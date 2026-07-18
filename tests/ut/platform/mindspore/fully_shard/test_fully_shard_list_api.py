@@ -48,7 +48,7 @@ from hyper_parallel.core.fully_shard.api import (
     _validate_module_for_fully_shard,
     fully_shard,
 )
-from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy
 from hyper_parallel.platform.platform import PlatformType
 
 
@@ -366,6 +366,57 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
         mesh = MagicMock()
         mesh.ndim = 1
         return mesh
+
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_sharded_accumulated_grad_validates_unsupported_combinations(self, mock_platform):
+        """The opt-in mode should fail before scheduler setup for unsupported options."""
+        mock_platform.platform_type = PlatformType.MINDSPORE
+        cell = ms_nn.Dense(4, 4)
+        mesh = self._create_mock_mesh()
+
+        with self.assertRaisesRegex(ValueError, "must be bool"):
+            fully_shard(cell, mesh=mesh, sharded_accumulated_grad=1)
+        with self.assertRaisesRegex(ValueError, "explicit FSDP/HSDP mesh"):
+            fully_shard(cell, sharded_accumulated_grad=True)
+        with self.assertRaisesRegex(ValueError, "comm_fusion"):
+            fully_shard(
+                cell,
+                mesh=mesh,
+                comm_fusion=True,
+                sharded_accumulated_grad=True,
+            )
+        with self.assertRaisesRegex(ValueError, "CPU gradient offload"):
+            fully_shard(
+                cell,
+                mesh=mesh,
+                offload_policy=CPUOffloadPolicy(),
+                sharded_accumulated_grad=True,
+            )
+
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_sharded_accumulated_grad_reaches_scheduler(self, mock_platform, mock_get_device):
+        """fully_shard should forward the opt-in flag to HSDP scheduler setup."""
+        mock_platform.platform_type = PlatformType.MINDSPORE
+        mock_get_device.return_value = "npu"
+        captured = {}
+
+        def _fake_hsdp_init(self, *args, **kwargs):
+            captured["sharded_accumulated_grad"] = args[-1]
+            self.hsdp_scheduler = object()
+
+        with patch(
+            "hyper_parallel.core.fully_shard.api.HSDPModule.hsdp_init",
+            _fake_hsdp_init,
+        ):
+            fully_shard(
+                ms_nn.Dense(4, 4),
+                mesh=self._create_mock_mesh(),
+                mp_policy=_default_mp_policy(),
+                sharded_accumulated_grad=True,
+            )
+
+        self.assertTrue(captured["sharded_accumulated_grad"])
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")

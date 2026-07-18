@@ -63,8 +63,10 @@ def _make_state():
         shard_placement_fn="shard-fn",
         comm_fusion=False,
         comm_fusion_zero_copy=False,
+        sharded_accumulated_grad=False,
     )
     state.comm_fusion = False
+    state.sharded_accumulated_grad = False
     state.mesh_info = SimpleNamespace(mesh="mesh-info")
     state.modules = []
     state.reduce_grads = True
@@ -186,6 +188,131 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state.replicate_params = [replicate_param]
 
         self.assertEqual(state._iter_managed_params(), [hsdp_param, replicate_param])
+
+    def test_post_backward_without_reduce_supports_sharded_accumulation(self):
+        """The opt-in no-sync path should reduce into local shards and reshard."""
+        state = _make_state()
+        hsdp_param = SimpleNamespace(to_accumulated_grad_if_needed=MagicMock())
+        state.hsdp_params = [hsdp_param]
+
+        state._post_backward_without_reduce()
+
+        hsdp_param.to_accumulated_grad_if_needed.assert_called_once_with()
+        state.shard.assert_not_called()
+
+        state = _make_state()
+        state.sharded_accumulated_grad = True
+        state.reshard_after_backward = True
+        state._reduce_pending_grads = MagicMock()
+
+        state._post_backward_without_reduce()
+
+        state._reduce_pending_grads.assert_called_once_with()
+        state.shard.assert_called_once_with()
+
+    def test_flush_sharded_accumulation_handles_late_leaf_grad(self):
+        """Post-backward flush should clear owned grads and reduce a late leaf grad once."""
+        state = _make_state()
+        state.sharded_accumulated_grad = True
+        state.reduce_grads = False
+        grad = ms.Tensor(np.ones((2,), dtype=np.float32))
+        unsharded = SimpleNamespace(grad=grad)
+        hsdp_param = SimpleNamespace(
+            unsharded_accumulated_grad=None,
+            _unsharded_param=unsharded,
+            unsharded_param=unsharded,
+            clear_released_unsharded_grad=MagicMock(),
+        )
+        state.hsdp_params = [hsdp_param]
+        state.post_backward = MagicMock()
+
+        state.flush_sharded_accumulation_after_backward()
+
+        state.post_backward.assert_called_once_with()
+        self.assertEqual(hsdp_param.clear_released_unsharded_grad.call_count, 2)
+
+        hsdp_param.unsharded_param.grad = None
+        hsdp_param.clear_released_unsharded_grad.reset_mock()
+        state.post_backward.reset_mock()
+
+        state.flush_sharded_accumulation_after_backward()
+
+        state.post_backward.assert_not_called()
+        hsdp_param.clear_released_unsharded_grad.assert_called_once_with()
+
+    def test_sharded_accumulation_issues_pure_reduce_scatter_and_releases_full_grad(self):
+        """No-sync HSDP should skip replicate AR and transfer the full grad to async RS."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
+        state = _make_state()
+        state.sharded_accumulated_grad = True
+        state.reduce_grads = False
+        grad = ms.Tensor(np.ones((4,), dtype=np.float32))
+        unsharded = SimpleNamespace(grad=grad)
+        hsdp_param = SimpleNamespace(
+            _unsharded_param=unsharded,
+            unsharded_param=unsharded,
+            unsharded_accumulated_grad=None,
+            sharded_param=SimpleNamespace(requires_grad=True),
+            shard_size=2,
+            dp_size=2,
+            param_mode=FullyShardParamMode.LOCAL_PARAM,
+            enable_fsdp_shard=True,
+            is_sharded=True,
+            reduce_dtype=ms.float32,
+            orig_dtype=ms.float32,
+            reduce_scatter_grad=MagicMock(return_value=("shard", "handle")),
+        )
+        state.hsdp_params = [hsdp_param]
+
+        state._issue_reduce_scatter_for_current_module()
+
+        hsdp_param.reduce_scatter_grad.assert_called_once_with(
+            async_op=True,
+            dtype=ms.float32,
+            reduce_op=ops.ReduceOp.SUM,
+            release_unsharded_grad=True,
+        )
+        self.assertEqual(
+            HSDPState.pre_reduce_scatter_params,
+            [(hsdp_param, ms.float32)],
+        )
+        self.assertEqual(MindSporeHSDPStateV2.pre_all_reduce_groups, [])
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.state.dist.all_reduce")
+    def test_finalize_sharded_accumulation_allreduces_each_local_shard_once(self, mock_all_reduce):
+        """The final pipeline action should issue one replicate AR per accumulated shard."""
+        state = _make_state()
+        state.sharded_accumulated_grad = True
+        state.reduce_op_type = ops.ReduceOp.AVG
+        local_grad = ms.Tensor(np.array([2.0, 4.0], dtype=np.float32))
+        handle = MagicMock()
+        mock_all_reduce.return_value = handle
+        hsdp_param = SimpleNamespace(
+            param_mode=FullyShardParamMode.LOCAL_PARAM,
+            mp_policy=MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True),
+            sharded_param=SimpleNamespace(
+                main_grad=SimpleNamespace(_local_tensor=local_grad),
+                grad=None,
+            ),
+            dp_size=2,
+            unsharded_group_info=GroupInfo("replicate", "replicate-group", 2),
+            accumulated_allreduced_grad=False,
+            _param_fqn="weight",
+        )
+        state.hsdp_params = [hsdp_param]
+
+        state.finalize_sharded_accumulated_grads()
+        state.finalize_sharded_accumulated_grads()
+
+        mock_all_reduce.assert_called_once_with(
+            local_grad,
+            group="replicate-group",
+            op=ops.ReduceOp.AVG,
+            async_op=True,
+        )
+        handle.wait.assert_called_once_with()
+        self.assertTrue(hsdp_param.accumulated_allreduced_grad)
 
     def test_prefetch_forwards_unshard_replicate_flag(self):
         """prefetch should forward the replicate-policy bit to unshard."""

@@ -102,11 +102,17 @@ class MindSporeHSDPStateV2(HSDPState):
         apply_gradient_scaling_factor(
             pending_grad, hsdp_param.gradient_scaling_factor
         )
-        return hsdp_param.apply_reduced_grad(pending_grad, hsdp_param.orig_dtype)
+        need_synchronize = hsdp_param.apply_reduced_grad(
+            pending_grad, hsdp_param.orig_dtype
+        )
+        if self._is_sharded_grad_accumulation_active():
+            hsdp_param.accumulated_allreduced_grad = False
+        return need_synchronize
 
     def __init__(self, cell, mesh_info, config, platform, device=None):
         super().__init__(cell, mesh_info, config, platform, device)
         self.comm_fusion = config.comm_fusion
+        self.sharded_accumulated_grad = getattr(config, "sharded_accumulated_grad", False)
         # Do ReduceScatter/AllReduce for grad
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
@@ -340,7 +346,10 @@ class MindSporeHSDPStateV2(HSDPState):
                 continue
             if not self._has_pending_unsharded_grad(hsdp_param):
                 continue
-            if self._should_run_all_reduce(hsdp_param):
+            if self._is_sharded_grad_accumulation_active():
+                need_synchronize = self._apply_pending_unsharded_grad_locally(hsdp_param)
+                self._synchronize_current_stream_if_needed(need_synchronize)
+            elif self._should_run_all_reduce(hsdp_param):
                 self._queue_compat_all_reduce(hsdp_param)
             else:
                 need_synchronize = self._apply_pending_unsharded_grad_locally(hsdp_param)
@@ -460,8 +469,9 @@ class MindSporeHSDPStateV2(HSDPState):
             return
 
         groups_by_comm = defaultdict(list)
+        defer_all_reduce = self._is_sharded_grad_accumulation_active()
         for hsdp_param in params_to_reduce:
-            if self._should_run_all_reduce(hsdp_param):
+            if self._should_run_all_reduce(hsdp_param) and not defer_all_reduce:
                 replicate_group = hsdp_param.unsharded_group_info.group
                 key = id(replicate_group) if replicate_group is not None else None
                 groups_by_comm[key].append(hsdp_param)
@@ -474,6 +484,7 @@ class MindSporeHSDPStateV2(HSDPState):
                     async_op=True,
                     dtype=hsdp_param.reduce_dtype,
                     reduce_op=self._resolve_reduce_op(),
+                    release_unsharded_grad=defer_all_reduce,
                 )
                 HSDPState.pre_reduce_scatter_params.append(
                     (hsdp_param, hsdp_param.orig_dtype)
@@ -538,10 +549,126 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def _post_backward_without_reduce(self):
         """Finish backward when gradient communication is disabled."""
+        if getattr(self, "sharded_accumulated_grad", False):
+            self._reduce_pending_grads()
+            if self.reshard_after_backward:
+                self.shard()
+            return
         if self.reshard_after_backward:
             self.shard()
         for hsdp_param in self._iter_managed_params():
             hsdp_param.to_accumulated_grad_if_needed()
+
+    def _is_sharded_grad_accumulation_active(self) -> bool:
+        """Whether this no-sync backward should reduce into local gradient shards."""
+        return getattr(self, "sharded_accumulated_grad", False) and not self.reduce_grads
+
+    def flush_sharded_accumulation_after_backward(self) -> None:
+        """Reduce grads populated after MindSpore's final backward callback.
+
+        When native leaf-gradient accumulation recreates a cleared ``.grad``
+        buffer, that buffer may become visible only after the HSDP callback.
+        Pipeline calls this method after the backward API returns so the current
+        micro-batch still enters the async reduce-scatter pipeline.
+        """
+        if not self._is_sharded_grad_accumulation_active():
+            return
+        for hsdp_param in self._iter_managed_params():
+            hsdp_param.clear_released_unsharded_grad()
+        if not any(
+            self._has_pending_unsharded_grad(hsdp_param)
+            for hsdp_param in self._iter_managed_params()
+        ):
+            return
+        self.post_backward()
+        for hsdp_param in self._iter_managed_params():
+            hsdp_param.clear_released_unsharded_grad()
+
+    def _reduce_pending_grads(self) -> None:
+        """Issue reductions for gradients produced by the current backward."""
+        if self.comm_fusion:
+            self.post_backward_for_comm_fusion()
+            return
+
+        defer_all_reduce = self._is_sharded_grad_accumulation_active()
+        self.reduce_params()
+        for hsdp_param in self._iter_managed_params():
+            # replicate_params are handled once by _queue_replicate_params_allreduce().
+            if not getattr(hsdp_param, "enable_fsdp_shard", True):
+                continue
+            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                if not defer_all_reduce and self._can_direct_all_reduce_compat_grad(hsdp_param):
+                    self._queue_direct_compat_all_reduce(hsdp_param)
+                continue
+            if not hasattr(hsdp_param, "sharded_param") or not hsdp_param.sharded_param.requires_grad:
+                continue
+            if not self._has_pending_unsharded_grad(hsdp_param):
+                continue
+            if hsdp_param.shard_size <= 1:
+                if self._should_run_all_reduce(hsdp_param) and not defer_all_reduce:
+                    self._queue_compat_all_reduce(hsdp_param)
+                else:
+                    need_synchronize = self._apply_pending_unsharded_grad_locally(hsdp_param)
+                    self._synchronize_current_stream_if_needed(need_synchronize)
+
+        if self._needs_overlap_post_backward_steps():
+            self._run_overlap_post_backward_steps()
+        self._queue_replicate_params_allreduce()
+
+    @staticmethod
+    def _get_local_accumulated_grad(hsdp_param):
+        """Return the local tensor holding this step's accumulated gradient shard."""
+        if hsdp_param.mp_policy.apply_grad_on_fp32_main_grad:
+            grad = getattr(hsdp_param.sharded_param, "main_grad", None)
+        else:
+            grad = hsdp_param.sharded_param.grad
+        if grad is None:
+            return None
+        local_tensor = getattr(grad, "_local_tensor", None)
+        if local_tensor is not None:
+            return local_tensor
+        to_local = getattr(grad, "to_local", None)
+        if callable(to_local):
+            return to_local()
+        return grad
+
+    def finalize_sharded_accumulated_grads(self) -> None:
+        """Synchronize locally accumulated gradient shards across HSDP replicas."""
+        if not getattr(self, "sharded_accumulated_grad", False):
+            return
+
+        pending_all_reduces = []
+        for hsdp_param in self._iter_managed_params():
+            target_grad = self._get_local_accumulated_grad(hsdp_param)
+            if target_grad is None:
+                continue
+            if not self._should_run_all_reduce(hsdp_param):
+                hsdp_param.accumulated_allreduced_grad = True
+                continue
+            if hsdp_param.accumulated_allreduced_grad:
+                continue
+            group_info = hsdp_param.unsharded_group_info
+            if group_info.group is None:
+                raise RuntimeError(
+                    f"Expected a valid replicate group for parameter {hsdp_param._param_fqn}."
+                )
+            reduced_grad = target_grad.contiguous()
+            handle = dist.all_reduce(
+                reduced_grad,
+                group=group_info.group,
+                op=self._resolve_reduce_op(),
+                async_op=True,
+            )
+            pending_all_reduces.append((hsdp_param, handle, reduced_grad, target_grad))
+
+        for hsdp_param, handle, reduced_grad, target_grad in pending_all_reduces:
+            if handle is not None:
+                handle.wait()
+            if reduced_grad is not target_grad:
+                if reduced_grad.dtype != target_grad.dtype:
+                    reduced_grad = reduced_grad.to(target_grad.dtype)
+                copy_without_bumping_version(target_grad, reduced_grad)
+            hsdp_param.accumulated_allreduced_grad = True
 
     def _should_run_all_reduce(self, hsdp_param) -> bool:
         """Whether the current parameter should issue an all-reduce in this backward pass."""
@@ -611,37 +738,7 @@ class MindSporeHSDPStateV2(HSDPState):
         if not self.reduce_grads:
             self._post_backward_without_reduce()
             return
-        if not self.comm_fusion:
-            self.reduce_params()
-            for hsdp_param in self._iter_managed_params():
-                # replicate_params are queued once by _queue_replicate_params_allreduce().
-                if not getattr(hsdp_param, "enable_fsdp_shard", True):
-                    continue
-                if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
-                    if self._can_direct_all_reduce_compat_grad(hsdp_param):
-                        self._queue_direct_compat_all_reduce(hsdp_param)
-                    continue
-                if not hasattr(hsdp_param, "sharded_param") or not hsdp_param.sharded_param.requires_grad:
-                    continue
-                if not self._has_pending_unsharded_grad(hsdp_param):
-                    continue
-                if hsdp_param.shard_size <= 1:
-                    if self._should_run_all_reduce(hsdp_param):
-                        self._queue_compat_all_reduce(hsdp_param)
-                    else:
-                        # No-communication path (shard_size == 1, no all-reduce):
-                        # this leg owns the scaling since the grad never goes through
-                        # reduce_scatter_grad / all_reduce_grad.
-                        need_synchronize = self._apply_pending_unsharded_grad_locally(
-                            hsdp_param
-                        )
-                        self._synchronize_current_stream_if_needed(need_synchronize)
-
-            if self._needs_overlap_post_backward_steps():
-                self._run_overlap_post_backward_steps()
-            self._queue_replicate_params_allreduce()
-        else:
-            self.post_backward_for_comm_fusion()
+        self._reduce_pending_grads()
         if self.reshard_after_backward:
             self.shard()
 

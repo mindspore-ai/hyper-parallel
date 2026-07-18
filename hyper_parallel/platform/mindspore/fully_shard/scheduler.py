@@ -157,9 +157,10 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         module (each layer becomes its own root yet is fed a grad-requiring activation).
         PP hit the same boundary and worked around it with ``force_reduce=True`` from
         ``PipelineStage.execute_reduce_grad``; that call site keeps working -- the drain is
-        simply always performed now. PP per-micro-batch accumulation is unaffected because
-        each chunk's backward sets ``requires_gradient_sync=False``, leaving the reduce
-        queue empty here so this drain is a no-op until the explicit reduce step.
+        simply always performed now. When sharded gradient accumulation is enabled, a
+        no-sync backward deliberately leaves its tail reduce-scatter pending so it can
+        overlap the next micro-batch. The final pipeline action passes ``force_reduce=True``
+        and drains that work before the optimizer reads gradients.
 
         ``root_bp_state`` (top-level root backward in flight; gates forward prefetch during
         activation recompute) is independent of the drain and is cleared only by the root
@@ -168,6 +169,12 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         self._backward_hook()
         if self._is_root:
             HSDPSchedulerV2.root_bp_state = False
+        if (
+            getattr(self.hsdp_state, "sharded_accumulated_grad", False)
+            and not getattr(self.hsdp_state, "reduce_grads", True)
+            and not force_reduce
+        ):
+            return
         comm_ctx = get_comm_ctx()
         if comm_ctx.all_reduce_param_group is not None:
             comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()

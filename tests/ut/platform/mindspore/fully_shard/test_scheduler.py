@@ -266,6 +266,34 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         MindSporeHSDPSchedulerV2._backward_hook(scheduler)
         scheduler._hsdp_backward_hook.assert_not_called()
 
+    def test_root_backward_defers_no_sync_sharded_accumulation_until_forced(self):
+        """No-sync callbacks should leave the tail RS pending for cross-micro overlap."""
+        scheduler = _make_scheduler()
+        scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler._is_root = True
+        scheduler._hsdp_backward_hook = MagicMock()
+        scheduler.hsdp_state.sharded_accumulated_grad = True
+        scheduler.hsdp_state.reduce_grads = False
+        HSDPSchedulerV2.root_bp_state = True
+
+        with patch.object(scheduler_mod, "get_comm_ctx") as get_comm_ctx:
+            MindSporeHSDPSchedulerV2._root_backward_hook(scheduler)
+
+        scheduler._hsdp_backward_hook.assert_called_once_with(scheduler.cell, None, None)
+        get_comm_ctx.assert_not_called()
+        scheduler.hsdp_state.reduce_scattered_params.assert_not_called()
+        scheduler.hsdp_state.reduce_params.assert_not_called()
+        self.assertFalse(HSDPSchedulerV2.root_bp_state)
+
+        scheduler._hsdp_backward_hook.reset_mock()
+        comm_ctx = SimpleNamespace(all_reduce_param_group=None, pre_param_group=None)
+        with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx):
+            MindSporeHSDPSchedulerV2._root_backward_hook(scheduler, force_reduce=True)
+
+        scheduler._hsdp_backward_hook.assert_called_once_with(scheduler.cell, None, None)
+        scheduler.hsdp_state.reduce_scattered_params.assert_called_once_with()
+        scheduler.hsdp_state.reduce_params.assert_called_once_with()
+
     def test_register_forward_backward_hooks_for_single_and_grouped_modules(self):
         """Hook registration should use grouped hooks only when the grouped marker exists."""
         scheduler = _make_scheduler()

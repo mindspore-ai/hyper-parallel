@@ -518,10 +518,19 @@ class PipelineStage(PipelineStageBase):
         fsdp_module.set_reshard_after_backward(True)
         fsdp_module.set_requires_gradient_sync(True)
 
+        hsdp_states = []
+        seen_states = set()
         for _, submod in platform.get_cells_and_names(fsdp_module):
             if not isinstance(submod, HSDPModule):
                 continue
             sub_mod_state = submod.hsdp_scheduler.hsdp_state
+            state_id = id(sub_mod_state)
+            if state_id in seen_states:
+                continue
+            seen_states.add(state_id)
+            hsdp_states.append(sub_mod_state)
+            if getattr(sub_mod_state, "sharded_accumulated_grad", False):
+                continue
             sub_mod_state.post_backward()
             sub_mod_state.reduce_params()
 
@@ -530,6 +539,34 @@ class PipelineStage(PipelineStageBase):
         # scheduler_state==BACKWARD, so the natural gate would skip the final drain and the
         # last module's reduce-scatter would lag one optimizer step.
         fsdp_module.hsdp_scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
+
+        for hsdp_state in hsdp_states:
+            if not getattr(hsdp_state, "sharded_accumulated_grad", False):
+                continue
+            hsdp_state.finalize_sharded_accumulated_grads()
+            if hsdp_state.reshard_after_backward:
+                hsdp_state.shard()
+
+    def flush_sharded_accumulation_after_backward(self) -> None:
+        """Flush no-sync gradients that become visible after backward returns."""
+        if not isinstance(self.submodule, HSDPModule):
+            return
+        seen_states = set()
+        for _, submod in platform.get_cells_and_names(self.submodule):
+            if not isinstance(submod, HSDPModule):
+                continue
+            hsdp_state = submod.hsdp_scheduler.hsdp_state
+            state_id = id(hsdp_state)
+            if state_id in seen_states:
+                continue
+            seen_states.add(state_id)
+            flush = getattr(
+                hsdp_state,
+                "flush_sharded_accumulation_after_backward",
+                None,
+            )
+            if callable(flush):
+                flush()
 
     def _build_padded_sens(self, micro_index):
         """Build an N-length sens list aligned with the forward output structure.

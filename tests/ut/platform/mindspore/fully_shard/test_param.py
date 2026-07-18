@@ -51,6 +51,8 @@ def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
     obj.all_gather_outputs = []
     obj.gradient_scaling_factor = None
     obj.mp_policy = MixedPrecisionPolicy()
+    obj._reduce_scatter_input = None
+    obj._reduce_scatter_source = None
     return obj
 
 
@@ -469,12 +471,14 @@ class TestMindSporeParam(unittest.TestCase):
         self.assertIsNone(hsdp_param.reduce_scatter_handle)
 
     def test_clear_reduce_scatter_output_clears_cached_tensor(self):
-        """Clear helper should drop the cached reduce-scatter output."""
+        """Clear helper should drop cached reduce-scatter input and output."""
         hsdp_param = _new_hsdp_param_v2()
+        hsdp_param._reduce_scatter_input = "retained-input"
         hsdp_param._reduce_scatter_output = "reduced"
 
         MindSporeHSDPParamV2.clear_reduce_scatter_output(hsdp_param)
 
+        self.assertIsNone(hsdp_param._reduce_scatter_input)
         self.assertIsNone(hsdp_param._reduce_scatter_output)
 
     def test_all_reduce_output_waits_for_async_handle(self):
@@ -752,14 +756,23 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param._spmd_shard_mesh_dim = 0
         hsdp_param._spmd_placements = (StridedShard(1, split_factor=2), Shard(1))
 
-        reduced_grad, _ = MindSporeHSDPParamV2.reduce_scatter_grad(hsdp_param, async_op=False)
+        reduced_grad, _ = MindSporeHSDPParamV2.reduce_scatter_grad(
+            hsdp_param,
+            async_op=False,
+            release_unsharded_grad=True,
+        )
 
         expected_packed = np.concatenate(
             np.array_split(np.arange(32, dtype=np.float32).reshape(4, 8), 2, axis=1),
             axis=0,
         ).reshape(-1)
         self.assertEqual(reduced_grad.numel(), 16)
-        np.testing.assert_allclose(mock_reduce_scatter.call_args.args[1].asnumpy(), expected_packed)
+        reduce_scatter_input = mock_reduce_scatter.call_args.args[1]
+        np.testing.assert_allclose(reduce_scatter_input.asnumpy(), expected_packed)
+        self.assertIs(hsdp_param._reduce_scatter_input, reduce_scatter_input)
+        self.assertIsNotNone(hsdp_param._unsharded_param.grad)
+        MindSporeHSDPParamV2.clear_released_unsharded_grad(hsdp_param)
+        self.assertIsNone(hsdp_param._unsharded_param.grad)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.all_reduce")
     def test_all_reduce_grad_uses_layout_driven_unsharded_group(self, mock_all_reduce):

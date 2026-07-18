@@ -26,14 +26,18 @@ _TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_simu_pp.
 def test_fully_shard_simu_pp_suite():
     """
     Feature: fully_shard simulating 1F1B-style micro-batching.
-    Description: Run both unshard-toggle variants together on a 4-card dp mesh; each variant
+    Description: Run both unshard-toggle variants and sharded accumulation on a 4-card dp mesh; each case
                  compares per-rank loss + grad against a single-card baseline that consumes
                  the full global input.
-    Expectation: fully_shard loss/grad match the baseline on every rank for both variants.
+    Expectation: fully_shard loss/grad match the baseline on every rank for all cases.
     """
     parallel_run([
         MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_implicit_unshard_reshard",
                       worker_num=4, local_worker_num=4),
         MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_explicit_unshard_no_reshard",
+                      worker_num=4, local_worker_num=4),
+        MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_sharded_accumulated_grad",
+                      worker_num=4, local_worker_num=4),
+        MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad",
                       worker_num=4, local_worker_num=4),
     ])

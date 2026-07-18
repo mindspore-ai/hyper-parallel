@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hyper_parallel.core.pipeline_parallel import scheduler as scheduler_module
+from hyper_parallel.core.pipeline_parallel import stage as stage_module
 from tests.common.mark_utils import arg_mark
 
 
@@ -28,6 +29,7 @@ class _FakeHSDPModule:
         self.set_reshard_after_forward = MagicMock()
         self.set_reshard_after_backward = MagicMock()
         self.set_requires_gradient_sync = MagicMock()
+        self.set_is_last_backward = MagicMock()
 
 
 @arg_mark(
@@ -113,3 +115,67 @@ def test_fsdp_backward_configured_once_per_run_for_multiple_microbatches() -> No
     )
     fsdp_module.set_reshard_after_backward.assert_called_with(False)
     fsdp_module.set_requires_gradient_sync.assert_called_with(False)
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_reduce_grad_finalizes_sharded_accumulation_once_per_state() -> None:
+    """
+    Feature: Pipeline sharded gradient accumulation finalization.
+    Description: Drain the tail RS, finalize local shards, and deduplicate shared HSDP states.
+    Expectation: Legacy states use post_backward while opt-in states use one final replicate reduction.
+    """
+    feature_state = SimpleNamespace(
+        sharded_accumulated_grad=True,
+        reshard_after_backward=True,
+        post_backward=MagicMock(),
+        reduce_params=MagicMock(),
+        flush_sharded_accumulation_after_backward=MagicMock(),
+        finalize_sharded_accumulated_grads=MagicMock(),
+        shard=MagicMock(),
+    )
+    legacy_state = SimpleNamespace(
+        sharded_accumulated_grad=False,
+        reshard_after_backward=True,
+        post_backward=MagicMock(),
+        reduce_params=MagicMock(),
+        flush_sharded_accumulation_after_backward=MagicMock(),
+        finalize_sharded_accumulated_grads=MagicMock(),
+        shard=MagicMock(),
+    )
+    root = _FakeHSDPModule()
+    root.hsdp_scheduler = SimpleNamespace(
+        hsdp_state=feature_state,
+        _root_backward_hook=MagicMock(),
+    )
+    legacy = _FakeHSDPModule()
+    legacy.hsdp_scheduler = SimpleNamespace(hsdp_state=legacy_state)
+    stage = object.__new__(stage_module.PipelineStage)
+    stage.submodule = root
+
+    module_tree = [("", root), ("legacy", legacy), ("legacy_alias", legacy)]
+    with patch.object(stage_module, "HSDPModule", _FakeHSDPModule), patch.object(
+        stage_module.platform,
+        "get_cells_and_names",
+        return_value=module_tree,
+    ):
+        stage.flush_sharded_accumulation_after_backward()
+        stage.execute_reduce_grad()
+
+    root.set_reshard_after_backward.assert_called_once_with(True)
+    root.set_requires_gradient_sync.assert_called_once_with(True)
+    feature_state.post_backward.assert_not_called()
+    feature_state.reduce_params.assert_not_called()
+    feature_state.flush_sharded_accumulation_after_backward.assert_called_once_with()
+    legacy_state.post_backward.assert_called_once_with()
+    legacy_state.reduce_params.assert_called_once_with()
+    legacy_state.flush_sharded_accumulation_after_backward.assert_called_once_with()
+    root.hsdp_scheduler._root_backward_hook.assert_called_once_with(force_reduce=True)
+    feature_state.finalize_sharded_accumulated_grads.assert_called_once_with()
+    feature_state.shard.assert_called_once_with()
+    legacy_state.finalize_sharded_accumulated_grads.assert_not_called()
+    legacy_state.shard.assert_not_called()
