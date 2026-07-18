@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -85,15 +85,6 @@ class PipelineStageBase:
 
     def forward_one_chunk(self, micro_index, args=None, kwargs=None):
         """Execution a forward function."""
-        # PP drives FSDP unshard/reshard through injected FSDP MetaSteps, so the
-        # nested HSDPModules must NOT reshard after their own forward hook.  GPipe
-        # runs every micro-batch forward before any backward; if a module resharded
-        # after micro-batch 0, the next micro-batch's ``_assert_in_unshard_if_needed``
-        # would fail (parameters already freed). Keep them unsharded for the whole
-        # stage; the FSDP_RESHARD MetaStep frees them explicitly afterwards.
-        for _, mod in self.submodule.named_modules():
-            if isinstance(mod, hyper_parallel.HSDPModule):
-                mod.set_reshard_after_forward(False)
         if self.is_first_stage:
             composite_args = args
         else:
@@ -154,16 +145,6 @@ class PipelineStageBase:
         """
         if not self._has_backward:
             return
-        # Accumulate per-micro-batch gradients locally without resharding or
-        # reducing.  The schedule's FSDP_REDUCE_GRAD MetaStep
-        # (PipelineStage.execute_reduce_grad) re-enables both flags and performs
-        # the single reduce-scatter once after the last micro-batch's backward.
-        # Per-micro-batch reduce here would conflict with that explicit reduce and
-        # over-count the gradient.
-        for _, mod in self.submodule.named_modules():
-            if isinstance(mod, hyper_parallel.HSDPModule):
-                mod.set_reshard_after_backward(False)
-                mod.set_requires_gradient_sync(False)
         recv_args = []
         if micro_index in self.grad_recv_info:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]

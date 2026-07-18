@@ -122,6 +122,11 @@ class PipelineStage(PipelineStageBase):
         self._shared_parameters = self._check_shared_parameters(shared_parameters)
         self._virtual_chunk_num = 1
 
+    @property
+    def has_backward(self) -> bool:
+        """Return whether this stage executes backward passes."""
+        return self._has_backward
+
     def init(self, virtual_chunk_num):
         """Initialize the pipeline stage: set virtual chunk count, PP group, and sync shared parameters."""
         self._virtual_chunk_num = virtual_chunk_num
