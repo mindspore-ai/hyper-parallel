@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -89,10 +89,11 @@ class PipelineStageBase:
 
     @staticmethod
     def _grad_position_from_requires_grad(composite_args):
-        """Derive grad_position from composite_args' requires_grad attributes.
+        """Return positional Tensor indices that already require gradients.
 
-        Returns -1 if all tensor args require grad, a tuple of indices if some do,
-        and an empty list if none do.
+        Pipeline stages only route gradients for positional stage inputs. Always
+        returning explicit indices avoids the broader ``-1`` contract, which also
+        selects keyword Tensor inputs in ``forward_and_gradfn``.
         """
         # pylint: disable=C0415
         from mindspore import Tensor
@@ -101,10 +102,6 @@ class PipelineStageBase:
             i for i in tensor_indices
             if composite_args[i]._requires_grad  # pylint: disable=protected-access
         ]
-        if not requires_grad_indices:
-            return []
-        if len(requires_grad_indices) == len(tensor_indices):
-            return -1
         return tuple(requires_grad_indices)
 
     @property
@@ -119,11 +116,6 @@ class PipelineStageBase:
 
     def forward_one_chunk(self, micro_index, args=None, kwargs=None):
         """Execution a forward function."""
-        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
-        for _, mod in self.submodule.cells_and_names():
-            if not isinstance(mod, HSDPModule):
-                continue
-            mod.set_reshard_after_forward(False)
         if self.is_first_stage:
             composite_args = args
         else:
@@ -191,15 +183,8 @@ class PipelineStageBase:
 
     def backward_one_chunk(self, micro_index):
         """Execution a backward function."""
-        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
             return
-        for _, mod in self.submodule.cells_and_names():
-            if not isinstance(mod, HSDPModule):
-                continue
-            mod.set_reshard_after_backward(False)
-            mod.set_requires_gradient_sync(False)
-
         grad_fn = self.fwd_grad_fn_cache.pop(micro_index)
         handles = self.recompute_handles.pop(micro_index, None)
         platform = get_platform()
@@ -247,15 +232,9 @@ class PipelineStageBase:
         :meth:`backward_weight_one_chunk` runs the full backward instead, so
         ``grad_fn`` is left untouched in the cache for it to pop.
         """
-        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
             return
         with get_platform().profiler_record(f"backward_input_one_chunk: stage_{self.stage_index}/mi_{micro_index}"):
-            for _, mod in self.submodule.cells_and_names():
-                if not isinstance(mod, HSDPModule):
-                    continue
-                mod.set_reshard_after_backward(False)
-                mod.set_requires_gradient_sync(False)
             if self.is_first_stage:
                 return
             # Index, NOT pop: backward_weight_one_chunk performs the terminal pop.
@@ -290,16 +269,9 @@ class PipelineStageBase:
         runs here instead, which yields only weight gradients (the stage has no
         input grad to compute).
         """
-        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
             return
         with get_platform().profiler_record(f"backward_weight_one_chunk: stage_{self.stage_index}/mi_{micro_index}"):
-            for _, mod in self.submodule.cells_and_names():
-                if not isinstance(mod, HSDPModule):
-                    continue
-                mod.set_reshard_after_backward(False)
-                mod.set_requires_gradient_sync(False)
-
             grad_fn = self.fwd_grad_fn_cache.pop(micro_index)
             handles = self.recompute_handles.pop(micro_index, None)
             platform = get_platform()

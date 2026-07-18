@@ -418,12 +418,32 @@ class PipelineScheduleRuntime(ABC):
                 "When injecting fsdp_action, expect all stages to be HSDPModule. "
                 "Check whether all separated modules are wrapped with 'fully_shard'."
             )
+        # Pipeline MetaSteps own parameter resharding, so disable the HSDP
+        # forward hook once when building the schedule instead of once per
+        # micro-batch. The root API applies the setting recursively.
+        for stage in self.stages:
+            stage.submodule.set_reshard_after_forward(False)
         rank_actions = add_fsdp_unshard_reshard(self.exec_order[current_rank], managed_stage_indices)
         self.exec_order[current_rank] = add_fsdp_reduce_grad(
             rank_actions,
             managed_stage_indices,
             self.micro_batch_num,
         )
+
+    def _prepare_fsdp_backward(self):
+        """Disable HSDP post-backward actions once for the current pipeline run.
+
+        Pipeline accumulates gradients across all micro-batches and executes
+        the reduction through ``FSDP_REDUCE_GRAD`` after the last backward.
+        ``execute_reduce_grad`` restores both flags, so they must be disabled
+        once again at the beginning of the next run.
+        """
+        for stage in self.stages:
+            if not stage.has_backward:
+                continue
+            if isinstance(stage.submodule, HSDPModule):
+                stage.submodule.set_reshard_after_backward(False)
+                stage.submodule.set_requires_gradient_sync(False)
 
     def _inject_local_pp_swap_actions(self):
         """Annotate the local rank schedule with pipeline activation-swap actions."""
@@ -934,6 +954,7 @@ class PipelineScheduleRuntime(ABC):
         (handy when diagnosing deadlocks or callback ordering issues).
         """
         real_stage_index = self.stages[0].stage_index % self.real_stage_num
+        self._prepare_fsdp_backward()
         self._send_handles = []
         self._boundary_issued = set()
         self._pending_boundary = {}
