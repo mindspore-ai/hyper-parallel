@@ -1,0 +1,898 @@
+diff --git a/mindformers/dataset/dataloader/ordered_index_dataloader.py b/mindformers/dataset/dataloader/ordered_index_dataloader.py
+new file mode 100644
+index 000000000..a6aee9a8c
+--- /dev/null
++++ b/mindformers/dataset/dataloader/ordered_index_dataloader.py
+@@ -0,0 +1,867 @@
++# Copyright 2026 Huawei Technologies Co., Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ============================================================================
++"""Ordered Index DataLoader."""
++
++import os
++import hashlib
++from typing import List, Tuple, Optional, Union
++from pathlib import Path
++from dataclasses import dataclass
++
++import numpy as np
++
++import mindspore as ms
++from mindspore import Tensor, ops
++from mindspore.dataset import GeneratorDataset
++
++from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
++from mindformers.tools.logger import logger
++from mindformers.version_control import skip_barrier_controller
++from mindformers.tools.utils import get_real_group_size, MODE
++from mindformers.core.context.build_context import get_context
++from mindformers.dataset.blended_datasets.indexed_dataset import IndexedDataset
++
++from .utils import is_dataset_built_on_rank
++from .blended_megatron_dataloader import MockBlendedMegatron
++
++
++@dataclass
++class OrderedIndexDataLoaderConfig:
++    """
++    Configuration for OrderedIndexDataLoader.
++
++    Args:
++        data_path (Union[str, List[str]]): Path(s) to .bin/.idx dataset files. Required.
++        mmap (bool): Whether to use memory mapping when loading data. Default: False.
++        use_cache (bool): Whether to cache the index map. Default: True.
++        cache_dir (Optional[str]): Directory to store cached index maps. If None, no disk cache.
++        reset_position_ids (bool): Whether to reset position IDs at EOD tokens. Default: False.
++        reset_attention_mask (bool): Whether to reset attention mask at EOD tokens. Default: False.
++        eod_mask_loss (bool): Whether to mask loss at EOD tokens. Default: False.
++        create_attention_mask (bool): Whether to generate full attention mask. Default: False.
++        create_compressed_eod_mask (bool): Whether to generate compressed EOD-based attention mask (e.g., for FlashAttention).
++            Takes precedence over `create_attention_mask`. Default: False.
++        compressed_eod_mask_length (int): Max number of EOD positions to record when `create_compressed_eod_mask=True`.
++            Default: 128.
++        sequence_length (int): Maximum sequence length. Required.
++        eod_token (int): Token ID indicating end-of-document. Default: 0.
++        pad_token (int): Token ID used for padding. Default: 0.
++    """
++
++    data_path: Union[str, List[str]] = None
++    mmap: bool = False
++    use_cache: bool = True
++    cache_dir: Optional[str] = None
++    reset_position_ids: bool = False
++    reset_attention_mask: bool = False
++    eod_mask_loss: bool = False
++    create_attention_mask: bool = False
++    create_compressed_eod_mask: bool = False
++    compressed_eod_mask_length: int = 128
++    sequence_length: int = None
++    eod_token: int = 0
++    pad_token: int = 0
++    create_seq_len_vector: bool = False
++
++    def __post_init__(self) -> None:
++        """Validate required fields after initialization."""
++        if self.sequence_length is None:
++            raise ValueError("sequence_length must be specified in OrderedIndexDataLoaderConfig.")
++
++        if self.create_seq_len_vector:
++            self.create_attention_mask = False
++            self.create_compressed_eod_mask = False
++
++
++@MindFormerRegister.register(MindFormerModuleType.DATASET_LOADER)
++class OrderedIndexDataLoader:
++    """
++    A dataset loader that loads indexed binary datasets (.bin/.idx) in a deterministic order.
++
++    Supports distributed training with consistent dataset size broadcasting.
++    Uses cached index mapping for faster initialization.
++    Integrates with Megatron-style data processing (EOD, position reset, etc.).
++
++    This class uses `__new__` to control instantiation and handle distributed coordination.
++    """
++
++    def __new__(cls, **kwargs):
++        """
++        Construct a GeneratorDataset based on configuration and distributed context.
++
++        In distributed mode, only rank 0 builds the real dataset and broadcasts its size.
++        Other ranks receive the size and use a mock dataset placeholder.
++
++        Args:
++            **kwargs: Keyword arguments for configuration. See `OrderedIndexDataLoaderConfig`.
++
++        Returns:
++            GeneratorDataset: A dataset instance ready for training.
++        """
++        config = cls._build_config(**kwargs)
++
++        world_size = get_real_group_size()
++        balance_config = kwargs.get('balance_config')
++        dataset = OrderedIndexDataset(config, balance_config=balance_config)
++
++        if world_size > 1 and get_context('mode') == MODE['PYNATIVE_MODE']:
++            return GeneratorDataset(
++                dataset,
++                column_names=kwargs.get('column_names'),
++                num_parallel_workers=kwargs.get("num_parallel_workers", 1),
++                python_multiprocessing=kwargs.get("python_multiprocessing", False),
++                shard_id=kwargs.get("shard_id"),
++                num_shards=kwargs.get("num_shards"),
++                shuffle=False,
++            )
++        if  world_size > 1:
++            is_main_rank = is_dataset_built_on_rank()
++        else:
++            is_main_rank = True
++        enable_dryrun = os.environ.get('MS_SIMULATION_LEVEL', '0') != '0'
++        if world_size > 1 and not is_main_rank and not enable_dryrun:
++            skip_barrier_controller()  # barrier
++
++            logger.info(" > Start receive dataset size from main rank.")
++            received_data = (Tensor([0], dtype=ms.int32),)
++            dataset_size = ops.Broadcast(0)(received_data)[0].numpy()[0]
++            logger.info(f" > Received dataset size: {dataset_size}")
++
++            setattr(config, 'eod_pad_length', config.compressed_eod_mask_length)
++            dataset = MockBlendedMegatron(config, dataset_size)
++            return GeneratorDataset(
++                dataset,
++                column_names=kwargs.get('column_names'),
++                shard_id=kwargs.get("shard_id"),
++                num_shards=kwargs.get("num_shards"),
++            )
++
++        balance_config = kwargs.get('balance_config')
++        dataset = OrderedIndexDataset(config, balance_config=balance_config)
++
++        if world_size > 1:
++            skip_barrier_controller()  # barrier
++            dataset_size = Tensor(len(dataset), dtype=ms.int32)
++            logger.info(f" > Start broadcast dataset size: {dataset_size}")
++            ops.Broadcast(0)((dataset_size,))
++
++        return GeneratorDataset(
++            dataset,
++            column_names=kwargs.get('column_names'),
++            num_parallel_workers=kwargs.get("num_parallel_workers", 1),
++            python_multiprocessing=kwargs.get("python_multiprocessing", False),
++            shard_id=kwargs.get("shard_id"),
++            num_shards=kwargs.get("num_shards"),
++            shuffle=False,
++        )
++
++    @classmethod
++    def _build_config(cls, **kwargs) -> OrderedIndexDataLoaderConfig:
++        """
++        Build configuration from input arguments.
++
++        Args:
++            **kwargs: Input parameters.
++
++        Returns:
++            OrderedIndexDataLoaderConfig: Validated configuration object.
++        """
++        data_path = kwargs.get('data_path')
++        if data_path is None:
++            raise ValueError("`data_path` must be provided in OrderedIndexDataLoader.")
++
++        processed_data_path = cls._process_data_path(data_path)
++
++        compressed_eod_mask_length = kwargs.get(
++            'compressed_eod_mask_length',
++            kwargs.get('eod_pad_length', 128)
++        )
++
++        return OrderedIndexDataLoaderConfig(
++            data_path=processed_data_path,
++            mmap=kwargs.get('mmap', False),
++            use_cache=kwargs.get('use_cache', True),
++            cache_dir=kwargs.get('cache_dir'),
++            # corresponding to megatron datasets
++            sequence_length=kwargs.get('sequence_length'),
++            reset_position_ids=kwargs.get('reset_position_ids', False),
++            reset_attention_mask=kwargs.get('reset_attention_mask', False),
++            eod_mask_loss=kwargs.get('eod_mask_loss', False),
++            create_attention_mask=kwargs.get('create_attention_mask', False),
++            # create_compressed_eod_mask has a higher priority than create_attention_mask
++            create_compressed_eod_mask=kwargs.get('create_compressed_eod_mask', False),
++            compressed_eod_mask_length=compressed_eod_mask_length,
++            eod_token=kwargs.get('eod_token', 0),
++            pad_token=kwargs.get('pad_token', 0),
++            create_seq_len_vector=kwargs.get('create_seq_len_vector', False),
++        )
++
++    @staticmethod
++    def _process_data_path(data_path: Union[str, List[str]]) -> List[str]:
++        """
++        Process input data path into a list of valid .bin/.idx file prefixes.
++
++        If a directory is provided, recursively find all .bin files and extract their base paths.
++        Validates existence of both .bin and .idx files.
++
++        Args:
++            data_path (Union[str, List[str]]): File path, directory path, or list of file paths.
++
++        Returns:
++            List[str]: List of file prefixes (without extension) that have valid .bin and .idx pairs.
++
++        Raises:
++            TypeError: If data_path is not str or list of str.
++        """
++        # Parse data_path as a list of file path
++        if isinstance(data_path, str):
++            path = Path(data_path)
++            if path.is_dir():
++                bin_files = [str(f).rstrip('.bin') for f in path.rglob("*.bin")]
++                bin_files.sort()
++            else:
++                bin_files = [data_path]
++        elif isinstance(data_path, list):
++            bin_files = data_path
++        else:
++            raise TypeError(
++                f"data_path must be str or List[str], got {type(data_path)}."
++            )
++
++        # Check whether bin_files valid
++        invalid_files = []
++        for bin_file in bin_files:
++            bin_path = Path(f"{bin_file}.bin")
++            idx_path = Path(f"{bin_file}.idx")
++            if not (bin_path.exists() and idx_path.exists()):
++                invalid_files.append(bin_file)
++
++        if invalid_files:
++            invalid_files_str = '\n'.join(invalid_files)
++            logger.info(f"Invalid data paths (missing .bin or .idx):\n{invalid_files_str}")
++
++        return bin_files
++
++
++class OrderedIndexDataset:
++    """
++    Dataset that combines multiple indexed binary datasets (.bin/.idx) into a single ordered dataset.
++
++    Uses a global-to-local index map for O(1) access. Supports caching of index map for faster reload.
++    Designed for large-scale language model pretraining with document boundaries.
++    """
++
++    _cache: dict = {}
++
++    def __init__(self, config: OrderedIndexDataLoaderConfig, **kwargs):
++        """
++        Initialize the dataset.
++
++        Args:
++            config (OrderedIndexDataLoaderConfig): Configuration object.
++        """
++        self.config = config
++        self.file_list = config.data_path
++        self.mmap = config.mmap
++        self.cache_dir = config.cache_dir
++        self.use_cache = config.use_cache
++        self.multimodal = False
++
++        self.dataset_list = []
++        self.dataset_offsets = []
++        self.lengths = []
++        self.total_length = 0
++        self.index_map = None
++        self.state_hash = None
++
++        self.current_file_index = 0
++        self.current_data_index = 0
++
++        self._load_datasets()
++        self._build_index_map()
++
++        self.balance_config = kwargs.get('balance_config')
++        self.balanced_indices = None
++        self.data_parallel_stage = None
++        if self.balance_config:
++            from mindspore.communication import get_rank
++            logger.info(f"use balance_config: {self.balance_config}")
++            dp = self.balance_config.data_parallel
++            tp = self.balance_config.model_parallel
++            self.data_parallel_stage = (get_rank() // tp) % dp
++
++    def __len__(self) -> int:
++        """
++        Get total number of samples in the dataset.
++
++        Returns:
++            int: Total number of samples.
++        """
++        return self.total_length
++
++    def _load_datasets(self):
++        """
++        Load all datasets from file_list using IndexedDataset.
++        Record lengths and build offset table.
++        """
++        self.dataset_list = []
++        self.dataset_offsets = [0]
++        self.lengths = []  # Store the length of each dataset
++
++        for file_path in self.file_list:
++            # Create an IndexedDataset instance
++            dataset = IndexedDataset(
++                path_prefix=file_path,
++                multimodal=self.multimodal,
++                mmap=self.mmap
++            )
++            self.dataset_list.append(dataset)
++
++            # Record dataset length
++            dataset_length = len(dataset)
++            self.lengths.append(dataset_length)
++
++            # Update total length and offset
++            self.total_length += dataset_length
++            self.dataset_offsets.append(self.total_length)
++
++    def _compute_state_hash(self) -> str:
++        """
++        Compute SHA256 hash of dataset state to validate cache integrity.
++
++        Includes file list, lengths, and key settings.
++
++        Returns:
++            str: Hexadecimal hash string.
++        """
++        hasher = hashlib.sha256()
++
++        # Include file list and the length of each file
++        hasher.update(",".join(self.file_list).encode('utf-8'))
++        hasher.update(",".join(map(str, self.lengths)).encode('utf-8'))
++
++        # Include dataset configuration
++        hasher.update(str(self.multimodal).encode('utf-8'))
++        hasher.update(str(self.mmap).encode('utf-8'))
++
++        return hasher.hexdigest()
++
++    def _get_cache_key(self) -> str:
++        """
++        Generate cache key based on dataset state hash.
++
++        Returns:
++            str: Cache key.
++        """
++        return f"index_map_{self._compute_state_hash()}"
++
++    def _cache_file_path(self) -> Tuple[Optional[str], Optional[str]]:
++        """
++        Get file paths for disk cache (.npy for index map, .hash for state hash).
++
++        Returns:
++            Tuple[Optional[str], Optional[str]]: (index_path, hash_path), or (None, None) if no cache_dir.
++        """
++        if not self.cache_dir:
++            return None, None
++
++        os.makedirs(self.cache_dir, exist_ok=True)
++        cache_key = self._get_cache_key()
++        index_path = os.path.join(self.cache_dir, f"{cache_key}.npy")
++        hash_path = os.path.join(self.cache_dir, f"{cache_key}.hash")
++        return index_path, hash_path
++
++    def _load_cached_index_map(self) -> bool:
++        """
++        Attempt to load index map from memory or disk cache.
++
++        Returns:
++            bool: True if successfully loaded, False otherwise.
++        """
++        if not self.use_cache:
++            return False
++
++        cache_key = self._get_cache_key()
++        if cache_key in self._cache:
++            cached_map, cached_hash = self._cache[cache_key]
++            if cached_hash == self.state_hash:
++                self.index_map = cached_map
++                return True
++
++        index_path, hash_path = self._cache_file_path()
++        if index_path and os.path.exists(index_path) and hash_path and os.path.exists(hash_path):
++            try:
++                with open(hash_path, 'r') as f:
++                    cached_hash = f.read().strip()
++                if cached_hash != self.state_hash:
++                    return False
++
++                index_map = np.load(index_path)
++                if index_map.shape != (self.total_length, 2):
++                    return False
++
++                self.index_map = index_map
++                self._cache[cache_key] = (self.index_map, self.state_hash)
++                return True
++            except Exception as e:
++                print(f"Failed to load cache: {e}")
++                return False
++
++        return False
++
++    def _save_index_map_cache(self):
++        """
++        Save index map to memory and disk cache.
++        """
++        if not self.use_cache or self.index_map is None:
++            return
++
++        cache_key = self._get_cache_key()
++        index_path, hash_path = self._cache_file_path()
++
++        # Update in-memory cache
++        self._cache[cache_key] = (self.index_map, self.state_hash)
++
++        # Save to disk cache
++        if index_path and hash_path:
++            try:
++                # Save index map
++                np.save(index_path, self.index_map)
++
++                # Save state hash
++                with open(hash_path, 'w') as f:
++                    f.write(self.state_hash)
++            except Exception as e:
++                logger.info(f"Failed to save cache: {e}")
++
++    def _build_index_map(self):
++        """
++        Build a global index map: [global_idx] -> (dataset_idx, local_idx).
++        Uses cache if available.
++        """
++        # Compute the current state hash
++        self.state_hash = self._compute_state_hash()
++
++        # Try to load from cache
++        if self._load_cached_index_map():
++            logger.info("Using cached index map")
++            return
++
++        logger.info("Building new index map")
++
++        # Create a new index map
++        self.index_map = np.zeros((self.total_length, 2), dtype=np.int32)
++
++        global_idx = 0
++        for dataset_idx, dataset in enumerate(self.dataset_list):
++            dataset_length = len(dataset)
++            for local_idx in range(dataset_length):
++                self.index_map[global_idx, 0] = dataset_idx
++                self.index_map[global_idx, 1] = local_idx
++                global_idx += 1
++
++        # Save to cache
++        self._save_index_map_cache()
++
++    def __getitem__(self, index: int) -> Union[Tuple[np.ndarray, ...], object]:
++        """
++        Get a single sample by global index.
++
++        Processes the raw token sequence into tokens, labels, loss mask, position IDs,
++        and optionally attention mask.
++
++        Args:
++            index (int): Global dataset index.
++
++        Returns:
++            tuple: (tokens, labels, loss_mask, position_ids) or
++                   (tokens, labels, loss_mask, position_ids, attention_mask)
++        """
++        # src_index = index
++        if self.balance_config:
++            index = self._balance_index(index)
++            index = min(index, self.total_length - 1)
++        # print(f">>> input index: {src_index}, <<< output index: {index}")
++        return self._query_data(index)
++
++    def _query_data(self, index):
++        if index < 0:
++            index = self.total_length + index
++        if index < 0 or index >= self.total_length:
++            raise IndexError(f"Index {index} out of range [0, {self.total_length - 1}]")
++
++        dataset_idx = int(self.index_map[index, 0])
++        local_idx = int(self.index_map[index, 1])
++
++        text = self.dataset_list[dataset_idx][local_idx]  # equal to sequence length + 1
++
++        max_seq_length = self.config.sequence_length + 1
++        if len(text) > max_seq_length:
++            logger.warning(f"idx: {index} data got {len(text)} exceeds the configured "
++                           f"sequence length {self.config.sequence_length}, thus data will be "
++                           f"truncated to {self.config.sequence_length} + 1.")
++            text = text[:max_seq_length]
++        elif len(text) < max_seq_length:
++            logger.warning(f"idx: {index} data got {len(text)} shorter than the configured "
++                           f"sequence length {self.config.sequence_length}, thus data will be "
++                           f"padded to {self.config.sequence_length} + 1 with pad token: {self.config.pad_token}.")
++            text = np.pad(text, (0, max_seq_length - len(text)), 'constant', constant_values=self.config.pad_token)
++
++        tokens = text[:-1]
++        labels = text[1:]
++
++        attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
++            tokens,
++            self.config.eod_token,
++            self.config.reset_position_ids,
++            self.config.reset_attention_mask,
++            self.config.eod_mask_loss,
++            self.config.create_attention_mask,
++            self.config.create_compressed_eod_mask,
++            self.config.compressed_eod_mask_length,
++            self.config.create_seq_len_vector
++        )
++
++        # For padded sequences, mask the loss
++        loss_mask[labels == self.config.pad_token] = 0.0
++
++        # For padded sequences, ensure the embedding layer can map the token ID
++        tokens[tokens == self.config.pad_token] = 0
++        labels[labels == self.config.pad_token] = 0
++
++        if self.config.create_seq_len_vector:
++            return (
++                tokens.astype(np.int32),
++                labels.astype(np.int32),
++                loss_mask.astype(np.int32),
++                position_ids.astype(np.int32),
++                attention_mask.astype(np.int32),
++            )
++
++        if not (self.config.create_compressed_eod_mask and self.config.create_attention_mask):
++            return (
++                tokens.astype(np.int32),
++                labels.astype(np.int32),
++                loss_mask.astype(np.int32),
++                position_ids.astype(np.int32),
++            )
++        return (
++            tokens.astype(np.int32),
++            labels.astype(np.int32),
++            loss_mask.astype(np.int32),
++            position_ids.astype(np.int32),
++            attention_mask.astype(np.int32),
++        )
++
++    def __iter__(self):
++        """
++        Return iterator over the dataset (sequential scan).
++
++        Returns:
++            OrderedIndexDataset: Iterator.
++        """
++        self.current_file_index = 0
++        self.current_data_index = 0
++        return self
++
++    def __next__(self) -> np.ndarray:
++        """
++        Get next sample in sequential order. Loops infinitely.
++
++        Returns:
++            np.ndarray: Next token sequence.
++
++        Raises:
++            StopIteration: Only raised if no datasets are loaded.
++        """
++        # If no dataset is available, stop iteration
++        if not self.dataset_list:
++            raise StopIteration
++
++        # Loop through datasets until valid data is found or all datasets are exhausted
++        while self.current_file_index < len(self.dataset_list):
++            dataset = self.dataset_list[self.current_file_index]
++
++            # If the current dataset has remaining data
++            if self.current_data_index < len(dataset):
++                data = dataset[self.current_data_index]
++                self.current_data_index += 1
++                return data
++
++            # Current dataset is exhausted, move to the next one
++            self.current_file_index += 1
++            self.current_data_index = 0
++
++        # All datasets have been read; reset indices to restart from the beginning
++        self.current_file_index = 0
++        self.current_data_index = 0
++
++        # Start reading from the first sample of the first dataset
++        data = self.dataset_list[0][0]
++        self.current_data_index = 1
++        return data
++
++    def reset(self):
++        """
++        Reset sequential iterator to beginning.
++        """
++        self.current_file_index = 0
++        self.current_data_index = 0
++
++    def get_index_map(self) -> Tuple[np.ndarray, str]:
++        """
++        Get the global index map and its state hash.
++
++        Useful for external caching or inspection.
++
++        Returns:
++            Tuple[np.ndarray, str]: (index_map, state_hash)
++        """
++        return self.index_map, self.state_hash
++
++    def set_index_map(self, index_map: np.ndarray, state_hash: str):
++        """
++        Set a precomputed index map with validation.
++
++        Args:
++            index_map (np.ndarray): Shape (N, 2), where N == total_length.
++            state_hash (str): Must match current state_hash.
++
++        Raises:
++            ValueError: If hash mismatch or shape invalid.
++        """
++        if state_hash != self.state_hash:
++            raise ValueError("Provided state hash does not match current dataset state.")
++        if index_map.shape != (self.total_length, 2):
++            raise ValueError("Provided index map has incorrect shape.")
++        self.index_map = index_map
++
++    def _balance_index(self, index):
++        global_batch_size = int(self.balance_config.global_batch_size)
++        start_idx, local_idx = divmod(index, global_batch_size)
++        start_idx *= global_batch_size
++
++        # re-compute local_idx in pipeline parallel
++        # print(f"src_index: {local_idx}")
++        m, d = divmod(local_idx, self.balance_config.data_parallel)
++        local_idx = m + d * self.balance_config.micro_batch_num
++        # print(f"dst_index: {local_idx}")
++
++        # if (index - self.data_parallel_stage) % global_batch_size != 0:
++        #     return self.balanced_indices[local_idx] + start_idx
++
++        actual_seq_lens = []
++        for i in range(start_idx, start_idx + global_batch_size):
++            i = min(i, self.total_length - 1)
++            _, _, _, _, actual_seq_len = self._query_data(i)
++            actual_seq_lens.append(actual_seq_len)
++
++        balanced_indices = _balance_attention_load(
++            actual_seq_lens,
++            self.balance_config.data_parallel,
++            self.balance_config.micro_batch_num
++        )
++        return balanced_indices[local_idx] + start_idx
++
++
++def _get_eod_attention_mask(
++        data: np.ndarray,
++        eod_token: int,
++        compressed_eod_mask_length: int = 128
++) -> np.ndarray:
++    """
++    Generate compressed EOD-based attention mask for FlashAttention-like kernels.
++
++    Records positions of EOD tokens and pads to fixed length.
++
++    Args:
++        data (np.ndarray): Input token sequence.
++        eod_token (int): End-of-document token ID.
++        compressed_eod_mask_length (int): Fixed length for output.
++
++    Returns:
++        np.ndarray: Array of EOD positions padded to `compressed_eod_mask_length`.
++
++    Raises:
++        ValueError: If number of EOD tokens exceeds `compressed_eod_mask_length`.
++    """
++    seq_length = data.size
++    eod_positions = np.where(data == eod_token)[0] + 1  # EOD after the token
++    if len(data) > 0 and data[-1] == eod_token:
++        eod_positions = eod_positions[:-1]  # Do not include final EOD
++
++    if len(eod_positions) > compressed_eod_mask_length:
++        raise ValueError(
++            f"Number of EOD tokens ({len(eod_positions)}) exceeds "
++            f"compressed_eod_mask_length ({compressed_eod_mask_length})."
++        )
++
++    actual_seq_len = np.pad(
++        eod_positions,
++        (0, compressed_eod_mask_length - len(eod_positions)),
++        mode='constant',
++        constant_values=seq_length
++    )
++    return actual_seq_len
++
++
++def _get_ltor_masks_and_position_ids(
++        data: np.ndarray,
++        eod_token: int,
++        reset_position_ids: bool,
++        reset_attention_mask: bool,
++        eod_mask_loss: bool,
++        create_attention_mask: bool,
++        create_compressed_eod_mask: bool,
++        compressed_eod_mask_length: int,
++        create_seq_len_vector: bool
++) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
++    """
++    Generate left-to-right attention mask, loss mask, and position IDs.
++
++    Handles document boundaries via EOD tokens.
++
++    Args:
++        data (numpy.ndarray): The data tenor that holds the tokens from the dataset
++
++        eod_token (int): ID of the token to that is considered the EOD
++
++        reset_position_ids (bool): Switch to reset the document position ID's
++
++        reset_attention_mask (bool): Switch to reset the attention mask
++
++        eod_mask_loss (bool): Switch to enable the EOD mask loss
++
++        create_attention_mask (bool): Switch to enable the attention masks generation. Can be disabled if attention
++            kernel generates masks by itself.
++
++        create_compressed_eod_mask (bool): Use compressed EOD mask instead.
++
++        compressed_eod_mask_length (int): Max length for compressed mask.
++
++    Returns:
++        tuple: (attention_mask, loss_mask, position_ids)
++    """
++    seq_length = np.size(data)
++
++    if create_attention_mask and not create_compressed_eod_mask:
++        attention_mask = np.expand_dims(np.tril(np.ones((seq_length, seq_length))), axis=0)
++    else:
++        attention_mask = None
++
++    # Loss mask.
++    loss_mask = np.ones(seq_length, dtype=np.float32)
++    if eod_mask_loss:
++        loss_mask[data == eod_token] = 0.0
++
++    # Position ids.
++    position_ids = np.arange(seq_length, dtype=np.float32)
++    # We need to clone as the ids will be modified based on batch index.
++    import copy
++    if reset_position_ids:
++        position_ids = copy.deepcopy(position_ids)
++
++    eod_index = None
++    if reset_position_ids or reset_attention_mask:
++        # Find indices where EOD token is.
++        eod_index = position_ids[data == eod_token]
++        # Detach indices from positions if going to modify positions.
++
++        if reset_position_ids:
++            eod_index = copy.deepcopy(eod_index)
++
++        # Loop through EOD indices:
++        prev_index = 0
++        for j in range(np.size(eod_index)):
++            i = int(eod_index[j])
++            # Mask attention loss.
++            if reset_attention_mask and attention_mask is not None:
++                attention_mask[0, (i + 1):, : (i + 1)] = 0
++            # Reset positions.
++            if reset_position_ids:
++                position_ids[(i + 1):] -= i + 1 - prev_index
++                prev_index = i + 1
++
++    if attention_mask is not None:
++        # Convert attention mask to binary:
++        attention_mask = attention_mask < 0.5
++
++    if create_compressed_eod_mask:
++        # generate actual_seq_len
++        attention_mask = _get_eod_attention_mask(data, eod_token, compressed_eod_mask_length)
++
++    if create_seq_len_vector:
++        seq_len_vector = np.zeros(np.size(data))
++        segment_id = 0
++        for cur_idx in range(np.size(data)):
++            seq_len_vector[cur_idx] = segment_id
++            if data[cur_idx] == eod_token:
++                segment_id += 1
++        attention_mask = seq_len_vector
++
++    return attention_mask, loss_mask, position_ids
++
++
++def _balance_attention_load(actual_seq_lens, data_parallel, micro_batch_num):
++    # Compute attention load for each sequence:
++    # load = sum((len_i - len_{i-1})^2)
++    attn_load = []
++    for seq in actual_seq_lens:
++        # Add 0 at the beginning of seq to calculate the square of the first value
++        seq_with_zero = [0] + seq.tolist()
++        cur_load = sum((seq_with_zero[i] - seq_with_zero[i - 1]) ** 2 for i in range(1, len(seq_with_zero)))
++        attn_load.append(cur_load)
++    attn_load = np.array(attn_load)
++
++    # Balance loads using greedy partition
++    balanced_group, group_sums = _greedy_balanced_group(
++        attn_load,
++        data_parallel * micro_batch_num
++    )
++
++    # Reorder groups by ascending group load
++    indices = np.argsort(np.array(group_sums))
++    balanced_group = np.array(balanced_group)[indices].flatten()
++    # print("balanced group index:", balanced_group)
++    return balanced_group
++
++
++def _greedy_balanced_group(attn_load, k=None):
++    max_group_size = len(attn_load) // k
++
++    pairs = [(int(attn_load[i]), i) for i in range(len(attn_load))]
++    pairs.sort(key=lambda x: -x[0])
++
++    groups = [[] for _ in range(k)]
++    group_sums = np.zeros(k, dtype=np.int64)
++    group_sizes = np.zeros(k, dtype=int)
++
++    for value, idx in pairs:
++        best_group = None
++        best_sum = None
++
++        for g in range(k):
++            if group_sizes[g] < max_group_size:
++                if best_group is None or group_sums[g] < best_sum:
++                    best_group = g
++                    best_sum = group_sums[g]
++
++        groups[best_group].append(idx)
++        group_sums[best_group] += value
++        group_sizes[best_group] += 1
++
++    # for i in range(k):
++    #     print(f"Group {i + 1}: size={group_sizes[i]}, sum={group_sums[i]}, indices={groups[i]}")
++
++    return groups, group_sums
+diff --git a/mindformers/pynative/trainer/utils.py b/mindformers/pynative/trainer/utils.py
+index f8e0af9e0..15a976de4 100644
+--- a/mindformers/pynative/trainer/utils.py
++++ b/mindformers/pynative/trainer/utils.py
+@@ -36,6 +36,7 @@ from mindformers.dataset.dataloader.blended_megatron_dataloader import (
+     BlendedMegatronDatasetDataLoader,
+ )
+ from mindformers.dataset.dataloader.hf_dataloader import HFDataLoader
++from mindformers.dataset.dataloader.ordered_index_dataloader import OrderedIndexDataLoader
+ from mindformers.dataset.dataloader.utils import _get_mindrecord_files
+ from mindformers.pynative.optimizer.adamw import AdamW
+ from mindformers.pynative.optimizer import Muon
+@@ -386,6 +387,11 @@ def _build_dataset(
+         dataset = ms_dataset.MindDataset(**dataloader_config)
+         if 'actual_seq_len' in dataset.get_col_names():
+             create_compressed_eod_mask = True
++    elif dataloader_type == "OrderedIndexDataLoader":
++        dataset = OrderedIndexDataLoader(**dataloader_config)
++        create_compressed_eod_mask = dataloader_config.get('create_compressed_eod_mask', False)
++        if not create_compressed_eod_mask and 'config' in dataloader_config:
++            create_compressed_eod_mask = dataloader_config['config'].get('create_compressed_eod_mask', False)
+     else:
+         raise ValueError(f"Unsupported dataloader type: {dataloader_type}")
+ 
