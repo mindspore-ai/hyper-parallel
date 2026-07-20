@@ -310,6 +310,53 @@ class MemoryMonitorConfig:
 
 
 @dataclass
+class DryRunConfig:
+    """``train.dry_run.*`` — no-accelerator logical memory analysis.
+
+    ``world_size`` may be omitted when every parallel degree is explicit. If
+    ``dp_shard`` is automatic, the runner requires an explicit world size.
+    ``device_memory_gib`` is optional and only controls the report's OOM-risk
+    calculation; it never changes the simulated allocation.
+    """
+    enabled: bool = False
+    world_size: Optional[int] = None
+    rank: int = 0
+    device_type: Optional[str] = None
+    output_dir: str = "outputs/dry_run"
+    module_depth: int = 3
+    top_modules: int = 20
+    device_memory_gib: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.world_size is not None and self.world_size < 1:
+            raise ValueError(
+                f"dry_run.world_size must be >= 1, got {self.world_size}"
+            )
+        if self.rank < 0:
+            raise ValueError(f"dry_run.rank must be >= 0, got {self.rank}")
+        if self.device_type not in (None, "npu", "cuda"):
+            raise ValueError(
+                "dry_run.device_type must be 'npu', 'cuda', or null, "
+                f"got {self.device_type!r}"
+            )
+        if not isinstance(self.output_dir, str) or not self.output_dir.strip():
+            raise ValueError("dry_run.output_dir must not be empty")
+        if self.module_depth < 0:
+            raise ValueError(
+                f"dry_run.module_depth must be >= 0, got {self.module_depth}"
+            )
+        if self.top_modules < 0:
+            raise ValueError(
+                f"dry_run.top_modules must be >= 0, got {self.top_modules}"
+            )
+        if self.device_memory_gib is not None and self.device_memory_gib <= 0:
+            raise ValueError(
+                "dry_run.device_memory_gib must be > 0, "
+                f"got {self.device_memory_gib}"
+            )
+
+
+@dataclass
 class MonitorConfig:
     """``train.monitor.*`` — training-state monitor for loss / gradient scalars."""
     monitor_on: bool = False
@@ -405,6 +452,7 @@ class TrainConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     memory_monitor: MemoryMonitorConfig = field(default_factory=MemoryMonitorConfig)
+    dry_run: DryRunConfig = field(default_factory=DryRunConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     moe_monitor: MoEMonitorConfig = field(default_factory=MoEMonitorConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
@@ -577,6 +625,7 @@ def _validate_top_level(config: Dict[str, Any]) -> None:
         "wandb": "train.wandb",
         "profiler": "train.profile",
         "memory_monitor": "train.memory_monitor",
+        "dry_run": "train.dry_run",
         "moe_monitor": "train.moe_monitor",
         "eval": "train.eval",
         "runtime": "train (flatten init_device / backend / comm_backend)",

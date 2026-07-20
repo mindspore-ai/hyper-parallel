@@ -491,8 +491,14 @@ class TorchPlatform(Platform):
         Returns:
             str: The device type string ("npu" for NPU, "cuda" for GPU).
         """
-        device_handle = self.get_device_handle()
-        if device_handle == torch.npu:
+        try:
+            device_handle = self.get_device_handle()
+        except RuntimeError:
+            # CUDA-only wheels do not expose ``torch.npu``. Keep the default
+            # NPU behavior when that backend exists, but allow shape-only
+            # dry-run (and normal CUDA selection) without the extension.
+            return "cuda"
+        if hasattr(torch, "npu") and device_handle == torch.npu:
             return "npu"
         return "cuda"
 
@@ -727,14 +733,15 @@ class TorchPlatform(Platform):
         Returns:
             str: The operation name.
         """
-        if hasattr(func, "__name__"):
-            return func.__name__
         if isinstance(func, OpOverload):
-            full_name = func.name
+            full_name = func.name() if callable(func.name) else func.name
             core_name = full_name.split("::")[-1].split(".")[0]
             return core_name
         if isinstance(func, OpOverloadPacket):
-            return func.name.split("::")[-1]
+            full_name = func.name() if callable(func.name) else func.name
+            return full_name.split("::")[-1]
+        if hasattr(func, "__name__"):
+            return func.__name__
         func_str = str(func)
         if "built-in function" in func_str:
             return func_str.split()[-1].strip(">")
@@ -1336,6 +1343,28 @@ class TorchPlatform(Platform):
                 backend = "hccl"
             dist.init_process_group(backend=backend, init_method=init_method, timeout=timeout, world_size=world_size,
                                     rank=rank, store=store, pg_options=pg_options, device_id=device_id)
+
+    @staticmethod
+    def init_dry_run_process_group(world_size: int, rank: int) -> None:
+        """Initialize PyTorch's fake process group without peer processes.
+
+        Args:
+            world_size: Logical number of ranks to simulate.
+            rank: Logical rank represented by the current process.
+        """
+        # pylint: disable=C0415
+        from torch.testing._internal.distributed import fake_pg
+
+        # Importing PyTorch's fake_pg module registers the version-matched
+        # factory. In particular, newer releases require a private internal
+        # constructor while 2.7/2.9 use the factory shipped with that release.
+        del fake_pg
+        dist.init_process_group(
+            backend=dist.Backend.FAKE,
+            store=dist.HashStore(),
+            world_size=world_size,
+            rank=rank,
+        )
 
     @staticmethod
     def destroy_process_group(group: Optional[ProcessGroup] = None) -> None:

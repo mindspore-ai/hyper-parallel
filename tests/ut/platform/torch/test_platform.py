@@ -27,13 +27,14 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from tests.common.mark_utils import arg_mark
 from hyper_parallel.platform.torch.platform import TorchPlatform
 from hyper_parallel.platform.torch.dtensor import DTensorBase
 
 
 class TestTorchPlatformCore(unittest.TestCase):
     """Unit tests for TorchPlatform core functionality.
-    
+
     Tests cover device and distributed environment management,
     distributed communication primitives, parameter management,
     and tensor operations.
@@ -41,7 +42,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method.
-        
+
         Configures the environment and initializes the TorchPlatform instance.
         """
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -111,33 +112,36 @@ class TestTorchPlatformCore(unittest.TestCase):
             [(fake_dtensor, "local-shard"), (fake_dtensor._local_tensor, "local-shard")],
         )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     @mock.patch('hyper_parallel.platform.torch.platform.TorchPlatform.get_device_handle')
     def test_device_type(self, mock_get_device_handle):
-        """Test device type detection logic.
-        
-        Verifies that the platform correctly identifies different device types
-        (NPU and CUDA) based on the device handle.
-        
+        """Feature: Torch device-type detection.
+
+        Description: Resolve NPU and CUDA handles, including a wheel without torch.npu.
+        Expectation: Handles map to the correct backend and missing NPU support falls back to CUDA.
+
         Args:
             mock_get_device_handle: Mock for the get_device_handle method.
         """
         # Test NPU device
-        mock_get_device_handle.return_value = torch.npu
-        self.assertEqual(self.platform.device_type(), "npu")
+        fake_npu = object()
+        with patch.object(torch, "npu", fake_npu, create=True):
+            mock_get_device_handle.return_value = fake_npu
+            self.assertEqual(self.platform.device_type(), "npu")
 
         # Test CUDA device
         mock_get_device_handle.return_value = torch.cuda
         self.assertEqual(self.platform.device_type(), "cuda")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     @mock.patch('hyper_parallel.platform.torch.platform._get_default_group')
     @mock.patch('torch.distributed.init_process_group')
     def test_init_process_group(self, mock_init, mock_get_default):
-        """Test distributed process group initialization logic.
-        
-        Verifies that the platform properly initializes the distributed
-        environment when not already initialized, and avoids reinitialization
-        when already initialized.
-        
+        """Feature: Torch process-group initialization.
+
+        Description: Initialize with and without an existing default process group.
+        Expectation: Initialization occurs exactly once and never replaces an existing group.
+
         Args:
             mock_init: Mock for torch.distributed.init_process_group.
             mock_get_default: Mock for _get_default_group function.
@@ -155,14 +159,15 @@ class TestTorchPlatformCore(unittest.TestCase):
         TorchPlatform.init_process_group()
         mock_init.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     @mock.patch('hyper_parallel.platform.torch.platform.TorchPlatform.get_rank')
     @mock.patch('torch.distributed.new_group')
     def test_split_group(self, mock_new_group, mock_get_rank):
-        """Test process group splitting logic.
-        
-        Verifies that the platform correctly splits the default process group
-        into subgroups based on provided rank lists.
-        
+        """Feature: Torch process-group splitting.
+
+        Description: Split a logical rank list while no cached groups exist.
+        Expectation: Every subgroup is created and the current rank receives its group.
+
         Args:
             mock_new_group: Mock for torch.distributed.new_group.
             mock_get_rank: Mock for TorchPlatform.get_rank.
@@ -172,7 +177,8 @@ class TestTorchPlatformCore(unittest.TestCase):
         mock_new_group.return_value = mock_group
 
         split_ranks = [[0, 1], [2, 3], [4, 5], [6, 7]]
-        result = TorchPlatform.split_group(split_ranks=split_ranks)
+        with patch.object(TorchPlatform, "get_created_group", return_value=None):
+            result = TorchPlatform.split_group(split_ranks=split_ranks)
 
         self.assertEqual(mock_new_group.call_count, 4)
         self.assertEqual(result, mock_group)
@@ -184,13 +190,14 @@ class TestTorchPlatformCore(unittest.TestCase):
         with self.assertRaises(ValueError):
             TorchPlatform.split_group(split_ranks=None)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     @mock.patch('torch.distributed.nn.functional.all_gather')
     def test_differentiable_all_gather_concat(self, mock_all_gather):
-        """Test differentiable all_gather and concatenation logic.
-        
-        Verifies that the platform correctly performs all_gather operation
-        and concatenates results along the specified dimension.
-        
+        """Feature: Differentiable all-gather.
+
+        Description: Gather local tensors and concatenate the returned shards.
+        Expectation: The output shape and values follow the requested concatenation dimension.
+
         Args:
             mock_all_gather: Mock for torch.distributed.nn.functional.all_gather.
         """
@@ -209,13 +216,14 @@ class TestTorchPlatformCore(unittest.TestCase):
         expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
         self.assertTrue(torch.allclose(result, expected))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     @mock.patch('torch.distributed.nn.functional.all_reduce')
     def test_differentiable_all_reduce(self, mock_all_reduce):
-        """Test differentiable all_reduce logic.
-        
-        Verifies that the platform correctly performs all_reduce operation
-        with the specified reduction operation.
-        
+        """Feature: Differentiable all-reduce.
+
+        Description: Reduce a tensor with the requested logical operation.
+        Expectation: The operation and process group are forwarded to Torch correctly.
+
         Args:
             mock_all_reduce: Mock for torch.distributed.nn.functional.all_reduce.
         """
@@ -227,15 +235,16 @@ class TestTorchPlatformCore(unittest.TestCase):
         result = TorchPlatform.differentiable_all_reduce(tensor, op='sum', group=None)
         self.assertTrue(torch.allclose(result, mock_result))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     @mock.patch('torch.distributed.nn.functional.reduce_scatter')
     @mock.patch('torch.chunk')
     @mock.patch('torch.empty')
     def test_differentiable_reduce_scatter(self, mock_empty, mock_chunk, mock_reduce_scatter):
-        """Test differentiable reduce_scatter logic.
-        
-        Verifies that the platform correctly performs reduce_scatter operation
-        with both sum and average reduction operations.
-        
+        """Feature: Differentiable reduce-scatter.
+
+        Description: Reduce and scatter input chunks for sum and average operations.
+        Expectation: Torch receives the correct chunks, group, and reduction mode.
+
         Args:
             mock_empty: Mock for torch.empty.
             mock_chunk: Mock for torch.chunk.
@@ -264,13 +273,14 @@ class TestTorchPlatformCore(unittest.TestCase):
         expected_avg = torch.tensor([3.0, 7.0])  # sum / 2
         self.assertTrue(torch.allclose(result, expected_avg))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     @mock.patch('torch.distributed.all_reduce')
     def test_all_reduce_non_contiguous(self, mock_all_reduce):
-        """Test all_reduce handling of non-contiguous tensors.
-        
-        Verifies that the platform correctly handles non-contiguous tensors
-        by converting them to contiguous before performing all_reduce.
-        
+        """Feature: Non-contiguous all-reduce.
+
+        Description: Reduce a non-contiguous tensor through the platform wrapper.
+        Expectation: A contiguous buffer is reduced and copied back to the original view.
+
         Args:
             mock_all_reduce: Mock for torch.distributed.all_reduce.
         """
@@ -442,11 +452,12 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertTrue(torch.allclose(output_buffer, torch.ones_like(output_buffer)))
         self.assertTrue(torch.allclose(x.grad, torch.zeros_like(x)))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_search_parameter_by_name(self):
-        """Test parameter search by name logic.
-        
-        Verifies that the platform correctly searches for parameters
-        in nested model structures using dot notation.
+        """Feature: Parameter lookup.
+
+        Description: Search nested model parameters using a dotted name.
+        Expectation: Existing parameters are returned and missing paths are handled consistently.
         """
 
         # Create nested model structure
@@ -479,11 +490,12 @@ class TestTorchPlatformCore(unittest.TestCase):
         result = TorchPlatform.search_parameter_by_name(model, "non_existent")
         self.assertIsNone(result)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_update_parameter_by_name(self):
-        """Test parameter update by name logic.
-        
-        Verifies that the platform correctly updates model parameters
-        using the result from search_parameter_by_name.
+        """Feature: Parameter replacement.
+
+        Description: Replace a nested model parameter selected by dotted name.
+        Expectation: The target parameter is updated without changing unrelated parameters.
         """
 
         class SimpleModel(torch.nn.Module):
@@ -501,15 +513,16 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertIsNot(model.weight, old_param)
         self.assertIs(model.weight, new_param)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     @mock.patch('hyper_parallel.platform.torch.platform.Parameter')
     @mock.patch('hyper_parallel.core.dtensor.dtensor.DTensor.from_local')
     @mock.patch('hyper_parallel.core.dtensor.layout._get_slice_tensor_by_layout')
     def test_set_layout_into_parameter(self, mock_get_slice, mock_dtensor_from_local, mock_parameter):
-        """Test parameter layout setting logic.
-        
-        Verifies that the platform correctly sets tensor layouts into parameters
-        and handles error cases appropriately.
-        
+        """Feature: Parameter layout assignment.
+
+        Description: Apply a DTensor layout to a parameter and exercise invalid inputs.
+        Expectation: Valid layouts create the expected local shard and invalid layouts fail clearly.
+
         Args:
             mock_get_slice: Mock for _get_slice_tensor_by_layout function.
             mock_dtensor_from_local: Mock for DTensor.from_local method.
@@ -540,11 +553,12 @@ class TestTorchPlatformCore(unittest.TestCase):
 
             TorchPlatform.set_layout_into_parameter(MagicMock(spec=DTensor), mock_layout)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_cast_fp_tensor(self):
-        """Test floating-point tensor type casting logic.
-        
-        Verifies that the platform correctly casts tensors to different
-        floating-point types and handles edge cases.
+        """Feature: Floating-point tensor casting.
+
+        Description: Cast floating and non-floating tensor values through the platform helper.
+        Expectation: Eligible tensors change dtype and ineligible values remain unchanged.
         """
         # Test different floating point type conversions
         tensor32 = torch.randn(2, 2, dtype=torch.float32)
@@ -565,11 +579,12 @@ class TestTorchPlatformCore(unittest.TestCase):
         result = self.platform.cast_fp_tensor(torch.float32, non_tensor)
         self.assertIs(result, non_tensor)  # Should return the same object
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_apply_to_tensors(self):
-        """Test recursive tensor processing logic.
-        
-        Verifies that the platform correctly applies functions recursively
-        to tensors within nested data structures.
+        """Feature: Recursive tensor transformation.
+
+        Description: Apply a function to tensors nested in common Python containers.
+        Expectation: Every tensor is transformed while container structure and scalar values remain intact.
         """
         # Create test data with different container types
         test_data = {

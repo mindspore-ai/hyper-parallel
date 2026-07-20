@@ -173,16 +173,26 @@ class BaseTrainer:
         Calls hyper's own ``init_process_group`` and ``init_device_mesh``.
         Mesh shape is derived from ``args.parallel`` (dp, tp, cp, pp, ep).
         """
-        self._apply_pre_init_deterministic_env()
-        backend = self.args.train.comm_backend
-        init_process_group(backend=backend)
+        dry_run_cfg = getattr(self.args.train, "dry_run", None)
+        dry_run_enabled = bool(dry_run_cfg and dry_run_cfg.enabled)
+        if not dry_run_enabled:
+            self._apply_pre_init_deterministic_env()
+        if dry_run_enabled:
+            platform.init_dry_run_process_group(
+                world_size=dry_run_cfg.world_size,
+                rank=dry_run_cfg.rank,
+            )
+        else:
+            backend = self.args.train.comm_backend
+            init_process_group(backend=backend)
 
         local_rank = self.args.train.local_rank
         device_type = platform.device_type()  # "npu" or "cuda"
         # Use platform.device(idx) — backend-agnostic.
         self.device = platform.device(local_rank)
-        device_handle = platform.get_device_handle(device_type)
-        device_handle.set_device(local_rank)
+        if not dry_run_enabled:
+            device_handle = platform.get_device_handle(device_type)
+            device_handle.set_device(local_rank)
 
         # Build & validate parallel dims in one place (fail-fast).
 
@@ -226,21 +236,22 @@ class BaseTrainer:
             group_name="trainer_dp", group=dp_group, rank_size=dp_size,
         )
 
-        seed = self.args.train.seed
-        platform.manual_seed(seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        # ``platform.manual_seed`` only covers CPU; seed the device RNG too.
-        try:
-            handle = platform.get_device_handle(device_type)
-            if hasattr(handle, "manual_seed_all"):
-                handle.manual_seed_all(seed)
-            elif hasattr(handle, "manual_seed"):
-                handle.manual_seed(seed)
-        except Exception as exc:  # pylint: disable=W0718
-            logger.warning("Device-side seed init skipped: %s", exc)
+        if not dry_run_enabled:
+            seed = self.args.train.seed
+            platform.manual_seed(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+            # ``platform.manual_seed`` only covers CPU; seed the device RNG too.
+            try:
+                handle = platform.get_device_handle(device_type)
+                if hasattr(handle, "manual_seed_all"):
+                    handle.manual_seed_all(seed)
+                elif hasattr(handle, "manual_seed"):
+                    handle.manual_seed(seed)
+            except Exception as exc:  # pylint: disable=W0718
+                logger.warning("Device-side seed init skipped: %s", exc)
 
-        if self._deterministic:
+        if self._deterministic and not dry_run_enabled:
             warn_only = self.args.train.debug.deterministic_warn_only
             torch.use_deterministic_algorithms(True, warn_only=warn_only)
             torch.backends.cudnn.deterministic = True
@@ -730,7 +741,11 @@ class BaseTrainer:
         random.
         """
         init_device = self.args.train.init_device
-        weights_path = self.args.model.weights_path
+        weights_path = (
+            None
+            if getattr(getattr(self.args.train, "dry_run", None), "enabled", False)
+            else self.args.model.weights_path
+        )
         if init_device == "meta":
             # Always materialize first (random init baseline) so no param
             # stays on meta — then overlay the checkpoint.
@@ -1004,7 +1019,7 @@ class BaseTrainer:
                 "Mixed precision via FSDP2 mp_policy: param=%s reduce=%s on %s",
                 mp_cfg.param_dtype,
                 mp_cfg.reduce_dtype,
-                platform.device_type(),
+                self.device.type,
             )
 
     def _init_callbacks(self):
@@ -1034,7 +1049,7 @@ class BaseTrainer:
         logger.info_rank0(
             "Callbacks initialized: logging, checkpoint, hf_export, eval, "
             "profiler, wandb, tensorboard, progress, moe_monitor, "
-            "training_state_monitor, " 
+            "training_state_monitor, "
             "gradient_health, memory_monitor, gc"
         )
 
@@ -2034,17 +2049,27 @@ class BaseTrainer:
         This is the meta-init path used after ``fully_shard`` has installed
         FSDP views.
         """
-        device_type = platform.device_type()
+        dry_run_enabled = bool(
+            getattr(getattr(self.args.train, "dry_run", None), "enabled", False)
+        )
+        device_type = self.device.type if dry_run_enabled else platform.device_type()
         # Step 1: meta → real storage, in-place (FSDP-views preserved).
         self.model.to_empty(device=device_type)
         self._materialize_replicate_params(device_type)
         # Step 2: init the local shard of every param (and zero every buffer).
-        param_count = self._init_local_shards()
+        if dry_run_enabled:
+            # Fake tensors carry shape/dtype/device only. Random initialization
+            # is unnecessary and may ask a CPU-only Torch build for a real
+            # CUDA/NPU generator before FakeTensorMode can intercept the op.
+            param_count = sum(1 for _ in self.model.parameters())
+        else:
+            param_count = self._init_local_shards()
         # Re-derive buffers wiped by ``to_empty`` (e.g. ``inv_freq``);
         # without this RoPE silently returns identity rotation.
-        for module in self.model.modules():
-            if hasattr(module, "reset_inv_freq"):
-                module.reset_inv_freq()
+        if not dry_run_enabled:
+            for module in self.model.modules():
+                if hasattr(module, "reset_inv_freq"):
+                    module.reset_inv_freq()
         # Re-tie weights — ``to_empty`` gives every nn.Parameter fresh
         # storage so ``__init__``-time ties are broken. Must happen before
         # ``lazy_init`` re-wraps params as DTensor (non-leaf), which would

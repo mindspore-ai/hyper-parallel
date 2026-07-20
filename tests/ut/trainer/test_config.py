@@ -43,9 +43,11 @@ from typing import Optional
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
+from tests.common.mark_utils import arg_mark
 from hyper_parallel.trainer.config import (
     AcceleratorConfig,
     DataConfig,
+    DryRunConfig,
     HyperTrainerConfig,
     ModelConfig,
     MonitorConfig,
@@ -225,8 +227,13 @@ class TestHyperTrainerConfigPostInit(unittest.TestCase):
             f"train_steps must mirror train.max_steps, got {cfg.train_steps}"
         ))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_defaults_are_strict_three_tier(self):
-        """Default construction holds the three top-level slots: model/data/train."""
+        """Feature: Trainer configuration defaults.
+
+        Description: Construct the strict three-tier configuration without overrides.
+        Expectation: Nested sections include a disabled dry-run configuration with documented defaults.
+        """
         cfg = HyperTrainerConfig()
         self.assertIsInstance(cfg.model, ModelConfig)
         self.assertIsInstance(cfg.data, DataConfig)
@@ -234,6 +241,29 @@ class TestHyperTrainerConfigPostInit(unittest.TestCase):
         self.assertIsInstance(cfg.train.accelerator, AcceleratorConfig)
         self.assertEqual(cfg.train.accelerator.moe_token_dispatcher_type, "all_to_all")
         self.assertEqual(cfg.train.accelerator.npu_nums_per_device, 8)
+        self.assertIsInstance(cfg.train.dry_run, DryRunConfig)
+        self.assertFalse(cfg.train.dry_run.enabled)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_dry_run_rejects_invalid_values(self):
+        """Feature: Dry-run configuration validation.
+
+        Description: Construct dry-run configurations with invalid boundary values.
+        Expectation: Every invalid value raises ValueError during construction.
+        """
+        invalid_kwargs = (
+            {"world_size": 0},
+            {"rank": -1},
+            {"device_type": "cpu"},
+            {"output_dir": ""},
+            {"module_depth": -1},
+            {"top_modules": -1},
+            {"device_memory_gib": 0},
+        )
+        for kwargs in invalid_kwargs:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    DryRunConfig(**kwargs)
 
     def test_monitor_defaults(self):
         """Monitor scalar-output config defaults are disabled and non-invasive."""
@@ -341,6 +371,43 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.train.accelerator.ep, 4)
         self.assertEqual(cfg.train.accelerator.moe_token_dispatcher_type, "deredundency")
         self.assertEqual(cfg.train.accelerator.npu_nums_per_device, 2)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_dry_run_yaml_plus_cli_override(self):
+        """Feature: Dry-run configuration parsing.
+
+        Description: Parse nested YAML fields and override selected values from the CLI.
+        Expectation: CLI values take precedence while untouched YAML values remain intact.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            yaml_path = os.path.join(tmp, "cfg.yaml")
+            self._write_yaml(
+                """
+                train:
+                  dry_run:
+                    enabled: false
+                    world_size: 4
+                    rank: 1
+                    device_type: npu
+                    output_dir: reports
+                """,
+                yaml_path,
+            )
+            sys.argv = [
+                "prog",
+                yaml_path,
+                "--train.dry_run.enabled=true",
+                "--train.dry_run.rank=3",
+                "--train.dry_run.device_memory_gib=64.0",
+            ]
+            cfg = parse_args(HyperTrainerConfig)
+
+        self.assertTrue(cfg.train.dry_run.enabled)
+        self.assertEqual(cfg.train.dry_run.world_size, 4)
+        self.assertEqual(cfg.train.dry_run.rank, 3)
+        self.assertEqual(cfg.train.dry_run.device_type, "npu")
+        self.assertEqual(cfg.train.dry_run.output_dir, "reports")
+        self.assertEqual(cfg.train.dry_run.device_memory_gib, 64.0)
 
     def test_invalid_bool_string_in_cli_raises(self):
         """An unrecognised bool alias on a bool field must surface a ValueError.

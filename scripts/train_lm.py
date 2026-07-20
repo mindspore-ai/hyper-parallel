@@ -26,6 +26,7 @@ No edit to this file is required. Create
 for the resolution rules (built-in vs. fully-qualified external package).
 """
 # pylint: disable=wrong-import-position
+import logging
 import os
 
 # Pin the backend before importing hyper_parallel because platform objects are
@@ -41,6 +42,9 @@ init_logger()
 from hyper_parallel.trainer.config import parse_args, HyperTrainerConfig
 from hyper_parallel.trainer.utils.discovery import discover_model_spec
 from hyper_parallel.trainer.llm_trainer import LLMTrainer
+from hyper_parallel.platform.torch.dry_run import TorchDryRunRunner
+
+logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     args = parse_args(HyperTrainerConfig)
@@ -49,5 +53,9 @@ if __name__ == "__main__":
     # global registry that ``BaseTrainer.__init__`` then queries via
     # ``get_spec(args.model.name)``.
     discover_model_spec(args.model.name)
-    trainer = LLMTrainer(args)
-    trainer.train()
+    if args.train.dry_run.enabled:
+        report_path = TorchDryRunRunner(args).run()
+        logger.info("HyperDryRun report: %s", report_path)
+    else:
+        trainer = LLMTrainer(args)
+        trainer.train()

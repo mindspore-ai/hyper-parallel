@@ -504,7 +504,12 @@ class HSDPParamGroup:
         """
         if self._flat_param_buffer is None or len(self.hsdp_params) == 0:
             return False
-        return self.hsdp_params[0]._sharded_param_data.data_ptr() == self._flat_param_buffer.data_ptr()
+        param_data = self.hsdp_params[0]._sharded_param_data
+        # pylint: disable=C0415
+        from torch._subclasses.fake_tensor import FakeTensor
+        if isinstance(param_data, FakeTensor):
+            return param_data.untyped_storage() is self._flat_param_buffer.untyped_storage()
+        return param_data.data_ptr() == self._flat_param_buffer.data_ptr()
 
     def unshard(self, async_op: bool = False):
         """Trigger fused all-gather to reconstruct full parameters from shards.

@@ -23,7 +23,8 @@ from .parallel_ops import DistributedOp
 
 
 _INPLACE_ELEMENTWISE_OPS = frozenset({
-    "add_", "sub_", "InplaceAddExt", "InplaceSubExt",
+    "add_", "sub_", "lerp_", "addcmul_", "addcdiv_",
+    "InplaceAddExt", "InplaceSubExt",
 })
 
 

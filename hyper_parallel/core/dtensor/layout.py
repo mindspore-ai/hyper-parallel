@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -208,7 +208,10 @@ class Layout:
         result = cls.__new__(cls)
         memo[id(self)] = result
         for k, v in self.__dict__.items():
-            setattr(result, k, copy.deepcopy(v, memo))
+            # DeviceMesh topology/process groups are immutable for a Layout.
+            # Sharing the mesh also avoids copying its real CPU rank tensor
+            # while FakeTensorMode is active during dry-run materialization.
+            setattr(result, k, v if k == "_mesh" else copy.deepcopy(v, memo))
         return result
 
     @staticmethod

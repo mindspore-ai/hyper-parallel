@@ -1195,6 +1195,22 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement init_process_group")
 
     @staticmethod
+    def init_dry_run_process_group(world_size: int, rank: int) -> None:
+        """Initialize a single-process fake distributed topology.
+
+        Args:
+            world_size: Logical number of ranks to simulate.
+            rank: Logical rank represented by the current process.
+
+        Raises:
+            NotImplementedError: When the selected backend has no fake process
+                group implementation.
+        """
+        raise NotImplementedError(
+            "Dry-run process groups are not supported by this platform"
+        )
+
+    @staticmethod
     def destroy_process_group(group=None) -> None:
         """
         Destroy a given process group.
