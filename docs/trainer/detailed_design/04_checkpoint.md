@@ -64,12 +64,12 @@ main() → recipe.setup(cfg)                                           # 01_hf_c
 │       ├─ adapter.to_hf → dcp.load → adapter.from_hf                #   key 对齐 checkpoint
 │       └─ model_state.load_state_dict(state_dict)
 │   │
-│   └─ checkpointer.load_optimizer(self.model_parts, optimizer, ...) # 恢复优化器状态
+│   └─ checkpointer.load_optimizer(self.model_parts, optimizers, ...) # 恢复优化器状态（list，与 03 §3.1 canonical 对齐）
 │   └─ load LR scheduler / RNG / DataLoader state                    # 恢复其他组件
 │
 └─⑤ recipe.run_train_validation_loop()                               # 训练循环
     │
-    └─ if is_ckpt_step: self.save_checkpoint(...)                     # §? BaseRecipe: 遍历 __state_tracked
+    └─ if is_ckpt_step: self.save_checkpoint(...)                     # 03 §3 BaseRecipe: 遍历 __state_tracked
         │
         ├─ checkpointer.save_model(model, f"{path}/model")            # §4.2: 保存路径
         │   │
@@ -94,7 +94,7 @@ main() → recipe.setup(cfg)                                           # 01_hf_c
         │   └─ consolidate_safetensors_files_on_every_rank(...)       # §4.2: 合并导出 HF safetensors
         │       └─ 每 rank 并行写自己的 shard → 最终合并为 .safetensors 文件
         │
-        └─ checkpointer.save_optimizer(model, optimizer, f"{path}/optimizer")    # §5: OptimizerState → DCP（与 _state_path 同源）
+        └─ checkpointer.save_optimizer(model, optimizers, f"{path}/optimizer")    # §5: OptimizerState → DCP（与 _state_path 同源；optimizers 为 list，03 §3.1 canonical）
 
 ── 模型初始化路径（from_pretrained 内部）──
 
@@ -132,7 +132,7 @@ main()                                  # 01 §4
 │   ├─④.7  checkpointer = ...          # 本文档 §3/§4 (初始化)
 │   ├─④.8  model = from_pretrained()   # 01 §6
 │   │   └─ load_base_model()           # 本文档 §4.3/§4.4 (权重加载)
-│   └─④.13 load_checkpoint()           # 本文档 §7 (断点续训恢复)
+│   └─④.13 load_checkpoint()           # 本文档 §8 (断点续训恢复)
 └─⑤ run_train_validation_loop()        # 03_training_loop.md §6
     └─ save_checkpoint()               # 本文档 §4.2 (保存)
 ```
@@ -142,32 +142,35 @@ main()                                  # 01 §4
 ## 3. Checkpoint 目录结构
 
 ```
-{checkpoint_dir}/epoch_0_step_100/
-├── model/
-│   ├── dp_rank_0/
-│   │   └── __0_0.distcp           ← DCP 切分权重（per-rank shard）
-│   ├── dp_rank_1/
-│   │   └── __1_0.distcp
-│   ├── consolidated/              ← 可选：HF 兼容合并导出
-│   │   ├── model-00001-of-00002.safetensors
-│   │   ├── model-00002-of-00002.safetensors
-│   │   └── model.safetensors.index.json
-│   ├── .hf_metadata/
-│   │   ├── config.json            ← 模型配置
-│   │   └── tokenizer.json         ← Tokenizer 配置
-│   └── consolidate.sh             ← 离线合并脚本（由 _write_consolidate_script 写入 model/ 目录下）
-├── optimizer/
-│   ├── dp_rank_0/
-│   │   └── __0_0.distcp           ← DCP optimizer state (per-rank)
-│   └── dp_rank_1/
-│       └── __1_0.distcp
-├── dataloader/
-│   └── dataloader_dp_rank_0.pt
-├── rng/
-│   └── rng_dp_rank_0.pt
-├── scheduler.pt                   ← LR scheduler state (rank 0)
-├── extra_state.json               ← global_step + epoch
-└── LATEST → epoch_0_step_100/     ← 软链接指向最新 checkpoint
+{checkpoint_dir}/
+├── epoch_0_step_100/
+│   ├── model/
+│   │   ├── dp_rank_0/
+│   │   │   └── __0_0.distcp           ← DCP 切分权重（per-rank shard）
+│   │   ├── dp_rank_1/
+│   │   │   └── __1_0.distcp
+│   │   ├── consolidated/              ← 可选：HF 兼容合并导出
+│   │   │   ├── model-00001-of-00002.safetensors
+│   │   │   ├── model-00002-of-00002.safetensors
+│   │   │   └── model.safetensors.index.json
+│   │   ├── .hf_metadata/
+│   │   │   ├── config.json            ← 模型配置
+│   │   │   └── tokenizer.json         ← Tokenizer 配置
+│   │   └── consolidate.sh             ← 离线合并脚本（由 _write_consolidate_script 写入 model/ 目录下）
+│   ├── optimizer/
+│   │   ├── dp_rank_0/
+│   │   │   └── __0_0.distcp           ← DCP optimizer state (per-rank)
+│   │   └── dp_rank_1/
+│   │       └── __1_0.distcp
+│   ├── dataloader/
+│   │   └── dataloader_dp_rank_0.pt
+│   ├── rng/
+│   │   └── rng_dp_rank_0.pt
+│   ├── scheduler.pt                   ← LR scheduler state (rank 0)
+│   └── extra_state.json               ← global_step + epoch
+└── LATEST → epoch_0_step_100          ← 软链接指向最新 checkpoint（存相对路径，见 03 §7.1
+                                         ``_update_latest_symlink``；位于 checkpoint_dir 根，
+                                         不在 step 目录内部）
 ```
 
 ---
@@ -356,6 +359,12 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self._moe_mesh = moe_mesh
+        # 注（06 D-10 口径）：主 mesh 不含 EP 轴，expert mesh 由
+        # apply_sharding_plan 期派生（sharding_applier._build_expert_mesh）
+        # 且当前代码未导出——非 MoE 或 EP=1 时本参数为 None；MoE 模型的
+        # consolidated 导出（adapter.to_hf(device_mesh=...)）需要派生
+        # expert mesh 时，需先在 sharding 层暴露该 mesh 再在 Recipe.setup
+        # 注入。这是已知的待落地缺口，不影响非 MoE 路径。
 
         # 异步上下文
         self._async_model_future = None
@@ -446,8 +455,8 @@ def save_model(
     else:
         writer = FileSystemWriter(weights_path)
 
-    # ⑨ DCP 保存
-    self._do_save(state_dict, weights_path, writer)
+    # ⑨ DCP 保存（model 的异步 future 写入 _async_model_future）
+    self._do_save(state_dict, weights_path, writer, future_slot="_async_model_future")
 
     # ⑩ Addon post-save
     for addon in self._addons:
@@ -463,9 +472,12 @@ def save_model(
 def _should_write_consolidated(self, is_final: bool) -> bool:
     """判断是否需要导出 consolidated HF safetensors。
 
-    ``save_consolidated="final"`` 仅在 ``is_final=True`` 时触发——03
-    ``save_checkpoint`` 在训练结束调用 ``save_model`` 时必须传
-    ``is_final_checkpoint=True``，否则 final 模式永不触发 consolidated 导出。
+    ``save_consolidated="final"`` 仅在 ``is_final=True`` 时触发。
+    调用侧契约（与 03 ``save_checkpoint`` 新签名一致）：03 的
+    ``save_checkpoint(..., is_final_checkpoint=False)`` 将
+    ``is_final_checkpoint`` 透传给 ``save_model``——训练结束的 final save
+    传 ``True``，周期 save 使用默认 ``False``，final 模式因此只在训练
+    结束时触发一次 consolidated 导出。
     """
     mode = self.config.save_consolidated
     if mode == SaveConsolidatedMode.EVERY:
@@ -475,13 +487,21 @@ def _should_write_consolidated(self, is_final: bool) -> bool:
     return False
 
 
-def _do_save(self, state_dict: dict, path: str, writer) -> None:
+def _do_save(self, state_dict: dict, path: str, writer, *,
+             future_slot: str = "_async_model_future") -> None:
     """执行 DCP 保存。
 
     dtensor_metadata 不进入 DCP SavePlan（torch 原生 ``SavePlan`` 不接受自定义
     字段），改写入 sidecar JSON（``{path}/.dtensor_metadata.json``），供外部
     审查工具与 ShardingPlan validate 模式消费。DCP 原生重分片由 DTensor 内部
     placements + mesh 元数据驱动，不依赖此 sidecar。
+
+    async 契约（唯一一套）：``dcp.async_save``（torch >= 2.3，与
+    ``CheckpointingConfig.is_async`` 的版本断言一致）返回
+    ``torch.futures.Future``，本方法将其写入 ``future_slot`` 指定的实例
+    属性——model 保存用 ``_async_model_future``、optimizer 保存用
+    ``_async_optim_future``。若两处共用同一属性，save_optimizer 会覆盖
+    model 的 future，``async_wait`` 将等不到 optimizer 保存完成。
 
     DTensorMetadata 定义见 §7。
     """
@@ -504,14 +524,15 @@ def _do_save(self, state_dict: dict, path: str, writer) -> None:
 
     # ② DCP 保存（torch 原生 SavePlan 由 DCP 内部构造，用户只传 state_dict）
     if self.config.is_async and self._async_stager is not None:
-        # 异步保存
-        self._async_model_future = dcp.async_save(
+        # 异步保存：dcp.async_save 返回 torch.futures.Future，写入 future_slot
+        future = dcp.async_save(
             state_dict,
             checkpoint_id=path,
             storage_writer=writer,
             process_group=self._saving_pg,
             async_stager=self._async_stager,
         )
+        setattr(self, future_slot, future)
     else:
         dcp.save(
             state_dict,
@@ -546,6 +567,16 @@ def load_model(
         model: 单个模型或 PP 多 stage 的 model_parts 列表。
         model_path: DCP checkpoint 目录。
         allow_checkpoint_key_subset: 加载时是否允许 checkpoint key 为模型 key 的子集。
+
+    PP key 集合一致性（方案 a）：save 侧（03 save_checkpoint）保存的是单个
+    ``self.model`` 的全模型 key 集合，而 load 侧传入 ``model_parts`` 列表、
+    ``ModelState.state_dict()`` 逐 part 收集模板——合并模板与 checkpoint 的
+    key 集合天然一致（同一全模型）。加载时 ``ModelState.load_state_dict``
+    先对合并 key 集合做 strict 校验，再按 part 过滤子集、逐 part 以
+    ``strict=False`` 的 ``set_model_state_dict`` 分发（每个 part 只取自己的
+    key，合并 dict 是其超集）。选 (a) 而非 (b)（save 侧按 part 分文件存）
+    的理由：保持磁盘格式与 PP 拓扑无关，单卡保存的 checkpoint 可直接用于
+    PP 恢复（与跨配置重分片语义一致，见 §7.1）。
     """
     model_state = ModelState(
         model,
@@ -756,13 +787,18 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> dict:
 
 ```python
 def async_wait(self) -> None:
-    """等待上一次异步保存完成（model + optimizer）。"""
+    """等待上一次异步保存完成（model + optimizer）。
+
+    async 契约（唯一一套，旧 ``persist_completion`` 防御分支已删除）：
+    ``dcp.async_save``（torch >= 2.3）返回 ``torch.futures.Future``，
+    ``async_wait`` 对每个 future 调 ``.result()`` 阻塞至磁盘 upload 完成。
+    旧 fork 的 ``AsyncSaveResponse.persist_completion`` 分支废弃——本仓库
+    只以 torch 原生 async_save 为准（与 ``CheckpointingConfig.is_async``
+    的 torch >= 2.3 版本断言一致）。
+    """
     for future in (self._async_model_future, self._async_optim_future):
         if future is not None:
-            if hasattr(future, 'persist_completion'):
-                future.persist_completion.result()  # AsyncSaveResponse
-            else:
-                future.result()  # Future
+            future.result()
     self._async_model_future = None
     self._async_optim_future = None
 
@@ -876,45 +912,93 @@ class ModelState:
         elif self.is_peft:
             self._load_peft_state_dict(state_dict)
         else:
+            # PP key 集合修复（方案 a，理由见 §5.3 load_model 注释）：
+            # save 侧（03 save_checkpoint）存的是 self.model 全模型 key，
+            # load 侧传入 model_parts 列表。此处先合并校验、再按 part 过滤分发。
+            if strict:
+                # strict 语义在合并层面校验：state_dict 须覆盖所有 part 的 key
+                missing: set[str] = set()
+                for part in self.model:
+                    missing |= set(part.state_dict().keys()) - set(state_dict.keys())
+                if missing:
+                    raise KeyError(
+                        f"Missing keys in checkpoint state_dict: {sorted(missing)}"
+                    )
             for part in self.model:
                 # 材质化缺失的 tied lm_head
                 if self.uses_tied_lm_head:
                     materialize_missing_tied_lm_head(part, state_dict)
-                set_model_state_dict(part, model_state_dict=state_dict, options=StateDictOptions(strict=strict))
+                # 每个 part 只取自己的 key 子集——合并 state_dict 是各 part
+                # key 的超集，逐 part 恒用 strict=False 加载子集
+                part_keys = set(part.state_dict().keys())
+                part_state = {k: v for k, v in state_dict.items() if k in part_keys}
+                set_model_state_dict(
+                    part,
+                    model_state_dict=part_state,
+                    options=StateDictOptions(strict=False),
+                )
                 ensure_tied_lm_head(part)
 
 
 class OptimizerState:
-    """优化器 StateDict wrapper。"""
+    """优化器 StateDict wrapper（optimizer 接受单个或 list，与 03 §3.1 canonical 对齐）。
 
-    def __init__(self, model: nn.Module | list[nn.Module], optimizer: torch.optim.Optimizer,
+    03 canonical：``OptimizerConfig.build()`` 返回 ``list[torch.optim.Optimizer]``
+    （PP 多 stage 时每个 model part 一个 optimizer，见 03 §9.3），
+    ``__state_tracked`` 注册的 optimizer 即该 list。本 wrapper 内部统一归一为
+    list；``get_optimizer_state_dict`` / ``set_optimizer_state_dict`` 原生支持
+    ``(model, optimizers)`` 的 list 传参（torch >= 2.2）。
+    """
+
+    def __init__(self, model: nn.Module | list[nn.Module],
+                 optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
                  scheduler: torch.optim.lr_scheduler.LRScheduler | None = None):
         self.models = model if isinstance(model, list) else [model]
-        self.optimizer = optimizer
+        self.optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
         self.scheduler = scheduler
 
     def state_dict(self) -> dict:
         result = {}
 
         # FSDP2 使用 DTensor 优化器状态，不需要 flatten
-        # PP 多 stage：遍历所有 model parts，按 part_{i} 分桶保存（与 ModelState 对称）
-        result["optim"] = {
-            f"part_{i}": get_optimizer_state_dict(
-                m, self.optimizer,
+        # 按 part_{i} 分桶保存（与 ModelState 对称）：
+        # - 单模型（len(models) == 1）：直接把 self.optimizers 作为 list 传给
+        #   get_optimizer_state_dict（原生支持 list，单模型多 optimizer 也成立）
+        # - PP 多 stage：models 与 optimizers 等长（03 §9.3：每 part 一个
+        #   optimizer），逐 (part, optimizer) 配对调用
+        optim_bucket = {}
+        if len(self.models) == 1:
+            optim_bucket["part_0"] = get_optimizer_state_dict(
+                self.models[0], self.optimizers,
                 options=StateDictOptions(flatten_optimizer_state_dict=False),
             )
-            for i, m in enumerate(self.models)
-        }
+        else:
+            assert len(self.models) == len(self.optimizers), (
+                "PP 多 stage 时 models 与 optimizers 必须等长（每 part 一个 optimizer）"
+            )
+            for i, (m, o) in enumerate(zip(self.models, self.optimizers)):
+                optim_bucket[f"part_{i}"] = get_optimizer_state_dict(
+                    m, o,
+                    options=StateDictOptions(flatten_optimizer_state_dict=False),
+                )
+        result["optim"] = optim_bucket
         if self.scheduler is not None:
             result["sched"] = self.scheduler.state_dict()
         return result
 
     def load_state_dict(self, state_dict: dict) -> None:
-        for i, m in enumerate(self.models):
+        # 与 state_dict() 对称：单模型直接传 list；PP 逐 (part, optimizer) 配对
+        if len(self.models) == 1:
             set_optimizer_state_dict(
-                m, self.optimizer,
-                optim_state_dict=state_dict["optim"][f"part_{i}"],
+                self.models[0], self.optimizers,
+                optim_state_dict=state_dict["optim"]["part_0"],
             )
+        else:
+            for i, (m, o) in enumerate(zip(self.models, self.optimizers)):
+                set_optimizer_state_dict(
+                    m, o,
+                    optim_state_dict=state_dict["optim"][f"part_{i}"],
+                )
         if self.scheduler is not None and "sched" in state_dict:
             self.scheduler.load_state_dict(state_dict["sched"])
 ```
@@ -983,14 +1067,23 @@ def _extract_dtensor_metadata(state_dict: dict) -> dict[str, DTensorMetadata]:
 
 ---
 
-## 7.5. 辅助函数签名
+### 7.2 辅助函数签名
 
 ```python
 # ── Checkpointer 方法（save/load optimizer） ──
-def save_optimizer(self, model, optimizer, path, scheduler=None) -> None:
+def save_optimizer(
+    self,
+    model: nn.Module | list[nn.Module],
+    optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+    path: str,
+    scheduler=None,
+) -> None:
     """保存优化器状态（含 LR scheduler，若传入非 None 则绑定）。
 
     与 save_model 对称：组装 OptimizerState → DCP 切分写入。
+    ``optimizer`` 接受单个或 list——与 03 §3.1 canonical 对齐
+    （``OptimizerConfig.build()`` 返回 ``list[torch.optim.Optimizer]``，
+    ``__state_tracked`` 注册的 optimizer 即该 list）。
     """
     opt_state = OptimizerState(model, optimizer, scheduler=scheduler)
     state_dict = opt_state.state_dict()
@@ -998,11 +1091,19 @@ def save_optimizer(self, model, optimizer, path, scheduler=None) -> None:
         writer = _HuggingFaceStorageWriter(path, None, None)
     else:
         writer = FileSystemWriter(path)
-    self._do_save(state_dict, path, writer)
+    self._do_save(state_dict, path, writer, future_slot="_async_optim_future")
 
 
-def load_optimizer(self, model, optimizer, path) -> None:
-    """从 DCP checkpoint 恢复优化器状态（断点续训 resume）。"""
+def load_optimizer(
+    self,
+    model: nn.Module | list[nn.Module],
+    optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+    path: str,
+) -> None:
+    """从 DCP checkpoint 恢复优化器状态（断点续训 resume）。
+
+    ``optimizer`` 签名与 save_optimizer 一致（list 与 03 §3.1 canonical 对齐）。
+    """
     opt_state = OptimizerState(model, optimizer, scheduler=None)
     state_dict = opt_state.state_dict()
     if self.config._serialization_format == SerializationFormat.SAFETENSORS:
@@ -1024,20 +1125,28 @@ def _validate_checkpoint_compatibility(self, restore_from: str) -> None:
     ...
 
 def _resolve_latest_symlink(checkpoint_dir: str) -> str | None:
-    """读取 LATEST symlink 指向的最新 checkpoint 目录，不存在则返回 None。"""
+    """读取 LATEST symlink 指向的最新 checkpoint 目录，不存在则返回 None。
+
+    03 §7.1 ``_update_latest_symlink`` 写入的是**相对路径**
+    （``os.path.relpath(path, checkpoint_dir)``，即 checkpoint 子目录名），
+    消费端必须拼回 ``checkpoint_dir`` 再判 exists——直接对 readlink 结果
+    调 ``os.path.exists`` 会依赖 CWD，CWD ≠ checkpoint_dir 时误判不存在。
+    """
     import os
     symlink = os.path.join(checkpoint_dir, "LATEST")
     if os.path.islink(symlink):
-        target = os.readlink(symlink)
+        target = os.path.join(checkpoint_dir, os.readlink(symlink))
         if os.path.exists(target):
             return target
+        return None
     return _maybe_load_latest_marker(checkpoint_dir)
 
 def _maybe_load_latest_marker(checkpoint_dir: str) -> str | None:
     """无 symlink 时尝试读取 LATEST marker 文件（兼容无符号链接的 FS）。
 
-    读取 ``{checkpoint_dir}/LATEST`` 纯文本文件（非 symlink），返回其中
-    记录的最后一行的 checkpoint 子目录名。不存在或无内容时返回 None。
+    读取 ``{checkpoint_dir}/LATEST`` 纯文本文件（非 symlink），将其中
+    记录的最后一行 checkpoint 子目录名拼回 ``checkpoint_dir`` 后返回
+    完整路径（与 symlink 分支一致，不依赖 CWD）。不存在或无内容时返回 None。
     """
     import os
     marker = os.path.join(checkpoint_dir, "LATEST")
@@ -1045,26 +1154,28 @@ def _maybe_load_latest_marker(checkpoint_dir: str) -> str | None:
         with open(marker) as f:
             lines = f.read().strip().splitlines()
             if lines:
-                return lines[-1]
+                return os.path.join(checkpoint_dir, lines[-1])
     return None
 
-# ── StateDictAdapter 工厂 ──
+# ── StateDictAdapter 获取（canonical：01 §2.14） ──
 def _get_state_dict_adapter(model: nn.Module):
-    """按模型类型返回 StateDictAdapter 实例；无 HF key 映射需求时返回 None。
+    """从模型读取 ``_state_dict_adapter`` 属性（canonical：01 §2.14）。
 
-    通过模型类名 / config.model_type 派发：
-    - Llama / Qwen / Gemma → 使用通用 HF adapter（直接映射，无重命名）
-    - 自定义模型 → 从注册表查找（若注册过映射表则返回对应 adapter）
-    - 无映射需求 → 返回 None（checkpoint key 与模型内部 key 一致）
+    - 模型经 01 §11 ``HFCheckpointingMixin`` 持有 ``_state_dict_adapter``
+      实例（注册期绑定，如 ``Qwen3_5DenseStateDictAdapter()``）→ 返回该实例。
+    - 无该属性或属性为 None（无 HF key 映射需求）→ 返回 None
+      （checkpoint key 与模型内部 key 一致）。
+
+    注意：01 §10.1 的 ``StateDictAdapter`` ABC 上**不存在**
+    ``from_model_type()`` 类方法，旧版按 ``model_type`` 派发的实现已删除。
+    本函数即 01 §8.3 从 ``components.checkpoint.checkpointing`` import 的
+    实现——checkpointing 模块提供的是"读取模型属性 + fallback None"的
+    薄封装，不做类型派发。
 
     返回的 adapter 提供 ``to_hf(state_dict)``（模型内部 key → HF key）和
     ``from_hf(state_dict)``（HF key → 模型内部 key）两个方向。
     """
-    from hyper_parallel.components.checkpoint.conversion_mapping import StateDictAdapter
-    model_type = _get_model_type(model)
-    if model_type is not None:
-        return StateDictAdapter.from_model_type(model_type)
-    return None
+    return getattr(model, "_state_dict_adapter", None)
 
 # ── safetensors 序列化辅助 ──
 def _materialize_non_contiguous(state_dict: dict) -> dict:
@@ -1258,6 +1369,37 @@ def materialize_missing_tied_lm_head(model, state_dict: dict | None = None) -> N
     ...
 ```
 
+### 7.3 MoE stacked 参数 key 映射（05 D-09 衔接）
+
+> 对应 05 §6.4.7（D-09：HF 原生 MoE 的 EP 直通）。v1 的 key 转换逻辑归
+> checkpoint 层，05 的 apply 不感知。
+
+D-09 在 apply 期把 HF per-expert 权重 stack 成 3D 参数后，**内存中的参数 key
+与 HF checkpoint 的 key 结构不再一致**：
+
+```
+HF checkpoint（磁盘）          训练内存（D-09 堆叠后）
+─────────────────────          ──────────────────────
+mlp.experts.0.gate_proj.weight  mlp.experts.gate_proj   [E, I, H]（holder Parameter，
+mlp.experts.1.gate_proj.weight  mlp.experts.up_proj      无序号段、无 .weight 后缀，
+...                             mlp.experts.down_proj    EP Shard(0) + TP D-08 分片）
+mlp.experts.0.down_proj.weight
+...
+```
+
+三个方向的约定：
+
+| 方向 | 路径 | 转换 |
+|------|------|------|
+| **HF → 训练（init 加载）** | `load_base_model` 在 `apply_sharding_plan` **之前**执行（01 §7 时序） | **零转换**——per-expert 权重原样加载进模型，Phase A 的 `_stack_moe_experts` 在堆叠时自行 concat；推荐路径，WeightConverter 无需感知 stacked 格式 |
+| **训练 → HF 导出（save）** | `Adapter.to_hf`（§5.2 保存 5 阶段的第 2 步） | **unstack**：stacked 参数按 E 维 split 回 per-expert key（补序号段与 `.weight` 后缀）；与现有 MoE tensor merging（§5.3 路径 1）互为逆操作，复用同一 key 映射表 |
+| **DCP resume（自格式）** | `full_state_dict=False` local shard 保存 | **零转换**——stacked key 直接入盘，DTensor 元数据记录 `{EP: Shard(0), TP: ...}`，加载时 DCP 原生 re-shard（§7.1）；模型侧须已先经 apply 堆叠出同名参数（先 apply 后 resume 的固定时序） |
+
+注意：unstack 需要知道 expert 数 E 与 proj 命名映射（gate_proj/up_proj/down_proj
+↔ w1/w2/w3 两套命名），映射表按 arch 注册（与 05 `MOE_ROUTER_ADAPTERS` 同
+机制），v1 覆盖 DeepSeek/Qwen3-MoE/GLM；未注册 arch 保存时 fail-fast 报错
+（不静默写出无法回读的格式）。
+
 ---
 
 ## 8. 故障恢复集成
@@ -1307,10 +1449,13 @@ def _load_state_by_kind(self, name: str, kind: str, path: str) -> None:
     """按 state 种类分发加载（kind 来自 __state_tracked 注册绑定，不重推导）。"""
     obj = getattr(self, name)
     if kind == "model":
-        # PP 多 stage：传 model_parts 列表，与 §6 ModelState save/load 遍历所有 part 对称
+        # PP 多 stage：传 model_parts 列表。save 侧存的是 self.model 全模型
+        # key（03 save_checkpoint 传单个模型），load 侧 ModelState 合并校验后
+        # 按 part 过滤子集分发（方案 a，见 §5.3 load_model 说明）
         self.checkpointer.load_model(self.model_parts, model_path=path)
     elif kind == "optimizer":
-        # 同样传 model_parts 列表，OptimizerState 内部遍历所有 part
+        # obj 为 list[Optimizer]（03 §3.1 canonical）；传 model_parts 列表，
+        # OptimizerState 内部逐 (part, optimizer) 配对恢复
         self.checkpointer.load_optimizer(self.model_parts, obj, path)
     elif kind == "lr_scheduler":
         # lr_scheduler build 返回 list[OptimizerParamScheduler]（见 03 §9.6），
@@ -1357,36 +1502,16 @@ AutoModel 对 checkpoint 使用与 optimizer 相同的**两层 typed config 模�
 1. **RecipeConfig.checkpoint**：从 YAML 提取 kwargs（丢弃 `_target_`，如果有的话）→ 直接构造 `CheckpointingConfig`
 2. **checkpoint_config.build(dp_rank=..., ...)**：注入运行时依赖，创建 `Checkpointer`
 
-```python
-# recipes/_typed_config.py
+**canonical 实现归 01 §3.3**（`RecipeConfig.checkpoint` cached_property，含
+`model_repo_id` / `model_cache_dir` / `is_peft` 等模型派生字段的注入），
+本文档不再重复完整实现，仅保留 04 特有的 checkpoint 配置说明：
 
-class RecipeConfig:
-    """将 YAML ConfigNode 桥接到强类型配置 Dataclass。"""
-
-    @cached_property
-    def checkpoint(self) -> "CheckpointingConfig":
-        """从 YAML checkpoint 段构建 CheckpointingConfig。
-
-        注意：AutoModel 的 checkpoint 段不使用 _target_（CheckpointingConfig 是固定类型），
-        直接通过 _section_kwargs() 提取字段。模型相关的派生字段在此注入。
-        """
-        from hyper_parallel.components.checkpoint.config import CheckpointingConfig
-
-        node = self._raw.get("checkpoint", None)
-        kwargs = _as_dict(node) if node is not None else {}
-        kwargs.pop("restore_from", None)  # 由 Recipe 单独处理
-        model = self._raw.get("model", None)
-        # 模型派生字段（YAML 显式设置的值优先）
-        kwargs |= {
-            "model_repo_id": _model_name_from_cfg(model) if model is not None else None,
-            "model_cache_dir": self._raw.get("model.cache_dir", None),
-            "is_peft": bool(self._raw.get("peft", None)),
-        }
-        return CheckpointingConfig(**kwargs)
-
-    # RNG 在 AutoModel 中不走 _target_——直接使用 seed 构造
-    # self.rng = StatefulRNG(seed=cfg.get("seed", 42), ranked=True)
-```
+- `CheckpointingConfig` 是**固定类型**（不走 `_target_`），cached_property 直接
+  用 `_section_kwargs()` 提取 YAML checkpoint 段字段后构造；
+- `restore_from` 由 Recipe 单独解析（`load_checkpoint(restore_from)`），
+  不传入 `CheckpointingConfig`；
+- 模型派生字段（`model_repo_id` / `model_cache_dir` / `is_peft`）在
+  cached_property 中注入，YAML 显式设置的值优先（详见 01 §3.3）。
 
 ### 使用方式
 
@@ -1397,7 +1522,11 @@ self.checkpointer = checkpoint_config.build(
     dp_rank=self._get_dp_rank(),
     tp_rank=self._get_tp_rank(),
     pp_rank=self._get_pp_rank(),
-    moe_mesh=self.moe_mesh,
+    moe_mesh=getattr(self.mesh, "moe_mesh", None),
+    # 06 D-10 口径：MeshContext 无 moe_mesh 字段（主 mesh 不含 EP 轴，
+    # expert mesh 由 apply_sharding_plan 期派生且当前未导出），getattr 恒为
+    # None；MoE consolidated 导出需要派生 expert mesh 时，需由 sharding 层
+    # 暴露后在此注入（已知缺口，见 §5.1 Checkpointer.__init__ 的 moe_mesh 注）。
 )
 ```
 

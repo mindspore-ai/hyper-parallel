@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components.distributed.testing: 双模式验证工具。"""
+"""components.distributed.testing: dual-mode validation utilities."""

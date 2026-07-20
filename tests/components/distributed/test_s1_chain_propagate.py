@@ -5,14 +5,12 @@
 
 import logging
 
-import pytest
 import torch.nn as nn
 
 from hyper_parallel.components.distributed.sharding_config import (
     CP,
     TP,
     ModuleShardingSpec,
-    PlacementMismatchError,
     ShardingPlan,
 )
 from hyper_parallel.components.distributed.sharding_planner import ShardingPlanner
@@ -82,16 +80,36 @@ class TestChainPropagate:
         assert plan.modules["c"]._is_terminal is True
         assert plan.modules["a"]._is_terminal is False
 
-    def test_scenario3_mismatch_raises(self):
-        """模板错误：a.out_dst=Replicate ≠ b.in_src=Shard(1) → PlacementMismatchError。"""
+    def test_scenario3_mismatch_warns(self, caplog):
+        """a.out_dst=Replicate ≠ b.in_src=Shard(1) → 仅 warning，plan 保留。
+
+        值相等比较无 shape 感知，边上的 reshape/transpose（合法场景）必然
+        不等，故不报错；声明正确性由 validate 模式兜 correctness。
+        """
         bad = _spec(out_dst={"output": {TP: Replicate(), CP: Replicate(),
                                         "ep": Replicate()}})
         plan = _plan_with({"a": bad, "b": _spec(), "c": _spec()})
-        with pytest.raises(PlacementMismatchError) as exc:
+        with caplog.at_level(logging.WARNING):
             P._chain_propagate_and_validate(plan, _Chain())
-        msg = str(exc.value)
-        assert "a" in msg and "b" in msg
-        assert "Shard" in msg and "Replicate" in msg
+        assert "chain contract mismatch" in caplog.text
+        assert "a" in caplog.text and "b" in caplog.text
+        # 声明不被改写，plan 照常生成，terminal 标记不受影响
+        declared = plan.modules["b"].in_src["hidden_states"]
+        assert declared[TP] == Shard(1)
+        assert plan.modules["b"]._is_terminal is False
+
+    def test_scenario3_reshape_edge_legitimate(self):
+        """边上有 reshape：a.out_dst Shard(1)（3D S 维）≠ b.in_src Shard(0)
+        （2D 折叠维）→ 合法场景，不抛错即通过。"""
+        up = _spec(out_dst={"output": {TP: Shard(1), CP: Shard(1),
+                                       "ep": Replicate()}})
+        down = _spec(in_src={"hidden_states": {TP: Shard(0), CP: Shard(0),
+                                               "ep": Replicate()}},
+                     in_dst={"hidden_states": {TP: Shard(0), CP: Shard(0),
+                                               "ep": Replicate()}})
+        plan = _plan_with({"a": up, "b": down, "c": _spec()})
+        P._chain_propagate_and_validate(plan, _Chain())  # 不抛错即通过
+        assert plan.modules["b"].in_src["hidden_states"][TP] == Shard(0)
 
     def test_scenario4_custom_module_inserted(self):
         """自定义模块（标量简写 + 空 in_src）插入后契约连接。"""
@@ -133,4 +151,4 @@ class TestTopologicalSort:
         with caplog.at_level(logging.WARNING):
             out = P._topological_sort_by_forward_order(["a", "ghost"], model)
         assert out == ["a", "ghost"]
-        assert "未在 named_modules" in caplog.text
+        assert "not found in named_modules" in caplog.text

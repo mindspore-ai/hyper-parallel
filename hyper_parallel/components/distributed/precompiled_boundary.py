@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""precompiled_boundary: 编译期通信规划（05 §4.3）。
+"""precompiled_boundary: compile-time communication planning (05 §4.3).
 
-RedistOp / PrecompiledBoundary 把 in_src→in_dst、out_src→out_dst 的 placement
-差异编译为 RedistOp 序列；运行时零判断直接执行。所有非 identity 通信统一走
-DTensor.redistribute()（自研 DTensor 内部按 (src,dst) 自动选最优 collective）。
+RedistOp / PrecompiledBoundary compile the placement differences of
+in_src→in_dst and out_src→out_dst into sequences of RedistOps; at runtime
+they execute directly with zero branching. All non-identity communication
+goes uniformly through DTensor.redistribute() (the in-house DTensor
+internally picks the optimal collective based on (src, dst)).
 
-API 适配（与 05 文档伪代码的差异，自研 DTensor 实际签名）：
-- ``DTensor.from_local(local, mesh, placements)``：无 run_check 参数；
-- ``dt.redistribute(mesh, placements)``：mesh 为第一个参数，无 async_op。
+API adaptation (differences from the 05 doc pseudocode; actual in-house
+DTensor signatures):
+- ``DTensor.from_local(local, mesh, placements)``: no run_check parameter;
+- ``dt.redistribute(mesh, placements)``: mesh is the first argument, no async_op.
 """
 
 import logging
@@ -37,10 +40,12 @@ logger = logging.getLogger(__name__)
 
 
 def _classify_collective(src, dst) -> str:
-    """从 placement 推导通信类型（调试/profiling 标签，非通信路径选择）。
+    """Derive the communication type from placements (a debug/profiling label,
+    not a communication-path selector).
 
-    只比较有差异的维度——identity 维（如 attention 的 CP 维 Shard(1)→Shard(1)）
-    不参与分类，使 TP 维 Shard→Replicate 正确归类为 all_gather。
+    Only differing dimensions are compared — identity dims (e.g. the CP dim
+    Shard(1)→Shard(1) of attention) do not participate in classification, so
+    a TP-dim Shard→Replicate is correctly classified as all_gather.
     """
     if tuple(src) == tuple(dst):
         return "identity"
@@ -85,9 +90,10 @@ def _set_arg(args, kwargs, name, idx, value):
 
 @dataclass
 class RedistOp:
-    """一个预编译的 redistribute 操作（05 §4.3.1）。
+    """A single precompiled redistribute operation (05 §4.3.1).
 
-    collective_type 为调试/profiling 标签；通信统一走 DTensor.redistribute()。
+    collective_type is a debug/profiling label; all communication goes
+    uniformly through DTensor.redistribute().
     """
     arg_name: str
     arg_index: Optional[int]
@@ -97,24 +103,25 @@ class RedistOp:
     collective_type: str
 
     def execute(self, tensor: torch.Tensor, *, as_dtensor: bool = False):
-        """执行通信。
+        """Execute the communication.
 
         Args:
-            tensor: 输入 local tensor（或 DTensor）。
-            as_dtensor: True → 返回 DTensor（校验模式），False → 返回 local tensor。
+            tensor: input local tensor (or DTensor).
+            as_dtensor: True → return a DTensor (validate mode), False → return a local tensor.
         """
         if self.collective_type == "identity":
             if isinstance(tensor, DTensor):
-                # validate（as_dtensor=True）保持 DTensor；production 返回
-                # local——identity op 的输入可能来自 local region 的
-                # from_local 重包装（MoE/CP wrapper），boundary 出口必须解包。
+                # validate (as_dtensor=True) keeps the DTensor; production
+                # returns local — an identity op's input may come from a
+                # from_local re-wrap in a local region (MoE/CP wrapper), so
+                # the boundary exit must unwrap it.
                 return tensor if as_dtensor else tensor.to_local()
             if as_dtensor:
                 return DTensor.from_local(
                     tensor, self.mesh, tuple(self.src_placements))
             return tensor
 
-        # 统一路径：零拷贝包装 → redistribute → 可选 to_local
+        # Unified path: zero-copy wrap → redistribute → optional to_local
         if isinstance(tensor, DTensor):
             dt = tensor
         else:
@@ -124,7 +131,7 @@ class RedistOp:
 
 
 class PrecompiledBoundary:
-    """编译期通信计划（05 §4.3.3）：in_plan/out_plan 两个 RedistOp 序列。"""
+    """Compile-time communication plan (05 §4.3.3): two RedistOp sequences, in_plan/out_plan."""
 
     def __init__(self, spec, mesh, mesh_dim_names):
         self.spec = spec
@@ -133,10 +140,11 @@ class PrecompiledBoundary:
         self.in_plan = self._compile_input_plan(spec, mesh, self.mesh_dim_names)
         self.out_plan = self._compile_output_plan(spec, mesh, self.mesh_dim_names)
 
-    # ── 编译 ────────────────────────────────────────────────────────────
+    # ── Compilation ─────────────────────────────────────────────────────
 
     def _compile_input_plan(self, spec, mesh, mesh_dim_names):
-        """从 in_src → in_dst 编译输入通信计划（identity 维度自然编译为直通 op）。"""
+        """Compile the input communication plan from in_src → in_dst (identity
+        dimensions naturally compile to pass-through ops)."""
         plan = []
         all_names = set(spec.in_src.keys()) | set(spec.in_dst.keys())
         for name in sorted(all_names):
@@ -155,10 +163,12 @@ class PrecompiledBoundary:
         return plan
 
     def _compile_output_plan(self, spec, mesh, mesh_dim_names):
-        """从 out_src → out_dst 编译输出通信计划（identity 跳过，支持多输出）。
+        """Compile the output communication plan from out_src → out_dst (identity
+        skipped, multi-output supported).
 
-        arg_index 来源优先级：(1) spec.out_names 显式顺序；(2) out_src key 顺序。
-        out_src=None 或 out_dst=None → 不编译。
+        arg_index source priority: (1) explicit order in spec.out_names;
+        (2) key order of out_src.
+        out_src=None or out_dst=None → nothing is compiled.
         """
         if spec.out_src is None or spec.out_dst is None:
             return []
@@ -174,7 +184,7 @@ class PrecompiledBoundary:
             dst_p = tuple(resolve_placements(
                 spec.out_dst.get(name, {}), mesh_dim_names))
             if src_p == dst_p:
-                continue  # identity，不需要通信
+                continue  # identity, no communication needed
             plan.append(RedistOp(
                 arg_name=name,
                 arg_index=name_to_idx.get(name, 0),
@@ -185,13 +195,14 @@ class PrecompiledBoundary:
             ))
         return plan
 
-    # ── 运行时执行 ──────────────────────────────────────────────────────
+    # ── Runtime execution ───────────────────────────────────────────────
 
     def redistribute_inputs(self, args, kwargs, *, as_dtensor=False):
-        """执行输入重分布。as_dtensor=True → 返回 DTensor（校验模式）。
+        """Execute input redistribution. as_dtensor=True → return DTensors (validate mode).
 
-        arg 未在 args/kwargs 中找到（None）时跳过该 op——如 embed 的
-        in_src key "input" 与实际 kwargs 名 "input_ids" 不同名且 identity。
+        When an arg is not found in args/kwargs (None) the op is skipped —
+        e.g. embed's in_src key "input" differs from the actual kwargs name
+        "input_ids" and is identity.
         """
         for op in self.in_plan:
             arg = _get_arg(args, kwargs, op.arg_name, op.arg_index, default=None)
@@ -202,9 +213,10 @@ class PrecompiledBoundary:
         return args, kwargs
 
     def redistribute_outputs(self, outputs, *, as_dtensor_input=False):
-        """执行输出重分布（单输出 Tensor / 多输出 tuple，保序，返回同构）。
+        """Execute output redistribution (single Tensor output / multi-output
+        tuple, order preserved, same structure returned).
 
-        as_dtensor_input=True → 输入已是 DTensor（校验模式）。
+        as_dtensor_input=True → inputs are already DTensors (validate mode).
         """
         is_tuple = isinstance(outputs, (tuple, list))
         outputs_list = list(outputs) if is_tuple else [outputs]
@@ -220,7 +232,7 @@ class PrecompiledBoundary:
             tensor = outputs_list[idx]
             if tensor is None:
                 continue
-            # as_dtensor_input=True（validate）→ 保持 DTensor 供 out_dst 校验；
-            # 否则返回 local（production / 边界最终出口）。
+            # as_dtensor_input=True (validate) → keep DTensors for out_dst
+            # validation; otherwise return local (production / final boundary exit).
             outputs_list[idx] = op.execute(tensor, as_dtensor=as_dtensor_input)
         return tuple(outputs_list) if is_tuple else outputs_list[0]

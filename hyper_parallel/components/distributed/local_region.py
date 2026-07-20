@@ -12,29 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""local_region: DTensor -> local -> DTensor 的局部计算区域包装。
+"""local_region: a DTensor -> local -> DTensor local-compute-region wrapper.
 
-基于 ``core.shard.custom_shard`` 的骨架，面向 05 双模式 DTensor 设计（validate 模式
-的 MoE local_map / CP attention 内部区域）做了三点增强：
+Built on the ``core.shard.custom_shard`` skeleton, with three enhancements for
+the 05 dual-mode DTensor design (the MoE local_map / CP attention internal
+regions in validate mode):
 
-1. **命名参数绑定**：``in_placements`` 为 ``dict[str, placements]``，与
-   ``ModuleShardingSpec.in_dst`` 的 dict 契约对齐；positional args 通过
-   ``inspect.signature`` 映射到参数名，kwargs 原生支持（HF forward 以 kwargs 为主）。
-2. **容错透传**：输入不是 DTensor 时原样透传（production 路径参数已解包的场景）；
-   输出已是 DTensor 时不重复包装；全部输入均非 DTensor 时不包装输出。
+1. **Named-parameter binding**: ``in_placements`` is a
+   ``dict[str, placements]``, aligned with the dict contract of
+   ``ModuleShardingSpec.in_dst``; positional args are mapped to parameter
+   names via ``inspect.signature``, and kwargs are natively supported (HF
+   forwards are predominantly kwargs-based).
+2. **Tolerant passthrough**: inputs that are not DTensors are passed through
+   as-is (the production path where parameters are already unwrapped); outputs
+   that are already DTensors are not re-wrapped; when no input is a DTensor,
+   outputs are not wrapped either.
 
-**无反向缝合的说明（重要）**：hyper_parallel 的 DTensor 是自研的**前向-only**
-placement/dispatch 系统，反向不经过 DTensor（不存在 DTensor autograd）。因此本
-函数只做前向的 unwrap/wrap，不包含也不需要 autograd.Function 缝合与梯度
-placement 声明（区别于 PyTorch ``local_map`` / Titan ``LocalMapConfig.
-in_grad_placements``——那些是 torch DTensor 有反向语义的产物）。区域内部的
-反向就是 local tensor 上的普通 autograd，梯度直接落在 local 参数分片上，
-与 production 模式一致。
+**Why there is no backward stitching (important)**: hyper_parallel's DTensor
+is an in-house **forward-only** placement/dispatch system; the backward pass
+does not go through DTensor (there is no DTensor autograd). Therefore this
+function only performs forward unwrap/wrap and contains -- and needs -- no
+autograd.Function stitching or gradient-placement declarations (unlike
+PyTorch ``local_map`` / Titan ``LocalMapConfig.in_grad_placements``, which
+exist because torch DTensor has backward semantics). Backward inside the
+region is plain autograd on local tensors, with gradients landing directly on
+the local parameter shards, consistent with production mode.
 
-与 production 模式的关系：production 的 forward 包装（``_wrap_moe_forward``）在
-build 期已把参数永久解包为 plain tensor，边界通信由 ``PrecompiledBoundary`` 执行，
-不使用本函数。本函数服务于 **validate 模式**（参数保持 DTensor，区域边界需要
-DTensor 契约缝合）与独立使用场景。
+Relationship with production mode: production's forward wrapper
+(``_wrap_local_region_forward``) permanently unwraps parameters to plain
+tensors at build time, and boundary communication is executed by
+``PrecompiledBoundary``; it does not use this function. This function serves
+**validate mode** (parameters stay DTensors and the region boundary needs
+DTensor-contract stitching) and standalone use.
 """
 
 import functools
@@ -47,15 +56,17 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Placement
 
-# 单个 tensor 的 placements：tuple[Placement, ...]，与 mesh 维度对齐
+# Placements of a single tensor: tuple[Placement, ...], aligned with the mesh dims
 Placements = Sequence[Placement]
 
 
 def _bind_arg_names(func: Callable) -> Dict[str, int]:
-    """把 positional 参数位置映射到参数名（用于 dict 契约的按名查找）。
+    """Map positional-argument positions to parameter names (for name-based
+    lookup under the dict contract).
 
-    签名不可内省（C 扩展等）时返回空 dict——此时仅 kwargs 传参能被
-    in_placements 命中，positional 参数全部透传。
+    When the signature cannot be introspected (C extensions, etc.), an empty
+    dict is returned -- in that case only kwargs-passed arguments can be
+    matched by in_placements, and all positional arguments pass through.
     """
     try:
         sig = inspect.signature(func)
@@ -69,12 +80,14 @@ def _bind_arg_names(func: Callable) -> Dict[str, int]:
 
 
 def _normalize_out_placements(out_placements, num_outputs: int):
-    """把 out_placements 归一化为逐输出的 tuple[tuple[Placement, ...] | None, ...]。
+    """Normalize out_placements into a per-output
+    tuple[tuple[Placement, ...] | None, ...].
 
-    接受的写法：
-      - 单输出扁平写法 ``(Partial(), Replicate())``（元素全是 Placement）；
-      - 逐输出写法 ``((Partial(), Replicate()), None, (Shard(1), Replicate()))``
-        （任一元素是 tuple 或 None，长度须等于输出数）。
+    Accepted forms:
+      - flat single-output form ``(Partial(), Replicate())`` (all elements
+        are Placements);
+      - per-output form ``((Partial(), Replicate()), None, (Shard(1), Replicate()))``
+        (any element is a tuple or None; length must equal the output count).
     """
     if len(out_placements) == 0:
         raise ValueError("out_placements must not be empty")
@@ -102,33 +115,39 @@ def local_region(
     out_placements: Optional[Sequence[Optional[Placements]]] = None,
     redistribute_inputs: bool = False,
 ) -> Callable:
-    """把 func 包装为一个 DTensor -> local -> DTensor 的局部计算区域（前向）。
+    """Wrap func into a DTensor -> local -> DTensor local compute region (forward).
 
     Args:
-        func: 被包装函数（forward 或任意 callable）。也可作装饰器工厂使用。
-        device_mesh: DTensor 构造 / redistribute 使用的 mesh。
-        in_placements: ``{arg_name: placements}`` —— 区域入口各 DTensor 输入
-            期望的 placement。缺省（None 值或未列出）的输入不做 redistribute；
-            非 DTensor 输入一律透传。
-        out_placements: 区域出口的输出 placement 声明。单输出可扁平写
-            ``(Partial(), Replicate())``；多输出逐位置写，非 tensor 输出用
-            None 占位。为 None 时不包装输出（原样返回）。
-        redistribute_inputs: 入口是否先把输入 redistribute 到 in_placements
-            声明的 placement。双模式场景中边界通信已由 PrecompiledBoundary
-            完成，传 False（默认）；独立使用时传 True。
+        func: the function to wrap (a forward or any callable). Can also be
+            used as a decorator factory.
+        device_mesh: the mesh used for DTensor construction / redistribution.
+        in_placements: ``{arg_name: placements}`` -- the expected placements
+            of each DTensor input at the region entry. Inputs left as None
+            (value) or not listed are not redistributed; non-DTensor inputs
+            always pass through.
+        out_placements: placement declarations for the outputs at the region
+            exit. A single output may be written flat as
+            ``(Partial(), Replicate())``; multiple outputs are written
+            position-by-position, with None as the placeholder for non-tensor
+            outputs. When None, outputs are not wrapped (returned as-is).
+        redistribute_inputs: whether to redistribute inputs to the placements
+            declared in in_placements at the entry. In dual-mode scenarios the
+            boundary communication is already done by PrecompiledBoundary, so
+            pass False (default); pass True for standalone use.
 
     Returns:
-        包装后的函数。签名与 func 一致。
+        The wrapped function, with the same signature as func.
 
     Examples:
-        >>> # validate 模式 MoE 模块：边界 DTensor 契约保持，内部 local all-to-all
+        >>> # validate-mode MoE module: boundary DTensor contract preserved,
+        >>> # internal local all-to-all
         >>> wrapped = local_region(
         ...     moe.forward, device_mesh=mesh,
         ...     in_placements={"hidden_states": (Replicate(), Replicate())},
         ...     out_placements=(Partial(), Replicate()),
         ... )
 
-        >>> # 装饰器写法（独立使用，入口自行 redistribute）
+        >>> # decorator form (standalone use, entry redistributes by itself)
         >>> @local_region(device_mesh=mesh,
         ...               in_placements={"x": (Shard(0),)},
         ...               out_placements=((Shard(0),),),
@@ -137,7 +156,7 @@ def local_region(
         ...     return x + bias
     """
     def decorator(fn: Callable) -> Callable:
-        name_to_idx = None  # 惰性缓存签名映射
+        name_to_idx = None  # lazily cached signature mapping
 
         @functools.wraps(fn)
         def wrapped(*args, **kwargs):
@@ -161,7 +180,8 @@ def local_region(
                         value = args[idx]
 
                     if not isinstance(value, DTensor):
-                        # 非 DTensor 输入（production 已解包 / 非 tensor 参数）→ 透传
+                        # non-DTensor input (already unwrapped by production /
+                        # non-tensor argument) -> passthrough
                         continue
                     saw_dtensor = True
 
@@ -188,7 +208,7 @@ def local_region(
             wrapped_out = []
             for item, placements in zip(out_items, placements_items):
                 if isinstance(item, DTensor):
-                    # 区域内部已自行包装 → 不重复包装
+                    # already wrapped inside the region -> do not re-wrap
                     wrapped_out.append(item)
                 elif isinstance(item, torch.Tensor):
                     if placements is None:

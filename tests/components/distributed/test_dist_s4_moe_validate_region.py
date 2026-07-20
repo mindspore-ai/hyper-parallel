@@ -33,7 +33,7 @@ def _worker(rank, world_size):
     model = TinyLlamaForCausalLM(TinyConfig(num_experts=4)).eval()
     plan = ShardingPlanner().plan(model, mesh, tp_size=1, ep_size=world_size)
     moe_spec = plan.modules["model.layers.0.mlp"]
-    assert moe_spec._use_local_map
+    assert moe_spec.use_local_map
     model, _ = apply_sharding_plan(model, plan, mesh, validate_mode=True)
     _attach_ep(model, mesh, world_size)
 

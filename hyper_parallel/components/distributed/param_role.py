@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""param_role: ParamRole 枚举 + ParameterClassifier（05 §3.6 Phase 1）。
+"""param_role: ParamRole enum + ParameterClassifier (05 §3.6 Phase 1).
 
-ParamRole 是命名规则与 ShardingTemplate 之间的桥梁：
-- Phase 1 把 named_parameters() 按命名规则分类为 ParamRole；
-- Phase 2 按 ParamRole 聚合通信边界；
-- Phase 4 由 Template 按 ParamRole 填充 spec.params 的 placement。
+ParamRole is the bridge between naming rules and ShardingTemplate:
+- Phase 1 classifies named_parameters() into ParamRole by naming rules;
+- Phase 2 aggregates communication boundaries by ParamRole;
+- Phase 4 fills the placements of spec.params from the Template by ParamRole.
 
-ParamRole 不决定 I/O 契约——那是 Template 的语义角色（attention/mlp/...）决定的。
+ParamRole does not decide the I/O contract — that is decided by the Template's
+semantic role (attention/mlp/...).
 """
 
 import logging
@@ -30,34 +31,39 @@ logger = logging.getLogger(__name__)
 
 
 class ParamRole(Enum):
-    """参数语义角色（13 个枚举值，05 §3.6）。"""
-    COLWISE = auto()        # 列切线性层: q/k/v/gate/up proj → Shard(0)
-    ROWWISE = auto()        # 行切线性层: o/down proj → Shard(1)
+    """Semantic roles of parameters (14 enum values, 05 §3.6)."""
+    COLWISE = auto()        # column-sharded linear layers: q/k/v/gate/up proj → Shard(0)
+    ROWWISE = auto()        # row-sharded linear layers: o/down proj → Shard(1)
     NORM = auto()           # RMSNorm/LayerNorm weight → Replicate
-    EMBED = auto()          # embedding weight → Shard(0)（词表维）
-    LM_HEAD = auto()        # lm_head weight → Shard(0)（词表维）
+    EMBED = auto()          # embedding weight → Shard(0) (vocab dim)
+    LM_HEAD = auto()        # lm_head weight → Shard(0) (vocab dim)
     MOE_GATE = auto()       # MoE router/gate → Replicate
     MOE_EXPERT = auto()     # MoE routed expert → EP Shard(0) + TP colwise/rowwise
     SHARED_EXPERT = auto()  # MoE shared expert → EP Replicate + TP colwise/rowwise
-    FUSED_QKV = auto()      # 融合 QKV → Shard(0)（后续 SpecialHandler 可调整）
-    FUSED_GATE_UP = auto()  # 融合 gate/up → Shard(0)
-    BIAS = auto()           # bias → 恒 Replicate
-    SPECIAL = auto()        # 特殊参数（gated_delta 等）→ Phase 6 SpecialHandler
-    SKIP = auto()           # 冻结/不分片 → 不进入 spec.params
+    FUSED_QKV = auto()      # fused QKV → Shard(0) (a later SpecialHandler may adjust)
+    FUSED_GATE_UP = auto()  # fused gate/up → Shard(0)
+    BIAS = auto()           # bias → always Replicate
+    REPLICATED = auto()     # linear-layer weights forced to be replicated
+                            # (e.g. MLA q_a/kv_a down projections)
+                            # → Replicate on all dims; assigned only explicitly via
+                            # ARCH_OVERRIDES, never produced by the default naming rules
+    SPECIAL = auto()        # special parameters (gated_delta etc.) → Phase 6 SpecialHandler
+    SKIP = auto()           # frozen / not sharded → excluded from spec.params
 
 
 def _match_any(name: str, patterns: List[str]) -> bool:
-    """子串匹配：name 中包含任一 pattern。"""
+    """Substring matching: name contains any of the patterns."""
     return any(p in name for p in patterns)
 
 
 def _build_default_rules() -> List[Tuple[List[str], ParamRole]]:
-    """默认命名规则：list[(patterns, ParamRole)]，按顺序首匹配。
+    """Default naming rules: list[(patterns, ParamRole)], first match wins.
 
-    排序原则：更具体的规则在前（shared_experts 先于 experts；moe gate 的
-    带圆点模式先于裸 "gate" 词；bias 先于 colwise/rowwise，否则 q_proj.bias
-    会被 colwise 截获）。"ln"/"norm" 类模式不会误伤 "linear"/"kernel"
-    （子串不含）。
+    Ordering principle: more specific rules come first (shared_experts before
+    experts; dotted patterns of the MoE gate before the bare "gate" word; bias
+    before colwise/rowwise, otherwise q_proj.bias would be captured by
+    colwise). The "ln"/"norm"-style patterns do not misfire on
+    "linear"/"kernel" (neither contains them as a substring).
     """
     return [
         (["embed_tokens.weight", "wte.weight", "tok_embeddings.weight",
@@ -78,12 +84,12 @@ def _build_default_rules() -> List[Tuple[List[str], ParamRole]]:
 
 
 class ParameterClassifier:
-    """按命名规则 + 架构覆盖把 named_parameters 分类为 ParamRole（05 §3.6.6）。
+    """Classifies named_parameters into ParamRole by naming rules + arch overrides (05 §3.6.6).
 
-    规则来源（优先级递减）：
-      1. ``arch_overrides[arch]`` —— 显式 (pattern | [patterns], ParamRole) 覆盖；
-      2. 默认命名规则（首匹配）；
-      3. 未命中 → ``ParamRole.SKIP``。
+    Rule sources (in decreasing priority):
+      1. ``arch_overrides[arch]`` — explicit (pattern | [patterns], ParamRole) overrides;
+      2. default naming rules (first match);
+      3. no match → ``ParamRole.SKIP``.
     """
 
     def __init__(self, name_rules=None, arch_overrides=None):
@@ -93,7 +99,7 @@ class ParameterClassifier:
         self._arch_overrides = arch_overrides if arch_overrides is not None else {}
 
     def classify(self, model, arch: str = "") -> Dict[str, ParamRole]:
-        """遍历所有命名参数，返回 {param_fqn: ParamRole}。"""
+        """Iterate over all named parameters and return {param_fqn: ParamRole}."""
         roles: Dict[str, ParamRole] = {}
         overrides = self._arch_overrides.get(arch, [])
         for name, _ in model.named_parameters():
@@ -101,16 +107,17 @@ class ParameterClassifier:
         return roles
 
     def classify_param(self, name: str, overrides=None) -> ParamRole:
-        """单参数分类（overrides 缺省时不应用架构覆盖）。"""
+        """Classify a single parameter (arch overrides are not applied when overrides is omitted)."""
         name_lower = name.lower()
-        # 1. 架构显式覆盖（精确 FQN / 子串 / list-of-patterns 三种写法）
+        # 1. Explicit arch overrides (three forms: exact FQN / substring /
+        #    list-of-patterns)
         for pattern, forced_role in (overrides or []):
             patterns = [pattern] if isinstance(pattern, str) else list(pattern)
             if _match_any(name_lower, [p.lower() for p in patterns]):
                 return forced_role
-        # 2. 默认命名规则（首匹配）
+        # 2. Default naming rules (first match)
         for patterns, default_role in self._name_rules:
             if _match_any(name_lower, patterns):
                 return default_role
-        # 3. 兜底
+        # 3. Fallback
         return ParamRole.SKIP

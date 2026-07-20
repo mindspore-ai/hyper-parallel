@@ -20,7 +20,7 @@ def test_spec_defaults():
     assert spec.is_boundary is True
     # 内部标记存在且默认 False
     assert spec._is_terminal is False
-    assert spec._use_local_map is False
+    assert spec.use_local_map is False
     assert spec._needs_cp_attn is False
 
 

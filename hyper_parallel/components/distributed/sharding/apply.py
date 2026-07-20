@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""sharding.apply: _local_params_context / 路径工具（canonical 定义，05 §4.4）。
+"""sharding.apply: _local_params_context / path utilities (canonical definitions, 05 §4.4).
 
-06 的 dtensor_utils.py re-export 本模块定义，勿另起副本。
+06's dtensor_utils.py re-exports the definitions of this module — do not
+create another copy.
 """
 
 import logging
+from typing import Dict, List
 
+import torch
 import torch.nn as nn
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -27,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_attr_by_path(model, fqn):
-    """沿点分 FQN 取属性（数字段走 ModuleList 索引）。"""
+    """Fetch an attribute along a dotted FQN (numeric segments index into ModuleLists)."""
     obj = model
     for p in fqn.split("."):
         obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
@@ -35,10 +38,11 @@ def _get_attr_by_path(model, fqn):
 
 
 def _set_param_by_path(model: nn.Module, fqn: str, new_param) -> None:
-    """沿点分 FQN 定位父模块并替换 leaf 参数。
+    """Locate the parent module along a dotted FQN and replace the leaf parameter.
 
-    object.__setattr__(model, dotted_name, ...) 只会在 model 上设一个怪属性，
-    不会替换子模块参数——必须沿路径定位到真正的父模块再赋值。
+    object.__setattr__(model, dotted_name, ...) would only set a stray
+    attribute on model and would not replace the submodule parameter — you
+    must walk the path to the true parent module before assigning.
     """
     *path, leaf = fqn.split(".")
     obj = model
@@ -51,11 +55,12 @@ def _set_param_by_path(model: nn.Module, fqn: str, new_param) -> None:
 
 
 def _resolve_module(model, fqn):
-    """按 FQN 取模块（不剥离末段，调用点传模块 FQN）。
+    """Fetch a module by FQN (the last segment is NOT stripped; call sites pass module FQNs).
 
-    与 _get_attr_by_path 同语义——所有调用点（Phase A/B/C）传入的 fqn 均为
-    模块完全限定名（如 `model.layers.0.self_attn`），而非参数 FQN，故不做
-    末段剥离（剥离会错误返回父模块）。
+    Same semantics as _get_attr_by_path — every call site (Phase A/B/C)
+    passes a module fully-qualified name (e.g. `model.layers.0.self_attn`),
+    not a parameter FQN, so no last-segment stripping is done (stripping
+    would incorrectly return the parent module).
     """
     obj = model
     for p in fqn.split("."):
@@ -64,13 +69,16 @@ def _resolve_module(model, fqn):
 
 
 def _local_params_context(model: nn.Module):
-    """build 期一次性解包：把 DTensor 参数替换为 _local_tensor（plain），零拷贝。
+    """One-shot unwrap at build time: replace DTensor parameters with their
+    _local_tensor (plain), zero-copy.
 
-    在 apply_sharding_plan 的 Phase C 入口、fully_shard 之前调用，永久解包不恢复。
-    _local_tensor 与原 DTensor 共享存储（data_ptr 相同）。
+    Called at the Phase C entry of apply_sharding_plan, before fully_shard;
+    the permanent unwrap is not restored. _local_tensor shares storage with
+    the original DTensor (same data_ptr).
 
-    返回 {fqn: placements} 解包前的 placement 快照（仅诊断用途；tp_grad_info 的
-    canonical 来源是 ShardingPlan，见 build_tp_grad_info）。
+    Returns a {fqn: placements} snapshot of the placements before unwrapping
+    (diagnostic use only; the canonical source for tp_grad_info is the
+    ShardingPlan, see build_tp_grad_info).
     """
     tp_grad_records = {}
     for name, param in list(model.named_parameters()):
@@ -79,3 +87,58 @@ def _local_params_context(model: nn.Module):
             _set_param_by_path(model, name, nn.Parameter(
                 param.to_local(), requires_grad=param.requires_grad))
     return tp_grad_records
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# D-09: HF-native MoE parameter stacking (05 §6.4.7 D-09b)
+# ────────────────────────────────────────────────────────────────────────────
+
+class _StackedExperts(nn.Module):
+    """Container for stacked per-expert weights: gate_proj/up_proj/down_proj
+    (or w1/w2/w3) become Parameters of shape [E, ...], sharded uniformly by
+    EP Shard(0) + TP (the D-08 ndim=3 rule)."""
+
+
+def _stack_moe_experts(module: nn.Module, ep_stack: Dict[str, List[str]]) -> None:
+    """Per-expert parameters → stacked 3D parameters (stack is concat, values
+    exactly equal).
+
+    Executed before _shard_module_params in Phase A:
+    - fetch weights by source path → torch.stack(dim=0), register onto the
+      replaced experts holder;
+    - the original ModuleList is replaced as a whole (memory freed);
+    - v1 asserts no bias and consistent source-parameter shapes; meta tensors
+      work the same way (concat of metas).
+
+    ep_stack: {stacked relative path: [source parameter relative paths
+    (ordered by expert idx)]}, e.g.
+    {"experts.gate_proj": ["experts.0.gate_proj.weight", ...]}.
+    """
+    holders: Dict[str, Dict[str, nn.Parameter]] = {}
+    for stacked_path, sources in ep_stack.items():
+        parent_path, param_name = stacked_path.rsplit(".", 1)
+        tensors = []
+        requires_grad = True
+        for src in sources:
+            owner = _resolve_module(module, src.rsplit(".", 1)[0])
+            if getattr(owner, "bias", None) is not None:
+                raise NotImplementedError(
+                    f"D-09 v1 does not support experts with bias "
+                    f"({src.rsplit('.', 1)[0]}); use an EP-aware MoE module instead"
+                )
+            t = _get_attr_by_path(module, src)
+            tensors.append(t.data if hasattr(t, "data") else t)
+            requires_grad = getattr(t, "requires_grad", True)
+        stacked = torch.stack(tensors, dim=0)
+        holders.setdefault(parent_path, {})[param_name] = nn.Parameter(
+            stacked, requires_grad=requires_grad)
+
+    for parent_path, params in holders.items():
+        holder = _StackedExperts()
+        for name, p in params.items():
+            holder.register_parameter(name, p)
+        *path, leaf = parent_path.split(".")
+        obj = module
+        for seg in path:
+            obj = obj[int(seg)] if seg.isdigit() else getattr(obj, seg)
+        setattr(obj, leaf, holder)   # replace the original ModuleList (original expert params freed)

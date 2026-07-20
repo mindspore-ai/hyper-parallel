@@ -36,7 +36,7 @@ def test_tiny_llama_golden_sp_on(tiny_llama, make_mesh):
     _assert_placement(attn.out_src["output"], dims, Partial())
     _assert_placement(attn.out_dst["output"], dims, Shard(1))
     assert attn._needs_cp_attn is True
-    assert attn._use_local_map is False
+    assert attn.use_local_map is False
 
     mlp = plan.modules["model.layers.0.mlp"]
     assert mlp.params["gate_proj.weight"][TP] == Shard(0)
@@ -91,7 +91,7 @@ def test_tiny_moe_golden(tiny_moe, make_mesh):
     plan = ShardingPlanner().plan(tiny_moe, mesh, tp_size=2, ep_size=2)
     assert plan.mesh_dim_names == ("tp", "ep")
     moe = plan.modules["model.layers.0.mlp"]
-    assert moe._use_local_map is True
+    assert moe.use_local_map is True
     # gate 全复制
     assert moe.params["gate.weight"][TP] == Replicate()
     assert moe.params["gate.weight"][EP] == Replicate()

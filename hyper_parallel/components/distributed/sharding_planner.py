@@ -12,29 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""sharding_planner: ShardingPlanner 6-phase 推导管线（05 §3.6 canonical）。
+"""sharding_planner: ShardingPlanner 6-phase derivation pipeline (05 §3.6 canonical).
 
-Phase 1  参数角色分类（ParameterClassifier + ARCH_OVERRIDES）
-Phase 2  通信边界分组（两趟：先按直属模块分组，再深度优先向上合并——
-         修正 05 §3.6.6 伪代码"单参数 group 推断"会把 q_proj 叶模块误判为
-         mlp 边界的缺陷）
-Phase 3  语义角色推断（FQN 显式模式 > 结构守卫 > 参数角色组合）
-Phase 4  模板查表生成 spec（_build_spec_from_template）
-Phase 4.5 用户 plan_overrides 合并（_merge_plan_overrides，05 §3.6.7）
-Phase 5  链式传播校验（填充缺省 in_src + 校验相邻契约 + _is_terminal 标记）
-Phase 6  特殊参数处理器收集（SPECIAL_HANDLERS）
+Phase 1  parameter role classification (ParameterClassifier + ARCH_OVERRIDES)
+Phase 2  communication boundary grouping (two passes: first group by owning
+         module, then merge upward depth-first — fixes the flaw in the
+         05 §3.6.6 pseudocode where "single-parameter group inference"
+         misjudges a q_proj leaf module as an mlp boundary)
+Phase 3  semantic role inference (explicit FQN patterns > structural guards
+         > parameter role combinations)
+Phase 4  template lookup to generate spec (_build_spec_from_template)
+Phase 4.5 user plan_overrides merge (_merge_plan_overrides, 05 §3.6.7)
+Phase 5  chain propagation (fill default in_src + warn on adjacent
+         contract mismatch + _is_terminal marking)
+Phase 6  special parameter handler collection (SPECIAL_HANDLERS)
 
-注册表：
+Registries:
 - ``ARCH_OVERRIDES``: {arch_name: [(pattern | [patterns], ParamRole)]}
 - ``SPECIAL_HANDLERS``: {handler_name: callable(module, param_name, mesh)}
 """
 
 import copy
 import logging
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
+from hyper_parallel.components.distributed.ep_utils import MOE_ROUTER_ADAPTERS
 from hyper_parallel.components.distributed.param_role import (
     ParameterClassifier,
     ParamRole,
@@ -45,7 +50,6 @@ from hyper_parallel.components.distributed.sharding_config import (
     TP,
     ModuleShardingSpec,
     NamedPlacement,
-    PlacementMismatchError,
     ShardingPlan,
     ShardingTemplate,
     TEMPLATES,
@@ -56,21 +60,41 @@ from hyper_parallel.components.distributed.sharding_config import (
 
 logger = logging.getLogger(__name__)
 
-# {arch_name: [(pattern | [patterns], ParamRole)]} —— 架构级命名覆盖（方式 B）。
-# pattern 为小写子串（或子串列表），命中即强制为该角色。
+# {arch_name: [(pattern | [patterns], ParamRole)]} — arch-level naming
+# overrides (Option B: replicate down-projections, colwise up-projections).
+# A pattern is a lowercase substring (or list of substrings); a hit forces
+# the parameter into that role.
+# DeepSeek MLA (deepseek_v2/v3 share the same structure): the q_a/kv_a
+# down-projections are forced to replicated (the LoRA rank dim is not
+# sharded); the q_b/kv_b up-projections are colwise along the head dim —
+# isomorphic to the standard attention template (the o_proj rowwise
+# contract over the head dim is unchanged). Keys are registered under both
+# the architectures spelling ("deepseekv3") and the model_type spelling
+# ("deepseek_v3").
+_DEEPSEEK_MLA_OVERRIDES = [
+    (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),
+    (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
+]
 ARCH_OVERRIDES: Dict[str, list] = {
     "llama": [],
     "qwen2": [],
     "qwen3": [],
     "mixtral": [],
+    "deepseekv2": _DEEPSEEK_MLA_OVERRIDES,
+    "deepseekv3": _DEEPSEEK_MLA_OVERRIDES,
+    "deepseek_v2": _DEEPSEEK_MLA_OVERRIDES,
+    "deepseek_v3": _DEEPSEEK_MLA_OVERRIDES,
 }
 
 
 def _shard_gated_delta(module, param_name, mesh):
-    """gated_delta 模块自定义 TP 分片骨架（SSM/Mamba 类模块，05 §6.4.6）。
+    """Custom TP sharding skeleton for gated_delta modules (SSM/Mamba-style
+    modules, 05 §6.4.6).
 
-    按 SSM head 结构切分而非标准 colwise/rowwise。骨架实现：结构识别与
-    标准 Shard(0) 回退；head 对齐的精细切分留待具体模型接入时补全。
+    Shards along the SSM head structure rather than standard
+    colwise/rowwise. Skeleton implementation: structural recognition plus
+    a standard Shard(0) fallback; the head-aligned fine-grained sharding is
+    left to be completed when a concrete model is onboarded.
     """
     import torch.nn as nn
 
@@ -81,19 +105,21 @@ def _shard_gated_delta(module, param_name, mesh):
     module.register_parameter(param_name, nn.Parameter(sharded))
 
 
-# {handler_name: callable(module, param_name, mesh)} —— Phase B 特殊参数处理器。
+# {handler_name: callable(module, param_name, mesh)} — Phase B special parameter handlers.
 SPECIAL_HANDLERS: Dict[str, Callable] = {
     "gated_delta_tp_shard": _shard_gated_delta,
 }
 
-# planner 侧 pattern → handler_name 映射（fqn 子串小写匹配）。
+# planner-side pattern → handler_name mapping (lowercase fqn substring match).
 _SPECIAL_HANDLER_PATTERNS: Dict[str, str] = {
     "gated_delta": "gated_delta_tp_shard",
     "a_log": "gated_delta_tp_shard",
     "dt_bias": "gated_delta_tp_shard",
 }
 
-# 叶子投影/容器段名守卫：这些段名自身不是边界容器，推断时返回 unknown 继续向上。
+# Leaf-segment guard for projection/container segment names: these segment
+# names are not boundary containers themselves; inference returns unknown
+# and continues upward.
 _LEAF_SEGMENT_GUARD = frozenset({
     "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
     "qkv_proj", "fused_qkv", "gate_up_proj", "query_key_value",
@@ -111,7 +137,7 @@ def _last_segment(fqn: str) -> str:
 
 
 def _infer_colwise_vs_rowwise(param_path: str, template: ShardingTemplate):
-    """按参数名后缀推断 TP placement：w2/down → rowwise，其余 → colwise。"""
+    """Infer the TP placement from the parameter name suffix: w2/down → rowwise, everything else → colwise."""
     name = param_path.lower()
     if any(k in name for k in ("w2", "down_proj", "down.")):
         return template.rowwise_placement
@@ -120,14 +146,18 @@ def _infer_colwise_vs_rowwise(param_path: str, template: ShardingTemplate):
 
 def _moe_expert_tp_placement(param_path: str, ndim: int,
                              template: ShardingTemplate):
-    """MOE_EXPERT 的 TP placement（修订 D-08，按参数 ndim 感知）。
+    """TP placement for MOE_EXPERT (revision D-08, ndim-aware per parameter).
 
-    expert 权重为 batched 3D 布局 [E, H_out, H_in]（ndim>=3）时，tensor dim 0
-    是 expert 维（归 EP Shard(0)），TP 的 colwise/rowwise 须作用在 +1 维：
-    colwise（切 H_out）→ Shard(1)；rowwise（切 contraction 维 H_in）→ Shard(2)。
-    per-expert 2D 布局（experts.N.w1 [H_out, H_in]）沿用标准 Shard(0)/Shard(1)
-    ——但此时 EP Shard(0) 会切 H_out，语义不成立：EP 应按"每 rank 持有 expert
-    子集"实现（module 级），需 ARCH_OVERRIDES/SpecialHandler，不在模板覆盖范围。
+    When expert weights use a batched 3D layout [E, H_out, H_in] (ndim>=3),
+    tensor dim 0 is the expert dim (owned by EP Shard(0)), so the TP
+    colwise/rowwise sharding must apply at dim +1:
+    colwise (shard H_out) → Shard(1); rowwise (shard the contraction dim
+    H_in) → Shard(2).
+    The per-expert 2D layout (experts.N.w1 [H_out, H_in]) keeps the standard
+    Shard(0)/Shard(1) — but then EP Shard(0) would shard H_out, which is
+    semantically invalid: EP must be implemented as "each rank holds a
+    subset of experts" (module level), requiring ARCH_OVERRIDES /
+    SpecialHandler; it is outside template coverage.
     """
     name = param_path.lower()
     is_rowwise = any(k in name for k in ("w2", "down_proj", "down."))
@@ -137,11 +167,13 @@ def _moe_expert_tp_placement(param_path: str, ndim: int,
 
 
 class ShardingPlanner:
-    """从任意 HF 风格模型自动推导 ShardingPlan（05 §3.6.6）。
+    """Automatically derive a ShardingPlan from any HF-style model (05 §3.6.6).
 
-    ``plan_overrides``: {module_fqn: ModuleShardingSpec} —— 用户手写 spec，
-    在 Phase 5 链式传播之前整体替换/插入（05 §3.6.7）。覆盖 spec 仍参与
-    相邻契约校验与 terminal 标记，比 plan() 返回后再打补丁安全。
+    ``plan_overrides``: {module_fqn: ModuleShardingSpec} — hand-written user
+    specs, which wholesale replace/insert entries before the Phase 5 chain
+    propagation (05 §3.6.7). Override specs still participate in adjacent
+    contract validation and terminal marking, which is safer than patching
+    after plan() returns.
     """
 
     def __init__(
@@ -153,7 +185,7 @@ class ShardingPlanner:
         self._special_handler_patterns = dict(_SPECIAL_HANDLER_PATTERNS)
         self._plan_overrides = dict(plan_overrides or {})
 
-    # ── 主入口 ──────────────────────────────────────────────────────────
+    # ── Main entry point ────────────────────────────────────────────────
 
     def plan(
         self,
@@ -168,14 +200,22 @@ class ShardingPlanner:
     ) -> ShardingPlan:
         arch = self._get_architecture(model)
         mesh_dim_names = self._build_mesh_dim_names(mesh, tp_size, cp_size, ep_size)
+        # D-10 TP-extend-EP (05 §6.4.8): ep_size is the extended EP group
+        # size (the a2a communication domain, extended from the TP group to
+        # neighboring dp/cp ranks; expert weights are sharded only along
+        # the expert dim; no separate etp configuration). Validation
+        # happens when _mark_hf_native_moe actually matches an HF-native
+        # MoE (pre-stacked EP-aware modules use their own dispatcher and
+        # are not subject to this constraint)
+        ep_extend = ep_size if ep_size > 1 else 0
 
-        # Phase 1: 参数角色分类
+        # Phase 1: parameter role classification
         param_roles = self._classify_all_params(model, arch)
 
-        # Phase 2: 通信边界分组
+        # Phase 2: communication boundary grouping
         boundary_groups = self._group_by_boundary(param_roles)
 
-        # Phase 3+4: 语义推断 + 模板填充 I/O
+        # Phase 3+4: semantic inference + template-fills I/O
         param_ndims = {name: p.ndim for name, p in model.named_parameters()}
         plan = ShardingPlan(
             mesh_dim_names=mesh_dim_names,
@@ -197,29 +237,36 @@ class ShardingPlanner:
                 param_ndims=param_ndims,
             )
             if spec is not None:
+                if boundary_type == "moe_mlp":
+                    self._mark_hf_native_moe(
+                        spec, group, boundary_fqn, template, mesh_dim_names, arch,
+                        ep_extend=ep_extend, mesh=mesh, model=model,
+                        param_ndims=param_ndims)
                 plan.modules[boundary_fqn] = spec
                 inferred_templates[boundary_fqn] = template
 
-        # Phase 4.5: 用户 plan_overrides 合并（05 §3.6.7，须在 Phase 5 之前——
-        # 覆盖 spec 仍要参与链式契约校验与 terminal 标记）
+        # Phase 4.5: merge user plan_overrides (05 §3.6.7; must run before
+        # Phase 5 — override specs still participate in chain propagation
+        # and terminal marking)
         self._merge_plan_overrides(plan, model, inferred_templates)
 
-        # Phase 5: 链式传播校验
+        # Phase 5: chain propagation
         plan = self._chain_propagate_and_validate(plan, model)
 
-        # Phase 6: 特殊参数处理
+        # Phase 6: special parameter handling
         plan.special_handlers = self._collect_special_handlers(param_roles)
 
-        # tied-weight 检测（embed <-> lm_head 共享存储）
+        # tied-weight detection (embed <-> lm_head sharing storage)
         plan.tied_pairs = self._detect_tied_pairs(model)
 
         return plan
 
-    # ── 架构检测 ────────────────────────────────────────────────────────
+    # ── Architecture detection ──────────────────────────────────────────
 
     def _get_architecture(self, model) -> str:
-        """检测 canonical 架构名：config.architectures[0] > config.model_type > 类名，
-        小写化并剥离 ForCausalLM 等后缀。"""
+        """Detect the canonical architecture name:
+        config.architectures[0] > config.model_type > class name;
+        lowercased with ForCausalLM-style suffixes stripped."""
         cfg = getattr(model, "config", None)
         arch_str = None
         archs = getattr(cfg, "architectures", None)
@@ -240,8 +287,8 @@ class ShardingPlanner:
     def _build_mesh_dim_names(
         self, mesh, tp_size: int, cp_size: int, ep_size: int,
     ) -> Tuple[str, ...]:
-        """以 mesh.mesh_dim_names 为权威顺序过滤 tp/cp/ep；未声明时按 (tp,cp,ep)
-        回退；size=1 轴剔除。"""
+        """Filter tp/cp/ep with mesh.mesh_dim_names as the authoritative
+        order; fall back to (tp,cp,ep) when undeclared; drop size=1 axes."""
         mesh_names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
         dtensor_axes = ("tp", "cp", "ep")
         active = {ax for ax, sz in (("tp", tp_size), ("cp", cp_size), ("ep", ep_size))
@@ -260,21 +307,27 @@ class ShardingPlanner:
     def _group_by_boundary(
         self, param_roles: Dict[str, ParamRole],
     ) -> Dict[str, List[Tuple[str, ParamRole]]]:
-        """两趟分组（修正 05 §3.6.6 伪代码的单参数 group 缺陷）：
+        """Two-pass grouping (fixes the single-parameter group flaw in the
+        05 §3.6.6 pseudocode):
 
-        趟 1：按直属模块 FQN 分组（去掉 leaf 参数名）。
-        趟 2：工作队列深度优先——组内角色齐全时做边界推断；unknown 则把整组
-              参数向上合并到父模块并入队（父模块更浅、必然后处理；兄弟模块的
-              参数先合并齐备再推断，避免 q_proj 单独被误判）。回溯到根仍
-              unknown 归入参数所在模块（后续无模板命中 → warning 跳过）。
+        Pass 1: group by owning module FQN (strip the leaf parameter name).
+        Pass 2: depth-first work queue — when the group's roles are
+                complete, run boundary inference; on unknown, merge the
+                whole group's parameters upward into the parent module and
+                enqueue it (the parent is shallower and is therefore
+                processed later; sibling modules' parameters are merged
+                completely before inference, avoiding q_proj being
+                misjudged on its own). If still unknown after backtracking
+                to the root, attribute the group to the parameter's own
+                module (no template will match later → warning and skip).
         """
-        # 趟 1
+        # Pass 1
         own: Dict[str, List[Tuple[str, ParamRole]]] = {}
         for fqn, role in param_roles.items():
             module_fqn = ".".join(fqn.split(".")[:-1])
             own.setdefault(module_fqn, []).append((fqn, role))
 
-        # 趟 2
+        # Pass 2
         merged: Dict[str, List[Tuple[str, ParamRole]]] = {
             mfqn: list(params) for mfqn, params in own.items()
         }
@@ -295,10 +348,12 @@ class ShardingPlanner:
                 if parent:
                     if parent not in merged:
                         merged[parent] = []
-                        pending.append(parent)  # 父模块更浅，尾部入队即可
+                        pending.append(parent)  # parent is shallower; tail-enqueue suffices
                     merged[parent].extend(params)
                 else:
-                    # 回溯到根仍 unknown：归入参数所在模块（后续无模板 → 跳过）
+                    # Still unknown after backtracking to the root:
+                    # attribute to the parameter's own module (no template
+                    # will match later → skipped)
                     origin = ".".join(params[0][0].split(".")[:-1]) if params else mfqn
                     groups.setdefault(origin, params)
             consumed.add(mfqn)
@@ -307,14 +362,16 @@ class ShardingPlanner:
     # ── Phase 3 ─────────────────────────────────────────────────────────
 
     def _infer_boundary_type(self, fqn: str, group: List[Tuple[str, ParamRole]]) -> str:
-        """从模块 FQN + 组内参数角色识别语义角色。
+        """Identify the semantic role from the module FQN + the group's
+        parameter roles.
 
-        优先级：显式 FQN 模式 > 叶子段守卫 > MoE 角色 > 参数角色组合 > 默认。
+        Priority: explicit FQN patterns > leaf-segment guard > MoE roles >
+        parameter role combinations > default.
         """
         fqn_lower = fqn.lower()
         seg = _last_segment(fqn)
 
-        # 1. 显式规则（最高优先级，叶模块即边界）
+        # 1. Explicit rules (highest priority; the leaf module itself is the boundary)
         if _match_any(fqn_lower, ["embed_tokens", "wte", ".embed.", "tok_embeddings",
                                   "embed_in", "word_embeddings"]):
             return "embed"
@@ -325,11 +382,18 @@ class ShardingPlanner:
         if _match_any(seg, ["router"]):
             return "moe_gate"
 
-        # 2. 叶子段守卫：投影/expert 叶模块自身不是边界容器
+        # 2. Leaf-segment guard: projection/expert leaf modules are not
+        # boundary containers themselves
         if seg in _LEAF_SEGMENT_GUARD:
             return "unknown"
+        # Numeric-segment guard: HF per-expert containers (experts.0..N) are
+        # not boundaries; parameters must aggregate upward into the moe
+        # container (D-09, 05 §6.4.7)
+        if seg.isdigit():
+            return "unknown"
 
-        # 3. MoE 角色：含 MOE_* 角色的组向上聚合到 moe 容器边界
+        # 3. MoE roles: groups containing MOE_* roles aggregate upward into
+        # the moe container boundary
         roles = {r for _, r in group}
         moe_roles = {ParamRole.MOE_EXPERT, ParamRole.SHARED_EXPERT, ParamRole.MOE_GATE}
         if roles & moe_roles:
@@ -337,7 +401,7 @@ class ShardingPlanner:
                 return "moe_mlp"
             return "unknown"
 
-        # 4. 参数角色组合
+        # 4. Parameter role combinations
         has_colwise = any(r in (ParamRole.COLWISE, ParamRole.FUSED_QKV,
                                 ParamRole.FUSED_GATE_UP) for _, r in group)
         has_rowwise = any(r == ParamRole.ROWWISE for _, r in group)
@@ -346,7 +410,7 @@ class ShardingPlanner:
                 return "attention"
             if _match_any(fqn_lower, list(_MLP_PATTERNS)):
                 return "mlp"
-            return "attention"  # 默认 attention（更保守的 SP 通信）
+            return "attention"  # default to attention (more conservative SP communication)
         if has_colwise and not has_rowwise:
             if _match_any(fqn_lower, list(_MLP_PATTERNS)):
                 return "mlp"
@@ -361,12 +425,12 @@ class ShardingPlanner:
         template: ShardingTemplate, sequence_parallel: bool, loss_parallel: bool,
         mesh_dim_names: Tuple[str, ...], param_ndims: Optional[Dict[str, int]] = None,
     ) -> Optional[ModuleShardingSpec]:
-        """Template + ParamRole → ModuleShardingSpec（05 §3.5 Template Mapping）。"""
+        """Template + ParamRole → ModuleShardingSpec (05 §3.5 Template Mapping)."""
         has_tp = "tp" in mesh_dim_names
         has_ep = "ep" in mesh_dim_names
         spec = ModuleShardingSpec()
 
-        # Step 1: 按 ParamRole 填充 spec.params
+        # Step 1: fill spec.params per ParamRole
         for param_fqn, role in group:
             param_path = param_fqn[len(boundary_fqn) + 1:]
             ndim = (param_ndims or {}).get(param_fqn, 2)
@@ -375,7 +439,8 @@ class ShardingPlanner:
             if placement is not None:
                 spec.params[param_path] = placement
 
-        # Step 2: 按 SP 开关选择 I/O 契约（深拷贝，避免链式传播改脏共享模板）
+        # Step 2: select the I/O contract per the SP switch (deep copy, so
+        # chain propagation cannot dirty the shared templates)
         if sequence_parallel:
             spec.in_src = copy.deepcopy(template.sp_in_src)
             spec.in_dst = copy.deepcopy(template.sp_in_dst)
@@ -387,18 +452,22 @@ class ShardingPlanner:
             spec.out_src = copy.deepcopy(template.nosp_out_src)
             spec.out_dst = copy.deepcopy(template.nosp_out_dst)
 
-        # Step 2.5: lm_head 的 out_dst 取决于 loss_parallel（运行时决策）。
-        # CP 维恒 Shard(1)（D-07/R8）：CP 下在本地 chunk 上算 loss，不做 gather。
+        # Step 2.5: lm_head's out_dst depends on loss_parallel (a runtime
+        # decision).
+        # The CP dim is always Shard(1) (D-07/R8): under CP the loss is
+        # computed on the local chunk; no gather is performed.
         if template is self._templates.get("lm_head"):
             spec.out_dst = _multi_dim(
                 tp=Shard(-1) if loss_parallel else Replicate(),
                 cp=Shard(1), ep=Replicate(),
             )
 
-        # Step 2.6: embed 的 CP 契约（修订 D-05）：CP 数据管道
-        # （shard_batch_for_cp，05 §6.3.4）已把 input_ids 按 CP 切好——
-        # in/out 的 CP 维为 Shard(1) 而非模板默认的 Replicate，否则 boundary
-        # 会把已切分的 chunk 再 scatter 一次（序列被切两次）。
+        # Step 2.6: embed's CP contract (revision D-05): the CP data
+        # pipeline (shard_batch_for_cp, 05 §6.3.4) has already sharded
+        # input_ids along CP — the CP dim of in/out is Shard(1) rather than
+        # the template's default Replicate, otherwise the boundary would
+        # scatter the already-sharded chunk a second time (the sequence
+        # would be sharded twice).
         has_cp = "cp" in mesh_dim_names
         if template is self._templates.get("embed") and has_cp and sequence_parallel:
             spec.in_src = {"input": _multi_dim(tp=Replicate(), cp=Shard(1),
@@ -407,12 +476,12 @@ class ShardingPlanner:
                                                ep=Replicate())}
             spec.out_src = _multi_dim(tp=Partial(), cp=Shard(1), ep=Replicate())
 
-        # Step 3: 特殊标记
-        spec._use_local_map = template.use_local_map
+        # Step 3: special flags
+        spec.use_local_map = template.use_local_map
         if template.needs_cp_attn:
             spec._needs_cp_attn = True
 
-        # Step 4: 归一化 out_src/out_dst 标量简写
+        # Step 4: normalize out_src/out_dst scalar shorthand
         return _normalize_out_fields(spec)
 
     @staticmethod
@@ -420,7 +489,8 @@ class ShardingPlanner:
         param_path: str, role: ParamRole, template: ShardingTemplate,
         has_tp: bool, has_ep: bool, ndim: int = 2,
     ) -> Optional[NamedPlacement]:
-        """13 角色 → placement 映射（05 §3.5 映射表 + D-08 ndim 感知）。"""
+        """13 roles → placement mapping (05 §3.5 mapping table + D-08
+        ndim-aware)."""
         if role in (ParamRole.COLWISE, ParamRole.EMBED, ParamRole.LM_HEAD,
                     ParamRole.FUSED_QKV, ParamRole.FUSED_GATE_UP):
             return _multi_dim(tp=template.colwise_placement if has_tp else None,
@@ -432,79 +502,327 @@ class ShardingPlanner:
             return _multi_dim(tp=template.norm_placement if has_tp else None,
                               cp=Replicate(), ep=Replicate())
         if role == ParamRole.MOE_EXPERT:
-            # 05 §3.5 NOTE：has_tp=False 时显式 Replicate（而非省略 TP 键）。
-            # D-08：3D expert 权重 [E, H_out, H_in] 的 TP 维按 ndim 平移。
+            # 05 §3.5 NOTE: when has_tp=False, use an explicit Replicate
+            # (rather than omitting the TP key).
+            # D-08: the TP dim of a 3D expert weight [E, H_out, H_in] is
+            # shifted according to ndim.
             tp_p = (_moe_expert_tp_placement(param_path, ndim, template)
                     if has_tp else Replicate())
             return _multi_dim(tp=tp_p, cp=Replicate(),
                               ep=template.moe_expert_placement if has_ep else None)
         if role == ParamRole.SHARED_EXPERT:
-            # EP 维全复制；TP 按 w1/w3(colwise)/w2(rowwise)
+            # replicated along the EP dim; TP per w1/w3(colwise)/w2(rowwise)
             tp_p = _infer_colwise_vs_rowwise(param_path, template)
             return _multi_dim(tp=tp_p if has_tp else None,
                               cp=Replicate(), ep=Replicate())
         if role == ParamRole.BIAS:
             return _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())
-        # SPECIAL → Phase 6；SKIP → 不分片
+        if role == ParamRole.REPLICATED:
+            # MLA down-projections etc. (explicitly assigned via
+            # ARCH_OVERRIDES): replicate on all dims.
+            # The output latent is identical within the TP group, so the
+            # input contract of the downstream q_b/kv_b (COLWISE), sharded
+            # along the head dim, matches standard attention.
+            return _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())
+        # SPECIAL → Phase 6; SKIP → not sharded
         return None
 
-    # ── Phase 4.5: 用户 spec 覆盖（05 §3.6.7） ───────────────────────────
+    # ── Phase 4 post-processing: HF-native MoE marking (D-09, 05 §6.4.7) ──
+
+    @staticmethod
+    def _validate_ep_extend(ep_extend, mesh, model) -> None:
+        """D-10 TP-extend-EP validation (05 §6.4.8): ep_size must not
+        exceed the dense region and must divide it;
+        num_experts % ep_size == 0 (each rank holds num_experts/ep_size
+        complete experts).
+
+        The dense region = all ranks of the non-pp mesh axes
+        (dp_replicate × dp_cp × tp).
+        Called only when _mark_hf_native_moe actually matches an
+        HF-native MoE.
+        """
+        names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
+        shape = tuple(getattr(mesh, "mesh_shape", ()) or ())
+        domain = 1
+        for name, size in zip(names, shape):
+            if name == "pp" and size > 1:
+                raise NotImplementedError(
+                    "D-10 TP-extend-EP v1 does not support pp>1 "
+                    "(split the mesh by stage before calling)"
+                )
+            if name != "pp":
+                domain *= size
+        if ep_extend > domain or domain % ep_extend != 0:
+            raise ValueError(
+                f"ep_size ({ep_extend}) must not exceed and must divide "
+                f"the dense region (dp_replicate × dp_cp × tp = {domain})"
+            )
+        num_experts = (getattr(getattr(model, "config", None), "num_experts", None)
+                       or getattr(getattr(model, "config", None), "n_routed_experts", 0))
+        if num_experts and num_experts % ep_extend != 0:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by ep_size ({ep_extend})"
+            )
+
+    # per-expert parameter pattern: experts.<idx>.<proj>.weight (legacy HF /
+    # in-house MoE layouts).
+    _PER_EXPERT_RE = re.compile(r"^experts\.(\d+)\.([^.]+)\.weight$")
+    # batched parameter pattern: experts.<attr> (a single attribute with no
+    # numeric segment, the layout after the HF 2025 refactor —
+    # gate_up_proj [E, 2I, H] / down_proj [E, H, I], natively stacked with
+    # no stacking needed; the automodel names gate_and_up_projs/down_projs
+    # are isomorphic). w1/w2/w3 names are not accepted: that is the
+    # conventional layout of EP-aware pre-stacked modules (own dispatcher),
+    # which follow the original path.
+    _BATCHED_EXPERT_RE = re.compile(
+        r"^experts\.(gate_up_proj|gate_and_up_projs|down_proj|down_projs"
+        r"|gate_proj|up_proj)$")
+
+    def _mark_hf_native_moe(
+        self, spec: ModuleShardingSpec, group, boundary_fqn: str,
+        template: ShardingTemplate, mesh_dim_names: Tuple[str, ...], arch: str,
+        *, ep_extend: int = 0, mesh=None, model=None, param_ndims=None,
+    ) -> None:
+        """HF-native MoE → TP-extend-EP metadata (D-09a stacking /
+        D-11 batched + D-10).
+
+        Match condition: ep_extend > 0 (i.e. ep_size > 1) and all MOE_EXPERT
+        parameters in the group belong to the same layout (mixed layouts
+        are not marked and emit a warning):
+        - **per-expert layout** (legacy HF / in-house):
+          experts.<idx>.<proj>.weight 2D parameters → record _ep_stack
+          stacking metadata and replace spec.params with the stacked
+          entry {EP: Shard(0)};
+        - **batched layout** (after the HF 2025 refactor, D-11):
+          experts.gate_up_proj [E, 2I, H] / experts.down_proj [E, H, I]
+          and similar single-attribute 3D parameters — natively stacked
+          with no stacking needed (_ep_stack stays empty); mark
+          {EP: Shard(0)} directly.
+        In both layouts the expert weights are sharded only along the
+        expert dim (each rank of the extended EP group holds
+        num_experts/ep_size complete experts; no second axis, 05 §6.4.8);
+        the MoE boundary contract is changed to SP-in identity
+        (communication-cohesive region); records
+        spec._ep_stack / spec._moe_router / spec._ep_size.
+        v1 does not support expert bias (a bias hit is not marked and
+        emits a warning).
+        """
+        if not ep_extend:
+            return
+        expert_params = [fqn for fqn, r in group if r == ParamRole.MOE_EXPERT]
+        if not expert_params:
+            return
+
+        stacks: Dict[str, List[Tuple[int, str]]] = {}   # proj → [(expert_idx, rel_path)]
+        batched: List[str] = []                          # rel paths of the batched layout
+        for param_fqn in expert_params:
+            rel = param_fqn[len(boundary_fqn) + 1:]
+            if "bias" in rel.lower():
+                logger.warning(
+                    "%s: MoE expert has bias (%s); not supported in v1, "
+                    "skipping EP marking",
+                    boundary_fqn, rel,
+                )
+                return
+            m = self._PER_EXPERT_RE.match(rel)
+            if m is not None:
+                stacks.setdefault(m.group(2), []).append((int(m.group(1)), rel))
+                continue
+            if (self._BATCHED_EXPERT_RE.match(rel) is not None
+                    and (param_ndims or {}).get(param_fqn, 2) >= 3):
+                batched.append(rel)
+                continue
+            logger.warning(
+                "%s: MoE parameter %s is neither per-expert nor batched "
+                "layout; skipping EP marking (the EP Shard(0) semantics do "
+                "not hold for a 2D parameter)",
+                boundary_fqn, rel,
+            )
+            return
+        if stacks and batched:
+            logger.warning(
+                "%s: mixed per-expert and batched layouts (%s ...); "
+                "skipping EP marking",
+                boundary_fqn, batched[0],
+            )
+            return
+
+        # D-10 validation runs on an actual match (pre-stacked modules are
+        # not subject to the dense region constraint)
+        self._validate_ep_extend(ep_extend, mesh, model)
+
+        # D-10 TP-extend-EP: expert weights are Shard(0) only along the
+        # expert dim (on the ep axis of the derived expert mesh (edp, ep));
+        # no TP key, no second-axis sharding
+        for proj, items in stacks.items():
+            items.sort()
+            sources = [rel for _, rel in items]
+            stacked = f"experts.{proj}"
+            for rel in sources:
+                spec.params.pop(rel, None)
+            spec.params[stacked] = _multi_dim(
+                tp=None, cp=Replicate(), ep=template.moe_expert_placement)
+            spec._ep_stack[stacked] = sources
+        for rel in batched:
+            spec.params[rel] = _multi_dim(
+                tp=None, cp=Replicate(), ep=template.moe_expert_placement)
+        spec._moe_router = arch if arch in MOE_ROUTER_ADAPTERS else "default"
+
+        # D-10: change the MoE boundary contract to SP-in identity
+        # (Megatron MoE never gathers anyway; all communication is
+        # cohesive inside the region, 05 §6.4.8). The layout follows the
+        # template in_src (SP → TP Shard(1); non-SP → Replicate); MoE is
+        # per-token computation, so the output layout always equals the
+        # input layout.
+        identity = copy.deepcopy(spec.in_src)
+        spec.in_dst = copy.deepcopy(identity)
+        out_layout = copy.deepcopy(next(iter(identity.values())))
+        spec.out_src = {"output": copy.deepcopy(out_layout)}
+        spec.out_dst = {"output": copy.deepcopy(out_layout)}
+        spec._ep_size = ep_extend
+
+    # ── Phase 4.5: user spec overrides (05 §3.6.7) ──────────────────────
 
     def _merge_plan_overrides(
         self, plan: ShardingPlan, model,
         inferred_templates: Dict[str, ShardingTemplate],
     ) -> None:
-        """合并用户手写 spec（plan_overrides），在 Phase 5 之前执行。
+        """Merge hand-written user specs (plan_overrides), executed before
+        Phase 5.
 
-        语义：
-        - fqn 已命中 planner 生成的 spec → 整体替换（用户 spec 为权威）；
-        - fqn 未命中（planner 漏识别/无模板/无参数模块）→ 插入；
-        - 结构标记 ``_use_local_map`` / ``_needs_cp_attn`` 从推断模板补齐
-          （它们是模块结构属性而非 I/O 契约：MoE all-to-all 与 CP K/V
-          all-gather 缺失会导致数值错误，因此模板推断为 True 时强制置位，
-          用户 spec 无需也不应负责）；
-        - ``out_src``/``out_dst`` 标量简写在此归一化；
-        - ``_is_terminal`` 由 Phase 5 统一标记，用户预设值会被覆盖；
-        - 深拷贝用户 spec——plan() 可重复调用，chain 传播会就地改 in_src，
-          不能污染调用方持有的对象。
+        Semantics:
+        - fqn already matches a planner-generated spec → wholesale
+          replacement (the user spec is authoritative);
+        - fqn not matched (planner missed it / no template / module
+          without parameters) → insertion;
+        - the structural flags ``use_local_map`` / ``_needs_cp_attn`` are
+          backfilled from the inferred template (they are module structural
+          properties, not I/O contracts: a missing MoE all-to-all or CP
+          K/V all-gather causes numerical errors, so they are force-set
+          whenever template inference yields True; the user spec neither
+          needs to nor should be responsible for them);
+        - the CP customization entries ``inner_target`` / ``inner_wrapper``
+          are user fields (preserved via deep copy) and no flag is
+          rewritten — inner-wrap gating is derived by the applier's
+          ``_resolve_inner_wrapper`` resolution chain (05 §4.4.2);
+        - ``local_compute_fn`` is a user field (preserved via deep copy)
+          and no flag is rewritten — local-region gating is derived by the
+          applier's ``_resolve_local_compute_fn`` resolution chain
+          (05 §4.4.3);
+        - ``out_src``/``out_dst`` scalar shorthand is normalized here;
+        - ``_is_terminal`` is uniformly marked by Phase 5; any user-preset
+          value is overwritten;
+        - the user spec is deep-copied — plan() can be called repeatedly
+          and chain propagation mutates in_src in place, so the caller's
+          held object must not be polluted.
+
+        Nesting is rejected up front (``_check_no_nested_overrides``):
+        boundaries assume a flat chain — chain propagation aligns each
+        boundary's in_src with the previous boundary's out_dst, which only
+        holds at module exits, and nested specs would also shard the same
+        parameter twice (production corrupts silently). An override FQN
+        must therefore not be an ancestor or descendant of any
+        planner-derived boundary, nor of another override; exact-FQN
+        replacement is the only supported same-tree form.
         """
         if not self._plan_overrides:
             return
+        self._check_no_nested_overrides(plan)
         module_names = {name for name, _ in model.named_modules()}
         for fqn, user_spec in self._plan_overrides.items():
             if not isinstance(user_spec, ModuleShardingSpec):
                 raise TypeError(
-                    f"plan_overrides[{fqn!r}] 必须是 ModuleShardingSpec，"
-                    f"得到 {type(user_spec).__name__}"
+                    f"plan_overrides[{fqn!r}] must be a ModuleShardingSpec, "
+                    f"got {type(user_spec).__name__}"
                 )
             if fqn not in module_names:
                 raise ValueError(
-                    f"plan_overrides 的 FQN 未在模型 named_modules 中命中: {fqn!r}"
-                    f"（检查拼写；PP 场景请对单 part 模型分别 plan）"
+                    f"plan_overrides FQN not found in the model's "
+                    f"named_modules: {fqn!r} (check spelling; in PP "
+                    f"scenarios plan each single-part model separately)"
                 )
             spec = copy.deepcopy(user_spec)
             template = inferred_templates.get(fqn)
             if template is not None:
                 if template.use_local_map:
-                    spec._use_local_map = True
+                    # force-set when the template is True (guards against
+                    # numerical errors); modules the user explicitly set to
+                    # True (in-house data-dependent modules) are unaffected
+                    # by the template and are naturally preserved
+                    spec.use_local_map = True
                 if template.needs_cp_attn:
                     spec._needs_cp_attn = True
+            # inner_target/inner_wrapper/local_compute_fn need no flag
+            # set: inner-wrap and local-region gating are derived by the
+            # applier's resolution chains (05 §4.4.2/§4.4.3)
             _normalize_out_fields(spec)
-            action = "替换" if fqn in plan.modules else "插入"
-            logger.info("plan_overrides: %s模块 %s 的 spec", action, fqn)
+            action = "replace" if fqn in plan.modules else "insert"
+            logger.info("plan_overrides: %s the spec of module %s", action, fqn)
             plan.modules[fqn] = spec
+
+    def _check_no_nested_overrides(self, plan: ShardingPlan) -> None:
+        """Fail-fast on nested spec FQNs (override ↔ planner-derived,
+        override ↔ override); exact-FQN replacement is allowed."""
+        derived = sorted(plan.modules)
+        overrides = list(self._plan_overrides)
+        for i, fqn in enumerate(overrides):
+            for other in overrides[i + 1:]:
+                if fqn.startswith(other + ".") or other.startswith(fqn + "."):
+                    raise ValueError(
+                        f"plan_overrides FQNs {other!r} and {fqn!r} are "
+                        f"nested (ancestor/descendant): merge them into a "
+                        f"single spec at the outer module — nested specs "
+                        f"are not supported"
+                    )
+            for d in derived:
+                if d == fqn:
+                    continue  # replacement semantics
+                if d.startswith(fqn + "."):
+                    children = [x for x in derived if x.startswith(fqn + ".")]
+                    raise ValueError(
+                        f"plan_overrides FQN {fqn!r} is an ancestor of the "
+                        f"planner-derived boundaries {children}: subtree "
+                        f"takeover via a nested spec is not supported (the "
+                        f"children would be double-wrapped/double-sharded, "
+                        f"and their structural flags such as use_local_map/"
+                        f"needs_cp_attn cannot be lifted to the ancestor "
+                        f"safely). Override each derived boundary directly "
+                        f"instead"
+                    )
+                if fqn.startswith(d + "."):
+                    raise ValueError(
+                        f"plan_overrides FQN {fqn!r} nests inside the "
+                        f"planner-derived boundary {d!r}: nested specs are "
+                        f"not supported (the parameter would be sharded "
+                        f"twice, and the inner boundary's in_src would be "
+                        f"filled from {d!r}.out_dst while at runtime it "
+                        f"sees {d!r}.in_dst). Override {d!r} directly — "
+                        f"replacement semantics, with param names relative "
+                        f"to it"
+                    )
 
     # ── Phase 5 ─────────────────────────────────────────────────────────
 
     def _chain_propagate_and_validate(self, plan: ShardingPlan, model) -> ShardingPlan:
-        """链式传播：填充缺省 in_src + 校验相邻模块契约一致性。
+        """Chain propagation: fill default in_src + warn on contract
+        mismatch between adjacent modules + _is_terminal marking.
 
-        匹配规则（对 05 §3.6.5 的修订——模板 in_src key 与上游 out_dst key
-        可能不同名，如 attention out "output" vs moe_mlp in "x_BLD"）：
-        - 双方都恰好 1 个 entry 时按"唯一 arg"配对（名字无关）；
-        - 否则按 key 名配对；
-        - next.in_src 整体为空时，用上游唯一 out_dst 值填充其 in_dst 声明的 key。
-        """
+        Matching rules (a revision to 05 §3.6.5 — the template in_src key
+        and the upstream out_dst key may have different names, e.g.
+        attention out "output" vs moe_mlp in "x_BLD"):
+        - when both sides have exactly 1 entry, pair as "the unique arg"
+          (name-agnostic);
+        - otherwise pair by key name;
+        - when next.in_src is entirely empty, fill the key declared by its
+          in_dst with the upstream's unique out_dst value.
+
+        A declared in_src differing from the upstream out_dst only logs a
+        warning (never raises): the comparison is a placement-tuple value
+        check with no shape awareness, so legitimate edges where the tensor
+        is reshaped/transposed between modules (e.g. [B,S,H] Shard(1) folded
+        to [B*S,H] Shard(0)) would otherwise be false positives. Correctness
+        of the declaration is covered by validate mode (DTensor dispatch +
+        numerical equivalence)."""
         sorted_fqns = self._topological_sort_by_forward_order(
             list(plan.modules.keys()), model
         )
@@ -522,23 +840,32 @@ class ShardingPlanner:
                 out_placement = curr_spec.out_dst[out_key]
                 if in_key is None:
                     continue
-                non_terminal.add(curr_fqn)  # out_dst 被下游引用
+                non_terminal.add(curr_fqn)  # out_dst is referenced downstream
                 declared = next_spec.in_src.get(in_key)
                 if not declared:
-                    # 场景 1：填充缺省
+                    # Scenario 1: fill the default
                     next_spec.in_src[in_key] = out_placement
                     continue
-                # 场景 3：校验一致性
+                # Scenario 3: mismatch — warn only (may be a legitimate
+                # reshape/transpose at the edge; validate mode covers
+                # correctness)
                 next_in = tuple(resolve_placements(declared, plan.mesh_dim_names))
                 curr_out = tuple(resolve_placements(out_placement, plan.mesh_dim_names))
                 if next_in != curr_out:
-                    raise PlacementMismatchError(
-                        f"{curr_fqn} → {next_fqn}", curr_out, next_in, "chain"
+                    logger.warning(
+                        "chain contract mismatch: %s.out_dst[%s] = %s vs "
+                        "%s.in_src[%s] = %s — the plan is kept (legitimate "
+                        "when the tensor is reshaped/transposed between the "
+                        "two modules); verify with validate mode if this is "
+                        "not intentional",
+                        curr_fqn, out_key, curr_out,
+                        next_fqn, in_key, next_in,
                     )
 
-        # _is_terminal 标记：out_dst 未被任何下游 in_src 引用 → terminal
-        # （按链式相邻关系判定——不做跨模块 placement 值相等匹配，避免
-        # lm_head 的 Replicate out_dst 被 embed 的 Replicate in_src 误引用。）
+        # _is_terminal marking: an out_dst not referenced by any downstream
+        # in_src → terminal (judged by chain adjacency — no cross-module
+        # placement value-equality matching, to avoid lm_head's Replicate
+        # out_dst being falsely referenced by embed's Replicate in_src.)
         for fqn, spec in plan.modules.items():
             spec._is_terminal = fqn not in non_terminal
         return plan
@@ -546,7 +873,8 @@ class ShardingPlanner:
     @staticmethod
     def _pair_contracts(out_dst: Dict[str, NamedPlacement],
                         next_spec: ModuleShardingSpec):
-        """产出 (out_key, in_key|None) 配对：单 entry 名字无关配对，否则按名配对。"""
+        """Produce (out_key, in_key|None) pairs: name-agnostic pairing when
+        both sides have a single entry, otherwise pair by name."""
         in_keys = list(next_spec.in_src.keys()) or list(next_spec.in_dst.keys())
         if len(out_dst) == 1 and len(in_keys) <= 1:
             out_key = next(iter(out_dst))
@@ -558,7 +886,8 @@ class ShardingPlanner:
         return pairs
 
     def _topological_sort_by_forward_order(self, fqns: List[str], model) -> List[str]:
-        """按 named_modules 注册顺序排序；未命中 FQN 追加到末尾并 warning。"""
+        """Sort by named_modules registration order; unmatched FQNs are
+        appended at the end with a warning."""
         fqn_set = set(fqns)
         ordered: List[str] = []
         seen: set = set()
@@ -569,8 +898,9 @@ class ShardingPlanner:
         missing = fqn_set - seen
         if missing:
             logger.warning(
-                "_topological_sort_by_forward_order: %d FQN 未在 named_modules "
-                "中命中，追加到末尾: %s", len(missing), sorted(missing)[:5],
+                "_topological_sort_by_forward_order: %d FQNs not found in "
+                "named_modules; appended at the end: %s",
+                len(missing), sorted(missing)[:5],
             )
             ordered.extend(sorted(missing))
         return ordered
@@ -580,7 +910,8 @@ class ShardingPlanner:
     def _collect_special_handlers(
         self, param_roles: Dict[str, ParamRole],
     ) -> Dict[str, str]:
-        """SPECIAL 角色参数 → handler 名（未注册模式归 "default"）。"""
+        """SPECIAL-role parameters → handler name (unregistered patterns
+        fall back to "default")."""
         result: Dict[str, str] = {}
         for fqn, role in param_roles.items():
             if role != ParamRole.SPECIAL:
@@ -597,15 +928,18 @@ class ShardingPlanner:
 
     @staticmethod
     def _detect_tied_pairs(model) -> List[Tuple[str, str]]:
-        """检测 embed_tokens.weight <-> lm_head.weight 的 tied 对。
+        """Detect the embed_tokens.weight <-> lm_head.weight tied pair.
 
-        HF tie_word_embeddings 时两端共享存储；PP 场景跨 stage 检测不到，
-        需用户显式声明 plan.tied_pairs（05 detect_tied_weights 注释）。
+        With HF tie_word_embeddings both ends share storage; in PP
+        scenarios the two ends cannot be detected across stages, so the
+        user must declare plan.tied_pairs explicitly (05
+        detect_tied_weights comment).
         """
         if not getattr(getattr(model, "config", None), "tie_word_embeddings", False):
             return []
         embed_fqn = lm_head_fqn = None
-        # remove_duplicate=False：tied 参数在 named_parameters 默认去重下只出现一次。
+        # remove_duplicate=False: under the default deduplication of
+        # named_parameters a tied parameter appears only once.
         for name, _ in model.named_parameters(remove_duplicate=False):
             if name.endswith("embed_tokens.weight"):
                 embed_fqn = name
@@ -620,7 +954,9 @@ def validate_model_compatibility(
     model, *, tp_size: int = 1, cp_size: int = 1, ep_size: int = 1,
     seq_len: Optional[int] = None,
 ) -> None:
-    """模型侧兼容性校验（05 §6.5；与 06 的拓扑校验分工——这里只看模型 config）。"""
+    """Model-side compatibility validation (05 §6.5; division of labor
+    with 06's topology validation — this only inspects the model
+    config)."""
     config = getattr(model, "config", None)
     if config is None:
         return

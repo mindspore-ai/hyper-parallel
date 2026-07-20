@@ -32,17 +32,9 @@ from torch.distributed.device_mesh import DeviceMesh
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 ```
 
-> 注：`FSDPModule` 的精确 import 路径随 torch 版本变化
-> （`torch.distributed.fsdp.FSDPModule` / `torch.distributed.fsdp2.FSDPModule`），
-> 实现时以目标 torch 版本为准。推荐使用 try/except 兼容导入：
-> ```python
-> try:
->     from torch.distributed.fsdp import FSDPModule    # torch >= 2.4
-> except ImportError:
->     from torch.distributed.fsdp2 import FSDPModule   # torch >= 2.6
-> ```
-> `nullcontext` 用于 `train_ctx` 在非 CP 场景的预赋值，避免 `if 'train_ctx' in dir()`
-> 这种脆弱判断。
+> 注：`FSDPModule` 统一从 `torch.distributed.fsdp` 导入（torch >= 2.4；
+> torch 2.13 实测无 `torch.distributed.fsdp2` 模块，不设 fallback 分支）。
+> `nullcontext` 用于 `get_sync_ctx` 的各分支统一返回 ContextManager（§7.1）。
 
 ---
 
@@ -83,6 +75,10 @@ from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 
 训练流程的全部工作在 `main()` → `recipe.setup()` → `recipe.run_train_validation_loop()` 三个入口完成。以下是完整的调用树。
 
+> 编号约定：④.x 采用 01 §4.1 canonical 编号（④.4=model、④.5=loss_fn、④.7=checkpointer、
+> ④.8=optimizer、④.9=dataloader…），与 01/02 文档对齐；树中缩进顺序为实际执行顺序，
+> 编号非单调属预期（如 ④.5 loss_fn 先于 ④.4 model 构建）。
+
 ```
 main()                                                               # 01_hf_compatibility_layer.md §4
 │
@@ -95,9 +91,9 @@ main()                                                               # 01_hf_com
 │   ├─④.1 self.dist_env = initialize_distributed("nccl")             # 分布式初始化
 │   ├─④.2 self.rng = StatefulRNG(seed=..., ranked=True)              # RNG
 │   ├─④.3 self.distributed_setup = create_distributed_setup_from_config(cfg)
-│   ├─④.4 self.metric_logger = build_metric_logger(cfg)              # 日志器
+│   ├─④.3a self.metric_logger = build_metric_logger(cfg)             # 日志器（03 附加步骤，01 canonical 未单列）
 │   │
-│   ├─④.5 self.loss_fn = cfg.loss_fn.build()                         # §9: typed .build()
+│   ├─④.5 self.loss_fn = cfg.loss_fn.build()                         # §10: typed .build()
 │   │   → LossConfig → MaskedCrossEntropy() / FusedLinearCrossEntropy()
 │   │
 │   ├─④.6 self.peft_config = cfg.peft.instantiate()  if configured   # untyped .instantiate()
@@ -105,48 +101,48 @@ main()                                                               # 01_hf_com
 │   ├─④.7 self.checkpointer = cfg.checkpoint.build(                  # 04_checkpoint.md: typed .build()
 │   │       dp_rank=..., tp_rank=..., pp_rank=...)
 │   │
-│   ├─④.8 self.model, self.optimizer_init = build_model(               # 01 §6: 构建分片模型
+│   ├─④.4 self.model, self.optimizer_init = build_model(               # 01 §6: 构建分片模型
 │   │       cfg.model, self.peft_config,
 │   │       distributed_setup=self.distributed_setup)
 │   │   └─ from_pretrained() → _build_model() → 返回已分片模型
 │   │   └─ self.model_parts = self.model.parts or [self.model]
 │   │
-│   ├─④.9 self.optimizer = cfg.optimizer.build(                      # §8: typed .build()
+│   ├─④.8 self.optimizer = cfg.optimizer.build(                      # §9: typed .build()
 │   │       model, device_mesh=self.mesh.device_mesh)
 │   │   └─ OptimizerConfig → 参数分组 → AdamW(param_groups, ...)
 │   │
-│   ├─④.10 self.dataloader, self.tokenizer = build_dataloader(...)   # 02_data_pipeline.md
-│   ├─④.11 self.val_dataloaders = build_validation_dataloader(...)
+│   ├─④.9 self.dataloader, self.tokenizer = build_dataloader(...)    # 02_data_pipeline.md
+│   ├─④.10 self.val_dataloaders = build_validation_dataloader(...)
 │   │
-│   ├─④.12 self.step_scheduler = cfg.step_scheduler.build(           # §3: typed .build()
+│   ├─④.11 self.step_scheduler = cfg.step_scheduler.build(           # §4: typed .build()
 │   │        self.dataloader, dp_size, local_batch_size)
 │   │
-│   ├─④.13 self.lr_scheduler = cfg.lr_scheduler.build(               # §8.6: typed .build()
+│   ├─④.12 self.lr_scheduler = cfg.lr_scheduler.build(               # §9.6: typed .build()
 │   │        self.optimizer, self.step_scheduler)
 │   │
-│   ├─④.14 self.load_checkpoint(restore_from)                        # 断点续训恢复
-│   └─④.15 self.mfu_calc = AutoMFU.from_config(model)
+│   ├─④.13 self.load_checkpoint(restore_from)                        # 断点续训恢复
+│   └─④.14 self.mfu_calc = AutoMFU.from_config(model)
 │
-└─⑤ recipe.run_train_validation_loop()                               # §5: 训练主循环
+└─⑤ recipe.run_train_validation_loop()                               # §6: 训练主循环
     │
-    ├─ for epoch in self.step_scheduler.epochs:                       # §3: StepScheduler 控制节奏
+    ├─ for epoch in self.step_scheduler.epochs:                       # §4: StepScheduler 控制节奏
     │   └─ self.step_scheduler.set_epoch(epoch)                      # sampler shuffle 种子
     │
-    └─ for batches in self.step_scheduler:                            # §3: 按 grad_acc_steps 分组
+    └─ for batches in self.step_scheduler:                            # §4: 按 grad_acc_steps 分组
         │
-        ├─⑤.1 train_metrics = self._run_train_optim_step(            # §6: 单步优化
+        ├─⑤.1 train_metrics = self._run_train_optim_step(            # §7: 单步优化
         │       batches, max_grad_norm)
         │   │
         │   ├─⑤.1.1 统计全局 token 数 (DP all-reduce)
         │   │
         │   ├─⑤.1.2 梯度累积循环 (for each microbatch):
-        │   │   └─ self._forward_backward_step(batch)                 # §7: 前向+反向
+        │   │   └─ self._forward_backward_step(batch)                 # §8: 前向+反向
         │   │       ├─ batch → GPU (non_blocking)
         │   │       ├─ CP batch 准备 (if cp_size > 1)
         │   │       ├─ labels 分离
         │   │       ├─ model(**filtered_batch)                        # 前向传播
         │   │       │   └─ PrecompiledBoundary → DTensor redistribute
-        │   │       ├─ calculate_loss(loss_fn, logits, labels, ...)   # §9: dispatcher
+        │   │       ├─ calculate_loss(loss_fn, logits, labels, ...)   # §10: dispatcher
         │   │       │   ├─ FusedLinearCrossEntropy? → hidden_states 路径
         │   │       │   └─ 标准 CE? → logits 路径 (shift + CE / num_tokens)
         │   │       └─ (loss * dp_size).backward()                    # 反向传播
@@ -155,7 +151,7 @@ main()                                                               # 01_hf_com
         │
         ├─⑤.2 if is_val_step: val_losses = self._run_validation(dl)  # 验证
         │
-        ├─⑤.3 if is_ckpt_step: self.save_checkpoint(...)             # §2 BaseRecipe: 遍历 __state_tracked
+        ├─⑤.3 if is_ckpt_step: self.save_checkpoint(...)             # §3 BaseRecipe: 遍历 __state_tracked
         │
         └─⑤.4 _maybe_collect_garbage()
 ```
@@ -167,15 +163,15 @@ main()
 ├─① load_yaml_config()           # 01 §2
 ├─② RecipeConfig(cfg)            # 01 §3
 └─④ recipe.setup(cfg)            # 01 §4
-    ├─④.8  model = ...           # 01 §6 (from_pretrained → _build_model)
-    ├─④.10 dataloader = ...      # 02_data_pipeline.md §3 (build_dataloader)
-    ├─④.9  optimizer = ...       # 本文档 §8
-    ├─④.12 step_scheduler = ...  # 本文档 §3
-    ├─④.5  loss_fn = ...         # 本文档 §9
-    └─④.13 lr_scheduler = ...    # 本文档 §8.6
-└─⑤ run_train_validation_loop()  # 本文档 §5
-    └─⑤.1 _run_train_optim_step  # 本文档 §6
-        └─⑤.1.2 _forward_backward_step  # 本文档 §7
+    ├─④.4  model = ...           # 01 §6 (from_pretrained → _build_model)
+    ├─④.9  dataloader = ...      # 02_data_pipeline.md §3 (build_dataloader)
+    ├─④.8  optimizer = ...       # 本文档 §9
+    ├─④.11 step_scheduler = ...  # 本文档 §4
+    ├─④.5  loss_fn = ...         # 本文档 §10
+    └─④.12 lr_scheduler = ...    # 本文档 §9.6
+└─⑤ run_train_validation_loop()  # 本文档 §6
+    └─⑤.1 _run_train_optim_step  # 本文档 §7
+        └─⑤.1.2 _forward_backward_step  # 本文档 §8
 ```
 
 ---
@@ -202,7 +198,8 @@ class BaseRecipe:
 
     def __init__(self):
         # 注册表：list[tuple[name, kind]]，kind ∈ {"model","optimizer",
-        # "lr_scheduler","rng","dataloader"}，与 04 `_state_path` kind 一致。
+        # "lr_scheduler","rng","dataloader","train_state"}，与 04 `_state_path`
+        # kind 一致。
         #
         # 注意：__state_tracked 使用双下划线前缀触发 Python name mangling
         # （实际存储为 _BaseRecipe__state_tracked）。这可以防止子类意外覆盖，
@@ -218,7 +215,8 @@ class BaseRecipe:
 
         name: Recipe 上的属性名（如 "model" / "optimizer"）。
         kind: 04 `_state_path` 所用的 state kind，取值：
-              "model" / "optimizer" / "lr_scheduler" / "rng" / "dataloader"。
+              "model" / "optimizer" / "lr_scheduler" / "rng" / "dataloader"
+              / "train_state"（如 §5.3 ⑰ 注册 ("step_scheduler", "train_state")）。
         同名重复注册将被忽略。
         """
         if name in self.__state_names:
@@ -252,13 +250,18 @@ class BaseRecipe:
     # 保证 save/load 同源。本方法仅负责遍历 `__state_tracked` 分发。
 
     def save_checkpoint(self, checkpoint_dir: str, epoch: int, step: int,
-                        train_loss: float, val_losses: dict | None = None) -> None:
+                        train_loss: float, val_losses: dict | None = None,
+                        is_final_checkpoint: bool = False) -> None:
         """遍历 __state_tracked，按 kind 委托 Checkpointer 保存。
 
         model / optimizer 走 `self.checkpointer.save_model` / `save_optimizer`
         （per-rank 子目录）；scheduler.pt / extra_state.json 落在 checkpoint
         根目录；dataloader / rng 等通过 `self._state_path`（Recipe 方法）
         落到对应 per-rank 子目录（与 04 load 同源）。
+
+        is_final_checkpoint: 训练结束后的 final save 传 True（04 §5.2 要求，
+        用于触发 save_consolidated=final 的 consolidated 权重导出等收尾行为）；
+        周期保存保持默认 False。
         """
         path = f"{checkpoint_dir}/epoch_{epoch}_step_{step}/"
         os.makedirs(path, exist_ok=True)
@@ -274,6 +277,10 @@ class BaseRecipe:
                     model_ref = obj
                 self.checkpointer.save_model(obj, f"{path}/model")
             elif kind == "optimizer":
+                # 【canonical】self.optimizer 为 list[Optimizer]（nemo_automodel
+                # 惯例，见 §9.3 build 返回类型），此处**原样**（不拆包）传给
+                # checkpointer；04 OptimizerState 接受 list[Optimizer]（以本节
+                # 为准，04 侧同步支持 list）。
                 # optimizer 子目录名与 04 `_state_path(kind=="optimizer")` 对齐
                 self.checkpointer.save_optimizer(model_ref, obj, f"{path}/optimizer")
             elif kind == "lr_scheduler":
@@ -331,7 +338,7 @@ def _is_stateful(obj: Any) -> bool:
 
 ## 4. StepScheduler —— 训练节奏控制
 
-> **调用位置**: 时序树 ④.12 — `cfg.step_scheduler.build()` 创建；⑤ — `epochs`/`__iter__` 控制训练循环节奏
+> **调用位置**: 时序树 ④.11 — `cfg.step_scheduler.build()` 创建；⑤ — `epochs`/`__iter__` 控制训练循环节奏
 
 ```python
 # components/training/step_scheduler.py
@@ -491,7 +498,7 @@ class StepScheduler:
         示例：`finally: self.step_scheduler.cleanup()`。
         """
         self.sig_handler.__exit__(None, None, None)
-
+```
 
 ### 4.1 StepSchedulerConfig
 
@@ -511,11 +518,21 @@ class StepSchedulerConfig:
     loss_average_window_steps: int = 100
     gc_every_steps: int | None = None
     num_train_epochs: int = 1
+    # global_batch_size 为正式字段（§12 YAML 示例直接配置它）。
+    # None 时退化为 local_batch_size * dp_world_size（即 grad_acc_steps=1）。
+    # 注意：本字段与 §5.3 ⑬ 传给 build_dataloader 的
+    # `step_scheduler.global_batch_size` 读取的是同一 YAML 键（同源），
+    # grad_acc_steps 计算与 dataloader 的 global_batch_size 不会出现口径分叉。
+    global_batch_size: int | None = None
 
     def build(self, dataloader, dp_world_size, local_batch_size,
               start_step=0, start_epoch=0):
-        global_batch_size = getattr(self, 'global_batch_size',
-                                    local_batch_size * dp_world_size)
+        # 字段已声明，直接读取；None 时按 local*dp 退化（与 dataloader 同源）
+        global_batch_size = (
+            self.global_batch_size
+            if self.global_batch_size is not None
+            else local_batch_size * dp_world_size
+        )
         return StepScheduler(
             dataloader=dataloader,
             global_batch_size=global_batch_size,
@@ -551,101 +568,44 @@ AutoModel 区分两类组件，使用不同的 `_target_` 消费方式：
 
 ### 5.2 RecipeConfig 桥接：YAML → 类型化 Config
 
-```python
-# recipes/_typed_config.py
+> **canonical 定义归 01 §3.3**（属性全集、`_callable_and_kwargs` /
+> `_section_kwargs` 辅助函数、`get()` 语义以 01 为准，01 侧同步补齐）。
+> 本节不重复完整实现，仅保留 03 消费侧视图：哪些属性是 typed（两层
+> `.build()`）、setup() 如何取用。与 01 §3.3 冲突的描述（含此前本节
+> `get()` 的 docstring 细节）一律删除。
 
-class RecipeConfig:
+```python
+# recipes/_typed_config.py（实现见 01 §3.3；以下为 03 消费侧视图）
+
+class RecipeConfig:  # canonical: 01 §3.3
     """将 YAML ConfigNode 桥接到强类型配置 Dataclass。
 
-    关键函数：
-    - _callable_and_kwargs(node): 提取 _target_ factory + 剩余 kwargs
-    - _section_kwargs(node): 提取 kwargs（丢弃 _target_）
-
-    两类消费方式：
-    - typed（有 .build() 方法）: optimizer, lr_scheduler, step_scheduler, loss_fn, checkpoint
-    - untyped（直接 .instantiate()）: model, peft, dataset, dataloader（通过 __getattr__ 透传原始 ConfigNode）
+    03 消费的两类属性：
+    - typed（有 .build()，setup() 注入运行时依赖）:
+        optimizer   -> OptimizerConfig        （§9.2/§9.3）
+        lr_scheduler -> LRSchedulerConfig     （§9.6）
+        step_scheduler -> StepSchedulerConfig （§4.1；过滤
+            local_batch_size/dp_size/dataloader 等运行时键后构造）
+        loss_fn     -> LossConfig             （§10.0）
+        checkpoint  -> CheckpointingConfig    （补 model_repo_id/is_peft）
+    - untyped（直接 .instantiate()，__getattr__ 透传原始 ConfigNode）:
+        model, peft, dataset, dataloader, tokenizer, collate
+    另有 get(dot_path, default) 供 setup() 读取嵌套标量（语义见 01 §3.3）。
     """
+```
 
-    def __init__(self, raw: ConfigNode):
-        self._raw = raw
+setup() 中的典型取用方式（与 §5.3 对应）：
 
-    # ── typed: optimizer ──
-    @cached_property
-    def optimizer(self) -> "OptimizerConfig | None":
-        from hyper_parallel.components.optim.optimizer import build_optimizer_config
-
-        node = self._raw.get("optimizer", None)
-        if node is None:
-            return None
-        factory, kwargs = _callable_and_kwargs(node)
-        return build_optimizer_config(factory, kwargs)
-
-    # ── typed: lr_scheduler ──
-    @cached_property
-    def lr_scheduler(self) -> "LRSchedulerConfig | None":
-        node = self._raw.get("lr_scheduler", None)
-        return LRSchedulerConfig(**_section_kwargs(node)) if node else None
-
-    # ── typed: step_scheduler ──
-    @cached_property
-    def step_scheduler(self) -> "StepSchedulerConfig":
-        node = self._raw.get("step_scheduler", None)
-        if node is None:
-            return StepSchedulerConfig()
-        kwargs = {k: v for k, v in _section_kwargs(node).items()
-                  if k not in ("local_batch_size", "dp_size", "dataloader")}
-        return StepSchedulerConfig(**kwargs)
-
-    # ── typed: loss_fn ──
-    @cached_property
-    def loss_fn(self) -> "LossConfig | None":
-        from hyper_parallel.components.loss import build_loss_config
-
-        node = self._raw.get("loss_fn", None)
-        if node is None:
-            return None
-        factory, kwargs = _callable_and_kwargs(node)
-        return build_loss_config(factory, **kwargs)
-
-    # ── typed: checkpoint ──
-    @cached_property
-    def checkpoint(self) -> "CheckpointingConfig":
-        from hyper_parallel.components.checkpoint.config import CheckpointingConfig
-
-        node = self._raw.get("checkpoint", None)
-        kwargs = _as_dict(node) if node is not None else {}
-        kwargs.pop("restore_from", None)
-        model = self._raw.get("model", None)
-        kwargs |= {
-            "model_repo_id": _model_name_from_cfg(model) if model is not None else None,
-            "is_peft": bool(self._raw.get("peft", None)),
-        }
-        return CheckpointingConfig(**kwargs)
-
-    # ── untyped: 所有其他属性透传原始 ConfigNode ──
-    def __getattr__(self, name: str) -> Any:
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return getattr(self._raw, name)
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """支持点号遍历的 get（如 'step_scheduler.local_batch_size'）。
-
-        逐段 getattr 进入 `_raw` 子节点；任意段缺失返回 `default`。
-        单段 key 等价于 `getattr(self._raw, key, default)`。
-
-        设计决策：使用 getattr 而非 ConfigNode.get，因为 `_raw` 为 OmegaConf
-        ConfigNode，其 .get() 仅作用于当前层不支持点号嵌套；用 getattr 可
-        直接沿对象属性链递归下降到任意深度的子节点，自然获得 dot-path 遍历
-        能力。中间节点缺失时 getattr(node, part, None) 返回 None，外层返回
-        `default`，行为与 ConfigNode.get 的缺失默认值语义一致。
-        """
-        node: Any = self._raw
-        for part in key.split("."):
-            if node is None:
-                return default
-            node = getattr(node, part, None)
-        return default if node is None else node
+```python
+self.loss_fn       = self.cfg.loss_fn.build()                       # ⑦
+self.checkpointer  = self.cfg.checkpoint.build(dp_rank=..., ...)    # ⑩
+self.optimizer     = self.cfg.optimizer.build(                      # ⑫
+    self.model, device_mesh=..., optimizer_init=..., is_peft=...)
+self.step_scheduler = self.cfg.step_scheduler.build(                # ⑮
+    self.dataloader, dp_size, local_batch_size)
+self.lr_scheduler  = self.cfg.lr_scheduler.build(                   # ⑯
+    self.optimizer, self.step_scheduler)
+# 嵌套标量：cfg.get("step_scheduler.local_batch_size", 1) 等（⑬⑭⑮）
 ```
 
 ### 5.3 Recipe.setup() 实现
@@ -663,12 +623,16 @@ class FinetuneRecipe(BaseRecipe):
         - cfg.<typed>.build(**runtime_deps) → optimizer, lr_scheduler, step_scheduler, loss, checkpoint
         - cfg.<untyped>.instantiate(**runtime_kwargs) → model, peft, dataset, dataloader, tokenizer
 
-        03 步骤编号 → 01 §4  canonical 编号映射：
-          03 ①=01 ④.1, 03 ②=01 ④.x（日志）, 03 ③=01 ④.2, 03 ④=01 ④.3,
-          03 ⑤=01 ④.x（MagiAttention）, 03 ⑥=01 ④.4, 03 ⑦=01 ④.5,
-          03 ⑧=01 ④.x（PP）, 03 ⑨=01 ④.6, 03 ⑩=01 ④.7, 03 ⑪=01 ④.8,
-          03 ⑫=01 ④.9, 03 ⑬=01 ④.10, 03 ⑭=01 ④.11, 03 ⑮=01 ④.12,
-          03 ⑯=01 ④.13, 03 ⑰/⑱=01 ④.14, 03 ⑲=01 ④.15
+        03 步骤编号 → 01 §4.1 canonical 编号映射（canonical 以 01 §4.1 时序树为准）：
+          03 ①=01 ④.1, 03 ②=01 ④.x（日志，canonical 未单列）, 03 ③=01 ④.2,
+          03 ④=01 ④.3, 03 ⑤=01 ④.x（MagiAttention）,
+          03 ⑥=01 ④.x（日志器，canonical 未单列；§2 树记为 ④.3a）,
+          03 ⑦=01 ④.5（Loss）, 03 ⑧=01 ④.x（PP）, 03 ⑨=01 ④.6（PEFT）,
+          03 ⑩=01 ④.7（Checkpointer）, 03 ⑪=01 ④.4（Model）,
+          03 ⑫=01 ④.8（Optimizer）, 03 ⑬=01 ④.9（DataLoader）,
+          03 ⑭=01 ④.10（Val DataLoader）, 03 ⑮=01 ④.11（StepScheduler）,
+          03 ⑯=01 ④.12（LR Scheduler）, 03 ⑰=01 ④.x（注册追踪状态）,
+          03 ⑱=01 ④.13（load_checkpoint）, 03 ⑲=01 ④.14（MFU）
         """
         self.cfg = cfg
 
@@ -728,7 +692,11 @@ class FinetuneRecipe(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
-            moe_mesh=getattr(self.distributed_setup, "moe_mesh", None),
+            moe_mesh=getattr(self.mesh, "moe_mesh", None),
+            # 06 D-10 口径：MeshContext 无 moe_mesh 字段（主 mesh 不含 EP 轴，
+            # expert mesh 由 apply_sharding_plan 期派生），此处 getattr 恒为 None。
+            # MoE 模型的 consolidated 导出需要派生 expert mesh 时，需由 sharding
+            # 层暴露（当前代码未导出，属已知缺口，见 04 §5.1 Checkpointer.__init__ 的 moe_mesh 注）。
         )
 
         # ⑪ Model —— untyped: .instantiate(**runtime_kwargs)
@@ -739,6 +707,8 @@ class FinetuneRecipe(BaseRecipe):
         self.model_parts = self.model.parts if hasattr(self.model, "parts") else [self.model]
 
         # ⑫ Optimizer —— typed: .build(model, device_mesh=...)
+        #     返回 list[Optimizer]（canonical，nemo_automodel 惯例；04
+        #     OptimizerState 接受 list[Optimizer]，以本节/§9.3 为准）
         self.optimizer = self.cfg.optimizer.build(
             self.model, device_mesh=self.mesh.device_mesh,
             optimizer_init=self.optimizer_init,      # 传入 build_model 导出的 param 分组（01 §4.2 / §6.2）
@@ -746,6 +716,8 @@ class FinetuneRecipe(BaseRecipe):
         )
 
         # ⑬ DataLoader —— untyped: .instantiate()
+        #     global_batch_size 与 StepSchedulerConfig.global_batch_size（§4.1）
+        #     读同一 YAML 键 step_scheduler.global_batch_size（同源，不分叉）
         self.dataloader, self.tokenizer = build_dataloader(
             cfg.dataset, cfg.dataloader, cfg.model, cfg.packed_sequence,
             cfg.get("seed", 42),
@@ -827,6 +799,11 @@ def run_train_validation_loop(self) -> None:
     # 若不需要进度条，可退化为 nullcontext / 空迭代器包装。
     pbar = self._make_progress_bar()
 
+    # 预绑 None：max_steps<=0 / 首步即 SIGTERM 等零迭代场景下，
+    # train_metrics/val_losses 不会在循环内赋值，final save 需守卫。
+    train_metrics: dict | None = None
+    val_losses: dict | None = None
+
     try:
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
@@ -868,12 +845,15 @@ def run_train_validation_loop(self) -> None:
         self.checkpointer.close()
 
     # 训练结束：最终 checkpoint + destroy process group
+    # is_final_checkpoint=True（04 §5.2 要求，触发 final consolidated 导出）；
+    # train_metrics/val_losses 零迭代时为 None（已在循环前预绑），做守卫。
     self.save_checkpoint(
         self.cfg.checkpoint.checkpoint_dir,
         self.step_scheduler.epoch,
         self.step_scheduler.global_step,
-        train_metrics.get("loss", 0.0),
-        val_losses if self.val_dataloaders else None,
+        (train_metrics or {}).get("loss", 0.0),
+        val_losses if (self.val_dataloaders and val_losses) else None,
+        is_final_checkpoint=True,
     )
     # destroy_process_group 定义见 06_distributed_infrastructure.md，
     # import: from hyper_parallel.components.distributed import destroy_process_group
@@ -907,28 +887,28 @@ def _run_validation_epoch(self, val_dl) -> dict[str, float]:
                     for k, v in batch.items()
                 }
 
-                # CP batch 准备（与训练一致；CP 维度非冗余，不需特别处理）。
-                # 05 canonical：shard_batch_for_cp(batch, cp_mesh) -> dict 只返回
-                # 切分后的 batch（含 seq_lens）；CP 上下文与 batch 解耦，由
-                # make_cp_context(mesh) 独立提供（或模型侧 prepare_model_inputs_for_cp
-                # 内部自管上下文）。
-                train_ctx = nullcontext()
+                # CP batch 准备（与训练 §8 Step 2 一致；CP 维度非冗余）。
+                # 已落地实现（hyper_parallel/components/distributed/cp_utils.py）：
+                # Q 按 contiguous chunk 切分（shard_batch_for_cp，契约：
+                # input_ids/labels/position_ids [B,S]、seq_lens/seq_lens_padded
+                # 按 CP rank 重算并保留 -1000 哨兵、qkv_format="thd" 透传）；
+                # K/V all-gather 由 apply_sharding_plan 编译期注入的 CP
+                # inner-attention wrapper（_wrap_cp_inner_attention，cp_mesh
+                # .size()>1 时生效）在 forward 内部完成——训练/验证循环
+                # **无需任何 CP context manager 或额外 hook**。
                 if self.mesh.cp_size > 1:
                     if hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
                         batch = self.model_parts[0].prepare_model_inputs_for_cp(**batch)
                     else:
                         batch = shard_batch_for_cp(batch, self.mesh.cp_mesh)
-                    train_ctx = make_cp_context(self.mesh)
 
                 labels = batch.pop("labels", None)
                 filtered_batch = filter_forward_kwargs(self.model_parts[0], batch)
 
                 # validate 路径：模型走 forward 的 validate 分支。
-                # CP 上下文必须包裹 forward，否则 ring-attention 通信不会插入
-                # （与训练 §8 Step 4 一致）。PP 多 stage 时复用 §8 训练侧
+                # PP 多 stage 时复用 §8 训练侧
                 # PP forward 调度（send/recv），此处仅展示单 stage 路径。
-                with train_ctx:
-                    output = self.model_parts[0](**filtered_batch)
+                output = self.model_parts[0](**filtered_batch)
                 logits = output.logits if hasattr(output, "logits") else output
 
                 # 统计本 microbatch 的 label token 数
@@ -1181,7 +1161,8 @@ def prepare_for_final_backward(model_parts: list[nn.Module]) -> None:
         # PP 多 stage：在各 stage 间挂 send/recv 钩子（实现见 PP runtime）。
         # _attach_pp_backward_hooks 注册 autograd hook 以在 backward 时
         # 跨 PP stage 传递梯度（send/recv），确保反向传播按 stage 顺序传播。
-        # 定义位置：components/parallel/pp_utils.py
+        # 【状态：待实现】PP 工具模块尚无属主代码，属主定为
+        # components/parallel/pp_utils.py（路径保留，落地前 PP>1 不可用）。
         # 签名：def _attach_pp_backward_hooks(model_parts: list[nn.Module]) -> None
         _attach_pp_backward_hooks(model_parts)
 
@@ -1256,38 +1237,26 @@ def _dp_cp_all_reduce_sum(tensor, dp_cp_mesh) -> torch.Tensor:
     return tensor
 
 
-# shard_batch_for_cp 为 05 canonical（定义见 05_dual_mode_dtensor_parallel_strategy.md），
-# 03 仅 import 调用：
-#   from hyper_parallel.components.parallel.cp_utils import shard_batch_for_cp
-# 签名：def shard_batch_for_cp(batch: dict, cp_mesh: DeviceMesh) -> dict
-
-
-def make_cp_context(mesh: "MeshContext"):
-    """独立构建 CP ring-attention 上下文（ContextManager），与 batch 解耦。
-
-    CP 启用时由训练/验证侧调用，包裹 model forward 以插入 K/V ring-attention
-    通信。CP 关闭（cp_size==1）时调用方不应走到此路径（预先 nullcontext 兜底）。
-
-    Args:
-        mesh: MeshContext，提供 cp_mesh / cp_rank / cp_size 等访问。
-    Returns:
-        ContextManager（with 语义），进入时注册 CP 通信组、退出时清理。
-    """
-    from hyper_parallel.components.parallel.cp_utils import (
-        RingAttentionContext,
-        get_cp_group,
-    )
-
-    cp_mesh = mesh.cp_mesh
-    cp_group = get_cp_group(cp_mesh)
-    cp_rank = mesh.cp_rank
-    cp_size = mesh.cp_size
-
-    return RingAttentionContext(
-        cp_group=cp_group,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-    )
+# shard_batch_for_cp 为 05 canonical，已落地于
+# hyper_parallel/components/distributed/cp_utils.py，03 仅 import 调用：
+#   from hyper_parallel.components.distributed.cp_utils import shard_batch_for_cp
+# 签名：def shard_batch_for_cp(batch: dict, cp_mesh) -> dict
+# 契约：input_ids/labels/position_ids [B,S] int64；seq_lens/seq_lens_padded
+# [B, max_num_packs] int64 且以 -1000 为哨兵填充；qkv_format="thd" 透传。
+# 切分策略：pad 到 2*cp 倍数后按 contiguous chunk [cp_rank*chunk,
+# (cp_rank+1)*chunk) 切片；seq_lens 系列由 _shard_seq_lens_for_cp 单独重算。
+#
+# CP 前向通信（K/V all-gather）不在训练循环内发生：apply_sharding_plan
+# 编译期对标记 _needs_cp_attn 的边界模块调用
+# sharding_applier._wrap_cp_inner_attention(
+#     attn_module, cp_mesh, *, spec=None, mesh=None, mesh_dim_names=())
+# （cp_mesh.size()>1 时生效），把 inner attention 的 forward 替换为
+# CP-aware 版本——内部调 flex_cp_allgather(k, v, cp_dim=2, cp_mesh)
+# （带 autograd 的 all-gather：前向 all-gather K/V，反向 reduce-scatter），
+# is_causal 时替换为按本 rank Q 全局偏移的 offset-aware 显式 mask（D-04）。
+# 因此训练循环只需 shard_batch_for_cp 切数据，**无需 make_cp_context /
+# RingAttentionContext / attach_context_parallel_hooks 之类的运行时 hook**。
+# （早期草案的 ring-attention 方案 D-01'' 已否决，本文统一为 all-gather K/V。）
 
 
 def _dp_all_reduce_avg(tensor, dp_mesh=None) -> torch.Tensor:
@@ -1427,7 +1396,11 @@ def _infer_peak_tflops(device_name: str) -> float:
 
 def _update_latest_symlink(checkpoint_dir: str, path: str) -> None:
     """原子更新 `{checkpoint_dir}/LATEST` 软链接，指向最新的 step 目录。
-    用 `os.symlink` + rename 实现原子替换。"""
+    用 `os.symlink` + rename 实现原子替换。
+
+    软链接写**相对路径**（相对 checkpoint_dir）的行为保留；消费端 04 的
+    `_resolve_latest_symlink` 需相对 checkpoint_dir 解析该链接（04 侧同步修）。
+    """
     import tempfile
 
     latest = os.path.join(checkpoint_dir, "LATEST")
@@ -1466,19 +1439,21 @@ def _forward_backward_step(
     }
 
     # ── Step 2: CP batch 准备 ──
-    # CP（Context Parallel）沿序列维度切分：每个 cp rank 持有不同的序列段，
-    # K/V 通过 ring-attention 在 CP context manager 内部跨 rank 交换。
-    # 05 canonical：shard_batch_for_cp(batch, cp_mesh) -> dict 只返回切分后的
-    # batch（含 seq_lens）；CP 上下文与 batch 解耦，由 make_cp_context(mesh)
-    # 独立提供（或模型侧 prepare_model_inputs_for_cp 自管）。train_ctx 预赋值
-    # 为 nullcontext，仅在 CP 开启时被覆盖为真实 CP 上下文。
-    train_ctx = nullcontext()
+    # CP（Context Parallel）沿序列维度切分：每个 cp rank 持有 Q 的 contiguous
+    # chunk；K/V 在 attention 内部由 CP wrapper 做 all-gather（flex_cp_allgather，
+    # 带 autograd），见 §7.1 末尾的 CP 机制说明。
+    # shard_batch_for_cp(batch, cp_mesh) -> dict 返回切分后的 batch：
+    # input_ids/labels/position_ids 按 [cp_rank*chunk, (cp_rank+1)*chunk) 切片
+    # （labels 的 pad 用 -100，CE 的 ignore_index 天然屏蔽）；seq_lens /
+    # seq_lens_padded 由 _shard_seq_lens_for_cp 按本 rank 区间重算并保留
+    # -1000 哨兵，供模型侧 varlen attention 与 loss 还原使用；qkv_format 透传。
+    # CP 包装由 apply_sharding_plan 编译期完成（_wrap_cp_inner_attention），
+    # 训练循环无需任何 CP context manager / hook。
     if self.mesh.cp_size > 1:
         if hasattr(model, "prepare_model_inputs_for_cp"):
             batch = model.prepare_model_inputs_for_cp(**batch)
         else:
             batch = shard_batch_for_cp(batch, self.mesh.cp_mesh)
-        train_ctx = make_cp_context(self.mesh)
 
     # ── Step 3: 分离 labels ──
     labels = batch.pop("labels", None)
@@ -1499,11 +1474,10 @@ def _forward_backward_step(
         # 过滤 forward 不接受的 kwargs
         filtered_batch = filter_forward_kwargs(model, batch)
 
-        # CP 模式：K/V ring-attention 通信在 train_ctx 内插入；
-        # backward 沿 CP 维自动微分（ring-attention 的反向通信由 autograd
-        # 自动触发，无需在此显式处理）。非 CP 模式 train_ctx == nullcontext()。
-        with train_ctx:
-            output = model(**filtered_batch)
+        # CP 模式：K/V all-gather 在 CP wrapper 包裹的 inner attention forward
+        # 内部发生（编译期注入，见 §7.1）；backward 沿 all-gather 的 autograd
+        # Function 自动做 reduce-scatter，无需在此显式处理。
+        output = model(**filtered_batch)
 
         # ── Step 5: Loss 计算 ──
         # local_loss = ce_sum_local（raw，不除 N）
@@ -1547,45 +1521,53 @@ def _forward_backward_step(
         (local_loss * dp_group_size).backward()
 
 
-# ── CP backward 机制说明 ──
+# ── CP backward 机制说明（all-gather K/V 方案，D-01''） ──
 #
-# CP 维度的前向：每个 cp rank 持有序列的一段，attention 的 K/V 通过
-# ring-attention（在 train_ctx 内部）跨 cp rank 流通，得到完整的 attention
-# 输出。loss 计算时 ce_sum_local 只统计本 rank 持有段的 token。
+# CP 维度的前向：每个 cp rank 持有 Q 的 contiguous chunk；inner attention
+# 内部先由 flex_cp_allgather 把 K/V 沿序列维 all-gather 为全量，再用本 rank
+# Q chunk 做 SDPA（is_causal 时替换为按本 rank Q 全局偏移 lo 的 offset-aware
+# 显式 mask，D-04），得到本 rank 段的 attention 输出。loss 计算时
+# ce_sum_local 只统计本 rank 持有段的 token（labels 的 CP pad 位为 -100，
+# 被 ignore_index 屏蔽；packed 序列按切分后的 seq_lens 还原）。
 #
-# CP 维度的反向：autograd 沿 CP 维自动微分。ring-attention 前向记录的
-# send/recv 通信在反向时按相反顺序触发（K/V gradient 反向 ring），无需
-# 用户显式插入反向通信。因此 backward() 调用与无 CP 场景完全一致，
+# CP 维度的反向：flex_cp_allgather 是显式 autograd.Function
+# （_AllGatherAlongDim），前向 all-gather、反向 reduce-scatter 语义
+# （梯度跨 rank all-reduce 求和后取本 rank chunk），由 autograd 自动触发，
+# 无需用户插入反向通信。因此 backward() 调用与无 CP 场景完全一致，
 # 不需要额外的 cp_size 因子（CP 不是冗余计算，梯度无需除以 cp_size）。
 #
-# 相关签名（实现见 05_dual_mode_dtensor_parallel_strategy.md / 模型侧）：
-#   def shard_batch_for_cp(batch: dict, cp_mesh: DeviceMesh) -> dict:
-#       """05 canonical：按 cp_size/cp_rank 切分 batch（含 seq_lens），
-#       只返回切分后的 batch dict，不返回 CP 上下文。"""
+# 相关签名（已落地：hyper_parallel/components/distributed/cp_utils.py、
+# sharding_applier.py；05 §4.4.2 / §6.3.4 canonical）：
+#   def shard_batch_for_cp(batch: dict, cp_mesh) -> dict:
+#       """按 cp_rank 取 contiguous chunk 切分 batch（seq_lens/seq_lens_padded
+#       按区间重算、保留 -1000 哨兵），只返回切分后的 batch dict。"""
 #       ...
 #
-#   def make_cp_context(mesh: MeshContext) -> "ContextManager":
-#       """独立构建 CP ring-attention 上下文（ContextManager），与 batch 解耦。
-#       mesh: MeshContext（提供 cp_mesh / cp_rank / cp_size）。
-#       CP 关闭时调用方不应走到此路径。"""
+#   def flex_cp_allgather(k, v, cp_dim: int, cp_mesh):
+#       """K/V 沿 cp_dim 在 CP 组内 all-gather（带 autograd；通信组取
+#       cp_mesh.get_group()，禁 new_group）。cp_size<=1 时原样返回。"""
+#       ...
+#
+#   def _wrap_cp_inner_attention(attn_module, cp_mesh, *, spec=None,
+#                                mesh=None, mesh_dim_names=()):
+#       """编译期（apply_sharding_plan Phase C）把 inner attention 替换为
+#       CP-aware forward；cp_mesh.size()>1 且 spec._needs_cp_attn 时生效。"""
 #       ...
 #
 #   def prepare_model_inputs_for_cp(self, **batch) -> dict:
 #       """模型自带版 CP 输入准备（处理 seq_lens 等），返回切分后 batch。
-#       若模型实现了该方法则优先使用，否则回退到 shard_batch_for_cp。
-#       注意：此方法只负责 batch 切分，CP 上下文仍由 make_cp_context 提供。"""
+#       若模型实现了该方法则优先使用，否则回退到 shard_batch_for_cp。"""
 #       ...
 #
-# train_ctx 的来源：CP 启用时由 make_cp_context(mesh) 返回（或模型自行
-# 暴露 cp_context 属性）；CP 关闭时为 nullcontext()。本函数顶部已统一预赋值，
-# 不再用 `if 'train_ctx' in dir()` 这种脆弱判断。
+# 注：01 §8.3 ⑩ 早期草案中的 attach_context_parallel_hooks 不存在——
+# CP 包装由 apply_sharding_plan 内部完成，训练循环无需额外 hook。
 ```
 
 ---
 
 ## 9. Optimizer 与 LR Scheduler
 
-> **调用位置**: 时序树 ④.9 / ④.13 — typed `.build()` 路径（`_target_` → typed config → `.build()`）
+> **调用位置**: 时序树 ④.8 / ④.12 — typed `.build()` 路径（`_target_` → typed config → `.build()`）
 
 ### 9.1 设计理念
 
@@ -1677,8 +1659,10 @@ class AdamWConfig(OptimizerConfig):
         parts = getattr(model, "parts", [model])
         optimizers = []
         for part in parts:
-            # 优先复用 optimizer_init.param_groups（已由 ShardingPlan 推导），
-            # 否则现场用 _is_no_decay + _build_param_groups 推导
+            # 优先复用 optimizer_init.param_groups（已由 ShardingPlan 推导，
+            # 01 §2.14 修正后 group 内为实际 weight_decay 值——此处原样复用，
+            # 不再覆盖 weight_decay）；否则现场用 _is_no_decay +
+            # _build_param_groups 推导
             if optimizer_init is not None and getattr(optimizer_init, "param_groups", None):
                 param_groups = optimizer_init.param_groups
             else:
@@ -1697,8 +1681,17 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         self.factory = factory
         self.kwargs = kwargs
 
-    def build(self, model, *, device_mesh=None, is_peft=False):
-        param_groups = _build_param_groups(model, self.kwargs.get("weight_decay", 0.1))
+    # 签名与基类 OptimizerConfig.build 一致（补 optimizer_init 形参），
+    # 外部优化器（如 Muon 示例）路径可用。
+    def build(self, model, *, device_mesh=None, optimizer_init=None,
+              is_peft=False):
+        # 与 AdamWConfig 同口径：优先复用 optimizer_init.param_groups
+        # （01 §2.14 已在 group 内写入实际 weight_decay 值，此处不重复覆盖，
+        # 也不再从 kwargs 取 weight_decay 传入 factory）
+        if optimizer_init is not None and getattr(optimizer_init, "param_groups", None):
+            param_groups = optimizer_init.param_groups
+        else:
+            param_groups = _build_param_groups(model, self.kwargs.get("weight_decay", 0.1))
         return [self.factory(param_groups, **{k: v for k, v in self.kwargs.items()
                                                if k != "weight_decay"})]
 ```
@@ -1771,10 +1764,14 @@ def _is_no_decay(name: str) -> bool:
 
 **设计决策**：为兼容 AutoModel checkpoint（`OptimizerParamScheduler.state_dict()`），hyper_parallel 采用 AutoModel 的 **step-based** 配置（绝对步数，非比例），而非之前设计的 ratio-based `LambdaLR`。如果需要 ratio-based 便利性，可以额外提供一个轻量 wrapper 将比例转换为绝对步数。
 
-> 注：`OptimizerParamScheduler` 来自 AutoModel 的 `nemo_automodel.components.optim.lr_scheduler`，
-> 需在 `components/optim/lr_scheduler.py` 中 import：
+> 注：`OptimizerParamScheduler` 来源于 AutoModel 的
+> `nemo_automodel.components.optim.lr_scheduler`，但 hyper_parallel 不 import
+> nemo_automodel（与 02 开头"不 import nemo_automodel"的约定一致）——需将
+> 该类 **port 进 hyper_parallel**，存放于
+> `hyper_parallel/components/optim/lr_scheduler.py`（文件头注明来源与出处
+> commit），使用时直接：
 > ```python
-> from nemo_automodel.components.optim.lr_scheduler import OptimizerParamScheduler
+> from hyper_parallel.components.optim.lr_scheduler import OptimizerParamScheduler
 > ```
 
 ```python
@@ -2092,8 +2089,15 @@ class DistributedSignalHandler:
 
     def signals_received(self) -> list[bool]:
         """all_gather：只要有一个 rank 收到 → 全体返回 True。"""
-        tensor = torch.tensor([int(self._signal_received)], dtype=torch.int32)
-        gathered = [torch.zeros(1, dtype=torch.int32) for _ in range(get_world_size())]
+        # NCCL 不支持 CPU tensor 的集合通信——选型：把 tensor 搬到当前 CUDA
+        # 设备再走默认（NCCL）group，而非新建 gloo group。理由：进程组初始
+        # 化只有 nccl（initialize_distributed("nccl")），单后端少一个需要
+        # 生命周期管理的专用 group，开销可忽略（每步 1 个 int32）。
+        device = torch.device("cuda", torch.cuda.current_device())
+        tensor = torch.tensor([int(self._signal_received)], dtype=torch.int32,
+                              device=device)
+        gathered = [torch.zeros(1, dtype=torch.int32, device=device)
+                    for _ in range(get_world_size())]
         torch.distributed.all_gather(gathered, tensor)
         return [bool(t.item()) for t in gathered]
 ```

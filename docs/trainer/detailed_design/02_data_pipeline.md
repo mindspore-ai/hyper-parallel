@@ -67,7 +67,7 @@ recipe.setup(cfg)                                                    # 03_traini
 │
 ├─ ... (model, optimizer, loss, ... 等组件构建)
 │
-└─⑧/④.10 self.dataloader, self.tokenizer = build_dataloader(  # ⑧ = 02 编号, ④.10 = 01/03 编号             # 唯一入口
+└─⑧/④.9 self.dataloader, self.tokenizer = build_dataloader(  # ⑧ = 02 编号, ④.9 = 01/03 canonical 编号              # 唯一入口
         cfg.dataset, cfg.dataloader, cfg.model, cfg.packed_sequence,
         seed, local_batch_size, global_batch_size,
         max_steps, val_check_interval, dp_rank, dp_world_size,
@@ -122,7 +122,7 @@ recipe.setup(cfg)                                                    # 03_traini
     │   ├─ cfg_dl.collate_fn 有 _target_                               # §5: _target_ 模式
     │   │   → lambda batch: collate_cfg.instantiate(batch=batch)      # lazy per-batch
     │   ├─ cfg_dl.collate_fn 是 callable                               # 直接用
-    │   ├─ 否则 → _default_lm_collate(tokenizer)                      # §5.1: 默认 padding
+    │   ├─ 否则 → default_collater(tokenizer)                         # §5.1: 默认 padding
     │   └─ PP 模式 → AutoConfig.from_pretrained + chained_collate_fn  # §3.2 Step 6: 预计算 causal mask
     │       （base_collate → add_causal_masks_to_batch，用 hf_model_config 而非 model.config）
     │
@@ -138,9 +138,9 @@ main()
 ├─① load_yaml_config()           # 01 §2
 ├─② RecipeConfig(cfg)            # 01 §3
 └─④ recipe.setup(cfg)            # 01 §4
-    ├─④.3  model = ...           # 01 §6
-    ├─④.7  optimizer = ...       # 03_training_loop §8
-    └─④.8  dataloader, tokenizer = build_dataloader(...)  ← 本文档入口
+    ├─④.4  model = ...           # 01 §4.1/§6
+    ├─④.8  optimizer = ...       # 03_training_loop §9
+    └─④.9  dataloader, tokenizer = build_dataloader(...)  ← 本文档入口
 ```
 
 ---
@@ -162,6 +162,7 @@ def build_dataloader(
     seed: int,
     local_batch_size: int,
     global_batch_size: int,
+    *,                   # 以下均为 keyword-only（调用方 03 按关键字传参）
     max_steps: int | None = None,
     val_check_interval: int | None = None,
     dp_rank: int,
@@ -198,8 +199,9 @@ def build_dataloader(
 # )
 # from hyper_parallel.components.training.rng import ScopedRNG
 # from hyper_parallel.components.distributed.utils import FirstRankPerNode
+#   （属主文件 components/distributed/utils.py，由 06 实现；契约见 §10）
 # from hyper_parallel.components.utils.model_utils import _supports_seq_lens
-# from hyper_parallel.components.config.loader import ConfigNode
+# from hyper_parallel.components.config.node import ConfigNode   # canonical 位置见 01
 # from hyper_parallel.components.datasets.utils import (
 #     _get_model_name,
 #     compute_trust_remote_code_from_model,
@@ -212,6 +214,7 @@ def build_dataloader(
 def build_dataloader(
     cfg_ds, cfg_dl, cfg_model, cfg_ps,
     seed, local_batch_size, global_batch_size,
+    *,  # 以下 keyword-only：默认参数不得先于非默认参数（Python 语法要求）
     max_steps=None, val_check_interval=None,
     dp_rank, dp_world_size, pp_enabled, cp_size=1,
     model=None,
@@ -226,6 +229,10 @@ def build_dataloader(
         if cfg_ds._target_ is MegatronPretraining:
             # Megatron 路径：传递 global_batch_size 等训练参数
             kwargs["global_batch_size"] = global_batch_size
+            # 注入 micro_batch_size=local_batch_size：MegatronPretraining 默认 4，
+            # 而 Step 5 的 create_megatron_sampler 用 local_batch_size 切 batch，
+            # 二者必须一致，否则 sampler 语义与 dataset 记录的 micro_batch_size 漂移
+            kwargs["micro_batch_size"] = local_batch_size
             kwargs["trainer_max_steps"] = max_steps
             kwargs["trainer_val_check_interval"] = val_check_interval
             ds = cfg_ds.instantiate(**kwargs)
@@ -272,6 +279,8 @@ def build_dataloader(
                 from hyper_parallel.components.models.common.packing import (
                     configure_packing, get_attn_implementation,
                 )
+                # 注：models/common/packing.py 为新模块，01–06 其他文档未覆盖；
+                # 其契约与最小实现要点见 §3.4。
 
                 ds = neat_pack_dataset(
                     ds,
@@ -303,11 +312,16 @@ def build_dataloader(
         # ── Step 5: Sampler ──
         if isinstance(ds, MegatronPretraining):
             # Megatron 路径：先取 split dataset 再取 len（build() 产出的是包装对象）
-            split_to_get = cfg_ds.splits_to_build
-            if isinstance(split_to_get, list):
-                split_to_get = split_to_get[0]
-            elif split_to_get is None:
+            # 用 .get() 取 splits_to_build：YAML 未配该 key 时 raise_on_missing_attr=True
+            # 下直接属性访问会 AttributeError，且 None 兜底分支不可达
+            split_to_get = cfg_ds.get("splits_to_build", None)
+            if split_to_get is None:
                 split_to_get = "train"
+            elif isinstance(split_to_get, list):
+                # splits_to_build 配成 list（如 [train, validation]）时，训练主
+                # DataLoader 只取第一个 split；其余 split 由
+                # build_validation_dataloader（§3.3）各自构建，不在此隐式展开
+                split_to_get = split_to_get[0]
             ds = ds.get_dataset(split=split_to_get)
             dataloader_type = cfg_dl.get("dataloader_type", "single")
             if "dataloader_type" in cfg_dl:
@@ -326,6 +340,11 @@ def build_dataloader(
             cfg_dl.__dict__.pop("shuffle", None)
             group_by_length = cfg_dl.get("group_by_length", False)
             cfg_dl.__dict__.pop("group_by_length", None)
+            # drop_last 由 cfg_dl 驱动：训练默认 True；build_validation_dataloader
+            # 会 replace(drop_last=False)，使验证集不丢尾部 batch（§3.3 契约）。
+            # 此前此处硬编码 drop_last=True 会导致验证集尾部样本被 sampler 丢弃。
+            drop_last = cfg_dl.get("drop_last", True)
+            cfg_dl.__dict__.pop("drop_last", None)
 
             if group_by_length:
                 from hyper_parallel.components.datasets.llm.length_grouped_sampler import (
@@ -337,13 +356,16 @@ def build_dataloader(
                 )
             else:
                 sampler = StatefulDistributedSampler(
-                    ds, seed=seed, drop_last=True,
+                    ds, seed=seed, drop_last=drop_last,
                     num_replicas=dp_world_size, rank=dp_rank,
                     shuffle=shuffle,
                 )
-            dl_kwargs = {"sampler": sampler, "batch_size": local_batch_size}
-            if pp_enabled:
-                dl_kwargs["drop_last"] = True
+            # sampler 与 DataLoader 两层 drop_last 保持一致（PP 强制 True）
+            dl_kwargs = {
+                "sampler": sampler,
+                "batch_size": local_batch_size,
+                "drop_last": drop_last or pp_enabled,
+            }
         else:
             # IterableDataset：清理 shuffle 相关字段，不传 sampler
             cfg_dl.__dict__.pop("shuffle", None)
@@ -372,7 +394,14 @@ def build_dataloader(
                 dl_kwargs["collate_fn"] = cfg_dl.collate_fn
             assert callable(dl_kwargs["collate_fn"]), "collate_fn must be callable"
         else:
-            dl_kwargs["collate_fn"] = _default_lm_collate(tokenizer, seq_divisor=seq_divisor)
+            # tokenizer 为 None（路径 2）时 default_collater 内部以 pad_token_id=0
+            # 兜底（见 §5.1 守卫），不会 None.pad_token_id AttributeError；
+            # 但语义上无 tokenizer 的 padding 仅是兜底，建议 YAML 配置 tokenizer
+            if tokenizer is None:
+                logger.warning(
+                    "No tokenizer configured; default_collater falls back to pad_token_id=0"
+                )
+            dl_kwargs["collate_fn"] = default_collater(tokenizer, seq_divisor=seq_divisor)
 
         # PP 模式：链式包装 collate 预计算 causal mask
         # 注意：用 AutoConfig.from_pretrained 而非 model.config，以避免 model 已被
@@ -419,8 +448,14 @@ def build_dataloader(
             "num_workers": cfg_dl.get("num_workers", 1),
             "pin_memory": cfg_dl.get("pin_memory", True),
         })
-        # drop_last 已在 Megatron/map-style 分支按需设置；IterableDataset 不传 drop_last
-        if "drop_last" not in dl_kwargs and cfg_dl.get("drop_last", True):
+        # drop_last 已在 Megatron/map-style 分支按需设置；IterableDataset 不传 drop_last。
+        # 注意：batch_sampler 与 drop_last 互斥（torch DataLoader ValueError），
+        # Megatron 分支（batch_sampler）跳过此兜底，drop_last 由 create_megatron_sampler 内部处理
+        if (
+            "drop_last" not in dl_kwargs
+            and "batch_sampler" not in dl_kwargs
+            and cfg_dl.get("drop_last", True)
+        ):
             dl_kwargs["drop_last"] = True
         return cfg_dl.instantiate(**dl_kwargs), tokenizer
 ```
@@ -431,10 +466,19 @@ def build_dataloader(
 > **canonical 归属**: `build_validation_dataloader` canonical 实现放在 02，03 调用。
 
 `build_validation_dataloader` 复用 `build_dataloader` 主体，但参数化以下差异：
-- `drop_last=False`（验证集不丢弃尾部 batch）
+- `drop_last=False`（验证集不丢弃尾部 batch——该标记经 cfg_dl 传入
+  `build_dataloader` Step 5，驱动 sampler 与 DataLoader 两层 drop_last，见 §3.2）
 - `shuffle=False`（验证集顺序遍历）
 - 不做 packing（`no_packing=True`，逐样本评估）
 - 不创建 sampler 的断点续训状态（验证集无 checkpoint 恢复需求）
+
+**调用约定（与 03 对齐，签名固定）**：前 7 个参数
+`(cfg_ds, cfg_dl, cfg_model, cfg_ps, seed, local_batch_size, global_batch_size)`
+按位置传，其余（`dp_rank / dp_world_size / pp_enabled / cp_size / model`）按关键字传；
+不接收 `max_steps / val_check_interval`（内部以 None 传给 `build_dataloader`，
+避免 `MegatronPretraining.build()` 误判训练步数调度）。返回
+`dict[str, DataLoader]`，当前固定为 `{"validation": dl}`，03 按
+`self.val_dataloaders = build_validation_dataloader(...)` 消费并遍历该 dict。
 
 ```python
 # components/datasets/llm/dataloader.py
@@ -471,7 +515,7 @@ def build_validation_dataloader(
     # 关闭 packing：复制一份避免污染训练用 config
     # ConfigNode.__init__ 收 dict（见 01 §2.3），且提供 replace(**overrides) 不可变更新
     # （等价于 to_dict()+ConfigNode(dict)）。此处用 replace 覆盖个别字段。
-    from hyper_parallel.components.config.loader import ConfigNode
+    from hyper_parallel.components.config.node import ConfigNode  # canonical 位置（01）
 
     cfg_ps_val = cfg_ps.replace(packed_sequence_size=0) if no_packing else cfg_ps
 
@@ -495,7 +539,55 @@ def build_validation_dataloader(
 
 ---
 
-## 4. Tokenizer 构建
+### 3.4 `components/models/common/packing.py` 模块契约（NEAT 分支依赖）
+
+§3.2 NEAT 分支从 `hyper_parallel.components.models.common.packing` import
+`configure_packing` / `get_attn_implementation`。该模块为新设模块（01–06 其他文档
+未覆盖），此处补齐其契约与最小实现要点；实现归属模型层
+（`components/models/common/`），数据层仅消费。
+
+**存在理由**：NEAT packing 的 collater（`neat_packed_collater`）产出 attention
+mask 的格式必须与模型 forward 实际使用的 attention 实现一致——
+`flash_attention_2` 保留 2D indexed mask，`sdpa/eager` 需转为 4D block-causal
+mask。数据层在构建期从 model config 读出实现名并写入一个进程级配置，collater
+在每个 worker 进程内读取该配置决定 mask 格式。
+
+```python
+# components/models/common/packing.py
+
+# 进程级 packing 配置（DataLoader worker fork/spawn 时随模块状态继承；
+# spawn 模式下 collater 需能在 worker 内重新获取，故 configure_packing 须在
+# DataLoader 构建前于主进程调用，且实现应保证幂等）
+_PACKING_CONFIG: dict = {"attn_implementation": "sdpa"}
+
+
+def get_attn_implementation(cfg_model) -> str:
+    """从 model ConfigNode 推导 attention 实现名。
+
+    契约：
+    - 依次查 cfg_model.attn_implementation、cfg_model.config.attn_implementation
+      （HF 风格嵌套 config），均未配置时返回 "sdpa" 作为安全默认。
+    - 返回值 ∈ {"flash_attention_2", "sdpa", "eager"}（与 HF
+      PretrainedConfig._attn_implementation 取值域一致）。
+    """
+    ...
+
+
+def configure_packing(attn_implementation: str) -> None:
+    """设置进程级 packing 配置，供 neat_packed_collater 在 collate 时读取。
+
+    契约：
+    - 幂等；重复调用以后一次为准。
+    - 必须在构建 DataLoader 之前调用（worker 继承主进程模块状态）。
+    - neat_packed_collater 内部读取本模块状态决定 mask 格式（§10
+      neat_packed_collater 注释"必须在调用前先 configure_packing"即指此）。
+    """
+    _PACKING_CONFIG["attn_implementation"] = attn_implementation
+```
+
+---
+
+
 
 > **调用位置**: 时序树 ⑧.1 — `build_dataloader()` Step 1
 
@@ -515,6 +607,29 @@ dataset:
     pretrained_model_name_or_path: Qwen/Qwen3.5-4B
     trust_remote_code: true
 ```
+
+#### 背景：为什么 AutoModel 要自己实现 Tokenizer
+
+`NeMoAutoTokenizer`（hyper_parallel 中为 `HyperAutoTokenizer`）**不是"重新实现" tokenizer，而是在 HF `AutoTokenizer` 之上加了一个可扩展的分发层 + 训练框架所需的补丁层**。它存在的具体原因：
+
+1. **按模型类型分发到专用 tokenizer（注册表机制）**
+
+   真实代码 `auto_tokenizer.py:50-134` 中的分发逻辑是：
+
+   - 先读 config 得到 `model_type`，查 `TokenizerRegistry` 里有没有注册的自定义实现（比如 Mistral 模型走 `tokenization_mistral_common.py` 的 `MistralCommonBackend`，用 `mistral-common` 官方分词，行为与 HF 的分词不同）；
+   - 没有注册项才回退到 HF 的 tokenizer。
+
+   HF 的 `AutoTokenizer` 不支持这种"按 `model_type` 插第三方后端"的扩展点，所以需要自己的门面。同时还保留了 `force_hf=True` 的逃生口，可以直接拿原始 HF tokenizer。
+
+2. **训练侧强制 BOS/EOS 语义一致**
+
+   默认实现 `NeMoAutoTokenizerWithBosEosEnforced` 的名字就说明了用途：有些 HF tokenizer（典型如 `GPT2Tokenizer`）不会自动加 BOS/EOS，而训练 pipeline（loss mask、序列拼接、`assistant_masks`）依赖边界 token 一定存在。它通过重写 `__call__` 和 `encode`（`nemo_auto_tokenizer.py:470-504`）保证 BOS/EOS 始终插入，并同步补齐 `attention_mask` / `assistant_masks`。
+
+3. **集中消化 transformers v5 和各模型的兼容性坑**
+
+   transformers 大版本升级（v5）以及各模型自带 tokenizer 的行为差异，会在训练数据侧引入大量边角问题。自研门面把这些兼容性 patch 集中在一个地方消化，而不是散落在各 dataset / collate 实现里。
+
+> **设计推论**：hyper_parallel 保留 `HyperAutoTokenizer` 这一层，不是为了改分词行为，而是为了**继承上述扩展点**——路径 1/3 走它，路径 4 允许用户通过 `_target_` 显式绕过（如直接使用 `transformers.AutoTokenizer.from_pretrained`）。
 
 ### 4.2 实现：4 路分发
 
@@ -538,7 +653,10 @@ def _build_tokenizer(cfg_model, cfg_ds) -> tuple[dict, PreTrainedTokenizerBase]:
     elif cfg_ds.get("tokenizer", None) is None:
         tokenizer = None
     # ── 路径 3: 有 tokenizer 但无 _target_ → from_pretrained(**dict) ──
-    elif "_target_" not in cfg_ds.tokenizer:
+    # 注意：不能用 `"_target_" not in cfg_ds.tokenizer`——ConfigNode.__contains__
+    # （01 §2.11）按 to_dict() 判定，而 to_dict() 排除 _target_，导致该条件恒真、
+    # 路径 4 成为死代码。改用 getattr 显式探测 _target_ 属性。
+    elif getattr(cfg_ds.tokenizer, "_target_", None) is None:
         tokenizer_dict = cfg_ds.tokenizer.to_dict()
         trust_remote_code = tokenizer_dict.pop("trust_remote_code", trust_remote_code)
         tokenizer = HyperAutoTokenizer.from_pretrained(
@@ -576,12 +694,22 @@ def _build_tokenizer(cfg_model, cfg_ds) -> tuple[dict, PreTrainedTokenizerBase]:
 
 ### 5.1 标准 LM Collate
 
+> **命名约定**：对外名为 `default_collater`（`components/datasets/utils.py`），
+> 与 01 §2.8 YAML `_target_: hyper_parallel.components.datasets.utils.default_collater`
+> 及 §3.2 模块级 import 列表一致。曾用内部名 `_default_lm_collate` 已统一为
+> `default_collater`，全文（含 §10 helper 清单）按此名引用。
+
 ```python
 # components/datasets/utils.py
 
-def _default_lm_collate(tokenizer, seq_divisor: int = 1):
-    """对已有 labels 做 per-key padding（labels 由 dataset 提供，本函数不生成）。"""
-    pad_token_id = tokenizer.pad_token_id or 0
+def default_collater(tokenizer, seq_divisor: int = 1):
+    """对已有 labels 做 per-key padding（labels 由 dataset 提供，本函数不生成）。
+
+    tokenizer 可为 None（tokenizer 构建路径 2：YAML 显式 tokenizer: null）——
+    此时回退 pad_token_id=0，仅作为兜底；需要正确 padding 语义时应配置 tokenizer。
+    """
+    # None 守卫：避免 tokenizer=None 时 None.pad_token_id AttributeError
+    pad_token_id = (getattr(tokenizer, "pad_token_id", None) or 0)
 
     # Per-key pad token IDs（与 AutoModel default_collater 对齐）
     ___PAD_TOKEN_IDS___ = {
@@ -828,7 +956,8 @@ class MegatronPretraining:
             split: "train,valid,test" 比例（逗号分隔三整数）；paths 为 dict 时忽略。
             index_mapping_dir: index mapping 文件写入目录。
             splits_to_build: 要构建的 split（"train"/"validation"/"test" 或其列表）；
-                None 表示全部构建。Step 5 的 get_dataset(split=cfg_ds.splits_to_build)
+                None 表示全部构建。Step 5 的
+                get_dataset(split=cfg_ds.get("splits_to_build", None) 或 "train")
                 依赖此字段。
             trainer_max_steps: 最大训练步数；None 或 -1 表示全 epoch。
             trainer_val_check_interval: 验证间隔。
@@ -1021,7 +1150,8 @@ Context Parallel (CP)、Sequence Parallel (SP) 和 THD Packing 是三种
 │  ┌──────────────────────────────────────────────────────────┐│
 │  │ Layer 1: CP (Context Parallel) — 粗粒度序列切分            ││
 │  │   - 将 S 维度切分为 cp_size 个等长 chunk                   ││
-│  │   - 每 rank 持有一个 chunk，跨 rank ring attention 通信    ││
+│  │   - 每 rank 持有一个 contiguous chunk，attention 前        ││
+│  │     all-gather K/V（05 D-01'' 定稿，flex_cp_allgather）     ││
 │  │   - chunk 粒度: S / cp_size tokens                        ││
 │  │   - seq_lens/seq_lens_padded 随 chunk 一起切分并重算       ││
 │  └──────────────────────────────────────────────────────────┘│
@@ -1045,8 +1175,8 @@ Context Parallel (CP)、Sequence Parallel (SP) 和 THD Packing 是三种
 | 维度 | CP | SP | THD Packing |
 |------|-----|-----|-------------|
 | 粒度 | S / cp_size | 在 chunk 内按 tp 分片 | 变长子序列打包 |
-| 通信模式 | ring attention (P2P) | all-gather + reduce-scatter (collective) | 无通信（纯数据组织） |
-| 对模型影响 | attention 计算改为分块 ring | LN/MLP 序列维度分片 | 无——对模型透明 |
+| 通信模式 | all-gather K/V（collective，flex_cp_allgather，05 D-01'' 定稿） | all-gather + reduce-scatter (collective) | 无通信（纯数据组织） |
+| 对模型影响 | attention 前 all-gather K/V 后按全序列计算（注入内部 attention） | LN/MLP 序列维度分片 | 无——对模型透明 |
 | seq_lens/seq_lens_padded | 随 chunk 切分映射 | 不涉及 | 由 packing 阶段记录 |
 | 典型配置 | cp_size=2~8 | 与 TP 共用 tp mesh | packed_sequence_size=8192~32768 |
 
@@ -1411,6 +1541,15 @@ dataloader:
 具体实现归属见各函数注释）。列出签名是为了让调用点的 arity 与类型可据文档核对。
 
 ```python
+# ── Collate 函数归属清单 ──
+# 以下 collater 均属主 hyper_parallel/components/datasets/utils.py：
+#   default_collater            —— §5.1（标准 LM padding collater；对外名，
+#                                  01 §2.8 YAML 与 §3.2 import 列表均用此名）
+#   packed_sequence_thd_collater —— §5.2（THD packing，完整实现见 §5.2）
+#   neat_packed_collater        —— 下方签名（VLM NEAT）
+#   add_causal_masks_to_batch   —— 下方签名（PP causal mask 预计算）
+
+
 # ── ConfigNode 解析 ──
 # 注：通用 _target_ 字符串 → callable 的解析由 01 §2.4 的 _resolve_target(dotted_path: str)
 # 统一权威实现。本函数仅是 dataset 侧的薄封装：当 ConfigNode 已缓存解析后的
@@ -1469,8 +1608,18 @@ def _supports_seq_lens(model) -> bool:
 
 
 # ── 分布式 / RNG 上下文（§3.2 引用） ──
+# 属主文件：hyper_parallel/components/distributed/utils.py
+# （该文件目前不存在，06 实现分布式基础设施时需补建；02 的 import 路径
+#  `from hyper_parallel.components.distributed.utils import FirstRankPerNode`
+#  保持不变）
 class FirstRankPerNode:
-    """上下文管理器：仅在该 node 的 local rank 0 上执行块内逻辑（用于 HF 下载）。"""
+    """上下文管理器：仅在该 node 的 local rank 0 上执行块内逻辑（用于 HF 下载）。
+
+    契约：进入时 local_rank != 0 的进程阻塞（barrier 或条件等待），local_rank == 0
+    的进程执行块内逻辑（如触发 HF datasets 下载/缓存）；退出时所有进程同步一次
+    （barrier），保证非 0 号进程进入后续逻辑时缓存已就绪。多节点下每节点各有一个
+    "first rank"（按 node 内 local rank 判定，而非全局 rank 0）。
+    """
     def __enter__(self): ...
     def __exit__(self, *exc): ...
 

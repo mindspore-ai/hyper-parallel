@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""cp_utils: Context Parallel 工具（05 §4.4.2 / §6.3.4 canonical）。
+"""cp_utils: Context Parallel utilities (05 §4.4.2 / §6.3.4 canonical).
 
-- ``flex_cp_allgather``：CP 维 K/V all-gather（复用 cp_mesh.get_group()，禁 new_group）；
-- ``shard_batch_for_cp``：数据管道 CP 切分（与 02 collater 的 THD 契约对齐）；
-- ``_shard_seq_lens_for_cp``：seq_lens/seq_lens_padded 按 CP rank 重算。
+- ``flex_cp_allgather``: K/V all-gather along the CP dim (reuses
+  cp_mesh.get_group(); new_group is forbidden);
+- ``shard_batch_for_cp``: data-pipeline CP sharding (aligned with the THD
+  contract of the 02 collater);
+- ``_shard_seq_lens_for_cp``: recompute seq_lens/seq_lens_padded per CP rank.
 
-说明（G5）：seq_len % (2*cp) 的 padding 约束源自 zigzag/ring 负载均衡方案；
-本设计采用 all-gather K/V + contiguous chunk（D-01'' 已否决 ring），各 rank
-Q chunk 等长、FLOPs 天然均衡，约束冗余但无害——保留实现、文档注明。
+Note (G5): the seq_len % (2*cp) padding constraint originates from the
+zigzag/ring load-balancing scheme; this design uses all-gather K/V +
+contiguous chunk (D-01'' rejected ring), so each rank's Q chunk is
+equal-length and FLOPs are naturally balanced -- the constraint is redundant
+but harmless: the implementation is kept and documented here.
 """
 
 import torch
@@ -28,7 +32,8 @@ import torch.distributed as dist
 
 
 class _AllGatherAlongDim(torch.autograd.Function):
-    """all-gather along cp_dim + backward reduce-scatter 语义（求和后取本 rank chunk）。"""
+    """all-gather along cp_dim + backward reduce-scatter semantics (sum across
+    ranks, then take this rank's chunk)."""
 
     @staticmethod
     def forward(ctx, t, cp_dim, group, cp_size):
@@ -37,12 +42,12 @@ class _AllGatherAlongDim(torch.autograd.Function):
         ctx.cp_size = cp_size
         world_t = [torch.empty_like(t) for _ in range(cp_size)]
         dist.all_gather(world_t, t.contiguous(), group=group)
-        # 按 cp_rank 顺序 cat：[chunk_rank0, chunk_rank1, ...]
+        # cat in cp_rank order: [chunk_rank0, chunk_rank1, ...]
         return torch.cat(world_t, dim=cp_dim)
 
     @staticmethod
     def backward(ctx, grad_output):
-        # reduce-scatter：跨 rank 求和梯度，取本 rank 对应的 chunk
+        # reduce-scatter: sum the gradient across ranks, take this rank's chunk
         grad = grad_output.contiguous().clone()
         dist.all_reduce(grad, group=ctx.group)
         rank = dist.get_rank(ctx.group)
@@ -53,17 +58,19 @@ class _AllGatherAlongDim(torch.autograd.Function):
 def flex_cp_allgather(k, v, cp_dim: int, cp_mesh):
     """All-gather K/V along CP dimension for context parallel attention.
 
-    Forward: all-gather K/V 沿 cp_dim（各 rank 持有全量 K/V）。
-    Backward: reduce-scatter 语义（梯度跨 rank 求和后取本 rank chunk，
-      由 _AllGatherAlongDim autograd.Function 显式实现——plain
-      ``dist.all_gather`` 没有 autograd 核）。
+    Forward: all-gather K/V along cp_dim (each rank ends up holding the full K/V).
+    Backward: reduce-scatter semantics (gradients summed across ranks, then this
+      rank's chunk is taken -- implemented explicitly by the _AllGatherAlongDim
+      autograd.Function, since plain ``dist.all_gather`` has no autograd kernel).
 
     Args:
-        k, v: [B, N, S_local, H]（cp_dim=2 时为序列维）。
-        cp_dim: gather 维度。
-        cp_mesh: CP 维 DeviceMesh。通信组取 ``cp_mesh.get_group()``——
-            DeviceMesh 构建时已创建并缓存，**此处不得再调 dist.new_group**
-            （否则每次 forward 泄露一个 process group，且语义错位）。
+        k, v: [B, N, S_local, H] (cp_dim=2 is the sequence dim).
+        cp_dim: the gather dimension.
+        cp_mesh: DeviceMesh of the CP dim. The communication group is taken from
+            ``cp_mesh.get_group()`` -- already created and cached at DeviceMesh
+            construction; **dist.new_group must NOT be called here** (otherwise
+            every forward leaks one process group, and the semantics would be
+            misaligned).
     """
     cp_size = cp_mesh.size()
     if cp_size <= 1:
@@ -74,15 +81,18 @@ def flex_cp_allgather(k, v, cp_dim: int, cp_mesh):
 
 
 def shard_batch_for_cp(batch: dict, cp_mesh) -> dict:
-    """将 batch 中的序列维度 tensors 沿 CP mesh 切分（05 §6.3.4 canonical）。
+    """Shard the sequence-dim tensors of a batch along the CP mesh
+    (05 §6.3.4 canonical).
 
-    契约（与 02 collater 产出对齐）：
+    Contract (aligned with the 02 collater output):
       - input_ids/labels/position_ids: [B, S] int64
-      - seq_lens / seq_lens_padded: [B, max_num_packs] int64，-1000 哨兵填充
-      - qkv_format: "thd"（透传）
+      - seq_lens / seq_lens_padded: [B, max_num_packs] int64, padded with the
+        -1000 sentinel
+      - qkv_format: "thd" (passthrough)
 
-    切分策略：pad 到 2*cp 倍数后按 token 区间 [cp_rank*chunk, (cp_rank+1)*chunk)
-    切片；seq_lens 系列单独重算（_shard_seq_lens_for_cp）。
+    Sharding strategy: pad to a multiple of 2*cp, then slice the token
+    interval [cp_rank*chunk, (cp_rank+1)*chunk); the seq_lens family is
+    recomputed separately (_shard_seq_lens_for_cp).
     """
     cp_size = cp_mesh.size()
     if cp_size <= 1:
@@ -103,9 +113,9 @@ def shard_batch_for_cp(batch: dict, cp_mesh) -> dict:
             if k == "qkv_format" or not isinstance(v, torch.Tensor) or v.ndim < 1:
                 continue
             if k in ("seq_lens", "seq_lens_padded"):
-                continue  # 单独重算，不 pad
+                continue  # recomputed separately, not padded
             if k == "position_ids":
-                # position_ids 递增 pad：接续末值继续递增
+                # position_ids increment-pad: continue incrementing from the last value
                 last = v[..., -1:].to(torch.long)
                 inc = torch.arange(1, pad_len + 1, device=v.device,
                                    dtype=v.dtype)
@@ -138,13 +148,17 @@ def shard_batch_for_cp(batch: dict, cp_mesh) -> dict:
 
 
 def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: int):
-    """seq_lens/seq_lens_padded 按 CP 分片重算（保留 -1000 哨兵语义）。
+    """Recompute seq_lens/seq_lens_padded per CP shard (preserving the -1000
+    sentinel semantics).
 
-    遍历每个样本的 pack 累计偏移（按 seq_lens_padded 累加），对每个 pack：
-    - 完全在 [lo, hi) 内：原样保留；
-    - 跨界：截断到 [lo, hi)，按截断后实际/含 padding 长度重算；
-    - 完全在外：跳过。
-    输出平移到本地坐标系；max_local_packs=0 时置 1 防空 tensor。
+    Walk the cumulative pack offsets of each sample (accumulated by
+    seq_lens_padded); for each pack:
+    - fully inside [lo, hi): kept as-is;
+    - crossing the boundary: truncated to [lo, hi), with the actual /
+      padding-inclusive lengths recomputed after truncation;
+    - fully outside: skipped.
+    The output is shifted to the local coordinate system; when
+    max_local_packs=0 it is set to 1 to avoid an empty tensor.
     """
     B, _K = seq_lens.shape
     lo = cp_rank * chunk
@@ -199,11 +213,12 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
 
 def _cp_offset_causal_mask(q_len: int, kv_len: int, lo: int,
                            device, dtype=torch.bool):
-    """D-04：offset-aware causal mask（本 rank Q chunk 全局偏移 lo）。
+    """D-04: offset-aware causal mask (this rank's Q chunk has global offset lo).
 
-    允许 attend 的位置：j <= lo + i（i 为本地 Q 行号）。
-    替代 is_causal=True——SDPA 的 is_causal 在 q_len ≠ kv_len 时按右下对齐，
-    对 rank>0 的 chunk 会错误掩码（G4）。
+    Attendable positions: j <= lo + i (i is the local Q row index).
+    Replaces is_causal=True -- torch SDPA's is_causal is top-left aligned when
+    q_len != kv_len (equivalent to assuming Q starts at global position 0), so
+    under CP the chunks of rank>0 would be incorrectly masked (G4).
     """
     i = torch.arange(q_len, device=device).view(-1, 1)
     j = torch.arange(kv_len, device=device).view(1, -1)

@@ -53,7 +53,7 @@ def test_tiny_moe_boundaries(tiny_moe, make_mesh):
     plan = ShardingPlanner().plan(tiny_moe, mesh, tp_size=2, ep_size=2)
     for layer in ("0", "1"):
         spec = plan.modules[f"model.layers.{layer}.mlp"]
-        assert spec._use_local_map is True
+        assert spec.use_local_map is True
         assert any(p.startswith("experts.") for p in spec.params)
         assert "gate.weight" in spec.params
 

@@ -51,6 +51,8 @@ model = HyperAutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-4B",
 # → 自动完成 ShardingPlanner 推导 + apply_sharding_plan + 权重加载 + FSDP2
 
 # 方式 B：只使用并行能力，自己管理训练循环
+# ★ 注意：MeshContext / FSDP2Config / FSDP2Manager 属 06_distributed_infrastructure 范围，
+#   当前尚未实现（待 06 落地）；以下示例展示目标 API 形态。
 from hyper_parallel.components.distributed import (
     MeshContext, ShardingPlanner, apply_sharding_plan, FSDP2Manager
 )
@@ -174,11 +176,20 @@ optimizer:
     },
     "optimizer": {
         "_target_": "torch.optim.AdamW",
-        "lr": "1.0e-4",          # 注意：YAML 值都是字符串！
-        "weight_decay": "0.01",
+        "lr": 1.0e-4,           # PyYAML safe_load 已按 YAML 1.1 规范解析为 float
+        "weight_decay": 0.01,   # 同上：数值标量 → float，不是字符串
     },
 }
 ```
+
+注意：`yaml.safe_load()` 会自动解析数值/布尔标量（`1.0e-4` → float、`0.01` → float、
+`42` → int、`true` → bool）。只有无法匹配数值/布尔形式的标量（如 `"bfloat16"`、
+`"Qwen/Qwen3.5-0.8B"`）才保持为字符串，随后由 `translate_value()` 做进一步转换（§2.3）。
+
+**Canonical 模块位置（裁决）**：`load_yaml_config` 位于 `components/config/loader.py`；
+`ConfigNode` 与 `_resolve_target` 的 canonical 位置为 **`components/config/node.py`**
+（loader.py 内部 `from .node import ConfigNode`）。02 §10 等其它文档的模块位置表述
+以此为准对齐。
 
 然后 `ConfigNode(raw)` 递归包装每个嵌套 dict。
 
@@ -187,7 +198,22 @@ optimizer:
 ### 2.3 Step 2: `ConfigNode.__init__` + `_wrap` — 立即解析（Eager Resolution）
 
 ```python
+# components/config/node.py（ConfigNode 与 _resolve_target 的 canonical 位置，见 §2.2 末注）
+
 from copy import deepcopy
+
+
+class _OrigValueStr(str):
+    """String wrapper that preserves the original placeholder for safe display.
+
+    The resolved value is the actual string content; the original placeholder
+    (with $ENV_VAR references) is stored for to_yaml_dict() safe output.
+    """
+    def __new__(cls, resolved: str, original: str):
+        instance = super().__new__(cls, resolved)
+        instance._orig_value = original
+        return instance
+
 
 class ConfigNode:
     """配置节点——属性式访问 + 延迟实例化。"""
@@ -205,18 +231,6 @@ class ConfigNode:
         for k, v in source.items():
             self.__dict__[k] = self._wrap(k, v)
         self.raise_on_missing_attr = raise_on_missing_attr
-
-class _OrigValueStr(str):
-    """String wrapper that preserves the original placeholder for safe display.
-
-    The resolved value is the actual string content; the original placeholder
-    (with $ENV_VAR references) is stored for to_yaml_dict() safe output.
-    """
-    def __new__(cls, resolved: str, original: str):
-        instance = super().__new__(cls, resolved)
-        instance._orig_value = original
-        return instance
-
 
     def _wrap(self, k: str, v: Any) -> Any:
         """对每个 key-value 进行分类处理——这是 ConfigNode 的核心分发逻辑。"""
@@ -418,9 +432,9 @@ with open("train.yaml") as f:
 #     },
 #     "optimizer": {
 #         "_target_": "torch.optim.AdamW",
-#         "lr": "1.0e-4",                 # 字符串！
-#         "betas": [0.9, 0.95],           # YAML 已转 float
-#         "weight_decay": "0.01",         # 字符串！
+#         "lr": 0.0001,                   # YAML 已自动转为 float（1.0e-4）
+#         "betas": [0.9, 0.95],           # YAML 已转 float 列表
+#         "weight_decay": 0.01,           # YAML 已自动转为 float
 #     },
 #     "dataset": {
 #         "_target_": "datasets.load_dataset",
@@ -489,8 +503,8 @@ ConfigNode 对 `raw` 的每个顶层 key 调用 `_wrap(k, v)`：
 #         结果: self._target_ = <class 'torch.optim.adamw.AdamW'>
 #              ★ self._target_ 不是一个字符串！它是一个 Python class 对象！
 #
-#      b) _wrap("lr", "1.0e-4")
-#         translate_value("1.0e-4") → ast.literal_eval("1.0e-4") → 0.0001
+#      b) _wrap("lr", 0.0001)
+#         translate_value(0.0001) → 0.0001（非 str 直接返回；float 由 YAML 解析产生）
 #         结果: self.lr = 0.0001
 #
 #      c) _wrap("betas", [0.9, 0.95])
@@ -499,8 +513,8 @@ ConfigNode 对 `raw` 的每个顶层 key 调用 `_wrap(k, v)`：
 #         → [0.9, 0.95]
 #         结果: self.betas = [0.9, 0.95]
 #
-#      d) _wrap("weight_decay", "0.01")
-#         translate_value("0.01") → ast.literal_eval("0.01") → 0.01
+#      d) _wrap("weight_decay", 0.01)
+#         translate_value(0.01) → 0.01（非 str 直接返回）
 #         结果: self.weight_decay = 0.01
 #    ── 子 ConfigNode 构造完成 ──
 #    结果: self.optimizer = <ConfigNode {
@@ -770,21 +784,22 @@ class ConfigNode:
 # → <PreTrainedTokenizerFast>
 
 # ── ② 实例化 dataset ──
-# cfg.dataset.instantiate(tokenizer=<tokenizer>)
+# cfg.dataset.instantiate()   # ★ 不传 tokenizer！
 #
 # func = <function datasets.load_dataset>
 # config_kwargs = {
 #     "path": "HuggingFaceFW/fineweb",
 #     "streaming": True,
 #     "split": "train",
-#     "tokenizer": ???  # ← tokenizer ConfigNode 有 _target_，会递归 instantiate！
+#     "tokenizer": <PreTrainedTokenizerFast>   # ← 嵌套 ConfigNode 递归 instantiate 的结果
 # }
-# 但 tokenizer 在 runtime kwargs 中被覆盖了 → 跳过递归实例化
-# config_kwargs["tokenizer"] 不会出现在 config_kwargs 中（被 skip 了）
-# runtime: kwargs = {"tokenizer": <PreTrainedTokenizerFast>}
-# → load_dataset(path="HuggingFaceFW/fineweb", streaming=True, split="train",
-#                tokenizer=<PreTrainedTokenizerFast>)
+# ★ 但 datasets.load_dataset 不接受 tokenizer kwarg——
+#   02 §4.2 的 signature 守卫（inspect.signature 检查）会在调用前剔除
+#   不在 load_dataset 签名中的 kwargs，因此 tokenizer 不会被注入。
+# → load_dataset(path="HuggingFaceFW/fineweb", streaming=True, split="train")
 # → <Dataset>
+# （tokenizer 由 build_dataloader 内部 _build_tokenizer 单独实例化，
+#   供后续 map/tokenize 步骤使用，而不是传给 load_dataset）
 
 # ── ③ 实例化 model ──
 # cfg.model.instantiate(distributed_setup=<setup>)
@@ -1035,6 +1050,9 @@ def _instantiate_fsdp2(*, config, mesh_context) -> "FSDP2Manager | None":
 
     canonical：FSDP2Manager 收 2 参 (config, mesh: MeshContext)，
     内部从 mesh.device_mesh / mesh.device 取出 DeviceMesh 与 device。
+
+    canonical（裁决：以 01 为准）：本工厂的关键字形参名为 `mesh_context`——
+    06 §4.1 中 `(config, mesh)` 的表述需向此对齐。
     """
     if config is None:
         return None
@@ -1043,8 +1061,12 @@ def _instantiate_fsdp2(*, config, mesh_context) -> "FSDP2Manager | None":
 
 # components/distributed/pipelining.py
 
-def _instantiate_pipeline(pipeline_config, mesh, device) -> "AutoPipeline | None":
-    """根据 pipeline_config 创建 AutoPipeline 实例（pp_size > 1 时）。"""
+def _instantiate_pipeline(pipeline_config, mesh) -> "AutoPipeline | None":
+    """根据 pipeline_config 创建 AutoPipeline 实例（pp_size > 1 时）。
+
+    canonical：2 参签名 (pipeline_config, mesh)，与 §8.2
+    `AutoPipeline.__init__(self, pipeline_config, mesh)` 一致（device 由 mesh 内部携带）。
+    """
     ...
 
 
@@ -1101,6 +1123,8 @@ def build_model(
     )
 
     # ③ 从 distributed_setup / ShardingPlan 导出 OptimizerInit（param 分组、mesh、is_peft）
+    #    weight_decay 由 Recipe 侧从 cfg.optimizer 读取后经 OptimizerConfig.build 生效（§3.4）；
+    #    此处不臆造 wd 值（默认 0.0 占位，禁止用 True——True 等价于 wd=1.0）。
     optimizer_init = OptimizerInit.from_distributed_setup(
         distributed_setup=distributed_setup,
         model=model,
@@ -1133,8 +1157,17 @@ class OptimizerInit:
         distributed_setup,
         model: "nn.Module",
         peft_config=None,
+        weight_decay: float = 0.0,
     ) -> "OptimizerInit":
-        """从 distributed_setup.mesh_context.device_mesh + model 参数推导分组。"""
+        """从 distributed_setup.mesh_context.device_mesh + model 参数推导分组。
+
+        Args:
+            weight_decay: 从 optimizer 配置读取的实际 weight_decay 值
+                （如 cfg.optimizer.weight_decay），用于 decay 组；no_decay 组恒为 0.0。
+                ★ 禁止传 bool——`weight_decay=True` 传入 AdamW 等价于 wd=1.0。
+        注：最终分组由 OptimizerConfig.build 内部以 self.weight_decay 重做（§3.4），
+        此处 param_groups 为预分组描述，供调用方/调试参考。
+        """
         mesh_ctx = getattr(distributed_setup, "mesh_context", None) if distributed_setup else None
         device_mesh = mesh_ctx.device_mesh if mesh_ctx is not None else None
         is_peft = peft_config is not None
@@ -1146,8 +1179,8 @@ class OptimizerInit:
                 continue
             (no_decay_p if _is_no_decay(name) else decay_p).append(param)
         param_groups = [
-            {"params": decay_p, "weight_decay": True},
-            {"params": no_decay_p, "weight_decay": 0.0},
+            {"params": decay_p, "weight_decay": weight_decay},   # decay 组：配置的实际 wd 值
+            {"params": no_decay_p, "weight_decay": 0.0},          # no_decay 组：恒 0.0
         ]
         return cls(
             param_groups=param_groups,
@@ -1242,6 +1275,10 @@ def _callable_and_kwargs(cfg: Any) -> tuple[Callable, dict]:
 
 ### 3.3 RecipeConfig 完整实现
 
+> **Canonical 声明（裁决）**：本节为 `RecipeConfig` 的**唯一 canonical 定义**。
+> 03_training_loop.md §5.2 与 04_checkpoint.md §9 中的 `RecipeConfig` 展示均为
+> 本节的引用/节选；三处如有不一致，**以本节为准**。
+
 ```python
 # recipes/_typed_config.py
 
@@ -1331,7 +1368,7 @@ class RecipeConfig:
     def checkpoint(self) -> "CheckpointingConfig":
         """checkpoint: 固定类型（CheckpointingConfig）。
 
-        模型派生字段（model_repo_id, is_peft）在此注入。
+        模型派生字段（model_repo_id, model_cache_dir, is_peft）在此注入。
         """
         from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 
@@ -1341,6 +1378,8 @@ class RecipeConfig:
         model = self._raw.get("model", None)
         kwargs |= {  # dict union (|=) 需要 Python 3.9+
             "model_repo_id": _model_name_from_cfg(model) if model is not None else None,
+            # 自 04 §9 版并入 canonical：从 model 段派生缓存目录
+            "model_cache_dir": self._raw.get("model.cache_dir", None),
             "is_peft": bool(self._raw.get("peft", None)),
         }
         return CheckpointingConfig(**kwargs)
@@ -1369,6 +1408,12 @@ class RecipeConfig:
         return key in self._raw.to_dict()
 
     def get(self, key: str, default: Any = None) -> Any:
+        """点号路径访问，直接透传 `ConfigNode.get`（§2.7）。
+
+        `self._raw` 是 01 §2 的自研 **ConfigNode**（不是 OmegaConf）；
+        ConfigNode.get 原生支持点号路径（如 "step_scheduler.local_batch_size"），
+        未命中返回 default。
+        """
         return self._raw.get(key, default)
 
     def to_dict(self) -> dict:
@@ -1505,10 +1550,15 @@ main()                                          # recipes/llm/train_ft.py
 │   ├─④.3 self.distributed_setup = create_distributed_setup_from_config(cfg)  # 从 cfg 构建分布式拓扑 → 06_distributed_infrastructure.md §3
 │   │
 │   ├─④.4 self.peft_config = cfg.peft.instantiate() if cfg.get("peft") else None  # ★ PEFT 先实例化
-│   │   model = cfg.model.instantiate(
-│   │       distributed_setup=self.distributed_setup,
-│   │       peft_config=self.peft_config)        # cfg.model 是 ConfigNode（__getattr__ 透传）
-│   │   │                                       # _target_ = <bound method HyperAutoModelForCausalLM.from_pretrained>
+│   │   self.model, self.optimizer_init = build_model(          # §2.14 / §4.2: Recipe 内部编排入口，返回 (model, optimizer_init)
+│   │       cfg.model,                                          # 与 03 §5.3 ⑪ / §4.2 口径一致（canonical：build_model）
+│   │       peft_config=self.peft_config,
+│   │       distributed_setup=self.distributed_setup)
+│   │   │
+│   │   ├─ build_model 内部①: model = cfg.model.instantiate(    # cfg.model 是 ConfigNode（__getattr__ 透传）
+│   │   │       distributed_setup=distributed_setup,
+│   │   │       peft_config=peft_config)
+│   │   │                                                       # _target_ = <bound method HyperAutoModelForCausalLM.from_pretrained>
 │   │   │
 │   │   └─ HyperAutoModelForCausalLM.from_pretrained(        # §6.2
 │   │           pretrained_model_name_or_path="Qwen/Qwen3.5-0.8B",
@@ -1587,13 +1637,15 @@ main()                                          # recipes/llm/train_ft.py
 │   │           │
 │   │           ├─④.4.5.10 fsdp2_manager.parallelize(model, tp_grad_info=tp_grad_info)  if fsdp2  # FSDP2 在 meta 上包裹（canonical：先于 to_empty/load）
 │   │           │
-│   │           ├─④.4.5.11 model.to_empty(device=device)                              # meta → GPU（物化 sharded 参数）
-│   │           │         load_base_model(model, device, pretrained_path,             # §10.3: 每 rank 独立加载权重 (04_checkpoint.md §5.3, 5 参 canonical 签名)
-│   │           │                        adapter=_get_state_dict_adapter(model),      # HF key 映射
-│   │           │                        mesh=mesh.device_mesh)                       # ★ DeviceMesh：按 TP/DP 读本地份，零 NCCL
+│   │           ├─④.4.5.11 load_base_model(model, device, pretrained_path,            # canonical：④.4.5.11 = load_base_model（以衔接表为准）
+│   │           │         │  adapter=_get_state_dict_adapter(model),                  # §10.3: 每 rank 独立加载权重 (04_checkpoint.md §5.3, 5 参 canonical 签名)
+│   │           │         │  mesh=mesh.device_mesh)                                   # ★ DeviceMesh：按 TP/DP 读本地份，零 NCCL
+│   │           │         └─ 前置动作（同属 ④.4.5.11 一步）：model.to_empty(device=device)   # meta → GPU（物化 sharded 参数），load_base_model 写入前必须先物化
 │   │           │
 │   │           ├─④.4.5.12 _freeze_non_lora_params(model)              if peft_config   # PEFT 非 LoRA 参数冻结 (§6.4)
 │   │           └─ return model                                         # 已分片、权重已加载
+│   │   ← build_model 内部②: optimizer_init = OptimizerInit.from_distributed_setup(...)  # 导出 param 分组/mesh
+│   │   ← build_model 返回 (model, optimizer_init)                      # → self.model, self.optimizer_init
 │   │
 │   ├─④.5 self.loss_fn = cfg.loss_fn.build()                                          # typed: LossConfig → nn.Module
 │   │   └─ 详见 03_training_loop.md §10
@@ -1613,8 +1665,10 @@ main()                                          # recipes/llm/train_ft.py
 │   │   ├─ _build_tokenizer(cfg_model, cfg_ds)
 │   │   │   └─ cfg.dataset.tokenizer.instantiate(trust_remote_code=True)
 │   │   │       → AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
-│   │   ├─ cfg.dataset.instantiate(tokenizer=tokenizer)
-│   │   │   → load_dataset(path="HuggingFaceFW/fineweb", split="train", streaming=True, tokenizer=...)
+│   │   ├─ cfg.dataset.instantiate()                                    # ★ 不传 tokenizer：load_dataset 签名无此参数
+│   │   │   → load_dataset(path="HuggingFaceFW/fineweb", split="train", streaming=True)
+│   │   │     （tokenizer kwarg 被 02 §4.2 signature 守卫剔除；tokenizer 由 build_dataloader
+│   │   │       单独返回，供 map/tokenize 步骤使用）
 │   │   ├─ StatefulDistributedSampler(dataset, seed=..., ...)
 │   │   └─ cfg.dataloader.instantiate(dataset=ds, sampler=sampler)
 │   │       → StatefulDataLoader(dataset=ds, sampler=sampler, batch_size=1, ...)
@@ -1640,6 +1694,10 @@ main()                                          # recipes/llm/train_ft.py
 
 **关键时序要点**：
 
+> **PP 说明**：`autopipeline.build(model)`（PP stage 拆分）在 `apply_model_infrastructure()`
+> 中**最先执行**（④.4.5.3 之前，PP 未启用时无此步）——裁决以 §8.2 为准，stage 切分必须
+> 先于权重加载与 FSDP2 包裹（§8.3 ① / §6.3 Step 3）。时序树中从略。
+
 | 序号 | 操作 | 关键输出 |
 |:----:|------|---------|
 | ① | YAML 加载 | ConfigNode 树（所有 `_target_` 已解析） |
@@ -1650,7 +1708,7 @@ main()                                          # recipes/llm/train_ft.py
 | ④.4.5.7 | `sharding_planner.plan()` | ShardingPlan（可序列化分片策略）→ 05 §5 |
 | ④.4.5.8 | `apply_sharding_plan()` | DTensor 分片应用（生产/校验双模）+ `_local_params_context` 解包 → 05 §4/§7/§8 |
 | ④.4.5.10 | `fsdp2_manager.parallelize()` | FSDP2 在 meta 上包裹（canonical：先于 to_empty/load） |
-| ④.4.5.11 | `load_base_model()` | 每 rank 独立加载权重（5 参 canonical，零 NCCL） |
+| ④.4.5.11 | `load_base_model()`（前置 `model.to_empty()` 物化，同属本步） | 每 rank 独立加载权重（5 参 canonical，零 NCCL） |
 | ④.8 | `cfg.optimizer.build()` | 真正的优化器（参数分组完成）→ 03 §9 |
 | ④.9 | `build_dataloader()` | DataLoader + Tokenizer → 02 §3 |
 | ④.11 | `cfg.step_scheduler.build()` | StepScheduler → 03 §4 |
@@ -1661,12 +1719,15 @@ main()                                          # recipes/llm/train_ft.py
 
 以下追踪 `setup()` 中每个关键变量的**完整来源**——它来自哪个 ConfigNode、`_target_` 解析成了什么、`instantiate()` 实际调用了哪个函数：
 
+> 编号约定：本节内部变量标记用 **m1–m9**（m = member/组件变量），与 §4.1 时序树的
+> canonical ①–⑤ 编号（①=load_yaml_config … ⑤=instantiate）区分，避免同名歧义。
+
 ```python
 class FinetuneRecipe(BaseRecipe):
     def setup(self, cfg: RecipeConfig):
 
         # ═══════════════════════════════════════════════════════
-        # ① model
+        # m1 model
         # 来源: cfg.model (ConfigNode, __getattr__ 透传)
         # _target_: <bound method HyperAutoModelForCausalLM.from_pretrained>
         # build_model() 是 Recipe 内部编排入口（§6.2），返回 (model, optimizer_init)：
@@ -1676,7 +1737,7 @@ class FinetuneRecipe(BaseRecipe):
         # 与 03 §5.3 canonical 完全对齐：`self.model, self.optimizer_init = build_model(...)`
         # ═══════════════════════════════════════════════════════
         # ★ 先实例化 peft_config，再传给 build_model（PEFT 必须在 ShardingPlanner.plan
-        #    之前注入，见 §6.4 / §8.3 ①）
+        #    之前注入，见 §6.4 / §8.3 ②）
         self.mesh = self.distributed_setup.mesh_context
         self.peft_config = cfg.peft.instantiate() if cfg.get("peft") else None
         self.model, self.optimizer_init = build_model(
@@ -1690,7 +1751,7 @@ class FinetuneRecipe(BaseRecipe):
         )
 
         # ═══════════════════════════════════════════════════════
-        # ② tokenizer
+        # m2 tokenizer
         # 来源: cfg.dataset.tokenizer (子 ConfigNode, __getattr__ 透传)
         # _target_: <bound method AutoTokenizer.from_pretrained>
         # 获取方式: build_dataloader() 内部调用 _build_tokenizer()
@@ -1703,18 +1764,20 @@ class FinetuneRecipe(BaseRecipe):
         # tokenizer 在 build_dataloader() 内部获取，不直接出现在 setup() 中
 
         # ═══════════════════════════════════════════════════════
-        # ③ ds (Dataset)
+        # m3 ds (Dataset)
         # 来源: cfg.dataset (ConfigNode, __getattr__ 透传)
         # _target_: <function datasets.load_dataset>
         # 获取方式: build_dataloader() 内部
         #   → load_dataset(path="HuggingFaceFW/fineweb", name="sample-10BT",
-        #                  split="train", streaming=True, tokenizer=<tokenizer>)
+        #                  split="train", streaming=True)
+        #   ★ 不传 tokenizer：datasets.load_dataset 不接受 tokenizer kwarg，
+        #     02 §4.2 的 signature 守卫保证其不会被注入。
         # 返回: Dataset (可能是 IterableDataset)
         # ═══════════════════════════════════════════════════════
-        # ds 在 build_dataloader() 内部通过 cfg.dataset.instantiate(tokenizer=tokenizer) 获取
+        # ds 在 build_dataloader() 内部通过 cfg.dataset.instantiate() 获取
 
         # ═══════════════════════════════════════════════════════
-        # ④ sampler
+        # m4 sampler
         # 来源: 不由 _target_ 驱动，由 build_dataloader() 内部逻辑决定:
         #   - map-style Dataset → StatefulDistributedSampler(dataset, seed=..., ...)
         #   - MegatronPretraining → create_megatron_sampler(...)
@@ -1723,7 +1786,7 @@ class FinetuneRecipe(BaseRecipe):
         # sampler 在 build_dataloader() 内部创建
 
         # ═══════════════════════════════════════════════════════
-        # ⑤ dataloader
+        # m5 dataloader
         # 来源: cfg.dataloader (ConfigNode, __getattr__ 透传)
         # _target_: <class StatefulDataLoader>
         # 获取方式: build_dataloader() 末尾
@@ -1738,10 +1801,10 @@ class FinetuneRecipe(BaseRecipe):
             local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
             ...
         )
-        # build_dataloader() 内部做了上述 ②③④⑤ 全部工作
+        # build_dataloader() 内部做了上述 m2–m5 全部工作
 
         # ═══════════════════════════════════════════════════════
-        # ⑥ optimizer
+        # m6 optimizer
         # 来源: cfg.optimizer (RecipeConfig cached_property → OptimizerConfig)
         # 非 ConfigNode！cfg.optimizer 已经是 OptimizerConfig(lr=2e-4, ...)
         # .build(model) 内部:
@@ -1756,7 +1819,7 @@ class FinetuneRecipe(BaseRecipe):
         )
 
         # ═══════════════════════════════════════════════════════
-        # ⑦ loss_fn
+        # m7 loss_fn
         # 来源: cfg.loss_fn (RecipeConfig cached_property → LossConfig)
         # .build() 内部: MaskedCrossEntropy()
         # 返回: nn.Module
@@ -1765,7 +1828,7 @@ class FinetuneRecipe(BaseRecipe):
     # └─ 详见 03_training_loop.md §10
 
         # ═══════════════════════════════════════════════════════
-        # ⑧ lr_scheduler
+        # m8 lr_scheduler
         # 来源: cfg.lr_scheduler (RecipeConfig cached_property → LRSchedulerConfig)
         # .build(optimizer, step_scheduler) 内部:
         #   ① 未设置字段从 step_scheduler 推断默认值
@@ -1777,8 +1840,8 @@ class FinetuneRecipe(BaseRecipe):
         )
 
         # ═══════════════════════════════════════════════════════
-        # ⑨ peft_config 已在 ① 之前实例化并注入 model（见 ① 上方 self.peft_config
-        #    赋值，与 §6.4 / §8.3 ① PEFT 注入时序一致）
+        # m9 peft_config 已在 m1 之前实例化并注入 model（见 m1 上方 self.peft_config
+        #    赋值，与 §6.4 / §8.3 ② PEFT 注入时序一致）
         # ═══════════════════════════════════════════════════════
 ```
 
@@ -2224,16 +2287,19 @@ def _build_model(
     # apply_model_infrastructure 位于 hyper_parallel._transformers.infrastructure，
     # 与本 class（auto_model.py）不同模块，需 local-import（第六轮 P1 修复）。
     from hyper_parallel._transformers.infrastructure import apply_model_infrastructure
-    # canonical 执行顺序（fully_shard 在 to_empty/load 之前）：
-    #   Step 3:  PEFT 注入（分片之前）
-    #   Step 4:  QAT / FP8（分片之前）
-    #   Step 5:  参数冻结（分片之前）
-    #   Step 6:  ShardingPlanner.plan() → ShardingPlan
-    #   Step 7:  apply_sharding_plan()（含 _local_params_context 解包 → tp_grad_info）
-    #   Step 8:  torch.compile
-    #   Step 9:  FSDP2 包裹（meta 上 fully_shard，先于 to_empty/load）
-    #   Step 10: meta→GPU（to_empty 物化 sharded 参数）+ load_base_model（写入本地份）
-    #   Step 11: PP/CP（在 FSDP2 / 权重加载之后）
+    # canonical 执行顺序（PP 最先——裁决以 §8.2 为准；fully_shard 在 to_empty/load 之前）：
+    #   Step 3:  PP 拆分（最先执行：stage 切分必须在权重加载与 FSDP2 包裹之前完成，
+    #            否则每 rank 加载全模型权重，PP 失去意义）
+    #   Step 4:  PEFT 注入（分片之前）
+    #   Step 5:  QAT / FP8（分片之前）
+    #   Step 6:  参数冻结（分片之前）
+    #   Step 7:  ShardingPlanner.plan() → ShardingPlan
+    #   Step 8:  apply_sharding_plan()（含 _local_params_context 解包 → tp_grad_info）
+    #   Step 9:  torch.compile
+    #   Step 10: FSDP2 包裹（meta 上 fully_shard，先于 to_empty/load）
+    #   Step 11: meta→GPU（to_empty 物化 sharded 参数）+ load_base_model（写入本地份）
+    #   （原 Step 12 "CP hooks" 已取消——D-01''：CP K/V all-gather 在 Step 8
+    #    apply_sharding_plan 内编译期注入，无运行时 hooks，见 §8.3 ⑩）
     #
     model = apply_model_infrastructure(
         model,
@@ -2257,6 +2323,24 @@ def _build_model(
     model.train()
     return model
 ```
+
+**HF 原生路径的权重加载职责澄清（`is_meta_device` 与"双重加载"疑问）**：
+
+`world_size > 1` 时即使 `is_hf_model=True`，`is_meta_device` 也为 True（Step 1）。
+此时 `_init_model` 路径 A 的 `_from_pretrained_parent_class` 是在
+`no_init_weights() + init_empty_weights()` 上下文内执行的——HF `from_pretrained`
+的权重填充被 meta context 短路，产出的仍是 **meta 参数空壳**，并未完成真实权重加载。
+因此不存在"双重加载"：
+
+- **meta 路径（`world_size > 1`，或任意 `world_size` 的自定义模型）**：权重加载职责
+  **唯一归属于** Step ⑧ 的 `load_base_model()`（每 rank 按 TP/DP 读本地份写入，零 NCCL）。
+  `_from_pretrained_parent_class` 在此路径下只负责构建模型结构。`to_empty()` 是
+  **必要的**——它把 FSDP2 已在 meta 上包裹的 sharded 参数物化到真实设备，
+  `load_base_model` 才有真实存储可写。
+- **单卡 HF 原生路径（`world_size == 1` 且 `is_hf_model=True`）**：`is_meta_device=False`，
+  `_from_pretrained_parent_class` 在真设备上**直接完成完整权重加载**；Step ⑧ 走
+  `elif not is_meta_device` 分支，仅 `model.to(device)`，不再调用 `load_base_model`，
+  也不需要 `to_empty()`（参数本就在真设备上）。
 
 ### 6.4 PEFT 注入（`_apply_peft`）
 
@@ -2294,7 +2378,7 @@ def _freeze_non_lora_params(model: nn.Module):
             param.requires_grad = False
 ```
 
-**关键时序**：PEFT 注入在分片**之前**（Step 3），非 LoRA 冻结在 FSDP2 **之后**（Step 9 之后，详见 §8.3 ④.4.5.12）——因为冻结操作需要遍历已包裹的参数。
+**关键时序**：PEFT 注入在分片**之前**（§6.3 Step 4 / §8.3 ②），非 LoRA 冻结在 FSDP2 包裹 + 权重加载**之后**（§8.3 ⑨.5，对应 §4 时序树 ④.4.5.12）——因为冻结操作需要遍历已包裹、已物化的参数。
 
 ### 6.5 参数冻结（`_apply_parameter_freezing`）
 
@@ -2398,7 +2482,7 @@ def _apply_fp8(model: nn.Module, fp8_config: "FP8Config | dict") -> None:
     convert_to_float8_training(model, config=config)
 ```
 
-**关键时序**：QAT/FP8 在分片**之前**（§8.3 ②），与 PEFT/参数冻结同阶段——量化后的模块结构改变必须在 ShardingPlanner 看到模型之前完成。
+**关键时序**：QAT/FP8 在分片**之前**（§8.3 ③），与 PEFT/参数冻结同阶段——量化后的模块结构改变必须在 ShardingPlanner 看到模型之前完成。
 
 ---
 
@@ -2501,19 +2585,23 @@ def instantiate_infrastructure(
     sharding_planner = ShardingPlanner()
 
     # FSDP2Manager
-    strategy = distributed_setup.strategy_config
     mesh = distributed_setup.mesh_context
+    # canonical 形参名：mesh_context（以 01 为准，06 §4.1 需向此对齐）
     fsdp2_manager = _instantiate_fsdp2(config=distributed_setup.strategy_config, mesh_context=mesh) if distributed_setup.strategy_config else None
 
-    # AutoPipeline（如果 pp > 1）
-    autopipeline = _instantiate_pipeline(distributed_setup.pipeline_config, mesh, device)
+    # AutoPipeline（如果 pp > 1；canonical 2 参签名 (pipeline_config, mesh)，见 §8.2）
+    autopipeline = _instantiate_pipeline(distributed_setup.pipeline_config, mesh)
 
     return sharding_planner, fsdp2_manager, autopipeline
 ```
 
 ### 8.2 AutoPipeline：Pipeline Parallelism
 
-当 `pp_size > 1` 时，AutoPipeline 将模型切分为多个 stage，每个 stage 在独立的 GPU 组上执行。AutoPipeline 在 `apply_model_infrastructure()` 中最先执行（在 ShardingPlan 和 FSDP2 之前），因为 PP 切分改变了模型的物理结构。
+当 `pp_size > 1` 时，AutoPipeline 将模型切分为多个 stage，每个 stage 在独立的 GPU 组上执行。AutoPipeline 在 `apply_model_infrastructure()` 中**最先执行**（在 ShardingPlan 和 FSDP2 之前），因为 PP 切分改变了模型的物理结构。
+
+> **裁决说明**：PP 的执行位置以本节为准——PP stage 切分必须在权重加载
+> （`load_base_model`）与 FSDP2 包裹**之前**完成，否则每个 rank 都会加载全模型
+> 权重，PP 失去意义。§8.3 与 §6.3 的顺序注释已对齐为本顺序。
 
 ```python
 # components/distributed/pipelining.py
@@ -2588,11 +2676,17 @@ def apply_model_infrastructure(
 ):
     """Phase 2: 运行时对象 → 应用到模型。
 
-    规范化执行顺序（canonical：meta 链路，fully_shard 在 to_empty/load 之前）：
-        meta → PEFT → freeze → plan → apply_sharding_plan(含 _local_params_context 解包)
+    规范化执行顺序（canonical：PP 最先——以 §8.2 裁决为准；meta 链路，fully_shard 在 to_empty/load 之前）：
+        PP 拆分（最先执行） → PEFT → freeze → plan → apply_sharding_plan(含 _local_params_context 解包)
               → build_tp_grad_info → torch.compile → fully_shard(meta 上包裹 FSDP2)
               → to_empty(meta→GPU 物化 sharded 参数) → load_base_model(写入本地份)
-              → PP/CP hooks
+              （原末尾"CP hooks"步骤已取消——D-01''：CP 通信在 apply_sharding_plan
+               内编译期注入，见本节 ⑩）
+
+    裁决说明：PP 执行位置曾与 §6.3 / 本节旧版注释不一致（旧版置于 FSDP2/权重加载
+    之后）。裁定以 §8.2 为准——AutoPipeline 在 apply_model_infrastructure() 中
+    最先执行：PP 切分 stage 必须在权重加载与 FSDP2 包裹之前完成，否则每个 rank
+    都会加载全模型权重，PP 失去意义。
 
     与旧 load→FSDP2 顺序的关键差异：FSDP2 在 meta 上包裹，物化即得到 sharded 参数，
     再由 load_base_model 按 TP/DP 读本地份写入——避免先 load 全量再 shard 的二次显存峰值。
@@ -2603,22 +2697,27 @@ def apply_model_infrastructure(
     from hyper_parallel.components.training.quantization import _apply_qat, _apply_fp8
     from hyper_parallel.components.training.freeze import _apply_parameter_freezing
 
-    # ① PEFT 注入（在参数分片之前）
+    # ① PP 拆分（最先执行——裁决以 §8.2 为准：先于 PEFT/分片/FSDP2/权重加载）
+    #    build() in-place 注册 model.parts，不返回值——model 仍为原 nn.Module
+    if autopipeline is not None:
+        autopipeline.build(model)
+
+    # ② PEFT 注入（在参数分片之前）
     if peft_config is not None:
         model = _apply_peft(model, peft_config)
 
-    # ② QAT / FP8（在参数分片之前）
+    # ③ QAT / FP8（在参数分片之前）
     if qat_config is not None:
         _apply_qat(model, qat_config)
 
     if fp8_config is not None:
         _apply_fp8(model, fp8_config)
 
-    # ③ 参数冻结（在分片之前）
+    # ④ 参数冻结（在分片之前）
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
 
-    # ④ ShardingPlanner.plan() → ShardingPlan（补 sequence_parallel / loss_parallel）
+    # ⑤ ShardingPlanner.plan() → ShardingPlan（补 sequence_parallel / loss_parallel）
     plan = None
     if not is_hf_model and sharding_planner is not None:
         from hyper_parallel.components.distributed.sharding_planner import ShardingPlanner
@@ -2633,7 +2732,7 @@ def apply_model_infrastructure(
             loss_parallel=getattr(mesh, "loss_parallel", False),
         )
 
-    # ⑤ apply_sharding_plan（DTensor 分片应用 + _local_params_context 一次性解包）
+    # ⑥ apply_sharding_plan（DTensor 分片应用 + _local_params_context 一次性解包）
     #    生产模式：返回 (model, tp_grad_info)，tp_grad_info 由 ShardingPlan 导出
     tp_grad_info = None
     if not is_hf_model and plan is not None:
@@ -2644,16 +2743,16 @@ def apply_model_infrastructure(
             validate_mode=validate_placement,
         )
 
-    # ⑥ torch.compile（在 fully_shard 之前；Inductor 在 meta/空参数上追踪计算图）
+    # ⑦ torch.compile（在 fully_shard 之前；Inductor 在 meta/空参数上追踪计算图）
     if compile_config is not None:
         model = torch.compile(model, **compile_config)
 
-    # ⑦ FSDP2 包裹（canonical：在 meta 上 fully_shard，先于 to_empty/load_base_model）
+    # ⑧ FSDP2 包裹（canonical：在 meta 上 fully_shard，先于 to_empty/load_base_model）
     #    物化 sharded 参数由 to_empty 完成，load_base_model 再写入本地份。
     if fsdp2_manager is not None:
         model = fsdp2_manager.parallelize(model, tp_grad_info=tp_grad_info)
 
-    # ⑧ meta → GPU（物化 sharded 参数）+ 权重加载（5 参 canonical 签名）
+    # ⑨ meta → GPU（物化 sharded 参数）+ 权重加载（5 参 canonical 签名）
     if is_meta_device and load_base_model:
         # meta → 真实设备（FSDP2 已在 meta 上包裹，物化即得到 sharded 参数）
         model.to_empty(device=device)
@@ -2671,11 +2770,6 @@ def apply_model_infrastructure(
     elif not is_meta_device and load_base_model:
         model = model.to(device=device)
 
-    # ⑨ PP 拆分（在 FSDP2 / 权重加载之后）
-    #    build() in-place 注册 model.parts，不返回值——model 仍为原 nn.Module
-    if autopipeline is not None:
-        autopipeline.build(model)
-
     # ⑨.5 PEFT 非 LoRA 参数冻结（在 FSDP2 + 权重加载之后；与 §6.4 / §4 ④.4.5.12 一致）
     #    原因：冻结操作需要遍历已 FSDP2 包裹、已物化的参数。
     if peft_config is not None:
@@ -2683,10 +2777,11 @@ def apply_model_infrastructure(
 
         _freeze_non_lora_params(model)
 
-    # ⑩ CP hooks
-    if mesh.cp_size > 1:
-        from hyper_parallel.components.distributed.cp_utils import attach_context_parallel_hooks
-        attach_context_parallel_hooks(model)
+    # ⑩ CP hooks —— 已取消（D-01''）：CP 的 K/V all-gather 由 ⑥
+    #    apply_sharding_plan 在编译期注入 inner attention wrapper
+    #    （_wrap_cp_inner_attention → flex_cp_allgather，05 §4.4.2），
+    #    无运行时 hooks 步骤；早期草案的 attach_context_parallel_hooks
+    #    不存在于代码（03 §7.1 同注）。
 
     return model
 ```

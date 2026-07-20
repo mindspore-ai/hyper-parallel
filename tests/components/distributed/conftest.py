@@ -180,6 +180,54 @@ class TinyDecoderLayer(nn.Module):
         return hidden_states
 
 
+class TinyHFNativeMoEMLP(nn.Module):
+    """HF 原生风格 MoE（D-09 直通目标）：gate + per-expert MLP ModuleList，
+    forward 逐 expert 循环——无 all_to_all、无 dispatcher 钩子、无 EP 感知。
+
+    路由语义与 ep_utils._softmax_topk_router 一致（softmax → top-2 → 归一化），
+    作为 EP 计算路径的单卡参考实现。
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = 2
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            TinyLlamaMLP(config) for _ in range(config.num_experts))
+
+    def forward(self, hidden_states):
+        b, s, h = hidden_states.shape
+        x = hidden_states.view(-1, h)
+        logits = self.gate(hidden_states).view(-1, self.num_experts)
+        weights = logits.softmax(-1)
+        topk_w, topk_idx = weights.topk(self.top_k, dim=-1)
+        topk_w = topk_w / topk_w.sum(-1, keepdim=True)
+        out = torch.zeros_like(x)
+        for e_idx, expert in enumerate(self.experts):
+            tok, slot = (topk_idx == e_idx).nonzero(as_tuple=True)
+            if tok.numel() == 0:
+                continue
+            out.index_add_(0, tok, expert(x[tok]) * topk_w[tok, slot].unsqueeze(-1))
+        return out.view(b, s, h)
+
+
+class TinyHFNativeMoEDecoderLayer(nn.Module):
+    def __init__(self, config, causal=False):
+        super().__init__()
+        self.input_layernorm = TinyRMSNorm(config.hidden_size)
+        self.self_attn = TinyLlamaAttention(config, causal=causal)
+        self.post_attention_layernorm = TinyRMSNorm(config.hidden_size)
+        self.mlp = TinyHFNativeMoEMLP(config)
+
+    def forward(self, hidden_states, position_ids=None):
+        hidden_states = hidden_states + self.self_attn(
+            self.input_layernorm(hidden_states), position_ids)
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states))
+        return hidden_states
+
+
 class TinyLlamaModel(nn.Module):
     def __init__(self, config, causal=False):
         super().__init__()
@@ -211,6 +259,102 @@ class TinyLlamaForCausalLM(nn.Module):
         return self.lm_head(hidden)
 
 
+class TinyHFNativeMoEForCausalLM(TinyLlamaForCausalLM):
+    """HF 原生 MoE 版小模型（FQN: model.layers.N.mlp.experts.{i}.gate_proj.weight）。"""
+
+    def __init__(self, config=None, causal=False):
+        super().__init__(config, causal)
+        self.model.layers = nn.ModuleList(
+            TinyHFNativeMoEDecoderLayer(self.config, causal=causal)
+            for _ in range(self.config.num_hidden_layers))
+
+
+class TinyBatchedTopKRouter(nn.Module):
+    """Qwen3MoeTopKRouter 风格（HF 2025 重构后）：forward 返回
+    (logits, scores [T,K], indices [T,K])。"""
+
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = 2
+        self.weight = nn.Parameter(
+            torch.randn(config.num_experts, config.hidden_size) * 0.02)
+
+    def forward(self, hidden_states):
+        h = hidden_states.shape[-1]
+        logits = F.linear(hidden_states.view(-1, h), self.weight)
+        probs = logits.softmax(-1)
+        top_value, indices = probs.topk(self.top_k, dim=-1)
+        top_value = top_value / top_value.sum(dim=-1, keepdim=True)
+        return logits, top_value.to(logits.dtype), indices
+
+
+class TinyBatchedExperts(nn.Module):
+    """HF 2025 batched 布局（D-11）：gate_up_proj [E, 2I, H] + down_proj
+    [E, H, I]——天生 stacked 3D 参数，gate/up 融合。"""
+
+    def __init__(self, config):
+        super().__init__()
+        h, inter, e = (config.hidden_size, config.moe_intermediate_size,
+                       config.num_experts)
+        self.num_experts = e
+        self.gate_up_proj = nn.Parameter(torch.randn(e, 2 * inter, h) * 0.02)
+        self.down_proj = nn.Parameter(torch.randn(e, h, inter) * 0.02)
+
+    def forward(self, x, topk_idx, topk_w):
+        out = torch.zeros_like(x)
+        for e in range(self.num_experts):
+            tok, slot = (topk_idx == e).nonzero(as_tuple=True)
+            if tok.numel() == 0:
+                continue
+            gate, up = F.linear(x[tok], self.gate_up_proj[e]).chunk(2, dim=-1)
+            y = F.linear(F.silu(gate) * up, self.down_proj[e])
+            out.index_add_(0, tok, y * topk_w[tok, slot].unsqueeze(-1))
+        return out
+
+
+class TinyBatchedMoEMLP(nn.Module):
+    """HF 2025 SparseMoeBlock 风格：gate（TopKRouter 模块）+ batched experts，
+    forward 无 all_to_all（D-11 直通目标）。"""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.gate = TinyBatchedTopKRouter(config)
+        self.experts = TinyBatchedExperts(config)
+
+    def forward(self, hidden_states):
+        b, s, h = hidden_states.shape
+        x = hidden_states.view(-1, h)
+        _, scores, indices = self.gate(x)
+        return self.experts(x, indices, scores).view(b, s, h)
+
+
+class TinyBatchedMoEDecoderLayer(nn.Module):
+    def __init__(self, config, causal=False):
+        super().__init__()
+        self.input_layernorm = TinyRMSNorm(config.hidden_size)
+        self.self_attn = TinyLlamaAttention(config, causal=causal)
+        self.post_attention_layernorm = TinyRMSNorm(config.hidden_size)
+        self.mlp = TinyBatchedMoEMLP(config)
+
+    def forward(self, hidden_states, position_ids=None):
+        hidden_states = hidden_states + self.self_attn(
+            self.input_layernorm(hidden_states), position_ids)
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states))
+        return hidden_states
+
+
+class TinyBatchedMoEForCausalLM(TinyLlamaForCausalLM):
+    """HF 2025 batched MoE 版小模型（FQN: model.layers.N.mlp.experts.gate_up_proj）。"""
+
+    def __init__(self, config=None, causal=False):
+        super().__init__(config, causal)
+        self.model.layers = nn.ModuleList(
+            TinyBatchedMoEDecoderLayer(self.config, causal=causal)
+            for _ in range(self.config.num_hidden_layers))
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # fixtures
 # ────────────────────────────────────────────────────────────────────────────
@@ -227,6 +371,25 @@ def tiny_moe():
     """MoE 版小模型（gate + experts + 无 shared_experts）。"""
     torch.manual_seed(1234)
     return TinyLlamaForCausalLM(TinyConfig(num_experts=4))
+
+
+@pytest.fixture
+def tiny_hf_native_moe():
+    """HF 原生 MoE 小模型（per-expert Linear 列表，D-09 直通目标）。"""
+    torch.manual_seed(1234)
+    return TinyHFNativeMoEForCausalLM(TinyConfig(num_experts=4))
+
+
+@pytest.fixture
+def tiny_hf_batched_moe():
+    """HF 2025 batched MoE 小模型（experts.gate_up_proj [E,2I,H]，D-11 直通目标）。
+
+    architectures=["Qwen3MoeForCausalLM"] → arch="qwen3moe" → TopKRouter
+    模块 adapter。
+    """
+    torch.manual_seed(1234)
+    return TinyBatchedMoEForCausalLM(TinyConfig(
+        num_experts=4, architectures=["Qwen3MoeForCausalLM"]))
 
 
 @pytest.fixture

@@ -1,7 +1,7 @@
 # Copyright 2025-2026 Huawei Technologies Co., Ltd
 # Licensed under the Apache License, Version 2.0
 # ============================================================================
-"""S4.2（2 进程）: _wrap_moe_forward — toy MoE EP=2 输出 vs 单卡参考（N8 非对称通信）。"""
+"""S4.2（2 进程）: _wrap_local_region_forward — toy MoE EP=2 输出 vs 单卡参考（N8 非对称通信）。"""
 
 import torch
 

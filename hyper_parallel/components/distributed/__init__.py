@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components.distributed: 独立可用的 DTensor 分片组件（零依赖 recipes/_transformers/models）。"""
+"""components.distributed: standalone DTensor sharding components (zero dependency on recipes/_transformers/models)."""
 
 from hyper_parallel.components.distributed.cp_utils import (
     flex_cp_allgather,

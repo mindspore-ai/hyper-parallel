@@ -13,14 +13,14 @@ from hyper_parallel.components.distributed.param_role import (
 
 
 class TestParamRoleEnum:
-    def test_thirteen_roles(self):
-        assert len(ParamRole) == 13
+    def test_fourteen_roles(self):
+        assert len(ParamRole) == 14
 
     def test_expected_role_names(self):
         expected = {
             "COLWISE", "ROWWISE", "NORM", "EMBED", "LM_HEAD", "MOE_GATE",
             "MOE_EXPERT", "SHARED_EXPERT", "FUSED_QKV", "FUSED_GATE_UP",
-            "BIAS", "SPECIAL", "SKIP",
+            "BIAS", "REPLICATED", "SPECIAL", "SKIP",
         }
         assert {r.name for r in ParamRole} == expected
 
@@ -49,7 +49,8 @@ class TestParameterClassifier:
         return self.clf.classify(model)[name]
 
     def test_each_role_hit(self):
-        """13 个角色每个至少 1 个命中用例（SPECIAL/SKIP 在内）。"""
+        """默认规则可产生的 13 个角色每个至少 1 个命中用例（SPECIAL/SKIP 在内；
+        REPLICATED 仅经 ARCH_OVERRIDES 指派，见 test_s1_mla_deepseek.py）。"""
         cases = {
             "model.embed_tokens.weight": ParamRole.EMBED,
             "lm_head.weight": ParamRole.LM_HEAD,

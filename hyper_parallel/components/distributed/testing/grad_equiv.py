@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""testing.grad_equiv: M_D.15a 双模式梯度等价工具（05 §5.5 修订版）。
+"""testing.grad_equiv: M_D.15a dual-mode gradient equivalence utilities (05 §5.5 revised).
 
-自研 DTensor 前向-only（05 §1.0）：production（FSDP/tp_grad_info 旁路）与
-validate（local autograd 直出）的 backward **均为 local tensor 路径**——不存在
-"DTensor backward" 对照组。因此双模式梯度等价直接逐参数比较：
+The in-house DTensor is forward-only (05 §1.0): the backward of both
+production (FSDP/tp_grad_info bypass) and validate (local autograd, direct
+output) follows the **local tensor path** — there is no "DTensor backward"
+control group. Dual-mode gradient equivalence therefore compares gradients
+parameter by parameter directly:
 
-- TP-Shard 参数：两模式梯度天然是 local shard，逐 rank 相等（免同步）；
-- TP-Replicate 参数：两模式梯度同为 Partial 贡献，逐 rank 相等；
-  与单卡参考梯度比较前需先经 tp_grad_info 旁路 all-reduce（本模块提供模拟；
-  真实 FSDP2 fork 路径属 M_M.2a 联调）。
+- TP-Shard parameters: gradients in both modes are naturally local shards,
+  equal rank by rank (no sync needed);
+- TP-Replicate parameters: gradients in both modes are likewise Partial
+  contributions, equal rank by rank; before comparing against the
+  single-card reference gradient they must first go through the
+  tp_grad_info bypass all-reduce (this module provides a simulation; the
+  real FSDP2 fork path is part of the M_M.2a joint integration).
 """
 
 import torch
@@ -29,7 +34,7 @@ import torch.distributed as dist
 
 
 def run_one_step(model, input_ids, labels, vocab_size):
-    """单步 forward+backward，返回 {param_fqn: grad}。"""
+    """Single forward+backward step, returns {param_fqn: grad}."""
     model.zero_grad()
     logits = model(input_ids)
     loss = torch.nn.functional.cross_entropy(
@@ -42,21 +47,22 @@ def run_one_step(model, input_ids, labels, vocab_size):
 
 
 def assert_grad_equivalence(prod_grads, val_grads, *, rtol=1e-3, atol=1e-5):
-    """双模式梯度逐参数 assert_close（跳过两侧均缺失的参数）。"""
+    """Dual-mode per-parameter assert_close on gradients (parameters missing on both sides are skipped)."""
     for name, gp in prod_grads.items():
         gv = val_grads.get(name)
         if gp is None and gv is None:
             continue
-        assert gp is not None, f"{name}: production 缺梯度"
-        assert gv is not None, f"{name}: validate 缺梯度"
+        assert gp is not None, f"{name}: production missing gradient"
+        assert gv is not None, f"{name}: validate missing gradient"
         torch.testing.assert_close(gp, gv, rtol=rtol, atol=atol)
 
 
 def simulate_tp_replicate_grad_sync(grad, tp_group):
-    """模拟 tp_grad_info 旁路：TP-Replicate 参数梯度的 TP all-reduce。
+    """Simulate the tp_grad_info bypass: TP all-reduce of TP-Replicate parameter gradients.
 
-    真实路径由 FSDP2 fork 的 all_reduce_grad 完成（M_M.2a 联调）；此处用于
-    独立开发阶段的梯度等价验证。
+    The real path is implemented by the FSDP2 fork's all_reduce_grad
+    (M_M.2a joint integration); this is used for gradient equivalence
+    validation during the independent-development phase.
     """
     synced = grad.clone()
     dist.all_reduce(synced, group=tp_group)
