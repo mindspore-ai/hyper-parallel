@@ -21,7 +21,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 # Skip entire module if mindspore is not installed (avoids import failure)
-pytest.importorskip("mindspore")
+ms = pytest.importorskip("mindspore")
 
 # Force mindspore platform before any hyper_parallel imports
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
@@ -376,14 +376,58 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must be bool"):
             fully_shard(cell, mesh=mesh, sharded_accumulated_grad=1)
+        with self.assertRaisesRegex(ValueError, "must be bool"):
+            fully_shard(cell, mesh=mesh, sharded_grad_ready_overlap=1)
         with self.assertRaisesRegex(ValueError, "explicit FSDP/HSDP mesh"):
             fully_shard(cell, sharded_accumulated_grad=True)
-        with self.assertRaisesRegex(ValueError, "comm_fusion"):
+        with self.assertRaisesRegex(ValueError, "requires sharded_accumulated_grad"):
+            fully_shard(
+                cell,
+                mesh=mesh,
+                comm_fusion=True,
+                sharded_grad_ready_overlap=True,
+            )
+        with self.assertRaisesRegex(ValueError, "requires comm_fusion"):
+            fully_shard(
+                cell,
+                mesh=mesh,
+                sharded_accumulated_grad=True,
+                sharded_grad_ready_overlap=True,
+            )
+        with self.assertRaisesRegex(ValueError, "positive integer"):
             fully_shard(
                 cell,
                 mesh=mesh,
                 comm_fusion=True,
                 sharded_accumulated_grad=True,
+                sharded_accumulated_grad_max_pending=0,
+            )
+        with self.assertRaisesRegex(ValueError, "requires sharded_accumulated_grad"):
+            fully_shard(
+                cell,
+                mesh=mesh,
+                comm_fusion=True,
+                sharded_accumulated_grad_max_pending=2,
+            )
+        with self.assertRaisesRegex(ValueError, "requires comm_fusion"):
+            fully_shard(
+                cell,
+                mesh=mesh,
+                sharded_accumulated_grad=True,
+                sharded_accumulated_grad_max_pending=2,
+            )
+        with self.assertRaisesRegex(ValueError, "requires sharded_accumulated_grad"):
+            fully_shard(
+                cell,
+                mesh=mesh,
+                sharded_grad_reduce_dtype=ms.bfloat16,
+            )
+        with self.assertRaisesRegex(ValueError, "must be mindspore.dtype"):
+            fully_shard(
+                cell,
+                mesh=mesh,
+                sharded_accumulated_grad=True,
+                sharded_grad_reduce_dtype="bfloat16",
             )
         with self.assertRaisesRegex(ValueError, "CPU gradient offload"):
             fully_shard(
@@ -402,7 +446,10 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
         captured = {}
 
         def _fake_hsdp_init(self, *args, **kwargs):
-            captured["sharded_accumulated_grad"] = args[-1]
+            captured["sharded_accumulated_grad"] = args[-4]
+            captured["sharded_grad_ready_overlap"] = args[-3]
+            captured["sharded_accumulated_grad_max_pending"] = args[-2]
+            captured["sharded_grad_reduce_dtype"] = args[-1]
             self.hsdp_scheduler = object()
 
         with patch(
@@ -413,10 +460,17 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
                 ms_nn.Dense(4, 4),
                 mesh=self._create_mock_mesh(),
                 mp_policy=_default_mp_policy(),
+                comm_fusion=True,
                 sharded_accumulated_grad=True,
+                sharded_grad_ready_overlap=True,
+                sharded_accumulated_grad_max_pending=4,
+                sharded_grad_reduce_dtype=ms.bfloat16,
             )
 
         self.assertTrue(captured["sharded_accumulated_grad"])
+        self.assertTrue(captured["sharded_grad_ready_overlap"])
+        self.assertEqual(captured["sharded_accumulated_grad_max_pending"], 4)
+        self.assertEqual(captured["sharded_grad_reduce_dtype"], ms.bfloat16)
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")

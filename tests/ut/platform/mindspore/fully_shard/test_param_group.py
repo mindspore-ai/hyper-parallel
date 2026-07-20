@@ -47,6 +47,7 @@ from hyper_parallel.platform.mindspore.fully_shard.param_group import (
     ReplicateBucket,
     _normalize_device,
     _shape_numel,
+    fuse_reduce_scatter_inputs,
     get_all_gather_metadata,
     reduce_scatter_copy_in,
     split_with_sizes_copy,
@@ -77,6 +78,7 @@ def _new_param_group():
     group.mesh_info = _mesh_info(FSDPMeshInfo)
     group.device = "Ascend:0"
     group.enable_zero_copy_param_buffer = False
+    group.sharded_grad_reduce_dtype = None
     group.shard_rank = 0
     group.shard_world_size = 2
     group.shard_group = "shard-group"
@@ -85,9 +87,13 @@ def _new_param_group():
     group.metadata_cache = None
     group.mp_policy = None
     group._result = None
+    group._reduce_input = None
     group._reduce_output = None
+    group._reduce_scatter_handle = None
     group._reduce_op = None
     group._reduce_hsdp_params = None
+    group._defer_all_reduce = False
+    group._reduce_output_accumulation_dtype = None
     group._active_replicate_buckets = {}
     group._active_param_flat_offsets = []
     group._pending_all_reduce_handles = []
@@ -121,6 +127,9 @@ def _fake_hsdp_param(name="param", *, dtype=ms.float32, requires_grad=True, shar
     param.unsharded_grad_data = ms.Tensor(np.ones((2, 2), dtype=np.float32))
     param.unsharded_accumulated_grad_data = None
     param.unsharded_group_info = SimpleNamespace(group=None, rank_size=1)
+    param.accumulated_allreduced_grad = False
+    param._retain_unsharded_grad_source_for_reduce_scatter = MagicMock()
+    param.clear_released_unsharded_grad = MagicMock()
     param.init_dtype_attrs.side_effect = lambda policy: None
     return param
 
@@ -221,6 +230,39 @@ class TestMindSporeParamGroupHelpers(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "one hsdp_param per unsharded_grad"):
             reduce_scatter_copy_in([MagicMock()], [], MagicMock(), world_size=2)
 
+    def test_fuse_reduce_scatter_inputs_concatenates_rank_major_columns(self):
+        """Vectorized packing should concatenate each parameter within destination rows."""
+        first_param = SimpleNamespace(hsdp_placement=SimpleNamespace(dim=0))
+        second_param = SimpleNamespace(hsdp_placement=SimpleNamespace(dim=1))
+        first_grad = ms.Tensor(np.arange(8, dtype=np.float32).reshape(4, 2))
+        second_grad = ms.Tensor(np.arange(8, 16, dtype=np.float32).reshape(2, 4))
+
+        fused_input = fuse_reduce_scatter_inputs(
+            [first_param, second_param],
+            [first_grad, second_grad],
+            world_size=2,
+            reduce_dtype=ms.float16,
+        )
+
+        self.assertEqual(fused_input.dtype, ms.float16)
+        np.testing.assert_allclose(
+            fused_input.asnumpy().reshape(2, 8),
+            np.array(
+                [
+                    [0, 1, 2, 3, 8, 9, 12, 13],
+                    [4, 5, 6, 7, 10, 11, 14, 15],
+                ],
+                dtype=np.float16,
+            ),
+        )
+
+    def test_fuse_reduce_scatter_inputs_validates_inputs(self):
+        """Vectorized packing should reject mismatched or empty input lists."""
+        with self.assertRaisesRegex(AssertionError, "one hsdp_param per unsharded_grad"):
+            fuse_reduce_scatter_inputs([MagicMock()], [], 2, ms.float32)
+        with self.assertRaisesRegex(ValueError, "at least one gradient"):
+            fuse_reduce_scatter_inputs([], [], 2, ms.float32)
+
 
 class TestMindSporeParamGroup(unittest.TestCase):
     """Cover HSDPParamGroup fused communication state transitions."""
@@ -244,9 +286,18 @@ class TestMindSporeParamGroup(unittest.TestCase):
         """Layout-driven FSDP params can provide a separate replicate group."""
         group = _new_param_group()
         group.hsdp_params = [
-            SimpleNamespace(unsharded_group_info=SimpleNamespace(group=None, rank_size=1), replicate_world_size=1),
-            SimpleNamespace(unsharded_group_info=SimpleNamespace(group="replicate-a", rank_size=2), replicate_world_size=2),
-            SimpleNamespace(unsharded_group_info=SimpleNamespace(group="replicate-b", rank_size=2), replicate_world_size=2),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group=None, rank_size=1),
+                replicate_world_size=1,
+            ),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group="replicate-a", rank_size=2),
+                replicate_world_size=2,
+            ),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group="replicate-b", rank_size=2),
+                replicate_world_size=2,
+            ),
         ]
 
         self.assertEqual(HSDPParamGroup._infer_layout_replicate_group(group), "replicate-a")
@@ -254,9 +305,21 @@ class TestMindSporeParamGroup(unittest.TestCase):
     def test_build_active_replicate_buckets_groups_params_by_process_group(self):
         """Active all-reduce buckets should group params by their replicate process group."""
         params = [
-            SimpleNamespace(unsharded_group_info=SimpleNamespace(group="rep-a", rank_size=2), replicate_world_size=2, sharded_size=(2,)),
-            SimpleNamespace(unsharded_group_info=SimpleNamespace(group="rep-a", rank_size=2), replicate_world_size=2, sharded_size=(3,)),
-            SimpleNamespace(unsharded_group_info=SimpleNamespace(group=None, rank_size=1), replicate_world_size=1, sharded_size=(5,)),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group="rep-a", rank_size=2),
+                replicate_world_size=2,
+                sharded_size=(2,),
+            ),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group="rep-a", rank_size=2),
+                replicate_world_size=2,
+                sharded_size=(3,),
+            ),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group=None, rank_size=1),
+                replicate_world_size=1,
+                sharded_size=(5,),
+            ),
         ]
 
         buckets = HSDPParamGroup._build_active_replicate_buckets(params)
@@ -402,7 +465,9 @@ class TestMindSporeParamGroup(unittest.TestCase):
         """foreach_all_gather should pack local shards and launch the fused all-gather."""
         group = _new_param_group()
         group.hsdp_params = [_fake_hsdp_param()]
-        group.alloc_all_gather_output = MagicMock(side_effect=lambda total, dtype: setattr(group, "ag_output", MagicMock()))
+        group.alloc_all_gather_output = MagicMock(
+            side_effect=lambda total, dtype: setattr(group, "ag_output", MagicMock())
+        )
         mock_all_gather.return_value = "ag-handle"
 
         HSDPParamGroup.foreach_all_gather(group, async_op=True)
@@ -475,6 +540,72 @@ class TestMindSporeParamGroup(unittest.TestCase):
         self.assertIs(reduce_output, group._reduce_output)
         self.assertEqual(param_group_mod.comm_ctx.comm_handle, "rs-handle")
         self.assertIs(param_group_mod.comm_ctx.pre_param_group, group)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.dist.reduce_scatter_tensor")
+    def test_foreach_reduce_can_defer_all_reduce_and_release_full_grad(self, mock_reduce_scatter):
+        """Deferred fused reduction should retain its source and apply only the local shard."""
+        group = _new_param_group()
+        hsdp_param = _fake_hsdp_param(shard_size=(2,))
+        hsdp_param._unsharded_param = SimpleNamespace(grad="grad")
+        group.hsdp_params = [hsdp_param]
+        handle = MagicMock()
+        mock_reduce_scatter.return_value = handle
+        param_group_mod.comm_ctx.comm_handle = None
+        param_group_mod.comm_ctx.pre_param_group = None
+
+        HSDPParamGroup.foreach_reduce(
+            group,
+            defer_all_reduce=True,
+        )
+        self.assertIsNone(param_group_mod.comm_ctx.pre_param_group)
+        self.assertIs(group._reduce_scatter_handle, handle)
+
+        HSDPParamGroup.wait_deferred_reduce_scatter_and_apply_grad(group)
+
+        handle.wait.assert_called_once_with()
+        hsdp_param._retain_unsharded_grad_source_for_reduce_scatter.assert_called_once_with()
+        hsdp_param.apply_reduced_grad.assert_called_once()
+        self.assertFalse(
+            hsdp_param.apply_reduced_grad.call_args.kwargs["clear_unsharded_grad"]
+        )
+        hsdp_param.clear_released_unsharded_grad.assert_called_once_with()
+        self.assertFalse(hsdp_param.accumulated_allreduced_grad)
+        self.assertIsNone(group._reduce_input)
+        self.assertIsNone(group._reduce_scatter_handle)
+        self.assertFalse(group._defer_all_reduce)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.dist.reduce_scatter_tensor")
+    def test_deferred_reduce_scatter_uses_low_precision_comm_and_fp32_accumulation(
+        self, mock_reduce_scatter
+    ):
+        """Deferred RS may communicate in BF16 but must apply an FP32 local shard."""
+        group = _new_param_group()
+        group.sharded_grad_reduce_dtype = ms.bfloat16
+        hsdp_param = _fake_hsdp_param(shard_size=(2,))
+        hsdp_param._unsharded_param = SimpleNamespace(grad="grad")
+        group.hsdp_params = [hsdp_param]
+        handle = MagicMock()
+        mock_reduce_scatter.return_value = handle
+
+        HSDPParamGroup.foreach_reduce(group, defer_all_reduce=True)
+
+        reduce_scatter_call = mock_reduce_scatter.call_args
+        self.assertEqual(reduce_scatter_call.kwargs["input"].dtype, ms.bfloat16)
+        self.assertEqual(reduce_scatter_call.kwargs["output"].dtype, ms.bfloat16)
+
+        HSDPParamGroup.wait_deferred_reduce_scatter_and_apply_grad(group)
+
+        reduced_grad = hsdp_param.apply_reduced_grad.call_args.args[0]
+        self.assertEqual(reduced_grad.dtype, ms.float32)
+        self.assertIsNone(group._reduce_output_accumulation_dtype)
+
+    def test_foreach_reduce_rejects_reuse_while_deferred_work_is_pending(self):
+        """A state-owned fused group must finish before another micro reuses its buffers."""
+        group = _new_param_group()
+        group._reduce_output = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "previous reduce-scatter is pending"):
+            HSDPParamGroup.foreach_reduce(group, defer_all_reduce=True)
 
     def test_wait_reduce_scatter_and_issue_all_reduce_applies_when_no_buckets(self):
         """No active replicate buckets should apply reduced grads immediately."""
@@ -755,6 +886,119 @@ class TestAllReduceParamGroup(MindSporeFullyShardUnitTest):
             group.fused_buffer.asnumpy()[:2], np.array([0.0, 0.0], dtype=np.float32)
         )
         self.assertIsNotNone(param.sharded_param.grad)
+
+    def test_accumulate_existing_grads_packs_and_releases_main_grad(self):
+        """Final fused all-reduce should move each local main_grad into its buffer."""
+        param = self._fake_param((2,))
+        param.sharded_param = SimpleNamespace(
+            main_grad=ms.Tensor(np.array([3.0, 5.0], dtype=np.float32)),
+            grad=None,
+        )
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.SUM,
+            replicate_world_size=2,
+            params=[param],
+            buffer_values=[0.0, 0.0],
+        )
+        group.mp_policy = MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True)
+
+        AllReduceParamGroup.accumulate_existing_grads_to_buffer(group)
+
+        np.testing.assert_allclose(
+            group.fused_buffer.asnumpy()[:2], np.array([3.0, 5.0], dtype=np.float32)
+        )
+        self.assertIsNone(param.sharded_param.main_grad)
+
+    def test_accumulate_existing_grads_preserves_reduce_scatter_output(self):
+        """Existing shard gradients should be added to the current reduce-scatter output."""
+        param = self._fake_param((2,))
+        param.sharded_param = SimpleNamespace(
+            grad=ms.Tensor(np.array([3.0, 5.0], dtype=np.float32)),
+        )
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.SUM,
+            replicate_world_size=2,
+            params=[param],
+            buffer_values=[7.0, 11.0],
+        )
+
+        AllReduceParamGroup.accumulate_existing_grads_to_buffer(group)
+
+        np.testing.assert_allclose(
+            group.fused_buffer.asnumpy()[:2], np.array([10.0, 16.0], dtype=np.float32)
+        )
+        self.assertIsNone(param.sharded_param.grad)
+
+    def test_pack_existing_grads_builds_exact_payload(self):
+        """Final packing should concatenate local shards without trailing padding."""
+        first_param = self._fake_param((2,))
+        first_param.sharded_param = SimpleNamespace(
+            grad=ms.Tensor(np.array([3.0, 5.0], dtype=np.float32)),
+        )
+        second_param = self._fake_param((1,))
+        second_param.sharded_param = SimpleNamespace(
+            grad=ms.Tensor(np.array([7.0], dtype=np.float32)),
+        )
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.SUM,
+            replicate_world_size=2,
+            params=[first_param, second_param],
+            buffer_values=[],
+        )
+        group.ALIGNMENT_BYTES = 16
+
+        AllReduceParamGroup.pack_existing_grads_to_buffer(group)
+
+        np.testing.assert_allclose(
+            group.fused_buffer.asnumpy(),
+            np.array([3.0, 5.0, 7.0], dtype=np.float32),
+        )
+        self.assertIsNone(first_param.sharded_param.grad)
+        self.assertIsNone(second_param.sharded_param.grad)
+
+    def test_pack_existing_single_grad_reuses_storage(self):
+        """A singleton final bucket should reuse its gradient shard storage."""
+        param = self._fake_param((2,))
+        grad = ms.Tensor(np.array([3.0, 5.0], dtype=np.float32))
+        param.sharded_param = SimpleNamespace(grad=grad)
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.SUM,
+            replicate_world_size=2,
+            params=[param],
+            buffer_values=[],
+        )
+
+        AllReduceParamGroup.pack_existing_grads_to_buffer(group)
+
+        self.assertEqual(group.fused_buffer.data_ptr(), grad.data_ptr())
+        self.assertIsNone(param.sharded_param.grad)
+
+    def test_pack_existing_grads_preserves_sources_on_validation_failure(self):
+        """A failed final pack must not release any source gradient shard."""
+        first_param = self._fake_param((2,))
+        first_grad = ms.Tensor(np.array([3.0, 5.0], dtype=np.float32))
+        first_param.sharded_param = SimpleNamespace(grad=first_grad)
+        missing_param = self._fake_param((1,))
+        missing_param.sharded_param = SimpleNamespace(grad=None)
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.SUM,
+            replicate_world_size=2,
+            params=[first_param, missing_param],
+            buffer_values=[],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "one pending local gradient shard"):
+            AllReduceParamGroup.pack_existing_grads_to_buffer(group)
+
+        self.assertIs(first_param.sharded_param.grad, first_grad)
+
+        missing_param.sharded_param.grad = ms.Tensor(
+            np.array([7.0, 11.0], dtype=np.float32)
+        )
+        with self.assertRaisesRegex(ValueError, "requires 1"):
+            AllReduceParamGroup.pack_existing_grads_to_buffer(group)
+
+        self.assertIs(first_param.sharded_param.grad, first_grad)
 
 
 class TestAllReduceParamGroupReduceOpConsistency(MindSporeFullyShardUnitTest):

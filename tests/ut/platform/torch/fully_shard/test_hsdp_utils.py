@@ -272,6 +272,7 @@ class TestHSDPConfigAndParamDiscovery(unittest.TestCase):
         self.assertEqual(config.replicate_params, {"replicate"})
         self.assertTrue(config.comm_fusion)
         self.assertTrue(config.comm_fusion_zero_copy)
+        self.assertFalse(config.sharded_grad_ready_overlap)
 
     def test_get_managed_modules_parameters_skips_ignored_duplicates_and_initialized(self):
         """Only unique, non-ignored, non-HSDP-initialized params should be managed."""

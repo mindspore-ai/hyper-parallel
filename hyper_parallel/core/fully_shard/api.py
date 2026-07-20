@@ -132,7 +132,10 @@ class HSDPModule:
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
                   comm_fusion, comm_fusion_zero_copy: Optional[bool] = None,
-                  sharded_accumulated_grad: bool = False):
+                  sharded_accumulated_grad: bool = False,
+                  sharded_grad_ready_overlap: bool = False,
+                  sharded_accumulated_grad_max_pending: int = 1,
+                  sharded_grad_reduce_dtype: Optional[platform.dtype] = None):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -160,6 +163,9 @@ class HSDPModule:
                                               comm_fusion,
                                               resolved_comm_fusion_zero_copy,
                                               sharded_accumulated_grad,
+                                              sharded_grad_ready_overlap,
+                                              sharded_accumulated_grad_max_pending,
+                                              sharded_grad_reduce_dtype,
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
@@ -516,15 +522,23 @@ def _validate_hsdp_optimizer_level(optimizer_level: str) -> None:
         )
 
 
-def _validate_hsdp_reduce_dtype(platform_type: PlatformType, reduce_dtype) -> None:
+def _validate_hsdp_reduce_dtype(
+    platform_type: PlatformType,
+    reduce_dtype,
+    argument_name: str = "reduce_dtype",
+) -> None:
     if platform_type == PlatformType.MINDSPORE:
         from mindspore._c_expression.typing import Type
         if reduce_dtype is not None and not isinstance(reduce_dtype, Type):
-            raise ValueError(f"reduce_dtype must be mindspore.dtype but got {reduce_dtype}.")
+            raise ValueError(
+                f"{argument_name} must be mindspore.dtype but got {reduce_dtype}."
+            )
         return
     import torch
     if reduce_dtype is not None and not isinstance(reduce_dtype, torch.dtype):
-        raise ValueError(f"reduce_dtype must be torch.dtype but got {reduce_dtype}.")
+        raise ValueError(
+            f"{argument_name} must be torch.dtype but got {reduce_dtype}."
+        )
 
 
 def _check_hsdp_input_valid(platform_type, module, options: HsdpValidationOptions):
@@ -616,6 +630,9 @@ def fully_shard(
         comm_fusion: bool = False,
         comm_fusion_zero_copy: Optional[bool] = None,
         sharded_accumulated_grad: bool = False,
+        sharded_grad_ready_overlap: bool = False,
+        sharded_accumulated_grad_max_pending: int = 1,
+        sharded_grad_reduce_dtype: Optional[platform.dtype] = None,
 ) -> Union[platform.Module, List[platform.Module]]:
 
     """
@@ -693,6 +710,27 @@ def fully_shard(
             until the final pipeline gradient-reduction action. This mode
             requires an explicit FSDP/HSDP ``mesh``.
 
+        sharded_grad_ready_overlap (bool, default=False):
+            Launch each fused parameter group's reduce-scatter from its final
+            gradient-ready hook instead of waiting for the backward API to
+            return. This is experimental because earlier communication can
+            improve overlap while increasing peak memory and rank-arrival
+            sensitivity. Requires ``sharded_accumulated_grad=True`` and
+            ``comm_fusion=True``.
+
+        sharded_accumulated_grad_max_pending (int, default=1):
+            Maximum number of fused reduce-scatter operations allowed to
+            remain pending across pipeline actions. Larger values increase
+            communication/compute overlap while retaining more communication
+            input buffers. Values greater than ``1`` require
+            ``comm_fusion=True``.
+
+        sharded_grad_reduce_dtype (Optional[dtype], default=None):
+            Communication dtype used only by the deferred reduce-scatter in
+            ``sharded_accumulated_grad`` mode. The local shards are cast back
+            to the regular mixed-precision reduction dtype before accumulation,
+            and the step-final all-reduce keeps using that regular dtype.
+
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
     """
@@ -702,6 +740,46 @@ def fully_shard(
             "sharded_accumulated_grad must be bool, "
             f"but got {type(sharded_accumulated_grad).__name__}."
         )
+    if not isinstance(sharded_grad_ready_overlap, bool):
+        raise ValueError(
+            "sharded_grad_ready_overlap must be bool, "
+            f"but got {type(sharded_grad_ready_overlap).__name__}."
+        )
+    if sharded_grad_ready_overlap and not sharded_accumulated_grad:
+        raise ValueError(
+            "sharded_grad_ready_overlap requires sharded_accumulated_grad=True."
+        )
+    if sharded_grad_ready_overlap and not comm_fusion:
+        raise ValueError(
+            "sharded_grad_ready_overlap requires comm_fusion=True."
+        )
+    if not isinstance(sharded_accumulated_grad_max_pending, int) or isinstance(
+        sharded_accumulated_grad_max_pending, bool
+    ) or sharded_accumulated_grad_max_pending < 1:
+        raise ValueError(
+            "sharded_accumulated_grad_max_pending must be a positive integer, "
+            f"but got {sharded_accumulated_grad_max_pending}."
+        )
+    if not sharded_accumulated_grad and sharded_accumulated_grad_max_pending != 1:
+        raise ValueError(
+            "sharded_accumulated_grad_max_pending requires "
+            "sharded_accumulated_grad=True."
+        )
+    if sharded_accumulated_grad_max_pending > 1 and not comm_fusion:
+        raise ValueError(
+            "sharded_accumulated_grad_max_pending greater than 1 requires "
+            "comm_fusion=True."
+        )
+    if not sharded_accumulated_grad and sharded_grad_reduce_dtype is not None:
+        raise ValueError(
+            "sharded_grad_reduce_dtype requires sharded_accumulated_grad=True."
+        )
+    if sharded_grad_reduce_dtype is not None:
+        _validate_hsdp_reduce_dtype(
+            platform_type,
+            sharded_grad_reduce_dtype,
+            "sharded_grad_reduce_dtype",
+        )
     if sharded_accumulated_grad and platform_type != PlatformType.MINDSPORE:
         raise NotImplementedError(
             "sharded_accumulated_grad is currently only supported on MindSpore."
@@ -709,10 +787,6 @@ def fully_shard(
     if sharded_accumulated_grad and mesh is None:
         raise ValueError(
             "sharded_accumulated_grad requires an explicit FSDP/HSDP mesh."
-        )
-    if sharded_accumulated_grad and comm_fusion:
-        raise ValueError(
-            "sharded_accumulated_grad does not support comm_fusion=True."
         )
     if sharded_accumulated_grad and isinstance(offload_policy, CPUOffloadPolicy):
         raise ValueError(
@@ -767,6 +841,9 @@ def fully_shard(
         comm_fusion,
         comm_fusion_zero_copy,
         sharded_accumulated_grad,
+        sharded_grad_ready_overlap,
+        sharded_accumulated_grad_max_pending,
+        sharded_grad_reduce_dtype,
     )
     # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
     if len(modules) > 1:

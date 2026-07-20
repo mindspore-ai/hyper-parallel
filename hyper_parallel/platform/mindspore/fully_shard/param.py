@@ -77,9 +77,9 @@ def make_contiguous_strides_for(shape, row_major=True):
 
     Args:
         shape (tuple of int): The shape of the tensor. Each dimension must be a non-negative integer.
-        row_major (bool): 
+        row_major (bool):
             - If True (default), returns C-style (row-major) strides: last dimension changes fastest.
-            - If False, returns strides where the last two dimensions are Fortran-style 
+            - If False, returns strides where the last two dimensions are Fortran-style
               (i.e., for batched matrix operations in BLAS/LAPACK): second-to-last dim changes fastest.
 
     Returns:
@@ -166,6 +166,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
         self._orig_param_hooks: List[Callable] = []
+        self._internal_param_hooks: List[Callable] = []
+        self._internal_hook_ids = set()
         self.grad_offload_event: Optional[ms.runtime.Event] = None
         dtensor_payload = unwrap_dtensor_param(param)
         self._orig_param_is_dtensor = dtensor_payload is not None
@@ -267,13 +269,31 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         for hook_func in self._iter_backward_hooks(param):
             hook_func_id = id(hook_func)
+            if hook_func_id in getattr(self, "_internal_hook_ids", ()):
+                continue
             if hook_func_id not in self._saved_hook_ids:
                 self._orig_param_hooks.append(hook_func)
                 self._saved_hook_ids.add(hook_func_id)
 
+    def _register_internal_backward_hook(self, hook_func: Callable) -> None:
+        """Register a fully_shard-owned hook after all user parameter hooks."""
+        if not hasattr(self, "_internal_param_hooks"):
+            self._internal_param_hooks = []
+        if not hasattr(self, "_internal_hook_ids"):
+            self._internal_hook_ids = set()
+        hook_func_id = id(hook_func)
+        if hook_func_id in self._internal_hook_ids:
+            return
+        self._internal_param_hooks.append(hook_func)
+        self._internal_hook_ids.add(hook_func_id)
+
     def _migrate_backward_hooks(self, new_param: Parameter) -> None:
-        """Migrate saved user backward hooks to the active sharded/unsharded parameter."""
-        if not getattr(self, "_orig_param_hooks", None):
+        """Migrate user and internal hooks to the active parameter in stable order."""
+        hooks = [
+            *getattr(self, "_orig_param_hooks", ()),
+            *getattr(self, "_internal_param_hooks", ()),
+        ]
+        if not hooks:
             return
         if hasattr(new_param, "migrate_backward_hooks_run_once"):
             return
@@ -281,7 +301,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         if not callable(register_hook):
             return
 
-        for hook_func in self._orig_param_hooks:
+        for hook_func in hooks:
             try:
                 if getattr(new_param, "requires_grad", False):
                     register_hook(hook_func)
@@ -779,6 +799,14 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 f"Parameter {self._param_fqn} already has pending reduce-scatter input."
             )
         self._reduce_scatter_input = reduce_scatter_input
+        self._retain_unsharded_grad_source_for_reduce_scatter()
+
+    def _retain_unsharded_grad_source_for_reduce_scatter(self) -> None:
+        """Retain the full-gradient source while a fused buffer owns its packed data."""
+        if self._reduce_scatter_source is not None:
+            raise RuntimeError(
+                f"Parameter {self._param_fqn} already has a pending reduce-scatter source."
+            )
         if self.unsharded_accumulated_grad is not None:
             self._reduce_scatter_source = self.unsharded_accumulated_grad
         elif self._unsharded_param is not None:
@@ -1000,7 +1028,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         """Clear cached all-reduce output."""
         self._all_reduce_output = None
 
-    def apply_reduced_grad(self, reduced_grad, param_type):
+    def apply_reduced_grad(
+        self,
+        reduced_grad: ms.Tensor,
+        param_type: Optional[ms.Type],
+        clear_unsharded_grad: bool = True,
+    ) -> bool:
         """
         Apply reduced gradient to the sharded parameter.
 
@@ -1013,6 +1046,9 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             param_type (Optional[ms.Type]): Target dtype for the gradient
                 (typically HSDPState ``_orig_dtype``). Non-main-grad writeback
                 then realigns to local storage dtype for issue #215.
+            clear_unsharded_grad: Whether to clear whichever full gradient is
+                currently attached to the parameter. Deferred reduce-scatter
+                paths clear only their recorded source object instead.
         """
         if self.mp_policy.apply_grad_on_fp32_main_grad:
             if not hasattr(self.sharded_param, "main_grad"):
@@ -1050,13 +1086,14 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             else:
                 self.sharded_param.grad._local_tensor += reduced_grad
 
-        if self.unsharded_accumulated_grad_data is not None:
-            self.unsharded_accumulated_grad = None
-        elif self._unsharded_param is not None and self.unsharded_param.grad is not None:
-            # The direct DTENSOR_COMPAT all-reduce path applies the reduced grad
-            # straight onto sharded_param (main_grad) while _unsharded_param is None,
-            # so guard the unsharded cleanup against that case.
-            self.unsharded_param.grad = None
+        if clear_unsharded_grad:
+            if self.unsharded_accumulated_grad_data is not None:
+                self.unsharded_accumulated_grad = None
+            elif self._unsharded_param is not None and self.unsharded_param.grad is not None:
+                # The direct DTENSOR_COMPAT all-reduce path applies the reduced grad
+                # straight onto sharded_param (main_grad) while _unsharded_param is None,
+                # so guard the unsharded cleanup against that case.
+                self.unsharded_param.grad = None
         return need_synchronize
 
 

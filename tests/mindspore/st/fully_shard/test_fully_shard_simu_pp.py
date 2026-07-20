@@ -31,7 +31,7 @@ def test_fully_shard_simu_pp_suite():
                  the full global input.
     Expectation: fully_shard loss/grad match the baseline on every rank for all cases.
     """
-    parallel_run([
+    cases = [
         MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_implicit_unshard_reshard",
                       worker_num=4, local_worker_num=4),
         MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_explicit_unshard_no_reshard",
@@ -40,4 +40,23 @@ def test_fully_shard_simu_pp_suite():
                       worker_num=4, local_worker_num=4),
         MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad",
                       worker_num=4, local_worker_num=4),
-    ])
+        MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_ready",
+                      worker_num=4, local_worker_num=4),
+        MindSporeCase(
+            _TEST_FILE,
+            "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_bf16_rs",
+            worker_num=4,
+            local_worker_num=4,
+        ),
+        MindSporeCase(
+            _TEST_FILE,
+            "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_pending_window",
+            worker_num=4,
+            local_worker_num=4,
+        ),
+    ]
+    # MindSpore msrun jobs share the default world-group namespace on one host,
+    # so run the 4-card cases sequentially instead of overcommitting devices or
+    # allowing independent jobs to interfere with each other's collectives.
+    for case in cases:
+        parallel_run([case])

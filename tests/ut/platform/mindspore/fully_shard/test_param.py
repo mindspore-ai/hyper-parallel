@@ -53,6 +53,8 @@ def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
     obj.mp_policy = MixedPrecisionPolicy()
     obj._reduce_scatter_input = None
     obj._reduce_scatter_source = None
+    obj._internal_param_hooks = []
+    obj._internal_hook_ids = set()
     return obj
 
 
@@ -444,10 +446,17 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param._orig_dtensor_placements = (Shard(0),)
         mock_from_local.return_value = "wrapped-dtensor"
 
-        unsharded_param = MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output(hsdp_param)
+        unsharded_param = (
+            MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output(
+                hsdp_param
+            )
+        )
 
         mock_from_local.assert_called_once()
-        np.testing.assert_allclose(mock_from_local.call_args.args[0].asnumpy(), np.arange(16, dtype=np.float32).reshape(4, 4))
+        np.testing.assert_allclose(
+            mock_from_local.call_args.args[0].asnumpy(),
+            np.arange(16, dtype=np.float32).reshape(4, 4),
+        )
         self.assertEqual(mock_from_local.call_args.args[1:], ("orig-mesh", (Shard(0),)))
         self.assertEqual(unsharded_param, "wrapped-dtensor")
 
@@ -517,6 +526,28 @@ class TestMindSporeParam(unittest.TestCase):
         MindSporeHSDPParamV2._save_backward_hooks(hsdp_param, source)
 
         self.assertEqual(hsdp_param._orig_param_hooks, [hook_a, hook_b])
+
+    def test_internal_backward_hook_migrates_after_user_hooks(self):
+        """The grad-ready hook should run after user hooks and stay out of the user hook list."""
+        hsdp_param = _new_hsdp_param_v2()
+
+        def _user_hook(grad):
+            return grad
+
+        def _internal_hook(grad):
+            return grad
+
+        hsdp_param._orig_param_hooks = [_user_hook]
+        hsdp_param._saved_hook_ids = {id(_user_hook)}
+        hsdp_param._register_internal_backward_hook(_internal_hook)
+        source = HookSourceParam([_user_hook, _internal_hook])
+
+        MindSporeHSDPParamV2._save_backward_hooks(hsdp_param, source)
+        replacement = HookableParam(requires_grad=True)
+        MindSporeHSDPParamV2._migrate_backward_hooks(hsdp_param, replacement)
+
+        self.assertEqual(hsdp_param._orig_param_hooks, [_user_hook])
+        self.assertEqual(replacement.registered_hooks, [_user_hook, _internal_hook])
 
     def test_setattr_on_modules_migrates_saved_hooks_once(self):
         """Swapping module params should migrate saved hooks to the active replacement once."""
@@ -602,18 +633,26 @@ class TestMindSporeParam(unittest.TestCase):
 
         hsdp_param._unsharded_param.grad = ms.Tensor(np.ones((2,), dtype=np.float16))
         MindSporeHSDPParamV2.to_accumulated_grad_if_needed(hsdp_param)
-        np.testing.assert_allclose(hsdp_param.unsharded_accumulated_grad.asnumpy(), np.full((2,), 2.0, dtype=np.float16))
+        np.testing.assert_allclose(
+            hsdp_param.unsharded_accumulated_grad.asnumpy(),
+            np.full((2,), 2.0, dtype=np.float16),
+        )
 
     def test_accumulate_unsharded_grad_if_needed_normalizes_new_grad(self):
         """Pending accumulated grad should absorb the latest local unsharded grad."""
         hsdp_param = _new_hsdp_param_v2()
         hsdp_param.unsharded_accumulated_grad = ms.Tensor(np.ones((2,), dtype=np.float32))
         hsdp_param._unsharded_param = SimpleNamespace(grad="dtensor-grad")
-        hsdp_param._to_local_unsharded_grad = MagicMock(return_value=ms.Tensor(np.full((2,), 3.0, dtype=np.float32)))
+        hsdp_param._to_local_unsharded_grad = MagicMock(
+            return_value=ms.Tensor(np.full((2,), 3.0, dtype=np.float32))
+        )
 
         MindSporeHSDPParamV2.accumulate_unsharded_grad_if_needed(hsdp_param)
 
-        np.testing.assert_allclose(hsdp_param.unsharded_accumulated_grad.asnumpy(), np.full((2,), 4.0, dtype=np.float32))
+        np.testing.assert_allclose(
+            hsdp_param.unsharded_accumulated_grad.asnumpy(),
+            np.full((2,), 4.0, dtype=np.float32),
+        )
         self.assertIsNone(hsdp_param._unsharded_param.grad)
 
     def test_all_gather_inputs_respects_state_offload_and_param_dtype(self):

@@ -46,7 +46,10 @@ class HSDPSchedulerV2:
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
                  reshard_after_forward, shard_placement_fn,
                  mp_policy, offload_policy, ignored_params, replicate_params, device, comm_fusion,
-                 comm_fusion_zero_copy=False, sharded_accumulated_grad=False):
+                 comm_fusion_zero_copy=False, sharded_accumulated_grad=False,
+                 sharded_grad_ready_overlap=False,
+                 sharded_accumulated_grad_max_pending=1,
+                 sharded_grad_reduce_dtype=None):
         """init hsdp scheduler.
 
         Args:
@@ -84,6 +87,9 @@ class HSDPSchedulerV2:
             comm_fusion=comm_fusion,
             comm_fusion_zero_copy=comm_fusion_zero_copy,
             sharded_accumulated_grad=sharded_accumulated_grad,
+            sharded_grad_ready_overlap=sharded_grad_ready_overlap,
+            sharded_accumulated_grad_max_pending=sharded_accumulated_grad_max_pending,
+            sharded_grad_reduce_dtype=sharded_grad_reduce_dtype,
         )
         self._init_platform()
         self._new_cell_state()

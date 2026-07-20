@@ -516,7 +516,6 @@ class PipelineStage(PipelineStageBase):
         fsdp_module = self.submodule
         fsdp_module.set_is_last_backward(True)
         fsdp_module.set_reshard_after_backward(True)
-        fsdp_module.set_requires_gradient_sync(True)
 
         hsdp_states = []
         seen_states = set()
@@ -529,10 +528,13 @@ class PipelineStage(PipelineStageBase):
                 continue
             seen_states.add(state_id)
             hsdp_states.append(sub_mod_state)
-            if getattr(sub_mod_state, "sharded_accumulated_grad", False):
+
+        fsdp_module.set_requires_gradient_sync(True)
+        for hsdp_state in hsdp_states:
+            if getattr(hsdp_state, "sharded_accumulated_grad", False):
                 continue
-            sub_mod_state.post_backward()
-            sub_mod_state.reduce_params()
+            hsdp_state.post_backward()
+            hsdp_state.reduce_params()
 
         # No public API exposes the root backward finalization; call the platform hook directly.
         # force_reduce=True: the recv buffer's PostBackwardFunction has put the root into
@@ -540,10 +542,18 @@ class PipelineStage(PipelineStageBase):
         # last module's reduce-scatter would lag one optimizer step.
         fsdp_module.hsdp_scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
 
-        for hsdp_state in hsdp_states:
-            if not getattr(hsdp_state, "sharded_accumulated_grad", False):
-                continue
-            hsdp_state.finalize_sharded_accumulated_grads()
+        feature_states = [
+            hsdp_state
+            for hsdp_state in hsdp_states
+            if getattr(hsdp_state, "sharded_accumulated_grad", False)
+        ]
+        # Launch all state buckets before waiting so independent replicate
+        # groups can make progress concurrently.
+        for hsdp_state in feature_states:
+            hsdp_state.launch_sharded_accumulated_grad_all_reduces()
+        for hsdp_state in feature_states:
+            hsdp_state.wait_sharded_accumulated_grad_all_reduces()
+        for hsdp_state in feature_states:
             if hsdp_state.reshard_after_backward:
                 hsdp_state.shard()
 
