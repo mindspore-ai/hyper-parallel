@@ -23,6 +23,7 @@ from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_rotary_position_embedding import (
     RotaryPositionEmbeddingDistributedOp,
+    _normalize_npu_rotary_mul_args,
     _normalize_rpe_args,
 )
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
@@ -499,6 +500,232 @@ class TestInferLayoutNegative(unittest.TestCase):
         op = self._get_op()
         with self.assertRaises(ValueError):
             op.infer_layout([x, cos, sin])
+
+
+class TestNormalizeNpuRotaryMulArgs(unittest.TestCase):
+    """Unit tests for _normalize_npu_rotary_mul_args."""
+
+    def test_no_rotary_mode_defaults_to_mode_0(self):
+        """
+        Feature: _normalize_npu_rotary_mul_args fills default mode=0.
+        Description: Call with only x, cos, sin (no rotary_mode kwarg).
+        Expectation: args == (x, cos, sin, 0), kwargs == {}.
+        """
+        x, cos, sin = object(), object(), object()
+        args, kwargs = _normalize_npu_rotary_mul_args(x, cos, sin)
+        self.assertIs(args[0], x, msg=f"args[0] should be x, got {args[0]}")
+        self.assertIs(args[1], cos, msg=f"args[1] should be cos, got {args[1]}")
+        self.assertIs(args[2], sin, msg=f"args[2] should be sin, got {args[2]}")
+        self.assertEqual(args[3], 0, msg=f"default mode should be 0, got {args[3]}")
+        self.assertEqual(kwargs, {}, msg=f"kwargs should be empty, got {kwargs}")
+
+    def test_rotary_mode_none_defaults_to_mode_0(self):
+        """
+        Feature: _normalize_npu_rotary_mul_args rotary_mode=None → mode=0.
+        Description: Call with rotary_mode=None kwarg.
+        Expectation: args[3] == 0.
+        """
+        x, cos, sin = object(), object(), object()
+        args, kwargs = _normalize_npu_rotary_mul_args(x, cos, sin, rotary_mode=None)
+        self.assertEqual(args[3], 0, msg=f"rotary_mode=None should give mode=0, got {args[3]}")
+        self.assertEqual(kwargs, {}, msg=f"kwargs should be empty, got {kwargs}")
+
+    def test_rotary_mode_half_maps_to_mode_0(self):
+        """
+        Feature: _normalize_npu_rotary_mul_args rotary_mode='half' → mode=0.
+        Description: Call with rotary_mode='half' kwarg.
+        Expectation: args[3] == 0.
+        """
+        x, cos, sin = object(), object(), object()
+        args, kwargs = _normalize_npu_rotary_mul_args(x, cos, sin, rotary_mode="half")
+        self.assertEqual(args[3], 0, msg=f"rotary_mode='half' should give mode=0, got {args[3]}")
+        self.assertEqual(kwargs, {}, msg=f"kwargs should be empty, got {kwargs}")
+
+    def test_rotary_mode_interleave_maps_to_mode_1(self):
+        """
+        Feature: _normalize_npu_rotary_mul_args rotary_mode='interleave' → mode=1.
+        Description: Call with rotary_mode='interleave' kwarg.
+        Expectation: args[3] == 1.
+        """
+        x, cos, sin = object(), object(), object()
+        args, _ = _normalize_npu_rotary_mul_args(x, cos, sin, rotary_mode="interleave")
+        self.assertEqual(args[3], 1, msg=f"rotary_mode='interleave' should give mode=1, got {args[3]}")
+
+    def test_unsupported_rotary_mode_raises(self):
+        """
+        Feature: _normalize_npu_rotary_mul_args rejects unsupported rotary_mode.
+        Description: Call with rotary_mode='invalid'.
+        Expectation: Raises ValueError mentioning 'unsupported'.
+        """
+        x, cos, sin = object(), object(), object()
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            _normalize_npu_rotary_mul_args(x, cos, sin, rotary_mode="invalid")
+
+
+class TestPreprocessRouting(unittest.TestCase):
+    """Unit tests for preprocess cross-platform routing."""
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    @staticmethod
+    def _setup_mock_platform(mock_platform, world_size=4):
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.split_group.return_value = MagicMock()
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.asnumpy() if hasattr(t, "asnumpy") else np.array(t)
+        )
+
+    @staticmethod
+    def _make_dtensor_mock(mesh, ndim, shard_dim=None):
+        """Build a mock DTensor with a real Layout attached."""
+        from hyper_parallel.core.dtensor.dtensor import DTensor
+        if shard_dim is not None:
+            p = tuple(Shard(shard_dim) if i == shard_dim else Replicate()
+                      for i in range(ndim))
+        else:
+            p = tuple(Replicate() for _ in range(ndim))
+        ly = _build_layout(mesh, p, ndim)
+        dt = MagicMock(spec=DTensor)
+        dt.layout = ly
+        dt.to_local.return_value = "local"
+        return dt
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_preprocess_primitive_mode_in_local_args(self, mock_platform):
+        """
+        Feature: Primitive preprocess puts mode in local_args, local_kwargs empty.
+        Description: op_name="RotaryPositionEmbedding", mode=2 passed as kwarg.
+        Expectation: local_args[3] == 2, local_kwargs == {}.
+        """
+        self._setup_mock_platform(mock_platform)
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
+        x_dt = self._make_dtensor_mock(mesh, 4)
+        cos_dt = self._make_dtensor_mock(mesh, 4)
+        sin_dt = self._make_dtensor_mock(mesh, 4)
+
+        op = RotaryPositionEmbeddingDistributedOp("RotaryPositionEmbedding")
+        local_args, local_kwargs, cv = op.preprocess(
+            (x_dt, cos_dt, sin_dt), {"mode": 2}
+        )
+
+        self.assertEqual(len(local_args), 4,
+                         msg=f"Primitive: local_args should have 4 entries, got {len(local_args)}")
+        self.assertEqual(local_kwargs, {},
+                         msg=f"Primitive: local_kwargs should be empty, got {local_kwargs}")
+        self.assertEqual(len(cv), 3,
+                         msg=f"cache_values should have 3 entries, got {len(cv)}")
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_preprocess_pytorch_rotary_mode_in_local_kwargs(self, mock_platform):
+        """
+        Feature: PyTorch preprocess puts rotary_mode in local_kwargs.
+        Description: op_name="npu_rotary_mul", rotary_mode="interleave".
+        Expectation: local_args has 3 tensors, local_kwargs={'rotary_mode': 'interleave'}.
+        """
+        self._setup_mock_platform(mock_platform)
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
+        x_dt = self._make_dtensor_mock(mesh, 4)
+        cos_dt = self._make_dtensor_mock(mesh, 4)
+        sin_dt = self._make_dtensor_mock(mesh, 4)
+
+        op = RotaryPositionEmbeddingDistributedOp("npu_rotary_mul")
+        local_args, local_kwargs, cv = op.preprocess(
+            (x_dt, cos_dt, sin_dt), {"rotary_mode": "interleave"}
+        )
+
+        self.assertEqual(len(local_args), 3,
+                         msg=(
+                             f"PyTorch: local_args should have 3 tensors only, "
+                             f"got {local_args}"
+                         ))
+        self.assertEqual(local_kwargs, {"rotary_mode": "interleave"},
+                         msg=(
+                             f"PyTorch: local_kwargs should contain rotary_mode='interleave', "
+                             f"got {local_kwargs}"
+                         ))
+        self.assertEqual(len(cv), 3,
+                         msg=f"cache_values should have 3 entries, got {len(cv)}")
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_preprocess_pytorch_no_rotary_mode_empty_kwargs(self, mock_platform):
+        """
+        Feature: PyTorch preprocess with no rotary_mode → empty local_kwargs.
+        Description: op_name="npu_rotary_mul", no rotary_mode kwarg.
+        Expectation: local_args has 3 tensors, local_kwargs == {}.
+        """
+        self._setup_mock_platform(mock_platform)
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
+        x_dt = self._make_dtensor_mock(mesh, 4)
+        cos_dt = self._make_dtensor_mock(mesh, 4)
+        sin_dt = self._make_dtensor_mock(mesh, 4)
+
+        op = RotaryPositionEmbeddingDistributedOp("npu_rotary_mul")
+        local_args, local_kwargs, cv = op.preprocess(
+            (x_dt, cos_dt, sin_dt), {}
+        )
+
+        self.assertEqual(len(local_args), 3,
+                         msg=f"PyTorch no-rotary-mode: local_args should have 3 tensors, got {local_args}")
+        self.assertEqual(local_kwargs, {},
+                         msg=f"PyTorch no-rotary-mode: local_kwargs should be empty, got {local_kwargs}")
+        self.assertEqual(len(cv), 3,
+                         msg=f"cache_values should have 3 entries, got {len(cv)}")
+
+
+class TestNpuRotaryMulYamlRegistration(unittest.TestCase):
+    """YAML registration tests for npu_rotary_mul."""
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    def test_npu_rotary_mul_registration(self):
+        """
+        Feature: YAML registers npu_rotary_mul.
+        Description: get_distributed_op("npu_rotary_mul").
+        Expectation: Returns a RotaryPositionEmbeddingDistributedOp instance.
+        """
+        op = get_distributed_op("npu_rotary_mul")
+        self.assertIsNotNone(
+            op, msg="npu_rotary_mul should be registered via YAML"
+        )
+        self.assertIsInstance(
+            op, RotaryPositionEmbeddingDistributedOp,
+            msg=(
+                f"Expected RotaryPositionEmbeddingDistributedOp, "
+                f"got {type(op)}"
+            )
+        )
+
+    def test_ms_primitive_op_names_contains_rotary(self):
+        """
+        Feature: _MS_PRIMITIVE_OP_NAMES contains RotaryPositionEmbedding.
+        Description: Read class attribute.
+        Expectation: 'RotaryPositionEmbedding' in _MS_PRIMITIVE_OP_NAMES.
+        """
+        self.assertIn(
+            "RotaryPositionEmbedding",
+            RotaryPositionEmbeddingDistributedOp._MS_PRIMITIVE_OP_NAMES,
+            msg=(
+                "_MS_PRIMITIVE_OP_NAMES should contain 'RotaryPositionEmbedding', "
+                f"got {RotaryPositionEmbeddingDistributedOp._MS_PRIMITIVE_OP_NAMES}"
+            )
+        )
 
 
 if __name__ == "__main__":

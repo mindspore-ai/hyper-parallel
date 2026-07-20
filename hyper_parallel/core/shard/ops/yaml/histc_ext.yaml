@@ -2,3 +2,8 @@ HistcExt:
   dist_op_name: _histc_ext_dist_op
   distributed_op_class: HistcExtDistributedOp
   distributed_op_file: parallel_histc_ext
+
+histc:
+  dist_op_name: _torch_histc_dist_op
+  distributed_op_class: HistcExtDistributedOp
+  distributed_op_file: parallel_histc_ext
