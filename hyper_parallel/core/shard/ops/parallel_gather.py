@@ -27,8 +27,9 @@ def _normalize_index_select_args(input_tensor, dim, index):
     return (input_tensor, dim, index), {}
 
 
-def _normalize_gatherd_args(input_tensor, dim, index):
-    return (input_tensor, dim, index), {}
+def _normalize_gatherd_args(input_tensor, dim, index, **kwargs):
+    """Normalize torch.gather / GatherD args, forwarding keyword-only params."""
+    return (input_tensor, dim, index), kwargs
 
 
 def _normalize_gathernd_args(input_tensor, indices):
@@ -220,10 +221,10 @@ class GatherDDistributedOp(DistributedOp):
         Returns:
             tuple: (local_args, local_kwargs, cache_values)
         """
-        args, _ = _normalize_gatherd_args(*args, **kwargs)
+        args, kwargs = _normalize_gatherd_args(*args, **kwargs)
         input_tensor, dim, index = args[0], args[1], args[2]
         local_args = (input_tensor.to_local(), dim, index.to_local())
-        local_kwargs = {}
+        local_kwargs = kwargs
         cache_values = [input_tensor.layout, index.layout, dim]
         return local_args, local_kwargs, cache_values
 
