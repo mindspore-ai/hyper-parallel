@@ -700,6 +700,18 @@ def _distribute_module_named_modules(module: Any):
     )
 
 
+def _distribute_module_named_parameters(module: Any):
+    """``nn.Module.named_parameters(recurse=False)`` or MindSpore ``Cell.parameters_and_names(expand=False)``."""
+    if hasattr(module, "named_parameters"):
+        return module.named_parameters(recurse=False)
+    if hasattr(module, "parameters_and_names"):
+        return module.parameters_and_names(expand=False)
+    raise TypeError(
+        f"distribute_module expects module-like objects with named_parameters or parameters_and_names; "
+        f"got {type(module)}."
+    )
+
+
 def _replicate_submodule_params_buffers(
     sub_mod: Any,
     device_mesh: DeviceMesh,
