@@ -248,15 +248,17 @@ class CommDebugMode:
 
     def _collect_module_info(self):
         """Collect parameter and sharding info from the tracked module."""
-        from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0415
+        from hyper_parallel.core.dtensor.dtensor import (  # pylint: disable=C0415
+            DTensor, _distribute_module_named_modules, _distribute_module_named_parameters,
+        )
 
         if self._module is None:
             return
 
-        for fqn, mod in self._module.named_modules():
+        for fqn, mod in _distribute_module_named_modules(self._module):
             name = fqn or "(root)"
             params = {}
-            for param_name, param in mod.named_parameters(recurse=False):
+            for param_name, param in _distribute_module_named_parameters(mod):
                 params[param_name] = param.data
                 if isinstance(param, DTensor):
                     key = f"{name}.{param_name}" if fqn else param_name

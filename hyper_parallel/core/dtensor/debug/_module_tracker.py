@@ -16,6 +16,7 @@
 from typing import Callable, List
 
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.dtensor.dtensor import _distribute_module_named_modules
 
 platform = get_platform()
 
@@ -38,10 +39,10 @@ class ModuleTracker:
     def install(self):
         """Register forward_pre_hook and forward_hook on all sub-modules."""
         # Build fully-qualified name map.
-        for name, mod in self._root.named_modules():
+        for name, mod in _distribute_module_named_modules(self._root):
             self._fqn_map[id(mod)] = name or "(root)"
 
-        for _, mod in self._root.named_modules():
+        for _, mod in _distribute_module_named_modules(self._root):
             fqn = self._fqn_map.get(id(mod), "unknown")
 
             def _make_pre_hook(module_fqn):
