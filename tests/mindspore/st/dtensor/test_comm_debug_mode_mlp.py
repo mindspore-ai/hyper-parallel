@@ -47,7 +47,7 @@ def _run_group(*cases):
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_comm_debug_mode_wave_one():
     """
@@ -71,7 +71,7 @@ def test_comm_debug_mode_wave_one():
     )
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_comm_debug_mode_wave_two():
     """
@@ -95,7 +95,7 @@ def test_comm_debug_mode_wave_two():
     )
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_comm_debug_mode_wave_three():
     """
