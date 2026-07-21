@@ -35,13 +35,21 @@ variant from ``transformers.models.qwen3_next``.
 """
 # pylint: disable=C0103  # SSM/state-space convention: A_log, A
 
+import importlib.metadata
+import importlib.util
 from typing import Optional
 
+from packaging.version import Version
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from hyper_parallel.models.modules.rmsnorm import RMSNormGated
+
+
+_GDN_BACKENDS = frozenset({"eager", "triton", "auto"})
+_CONV_BACKENDS = frozenset({"eager", "triton", "auto"})
+_MIN_TRITON_ASCEND_VERSION = Version("3.2.1")
 
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -149,6 +157,235 @@ def torch_chunk_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+def is_triton_gdn_available(query: Optional[torch.Tensor] = None) -> bool:
+    """Return whether the local Triton GDN backend can handle ``query``."""
+    if query is not None and not (
+        query.device.type == "npu"
+        and query.dtype == torch.bfloat16
+        and query.ndim == 4
+        and query.shape[-1] <= 256
+    ):
+        return False
+
+    try:
+        ascend_version = Version(importlib.metadata.version("triton-ascend"))
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    if ascend_version < _MIN_TRITON_ASCEND_VERSION:
+        return False
+
+    try:
+        return importlib.util.find_spec("triton.backends.ascend") is not None
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
+def is_triton_causal_conv1d_available(
+    x: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+) -> bool:
+    """Return whether the NPU Triton causal Conv1d supports this shape."""
+    if x is not None and not (
+        x.device.type == "npu"
+        and x.dtype in {torch.float32, torch.bfloat16}
+        and x.ndim == 3
+        and x.shape[-1] % 512 == 0
+    ):
+        return False
+    if weight is not None:
+        channels = weight.shape[0]
+        width = weight.shape[-1]
+        if channels % 512 != 0 or width > 8:
+            return False
+    return is_triton_gdn_available()
+
+
+def causal_depthwise_conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    initial_state: Optional[torch.Tensor] = None,
+    activation: Optional[str] = "silu",
+    dilation: int = 1,
+    num_heads: int = 1,
+    backend: str = "eager",
+) -> torch.Tensor:
+    """Run causal depthwise Conv1d on ``[B, T, D]`` activations.
+
+    ``weight`` follows the checkpoint layout ``[D, 1, W]``. An initial state
+    uses ``[B, D, W]``; slot zero is the unused oldest position and slots
+    ``1:`` contain the preceding ``W - 1`` tokens.
+    """
+    backend = backend.lower()
+    if backend not in _CONV_BACKENDS:
+        raise ValueError(
+            f"unsupported causal Conv1d backend {backend!r}; "
+            f"expected one of {sorted(_CONV_BACKENDS)}."
+        )
+    if weight.ndim != 3 or weight.shape[1] != 1:
+        raise ValueError(f"causal depthwise Conv1d expects weight [D, 1, W], got {weight.shape}.")
+    if x.shape[-1] != weight.shape[0]:
+        raise ValueError(
+            f"causal depthwise Conv1d channel mismatch: input={x.shape[-1]}, "
+            f"weight={weight.shape[0]}."
+        )
+
+    use_triton = backend == "triton" or (
+        backend == "auto" and is_triton_causal_conv1d_available(x, weight)
+    )
+    if use_triton:
+        if dilation != 1:
+            raise ValueError("Triton causal Conv1d currently supports only dilation=1.")
+        if not is_triton_causal_conv1d_available(x, weight):
+            raise RuntimeError(
+                "causal Conv1d backend='triton' requires triton-ascend>=3.2.1, "
+                "an NPU float32/bfloat16 [B,T,D] tensor, D divisible by 512, "
+                "and kernel width <= 8."
+            )
+        from hyper_parallel.platform.torch.custom_ops.gdn import (  # pylint: disable=import-outside-toplevel
+            causal_conv1d_triton,
+        )
+
+        kernel_weight = weight[:, 0, :]
+        if initial_state is None or weight.shape[-1] == 1:
+            output, _ = causal_conv1d_triton(
+                x,
+                kernel_weight,
+                num_heads,
+                bias=bias,
+                activation=activation,
+                output_final_state=False,
+            )
+            return output
+
+        # Only the first W - 1 outputs depend on the previous CP rank's halo.
+        # The imported kernel's T < W / tiny-BT backward variant is unstable,
+        # so execute a known-good 128-token prefix but retain only W - 1 rows.
+        state_output_len = min(weight.shape[-1] - 1, x.shape[1])
+        if x.shape[1] < 128:
+            output, _ = causal_conv1d_triton(
+                x,
+                kernel_weight,
+                num_heads,
+                bias=bias,
+                initial_state=initial_state,
+                activation=activation,
+                output_final_state=False,
+            )
+            return output
+        head, _ = causal_conv1d_triton(
+            x[:, :128],
+            kernel_weight,
+            num_heads,
+            bias=bias,
+            initial_state=initial_state,
+            activation=activation,
+            output_final_state=False,
+        )
+        full, _ = causal_conv1d_triton(
+            x,
+            kernel_weight,
+            num_heads,
+            bias=bias,
+            activation=activation,
+            output_final_state=False,
+        )
+        return torch.cat(
+            (head[:, :state_output_len], full[:, state_output_len:]), dim=1
+        )
+
+    width = weight.shape[-1]
+    if initial_state is None:
+        conv_input = x.transpose(1, 2)
+        padding = (width - 1) * dilation
+    else:
+        if dilation != 1:
+            raise ValueError("initial-state causal Conv1d currently supports only dilation=1.")
+        expected_shape = (x.shape[0], x.shape[2], width)
+        if tuple(initial_state.shape) != expected_shape:
+            raise ValueError(
+                f"causal Conv1d initial_state must have shape {expected_shape}, "
+                f"got {tuple(initial_state.shape)}."
+            )
+        prefix = initial_state[:, :, 1:].transpose(1, 2)
+        conv_input = torch.cat((prefix, x), dim=1).transpose(1, 2)
+        padding = 0
+
+    output = F.conv1d(
+        conv_input,
+        weight,
+        bias,
+        padding=padding,
+        dilation=dilation,
+        groups=x.shape[-1],
+    )[:, :, : x.shape[1]].transpose(1, 2)
+    if activation in {"silu", "swish"}:
+        output = F.silu(output)
+    elif activation is not None:
+        raise ValueError(f"unsupported causal Conv1d activation {activation!r}.")
+    return output
+
+
+def chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    backend: str = "eager",
+):
+    """Dispatch Gated DeltaNet to the eager or Triton local backend."""
+    backend = backend.lower()
+    if backend not in _GDN_BACKENDS:
+        raise ValueError(
+            f"unsupported GDN backend {backend!r}; expected one of {sorted(_GDN_BACKENDS)}."
+        )
+
+    use_triton = backend == "triton" or (
+        backend == "auto" and is_triton_gdn_available(query)
+    )
+    if not use_triton:
+        return torch_chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
+    if not is_triton_gdn_available(query):
+        raise RuntimeError(
+            "GDN backend='triton' requires triton-ascend>=3.2.1 with the "
+            "Ascend backend installed, an NPU tensor, bfloat16 q/k/v, and "
+            "key head dimension <= 256."
+        )
+
+    from hyper_parallel.platform.torch.custom_ops.gdn import (  # pylint: disable=import-outside-toplevel
+        chunk_gated_delta_rule as triton_chunk_gated_delta_rule,
+    )
+
+    return triton_chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        chunk_size=chunk_size,
+    )
+
+
 class GatedDeltaNet(nn.Module):
     """Gated DeltaNet linear-attention block (Qwen3.5 / Qwen3-Next style).
 
@@ -171,6 +408,8 @@ class GatedDeltaNet(nn.Module):
         head_v_dim: int = 128,
         conv_kernel_size: int = 4,
         rms_norm_eps: float = 1e-6,
+        gdn_backend: str = "eager",
+        conv_backend: str = "eager",
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -182,6 +421,17 @@ class GatedDeltaNet(nn.Module):
         self.value_dim = head_v_dim * num_v_heads
         self.conv_kernel_size = conv_kernel_size
         self.kv_groups = num_v_heads // num_k_heads
+        if gdn_backend not in _GDN_BACKENDS:
+            raise ValueError(
+                f"unsupported GDN backend {gdn_backend!r}; expected one of {sorted(_GDN_BACKENDS)}."
+            )
+        self.gdn_backend = gdn_backend
+        if conv_backend not in _CONV_BACKENDS:
+            raise ValueError(
+                f"unsupported causal Conv1d backend {conv_backend!r}; "
+                f"expected one of {sorted(_CONV_BACKENDS)}."
+            )
+        self.conv_backend = conv_backend
 
         # Submodule order is fixed so ``model.parameters()`` ordering and
         # the resulting fp32 ``clip_grad_norm_`` reduction are bit-stable.
@@ -223,7 +473,7 @@ class GatedDeltaNet(nn.Module):
         bsz, seq_len, _ = hidden_states.shape
 
         # 1. Project to mixed QKV; transpose for Conv1d (B, C, S).
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        mixed_qkv = self.in_proj_qkv(hidden_states)
 
         # 2. z, b, a paths.
         z = self.in_proj_z(hidden_states).reshape(
@@ -233,8 +483,13 @@ class GatedDeltaNet(nn.Module):
         a = self.in_proj_a(hidden_states)  # (B, S, num_v_heads)
 
         # 3. Conv1d + causal trim + SiLU.
-        mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
-        mixed_qkv = mixed_qkv.transpose(1, 2)  # (B, S, conv_dim)
+        mixed_qkv = causal_depthwise_conv1d(
+            mixed_qkv,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            num_heads=2 * self.num_k_heads + self.num_v_heads,
+            backend=self.conv_backend,
+        )
 
         # 4. Split QKV.
         query, key, value = torch.split(
@@ -256,10 +511,11 @@ class GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.kv_groups, dim=2)
 
         # 7. Chunked gated delta rule.
-        core_attn_out, _ = torch_chunk_gated_delta_rule(
+        core_attn_out, _ = chunk_gated_delta_rule(
             query, key, value, g=g, beta=beta,
             initial_state=None, output_final_state=False,
             use_qk_l2norm_in_kernel=True,
+            backend=self.gdn_backend,
         )
 
         # 8. RMSNormGated with z as the SiLU gate.

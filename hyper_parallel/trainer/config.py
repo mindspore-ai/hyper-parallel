@@ -192,6 +192,8 @@ class AcceleratorConfig:
     reshard_after_forward: bool = True
     async_cp: bool = False
     ulysses_degree: Optional[int] = None
+    # Qwen3.5 linear-attention CP implementation: ``ulysses`` or ``p2p``.
+    linear_attention_cp_mode: str = "ulysses"
     # Bucketed reduce-scatter: single fused RS per FSDP unit, stable fp32
     # reduction order across runs.
     comm_fusion: bool = True

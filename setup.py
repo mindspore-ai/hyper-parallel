@@ -350,6 +350,10 @@ if __name__ == '__main__':
                        'lib/*/*.so'],
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
             'hyper_parallel.platform.torch.symmetric_memory': ['*.so'],
+            'hyper_parallel.platform.torch.custom_ops.gdn': [
+                'LICENSE',
+                'THIRD_PARTY_NOTICES.md',
+            ],
             'hyper_parallel.platform.mindspore.symmetric_memory': ['aclshmem_ms/*.so'],
             'hyper_parallel.platform.mindspore.custom_ops': [
                 'build/lib/*.so',

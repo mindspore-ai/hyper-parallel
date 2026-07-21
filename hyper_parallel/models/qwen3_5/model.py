@@ -44,7 +44,10 @@ from torch.nn import functional as F
 
 from hyper_parallel.models.modules.attention import _expand_kv_heads
 from hyper_parallel.models.modules.feed_forward import SwiGLUMLP
-from hyper_parallel.models.modules.linear_attention import torch_chunk_gated_delta_rule
+from hyper_parallel.models.modules.linear_attention import (
+    causal_depthwise_conv1d,
+    chunk_gated_delta_rule,
+)
 from hyper_parallel.models.modules.rmsnorm import RMSNormGated
 from hyper_parallel.models.modules.rope import MultiModalRotaryEmbedding, apply_rotary_pos_emb
 
@@ -115,6 +118,8 @@ class Qwen3_5Config:
     linear_value_head_dim: int = 128
     linear_key_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
+    gdn_backend: str = "eager"
+    conv_backend: str = "eager"
 
     # ── layer-by-layer dispatch ──
     layer_types: Optional[List[str]] = None  # populated in __post_init__ if None
@@ -338,6 +343,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         head_v_dim: int = 128,
         conv_kernel_size: int = 4,
         rms_norm_eps: float = 1e-6,
+        gdn_backend: str = "eager",
+        conv_backend: str = "eager",
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -349,6 +356,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.value_dim = head_v_dim * num_v_heads
         self.conv_kernel_size = conv_kernel_size
         self.kv_groups = num_v_heads // num_k_heads
+        self.gdn_backend = gdn_backend
+        self.conv_backend = conv_backend
 
         # Depthwise causal 1-D conv across the (Q, K, V) channel stack.
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -386,7 +395,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         bsz = hidden_states.shape[0]
 
         mixed_qkv_local = self.in_proj_qkv(hidden_states)
-        mixed_qkv_local = mixed_qkv_local.transpose(1, 2)
 
         z_raw = self.in_proj_z(hidden_states)
         b = self.in_proj_b(hidden_states)
@@ -396,8 +404,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # ``conv1d`` is depthwise (groups=conv_dim), so the channel stack has no
         # cross-channel interaction.
-        mixed_qkv_local = F.silu(self.conv1d(mixed_qkv_local)[:, :, :seq_len])
-        mixed_qkv_local = mixed_qkv_local.transpose(1, 2)
+        mixed_qkv_local = causal_depthwise_conv1d(
+            mixed_qkv_local,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            num_heads=2 * self.num_k_heads + self.num_v_heads,
+            backend=self.conv_backend,
+        )
 
         key_dim_local = mixed_qkv_local.shape[-1] * self.key_dim // self.conv_dim
         value_dim_local = mixed_qkv_local.shape[-1] - 2 * key_dim_local
@@ -420,10 +433,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query_local = query_local.repeat_interleave(self.kv_groups, dim=2)
             key_local = key_local.repeat_interleave(self.kv_groups, dim=2)
 
-        core_attn_out, _ = torch_chunk_gated_delta_rule(
+        core_attn_out, _ = chunk_gated_delta_rule(
             query_local, key_local, value_local, g=g, beta=beta,
             initial_state=None, output_final_state=False,
             use_qk_l2norm_in_kernel=True,
+            backend=self.gdn_backend,
         )
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -469,6 +483,8 @@ class Qwen3_5Decoder(nn.Module):
                 head_v_dim=config.linear_value_head_dim,
                 conv_kernel_size=config.linear_conv_kernel_dim,
                 rms_norm_eps=config.rms_norm_eps,
+                gdn_backend=config.gdn_backend,
+                conv_backend=config.conv_backend,
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3_5Attention(
