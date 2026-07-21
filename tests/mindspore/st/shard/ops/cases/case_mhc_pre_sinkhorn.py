@@ -48,7 +48,7 @@ register(OpShardCase(
     compare_outputs=(0,),  # old test validates output[0] only
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))
 
 # ----- BSND DP (2-device) -----
@@ -72,7 +72,7 @@ register(OpShardCase(
     compare_outputs=(0,),  # old test validates output[0] only
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))
 
 # ----- BSND DP+CP+TP (8-device) -----
@@ -96,5 +96,5 @@ register(OpShardCase(
     compare_outputs=(0,),  # old test validates output[0] only
     mesh_shape=(2, 2, 2),
     mesh_dim_names=("dp", "cp", "tp"),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))

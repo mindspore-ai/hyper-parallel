@@ -466,6 +466,8 @@ class Layout:
             if op is not None:
                 placements[mesh_idx] = Partial(reduce_op=op)
         self.set_placements(placements)
+        self._alias_tensor_map = self._build_readable_tensor_map()
+        self.update_compact_str()
         return placements
 
     def __setstate__(self, state):
