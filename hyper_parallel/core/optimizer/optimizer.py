@@ -17,7 +17,7 @@
 
 from collections import defaultdict
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -26,6 +26,7 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
+
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
@@ -34,9 +35,8 @@ from hyper_parallel.core.optimizer.sharding_category import (
     select_owned_records,
     group_parameters_for_hsdp
 )
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.optimizer.utils import empty_accelerator_cache, get_current_device, get_device_count
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -56,14 +56,48 @@ class ChainedOptimizer:
         self.flatten = flatten  # not flatten adamw, flatten for multi-optimizer
         self._is_multi_optimizer = flatten
 
+        self._rebind_param_attrs()
+
     def __iter__(self):
         """Allow iteration over the underlying optimizers."""
         return iter(self.chained_optimizers)
 
-    def step(self) -> None:
+    def _rebind_param_attrs(self) -> None:
+        """Restore ``model_name`` and ``is_muon`` on the current parameters."""
+        muon_param_ids: set = set()
+        adamw_param_ids: set = set()
+        self.muon_keys = []
+        self.no_muon_keys = []
+        for _, opt in self.optimizers_dict.items():
+            target = muon_param_ids if getattr(opt, "is_muon", False) else adamw_param_ids
+            for group in opt.param_groups:
+                for p in group.get("params", []):
+                    target.add(id(p))
+
+        for param_name, param in self.model.named_parameters():
+            setattr(param, "model_name", param_name)
+            if id(param) in muon_param_ids:
+                setattr(param, "is_muon", True)
+                self.muon_keys.append(param_name)
+            elif id(param) in adamw_param_ids:
+                setattr(param, "is_muon", False)
+                self.no_muon_keys.append(param_name)
+
+    def __str__(self):
+        if not self.optimizers_dict:
+            return f'{self.__class__.__name__}'
+
+        sections = []
+        for name, optimizer in self.optimizers_dict.items():
+            sections.append(f'{name}: {repr(optimizer)}')
+        return "\n\n".join(sections)
+
+    __repr__ = __str__
+
+    def step(self, closure=None) -> None:
         """Call each sub-optimizer's step in order."""
         for opt in self.chained_optimizers:
-            opt.step()
+            opt.step(closure=closure)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear gradients for all sub-optimizers."""
@@ -183,7 +217,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             params: Any,
             defaults: Dict[str, Any],
             is_muon: bool,
-            hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
+            hsdp_replica_count: Optional[int] = None,
     ) -> None:
         super().__init__(params, defaults)
         self.is_muon = is_muon
@@ -202,18 +236,14 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             no_comm_params, hsdp_groups = group_parameters_for_hsdp(group["params"])
             self._hsdp_grouping[group_key] = (no_comm_params, hsdp_groups)
 
-    def _auto_deduce_replica_count(self) -> Optional[Union[int, Tuple[int, ...]]]:
+    def _auto_deduce_replica_count(self) -> Optional[int]:
         """Deduce hsdp_replica_count based on cluster topology.
 
         - Intra-node PGs: Full dedup (no split), high bandwidth makes broadcast cheap.
         - Inter-node PGs: Split at node boundaries to restrict communication domains 
           within a single node, bypassing cross-node bottlenecks.
         """
-        devices_per_node = 1
-        if torch.npu.is_available():
-            devices_per_node = torch.npu.device_count()
-        elif torch.cuda.is_available():
-            devices_per_node = torch.cuda.device_count()
+        devices_per_node = get_device_count()
 
         dedup_per_dim: Dict[int, int] = {}
         needs_split = False
@@ -248,10 +278,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             return None
 
         sorted_dedups = [dedup_per_dim[k] for k in sorted(dedup_per_dim.keys())]
-        if len(sorted_dedups) == 1:
-            return sorted_dedups[0]
-
-        return tuple(sorted_dedups)
+        return min(sorted_dedups)
 
     def _split_replicate_groups(self) -> None:
         """Split replicate ProcessGroups into smaller sub-groups based on hsdp_replica_count."""
@@ -259,17 +286,10 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             return
 
         # Argument validation
-        if isinstance(self.hsdp_replica_count, int):
-            if self.hsdp_replica_count <= 0:
-                raise ValueError(f"hsdp_replica_count must be positive, got {self.hsdp_replica_count}")
-        elif isinstance(self.hsdp_replica_count, tuple):
-            if not self.hsdp_replica_count:
-                raise ValueError("hsdp_replica_count tuple must not be empty")
-            for i, v in enumerate(self.hsdp_replica_count):
-                if not isinstance(v, int) or v <= 0:
-                    raise ValueError(f"hsdp_replica_count[{i}] must be positive, got {v}")
-        else:
+        if not isinstance(self.hsdp_replica_count, int):
             raise TypeError(f"Unsupported hsdp_replica_count type: {type(self.hsdp_replica_count).__name__}")
+        if self.hsdp_replica_count <= 0:
+            raise ValueError(f"hsdp_replica_count must be positive, got {self.hsdp_replica_count}")
 
         for group_key, (_, hsdp_groups) in self._hsdp_grouping.items():
             for hsdp_group in hsdp_groups:
@@ -280,7 +300,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                         continue
 
                     pg_size = dist.get_world_size(pg)
-                    dedup_size = self._get_dedup_size_for_dim(dim_idx, pg_size)
+                    dedup_size = self.hsdp_replica_count
 
                     if pg_size <= dedup_size:
                         new_replicate_pgs.append(pg)
@@ -301,16 +321,6 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
 
                 # replace new sub groups of hsdp groups
                 hsdp_group.replicate_pgs = tuple(new_replicate_pgs)
-
-    def _get_dedup_size_for_dim(self, dim_idx: int, pg_size: int) -> int:
-        """Get the effective dedup size for a specific replicate dimension."""
-        if isinstance(self.hsdp_replica_count, int):
-            return self.hsdp_replica_count
-
-        if dim_idx < len(self.hsdp_replica_count):
-            return self.hsdp_replica_count[dim_idx]
-
-        return pg_size
 
     def _get_or_create_sub_pg(
             self,
@@ -338,7 +348,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
 
         # Global Rendezvous via GPU all_gather_into_tensor (NCCL/HCCL fast-path).
         # Far more scalable than all_gather_object for large world_size.
-        device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
+        device = get_current_device()
         num_parent_ranks = len(local_parent_ranks)
         local_tensor = torch.tensor(local_parent_ranks, dtype=torch.long, device=device)
         gathered_tensor = torch.empty((world_size, num_parent_ranks), dtype=torch.long, device=device)
@@ -390,7 +400,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                 self, "replicate_broadcast_max_bytes", 512 * 1024 * 1024,
             )
             hsdp_size = self.hsdp_replica_count if self.hsdp_replica_count is not None else 1
-            max_batch_numel = broadcast_max_bytes * hsdp_size if hsdp_size > 1 else float('inf')
+            max_batch_numel = broadcast_max_bytes * hsdp_size  # if hsdp_size > 1 else float('inf')
 
         self._hsdp_batches: Dict[int, List[Dict]] = {}
 
@@ -424,8 +434,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                     current_numel += p_numel
 
                     # Soft limit: allow the bucket to slightly exceed the cap
-                    # so that symmetric structures stay together and fragmentation
-                    # is reduced (same approach as PyTorch FSDP/DDP bucketing).
+                    # so that symmetric structures stay together and fragmentation is reduced.
                     if current_numel >= max_batch_numel:
                         sub_batches.append(current_batch)
                         current_batch = []
@@ -477,17 +486,12 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         # When hsdp_replica_count is set, remap coordinates into
         # sub-groups: each original coord maps to (coord % sub_size)
         # within its sub-group, and the effective group size shrinks.
-        # Supports per-dimension control via Tuple[int, ...].
         if self.hsdp_replica_count is not None:
-            if isinstance(self.hsdp_replica_count, int):
-                dedup_per_dim = (self.hsdp_replica_count,) * len(replicate_group_ranks)
-            else:
-                dedup_per_dim = self.hsdp_replica_count
             replicate_group_ranks = tuple(
-                r % dedup_per_dim[i] for i, r in enumerate(replicate_group_ranks)
+                r % self.hsdp_replica_count for r in replicate_group_ranks
             )
             replicate_sizes = tuple(
-                min(s, dedup_per_dim[i]) for i, s in enumerate(replicate_sizes)
+                min(s, self.hsdp_replica_count) for s in replicate_sizes
             )
 
         # Greedy owner assignment on this sub-batch's records.
@@ -518,6 +522,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             is_shard=is_shard_for_ns,
             layout_spec=hsdp_group.layout_spec,
         )
+        logger.info_rank0(f'[Hyper-optimizer] hsdp_assign: {hsdp_assign}')
 
         # Build broadcast reverse mapping for replicated groups
         if hsdp_assign.is_replicated and hsdp_assign.replicate_pgs:
@@ -669,7 +674,6 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             replicate_pgs: Tuple of ProcessGroups (one per dimension).
             local_coord: Local rank coordinate tuple.
         """
-        platform = get_platform()
 
         for dim_idx, pg in enumerate(replicate_pgs):
             if pg is None:
@@ -685,7 +689,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                 continue
 
             src_rank_in_pg = src_coord[dim_idx]
-            global_src_rank = platform.get_global_rank(pg, src_rank_in_pg)
+            global_src_rank = dist.get_global_rank(pg, src_rank_in_pg)
             dist.broadcast(batch_buffer, src=global_src_rank, group=pg)
 
     @staticmethod
@@ -703,7 +707,6 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         Note: dimensions within a single buffer are still sequential (dim N+1
         depends on dim N completing), but different buffers can overlap.
         """
-        platform = get_platform()
         handles: List[dist.Work] = []
 
         for dim_idx, pg in enumerate(replicate_pgs):
@@ -720,7 +723,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                 continue
 
             src_rank_in_pg = src_coord[dim_idx]
-            global_src_rank = platform.get_global_rank(pg, src_rank_in_pg)
+            global_src_rank = dist.get_global_rank(pg, src_rank_in_pg)
             handle = dist.broadcast(
                 batch_buffer, src=global_src_rank, group=pg, async_op=True,
             )
@@ -742,7 +745,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             target: "param" or "state".
             state_keys: State dict keys to broadcast when target="state".
         """
-        device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
+        device = get_current_device()
 
         alignment = 512  # bytes
         rank_dtype_tensors = self._collect_broadcast_tensors(target, state_keys)
@@ -814,7 +817,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             self.state[p].clear()
             del self.state[p]
 
-        torch.npu.empty_cache()
+        empty_accelerator_cache()
 
 
 class AsyncReplicateBroadcaster:
@@ -853,6 +856,9 @@ class AsyncReplicateBroadcaster:
                 List[dist.Work],
             ]
         ] = []
+        # Allow one batch of replicate communication to overlap with the
+        # next batch's compute, but avoid unbounded inflight buffer growth.
+        self._max_inflight_batches = 1
 
     def flush_group(
             self,
@@ -894,6 +900,9 @@ class AsyncReplicateBroadcaster:
             if tensors:
                 self._flush_key(key, tensors, async_op=True)
 
+        while len(self._inflight) > self._max_inflight_batches:
+            self._wait_and_release_oldest()
+
     def _flush_key(
             self,
             key: Tuple[Tuple[int, ...], torch.dtype, Tuple[dist.ProcessGroup, ...]],
@@ -901,7 +910,7 @@ class AsyncReplicateBroadcaster:
             async_op: bool = True,
     ) -> None:
         """Pack and broadcast tensors for one broadcast key."""
-        device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
+        device = get_current_device()
         src_coord, dtype, replicate_pgs = key
         alignment = 512  # bytes
 
@@ -928,11 +937,15 @@ class AsyncReplicateBroadcaster:
         if not batches:
             return
 
-        max_batch_size = max(batch_size for _, batch_size in batches)
-        buffer = torch.empty(max_batch_size, dtype=dtype, device=device)
+        if not async_op:
+            max_batch_size = max(batch_size for _, batch_size in batches)
+            buffer = torch.empty(max_batch_size, dtype=dtype, device=device)
 
         for batch_tensor_offsets, batch_total_size in batches:
-            batch_buffer = buffer[:batch_total_size]
+            if async_op:
+                batch_buffer = torch.empty(batch_total_size, dtype=dtype, device=device)
+            else:
+                batch_buffer = buffer[:batch_total_size]
 
             # Pack: owner rank
             if local_coord == src_coord:
@@ -945,8 +958,15 @@ class AsyncReplicateBroadcaster:
                 handles = BaseDistributedOptimizer._hierarchical_broadcast_buffer_async(
                     batch_buffer, src_coord, replicate_pgs, local_coord,
                 )
-                # Pin buffer + offsets until wait_all unpacks them
-                self._inflight.append((batch_buffer, batch_tensor_offsets, handles))
+                if handles:
+                    # Pin buffer + offsets until wait_all unpacks them.
+                    self._inflight.append((batch_buffer, batch_tensor_offsets, handles))
+                else:
+                    # No async work was enqueued on this rank, so unpack and free now.
+                    for t, offset, actual_numel, _ in batch_tensor_offsets:
+                        t.view(-1).copy_(batch_buffer[offset:offset + actual_numel])
+                    batch_buffer.untyped_storage().resize_(0)
+                    del batch_buffer
             else:
                 BaseDistributedOptimizer._hierarchical_broadcast_buffer(
                     batch_buffer, src_coord, replicate_pgs, local_coord,
@@ -960,13 +980,20 @@ class AsyncReplicateBroadcaster:
             buffer.untyped_storage().resize_(0)
             del buffer
 
+    def _wait_and_release_oldest(self) -> None:
+        """Wait, unpack, and release the oldest inflight async batch."""
+        batch_buffer, batch_tensor_offsets, handles = self._inflight.pop(0)
+        for handle in handles:
+            handle.wait()
+
+        # Unpack after the async broadcast completes.
+        for t, offset, actual_numel, _ in batch_tensor_offsets:
+            t.view(-1).copy_(batch_buffer[offset:offset + actual_numel])
+
+        batch_buffer.untyped_storage().resize_(0)
+        del batch_buffer
+
     def wait_all(self) -> None:
         """Wait for all inflight async broadcasts and unpack results."""
-        for batch_buffer, batch_tensor_offsets, handles in self._inflight:
-            for handle in handles:
-                handle.wait()
-            # Unpack: copy buffer data back to individual tensors
-            for t, offset, actual_numel, _ in batch_tensor_offsets:
-                t.view(-1).copy_(batch_buffer[offset:offset + actual_numel])
-
-        self._inflight.clear()
+        while self._inflight:
+            self._wait_and_release_oldest()

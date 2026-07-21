@@ -16,7 +16,9 @@
 """Muon optimizer with HSDP shard-group-aware communication."""
 
 import math
+from collections.abc import Callable
 from collections import defaultdict
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -26,73 +28,86 @@ from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, B
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
-    fused_allgather_dtensor_params,
+    ParamShardMeta,
     build_owner_by_size,
-    chunk_update_by_layout,
 )
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.optimizer.muon_shard import (
+    _debug_param_shard_metadata,
+    build_pad_ns_inputs,
+    build_param_shard_metadata_for_group,
+    chunk_update_by_layout,
+    fused_allgather_dtensor_params,
+)
+
+logger = logging.getLogger(__name__)
+
+# Legacy: single-coefficient quintic NS (Keller Jordan / Moonlight).
+# Same (a, b, c) applied every step; typically 5 steps.
+_NS_LEGACY_COEFFS: Tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
+
+# Asym5: 5-step asymmetric NS (dion). Each step uses different coefficients.
+_NS_ASYM5_COEFFS: Tuple[Tuple[float, float, float], ...] = (
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012),
+)
 
 
-def zeropower_via_newtonschulz5(ns_inputs: torch.Tensor, steps: int) -> torch.Tensor:
-    """Matrix orthogonalization with preallocated matmul buffers."""
+def zeropower_via_newtonschulz5(
+        ns_inputs: torch.Tensor,
+        steps: int,
+        ns_variant: str = "asym5",
+) -> torch.Tensor:
+    """Newton-Schulz orthogonalization with preallocated matmul buffers."""
     mat_x = ns_inputs
-    if ns_inputs.size(-2) > ns_inputs.size(-1):
+    transposed = ns_inputs.size(-2) > ns_inputs.size(-1)
+    if transposed:
         mat_x = mat_x.mT
 
-    # Create a new tensor so later in-place updates are safe.
-    mat_x = mat_x / (torch.norm(mat_x, dim=[-2, -1], keepdim=True) + 1e-7)
+    # Normalize input before Newton-Schulz iteration.
+    mat_x = mat_x / (mat_x.norm(dim=(-2, -1), keepdim=True) + 1e-10)
 
-    coeffs = [
-        (4.0848, -6.8946, 2.9270),
-        (3.9505, -6.3029, 2.6377),
-        (3.7418, -5.5913, 2.3037),
-        (2.8769, -3.1427, 1.2046),
-        (2.8366, -3.0525, 1.2012),
-    ]
-
-    # Preallocate temporary buffers to avoid loop-time allocations.
     n_size = mat_x.size(-2)
     buf_a = torch.empty(mat_x.shape[:-2] + (n_size, n_size), dtype=mat_x.dtype, device=mat_x.device)
-    buf_a2 = torch.empty_like(buf_a)
     buf_b = torch.empty_like(buf_a)
-    buf_bx = torch.empty_like(mat_x)
+    buf_c = torch.empty(mat_x.shape, dtype=mat_x.dtype, device=mat_x.device)
 
-    for coeff_a, coeff_b, coeff_c in coeffs[:steps]:
-        # A = X @ X.T
+    if ns_variant == "legacy":
+        step_coeffs = [_NS_LEGACY_COEFFS] * steps
+    elif ns_variant == "asym5":
+        step_coeffs = _NS_ASYM5_COEFFS[:steps]
+    else:
+        raise ValueError(
+            f"ns_variant must be 'legacy' or 'asym5', got {ns_variant!r}"
+        )
+
+    for coeff_a, coeff_b, coeff_c in step_coeffs:
         torch.matmul(mat_x, mat_x.mT, out=buf_a)
+        torch.matmul(buf_a, buf_a, out=buf_b)
+        buf_a.mul_(coeff_b)
+        buf_b.mul_(coeff_c)
+        buf_a.add_(buf_b)
+        torch.matmul(buf_a, mat_x, out=buf_c)
+        mat_x.mul_(coeff_a).add_(buf_c)
 
-        # A2 = A @ A
-        torch.matmul(buf_a, buf_a, out=buf_a2)
+    del buf_a, buf_b, buf_c
 
-        # B = b * A + c * A2
-        buf_b.copy_(buf_a).mul_(coeff_b)
-        buf_a2.mul_(coeff_c)
-        buf_b.add_(buf_a2)
-
-        # BX = B @ X
-        torch.matmul(buf_b, mat_x, out=buf_bx)
-
-        # X = a * X + BX
-        mat_x.mul_(coeff_a).add_(buf_bx)
-
-    if ns_inputs.size(-2) > ns_inputs.size(-1):
+    if transposed:
         mat_x = mat_x.mT
 
     return mat_x
 
 
-def adjust_lr_wd_for_muon(lr: float, matched_adamw_rms: float, param_shape: torch.Size) -> float:
-    """Scale learning rate for 2D Muon parameters based on tensor dimensions."""
-    dim_a, dim_b = param_shape[-2:]
-    adjusted_ratio = math.sqrt(max(dim_a, dim_b)) * matched_adamw_rms
-    return lr * adjusted_ratio
-
-
-def adjust_lr_wd_for_muon_conv(lr: float, matched_adamw_rms: float, param_shape: torch.Size) -> float:
-    """Scale learning rate for 3D convolutional Muon parameters."""
-    dim_a, dim_b, dim_c = param_shape[:]
-    adjusted_ratio = math.sqrt(max(dim_a, dim_b, dim_c)) * matched_adamw_rms
-    return lr * adjusted_ratio
+def compute_muon_slice_scale(slice_tensor: torch.Tensor, matched_adamw_rms: float) -> float:
+    """Compute Muon scale from the logical matrix dims of a reshaped slice."""
+    shape = tuple(slice_tensor.shape)
+    if len(shape) == 3 and shape[1] == 1:
+        logical_dims = (shape[0], shape[2])
+    else:
+        logical_dims = shape[-2:]
+    return math.sqrt(max(logical_dims)) * matched_adamw_rms
 
 
 class Muon(BaseDistributedOptimizer):
@@ -112,8 +127,18 @@ class Muon(BaseDistributedOptimizer):
             momentum: float = 0.95,
             nesterov: bool = True,
             ns_steps: int = 5,
+            ns_variant: str = "asym5",
+            reshape_fn: Optional[Callable[..., Any]] = None,
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
     ):
+        if ns_variant not in ("legacy", "asym5"):
+            raise ValueError(
+                f"ns_variant must be 'legacy' or 'asym5', got {ns_variant!r}"
+            )
+        if not isinstance(momentum, (list, tuple)):
+            momentum = [momentum]
+        if len(momentum) == 1:
+            momentum = (momentum[0], momentum[0])
         defaults = {
             "lr": lr,
             "weight_decay": weight_decay,
@@ -121,10 +146,13 @@ class Muon(BaseDistributedOptimizer):
             "momentum": momentum,
             "nesterov": nesterov,
             "ns_steps": ns_steps,
+            "ns_variant": ns_variant,
         }
         super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
+        self.reshape_fn = reshape_fn
 
         self._group_dtensor_by_mesh()
+        self._build_param_shard_metadata()
         deduced_count = self._auto_deduce_replica_count()
         if deduced_count is None:
             self.hsdp_replica_count = None
@@ -134,6 +162,11 @@ class Muon(BaseDistributedOptimizer):
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
+
+    def __str__(self):
+        return super().__repr__()
+
+    __repr__ = __str__
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
@@ -271,7 +304,7 @@ class Muon(BaseDistributedOptimizer):
             params: List[torch.Tensor],
     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
         """Compute first-order momentum and return bfloat16 NS inputs."""
-        momentum = group['momentum']
+        momentum1, momentum2 = group["momentum"]
         nesterov = group['nesterov']
 
         # Pre-filter params with valid grads and ensure momentum buffers exist
@@ -292,27 +325,28 @@ class Muon(BaseDistributedOptimizer):
         if not valid_params:
             return {}
 
-        # Strip DTensor wrappers for elementwise foreach ops
+        # Match muon_update_core():
+        # m_for_update = grad + momentum1 * m_old
+        # m_new = grad + momentum2 * m_old
         local_grads = [to_local_if_dtensor(g) for g in grads]
         local_bufs = [to_local_if_dtensor(b) for b in bufs]
-
-        # Fused momentum update: buf = momentum * buf + grad
         # pylint: disable=protected-access
-        torch._foreach_mul_(local_bufs, momentum)
+        local_us = torch._foreach_add(local_grads, local_bufs, alpha=momentum1)
+
+        torch._foreach_mul_(local_bufs, momentum2)
         torch._foreach_add_(local_bufs, local_grads)
 
-        # Nesterov: u = momentum * buf + grad  (out-of-place, keeps buf intact)
         if nesterov:
-            local_us = torch._foreach_mul(local_bufs, momentum)
+            torch._foreach_mul_(local_us, momentum1)
             torch._foreach_add_(local_us, local_grads)
-        else:
-            local_us = list(local_bufs)
 
-        # Cast to bfloat16 for NS iteration
         if local_us[0].dtype == torch.bfloat16:
             local_us_bf = local_us
         else:
-            local_us_bf = [u.to(torch.bfloat16) for u in local_us]
+            local_us = list(local_us)
+            for i, u in enumerate(local_us):
+                local_us[i] = u.to(torch.bfloat16)
+            local_us_bf = local_us
 
         return dict(zip(valid_params, local_us_bf))
 
@@ -324,20 +358,23 @@ class Muon(BaseDistributedOptimizer):
         """Process un-sharded params: shape-group -> memory-batch -> NS -> local update."""
         lr = group["lr"]
         weight_decay = group["weight_decay"]
-        rms = group["matched_adamw_rms"]
-        ns_steps = group["ns_steps"]
+
+        # empty params are not processed in muon, for uneven shard
+        param_to_ns_input = {
+            p: ns_input for p, ns_input in param_to_ns_input.items() if ns_input.numel() > 0
+        }
+        if not param_to_ns_input:
+            return
 
         shape_groups = self._group_by_shape(list(param_to_ns_input.keys()))
         for _, p_list in shape_groups.items():
             safe_batches = self._split_into_memory_safe_batches(p_list, shard_size=1)
 
             for sub_batch in safe_batches:
-                updates_dict, adjusted_lr = self._compute_batched_ns_updates(
-                    sub_batch, param_to_ns_input, lr, rms, ns_steps, no_shard=True
+                updates_dict = self._compute_batched_ns_updates(
+                    sub_batch, param_to_ns_input, group, no_shard=True
                 )
 
-                # Fused batched apply — all params in the same sub_batch share
-                # the same adjusted_lr, so we can use foreach ops.
                 local_params = [to_local_if_dtensor(p.data) for p in sub_batch]
                 local_updates = [updates_dict[p].view(lp.shape) for p, lp in zip(sub_batch, local_params)]
 
@@ -345,7 +382,7 @@ class Muon(BaseDistributedOptimizer):
                     # pylint: disable=protected-access
                     torch._foreach_mul_(local_params, 1 - lr * weight_decay)
                 # pylint: disable=protected-access
-                torch._foreach_add_(local_params, local_updates, alpha=-adjusted_lr)
+                torch._foreach_add_(local_params, local_updates, alpha=-lr)
 
     def _gather_and_compute_shard_updates(
             self,
@@ -353,13 +390,7 @@ class Muon(BaseDistributedOptimizer):
             param_to_ns_input: Dict[torch.nn.Parameter, torch.Tensor],
             hsdp_assign: HSDPGroupAssignment,
             shard_compute_coord: Dict[int, Tuple[int, ...]],
-            shard_sizes: Tuple[int, ...],
-            local_coords: Tuple[int, ...],
-            shard_pgs: Tuple[dist.ProcessGroup, ...],
-            total_shard_size: int,
-            lr: float,
-            rms: float,
-            ns_steps: int,
+            group: Dict[str, Any],
             buffer_cache: Optional[Dict],
     ) -> Tuple[
         Dict[torch.nn.Parameter, torch.Tensor],
@@ -370,6 +401,7 @@ class Muon(BaseDistributedOptimizer):
         Returns:
             (my_updates, param_compute_coord) for this HSDP assignment.
         """
+        shard_sizes, local_coords, shard_pgs, total_shard_size = self._get_shard_info(hsdp_assign)
         param_to_index = {record.param: record.index for record in hsdp_assign.owned_records}
 
         my_params: List[torch.nn.Parameter] = []
@@ -388,9 +420,16 @@ class Muon(BaseDistributedOptimizer):
 
         # Fused all-gather full NS inputs; keep only tensors computed locally.
         gathered_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
-        local_inputs = [param_to_ns_input[p] for p in valid_params]
+        local_inputs = build_pad_ns_inputs(
+            valid_params,
+            param_to_ns_input,
+            self._param_shard_metadata,
+        )
+        param_shard_metadata = [self._param_shard_metadata.get(p) for p in valid_params]
         gathered_list = fused_allgather_dtensor_params(
-            local_inputs, shard_pgs, hsdp_assign.layout_spec, buffer_cache=buffer_cache,
+            local_inputs, shard_pgs, hsdp_assign.layout_spec,
+            param_shard_metadata=param_shard_metadata,
+            buffer_cache=buffer_cache,
             keep_indices=my_indices,
         )
         for p, full_inp in zip(valid_params, gathered_list):
@@ -406,8 +445,8 @@ class Muon(BaseDistributedOptimizer):
             for _, p_list in shape_groups.items():
                 safe_batches = self._split_into_memory_safe_batches(p_list, shard_size=total_shard_size)
                 for sub_batch in safe_batches:
-                    updates_dict, _ = self._compute_batched_ns_updates(
-                        sub_batch, gathered_inputs, lr, rms, ns_steps
+                    updates_dict = self._compute_batched_ns_updates(
+                        sub_batch, gathered_inputs, group
                     )
                     for p in sub_batch:
                         my_updates[p] = updates_dict[p].contiguous()
@@ -425,38 +464,50 @@ class Muon(BaseDistributedOptimizer):
             buffer_cache: Optional[Dict] = None,
     ) -> None:
         """Process sharded params with greedy shard-group compute assignment."""
-        platform = get_platform()
-        device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
-
-        lr = group["lr"]
-        weight_decay = group["weight_decay"]
-        rms = group["matched_adamw_rms"]
-        ns_steps = group["ns_steps"]
-
         shard_compute_coord = self._shard_compute_coord.get(group_idx, {})
 
         for hsdp_assign in hsdp_assignments:
             owned_params = hsdp_assign.owned_params
-            valid_params = [p for p in owned_params if p in param_to_ns_input]
+            # Communication membership is static per assignment. Ranks with empty
+            # local shards still participate via build_pad_ns_inputs().
+            valid_params = owned_params
 
-            shard_sizes, local_coords, shard_pgs, total_shard_size = self._get_shard_info(hsdp_assign)
+            shard_sizes, _, shard_pgs, total_shard_size = self._get_shard_info(hsdp_assign)
 
-            # Gather NS inputs and compute updates assigned to this shard coordinate.
+            # uneven shard check
+            shard_pgs_rank = []
+            for pg in shard_pgs:
+                pg_rank = torch.distributed.get_process_group_ranks(pg)
+                shard_pgs_rank.append(pg_rank)
+
+            for p in valid_params:
+                if tuple(p.shape)[0] % shard_sizes[0] != 0:
+                    logger.debug_rank0(
+                        "[hyper-optimizer uneven-shard] p %s placement %s device_mesh %s "
+                        "local_shape %s global_shape %s pg_rank %s shard_sizes %s",
+                        p.model_name,
+                        p.placements,
+                        p.device_mesh,
+                        p.to_local().shape,
+                        p.shape,
+                        shard_pgs_rank,
+                        shard_sizes,
+                    )
+
             if valid_params:
-                my_updates, param_compute_coord = self._gather_and_compute_shard_updates(
-                    valid_params, param_to_ns_input, hsdp_assign,
-                    shard_compute_coord, shard_sizes, local_coords,
-                    shard_pgs, total_shard_size,
-                    lr, rms, ns_steps, buffer_cache,
+                safe_batches = self._split_into_memory_safe_batches(
+                    valid_params, shard_size=total_shard_size,
                 )
+                for sub_batch in safe_batches:
+                    my_updates, param_compute_coord = self._gather_and_compute_shard_updates(
+                        sub_batch, param_to_ns_input, hsdp_assign,
+                        shard_compute_coord, group, buffer_cache,
+                    )
 
-                # Fused broadcast full updates within the shard group, then batched apply.
-                self._fused_broadcast_and_apply(
-                    valid_params, my_updates, param_compute_coord,
-                    lr, weight_decay, rms,
-                    shard_pgs, shard_sizes, local_coords, total_shard_size,
-                    hsdp_assign, platform, device,
-                )
+                    self._fused_broadcast_and_apply(
+                        sub_batch, my_updates, param_compute_coord,
+                        group, hsdp_assign,
+                    )
 
     def _group_by_shape(
             self,
@@ -470,20 +521,117 @@ class Muon(BaseDistributedOptimizer):
         groups = defaultdict(list)
 
         for p in params:
-            shape = tuple(p.shape)
-
-            if len(shape) == 2:
-                core_shape = (shape[0], shape[1])
-            elif len(shape) == 3 and shape[1] == 1:
-                core_shape = (shape[0], shape[2])
-            elif len(shape) >= 3:
-                core_shape = (shape[-2], shape[-1])
-            else:
-                raise ValueError('1D parameters are not supported in Muon')
-
+            core_shape = self._shape_to_core_shape(tuple(p.shape))
             groups[core_shape].append(p)
 
         return groups
+
+    @staticmethod
+    def _shape_to_core_shape(shape: Tuple[int, ...]) -> Tuple[int, int]:
+        if len(shape) == 2:
+            return (shape[0], shape[1])
+        if len(shape) == 3 and shape[1] == 1:
+            return (shape[0], shape[2])
+        if len(shape) >= 3:
+            return (shape[-2], shape[-1])
+        raise ValueError('1D parameters are not supported in Muon')
+
+    def _reshape_ns_input(
+            self,
+            param: torch.nn.Parameter,
+            ns_input: torch.Tensor,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Return the contiguous NS input and any reshape views used for NS."""
+        working_input = ns_input if ns_input.is_contiguous() else ns_input.contiguous()
+        if self.reshape_fn is None:
+            return working_input, [working_input]
+
+        param_fqn = param.model_name
+        if param_fqn is None:
+            return working_input, [working_input]
+
+        reshaped_inputs = list(self.reshape_fn(param_fqn, working_input))
+        if not reshaped_inputs:
+            return working_input, [working_input]
+
+        if reshaped_inputs[0].shape != working_input.shape:
+            logger.info_rank0(
+                "Reshape %s from %s to %s",
+                param_fqn,
+                working_input.shape,
+                reshaped_inputs[0].shape,
+            )
+
+        for reshaped_input in reshaped_inputs:
+            assert (
+                    reshaped_input.untyped_storage().data_ptr() == working_input.untyped_storage().data_ptr()
+            ), "reshape_fn must return views that share storage with the working NS input tensor."
+
+        return working_input, reshaped_inputs
+
+    def _compute_batched_ns_outputs_for_tensors(
+            self,
+            tensor_list: List[torch.Tensor],
+            ns_steps: int,
+            ns_variant: str = "asym5",
+    ) -> List[torch.Tensor]:
+        """Run batched NS on mixed-shape tensors and restore their original shapes."""
+        if not tensor_list:
+            return []
+
+        inputs_3d = []
+        slice_sizes = []
+        shapes_info = []
+
+        for tensor in tensor_list:
+            origin_shape = tuple(tensor.shape)
+            is_conv = False
+            if len(origin_shape) == 2:
+                inp_3d = tensor.unsqueeze(0)
+                n_dim = 1
+            elif len(origin_shape) == 3 and origin_shape[1] == 1:
+                inp_3d = tensor.squeeze(1).unsqueeze(0)
+                is_conv = True
+                n_dim = 1
+            elif len(origin_shape) == 3:
+                inp_3d = tensor
+                n_dim = origin_shape[0]
+            else:
+                inp_3d = tensor.reshape(-1, origin_shape[-2], origin_shape[-1])
+                n_dim = inp_3d.shape[0]
+
+            inputs_3d.append(inp_3d)
+            slice_sizes.append(n_dim)
+            shapes_info.append((origin_shape, is_conv))
+
+        merged_input = torch.cat(inputs_3d, dim=0)
+        squeeze_batch = merged_input.shape[0] == 1
+        if squeeze_batch:
+            merged_input = merged_input.squeeze(0)
+
+        merged_update = zeropower_via_newtonschulz5(merged_input, steps=ns_steps, ns_variant=ns_variant)
+        del merged_input
+
+        if squeeze_batch:
+            merged_update = merged_update.unsqueeze(0)
+
+        outputs = []
+        current_idx = 0
+        for n_dim, (origin_shape, is_conv) in zip(slice_sizes, shapes_info):
+            update = merged_update[current_idx: current_idx + n_dim]
+            current_idx += n_dim
+
+            if is_conv:
+                update = update.squeeze(0).unsqueeze(1)
+            elif len(origin_shape) == 2:
+                update = update.squeeze(0)
+            elif len(origin_shape) >= 4:
+                update = update.reshape(origin_shape)
+
+            outputs.append(update)
+
+        del merged_update
+        return outputs
 
     def _split_into_memory_safe_batches(
             self,
@@ -520,106 +668,82 @@ class Muon(BaseDistributedOptimizer):
             self,
             p_list: List[torch.nn.Parameter],
             ns_inputs: Dict[torch.nn.Parameter, torch.Tensor],
-            lr: float,
-            rms: float,
-            ns_steps: int,
+            group: Dict[str, Any],
             no_shard: bool = False
-    ) -> Tuple[Dict[torch.nn.Parameter, torch.Tensor], float]:
+    ) -> Dict[torch.nn.Parameter, torch.Tensor]:
         """Batched Newton-Schulz update for mixed 2D / Conv3D / 3D parameters.
 
         Normalizes all inputs to 3D, concatenates along dim 0, runs a single
         NS iteration, then slices results back to original shapes.
 
-        Returns:
-            updates_dict: per-parameter NS-orthogonalized updates.
-            adjusted_lr: a single scalar — all params in the same batch share
-                the same shape group and optimizer hyper-params, so their
-                adjusted_lr is identical.
         """
         updates_dict = {}
 
         if not p_list:
-            return updates_dict, 0.0
+            return updates_dict
 
-        inputs_3d = []
-        slice_sizes = []
-        shapes_info = []
+        rms = group["matched_adamw_rms"]
+        ns_steps = group["ns_steps"]
+        ns_variant = group["ns_variant"]
+
+        reshape_groups: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
+        origin_shapes: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
+        working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
 
         for p in p_list:
             origin_shape = tuple(getattr(p, 'local_shape', None) or p.to_local().shape) if no_shard else tuple(p.shape)
             ns_input = ns_inputs[p].view(origin_shape)
+            origin_shapes[p] = origin_shape
 
-            is_conv = False
-            if len(origin_shape) == 2:
-                inp_3d = ns_input.unsqueeze(0)
-                n_dim = 1
-            elif len(origin_shape) == 3 and origin_shape[1] == 1:
-                inp_3d = ns_input.squeeze(1).unsqueeze(0)
-                is_conv = True
-                n_dim = 1
-            else:
-                inp_3d = ns_input
-                n_dim = origin_shape[0]
+            working_input, reshaped_inputs = self._reshape_ns_input(p, ns_input)
+            working_inputs[p] = working_input
+            for reshaped_input in reshaped_inputs:
+                core_shape = self._shape_to_core_shape(tuple(reshaped_input.shape))
+                reshape_groups[core_shape].append(reshaped_input)
 
-            inputs_3d.append(inp_3d)
-            slice_sizes.append(n_dim)
-            shapes_info.append((origin_shape, is_conv))
+        for _, tensor_list in reshape_groups.items():
+            reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
+                tensor_list,
+                ns_steps,
+                ns_variant=ns_variant,
+            )
 
-        merged_input = torch.cat(inputs_3d, dim=0)
-        merged_update = zeropower_via_newtonschulz5(merged_input, steps=ns_steps)
-        del merged_input
+            # scale updates
+            for reshaped_input, reshaped_update in zip(tensor_list, reshaped_updates):
+                slice_scale = compute_muon_slice_scale(reshaped_update, rms)
+                reshaped_update.mul_(slice_scale)
+                reshaped_input.copy_(reshaped_update.contiguous().view_as(reshaped_input))
 
-        current_idx = 0
-        for i, p in enumerate(p_list):
-            n_dim = slice_sizes[i]
-            origin_shape, is_conv = shapes_info[i]
+        for p in p_list:
+            ns_input = ns_inputs[p].view(origin_shapes[p])
+            working_input = working_inputs[p]
+            if working_input.untyped_storage().data_ptr() != ns_input.untyped_storage().data_ptr():
+                ns_input.copy_(working_input)
+            updates_dict[p] = ns_input
 
-            update = merged_update[current_idx: current_idx + n_dim]
-            current_idx += n_dim
-
-            if is_conv:
-                update = update.squeeze(0).unsqueeze(1)
-            elif len(origin_shape) == 2:
-                update = update.squeeze(0)
-
-            updates_dict[p] = update
-        del merged_update
-
-        # Compute adjusted_lr once — all params share the same shape group
-        ref_shape, is_conv = shapes_info[0]
-        if is_conv:
-            adjusted_lr = adjust_lr_wd_for_muon_conv(lr, rms, ref_shape)
-        else:
-            adjusted_lr = adjust_lr_wd_for_muon(lr, rms, ref_shape)
-
-        return updates_dict, adjusted_lr
+        return updates_dict
 
     def _fused_broadcast_and_apply(
             self,
             valid_params: List[torch.nn.Parameter],
             my_updates: Dict[torch.nn.Parameter, torch.Tensor],
             param_compute_coord: Dict[torch.nn.Parameter, Tuple[int, ...]],
-            lr: float,
-            weight_decay: float,
-            rms: float,
-            shard_pgs: Tuple[dist.ProcessGroup, ...],
-            shard_sizes: Tuple[int, ...],
-            local_coords: Tuple[int, ...],
-            total_shard_size: int,
+            group: Dict[str, Any],
             hsdp_assign: HSDPGroupAssignment,
-            platform: Any,
-            device: torch.device,
     ) -> None:
-        """Fused broadcast + batched apply for shard-group updates (Optimized for low Free time)."""
+        """Fused broadcast and apply for shard-group updates."""
+        lr = group["lr"]
+        weight_decay = group["weight_decay"]
+        shard_sizes, local_coords, shard_pgs, total_shard_size = self._get_shard_info(hsdp_assign)
+        device = to_local_if_dtensor(valid_params[0].data).device
+
         coord_groups: Dict[Tuple[int, ...], List[torch.nn.Parameter]] = defaultdict(list)
         for p in valid_params:
             coord_groups[param_compute_coord[p]].append(p)
 
         all_local_params: List[torch.Tensor] = []
         all_update_shards: List[torch.Tensor] = []
-        all_adjusted_lrs: List[float] = []
 
-        # Phase 1: Batched Pack
         alignment_bytes = 512
         element_size = torch.empty(0, dtype=torch.bfloat16, device=device).element_size()
         alignment_elements = max(1, alignment_bytes // element_size)
@@ -650,13 +774,11 @@ class Muon(BaseDistributedOptimizer):
 
             pack_buffers[coord] = pack_buffer
 
-        # Phase 2: Async Batched Relay Broadcast
         if total_shard_size > 1:
             self._batched_relay_broadcast(
-                pack_buffers, shard_pgs, shard_sizes, local_coords, platform
+                pack_buffers, shard_pgs, shard_sizes, local_coords
             )
 
-        # Phase 3: Batched Unpack & Apply
         layout_spec = hsdp_assign.layout_spec
         for coord, coord_params in coord_groups.items():
             pack_buffer = pack_buffers[coord]
@@ -664,19 +786,17 @@ class Muon(BaseDistributedOptimizer):
 
             for p, (offset, actual_numel, _) in zip(coord_params, param_offsets):
                 full_update = pack_buffer[offset:offset + actual_numel].view(tuple(p.shape))
-                update_to_apply = chunk_update_by_layout(full_update, p, layout_spec)
+                update_to_apply = chunk_update_by_layout(
+                    full_update,
+                    p,
+                    layout_spec,
+                    self._param_shard_metadata.get(p),
+                )
 
-                origin_shape = tuple(p.shape)
-                if len(origin_shape) == 3 and origin_shape[1] == 1:
-                    adjusted_lr = adjust_lr_wd_for_muon_conv(lr, rms, origin_shape)
-                else:
-                    adjusted_lr = adjust_lr_wd_for_muon(lr, rms, origin_shape)
+                local_param = to_local_if_dtensor(p.data)
+                all_local_params.append(local_param)
+                all_update_shards.append(update_to_apply.view(local_param.shape))
 
-                all_local_params.append(to_local_if_dtensor(p.data))
-                all_update_shards.append(update_to_apply.view(to_local_if_dtensor(p.data).shape))
-                all_adjusted_lrs.append(adjusted_lr)
-
-        # Batched Apply
         if not all_local_params:
             return
 
@@ -685,16 +805,22 @@ class Muon(BaseDistributedOptimizer):
             # pylint: disable=protected-access
             torch._foreach_mul_(all_local_params, coeff)
 
-        lr_group_map: Dict[float, Tuple[List[torch.Tensor], List[torch.Tensor]]] = defaultdict(lambda: ([], []))
-        for local_p, update_shard, adj_lr in zip(all_local_params, all_update_shards, all_adjusted_lrs):
-            params_list, updates_list = lr_group_map[adj_lr]
-            params_list.append(local_p)
-            updates_list.append(update_shard)
+        # Slice-wise Muon scaling has already been applied during NS postprocess.
+        # pylint: disable=protected-access
+        torch._foreach_add_(all_local_params, all_update_shards, alpha=-lr)
 
-        for adj_lr, (params_list, updates_list) in lr_group_map.items():
-            if params_list:
-                # pylint: disable=protected-access
-                torch._foreach_add_(params_list, updates_list, alpha=-adj_lr)
+    def _build_param_shard_metadata(self) -> None:
+        """Build shard metadata once during optimizer init."""
+        self._param_shard_metadata: Dict[torch.nn.Parameter, ParamShardMeta] = {}
+
+        for _, hsdp_groups in self._hsdp_grouping.values():
+            for hsdp_group in hsdp_groups:
+                if hsdp_group.layout_spec is None or not hsdp_group.layout_spec.shard_axes:
+                    continue
+                group_param_to_meta = build_param_shard_metadata_for_group(hsdp_group)
+                for param, shard_meta in group_param_to_meta.items():
+                    self._param_shard_metadata[param] = shard_meta
+                _debug_param_shard_metadata(hsdp_group, group_param_to_meta)
 
     @staticmethod
     def _get_shard_info(
@@ -729,7 +855,6 @@ class Muon(BaseDistributedOptimizer):
             shard_pgs: Tuple[dist.ProcessGroup, ...],
             shard_sizes: Tuple[int, ...],
             local_coords: Tuple[int, ...],
-            platform: Any,
     ) -> None:
         """
         Batched asynchronous multi-dimensional relay broadcast.
@@ -751,7 +876,7 @@ class Muon(BaseDistributedOptimizer):
                     continue
 
                 src_rank_in_pg = coord[dim_idx]
-                global_src_rank = platform.get_global_rank(pg, src_rank_in_pg)
+                global_src_rank = dist.get_global_rank(pg, src_rank_in_pg)
 
                 work = dist.broadcast(tensor, src=global_src_rank, group=pg, async_op=True)
                 if work is not None:

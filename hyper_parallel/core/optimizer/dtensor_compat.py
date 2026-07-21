@@ -22,11 +22,10 @@ and StridedShard based on the detected backend ('torch' or 'hyper').
 from __future__ import annotations
 
 import logging
-from typing import Any, List
+from typing import Any, Dict, List
 
 import torch.distributed._tensor as torch_dt
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global backend flag
@@ -39,7 +38,7 @@ class _NeverMatch:
 
 
 # Lazy-export cache
-_LAZY_CACHE: dict = {}
+_LAZY_CACHE: Dict[str, Any] = {}
 
 
 def _invalidate_lazy_cache() -> None:
@@ -60,7 +59,7 @@ def detect_dtensor_backend(
         sample_param = _extract_first_param(adamw_params)
 
     if sample_param is None:
-        logger.info("No parameters found for backend detection; defaulting to 'hyper'.")
+        logger.info_rank0("No parameters found for backend detection; defaulting to 'hyper'.")
         _DTENSOR_BACKEND = "hyper"
         _invalidate_lazy_cache()
         return _DTENSOR_BACKEND
@@ -71,7 +70,7 @@ def detect_dtensor_backend(
     else:
         _DTENSOR_BACKEND = "hyper"
 
-    logger.info("Detected DTensor backend: '%s'.", _DTENSOR_BACKEND)
+    logger.info_rank0("Detected DTensor backend: '%s'.", _DTENSOR_BACKEND)
     _invalidate_lazy_cache()
     return _DTENSOR_BACKEND
 
