@@ -182,6 +182,28 @@ def _is_broadcastable(src_shape: Sequence[int], dst_shape: Sequence[int]) -> boo
     return True
 
 
+def _device_spec(device: Any) -> Tuple[str, Optional[int]]:
+    """Return normalised ``(device_type, device_index)``.
+
+    Handles device objects and strings such as ``"npu:0"``.
+    """
+    device_type = getattr(device, "type", None)
+    # Only read .index from objects that also have a .type attribute
+    # (i.e. torch.device).  Avoids capturing str.index on plain strings.
+    device_index = (
+        getattr(device, "index", None) if device_type is not None else None
+    )
+    device_text = str(device).lower()
+
+    if device_type is None:
+        parts = device_text.split(":", maxsplit=1)
+        device_type = parts[0]
+        if len(parts) == 2 and parts[1].isdigit():
+            device_index = int(parts[1])
+
+    return str(device_type).lower(), device_index
+
+
 class DTensor(DTensorBase):
     """
     DTensor - Distributed Tensor
@@ -330,6 +352,253 @@ class DTensor(DTensorBase):
         new_local = self._local_tensor.float()
         return self._from_converted_local(new_local)
 
+    def type_as(self, other: Tensor) -> "DTensor":
+        """Cast this DTensor to the dtype of ``other``.
+
+        This is a **local** operation — no communication. Each shard
+        independently casts its elements to the target dtype.
+
+        Only the **dtype** of ``other`` is read; its shape, values, and
+        layout are ignored.  The returned DTensor preserves the
+        device-mesh and placements of ``self`` unchanged.
+
+        Args:
+            other (Tensor): A tensor whose ``.dtype`` will be used as the
+                target type.  May be a plain :class:`Tensor` or a
+                :class:`DTensor`.  Must reside on the same device as
+                ``self``.
+
+        Returns:
+            DTensor: A new DTensor with the converted local tensor.  When
+            ``self.dtype == other.dtype`` the method returns ``self``
+            unchanged (no-op).
+
+        Raises:
+            ValueError: If ``other`` is not a Tensor.
+            ValueError: If ``self`` has Partial placement (cast does not
+                commute with reduction).
+            ValueError: If ``self`` and ``other`` are on different devices.
+
+        Note:
+            This implementation intentionally covers **dtype-only**
+            conversion.  PyTorch's native ``type_as`` may also handle
+            cross-device transfers, but a DTensor cannot silently change
+            its backend device while retaining the old ``DeviceMesh``.
+            Use :meth:`to` for explicit device + dtype conversion.
+
+        Example:
+            >>> # x is a DTensor of float16, y is a plain float32 Tensor
+            >>> # on the same device.
+            >>> z = x.type_as(y)
+            >>> z.dtype == y.dtype
+            True
+        """
+        if not isinstance(other, Tensor):
+            raise ValueError(
+                f"type_as() argument must be a Tensor, but got "
+                f"{type(other).__name__}."
+            )
+        if hasattr(self, '_layout') and self._layout is not None:
+            if self._layout.is_partial():
+                raise ValueError(
+                    "DTensor.type_as does not support Partial input; "
+                    "call reduce_partial() first."
+                )
+
+        other_local = other.to_local() if isinstance(other, DTensor) else other
+        if self._local_tensor.device != other_local.device:
+            raise ValueError(
+                "DTensor.type_as requires self and other to be on the "
+                "same device. Use to() for explicit device + dtype "
+                "conversion."
+            )
+
+        target_dtype = other.dtype
+        if self.dtype == target_dtype:
+            return self
+        new_local = self._local_tensor.to(dtype=target_dtype)
+        return self._from_converted_local(new_local)
+
+    def _validate_factory_device(self, device: Any) -> None:
+        """Raise :class:`ValueError` if ``device`` does not match the DTensor's device."""
+        requested_type, requested_index = _device_spec(device)
+        local_type, local_index = _device_spec(self._local_tensor.device)
+        if (
+            requested_type != local_type
+            or (
+                requested_index is not None
+                and requested_index != local_index
+            )
+        ):
+            raise ValueError(
+                f"DTensor requires device to match the input DTensor "
+                f"device {self._local_tensor.device}, but got {device}."
+            )
+
+    def _new_const_tensor_op(
+            self,
+            method_name: str,
+            size: Union[int, Sequence[int]],
+            *,
+            dtype: Optional[Any] = None,
+            device: Optional[Any] = None,
+            requires_grad: bool = False,
+            layout: Optional[Any] = None,
+            pin_memory: bool = False,
+    ) -> 'DTensor':
+        """Create an all-``Replicate`` constant DTensor.
+
+        Shared implementation for ``new_zeros`` and ``new_ones``.
+
+        ``self`` is only used as a dtype/device reference and mesh source;
+        its values are ignored.  The output is always **all-Replicate**
+        because every device produces identical data independently.
+
+        Args:
+            method_name:
+                ``"new_zeros"`` or ``"new_ones"`` — the local tensor
+                factory method to call.
+            size:
+                Output shape — an int or a sequence of ints.
+            dtype:
+                Desired dtype.  Defaults to ``self.dtype`` on Torch.
+            device:
+                Must match ``self``'s device (Torch only).
+            requires_grad:
+                Forwarded on Torch; rejected on MindSpore.
+            layout:
+                Forwarded on Torch; rejected on MindSpore.
+            pin_memory:
+                Forwarded on Torch; rejected on MindSpore.
+
+        Returns:
+            DTensor: A new DTensor with all-``Replicate`` placements on
+            ``self``'s ``DeviceMesh``.
+
+        Raises:
+            ValueError: If a Torch-only kwarg is used on MindSpore, or
+                ``device`` does not match the DTensor's device.
+        """
+        if isinstance(size, int):
+            size = (size,)
+
+        if platform.platform_type == PlatformType.MINDSPORE:
+            if device is not None or layout is not None or requires_grad or pin_memory:
+                raise ValueError(
+                    f"DTensor.{method_name} only supports size and dtype "
+                    "on MindSpore."
+                )
+            local_kwargs = {}
+            if dtype is not None:
+                local_kwargs["dtype"] = dtype
+        else:
+            local_kwargs = {}
+            if dtype is not None:
+                local_kwargs["dtype"] = dtype
+            if device is not None:
+                self._validate_factory_device(device)
+                # An unindexed device such as "cuda" resolves to the framework's
+                # current device, which may differ from this DTensor's local device.
+                local_kwargs["device"] = self._local_tensor.device
+            if requires_grad:
+                local_kwargs["requires_grad"] = True
+            if layout is not None:
+                local_kwargs["layout"] = layout
+            if pin_memory:
+                local_kwargs["pin_memory"] = True
+
+        factory = getattr(self._local_tensor, method_name)
+        local_result = factory(size, **local_kwargs)
+
+        replicated_placements = [Replicate()] * self._device_mesh.ndim
+        return DTensor.from_local(
+            local_result, self._device_mesh, replicated_placements,
+        )
+
+    def new_zeros(
+            self,
+            size: Union[int, Sequence[int]],
+            *,
+            dtype: Optional[Any] = None,
+            device: Optional[Any] = None,
+            requires_grad: bool = False,
+            layout: Optional[Any] = None,
+            pin_memory: bool = False,
+    ) -> 'DTensor':
+        """Create an all-Replicate DTensor filled with zeros.
+
+        The output is always **fully replicated** across every device in
+        ``self``'s ``DeviceMesh``, regardless of how ``self`` is sharded.
+
+        Args:
+            size:
+                Output shape — an int or a sequence of ints.
+            dtype:
+                Desired dtype.  Defaults to ``self.dtype`` (Torch).
+                Not forwarded to MindSpore unless explicitly set.
+            device:
+                Must match ``self``'s device.  Not supported on MindSpore.
+            requires_grad:
+                Forwarded on Torch; rejected on MindSpore.
+            layout:
+                Forwarded on Torch; rejected on MindSpore.
+            pin_memory:
+                Forwarded on Torch; rejected on MindSpore.
+
+        Returns:
+            DTensor: A new all-Replicate DTensor filled with zeros.
+        """
+        return self._new_const_tensor_op(
+            "new_zeros", size,
+            dtype=dtype,
+            device=device,
+            requires_grad=requires_grad,
+            layout=layout,
+            pin_memory=pin_memory,
+        )
+
+    def new_ones(
+            self,
+            size: Union[int, Sequence[int]],
+            *,
+            dtype: Optional[Any] = None,
+            device: Optional[Any] = None,
+            requires_grad: bool = False,
+            layout: Optional[Any] = None,
+            pin_memory: bool = False,
+    ) -> 'DTensor':
+        """Create an all-Replicate DTensor filled with ones.
+
+        The output is always **fully replicated** across every device in
+        ``self``'s ``DeviceMesh``, regardless of how ``self`` is sharded.
+
+        Args:
+            size:
+                Output shape — an int or a sequence of ints.
+            dtype:
+                Desired dtype.  Defaults to ``self.dtype`` (Torch).
+                Not forwarded to MindSpore unless explicitly set.
+            device:
+                Must match ``self``'s device.  Not supported on MindSpore.
+            requires_grad:
+                Forwarded on Torch; rejected on MindSpore.
+            layout:
+                Forwarded on Torch; rejected on MindSpore.
+            pin_memory:
+                Forwarded on Torch; rejected on MindSpore.
+
+        Returns:
+            DTensor: A new all-Replicate DTensor filled with ones.
+        """
+        return self._new_const_tensor_op(
+            "new_ones", size,
+            dtype=dtype,
+            device=device,
+            requires_grad=requires_grad,
+            layout=layout,
+            pin_memory=pin_memory,
+        )
+
     def to_local(self) -> Tensor:
         """
         Convert DTensor to local tensor.
@@ -338,6 +607,35 @@ class DTensor(DTensorBase):
             Tensor: The local tensor shard on this device.
         """
         return self._local_tensor
+
+    def tolist(self):
+        """
+        Convert the DTensor to a nested Python list or number.
+
+        This operation gathers the complete tensor on every participating rank
+        before converting it to Python values. It is an **implicit collective**:
+        all ranks in the DeviceMesh must participate.
+
+        Returns:
+            Union[list, int, float, bool]: A nested Python list, or a Python
+            number for a scalar DTensor.
+
+        Note:
+            This triggers ``full_tensor()`` under the hood, which performs
+            all-gather communication. For large tensors, prefer slicing or
+            index-based access to avoid materialising the full tensor.
+
+            If you only need the **local shard** as a list, use
+            ``dtensor.to_local().tolist()`` instead — that path has zero
+            communication overhead.
+
+        Example:
+            >>> mesh = init_device_mesh("npu", (2,), ("dp",))
+            >>> x = distribute_tensor(torch.arange(8).reshape(4, 2), mesh, [Shard(0)])
+            >>> x.tolist()              # full data: [[0,1],[2,3],[4,5],[6,7]]
+            >>> x.to_local().tolist()   # local shard only (no comm)
+        """
+        return self.full_tensor().tolist()
 
     def copy_(self, src: "DTensor", non_blocking: bool = False) -> "DTensor":
         """In-place copy of ``src`` into this DTensor's local shard.

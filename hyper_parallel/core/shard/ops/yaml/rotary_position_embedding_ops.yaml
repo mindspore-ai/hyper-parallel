@@ -2,3 +2,8 @@ RotaryPositionEmbedding:
   dist_op_name: _rotary_position_embedding_dist_op
   distributed_op_class: RotaryPositionEmbeddingDistributedOp
   distributed_op_file: parallel_rotary_position_embedding
+
+npu_rotary_mul:
+  dist_op_name: _torch_npu_rotary_mul_dist_op
+  distributed_op_class: RotaryPositionEmbeddingDistributedOp
+  distributed_op_file: parallel_rotary_position_embedding

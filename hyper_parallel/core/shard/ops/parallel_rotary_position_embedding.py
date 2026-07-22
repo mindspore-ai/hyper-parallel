@@ -35,14 +35,52 @@ def _normalize_rpe_args(x, cos, sin, mode=0):
     return (x, cos, sin, mode), {}
 
 
+def _normalize_npu_rotary_mul_args(x, cos, sin, rotary_mode=None):
+    """Normalize npu_rotary_mul args to canonical positional form.
+
+    Maps ``rotary_mode`` (string, keyword-only) to ``mode`` (int, positional),
+    matching the canonical form produced by :func:`_normalize_rpe_args`.
+
+    Mapping:
+      - ``None`` / not specified / ``"half"`` → mode=0 (rotate_half)
+      - ``"interleave"``           → mode=1 (rotate_interleaved)
+
+    Args:
+        x: Input tensor.
+        cos: Cosine position encoding tensor.
+        sin: Sine position encoding tensor.
+        rotary_mode: Rotation mode string, optional.
+
+    Returns:
+        tuple: ((x, cos, sin, mode), {})
+
+    Raises:
+        ValueError: If rotary_mode is not None, 'half', or 'interleave'.
+    """
+    if rotary_mode in (None, "half"):
+        mode = 0
+    elif rotary_mode == "interleave":
+        mode = 1
+    else:
+        raise ValueError(
+            f"npu_rotary_mul: unsupported rotary_mode '{rotary_mode}'. "
+            f"Supported values: None, 'half', 'interleave'."
+        )
+    return (x, cos, sin, mode), {}
+
+
 class RotaryPositionEmbeddingDistributedOp(DistributedOp):
-    """Distributed operator for RotaryPositionEmbedding.
+    """Distributed operator for RotaryPositionEmbedding and npu_rotary_mul.
 
     Computes rotary position embedding element-wise:
         y = x * cos + x_rotate * sin
 
     where x_rotate is obtained by rotating within the last (D) dimension.
     Output shape equals x shape exactly.
+
+    Serves both:
+      - MindSpore Primitive ``RotaryPositionEmbedding`` (mode positional)
+      - PyTorch ``torch_npu.npu_rotary_mul`` (rotary_mode keyword-only)
 
     Sharding constraints:
       - D (last dim) must be replicated for x, cos, and sin: the kernel rotates
@@ -53,16 +91,16 @@ class RotaryPositionEmbeddingDistributedOp(DistributedOp):
         but if cos/sin is sharded on a dimension, it must match x's sharding
         on that dimension.
 
-    MODE does not affect layout inference: all modes produce output shape == x
-    shape and leave B/N/S independence unchanged. MODE is passed through as a
-    kernel parameter.
+    MODE / rotary_mode does not affect layout inference: all modes produce
+    output shape == x shape and leave B/N/S independence unchanged.
 
     Output:
       Single tensor with the same shape and layout as x.
     """
 
-    @staticmethod
-    def _validate_input_layouts(x_layout, cos_layout, sin_layout) -> None:
+    _MS_PRIMITIVE_OP_NAMES = frozenset({'RotaryPositionEmbedding'})
+
+    def _validate_input_layouts(self, x_layout, cos_layout, sin_layout) -> None:
         """Validate sharding constraints for all input tensors.
 
         Rules (applied to both 4-D BNSD/BSND/SBND and 3-D TND layouts):
@@ -80,12 +118,11 @@ class RotaryPositionEmbeddingDistributedOp(DistributedOp):
             ValueError: If D is sharded for any input, or if cos/sin sharding
                 is inconsistent with x on any non-D dimension.
         """
-        op = "rotary_position_embedding"
         x_tm = x_layout.tensor_map
 
         if x_tm[-1] != -1:
             raise ValueError(
-                f"For {op}, D (last dim) of x must be replicated, "
+                f"For {self.op_name}, D (last dim) of x must be replicated, "
                 f"but got tensor_map={x_tm}"
             )
 
@@ -93,21 +130,27 @@ class RotaryPositionEmbeddingDistributedOp(DistributedOp):
             tm = layout.tensor_map
             if tm[-1] != -1:
                 raise ValueError(
-                    f"For {op}, D (last dim) of {name} must be replicated, "
+                    f"For {self.op_name}, D (last dim) of {name} must be replicated, "
                     f"but got tensor_map={tm}"
                 )
             for d in range(len(tm) - 1):
                 x_d = x_tm[d] if d < len(x_tm) - 1 else -1
                 if tm[d] != -1 and tm[d] != x_d:
                     raise ValueError(
-                        f"For {op}, {name} sharding on dim {d} must match x or be replicated, "
-                        f"but got x={x_d}, {name}={tm[d]}"
+                        f"For {self.op_name}, {name} sharding on dim {d} must match x "
+                        f"or be replicated, but got x={x_d}, {name}={tm[d]}"
                     )
 
     def preprocess(self, args: tuple, kwargs: dict) -> Optional[tuple]:
         """Extract local tensors and build the layout cache.
 
-        All inputs (x, cos, sin) are expected to be DTensors.
+        Cross-platform routing via ``_MS_PRIMITIVE_OP_NAMES``:
+          - Primitive (RotaryPositionEmbedding): normalize with
+            _normalize_rpe_args, mode → local_args (all positional),
+            local_kwargs = {}.
+          - PyTorch (npu_rotary_mul): normalize with
+            _normalize_npu_rotary_mul_args, rotary_mode → local_kwargs
+            (keyword-only).
 
         Args:
             args: Positional arguments, may include DTensors.
@@ -115,19 +158,31 @@ class RotaryPositionEmbeddingDistributedOp(DistributedOp):
 
         Returns:
             tuple: (local_args, local_kwargs, cache_values) where
-                local_args = (x_local, cos_local, sin_local, mode),
-                local_kwargs = {},
                 cache_values = [x_layout, cos_layout, sin_layout].
         """
-        norm_args, _ = _normalize_rpe_args(*args, **kwargs)
-        x = norm_args[0]
-        cos = norm_args[1]
-        sin = norm_args[2]
-        mode = norm_args[3]
+        # Step 1: normalize — both functions return canonical
+        # (x, cos, sin, mode_int), {}.
+        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
+            norm_args, _ = _normalize_rpe_args(*args, **kwargs)
+        else:
+            norm_args, _ = _normalize_npu_rotary_mul_args(*args, **kwargs)
 
-        local_args = (x.to_local(), cos.to_local(), sin.to_local(), mode)
+        x, cos, sin, mode = norm_args
+
+        # Step 2: assemble local_args / local_kwargs by platform convention.
+        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
+            # MindSpore Primitive: all positional, no kwargs.
+            local_args = (x.to_local(), cos.to_local(), sin.to_local(), mode)
+            local_kwargs = {}
+        else:
+            # PyTorch: keyword-only params go in kwargs.
+            local_args = (x.to_local(), cos.to_local(), sin.to_local())
+            local_kwargs = {}
+            if mode == 1:
+                local_kwargs['rotary_mode'] = 'interleave'
+
         cache_values = [x.layout, cos.layout, sin.layout]
-        return local_args, {}, cache_values
+        return local_args, local_kwargs, cache_values
 
     def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """Infer output layout for the single output tensor.

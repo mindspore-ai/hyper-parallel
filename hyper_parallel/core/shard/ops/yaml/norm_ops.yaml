@@ -3,6 +3,11 @@ RmsNorm:
   distributed_op_class: NormDistributedOp
   distributed_op_file: parallel_norm
 
+npu_rms_norm:
+  dist_op_name: _torch_npu_rms_norm_dist_op
+  distributed_op_class: NormDistributedOp
+  distributed_op_file: parallel_norm
+
 layer_norm:
   dist_op_name: _torch_layer_norm_dist_op
   distributed_op_class: LayerNormDistributedOp
