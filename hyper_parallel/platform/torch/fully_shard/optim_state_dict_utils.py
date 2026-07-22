@@ -32,7 +32,7 @@ from torch import nn
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +118,14 @@ def _convert_state_tensor(
     For scalar states (step), only cpu_offload applies.
     For tensor states sharing the parameter shape, full/local conversion applies.
 
+    When the optimizer state value is itself a DTensor (e.g. when
+    ``optimizer.step()`` ran without ``SkipDTensorDispatch`` and the
+    parameter is a DTensor), we extract the local shard via
+    ``.to_local()`` or gather via ``.full_tensor()`` directly rather
+    than wrapping it again.
+
     Args:
-        tensor: The optimizer state tensor (plain torch.Tensor, local shard view).
+        tensor: The optimizer state tensor (plain Tensor or DTensor).
         param: The corresponding model parameter (may be DTensor).
         full_state_dict: If True, gather to full tensor.
         cpu_offload: If True, move to CPU.
@@ -129,20 +135,27 @@ def _convert_state_tensor(
         Converted tensor, or None if this rank should not keep the result.
     """
     dtensor_info = _get_param_dtensor_info(param)
+    is_dtensor_value = isinstance(tensor, DTensor)
 
     if full_state_dict and dtensor_info is not None:
-        mesh, placements = dtensor_info
-        full_t = DTensor.from_local(tensor, mesh, placements).full_tensor()
+        if is_dtensor_value:
+            full_t = tensor.full_tensor()
+        else:
+            mesh, placements = dtensor_info
+            full_t = DTensor.from_local(tensor, mesh, placements).full_tensor()
         if cpu_offload:
             if not is_rank0:
                 return None
             return full_t.cpu()
         return full_t
 
+    if is_dtensor_value:
+        local_t = tensor.to_local()
+        if cpu_offload:
+            return local_t.cpu()
+        return local_t
+
     if cpu_offload:
-        if dtensor_info is not None:
-            mesh, placements = dtensor_info
-            return DTensor.from_local(tensor.cpu(), mesh, placements)
         return tensor.cpu()
 
     return tensor
@@ -156,6 +169,8 @@ def _convert_state_scalar(
     tensor: torch.Tensor,
     cpu_offload: bool,
 ) -> torch.Tensor:
+    if isinstance(tensor, DTensor):
+        tensor = tensor.to_local()
     if cpu_offload:
         return tensor.cpu()
     return tensor
@@ -318,6 +333,13 @@ def set_optim_state_dict(
                 target_fqn_to_saved_id[name] = saved_id
                 break
 
+    dtensor_state_ids: set = set()
+    for saved_id, state in target_raw_sd["state"].items():
+        for value in state.values():
+            if isinstance(value, DTensor):
+                dtensor_state_ids.add(saved_id)
+                break
+
     new_state: Dict[int, Dict[str, Any]] = dict(target_raw_sd["state"])
 
     source_fqns = set(optim_state_dict.get("state", {}).keys())
@@ -347,9 +369,16 @@ def set_optim_state_dict(
 
         for key, value in source_state.items():
             if isinstance(value, torch.Tensor):
-                converted = _convert_input_tensor_to_target(
-                    value, param, full_state_dict, cpu_offload,
-                )
+                if _is_scalar_state(key):
+                    converted = _convert_input_scalar_to_target(
+                        value, param, cpu_offload,
+                        target_saved_id in dtensor_state_ids,
+                    )
+                else:
+                    converted = _convert_input_tensor_to_target(
+                        value, param, full_state_dict, cpu_offload,
+                        target_saved_id in dtensor_state_ids,
+                    )
                 new_state[target_saved_id][key] = converted
             else:
                 new_state[target_saved_id][key] = value
@@ -364,21 +393,37 @@ def _convert_input_tensor_to_target(
     param: nn.Parameter,
     full_state_dict: bool,
     cpu_offload: bool,
-) -> torch.Tensor:
-    """Convert an incoming state tensor to the target optimizer's local format.
+    stores_dtensor: bool = False,
+) -> Union[torch.Tensor, DTensor]:
+    """Convert an incoming state tensor to the target optimizer's format.
 
-    For HSDP params, the optimizer stores local shard tensors. If the input
-    is a full tensor (full_state_dict=True), we need to shard it. If it's
-    on CPU (cpu_offload=True), we need to move it to the target device.
+    For DTensor params whose optimizer stores DTensor state values (i.e. when
+    ``optimizer.step()`` ran without ``SkipDTensorDispatch``), we return a
+    DTensor so that ``optimizer.load_state_dict()`` receives the correct type.
+
+    For DTensor params whose optimizer stores plain local-shard tensors (i.e.
+    when ``optimizer.step()`` ran inside ``SkipDTensorDispatch``), we return
+    a plain local-shard tensor.
+
+    For plain (non-DTensor) params, we return a plain tensor on the correct
+    device.
+
+    Args:
+        tensor: Incoming state tensor (plain Tensor, possibly on CPU).
+        param: The corresponding model parameter (may be DTensor).
+        full_state_dict: If True, input tensor represents the full (non-sharded) value.
+        cpu_offload: If True, input tensor is on CPU and may need device transfer.
+        stores_dtensor: If True, the target optimizer stores DTensor state values
+            for this parameter (detected from existing ``optimizer.state_dict()``).
+
+    Returns:
+        Tensor or DTensor matching the target optimizer's expected format.
     """
     dtensor_info = _get_param_dtensor_info(param)
 
     if not dtensor_info:
         target_device = param.data.device
-        if full_state_dict:
-            result = tensor
-        else:
-            result = tensor
+        result = tensor
         if cpu_offload and result.device != target_device:
             result = result.to(target_device)
         return result
@@ -386,22 +431,70 @@ def _convert_input_tensor_to_target(
     mesh, placements = dtensor_info
     target_device = param.to_local().device
 
+    from hyper_parallel.core.dtensor.dtensor import distribute_tensor  # pylint: disable=C0415
+
     if full_state_dict:
         if cpu_offload:
             tensor = tensor.to(target_device)
-        from hyper_parallel.core.dtensor.dtensor import distribute_tensor  # pylint: disable=C0415
-        dtensor = distribute_tensor(tensor, mesh, placements)
-        return dtensor.to_local()
+        dt = distribute_tensor(tensor, mesh, placements)
+        if stores_dtensor:
+            return dt
+        return dt.to_local()
 
     if cpu_offload and tensor.device != target_device:
         tensor = tensor.to(target_device)
 
+    if stores_dtensor:
+        if tensor.shape == param.to_local().shape:
+            return DTensor.from_local(tensor, mesh, placements)
+        dt = distribute_tensor(tensor, mesh, placements)
+        return dt
+
     if tensor.shape == param.to_local().shape:
         return tensor
 
-    from hyper_parallel.core.dtensor.dtensor import distribute_tensor  # pylint: disable=C0415
-    dtensor = distribute_tensor(tensor, mesh, placements)
-    return dtensor.to_local()
+    dt = distribute_tensor(tensor, mesh, placements)
+    return dt.to_local()
+
+
+def _convert_input_scalar_to_target(
+    tensor: torch.Tensor,
+    param: nn.Parameter,
+    cpu_offload: bool,
+    stores_dtensor: bool = False,
+) -> Union[torch.Tensor, DTensor]:
+    """Convert an incoming scalar state tensor (e.g. step) to the target format.
+
+    Scalar states are not sharded — they are replicated on all ranks. When the
+    target optimizer stores DTensor values (``stores_dtensor=True``), we wrap
+    the scalar as a replicated DTensor; otherwise we return a plain tensor on
+    the correct device.
+
+    Args:
+        tensor: Incoming scalar tensor (plain Tensor, possibly on CPU).
+        param: The corresponding model parameter (may be DTensor).
+        cpu_offload: If True, input tensor is on CPU and may need device transfer.
+        stores_dtensor: If True, the target optimizer stores DTensor state values.
+
+    Returns:
+        Plain tensor or replicated DTensor matching the target's expected format.
+    """
+    dtensor_info = _get_param_dtensor_info(param)
+
+    if not dtensor_info or not stores_dtensor:
+        target_device = param.data.device if not dtensor_info else param.to_local().device
+        result = tensor
+        if cpu_offload and result.device != target_device:
+            result = result.to(target_device)
+        return result
+
+    mesh, placements = dtensor_info
+    target_device = param.to_local().device
+
+    scalar_placements = [Replicate()] * mesh.ndim
+    if cpu_offload and tensor.device != target_device:
+        tensor = tensor.to(target_device)
+    return DTensor.from_local(tensor, mesh, scalar_placements)
 
 
 def _broadcast_state_from_rank0(
