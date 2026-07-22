@@ -95,6 +95,7 @@ def _train_step_with_optim(model, optimizer, x):
     loss.backward()
     with SkipDTensorDispatch():
         optimizer.step()
+    return loss.item()
 
 
 def _cleanup_ckpt(path):
@@ -107,7 +108,12 @@ def _cleanup_ckpt(path):
 # O1: FQN roundtrip
 # =====================================================================
 def test_o1_optim_state_dict_fqn_roundtrip():
-    """get_optim_state_dict (default) -> set_optim_state_dict -> step."""
+    """get_optim_state_dict (default) -> set_optim_state_dict -> step.
+
+    E2E verification: after set, the restored optimizer must produce the
+    same loss as the source optimizer when running the same input, and
+    optimizer state values (exp_avg, step) must match numerically.
+    """
     init_dist()
     torch.manual_seed(42 + _rank())
     model, _ = _make_hsdp_model()
@@ -125,21 +131,54 @@ def test_o1_optim_state_dict_fqn_roundtrip():
                     f"state.{fqn}.{key} should be plain Tensor, got DTensor"
                 )
 
+    source_raw_sd = optimizer.state_dict()
+    source_step_vals = {}
+    source_exp_avg_norms = {}
+    for pid, state in source_raw_sd["state"].items():
+        if "step" in state:
+            source_step_vals[pid] = state["step"].item() if isinstance(state["step"], torch.Tensor) else float(state["step"])
+        if "exp_avg" in state:
+            source_exp_avg_norms[pid] = state["exp_avg"].norm().item()
+
     model2, _ = _make_hsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _train_step_with_optim(model2, optimizer2, x)
 
     set_optim_state_dict(model2, optimizer2, sd)
-    _train_step_with_optim(model2, optimizer2, x)
 
-    print(f"[rank{_rank()}] O1 PASS: FQN roundtrip")
+    target_raw_sd = optimizer2.state_dict()
+    for pid in source_step_vals:
+        if pid in target_raw_sd["state"]:
+            target_step = target_raw_sd["state"][pid]["step"]
+            target_step_val = target_step.item() if isinstance(target_step, torch.Tensor) else float(target_step)
+            assert target_step_val == source_step_vals[pid], (
+                f"step mismatch for pid={pid}: source={source_step_vals[pid]}, target={target_step_val}"
+            )
+
+    for pid in source_exp_avg_norms:
+        if pid in target_raw_sd["state"] and "exp_avg" in target_raw_sd["state"][pid]:
+            target_norm = target_raw_sd["state"][pid]["exp_avg"].norm().item()
+            assert abs(target_norm - source_exp_avg_norms[pid]) < 1e-5, (
+                f"exp_avg norm mismatch for pid={pid}: source={source_exp_avg_norms[pid]}, target={target_norm}"
+            )
+
+    loss_after = _train_step_with_optim(model2, optimizer2, x)
+    assert not (loss_after != loss_after), f"loss is NaN after roundtrip step: {loss_after}"
+
+    print(f"[rank{_rank()}] O1 PASS: FQN roundtrip (loss={loss_after:.4f}, step/state verified)")
 
 
 # =====================================================================
 # O2: full_state_dict + cpu_offload
 # =====================================================================
 def test_o2_optim_state_dict_full_cpu():
-    """get_optim_state_dict with full_state_dict=True + cpu_offload=True."""
+    """get with full_state_dict+cpu_offload -> set with broadcast -> step.
+
+    E2E verification: rank 0 holds full CPU state dict, other ranks have
+    empty state. After set_optim_state_dict with broadcast_from_rank0,
+    all ranks can continue training successfully, and optimizer state
+    tensors are restored to the correct NPU device.
+    """
     init_dist()
     torch.manual_seed(42 + _rank())
     model, _ = _make_hsdp_model()
@@ -163,7 +202,30 @@ def test_o2_optim_state_dict_full_cpu():
     else:
         assert len(sd["state"]) == 0, "non-rank0 should have empty state"
 
-    print(f"[rank{_rank()}] O2 PASS: full + cpu_offload")
+    model2, _ = _make_hsdp_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
+    _train_step_with_optim(model2, optimizer2, x)
+
+    opts_set = StateDictOptions(
+        full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True
+    )
+    set_optim_state_dict(model2, optimizer2, sd, options=opts_set)
+
+    raw_sd2 = optimizer2.state_dict()
+    for param_id, state in raw_sd2["state"].items():
+        for key, value in state.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if key == "step":
+                continue
+            assert value.device.type == "npu", (
+                f"state[{param_id}].{key} should be on NPU after set, got {value.device}"
+            )
+
+    loss_after = _train_step_with_optim(model2, optimizer2, x)
+    assert not (loss_after != loss_after), f"loss is NaN after full+cpu roundtrip step: {loss_after}"
+
+    print(f"[rank{_rank()}] O2 PASS: full + cpu_offload -> set -> step (loss={loss_after:.4f})")
 
 
 # =====================================================================
@@ -232,7 +294,12 @@ def test_o4_optim_state_dict_flatten():
 # O5: strict=False
 # =====================================================================
 def test_o5_optim_state_dict_strict_false():
-    """set_optim_state_dict with strict=False allows extra FQNs."""
+    """set_optim_state_dict with strict=False allows extra FQNs and step succeeds.
+
+    E2E verification: after loading with strict=False (ignoring extra FQNs),
+    the optimizer must still be able to execute a real training step without
+    shape mismatch or crash. param_groups integrity is also verified.
+    """
     init_dist()
     torch.manual_seed(42 + _rank())
     model, _ = _make_hsdp_model()
@@ -249,10 +316,24 @@ def test_o5_optim_state_dict_strict_false():
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _train_step_with_optim(model2, optimizer2, x)
 
+    original_pg_count = len(optimizer2.param_groups)
+    original_params_per_group = [len(g["params"]) for g in optimizer2.param_groups]
+
     opts = StateDictOptions(strict=False)
     set_optim_state_dict(model2, optimizer2, sd, options=opts)
 
-    print(f"[rank{_rank()}] O5 PASS: strict=False")
+    assert len(optimizer2.param_groups) == original_pg_count, (
+        "strict=False should not change param_groups count"
+    )
+    for i, g in enumerate(optimizer2.param_groups):
+        assert len(g["params"]) == original_params_per_group[i], (
+            f"strict=False should not change param_groups[{i}] params count"
+        )
+
+    loss_after = _train_step_with_optim(model2, optimizer2, x)
+    assert not (loss_after != loss_after), f"loss is NaN after strict=False step: {loss_after}"
+
+    print(f"[rank{_rank()}] O5 PASS: strict=False -> step (loss={loss_after:.4f})")
 
 
 # =====================================================================
