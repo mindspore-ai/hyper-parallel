@@ -683,6 +683,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             self._refresh_sharded_local_tensor_view(local_tensor, shard_dim, length)
         self._sharding_spec = cast(DTensor, self.sharded_param).layout
 
+    @_no_grad()
     def _get_unsharded_param_data(self, async_op: bool = False) -> Tuple[ms.Tensor, Optional[CommHandle]]:
         """
         Perform all-gather to get unsharded parameter data.
