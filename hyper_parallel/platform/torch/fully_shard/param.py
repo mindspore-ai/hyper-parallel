@@ -835,6 +835,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         # holds ``self.sharded_param`` (same data_ptr → no-op in practice).
         self._setattr_on_modules(self.sharded_param)
 
+    @torch.no_grad()
     def _get_unsharded_param_data(self, async_op: bool = False) -> Tuple[torch.Tensor, Optional[dist.Work]]:
         """
         Perform all-gather to get unsharded parameter data.
