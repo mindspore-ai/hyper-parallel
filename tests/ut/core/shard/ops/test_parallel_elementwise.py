@@ -21,6 +21,7 @@ import numpy as np
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_elementwise import ElementWiseDistributedOp, AddDistributedOp
+from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
@@ -857,6 +858,165 @@ class TestParallelZerosLike(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
             self.op.infer_layout([x_layout, None])
+
+
+class TestParallelSoftplus(unittest.TestCase):
+    """Unit tests for ElementWiseDistributedOp used by PyTorch softplus."""
+
+    def setUp(self) -> None:
+        """Clear distributed state before each test."""
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+        self.op = get_distributed_op("softplus")
+
+    def tearDown(self) -> None:
+        """Clear distributed state after each test."""
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    @staticmethod
+    def _setup_mock_platform(mock_platform, world_size=4):
+        """Configure the mocked platform for a 2D mesh."""
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda tensor: tensor.numpy() if hasattr(tensor, "numpy") else np.array(tensor)
+        )
+
+    def _make_2x2_mesh(self, mock_platform):
+        """Return a 2x2 (dp, tp) mesh with a mocked backend."""
+        self._setup_mock_platform(mock_platform)
+        return init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(2, 2),
+            mesh_dim_names=("dp", "tp"),
+            init_backend=False,
+        )
+
+    def test_softplus_registered(self):
+        """The YAML registry maps softplus to ElementWiseDistributedOp."""
+        self.assertIsInstance(self.op, ElementWiseDistributedOp)
+
+    def test_softplus_preprocess_defaults(self):
+        """Default invocation unwraps the DTensor input and preserves empty kwargs."""
+        input_layout = MagicMock()
+        local_input = MagicMock()
+        input_tensor = MagicMock()
+        input_tensor._layout = input_layout
+        input_tensor.layout = input_layout
+        input_tensor.shape = (4, 8)
+        input_tensor.to_local.return_value = local_input
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((input_tensor,), {})
+
+        self.assertEqual(local_args, (local_input,))
+        self.assertEqual(local_kwargs, {})
+        self.assertIs(cache_values[0], input_layout)
+        self.assertEqual(cache_values[1], [(4, 8)])
+
+    def test_softplus_preprocess_explicit_args(self):
+        """Positional beta and threshold remain positional local arguments."""
+        input_layout = MagicMock()
+        local_input = MagicMock()
+        input_tensor = MagicMock()
+        input_tensor._layout = input_layout
+        input_tensor.layout = input_layout
+        input_tensor.shape = (4, 8)
+        input_tensor.to_local.return_value = local_input
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((input_tensor, 2.0, 1.0), {})
+
+        self.assertEqual(local_args, (local_input, 2.0, 1.0))
+        self.assertEqual(local_kwargs, {})
+        self.assertIs(cache_values[0], input_layout)
+        self.assertEqual(cache_values[1:3], [None, None])
+        self.assertEqual(cache_values[3], [(4, 8), None, None])
+
+    def test_softplus_preprocess_keyword_args(self):
+        """Keyword beta and threshold remain keyword local arguments."""
+        input_layout = MagicMock()
+        local_input = MagicMock()
+        input_tensor = MagicMock()
+        input_tensor._layout = input_layout
+        input_tensor.layout = input_layout
+        input_tensor.shape = (4, 8)
+        input_tensor.to_local.return_value = local_input
+
+        local_args, local_kwargs, cache_values = self.op.preprocess(
+            (input_tensor,), {"beta": 2.0, "threshold": 1.0}
+        )
+
+        self.assertEqual(local_args, (local_input,))
+        self.assertEqual(local_kwargs, {"beta": 2.0, "threshold": 1.0})
+        self.assertIs(cache_values[0], input_layout)
+        self.assertEqual(cache_values[1:3], [None, None])
+        self.assertEqual(cache_values[3], [(4, 8), None, None])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_data_parallel(self, mock_platform):
+        """Data-parallel sharding is preserved in the output layout."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        input_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        cache_values = [input_layout, [(8, 16)]]
+
+        infer_result = self.op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
+
+        self.assertEqual(output_layout.tensor_map, (1, -1))
+        # Softplus is rank-local, so no expanded implementation is needed.
+        self.assertIsNone(self.op.get_expand_impl(None, infer_result, cache_values))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_model_parallel(self, mock_platform):
+        """Model-parallel sharding is preserved in the output layout."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        input_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+
+        output_layout = self.op.infer_layout([input_layout, [(8, 16)]])[0][0]
+
+        self.assertEqual(output_layout.tensor_map, (-1, 0))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_hybrid_parallel(self, mock_platform):
+        """Two mesh axes may shard independent dimensions of a 3D input."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        input_layout = _build_layout(mesh, (Shard(0), Shard(2)), 3)
+
+        output_layout = self.op.infer_layout([input_layout, [(4, 8, 16)]])[0][0]
+
+        self.assertEqual(output_layout.tensor_map, (1, -1, 0))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_all_replicated(self, mock_platform):
+        """A fully replicated input produces a fully replicated output."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+
+        output_layout = self.op.infer_layout([input_layout, [(8, 16)]])[0][0]
+
+        self.assertEqual(output_layout.tensor_map, (-1, -1))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_negative_dim(self, mock_platform):
+        """A negative shard dimension is normalized and preserved."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        input_layout = _build_layout(mesh, (Shard(-2), Replicate()), 2)
+
+        output_layout = self.op.infer_layout([input_layout, [(8, 16)]])[0][0]
+
+        self.assertEqual(output_layout.tensor_map, (1, -1))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_partial_input_raises(self, mock_platform):
+        """A Partial input is rejected before output layout inference."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        input_layout.set_partial_by_dev_axis("dp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "(?i)partial status"):
+            self.op.infer_layout([input_layout, [(8, 16)]])
 
 
 class TestParallelSoftplusExt(unittest.TestCase):

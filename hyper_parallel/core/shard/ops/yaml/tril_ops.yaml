@@ -1,0 +1,9 @@
+TrilExt:
+  dist_op_name: _tril_ext_dist_op
+  distributed_op_class: TrilDistributedOp
+  distributed_op_file: parallel_tril
+
+tril:
+  dist_op_name: _torch_tril_dist_op
+  distributed_op_class: TrilDistributedOp
+  distributed_op_file: parallel_tril
