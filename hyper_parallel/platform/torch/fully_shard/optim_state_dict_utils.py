@@ -311,10 +311,15 @@ def set_optim_state_dict(
             full_state_dict (bool): Input contains full (non-sharded) tensors.
             cpu_offload (bool): Input tensors are on CPU.
             flatten_optimizer_state_dict (bool): Input is in flatten format.
-            strict (bool): If True, require exact FQN match; if False, allow
-                missing/extra FQNs.
+            strict (bool): If True, reject FQNs in the checkpoint that do not
+                exist in the target optimizer (extra FQNs).  Missing FQNs are
+                always allowed because the target optimizer may have
+                untrained/empty state for some parameters.  If False, extra
+                FQNs in the checkpoint are silently ignored.
             broadcast_from_rank0 (bool): If True and full_state_dict+cpu_offload,
-                broadcast from rank 0 to all ranks.
+                broadcast from the replicate-group root to all ranks within
+                the same replicate subgroup.  In PP+HSDP, each PP stage
+                broadcasts independently within its own HSDP subgroup.
     """
     full_state_dict = getattr(options, "full_state_dict", False)
     cpu_offload = getattr(options, "cpu_offload", False)
@@ -561,6 +566,66 @@ def _convert_input_scalar_to_target(
     return DTensor.from_local(tensor, mesh, scalar_placements)
 
 
+def _get_broadcast_groups(
+    model: nn.Module,
+) -> List[Dict[str, Any]]:
+    """Identify broadcast groups from the model's DTensor parameters.
+
+    A broadcast group is a set of ranks that share the same model
+    parameters (same FQNs).  In HSDP, ranks within the same replicate
+    subgroup share parameters.  In PP, each PP stage is a different
+    broadcast group because different stages own different parameters.
+
+    Returns:
+        List of dicts, each with keys:
+            fqns: list of FQN strings owned by this group
+            pg: ProcessGroup for broadcast within the group
+            src_rank: global rank of the replicate-group root
+            is_root: True if current rank is the root of this group
+    """
+    param_by_fqn: Dict[str, nn.Parameter] = {}
+    for name, param in model.named_parameters():
+        param_by_fqn[name] = param
+
+    model_fqns = list(param_by_fqn.keys())
+
+    if not model_fqns:
+        return []
+
+    first_param = param_by_fqn[model_fqns[0]]
+    dtensor_info = _get_param_dtensor_info(first_param)
+
+    if dtensor_info is not None:
+        mesh, placements = dtensor_info
+        is_root = _is_replicate_group_root(mesh, placements)
+        replicate_dims = [i for i, p in enumerate(placements) if isinstance(p, Replicate)]
+        if replicate_dims:
+            pg = mesh.get_group(replicate_dims[0])
+            coord = mesh.get_coordinate()
+            if coord is not None:
+                root_coord = list(coord)
+                for d in replicate_dims:
+                    root_coord[d] = 0
+                src_rank = int(mesh.mesh[tuple(root_coord)])
+            else:
+                src_rank = 0
+        else:
+            pg = dist.group.WORLD
+            src_rank = 0
+    else:
+        is_root = dist.get_rank() == 0
+        pg = dist.group.WORLD
+        src_rank = 0
+
+    return [{
+        "fqns": model_fqns,
+        "pg": pg,
+        "src_rank": src_rank,
+        "is_root": is_root,
+        "param_by_fqn": param_by_fqn,
+    }]
+
+
 def _broadcast_state_from_rank0(
     optim_state_dict: Dict[str, Any],
     model: nn.Module,
@@ -577,72 +642,48 @@ def _broadcast_state_from_rank0(
     For non-DTensor parameters (pure FSDP), falls back to global rank 0
     as the broadcast source.
 
-    The FQN list is derived from the model's named parameters so that
-    all ranks agree on the same set, even when non-root ranks received
-    an empty state dict from ``get_optim_state_dict``.
+    **MPMD / Pipeline Parallelism**: each rank uses its own model's FQN
+    list, which only contains the parameters of its own PP stage.  The
+    broadcast is scoped to the replicate-dim process group (HSDP
+    subgroup), so different PP stages broadcast independently without
+    cross-stage interference.  This avoids the problem where global
+    rank 0's FQN list does not include other stages' parameters.
     """
     if not dist.is_initialized():
         return optim_state_dict
 
-    param_by_fqn: Dict[str, nn.Parameter] = {}
-    for name, param in model.named_parameters():
-        param_by_fqn[name] = param
+    groups = _get_broadcast_groups(model)
 
-    model_fqns = list(param_by_fqn.keys())
+    if not groups:
+        return {
+            "state": {},
+            "param_groups": optim_state_dict.get("param_groups", []),
+        }
 
-    # Broadcast the FQN list from a single root so that all ranks
-    # agree on the iteration order, even when non-root ranks have empty
-    # state dicts.
-    if dist.get_rank() == 0:
-        fqn_list = model_fqns
+    group = groups[0]
+    fqns = group["fqns"]
+    pg = group["pg"]
+    src_rank = group["src_rank"]
+    is_root = group["is_root"]
+    param_by_fqn = group["param_by_fqn"]
+
+    # ---- Phase 1: broadcast FQN list within replicate group ------
+    # The root broadcasts the FQN list so that all ranks in the same
+    # replicate subgroup agree on the iteration order.  This is scoped
+    # to the replicate-dim process group, NOT dist.group.WORLD, so
+    # different PP stages with different FQNs broadcast independently.
+    if is_root:
+        fqn_list = fqns
     else:
         fqn_list = []
     obj = [fqn_list]
-    dist.broadcast_object_list(obj, src=0, group=dist.group.WORLD)
+    dist.broadcast_object_list(obj, src=src_rank, group=pg)
     fqn_list = obj[0]
 
-    # Determine per-FQN metadata: is_root, process group, src rank
-    fqn_meta: Dict[str, Dict[str, Any]] = {}
+    # ---- Phase 2: broadcast schema per-FQN -----------------------
+    fqn_schema: Dict[str, Dict[str, Any]] = {}
 
     for fqn in fqn_list:
-        param = param_by_fqn.get(fqn)
-        dtensor_info = _get_param_dtensor_info(param) if param is not None else None
-
-        if dtensor_info is not None:
-            mesh, placements = dtensor_info
-            is_root = _is_replicate_group_root(mesh, placements)
-            replicate_dims = [i for i, p in enumerate(placements) if isinstance(p, Replicate)]
-            if replicate_dims:
-                pg = mesh.get_group(replicate_dims[0])
-                coord = mesh.get_coordinate()
-                if coord is not None:
-                    root_coord = list(coord)
-                    for d in replicate_dims:
-                        root_coord[d] = 0
-                    src_rank = int(mesh.mesh[tuple(root_coord)])
-                else:
-                    src_rank = 0
-            else:
-                pg = dist.group.WORLD
-                src_rank = 0
-        else:
-            is_root = dist.get_rank() == 0
-            pg = dist.group.WORLD
-            src_rank = 0
-
-        fqn_meta[fqn] = {
-            "is_root": is_root,
-            "pg": pg,
-            "src_rank": src_rank,
-        }
-
-    # ---- Phase 1: broadcast schema per-FQN -----------------------
-    for fqn in fqn_list:
-        meta = fqn_meta[fqn]
-        is_root = meta["is_root"]
-        pg = meta["pg"]
-        src_rank = meta["src_rank"]
-
         if is_root and fqn in optim_state_dict.get("state", {}):
             schema: Dict[str, Any] = {}
             state = optim_state_dict["state"][fqn]
@@ -660,21 +701,16 @@ def _broadcast_state_from_rank0(
 
         schema_list = [schema] if is_root else [None]
         dist.broadcast_object_list(schema_list, src=src_rank, group=pg)
-        meta["schema"] = schema_list[0]
+        fqn_schema[fqn] = schema_list[0]
 
-    # ---- Phase 2: broadcast tensor data per-FQN ------------------
+    # ---- Phase 3: broadcast tensor data per-FQN ------------------
     result: Dict[str, Any] = {
         "state": {},
         "param_groups": optim_state_dict.get("param_groups", []),
     }
 
     for fqn in fqn_list:
-        meta = fqn_meta[fqn]
-        is_root = meta["is_root"]
-        schema = meta["schema"]
-        pg = meta["pg"]
-        src_rank = meta["src_rank"]
-
+        schema = fqn_schema[fqn]
         if not schema:
             continue
         result["state"][fqn] = {}
@@ -734,6 +770,16 @@ def _flatten_optim_state_dict(
     Format:
         state.<FQN>.<state_key> = value
         param_group.<FQN>.<group_field> = value
+
+    **MPMD / Pipeline Parallelism caveat**: in PP, different ranks may
+    own parameters with the same local FQN (e.g. ``layers.0.net1.weight``
+    exists on both stage 0 and stage 1).  The flatten format does not
+    include a PP-rank or stage identifier, so these FQNs would collide
+    when combined into a single flat dict.  The recommended PP checkpoint
+    pattern is for each rank to independently save/load its own stages'
+    optimizer state dicts using ``no_dist=True`` (see P6 test pattern),
+    rather than using a coordinated DCP save with flatten format across
+    all ranks.
     """
     flat: Dict[str, Any] = {}
 
