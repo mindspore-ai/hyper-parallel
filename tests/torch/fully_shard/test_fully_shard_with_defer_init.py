@@ -44,7 +44,7 @@ def test_fully_shard_meta_init_comm_fusion():
     """
     parallel_run([
         TorchCase(
-            "tests/torch/fully_shard/_test_fully_shard_with_defer_init.py",
+            _TEST_FULLY_SHARD_WITH_DEFER_INIT,
             "test_fully_shard_meta_init_comm_fusion_matches_nonfusion",
             12362,
             4,
