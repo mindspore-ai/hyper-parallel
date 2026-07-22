@@ -439,15 +439,17 @@ def test_p3_pp_hsdp_optim_state_dict_fqn_roundtrip():
 # P4: PP+HSDP full_state_dict + cpu_offload restore to correct device
 # =====================================================================
 def test_p4_pp_hsdp_full_cpu_restore_to_device():
-    """PP+HSDP: get with full_state_dict+cpu_offload -> set -> verify device placement.
+    """PP+HSDP: get with full_state_dict+cpu_offload -> set with broadcast -> verify device.
 
-    Each PP rank independently gets its own stage's full optimizer state dict
-    (cpu_offload=True), then sets it back into a fresh optimizer.  After
-    ``set_optim_state_dict``, all optimizer state tensors should be on NPU.
+    Each PP stage's HSDP replicate-group root gets the full unsharded
+    optimizer state on CPU.  ``set_optim_state_dict`` with
+    ``broadcast_from_rank0=True`` then broadcasts from the per-stage
+    replicate root to all HSDP peers, and converts back to the correct
+    local shard on NPU.
 
-    Note: ``broadcast_from_rank0`` is NOT used because different PP ranks
-    have different model parameters.  Each rank saves/loads its own stage's
-    optimizer state dict independently — the recommended PP checkpoint pattern.
+    This test verifies that ``full_state_dict + cpu_offload +
+    broadcast_from_rank0`` works correctly under PP+HSDP, where the
+    replicate root is NOT global rank 0 for the second PP stage.
     """
     stages, pipeline_stages, schedule, stage_optimizers, device, pp_rank, mesh, hsdp_mesh = (
         _build_pp_hsdp_stages()
@@ -457,36 +459,31 @@ def test_p4_pp_hsdp_full_cpu_restore_to_device():
     for _ in range(2):
         _pp_hsdp_train_step(schedule, stage_optimizers, x, pp_rank)
 
-    # Get full+cpu state dict for each stage to verify cpu_offload works
+    # Get full+cpu state dict for each stage
     opts_get = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    all_full_sd = []
     for stage, optimizer in zip(stages, stage_optimizers):
         sd = get_optim_state_dict(stage, optimizer, options=opts_get)
-        # On the HSDP rank-0 for this stage (global rank 0 in the HSDP group),
-        # full_state_dict+cpu_offload returns full unsharded data on CPU.
-        # Other HSDP ranks receive an empty state dict.
+        # Verify CPU offload: only the replicate-group root keeps data
         for fqn, state in sd.get("state", {}).items():
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
                     assert value.device.type == "cpu", (
                         f"full+cpu state.{fqn}.{key} should be on CPU, got {value.device}"
                     )
+        all_full_sd.append(sd)
 
-    # Build fresh model+optimizers
+    # Build fresh model+optimizers, train one step, then load full+cpu state
     stages2, pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
         _build_pp_hsdp_stages()
     )
     _pp_hsdp_train_step(schedule2, stage_optimizers2, x, pp_rank)
 
-    # For PP, we use the local roundtrip pattern (not broadcast_from_rank0)
-    # because different PP ranks have different models.  Get local state dict
-    # and set it directly — the recommended PP checkpoint pattern.
-    all_local_sd = []
-    for stage, optimizer in zip(stages, stage_optimizers):
-        sd = get_optim_state_dict(stage, optimizer)
-        all_local_sd.append(sd)
-
-    for stage2, optimizer2, sd in zip(stages2, stage_optimizers2, all_local_sd):
-        set_optim_state_dict(stage2, optimizer2, sd)
+    opts_set = StateDictOptions(
+        full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True,
+    )
+    for stage2, optimizer2, sd in zip(stages2, stage_optimizers2, all_full_sd):
+        set_optim_state_dict(stage2, optimizer2, sd, options=opts_set)
 
     # After set, optimizer state tensors should be on NPU
     for optimizer2 in stage_optimizers2:

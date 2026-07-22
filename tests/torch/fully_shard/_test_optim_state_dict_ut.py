@@ -464,11 +464,13 @@ def test_u11_set_restores_param_groups_fields():
 
 
 # =====================================================================
-# U12: strict=True raises on missing FQNs (target has FQNs not in checkpoint)
+# U12: strict=True raises on extra FQNs (checkpoint has FQNs not in target)
 # =====================================================================
-def test_u12_strict_true_missing_fqns():
-    """strict=True raises ValueError when target optimizer has FQNs absent
-    from the checkpoint state dict."""
+def test_u12_strict_true_extra_fqns():
+    """strict=True raises ValueError when checkpoint contains FQNs not in
+    the target optimizer.  Missing FQNs (target has but checkpoint does not)
+    are allowed because an untrained or partially-initialized optimizer
+    legitimately has an empty state."""
     model = _SimpleNet()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     x = torch.randn(2, 8)
@@ -479,9 +481,10 @@ def test_u12_strict_true_missing_fqns():
     all_fqns = list(sd["state"].keys())
     assert len(all_fqns) > 1, "Need at least 2 FQNs for this test"
 
-    kept_fqn = all_fqns[0]
-    partial_sd = {
-        "state": {kept_fqn: sd["state"][kept_fqn]},
+    # Add a fake FQN to the checkpoint that doesn't exist in the target model
+    fake_fqn = "nonexistent.param.weight"
+    sd_with_extra = {
+        "state": {**sd["state"], fake_fqn: sd["state"][all_fqns[0]]},
         "param_groups": sd["param_groups"],
     }
 
@@ -489,5 +492,5 @@ def test_u12_strict_true_missing_fqns():
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _train_step(model2, optimizer2, x)
 
-    with pytest.raises(ValueError, match="strict=True but target optimizer has FQNs not in checkpoint"):
-        set_optim_state_dict(model2, optimizer2, partial_sd)
+    with pytest.raises(ValueError, match="strict=True but checkpoint contains FQNs not in target"):
+        set_optim_state_dict(model2, optimizer2, sd_with_extra)

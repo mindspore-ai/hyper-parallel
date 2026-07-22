@@ -79,10 +79,10 @@ def test_optim_state_dict_ut_group4():
     Feature: optim state dict single-card UT
     Description:
         1.test_u11_set_restores_param_groups_fields
-        2.test_u12_strict_true_missing_fqns
+        2.test_u12_strict_true_extra_fqns
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(UT_FILE, "test_u11_set_restores_param_groups_fields", num_proc=1),
-        TorchCase(UT_FILE, "test_u12_strict_true_missing_fqns", num_proc=1),
+        TorchCase(UT_FILE, "test_u12_strict_true_extra_fqns", num_proc=1),
     ])

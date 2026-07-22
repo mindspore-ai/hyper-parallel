@@ -77,6 +77,18 @@ def _rank():
     return dist.get_rank()
 
 
+def _is_replicate_root(mesh):
+    coord = mesh.get_coordinate()
+    if coord is None:
+        return False
+    dim_names = mesh.mesh_dim_names
+    for i, name in enumerate(dim_names):
+        if name == "replicate":
+            if coord[i] != 0:
+                return False
+    return True
+
+
 def _make_hsdp_model():
     mesh = init_device_mesh(
         device_type="npu",
@@ -183,7 +195,7 @@ def test_o2_optim_state_dict_full_cpu():
     """
     init_dist()
     torch.manual_seed(42 + _rank())
-    model, _ = _make_hsdp_model()
+    model, mesh = _make_hsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     x = torch.randn(BATCH, HIDDEN).npu()
 
@@ -193,8 +205,9 @@ def test_o2_optim_state_dict_full_cpu():
     opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
     sd = get_optim_state_dict(model, optimizer, options=opts)
 
-    if _rank() == 0:
-        assert len(sd["state"]) > 0, "rank0 should have non-empty state"
+    is_root = _is_replicate_root(mesh)
+    if is_root:
+        assert len(sd["state"]) > 0, "replicate-group root should have non-empty state"
         for fqn, state in sd["state"].items():
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
@@ -202,7 +215,7 @@ def test_o2_optim_state_dict_full_cpu():
                         f"state.{fqn}.{key} should be on CPU, got {value.device}"
                     )
     else:
-        assert len(sd["state"]) == 0, "non-rank0 should have empty state"
+        assert len(sd["state"]) == 0, "non-root should have empty state"
 
     model2, _ = _make_hsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)

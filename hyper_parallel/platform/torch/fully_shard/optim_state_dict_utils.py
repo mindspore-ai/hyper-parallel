@@ -49,6 +49,28 @@ def _is_dtensor_param(param: Any) -> bool:
     return isinstance(param, DTensor)
 
 
+def _is_replicate_group_root(
+    mesh: DeviceMesh,
+    placements: Sequence,
+) -> bool:
+    """Return True if current rank is the root (coordinate-0) in every
+    Replicate dimension of the given mesh+placements.
+
+    For HSDP with mesh (replicate, shard) and placements (Replicate(), Shard(0)),
+    only the rank whose replicate-dim coordinate is 0 returns True — even if
+    its global rank is not 0 (e.g. PP stage-1 ranks in a 3-D mesh).
+
+    If there are no Replicate dimensions, falls back to ``dist.get_rank() == 0``.
+    """
+    coord = mesh.get_coordinate()
+    if coord is None:
+        return False
+    replicate_dims = [i for i, p in enumerate(placements) if isinstance(p, Replicate)]
+    if not replicate_dims:
+        return dist.get_rank() == 0
+    return all(coord[d] == 0 for d in replicate_dims)
+
+
 def _param_to_fqn(model: nn.Module) -> Dict[nn.Parameter, str]:
     """Build a mapping from parameter object to its fully-qualified name."""
     param_to_name: Dict[nn.Parameter, str] = {}
@@ -213,8 +235,6 @@ def get_optim_state_dict(
     cpu_offload = getattr(options, "cpu_offload", False)
     flatten = getattr(options, "flatten_optimizer_state_dict", False)
 
-    is_rank0 = (not dist.is_initialized()) or (dist.get_rank() == 0)
-
     raw_sd = optimizer.state_dict()
     saved_id_to_fqn, _ = _build_id_to_fqn(optimizer, model)
 
@@ -227,20 +247,31 @@ def get_optim_state_dict(
     for saved_id, state in raw_sd["state"].items():
         fqn = saved_id_to_fqn[saved_id]
         param = param_by_id[saved_id]
+        dtensor_info = _get_param_dtensor_info(param)
+        if full_state_dict and cpu_offload and dtensor_info is not None:
+            is_root = _is_replicate_group_root(dtensor_info[0], dtensor_info[1])
+        elif full_state_dict and cpu_offload:
+            is_root = (not dist.is_initialized()) or (dist.get_rank() == 0)
+        else:
+            is_root = True
         converted: Dict[str, Any] = {}
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
                 if _is_scalar_state(key):
-                    converted[key] = _convert_state_scalar(value, cpu_offload)
+                    result = _convert_state_scalar(value, cpu_offload)
+                    if not (full_state_dict and cpu_offload and not is_root):
+                        converted[key] = result
                 else:
                     result = _convert_state_tensor(
-                        value, param, full_state_dict, cpu_offload, is_rank0,
+                        value, param, full_state_dict, cpu_offload, is_root,
                     )
                     if result is not None:
                         converted[key] = result
             else:
-                converted[key] = value
-        result_state[fqn] = converted
+                if not (full_state_dict and cpu_offload and not is_root):
+                    converted[key] = value
+        if converted:
+            result_state[fqn] = converted
 
     result_param_groups: List[Dict[str, Any]] = []
     for runtime_group, saved_group in zip(optimizer.param_groups, raw_sd["param_groups"]):
@@ -256,9 +287,6 @@ def get_optim_state_dict(
         "state": result_state,
         "param_groups": result_param_groups,
     }
-
-    if full_state_dict and cpu_offload and not is_rank0:
-        result = {"state": {}, "param_groups": result_param_groups}
 
     if flatten:
         result = _flatten_optim_state_dict(result)
@@ -296,17 +324,17 @@ def set_optim_state_dict(
 
     _check_chained_optimizer(optimizer)
 
-    is_rank0 = (not dist.is_initialized()) or (dist.get_rank() == 0)
-
     if flatten:
         optim_state_dict = _unflatten_optim_state_dict(optim_state_dict, model, strict=strict)
 
-    if full_state_dict and cpu_offload and not is_rank0:
-        if not broadcast_from_rank0:
+    if full_state_dict and cpu_offload and not broadcast_from_rank0:
+        has_any_state = bool(optim_state_dict.get("state", {}))
+        if not has_any_state:
             raise ValueError(
-                "Non-rank-0 received empty state dict with full_state_dict=True "
+                "Received empty state dict with full_state_dict=True "
                 "and cpu_offload=True but broadcast_from_rank0=False. "
-                "Set broadcast_from_rank0=True to allow rank 0 to broadcast."
+                "Set broadcast_from_rank0=True to allow the replicate-group "
+                "root to broadcast."
             )
 
     if broadcast_from_rank0:
@@ -351,12 +379,6 @@ def set_optim_state_dict(
             raise ValueError(
                 f"strict=True but checkpoint contains FQNs not in target "
                 f"optimizer: {sorted(extra_fqns)}"
-            )
-        missing_fqns = target_fqns - source_fqns
-        if missing_fqns:
-            raise ValueError(
-                f"strict=True but target optimizer has FQNs not in checkpoint: "
-                f"{sorted(missing_fqns)}"
             )
 
     for fqn, source_state in optim_state_dict.get("state", {}).items():
@@ -545,50 +567,119 @@ def _broadcast_state_from_rank0(
     full_state_dict: bool,
     cpu_offload: bool,
 ) -> Dict[str, Any]:
-    """Broadcast full optimizer state from rank 0 to all ranks.
+    """Broadcast full optimizer state from replicate-group root to all ranks.
 
     Only meaningful when full_state_dict=True and cpu_offload=True.
-    Rank 0 has the full data; other ranks receive it via broadcast.
+    The root rank (coordinate-0 in every Replicate dimension) has the full
+    data; other ranks in the same replicate subgroup receive it via
+    broadcast on the parameter's replicate-dim process group.
+
+    For non-DTensor parameters (pure FSDP), falls back to global rank 0
+    as the broadcast source.
+
+    The FQN list is derived from the model's named parameters so that
+    all ranks agree on the same set, even when non-root ranks received
+    an empty state dict from ``get_optim_state_dict``.
     """
     if not dist.is_initialized():
         return optim_state_dict
 
-    is_rank0 = dist.get_rank() == 0
     param_by_fqn: Dict[str, nn.Parameter] = {}
     for name, param in model.named_parameters():
         param_by_fqn[name] = param
 
-    if is_rank0:
-        schema: Dict[str, Any] = {}
-        for fqn, state in optim_state_dict.get("state", {}).items():
-            schema[fqn] = {}
+    model_fqns = list(param_by_fqn.keys())
+
+    # Broadcast the FQN list from a single root so that all ranks
+    # agree on the iteration order, even when non-root ranks have empty
+    # state dicts.
+    if dist.get_rank() == 0:
+        fqn_list = model_fqns
+    else:
+        fqn_list = []
+    obj = [fqn_list]
+    dist.broadcast_object_list(obj, src=0, group=dist.group.WORLD)
+    fqn_list = obj[0]
+
+    # Determine per-FQN metadata: is_root, process group, src rank
+    fqn_meta: Dict[str, Dict[str, Any]] = {}
+
+    for fqn in fqn_list:
+        param = param_by_fqn.get(fqn)
+        dtensor_info = _get_param_dtensor_info(param) if param is not None else None
+
+        if dtensor_info is not None:
+            mesh, placements = dtensor_info
+            is_root = _is_replicate_group_root(mesh, placements)
+            replicate_dims = [i for i, p in enumerate(placements) if isinstance(p, Replicate)]
+            if replicate_dims:
+                pg = mesh.get_group(replicate_dims[0])
+                coord = mesh.get_coordinate()
+                if coord is not None:
+                    root_coord = list(coord)
+                    for d in replicate_dims:
+                        root_coord[d] = 0
+                    src_rank = int(mesh.mesh[tuple(root_coord)])
+                else:
+                    src_rank = 0
+            else:
+                pg = dist.group.WORLD
+                src_rank = 0
+        else:
+            is_root = dist.get_rank() == 0
+            pg = dist.group.WORLD
+            src_rank = 0
+
+        fqn_meta[fqn] = {
+            "is_root": is_root,
+            "pg": pg,
+            "src_rank": src_rank,
+        }
+
+    # ---- Phase 1: broadcast schema per-FQN -----------------------
+    for fqn in fqn_list:
+        meta = fqn_meta[fqn]
+        is_root = meta["is_root"]
+        pg = meta["pg"]
+        src_rank = meta["src_rank"]
+
+        if is_root and fqn in optim_state_dict.get("state", {}):
+            schema: Dict[str, Any] = {}
+            state = optim_state_dict["state"][fqn]
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
-                    schema[fqn][key] = {
+                    schema[key] = {
                         "shape": tuple(value.shape),
                         "dtype": str(value.dtype),
                         "is_scalar": _is_scalar_state(key),
                     }
                 else:
-                    schema[fqn][key] = {"type": type(value).__name__, "value": value}
+                    schema[key] = {"type": type(value).__name__, "value": value}
+        else:
+            schema = {}
 
-        schema_list = [schema]
-    else:
-        schema_list = [None]
+        schema_list = [schema] if is_root else [None]
+        dist.broadcast_object_list(schema_list, src=src_rank, group=pg)
+        meta["schema"] = schema_list[0]
 
-    dist.broadcast_object_list(schema_list, src=0)
-    schema = schema_list[0]
-
+    # ---- Phase 2: broadcast tensor data per-FQN ------------------
     result: Dict[str, Any] = {
         "state": {},
         "param_groups": optim_state_dict.get("param_groups", []),
     }
 
-    for fqn, key_info in schema.items():
-        param = param_by_fqn.get(fqn)
+    for fqn in fqn_list:
+        meta = fqn_meta[fqn]
+        is_root = meta["is_root"]
+        schema = meta["schema"]
+        pg = meta["pg"]
+        src_rank = meta["src_rank"]
+
+        if not schema:
+            continue
         result["state"][fqn] = {}
 
-        for key, info in key_info.items():
+        for key, info in schema.items():
             is_scalar = info.get("is_scalar", False)
             shape = info.get("shape", ())
             dtype_str = info.get("dtype", "torch.float32")
@@ -598,8 +689,13 @@ def _broadcast_state_from_rank0(
             except AttributeError:
                 dtype = torch.float32
 
+            local_rank = dist.get_rank() if dist.is_initialized() else 0
+            device = torch.device(
+                f"npu:{local_rank}" if torch.npu.is_available() else f"cuda:{local_rank}"
+            )
+
             if is_scalar:
-                if is_rank0:
+                if is_root and fqn in optim_state_dict.get("state", {}):
                     scalar_val = optim_state_dict["state"][fqn][key]
                     t = scalar_val.clone() if isinstance(scalar_val, torch.Tensor) else torch.tensor(scalar_val)
                     if t.dim() == 0:
@@ -608,28 +704,22 @@ def _broadcast_state_from_rank0(
                     t = torch.zeros(1, dtype=dtype)
 
                 if t.device.type == "cpu":
-                    t = t.to(torch.device(f"npu:{dist.get_rank()}" if torch.npu.is_available() else f"cuda:{dist.get_rank()}"))
-                dist.broadcast(t, src=0)
+                    t = t.to(device)
+                dist.broadcast(t, src=src_rank, group=pg)
                 result["state"][fqn][key] = t.reshape(()).cpu() if cpu_offload else t.reshape(())
 
             else:
-                if is_rank0:
+                if is_root and fqn in optim_state_dict.get("state", {}):
                     src_tensor = optim_state_dict["state"][fqn][key]
                     if src_tensor.device.type == "cpu":
-                        device = torch.device(
-                            f"npu:{dist.get_rank()}" if torch.npu.is_available() else f"cuda:{dist.get_rank()}"
-                        )
                         src_tensor = src_tensor.to(device)
                 else:
-                    device = torch.device(
-                        f"npu:{dist.get_rank()}" if torch.npu.is_available() else f"cuda:{dist.get_rank()}"
-                    )
                     src_tensor = torch.zeros(shape, dtype=dtype, device=device)
 
-                dist.broadcast(src_tensor, src=0)
+                dist.broadcast(src_tensor, src=src_rank, group=pg)
 
                 if full_state_dict and cpu_offload:
-                    result["state"][fqn][key] = src_tensor.cpu() if is_rank0 else src_tensor
+                    result["state"][fqn][key] = src_tensor.cpu() if is_root else src_tensor
                 else:
                     result["state"][fqn][key] = src_tensor.cpu() if cpu_offload else src_tensor
 
