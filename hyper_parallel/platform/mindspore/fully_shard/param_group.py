@@ -270,13 +270,11 @@ class HSDPParamGroup:
         device: Optional[str] = None,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         enable_zero_copy_param_buffer: bool = False,
-        sharded_grad_reduce_dtype: Optional[ms.Type] = None,
     ):
         self.mesh_info = mesh_info
         self.device = device
         self.hsdp_params = hsdp_params
         self.enable_zero_copy_param_buffer = enable_zero_copy_param_buffer
-        self.sharded_grad_reduce_dtype = sharded_grad_reduce_dtype
         if isinstance(self.mesh_info, (FSDPMeshInfo, HSDPMeshInfo)):
             self.shard_rank = self.mesh_info.shard_mesh_rank
             self.shard_world_size = self.mesh_info.shard_mesh_size
@@ -299,7 +297,6 @@ class HSDPParamGroup:
         self._reduce_op = None
         self._reduce_hsdp_params = None
         self._defer_all_reduce = False
-        self._reduce_output_accumulation_dtype = None
         self._active_replicate_buckets: dict[int, ReplicateBucket] = {}
         self._active_param_flat_offsets: list[int] = []
         self._pending_all_reduce_handles: list[PendingBucketAllReduce] = []
@@ -637,15 +634,7 @@ class HSDPParamGroup:
             )
         grad_dtype = unsharded_grads[0].dtype
         world_size = self.shard_world_size
-        accumulation_dtype = self._reduce_dtype or grad_dtype
-        reduce_dtype = accumulation_dtype
-        if (
-            defer_all_reduce
-            and self.shard_group is not None
-            and world_size > 1
-            and self.sharded_grad_reduce_dtype is not None
-        ):
-            reduce_dtype = self.sharded_grad_reduce_dtype
+        reduce_dtype = self._reduce_dtype or grad_dtype
         device = _normalize_device(unsharded_grads[0].device)
         reduce_scatter_input = fuse_reduce_scatter_inputs(
             hsdp_params,
@@ -661,9 +650,6 @@ class HSDPParamGroup:
         self._reduce_op = reduce_scatter_reduce_op
         self._reduce_hsdp_params = hsdp_params
         self._defer_all_reduce = defer_all_reduce
-        self._reduce_output_accumulation_dtype = (
-            accumulation_dtype if reduce_dtype != accumulation_dtype else None
-        )
         self._active_param_flat_offsets = []
         flat_offset = 0
         for hsdp_param in hsdp_params:
@@ -774,10 +760,6 @@ class HSDPParamGroup:
         flat_grad_offset = 0
         if self._reduce_hsdp_params is None or self._reduce_output is None:
             return
-        if self._reduce_output_accumulation_dtype is not None:
-            self._reduce_output = self._reduce_output.to(
-                self._reduce_output_accumulation_dtype
-            )
         for hsdp_param in self._reduce_hsdp_params:
             shard_numel = _shape_numel(hsdp_param.sharded_size)
             new_sharded_grad = self._reduce_output.narrow(0, flat_grad_offset, shard_numel)
@@ -797,7 +779,6 @@ class HSDPParamGroup:
         self._reduce_scatter_handle = None
         self._reduce_hsdp_params = None
         self._defer_all_reduce = False
-        self._reduce_output_accumulation_dtype = None
         self._active_param_flat_offsets = []
         self._active_replicate_buckets = {}
         self._pending_all_reduce_handles = []

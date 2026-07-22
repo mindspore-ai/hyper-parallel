@@ -33,7 +33,6 @@ Precision strategy (DP=world_size vs single-card):
 # pylint: disable=wrong-import-position
 import copy
 import os
-from typing import Optional
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
@@ -90,10 +89,6 @@ def _wrap_with_fsdp(
     dp_mesh,
     *,
     sharded_accumulated_grad: bool = False,
-    sharded_grad_ready_overlap: bool = False,
-    comm_fusion: bool = False,
-    sharded_accumulated_grad_max_pending: int = 1,
-    sharded_grad_reduce_dtype: Optional[ms.Type] = None,
     per_layer_fsdp: bool = False,
 ) -> FullModel:
     """Apply per-layer + module-level fully_shard, with sum-reduce for exact grad parity."""
@@ -107,11 +102,7 @@ def _wrap_with_fsdp(
         "mesh": dp_mesh,
         "reshard_after_forward": False,
         "mp_policy": mp_policy,
-        "comm_fusion": comm_fusion,
         "sharded_accumulated_grad": sharded_accumulated_grad,
-        "sharded_grad_ready_overlap": sharded_grad_ready_overlap,
-        "sharded_accumulated_grad_max_pending": sharded_accumulated_grad_max_pending,
-        "sharded_grad_reduce_dtype": sharded_grad_reduce_dtype,
     }
     if per_layer_fsdp:
         for layer in model.layers:
@@ -241,11 +232,7 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
                                                 use_explicit_unshard: bool,
                                                 reshard_after_backward: bool,
                                                 sharded_accumulated_grad: bool = False,
-                                                sharded_grad_ready_overlap: bool = False,
                                                 use_hsdp_mesh: bool = False,
-                                                comm_fusion: bool = False,
-                                                sharded_accumulated_grad_max_pending: int = 1,
-                                                sharded_grad_reduce_dtype: Optional[ms.Type] = None,
                                                 grad_rtol: float = RTOL,
                                                 grad_atol: float = ATOL,
                                                 per_layer_fsdp: bool = False) -> None:
@@ -274,10 +261,6 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
         FullModel(copy.deepcopy(base_layers)),
         dp_mesh,
         sharded_accumulated_grad=sharded_accumulated_grad,
-        sharded_grad_ready_overlap=sharded_grad_ready_overlap,
-        comm_fusion=comm_fusion,
-        sharded_accumulated_grad_max_pending=sharded_accumulated_grad_max_pending,
-        sharded_grad_reduce_dtype=sharded_grad_reduce_dtype,
         per_layer_fsdp=per_layer_fsdp,
     )
     ref_model = FullModel(copy.deepcopy(base_layers))
@@ -319,10 +302,6 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
         f"num_microbatches={num_microbatches}, use_explicit_unshard={use_explicit_unshard}, "
         f"reshard_after_backward={reshard_after_backward}, "
         f"sharded_accumulated_grad={sharded_accumulated_grad}, "
-        f"sharded_grad_ready_overlap={sharded_grad_ready_overlap}, "
-        f"comm_fusion={comm_fusion}, "
-        f"sharded_accumulated_grad_max_pending={sharded_accumulated_grad_max_pending}, "
-        f"sharded_grad_reduce_dtype={sharded_grad_reduce_dtype}, "
         f"per_layer_fsdp={per_layer_fsdp}, "
         f"use_hsdp_mesh={use_hsdp_mesh}"
     )
@@ -368,50 +347,17 @@ def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad():
         reshard_after_backward=False,
         sharded_accumulated_grad=True,
         use_hsdp_mesh=True,
-        comm_fusion=True,
     )
 
 
-def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_ready():
-    """Fused HSDP grad-ready hooks should reduce each micro-batch exactly once."""
+def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_fixed_pending():
+    """Multiple FSDP states should keep the fixed one-RS window without losing gradients."""
     _assert_fully_shard_simu_pp_match_reference(
-        case_name="fully_shard_simu_pp_hsdp_sharded_accumulated_grad_ready",
-        num_microbatches=3,
-        use_explicit_unshard=False,
-        reshard_after_backward=False,
-        sharded_accumulated_grad=True,
-        sharded_grad_ready_overlap=True,
-        use_hsdp_mesh=True,
-        comm_fusion=True,
-    )
-
-
-def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_bf16_rs():
-    """BF16 micro-batch RS should retain FP32 local accumulation with bounded error."""
-    _assert_fully_shard_simu_pp_match_reference(
-        case_name="fully_shard_simu_pp_hsdp_sharded_accumulated_grad_bf16_rs",
+        case_name="fully_shard_simu_pp_hsdp_sharded_accumulated_grad_fixed_pending",
         num_microbatches=3,
         use_explicit_unshard=False,
         reshard_after_backward=False,
         sharded_accumulated_grad=True,
         use_hsdp_mesh=True,
-        comm_fusion=True,
-        sharded_grad_reduce_dtype=ms.bfloat16,
-        grad_rtol=2e-2,
-        grad_atol=2e-2,
-    )
-
-
-def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_pending_window():
-    """Multiple FSDP states should keep a bounded fused RS window without losing gradients."""
-    _assert_fully_shard_simu_pp_match_reference(
-        case_name="fully_shard_simu_pp_hsdp_sharded_accumulated_grad_pending_window",
-        num_microbatches=3,
-        use_explicit_unshard=False,
-        reshard_after_backward=False,
-        sharded_accumulated_grad=True,
-        use_hsdp_mesh=True,
-        comm_fusion=True,
-        sharded_accumulated_grad_max_pending=2,
         per_layer_fsdp=True,
     )

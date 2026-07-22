@@ -41,9 +41,6 @@ class HSDPConfigV2:
         comm_fusion=False,
         comm_fusion_zero_copy=False,
         sharded_accumulated_grad=False,
-        sharded_grad_ready_overlap=False,
-        sharded_accumulated_grad_max_pending=1,
-        sharded_grad_reduce_dtype=None,
     ):
         self.mesh = mesh
         self.reshard_after_forward = reshard_after_forward
@@ -56,9 +53,6 @@ class HSDPConfigV2:
         self.comm_fusion = comm_fusion
         self.comm_fusion_zero_copy = comm_fusion_zero_copy
         self.sharded_accumulated_grad = sharded_accumulated_grad
-        self.sharded_grad_ready_overlap = sharded_grad_ready_overlap
-        self.sharded_accumulated_grad_max_pending = sharded_accumulated_grad_max_pending
-        self.sharded_grad_reduce_dtype = sharded_grad_reduce_dtype
 
 
 class ShardedState(Enum):

@@ -69,15 +69,9 @@ def _make_state():
         comm_fusion=False,
         comm_fusion_zero_copy=False,
         sharded_accumulated_grad=False,
-        sharded_grad_ready_overlap=False,
-        sharded_accumulated_grad_max_pending=1,
-        sharded_grad_reduce_dtype=None,
     )
     state.comm_fusion = False
     state.sharded_accumulated_grad = False
-    state.sharded_grad_ready_overlap = False
-    state.sharded_accumulated_grad_max_pending = 1
-    state.sharded_grad_reduce_dtype = None
     state._pending_sharded_grad_all_reduce_groups = []
     state._param_group_grad_ready_expected = frozenset()
     state._param_group_grad_ready_params = set()
@@ -288,7 +282,6 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         """Grad-ready registration should include sharded and replicated trainable params."""
         state = _make_state()
         state.sharded_accumulated_grad = True
-        state.sharded_grad_ready_overlap = True
         state.comm_fusion = True
         state.param_group = MagicMock()
         sharded_param = _make_grad_ready_hsdp_param()
@@ -308,10 +301,9 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         replicated_param._register_internal_backward_hook.assert_called_once()
         frozen_param._register_internal_backward_hook.assert_not_called()
 
-    def test_register_param_group_grad_ready_hooks_is_disabled_by_default(self):
-        """Sharded accumulation should retain its after-backward trigger by default."""
+    def test_register_param_group_grad_ready_hooks_requires_sharded_accumulation(self):
+        """Grad-ready registration should remain disabled without the feature switch."""
         state = _make_state()
-        state.sharded_accumulated_grad = True
         state.comm_fusion = True
         state.param_group = MagicMock()
         hsdp_param = _make_grad_ready_hsdp_param()
@@ -361,7 +353,6 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         """Ready hooks should materialize stable full grads before communication."""
         state = _make_state()
         state.sharded_accumulated_grad = True
-        state.sharded_grad_reduce_dtype = ms.bfloat16
         state.reduce_grads = False
         hsdp_param = _make_grad_ready_hsdp_param()
         hsdp_param.reduce_dtype = ms.float32
@@ -439,11 +430,10 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         second_param.to_accumulated_grad_if_needed.assert_called_once_with()
         state._reduce_pending_grads.assert_called_once_with()
 
-    def test_fused_sharded_accumulation_keeps_bounded_pending_rs_window(self):
-        """Feature fused RS should retain only the configured number of oldest-safe work items."""
+    def test_fused_sharded_accumulation_keeps_one_pending_rs(self):
+        """Feature fused RS should retain one pending work item across pipeline actions."""
         state = _make_state()
         state.sharded_accumulated_grad = True
-        state.sharded_accumulated_grad_max_pending = 2
         state.reduce_grads = False
         state.comm_fusion = True
         state.reduce_params = MagicMock()
@@ -465,21 +455,20 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             state.post_backward_for_comm_fusion()
 
         first_group.wait_deferred_reduce_scatter_and_apply_grad.assert_called_once_with()
-        second_group.wait_deferred_reduce_scatter_and_apply_grad.assert_not_called()
+        second_group.wait_deferred_reduce_scatter_and_apply_grad.assert_called_once_with()
         third_group.foreach_reduce.assert_called_once_with(
             reduce_scatter_reduce_op=ops.ReduceOp.SUM,
             defer_all_reduce=True,
         )
         self.assertEqual(
             MindSporeHSDPStateV2.pending_sharded_grad_param_groups,
-            [second_group, third_group],
+            [third_group],
         )
 
     def test_fused_sharded_accumulation_drains_same_group_before_reuse(self):
         """A state should wait its previous RS only when that state is reused."""
         state = _make_state()
         state.sharded_accumulated_grad = True
-        state.sharded_accumulated_grad_max_pending = 4
         state.reduce_grads = False
         state.comm_fusion = True
         state.reduce_params = MagicMock()
@@ -615,44 +604,6 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
 
         HSDPState.pre_reduce_scatter_params.clear()
         hsdp_param.reduce_scatter_grad.reset_mock()
-        state.sharded_grad_reduce_dtype = ms.bfloat16
-
-        state._issue_reduce_scatter_for_current_module()
-
-        hsdp_param.reduce_scatter_grad.assert_called_once_with(
-            async_op=True,
-            dtype=ms.bfloat16,
-            reduce_op=ops.ReduceOp.SUM,
-            release_unsharded_grad=True,
-        )
-        self.assertEqual(
-            HSDPState.pre_reduce_scatter_params,
-            [(hsdp_param, ms.float32, True, ms.float32)],
-        )
-
-    def test_low_precision_nonfusion_reduce_scatter_applies_fp32_shard(self):
-        """The non-fused deferred path should restore the normal accumulation dtype."""
-        state = _make_state()
-        reduced_grad = ms.Tensor(np.ones((2,), dtype=np.float16))
-        hsdp_param = SimpleNamespace(
-            reduce_scatter_output=MagicMock(return_value=reduced_grad),
-            clear_reduce_scatter_output=MagicMock(),
-            apply_reduced_grad=MagicMock(return_value=False),
-            clear_released_unsharded_grad=MagicMock(),
-            accumulated_allreduced_grad=True,
-        )
-        HSDPState.pre_reduce_scatter_params.append(
-            (hsdp_param, ms.float32, True, ms.float32)
-        )
-
-        state._drain_reduce_scatter_params()
-
-        applied_grad = hsdp_param.apply_reduced_grad.call_args.args[0]
-        self.assertEqual(applied_grad.dtype, ms.float32)
-        self.assertFalse(
-            hsdp_param.apply_reduced_grad.call_args.kwargs["clear_unsharded_grad"]
-        )
-        hsdp_param.clear_released_unsharded_grad.assert_called_once_with()
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.state.AllReduceParamGroup")
     def test_finalize_sharded_accumulation_fuses_local_shards(self, mock_group_ctor):
@@ -1010,7 +961,6 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             state.device,
             state.mp_policy,
             state.config.comm_fusion_zero_copy,
-            state.sharded_grad_reduce_dtype,
         )
         self.assertEqual(state.param_group, "param-group")
 

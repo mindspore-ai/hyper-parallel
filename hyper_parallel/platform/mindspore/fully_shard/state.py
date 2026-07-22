@@ -37,6 +37,8 @@ from hyper_parallel.platform.mindspore.fully_shard.param_group import (
 from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 
+_SHARDED_GRAD_MAX_PENDING = 1
+
 
 def _to_dtype_if_needed(
     tensor: ms.Tensor, dtype: Optional[ms.Type]
@@ -62,8 +64,9 @@ class MindSporeHSDPStateV2(HSDPState):
     # Reserved for HSDP fused all-reduce pipeline (phase-2); kept for API parity with Torch.
     pre_all_reduce_groups: List = []
     pending_all_reduce_groups: List = []
-    # Feature-only fused reduce-scatter groups. Each entry owns its handle and
-    # packed input, so several states can remain pending across pipeline work.
+    # Feature-only fused reduce-scatter groups. The internal pending window is
+    # fixed to one so the next group's backward compute can overlap the oldest
+    # communication without retaining multiple full communication inputs.
     pending_sharded_grad_param_groups: List[HSDPParamGroup] = []
 
     @staticmethod
@@ -117,15 +120,6 @@ class MindSporeHSDPStateV2(HSDPState):
         super().__init__(cell, mesh_info, config, platform, device)
         self.comm_fusion = config.comm_fusion
         self.sharded_accumulated_grad = getattr(config, "sharded_accumulated_grad", False)
-        self.sharded_grad_ready_overlap = getattr(
-            config, "sharded_grad_ready_overlap", False
-        )
-        self.sharded_accumulated_grad_max_pending = getattr(
-            config, "sharded_accumulated_grad_max_pending", 1
-        )
-        self.sharded_grad_reduce_dtype = getattr(
-            config, "sharded_grad_reduce_dtype", None
-        )
         self._pending_sharded_grad_all_reduce_groups = []
         self._param_group_grad_ready_expected = frozenset()
         self._param_group_grad_ready_params = set()
@@ -212,14 +206,12 @@ class MindSporeHSDPStateV2(HSDPState):
                     self.device,
                     self.mp_policy,
                     self.config.comm_fusion_zero_copy,
-                    self.sharded_grad_reduce_dtype,
                 )
 
     def _register_param_group_grad_ready_hooks(self) -> None:
         """Register one internal gradient-ready hook per trainable managed parameter."""
         if (
             not self.sharded_accumulated_grad
-            or not self.sharded_grad_ready_overlap
             or not self.comm_fusion
             or self.param_group is None
         ):
@@ -475,10 +467,6 @@ class MindSporeHSDPStateV2(HSDPState):
             reduced_grad = hsdp_param.reduce_scatter_output()
             hsdp_param.clear_reduce_scatter_output()
             if defer_all_reduce:
-                accumulation_dtype = pending[3] if len(pending) > 3 else None
-                reduced_grad = _to_dtype_if_needed(
-                    reduced_grad, accumulation_dtype
-                )
                 apply_need_synchronize = hsdp_param.apply_reduced_grad(
                     reduced_grad,
                     pre_orig_dtype,
@@ -608,20 +596,15 @@ class MindSporeHSDPStateV2(HSDPState):
                     hsdp_param.reduce_dtype
                     or self._get_pending_unsharded_grad(hsdp_param).dtype
                 )
-                reduce_dtype = accumulation_dtype
-                if defer_all_reduce and self.sharded_grad_reduce_dtype is not None:
-                    reduce_dtype = self.sharded_grad_reduce_dtype
                 hsdp_param.reduce_scatter_grad(
                     async_op=True,
-                    dtype=reduce_dtype,
+                    dtype=accumulation_dtype,
                     reduce_op=self._resolve_reduce_op(),
                     release_unsharded_grad=defer_all_reduce,
                 )
                 pending_param = (hsdp_param, hsdp_param.orig_dtype)
                 if defer_all_reduce:
                     pending_param += (True,)
-                    if reduce_dtype != accumulation_dtype:
-                        pending_param += (accumulation_dtype,)
                 HSDPState.pre_reduce_scatter_params.append(pending_param)
 
         for key, hsdp_params in groups_by_comm.items():
@@ -690,7 +673,7 @@ class MindSporeHSDPStateV2(HSDPState):
                     self.param_group
                 )
                 self._drain_pending_sharded_grad_param_groups(
-                    self.sharded_accumulated_grad_max_pending
+                    _SHARDED_GRAD_MAX_PENDING
                 )
         self._queue_replicate_params_allreduce()
 

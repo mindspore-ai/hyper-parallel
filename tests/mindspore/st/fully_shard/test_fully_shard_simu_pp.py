@@ -40,17 +40,9 @@ def test_fully_shard_simu_pp_suite():
                       worker_num=4, local_worker_num=4),
         MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad",
                       worker_num=4, local_worker_num=4),
-        MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_ready",
-                      worker_num=4, local_worker_num=4),
         MindSporeCase(
             _TEST_FILE,
-            "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_bf16_rs",
-            worker_num=4,
-            local_worker_num=4,
-        ),
-        MindSporeCase(
-            _TEST_FILE,
-            "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_pending_window",
+            "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_fixed_pending",
             worker_num=4,
             local_worker_num=4,
         ),

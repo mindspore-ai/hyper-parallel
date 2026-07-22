@@ -78,7 +78,6 @@ def _new_param_group():
     group.mesh_info = _mesh_info(FSDPMeshInfo)
     group.device = "Ascend:0"
     group.enable_zero_copy_param_buffer = False
-    group.sharded_grad_reduce_dtype = None
     group.shard_rank = 0
     group.shard_world_size = 2
     group.shard_group = "shard-group"
@@ -93,7 +92,6 @@ def _new_param_group():
     group._reduce_op = None
     group._reduce_hsdp_params = None
     group._defer_all_reduce = False
-    group._reduce_output_accumulation_dtype = None
     group._active_replicate_buckets = {}
     group._active_param_flat_offsets = []
     group._pending_all_reduce_handles = []
@@ -574,30 +572,6 @@ class TestMindSporeParamGroup(unittest.TestCase):
         self.assertIsNone(group._reduce_scatter_handle)
         self.assertFalse(group._defer_all_reduce)
 
-    @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.dist.reduce_scatter_tensor")
-    def test_deferred_reduce_scatter_uses_low_precision_comm_and_fp32_accumulation(
-        self, mock_reduce_scatter
-    ):
-        """Deferred RS may communicate in BF16 but must apply an FP32 local shard."""
-        group = _new_param_group()
-        group.sharded_grad_reduce_dtype = ms.bfloat16
-        hsdp_param = _fake_hsdp_param(shard_size=(2,))
-        hsdp_param._unsharded_param = SimpleNamespace(grad="grad")
-        group.hsdp_params = [hsdp_param]
-        handle = MagicMock()
-        mock_reduce_scatter.return_value = handle
-
-        HSDPParamGroup.foreach_reduce(group, defer_all_reduce=True)
-
-        reduce_scatter_call = mock_reduce_scatter.call_args
-        self.assertEqual(reduce_scatter_call.kwargs["input"].dtype, ms.bfloat16)
-        self.assertEqual(reduce_scatter_call.kwargs["output"].dtype, ms.bfloat16)
-
-        HSDPParamGroup.wait_deferred_reduce_scatter_and_apply_grad(group)
-
-        reduced_grad = hsdp_param.apply_reduced_grad.call_args.args[0]
-        self.assertEqual(reduced_grad.dtype, ms.float32)
-        self.assertIsNone(group._reduce_output_accumulation_dtype)
 
     def test_foreach_reduce_rejects_reuse_while_deferred_work_is_pending(self):
         """A state-owned fused group must finish before another micro reuses its buffers."""

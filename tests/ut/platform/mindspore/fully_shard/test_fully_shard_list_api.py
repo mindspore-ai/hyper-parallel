@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for fully_shard list support on MindSpore platform (no NPU required)."""
+import inspect
 import os
 import unittest
 from types import SimpleNamespace
@@ -376,59 +377,8 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must be bool"):
             fully_shard(cell, mesh=mesh, sharded_accumulated_grad=1)
-        with self.assertRaisesRegex(ValueError, "must be bool"):
-            fully_shard(cell, mesh=mesh, sharded_grad_ready_overlap=1)
         with self.assertRaisesRegex(ValueError, "explicit FSDP/HSDP mesh"):
             fully_shard(cell, sharded_accumulated_grad=True)
-        with self.assertRaisesRegex(ValueError, "requires sharded_accumulated_grad"):
-            fully_shard(
-                cell,
-                mesh=mesh,
-                comm_fusion=True,
-                sharded_grad_ready_overlap=True,
-            )
-        with self.assertRaisesRegex(ValueError, "requires comm_fusion"):
-            fully_shard(
-                cell,
-                mesh=mesh,
-                sharded_accumulated_grad=True,
-                sharded_grad_ready_overlap=True,
-            )
-        with self.assertRaisesRegex(ValueError, "positive integer"):
-            fully_shard(
-                cell,
-                mesh=mesh,
-                comm_fusion=True,
-                sharded_accumulated_grad=True,
-                sharded_accumulated_grad_max_pending=0,
-            )
-        with self.assertRaisesRegex(ValueError, "requires sharded_accumulated_grad"):
-            fully_shard(
-                cell,
-                mesh=mesh,
-                comm_fusion=True,
-                sharded_accumulated_grad_max_pending=2,
-            )
-        with self.assertRaisesRegex(ValueError, "requires comm_fusion"):
-            fully_shard(
-                cell,
-                mesh=mesh,
-                sharded_accumulated_grad=True,
-                sharded_accumulated_grad_max_pending=2,
-            )
-        with self.assertRaisesRegex(ValueError, "requires sharded_accumulated_grad"):
-            fully_shard(
-                cell,
-                mesh=mesh,
-                sharded_grad_reduce_dtype=ms.bfloat16,
-            )
-        with self.assertRaisesRegex(ValueError, "must be mindspore.dtype"):
-            fully_shard(
-                cell,
-                mesh=mesh,
-                sharded_accumulated_grad=True,
-                sharded_grad_reduce_dtype="bfloat16",
-            )
         with self.assertRaisesRegex(ValueError, "CPU gradient offload"):
             fully_shard(
                 cell,
@@ -437,19 +387,26 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
                 sharded_accumulated_grad=True,
             )
 
+    def test_sharded_accumulated_grad_is_the_only_public_feature_switch(self):
+        """The public fully_shard API should expose one sharded-accumulation switch."""
+        parameters = inspect.signature(fully_shard).parameters
+
+        self.assertIn("sharded_accumulated_grad", parameters)
+        self.assertNotIn("sharded_grad_ready_overlap", parameters)
+        self.assertNotIn("sharded_accumulated_grad_max_pending", parameters)
+        self.assertNotIn("sharded_grad_reduce_dtype", parameters)
+
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_sharded_accumulated_grad_reaches_scheduler(self, mock_platform, mock_get_device):
-        """fully_shard should forward the opt-in flag to HSDP scheduler setup."""
+    def test_sharded_accumulated_grad_enables_fused_scheduler(self, mock_platform, mock_get_device):
+        """The single opt-in flag should enable fusion and reach scheduler setup."""
         mock_platform.platform_type = PlatformType.MINDSPORE
         mock_get_device.return_value = "npu"
         captured = {}
 
         def _fake_hsdp_init(self, *args, **kwargs):
-            captured["sharded_accumulated_grad"] = args[-4]
-            captured["sharded_grad_ready_overlap"] = args[-3]
-            captured["sharded_accumulated_grad_max_pending"] = args[-2]
-            captured["sharded_grad_reduce_dtype"] = args[-1]
+            captured["comm_fusion"] = args[-3]
+            captured["sharded_accumulated_grad"] = args[-1]
             self.hsdp_scheduler = object()
 
         with patch(
@@ -460,17 +417,11 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
                 ms_nn.Dense(4, 4),
                 mesh=self._create_mock_mesh(),
                 mp_policy=_default_mp_policy(),
-                comm_fusion=True,
                 sharded_accumulated_grad=True,
-                sharded_grad_ready_overlap=True,
-                sharded_accumulated_grad_max_pending=4,
-                sharded_grad_reduce_dtype=ms.bfloat16,
             )
 
+        self.assertTrue(captured["comm_fusion"])
         self.assertTrue(captured["sharded_accumulated_grad"])
-        self.assertTrue(captured["sharded_grad_ready_overlap"])
-        self.assertEqual(captured["sharded_accumulated_grad_max_pending"], 4)
-        self.assertEqual(captured["sharded_grad_reduce_dtype"], ms.bfloat16)
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
