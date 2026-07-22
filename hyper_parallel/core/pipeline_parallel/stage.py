@@ -392,15 +392,12 @@ class PipelineStage(PipelineStageBase):
         """Execute the forward recv operation."""
         return [platform.irecv(tensor, rank) for _, tensor, rank in self.fwd_recv_specs(micro_index)]
 
-    def _construct_backward_recv_info(self, micro_index, idx, global_rank, tensor_send):
-        """construct backward recv info."""
+    def _construct_backward_recv_info(self, micro_index, idx, global_rank):
+        """Reserve backward recv bookkeeping without allocating its device buffer."""
         if micro_index not in self.grad_recv_info:
-            shape = tensor_send.shape if not isinstance(tensor_send, DTensor) else tensor_send.local_shape
-            buffer = platform.empty(shape, dtype=tensor_send.dtype, device=self.device)
-            return _RecvInfo(global_rank, buffer)
+            return _RecvInfo(global_rank)
         recv_info = self.grad_recv_info[micro_index][idx]
-        shape = tensor_send.shape if not isinstance(tensor_send, DTensor) else tensor_send.local_shape
-        recv_info.buffer = platform.empty(shape, dtype=tensor_send.dtype, device=self.device)
+        recv_info.buffer = None
         return None
 
     def _extract_meta_from_tensor(self, tensor):
@@ -431,7 +428,7 @@ class PipelineStage(PipelineStageBase):
         while this side waits for fewer, and the irecv count would
         diverge.  ``bwd_idx`` tracks the position **within
         ``grad_recv_info[micro_index]``** (which skips non-grad outputs),
-        so the buffer-reuse path in ``_construct_backward_recv_info``
+        so the recv-info reuse path in ``_construct_backward_recv_info``
         keeps aligned across micro-batches.
 
         The full output meta list is also stashed in ``_fwd_output_meta``
@@ -461,7 +458,7 @@ class PipelineStage(PipelineStageBase):
         bwd_idx = 0
         for idx, cur_out in enumerate(out):
             if self._has_backward and bool(getattr(cur_out, "requires_grad", False)):
-                recv_info = self._construct_backward_recv_info(micro_index, bwd_idx, global_rank, cur_out)
+                recv_info = self._construct_backward_recv_info(micro_index, bwd_idx, global_rank)
                 if recv_info is not None:
                     bwd_recv_infos.append(recv_info)
                 bwd_idx += 1
@@ -470,16 +467,27 @@ class PipelineStage(PipelineStageBase):
             self.grad_recv_info[micro_index] = bwd_recv_infos
         return specs
 
-    def bwd_recv_specs(self, micro_index):
+    def bwd_recv_specs(self, micro_index: int) -> list[tuple[str, object, int]]:
         """Prepare backward-recv (grad) buffers without launching.
 
+        Device buffers are allocated here, immediately before the scheduler
+        posts the receive, instead of remaining resident from forward-send
+        time. Repeated specs construction reuses an existing buffer.
+
         Returns ``(op_type, tensor, peer_global_rank)`` tuples (all
-        ``"irecv"``).  Empty when no grad is expected for ``micro_index``
+        ``"irecv"``). Empty when no grad is expected for ``micro_index``
         (e.g. its forward output had ``requires_grad=False``).
         """
-        if micro_index not in self.grad_recv_info:
+        recv_infos = self.grad_recv_info.get(micro_index)
+        if not recv_infos:
             return []
-        return [("irecv", info.buffer, info.global_rank) for info in self.grad_recv_info[micro_index]]
+        grad_metas = [meta for meta in self._fwd_output_meta[micro_index] if bool(meta[-1])]
+        specs = []
+        for recv_info, meta in zip(recv_infos, grad_metas):
+            if recv_info.buffer is None:
+                recv_info.buffer = platform.empty(meta[0], dtype=meta[1], device=self.device)
+            specs.append(("irecv", recv_info.buffer, recv_info.global_rank))
+        return specs
 
     def exec_bwd_recv_ops(self, micro_index):
         """Execute the backward recv operation."""
