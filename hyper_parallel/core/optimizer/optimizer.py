@@ -194,7 +194,6 @@ class ChainedOptimizer:
         parameters. This method first broadcasts state to all replicate-group peers,
         then converts DTensor values to local CPU tensors for serialization.
         """
-        # Ensure all ranks have consistent optimizer state before snapshotting
         for opt in self.chained_optimizers:
             if hasattr(opt, "_broadcast_state_fused_for_ckpt"):
                 opt._broadcast_state_fused_for_ckpt()  # pylint: disable=protected-access

@@ -32,7 +32,8 @@ __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDP
            "ColwiseParallel", "MC2ColwiseParallel", "MC2RowwiseParallel", "MC2Linear",
            "NoParallel", "RowwiseParallel", "SequenceParallel",
            "PrepareModuleInput", "PrepareModuleInputOutput", "PrepareModuleOutput",
-           "ParallelStyle", "parallelize_module", "manual_seed"]
+           "ParallelStyle", "parallelize_module", "manual_seed",
+           "get_optim_state_dict", "set_optim_state_dict"]
 
 from importlib import import_module as _import_module  # pylint: disable=invalid-name
 
@@ -89,6 +90,7 @@ from hyper_parallel.core.tensor_parallel import (
 )
 from hyper_parallel.core.dtensor.random import manual_seed
 from hyper_parallel.core.fully_shard.api import fully_shard, hsdp_sync_stream, HSDPModule
+from hyper_parallel.core.distributed_checkpoint.state_dict import get_optim_state_dict, set_optim_state_dict
 
 get_current_mesh = _mesh_resources.get_current_mesh
 

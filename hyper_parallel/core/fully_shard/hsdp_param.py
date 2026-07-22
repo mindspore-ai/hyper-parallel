@@ -14,6 +14,8 @@
 # ============================================================================
 """HSDP parameter"""
 
+from __future__ import annotations
+
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
