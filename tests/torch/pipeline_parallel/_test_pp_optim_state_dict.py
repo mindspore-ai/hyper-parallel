@@ -577,17 +577,15 @@ def test_p6_pp_hsdp_dcp_save_load_nested():
     _cleanup_ckpt(_CKPT_DIR_NESTED)
 
     # Save each stage's optimizer state dict with no_dist=True.
-    # Use per-(pp_rank, virtual_stage) paths to avoid conflicts across
-    # PP ranks that own different virtual stages.
+    # Different PP ranks own different stages with different FQNs,
+    # and each HSDP rank within a PP stage holds its own local shard.
+    # no_dist=True lets each rank save independently without collective ops.
     virtual_stage_indices = _owned_virtual_stages(pp_rank)
     for local_idx, (stage, optimizer) in enumerate(zip(stages, stage_optimizers)):
         optim_sd = get_optim_state_dict(stage, optimizer)
         v_stage = virtual_stage_indices[local_idx]
         ckpt_path = os.path.join(_CKPT_DIR_NESTED, f"pp{pp_rank}_vstage{v_stage}")
         save(optim_sd, checkpoint_id=ckpt_path, no_dist=True)
-
-    # Ensure all ranks finish saving before any starts loading
-    dist.barrier()
 
     # Build fresh model+optimizers
     stages2, pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (

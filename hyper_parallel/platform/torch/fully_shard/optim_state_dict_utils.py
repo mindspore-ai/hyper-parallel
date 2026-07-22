@@ -741,7 +741,11 @@ def _build_optim_state_dict_load_template(
     cpu_offload = getattr(options, "cpu_offload", False)
     flatten = getattr(options, "flatten_optimizer_state_dict", False)
 
-    metadata = storage_reader.load_metadata()
+    try:
+        metadata = storage_reader.load_metadata()
+    except FileNotFoundError:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        metadata = storage_reader.load_metadata(rank=rank)
 
     param_by_fqn: Dict[str, nn.Parameter] = {}
     for name, param in model.named_parameters():
