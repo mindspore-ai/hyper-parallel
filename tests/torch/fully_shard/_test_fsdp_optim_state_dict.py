@@ -421,6 +421,10 @@ def test_f8_fsdp_local_shape_correctness():
                 continue
             if key == "step":
                 continue
+            assert not isinstance(value, DTensor), (
+                f"state.{fqn}.{key}: expected plain Tensor with SkipDTensorDispatch, "
+                f"got DTensor"
+            )
             assert value.shape[0] == HIDDEN // 4, (
                 f"state.{fqn}.{key}: expected local dim0={HIDDEN // 4}, "
                 f"got {value.shape[0]}"

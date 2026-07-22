@@ -97,3 +97,31 @@ def test_optim_state_dict_group5():
     parallel_run([
         TorchCase(_TEST_OPTIM_SD, "test_o8_dcp_load_new_optimizer", 12419, 4),
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_optim_state_dict_group6():
+    """
+    Feature: DCP load into trained optimizer (plan section 10 flow)
+    Description:
+        1.test_o11_dcp_load_trained_optimizer
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_OPTIM_SD, "test_o11_dcp_load_trained_optimizer", 12420, 4),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_optim_state_dict_group7():
+    """
+    Feature: DCP save/load with {"optimizer": ...} wrapper format
+    Description:
+        1.test_o12_dcp_save_load_wrapped
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_OPTIM_SD, "test_o12_dcp_save_load_wrapped", 12421, 4),
+    ])

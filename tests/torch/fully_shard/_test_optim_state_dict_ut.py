@@ -323,3 +323,141 @@ def test_u8_chained_optimizer_rejection():
 
     with pytest.raises(ValueError, match="ChainedOptimizer"):
         set_optim_state_dict(model, fake_optimizer, {"state": {}, "param_groups": []})
+
+
+# =====================================================================
+# U9: unflatten strict=True raises on inconsistent param_group fields
+# =====================================================================
+def test_u9_unflatten_strict_true_inconsistent_fields():
+    """strict=True in _unflatten_optim_state_dict raises ValueError when
+    param_group fields are inconsistent within the same group."""
+    model = _SimpleNet()
+
+    flat_dict = {
+        "state.linear1.weight.step": torch.tensor(1.0),
+        "state.linear1.bias.step": torch.tensor(1.0),
+        "state.linear2.weight.step": torch.tensor(1.0),
+        "state.linear2.bias.step": torch.tensor(1.0),
+        "param_group.linear1.weight.lr": 0.01,
+        "param_group.linear1.bias.lr": 0.01,
+        "param_group.linear2.weight.lr": 0.001,
+        "param_group.linear2.bias.lr": 0.001,
+    }
+
+    with pytest.raises(ValueError, match="strict=True.*inconsistent"):
+        _unflatten_optim_state_dict(flat_dict, model, strict=True)
+
+
+# =====================================================================
+# U10: unflatten strict=False keeps existing group value + warns
+# =====================================================================
+def test_u10_unflatten_strict_false_inconsistent_fields():
+    """strict=False in _unflatten_optim_state_dict keeps existing group
+    values and logs a warning when param_group fields are inconsistent."""
+    model = _SimpleNet()
+
+    flat_dict = {
+        "state.linear1.weight.step": torch.tensor(1.0),
+        "state.linear1.bias.step": torch.tensor(1.0),
+        "state.linear2.weight.step": torch.tensor(2.0),
+        "state.linear2.bias.step": torch.tensor(2.0),
+        "param_group.linear1.weight.lr": 0.01,
+        "param_group.linear1.bias.lr": 0.01,
+        "param_group.linear2.weight.lr": 0.001,
+        "param_group.linear2.bias.lr": 0.001,
+    }
+
+    import logging
+
+    class _LogCapture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _LogCapture()
+    logger = logging.getLogger(
+        "hyper_parallel.platform.torch.fully_shard.optim_state_dict_utils"
+    )
+    logger.addHandler(handler)
+    original_level = logger.level
+    logger.setLevel(logging.WARNING)
+
+    try:
+        result = _unflatten_optim_state_dict(flat_dict, model, strict=False)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(original_level)
+
+    assert len(result["param_groups"]) == 1, (
+        f"strict=False should keep a single group, got {len(result['param_groups'])}"
+    )
+    assert result["param_groups"][0]["lr"] == 0.01, (
+        "strict=False should keep existing group value (0.01), "
+        f"got {result['param_groups'][0]['lr']}"
+    )
+    assert len(result["param_groups"][0]["params"]) == 4, (
+        "All FQNs should be in the single group"
+    )
+
+    warning_messages = [
+        r.getMessage() for r in handler.records if "inconsistent" in r.getMessage()
+    ]
+    assert len(warning_messages) > 0, (
+        "strict=False should log a warning for inconsistent fields"
+    )
+
+
+# =====================================================================
+# U11: set_optim_state_dict restores param_groups fields from checkpoint
+# =====================================================================
+def test_u11_set_restores_param_groups_fields():
+    """set_optim_state_dict restores lr, betas, weight_decay, initial_lr
+    from the checkpoint's param_groups, not just the state tensors."""
+    model = _SimpleNet()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+    x = torch.randn(2, 8)
+    _train_step(model, optimizer, x)
+    _train_step(model, optimizer, x)
+    scheduler.step()
+
+    sd = get_optim_state_dict(model, optimizer)
+
+    source_lr = sd["param_groups"][0]["lr"]
+    source_initial_lr = sd["param_groups"][0]["initial_lr"]
+    source_weight_decay = sd["param_groups"][0]["weight_decay"]
+    assert source_initial_lr == 0.01
+
+    model2 = _SimpleNet()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.5, weight_decay=0.0)
+    _train_step(model2, optimizer2, x)
+
+    assert optimizer2.param_groups[0]["lr"] == 0.5, (
+        "target optimizer lr should be 0.5 before set"
+    )
+    assert optimizer2.param_groups[0]["weight_decay"] == 0.0, (
+        "target optimizer weight_decay should be 0.0 before set"
+    )
+
+    set_optim_state_dict(model2, optimizer2, sd)
+
+    assert optimizer2.param_groups[0]["lr"] == source_lr, (
+        f"set should restore lr from checkpoint: expected {source_lr}, "
+        f"got {optimizer2.param_groups[0]['lr']}"
+    )
+    assert optimizer2.param_groups[0]["initial_lr"] == source_initial_lr, (
+        f"set should restore initial_lr from checkpoint: expected {source_initial_lr}, "
+        f"got {optimizer2.param_groups[0]['initial_lr']}"
+    )
+    assert optimizer2.param_groups[0]["weight_decay"] == source_weight_decay, (
+        f"set should restore weight_decay from checkpoint: expected {source_weight_decay}, "
+        f"got {optimizer2.param_groups[0]['weight_decay']}"
+    )
+    assert optimizer2.param_groups[0]["betas"] == sd["param_groups"][0]["betas"], (
+        "set should restore betas from checkpoint"
+    )
+
+    _train_step(model2, optimizer2, x)

@@ -539,8 +539,10 @@ def test_p5_pp_hsdp_local_shape_correctness():
                     continue
                 if key == "step":
                     continue
-                # Check local shard shape: linear weight is (out_features, in_features)
-                # sharded on dim-0 by fsdp_size=2, so dim0 = out_features // fsdp_size
+                assert not isinstance(value, DTensor), (
+                    f"state.{fqn}.{key}: expected plain Tensor with SkipDTensorDispatch, "
+                    f"got DTensor"
+                )
                 expected_dim0 = _D_HID // _FSDP_SIZE
                 assert value.shape[0] == expected_dim0, (
                     f"state.{fqn}.{key}: expected local dim0={expected_dim0}, "

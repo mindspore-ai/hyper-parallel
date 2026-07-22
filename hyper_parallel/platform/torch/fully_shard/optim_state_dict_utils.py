@@ -299,7 +299,7 @@ def set_optim_state_dict(
     is_rank0 = (not dist.is_initialized()) or (dist.get_rank() == 0)
 
     if flatten:
-        optim_state_dict = _unflatten_optim_state_dict(optim_state_dict, model)
+        optim_state_dict = _unflatten_optim_state_dict(optim_state_dict, model, strict=strict)
 
     if full_state_dict and cpu_offload and not is_rank0:
         if not broadcast_from_rank0:
@@ -385,6 +385,32 @@ def set_optim_state_dict(
 
     target_raw_sd["state"] = new_state
 
+    source_param_groups = optim_state_dict.get("param_groups", [])
+    if source_param_groups:
+        target_saved_id_to_fqn = {v: k for k, v in target_fqn_to_saved_id.items()}
+
+        target_pg_by_fqns: Dict[frozenset, Dict[str, Any]] = {}
+        for saved_group in target_raw_sd["param_groups"]:
+            fqns_in_group = frozenset(
+                target_saved_id_to_fqn.get(sid, "")
+                for sid in saved_group.get("params", [])
+            )
+            target_pg_by_fqns[fqns_in_group] = saved_group
+
+        for source_pg in source_param_groups:
+            source_fqn_set = frozenset(source_pg.get("params", []))
+            matched_target_pg = None
+            for target_fqn_set, target_pg in target_pg_by_fqns.items():
+                if source_fqn_set & target_fqn_set:
+                    matched_target_pg = target_pg
+                    break
+            if matched_target_pg is None:
+                continue
+            for k, v in source_pg.items():
+                if k == "params":
+                    continue
+                matched_target_pg[k] = v
+
     optimizer.load_state_dict(target_raw_sd)
 
 
@@ -432,6 +458,16 @@ def _convert_input_tensor_to_target(
     target_device = param.to_local().device
 
     from hyper_parallel.core.dtensor.dtensor import distribute_tensor  # pylint: disable=C0415
+
+    if isinstance(tensor, DTensor):
+        if tensor.device_mesh == mesh and tensor.placements == placements:
+            if stores_dtensor:
+                return tensor
+            return tensor.to_local()
+        redistributed = tensor.redistribute(mesh, placements)
+        if stores_dtensor:
+            return redistributed
+        return redistributed.to_local()
 
     if full_state_dict:
         if cpu_offload:
@@ -630,11 +666,22 @@ def _flatten_optim_state_dict(
 def _unflatten_optim_state_dict(
     flat_dict: Dict[str, Any],
     model: nn.Module,
+    strict: bool = True,
 ) -> Dict[str, Any]:
     """Unflatten a flat state dict back to nested format.
 
     Uses longest-prefix matching against model FQNs to handle FQNs
     containing dots.
+
+    Args:
+        flat_dict: The flattened state dict.
+        model: The model whose FQNs are used for prefix matching.
+        strict: If True, raise ValueError when param_group fields are
+            inconsistent within the same group. If False, keep the
+            current group's values and log a warning.
+
+    Returns:
+        The nested state dict with FQN keys.
     """
     known_fqns = [name for name, _ in model.named_parameters()]
     known_fqns_sorted = sorted(known_fqns, key=len, reverse=True)
@@ -673,7 +720,26 @@ def _unflatten_optim_state_dict(
 
     param_groups: List[Dict[str, Any]] = []
     current_group: Dict[str, Any] = {"params": []}
-    seen_fqns_in_group: set = set()
+
+    def _check_inconsistent_fields(
+        existing: Dict[str, Any], incoming: Dict[str, Any], fqn: str,
+    ) -> None:
+        common_keys = set(existing.keys()) & set(incoming.keys())
+        for k in common_keys:
+            if existing[k] != incoming[k]:
+                if strict:
+                    raise ValueError(
+                        f"strict=True but param_group field '{k}' is "
+                        f"inconsistent within the same group: "
+                        f"existing={existing[k]!r}, "
+                        f"incoming(from {fqn})={incoming[k]!r}"
+                    )
+                logger.warning(
+                    "param_group field '%s' is inconsistent within the "
+                    "same group: existing=%r, incoming(from %s)=%r. "
+                    "Keeping existing value (strict=False).",
+                    k, existing[k], fqn, incoming[k],
+                )
 
     for fqn in known_fqns:
         if fqn in param_group_fields or fqn in state:
@@ -681,19 +747,15 @@ def _unflatten_optim_state_dict(
             if not current_group["params"]:
                 current_group["params"].append(fqn)
                 current_group.update(fields)
-                seen_fqns_in_group.add(fqn)
             else:
                 existing_fields = {
                     k: v for k, v in current_group.items() if k != "params"
                 }
                 if existing_fields == fields or not fields:
                     current_group["params"].append(fqn)
-                    seen_fqns_in_group.add(fqn)
                 else:
-                    param_groups.append(current_group)
-                    current_group = {"params": [fqn]}
-                    current_group.update(fields)
-                    seen_fqns_in_group.add(fqn)
+                    _check_inconsistent_fields(existing_fields, fields, fqn)
+                    current_group["params"].append(fqn)
 
     if current_group["params"]:
         param_groups.append(current_group)

@@ -376,6 +376,10 @@ def test_t6_tp_fsdp_local_shape_correctness():
                 continue
             if key == "step":
                 continue
+            assert not isinstance(value, DTensor), (
+                f"state.{fqn}.{key}: expected plain Tensor with SkipDTensorDispatch, "
+                f"got DTensor"
+            )
             assert value.shape[0] <= HIDDEN_F, (
                 f"state.{fqn}.{key}: local dim0={value.shape[0]} should be "
                 f"<= full dim0={HIDDEN_F}"

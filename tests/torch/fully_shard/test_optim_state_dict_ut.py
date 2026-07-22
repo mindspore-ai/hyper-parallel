@@ -56,3 +56,31 @@ def test_optim_state_dict_ut_group2():
         TorchCase(UT_FILE, "test_u7_empty_param_group_flatten_error", num_proc=1),
         TorchCase(UT_FILE, "test_u8_chained_optimizer_rejection", num_proc=1),
     ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_optim_state_dict_ut_group3():
+    """
+    Feature: optim state dict single-card UT
+    Description:
+        1.test_u9_unflatten_strict_true_inconsistent_fields
+        2.test_u10_unflatten_strict_false_inconsistent_fields
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(UT_FILE, "test_u9_unflatten_strict_true_inconsistent_fields", num_proc=1),
+        TorchCase(UT_FILE, "test_u10_unflatten_strict_false_inconsistent_fields", num_proc=1),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_optim_state_dict_ut_group4():
+    """
+    Feature: optim state dict single-card UT
+    Description:
+        1.test_u11_set_restores_param_groups_fields
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(UT_FILE, "test_u11_set_restores_param_groups_fields", num_proc=1),
+    ])

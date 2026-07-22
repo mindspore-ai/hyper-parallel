@@ -361,6 +361,10 @@ def test_e6_fsdp_ep_local_shape_correctness():
                 continue
             if key == "step":
                 continue
+            assert not isinstance(value, DTensor), (
+                f"state.{fqn}.{key}: expected plain Tensor (local shard), "
+                f"got DTensor"
+            )
             assert value.numel() > 0, (
                 f"state.{fqn}.{key}: local tensor should have numel > 0"
             )

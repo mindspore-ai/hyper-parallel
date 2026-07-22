@@ -69,6 +69,8 @@ MP = MixedPrecisionPolicy(
 _CKPT_DIR_NESTED = "/tmp/hp_optim_sd_test_nested"
 _CKPT_DIR_FLATTEN = "/tmp/hp_optim_sd_test_flatten"
 _CKPT_DIR_NEW_OPTIM = "/tmp/hp_optim_sd_test_new_optim"
+_CKPT_DIR_TRAINED_LOAD = "/tmp/hp_optim_sd_test_trained_load"
+_CKPT_DIR_WRAPPED = "/tmp/hp_optim_sd_test_wrapped"
 
 
 def _rank():
@@ -496,6 +498,10 @@ def test_o9_hsdp_local_shape_correctness():
                 continue
             if key == "step":
                 continue
+            assert not isinstance(value, DTensor), (
+                f"state.{fqn}.{key}: expected plain Tensor with SkipDTensorDispatch, "
+                f"got DTensor"
+            )
             assert value.shape[0] == HIDDEN // 2, (
                 f"state.{fqn}.{key}: expected local dim0={HIDDEN // 2}, "
                 f"got {value.shape[0]}"
@@ -542,3 +548,97 @@ def test_o10_full_cpu_restore_to_device():
             )
 
     print(f"[rank{_rank()}] O10 PASS: full+cpu restore to correct device")
+
+
+# =====================================================================
+# O11: DCP load into trained optimizer (plan section 10 flow)
+# =====================================================================
+def test_o11_dcp_load_trained_optimizer():
+    """DCP load into a trained optimizer: get -> dcp.load -> set.
+
+    This tests the trained optimizer load flow defined in plan section 10:
+
+        optim_sd = get_optim_state_dict(model, optimizer, options=options)
+        dcp.load({"optimizer": optim_sd}, checkpoint_id=checkpoint_id)
+        set_optim_state_dict(model, optimizer, optim_sd, options=options)
+
+    The target optimizer has already stepped, so get_optim_state_dict
+    returns a state dict with existing tensors that dcp.load can fill.
+    """
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    model, _ = _make_hsdp_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    x = torch.randn(BATCH, HIDDEN).npu()
+
+    for _ in range(3):
+        _train_step_with_optim(model, optimizer, x)
+
+    _cleanup_ckpt(_CKPT_DIR_TRAINED_LOAD)
+
+    optim_sd = get_optim_state_dict(model, optimizer)
+    save(optim_sd, checkpoint_id=_CKPT_DIR_TRAINED_LOAD)
+
+    model2, _ = _make_hsdp_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
+    for _ in range(2):
+        _train_step_with_optim(model2, optimizer2, x)
+
+    assert len(optimizer2.state_dict()["state"]) > 0, (
+        "trained optimizer should have non-empty state"
+    )
+
+    target_sd = get_optim_state_dict(model2, optimizer2)
+    load(target_sd, checkpoint_id=_CKPT_DIR_TRAINED_LOAD)
+    set_optim_state_dict(model2, optimizer2, target_sd)
+
+    loss_after = _train_step_with_optim(model2, optimizer2, x)
+    assert not (loss_after != loss_after), (
+        f"loss is NaN after trained optimizer DCP load step: {loss_after}"
+    )
+
+    print(f"[rank{_rank()}] O11 PASS: DCP load into trained optimizer (loss={loss_after:.4f})")
+    _cleanup_ckpt(_CKPT_DIR_TRAINED_LOAD)
+
+
+# =====================================================================
+# O12: DCP save/load with {"optimizer": ...} wrapper (plan section 10)
+# =====================================================================
+def test_o12_dcp_save_load_wrapped():
+    """DCP save/load with {"optimizer": optim_sd} wrapper format.
+
+    Plan section 10 specifies:
+        dcp.save({"optimizer": optim_sd}, checkpoint_id=...)
+        dcp.load({"optimizer": optim_sd}, checkpoint_id=...)
+
+    This tests the wrapped format where the optimizer state dict is nested
+    under an "optimizer" key, as shown in the plan examples.
+    """
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    model, _ = _make_hsdp_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    x = torch.randn(BATCH, HIDDEN).npu()
+
+    for _ in range(2):
+        _train_step_with_optim(model, optimizer, x)
+
+    _cleanup_ckpt(_CKPT_DIR_WRAPPED)
+
+    optim_sd = get_optim_state_dict(model, optimizer)
+    save({"optimizer": optim_sd}, checkpoint_id=_CKPT_DIR_WRAPPED)
+
+    model2, _ = _make_hsdp_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
+
+    storage_reader = FileSystemReader(_CKPT_DIR_WRAPPED)
+    template = _build_optim_state_dict_load_template(
+        model2, optimizer2, storage_reader,
+    )
+
+    load({"optimizer": template}, checkpoint_id=_CKPT_DIR_WRAPPED)
+    set_optim_state_dict(model2, optimizer2, template)
+    _train_step_with_optim(model2, optimizer2, x)
+
+    print(f"[rank{_rank()}] O12 PASS: DCP save/load with wrapper format")
+    _cleanup_ckpt(_CKPT_DIR_WRAPPED)
