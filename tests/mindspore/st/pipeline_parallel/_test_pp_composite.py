@@ -36,10 +36,13 @@ fully_shard wrapping, and grad parity logic are unchanged.
 # pylint: disable=wrong-import-position
 import copy
 import os
+import pickle
+import tempfile
 from dataclasses import dataclass
 from typing import Callable
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+os.environ["MS_DEV_RUNTIME_CONF"] = "memory_statistics:True"
 
 import mindspore as ms
 import mindspore.communication.management as D
@@ -47,6 +50,8 @@ import numpy as np
 from mindspore import Tensor, nn, mint
 from mindspore.common import _no_grad
 from hyper_parallel import PipelineStage, init_device_mesh
+from hyper_parallel.core.activation_checkpoint import swap_wrapper
+from hyper_parallel.core.activation_checkpoint.swap import SwapManager
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.core.pipeline_parallel.scheduler import (
@@ -56,6 +61,13 @@ from hyper_parallel.core.pipeline_parallel.scheduler import (
     ScheduleInterleaved1F1B,
 )
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+from tests.mindspore.st.pipeline_parallel.pp_swap_test_utils import (
+    assert_step_memory_stable,
+    current_step_peak_memory_mb,
+    format_step_peaks,
+    reset_step_peak_memory,
+    steady_peak_memory_mb,
+)
 
 ms.set_seed(42)
 ms.set_deterministic(True)
@@ -69,6 +81,8 @@ RTOL = 1e-4
 ATOL = 1e-5
 NUM_TRAIN_STEPS = 5
 LEARNING_RATE = 0.01
+_NO_SWAP_WINDOW_MEMORY_TOLERANCE_MB = 8.0
+_BASELINE_FILE_PREFIX = os.path.join(tempfile.gettempdir(), "pp_swap_composite")
 
 
 class MLPModule(nn.Cell):
@@ -123,7 +137,7 @@ VirtualStageAssignment = tuple[int, list[int]]
 StageLayoutFn = Callable[[int, int], list[VirtualStageAssignment]]
 TotalVirtualStagesFn = Callable[[int], int]
 LossOwnerFn = Callable[[int], int]
-ScheduleFactoryFn = Callable[[list[PipelineStage], int], PipelineScheduleRuntime]
+ScheduleFactoryFn = Callable[[list[PipelineStage], int, bool], PipelineScheduleRuntime]
 
 
 @dataclass(frozen=True)
@@ -137,7 +151,7 @@ class PipelineSpec:
         total_virtual_stages: ``pp_size -> int``; total ``stage_num`` for ``PipelineStage``.
         last_stage_owner_pp_idx: ``pp_size -> int``; pp_rank that runs the final virtual
             stage (and therefore emits losses).
-        schedule_factory: ``(stages, micro_batch_num) -> PipelineScheduleRuntime``.
+        schedule_factory: ``(stages, micro_batch_num, enable_swap) -> PipelineScheduleRuntime``.
     """
     name: str
     stage_layout: StageLayoutFn
@@ -193,8 +207,8 @@ GPIPE_SPEC = PipelineSpec(
     stage_layout=_contiguous_layout,
     total_virtual_stages=lambda pp_size: pp_size,
     last_stage_owner_pp_idx=_last_stage_is_last_pp_rank,
-    schedule_factory=lambda stages, micro_batch_num: ScheduleGPipe(
-        stages, micro_batch_num=micro_batch_num,
+    schedule_factory=lambda stages, micro_batch_num, enable_swap: ScheduleGPipe(
+        stages, micro_batch_num=micro_batch_num, swap=enable_swap,
     ),
 )
 
@@ -203,8 +217,8 @@ ONE_F_ONE_B_SPEC = PipelineSpec(
     stage_layout=_contiguous_layout,
     total_virtual_stages=lambda pp_size: pp_size,
     last_stage_owner_pp_idx=_last_stage_is_last_pp_rank,
-    schedule_factory=lambda stages, micro_batch_num: Schedule1F1B(
-        stages, micro_batch_num=micro_batch_num,
+    schedule_factory=lambda stages, micro_batch_num, enable_swap: Schedule1F1B(
+        stages, micro_batch_num=micro_batch_num, swap=enable_swap,
     ),
 )
 
@@ -213,8 +227,8 @@ VPP_SPEC = PipelineSpec(
     stage_layout=_loop_single_layer_layout,
     total_virtual_stages=lambda pp_size: TOTAL_LAYERS,
     last_stage_owner_pp_idx=_last_stage_is_last_pp_rank,
-    schedule_factory=lambda stages, micro_batch_num: ScheduleInterleaved1F1B(
-        stages, micro_batch_num=micro_batch_num,
+    schedule_factory=lambda stages, micro_batch_num, enable_swap: ScheduleInterleaved1F1B(
+        stages, micro_batch_num=micro_batch_num, swap=enable_swap,
     ),
 )
 
@@ -248,10 +262,21 @@ def _to_numpy(value) -> np.ndarray:
     return value.asnumpy()
 
 
+def _tokens_per_microbatch() -> int:
+    """Return the per-microbatch token count used to expose activation memory."""
+    activation_mb = float(os.environ.get("PP_SWAP_COMPOSITE_ACTIVATION_MB", "0"))
+    if activation_mb > 0:
+        target_bytes = int(activation_mb * 1024 * 1024)
+        bytes_per_token = D_HID * np.dtype(np.float32).itemsize
+        return max(1, (target_bytes + bytes_per_token - 1) // bytes_per_token)
+    return int(os.environ.get("PP_SWAP_COMPOSITE_TOKENS_PER_MICRO", "1"))
+
+
 def _global_inputs(dp_size: int, num_microbatches: int, step: int) -> Tensor:
     """Generate the global ``(dp_size * num_microbatches, D_HID)`` input; same on every rank."""
     rng = np.random.default_rng(2026 + step)
-    return Tensor(rng.standard_normal((dp_size * num_microbatches, D_HID)).astype(np.float32))
+    batch_size = dp_size * num_microbatches * _tokens_per_microbatch()
+    return Tensor(rng.standard_normal((batch_size, D_HID)).astype(np.float32))
 
 
 def _build_ref_param_map(ref_layers: list[nn.Cell]) -> dict[str, ms.Parameter]:
@@ -347,8 +372,14 @@ def _wrap_stage_with_fsdp(stage_model: StageModel, dp_mesh, *, reduce_op: str) -
     return fsdp_model
 
 
-def _build_fsdp_stages(spec: PipelineSpec, base_layers: list[MLPModule], pp_idx: int,
-                       pp_mesh, dp_mesh) -> tuple[list[StageModel], list[PipelineStage], dict[str, ms.Parameter]]:
+def _build_fsdp_stages(
+    spec: PipelineSpec,
+    base_layers: list[MLPModule],
+    pp_idx: int,
+    pp_mesh,
+    dp_mesh,
+    enable_swap: bool,
+) -> tuple[list[StageModel], list[PipelineStage], dict[str, ms.Parameter]]:
     """Realise ``spec.stage_layout`` into FSDP-wrapped ``StageModel`` + ``PipelineStage`` pairs.
 
     Returns:
@@ -366,6 +397,8 @@ def _build_fsdp_stages(spec: PipelineSpec, base_layers: list[MLPModule], pp_idx:
     stage_param_map: dict[str, ms.Parameter] = {}
     for virtual_stage_idx, layer_indices in assignments:
         owned_layers = [layers_copy[layer_idx] for layer_idx in layer_indices]
+        if enable_swap:
+            owned_layers = [swap_wrapper(layer) for layer in owned_layers]
         fsdp_stage = _wrap_stage_with_fsdp(StageModel(owned_layers), dp_mesh, reduce_op="sum")
         pipeline_stage = PipelineStage(
             fsdp_stage,
@@ -382,6 +415,77 @@ def _build_fsdp_stages(spec: PipelineSpec, base_layers: list[MLPModule], pp_idx:
     return fsdp_stages, pipeline_stages, stage_param_map
 
 
+def _enable_swap() -> bool:
+    """Return whether this worker is the swap phase of a paired run."""
+    return os.environ.get("PP_SWAP_COMPOSITE_ENABLE_SWAP", "0") == "1"
+
+
+def _compare_swap_phase() -> bool:
+    """Return whether this worker belongs to the added no-swap/swap comparison."""
+    return "PP_SWAP_COMPOSITE_BASELINE_TAG" in os.environ
+
+
+def _baseline_file(spec: PipelineSpec, rank: int) -> str:
+    """Return the paired-run baseline file for this schedule and rank."""
+    tag = os.environ.get("PP_SWAP_COMPOSITE_BASELINE_TAG", "default")
+    return f"{_BASELINE_FILE_PREFIX}_{tag}_{spec.name}_rank{rank}.pkl"
+
+
+def _save_baseline(spec: PipelineSpec, rank: int, payload: dict) -> None:
+    """Atomically persist no-swap accuracy and memory data."""
+    path = _baseline_file(spec, rank)
+    with open(path + ".tmp", "wb") as file:
+        pickle.dump(payload, file)
+    os.replace(path + ".tmp", path)
+
+
+def _load_baseline(spec: PipelineSpec, rank: int) -> dict:
+    """Load the no-swap phase data recorded by the preceding worker."""
+    with open(_baseline_file(spec, rank), "rb") as file:
+        return pickle.load(file)
+
+
+def _snapshot_grads(stage_param_map: dict[str, ms.Parameter]) -> dict[str, np.ndarray]:
+    """Copy every local FSDP gradient shard for no-swap/swap comparison."""
+    grads = {}
+    for name, param in stage_param_map.items():
+        assert param.grad is not None, f"parameter '{name}' has no gradient"
+        grads[name] = _to_numpy(param.grad).copy()
+    return grads
+
+
+def _assert_phase_accuracy(
+    spec: PipelineSpec,
+    rank: int,
+    losses: list[np.ndarray],
+    grads: list[dict[str, np.ndarray]],
+    baseline: dict,
+) -> None:
+    """Compare every training step between the no-swap and swap phases."""
+    baseline_losses = baseline["losses"]
+    baseline_grads = baseline["grads"]
+    assert len(losses) == len(baseline_losses)
+    assert len(grads) == len(baseline_grads)
+    for step, (loss, baseline_loss) in enumerate(zip(losses, baseline_losses)):
+        np.testing.assert_allclose(
+            loss,
+            baseline_loss,
+            rtol=RTOL,
+            atol=ATOL,
+            err_msg=f"{spec.name}, rank {rank}, step {step} loss",
+        )
+    for step, (step_grads, baseline_step_grads) in enumerate(zip(grads, baseline_grads)):
+        assert step_grads.keys() == baseline_step_grads.keys()
+        for name, grad in step_grads.items():
+            np.testing.assert_allclose(
+                grad,
+                baseline_step_grads[name],
+                rtol=RTOL,
+                atol=ATOL,
+                err_msg=f"{spec.name}, rank {rank}, step {step}, grad '{name}'",
+            )
+
+
 # ---------------------------------------------------------------------------
 # Driver: one function consumes any ``PipelineSpec``.
 # ---------------------------------------------------------------------------
@@ -393,6 +497,9 @@ def _assert_pp_fsdp_match_reference(spec: PipelineSpec, num_microbatches: int) -
     D.init()
     rank = D.get_rank()
     world_size = D.get_group_size()
+    enable_swap = _enable_swap()
+    compare_swap_phase = _compare_swap_phase()
+    phase = "swap" if enable_swap else "no-swap"
 
     root_mesh, dp_mesh, pp_mesh, dp_size = _build_pp_dp_mesh(world_size)
     if root_mesh is None:
@@ -407,9 +514,15 @@ def _assert_pp_fsdp_match_reference(spec: PipelineSpec, num_microbatches: int) -
 
     # FSDP path: each pp_rank's virtual stages, each wrapped with fully_shard (reduce_op=SUM).
     fsdp_stages, pipeline_stages, stage_param_map = _build_fsdp_stages(
-        spec, base_layers, pp_idx, pp_mesh, dp_mesh,
+        spec, base_layers, pp_idx, pp_mesh, dp_mesh, enable_swap,
     )
-    schedule = spec.schedule_factory(pipeline_stages, num_microbatches)
+    schedule = spec.schedule_factory(pipeline_stages, num_microbatches, enable_swap)
+    has_swap_window = False
+    if enable_swap:
+        has_swap_window = any(
+            step is not None and step.type.name.startswith("SWAP_")
+            for step in schedule.exec_order[pp_idx]
+        )
     # Each single-layer virtual stage (VPP / future V-shape) names its sole layer ``layers.0.*``;
     # combining params from multiple virtual stages into one optimizer would produce duplicate
     # names.  Build one optimizer per stage uniformly — for GPipe / 1F1B this degenerates to a
@@ -426,16 +539,26 @@ def _assert_pp_fsdp_match_reference(spec: PipelineSpec, num_microbatches: int) -
     ref_optimizer = nn.Adam(ref_params, learning_rate=LEARNING_RATE)
     ref_param_map = _build_ref_param_map(ref_layers)
 
+    phase_losses: list[np.ndarray] = []
+    phase_grads: list[dict[str, np.ndarray]] = []
+    step_peaks_mb: list[float] = []
     for step in range(NUM_TRAIN_STEPS):
         _zero_grads(fsdp_params)
         _zero_grads(ref_params)
 
         global_inputs = _global_inputs(dp_size, num_microbatches, step)
-        fsdp_inputs = global_inputs[dp_idx * num_microbatches: (dp_idx + 1) * num_microbatches]
+        dp_batch_size = num_microbatches * _tokens_per_microbatch()
+        fsdp_inputs = global_inputs[dp_idx * dp_batch_size: (dp_idx + 1) * dp_batch_size]
 
+        reset_step_peak_memory()
         fsdp_losses = schedule.run(fsdp_inputs) if pp_idx == 0 else schedule.run()
+        step_peaks_mb.append(current_step_peak_memory_mb())
+        assert SwapManager().active_group_count() == 0, (
+            f"{spec.name}, rank {rank}, step {step} leaked activation-swap groups"
+        )
         ref_total_loss = _run_ref_serial(ref_layers, global_inputs, total_microbatches)
 
+        step_loss = np.array([], dtype=np.float32)
         if is_loss_owner:
             micro_loss_accu = Tensor([0.0])
             for sub_loss in fsdp_losses:
@@ -454,20 +577,61 @@ def _assert_pp_fsdp_match_reference(spec: PipelineSpec, num_microbatches: int) -
                 f"fsdp_global_loss={micro_loss_accu.asnumpy()}, "
                 f"ref_total_loss={ref_total_value}"
             )
+            step_loss = micro_loss_accu.asnumpy().copy()
         for local_pos, fsdp_stage in enumerate(fsdp_stages):
             check_param_and_grad(fsdp_stage, f"{spec.name}_stage_{local_pos}")
         check_param_and_grad(ref_layers, "ref_layers")
         _assert_grad_parity(spec.name, rank, step, dp_size, dp_idx, stage_param_map, ref_param_map)
+        phase_losses.append(step_loss)
+        if compare_swap_phase:
+            phase_grads.append(_snapshot_grads(stage_param_map))
         with _no_grad():
             for stage_optimizer, stage_params in zip(fsdp_optimizers, fsdp_stage_params):
                 stage_optimizer(tuple(p.grad for p in stage_params))
             ref_optimizer(tuple(p.grad for p in ref_params))
 
+    scene = f"{spec.name} {phase}"
+    assert_step_memory_stable(step_peaks_mb, scene)
+    steady_peak_mb = steady_peak_memory_mb(step_peaks_mb)
+    if enable_swap:
+        baseline = _load_baseline(spec, rank)
+        _assert_phase_accuracy(spec, rank, phase_losses, phase_grads, baseline)
+        no_swap_peak_mb = float(baseline["peak_memory_mb"])
+        reduction = (no_swap_peak_mb - steady_peak_mb) / no_swap_peak_mb * 100
+        if has_swap_window:
+            assert steady_peak_mb < no_swap_peak_mb, (
+                f"{spec.name}, rank {rank}: swap peak {steady_peak_mb:.1f} MB must be less than "
+                f"no-swap peak {no_swap_peak_mb:.1f} MB"
+            )
+        else:
+            assert steady_peak_mb <= no_swap_peak_mb + _NO_SWAP_WINDOW_MEMORY_TOLERANCE_MB, (
+                f"{spec.name}, rank {rank} without a swap window regressed memory: "
+                f"swap={steady_peak_mb:.1f} MB, no-swap={no_swap_peak_mb:.1f} MB"
+            )
+        print(
+            f"[Rank {rank}] {spec.name} no-swap/swap accuracy matched; "
+            f"peak memory {no_swap_peak_mb:.1f} -> {steady_peak_mb:.1f} MB "
+            f"({reduction:.1f}% reduction), swap_window={has_swap_window}",
+            flush=True,
+        )
+    elif compare_swap_phase:
+        _save_baseline(
+            spec,
+            rank,
+            {
+                "losses": phase_losses,
+                "grads": phase_grads,
+                "peak_memory_mb": steady_peak_mb,
+            },
+        )
+
     print(
-        f"[Rank {rank}] {spec.name} passed with mesh={root_mesh.mesh_shape}, "
+        f"[Rank {rank}] {scene} passed with mesh={root_mesh.mesh_shape}, "
         f"dp_size={dp_size}, pp_idx={pp_idx}, "
         f"owned_virtual_stages={[v for v, _ in spec.stage_layout(pp_idx, PP_SIZE)]}, "
-        f"steps={NUM_TRAIN_STEPS}, num_microbatches={num_microbatches}"
+        f"steps={NUM_TRAIN_STEPS}, num_microbatches={num_microbatches}, "
+        f"step_peaks={format_step_peaks(step_peaks_mb)}, steady_peak={steady_peak_mb:.1f} MB",
+        flush=True,
     )
 
 
@@ -478,14 +642,23 @@ def _assert_pp_fsdp_match_reference(spec: PipelineSpec, num_microbatches: int) -
 
 def test_fully_shard_pp_gpipe():
     """Pipeline parallel + fully_shard (replicate-style) under the GPipe schedule."""
-    _assert_pp_fsdp_match_reference(GPIPE_SPEC, num_microbatches=4)
+    _assert_pp_fsdp_match_reference(
+        GPIPE_SPEC,
+        num_microbatches=int(os.environ.get("PP_SWAP_COMPOSITE_MICROBATCHES", "4")),
+    )
 
 
 def test_fully_shard_pp_1f1b():
     """Pipeline parallel + fully_shard (replicate-style) under the 1F1B schedule."""
-    _assert_pp_fsdp_match_reference(ONE_F_ONE_B_SPEC, num_microbatches=4)
+    _assert_pp_fsdp_match_reference(
+        ONE_F_ONE_B_SPEC,
+        num_microbatches=int(os.environ.get("PP_SWAP_COMPOSITE_MICROBATCHES", "4")),
+    )
 
 
 def test_fully_shard_pp_vpp():
     """Pipeline parallel + fully_shard under the Interleaved 1F1B (VPP) schedule."""
-    _assert_pp_fsdp_match_reference(VPP_SPEC, num_microbatches=4)
+    _assert_pp_fsdp_match_reference(
+        VPP_SPEC,
+        num_microbatches=int(os.environ.get("PP_SWAP_COMPOSITE_MICROBATCHES", "4")),
+    )

@@ -17,7 +17,8 @@ from unittest import mock
 
 import pytest
 
-pytest.importorskip("mindspore")
+ms = pytest.importorskip("mindspore")
+nn = pytest.importorskip("mindspore.nn")
 
 from hyper_parallel.platform.mindspore.platform import MindSporePlatform  # pylint: disable=wrong-import-position
 
@@ -29,3 +30,16 @@ def test_prepare_batch_p2p_group_does_not_synchronize():
 
     barrier.assert_not_called()
     assert result is None
+
+
+def test_buffers_dict_includes_all_registered_buffers():
+    """MindSpore buffer enumeration includes persistent and non-persistent buffers."""
+    cell = nn.Cell()
+    cell.register_buffer("persistent", ms.Tensor([1.0]))
+    cell.register_buffer("scratch", ms.Tensor([2.0]), persistent=False)
+
+    buffers = dict(MindSporePlatform.buffers_dict(cell))
+
+    assert set(buffers) == {"persistent", "scratch"}
+    assert buffers["persistent"] is cell.persistent
+    assert buffers["scratch"] is cell.scratch

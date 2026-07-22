@@ -16,6 +16,7 @@
 import contextlib
 import importlib
 import os
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -1215,7 +1216,7 @@ class TestSwapManager(unittest.TestCase):
         """Test __init__ creates empty groups and state."""
         mgr = SwapManager()
         self.assertEqual(len(mgr._groups), 0)
-        self.assertEqual(mgr._current_group_name, "")
+        self.assertEqual(mgr.get_current_group_name(), "")
         self.assertEqual(mgr._layer_count, 0)
         self.assertIsNone(mgr._copy_stream)
 
@@ -1288,6 +1289,40 @@ class TestSwapManager(unittest.TestCase):
         self.assertEqual(mgr.get_current_group_name(), "")
         mgr.set_current_group_name("test_name")
         self.assertEqual(mgr.get_current_group_name(), "test_name")
+
+    def test_group_context_is_thread_local_and_restores(self):
+        """Group contexts should isolate worker threads and restore nesting."""
+        mgr = SwapManager()
+        observed = []
+
+        with mgr.group_context("main"):
+            def worker():
+                observed.append(mgr.get_current_group_name())
+                with mgr.group_context("worker"):
+                    observed.append(mgr.get_current_group_name())
+                observed.append(mgr.get_current_group_name())
+
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join()
+            self.assertEqual(mgr.get_current_group_name(), "main")
+
+        self.assertEqual(observed, ["", "worker", ""])
+        self.assertEqual(mgr.get_current_group_name(), "")
+
+    def test_abort_group_waits_for_inflight_events(self):
+        """Failed runs must not drop storage while a copy is in flight."""
+        mgr = SwapManager()
+        mgr.ensure_group("group_a")
+        group = mgr._groups["group_a"]
+        group._offload_event = MagicMock()
+        group._load_event = MagicMock()
+
+        mgr.abort_group("group_a")
+
+        group._offload_event.synchronize.assert_called_once_with()
+        group._load_event.synchronize.assert_called_once_with()
+        self.assertNotIn("group_a", mgr._groups)
 
     def test_is_last_group_default(self):
         """Test is_last_group returns False by default."""

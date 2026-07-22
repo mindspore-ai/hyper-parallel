@@ -920,6 +920,11 @@ class TorchPlatform(Platform):
         return cell.named_parameters()
 
     @staticmethod
+    def buffers_dict(cell: Module) -> Any:
+        """Return all named buffers registered by the module tree."""
+        return cell.named_buffers()
+
+    @staticmethod
     def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
         """Get the state dictionary of a model.
 

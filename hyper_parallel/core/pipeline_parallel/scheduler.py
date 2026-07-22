@@ -14,15 +14,26 @@
 # ============================================================================
 """pipeline schedule"""
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum, auto
 from collections import defaultdict
 import itertools
 import bisect
 import logging
 import re
+from typing import Any
+
 import hyper_parallel
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.api import HSDPModule
+from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
+    PipelineSwapSession,
+    inject_pipeline_swap_steps,
+    swap_launch_load,
+    swap_launch_offload,
+    swap_wait_load,
+    swap_wait_offload,
+)
 from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
 platform = get_platform()
 logger = logging.getLogger(__name__)
@@ -48,7 +59,6 @@ class MetaStepType(Enum):
     FSDP_UNSHARD = auto()
     FSDP_RESHARD = auto()
     FSDP_REDUCE_GRAD = auto()
-    SWAP_SET_GROUP = auto()
     SWAP_LAUNCH_OFFLOAD = auto()
     SWAP_WAIT_OFFLOAD = auto()
     SWAP_LAUNCH_LOAD = auto()
@@ -337,6 +347,8 @@ class PipelineScheduleRuntime(ABC):
         self.bwd_handle_cache = {}
         self._custom_fn_map = {}
         self._pp_swap_enabled = swap
+        self._swap_keys = frozenset()
+        self._swap_session = None
         # Outstanding async send handle groups for the in-flight
         # ``run_microbatches`` call; reset per run and drained at its end.
         self._send_handles = []
@@ -399,6 +411,10 @@ class PipelineScheduleRuntime(ABC):
             step_type: The :class:`MetaStepType` to intercept.
             fn: A callable with signature ``(step: MetaStep, ctx: PipelineContext) -> None``.
 
+                When pipeline activation swap is enabled, callbacks that
+                execute FWD leaves must call ``ctx.schedule.execute_fwd_leaf``
+                so swap collection runs in the matching chunk context.
+
         Example:
             >>> def my_overlap_callback(step, ctx):
             ...     fwd_step, bwd_step = step.sub_steps
@@ -434,13 +450,16 @@ class PipelineScheduleRuntime(ABC):
 
     def _inject_local_pp_swap_actions(self):
         """Annotate the local rank schedule with pipeline activation-swap actions."""
+        self._swap_keys = frozenset()
         if not self._pp_swap_enabled:
             return
         current_rank = self._stage_to_rank_index[self.stages[0].stage_index]
-        from hyper_parallel.core.pipeline_parallel.pipeline_swap import (  # pylint: disable=C0415
-            inject_pipeline_swap_steps,
-        )
         self.exec_order[current_rank] = inject_pipeline_swap_steps(self.exec_order[current_rank])
+        self._swap_keys = frozenset(
+            (step.stage_index, step.micro_index)
+            for step in self.exec_order[current_rank]
+            if step is not None and step.type == MetaStepType.SWAP_LAUNCH_OFFLOAD
+        )
 
     @abstractmethod
     def _build_stage_to_rank_index(self) -> None:
@@ -454,13 +473,51 @@ class PipelineScheduleRuntime(ABC):
         """Build exec order, PP cmopute and PP comms(Send/Recv)"""
 
     def build_exec_order(self) -> None:
-        """Build the execution order and inject optional PP-swap/FSDP actions.
+        """Build the execution order and inject optional FSDP / PP-swap actions.
+
+        Meta-Step Ordering Contract
+        --------------------------
+        The per-rank execution schedule is assembled in layers:
+
+        1. ``construct_exec_order()``
+           Pure compute (FWD/BWD) + P2P communication (SEND/RECV).
+
+        2. ``_inject_local_fsdp_actions()``
+           FSDP parameter management: UNSHARD before compute, RESHARD after,
+           REDUCE_GRAD after the last backward of each stage.  This layer must
+           run *before* swap injection so that swap can see the already-placed
+           FSDP steps and optimise its placement relative to them:
+
+           * After FWD: ``SWAP_LAUNCH_OFFLOAD`` before ``FSDP_RESHARD``
+             (start D2H early, freeing parameter memory is fast).
+           * Before BWD: if a direct lookahead ``FSDP_UNSHARD`` exists,
+             ``SWAP_LAUNCH_LOAD`` precedes it so H2D overlaps all-gather.
+             If parameters are already unsharded, load is delayed until the
+             BWD container to avoid extending activation residency.
+
+        3. ``coalesce_p2p()`` or ``attach_fwd_boundary_p2p()``
+           P2P batching — runs before swap injection so P2P containers are
+           finalized first.
+
+        4. ``_inject_local_pp_swap_actions()``
+           Activation swap: leaf-local collection around ``FWD``, followed by
+           ``LAUNCH_OFFLOAD → WAIT_OFFLOAD → LAUNCH_LOAD → WAIT_LOAD``.
+           ``WAIT_LOAD`` executes on the scheduler thread immediately before
+           the backward consumer container.
+           When ``enable_dxdw_split`` is active, ``BWD_INPUT`` is used as
+           the backward anchor because it is the activation consumer;
+           ``BWD_WEIGHT`` receives no swap control steps.
+
+           Swap steps are inserted only into before/after slots around
+           top-level containers and never inside ``BATCH_SEND_RECV.sub_steps``.
+           This preserves symmetric, paired fusion-block members and avoids
+           deadlocks caused by splitting a fused P2P block.
 
         Also resolves ``p2p_transport``: ``"auto"`` becomes ``"batch"`` (the
         measured-beneficial duplex) on schedules running with ``overlap_b_f``
-        and ``"plain"`` everywhere else, then the matching order-rewrite pass
-        runs last (after swap/FSDP injection) so it sees the final per-rank
-        order.
+        and ``"plain"`` everywhere else.  The matching P2P order-rewrite pass
+        runs after FSDP injection and before swap injection, so swap sees the
+        finalized top-level P2P containers.
         """
         mode = self._p2p_transport
         if mode == "auto":
@@ -469,7 +526,9 @@ class PipelineScheduleRuntime(ABC):
         self._batch_p2p = mode != "plain"
         self._batch_p2p_group = self._resolve_batch_p2p_group() if self._batch_p2p else None
         self.construct_exec_order()
-        self._inject_local_pp_swap_actions()
+        # FSDP must inject before PP-swap so that swap can optimise
+        # placement relative to FSDP steps (LAUNCH_OFFLOAD before
+        # RESHARD after FWD; LAUNCH_LOAD before UNSHARD for BWD).
         self._inject_local_fsdp_actions()
         if mode == "boundary":
             # fwd-boundary mode: hang the forward's F_SEND + next slot's recvs
@@ -483,6 +542,7 @@ class PipelineScheduleRuntime(ABC):
             # the riding send into the compute-gating recv wait — see
             # __init__.
             self.exec_order = coalesce_p2p(self.exec_order)
+        self._inject_local_pp_swap_actions()
 
     def convert_stages_dict(self):
         """convert stages to dict."""
@@ -588,18 +648,19 @@ class PipelineScheduleRuntime(ABC):
         if step is not None:
             self.exec_boundary_p2p(step)
 
-    def run(self, *args, **kwargs):
+    def run(self, *args: Any, **kwargs: Any) -> list:
         """schedule run."""
         losses = []
         try:
+            if self._pp_swap_enabled:
+                self._swap_session = PipelineSwapSession(self._swap_keys)
             split_args, split_kwargs = self.split_microbatches(args, kwargs)
             self.run_microbatches(split_args, split_kwargs, losses)
         finally:
-            # An exception unwinds past run_microbatches' end-of-iteration send
-            # drain, leaving in-flight isend/irecv handles un-waited. Wait them
-            # here so the comm contract holds on the error path too. No-op on the
-            # normal path. See _drain_inflight_p2p.
             self._drain_inflight_p2p()
+            if self._swap_session is not None:
+                self._swap_session.close()
+                self._swap_session = None
         return losses
 
     def sync_shared_parameters_grad(self):
@@ -882,7 +943,6 @@ class PipelineScheduleRuntime(ABC):
         step_type = cur_step.type
 
         if step_type in (
-            MetaStepType.SWAP_SET_GROUP,
             MetaStepType.SWAP_LAUNCH_OFFLOAD,
             MetaStepType.SWAP_WAIT_OFFLOAD,
             MetaStepType.SWAP_LAUNCH_LOAD,
@@ -894,10 +954,7 @@ class PipelineScheduleRuntime(ABC):
             self.recv_fwd(stage, micro_index)
 
         elif step_type == MetaStepType.FWD:
-            self._assert_in_unshard_if_needed(stage, cur_step)
-            self.wait_fwd_recv(stage.stage_index, micro_index)
-            out = stage.forward_one_chunk(micro_index, arg_mbs[micro_index], kwarg_mbs[micro_index])
-            self.update_losses(stage, out, losses)
+            self.execute_fwd_leaf(cur_step, arg_mbs, kwarg_mbs, losses)
 
         elif step_type == MetaStepType.FWD_SEND:
             self.send_fwd(stage, micro_index)
@@ -930,26 +987,35 @@ class PipelineScheduleRuntime(ABC):
             if fsdp_handler is not None:
                 fsdp_handler(stage)
 
+    def execute_fwd_leaf(self, step: MetaStep, arg_mbs: list, kwarg_mbs: list, losses: list) -> None:
+        """Execute a forward leaf within its run-scoped swap group context."""
+        stage = self._stage_dict[step.stage_index]
+        micro_index = step.micro_index
+        self._assert_in_unshard_if_needed(stage, step)
+        self.wait_fwd_recv(stage.stage_index, micro_index)
+        swap_managed = self._swap_session is not None and self._swap_session.manages(step)
+        group_context = self._swap_session.group_context(step) if swap_managed else nullcontext()
+        with group_context:
+            out = stage.forward_one_chunk(micro_index, arg_mbs[micro_index], kwarg_mbs[micro_index])
+            if swap_managed:
+                # Boundary transport may pop the stage output cache from the
+                # after-forward hook before this leaf returns. Protect the
+                # local output while it is still directly available.
+                self._swap_session.protect_aliases(step, out)
+        self.update_losses(stage, out, losses)
+
     def _exec_pipeline_swap_step(self, cur_step, arg_mbs, kwarg_mbs):
         """Execute a pipeline activation-swap control step."""
-        from hyper_parallel.core.pipeline_parallel.pipeline_swap import (  # pylint: disable=C0415
-            swap_launch_load,
-            swap_launch_offload,
-            swap_set_group,
-            swap_wait_load,
-            swap_wait_offload,
-        )
-
-        if cur_step.type == MetaStepType.SWAP_SET_GROUP:
-            swap_set_group(cur_step)
-        elif cur_step.type == MetaStepType.SWAP_LAUNCH_OFFLOAD:
-            swap_launch_offload(cur_step, self, arg_mbs, kwarg_mbs)
+        if self._swap_session is None:
+            raise RuntimeError("Pipeline swap step executed without an active run session.")
+        if cur_step.type == MetaStepType.SWAP_LAUNCH_OFFLOAD:
+            swap_launch_offload(cur_step, self, arg_mbs, kwarg_mbs, self._swap_session)
         elif cur_step.type == MetaStepType.SWAP_WAIT_OFFLOAD:
-            swap_wait_offload(cur_step)
+            swap_wait_offload(cur_step, self._swap_session)
         elif cur_step.type == MetaStepType.SWAP_LAUNCH_LOAD:
-            swap_launch_load(cur_step)
+            swap_launch_load(cur_step, self._swap_session)
         elif cur_step.type == MetaStepType.SWAP_WAIT_LOAD:
-            swap_wait_load(cur_step)
+            swap_wait_load(cur_step, self._swap_session)
 
     def run_microbatches(self, arg_mbs: list, kwarg_mbs: list, losses: list) -> None:
         """Execute the schedule step by step.
@@ -1852,13 +1918,6 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                 "enable_dxdw_split=True requires overlap_b_f=True; the split "
                 "is only applied to BWD sub-steps inside OVERLAP_B_F composite steps."
             )
-        if enable_dxdw_split and swap:
-            raise ValueError(
-                "enable_dxdw_split=True is incompatible with swap=True: "
-                "pipeline-swap injection anchors on unified BWD steps and "
-                "does not recognize the split BWD_INPUT/BWD_WEIGHT steps."
-            )
-
         self._init_round_layout()
         self.build_exec_order()
 

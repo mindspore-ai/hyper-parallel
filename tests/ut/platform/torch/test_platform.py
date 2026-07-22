@@ -54,6 +54,18 @@ class TestTorchPlatformCore(unittest.TestCase):
 
         mock_barrier.assert_called_once_with(group=mock.sentinel.pp_group)
 
+    def test_buffers_dict_includes_all_registered_buffers(self):
+        """Torch buffer enumeration includes persistent and non-persistent buffers."""
+        module = torch.nn.Module()
+        module.register_buffer("persistent", torch.tensor([1.0]))
+        module.register_buffer("scratch", torch.tensor([2.0]), persistent=False)
+
+        buffers = dict(TorchPlatform.buffers_dict(module))
+
+        self.assertEqual(set(buffers), {"persistent", "scratch"})
+        self.assertIs(buffers["persistent"], module.persistent)
+        self.assertIs(buffers["scratch"], module.scratch)
+
     def test_dtensor_data_setter_updates_wrapper_and_local_tensor(self):
         """Assigning ``dtensor.data = x`` should synchronize wrapper and local tensor payloads."""
         class FakeDataDescriptor:

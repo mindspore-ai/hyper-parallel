@@ -20,7 +20,9 @@ import threading
 import warnings
 
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, Iterator, List, Optional, Set
 
 from hyper_parallel.platform import get_platform
 
@@ -701,11 +703,14 @@ class SwapManager:
     _instance: Optional["SwapManager"] = None
     _lock = threading.Lock()
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize process-local swap groups once for the singleton."""
         if hasattr(self, '_groups'):
             return
         self._groups: Dict[str, SwapGroup] = {}
-        self._current_group_name: str = ""
+        self._current_group_name: ContextVar[str] = ContextVar(
+            "swap_current_group_name", default=""
+        )
         self._layer_count: int = 0
         self._copy_stream: Optional[Any] = None
 
@@ -766,27 +771,45 @@ class SwapManager:
         group.wait_load()
 
     def release_group_storage(self, group_name: str) -> None:
-        """Release live storage references held by the swap group.
-
-        Called at the end of backward to free Storage objects that were never
-        released via wait_load (e.g. the last layer, which has no next layer
-        and therefore never goes through the offload-load cycle).
-        """
+        """Release storage references held by the swap group."""
         group = self._groups.get(group_name)
         if group is not None:
             group._storages.clear()
 
+    def abort_group(self, group_name: str) -> None:
+        """Synchronize in-flight transfers and remove a failed run's group."""
+        group = self._groups.pop(group_name, None)
+        if group is None:
+            return
+        for event in (group._offload_event, group._load_event):
+            if event is not None:
+                event.synchronize()
+        group._storages.clear()
+
     def get_current_group_name(self) -> str:
         """Return the name of the currently active swap group."""
-        return self._current_group_name
+        return self._current_group_name.get()
 
     def set_current_group_name(self, group_name: str) -> None:
         """Set the name of the currently active swap group."""
-        self._current_group_name = group_name
+        self._current_group_name.set(group_name)
+
+    def active_group_count(self) -> int:
+        """Return the number of live swap groups for lifecycle diagnostics."""
+        return len(self._groups)
+
+    @contextmanager
+    def group_context(self, group_name: str) -> Iterator[None]:
+        """Activate a swap group within the current execution context."""
+        token = self._current_group_name.set(group_name)
+        try:
+            yield
+        finally:
+            self._current_group_name.reset(token)
 
     def is_last_group(self, group_name: Optional[str] = None) -> bool:
         """Return whether the specified swap group is the terminal group in the chain."""
-        group_name = self._current_group_name if group_name is None else group_name
+        group_name = self.get_current_group_name() if group_name is None else group_name
         group = self._groups.get(group_name)
         if group is None:
             return False

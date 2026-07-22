@@ -440,6 +440,17 @@ class TestMPipeTransposeBodyPreserved(unittest.TestCase):
 class TestMPipeTransposeValidation(unittest.TestCase):
     """Constructor argument validation that runs before any distributed setup."""
 
+    def test_swap_rejected_before_other_constructor_work(self):
+        """MPipe rejects swap before inspecting stages or preprocess state."""
+        with self.assertRaisesRegex(ValueError, "activation swap is not yet supported"):
+            ScheduleMPipeTranspose(
+                stages=None,
+                micro_batch_num=0,
+                preprocess_module=None,
+                num_transpose_layers=0,
+                swap=True,
+            )
+
     def test_negative_transpose_layers_rejected(self):
         """
         Feature: MPipe Transpose constructor validation.

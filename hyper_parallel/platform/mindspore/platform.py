@@ -1483,6 +1483,11 @@ class MindSporePlatform(Platform):
         return cell.parameters_and_names()
 
     @staticmethod
+    def buffers_dict(cell: Cell) -> Any:
+        """Return all named buffers registered by the cell tree."""
+        return cell.named_buffers()
+
+    @staticmethod
     def get_tensor_transform():
         return _tensor_transform
 

@@ -84,8 +84,8 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         output_concat_dim (int, optional): See ``PipelineScheduleRuntime``.
         overlap_p2p (bool, optional): See ``ScheduleInterleaved1F1B``.
             Default ``False``.
-        swap (bool, optional): Whether to inject activation-swap steps.
-            Default ``False``.
+        swap (bool, optional): Reserved for API compatibility. MPipe activation
+            swap is not supported and ``True`` raises ``ValueError``.
 
     Note:
         This class builds the schedule ordering and registers the ``MPIPE_*``
@@ -116,8 +116,12 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
             kwargs_batch_dim (Optional[BatchDimSpec]): Keyword-arg batch-dim spec (forwarded to the base).
             output_concat_dim (Optional[int]): Output concatenation dim (forwarded to the base).
             overlap_p2p (bool): Whether to overlap P2P (forwarded to the base).
-            swap (bool): Whether to enable activation swapping (forwarded to the base).
+            swap (bool): Reserved for API compatibility. Must be ``False``.
         """
+        if swap:
+            raise ValueError(
+                "MPipe Transpose with pipeline activation swap is not yet supported."
+            )
         if not isinstance(num_transpose_layers, int) or num_transpose_layers < 0:
             raise ValueError(
                 f"Argument 'num_transpose_layers' must be a non-negative int, "
