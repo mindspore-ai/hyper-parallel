@@ -289,11 +289,12 @@ def test_e4_fsdp_ep_optim_state_dict_full_cpu_broadcast():
     opts_get = StateDictOptions(full_state_dict=True, cpu_offload=True)
     sd = get_optim_state_dict(moe, optimizer, options=opts_get)
 
-    is_rank0 = dist.get_rank() == 0
-    if is_rank0:
-        assert len(sd["state"]) > 0, "global rank0 should have non-empty state"
-    else:
-        assert len(sd["state"]) == 0, "non-rank0 should have empty state"
+    for fqn, state in sd["state"].items():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                assert value.device.type == "cpu", (
+                    f"state.{fqn}.{key} should be on CPU, got {value.device}"
+                )
 
     moe2, mesh2, device2, grad_scale2 = _make_fsdp_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)

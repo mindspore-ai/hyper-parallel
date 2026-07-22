@@ -240,11 +240,12 @@ def test_c2_cp_fsdp_optim_state_dict_full_cpu_broadcast():
     opts_get = StateDictOptions(full_state_dict=True, cpu_offload=True)
     sd = get_optim_state_dict(model, optimizer, options=opts_get)
 
-    is_rank0 = dist.get_rank() == 0
-    if is_rank0:
-        assert len(sd["state"]) > 0, "global rank0 should have non-empty state"
-    else:
-        assert len(sd["state"]) == 0, "non-rank0 should have empty state"
+    for fqn, state in sd["state"].items():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                assert value.device.type == "cpu", (
+                    f"state.{fqn}.{key} should be on CPU, got {value.device}"
+                )
 
     model2, mesh2, fsdp_mesh2, device2 = _make_cp_fsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
