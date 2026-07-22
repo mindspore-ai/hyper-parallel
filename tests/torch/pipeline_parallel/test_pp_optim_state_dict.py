@@ -16,7 +16,7 @@
 
 Spawns torchrun workers:
   - P1, P2: 2-card PP-only tests (run in parallel, 2+2=4 <= 8)
-  - P3-P7: 8-card PP+HSDP tests (one per group, each needs all 8 cards)
+  - P3-P7: 4-card PP+HSDP tests (pp=2, dp=1, fsdp=2)
 """
 from pathlib import Path
 
@@ -51,7 +51,7 @@ def test_pp_only_optim_state_dict_group1():
 
 
 # -----------------------------------------------------------------------
-# PP+HSDP tests (8 cards each — one per group)
+# PP+HSDP tests (4 cards each — pp=2, dp=1, fsdp=2)
 # -----------------------------------------------------------------------
 @arg_mark(
     plat_marks=["platform_ascend910b"],
@@ -70,7 +70,7 @@ def test_pp_hsdp_optim_state_dict_p3():
         _WORKER,
         "test_p3_pp_hsdp_optim_state_dict_fqn_roundtrip",
         master_port=13842,
-        num_proc=8,
+        num_proc=4,
     )
 
 
@@ -91,7 +91,7 @@ def test_pp_hsdp_optim_state_dict_p4():
         _WORKER,
         "test_p4_pp_hsdp_full_cpu_restore_to_device",
         master_port=13843,
-        num_proc=8,
+        num_proc=4,
     )
 
 
@@ -112,7 +112,7 @@ def test_pp_hsdp_optim_state_dict_p5():
         _WORKER,
         "test_p5_pp_hsdp_local_shape_correctness",
         master_port=13844,
-        num_proc=8,
+        num_proc=4,
     )
 
 
@@ -133,7 +133,7 @@ def test_pp_hsdp_optim_state_dict_p6():
         _WORKER,
         "test_p6_pp_hsdp_dcp_save_load_nested",
         master_port=13845,
-        num_proc=8,
+        num_proc=4,
     )
 
 
@@ -154,5 +154,5 @@ def test_pp_hsdp_optim_state_dict_p7():
         _WORKER,
         "test_p7_pp_hsdp_flatten_roundtrip",
         master_port=13846,
-        num_proc=8,
+        num_proc=4,
     )

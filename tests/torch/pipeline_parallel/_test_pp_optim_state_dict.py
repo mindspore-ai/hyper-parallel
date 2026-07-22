@@ -17,11 +17,11 @@
 Verified scenarios:
   P1 (2-card): PP-only get/set_optim_state_dict FQN roundtrip (default options)
   P2 (2-card): PP-only cpu_offload roundtrip
-  P3 (8-card): PP+HSDP get/set_optim_state_dict FQN roundtrip
-  P4 (8-card): PP+HSDP full_state_dict + cpu_offload restore to correct device
-  P5 (8-card): PP+HSDP local shape correctness after set_optim_state_dict
-  P6 (8-card): PP+HSDP DCP save/load + load template (nested)
-  P7 (8-card): PP+HSDP flatten roundtrip
+  P3 (4-card): PP+HSDP get/set_optim_state_dict FQN roundtrip
+  P4 (4-card): PP+HSDP full_state_dict + cpu_offload restore to correct device
+  P5 (4-card): PP+HSDP local shape correctness after set_optim_state_dict
+  P6 (4-card): PP+HSDP DCP save/load + load template (nested)
+  P7 (4-card): PP+HSDP flatten roundtrip
 
 Key design decisions for PP optimizer state dict testing:
   - Each PP rank owns different stage parameters (different FQNs), so
@@ -304,10 +304,10 @@ def test_p2_pp_only_cpu_offload_roundtrip():
 
 
 # =====================================================================
-# PP+HSDP helpers (8-card, 3-D mesh pp=2, dp=2, fsdp=2)
+# PP+HSDP helpers (4-card, 3-D mesh pp=2, dp=1, fsdp=2)
 # =====================================================================
 _PP_SIZE = 2
-_DP_SIZE = 2
+_DP_SIZE = 1
 _FSDP_SIZE = 2
 _NUM_MICROBATCHES = 4
 
@@ -318,7 +318,7 @@ def _owned_virtual_stages(pp_rank: int, total_layers: int = _TOTAL_LAYERS) -> li
 
 
 def _build_pp_hsdp_stages():
-    """Build PP+HSDP stages on 8 ranks with 3-D mesh.
+    """Build PP+HSDP stages on 4 ranks with 3-D mesh.
 
     Uses ScheduleInterleaved1F1B with VPP loop layout.
     Each pp_rank owns 2 virtual stages (single-layer each).

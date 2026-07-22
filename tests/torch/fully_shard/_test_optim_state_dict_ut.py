@@ -461,3 +461,33 @@ def test_u11_set_restores_param_groups_fields():
     )
 
     _train_step(model2, optimizer2, x)
+
+
+# =====================================================================
+# U12: strict=True raises on missing FQNs (target has FQNs not in checkpoint)
+# =====================================================================
+def test_u12_strict_true_missing_fqns():
+    """strict=True raises ValueError when target optimizer has FQNs absent
+    from the checkpoint state dict."""
+    model = _SimpleNet()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    x = torch.randn(2, 8)
+    _train_step(model, optimizer, x)
+
+    sd = get_optim_state_dict(model, optimizer)
+
+    all_fqns = list(sd["state"].keys())
+    assert len(all_fqns) > 1, "Need at least 2 FQNs for this test"
+
+    kept_fqn = all_fqns[0]
+    partial_sd = {
+        "state": {kept_fqn: sd["state"][kept_fqn]},
+        "param_groups": sd["param_groups"],
+    }
+
+    model2 = _SimpleNet()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
+    _train_step(model2, optimizer2, x)
+
+    with pytest.raises(ValueError, match="strict=True but target optimizer has FQNs not in checkpoint"):
+        set_optim_state_dict(model2, optimizer2, partial_sd)

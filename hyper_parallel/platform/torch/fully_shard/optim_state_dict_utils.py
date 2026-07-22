@@ -352,6 +352,12 @@ def set_optim_state_dict(
                 f"strict=True but checkpoint contains FQNs not in target "
                 f"optimizer: {sorted(extra_fqns)}"
             )
+        missing_fqns = target_fqns - source_fqns
+        if missing_fqns:
+            raise ValueError(
+                f"strict=True but target optimizer has FQNs not in checkpoint: "
+                f"{sorted(missing_fqns)}"
+            )
 
     for fqn, source_state in optim_state_dict.get("state", {}).items():
         if fqn not in target_fqn_to_saved_id:
