@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP parameter"""
-from typing import Any, Callable, List, Optional, Tuple, cast
+from typing import Callable, List, Optional, Tuple, cast
 import itertools
 import mindspore as ms
 from mindspore import nn
@@ -166,8 +166,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
         self._orig_param_hooks: List[Callable] = []
-        self._internal_param_hooks: List[Callable] = []
-        self._internal_hook_ids = set()
         self.grad_offload_event: Optional[ms.runtime.Event] = None
         dtensor_payload = unwrap_dtensor_param(param)
         self._orig_param_is_dtensor = dtensor_payload is not None
@@ -186,7 +184,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._param_fqn: Optional[str] = None
         # Communication attributes for prefetch pattern
         self.prefetch_handle: Optional[CommHandle] = None
-        self._reduce_scatter_input = None
         self._reduce_scatter_source = None
         self._reduce_scatter_output = None
         self.reduce_scatter_handle: Optional[CommHandle] = None
@@ -269,31 +266,13 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         for hook_func in self._iter_backward_hooks(param):
             hook_func_id = id(hook_func)
-            if hook_func_id in getattr(self, "_internal_hook_ids", ()):
-                continue
             if hook_func_id not in self._saved_hook_ids:
                 self._orig_param_hooks.append(hook_func)
                 self._saved_hook_ids.add(hook_func_id)
 
-    def _register_internal_backward_hook(self, hook_func: Callable) -> None:
-        """Register a fully_shard-owned hook after all user parameter hooks."""
-        if not hasattr(self, "_internal_param_hooks"):
-            self._internal_param_hooks = []
-        if not hasattr(self, "_internal_hook_ids"):
-            self._internal_hook_ids = set()
-        hook_func_id = id(hook_func)
-        if hook_func_id in self._internal_hook_ids:
-            return
-        self._internal_param_hooks.append(hook_func)
-        self._internal_hook_ids.add(hook_func_id)
-
     def _migrate_backward_hooks(self, new_param: Parameter) -> None:
-        """Migrate user and internal hooks to the active parameter in stable order."""
-        hooks = [
-            *getattr(self, "_orig_param_hooks", ()),
-            *getattr(self, "_internal_param_hooks", ()),
-        ]
-        if not hooks:
+        """Migrate saved user backward hooks to the active sharded/unsharded parameter."""
+        if not getattr(self, "_orig_param_hooks", None):
             return
         if hasattr(new_param, "migrate_backward_hooks_run_once"):
             return
@@ -301,7 +280,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         if not callable(register_hook):
             return
 
-        for hook_func in hooks:
+        for hook_func in self._orig_param_hooks:
             try:
                 if getattr(new_param, "requires_grad", False):
                     register_hook(hook_func)
@@ -788,104 +767,46 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         return self._reduce_scatter_output
 
     def clear_reduce_scatter_output(self):
-        """Clear cached reduce-scatter input and output after completion."""
-        self._reduce_scatter_input = None
+        """Clear cached reduce-scatter output."""
         self._reduce_scatter_output = None
 
-    def _release_unsharded_grad_for_reduce_scatter(self, reduce_scatter_input: ms.Tensor) -> None:
-        """Transfer ownership without clearing ``.grad`` inside backward."""
-        if self._reduce_scatter_input is not None or self._reduce_scatter_source is not None:
-            raise RuntimeError(
-                f"Parameter {self._param_fqn} already has pending reduce-scatter input."
-            )
-        self._reduce_scatter_input = reduce_scatter_input
-        self._retain_unsharded_grad_source_for_reduce_scatter()
-
     def _retain_unsharded_grad_source_for_reduce_scatter(self) -> None:
-        """Retain the full-gradient source while a fused buffer owns its packed data."""
+        """Record which full-gradient field was packed by fused reduce-scatter."""
         if self._reduce_scatter_source is not None:
             raise RuntimeError(
                 f"Parameter {self._param_fqn} already has a pending reduce-scatter source."
             )
         if self.unsharded_accumulated_grad is not None:
-            self._reduce_scatter_source = self.unsharded_accumulated_grad
+            self._reduce_scatter_source = "accumulated_grad"
         elif self._unsharded_param is not None:
-            self._reduce_scatter_source = self.unsharded_param.grad
+            self._reduce_scatter_source = "param_grad"
 
     def clear_released_unsharded_grad(self) -> None:
         """Clear a transferred full gradient after the backward API returns.
 
-        Clearing a leaf Parameter's ``.grad`` from a backward final callback
-        prevents MindSpore from publishing the next micro-batch gradient.
-        Pipeline therefore invokes this method immediately after backward.
+        MindSpore may replace a leaf Parameter's ``.grad`` while finalizing
+        backward, so clearing it from an in-graph callback is unreliable.
+        Pipeline invokes this method immediately after backward returns and
+        before the next micro-batch starts.
         """
-        source = self._reduce_scatter_source
-        if source is None:
+        source_field = self._reduce_scatter_source
+        if source_field is None:
             return
-        if self.unsharded_accumulated_grad is source:
+        if source_field == "accumulated_grad":
             self.unsharded_accumulated_grad = None
-        elif self._unsharded_param is not None and self.unsharded_param.grad is source:
+        elif source_field == "param_grad" and self._unsharded_param is not None:
+            # MindSpore may publish a new ``Parameter.grad`` wrapper while
+            # finalizing backward, so object identity cannot identify whether
+            # this is still the gradient packed earlier in the same backward.
+            # This method runs before the next micro-batch starts, making the
+            # field the correct ownership boundary.
             self.unsharded_param.grad = None
-        self._reduce_scatter_source = None
-
-    def _prepare_reduce_scatter_input(
-        self, dtype: Optional[ms.Type]
-    ) -> Tuple[ms.Tensor, ms.Type, Optional[Any], int, bool]:
-        """Prepare a flat gradient and resolve its shard communication group."""
-        if self.unsharded_accumulated_grad is not None:
-            grad = self.unsharded_accumulated_grad_data
         else:
-            grad = self.unsharded_grad_data
-        reduce_dtype = dtype or grad.dtype
-        if grad.dtype != reduce_dtype:
-            grad = grad.to(reduce_dtype)
-        grad = grad.contiguous()
-
-        shard_group_info = getattr(self, "sharded_group_info", None)
-        shard_group = shard_group_info.group if shard_group_info is not None else None
-        shard_group_size = shard_group_info.rank_size if shard_group_info is not None else 1
-        if shard_group is None and isinstance(self.mesh_info, FSDPMeshInfo):
-            shard_group = self.mesh_info.shard_process_group
-            shard_group_size = self.shard_world_size
-
-        needs_collective = self.is_sharded and shard_group is not None and shard_group_size > 1
-        plan_world_size = shard_group_size if needs_collective else 1
-        plan = build_rs_plan(self, grad, plan_world_size)
-        grad_flat = pack_for_reduce_scatter(grad, plan).reshape(-1)
-        apply_gradient_scaling_factor(grad_flat, self.gradient_scaling_factor)
-        return grad_flat, reduce_dtype, shard_group, shard_group_size, needs_collective
-
-    def _prepare_reduce_scatter_output(
-        self,
-        grad_flat: ms.Tensor,
-        reduce_dtype: ms.Type,
-        output_buffer: Optional[ms.Tensor],
-        output_numel: int,
-        needs_collective: bool,
-    ) -> None:
-        """Select or allocate the reduce-scatter result buffer."""
-        if output_buffer is not None:
-            if needs_collective and output_buffer.numel() != output_numel:
-                raise ValueError(
-                    f"output_buffer size mismatch: expected {output_numel}, got {output_buffer.numel()}"
-                )
-            if needs_collective and output_buffer.dtype != reduce_dtype:
-                raise ValueError(
-                    f"output_buffer dtype mismatch: expected {reduce_dtype}, got {output_buffer.dtype}"
-                )
-            if needs_collective:
-                self._reduce_scatter_output = output_buffer
-            else:
-                copy_without_bumping_version(output_buffer, grad_flat)
-                self._reduce_scatter_output = output_buffer
-            return
-
-        if needs_collective:
-            self._reduce_scatter_output = ms.mint.empty(
-                output_numel, dtype=reduce_dtype, device=grad_flat.device.split(":")[0]
+            raise RuntimeError(
+                f"Parameter {self._param_fqn} has an unknown reduce-scatter source "
+                f"field: {source_field}."
             )
-        else:
-            self._reduce_scatter_output = grad_flat
+        self._reduce_scatter_source = None
 
     def reduce_scatter_grad(
         self,
@@ -893,7 +814,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         dtype: Optional[ms.Type] = None,
         reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.AVG,
         output_buffer: Optional[ms.Tensor] = None,
-        release_unsharded_grad: bool = False,
     ) -> Tuple[ms.Tensor, Optional[CommHandle]]:
         """
         Perform reduce-scatter on gradient to reduce and shard the full gradient.
@@ -903,43 +823,87 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             dtype: reduce dtype.
             reduce_op: do reduce-scatter avg or sum.
             output_buffer: Optional pre-allocated output for fused all-reduce groups.
-            release_unsharded_grad: Whether pending communication takes ownership
-                of the full-gradient input so the next micro-batch gets a fresh
-                autograd gradient buffer.
-
         Returns:
             (sharded_grad, handle): Sharded gradient and communication handle.
         """
         self._assert_in_states(ShardedState.UNSHARDED)
-        grad_flat, reduce_dtype, shard_group, shard_group_size, needs_collective = (
-            self._prepare_reduce_scatter_input(dtype)
+
+        # Choose gradient source based on use_accumulated_grad flag
+        if self.unsharded_accumulated_grad is not None:
+            grad = self.unsharded_accumulated_grad_data
+        else:
+            grad = self.unsharded_grad_data
+        reduce_dtype = dtype or grad.dtype
+        if grad.dtype != reduce_dtype:
+            grad = grad.to(reduce_dtype)
+        grad = grad.contiguous()
+        shard_group_info = getattr(self, "sharded_group_info", None)
+        shard_group = shard_group_info.group if shard_group_info is not None else None
+        shard_group_size = shard_group_info.rank_size if shard_group_info is not None else 1
+        if shard_group is None and isinstance(self.mesh_info, FSDPMeshInfo):
+            shard_group = self.mesh_info.shard_process_group
+            shard_group_size = self.shard_world_size
+        plan_world_size = (
+            shard_group_size
+            if self.is_sharded and shard_group is not None and shard_group_size > 1
+            else 1
         )
-        output_numel = grad_flat.numel() // shard_group_size if needs_collective else grad_flat.numel()
-        self._prepare_reduce_scatter_output(
-            grad_flat,
-            reduce_dtype,
-            output_buffer,
-            output_numel,
-            needs_collective,
-        )
-        self.reduce_scatter_handle = None
+        grad = grad.contiguous()
+        plan = build_rs_plan(self, grad, plan_world_size)
+        grad_flat = pack_for_reduce_scatter(grad, plan).reshape(-1)
+        # apply gradient_scaling_factor (reduce-scatter leg)
+        apply_gradient_scaling_factor(grad_flat, self.gradient_scaling_factor)
+        # If parameter is not sharded (below threshold), no reduce-scatter needed
+        if not self.is_sharded:
+            if output_buffer is not None:
+                copy_without_bumping_version(output_buffer, grad_flat)
+                self._reduce_scatter_output = output_buffer
+            else:
+                self._reduce_scatter_output = grad_flat
+            self.reduce_scatter_handle = None
+            return self._reduce_scatter_output, None
+
+        if shard_group is None or shard_group_size <= 1:
+            if output_buffer is not None:
+                copy_without_bumping_version(output_buffer, grad_flat)
+                self._reduce_scatter_output = output_buffer
+            else:
+                self._reduce_scatter_output = grad_flat
+            self.reduce_scatter_handle = None
+            return self._reduce_scatter_output, None
+
+        # Calculate output size
+        output_numel = grad_flat.numel() // shard_group_size
+        if output_buffer is not None:
+            if output_buffer.numel() != output_numel:
+                raise ValueError(
+                    f"output_buffer size mismatch: expected {output_numel}, got {output_buffer.numel()}"
+                )
+            if output_buffer.dtype != reduce_dtype:
+                raise ValueError(
+                    f"output_buffer dtype mismatch: expected {reduce_dtype}, got {output_buffer.dtype}"
+                )
+            self._reduce_scatter_output = output_buffer
+        else:
+            self._reduce_scatter_output = ms.mint.empty(
+                output_numel, dtype=reduce_dtype, device=grad.device.split(":")[0]
+            )
 
         # Ascend HCCL DistCommReduceScatter rejects non-contiguous tensors.
         # ``pack_for_reduce_scatter`` on a shard-dim-0 path returns the input
         # tensor as-is (potentially a view from to_local() / redistribute()),
         # and the trailing ``.reshape(-1)`` may yield a view. Force contiguous
         # storage here (no-op when already contig).
-        if needs_collective:
-            grad_flat = grad_flat.contiguous()
-            self.reduce_scatter_handle = dist.reduce_scatter_tensor(
-                self._reduce_scatter_output,
-                grad_flat,
-                op=reduce_op,
-                group=shard_group,
-                async_op=async_op,
-            )
-        if release_unsharded_grad:
-            self._release_unsharded_grad_for_reduce_scatter(grad_flat)
+        grad_flat = grad_flat.contiguous()
+
+        # Execute reduce_scatter_tensor
+        self.reduce_scatter_handle = dist.reduce_scatter_tensor(
+            self._reduce_scatter_output,
+            grad_flat,
+            op=reduce_op,
+            group=shard_group,
+            async_op=async_op,
+        )
 
         return self._reduce_scatter_output, self.reduce_scatter_handle
 
@@ -1040,6 +1004,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         Reshapes ``reduced_grad`` to match the local shard, optionally
         offloads to CPU, then accumulates or assigns onto ``grad`` or
         ``main_grad`` depending on the mixed-precision policy.
+
         Args:
             reduced_grad (ms.Tensor): Gradient after reduce-scatter
                 and/or all-reduce.
@@ -1048,7 +1013,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 then realigns to local storage dtype for issue #215.
             clear_unsharded_grad: Whether to clear whichever full gradient is
                 currently attached to the parameter. Deferred reduce-scatter
-                paths clear only their recorded source object instead.
+                paths release their recorded source field after backward
+                returns instead.
         """
         if self.mp_policy.apply_grad_on_fp32_main_grad:
             if not hasattr(self.sharded_param, "main_grad"):

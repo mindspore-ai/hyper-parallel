@@ -538,6 +538,13 @@ class PipelineStage(PipelineStageBase):
             hsdp_states.append(sub_mod_state)
 
         fsdp_module.set_requires_gradient_sync(True)
+        feature_states = [
+            hsdp_state
+            for hsdp_state in hsdp_states
+            if getattr(hsdp_state, "sharded_accumulated_grad", False)
+        ]
+        if feature_states:
+            fsdp_module.set_requires_all_reduce(True)
         for hsdp_state in hsdp_states:
             if getattr(hsdp_state, "sharded_accumulated_grad", False):
                 continue
@@ -550,11 +557,6 @@ class PipelineStage(PipelineStageBase):
         # last module's reduce-scatter would lag one optimizer step.
         fsdp_module.hsdp_scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
 
-        feature_states = [
-            hsdp_state
-            for hsdp_state in hsdp_states
-            if getattr(hsdp_state, "sharded_accumulated_grad", False)
-        ]
         # Launch all state buckets before waiting so independent replicate
         # groups can make progress concurrently.
         for hsdp_state in feature_states:
@@ -565,8 +567,8 @@ class PipelineStage(PipelineStageBase):
             if hsdp_state.reshard_after_backward:
                 hsdp_state.shard()
 
-    def flush_sharded_accumulation_after_backward(self) -> None:
-        """Flush no-sync gradients that become visible after backward returns."""
+    def release_sharded_grad_sources_after_backward(self) -> None:
+        """Release full gradients already packed by native fused reduce-scatter."""
         if not isinstance(self.submodule, HSDPModule):
             return
         seen_states = set()
@@ -578,13 +580,13 @@ class PipelineStage(PipelineStageBase):
             if state_id in seen_states:
                 continue
             seen_states.add(state_id)
-            flush = getattr(
+            release = getattr(
                 hsdp_state,
-                "flush_sharded_accumulation_after_backward",
+                "release_sharded_grad_sources_after_backward",
                 None,
             )
-            if callable(flush):
-                flush()
+            if callable(release):
+                release()
 
     def _build_padded_sens(self, micro_index):
         """Build an N-length sens list aligned with the forward output structure.

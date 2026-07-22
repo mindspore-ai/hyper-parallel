@@ -516,23 +516,15 @@ def _validate_hsdp_optimizer_level(optimizer_level: str) -> None:
         )
 
 
-def _validate_hsdp_reduce_dtype(
-    platform_type: PlatformType,
-    reduce_dtype,
-    argument_name: str = "reduce_dtype",
-) -> None:
+def _validate_hsdp_reduce_dtype(platform_type: PlatformType, reduce_dtype) -> None:
     if platform_type == PlatformType.MINDSPORE:
         from mindspore._c_expression.typing import Type
         if reduce_dtype is not None and not isinstance(reduce_dtype, Type):
-            raise ValueError(
-                f"{argument_name} must be mindspore.dtype but got {reduce_dtype}."
-            )
+            raise ValueError(f"reduce_dtype must be mindspore.dtype but got {reduce_dtype}.")
         return
     import torch
     if reduce_dtype is not None and not isinstance(reduce_dtype, torch.dtype):
-        raise ValueError(
-            f"{argument_name} must be torch.dtype but got {reduce_dtype}."
-        )
+        raise ValueError(f"reduce_dtype must be torch.dtype but got {reduce_dtype}.")
 
 
 def _check_hsdp_input_valid(platform_type, module, options: HsdpValidationOptions):
@@ -695,15 +687,13 @@ def fully_shard(
             view-backed parameters.
 
         sharded_accumulated_grad (bool, default=False):
-            MindSpore-only memory-first gradient accumulation. No-sync
-            micro-batches reduce-scatter gradients immediately and accumulate
-            the local shards. The HSDP replicate-axis all-reduce is deferred
-            until the final pipeline gradient-reduction action. This mode
-            requires an explicit FSDP/HSDP ``mesh``. Enabling it also enables
-            communication fusion and launches each parameter group's
-            reduce-scatter from its final gradient-ready hook. At most one
-            fused reduce-scatter is kept pending, and communication uses the
-            mixed-precision policy's reduction dtype.
+            MindSpore-only memory-first pipeline gradient accumulation. Every
+            micro-batch uses the native fused reduce-scatter path and
+            accumulates local gradient shards. HSDP defers only the
+            replicate-axis all-reduce until the pipeline's final gradient
+            action. This mode requires an explicit FSDP/HSDP ``mesh`` and
+            enables communication fusion. It reuses the native communication
+            context, which keeps at most one fused reduce-scatter tail pending.
 
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.

@@ -42,7 +42,13 @@ def test_fully_shard_simu_pp_suite():
                       worker_num=4, local_worker_num=4),
         MindSporeCase(
             _TEST_FILE,
-            "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_fixed_pending",
+            "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_native_tail",
+            worker_num=4,
+            local_worker_num=4,
+        ),
+        MindSporeCase(
+            _TEST_FILE,
+            "test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_replicate_params",
             worker_num=4,
             local_worker_num=4,
         ),

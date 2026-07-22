@@ -17,6 +17,7 @@
 # pylint: disable=protected-access
 
 import os
+import threading
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -73,6 +74,26 @@ class FakeMesh:
 
 class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
     """Test scheduler compatibility-mode mesh resolution and hook wrapping."""
+
+    def test_scheduler_state_is_thread_local(self):
+        """Concurrent pipeline forward/backward threads must not overwrite each other's state."""
+        scheduler = _make_scheduler()
+        worker_state = []
+
+        def _set_worker_state() -> None:
+            worker_state.append(scheduler.scheduler_state)
+            scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+            worker_state.append(scheduler.scheduler_state)
+
+        worker = threading.Thread(target=_set_worker_state)
+        worker.start()
+        worker.join()
+
+        self.assertEqual(
+            worker_state,
+            [None, FSDPSchedulerState.PRE_BACKWARD],
+        )
+        self.assertEqual(scheduler.scheduler_state, FSDPSchedulerState.PRE_FORWARD)
 
     def test_zero_grad_register_hooks_and_platform_validation(self):
         """Small delegating methods should use existing state/platform extension points."""
@@ -266,14 +287,14 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         MindSporeHSDPSchedulerV2._backward_hook(scheduler)
         scheduler._hsdp_backward_hook.assert_not_called()
 
-    def test_root_backward_defers_no_sync_sharded_accumulation_until_forced(self):
-        """No-sync callbacks should leave the tail RS pending for cross-micro overlap."""
+    def test_root_backward_defers_sharded_accumulation_tail_until_forced(self):
+        """Deferred HSDP all-reduce should leave the tail RS pending across micros."""
         scheduler = _make_scheduler()
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
         scheduler._is_root = True
         scheduler._hsdp_backward_hook = MagicMock()
         scheduler.hsdp_state.sharded_accumulated_grad = True
-        scheduler.hsdp_state.reduce_grads = False
+        scheduler.hsdp_state.requires_all_reduce = False
         HSDPSchedulerV2.root_bp_state = True
 
         with patch.object(scheduler_mod, "get_comm_ctx") as get_comm_ctx:

@@ -431,19 +431,24 @@ class PipelineScheduleRuntime(ABC):
         )
 
     def _prepare_fsdp_backward(self):
-        """Disable HSDP post-backward actions once for the current pipeline run.
+        """Configure HSDP gradient reduction once for the current pipeline run.
 
-        Pipeline accumulates gradients across all micro-batches and executes
-        the reduction through ``FSDP_REDUCE_GRAD`` after the last backward.
-        ``execute_reduce_grad`` restores both flags, so they must be disabled
-        once again at the beginning of the next run.
+        The default path accumulates full gradients and reduces them through
+        ``FSDP_REDUCE_GRAD``. Sharded accumulation instead runs native fused
+        reduce-scatter for every micro-batch and defers only HSDP's replicate
+        all-reduce to that final action.
         """
         for stage in self.stages:
             if not stage.has_backward:
                 continue
             if isinstance(stage.submodule, HSDPModule):
                 stage.submodule.set_reshard_after_backward(False)
-                stage.submodule.set_requires_gradient_sync(False)
+                hsdp_state = stage.submodule.hsdp_scheduler.hsdp_state
+                if getattr(hsdp_state, "sharded_accumulated_grad", False):
+                    stage.submodule.set_requires_gradient_sync(True)
+                    stage.submodule.set_requires_all_reduce(False)
+                else:
+                    stage.submodule.set_requires_gradient_sync(False)
 
     def _inject_local_pp_swap_actions(self):
         """Annotate the local rank schedule with pipeline activation-swap actions."""

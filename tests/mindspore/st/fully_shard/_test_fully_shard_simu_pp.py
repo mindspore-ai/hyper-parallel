@@ -90,6 +90,7 @@ def _wrap_with_fsdp(
     *,
     sharded_accumulated_grad: bool = False,
     per_layer_fsdp: bool = False,
+    replicate_biases: bool = False,
 ) -> FullModel:
     """Apply per-layer + module-level fully_shard, with sum-reduce for exact grad parity."""
     mp_policy = MixedPrecisionPolicy(
@@ -104,6 +105,12 @@ def _wrap_with_fsdp(
         "mp_policy": mp_policy,
         "sharded_accumulated_grad": sharded_accumulated_grad,
     }
+    if replicate_biases:
+        fsdp_kwargs["replicate_params"] = {
+            param
+            for name, param in model.parameters_and_names()
+            if name.endswith("bias")
+        }
     if per_layer_fsdp:
         for layer in model.layers:
             fully_shard(layer, **fsdp_kwargs)
@@ -152,8 +159,8 @@ def _run_fsdp_1f1b(fsdp_model: FullModel, inputs_per_mb: list[Tensor], *,
     """Run 1F1B-style micro-batching on a fully_shard-wrapped model.
 
     The default path syncs only the last micro-batch. The sharded-accumulation
-    path keeps every micro-batch in no-sync mode and explicitly finalizes after
-    backward, matching PipelineStage's FSDP_REDUCE_GRAD action.
+    path runs native reduce-scatter for every micro-batch, defers only HSDP's
+    replicate all-reduce, and finalizes it in PipelineStage's FSDP_REDUCE_GRAD.
     """
     if use_explicit_unshard:
         for layer in fsdp_model.layers:
@@ -165,9 +172,13 @@ def _run_fsdp_1f1b(fsdp_model: FullModel, inputs_per_mb: list[Tensor], *,
     hsdp_states = _get_hsdp_states(fsdp_model)
     losses = []
     last_idx = len(inputs_per_mb) - 1
+    if explicit_sharded_finalize:
+        fsdp_model.set_requires_gradient_sync(True)
+        fsdp_model.set_requires_all_reduce(False)
     for mb_idx, inp in enumerate(inputs_per_mb):
         is_last = mb_idx == last_idx and not explicit_sharded_finalize
-        fsdp_model.set_requires_gradient_sync(is_last)
+        if not explicit_sharded_finalize:
+            fsdp_model.set_requires_gradient_sync(is_last)
         fsdp_model.set_is_last_backward(is_last)
         if not reshard_after_backward:
             fsdp_model.set_reshard_after_backward(is_last)
@@ -175,12 +186,13 @@ def _run_fsdp_1f1b(fsdp_model: FullModel, inputs_per_mb: list[Tensor], *,
         loss.backward()
         if explicit_sharded_finalize:
             for hsdp_state in hsdp_states:
-                hsdp_state.flush_sharded_accumulation_after_backward()
+                hsdp_state.release_sharded_grad_sources_after_backward()
         losses.append(loss)
     if explicit_sharded_finalize:
         fsdp_model.set_is_last_backward(True)
         fsdp_model.set_reshard_after_backward(True)
         fsdp_model.set_requires_gradient_sync(True)
+        fsdp_model.set_requires_all_reduce(True)
         fsdp_model.hsdp_scheduler._root_backward_hook(  # pylint: disable=protected-access
             force_reduce=True
         )
@@ -218,10 +230,14 @@ def _assert_grad_parity(case_name: str, rank: int,
     for idx, (fsdp_p, ref_p) in enumerate(zip(fsdp_params, ref_params)):
         if fsdp_p.grad is None and ref_p.grad is None:
             continue
-        ref_gradient_chunk_size = ref_p.grad.shape[0] // gradient_shard_size
         fsdp_grad = _to_numpy(fsdp_p.grad)
-        start = gradient_shard_rank * ref_gradient_chunk_size
-        ref_grad = _to_numpy(ref_p.grad[start: start + ref_gradient_chunk_size])
+        full_ref_grad = _to_numpy(ref_p.grad)
+        if fsdp_grad.shape == full_ref_grad.shape:
+            ref_grad = full_ref_grad
+        else:
+            ref_gradient_chunk_size = ref_p.grad.shape[0] // gradient_shard_size
+            start = gradient_shard_rank * ref_gradient_chunk_size
+            ref_grad = _to_numpy(ref_p.grad[start: start + ref_gradient_chunk_size])
         assert np.allclose(fsdp_grad, ref_grad, rtol=rtol, atol=atol), (
             f"{case_name}, rank {rank}, param {idx} ({fsdp_p.name}): "
             f"fsdp_grad={fsdp_grad}, ref_grad={ref_grad}"
@@ -235,7 +251,8 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
                                                 use_hsdp_mesh: bool = False,
                                                 grad_rtol: float = RTOL,
                                                 grad_atol: float = ATOL,
-                                                per_layer_fsdp: bool = False) -> None:
+                                                per_layer_fsdp: bool = False,
+                                                replicate_biases: bool = False) -> None:
     """Run fully_shard 1F1B-style micro-batching and compare loss + grad against the single-card baseline."""
     D.init()
     rank = D.get_rank()
@@ -262,6 +279,7 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
         dp_mesh,
         sharded_accumulated_grad=sharded_accumulated_grad,
         per_layer_fsdp=per_layer_fsdp,
+        replicate_biases=replicate_biases,
     )
     ref_model = FullModel(copy.deepcopy(base_layers))
 
@@ -303,6 +321,7 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
         f"reshard_after_backward={reshard_after_backward}, "
         f"sharded_accumulated_grad={sharded_accumulated_grad}, "
         f"per_layer_fsdp={per_layer_fsdp}, "
+        f"replicate_biases={replicate_biases}, "
         f"use_hsdp_mesh={use_hsdp_mesh}"
     )
 
@@ -328,7 +347,7 @@ def test_fully_shard_simu_pp_explicit_unshard_no_reshard():
 
 
 def test_fully_shard_simu_pp_sharded_accumulated_grad():
-    """Pipeline-style no-sync micro-batches should accumulate reduced gradient shards."""
+    """Pipeline-style micro-batches should accumulate native reduced gradient shards."""
     _assert_fully_shard_simu_pp_match_reference(
         case_name="fully_shard_simu_pp_sharded_accumulated_grad",
         num_microbatches=4,
@@ -350,14 +369,27 @@ def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad():
     )
 
 
-def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_fixed_pending():
-    """Multiple FSDP states should keep the fixed one-RS window without losing gradients."""
+def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_native_tail():
+    """Multiple FSDP states should reuse the single native tail RS without losing gradients."""
     _assert_fully_shard_simu_pp_match_reference(
-        case_name="fully_shard_simu_pp_hsdp_sharded_accumulated_grad_fixed_pending",
+        case_name="fully_shard_simu_pp_hsdp_sharded_accumulated_grad_native_tail",
         num_microbatches=3,
         use_explicit_unshard=False,
         reshard_after_backward=False,
         sharded_accumulated_grad=True,
         use_hsdp_mesh=True,
         per_layer_fsdp=True,
+    )
+
+
+def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_replicate_params():
+    """Replicated bias gradients should follow the same per-micro release lifecycle."""
+    _assert_fully_shard_simu_pp_match_reference(
+        case_name="fully_shard_simu_pp_hsdp_sharded_accumulated_grad_replicate_params",
+        num_microbatches=3,
+        use_explicit_unshard=False,
+        reshard_after_backward=False,
+        sharded_accumulated_grad=True,
+        use_hsdp_mesh=True,
+        replicate_biases=True,
     )

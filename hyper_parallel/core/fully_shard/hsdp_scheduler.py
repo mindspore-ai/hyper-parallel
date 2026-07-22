@@ -14,6 +14,7 @@
 # ============================================================================
 """HSDP scheduler"""
 import functools
+import threading
 from typing import Any, List, Optional, Tuple, Union
 
 from hyper_parallel.platform import get_platform
@@ -42,6 +43,22 @@ class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
     root_bp_state = False
 
+    @property
+    def scheduler_state(self) -> Optional[FSDPSchedulerState]:
+        """Return the scheduler state owned by the current execution thread."""
+        state_local = getattr(self, "_scheduler_state_local", None)
+        if state_local is None:
+            return None
+        return getattr(state_local, "value", None)
+
+    @scheduler_state.setter
+    def scheduler_state(self, state: Optional[FSDPSchedulerState]) -> None:
+        """Set the scheduler state for the current execution thread."""
+        state_local = getattr(self, "_scheduler_state_local", None)
+        if state_local is None:
+            state_local = threading.local()
+            self._scheduler_state_local = state_local
+        state_local.value = state
 
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
                  reshard_after_forward, shard_placement_fn,

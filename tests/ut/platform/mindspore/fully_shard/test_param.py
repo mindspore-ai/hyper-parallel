@@ -51,10 +51,7 @@ def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
     obj.all_gather_outputs = []
     obj.gradient_scaling_factor = None
     obj.mp_policy = MixedPrecisionPolicy()
-    obj._reduce_scatter_input = None
     obj._reduce_scatter_source = None
-    obj._internal_param_hooks = []
-    obj._internal_hook_ids = set()
     return obj
 
 
@@ -446,11 +443,7 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param._orig_dtensor_placements = (Shard(0),)
         mock_from_local.return_value = "wrapped-dtensor"
 
-        unsharded_param = (
-            MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output(
-                hsdp_param
-            )
-        )
+        unsharded_param = MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output(hsdp_param)
 
         mock_from_local.assert_called_once()
         np.testing.assert_allclose(
@@ -480,15 +473,28 @@ class TestMindSporeParam(unittest.TestCase):
         self.assertIsNone(hsdp_param.reduce_scatter_handle)
 
     def test_clear_reduce_scatter_output_clears_cached_tensor(self):
-        """Clear helper should drop cached reduce-scatter input and output."""
+        """Clear helper should drop the cached reduce-scatter output."""
         hsdp_param = _new_hsdp_param_v2()
-        hsdp_param._reduce_scatter_input = "retained-input"
         hsdp_param._reduce_scatter_output = "reduced"
 
         MindSporeHSDPParamV2.clear_reduce_scatter_output(hsdp_param)
 
-        self.assertIsNone(hsdp_param._reduce_scatter_input)
         self.assertIsNone(hsdp_param._reduce_scatter_output)
+
+    def test_clear_released_unsharded_grad_clears_published_param_grad(self):
+        """Release clears a completed micro grad even if MindSpore replaced its wrapper."""
+        hsdp_param = _new_hsdp_param_v2()
+        old_grad = ms.Tensor(np.ones((2,), dtype=np.float32))
+        next_grad = ms.Tensor(np.full((2,), 2.0, dtype=np.float32))
+        hsdp_param.unsharded_accumulated_grad = None
+        hsdp_param._unsharded_param = SimpleNamespace(grad=old_grad)
+
+        MindSporeHSDPParamV2._retain_unsharded_grad_source_for_reduce_scatter(hsdp_param)
+        hsdp_param._unsharded_param.grad = next_grad
+        MindSporeHSDPParamV2.clear_released_unsharded_grad(hsdp_param)
+
+        self.assertIsNone(hsdp_param._unsharded_param.grad)
+        self.assertIsNone(hsdp_param._reduce_scatter_source)
 
     def test_all_reduce_output_waits_for_async_handle(self):
         """Cached all-reduce outputs should wait on outstanding async work."""
@@ -526,28 +532,6 @@ class TestMindSporeParam(unittest.TestCase):
         MindSporeHSDPParamV2._save_backward_hooks(hsdp_param, source)
 
         self.assertEqual(hsdp_param._orig_param_hooks, [hook_a, hook_b])
-
-    def test_internal_backward_hook_migrates_after_user_hooks(self):
-        """The grad-ready hook should run after user hooks and stay out of the user hook list."""
-        hsdp_param = _new_hsdp_param_v2()
-
-        def _user_hook(grad):
-            return grad
-
-        def _internal_hook(grad):
-            return grad
-
-        hsdp_param._orig_param_hooks = [_user_hook]
-        hsdp_param._saved_hook_ids = {id(_user_hook)}
-        hsdp_param._register_internal_backward_hook(_internal_hook)
-        source = HookSourceParam([_user_hook, _internal_hook])
-
-        MindSporeHSDPParamV2._save_backward_hooks(hsdp_param, source)
-        replacement = HookableParam(requires_grad=True)
-        MindSporeHSDPParamV2._migrate_backward_hooks(hsdp_param, replacement)
-
-        self.assertEqual(hsdp_param._orig_param_hooks, [_user_hook])
-        self.assertEqual(replacement.registered_hooks, [_user_hook, _internal_hook])
 
     def test_setattr_on_modules_migrates_saved_hooks_once(self):
         """Swapping module params should migrate saved hooks to the active replacement once."""
@@ -643,9 +627,7 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param = _new_hsdp_param_v2()
         hsdp_param.unsharded_accumulated_grad = ms.Tensor(np.ones((2,), dtype=np.float32))
         hsdp_param._unsharded_param = SimpleNamespace(grad="dtensor-grad")
-        hsdp_param._to_local_unsharded_grad = MagicMock(
-            return_value=ms.Tensor(np.full((2,), 3.0, dtype=np.float32))
-        )
+        hsdp_param._to_local_unsharded_grad = MagicMock(return_value=ms.Tensor(np.full((2,), 3.0, dtype=np.float32)))
 
         MindSporeHSDPParamV2.accumulate_unsharded_grad_if_needed(hsdp_param)
 
@@ -795,23 +777,14 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param._spmd_shard_mesh_dim = 0
         hsdp_param._spmd_placements = (StridedShard(1, split_factor=2), Shard(1))
 
-        reduced_grad, _ = MindSporeHSDPParamV2.reduce_scatter_grad(
-            hsdp_param,
-            async_op=False,
-            release_unsharded_grad=True,
-        )
+        reduced_grad, _ = MindSporeHSDPParamV2.reduce_scatter_grad(hsdp_param, async_op=False)
 
         expected_packed = np.concatenate(
             np.array_split(np.arange(32, dtype=np.float32).reshape(4, 8), 2, axis=1),
             axis=0,
         ).reshape(-1)
         self.assertEqual(reduced_grad.numel(), 16)
-        reduce_scatter_input = mock_reduce_scatter.call_args.args[1]
-        np.testing.assert_allclose(reduce_scatter_input.asnumpy(), expected_packed)
-        self.assertIs(hsdp_param._reduce_scatter_input, reduce_scatter_input)
-        self.assertIsNotNone(hsdp_param._unsharded_param.grad)
-        MindSporeHSDPParamV2.clear_released_unsharded_grad(hsdp_param)
-        self.assertIsNone(hsdp_param._unsharded_param.grad)
+        np.testing.assert_allclose(mock_reduce_scatter.call_args.args[1].asnumpy(), expected_packed)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.all_reduce")
     def test_all_reduce_grad_uses_layout_driven_unsharded_group(self, mock_all_reduce):
