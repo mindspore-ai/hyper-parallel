@@ -772,6 +772,48 @@
       cursor: not-allowed;
     }
 
+    /* ── Detail Tab Bar ── */
+    .detail-tab-bar {
+      display: flex;
+    }
+
+    .detail-tab-btn {
+      flex: 1;
+      padding: 9px 24px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 0;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.45);
+      color: var(--text);
+      text-align: center;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+
+    .detail-tab-btn:not(:last-child) {
+      border-right: 0;
+    }
+
+    .detail-tab-btn:first-child {
+      border-radius: 12px 0 0 12px;
+    }
+
+    .detail-tab-btn:last-child {
+      border-radius: 0 12px 12px 0;
+    }
+
+    .detail-tab-btn.active {
+      background: linear-gradient(135deg, #0f766e, #2563eb);
+      color: #fff;
+    }
+
+    .detail.card {
+      border-top: 0;
+      border-radius: 0 0 20px 20px;
+    }
+
     #mvizStatus {
       text-align: center;
       padding: 4px 12px;
@@ -1123,7 +1165,25 @@
   <div class="app">
     <aside class="sidebar card">
       <h1>显存分析浏览器</h1>
-      <p class="lead">本地打开即可。横轴显示时间点，纵轴显示显存。支持滚轮缩放、图内拖拽平移，页面本身不会被超宽表格撑开。</p>
+
+      <div class="block">
+        <div class="block-title">使用说明</div>
+        <div class="hint" style="margin-top:0;">
+          点击或拖拽 CSV 文件到页面即可加载，支持本地离线使用。
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>图表操作：</b>滚轮缩放时间轴，Shift + 滚轮缩放显存轴，拖拽平移，Alt + 拖拽框选放大。单击曲线上的点可查看该时刻的存活/后续明细。
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>折线图 / 生命周期：</b>顶部按钮切换。折线图适合查看全局趋势和峰值；生命周期适合查看内存块分配-释放时间线。大文件建议先用折线图。
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>明细表：</b>峰值明细查看峰值时刻存活块，差异分析对比两个时间点的分配变化，峰值解释器按维度聚合分析峰值构成。
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>横线标记：</b>点"点图加线"后点击图表添加参考线，用于标记关键时间点。
+        </div>
+      </div>
 
       <div class="block">
         <div class="block-title">文件</div>
@@ -1189,31 +1249,6 @@
         </div>
       </div>
 
-      <div class="block">
-        <div class="block-title">激活点差异分析</div>
-        <div class="diff-setup">
-          <div class="diff-setup-title">分析点 A</div>
-          <div class="diff-point-row">
-            <span class="diff-point-label">时间戳</span>
-            <input id="diffATime" type="number" placeholder="输入时间或点击曲线">
-            <button id="diffASetClick" type="button" title="从点击的曲线点设置">点击</button>
-            <select id="diffARefLine">
-              <option value="">-- 参考线 --</option>
-            </select>
-          </div>
-          <div class="diff-setup-title" style="margin-top:8px;">分析点 B</div>
-          <div class="diff-point-row">
-            <span class="diff-point-label">时间戳</span>
-            <input id="diffBTime" type="number" placeholder="输入时间或点击曲线">
-            <button id="diffBSetClick" type="button" title="从点击的曲线点设置">点击</button>
-            <select id="diffBRefLine">
-              <option value="">-- 参考线 --</option>
-            </select>
-          </div>
-          <button id="diffRunBtn" class="diff-run-btn" disabled>运行差异分析</button>
-        </div>
-        <div class="hint">设置 A/B 两个时间点后，比较两个时刻的存活显存分配差异。</div>
-      </div>
     </aside>
 
     <main class="content">
@@ -1249,7 +1284,13 @@
         </div>
       </section>
 
-      <section class="detail card">
+      <div class="detail-tab-bar" id="detailTabBar" style="display:none;">
+        <button class="detail-tab-btn active" data-tab="detail" type="button">峰值明细</button>
+        <button class="detail-tab-btn" data-tab="diff" type="button">激活点差异分析</button>
+        <button class="detail-tab-btn" data-tab="interp" type="button">峰值解释器</button>
+      </div>
+
+      <section class="detail card" id="detailCard" style="display:none;">
         <div class="column-panel">
           <div class="column-title">显示列</div>
           <div class="column-list" id="columnList"></div>
@@ -1376,6 +1417,23 @@
           </div>
         </div>
 
+        <div class="diff-setup">
+          <div class="diff-setup-title">分析点 A</div>
+          <div class="diff-point-row">
+            <span class="diff-point-label">时间戳</span>
+            <input id="diffATime" type="number" placeholder="输入时间或点击曲线">
+            <button id="diffASetClick" type="button" title="从点击的曲线点设置">点击</button>
+          </div>
+          <div class="diff-setup-title" style="margin-top:8px;">分析点 B</div>
+          <div class="diff-point-row">
+            <span class="diff-point-label">时间戳</span>
+            <input id="diffBTime" type="number" placeholder="输入时间或点击曲线">
+            <button id="diffBSetClick" type="button" title="从点击的曲线点设置">点击</button>
+          </div>
+          <button id="diffRunBtn" class="diff-run-btn" disabled>运行差异分析</button>
+        </div>
+        <div class="hint">设置 A/B 两个时间点后，比较两个时刻的存活显存分配差异。</div>
+
         <div class="diff-summary" id="diffSummaryGrid" style="display:none;"></div>
 
         <div id="diffContent" style="display:none;">
@@ -1474,6 +1532,8 @@
       statActualPeak: document.getElementById("statActualPeak"),
       detailMode: document.getElementById("detailMode"),
       detailSummary: document.getElementById("detailSummary"),
+      detailCard: document.getElementById("detailCard"),
+      detailTabBar: document.getElementById("detailTabBar"),
       detailHeadRow: document.getElementById("detailHeadRow"),
       detailBody: document.getElementById("detailBody"),
       columnList: document.getElementById("columnList"),
@@ -1488,8 +1548,6 @@
       diffBTime: document.getElementById("diffBTime"),
       diffASetClick: document.getElementById("diffASetClick"),
       diffBSetClick: document.getElementById("diffBSetClick"),
-      diffARefLine: document.getElementById("diffARefLine"),
-      diffBRefLine: document.getElementById("diffBRefLine"),
       diffRunBtn: document.getElementById("diffRunBtn"),
       diffCard: document.getElementById("diffCard"),
       diffSummary: document.getElementById("diffSummary"),
@@ -1884,7 +1942,6 @@
         const addr = parseInt((row.device_addr || "0x0").replace(/^0x/i, ""), 16);
         const size = parseInt(row.size, 10);
         const stream = row.stream ? parseInt(row.stream, 10) : 0;
-        const frames = parsePythonStack(row.python_stack || "");
 
         events[eventCount++] = {
           action: "alloc",
@@ -1892,10 +1949,10 @@
           size,
           stream,
           time_us: start,
-          frames,
         };
 
         if (endStr === INT64_MAX_STR || !endStr || Number(endStr) >= 9e18) {
+          const frames = parsePythonStack(row.python_stack || "");
           stillAlive.push({ addr, size, frames });
         } else {
           const endTime = parseInt(endStr, 10);
@@ -1906,7 +1963,6 @@
               size,
               stream,
               time_us: endTime,
-              frames,
             };
           }
         }
@@ -2390,8 +2446,8 @@
 
     function updateDiffUI() {
       const results = state.diffResults;
-      elements.diffCard.style.display = results ? "" : "none";
       if (!results) return;
+      switchDetailTab("diff");
 
       elements.diffSummary.textContent =
         `A 点（${formatNumber(results.timeA)}）：${formatNumber(results.countA)} blocks, ${formatBytes(results.totalSizeA)} → B 点（${formatNumber(results.timeB)}）：${formatNumber(results.countB)} blocks, ${formatBytes(results.totalSizeB)}`;
@@ -2436,18 +2492,16 @@
       tabs.forEach((tab) => {
         tab.classList.remove("active-add", "active-release", "active-common");
         const cat = tab.dataset.category;
-        if (cat === "added") tab.classList.add("active-add");
-        if (cat === "release") tab.classList.add("active-release");
-        if (cat === "common") tab.classList.add("active-common");
+
+        const activeClass = state.diffCategory === cat
+          ? (cat === "added" ? "active-add" : cat === "released" ? "active-release" : "active-common")
+          : "";
+        if (activeClass) tab.classList.add(activeClass);
 
         const countKey = cat === "added" ? "addedCount" : cat === "released" ? "releasedCount" : "commonCount";
         const sizeKey = cat === "added" ? "addedSize" : cat === "released" ? "releasedSize" : "commonSize";
         const result = state.diffResults;
         const catLabel = cat === "added" ? "新增" : cat === "released" ? "释放" : "共同存活";
-        const activeClass = state.diffCategory === cat
-          ? (cat === "added" ? "active-add" : cat === "released" ? "active-release" : "active-common")
-          : "";
-        if (activeClass) tab.classList.add(activeClass);
         tab.textContent = `${catLabel} (${formatNumber(result ? result[countKey] : 0)})`;
       });
     }
@@ -2597,22 +2651,6 @@
           setStatus(`差异分析失败: ${err.message}`);
         }
       }, 0);
-    }
-
-    function updateDiffRefLineSelects() {
-      [elements.diffARefLine, elements.diffBRefLine].forEach((select) => {
-        const currentValue = select.value;
-        select.innerHTML = '<option value="">-- 参考线 --</option>';
-        for (const line of state.referenceLines) {
-          const option = document.createElement("option");
-          option.value = String(line.value);
-          option.textContent = `${formatBytes(line.value)} (${formatNumber(line.value)})`;
-          select.appendChild(option);
-        }
-        if (Array.from(select.options).some((o) => o.value === currentValue)) {
-          select.value = currentValue;
-        }
-      });
     }
 
     function setDiffPointFromClick(target) {
@@ -2841,12 +2879,8 @@
       }
       breakdowns["is_small"] = Array.from(smallBuckets.values()).filter((x) => x.count > 0).sort((a, b) => b.size - a.size);
 
-      // Conclusions
+      // Conclusions (non-dimension-specific ones)
       const conclusions = [];
-      const topItem = breakdowns["type"][0];
-      if (topItem) {
-        conclusions.push({ text: `最大 type 贡献: "${escapeHtml(topItem.value)}" 占 ${topItem.pct.toFixed(1)}%（${formatBytes(topItem.size)}），共 ${formatNumber(topItem.count)} 个 block。`, cls: "info" });
-      }
 
       const topFrame = breakdowns["python_stack_frame"][0];
       if (topFrame && topFrame.pct > 20) {
@@ -2896,6 +2930,7 @@
         elements.peakInterpCard.style.display = "none";
         return;
       }
+      switchDetailTab("interp");
       elements.peakInterpCard.style.display = "";
       elements.peakInterpContent.style.display = "";
       elements.peakInterpDesc.textContent =
@@ -2917,8 +2952,13 @@
         </div>
       `;
 
-      // Conclusions
-      elements.peakInterpConclusionList.innerHTML = results.conclusions.map((c) =>
+      // Conclusions — prepend a dynamic top-item conclusion for the current dimension
+      const peakDim = state.peakInterpDim || "type";
+      const dimTopItem = results.breakdowns[peakDim]?.[0];
+      const allConclusions = dimTopItem
+        ? [{ text: `最大 ${peakDim} 贡献: "${escapeHtml(dimTopItem.value)}" 占 ${dimTopItem.pct.toFixed(1)}%（${formatBytes(dimTopItem.size)}），共 ${formatNumber(dimTopItem.count)} 个 block。`, cls: "info" }].concat(results.conclusions)
+        : results.conclusions;
+      elements.peakInterpConclusionList.innerHTML = allConclusions.map((c) =>
         `<div class="peak-interp-conclusion-item ${c.cls}">• ${c.text}</div>`
       ).join("");
 
@@ -3279,12 +3319,10 @@
       ctx.stroke();
 
       ctx.font = `${13 * state.dpr}px Segoe UI`;
+      ctx.textAlign = "right";
       ctx.fillText("Time", plot.right - 20 * state.dpr, plot.bottom + 46 * state.dpr);
-      ctx.save();
-      ctx.translate(18 * state.dpr, plot.top + plot.height / 2);
-      ctx.rotate(-Math.PI / 2);
-      ctx.fillText("Memory", 0, 0);
-      ctx.restore();
+      ctx.textAlign = "left";
+      ctx.fillText("Memory", 10 * state.dpr, plot.bottom + 46 * state.dpr);
       ctx.restore();
     }
 
@@ -4235,7 +4273,6 @@
         item.appendChild(remove);
         elements.lineList.appendChild(item);
       });
-      updateDiffRefLineSelects();
     }
 
     function addReferenceLine(value) {
@@ -4303,10 +4340,13 @@
       elements.diffBTime.value = "";
       elements.diffRunBtn.disabled = true;
       elements.diffCard.style.display = "none";
-      elements.peakInterpCard.style.display = "";
+      elements.peakInterpCard.style.display = "none";
       elements.peakInterpContent.style.display = "none";
       state.peakInterpResults = null;
       state.peakInterpSelected = null;
+
+      elements.detailTabBar.style.display = "";
+      switchDetailTab("detail");
 
       fitView();
       renderColumnSelector();
@@ -4332,6 +4372,14 @@
         state.memoryVizBase64 = b64;
         state.memoryVizReady = true;
         document.getElementById("btnLifetime").disabled = false;
+        const mvizStatus = document.getElementById("mvizStatus");
+        if (state.rows.length > 50000) {
+          mvizStatus.textContent = "数据量较大（" + state.rows.length + " 行），生命周期视图可能较卡，建议优先使用折线图查看全局趋势。";
+          mvizStatus.className = "";
+        } else {
+          mvizStatus.textContent = "";
+          mvizStatus.className = "ok";
+        }
       } catch (err) {
         console.error("MemoryViz data preparation failed:", err);
         state.memoryVizReady = false;
@@ -4596,19 +4644,19 @@
     elements.diffASetClick.addEventListener("click", () => setDiffPointFromClick("A"));
     elements.diffBSetClick.addEventListener("click", () => setDiffPointFromClick("B"));
 
-    elements.diffARefLine.addEventListener("change", () => {
-      const val = elements.diffARefLine.value;
-      if (val !== "") {
-        elements.diffATime.value = val;
-        updateDiffRunButton();
-      }
-    });
-    elements.diffBRefLine.addEventListener("change", () => {
-      const val = elements.diffBRefLine.value;
-      if (val !== "") {
-        elements.diffBTime.value = val;
-        updateDiffRunButton();
-      }
+    function switchDetailTab(tabName) {
+      const btns = elements.detailTabBar.querySelectorAll(".detail-tab-btn");
+      btns.forEach(b => b.classList.toggle("active", b.dataset.tab === tabName));
+      elements.detailCard.style.display = tabName === "detail" ? "" : "none";
+      elements.peakInterpCard.style.display = tabName === "interp" ? "" : "none";
+      elements.diffCard.style.display = tabName === "diff" ? "" : "none";
+    }
+    window.switchDetailTab = switchDetailTab;
+
+    elements.detailTabBar.addEventListener("click", (event) => {
+      const btn = event.target.closest(".detail-tab-btn");
+      if (!btn) return;
+      switchDetailTab(btn.dataset.tab);
     });
 
     elements.diffRunBtn.addEventListener("click", runDiffAnalysis);
@@ -4622,7 +4670,8 @@
       if (!tab) return;
       const category = tab.dataset.category;
       if (category) {
-        state.diffCategory = category;
+        // Toggle: clicking the active tab deselects it
+        state.diffCategory = state.diffCategory === category ? "" : category;
         state.diffCurrentPage = 1;
         updateDiffTabs();
         updateDiffAggTable();
