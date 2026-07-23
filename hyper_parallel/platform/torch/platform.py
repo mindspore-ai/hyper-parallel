@@ -621,6 +621,16 @@ class TorchPlatform(Platform):
         return torch.empty(size, dtype=dtype, device=device)
 
     @staticmethod
+    def rand(size, dtype=None, device=None):
+        """Create a tensor filled with uniform random values in ``[0, 1)``."""
+        return torch.rand(size, dtype=dtype, device=device)
+
+    @staticmethod
+    def randn(size, dtype=None, device=None):
+        """Create a tensor filled with standard-normal random values."""
+        return torch.randn(size, dtype=dtype, device=device)
+
+    @staticmethod
     def get_rank():
         """
         Get the rank of the current process in the distributed group.

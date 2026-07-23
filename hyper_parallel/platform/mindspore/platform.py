@@ -933,6 +933,22 @@ class MindSporePlatform(Platform):
         return mint.empty(size, dtype=dtype)
 
     @staticmethod
+    def rand(size, dtype=None, device=None):  # pylint: disable=unused-argument
+        """Create a tensor filled with uniform random values in ``[0, 1)``."""
+        tensor = mint.rand(size, dtype=dtype)
+        if device in ("GPU", "Ascend"):
+            return tensor.to(device)
+        return tensor
+
+    @staticmethod
+    def randn(size, dtype=None, device=None):  # pylint: disable=unused-argument
+        """Create a tensor filled with standard-normal random values."""
+        tensor = mint.randn(size, dtype=dtype)
+        if device in ("GPU", "Ascend"):
+            return tensor.to(device)
+        return tensor
+
+    @staticmethod
     def get_rank():
         """
         Get the rank of the current process in the distributed group.

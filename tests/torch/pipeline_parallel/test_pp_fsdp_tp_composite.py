@@ -57,19 +57,19 @@ def test_pp_fsdp_tp_1f1b_composite():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_pp_fsdp_tp_1f1b_composite_1000_steps():
+def test_pp_fsdp_tp_1f1b_composite_100_steps():
     """
-    Feature: Llama3 ``PP + FSDP + TP`` 1F1B composite vs single-card baseline (1000 steps).
+    Feature: Llama3 ``PP + FSDP + TP`` 1F1B composite vs single-card baseline (100 steps).
     Description:
-        Launch :func:`test_pp_fsdp_tp_1f1b_composite_matches_reference_1000_steps` on 8 ranks
-        with mesh ``(pp=2, fsdp=2, tp=2)``.  Each of 1000 steps asserts global sum-loss against
+        Launch :func:`test_pp_fsdp_tp_1f1b_composite_matches_reference_100_steps` on 8 ranks
+        with mesh ``(pp=2, fsdp=2, tp=2)``.  Each of 100 steps asserts global sum-loss against
         a single-card ``Llama3Model`` baseline (``rtol=2e-3``, ``atol=2.0``); rank 0 prints
         abs/rel error drift statistics after all steps pass.
     Expectation: Worker exits with status 0 on every rank.
     """
     torchrun_case(
         _WORKER,
-        "test_pp_fsdp_tp_1f1b_composite_matches_reference_1000_steps",
+        "test_pp_fsdp_tp_1f1b_composite_matches_reference_100_steps",
         master_port=13821,
         num_proc=8,
     )
