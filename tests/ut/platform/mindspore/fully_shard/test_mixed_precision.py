@@ -282,19 +282,20 @@ class TestInitMpDtypes(unittest.TestCase):
         self.assertFalse(hasattr(state, "_orig_dtype"))
         self.assertFalse(hasattr(state, "_reduce_dtype"))
 
-    def test_comm_fusion_non_uniform_orig_dtype_raises(self):
+    def test_comm_fusion_non_uniform_orig_dtype_uses_dtype_groups(self):
         """
         Feature: _init_mp_dtypes
-        Description: Raise AssertionError when multiple parameters have inconsistent orig_dtype values
-        Expectation: Raise AssertionError with a message containing 'uniform original parameter dtype'
+        Description: Allow multiple parameters with inconsistent orig_dtype values
+        Expectation: State-wide dtype metadata is unset because dtype-specific groups own it
         """
         policy = MixedPrecisionPolicy(param_dtype=ms.float16)
-        with self.assertRaises(AssertionError) as ctx:
-            self._run(policy, [
-                (ms.float32, None, True),
-                (ms.float16, None, True),
-            ], comm_fusion=True)
-        self.assertIn("uniform original parameter dtype", str(ctx.exception))
+        state = self._run(policy, [
+            (ms.float32, None, True),
+            (ms.float16, None, True),
+        ], comm_fusion=True)
+
+        self.assertIsNone(state._orig_dtype)
+        self.assertIsNone(state._reduce_dtype)
 
 
 # ---------------------------------------------------------------------------

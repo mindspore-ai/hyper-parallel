@@ -249,6 +249,7 @@ class HSDPParamGroup:
         self._result = None
         self._reduce_input = None
         self._reduce_output = None
+        self._reduce_scatter_handle: Optional[CommHandle] = None
         self._reduce_op = None
         self._reduce_hsdp_params = None
         self._defer_all_reduce = False
@@ -263,6 +264,55 @@ class HSDPParamGroup:
         if self.enable_zero_copy_param_buffer:
             self._init_flat_param_buffer()
         self.gradient_scaling_factor = None
+
+    @classmethod
+    def from_params(
+        cls,
+        hsdp_params: List[MindSporeHSDPParamV2],
+        mesh_info: FSDPMeshInfo,
+        device: Optional[str] = None,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        enable_zero_copy_param_buffer: bool = False,
+    ) -> HSDPParamGroup | HSDPMultiDtypeParamGroup:
+        """Create one logical parameter group with dtype-specific fusion buffers.
+
+        Args:
+            hsdp_params: Parameters managed by one fully-shard state.
+            mesh_info: FSDP or HSDP mesh metadata shared by all parameters.
+            device: Device used to allocate communication buffers.
+            mp_policy: Mixed-precision policy for parameter and gradient communication.
+            enable_zero_copy_param_buffer: Whether local shards may share flat storage.
+
+        Returns:
+            A uniform-dtype ``HSDPParamGroup`` or a multi-dtype coordinator.
+
+        Raises:
+            ValueError: If ``hsdp_params`` is empty.
+        """
+        if not hsdp_params:
+            raise ValueError("hsdp_params must not be empty.")
+
+        dtype_buckets: dict[tuple[Any, Any, Any], List[MindSporeHSDPParamV2]] = {}
+        for hsdp_param in hsdp_params:
+            hsdp_param.init_dtype_attrs(mp_policy)
+            all_gather_dtype = hsdp_param.param_dtype or hsdp_param.orig_dtype
+            reduce_dtype = hsdp_param.reduce_dtype or all_gather_dtype
+            key = (all_gather_dtype, hsdp_param.orig_dtype, reduce_dtype)
+            dtype_buckets.setdefault(key, []).append(hsdp_param)
+
+        param_groups = [
+            cls(
+                bucket_params,
+                mesh_info,
+                device,
+                mp_policy,
+                enable_zero_copy_param_buffer,
+            )
+            for bucket_params in dtype_buckets.values()
+        ]
+        if len(param_groups) == 1:
+            return param_groups[0]
+        return HSDPMultiDtypeParamGroup(param_groups)
 
     def _infer_layout_replicate_group(self):
         replicate_groups = []
@@ -561,6 +611,7 @@ class HSDPParamGroup:
             for value in (
                 self._reduce_input,
                 self._reduce_output,
+                self._reduce_scatter_handle,
                 self._reduce_hsdp_params,
             )
         ):
@@ -637,6 +688,7 @@ class HSDPParamGroup:
             op=reduce_scatter_reduce_op,
             async_op=async_op,
         )
+        self._reduce_scatter_handle = rs_handle
         comm_ctx.comm_handle = rs_handle
         self._reduce_output = reduce_output
         if async_op:
@@ -645,11 +697,18 @@ class HSDPParamGroup:
             self.apply_fusion_reduced_grad()
         return self._reduce_output
 
+    def _wait_reduce_scatter(self) -> None:
+        """Wait for this group's reduce-scatter without consuming another dtype bucket's handle."""
+        handle = self._reduce_scatter_handle
+        if handle is not None:
+            handle.wait()
+        if comm_ctx.comm_handle is handle:
+            comm_ctx.comm_handle = None
+        self._reduce_scatter_handle = None
+
     def wait_reduce_scatter_and_issue_all_reduce(self):
         """Wait for reduce-scatter and issue async all-reduces for active buckets."""
-        if comm_ctx.comm_handle is not None:
-            comm_ctx.comm_handle.wait()
-            comm_ctx.comm_handle = None
+        self._wait_reduce_scatter()
         if not self._active_replicate_buckets:
             self._apply_reduced_grad()
             return
@@ -679,9 +738,7 @@ class HSDPParamGroup:
 
     def apply_fusion_reduced_grad(self):
         """Synchronous fallback: wait, all-reduce buckets, then apply grads."""
-        if comm_ctx.comm_handle is not None:
-            comm_ctx.comm_handle.wait()
-            comm_ctx.comm_handle = None
+        self._wait_reduce_scatter()
         for bucket in self._active_replicate_buckets.values():
             packed = self._pack_bucket_from_reduce_output(bucket)
             dist.all_reduce(
@@ -712,11 +769,90 @@ class HSDPParamGroup:
             flat_grad_offset += shard_numel
         self._reduce_input = None
         self._reduce_output = None
+        self._reduce_scatter_handle = None
         self._reduce_hsdp_params = None
         self._defer_all_reduce = False
         self._active_param_flat_offsets = []
         self._active_replicate_buckets = {}
         self._pending_all_reduce_handles = []
+
+
+class HSDPMultiDtypeParamGroup:
+    """Coordinate dtype-specific fused buffers as one schedulable HSDP group."""
+
+    def __init__(self, param_groups: List[HSDPParamGroup]) -> None:
+        """Initialize the logical group from at least two dtype-specific groups."""
+        if len(param_groups) < 2:
+            raise ValueError("HSDPMultiDtypeParamGroup requires at least two parameter groups.")
+        self.param_groups = param_groups
+        self.hsdp_params = [
+            hsdp_param
+            for param_group in param_groups
+            for hsdp_param in param_group.hsdp_params
+        ]
+        self._gradient_scaling_factor = None
+
+    @property
+    def gradient_scaling_factor(self) -> Any:
+        """Return the gradient scaling factor shared by every dtype bucket."""
+        return self._gradient_scaling_factor
+
+    @gradient_scaling_factor.setter
+    def gradient_scaling_factor(self, factor: Any) -> None:
+        """Apply one gradient scaling factor to every dtype bucket."""
+        self._gradient_scaling_factor = factor
+        for param_group in self.param_groups:
+            param_group.gradient_scaling_factor = factor
+
+    def unshard(self, async_op: bool = False) -> None:
+        """Launch one fused all-gather per parameter dtype."""
+        for param_group in self.param_groups:
+            param_group.unshard(async_op)
+
+    def wait_for_unshard(self) -> None:
+        """Wait for all dtype-specific all-gathers and materialize parameters."""
+        for param_group in self.param_groups:
+            param_group.wait_for_unshard()
+
+    def foreach_reduce(
+        self,
+        reduce_scatter_reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM,
+        async_op: bool = True,
+        defer_all_reduce: bool = False,
+    ) -> Optional[List[ms.Tensor]]:
+        """Launch one fused reduce-scatter per dtype under one logical pending tail."""
+        reduce_outputs = []
+        for param_group in self.param_groups:
+            reduce_output = param_group.foreach_reduce(
+                reduce_scatter_reduce_op=reduce_scatter_reduce_op,
+                async_op=async_op,
+                defer_all_reduce=defer_all_reduce,
+            )
+            if reduce_output is not None:
+                reduce_outputs.append(reduce_output)
+        if async_op and reduce_outputs:
+            comm_ctx.pre_param_group = self
+        return reduce_outputs or None
+
+    def wait_reduce_scatter_and_issue_all_reduce(self) -> None:
+        """Drain every dtype RS and preserve one logical HSDP all-reduce tail."""
+        for param_group in self.param_groups:
+            param_group.wait_reduce_scatter_and_issue_all_reduce()
+        has_pending_all_reduce = any(
+            param_group._pending_all_reduce_handles
+            for param_group in self.param_groups
+        )
+        comm_ctx.all_reduce_param_group = self if has_pending_all_reduce else None
+
+    def wait_all_reduce_and_apply_grad(self) -> None:
+        """Wait for all dtype-specific HSDP all-reduces and apply gradients."""
+        for param_group in self.param_groups:
+            param_group.wait_all_reduce_and_apply_grad()
+
+    def apply_fusion_reduced_grad(self) -> None:
+        """Synchronously finish communication for every dtype-specific buffer."""
+        for param_group in self.param_groups:
+            param_group.apply_fusion_reduced_grad()
 
 
 class AllReduceParamGroup:

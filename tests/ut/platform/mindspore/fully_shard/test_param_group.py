@@ -42,6 +42,7 @@ from hyper_parallel.platform.mindspore.fully_shard.param_group import (
     AllGatherMetadataCache,
     AllGatherResult,
     AllReduceParamGroup,
+    HSDPMultiDtypeParamGroup,
     HSDPParamGroup,
     PendingBucketAllReduce,
     ReplicateBucket,
@@ -87,6 +88,7 @@ def _new_param_group():
     group._result = None
     group._reduce_input = None
     group._reduce_output = None
+    group._reduce_scatter_handle = None
     group._reduce_op = None
     group._reduce_hsdp_params = None
     group._defer_all_reduce = False
@@ -302,6 +304,68 @@ class TestMindSporeParamGroup(unittest.TestCase):
 
         with self.assertRaisesRegex(AssertionError, "uniform original parameter dtype"):
             HSDPParamGroup._init_mp_dtypes(group)
+
+    def test_from_params_partitions_mixed_dtypes_into_fusion_groups(self):
+        """Mixed parameter dtypes should use independent fused communication buffers."""
+        fp32_param = _fake_hsdp_param(name="fp32_param", dtype=ms.float32)
+        bf16_param = _fake_hsdp_param(name="bf16_param", dtype=ms.bfloat16)
+        policy = MixedPrecisionPolicy(reduce_dtype=ms.float32)
+
+        group = HSDPParamGroup.from_params(
+            [fp32_param, bf16_param],
+            _mesh_info(FSDPMeshInfo),
+            "Ascend:0",
+            policy,
+        )
+
+        self.assertEqual(len(group.param_groups), 2)
+        self.assertEqual(
+            [subgroup.hsdp_params for subgroup in group.param_groups],
+            [[fp32_param], [bf16_param]],
+        )
+
+    def test_multi_dtype_group_schedules_one_logical_pending_tail(self):
+        """Dtype buffers should remain separate without exposing multiple scheduler tails."""
+        fp32_group = MagicMock()
+        fp32_group.hsdp_params = ["fp32-param"]
+        fp32_group.foreach_reduce.return_value = "fp32-output"
+        fp32_group._pending_all_reduce_handles = ["fp32-handle"]
+        bf16_group = MagicMock()
+        bf16_group.hsdp_params = ["bf16-param"]
+        bf16_group.foreach_reduce.return_value = "bf16-output"
+        bf16_group._pending_all_reduce_handles = []
+        group = HSDPMultiDtypeParamGroup([fp32_group, bf16_group])
+
+        group.gradient_scaling_factor = 0.5
+        outputs = group.foreach_reduce(async_op=True, defer_all_reduce=True)
+
+        self.assertEqual(outputs, ["fp32-output", "bf16-output"])
+        self.assertEqual(fp32_group.gradient_scaling_factor, 0.5)
+        self.assertEqual(bf16_group.gradient_scaling_factor, 0.5)
+        fp32_group.foreach_reduce.assert_called_once_with(
+            reduce_scatter_reduce_op=ops.ReduceOp.SUM,
+            async_op=True,
+            defer_all_reduce=True,
+        )
+        bf16_group.foreach_reduce.assert_called_once_with(
+            reduce_scatter_reduce_op=ops.ReduceOp.SUM,
+            async_op=True,
+            defer_all_reduce=True,
+        )
+        self.assertIs(param_group_mod.comm_ctx.pre_param_group, group)
+
+        group.wait_reduce_scatter_and_issue_all_reduce()
+
+        fp32_group.wait_reduce_scatter_and_issue_all_reduce.assert_called_once_with()
+        bf16_group.wait_reduce_scatter_and_issue_all_reduce.assert_called_once_with()
+        self.assertIs(param_group_mod.comm_ctx.all_reduce_param_group, group)
+
+        group.wait_all_reduce_and_apply_grad()
+
+        fp32_group.wait_all_reduce_and_apply_grad.assert_called_once_with()
+        bf16_group.wait_all_reduce_and_apply_grad.assert_called_once_with()
+        param_group_mod.comm_ctx.pre_param_group = None
+        param_group_mod.comm_ctx.all_reduce_param_group = None
 
     def test_init_mp_dtypes_ignores_frozen_params(self):
         """Frozen params should not determine fused reduce dtype metadata."""
@@ -545,10 +609,13 @@ class TestMindSporeParamGroup(unittest.TestCase):
         group = _new_param_group()
         group._reduce_output = MagicMock()
         group._apply_reduced_grad = MagicMock()
-        param_group_mod.comm_ctx.comm_handle = MagicMock()
+        handle = MagicMock()
+        group._reduce_scatter_handle = handle
+        param_group_mod.comm_ctx.comm_handle = handle
 
         HSDPParamGroup.wait_reduce_scatter_and_issue_all_reduce(group)
 
+        handle.wait.assert_called_once_with()
         group._apply_reduced_grad.assert_called_once()
         self.assertIsNone(param_group_mod.comm_ctx.comm_handle)
 
@@ -593,10 +660,13 @@ class TestMindSporeParamGroup(unittest.TestCase):
         group._pack_bucket_from_reduce_output = MagicMock(return_value=bucket.buffer)
         group._unpack_bucket_to_reduce_output = MagicMock()
         group._apply_reduced_grad = MagicMock()
-        param_group_mod.comm_ctx.comm_handle = MagicMock()
+        handle = MagicMock()
+        group._reduce_scatter_handle = handle
+        param_group_mod.comm_ctx.comm_handle = handle
 
         HSDPParamGroup.apply_fusion_reduced_grad(group)
 
+        handle.wait.assert_called_once_with()
         mock_all_reduce.assert_called_once()
         group._unpack_bucket_to_reduce_output.assert_called_once_with(bucket)
         group._apply_reduced_grad.assert_called_once()

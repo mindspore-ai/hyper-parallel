@@ -71,6 +71,25 @@ class MLPModule(nn.Cell):
         return self.net2(self.relu(self.net1(x)))
 
 
+class MixedDtypeMLPModule(nn.Cell):
+    """MLP-like block with BF16 matrix weights and an FP32 normalization scale."""
+
+    def __init__(self, d_hid: int) -> None:
+        """Initialize parameters with the two dtypes merged by layer-level FSDP."""
+        super().__init__()
+        weight = np.eye(d_hid, dtype=np.float32) * 0.5
+        self.weight = ms.Parameter(Tensor(weight, dtype=ms.bfloat16), name="weight")
+        self.norm_scale = ms.Parameter(
+            Tensor(np.linspace(0.75, 1.25, d_hid), dtype=ms.float32),
+            name="norm_scale",
+        )
+
+    def construct(self, x: Tensor) -> Tensor:
+        """Apply BF16 matrix multiplication followed by an FP32 scale."""
+        hidden = mint.matmul(x.to(ms.bfloat16), self.weight)
+        return hidden.to(ms.float32) * self.norm_scale
+
+
 class FullModel(nn.Cell):
     """Stack of ``TOTAL_LAYERS`` MLP blocks."""
 
@@ -91,10 +110,11 @@ def _wrap_with_fsdp(
     sharded_accumulated_grad: bool = False,
     per_layer_fsdp: bool = False,
     replicate_biases: bool = False,
+    mixed_dtype: bool = False,
 ) -> FullModel:
     """Apply per-layer + module-level fully_shard, with sum-reduce for exact grad parity."""
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=ms.float32,
+        param_dtype=None if mixed_dtype else ms.float32,
         reduce_dtype=ms.float32,
         output_dtype=ms.float32,
         cast_forward_inputs=False,
@@ -238,10 +258,30 @@ def _assert_grad_parity(case_name: str, rank: int,
             ref_gradient_chunk_size = ref_p.grad.shape[0] // gradient_shard_size
             start = gradient_shard_rank * ref_gradient_chunk_size
             ref_grad = _to_numpy(ref_p.grad[start: start + ref_gradient_chunk_size])
-        assert np.allclose(fsdp_grad, ref_grad, rtol=rtol, atol=atol), (
+        fsdp_compare = fsdp_grad.astype(np.float32)
+        ref_compare = ref_grad.astype(np.float32)
+        assert np.allclose(fsdp_compare, ref_compare, rtol=rtol, atol=atol), (
             f"{case_name}, rank {rank}, param {idx} ({fsdp_p.name}): "
             f"fsdp_grad={fsdp_grad}, ref_grad={ref_grad}"
         )
+
+
+def _assert_mixed_dtype_fusion_groups(fsdp_model: FullModel) -> None:
+    """Verify one logical FSDP state owns separate BF16 and FP32 fusion buffers."""
+    found_mixed_dtype_group = False
+    for hsdp_state in _get_hsdp_states(fsdp_model):
+        param_group = getattr(hsdp_state, "param_group", None)
+        dtype_groups = getattr(param_group, "param_groups", None)
+        if dtype_groups is None:
+            continue
+        orig_dtypes = {subgroup._orig_dtype for subgroup in dtype_groups}  # pylint: disable=protected-access
+        if orig_dtypes == {ms.bfloat16, ms.float32}:
+            found_mixed_dtype_group = True
+            assert all(
+                subgroup._reduce_dtype == ms.float32  # pylint: disable=protected-access
+                for subgroup in dtype_groups
+            )
+    assert found_mixed_dtype_group, "expected independent BF16 and FP32 fusion buffers"
 
 
 def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatches: int,
@@ -252,7 +292,8 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
                                                 grad_rtol: float = RTOL,
                                                 grad_atol: float = ATOL,
                                                 per_layer_fsdp: bool = False,
-                                                replicate_biases: bool = False) -> None:
+                                                replicate_biases: bool = False,
+                                                mixed_dtype: bool = False) -> None:
     """Run fully_shard 1F1B-style micro-batching and compare loss + grad against the single-card baseline."""
     D.init()
     rank = D.get_rank()
@@ -273,15 +314,19 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
         gradient_shard_size = world_size
         gradient_shard_rank = rank
 
-    base_layers = [MLPModule(D_HID) for _ in range(TOTAL_LAYERS)]
+    layer_type = MixedDtypeMLPModule if mixed_dtype else MLPModule
+    base_layers = [layer_type(D_HID) for _ in range(TOTAL_LAYERS)]
     fsdp_model = _wrap_with_fsdp(
         FullModel(copy.deepcopy(base_layers)),
         dp_mesh,
         sharded_accumulated_grad=sharded_accumulated_grad,
         per_layer_fsdp=per_layer_fsdp,
         replicate_biases=replicate_biases,
+        mixed_dtype=mixed_dtype,
     )
     ref_model = FullModel(copy.deepcopy(base_layers))
+    if mixed_dtype:
+        _assert_mixed_dtype_fusion_groups(fsdp_model)
 
     rows_per_rank = num_microbatches * MICRO_BATCH
     total_microbatches = world_size * num_microbatches
@@ -322,6 +367,7 @@ def _assert_fully_shard_simu_pp_match_reference(*, case_name: str, num_microbatc
         f"sharded_accumulated_grad={sharded_accumulated_grad}, "
         f"per_layer_fsdp={per_layer_fsdp}, "
         f"replicate_biases={replicate_biases}, "
+        f"mixed_dtype={mixed_dtype}, "
         f"use_hsdp_mesh={use_hsdp_mesh}"
     )
 
@@ -392,4 +438,20 @@ def test_fully_shard_simu_pp_hsdp_sharded_accumulated_grad_replicate_params():
         sharded_accumulated_grad=True,
         use_hsdp_mesh=True,
         replicate_biases=True,
+    )
+
+
+def test_fully_shard_simu_pp_mixed_dtype_sharded_accumulated_grad():
+    """One FSDP unit should fuse BF16 and FP32 parameters in separate buffers."""
+    _assert_fully_shard_simu_pp_match_reference(
+        case_name="fully_shard_simu_pp_mixed_dtype_sharded_accumulated_grad",
+        num_microbatches=3,
+        use_explicit_unshard=False,
+        reshard_after_backward=False,
+        sharded_accumulated_grad=True,
+        use_hsdp_mesh=True,
+        per_layer_fsdp=True,
+        mixed_dtype=True,
+        grad_rtol=2e-2,
+        grad_atol=2e-2,
     )

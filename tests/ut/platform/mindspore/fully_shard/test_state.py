@@ -577,7 +577,11 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state.config.comm_fusion = True
         state.hsdp_params = [param]
         with patch.object(MindSporeHSDPStateV2, "_comm_fusion_unsupported_reason", return_value=None):
-            with patch.object(state_mod, "HSDPParamGroup", return_value="param-group") as group_ctor:
+            with patch.object(
+                state_mod.HSDPParamGroup,
+                "from_params",
+                return_value="param-group",
+            ) as group_ctor:
                 state._init_param_group()
         group_ctor.assert_called_once_with(
             state.hsdp_params,
@@ -664,8 +668,9 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             _param_fqn="p1",
         )
         state.hsdp_params = [param, mismatch]
-        with self.assertRaises(AssertionError):
-            state._init_mp_dtypes()
+        state._init_mp_dtypes()
+        self.assertIsNone(state._orig_dtype)
+        self.assertEqual(state._reduce_dtype, "float16")
 
         meta_state = _make_state()
         meta_state.hsdp_params = [

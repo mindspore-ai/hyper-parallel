@@ -52,6 +52,12 @@ def test_fully_shard_simu_pp_suite():
             worker_num=4,
             local_worker_num=4,
         ),
+        MindSporeCase(
+            _TEST_FILE,
+            "test_fully_shard_simu_pp_mixed_dtype_sharded_accumulated_grad",
+            worker_num=4,
+            local_worker_num=4,
+        ),
     ]
     # MindSpore msrun jobs share the default world-group namespace on one host,
     # so run the 4-card cases sequentially instead of overcommitting devices or

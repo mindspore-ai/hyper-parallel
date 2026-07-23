@@ -194,7 +194,7 @@ class MindSporeHSDPStateV2(HSDPState):
                 )
             self.param_group = None
             if self.hsdp_params:
-                self.param_group = HSDPParamGroup(
+                self.param_group = HSDPParamGroup.from_params(
                     self.hsdp_params,
                     self.mesh_info,
                     self.device,
@@ -274,41 +274,21 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def _init_mp_dtypes(self):
         """init mp dtypes for hsdp parameters and replicate parameters"""
-        fused_trainable_params = []
         fused_orig_dtypes = set()
         fused_reduce_dtypes = set()
-        fused_all_gather_dtypes = set()
         for hsdp_param in self.hsdp_params:
             hsdp_param.init_dtype_attrs(self.mp_policy)
             if not self.comm_fusion:
                 continue
-            all_gather_dtype = hsdp_param.orig_dtype
-            if hsdp_param.param_dtype is not None:
-                all_gather_dtype = hsdp_param.param_dtype
-            fused_all_gather_dtypes.add(all_gather_dtype)
             if hsdp_param.sharded_param.requires_grad:
-                fused_trainable_params.append(hsdp_param)
                 fused_orig_dtypes.add(hsdp_param.orig_dtype)
                 fused_reduce_dtypes.add(hsdp_param.reduce_dtype)
         for replicate_param in self.replicate_params:
             replicate_param.init_dtype_attrs(self.mp_policy)
         if not self.comm_fusion:
             return
-        if len(fused_trainable_params) > 0 and len(fused_orig_dtypes) != 1:
-            raise AssertionError(
-                f"hsdp expects uniform original parameter dtype but got {fused_orig_dtypes}"
-            )
-        self._orig_dtype = next(iter(fused_orig_dtypes)) if fused_trainable_params else None
-        if len(fused_trainable_params) > 0 and len(fused_reduce_dtypes) != 1:
-            raise AssertionError(
-                f"hsdp expects uniform reduce dtype but got {fused_reduce_dtypes}"
-            )
-        self._reduce_dtype = next(iter(fused_reduce_dtypes)) if fused_trainable_params else None
-        if len(fused_all_gather_dtypes) > 1:
-            raise AssertionError(
-                "hsdp comm_fusion expects uniform all-gather parameter dtype "
-                f"but got {fused_all_gather_dtypes}"
-            )
+        self._orig_dtype = next(iter(fused_orig_dtypes)) if len(fused_orig_dtypes) == 1 else None
+        self._reduce_dtype = next(iter(fused_reduce_dtypes)) if len(fused_reduce_dtypes) == 1 else None
 
     def lazy_init(self):
         """Refresh parameter views and validate runtime state before first execution."""
