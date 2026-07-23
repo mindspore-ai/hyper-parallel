@@ -8,7 +8,7 @@
 
 ## 1. 模块职责
 
-提供统一的数据管道，支持 **HF datasets**、**Megatron 二进制格式**、**对话格式（ChatDataset）**、**多源加权采样** 四种数据源，通过 `_target_` IoC 容器声明式配置。
+提供统一的数据管道，支持 **HF datasets**、**Megatron 二进制格式**、**对话格式（ChatDataset）**、**多源加权采样** 四种数据源，通过 `_target_` 声明式配置（配置容器为强类型 dataclass，见 01 §2 强类型配置解析）。
 
 ### 核心文件
 
@@ -51,7 +51,7 @@
 
 | 旧代码 | 替代方案 |
 |--------|---------|
-| `hyper_parallel/data/registry.py` — `DATASET_REGISTRY` 装饰器注册 | HF `datasets.load_dataset()` + `_target_` IoC + TransformRegistry |
+| `hyper_parallel/data/registry.py` — `DATASET_REGISTRY` 装饰器注册 | HF `datasets.load_dataset()` + `_target_` + TransformRegistry |
 | `hyper_parallel/data/dummy.py` | 封装为 `_target_: hyper_models.components.datasets.llm.DeterministicTokenDataset` |
 | `hyper_parallel/data/hf.py` | 合并到 `build_dataloader()`，直接使用 `datasets.load_dataset()` |
 | `hyper_parallel/data/preset_pt.py` | 封装为 `torch.utils.data.TensorDataset` 或独立路径 |
@@ -88,13 +88,13 @@
 数据管道的全部构建工作在 `recipe.setup()` 中的 `build_dataloader()` 一次调用完成。以下是完整的调用树，数字序号表示执行顺序，缩进表示调用深度。
 
 ```
-recipe.setup(cfg)                                                    # 03_training_loop.md
+③ recipe.setup(cfg)                                                  # 03_training_loop.md（D1 时序编号，以 01 §4.1 为 canonical）
 │
 ├─ ... (model, optimizer, loss, ... 等组件构建)
 │
-└─⑧/④.9 self.dataloader, self.tokenizer = build_dataloader(  # ⑧ = 02 编号, ④.9 = 01/03 canonical 编号
+└─③.8 self.dataloader, self.tokenizer = build_dataloader(  # ③.8 = 01 §4.1 canonical 编号（以 01 为准）; ⑧ = 本文档内部步骤编号
         cfg.dataset, cfg.dataloader, cfg.model, cfg.packed_sequence,
-        cfg.dynamic_batching, cfg.transform, cfg.multisource,        # 新增配置
+        cfg.dynamic_batching, cfg.transform, cfg.multisource,        # （规划中：数据管道配置段，经 resolve_data_config 独立解析，不在当前 TrainerConfig 字段内）
         seed, local_batch_size, global_batch_size,
         max_steps, val_check_interval, dp_rank, dp_world_size,
         pp_enabled, cp_size, model)
@@ -108,13 +108,15 @@ recipe.setup(cfg)                                                    # 03_traini
     ├─⑧.3 MultiSource 包装（可选）                                    # §6: 新增
     │   └─ ds = WeightedMultiSourceDataset(sources=..., weights=...)
     │
-    ├─⑧.4 ds = cfg_ds.instantiate(**kwargs)                          # §7: 数据集实例化
-    │   │                                                            # _target_ 决定类型:
-    │   ├─ _target_ == ChatDataset                                     # §7.1: 对话格式
+    ├─⑧.4 ds = dataset_target(**kwargs)                            # §7: 数据集实例化
+    │   │   （dataset_target = import_target(cfg.dataset["_target_"]) 解析出的
+    │   │    callable；解析入口为规划中的 resolve_data_config()，
+    │   │    机制复用 01 §2.4 的 import_target() + coerce_value()）
+    │   ├─ dataset_target == ChatDataset                             # §7.1: 对话格式
     │   │   → ChatDataset(path_or_dataset_id, tokenizer, ...)
-    │   ├─ _target_ == MegatronPretraining                            # §7.2: Megatron 路径
+    │   ├─ dataset_target == MegatronPretraining                     # §7.2: Megatron 路径
     │   │   → MegatronPretraining(paths=[...], ...).build()
-    │   └─ _target_ == datasets.load_dataset (或其他)                 # §7.3: HF 路径
+    │   └─ dataset_target == datasets.load_dataset (或其他)          # §7.3: HF 路径
     │       → load_dataset(path="HuggingFaceFW/fineweb", ...)
     │
     ├─⑧.5 IterableDataset 分片                                        # §8
@@ -131,7 +133,8 @@ recipe.setup(cfg)                                                    # 03_traini
     │   └─ IterableDataset → 不设 sampler/batch_size
     │
     ├─⑧.8 Collate 函数                                                 # §11
-    │   ├─ cfg_dl.collate_fn 有 _target_  → lazy instantiate
+    │   ├─ cfg_dl.collate_fn 有 _target_  → import_target 解析后构建期调用一次
+    │   │     （嵌套 _target_ 段由 resolve_data_config 递归解析，规划中）
     │   ├─ cfg_dl.collate_fn 是 callable  → 直接用
     │   ├─ 否则 → default_collater(tokenizer)
     │   └─ PP 模式 → chained_collate_fn（base → add_causal_masks_to_batch）
@@ -150,12 +153,16 @@ recipe.setup(cfg)                                                    # 03_traini
 
 ```
 main()
-├─① load_yaml_config()           # 01 §2
-├─② RecipeConfig(cfg)            # 01 §3
-└─④ recipe.setup(cfg)            # 01 §4
-    ├─④.4  model = ...           # 01 §4.1/§6
-    ├─④.8  optimizer = ...       # 03_training_loop §9
-    └─④.9  dataloader, tokenizer = build_dataloader(...)  ← 本文档入口
+├─① cfg = parse_training_args()   # 01 §2: 强类型配置解析 → TrainerConfig
+│   # 注：TrainerConfig 当前只接受 9 个一级字段（model/optimizer/lr_scheduler/
+│   # loss/training/accelerator/mixed_precision/gradient_checkpointing/debug），
+│   # resolve_root() 拒绝未知一级字段；dataset/dataloader/packed_sequence 等
+│   # 数据管道配置段须经 resolve_data_config() 独立解析（规划中），不走 resolve_root()
+├─② recipe = FinetuneRecipe()     # 01 §4.1（规划中）
+└─③ recipe.setup(cfg)            # 01 §4.1; cfg 为 TrainerConfig（不再需要 RecipeConfig 桥接）
+    ├─③.4  model = ...           # 01 §4.1/§6
+    ├─③.6  optimizer = ...       # 03_training_loop §9
+    └─③.8  dataloader, tokenizer = build_dataloader(...)  ← 本文档入口（编号以 01 §4.1 为准）
 ```
 
 ---
@@ -170,16 +177,16 @@ main()
 # hyper_models/components/datasets/llm/dataloader.py
 
 def build_dataloader(
-    cfg_ds,                # Dataset ConfigNode（含 _target_）
-    cfg_dl,                # DataLoader ConfigNode
-    cfg_model,             # Model ConfigNode
-    cfg_ps,                # PackedSequence ConfigNode
+    cfg_ds,                # Dataset 配置（含 _target_）
+    cfg_dl,                # DataLoader 配置
+    cfg_model,             # Model 配置
+    cfg_ps,                # PackedSequence 配置
     seed: int,
     local_batch_size: int,
     global_batch_size: int,
-    cfg_db=None,           # DynamicBatching ConfigNode（可选，新增）
-    cfg_transform=None,    # Transform ConfigNode（可选，新增）
-    cfg_multisource=None,  # MultiSource ConfigNode（可选，新增）
+    cfg_db=None,           # DynamicBatching 配置（可选，新增）
+    cfg_transform=None,    # Transform 配置（可选，新增）
+    cfg_multisource=None,  # MultiSource 配置（可选，新增）
     *,                   # 以下均为 keyword-only（调用方 03 按关键字传参）
     max_steps: int | None = None,
     val_check_interval: int | None = None,
@@ -195,7 +202,7 @@ def build_dataloader(
     - ChatDataset → 对话格式 SFT 数据集
     - datasets.load_dataset() → HF hub 数据集
     - MegatronPretraining → Megatron .bin/.idx 格式
-    - 自定义 Dataset 类 → 任意 _target_ 可实例化的 Dataset
+    - 自定义 Dataset 类 → 任意 `_target_` 可调用的 Dataset
 
     新增可选包装层：
     - cfg_transform: TransformRegistry 数据变换
@@ -231,7 +238,9 @@ def build_dataloader(
 # from hyper_models.components.training.rng import ScopedRNG
 # from hyper_models.components.distributed.utils import FirstRankPerNode
 # from hyper_models.components.utils.model_utils import _supports_seq_lens
-# from hyper_models.components.config.node import ConfigNode
+# 注：ConfigNode 已不存在，配置容器均为强类型 dataclass（见 01 §2）
+# from hyper_models.config.resolver import import_target  # _target_ 解析（01 §2.4；
+#     数据管道各配置段规划上由 resolve_data_config() 统一调用，见 §18）
 # from hyper_models.components.datasets.utils import (
 #     _get_model_name, compute_trust_remote_code_from_model,
 #     _should_precompute_pp_causal_masks,
@@ -298,19 +307,21 @@ def build_dataloader(
             for src_cfg in cfg_multisource.get("sources", []):
                 src_kwargs = dict(kwargs)
                 # weight 是 multisource 的保留键，不属于子数据集构造参数。
-                # ConfigNode.instantiate() 会把节点上所有非内部键传给 _target_
-                # （01 §2.9），因此实例化前必须剥离，避免 weight 泄漏进
-                # 子数据集构造函数导致 TypeError
+                # _target_ 调用时会把配置中所有非保留键传给 target，
+                # 因此实例化前必须剥离，避免 weight 泄漏进子数据集构造函数导致 TypeError
                 weight = src_cfg.get("weight", 1.0)
-                src_cfg_clean = ConfigNode(
-                    {k: v for k, v in src_cfg.to_dict().items() if k != "weight"}
-                )
-                if src_cfg._target_ is ChatDataset:
-                    src = src_cfg_clean.instantiate(**{
+                src_cfg_clean = {k: v for k, v in src_cfg.items()
+                                 if k not in ("weight", "_target_")}
+                # 嵌套 _target_ 段由 resolve_data_config（规划中）递归解析为
+                # callable，机制复用 01 §2.4 的 import_target() + coerce_value()；
+                # 此处以显式 import_target() 示意解析结果
+                src_target = import_target(src_cfg["_target_"])
+                if src_target is ChatDataset:
+                    src = src_target(**src_cfg_clean, **{
                         "tokenizer": tokenizer,
                         "seq_length": src_cfg.get("seq_length", cfg_ds.get("seq_length", 8192)),
                     })
-                elif src_cfg._target_ is MegatronPretraining:
+                elif src_target is MegatronPretraining:
                     # Megatron 源：与 Step 4 同口径注入训练参数，
                     # build() 后取底层 GPTDataset/BlendableDataset
                     src_kwargs.update({
@@ -319,12 +330,12 @@ def build_dataloader(
                         "trainer_max_steps": max_steps,
                         "trainer_val_check_interval": val_check_interval,
                     })
-                    src = src_cfg_clean.instantiate(**src_kwargs)
+                    src = src_target(**src_cfg_clean, **src_kwargs)
                     src.build()
                     src = src.get_dataset(split=src_cfg.get("split", "train"))
                 else:
                     with FirstRankPerNode():
-                        src = src_cfg_clean.instantiate(**src_kwargs)
+                        src = src_target(**src_cfg_clean, **src_kwargs)
 
                 # transform 配置存在时按源包装（替代单源模式 Step 5 的整体包装）；
                 # LazyMappedDataset 为 map-style，Iterable 源暂不支持，显式报错
@@ -360,7 +371,12 @@ def build_dataloader(
             )
         else:
             # ── Step 4: 实例化 Dataset ──
-            if cfg_ds._target_ is ChatDataset:
+            # dataset 段的 _target_ 为字符串 dotted path，经 import_target() 解析
+            # 为 callable 后按类型分发；解析入口为规划中的 resolve_data_config()
+            # （机制复用 01 §2.4 import_target() + coerce_value()），
+            # 此处以显式 import_target() 示意解析结果
+            dataset_target = import_target(cfg_ds["_target_"])
+            if dataset_target is ChatDataset:
                 # ChatDataset 路径：需要 tokenizer
                 # 从 cfg_ds 提取 path_or_dataset_id（核心字段），其余 kwargs 由
                 # _build_tokenizer 产出的 kwargs 提供基础键（tokenizer）；
@@ -377,18 +393,18 @@ def build_dataloader(
                 kwargs["mask_history"] = cfg_ds.get("mask_history", False)
                 kwargs["mask_reasoning_content"] = cfg_ds.get("mask_reasoning_content", False)
                 ds = ChatDataset(path_or_dataset_id, **kwargs)
-            elif cfg_ds._target_ is MegatronPretraining:
+            elif dataset_target is MegatronPretraining:
                 # Megatron 路径
                 kwargs["global_batch_size"] = global_batch_size
                 kwargs["micro_batch_size"] = local_batch_size
                 kwargs["trainer_max_steps"] = max_steps
                 kwargs["trainer_val_check_interval"] = val_check_interval
-                ds = cfg_ds.instantiate(**kwargs)
+                ds = dataset_target(**kwargs)
                 ds.build()
             else:
                 # HF datasets 路径：每节点仅 rank 0 触发下载
                 with FirstRankPerNode():
-                    ds = cfg_ds.instantiate(**kwargs)
+                    ds = dataset_target(**kwargs)
 
         # ── Step 5: 应用 Transform（单源模式；multisource 已在 Step 3 按源包装） ──
         if transform_name and not cfg_multisource:
@@ -514,10 +530,14 @@ def build_dataloader(
         if "collate_fn" not in dl_kwargs:
             if hasattr(cfg_dl, "collate_fn"):
                 if getattr(cfg_dl.collate_fn, "_target_", None) is not None:
+                    # 嵌套 _target_ 段由 resolve_data_config（规划中）递归解析，
+                    # 机制复用 01 §2.4 import_target() + coerce_value()；
                     # _target_ 声明的 collator 在构建期实例化一次，得到实现了
                     # __call__(batch) 的可调用对象；不能在每个 batch 到来时
-                    # 才 instantiate（那会把 collator 实例误当 collate 结果）
-                    dl_kwargs["collate_fn"] = cfg_dl.collate_fn.instantiate()
+                    # 才实例化（那会把 collator 实例误当 collate 结果）
+                    collate_cfg = cfg_dl.collate_fn.to_dict()
+                    collate_target = import_target(collate_cfg.pop("_target_"))
+                    dl_kwargs["collate_fn"] = collate_target(**collate_cfg)
                 else:
                     dl_kwargs["collate_fn"] = cfg_dl.collate_fn
                 assert callable(dl_kwargs["collate_fn"]), "collate_fn must be callable"
@@ -643,14 +663,14 @@ def build_validation_dataloader(
     Returns:
         {"validation": DataLoader}
     """
-    from hyper_models.components.config.node import ConfigNode
-
-    # ConfigNode 无 replace() 方法（01 §2.9 未定义），用 to_dict + 重建
-    # 实现覆盖式拷贝
+    # 注：配置容器支持 replace() 方法（01 §3 Configurable.Config.replace()），
+    # dataclass 配置直接 replace() 创建覆盖式拷贝；plain dict 走浅拷贝合并
     def _override_cfg(cfg, **overrides):
-        d = cfg.to_dict()
-        d.update(overrides)
-        return ConfigNode(d)
+        if hasattr(cfg, "replace"):
+            # dataclass 配置（Configurable.Config）：不可变覆盖式拷贝
+            return cfg.replace(**overrides)
+        # plain dict：浅拷贝后合并 overrides
+        return {**cfg, **overrides}
 
     cfg_ps_val = _override_cfg(cfg_ps, packed_sequence_size=0) if no_packing else cfg_ps
     cfg_dl_val = cfg_dl
@@ -683,7 +703,7 @@ Tokenizer 的类型和来源通过 YAML `_target_` 声明。4 条构建路径：
 1. **无 tokenizer key** → 从 model 推断 → `HyperAutoTokenizer.from_pretrained(model_name)`
 2. **tokenizer 为 null** → 跳过
 3. **有 tokenizer 但无 `_target_`** → `HyperAutoTokenizer.from_pretrained(**tokenizer_dict)`
-4. **有 `_target_`** → `cfg_ds.tokenizer.instantiate(trust_remote_code=...)`
+4. **有 `_target_`** → `import_target(cfg_ds.tokenizer["_target_"])(..., trust_remote_code=...)`（嵌套 `_target_` 段由 resolve_data_config 递归解析，规划中）
 
 ```yaml
 dataset:
@@ -697,7 +717,7 @@ dataset:
 
 ```python
 def _build_tokenizer(cfg_model, cfg_ds) -> tuple[dict, PreTrainedTokenizerBase]:
-    """从 ConfigNode 构建 tokenizer。
+    """从配置构建 tokenizer（强类型配置，`_target_` 声明 tokenizer 类型）。
 
     与 AutoModel train_ft.py::_build_tokenizer 完全对齐的 4 路分发。
     """
@@ -721,20 +741,27 @@ def _build_tokenizer(cfg_model, cfg_ds) -> tuple[dict, PreTrainedTokenizerBase]:
         tokenizer = HyperAutoTokenizer.from_pretrained(
             **tokenizer_dict, trust_remote_code=trust_remote_code
         )
-    # ── 路径 4: 有 _target_ → cfg_ds.tokenizer.instantiate(trust_remote_code=...) ──
+    # ── 路径 4: 有 _target_ → import_target 解析后显式调用 ──
     else:
-        trust_remote_code = cfg_ds.tokenizer.to_dict().pop("trust_remote_code", trust_remote_code)
-        tokenizer = cfg_ds.tokenizer.instantiate(trust_remote_code=trust_remote_code)
+        # 嵌套 _target_ 段由 resolve_data_config（规划中）递归解析，
+        # 机制复用 01 §2.4 的 import_target() + coerce_value()
+        tokenizer_cfg = cfg_ds.tokenizer.to_dict()
+        trust_remote_code = tokenizer_cfg.pop("trust_remote_code", trust_remote_code)
+        tokenizer_target = import_target(tokenizer_cfg.pop("_target_"))
+        tokenizer = tokenizer_target(**tokenizer_cfg, trust_remote_code=trust_remote_code)
 
     # 设置 pad_token
     if tokenizer is not None and tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # Dataset 构建时需要的 kwargs（根据 _target_ 签名决定是否注入 tokenizer）
+    # dataset 段 _target_ 为字符串 dotted path，先经 import_target() 解析为
+    # callable 再检查签名（解析入口 resolve_data_config 规划中）
     kwargs = {}
-    if tokenizer is not None and cfg_ds._target_ is not None and callable(cfg_ds._target_):
+    ds_target = import_target(cfg_ds["_target_"]) if cfg_ds.get("_target_") else None
+    if tokenizer is not None and ds_target is not None:
         try:
-            sig = inspect.signature(cfg_ds._target_)
+            sig = inspect.signature(ds_target)
             if "tokenizer" in sig.parameters:
                 kwargs["tokenizer"] = tokenizer
         except (ValueError, TypeError):
@@ -1667,7 +1694,8 @@ dataset:
   seq_length: 2048
 ```
 
-> **注意**：Step 4 中 `ds = cfg_ds.instantiate(**kwargs); ds.build()` 后 `ds` 仍为
+> **注意**：Step 4 中 `ds = dataset_target(**kwargs); ds.build()`（`dataset_target` 为
+> `_target_` 经 `import_target()` 解析后的 callable，解析入口 resolve_data_config 规划中）后 `ds` 仍为
 > `MegatronPretraining` 实例（`.build()` 是副作用方法不改变类型）；Step 8 中通过
 > `ds.get_dataset(split)` 获取底层 `GPTDataset`/`BlendableDataset` 用于 sampler。
 
@@ -2708,8 +2736,7 @@ class VlmDataloaderConfig:
             if hasattr(tokenizer, "chat_template"):
                 tokenizer.chat_template = self.chat_template
 
-        # 2. 构建数据集
-        from hyper_models.components.config.node import ConfigNode
+        # 2. 构建数据集（注：ConfigNode 已不存在，直接通过 typed config.build() 构造）
         tokenizer = getattr(processor, "tokenizer", processor) if processor else None
         ds = self.dataset_config.build(tokenizer=tokenizer)
 
@@ -3194,6 +3221,9 @@ vlm_dataloader:
 # 03_training_loop.md 中的集成示例
 
 # 构建 DataLoader
+# 注：cfg.dataset / cfg.dataloader / cfg.packed_sequence / cfg.dynamic_batching /
+# cfg.transform / cfg.multisource 均为规划中的数据管道配置段，经 resolve_data_config
+# 独立解析，不在当前 TrainerConfig 字段内（resolve_root() 拒绝未知一级字段）
 self.dataloader, self.tokenizer = build_dataloader(
     cfg.dataset, cfg.dataloader, cfg.model, cfg.packed_sequence,
     cfg_db=cfg.dynamic_batching,  # 可选
@@ -3218,11 +3248,19 @@ for epoch in self.step_scheduler.epochs:
 
 ---
 
-## 18. 配置类型化解析层（可选）
+## 18. 配置类型化解析层（规划中）
 
 > **参考**: Automodel `nemo_automodel/recipes/_typed_config.py` — `_resolve_dataloader`
 
-为提升配置的类型安全性和 IDE 支持，可以在 `hyper_models/components/datasets/config.py` 中添加类型化解析层。当前优先使用 ConfigNode 弱类型，类型化解析作为可选升级路径。
+为提升配置的类型安全性和 IDE 支持，`hyper_models/components/datasets/config.py` 中使用强类型 dataclass 定义数据集配置。与 01 §2 的 `TrainerConfig` 保持一致，均基于 `Configurable.Config`（01 §3）或独立 dataclass。
+
+> **定位说明（与 D4 统一）**：dataset/dataloader/packed_sequence/dynamic_batching/
+> transform/multisource 等数据管道配置段不在当前 `TrainerConfig` 的 9 个一级字段内
+> （`resolve_root()` 拒绝未知一级字段），因此不由 `resolve_component()` 解析，
+> 而由规划中的独立入口 `resolve_data_config(cfg_dict)` 解析——机制复用 01 §2.4 的
+> `import_target()` + `coerce_value()`，产出"已解析 callable + typed kwargs"或
+> 直接产出本节定义的 Config 对象；嵌套 `_target_` 段（如 collate_fn、tokenizer、
+> multisource.sources[*]）由 `resolve_data_config` 递归解析。
 
 ```python
 # hyper_models/components/datasets/config.py
@@ -3230,17 +3268,27 @@ for epoch in self.step_scheduler.epochs:
 from dataclasses import dataclass, field
 from typing import Optional, Any
 
+from hyper_models.config.resolver import import_target
+
 
 @dataclass
 class DatasetConfig:
-    """类型化数据集配置基类。"""
+    """类型化数据集配置基类。
+
+    `_target_` 声明要调用的数据集类/函数（字符串 dotted path），其余字段为其构造参数。
+    """
     _target_: str
     split: Optional[str] = None
 
     def build(self, **kwargs) -> Any:
-        """构建数据集实例。"""
-        from hyper_models.components.config.node import ConfigNode
-        return ConfigNode({"_target_": self._target_, **self.__dict__}).instantiate()
+        """构建数据集实例——解析 `_target_` 并传入配置字段 + runtime kwargs。"""
+        # _target_ 为字符串 dotted path，build() 内先经 import_target()（01 §2.4）
+        # 解析为 callable 再调用；规划上由 resolve_data_config 在解析阶段统一完成，
+        # 此处保留显式 import_target() 作为独立使用时的兜底
+        target = import_target(self._target_)
+        config_kwargs = {k: v for k, v in self.__dict__.items()
+                        if k != "_target_" and not k.startswith("_")}
+        return target(**config_kwargs, **kwargs)
 
 
 @dataclass
@@ -3307,10 +3355,15 @@ def add_flash_attention_kwargs_from_position_ids(batch: dict) -> dict:
     ...
 
 
-# ── ConfigNode 解析 ──
+# ── _target_ 解析 ──
 
 def _resolve_dataset_target(cfg) -> type | callable:
-    """解析 ConfigNode 的 _target_ 为可调用对象。"""
+    """解析数据管道配置段的 `_target_` 为可调用对象。
+
+    规划中的独立解析入口 resolve_data_config() 的内部环节：dataset 等数据管道
+    配置段不在当前 TrainerConfig 字段内（resolve_root() 拒绝未知一级字段），
+    不经 resolve_component()；机制复用 01 §2.4 的 import_target() + coerce_value()。
+    """
     ...
 
 

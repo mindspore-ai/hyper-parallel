@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import inspect
 import types
@@ -166,9 +167,13 @@ def _coerce_scalar(value: object, annotation: object, *, path: str) -> object:
 def _coerce_literal(value: object, choices: tuple, *, path: str) -> object:
     """Validate a value against the exact choices of a ``Literal``."""
 
-    # PyYAML 1.1 parses an unquoted ``off`` scalar as ``False``.
-    if value is False and "off" in choices:
-        return "off"
+    # PyYAML 1.1 parses unquoted on/off/yes/no/true/false scalars as bool.
+    # Map the bool back to the matching word when it is one of the choices.
+    if isinstance(value, bool):
+        words = ("on", "yes", "true") if value else ("off", "no", "false")
+        for word in words:
+            if word in choices:
+                return word
     if any(type(value) is type(choice) and value == choice for choice in choices):
         return value
     expected = ", ".join(repr(choice) for choice in choices)
@@ -182,6 +187,8 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
         return value
     if annotation is inspect.Signature.empty:
         raise _fail(path, "target parameter has no type annotation")
+    if isinstance(annotation, dataclasses.InitVar):
+        return coerce_value(value, annotation.type, path=path)
     if value is None:
         return _coerce_none(annotation, path=path)
     if _is_union(annotation):
@@ -218,10 +225,10 @@ def _annotation_assignable(source: object, expected: object) -> bool:
         return True
     if source is Any:
         return False
-    if _is_union(expected):
-        return any(_annotation_assignable(source, item) for item in get_args(expected))
     if _is_union(source):
         return all(_annotation_assignable(item, expected) for item in get_args(source))
+    if _is_union(expected):
+        return any(_annotation_assignable(source, item) for item in get_args(expected))
     source_origin = get_origin(source) or source
     expected_origin = get_origin(expected) or expected
     if isinstance(source_origin, type) and isinstance(expected_origin, type):
@@ -238,14 +245,23 @@ def resolve_component(node: object, *, expected_type: object, path: str) -> obje
         raise _fail(path, "component group is missing required _target_")
 
     target = import_target(node["_target_"], path=f"{path}._target_")
-    try:
-        hints = get_type_hints(target)
-    except (NameError, TypeError) as exc:
-        raise _fail(path, f"could not resolve target type annotations: {exc}") from exc
 
     if inspect.isclass(target):
         result_type = target
+        # Class-level hints (get_type_hints(target)) only cover dataclass
+        # fields; constructor parameters of plain classes live on __init__.
+        # Resolving from __init__ also handles modules using
+        # ``from __future__ import annotations``, where raw parameter
+        # annotations are unparsed strings.
+        hint_source = target.__init__
     else:
+        hint_source = target
+    try:
+        hints = get_type_hints(hint_source)
+    except (NameError, TypeError) as exc:
+        raise _fail(path, f"could not resolve target type annotations: {exc}") from exc
+
+    if not inspect.isclass(target):
         result_type = hints.get("return", inspect.Signature.empty)
         if result_type is inspect.Signature.empty:
             raise _fail(path, "factory target must declare a return annotation")

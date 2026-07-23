@@ -36,14 +36,14 @@
 Checkpoint 模块在两条调用路径上工作——**初始化**（`setup()` 中创建 Checkpointer）和**运行时**（训练循环中保存/加载）。
 
 ```
-main() → recipe.setup(cfg)                                           # 01_hf_compatibility_layer.md §4
+main() → cfg = parse_training_args()                                # 01_hf_compatibility_layer.md §4
+│   → recipe.setup(cfg)                                              # cfg 为 TrainerConfig 实例
 │
-├─④.7 self.checkpointer = cfg.checkpoint.build(                      # §3/§4: 初始化路径
+├─③.6 self.checkpointer = checkpoint_config.build(                  # §3/§4: 初始化路径
 │       dp_rank=..., tp_rank=..., pp_rank=..., moe_mesh=...)
 │   │
-│   ├─ cfg.checkpoint                                                # RecipeConfig cached_property (§8)
-│   │   → CheckpointingConfig(                                       # §3: 类型化配置
-│   │         checkpoint_dir="outputs/",
+│   ├─ checkpoint_config = CheckpointingConfig(                       # §3: 类型化配置，规划中为
+│   │         checkpoint_dir="outputs/",                              #     cfg.checkpoint；当前由调用方独立构造传入
 │   │         model_save_format="safetensors",
 │   │         save_consolidated="final",
 │   │         is_async=True,
@@ -57,7 +57,7 @@ main() → recipe.setup(cfg)                                           # 01_hf_c
 │           ├─ 注册 Addons (ConsolidatedHFAddon / PeftAddon)
 │           └─ 异步 stager (if is_async)
 │
-├─④.13 self.load_checkpoint(restore_from)                            # 断点续训恢复（§8 Recipe 方法）
+├─③.12 self.load_checkpoint(restore_from)                            # 断点续训恢复（§8 Recipe 方法）
 │   │
 │   └─ checkpointer.load_model(self.model_parts, model_path)         # §5.3: DCP resume（仅 resume 语义）
 │       ├─ ModelState(model_parts) → state_dict()                    #   遍历所有 PP part
@@ -67,7 +67,7 @@ main() → recipe.setup(cfg)                                           # 01_hf_c
 │   └─ checkpointer.load_optimizer(self.model_parts, optimizers, ...) # 恢复优化器状态（list，与 03 §3.1 canonical 对齐）
 │   └─ load LR scheduler / RNG / DataLoader state                    # 恢复其他组件
 │
-└─⑤ recipe.run_train_validation_loop()                               # 训练循环
+└─④ recipe.run_train_validation_loop()                               # 训练循环
     │
     └─ if is_ckpt_step: self.save_checkpoint(...)                     # 03 §3 BaseRecipe: 遍历 __state_tracked
         │
@@ -128,12 +128,14 @@ HyperAutoModelForCausalLM.from_pretrained()                           # 01 §6
 
 ```
 main()                                  # 01 §4
-├─④ recipe.setup(cfg)
-│   ├─④.7  checkpointer = ...          # 本文档 §3/§4 (初始化)
-│   ├─④.8  model = from_pretrained()   # 01 §6
+├─① cfg = parse_training_args()       # 01 §4 (返回 TrainerConfig)
+├─② recipe = FinetuneRecipe()          # 01 §4.1
+├─③ recipe.setup(cfg)
+│   ├─③.4  model = from_pretrained()   # 01 §6
 │   │   └─ load_base_model()           # 本文档 §4.3/§4.4 (权重加载)
-│   └─④.13 load_checkpoint()           # 本文档 §8 (断点续训恢复)
-└─⑤ run_train_validation_loop()        # 03_training_loop.md §6
+│   ├─③.6 checkpointer = ...          # 本文档 §3/§4 (初始化)
+│   └─③.12 load_checkpoint()           # 本文档 §8 (断点续训恢复)
+└─④ run_train_validation_loop()        # 03_training_loop.md §6
     └─ save_checkpoint()               # 本文档 §4.2 (保存)
 ```
 
@@ -177,7 +179,7 @@ main()                                  # 01 §4
 
 ## 4. CheckpointingConfig
 
-> **调用位置**: 时序树 ④.7 — `RecipeConfig.checkpoint` → `CheckpointingConfig(**kwargs)`
+> **调用位置**: 时序树 ③.6 — checkpoint 配置当前由调用方独立构造 `CheckpointingConfig` 传入（规划中作为 TrainerConfig 顶层字段 `cfg.checkpoint`），由 `Checkpointer` 构建
 
 ```python
 # hyper_models/components/checkpoint/config.py
@@ -219,7 +221,7 @@ class CheckpointingConfig:
     # ── 模型来源 ──
     model_cache_dir: str | None = None  # reserved for future use
     model_repo_id: str | None = None
-    original_model_root_dir: str | None = None  # 基座模型根目录（用于 HF metadata）；set by RecipeConfig bridge in 01
+    original_model_root_dir: str | None = None  # 基座模型根目录（用于 HF metadata）；由 TrainerConfig 或调用方传入
 
     # ── DCP 恢复 ──
     model_state_dict_keys: list[str] | None = None  # 预并行化 key 快照（DCP 恢复时校验）
@@ -297,7 +299,7 @@ def _is_geq_torch_2_3() -> bool:
 
 ## 5. Checkpointer 核心类
 
-> **调用位置**: 时序树 ④.7 — `CheckpointingConfig.build()` → `Checkpointer`
+> **调用位置**: 时序树 ③.6 — `CheckpointingConfig.build()` → `Checkpointer`
 
 ### 5.1 初始化
 
@@ -332,7 +334,7 @@ class Checkpointer:
     """统一的 Checkpoint 管理器。
 
     生命周期：
-    - 构造：在 recipe.setup() 中创建（step ④.7），用于训练过程中的 checkpoint 保存/恢复
+    - 构造：在 recipe.setup() 中创建（step ③.6），用于训练过程中的 checkpoint 保存/恢复
     - 初始化加载：load_base_model() 是独立的自由函数，在 _build_model() 中调用（不依赖 Checkpointer 实例状态）
     - 运行时：save_model/save_optimizer 在训练循环中调用；load_model/load_optimizer 用于断点续训恢复
     - 销毁：训练结束时 close()（清理异步 future 和 process group）
@@ -388,7 +390,7 @@ class Checkpointer:
 
 ### 5.2 保存模型
 
-> **调用位置**: 时序树 ⑤ `save_checkpoint()` — `checkpointer.save_model()`
+> **调用位置**: 时序树 ④ `save_checkpoint()` — `checkpointer.save_model()`
 
 ```python
 def save_model(
@@ -544,7 +546,7 @@ def _do_save(self, state_dict: dict, path: str, writer, *,
 ### 5.3 加载模型
 
 > **调用位置**:
-> - 时序树 ④.13 — `checkpointer.load_model()`（断点续训 resume，仅 DCP path）
+> - 时序树 ③.12 — `checkpointer.load_model()`（断点续训 resume，仅 DCP path）
 > - 时序树 _build_model — `load_base_model()`（基座模型 init，路径 1 MoE merging / 路径 2 safetensors）
 >
 > init 路径已从 `Checkpointer.load_model` 迁入自由函数 `load_base_model`（见下方），
@@ -1157,9 +1159,9 @@ def _maybe_load_latest_marker(checkpoint_dir: str) -> str | None:
                 return os.path.join(checkpoint_dir, lines[-1])
     return None
 
-# ── StateDictAdapter 获取（canonical：01 §2.14） ──
+# ── StateDictAdapter 获取（canonical：01 §10.1） ──
 def _get_state_dict_adapter(model: nn.Module):
-    """从模型读取 ``_state_dict_adapter`` 属性（canonical：01 §2.14）。
+    """从模型读取 ``_state_dict_adapter`` 属性（canonical：01 §10.1）。
 
     - 模型经 01 §11 ``HFCheckpointingMixin`` 持有 ``_state_dict_adapter``
       实例（注册期绑定，如 ``Qwen3_5DenseStateDictAdapter()``）→ 返回该实例。
@@ -1404,7 +1406,7 @@ mlp.experts.0.down_proj.weight
 
 ## 8. 故障恢复集成
 
-> **调用位置**: 时序树 ④.13 — `load_checkpoint()` 完整流程
+> **调用位置**: 时序树 ③.12 — `load_checkpoint()` 完整流程
 
 ```python
 # recipes/base_recipe.py 中 load_checkpoint 的完整流程
@@ -1422,7 +1424,7 @@ def load_checkpoint(self, restore_from: str | None) -> None:
         return
 
     if restore_from == "LATEST":
-        restore_from = _resolve_latest_symlink(self.cfg.checkpoint.checkpoint_dir)
+        restore_from = _resolve_latest_symlink(self.checkpoint_config.checkpoint_dir)
         if restore_from is None:
             logger.info("No LATEST checkpoint found, starting from scratch.")
             return
@@ -1493,31 +1495,37 @@ def _state_path(self, root: str, name: str, kind: str) -> str:
 
 ---
 
-## 9. RecipeConfig 桥接
+## 9. Checkpoint 配置接入
 
-> **调用位置**: 时序树 ④.7 — `RecipeConfig.checkpoint` cached_property（`_target_` → 类型化 Config → `.build()`）
+> **调用位置**: 时序树 ③.6 — checkpoint 配置当前由调用方独立构造 `CheckpointingConfig` 传入（规划中作为 TrainerConfig 顶层字段 `cfg.checkpoint`），由 `Checkpointer` 构建
 
-AutoModel 对 checkpoint 使用与 optimizer 相同的**两层 typed config 模式**：
+> **实现状态**：checkpoint 配置是 `CheckpointingConfig` 类型化 dataclass，**当前由调用方
+> 独立构造传入**；规划中将作为 `TrainerConfig` 顶层 typed 字段 `cfg.checkpoint`
+> （规划中：待加入 TrainerConfig）。不存在 `RecipeConfig` / `cached_property` /
+> `_section_kwargs()` 等旧桥接概念。
 
-1. **RecipeConfig.checkpoint**：从 YAML 提取 kwargs（丢弃 `_target_`，如果有的话）→ 直接构造 `CheckpointingConfig`
-2. **checkpoint_config.build(dp_rank=..., ...)**：注入运行时依赖，创建 `Checkpointer`
+Checkpoint 使用**单层 typed config + build() 模式**：
 
-**canonical 实现归 01 §3.3**（`RecipeConfig.checkpoint` cached_property，含
-`model_repo_id` / `model_cache_dir` / `is_peft` 等模型派生字段的注入），
+1. **构造**：`CheckpointingConfig` 当前由调用方独立构造传入（规划中由 `TrainerConfig`
+   顶层字段 `cfg.checkpoint` 提供），字段直接对应 YAML checkpoint 段
+2. **build(dp_rank=..., ...)**：注入运行时依赖，创建 `Checkpointer`
+
+**canonical 实现见 01 §3**（`Configurable.build()` protocol），
 本文档不再重复完整实现，仅保留 04 特有的 checkpoint 配置说明：
 
-- `CheckpointingConfig` 是**固定类型**（不走 `_target_`），cached_property 直接
-  用 `_section_kwargs()` 提取 YAML checkpoint 段字段后构造；
+- `CheckpointingConfig` 是**固定类型** dataclass，直接通过类型化字段构造；
 - `restore_from` 由 Recipe 单独解析（`load_checkpoint(restore_from)`），
   不传入 `CheckpointingConfig`；
-- 模型派生字段（`model_repo_id` / `model_cache_dir` / `is_peft`）在
-  cached_property 中注入，YAML 显式设置的值优先（详见 01 §3.3）。
+- 模型派生字段（`model_repo_id` / `model_cache_dir` / `is_peft`）当前由
+  调用方注入（规划中在 TrainerConfig 层注入），YAML 显式设置的值优先。
 
 ### 使用方式
 
 ```python
 # Recipe.setup() 中
-checkpoint_config = self.cfg.checkpoint  # → CheckpointingConfig 实例（已类型校验）
+# checkpoint_config 当前由调用方独立构造传入，已是 CheckpointingConfig 实例；
+# 规划中改为从 TrainerConfig 顶层字段 cfg.checkpoint 获取
+checkpoint_config: CheckpointingConfig = self.cfg.checkpoint  # 规划中：待加入 TrainerConfig；当前由独立配置传入
 self.checkpointer = checkpoint_config.build(
     dp_rank=self._get_dp_rank(),
     tp_rank=self._get_tp_rank(),
@@ -1535,7 +1543,8 @@ self.checkpointer = checkpoint_config.build(
 ```yaml
 recipe: FinetuneRecipe
 
-# Checkpoint 配置（typed —— RecipeConfig 直接构造 CheckpointingConfig）
+# Checkpoint 配置（typed —— 规划中键：将作为 TrainerConfig 顶层字段 cfg.checkpoint；
+# 当前由调用方独立构造 CheckpointingConfig 传入）
 checkpoint:
   checkpoint_dir: outputs/qwen35_08b
   model_save_format: safetensors       # "safetensors" | "torch_save"
@@ -1545,20 +1554,27 @@ checkpoint:
   restore_from: LATEST                 # 由 Recipe 单独解析，不传给 CheckpointingConfig
 ```
 
-**与 AutoModel 的 `_target_` 使用对比总表**：
+> **实现状态**：项目实际使用 `TrainerConfig` 强类型 dataclass（通过 `parse_training_args()` 获取），
+> 不存在 `ConfigNode` / `RecipeConfig` / `.instantiate()` 等旧概念。所有配置段均为类型化 dataclass
+> 字段，通过 `Configurable.build()` protocol 创建运行时对象。详见 01 §3。
 
-| 组件 | 路径 | YAML `_target_` | Recipe 调用 |
-|------|------|----------|-----------|
-| Model | **untyped** `.instantiate()` | `_target_: ...from_pretrained` | `cfg.model.instantiate(distributed_setup=...)` |
-| Dataset | **untyped** `.instantiate()` | `_target_: datasets.load_dataset` | `cfg.dataset.instantiate(tokenizer=...)` |
-| DataLoader | **untyped** `.instantiate()` | `_target_: ...StatefulDataLoader` | `cfg.dataloader.instantiate(dataset=...)` |
-| Tokenizer | **untyped** `.instantiate()` | `_target_: AutoTokenizer.from_pretrained` | `cfg.dataset.tokenizer.instantiate()` |
-| Collate | **untyped** `.instantiate()` | `_target_: ...default_collater` | `collate_cfg.instantiate(batch=batch)` |
-| PEFT | **untyped** `.instantiate()` | `_target_: ...PeftConfig` | `cfg.peft.instantiate()` |
-| **Optimizer** | **typed** `.build()` | `_target_: torch.optim.AdamW` | `cfg.optimizer.build(model, device_mesh=...)` |
-| **LR Scheduler** | **typed** `.build()` | 无（固定类型 `LRSchedulerConfig`） | `cfg.lr_scheduler.build(optimizer, step_scheduler)` |
-| **StepScheduler** | **typed** `.build()` | 无（固定类型 `StepSchedulerConfig`） | `cfg.step_scheduler.build(dataloader, dp_size, local_bs)` |
-| **Loss** | **typed** `.build()` | `_target_: ...MaskedCrossEntropy` | `cfg.loss_fn.build()` |
-| **Checkpoint** | **typed** `.build()` | 无（固定类型 `CheckpointingConfig`） | `cfg.checkpoint.build(dp_rank, tp_rank, ...)` |
-| WandB/MLflow | **typed** `.build()` | 无（固定类型） | `cfg.wandb.build(run_config=...)` |
-| RNG | **直接构造** | 无（`seed` 字段） | `StatefulRNG(seed=cfg.get("seed", 42), ranked=True)` |
+**组件构建方式总览**：
+
+> 本表为规划目标形态：`cfg.dataloader` / `cfg.step_scheduler` / `cfg.checkpoint` /
+> `cfg.wandb` / `cfg.training.seed` 均为规划中字段（待加入 TrainerConfig）；
+> 当前 TrainerConfig 仅有 model / optimizer / lr_scheduler / loss / training /
+> accelerator / mixed_precision / gradient_checkpointing / debug 九个字段。
+
+| 组件 | 构建方式 | 说明 |
+|------|----------|------|
+| Model | `HyperAutoModelForCausalLM.from_pretrained(cfg.model, distributed_setup=...)` | typed 配置传入 |
+| Dataset | 由 data pipeline 单独处理 | 不在 TrainerConfig 内 |
+| DataLoader | `cfg.dataloader.build(dataset=...)` | typed `.build()`（规划中） |
+| Tokenizer | `AutoTokenizer.from_pretrained(cfg.model.model_repo_id)` | 标准 HF API |
+| **Optimizer** | `cfg.optimizer.build(model, device_mesh=...)` | typed `.build()` |
+| **LR Scheduler** | `cfg.lr_scheduler.build(optimizer, step_scheduler)` | typed `.build()` |
+| **StepScheduler** | `cfg.step_scheduler.build(dataloader, dp_size, local_bs)` | typed `.build()`（规划中） |
+| **Loss** | `cfg.loss.build()` | typed `.build()` |
+| **Checkpoint** | `cfg.checkpoint.build(dp_rank, tp_rank, ...)` | typed `.build()`（规划中；当前独立构造传入） |
+| WandB/MLflow | `cfg.wandb.build(run_config=...)` | typed `.build()`（规划中） |
+| RNG | `StatefulRNG(seed=cfg.training.seed, ranked=True)` | typed 字段访问（seed 规划中） |

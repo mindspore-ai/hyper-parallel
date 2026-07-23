@@ -89,9 +89,9 @@ row(55.3, 5.6, [
 ])
 
 # ── L3 训练组件 ────────────────────────────────────────────────────────────
-band(46.6, 6.8, "L3\n训练组件", "typed build / untyped instantiate")
+band(46.6, 6.8, "L3\n训练组件", "强类型 dataclass + typed build")
 row(47.1, 5.6, [
-    ("配置系统 01（待实现）", ["ConfigNode · RecipeConfig", "components/config/node.py"], "todo"),
+    ("配置系统 01（已实现）", ["parse_training_args · TrainerConfig", "hyper_models/config/"], "done"),
     ("数据管道 02（待实现）", ["build_dataloader · packing", "sampler · default_collater"], "todo"),
     ("Checkpoint 04（待实现）", ["Checkpointer · DCP 切分", "OptimizerState: list[Optimizer]"], "todo"),
     ("Optim / Loss 03（待实现）", ["list[Optimizer] canonical", "LR 调度 · MaskedCE"], "todo"),
@@ -155,7 +155,7 @@ col2 = ("已定稿决策\n"
         "· EP（D-10）：TP-extend-EP，expert 仅 {EP: Shard(0)}，\n"
         "  派生 (edp, ep) expert mesh，Megatron ETP=1 同构\n"
         "· optimizer：list[Optimizer]（03 canonical）\n"
-        "· RecipeConfig canonical：01 §3.3")
+        "· 强类型配置：TrainerConfig + Configurable（01 §2/§3）")
 col3 = ("待决点（D-12）\n"
         "TP-Replicate 参数梯度同步二选一：\n"
         "a) 调时序走 DTENSOR_UNIFIED\n"

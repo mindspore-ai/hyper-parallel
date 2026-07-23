@@ -26,11 +26,15 @@
 ### Hyper-Parallel 重构方案
 
 ```
-YAML 文件 → load_yaml_config() → ConfigNode（弱类型 dict 包装）
-                                  → _target_ 即时解析为 callable
-                                  → RecipeConfig（类型化桥接）
-                                  → .build() / .instantiate()
+YAML 文件 + CLI --field=value overrides
+   → parse_training_args()（hyper_models/config/manager.py）
+   → resolve_root() / resolve_component()（hyper_models/config/resolver.py：
+       _target_ 经 import_target 即时解析 → 签名校验 → coerce_value typed 转换 → 立即构造）
+   → TrainerConfig（强类型配置树，hyper_models/trainer/config.py，9 个一级字段）
+   → typed .build()（Configurable 协议，hyper_models/config/configurable.py）
 ```
+
+> 注：原设计的 `load_yaml_config()` → ConfigNode 弱类型 → RecipeConfig 桥接 → `.instantiate()` 方案**未实现、不会实现**；实际已落地为上述强类型方案（commit 78a79c0f），与 VeOmni 的 `_typed_config.py` 同属强类型路线。
 
 **核心思想**：YAML 即 IoC 容器。所有组件通过 `_target_: fully.qualified.ClassName` 声明类型，框架不硬编码任何 `if-else` 分支。
 
@@ -45,8 +49,8 @@ optimizer:
 - ✅ 新增组件只需改 YAML，零 Python 代码改动
 - ✅ 非开发用户也可独立配置训练
 - ✅ `_target_` 字符串路径可以精确追踪到类定义（"torch.optim.AdamW" 直接定位）
-- ❌ `_target_` 字符串路径没有类型检查，拼写错误在运行时才暴露
-- ❌ 中间层 `ConfigNode` 是黑盒，`_resolve_target()` → `importlib.import_module()` 链路需要理解才能追踪
+- ✅ `_target_` 在配置解析期即被 import_target 解析 + 构造签名校验 + coerce_value typed 转换，拼写/类型错误在启动时暴露（非训练中途）
+- ✅ 无 ConfigNode 中间黑盒：YAML 直接构造为强类型 dataclass（TrainerConfig / Configurable.Config），IDE 可跳转、可补全
 
 ### VeOmni
 
@@ -80,11 +84,11 @@ args = parse_args("train.yaml")
 |------|---------------|--------|
 | 调参（改 lr） | 改 YAML 一行 | 改 YAML 或命令行参数 |
 | 新增优化器类型 | YAML 改 `_target_` 即可 | 改 `arguments_types.py` 的 `OptimizerConfig` |
-| 类型错误发现时机 | 运行时 | 编译期（IDE 报错） |
-| 代码追踪路径 | `_target_` 字符串 → `_resolve_target` → import | 属性访问 → `OptimizerConfig` 类定义 |
+| 类型错误发现时机 | 配置解析期（resolve_component 签名校验 + coerce_value typed 转换，启动时暴露） | 编译期（IDE 报错） |
+| 代码追踪路径 | `_target_` 字符串 → import_target 解析 → 强类型 Config 类定义（IDE 可跳转） | 属性访问 → `OptimizerConfig` 类定义 |
 | 配置嵌套深度 | 点号路径 `cfg.get("step_scheduler.local_batch_size")` | 属性链 `args.train.step_scheduler.local_batch_size` |
 
-**结论**：VeOmni 的纯类型方案在开发时代的**安全性**（IDE 补全、类型检查）更好。Hyper-Parallel 的 `_target_` IoC 方案在**扩展性**（新增组件零代码改动）更好。对算法人员日常调参来说，VeOmni 的 IDE 支持更友好。
+**结论**：两者均为强类型方案，**类型安全性基本持平**——Hyper-Parallel 已落地强类型解析（TrainerConfig + coerce_value typed 校验，commit 78a79c0f），配置错误在启动期暴露；VeOmni 为编译期 IDE 检查，开发期反馈略早。Hyper-Parallel 的 `_target_` IoC 方案在**扩展性**（新增组件零代码改动）更好。原"ConfigNode 弱类型"的差距结论已失效。
 
 ---
 
@@ -166,14 +170,14 @@ main() → recipe.setup(cfg) → recipe.run_train_validation_loop()
 
 **Recipe.setup() 显式编排**：
 ```python
-def setup(self, cfg: RecipeConfig):
+def setup(self, cfg: TrainerConfig):
     # ① 分布式初始化
     self.dist_env = initialize_distributed("nccl")
     # ③ RNG
     self.rng = StatefulRNG(seed=..., ranked=True)
     # ⑦ Loss
-    self.loss_fn = self.cfg.loss_fn.build()
-    # ⑩ Checkpointer
+    self.loss_fn = self.cfg.loss.build()
+    # ⑩ Checkpointer（规划中：checkpoint 字段待加入 TrainerConfig）
     self.checkpointer = self.cfg.checkpoint.build(...)
     # ⑪ Model
     self.model, self.optimizer_init = build_model(...)
@@ -181,7 +185,7 @@ def setup(self, cfg: RecipeConfig):
     self.optimizer = self.cfg.optimizer.build(...)
     # ⑬ DataLoader
     self.dataloader, self.tokenizer = build_dataloader(...)
-    # ⑮ StepScheduler
+    # ⑮ StepScheduler（规划中：step_scheduler 字段待加入 TrainerConfig）
     self.step_scheduler = self.cfg.step_scheduler.build(...)
     # ⑯ LR Scheduler
     self.lr_scheduler = self.cfg.lr_scheduler.build(...)
@@ -195,7 +199,7 @@ def setup(self, cfg: RecipeConfig):
 
 **核心设计**：
 - 18 步组件构建按依赖顺序显式排列
-- 每条语句的调用方式明确（`.build()` 或 `.instantiate()`）
+- 每条语句的调用方式明确（typed `.build()`，Configurable 协议；原设计的 untyped `.instantiate()` 路径已取消）
 - 每个组件的创建时机和依赖关系一目了然
 
 **对算法人员的影响**：
@@ -447,7 +451,7 @@ class VeOmniIter:
 | 后台预取 | 无 | BackgroundPrefetcher | 无 |
 | SP Collator | 无 | 3 步管线（MainCollator） | 仅 CP sharding 契约 |
 | 媒体工具 | VLM utils（图像/视频/LMDB） | multimodal/(image/video/audio)_utils | 无 |
-| 配置类型化 | _typed_config.py 强类型解析 | ConfigNode 弱类型 | ConfigNode 弱类型 |
+| 配置类型化 | _typed_config.py 强类型解析 | VeOmniArguments 强类型 dataclass | 强类型 dataclass 解析（TrainerConfig + Configurable，commit 78a79c0f） |
 | 状态管理 | StatefulDataLoader | StatefulDataLoader + 快照 | StatefulDataLoader |
 
 ### 6.2 数据集类型覆盖
@@ -543,7 +547,7 @@ class VeOmniIter:
 | 训练吞吐量 | ✅ BackgroundPrefetcher | ❌ | ❌ | ✅ BackgroundPrefetcher |
 | 定制数据处理 | ✅ override Transform | 修改 dataset 类 | 修改 build_dataloader 内部 | ✅ TransformRegistry |
 | 数据源切换 | 手动配置 dataloader_type | _target_ 自动分发 | _target_ 自动分发 | _target_ 自动分发 |
-| 配置类型安全 | ❌ ConfigNode 弱类型 | ✅ _typed_config.py | ❌ ConfigNode 弱类型 | 可选类型化解析层 |
+| 配置类型安全 | ✅ 强类型 dataclass | ✅ _typed_config.py | ✅ 强类型 dataclass 解析（coerce_value typed 校验，commit 78a79c0f） | ✅ 已落地 |
 | 评估数据集 | ❌ | ✅ HellaSwag/SQuAD | ❌ | ✅（P2） |
 
 ### 6.8 结论
@@ -706,7 +710,7 @@ BaseTrainer
 
 | 维度 | Hyper-Parallel 重构方案 | VeOmni | 胜出 |
 |------|----------------------|--------|:----:|
-| **配置系统易用性** | `_target_` IoC 灵活但类型不安全 | 强类型 dataclass，IDE 友好 | VeOmni |
+| **配置系统易用性** | `_target_` IoC 灵活 + 强类型解析（typed 校验、IDE 友好） | 强类型 dataclass，IDE 友好 | 持平（Hyper-Parallel 扩展性更优） |
 | **模型并行化适配** | ShardingPlanner 声明式，~20 行/模型 | `build_parallelize_model` 函数式 | **Hyper-Parallel** |
 | **训练流程可读性** | 显式 `setup()` + 混合 Callback | 纯 Callback + 分散的 `_build_*` | **Hyper-Parallel** |
 | **调试友好性** | StepState 透传时序标记，单步追踪 | 7 个 callback 串联，调用栈深 | **Hyper-Parallel** |
@@ -714,7 +718,7 @@ BaseTrainer
 | **数据管道成熟度** | 简洁但缺少生产级特性 | 有 BackgroundPrefetcher/动态 batching | VeOmni |
 | **多任务扩展** | 继承模式简洁，但变体少 | Composition 灵活，5 种变体验证 | VeOmni |
 | **运行时性能** | PrecompiledBoundary 零 dispatch | FSDP 运行时管理 | **Hyper-Parallel** |
-| **学习曲线** | 概念多（ShardingTemplate/ParamRole/ConfigNode） | 概念少（纯 Python 类型） | VeOmni |
+| **学习曲线** | 概念多（ShardingTemplate/ParamRole/Configurable） | 概念少（纯 Python 类型） | VeOmni |
 
 ### 结论
 
@@ -725,7 +729,7 @@ BaseTrainer
 2. **易调试性胜出**：`StepState` 将所有时序标记集中透传，算法人员不需要追踪多个 callback 的独立判断逻辑。`__state_tracked` 自动追踪确保没有组件状态被遗漏。VeOmni 的 7 个 callback 串联和手动 `extra_state` 管理增加了调试时的认知负担。
 
 3. **易用性各有优劣**：
-   - **配置**：VeOmni 的强类型 dataclass 在开发期更友好（IDE 补全、类型检查），但 Hyper-Parallel 的 `_target_` IoC 在扩展性上更好（新增组件零代码改动）
+   - **配置**：两者均为强类型 dataclass 解析（IDE 补全、typed 校验）——Hyper-Parallel 已落地 TrainerConfig 强类型方案（commit 78a79c0f）；且 Hyper-Parallel 的 `_target_` IoC 在扩展性上更好（新增组件零代码改动）
    - **模型适配**：Hyper-Parallel 的 ShardingPlanner 显著优于 VeOmni 的 `build_parallelize_model`（~20 行 vs 千行级 `parallelize.py`）
    - **数据管道**：VeOmni 更成熟，有 `BackgroundPrefetcher` 和 `dynamic_batching` 等生产级特性
    - **多任务**：VeOmni 已验证 5 种变体，Hyper-Parallel 当前只有 2 种
@@ -738,7 +742,7 @@ BaseTrainer
 2. **保留** Hyper-Parallel 的显式 Recipe 编排 + 混合 Callback 方案——在可读性和可调试性上显著优于 VeOmni
 3. **保留** `__state_tracked` 自动追踪——在 checkpoint 完整性上优于 VeOmni 的手动管理
 4. **借鉴** VeOmni 的 `BackgroundPrefetcher` 和 `dynamic_batching`——补齐生产级数据管道
-5. **借鉴** VeOmni 的 `VeOmniArguments` 的强类型设计——后续 `ConfigNode` 优化可参考其类型安全经验
+5. ~~**借鉴** VeOmni 的 `VeOmniArguments` 的强类型设计~~（已达成，本项关闭）——Hyper-Parallel 已落地强类型配置解析（`parse_training_args` → `resolve_root` → `TrainerConfig`，coerce_value typed 校验，commit 78a79c0f），原 ConfigNode 弱类型方案已取消
 6. **补齐** Hyper-Parallel 的 Recipe 变体数量——参考 VeOmni 的 DPO/RL/DiT 实现
 
 **一句话总结**：Hyper-Parallel 重构方案的**架构设计**（声明式并行化 + 显式 Recipe 编排 + 混合 Callback + 自动状态追踪）在理论上优于 VeOmni，但需要在**生产级特性**（BackgroundPrefetcher、动态 batching、多任务变体）上补齐，才能真正在算法人员的日常使用中全面超越 VeOmni。

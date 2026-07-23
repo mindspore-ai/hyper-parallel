@@ -17,7 +17,6 @@ import signal
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from functools import cached_property
 from typing import Any
 
 import torch
@@ -79,69 +78,70 @@ logger = logging.getLogger(__name__)
 
 训练流程的全部工作在 `main()` → `recipe.setup()` → `recipe.run_train_validation_loop()` 三个入口完成。以下是完整的调用树。
 
-> 编号约定：④.x 采用 01 §4.1 canonical 编号（④.4=model、④.5=loss_fn、④.7=checkpointer、
-> ④.8=optimizer、④.9=dataloader…），与 01/02 文档对齐；树中缩进顺序为实际执行顺序，
-> 编号非单调属预期（如 ④.5 loss_fn 先于 ④.4 model 构建）。
+> 编号约定：③.x 为 `recipe.setup(cfg)` 的子步骤编号（与 01 §4.1 的 ①→②→③→④
+> 层级编号对齐），按实际执行顺序编排：③.1 initialize_distributed、③.2 RNG、
+> ③.3 distributed_setup、③.3a callback_manager、③.5 loss、③.6 peft、
+> ③.7 checkpointer、③.8 model…（01 未单列的步骤如 checkpointer / step_scheduler
+> 由本文档补号，保证 03 内部一致）。训练主循环为 ④。
 
 ```
 main()                                                               # 01_hf_compatibility_layer.md §4
 │
-├─① cfg = load_yaml_config("train.yaml")                             # 01 §2: YAML → ConfigNode
-├─② cfg = RecipeConfig(cfg)                                          # 01 §3: 类型化桥接
+├─① cfg = parse_training_args()                                      # 01 §2: 返回强类型 TrainerConfig
 │
-├─③ recipe = FinetuneRecipe()
-├─④ recipe.setup(cfg)                                                # 01 §4: 构建所有组件
+├─② recipe = FinetuneRecipe()
+├─③ recipe.setup(cfg)                                                # 01 §4: 构建所有组件
 │   │
-│   ├─④.1 self.dist_env = initialize_distributed("nccl")             # 分布式初始化
-│   ├─④.2 self.rng = StatefulRNG(seed=..., ranked=True)              # RNG
-│   ├─④.3 self.distributed_setup = create_distributed_setup_from_config(cfg)
-│   ├─④.3a self.callback_manager = build_callback_manager(cfg)       # §4.2: Callback 管理器
+│   ├─③.1 self.dist_env = initialize_distributed("nccl")             # 分布式初始化
+│   ├─③.2 self.rng = StatefulRNG(seed=..., ranked=True)              # RNG
+│   ├─③.3 self.distributed_setup = create_distributed_setup_from_config(cfg)
+│   ├─③.3a self.callback_manager = build_callback_manager(cfg)       # §4.2: Callback 管理器
 │   │
-│   ├─④.5 self.loss_fn = cfg.loss_fn.build()                         # §10: typed .build()
+│   ├─③.5 self.loss = cfg.loss.build()                                # §10: typed .build()
 │   │   → LossConfig → MaskedCrossEntropy() / FusedLinearCrossEntropy()
 │   │
-│   ├─④.6 self.peft_config = cfg.peft.instantiate()  if configured   # untyped .instantiate()
+│   ├─③.6 self.peft_config = peft_config  if configured                # PEFT 配置（规划中：由 YAML peft 段经独立解析后传入 setup/build_model）
 │   │
-│   ├─④.7 self.checkpointer = cfg.checkpoint.build(                  # 04_checkpoint.md: typed .build()
-│   │       dp_rank=..., tp_rank=..., pp_rank=...)
+│   ├─③.7 self.checkpointer = cfg.checkpoint.build(                  # 04_checkpoint.md: typed .build()
+│   │       dp_rank=..., tp_rank=..., pp_rank=...)                    # （cfg.checkpoint 规划中：待加入 TrainerConfig）
 │   │
-│   ├─④.4 self.model, self.optimizer_init = build_model(               # 01 §6: 构建分片模型
+│   ├─③.8 self.model, self.optimizer_init = build_model(               # 01 §6: 构建分片模型
 │   │       cfg.model, self.peft_config,
 │   │       distributed_setup=self.distributed_setup)
 │   │   └─ from_pretrained() → _build_model() → 返回已分片模型
 │   │   └─ self.model_parts = self.model.parts or [self.model]
 │   │
-│   ├─④.8 self.optimizer = cfg.optimizer.build(                      # §9: typed .build()
+│   ├─③.9 self.optimizer = cfg.optimizer.build(                      # §9: typed .build()
 │   │       model, device_mesh=self.mesh.device_mesh)
 │   │   └─ OptimizerConfig → 参数分组 → AdamW(param_groups, ...)
 │   │
-│   ├─④.9 self.dataloader, self.tokenizer = build_dataloader(...)    # 02_data_pipeline.md
-│   ├─④.10 self.val_dataloaders = build_validation_dataloader(...)
+│   ├─③.10 self.dataloader, self.tokenizer = build_dataloader(...)    # 02_data_pipeline.md
+│   ├─③.11 self.val_dataloaders = build_validation_dataloader(...)
 │   │
-│   ├─④.11 self.step_scheduler = cfg.step_scheduler.build(           # §4: typed .build()
-│   │        self.dataloader, dp_size, local_batch_size)
+│   ├─③.12 self.step_scheduler = cfg.step_scheduler.build(           # §4: typed .build()
+│   │        self.dataloader, dp_size, local_batch_size)               # （cfg.step_scheduler 规划中：待加入 TrainerConfig）
 │   │
-│   ├─④.12 self.lr_scheduler = cfg.lr_scheduler.build(               # §9.6: typed .build()
+│   ├─③.13 self.lr_scheduler = cfg.lr_scheduler.build(               # §9.6: typed .build()
 │   │        self.optimizer, self.step_scheduler)
 │   │
-│   ├─④.13 self.load_checkpoint(restore_from)                        # 断点续训恢复
-│   └─④.14 self.mfu_calc = AutoMFU.from_config(model)
+│   ├─③.14 self.load_checkpoint(restore_from)                        # 断点续训恢复
+│   └─③.15 self.mfu_calc = AutoMFU.from_config(model)
 │
-└─⑤ recipe.run_train_validation_loop()                               # §6: 训练主循环
+└─④ recipe.run_train_validation_loop()                               # §6: 训练主循环
     │
-    ├─⑤.0 self.callback_manager.on_train_begin()                     # Callback: 训练开始
+    ├─④.0 self.callback_manager.on_train_begin()                     # Callback: 训练开始
     │
     ├─ for epoch in self.step_scheduler.epochs:                       # §4: StepScheduler 控制节奏
     │   └─ self.step_scheduler.set_epoch(epoch)                      # sampler shuffle 种子
     │
     └─ for batches in self.step_scheduler:                            # §4: 按 grad_acc_steps 分组
         │
-        ├─⑤.1 train_metrics = self._run_train_optim_step(            # §7: 单步优化（核心：显式）
+        ├─④.1 train_metrics = self._run_train_optim_step(            # §7: 单步优化（核心：显式）
         │       batches, max_grad_norm)
         │   │
-        │   ├─⑤.1.1 统计全局 token 数 (DP all-reduce)
+        │   ├─④.1.1 统计全局 token 数 (DP all-reduce)
         │   │
-        │   ├─⑤.1.2 梯度累积循环 (for each microbatch):
+        │   ├─④.1.2 梯度累积循环 (for each microbatch):
         │   │   └─ self._forward_backward_step(batch)                 # §8: 前向+反向
         │   │       ├─ batch → GPU (non_blocking)
         │   │       ├─ CP batch 准备 (if cp_size > 1)
@@ -151,9 +151,9 @@ main()                                                               # 01_hf_com
         │   │       ├─ calculate_loss(...)                            # §10: dispatcher
         │   │       └─ (loss * dp_size).backward()                    # 反向传播
         │   │
-        │   └─⑤.1.3 scale_grads + clip_grad_norm + optimizer.step() + lr_scheduler.step()
+        │   └─④.1.3 scale_grads + clip_grad_norm + optimizer.step() + lr_scheduler.step()
         │
-        └─⑤.2 self.callback_manager.on_step_end(StepState(...))      # §4.2: Callback（外围）
+        └─④.2 self.callback_manager.on_step_end(StepState(...))      # §4.2: Callback（外围）
             ├─ [CheckpointCallback]  is_ckpt_step → save_checkpoint
             ├─ [EvaluateCallback]    is_val_step  → _run_validation_epoch
             ├─ [LoggingCallback]     is_log_step  → 日志输出
@@ -163,29 +163,30 @@ main()                                                               # 01_hf_com
             └─ [SIGTERMHandler]      sigterm      → 优雅退出
 ```
 
-**与 01、02 文档的时序衔接**：
+**与 01、02 文档的时序衔接**（括号内为 01 §4.1 canonical 编号；step_scheduler / checkpointer
+在 01 树中尚未单列，以本文档 §2 主时序树编号为准）：
 
 ```
 main()
-├─① load_yaml_config()           # 01 §2
-├─② RecipeConfig(cfg)            # 01 §3
-└─④ recipe.setup(cfg)            # 01 §4
-    ├─④.4  model = ...           # 01 §6 (from_pretrained → _build_model)
-    ├─④.9  dataloader = ...      # 02_data_pipeline.md §3 (build_dataloader)
-    ├─④.8  optimizer = ...       # 本文档 §9
-    ├─④.11 step_scheduler = ...  # 本文档 §4
-    ├─④.5  loss_fn = ...         # 本文档 §10
-    └─④.12 lr_scheduler = ...    # 本文档 §9.6
-└─⑤ run_train_validation_loop()  # 本文档 §6
-    └─⑤.1 _run_train_optim_step  # 本文档 §7
-        └─⑤.1.2 _forward_backward_step  # 本文档 §8
+├─① parse_training_args()        # 01 §2: 返回强类型 TrainerConfig
+├─② recipe = FinetuneRecipe()
+├─③ recipe.setup(cfg)            # 01 §4
+│   ├─③.8  model = ...           #（01 canonical ③.4）01 §6: from_pretrained → _build_model
+│   ├─③.9  optimizer = ...       #（01 canonical ③.7）本文档 §9
+│   ├─③.10 dataloader = ...      #（01 canonical ③.8）02_data_pipeline.md §3: build_dataloader
+│   ├─③.12 step_scheduler = ...  #（01 canonical ③.10）本文档 §4
+│   ├─③.5  loss = ...            #（01 canonical ③.5）本文档 §10
+│   └─③.13 lr_scheduler = ...    #（01 canonical ③.11）本文档 §9.6
+└─④ run_train_validation_loop()  # 本文档 §6
+    └─④.1 _run_train_optim_step  # 本文档 §7
+        └─④.1.2 _forward_backward_step  # 本文档 §8
 ```
 
 ---
 
 ## 3. BaseRecipe —— 自动状态追踪
 
-> **调用位置**: 时序树 ⑤.3 — `save_checkpoint()` 遍历 `__state_tracked` 自动保存所有组件
+> **调用位置**: 时序树 ④.2（CheckpointCallback → `save_checkpoint()`）与 ④ 循环末尾 final save —— `save_checkpoint()` 遍历 `__state_tracked` 自动保存所有组件
 
 ### 3.1 核心机制
 
@@ -379,7 +380,7 @@ def _is_stateful(obj: Any) -> bool:
 
 ## 4. StepScheduler —— 训练节奏控制
 
-> **调用位置**: 时序树 ④.11 — `cfg.step_scheduler.build()` 创建；⑤ — `epochs`/`__iter__` 控制训练循环节奏
+> **调用位置**: 时序树 ③.12 — `cfg.step_scheduler.build()` 创建；④ — `epochs`/`__iter__` 控制训练循环节奏
 
 ```python
 # hyper_models/components/training/step_scheduler.py
@@ -588,7 +589,7 @@ class StepScheduler:
 ```python
 @dataclass
 class StepSchedulerConfig:
-    """StepScheduler typed config —— RecipeConfig.step_scheduler 的返回类型。
+    """StepScheduler typed config —— TrainerConfig.step_scheduler 的返回类型。
 
     与 StepScheduler 构造参数一一对应，.build() 负责注入运行时依赖
     （dataloader, dp_world_size, local_batch_size）。
@@ -739,6 +740,7 @@ class CheckpointCallback(TrainingCallback):
         if not state.is_ckpt_step or state.is_final_step:
             return
         self.recipe.save_checkpoint(
+            # cfg.checkpoint 规划中：待加入 TrainerConfig
             self.recipe.cfg.checkpoint.checkpoint_dir,
             state.epoch, state.step, state.loss,
             val_losses=self.recipe._last_val_losses,
@@ -866,7 +868,7 @@ class SIGTERMHandler(TrainingCallback):
 
 def build_callback_manager(
     recipe: BaseRecipe,
-    cfg: RecipeConfig,
+    cfg: TrainerConfig,
     pbar_total: int | None = None,
 ) -> CallbackManager:
     """构建默认的 CallbackManager，注册所有内置 callback。"""
@@ -875,13 +877,15 @@ def build_callback_manager(
     manager.register(EvaluateCallback(recipe))
     manager.register(LoggingCallback(recipe))
     manager.register(TqdmCallback(recipe, total=pbar_total))
-    if cfg.get("wandb.enabled", False):
+    # cfg.wandb 规划中：待加入 TrainerConfig（强类型配置对象，属性直读）
+    if cfg.wandb and cfg.wandb.enabled:
         manager.register(WandbCallback(
-            recipe, project=cfg.get("wandb.project", ""),
+            recipe, project=cfg.wandb.project,
         ))
     # gc_every_steps 是 StepSchedulerConfig 的字段，YAML 中位于
-    # step_scheduler 节下（§4.1/§13），不能读顶层键
-    if cfg.get("step_scheduler.gc_every_steps"):
+    # step_scheduler 节下（§4.1/§13），从 cfg.step_scheduler（规划中：
+    # 待加入 TrainerConfig 顶层）读取
+    if cfg.step_scheduler.gc_every_steps:
         manager.register(GCCallback(recipe))
     manager.register(SIGTERMHandler(recipe))
     return manager
@@ -929,60 +933,50 @@ def build_callback_manager(
 
 ## 5. Recipe.setup() 完整实现
 
-> **调用位置**: 时序树 ④ — `main()` 中 `recipe.setup(cfg)` —— 组件构建顺序
+> **调用位置**: 时序树 ③ — `main()` 中 `recipe.setup(cfg)` —— 组件构建顺序
 
-### 5.1 两条 `_target_` 使用路径
+### 5.1 组件构建路径
 
-AutoModel 区分两类组件，使用不同的 `_target_` 消费方式：
+所有组件均为强类型 Config 对象。构建方式取决于组件类型：
 
 | 路径 | 适用组件 | 调用方式 | 原因 |
 |------|---------|---------|------|
-| **直接 `.instantiate()`** | model, dataset, dataloader, tokenizer, collate, peft | `cfg.xxx.instantiate(**runtime_kwargs)` | 参数全部可在 YAML 中声明 |
-| **两层 `.build()`** | optimizer, lr_scheduler, step_scheduler, loss_fn, checkpoint | `RecipeConfig` 先提取 `_target_`→类型化Config，再 `.build(**runtime_deps)` | 依赖运行时对象（model、optimizer、device_mesh 等） |
+| **构建函数** | model | `HyperAutoModelForCausalLM.from_pretrained(cfg.model, ...)` | Model 需分布式分片 + sharding plan |
+| **typed `.build()`** | optimizer, lr_scheduler, step_scheduler, loss, checkpoint | `cfg.xxx.build(**runtime_deps)` | 强类型 Config 直接 `.build()`——无需 `_target_` 桥接 |
+| **独立构建函数** | dataloader, tokenizer | `build_dataloader(cfg.dataset, cfg.dataloader, ...)` | 多配置节联合构建（见 02_data_pipeline.md） |
 
-### 5.2 RecipeConfig 桥接：YAML → 类型化 Config
+> 注：`cfg.dataset` / `cfg.dataloader`（以及后文 `cfg.packed_sequence`）均为规划中字段
+> （待加入 TrainerConfig）；当前 TrainerConfig 一级字段仅 9 个（见 §5.2）。
 
-> **canonical 定义归 01 §3.3**（属性全集、`_callable_and_kwargs` /
-> `_section_kwargs` 辅助函数、`get()` 语义以 01 为准，01 侧同步补齐）。
-> 本节不重复完整实现，仅保留 03 消费侧视图：哪些属性是 typed（两层
-> `.build()`）、setup() 如何取用。与 01 §3.3 冲突的描述（含此前本节
-> `get()` 的 docstring 细节）一律删除。
+> **实现状态**：`parse_training_args()` 返回的 `TrainerConfig` 已是强类型 dataclass。
+> 不再需要 `RecipeConfig` 桥接层——所有 Config 对象（OptimizerConfig、LRSchedulerConfig 等）
+> 直接从 `TrainerConfig` 的属性获取。
 
-```python
-# recipes/_typed_config.py（实现见 01 §3.3；以下为 03 消费侧视图）
+### 5.2 配置访问：TrainerConfig 直接使用
 
-class RecipeConfig:  # canonical: 01 §3.3
-    """将 YAML ConfigNode 桥接到强类型配置 Dataclass。
-
-    03 消费的两类属性：
-    - typed（有 .build()，setup() 注入运行时依赖）:
-        optimizer   -> OptimizerConfig        （§9.2/§9.3）
-        lr_scheduler -> LRSchedulerConfig     （§9.6）
-        step_scheduler -> StepSchedulerConfig （§4.1；过滤
-            local_batch_size/dp_size/dataloader 等运行时键后构造）
-        loss_fn     -> LossConfig             （§10.0）
-        checkpoint  -> CheckpointingConfig    （补 model_repo_id/is_peft）
-    - untyped（直接 .instantiate() 或独立构建函数，__getattr__ 透传原始 ConfigNode）:
-        model, peft, dataset, tokenizer, collate
-      注：dataloader 不走 .instantiate()，而是通过 02_data_pipeline.md 的
-      build_dataloader() 独立函数构建（cfg.dataset + cfg.dataloader +
-      cfg.model + cfg.packed_sequence 等作为参数传入）
-    另有 get(dot_path, default) 供 setup() 读取嵌套标量（语义见 01 §3.3）。
-    """
-```
+> **实现状态**：`parse_training_args()` 返回强类型 `TrainerConfig` dataclass。
+> 不再需要 `RecipeConfig` 桥接层——所有 Config 对象直接从 `TrainerConfig` 的属性获取。
+> 
+> 旧设计中 `RecipeConfig` 包装 `ConfigNode` 并缓存 typed config 属性（optimizer、lr_scheduler 等），
+> 但实际实现中 `parse_training_args()` 直接解析 YAML 为 `TrainerConfig` dataclass。
+> TrainerConfig 目前含 model / optimizer / lr_scheduler / loss 等组件字段
+> （一级字段共 9 个：model、optimizer、lr_scheduler、loss、training、accelerator、
+> mixed_precision、gradient_checkpointing、debug），其余组件字段
+> （step_scheduler、checkpoint、dataset、dataloader 等）为规划扩展。
 
 setup() 中的典型取用方式（与 §5.3 对应）：
 
 ```python
-self.loss_fn       = self.cfg.loss_fn.build()                       # ⑦
-self.checkpointer  = self.cfg.checkpoint.build(dp_rank=..., ...)    # ⑩
-self.optimizer     = self.cfg.optimizer.build(                      # ⑫
+self.loss          = self.cfg.loss.build()                            # ⑦
+self.checkpointer  = self.cfg.checkpoint.build(dp_rank=..., ...)      # ⑩（cfg.checkpoint 规划中：待加入 TrainerConfig）
+self.optimizer     = self.cfg.optimizer.build(                        # ⑫
     self.model, device_mesh=..., optimizer_init=..., is_peft=...)
-self.step_scheduler = self.cfg.step_scheduler.build(                # ⑮
+self.step_scheduler = self.cfg.step_scheduler.build(                  # ⑮（cfg.step_scheduler 规划中：待加入 TrainerConfig）
     self.dataloader, dp_size, local_batch_size)
-self.lr_scheduler  = self.cfg.lr_scheduler.build(                   # ⑯
+self.lr_scheduler  = self.cfg.lr_scheduler.build(                     # ⑯
     self.optimizer, self.step_scheduler)
-# 嵌套标量：cfg.get("step_scheduler.local_batch_size", 1) 等（⑬⑭⑮）
+# step_scheduler 为 TrainerConfig 顶层组件字段（规划中）：
+# cfg.step_scheduler.local_batch_size 等（⑬⑭⑮）
 ```
 
 ### 5.3 Recipe.setup() 实现
@@ -993,23 +987,23 @@ self.lr_scheduler  = self.cfg.lr_scheduler.build(                   # ⑯
 class FinetuneRecipe(BaseRecipe):
     """LLM 微调 Recipe。"""
 
-    def setup(self, cfg: RecipeConfig) -> None:
+    def setup(self, cfg: TrainerConfig) -> None:
         """按依赖顺序构建训练组件。
 
         两类构建方式：
         - cfg.<typed>.build(**runtime_deps) → optimizer, lr_scheduler, step_scheduler, loss, checkpoint
-        - cfg.<untyped>.instantiate(**runtime_kwargs) → model, peft, dataset, dataloader, tokenizer
+        - 独立构建函数 或 from_pretrained → model, peft, dataloader, tokenizer
 
-        03 步骤编号 → 01 §4.1 canonical 编号映射（canonical 以 01 §4.1 时序树为准）：
-          03 ①=01 ④.1, 03 ②=01 ④.x（日志，canonical 未单列）, 03 ③=01 ④.2,
-          03 ④=01 ④.3, 03 ⑤=01 ④.x（MagiAttention）,
-          03 ⑥=01 ④.x（日志器，canonical 未单列；§2 树记为 ④.3a）,
-          03 ⑦=01 ④.5（Loss）, 03 ⑧=01 ④.x（PP）, 03 ⑨=01 ④.6（PEFT）,
-          03 ⑩=01 ④.7（Checkpointer）, 03 ⑪=01 ④.4（Model）,
-          03 ⑫=01 ④.8（Optimizer）, 03 ⑬=01 ④.9（DataLoader）,
-          03 ⑭=01 ④.10（Val DataLoader）, 03 ⑮=01 ④.11（StepScheduler）,
-          03 ⑯=01 ④.12（LR Scheduler）, 03 ⑰=01 ④.x（注册追踪状态）,
-          03 ⑱=01 ④.13（load_checkpoint）, 03 ⑲=01 ④.14（MFU）
+        03 步骤编号（①–⑲）→ §2 主时序树编号映射（③.x 与 01 §4.1 层级对齐）：
+          ①=③.1（initialize_distributed）, ②=日志/补丁（时序树未单列）,
+          ③=③.2（RNG）, ④=③.3（distributed_setup）,
+          ⑤=MagiAttention（时序树未单列）, ⑥=③.3a（callback_manager）,
+          ⑦=③.5（Loss）, ⑧=PP 配置（时序树未单列）, ⑨=③.6（PEFT）,
+          ⑩=③.7（Checkpointer）, ⑪=③.8（Model）, ⑫=③.9（Optimizer）,
+          ⑬=③.10（DataLoader）, ⑭=③.11（Val DataLoader）,
+          ⑮=③.12（StepScheduler）, ⑯=③.13（LR Scheduler）,
+          ⑰=注册追踪状态（时序树未单列）, ⑱=③.14（load_checkpoint）,
+          ⑲=③.15（MFU）
         """
         self.cfg = cfg
 
@@ -1020,8 +1014,8 @@ class FinetuneRecipe(BaseRecipe):
         setup_logging()
         apply_cache_compatibility_patches()
 
-        # ③ RNG
-        self.rng = StatefulRNG(seed=cfg.get("seed", 42), ranked=True)
+        # ③ RNG（cfg.training.seed 规划中：待加入 TrainerConfig.training）
+        self.rng = StatefulRNG(seed=cfg.training.seed, ranked=True)
 
         # ④ 分布式策略
         self.distributed_setup = create_distributed_setup_from_config(cfg)
@@ -1053,29 +1047,31 @@ class FinetuneRecipe(BaseRecipe):
         if self.dp_cp_mesh.ndim > 1:
             self.dp_cp_mesh = self.dp_cp_mesh._flatten("dp_cp")
 
-        # ⑤ MagiAttention（可选）
-        self.magi = setup_magi(cfg, self.mesh.device_mesh) if cfg.get("magi") else None
+        # ⑤ MagiAttention（可选；cfg.magi 规划中：待加入 TrainerConfig）
+        self.magi = setup_magi(cfg, self.mesh.device_mesh) if cfg.magi else None
 
         # ⑥ Callback 管理器 —— 注册所有内置 callback
         # 由 build_callback_manager 根据 cfg 自动创建 CheckpointCallback、
         # EvaluateCallback、LoggingCallback、TqdmCallback、WandbCallback 等
         self.callback_manager = build_callback_manager(
             self, cfg,
-            pbar_total=cfg.get("step_scheduler.max_steps", None),
+            pbar_total=cfg.step_scheduler.max_steps if cfg.step_scheduler.max_steps > 0 else None,
         )
 
         # ⑦ Loss —— typed: .build()
-        self.loss_fn = self.cfg.loss_fn.build()
+        self.loss = self.cfg.loss.build()
 
         # ⑧ PP 配置
         self.pp_enabled = self.mesh.pp_size > 1
         self._configure_pp(cfg)
 
-        # ⑨ PEFT —— untyped: .instantiate()
-        self.peft_config = self.cfg.peft.instantiate() if cfg.get("peft", None) else None
+        # ⑨ PEFT —— 由 build_model 内部处理，不在 setup 中单独构建
+        #     peft_config 来源（规划中）：由 YAML peft 段经独立解析后传入
+        #     setup/build_model（cfg.peft 规划中：待加入 TrainerConfig）
+        self.peft_config = peft_config  # 传入 build_model，用于判断 is_peft
 
         # ⑩ Checkpoint —— typed: .build(dp_rank=..., ...)
-        checkpoint_config = self.cfg.checkpoint  # CheckpointingConfig 实例
+        checkpoint_config = self.cfg.checkpoint  # CheckpointingConfig 实例（cfg.checkpoint 规划中：待加入 TrainerConfig）
         self.checkpointer = checkpoint_config.build(
             dp_rank=self._get_dp_rank(),
             tp_rank=self._get_tp_rank(),
@@ -1087,7 +1083,7 @@ class FinetuneRecipe(BaseRecipe):
             # 层暴露（当前代码未导出，属已知缺口，见 04 §5.1 Checkpointer.__init__ 的 moe_mesh 注）。
         )
 
-        # ⑪ Model —— untyped: .instantiate(**runtime_kwargs)
+        # ⑪ Model —— HyperAutoModelForCausalLM.from_pretrained()
         self.model, self.optimizer_init = build_model(
             cfg.model, self.peft_config,
             distributed_setup=self.distributed_setup,
@@ -1105,17 +1101,16 @@ class FinetuneRecipe(BaseRecipe):
 
         # ⑬ DataLoader —— 调用 02_data_pipeline.md::build_dataloader()
         #     global_batch_size 与 StepSchedulerConfig.global_batch_size（§4.1）
-        #     读同一 YAML 键 step_scheduler.global_batch_size（同源，不分叉）
+        #     读同一 TrainerConfig.step_scheduler 属性（规划中字段；同源，不分叉）
+        #     cfg.dataset / cfg.dataloader / cfg.packed_sequence 均为规划中字段
+        #     （待加入 TrainerConfig）
         self.dataloader, self.tokenizer = build_dataloader(
             cfg.dataset, cfg.dataloader, cfg.model, cfg.packed_sequence,
-            cfg_db=cfg.get("dynamic_batching", None),
-            cfg_transform=cfg.get("transform", None),
-            cfg_multisource=cfg.get("multisource", None),
-            seed=cfg.get("seed", 42),
-            local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
-            global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
-            max_steps=cfg.get("step_scheduler.max_steps", None),
-            val_check_interval=cfg.get("step_scheduler.val_every_steps", None),
+            seed=cfg.training.seed,
+            local_batch_size=cfg.step_scheduler.local_batch_size,
+            global_batch_size=cfg.step_scheduler.global_batch_size,
+            max_steps=cfg.step_scheduler.max_steps,
+            val_check_interval=cfg.step_scheduler.val_every_steps,
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
@@ -1128,9 +1123,9 @@ class FinetuneRecipe(BaseRecipe):
         #    不维护 sampler state；返回 dict[str, DataLoader]，03 仅调用）
         self.val_dataloaders = build_validation_dataloader(
             cfg.dataset, cfg.dataloader, cfg.model, cfg.packed_sequence,
-            cfg.get("seed", 42),
-            local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
-            global_batch_size=cfg.get("step_scheduler.global_batch_size", 1),
+            cfg.training.seed,
+            local_batch_size=cfg.step_scheduler.local_batch_size,
+            global_batch_size=cfg.step_scheduler.global_batch_size,
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
@@ -1142,7 +1137,7 @@ class FinetuneRecipe(BaseRecipe):
         self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
-            cfg.get("step_scheduler.local_batch_size", 1),
+            cfg.step_scheduler.local_batch_size,
         )
 
         # ⑯ LR Scheduler —— typed: .build(optimizer, step_scheduler)
@@ -1166,7 +1161,7 @@ class FinetuneRecipe(BaseRecipe):
         self.register_state("step_scheduler", "train_state")
 
         # ⑱ 断点续训（继承自 04 §8 的 Recipe.load_checkpoint，1 参 restore_from）
-        self.load_checkpoint(cfg.get("checkpoint.restore_from", None))
+        self.load_checkpoint(cfg.checkpoint.restore_from)  # cfg.checkpoint 规划中：待加入 TrainerConfig
 
         # ⑲ MFU 计算器 + 模型信息打印
         self.mfu_calc = AutoMFU.from_config(self.model_parts[0])
@@ -1177,7 +1172,7 @@ class FinetuneRecipe(BaseRecipe):
 
 ## 6. 训练主循环
 
-> **调用位置**: 时序树 ⑤ — `recipe.run_train_validation_loop()`
+> **调用位置**: 时序树 ④ — `recipe.run_train_validation_loop()`
 >
 > **混合方案**：核心训练（`_run_train_optim_step`）显式可见；外围关注点（checkpoint/验证/日志/GC）通过 `callback_manager.on_step_end` 驱动。
 > `StepState` 将 `StepScheduler` 计算的时序标记统一透传，callback 只负责执行，不做判断。
@@ -1244,7 +1239,7 @@ def run_train_validation_loop(self) -> None:
         # 最终步/SIGTERM 的保存统一由本处完成：Callback 的 on_step_end 在循环
         # 结束后不再被调用，且 CheckpointCallback 对 is_final_step 跳过（§4.2.4）
         self.save_checkpoint(
-            self.cfg.checkpoint.checkpoint_dir,
+            self.cfg.checkpoint.checkpoint_dir,  # cfg.checkpoint 规划中：待加入 TrainerConfig
             self.step_scheduler.epoch,
             self.step_scheduler.global_step,
             (train_metrics or {}).get("loss", 0.0),
@@ -1321,7 +1316,7 @@ def _run_validation_epoch(self, val_dl) -> dict[str, float]:
                 # 还原正确的 token-mean（第六轮 P1 修复：旧实现 local_ce/global_tok
                 # 每步相除再 DP-mean，少算 dp_size*cp_size 倍）。
                 local_ce_sum = calculate_loss(
-                    self.loss_fn,
+                    self.loss,
                     logits=logits,
                     labels=labels,
                     model=self.model_parts[0],
@@ -1355,7 +1350,7 @@ def _run_validation_epoch(self, val_dl) -> dict[str, float]:
 
 ## 7. 单步优化器步进
 
-> **调用位置**: 时序树 ⑤.1 — `_run_train_optim_step()`
+> **调用位置**: 时序树 ④.1 — `_run_train_optim_step()`
 
 ```python
 def _run_train_optim_step(
@@ -1415,8 +1410,7 @@ def _run_train_optim_step(
     # num_label_tokens 仅在 token_weighted 且非 PP 时传入：rank_average
     # 等 mean 尺度 loss（§10）不能再除 N，PP 场景由 PP runtime 平衡（§10.1）
     _token_weighted = (
-        getattr(self.cfg.loss_fn, "loss_aggregation", "token_weighted")
-        == "token_weighted"
+        self.cfg.loss.loss_aggregation == "token_weighted"
     )
     grad_norm = scale_grads_and_clip_grad_norm(
         self.model_parts, max_grad_norm,
@@ -1717,7 +1711,7 @@ def calculate_mtp_loss(
     mtp_per_depth_logits: list[torch.Tensor],
     mtp_per_depth_h: list[torch.Tensor],
     labels: torch.Tensor,
-    loss_fn: nn.Module,
+    loss: nn.Module,
 ) -> torch.Tensor:
     """Multi-Token-Prediction 辅助 loss（Qwen3.5 等）。
     逐 depth 计算 CE 并求和（与主 loss 同尺度，token-mean）。
@@ -1729,7 +1723,7 @@ def calculate_mtp_loss(
         # Shift: 预测下一个 token
         logits_shifted = logits[..., :-1, :].contiguous()
         labels_shifted = labels[..., 1:].contiguous()
-        depth_loss = loss_fn(
+        depth_loss = loss(
             logits_shifted.view(-1, logits_shifted.size(-1)),
             labels_shifted.view(-1),
         )  # reduction="sum"
@@ -1739,7 +1733,7 @@ def calculate_mtp_loss(
 
 def setup_magi(cfg, device_mesh):
     """构建 MagiAttention 上下文（可选）；无配置时返回 None。"""
-    magi_cfg = cfg.get("magi", None)
+    magi_cfg = cfg.magi  # cfg.magi 规划中：待加入 TrainerConfig
     if magi_cfg is None:
         return None
     try:
@@ -1830,7 +1824,7 @@ def _update_latest_symlink(checkpoint_dir: str, path: str) -> None:
 
 ## 8. 前向+反向传播
 
-> **调用位置**: 时序树 ⑤.1.2 — `_forward_backward_step()`
+> **调用位置**: 时序树 ④.1.2 — `_forward_backward_step()`
 
 ```python
 def _forward_backward_step(
@@ -1898,16 +1892,14 @@ def _forward_backward_step(
         # 见 §10.1 loss 归一化推导。
         logits = output.logits if hasattr(output, "logits") else output
         local_loss = calculate_loss(
-            self.loss_fn,
+            self.loss,
             logits=logits,
             labels=labels,
             model=model,
             num_label_tokens=num_label_tokens,
             # loss_aggregation 从 LossConfig 透传（§10.0），缺省 token_weighted；
             # rank_average 路径 loss 为 mean 尺度，§7 Phase 3 相应跳过除 N
-            loss_aggregation=getattr(
-                self.cfg.loss_fn, "loss_aggregation", "token_weighted"
-            ),
+            loss_aggregation=self.cfg.loss.loss_aggregation,
             hidden_states=getattr(output, "hidden_states", None),
             lm_weight=(
                 model.lm_head.weight
@@ -1922,7 +1914,7 @@ def _forward_backward_step(
                 output.mtp_per_depth_logits,
                 output.mtp_per_depth_h,
                 labels,
-                self.loss_fn,
+                self.loss,
             )
 
         loss_buffer.append(local_loss.detach())
@@ -1983,16 +1975,16 @@ def _forward_backward_step(
 
 ## 9. Optimizer 与 LR Scheduler
 
-> **调用位置**: 时序树 ④.8 / ④.12 — typed `.build()` 路径（`_target_` → typed config → `.build()`）
+> **调用位置**: 时序树 ③.9 / ③.13 — typed `.build()` 路径（`_target_` → typed config → `.build()`）
 
 ### 9.1 设计理念
 
-AutoModel 为 optimizer/scheduler/loss 等**依赖运行时对象的组件**使用两层模式：
+> **实现状态**：`parse_training_args()` 返回的 `TrainerConfig` 已是强类型 dataclass。
+> `TrainerConfig.optimizer` 直接是 `Optimizer.Config | None`，`TrainerConfig.lr_scheduler` 直接是 `LRScheduler.Config | None`。
+> 无需 `RecipeConfig` 桥接层——直接从 `TrainerConfig` 属性获取 Config 对象，调用 `.build()` 构建运行时组件。
 
-1. **Layer 1 — RecipeConfig.__init__**：`_callable_and_kwargs(node)` 提取 `_target_` factory + kwargs → **类型化 Config 实例**（类型校验完成）
-2. **Layer 2 — Recipe.setup()**：`cfg.xxx.build(**runtime_deps)` → **真正的组件**
-
-新增优化器类型只需修改 YAML 的 `_target_`，`build_optimizer_config()` 自动路由。
+1. **Layer 1 — `parse_training_args()`**：YAML 直接解析为 `TrainerConfig` dataclass，其中 `optimizer`、`lr_scheduler` 等字段已是强类型 Config 对象
+2. **Layer 2 — `Recipe.setup()`**：`cfg.xxx.build(**runtime_deps)` → **真正的组件**
 
 ```yaml
 # 使用 torch.optim.AdamW
@@ -2015,22 +2007,15 @@ lr_scheduler:
   min_lr_ratio: 0.0
 ```
 
-### 9.2 RecipeConfig.optimizer：`_target_` → OptimizerConfig
+### 9.2 TrainerConfig.optimizer —— 直接得到 Optimizer.Config
+
+> **实现状态**：`TrainerConfig.optimizer` 已是 `Optimizer.Config | None` 类型。
+> `parse_training_args()` 在解析 YAML 时直接构建 OptimizerConfig，不再需要 `RecipeConfig` 桥接。
 
 ```python
-# recipes/_typed_config.py
-
-@cached_property
-def optimizer(self) -> "OptimizerConfig | None":
-    from hyper_models.components.optim.optimizer import build_optimizer_config
-
-    node = self._raw.get("optimizer", None)
-    if node is None:
-        return None
-    factory, kwargs = _callable_and_kwargs(node)
-    # build_optimizer_config 将 factory(如 torch.optim.AdamW) + kwargs
-    # 归一化为 OptimizerConfig 子类实例
-    return build_optimizer_config(factory, kwargs)
+# TrainerConfig.optimizer 直接返回 Optimizer.Config（如 AdamW.Config）
+# parse_training_args() 内部根据 YAML optimizer._target_ 路由到对应 Config 子类
+optimizer_config: Optimizer.Config | None = cfg.optimizer
 ```
 
 ### 9.3 OptimizerConfig.build(model) → 真正的优化器
@@ -2076,7 +2061,7 @@ class AdamWConfig(OptimizerConfig):
         optimizers = []
         for part in parts:
             # 优先复用 optimizer_init.param_groups（已由 ShardingPlan 推导，
-            # 01 §2.14 修正后 group 内为实际 weight_decay 值——此处原样复用，
+            # group 内为实际 weight_decay 值——此处原样复用，
             # 不再覆盖 weight_decay）；否则现场用 _is_no_decay +
             # _build_param_groups 推导
             if optimizer_init is not None and getattr(optimizer_init, "param_groups", None):
@@ -2102,7 +2087,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
     def build(self, model, *, device_mesh=None, optimizer_init=None,
               is_peft=False):
         # 与 AdamWConfig 同口径：优先复用 optimizer_init.param_groups
-        # （01 §2.14 已在 group 内写入实际 weight_decay 值，此处不重复覆盖，
+        # （OptimizerInit 已在 group 内写入实际 weight_decay 值，此处不重复覆盖，
         # 也不再从 kwargs 取 weight_decay 传入 factory）
         if optimizer_init is not None and getattr(optimizer_init, "param_groups", None):
             param_groups = optimizer_init.param_groups
@@ -2191,12 +2176,8 @@ def _is_no_decay(name: str) -> bool:
 > ```
 
 ```python
-# RecipeConfig
-@cached_property
-def lr_scheduler(self) -> "LRSchedulerConfig | None":
-    node = self._raw.get("lr_scheduler", None)
-    return LRSchedulerConfig(**_section_kwargs(node)) if node else None
-
+# TrainerConfig.lr_scheduler 直接返回 LRSchedulerConfig（由 parse_training_args 构建）
+# 无需 RecipeConfig 桥接层
 
 @dataclass
 class LRSchedulerConfig:
@@ -2308,31 +2289,31 @@ class RatioBasedLRSchedulerConfig(LRSchedulerConfig):
 
 ## 10. Loss 计算
 
-> **调用位置**: 时序树 ⑤.1.2 — `calculate_loss()` dispatcher（dispatcher 模式）
+> **调用位置**: 时序树 ④.1.2 — `calculate_loss()` dispatcher（dispatcher 模式）
 
 ```python
 # hyper_models/components/loss/utils.py
 
-def calculate_loss(loss_fn: nn.Module, **kwargs) -> torch.Tensor:
-    """统一的 loss 计算 —— 根据 loss_fn 类型分发。
+def calculate_loss(loss: nn.Module, **kwargs) -> torch.Tensor:
+    """统一的 loss 计算 —— 根据 loss 模块类型分发。
 
     支持两种 loss 路径：
     - FusedLinearCrossEntropy：融合 lm_head + CE，直接接收 hidden_states
     - 标准 logit-based loss：CE / MaskedCrossEntropy 等
 
     注：num_label_tokens 由调用方传入 kwargs 但函数体内未直接使用——保留该参数
-    是为自定义 loss_fn 提供归一化所需的全局 token 数（例如某些 loss 内部需要
+    是为自定义 loss 提供归一化所需的全局 token 数（例如某些 loss 内部需要
     除以 N 做 token-mean，此时可通过 kwargs 取用）。
     """
     # ── 路径 A: FusedLinearCrossEntropy（融合 lm_head + CE） ──
     # 返回 raw ce_sum（不除 N）；token-mean 归一化由 §7.1 scale_grads 统一除以
     # num_label_tokens 完成，避免双除。FusedLinearCrossEntropy 内部以
     # reduction="sum" 计算，不传 num_label_tokens。
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
+    if isinstance(loss, FusedLinearCrossEntropy):
         hidden_states = kwargs.get("hidden_states")
         lm_weight = kwargs.get("lm_weight")
         if hidden_states is not None and lm_weight is not None:
-            return loss_fn(
+            return loss(
                 hidden_states=hidden_states,
                 labels=kwargs["labels"],
                 lm_weight=lm_weight,
@@ -2347,7 +2328,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs) -> torch.Tensor:
             )
         logits = logits[..., :-1, :].contiguous()
         labels = labels[..., 1:].contiguous()
-        return loss_fn(
+        return loss(
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
         )  # reduction="sum"
@@ -2365,14 +2346,14 @@ def calculate_loss(loss_fn: nn.Module, **kwargs) -> torch.Tensor:
         if kwargs.get("loss_aggregation", "token_weighted") == "token_weighted":
             # 返回 raw ce_sum（不除 N）；token-mean 归一化由 scale_grads 统一完成。
             # num_label_tokens 不在此处使用（避免与 scale_grads 双除）。
-            return loss_fn(
+            return loss(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
             )  # reduction="sum"
         else:
             # rank_average: 等长 batch 场景（不参与 token-mean 归一化路径，
             # scale_grads 应传 num_label_tokens=None 跳过除法）
-            return loss_fn(
+            return loss(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
             )  # reduction="mean"
@@ -2391,7 +2372,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs) -> torch.Tensor:
 ```python
 @dataclass
 class LossConfig:
-    """Loss typed config —— RecipeConfig.loss_fn 的返回类型。
+    """Loss typed config —— TrainerConfig.loss 的返回类型。
 
     支持两种消费路径：
     - _target_ 未设置：默认构建 MaskedCrossEntropy()
@@ -2411,7 +2392,7 @@ def build_loss_config(factory, **kwargs) -> LossConfig:
     """归一化入口：将 _target_ factory + kwargs 转为 LossConfig 实例。
 
     factory 无论是 nn.Module 子类还是普通 callable，最终都归一为同一个
-    LossConfig（loss 的实例化由 RecipeConfig/ConfigNode.instantiate 统一处理）。
+    LossConfig（loss 的实例化由 LossConfig.build() 统一处理）。
     此函数仅为调用点提供类型稳定的入口，不做分支特化。
     """
     return LossConfig(_target_=factory, kwargs=kwargs)
@@ -2486,7 +2467,7 @@ cast 回 bf16 注入参数 `.grad`；`scale_grads` 再在 bf16 `.grad` 上除以
 
 ## 11. DistributedSignalHandler
 
-> **调用位置**: 时序树 ④ — `StepScheduler.__init__` 中创建，控制 SIGTERM 响应
+> **调用位置**: 时序树 ③.12 — `StepScheduler.__init__` 中创建，控制 SIGTERM 响应
 
 ```python
 # hyper_models/components/training/signal_handler.py
@@ -2584,9 +2565,19 @@ BaseRecipe（__state_tracked + save/load_checkpoint + callback_manager）
 > `recipe: FinetuneRecipe` 是字符串形式的 Recipe 类名，由 `main()` 中的
 > Recipe 注册/导入机制解析为实际类。机制：维护 `RECIPE_REGISTRY` dict
 > （`{"FinetuneRecipe": FinetuneRecipe, ...}`），`main()` 通过
-> `cfg.get("recipe")` 取字符串 → `RECIPE_REGISTRY[name]` 查表；
+> `cfg.recipe`（规划中：待加入 TrainerConfig）取字符串 → `RECIPE_REGISTRY[name]` 查表；
 > 未命中时尝试 `importlib.import_module` 动态导入。若 YAML 未设置 recipe，
 > 默认使用 `FinetuneRecipe`。见 01_hf_compatibility_layer.md §4。
+
+> **实现状态（schema 现状）**：当前 `parse_training_args()` → `resolve_root()` 仅接受
+> 9 个一级键：`model`、`optimizer`、`lr_scheduler`、`loss`、`training`、`accelerator`、
+> `mixed_precision`、`gradient_checkpointing`、`debug`；其余一级键会以 unknown fields
+> 拒绝。下面示例中的 `recipe` / `seed` / `distributed` / `wandb` / `checkpoint` /
+> `step_scheduler` / `dataset` / `dataloader` / `packed_sequence` 均为**规划目标
+> schema**（示例整体保留作为规划目标，落地前不可直接运行）。其中 `seed` 规划归入
+> `training.seed`；`step_scheduler` / `checkpoint` 等规划为 TrainerConfig 顶层组件字段。
+> 另外 `model._target_: ...from_pretrained` 也与现状不符——现状 `model` 段解析为
+> `ModelConfig`（name / weights_path 等字段，见 01 §2.4），`_target_` DI 形式为规划目标。
 
 ```yaml
 recipe: FinetuneRecipe
@@ -2615,12 +2606,12 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
-# ── typed: loss_fn（_target_ → LossConfig → .build()） ──
-loss_fn:
+# ── typed: loss（LossConfig → .build()） ──
+loss:
   _target_: hyper_models.components.loss.masked_ce.MaskedCrossEntropy
 
 # WandB（可选，启用远程日志记录到 Weights & Biases）
-# 注意：此键由 build_callback_manager() 中的 cfg.get("wandb") 读取
+# 注意：此键由 build_callback_manager() 中的 cfg.wandb 读取
 wandb:
   enabled: true
   project: my-training-project
@@ -2641,7 +2632,7 @@ checkpoint:
   is_async: true
   restore_from: LATEST
 
-# ── untyped: dataset（.instantiate() 直接调用） ──
+# ── dataset（由 build_dataloader 消费） ──
 dataset:
   _target_: datasets.load_dataset
   path: HuggingFaceFW/fineweb
@@ -2652,7 +2643,7 @@ dataset:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3.5-0.8B
 
-# ── untyped: dataloader（.instantiate() 直接调用） ──
+# ── dataloader（由 build_dataloader 消费） ──
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   batch_size: 1

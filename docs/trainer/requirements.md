@@ -1,16 +1,16 @@
 # Hyper-Parallel 需求分解（端到端训练流程版）
 
-> 本文档与 `requirements.xlsx` / `requirements.csv` 同源生成（2026-07-22 更新：状态列按 hyper_models/components/distributed 实现实况标注）。
+> 本文档与 `requirements.xlsx` / `requirements.csv` 同源生成（2026-07-22 更新：状态列按 components/distributed 实现实况标注）。
 > 组织方式：**按大模型训练端到端流程（S0→S13）列出需求**，每个需求点按「模块 + 功能」划分，可直接交由程序员开发。
 > 交付模型：**DeepSeek V3/V4、Qwen3.5、GLM-Image**（基于 HuggingFace 接入）、**Pangu**（自研，走内置模型路径）。
-> 实现状态：**已实现 25 / 部分实现 8 / 未实现 86**（hyper_models/components/distributed 已落地，tests/components/distributed 282 用例全绿）。
+> 实现状态：**已实现 30 / 部分实现 9 / 未实现 80**（components/distributed 已落地，tests/components/distributed 282 用例全绿）。
 
 ## 端到端流程总览
 
 | 流程阶段 | 阶段内容 | 阶段目标 |
 |---------|---------|---------|
 | S0 前置依赖 | TP 梯度同步集成（D-12 二选一）+ 版本钉板 + 交付模型可获得性确认 | 解锁生产模式 TP 梯度同步；不阻塞正确性（可降级校验模式） |
-| S1 启动与配置 | CLI 读入 YAML → ConfigNode → RecipeConfig 类型化配置 | 用户写一个 YAML 即可启动训练 |
+| S1 启动与配置 | CLI 读入 YAML → parse_training_args → TrainerConfig 强类型配置【已实现】 | 用户写一个 YAML 即可启动训练 |
 | S2 分布式环境 | 并行度声明 → DeviceMesh（主 mesh 无 EP 轴，D-10）→ FSDP2 包裹 + TP 梯度元数据 | 多卡通信拓扑与数据并行就绪 |
 | S3 数据供给 | tokenizer → dataset → packing → sampler → collate → DataLoader | 数据按 DP/CP 契约切好喂给模型 |
 | S4 模型构建 | 模型注册 → from_pretrained → meta 空壳 → PEFT/freeze | 模型结构就绪（零显存） |
@@ -43,13 +43,13 @@
 
 | # | 模块 | 功能/需求点 | 需求描述 | 适用模型 | 工时 | 优先级 | 设计文档 | 状态 |
 |--:|------|------------|---------|---------|:----:|:------:|---------|:----:|
-| 6 | 配置解析 | YAML 解析与递归包装 | 读取训练 YAML，将内容递归包装为可点号访问的 ConfigNode | 全部 | 1 | P0 | 01 §2.3 | 未实现 |
-| 7 | 配置解析 | 组件引用即时解析 | _target_ 字符串 → 实际 Python 类/函数（点分隔导入 + file.py:attr 两种格式） | 全部 | 0.5 | P0 | 01 §2.4 | 未实现 |
-| 8 | 配置解析 | 值类型自动转换 | YAML 字符串 → Python 原生类型（ast.literal_eval + 特殊符号映射） | 全部 | 0.5 | P0 | 01 §2.5 | 未实现 |
-| 9 | 配置解析 | 嵌套组件递归实例化 | 按需将嵌套 _target_ 配置递归实例化为 Python 对象 | 全部 | 1 | P0 | 01 §2.9-2.10 | 未实现 |
-| 10 | 配置解析 | 辅助访问与序列化 | get / to_dict / to_yaml_dict / instantiate_path，含敏感字段脱敏 | 全部 | 0.5 | P1 | 01 §2.7/2.11 | 未实现 |
-| 11 | 配置解析 | 导入安全控制 | 白名单前缀限制 + 用户模块开关，防止 YAML 执行未授权导入 | 全部 | 0.5 | P1 | 01 §2.12 | 未实现 |
-| 12 | 配置解析 | 类型化配置桥接 | RecipeConfig（canonical 定义在 01 §3.3）：原始配置按语义分类（优化器/调度器/损失/检查点），每类提供类型安全访问 | 全部 | 1 | P0 | 01 §3.3 | 未实现 |
+| 6 | 配置解析 | YAML 强类型解析 | 读取训练 YAML，经 resolve_root() 解析为强类型 TrainerConfig（拒绝未知一级字段） | 全部 | 1 | P0 | 01 §2 | 已实现 |
+| 7 | 配置解析 | 组件引用即时解析 | _target_ 字符串 → 实际 Python 类/函数（import_target 点分隔导入，类 target 注解取自 __init__） | 全部 | 0.5 | P0 | 01 §2.4 | 已实现 |
+| 8 | 配置解析 | typed 值校验与 CLI override | coerce_value 基于类型注解做校验与转换；CLI --field=value 走 typed 路径替换 | 全部 | 0.5 | P0 | 01 §2.4/§2.5 | 已实现 |
+| 9 | 配置解析 | 组件即时构造 | resolve_component：签名校验 + typed 参数转换后立即调用 _target_ 构造 Config 对象 | 全部 | 1 | P0 | 01 §2.4 | 已实现 |
+| 10 | 配置解析 | 辅助访问与序列化 | Configurable.Config 的 replace / to_dict / traverse（instantiate_path 与敏感字段脱敏未实现） | 全部 | 0.5 | P1 | 01 §3 | 部分实现 |
+| 11 | 配置解析 | 导入安全控制 | 白名单前缀限制 + 用户模块开关，防止 YAML 执行未授权导入（原 01 §2.12 已移除，需求保留） | 全部 | 0.5 | P1 | — | 未实现 |
+| 12 | 配置解析 | 强类型配置协议 | TrainerConfig + Configurable.Config（build/replace/to_dict/traverse）：组件 typed 配置与构建协议 | 全部 | 1 | P0 | 01 §3 | 已实现 |
 
 ### S2 分布式环境（小计 5.5 人·日）
 
@@ -182,7 +182,7 @@
 | 92 | DeepSeek V3/V4 | MTP 模块适配 | Multi-Token Prediction 模块的分片与损失链路接入 | DeepSeek V3/V4 | 1 | P1 | — | 未实现 |
 | 93 | DeepSeek V3/V4 | 权重映射与 E2E 测试 | V3/V4 权重键名映射 + TP/EP 组合 100 步训练 + 输出与 HF 参考容差 1e-5 | DeepSeek V3/V4 | 1.5 | P0 | 04 §5.4 | 未实现 |
 | 94 | Qwen3.5 | Dense 架构实现 | GatedDeltaNet 层 + MTP 特殊逻辑 + 架构注册 | Qwen3.5 | 1.5 | P0 | 01 §12 | 未实现 |
-| 95 | Qwen3.5 | 架构覆盖规则 | 已实现：GatedDeltaNet SPECIAL 角色 + gated_delta_tp_shard SpecialHandler（按 SSM head 切分，含 a_log/dt_bias 模式映射），hyper_models/components/distributed 交付并测绿；模型级接入属上行条目 | Qwen3.5 | 1 | P0 | 05 §6.4.6 | 已实现 |
+| 95 | Qwen3.5 | 架构覆盖规则 | 已实现：GatedDeltaNet SPECIAL 角色 + gated_delta_tp_shard SpecialHandler（按 SSM head 切分，含 a_log/dt_bias 模式映射），components/distributed 交付并测绿；模型级接入属上行条目 | Qwen3.5 | 1 | P0 | 05 §6.4.6 | 已实现 |
 | 96 | Qwen3.5 | MoE 架构实现 | MoE expert 合并 + EP 分片已实现（D-09/D-10：qwen3moe router adapter + 堆叠/batched 直通 + 派生 expert mesh）；FSDP2 下 expert 梯度同步待 D-12 集成接线 | Qwen3.5 | 2 | P0 | 05 §6.4 | 部分实现 |
 | 97 | Qwen3.5 | E2E 测试 | Dense/MoE 两变体 TP=2/4 100 步 + 输出容差 1e-5 | Qwen3.5 | 1 | P0 | — | 未实现 |
 | 98 | GLM-Image | VLM 架构接入 | 基于 HuggingFace：vision encoder + LLM 的 ForImageTextToText 接入与架构注册 | GLM-Image | 1.5 | P0 | 01 §6.1 | 未实现 |
@@ -232,7 +232,7 @@
 | 流程阶段 | 需求点数 | 工时小计（人·日） | 已实现 | 部分实现 | 未实现 |
 |---------|:-------:|:----------------:|:-----:|:-------:|:-----:|
 | S0 前置依赖 | 5 | 5.0 | 1 | 1 | 3 |
-| S1 启动与配置 | 7 | 5.0 | 0 | 0 | 7 |
+| S1 启动与配置 | 7 | 5.0 | 5 | 1 | 1 |
 | S2 分布式环境 | 8 | 5.5 | 1 | 1 | 6 |
 | S3 数据供给 | 8 | 5.0 | 0 | 1 | 7 |
 | S4 模型构建 | 9 | 7.5 | 0 | 0 | 9 |
@@ -245,4 +245,4 @@
 | S11 模型交付 | 17 | 23.0 | 1 | 3 | 13 |
 | S12 CLI与监控 | 5 | 3.0 | 0 | 0 | 5 |
 | S13 质量保障 | 9 | 6.5 | 2 | 1 | 6 |
-| **合计** | **119** | **110.0** | **25** | **8** | **86** |
+| **合计** | **119** | **110.0** | **30** | **9** | **80** |

@@ -60,21 +60,21 @@ for spec in plan.module_specs:
 
 ```
 main() → recipe.setup(cfg)                                              # 01_hf_compatibility_layer.md §4
-└─④.3 model = cfg.model.instantiate(distributed_setup=...)
-    └─ HyperAutoModelForCausalLM.from_pretrained(...)                    # 01 §6
-        └─ _build_model(...)                                             # 01 §6.3
+└─③.4 model 构建（01 §4.1 时序树）：model 经
+    `HyperAutoModelForCausalLM.from_pretrained(cfg.model, distributed_setup=...)` 构建  # 01 §6
+    └─ _build_model(...)                                                 # 01 §6.3
             │
-            ├─④.3.2 instantiate_infrastructure(distributed_setup, device)
-            │   ├─ sharding_planner = ShardingPlanner()                  # 05 §5
+            ├─③.4.2 instantiate_infrastructure(distributed_setup, device)
+            │   ├─ sharding_planner = ShardingPlanner()                  # 05 §3.6
             │   └─ script_generator = ModelScriptGenerator()             # ★ 本文档：可选
             │
-            ├─④.3.5.2 _init_model() → meta device 空壳模型              # 01 §7
-            ├─④.3.5.5 load_weights() → 权重加载                        # 01 §10
+            ├─ _init_model() → meta device 空壳模型                      # 01 §7
+            ├─ load_base_model() → 权重加载                              # 04 §5
             │
-            ├─④.3.5.7 plan = sharding_planner.plan(model, mesh, ...)     # 05 §5: 编译期规划
-            └─④.3.5.8 apply_sharding_plan(model, plan, mesh, ...)        # 05 §6/§7/§8: 运行时应用
+            ├─ plan = sharding_planner.plan(model, mesh, ...)            # 05 §3.6: 编译期规划
+            └─ apply_sharding_plan(model, plan, mesh, ...)               # 05 §4: 运行时应用
                 │
-                └─④.3.5.9 [if cfg.scriptgen.enabled]                     # ★ 本文档：可选脚本生成
+                └─ [if cfg.scriptgen.enabled]（规划中：待加入 TrainerConfig）  # ★ 本文档：可选脚本生成
                     └─ script_generator.generate(
                            model, plan, mesh,
                            output_dir="generated/",
@@ -111,7 +111,7 @@ scriptgen 支持三种触发方式：
 
 | 方式 | 触发位置 | 适用场景 |
 |------|---------|---------|
-| **配置自动触发** | `cfg.scriptgen.enabled = true` | 常规训练任务，自动生成调试脚本 |
+| **配置自动触发** | `cfg.scriptgen.enabled = true`（规划中：待加入 TrainerConfig） | 常规训练任务，自动生成调试脚本 |
 | **API 手动调用** | 调用 `generate_model_script()` | 独立使用场景、临时调试 |
 | **CLI 命令** | `hyper-parallel generate-script --config train.yaml` | 基于已有配置文件生成 |
 
@@ -338,7 +338,8 @@ SHARDING_MAP = {
 class ScriptGenConfig:
     """脚本生成配置。
 
-    通常在 RecipeConfig 中以 `scriptgen:` 子配置提供。
+    规划为 TrainerConfig 顶层 typed Config 字段 `cfg.scriptgen`
+    （规划中：待加入 TrainerConfig），经 `.build()` 构建。
     """
     enabled: bool = False                    # 是否启用脚本生成
     output_dir: str = "generated"            # 输出目录（相对于项目根目录）
@@ -1133,7 +1134,7 @@ distributed:
 |-----------|--------|------|--------------|
 | **N_A: ScriptGenConfig** | | | **0.5** |
 | N_A-1 | `ScriptGenConfig` 数据类 | `ScriptGenConfig` dataclass，包含所有配置字段：`enabled`, `output_dir`, `approach`, `include_smoke_test`, `include_diff`, `ruff_format`, `inline_boundary_class`, `target_modules`, `exclude_modules`, `add_debug_logging`, `add_pdb_hooks` | 0.3 |
-| N_A-2 | RecipeConfig 集成 | 在 `RecipeConfig` 中添加 `scriptgen:` 子配置，支持 `cfg.scriptgen.instantiate()` 和 `cfg.scriptgen.build()` | 0.2 |
+| N_A-2 | TrainerConfig 集成（规划） | scriptgen 规划为 TrainerConfig 顶层 typed Config 字段 `cfg.scriptgen`，经 `cfg.scriptgen.build()` 构建 | 0.2 |
 | **N_B: BoundaryExtractor** | | | **0.8** |
 | N_B-1 | `extract_specs` | 从运行时模型 + ShardingPlan 中提取每个模块的 `BoundarySpec`（包含 `in_plan`, `out_plan`, `in_src`, `in_dst`, `out_src`, `out_dst`） | 0.3 |
 | N_B-2 | `extract_sharding_map` | 从 `ShardingPlan.module_specs` 中提取参数分片映射 `{param_path: placements}` | 0.15 |
@@ -1162,7 +1163,7 @@ distributed:
 | **N_G: 集成与 CLI** | | | **1.0** |
 | N_G-1 | `ModelScriptGenerator` 主类 | 统一入口，调度 Extractor + Codegen | 0.3 |
 | N_G-2 | `generate_model_script` 便捷函数 | 顶层 API，from `hyper_models/components/distributed/__init__.py` | 0.1 |
-| N_G-3 | 配置自动触发 | `_build_model()` 末尾调用 scriptgen（如果 `cfg.scriptgen.enabled`） | 0.2 |
+| N_G-3 | 配置自动触发 | `_build_model()` 末尾调用 scriptgen（如果 `cfg.scriptgen.enabled`；该字段规划中，待加入 TrainerConfig） | 0.2 |
 | N_G-4 | CLI 命令 | `hyper-parallel generate-script --config train.yaml` 或 `--model-path Qwen/Qwen3.5-4B --tp-size 4` | 0.4 |
 | **N_H: 测试** | | | **1.0** |
 | N_H-1 | Wrapper 方案正确性测试 | 生成脚本执行结果 vs 原始 wrapped 模型 forward 结果（atol 容差校验） | 0.4 |
@@ -1188,19 +1189,19 @@ distributed:
 ```
 main()
 │
-├─ ① ConfigNode / RecipeConfig (01 §2-3)
+├─ ① TrainerConfig (01 §2)        ← parse_training_args() 返回强类型配置
 ├─ ② 分布式基础设施 (06 §2)     ← DistributedSetup / MeshContext
 ├─ ③ HF 兼容层 (01 §5-6)        ← MODEL_ARCH_MAPPING / from_pretrained
-├─ ④ _build_model (01 §6.3)
-│   ├─ ④.3.1 分布式环境初始化 (06 §3)
-│   ├─ ④.3.2 instantiate_infrastructure (01 §8)
-│   ├─ ④.3.5.2 _init_model (01 §7)
-│   ├─ ④.3.5.4 权重加载 (01 §10)
-│   ├─ ④.3.5.7 ShardingPlanner.plan() (05 §5)     ← 编译期规划
-│   ├─ ④.3.5.8 apply_sharding_plan() (05 §6/§7/§8) ← 运行时应用
-│   └─ ④.3.5.9 scriptgen.generate() ★ 本文档       ← 脚本生成（可选）
+├─ ③.4.5 _build_model (01 §6.3)
+│   ├─ ③.1 分布式环境初始化 (06 §3)
+│   ├─ ③.4.2 instantiate_infrastructure (01 §8)
+│   ├─ _init_model (01 §7)
+│   ├─ 权重加载 (04 §5)
+│   ├─ ShardingPlanner.plan() (05 §3.6)     ← 编译期规划
+│   ├─ apply_sharding_plan() (05 §4)        ← 运行时应用
+│   └─ scriptgen.generate() ★ 本文档        ← 脚本生成（可选，cfg.scriptgen 规划中）
 │
-├─ ⑤ run_train_validation_loop() (03 §6)
+├─ ④ run_train_validation_loop() (03 §6)
 │   └─ ⑤.1.2 _forward_backward_step()
 │       └─ PrecompiledBoundary 执行 (05 §7)
 │

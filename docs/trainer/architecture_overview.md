@@ -35,10 +35,10 @@ hyper_parallel/
 
 hyper_models/
 └── components/
-│   ├── config/                             # ── 01 配置系统（📋）──
-│   │   ├── node.py                         #   ConfigNode / _resolve_target（canonical 位置）
-│   │   ├── loader.py                     #   load_yaml_config（仅 YAML 加载）
-│   │   └── _utils.py                     #   辅助 helpers
+│   ├── config/                             # ── 01 配置系统（✅ 强类型方案已落地，commit 78a79c0f）──
+│   │   ├── manager.py                    #   parse_training_args()（CLI 入口 + typed override）
+│   │   ├── resolver.py                   #   resolve_root / resolve_component / import_target / coerce_value
+│   │   └── configurable.py               #   Configurable.Config（build/replace/to_dict/traverse）
 │   │
 │   ├── datasets/                           # ── 02 数据管道（📋）──
 │   │   ├── llm/
@@ -88,7 +88,7 @@ hyper_models/
 │   │
 │   ├── checkpoint/                         # ── 04 持久化（📋）──
 │   │   ├── checkpointing.py              #   Checkpointer 核心类（moe_mesh 参数保留；MoE consolidated 导出待 expert mesh 导出）
-│   │   ├── config.py                     #   CheckpointingConfig（typed，RecipeConfig 直接构造）
+│   │   ├── config.py                     #   CheckpointingConfig（typed dataclass + build()；当前由调用方独立构造传入，规划中接入 TrainerConfig）
 │   │   ├── stateful_wrappers.py          #   ModelState / OptimizerState（接受 list[Optimizer]，与 03 canonical 对齐）
 │   │   ├── conversion_mapping.py         #   HF key ↔ 模型 FQN 映射 + WeightConverter
 │   │   ├── addons.py                     #   ConsolidatedHFAddon / PeftAddon
@@ -122,8 +122,8 @@ hyper_models/
 | 层 | 内容 | 关键契约 |
 |----|------|---------|
 | **L1 用户接口** | train.yaml + CLI 入口 | 一个 YAML 启动训练（01 §2/§3） |
-| **L2 Recipe 编排** | FinetuneRecipe.setup()（④.1–④.14）→ run_train_validation_loop（⑤） | 组件构建顺序以 01 §4.1 时序图为 canonical 编号来源 |
-| **L3 训练组件** | ConfigNode/RecipeConfig（01）· build_dataloader（02）· Checkpointer（04）· Optimizer/LR/Loss（03） | typed `.build()` / untyped `.instantiate()` 两路径；optimizer 为 `list[Optimizer]` |
+| **L2 Recipe 编排** | FinetuneRecipe.setup()（③.1–③.10）→ run_train_validation_loop（④） | 组件构建顺序以 01 §4.1 时序图为 canonical 编号来源 |
+| **L3 训练组件** | TrainerConfig/Configurable（01）· build_dataloader（02）· Checkpointer（04）· Optimizer/LR/Loss（03） | 强类型 dataclass 解析 + typed `.build()` 单一路径；optimizer 为 `list[Optimizer]` |
 | **L4 模型构建与并行策略** | HyperAutoModel.from_pretrained → ShardingPlanner → apply_sharding_plan → FSDP2Manager | plan(model, mesh, *, tp/cp/ep/sequence_parallel/loss_parallel) → apply → (model, tp_grad_info)；PP 最先执行 |
 | **L5 分布式核心** | MeshContext（init_device_mesh+rank_list）· DTensor · FSDP2（DTENSOR_UNIFIED）· PrecompiledBoundary · cp/ep_utils | 主 mesh 无 EP 轴；expert mesh (edp,ep) apply 期派生；CP=all-gather K/V |
 | **L6 运行时** | PyTorch / NCCL·HCCL | torch.distributed.fsdp（非 fsdp2 模块） |

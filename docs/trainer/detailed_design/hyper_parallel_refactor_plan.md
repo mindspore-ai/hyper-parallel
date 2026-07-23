@@ -76,7 +76,7 @@ apply_sharding_plan(model, plan, mesh.device_mesh)
 | `torch`、`torch.distributed`、`DTensor` | `recipes/` |
 | 自身数据结构（`ShardingPlan`、`ModuleShardingSpec`、`NamedPlacement`） | `_transformers/`（from_pretrained 等） |
 | `shared/`（平台抽象、工具函数） | `hyper_models/components/models/`（任何具体模型） |
-| `hyper_models/components/config/node.py`（ConfigNode，用于 `_target_` 场景；`loader.py` 仅含 `load_yaml_config`） | `hyper_models/components/datasets/`、`hyper_models/components/training/` |
+| `hyper_models/config/`（强类型配置解析：`manager.py` 的 `parse_training_args()`、`resolver.py` 的 `resolve_root()`/`resolve_component()`、`configurable.py` 的 `Configurable`；方案已变更，原计划的 ConfigNode 模块（components/config 下）未实现、不会实现） | `hyper_models/components/datasets/`、`hyper_models/components/training/` |
 
 ---
 
@@ -87,25 +87,26 @@ apply_sharding_plan(model, plan, mesh.device_mesh)
 核心思想：**YAML 配置文件本身就是一个轻量级 IoC 容器**。所有组件（模型、优化器、调度器、数据集、DataLoader、Tokenizer、Loss、Checkpoint）通过 `_target_: fully.qualified.ClassName` 声明类型，框架不硬编码任何 `if-else` 分支。
 
 ```
-YAML 文件 (train.yaml)
-    │  load_yaml_config()
+YAML 文件 (train.yaml) + CLI --field=value overrides
+    │  parse_training_args()  ← hyper_models/config/manager.py（已实现）
     ▼
-ConfigNode 树（所有 _target_ 和 *_fn 已即时解析为 Python callable）
-    │  RecipeConfig(cfg)  ← 类型化桥接
+resolve_root() / resolve_component()  ← hyper_models/config/resolver.py（已实现）
+    │  import_target 解析 `_target_` → 签名校验 → coerce_value typed 转换 → 立即构造
     ▼
-RecipeConfig（typed 属性已就绪，类型校验完成）
-    │  cfg.xxx.instantiate(**runtime_kwargs)  ← untyped 组件
-    │  cfg.xxx.build(**runtime_deps)          ← typed 组件
+TrainerConfig（强类型配置树，9 个一级字段；hyper_models/trainer/config.py）
+    │  cfg.xxx.build(**runtime_deps)   ← Configurable 协议（typed 组件）
     ▼
 Python 对象（模型、优化器、DataLoader...）
 ```
 
-**两类消费路径**：
+> **方案已变更注记**：本节原设计为 `load_yaml_config()` → ConfigNode 弱类型树 → RecipeConfig 桥接 → `.instantiate()`/`.build()` 双路径。该方案**未实现、不会实现**；实际已落地为上述强类型方案（commit 78a79c0f），见 [01 §2/§3](detailed_design/01_hf_compatibility_layer.md)。下表保留原两类消费路径设计作对照，其中 untyped `.instantiate()` 路径已随 ConfigNode 一并取消。
+
+**两类消费路径**（原设计，仅 untyped 路径已废弃）：
 
 | 路径 | 组件 | 调用方式 | 原理 |
 |------|------|---------|------|
-| **untyped `.instantiate()`** | model, dataset, dataloader, tokenizer, collate, peft | `cfg.xxx.instantiate(**runtime)` | ConfigNode 的 key-value 1:1 映射到构造函数参数 |
-| **typed `.build()`** | optimizer, lr_scheduler, step_scheduler, loss_fn, checkpoint | `cfg.xxx.build(**runtime_deps)` | 需要复杂的预处理（参数分组、model.parts 遍历），YAML 值无法直接作为构造函数参数 |
+| ~~**untyped `.instantiate()`**~~（已废弃） | model, dataset, dataloader, tokenizer, collate, peft | ~~`cfg.xxx.instantiate(**runtime)`~~ | 原 ConfigNode 方案；现由强类型 Config + `build()`/Recipe 编排取代 |
+| **typed `.build()`** | optimizer, lr_scheduler, loss 等 Configurable 组件 | `cfg.xxx.build(**runtime_deps)` | Configurable.Config 协议（01 §3），需要复杂预处理（参数分组、model.parts 遍历）的组件在 build 内完成 |
 
 详见 [01_hf_compatibility_layer.md §2-4](detailed_design/01_hf_compatibility_layer.md)。
 
@@ -113,8 +114,7 @@ Python 对象（模型、优化器、DataLoader...）
 
 所有模型通过 `HyperAutoModelForCausalLM.from_pretrained()` 加载，内部自动完成：
 
-1. **YAML 解析** → ConfigNode（`_target_` 即时解析）
-2. **类型化桥接** → RecipeConfig
+1. **YAML 强类型解析** → `parse_training_args()` → `resolve_root()`/`resolve_component()`（`_target_` 经 import_target 即时解析 + coerce_value typed 转换）→ `TrainerConfig`（01 §2）
 3. **分布式拓扑构建** → `DistributedSetup.build()` → MeshContext
 4. **基础设施创建** → `instantiate_infrastructure()` → ShardingPlanner + FSDP2Manager
 5. **模型架构分发** → `get_is_hf_model()` 查 MODEL_ARCH_MAPPING → 自定义模型 / HF 原生
@@ -130,7 +130,7 @@ Python 对象（模型、优化器、DataLoader...）
 
 ### 2.3 Recipe.setup() 组件编排
 
-`FinetuneRecipe.setup(cfg)` 是全部训练组件的唯一组装入口。18 步构建按依赖顺序执行，每个组件通过 `.instantiate()` 或 `.build()` 创建，新增组件类型只需修改 YAML 的 `_target_`，无需改动任何 Python 代码。
+`FinetuneRecipe.setup(cfg)` 是全部训练组件的唯一组装入口。构建步骤按依赖顺序执行，组件通过 Configurable 协议的 typed `.build()` 创建（原设计的 untyped `.instantiate()` 路径已随 ConfigNode 方案取消），新增组件类型只需修改 YAML 的 `_target_`，无需改动任何 Python 代码。
 
 详见 [03_training_loop.md §5](detailed_design/03_training_loop.md)。
 
@@ -292,8 +292,7 @@ Layer 1: nn.Module        ← 原始 HF 模型
 ```
 main() 调用时序                         对应模块
 ══════════════════════════════════════════════════════════
-① load_yaml_config()          ──→  M_A  ConfigNode / RecipeConfig
-② RecipeConfig(cfg)           ──→  (同上)
+①② parse_training_args()     ──→  M_A  强类型配置解析（TrainerConfig；原 ConfigNode/RecipeConfig 方案已变更，✅ 已落地）
 ③ recipe = FinetuneRecipe()   ──→  M_H  训练循环
 ④ recipe.setup(cfg)           ──→  (以下全部)
   ④.1 initialize_distributed  ──→  M_B  分布式基础设施
@@ -332,55 +331,69 @@ main() 调用时序                         对应模块
 
 ### 编号统一约定
 
-**canonical 编号来源**：[01_hf_compatibility_layer.md §4.1](01_hf_compatibility_layer.md) 的 `main()`/`setup()` 时序图是全部文档中步骤编号（①②③④⑤…）的**唯一 canonical 来源**。本计划 §5 调用树、05/06 文档内部时序图各自使用简化编号；凡跨文档引用步骤编号，一律以 01 的时序图为准，其余编号通过下表对照换算。
+**canonical 编号来源**：[01_hf_compatibility_layer.md §4.1](01_hf_compatibility_layer.md) 的 `main()`/`setup()` 时序图是全部文档中步骤编号（①②③④…）的**唯一 canonical 来源**。01 §4.1 现行 canonical 编号为：**① `parse_training_args()`（强类型配置解析）→ ② `recipe = FinetuneRecipe()` → ③ `recipe.setup(cfg)`（子步骤 ③.1–③.13）→ ④ run loop**。01 §4.1 时序树与 06 文档已切换为 ③.x 新编号（05 文档亦已对齐 ③.4/④）；仅本计划 §5 调用树保留其简化编号（①②=配置解析、③=recipe、④=setup、⑤=run），凡跨文档引用步骤编号，一律以 01 §4.1 为准，其余编号通过下表对照换算。
 
 本计划 §5 调用树编号 → 01 canonical 编号对照表：
 
 | 本计划 §5 | 01 canonical | 步骤 |
 |:---------|:------------|------|
-| ①②③ | ①②③ | load_yaml_config / RecipeConfig / FinetuneRecipe |
-| ④.1 | ④.1 | initialize_distributed |
-| ④.2 | ④.3 | create_distributed_setup_from_config（DistributedSetup.build） |
-| ④.3 | ④.4.1 | mesh = distributed_setup.mesh_context |
-| ④.4 | ④.4 | model = cfg.model.instantiate → from_pretrained |
-| ④.4.1 | ④.4.2 | infrastructure（ShardingPlanner / FSDP2Manager / AutoPipeline） |
-| ④.4.2 | ④.4.4 | get_is_hf_model（MODEL_ARCH_MAPPING 查表） |
-| ④.4.3 | ④.4.5.2 | _init_model（meta device 空壳构建） |
-| ④.4.4 | ④.4.5.3 | PEFT 注入（_apply_peft） |
-| ④.4.5 | ④.4.5.6 | 参数冻结（_apply_parameter_freezing） |
-| ④.4.6 | ④.4.5.7 | sharding_planner.plan() |
-| ④.4.7 | ④.4.5.8 | apply_sharding_plan() |
-| ④.4.8 | ④.4.5.11 | load_base_model（01 已统一定稿：④.4.5.11 = load_base_model，前置 model.to_empty 物化为同一步内动作） |
-| ④.4.9 | ④.4.5.10 | fsdp2_manager.parallelize() |
-| ④.5 | ④.5 | loss_fn |
-| ④.6 | ④.7 | checkpointer |
-| ④.7 | ④.8 | optimizer |
-| ④.8 | ④.9 | build_dataloader |
-| ④.9 | ④.11 | step_scheduler |
-| ④.10 | ④.12 | lr_scheduler |
-| ④.11 | ④.13 | load_checkpoint |
-| ⑤ | ⑤ | run_train_validation_loop |
+| ①② | ① | parse_training_args（YAML 强类型解析 → TrainerConfig，01 §2） |
+| ③ | ② | recipe = FinetuneRecipe() |
+| ④.1 | ③.1 | initialize_distributed |
+| ④.2 | ③.3 | create_distributed_setup_from_config（DistributedSetup.build） |
+| ④.3 | ③.4.1 | mesh = distributed_setup.mesh_context |
+| ④.4 | ③.4 | model = build_model → HyperAutoModelForCausalLM.from_pretrained |
+| ④.4.1 | ③.4.2 | instantiate_infrastructure（ShardingPlanner / FSDP2Manager / AutoPipeline） |
+| ④.4.2 | ③.4.4 | get_is_hf_model（MODEL_ARCH_MAPPING 查表） |
+| ④.4.3 | ③.4.5 内 | _init_model（meta device 空壳构建，01 §7） |
+| ④.4.4 | ③.4.5 内 | PEFT 注入（_apply_peft，分片之前） |
+| ④.4.5 | ③.4.5 内 | 参数冻结（_apply_parameter_freezing） |
+| ④.4.6 | ③.4.5 内 | sharding_planner.plan() |
+| ④.4.7 | ③.4.5 内 | apply_sharding_plan() |
+| ④.4.8 | ③.4.5 内 | load_base_model（前置 model.to_empty 物化，同属一步） |
+| ④.4.9 | ③.4.5 内 | fsdp2_manager.parallelize() |
+| ④.5 | ③.5 | loss_fn = cfg.loss.build() |
+| ④.6 | ③.6（规划中） | checkpointer（checkpoint 字段待加入 TrainerConfig） |
+| ④.7 | ③.7 | optimizer = cfg.optimizer.build(model, ...) |
+| ④.8 | ③.8 | build_dataloader |
+| ④.9 | ③.10（规划中） | step_scheduler（待加入 TrainerConfig，03 §4） |
+| ④.10 | ③.11 | lr_scheduler = cfg.lr_scheduler.build(optimizer, ...) |
+| ④.11 | ③.12 | load_checkpoint |
+| ⑤ | ④ | run_train_validation_loop |
 
-> 06 文档 §2 时序图使用其内部简化编号（如 ④.2=DistributedSetup.build、④.4=FSDP2Manager、
-> ④.5.1-④.5.3=plan/apply/parallelize），为简化视图，不与上表逐级对应；
-> canonical 编号一律以 01 §4.1 为准，跨文档引用时按上表口径换算。
+> 注：01 §4.1 时序树已改为 ③.x 编号（③.1–③.13，模型构建链路为 ③.4→③.4.1–③.4.5），
+> 06 文档时序图已同步改为 ③.x，05 文档已对齐 ③.4/④；上表"01 canonical"列即现行有效编号。
+> 01 §4.1 树中 ③.4.5 `_build_model()` 的内部子步骤（_init_model / PEFT / plan / apply / fully_shard / load）
+> 在 01 树内不单独编号，本计划④.4.3–④.4.9 均映射到其内部；另有 ③.2（StatefulRNG）、③.3a（build_callback_manager）、
+> ③.9（val_dataloaders）、③.13（mfu_calc）为本计划简化树未列出的 canonical 步骤。
 
 ---
 
-### M_A · ConfigNode / RecipeConfig 配置系统
+### M_A · 强类型配置解析（原 ConfigNode / RecipeConfig 方案已变更）
 
-> **调用位置**: ①② — `main()` 最前两步，所有后续模块的基础
-> **设计文档**: [01 §2-3](01_hf_compatibility_layer.md)
+> **状态**: ✅ **已落地（方案变更）** — 原 M_A.1–M_A.7 设计的 ConfigNode 弱类型 + RecipeConfig 桥接方案**未按此实现，也不会实现**。实际已落地为**强类型配置解析**（commit 78a79c0f，merge 进 trainer_dev）：
+>
+> - `parse_training_args()`（`hyper_models/config/manager.py`）：argparse 分离 config_file 与 `--field=value` CLI typed override
+> - `resolve_root()` / `resolve_component()`（`hyper_models/config/resolver.py`）：import_target 解析 `_target_` → 签名校验 → `coerce_value` typed 转换 → **立即构造**类型化 Config 对象
+> - `TrainerConfig`（`hyper_models/trainer/config.py`）：9 个一级字段（model, optimizer, lr_scheduler, loss, training, accelerator, mixed_precision, gradient_checkpointing, debug）
+> - 组件 Config 基于 `Configurable.Config`（`hyper_models/config/configurable.py`），支持 `build()` / `replace()` / `to_dict()` / `traverse()`
+>
+> **模块位置为 `hyper_models/config/`**（非原计划的 components/config 下 ConfigNode 模块）。ConfigNode / RecipeConfig / `.instantiate()` / `load_yaml_config` / `translate_value` 均未实现、不会实现。
+>
+> **调用位置**: ① — `main()` 第一步（`parse_training_args()`），所有后续模块的基础
+> **设计锚点**: [01 §2（强类型配置解析）/ §3（Configurable 协议）](01_hf_compatibility_layer.md)
+>
+> **⚠ 方案已变更**：下表为原 ConfigNode/RecipeConfig 方案的任务分解，**仅作历史记录保留，不会按此实现**；表中 01 §2.3–2.12/§3 锚点已随 01 文档重写而失效，实际交付物见上方实现摘要。
 
-| # | 子需求 | 说明 | 工时(日) | 设计文档 |
+| # | 子需求（历史记录，方案已变更） | 说明 | 工时(日) | 设计文档 |
 |---|--------|------|:------:|---------|
-| M_A.1 | `ConfigNode.__init__` + `_wrap()` | dict→ConfigNode 递归包装，`_target_` 和 `*_fn` 即时解析（eager resolution） | 1 | 01 §2.3 |
-| M_A.2 | `_resolve_target()` | `"torch.optim.AdamW"` → `<class AdamW>`，支持点分隔导入和 `file.py:attr` | 0.5 | 01 §2.4 |
-| M_A.3 | `translate_value()` | YAML 字符串 → Python 原生类型（`ast.literal_eval`） | 0.5 | 01 §2.5 |
-| M_A.4 | `ConfigNode.instantiate()` + `_instantiate_value()` | 递归实例化嵌套 `_target_` | 1 | 01 §2.9-2.10 |
-| M_A.5 | `ConfigNode` 辅助方法 | `get()` / `get_as_string()` / `to_dict()` / `to_yaml_dict()` / `instantiate_path()` | 0.5 | 01 §2.7/2.11 |
-| M_A.6 | 安全模型 | `ALLOWED_IMPORT_PREFIXES` + `_is_allowed_module()` + `ENABLE_USER_MODULES` | 0.5 | 01 §2.12 |
-| M_A.7 | `RecipeConfig` typed 属性 | `_callable_and_kwargs()` + optimizer/scheduler/loss/checkpoint cached_property + `__getattr__` untyped 透传 | 1 | 01 §3 |
+| M_A.1 | ~~`ConfigNode.__init__` + `_wrap()`~~ | dict→ConfigNode 递归包装，`_target_` 和 `*_fn` 即时解析（eager resolution） | 1 | 01 §2.3（已失效） |
+| M_A.2 | ~~`_resolve_target()`~~ | `"torch.optim.AdamW"` → `<class AdamW>`，支持点分隔导入和 `file.py:attr` | 0.5 | 01 §2.4（已实现为 import_target，锚点已更新） |
+| M_A.3 | ~~`translate_value()`~~ | YAML 字符串 → Python 原生类型（`ast.literal_eval`） | 0.5 | 01 §2.5（已实现为 coerce_value + CLI typed override） |
+| M_A.4 | ~~`ConfigNode.instantiate()` + `_instantiate_value()`~~ | 递归实例化嵌套 `_target_` | 1 | 01 §2.9-2.10（已取消，改为立即构造） |
+| M_A.5 | ~~`ConfigNode` 辅助方法~~ | `get()` / `get_as_string()` / `to_dict()` / `to_yaml_dict()` / `instantiate_path()` | 0.5 | 01 §2.7/2.11（已取消） |
+| M_A.6 | 安全模型 | `ALLOWED_IMPORT_PREFIXES` + `_is_allowed_module()` + `ENABLE_USER_MODULES` | 0.5 | 01 §2.12（锚点已移除；**未实现**，需求保留，见 requirements.md） |
+| M_A.7 | ~~`RecipeConfig` typed 属性~~ | `_callable_and_kwargs()` + optimizer/scheduler/loss/checkpoint cached_property + `__getattr__` untyped 透传 | 1 | 01 §3（已实现为 TrainerConfig + Configurable 协议） |
 | | **小计** | | **5** | |
 
 ---
@@ -626,7 +639,7 @@ main() 调用时序                         对应模块
 
 | 模块 | 调用位置 | AI 辅助人·日 | 状态（2026-07） |
 |------|---------|:----------:|----------------|
-| M_A  ConfigNode / RecipeConfig | ①② | 5 | 未开始 |
+| M_A  强类型配置解析（TrainerConfig） | ① | 5 | ✅ 已落地（方案变更：强类型解析，commit 78a79c0f，`hyper_models/config/`；安全模型 M_A.6 未实现） |
 | M_B  分布式基础设施 | ④.1/④.2/④.4.9 | 6 | 部分完成（B.7/B.7a 已交付 1.5，剩余 4.5） |
 | M_C  HF 兼容层 | ④.4 全部子步骤 | 8 | 未开始 |
 | M_D  双模式 DTensor | ④.4.6-7 + ⑤.1.2 | 15 | ✅ 已完成（300 用例全绿）。未闭环子项：`dtensor_utils.py` 待创建（06）、`tp_grad_info` 消费端接线待落地（05 §6.7.1 / D-12）。`init_ep_token_dispatchers` 已由 ep_utils 落地闭环（2026-07-20：`_hf_native_ep_compute` + `_ep_all_to_all` + `MOE_ROUTER_ADAPTERS`，经 planner EP 注入意图挂接，05 §6.4.7/§6.4.8 D-09/D-10） |
@@ -639,13 +652,13 @@ main() 调用时序                         对应模块
 | M_K  高级特性 | ④.4.1/④.4.9 | 6 | 未开始 |
 | M_L  CLI / 监控 | main 入口 + ⑤ | 3 | 未开始 |
 | M_M  测试 / 文档 | 全部完成后 | 6.0 | 未开始 |
-| **合计** | | **80.5** (~4 人·月) | 已交付 16.5，**剩余 64.0** |
+| **合计** | | **80.5** (~4 人·月) | 已交付 21.5，**剩余 59.0** |
 
 
 ## 6. 依赖关系与里程碑
 
 > **记号约定（消歧）**：本章有两套独立命名空间，切勿混淆——
-> - `M_A`–`M_M`（带字母下标）：**模块标识**，对应第五章各模块及其人·日估算（如 `M_A` ConfigNode=5、`M_D` 双模式 DTensor=15）。依赖图 §6.1、关键路径 §6.2 均用此记号。
+> - `M_A`–`M_M`（带字母下标）：**模块标识**，对应第五章各模块及其人·日估算（如 `M_A` 强类型配置解析=5、`M_D` 双模式 DTensor=15）。依赖图 §6.1、关键路径 §6.2 均用此记号。
 > - `M1`–`M4`（纯数字）：**集成里程碑**，对应 §6.3 里程碑表的累计人·日节点（M1 基础设施就绪=16、M2 DTensor 核心=35、M3 端到端=60.5、M4 全特性发布=78.5）。§6.2 说明文字中的 M3/M4 指里程碑。
 > 二者无一一对应；模块人·日之和约等于里程碑累计人·日。
 
@@ -658,7 +671,7 @@ main() 调用时序                         对应模块
 - **CP 数据管道 (M_I)**：详见 [02_data_pipeline.md §5.3/§7](02_data_pipeline.md) —— CP `seq_lens`/`seq_lens_padded` 对齐、CP+SP+THD 三层粒度说明
 
 ```
-M_A (ConfigNode, 5) — 根
+M_A (强类型配置解析, 5) — 根  ✅ 已落地（方案变更，commit 78a79c0f）
  ├─ M_B (分布式基础设施, 6) ← M_A   [B.7/B.7a 已交付 1.5，剩余 4.5]
  │   ├─ M_C (HF 兼容层, 8) ← M_A, M_B
  │   │   ├─ M_E (权重加载, 4) ← M_C
@@ -682,11 +695,11 @@ M_A → M_B → M_C → M_E → M_F → M_H → M_L → M_M
  5 + 6 + 8 + 4 + 5.5 + 5 + 3 + 6.0 = 42.5 人·日（AI 辅助，单线程 ~2 人·月）| 纯人工参考 120 人·日
 ```
 
-**剩余关键路径（2026-07 rebase）**：M_D（15）已完成，M_B.7/B.7a（1.5）已交付。剩余关键路径从 M_B 的 mesh/FSDP2 部分（06 §3-4，M_B.1-B.6/B.8）起算：
+**剩余关键路径（2026-07 rebase）**：M_A（5）已落地（方案变更：强类型配置解析，commit 78a79c0f），M_D（15）已完成，M_B.7/B.7a（1.5）已交付。剩余关键路径从 M_B 的 mesh/FSDP2 部分（06 §3-4，M_B.1-B.6/B.8）起算：
 
 ```
-M_A → M_B 剩余 → M_C → M_E → M_F → M_H → M_L → M_M
- 5 + 4.5 + 8 + 4 + 5.5 + 5 + 3 + 6.0 = 41.0 人·日（AI 辅助，单线程 ~2 人·月）
+M_B 剩余 → M_C → M_E → M_F → M_H → M_L → M_M
+ 4.5 + 8 + 4 + 5.5 + 5 + 3 + 6.0 = 36.0 人·日（AI 辅助，单线程 ~1.5 人·月）
 ```
 
 > 说明：M_K（高级特性 PP/AC/混合精度）与上述路径并行开发，其端到端测试在 M_K.7 内闭环，
@@ -696,10 +709,10 @@ M_A → M_B 剩余 → M_C → M_E → M_F → M_H → M_L → M_M
 
 | 里程碑 | 累计人·日 | 交付物 | 验收标准 | 状态（2026-07） |
 |--------|:------:|--------|---------|----------------|
-| **M1: 基础设施就绪** | 16 | ConfigNode + from_pretrained + MeshContext 可用 | Llama 3.2 1B 单 GPU from_pretrained 推理与 HF 一致 | 进行中（M_B.7/B.7a 已交付 1.5/16） |
+| **M1: 基础设施就绪** | 16 | 强类型配置解析（TrainerConfig）+ from_pretrained + MeshContext 可用 | Llama 3.2 1B 单 GPU from_pretrained 推理与 HF 一致 | 进行中（M_A 已落地 5/16，M_B.7/B.7a 已交付 1.5/16） |
 | **M2: DTensor 核心可用** | 35 | ShardingPlanner + ShardingApplier + PrecompiledBoundary 可用 | Llama TP=4 校验模式全部 pass + 生产模式 loss 正常下降 + 梯度等价性测试通过（同 batch production vs validation `param.grad` 容差内一致） | 核心件 M_D 已完成（15/35），待 M1 + M_E |
-| **M3: 端到端训练可用** | 62.5 | Qwen3.5-0.8B 完整训练 + 断点续训 + HF ckpt 导出 | loss 与现有 Hyper-Parallel 一致 | 已交付 16.5/62.5 |
-| **M4: 全特性发布** | 80.5 | 全特性 + 文档 + 测试 + 迁移指南 | 外部用户可独立完成第一个训练 | 已交付 16.5/80.5 |
+| **M3: 端到端训练可用** | 62.5 | Qwen3.5-0.8B 完整训练 + 断点续训 + HF ckpt 导出 | loss 与现有 Hyper-Parallel 一致 | 已交付 21.5/62.5 |
+| **M4: 全特性发布** | 80.5 | 全特性 + 文档 + 测试 + 迁移指南 | 外部用户可独立完成第一个训练 | 已交付 21.5/80.5 |
 
 各里程碑覆盖的模块：
 
@@ -782,7 +795,7 @@ TP 梯度 all-reduce 复用现有 HSDP layout-driven 梯度同步。详见 05 �
 
 | # | 文档 | 覆盖内容 |
 |---|------|---------|
-| 01 | [01_hf_compatibility_layer.md](detailed_design/01_hf_compatibility_layer.md) | ConfigNode → RecipeConfig → from_pretrained → _build_model → 各模块衔接 |
+| 01 | [01_hf_compatibility_layer.md](detailed_design/01_hf_compatibility_layer.md) | 强类型配置解析（parse_training_args → resolve_root → TrainerConfig）→ Configurable 协议 → from_pretrained → _build_model → 各模块衔接 |
 | 02 | [02_data_pipeline.md](detailed_design/02_data_pipeline.md) | build_dataloader：tokenizer → dataset → sampler → collate → dataloader |
 | 03 | [03_training_loop.md](detailed_design/03_training_loop.md) | Recipe.setup() → run_train_validation_loop → optimizer step → forward/backward |
 | 04 | [04_checkpoint.md](detailed_design/04_checkpoint.md) | Checkpointer：DCP save/load → 跨配置重分片 → 异步保存 → 故障恢复 |

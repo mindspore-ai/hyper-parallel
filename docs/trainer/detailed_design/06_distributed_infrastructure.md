@@ -85,20 +85,19 @@ setup = DistributedSetup.build(
 
 ```
 main()
-├─① cfg = load_yaml_config("train.yaml")                             # 01_hf_compatibility_layer.md §2
-├─② cfg = RecipeConfig(cfg)                                          # 01 §3
+├─① cfg = parse_training_args()    # Returns TrainerConfig              # 01_hf_compatibility_layer.md §2 (强类型配置解析)
 │
-├─③ recipe = FinetuneRecipe()
-├─④ recipe.setup(cfg)
+├─② recipe = FinetuneRecipe()
+├─③ recipe.setup(cfg)
 │   │
-│   ├─④.1 self.dist_env = initialize_distributed("nccl")             # torch.distributed.init_process_group
+│   ├─③.1 self.dist_env = initialize_distributed("nccl")             # torch.distributed.init_process_group
 │   │
-│   ├─④.2 self.distributed_setup = create_distributed_setup_from_config(cfg)  # ★ 拓扑构建
+│   ├─③.2 self.distributed_setup = create_distributed_setup_from_config(cfg)  # ★ 拓扑构建
 │   │   │
-│   │   ├─④.2.1 ParallelismSizes(tp_size=4, cp_size=2, pp_size=1, ...)
-│   │   │                                                             # §3.1: 从 YAML 提取并行度
+│   │   ├─③.2.1 ParallelismSizes(tp_size=4, cp_size=2, pp_size=1, ...)
+│   │   │                                                             # §3.1: 从 TrainerConfig 提取并行度（规划目标，见 §4.3.1 注）
 │   │   │
-│   │   ├─④.2.2 MeshContext.build(strategy_config, parallelism_sizes) # §3.2: 构建 DeviceMesh
+│   │   ├─③.2.2 MeshContext.build(strategy_config, parallelism_sizes) # §3.2: 构建 DeviceMesh
 │   │   │   ├─ _validate_parallelism_sizes(tp, cp, pp, ep, dp, world_size)
 │   │   │   │   # world_size == tp * cp * pp * dp；
 │   │   │   │   # ep 规则（D-10）：ep_size ≤ dense 区域且整除（§4.5.1）
@@ -106,16 +105,16 @@ main()
 │   │   │   │   # 主 mesh: ("dp_shard_cp", "cp", "tp")，不含 EP 轴（§3.2）
 │   │   │   └─ 验证 axis names ∈ MeshAxisName
 │   │   │
-│   │   └─④.2.3 DistributedSetup(mesh_context, strategy_config, ...) # §3.3: 统一配置容器
+│   │   └─③.2.3 DistributedSetup(mesh_context, strategy_config, ...) # §3.3: 统一配置容器
 │   │
-│   ├─④.3 self.mesh = self.distributed_setup.mesh_context            # §3.2: 所有组件通过 mesh 查询拓扑
+│   ├─③.3 self.mesh = self.distributed_setup.mesh_context            # §3.2: 所有组件通过 mesh 查询拓扑
 │   │   ├─ mesh.tp_size → 4     (@property 从 device_mesh["tp"] 读取)
 │   │   ├─ mesh.cp_size → 2
 │   │   ├─ mesh.dp_size → N     (从 device_mesh["dp_shard_cp"] 读取)
 │   │   ├─ mesh.tp_rank → 0..3
 │   │   └─ mesh.device_mesh → DeviceMesh("cuda", (2,4), ("cp","tp"))
 │   │
-│   └─④.4 instantiate_infrastructure(distributed_setup, device)    # 01 §8
+│   └─③.4 instantiate_infrastructure(distributed_setup, device)    # 01 §8
 │       ├─ ShardingPlanner()                                          # 05
 │       ├─ FSDP2Manager(strategy_config, mesh)  if strategy          # ★ §4 (收 MeshContext)
 │       │   └─ 详见 §4
@@ -126,14 +125,14 @@ main()
 ── FSDP2 应用（canonical meta 链路，在 _build_model 中）──
 
 _build_model()                                                        # 01 §6.3
-├─④.5.1 sharding_planner.plan() → ShardingPlan                       # 05 §4: TP/CP/SP 分片
-├─④.5.2 apply_sharding_plan(model, plan, mesh.device_mesh)           # 05 §4: DTensor 应用
+├─③.5.1 sharding_planner.plan() → ShardingPlan                       # 05 §4: TP/CP/SP 分片
+├─③.5.2 apply_sharding_plan(model, plan, mesh.device_mesh)           # 05 §4: DTensor 应用
 │   ├─ Phase C 含 _local_params_context 解包；内部调 build_tp_grad_info(plan, tp_mesh)
 │   │   → 返回 (model, tp_grad_info)（build_tp_grad_info 是内部调用，非独立步骤）
 │   │   详见 §5
 │   └─ MoE 且 ep_size>1 时：apply 期由 _build_expert_mesh 从 dense 区域现建
 │       派生 expert mesh (edp, ep)（§4.5.1，主 mesh 不含 EP 轴）
-├─④.5.3 fsdp2_manager.parallelize(model, tp_shard_plan=plan, tp_grad_info=tp_grad_info)
+├─③.5.3 fsdp2_manager.parallelize(model, tp_shard_plan=plan, tp_grad_info=tp_grad_info)
 │   │                                                                 # ★ §4.2: meta 上 fully_shard（唯一一次）
 │   └─ fsdp2_strategy_parallelize(model, dp_mesh=..., tp_shard_plan=..., tp_grad_info=...)  # §4.3
 │       ├─ fully_shard(block, mesh=dp_mesh, mp_policy=..., reshard_after_forward=True, tp_grad_info=...)
@@ -141,25 +140,29 @@ _build_model()                                                        # 01 §6.3
 │       ├─ 应用 activation checkpointing
 │       └─ 可选: async TP, per-layer compile, prefetch
 ├─ to_empty(device=...) → 物化 sharded 参数                           # FSDP2 canonical 顺序
-└─④.5.4 load_base_model(model, device, path, adapter=..., mesh=mesh.device_mesh)  # 04 §5: 权重写入 sharded 参数
+└─③.5.4 load_base_model(model, device, path, adapter=..., mesh=mesh.device_mesh)  # 04 §5: 权重写入 sharded 参数
 ```
 
-> **编号说明**：本节 ④.x 编号为本文件内部时序编号（已去重自洽）；
+> **注意**：与旧设计的差异——不再使用 `load_yaml_config()` + `RecipeConfig` 两步加载。
+> 实际实现直接通过 `parse_training_args()` 返回强类型 `TrainerConfig`（见 01 §2 强类型配置解析），
+> 无需 RecipeConfig 桥接层。`create_distributed_setup_from_config(cfg)` 接收 `TrainerConfig` 实例。
+
+> **编号说明**：本节 ③.x 编号为本文件内部时序编号（已去重自洽）；
 > 与 01 文档 ④.4.5.x 全局编号的统一映射由文档总计划任务另行处理。
 
 **与 01、05 文档的时序衔接**：
 
 ```
 main()
-├─④.1 initialize_distributed         # 本文档 §3
-├─④.2 DistributedSetup.build()       # 本文档 §3
-│   └─④.2.2 MeshContext.build()      # 本文档 §3.2
-├─④.4 FSDP2Manager()                 # 本文档 §4 (创建)
+├─③.1 initialize_distributed         # 本文档 §3
+├─③.2 DistributedSetup.build()       # 本文档 §3
+│   └─③.2.2 MeshContext.build()      # 本文档 §3.2
+├─③.4 FSDP2Manager()                 # 本文档 §4 (创建)
 └─_build_model()
-    ├─④.5.1 sharding_planner.plan()  # 05 §4
-    ├─④.5.2 apply_sharding_plan()    # 05 §4
+    ├─③.5.1 sharding_planner.plan()  # 05 §4
+    ├─③.5.2 apply_sharding_plan()    # 05 §4
     │   └─ _local_params_context     # 本文档 §5
-    └─④.5.3 fsdp2.parallelize()      # 本文档 §4.1 (应用)
+    └─③.5.3 fsdp2.parallelize()      # 本文档 §4.1 (应用)
 ```
 
 ---
@@ -662,7 +665,7 @@ class FSDP2Manager:
 
         签名含 `tp_shard_plan=None, tp_grad_info=None`（与 §5.2 调用
         `parallelize(model, tp_shard_plan=plan, tp_grad_info=tp_grad_info)` 一致；
-        §2 时序树 ④.5.3 同步）。**注意**：`tp_grad_info` 参数保留，但其
+        §2 时序树 ③.5.3 同步）。**注意**：`tp_grad_info` 参数保留，但其
         fully_shard 消费链路（写入 _orig_dtensor_placements 等）当前未实现，
         消费端接线待落地（05 §6.7/§7 正按代码机制改写）。
 
@@ -737,7 +740,7 @@ def fsdp2_strategy_parallelize(
         model: 已经过 DTensor 分片并解包为 plain local tensor 的模型
         dp_mesh: DP 维度的 DeviceMesh（如 device_mesh["dp_shard_cp"]）
         tp_shard_plan: TP 分片计划（可选，保留用于 AC/SP 决策）。默认 None；
-            §5.2 调用侧传 `tp_shard_plan=plan`（§2 ④.5.3 同步），
+            §5.2 调用侧传 `tp_shard_plan=plan`（§2 ③.5.3 同步），
             TP 分片本身已由 apply_sharding_plan 应用到参数。
         tp_grad_info: TP 梯度旁路 {fqn: (tp_placement, tp_mesh)}，
             由 build_tp_grad_info(plan, tp_mesh) 构造（05 §6.7.1）。
@@ -947,7 +950,7 @@ distributed:
 ```
 
 ```
-YAML → RecipeConfig
+YAML → TrainerConfig (strongly typed)
     → create_distributed_setup_from_config()
         → ParallelismSizes(tp_size=4, cp_size=2, pp_size=1)
         → MeshContext.build(FSDP2Config, sizes)
@@ -961,6 +964,15 @@ YAML → RecipeConfig
     → model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # 内部调 build_tp_grad_info
     → fsdp2_manager.parallelize(model, tp_shard_plan=plan, tp_grad_info=tp_grad_info)
 ```
+
+> **注意**：YAML 配置经过 `parse_training_args()` 解析后直接得到强类型 `TrainerConfig`，
+> 不再需要通过 RecipeConfig 中间层桥接。`create_distributed_setup_from_config(cfg)` 
+> 接收 `TrainerConfig` 实例，从中提取 `accelerator.tp_size`、`accelerator.dp_shard_size` 等字段。
+
+> **规划目标 schema 说明**：上述 `distributed:` 段为规划目标形态——当前实现中该顶层段
+> 会被 `resolve_root()` 拒绝；`AcceleratorConfig` 仅有 `dp_shard_size` / `tp_size` 字段，
+> `cp_size` / `pp_size` / `ep_size` / `FSDP2Config` 暂无配置来源。规划中 `distributed` 段
+> 将作为 TrainerConfig 扩展字段，cp/pp/ep 等并行度字段待加入。
 
 ---
 
@@ -1406,6 +1418,6 @@ model:
 | 文档 | 覆盖内容 | 本文档的关系 |
 |------|---------|------------|
 | 01 §8 | `instantiate_infrastructure()` — 创建 FSDP2Manager + ShardingPlanner | 本文档 §4 展开 FSDP2Manager 的实现细节 |
-| 01 §6.3 | `_build_model()` — ④.4.5.10 `fsdp2_manager.parallelize()` | 本文档 §4.2 展开 `parallelize()` 的实现 |
+| 01 §6.3 | `_build_model()` — ③.4.5 中 `fsdp2_manager.parallelize()` 步骤（01 §4.1 时序树） | 本文档 §4.2 展开 `parallelize()` 的实现 |
 | 05 §10 | FSDP2 与 DTensor 的关系概述 | 本文档 §4.2 给出层叠架构图 |
 | 05 §6.3 | 生产模式 forward 包装 | 本文档 §5 给出 `_local_params_context` 的完整实现 |

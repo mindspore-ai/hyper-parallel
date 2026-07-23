@@ -9,7 +9,7 @@
 ```
 docs/
 ├── detailed_design/                  # 【设计文档 canonical】01–07 + 重构总计划
-│   ├── 01_hf_compatibility_layer.md      # HF 兼容层：ConfigNode/RecipeConfig/registry/from_pretrained
+│   ├── 01_hf_compatibility_layer.md      # HF 兼容层：强类型配置解析（TrainerConfig/Configurable）/registry/from_pretrained
 │   ├── 02_data_pipeline.md               # 数据管道：build_dataloader/packing/sampler/collater
 │   ├── 03_training_loop.md               # 训练循环：BaseRecipe/FinetuneRecipe/StepScheduler
 │   ├── 04_checkpoint.md                  # Checkpoint：Checkpointer/DCP/HF 导出/断点续训

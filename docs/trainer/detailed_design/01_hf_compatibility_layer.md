@@ -88,1733 +88,786 @@ model = fsdp2.parallelize(model)
 
 ---
 
-## 2. ConfigNode 配置系统：从 YAML 到对象
+## 2. 强类型配置解析系统：从 YAML 到 TrainerConfig
+
+> **实现状态**：已实现于 commit `78a79c0f`。
+> 与原始设计的关键差异：去除了 `ConfigNode` 弱类型中间容器，统一为强类型 dataclass 解析。
+>
+> 原始设计中的 `ConfigNode` / `_wrap()` / `translate_value()` / `instantiate()` / `RecipeConfig` 等概念
+> **未在代码中实现**，实际采用了直接构造强类型 `TrainerConfig` 的方案。以下描述的是实际实现。
 
 ### 2.1 总体处理流程
 
-Hyper-Parallel 的配置系统按以下顺序处理一份 YAML 训练配置：
+配置系统的入口为 `parse_training_args()`，按以下顺序处理：
 
 ```
-YAML 文件 (train.yaml)
+命令行参数
     │
     ▼
-① load_yaml_config(path)
-    │  yaml.safe_load() → 原始 dict
-    │  ConfigNode(dict)  → 递归包装
+① parse_training_args()
+    │  argparse → 分离 config_file 和 --field=value overrides
     ▼
-② ConfigNode.__init__()
-    │  对每个 key-value 调用 _wrap(k, v):
-    │    • dict   → ConfigNode(v)           # 递归嵌套
-    │    • list   → [_wrap("", i) for i]    # 递归列表
-    │    • _target_ → _resolve_target(v)     # 解析为 callable ★
-    │    • *_fn   → _resolve_target(v)      # 解析为 callable ★
-    │    • 其他    → translate_value(v)      # 类型转换
+② yaml.safe_load(path)
+    │  → 原始 dict
     ▼
-③ _resolve_target(dotted_path)
-    │  "torch.optim.AdamW" → <class 'torch.optim.adamw.AdamW'>
-    │  "path/to/file.py:MyClass" → <class 'MyClass'>
+③ resolve_root(raw)
+    │  校验 TrainerConfig 一级字段（拒绝未知字段）
+    │  对每个一级分组调用 resolve_component()
+    │    ├─ 读取 _target_ → import_target() 解析为 callable
+    │    ├─ 校验 target 类型与 TrainerConfig 字段类型是否匹配
+    │    ├─ 校验 target 参数签名与返回类型
+    │    └─ 通过 coerce_value() 做 typed 参数转换
+    │  构造 TrainerConfig(**resolved)
     ▼
-④ ConfigNode 就绪（所有 _target_ 和 *_fn 已解析为 callable）
-    │
+④ _apply_typed_overrides(config, overrides)
+    │  解析 --field=value → yaml.safe_load(value)
+    │  通过 _replace_path() 做 typed dotted 路径替换
+    │  拒绝未知字段、未选择组件和错误类型
     ▼
-⑤ cfg.xxx.instantiate(**runtime_kwargs)
-    │  func = self._target_              # 已解析的 callable
-    │  config_kwargs = {}                # 收集其他属性
-    │  对每个 attr（排除 _target_ 等内部 key）:
-    │    • ConfigNode 且有 _target_ → v.instantiate()   # ★ 递归！
-    │    • ConfigNode 无 _target_      → v.to_dict()
-    │    • 普通值                       → 原值
-    │  func(*args, **config_kwargs, **runtime_kwargs)
-    ▼
-Python 对象（模型、优化器、Dataset...）
+TrainerConfig (完全类型化的 dataclass 实例)
 ```
 
-**关键设计决策**：`_target_` 和 `*_fn` 在 **YAML 加载时**（ConfigNode 构造）立即解析为 callable，而不是延迟到 `instantiate()` 时。这意味着：
-- `self._target_` 始终是一个已解析的 class/function/method，不是字符串
-- 日志和序列化时通过 `_original_strings` 保留原始字符串
+**核心设计决策**：
+
+| 原始设计（ConfigNode） | 实际实现（强类型） |
+|---|---|
+| ConfigNode 弱类型容器，接受任意 key | `TrainerConfig` 固定 9 个 dataclass 字段，拒绝未知字段 |
+| `_target_` 解析后存储在 ConfigNode 上，延迟到 `instantiate()` 才创建对象 | `_target_` 解析后**立即调用** target 构造类型化 Config 对象 |
+| 需要 `RecipeConfig` 做弱类型→强类型桥接 | 不需要桥接层——解析结果直接就是强类型 `TrainerConfig` |
+| `_wrap()` / `translate_value()` 做标量转换 | `coerce_value()` 基于 type annotation 做 typed 校验与转换 |
+| CLI override 通过 `replace()` 修改 ConfigNode | CLI override 通过 `_replace_path()` 对 dataclass 做 typed 路径替换 |
 
 ---
 
-### 2.2 Step 1: `load_yaml_config` — YAML 文件 → ConfigNode
+### 2.2 对外接口：`parse_training_args()`
 
 ```python
-# hyper_models/components/config/loader.py
+# hyper_models/config/manager.py
 
-def load_yaml_config(path: str | Path) -> ConfigNode:
-    """加载 YAML 文件并包装为 ConfigNode。
+def parse_training_args(argv: Sequence[str] | None = None) -> TrainerConfig:
+    """解析训练命令行参数，返回强类型 TrainerConfig。
 
-    这是整个配置系统的入口。流程极简：
-    ① yaml.safe_load() 读取文件 → 原生 Python dict
-    ② ConfigNode(dict) → 递归包装，立即解析所有 _target_ 和 *_fn
+    预期命令行形式：
+        train.yaml --accelerator.tp_size=4 --optimizer.lr=0.0003
+
+    Args:
+        argv: 显式参数 token 列表（用于测试）。默认从 sys.argv 读取。
+
+    Returns:
+        完全解析、类型校验通过的 TrainerConfig 实例。
     """
-    with open(path, "r") as f:
-        raw = yaml.safe_load(f)
-    return ConfigNode(raw)
+    parser = argparse.ArgumentParser(description="HyperParallel training config")
+    parser.add_argument("config_file", help="Path to the YAML training config")
+    args, overrides = parser.parse_known_args(argv)
+    return _load_training_config(args.config_file, overrides)
 ```
 
-**示例**：对于以下 YAML 文件：
-
-```yaml
-recipe: FinetuneRecipe
-model:
-  _target_: hyper_models.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3.5-0.8B
-optimizer:
-  _target_: torch.optim.AdamW
-  lr: 1.0e-4
-  weight_decay: 0.01
-```
-
-`yaml.safe_load()` 产出的原始 dict 为：
+使用示例：
 
 ```python
-{
-    "recipe": "FinetuneRecipe",
-    "model": {
-        "_target_": "hyper_models.HyperAutoModelForCausalLM.from_pretrained",
-        "pretrained_model_name_or_path": "Qwen/Qwen3.5-0.8B",
-    },
-    "optimizer": {
-        "_target_": "torch.optim.AdamW",
-        "lr": 1.0e-4,           # PyYAML safe_load 已按 YAML 1.1 规范解析为 float
-        "weight_decay": 0.01,   # 同上：数值标量 → float，不是字符串
-    },
-}
+from hyper_models.config.manager import parse_training_args
+
+config = parse_training_args()
+# config.model         → ModelConfig(name="qwen3_5", ...)
+# config.optimizer     → AdamW.Config(lr=0.0001, weight_decay=0.01, ...)
+# config.training      → TrainingConfig(max_steps=100, ...)
+# config.accelerator   → AcceleratorConfig(tp_size=2, dp_shard_size=4)
 ```
 
-注意：`yaml.safe_load()` 会自动解析数值/布尔标量（`1.0e-4` → float、`0.01` → float、
-`42` → int、`true` → bool）。只有无法匹配数值/布尔形式的标量（如 `"bfloat16"`、
-`"Qwen/Qwen3.5-0.8B"`）才保持为字符串，随后由 `translate_value()` 做进一步转换（§2.3）。
+CLI dotted override 统一使用 `--field=value`：
 
-**Canonical 模块位置（裁决）**：`load_yaml_config` 位于 `hyper_models/components/config/loader.py`；
-`ConfigNode` 与 `_resolve_target` 的 canonical 位置为 **`hyper_models/components/config/node.py`**
-（loader.py 内部 `from .node import ConfigNode`）。02 §10 等其它文档的模块位置表述
-以此为准对齐。
+```text
+--training.max_steps=200
+--accelerator.tp_size=4
+--optimizer.lr=0.0003
+```
 
-然后 `ConfigNode(raw)` 递归包装每个嵌套 dict。
+完整训练命令形式：
+
+```bash
+torchrun --nproc_per_node=8 scripts/train_lm.py \
+  configs/qwen3_5.yaml \
+  --training.max_steps=200 \
+  --accelerator.tp_size=4 \
+  --optimizer.lr=0.0003
+```
 
 ---
 
-### 2.3 Step 2: `ConfigNode.__init__` + `_wrap` — 立即解析（Eager Resolution）
+### 2.3 TrainerConfig：强类型配置树
 
 ```python
-# hyper_models/components/config/node.py（ConfigNode 与 _resolve_target 的 canonical 位置，见 §2.2 末注）
+# hyper_models/trainer/config.py
 
-from copy import deepcopy
+@dataclass
+class TrainerConfig:
+    """Resolved component tree; runtime objects are built by the task trainer."""
 
-
-class _OrigValueStr(str):
-    """String wrapper that preserves the original placeholder for safe display.
-
-    The resolved value is the actual string content; the original placeholder
-    (with $ENV_VAR references) is stored for to_yaml_dict() safe output.
-    """
-    def __new__(cls, resolved: str, original: str):
-        instance = super().__new__(cls, resolved)
-        instance._orig_value = original
-        return instance
-
-
-class ConfigNode:
-    """配置节点——属性式访问 + 延迟实例化。"""
-
-    _target_: Optional[Callable] = None    # ★ 注意：类型是 Callable，不是 str
-    raise_on_missing_attr: bool = True     # AutoModel 默认 True
-
-    def __init__(self, d: Optional[dict] = None, /, raise_on_missing_attr: bool = True, **kwargs):
-        # 保存原始 dict 的深拷贝（用于 checkpoint 恢复）
-        self.__dict__["_raw_config"] = deepcopy(d) if d else {}
-        # 保存 _target_ 和 *_fn 的原始字符串（用于日志/序列化）
-        self.__dict__["_original_strings"]: dict[str, str] = {}
-        # ★ 核心：对每个 key-value 调用 _wrap 进行分类处理
-        source = {**(d or {}), **kwargs}
-        for k, v in source.items():
-            self.__dict__[k] = self._wrap(k, v)
-        self.raise_on_missing_attr = raise_on_missing_attr
-
-    def _wrap(self, k: str, v: Any) -> Any:
-        """对每个 key-value 进行分类处理——这是 ConfigNode 的核心分发逻辑。"""
-        if isinstance(v, dict):
-            # ── dict → 递归包装为 ConfigNode ──
-            return ConfigNode(v)
-
-        elif isinstance(v, list):
-            # ── list → 递归包装每个元素 ──
-            return [self._wrap("", item) for item in v]
-
-        elif k.endswith("_fn"):
-            # ── *_fn → 解析为 callable（详见 §2.8） ──
-            # 例如: collate_fn: "my_package.my_collate"
-            if isinstance(v, str):
-                self._original_strings[k] = v   # 保存原始字符串
-            return _resolve_target(v)           # ★ 立即解析为 callable
-
-        elif k == "_target_":
-            # ── _target_ → 解析为 callable ★ ──
-            # 例如: _target_: "torch.optim.AdamW"
-            if isinstance(v, str):
-                self._original_strings[k] = v   # 保存原始字符串
-            # 注：若 v 本身已是 callable（非字符串），则不设置 _original_strings，
-            # get_as_string("_target_") 将回退到 str() 表示
-            return _resolve_target(v)           # ★ 立即解析为 callable
-            # 此时 self._target_ 已经是 <class 'torch.optim.adamw.AdamW'>，不是字符串！
-
-        else:
-            # ── 普通值 → 类型转换 ──
-            if isinstance(v, str) and "$" in v:
-                # 含环境变量引用 → 解析 + 翻译
-                resolved = resolve_yaml_env_vars(v)
-                translated = translate_value(resolved)
-                # 保留原始占位符用于安全打印（不泄露环境变量值）
-                if isinstance(translated, str) and resolved != v:
-                    return _OrigValueStr(translated, v)
-                return translated
-            return translate_value(v)
+    model: ModelConfig                                          # 必填，来自 hyper_parallel.trainer.config.ModelConfig
+    optimizer: Optional[Optimizer.Config] = None                # 可选组件
+    lr_scheduler: Optional[LRScheduler.Config] = None           # 可选组件
+    loss: Optional[Loss.Config] = None                          # 可选组件
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
+    mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
 ```
 
-**关键点**：
-- `self._target_` 来自 `_wrap("_target_", v)`，其中 `_resolve_target(v)` 将字符串 `"torch.optim.AdamW"` 解析为 `<class 'torch.optim.adamw.AdamW'>`
-- `self._original_strings["_target_"]` 保存原始字符串 `"torch.optim.AdamW"`，用于 `__repr__`、`to_yaml_dict()` 等安全输出
-- 所有解析发生在 `__init__` 阶段（eager），而非 `instantiate()` 阶段（lazy）
+9 个一级字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `model` | `ModelConfig` | **是** | 模型配置，复用 `hyper_parallel.trainer.config.ModelConfig` |
+| `optimizer` | `Optional[Optimizer.Config]` | 否 | 优化器类别 Config |
+| `lr_scheduler` | `Optional[LRScheduler.Config]` | 否 | 学习率调度器类别 Config |
+| `loss` | `Optional[Loss.Config]` | 否 | Loss 类别 Config |
+| `training` | `TrainingConfig` | 否（有默认值） | 训练循环参数 |
+| `accelerator` | `AcceleratorConfig` | 否 | 并行拓扑 |
+| `mixed_precision` | `MixedPrecisionConfig` | 否 | 混合精度 |
+| `gradient_checkpointing` | `GradientCheckpointingConfig` | 否 | activation checkpoint 模式 |
+| `debug` | `DebugConfig` | 否 | 调试参数 |
+
+各子 Config 定义：
+
+```python
+@dataclass
+class TrainingConfig:
+    max_steps: int = 100
+    global_batch_size: int = 8
+    init_device: Literal["meta", "cpu", "cuda", "npu"] = "meta"
+    loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"
+
+@dataclass
+class AcceleratorConfig:
+    dp_shard_size: int = 1
+    tp_size: int = 1
+
+@dataclass
+class MixedPrecisionConfig:
+    enabled: bool = False
+
+@dataclass
+class GradientCheckpointingConfig:
+    activation_checkpoint: Literal["off", "none", "full", "selective"] = "off"
+
+@dataclass
+class DebugConfig:
+    check_nan_inf: bool = False
+```
+
+`model` 字段仍使用 `hyper_parallel.trainer.config.ModelConfig`（复用现有 `ModelSpec` registry 和 `name` 查找机制），本阶段不修改模型侧构建逻辑。
 
 ---
 
-### 2.4 Step 3: `_resolve_target` — 字符串 → Callable
+### 2.4 YAML 解析：`resolve_root()` 与 `resolve_component()`
+
+#### 2.4.1 `resolve_root()` — 入口
 
 ```python
-def _resolve_target(dotted_path: str) -> Any:
-    """将字符串解析为 Python 对象（class / function / method）。
+# hyper_models/config/resolver.py
 
-    支持两种形式：
+def resolve_root(raw: object) -> TrainerConfig:
+    """校验 YAML 根字段并构造 TrainerConfig。"""
 
-    ① 文件路径:对象名 → "path/to/module.py:MyClass"
-       ── 从 .py 文件动态加载模块，获取指定属性
-       ── 用于用户自定义组件
+    # 1. 必须是 mapping
+    if not isinstance(raw, Mapping):
+        raise _fail("$", "YAML root must be a mapping")
 
-    ② 点分隔导入路径 → "torch.optim.AdamW"
-       ── 从最长前缀开始尝试 import，逐级 getattr
-       ── 用于标准库和第三方库组件
+    # 2. 拒绝未知一级字段
+    root_fields = {field.name: field for field in fields(TrainerConfig)}
+    unknown = sorted(set(raw) - set(root_fields))
+    if unknown:
+        raise _fail("$", f"unknown configuration fields: {unknown}")
+
+    # 3. 检查必填字段
+    missing = [
+        field.name for field in root_fields.values()
+        if field.name not in raw
+        and field.default is MISSING
+        and field.default_factory is MISSING
+    ]
+    if missing:
+        raise _fail("$", f"missing required configuration fields: {missing}")
+
+    # 4. 对每个一级字段调用 resolve_component()
+    root_hints = get_type_hints(TrainerConfig)
+    resolved = {
+        name: resolve_component(node, expected_type=root_hints[name], path=f"$.{name}")
+        for name, node in raw.items()
+    }
+
+    # 5. 构造 TrainerConfig
+    return TrainerConfig(**resolved)
+```
+
+#### 2.4.2 `import_target()` — 解析 `_target_`
+
+```python
+def import_target(target_path: str, *, path: str) -> object:
+    """将 dotted path 解析为 callable，支持嵌套类如 X.Config。
+
+    示例：
+        "hyper_models.components.optim.AdamW.Config" → <class 'AdamW.Config'>
+        "hyper_models.trainer.config.TrainingConfig" → <class 'TrainingConfig'>
     """
-    if not isinstance(dotted_path, str):
-        return dotted_path  # 已经是 callable → 透传
+    parts = target_path.split(".")
 
-    # ── 形式 ①: path/to/file.py:attr ──
-    if ":" in dotted_path and not dotted_path.startswith(("http:", "https:")):
-        file_path, attr_name = dotted_path.rsplit(":", 1)
-        assert file_path.endswith(".py"), \
-            f"_resolve_target file-path form requires .py suffix, got: {file_path}"
-        module = load_module_from_file(file_path)
-        return _safe_getattr(module, attr_name)
-
-    # ── 形式 ②: dotted.import.path ──
-    parts = dotted_path.split(".")
-    # 从最长前缀开始尝试导入
-    for i in range(len(parts), 0, -1):
-        module_path = ".".join(parts[:i])
-        attr_chain = parts[i:]
-
-        if not _is_allowed_module(module_path):
-            continue
-
+    # 从最长前缀开始尝试 import
+    for split_at in range(len(parts), 0, -1):
+        module_name = ".".join(parts[:split_at])
         try:
-            module = importlib.import_module(module_path)
-        except (ImportError, ModuleNotFoundError):
-            continue
+            target = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or module_name.startswith(f"{exc.name}."):
+                continue
+            # 模块本身存在、但其内部 import 的依赖缺失：
+            # 不透传 ModuleNotFoundError，统一包装为 ConfigResolutionError
+            raise _fail(
+                path,
+                f"target {target_path!r} failed while importing dependency {exc.name!r}",
+            ) from exc
+        except ImportError as exc:
+            raise _fail(path, f"target {target_path!r} could not be imported: {exc}") from exc
 
         # 逐级 getattr
-        obj = module
-        for attr in attr_chain:
-            obj = _safe_getattr(obj, attr)
-        return obj
+        for attribute in parts[split_at:]:
+            if not hasattr(target, attribute):
+                raise _fail(path, f"target {target_path!r} has no attribute {attribute!r}")
+            target = getattr(target, attribute)
 
-    raise ImportError(
-        f"Cannot resolve target '{dotted_path}': module not found "
-        f"or not in allowed prefixes {ALLOWED_IMPORT_PREFIXES}"
-    )
+        if not callable(target):
+            raise _fail(path, f"target {target_path!r} is not callable")
+        return target
+
+    raise _fail(path, f"target {target_path!r} could not be imported")
 ```
 
-**解析过程示例**：
-
-```
-① _resolve_target("torch.optim.AdamW")
-   parts = ["torch", "optim", "AdamW"]
-   i=3: module_path="torch.optim.AdamW" → ModuleNotFoundError（不是模块）
-   i=2: module_path="torch.optim" → importlib.import_module("torch.optim") ✓
-        attr_chain=["AdamW"]
-        getattr(torch.optim, "AdamW") → <class 'torch.optim.adamw.AdamW'> ✓
-
-② _resolve_target("hyper_models.HyperAutoModelForCausalLM.from_pretrained")
-   parts = ["hyper_parallel", "HyperAutoModelForCausalLM", "from_pretrained"]
-   i=1: module_path="hyper_parallel" → importlib ✓
-        attr_chain=["HyperAutoModelForCausalLM", "from_pretrained"]
-        getattr(hyper_parallel, "HyperAutoModelForCausalLM") → <class ...>
-        getattr(class, "from_pretrained") → <bound method ...> ✓
-
-③ _resolve_target("my_custom/callback.py:on_step_end")
-   检测到 ":" 且非 http → 形式①
-   load_module_from_file("my_custom/callback.py") → module
-   getattr(module, "on_step_end") → <function on_step_end> ✓
-```
-
----
-
-### 2.5 `translate_value` — 标量值类型转换
+#### 2.4.3 `resolve_component()` — 类型校验 + 参数校验 + 构造
 
 ```python
-def translate_value(v: Any) -> Any:
-    """将 YAML 字符串智能转换为 Python 原生类型。
+def resolve_component(node: object, *, expected_type: object, path: str) -> object:
+    """解析一个 YAML 一级分组。
 
-    YAML 的值默认都是字符串（如 "1.0e-4", "true", "None"），
-    此函数用 ast.literal_eval 自动转换。
+    完整流程：
+    1. 必须是 mapping + 必须有 _target_
+    2. import_target() 解析 _target_ 为 callable
+    3. 校验 target 返回类型是否与 expected_type 兼容（通过 _annotation_assignable）
+    4. 校验 target 参数签名（拒绝 *args / **kwargs）
+    5. 对每个 YAML 参数做 typed 转换（coerce_value）
+    6. 调用 target(**normalized_args) 构造 Config 对象
+    7. 校验返回值的实际类型
     """
-    if not isinstance(v, str):
-        return v
-
-    # Fast-path: 特殊符号
-    special_symbols = {"none": None, "None": None, "true": True, "True": True,
-                       "false": False, "False": False}
-    # 注：YAML 通常输出首字母大写的 "True"/"False"/"None"，小写 key 为防御性保留
-    if v in special_symbols:
-        return special_symbols[v]
-
-    # 防止评估超长字符串
-    if len(v) > 1000:
-        return v
-
-    try:
-        return ast.literal_eval(v)  # "1.0e-4" → 0.0001, "[1,2]" → [1,2]
-    except Exception:
-        return v  # 解析失败 → 保留原字符串
 ```
+
+关键校验点：
+
+- **target 类型匹配**：`_target_` 指向的 callable 返回类型必须与 `TrainerConfig` 对应字段的类型兼容（如 `optimizer` 字段期望 `Optimizer.Config`，则 target 返回类型必须是 `Optimizer.Config` 的子类）
+- **参数签名校验**：拒绝 `*args` 和 `**kwargs` 可变参数，所有参数必须有显式名称
+- **类 target 的注解取自 `__init__`**：`_target_` 为类时，参数类型注解通过 `get_type_hints(target.__init__)` 解析——类级注解只覆盖 dataclass 字段，普通类的构造参数注解在 `__init__` 上；从 `__init__` 解析同时保证 `from __future__ import annotations` 模块中未求值的字符串注解也能正确解析
+- **参数类型转换**：YAML 中的每个参数值都通过 `coerce_value()` 按 target 参数类型做校验和转换
+- **factory 返回类型**：非 class 的 target（如工厂函数）必须声明返回类型注解
+- **构造即校验**：target 在解析阶段就被调用，返回的 Config 对象立即通过 `coerce_value()` 做类型校验
+
+#### 2.4.4 `coerce_value()` — typed 值校验与转换
+
+```python
+def coerce_value(value: object, annotation: object, *, path: str) -> object:
+    """按类型注解校验和转换一个值。
+
+    支持的类型：
+    - bool, int, float, str — 严格类型检查（bool 不与 int 混淆）
+    - list[T] — 递归校验每个元素
+    - tuple[...] — 支持固定长度、可变长度（...）
+    - Optional[T] / Union[A, B] — 依次尝试匹配
+    - Literal["a", "b"] — 精确值校验
+    - 自定义类型（dataclass 等） — isinstance 检查
+    """
+```
+
+关键特性：
+
+- **bool 严格检查**：`bool` 不与 `int` 混合（`isinstance(True, int)` 为 True，但 `coerce_value` 对 `bool` 注解只接受 `bool` 值）
+- **Literal 闭集校验**：`init_device` 只能是 `"meta"`/`"cpu"`/`"cuda"`/`"npu"` 之一，`activation_checkpoint` 只能是 `"off"`/`"none"`/`"full"`/`"selective"` 之一，非法值在启动阶段即报错
+- **Literal 布尔词映射（PyYAML 1.1 兼容）**：PyYAML 1.1 将未加引号的 `on`/`off`/`yes`/`no`/`true`/`false` 解析为 `bool`。`_coerce_literal` 收到 `bool` 值时统一映射回 choices 中对应的词（`True` 按 `on`→`yes`→`true` 顺序、`False` 按 `off`→`no`→`false` 顺序，取 choices 中首个命中）；建议用户在 YAML 中为这类值加引号以避免歧义
+- **完整字段路径**：所有错误信息都包含完整路径（如 `$.optimizer.lr`、`CLI.training.max_steps`）
 
 ---
 
-### 2.6 完整示例：一份 YAML 的逐函数解析
+### 2.5 CLI typed override
 
-以下追踪一个简化训练配置从 YAML 文件到 ConfigNode 的**完整过程**，覆盖每个函数的作用。
+```python
+# hyper_models/config/manager.py
+
+def _apply_typed_overrides(config: TrainerConfig, overrides: Sequence[str]) -> TrainerConfig:
+    """对已解析的 TrainerConfig 应用 typed CLI override。
+
+    规则：
+    1. 只能 override 最终 Config Tree 中已存在的字段
+    2. value 通过 yaml.safe_load() 解析
+    3. 通过 _replace_path() 做 dotted 路径替换，每层都校验类型
+    4. 未选择组件（值为 None）的路径报错
+    5. 未知字段报错（含模糊匹配建议）
+    """
+```
+
+`_replace_path()` 的关键行为：
+
+- 对每层 dataclass 校验字段名是否存在（未知字段用 `difflib.get_close_matches` 给出建议）
+- 叶子节点通过 `coerce_value()` 按类型注解校验新值
+- 中间节点为 `None`（组件未选择）时报错
+
+**标量回退转换**：CLI override 的 value 先经 `yaml.safe_load()` 解析。PyYAML 1.1 不把无小数点的科学计数法（如 `1e-4`）解析为 float——`yaml.safe_load("1e-4")` 得到字符串 `"1e-4"`。因此当目标注解为 `int`/`float`（含 `Optional` 包装）且解析结果为 `str` 时，会先做 `int()`/`float()` 回退转换，`--optimizer.lr=1e-4` 为合法写法；转换失败再按类型错误报错。
+
+---
+
+### 2.6 Configurable 基类与嵌套 Config
+
+所有训练组件（Optimizer、LRScheduler、Loss）继承自 `Configurable` 基类，使用嵌套 `Config` dataclass 定义配置参数。
+
+```python
+# hyper_models/config/configurable.py
+
+class Configurable:
+    """组件基类——通过嵌套 Config dataclass 声明配置参数。
+
+    Config.build() 构造外层对象；__init_subclass__ 自动绑定 Config._owner。
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config:
+        """配置基类：提供 replace() / to_dict() / traverse() / build()。"""
+        _owner: ClassVar[type["Configurable"] | None] = None
+
+        def replace(self, **kwargs) -> "Configurable.Config": ...
+        def to_dict(self) -> dict: ...
+        def traverse(self, config_cls, *, _prefix="") -> Iterator[...]: ...
+        def build(self, **kwargs) -> "Configurable": ...
+```
+
+以 `AdamW` 为例：
+
+```python
+# hyper_models/components/optim/optimizer.py
+
+class Optimizer(Configurable):
+    """优化器组件类别基类。"""
+
+    @dataclass
+    class Config(Configurable.Config):
+        """优化器槽位接受的配置基类。"""
+
+class AdamW(Optimizer):
+    """AdamW 优化器。"""
+
+    @dataclass
+    class Config(Optimizer.Config):
+        lr: float = 1e-4
+        weight_decay: float = 0.01
+        betas: tuple[float, float] = (0.9, 0.999)
+        eps: float = 1e-8
+        foreach: Optional[bool] = None
+
+    def __init__(self, config: "AdamW.Config") -> None:
+        self.config = config
+```
+
+`CosineWithWarmup` 和 `CausalLMLoss` 同理，分别继承 `LRScheduler.Config` 和 `Loss.Config`。
+
+**组件扩展**：新增实现只需继承对应类别基类并定义自己的 `Config` 子类，不需要修改 `TrainerConfig`。`TrainerConfig` 中 `optimizer` 字段类型为 `Optional[Optimizer.Config]`，任何 `Optimizer.Config` 的子类都能通过类型检查。
+
+---
+
+### 2.7 YAML 示例与完整解析过程
 
 #### 输入 YAML
 
 ```yaml
-recipe: FinetuneRecipe
-seed: 42
 model:
-  _target_: hyper_models.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3.5-0.8B
-  torch_dtype: bfloat16
-optimizer:
-  _target_: torch.optim.AdamW
-  lr: 1.0e-4
-  betas: [0.9, 0.95]
-  weight_decay: 0.01
-dataset:
-  _target_: datasets.load_dataset
-  path: HuggingFaceFW/fineweb
-  streaming: true
-  split: train
-  tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3.5-0.8B
-```
+  _target_: hyper_parallel.trainer.config.ModelConfig
+  name: qwen3_5
+  weights_path: /path/to/weights
 
-#### Step 1: `load_yaml_config("train.yaml")`
-
-```python
-with open("train.yaml") as f:
-    raw = yaml.safe_load(f)
-# raw = {
-#     "recipe": "FinetuneRecipe",
-#     "seed": 42,                         # YAML 已自动转为 int
-#     "model": {
-#         "_target_": "hyper_models.HyperAutoModelForCausalLM.from_pretrained",
-#         "pretrained_model_name_or_path": "Qwen/Qwen3.5-0.8B",
-#         "torch_dtype": "bfloat16",
-#     },
-#     "optimizer": {
-#         "_target_": "torch.optim.AdamW",
-#         "lr": 0.0001,                   # YAML 已自动转为 float（1.0e-4）
-#         "betas": [0.9, 0.95],           # YAML 已转 float 列表
-#         "weight_decay": 0.01,           # YAML 已自动转为 float
-#     },
-#     "dataset": {
-#         "_target_": "datasets.load_dataset",
-#         "path": "HuggingFaceFW/fineweb",
-#         "streaming": true,              # YAML bool
-#         "split": "train",
-#         "tokenizer": {
-#             "_target_": "transformers.AutoTokenizer.from_pretrained",
-#             "pretrained_model_name_or_path": "Qwen/Qwen3.5-0.8B",
-#         },
-#     },
-# }
-return ConfigNode(raw)  # → Step 2
-```
-
-#### Step 2: `ConfigNode.__init__(raw)`
-
-ConfigNode 对 `raw` 的每个顶层 key 调用 `_wrap(k, v)`：
-
-```python
-# self = ConfigNode()  (正在构造中)
-
-# ① _wrap("recipe", "FinetuneRecipe")
-#    v 是 str, k 不是 "_target_"/"*_fn", 不含 "$"
-#    → translate_value("FinetuneRecipe")
-#    → ast.literal_eval("FinetuneRecipe") 失败 → 返回 "FinetuneRecipe"
-#    结果: self.recipe = "FinetuneRecipe"
-
-# ② _wrap("seed", 42)
-#    v 是 int → translate_value(42) → 42（非 str 直接返回）
-#    结果: self.seed = 42
-
-# ③ _wrap("model", {"_target_": "...", ...})
-#    v 是 dict → ConfigNode(v)  # ★ 递归创建子 ConfigNode
-#    ── 进入子 ConfigNode.__init__({"pretrained_model_name_or_path": ..., "_target_": ..., ...}) ──
-#      a) _wrap("_target_", "hyper_models.HyperAutoModelForCausalLM.from_pretrained")
-#         k == "_target_" → _resolve_target("hyper_models.HyperAutoModelForCausalLM.from_pretrained")
-#           parts = ["hyper_parallel", "HyperAutoModelForCausalLM", "from_pretrained"]
-#           i=1: importlib.import_module("hyper_parallel") ✓
-#                getattr(mod, "HyperAutoModelForCausalLM") → <class>
-#                getattr(class, "from_pretrained") → <bound method>
-#         保存: self._original_strings["_target_"] = "hyper_models.HyperAutoModelForCausalLM.from_pretrained"
-#         结果: self._target_ = <bound method HyperAutoModelForCausalLM.from_pretrained>
-#
-#      b) _wrap("pretrained_model_name_or_path", "Qwen/Qwen3.5-0.8B")
-#         translate_value("Qwen/Qwen3.5-0.8B") → "Qwen/Qwen3.5-0.8B"
-#         结果: self.pretrained_model_name_or_path = "Qwen/Qwen3.5-0.8B"
-#
-#      c) _wrap("torch_dtype", "bfloat16")
-#         translate_value("bfloat16") → "bfloat16"
-#         结果: self.torch_dtype = "bfloat16"
-#    ── 子 ConfigNode 构造完成 ──
-#    结果: self.model = <ConfigNode {
-#        _target_: <bound method ...from_pretrained>,
-#        pretrained_model_name_or_path: "Qwen/Qwen3.5-0.8B",
-#        torch_dtype: "bfloat16",
-#    }>
-
-# ④ _wrap("optimizer", {"_target_": "torch.optim.AdamW", ...})
-#    v 是 dict → ConfigNode(v)  # ★ 递归
-#    ── 子 ConfigNode.__init__ ──
-#      a) _wrap("_target_", "torch.optim.AdamW")
-#         _resolve_target("torch.optim.AdamW")
-#           i=2: importlib.import_module("torch.optim") ✓
-#                getattr(torch.optim, "AdamW") → <class 'torch.optim.adamw.AdamW'>
-#         结果: self._target_ = <class 'torch.optim.adamw.AdamW'>
-#              ★ self._target_ 不是一个字符串！它是一个 Python class 对象！
-#
-#      b) _wrap("lr", 0.0001)
-#         translate_value(0.0001) → 0.0001（非 str 直接返回；float 由 YAML 解析产生）
-#         结果: self.lr = 0.0001
-#
-#      c) _wrap("betas", [0.9, 0.95])
-#         v 是 list → [self._wrap("", 0.9), self._wrap("", 0.95)]
-#         → [translate_value(0.9), translate_value(0.95)]
-#         → [0.9, 0.95]
-#         结果: self.betas = [0.9, 0.95]
-#
-#      d) _wrap("weight_decay", 0.01)
-#         translate_value(0.01) → 0.01（非 str 直接返回）
-#         结果: self.weight_decay = 0.01
-#    ── 子 ConfigNode 构造完成 ──
-#    结果: self.optimizer = <ConfigNode {
-#        _target_: <class 'torch.optim.adamw.AdamW'>,
-#        lr: 0.0001,
-#        betas: [0.9, 0.95],
-#        weight_decay: 0.01,
-#    }>
-
-# ⑤ _wrap("dataset", {"_target_": "datasets.load_dataset", ..., "tokenizer": {...}})
-#    v 是 dict → ConfigNode(v)  # ★ 递归
-#    ── 子 ConfigNode.__init__ ──
-#      a) _wrap("_target_", "datasets.load_dataset")
-#         _resolve_target("datasets.load_dataset")
-#           i=1: importlib.import_module("datasets") ✓
-#                getattr(datasets, "load_dataset") → <function load_dataset>
-#         结果: self._target_ = <function datasets.load_dataset>
-#
-#      b) _wrap("path", "HuggingFaceFW/fineweb")
-#         translate_value → "HuggingFaceFW/fineweb"
-#
-#      c) _wrap("streaming", True)
-#         translate_value(True) → True
-#
-#      d) _wrap("split", "train")
-#         translate_value → "train"
-#
-#      e) _wrap("tokenizer", {"_target_": "transformers.AutoTokenizer.from_pretrained", ...})
-#         v 是 dict → ConfigNode(v)  # ★ 三层嵌套！
-#         ── 子子 ConfigNode.__init__ ──
-#           · _wrap("_target_", "transformers.AutoTokenizer.from_pretrained")
-#             _resolve_target → <bound method AutoTokenizer.from_pretrained>
-#             结果: self._target_ = <bound method>
-#           · _wrap("pretrained_model_name_or_path", "Qwen/Qwen3.5-0.8B")
-#             → "Qwen/Qwen3.5-0.8B"
-#         ── 子子 ConfigNode 构造完成 ──
-#         结果: self.tokenizer = <ConfigNode {
-#             _target_: <bound method AutoTokenizer.from_pretrained>,
-#             pretrained_model_name_or_path: "Qwen/Qwen3.5-0.8B",
-#         }>
-#    ── 子 ConfigNode 构造完成 ──
-#    结果: self.dataset = <ConfigNode {
-#        _target_: <function datasets.load_dataset>,
-#        path: "HuggingFaceFW/fineweb",
-#        streaming: True,
-#        split: "train",
-#        tokenizer: <ConfigNode {_target_: <bound method>, ...}>,
-#    }>
-```
-
-**构造完成后的内存结构**：
-
-```
-cfg (ConfigNode)
-├── recipe: "FinetuneRecipe"
-├── seed: 42
-├── model (ConfigNode)
-│   ├── _target_: <bound method HyperAutoModelForCausalLM.from_pretrained>
-│   ├── pretrained_model_name_or_path: "Qwen/Qwen3.5-0.8B"
-│   └── torch_dtype: "bfloat16"
-├── optimizer (ConfigNode)
-│   ├── _target_: <class 'torch.optim.adamw.AdamW'>
-│   ├── lr: 0.0001
-│   ├── betas: [0.9, 0.95]
-│   └── weight_decay: 0.01
-└── dataset (ConfigNode)
-    ├── _target_: <function datasets.load_dataset>
-    ├── path: "HuggingFaceFW/fineweb"
-    ├── streaming: True
-    ├── split: "train"
-    └── tokenizer (ConfigNode)
-        ├── _target_: <bound method AutoTokenizer.from_pretrained>
-        └── pretrained_model_name_or_path: "Qwen/Qwen3.5-0.8B"
-```
-
-每个 `_target_` 字段的值**已经是解析好的 callable**，不再是字符串。
-
----
-
-### 2.7 Step 4: `__getattr__` / `get` / `get_as_string` — 属性访问
-
-```python
-class ConfigNode:
-    def __getattr__(self, key: str) -> Any:
-        """属性式访问：cfg.model → 返回子 ConfigNode。
-
-        dunder 方法（如 __setstate__）必须 raise AttributeError，
-        否则 copy.deepcopy 等协议会误判。
-        """
-        if key.startswith("__") and key.endswith("__"):
-            raise AttributeError(key)
-        try:
-            return self.__dict__[key]
-        except KeyError:
-            if self.__dict__.get("raise_on_missing_attr", True):
-                raise AttributeError(key)   # AutoModel 默认：严格模式
-            return None                     # 宽松模式
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """点分隔路径访问：cfg.get("dataset.tokenizer") → 子 ConfigNode。"""
-        parts = key.split(".")
-        current = self
-        for p in parts:
-            if isinstance(current, ConfigNode):
-                if p in current.__dict__:
-                    current = current.__dict__[p]
-                else:
-                    return default
-            elif isinstance(current, list):
-                try:
-                    current = current[int(p)]
-                except (ValueError, IndexError):
-                    return default
-            else:
-                return default
-        return current
-
-    def get_as_string(self, key: str) -> str:
-        """获取 _target_ 或 *_fn 的原始字符串（非解析后的 callable）。
-
-        用于日志和 YAML 序列化——显示 "torch.optim.AdamW" 而非
-        "<class 'torch.optim.adamw.AdamW'>"。
-        """
-        if key in self._original_strings:
-            return self._original_strings[key]
-        # 当 _target_ 是 callable（直接在 YAML 中传入）时，_original_strings 无此 key，
-        # 回退到 __dict__ 的 str 表示（如 "<class 'torch.optim.adamw.AdamW'>"）
-        return self._original_strings.get(key, str(self.__dict__.get(key, "")))
-```
-
-**使用示例**：
-```python
-cfg.model.pretrained_model_name_or_path   # → "Qwen/Qwen3.5-0.8B"
-cfg.get("dataset.tokenizer")              # → <ConfigNode {_target_: <bound method>, ...}>
-cfg.optimizer.get_as_string("_target_")   # → "torch.optim.AdamW"（原始字符串！）
-```
-
----
-
-### 2.8 `*_fn` 机制详解：函数作为构造参数
-
-**为什么需要 `*_fn`？**
-
-有些组件的构造函数接受**函数/回调**作为参数（如 `collate_fn`、`loss_fn`、`reward_fn`）。这些函数需要在 YAML 中通过字符串路径引用，在 ConfigNode 构造时解析为 callable，然后在 `instantiate()` 时作为普通 keyword argument 传入。
-
-**规则**：任何以 `_fn` 结尾的 key，其字符串值会在 `_wrap()` 中通过 `_resolve_target()` **立即解析为 callable**，行为与 `_target_` 完全一致。
-
-**示例**：配置一个 DataLoader 的 collate function
-
-```yaml
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 1
-  collate_fn: hyper_models.components.datasets.utils.default_collater
-```
-
-解析过程：
-
-```python
-# _wrap("collate_fn", "hyper_models.components.datasets.utils.default_collater")
-# k == "collate_fn" → k.endswith("_fn") is True!
-# → _resolve_target("hyper_models.components.datasets.utils.default_collater")
-#   → importlib.import_module("hyper_models.components.datasets.utils")
-#   → getattr(module, "default_collater")
-#   → <function default_collater>
-# self._original_strings["collate_fn"] = "hyper_models.components.datasets.utils.default_collater"
-# 结果: self.collate_fn = <function default_collater>   ★ 直接是函数对象！
-
-# 注意：collate_fn 不是 _target_，不会被 instantiate() 调用。
-# 它作为普通 kwarg 传给 DataLoader 的构造函数：
-#   DataLoader(dataset=..., batch_size=1, collate_fn=<function default_collater>)
-```
-
-**`_fn` vs `_target_` 的区别**：
-
-| | `_target_` | `*_fn` |
-|------|----------|--------|
-| 解析时机 | `_wrap()` 中立即解析 | `_wrap()` 中立即解析 |
-| `instantiate()` 行为 | **调用** `_target_(*args, **kwargs)` | 作为 **kwarg 传入** `_target_` |
-| 用途 | "这个 ConfigNode 要实例化什么类" | "构造函数的某个参数是什么函数" |
-| 例子 | `_target_: torch.optim.AdamW` | `collate_fn: my_package.my_collate` |
-
----
-
-### 2.9 Step 5: `instantiate()` — ConfigNode → Python 对象
-
-```python
-class ConfigNode:
-    def instantiate(self, *args: Any, **kwargs: Any) -> Any:
-        """调用 _target_ 创建对象。
-
-        这是 ConfigNode 的最终目标——将配置树转换为 Python 对象树。
-
-        流程：
-        ① 获取 _target_ callable（已在 __init__ 中解析好）
-        ② 遍历 self 的其他属性，收集为 config_kwargs
-        ③ 对每个属性值调用 _instantiate_value（递归实例化嵌套 ConfigNode）
-        ④ 合并运行时 kwargs（覆盖 config 中的值）
-        ⑤ 调用 _target_(*args, **merged_kwargs)
-        """
-        if self._target_ is None:
-            raise AttributeError("No _target_ found to instantiate")
-
-        func = self._target_   # ★ 已经是 callable，不需要 _resolve_target
-        # 但为安全起见，AutoModel 还是调了一次 _resolve_target（幂等操作）
-
-        # ── 收集 config_kwargs ──
-        config_kwargs = {}
-        for k, v in self.__dict__.items():
-            # 跳过内部 key
-            if k in ("_target_", "raise_on_missing_attr", "_raw_config", "_original_strings"):
-                continue
-            # 运行时覆盖 → 跳过（节省递归实例化的开销）
-            if k in kwargs:
-                continue
-            if k.endswith("_fn"):
-                # ★ *_fn 已经解析为 callable，直接作为 kwarg 传入
-                # 例如: collate_fn=<function default_collater>
-                config_kwargs[k] = v
-            else:
-                # ★ 递归实例化嵌套 ConfigNode
-                config_kwargs[k] = self._instantiate_value(v)
-
-        # 解析 config_kwargs 中的环境变量（只解析 config 的，不解析 runtime 的）
-        config_kwargs = resolve_yaml_env_vars(config_kwargs)
-
-        # runtime kwargs 覆盖 config kwargs
-        config_kwargs.update(kwargs)
-
-        try:
-            return func(*args, **config_kwargs)
-        except Exception as e:
-            # 详细的错误信息：展示签名 + 参数
-            import inspect
-            import sys
-            import pprint
-            sig = inspect.signature(func)
-            safe_kwargs = _redact(config_kwargs)  # 脱敏
-            print(f"Instantiation failed for `{func.__name__}`\n"
-                  f"Accepted signature: {sig}\n"
-                  f"Positional args: {args}\n"
-                  f"Keyword args: {pprint.pformat(safe_kwargs)}\n"
-                  f"Exception: {e}", file=sys.stderr)
-            raise e
-
-    def instantiate_path(self, dotted_path: str, default: Any = None, *args, **kwargs) -> Any:
-        """按路径查找并 instantiate，未找到返回 default。
-
-        用于可选配置段（peft、qat 等）：
-            peft_config = cfg.instantiate_path("peft")  # None if not configured
-        """
-        item = self.get(dotted_path, default)
-        if item is default:
-            return default
-        return item.instantiate(*args, **kwargs)
-```
-
-**实例化示例**：继续 §2.6 的配置
-
-```python
-# ── ① 实例化 tokenizer ──
-# cfg.dataset.tokenizer.instantiate()
-#
-# func = <bound method AutoTokenizer.from_pretrained>
-# config_kwargs = {"pretrained_model_name_or_path": "Qwen/Qwen3.5-0.8B"}
-# → AutoTokenizer.from_pretrained(pretrained_model_name_or_path="Qwen/Qwen3.5-0.8B")
-# → <PreTrainedTokenizerFast>
-
-# ── ② 实例化 dataset ──
-# cfg.dataset.instantiate()   # ★ 不传 tokenizer！
-#
-# func = <function datasets.load_dataset>
-# config_kwargs = {
-#     "path": "HuggingFaceFW/fineweb",
-#     "streaming": True,
-#     "split": "train",
-#     "tokenizer": <PreTrainedTokenizerFast>   # ← 嵌套 ConfigNode 递归 instantiate 的结果
-# }
-# ★ 但 datasets.load_dataset 不接受 tokenizer kwarg——
-#   02 §4.2 的 signature 守卫（inspect.signature 检查）会在调用前剔除
-#   不在 load_dataset 签名中的 kwargs，因此 tokenizer 不会被注入。
-# → load_dataset(path="HuggingFaceFW/fineweb", streaming=True, split="train")
-# → <Dataset>
-# （tokenizer 由 build_dataloader 内部 _build_tokenizer 单独实例化，
-#   供后续 map/tokenize 步骤使用，而不是传给 load_dataset）
-
-# ── ③ 实例化 model ──
-# cfg.model.instantiate(distributed_setup=<setup>)
-#
-# func = <bound method HyperAutoModelForCausalLM.from_pretrained>
-# config_kwargs = {
-#     "pretrained_model_name_or_path": "Qwen/Qwen3.5-0.8B",
-#     "torch_dtype": "bfloat16",
-# }
-# runtime: kwargs = {"distributed_setup": <setup>}
-# merged = {**config_kwargs, **kwargs}
-# → HyperAutoModelForCausalLM.from_pretrained(
-#       pretrained_model_name_or_path="Qwen/Qwen3.5-0.8B",
-#       torch_dtype="bfloat16",
-#       distributed_setup=<setup>,
-#   )
-# → <HyperAutoModelForCausalLM>
-```
-
----
-
-### 2.10 `_instantiate_value` — 递归实例化
-
-```python
-class ConfigNode:
-    def _instantiate_value(self, v: Any) -> Any:
-        """递归处理 config_kwargs 中的每个值。
-
-        核心规则：
-        - ConfigNode 且有 _target_ → v.instantiate()  ★ 递归实例化
-        - ConfigNode 无 _target_      → v.to_dict()     ★ 展开为普通 dict
-        - list                         → 递归处理每个元素
-        - 叶子值                       → translate_value(resolve_yaml_env_vars(v))
-        """
-        if isinstance(v, ConfigNode) and v._target_ is not None:
-            # ★ 嵌套的 _target_ ConfigNode → 先实例化它！
-            # 例如：optimizer ConfigNode 内的 lr_scheduler ConfigNode
-            return v.instantiate()
-        elif isinstance(v, ConfigNode):
-            # 无 _target_ 的 ConfigNode → 展开为普通 dict
-            # 例如：model.backend 只是一个配置分组，不需要实例化
-            return resolve_yaml_env_vars(v.to_dict())
-        elif isinstance(v, list):
-            return [self._instantiate_value(item) for item in v]
-        else:
-            # 叶子值：解析环境变量 + 类型转换
-            return translate_value(resolve_yaml_env_vars(v))
-```
-
-**递归实例化示例**：
-
-```yaml
-optimizer:
-  _target_: torch.optim.AdamW
-  lr: 1.0e-4
-  # 没有嵌套的 _target_，所有值都是叶子 → 直接传入
-```
-
-vs
-
-```yaml
-# 如果优化器内部有嵌套的 _target_（示意）：
 training:
-  _target_: hyper_models.TrainingLoop
-  optimizer:
-    _target_: torch.optim.AdamW     # ← 嵌套 _target_，会先被实例化
-    lr: 1.0e-4
+  _target_: hyper_models.trainer.config.TrainingConfig
+  max_steps: 100
+  global_batch_size: 8
+
+accelerator:
+  _target_: hyper_models.trainer.config.AcceleratorConfig
+  tp_size: 2
+  dp_shard_size: 4
+
+optimizer:
+  _target_: hyper_models.components.optim.AdamW.Config
+  lr: 0.0001
+  weight_decay: 0.1
+
+lr_scheduler:
+  _target_: hyper_models.components.optim.CosineWithWarmup.Config
+  warmup_ratio: 0.05
+
+loss:
+  _target_: hyper_models.components.loss.CausalLMLoss.Config
+  ignore_index: -100
 ```
 
-```python
-# cfg.training.instantiate()
-# config_kwargs["optimizer"] = self._instantiate_value(optimizer_Confignode)
-#   → optimizer_Confignode 有 _target_
-#   → optimizer_Confignode.instantiate() → AdamW(lr=0.0001)
-# config_kwargs = {"optimizer": <AdamW optimizer>}
-# → TrainingLoop(optimizer=<AdamW>)
+#### 解析过程
+
 ```
+① yaml.safe_load() → raw dict
+
+② resolve_root(raw)
+   │
+   ├─ $.model
+   │   import_target("hyper_parallel.trainer.config.ModelConfig") → <class ModelConfig>
+   │   校验: ModelConfig 是类 → result_type = ModelConfig
+   │         _annotation_assignable(ModelConfig, ModelConfig) → True ✓
+   │   签名: ModelConfig(name=..., weights_path=...)
+   │   coerce_value("qwen3_5", str) → "qwen3_5"
+   │   coerce_value("/path/to/weights", str) → "/path/to/weights"
+   │   → ModelConfig(name="qwen3_5", weights_path="/path/to/weights")
+   │
+   ├─ $.training
+   │   import_target("hyper_models.trainer.config.TrainingConfig") → <class TrainingConfig>
+   │   校验: _annotation_assignable(TrainingConfig, TrainingConfig) → True ✓
+   │   → TrainingConfig(max_steps=100, global_batch_size=8)
+   │
+   ├─ $.accelerator
+   │   → AcceleratorConfig(tp_size=2, dp_shard_size=4)
+   │
+   ├─ $.optimizer
+   │   import_target("hyper_models.components.optim.AdamW.Config") → <class AdamW.Config>
+   │   校验: _annotation_assignable(AdamW.Config, Optimizer.Config) → True ✓（issubclass）
+   │   → AdamW.Config(lr=0.0001, weight_decay=0.1)
+   │
+   ├─ $.lr_scheduler
+   │   → CosineWithWarmup.Config(warmup_ratio=0.05)
+   │
+   └─ $.loss
+       → CausalLMLoss.Config(ignore_index=-100)
+
+③ TrainerConfig(**resolved) → 最终强类型配置树
+
+④ _apply_typed_overrides(config, ["--training.max_steps=200", "--accelerator.tp_size=4"])
+   │
+   ├─ "training.max_steps" → _replace_path(config, ["training", "max_steps"], 200)
+   │   config.training 是 TrainingConfig → 字段 "max_steps" 存在 ✓
+   │   coerce_value(200, int) → 200 ✓
+   │   → replace(config.training, max_steps=200)
+   │
+   └─ "accelerator.tp_size" → _replace_path(config, ["accelerator", "tp_size"], 4)
+       → replace(config.accelerator, tp_size=4)
+
+最终 TrainerConfig:
+  model = ModelConfig(name="qwen3_5", weights_path="/path/to/weights")
+  training = TrainingConfig(max_steps=200, global_batch_size=8)
+  accelerator = AcceleratorConfig(tp_size=4, dp_shard_size=4)
+  optimizer = AdamW.Config(lr=0.0001, weight_decay=0.1)
+  lr_scheduler = CosineWithWarmup.Config(warmup_ratio=0.05)
+  loss = CausalLMLoss.Config(ignore_index=-100)
+```
+
+**关键差异**：与原始 ConfigNode 设计不同，这里 `_target_` 解析后**立即被调用**（如 `AdamW.Config(lr=0.0001, weight_decay=0.1)`），返回的是类型化 Config 对象，而非存储 callable 等待后续 `instantiate()`。整个解析过程是**完全 eager** 的——所有类型校验、参数转换、对象构造都在 `parse_training_args()` 返回之前完成。
 
 ---
 
-### 2.11 序列化：`to_dict` / `to_yaml_dict`
+### 2.8 文件结构总览
 
-```python
-class ConfigNode:
-    def to_dict(self) -> dict:
-        """递归转换为普通 dict（用于 checkpoint 保存）。
-
-        注意：此方法会丢弃 _target_，不可逆——无法从返回的 dict 还原回 ConfigNode。
-        需要保留 _target_ 的场景请使用 to_yaml_dict()。
-        """
-        return {
-            k: self._unwrap(v)
-            for k, v in self.__dict__.items()
-            if k not in ("_target_", "raise_on_missing_attr", "_raw_config", "_original_strings")
-        }
-
-    def _unwrap(self, v: Any) -> Any:
-        if isinstance(v, ConfigNode):
-            return v.to_dict()
-        elif isinstance(v, list):
-            return [self._unwrap(item) for item in v]
-        else:
-            return v
-
-    def to_yaml_dict(self, *, use_orig_values: bool = True, **kwargs) -> dict:
-        """转换为 YAML 可序列化的 dict。
-
-        use_orig_values=True 时，_target_ 和 *_fn 输出原始字符串
-        （如 "torch.optim.AdamW"），而非 callable 的 repr。
-        """
-        def _convert(key, value):
-            if isinstance(value, ConfigNode):
-                return value.to_yaml_dict(use_orig_values=use_orig_values, **kwargs)
-            if isinstance(value, list):
-                return [_convert(None, v) for v in value]
-            # _target_ / *_fn / callable → 原始字符串或 dotted path
-            orig_strings = getattr(self, "_original_strings", {})
-            if use_orig_values and key in orig_strings:
-                return orig_strings[key]
-            if callable(value) or inspect.ismethod(value) or inspect.isclass(value):
-                return self._to_dotted_path(value)  # 反向转换
-            if use_orig_values and hasattr(value, "_orig_value"):
-                return getattr(value, "_orig_value")
-            return value
-
-        return {
-            k: _convert(k, v)
-            for k, v in self.__dict__.items()
-            if k not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
-        }
-
-    def __contains__(self, key: object) -> bool:
-        """支持 `key in cfg` —— ConfigNode 不可迭代，按内部键集判定。"""
-        return key in self.to_dict()
-
-    def replace(self, **overrides) -> "ConfigNode":
-        """不可变更新：基于 to_dict() 取值，应用 overrides 后构造新 ConfigNode。
-
-        用于 `build_validation_dataloader` 等场景需覆盖个别字段（如 packed_sequence_size=0）
-        而不污染原 config（见 02 §`build_validation_dataloader`）。等价于
-        `ConfigNode({**cfg.to_dict(), **overrides})`，但保留 _target_ 解析语义。
-        """
-        new_dict = self.to_dict()
-        new_dict.update(overrides)
-        new_cfg = ConfigNode(new_dict)
-        # Preserve _target_ from original ConfigNode (to_dict() intentionally excludes it)
-        if self._target_ is not None:
-            new_cfg._target_ = self._target_
-        if "_target_" in self._original_strings:
-            new_cfg._original_strings["_target_"] = self._original_strings["_target_"]
-        return new_cfg
-```
+| 文件 | 职责 |
+|------|------|
+| `hyper_models/config/configurable.py` | `Configurable` 基类 + 嵌套 `Config` dataclass：`replace()` / `to_dict()` / `traverse()` / `build()` |
+| `hyper_models/config/manager.py` | 公开入口 `parse_training_args()` + CLI override `_apply_typed_overrides()` |
+| `hyper_models/config/resolver.py` | `resolve_root()` / `resolve_component()` / `import_target()` / `coerce_value()` — typed 解析核心 |
+| `hyper_models/trainer/config.py` | `TrainerConfig` + 子 Config dataclass 定义 |
+| `hyper_models/components/optim/optimizer.py` | `Optimizer` 类别 + `AdamW.Config` |
+| `hyper_models/components/optim/lr_scheduler.py` | `LRScheduler` 类别 + `CosineWithWarmup.Config` |
+| `hyper_models/components/loss/loss.py` | `Loss` 类别 + `CausalLMLoss.Config` |
 
 ---
 
-### 2.12 安全模型
+### 2.9 与旧代码的对比
 
-```python
-# 白名单：只允许从显式列出的顶层包前缀解析 _target_ / *_fn。
-# 收敛原因：原 _is_allowed_module 含"已导入模块即放行"（if top_level in sys.modules）
-# 与 ENABLE_USER_MODULES 全放行分支，导致任意已 import 的顶层模块都可被
-# _resolve_target 解析为 callable，三层安全退化为"已安装即放行"。
-# canonical：显式白名单前缀匹配 → 放行；其余 → 阻止。
-# 用户扩展须显式注册到 hyper_parallel 命名空间下，或在此处显式追加前缀。
-ALLOWED_IMPORT_PREFIXES = (
-    "hyper_parallel",     # 框架自身
-    "torch",              # torch.optim.AdamW 等
-    "transformers",       # AutoTokenizer / AutoModel 兼容入口
-    "datasets",           # datasets.load_dataset
-    "torchdata",          # StatefulDataLoader
-    "torchao",
-    "liger_kernel",
-)
-
-def _is_allowed_module(module_name: str) -> bool:
-    """白名单前缀匹配 → 放行；其余 → 阻止。
-
-    不再提供"已导入模块即放行"与 ENABLE_USER_MODULES 全放行分支，
-    避免 sys.modules 状态污染白名单。
-    """
-    top_level = module_name.split(".", 1)[0]
-    return top_level in ALLOWED_IMPORT_PREFIXES
-
-def _is_safe_attr(name: str) -> bool:
-    """阻止访问私有/魔术属性。"""
-    return not (name.startswith("_") or "__" in name)
-```
-
----
-
-### 2.13 与旧代码的对比
-
-| 旧方式（硬编码） | 新方式（ConfigNode `_target_` IoC） |
+| 旧方式（硬编码） | 新方式（强类型 `_target_` IoC） |
 |-----------------|------------------------|
-| `if model_type == "llama": model = LlamaForCausalLM(config)` | `cfg.model.instantiate()` — YAML 决定类型 |
-| `if optim == "adamw": opt = AdamW(params, **kwargs)` | `cfg.optimizer.instantiate(params=params)` |
-| `register_spec("qwen3_5", ModelSpec(...))` | YAML 配置 `_target_: ...Qwen3_5ForCausalLM` |
-| 新增模型需要修改 Recipe 代码 | 新增模型只需新增 YAML 配置文件 |
-| 新增组件需要注册 + if/else 分支 | 新增组件只需在 YAML 中声明 `_target_` |
-| `_target_` / `*_fn` 是字符串，运行时才 import | ConfigNode 构造时立即解析，`instantiate()` 零延迟 |
-| 配置拼写错误静默返回 None | `raise_on_missing_attr=True` 立即抛出 AttributeError |
----
-
-
-### 2.14 辅助函数签名
-
-```python
-# hyper_models/components/config/_utils.py
-
-def resolve_yaml_env_vars(v: Any) -> Any:
-    """解析 YAML 值中的环境变量引用（如 ${VAR_NAME}）。
-
-    在 _wrap() 和 _instantiate_value() 的叶子值路径中被调用，确保 $ENV_VAR
-    在配置加载和实例化时都被展开。解析后的值不含 $ 引用时原样返回；
-    _OrigValueStr 会保留原始占位符供 to_yaml_dict() 安全输出。
-    """
-    ...
-
-def load_module_from_file(file_path: str):
-    """从 .py 文件动态加载模块（用于用户自定义组件）。
-
-    通过 importlib 从文件路径创建模块对象并执行模块代码，
-    返回模块对象供 _resolve_target 的 getattr 链使用。
-    """
-    ...
-
-def _safe_getattr(obj, attr: str) -> Any:
-    """安全 getattr——阻止私有/魔术属性访问。
-
-    在 _resolve_target 的逐级 getattr 链中被调用，
-    对私有属性（以 _ 开头）抛出 AttributeError 以维护白名单安全模型。
-    """
-    ...
-
-def _as_dict(cfg: Any) -> dict:
-    """将 ConfigNode 或 Mapping 安全转换为普通 dict。"""
-    ...
-
-def _redact(kwargs: dict) -> dict:
-    """脱敏关键字参数（隐藏 password/secret 等）。"""
-    ...
-
-
-# hyper_models/components/distributed/fsdp2.py
-
-def _instantiate_fsdp2(*, config, mesh_context) -> "FSDP2Manager | None":
-    """根据 strategy config 创建 FSDP2Manager 实例。
-
-    canonical：FSDP2Manager 收 2 参 (config, mesh: MeshContext)，
-    内部从 mesh.device_mesh / mesh.device 取出 DeviceMesh 与 device。
-
-    canonical（裁决：以 01 为准）：本工厂的关键字形参名为 `mesh_context`——
-    06 §4.1 中 `(config, mesh)` 的表述需向此对齐。
-    """
-    if config is None:
-        return None
-    return FSDP2Manager(config=config, mesh=mesh_context)
-
-
-# hyper_models/components/distributed/pipelining.py
-
-def _instantiate_pipeline(pipeline_config, mesh) -> "AutoPipeline | None":
-    """根据 pipeline_config 创建 AutoPipeline 实例（pp_size > 1 时）。
-
-    canonical：2 参签名 (pipeline_config, mesh)，与 §8.2
-    `AutoPipeline.__init__(self, pipeline_config, mesh)` 一致（device 由 mesh 内部携带）。
-    """
-    ...
-
-
-# hyper_models/components/checkpoint/checkpointing.py
-
-def _load_full_state_dict_into_model(model: nn.Module, state_dict: dict) -> None:
-    """将 full state dict 加载到（可能已 DTensor 分片的）模型中，每 rank 独立切分。"""
-    ...
-
-def _get_state_dict_adapter(model: nn.Module) -> "StateDictAdapter | None":
-    """从模型中提取 StateDictAdapter（查找 _state_dict_adapter 属性）。"""
-    ...
-
-
-# hyper_models/components/models/common/
-
-def _model_name_from_cfg(model_cfg) -> str | None:
-    """从模型 ConfigNode 中提取 pretrained_model_name_or_path。"""
-    ...
-
-def build_model(
-    model_cfg,
-    peft_config=None,
-    distributed_setup=None,
-    **kwargs,
-) -> tuple["nn.Module", "OptimizerInit"]:  # 需要 Python 3.12+ 或 from __future__ import annotations
-    """高层 build_model 入口——ConfigNode.instantiate() 的快捷方式。
-
-    与 HyperAutoModel.from_pretrained 的职责区分：
-    - from_pretrained 是 HF 入口，**返回单 model**（PreTrainedModel）。
-    - build_model 是 Recipe 内部编排入口，**返回 (model, optimizer_init)**——
-      内部调用 from_pretrained（自定义路径）或 _build_model（HF 原生路径）
-      完成 meta→shard→load，并从 ShardingPlan / distributed_setup 导出
-      OptimizerInit，供 Recipe.setup() 调用 OptimizerConfig.build(model,
-      optimizer_init=...) 时使用，避免 Recipe 重复推导 param 分组与 mesh 信息。
-
-    Returns:
-        (model, optimizer_init)
-        - model: 已分片、权重已加载的模型（meta→shard→load 完成）
-        - optimizer_init: 见 OptimizerInit。
-    """
-    # ① 先处理 peft_config（供 from_pretrained / _build_model 内部 PEFT 注入）
-    if peft_config is None and hasattr(model_cfg, "get"):
-        peft_node = model_cfg.get("peft")
-        if peft_node is not None:
-            peft_config = peft_node.instantiate()
-
-    # ② 调用 HF 兼容入口构建模型（自定义路径走 from_pretrained，含 meta→shard→load）
-    #    _target_ 已在 ConfigNode 构造时解析为 HyperAutoModelForCausalLM.from_pretrained
-    model = model_cfg.instantiate(
-        distributed_setup=distributed_setup,
-        peft_config=peft_config,
-        **kwargs,
-    )
-
-    # ③ 从 distributed_setup / ShardingPlan 导出 OptimizerInit（param 分组、mesh、is_peft）
-    #    weight_decay 由 Recipe 侧从 cfg.optimizer 读取后经 OptimizerConfig.build 生效（§3.4）；
-    #    此处不臆造 wd 值（默认 0.0 占位，禁止用 True——True 等价于 wd=1.0）。
-    optimizer_init = OptimizerInit.from_distributed_setup(
-        distributed_setup=distributed_setup,
-        model=model,
-        peft_config=peft_config,
-    )
-    return model, optimizer_init
-
-
-@dataclass
-class OptimizerInit:
-    """优化器初始化描述——由 build_model 从 distributed_setup / ShardingPlan 导出。
-
-    Recipe.setup() 将其传给 OptimizerConfig.build(model, optimizer_init=...)，
-    避免 Recipe 侧重复推导 param 分组与 mesh 信息（与 03 §self.model,
-    self.optimizer_init = build_model(...) 对称）。
-    """
-    # param_groups 分组（decay / no_decay / lora_only 等），由 ShardingPlan 推导
-    param_groups: list[dict]
-    # DeviceMesh（用于 optimizer state 的 DTensor placement）；04 §5.3 期待 DeviceMesh
-    device_mesh: "DeviceMesh | None"
-    # 是否为 PEFT 训练（影响 param 过滤 / 可训练参数统计）
-    is_peft: bool = False
-    # 可选：tp_grad_info（由 apply_sharding_plan 导出，供 FSDP2 / optimizer 复用）
-    tp_grad_info: Any = None
-
-    @classmethod
-    def from_distributed_setup(
-        cls,
-        *,
-        distributed_setup,
-        model: "nn.Module",
-        peft_config=None,
-        weight_decay: float = 0.0,
-    ) -> "OptimizerInit":
-        """从 distributed_setup.mesh_context.device_mesh + model 参数推导分组。
-
-        Args:
-            weight_decay: 从 optimizer 配置读取的实际 weight_decay 值
-                （如 cfg.optimizer.weight_decay），用于 decay 组；no_decay 组恒为 0.0。
-                ★ 禁止传 bool——`weight_decay=True` 传入 AdamW 等价于 wd=1.0。
-        注：最终分组由 OptimizerConfig.build 内部以 self.weight_decay 重做（§3.4），
-        此处 param_groups 为预分组描述，供调用方/调试参考。
-        """
-        mesh_ctx = getattr(distributed_setup, "mesh_context", None) if distributed_setup else None
-        device_mesh = mesh_ctx.device_mesh if mesh_ctx is not None else None
-        is_peft = peft_config is not None
-
-        # 简化的 decay/no_decay 分组（完整分组逻辑由 OptimizerConfig.build 内部完成）
-        decay_p, no_decay_p = [], []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            (no_decay_p if _is_no_decay(name) else decay_p).append(param)
-        param_groups = [
-            {"params": decay_p, "weight_decay": weight_decay},   # decay 组：配置的实际 wd 值
-            {"params": no_decay_p, "weight_decay": 0.0},          # no_decay 组：恒 0.0
-        ]
-        return cls(
-            param_groups=param_groups,
-            device_mesh=device_mesh,
-            is_peft=is_peft,
-        )
-
-
-# hyper_models/components/models/common/param_utils.py
-def _is_no_decay(name: str) -> bool:
-    """判定参数是否应归入 no_decay 组（常规规则：bias 与 1D norm 权重不衰减）。
-
-    被 OptimizerInit.from_distributed_setup 与 AdamWConfig.build 复用（第六轮 P1 修复：
-    此前调用点存在但函数未定义）。匹配 "bias"、层归一化权重（weight 且 ndim<=1 或名字含
-    "norm"/"ln"/"layernorm"）等常见模式。
-    """
-    if name.endswith("bias"):
-        return True
-    if "norm" in name.lower() or "ln" in name.lower() or "layernorm" in name.lower():
-        return True
-    return False
-
-
-# hyper_models/components/logging/wandb.py
-
-class WandbConfig:
-    @classmethod
-    def from_kwargs(cls, **kwargs) -> "WandbConfig | None":
-        """从关键字参数创建 WandbConfig 实例。"""
-        ...
-```
+| `if model_type == "llama": model = LlamaForCausalLM(config)` | YAML `_target_` 声明类型，`resolve_component()` 自动校验 |
+| `if optim == "adamw": opt = AdamW(params, **kwargs)` | `--optimizer.lr=0.0003` typed CLI override |
+| `register_spec("qwen3_5", ModelSpec(...))` | YAML `model:` 段 `_target_: hyper_parallel.trainer.config.ModelConfig`，模型选择走 `ModelConfig.name` + registry |
+| 新增模型需要修改 Recipe 代码 | 新增模型只需新增 YAML 配置文件 + `MODEL_ARCH_MAPPING` 条目 |
+| 新增组件需要注册 + if/else 分支 | 新增组件继承类别基类 + YAML 中声明 `_target_`，不需要修改 `TrainerConfig` |
+| 配置拼写错误静默使用默认值 | 未知字段、未选择组件、错误类型**立即报错**，含完整字段路径 |
+| 类型错误在运行时暴露 | 所有类型校验在 `parse_training_args()` 阶段完成 |
 
 ---
 
-## 3. RecipeConfig 类型化桥接
+## 3. 配置解析后的组件构建
 
-### 3.1 设计动机
+> **实现状态**：当前 `AdamW`、`CosineWithWarmup` 和 `CausalLMLoss` 提供 typed Config、组件类别和 `build()` 协议。
+> 它们**尚未接入**现有 Trainer 的 optimizer、scheduler 和 loss 构建流程（后续迁移完成）。
+> `RecipeConfig` 桥接层**未在代码中实现**——因为 `parse_training_args()` 直接返回强类型 `TrainerConfig`，不需要桥接。
 
-ConfigNode 是"弱类型"的——任何 YAML key 都会被接受，且所有值在加载时已解析完成（eager resolution）。但 Recipe 需要**类型安全**：optimizer 的 `lr` 必须是 float，scheduler 的 `warmup_steps` 必须是 int。
+### 3.1 Configurable.build() 协议
 
-`RecipeConfig` 是两者之间的桥接层：
-
-```
-YAML ConfigNode（弱类型）  →  RecipeConfig（类型化）  →  Recipe.setup()
-     "_target_" 已解析              typed 属性                    .build() / .instantiate()
-     任意 key 可访问                类型校验 + 默认值              运行时依赖注入
-```
-
-### 3.2 两个关键工具函数
+`Configurable.Config.build()` 用于从 Config 对象构造运行时组件实例：
 
 ```python
-# recipes/_typed_config.py
+# Configurable.Config 提供的基础 build()
 
-def _section_kwargs(node: Any) -> dict[str, Any]:
-    """提取 config 字段（丢弃 _target_）。
+def build(self, **kwargs) -> "Configurable":
+    """构造 Configurable 子类实例。
 
-    用于**固定类型**的组件（lr_scheduler, step_scheduler, checkpoint 等）。
-    这些组件的类型不需要多态，只需要提取 YAML 中的配置值。
+    使用 Config._owner 找到外层类，dataclasses.replace 复制配置后传入。
+    **kwargs 允许传入不存储在 Config 中的运行时参数（如 model、device_mesh 等）。
     """
-    d = node.to_dict() if hasattr(node, "to_dict") else dict(node)
-    d.pop("_target_", None)  # to_dict() 已排除 _target_，此处为幂等安全调用
-    return d
-
-
-def _callable_and_kwargs(cfg: Any) -> tuple[Callable, dict]:
-    """从 ConfigNode 中提取 _target_ factory + 剩余 kwargs。
-
-    用于**多态类型**的组件（optimizer, loss_fn 等）。
-    这些组件通过 _target_ 支持任意类型。
-
-    支持的 cfg 形态：
-    - ConfigNode（有 to_dict） → pop _target_
-    - 普通对象 → getattr _target_
-    - 直接 callable → (cfg, {})
-    """
-    if hasattr(cfg, "to_dict") or isinstance(cfg, Mapping):
-        cfg_dict = _as_dict(cfg)
-        target = cfg_dict.pop("_target_", None)
-        if target is not None:
-            return target, cfg_dict
-    target = getattr(cfg, "_target_", None)
-    if target is not None:
-        return target, {}
-    if callable(cfg):
-        return cfg, {}
-    if hasattr(cfg, "instantiate"):
-        return cfg.instantiate, {}
-    raise AttributeError(
-        "Config must provide _target_, be callable, or provide instantiate()"
-    )
+    owner_cls = self._owner
+    built_config = replace(self)
+    if not kwargs:
+        return _build_from_config(owner_cls, built_config)
+    # 校验 kwargs 不与 config 字段名冲突
+    ...
+    return _build_from_config(owner_cls, built_config, **kwargs)
 ```
 
-### 3.3 RecipeConfig 完整实现
+**Config 绑定校验（`__init_subclass__`）**：`Configurable.__init_subclass__` 在子类定义嵌套 `Config` 时自动绑定 `Config._owner`，并做严格校验：
 
-> **Canonical 声明（裁决）**：本节为 `RecipeConfig` 的**唯一 canonical 定义**。
-> 03_training_loop.md §5.2 与 04_checkpoint.md §9 中的 `RecipeConfig` 展示均为
-> 本节的引用/节选；三处如有不一致，**以本节为准**。
+- 嵌套 `Config` 必须是 `Configurable.Config` 的子类，否则抛 `TypeError`
+- 若该 `Config` 已被其他 owner 绑定（别名复用，如 `Config = AdamW.Config`），拒绝重绑定并抛 `TypeError`——应**子类化** Config 而非起别名
+
+### 3.2 为什么需要 `.build()` 分开配置与构造
+
+以优化器为例，参数分组（decay / no_decay）依赖运行时的 `model.parameters()` 迭代器，无法在 YAML 解析阶段确定：
 
 ```python
-# recipes/_typed_config.py
-
-class RecipeConfig:
-    """将 YAML ConfigNode 桥接到强类型配置 Dataclass。
-
-    两类属性：
-    - typed（cached_property，返回类型化 Config 实例，拥有 .build() 方法）:
-      optimizer, lr_scheduler, step_scheduler, loss_fn, checkpoint, wandb, mlflow
-    - untyped（__getattr__ 透传原始 ConfigNode，拥有 .instantiate() 方法）:
-      model, dataset, dataloader, peft, packed_sequence 等
-    """
-
-    def __init__(self, raw: ConfigNode):
-        self._raw = raw
-
-    # ═══════════════════════════════════════════
-    # typed 属性：_target_ 提取 + 类型校验 → 返回类型化 Config
-    # ═══════════════════════════════════════════
-
-    @cached_property
-    def optimizer(self) -> "OptimizerConfig | None":
-        """optimizer: 多态类型（通过 _target_ 支持任意优化器）。
-
-        YAML 示例:
-            optimizer:
-              _target_: torch.optim.AdamW
-              lr: 2.0e-4
-              weight_decay: 0.1
-        """
-        from hyper_models.components.optim.optimizer import build_optimizer_config
-
-        node = self._raw.get("optimizer", None)
-        if node is None:
-            return None
-        factory, kwargs = _callable_and_kwargs(node)
-        # build_optimizer_config 将 factory（如 torch.optim.AdamW）+ kwargs
-        # 归一化为 OptimizerConfig 子类实例（AdamWConfig / OptimizerFromFactoryConfig）
-        return build_optimizer_config(factory, kwargs)
-
-    @cached_property
-    def lr_scheduler(self) -> "LRSchedulerConfig | None":
-        """lr_scheduler: 固定类型（LRSchedulerConfig）。
-
-        YAML 示例:
-            lr_scheduler:
-              lr_warmup_steps: 100
-              lr_decay_style: cosine
-              min_lr: 1.0e-6
-        """
-        node = self._raw.get("lr_scheduler", None)
-        return LRSchedulerConfig(**_section_kwargs(node)) if node else None
-
-    @cached_property
-    def step_scheduler(self) -> "StepSchedulerConfig":
-        """step_scheduler: 固定类型（StepSchedulerConfig）。
-
-        过滤掉运行时参数（local_batch_size, dp_size, dataloader），
-        这些由 .build() 的调用者传入。
-        """
-        node = self._raw.get("step_scheduler", None)
-        if node is None:
-            return StepSchedulerConfig()
-        kwargs = {
-            k: v for k, v in _section_kwargs(node).items()
-            if k not in ("local_batch_size", "dp_size", "dataloader")
-        }
-        return StepSchedulerConfig(**kwargs)
-
-    @cached_property
-    def loss_fn(self) -> "LossConfig | None":
-        """loss_fn: 多态类型（通过 _target_ 支持任意 loss 函数）。
-
-        YAML 示例:
-            loss_fn:
-              _target_: hyper_models.components.loss.masked_ce.MaskedCrossEntropy
-        """
-        from hyper_models.components.loss import build_loss_config
-
-        node = self._raw.get("loss_fn", None)
-        if node is None:
-            return None
-        factory, kwargs = _callable_and_kwargs(node)
-        return build_loss_config(factory, **kwargs)
-
-    @cached_property
-    def checkpoint(self) -> "CheckpointingConfig":
-        """checkpoint: 固定类型（CheckpointingConfig）。
-
-        模型派生字段（model_repo_id, model_cache_dir, is_peft）在此注入。
-        """
-        from hyper_models.components.checkpoint.config import CheckpointingConfig
-
-        node = self._raw.get("checkpoint", None)
-        kwargs = _as_dict(node) if node is not None else {}
-        kwargs.pop("restore_from", None)  # 由 Recipe 单独处理
-        model = self._raw.get("model", None)
-        kwargs |= {  # dict union (|=) 需要 Python 3.9+
-            "model_repo_id": _model_name_from_cfg(model) if model is not None else None,
-            # 自 04 §9 版并入 canonical：从 model 段派生缓存目录
-            "model_cache_dir": self._raw.get("model.cache_dir", None),
-            "is_peft": bool(self._raw.get("peft", None)),
-        }
-        return CheckpointingConfig(**kwargs)
-
-    @cached_property
-    def wandb(self) -> "WandbConfig | None":
-        node = self._raw.get("wandb", None)
-        return WandbConfig.from_kwargs(**_section_kwargs(node)) if node else None
-
-    # ═══════════════════════════════════════════
-    # untyped 属性：透传原始 ConfigNode
-    # ═══════════════════════════════════════════
-
-    def __getattr__(self, name: str) -> Any:
-        """所有未显式定义的属性透传到原始 ConfigNode。
-
-        这意味着 cfg.model / cfg.dataset / cfg.dataloader / cfg.peft
-        都返回原始 ConfigNode（其 _target_ 已解析为 callable）。
-        """
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return getattr(self._raw, name)
-
-    def __contains__(self, key: object) -> bool:
-        # ★ ConfigNode 不可迭代，不能直接 `key in self._raw`；改用 to_dict() 取键集。
-        return key in self._raw.to_dict()
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """点号路径访问，直接透传 `ConfigNode.get`（§2.7）。
-
-        `self._raw` 是 01 §2 的自研 **ConfigNode**（不是 OmegaConf）；
-        ConfigNode.get 原生支持点号路径（如 "step_scheduler.local_batch_size"），
-        未命中返回 default。
-        """
-        return self._raw.get(key, default)
-
-    def to_dict(self) -> dict:
-        return self._raw.to_dict()
+# 典型 build() 实现（规划中，当前未接入 Trainer）
+class AdamW(Optimizer):
+    def __init__(self, config: AdamW.Config, model=None):
+        self.config = config
+        if model is not None:
+            # 参数分组 → 创建真正的 torch.optim.AdamW
+            ...
 ```
 
-### 3.4 为什么需要 `.build()` 而非直接 `.instantiate()`？
+**`.build()` 与直接构造的关系**：
 
-**`cfg.optimizer` 返回的是 `OptimizerConfig` 实例——一个类型化的配置 dataclass，不是 `torch.optim.Optimizer`。**
+| | YAML 解析阶段（`resolve_component`） | 运行时构造阶段（`build()`） |
+|---|---|---|
+| 做什么 | Config 对象（纯数据） | 真正的运行时对象（torch.optim.Optimizer 等） |
+| 何时 | `parse_training_args()` 内 | `Recipe.setup()` 内 |
+| 依赖 | 只有 YAML 中的静态值 | 需要 model、device_mesh 等运行时对象 |
+| 典型产物 | `AdamW.Config(lr=0.0001, ...)` | `torch.optim.AdamW(param_groups, lr=0.0001)` |
+
+---
+
+### 3.3 Configurable 辅助功能
+
+#### `replace()` — 不可变更新
 
 ```python
-# cfg.optimizer → OptimizerConfig(lr=0.0001, betas=(0.9, 0.95), weight_decay=0.01)
-# 这只是一个配置对象！不能用于训练。
+cfg = AdamW.Config(lr=0.0001, weight_decay=0.1)
+cfg2 = cfg.replace(lr=0.001)  # AdamW.Config(lr=0.001, weight_decay=0.1)
+# cfg 不变
 ```
 
-**`cfg.optimizer.build(model)` 才创建真正的优化器。** 它内部做了四件事：
+#### `to_dict()` — 序列化
+
+递归将 Config 树转为 JSON 友好的 dict，跳过 `_` 前缀字段。callable 字段用 `repr()` 转换。
+
+#### `traverse()` — 递归遍历
 
 ```python
-class AdamWConfig(OptimizerConfig):
-    lr: float = 1e-3
-    betas: tuple = (0.9, 0.999)
-    weight_decay: float = 0.1
-
-    def build(self, model, *, optimizer_init=None, device_mesh=None, is_peft=False):
-        """OptimizerConfig → list[torch.optim.Optimizer]
-
-        ① 遍历 model 参数 → 分组（decay / no_decay）
-        ② 处理 model.parts（PP 模式下返回多个优化器）
-        ③ 用分好的 param_groups + 存储的 kwargs 创建优化器
-        ④ 返回 list[Optimizer]（每 part 一个）
-        """
-        parts = getattr(model, "parts", [model])
-        optimizers = []
-        for part in parts:
-            # ★ 参数分组——这是 .instantiate() 做不到的
-            decay_p, no_decay_p = [], []
-            for name, param in part.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if _is_no_decay(name):
-                    no_decay_p.append(param)
-                else:
-                    decay_p.append(param)
-            param_groups = [
-                {"params": decay_p, "weight_decay": self.weight_decay},
-                {"params": no_decay_p, "weight_decay": 0.0},
-            ]
-            # ★ 现在才能创建优化器——param_groups 依赖运行时 model 对象
-            optimizers.append(torch.optim.AdamW(
-                param_groups, lr=self.lr, betas=self.betas
-            ))
-        return optimizers
+# 遍历配置树中所有特定类型的 Config 节点
+for fqn, config, parent, field_name in root_config.traverse(SomeConfig):
+    print(f"Found {fqn}: {config}")
 ```
 
-**`.instantiate()` 和 `.build()` 的根本区别**：
-
-| | `.instantiate()` | `.build()` |
-|------|---------|---------|
-| 中间层 | **无**——ConfigNode 就是构造参数 | **有**——Typed Config（`OptimizerConfig` 等） |
-| YAML → 构造参数 | 1:1 映射：`{path: "x"}` → `load_dataset(path="x")` | 需要 **transform**：`{lr: 2e-4}` → 先分组参数 → `AdamW(param_groups, lr=2e-4)` |
-| 构造参数能否提前确定 | ✅ `tokenizer`、`sampler` 等可以通过 runtime kwargs 传入 | ❌ `model.parameters()` 迭代器无法作为 kwarg 传递 |
-| 典型场景 | `load_dataset(path=..., tokenizer=t)` | `AdamW(param_groups, lr=...)` 其中 `param_groups` 是 live 对象 |
-
-**简单说：`.instantiate()` 做的是"把 YAML 的 key-value 原样传给构造函数"；`.build()` 做的是"把 YAML 的 key-value 先转换成构造函数能接受的形态，再传进去"。** 参数分组是这个转换的典型例子。
-
-### 3.5 类型化 Config 的 `.build()` 调用一览
-
-```python
-# Recipe.setup() 中的使用
-
-# optimizer: OptimizerConfig → .build(model) → list[Optimizer]
-#   内部：遍历 model 参数 → decay/no_decay 分组 → 创建优化器
-self.optimizer = self.cfg.optimizer.build(
-    model, device_mesh=self.mesh.device_mesh
-)
-
-# lr_scheduler: LRSchedulerConfig → .build(optimizer, step_scheduler) → OptimizerParamScheduler
-#   内部：从 step_scheduler 推断默认步数 → 创建调度器
-self.lr_scheduler = self.cfg.lr_scheduler.build(
-    self.optimizer, self.step_scheduler
-)
-
-# loss_fn: LossConfig → .build() → nn.Module
-#   内部：用 _target_ factory + kwargs 实例化 loss 模块
-self.loss_fn = self.cfg.loss_fn.build()
-
-# checkpoint: CheckpointingConfig → .build(dp_rank, ...) → Checkpointer
-#   内部：创建 Checkpointer 实例，初始化 StorageWriter/Reader
-self.checkpointer = self.cfg.checkpoint.build(
-    dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank
-)
-
-# step_scheduler: StepSchedulerConfig → .build(dataloader, dp_size, local_bs) → StepScheduler
-self.step_scheduler = self.cfg.step_scheduler.build(
-    self.dataloader, dp_size, local_batch_size
-)
-```
+支持在遍历中替换节点：`setattr(parent, field_name, new_cfg)` 或 `parent[index] = new_cfg`。
 
 ---
 
 ## 4. 总入口调用时序：从 `main()` 到所有组件就绪
 
-下面从 `main()` 开始，逐层展开每一个函数调用，直到模型加载完成、优化器就绪。数字序号表示调用顺序，缩进表示调用深度。
+> **实现状态**：当前已实现的仅为配置解析阶段（步骤① `parse_training_args()`）。
+> ③ `recipe.setup(cfg)` 及之后的模型构建、优化器构建、数据加载等编排流程
+> 仍为**规划中的目标调用链**，尚未在代码中落地。
+>
+> 当前 `train_lm.py` 和 `train_vl.py` 继续使用原有 `parse_args(HyperTrainerConfig)` 流程，
+> 模型节点继续复用现有 `hyper_parallel.trainer.config.ModelConfig` 和 `ModelSpec` registry。
+
+下面从 `main()` 开始，逐层展开每一个函数调用。数字序号表示调用顺序，缩进表示调用深度。
+**粗体 = 已实现**，普通文本 = 规划中。
 
 ### 4.1 总体调用链
 
 ```
 main()                                          # recipes/llm/train_ft.py
 │
-├─① cfg = parse_args_and_load_config()
-│   └─ load_yaml_config("train.yaml")           # §2.2
-│       └─ yaml.safe_load() → raw dict
-│       └─ ConfigNode(raw)                      # §2.3: 递归 _wrap()，即时解析所有 _target_ 和 *_fn
-│           ├─ _wrap("model", {...}) → ConfigNode({_target_: <bound method from_pretrained>, ...})
-│           ├─ _wrap("optimizer", {...}) → ConfigNode({_target_: <class AdamW>, lr: 0.0001, ...})
-│           ├─ _wrap("dataset", {...}) → ConfigNode({_target_: <function load_dataset>, ...})
-│           │   └─ _wrap("tokenizer", {...}) → ConfigNode({_target_: <bound method from_pretrained>, ...})
-│           └─ ...所有 _target_ 和 *_fn 已解析为 callable
+├─① **cfg = parse_training_args()**                               # **§2.2: 已实现**
+│   │   **argparse → 分离 config_file 和 --field=value overrides**
+│   └─ **_load_training_config(config_file, overrides)**
+│       ├─ **yaml.safe_load() → raw dict**
+│       ├─ **resolve_root(raw)**                                  # **§2.4: 已实现**
+│       │   ├─ **校验 TrainerConfig 一级字段（拒绝未知字段）**
+│       │   ├─ **$.model → resolve_component() → ModelConfig(name=..., ...)**
+│       │   ├─ **$.training → resolve_component() → TrainingConfig(max_steps=100, ...)**
+│       │   ├─ **$.accelerator → resolve_component() → AcceleratorConfig(tp_size=2, ...)**
+│       │   ├─ **$.optimizer → resolve_component() → AdamW.Config(lr=0.0001, ...)**
+│       │   ├─ **$.lr_scheduler → resolve_component() → CosineWithWarmup.Config(...)**
+│       │   ├─ **$.loss → resolve_component() → CausalLMLoss.Config(...)**
+│       │   └─ **→ TrainerConfig(**resolved)**                   # **强类型配置树就绪**
+│       │
+│       └─ **_apply_typed_overrides(config, overrides)**          # **§2.5: 已实现**
+│           ├─ **--training.max_steps=200 → replace(TrainingConfig, max_steps=200)**
+│           └─ **--accelerator.tp_size=4 → replace(AcceleratorConfig, tp_size=4)**
 │
-├─② cfg = RecipeConfig(cfg)                     # §3: 类型化桥接
-│   ├─ cfg.optimizer → OptimizerConfig(lr=0.0001, betas=(0.9,0.95), ...)  # _callable_and_kwargs → build_optimizer_config
-│   ├─ cfg.lr_scheduler → LRSchedulerConfig(lr_warmup_steps=100, ...)      # _section_kwargs → LRSchedulerConfig(**kwargs)
-│   ├─ cfg.step_scheduler → StepSchedulerConfig(ckpt_every_steps=500, ...) # _section_kwargs → StepSchedulerConfig(**kwargs)
-│   ├─ cfg.loss_fn → LossConfig(factory=<class MaskedCrossEntropy>, ...)   # _callable_and_kwargs → build_loss_config
-│   ├─ cfg.checkpoint → CheckpointingConfig(checkpoint_dir="outputs/", ...) # direct construction
-│   └─ cfg.model / cfg.dataset / cfg.dataloader / cfg.peft → 保留为 ConfigNode（__getattr__ 透传）
+│   最终 cfg: TrainerConfig = TrainerConfig(
+│       model = ModelConfig(name="qwen3_5", weights_path="/path/to/weights"),
+│       training = TrainingConfig(max_steps=200, global_batch_size=8),
+│       accelerator = AcceleratorConfig(tp_size=4, dp_shard_size=4),
+│       optimizer = AdamW.Config(lr=0.0001, weight_decay=0.1),
+│       lr_scheduler = CosineWithWarmup.Config(warmup_ratio=0.05),
+│       loss = CausalLMLoss.Config(ignore_index=-100),
+│   )
 │
-├─③ recipe = FinetuneRecipe()
+├─② recipe = FinetuneRecipe()                                    # 规划中
 │
-├─④ recipe.setup(cfg)                           # §4.2: 构建所有训练组件
+├─③ recipe.setup(cfg)                                            # 规划中: 构建所有训练组件
 │   │
-│   ├─④.1 initialize_distributed("nccl")                          # 初始化 torch.distributed 进程组 + CUDA device
-│   ├─④.2 self.rng = StatefulRNG(seed=cfg.get("seed", 42), ranked=True)
-│   ├─④.3 self.distributed_setup = create_distributed_setup_from_config(cfg)  # 从 cfg 构建分布式拓扑 → 06_distributed_infrastructure.md §3
+│   ├─③.1 initialize_distributed("nccl")                          # 初始化 torch.distributed 进程组 + CUDA device
+│   ├─③.2 self.rng = StatefulRNG(seed=cfg.training.seed, ranked=True)         # 规划中：seed 待加入 TrainingConfig
+│   ├─③.3 self.distributed_setup = create_distributed_setup_from_config(cfg)  # 从 cfg 构建分布式拓扑 → 06_distributed_infrastructure.md §3
 │   │
-│   ├─④.3a self.callback_manager = build_callback_manager(                     # 03 §4.2: 混合 Callback 系统——注册 CheckpointCallback、
-│   │       cfg, ...)                                                           # EvaluateCallback、LoggingCallback、TqdmCallback 等内置 callback
+│   ├─③.3a self.callback_manager = build_callback_manager(cfg, ...)           # 03 §4.2: 混合 Callback 系统
 │   │
-│   ├─④.4 self.peft_config = cfg.peft.instantiate() if cfg.get("peft") else None  # ★ PEFT 先实例化
-│   │   self.model, self.optimizer_init = build_model(          # §2.14 / §4.2: Recipe 内部编排入口，返回 (model, optimizer_init)
-│   │       cfg.model,                                          # 与 03 §5.3 ⑪ / §4.2 口径一致（canonical：build_model）
-│   │       peft_config=self.peft_config,
+│   ├─③.4 self.model, self.optimizer_init = build_model(cfg.model, peft_config, ...)  # §6.7: Recipe 编排入口（peft_config 规划中：由 YAML peft 段解析后传入）
+│   │   self.model, self.optimizer_init = build_model(                        # Recipe 内部编排入口（§6.7）
+│   │       cfg.model, peft_config=self.peft_config,
 │   │       distributed_setup=self.distributed_setup)
 │   │   │
-│   │   ├─ build_model 内部①: model = cfg.model.instantiate(    # cfg.model 是 ConfigNode（__getattr__ 透传）
-│   │   │       distributed_setup=distributed_setup,
-│   │   │       peft_config=peft_config)
-│   │   │                                                       # _target_ = <bound method HyperAutoModelForCausalLM.from_pretrained>
-│   │   │
-│   │   └─ HyperAutoModelForCausalLM.from_pretrained(        # §6.2
+│   │   └─ HyperAutoModelForCausalLM.from_pretrained(          # §6.2
 │   │           pretrained_model_name_or_path="Qwen/Qwen3.5-0.8B",
 │   │           torch_dtype="bfloat16",
 │   │           distributed_setup=<DistributedSetup>,
 │   │           peft_config=<PeftConfig | None>)
 │   │       │
-│   │       ├─④.4.1 mesh = distributed_setup.mesh_context                    # 解析分布式拓扑
-│   │       │
-│   │       ├─④.4.2 sharding_planner, fsdp2_manager, autopipeline           # §8
-│   │       │       = instantiate_infrastructure(
-│   │       │             distributed_setup=distributed_setup,
-│   │       │             device=torch.device("cuda", current_device))
-│   │       │   ├─ ShardingPlanner()                                         # hyper_parallel 核心 (05_dual_mode_dtensor §1)
-│   │       │   ├─ FSDP2Manager(config, mesh)   if strategy                  # DP 维度 (06_distributed_infrastructure.md §4)，2 参 MeshContext
-│   │       │   └─ AutoPipeline(pipeline_config, mesh)     if pp_size > 1    # PP 维度 (本文档 §8.2)
-│   │       │
-│   │       ├─④.4.3 hf_config = AutoConfig.from_pretrained(                 # 获取 HF 配置
-│   │       │       pretrained_model_name_or_path,
-│   │       │       attn_implementation="sdpa",
-│   │       │       torch_dtype="bfloat16")
-│   │       │
-│   │       ├─④.4.4 is_hf_model = get_is_hf_model(hf_config)                # §5: 查 MODEL_ARCH_MAPPING
-│   │       │   ├─ arch_name = hf_config.architectures[0]                   # e.g. "Qwen3_5ForCausalLM"
-│   │       │   └─ _resolve_custom_model_cls(arch_name)                     # 懒加载 import
-│   │       │       ├─ 命中 → 返回自定义模型类 → is_hf_model=False
-│   │       │       └─ 未命中 → None → is_hf_model=True
-│   │       │
-│   │       └─④.4.5 model = _build_model(                                   # §6.3: 核心编排
-│   │               pretrained_model_name_or_path,
-│   │               is_hf_model=False,       # 假设自定义模型
-│   │               hf_config=hf_config,
-│   │               mesh=mesh,
-│   │               sharding_planner=sharding_planner,
-│   │               fsdp2_manager=fsdp2_manager,
-│   │               torch_dtype=torch_dtype,
-│   │               validate_placement=False,
-│   │               load_base_model=True)
-│   │           │
-│   │           ├─④.4.5.1 is_meta_device = (world_size > 1 or not is_hf_model)  # 确定 meta device
-│   │           │       init_ctx = (no_init_weights(), init_empty_weights())
-│   │           │
-│   │           ├─④.4.5.2 with init_ctx:                                        # §7: 模型实例化
-│   │           │       is_custom_model, model = _init_model(
-│   │           │           cls=HyperAutoModelForCausalLM,
-│   │           │           pretrained_model_name_or_path,
-│   │           │           hf_config, attn_implementation,
-│   │           │           torch_dtype, is_hf_model=False)
-│   │           │   ├─ arch_name = "Qwen3_5ForCausalLM"
-│   │           │   ├─ model_cls = _resolve_custom_model_cls(arch_name)        # §5: MODEL_ARCH_MAPPING 懒加载
-│   │           │   │   → importlib.import_module("...qwen3_5.model")
-│   │           │   │   → Qwen3_5ForCausalLM
-│   │           │   └─ model = Qwen3_5ForCausalLM(hf_config)                   # meta device 空壳
-│   │           │       → 模型结构完整，参数为 meta tensor (零显存)
-│   │           │
-│   │           ├─④.4.5.3 _apply_peft(model, peft_config)         if peft_config    # LoRA 层注入 (§6.4)
-│   │           ├─④.4.5.4 _apply_qat(model, qat_config)           if qat_config
-│   │           ├─④.4.5.5 _apply_fp8(model, fp8_config)           if fp8_config
-│   │           ├─④.4.5.6 _apply_parameter_freezing(model, freeze_config)            # 参数冻结 (§6.5)
-│   │           │
-│   │           ├─④.4.5.7 plan = sharding_planner.plan(model, mesh.device_mesh, ...)  # §9: 推导分片策略 → 05_dual_mode_dtensor §5
-│   │           │   ├─ ParameterClassifier.classify(model)                             # ParamRole 分类 (05 §3.6.2)
-│   │           │   ├─ BoundaryGrouper.group(model)                                    # 模块边界分组
-│   │           │   ├─ TemplateLookup.lookup(roles, boundary_types)                    # 查 ShardingTemplate (05 §3.5)
-│   │           │   ├─ ChainPropagator.propagate(specs)                                # 链式传播校验 (05 §3.6.5)
-│   │           │   └─ → ShardingPlan(module_specs={...})                              # 可序列化中间表示 (05 §3)
-│   │           │
-│   │           ├─④.4.5.8 apply_sharding_plan(model, plan, mesh.device_mesh, validate_mode=False)  # 应用分片 → 05_dual_mode_dtensor §6
-│   │           │   ├─ 生产模式: _local_params_context → 用 DTensor._local_tensor 替换参数
-│   │           │   │   → PrecompiledBoundary 预编译通信原语 → 零运行时 dispatch 开销 (05 §7)
-│   │           │   │   └─ _local_params_context: DTensor._local_tensor → 零拷贝 (06 §5)
-│   │           │   ├─ build_tp_grad_info(plan, tp_mesh) → tp_grad_info（从 ShardingPlan 导出，非 DTensor placement）
-│   │           │   └─ 校验模式: DTensor 传播 → assert placements 一致 (05 §8)
-│   │           │
-│   │           ├─④.4.5.9 torch.compile(model, **compile_config)   if compile_config  # Inductor 编译（fully_shard 之前）
-│   │           │
-│   │           ├─④.4.5.10 fsdp2_manager.parallelize(model, tp_grad_info=tp_grad_info)  if fsdp2  # FSDP2 在 meta 上包裹（canonical：先于 to_empty/load）
-│   │           │
-│   │           ├─④.4.5.11 load_base_model(model, device, pretrained_path,            # canonical：④.4.5.11 = load_base_model（以衔接表为准）
-│   │           │         │  adapter=_get_state_dict_adapter(model),                  # §10.3: 每 rank 独立加载权重 (04_checkpoint.md §5.3, 5 参 canonical 签名)
-│   │           │         │  mesh=mesh.device_mesh)                                   # ★ DeviceMesh：按 TP/DP 读本地份，零 NCCL
-│   │           │         └─ 前置动作（同属 ④.4.5.11 一步）：model.to_empty(device=device)   # meta → GPU（物化 sharded 参数），load_base_model 写入前必须先物化
-│   │           │
-│   │           ├─④.4.5.12 _freeze_non_lora_params(model)              if peft_config   # PEFT 非 LoRA 参数冻结 (§6.4)
-│   │           └─ return model                                         # 已分片、权重已加载
-│   │   ← build_model 内部②: optimizer_init = OptimizerInit.from_distributed_setup(...)  # 导出 param 分组/mesh
-│   │   ← build_model 返回 (model, optimizer_init)                      # → self.model, self.optimizer_init
+│   │       ├─③.4.1 mesh = distributed_setup.mesh_context
+│   │       ├─③.4.2 sharding_planner, fsdp2_manager, autopipeline           # §8
+│   │       │       = instantiate_infrastructure(...)
+│   │       ├─③.4.3 hf_config = AutoConfig.from_pretrained(...)
+│   │       ├─③.4.4 is_hf_model = get_is_hf_model(hf_config)                # §5: MODEL_ARCH_MAPPING
+│   │       └─③.4.5 model = _build_model(...)                               # §6.3: meta→shard→load
+│   │           ├─③.4.5.1 is_meta_device = (world_size > 1 or not is_hf_model)  # 确定 meta device
+│   │           ├─③.4.5.2 with init_ctx: model = _init_model(...)             # §7: meta device 空壳模型（零显存）
+│   │           ├─③.4.5.3 _apply_peft(model, peft_config)        if peft_config   # LoRA 层注入 (§6.4)
+│   │           ├─③.4.5.4 _apply_qat(model, qat_config)          if qat_config
+│   │           ├─③.4.5.5 _apply_fp8(model, fp8_config)          if fp8_config
+│   │           ├─③.4.5.6 _apply_parameter_freezing(model, freeze_config)         # 参数冻结 (§6.5)
+│   │           ├─③.4.5.7 plan = sharding_planner.plan(model, mesh.device_mesh, ...)  # §9 → 05 §3.6
+│   │           ├─③.4.5.8 apply_sharding_plan(model, plan, mesh.device_mesh, ...)     # DTensor 分片应用 → 05 §4
+│   │           ├─③.4.5.9 torch.compile(model, **compile_config) if compile_config    # fully_shard 之前
+│   │           ├─③.4.5.10 fsdp2_manager.parallelize(model, ...) if fsdp2             # FSDP2 在 meta 上包裹（canonical：先于 to_empty/load）
+│   │           ├─③.4.5.11 load_base_model(model, device, pretrained_path, adapter=..., mesh=...)
+│   │           │       └─ 前置动作（同属本步）：model.to_empty(device=device)  # meta → GPU 物化，load 前必须先物化
+│   │           ├─③.4.5.12 _freeze_non_lora_params(model)        if peft_config   # PEFT 非 LoRA 参数冻结 (§6.4)
+│   │           └─ return model                                # 已分片、权重已加载
+│   │   ← build_model 内部②: optimizer_init = OptimizerInit.from_distributed_setup(...)  # §6.7: 导出 param 分组/mesh
+│   │   ← build_model 返回 (model, optimizer_init)
 │   │
-│   ├─④.5 self.loss_fn = cfg.loss_fn.build()                                          # typed: LossConfig → nn.Module
-│   │   └─ 详见 03_training_loop.md §10
-│   │
-│   ├─④.6 self.peft_config 已在 ④.4 之前实例化并注入 model（见 ④.4）                 # PEFT 在分片之前注入
-│   │
-│   ├─④.7 self.checkpointer = cfg.checkpoint.build(dp_rank=..., tp_rank=..., ...)     # typed: CheckpointingConfig → Checkpointer
-│   │   └─ 详见 04_checkpoint.md §4/§5
-│   │
-│   ├─④.8 self.optimizer = cfg.optimizer.build(model, device_mesh=...)                # typed: OptimizerConfig → list[Optimizer]
-│   │   ├─ decay/no_decay 参数分组
-│   │   ├─ 遍历 model.parts (PP 模式下多 part)
-│   │   └─ AdamW(param_groups, lr=2e-4, betas=(0.9,0.95), ...)
-│   │
-│   ├─④.9 self.dataloader, self.tokenizer = build_dataloader(                         # untyped: → DataLoader + Tokenizer
-│   │       cfg.dataset, cfg.dataloader, cfg.model, ...)
-│   │   ├─ _build_tokenizer(cfg_model, cfg_ds)
-│   │   │   └─ cfg.dataset.tokenizer.instantiate(trust_remote_code=True)
-│   │   │       → AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
-│   │   ├─ cfg.dataset.instantiate()                                    # ★ 不传 tokenizer：load_dataset 签名无此参数
-│   │   │   → load_dataset(path="HuggingFaceFW/fineweb", split="train", streaming=True)
-│   │   │     （tokenizer kwarg 被 02 §4.2 signature 守卫剔除；tokenizer 由 build_dataloader
-│   │   │       单独返回，供 map/tokenize 步骤使用）
-│   │   ├─ StatefulDistributedSampler(dataset, seed=..., ...)
-│   │   └─ StatefulDataLoader(**dl_kwargs, **dl_base_kwargs)   # 02 §3.2 Step 10 直接构造：
-│   │       dataset/sampler/collate_fn 由前序步骤注入 dl_kwargs，
-│   │       cfg.dataloader 仅提供 num_workers/pin_memory 等通用参数（_target_ 仅作过滤键）
-│   │
-│   ├─④.10 self.val_dataloaders = build_validation_dataloader(cfg, ...)
-│   │
-│   ├─④.11 self.step_scheduler = cfg.step_scheduler.build(                             # typed: StepSchedulerConfig → StepScheduler
-│   │        self.dataloader, dp_size, local_batch_size)
-│   │   └─ 详见 03_training_loop.md §4
-│   │
-│   ├─④.12 self.lr_scheduler = cfg.lr_scheduler.build(                                 # typed: LRSchedulerConfig → OptimizerParamScheduler
-│   │        self.optimizer, self.step_scheduler)
-│   │   └─ 详见 03_training_loop.md §9.6
-│   │
-│   ├─④.13 self.load_checkpoint(cfg.get("checkpoint.restore_from", None))             # 断点续训恢复
-│   │   └─ 详见 04_checkpoint.md §8
-│   │
-│   └─④.14 self.mfu_calc = AutoMFU.from_config(self.model_parts[0])                    # MFU 计算器
+│   ├─③.5 self.loss = cfg.loss.build()                                     # Configurable.build()
+│   ├─③.6 self.checkpointer = cfg.checkpoint.build(dp_rank=..., tp_rank=...)  # 规划中：checkpoint 待加入 TrainerConfig → 04 §4/§5
+│   ├─③.7 self.optimizer = cfg.optimizer.build(model, device_mesh=...)        # Configurable.build()
+│   ├─③.8 self.dataloader, self.tokenizer = build_dataloader(cfg, ...)        # 数据加载 → 02 §3
+│   ├─③.9 self.val_dataloaders = build_validation_dataloader(cfg, ...)        # 验证集加载 → 02 §3
+│   ├─③.10 self.step_scheduler = cfg.step_scheduler.build(                    # 规划中：step_scheduler 待加入 TrainerConfig
+│   │        self.dataloader, dp_size, local_batch_size)                      # → 03 §4
+│   ├─③.11 self.lr_scheduler = cfg.lr_scheduler.build(optimizer, step_scheduler)  # Configurable.build()
+│   ├─③.12 self.load_checkpoint(...)                                          # 断点续训 → 04 §8
+│   └─③.13 self.mfu_calc = AutoMFU.from_config(self.model)                    # MFU 计算器
 │
-└─⑤ recipe.run_train_validation_loop()                                                 # 开始训练
+└─④ recipe.run_train_validation_loop()                                         # 开始训练
     └─ 详见 03_training_loop.md §6/§7/§8
 ```
 
 **关键时序要点**：
 
 > **PP 说明**：`autopipeline.build(model)`（PP stage 拆分）在 `apply_model_infrastructure()`
-> 中**最先执行**（④.4.5.3 之前，PP 未启用时无此步）——裁决以 §8.2 为准，stage 切分必须
+> 中**最先执行**（③.4.5.3 的 PEFT 注入步骤之前，PP 未启用时无此步）——裁决以 §8.2 为准，stage 切分必须
 > 先于权重加载与 FSDP2 包裹（§8.3 ① / §6.3 Step 3）。时序树中从略。
 
 | 序号 | 操作 | 关键输出 |
 |:----:|------|---------|
-| ① | YAML 加载 | ConfigNode 树（所有 `_target_` 已解析） |
-| ② | RecipeConfig 桥接 | typed config 对象就绪，类型校验完成 |
-| ④.4.2 | `instantiate_infrastructure` | ShardingPlanner(05 §3.6) + FSDP2Manager(06 §4) + AutoPipeline(01 §8.2) |
-| ④.4.4 | `get_is_hf_model` | MODEL_ARCH_MAPPING 查表 → 自定义/HF 路径判定 |
-| ④.4.5.2 | `_init_model` | meta device 空壳模型（零显存） |
-| ④.4.5.7 | `sharding_planner.plan()` | ShardingPlan（可序列化分片策略）→ 05 §5 |
-| ④.4.5.8 | `apply_sharding_plan()` | DTensor 分片应用（生产/校验双模）+ `_local_params_context` 解包 → 05 §4/§7/§8 |
-| ④.4.5.10 | `fsdp2_manager.parallelize()` | FSDP2 在 meta 上包裹（canonical：先于 to_empty/load） |
-| ④.4.5.11 | `load_base_model()`（前置 `model.to_empty()` 物化，同属本步） | 每 rank 独立加载权重（5 参 canonical，零 NCCL） |
-| ④.3a | `build_callback_manager()` | CallbackManager（含 CheckpointCallback/EvaluateCallback/LoggingCallback/TqdmCallback 等内置 callback）→ 03 §4.2 |
-| ④.8 | `cfg.optimizer.build()` | 真正的优化器（参数分组完成）→ 03 §9 |
-| ④.9 | `build_dataloader()` | DataLoader + Tokenizer → 02 §3 |
-| ④.11 | `cfg.step_scheduler.build()` | StepScheduler → 03 §4 |
-| ④.13 | `load_checkpoint()` | 恢复所有组件状态 → 04 §8 |
-| ⑤ | `run_train_validation_loop()` | 训练主循环 → 03 §6/§7/§8 |
+| ① | **YAML 加载** | **`TrainerConfig` 强类型配置树（所有 `_target_` 已解析为类型化 Config 对象）** |
+| ③.4.2 | `instantiate_infrastructure` | ShardingPlanner(05 §3.6) + FSDP2Manager(06 §4) + AutoPipeline(01 §8.2) |
+| ③.4.4 | `get_is_hf_model` | MODEL_ARCH_MAPPING 查表 → 自定义/HF 路径判定 |
+| ③.4.5.2 | `_init_model` | meta device 空壳模型（零显存） |
+| ③.4.5.7 | `sharding_planner.plan()` | ShardingPlan（可序列化分片策略）→ 05 §3.6 |
+| ③.4.5.8 | `apply_sharding_plan()` | DTensor 分片应用（生产/校验双模）+ `_local_params_context` 解包 → 05 §4/§7/§8 |
+| ③.4.5.10 | `fsdp2_manager.parallelize()` | FSDP2 在 meta 上包裹（canonical：先于 to_empty/load） |
+| ③.4.5.11 | `load_base_model()`（前置 `model.to_empty()` 物化，同属本步） | 每 rank 独立加载权重（5 参 canonical，零 NCCL） |
+| ③.3a | `build_callback_manager()` | CallbackManager（含 CheckpointCallback/EvaluateCallback/LoggingCallback/TqdmCallback 等内置 callback）→ 03 §4.2 |
+| ③.6 | `cfg.checkpoint.build()` | Checkpointer → 04 §4/§5 |
+| ③.7 | `cfg.optimizer.build()` | 真正的优化器（参数分组完成）→ 03 §9 |
+| ③.8 | `build_dataloader()` | DataLoader + Tokenizer → 02 §3 |
+| ③.10 | `cfg.step_scheduler.build()` | StepScheduler → 03 §4 |
+| ③.12 | `load_checkpoint()` | 恢复所有组件状态 → 04 §8 |
+| ④ | `run_train_validation_loop()` | 训练主循环 → 03 §6/§7/§8 |
 
-### 4.2 `setup()` 内部：每条语句的数据来源
+### 4.2 `setup()` 内部：每条语句的数据来源（规划中）
 
-以下追踪 `setup()` 中每个关键变量的**完整来源**——它来自哪个 ConfigNode、`_target_` 解析成了什么、`instantiate()` 实际调用了哪个函数：
+> **实现状态**：以下为规划中的 `setup()` 实现。当前代码中 optimizer / scheduler / loss
+> 的 `build()` 未接入 Trainer，`cfg` 为 `TrainerConfig` 强类型对象。
 
-> 编号约定：本节内部变量标记用 **m1–m9**（m = member/组件变量），与 §4.1 时序树的
-> canonical ①–⑤ 编号（①=load_yaml_config … ⑤=instantiate）区分，避免同名歧义。
+以下追踪 `setup()` 中每个关键变量的**完整来源**——它来自 `TrainerConfig` 的哪个字段、`_target_` 解析成了什么 Config 类型：
 
 ```python
 class FinetuneRecipe(BaseRecipe):
-    def setup(self, cfg: RecipeConfig):
+    def setup(self, cfg: TrainerConfig):  # cfg 已是强类型 TrainerConfig
 
         # ═══════════════════════════════════════════════════════
         # m1 model
-        # 来源: cfg.model (ConfigNode, __getattr__ 透传)
-        # _target_: <bound method HyperAutoModelForCausalLM.from_pretrained>
-        # build_model() 是 Recipe 内部编排入口（§6.2），返回 (model, optimizer_init)：
-        #   → 内部调用 from_pretrained / _build_model：meta device → ShardingPlanner →
-        #     apply_sharding_plan → FSDP2Manager.parallelize → load_base_model
-        #   → 从 distributed_setup / ShardingPlan 导出 OptimizerInit（param 分组、mesh）
-        # 与 03 §5.3 canonical 完全对齐：`self.model, self.optimizer_init = build_model(...)`
+        # 来源: cfg.model → ModelConfig(name="qwen3_5", weights_path="...")
+        # （当前仍通过现有 ModelSpec registry 解析模型类，本阶段不修改模型侧逻辑）
+        # build_model() 是 Recipe 内部编排入口（§6.7），返回 (model, optimizer_init)
         # ═══════════════════════════════════════════════════════
-        # ★ 先实例化 peft_config，再传给 build_model（PEFT 必须在 ShardingPlanner.plan
-        #    之前注入，见 §6.4 / §8.3 ②）
         self.mesh = self.distributed_setup.mesh_context
-        self.peft_config = cfg.peft.instantiate() if cfg.get("peft") else None
+        self.peft_config = peft_config  # PEFT 必须在 ShardingPlanner.plan 之前注入
+                                        # （规划中：peft_config 由 YAML peft 段解析后传入 setup/build_model；
+                                        #  peft 非 TrainerConfig 一级字段）
         self.model, self.optimizer_init = build_model(
             cfg.model,
             peft_config=self.peft_config,
             distributed_setup=self.distributed_setup,
         )
-        # model_parts：PP 多 stage 时为 list，单 stage 为 [model]（与 03 §5.3 对齐）
-        self.model_parts = (
-            self.model.parts if hasattr(self.model, "parts") else [self.model]
-        )
 
         # ═══════════════════════════════════════════════════════
-        # m2 tokenizer
-        # 来源: cfg.dataset.tokenizer (子 ConfigNode, __getattr__ 透传)
-        # _target_: <bound method AutoTokenizer.from_pretrained>
-        # 获取方式: build_dataloader() 内部调用 _build_tokenizer()
-        #   路径 4 (有 _target_):
-        #     → AutoTokenizer.from_pretrained(
-        #           pretrained_model_name_or_path="Qwen/Qwen3.5-0.8B",
-        #           trust_remote_code=True)
-        # 返回: PreTrainedTokenizerBase
-        # ═══════════════════════════════════════════════════════
-        # tokenizer 在 build_dataloader() 内部获取，不直接出现在 setup() 中
-
-        # ═══════════════════════════════════════════════════════
-        # m3 ds (Dataset)
-        # 来源: cfg.dataset (ConfigNode, __getattr__ 透传)
-        # _target_: <function datasets.load_dataset>
-        # 获取方式: build_dataloader() 内部
-        #   → load_dataset(path="HuggingFaceFW/fineweb", name="sample-10BT",
-        #                  split="train", streaming=True)
-        #   ★ 不传 tokenizer：datasets.load_dataset 不接受 tokenizer kwarg，
-        #     02 §4.2 的 signature 守卫保证其不会被注入。
-        # 返回: Dataset (可能是 IterableDataset)
-        # ═══════════════════════════════════════════════════════
-        # ds 在 build_dataloader() 内部通过 cfg.dataset.instantiate() 获取
-
-        # ═══════════════════════════════════════════════════════
-        # m4 sampler
-        # 来源: 不由 _target_ 驱动，由 build_dataloader() 内部逻辑决定:
-        #   - map-style Dataset → StatefulDistributedSampler(dataset, seed=..., ...)
-        #   - MegatronPretraining → create_megatron_sampler(...)
-        #   - IterableDataset → 无 sampler
-        # ═══════════════════════════════════════════════════════
-        # sampler 在 build_dataloader() 内部创建
-
-        # ═══════════════════════════════════════════════════════
-        # m5 dataloader
-        # 来源: cfg.dataloader (ConfigNode, __getattr__ 透传)
-        # _target_: <class StatefulDataLoader>
-        # 获取方式: build_dataloader() 末尾
-        #   → StatefulDataLoader(dataset=ds, sampler=sampler, batch_size=1, ...)
-        # 返回: DataLoader
+        # m2 tokenizer — build_dataloader() 内部通过 _build_tokenizer() 获取
         # ═══════════════════════════════════════════════════════
 
-        # 实际调用——build_dataloader() 一次返回 (dataloader, tokenizer):
+        # ═══════════════════════════════════════════════════════
+        # m3 ds (Dataset) — build_dataloader() 内部通过 load_dataset() 获取
+        # ═══════════════════════════════════════════════════════
+
+        # ═══════════════════════════════════════════════════════
+        # m4 sampler — build_dataloader() 内部逻辑决定
+        # ═══════════════════════════════════════════════════════
+
+        # ═══════════════════════════════════════════════════════
+        # m5 dataloader — build_dataloader() 末尾构造
+        # ═══════════════════════════════════════════════════════
+
         self.dataloader, self.tokenizer = build_dataloader(
-            cfg.dataset, cfg.dataloader, cfg.model, cfg.packed_sequence,
-            seed=cfg.get("seed", 42),
-            local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
+            cfg.dataset,          # 规划中：dataset 待加入 TrainerConfig
+            cfg.dataloader,       # 规划中：dataloader 待加入 TrainerConfig
+            cfg.model,
+            cfg.packed_sequence,  # 规划中：packed_sequence 待加入 TrainerConfig
+            seed=cfg.training.seed,  # 规划中：seed 待加入 TrainingConfig
+            local_batch_size=1,  # 规划中：step_scheduler 待加入 TrainerConfig
             ...
         )
-        # build_dataloader() 内部做了上述 m2–m5 全部工作
 
         # ═══════════════════════════════════════════════════════
         # m6 optimizer
-        # 来源: cfg.optimizer (RecipeConfig cached_property → OptimizerConfig)
-        # 非 ConfigNode！cfg.optimizer 已经是 OptimizerConfig(lr=2e-4, ...)
-        # .build(model) 内部:
-        #   ① 遍历 model 参数 → decay/no_decay 分组
-        #   ② 创建 AdamW(param_groups, lr=2e-4, betas=(0.9, 0.95), ...)
+        # 来源: cfg.optimizer → AdamW.Config(lr=0.0001, weight_decay=0.1, ...)
+        # 已是强类型 Config！直接 .build(model) 创建真正的 torch.optim.AdamW
         # 返回: list[torch.optim.Optimizer]
         # ═══════════════════════════════════════════════════════
         self.optimizer = cfg.optimizer.build(
@@ -1825,20 +878,21 @@ class FinetuneRecipe(BaseRecipe):
 
         # ═══════════════════════════════════════════════════════
         # m7 loss_fn
-        # 来源: cfg.loss_fn (RecipeConfig cached_property → LossConfig)
-        # .build() 内部: MaskedCrossEntropy()
+        # 来源: cfg.loss → CausalLMLoss.Config(ignore_index=-100)
+        # .build() 内部: CausalLMLoss(config=...)
         # 返回: nn.Module
         # ═══════════════════════════════════════════════════════
-        self.loss_fn = cfg.loss_fn.build()
-    # └─ 详见 03_training_loop.md §10
+        self.loss = cfg.loss.build()
 
         # ═══════════════════════════════════════════════════════
         # m8 lr_scheduler
-        # 来源: cfg.lr_scheduler (RecipeConfig cached_property → LRSchedulerConfig)
+        # 来源: cfg.lr_scheduler → CosineWithWarmup.Config(warmup_ratio=0.05, ...)
         # .build(optimizer, step_scheduler) 内部:
         #   ① 未设置字段从 step_scheduler 推断默认值
         #   ② 创建 OptimizerParamScheduler(optimizer, lr_warmup_steps=100, ...)
         # 返回: OptimizerParamScheduler
+        # 注: self.step_scheduler 由 cfg.step_scheduler.build() 构造
+        #    （规划中：step_scheduler 待加入 TrainerConfig，见 §4.1 ③.10）
         # ═══════════════════════════════════════════════════════
         self.lr_scheduler = cfg.lr_scheduler.build(
             self.optimizer, self.step_scheduler
@@ -2383,7 +1437,7 @@ def _freeze_non_lora_params(model: nn.Module):
             param.requires_grad = False
 ```
 
-**关键时序**：PEFT 注入在分片**之前**（§6.3 Step 4 / §8.3 ②），非 LoRA 冻结在 FSDP2 包裹 + 权重加载**之后**（§8.3 ⑨.5，对应 §4 时序树 ④.4.5.12）——因为冻结操作需要遍历已包裹、已物化的参数。
+**关键时序**：PEFT 注入在分片**之前**（§6.3 Step 4 / §8.3 ②），非 LoRA 冻结在 FSDP2 包裹 + 权重加载**之后**（§8.3 ⑨.5，对应 §4 时序树 ③.4.5.12 的 `_freeze_non_lora_params` 步骤）——因为冻结操作需要遍历已包裹、已物化的参数。
 
 ### 6.5 参数冻结（`_apply_parameter_freezing`）
 
@@ -2491,6 +1545,121 @@ def _apply_fp8(model: nn.Module, fp8_config: "FP8Config | dict") -> None:
 
 ---
 
+### 6.7 `build_model` 与 `OptimizerInit`（Recipe 编排入口）
+
+> **实现状态**：本节为规划中的 Recipe 侧编排入口，尚未在代码中落地。
+> 当前模型构建仍走现有 `ModelSpec` registry 流程。
+
+`build_model()` 是 Recipe 内部编排入口（§4.1 ③.4 / §4.2 m1），与 `HyperAutoModel.from_pretrained` 的职责区分：
+
+- `from_pretrained` 是 HF 入口，**返回单 model**（PreTrainedModel）。
+- `build_model` **返回 `(model, optimizer_init)`**——内部调用 `from_pretrained`（自定义路径）或 `_build_model`（HF 原生路径）完成 meta→shard→load，并从 `distributed_setup` / ShardingPlan 导出 `OptimizerInit`，供 `Recipe.setup()` 调用 `cfg.optimizer.build(model, optimizer_init=...)` 时使用，避免 Recipe 重复推导 param 分组与 mesh 信息。
+
+```python
+# hyper_models/components/models/common/
+
+def build_model(
+    model_cfg,                        # ModelConfig（name + weights_path 等）
+    peft_config=None,                 # 由 setup() 从 YAML peft 段解析后传入（规划中）
+    distributed_setup=None,
+    **kwargs,
+) -> tuple["nn.Module", "OptimizerInit"]:
+    """高层 build_model 入口。
+
+    Returns:
+        (model, optimizer_init)
+        - model: 已分片、权重已加载的模型（meta→shard→load 完成）
+        - optimizer_init: 见 OptimizerInit。
+    """
+    # ① 调用 HF 兼容入口构建模型（自定义路径走 from_pretrained，含 meta→shard→load）
+    model = HyperAutoModelForCausalLM.from_pretrained(
+        model_cfg.weights_path,
+        distributed_setup=distributed_setup,
+        peft_config=peft_config,
+        **kwargs,
+    )
+
+    # ② 从 distributed_setup / ShardingPlan 导出 OptimizerInit（param 分组、mesh、is_peft）
+    #    weight_decay 由 Recipe 侧从 cfg.optimizer 读取后经 Optimizer.Config.build 生效；
+    #    此处不臆造 wd 值（默认 0.0 占位，禁止用 True——True 等价于 wd=1.0）。
+    optimizer_init = OptimizerInit.from_distributed_setup(
+        distributed_setup=distributed_setup,
+        model=model,
+        peft_config=peft_config,
+    )
+    return model, optimizer_init
+
+
+@dataclass
+class OptimizerInit:
+    """优化器初始化描述——由 build_model 从 distributed_setup / ShardingPlan 导出。
+
+    Recipe.setup() 将其传给 Optimizer.Config.build(model, optimizer_init=...)，
+    避免 Recipe 侧重复推导 param 分组与 mesh 信息。
+    """
+    # param_groups 分组（decay / no_decay / lora_only 等），由 ShardingPlan 推导
+    param_groups: list[dict]
+    # DeviceMesh（用于 optimizer state 的 DTensor placement）；04 §5.3 期待 DeviceMesh
+    device_mesh: "DeviceMesh | None"
+    # 是否为 PEFT 训练（影响 param 过滤 / 可训练参数统计）
+    is_peft: bool = False
+    # 可选：tp_grad_info（由 apply_sharding_plan 导出，供 FSDP2 / optimizer 复用）
+    tp_grad_info: Any = None
+
+    @classmethod
+    def from_distributed_setup(
+        cls,
+        *,
+        distributed_setup,
+        model: "nn.Module",
+        peft_config=None,
+        weight_decay: float = 0.0,
+    ) -> "OptimizerInit":
+        """从 distributed_setup.mesh_context.device_mesh + model 参数推导分组。
+
+        Args:
+            weight_decay: 从 optimizer 配置读取的实际 weight_decay 值
+                （如 cfg.optimizer.weight_decay），用于 decay 组；no_decay 组恒为 0.0。
+                ★ 禁止传 bool——`weight_decay=True` 传入 AdamW 等价于 wd=1.0。
+        注：最终分组由 Optimizer.Config.build 内部以 self.weight_decay 重做，
+        此处 param_groups 为预分组描述，供调用方/调试参考。
+        """
+        mesh_ctx = getattr(distributed_setup, "mesh_context", None) if distributed_setup else None
+        device_mesh = mesh_ctx.device_mesh if mesh_ctx is not None else None
+        is_peft = peft_config is not None
+
+        # 简化的 decay/no_decay 分组（完整分组逻辑由 Optimizer.Config.build 内部完成）
+        decay_p, no_decay_p = [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            (no_decay_p if _is_no_decay(name) else decay_p).append(param)
+        param_groups = [
+            {"params": decay_p, "weight_decay": weight_decay},   # decay 组：配置的实际 wd 值
+            {"params": no_decay_p, "weight_decay": 0.0},          # no_decay 组：恒 0.0
+        ]
+        return cls(
+            param_groups=param_groups,
+            device_mesh=device_mesh,
+            is_peft=is_peft,
+        )
+
+
+def _is_no_decay(name: str) -> bool:
+    """判定参数是否应归入 no_decay 组（常规规则：bias 与 1D norm 权重不衰减）。
+
+    被 OptimizerInit.from_distributed_setup 与 AdamW.Config.build 复用。
+    匹配 "bias"、层归一化权重（名字含 "norm"/"ln"/"layernorm"）等常见模式。
+    """
+    if name.endswith("bias"):
+        return True
+    if "norm" in name.lower() or "ln" in name.lower() or "layernorm" in name.lower():
+        return True
+    return False
+```
+
+---
+
 ## 7. _init_model：自定义 vs HF 路径分发
 
 ```python
@@ -2582,7 +1751,7 @@ def instantiate_infrastructure(
     """
     from hyper_models.components.distributed.sharding_planner import ShardingPlanner
     from hyper_models.components.distributed.fsdp2 import FSDP2Manager
-    # 辅助工厂定义在 hyper_models/components/distributed/fsdp2.py 与 pipelining.py（§2.14）
+    # 辅助工厂定义在 hyper_models/components/distributed/fsdp2.py 与 pipelining.py（见 §8.1/§8.2）
     from hyper_models.components.distributed.fsdp2 import _instantiate_fsdp2
     from hyper_models.components.distributed.pipelining import _instantiate_pipeline
 
@@ -2598,6 +1767,25 @@ def instantiate_infrastructure(
     autopipeline = _instantiate_pipeline(distributed_setup.pipeline_config, mesh)
 
     return sharding_planner, fsdp2_manager, autopipeline
+```
+
+`_instantiate_fsdp2` 的 canonical 签名（06 文档引用 "01 §8.1 `_instantiate_fsdp2(*, config, mesh_context)`"，以此为准）：
+
+```python
+# hyper_models/components/distributed/fsdp2.py
+
+def _instantiate_fsdp2(*, config, mesh_context) -> "FSDP2Manager | None":
+    """根据 strategy config 创建 FSDP2Manager 实例。
+
+    canonical：FSDP2Manager 收 2 参 (config, mesh: MeshContext)，
+    内部从 mesh.device_mesh / mesh.device 取出 DeviceMesh 与 device。
+
+    canonical（裁决：以 01 为准）：本工厂的关键字形参名为 `mesh_context`——
+    06 §4.1 中 `(config, mesh)` 的表述需向此对齐。
+    """
+    if config is None:
+        return None
+    return FSDP2Manager(config=config, mesh=mesh_context)
 ```
 
 ### 8.2 AutoPipeline：Pipeline Parallelism
@@ -2775,7 +1963,7 @@ def apply_model_infrastructure(
     elif not is_meta_device and load_base_model:
         model = model.to(device=device)
 
-    # ⑨.5 PEFT 非 LoRA 参数冻结（在 FSDP2 + 权重加载之后；与 §6.4 / §4 ④.4.5.12 一致）
+    # ⑨.5 PEFT 非 LoRA 参数冻结（在 FSDP2 + 权重加载之后；与 §6.4 / §4 ③.4.5.12 一致）
     #    原因：冻结操作需要遍历已 FSDP2 包裹、已物化的参数。
     if peft_config is not None:
         from hyper_models.components._peft.lora import _freeze_non_lora_params

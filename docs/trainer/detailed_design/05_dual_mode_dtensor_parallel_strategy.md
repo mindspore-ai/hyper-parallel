@@ -60,16 +60,15 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
 
 ```
 main() → recipe.setup(cfg)                                              # 01_hf_compatibility_layer.md §4
-└─④.3 model = cfg.model.instantiate(distributed_setup=...)
-    └─ HyperAutoModelForCausalLM.from_pretrained(...)                    # 01 §6
-        └─ _build_model(...)                                             # 01 §6.3
+└─③.4 model = HyperAutoModelForCausalLM.from_pretrained(cfg.model, distributed_setup=...)  # 01 §6（编号以 01 §4.1 为准）
+    └─ _build_model(...)                                             # 01 §6.3
             │
-            ├─④.3.2 instantiate_infrastructure(distributed_setup, device)  # 01 §8
+            ├─③.4.2 instantiate_infrastructure(distributed_setup, device)  # 01 §8
             │   └─ sharding_planner = ShardingPlanner()                    # hyper_parallel 核心
             │
-            ├─④.3.5.2 _init_model() → meta device 空壳模型                # 01 §7
+            ├─③.4.5.2 _init_model() → meta device 空壳模型                # 01 §7
             │
-            ├─④.3.5.7 plan = sharding_planner.plan(model, mesh, ...)       # ★ 编译期规划 → §3
+            ├─③.4.5.7 plan = sharding_planner.plan(model, mesh, ...)       # ★ 编译期规划 → §3
             │   │                                                           # └─ 详见 §3
             │   ├─ Phase 1: ParameterClassifier.classify(model)             # §3.2: ParamRole 分类
             │   │   ├─ 命名规则匹配（按参数名后缀识别角色）
@@ -106,7 +105,7 @@ main() → recipe.setup(cfg)                                              # 01_h
             │   └─ Phase 6: SpecialHandler.apply(special_params)           # §3.7: 特殊参数处理
             │       └─ 例如: gated_delta_tp_shard, fused_qkv 合并等
             │
-            └─④.3.5.8 apply_sharding_plan(model, plan, mesh, validate_mode)  # ★ 运行时应用 → §4
+            └─③.4.5.8 apply_sharding_plan(model, plan, mesh, validate_mode)  # ★ 运行时应用 → §4
                 │                                                              # └─ 详见 §4
                 ├─ Phase A: _shard_params(model, plan)                        # §4.2: 参数 → DTensor
                 │   ├─ for each spec in plan.modules:
@@ -188,11 +187,11 @@ EP MoE 的 forward 包装在 Phase C 执行时，检测到 spec.use_local_map:
 
 ```
 main()                                           # 01 §4
-└─④.3 model = from_pretrained()
+└─③.4 model = from_pretrained()
     └─ _build_model()
-        ├─④.3.5.2 _init_model()                  # 01 §7: meta device 空壳
-        ├─④.3.5.7 sharding_planner.plan()         # 本文档 §3: 编译期规划 ★
-        └─④.3.5.8 apply_sharding_plan()           # 本文档 §4: 运行时应用 ★
+        ├─③.4.5.2 _init_model()                  # 01 §7: meta device 空壳
+        ├─③.4.5.7 sharding_planner.plan()         # 本文档 §3: 编译期规划 ★
+        └─③.4.5.8 apply_sharding_plan()           # 本文档 §4: 运行时应用 ★
             ├─ Phase A: _shard_params              # §4.2
             ├─ Phase B: PrecompiledBoundary.build  # §4.3
             └─ Phase C: _wrap_forward              # §4.4
@@ -203,8 +202,8 @@ main()                                           # 01 §4
 
 ── 运行时使用（训练循环中）──
 
-⑤ run_train_validation_loop()                    # 03_training_loop.md §6
-└─⑤.1.2 _forward_backward_step()                 # 03_training_loop.md §8
+④ run_train_validation_loop()                    # 03_training_loop.md §6（编号以 01 §4.1 为准）
+└─④.1.2 _forward_backward_step()                 # 03_training_loop.md §8
     └─ model(**batch)
         ├─ PrecompiledBoundary.redistribute_inputs(x)   # 本文档 §4.3: TP+CP+EP 多维度通信
         ├─ _local_params_context:  # build-time one-shot (params permanently unpacked, called before fully_shard)
@@ -857,7 +856,7 @@ SKIP             -> (skip params)            -> --                        frozen
 
 ---
 
-> **调用位置**: 时序树 ④.3.5.7 — `sharding_planner.plan(model, mesh, ...)` → `ShardingPlan`
+> **调用位置**: 时序树 ③.4.5.7 — `sharding_planner.plan(model, mesh, ...)` → `ShardingPlan`
 
 ### 3.6 Phase 1-2: Parameter Classification + Boundary Grouping
 
@@ -1779,7 +1778,7 @@ def _get_cp_submesh(mesh: DeviceMesh, mesh_dim_names: tuple[str, ...]) -> Device
 
 ### 4.2 Phase A: 参数分片
 
-> **对应时序**: ④.3.5.8 Phase A — `distribute_tensor()` → DTensor
+> **对应时序**: ③.4.5.8 Phase A — `distribute_tensor()` → DTensor
 
 ```python
 def _shard_module_params(
@@ -2090,7 +2089,7 @@ def production_forward(*args, **kwargs):
 
 ### 4.4 Phase C: Forward Wrapping: 生产模式 forward 包装
 
-> **对应时序**: ④.3.5.8 Phase C — `_wrap_forward()`
+> **对应时序**: ③.4.5.8 Phase C — `_wrap_forward()`
 
 #### 4.4.1 标准生产模式：`_wrap_production_forward` + Phase C 辅助函数
 
@@ -2815,7 +2814,7 @@ internal local-tensor communication with explicit DTensor recovery.
 
 ## 5. Validate 模式的 placement 校验
 
-> **调用位置**: 时序树 ④.3.5.8 Phase C validate 分支 — `_wrap_validate_forward()`
+> **调用位置**: 时序树 ③.4.5.8 Phase C validate 分支 — `_wrap_validate_forward()`
 
 ### 5.1 核心校验：`out_src`
 
@@ -3065,7 +3064,7 @@ def simulate_tp_replicate_grad_sync(grad, tp_group):
 
 ## 6. 并行策略组合：TP × CP × EP × DP
 
-> **调用位置**: 时序树 ④.3.5.7 — ShardingPlan 中的多 mesh 维度组合
+> **调用位置**: 时序树 ③.4.5.7 — ShardingPlan 中的多 mesh 维度组合
 
 ### 6.1 核心原则：CP/EP 与 TP 统一走 PrecompiledBoundary
 
@@ -4393,7 +4392,7 @@ BACKWARD 通信职责:  FSDP2 / HSDP（参数梯度同步）
 
 ## 7. 与 FSDP2 的关系
 
-> **调用位置**: 时序树 ④.3.5.11 — `fsdp2_manager.parallelize(model)` 在 ShardingApplier 之后执行（06 侧集成契约；`apply_sharding_plan` ↔ `fully_shard` 的接线当前未落地，见本节"代码现状"）
+> **调用位置**: 时序树 ③.4.5.11 — `fsdp2_manager.parallelize(model)` 在 ShardingApplier 之后执行（06 侧集成契约；`apply_sharding_plan` ↔ `fully_shard` 的接线当前未落地，见本节"代码现状"）
 
 ```
 分工边界:
@@ -4516,7 +4515,7 @@ Checkpoint (DCP):
 
 ## 8. 用户自定义模块的配置方式
 
-> **调用位置**: 时序树 ④.3.5.7 Phase 1 — ParameterClassifier 处理 ARCH_OVERRIDES
+> **调用位置**: 时序树 ③.4.5.7 Phase 1 — ParameterClassifier 处理 ARCH_OVERRIDES
 
 ### 8.1 三种配置方式
 

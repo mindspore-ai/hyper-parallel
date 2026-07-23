@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import types
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
-from typing import Sequence, get_type_hints
+from typing import Sequence, Union, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -53,6 +54,37 @@ def _parse_override_tokens(tokens: Sequence[str]) -> list[tuple[str, str]]:
     return parsed
 
 
+def _parse_cli_scalar(value: object, annotation: object) -> object:
+    """Best-effort string-to-numeric conversion for CLI override scalars.
+
+    PyYAML 1.1 only recognizes floats with a decimal point, so
+    ``yaml.safe_load("1e-4")`` yields the string ``"1e-4"``. When the target
+    annotation is ``int``/``float`` (optionally wrapped in ``Optional``), try a
+    direct conversion before strict coercion; anything that does not parse is
+    returned unchanged so ``coerce_value`` reports the original type error.
+    """
+
+    if not isinstance(value, str):
+        return value
+    target = annotation
+    if get_origin(target) in (Union, types.UnionType):
+        members = [member for member in get_args(target) if member is not type(None)]
+        if len(members) != 1:
+            return value
+        target = members[0]
+    if target is int:
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if target is float:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
 def _replace_path(config: object, parts: list[str], value: object, *, path: str) -> object:
     """Return a dataclass copy with one typed dotted-path value replaced."""
 
@@ -74,7 +106,9 @@ def _replace_path(config: object, parts: list[str], value: object, *, path: str)
     full_path = f"{path}.{name}" if path else name
     if len(parts) == 1:
         annotation = get_type_hints(type(config))[name]
-        normalized = coerce_value(value, annotation, path=f"CLI.{full_path}")
+        normalized = coerce_value(
+            _parse_cli_scalar(value, annotation), annotation, path=f"CLI.{full_path}"
+        )
         return replace(config, **{name: normalized})
 
     child = getattr(config, name)
