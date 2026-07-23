@@ -123,7 +123,7 @@ def _wrap_with_fsdp(
         "mesh": dp_mesh,
         "reshard_after_forward": False,
         "mp_policy": mp_policy,
-        "sharded_accumulated_grad": sharded_accumulated_grad,
+        "comm_fusion": sharded_accumulated_grad,
     }
     if replicate_biases:
         fsdp_kwargs["replicate_params"] = {
@@ -135,6 +135,9 @@ def _wrap_with_fsdp(
         for layer in model.layers:
             fully_shard(layer, **fsdp_kwargs)
     fsdp_model = fully_shard(model, **fsdp_kwargs)
+    if sharded_accumulated_grad:
+        fsdp_model.set_requires_gradient_sync(True)
+        fsdp_model.set_requires_all_reduce(False)
     for hsdp_state in _get_hsdp_states(fsdp_model):
         hsdp_state.set_reduce_op_type("sum")
     return fsdp_model
@@ -206,7 +209,7 @@ def _run_fsdp_1f1b(fsdp_model: FullModel, inputs_per_mb: list[Tensor], *,
         loss.backward()
         if explicit_sharded_finalize:
             for hsdp_state in hsdp_states:
-                hsdp_state.release_sharded_grad_sources_after_backward()
+                hsdp_state._release_reduced_grad_sources_after_backward()  # pylint: disable=protected-access
         losses.append(loss)
     if explicit_sharded_finalize:
         fsdp_model.set_is_last_backward(True)
@@ -217,12 +220,9 @@ def _run_fsdp_1f1b(fsdp_model: FullModel, inputs_per_mb: list[Tensor], *,
             force_reduce=True
         )
         for hsdp_state in hsdp_states:
-            hsdp_state.launch_sharded_accumulated_grad_all_reduces()
-        for hsdp_state in hsdp_states:
-            hsdp_state.wait_sharded_accumulated_grad_all_reduces()
-        for hsdp_state in hsdp_states:
             if not hsdp_state.is_shard:
                 hsdp_state.shard()
+        fsdp_model.set_requires_all_reduce(False)
     return losses
 
 

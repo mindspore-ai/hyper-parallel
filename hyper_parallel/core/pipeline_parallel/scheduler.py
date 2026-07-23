@@ -434,19 +434,20 @@ class PipelineScheduleRuntime(ABC):
         """Configure HSDP gradient reduction once for the current pipeline run.
 
         The default path accumulates full gradients and reduces them through
-        ``FSDP_REDUCE_GRAD``. Sharded accumulation instead runs native fused
-        reduce-scatter for every micro-batch and defers only HSDP's replicate
-        all-reduce to that final action.
+        ``FSDP_REDUCE_GRAD``. A caller may instead use the existing HSDP controls
+        to keep gradient sync enabled and disable only replicate all-reduce; that
+        runs reduce-scatter for every micro-batch and restores all-reduce at the
+        final action.
         """
         for stage in self.stages:
             if not stage.has_backward:
                 continue
             if isinstance(stage.submodule, HSDPModule):
                 stage.submodule.set_reshard_after_backward(False)
+                stage.submodule.set_is_last_backward(False)
                 hsdp_state = stage.submodule.hsdp_scheduler.hsdp_state
-                if getattr(hsdp_state, "sharded_accumulated_grad", False):
+                if hsdp_state.reduce_grads and not hsdp_state.requires_all_reduce:
                     stage.submodule.set_requires_gradient_sync(True)
-                    stage.submodule.set_requires_all_reduce(False)
                 else:
                     stage.submodule.set_requires_gradient_sync(False)
 

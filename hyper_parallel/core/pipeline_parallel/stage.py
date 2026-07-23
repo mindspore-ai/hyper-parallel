@@ -537,37 +537,38 @@ class PipelineStage(PipelineStageBase):
             seen_states.add(state_id)
             hsdp_states.append(sub_mod_state)
 
-        fsdp_module.set_requires_gradient_sync(True)
-        feature_states = [
+        deferred_states = [
             hsdp_state
             for hsdp_state in hsdp_states
-            if getattr(hsdp_state, "sharded_accumulated_grad", False)
+            if hsdp_state.reduce_grads and not hsdp_state.requires_all_reduce
         ]
-        if feature_states:
-            fsdp_module.set_requires_all_reduce(True)
-        for hsdp_state in hsdp_states:
-            if getattr(hsdp_state, "sharded_accumulated_grad", False):
-                continue
-            hsdp_state.post_backward()
-            hsdp_state.reduce_params()
+        deferred_state_ids = {id(hsdp_state) for hsdp_state in deferred_states}
+        fsdp_module.set_requires_gradient_sync(True)
+        try:
+            if deferred_states:
+                fsdp_module.set_requires_all_reduce(True)
+            for hsdp_state in hsdp_states:
+                if id(hsdp_state) in deferred_state_ids:
+                    continue
+                hsdp_state.post_backward()
+                hsdp_state.reduce_params()
 
-        # No public API exposes the root backward finalization; call the platform hook directly.
-        # force_reduce=True: the recv buffer's PostBackwardFunction has put the root into
-        # scheduler_state==BACKWARD, so the natural gate would skip the final drain and the
-        # last module's reduce-scatter would lag one optimizer step.
-        fsdp_module.hsdp_scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
+            # No public API exposes the root backward finalization; call the platform hook directly.
+            # force_reduce=True: the recv buffer's PostBackwardFunction has put the root into
+            # scheduler_state==BACKWARD, so the natural gate would skip the final drain and the
+            # last module's reduce-scatter would lag one optimizer step.
+            fsdp_module.hsdp_scheduler._root_backward_hook(  # pylint: disable=protected-access
+                force_reduce=True
+            )
 
-        # Launch all state buckets before waiting so independent replicate
-        # groups can make progress concurrently.
-        for hsdp_state in feature_states:
-            hsdp_state.launch_sharded_accumulated_grad_all_reduces()
-        for hsdp_state in feature_states:
-            hsdp_state.wait_sharded_accumulated_grad_all_reduces()
-        for hsdp_state in feature_states:
-            if hsdp_state.reshard_after_backward:
-                hsdp_state.shard()
+            for hsdp_state in deferred_states:
+                if hsdp_state.reshard_after_backward:
+                    hsdp_state.shard()
+        finally:
+            if deferred_states:
+                fsdp_module.set_requires_all_reduce(False)
 
-    def release_sharded_grad_sources_after_backward(self) -> None:
+    def _release_reduced_grad_sources_after_backward(self) -> None:
         """Release full gradients already packed by native fused reduce-scatter."""
         if not isinstance(self.submodule, HSDPModule):
             return
@@ -582,7 +583,7 @@ class PipelineStage(PipelineStageBase):
             seen_states.add(state_id)
             release = getattr(
                 hsdp_state,
-                "release_sharded_grad_sources_after_backward",
+                "_release_reduced_grad_sources_after_backward",
                 None,
             )
             if callable(release):

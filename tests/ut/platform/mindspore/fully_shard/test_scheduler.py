@@ -56,6 +56,9 @@ def _make_scheduler():
     scheduler.mesh = None
     scheduler._get_managed_params = MagicMock(return_value=[])
     scheduler.hsdp_state = MagicMock()
+    scheduler.hsdp_state.reduce_grads = True
+    scheduler.hsdp_state.requires_all_reduce = True
+    scheduler.scheduler_ctx = SimpleNamespace(is_last_backward=True, root_module=None)
     scheduler.scheduler_state = FSDPSchedulerState.PRE_FORWARD
     scheduler.cell = "cell"
     scheduler._fsdp_group_post_pending = None
@@ -293,8 +296,8 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
         scheduler._is_root = True
         scheduler._hsdp_backward_hook = MagicMock()
-        scheduler.hsdp_state.sharded_accumulated_grad = True
         scheduler.hsdp_state.requires_all_reduce = False
+        scheduler.scheduler_ctx.is_last_backward = False
         HSDPSchedulerV2.root_bp_state = True
 
         with patch.object(scheduler_mod, "get_comm_ctx") as get_comm_ctx:
@@ -307,6 +310,9 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         self.assertFalse(HSDPSchedulerV2.root_bp_state)
 
         scheduler._hsdp_backward_hook.reset_mock()
+        scheduler.hsdp_state.requires_all_reduce = True
+        scheduler.scheduler_ctx.is_last_backward = True
+        scheduler._get_root_hsdp_states = MagicMock(return_value=[scheduler.hsdp_state])
         comm_ctx = SimpleNamespace(all_reduce_param_group=None, pre_param_group=None)
         with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx):
             MindSporeHSDPSchedulerV2._root_backward_hook(scheduler, force_reduce=True)
@@ -314,6 +320,24 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         scheduler._hsdp_backward_hook.assert_called_once_with(scheduler.cell, None, None)
         scheduler.hsdp_state.reduce_scattered_params.assert_called_once_with()
         scheduler.hsdp_state.reduce_params.assert_called_once_with()
+        scheduler.hsdp_state._queue_accumulated_sharded_grad_all_reduces.assert_called_once_with()
+
+    def test_root_backward_drains_when_all_reduce_is_disabled_on_last_backward(self):
+        """Disabling all-reduce alone must not leave a tail outside pipeline accumulation."""
+        scheduler = _make_scheduler()
+        scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler._is_root = True
+        scheduler._hsdp_backward_hook = MagicMock()
+        scheduler.hsdp_state.requires_all_reduce = False
+        scheduler.scheduler_ctx.is_last_backward = True
+        comm_ctx = SimpleNamespace(all_reduce_param_group=None, pre_param_group=None)
+
+        with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx):
+            MindSporeHSDPSchedulerV2._root_backward_hook(scheduler)
+
+        scheduler.hsdp_state.reduce_scattered_params.assert_called_once_with()
+        scheduler.hsdp_state.reduce_params.assert_called_once_with()
+        scheduler.hsdp_state._queue_accumulated_sharded_grad_all_reduces.assert_not_called()
 
     def test_register_forward_backward_hooks_for_single_and_grouped_modules(self):
         """Hook registration should use grouped hooks only when the grouped marker exists."""

@@ -49,7 +49,7 @@ from hyper_parallel.core.fully_shard.api import (
     _validate_module_for_fully_shard,
     fully_shard,
 )
-from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.platform import PlatformType
 
 
@@ -368,60 +368,14 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
         mesh.ndim = 1
         return mesh
 
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_sharded_accumulated_grad_validates_unsupported_combinations(self, mock_platform):
-        """The opt-in mode should fail before scheduler setup for unsupported options."""
-        mock_platform.platform_type = PlatformType.MINDSPORE
-        cell = ms_nn.Dense(4, 4)
-        mesh = self._create_mock_mesh()
-
-        with self.assertRaisesRegex(ValueError, "must be bool"):
-            fully_shard(cell, mesh=mesh, sharded_accumulated_grad=1)
-        with self.assertRaisesRegex(ValueError, "explicit FSDP/HSDP mesh"):
-            fully_shard(cell, sharded_accumulated_grad=True)
-        with self.assertRaisesRegex(ValueError, "CPU gradient offload"):
-            fully_shard(
-                cell,
-                mesh=mesh,
-                offload_policy=CPUOffloadPolicy(),
-                sharded_accumulated_grad=True,
-            )
-
-    def test_sharded_accumulated_grad_is_the_only_public_feature_switch(self):
-        """The public fully_shard API should expose one sharded-accumulation switch."""
+    def test_sharded_accumulated_grad_is_not_a_fully_shard_option(self):
+        """Pipeline accumulation should use existing HSDP controls, not a new fully_shard option."""
         parameters = inspect.signature(fully_shard).parameters
 
-        self.assertIn("sharded_accumulated_grad", parameters)
+        self.assertNotIn("sharded_accumulated_grad", parameters)
         self.assertNotIn("sharded_grad_ready_overlap", parameters)
         self.assertNotIn("sharded_accumulated_grad_max_pending", parameters)
         self.assertNotIn("sharded_grad_reduce_dtype", parameters)
-
-    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_sharded_accumulated_grad_enables_fused_scheduler(self, mock_platform, mock_get_device):
-        """The single opt-in flag should enable fusion and reach scheduler setup."""
-        mock_platform.platform_type = PlatformType.MINDSPORE
-        mock_get_device.return_value = "npu"
-        captured = {}
-
-        def _fake_hsdp_init(self, *args, **kwargs):
-            captured["comm_fusion"] = args[-3]
-            captured["sharded_accumulated_grad"] = args[-1]
-            self.hsdp_scheduler = object()
-
-        with patch(
-            "hyper_parallel.core.fully_shard.api.HSDPModule.hsdp_init",
-            _fake_hsdp_init,
-        ):
-            fully_shard(
-                ms_nn.Dense(4, 4),
-                mesh=self._create_mock_mesh(),
-                mp_policy=_default_mp_policy(),
-                sharded_accumulated_grad=True,
-            )
-
-        self.assertTrue(captured["comm_fusion"])
-        self.assertTrue(captured["sharded_accumulated_grad"])
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")

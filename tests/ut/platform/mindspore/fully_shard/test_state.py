@@ -67,11 +67,8 @@ def _make_state():
         shard_placement_fn="shard-fn",
         comm_fusion=False,
         comm_fusion_zero_copy=False,
-        sharded_accumulated_grad=False,
     )
     state.comm_fusion = False
-    state.sharded_accumulated_grad = False
-    state._pending_sharded_grad_all_reduce_groups = []
     state.mesh_info = SimpleNamespace(mesh="mesh-info")
     state.modules = []
     state.reduce_grads = True
@@ -196,20 +193,18 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         self.assertEqual(state._iter_managed_params(), [hsdp_param, replicate_param])
 
     def test_sharded_accumulation_defers_only_replicate_all_reduce(self):
-        """The feature should keep native gradient sync enabled and defer only HSDP AR."""
+        """Existing reduction controls should defer only HSDP all-reduce."""
         state = _make_state()
-        state.sharded_accumulated_grad = True
         state.requires_all_reduce = False
 
-        self.assertTrue(state._is_sharded_grad_accumulation_active())
+        self.assertTrue(state._is_replicate_all_reduce_deferred())
 
         state.reduce_grads = False
-        self.assertFalse(state._is_sharded_grad_accumulation_active())
+        self.assertFalse(state._is_replicate_all_reduce_deferred())
 
     def test_post_backward_for_comm_fusion_reuses_native_tail_state(self):
         """A new fused RS should drain the prior native tail before it is launched."""
         state = _make_state()
-        state.sharded_accumulated_grad = True
         state.requires_all_reduce = False
         state.param_group = MagicMock()
         state.reduce_params = MagicMock()
@@ -230,17 +225,16 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         )
         state._queue_replicate_params_allreduce.assert_called_once_with()
 
-    def test_release_sharded_grad_sources_runs_after_backward(self):
-        """Only the feature path should detach full gradients packed by fused RS."""
+    def test_release_reduced_grad_sources_runs_after_backward(self):
+        """Deferred all-reduce should detach full gradients packed by fused RS."""
         state = _make_state()
-        state.sharded_accumulated_grad = True
         state.requires_all_reduce = False
         first_param = SimpleNamespace(clear_released_unsharded_grad=MagicMock())
         second_param = SimpleNamespace(clear_released_unsharded_grad=MagicMock())
         state.hsdp_params = [first_param]
         state.replicate_params = [second_param]
 
-        state.release_sharded_grad_sources_after_backward()
+        state._release_reduced_grad_sources_after_backward()
 
         first_param.clear_released_unsharded_grad.assert_called_once_with()
         second_param.clear_released_unsharded_grad.assert_called_once_with()
@@ -249,8 +243,6 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
     def test_final_sharded_accumulation_reuses_native_all_reduce_group(self, mock_group_ctor):
         """The terminal action should pack local shards with native AllReduceParamGroup APIs."""
         state = _make_state()
-        state.sharded_accumulated_grad = True
-        state.wait_sharded_accumulated_grad_reduce_scatters = MagicMock()
         local_grad = ms.Tensor(np.array([2.0, 4.0], dtype=np.float32))
         hsdp_param = SimpleNamespace(
             mp_policy=state.mp_policy,
@@ -269,17 +261,16 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         group.wait_and_apply_grads.return_value = False
         mock_group_ctor.return_value = group
 
-        state.launch_sharded_accumulated_grad_all_reduces()
+        state._queue_accumulated_sharded_grad_all_reduces()
 
-        state.wait_sharded_accumulated_grad_reduce_scatters.assert_called_once_with()
         group.allocate_fused_buffer.assert_called_once_with(state.device)
         group.accumulate_existing_grads_to_buffer.assert_called_once_with()
         group.issue_async_allreduce.assert_called_once_with()
 
-        state.wait_sharded_accumulated_grad_all_reduces()
+        MindSporeHSDPStateV2.delay_apply_reduce_grads()
 
         group.wait_and_apply_grads.assert_called_once_with()
-        self.assertEqual(state._pending_sharded_grad_all_reduce_groups, [])
+        self.assertEqual(MindSporeHSDPStateV2.pending_all_reduce_groups, [])
 
     def test_prefetch_forwards_unshard_replicate_flag(self):
         """prefetch should forward the replicate-policy bit to unshard."""
@@ -334,7 +325,6 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
     def test_queue_replicate_params_allreduce_applies_local_grad_when_all_reduce_disabled(self):
         """requires_all_reduce=False should still materialize replicate_params grads locally."""
         state = _make_state()
-        state.sharded_accumulated_grad = True
         state.requires_all_reduce = False
         grad = ms.Tensor(np.full((2,), 4.0, dtype=np.float32))
         replicate_param = SimpleNamespace(
@@ -600,11 +590,24 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         """Simple state mutators should touch only managed params and non-meta tensors."""
         state = _make_state()
         state.comm_fusion = True
-        hsdp_param = SimpleNamespace(zero_grad=MagicMock())
-        replicate_param = SimpleNamespace(zero_grad=MagicMock())
+        state.requires_all_reduce = False
+        hsdp_param = SimpleNamespace(
+            clear_released_unsharded_grad=MagicMock(),
+            unsharded_accumulated_grad=MagicMock(),
+            zero_grad=MagicMock(),
+        )
+        replicate_param = SimpleNamespace(
+            clear_released_unsharded_grad=MagicMock(),
+            unsharded_accumulated_grad=MagicMock(),
+            zero_grad=MagicMock(),
+        )
         state.hsdp_params = [hsdp_param]
         state.replicate_params = [replicate_param]
         state.zero_grad()
+        hsdp_param.clear_released_unsharded_grad.assert_called_once_with()
+        replicate_param.clear_released_unsharded_grad.assert_called_once_with()
+        self.assertIsNone(hsdp_param.unsharded_accumulated_grad)
+        self.assertIsNone(replicate_param.unsharded_accumulated_grad)
         hsdp_param.zero_grad.assert_called_once_with()
         replicate_param.zero_grad.assert_called_once_with()
 

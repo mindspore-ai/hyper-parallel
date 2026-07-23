@@ -14,7 +14,7 @@
 # ============================================================================
 """Unit tests for pipeline FSDP configuration."""
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from hyper_parallel.core.pipeline_parallel import scheduler as scheduler_module
 from hyper_parallel.core.pipeline_parallel import stage as stage_module
@@ -32,7 +32,10 @@ class _FakeHSDPModule:
         self.set_requires_all_reduce = MagicMock()
         self.set_is_last_backward = MagicMock()
         self.hsdp_scheduler = SimpleNamespace(
-            hsdp_state=SimpleNamespace(sharded_accumulated_grad=False)
+            hsdp_state=SimpleNamespace(
+                reduce_grads=True,
+                requires_all_reduce=True,
+            )
         )
 
 
@@ -118,6 +121,7 @@ def test_fsdp_backward_configured_once_per_run_for_multiple_microbatches() -> No
         f"got={fsdp_module.set_requires_gradient_sync.call_count}"
     )
     fsdp_module.set_reshard_after_backward.assert_called_with(False)
+    fsdp_module.set_is_last_backward.assert_called_with(False)
     fsdp_module.set_requires_gradient_sync.assert_called_with(False)
 
 
@@ -128,9 +132,9 @@ def test_fsdp_backward_configured_once_per_run_for_multiple_microbatches() -> No
     essential_mark="essential",
 )
 def test_fsdp_backward_sharded_accumulation_keeps_native_gradient_sync() -> None:
-    """Sharded accumulation should run native RS and defer only replicate AR."""
+    """Existing HSDP controls should run native RS and defer only replicate AR."""
     fsdp_module = _FakeHSDPModule()
-    fsdp_module.hsdp_scheduler.hsdp_state.sharded_accumulated_grad = True
+    fsdp_module.hsdp_scheduler.hsdp_state.requires_all_reduce = False
     stage = SimpleNamespace(stage_index=0, submodule=fsdp_module, has_backward=True)
     schedule = object.__new__(scheduler_module.ScheduleGPipe)
     schedule.stages = [stage]
@@ -139,8 +143,9 @@ def test_fsdp_backward_sharded_accumulation_keeps_native_gradient_sync() -> None
         schedule._prepare_fsdp_backward()
 
     fsdp_module.set_reshard_after_backward.assert_called_once_with(False)
+    fsdp_module.set_is_last_backward.assert_called_once_with(False)
     fsdp_module.set_requires_gradient_sync.assert_called_once_with(True)
-    fsdp_module.set_requires_all_reduce.assert_called_once_with(False)
+    fsdp_module.set_requires_all_reduce.assert_not_called()
 
 
 @arg_mark(
@@ -153,49 +158,45 @@ def test_fsdp_reduce_grad_finalizes_sharded_accumulation_once_per_state() -> Non
     """
     Feature: Pipeline sharded gradient accumulation finalization.
     Description: Finalize local shards and deduplicate shared HSDP states.
-    Expectation: Legacy states use post_backward while opt-in states use one final replicate reduction.
+    Expectation: Legacy states use post_backward while deferred states are finalized by the root hook.
     """
     finalization_order = []
     feature_state = SimpleNamespace(
-        sharded_accumulated_grad=True,
+        reduce_grads=True,
+        requires_all_reduce=False,
         reshard_after_backward=True,
         post_backward=MagicMock(),
         reduce_params=MagicMock(),
-        release_sharded_grad_sources_after_backward=MagicMock(),
-        launch_sharded_accumulated_grad_all_reduces=MagicMock(
-            side_effect=lambda: finalization_order.append("launch-1")
-        ),
-        wait_sharded_accumulated_grad_all_reduces=MagicMock(
-            side_effect=lambda: finalization_order.append("wait-1")
-        ),
+        _release_reduced_grad_sources_after_backward=MagicMock(),
         shard=MagicMock(),
     )
     second_feature_state = SimpleNamespace(
-        sharded_accumulated_grad=True,
+        reduce_grads=True,
+        requires_all_reduce=False,
         reshard_after_backward=True,
         post_backward=MagicMock(),
         reduce_params=MagicMock(),
-        release_sharded_grad_sources_after_backward=MagicMock(),
-        launch_sharded_accumulated_grad_all_reduces=MagicMock(
-            side_effect=lambda: finalization_order.append("launch-2")
-        ),
-        wait_sharded_accumulated_grad_all_reduces=MagicMock(
-            side_effect=lambda: finalization_order.append("wait-2")
-        ),
+        _release_reduced_grad_sources_after_backward=MagicMock(),
         shard=MagicMock(),
     )
     legacy_state = SimpleNamespace(
-        sharded_accumulated_grad=False,
+        reduce_grads=False,
+        requires_all_reduce=True,
         reshard_after_backward=True,
         post_backward=MagicMock(),
         reduce_params=MagicMock(),
-        release_sharded_grad_sources_after_backward=MagicMock(),
+        _release_reduced_grad_sources_after_backward=MagicMock(),
         shard=MagicMock(),
     )
     root = _FakeHSDPModule()
+    root.set_requires_all_reduce = MagicMock(
+        side_effect=lambda enabled: finalization_order.append(f"root-ar-{enabled}")
+    )
     root.hsdp_scheduler = SimpleNamespace(
         hsdp_state=feature_state,
-        _root_backward_hook=MagicMock(),
+        _root_backward_hook=MagicMock(
+            side_effect=lambda **_: finalization_order.append("root-finalize")
+        ),
     )
     legacy = _FakeHSDPModule()
     legacy.hsdp_scheduler = SimpleNamespace(hsdp_state=legacy_state)
@@ -215,21 +216,26 @@ def test_fsdp_reduce_grad_finalizes_sharded_accumulation_once_per_state() -> Non
         "get_cells_and_names",
         return_value=module_tree,
     ):
-        stage.release_sharded_grad_sources_after_backward()
+        stage._release_reduced_grad_sources_after_backward()
         stage.execute_reduce_grad()
 
+    root.set_is_last_backward.assert_called_once_with(True)
     root.set_reshard_after_backward.assert_called_once_with(True)
     root.set_requires_gradient_sync.assert_called_once_with(True)
-    root.set_requires_all_reduce.assert_called_once_with(True)
+    assert root.set_requires_all_reduce.call_args_list == [call(True), call(False)]
     feature_state.post_backward.assert_not_called()
     feature_state.reduce_params.assert_not_called()
-    feature_state.release_sharded_grad_sources_after_backward.assert_called_once_with()
-    second_feature_state.release_sharded_grad_sources_after_backward.assert_called_once_with()
+    feature_state._release_reduced_grad_sources_after_backward.assert_called_once_with()
+    second_feature_state._release_reduced_grad_sources_after_backward.assert_called_once_with()
     legacy_state.post_backward.assert_called_once_with()
     legacy_state.reduce_params.assert_called_once_with()
-    legacy_state.release_sharded_grad_sources_after_backward.assert_called_once_with()
+    legacy_state._release_reduced_grad_sources_after_backward.assert_called_once_with()
     root.hsdp_scheduler._root_backward_hook.assert_called_once_with(force_reduce=True)
-    assert finalization_order == ["launch-1", "launch-2", "wait-1", "wait-2"]
+    assert finalization_order == [
+        "root-ar-True",
+        "root-finalize",
+        "root-ar-False",
+    ]
     feature_state.shard.assert_called_once_with()
     second_feature_state.shard.assert_called_once_with()
     legacy_state.shard.assert_not_called()

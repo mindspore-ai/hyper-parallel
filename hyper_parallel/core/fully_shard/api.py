@@ -17,7 +17,7 @@ from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
 from hyper_parallel.platform.platform import PlatformType
-from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
@@ -131,8 +131,7 @@ class HSDPModule:
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
-                  comm_fusion, comm_fusion_zero_copy: Optional[bool] = None,
-                  sharded_accumulated_grad: bool = False):
+                  comm_fusion, comm_fusion_zero_copy: Optional[bool] = None):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -159,7 +158,6 @@ class HSDPModule:
                                               device,
                                               comm_fusion,
                                               resolved_comm_fusion_zero_copy,
-                                              sharded_accumulated_grad,
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
@@ -615,7 +613,6 @@ def fully_shard(
         replicate_params: Optional[set[platform.Parameter]] = None,
         comm_fusion: bool = False,
         comm_fusion_zero_copy: Optional[bool] = None,
-        sharded_accumulated_grad: bool = False,
 ) -> Union[platform.Module, List[platform.Module]]:
 
     """
@@ -686,37 +683,10 @@ def fully_shard(
             contiguous memory. This path depends on optimizer compatibility with
             view-backed parameters.
 
-        sharded_accumulated_grad (bool, default=False):
-            MindSpore-only memory-first pipeline gradient accumulation. Every
-            micro-batch uses the native fused reduce-scatter path and
-            accumulates local gradient shards. HSDP defers only the
-            replicate-axis all-reduce until the pipeline's final gradient
-            action. This mode requires an explicit FSDP/HSDP ``mesh`` and
-            enables communication fusion. It reuses the native communication
-            context, which keeps at most one fused reduce-scatter tail pending.
-
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
     """
     platform_type = platform.platform_type
-    if not isinstance(sharded_accumulated_grad, bool):
-        raise ValueError(
-            "sharded_accumulated_grad must be bool, "
-            f"but got {type(sharded_accumulated_grad).__name__}."
-        )
-    if sharded_accumulated_grad and platform_type != PlatformType.MINDSPORE:
-        raise NotImplementedError(
-            "sharded_accumulated_grad is currently only supported on MindSpore."
-        )
-    if sharded_accumulated_grad and mesh is None:
-        raise ValueError(
-            "sharded_accumulated_grad requires an explicit FSDP/HSDP mesh."
-        )
-    if sharded_accumulated_grad and isinstance(offload_policy, CPUOffloadPolicy):
-        raise ValueError(
-            "sharded_accumulated_grad does not support CPU gradient offload."
-        )
-    comm_fusion = comm_fusion or sharded_accumulated_grad
     _validate_module_for_fully_shard(module, platform_type)
     if platform_type == PlatformType.MINDSPORE:
         from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
@@ -765,7 +735,6 @@ def fully_shard(
         device,
         comm_fusion,
         comm_fusion_zero_copy,
-        sharded_accumulated_grad,
     )
     # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
     if len(modules) > 1:

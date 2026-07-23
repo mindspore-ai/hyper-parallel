@@ -70,7 +70,7 @@ class PipelineStageBase:
         self.fwd_grad_fn_cache.clear()
         self.bwd_cache.clear()
 
-    def release_sharded_grad_sources_after_backward(self) -> None:
+    def _release_reduced_grad_sources_after_backward(self) -> None:
         """Hook for the core pipeline stage to release packed full gradients."""
 
     @staticmethod
@@ -211,7 +211,7 @@ class PipelineStageBase:
                 else:
                     sens = self._build_padded_sens(micro_index)
                 grad_fn.accumulate_grad(sens=sens)
-        self.release_sharded_grad_sources_after_backward()
+        self._release_reduced_grad_sources_after_backward()
         if handles:
             platform.clear_recompute_session(session_id)
         if not self.is_first_stage:
@@ -295,7 +295,7 @@ class PipelineStageBase:
                             f"stage: {self.stage_index} micro_{micro_index} dw called before dx."
                         )
                     grad_fn.compute_weight_grad()
-            self.release_sharded_grad_sources_after_backward()
+            self._release_reduced_grad_sources_after_backward()
             if handles:
                 platform.clear_recompute_session(session_id)
             self._clear_recv_buffer(self.grad_recv_info, micro_index)

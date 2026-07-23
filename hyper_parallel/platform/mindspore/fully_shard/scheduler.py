@@ -19,7 +19,7 @@ from mindspore._c_expression import _DisableMsDispatchMode
 from mindspore.common.api import _pynative_executor
 from mindspore.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
-from hyper_parallel.core.fully_shard.hsdp_utils import get_dtensor_managed_mesh
+from hyper_parallel.core.fully_shard.hsdp_utils import get_dtensor_managed_mesh, get_hsdp_state
 from hyper_parallel.platform.mindspore.fully_shard.hook_function import PostBackwardFunction
 from hyper_parallel.platform.mindspore.fully_shard.param_group import get_comm_ctx
 from hyper_parallel.platform.mindspore.fully_shard.state import MindSporeHSDPStateV2
@@ -157,10 +157,10 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         module (each layer becomes its own root yet is fed a grad-requiring activation).
         PP hit the same boundary and worked around it with ``force_reduce=True`` from
         ``PipelineStage.execute_reduce_grad``; that call site keeps working -- the drain is
-        simply always performed now. When sharded gradient accumulation is enabled, the
-        replicate all-reduce is disabled while native reduce-scatter leaves one tail op
-        pending to overlap the next micro-batch. The final pipeline action passes
-        ``force_reduce=True`` and drains that work before the optimizer reads gradients.
+        simply always performed now. Pipeline sharded accumulation uses the existing
+        ``requires_gradient_sync``, ``requires_all_reduce``, and ``is_last_backward``
+        controls: non-final micro-batches reduce to local shards and leave one native
+        fused tail pending, while the final pipeline action passes ``force_reduce=True``.
 
         ``root_bp_state`` (top-level root backward in flight; gates forward prefetch during
         activation recompute) is independent of the drain and is cleared only by the root
@@ -170,8 +170,9 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         if self._is_root:
             HSDPSchedulerV2.root_bp_state = False
         if (
-            getattr(self.hsdp_state, "sharded_accumulated_grad", False)
-            and not getattr(self.hsdp_state, "requires_all_reduce", True)
+            self.hsdp_state.reduce_grads
+            and not self.hsdp_state.requires_all_reduce
+            and not self.scheduler_ctx.is_last_backward
             and not force_reduce
         ):
             return
@@ -191,10 +192,30 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
             MindSporeHSDPStateV2.pending_all_reduce_groups.append(group)
         # Step 3: Wait/apply any remaining reduce-scatter for pure FSDP params
         self.hsdp_state.reduce_scattered_params()
-        # Step 4: Wait for pending all-reduce groups and apply grads
-        MindSporeHSDPStateV2.delay_apply_reduce_grads()
-        # Step 5: Process any remaining all-reduce params (without fusion)
+        # Step 4: Process any remaining all-reduce params (without fusion)
         self.hsdp_state.reduce_params()
+        # Step 5: At the explicit pipeline boundary, queue the replicate reduction
+        # for every local shard accumulated while requires_all_reduce was False.
+        if force_reduce and self.scheduler_ctx.is_last_backward:
+            for hsdp_state in self._get_root_hsdp_states():
+                hsdp_state._queue_accumulated_sharded_grad_all_reduces()  # pylint: disable=protected-access
+        # Step 6: Wait for all regular and step-final all-reduce groups together.
+        MindSporeHSDPStateV2.delay_apply_reduce_grads()
+
+    def _get_root_hsdp_states(self) -> List[MindSporeHSDPStateV2]:
+        """Return distinct HSDP states managed by this scheduler's root module."""
+        root_module = self.scheduler_ctx.root_module or self.cell
+        hsdp_states = []
+        seen_states = set()
+        for _, module in self.platform.get_cells_and_names(root_module):
+            hsdp_state = get_hsdp_state(module)
+            if hsdp_state is None or id(hsdp_state) in seen_states:
+                continue
+            seen_states.add(id(hsdp_state))
+            hsdp_states.append(hsdp_state)
+        if not hsdp_states:
+            hsdp_states.append(self.hsdp_state)
+        return hsdp_states
 
     def _backward_hook(self):
         """Execute backward hook."""

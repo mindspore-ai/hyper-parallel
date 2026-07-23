@@ -40,7 +40,6 @@ class HSDPConfigV2:
         replicate_params=None,
         comm_fusion=False,
         comm_fusion_zero_copy=False,
-        sharded_accumulated_grad=False,
     ):
         self.mesh = mesh
         self.reshard_after_forward = reshard_after_forward
@@ -52,7 +51,6 @@ class HSDPConfigV2:
         self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
         self.comm_fusion = comm_fusion
         self.comm_fusion_zero_copy = comm_fusion_zero_copy
-        self.sharded_accumulated_grad = sharded_accumulated_grad
 
 
 class ShardedState(Enum):
