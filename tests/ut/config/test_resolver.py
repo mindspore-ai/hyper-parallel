@@ -14,20 +14,25 @@
 # ============================================================================
 """Tests for target-selected YAML resolution and typed CLI overrides."""
 
+import dataclasses
+import importlib.util
+import sys
 import tempfile
 import textwrap
 import unittest
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional, Union
 
 from hyper_models.components.loss import CausalLMLoss
 from hyper_models.components.optim import AdamW, LRScheduler
 from hyper_models.config.manager import parse_training_args
 from hyper_models.config.resolver import (
     ConfigResolutionError,
+    _annotation_assignable,
     coerce_value,
+    resolve_component,
     resolve_root,
 )
 from hyper_models.trainer.config import (
@@ -70,6 +75,16 @@ class _MyWarmup(LRScheduler):
     def __init__(self, config: "_MyWarmup.Config") -> None:
         """Store the custom scheduler configuration."""
         self.config = config
+
+
+@dataclass
+class _WithInitVar:
+    seed: dataclasses.InitVar[int]
+    derived: int = 0
+
+    def __post_init__(self, seed: int) -> None:
+        """Derive a stored field from the InitVar seed."""
+        self.derived = seed * 2
 
 
 class TestTrainingConfigResolution(unittest.TestCase):
@@ -442,6 +457,96 @@ class TestTrainingConfigResolution(unittest.TestCase):
         optimizer_component = optimizer_config.build()
         self.assertIsInstance(optimizer_component, AdamW)
         self.assertEqual(optimizer_component.config.lr, 0.1)
+
+
+class TestCoercionEdgeCases(unittest.TestCase):
+    """Regression tests for scalar, Literal, union, and InitVar coercion."""
+
+    def test_cli_scientific_notation_float_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                    model:
+                      _target_: hyper_parallel.trainer.config.ModelConfig
+                      name: qwen3_5
+                    optimizer:
+                      _target_: hyper_models.components.optim.AdamW.Config
+                    """
+                ),
+                encoding="utf-8",
+            )
+            config = parse_training_args([str(path), "--optimizer.lr=1e-4"])
+
+        self.assertEqual(config.optimizer.lr, 1e-4)
+        self.assertIsInstance(config.optimizer.lr, float)
+
+    def test_literal_yaml11_bool_words(self):
+        self.assertEqual(
+            coerce_value(False, Literal["off", "none", "full"], path="test.ac"),
+            "off",
+        )
+        self.assertEqual(
+            coerce_value(True, Literal["on", "off"], path="test.mode"),
+            "on",
+        )
+        with self.assertRaisesRegex(ConfigResolutionError, r"expected one of"):
+            coerce_value(False, Literal["none", "full"], path="test.ac")
+
+    def test_annotation_assignable_accepts_identical_unions(self):
+        self.assertTrue(
+            _annotation_assignable(Union[int, str], Union[int, str])
+        )
+        self.assertTrue(
+            _annotation_assignable(int, Union[int, str])
+        )
+        self.assertFalse(
+            _annotation_assignable(Union[int, str], int)
+        )
+
+    def test_initvar_field_is_accepted(self):
+        result = resolve_component(
+            {"_target_": f"{__name__}._WithInitVar", "seed": 21},
+            expected_type=object,
+            path="$.component",
+        )
+        self.assertEqual(result.derived, 42)
+
+
+class TestPlainClassTarget(unittest.TestCase):
+    """Plain (non-dataclass) classes resolve constructor hints from __init__."""
+
+    def test_future_annotations_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            module_path = Path(directory) / "pep563_target.py"
+            module_path.write_text(
+                textwrap.dedent(
+                    '''
+                    from __future__ import annotations
+
+
+                    class PlainTarget:
+                        def __init__(self, name: str, count: int = 1) -> None:
+                            self.name = name
+                            self.count = count
+                    '''
+                ),
+                encoding="utf-8",
+            )
+            spec = importlib.util.spec_from_file_location("pep563_target", module_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["pep563_target"] = module
+            self.addCleanup(sys.modules.pop, "pep563_target")
+            spec.loader.exec_module(module)
+
+            result = resolve_component(
+                {"_target_": "pep563_target.PlainTarget", "name": "x", "count": 2},
+                expected_type=object,
+                path="$.component",
+            )
+
+        self.assertEqual((result.name, result.count), ("x", 2))
 
 
 if __name__ == "__main__":
