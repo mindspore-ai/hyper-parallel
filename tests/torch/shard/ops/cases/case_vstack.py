@@ -72,7 +72,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 register(OpShardCase(
@@ -89,7 +89,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # --- 3D on 2D mesh ---
@@ -108,7 +108,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # --- 0D scalar ---
@@ -127,7 +127,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # --- 1D cases ---
@@ -146,7 +146,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 register(OpShardCase(
@@ -163,7 +163,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # --- Mixed ndim ---
@@ -182,7 +182,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 register(OpShardCase(
@@ -199,7 +199,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # --- Multi / single ---
@@ -220,7 +220,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 register(OpShardCase(
@@ -235,7 +235,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # --- 8-card 3D mesh ---

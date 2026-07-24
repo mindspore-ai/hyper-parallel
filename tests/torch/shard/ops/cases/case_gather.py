@@ -97,7 +97,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # Data parallel dim=1: x sharded on seq, index replicated
@@ -115,7 +115,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # Data parallel dim=2: x sharded on feature, index replicated
@@ -133,7 +133,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # Row parallel dim=0: x sharded and index co-sharded on non-gather axis
@@ -151,7 +151,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # Explicit sparse_grad=False: verify keyword args are forwarded correctly
@@ -169,7 +169,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # =============================================================================
@@ -191,7 +191,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # 2D gather dim=1 with DP on dim=1
@@ -209,7 +209,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # =============================================================================
@@ -231,7 +231,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # =============================================================================
@@ -252,7 +252,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # =============================================================================
@@ -274,7 +274,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # Negative dim with sharding on non-gather axes:
@@ -293,7 +293,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # =============================================================================
@@ -315,7 +315,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # Duplicate indices: verify gather with repeated index values
@@ -333,7 +333,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # Out-of-order indices: verify gather with shuffled index order
@@ -351,7 +351,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # =============================================================================
@@ -373,7 +373,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2, 2),
     mesh_dim_names=("dp", "cp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
 
 # 3D mesh matched non-gather axes
@@ -391,5 +391,5 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2, 2),
     mesh_dim_names=("dp", "cp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level1", "npu_level1"),
 ))
