@@ -3671,32 +3671,44 @@ Planner (Phase 4 后处理)          Phase A 前置                    Phase C w
 → spec._moe_router 选 adapter        distribute_tensor 分片          (all_to_all 在这里)
 ```
 
-ep=1（mesh 无 ep 轴）时不做任何标记，走原路径（TP-only 下 per-expert 2D
-分片语义本来就正确）；pre-stacked MoE（`experts.w1 [E, ...]` 3D，如
-TinyMoEMLP、自研 EP-aware 模块）同样走原路径——两条老路径完全不受影响。
+ep=1 时不做任何标记，走原路径（TP-only 下 per-expert 2D
+分片语义本来就正确）。
 
 ##### D-09a：Planner 标记（`_mark_hf_native_moe`，Phase 4 后处理）
 
-对 `boundary_type == "moe_mlp"` 的边界，检查组内 MOE_EXPERT 参数名是否命中
-per-expert 模式 `experts.<数字>.<proj>.weight`：
+**EP 模式判别（2026-07-24 修订）**：EP 模式（old-style EP vs D-10
+TP-extend-EP）由 **mesh 是否含 `"ep"` 轴**唯一决定，不再依赖参数命名：
+
+- **`"ep" in mesh_dim_names` → old-style EP**：`_build_spec_from_template`
+  已生成 `{TP: Shard(…), CP: Replicate(), EP: Shard(0)}` 的正确双轴分片。
+  `_mark_hf_native_moe` 仅做 stacking（当 expert 为 per-expert 2D 布局时），
+  stacked 条目保留 TP 和 EP 双键。batched/custom 布局已是 3D，无需处理。
+  不设 `_ep_size`。
+
+- **`"ep" not in mesh_dim_names` → D-10 TP-extend-EP**：expert 权重覆盖为
+  `{EP: Shard(0)}`（无 TP 键），边界契约改为 SP-in identity，设 `_ep_size`。
+
+**参数布局检测（仅影响 stacking 策略，与 EP 模式正交）**：检查组内
+MOE_EXPERT 参数名命中何种布局——
+
+- **per-expert** `experts.<数字>.<proj>.weight` → 需 stack；
+- **batched（D-11）** `experts.gate_up_proj` 等 → 天生 3D，无需 stack；
+- **custom** `experts.w1`/`w2`/`w3` → pre-stacked 3D，无需 stack。
+
+D-10 模式下三种布局均支持；old-style EP 模式下仅 per-expert 需 stack。
 
 ```python
 # spec 新增内部字段（与 use_local_map 同族的结构标记）
 spec._ep_stack: Dict[str, List[str]] = {}   # stacked 相对路径 → 源参数相对路径（按 expert idx 排序）
 spec._moe_router: str = "default"           # router adapter 名（按 arch 查注册表）
 
-# spec.params 改写（对每组 per-expert 参数）：
-#   源: experts.0.gate_proj.weight, experts.1.gate_proj.weight, ...  (逐条删除)
-#   目标: experts.gate_proj → {TP: Shard(1), CP: Replicate(), EP: Shard(0)}
-#   （ndim=3 语义——colwise proj: gate/up/w1/w3 切 H_out=Shard(1)；
-#     rowwise proj: down/w2 切 H_in=Shard(2)，即 D-08 规则的直接复用）
+# D-10 TP-extend-EP（"ep" not in mesh_dim_names）：
+#   spec.params 改写为 {EP: Shard(0)}（无 TP 键、无第二轴，§6.4.8）
+#
+# old-style EP（"ep" in mesh_dim_names）：
+#   spec.params 保留 {TP: Shard(…), EP: Shard(0)} 双轴分片；
+#   per-expert 布局先 stack 再写入
 ```
-
-placement 推导不新增规则：stacked ndim=3 恰好落入 D-08 的
-`_moe_expert_tp_placement(ndim>=3)` 分支，planner 只需把 ndim 按
-"per-expert ndim + 1" 传入。**D-10 定稿后实际写入的 stacked 条目为
-`{CP: Replicate(), EP: Shard(0)}`（无 TP 键、无第二轴，§6.4.8）**——
-上述 TP 键写法为 D-09 初版契约，此处保留作设计记录。
 
 ##### D-09b：Phase A 前置堆叠（`_stack_moe_experts`，sharding/apply.py）
 
@@ -3913,11 +3925,13 @@ module.config；选择分 = sigmoid 分 + correction bias，权重分 = 无 bias
 > **完整** expert，无 hidden 维第二轴切分，因此计算流中**不存在**
 > all_gather/reduce_scatter 对。
 >
-> **实现状态（2026-07-21）**：planner `_mark_hf_native_moe` 生成
-> `{EP: Shard(0)}` 契约（无 TP 键、无第二轴），支持两种 expert 布局——
-> per-expert 2D（旧版 HF/自研，`_ep_stack` 堆叠）与 **batched 3D**
+> **实现状态（2026-07-24）**：planner `_mark_hf_native_moe` 生成
+> `{EP: Shard(0)}` 契约（无 TP 键、无第二轴），支持三种 expert 布局——
+> per-expert 2D（旧版 HF/自研，`_ep_stack` 堆叠）、**batched 3D**
 > （HF 2025 重构后 `experts.gate_up_proj [E,2I,H]`，天生 stacked 无需
-> 堆叠，D-11）；`_expert_mesh_layout`（全 dense 区域 → (edp, ep) 纯
+> 堆叠，D-11）、**custom 3D**（`experts.w1/w2/w3`，pre-stacked 无需
+> 堆叠）；EP 模式由 mesh 是否含 `"ep"` 轴唯一决定（不再依赖参数命名）；
+> `_expert_mesh_layout`（全 dense 区域 → (edp, ep) 纯
 > rank 映射）+ `_build_expert_mesh`；`_hf_native_ep_compute`（router →
 > a2a → 本地 SwiGLU（分离/fused 双分支）→ a2a）；router adapter 注册表
 > （qwen3moe/mixtral TopKRouter 模块、deepseekv3/glm4moe sigmoid+

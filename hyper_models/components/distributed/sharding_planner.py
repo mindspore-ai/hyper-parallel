@@ -198,6 +198,46 @@ class ShardingPlanner:
         sequence_parallel: bool = True,
         loss_parallel: bool = False,
     ) -> ShardingPlan:
+        """Derive a ShardingPlan from *model* and *mesh* (6-phase pipeline).
+
+        Args:
+            model: Any HuggingFace ``PreTrainedModel``.
+            mesh: A :class:`~hyper_parallel.core.dtensor.device_mesh.DeviceMesh`
+                whose ``mesh_dim_names`` declare the physical topology axes (e.g.
+                ``("dp", "tp")`` or ``("dp_replicate", "tp", "cp")``).  The
+                ``tp`` / ``cp`` axes are managed by DTensor; ``dp*`` / ``pp``
+                axes belong to FSDP2 / pipeline-parallel runtimes and are
+                filtered out.
+            tp_size: Tensor-parallel group size.  Must be **equal** to
+                ``mesh[\"tp\"].size()`` when ``mesh_dim_names`` contains ``"tp"``
+                and tp_size > 1; a mismatch raises :class:`ValueError`
+                immediately (fail-first).
+            cp_size: Context-parallel group size.  Same fail-first contract as
+                *tp_size* with respect to ``mesh[\"cp\"]``.
+            ep_size: Expert-parallel group size.
+
+                - **D-10 TP-extend-EP** (the default MoE path, 05 §6.4.8): the
+                  mesh does **not** have an ``"ep"`` axis; *ep_size* is the
+                  extended EP group size, and the expert mesh ``(edp, ep)`` is
+                  derived by flattening the full dense region
+                  (``dp × tp × cp``).  *ep_size* is **not** validated against
+                  the mesh in this case.
+                - **Old-style EP** (when ``mesh_dim_names`` contains ``"ep"``):
+                  *ep_size* must equal ``mesh[\"ep\"].size()``, validated
+                  fail-first.
+            sequence_parallel: When ``True`` (default), sequence dimension is
+                sharded across TP (Shard(1) on the ``tp`` axis of activations).
+            loss_parallel: When ``True``, lm_head output stays Shard(-1);
+                otherwise gathered to Replicate (cross-entropy compatibility).
+
+        Returns:
+            :class:`ShardingPlan`: module FQN → :class:`ModuleShardingSpec`.
+
+        Raises:
+            ValueError: If *tp_size* / *cp_size* / *ep_size* do not match the
+                corresponding mesh dimensions (fail-first), or if model-level
+                constraints are violated (head divisibility, expert count, etc.).
+        """
         arch = self._get_architecture(model)
         mesh_dim_names = self._build_mesh_dim_names(mesh, tp_size, cp_size, ep_size)
         # D-10 TP-extend-EP (05 §6.4.8): ep_size is the extended EP group
@@ -284,11 +324,76 @@ class ShardingPlanner:
                 s = s[: -len(suffix)]
         return s
 
+    @staticmethod
+    def _validate_dtensor_axes(
+        mesh, tp_size: int, cp_size: int, ep_size: int,
+    ) -> None:
+        """Fail-first: validate passed tp/cp/ep sizes against the mesh dimensions.
+
+        The mesh *must* declare ``mesh_dim_names`` (and the corresponding
+        ``mesh_shape``) for validation to proceed; a mesh without names skips
+        validation (backward-compatible fallback).
+
+        Degenerate single-rank meshes (all dimensions size 1, common in
+        compile-time unit tests) also skip validation — on a single rank every
+        DTensor placement is a no-op.
+
+        Rules:
+        - tp_size > 1 → mesh must contain a "tp" axis whose size equals tp_size.
+        - cp_size > 1 → mesh must contain a "cp" axis whose size equals cp_size.
+        - ep_size > 1 is validated only when the mesh has an explicit "ep"
+          dimension (old-style EP).  In D-10 TP-extend-EP the ep group is
+          *derived* from the dense region, not a native mesh axis, so the
+          absence of "ep" in mesh_dim_names is expected and not an error.
+        """
+        mesh_names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
+        mesh_shape = tuple(getattr(mesh, "mesh_shape", ()) or ())
+        if not mesh_names or not mesh_shape:
+            return  # cannot validate without mesh metadata
+
+        # Degenerate single-rank mesh (compile-time test fixtures): skip
+        if all(sz == 1 for sz in mesh_shape):
+            return
+
+        name_to_size = dict(zip(mesh_names, mesh_shape))
+
+        for ax, size in (("tp", tp_size), ("cp", cp_size)):
+            if size > 1:
+                if ax not in name_to_size:
+                    raise ValueError(
+                        f"{ax}_size={size} > 1, but the mesh has no '{ax}' dimension. "
+                        f"Mesh dimensions: {list(name_to_size.keys())}. "
+                        f"Either add '{ax}' to the mesh's mesh_dim_names, or set "
+                        f"{ax}_size=1."
+                    )
+                mesh_sz = name_to_size[ax]
+                if size != mesh_sz:
+                    raise ValueError(
+                        f"{ax}_size ({size}) does not match mesh['{ax}'] size "
+                        f"({mesh_sz}). They must be equal."
+                    )
+
+        # ep_size: only validate when "ep" is a declared mesh axis (old-style
+        # EP).  D-10 TP-extend-EP does not put "ep" in mesh_dim_names — the
+        # ep group is derived from the dense region by _expert_mesh_layout.
+        if ep_size > 1 and "ep" in name_to_size:
+            mesh_sz = name_to_size["ep"]
+            if ep_size != mesh_sz:
+                raise ValueError(
+                    f"ep_size ({ep_size}) does not match mesh['ep'] size "
+                    f"({mesh_sz}). They must be equal."
+                )
+
     def _build_mesh_dim_names(
         self, mesh, tp_size: int, cp_size: int, ep_size: int,
     ) -> Tuple[str, ...]:
         """Filter tp/cp/ep with mesh.mesh_dim_names as the authoritative
-        order; fall back to (tp,cp,ep) when undeclared; drop size=1 axes."""
+        order; fall back to (tp,cp,ep) when undeclared; drop size=1 axes.
+
+        Raises :class:`ValueError` when *tp_size* / *cp_size* do not match the
+        corresponding mesh dimension sizes (fail-first before any planning work).
+        """
+        self._validate_dtensor_axes(mesh, tp_size, cp_size, ep_size)
         mesh_names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
         dtensor_axes = ("tp", "cp", "ep")
         active = {ax for ax, sz in (("tp", tp_size), ("cp", cp_size), ("ep", ep_size))
@@ -527,7 +632,7 @@ class ShardingPlanner:
         # SPECIAL → Phase 6; SKIP → not sharded
         return None
 
-    # ── Phase 4 post-processing: HF-native MoE marking (D-09, 05 §6.4.7) ──
+    # ── Phase 4 post-processing: MoE EP marking (D-09/D-10, 05 §6.4.7/§6.4.8) ──
 
     @staticmethod
     def _validate_ep_extend(ep_extend, mesh, model) -> None:
@@ -538,8 +643,6 @@ class ShardingPlanner:
 
         The dense region = all ranks of the non-pp mesh axes
         (dp_replicate × dp_cp × tp).
-        Called only when _mark_hf_native_moe actually matches an
-        HF-native MoE.
         """
         names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
         shape = tuple(getattr(mesh, "mesh_shape", ()) or ())
@@ -571,9 +674,7 @@ class ShardingPlanner:
     # numeric segment, the layout after the HF 2025 refactor —
     # gate_up_proj [E, 2I, H] / down_proj [E, H, I], natively stacked with
     # no stacking needed; the automodel names gate_and_up_projs/down_projs
-    # are isomorphic). w1/w2/w3 names are not accepted: that is the
-    # conventional layout of EP-aware pre-stacked modules (own dispatcher),
-    # which follow the original path.
+    # are isomorphic).
     _BATCHED_EXPERT_RE = re.compile(
         r"^experts\.(gate_up_proj|gate_and_up_projs|down_proj|down_projs"
         r"|gate_proj|up_proj)$")
@@ -583,29 +684,38 @@ class ShardingPlanner:
         template: ShardingTemplate, mesh_dim_names: Tuple[str, ...], arch: str,
         *, ep_extend: int = 0, mesh=None, model=None, param_ndims=None,
     ) -> None:
-        """HF-native MoE → TP-extend-EP metadata (D-09a stacking /
-        D-11 batched + D-10).
+        """Post-process moe_mlp spec for EP (05 §6.4.7/§6.4.8).
 
-        Match condition: ep_extend > 0 (i.e. ep_size > 1) and all MOE_EXPERT
-        parameters in the group belong to the same layout (mixed layouts
-        are not marked and emit a warning):
-        - **per-expert layout** (legacy HF / in-house):
-          experts.<idx>.<proj>.weight 2D parameters → record _ep_stack
-          stacking metadata and replace spec.params with the stacked
-          entry {EP: Shard(0)};
-        - **batched layout** (after the HF 2025 refactor, D-11):
-          experts.gate_up_proj [E, 2I, H] / experts.down_proj [E, H, I]
-          and similar single-attribute 3D parameters — natively stacked
-          with no stacking needed (_ep_stack stays empty); mark
-          {EP: Shard(0)} directly.
-        In both layouts the expert weights are sharded only along the
-        expert dim (each rank of the extended EP group holds
-        num_experts/ep_size complete experts; no second axis, 05 §6.4.8);
-        the MoE boundary contract is changed to SP-in identity
-        (communication-cohesive region); records
-        spec._ep_stack / spec._moe_router / spec._ep_size.
-        v1 does not support expert bias (a bias hit is not marked and
-        emits a warning).
+        The EP **mode** is determined solely by whether the mesh includes an
+        explicit ``"ep"`` axis — NOT by parameter naming:
+
+        * **Old-style EP** (``"ep" in mesh_dim_names``): the mesh already has
+          an ``"ep"`` axis.  :meth:`_build_spec_from_template` produced
+          ``{TP: Shard(…), EP: Shard(0)}`` — the correct dual-axis
+          sharding.  This method only performs **stacking** when the expert
+          layout is per-expert 2D (``experts.<idx>.<proj>.weight``); the
+          stacked entry keeps both TP and EP keys.  Batched 3D and custom
+          (``w1``/``w2``/``w3``) layouts are already ready — nothing to do.
+          No ``_ep_size`` is set; communication is handled by the module's
+          own dispatcher or external ``_attach_ep``.
+
+        * **D-10 TP-extend-EP** (``"ep" not in mesh_dim_names``, the
+          default for HF-native models): the ep group is *derived* from the
+          dense region.  Expert weights are rewritten to
+          ``{EP: Shard(0)}`` (no TP key), the boundary contract is changed
+          to SP-in identity, and ``_ep_size`` is set.
+
+        The expert **layout** (per-expert / batched / custom) only affects
+        the *stacking strategy* — orthogonal to the EP mode:
+
+        - **per-expert**: ``experts.<idx>.<proj>.weight`` → stack into
+          ``experts.<proj>`` 3D before sharding;
+        - **batched** (D-11): ``experts.gate_up_proj`` etc., natively 3D;
+        - **custom**: ``experts.w1`` / ``w2`` / ``w3``, already 3D,
+          pre-stacked by the module author.
+
+        In D-10 mode all three layouts are supported; in old-style EP mode
+        only per-expert needs stacking (batched and custom are already 3D).
         """
         if not ep_extend:
             return
@@ -613,8 +723,11 @@ class ShardingPlanner:
         if not expert_params:
             return
 
-        stacks: Dict[str, List[Tuple[int, str]]] = {}   # proj → [(expert_idx, rel_path)]
-        batched: List[str] = []                          # rel paths of the batched layout
+        has_ep_in_mesh = "ep" in mesh_dim_names
+
+        # ── Detect expert layout (only affects stacking strategy) ──
+        stacks: Dict[str, List[Tuple[int, str]]] = {}
+        batched: List[str] = []
         for param_fqn in expert_params:
             rel = param_fqn[len(boundary_fqn) + 1:]
             if "bias" in rel.lower():
@@ -632,13 +745,9 @@ class ShardingPlanner:
                     and (param_ndims or {}).get(param_fqn, 2) >= 3):
                 batched.append(rel)
                 continue
-            logger.warning(
-                "%s: MoE parameter %s is neither per-expert nor batched "
-                "layout; skipping EP marking (the EP Shard(0) semantics do "
-                "not hold for a 2D parameter)",
-                boundary_fqn, rel,
-            )
-            return
+            # Custom naming (w1/w2/w3 etc.) — pre-stacked 3D, no-op for
+            # both modes; D-10 will mark EP on them below.
+
         if stacks and batched:
             logger.warning(
                 "%s: mixed per-expert and batched layouts (%s ...); "
@@ -647,25 +756,63 @@ class ShardingPlanner:
             )
             return
 
-        # D-10 validation runs on an actual match (pre-stacked modules are
-        # not subject to the dense region constraint)
+        # ────────────────────────────────────────────────────────────────
+        # Old-style EP: mesh has explicit "ep" axis
+        # ────────────────────────────────────────────────────────────────
+        if has_ep_in_mesh:
+            if not stacks:
+                # Batched / custom layouts: already 3D, placements from
+                # _build_spec_from_template ({TP: Shard(…), EP: Shard(0)})
+                # are correct. Nothing to do.
+                return
+            # Per-expert layout: stack first so the expert dim exists for
+            # EP Shard(0).  Keep both TP and EP keys — old-style EP shards
+            # on both axes simultaneously on the main mesh.
+            for proj, items in stacks.items():
+                items.sort()
+                sources = [rel for _, rel in items]
+                stacked = f"experts.{proj}"
+                # Compute the correct TP placement for the 3D stacked
+                # tensor (ndim=3 shifts TP axes: colwise Shard(1),
+                # rowwise Shard(2))
+                tp_p = _moe_expert_tp_placement(stacked, ndim=3, template=template)
+                for rel in sources:
+                    spec.params.pop(rel, None)
+                spec.params[stacked] = _multi_dim(
+                    tp=tp_p, cp=Replicate(),
+                    ep=template.moe_expert_placement)
+                spec._ep_stack[stacked] = sources
+            # No _ep_size — old-style EP uses the main mesh's "ep" axis
+            return
+
+        # ────────────────────────────────────────────────────────────────
+        # D-10 TP-extend-EP: mesh has NO "ep" axis
+        # ────────────────────────────────────────────────────────────────
         self._validate_ep_extend(ep_extend, mesh, model)
 
-        # D-10 TP-extend-EP: expert weights are Shard(0) only along the
-        # expert dim (on the ep axis of the derived expert mesh (edp, ep));
-        # no TP key, no second-axis sharding
-        for proj, items in stacks.items():
-            items.sort()
-            sources = [rel for _, rel in items]
-            stacked = f"experts.{proj}"
-            for rel in sources:
-                spec.params.pop(rel, None)
-            spec.params[stacked] = _multi_dim(
-                tp=None, cp=Replicate(), ep=template.moe_expert_placement)
-            spec._ep_stack[stacked] = sources
-        for rel in batched:
-            spec.params[rel] = _multi_dim(
-                tp=None, cp=Replicate(), ep=template.moe_expert_placement)
+        if stacks:
+            # Per-expert layout: stack + {EP: Shard(0)} (no TP key)
+            for proj, items in stacks.items():
+                items.sort()
+                sources = [rel for _, rel in items]
+                stacked = f"experts.{proj}"
+                for rel in sources:
+                    spec.params.pop(rel, None)
+                spec.params[stacked] = _multi_dim(
+                    tp=None, cp=Replicate(), ep=template.moe_expert_placement)
+                spec._ep_stack[stacked] = sources
+        elif batched:
+            # Batched layout: already 3D, just mark {EP: Shard(0)}
+            for rel in batched:
+                spec.params[rel] = _multi_dim(
+                    tp=None, cp=Replicate(), ep=template.moe_expert_placement)
+        else:
+            # Custom naming (w1/w2/w3): pre-stacked 3D, mark {EP: Shard(0)}
+            for param_fqn in expert_params:
+                rel = param_fqn[len(boundary_fqn) + 1:]
+                spec.params[rel] = _multi_dim(
+                    tp=None, cp=Replicate(), ep=template.moe_expert_placement)
+
         spec._moe_router = arch if arch in MOE_ROUTER_ADAPTERS else "default"
 
         # D-10: change the MoE boundary contract to SP-in identity

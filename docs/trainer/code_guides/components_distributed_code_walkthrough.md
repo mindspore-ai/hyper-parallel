@@ -302,17 +302,25 @@ plan = ShardingPlanner(plan_overrides={"model.layers.0.mlp": my_spec}).plan(
 
 
 > **用例**：[`test_s1_role_mapping.py`](../../../tests/components/distributed/test_s1_role_mapping.py)（S1.6：13 角色 → placement 映射 + D-08 ndim=3 平移）。
-### 2.5 Phase 4 后处理：`_mark_hf_native_moe(...)`（D-09 堆叠 + D-10 TP-extend-EP 核心）
+### 2.5 Phase 4 后处理：`_mark_hf_native_moe(...)`（EP 标记核心）
 
-[sharding_planner.py:L556-653](../../../hyper_models/components/distributed/sharding_planner.py#L556-L653)
+[sharding_planner.py:L635-788](../../../hyper_models/components/distributed/sharding_planner.py#L635-L788)
 
-**功能**：识别 HF 原生 MoE 的两种 expert 布局（D-09a 堆叠 / D-11 batched），把 spec 改写为（堆叠元数据 +）TP-extend-EP 形式。
-**命中条件**：`ep_extend>0`（即 ep_size>1）且组内全部 MOE_EXPERT 参数属于同一布局（`_PER_EXPERT_RE` / `_BATCHED_EXPERT_RE`（[L547-554](../../../hyper_models/components/distributed/sharding_planner.py#L547-L554)），混合不标记并 warning）：
-- **per-expert**：`experts.<idx>.<proj>.weight`（旧版 HF / 自研）→ 记录 `_ep_stack` 堆叠元数据；
-- **batched**（D-11，当前 HF main）：`experts.gate_up_proj [E,2I,H]` / `down_proj [E,H,I]` 等单属性 3D 参数（ndim≥3）→ 天生 stacked，`_ep_stack` 留空跳过堆叠。
-`w1/w2/w3` 命名的 pre-stacked 布局**不收**（EP-aware 模块约定，走自身 dispatcher）；expert bias v1 不支持（不标记并 warning）。
+**功能**：对 moe_mlp 边界进行 EP 后处理。**EP 模式由 mesh 是否含 `"ep"` 轴唯一决定**（不再依赖参数命名），参数布局只影响 stacking 策略。
 
-原命中条件（[L547-554](../../../hyper_models/components/distributed/sharding_planner.py#L547-L554)，`^experts\.(\d+)\.([^.]+)\.weight$`）。任一不满足 → 原样返回（pre-stacked 布局走模块自身 dispatcher）。
+**EP 模式判别**（2026-07-24 修订）：
+
+- **`"ep" in mesh_dim_names` → old-style EP**：mesh 已有显式 `"ep"` 轴，`_build_spec_from_template` 生成的 `{TP: Shard(…), EP: Shard(0)}` 双轴分片已正确。仅当 expert 为 per-expert 2D 布局时做 stacking（保留 TP+EP 双键）。不设 `_ep_size`。通信由模块自身 dispatcher 或外部 `_attach_ep` 管理。
+
+- **`"ep" not in mesh_dim_names` → D-10 TP-extend-EP**（默认路径）：expert 权重覆盖为 `{EP: Shard(0)}`（无 TP 键、无第二轴），边界契约改为 SP-in identity，设 `_ep_size`。D-10 校验（`_validate_ep_extend`：ep_size ≤ dense 区域且整除、num_experts 整除 ep_size）。
+
+**参数布局检测**（仅影响 stacking 策略，与 EP 模式正交）：
+
+- **per-expert**：`experts.<idx>.<proj>.weight` → stack 成 `experts.<proj>` 3D；
+- **batched（D-11）**：`experts.gate_up_proj [E,2I,H]` / `down_proj [E,H,I]` 等单属性 3D 参数 → 天生 stacked，`_ep_stack` 留空；
+- **custom**：`experts.w1/w2/w3` → pre-stacked 3D，无需处理。
+
+D-10 模式下三种布局均支持。旧式 EP 模式下仅 per-expert 需 stack 处理。
 
 **命中后做三件事**：
 
