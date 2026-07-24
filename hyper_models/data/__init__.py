@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components"""
+"""Data pipeline — stubs following design doc 02_data_pipeline.md."""
 
-from hyper_models.components import training
+from hyper_models.data.build_dataloader import (
+    build_dataloader,
+    build_validation_dataloader,
+)
 
-__all__ = ["training"]
-
+__all__ = ["build_dataloader", "build_validation_dataloader"]

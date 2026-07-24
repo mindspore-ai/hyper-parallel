@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components"""
+"""LLM recipes."""
 
-from hyper_models.components import training
+from hyper_models.recipes.llm.train_ft import FinetuneRecipe
 
-__all__ = ["training"]
-
+__all__ = ["FinetuneRecipe"]
