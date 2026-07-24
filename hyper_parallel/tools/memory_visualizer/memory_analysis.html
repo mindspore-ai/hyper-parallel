@@ -1,0 +1,4930 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MS Runtime 显存分析</title>
+  <style data-main-page>
+    :root {
+      --bg: #f6f2e9;
+      --panel: rgba(255, 251, 245, 0.96);
+      --line: #dccfb9;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --blue: #2563eb;
+      --red: #dc2626;
+      --amber: #d97706;
+      --teal: #0f766e;
+      --shadow: 0 18px 50px rgba(86, 64, 26, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      min-height: 100%;
+      overflow-x: hidden;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(15, 118, 110, 0.16), transparent 30%),
+        radial-gradient(circle at top right, rgba(217, 119, 6, 0.14), transparent 26%),
+        linear-gradient(180deg, #faf7f0, var(--bg));
+    }
+
+    .app {
+      width: min(1600px, calc(100vw - 24px));
+      margin: 12px auto;
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+      min-width: 0;
+    }
+
+    .sidebar {
+      padding: 18px;
+      position: sticky;
+      top: 12px;
+    }
+
+    .content {
+      min-width: 0;
+      display: grid;
+      gap: 16px;
+    }
+
+    h1,
+    h2 {
+      margin: 0;
+      line-height: 1.15;
+    }
+
+    h1 {
+      font-size: 28px;
+      margin-bottom: 10px;
+    }
+
+    h2 {
+      font-size: 18px;
+    }
+
+    .lead,
+    .muted,
+    .small {
+      color: var(--muted);
+    }
+
+    .lead {
+      font-size: 14px;
+      line-height: 1.6;
+      margin: 0 0 16px;
+    }
+
+    .block {
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.62);
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+
+    .block-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--teal);
+      margin-bottom: 10px;
+    }
+
+    label,
+    .small {
+      display: block;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    input[type="file"],
+    input[type="number"],
+    select {
+      width: 100%;
+      margin-top: 8px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.92);
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 12px;
+      padding: 11px 14px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #fff;
+      cursor: pointer;
+      background: linear-gradient(135deg, #0f766e, #2563eb);
+    }
+
+    button.secondary {
+      margin-top: 10px;
+      background: linear-gradient(135deg, #9a3412, #d97706);
+    }
+
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .checks {
+      display: grid;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      color: var(--text);
+    }
+
+    .check input {
+      margin: 0;
+      width: 16px;
+      height: 16px;
+    }
+
+    .stats {
+      display: grid;
+      gap: 10px;
+    }
+
+    .stat {
+      padding: 12px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.75);
+      border: 1px solid rgba(220, 207, 185, 0.95);
+    }
+
+    .stat-name {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .stat-value {
+      margin-top: 4px;
+      font-size: 17px;
+      font-weight: 700;
+      word-break: break-word;
+    }
+
+    .viewer {
+      padding: 16px;
+      min-width: 0;
+    }
+
+    .viewer-top {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .line-panel {
+      margin-bottom: 12px;
+      padding: 12px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.68);
+    }
+
+    .line-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--teal);
+      margin-bottom: 8px;
+    }
+
+    .line-form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .line-form input,
+    .line-form select {
+      width: auto;
+      min-width: 120px;
+      margin: 0;
+    }
+
+    .line-form button {
+      width: auto;
+      min-width: 90px;
+    }
+
+    .line-form button.active {
+      background: linear-gradient(135deg, #7c3aed, #2563eb);
+    }
+
+    .line-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .line-item {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.78);
+      font-size: 13px;
+    }
+
+    .line-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      color: var(--text);
+    }
+
+    .line-color {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+
+    .line-remove {
+      width: auto;
+      min-width: 72px;
+      padding: 7px 10px;
+      background: linear-gradient(135deg, #9a3412, #d97706);
+      font-size: 12px;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+    }
+
+    .chart-shell {
+      position: relative;
+      width: 100%;
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 18px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(250, 247, 241, 0.96)),
+        repeating-linear-gradient(
+          90deg,
+          rgba(15, 118, 110, 0.03) 0,
+          rgba(15, 118, 110, 0.03) 1px,
+          transparent 1px,
+          transparent 120px
+        );
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: min(62vh, 640px);
+      min-height: 420px;
+      cursor: grab;
+    }
+
+    canvas.dragging {
+      cursor: grabbing;
+    }
+
+    canvas.line-adding {
+      cursor: crosshair;
+    }
+
+    canvas.line-hover {
+      cursor: ns-resize;
+    }
+
+    .status,
+    .tooltip {
+      position: absolute;
+      z-index: 2;
+      color: #f9fafb;
+      background: rgba(17, 24, 39, 0.88);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+      white-space: pre-line;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .tooltip {
+      pointer-events: none;
+    }
+
+    .status {
+      right: 14px;
+      top: 14px;
+      width: max-content;
+      max-width: min(32%, 320px);
+      padding: 10px 12px;
+      cursor: move;
+      user-select: none;
+    }
+
+    .status.hidden {
+      width: auto;
+      max-width: 120px;
+      padding: 7px 10px;
+      background: rgba(15, 118, 110, 0.92);
+      cursor: pointer;
+    }
+
+    .status.dragging-summary {
+      cursor: grabbing;
+    }
+
+    .tooltip {
+      display: none;
+      padding: 8px 10px;
+      transform: translate(12px, -12px);
+    }
+
+    .detail {
+      padding: 16px;
+      min-width: 0;
+    }
+
+    .detail-top {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: end;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .detail-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .detail-controls > div {
+      min-width: 180px;
+    }
+
+    .detail-controls button {
+      width: auto;
+      min-width: 170px;
+    }
+
+    .pager {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .pager-info {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .pager-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .pager-actions button {
+      width: auto;
+      min-width: 84px;
+      padding: 9px 12px;
+    }
+
+    .pager-actions input {
+      width: 96px;
+      margin: 0;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.92);
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .column-panel {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.68);
+    }
+
+    .column-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--teal);
+      margin-bottom: 8px;
+    }
+
+    .column-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+    }
+
+    .column-chip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 6px;
+      border-radius: 8px;
+      font-size: 12px;
+      color: var(--text);
+      white-space: nowrap;
+      cursor: grab;
+      user-select: none;
+    }
+
+    .column-chip input {
+      margin: 0;
+    }
+
+    .column-chip.dragging-column {
+      opacity: 0.48;
+      cursor: grabbing;
+    }
+
+    .column-chip.drop-before {
+      box-shadow: inset 3px 0 0 var(--teal);
+      background: rgba(15, 118, 110, 0.08);
+    }
+
+    .column-chip.drop-after {
+      box-shadow: inset -3px 0 0 var(--teal);
+      background: rgba(15, 118, 110, 0.08);
+    }
+
+    .table-scroll {
+      width: 100%;
+      overflow-x: auto;
+      overflow-y: auto;
+      max-height: 480px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.75);
+    }
+
+    table {
+      width: max-content;
+      min-width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(220, 207, 185, 0.65);
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      background: rgba(248, 244, 236, 0.98);
+      z-index: 1;
+      font-weight: 700;
+    }
+
+    .th-content {
+      display: grid;
+      gap: 7px;
+      min-width: max-content;
+    }
+
+    .th-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .header-tool-button,
+    .sort-button,
+    .clear-filter-button {
+      width: 28px;
+      min-width: 28px;
+      height: 26px;
+      padding: 0;
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1;
+      background: rgba(15, 118, 110, 0.12);
+      color: var(--teal);
+    }
+
+    .header-tool-button {
+      position: relative;
+      display: inline-grid;
+      place-items: center;
+    }
+
+    .header-tool-button::before {
+      content: "";
+      width: 0;
+      height: 0;
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-top: 6px solid currentColor;
+      transform: translateY(1px);
+    }
+
+    .header-tool-button.active::after {
+      content: "";
+      position: absolute;
+      right: 5px;
+      top: 5px;
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .header-tool-button.active,
+    .sort-button.active {
+      background: rgba(15, 118, 110, 0.9);
+      color: #fff;
+    }
+
+    .filter-panel {
+      display: grid;
+      gap: 7px;
+      min-width: 180px;
+      padding-top: 2px;
+    }
+
+    .filter-sort-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .filter-input,
+    .filter-range input {
+      width: 100%;
+      min-width: 0;
+      margin: 0;
+      padding: 6px 7px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.9);
+      color: var(--text);
+      font-size: 12px;
+    }
+
+    .filter-range {
+      display: grid;
+      grid-template-columns: minmax(76px, 1fr) minmax(76px, 1fr);
+      gap: 6px;
+    }
+
+    tr:hover td {
+      background: rgba(37, 99, 235, 0.05);
+    }
+
+    .cell-short {
+      display: inline-block;
+      max-width: 320px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: top;
+    }
+
+    .cell-wrap {
+      position: relative;
+      display: inline-grid;
+      grid-template-columns: minmax(0, 320px) auto;
+      align-items: start;
+      gap: 6px;
+      max-width: 360px;
+      vertical-align: top;
+    }
+
+    .cell-toggle {
+      border: 0;
+      background: transparent;
+      color: var(--blue);
+      cursor: pointer;
+      font-size: 12px;
+      padding: 0;
+      white-space: nowrap;
+      align-self: start;
+    }
+
+    .cell-full {
+      display: none;
+      position: absolute;
+      left: 0;
+      top: calc(100% + 6px);
+      z-index: 5;
+      width: min(720px, 70vw);
+      max-height: 320px;
+      overflow: auto;
+      padding: 10px 12px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 12px;
+      background: rgba(255, 251, 245, 0.99);
+      box-shadow: 0 16px 40px rgba(17, 24, 39, 0.16);
+      white-space: pre;
+      word-break: normal;
+      line-height: 1.5;
+      color: var(--text);
+    }
+
+    .cell-expanded .cell-full {
+      display: block;
+    }
+
+    .hint {
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--muted);
+      margin-top: 10px;
+    }
+
+    .detail-explain {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.62);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .detail-explain-title {
+      margin-bottom: 6px;
+      color: var(--teal);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .detail-explain ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    .detail-explain li {
+      margin: 4px 0;
+    }
+
+    /* ── View Switch Bar ── */
+    .view-switch-bar {
+      display: flex;
+      justify-content: center;
+      gap: 0;
+      padding: 8px 12px;
+      margin-bottom: 0;
+    }
+
+    .view-switch-btn {
+      padding: 9px 28px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.6);
+      color: var(--text);
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    .view-switch-btn:first-child {
+      border-radius: 12px 0 0 12px;
+      border-right: 0;
+    }
+
+    .view-switch-btn:last-child {
+      border-radius: 0 12px 12px 0;
+    }
+
+    .view-switch-btn.active {
+      background: linear-gradient(135deg, #0f766e, #2563eb);
+      color: #fff;
+    }
+
+    .view-switch-btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    /* ── Detail Tab Bar ── */
+    .detail-tab-bar {
+      display: flex;
+    }
+
+    .detail-tab-btn {
+      flex: 1;
+      padding: 9px 24px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 0;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.45);
+      color: var(--text);
+      text-align: center;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+
+    .detail-tab-btn:not(:last-child) {
+      border-right: 0;
+    }
+
+    .detail-tab-btn:first-child {
+      border-radius: 12px 0 0 12px;
+    }
+
+    .detail-tab-btn:last-child {
+      border-radius: 0 12px 12px 0;
+    }
+
+    .detail-tab-btn.active {
+      background: linear-gradient(135deg, #0f766e, #2563eb);
+      color: #fff;
+    }
+
+    .detail.card {
+      border-top: 0;
+      border-radius: 0 0 20px 20px;
+    }
+
+    #mvizStatus {
+      text-align: center;
+      padding: 4px 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    #mvizStatus.error { color: #dc2626; }
+    #mvizStatus.ok { color: #0f766e; }
+
+    /* Hide all MemoryViz body-level elements in line-chart mode
+       (uses !important to override MemoryViz inline styles like display:flex/grid) */
+    body.hide-mviz > div:not(.app):not(.view-switch-bar):not(#mvizStatus),
+    body.hide-mviz > label,
+    body.hide-mviz > input {
+      display: none !important;
+    }
+
+    /* In lifetime mode, reset global label rule so MemoryViz detail-bar stays on one line */
+    body:not(.hide-mviz) > label,
+    body:not(.hide-mviz) label {
+      display: inline;
+    }
+
+    /* ── Peak Interpreter ── */
+    .peak-interp-overview {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .peak-interp-stat {
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.75);
+      border: 1px solid rgba(220, 207, 185, 0.95);
+    }
+
+    .peak-interp-stat .label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .peak-interp-stat .value {
+      margin-top: 2px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .peak-interp-conclusions {
+      margin-bottom: 14px;
+      padding: 12px 14px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.68);
+    }
+
+    .peak-interp-conclusions-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--teal);
+      margin-bottom: 8px;
+    }
+
+    .peak-interp-conclusion-item {
+      font-size: 13px;
+      line-height: 1.6;
+      padding: 3px 0;
+      color: var(--text);
+    }
+
+    .peak-interp-conclusion-item.risk { color: #dc2626; }
+    .peak-interp-conclusion-item.warn { color: #d97706; }
+    .peak-interp-conclusion-item.info { color: #2563eb; }
+
+    .peak-agg-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(220, 207, 185, 0.5);
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.1s;
+    }
+
+    .peak-agg-row:hover {
+      background: rgba(37, 99, 235, 0.05);
+    }
+
+    .peak-agg-row.selected {
+      background: rgba(37, 99, 235, 0.12);
+      border-left: 3px solid #2563eb;
+    }
+
+    .peak-agg-bar-wrap {
+      flex: 1;
+      min-width: 60px;
+      height: 8px;
+      border-radius: 4px;
+      background: rgba(220, 207, 185, 0.4);
+      overflow: hidden;
+    }
+
+    .peak-agg-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: linear-gradient(90deg, #2563eb, #7c3aed);
+    }
+
+    .peak-interp-export-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .peak-interp-export-row button {
+      width: auto;
+      min-width: 120px;
+    }
+
+    @media (max-width: 1120px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: static;
+      }
+    }
+
+    /* ── Diff Analysis ── */
+    .diff-setup {
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.62);
+    }
+
+    .diff-setup-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--teal);
+      margin-bottom: 10px;
+    }
+
+    .diff-point-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto auto;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .diff-point-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .diff-point-row input {
+      width: 100%;
+      min-width: 80px;
+      margin: 0;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.92);
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    .diff-point-row button {
+      width: auto;
+      min-width: 56px;
+      padding: 8px 10px;
+      font-size: 12px;
+    }
+
+    .diff-point-row select {
+      width: auto;
+      min-width: 80px;
+      margin: 0;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+
+    .diff-run-btn {
+      width: 100%;
+      margin-top: 4px;
+      background: linear-gradient(135deg, #7c3aed, #2563eb);
+    }
+
+    .diff-summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .diff-summary-item {
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.75);
+      border: 1px solid rgba(220, 207, 185, 0.95);
+    }
+
+    .diff-summary-label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .diff-summary-value {
+      margin-top: 2px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .diff-summary-value.added { color: #dc2626; }
+    .diff-summary-value.released { color: #0f766e; }
+    .diff-summary-value.common { color: #2563eb; }
+
+    .diff-tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 12px;
+      border: 1px solid rgba(220, 207, 185, 0.95);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .diff-tab {
+      flex: 1;
+      border: 0;
+      border-radius: 0;
+      padding: 10px 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.6);
+      color: var(--text);
+      text-align: center;
+    }
+
+    .diff-tab.active-add {
+      background: linear-gradient(135deg, #dc2626, #ef4444);
+      color: #fff;
+    }
+
+    .diff-tab.active-release {
+      background: linear-gradient(135deg, #0f766e, #14b8a6);
+      color: #fff;
+    }
+
+    .diff-tab.active-common {
+      background: linear-gradient(135deg, #2563eb, #60a5fa);
+      color: #fff;
+    }
+
+    .diff-agg-select {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .diff-agg-select label {
+      font-size: 13px;
+      color: var(--muted);
+      margin: 0;
+    }
+
+    .diff-agg-select select {
+      width: auto;
+      min-width: 140px;
+      margin: 0;
+      padding: 8px 10px;
+    }
+
+    .diff-export-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .diff-export-row button {
+      width: auto;
+      min-width: 120px;
+    }
+
+    .diff-export-row button.json-btn {
+      background: linear-gradient(135deg, #7c3aed, #a78bfa);
+    }
+
+    .diff-highlight-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+      align-items: center;
+    }
+
+    .diff-highlight-row span {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .diff-highlight-row button {
+      width: auto;
+      min-width: 80px;
+      padding: 8px 12px;
+      font-size: 12px;
+    }
+
+    .diff-highlight-row button.hl-added { background: linear-gradient(135deg, #dc2626, #ef4444); }
+    .diff-highlight-row button.hl-released { background: linear-gradient(135deg, #0f766e, #14b8a6); }
+    .diff-highlight-row button.hl-common { background: linear-gradient(135deg, #2563eb, #60a5fa); }
+    .diff-highlight-row button.hl-off { background: linear-gradient(135deg, #6b7280, #9ca3af); }
+
+    @media (max-width: 700px) {
+      .app {
+        width: calc(100vw - 12px);
+        margin: 6px auto;
+      }
+
+      .sidebar,
+      .viewer,
+      .detail {
+        padding: 14px;
+      }
+
+      canvas {
+        height: 460px;
+        min-height: 460px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="view-switch-bar" id="viewSwitchBar">
+    <button class="view-switch-btn active" id="btnLineChart" type="button">折线图</button>
+    <button class="view-switch-btn" id="btnLifetime" type="button" disabled>生命周期</button>
+  </div>
+  <div id="mvizStatus"></div>
+  <div class="app">
+    <aside class="sidebar card">
+      <h1>显存分析浏览器</h1>
+
+      <div class="block">
+        <div class="block-title">使用说明</div>
+        <div class="hint" style="margin-top:0;">
+          点击或拖拽 CSV 文件到页面即可加载，支持本地离线使用。
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>图表操作：</b>滚轮缩放时间轴，Shift + 滚轮缩放显存轴，拖拽平移，Alt + 拖拽框选放大。单击曲线上的点可查看该时刻的存活/后续明细。
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>折线图 / 生命周期：</b>顶部按钮切换。折线图适合查看全局趋势和峰值；生命周期适合查看内存块分配-释放时间线。大文件建议先用折线图。
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>明细表：</b>峰值明细查看峰值时刻存活块，差异分析对比两个时间点的分配变化，峰值解释器按维度聚合分析峰值构成。
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          <b>横线标记：</b>点"点图加线"后点击图表添加参考线，用于标记关键时间点。
+        </div>
+      </div>
+
+      <div class="block">
+        <div class="block-title">文件</div>
+        <label>
+          选择 block CSV
+          <input id="fileInput" type="file" accept=".csv,text/csv">
+        </label>
+        <div class="small" id="fileName">尚未选择文件</div>
+      </div>
+
+      <div class="block">
+        <div class="block-title">显示项</div>
+        <div class="checks">
+          <label class="check"><input type="checkbox" id="showReal" checked> 无碎片显存</label>
+          <label class="check"><input type="checkbox" id="showTheory"> 理论显存</label>
+          <label class="check"><input type="checkbox" id="showActual" checked> 含碎片显存</label>
+        </div>
+      </div>
+
+      <div class="block">
+        <div class="block-title">采样</div>
+        <label>
+          每像素采样上限
+          <input id="samplesPerPixel" type="number" min="1" max="20" step="1" value="2">
+        </label>
+        <div class="hint">数据量很大时会自动降采样，避免图线太密或渲染太慢。</div>
+      </div>
+
+      <div class="block">
+        <button id="fitButton">适配全局视图</button>
+        <button id="resetYButton" class="secondary">重置纵轴</button>
+        <div class="hint">
+          滚轮：缩放时间轴
+          <br>Shift + 滚轮：缩放显存轴
+          <br>按住鼠标拖拽：在图里左右移动
+          <br>Alt + 拖拽：框选放大
+        </div>
+      </div>
+
+      <div class="block">
+        <div class="block-title">统计</div>
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-name">总行数</div>
+            <div class="stat-value" id="statRows">-</div>
+          </div>
+          <div class="stat">
+            <div class="stat-name">时间范围</div>
+            <div class="stat-value" id="statTime">-</div>
+          </div>
+          <div class="stat">
+            <div class="stat-name">申请量峰值</div>
+            <div class="stat-value" id="statRealPeak">-</div>
+          </div>
+          <div class="stat">
+            <div class="stat-name">理论峰值</div>
+            <div class="stat-value" id="statTheoryPeak">-</div>
+          </div>
+          <div class="stat">
+            <div class="stat-name">内存池峰值</div>
+            <div class="stat-value" id="statActualPeak">-</div>
+          </div>
+        </div>
+      </div>
+
+    </aside>
+
+    <main class="content">
+      <section class="viewer card">
+        <div class="viewer-top">
+          <div class="legend" id="lineChartLegend">
+            <div class="legend-item"><span class="swatch" style="background: var(--blue);"></span>无碎片显存</div>
+            <div class="legend-item"><span class="swatch" style="background: var(--red);"></span>理论显存</div>
+            <div class="legend-item"><span class="swatch" style="background: var(--amber);"></span>含碎片显存</div>
+          </div>
+          <div class="small" id="viewportText">等待载入数据</div>
+        </div>
+
+        <div class="line-panel" id="linePanel">
+          <div class="line-title">横线标记</div>
+          <div class="line-form">
+            <select id="lineColorSelect">
+              <option value="#0f766e">青绿</option>
+              <option value="#7c3aed">紫色</option>
+              <option value="#db2777">玫红</option>
+              <option value="#ea580c">橙色</option>
+              <option value="#2563eb">蓝色</option>
+            </select>
+            <button id="addLineModeButton" type="button">点图加线</button>
+          </div>
+          <div class="line-list" id="lineList"></div>
+        </div>
+
+        <div class="chart-shell">
+          <canvas id="chartCanvas"></canvas>
+          <div class="tooltip" id="hoverTooltip"></div>
+          <div class="status" id="statusText">选择 CSV 文件后开始分析。</div>
+        </div>
+      </section>
+
+      <div class="detail-tab-bar" id="detailTabBar" style="display:none;">
+        <button class="detail-tab-btn active" data-tab="detail" type="button">峰值明细</button>
+        <button class="detail-tab-btn" data-tab="diff" type="button">激活点差异分析</button>
+        <button class="detail-tab-btn" data-tab="interp" type="button">峰值解释器</button>
+      </div>
+
+      <section class="detail card" id="detailCard" style="display:none;">
+        <div class="column-panel">
+          <div class="column-title">显示列</div>
+          <div class="column-list" id="columnList"></div>
+        </div>
+        <div class="detail-top">
+          <div>
+            <h2>峰值明细</h2>
+            <div class="small" id="detailSummary">载入数据后可查看全量申请、峰值时刻仍占用的内存块，以及点击/框选区域明细。</div>
+          </div>
+          <div class="detail-controls">
+            <div>
+              <label>
+                明细来源
+                <select id="detailMode">
+                  <option value="all_allocations">从头开始</option>
+                  <option value="real_peak">无碎片峰值时刻存活</option>
+                  <option value="actual_peak">含碎片峰值时刻存活</option>
+                  <option value="abnormal">异常 PyNative</option>
+                  <option value="clicked_alive">点击时刻存活</option>
+                  <option value="clicked_point">点击后续申请</option>
+                  <option value="selected_range">框选时间范围</option>
+                </select>
+              </label>
+            </div>
+            <div>
+              <button id="exportButton" disabled>导出当前明细 CSV</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr id="detailHeadRow"></tr>
+            </thead>
+            <tbody id="detailBody"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <div class="pager-info" id="pagerInfo">第 0 / 0 页</div>
+          <div class="pager-actions">
+            <button id="prevPageButton" type="button">上一页</button>
+            <button id="nextPageButton" type="button">下一页</button>
+            <input id="pageInput" type="number" min="1" step="1" placeholder="跳转页">
+            <button id="goPageButton" type="button">跳转</button>
+          </div>
+        </div>
+        <div class="hint">单击曲线附近的点会显示该时间点的明细。按住 Alt 拖拽框选后，会同时放大并显示该时间范围的明细。明细表使用自己的横向滚动条，不会把整个网页撑宽。</div>
+        <div class="detail-explain">
+          <div class="detail-explain-title">明细来源说明</div>
+          <ul>
+            <li>从头开始：显示所有有效申请记录，按 start_time_stamp 从小到大排列，用于从任务开始顺序排查内存申请。</li>
+            <li>无碎片峰值时刻存活：先用 size 按申请/释放时间累加出“无碎片显存”曲线，找到该曲线峰值时间点，再显示这个时间点仍存活的记录。</li>
+            <li>含碎片峰值时刻存活：先读取 actual_peak_memory 形成“含碎片显存”曲线，找到该曲线峰值时间点，再显示这个时间点仍存活的记录。</li>
+            <li>点击时刻存活：点击图上的某个时间点后，显示该时间点仍存活的记录；判定条件为 start_time_stamp <= 点击时间 <= end_time_stamp。</li>
+            <li>点击后续申请：点击图上的某个时间点后，显示 start_time_stamp >= 点击时间 的后续申请记录，适合从某个阶段开始向后排查。</li>
+            <li>框选时间范围：按住 Alt 框选一段时间后，显示 start_time_stamp 落在该时间范围内的申请记录。</li>
+            <li>异常 PyNative：在无碎片峰值时刻存活的记录里，筛出 user_tasks 已早于峰值时间结束、但 PyNative 相关内存仍存活的记录，用于辅助排查疑似未及时释放的内存。</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="detail card" id="peakInterpCard" style="display:none;">
+        <div class="detail-top">
+          <div>
+            <h2>峰值解释器</h2>
+            <div class="small" id="peakInterpDesc">载入数据后可查看峰值来源分析。</div>
+          </div>
+          <div class="detail-controls">
+            <div>
+              <label>解释对象
+                <select id="peakInterpTarget">
+                  <option value="real_peak">无碎片峰值</option>
+                  <option value="theory_peak">理论峰值</option>
+                  <option value="actual_peak">含碎片峰值</option>
+                  <option value="clicked_time">当前点击时间点</option>
+                </select>
+              </label>
+            </div>
+            <div>
+              <button id="peakInterpRun">运行分析</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="peakInterpContent" style="display:none;">
+          <div class="peak-interp-overview" id="peakInterpOverview"></div>
+
+          <div class="peak-interp-conclusions" id="peakInterpConclusions">
+            <div class="peak-interp-conclusions-title">解释结论</div>
+            <div id="peakInterpConclusionList"></div>
+          </div>
+
+          <div style="margin-bottom:12px;">
+            <label style="font-size:13px;color:var(--muted);">聚合维度</label>
+            <select id="peakInterpDim" style="width:auto;min-width:160px;margin:0;padding:7px 10px;">
+              <option value="type">type</option>
+              <option value="task_name">task_name</option>
+              <option value="node_name">node_name</option>
+              <option value="graph_name">graph_name</option>
+              <option value="producer_task">producer_task</option>
+              <option value="pool_type">pool_type</option>
+              <option value="python_stack_frame">python_stack 顶层帧</option>
+              <option value="is_persistent">is_persistent</option>
+              <option value="is_small">is_small</option>
+            </select>
+          </div>
+
+          <div style="max-height:360px;overflow-y:auto;border:1px solid rgba(220,207,185,0.95);border-radius:12px;background:rgba(255,255,255,0.75);" id="peakInterpAggList"></div>
+          <div class="small" style="margin-top:8px;color:var(--muted)" id="peakInterpAggNote"></div>
+
+          <div class="peak-interp-export-row">
+            <button id="peakInterpExportCSV">导出解释 CSV</button>
+            <button id="peakInterpExportJSON" class="json-btn">导出解释 JSON</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="detail card" id="diffCard" style="display:none;">
+        <div class="detail-top">
+          <div>
+            <h2>激活点差异分析</h2>
+            <div class="small" id="diffSummary">设置 A/B 时间点并运行分析后，这里会显示差异结果。</div>
+          </div>
+        </div>
+
+        <div class="diff-setup">
+          <div class="diff-setup-title">分析点 A</div>
+          <div class="diff-point-row">
+            <span class="diff-point-label">时间戳</span>
+            <input id="diffATime" type="number" placeholder="输入时间或点击曲线">
+            <button id="diffASetClick" type="button" title="从点击的曲线点设置">点击</button>
+          </div>
+          <div class="diff-setup-title" style="margin-top:8px;">分析点 B</div>
+          <div class="diff-point-row">
+            <span class="diff-point-label">时间戳</span>
+            <input id="diffBTime" type="number" placeholder="输入时间或点击曲线">
+            <button id="diffBSetClick" type="button" title="从点击的曲线点设置">点击</button>
+          </div>
+          <button id="diffRunBtn" class="diff-run-btn" disabled>运行差异分析</button>
+        </div>
+        <div class="hint">设置 A/B 两个时间点后，比较两个时刻的存活显存分配差异。</div>
+
+        <div class="diff-summary" id="diffSummaryGrid" style="display:none;"></div>
+
+        <div id="diffContent" style="display:none;">
+          <div class="diff-agg-select">
+            <label>聚合维度</label>
+            <select id="diffAggDimension">
+              <option value="type">type</option>
+              <option value="task_name">task_name</option>
+              <option value="node_name">node_name</option>
+              <option value="graph_name">graph_name</option>
+              <option value="python_stack">python_stack</option>
+            </select>
+          </div>
+
+          <div class="diff-tabs" id="diffTabs">
+            <button class="diff-tab active-add" data-category="added" type="button">新增</button>
+            <button class="diff-tab" data-category="released" type="button">释放</button>
+            <button class="diff-tab" data-category="common" type="button">共同存活</button>
+          </div>
+
+          <div class="table-scroll" style="max-height:300px;">
+            <table>
+              <thead id="diffAggHead"></thead>
+              <tbody id="diffAggBody"></tbody>
+            </table>
+          </div>
+
+          <div class="small" style="margin-top:10px;color:var(--muted)" id="diffAggNote"></div>
+
+          <div style="margin-top:12px;">
+            <div class="small" id="diffDetailSummary" style="margin-bottom:8px;"></div>
+            <div class="table-scroll">
+              <table>
+                <thead id="diffDetailHead"></thead>
+                <tbody id="diffDetailBody"></tbody>
+              </table>
+            </div>
+            <div class="pager">
+              <div class="pager-info" id="diffPagerInfo">第 0 / 0 页</div>
+              <div class="pager-actions">
+                <button id="diffPrevPage" type="button">上一页</button>
+                <button id="diffNextPage" type="button">下一页</button>
+                <input id="diffPageInput" type="number" min="1" step="1" placeholder="跳转页">
+                <button id="diffGoPage" type="button">跳转</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="diff-export-row">
+            <button id="diffExportCSV">导出差异 CSV</button>
+            <button id="diffExportJSON" class="json-btn">导出差异 JSON</button>
+          </div>
+
+          <div class="diff-highlight-row">
+            <span>图表联动:</span>
+            <button id="diffHighlightAdded" class="hl-added" type="button">高亮新增</button>
+            <button id="diffHighlightReleased" class="hl-released" type="button">高亮释放</button>
+            <button id="diffHighlightCommon" class="hl-common" type="button">高亮共同</button>
+            <button id="diffHighlightOff" class="hl-off" type="button">关闭高亮</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const colors = {
+      real: "#2563eb",
+      theory: "#dc2626",
+      actual: "#d97706",
+      axis: "#374151",
+      grid: "rgba(31, 41, 55, 0.10)",
+      hover: "#111827",
+      select: "rgba(37, 99, 235, 0.12)"
+    };
+
+    const elements = {
+      fileInput: document.getElementById("fileInput"),
+      fileName: document.getElementById("fileName"),
+      showReal: document.getElementById("showReal"),
+      showTheory: document.getElementById("showTheory"),
+      showActual: document.getElementById("showActual"),
+      samplesPerPixel: document.getElementById("samplesPerPixel"),
+      lineColorSelect: document.getElementById("lineColorSelect"),
+      addLineModeButton: document.getElementById("addLineModeButton"),
+      lineList: document.getElementById("lineList"),
+      fitButton: document.getElementById("fitButton"),
+      resetYButton: document.getElementById("resetYButton"),
+      viewportText: document.getElementById("viewportText"),
+      statusText: document.getElementById("statusText"),
+      hoverTooltip: document.getElementById("hoverTooltip"),
+      statRows: document.getElementById("statRows"),
+      statTime: document.getElementById("statTime"),
+      statRealPeak: document.getElementById("statRealPeak"),
+      statTheoryPeak: document.getElementById("statTheoryPeak"),
+      statActualPeak: document.getElementById("statActualPeak"),
+      detailMode: document.getElementById("detailMode"),
+      detailSummary: document.getElementById("detailSummary"),
+      detailCard: document.getElementById("detailCard"),
+      detailTabBar: document.getElementById("detailTabBar"),
+      detailHeadRow: document.getElementById("detailHeadRow"),
+      detailBody: document.getElementById("detailBody"),
+      columnList: document.getElementById("columnList"),
+      exportButton: document.getElementById("exportButton"),
+      pagerInfo: document.getElementById("pagerInfo"),
+      prevPageButton: document.getElementById("prevPageButton"),
+      nextPageButton: document.getElementById("nextPageButton"),
+      pageInput: document.getElementById("pageInput"),
+      goPageButton: document.getElementById("goPageButton"),
+      canvas: document.getElementById("chartCanvas"),
+      diffATime: document.getElementById("diffATime"),
+      diffBTime: document.getElementById("diffBTime"),
+      diffASetClick: document.getElementById("diffASetClick"),
+      diffBSetClick: document.getElementById("diffBSetClick"),
+      diffRunBtn: document.getElementById("diffRunBtn"),
+      diffCard: document.getElementById("diffCard"),
+      diffSummary: document.getElementById("diffSummary"),
+      diffSummaryGrid: document.getElementById("diffSummaryGrid"),
+      diffContent: document.getElementById("diffContent"),
+      diffAggDimension: document.getElementById("diffAggDimension"),
+      diffTabs: document.getElementById("diffTabs"),
+      diffAggHead: document.getElementById("diffAggHead"),
+      diffAggBody: document.getElementById("diffAggBody"),
+      diffAggNote: document.getElementById("diffAggNote"),
+      diffDetailSummary: document.getElementById("diffDetailSummary"),
+      diffDetailHead: document.getElementById("diffDetailHead"),
+      diffDetailBody: document.getElementById("diffDetailBody"),
+      diffPagerInfo: document.getElementById("diffPagerInfo"),
+      diffPrevPage: document.getElementById("diffPrevPage"),
+      diffNextPage: document.getElementById("diffNextPage"),
+      diffPageInput: document.getElementById("diffPageInput"),
+      diffGoPage: document.getElementById("diffGoPage"),
+      diffExportCSV: document.getElementById("diffExportCSV"),
+      diffExportJSON: document.getElementById("diffExportJSON"),
+      diffHighlightAdded: document.getElementById("diffHighlightAdded"),
+      diffHighlightReleased: document.getElementById("diffHighlightReleased"),
+      diffHighlightCommon: document.getElementById("diffHighlightCommon"),
+      diffHighlightOff: document.getElementById("diffHighlightOff"),
+      lineChartLegend: document.getElementById("lineChartLegend"),
+      linePanel: document.getElementById("linePanel"),
+      peakInterpCard: document.getElementById("peakInterpCard"),
+      peakInterpDesc: document.getElementById("peakInterpDesc"),
+      peakInterpTarget: document.getElementById("peakInterpTarget"),
+      peakInterpRun: document.getElementById("peakInterpRun"),
+      peakInterpContent: document.getElementById("peakInterpContent"),
+      peakInterpOverview: document.getElementById("peakInterpOverview"),
+      peakInterpConclusions: document.getElementById("peakInterpConclusions"),
+      peakInterpConclusionList: document.getElementById("peakInterpConclusionList"),
+      peakInterpDim: document.getElementById("peakInterpDim"),
+      peakInterpAggList: document.getElementById("peakInterpAggList"),
+      peakInterpAggNote: document.getElementById("peakInterpAggNote"),
+      peakInterpExportCSV: document.getElementById("peakInterpExportCSV"),
+      peakInterpExportJSON: document.getElementById("peakInterpExportJSON")
+    };
+
+    const ctx = elements.canvas.getContext("2d");
+
+    const state = {
+      dpr: Math.max(1, window.devicePixelRatio || 1),
+      headers: [],
+      visibleHeaders: [],
+      columnOrder: [],
+      rows: [],
+      detailPageSize: 100,
+      detailCurrentPage: 1,
+      detailRows: [],
+      detailSourceRows: [],
+      detailFilteredRows: [],
+      detailFilters: {},
+      detailSort: { header: null, direction: null },
+      detailToolsOpen: {},
+      detailModeUserLocked: false,
+      clickedPointRows: [],
+      clickedAliveRows: [],
+      selectedRangeRows: [],
+      clickedPointTime: null,
+      selectedPoint: null,
+      selectedRange: null,
+      allRowsFromStart: [],
+      detailModes: { real_peak: [], actual_peak: [], abnormal: [] },
+        referenceLines: [],
+        lineAddMode: false,
+        draggingReferenceLineId: null,
+        hoverReferenceLineId: null,
+        series: {},
+      fullRangeX: [0, 1],
+      fullRangeY: [0, 1],
+      viewX: [0, 1],
+      viewY: [0, 1],
+      dragging: false,
+      selecting: false,
+      dragStart: null,
+      selection: null,
+      hoverPoint: null,
+      draggingColumn: null,
+      statusSummaryText: "选择 CSV 文件后开始分析。",
+      statusHidden: false,
+      statusDrag: null,
+      diffPointA: null,
+      diffPointB: null,
+      diffActiveA: [],
+      diffActiveB: [],
+      diffResults: null,
+      diffCategory: "added",
+      diffAggDimension: "type",
+      diffCurrentPage: 1,
+      diffPageSize: 50,
+      diffHighlight: null,
+      viewMode: "line",
+      memoryVizReady: false,
+      memoryVizBase64: null,
+      memoryVizLoaded: false,
+      peakInterpTarget: "real_peak",
+      peakInterpResults: null,
+      peakInterpDim: "type",
+      peakInterpSelected: null
+    };
+
+    window.state = state;
+
+    const END_SENTINEL_THRESHOLD = 9e18;
+    const DEFAULT_MEMORY_POOL = "DefaultEnhancedAscendMemoryPool";
+    const DEFAULT_VISIBLE_HEADERS = [
+      "start_time_stamp",
+      "end_time_stamp",
+      "size",
+      "actual_peak_memory",
+      "type",
+      "producer_task",
+      "task_name",
+      "node_name",
+      "user_tasks",
+      "python_stack"
+    ];
+
+    function setStatus(text) {
+      state.statusSummaryText = text;
+      if (!state.statusHidden) {
+        elements.statusText.textContent = text;
+      }
+    }
+
+    function setStatusHidden(hidden) {
+      state.statusHidden = hidden;
+      elements.statusText.classList.toggle("hidden", hidden);
+      elements.statusText.textContent = hidden ? "显示摘要" : state.statusSummaryText;
+      if (hidden) {
+        elements.statusText.style.bottom = "";
+        const currentLeft = Number.parseFloat(elements.statusText.style.left);
+        const currentTop = Number.parseFloat(elements.statusText.style.top);
+        if (!Number.isFinite(currentLeft) || !Number.isFinite(currentTop)) {
+          requestAnimationFrame(() => {
+            const shell = elements.statusText.parentElement.getBoundingClientRect();
+            const status = elements.statusText.getBoundingClientRect();
+            setStatusPosition(shell.width - status.width - 14, 14);
+          });
+        } else {
+          requestAnimationFrame(() => setStatusPosition(currentLeft, currentTop));
+        }
+      }
+    }
+
+    function setStatusPosition(left, top) {
+      const shell = elements.statusText.parentElement;
+      const shellRect = shell.getBoundingClientRect();
+      const statusRect = elements.statusText.getBoundingClientRect();
+      const maxLeft = Math.max(0, shellRect.width - statusRect.width - 8);
+      const maxTop = Math.max(0, shellRect.height - statusRect.height - 8);
+      const nextLeft = Math.max(8, Math.min(maxLeft, left));
+      const nextTop = Math.max(8, Math.min(maxTop, top));
+      elements.statusText.style.left = `${nextLeft}px`;
+      elements.statusText.style.top = `${nextTop}px`;
+      elements.statusText.style.right = "";
+      elements.statusText.style.bottom = "";
+    }
+
+    function formatNumber(n) {
+      return Number.isFinite(n) ? new Intl.NumberFormat("zh-CN").format(Math.round(n)) : "-";
+    }
+
+    function formatAxisTime(n) {
+      return Number.isFinite(n) ? new Intl.NumberFormat("zh-CN").format(Math.round(n)) : "-";
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return "-";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let value = Math.abs(bytes);
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+      }
+      const signed = bytes < 0 ? -value : value;
+      return `${signed.toFixed(unit === 0 ? 0 : 2)} ${units[unit]}`;
+    }
+
+    function formatAxisBytes(bytes) {
+      if (!Number.isFinite(bytes)) return "-";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let value = Math.abs(bytes);
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+      }
+      const signed = bytes < 0 ? -value : value;
+      return `${signed.toFixed(value >= 100 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+    }
+
+    function parseCsvLine(line) {
+      if (!line.includes('"')) {
+        return line.split(",");
+      }
+
+      const fields = [];
+      let current = "";
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+          if (inQuotes && line[i + 1] === '"') {
+            current += '"';
+            i += 1;
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (ch === "," && !inQuotes) {
+          fields.push(current);
+          current = "";
+        } else {
+          current += ch;
+        }
+      }
+      fields.push(current);
+      return fields;
+    }
+
+    function parseCsv(text) {
+      const lines = text.replace(/^\uFEFF/, "").replace(/\r/g, "").split("\n").filter(Boolean);
+      if (lines.length < 2) {
+        throw new Error("CSV 内容为空或缺少表头");
+      }
+
+      const headers = parseCsvLine(lines[0]);
+      const index = Object.fromEntries(headers.map((name, i) => [name, i]));
+      const required = ["start_time_stamp", "end_time_stamp", "size", "producer_task", "user_tasks", "type"];
+      for (const key of required) {
+        if (!(key in index)) {
+          throw new Error(`CSV 缺少字段: ${key}`);
+        }
+      }
+
+      const rows = [];
+      for (let i = 1; i < lines.length; i++) {
+        const values = parseCsvLine(lines[i]);
+        if (values.length === 1 && values[0] === "") continue;
+        const row = {};
+        for (let j = 0; j < headers.length; j++) {
+          row[headers[j]] = values[j] ?? "";
+        }
+        rows.push(row);
+      }
+      return { headers, rows };
+    }
+
+    function detectTextEncoding(bytes) {
+      if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) return "utf-16le";
+      if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) return "utf-16be";
+      if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) return "utf-8";
+
+      const sampleSize = Math.min(bytes.length, 4096);
+      let evenNulls = 0;
+      let oddNulls = 0;
+      for (let i = 0; i < sampleSize; i++) {
+        if (bytes[i] !== 0) continue;
+        if (i % 2 === 0) {
+          evenNulls += 1;
+        } else {
+          oddNulls += 1;
+        }
+      }
+
+      if (oddNulls > sampleSize / 8 && evenNulls < sampleSize / 32) return "utf-16le";
+      if (evenNulls > sampleSize / 8 && oddNulls < sampleSize / 32) return "utf-16be";
+      return "utf-8";
+    }
+
+    async function parseCsvFile(file, onProgress) {
+      if (!window.TextDecoder) {
+        return parseCsv(await file.text());
+      }
+      if (!file.stream) {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const text = new TextDecoder(detectTextEncoding(bytes)).decode(bytes);
+        if (onProgress) onProgress(file.size, file.size, 0);
+        return parseCsv(text);
+      }
+
+      const reader = file.stream().getReader();
+      let pending = "";
+      let headers = null;
+      let index = null;
+      let loaded = 0;
+      let lastProgressBytes = 0;
+      let lastProgressTime = 0;
+      const rows = [];
+      const required = ["start_time_stamp", "end_time_stamp", "size", "producer_task", "user_tasks", "type"];
+      let decoder = null;
+
+      const consumeLine = (rawLine) => {
+        const line = (rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine).replace(/^\uFEFF/, "");
+        if (!line) return;
+
+        if (!headers) {
+          headers = parseCsvLine(line);
+          index = Object.fromEntries(headers.map((name, i) => [name, i]));
+          for (const key of required) {
+            if (!(key in index)) {
+              throw new Error(`CSV 缺少字段: ${key}`);
+            }
+          }
+          return;
+        }
+
+        const values = parseCsvLine(line);
+        if (values.length === 1 && values[0] === "") return;
+        const row = {};
+        for (let j = 0; j < headers.length; j++) {
+          row[headers[j]] = values[j] ?? "";
+        }
+        rows.push(row);
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        loaded += value.byteLength;
+        if (!decoder) {
+          decoder = new TextDecoder(detectTextEncoding(value));
+        }
+        pending += decoder.decode(value, { stream: true });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          consumeLine(line);
+        }
+
+        const now = performance.now();
+        if (onProgress && (loaded - lastProgressBytes >= 16 * 1024 * 1024 || now - lastProgressTime > 250)) {
+          onProgress(loaded, file.size, rows.length);
+          lastProgressBytes = loaded;
+          lastProgressTime = now;
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      }
+
+      if (decoder) pending += decoder.decode();
+      if (pending) consumeLine(pending);
+      if (!headers || rows.length === 0) {
+        throw new Error("CSV 内容为空或缺少表头");
+      }
+      return { headers, rows };
+    }
+
+    function extractUsers(str) {
+      const matches = str.match(/\d+/g);
+      return matches ? matches.map(Number) : [];
+    }
+
+    function arrayMax(values) {
+      let max = -Infinity;
+      for (const value of values) {
+        if (value > max) max = value;
+      }
+      return max;
+    }
+
+    function parsePythonStack(raw) {
+      if (!raw) return [];
+      const STACK_RE = /File:(.+?);Line:(\d+);Function:(.+)/;
+      const frames = [];
+      for (const seg of raw.split("|")) {
+        const s = seg.trim();
+        if (!s) continue;
+        const m = STACK_RE.exec(s);
+        if (m) {
+          frames.push({ name: m[3], filename: m[1], line: parseInt(m[2], 10) });
+        }
+      }
+      frames.reverse();
+      return frames;
+    }
+
+    function buildSnapshot(rows) {
+      const INT64_MAX_STR = "9223372036854775807";
+      let eventCount = 0;
+      const estEvents = rows.length * 3;
+      const events = new Array(estEvents);
+      const stillAlive = [];
+
+      for (const row of rows) {
+        const start = parseInt(row.start_time_stamp, 10);
+        const endStr = row.end_time_stamp;
+        const addr = parseInt((row.device_addr || "0x0").replace(/^0x/i, ""), 16);
+        const size = parseInt(row.size, 10);
+        const stream = row.stream ? parseInt(row.stream, 10) : 0;
+
+        events[eventCount++] = {
+          action: "alloc",
+          addr,
+          size,
+          stream,
+          time_us: start,
+        };
+
+        if (endStr === INT64_MAX_STR || !endStr || Number(endStr) >= 9e18) {
+          const frames = parsePythonStack(row.python_stack || "");
+          stillAlive.push({ addr, size, frames });
+        } else {
+          const endTime = parseInt(endStr, 10);
+          for (const action of ["free_requested", "free_completed"]) {
+            events[eventCount++] = {
+              action,
+              addr,
+              size,
+              stream,
+              time_us: endTime,
+            };
+          }
+        }
+      }
+
+      events.length = eventCount;
+      events.sort((a, b) => {
+        if (a.time_us !== b.time_us) return a.time_us - b.time_us;
+        const aIsFree = a.action !== "alloc";
+        const bIsFree = b.action !== "alloc";
+        return aIsFree === bIsFree ? 0 : aIsFree ? -1 : 1;
+      });
+
+      stillAlive.sort((a, b) => a.addr - b.addr);
+      const blocks = [];
+      let lastAddr = null;
+      const segStart = stillAlive.length > 0 ? stillAlive[0].addr : 0;
+
+      for (const { addr, size, frames } of stillAlive) {
+        if (lastAddr !== null && addr > lastAddr) {
+          blocks.push({
+            address: lastAddr,
+            size: addr - lastAddr,
+            requested_size: addr - lastAddr,
+            state: "inactive",
+            frames: [],
+          });
+        }
+        blocks.push({
+          address: addr,
+          size,
+          requested_size: size,
+          state: "active_allocated",
+          frames,
+        });
+        lastAddr = addr + size;
+      }
+
+      const segTotalSize = lastAddr !== null ? lastAddr - segStart : 0;
+      const segments = [];
+      if (blocks.length > 0) {
+        const activeSize = blocks
+          .filter((b) => b.state === "active_allocated")
+          .reduce((s, b) => s + b.size, 0);
+        segments.push({
+          device: 0,
+          address: segStart,
+          total_size: segTotalSize,
+          allocated_size: activeSize,
+          active_size: activeSize,
+          requested_size: activeSize,
+          stream: 0,
+          segment_type: "large",
+          segment_pool_id: [0, 0],
+          is_expandable: false,
+          frames: [],
+          blocks,
+        });
+      }
+
+      return {
+        device_traces: [events],
+        segments,
+      };
+    }
+
+    function jsonToBase64(obj) {
+      const json = JSON.stringify(obj);
+      let bytes = new TextEncoder().encode(json);
+      const pad = (3 - (bytes.length % 3)) % 3;
+      if (pad > 0) {
+        const padded = new Uint8Array(bytes.length + pad);
+        padded.set(bytes);
+        padded.fill(0x20, bytes.length);
+        bytes = padded;
+      }
+      const CHUNK = 8192;
+      const parts = [];
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        const chunk = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
+        parts.push(String.fromCharCode.apply(null, chunk));
+      }
+      return btoa(parts.join(""));
+    }
+
+    function buildSeries(memoryChanges, cumulative) {
+      const times = Array.from(memoryChanges.keys()).sort((a, b) => a - b);
+      const points = [];
+      let current = 0;
+      let peak = null;
+
+      for (const time of times) {
+        const delta = memoryChanges.get(time);
+        const value = cumulative ? (current += delta) : delta;
+        points.push([time, value]);
+        if (!peak || value > peak.value) {
+          peak = { time, value };
+        }
+      }
+
+      return { points, peak };
+    }
+
+    function computeBounds(seriesList) {
+      let minX = Infinity;
+      let maxX = -Infinity;
+      let minY = Infinity;
+      let maxY = -Infinity;
+      let hasPoint = false;
+
+      for (const series of seriesList) {
+        for (const [x, y] of series.points) {
+          hasPoint = true;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+
+      if (!hasPoint) {
+        throw new Error("没有生成任何曲线点，请检查 CSV 内容");
+      }
+
+      return {
+        minX,
+        maxX,
+        minY: Math.min(0, minY),
+        maxY
+      };
+    }
+
+    function computeBoundsFromActive() {
+      const active = getActiveSeries();
+      return active.length ? computeBounds(active) : {
+        minX: state.fullRangeX[0],
+        maxX: state.fullRangeX[1],
+        minY: state.fullRangeY[0],
+        maxY: state.fullRangeY[1]
+      };
+    }
+
+    function analyzeRows(rows) {
+      const realChanges = new Map();
+      const theoryChanges = new Map();
+      const actualMemory = new Map();
+      let maxObservedTime = 0;
+
+      function add(map, key, value) {
+        map.set(key, (map.get(key) || 0) + value);
+      }
+
+      for (const row of rows) {
+        const start = Number(row.start_time_stamp);
+        const end = Number(row.end_time_stamp);
+        if (Number.isFinite(start) && start >= 0) {
+          if (start > maxObservedTime) maxObservedTime = start;
+        }
+        if (Number.isFinite(end) && end >= 0 && end < END_SENTINEL_THRESHOLD) {
+          if (end > maxObservedTime) maxObservedTime = end;
+        }
+      }
+
+      for (const row of rows) {
+        const start = Number(row.start_time_stamp);
+        const end = Number(row.end_time_stamp);
+        const size = Number(row.size);
+        const effectiveEnd = (Number.isFinite(end) && end >= 0 && end < END_SENTINEL_THRESHOLD)
+          ? end
+          : maxObservedTime + 1;
+
+        if (row.actual_peak_memory !== undefined && row.actual_peak_memory !== "") {
+          actualMemory.set(start, Number(row.actual_peak_memory));
+        }
+
+        if (start === -1 || row.pool_type !== DEFAULT_MEMORY_POOL) continue;
+
+        add(realChanges, start, size);
+        add(realChanges, effectiveEnd - 1, 0);
+        add(realChanges, effectiveEnd, -size);
+      }
+
+      for (const row of rows) {
+        const producer = row.producer_task;
+        if (!producer) continue;
+
+        const producerId = Number(producer);
+        const type = row.type;
+        const start = Number(row.start_time_stamp);
+        const end = Number(row.end_time_stamp);
+        const userTasks = extractUsers(row.user_tasks || "");
+        if (!userTasks.length) continue;
+        if (type === "SomasOutput" && start === -1) continue;
+
+        const maxUserId = arrayMax(userTasks);
+        const size = Number(row.size);
+        add(theoryChanges, producerId, size);
+        add(theoryChanges, maxUserId, 0);
+        add(theoryChanges, maxUserId + 1, -size);
+      }
+
+      const real = buildSeries(realChanges, true);
+      const theory = buildSeries(theoryChanges, true);
+      const actual = buildSeries(actualMemory, false);
+      const bounds = computeBounds([real, theory, actual]);
+
+      const detailModes = {
+        real_peak: [],
+        actual_peak: [],
+        abnormal: []
+      };
+
+      const realPeakTime = real.peak ? real.peak.time : null;
+      const actualPeakTime = actual.peak ? actual.peak.time : null;
+
+      for (const row of rows) {
+        const start = Number(row.start_time_stamp);
+        const end = Number(row.end_time_stamp);
+        const effectiveEnd = (Number.isFinite(end) && end >= 0 && end < END_SENTINEL_THRESHOLD)
+          ? end
+          : maxObservedTime + 1;
+        if (start === -1) continue;
+
+        if (realPeakTime !== null && start <= realPeakTime && realPeakTime <= effectiveEnd) {
+          detailModes.real_peak.push(row);
+
+          const userTasks = extractUsers(row.user_tasks || "");
+          if (userTasks.length) {
+            const maxUserId = arrayMax(userTasks);
+            if (maxUserId < realPeakTime && (row.type || "").startsWith("PyNative")) {
+              detailModes.abnormal.push(row);
+            }
+          }
+        }
+
+        if (actualPeakTime !== null && start <= actualPeakTime && actualPeakTime <= effectiveEnd) {
+          detailModes.actual_peak.push(row);
+        }
+      }
+
+      return {
+        real,
+        theory,
+        actual,
+        xRange: [bounds.minX, bounds.maxX],
+        yRange: [bounds.minY, bounds.maxY],
+        detailModes
+      };
+    }
+
+    function rowsForTimePoint(timePoint) {
+      if (!Number.isFinite(timePoint)) return [];
+      const matched = [];
+      for (const row of state.rows) {
+        const start = Number(row.start_time_stamp);
+        if (start !== -1 && Number.isFinite(start) && start >= timePoint) {
+          matched.push(row);
+        }
+      }
+      matched.sort((a, b) => {
+        const aStart = Number(a.start_time_stamp);
+        const bStart = Number(b.start_time_stamp);
+        if (aStart !== bStart) return aStart - bStart;
+        return Number(b.size) - Number(a.size);
+      });
+      return matched;
+    }
+
+    function rowsAliveAtTimePoint(timePoint) {
+      if (!Number.isFinite(timePoint)) return [];
+      const matched = [];
+      const fallbackEnd = Number.isFinite(state.fullRangeX[1]) ? state.fullRangeX[1] + 1 : timePoint + 1;
+      for (const row of state.rows) {
+        const start = Number(row.start_time_stamp);
+        const end = Number(row.end_time_stamp);
+        const effectiveEnd = (Number.isFinite(end) && end >= 0 && end < END_SENTINEL_THRESHOLD)
+          ? end
+          : fallbackEnd;
+        if (start !== -1 && Number.isFinite(start) && start <= timePoint && timePoint <= effectiveEnd) {
+          matched.push(row);
+        }
+      }
+      matched.sort((a, b) => {
+        const aSize = Number(a.size || 0);
+        const bSize = Number(b.size || 0);
+        if (aSize !== bSize) return bSize - aSize;
+        return Number(a.start_time_stamp) - Number(b.start_time_stamp);
+      });
+      return matched;
+    }
+
+    function buildRowsFromStart(rows) {
+      const matched = [];
+      for (const row of rows) {
+        const start = Number(row.start_time_stamp);
+        if (start !== -1 && Number.isFinite(start)) {
+          matched.push(row);
+        }
+      }
+      matched.sort((a, b) => {
+        const aStart = Number(a.start_time_stamp);
+        const bStart = Number(b.start_time_stamp);
+        if (aStart !== bStart) return aStart - bStart;
+        return Number(b.size || 0) - Number(a.size || 0);
+      });
+      return matched;
+    }
+
+    function rowsForTimeRange(startTime, endTime) {
+      if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) return [];
+      const rangeStart = Math.min(startTime, endTime);
+      const rangeEnd = Math.max(startTime, endTime);
+      const matched = [];
+      for (const row of state.rows) {
+        const start = Number(row.start_time_stamp);
+        if (start === -1) continue;
+        // For selected ranges, default to allocations that start within the range.
+        if (start >= rangeStart && start <= rangeEnd) {
+          matched.push(row);
+        }
+      }
+      matched.sort((a, b) => {
+        const aStart = Number(a.start_time_stamp);
+        const bStart = Number(b.start_time_stamp);
+        const aDistance = Math.abs(aStart - rangeStart);
+        const bDistance = Math.abs(bStart - rangeStart);
+        if (aDistance !== bDistance) return aDistance - bDistance;
+        if (aStart !== bStart) return aStart - bStart;
+        return Number(b.size || 0) - Number(a.size || 0);
+      });
+      return matched;
+    }
+
+    /* ── Diff Analysis ── */
+
+    function getRowIdentityKey(row) {
+      const addr = (row.device_addr || "").trim();
+      if (addr && addr !== "0x0" && addr !== "0") {
+        return `addr:${addr}`;
+      }
+      const start = row.start_time_stamp || "";
+      const end = row.end_time_stamp || "";
+      const size = row.size || "";
+      const producer = row.producer_task || "";
+      const taskName = row.task_name || "";
+      return `key:${start}|${end}|${size}|${producer}|${taskName}`;
+    }
+
+    function computeActiveSetAt(timePoint) {
+      if (!Number.isFinite(timePoint)) return new Map();
+      const active = new Map();
+      const fallbackEnd = Number.isFinite(state.fullRangeX[1]) ? state.fullRangeX[1] + 1 : timePoint + 1;
+      for (const row of state.rows) {
+        const start = Number(row.start_time_stamp);
+        if (start === -1) continue;
+        if (!Number.isFinite(start)) continue;
+        const end = Number(row.end_time_stamp);
+        const effectiveEnd = (Number.isFinite(end) && end >= 0 && end < END_SENTINEL_THRESHOLD)
+          ? end
+          : fallbackEnd;
+        if (start <= timePoint && timePoint <= effectiveEnd) {
+          const key = getRowIdentityKey(row);
+          const existing = active.get(key);
+          if (!existing || Number(row.size || 0) > Number(existing.size || 0)) {
+            active.set(key, row);
+          }
+        }
+      }
+      return active;
+    }
+
+    function computeActiveSetNoFragment(timePoint) {
+      if (!Number.isFinite(timePoint)) return new Map();
+      const active = new Map();
+      const fallbackEnd = Number.isFinite(state.fullRangeX[1]) ? state.fullRangeX[1] + 1 : timePoint + 1;
+      for (const row of state.rows) {
+        const start = Number(row.start_time_stamp);
+        if (start === -1) continue;
+        if (!Number.isFinite(start)) continue;
+        if (row.pool_type !== DEFAULT_MEMORY_POOL) continue;
+        const end = Number(row.end_time_stamp);
+        const effectiveEnd = (Number.isFinite(end) && end >= 0 && end < END_SENTINEL_THRESHOLD)
+          ? end
+          : fallbackEnd;
+        if (start <= timePoint && timePoint <= effectiveEnd) {
+          const key = getRowIdentityKey(row);
+          const existing = active.get(key);
+          if (!existing || Number(row.size || 0) > Number(existing.size || 0)) {
+            active.set(key, row);
+          }
+        }
+      }
+      return active;
+    }
+
+    function computeDiff(timeA, timeB) {
+      const activeA = computeActiveSetNoFragment(timeA);
+      const activeB = computeActiveSetNoFragment(timeB);
+      const keysA = new Set(activeA.keys());
+      const keysB = new Set(activeB.keys());
+
+      const added = [];
+      const released = [];
+      const common = [];
+
+      for (const key of keysB) {
+        if (!keysA.has(key)) {
+          added.push(activeB.get(key));
+        }
+      }
+      for (const key of keysA) {
+        if (!keysB.has(key)) {
+          released.push(activeA.get(key));
+        }
+      }
+      for (const key of keysA) {
+        if (keysB.has(key)) {
+          common.push(activeA.get(key));
+        }
+      }
+
+      const sumSize = (rows) => rows.reduce((s, r) => s + Number(r.size || 0), 0);
+      const countA = activeA.size;
+      const countB = activeB.size;
+      const totalSizeA = sumSize(Array.from(activeA.values()));
+      const totalSizeB = sumSize(Array.from(activeB.values()));
+      const addedSize = sumSize(added);
+      const releasedSize = sumSize(released);
+      const commonSize = sumSize(common);
+      const netSize = totalSizeB - totalSizeA;
+
+      return {
+        timeA,
+        timeB,
+        activeA,
+        activeB,
+        countA,
+        countB,
+        totalSizeA,
+        totalSizeB,
+        netCount: countB - countA,
+        netSize,
+        added,
+        released,
+        common,
+        addedSize,
+        releasedSize,
+        commonSize,
+        addedCount: added.length,
+        releasedCount: released.length,
+        commonCount: common.length
+      };
+    }
+
+    function aggregateByDimension(rows, dimension) {
+      const buckets = new Map();
+      for (const row of rows) {
+        const raw = row[dimension] == null ? "" : String(row[dimension]);
+        const val = raw.trim() || "(empty)";
+        const entry = buckets.get(val);
+        if (entry) {
+          entry.count += 1;
+          entry.size += Number(row.size || 0);
+        } else {
+          buckets.set(val, { value: val, count: 1, size: Number(row.size || 0) });
+        }
+      }
+      const results = Array.from(buckets.values());
+      results.sort((a, b) => b.size - a.size);
+      return results;
+    }
+
+    function getDiffDetailRows() {
+      if (!state.diffResults) return [];
+      const category = state.diffCategory;
+      if (category === "added") return state.diffResults.added;
+      if (category === "released") return state.diffResults.released;
+      if (category === "common") return state.diffResults.common;
+      return [];
+    }
+
+    function updateDiffUI() {
+      const results = state.diffResults;
+      if (!results) return;
+      switchDetailTab("diff");
+
+      elements.diffSummary.textContent =
+        `A 点（${formatNumber(results.timeA)}）：${formatNumber(results.countA)} blocks, ${formatBytes(results.totalSizeA)} → B 点（${formatNumber(results.timeB)}）：${formatNumber(results.countB)} blocks, ${formatBytes(results.totalSizeB)}`;
+
+      elements.diffSummaryGrid.style.display = "";
+      elements.diffSummaryGrid.innerHTML = `
+        <div class="diff-summary-item">
+          <div class="diff-summary-label">A 总 size</div>
+          <div class="diff-summary-value">${formatBytes(results.totalSizeA)} (${formatNumber(results.countA)} blocks)</div>
+        </div>
+        <div class="diff-summary-item">
+          <div class="diff-summary-label">B 总 size</div>
+          <div class="diff-summary-value">${formatBytes(results.totalSizeB)} (${formatNumber(results.countB)} blocks)</div>
+        </div>
+        <div class="diff-summary-item">
+          <div class="diff-summary-label">净增</div>
+          <div class="diff-summary-value" style="color:${results.netSize >= 0 ? '#dc2626' : '#0f766e'}">${results.netSize >= 0 ? '+' : ''}${formatBytes(results.netSize)}</div>
+        </div>
+        <div class="diff-summary-item">
+          <div class="diff-summary-label">新增 (B有A无)</div>
+          <div class="diff-summary-value added">+${formatBytes(results.addedSize)} (${formatNumber(results.addedCount)} blocks)</div>
+        </div>
+        <div class="diff-summary-item">
+          <div class="diff-summary-label">释放 (A有B无)</div>
+          <div class="diff-summary-value released">-${formatBytes(results.releasedSize)} (${formatNumber(results.releasedCount)} blocks)</div>
+        </div>
+        <div class="diff-summary-item">
+          <div class="diff-summary-label">共同存活</div>
+          <div class="diff-summary-value common">${formatBytes(results.commonSize)} (${formatNumber(results.commonCount)} blocks)</div>
+        </div>
+      `;
+
+      elements.diffContent.style.display = "";
+
+      updateDiffTabs();
+      updateDiffAggTable();
+      updateDiffDetailTable();
+    }
+
+    function updateDiffTabs() {
+      const tabs = elements.diffTabs.querySelectorAll(".diff-tab");
+      tabs.forEach((tab) => {
+        tab.classList.remove("active-add", "active-release", "active-common");
+        const cat = tab.dataset.category;
+
+        const activeClass = state.diffCategory === cat
+          ? (cat === "added" ? "active-add" : cat === "released" ? "active-release" : "active-common")
+          : "";
+        if (activeClass) tab.classList.add(activeClass);
+
+        const countKey = cat === "added" ? "addedCount" : cat === "released" ? "releasedCount" : "commonCount";
+        const sizeKey = cat === "added" ? "addedSize" : cat === "released" ? "releasedSize" : "commonSize";
+        const result = state.diffResults;
+        const catLabel = cat === "added" ? "新增" : cat === "released" ? "释放" : "共同存活";
+        tab.textContent = `${catLabel} (${formatNumber(result ? result[countKey] : 0)})`;
+      });
+    }
+
+    function updateDiffAggTable() {
+      if (!state.diffResults) return;
+      const rows = getDiffDetailRows();
+      const dimension = elements.diffAggDimension.value;
+      const agg = aggregateByDimension(rows, dimension);
+
+      elements.diffAggHead.innerHTML = "";
+      elements.diffAggBody.innerHTML = "";
+
+      const headers = [dimension, "count", "total_size"];
+      const tr = document.createElement("tr");
+      for (const h of headers) {
+        const th = document.createElement("th");
+        th.textContent = h;
+        tr.appendChild(th);
+      }
+      elements.diffAggHead.appendChild(tr);
+
+      if (!agg.length) {
+        const emptyTr = document.createElement("tr");
+        const emptyTd = document.createElement("td");
+        emptyTd.colSpan = 3;
+        emptyTd.className = "muted";
+        emptyTd.textContent = "无数据";
+        emptyTr.appendChild(emptyTd);
+        elements.diffAggBody.appendChild(emptyTr);
+        return;
+      }
+
+      const topN = Math.min(agg.length, 30);
+      let shownCount = 0;
+      let shownSize = 0;
+      for (let i = 0; i < topN; i++) {
+        const item = agg[i];
+        shownCount += item.count;
+        shownSize += item.size;
+        const rowTr = document.createElement("tr");
+        const tdDim = document.createElement("td");
+        tdDim.textContent = item.value;
+        const tdCount = document.createElement("td");
+        tdCount.textContent = formatNumber(item.count);
+        const tdSize = document.createElement("td");
+        tdSize.textContent = formatBytes(item.size);
+        rowTr.appendChild(tdDim);
+        rowTr.appendChild(tdCount);
+        rowTr.appendChild(tdSize);
+        elements.diffAggBody.appendChild(rowTr);
+      }
+
+      const totalCount = rows.length;
+      const totalSize = rows.reduce((s, r) => s + Number(r.size || 0), 0);
+      if (topN < agg.length) {
+        elements.diffAggNote.textContent =
+          `显示 top ${topN}/${agg.length} 聚合项（覆盖 ${formatNumber(shownCount)}/${formatNumber(totalCount)} blocks, ${formatBytes(shownSize)}/${formatBytes(totalSize)}）。`;
+      } else {
+        elements.diffAggNote.textContent =
+          `${agg.length} 个聚合项，共 ${formatNumber(totalCount)} blocks, ${formatBytes(totalSize)}。`;
+      }
+    }
+
+    function updateDiffDetailTable() {
+      if (!state.diffResults) return;
+      const rows = getDiffDetailRows();
+      const totalPages = Math.max(1, Math.ceil(rows.length / state.diffPageSize));
+      state.diffCurrentPage = Math.min(Math.max(1, state.diffCurrentPage), totalPages);
+      const pageStart = (state.diffCurrentPage - 1) * state.diffPageSize;
+      const pageEnd = Math.min(rows.length, pageStart + state.diffPageSize);
+      const renderRows = rows.slice(pageStart, pageEnd);
+
+      elements.diffDetailSummary.textContent =
+        `明细列表：共 ${formatNumber(rows.length)} 行，显示第 ${formatNumber(pageStart + 1)} - ${formatNumber(pageEnd)} 行`;
+      elements.diffPagerInfo.textContent =
+        `第 ${formatNumber(state.diffCurrentPage)} / ${formatNumber(totalPages)} 页`;
+      elements.diffPrevPage.disabled = state.diffCurrentPage <= 1;
+      elements.diffNextPage.disabled = state.diffCurrentPage >= totalPages;
+      elements.diffPageInput.disabled = rows.length === 0;
+      elements.diffGoPage.disabled = rows.length === 0;
+      elements.diffPageInput.max = String(totalPages);
+
+      const activeHeaders = getActiveHeaders();
+      elements.diffDetailHead.innerHTML = "";
+      elements.diffDetailBody.innerHTML = "";
+
+      const headTr = document.createElement("tr");
+      for (const header of activeHeaders) {
+        const th = document.createElement("th");
+        th.textContent = header;
+        headTr.appendChild(th);
+      }
+      elements.diffDetailHead.appendChild(headTr);
+
+      if (!renderRows.length) {
+        const emptyTr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = Math.max(1, activeHeaders.length);
+        td.className = "muted";
+        td.textContent = "无数据";
+        emptyTr.appendChild(td);
+        elements.diffDetailBody.appendChild(emptyTr);
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+      for (const row of renderRows) {
+        const tr = document.createElement("tr");
+        for (const header of activeHeaders) {
+          const td = document.createElement("td");
+          renderTableCell(td, row[header] ?? "", header);
+          tr.appendChild(td);
+        }
+        fragment.appendChild(tr);
+      }
+      elements.diffDetailBody.appendChild(fragment);
+    }
+
+    function runDiffAnalysis() {
+      const timeA = Number(elements.diffATime.value);
+      const timeB = Number(elements.diffBTime.value);
+      if (!Number.isFinite(timeA) || !Number.isFinite(timeB)) {
+        setStatus("请为 A、B 两点设置有效的时间戳。");
+        return;
+      }
+
+      state.diffPointA = { time: timeA, label: `A: ${formatNumber(timeA)}` };
+      state.diffPointB = { time: timeB, label: `B: ${formatNumber(timeB)}` };
+
+      setStatus(`正在计算 ${formatNumber(timeA)} vs ${formatNumber(timeB)} 的差异...`);
+      setTimeout(() => {
+        try {
+          state.diffResults = computeDiff(timeA, timeB);
+          state.diffCurrentPage = 1;
+          state.diffCategory = "added";
+          updateDiffUI();
+          draw();
+          setStatus(
+            `差异分析完成\n` +
+            `A: ${formatBytes(state.diffResults.totalSizeA)} (${formatNumber(state.diffResults.countA)} blocks)\n` +
+            `B: ${formatBytes(state.diffResults.totalSizeB)} (${formatNumber(state.diffResults.countB)} blocks)\n` +
+            `新增: +${formatBytes(state.diffResults.addedSize)} | 释放: -${formatBytes(state.diffResults.releasedSize)} | 共同: ${formatBytes(state.diffResults.commonSize)}`
+          );
+        } catch (err) {
+          console.error(err);
+          setStatus(`差异分析失败: ${err.message}`);
+        }
+      }, 0);
+    }
+
+    function setDiffPointFromClick(target) {
+      const element = target === "A" ? elements.diffATime : elements.diffBTime;
+      const currentTime = state.clickedPointTime;
+      if (currentTime !== null && Number.isFinite(currentTime)) {
+        element.value = String(Math.round(currentTime));
+        updateDiffRunButton();
+      } else {
+        setStatus("请先在曲线上点击一个时间点。");
+      }
+    }
+
+    function updateDiffRunButton() {
+      const a = Number(elements.diffATime.value);
+      const b = Number(elements.diffBTime.value);
+      const hasData = state.rows && state.rows.length > 0;
+      elements.diffRunBtn.disabled = !Number.isFinite(a) || !Number.isFinite(b) || !hasData;
+    }
+
+    function exportDiffCSV() {
+      if (!state.diffResults) return;
+      const rows = getDiffDetailRows();
+      if (!rows.length) return;
+      const activeHeaders = getActiveHeaders();
+      const lines = [activeHeaders.map(escapeCsv).join(",")];
+      for (const row of rows) {
+        const values = [];
+        for (const header of activeHeaders) {
+          values.push(escapeCsv(row[header] ?? ""));
+        }
+        lines.push(values.join(","));
+      }
+      const category = state.diffCategory;
+      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `diff_${category}_A${Math.round(state.diffResults.timeA)}_B${Math.round(state.diffResults.timeB)}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function exportDiffJSON() {
+      if (!state.diffResults) return;
+      const rows = getDiffDetailRows();
+      const exportData = {
+        pointA: state.diffResults.timeA,
+        pointB: state.diffResults.timeB,
+        summary: {
+          aTotalSize: state.diffResults.totalSizeA,
+          aBlockCount: state.diffResults.countA,
+          bTotalSize: state.diffResults.totalSizeB,
+          bBlockCount: state.diffResults.countB,
+          netSize: state.diffResults.netSize,
+          addedSize: state.diffResults.addedSize,
+          addedCount: state.diffResults.addedCount,
+          releasedSize: state.diffResults.releasedSize,
+          releasedCount: state.diffResults.releasedCount,
+          commonSize: state.diffResults.commonSize,
+          commonCount: state.diffResults.commonCount
+        },
+        category: state.diffCategory,
+        aggregationDimension: elements.diffAggDimension.value,
+        aggregation: aggregateByDimension(rows, elements.diffAggDimension.value),
+        rows: rows
+      };
+      const json = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([json], { type: "application/json;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `diff_${state.diffCategory}_A${Math.round(state.diffResults.timeA)}_B${Math.round(state.diffResults.timeB)}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+    }
+
+    /* ── Peak Interpreter ── */
+
+    function getTopPythonFrame(stack) {
+      if (!stack) return "(empty)";
+      const parts = stack.split("|");
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const frame = parts[i].trim();
+        if (!frame) continue;
+        if (frame.includes("/mindspore/") || frame.includes("/site-packages/mindspore/")) continue;
+        return frame;
+      }
+      return parts[parts.length - 1].trim() || "(empty)";
+    }
+
+    function getPeakTimeAndRows(target) {
+      let peakTime = null;
+      if (target === "real_peak" && state.series.real && state.series.real.peak) {
+        peakTime = state.series.real.peak.time;
+      } else if (target === "theory_peak" && state.series.theory && state.series.theory.peak) {
+        peakTime = state.series.theory.peak.time;
+      } else if (target === "actual_peak" && state.series.actual && state.series.actual.peak) {
+        peakTime = state.series.actual.peak.time;
+      } else if (target === "clicked_time" && state.clickedPointTime !== null) {
+        peakTime = state.clickedPointTime;
+      }
+      if (peakTime === null) return { peakTime: null, rows: [] };
+
+      const rows = rowsAliveAtTimePoint(peakTime);
+      return { peakTime, rows };
+    }
+
+    function isPyNativeAbnormalAt(row, peakTime) {
+      const userTasks = extractUsers(row.user_tasks || "");
+      if (!userTasks.length) return false;
+      const maxUserId = arrayMax(userTasks);
+      return maxUserId < peakTime && (row.type || "").startsWith("PyNative");
+    }
+
+    function computePeakBreakdown(target) {
+      const { peakTime, rows } = getPeakTimeAndRows(target);
+      if (peakTime === null) return null;
+      if (!rows.length) return { peakTime, rows: [], totalSize: 0, blockCount: 0, breakdowns: {}, conclusions: [] };
+
+      const totalSize = rows.reduce((s, r) => s + Number(r.size || 0), 0);
+      const blockCount = rows.length;
+
+      const dimensions = ["type", "task_name", "node_name", "graph_name", "producer_task", "pool_type"];
+
+      const breakdowns = {};
+      for (const dim of dimensions) {
+        const buckets = new Map();
+        for (const row of rows) {
+          const raw = row[dim] == null ? "" : String(row[dim]);
+          const val = raw.trim() || "(empty)";
+          const entry = buckets.get(val);
+          if (entry) {
+            entry.count += 1;
+            entry.size += Number(row.size || 0);
+            if (Number(row.size || 0) > entry.maxBlockSize) {
+              entry.maxBlockSize = Number(row.size || 0);
+              entry.repRow = row;
+            }
+            const lifetime = (Number.isFinite(Number(row.end_time_stamp)) && Number(row.end_time_stamp) < END_SENTINEL_THRESHOLD)
+              ? Number(row.end_time_stamp) - Number(row.start_time_stamp)
+              : (state.fullRangeX[1] + 1 - Number(row.start_time_stamp));
+            if (lifetime > entry.maxLifetime) entry.maxLifetime = lifetime;
+          } else {
+            const lifetime = (Number.isFinite(Number(row.end_time_stamp)) && Number(row.end_time_stamp) < END_SENTINEL_THRESHOLD)
+              ? Number(row.end_time_stamp) - Number(row.start_time_stamp)
+              : (state.fullRangeX[1] + 1 - Number(row.start_time_stamp));
+            buckets.set(val, {
+              value: val,
+              count: 1,
+              size: Number(row.size || 0),
+              maxBlockSize: Number(row.size || 0),
+              maxLifetime: lifetime,
+              repRow: row
+            });
+          }
+        }
+        const arr = Array.from(buckets.values());
+        arr.sort((a, b) => b.size - a.size);
+        for (const item of arr) {
+          item.pct = totalSize > 0 ? (item.size / totalSize * 100) : 0;
+        }
+        breakdowns[dim] = arr;
+      }
+
+      // python_stack top frame
+      const frameBuckets = new Map();
+      for (const row of rows) {
+        const frame = getTopPythonFrame(row.python_stack || "");
+        const entry = frameBuckets.get(frame);
+        if (entry) {
+          entry.count += 1;
+          entry.size += Number(row.size || 0);
+        } else {
+          frameBuckets.set(frame, { value: frame, count: 1, size: Number(row.size || 0), maxBlockSize: Number(row.size || 0), maxLifetime: 0, repRow: row });
+        }
+        if (Number(row.size || 0) > frameBuckets.get(frame).maxBlockSize) {
+          frameBuckets.get(frame).maxBlockSize = Number(row.size || 0);
+          frameBuckets.get(frame).repRow = row;
+        }
+      }
+      const frameArr = Array.from(frameBuckets.values());
+      frameArr.sort((a, b) => b.size - a.size);
+      for (const item of frameArr) {
+        item.pct = totalSize > 0 ? (item.size / totalSize * 100) : 0;
+      }
+      breakdowns["python_stack_frame"] = frameArr;
+
+      // is_persistent
+      const persistentBuckets = new Map();
+      persistentBuckets.set("persistent", { value: "persistent", count: 0, size: 0, maxBlockSize: 0, maxLifetime: 0, repRow: null });
+      persistentBuckets.set("non_persistent", { value: "non_persistent", count: 0, size: 0, maxBlockSize: 0, maxLifetime: 0, repRow: null });
+      for (const row of rows) {
+        const isPersistent = (row.is_persistent === "1" || row.is_persistent === "true" || row.is_persistent === "True");
+        const key = isPersistent ? "persistent" : "non_persistent";
+        const entry = persistentBuckets.get(key);
+        entry.count += 1;
+        entry.size += Number(row.size || 0);
+        if (Number(row.size || 0) > entry.maxBlockSize) {
+          entry.maxBlockSize = Number(row.size || 0);
+          entry.repRow = row;
+        }
+      }
+      for (const item of persistentBuckets.values()) {
+        item.pct = totalSize > 0 ? (item.size / totalSize * 100) : 0;
+      }
+      breakdowns["is_persistent"] = Array.from(persistentBuckets.values()).filter((x) => x.count > 0).sort((a, b) => b.size - a.size);
+
+      // is_small
+      const smallBuckets = new Map();
+      smallBuckets.set("small", { value: "small (<1MB)", count: 0, size: 0, maxBlockSize: 0, maxLifetime: 0, repRow: null });
+      smallBuckets.set("medium", { value: "medium (1-10MB)", count: 0, size: 0, maxBlockSize: 0, maxLifetime: 0, repRow: null });
+      smallBuckets.set("large", { value: "large (>10MB)", count: 0, size: 0, maxBlockSize: 0, maxLifetime: 0, repRow: null });
+      for (const row of rows) {
+        const sz = Number(row.size || 0);
+        let key = "large";
+        if (sz < 1048576) key = "small";
+        else if (sz <= 10485760) key = "medium";
+        const entry = smallBuckets.get(key);
+        entry.count += 1;
+        entry.size += sz;
+        if (sz > entry.maxBlockSize) { entry.maxBlockSize = sz; entry.repRow = row; }
+      }
+      for (const item of smallBuckets.values()) {
+        item.pct = totalSize > 0 ? (item.size / totalSize * 100) : 0;
+      }
+      breakdowns["is_small"] = Array.from(smallBuckets.values()).filter((x) => x.count > 0).sort((a, b) => b.size - a.size);
+
+      // Conclusions (non-dimension-specific ones)
+      const conclusions = [];
+
+      const topFrame = breakdowns["python_stack_frame"][0];
+      if (topFrame && topFrame.pct > 20) {
+        conclusions.push({ text: `主要调用来源: ${escapeHtml(topFrame.value).slice(0, 80)} 贡献 ${topFrame.pct.toFixed(1)}%。`, cls: "info" });
+      }
+
+      const persistentItem = breakdowns["is_persistent"].find((x) => x.value === "persistent");
+      const persistentPct = persistentItem ? persistentItem.pct : 0;
+      if (persistentPct > 10) {
+        conclusions.push({ text: `持久内存占比 ${persistentPct.toFixed(1)}%（${formatBytes(persistentItem.size)}），可能为静态权重或常驻 buffer。`, cls: persistentPct > 30 ? "risk" : "warn" });
+      } else {
+        conclusions.push({ text: `持久内存占比 ${persistentPct.toFixed(1)}%，大部分峰值内存可在计算结束后释放。`, cls: "info" });
+      }
+
+      const smallItem = breakdowns["is_small"].find((x) => x.value === "small (<1MB)");
+      const smallPct = smallItem ? smallItem.pct : 0;
+      const smallCount = smallItem ? smallItem.count : 0;
+      if (smallPct > 20 && smallCount > 100) {
+        conclusions.push({ text: `小块碎片风险: <1MB 的 block 占 ${smallPct.toFixed(1)}%（${formatNumber(smallCount)} 个），可能因大量小块导致显存碎片。`, cls: smallPct > 40 ? "risk" : "warn" });
+      }
+
+      const largeItem = breakdowns["is_small"].find((x) => x.value === "large (>10MB)");
+      if (largeItem && largeItem.count > 0) {
+        conclusions.push({ text: `大块内存: >10MB 的 block 共 ${formatNumber(largeItem.count)} 个，总 ${formatBytes(largeItem.size)}，占峰值 ${largeItem.pct.toFixed(1)}%。`, cls: largeItem.pct > 50 ? "warn" : "info" });
+      }
+
+      const abnormalCount = rows.filter((r) => isPyNativeAbnormalAt(r, peakTime)).length;
+      if (abnormalCount > 0) {
+        conclusions.push({ text: `异常 PyNative: ${formatNumber(abnormalCount)} 个 PyNative 相关 block 在 user_task 结束后仍存活，疑似未及时释放。`, cls: abnormalCount > 10 ? "risk" : "warn" });
+      }
+
+      // Check for blocks that live far beyond peak
+      const longAfterPeak = rows.filter((r) => {
+        const end = Number(r.end_time_stamp);
+        return Number.isFinite(end) && end < END_SENTINEL_THRESHOLD && end > peakTime + 1e8;
+      });
+      if (longAfterPeak.length > 0) {
+        conclusions.push({ text: `峰值后长留对象: ${formatNumber(longAfterPeak.length)} 个 block 的 end_time 超出峰值 >1e8，可能在后续阶段仍占用显存。`, cls: "warn" });
+      }
+
+      return { peakTime, rows, totalSize, blockCount, breakdowns, conclusions };
+    }
+
+    function renderPeakInterpreter() {
+      const results = state.peakInterpResults;
+      if (!results) {
+        elements.peakInterpCard.style.display = "none";
+        return;
+      }
+      switchDetailTab("interp");
+      elements.peakInterpCard.style.display = "";
+      elements.peakInterpContent.style.display = "";
+      elements.peakInterpDesc.textContent =
+        `峰值时间: ${formatNumber(results.peakTime)} — 解释维度: ${state.peakInterpDim}`;
+
+      // Overview
+      elements.peakInterpOverview.innerHTML = `
+        <div class="peak-interp-stat">
+          <div class="label">峰值时间</div>
+          <div class="value">${formatNumber(results.peakTime)}</div>
+        </div>
+        <div class="peak-interp-stat">
+          <div class="label">峰值总 size</div>
+          <div class="value">${formatBytes(results.totalSize)}</div>
+        </div>
+        <div class="peak-interp-stat">
+          <div class="label">活跃 block 数</div>
+          <div class="value">${formatNumber(results.blockCount)}</div>
+        </div>
+      `;
+
+      // Conclusions — prepend a dynamic top-item conclusion for the current dimension
+      const peakDim = state.peakInterpDim || "type";
+      const dimTopItem = results.breakdowns[peakDim]?.[0];
+      const allConclusions = dimTopItem
+        ? [{ text: `最大 ${peakDim} 贡献: "${escapeHtml(dimTopItem.value)}" 占 ${dimTopItem.pct.toFixed(1)}%（${formatBytes(dimTopItem.size)}），共 ${formatNumber(dimTopItem.count)} 个 block。`, cls: "info" }].concat(results.conclusions)
+        : results.conclusions;
+      elements.peakInterpConclusionList.innerHTML = allConclusions.map((c) =>
+        `<div class="peak-interp-conclusion-item ${c.cls}">• ${c.text}</div>`
+      ).join("");
+
+      // Aggregation list
+      const dim = state.peakInterpDim;
+      const agg = results.breakdowns[dim] || [];
+      const topN = Math.min(agg.length, 40);
+      let html = "";
+      for (let i = 0; i < topN; i++) {
+        const item = agg[i];
+        const selected = state.peakInterpSelected && state.peakInterpSelected.dim === dim && state.peakInterpSelected.value === item.value;
+        html += `<div class="peak-agg-row${selected ? " selected" : ""}" data-dim="${escapeHtml(dim)}" data-value="${escapeHtml(item.value)}">
+          <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 220px;" title="${escapeHtml(item.value)}">${escapeHtml(item.value)}</span>
+          <span style="width:70px;text-align:right;flex-shrink:0;">${formatBytes(item.size)}</span>
+          <span style="width:48px;text-align:right;flex-shrink:0;color:var(--muted);">${item.pct.toFixed(1)}%</span>
+          <div class="peak-agg-bar-wrap"><div class="peak-agg-bar-fill" style="width:${Math.min(100, item.pct)}%;"></div></div>
+          <span style="width:48px;text-align:right;flex-shrink:0;color:var(--muted);">${formatNumber(item.count)}</span>
+        </div>`;
+      }
+      elements.peakInterpAggList.innerHTML = html || '<div class="small" style="padding:12px;">无聚合数据</div>';
+      if (topN < agg.length) {
+        elements.peakInterpAggNote.textContent = `显示 top ${topN}/${agg.length} 项。`;
+      } else {
+        elements.peakInterpAggNote.textContent = `${agg.length} 项，共 ${formatBytes(results.totalSize)}。`;
+      }
+
+      // Click handlers on agg rows
+      elements.peakInterpAggList.querySelectorAll(".peak-agg-row").forEach((el) => {
+        el.addEventListener("click", () => {
+          const dim = el.dataset.dim;
+          const value = el.dataset.value;
+          onPeakInterpItemClick(dim, value);
+        });
+      });
+    }
+
+    function escapeHtml(str) {
+      return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function onPeakInterpItemClick(dim, value) {
+      if (state.peakInterpSelected && state.peakInterpSelected.dim === dim && state.peakInterpSelected.value === value) {
+        state.peakInterpSelected = null;
+        // Reset detail filter for this dimension
+        delete state.detailFilters[dim];
+        updateDetailTable();
+      } else {
+        state.peakInterpSelected = { dim, value };
+        // Apply filter to detail table
+        const header = mapPeakDimToHeader(dim);
+        if (header) {
+          commitDetailFilter(header, { text: value, min: "", max: "" });
+        }
+        // Also filter other dimensions
+        if (dim === "is_persistent") {
+          const isPersistent = value === "persistent";
+          const filterVal = isPersistent ? "1" : "";
+          if (isPersistent) {
+            commitDetailFilter("is_persistent", { text: "1", min: "", max: "" });
+          } else {
+            delete state.detailFilters["is_persistent"];
+          }
+        } else if (dim === "is_small") {
+          delete state.detailFilters["size"];
+          if (value.includes("<1MB")) {
+            commitDetailFilter("size", { text: "", min: "0", max: "1048575" });
+          } else if (value.includes("1-10MB")) {
+            commitDetailFilter("size", { text: "", min: "1048576", max: "10485760" });
+          } else {
+            commitDetailFilter("size", { text: "", min: "10485761", max: "" });
+          }
+        } else {
+          commitDetailFilter(header, { text: value, min: "", max: "" });
+        }
+      }
+      renderPeakInterpreter();
+    }
+
+    function mapPeakDimToHeader(dim) {
+      if (dim === "python_stack_frame") return "python_stack";
+      if (dim === "is_persistent") return "is_persistent";
+      if (dim === "is_small") return "size";
+      return dim;
+    }
+
+    function runPeakInterpreter() {
+      const target = elements.peakInterpTarget.value;
+      state.peakInterpTarget = target;
+      state.peakInterpSelected = null;
+
+      setStatus("正在分析峰值...");
+      setTimeout(() => {
+        try {
+          state.peakInterpResults = computePeakBreakdown(target);
+          if (!state.peakInterpResults) {
+            setStatus("无法获取峰值时间。请确认 CSV 已加载且峰值数据可用。");
+            return;
+          }
+          state.detailFilters = {};
+          state.detailCurrentPage = 1;
+          renderPeakInterpreter();
+          elements.detailMode.value = "clicked_alive";
+          state.clickedAliveRows = state.peakInterpResults.rows;
+          state.clickedPointTime = state.peakInterpResults.peakTime;
+          updateDetailTable();
+          setStatus(
+            `峰值解释完成\n` +
+            `峰值时间: ${formatNumber(state.peakInterpResults.peakTime)}\n` +
+            `总 size: ${formatBytes(state.peakInterpResults.totalSize)}\n` +
+            `活跃 block: ${formatNumber(state.peakInterpResults.blockCount)}`
+          );
+        } catch (err) {
+          console.error(err);
+          setStatus(`峰值解释失败: ${err.message}`);
+        }
+      }, 0);
+    }
+
+    function exportPeakInterpCSV() {
+      if (!state.peakInterpResults) return;
+      const dim = state.peakInterpDim;
+      const agg = state.peakInterpResults.breakdowns[dim] || [];
+      const lines = ["dimension,value,count,size,pct"];
+      for (const item of agg) {
+        lines.push(`${escapeCsv(dim)},${escapeCsv(item.value)},${item.count},${item.size},${item.pct.toFixed(2)}`);
+      }
+      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `peak_interp_${state.peakInterpTarget}_${dim}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function exportPeakInterpJSON() {
+      if (!state.peakInterpResults) return;
+      const exportData = {
+        target: state.peakInterpTarget,
+        peakTime: state.peakInterpResults.peakTime,
+        totalSize: state.peakInterpResults.totalSize,
+        blockCount: state.peakInterpResults.blockCount,
+        conclusions: state.peakInterpResults.conclusions.map((c) => c.text),
+        breakdowns: state.peakInterpResults.breakdowns
+      };
+      const json = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([json], { type: "application/json;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `peak_interp_${state.peakInterpTarget}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function getActiveSeries() {
+      const active = [];
+      if (elements.showReal.checked && state.series.real) {
+        active.push({
+          key: "real",
+          points: state.series.real.points,
+          peak: state.series.real.peak,
+          color: colors.real,
+          label: "无碎片显存"
+        });
+      }
+      if (elements.showTheory.checked && state.series.theory) {
+        active.push({
+          key: "theory",
+          points: state.series.theory.points,
+          peak: state.series.theory.peak,
+          color: colors.theory,
+          label: "理论显存"
+        });
+      }
+      if (elements.showActual.checked && state.series.actual) {
+        active.push({
+          key: "actual",
+          points: state.series.actual.points,
+          peak: state.series.actual.peak,
+          color: colors.actual,
+          label: "含碎片显存"
+        });
+      }
+      return active;
+    }
+
+    function resizeCanvas() {
+      const rect = elements.canvas.getBoundingClientRect();
+      state.dpr = Math.max(1, window.devicePixelRatio || 1);
+      elements.canvas.width = Math.max(1, Math.floor(rect.width * state.dpr));
+      elements.canvas.height = Math.max(1, Math.floor(rect.height * state.dpr));
+      draw();
+    }
+
+    function getPlotRect() {
+      const width = elements.canvas.width;
+      const height = elements.canvas.height;
+      return {
+        left: 96 * state.dpr,
+        top: 24 * state.dpr,
+        right: width - 28 * state.dpr,
+        bottom: height - 62 * state.dpr,
+        width: width - 124 * state.dpr,
+        height: height - 86 * state.dpr
+      };
+    }
+
+    function clampView() {
+      const [fullMinX, fullMaxX] = state.fullRangeX;
+      const [fullMinY, fullMaxY] = state.fullRangeY;
+      let [minX, maxX] = state.viewX;
+      let [minY, maxY] = state.viewY;
+      const minWidth = Math.max(10, (fullMaxX - fullMinX) / 1e6);
+      const minHeight = Math.max(1, (fullMaxY - fullMinY) / 1e6);
+
+      if (maxX - minX < minWidth) {
+        const mid = (minX + maxX) / 2;
+        minX = mid - minWidth / 2;
+        maxX = mid + minWidth / 2;
+      }
+      if (maxY - minY < minHeight) {
+        const mid = (minY + maxY) / 2;
+        minY = mid - minHeight / 2;
+        maxY = mid + minHeight / 2;
+      }
+
+      if (minX < fullMinX) {
+        maxX += fullMinX - minX;
+        minX = fullMinX;
+      }
+      if (maxX > fullMaxX) {
+        minX -= maxX - fullMaxX;
+        maxX = fullMaxX;
+      }
+      if (minY < fullMinY) {
+        maxY += fullMinY - minY;
+        minY = fullMinY;
+      }
+      if (maxY > fullMaxY) {
+        minY -= maxY - fullMaxY;
+        maxY = fullMaxY;
+      }
+
+      state.viewX = [Math.max(fullMinX, minX), Math.min(fullMaxX, maxX)];
+      state.viewY = [Math.max(fullMinY, minY), Math.min(fullMaxY, maxY)];
+    }
+
+    function visiblePoints(points) {
+      const minX = state.viewX[0];
+      const maxX = state.viewX[1];
+      let start = 0;
+      let end = points.length - 1;
+
+      while (start < points.length && points[start][0] < minX) start++;
+      while (end >= 0 && points[end][0] > maxX) end--;
+      start = Math.max(0, start - 1);
+      end = Math.min(points.length - 1, end + 1);
+      return points.slice(start, end + 1);
+    }
+
+    function downsample(points, pixelWidth, samplesPerPixel) {
+      if (points.length <= pixelWidth * samplesPerPixel) {
+        return points;
+      }
+
+      const bucketCount = Math.max(1, Math.floor(pixelWidth * samplesPerPixel));
+      const bucketWidth = (state.viewX[1] - state.viewX[0]) / bucketCount;
+      const out = [];
+      let pointIndex = 0;
+
+      for (let bucket = 0; bucket < bucketCount; bucket++) {
+        const startX = state.viewX[0] + bucket * bucketWidth;
+        const endX = startX + bucketWidth;
+        let firstPoint = null;
+        let minPoint = null;
+        let maxPoint = null;
+        let lastPoint = null;
+
+        while (pointIndex < points.length && points[pointIndex][0] < endX) {
+          const point = points[pointIndex];
+          if (point[0] >= startX) {
+            if (!firstPoint) firstPoint = point;
+            lastPoint = point;
+            if (!minPoint || point[1] < minPoint[1]) minPoint = point;
+            if (!maxPoint || point[1] > maxPoint[1]) maxPoint = point;
+          }
+          pointIndex += 1;
+        }
+
+        if (firstPoint) out.push(firstPoint);
+        if (minPoint && minPoint !== firstPoint && minPoint !== lastPoint) out.push(minPoint);
+        if (maxPoint && maxPoint !== firstPoint && maxPoint !== lastPoint && maxPoint !== minPoint) out.push(maxPoint);
+        if (lastPoint && lastPoint !== firstPoint) out.push(lastPoint);
+      }
+
+      out.sort((a, b) => a[0] - b[0]);
+      return out.length ? out : points;
+    }
+
+    function dataToScreen(x, y, plot) {
+      return {
+        px: plot.left + ((x - state.viewX[0]) / (state.viewX[1] - state.viewX[0])) * plot.width,
+        py: plot.bottom - ((y - state.viewY[0]) / (state.viewY[1] - state.viewY[0])) * plot.height
+      };
+    }
+
+    function screenToData(clientX, clientY) {
+      const rect = elements.canvas.getBoundingClientRect();
+      const px = (clientX - rect.left) * state.dpr;
+      const py = (clientY - rect.top) * state.dpr;
+      const plot = getPlotRect();
+      const dataX = state.viewX[0] + ((px - plot.left) / plot.width) * (state.viewX[1] - state.viewX[0]);
+      const dataY = state.viewY[1] - ((py - plot.top) / plot.height) * (state.viewY[1] - state.viewY[0]);
+      return { px, py, dataX, dataY, rect, plot };
+    }
+
+    function drawAxes(plot) {
+      ctx.save();
+      ctx.strokeStyle = colors.grid;
+      ctx.fillStyle = colors.axis;
+      ctx.lineWidth = 1;
+      ctx.font = `${12 * state.dpr}px Segoe UI`;
+
+      const tickCountX = Math.max(4, Math.min(7, Math.floor(plot.width / (160 * state.dpr))));
+      const tickCountY = Math.max(4, Math.min(6, Math.floor(plot.height / (110 * state.dpr))));
+
+      for (let i = 0; i <= tickCountX; i++) {
+        const x = plot.left + (plot.width * i) / tickCountX;
+        ctx.beginPath();
+        ctx.moveTo(x, plot.top);
+        ctx.lineTo(x, plot.bottom);
+        ctx.stroke();
+
+        const value = state.viewX[0] + ((state.viewX[1] - state.viewX[0]) * i) / tickCountX;
+        const label = formatAxisTime(value);
+        const width = ctx.measureText(label).width;
+        ctx.fillText(label, x - width / 2, plot.bottom + 24 * state.dpr);
+      }
+
+      for (let i = 0; i <= tickCountY; i++) {
+        const y = plot.top + (plot.height * i) / tickCountY;
+        ctx.beginPath();
+        ctx.moveTo(plot.left, y);
+        ctx.lineTo(plot.right, y);
+        ctx.stroke();
+
+        const value = state.viewY[1] - ((state.viewY[1] - state.viewY[0]) * i) / tickCountY;
+        ctx.fillText(formatAxisBytes(value), 10 * state.dpr, y + 4 * state.dpr);
+      }
+
+      ctx.strokeStyle = colors.axis;
+      ctx.lineWidth = 1.5 * state.dpr;
+      ctx.beginPath();
+      ctx.moveTo(plot.left, plot.top);
+      ctx.lineTo(plot.left, plot.bottom);
+      ctx.lineTo(plot.right, plot.bottom);
+      ctx.stroke();
+
+      ctx.font = `${13 * state.dpr}px Segoe UI`;
+      ctx.textAlign = "right";
+      ctx.fillText("Time", plot.right - 20 * state.dpr, plot.bottom + 46 * state.dpr);
+      ctx.textAlign = "left";
+      ctx.fillText("Memory", 10 * state.dpr, plot.bottom + 46 * state.dpr);
+      ctx.restore();
+    }
+
+    function drawSeries(plot, item) {
+      const rawPoints = visiblePoints(item.points);
+      if (rawPoints.length < 2) return;
+
+      const samplesPerPixel = Math.max(1, Number(elements.samplesPerPixel.value) || 2);
+      const points = downsample(rawPoints, plot.width / state.dpr, samplesPerPixel);
+      if (points.length < 2) return;
+
+      ctx.save();
+      ctx.strokeStyle = item.color;
+      ctx.lineWidth = 2 * state.dpr;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.beginPath();
+
+      let started = false;
+      for (const [x, y] of points) {
+        const { px, py } = dataToScreen(x, y, plot);
+        if (!started) {
+          ctx.moveTo(px, py);
+          started = true;
+        } else {
+          ctx.lineTo(px, py);
+        }
+      }
+      ctx.stroke();
+
+      if (item.peak && item.peak.time >= state.viewX[0] && item.peak.time <= state.viewX[1]) {
+        const { px, py } = dataToScreen(item.peak.time, item.peak.value, plot);
+        ctx.fillStyle = item.color;
+        ctx.beginPath();
+        ctx.arc(px, py, 4 * state.dpr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function drawSelection() {
+      if (!state.selection) return;
+      ctx.save();
+      ctx.fillStyle = colors.select;
+      ctx.strokeStyle = colors.real;
+      ctx.lineWidth = 1.2 * state.dpr;
+      ctx.fillRect(state.selection.x, state.selection.y, state.selection.w, state.selection.h);
+      ctx.strokeRect(state.selection.x, state.selection.y, state.selection.w, state.selection.h);
+      ctx.restore();
+    }
+
+    function drawHoverMarker(plot) {
+      if (!state.hoverPoint) return;
+      ctx.save();
+      ctx.strokeStyle = state.hoverPoint.color;
+      ctx.fillStyle = "#ffffff";
+      ctx.lineWidth = 1.6 * state.dpr;
+      ctx.beginPath();
+      ctx.arc(state.hoverPoint.px, state.hoverPoint.py, 4.4 * state.dpr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.strokeStyle = "rgba(17, 24, 39, 0.18)";
+      ctx.setLineDash([4 * state.dpr, 4 * state.dpr]);
+      ctx.beginPath();
+      ctx.moveTo(state.hoverPoint.px, plot.top);
+      ctx.lineTo(state.hoverPoint.px, plot.bottom);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawSelectedPointMarker(plot) {
+      if (!state.selectedPoint || !Number.isFinite(state.selectedPoint.x)) return;
+      if (state.selectedPoint.x < state.viewX[0] || state.selectedPoint.x > state.viewX[1]) return;
+
+      const y = Number.isFinite(state.selectedPoint.y)
+        ? Math.max(state.viewY[0], Math.min(state.viewY[1], state.selectedPoint.y))
+        : state.viewY[0];
+      const { px, py } = dataToScreen(state.selectedPoint.x, y, plot);
+      const color = state.selectedPoint.color || colors.hover;
+
+      ctx.save();
+      ctx.strokeStyle = "rgba(17, 24, 39, 0.32)";
+      ctx.lineWidth = 1.2 * state.dpr;
+      ctx.setLineDash([5 * state.dpr, 5 * state.dpr]);
+      ctx.beginPath();
+      ctx.moveTo(px, plot.top);
+      ctx.lineTo(px, plot.bottom);
+      ctx.stroke();
+
+      if (Number.isFinite(state.selectedPoint.y) && state.selectedPoint.y >= state.viewY[0] && state.selectedPoint.y <= state.viewY[1]) {
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#ffffff";
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2.4 * state.dpr;
+        ctx.beginPath();
+        ctx.arc(px, py, 6.5 * state.dpr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(px, py, 2.6 * state.dpr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawReferenceLines(plot) {
+      for (const line of state.referenceLines) {
+        if (!Number.isFinite(line.value)) continue;
+        if (line.value < state.viewY[0] || line.value > state.viewY[1]) continue;
+
+        const { py } = dataToScreen(state.viewX[0], line.value, plot);
+        ctx.save();
+        ctx.strokeStyle = line.color;
+        ctx.lineWidth = 1.5 * state.dpr;
+        ctx.setLineDash([8 * state.dpr, 6 * state.dpr]);
+        ctx.beginPath();
+        ctx.moveTo(plot.left, py);
+        ctx.lineTo(plot.right, py);
+        ctx.stroke();
+
+        const label = `${formatBytes(line.value)} (${formatNumber(line.value)})`;
+        ctx.setLineDash([]);
+        ctx.font = `${12 * state.dpr}px Segoe UI`;
+        const paddingX = 8 * state.dpr;
+        const textWidth = ctx.measureText(label).width;
+        const boxWidth = textWidth + paddingX * 2;
+        const boxHeight = 20 * state.dpr;
+        const boxX = Math.min(plot.right - boxWidth, plot.left + 8 * state.dpr);
+        const boxY = Math.max(plot.top + 4 * state.dpr, py - boxHeight - 4 * state.dpr);
+
+        ctx.fillStyle = "rgba(255, 251, 245, 0.95)";
+        ctx.strokeStyle = line.color;
+        ctx.lineWidth = 1 * state.dpr;
+        ctx.beginPath();
+        ctx.roundRect(boxX, boxY, boxWidth, boxHeight, 8 * state.dpr);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = line.color;
+        ctx.fillText(label, boxX + paddingX, boxY + 14 * state.dpr);
+        ctx.restore();
+      }
+    }
+
+    function drawDiffMarkers(plot) {
+      function drawTimeMarker(time, color, label) {
+        if (!Number.isFinite(time)) return;
+        if (time < state.viewX[0] || time > state.viewX[1]) return;
+        const { px } = dataToScreen(time, state.viewY[0], plot);
+
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2 * state.dpr;
+        ctx.setLineDash([6 * state.dpr, 4 * state.dpr]);
+        ctx.beginPath();
+        ctx.moveTo(px, plot.top);
+        ctx.lineTo(px, plot.bottom);
+        ctx.stroke();
+
+        ctx.setLineDash([]);
+        ctx.font = `bold ${13 * state.dpr}px Segoe UI`;
+        const textWidth = ctx.measureText(label).width;
+        const boxPad = 6 * state.dpr;
+        const boxWidth = textWidth + boxPad * 2;
+        const boxHeight = 22 * state.dpr;
+        const boxX = Math.min(plot.right - boxWidth, Math.max(plot.left, px - boxWidth / 2));
+        const boxY = plot.top + 4 * state.dpr;
+
+        ctx.fillStyle = "rgba(255, 251, 245, 0.95)";
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.2 * state.dpr;
+        ctx.beginPath();
+        ctx.roundRect(boxX, boxY, boxWidth, boxHeight, 6 * state.dpr);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = color;
+        ctx.fillText(label, boxX + boxPad, boxY + 16 * state.dpr);
+
+        ctx.restore();
+      }
+
+      if (state.diffPointA) {
+        drawTimeMarker(state.diffPointA.time, "#2563eb", state.diffPointA.label);
+      }
+      if (state.diffPointB) {
+        drawTimeMarker(state.diffPointB.time, "#dc2626", state.diffPointB.label);
+      }
+
+      if (state.diffHighlight && state.diffResults) {
+        let highlightRows = [];
+        if (state.diffHighlight === "added") highlightRows = state.diffResults.added;
+        else if (state.diffHighlight === "released") highlightRows = state.diffResults.released;
+        else if (state.diffHighlight === "common") highlightRows = state.diffResults.common;
+
+        if (highlightRows.length) {
+          ctx.save();
+          const hlColor = state.diffHighlight === "added" ? "rgba(220,38,38,0.14)"
+            : state.diffHighlight === "released" ? "rgba(15,118,110,0.14)"
+            : "rgba(37,99,235,0.12)";
+          ctx.fillStyle = hlColor;
+
+          const MAX_HL_ROWS = 1000;
+          const rows = highlightRows.length > MAX_HL_ROWS
+            ? highlightRows.slice(0, MAX_HL_ROWS)
+            : highlightRows;
+
+          for (const row of rows) {
+            const start = Number(row.start_time_stamp);
+            const end = Number(row.end_time_stamp);
+            if (!Number.isFinite(start)) continue;
+            const effectiveEnd = (Number.isFinite(end) && end >= 0 && end < END_SENTINEL_THRESHOLD)
+              ? end
+              : state.fullRangeX[1] + 1;
+            if (effectiveEnd < state.viewX[0] || start > state.viewX[1]) continue;
+            const x1 = Math.max(plot.left + ((start - state.viewX[0]) / (state.viewX[1] - state.viewX[0])) * plot.width, plot.left);
+            const x2 = Math.min(plot.left + ((effectiveEnd - state.viewX[0]) / (state.viewX[1] - state.viewX[0])) * plot.width, plot.right);
+            if (x2 - x1 < 0.5) continue;
+            ctx.fillRect(x1, plot.top, x2 - x1, plot.height);
+          }
+          ctx.restore();
+        }
+      }
+    }
+
+    
+    function findReferenceLineAt(clientX, clientY) {
+      if (!state.referenceLines.length) return null;
+      const current = screenToData(clientX, clientY);
+      const threshold = 8 * state.dpr;
+
+      let best = null;
+      for (const line of state.referenceLines) {
+        if (!Number.isFinite(line.value)) continue;
+        if (line.value < state.viewY[0] || line.value > state.viewY[1]) continue;
+        const screen = dataToScreen(state.viewX[0], line.value, current.plot);
+        const dist = Math.abs(screen.py - current.py);
+        if (dist <= threshold && (!best || dist < best.dist)) {
+          best = { id: line.id, dist };
+        }
+      }
+      return best ? best.id : null;
+    }
+
+    function updateCanvasCursor() {
+      elements.canvas.classList.toggle(
+        "line-adding",
+        state.lineAddMode && !state.dragging && !state.selecting && !state.draggingReferenceLineId
+      );
+      elements.canvas.classList.toggle("line-hover", !!state.hoverReferenceLineId || !!state.draggingReferenceLineId);
+    }
+
+    function draw() {
+      const width = elements.canvas.width;
+      const height = elements.canvas.height;
+      ctx.clearRect(0, 0, width, height);
+
+      if (!state.series.real && !state.series.theory && !state.series.actual) {
+        ctx.save();
+        ctx.fillStyle = colors.axis;
+        ctx.font = `${18 * state.dpr}px Segoe UI`;
+        ctx.fillText("请先选择一个 CSV 文件", 36 * state.dpr, 80 * state.dpr);
+        ctx.restore();
+        return;
+      }
+
+      clampView();
+      const plot = getPlotRect();
+
+      drawAxes(plot);
+
+      const active = getActiveSeries();
+      for (const item of active) {
+        drawSeries(plot, item);
+      }
+
+      drawReferenceLines(plot);
+      drawSelection();
+      drawSelectedPointMarker(plot);
+      drawHoverMarker(plot);
+      drawDiffMarkers(plot);
+
+      elements.viewportText.textContent =
+        `时间: ${formatNumber(state.viewX[0])} - ${formatNumber(state.viewX[1])} | 显存: ${formatBytes(state.viewY[0])} - ${formatBytes(state.viewY[1])}`;
+    }
+
+    function fitView() {
+      const bounds = computeBoundsFromActive();
+      state.viewX = [bounds.minX, bounds.maxX];
+      state.viewY = [bounds.minY, bounds.maxY === bounds.minY ? bounds.minY + 1 : bounds.maxY];
+      draw();
+    }
+
+    function resetY() {
+      const bounds = computeBoundsFromActive();
+      state.viewY = [bounds.minY, bounds.maxY === bounds.minY ? bounds.minY + 1 : bounds.maxY];
+      draw();
+    }
+
+    function getActiveHeaders() {
+      const ordered = state.columnOrder.length ? state.columnOrder : state.headers;
+      if (!state.visibleHeaders.length) return ordered;
+      return ordered.filter((header) => state.visibleHeaders.includes(header));
+    }
+
+    function isNumericHeader(header, rows) {
+      let checked = 0;
+      let numeric = 0;
+      for (const row of rows) {
+        const value = row[header];
+        if (value === undefined || value === "") continue;
+        checked++;
+        if (Number.isFinite(Number(value))) numeric++;
+        if (checked >= 80) break;
+      }
+      return checked > 0 && numeric / checked >= 0.9;
+    }
+
+    function getDetailSourceRows() {
+      const mode = elements.detailMode.value;
+      if (mode === "all_allocations") return state.allRowsFromStart;
+      if (mode === "clicked_alive") return state.clickedAliveRows;
+      if (mode === "clicked_point") return state.clickedPointRows;
+      if (mode === "selected_range") return state.selectedRangeRows;
+      return state.detailModes[mode] || [];
+    }
+
+    function normalizeFilter(filter) {
+      return filter || { text: "", min: "", max: "" };
+    }
+
+    function applyDetailFilters(rows) {
+      const filters = Object.entries(state.detailFilters).filter(([, filter]) => {
+        const current = normalizeFilter(filter);
+        return current.text || current.min !== "" || current.max !== "";
+      });
+      if (!filters.length) return rows.slice();
+
+      return rows.filter((row) => {
+        for (const [header, filter] of filters) {
+          const current = normalizeFilter(filter);
+          const raw = row[header] == null ? "" : String(row[header]);
+          if (current.text && !raw.toLowerCase().includes(current.text.toLowerCase())) {
+            return false;
+          }
+          if (current.min !== "" || current.max !== "") {
+            const value = Number(raw);
+            if (!Number.isFinite(value)) return false;
+            const min = current.min === "" ? -Infinity : Number(current.min);
+            const max = current.max === "" ? Infinity : Number(current.max);
+            if (Number.isFinite(min) && value < min) return false;
+            if (Number.isFinite(max) && value > max) return false;
+          }
+        }
+        return true;
+      });
+    }
+
+    function compareDetailRows(a, b, header) {
+      const av = a[header] == null ? "" : String(a[header]);
+      const bv = b[header] == null ? "" : String(b[header]);
+      const an = Number(av);
+      const bn = Number(bv);
+      if (Number.isFinite(an) && Number.isFinite(bn)) {
+        return an - bn;
+      }
+      return av.localeCompare(bv, "zh-CN", { numeric: true });
+    }
+
+    function applyDetailSort(rows) {
+      if (!state.detailSort.header || !state.detailSort.direction) return rows;
+      const direction = state.detailSort.direction === "desc" ? -1 : 1;
+      return rows.slice().sort((a, b) => compareDetailRows(a, b, state.detailSort.header) * direction);
+    }
+
+    function getTransformedDetailRows(rows) {
+      return applyDetailSort(applyDetailFilters(rows));
+    }
+
+    function commitDetailFilter(header, patch) {
+      const next = { ...normalizeFilter(state.detailFilters[header]), ...patch };
+      if (!next.text && next.min === "" && next.max === "") {
+        delete state.detailFilters[header];
+      } else {
+        state.detailFilters[header] = next;
+      }
+      state.detailCurrentPage = 1;
+      updateDetailTable();
+    }
+
+    function toggleDetailSort(header) {
+      if (state.detailSort.header !== header) {
+        state.detailSort = { header, direction: "asc" };
+      } else if (state.detailSort.direction === "asc") {
+        state.detailSort = { header, direction: "desc" };
+      } else {
+        state.detailSort = { header: null, direction: null };
+      }
+      state.detailCurrentPage = 1;
+      updateDetailTable();
+    }
+
+    function setDetailSort(header, direction) {
+      state.detailSort = direction ? { header, direction } : { header: null, direction: null };
+      state.detailCurrentPage = 1;
+      updateDetailTable();
+    }
+
+    function hasActiveColumnTool(header) {
+      const filter = normalizeFilter(state.detailFilters[header]);
+      return Boolean(filter.text || filter.min !== "" || filter.max !== "" || state.detailSort.header === header);
+    }
+
+    function toggleDetailTools(header) {
+      state.detailToolsOpen[header] = !state.detailToolsOpen[header];
+      updateDetailTable();
+    }
+
+    function clearDetailColumnTools(header) {
+      delete state.detailFilters[header];
+      if (state.detailSort.header === header) {
+        state.detailSort = { header: null, direction: null };
+      }
+      state.detailCurrentPage = 1;
+      updateDetailTable();
+    }
+
+    function applyZoom(factor, centerX, centerY, zoomX, zoomY) {
+      if (zoomX) {
+        const [minX, maxX] = state.viewX;
+        const ratio = (centerX - minX) / Math.max(1, maxX - minX);
+        const newSpan = (maxX - minX) * factor;
+        state.viewX = [centerX - newSpan * ratio, centerX + newSpan * (1 - ratio)];
+      }
+      if (zoomY) {
+        const [minY, maxY] = state.viewY;
+        const ratio = (centerY - minY) / Math.max(1, maxY - minY);
+        const newSpan = (maxY - minY) * factor;
+        state.viewY = [centerY - newSpan * ratio, centerY + newSpan * (1 - ratio)];
+      }
+      draw();
+    }
+
+    function updateDetailTable() {
+      const mode = elements.detailMode.value;
+      state.detailSourceRows = getDetailSourceRows();
+      state.detailFilteredRows = getTransformedDetailRows(state.detailSourceRows);
+      state.detailRows = state.detailFilteredRows;
+      elements.exportButton.disabled = state.detailRows.length === 0;
+
+      const labelMap = {
+        all_allocations: "从头开始",
+        real_peak: "无碎片峰值时刻存活",
+        actual_peak: "含碎片峰值时刻存活",
+        abnormal: "异常 PyNative",
+        clicked_alive: "点击时刻存活",
+        clicked_point: "点击后续申请",
+        selected_range: "框选时间范围"
+      };
+
+      const sourceRows = state.detailSourceRows.length;
+      const totalRows = state.detailRows.length;
+      const totalPages = Math.max(1, Math.ceil(totalRows / state.detailPageSize));
+      state.detailCurrentPage = Math.min(Math.max(1, state.detailCurrentPage), totalPages);
+      const pageStart = (state.detailCurrentPage - 1) * state.detailPageSize;
+      const pageEnd = Math.min(totalRows, pageStart + state.detailPageSize);
+      const renderRows = state.detailRows.slice(pageStart, pageEnd);
+      const filteredText = sourceRows !== totalRows ? `，筛选后 ${formatNumber(totalRows)} / ${formatNumber(sourceRows)} 行` : "";
+      const suffix = totalRows > 0 ? `${filteredText}，当前显示第 ${formatNumber(pageStart + 1)} - ${formatNumber(pageEnd)} 行` : filteredText;
+      let prefix = `${labelMap[mode]}：${formatNumber(sourceRows)} 行`;
+      if ((mode === "clicked_point" || mode === "clicked_alive") && state.clickedPointTime !== null) {
+        prefix = `${labelMap[mode]}（start_time_stamp >= ${formatNumber(state.clickedPointTime)}）：${formatNumber(sourceRows)} 行`;
+      }
+      if (mode === "clicked_alive" && state.clickedPointTime !== null) {
+        prefix = `${labelMap[mode]}（${formatNumber(state.clickedPointTime)} 时刻仍存活）：${formatNumber(sourceRows)} 行`;
+      }
+      if (mode === "selected_range" && state.selectedRange) {
+        prefix = `${labelMap[mode]}（${formatNumber(state.selectedRange[0])} - ${formatNumber(state.selectedRange[1])}）：${formatNumber(sourceRows)} 行`;
+      }
+      elements.detailSummary.textContent = `${prefix}${suffix}`;
+      elements.pagerInfo.textContent = `第 ${formatNumber(state.detailCurrentPage)} / ${formatNumber(totalPages)} 页，共 ${formatNumber(totalRows)} 行`;
+      elements.prevPageButton.disabled = totalRows === 0 || state.detailCurrentPage <= 1;
+      elements.nextPageButton.disabled = totalRows === 0 || state.detailCurrentPage >= totalPages;
+      elements.pageInput.disabled = totalRows === 0;
+      elements.goPageButton.disabled = totalRows === 0;
+      elements.pageInput.max = String(totalPages);
+
+      elements.detailHeadRow.innerHTML = "";
+      elements.detailBody.innerHTML = "";
+
+      const activeHeaders = getActiveHeaders();
+
+      if (state.headers.length) {
+        for (const header of activeHeaders) {
+          elements.detailHeadRow.appendChild(renderHeaderCell(header, state.detailSourceRows));
+        }
+      }
+
+      if (!state.headers.length || !state.detailRows.length) {
+        const th = document.createElement("th");
+        th.textContent = "暂无数据";
+        if (!state.headers.length) elements.detailHeadRow.appendChild(th);
+
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = Math.max(1, activeHeaders.length);
+        td.className = "muted";
+        td.textContent = state.detailSourceRows.length ? "当前筛选条件下没有匹配行。" : "载入 CSV 后，这里会显示与峰值相关的原始行。";
+        tr.appendChild(td);
+        elements.detailBody.appendChild(tr);
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+      for (const row of renderRows) {
+        const tr = document.createElement("tr");
+        for (const header of activeHeaders) {
+          const td = document.createElement("td");
+          renderTableCell(td, row[header] ?? "", header);
+          tr.appendChild(td);
+        }
+        fragment.appendChild(tr);
+      }
+      elements.detailBody.appendChild(fragment);
+    }
+
+    function renderHeaderCell(header, sourceRows) {
+      const th = document.createElement("th");
+      const wrapper = document.createElement("div");
+      wrapper.className = "th-content";
+      const filter = normalizeFilter(state.detailFilters[header]);
+      const isOpen = Boolean(state.detailToolsOpen[header]);
+      const isNumeric = isNumericHeader(header, sourceRows);
+
+      const top = document.createElement("div");
+      top.className = "th-top";
+
+      const title = document.createElement("span");
+      title.textContent = header;
+
+      const toolButton = document.createElement("button");
+      toolButton.type = "button";
+      toolButton.className = "header-tool-button";
+      toolButton.classList.toggle("active", isOpen || hasActiveColumnTool(header));
+      toolButton.title = "筛选和排序";
+      toolButton.setAttribute("aria-label", `${header} 筛选和排序`);
+      toolButton.addEventListener("click", () => toggleDetailTools(header));
+
+      top.appendChild(title);
+      top.appendChild(toolButton);
+      wrapper.appendChild(top);
+
+      if (!isOpen) {
+        th.appendChild(wrapper);
+        return th;
+      }
+
+      const panel = document.createElement("div");
+      panel.className = "filter-panel";
+
+      const sortRow = document.createElement("div");
+      sortRow.className = "filter-sort-row";
+      const ascButton = document.createElement("button");
+      ascButton.type = "button";
+      ascButton.className = "sort-button";
+      ascButton.classList.toggle("active", state.detailSort.header === header && state.detailSort.direction === "asc");
+      ascButton.title = "升序";
+      ascButton.textContent = "↑";
+      ascButton.addEventListener("click", () => setDetailSort(header, "asc"));
+
+      const descButton = document.createElement("button");
+      descButton.type = "button";
+      descButton.className = "sort-button";
+      descButton.classList.toggle("active", state.detailSort.header === header && state.detailSort.direction === "desc");
+      descButton.title = "降序";
+      descButton.textContent = "↓";
+      descButton.addEventListener("click", () => setDetailSort(header, "desc"));
+
+      const clearButton = document.createElement("button");
+      clearButton.type = "button";
+      clearButton.className = "clear-filter-button";
+      clearButton.title = "清除本列筛选和排序";
+      clearButton.textContent = "×";
+      clearButton.addEventListener("click", () => clearDetailColumnTools(header));
+
+      sortRow.appendChild(ascButton);
+      sortRow.appendChild(descButton);
+      sortRow.appendChild(clearButton);
+      panel.appendChild(sortRow);
+
+      if (isNumeric) {
+        const range = document.createElement("div");
+        range.className = "filter-range";
+
+        const minInput = document.createElement("input");
+        minInput.type = "number";
+        minInput.placeholder = "最小";
+        minInput.value = filter.min;
+
+        const maxInput = document.createElement("input");
+        maxInput.type = "number";
+        maxInput.placeholder = "最大";
+        maxInput.value = filter.max;
+
+        const commitRange = () => {
+          commitDetailFilter(header, { min: minInput.value.trim(), max: maxInput.value.trim(), text: "" });
+        };
+        minInput.addEventListener("change", commitRange);
+        maxInput.addEventListener("change", commitRange);
+        minInput.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") commitRange();
+        });
+        maxInput.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") commitRange();
+        });
+
+        range.appendChild(minInput);
+        range.appendChild(maxInput);
+        panel.appendChild(range);
+      } else {
+        const input = document.createElement("input");
+        input.type = "search";
+        input.className = "filter-input";
+        input.placeholder = "包含文本";
+        input.value = filter.text;
+        const commitText = () => {
+          commitDetailFilter(header, { text: input.value.trim(), min: "", max: "" });
+        };
+        input.addEventListener("change", commitText);
+        input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") commitText();
+        });
+        panel.appendChild(input);
+      }
+
+      wrapper.appendChild(panel);
+      th.appendChild(wrapper);
+      return th;
+    }
+
+    function renderTableCell(td, value, header) {
+      const text = value == null ? "" : String(value);
+      const shouldCollapse = text.length > 80 || header === "python_stack" || header === "user_tasks";
+      const shortText = formatCellDisplayText(text, header, false);
+      const fullText = formatCellDisplayText(text, header, true);
+
+      if (!shouldCollapse) {
+        td.textContent = shortText;
+        return;
+      }
+
+      const wrapper = document.createElement("div");
+      wrapper.className = "cell-wrap";
+      const short = document.createElement("span");
+      short.className = "cell-short";
+      short.textContent = shortText;
+
+      const full = document.createElement("span");
+      full.className = "cell-full";
+      full.textContent = fullText;
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "cell-toggle";
+      button.textContent = "展开";
+      button.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+      });
+      button.addEventListener("click", () => {
+        const expanded = wrapper.classList.toggle("cell-expanded");
+        button.textContent = expanded ? "收起" : "展开";
+      });
+
+      wrapper.appendChild(short);
+      wrapper.appendChild(full);
+      wrapper.appendChild(button);
+      td.appendChild(wrapper);
+    }
+
+    function formatCellDisplayText(text, header, expanded) {
+      if (header === "python_stack") {
+        return expanded ? text.replace(/\|/g, "\n") : text.replace(/\|/g, " | ");
+      }
+      return text;
+    }
+
+    function clearColumnDropHints() {
+      elements.columnList.querySelectorAll(".drop-before, .drop-after").forEach((item) => {
+        item.classList.remove("drop-before", "drop-after");
+      });
+    }
+
+    function moveColumn(sourceHeader, targetHeader, insertAfter) {
+      if (!sourceHeader || !targetHeader || sourceHeader === targetHeader) return;
+      const nextOrder = state.columnOrder.filter((header) => header !== sourceHeader);
+      const targetIndex = nextOrder.indexOf(targetHeader);
+      if (targetIndex === -1) return;
+      nextOrder.splice(targetIndex + (insertAfter ? 1 : 0), 0, sourceHeader);
+      state.columnOrder = nextOrder;
+      renderColumnSelector();
+      updateDetailTable();
+    }
+
+    function renderColumnSelector() {
+      elements.columnList.innerHTML = "";
+      if (!state.headers.length) return;
+
+      const orderedHeaders = state.columnOrder.length ? state.columnOrder : state.headers;
+      for (const header of orderedHeaders) {
+        const label = document.createElement("label");
+        label.className = "column-chip";
+        label.draggable = true;
+        label.dataset.header = header;
+
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = state.visibleHeaders.includes(header);
+        input.addEventListener("change", () => {
+          if (input.checked) {
+            if (!state.visibleHeaders.includes(header)) state.visibleHeaders.push(header);
+          } else {
+            state.visibleHeaders = state.visibleHeaders.filter((item) => item !== header);
+          }
+          updateDetailTable();
+        });
+
+        const text = document.createElement("span");
+        text.textContent = header;
+
+        label.addEventListener("dragstart", (event) => {
+          state.draggingColumn = header;
+          label.classList.add("dragging-column");
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", header);
+        });
+        label.addEventListener("dragend", () => {
+          state.draggingColumn = null;
+          label.classList.remove("dragging-column");
+          clearColumnDropHints();
+        });
+        label.addEventListener("dragover", (event) => {
+          if (!state.draggingColumn || state.draggingColumn === header) return;
+          event.preventDefault();
+          const rect = label.getBoundingClientRect();
+          const insertAfter = event.clientX > rect.left + rect.width / 2;
+          clearColumnDropHints();
+          label.classList.add(insertAfter ? "drop-after" : "drop-before");
+          event.dataTransfer.dropEffect = "move";
+        });
+        label.addEventListener("drop", (event) => {
+          event.preventDefault();
+          const sourceHeader = event.dataTransfer.getData("text/plain") || state.draggingColumn;
+          const rect = label.getBoundingClientRect();
+          moveColumn(sourceHeader, header, event.clientX > rect.left + rect.width / 2);
+          clearColumnDropHints();
+        });
+
+        label.appendChild(input);
+        label.appendChild(text);
+        elements.columnList.appendChild(label);
+      }
+    }
+
+    function escapeCsv(value) {
+      const text = value == null ? "" : String(value);
+      return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+    }
+
+    function exportCurrentDetail() {
+      if (!state.detailRows.length || !state.headers.length) return;
+      const activeHeaders = getActiveHeaders();
+      const lines = [activeHeaders.map(escapeCsv).join(",")];
+      for (const row of state.detailRows) {
+        const values = [];
+        for (const header of activeHeaders) {
+          values.push(escapeCsv(row[header] ?? ""));
+        }
+        lines.push(values.join(","));
+      }
+
+      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `memory_detail_${elements.detailMode.value}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function findNearestPoint(clientX, clientY) {
+      const active = getActiveSeries();
+      if (!active.length) return null;
+
+      const { dataX, rect, plot } = screenToData(clientX, clientY);
+      if (dataX < state.viewX[0] || dataX > state.viewX[1]) return null;
+
+      let best = null;
+      const targetX = (clientX - rect.left) * state.dpr;
+      const targetY = (clientY - rect.top) * state.dpr;
+      const threshold = 18 * state.dpr;
+
+      for (const item of active) {
+        const points = visiblePoints(item.points);
+        if (!points.length) continue;
+
+        let lo = 0;
+        let hi = points.length - 1;
+        while (lo < hi) {
+          const mid = Math.floor((lo + hi) / 2);
+          if (points[mid][0] < dataX) lo = mid + 1;
+          else hi = mid;
+        }
+
+        const candidates = [points[lo], points[Math.max(0, lo - 1)]].filter(Boolean);
+        for (const point of candidates) {
+          const { px, py } = dataToScreen(point[0], point[1], plot);
+          const dist = Math.hypot(px - targetX, py - targetY);
+          if (dist <= threshold && (!best || dist < best.dist)) {
+            best = {
+              dist,
+              px,
+              py,
+              x: point[0],
+              y: point[1],
+              color: item.color,
+              label: item.label
+            };
+          }
+        }
+      }
+      return best;
+    }
+
+    function findNearestTimeX(clientX, clientY) {
+      const active = getActiveSeries();
+      if (!active.length) return null;
+
+      const { dataX } = screenToData(clientX, clientY);
+      let best = null;
+
+      for (const item of active) {
+        const points = visiblePoints(item.points);
+        if (!points.length) continue;
+
+        let lo = 0;
+        let hi = points.length - 1;
+        while (lo < hi) {
+          const mid = Math.floor((lo + hi) / 2);
+          if (points[mid][0] < dataX) lo = mid + 1;
+          else hi = mid;
+        }
+
+        const candidates = [points[lo], points[Math.max(0, lo - 1)]].filter(Boolean);
+        for (const point of candidates) {
+          const dist = Math.abs(point[0] - dataX);
+          if (!best || dist < best.dist) {
+            best = { x: point[0], dist };
+          }
+        }
+      }
+
+      return best ? best.x : Math.round(dataX);
+    }
+
+    function updateTooltip(clientX, clientY) {
+      const hit = findNearestPoint(clientX, clientY);
+      state.hoverPoint = hit;
+      if (!hit) {
+        elements.hoverTooltip.style.display = "none";
+        draw();
+        return;
+      }
+
+      const rect = elements.canvas.getBoundingClientRect();
+      elements.hoverTooltip.textContent =
+        `${hit.label}\n时间: ${formatNumber(hit.x)}\n显存: ${formatBytes(hit.y)}`;
+      elements.hoverTooltip.style.display = "block";
+      elements.hoverTooltip.style.left = `${Math.min(rect.width - 180, clientX - rect.left)}px`;
+      elements.hoverTooltip.style.top = `${Math.max(8, clientY - rect.top)}px`;
+      draw();
+    }
+
+    function setClickedPointDetail(timePoint, point) {
+      state.clickedPointTime = timePoint;
+      state.selectedPoint = point
+        ? { x: point.x, y: point.y, color: point.color, label: point.label }
+        : { x: timePoint, y: null, color: colors.hover, label: "点击时间点" };
+      state.clickedAliveRows = rowsAliveAtTimePoint(timePoint);
+      state.clickedPointRows = rowsForTimePoint(timePoint);
+      state.detailCurrentPage = 1;
+      if (!state.detailModeUserLocked) {
+        elements.detailMode.value = "clicked_point";
+      }
+      updateDetailTable();
+      draw();
+    }
+
+    function setSelectedRangeDetail(startTime, endTime) {
+      state.selectedRange = [Math.min(startTime, endTime), Math.max(startTime, endTime)];
+      state.selectedRangeRows = rowsForTimeRange(startTime, endTime);
+      state.detailCurrentPage = 1;
+      elements.detailMode.value = "selected_range";
+      updateDetailTable();
+    }
+
+    function renderReferenceLines() {
+      elements.lineList.innerHTML = "";
+      if (!state.referenceLines.length) {
+        const empty = document.createElement("div");
+        empty.className = "small";
+        empty.textContent = "还没有横线标记";
+        elements.lineList.appendChild(empty);
+        return;
+      }
+
+      state.referenceLines.forEach((line) => {
+        const item = document.createElement("div");
+        item.className = "line-item";
+
+        const meta = document.createElement("div");
+        meta.className = "line-meta";
+
+        const color = document.createElement("span");
+        color.className = "line-color";
+        color.style.background = line.color;
+
+        const text = document.createElement("span");
+        text.textContent = `${formatBytes(line.value)} (${formatNumber(line.value)} bytes)`;
+
+        meta.appendChild(color);
+        meta.appendChild(text);
+
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "line-remove";
+        remove.textContent = "删除";
+        remove.addEventListener("click", () => {
+          state.referenceLines = state.referenceLines.filter((item) => item.id !== line.id);
+          renderReferenceLines();
+          draw();
+        });
+
+        item.appendChild(meta);
+        item.appendChild(remove);
+        elements.lineList.appendChild(item);
+      });
+    }
+
+    function addReferenceLine(value) {
+      const color = elements.lineColorSelect.value || "#0f766e";
+      if (!Number.isFinite(value)) return;
+
+      state.referenceLines.push({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        value,
+        color
+      });
+      renderReferenceLines();
+      draw();
+    }
+
+    async function loadFile(file) {
+      elements.fileName.textContent = file.name;
+      setStatus(`正在流式读取 CSV... 文件大小 ${formatBytes(file.size || 0)}`);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const parsed = await parseCsvFile(file, (loaded, total, rowCount) => {
+        const percent = total ? `，${Math.min(100, (loaded / total) * 100).toFixed(1)}%` : "";
+        setStatus(`正在解析 CSV... 已读取 ${formatBytes(loaded)} / ${formatBytes(total || loaded)}${percent}\n已解析 ${formatNumber(rowCount)} 行`);
+      });
+      state.headers = parsed.headers;
+      state.columnOrder = parsed.headers.slice();
+      state.visibleHeaders = parsed.headers.filter((header) => DEFAULT_VISIBLE_HEADERS.includes(header));
+      if (!state.visibleHeaders.length) {
+        state.visibleHeaders = parsed.headers.slice(0, Math.min(8, parsed.headers.length));
+      }
+      state.rows = parsed.rows;
+
+      setStatus(`正在分析 ${formatNumber(parsed.rows.length)} 行数据...`);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const result = analyzeRows(parsed.rows);
+
+      state.series = result;
+      state.detailModes = result.detailModes;
+      state.allRowsFromStart = buildRowsFromStart(parsed.rows);
+      state.clickedPointRows = [];
+      state.clickedAliveRows = [];
+      state.selectedRangeRows = [];
+      state.clickedPointTime = null;
+      state.selectedPoint = null;
+      state.selectedRange = null;
+      state.detailCurrentPage = 1;
+      state.detailFilters = {};
+      state.detailSort = { header: null, direction: null };
+      state.detailToolsOpen = {};
+      elements.detailMode.value = "all_allocations";
+      state.detailModeUserLocked = false;
+      state.fullRangeX = result.xRange;
+      state.fullRangeY = result.yRange[0] === result.yRange[1]
+        ? [result.yRange[0], result.yRange[1] + 1]
+        : result.yRange;
+      state.hoverPoint = null;
+      state.diffPointA = null;
+      state.diffPointB = null;
+      state.diffActiveA = [];
+      state.diffActiveB = [];
+      state.diffResults = null;
+      state.diffCategory = "added";
+      state.diffCurrentPage = 1;
+      state.diffHighlight = null;
+      elements.diffATime.value = "";
+      elements.diffBTime.value = "";
+      elements.diffRunBtn.disabled = true;
+      elements.diffCard.style.display = "none";
+      elements.peakInterpCard.style.display = "none";
+      elements.peakInterpContent.style.display = "none";
+      state.peakInterpResults = null;
+      state.peakInterpSelected = null;
+
+      elements.detailTabBar.style.display = "";
+      switchDetailTab("detail");
+
+      fitView();
+      renderColumnSelector();
+      updateDetailTable();
+
+      elements.statRows.textContent = formatNumber(parsed.rows.length);
+      elements.statTime.textContent = `${formatNumber(result.xRange[0])} - ${formatNumber(result.xRange[1])}`;
+      elements.statRealPeak.textContent = result.real.peak ? `${formatBytes(result.real.peak.value)} @ ${formatNumber(result.real.peak.time)}` : "-";
+      elements.statTheoryPeak.textContent = result.theory.peak ? `${formatBytes(result.theory.peak.value)} @ ${formatNumber(result.theory.peak.time)}` : "-";
+      elements.statActualPeak.textContent = result.actual.peak ? `${formatBytes(result.actual.peak.value)} @ ${formatNumber(result.actual.peak.time)}` : "-";
+
+      setStatus(
+        `分析完成\n` +
+        `总行数: ${formatNumber(parsed.rows.length)}\n` +
+        `申请量峰值: ${elements.statRealPeak.textContent}\n` +
+        `理论峰值: ${elements.statTheoryPeak.textContent}\n` +
+        `内存池峰值: ${elements.statActualPeak.textContent}`
+      );
+
+      try {
+        const snapshot = buildSnapshot(state.rows);
+        const b64 = jsonToBase64(snapshot);
+        state.memoryVizBase64 = b64;
+        state.memoryVizReady = true;
+        document.getElementById("btnLifetime").disabled = false;
+        const mvizStatus = document.getElementById("mvizStatus");
+        if (state.rows.length > 50000) {
+          mvizStatus.textContent = "数据量较大（" + state.rows.length + " 行），生命周期视图可能较卡，建议优先使用折线图查看全局趋势。";
+          mvizStatus.className = "";
+        } else {
+          mvizStatus.textContent = "";
+          mvizStatus.className = "ok";
+        }
+      } catch (err) {
+        console.error("MemoryViz data preparation failed:", err);
+        state.memoryVizReady = false;
+        state.memoryVizBase64 = null;
+        document.getElementById("btnLifetime").disabled = true;
+        document.getElementById("mvizStatus").textContent = "生命周期数据准备失败: " + err.message;
+        document.getElementById("mvizStatus").className = "error";
+      }
+    }
+
+    async function loadSelectedFile(file) {
+      if (!file) return;
+      try {
+        await loadFile(file);
+      } catch (error) {
+        console.error(error);
+        setStatus(`解析失败: ${error.message}`);
+      }
+    }
+
+    elements.fileInput.addEventListener("change", async (event) => {
+      await loadSelectedFile(event.target.files[0]);
+    });
+
+    window.addEventListener("dragover", (event) => {
+      if (!event.dataTransfer || !Array.from(event.dataTransfer.types).includes("Files")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      setStatus("松开鼠标即可加载 CSV 文件");
+    });
+
+    window.addEventListener("drop", async (event) => {
+      if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+      event.preventDefault();
+      const file = Array.from(event.dataTransfer.files).find((item) => {
+        return item.name.toLowerCase().endsWith(".csv") || item.type === "text/csv";
+      }) || event.dataTransfer.files[0];
+      await loadSelectedFile(file);
+    });
+
+    elements.showReal.addEventListener("change", fitView);
+    elements.showTheory.addEventListener("change", fitView);
+    elements.showActual.addEventListener("change", fitView);
+    elements.samplesPerPixel.addEventListener("change", draw);
+    elements.fitButton.addEventListener("click", fitView);
+    elements.resetYButton.addEventListener("click", resetY);
+    elements.statusText.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      const rect = elements.statusText.getBoundingClientRect();
+      const shellRect = elements.statusText.parentElement.getBoundingClientRect();
+      state.statusDrag = {
+        startX: event.clientX,
+        startY: event.clientY,
+        left: rect.left - shellRect.left,
+        top: rect.top - shellRect.top,
+        moved: false
+      };
+      elements.statusText.classList.add("dragging-summary");
+    });
+    elements.statusText.addEventListener("click", () => {
+      if (state.statusDrag && state.statusDrag.moved) return;
+      setStatusHidden(!state.statusHidden);
+    });
+    elements.addLineModeButton.addEventListener("click", () => {
+      state.lineAddMode = !state.lineAddMode;
+      elements.addLineModeButton.classList.toggle("active", state.lineAddMode);
+      elements.addLineModeButton.textContent = state.lineAddMode ? "退出画线" : "点图加线";
+      updateCanvasCursor();
+    });
+    elements.detailMode.addEventListener("change", () => {
+      state.detailModeUserLocked = true;
+      state.detailCurrentPage = 1;
+      updateDetailTable();
+    });
+    elements.exportButton.addEventListener("click", exportCurrentDetail);
+    elements.prevPageButton.addEventListener("click", () => {
+      state.detailCurrentPage = Math.max(1, state.detailCurrentPage - 1);
+      updateDetailTable();
+    });
+    elements.nextPageButton.addEventListener("click", () => {
+      const totalPages = Math.max(1, Math.ceil(state.detailRows.length / state.detailPageSize));
+      state.detailCurrentPage = Math.min(totalPages, state.detailCurrentPage + 1);
+      updateDetailTable();
+    });
+    elements.goPageButton.addEventListener("click", () => {
+      const totalPages = Math.max(1, Math.ceil(state.detailRows.length / state.detailPageSize));
+      const target = Number(elements.pageInput.value);
+      if (Number.isFinite(target) && target >= 1) {
+        state.detailCurrentPage = Math.min(totalPages, Math.floor(target));
+        updateDetailTable();
+      }
+    });
+    elements.pageInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        elements.goPageButton.click();
+      }
+    });
+
+    elements.canvas.addEventListener("wheel", (event) => {
+      if (!state.series.real && !state.series.theory && !state.series.actual) return;
+      event.preventDefault();
+      const { dataX, dataY } = screenToData(event.clientX, event.clientY);
+      const factor = event.deltaY < 0 ? 0.85 : 1.18;
+      applyZoom(factor, dataX, dataY, !event.shiftKey, event.shiftKey);
+      updateTooltip(event.clientX, event.clientY);
+    }, { passive: false });
+
+    elements.canvas.addEventListener("mousedown", (event) => {
+      if (!state.series.real && !state.series.theory && !state.series.actual) return;
+      const hitLineId = findReferenceLineAt(event.clientX, event.clientY);
+      if (!event.altKey && hitLineId) {
+        state.draggingReferenceLineId = hitLineId;
+        state.hoverReferenceLineId = hitLineId;
+        elements.canvas.classList.add("dragging");
+        updateCanvasCursor();
+        return;
+      }
+
+      const { px, py } = screenToData(event.clientX, event.clientY);
+      state.dragStart = {
+        px,
+        py,
+        viewX: [state.viewX[0], state.viewX[1]],
+        viewY: [state.viewY[0], state.viewY[1]]
+      };
+      if (event.altKey) {
+        state.selecting = true;
+        state.selection = { x: px, y: py, w: 0, h: 0 };
+      } else {
+        state.dragging = true;
+        elements.canvas.classList.add("dragging");
+      }
+      updateCanvasCursor();
+    });
+
+    window.addEventListener("mousemove", (event) => {
+      if (state.statusDrag) {
+        const dx = event.clientX - state.statusDrag.startX;
+        const dy = event.clientY - state.statusDrag.startY;
+        if (Math.hypot(dx, dy) > 4) state.statusDrag.moved = true;
+        setStatusPosition(state.statusDrag.left + dx, state.statusDrag.top + dy);
+      }
+
+      state.hoverReferenceLineId = findReferenceLineAt(event.clientX, event.clientY);
+      updateCanvasCursor();
+      updateTooltip(event.clientX, event.clientY);
+      if (state.draggingReferenceLineId) {
+        const current = screenToData(event.clientX, event.clientY);
+        const line = state.referenceLines.find((item) => item.id === state.draggingReferenceLineId);
+        if (line) {
+          line.value = Math.max(state.fullRangeY[0], Math.min(state.fullRangeY[1], current.dataY));
+          renderReferenceLines();
+          draw();
+        }
+        return;
+      }
+
+      if (!state.dragging && !state.selecting) return;
+
+      const current = screenToData(event.clientX, event.clientY);
+      const plot = getPlotRect();
+
+      if (state.dragging && state.dragStart) {
+        const dx = ((current.px - state.dragStart.px) / plot.width) * (state.dragStart.viewX[1] - state.dragStart.viewX[0]);
+        const dy = ((current.py - state.dragStart.py) / plot.height) * (state.dragStart.viewY[1] - state.dragStart.viewY[0]);
+        state.viewX = [state.dragStart.viewX[0] - dx, state.dragStart.viewX[1] - dx];
+        state.viewY = [state.dragStart.viewY[0] + dy, state.dragStart.viewY[1] + dy];
+        draw();
+      }
+
+      if (state.selecting && state.selection) {
+        state.selection.w = current.px - state.selection.x;
+        state.selection.h = current.py - state.selection.y;
+        draw();
+      }
+    });
+
+    window.addEventListener("mouseup", (event) => {
+      if (state.statusDrag) {
+        elements.statusText.classList.remove("dragging-summary");
+        setTimeout(() => {
+          state.statusDrag = null;
+        }, 0);
+      }
+
+      if (state.draggingReferenceLineId) {
+        state.draggingReferenceLineId = null;
+        elements.canvas.classList.remove("dragging");
+        updateCanvasCursor();
+        draw();
+        return;
+      }
+
+      let shouldPickPoint = false;
+      if (state.dragStart && !state.selecting) {
+        const current = screenToData(event.clientX, event.clientY);
+        const moveDistance = Math.hypot(current.px - state.dragStart.px, current.py - state.dragStart.py);
+        shouldPickPoint = moveDistance < 6 * state.dpr;
+      }
+
+      if (state.selecting && state.selection) {
+        const rect = elements.canvas.getBoundingClientRect();
+        const sx = Math.min(state.selection.x, state.selection.x + state.selection.w) / state.dpr + rect.left;
+        const ex = Math.max(state.selection.x, state.selection.x + state.selection.w) / state.dpr + rect.left;
+        const sy = Math.min(state.selection.y, state.selection.y + state.selection.h) / state.dpr + rect.top;
+        const ey = Math.max(state.selection.y, state.selection.y + state.selection.h) / state.dpr + rect.top;
+
+        if (Math.abs(ex - sx) > 8) {
+          const a = screenToData(sx, sy);
+          const b = screenToData(ex, ey);
+          state.viewX = [Math.min(a.dataX, b.dataX), Math.max(a.dataX, b.dataX)];
+          if (Math.abs(ey - sy) > 8) {
+            state.viewY = [Math.min(a.dataY, b.dataY), Math.max(a.dataY, b.dataY)];
+          }
+          setSelectedRangeDetail(a.dataX, b.dataX);
+        }
+      }
+
+      if (shouldPickPoint) {
+        if (state.lineAddMode) {
+          const current = screenToData(event.clientX, event.clientY);
+          addReferenceLine(current.dataY);
+          state.lineAddMode = false;
+          elements.addLineModeButton.classList.remove("active");
+          elements.addLineModeButton.textContent = "点图加线";
+          updateCanvasCursor();
+        } else {
+          const hit = findNearestPoint(event.clientX, event.clientY);
+          if (hit) {
+            setClickedPointDetail(hit.x, hit);
+          } else {
+            const timeX = findNearestTimeX(event.clientX, event.clientY);
+            if (timeX !== null) setClickedPointDetail(timeX);
+          }
+        }
+      }
+
+      state.dragging = false;
+      state.selecting = false;
+      state.dragStart = null;
+      state.selection = null;
+      elements.canvas.classList.remove("dragging");
+      updateCanvasCursor();
+      draw();
+    });
+
+    elements.canvas.addEventListener("mouseleave", () => {
+      state.hoverPoint = null;
+      state.hoverReferenceLineId = null;
+      elements.hoverTooltip.style.display = "none";
+      updateCanvasCursor();
+      draw();
+    });
+
+    /* ── Diff event handlers ── */
+
+    elements.diffATime.addEventListener("input", updateDiffRunButton);
+    elements.diffBTime.addEventListener("input", updateDiffRunButton);
+    elements.diffATime.addEventListener("change", updateDiffRunButton);
+    elements.diffBTime.addEventListener("change", updateDiffRunButton);
+
+    elements.diffASetClick.addEventListener("click", () => setDiffPointFromClick("A"));
+    elements.diffBSetClick.addEventListener("click", () => setDiffPointFromClick("B"));
+
+    function switchDetailTab(tabName) {
+      const btns = elements.detailTabBar.querySelectorAll(".detail-tab-btn");
+      btns.forEach(b => b.classList.toggle("active", b.dataset.tab === tabName));
+      elements.detailCard.style.display = tabName === "detail" ? "" : "none";
+      elements.peakInterpCard.style.display = tabName === "interp" ? "" : "none";
+      elements.diffCard.style.display = tabName === "diff" ? "" : "none";
+    }
+    window.switchDetailTab = switchDetailTab;
+
+    elements.detailTabBar.addEventListener("click", (event) => {
+      const btn = event.target.closest(".detail-tab-btn");
+      if (!btn) return;
+      switchDetailTab(btn.dataset.tab);
+    });
+
+    elements.diffRunBtn.addEventListener("click", runDiffAnalysis);
+
+    elements.diffAggDimension.addEventListener("change", () => {
+      updateDiffAggTable();
+    });
+
+    elements.diffTabs.addEventListener("click", (event) => {
+      const tab = event.target.closest(".diff-tab");
+      if (!tab) return;
+      const category = tab.dataset.category;
+      if (category) {
+        // Toggle: clicking the active tab deselects it
+        state.diffCategory = state.diffCategory === category ? "" : category;
+        state.diffCurrentPage = 1;
+        updateDiffTabs();
+        updateDiffAggTable();
+        updateDiffDetailTable();
+      }
+    });
+
+    elements.diffPrevPage.addEventListener("click", () => {
+      state.diffCurrentPage = Math.max(1, state.diffCurrentPage - 1);
+      updateDiffDetailTable();
+    });
+    elements.diffNextPage.addEventListener("click", () => {
+      const rows = getDiffDetailRows();
+      const totalPages = Math.max(1, Math.ceil(rows.length / state.diffPageSize));
+      state.diffCurrentPage = Math.min(totalPages, state.diffCurrentPage + 1);
+      updateDiffDetailTable();
+    });
+    elements.diffGoPage.addEventListener("click", () => {
+      const rows = getDiffDetailRows();
+      const totalPages = Math.max(1, Math.ceil(rows.length / state.diffPageSize));
+      const target = Number(elements.diffPageInput.value);
+      if (Number.isFinite(target) && target >= 1) {
+        state.diffCurrentPage = Math.min(totalPages, Math.floor(target));
+        updateDiffDetailTable();
+      }
+    });
+    elements.diffPageInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") elements.diffGoPage.click();
+    });
+
+    elements.diffExportCSV.addEventListener("click", exportDiffCSV);
+    elements.diffExportJSON.addEventListener("click", exportDiffJSON);
+
+    elements.diffHighlightAdded.addEventListener("click", () => {
+      state.diffHighlight = state.diffHighlight === "added" ? null : "added";
+      draw();
+    });
+    elements.diffHighlightReleased.addEventListener("click", () => {
+      state.diffHighlight = state.diffHighlight === "released" ? null : "released";
+      draw();
+    });
+    elements.diffHighlightCommon.addEventListener("click", () => {
+      state.diffHighlight = state.diffHighlight === "common" ? null : "common";
+      draw();
+    });
+    elements.diffHighlightOff.addEventListener("click", () => {
+      state.diffHighlight = null;
+      draw();
+    });
+
+    /* ── Peak Interpreter event handlers ── */
+    elements.peakInterpRun.addEventListener("click", runPeakInterpreter);
+    elements.peakInterpDim.addEventListener("change", () => {
+      state.peakInterpDim = elements.peakInterpDim.value;
+      state.peakInterpSelected = null;
+      renderPeakInterpreter();
+    });
+    elements.peakInterpExportCSV.addEventListener("click", exportPeakInterpCSV);
+    elements.peakInterpExportJSON.addEventListener("click", exportPeakInterpJSON);
+
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+    renderReferenceLines();
+    updateDetailTable();
+    updateCanvasCursor();
+
+</script>
+<script type="module">
+const btnLineChart = document.getElementById("btnLineChart");
+const btnLifetime = document.getElementById("btnLifetime");
+const mvizStatus = document.getElementById("mvizStatus");
+const appDiv = document.querySelector(".app");
+
+let addLocalFiles = null;
+let mvizModuleLoaded = false;
+let mvizRendered = false;
+
+function setActiveView(mode) {
+  btnLineChart.classList.toggle("active", mode === "line");
+  btnLifetime.classList.toggle("active", mode === "lifetime");
+}
+
+function switchToLineChart() {
+  setActiveView("line");
+
+  // Use CSS class to hide all MemoryViz body-level elements
+  // (display:none !important overrides MemoryViz inline styles without destroying them)
+  document.body.classList.add("hide-mviz");
+
+  // Reset body layout back to main page defaults
+  document.documentElement.style.height = "";
+  document.body.style.height = "";
+  document.body.style.display = "";
+  document.body.style.flexDirection = "";
+  document.body.style.overflow = "";
+  const vsBar = document.querySelector(".view-switch-bar");
+  if (vsBar) vsBar.style.flexShrink = "";
+  mvizStatus.style.flexShrink = "";
+
+  appDiv.style.display = "";
+  disableMemoryVizStyles();
+}
+
+function switchToLifetime() {
+  if (!window.state || !window.state.memoryVizReady) {
+    mvizStatus.textContent = "请先加载 CSV 文件";
+    mvizStatus.className = "error";
+    return;
+  }
+
+  setActiveView("lifetime");
+
+  // Match original memory_viz_csv_tool.html: body as flex column with full viewport height
+  document.documentElement.style.height = "100%";
+  document.body.style.height = "100vh";
+  document.body.style.display = "flex";
+  document.body.style.flexDirection = "column";
+  document.body.style.overflow = "hidden";
+  const vsBar = document.querySelector(".view-switch-bar");
+  if (vsBar) vsBar.style.flexShrink = "0";
+  mvizStatus.style.flexShrink = "0";
+
+  appDiv.style.display = "none";
+  enableMemoryVizStyles();
+
+  if (!mvizModuleLoaded) {
+    // Hide MemoryViz elements during async loading (toolbar flashes otherwise)
+    document.body.classList.add("hide-mviz");
+    loadMemoryVizModule();
+    return;
+  }
+
+  if (!mvizRendered) {
+    document.body.classList.add("hide-mviz");
+    renderMemoryViz();
+    return;
+  }
+
+  // Already rendered — just un-hide and re-hide unwanted controls
+  document.body.classList.remove("hide-mviz");
+  hideMemoryVizFileUI();
+}
+
+async function loadMemoryVizModule() {
+  mvizStatus.textContent = "正在加载 MemoryViz...";
+  mvizStatus.className = "";
+
+  try {
+    // NOTE: import() does not support SRI (integrity attribute). We mitigate by
+    // pinning to a specific release version instead of @main (which is a moving target).
+    // For full SRI, a fetch()+crypto.subtle.verify()+blob URL approach would be needed.
+    const MVIZ_CDN_URL = "https://cdn.jsdelivr.net/gh/pytorch/pytorch@2.12.0/torch/utils/viz/MemoryViz.js";
+
+    const mod = await import(MVIZ_CDN_URL);
+    addLocalFiles = mod.add_local_files;
+    mvizModuleLoaded = true;
+    markMemoryVizStyles();
+    renderMemoryViz();
+  } catch (err) {
+    console.error("MemoryViz.js load failed:", err);
+    mvizStatus.textContent =
+      "MemoryViz 加载失败。请检查网络连接，或通过 HTTP 服务器访问本页面（python3 -m http.server 8888）。";
+    mvizStatus.className = "error";
+    switchToLineChart();
+  }
+}
+
+function renderMemoryViz() {
+  mvizStatus.textContent = "正在渲染时间线...";
+  mvizStatus.className = "";
+
+  try {
+    const b64 = window.state.memoryVizBase64;
+    const fileName = document.getElementById("fileName").textContent || "memory_data.csv";
+    addLocalFiles([{ name: fileName, base64: b64 }], "Active Memory Timeline");
+    mvizRendered = true;
+
+    // Remove hide-mviz so MemoryViz elements become visible (with their original inline styles intact)
+    document.body.classList.remove("hide-mviz");
+    hideMemoryVizFileUI();
+
+    mvizStatus.textContent = "";
+    mvizStatus.className = "ok";
+  } catch (err) {
+    console.error("MemoryViz render failed:", err);
+    mvizStatus.textContent = "MemoryViz 渲染失败: " + err.message;
+    mvizStatus.className = "error";
+  }
+}
+
+function hideMemoryVizFileUI() {
+  // 1. Hide file input (<input type="file" multiple>)
+  const fileInputs = document.querySelectorAll('input[type="file"][multiple]');
+  for (const input of fileInputs) {
+    if (input.id !== "fileInput") {
+      input.style.display = "none";
+    }
+  }
+
+  // 2. Hide "Drag and drop" placeholder div
+  const bodyChildren = document.body.children;
+  for (const child of bodyChildren) {
+    if (child.tagName === "DIV" && child.textContent && child.textContent.includes("Drag and drop")) {
+      child.style.display = "none";
+    }
+  }
+
+  // 3. Hide interaction checkbox label ("Require click to show trace")
+  const checkbox = document.getElementById("interaction-mode-toggle");
+  if (checkbox && checkbox.parentElement && checkbox.parentElement.tagName === "LABEL") {
+    checkbox.parentElement.style.display = "none";
+  }
+
+  // 4. Hide controls toolbar div (contains 3 select dropdowns: snapshot, view, gpu)
+  // The controls div has <select> as direct children (d3 append), and is a bare <div>
+  for (const child of bodyChildren) {
+    if (child.tagName === "DIV" && !child.id) {
+      const directSelects = child.querySelectorAll(":scope > select");
+      if (directSelects.length >= 2) {
+        child.style.display = "none";
+      }
+    }
+  }
+}
+
+function markMemoryVizStyles() {
+  const headStyles = document.head.querySelectorAll('style');
+  for (const style of headStyles) {
+    if (!style.hasAttribute('data-main-page')) {
+      style.setAttribute('data-mviz', '');
+    }
+  }
+}
+
+function disableMemoryVizStyles() {
+  for (const style of document.head.querySelectorAll('style[data-mviz]')) {
+    style.disabled = true;
+  }
+}
+
+function enableMemoryVizStyles() {
+  for (const style of document.head.querySelectorAll('style[data-mviz]')) {
+    style.disabled = false;
+  }
+}
+
+document.head.querySelectorAll('style').forEach(s => s.setAttribute('data-main-page', ''));
+
+btnLineChart.addEventListener("click", switchToLineChart);
+btnLifetime.addEventListener("click", switchToLifetime);
+
+window.switchToLineChart = switchToLineChart;
+window.switchToLifetime = switchToLifetime;
+</script>
+</body>
+</html>
