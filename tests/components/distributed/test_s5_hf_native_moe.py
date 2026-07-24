@@ -79,12 +79,20 @@ def test_planner_no_mark_without_ep(tiny_hf_native_moe, make_mesh):
     assert spec.params["experts.0.gate_proj.weight"][TP] == Shard(0)
 
 
-def test_planner_no_mark_for_pre_stacked(tiny_moe):
-    """pre-stacked 布局（experts.w1 3D）→ 不命中 per-expert 模式，原路径。"""
+def test_planner_pre_stacked_d10_ep_extend(tiny_moe):
+    """自定义命名（experts.w1 3D）→ D-10 TP-extend-EP 路径：{EP: Shard(0)}，
+    无 TP 键，SP-in identity 边界，_ep_stack 为空（已 stacked）。"""
     mesh = _meta_mesh((4, 2), ("dp", "tp"))
     plan = ShardingPlanner().plan(tiny_moe, mesh, tp_size=2, ep_size=2)
     spec = plan.modules["model.layers.0.mlp"]
+    assert spec._ep_size == 2
     assert spec._ep_stack == {}
+    # 自定义命名 w1/w2/w3 → expert 参数仅 {EP: Shard(0)}，无 TP 键
+    for proj in ("w1", "w2", "w3"):
+        p = spec.params[f"experts.{proj}"]
+        assert p[EP] == Shard(0)
+        assert TP not in p and p[CP] == Replicate()
+    assert spec.in_dst["x_BLD"][TP] == Shard(1)   # SP-in identity
 
 
 def test_stack_moe_experts(tiny_hf_native_moe):
