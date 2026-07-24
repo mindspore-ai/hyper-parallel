@@ -12,9 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components"""
+"""Distributed helpers — stubs matching 06_distributed_infrastructure.md §7.
 
-from hyper_models.components import training
+get_world_size_safe / get_rank_safe: safe wrappers around torch.distributed.
+"""
 
-__all__ = ["training"]
+import torch
+import torch.distributed as dist
 
+
+def get_world_size_safe() -> int:
+    """Return dist.get_world_size() if initialized, else 1."""
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def get_rank_safe() -> int:
+    """Return dist.get_rank() if initialized, else 0."""
+    if dist.is_initialized():
+        return dist.get_rank()
+    return 0

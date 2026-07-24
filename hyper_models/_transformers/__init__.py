@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components"""
+"""_transformers package."""
 
-from hyper_models.components import training
+from hyper_models._transformers.auto_model import (
+    HyperAutoModelForCausalLM,
+    HyperAutoModelForImageTextToText,
+    HyperAutoModelForSequenceClassification,
+)
 
-__all__ = ["training"]
-
+__all__ = [
+    "HyperAutoModelForCausalLM",
+    "HyperAutoModelForImageTextToText",
+    "HyperAutoModelForSequenceClassification",
+]

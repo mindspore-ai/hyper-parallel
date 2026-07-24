@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components"""
+"""Checkpoint components."""
 
-from hyper_models.components import training
+from hyper_models.components.checkpoint.config import CheckpointingConfig
+from hyper_models.components.checkpoint.checkpointing import Checkpointer
 
-__all__ = ["training"]
-
+__all__ = ["CheckpointingConfig", "Checkpointer"]

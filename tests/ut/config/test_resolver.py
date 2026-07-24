@@ -453,10 +453,14 @@ class TestTrainingConfigResolution(unittest.TestCase):
         self.assertEqual(scheduler.config.warmup_steps, 25)
 
     def test_component_config_keeps_build_contract(self):
+        # 设计文档 03 §9.3 新契约：build(model, ...) -> list[torch.optim.Optimizer]
+        import torch
+
         optimizer_config = AdamW.Config(lr=0.1)
-        optimizer_component = optimizer_config.build()
-        self.assertIsInstance(optimizer_component, AdamW)
-        self.assertEqual(optimizer_component.config.lr, 0.1)
+        optimizers = optimizer_config.build(torch.nn.Linear(2, 2))
+        self.assertIsInstance(optimizers, list)
+        self.assertIsInstance(optimizers[0], torch.optim.AdamW)
+        self.assertEqual(optimizers[0].param_groups[0]["lr"], 0.1)
 
 
 class TestCoercionEdgeCases(unittest.TestCase):

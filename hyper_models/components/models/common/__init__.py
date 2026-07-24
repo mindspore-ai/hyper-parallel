@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components"""
+"""Common model utilities — build_model entry point."""
 
-from hyper_models.components import training
+from hyper_models.components.models.common.model_utils import build_model
 
-__all__ = ["training"]
-
+__all__ = ["build_model"]
