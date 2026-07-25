@@ -49,6 +49,15 @@ class _BaseHyperAutoModelClass:
     """
 
     @classmethod
+    def _from_pretrained_parent_class(cls, *args, **kwargs):
+        """Delegate to the parent HuggingFace AutoModel class.
+
+        Used by the HF-native path in _init_model so that the model is loaded
+        through the standard transformers checkpoint logic.
+        """
+        return super().from_pretrained(*args, **kwargs)
+
+    @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,

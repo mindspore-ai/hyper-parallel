@@ -30,13 +30,16 @@ except ImportError:
     pass
 
 
-@dataclass
-class LossConfig:
+@dataclass(kw_only=True, slots=True)
+class LossConfig(Loss.Config):
     """Loss typed config — following design doc §10.0.
 
     Supports two consumption paths:
     - _target_ not set: default MaskedCrossEntropy()
     - _target_ set to Loss subclass: .build() instantiates _target_(**kwargs)
+
+    Inherits from :class:`Loss.Config` so it can be used in the typed
+    ``TrainerConfig.loss`` slot.
     """
     _target_: Optional[type] = None
     loss_aggregation: str = "token_weighted"

@@ -271,7 +271,11 @@ def _update_latest_symlink(checkpoint_dir: str, path: str) -> None:
     """Atomically update {checkpoint_dir}/LATEST symlink to point to path.
 
     Writes relative path. Uses os.symlink + rename for atomicity.
+    Only rank 0 updates the symlink to avoid multi-process races.
     """
+    if not _is_rank_0():
+        return
+
     latest = os.path.join(checkpoint_dir, "LATEST")
     rel_path = os.path.relpath(path, checkpoint_dir)
 

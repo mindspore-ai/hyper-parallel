@@ -275,11 +275,18 @@ def _shard_module_params(module, param_specs, mesh, mesh_dim_names):
 # ────────────────────────────────────────────────────────────────────────────
 
 def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
-    """Phase C: wrap forward (production/validate/moe/cp/vocab_embed, five paths)."""
+    """Phase C: wrap forward (production/validate/moe/cp/vocab_embed, five paths).
+
+    D-14 invariant 2 (05 §13.3): boundaries are wrapped in post-order (deepest
+    FQN first) — an outer boundary's local_compute_fn may cache inner forwards,
+    and the unpack-scope exclusion (invariant 3) requires inner wrappers to be
+    installed first.
+    """
     mesh_dim_names = plan.mesh_dim_names
     cp_mesh = _get_cp_submesh(mesh, mesh_dim_names)
     tp_mesh = _get_tp_submesh(mesh, mesh_dim_names)
-    for module_fqn, spec in plan.modules.items():
+    for module_fqn, spec in sorted(
+            plan.modules.items(), key=lambda kv: -kv[0].count(".")):
         if not spec.is_boundary:
             continue
         module = _resolve_module(model, module_fqn)
@@ -314,9 +321,14 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 # keep global counts for DTensor dispatch)
                 maybe_update_head_counts(
                     module, spec, module_fqn, mesh, mesh_dim_names)
+            # D-14 invariant 3 (05 §13.3): the region's temp-unwrap scope
+            # excludes nested-boundary subtrees — their parameters must stay
+            # DTensors for the inner validate islands (dispatch needs
+            # __torch_function__)
             _wrap_local_region_forward(
                 module, boundary, spec, mesh, mesh_dim_names,
-                validate_mode=validate_mode, compute_fn=compute_fn)
+                validate_mode=validate_mode, compute_fn=compute_fn,
+                exclude_subtrees=_descendant_boundary_fqns(plan, module_fqn))
         elif validate_mode:
             _wrap_validate_forward(module, boundary, spec, mesh, mesh_dim_names)
         else:
@@ -324,6 +336,19 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
             if _is_vocab_parallel_embed(module, spec, tp_mesh):
                 _wrap_vocab_parallel_embedding(module, tp_mesh)
             _wrap_production_forward(module, boundary)
+
+
+def _descendant_boundary_fqns(plan, module_fqn):
+    """Relative FQNs of boundaries nested inside *module_fqn* (D-14).
+
+    Returned relative to module_fqn (matching the name space of
+    module.named_parameters(recurse=True)); the root spec (fqn "") treats
+    every other boundary as a descendant.
+    """
+    if module_fqn == "":
+        return [f for f in plan.modules if f]
+    prefix = module_fqn + "."
+    return [f[len(prefix):] for f in plan.modules if f.startswith(prefix)]
 
 
 def _bind_input_indices(boundary, module):
@@ -383,6 +408,11 @@ def _wrap_validate_forward(module, boundary, spec, mesh, mesh_dim_names):
 
     @functools.wraps(original_forward)
     def validate_forward(*args, **kwargs):
+        # D-14 nesting (05 §13.4): detect whether the call arrives from an
+        # outer DTensor-propagating boundary BEFORE Step 1 wraps everything
+        # into DTensors (Step 1 would make the check useless).
+        nested = any(isinstance(a, DTensor) for a in args) or any(
+            isinstance(v, DTensor) for v in kwargs.values())
         # Step 1: inputs -> DTensor
         args, kwargs = boundary.redistribute_inputs(args, kwargs, as_dtensor=True)
 
@@ -400,7 +430,12 @@ def _wrap_validate_forward(module, boundary, spec, mesh, mesh_dim_names):
         if spec._is_terminal and spec.out_dst is not None:
             _validate_out_dst(outputs, spec, mesh_dim_names, module_name)
 
-        # Step 6: return local (isomorphic to production boundary outputs)
+        # Step 6: return local (isomorphic to production boundary outputs) --
+        # but under an outer DTensor-propagating boundary (D-14 nesting, 05
+        # §13.4) keep the DTensor so the outer forward's dispatch chain is
+        # unbroken; the outermost boundary exit unwraps.
+        if nested:
+            return outputs
         if isinstance(outputs, DTensor):
             outputs = outputs.to_local()
         elif isinstance(outputs, (tuple, list)):
@@ -474,7 +509,7 @@ def _validate_outputs(outputs, spec, mesh_dim_names, module_name, stage):
 # ────────────────────────────────────────────────────────────────────────────
 
 @contextmanager
-def _temp_local_params(module):
+def _temp_local_params(module, exclude=()):
     """Temporarily unwrap DTensor parameters inside a validate-mode local region (restored on exit).
 
     Under production the parameters were already permanently unwrapped at build
@@ -482,9 +517,17 @@ def _temp_local_params(module):
     all-to-all / HF CP attention) computes on local tensors internally and
     needs local parameters; after restoration the DTensor propagation chain is
     unbroken.
+
+    exclude: relative FQN prefixes of nested-boundary subtrees whose
+    parameters must stay DTensors (D-14 invariant 3, 05 §13.3 — inner
+    validate islands dispatch via __torch_function__ and break if the outer
+    region unwraps their parameters).
     """
+    excluded = tuple(e.rstrip(".") + "." for e in exclude)
     saved = []
     for name, param in list(module.named_parameters(recurse=True)):
+        if excluded and name.startswith(excluded):
+            continue
         if isinstance(param, DTensor):
             saved.append((name, param))
             _set_param_by_path(module, name, nn.Parameter(
@@ -537,7 +580,8 @@ def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
 
 
 def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
-                               *, validate_mode=False, compute_fn=None):
+                               *, validate_mode=False, compute_fn=None,
+                               exclude_subtrees=()):
     """Generic local-region forward wrapper (D-03', formerly the _wrap_moe_forward skeleton).
 
     Structure: boundary entry -> local region -> re-wrap per the declared
@@ -584,7 +628,7 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
                 k: (v.to_local() if isinstance(v, DTensor) else v)
                 for k, v in kwargs.items()
             }
-            with _temp_local_params(module):
+            with _temp_local_params(module, exclude=exclude_subtrees):
                 output = compute_fn(*local_args, **local_kwargs)
         else:
             output = compute_fn(*args, **kwargs)

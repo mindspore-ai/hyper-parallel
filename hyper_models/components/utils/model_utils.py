@@ -31,7 +31,7 @@ def init_empty_weights(include_buffers: bool = False):
     Stub implementation based on the standard "meta" dispatch trick.
     """
     old_init = torch.nn.Module.__init__
-    old_reset_parameters = torch.nn.Module.reset_parameters
+    old_reset_parameters = getattr(torch.nn.Module, "reset_parameters", None)
 
     def new_init(self, *args, **kwargs):
         old_init(self, *args, **kwargs)
@@ -50,9 +50,11 @@ def init_empty_weights(include_buffers: bool = False):
         pass
 
     torch.nn.Module.__init__ = new_init
-    torch.nn.Module.reset_parameters = new_reset_parameters
+    if old_reset_parameters is not None:
+        torch.nn.Module.reset_parameters = new_reset_parameters
     try:
         yield
     finally:
         torch.nn.Module.__init__ = old_init
-        torch.nn.Module.reset_parameters = old_reset_parameters
+        if old_reset_parameters is not None:
+            torch.nn.Module.reset_parameters = old_reset_parameters

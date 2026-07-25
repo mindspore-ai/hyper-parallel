@@ -45,11 +45,13 @@ class CosineWithWarmup(LRScheduler):
 
 # ── LRSchedulerConfig — step-based (AutoModel compatible) ──
 
-@dataclass
-class LRSchedulerConfig:
+@dataclass(kw_only=True, slots=True)
+class LRSchedulerConfig(LRScheduler.Config):
     """LR scheduler typed config — step-based (AutoModel compatible).
 
     Following design doc §9.6. All step fields are absolute (not ratio).
+    Inherits from :class:`LRScheduler.Config` so it can be used in the typed
+    ``TrainerConfig.lr_scheduler`` slot.
     """
 
     # ── LR decay ──
@@ -124,7 +126,7 @@ class LRSchedulerConfig:
         return schedulers
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class RatioBasedLRSchedulerConfig(LRSchedulerConfig):
     """Accepts ratio parameters, converts to absolute steps in build()."""
 

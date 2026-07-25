@@ -5,13 +5,11 @@
 
 覆盖点：
 - 替换：fqn 命中 planner 已生成 spec → 整体替换，结构标记从模板补齐；
-- 插入：fqn 未命中且与所有派生边界无祖孙关系 → 插入并参与链式传播与
-  terminal 标记；
-- 嵌套 fail-fast：override 是派生边界的祖先/后代、或 override 之间互相
-  嵌套 → ValueError（嵌套 spec 无合法语义：参数会重复切分、内层 in_src
-  参照系错位）；
-- 容错：覆盖 spec 与上游契约不一致 → 仅 warning（链式比较无 shape 感知，
-  边上 reshape/transpose 属合法场景），plan 保留且声明不被改写；
+- 插入：fqn 未命中派生边界 → 插入并参与 terminal 标记；
+- 嵌套（D-14，05 §13）：祖孙边界放行；外层 params 声明内层子树参数 →
+  参数唯一归属 fail-fast；spec 缺 in_src → 全声明强制化 fail-fast；
+- 契约不一致（D-14）：覆盖 spec 与上游契约不一致不再检查（无 warning
+  无报错），声明原样保留，正确性由双模式数值对拍兜底；
 - 容错：fqn 拼写错误 → ValueError；非 ModuleShardingSpec → TypeError；
 - 隔离：用户传入的 spec 对象不被 plan() 改写（深拷贝），plan() 可重复调用。
 """
@@ -102,31 +100,13 @@ def test_override_insert_for_missed_module(tiny_llama, make_mesh):
     assert plan.modules["lm_head"]._is_terminal is True
 
 
-class TestNestedOverrideRejection:
-    """嵌套 spec fail-fast（05 §3.6.7 修订）：边界假设扁平链，嵌套无合法
-    语义——参数会重复切分，内层 in_src 会从祖先 out_dst 填充而运行时实际
-    看到的是祖先 in_dst。"""
+class TestNestedOverrideD14:
+    """D-14（05 §13）嵌套 spec：祖孙边界放行，仅守两条 plan 期不变式——
+    参数唯一归属（双切 fail-fast）与全声明强制化（缺 in_src fail-fast）。"""
 
-    def test_descendant_of_derived_boundary_raises(self, tiny_llama, make_mesh):
-        """override model.layers.0.self_attn.q_proj 嵌套在派生边界
-        model.layers.0.self_attn 内 → ValueError 并指引覆盖祖先边界。"""
-        mesh = make_mesh((1,), ("tp",))
-        leaf = ModuleShardingSpec(
-            params={"weight": {TP: Shard(0)}},
-            in_src={"hidden_states": {TP: Shard(1)}},
-            in_dst={"hidden_states": {TP: Replicate()}},
-            out_src={TP: Partial()},
-            out_dst={TP: Shard(1)},
-        )
-        planner = ShardingPlanner(plan_overrides={
-            "model.layers.0.self_attn.q_proj": leaf,
-        })
-        with pytest.raises(ValueError, match="nests inside"):
-            planner.plan(tiny_llama, mesh, tp_size=2)
-
-    def test_ancestor_of_derived_boundaries_raises(self, tiny_llama, make_mesh):
-        """override model.layers.0 是多个派生边界的祖先 → ValueError 并
-        列出被波及的派生边界。"""
+    def test_nested_outer_allowed(self, tiny_llama, make_mesh):
+        """override model.layers.0 作为外层边界（params={} 仅 I/O 契约），
+        内层派生边界保留 → plan 成功，外层 spec 插入且内层不被改写。"""
         mesh = make_mesh((1,), ("tp",))
         block = ModuleShardingSpec(
             params={},
@@ -136,12 +116,33 @@ class TestNestedOverrideRejection:
             out_dst={TP: Shard(1)},
         )
         planner = ShardingPlanner(plan_overrides={"model.layers.0": block})
-        with pytest.raises(ValueError, match="ancestor") as exc:
-            planner.plan(tiny_llama, mesh, tp_size=2)
-        assert "model.layers.0.self_attn" in str(exc.value)
+        plan = planner.plan(tiny_llama, mesh, tp_size=2, sequence_parallel=True)
+        assert "model.layers.0" in plan.modules
+        # 内层派生边界照常存在（不被外层接管）
+        assert "model.layers.0.self_attn" in plan.modules
+        assert plan.modules["model.layers.0.self_attn"].params["q_proj.weight"]
 
-    def test_overrides_nested_with_each_other_raises(self, tiny_llama, make_mesh):
-        """两个 override 互为祖孙 → ValueError 指引合并为外层单个 spec。"""
+    def test_param_double_declaration_raises(self, tiny_llama, make_mesh):
+        """外层 spec.params 声明了内层边界子树的参数 → ValueError（不变式 1：
+        参数唯一归属，双切在 production 静默错误）。"""
+        mesh = make_mesh((1,), ("tp",))
+        block = ModuleShardingSpec(
+            # self_attn.q_proj.weight 已被派生 attention 边界声明
+            params={"self_attn.q_proj.weight": {TP: Shard(0)}},
+            in_src={"hidden_states": {TP: Shard(1)}},
+            in_dst={"hidden_states": {TP: Shard(1)}},
+            out_src={TP: Shard(1)},
+            out_dst={TP: Shard(1)},
+        )
+        planner = ShardingPlanner(plan_overrides={"model.layers.0": block})
+        with pytest.raises(ValueError, match="exactly one boundary") as exc:
+            planner.plan(tiny_llama, mesh, tp_size=2)
+        assert "self_attn.q_proj.weight" in str(exc.value)
+        assert "model.layers.0" in str(exc.value)
+
+    def test_leaf_override_double_declaration_raises(self, tiny_llama, make_mesh):
+        """override 派生边界的叶模块（q_proj）——参数与祖先边界冲突 →
+        同样的唯一归属报错（嵌套本身合法，双切非法）。"""
         mesh = make_mesh((1,), ("tp",))
         leaf = ModuleShardingSpec(
             params={"weight": {TP: Shard(0)}},
@@ -151,18 +152,32 @@ class TestNestedOverrideRejection:
             out_dst={TP: Shard(1)},
         )
         planner = ShardingPlanner(plan_overrides={
-            "model.layers.0.self_attn": _attn_override_spec(),
             "model.layers.0.self_attn.q_proj": leaf,
         })
-        with pytest.raises(ValueError, match="nested"):
+        with pytest.raises(ValueError, match="exactly one boundary"):
+            planner.plan(tiny_llama, mesh, tp_size=2)
+
+    def test_missing_in_src_raises(self, tiny_llama, make_mesh):
+        """全声明强制化（Scenario 1 填充已废除）：in_dst 非空而 in_src 为空
+        → plan 期 ValueError。"""
+        mesh = make_mesh((1,), ("tp",))
+        block = ModuleShardingSpec(
+            params={},
+            in_src={},                                    # ← 空：D-14 后不再填充
+            in_dst={"hidden_states": {TP: Shard(1)}},
+            out_src={TP: Shard(1)},
+            out_dst={TP: Shard(1)},
+        )
+        planner = ShardingPlanner(plan_overrides={"model.layers.0": block})
+        with pytest.raises(ValueError, match="in_src"):
             planner.plan(tiny_llama, mesh, tp_size=2)
 
 
-def test_override_chain_conflict_warns(tiny_llama, make_mesh, caplog):
-    """覆盖 spec 声明与上游 out_dst 不一致 → 仅 warning，plan 保留。
+def test_override_chain_conflict_no_check(tiny_llama, make_mesh, caplog):
+    """D-14：相邻契约一致性不再做任何静态/运行期检查——覆盖 spec 与上游
+    out_dst 不一致时无 warning 无报错，声明原样保留（各模块只断言自身
+    策略传播，端到端正确性由双模式数值对拍兜底）。
 
-    链式比较是 placement 值相等、无 shape 感知：边上 reshape/transpose 的
-    合法场景必然不等，故不报错；声明正确性由 validate 模式兜 correctness。
     """
     mesh = make_mesh((1,), ("tp",))
     # mlp 声明 in_src=Replicate，但上游 post_attention_layernorm out_dst=Shard(1)
@@ -180,7 +195,7 @@ def test_override_chain_conflict_warns(tiny_llama, make_mesh, caplog):
     planner = ShardingPlanner(plan_overrides={"model.layers.0.mlp": bad_mlp})
     with caplog.at_level(logging.WARNING):
         plan = planner.plan(tiny_llama, mesh, tp_size=2, sequence_parallel=True)
-    assert "chain contract mismatch" in caplog.text
+    assert "chain contract mismatch" not in caplog.text
     # 声明不被改写，plan 照常生成
     declared = plan.modules["model.layers.0.mlp"].in_src["hidden_states"]
     assert tuple(resolve_placements(declared, ("tp",))) == (Replicate(),)

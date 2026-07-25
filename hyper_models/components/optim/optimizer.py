@@ -19,8 +19,6 @@ from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
-from torch.distributed.device_mesh import DeviceMesh
-
 from hyper_models.config.configurable import Configurable
 
 
@@ -38,7 +36,7 @@ class Optimizer(Configurable):
             model: nn.Module,
             *,
             optimizer_init: Optional["OptimizerInit"] = None,
-            device_mesh: Optional[DeviceMesh] = None,
+            device_mesh: Optional[Any] = None,
             is_peft: bool = False,
         ) -> list[torch.optim.Optimizer]:
             """Build optimizer(s). Subclasses override this."""
@@ -63,7 +61,7 @@ class AdamW(Optimizer):
             model: nn.Module,
             *,
             optimizer_init: Optional["OptimizerInit"] = None,
-            device_mesh: Optional[DeviceMesh] = None,
+            device_mesh: Optional[Any] = None,
             is_peft: bool = False,
         ) -> list[torch.optim.Optimizer]:
             """Build AdamW optimizer(s) with param grouping.
@@ -103,7 +101,7 @@ class OptimizerFromFactoryConfig(Optimizer.Config):
         model: nn.Module,
         *,
         optimizer_init: Optional["OptimizerInit"] = None,
-        device_mesh: Optional[DeviceMesh] = None,
+        device_mesh: Optional[Any] = None,
         is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
         """Build external optimizer."""

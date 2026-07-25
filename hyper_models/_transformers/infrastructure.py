@@ -58,7 +58,7 @@ def instantiate_infrastructure(
         fsdp2_manager = _instantiate_fsdp2(config=strategy_cfg, mesh_context=mesh)
 
     if fsdp2_manager is None:
-        logger.warning("FSDP2Manager: no strategy_config provided; returning None")
+        logger.info("FSDP2Manager: no strategy_config provided; skipping FSDP2 wrap")
     else:
         logger.info("FSDP2Manager instantiated with %s", type(fsdp2_manager.config).__name__)
 
@@ -186,6 +186,15 @@ def apply_model_infrastructure(
         model.to_empty(device=device)
         if load_base_model and pretrained_path is not None:
             logger.warning("load_base_model not implemented in stub")
+        # Stub path: without real weight loading, uninitialized meta tensors
+        # would yield NaN losses. Initialize parameters/buffers so skeleton runs
+        # produce finite gradients. Remove/replace this when load_base_model lands.
+        for p in model.parameters():
+            if p.dtype.is_floating_point:
+                torch.nn.init.normal_(p, mean=0.0, std=0.02)
+        for b in model.buffers():
+            if b.dtype.is_floating_point:
+                torch.nn.init.zeros_(b)
         logger.info("Model moved from meta to %s", device)
 
     return model
