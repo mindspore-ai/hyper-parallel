@@ -22,8 +22,8 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextAttention as _Qwen3VLMoeTextAttention,
     create_causal_mask,
-    is_torchdynamo_compiling,
 )
+from transformers.utils import is_torchdynamo_compiling
 
 from hyper_parallel import ContextParallel, parallelize_module
 from hyper_parallel.core.dtensor.dtensor import DTensor
