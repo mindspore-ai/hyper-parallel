@@ -1,7 +1,7 @@
 # Hyper-Parallel 重构方案 vs VeOmni Trainer 对比分析
 
-> 编写日期：2026-07-23
-> 对比范围：Hyper-Parallel 重构方案（基于 01~06 详细设计） vs VeOmni VeOmni 现有 trainer 方案
+> 编写日期：2026-07-23，更新日期：2026-07-25
+> 对比范围：Hyper-Parallel 重构方案（基于 01~06 详细设计 + 训练骨架代码实现） vs VeOmni 现有 trainer 方案
 > 评价视角：**算法人员**的易用性、易读性、易调试性
 
 ---
@@ -162,52 +162,64 @@ self.model = build_parallelize_model(
 
 ## 3. 训练编排方式
 
-### Hyper-Parallel 重构方案
+### Hyper-Parallel 重构方案（已落地实现）
 
 ```python
 main() → recipe.setup(cfg) → recipe.run_train_validation_loop()
 ```
 
-**Recipe.setup() 显式编排**：
+**Recipe.setup() 显式编排**（19 步，[train_ft.py](../../../hyper_models/recipes/llm/train_ft.py#L72-L242)）：
 ```python
 def setup(self, cfg: TrainerConfig):
     # ① 分布式初始化
     self.dist_env = initialize_distributed("nccl")
+    # ② 日志 + 兼容性补丁
     # ③ RNG
     self.rng = StatefulRNG(seed=..., ranked=True)
-    # ⑦ Loss
-    self.loss_fn = self.cfg.loss.build()
-    # ⑩ Checkpointer（规划中：checkpoint 字段待加入 TrainerConfig）
+    # ④ 分布式拓扑（MeshContext + dp_cp_mesh 展平）
+    self.distributed_setup = create_distributed_setup_from_config(cfg)
+    # ⑤ MagiAttention（可选）
+    # ⑥ Callback 管理器（至多 7 个内置 Callback）
+    self.callback_manager = build_callback_manager(self, cfg, ...)
+    # ⑦ Loss — typed .build()
+    self.loss = self.cfg.loss.build()
+    # ⑧ PP 配置（桩）
+    # ⑨ PEFT 配置
+    # ⑩ Checkpointer — typed .build()
     self.checkpointer = self.cfg.checkpoint.build(...)
-    # ⑪ Model
+    # ⑪ Model — build_model() 内部走 HyperAutoModelForCausalLM.from_pretrained()
     self.model, self.optimizer_init = build_model(...)
-    # ⑫ Optimizer
+    # ⑫ Optimizer — typed .build() → list[Optimizer]（canonical）
     self.optimizer = self.cfg.optimizer.build(...)
-    # ⑬ DataLoader
+    # ⑬ DataLoader（桩：dummy 数据）
     self.dataloader, self.tokenizer = build_dataloader(...)
-    # ⑮ StepScheduler（规划中：step_scheduler 字段待加入 TrainerConfig）
+    # ⑭ Validation DataLoader（桩：dummy 数据）
+    self.val_dataloaders = build_validation_dataloader(...)
+    # ⑮ StepScheduler — typed .build()
     self.step_scheduler = self.cfg.step_scheduler.build(...)
-    # ⑯ LR Scheduler
+    # ⑯ LR Scheduler — typed .build()（桩：torch 原生暂代）
     self.lr_scheduler = self.cfg.lr_scheduler.build(...)
-    # ⑰ 注册 checkpoint 追踪状态
+    # ⑰ 注册 checkpoint 追踪状态（6 项）
     self.register_state("model", "model")
-    self.register_state("optimizer", "optimizer")
     ...
     # ⑱ 断点续训
     self.load_checkpoint(...)
+    # ⑲ MFU 计算器 + 模型信息打印
 ```
 
 **核心设计**：
-- 18 步组件构建按依赖顺序显式排列
-- 每条语句的调用方式明确（typed `.build()`，Configurable 协议；原设计的 untyped `.instantiate()` 路径已取消）
-- 每个组件的创建时机和依赖关系一目了然
+- 19 步组件构建按依赖顺序显式排列，打开 `setup()` 一目了然
+- 两类构建方式：typed `.build(**runtime_deps)`（loss/checkpoint/optimizer/step_scheduler/lr_scheduler）与独立构建函数/from_pretrained（model/dataloader/tokenizer）
+- **训练骨架核心已完整落地**：BaseRecipe（314 行）+ FinetuneRecipe（598 行）+ 5 个训练组件（step_scheduler/callback/grad_accum/signal_handler/rng，共 1020 行）+ loss 组件（386 行）+ optim 组件（426 行）+ checkpoint 组件（168 行，桩），**总计约 2912 行实现代码**
+- **138 个测试用例**覆盖训练核心：step_scheduler 24 + callback 24 + grad_accum 29 + loss 21 + base_recipe 24 + finetune_recipe 16
+- 桩模块接口已冻结（distributed/infrastructure、FSDP2、数据管道、HF 兼容层），实现待落地
 
 **对算法人员的影响**：
 - ✅ 打开 `setup()` 就能看到完整的组件构建流程，无需跳转多个文件
-- ✅ 新增组件只需在 `setup()` 中加一行，然后注册到 `__state_tracked`
+- ✅ 新增组件只需在 `setup()` 中加一行 + `register_state()`，自动接入 checkpoint
 - ✅ 组件构建顺序由依赖关系天然决定，不会出现"DataLoader 还没创建就引用它"的错误
-- ❌ 18 步顺序构建，代码较长（约 100 行）
-- ❌ 子类 override `setup()` 时，需要理解哪些步骤必须保留
+- ✅ 核心训练骨架已可端到端运行（单进程/mock 分布式），5 类组件的 typed `.build()` 契约已稳定
+- ❌ 分布式基础设施（DeviceMesh 构建、FSDP2 集成、数据管道）仍为桩，多机训练不可用
 
 ### VeOmni
 
@@ -256,48 +268,35 @@ self._init_callbacks()                  # Callback 初始化
 
 ## 4. Callback 系统
 
-### Hyper-Parallel 重构方案（混合方案）
+### Hyper-Parallel 重构方案（混合方案，已落地实现）
 
 **设计原则**：核心训练流程显式编排在 Recipe 中；外围关注点通过 Callback 处理。
 
-```python
-# 核心训练：显式
-metrics = self._run_train_optim_step(batches)
+**7 个内置 Callback**（[callback.py](../../../hyper_models/components/training/callback.py)，255 行）：
 
-# 外围关注点：Callback
-state = StepState(step=..., epoch=..., is_ckpt_step=..., ...)
-self.callback_manager.on_step_end(state)
-```
+| Callback | 触发条件 | 行为 |
+|----------|----------|------|
+| `CheckpointCallback` | is_ckpt_step 且非 is_final_step | `recipe.save_checkpoint(...)`；最终步跳过（防与 final save 重复） |
+| `EvaluateCallback` | is_val_step 且 val_dataloaders 非空 | 逐 val_dl 跑验证 → 聚合 val loss → log_val_metrics |
+| `LoggingCallback` | is_log_step | 一行 INFO 日志（step/loss/lr/grad_norm/tps/mfu） |
+| `TqdmCallback` | 每步（rank 0） | 延迟到 on_train_begin 创建（读取断点起始步） |
+| `WandbCallback` | is_log_step | `wandb.log`（可选依赖，cfg.wandb.enabled 控制） |
+| `GCCallback` | is_gc_step | `gc.collect()` + CUDA `empty_cache()` |
+| `SIGTERMHandler` | sigterm_received | `step_scheduler.cleanup()` + 设 `max_steps` 令迭代器退出 |
 
-**3 个回调点**：
-| 回调点 | 用途 |
-|--------|------|
-| `on_train_begin()` | 资源初始化 |
-| `on_step_end(state)` | 所有步级操作（checkpoint/验证/日志/GC） |
-| `on_train_end()` | 资源清理 |
+**3 个回调点**（接口简洁）：
+- `on_train_begin()` → 资源初始化（TqdmCallback 创建 pbar）
+- `on_step_end(StepState)` → 所有步级操作（7 个 Callback 按注册顺序依次执行）
+- `on_train_end()` → 资源清理
 
-**StepState**：Frozen dataclass，所有时序标记由 `StepScheduler` 统一计算透传。
-
-```python
-@dataclass(frozen=True)
-class StepState:
-    step: int
-    epoch: int
-    is_ckpt_step: bool          # 由 StepScheduler 计算
-    is_val_step: bool           # 由 StepScheduler 计算
-    is_log_step: bool           # 由 StepScheduler 计算
-    loss: float
-    grad_norm: float | None
-    lr: float
-    ...
-```
+**StepState**：Frozen dataclass（[callback.py:L35-57](../../../hyper_models/components/training/callback.py#L35-L57)），16 个字段分三组——步信息（step/epoch/is_final_step）、时序标记（is_ckpt/is_val/is_log/is_gc/sigterm_received）、训练指标（loss/grad_norm/lr/tps/mfu/num_tokens）。**frozen 保证 Callback 只读不写，无副作用。**
 
 **对算法人员的影响**：
 - ✅ 核心训练流程（forward/backward/optimizer step）在 Recipe 中可见，不会被 callback 链淹没
-- ✅ 时序标记集中管理，不用猜测"当前步该做什么"
-- ✅ `StepState` 是 frozen dataclass，callback 只读不写，无副作用
-- ✅ 想要自定义行为（如新的监控指标），只需注册新 callback
-- ❌ 1 个 `on_step_end` 点承载所有外围操作，单个 callback 的性能问题会影响整个步
+- ✅ 时序标记集中管理（StepScheduler 唯一计算），callback 不需要自己判断"现在该做什么"
+- ✅ `StepState` 是 frozen dataclass，callback 只读不写
+- ✅ 想要自定义行为（如新的监控指标），只需实现 `TrainingCallback` 并注册
+- ✅ `SIGTERMHandler` 已实现：SIGTERM 时优雅退出，final save 覆盖保存
 
 ### VeOmni
 
@@ -347,39 +346,61 @@ def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
 
 ## 5. 训练循环
 
-### Hyper-Parallel 重构方案
+### Hyper-Parallel 重构方案（已落地实现）
 
 ```python
 def run_train_validation_loop(self):
+    for mp in self.model_parts: mp.train()
     self.callback_manager.on_train_begin()
     try:
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batches in self.step_scheduler:
-                # ── 核心：显式 ──
-                train_metrics = self._run_train_optim_step(batches)
-                # ── 外围：Callback ──
-                state = StepState(step=..., is_ckpt_step=..., ...)
-                self.callback_manager.on_step_end(state)
+                # ── 核心训练：显式可见 ──
+                train_metrics = self._run_train_optim_step(
+                    batches, max_grad_norm=...)
+                # ── 外围关注点：Callback 统一驱动 ──
+                sigterm = self.step_scheduler.sigterm_received
+                self.callback_manager.on_step_end(StepState(
+                    step=..., is_ckpt_step=..., is_val_step=...,
+                    is_log_step=..., is_gc_step=..., is_final_step=...,
+                    sigterm_received=sigterm, loss=..., grad_norm=...,
+                    lr=..., tps=..., mfu=..., num_tokens=...,
+                ))
+        # 正常结束：final save 先于 checkpointer.close()
+        self.save_checkpoint(..., is_final_checkpoint=True)
     finally:
         self.callback_manager.on_train_end()
+        self.checkpointer.close()
+    destroy_process_group()
 ```
 
-**StepScheduler 统一控制训练节奏**：
-```python
-# 所有时序判断集中在一个地方
-self.step_scheduler.is_ckpt_step   # 需要保存 checkpoint
-self.step_scheduler.is_val_step    # 需要运行验证
-self.step_scheduler.is_log_step    # 需要远程日志
-self.step_scheduler.is_gc_step     # 需要垃圾回收
-self.step_scheduler.sigterm_received  # 收到 SIGTERM
-```
+**_run_train_optim_step 三阶段**（[train_ft.py:L413-519](../../../hyper_models/recipes/llm/train_ft.py#L413-L519)）：
+- **Phase 1**：全局 label token 统计（DP+CP 联合 all-reduce）
+- **Phase 2**：梯度累积循环（FSDP 双层 sync 管理：外层 `prepare_for_grad_accumulation`/`prepare_for_final_backward`，内层 `get_sync_ctx`）
+- **Phase 3**：`scale_grads_and_clip_grad_norm`（token-mean 归一化的**唯一除法点**） → optimizer.step/zero_grad → lr_scheduler.step → loss 聚合 → TPS/MFU 计算
+
+**_forward_backward_step 六步**（[train_ft.py:L522-598](../../../hyper_models/recipes/llm/train_ft.py#L522-L598)）：
+1. 数据 → GPU (non_blocking)
+2. CP batch 准备（cp_size>1 时按 CP 切分序列）
+3. 分离 labels
+4. 前向传播（FSDP sync ctx 管理 + filter_forward_kwargs）
+5. Loss 计算（dispatcher：标准 CE / 融合 CE / MTP loss）
+6. 反向传播（`loss × dp_size` 抵消 FSDP2 的 DP-mean 除法）
+
+**StepScheduler 统一控制训练节奏**（[step_scheduler.py](../../../hyper_models/components/training/step_scheduler.py)，294 行）：
+- `epochs` property：`range(start_epoch, num_train_epochs)`，支持断点续训
+- `__iter__`：按 grad_acc_steps 分组，step 在 yield 前自增（防止首步误触发 is_ckpt_step）
+- 5 种步标记由 StepScheduler 唯一计算：`is_ckpt_step`/`is_val_step`/`is_log_step`/`is_gc_step`/`sigterm_received`
+- `grad_acc_steps = max(global_batch // (local_batch × dp_size), 1)` + 整除防御
+- 状态序列化兼容 AutoModel 键名（`state_dict → {"step","epoch"}`）
 
 **对算法人员的影响**：
-- ✅ 打开 `run_train_validation_loop` 就能看到完整的训练流程骨架
-- ✅ `StepScheduler` 迭代器自动处理 grad_acc 分组，不用手动管理
-- ✅ 所有时序标记由 `StepScheduler` 统一计算，不会出现"checkpoint 回调认为该保存了但验证回调还没跑完"的时序问题
-- ❌ `StepScheduler` 是一个需要理解的抽象概念
+- ✅ 打开 `run_train_validation_loop` 就能看到完整的训练流程骨架（核心三阶段 + 外围 7 个 Callback）
+- ✅ `StepScheduler` 迭代器自动处理 grad_acc 分组，不需手动管理
+- ✅ 所有时序标记由 `StepScheduler` 统一计算，不会出现时序不一致
+- ✅ token-mean 归一化的唯一除法点（`scale_grads_and_clip_grad_norm`）保证数值正确性
+- ✅ 验证流程的分子分母分离聚合（DP+CP all-reduce SUM 后再除）保证正确性
 
 ### VeOmni
 
@@ -552,54 +573,59 @@ class VeOmniIter:
 
 ### 6.8 结论
 
-**Hyper-Parallel 当前数据管道严重不足，是重构方案中最大的薄弱环节。**
+**Hyper-Parallel 当前数据管道为桩实现，是重构方案中最大的薄弱环节。**
 
-- 当前设计仅覆盖了 LLM 基础的 `build_dataloader` 7 步流程，缺少对话格式（ChatDataset）、多源混合（WeightedMultiSource）、动态 Batching、Chat Template 等**核心能力**
+- 训练骨架中的 `build_dataloader` / `build_validation_dataloader` 当前返回 **dummy TensorDataset**（train 100 样本 / val 20 样本），仅用于骨架流程验证
+- 接口已冻结（参数签名含 local_batch_size/global_batch_size/max_steps/val_check_interval/dp_rank/dp_world_size/cp_size 等），但生产级数据管道（对话格式、多源混合、动态 Batching、Chat Template）尚未落地
 - 相比之下，Automodel 有 30 个数据集类 + 完整的 Chat Template 体系，VeOmni 有 10 个数据集类 + 动态 Batching + BackgroundPrefetcher + Transform 注册表
-- 补齐方案已输出至 [02_data_pipeline_addendum.md](02_data_pipeline_addendum.md)，按 P0/P1/P2 优先级规划，**总计新增约 15.5 人天**
+- 设计文档 [02_data_pipeline.md](02_data_pipeline.md)（§5~§18）已规划完整的补齐方案，按 P0/P1/P2 优先级排列
 
 **核心建议**：以 Automodel 的数据集类体系为骨架（ChatDataset、MegatronPretraining、formatting_utils），以 VeOmni 的生产级特性为补充（动态 Batching、BackgroundPrefetcher、Transform 注册表、WeightedMultiSource），构建完整的数据管道。
-
-> 补充设计已合并至 [02_data_pipeline.md](02_data_pipeline.md)（§5~§18），原 addendum 文件已删除。
 
 ---
 
 ## 7. Checkpoint 与断点续训
 
-### Hyper-Parallel 重构方案
+### Hyper-Parallel 重构方案（已落地实现）
+
+**显式注册而非 `__setattr__` 重写**（[base_recipe.py](../../../hyper_models/recipes/base_recipe.py)，314 行）：最终实现采用 `register_state(name, kind)` 显式注册（setup ⑰ 中 6 次调用），比原设计的 `__setattr__` 隐式检测更可控、可测试。
 
 ```python
-# 自动追踪——BaseRecipe.__setattr__
-class BaseRecipe:
-    def __setattr__(self, key, value):
-        # 自动检测 stateful 组件并注册到 __state_tracked
-        if is_model(value) or has_load_restore_state(value) or ...:
-            self.__state_tracked.add(key)
+# setup() 中显式注册（6 项）
+self.register_state("model", "model")
+self.register_state("optimizer", "optimizer")
+self.register_state("lr_scheduler", "lr_scheduler")
+self.register_state("rng", "rng")
+self.register_state("dataloader", "dataloader")
+self.register_state("step_scheduler", "train_state")
 
-# 自动保存——save_checkpoint 遍历 __state_tracked
+# save_checkpoint — 遍历 __state_tracked 按 kind 分发
 def save_checkpoint(self, ...):
-    for key in sorted(self.__state_tracked):
-        if is_model(getattr(self, key)): ...
-        elif is_optimizer(getattr(self, key)): ...
-        # 按 kind 自动分发，无需手动构造 state dict
+    for name, kind in sorted(self.__state_tracked):
+        path = _state_path(checkpoint_dir, name, kind)
+        if kind == "model":     checkpointer.save_model(obj, ...)
+        elif kind == "optimizer": checkpointer.save_optimizer(model_ref, obj, ...)
+        elif kind == "lr_scheduler": 聚合 dict torch.save
+        elif kind == "rng" / "dataloader": per-rank torch.save
+        elif kind == "train_state": extra_state.json（step/epoch/loss/val_losses）
+    _update_latest_symlink(checkpoint_dir, path)  # 原子更新 LATEST 软链
 
-# 自动恢复——load_checkpoint 遍历 __state_tracked
+# load_checkpoint — 同一注册表驱动恢复
 def load_checkpoint(self, restore_from):
-    for key in sorted(self.__state_tracked):
-        self._load_state_by_kind(name, kind, path)   # 按 kind 分发恢复
+    # restore_from="LATEST" → _resolve_latest_symlink
+    # 遍历 sorted(__state_tracked)，按 kind 分发 _load_state_by_kind
 ```
 
-**核心设计**：
-- `__setattr__` 重写：赋值时自动检测并注册 stateful 组件
-- 保存/恢复时按 `__state_tracked` 自动分发，无需手动管理
-- `Checkpointer` 统一管理 DCP 切分保存 + HF safetensors 导出
-- `StateDictAdapter` 透明处理 HF key ↔ 模型内部 key 映射
+**6 种 kind**：`model` / `optimizer` / `lr_scheduler` / `rng` / `dataloader` / `train_state`。save 和 load 两侧遍历同一注册表，按 kind 分发，save/load 天然对称。kind 与 `_state_path(root, name, kind)` 路径规则一一对应。
+
+**Checkpointer 当前为桩**：使用 `torch.save`/`torch.load` 暂代 DCP；DCP 切分保存 + HF safetensors 导出待落地。
 
 **对算法人员的影响**：
-- ✅ 永远不需要手动追踪"哪些组件需要保存"——框架自动完成
-- ✅ 新增组件只要实现了 `state_dict()` 和 `load_state_dict()`，自动被追踪
-- ✅ 断点续训只需 `restore_from: LATEST`，自动恢复所有组件状态
-- ❌ `__setattr__` 重写是隐式行为，需要理解其工作原理才能正确使用
+- ✅ 显式注册机制：`register_state(name, kind)` 一行接入，save/load 自动对称
+- ✅ 新增有状态组件只需在 setup 中加一行注册，无需在 3 个地方手动修改
+- ✅ 断点续训只需 `restore_from: LATEST`，自动恢复 6 类组件状态
+- ✅ save/load 两侧遍历同一注册表，不遗漏组件
+- ✅ 比原设计的 `__setattr__` 重写更可控、可测试
 
 ### VeOmni
 
@@ -680,31 +706,53 @@ BaseTrainer
 
 | 场景 | Hyper-Parallel | VeOmni |
 |------|---------------|--------|
-| 变体数量 | 2 个（LLM + VLM） | 5 个（Text/VLM/DiT/DPO/RL） |
+| 变体数量 | 1 个（FinetuneRecipe，LLM 微调） | 5 个（Text/VLM/DiT/DPO/RL） |
 | 扩展模式 | 继承 | Composition（多数） |
 | 样板代码 | 少（继承天然复用） | 多（手动拼接 _build_*） |
 | 与基础设施耦合 | 低（共享 BaseRecipe） | 高（需要理解 BaseTrainer 的 13 个 _build_*） |
+| 单进程可运行 | ✅（mock 分布式，dummy 数据） | ✅ |
 
-**结论**：VeOmni 在**变体数量**和**生产验证度**上领先（5 种变体已在实际业务中使用）。Hyper-Parallel 的继承模式在**扩展效率**上更好（更少的样板代码），但当前只覆盖了 LLM 和 VLM 两种任务。VeOmni 的 Composition 模式虽然样板代码多，但在**灵活性**上更好——可以自由选择调用哪些 `_build_*` 步骤。
+**结论**：VeOmni 在**变体数量**和**生产验证度**上大幅领先（5 种变体已在实际业务中使用）。Hyper-Parallel 当前仅有 FinetuneRecipe 一个 Recipe，继承模式在**扩展效率**上更好（更少的样板代码），但待分布式基础设施（DeviceMesh/FSDP2）落地后才能验证多机训练。VeOmni 的 Composition 模式虽然样板代码多，但在**灵活性**上更好——可以自由选择调用哪些 `_build_*` 步骤。
 
 ---
 
 ## 9. 分布式信号处理
 
-### Hyper-Parallel 重构方案
+### Hyper-Parallel 重构方案（已落地实现）
 
-- `DistributedSignalHandler` + `StepScheduler.sigterm_received`：SIGTERM 时优雅退出并保存 checkpoint
-- 集成了 `StepScheduler.__iter__` 中，每步检查
+- `DistributedSignalHandler`（[signal_handler.py](../../../hyper_models/components/training/signal_handler.py)，59 行）：SIGTERM handler 只置位标志，不做 IO 以外的操作；`signals_received()` 把标志搬到 CUDA 设备做 all_gather——任一 rank 收到 → 全体 True。dist 未初始化时直接返回本地标志（单进程/测试路径安全）
+- `StepScheduler.sigterm_received` 每步查询一次并缓存结果（内含 all_gather 集合通信，多次调用会死锁）
+- SIGTERM 步的保存由训练循环末尾的 `save_checkpoint(is_final_checkpoint=True)` 统一完成，CheckpointCallback 对 is_final_step 跳过（避免同一步重复保存）
+- `SIGTERMHandler` Callback 收到 sigterm 时调 `step_scheduler.cleanup()` 恢复原始 SIGTERM handler + 设 `max_steps = state.step` 令迭代器下次取数即退出
 
 ### VeOmni
 
 - 未在核心训练循环中看到显式的 SIGTERM 处理
 
-**结论**：Hyper-Parallel 对 SIGTERM 有更前瞻的处理，VeOmni 依赖外部机制。
+**结论**：Hyper-Parallel 对 SIGTERM 有完整的优雅退出机制（含 checkpoint 保存），且已落地实现。VeOmni 依赖外部机制。
 
 ---
 
 ## 10. 总体评价与结论
+
+### 实现状态快照（2026-07-25）
+
+| 模块 | 状态 | 代码量 |
+|------|------|--------|
+| 训练骨架核心（BaseRecipe + FinetuneRecipe） | **完整** | 912 行 |
+| 训练组件（step_scheduler/callback/grad_accum/signal_handler/rng） | **完整** | 1020 行 |
+| Loss 组件（MaskedCrossEntropy/dispatcher/MTP） | **完整** | 386 行 |
+| Optimizer 组件（AdamW/参数分组/OptimizerInit） | **完整** | 426 行 |
+| Checkpoint（save/load/state 追踪） | **桩**（torch.save 暂代 DCP） | 168 行 |
+| LR Scheduler | **桩**（torch 原生暂代） | 145 行 |
+| 分布式基础设施（MeshContext/DeviceMesh） | **桩** | 140 行 |
+| 数据管道（build_dataloader） | **桩**（dummy 数据） | ~100 行 |
+| HF 兼容层（_transformers） | **桩**（编排骨架完整） | ~300 行 |
+| FSDP2 集成 | **桩**（FSDP2Manager 空壳） | ~50 行 |
+| ShardingPlanner（6-phase 推导管线） | **完整** | ~2000 行 |
+| ShardingApplier（双模式应用 + PrecompiledBoundary） | **完整** | ~2000 行 |
+
+> 测试基线：138 例（step_scheduler 24 + callback 24 + grad_accum 29 + loss 21 + base_recipe 24 + finetune_recipe 16）
 
 ### 总评表
 
@@ -712,37 +760,46 @@ BaseTrainer
 |------|----------------------|--------|:----:|
 | **配置系统易用性** | `_target_` IoC 灵活 + 强类型解析（typed 校验、IDE 友好） | 强类型 dataclass，IDE 友好 | 持平（Hyper-Parallel 扩展性更优） |
 | **模型并行化适配** | ShardingPlanner 声明式，~20 行/模型 | `build_parallelize_model` 函数式 | **Hyper-Parallel** |
-| **训练流程可读性** | 显式 `setup()` + 混合 Callback | 纯 Callback + 分散的 `_build_*` | **Hyper-Parallel** |
+| **训练流程可读性** | 显式 `setup()` + 混合 Callback（已落地实现） | 纯 Callback + 分散的 `_build_*` | **Hyper-Parallel** |
 | **调试友好性** | StepState 透传时序标记，单步追踪 | 7 个 callback 串联，调用栈深 | **Hyper-Parallel** |
-| **Checkpoint 完整性** | `__state_tracked` 自动追踪 | 手动 `extra_state` 管理 | **Hyper-Parallel** |
-| **数据管道成熟度** | 简洁但缺少生产级特性 | 有 BackgroundPrefetcher/动态 batching | VeOmni |
-| **多任务扩展** | 继承模式简洁，但变体少 | Composition 灵活，5 种变体验证 | VeOmni |
+| **Checkpoint 完整性** | `register_state` 显式注册，save/load 对称 | 手动 `extra_state` 管理 | **Hyper-Parallel** |
+| **训练骨架实现度** | 核心完整（~2900 行），138 例测试覆盖 | 完整 | VeOmni（但差距缩小） |
+| **数据管道成熟度** | 桩（dummy 数据），接口已冻结 | 有 BackgroundPrefetcher/动态 batching | VeOmni |
+| **多任务扩展** | 1 个 Recipe（FinetuneRecipe） | 5 种变体（Text/VLM/DiT/DPO/RL） | VeOmni |
+| **分布式基础设施** | 桩（MeshContext 默认全 1） | 完整 DeviceMesh 构建 | VeOmni |
 | **运行时性能** | PrecompiledBoundary 零 dispatch | FSDP 运行时管理 | **Hyper-Parallel** |
 | **学习曲线** | 概念多（ShardingTemplate/ParamRole/Configurable） | 概念少（纯 Python 类型） | VeOmni |
 
 ### 结论
 
-**Hyper-Parallel 重构方案在算法人员的易用性、易读性、易调试性上整体优于 VeOmni**，具体表现为：
+**Hyper-Parallel 重构方案在架构设计上整体优于 VeOmni，训练骨架核心已落地实现**，具体表现为：
 
-1. **易读性胜出**：显式 `setup()` + 混合 Callback 方案使训练流程一目了然。算法人员打开 `setup()` 就能看到完整的组件构建流程，打开 `run_train_validation_loop` 就能看到完整的训练骨架。VeOmni 的纯 Callback 方案将核心训练流程分散在多个 callback 中，需要跳转多个文件才能理解完整流程。
+1. **架构设计优势（已验证）**：
+   - **易读性**：显式 `setup()` + 混合 Callback 方案使训练流程一目了然。打开 `setup()` 就能看到完整的 19 步组件构建流程，打开 `run_train_validation_loop` 就能看到完整的三阶段训练骨架
+   - **易调试性**：`StepState` 将所有时序标记集中透传（frozen dataclass），token-mean 归一化唯一除法点保证数值正确性，验证流程分子分母分离聚合保证正确性
+   - **并行化能力**：ShardingPlanner 6-phase 推导管线 + PrecompiledBoundary 编译期通信规划，新模型适配只需 ~20 行分片规则
 
-2. **易调试性胜出**：`StepState` 将所有时序标记集中透传，算法人员不需要追踪多个 callback 的独立判断逻辑。`__state_tracked` 自动追踪确保没有组件状态被遗漏。VeOmni 的 7 个 callback 串联和手动 `extra_state` 管理增加了调试时的认知负担。
+2. **实现进展（对比原设计文档）**：
+   - 训练骨架核心（BaseRecipe + FinetuneRecipe + 5 个训练组件 + loss + optim）已完整实现，总计约 2912 行，138 例测试覆盖
+   - 分布式并行组件（ShardingPlanner + ShardingApplier + PrecompiledBoundary）已完整实现，05b FSDP2 mesh 解析已定稿
+   - 桩模块接口已冻结（distributed/infrastructure、FSDP2、数据管道、checkpoint/DCP），待落地
 
-3. **易用性各有优劣**：
-   - **配置**：两者均为强类型 dataclass 解析（IDE 补全、typed 校验）——Hyper-Parallel 已落地 TrainerConfig 强类型方案（commit 78a79c0f）；且 Hyper-Parallel 的 `_target_` IoC 在扩展性上更好（新增组件零代码改动）
-   - **模型适配**：Hyper-Parallel 的 ShardingPlanner 显著优于 VeOmni 的 `build_parallelize_model`（~20 行 vs 千行级 `parallelize.py`）
-   - **数据管道**：VeOmni 更成熟，有 `BackgroundPrefetcher` 和 `dynamic_batching` 等生产级特性
-   - **多任务**：VeOmni 已验证 5 种变体，Hyper-Parallel 当前只有 2 种
+3. **与 VeOmni 的差距（待补齐）**：
+   - **分布式基础设施**：DeviceMesh 构建、FSDP2 集成、HSDP 支持尚未落地
+   - **数据管道**：当前为 dummy 数据桩，缺少对话格式、多源混合、动态 Batching
+   - **多任务变体**：仅有 FinetuneRecipe，缺少 DPO/RL/DiT
+   - **生产级特性**：BackgroundPrefetcher、异步 checkpoint（DCP）、PP runtime
 
 ### 最终建议
 
-**如果目标是构建一个面向算法人员的新训练框架，应以 Hyper-Parallel 重构方案为骨架，借鉴 VeOmni 的成熟特性**：
+**以 Hyper-Parallel 重构方案为骨架继续推进，优先补齐分布式基础设施与数据管道**：
 
-1. **保留** Hyper-Parallel 的分布式并行组件（ShardingPlanner、PrecompiledBoundary、DTensor 双模式）——这是超越 VeOmni 的核心差异化能力
-2. **保留** Hyper-Parallel 的显式 Recipe 编排 + 混合 Callback 方案——在可读性和可调试性上显著优于 VeOmni
-3. **保留** `__state_tracked` 自动追踪——在 checkpoint 完整性上优于 VeOmni 的手动管理
-4. **借鉴** VeOmni 的 `BackgroundPrefetcher` 和 `dynamic_batching`——补齐生产级数据管道
-5. ~~**借鉴** VeOmni 的 `VeOmniArguments` 的强类型设计~~（已达成，本项关闭）——Hyper-Parallel 已落地强类型配置解析（`parse_training_args` → `resolve_root` → `TrainerConfig`，coerce_value typed 校验，commit 78a79c0f），原 ConfigNode 弱类型方案已取消
-6. **补齐** Hyper-Parallel 的 Recipe 变体数量——参考 VeOmni 的 DPO/RL/DiT 实现
+1. **保留并继续完善** Hyper-Parallel 的分布式并行组件（ShardingPlanner、PrecompiledBoundary、DTensor 双模式）——这是超越 VeOmni 的核心差异化能力
+2. **保留并继续完善** Hyper-Parallel 的显式 Recipe 编排 + 混合 Callback 方案——训练骨架已完整落地，在可读性和可调试性上显著优于 VeOmni
+3. **保留** `register_state` 显式注册——在 checkpoint 完整性上优于 VeOmni 的手动管理
+4. **优先落地** 分布式基础设施（DeviceMesh 构建 + FSDP2 集成），使训练骨架可在多机环境运行
+5. **优先落地** 数据管道 P0 项（ChatDataset + WeightedMultiSource），使 SFT 训练可启动
+6. **借鉴** VeOmni 的 `BackgroundPrefetcher` 和 `dynamic_batching`——补齐生产级数据管道
+7. **补齐** Hyper-Parallel 的 Recipe 变体数量——参考 VeOmni 的 DPO/RL/DiT 实现
 
-**一句话总结**：Hyper-Parallel 重构方案的**架构设计**（声明式并行化 + 显式 Recipe 编排 + 混合 Callback + 自动状态追踪）在理论上优于 VeOmni，但需要在**生产级特性**（BackgroundPrefetcher、动态 batching、多任务变体）上补齐，才能真正在算法人员的日常使用中全面超越 VeOmni。
+**一句话总结**：Hyper-Parallel 重构方案的**架构设计**（声明式并行化 + 显式 Recipe 编排 + 混合 Callback + 显式状态追踪）在理论上优于 VeOmni，且训练骨架核心已完整落地（~2900 行，138 例测试）。当前最关键的差距在于**分布式基础设施（DeviceMesh/FSDP2）**和**数据管道**尚未落地——补齐这两块后，即可进行多机训练验证。

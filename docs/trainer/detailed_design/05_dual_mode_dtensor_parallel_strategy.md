@@ -97,6 +97,8 @@ main() → recipe.setup(cfg)                                              # 01_h
             │   │       └─ I/O 契约: Template.sp_in_src/dst/out_src/dst → spec（含 TP+CP+EP）
             │   │
             │   ├─ Phase 5: ChainPropagator.propagate(specs)               # §3.6: 链式传播
+            │   │   │   ⚠️ D-14（§13）：Scenario 1/2/4 编译期校验/传播将废除，
+            │   │   │   改 spec 全声明 + 各模块自证策略传播；仅保留 _is_terminal
             │   │   ├─ Scenario 1: 填充下游模块缺失的 in_src (A.out_dst → B.in_src)
             │   │   ├─ Scenario 2: 检测模板错误 (A.out_dst ≠ B.in_src)
             │   │   ├─ Scenario 3: 处理首/尾模块 (dataloader → embed, lm_head → loss)
@@ -138,32 +140,51 @@ main() → recipe.setup(cfg)                                              # 01_h
                 │   └─ 输出: PrecompiledBoundary(in_plan=[...], out_plan=[...])
                 │       └─ 所有非 identity 操作统一用 DTensor.redistribute()
                 │
-                └─ Phase C: _wrap_forward(model, boundaries, validate_mode)   # §4.4: forward 包装
+                └─ Phase C: _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh)  # §4.4: forward 包装
+                    │   （实现校准：本图按代码嵌套结构绘制——先按 local region 分流，
+                    │    validate_mode 是骨架参数而非并列分支，见 §12.4 第 8 条）
                     │
-                    ├─ if validate_mode:                                       # §5.3: 校验模式 forward
-                    │   ├─ 输入: DTensor（完整放置信息）
-                    │   ├─ forward 内部: DTensor 传播 → 记录实际 out_src
-                    │   └─ 校验: assert actual_out_src == spec.out_src
-                    │            assert actual_out_dst == spec.out_dst（仅终端模块）
-                    │
-                    ├─ elif spec.use_local_map (MoE EP):                      # §4.4.3: EP local_map 模式
-                    │   ├─ boundary.redistribute_inputs(args, kwargs)           # PrecompiledBoundary 入口
-                    │   ├─ _local_params_context(module)                          # build期一次性 unpack: DTensor→local（永久替换，在fully_shard前调用）
-                    │   │   └─ original_forward(*args, **kwargs)  (params already local)
-                    │   │       └─ all-to-all dispatch → expert compute → all-to-all combine
-                    │   │          (纯 local tensor, 零 DTensor overhead)
-                    │   ├─ output = DTensor.from_local(output, mesh, out_src)   # local→DTensor
-                    │   └─ boundary.redistribute_outputs(output)                # PrecompiledBoundary 出口
-                    │
-                    └─ else (生产模式):                                         # §4.4.1: 标准生产模式
-                        ├─ boundary.redistribute_inputs(args, kwargs)           # PrecompiledBoundary 入口
-                        │   └─ 同时处理 TP+CP+EP 多维度 redistribution
-                        ├─ _local_params_context(module)                        # build期一次性 unpack: DTensor→local（永久替换，在 fully_shard 之前调用，forward 内直接使用 local params）
-                        │   └─ original_forward(*args, **kwargs)  (params already local)
-                        │       ├─ [if CP enabled] CP inner attention 通信      # §4.4.2
-                        │       │   └─ K/V all-gather 在 SDPA/FlexAttention 内部
-                        │       └─ 纯 local tensor 计算（零 DTensor dispatch）
-                        └─ boundary.redistribute_outputs(output)                # PrecompiledBoundary 出口
+                    ├─ for each boundary spec（is_boundary=False 跳过）:
+                    │   ├─ boundary = PrecompiledBoundary(spec, mesh, mesh_dim_names)
+                    │   ├─ _bind_input_indices(boundary, module)                # in_plan arg_name → 签名 positional 下标
+                    │   │
+                    │   ├─ Step 1: inner-wrap（D-01''：production/validate 注入**同一个** wrapper）
+                    │   │   └─ if cp_mesh 激活: _wrap_cp_inner_attention(module, cp_mesh, ...)   # §4.4.2
+                    │   │       └─ K/V all-gather 在 SDPA/FlexAttention 内部（区域计算双模式指令级一致）
+                    │   │
+                    │   └─ Step 2: forward 包装（两级门控）
+                    │       ├─ compute_fn = _resolve_local_compute_fn(module, spec, mesh, ..., expert_mesh)
+                    │       │   # 单一解析链，非 None 即走 local region，三环永不嵌套（§4.4.3）：
+                    │       │   #   环1: spec.local_compute_fn（用户注入）
+                    │       │   #   环2: spec._ep_size>0 → _hf_native_ep_compute（D-10 TP-extend-EP）
+                    │       │   #   环3: spec.use_local_map → module.forward（纯门控）
+                    │       │
+                    │       ├─ if compute_fn is not None:                       # §4.4.3: local region 骨架
+                    │       │   │   （MoE EP / 用户自定义数据相关模块；validate 也走这里！）
+                    │       │   ├─ [validate 附加] maybe_update_head_counts     # D-17: 区域内头数改写
+                    │       │   └─ _wrap_local_region_forward(validate_mode=..., compute_fn=...):
+                    │       │       ├─ boundary.redistribute_inputs(as_dtensor=validate_mode)   # 入口
+                    │       │       ├─ 区域内恒为 local tensor 计算（双模式指令级一致）:
+                    │       │       │   ├─ validate:   输入 to_local + _temp_local_params 临时解包参数
+                    │       │       │   └─ production: 参数 build 期永久解包，输入本为 local
+                    │       │       │   └─ compute_fn: all-to-all dispatch → expert compute → all-to-all combine
+                    │       │       ├─ DTensor.from_local(output, mesh, out_src)  # 按声明 out_src 重包装
+                    │       │       │   （声明式校验：a2a 数据相关使 placement 不可推导，固有局限）
+                    │       │       └─ boundary.redistribute_outputs(as_dtensor_input=validate_mode)  # 出口
+                    │       │
+                    │       ├─ elif validate_mode:                              # §5.3: 普通模块校验模式
+                    │       │   └─ _wrap_validate_forward:
+                    │       │       ├─ 输入 DTensor（完整放置信息）全程传播 → dispatch 推导实际 out_src
+                    │       │       └─ 校验: assert actual_out_src == spec.out_src
+                    │       │                assert actual_out_dst == spec.out_dst（仅终端模块）
+                    │       │
+                    │       └─ else:                                            # §4.4.1: 普通模块生产模式
+                    │           ├─ [D-02] vocab embed 判定 → _wrap_vocab_parallel_embedding 前置
+                    │           └─ _wrap_production_forward:
+                    │               ├─ boundary.redistribute_inputs(args, kwargs)   # 入口（TP+CP 多维 redistribution）
+                    │               ├─ original_forward(*args, **kwargs)          # 参数 build 期永久解包
+                    │               │   └─ 纯 local tensor 计算（零 DTensor dispatch）
+                    │               └─ boundary.redistribute_outputs(output)        # 出口
 
 CP inner attention 的 forward 替换在 Phase C 的__init__阶段完成（非每次 forward 调用），与 PrecompiledBoundary 一样是编译期确定的:
   └─ sharding_applier._wrap_cp_inner_attention(attn_module, cp_mesh, spec=spec, mesh=mesh,
@@ -194,11 +215,11 @@ main()                                           # 01 §4
         └─③.4.5.8 apply_sharding_plan()           # 本文档 §4: 运行时应用 ★
             ├─ Phase A: _shard_params              # §4.2
             ├─ Phase B: PrecompiledBoundary.build  # §4.3
-            └─ Phase C: _wrap_forward              # §4.4
-                ├─ _wrap_production_forward        # §4.4.1 (标准 TP)
-                ├─ _wrap_cp_inner_attention        # §4.4.2 (CP attention)
-                ├─ _wrap_local_region_forward               # §4.4.3 (EP local_map)
-                └─ _wrap_validate_forward          # §5.3 (校验模式)
+            └─ Phase C: _apply_phase_c           # §4.4（两级门控：先 local region 分流）
+                ├─ _wrap_cp_inner_attention      # §4.4.2 (CP attention, Step 1 inner-wrap)
+                ├─ _wrap_local_region_forward    # §4.4.3 (local region 骨架: EP/用户 compute_fn, 双模式)
+                ├─ _wrap_validate_forward        # §5.3 (普通模块校验模式)
+                └─ _wrap_production_forward      # §4.4.1 (普通模块生产模式)
 
 ── 运行时使用（训练循环中）──
 
@@ -1232,6 +1253,14 @@ PrecompiledBoundary:
 
 ### 3.6.5 Phase 5 详解：链式传播 —— 填充 + 校验
 
+> ⚠️ **D-14 废除预告（2026-07-25 定稿，§13）**：本节的编译期链式
+> 校验/传播（Scenario 1/2/4）将被废除——spec 全声明强制化取而代之；
+> Scenario 2（相邻契约 mismatch 检测）不设替代，各模块只断言自身
+> 策略传播正确（out_src/out_dst），链一致性由声明 + 双模式数值对拍
+> 兜底；仅 `_is_terminal` 标记保留。嵌套 spec 场景下静态链对外层
+> 不透明 forward 不可定义（本节末尾 reshape/reduce 断链局限的放大版）。
+> 本节保留作历史参考。
+
 链式传播处理 4 种场景：
 
 | 场景 | 说明 | 链式传播行为 |
@@ -2089,7 +2118,7 @@ def production_forward(*args, **kwargs):
 
 ### 4.4 Phase C: Forward Wrapping: 生产模式 forward 包装
 
-> **对应时序**: ③.4.5.8 Phase C — `_wrap_forward()`
+> **对应时序**: ③.4.5.8 Phase C — `_apply_phase_c()`
 
 #### 4.4.1 标准生产模式：`_wrap_production_forward` + Phase C 辅助函数
 
@@ -3151,6 +3180,28 @@ CP:        {CP: Shard(1)}  -> 在 CP rank 组内沿序列切分
 两者组合:  {TP: Shard(1), CP: Shard(1)} -> 同时沿 TP 和 CP 切分序列
 ```
 
+**两个 Shard(1) 落在同一 tensor 维时的排布语义（cp-major 嵌套切分）**：
+mesh 轴顺序为 `("dp_replicate", "dp_shard_cp", "cp", "tp", ...)`——`cp` 在 `tp` 之前
+（`infrastructure.py` 的 `_build_device_mesh_from_accelerator`）。`resolve_placements`
+按 mesh_dim_names 顺序把 `{TP: Shard(1), CP: Shard(1)}` 排成
+`(cp→Shard(1), tp→Shard(1))`；自研 DTensor 的 `Layout._build_dim_map_from_placements`
+把同一 tensor 维上的 mesh 轴按 mesh_idx 递增收集为 `dim_map[1] = [cp_idx, tp_idx]`，
+再由 `_infer_slice_area_by_rank` 以 `reversed(mapping)` 累加 slice_id（越靠后的轴越
+是低位/内层），得到：
+
+```
+序列维先按 cp_size 粗切（外层），每个 CP 大块内再按 tp_size 细切（内层）
+chunk_id  = cp_rank * tp_size + tp_rank        # cp-major
+chunk_len = S / (cp_size * tp_size)            # 每 rank 持连续 token 段
+```
+
+这与 torch DTensor `_compute_local_shape_and_global_offset` 的 "Perform shard from
+left to right"（先应用左侧 mesh 轴做粗切，后到的轴在已有 chunk 内细分）语义一致。
+**示例**（S=16, TP=2, CP=2，chunk=4）：(cp0,tp0)→[0,4)、(cp0,tp1)→[4,8)、
+(cp1,tp0)→[8,12)、(cp1,tp1)→[12,16)。该布局与端到端数据流吻合：数据管道
+`shard_batch_for_cp` 先给每 rank `S/cp` 的连续段，embed 出口的 TP reduce-scatter
+再把该段按 tp_rank 顺序细分为 `S/(cp*tp)` 子块（详见 §6.3.2 Norm 示例与 §12.2 D-06）。
+
 **为什么需要 CP？** — TP 的 SP 受到 `num_attention_heads % tp_size == 0` 约束，不能无限增大。CP 提供了**正交的**序列切分维度，不受 attention heads 数量的限制。两者组合实现 `序列切分总数 = tp_size * cp_size`。
 
 参考 Titan `decoder_sharding.py` 的 `dense_sequence_parallel_placement()`：当 SP+CP 同时启用时，`SpmdLayout({TP: Shard(1), CP: Shard(1)})` —— 两个维度都沿序列维 Shard。
@@ -3203,6 +3254,33 @@ ModuleShardingSpec(
 # -> PrecompiledBoundary: in_plan=[], out_plan=[] (零通信)
 #    RMSNorm 是逐元素操作，可在分片序列上直接算
 ```
+
+**这个 spec 下 norm 实际"如何切分"**——norm 自己不切分任何东西，它继承上游的
+序列布局，三个字段的语义逐条拆解：
+
+- **params 全复制**：weight `[H]` 在所有 tp×cp rank 上各持完整副本（CP 维参数
+  恒 `Replicate`，见 §3.5 CP-dim 规则）；hidden 维 H 不属于任何 mesh 轴的 Shard
+  目标，RMSNorm 沿 H 的归约在本地完整进行，数值与全局序列上计算**逐位一致**。
+- **in_src == in_dst（identity）**：`_classify_collective` 对
+  `(Shard(1), Shard(1)) → (Shard(1), Shard(1))` 返回 `"identity"`
+  （`precompiled_boundary.py`），`RedistOp.execute` 零拷贝直通——**入口无通信**。
+- **out_src == out_dst（identity）**：`_compile_output_plan` 对 `src_p == dst_p`
+  直接跳过，不生成 RedistOp——**出口无通信**。
+
+norm 收到的 `hidden_states` 本地形状为 `[B, S/(tp*cp), H]`，其在全局序列中的
+位置遵循 §6.3.1 的 **cp-major 嵌套切分**：序列先按 `cp_size` 粗切（外层，来自
+数据管道 `shard_batch_for_cp`），每个 CP 块内再按 `tp_size` 细切（内层，来自
+上游 embed/attention 出口的 TP reduce-scatter）；rank (cp_i, tp_j) 持有连续
+token 段 `[ (cp_i*tp_size + tp_j) * S/(cp*tp), ... )`。例：S=16, TP=2, CP=2
+时 (cp0,tp0)→[0,4)、(cp0,tp1)→[4,8)、(cp1,tp0)→[8,12)、(cp1,tp1)→[12,16)。
+forward 在该本地 chunk 上逐 token 计算，零通信、零特判——这正是"逐 token
+pointwise 模块天然兼容任意序列切分布局"的体现。
+
+> ⚠️ 顺序不能反：若某模块的 in_dst CP 维声明为 `Replicate`（强制 boundary 做
+> 全序列 reduce-scatter），产出的将是 **tp-major** 布局（chunk_id =
+> `tp_rank*cp_size + cp_rank`），与 embed/attention 产出的 cp-major 布局错位，
+> 导致数值错误（§12.2 D-06 的实测教训）。boundary 层 CP 维恒 `Shard(1)`
+> identity，布局才能始终保持 cp-major。
 
 #### 6.3.3 CP Attention 内部的通信：K/V all-gather
 
@@ -4733,8 +4811,13 @@ overrides["layers.0.attention"] = ModuleShardingSpec(
 )
 ```
 
-与上下游契约冲突（如 `in_src` 声明与上游 `out_dst` 不一致）在 `plan()` 内
+与上下游契约冲突（如 `in_src` 声明与上游 `out_dst` 不一致）当前在 `plan()` 内
 即抛 `PlacementMismatchError`，不会延迟到运行时。
+
+> ⚠️ D-14（§13）：该编译期校验将随 Phase 5 链式传播一并废除，**不设替代**——
+> 各模块只断言自身策略传播正确（out_src/out_dst），链一致性由声明 +
+> 双模式数值对拍兜底；同时 spec 改为全声明强制化（缺 `in_src` → plan 期
+> 报错）。嵌套 spec（祖孙边界）届时按 §13.3 三条不变式放行。
 
 ### 8.6 自定义 wrapper 接口总览（2026-07-21）
 
@@ -5036,6 +5119,7 @@ torchrun --nproc_per_node=4 train.py
 | D-10 | D-09 的 EP 组不跨 TP（a2a 仅限同 TP 坐标 rank），EP 规模受 dp 限制；expert 权重若做 hidden 维 TP 切（Megatron ETP）需引入 AG/RS 对与第二轴 mesh | **TP-extend-EP 方案（§6.4.8，与 MindSpeed「TP 扩展 EP」/ Megatron etp=1+ep 跨 TP 同构）**：MoE 边界契约改 SP-in identity（Megatron MoE 本就不 gather）；全 dense 区域 flatten 重分区为派生 expert mesh (edp, ep)——扩展 EP 组 = flatten 连续 ep_size 个 rank（先跨完 TP 组再跨 dp/cp）；expert 权重仅 {EP: Shard(0)}（每 rank 持 num_experts/ep_size 个完整 expert，无第二轴切分）；通信流与 Megatron `MoEAlltoAllTokenDispatcher`（etp=1 配置）逐步对齐：router（本地 chunk）→ a2a（扩展 EP 组）→ 本地 SwiGLU（完整权重，无 Partial）→ a2a 返回，**无 all_gather/reduce_scatter**；SP-in 无 token 复制（规避 automodel 的 tp 倍梯度缩放）；**`ep_size` 即扩展 EP 组大小（无单独 etp 配置），校验 `ep_size ≤ dp_replicate×dp_cp×tp` 且整除、`num_experts % ep_size == 0`** |
 | D-12 | §6.7/§7 原叙事的 `tp_grad_info → fully_shard(tp_grad_info=...) → _build_layout_driven_group_info → TP all-reduce` 链路端到端走不通：`fully_shard` 不接受 `tp_grad_info` 入参（全仓库无消费者，仅 `grad_equiv.py` 测试模拟旁路）；且 §7 Stage 2 原称"fully_shard 之前永久解包为 plain tensor"——若真如此 `_orig_param_is_dtensor=False`，DTENSOR_UNIFIED 路径死亡 | **按代码现状重写 §6.7/§7**：FSDP 侧实际机制为 DTENSOR_UNIFIED——`fully_shard` 在参数仍为 DTensor 时记录 `_orig_dtensor_placements`（torch param.py:149-151），`_get_base_spmd_placements` 经 `DeviceMesh.concatenate`（已实现，device_mesh.py:1035）拼统一 mesh，`_build_layout_driven_group_info`（hsdp_param.py:285）从最终 layout 的 Replicate 轴推 TP 归约组，`_normalize_unsharded_grad_to_local` 处理 Partial 梯度回流；tp_grad_info 定位为"planner/applier 已产出、fully_shard 消费端接线待落地"的规划项（数据结构保留）。集成落地二选一：(a) fully_shard 先于 `_local_params_context` 解包执行（当前 apply_sharding_plan 在 Phase C 入口永久解包，需调时序或改临时解包）；(b) 补齐 tp_grad_info 消费端 |
 | D-13 | DeepSeek MLA 投影（`q_a_proj`/`q_b_proj`/`kv_a_proj_with_mqa`/`kv_b_proj`）不含任何默认命名规则子串，未覆盖时全部落 SKIP——`self_attn` 组只剩 `o_proj`(ROWWISE)，`has_colwise=False` → attention 边界推断失败，MLA 参数**静默全部不分片**（仅 warning），`_needs_cp_attn` 不置位（CP wrapper 不注入）；教训：命名覆盖缺口的失败模式是"整条边界消失"而非"少切一个参数" | **方式 B 内置条目（§3.6.1 注记）**：`q_a`/`kv_a` 下投影 → REPLICATED（LoRA rank 维不切，latent TP 组内一致），`q_b`/`kv_b` 上投影 → COLWISE（head 维），`o_proj` 仍 ROWWISE（contract head 维契约不变，与标准 attention 模板同构）；配套新增第 14 个角色 `ParamRole.REPLICATED`（全维 Replicate，仅经 ARCH_OVERRIDES 显式指派，默认规则不产生）；键同时注册 architectures 拼写（`"deepseekv2"`/`"deepseekv3"`）与 model_type 拼写（`"deepseek_v2"`/`"deepseek_v3"`，v2/v3 同构）。UT：`test_s1_mla_deepseek.py`（S1.14，含"无覆盖时落 SKIP"的回归保护） |
+| D-14 | 嵌套 spec 需求（外层插入重排布通信；整个 LM 外层契约 + 内层关键模块 validate）与编译期链校验冲突：静态链对外层不透明 forward 做不干净（§3.6.5 reshape 断链局限的嵌套放大版）；且链校验只守 in_src 一致，而模块正确性本应由各自的策略传播断言承担 | **§13 完整方案**：① 废除 Phase 5 编译期链校验/传播（Scenario 1/2/4），spec 全声明强制化，保留 `_is_terminal`；Scenario 2 不设替代——只断言本模块策略传播正确（out_src/out_dst 既有机制），链一致性由声明 + 双模式数值对拍兜底；② 嵌套 spec 放行，三条不变式——参数唯一归属（FQN 冲突 fail-fast）、Phase C post-order 包装、外层 local region 解包排除内层边界子树；③ validate 孤岛——外层 `use_local_map` + 内层 validate wrapper 经 `RedistOp` local 容忍自动成岛，无需新 wrapper 类型；④ 双模式 × 嵌套组合测试矩阵（§13.7，N1–N11）（2026-07-25 定稿并落地：S7 套件 `test_s7_nested_plan.py` + `test_dist_s7_nested_e2e.py`，299 项组件测试全绿；实现校准两点——production 全局永久解包无需 exclude（§13.3 注）、validate wrapper 新增 nested DTensor 透传 + 根 fqn `""` 支持（§13.5）） |
 
 **被推翻的历史方案（如实补记）**：commit bc749470 曾实现 **ETP 方案**——
 `ep_size` 即 ETP 组大小、expert 权重声明 `{EP: Shard(0), ETP: Shard(1/2)}`
@@ -5120,6 +5204,17 @@ torchrun --nproc_per_node=4 train.py
    已就地修正——SDPA dispatch 对 CP Shard(1) 的 K/V 不做 all-gather（会算成
    局部 attention），两模式必须注入同一个显式 all-gather wrapper；validate
    下 MoE 走 `_wrap_local_region_forward(validate_mode=True)` 也在伪代码中补全。
+8. **文档勘误（2026-07-25）**：§2 Phase C 分支图原为
+   `if validate_mode / elif spec.use_local_map / else` 三分支并列结构，与代码
+   不符（D-03' local region 泛化前的旧口径）。实际 `_apply_phase_c` 是**两级
+   门控**：先经 `_resolve_local_compute_fn` 单一解析链分流（用户
+   `local_compute_fn` / EP 注入意图 `_ep_size>0` / `use_local_map` 纯门控，
+   非 None 即走 `_wrap_local_region_forward`，`validate_mode` 只是骨架参数），
+   仅非 local-region 模块才在 `_wrap_validate_forward` /
+   `_wrap_production_forward` 间二选一。即 **MoE EP 在 validate 模式同样走
+   local region 骨架**（区域内 `_temp_local_params` 临时解包 + out_src 声明式
+   重包装），`_wrap_validate_forward` 的 dispatch 推导断言只覆盖普通模块。
+   §2 分支图已就地重写为嵌套结构。
 
 ### 12.5 双模式梯度语义（§5.5 补充）
 
@@ -5138,4 +5233,209 @@ torchrun --nproc_per_node=4 train.py
   `test_dist_s6_hf_native_moe.py`）。
 - G4 实测确认：torch `is_causal` 在 q_len≠kv_len 时按**左上角对齐**（等价于假设
   chunk 位于序列开头），rank>0 的 CP chunk 必须走 D-04 的 offset-aware mask。
+
+---
+
+## 13. 嵌套 spec 与 validate 孤岛（D-14，2026-07-25 设计定稿）
+
+> 本节为设计定稿，实现落地进度以代码为准；与正文的冲突点（废除/修订清单）
+> 见 §13.6。
+
+### 13.1 动机与场景
+
+两个真实需求指向同一个能力缺口——**嵌套 ModuleShardingSpec**（祖孙边界共存）：
+
+1. **外层插入重排布通信**：自定义容器模块（整个 decoder layer、跨模块复合块）
+   需要在其入口/出口插入 placement 重排布，而内部子模块（attention/mlp）
+   已是标准边界。此前 `_check_no_nested_overrides` 一律拒绝祖孙嵌套，理由
+   有二：flat chain 假设（链式对齐只在模块出口成立）与参数双切风险
+   （production 静默错误）。
+2. **整个 LM 外层 spec + 内层关键模块 validate**：用户想对整个语言模型声明
+   输入（`input_ids {CP: Shard(1)}`）/输出（logits）的切分契约，但整模型
+   forward 范围太大——glue 代码里可能存在未实现 dispatch 的算子，全量
+   DTensor 传播（validate）走不通；同时仍希望关键模块（attention/mlp/
+   norm/lm_head）能跑 dispatch 级校验。
+
+### 13.2 决策一：废除编译期链式校验（Phase 5 Scenario 1/2/4）
+
+**为什么静态链对嵌套做不干净**：外层 forward 不透明——入口到内层调用之间
+可能有任意预处理（reshape、逐元素变换、条件分支），静态规则只能粗暴要求
+`outer.in_dst == inner.in_src`，本质是在猜用户的计算图。§3.6.5 自己记录的
+reshape/reduce 断链局限（平铺链都会断）在嵌套下被放大——嵌套设计的难点
+恰恰全部集中在"进入链/返回链"的静态语义上，去掉它，嵌套支持简单一个量级。
+
+**关键事实**：in_src 的正确性此前**只有编译期链校验在守**——validate 只断言
+出口（`_validate_out_src/out_dst`），入口 redistribute 用的是**实际** placement
+而非声明（`RedistOp.execute` 的 `isinstance(tensor, DTensor)` 分支）。声明错了
+在 validate 里被静默 redistribute 修好，到 production 的
+`from_local(declared in_src)` 才变成静默数值错误。也就是说原机制既守不住
+嵌套，对平铺链的保护也存在盲区。
+
+替代机制（三项）：
+
+| 原职责 | 替代 | 说明 |
+|---|---|---|
+| Scenario 1/4：填充缺失 in_src | **spec 全声明强制化** | 模板本就全声明四字段；用户 spec 缺 in_src → plan 期 fail-fast。Scenario 3（首/尾模块）随之自然消失——首模块 in_src 由模板/用户显式声明 |
+| Scenario 2：A.out_dst ≠ B.in_src 编译期报错 | **废除，不设替代** | 只断言**本模块**的策略传播正确（out_src/out_dst 既有机制，§5），相邻契约一致性不再做任何静态/运行期检查。理由：in_dst 才是模块计算所需，redistribute 语义上数值安全——in_src 声明错误的代价只是一次多余通信，不是错误结果；production 的 `from_local(declared in_src)` 声明信任根无独立校验，由双模式数值对拍兜底（§13.4 层级 3、§13.7 测试矩阵） |
+| `_is_terminal` 标记 | **保留** | 推导极简（调用链最后一个 boundary），不依赖完整链传播 |
+
+代价与收益：失去 plan 期报错（错误推迟到首次 validate 运行——推荐工作流
+本就是先 validate 再 production，可接受）；in_src 声明错误不再有专门检查
+（残留风险：production `from_local` 按声明解释 local 张量，声明与上游实际
+排布不符时静默数值错误）——该风险由两层吸收：validate 孤岛入口的
+`from_local` 形状断言（形状不符当场炸）+ 双模式数值对拍（排布语义错误
+在对拍时炸）。换来嵌套无需定义任何静态链语义 + planner 瘦身。
+
+### 13.3 决策二：嵌套 spec 三条不变式
+
+`_check_no_nested_overrides` 从"一律拒绝"放宽为"只查不变式 1"，三条
+不变式共同保证嵌套的正确性：
+
+**不变式 1：参数唯一归属（plan 期 fail-fast）**。每个参数恰被一个 boundary
+切一次。Phase 4.5 合并时把所有 `spec.params` 的键解析为全模型参数 FQN，
+出现在 ≥2 个 spec 中 → `ValueError`（列出冲突参数与两个 boundary fqn）。
+外层**可以**声明：自己直属的参数 + 不属任何内层边界子树的中间层参数。
+纯 FQN 前缀运算，单进程可测，Phase A 无需改。拒绝"冲突时内层为准"的
+静默覆盖方案——静默是数值错误温床（D-13 教训）；也拒绝"外层禁止配
+params"的过强约束（外层容器可能持有直属参数）。
+
+**不变式 2：Phase C post-order 包装（内层先包）**。production 下外层
+wrapper 对内层的调用是运行时属性查找，看似顺序不敏感，但有两处真顺序
+敏感点：(a) 外层 `local_compute_fn` 经 `functools.partial` 绑定，若其内部
+缓存内层 forward 引用，先包外层会绑到**未包装的旧 forward**；(b) 参数
+解包状态依赖内层 wrapper 已就位（不变式 3 的作用域划分以内层边界集合
+为输入）。实现：按 FQN 深度排序（深的先），不依赖 dict 插入顺序。
+
+**不变式 3：外层 local region 解包作用域排除内层边界子树**。
+`_temp_local_params`（validate 临时解包）的作用域
+= `module 子树 − 所有内层 boundary 子树`。内层参数由内层自己的 wrapper
+管理（内层先包先解，外层跳过）。**这是 validate 孤岛的命门**——内层孤岛
+必须保持参数为 DTensor（dispatch 靠 `__torch_function__`），外层若把内层
+参数也解了，孤岛全军覆没。
+
+> 实现校准（2026-07-25 落地）：**production 的全局永久解包无需 exclude**——
+> 现行架构是 Phase C 入口对整模型一次性解包（`_local_params_context`），
+> 天然服务所有边界（内外层 wrapper 在 production 都假设参数已 local），
+> 不存在"外层抢走内层参数"的问题；exclude 只需加在 validate 的
+> `_temp_local_params`（临时解包+恢复，作用域敏感）。
+
+### 13.4 决策三：validate 孤岛（外层 local_map + 内层 dispatch 校验）
+
+**机制：孤岛不需要新 wrapper 类型**。`RedistOp.execute` 对 local 输入 +
+`as_dtensor=True` 自动 `from_local(declared in_src)`（precompiled_boundary.py），
+内层 validate wrapper 收到 local 张量即按声明重包装 → dispatch 传播 →
+`assert out_src` → 出口解包回 local（`_wrap_validate_forward` Step 6）。
+孤岛入口重包装、岛内全量 dispatch 校验、出口回落 local 世界，三步全部
+复用现有代码路径。
+
+数据流（整个 LM 外层 spec + validate 模式）：
+
+```
+外层 spec（整个 LM，use_local_map=True，params={}）
+  in_src = {"input_ids": {CP: Shard(1), ...}}, out_src/out_dst = logits 契约
+
+外层 local-region 入口: redistribute input_ids → DTensor → to_local
+  （区域内全 local——无 dispatch 实现的 glue 代码永远不碰 DTensor）
+├─ embed 边界【孤岛】: from_local(declared in_src) → dispatch 校验 → to_local
+├─ layers.N.self_attn 【孤岛】: 同上（CP wrapper 双模式容错照常）
+├─ layers.N.mlp 【孤岛】: 同上
+├─ ... 其余 norm / lm_head 【孤岛】
+└─ 外层出口: from_local(declared out_src) → boundary 出口 → local logits
+```
+
+**信任根层级**（从强到弱）：
+
+| 层级 | 机制 | 覆盖范围 |
+|---|---|---|
+| 1. dispatch 断言 | 孤岛内 out_src/out_dst 校验（§5）——**本模块策略传播正确性** | 孤岛模块的计算契约（全量） |
+| 2. `from_local` 形状断言 | local shape 由 (global shape, declared, mesh) 唯一确定 | 孤岛入口（local 世界无"实际 placement"可言） |
+| 3. 双模式数值对拍 | `grad_equiv` / `mode_equiv` 测试（§12.5） | 端到端兜底（含 in_src 声明错误这类无专门检查的残留风险） |
+
+**固有局限**：孤岛入口的 declared in_src 是信任根——形状断言抓不住**同形状
+错排布**（cp-major vs tp-major，§6.3.1/§6.3.2），与 MoE out_src 声明式校验
+同级（§4.4.3）。缓解：cp-major 全局约定（R8）+ 关键路径用 **DTensor 穿透**
+抽查——外层走 `local_compute_fn` 时，用户在 compute_fn 内对内层调用前自行
+`DTensor.from_local(x, mesh, declared)` 重包装，内层 validate 照常收 DTensor
+走层级 1 的全量 dispatch 校验（`RedistOp` 对 DTensor/local 双容忍，无需新机制）。
+
+### 13.5 落地清单
+
+> 状态（2026-07-25）：**已全部落地**，测试见 §13.7（S7 套件）。
+
+| 位置 | 改动 | 状态 |
+|---|---|---|
+| planner Phase 5 | 删除编译期链校验/传播（`_chain_propagate_and_validate`/`_pair_contracts`），`_mark_terminal` 保留 `_is_terminal`；`_check_full_declaration` 全声明强制化（缺 in_src → plan 期 `ValueError`） | ✅ |
+| `_check_no_nested_overrides` → `_check_param_uniqueness` | 放行嵌套，改查参数唯一归属（不变式 1） | ✅ |
+| Phase C `_apply_phase_c` | 边界按 FQN 深度 post-order 排序包装（不变式 2） | ✅ |
+| `_temp_local_params` | 加 `exclude`（内层边界子树，不变式 3）；production 全局永久解包经校准**无需**改动（见 §13.3 注） | ✅ |
+| `_wrap_validate_forward`（实现期新增） | 输入为 DTensor 时出口保持 DTensor（`nested` 透传）——外层普通 boundary 的 dispatch 链不被内层孤岛的 `to_local` 打断（N1 的必要条件；平铺链行为不变：local 进 → local 出） | ✅ |
+| `_resolve_module`（实现期新增） | 支持根 fqn `""` → 模型自身（整个 LM 外层 spec，N3 旗舰场景） | ✅ |
+| 测试 | 双模式 × 嵌套组合矩阵，见 §13.7 | ✅ |
+
+### 13.6 受影响章节（废除/修订清单）
+
+- **§3.6.5（Phase 5 链式传播详解）**：Scenario 1/2/4 废除，仅 `_is_terminal`
+  标记保留；该节保留作历史参考，头部已加废除标注。
+- **§3.6.7 / §8.5（plan_overrides）**："契约冲突在 `plan()` 内抛
+  `PlacementMismatchError`"口径修订为"plan 期不再做相邻契约校验；各模块
+  仅断言自身策略传播正确（out_src/out_dst），端到端正确性由双模式数值
+  对拍保障"；`_check_no_nested_overrides` 的嵌套拒绝语义由不变式 1 取代。
+- **§2 时序图 Phase 5 行**：已标注 D-14 废除范围。
+- **§5（validate 模式）**：孤岛语义（local 世界中的边界自动经
+  `from_local(declared in_src)` 成岛；输入为 DTensor 时出口保持 DTensor
+  的 nested 透传）已随实现落地，正式描述见 §13.4/§13.5。
+
+### 13.7 双模式 × 嵌套组合测试矩阵
+
+测试分**正例**（嵌套形态 × 双模式 × 并行组合，全部与单卡参考对拍）与
+**负例**（plan 期 fail-fast）两类。正例统一骨架：每个用例跑
+`validate` 与 `production` 两种模式，validate 模式额外断言孤岛内层
+out_src dispatch 校验真实发生（非空转），production 模式对拍数值；
+两模式输出互相对拍（mode_equiv）。建议落 `tests/components/distributed/`
+新增 S7 套件（`test_s7_nested_*.py` 单进程 + `test_dist_s7_nested_*.py`
+多进程）。
+
+#### 正例：嵌套形态 × 双模式
+
+| # | 嵌套形态 | 并行 | 外层类型 | 内层类型 | 关键断言 |
+|---|---|---|---|---|---|
+| N1 | 外层 decoder layer + 内层标准边界 | TP=2 | 普通 boundary（params={}，仅 I/O 契约） | attention/mlp/norm 标准边界 | 双模式数值对拍；validate 下内层 out_src dispatch 断言生效；外层 forward 全 dispatch 兼容时外层 out_src 同样被断言 |
+| N2 | 外层 decoder layer + 内层标准边界 | TP=2 | **local_map**（`use_local_map=True`） | 同上 | **孤岛主用例**：validate 下内层经 `from_local(declared in_src)` 自动成岛、out_src 断言生效；外层区域内 glue 代码全程 local；外层出口按声明 out_src 重包装 |
+| N3 | **整个 LM 外层 spec + 内层关键模块**（旗舰场景，§13.1 场景 2） | TP=2×CP=2 | local_map，in=`input_ids {CP: Shard(1)}`，out=logits 契约 | embed/attention/norm/lm_head 孤岛 | 数据管道 `shard_batch_for_cp` 照常；孤岛内 CP wrapper（sdpa_hf + D-04）照常；双模式对拍（CP 组 all-gather 拼回全序列）；外层 glue（rotary/mask/残差等无 dispatch 代码）零 DTensor 接触 |
+| N4 | 外层容器 + 内层 MoE local region + attention 孤岛 | TP=2×EP=2 | local_map | MoE（`_ep_size>0` → `_hf_native_ep_compute`）+ attention | **嵌套 local region 不嵌套包装**：内层 MoE 与 attention 各自成岛/成区，外层只缝合自身 I/O；expert 参数唯一归属（外层 params 不得覆盖 `experts.*`） |
+| N5 | 三层嵌套（LM → layer → attention） | TP=2 | local_map（LM 层）+ 普通 boundary（layer 层） | attention 标准边界 | post-order 深度排序正确（attention → layer → LM 包装顺序可观察断言） |
+
+#### 正例：时序与作用域专项（不变式 2/3 的直接验证）
+
+| # | 目标 | 断言 |
+|---|---|---|
+| N6 | 不变式 2（内层先包） | 外层 `local_compute_fn` 内缓存内层 forward 引用，运行前向，断言实际调用的是**包装后**的 forward（如 CP wrapper 的 misfire 检测不炸 / inner wrapper 日志出现） |
+| N7 | 不变式 3（解包作用域，validate） | 外层 local region 内，内层边界子树的参数**仍为 DTensor**（`isinstance` 断言）；外层直属参数已被 `_temp_local_params` 临时解包为 local |
+| N8 | 不变式 3（production） | build 期永久解包后，内层参数由内层 wrapper 解包且仅解一次（参数 id/存储地址稳定，无重复解包副作用）；双模式梯度逐参数相等（grad_equiv 口径，rtol=1e-3） |
+
+#### 负例：plan 期 fail-fast
+
+| # | 输入 | 期望 |
+|---|---|---|
+| N9 | 外层 `spec.params` 声明了内层边界子树的参数（如外层声明 `self_attn.q_proj.weight`） | `ValueError`：列出冲突参数 FQN 与两个 boundary fqn（不变式 1） |
+| N10 | 用户手写 spec 缺 `in_src`（全声明强制化） | plan 期报错，提示补齐字段（Scenario 1/4 填充已废除） |
+| N11 | 外层 spec 声明的内层不存在的参数名 | 沿用现有 `_shard_params` 未命中报错路径（行为不变，回归保护） |
+
+#### 组合覆盖说明
+
+- **落地状态（2026-07-25）**：N1/N2/N3/N4/N7 已实现于
+  `test_dist_s7_nested_e2e.py`（多进程 gloo 对拍全绿）；N9/N10 已实现于
+  `test_s1_plan_overrides.py::TestNestedOverrideD14` 与
+  `test_s7_nested_plan.py`；N5（三层嵌套）/N6（compute_fn 缓存引用）/N8
+  （production 解包次数）/N11（未命中参数名回归）暂未单列——N5/N6 的
+  机制由 post-order 排序 + N1–N4 的行为对拍间接覆盖，N8 经 §13.3 校准后
+  无独立语义（全局一次性解包），N11 沿用既有 `_shard_params` 路径；
+- **模式维**：N1–N4 每个用例内部强制跑 validate + production 双模式并互拍
+  （沿用 S5 mode_equiv 骨架），不单列模式维度用例；
+- **并行维**：N1/N2 覆盖 TP；N3 覆盖 TP×CP（含数据管道与 CP wrapper）；
+  N4 覆盖 TP×EP；TP×CP×EP 由 N3+N4 的机制并集覆盖，若需独立用例可在
+  N3 模型上把 mlp 换成 MoE（复用 `examples/distributed/tp_cp_ep.py` 模型）；
+- **负维度归一化**：孤岛入口 `from_local` 与 out_src 断言沿用
+  `_normalize_placements_ndim`（Shard(-1) ≡ Shard(ndim-1)），N2 用例中
+  lm_head 的 `Shard(-1)` 声明作回归点。
 

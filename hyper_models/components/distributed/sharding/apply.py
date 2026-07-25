@@ -60,9 +60,13 @@ def _resolve_module(model, fqn):
     Same semantics as _get_attr_by_path — every call site (Phase A/B/C)
     passes a module fully-qualified name (e.g. `model.layers.0.self_attn`),
     not a parameter FQN, so no last-segment stripping is done (stripping
-    would incorrectly return the parent module).
+    would incorrectly return the parent module). The empty FQN "" resolves
+    to the model itself (D-14: a root-level outer spec, e.g. a whole-LM
+    contract, 05 §13.4).
     """
     obj = model
+    if not fqn:
+        return obj
     for p in fqn.split("."):
         obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
     return obj

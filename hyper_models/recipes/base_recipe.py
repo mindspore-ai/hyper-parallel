@@ -168,7 +168,12 @@ class BaseRecipe:
             elif kind == "dataloader":
                 dl_path = self._state_path(path, name, kind)
                 os.makedirs(os.path.dirname(dl_path), exist_ok=True)
-                torch.save(obj.state_dict(), dl_path)
+                if hasattr(obj, "state_dict"):
+                    torch.save(obj.state_dict(), dl_path)
+                else:
+                    # Stub data pipeline: plain DataLoader has no state_dict;
+                    # persist an empty placeholder so checkpoint paths are created.
+                    torch.save({}, dl_path)
             elif kind == "train_state":
                 # 训练元信息（epoch/step/loss）——与 04 load `kind=="train_state"`
                 # 分支对称。state_dict 先展开，显式键居后，确保 epoch/global_step
@@ -249,7 +254,8 @@ class BaseRecipe:
             obj.load_state_dict(extra)
         elif kind in ("rng", "dataloader"):
             state = torch.load(path, weights_only=False)
-            obj.load_state_dict(state)
+            if hasattr(obj, "load_state_dict") and state:
+                obj.load_state_dict(state)
 
     def _state_path(self, root: str, name: str, kind: str) -> str:
         """根据 state 种类和 name 计算 checkpoint 子路径（04 §8）。"""

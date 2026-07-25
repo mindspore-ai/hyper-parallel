@@ -20,9 +20,31 @@ Stub implementations for build_dataloader and build_validation_dataloader.
 import logging
 from typing import Any, Optional
 
-from torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
+
+
+class _DummyDictDataset(Dataset):
+    """Simple dict-yielding dataset for skeleton testing.
+
+    Each sample is a dict with ``input_ids`` and ``labels`` tensors, which is
+    the contract expected by the training loop.
+    """
+
+    def __init__(self, num_samples: int, seq_len: int, vocab_size: int, seed: int):
+        g = torch.Generator().manual_seed(seed)
+        self.input_ids = torch.randint(
+            0, vocab_size, (num_samples, seq_len), generator=g,
+        )
+        self.labels = self.input_ids.clone()
+
+    def __len__(self) -> int:
+        return len(self.input_ids)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {"input_ids": self.input_ids[idx], "labels": self.labels[idx]}
 
 
 def build_dataloader(
@@ -44,22 +66,22 @@ def build_dataloader(
 ) -> tuple[DataLoader, Any]:
     """Build training dataloader and tokenizer.
 
-    Stub — returns a simple DataLoader wrapping a list of dummy batches.
+    Stub — returns a simple DataLoader wrapping a dict-yielding dummy dataset.
     Full implementation follows 02_data_pipeline.md.
 
     Returns:
         (dataloader, tokenizer) — tokenizer is None in stub.
     """
-    import torch
-    from torch.utils.data import TensorDataset
-
-    # Create a dummy dataset of 100 samples
-    dummy_input_ids = torch.randint(0, 1000, (100, 32))
-    dummy_labels = dummy_input_ids.clone()
-    dummy_dataset = TensorDataset(dummy_input_ids, dummy_labels)
+    # Rank-aware seed so different DP ranks see different samples.
+    dataset = _DummyDictDataset(
+        num_samples=100,
+        seq_len=32,
+        vocab_size=1000,
+        seed=seed + dp_rank,
+    )
 
     dataloader = DataLoader(
-        dummy_dataset,
+        dataset,
         batch_size=local_batch_size,
         shuffle=True,
         drop_last=True,
@@ -92,15 +114,15 @@ def build_validation_dataloader(
     Returns:
         dict[str, DataLoader] — validation dataloaders keyed by name.
     """
-    import torch
-    from torch.utils.data import TensorDataset
-
-    dummy_input_ids = torch.randint(0, 1000, (20, 32))
-    dummy_labels = dummy_input_ids.clone()
-    dummy_dataset = TensorDataset(dummy_input_ids, dummy_labels)
+    dataset = _DummyDictDataset(
+        num_samples=20,
+        seq_len=32,
+        vocab_size=1000,
+        seed=seed + 1000 + dp_rank,
+    )
 
     val_dataloader = DataLoader(
-        dummy_dataset,
+        dataset,
         batch_size=local_batch_size,
         shuffle=False,
         drop_last=False,

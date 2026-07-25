@@ -84,7 +84,7 @@ PYTHONPATH=. torchrun --nproc_per_node=2 examples/distributed/tp.py
 
 ### 2.1 示例目录一览
 
-[`examples/distributed/`](../../../examples/distributed/) 五个独立示例，均与单卡
+[`examples/distributed/`](../../../examples/distributed/) 七个独立示例，均与单卡
 参考做数值对拍：
 
 | 示例 | 并行 | 演示点 |
@@ -92,6 +92,8 @@ PYTHONPATH=. torchrun --nproc_per_node=2 examples/distributed/tp.py
 | `tp.py` | TP=2 | 零配置自动推导 + 应用（本节代码的完整版） |
 | `cp.py` | CP=2 | `shard_batch_for_cp` + 内置 `"sdpa_hf"` wrapper + D-04 causal 修正（§6） |
 | `ep.py` | TP=2×EP=2 | HF 原生 MoE 零配置：D-09 堆叠 + D-10 TP-extend-EP + 内置 `_hf_native_ep_compute`（§7） |
+| `tp_cp_ep.py` | TP=2×CP=2×EP=2 | 三维组合：cp-major 序列布局（§6.6）+ plan 内省断言（`_ep_stack`/`_needs_cp_attn` 等） |
+| `nested_local_map.py` | TP=2（嵌套） | D-14 嵌套 spec：外层 local_map（根 fqn `""`）+ 内层 validate 孤岛，双模式对拍（§10.1） |
 | `custom_local_compute_fn.py` | TP=2 | 自研 MoE：`plan_overrides` + `local_compute_fn` 注入自定义 compute（§10.3） |
 | `custom_inner_wrapper.py` | CP=2 | 自研 attention：`inner_target` + 注册表命名 wrapper（§10.4） |
 
@@ -379,6 +381,50 @@ for batch in dataloader:
 
 > 可运行示例：`examples/distributed/cp.py`（causal attention + 双模式对拍）。
 
+### 6.6 TP×CP 组合时的序列布局：cp-major 嵌套切分
+
+当 TP 与 CP 同时开启时，`hidden_states` 的序列维（dim 1）同时挂在 mesh 的
+`cp`、`tp` 两个轴上（`{TP: Shard(1), CP: Shard(1)}`）。这不是"各切一遍"，
+而是**嵌套切分**，顺序由 mesh 轴顺序决定（`cp` 在 `tp` 之前）：
+
+```
+序列先按 cp_size 粗切（外层），每个 CP 大块内再按 tp_size 细切（内层）
+chunk_id  = cp_rank * tp_size + tp_rank       # cp-major
+每 rank 持有 S/(cp_size*tp_size) 的连续 token 段
+```
+
+**示例**（S=16, TP=2, CP=2，chunk=4）：
+
+| mesh 坐标 | 持有 token 区间 |
+|---|---|
+| (cp0, tp0) | [0, 4) |
+| (cp0, tp1) | [4, 8) |
+| (cp1, tp0) | [8, 12) |
+| (cp1, tp1) | [12, 16) |
+
+这个布局由两步自然形成，用户无需关心：`shard_batch_for_cp` 先做外层 CP 粗切
+（§6.1），embed/attention 出口的 TP reduce-scatter 再做内层细分。
+
+**对 norm / pointwise 模块的含义**：以 norm 的 spec 为例——
+
+```python
+params={"weight": {TP: Replicate(), CP: Replicate()}},      # weight 全复制
+in_src/in_dst/out_src/out_dst 全为 {TP: Shard(1), CP: Shard(1)}   # 全 identity
+```
+
+norm **自己不切分、零通信**：入口/出口 placement 完全相同，PrecompiledBoundary
+不生成任何通信 op;RMSNorm 的归约维是 hidden 维 H（未被切分），直接在本地
+`[B, S/(tp*cp), H]` chunk 上逐 token 计算，数值与全局序列**逐位一致**。所有
+逐 token pointwise 模块（mlp、norm 等）同理天然兼容该布局。
+
+> ⚠️ 自定义模块注意：boundary 层 CP 维必须保持 `Shard(1)` identity（R8）。
+> 若把 in_dst 的 CP 维写成 `Replicate`，会触发全序列 reduce-scatter 并产出
+> **tp-major** 布局（chunk_id = `tp_rank*cp_size + cp_rank`），与上下游的
+> cp-major 布局错位，导致**静默数值错误**（设计文档 05 §12.2 D-06）。
+
+> 可运行示例：`examples/distributed/tp_cp_ep.py`（TP=2×CP=2×EP=2 三维组合，
+> 与单卡参考对拍；日志逐 rank 打印其持有的 cp-major token 区间）。
+
 ---
 
 ## 7. EP 教程
@@ -508,6 +554,7 @@ fully_shard(model, mesh=dp_mesh, ...)   # hyper_parallel/core/fully_shard
 | 纯 TP | `(8,)` `("tp",)` | `tp_size=8` | §5 |
 | 纯 CP | `(4,)` `("cp",)` | `cp_size=4` | §6，数据管道配合 |
 | TP×CP | `(2, 4)` `("cp", "tp")` | `tp_size=4, cp_size=2` | TP 组连续（内层） |
+| TP×CP×EP | `(2, 2)` `("cp", "tp")` | `tp_size=2, cp_size=2, ep_size=2` | 示例 `tp_cp_ep.py`；EP 组从 dense 区域派生 |
 | TP×EP | `(2, 4)` `("tp", "ep")` 或 `("dp","tp")` | `tp_size=2, ep_size=4` | D-10：EP 组从 dense 区域派生，无需专用 etp 轴 |
 | DP×CP×TP | `(2, 2, 2)` `("dp", "cp", "tp")` | `tp_size=2, cp_size=2` | dp 轴供 FSDP |
 | 全组合 | `(2, 2, 4)` `("dp", "cp", "tp")` | `tp_size=4, cp_size=2, ep_size=8` | EP 组跨 TP 组向 dp/cp 扩展 |
@@ -547,15 +594,21 @@ spec = ModuleShardingSpec(
 planner = ShardingPlanner(plan_overrides={"model.layers.0.self_attn": spec})
 ```
 
-与上游 `out_dst` 不一致仅产生 `chain contract mismatch` 警告（边上
-reshape/transpose 属合法场景，声明正确性由 validate 模式兜底）；fqn
-拼写错误 → `ValueError` fail-fast。
+与上游 `out_dst` 不一致**不再检查**（D-14：链式校验已废除，各模块只
+断言自身策略传播，端到端正确性由双模式数值对拍兜底）；fqn
+拼写错误 → `ValueError` fail-fast；spec 缺 `in_src`（`in_dst` 非空时）
+→ `ValueError`（D-14 全声明强制化，链式填充已废除）。
 
-**不支持嵌套 spec**：override 的 fqn 不得是任何派生边界（或其他
-override）的祖先/后代，命中即 `ValueError`——边界假设扁平链，嵌套时
-参数会被切两次、内层 in_src 参照系错位。想定制某个叶子（如
-`self_attn.q_proj`），应直接覆盖它所属的边界（`self_attn`，替换语义，
-参数名相对于边界模块）；想接管整个 block，请逐层覆盖各子边界。
+**嵌套 spec（D-14，05 §13）**：override 的 fqn 可以是其他边界的祖先/
+后代——外层边界（如整个 decoder layer、整个 LM 的根 fqn `""`）与内层
+边界共存，常用于"外层只做 I/O 缝合（`params={}` + `use_local_map`），
+内层关键模块跑 validate 孤岛"（§13.4）。唯一约束是**参数唯一归属**：
+每个参数只能被一个边界声明（外层不得声明内层边界子树的参数），冲突
+即 `ValueError`。想定制某个叶子（如 `self_attn.q_proj`），仍应直接
+覆盖它所属的边界（`self_attn`，替换语义，参数名相对于边界模块）。
+
+> 可运行示例：`examples/distributed/nested_local_map.py`（外层 local_map
+> + 内层 validate 孤岛，production/validate 双模式对拍）。
 
 ### 10.2 四接口总览（两个家族）
 

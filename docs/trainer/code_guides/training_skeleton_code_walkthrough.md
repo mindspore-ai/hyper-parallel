@@ -31,7 +31,7 @@
 | [components/checkpoint/config.py](../../../hyper_models/components/checkpoint/config.py) + [checkpointing.py](../../../hyper_models/components/checkpoint/checkpointing.py) | CheckpointingConfig + Checkpointer | runtime | 桩（torch.save 暂代 DCP） |
 | [components/distributed/infrastructure.py](../../../hyper_models/components/distributed/infrastructure.py) | MeshContext / DistributedSetup / initialize_distributed 等 | build | 桩 |
 | [hyper_models/_transformers/](../../../hyper_models/_transformers/) | HyperAutoModelForCausalLM 等 HF 兼容入口 | build | 桩 |
-| [components/models/common/model_utils.py](../../../hyper_models/components/models/common/model_utils.py) | build_model：模型构建 + OptimizerInit 导出 | build | 桩 |
+| [components/models/common/model_utils.py](../../../hyper_models/components/models/common/model_utils.py) | build_model：统一调用 HyperAutoModel 入口 + OptimizerInit 导出 | build | 完整 |
 | [hyper_models/data/build_dataloader.py](../../../hyper_models/data/build_dataloader.py) | build_dataloader / build_validation_dataloader | build | 桩（dummy 数据） |
 
 > 测试基线：138 例位于 [`tests/components/training/`](../../../tests/components/training/)（step_scheduler 24 + callback 24 + grad_accum 29 + loss 21）与 [`tests/hyper_models/recipes/`](../../../tests/hyper_models/recipes/)（base_recipe 24 + finetune_recipe 16）。
@@ -197,26 +197,28 @@ restore_from="LATEST"      → _resolve_latest_symlink(cfg.checkpoint.checkpoint
 
 ### ③④ RNG + 分布式拓扑
 
-[L106-139](../../../hyper_models/recipes/llm/train_ft.py#L106-L139)：`StatefulRNG(seed=cfg.training.seed, ranked=True)`；`create_distributed_setup_from_config(cfg)` → `self.mesh = distributed_setup.mesh_context`。
+[L106-115](../../../hyper_models/recipes/llm/train_ft.py#L106-L115)：`StatefulRNG(seed=cfg.training.seed, ranked=True)`；`create_distributed_setup_from_config(cfg)` → `self.mesh = distributed_setup.mesh_context`。
 
-**dp_cp_mesh 推导**（DP+CP 联合 all-reduce 通信域，统计全局 label token / val loss 用）：
+**dp_cp_mesh 推导已收敛到 `MeshContext`**：
+- `create_distributed_setup_from_config` 一次性构造完整的 `MeshContext`（含 `device_mesh`、各维 rank、以及 `dp_cp_mesh` / `cp_mesh` property 所需的全部信息）；
+- `FinetuneRecipe.setup()` 仅做 `self.dp_cp_mesh = self.mesh.dp_cp_mesh`，不再重复推导；
 - `mesh.device_mesh is None`（stub MeshContext 兜底）→ `self.dp_cp_mesh = None`，后续 `_dp_cp_all_reduce_sum` 退化为全局 all-reduce 或 no-op；
-- 有 mesh 时按轴名优先级取子 mesh：`("dp_shard_cp","cp")` 二维 > `"dp_shard_cp"` > `("dp","cp")`/`"dp"` > `("dp_replicate","cp")`/`"dp_replicate"` > 全 mesh 兜底；
+- 有 mesh 时 `MeshContext.dp_cp_mesh` 按轴名优先级取子 mesh：`("dp_shard_cp","cp")` 二维 > `"dp_shard_cp"` > `("dp","cp")`/`"dp"` > `("dp_replicate","cp")`/`"dp_replicate"` > 全 mesh 兜底；
 - 多维子 mesh **setup 期一次性 `_flatten("dp_cp")`** 为 1D——`DeviceMesh.get_group()` 仅对 1D 语义明确，且避免每步重建 group。
 
 > 为什么必须纳入 CP 维：cp_size>1 时全局 token 数 = 各 cp rank 持有段之和，只用 DP 维会少算 cp_size 倍（03 §5.3 ④ 注）。
 
 ### ⑤⑥ MagiAttention + Callback 管理器
 
-[L140-147](../../../hyper_models/recipes/llm/train_ft.py#L140-L147)：`cfg.magi` 为 None → `self.magi = None`；否则 `setup_magi(cfg, device_mesh)`（未安装 magi_attention 时 warning + None）。`build_callback_manager(self, cfg, pbar_total=max_steps>0 ? max_steps : None)`（§8.2.8）。
+[L117-124](../../../hyper_models/recipes/llm/train_ft.py#L117-L124)：`cfg.magi` 为 None → `self.magi = None`；否则 `setup_magi(cfg, device_mesh)`（未安装 magi_attention 时 warning + None）。`build_callback_manager(self, cfg, pbar_total=max_steps>0 ? max_steps : None)`（§8.2.8）。
 
 ### ⑦⑧⑨ Loss + PP + PEFT
 
-[L149-157](../../../hyper_models/recipes/llm/train_ft.py#L149-L157)：`self.loss = cfg.loss.build()`（LossConfig → MaskedCrossEntropy 或 `_target_` 实例，§9.3）；`self.pp_enabled = mesh.pp_size > 1` → `_configure_pp`（[L244-254](../../../hyper_models/recipes/llm/train_ft.py#L244-L254)，桩：pp>1 时 warning——PP backward 钩子未落地，`prepare_for_final_backward` 会显式 NotImplementedError）；`self.peft_config = cfg.peft`。
+[L126-134](../../../hyper_models/recipes/llm/train_ft.py#L126-L134)：`self.loss = cfg.loss.build()`（LossConfig → MaskedCrossEntropy 或 `_target_` 实例，§9.3）；`self.pp_enabled = mesh.pp_size > 1` → `_configure_pp`（[L219-226](../../../hyper_models/recipes/llm/train_ft.py#L219-L226)，桩：pp>1 时 warning——PP backward 钩子未落地，`prepare_for_final_backward` 会显式 NotImplementedError）；`self.peft_config = cfg.peft`。
 
 ### ⑩⑪⑫ Checkpointer + Model + Optimizer
 
-[L159-182](../../../hyper_models/recipes/llm/train_ft.py#L159-L182)：
+[L136-159](../../../hyper_models/recipes/llm/train_ft.py#L136-L159)：
 
 ```python
 self.checkpoint_config = cfg.checkpoint            # load_checkpoint 读取 checkpoint_dir
@@ -541,7 +543,7 @@ class LossConfig:
 | [_transformers/infrastructure.py](../../../hyper_models/_transformers/infrastructure.py) | `instantiate_infrastructure → (sharding_planner, fsdp2_manager, autopipeline)`；`apply_model_infrastructure`（01 §8.3 canonical Step 3-11） | ShardingPlanner 真实可用；plan/apply 完整传入 cp/ep/sequence_parallel/loss_parallel；FSDP2Manager stub 保留 `parallelize` 入口 | 01 §8 + 05 §4 |
 | [components/distributed/fsdp2.py](../../../hyper_models/components/distributed/fsdp2.py) | `FSDP2Manager` + `_instantiate_fsdp2` | 桩：`parallelize` 记录参数并原样返回 model | 06 §4 |
 | [components/distributed/pipelining.py](../../../hyper_models/components/distributed/pipelining.py) | `AutoPipeline` + `_instantiate_pipeline` | 桩：`build()` 仅日志，不改动 model | 06 §8.2 |
-| [models/common/model_utils.py](../../../hyper_models/components/models/common/model_utils.py) | `build_model(model_cfg, peft_config, distributed_setup) -> (model, OptimizerInit)` | Path A（HyperAutoModel）/ Path B（HF 原生 + 手动 apply infra）分派完整 | 01 §6.7 |
+| [models/common/model_utils.py](../../../hyper_models/components/models/common/model_utils.py) | `build_model(model_cfg, peft_config, distributed_setup) -> (model, OptimizerInit)` | 统一走 `HyperAutoModelForCausalLM.from_pretrained()`；单卡/多卡使用同一路径 | 01 §6.7 |
 | [checkpoint/config.py](../../../hyper_models/components/checkpoint/config.py) + [checkpointing.py](../../../hyper_models/components/checkpoint/checkpointing.py) | `CheckpointingConfig`（04 §4 全字段）+ `Checkpointer.save_model/save_optimizer/load_model/load_optimizer/save_on_dp_ranks/maybe_wait_for_staging/close` | torch.save/load 暂代 DCP；async 相关 no-op | 04：DCP + stateful_wrappers |
 | [data/build_dataloader.py](../../../hyper_models/data/build_dataloader.py) | `build_dataloader(...) -> (DataLoader, tokenizer)`；`build_validation_dataloader(...) -> dict[str, DataLoader]` | dummy TensorDataset（train 100 样本 drop_last / val 20 样本不 drop）+ warning 日志 | 02：数据管道 |
 
@@ -589,7 +591,113 @@ run_train_validation_loop:
 
 ---
 
-## 13. 速查：常用入口与典型用法
+## 13. 端到端多卡可运行示例
+
+除了 §12 的 mock 单进程走查，仓库还提供了一个**可直接 `torchrun` 运行的多卡示例**，用于把数据管线、分布式拓扑（TP/CP/DP/EP）、FSDP2、Checkpoint 等代码路径串起来。
+
+### 13.1 示例文件
+
+| 文件 | 说明 |
+|---|---|
+| [examples/training_skeleton/main.py](../../../examples/training_skeleton/main.py) | 入口：初始化分布式、准备 tiny GPT-2、解析 YAML、构建 Recipe、跑训练循环 |
+| [examples/training_skeleton/train.yaml](../../../examples/training_skeleton/train.yaml) | 完整 `TrainerConfig` YAML，使用新的 `_target_` 强类型配置 |
+| [examples/training_skeleton/run.sh](../../../examples/training_skeleton/run.sh) | `torchrun` 启动脚本（默认 `--nproc_per_node=4`） |
+
+### 13.2 设计目标
+
+- **数据管线**：使用 `build_dataloader` 的 stub 实现，返回 dict 形式的假数据，但真实参与 forward/backward。
+- **分布式应用**：`accelerator` 配置 TP/CP/DP/EP 尺寸；`create_distributed_setup_from_config` 在 `torchrun` 多进程环境下会自动构建 `DeviceMesh`。
+- **FSDP2**：`DistributedSetup.strategy_config` 默认设为 `FSDP2Config`，因此 `FSDP2Manager.parallelize` 会被调用；当前仍为 stub，仅记录参数并原样返回模型。
+- **Checkpoint**：`Checkpointer` 为 stub，使用 `torch.save`/`torch.load` 暂代 DCP，但 save/load 路径都会被调用。
+- **结果**：不校验精度，但每步都会输出 `loss`、`grad_norm`、`lr`，并真实产生梯度。
+
+### 13.3 运行方式
+
+```bash
+# 默认 4 卡（yaml 中 dp_shard_size=2, tp_size=2）
+bash examples/training_skeleton/run.sh
+
+# 或显式指定卡数
+NPROC=2 bash examples/training_skeleton/run.sh
+
+# 直接用 torchrun
+torchrun --nproc_per_node=4 \
+    --rdzv_id=training_skeleton --rdzv_backend=c10d \
+    --rdzv_endpoint=127.0.0.1:29500 \
+    examples/training_skeleton/main.py \
+    examples/training_skeleton/train.yaml
+```
+
+> 当前示例在 CPU 上会自动回退到 `gloo` backend；在 GPU 机器上会使用 `nccl`。
+
+### 13.4 YAML 关键配置
+
+```yaml
+model:
+  _target_: hyper_parallel.trainer.config.ModelConfig
+  weights_path: ./outputs/tiny_model
+
+optimizer:
+  _target_: hyper_models.components.optim.AdamW.Config
+  lr: 1.0e-4
+
+lr_scheduler:
+  _target_: hyper_models.components.optim.lr_scheduler.LRSchedulerConfig
+  lr_warmup_steps: 1
+
+loss:
+  _target_: hyper_models.components.loss.LossConfig
+
+step_scheduler:
+  _target_: hyper_models.components.training.step_scheduler.StepSchedulerConfig
+  max_steps: 4
+  local_batch_size: 1
+  global_batch_size: 2
+
+accelerator:
+  _target_: hyper_models.trainer.config.AcceleratorConfig
+  dp_shard_size: 2
+  tp_size: 2
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+```
+
+注意：**所有并行维度的乘积必须等于 `--nproc_per_node`**。上例 `2×2×1×1×1 = 4`，所以默认用 4 卡。
+
+### 13.5 典型输出
+
+```text
+Built DeviceMesh (2, 2) on device cpu for world_size=4
+FSDP2Manager instantiated with FSDP2Config
+FSDP2Manager.parallelize is a stub ... mesh=DeviceMesh((dp_shard_cp=2, tp=2), 'cpu')
+build_dataloader: using stub implementation with dummy data
+step=1 loss=6.6932 lr=1.00e-04 grad_norm=0.0620
+step=2 loss=6.6919 lr=7.50e-05 grad_norm=0.0628
+validation/default loss=6.6917
+step=4 loss=6.6923 lr=0.00e+00 grad_norm=0.0601
+```
+
+`outputs/training_skeleton/checkpoints/` 下会出现 `epoch_0_step_2/`、`epoch_0_step_4/` 目录，包含 `model/`、`optimizer/`、`scheduler.pt`、`rng/`、`dataloader/`、`extra_state.json`，说明 checkpoint 路径被完整调用。
+
+### 13.6 为示例所做的骨架加固
+
+为了让多卡 stub 跑通，示例依赖以下小幅度加固（均保持接口冻结）：
+
+1. `create_distributed_setup_from_config`：在 `dist` 已初始化且拓扑乘积匹配 `world_size` 时，一次性构造完整的 `MeshContext`（含 `device_mesh`、各维 rank、`dp_cp_mesh`/`cp_mesh` 推导）；多卡时默认注入 `FSDP2Config`，单卡时保持 `None` 以避免无关 stub 日志。
+2. `MeshContext.dp_cp_mesh` / `MeshContext.cp_mesh`：新增/修正 property，把 DP+CP 子 mesh 推导收敛到 `MeshContext` 内部，`FinetuneRecipe` 直接复用，避免与 Recipe 重复实现。
+3. `build_model`：删除 Path B（原生 HF AutoModel 回退），统一走 `HyperAutoModelForCausalLM.from_pretrained()`；单卡/多卡使用同一路径。
+4. `initialize_distributed`：无 CUDA 时自动回退 `gloo`，并按 `LOCAL_RANK` 设置当前 CUDA 设备。
+5. `build_dataloader`：stub 改为返回 dict 形式 batch，适配训练循环的 `.get("labels")` 语义。
+6. `base_recipe.save_checkpoint` / `load_checkpoint`：允许 `DataLoader` 没有 `state_dict` 时保存空占位，避免 stub 数据管道 crash。
+7. `_update_latest_symlink`：仅 rank 0 更新，避免多进程竞争。
+8. `apply_model_infrastructure`：meta → device 后，在 stub 未实现真实权重加载时，初始化参数/缓冲区为有限值。
+9. `init_empty_weights` / `_from_pretrained_parent_class`：修复新 PyTorch 版本兼容性。
+10. `LossConfig` / `LRSchedulerConfig`：调整为继承自 `Loss.Config` / `LRScheduler.Config`，以适配 `TrainerConfig` 的强类型槽位。
+
+---
+
+## 14. 速查：常用入口与典型用法
 
 ```python
 from hyper_models.recipes import RECIPE_REGISTRY                    # {"FinetuneRecipe": FinetuneRecipe}

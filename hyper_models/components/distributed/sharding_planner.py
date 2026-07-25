@@ -23,8 +23,9 @@ Phase 3  semantic role inference (explicit FQN patterns > structural guards
          > parameter role combinations)
 Phase 4  template lookup to generate spec (_build_spec_from_template)
 Phase 4.5 user plan_overrides merge (_merge_plan_overrides, 05 §3.6.7)
-Phase 5  chain propagation (fill default in_src + warn on adjacent
-         contract mismatch + _is_terminal marking)
+Phase 5  _is_terminal marking only (D-14, 05 §13: compile-time chain
+         propagation/validation removed — specs are fully self-declared and
+         each module vouches for its own propagation in validate mode)
 Phase 6  special parameter handler collection (SPECIAL_HANDLERS)
 
 Registries:
@@ -286,12 +287,17 @@ class ShardingPlanner:
                 inferred_templates[boundary_fqn] = template
 
         # Phase 4.5: merge user plan_overrides (05 §3.6.7; must run before
-        # Phase 5 — override specs still participate in chain propagation
-        # and terminal marking)
+        # the D-14 checks — nested overrides are legal since D-14, subject to
+        # the param-uniqueness invariant)
         self._merge_plan_overrides(plan, model, inferred_templates)
 
-        # Phase 5: chain propagation
-        plan = self._chain_propagate_and_validate(plan, model)
+        # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
+        # uniqueness (the only nesting check that remains)
+        self._check_full_declaration(plan)
+        self._check_param_uniqueness(plan)
+
+        # Phase 5: _is_terminal marking (D-14: chain propagation removed)
+        plan = self._mark_terminal(plan, model)
 
         # Phase 6: special parameter handling
         plan.special_handlers = self._collect_special_handlers(param_roles)
@@ -863,18 +869,17 @@ class ShardingPlanner:
           and chain propagation mutates in_src in place, so the caller's
           held object must not be polluted.
 
-        Nesting is rejected up front (``_check_no_nested_overrides``):
-        boundaries assume a flat chain — chain propagation aligns each
-        boundary's in_src with the previous boundary's out_dst, which only
-        holds at module exits, and nested specs would also shard the same
-        parameter twice (production corrupts silently). An override FQN
-        must therefore not be an ancestor or descendant of any
-        planner-derived boundary, nor of another override; exact-FQN
-        replacement is the only supported same-tree form.
+        Nesting (ancestor/descendant FQNs) is **allowed** since D-14 (05
+        §13): the outer boundary may declare I/O contracts and params of its
+        own/intermediate modules, inner boundaries keep theirs. The only
+        remaining nesting check is the param-uniqueness invariant
+        (``_check_param_uniqueness``, fail-fast on double sharding); each
+        module's declaration is fully self-contained (chain fill removed),
+        and correctness is covered by validate-mode per-module propagation
+        assertions + dual-mode numerical equivalence.
         """
         if not self._plan_overrides:
             return
-        self._check_no_nested_overrides(plan)
         module_names = {name for name, _ in model.named_modules()}
         for fqn, user_spec in self._plan_overrides.items():
             if not isinstance(user_spec, ModuleShardingSpec):
@@ -907,130 +912,53 @@ class ShardingPlanner:
             logger.info("plan_overrides: %s the spec of module %s", action, fqn)
             plan.modules[fqn] = spec
 
-    def _check_no_nested_overrides(self, plan: ShardingPlan) -> None:
-        """Fail-fast on nested spec FQNs (override ↔ planner-derived,
-        override ↔ override); exact-FQN replacement is allowed."""
-        derived = sorted(plan.modules)
-        overrides = list(self._plan_overrides)
-        for i, fqn in enumerate(overrides):
-            for other in overrides[i + 1:]:
-                if fqn.startswith(other + ".") or other.startswith(fqn + "."):
+    def _check_param_uniqueness(self, plan: ShardingPlan) -> None:
+        """D-14 invariant 1 (05 §13.3): every parameter is sharded by exactly
+        one boundary. spec.params keys are resolved to full parameter FQNs
+        (relative to the boundary module); any parameter declared by ≥2 specs
+        fails fast (double sharding corrupts silently under production)."""
+        seen: Dict[str, str] = {}  # full param fqn -> first declaring boundary
+        for fqn, spec in plan.modules.items():
+            prefix = fqn + "." if fqn else ""
+            for pname in spec.params:
+                full = prefix + pname
+                if full in seen:
                     raise ValueError(
-                        f"plan_overrides FQNs {other!r} and {fqn!r} are "
-                        f"nested (ancestor/descendant): merge them into a "
-                        f"single spec at the outer module — nested specs "
-                        f"are not supported"
+                        f"param {full!r} is declared by two boundaries: "
+                        f"{seen[full]!r} and {fqn!r} — each parameter must be "
+                        f"sharded by exactly one boundary (D-14, 05 §13.3); "
+                        f"drop it from one of the specs (an outer boundary "
+                        f"may only declare params of its own/intermediate "
+                        f"modules, never of a nested boundary's subtree)"
                     )
-            for d in derived:
-                if d == fqn:
-                    continue  # replacement semantics
-                if d.startswith(fqn + "."):
-                    children = [x for x in derived if x.startswith(fqn + ".")]
-                    raise ValueError(
-                        f"plan_overrides FQN {fqn!r} is an ancestor of the "
-                        f"planner-derived boundaries {children}: subtree "
-                        f"takeover via a nested spec is not supported (the "
-                        f"children would be double-wrapped/double-sharded, "
-                        f"and their structural flags such as use_local_map/"
-                        f"needs_cp_attn cannot be lifted to the ancestor "
-                        f"safely). Override each derived boundary directly "
-                        f"instead"
-                    )
-                if fqn.startswith(d + "."):
-                    raise ValueError(
-                        f"plan_overrides FQN {fqn!r} nests inside the "
-                        f"planner-derived boundary {d!r}: nested specs are "
-                        f"not supported (the parameter would be sharded "
-                        f"twice, and the inner boundary's in_src would be "
-                        f"filled from {d!r}.out_dst while at runtime it "
-                        f"sees {d!r}.in_dst). Override {d!r} directly — "
-                        f"replacement semantics, with param names relative "
-                        f"to it"
-                    )
+                seen[full] = fqn
+
+    def _check_full_declaration(self, plan: ShardingPlan) -> None:
+        """D-14 (05 §13.2): chain fill is removed — every boundary spec must
+        fully declare its I/O contract. A non-empty in_dst with an empty
+        in_src fails fast (the previous Scenario-1 fill no longer exists)."""
+        for fqn, spec in plan.modules.items():
+            if spec.is_boundary and spec.in_dst and not spec.in_src:
+                raise ValueError(
+                    f"boundary {fqn!r} declares in_dst but an empty in_src — "
+                    f"chain fill was removed (D-14, 05 §13.2); declare in_src "
+                    f"explicitly (keys must mirror in_dst)"
+                )
 
     # ── Phase 5 ─────────────────────────────────────────────────────────
 
-    def _chain_propagate_and_validate(self, plan: ShardingPlan, model) -> ShardingPlan:
-        """Chain propagation: fill default in_src + warn on contract
-        mismatch between adjacent modules + _is_terminal marking.
-
-        Matching rules (a revision to 05 §3.6.5 — the template in_src key
-        and the upstream out_dst key may have different names, e.g.
-        attention out "output" vs moe_mlp in "x_BLD"):
-        - when both sides have exactly 1 entry, pair as "the unique arg"
-          (name-agnostic);
-        - otherwise pair by key name;
-        - when next.in_src is entirely empty, fill the key declared by its
-          in_dst with the upstream's unique out_dst value.
-
-        A declared in_src differing from the upstream out_dst only logs a
-        warning (never raises): the comparison is a placement-tuple value
-        check with no shape awareness, so legitimate edges where the tensor
-        is reshaped/transposed between modules (e.g. [B,S,H] Shard(1) folded
-        to [B*S,H] Shard(0)) would otherwise be false positives. Correctness
-        of the declaration is covered by validate mode (DTensor dispatch +
-        numerical equivalence)."""
+    def _mark_terminal(self, plan: ShardingPlan, model) -> ShardingPlan:
+        """D-14 (05 §13.2): compile-time chain propagation/validation is
+        removed; only ``_is_terminal`` marking is kept — the last boundary
+        in forward order (each module vouches for its own propagation in
+        validate mode; adjacent-contract checks no longer exist)."""
         sorted_fqns = self._topological_sort_by_forward_order(
             list(plan.modules.keys()), model
         )
-
-        non_terminal: set = set()
-        for i in range(len(sorted_fqns) - 1):
-            curr_fqn, next_fqn = sorted_fqns[i], sorted_fqns[i + 1]
-            curr_spec = plan.modules[curr_fqn]
-            next_spec = plan.modules[next_fqn]
-            if curr_spec.out_dst is None:
-                continue
-
-            pairs = self._pair_contracts(curr_spec.out_dst, next_spec)
-            for out_key, in_key in pairs:
-                out_placement = curr_spec.out_dst[out_key]
-                if in_key is None:
-                    continue
-                non_terminal.add(curr_fqn)  # out_dst is referenced downstream
-                declared = next_spec.in_src.get(in_key)
-                if not declared:
-                    # Scenario 1: fill the default
-                    next_spec.in_src[in_key] = out_placement
-                    continue
-                # Scenario 3: mismatch — warn only (may be a legitimate
-                # reshape/transpose at the edge; validate mode covers
-                # correctness)
-                next_in = tuple(resolve_placements(declared, plan.mesh_dim_names))
-                curr_out = tuple(resolve_placements(out_placement, plan.mesh_dim_names))
-                if next_in != curr_out:
-                    logger.warning(
-                        "chain contract mismatch: %s.out_dst[%s] = %s vs "
-                        "%s.in_src[%s] = %s — the plan is kept (legitimate "
-                        "when the tensor is reshaped/transposed between the "
-                        "two modules); verify with validate mode if this is "
-                        "not intentional",
-                        curr_fqn, out_key, curr_out,
-                        next_fqn, in_key, next_in,
-                    )
-
-        # _is_terminal marking: an out_dst not referenced by any downstream
-        # in_src → terminal (judged by chain adjacency — no cross-module
-        # placement value-equality matching, to avoid lm_head's Replicate
-        # out_dst being falsely referenced by embed's Replicate in_src.)
+        terminal = sorted_fqns[-1] if sorted_fqns else None
         for fqn, spec in plan.modules.items():
-            spec._is_terminal = fqn not in non_terminal
+            spec._is_terminal = fqn == terminal
         return plan
-
-    @staticmethod
-    def _pair_contracts(out_dst: Dict[str, NamedPlacement],
-                        next_spec: ModuleShardingSpec):
-        """Produce (out_key, in_key|None) pairs: name-agnostic pairing when
-        both sides have a single entry, otherwise pair by name."""
-        in_keys = list(next_spec.in_src.keys()) or list(next_spec.in_dst.keys())
-        if len(out_dst) == 1 and len(in_keys) <= 1:
-            out_key = next(iter(out_dst))
-            in_key = in_keys[0] if in_keys else None
-            return [(out_key, in_key)]
-        pairs = []
-        for out_key in out_dst:
-            pairs.append((out_key, out_key if out_key in next_spec.in_src else None))
-        return pairs
 
     def _topological_sort_by_forward_order(self, fqns: List[str], model) -> List[str]:
         """Sort by named_modules registration order; unmatched FQNs are

@@ -20,7 +20,6 @@ Following design doc 01_hf_compatibility_layer.md §6.7.
 import logging
 from typing import Any, Optional
 
-import torch
 import torch.nn as nn
 
 from hyper_models._transformers import HyperAutoModelForCausalLM
@@ -42,12 +41,14 @@ def build_model(
     ① Call HyperAutoModelForCausalLM.from_pretrained() (HF-compatible entry)
     ② Export OptimizerInit from distributed_setup / ShardingPlan
 
-    Two model paths unified:
-    - Path A (HyperAutoModel): from_pretrained internally handles meta→shard→load
-    - Path B (HF native): _target_ is not HyperAutoModel — build separately
+    HyperAutoModelForCausalLM is the unified model loading path: it handles
+    both single-card and distributed setups, and applies ShardingPlanner /
+    FSDP2 / PEFT internally when a non-trivial DistributedSetup is provided.
+    The legacy "plain HF AutoModel" fallback has been removed because
+    HyperAutoModel already provides an equivalent single-card path.
 
     Args:
-        model_cfg: ModelConfig or ConfigNode (with _target_, name, weights_path etc.)
+        model_cfg: ModelConfig or ConfigNode (with weights_path etc.)
         peft_config: PEFT configuration (optional).
         distributed_setup: Distributed topology and strategy.
         **kwargs: Extra args for model construction.
@@ -55,52 +56,16 @@ def build_model(
     Returns:
         (model, optimizer_init) tuple.
     """
-    # Determine if this is a HyperAutoModel target
-    is_hyper_auto = False
-    target = getattr(model_cfg, "_target_", None) or getattr(model_cfg, "target", None)
-    if target is not None:
-        is_hyper_auto = target in (
-            HyperAutoModelForCausalLM.from_pretrained,
-            HyperAutoModelForCausalLM.from_config,
-        )
+    pretrained_path = getattr(model_cfg, "weights_path", None) or getattr(
+        model_cfg, "pretrained_model_name_or_path", None
+    )
 
-    if is_hyper_auto or distributed_setup is not None:
-        # Path A: HyperAutoModel path — from_pretrained handles infrastructure
-        pretrained_path = getattr(model_cfg, "weights_path", None) or getattr(model_cfg, "pretrained_model_name_or_path", None)
-        model = HyperAutoModelForCausalLM.from_pretrained(
-            pretrained_path,
-            distributed_setup=distributed_setup,
-            peft_config=peft_config,
-            **kwargs,
-        )
-    else:
-        # Path B: Non-HyperAutoModel path (e.g. transformers AutoModel)
-        # Build model first, then apply infrastructure separately
-        from transformers import AutoModelForCausalLM as HFAutoModel
-
-        pretrained_path = getattr(model_cfg, "weights_path", None) or getattr(model_cfg, "pretrained_model_name_or_path", None)
-        model = HFAutoModel.from_pretrained(pretrained_path, **kwargs)
-
-        if distributed_setup is not None:
-            from hyper_models._transformers.infrastructure import (
-                apply_model_infrastructure,
-                instantiate_infrastructure,
-            )
-            sharding_planner, fsdp2_manager, autopipeline = instantiate_infrastructure(
-                distributed_setup=distributed_setup,
-                device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
-            )
-            model = apply_model_infrastructure(
-                model,
-                mesh=distributed_setup.mesh_context,
-                sharding_planner=sharding_planner,
-                fsdp2_manager=fsdp2_manager,
-                autopipeline=autopipeline,
-                peft_config=peft_config,
-                is_meta_device=False,
-                device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
-                load_base_model=False,
-            )
+    model = HyperAutoModelForCausalLM.from_pretrained(
+        pretrained_path,
+        distributed_setup=distributed_setup,
+        peft_config=peft_config,
+        **kwargs,
+    )
 
     # Export OptimizerInit
     optimizer_init = OptimizerInit.from_distributed_setup(

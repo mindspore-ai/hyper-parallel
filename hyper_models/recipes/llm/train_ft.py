@@ -109,33 +109,8 @@ class FinetuneRecipe(BaseRecipe):
         # ④ 分布式策略
         self.distributed_setup = create_distributed_setup_from_config(cfg)
         self.mesh = self.distributed_setup.mesh_context
-        # DP+CP 联合子 mesh：用于 DP/CP 维度的联合 all-reduce（统计全局
-        # label token、val loss 聚合等）。取二维子 mesh ("dp_shard_cp","cp")，
-        # 确保 CP 维纳入 all-reduce；无 "cp" 轴（cp_size==1）时退化为纯 DP mesh。
-        mesh = self.mesh.device_mesh
-        if mesh is None:
-            # 单 rank / stub 兜底：无 DeviceMesh，all-reduce 退化为全局或 no-op
-            self.dp_cp_mesh = None
-        else:
-            dim_names = mesh.mesh_dim_names
-            # FSDP2 mesh（"dp_shard_cp" + "cp" 轴）：取二维子 mesh 纳入 CP 维
-            if "cp" in dim_names and "dp_shard_cp" in dim_names:
-                self.dp_cp_mesh = mesh[("dp_shard_cp", "cp")]
-            elif "dp_shard_cp" in dim_names:
-                self.dp_cp_mesh = mesh["dp_shard_cp"]            # cp_size==1
-            elif "dp" in dim_names:
-                # DDP / Megatron mesh（轴如 ("dp",) 或 ("dp","pp","tp","cp")）
-                self.dp_cp_mesh = mesh[("dp", "cp")] if "cp" in dim_names else mesh["dp"]
-            elif "dp_replicate" in dim_names:
-                self.dp_cp_mesh = (
-                    mesh[("dp_replicate", "cp")] if "cp" in dim_names else mesh["dp_replicate"]
-                )
-            else:
-                # 单 rank 兜底
-                self.dp_cp_mesh = mesh
-            # 多维子 mesh 预展平为 1D：_dp_cp_all_reduce_sum 需要 1D group
-            if self.dp_cp_mesh.ndim > 1:
-                self.dp_cp_mesh = self.dp_cp_mesh._flatten("dp_cp")
+        # DP+CP 联合子 mesh：MeshContext 已根据 device_mesh 推导好，直接复用。
+        self.dp_cp_mesh = self.mesh.dp_cp_mesh
 
         # ⑤ MagiAttention（可选）
         self.magi = setup_magi(cfg, self.mesh.device_mesh) if getattr(cfg, "magi", None) else None
