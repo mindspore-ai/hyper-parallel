@@ -39,6 +39,9 @@ from hyper_parallel import (
     fully_shard,
     parallelize_module,
 )
+from hyper_parallel.core.context_parallel.linear_attention_context_parallel import (
+    LinearAttentionContextParallel,
+)
 from hyper_parallel.core.pipeline_parallel import (
     BatchDimSpec, Schedule1F1B, ScheduleGPipe, ScheduleInterleaved1F1B)
 from hyper_parallel.core.pipeline_parallel.stage import SharedParameterInfo
@@ -473,62 +476,9 @@ def qwen3_5_tp_load_transforms(
     return transforms
 
 
-def _redistribute_first_tensor(
-    tensor: platform.Tensor,
-    mesh: DeviceMesh,
-    input_layout,
-    desired_layout,
-    *,
-    use_local_output: bool,
-):
-    """Redistribute one tensor at a Qwen3.5 model-parallel hook boundary."""
-    if isinstance(tensor, DTensor):
-        dtensor = tensor
-    else:
-        dtensor = DTensor.from_local(tensor, mesh, [input_layout])
-    if tuple(dtensor.placements) != (desired_layout,):
-        dtensor = dtensor.redistribute(mesh, [desired_layout])
-    return dtensor.to_local() if use_local_output else dtensor
-
-
-def _apply_linear_attention_cp(module: nn.Module, cp_mesh: DeviceMesh) -> None:
-    """Gather full sequence for Qwen3.5 linear attention and slice before ``out_proj``."""
-
-    def _pre_hook(hook_module, args, kwargs):
-        del hook_module
-        if args:
-            hidden_states = args[0]
-            rest = args[1:]
-        else:
-            hidden_states = kwargs.get("hidden_states")
-            rest = None
-        if hidden_states is None:
-            raise ValueError("linear attention CP hook expects hidden_states")
-        hidden_states = _redistribute_first_tensor(
-            hidden_states,
-            cp_mesh,
-            Shard(1),
-            Replicate(),
-            use_local_output=True,
-        )
-        if rest is None:
-            kwargs = dict(kwargs)
-            kwargs["hidden_states"] = hidden_states
-            return args, kwargs
-        return (hidden_states, *rest), kwargs
-
-    def _post_hook(hook_module, hook_args, output):
-        del hook_module, hook_args
-        return _redistribute_first_tensor(
-            output,
-            cp_mesh,
-            Replicate(),
-            Shard(1),
-            use_local_output=True,
-        )
-
-    module.register_forward_pre_hook(_pre_hook, with_kwargs=True)
-    module.out_proj_input.register_forward_hook(_post_hook)
+def _apply_linear_attention_cp(module: nn.Module, cp_mesh: DeviceMesh, mode: str) -> None:
+    """Apply CP to a Qwen3.5 linear-attention module."""
+    LinearAttentionContextParallel(mode=mode).apply(module, cp_mesh)
 
 
 def _validate_qwen3_5_tp_config(model: Qwen3_5ForCausalLM, tp_world: int) -> None:
@@ -729,6 +679,7 @@ def parallelize_qwen3_5_cp(
     cp_mesh: DeviceMesh,
     *,
     ulysses_degree: Optional[int] = None,
+    linear_attention_cp_mode: str = "ulysses",
 ) -> Qwen3_5ForCausalLM:
     """Apply context parallelism across the Qwen3.5 hybrid decoder.
 
@@ -746,11 +697,11 @@ def parallelize_qwen3_5_cp(
     rank ends up with the full sequence on a head-shard and a square causal
     mask is correct again.
 
-    Linear-attention (:class:`Qwen3_5GatedDeltaNet`) layers cannot use the
-    Ulysses head all-to-all (their per-head conv / SSM weights are head-fixed),
-    so the model-level plan gathers the full sequence at the module boundary
-    and slices the output back to the per-rank shard before any outer output
-    layout hooks run.
+    Linear-attention (:class:`Qwen3_5GatedDeltaNet`) layers use a matching
+    pure-Ulysses execution wrapper: project local sequence shards, all-to-all
+    the projected Q/K/V/B/A tensors to full-sequence local-head shards, run
+    the per-head conv and gated delta rule on local heads, then all-to-all the
+    result back to sequence shards before the output projection.
     """
     # Only pure Ulysses is wired here; a smaller ``ulysses_degree`` makes each
     # rank attend over gathered K/V with ``is_causal=True`` but without a
@@ -773,12 +724,12 @@ def parallelize_qwen3_5_cp(
             cp_plan.apply(block.self_attn.sdpa_core, cp_mesh)
             full_attached += 1
         else:
-            _apply_linear_attention_cp(block.linear_attn, cp_mesh)
+            _apply_linear_attention_cp(block.linear_attn, cp_mesh, linear_attention_cp_mode)
             linear_attached += 1
     logger.info_rank0(
         "CP applied to Qwen3.5: cp_size=%d, ulysses_degree=%s, full-attn hooks=%d, "
-        "linear-attn gather/slice=%d",
-        cp_mesh.size(), ulysses_degree, full_attached, linear_attached,
+        "linear-attn %s hooks=%d",
+        cp_mesh.size(), ulysses_degree, full_attached, linear_attention_cp_mode, linear_attached,
     )
     return model
 
@@ -786,11 +737,13 @@ def parallelize_qwen3_5_cp(
 def _needs_gqa_kv_expand_for_cp(model: Qwen3_5ForCausalLM, cp_mesh: DeviceMesh) -> bool:
     """Return whether GQA K/V heads must be expanded before Ulysses CP."""
     tp_size = int(getattr(model, "hp_loss_tp_scale_size", 1) or 1)
-    if tp_size <= 1:
-        return False
+    q_heads = int(model.config.num_attention_heads or 1)
     kv_heads = int(model.config.num_key_value_heads or 1)
     local_kv_heads = max(kv_heads // tp_size, 1)
-    return local_kv_heads % cp_mesh.size() != 0
+    if local_kv_heads % cp_mesh.size() == 0:
+        return False
+    local_q_heads = max(q_heads // tp_size, 1)
+    return local_q_heads % cp_mesh.size() == 0 and local_q_heads % local_kv_heads == 0
 
 
 def _resolve_fsdp_mesh(mesh):
@@ -1318,6 +1271,11 @@ def parallelize_qwen3_5(
         )
 
     cp_size = int(cfg.train.accelerator.cp)
+    if tp_size > 1 and cp_size > 1 and _has_linear_attention_layers(model):
+        raise NotImplementedError(
+            "Qwen3.5 TP+CP for linear-attention layers is not supported in the "
+            "initial linear-attention CP path. Set parallel.tp=1 when parallel.cp>1."
+        )
     if cp_size > 1:
         try:
             cp_mesh = mesh["cp"]
@@ -1329,7 +1287,17 @@ def parallelize_qwen3_5(
         # ``None`` (the default) resolves to pure Ulysses (degree == cp_size)
         # inside ``parallelize_qwen3_5_cp``; only coerce when explicitly set.
         ulysses_degree = int(ulysses_degree) if ulysses_degree is not None else None
-        parallelize_qwen3_5_cp(model, cp_mesh, ulysses_degree=ulysses_degree)
+        linear_attention_cp_mode = getattr(
+            cfg.train.accelerator,
+            "linear_attention_cp_mode",
+            "ulysses",
+        )
+        parallelize_qwen3_5_cp(
+            model,
+            cp_mesh,
+            ulysses_degree=ulysses_degree,
+            linear_attention_cp_mode=linear_attention_cp_mode,
+        )
 
     if cfg.train.accelerator.ep > 1:
         raise NotImplementedError("Qwen3.5 dense has no experts; set parallel.ep=1.")
