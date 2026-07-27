@@ -143,8 +143,11 @@ class _AsyncSequenceReplicateSlot:
                 local, work, out_perm = item
             if work is None:
                 return self._wrap_gathered(local, item)
+            graph_local = self._local_tensor(value)
+            if not platform.is_tensor(graph_local):
+                graph_local = local
             gathered = platform.differentiable_async_allgather_wait(
-                local,
+                graph_local,
                 work,
                 out_perm,
                 self.group,
