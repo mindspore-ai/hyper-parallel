@@ -1459,6 +1459,11 @@ class TorchPlatform(Platform):
         device = self.get_device_handle()
         return device.current_stream()
 
+    @staticmethod
+    def move_to_device(tensor, device, non_blocking=False):
+        """Move a tensor to the target device."""
+        return tensor.to(device=device, non_blocking=non_blocking)
+
     def new_event(self):
         device = self.get_device_handle()
         return device.Event()

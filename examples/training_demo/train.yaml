@@ -9,21 +9,34 @@
 
 model:
   _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ./outputs/training_demo/qwen3_30b_a3b
+  # pretrained_model_name_or_path: ./outputs/training_demo/qwen3_30b_a3b
+  pretrained_model_name_or_path: /home/ma-user/work/l00575993/models/tiny-random-LlamaForCausalLMB # Qwen/Qwen3-0.6B
+  ignore_mismatched_sizes: true
   torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
 
-tokenizer:
-  _target_: transformers.AutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: ./outputs/training_demo/qwen3_30b_a3b
-  use_fast: true
+# tokenizer:
+#   _target_: transformers.AutoTokenizer.from_pretrained
+#   pretrained_model_name_or_path: ./outputs/training_demo/qwen3_30b_a3b
+#   use_fast: true
 
 training:
-  max_steps: 100
+  train_iters: 10
+  eval_iters: 1
+
+  train_samples: null
   num_train_epochs: 1
+  # global_batch_size: 16
+  # micro_batch_size: 1
+  consumed_train_samples: 0
+  consumed_valid_samples: 0
+
+  # max_steps: 100
+  # num_train_epochs: 1
   global_batch_size: 8
   micro_batch_size: 1
+
   backend: hccl
   init_device: meta
   loss_aggregation: token_weighted
@@ -40,7 +53,7 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
-  dp_shard_size: 8
+  dp_shard_size: 4
   replicate_params: []
   reshard_after_forward: true
   defer_fsdp_grad_sync: true
@@ -88,26 +101,109 @@ mixed_precision:
 gradient_checkpointing:
   activation_checkpoint: off
 
+model_assets:
+  # _target_: hyper_models.trainer.text_trainer._build_model_assets
+  datasets_type: pretokenized
+  chat_template: null #chatml
+  tokenizer:
+    _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /home/ma-user/work/bucket-910c-6055/Pangu_CI/Train_CI_Data/pangu_ap/pretrain_ap_pangu_30BV2_ci/tokenizer/tokenizer/Zhizi_del_redundancy_153k/
+    local_files_only: true
+    trust_remote_code: true
+
 data_transform:
-  _target_: examples.training_demo.data.PlainTextDataTransform
-  text_column: text
-  seq_len: 1024
-  append_eos: true
+  _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+  data_type: 'pretokenized'
+  text_keys: 'text'
+  max_seq_len: 2048
+
+# data:
+#   train_path: tulu-3-sft-mixture
+#   data_type: conversation
+#   chat_template: chatml
+#   max_seq_len: 2048
+#   train_size: 750000
+#   text_keys: messages
+#   dyn_bsz_buffer_size: 200
+
 
 dataset:
-  _target_: examples.training_demo.data.load_tokenized_text_dataset
-  path: Salesforce/wikitext
-  name: wikitext-2-raw-v1
-  split: train
+  _target_: hyper_models.components.datasets.llm.build_llm_dataset
+  data_path: '/home/ma-user/work/bucket-910c-6055/hwy/data/moe74b/ADN_74B_stage1_10Ttokens_4Kcontext_part1_2168B_20250821/'
+  data_config:
+    source_type: offline
+
+    build_on_rank: null
+
+    seed: 1234
+    seq_length: 2048
+    split: '100, 0, 0'
+
+    # blend_per_split
+    train_data_path: null
+    valid_data_path: null
+    test_data_path: null
+    data_cache_path: null
+
+    distributed_walk: true
+    mock_data: false
+    mmap_bin_files: true
+    reuse_idx: false
+    data_lazy_load: true
+
+    tokenizer: null
+    reset_position_ids: false
+    reset_attention_mask: false
+    eod_mask_loss: false
+    create_attention_mask_in_dataloader: true
+
+    dataset_margin: 1.005
+    skip_data_check: false
+
+    is_dataset_from_mr: false
+    simple_blend: 'no'
 
 collate_fn:
-  _target_: hyper_models.components.data.data_collator.MakeMicroBatchCollator
+  _target_: hyper_models.components.datasets.llm.build_llm_collator
+  # PanGu indexed samples are already fixed-length model samples.
+  packing: false
 
 dataloader:
-  _target_: hyper_models.components.data.dataloader.DataLoader
-  shuffle: true
+  _target_: hyper_models.components.datasets.DataLoader
+  # single: sequential/rearranged; cyclic: deterministic shuffled epochs;
+  # external: the dataset target itself must return a complete dataloader.
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
   drop_last: true
   use_background_prefetcher: false
+  num_workers: 0
+  dataloader_pin_memory: false
+  prefetch_factor: null
+
+get_batch:
+  _target_: hyper_models.components.datasets.llm.build_llm_get_batch
+
+# data_transform:
+#   _target_: examples.training_demo.data.PlainTextDataTransform
+#   text_column: text
+#   seq_len: 1024
+#   append_eos: true
+
+# dataset:
+#   _target_: examples.training_demo.data.load_tokenized_text_dataset
+#   path: Salesforce/wikitext
+#   name: wikitext-2-raw-v1
+#   split: train
+
+# collate_fn:
+#   _target_: hyper_models.components.data.data_collator.MakeMicroBatchCollator
+
+# dataloader:
+#   _target_: hyper_models.components.data.dataloader.DataLoader
+#   shuffle: true
+#   drop_last: true
+#   use_background_prefetcher: false
 
 optimizer:
   _target_: hyper_models.components.optim.optimizer.Muon
