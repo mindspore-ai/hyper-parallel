@@ -511,7 +511,6 @@ def test_dcp_save_and_load_hsdp_ep_moe():
     num_experts = 8
     dim = 16
     hidden_dim = 32
-    _expert_global_shape = (num_experts, hidden_dim, dim)
 
     # ========== SAVE PHASE: HSDP(rep=2, shard=2) × EP=2 ==========
     save_mesh = init_device_mesh(

@@ -717,7 +717,6 @@ def test_dcp_save_and_load_with_static_dp_tp_pp() -> None:
 
     dp_tp_placements = [Replicate(), Shard(1)]
     param_local_shape = (8, 4)
-    _global_shape = (8, 8)
 
     local_tensor = to_device(
         torch.randn(*param_local_shape) + pp_rank * 100.0 + (rank % tp_size) * 10.0,
