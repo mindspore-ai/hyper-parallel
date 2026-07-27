@@ -624,9 +624,9 @@ def test_dcp_incremental_save_and_load() -> None:
     assert io_payload["step"] == 5
 
     # Step 5: verify metadata version
+    # pylint: disable=import-outside-toplevel
     from hyper_parallel.core.distributed_checkpoint.filesystem_storage import FileSystemReader
     from hyper_parallel.core.distributed_checkpoint.versioning import CURRENT_CHECKPOINT_VERSION
-    # pylint: disable=import-outside-toplevel
 
     reader = FileSystemReader(incremental_ckpt)
     md = reader.load_metadata()

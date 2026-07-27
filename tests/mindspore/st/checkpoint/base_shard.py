@@ -511,7 +511,7 @@ def test_dcp_save_and_load_hsdp_ep_moe():
     num_experts = 8
     dim = 16
     hidden_dim = 32
-    expert_global_shape = (num_experts, hidden_dim, dim)
+    _expert_global_shape = (num_experts, hidden_dim, dim)
 
     # ========== SAVE PHASE: HSDP(rep=2, shard=2) × EP=2 ==========
     save_mesh = init_device_mesh(
@@ -818,35 +818,33 @@ def test_dcp_incremental_save_and_load():
         new_dense_val.asnumpy(),
         rtol=1e-5,
         atol=1e-5,
-    ), "Rank {}: dense tensor mismatch after incremental load".format(rank)
+    ), f"Rank {rank}: dense tensor mismatch after incremental load"
 
     assert np.allclose(
         load_state_dict["dt_sharded"].to_local().asnumpy(),
         new_dt_sharded.to_local().asnumpy(),
         rtol=1e-5,
         atol=1e-5,
-    ), "Rank {}: dt_sharded mismatch after incremental load".format(rank)
+    ), f"Rank {rank}: dt_sharded mismatch after incremental load"
 
     assert np.allclose(
         load_state_dict["dt_replicated"].to_local().asnumpy(),
         new_dt_replicated.to_local().asnumpy(),
         rtol=1e-5,
         atol=1e-5,
-    ), "Rank {}: dt_replicated mismatch after incremental load".format(rank)
+    ), f"Rank {rank}: dt_replicated mismatch after incremental load"
 
     loaded_io = load_state_dict["io_payload"]
     assert isinstance(loaded_io, dict)
     assert loaded_io["step"] == 5, (
-        "Rank {}: io_payload step should be 5, got {}".format(rank, loaded_io["step"])
+        f"Rank {rank}: io_payload step should be 5, got {loaded_io['step']}"
     )
 
     # Step 5: verify metadata version
     reader = FileSystemReader(str(incremental_ckpt))
     md = reader.load_metadata()
     assert md.version == CURRENT_CHECKPOINT_VERSION, (
-        "Rank {}: metadata version should be {}, got {}".format(
-            rank, CURRENT_CHECKPOINT_VERSION, md.version,
-        )
+        f"Rank {rank}: metadata version should be {CURRENT_CHECKPOINT_VERSION}, got {md.version}"
     )
 
     platform_obj.barrier()

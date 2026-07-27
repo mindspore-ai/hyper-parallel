@@ -78,6 +78,84 @@ def _gather_from_all_ranks(
     return [local_object]
 
 
+def _validate_incremental_params(
+    incremental_from: Optional[Union[Path, str]],
+    changed_fqns: Optional[Collection[str]],
+    storage_writer: Optional[StorageWriter],
+) -> None:
+    """Validate incremental save parameters.
+
+    Args:
+        incremental_from: Baseline checkpoint directory for incremental save.
+        changed_fqns: Set of FQNs that have changed relative to the baseline.
+        storage_writer: Custom storage writer, if any.
+
+    Raises:
+        ValueError: If incremental parameters are partially provided, if a
+            custom *storage_writer* is used with incremental save, or if
+            *changed_fqns* contains invalid entries.
+    """
+    if (incremental_from is None) != (changed_fqns is None):
+        raise ValueError(
+            "incremental_from and changed_fqns must be provided together or both omitted."
+        )
+    if incremental_from is not None and storage_writer is not None:
+        raise ValueError(
+            "Incremental save is only supported with the default FileSystemWriter; "
+            "passing a custom storage_writer is not allowed."
+        )
+    if changed_fqns is not None:
+        for fqn in changed_fqns:
+            if not isinstance(fqn, str) or not fqn:
+                raise ValueError(
+                    f"Each item in changed_fqns must be a non-empty string, got {fqn!r}."
+                )
+
+
+def _build_save_plan(
+    planner: SavePlanner,
+    storage_writer: StorageWriter,
+    world_size: int,
+    use_collectives: bool,
+) -> tuple[Any, Metadata]:
+    """Build and finalize the save plan, returning (final_plan, metadata).
+
+    Uses the planner cache when available; otherwise builds from scratch.
+
+    Args:
+        planner: Configured save planner.
+        storage_writer: Configured storage writer.
+        world_size: Total number of ranks.
+        use_collectives: Whether to use collective communication.
+
+    Returns:
+        A pair ``(final_plan, metadata)``.
+    """
+    cached_res = planner.get_cached() if hasattr(planner, 'get_cached') else None
+    if cached_res:
+        return cached_res.final_plan, cached_res.metadata
+
+    local_plan = planner.build_local_plan()
+    local_plan = storage_writer.optimize_local_plan(local_plan)
+
+    all_local_plans = _gather_from_all_ranks(local_plan, world_size, use_collectives)
+    global_plans, metadata = planner.build_global_plan(all_local_plans)
+    global_plans = storage_writer.optimize_global_plan(global_plans)
+
+    rank = platform.get_rank()
+    if use_collectives and world_size > 1 and global_plans:
+        central_plan = global_plans[rank]
+    elif global_plans:
+        central_plan = global_plans[0]
+    else:
+        central_plan = local_plan
+
+    final_plan = planner.finalize_plan(central_plan)
+    if hasattr(planner, 'cache_result'):
+        planner.cache_result(final_plan, metadata)
+    return final_plan, metadata
+
+
 def _save_impl(
     state_dict: dict[str, Any],
     *,
@@ -112,28 +190,11 @@ def _save_impl(
             custom *storage_writer* is used with incremental save, or if
             *changed_fqns* contains invalid entries.
     """
-    if (incremental_from is None) != (changed_fqns is None):
-        raise ValueError(
-            "incremental_from and changed_fqns must be provided together or both omitted."
-        )
-    if incremental_from is not None and storage_writer is not None:
-        raise ValueError(
-            "Incremental save is only supported with the default FileSystemWriter; "
-            "passing a custom storage_writer is not allowed."
-        )
-    if changed_fqns is not None:
-        for fqn in changed_fqns:
-            if not isinstance(fqn, str) or not fqn:
-                raise ValueError(
-                    f"Each item in changed_fqns must be a non-empty string, got {fqn!r}."
-                )
-    # Convert checkpoint_id to Path if it's a string
-    checkpoint_id = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
+    _validate_incremental_params(incremental_from, changed_fqns, storage_writer)
 
-    # Determine if we're in distributed mode
+    checkpoint_id = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
     use_collectives = False if no_dist else use_collectives
 
-    # Set up storage writer
     if storage_writer is None:
         if checkpoint_id is None:
             raise ValueError("Either storage_writer or checkpoint_id must be provided")
@@ -146,16 +207,13 @@ def _save_impl(
         if checkpoint_id:
             storage_writer.initialize_writer(checkpoint_id)
 
-    # Set up planner
     planner = StandardSavePlanner() if planner is None else planner
 
-    # Get rank and coordinator info
     rank = platform.get_rank()
     world_size = platform.get_world_size()
     is_coordinator = rank == 0
-
-    # Configure planner
     is_incremental = incremental_from is not None
+
     planner.configure_planner(
         state_dict=state_dict,
         is_coordinator=is_coordinator,
@@ -163,47 +221,15 @@ def _save_impl(
         use_collectives=use_collectives,
         incremental=is_incremental,
     )
-
-    # Configure storage writer (use_collectives for rank-local metadata when False)
     storage_writer.configure_writer(
         is_coordinator=is_coordinator,
         rank=rank,
-        use_collectives=use_collectives
+        use_collectives=use_collectives,
     )
 
-    cached_res = planner.get_cached() if hasattr(planner, 'get_cached') else None
-    if cached_res:
-        # Get final plan and metadata from cache
-        final_plan, metadata = cached_res.final_plan, cached_res.metadata
+    final_plan, metadata = _build_save_plan(planner, storage_writer, world_size, use_collectives)
 
-    else:
-        # Build local plan
-        local_plan = planner.build_local_plan()
-        local_plan = storage_writer.optimize_local_plan(local_plan)
-
-        # Gather all local plans and build global plan
-        all_local_plans = _gather_from_all_ranks(local_plan, world_size, use_collectives)
-        global_plans, metadata = planner.build_global_plan(all_local_plans)
-        global_plans = storage_writer.optimize_global_plan(global_plans)
-
-        # Select central plan for current rank
-        if use_collectives and world_size > 1 and global_plans:
-            central_plan = global_plans[rank]
-        elif global_plans:
-            central_plan = global_plans[0]
-        else:
-            central_plan = local_plan
-
-        # Finalize and cache plan
-        final_plan = planner.finalize_plan(central_plan)
-        # Add final plan and metadata to the cache
-        if hasattr(planner, 'cache_result'):
-            planner.cache_result(final_plan, metadata)
-
-    # Write data
     write_results = storage_writer.execute_write(final_plan, planner)
-
-    # Finalize checkpoint
     all_write_results = _gather_from_all_ranks(write_results, world_size, use_collectives)
     storage_writer.finalize_checkpoint(metadata, all_write_results)
 
@@ -392,6 +418,41 @@ def async_save(
     return AsyncSaveResponse(persist_completion=persist_completion)
 
 
+def _build_load_plan(
+    planner: LoadPlanner,
+    storage_reader: StorageReader,
+    world_size: int,
+    use_collectives: bool,
+) -> Any:
+    """Build and finalize the load plan.
+
+    Args:
+        planner: Configured load planner.
+        storage_reader: Configured storage reader.
+        world_size: Total number of ranks.
+        use_collectives: Whether to use collective communication.
+
+    Returns:
+        The finalized load plan.
+    """
+    local_plan = planner.build_local_plan()
+    local_plan = storage_reader.optimize_local_plan(local_plan)
+
+    all_local_plans = _gather_from_all_ranks(local_plan, world_size, use_collectives)
+    global_plans = planner.build_global_plan(all_local_plans)
+    global_plans = storage_reader.optimize_global_plan(global_plans)
+
+    rank = platform.get_rank()
+    if use_collectives and world_size > 1 and global_plans:
+        central_plan = global_plans[rank]
+    elif global_plans:
+        central_plan = global_plans[0]
+    else:
+        central_plan = local_plan
+
+    return planner.finalize_plan(central_plan)
+
+
 def load(
         state_dict: dict[str, Any],
         *,
@@ -423,13 +484,9 @@ def load(
     Returns:
         None. The state_dict is modified in-place.
     """
-    # Convert checkpoint_id to Path if it's a string
     checkpoint_id = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
-
-    # Determine if we're in distributed mode
     use_collectives = False if no_dist else use_collectives
 
-    # Set up storage reader
     if storage_reader is None:
         if checkpoint_id is None:
             raise ValueError("Either storage_reader or checkpoint_id must be provided")
@@ -438,60 +495,27 @@ def load(
         if checkpoint_id:
             storage_reader.initialize_reader(checkpoint_id)
 
-    # Set up planner
     planner = StandardLoadPlanner() if planner is None else planner
-
-    # Get rank and coordinator info
     rank = platform.get_rank()
     world_size = platform.get_world_size()
     is_coordinator = rank == 0
 
-    # Load metadata
     try:
         metadata = storage_reader.load_metadata()
     except FileNotFoundError:
-        # Fallback to rank-local metadata (e.g. checkpoint saved with use_collectives=False)
         metadata = storage_reader.load_metadata(rank=rank)
         use_collectives = False
 
-    # Migrate metadata to the current format version
     metadata = migrate_metadata(metadata)
 
-    # Configure planner
     planner.configure_planner(
-        state_dict=state_dict,
-        metadata=metadata,
-        is_coordinator=is_coordinator,
-        rank=rank
+        state_dict=state_dict, metadata=metadata,
+        is_coordinator=is_coordinator, rank=rank,
     )
-
-    # Configure storage reader
     storage_reader.configure_reader(
-        metadata=metadata,
-        is_coordinator=is_coordinator,
-        rank=rank,
-        use_collectives=use_collectives
+        metadata=metadata, is_coordinator=is_coordinator,
+        rank=rank, use_collectives=use_collectives,
     )
 
-    # Build local plan
-    local_plan = planner.build_local_plan()
-    local_plan = storage_reader.optimize_local_plan(local_plan)
-
-    # Gather all local plans and build global plan
-    all_local_plans = _gather_from_all_ranks(local_plan, world_size, use_collectives)
-    global_plans = planner.build_global_plan(all_local_plans)
-    global_plans = storage_reader.optimize_global_plan(global_plans)
-
-    # Select central plan for current rank
-    if use_collectives and world_size > 1 and global_plans:
-        central_plan = global_plans[rank]
-    elif global_plans:
-        central_plan = global_plans[0]
-    else:
-        central_plan = local_plan
-
-    # Finalize plan
-    final_plan = planner.finalize_plan(central_plan)
-
-    # Execute read
+    final_plan = _build_load_plan(planner, storage_reader, world_size, use_collectives)
     storage_reader.execute_read(final_plan, planner)

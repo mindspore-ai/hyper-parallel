@@ -144,78 +144,114 @@ class TopologyMapper:
             return []
 
         read_items: list[ReadItem] = []
-
         for local_idx, local_chunk in enumerate(local_chunks):
-            local_area = chunk_to_area(local_chunk)
-            ndim = len(local_area)
-            covered_per_dim: list[list[tuple[int, int]]] = [[] for _ in range(ndim)]
-            has_any_overlap = False
-
-            for storage_idx, storage_chunk in enumerate(saved_chunks):
-                saved_area = chunk_to_area(storage_chunk)
-                overlap = infer_intersection(local_area, saved_area)
-                if overlap is None:
-                    continue
-
-                has_any_overlap = True
-                for dim in range(ndim):
-                    covered_per_dim[dim].append(overlap[dim])
-
-                dest_offsets = tuple(
-                    overlap[i][0] - local_chunk.offsets[i]
-                    for i in range(len(overlap))
-                )
-                storage_offsets = tuple(
-                    overlap[i][0] - storage_chunk.offsets[i]
-                    for i in range(len(overlap))
-                )
-                lengths = tuple(
-                    overlap[i][1] - overlap[i][0]
-                    for i in range(len(overlap))
-                )
-
-                read_items.append(
-                    ReadItem(
-                        type=LoadItemType.TENSOR,
-                        dest_index=MetadataIndex(
-                            fqn=target_fqn,
-                            offset=local_chunk.offsets,
-                            index=local_idx,
-                        ),
-                        dest_offsets=dest_offsets,
-                        storage_index=MetadataIndex(
-                            fqn=checkpoint_fqn,
-                            offset=storage_chunk.offsets,
-                            index=storage_idx,
-                        ),
-                        storage_offsets=storage_offsets,
-                        lengths=lengths,
-                    )
-                )
-
-            if not has_any_overlap:
-                raise ValueError(
-                    f"Target local chunk {local_idx} of {target_fqn!r} "
-                    f"(offsets={local_chunk.offsets}, sizes={local_chunk.sizes}) "
-                    f"has no intersection with any saved chunk"
-                )
-            uncovered_dims: list[int] = []
-            for dim in range(ndim):
-                merged = _merge_intervals(covered_per_dim[dim])
-                local_start, local_end = local_area[dim]
-                if not merged or merged[0][0] > local_start or merged[-1][1] < local_end:
-                    uncovered_dims.append(dim)
-                elif len(merged) != 1:
-                    uncovered_dims.append(dim)
-            if uncovered_dims:
-                raise ValueError(
-                    f"Target local chunk {local_idx} of {target_fqn!r} "
-                    f"(offsets={local_chunk.offsets}, sizes={local_chunk.sizes}) "
-                    f"is not fully covered by saved chunks; uncovered dimensions: "
-                    f"{uncovered_dims}"
-                )
-
+            items, covered = _compute_local_chunk_reads(
+                target_fqn, checkpoint_fqn, local_idx, local_chunk, saved_chunks,
+            )
+            _validate_full_coverage(local_idx, target_fqn, local_chunk, covered)
+            read_items.extend(items)
         return read_items
+
+
+def _compute_local_chunk_reads(
+    target_fqn: str,
+    checkpoint_fqn: str,
+    local_idx: int,
+    local_chunk: ChunkStorageMetadata,
+    saved_chunks: list[ChunkStorageMetadata],
+) -> tuple[list[ReadItem], list[list[tuple[int, int]]]]:
+    """Build ReadItems and per-dimension coverage for one local chunk.
+
+    Args:
+        target_fqn: FQN on the load side.
+        checkpoint_fqn: FQN in the checkpoint.
+        local_idx: Index of the local chunk.
+        local_chunk: The target local chunk.
+        saved_chunks: All saved chunks from checkpoint metadata.
+
+    Returns:
+        A pair ``(read_items, covered_per_dim)`` where *covered_per_dim[dim]*
+        is the list of overlapping intervals contributed by each saved chunk.
+    """
+    local_area = chunk_to_area(local_chunk)
+    ndim = len(local_area)
+    covered_per_dim: list[list[tuple[int, int]]] = [[] for _ in range(ndim)]
+    has_any_overlap = False
+    read_items: list[ReadItem] = []
+
+    for storage_idx, storage_chunk in enumerate(saved_chunks):
+        saved_area = chunk_to_area(storage_chunk)
+        overlap = infer_intersection(local_area, saved_area)
+        if overlap is None:
+            continue
+        has_any_overlap = True
+        for dim in range(ndim):
+            covered_per_dim[dim].append(overlap[dim])
+
+        dest_offsets = tuple(
+            overlap[i][0] - local_chunk.offsets[i] for i in range(len(overlap))
+        )
+        storage_offsets = tuple(
+            overlap[i][0] - storage_chunk.offsets[i] for i in range(len(overlap))
+        )
+        lengths = tuple(
+            overlap[i][1] - overlap[i][0] for i in range(len(overlap))
+        )
+        read_items.append(
+            ReadItem(
+                type=LoadItemType.TENSOR,
+                dest_index=MetadataIndex(
+                    fqn=target_fqn, offset=local_chunk.offsets, index=local_idx,
+                ),
+                dest_offsets=dest_offsets,
+                storage_index=MetadataIndex(
+                    fqn=checkpoint_fqn, offset=storage_chunk.offsets, index=storage_idx,
+                ),
+                storage_offsets=storage_offsets,
+                lengths=lengths,
+            )
+        )
+
+    if not has_any_overlap:
+        raise ValueError(
+            f"Target local chunk {local_idx} of {target_fqn!r} "
+            f"(offsets={local_chunk.offsets}, sizes={local_chunk.sizes}) "
+            f"has no intersection with any saved chunk"
+        )
+    return read_items, covered_per_dim
+
+
+def _validate_full_coverage(
+    local_idx: int,
+    target_fqn: str,
+    local_chunk: ChunkStorageMetadata,
+    covered_per_dim: list[list[tuple[int, int]]],
+) -> None:
+    """Raise ``ValueError`` if *covered_per_dim* does not fully cover *local_chunk*.
+
+    Args:
+        local_idx: Index of the local chunk.
+        target_fqn: FQN on the load side.
+        local_chunk: The target local chunk.
+        covered_per_dim: Per-dimension overlapping intervals from saved chunks.
+
+    Raises:
+        ValueError: If any dimension is not fully covered.
+    """
+    local_area = chunk_to_area(local_chunk)
+    uncovered_dims: list[int] = []
+    for dim, intervals in enumerate(covered_per_dim):
+        merged = _merge_intervals(intervals)
+        local_start, local_end = local_area[dim]
+        if not merged or merged[0][0] > local_start or merged[-1][1] < local_end or len(merged) != 1:
+            uncovered_dims.append(dim)
+    if uncovered_dims:
+        raise ValueError(
+            f"Target local chunk {local_idx} of {target_fqn!r} "
+            f"(offsets={local_chunk.offsets}, sizes={local_chunk.sizes}) "
+            f"is not fully covered by saved chunks; uncovered dimensions: "
+            f"{uncovered_dims}"
+        )
 
 
 def _merge_intervals(
