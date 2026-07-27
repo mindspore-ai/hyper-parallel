@@ -1,50 +1,88 @@
+**What type of PR is this?**
 /kind feature
 
 ----
 
 **What does this PR do / why do we need it**:
 
-本 PR 为分布式检查点模块新增三项核心能力，解决 issue-239 中提出的拓扑感知加载、增量保存与元数据版本管理需求：
+本 PR 为分布式检查点（Distributed Checkpoint）模块实现了三项核心增强能力，以支持训练过程中的弹性拓扑切换与增量保存，满足 issue-239 的需求：
 
-1. **TopologyMapper（拓扑感知加载）**
-   - 新增 `TopologyMapper` 类，支持在加载检查点时将保存拓扑下的参数分片映射到当前训练拓扑，实现跨拓扑无缝加载（如 TP4→TP2、EP2→EP4、PP 阶段重排等）。
-   - 在 `StandardLoadPlanner` 中集成 `topology_mapper` 参数，加载时自动完成 FQN 映射与分片交集计算，生成正确的 `ReadItem`。
+**1. 拓扑感知加载（TopologyMapper）**
 
-2. **Incremental Checkpoint Save（增量保存）**
-   - `save()` / `async_save()` 新增 `incremental_from` + `changed_fqns` 可选参数，仅写入相对基线检查点发生变化的张量，未变化的张量在文件系统中通过索引重定位复用，大幅减少写入量和保存耗时。
-   - `FileSystemWriter` 支持增量写入：校验 changed_fqns 一致性、跳过未变化张量的数据写入、将 baseline 中未变化条目的存储路径重定位到增量检查点目录。
+新增 `TopologyMapper` 类，统一解决跨 TP/PP/EP 拓扑加载检查点的问题：
+- **FQN 映射**：将加载侧目标 FQN 映射到检查点侧 FQN，支持 Pipeline 并行阶段数变化后参数名称迁移（如 `model.pp_stage_1.layers.0.weight` → `model.pp_stage_0.layers.1.weight`）
+- **Chunk 重叠规划**：替代原有内嵌在 `create_read_items_for_chunk_list` 中的 reshard 逻辑，在计算 ReadItem 时正确分离 `dest_index.fqn`（目标侧）与 `storage_index.fqn`（检查点侧），并增加覆盖率校验，确保目标 chunk 完全被检查点 chunk 覆盖，避免静默产生零填充张量
+- `StandardLoadPlanner` 新增 `topology_mapper` 参数，默认使用 identity mapper 保持向后兼容
+- 错误信息同时报告 target_fqn 和 checkpoint_fqn，便于定位拓扑映射问题
 
-3. **Metadata Versioning（元数据版本管理）**
-   - 新增 `versioning.py` 模块，定义 `CURRENT_CHECKPOINT_VERSION = "2.0"`，提供 `migrate_metadata()` 函数实现 1.0→2.0 自动迁移。
-   - 元数据默认版本从 `"1.0"` 升级到 `"2.0"`，加载时检测旧版本自动迁移，遇未来版本报错。
-   - `save()` / `async_save()` 在写入元数据前自动调用版本迁移，保证落盘格式始终为最新版本。
+**2. 增量保存（Incremental Checkpoint）**
 
-所有 API 变更均向后兼容：新增参数均为可选且带默认值，现有调用无需修改。
+在 `save` / `async_save` API 中新增 `incremental_from` 和 `changed_fqns` 参数，支持仅写入发生变化的参数：
+- `FileSystemWriter` 从基线检查点加载元数据，验证未变化 FQN 的 dtype/size/chunk 兼容性
+- 未变化参数继承基线存储路径（通过相对路径重定位），变化参数正常写入
+- 全局计划阶段过滤掉未变化的 WriteItem，减少 I/O 开销
+- 所有 rank 的 `changed_fqns` 一致性校验，防止不一致导致元数据损坏
+- 增量保存时自动禁用计划缓存，避免缓存与增量逻辑冲突
+
+**3. 元数据版本迁移（Versioning）**
+
+新增 `versioning.py` 模块，实现检查点元数据格式版本管理：
+- 元数据版本从 `"1.0"` 升级到 `"2.0"`，支持后续格式演进的渐进式迁移链
+- `migrate_metadata()` 在 `load_checkpoint` 时自动调用，将旧版本元数据迁移到当前版本
+- 对旧 pickle 反序列化缺少 `version` 字段的情况自动识别为 `"1.0"`
+- 迁移链内置循环检测、类型校验和进度校验，防止迁移规则注册错误
+
+**修改范围**：
+- 核心模块：`api.py`、`filesystem_storage.py`、`metadata.py`、`standard_planner.py`、`__init__.py`
+- 新增模块：`topology_mapper.py`、`versioning.py`
+- 单元测试：新增 `test_topology_mapper.py`（528 行）、`test_versioning.py`（150 行）、`test_filesystem_storage.py`（411 行）；扩展 `test_standard_planner.py`（+371 行）、`test_api.py`（+95 行）
+- 系统测试：扩展 PyTorch 侧 `dcp_save_and_load.py`（+476 行）及 MindSpore 侧 `base_shard.py`（+621 行）
+
+----
 
 **Which issue(s) this PR fixes**:
-
 Fixes #239
 
 ----
 
-**Test Plan and Test result：What scenarios were tested, and what were the verification results（Function, performance, reliability, etc.）**：
+**Test Plan and Test result：What scenarios were tested, and what were the verification results（Function, performance, reliability, etc.）**:
 
-### 单元测试（UT）— 134 passed, 0 failed
+**功能测试**：
 
-| 测试文件 | 用例数 | 覆盖内容 |
-|---------|--------|---------|
-| `test_topology_mapper.py` | 23 | TopologyMapper 初始化校验（7）+ compute_required_shards 计算逻辑（16），覆盖 TP/EP/PP/HSDP 拓扑变换、2D 重叠、异常输入 |
-| `test_versioning.py` | 7 | 版本迁移 1.0→2.0、当前版本直通、缺失版本处理、未来版本拒绝、迁移无进展拒绝 |
-| `test_filesystem_storage.py` | 12 | 原有 Reader/Writer（4）+ 增量保存（8）：基线-增量 roundtrip、未变化索引重定位、shape 不匹配拒绝、deleted FQN 不继承、ranks 不一致拒绝 |
-| `test_standard_planner.py` | 20 | 原有 plan 生成/缓存（8）+ 新增 TopologyMapper 委托（4）+ 增量 plan 缓存禁用（1）+ shape/key mismatch 双 FQN 报告（2）+ bytes item mapped FQN（1）+ 其他（2） |
-| `test_api.py` | 12 | 原有 save/load（8）+ 增量参数校验（3）+ 旧元数据迁移（1） |
-| `test_metadata.py` | 6 | 版本字段默认值更新为 2.0、可选字段验证 |
-| 其余原有测试 | 54 | layout、planner、reshard、storage、async_staging、util、convert roundtrip — 全部通过 |
+1. **TopologyMapper 单元测试**（`test_topology_mapper.py`，20+ 用例）：
+   - 默认 identity 映射、显式 FQN 映射、映射深拷贝隔离性
+   - 非法 key/value 输入校验
+   - compute_required_shards：TP4→TP2 收缩、TP2→TP4 扩展、2D TP、EP4→EP2/EP2→EP4、HSDP+EP 组合重叠、EP+TP 2D 重叠
+   - PP FQN 映射 + TP/EP resharding 组合场景
+   - 无交集 / 部分覆盖错误检测
+   - 空输入边界条件
 
-### 集成测试（ST）
+2. **StandardLoadPlanner 集成测试**（`test_standard_planner.py`，8 用例）：
+   - 显式 TopologyMapper 委托：dest_index.fqn 为目标，storage_index.fqn 为检查点 FQN
+   - 缺失 key 报告双方 FQN、shape 不匹配报告双方 FQN
+   - 默认 mapper 为 identity、bytes item 使用映射 FQN
+   - PP 前缀隔离 + DP 去重 + TP chunk 正确性
+   - HSDP+EP 专家权重去重、replicated router 去重、组合去重
 
-- `tests/torch/checkpoint/dcp_save_and_load.py` 中 4 个测试函数补充了 `barrier() + shutil.rmtree()` 清理逻辑，确保测试后无残留文件。
-- `tests/mindspore/st/checkpoint/` 新增增量保存与拓扑映射的 ST 用例。
+3. **Versioning 单元测试**（`test_versioning.py`，7 用例）：
+   - 当前版本直通、缺失版本识别为 1.0、1.0→2.0 迁移
+   - 未知/未来版本拒绝、无进展规则检测、返回类型校验
+
+4. **FileSystemStorage 单元测试**（`test_filesystem_storage.py`，411 行）：
+   - 增量保存：仅写入 changed FQN，基线路径重定位
+   - 未变化 FQN 兼容性校验（dtype/size/chunk 不匹配检测）
+   - changed_fqns 跨 rank 一致性校验
+   - 增量检查点元数据完整性验证
+
+5. **API 单元测试**（`test_api.py`，95 行）：
+   - incremental_from / changed_fqns 参数校验
+   - 增量保存不支持自定义 storage_writer 校验
+
+6. **分布式系统测试**：
+   - PyTorch 侧 `dcp_save_and_load.py`（+476 行）：全量保存/加载、增量保存/加载、TP reshard、TopologyMapper 加载
+   - MindSpore 侧 `base_shard.py`（+621 行）：分片检查点保存/加载验证
+
+**验证结果**：所有单元测试通过，覆盖 TopologyMapper、Versioning、Incremental Save、StandardPlanner 集成等核心场景。
 
 ----
 
