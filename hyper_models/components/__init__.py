@@ -12,4 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Reusable training component packages for HyperModels."""
+"""components"""
+
+from hyper_models.components import training
+
+__all__ = ["training"]
+

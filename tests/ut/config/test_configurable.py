@@ -172,6 +172,37 @@ class TestConfigurable(unittest.TestCase):
         obj = PlainComponent.Config(x=2).build()
         self.assertEqual(obj.config.x, 2)
 
+    def test_config_alias_rebinding_rejected(self):
+        """Aliasing another owner's Config must not steal its _owner binding."""
+
+        class FirstComponent(Configurable):
+            @dataclass(kw_only=True, slots=True)
+            class Config(Configurable.Config):
+                x: int = 1
+
+            def __init__(self, config: "FirstComponent.Config"):
+                self.config = config
+
+        with self.assertRaisesRegex(TypeError, "already bound"):
+            class AliasComponent(Configurable):
+                Config = FirstComponent.Config
+
+                def __init__(self, config):
+                    self.config = config
+
+        # The original binding is untouched.
+        obj = FirstComponent.Config(x=3).build()
+        self.assertIsInstance(obj, FirstComponent)
+
+    def test_non_config_subclass_rejected(self):
+        """A Config that is not a Configurable.Config subclass fails fast."""
+        with self.assertRaisesRegex(TypeError, "Configurable.Config subclass"):
+            class BadComponent(Configurable):
+                Config = dict
+
+                def __init__(self, config):
+                    self.config = config
+
 
 if __name__ == "__main__":
     unittest.main()
