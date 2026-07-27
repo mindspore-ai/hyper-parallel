@@ -103,6 +103,7 @@ def test_dcp_save_and_load_group4_gloo():
 
 
 
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dcp_save_and_load_dynamic_tp_pp():
     """
@@ -125,6 +126,7 @@ def test_dcp_save_and_load_dynamic_tp_pp_gloo():
     parallel_run([
         TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_dynamic_tp_pp", num_proc=8),
     ])
+
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")

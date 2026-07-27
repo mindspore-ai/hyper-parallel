@@ -539,6 +539,5 @@ class TestStandardPlanner(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertIs(cached.final_plan, plan)
 
-
 if __name__ == "__main__":
     unittest.main()

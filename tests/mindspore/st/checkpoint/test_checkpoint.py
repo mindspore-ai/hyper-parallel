@@ -80,6 +80,8 @@ def test_checkpoint_group3():
 
 
 
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_checkpoint_group4():
     """
@@ -91,6 +93,7 @@ def test_checkpoint_group4():
     parallel_run([
         MindSporeCase(BASE_SHARD, "test_dcp_save_and_load_dynamic_tp_pp", 11231, 8, 8),
     ])
+
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")

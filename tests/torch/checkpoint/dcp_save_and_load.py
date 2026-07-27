@@ -906,6 +906,8 @@ def test_dcp_save_and_load_dynamic_tp_pp() -> None:
         f"local shard mismatch for layer {global_layer_idx_for_load}"
     )
 
+
+
     platform_obj.barrier()
     if rank == 0:
         shutil.rmtree(checkpoint_path, ignore_errors=True)
