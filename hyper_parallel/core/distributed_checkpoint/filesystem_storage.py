@@ -474,6 +474,13 @@ class FileSystemWriter(StorageWriter):
                         f"{type(current_entry).__name__}. Mark as changed."
                     )
                 self._validate_unchanged_tensor(fqn, current_entry, baseline_entry)
+            elif isinstance(current_entry, BytesStorageMetadata):
+                if not isinstance(baseline_entry, BytesStorageMetadata):
+                    raise ValueError(
+                        f"Unchanged FQN {fqn!r} changed type from "
+                        f"{type(baseline_entry).__name__} to "
+                        f"{type(current_entry).__name__}. Mark as changed."
+                    )
             # Inherit baseline storage indices with relocated paths
             for idx, info in baseline_storage.items():
                 if idx.fqn == fqn:

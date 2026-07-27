@@ -366,32 +366,6 @@ class StandardSavePlanner(SavePlanner):
         raise TypeError(f"Unsupported write item type: {item.type}")
 
 
-def create_read_items_for_chunk_list(
-    fqn: str,
-    checkpoint_md: TensorStorageMetadata,
-    local_chunks: list[ChunkStorageMetadata],
-    topology_mapper: Optional[TopologyMapper] = None,
-) -> list[ReadItem]:
-    """Create ReadItems by matching local chunks with saved chunks.
-
-    Delegates to :class:`TopologyMapper.compute_required_shards` when a mapper
-    is provided so that target and checkpoint FQNs are correctly separated.
-    When *topology_mapper* is ``None`` a default identity mapper is used,
-    preserving the original behaviour.
-
-    Args:
-        fqn: Fully qualified name of the tensor.
-        checkpoint_md: Tensor storage metadata from checkpoint.
-        local_chunks: List of local chunks needed by this rank.
-        topology_mapper: Optional mapper for FQN translation and chunk-overlap
-            planning.  When ``None`` an identity mapper is created internally.
-
-    Returns:
-        List of ReadItems for loading the required data.
-    """
-    mapper = topology_mapper or TopologyMapper()
-    return mapper.compute_required_shards(fqn, checkpoint_md, local_chunks)
-
 
 class StandardLoadPlanner(LoadPlanner):
     """

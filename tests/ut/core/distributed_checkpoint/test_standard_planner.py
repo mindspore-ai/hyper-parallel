@@ -41,7 +41,6 @@ from hyper_parallel.core.distributed_checkpoint.planner import SavePlan, WriteIt
 from hyper_parallel.core.distributed_checkpoint.standard_planner import (
     StandardLoadPlanner,
     StandardSavePlanner,
-    create_read_items_for_chunk_list,
 )
 from hyper_parallel.core.distributed_checkpoint.topology_mapper import TopologyMapper
 
@@ -136,7 +135,7 @@ class TestStandardPlanner(unittest.TestCase):
 
     def test_create_read_items_for_chunk_list_overlap(self):
         """
-        Feature: create_read_items_for_chunk_list resharding overlap.
+        Feature: TopologyMapper.compute_required_shards resharding overlap.
         Description: Local chunk is half of a saved full tensor chunk.
         Expectation: One ReadItem copies the overlapping region with correct offsets.
         """
@@ -146,7 +145,8 @@ class TestStandardPlanner(unittest.TestCase):
             chunks=[ChunkStorageMetadata(offsets=(0, 0), sizes=(4, 4))],
         )
         local_chunks = [ChunkStorageMetadata(offsets=(0, 0), sizes=(2, 4))]
-        read_items = create_read_items_for_chunk_list("w", checkpoint_md, local_chunks)
+        mapper = TopologyMapper()
+        read_items = mapper.compute_required_shards("w", checkpoint_md, local_chunks)
         self.assertEqual(len(read_items), 1)
         self.assertEqual(read_items[0].lengths, (2, 4))
 

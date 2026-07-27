@@ -205,6 +205,8 @@ class TopologyMapper:
                 local_start, local_end = local_area[dim]
                 if not merged or merged[0][0] > local_start or merged[-1][1] < local_end:
                     uncovered_dims.append(dim)
+                elif len(merged) != 1:
+                    uncovered_dims.append(dim)
             if uncovered_dims:
                 raise ValueError(
                     f"Target local chunk {local_idx} of {target_fqn!r} "
