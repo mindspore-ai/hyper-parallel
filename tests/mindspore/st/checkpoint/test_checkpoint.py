@@ -64,3 +64,55 @@ def test_checkpoint_group2():
         MindSporeCase(RESHARD_HANDLER, "test_from_tensor_map_missing_rank", 11007),
         MindSporeCase(RESHARD_HANDLER, "test_from_tensor_map_has_unexpected_data", 11008)
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_checkpoint_group3():
+    """
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_dcp_save_and_load_with_static_dp_tp_pp
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(BASE_SHARD, "test_dcp_save_and_load_with_static_dp_tp_pp", 11230, 8, 8),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_checkpoint_group4():
+    """
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_dcp_save_and_load_dynamic_tp_pp
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(BASE_SHARD, "test_dcp_save_and_load_dynamic_tp_pp", 11231, 8, 8),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_checkpoint_group5():
+    """
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_dcp_save_and_load_hsdp_ep_moe
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(BASE_SHARD, "test_dcp_save_and_load_hsdp_ep_moe", 11232, 8, 8),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_checkpoint_group6():
+    """
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_dcp_incremental_save_and_load
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(BASE_SHARD, "test_dcp_incremental_save_and_load", 11233, 8, 8),
+    ])

@@ -38,10 +38,10 @@ from hyper_parallel.core.distributed_checkpoint.planner import (
     ReadItem,
     LoadItemType
 )
-from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank, infer_intersection
+from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank
+from hyper_parallel.core.distributed_checkpoint.topology_mapper import TopologyMapper
 from hyper_parallel.core.distributed_checkpoint.util import (
     narrow_tensor_by_index,
-    chunk_to_area,
     create_chunk_list_for_tensor,
     remove_redundant_plans,
     flatten_state_dict,
@@ -101,6 +101,8 @@ class StandardSavePlanner(SavePlanner):
         use_collectives = bool(kwargs.get("use_collectives", True))
         if not use_collectives:
             self.remove_redundancy = False
+            self._enable_plan_caching = False
+        elif kwargs.get("incremental", False):
             self._enable_plan_caching = False
         elif "enable_plan_caching" in kwargs:
             self._enable_plan_caching = bool(kwargs["enable_plan_caching"])
@@ -368,49 +370,27 @@ def create_read_items_for_chunk_list(
     fqn: str,
     checkpoint_md: TensorStorageMetadata,
     local_chunks: list[ChunkStorageMetadata],
+    topology_mapper: Optional[TopologyMapper] = None,
 ) -> list[ReadItem]:
-    """
-    Create ReadItems by matching local chunks (what this rank needs) with
-    saved chunks (checkpoint_md.chunks), including resharding overlaps.
+    """Create ReadItems by matching local chunks with saved chunks.
 
-    Mirrors torch create_read_items_for_chunk_list behavior.
+    Delegates to :class:`TopologyMapper.compute_required_shards` when a mapper
+    is provided so that target and checkpoint FQNs are correctly separated.
+    When *topology_mapper* is ``None`` a default identity mapper is used,
+    preserving the original behaviour.
 
     Args:
-        fqn (str): Fully qualified name of the tensor.
-        checkpoint_md (TensorStorageMetadata): Tensor storage metadata from checkpoint.
-        local_chunks (list[ChunkStorageMetadata]): List of local chunks needed by this rank.
+        fqn: Fully qualified name of the tensor.
+        checkpoint_md: Tensor storage metadata from checkpoint.
+        local_chunks: List of local chunks needed by this rank.
+        topology_mapper: Optional mapper for FQN translation and chunk-overlap
+            planning.  When ``None`` an identity mapper is created internally.
 
     Returns:
-        list[ReadItem]: List of ReadItems for loading the required data.
+        List of ReadItems for loading the required data.
     """
-    read_items: list[ReadItem] = []
-    saved_chunks = checkpoint_md.chunks
-    if not local_chunks or not saved_chunks:
-        return read_items
-
-    for local_idx, local_chunk in enumerate(local_chunks):
-        local_area = chunk_to_area(local_chunk)
-        for storage_idx, storage_chunk in enumerate(saved_chunks):
-            saved_area = chunk_to_area(storage_chunk)
-            overlap = infer_intersection(local_area, saved_area)
-            if overlap is None:
-                continue
-
-            dest_offsets = tuple(overlap[i][0] - local_chunk.offsets[i] for i in range(len(overlap)))
-            storage_offsets = tuple(overlap[i][0] - storage_chunk.offsets[i] for i in range(len(overlap)))
-            lengths = tuple(overlap[i][1] - overlap[i][0] for i in range(len(overlap)))
-
-            read_items.append(
-                ReadItem(
-                    type=LoadItemType.TENSOR,
-                    dest_index=MetadataIndex(fqn=fqn, offset=local_chunk.offsets, index=local_idx),
-                    dest_offsets=dest_offsets,
-                    storage_index=MetadataIndex(fqn=fqn, offset=storage_chunk.offsets, index=storage_idx),
-                    storage_offsets=storage_offsets,
-                    lengths=lengths,
-                )
-            )
-    return read_items
+    mapper = topology_mapper or TopologyMapper()
+    return mapper.compute_required_shards(fqn, checkpoint_md, local_chunks)
 
 
 class StandardLoadPlanner(LoadPlanner):
@@ -420,11 +400,18 @@ class StandardLoadPlanner(LoadPlanner):
     Iterate state_dict and creates load plans via chunk list for resharding support.
     """
 
-    def __init__(self, allow_partial_load: bool = False):
+    def __init__(
+        self,
+        allow_partial_load: bool = False,
+        topology_mapper: Optional[TopologyMapper] = None,
+    ):
         """
         Args:
             allow_partial_load (bool): If True, allow loading when checkpoint has fewer keys than state_dict.
                 Default False.
+            topology_mapper (Optional[TopologyMapper]): Mapper for translating target FQNs to checkpoint
+                FQNs and computing chunk-overlap ReadItems.  When ``None`` an identity
+                mapper is created, preserving the original static-load behaviour.
         """
         self.state_dict: Optional[dict[str, Any]] = None
         self.metadata: Optional[Metadata] = None
@@ -432,6 +419,7 @@ class StandardLoadPlanner(LoadPlanner):
         self.rank: int = 0
         self.allow_partial_load = allow_partial_load
         self.flatten_state_dict: bool = True
+        self._topology_mapper = topology_mapper or TopologyMapper()
 
     def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
         """
@@ -457,6 +445,8 @@ class StandardLoadPlanner(LoadPlanner):
         Build local load plan.
 
         Iterate state_dict and creates load plans via chunk list for resharding support.
+        Uses the TopologyMapper to translate target FQNs to checkpoint FQNs when
+        loading across different PP topologies.
 
         Returns:
             LoadPlan: Local load plan containing ReadItems for this rank.
@@ -467,19 +457,24 @@ class StandardLoadPlanner(LoadPlanner):
         requests: list[ReadItem] = []
         strict = not self.allow_partial_load
         for fqn, obj in self.state_dict.items():
-            if fqn not in self.metadata.state_dict_metadata:
-                if fqn.endswith(('matched_adamw_rms', 'step')):
+            checkpoint_fqn = self._topology_mapper.map_fqn(fqn)
+            if checkpoint_fqn not in self.metadata.state_dict_metadata:
+                if checkpoint_fqn.endswith(('matched_adamw_rms', 'step')):
                     continue
                 if strict:
-                    raise RuntimeError(f"Missing key in checkpoint state_dict: {fqn}.")
+                    raise RuntimeError(
+                        f"Missing key in checkpoint state_dict: target_fqn={fqn!r}, "
+                        f"checkpoint_fqn={checkpoint_fqn!r}."
+                    )
                 continue
-            md = self.metadata.state_dict_metadata[fqn]
+            md = self.metadata.state_dict_metadata[checkpoint_fqn]
             if isinstance(md, TensorStorageMetadata):
                 obj_size = getattr(obj, CHUNK_INFO).global_shape if hasattr(obj, CHUNK_INFO) \
                     else getattr(obj, "shape", None)
                 if obj_size is None or md.size != tuple(obj_size):
                     raise ValueError(
-                        f"Size mismatch between saved {md.size} and current: {obj_size} for {fqn}",
+                        f"Size mismatch between saved {md.size} and current: {obj_size} "
+                        f"for target_fqn={fqn!r}, checkpoint_fqn={checkpoint_fqn!r}",
                     )
                 if isinstance(obj, DTensor):
                     layout = getattr(obj, "layout", None)
@@ -489,16 +484,17 @@ class StandardLoadPlanner(LoadPlanner):
                     if layout is not None and rank_list is not None:
                         if get_platform().get_rank() not in rank_list:
                             continue
-                # Both DTensor and platform.Tensor: create local chunks and read items
                 local_chunks = create_chunk_list_for_tensor(obj)
-                requests += create_read_items_for_chunk_list(fqn, md, local_chunks)
+                requests += self._topology_mapper.compute_required_shards(
+                    fqn, md, local_chunks,
+                )
             else:
                 requests.append(
                     ReadItem(
                         type=LoadItemType.BYTE_IO,
                         dest_index=MetadataIndex(fqn=fqn),
                         dest_offsets=(0,),
-                        storage_index=MetadataIndex(fqn=fqn),
+                        storage_index=MetadataIndex(fqn=checkpoint_fqn),
                         storage_offsets=(0,),
                         lengths=(0,),
                     )

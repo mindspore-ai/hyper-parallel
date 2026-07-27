@@ -112,9 +112,9 @@ class Metadata:
         state_dict_metadata: Mapping from FQN to storage metadata.
         planner_data: Planner-specific data (optional). Default None.
         storage_data: Storage-specific data (optional). Default None.
-        version: Checkpoint format version. Default "1.0".
+        version: Checkpoint format version. Default "2.0".
     """
     state_dict_metadata: dict[str, Union[TensorStorageMetadata, BytesStorageMetadata]]
     planner_data: Any = None  # Planner-specific data (can be any type)
     storage_data: Optional[dict[MetadataIndex, Any]] = None  # Storage mapping: MetadataIndex -> StorageInfo
-    version: str = "1.0"
+    version: str = "2.0"

@@ -15,12 +15,18 @@
 """File system storage implementations for checkpoint save and load."""
 import os
 import pickle
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Optional, Union
 
 from safetensors import safe_open
 
-from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
+from hyper_parallel.core.distributed_checkpoint.metadata import (
+    BytesStorageMetadata,
+    Metadata,
+    MetadataIndex,
+    TensorStorageMetadata,
+)
 from hyper_parallel.core.distributed_checkpoint.planner import (
     LoadPlan,
     LoadPlanner,
@@ -30,13 +36,17 @@ from hyper_parallel.core.distributed_checkpoint.planner import (
     WriteItem,
 )
 from hyper_parallel.core.distributed_checkpoint.storage import (
+    METADATA_FILE_NAME,
     StorageInfo,
     StorageReader,
     StorageWriter,
     WriteResult,
-    METADATA_FILE_NAME,
 )
 from hyper_parallel.core.distributed_checkpoint.util import narrow_tensor_by_index
+from hyper_parallel.core.distributed_checkpoint.versioning import (
+    CURRENT_CHECKPOINT_VERSION,
+    migrate_metadata,
+)
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 
@@ -47,14 +57,30 @@ class FileSystemWriter(StorageWriter):
 
     Saves checkpoint data to the local file system, organizing tensors
     into safetensors files and bytes into separate files.
+
+    When *incremental_from* and *changed_fqns* are provided, only changed
+    items are written to disk; unchanged items inherit their storage
+    location from the baseline checkpoint (with relative paths relocated).
     """
 
-    def __init__(self, checkpoint_dir: Union[Path, str]):
+    def __init__(
+        self,
+        checkpoint_dir: Union[Path, str],
+        incremental_from: Optional[Union[Path, str]] = None,
+        changed_fqns: Optional[Collection[str]] = None,
+    ):
         self.checkpoint_dir = Path(checkpoint_dir) if isinstance(checkpoint_dir, str) else checkpoint_dir
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.rank: int = 0
         self.is_coordinator: bool = False
         self.use_collectives: bool = True
+        self._incremental_from: Optional[Path] = (
+            Path(incremental_from) if isinstance(incremental_from, str) else incremental_from
+        )
+        self._changed_fqns: Optional[frozenset[str]] = (
+            frozenset(changed_fqns) if changed_fqns is not None else None
+        )
+        self._baseline_metadata: Optional[Metadata] = None
 
     def initialize_writer(self, checkpoint_id: Optional[Union[Path, str]] = None) -> None:
         """
@@ -83,25 +109,149 @@ class FileSystemWriter(StorageWriter):
         """
         Optimize local plan.
 
+        For incremental saves, embeds the normalized ``changed_fqns`` into
+        ``plan.storage_data`` so that :meth:`optimize_global_plan` can verify
+        cross-rank consistency.
+
         Args:
             plan (SavePlan): Local save plan.
 
         Returns:
             SavePlan: Optimized local plan.
         """
+        if self._changed_fqns is not None:
+            plan = SavePlan(
+                items=plan.items,
+                storage_data={"changed_fqns": self._changed_fqns},
+                planner_data=plan.planner_data,
+            )
         return plan
 
     def optimize_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
         """
         Optimize global plan.
 
+        For incremental saves:
+        1. Verifies all ranks have identical ``changed_fqns``.
+        2. Filters out WriteItems whose FQN is not in ``changed_fqns``.
+        3. Loads and migrates the baseline metadata.
+
         Args:
             plans (list[SavePlan]): List of local plans from all ranks.
 
         Returns:
             list[SavePlan]: Optimized global plans.
+
+        Raises:
+            ValueError: If ranks disagree on ``changed_fqns``, or if an
+                unchanged tensor has incompatible storage metadata.
         """
-        return plans
+        if self._changed_fqns is None:
+            return plans
+
+        all_fqn_sets = []
+        for plan in plans:
+            plan_fqns = plan.storage_data.get("changed_fqns") if plan.storage_data else None
+            if plan_fqns is None:
+                raise ValueError(
+                    "Incremental save requires all ranks to provide changed_fqns, "
+                    "but a rank's plan has no changed_fqns in storage_data."
+                )
+            all_fqn_sets.append(frozenset(plan_fqns))
+        if len(set(all_fqn_sets)) != 1:
+            raise ValueError(
+                f"All ranks must agree on changed_fqns for incremental save, "
+                f"but got {len(set(all_fqn_sets))} distinct sets."
+            )
+
+        self._load_baseline_metadata()
+
+        filtered_plans = []
+        for plan in plans:
+            changed_items = [item for item in plan.items if item.index.fqn in self._changed_fqns]
+            filtered_plans.append(SavePlan(
+                items=changed_items,
+                storage_data=plan.storage_data,
+                planner_data=plan.planner_data,
+            ))
+        return filtered_plans
+
+    def _load_baseline_metadata(self) -> None:
+        """Load and migrate baseline checkpoint metadata.
+
+        Raises:
+            FileNotFoundError: If the baseline metadata file does not exist.
+        """
+        if self._baseline_metadata is not None:
+            return
+        baseline_reader = FileSystemReader(self._incremental_from)
+        if self.use_collectives:
+            self._baseline_metadata = migrate_metadata(baseline_reader.load_metadata())
+        else:
+            self._baseline_metadata = migrate_metadata(baseline_reader.load_metadata(rank=self.rank))
+
+    @staticmethod
+    def _validate_unchanged_tensor(
+        fqn: str,
+        current_md: TensorStorageMetadata,
+        baseline_md: TensorStorageMetadata,
+    ) -> None:
+        """Verify that an unchanged FQN has compatible tensor metadata.
+
+        Args:
+            fqn: The FQN being validated.
+            current_md: Tensor metadata from the current save plan.
+            baseline_md: Tensor metadata from the baseline checkpoint.
+
+        Raises:
+            ValueError: If dtype, size, chunk offsets/sizes or chunk order differ.
+        """
+        if current_md.properties.dtype != baseline_md.properties.dtype:
+            raise ValueError(
+                f"Unchanged FQN {fqn!r} has dtype mismatch: current "
+                f"{current_md.properties.dtype!r} vs baseline "
+                f"{baseline_md.properties.dtype!r}. Mark this FQN as changed."
+            )
+        if current_md.size != baseline_md.size:
+            raise ValueError(
+                f"Unchanged FQN {fqn!r} has size mismatch: current "
+                f"{current_md.size} vs baseline {baseline_md.size}. "
+                f"Mark this FQN as changed."
+            )
+        if len(current_md.chunks) != len(baseline_md.chunks):
+            raise ValueError(
+                f"Unchanged FQN {fqn!r} has different chunk count: current "
+                f"{len(current_md.chunks)} vs baseline {len(baseline_md.chunks)}. "
+                f"Mark this FQN as changed."
+            )
+        for i, (cur_chunk, base_chunk) in enumerate(
+            zip(current_md.chunks, baseline_md.chunks)
+        ):
+            if cur_chunk.offsets != base_chunk.offsets or cur_chunk.sizes != base_chunk.sizes:
+                raise ValueError(
+                    f"Unchanged FQN {fqn!r} chunk {i} differs: current "
+                    f"({cur_chunk.offsets}, {cur_chunk.sizes}) vs baseline "
+                    f"({base_chunk.offsets}, {base_chunk.sizes}). "
+                    f"Mark this FQN as changed."
+                )
+
+    def _relocate_baseline_path(self, baseline_relative_path: str) -> str:
+        """Relocate a baseline ``StorageInfo.relative_path`` to the current checkpoint dir.
+
+        If the baseline is itself an incremental checkpoint, its relative paths
+        are already relative to the baseline dir.  We resolve them against the
+        baseline dir first, then compute a new relative path from the current
+        checkpoint dir.
+
+        Args:
+            baseline_relative_path: The relative path stored in baseline metadata.
+
+        Returns:
+            str: A relative path from the current checkpoint dir to the same file.
+        """
+        baseline_abs = (self._incremental_from / baseline_relative_path).resolve()
+        current_abs = self.checkpoint_dir.resolve()
+        return os.path.relpath(str(baseline_abs), str(current_abs))
 
 
     def _serialize_bytes_item(self, item: WriteItem, planner: SavePlanner) -> bytes:
@@ -248,20 +398,35 @@ class FileSystemWriter(StorageWriter):
         When use_collectives=False: each rank saves its own metadata to .rank{rank}_metadata,
         no cross-rank interaction.
 
+        For incremental saves, this method:
+        1. Validates that unchanged FQNs have compatible tensor metadata.
+        2. Merges baseline storage_data (with relocated paths) for unchanged items.
+        3. Overlays current write results for changed items.
+        4. Verifies that the merged storage_data covers all expected indices.
+
         Args:
             metadata (Metadata): Checkpoint metadata to update.
             results (list[list[WriteResult]]): Write results from all ranks (or single rank when use_collectives=False).
+
+        Raises:
+            ValueError: If the merged storage_data is incomplete or if an unchanged
+                FQN has incompatible tensor metadata.
         """
         should_save = not self.use_collectives or (self.use_collectives and self.is_coordinator)
         if not should_save:
             return
 
-        # Build storage_data: map MetadataIndex -> StorageInfo
         storage_md: dict[MetadataIndex, StorageInfo] = {}
-        for wr_list in results:
-            for wr in wr_list:
-                storage_md[wr.index] = wr.storage_data
+
+        if self._baseline_metadata is not None and self._changed_fqns is not None:
+            self._merge_incremental_storage(metadata, results, storage_md)
+        else:
+            for wr_list in results:
+                for wr in wr_list:
+                    storage_md[wr.index] = wr.storage_data
+
         metadata.storage_data = storage_md
+        metadata.version = CURRENT_CHECKPOINT_VERSION
 
         # Save metadata file
         if self.use_collectives:
@@ -270,6 +435,77 @@ class FileSystemWriter(StorageWriter):
             metadata_file = self.checkpoint_dir / f"{self.rank}{METADATA_FILE_NAME}"
         with open(metadata_file, "wb") as f:
             pickle.dump(metadata, f)
+
+    def _merge_incremental_storage(
+        self,
+        metadata: Metadata,
+        results: list[list[WriteResult]],
+        storage_md: dict[MetadataIndex, StorageInfo],
+    ) -> None:
+        """Merge baseline and current write results into *storage_md*.
+
+        Args:
+            metadata: Current checkpoint metadata (full logical view).
+            results: Write results from this save (changed items only).
+            storage_md: Destination dict to populate with merged storage_data.
+
+        Raises:
+            ValueError: If an unchanged FQN has incompatible metadata, or if
+                the merged index is incomplete.
+        """
+        baseline_storage = self._baseline_metadata.storage_data or {}
+        baseline_sdict = self._baseline_metadata.state_dict_metadata
+
+        # 1. Validate unchanged tensor FQNs and inherit baseline storage_data
+        for fqn, current_entry in metadata.state_dict_metadata.items():
+            if fqn in self._changed_fqns:
+                continue
+            if fqn not in baseline_sdict:
+                raise ValueError(
+                    f"New FQN {fqn!r} is not marked as changed but does not "
+                    f"exist in the baseline checkpoint."
+                )
+            baseline_entry = baseline_sdict[fqn]
+            if isinstance(current_entry, TensorStorageMetadata):
+                if not isinstance(baseline_entry, TensorStorageMetadata):
+                    raise ValueError(
+                        f"Unchanged FQN {fqn!r} changed type from "
+                        f"{type(baseline_entry).__name__} to "
+                        f"{type(current_entry).__name__}. Mark as changed."
+                    )
+                self._validate_unchanged_tensor(fqn, current_entry, baseline_entry)
+            # Inherit baseline storage indices with relocated paths
+            for idx, info in baseline_storage.items():
+                if idx.fqn == fqn:
+                    relocated_path = self._relocate_baseline_path(info.relative_path)
+                    storage_md[idx] = StorageInfo(
+                        relative_path=relocated_path,
+                        offset=info.offset,
+                        length=info.length,
+                    )
+
+        # 2. Overlay current write results for changed FQNs
+        for wr_list in results:
+            for wr in wr_list:
+                storage_md[wr.index] = wr.storage_data
+
+        # 3. Verify completeness: every expected MetadataIndex must exist
+        expected_indices = set()
+        for fqn, entry in metadata.state_dict_metadata.items():
+            if isinstance(entry, TensorStorageMetadata):
+                for i, chunk in enumerate(entry.chunks):
+                    expected_indices.add(MetadataIndex(fqn=fqn, offset=chunk.offsets, index=i))
+            elif isinstance(entry, BytesStorageMetadata):
+                expected_indices.add(MetadataIndex(fqn=fqn))
+
+        missing = expected_indices - set(storage_md.keys())
+        if missing:
+            missing_fqns = sorted({idx.fqn for idx in missing})
+            raise ValueError(
+                f"Incremental checkpoint metadata is incomplete; missing "
+                f"storage indices for FQNs: {missing_fqns}. "
+                f"Mark missing FQNs as changed or ensure baseline covers them."
+            )
 
 
 def _copy_tensor_to_target(

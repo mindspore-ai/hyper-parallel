@@ -46,6 +46,8 @@ __all__ = [
     # Standard planners
     "StandardSavePlanner",
     "StandardLoadPlanner",
+    # Topology mapping
+    "TopologyMapper",
     # Storage interfaces
     "StorageWriter",
     "StorageReader",
@@ -65,6 +67,9 @@ __all__ = [
     "load_checkpoint",
     # Resharding
     "ReshardHandler",
+    # Versioning
+    "CURRENT_CHECKPOINT_VERSION",
+    "migrate_metadata",
 ]
 
 # Main API
@@ -105,6 +110,9 @@ from hyper_parallel.core.distributed_checkpoint.standard_planner import (
     StandardSavePlanner,
 )
 
+# Topology mapper for dynamic TP/PP loading
+from hyper_parallel.core.distributed_checkpoint.topology_mapper import TopologyMapper
+
 # Storage interfaces and data structures
 from hyper_parallel.core.distributed_checkpoint.storage import (
     StorageInfo,
@@ -134,3 +142,9 @@ from hyper_parallel.core.distributed_checkpoint.saver import save_checkpoint
 
 # Resharding utilities
 from hyper_parallel.core.distributed_checkpoint.reshard import ReshardHandler
+
+# Versioning utilities
+from hyper_parallel.core.distributed_checkpoint.versioning import (
+    CURRENT_CHECKPOINT_VERSION,
+    migrate_metadata,
+)

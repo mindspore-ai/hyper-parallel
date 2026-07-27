@@ -36,6 +36,7 @@ importlib.reload(api_mod)
 
 from hyper_parallel.core.distributed_checkpoint.api import (
     _gather_from_all_ranks,
+    _save_impl,
     load,
     save,
 )
@@ -131,6 +132,100 @@ class TestApi(unittest.TestCase):
         result = _gather_from_all_ranks({"a": 1}, world_size=2, use_collectives=True)
         mock_all_gather.assert_called_once()
         self.assertEqual(result, expected)
+
+    def test_incremental_params_must_be_paired(self):
+        """
+        Feature: save incremental parameter validation.
+        Description: Call save with incremental_from but not changed_fqns.
+        Expectation: ValueError mentioning both must be provided together.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ValueError) as ctx:
+                save(
+                    {"w": torch.zeros(1)},
+                    checkpoint_id=tmpdir,
+                    no_dist=True,
+                    incremental_from="/some/base",
+                )
+            self.assertIn("together", str(ctx.exception))
+
+    def test_incremental_params_changed_fqns_without_from(self):
+        """
+        Feature: save incremental parameter validation.
+        Description: Call save with changed_fqns but not incremental_from.
+        Expectation: ValueError mentioning both must be provided together.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ValueError) as ctx:
+                save(
+                    {"w": torch.zeros(1)},
+                    checkpoint_id=tmpdir,
+                    no_dist=True,
+                    changed_fqns={"w"},
+                )
+            self.assertIn("together", str(ctx.exception))
+
+    def test_incremental_with_custom_writer_raises(self):
+        """
+        Feature: save incremental with custom writer.
+        Description: Call save with incremental_from and a custom storage_writer.
+        Expectation: ValueError mentioning only default FileSystemWriter supported.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from hyper_parallel.core.distributed_checkpoint.filesystem_storage import FileSystemWriter
+            writer = FileSystemWriter(tmpdir)
+            with self.assertRaises(ValueError) as ctx:
+                _save_impl(
+                    {"w": torch.zeros(1)},
+                    checkpoint_id=tmpdir,
+                    storage_writer=writer,
+                    no_dist=True,
+                    incremental_from="/some/base",
+                    changed_fqns={"w"},
+                )
+            self.assertIn("FileSystemWriter", str(ctx.exception))
+
+    def test_incremental_invalid_fqn_raises(self):
+        """
+        Feature: save incremental changed_fqns validation.
+        Description: changed_fqns contains empty string.
+        Expectation: ValueError mentioning non-empty string.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ValueError) as ctx:
+                _save_impl(
+                    {"w": torch.zeros(1)},
+                    checkpoint_id=tmpdir,
+                    no_dist=True,
+                    incremental_from="/some/base",
+                    changed_fqns={""},
+                )
+            self.assertIn("non-empty string", str(ctx.exception))
+
+    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
+    def test_load_old_1_0_metadata_migrates(self, mock_barrier, mock_rank, mock_world_size):
+        """
+        Feature: load migrates old 1.0 metadata.
+        Description: Save a checkpoint, manually patch version to 1.0, then load.
+        Expectation: Load succeeds; migrated metadata version is 2.0.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save({"w": torch.zeros(2, 2)}, checkpoint_id=tmpdir, no_dist=True)
+
+            import pickle
+            meta_path = Path(tmpdir) / f"0{METADATA_FILE_NAME}"
+            with open(meta_path, "rb") as f:
+                md = pickle.load(f)
+            md.version = "1.0"
+            with open(meta_path, "wb") as f:
+                pickle.dump(md, f)
+
+            loaded = {"w": torch.zeros(2, 2)}
+            load(loaded, checkpoint_id=tmpdir, no_dist=True)
+            torch.testing.assert_close(loaded["w"], torch.zeros(2, 2))
+        mock_barrier.assert_called()
 
 
 if __name__ == "__main__":

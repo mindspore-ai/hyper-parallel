@@ -536,3 +536,98 @@ def test_dcp_minimal_plan_cache_model_optimizer_isolation_async() -> None:
     assert isinstance(optim_state, dict)
     # pylint: disable=unsubscriptable-object
     assert optim_state["step"] == 21
+
+
+def test_dcp_incremental_save_and_load() -> None:
+    """
+    Feature: incremental checkpoint save and load.
+    Description:
+        1) Save a full model checkpoint (baseline).
+        2) Mutate only ``dense`` and ``io_payload`` while keeping ``dt_sharded``
+           and ``dt_replicated`` unchanged.
+        3) Save an incremental checkpoint referencing the baseline with
+           ``changed_fqns={"dense", "io_payload"}``.
+        4) Load the incremental checkpoint and verify all values are correct.
+        5) Verify the incremental checkpoint metadata version is "2.0".
+    Expectation: Incremental save only writes changed items; load resolves
+        relocated baseline paths transparently and yields correct data.
+    """
+    rank, device_id = _init_dist_for_case()
+    runtime = _runtime_imports()
+    world = dist.get_world_size()
+    device = torch.device("npu", device_id)
+    mesh = runtime["init_device_mesh_fn"](
+        device_type="npu",
+        mesh_shape=(world,),
+        mesh_dim_names=("dp",),
+    )
+
+    base = Path("./test_dcp_incremental_save_and_load")
+    baseline_ckpt = base / "baseline"
+    incremental_ckpt = base / "incremental"
+
+    if rank == 0:
+        if base.exists():
+            shutil.rmtree(base)
+        base.mkdir(parents=True, exist_ok=True)
+    dist.barrier()
+
+    # Step 1: full baseline save
+    model_state = _build_model_state(
+        step=1,
+        device=device,
+        mesh=mesh,
+        runtime=runtime,
+    )
+    runtime["save_fn"](model_state, checkpoint_id=baseline_ckpt, use_collectives=True)
+    dist.barrier()
+
+    # Step 2: mutate only dense and io_payload
+    _mutate_model_state(
+        model_state,
+        step=5,
+        device=device,
+        mesh=mesh,
+        runtime=runtime,
+    )
+
+    # Step 3: incremental save — only dense and io_payload changed
+    runtime["save_fn"](
+        model_state,
+        checkpoint_id=incremental_ckpt,
+        incremental_from=baseline_ckpt,
+        changed_fqns={"dense", "io_payload"},
+        use_collectives=True,
+    )
+    dist.barrier()
+
+    # Step 4: load the incremental checkpoint
+    load_state = {
+        "dense": torch.zeros((64, 32), dtype=torch.float32, device=device),
+        "dt_sharded": runtime["dtensor_cls"].from_local(
+            torch.zeros((32, 32), dtype=torch.float32, device=device), mesh, [runtime["shard_cls"](0)]
+        ),
+        "dt_replicated": runtime["dtensor_cls"].from_local(
+            torch.zeros((16, 24), dtype=torch.float32, device=device), mesh, [runtime["replicate_cls"]()]
+        ),
+        "io_payload": {"step": 0, "tag": ""},
+    }
+    runtime["load_fn"](load_state, checkpoint_id=incremental_ckpt, use_collectives=True)
+    dist.barrier()
+
+    assert torch.allclose(load_state["dense"], model_state["dense"])
+    assert torch.allclose(load_state["dt_sharded"].to_local(), model_state["dt_sharded"].to_local())
+    assert torch.allclose(load_state["dt_replicated"].to_local(), model_state["dt_replicated"].to_local())
+    io_payload = load_state["io_payload"]
+    assert isinstance(io_payload, dict)
+    # pylint: disable=unsubscriptable-object
+    assert io_payload["step"] == 5
+
+    # Step 5: verify metadata version
+    from hyper_parallel.core.distributed_checkpoint.filesystem_storage import FileSystemReader
+    from hyper_parallel.core.distributed_checkpoint.versioning import CURRENT_CHECKPOINT_VERSION
+    # pylint: disable=import-outside-toplevel
+
+    reader = FileSystemReader(incremental_ckpt)
+    md = reader.load_metadata()
+    assert md.version == CURRENT_CHECKPOINT_VERSION

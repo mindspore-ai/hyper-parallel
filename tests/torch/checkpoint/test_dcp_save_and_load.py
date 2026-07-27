@@ -74,3 +74,81 @@ def test_dcp_save_and_load_group3():
     parallel_run([
         TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_save_8card_load_4card", 12254, 4),
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dcp_save_and_load_group4():
+    """
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_dcp_save_and_load_with_static_dp_tp_pp
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_with_static_dp_tp_pp", 12257, 8),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dcp_save_and_load_group4_gloo():
+    """
+    Feature: parallel run case in checkpoint (gloo CPU backend)
+    Description:
+        1.test_dcp_save_and_load_with_static_dp_tp_pp
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_with_static_dp_tp_pp", num_proc=8),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dcp_save_and_load_dynamic_tp_pp():
+    """
+    Feature: DCP save and load with dynamic TP+PP topology change.
+    Description: Save on PP2×TP4 and load on PP4×TP2 using TopologyMapper.
+    Expectation: Run success, loaded values match expected TP2 shards.
+    """
+    parallel_run([
+        TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_dynamic_tp_pp", 12258, 8),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dcp_save_and_load_dynamic_tp_pp_gloo():
+    """
+    Feature: DCP save and load with dynamic TP+PP topology change (gloo CPU backend).
+    Description: Save on PP2×TP4 and load on PP4×TP2 using TopologyMapper.
+    Expectation: Run success, loaded values match expected TP2 shards.
+    """
+    parallel_run([
+        TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_dynamic_tp_pp", num_proc=8),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dcp_save_and_load_hsdp_ep_moe():
+    """
+    Feature: DCP save and load with HSDP + EP (MoE) topology change.
+    Description: Save on HSDP(rep=2,shard=2)×EP=2 and load on EP=4×TP=2
+        using TopologyMapper with PP FQN mapping.
+    Expectation: Run success, HSDP dedup correct, loaded expert/router/buffer
+        values match expected slices.
+    """
+    parallel_run([
+        TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_hsdp_ep_moe", 12259, 8),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dcp_save_and_load_hsdp_ep_moe_gloo():
+    """
+    Feature: DCP save and load with HSDP + EP (MoE) topology change (gloo CPU backend).
+    Description: Save on HSDP(rep=2,shard=2)×EP=2 and load on EP=4×TP=2
+        using TopologyMapper with PP FQN mapping.
+    Expectation: Run success, HSDP dedup correct, loaded expert/router/buffer
+        values match expected slices.
+    """
+    parallel_run([
+        TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_hsdp_ep_moe", num_proc=8),
+    ])

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """DCP save and load integration tests."""
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,6 +25,8 @@ from hyper_parallel import DTensor
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.distributed_checkpoint import async_save, load, save
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata
+from hyper_parallel.core.distributed_checkpoint.standard_planner import StandardLoadPlanner
+from hyper_parallel.core.distributed_checkpoint.topology_mapper import TopologyMapper
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
@@ -334,6 +337,11 @@ def test_dcp_async_save_and_load_with_dtensor_and_tensor_and_scalar() -> None:
         tensor_values=tensor_values,
     )
 
+    platform_obj = get_platform()
+    platform_obj.barrier()
+    if platform_obj.get_rank() == 0:
+        shutil.rmtree(checkpoint_path, ignore_errors=True)
+
 
 def test_dcp_save_and_load_with_dtensor_and_tensor_and_scalar() -> None:
     """
@@ -415,6 +423,12 @@ def test_dcp_save_and_load_with_dtensor_and_tensor_and_scalar() -> None:
         use_collectives=False,
     )
 
+    platform_obj = get_platform()
+    platform_obj.barrier()
+    if platform_obj.get_rank() == 0:
+        shutil.rmtree(checkpoint_path, ignore_errors=True)
+        shutil.rmtree(checkpoint_path_no_coll, ignore_errors=True)
+
 
 def test_dcp_save_and_load_with_full_tensor() -> None:
     """
@@ -443,6 +457,11 @@ def test_dcp_save_and_load_with_full_tensor() -> None:
         tensor_values=tensor_values,
         use_collectives=False,
     )
+
+    platform_obj = get_platform()
+    platform_obj.barrier()
+    if platform_obj.get_rank() == 0:
+        shutil.rmtree(checkpoint_path, ignore_errors=True)
 
 
 def _run_dcp_save_load_with_different_mesh_test(
@@ -658,3 +677,481 @@ def test_dcp_save_and_load_save_8card_load_4card() -> None:
         seed=3,
         scalar_values=scalar_values
     )
+
+    platform_obj = get_platform()
+    platform_obj.barrier()
+    if platform_obj.get_rank() == 0:
+        shutil.rmtree(checkpoint_path, ignore_errors=True)
+
+
+def test_dcp_save_and_load_with_static_dp_tp_pp() -> None:
+    """
+    Feature: DCP save and load with static DP + TP + PP topology.
+    Description: Save a checkpoint on a 3-D mesh (pp=2, dp=2, tp=2) and reload on the
+        same topology. Each PP stage wraps its parameters under a ``pp_stage_{pp_rank}``
+        namespace so that different stages do not collide in the global plan.
+    Expectation:
+        - Each rank loads its local shard and the values match the originals.
+        - Metadata contains FQNs for all PP stages.
+        - Each TP-sharded parameter has exactly ``tp_size`` chunks in metadata (DP
+          replicas are deduplicated).
+        - Different stages with the same local parameter name do not overwrite each other.
+    """
+    checkpoint_path = Path("./test_dcp_static_dp_tp_pp")
+    init_backend(_DEVICE_TYPE)
+    torch.manual_seed(42)
+    np.random.seed(41)
+
+    pp_size, dp_size, tp_size = 2, 2, 2
+    root_mesh = init_device_mesh(
+        device_type=_DEVICE_TYPE,
+        mesh_shape=(pp_size, dp_size, tp_size),
+        mesh_dim_names=("pp", "dp", "tp"),
+    )
+
+    platform_obj = get_platform()
+    rank = platform_obj.get_rank()
+
+    pp_rank = rank // (dp_size * tp_size)
+    stage_mesh = root_mesh["dp", "tp"]
+
+    dp_tp_placements = [Replicate(), Shard(1)]
+    param_local_shape = (8, 4)
+    global_shape = (8, 8)
+
+    local_tensor = to_device(
+        torch.randn(*param_local_shape) + pp_rank * 100.0 + (rank % tp_size) * 10.0,
+        _DEVICE_TYPE,
+    )
+    dtensor = DTensor.from_local(local_tensor, stage_mesh, dp_tp_placements)
+
+    stage_key = f"pp_stage_{pp_rank}"
+    save_state_dict = {
+        "model": {
+            stage_key: {
+                "layers.0.weight": dtensor,
+            },
+        },
+    }
+    original_local = dtensor.to_local().clone()
+
+    metadata = save(save_state_dict, checkpoint_id=checkpoint_path, use_collectives=True)
+    assert metadata is not None
+
+    fqn0 = "model.pp_stage_0.layers.0.weight"
+    fqn1 = "model.pp_stage_1.layers.0.weight"
+    assert fqn0 in metadata.state_dict_metadata, f"Missing {fqn0} in metadata"
+    assert fqn1 in metadata.state_dict_metadata, f"Missing {fqn1} in metadata"
+
+    md0 = metadata.state_dict_metadata[fqn0]
+    md1 = metadata.state_dict_metadata[fqn1]
+    assert len(md0.chunks) == tp_size, (
+        f"Stage 0 should have {tp_size} TP chunks, got {len(md0.chunks)}"
+    )
+    assert len(md1.chunks) == tp_size, (
+        f"Stage 1 should have {tp_size} TP chunks, got {len(md1.chunks)}"
+    )
+
+    load_local_tensor = to_device(torch.zeros(*param_local_shape), _DEVICE_TYPE)
+    load_dtensor = DTensor.from_local(load_local_tensor, stage_mesh, dp_tp_placements)
+    load_state_dict = {
+        "model": {
+            stage_key: {
+                "layers.0.weight": load_dtensor,
+            },
+        },
+    }
+
+    load(load_state_dict, checkpoint_id=checkpoint_path, use_collectives=True)
+
+    loaded_local = load_state_dict["model"][stage_key]["layers.0.weight"].to_local()
+    assert np.allclose(
+        original_local.cpu().detach().numpy(),
+        loaded_local.cpu().detach().numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    ), "Loaded local shard does not match original"
+
+    platform_obj.barrier()
+    if rank == 0:
+        shutil.rmtree(checkpoint_path, ignore_errors=True)
+
+
+def test_dcp_save_and_load_dynamic_tp_pp() -> None:
+    """
+    Feature: DCP save and load with dynamic TP+PP topology change.
+    Description: Save a checkpoint on PP2×TP4 (4 logical layers, 2 per PP stage,
+        each stage sharded across 4 TP ranks) and reload on PP4×TP2 (4 logical
+        layers, 1 per PP stage, each stage sharded across 2 TP ranks).
+        Each weight uses a deterministic value derived from "logical layer index +
+        TP shard index" so that correctness can be verified after topology change.
+        The TopologyMapper provides the explicit mapping from target FQNs (under the
+        new PP stages) to checkpoint FQNs (under the old PP stages).
+    Expectation:
+        - Each rank loads its TP2 local shard and the values match the expected
+          slice of the global weight for the corresponding logical layer.
+        - Parameters that migrated to a different PP stage are loaded correctly
+          via the FQN mapping.
+        - A target TP2 shard may read from multiple source TP4 chunks.
+    """
+    checkpoint_path = Path("./test_dcp_dynamic_tp_pp")
+    init_backend(_DEVICE_TYPE)
+    torch.manual_seed(100)
+    np.random.seed(99)
+
+    platform_obj = get_platform()
+    rank = platform_obj.get_rank()
+    world_size = platform_obj.get_world_size()
+    assert world_size == 8, f"This test requires 8 ranks, got {world_size}"
+
+    num_layers = 4
+    global_shape = (8, 8)
+
+    # ========== SAVE PHASE: PP2×TP4 ==========
+    save_pp_size, save_dp_size, save_tp_size = 2, 1, 4
+    save_mesh = init_device_mesh(
+        device_type=_DEVICE_TYPE,
+        mesh_shape=(save_pp_size, save_dp_size, save_tp_size),
+        mesh_dim_names=("pp", "dp", "tp"),
+    )
+
+    save_pp_rank = rank // (save_dp_size * save_tp_size)
+    save_tp_rank = rank % save_tp_size
+    save_stage_mesh = save_mesh["dp", "tp"]
+
+    save_placements = [Replicate(), Shard(1)]
+    local_cols = global_shape[1] // save_tp_size
+    param_local_shape = (global_shape[0], local_cols)
+
+    layers_per_stage = num_layers // save_pp_size
+    stage_offset = save_pp_rank * layers_per_stage
+
+    save_state_dict: dict[str, Any] = {"model": {}}
+    original_global_weights: dict[int, torch.Tensor] = {}
+
+    for local_idx in range(layers_per_stage):
+        global_layer_idx = stage_offset + local_idx
+        local_tensor = to_device(
+            torch.full(param_local_shape, float(global_layer_idx * 100 + save_tp_rank * 10 + 1)),
+            _DEVICE_TYPE,
+        )
+        dtensor = DTensor.from_local(local_tensor, save_stage_mesh, save_placements)
+        stage_key = f"pp_stage_{save_pp_rank}"
+        save_state_dict["model"].setdefault(stage_key, {})[
+            f"layers.{local_idx}.weight"
+        ] = dtensor
+        original_global_weights[global_layer_idx] = dtensor.full_tensor().clone()
+
+    metadata = save(save_state_dict, checkpoint_id=checkpoint_path, use_collectives=True)
+    assert metadata is not None
+
+    platform_obj.barrier()
+
+    # ========== LOAD PHASE: PP4×TP2 ==========
+    load_pp_size, load_dp_size, load_tp_size = 4, 1, 2
+    load_mesh = init_device_mesh(
+        device_type=_DEVICE_TYPE,
+        mesh_shape=(load_pp_size, load_dp_size, load_tp_size),
+        mesh_dim_names=("pp", "dp", "tp"),
+    )
+
+    load_pp_rank = rank // (load_dp_size * load_tp_size)
+    load_tp_rank = rank % load_tp_size
+    load_stage_mesh = load_mesh["dp", "tp"]
+
+    load_placements = [Replicate(), Shard(1)]
+    load_local_cols = global_shape[1] // load_tp_size
+    load_local_shape = (global_shape[0], load_local_cols)
+
+    load_layers_per_stage = num_layers // load_pp_size
+    assert load_layers_per_stage == 1
+
+    load_state_dict: dict[str, Any] = {"model": {}}
+    load_stage_key = f"pp_stage_{load_pp_rank}"
+    load_local_tensor = to_device(torch.zeros(*load_local_shape), _DEVICE_TYPE)
+    load_dtensor = DTensor.from_local(load_local_tensor, load_stage_mesh, load_placements)
+    load_state_dict["model"][load_stage_key] = {
+        "layers.0.weight": load_dtensor,
+    }
+
+    target_fqn = f"model.{load_stage_key}.layers.0.weight"
+    global_layer_idx_for_load = load_pp_rank
+
+    old_pp_stage = global_layer_idx_for_load // layers_per_stage
+    old_local_idx = global_layer_idx_for_load % layers_per_stage
+    checkpoint_fqn = f"model.pp_stage_{old_pp_stage}.layers.{old_local_idx}.weight"
+
+    fqn_mapping = {target_fqn: checkpoint_fqn}
+    mapper = TopologyMapper(target_to_checkpoint_fqn=fqn_mapping)
+    planner = StandardLoadPlanner(topology_mapper=mapper)
+
+    load(
+        load_state_dict,
+        checkpoint_id=checkpoint_path,
+        planner=planner,
+        use_collectives=True,
+    )
+
+    loaded_local = load_state_dict["model"][load_stage_key]["layers.0.weight"].to_local()
+    expected_global = original_global_weights[global_layer_idx_for_load]
+    expected_local = expected_global[:, load_tp_rank * load_local_cols:(load_tp_rank + 1) * load_local_cols]
+
+    assert np.allclose(
+        expected_local.cpu().detach().numpy(),
+        loaded_local.cpu().detach().numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    ), (
+        f"Rank {rank} (load pp={load_pp_rank}, tp={load_tp_rank}): "
+        f"local shard mismatch for layer {global_layer_idx_for_load}"
+    )
+
+    platform_obj.barrier()
+    if rank == 0:
+        shutil.rmtree(checkpoint_path, ignore_errors=True)
+
+
+def test_dcp_save_and_load_hsdp_ep_moe() -> None:
+    """
+    Feature: DCP save and load with HSDP + EP (MoE) topology, including EP resize
+        and PP FQN mapping.
+    Description: Save a MoE-like state_dict on a 3-D mesh
+        (hsdp_rep=2, hsdp_shard=2, ep=2) where expert weights w1/w2/w3 are
+        sharded along dim-0 by both hsdp_shard and ep, the router gate weight
+        is replicated, and expert_bias / tokens_per_expert are regular tensors.
+        All parameters are wrapped under ``model.pp_stage_0``.
+
+        Reload on a 2-D mesh (ep=4, tp=2) where expert weights are sharded
+        by ep on dim-0 and by tp on dim-1 (simulating ExpertTensorParallel).
+        Parameters are wrapped under ``model.pp_stage_1`` with explicit
+        TopologyMapper FQN mapping.
+
+        Deterministic values encode the expert index so that correctness can
+        be verified after the topology change.
+    Expectation:
+        - HSDP replicate ranks produce identical chunks; after dedup the
+          expert weight metadata has exactly ``hsdp_shard * ep = 4`` unique
+          chunks instead of 8.
+        - Router gate weight has exactly 1 unique chunk (replicated on all
+          8 ranks).
+        - After loading with EP4×TP2, each rank's local expert shard matches
+          the expected slice of the global weight.
+        - Router, expert_bias, and tokens_per_expert are restored correctly.
+    """
+    checkpoint_path = Path("./test_dcp_hsdp_ep_moe")
+    init_backend(_DEVICE_TYPE)
+    torch.manual_seed(200)
+    np.random.seed(199)
+
+    platform_obj = get_platform()
+    rank = platform_obj.get_rank()
+    world_size = platform_obj.get_world_size()
+    assert world_size == 8, f"This test requires 8 ranks, got {world_size}"
+
+    num_experts = 8
+    dim = 16
+    hidden_dim = 32
+    expert_global_shape = (num_experts, hidden_dim, dim)
+
+    # ========== SAVE PHASE: HSDP(rep=2, shard=2) × EP=2 ==========
+    save_mesh = init_device_mesh(
+        device_type=_DEVICE_TYPE,
+        mesh_shape=(2, 2, 2),
+        mesh_dim_names=("hsdp_rep", "hsdp_shard", "ep"),
+    )
+
+    save_shard_rank = (rank % 4) // 2
+    save_ep_rank = rank % 2
+
+    save_stage_mesh = save_mesh["hsdp_shard", "ep"]
+
+    expert_placements = [Shard(0), Shard(0)]
+    local_experts = num_experts // (2 * 2)
+    expert_local_shape = (local_experts, hidden_dim, dim)
+
+    local_tensor = to_device(
+        torch.arange(
+            save_shard_rank * 4 + save_ep_rank * local_experts,
+            save_shard_rank * 4 + save_ep_rank * local_experts + local_experts,
+            dtype=torch.float32,
+        ).unsqueeze(-1).unsqueeze(-1).expand(expert_local_shape) + 0.1,
+        _DEVICE_TYPE,
+    )
+    expert_dtensor = DTensor.from_local(
+        local_tensor, save_stage_mesh, expert_placements,
+    )
+
+    router_placements = [Replicate(), Replicate()]
+    router_local_shape = expert_global_shape[:1] + expert_global_shape[2:]
+    router_local_tensor = to_device(
+        torch.full(router_local_shape, 42.0),
+        _DEVICE_TYPE,
+    )
+    router_dtensor = DTensor.from_local(
+        router_local_tensor, save_stage_mesh, router_placements,
+    )
+
+    original_expert_global = expert_dtensor.full_tensor().clone()
+    original_router_global = router_dtensor.full_tensor().clone()
+
+    expert_bias_val = to_device(
+        torch.full((num_experts,), 7.0), _DEVICE_TYPE,
+    )
+    tokens_per_expert_val = to_device(
+        torch.zeros((num_experts,)), _DEVICE_TYPE,
+    )
+
+    save_state_dict: dict[str, Any] = {
+        "model": {
+            "pp_stage_0": {
+                "experts.w1": expert_dtensor,
+                "experts.w2": expert_dtensor.clone(),
+                "experts.w3": expert_dtensor.clone(),
+                "router.gate.weight": router_dtensor,
+                "expert_bias": expert_bias_val,
+                "tokens_per_expert": tokens_per_expert_val,
+            },
+        },
+    }
+
+    metadata = save(
+        save_state_dict,
+        checkpoint_id=checkpoint_path,
+        use_collectives=True,
+    )
+    assert metadata is not None
+
+    fqn_prefix = "model.pp_stage_0"
+    for weight_name in ("experts.w1", "experts.w2", "experts.w3"):
+        fqn = f"{fqn_prefix}.{weight_name}"
+        assert fqn in metadata.state_dict_metadata, f"Missing {fqn}"
+        md = metadata.state_dict_metadata[fqn]
+        assert len(md.chunks) == 4, (
+            f"{fqn} should have 4 unique chunks after HSDP dedup, got {len(md.chunks)}"
+        )
+
+    router_fqn = f"{fqn_prefix}.router.gate.weight"
+    assert router_fqn in metadata.state_dict_metadata
+    router_md = metadata.state_dict_metadata[router_fqn]
+    assert len(router_md.chunks) == 1, (
+        f"Router should have 1 unique chunk after dedup, got {len(router_md.chunks)}"
+    )
+
+    platform_obj.barrier()
+
+    # ========== LOAD PHASE: EP=4 × TP=2, PP stage 0 → stage 1 ==========
+    load_mesh = init_device_mesh(
+        device_type=_DEVICE_TYPE,
+        mesh_shape=(4, 2),
+        mesh_dim_names=("ep", "tp"),
+    )
+
+    load_ep_rank = rank // 2
+    load_tp_rank = rank % 2
+
+    load_expert_placements = [Shard(0), Shard(2)]
+    load_local_experts = num_experts // 4
+    load_expert_local_shape = (load_local_experts, hidden_dim, dim // 2)
+
+    load_expert_tensor = to_device(
+        torch.zeros(*load_expert_local_shape), _DEVICE_TYPE,
+    )
+    load_expert_dtensor = DTensor.from_local(
+        load_expert_tensor, load_mesh, load_expert_placements,
+    )
+
+    load_router_placements = [Replicate(), Replicate()]
+    load_router_tensor = to_device(
+        torch.zeros(*router_local_shape), _DEVICE_TYPE,
+    )
+    load_router_dtensor = DTensor.from_local(
+        load_router_tensor, load_mesh, load_router_placements,
+    )
+
+    load_expert_bias = to_device(
+        torch.full((num_experts,), -1.0), _DEVICE_TYPE,
+    )
+    load_tokens_per_expert = to_device(
+        torch.full((num_experts,), -1.0), _DEVICE_TYPE,
+    )
+
+    load_state_dict: dict[str, Any] = {
+        "model": {
+            "pp_stage_1": {
+                "experts.w1": load_expert_dtensor,
+                "experts.w2": load_expert_dtensor.clone(),
+                "experts.w3": load_expert_dtensor.clone(),
+                "router.gate.weight": load_router_dtensor,
+                "expert_bias": load_expert_bias,
+                "tokens_per_expert": load_tokens_per_expert,
+            },
+        },
+    }
+
+    fqn_mapping: dict[str, str] = {}
+    for name in (
+        "experts.w1", "experts.w2", "experts.w3",
+        "router.gate.weight", "expert_bias", "tokens_per_expert",
+    ):
+        target_fqn = f"model.pp_stage_1.{name}"
+        ckpt_fqn = f"model.pp_stage_0.{name}"
+        fqn_mapping[target_fqn] = ckpt_fqn
+
+    mapper = TopologyMapper(target_to_checkpoint_fqn=fqn_mapping)
+    planner = StandardLoadPlanner(topology_mapper=mapper)
+
+    load(
+        load_state_dict,
+        checkpoint_id=checkpoint_path,
+        planner=planner,
+        use_collectives=True,
+    )
+
+    for weight_name in ("experts.w1", "experts.w2", "experts.w3"):
+        loaded_local = load_state_dict["model"]["pp_stage_1"][weight_name].to_local()
+        expected_global = original_expert_global
+        expert_start = load_ep_rank * load_local_experts
+        expert_end = expert_start + load_local_experts
+        tp_start = load_tp_rank * (dim // 2)
+        tp_end = tp_start + (dim // 2)
+        expected_local = expected_global[expert_start:expert_end, :, tp_start:tp_end]
+
+        assert np.allclose(
+            expected_local.cpu().detach().numpy(),
+            loaded_local.cpu().detach().numpy(),
+            rtol=1e-5,
+            atol=1e-5,
+        ), (
+            f"Rank {rank} (ep={load_ep_rank}, tp={load_tp_rank}): "
+            f"{weight_name} local shard mismatch"
+        )
+
+    loaded_router_local = load_state_dict["model"]["pp_stage_1"][
+        "router.gate.weight"
+    ].to_local()
+    assert np.allclose(
+        original_router_global.cpu().detach().numpy(),
+        loaded_router_local.cpu().detach().numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    ), f"Rank {rank}: router gate weight mismatch after load"
+
+    loaded_bias = load_state_dict["model"]["pp_stage_1"]["expert_bias"]
+    assert np.allclose(
+        torch.full((num_experts,), 7.0).numpy(),
+        loaded_bias.cpu().detach().numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    ), f"Rank {rank}: expert_bias mismatch after load"
+
+    loaded_tpe = load_state_dict["model"]["pp_stage_1"]["tokens_per_expert"]
+    assert np.allclose(
+        torch.zeros((num_experts,)).numpy(),
+        loaded_tpe.cpu().detach().numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    ), f"Rank {rank}: tokens_per_expert mismatch after load"
+
+    platform_obj.barrier()
+    if rank == 0:
+        shutil.rmtree(checkpoint_path, ignore_errors=True)

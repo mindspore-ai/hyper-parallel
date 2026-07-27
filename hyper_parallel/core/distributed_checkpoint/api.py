@@ -21,7 +21,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Collection, Optional, Union
 
 from hyper_parallel.core.distributed_checkpoint.async_staging import build_staged_state_dict
 from hyper_parallel.core.distributed_checkpoint.standard_planner import StandardSavePlanner, StandardLoadPlanner
@@ -29,6 +29,7 @@ from hyper_parallel.core.distributed_checkpoint.filesystem_storage import FileSy
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata
 from hyper_parallel.core.distributed_checkpoint.planner import SavePlanner, LoadPlanner
 from hyper_parallel.core.distributed_checkpoint.storage import StorageReader, StorageWriter
+from hyper_parallel.core.distributed_checkpoint.versioning import migrate_metadata
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -85,8 +86,47 @@ def _save_impl(
     planner: Optional[SavePlanner] = None,
     no_dist: bool = False,
     use_collectives: bool = True,
+    incremental_from: Optional[Union[Path, str]] = None,
+    changed_fqns: Optional[Collection[str]] = None,
 ) -> Metadata:
-    """Synchronous distributed checkpoint save (shared by :func:`save` and :func:`async_save`)."""
+    """Synchronous distributed checkpoint save (shared by :func:`save` and :func:`async_save`).
+
+    Args:
+        state_dict: The state_dict to save.
+        checkpoint_id: Checkpoint directory path.
+        storage_writer: Custom storage writer. Default None.
+        planner: Custom save planner. Default None.
+        no_dist: Single-process mode. Default False.
+        use_collectives: Use collective communication. Default True.
+        incremental_from: Baseline checkpoint directory for incremental save.
+            Must be provided together with *changed_fqns*. Default None.
+        changed_fqns: Set of dot-separated FQNs that have changed relative to
+            the baseline. Must be provided together with *incremental_from*.
+            Default None.
+
+    Returns:
+        Metadata: Metadata object for the saved checkpoint.
+
+    Raises:
+        ValueError: If incremental parameters are partially provided, if a
+            custom *storage_writer* is used with incremental save, or if
+            *changed_fqns* contains invalid entries.
+    """
+    if (incremental_from is None) != (changed_fqns is None):
+        raise ValueError(
+            "incremental_from and changed_fqns must be provided together or both omitted."
+        )
+    if incremental_from is not None and storage_writer is not None:
+        raise ValueError(
+            "Incremental save is only supported with the default FileSystemWriter; "
+            "passing a custom storage_writer is not allowed."
+        )
+    if changed_fqns is not None:
+        for fqn in changed_fqns:
+            if not isinstance(fqn, str) or not fqn:
+                raise ValueError(
+                    f"Each item in changed_fqns must be a non-empty string, got {fqn!r}."
+                )
     # Convert checkpoint_id to Path if it's a string
     checkpoint_id = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
 
@@ -97,7 +137,11 @@ def _save_impl(
     if storage_writer is None:
         if checkpoint_id is None:
             raise ValueError("Either storage_writer or checkpoint_id must be provided")
-        storage_writer = FileSystemWriter(checkpoint_id)
+        storage_writer = FileSystemWriter(
+            checkpoint_id,
+            incremental_from=incremental_from,
+            changed_fqns=changed_fqns,
+        )
     else:
         if checkpoint_id:
             storage_writer.initialize_writer(checkpoint_id)
@@ -111,11 +155,13 @@ def _save_impl(
     is_coordinator = rank == 0
 
     # Configure planner
+    is_incremental = incremental_from is not None
     planner.configure_planner(
         state_dict=state_dict,
         is_coordinator=is_coordinator,
         rank=rank,
-        use_collectives=use_collectives
+        use_collectives=use_collectives,
+        incremental=is_incremental,
     )
 
     # Configure storage writer (use_collectives for rank-local metadata when False)
@@ -172,6 +218,8 @@ def _async_persist_worker(
         planner: Optional[SavePlanner],
         no_dist: bool,
         use_collectives: bool,
+        incremental_from: Optional[Union[Path, str]],
+        changed_fqns: Optional[Collection[str]],
 ) -> None:
     """Child-process entry: run :func:`_save_impl` and report ``Metadata`` or an error string on ``result_queue``."""
     try:
@@ -182,6 +230,8 @@ def _async_persist_worker(
             planner=planner,
             no_dist=no_dist,
             use_collectives=use_collectives,
+            incremental_from=incremental_from,
+            changed_fqns=changed_fqns,
         )
         result_queue.put((_AsyncPersistStatus.SUCCESS, meta))
     except Exception:  # pylint: disable=broad-except
@@ -224,6 +274,8 @@ def save(
         planner: Optional[SavePlanner] = None,
         no_dist: bool = False,
         use_collectives: bool = True,
+        incremental_from: Optional[Union[Path, str]] = None,
+        changed_fqns: Optional[Collection[str]] = None,
 ) -> Metadata:
     """
     Save a distributed checkpoint in SPMD style.
@@ -243,6 +295,10 @@ def save(
         use_collectives (bool): If True, use collective communication for coordination.
             If False, each rank saves its own shard data and rank-local metadata (.metadata_rank{rank}),
             with no cross-rank interaction. Default True.
+        incremental_from (Optional[Union[Path, str]]): Baseline checkpoint directory for incremental save.
+            Must be provided together with *changed_fqns*. Default None.
+        changed_fqns (Optional[Collection[str]]): Set of dot-separated FQNs that have changed relative
+            to the baseline. Must be provided together with *incremental_from*. Default None.
 
     Returns:
         Metadata: Metadata object for the saved checkpoint.
@@ -254,6 +310,8 @@ def save(
         planner=planner,
         no_dist=no_dist,
         use_collectives=use_collectives,
+        incremental_from=incremental_from,
+        changed_fqns=changed_fqns,
     )
     platform.barrier()
     return metadata
@@ -267,6 +325,8 @@ def async_save(
         planner: Optional[SavePlanner] = None,
         no_dist: bool = False,
         use_collectives: bool = True,
+        incremental_from: Optional[Union[Path, str]] = None,
+        changed_fqns: Optional[Collection[str]] = None,
 ) -> AsyncSaveResponse:
     """
     Asynchronous version of :func:`save` using a **background child process** for persistence.
@@ -295,6 +355,8 @@ def async_save(
         planner (Optional[SavePlanner]): Same as :func:`save`.
         no_dist (bool): Same as :func:`save`.
         use_collectives (bool): Same as :func:`save`.
+        incremental_from (Optional[Union[Path, str]]): Same as :func:`save`.
+        changed_fqns (Optional[Collection[str]]): Same as :func:`save`.
 
     Returns:
         AsyncSaveResponse: Contains ``persist_completion`` only; staging is synchronous.
@@ -314,6 +376,8 @@ def async_save(
             planner,
             no_dist,
             use_collectives,
+            incremental_from,
+            changed_fqns,
         ),
         name="HPAsyncCheckpointPersist",
     )
@@ -389,6 +453,9 @@ def load(
         # Fallback to rank-local metadata (e.g. checkpoint saved with use_collectives=False)
         metadata = storage_reader.load_metadata(rank=rank)
         use_collectives = False
+
+    # Migrate metadata to the current format version
+    metadata = migrate_metadata(metadata)
 
     # Configure planner
     planner.configure_planner(

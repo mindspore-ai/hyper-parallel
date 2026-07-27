@@ -87,12 +87,12 @@ class TestMetadata(unittest.TestCase):
         """
         Feature: Global Metadata container defaults.
         Description: Build Metadata with one tensor entry.
-        Expectation: version is 1.0; planner_data and storage_data default to None.
+        Expectation: version is 2.0; planner_data and storage_data default to None.
         """
         props = TensorProperties(dtype="float32")
         tensor_md = TensorStorageMetadata(properties=props, size=(4,))
         md = Metadata(state_dict_metadata={"w": tensor_md})
-        self.assertEqual(md.version, "1.0")
+        self.assertEqual(md.version, "2.0")
         self.assertIsNone(md.planner_data)
         self.assertIsNone(md.storage_data)
         self.assertIn("w", md.state_dict_metadata)
