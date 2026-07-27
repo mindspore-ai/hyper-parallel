@@ -32,10 +32,18 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     """Training-loop parameters exposed by the initial YAML schema."""
 
-    max_steps: Optional[int] = None
+    train_iters: Optional[int] = None
+    train_samples: Optional[int] = None
+    eval_iters: int = 0
+
+    consumed_train_samples: int = 0
+    consumed_valid_samples: int = 0
+    # max_steps: Optional[int] = None
+
     num_train_epochs: int = 1
     global_batch_size: int = 8
     micro_batch_size: int = 1
+
     backend: Literal["nccl", "hccl", "gloo"] = "nccl"
     max_grad_norm: float = 1.0
     init_device: Literal["meta", "cpu", "cuda", "npu"] = "meta"
@@ -121,11 +129,11 @@ class Target(Generic[_T]):
     """Configuration for one callable whose invocation is delayed until runtime."""
 
     def __init__(
-        self,
-        _target_: Callable[..., _T],  # pylint: disable=invalid-name
-        *,
-        target_path: str,
-        **kwargs: Any,
+            self,
+            _target_: Callable[..., _T],  # pylint: disable=invalid-name
+            *,
+            target_path: str,
+            **kwargs: Any,
     ) -> None:
         """Store the resolved callable, its source path, and configured arguments."""
         if not callable(_target_):
@@ -148,8 +156,8 @@ class Target(Generic[_T]):
         """Invoke the target with configured and applicable runtime arguments."""
         signature = inspect.signature(self._target_)
         if not any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
         ):
             runtime_kwargs = {
                 name: value
@@ -326,9 +334,9 @@ class PlanOverride:
                 f"{path}: 期望 'first_input'、{{axis: placement}} 或 "
                 f"{{name: {{axis: placement}}}}，got {raw!r}")
         if all(isinstance(v, str) for v in raw.values()):
-            return parse_named_placement(raw, path=path)      # 单输出
+            return parse_named_placement(raw, path=path)  # 单输出
         return {name: parse_named_placement(named, path=f"{path}.{name}")
-                for name, named in raw.items()}               # 多输出
+                for name, named in raw.items()}  # 多输出
 
     def _parse_contract_field(self, attr, raw):
         """YAML form → spec field value (DSL parse / sentinel pass-through)."""
@@ -350,7 +358,7 @@ class PlanOverride:
                 f"plan_overrides match={self.match!r} 的契约字段 {attr} 期望映射"
                 f"或哨兵字符串，got {raw!r}")
         if not raw:
-            return {}        # 显式空（"写了照办"：清空/不切分），区别于不写
+            return {}  # 显式空（"写了照办"：清空/不切分），区别于不写
         if attr in ("out_src", "out_dst") and all(
                 isinstance(v, str) for v in raw.values()):
             # 标量简写 {axis: placement} —— 直接是 NamedPlacement（output 名由
@@ -368,7 +376,7 @@ _WHEN_CONDITIONS = ("cp", "ep")
 
 
 def entries_to_plan_overrides(
-    entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
+        entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
 ) -> "dict[str, Any]":
     """Desugar PlanOverride entries into a ``plan_overrides`` dict.
 
@@ -413,6 +421,17 @@ def entries_to_plan_overrides(
 
 
 @dataclass
+class ModelAssetsConfig:
+    """Tokenizer and chat-template configuration for text datasets."""
+
+    datasets_type: Literal["plaintext", "conversation", "pretokenized"] = (
+        "pretokenized"
+    )
+    chat_template: Optional[str] = None
+    tokenizer: Optional[Target[Any]] = None
+
+
+@dataclass
 class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
@@ -435,10 +454,14 @@ class TrainerConfig:
         default_factory=GradientCheckpointingConfig
     )
 
+    # data
+    tokenizer: Optional[Target[Any]] = None
+    model_assets: ModelAssetsConfig = field(default_factory=ModelAssetsConfig)
     data_transform: Optional[Target[Any]] = None
     dataset: Optional[Target[Any]] = None
     collate_fn: Optional[Target[Any]] = None
     dataloader: Optional[Target[Any]] = None
+    get_batch: Optional[Target[Any]] = None
     packed_sequence: Optional[Any] = None
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)

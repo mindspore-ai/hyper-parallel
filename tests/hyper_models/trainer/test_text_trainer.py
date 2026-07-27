@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import hyper_models.trainer.text_trainer as text_trainer_module
+from hyper_models.components.datasets.batch import PreparedBatch
 
 
 class _FakeBaseTrainer:
@@ -84,6 +85,17 @@ def test_text_trainer_keeps_explicit_base_stage_order(monkeypatch) -> None:
     )
     _FakeBaseTrainer.calls = []
     config = object()
+    for method_name, stage in (
+        ("_build_model_assets", "model_assets"),
+        ("_build_data_transform", "data_transform"),
+        ("_build_collate_fn", "collate_fn"),
+        ("_build_get_batch", "get_batch"),
+    ):
+        monkeypatch.setattr(
+            text_trainer_module.TextTrainer,
+            method_name,
+            lambda self, stage=stage: self.base._record(stage),
+        )
 
     trainer = text_trainer_module.TextTrainer(config)
 
@@ -97,6 +109,7 @@ def test_text_trainer_keeps_explicit_base_stage_order(monkeypatch) -> None:
         "dataset",
         "collate_fn",
         "dataloader",
+        "get_batch",
         "train_steps",
         "optimizer",
         "lr_scheduler",
@@ -111,6 +124,12 @@ def test_text_trainer_keeps_explicit_base_stage_order(monkeypatch) -> None:
 def test_text_train_step_uses_base_distributed_runtime(monkeypatch) -> None:
     """Use BaseTrainer FSDP synchronization and optional scheduler behavior."""
     optimizer = SimpleNamespace(step=Mock(), zero_grad=Mock())
+    get_batch = Mock(
+        side_effect=lambda data_iterator: PreparedBatch(
+            model_inputs=next(data_iterator),
+            loss_inputs={},
+        )
+    )
     base = SimpleNamespace(
         config=SimpleNamespace(
             training=SimpleNamespace(max_grad_norm=1.0),
@@ -119,6 +138,8 @@ def test_text_train_step_uses_base_distributed_runtime(monkeypatch) -> None:
         model=object(),
         optimizer=optimizer,
         lr_scheduler=None,
+        num_micro_batches=1,
+        get_batch=get_batch,
         model_reshard=Mock(),
         _configure_fsdp_gradient_sync=Mock(),
         forward_backward_step=Mock(
@@ -134,9 +155,10 @@ def test_text_train_step_uses_base_distributed_runtime(monkeypatch) -> None:
         text_trainer_module.TextTrainer
     )
     trainer.base = base
-    micro_batches = [
-        {"input_ids": torch.ones(2, 3), "labels": torch.ones(2, 3)}
-    ]
+    micro_batch = {
+        "input_ids": torch.ones(2, 3),
+        "labels": torch.ones(2, 3),
+    }
     sync_calls: list[str] = []
     monkeypatch.setattr(text_trainer_module, "synchronize", lambda: None)
     monkeypatch.setattr(
@@ -155,12 +177,13 @@ def test_text_train_step_uses_base_distributed_runtime(monkeypatch) -> None:
         nullcontext,
     )
 
-    metrics = trainer.train_step(iter([micro_batches]))
+    metrics = trainer.train_step(iter([micro_batch]))
 
     assert metrics == {"loss": 2.0, "grad_norm": 0.5}
     assert base.state.global_step == 1
     base.model_reshard.assert_called_once_with(0, 1)
     base._configure_fsdp_gradient_sync.assert_called_once_with(0, 1)
+    get_batch.assert_called_once()
     assert sync_calls == ["hsdp"]
     optimizer.step.assert_called_once_with()
     optimizer.zero_grad.assert_called_once_with()
@@ -174,6 +197,7 @@ def test_text_train_step_does_not_advance_after_dataloader_end() -> None:
     trainer.base = SimpleNamespace(
         config=SimpleNamespace(),
         state=SimpleNamespace(global_step=3),
+        get_batch=lambda data_iterator: next(data_iterator),
     )
 
     with pytest.raises(StopIteration):

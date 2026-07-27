@@ -206,10 +206,14 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
         )
     if origin is tuple or annotation is tuple:
         return _normalize_tuple(value, args, path=path)
-    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
-        # nested dataclass items (e.g. List[PlanOverride]) resolve as
-        # mappings, mirroring resolve_component's dataclass branch
-        return _resolve_dataclass(value, annotation, path=path)
+    if origin in (dict, Mapping) or annotation in (dict, Mapping):
+        if not isinstance(value, Mapping):
+            raise _fail(path, f"expected mapping, got {type(value).__name__}")
+        return dict(value)
+    # if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
+    #     # nested dataclass items (e.g. List[PlanOverride]) resolve as
+    #     # mappings, mirroring resolve_component's dataclass branch
+    #     return _resolve_dataclass(value, annotation, path=path)
     if isinstance(annotation, type):
         if isinstance(value, annotation):
             return value
