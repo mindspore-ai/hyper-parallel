@@ -29,6 +29,7 @@ import torch
 
 from hyper_parallel.platform.torch.platform import TorchPlatform
 from hyper_parallel.platform.torch.dtensor import DTensorBase
+from tests.common.mark_utils import arg_mark
 
 
 class TestTorchPlatformCore(unittest.TestCase):
@@ -372,6 +373,44 @@ class TestTorchPlatformCore(unittest.TestCase):
         handle.wait()
         work_a.wait.assert_called_once_with()
         work_b.wait.assert_called_once_with()
+
+    @arg_mark(
+        plat_marks=["cpu_linux"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_create_p2p_multi_stream_groups_creates_local_edges_in_stable_order(self) -> None:
+        """
+        Feature: PyTorch multi-stream pipeline P2P groups.
+        Description: Initialize groups for an interior rank in an interleaved PP ring.
+        Expectation: Adjacent groups are created in stable order with local synchronization.
+        """
+        groups = [MagicMock(name=f"group_{index}") for index in range(2)]
+        with mock.patch.dict(
+                "hyper_parallel.platform.torch.platform.EXISTING_COMM_GROUPS",
+                clear=True,
+        ), mock.patch(
+            "hyper_parallel.platform.torch.platform.dist.get_rank",
+            return_value=1,
+        ), mock.patch(
+            "hyper_parallel.platform.torch.platform.dist.get_world_size",
+            return_value=4,
+        ), mock.patch(
+            "hyper_parallel.platform.torch.platform.dist.new_group",
+            side_effect=groups,
+        ) as new_group:
+            local_groups = TorchPlatform.create_p2p_multi_stream_groups(
+                [0, 1, 2, 3],
+                include_wrap=True,
+            )
+
+        expected_calls = [
+            mock.call(ranks=[0, 1], use_local_synchronization=True),
+            mock.call(ranks=[1, 2], use_local_synchronization=True),
+        ]
+        self.assertEqual(new_group.call_args_list, expected_calls)
+        self.assertEqual(local_groups, {0: groups[0], 2: groups[1]})
 
     def test_differentiable_async_allgather_wait_immediate_backward(self):
         """Async all-gather wait should return a real gradient when handle_box is None."""

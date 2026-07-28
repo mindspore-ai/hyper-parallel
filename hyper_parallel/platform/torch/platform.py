@@ -36,7 +36,12 @@ import torch.distributed as dist
 from hyper_parallel.platform.torch.dtensor import DTensorBase
 from hyper_parallel.platform.torch.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
-from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import (
+    Platform,
+    PlatformType,
+    EXISTING_COMM_GROUPS,
+    _build_p2p_edge_rank_lists,
+)
 from hyper_parallel.platform.torch.function_override import override_functions
 from hyper_parallel.platform.torch.init_weights import init_on_device as _init_on_device
 
@@ -954,6 +959,51 @@ class TorchPlatform(Platform):
             return group
         group_dict = create_sub_groups(rank_list)
         return group_dict[normalized_rank_list]
+
+    @staticmethod
+    def create_p2p_multi_stream_groups(
+            pp_rank_list: list[int],
+            include_wrap: bool = False,
+    ) -> dict[int, ProcessGroup]:
+        """Create adjacent two-rank PP groups for independent communication streams.
+
+        Args:
+            pp_rank_list: Ordered global ranks in one pipeline-parallel group.
+            include_wrap: Whether to include the last-to-first interleaved edge.
+
+        Returns:
+            A mapping from adjacent peer rank to its process-group handle.
+        """
+        current_rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        edge_rank_lists = [
+            edge_ranks
+            for edge_ranks in _build_p2p_edge_rank_lists(pp_rank_list, include_wrap)
+            if current_rank in edge_ranks
+        ]
+
+        # Edge groups overlap, but their topology is only a path or one ring
+        # and the helper returns a stable global order. Local synchronization
+        # therefore lets non-members skip creation without making every rank
+        # instantiate every edge group in a large data-parallel world.
+        local_groups = {}
+        world_rank_list = tuple(range(world_size))
+        for edge_ranks in edge_rank_lists:
+            group_key = str(edge_ranks)
+            group = EXISTING_COMM_GROUPS.get(group_key)
+            if group is None:
+                group = (
+                    _get_default_group()
+                    if edge_ranks == world_rank_list
+                    else dist.new_group(
+                        ranks=list(edge_ranks),
+                        use_local_synchronization=True,
+                    )
+                )
+                EXISTING_COMM_GROUPS[group_key] = group
+            peer_rank = edge_ranks[0] if edge_ranks[1] == current_rank else edge_ranks[1]
+            local_groups[peer_rank] = group
+        return local_groups
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):

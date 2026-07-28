@@ -102,6 +102,28 @@ def get_platform():
 EXISTING_COMM_GROUPS = {}
 
 
+def _build_p2p_edge_rank_lists(pp_rank_list: list[int], include_wrap: bool = False) -> list[tuple[int, int]]:
+    """Build normalized two-rank groups for adjacent pipeline ranks."""
+    if not isinstance(pp_rank_list, (list, tuple)):
+        raise ValueError(
+            f"pp_rank_list must be a list or tuple of integer ranks, but got {type(pp_rank_list)}."
+        )
+    if any(not isinstance(rank, int) or isinstance(rank, bool) for rank in pp_rank_list):
+        raise ValueError(f"pp_rank_list must contain only integer ranks, but got {pp_rank_list}.")
+    if len(set(pp_rank_list)) != len(pp_rank_list):
+        raise ValueError(f"pp_rank_list must not contain duplicate ranks, but got {pp_rank_list}.")
+    if len(pp_rank_list) < 2:
+        return []
+
+    edge_rank_lists = {
+        tuple(sorted((src_rank, dst_rank)))
+        for src_rank, dst_rank in zip(pp_rank_list, pp_rank_list[1:])
+    }
+    if include_wrap and len(pp_rank_list) > 2:
+        edge_rank_lists.add(tuple(sorted((pp_rank_list[-1], pp_rank_list[0]))))
+    return sorted(edge_rank_lists)
+
+
 class Platform:
     """Platform api"""
     current_grad_handle = None
@@ -994,6 +1016,29 @@ class Platform:
         group = self._create_group(rank_list)
         EXISTING_COMM_GROUPS[group_key] = group
         return group
+
+    @staticmethod
+    def create_p2p_multi_stream_groups(
+            pp_rank_list: list[int],
+            include_wrap: bool = False,
+    ) -> dict[int, Any]:
+        """Create P2P groups that enable independent communication streams.
+
+        Backends may use different process-group initialization protocols, but
+        must return the same logical mapping from peer global rank to the raw
+        process group shared by that two-rank pipeline edge.
+
+        Args:
+            pp_rank_list: Ordered global ranks in one pipeline-parallel group.
+            include_wrap: Whether the last and first ranks also communicate,
+                as required by interleaved virtual pipeline chunks.
+
+        Returns:
+            A mapping from adjacent peer global rank to its two-rank process
+            group. A rank at a linear pipeline boundary has one entry; a
+            middle rank normally has two.
+        """
+        raise NotImplementedError("Platform subclasses must implement create_p2p_multi_stream_groups")
 
     @staticmethod
     def _process_current_handle():
