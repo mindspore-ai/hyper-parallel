@@ -41,7 +41,7 @@ class MetaStepType(Enum):
     # Composite P2P: a contiguous run of FWD_SEND/FWD_RECV/BWD_SEND/BWD_RECV
     # coalesced by ``coalesce_p2p`` into one step whose ``sub_steps`` the runtime
     # groups by peer and issues as ``batch_isend_irecv`` (same-peer send+recv ->
-    # duplex).  Only produced under ``p2p_transport="batch"``.
+    # duplex).  Produced under ``p2p_transport="batch"`` or ``"multi_stream"``.
     BATCH_SEND_RECV = auto()
     OVERLAP_F_B = auto()
     OVERLAP_B_F = auto()
@@ -296,10 +296,14 @@ class PipelineScheduleRuntime(ABC):
             the activation send ~half a slot early, but is not yet
             hardware-validated — opt in deliberately.  Must be set identically
             on every rank — HCCL cannot match a batched op against a plain one
-            (EI0005).
+            (EI0005). ``"multi_stream"`` — EXPERIMENTAL: the same gap-time duplex
+            batching as ``"batch"``, but each adjacent PP peer pair uses its
+            own two-rank communication group. MindSpore's default per-group
+            communication-stream policy then lets the previous and next PP
+            edges progress on separate streams.
     """
 
-    _P2P_TRANSPORTS = ("auto", "plain", "batch", "boundary")
+    _P2P_TRANSPORTS = ("auto", "plain", "batch", "boundary", "multi_stream")
 
     def __init__(self,
                  stages,
@@ -366,6 +370,13 @@ class PipelineScheduleRuntime(ABC):
         #    ([S,R] vs [R,S]), safe under both candidate HCCL pairing
         #    semantics.  Promote to the auto default only after it earns both
         #    a hardware accuracy pass and a perf win over "batch".
+        #  * ``"multi_stream"`` (EXPERIMENTAL, explicit opt-in only) — keeps the
+        #    ``"batch"`` schedule and same-peer duplex fusion, but routes each
+        #    physical PP edge through a fixed two-rank group. With MindSpore's
+        #    ``multi_stream:group`` runtime policy, the previous and next
+        #    edges then use separate communication streams. Group count is
+        #    bounded by physical PP degree (at most two per rank), not by the
+        #    number of micro-batches.
         #
         # Two transport invariants for any future rewrite: plain per-pair
         # streams need the gap's recv-first/send-first complementarity (a
@@ -376,6 +387,9 @@ class PipelineScheduleRuntime(ABC):
         # Effective mode + per-op batch gating; set by ``build_exec_order``.
         self._p2p_mode = None
         self._batch_p2p = False
+        # ``peer_global_rank -> two-rank process group``. Populated only for
+        # the experimental ``p2p_transport="multi_stream"`` mode.
+        self._p2p_multi_stream_groups = {}
         # OVERLAP steps whose boundary_p2p was already issued this run (the
         # stage after-forward hook and the post-step safety net are both
         # allowed to call exec_boundary_p2p; reset per run_microbatches call).
@@ -480,6 +494,8 @@ class PipelineScheduleRuntime(ABC):
             mode = "batch" if getattr(self, "_overlap_b_f", False) else "plain"
         self._p2p_mode = mode
         self._batch_p2p = mode != "plain"
+        if mode == "multi_stream":
+            self._init_p2p_multi_stream_groups()
         self.construct_exec_order()
         self._inject_local_pp_swap_actions()
         self._inject_local_fsdp_actions()
@@ -489,12 +505,38 @@ class PipelineScheduleRuntime(ABC):
             # forward).  Everything stays per-op solo batches — deliberately
             # NO coalesce_p2p (see __init__).
             self.exec_order = attach_fwd_boundary_p2p(self.exec_order)
-        elif mode == "batch":
+        elif mode in ("batch", "multi_stream"):
             # Coalesce contiguous P2P runs into BATCH_SEND_RECV so the runtime
             # issues same-peer send+recv as one duplex batch.  NOTE: couples
             # the riding send into the compute-gating recv wait — see
             # __init__.
             self.exec_order = coalesce_p2p(self.exec_order)
+
+    def _init_p2p_multi_stream_groups(self) -> None:
+        """Create adjacent two-rank groups for multi-stream P2P transport."""
+        first_stage = self.stages[0]
+        mesh = getattr(first_stage, "mesh", None)
+        pp_rank_list = (
+            list(mesh.rank_list)
+            if mesh is not None
+            else platform.get_process_group_ranks(first_stage.pp_group)
+        )
+        self._p2p_multi_stream_groups = platform.create_p2p_multi_stream_groups(
+            pp_rank_list,
+            include_wrap=self.n_local_stages > 1,
+        )
+
+    def _p2p_op(self, op_type, tensor, peer):
+        """Build a P2P descriptor, selecting the multi-stream group when enabled."""
+        group = None
+        if self._p2p_mode == "multi_stream":
+            group = self._p2p_multi_stream_groups.get(peer)
+            if group is None:
+                raise RuntimeError(
+                    f"No P2P multi-stream group was created for peer global rank {peer}. "
+                    f"Available peers are {sorted(self._p2p_multi_stream_groups)}."
+                )
+        return platform.p2p_op(op_type, tensor, peer, group)
 
     def convert_stages_dict(self):
         """convert stages to dict."""
@@ -665,7 +707,7 @@ class PipelineScheduleRuntime(ABC):
         """
         if not specs:
             return []
-        ops = [platform.p2p_op(op_type, tensor, peer) for op_type, tensor, peer in specs]
+        ops = [self._p2p_op(op_type, tensor, peer) for op_type, tensor, peer in specs]
         handle = platform.batch_isend_irecv(ops)
         return [handle] if handle is not None else []
 
@@ -829,7 +871,7 @@ class PipelineScheduleRuntime(ABC):
             by_peer.setdefault(item[2], []).append(item)
 
         for items in by_peer.values():
-            ops = [platform.p2p_op(op_type, tensor, peer) for op_type, tensor, peer, _ in items]
+            ops = [self._p2p_op(op_type, tensor, peer) for op_type, tensor, peer, _ in items]
             handle = platform.batch_isend_irecv(ops)
             if handle is None:
                 continue

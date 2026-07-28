@@ -1840,26 +1840,8 @@ def test_pp_overlap_moe_recompute_save_a2a_dxdw():
           f"params={len(baseline_grads)})", flush=True)
 
 
-def test_pp_overlap_moe_accuracy_batch_p2p():
-    """Numerical equivalence vs sync baseline with same-peer duplex P2P batching.
-
-    Feature: ``p2p_transport="batch"`` (what the ``"auto"`` default resolves
-        to under overlap_b_f) — ``build_exec_order`` runs ``coalesce_p2p``,
-        turning each contiguous P2P run into a ``BATCH_SEND_RECV`` step that the
-        runtime groups by peer and issues as one ``batch_isend_irecv`` per peer
-        (same-peer send+recv -> TX||RX duplex); leftover singletons are batched
-        too, so every transfer is batch-vs-batch, matched per-peer FIFO.
-    Description:
-        Same topology as :func:`test_pp_overlap_moe_accuracy`.  The overlap run
-        is built with ``overlap_p2p=True, overlap_b_f=True,
-        p2p_transport="batch"``; the baseline is the plain sync stack.  Coalescing only changes how the launch
-        is grouped (same sends/recvs, same data), so numerics must be unchanged.
-    Expectation:
-        No ``HcclBatchISendIRecv`` EI0005, no deadlock; per-micro-batch losses
-        (last PP rank) and per-parameter grads (every rank) match the sync
-        baseline within ``rtol=1e-3, atol=1e-3`` — proving duplex-batched P2P is
-        numerically correct in the real overlap_b_f schedule.
-    """
+def _test_pp_overlap_moe_accuracy_batched_p2p(p2p_transport: str, label: str) -> None:
+    """Compare one batched P2P transport against the synchronous baseline."""
     rank, device, pp_mesh, ep_mesh = _init_pp_ep_mesh()
     pp_rank = pp_mesh.get_local_rank()
     cfg = _TinyConfig()
@@ -1884,16 +1866,48 @@ def test_pp_overlap_moe_accuracy_batch_p2p():
         overlap_chunks, overlap_si, pp_rank, device, pp_mesh,
         overlap_p2p=True, overlap_b_f=True,
         callback=_make_overlap_b_f_callback(overlap),
-        p2p_transport="batch",
+        p2p_transport=p2p_transport,
     )
 
     _assert_overlap_matches_baseline(
         rank, pp_rank, baseline_losses, baseline_grads,
-        overlap_losses, overlap_grads, label="batch_p2p",
+        overlap_losses, overlap_grads, label=label,
     )
-    print(f"[rank{rank}] pp_overlap_moe_accuracy_batch_p2p: PASS "
-          f"(all PP P2P via batch_isend_irecv, params={len(baseline_grads)})",
+    print(f"[rank{rank}] pp_overlap_moe_accuracy_{label}: PASS "
+          f"(transport={p2p_transport}, params={len(baseline_grads)})",
           flush=True)
+
+
+def test_pp_overlap_moe_accuracy_batch_p2p() -> None:
+    """Numerical equivalence vs sync baseline with same-peer duplex P2P batching.
+
+    Feature: ``p2p_transport="batch"`` (what the ``"auto"`` default resolves
+        to under overlap_b_f) — ``build_exec_order`` runs ``coalesce_p2p``,
+        turning each contiguous P2P run into a ``BATCH_SEND_RECV`` step that the
+        runtime groups by peer and issues as one ``batch_isend_irecv`` per peer
+        (same-peer send+recv -> TX||RX duplex); leftover singletons are batched
+        too, so every transfer is batch-vs-batch, matched per-peer FIFO.
+    Expectation:
+        No ``HcclBatchISendIRecv`` EI0005, no deadlock; per-micro-batch losses
+        and per-parameter grads match the sync baseline.
+    """
+    _test_pp_overlap_moe_accuracy_batched_p2p("batch", "batch_p2p")
+
+
+def test_pp_overlap_moe_accuracy_multi_stream_p2p() -> None:
+    """Numerical equivalence with independent communication streams for adjacent PP peers.
+
+    Feature: ``p2p_transport="multi_stream"`` keeps the same coalesced per-peer batch
+        sequence as ``"batch"`` while assigning previous/next peers distinct
+        communication groups, including the interleaved last-to-first edge.
+    Description:
+        Run the overlap schedule with peer-specific communication groups and compare
+        its losses and gradients with the synchronous baseline.
+    Expectation:
+        Group creation and P2P matching do not deadlock; losses and gradients
+        match the synchronous baseline.
+    """
+    _test_pp_overlap_moe_accuracy_batched_p2p("multi_stream", "multi_stream_p2p")
 
 
 def test_pp_overlap_moe_accuracy_boundary():
