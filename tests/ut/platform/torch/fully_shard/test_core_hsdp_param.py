@@ -476,10 +476,17 @@ class TestCoreScheduler(unittest.TestCase):
         HSDPSchedulerV2.root_bp_state = False
 
     def test_scheduler_context_and_abstract_methods(self):
-        """Scheduler context defaults and platform hooks should stay abstract."""
+        """Validate scheduler context defaults and abstract platform hooks.
+
+        Feature: Shared HSDP scheduler context initialization.
+        Description: Inspect context defaults and call platform-specific abstract methods.
+        Expectation: Context caches start empty and abstract methods raise NotImplementedError.
+        """
         context = HSDPSchedulerContext()
         self.assertTrue(context.is_last_backward)
         self.assertIsNone(context.root_module)
+        self.assertEqual(context.all_hsdp_schedulers, [])
+        self.assertFalse(context._param_fqn_initilized)
 
         scheduler = self._scheduler()
         for method in (
@@ -523,6 +530,44 @@ class TestCoreScheduler(unittest.TestCase):
         prefetch_state.prefetch.assert_called_once_with()
         scheduler.hsdp_state.unshard.assert_called_once_with()
 
+    def test_forward_pre_hook_caches_scheduler_tree_and_module_names(self):
+        """Cache the scheduler tree and submodule names during root pre-forward.
+
+        Feature: HSDP forward pre-hook host-side initialization.
+        Description: Discover a root and child HSDP scheduler from one module-tree traversal.
+        Expectation: Both schedulers share one context and the child receives its module name.
+        """
+        scheduler = self._scheduler()
+        scheduler._init_params_fqn = MagicMock()
+        scheduler._lazy_init_all_states = MagicMock()
+
+        class _FakeHSDPModule:
+            """Minimal HSDP module used for scheduler-tree discovery."""
+
+        root_module = _FakeHSDPModule()
+        child_module = _FakeHSDPModule()
+        child_scheduler = SimpleNamespace(
+            scheduler_ctx=HSDPSchedulerContext(),
+            hsdp_state=SimpleNamespace(module_name=None),
+        )
+        root_module.hsdp_scheduler = scheduler
+        child_module.hsdp_scheduler = child_scheduler
+        scheduler.cell = root_module
+
+        with patch("hyper_parallel.core.fully_shard.api.HSDPModule", _FakeHSDPModule):
+            with patch.object(
+                hsdp_scheduler_mod.platform,
+                "get_cells_and_names",
+                return_value=[("", root_module), ("child", child_module)],
+            ) as get_cells_and_names:
+                scheduler._hsdp_forward_pre_hook(root_module, (), {})
+
+        self.assertIs(scheduler.scheduler_ctx.root_module, root_module)
+        self.assertEqual(scheduler.scheduler_ctx.all_hsdp_schedulers, [scheduler, child_scheduler])
+        self.assertIs(child_scheduler.scheduler_ctx, scheduler.scheduler_ctx)
+        self.assertEqual(child_scheduler.hsdp_state.module_name, "child")
+        get_cells_and_names.assert_called_once_with(root_module)
+
     def test_forward_pre_hook_returns_early_for_pre_backward_and_disables_recompute_prefetch(self):
         """Pre-forward should skip during pre-backward and disable recompute prefetch."""
         scheduler = self._scheduler()
@@ -541,8 +586,13 @@ class TestCoreScheduler(unittest.TestCase):
             scheduler._hsdp_forward_pre_hook("cell", ("x",), {})
         scheduler._disable_forward_prefetch_for_recompute.assert_called_once_with()
 
-    def test_lazy_init_and_param_fqn_assignments_use_root_module(self):
-        """Lazy init and FQN assignment should use the scheduler root module."""
+    def test_lazy_init_and_param_fqn_assignments_use_cached_schedulers(self):
+        """Use cached schedulers for lazy initialization and parameter FQNs.
+
+        Feature: HSDP scheduler context caching.
+        Description: Initialize a cached state and call parameter FQN initialization twice.
+        Expectation: Lazy initialization runs once and parameter FQNs are assigned only once.
+        """
         scheduler = self._scheduler()
         scheduler._is_root = True
         scheduler.scheduler_ctx.root_module = "root"
@@ -552,19 +602,22 @@ class TestCoreScheduler(unittest.TestCase):
             lazy_init=MagicMock(),
             _iter_managed_params=MagicMock(return_value=[hsdp_param]),
         )
+        scheduler.scheduler_ctx.all_hsdp_schedulers = [SimpleNamespace(hsdp_state=hsdp_state)]
 
-        with patch.object(hsdp_scheduler_mod.platform, "get_cells_and_names", return_value=[("root", "module")]):
-            with patch.object(hsdp_scheduler_mod, "get_hsdp_state", return_value=hsdp_state):
-                scheduler._lazy_init_all_states()
-                with patch.object(
-                    hsdp_scheduler_mod.platform,
-                    "parameters_dict",
-                    return_value=[("weight", sharded_param), ("alias", sharded_param)],
-                ):
-                    scheduler._init_params_fqn()
+        scheduler._lazy_init_all_states()
+        with patch.object(
+            hsdp_scheduler_mod.platform,
+            "parameters_dict",
+            return_value=[("weight", sharded_param), ("alias", sharded_param)],
+        ) as parameters_dict:
+            scheduler._init_params_fqn()
+            scheduler._init_params_fqn()
 
         hsdp_state.lazy_init.assert_called_once_with()
+        hsdp_state._iter_managed_params.assert_called_once_with()
+        parameters_dict.assert_called_once_with("root")
         self.assertEqual(hsdp_param._param_fqn, "weight")
+        self.assertTrue(scheduler.scheduler_ctx._param_fqn_initilized)
 
     def test_forward_backward_hooks_and_grouped_skip_defaults(self):
         """Forward/backward hooks should update state and grouped skips should no-op."""
