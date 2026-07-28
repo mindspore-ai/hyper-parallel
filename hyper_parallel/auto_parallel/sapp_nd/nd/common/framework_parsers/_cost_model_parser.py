@@ -127,7 +127,7 @@ class _CostModelParser(ABC):
 
     def config_dp_tp_exp(self, ccfg):
         """MoE strategy variables"""
-        if ccfg.etp:
+        if ccfg.etp > 1:
             ccfg.t_exp = ccfg.etp
             # d * t = inner dp * outer dp * etp
             # inner dp = EP, outer dp = the rest

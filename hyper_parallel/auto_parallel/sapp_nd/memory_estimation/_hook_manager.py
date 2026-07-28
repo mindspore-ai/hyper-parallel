@@ -28,7 +28,9 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
     NodeStatEval,
     NodeDynEval,
     NodeCommEval,
+    NodeComputeEval,
 )
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.compute import EvalExpertCompute
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.head import EvalHead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
@@ -122,6 +124,8 @@ class _HookManager(_Backbone):
             stat_grad = self._ctx.node_eval[target_node].stat.grad
         if not self.__is_valid_eval_func(dyn_activ):
             dyn_activ = self._ctx.node_eval[target_node].dyn.activation
+        # Compute formulas (FLOPs, not memory — bypass mem_counter)
+        compute_eval = self.__set_node_eval_compute_fun(target_node, **kwargs)
         self._ctx.node_eval[target_node] = NodeEval(
             self.__custom_getattr(cls_obj, num_p),
             NodeStatEval(
@@ -134,6 +138,7 @@ class _HookManager(_Backbone):
                 self.__set_node_eval_comm_fun(
                     cls_obj, target_node, *args, **kwargs
                 ),
+                compute=compute_eval,
             ),
         )
 
@@ -180,6 +185,65 @@ class _HookManager(_Backbone):
             self.__custom_getattr(comm_cls_obj, dyn_ep_comm),
             ep_balanced=ep_balanced,
             ep_imbalanced=ep_imbalanced,
+        )
+
+    def __resolve_compute_fun(self, name):
+        """Resolve compute formula name — bypasses __wrap_mem_counter.
+
+        Compute FLOPs are not memory bytes and must not be accumulated
+        into accu_mem_type. This method directly retrieves the function
+        from EvalExpertCompute without the mem_counter wrapper.
+        Falls back to a zero-returning function if the name is not found,
+        so YAML typos produce zero FLOPs instead of crashing.
+        """
+        fun = getattr(EvalExpertCompute, name, None)
+        if fun is not None:
+            return fun
+        logger.warning("Compute formula '%s' not found in EvalExpertCompute, "
+                       "falling back to zero", name)
+
+        def zero(*_):
+            return 0
+
+        zero.__qualname__ = f"0({name})"
+        return zero
+
+    def __set_node_eval_compute_fun(self, target_node, **kwargs):
+        """Build NodeComputeEval from kwargs, falling back to existing values."""
+        compute_kwargs = kwargs.get("compute", None)
+        if compute_kwargs is None:
+            # No compute config provided — preserve existing or return None
+            existing = self._ctx.node_eval.get(target_node)
+            if existing and existing.dyn.compute is not None:
+                return existing.dyn.compute
+            return None
+        if not isinstance(compute_kwargs, dict):
+            return None
+        router_name = compute_kwargs.get("router", None)
+        expert_balanced_name = compute_kwargs.get("expert_balanced", None)
+        expert_imbalanced_name = compute_kwargs.get("expert_imbalanced", None)
+        shared_expert_name = compute_kwargs.get("shared_expert", None)
+        # Resolve from EvalExpertCompute (bypass mem_counter)
+        router = self.__resolve_compute_fun(router_name) if router_name else None
+        expert_balanced = (
+            self.__resolve_compute_fun(expert_balanced_name)
+            if expert_balanced_name else None
+        )
+        expert_imbalanced = (
+            self.__resolve_compute_fun(expert_imbalanced_name)
+            if expert_imbalanced_name else None
+        )
+        shared_expert = (
+            self.__resolve_compute_fun(shared_expert_name)
+            if shared_expert_name else None
+        )
+        if not any([router, expert_balanced, expert_imbalanced, shared_expert]):
+            return None
+        return NodeComputeEval(
+            router=router,
+            expert_balanced=expert_balanced,
+            expert_imbalanced=expert_imbalanced,
+            shared_expert=shared_expert,
         )
 
     def set_head_eval_fun(self, *arg, **kwarg):
@@ -398,6 +462,11 @@ class _HookManager(_Backbone):
                 comm_kwargs["dyn_ep_comm_balanced"] = comm_cfg.ep_balanced
             if hasattr(comm_cfg, "ep_imbalanced"):
                 comm_kwargs["dyn_ep_comm_imbalanced"] = comm_cfg.ep_imbalanced
+            # Compute config (FLOPs, not memory)
+            compute_kwargs = {}
+            compute_cfg = getattr(b_cfg.dyn_fun, "compute", None)
+            if compute_cfg and hasattr(compute_cfg, "__dict__"):
+                compute_kwargs = {"compute": dict(vars(compute_cfg))}
             self.set_body_eval_fun(
                 lay_type=b_cfg.name,
                 num_p=b_cfg.num_param_fun,
@@ -406,6 +475,7 @@ class _HookManager(_Backbone):
                 stat_grad=b_cfg.stat_fun.grad,
                 dyn_activ=b_cfg.dyn_fun.activation,
                 **comm_kwargs,
+                **compute_kwargs,
             )
 
         # pp micro factor

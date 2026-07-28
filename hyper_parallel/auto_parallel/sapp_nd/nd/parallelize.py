@@ -157,6 +157,9 @@ class ParallelizeLayer:
         if not self.config.moe_valid(parallel_config):
             logger.warning("expert parallel is higher than expert number")
             return False
+        if hasattr(self.config, 'ep_constraints_valid') and not self.config.ep_constraints_valid(parallel_config):
+            logger.warning("EP divisibility constraints not satisfied")
+            return False
         if self.filtered_out(parallel_config):
             logger.warning("Config manually filtered out")
             return False

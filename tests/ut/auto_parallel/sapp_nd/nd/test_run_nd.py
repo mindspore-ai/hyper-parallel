@@ -742,6 +742,68 @@ class TestSappNDRunND(unittest.TestCase):
         ArchHooks.check_and_apply_custom_hook(wrapper)
         self.assertEqual(getattr(wrapped_cfg, "n_attMM"), 4)
 
+    def test_ep_constraints_valid_in_global_config(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover GlobalConfig.ep_constraints_valid for C1 (expert
+            divisibility) and C2 (expert-hidden divisibility), plus the dense
+            fast-path and the is_valid() wiring in ParallelizeLayer.
+        Expectation: MoE configs that violate C1 or C2 are rejected; dense
+            models and valid MoE configs are accepted.
+        """
+
+        def _make_gc(n_exp=4, ep=1, hff_exp=0, etp=0, tp=2, dp=2, pp=1):
+            """Build a minimal GlobalConfig for EP-constraint tests."""
+            ccfg = _FakeCostModelConfig()
+            ccfg.n_exp = n_exp
+            ccfg.ep = ep
+            ccfg.hff_exp = hff_exp
+            ccfg.etp = etp
+            ccfg.t = tp
+            ccfg.d = dp
+            ccfg.p = pp
+            gc = object.__new__(GC.GlobalConfig)
+            gc.ccfg = ccfg
+            gc.dimensions = Dim.ALL_DIMS.copy()
+            gc.balancing = _FakeBalancing()
+            return gc
+
+        # Dense model (n_exp=1) — fast-path, always True regardless of ep.
+        gc_dense = _make_gc(n_exp=1, ep=2, hff_exp=0)
+        pc_dense = gc_dense.make_parallel_config(
+            (2, 2, 1, 1), (4, 1), (2, 1, 2, False)
+        )
+        self.assertTrue(gc_dense.ep_constraints_valid(pc_dense))
+
+        # MoE model, valid C1 (8 % 4 == 0) and C2 (14336 % 2 == 0).
+        gc_ok = _make_gc(n_exp=8, ep=4, hff_exp=14336, etp=0, tp=2)
+        pc_ok = gc_ok.make_parallel_config(
+            (2, 2, 1, 1), (4, 1), (4, 1, 2, False)
+        )
+        self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
+
+        # MoE model, C1 fail: n_exp=8, ep=3 (8 % 3 != 0).
+        gc_c1 = _make_gc(n_exp=8, ep=3, hff_exp=14336, etp=0, tp=2)
+        pc_c1 = gc_c1.make_parallel_config(
+            (6, 2, 1, 1), (4, 1), (3, 1, 2, False)
+        )
+        self.assertFalse(gc_c1.ep_constraints_valid(pc_c1))
+
+        # MoE model, C2 fail: hff_exp=14336, tp=5 (14336 % 5 != 0), etp=0.
+        gc_c2 = _make_gc(n_exp=8, ep=4, hff_exp=14336, etp=0, tp=5)
+        pc_c2 = gc_c2.make_parallel_config(
+            (2, 5, 1, 1), (4, 1), (4, 1, 2, False)
+        )
+        self.assertFalse(gc_c2.ep_constraints_valid(pc_c2))
+
+        # MoE model, etp overrides tp for C2: hff_exp=14336, etp=4, tp=5.
+        # C2 uses t_exp=etp=4, 14336 % 4 == 0 → pass despite tp=5.
+        gc_etp = _make_gc(n_exp=8, ep=4, hff_exp=14336, etp=4, tp=5)
+        pc_etp = gc_etp.make_parallel_config(
+            (2, 5, 1, 1), (4, 1), (4, 1, 2, False)
+        )
+        self.assertTrue(gc_etp.ep_constraints_valid(pc_etp))
+
     def test_run_nd_cli_uses_fake_parallelize(self) -> None:
         """
         Feature: TestSappNDRunND.

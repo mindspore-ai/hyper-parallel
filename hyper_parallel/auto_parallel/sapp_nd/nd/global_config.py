@@ -121,6 +121,45 @@ class GlobalConfig:
             return ep <= min(expert_num, dp * mp)
         return True
 
+    def ep_constraints_valid(self, parallel_config):
+        """Check EP-specific divisibility constraints (C1, C2).
+
+        Runs only for MoE models (n_exp > 1).  C1 ensures experts can be
+        evenly partitioned across EP ranks; C2 ensures the expert FFN hidden
+        dim can be evenly sharded by the expert TP degree.  Both checks use
+        architecture constants from ``self.ccfg`` and the candidate values
+        from ``parallel_config``.
+
+        C3 (device count) is intentionally skipped here because the search
+        loop borrows EP from the dp*tp budget, so dp*tp*pp*cp already
+        equals total_devices by construction.
+
+        Args:
+            parallel_config: candidate ``Dim.Dimensions``.
+
+        Returns:
+            bool: True if all applicable EP constraints pass (or the model
+            is dense), False otherwise.
+        """
+        if self.ccfg.n_exp <= 1:
+            return True
+        # pylint: disable=C0415
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.validators.ep_constraints import EpConstraints
+        ep = self.dim_val(Dim.EP, parallel_config)
+        r1 = EpConstraints.check_ep_divisibility(self.ccfg.n_exp, ep)
+        if not r1:
+            logger.warning("EP constraint C1 failed: %s", r1.message)
+            return False
+        tp = self.dim_val(Dim.TP, parallel_config)
+        etp = max(getattr(self.ccfg, "etp", 0), 0)
+        t_exp = max(etp, 1) if etp > 1 else max(tp, 1)
+        hff_exp = max(getattr(self.ccfg, "hff_exp", 0), 0)
+        r2 = EpConstraints.check_expert_hidden_divisibility(hff_exp, t_exp)
+        if not r2:
+            logger.warning("EP constraint C2 failed: %s", r2.message)
+            return False
+        return True
+
     def make_parallel_config_args(self, **kwargs):
         """Create a parallel config from parallel values"""
         logger.debug("dimensions considered: %s", str(self.dimensions))

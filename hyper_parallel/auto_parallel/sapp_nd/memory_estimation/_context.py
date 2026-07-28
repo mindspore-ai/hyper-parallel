@@ -79,14 +79,40 @@ class NodeCommEval:
 
 
 @dataclass
+class NodeComputeEval:
+    """compute formula pointers"""
+
+    router: Any = None
+    expert_balanced: Any = None
+    expert_imbalanced: Any = None
+    shared_expert: Any = None
+
+    def __repr__(self):
+        parts = []
+        if self.router is not None:
+            parts.append(f"compute.router={_qname(self.router)}")
+        if self.expert_balanced is not None:
+            parts.append(f"compute.expert_balanced={_qname(self.expert_balanced)}")
+        if self.expert_imbalanced is not None:
+            parts.append(f"compute.expert_imbalanced={_qname(self.expert_imbalanced)}")
+        if self.shared_expert is not None:
+            parts.append(f"compute.shared_expert={_qname(self.shared_expert)}")
+        return ", ".join(parts) if parts else "compute=None"
+
+
+@dataclass
 class NodeDynEval:
     """dynamic formula pointers"""
 
     activation: Any
     comm: NodeCommEval
+    compute: NodeComputeEval = None
 
     def __repr__(self):
-        return f"dyn.activation={_qname(self.activation)}, " f"{str(self.comm)}"
+        s = f"dyn.activation={_qname(self.activation)}, {str(self.comm)}"
+        if self.compute is not None:
+            s += f", {str(self.compute)}"
+        return s
 
 
 @dataclass

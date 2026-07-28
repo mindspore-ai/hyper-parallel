@@ -44,6 +44,11 @@ nodes_mem_comp :
             ep_balanced : ep_comm_layer_balanced
             ep_imbalanced : ep_comm_layer_imbalanced
             cp : cp_comm_layer
+        compute : &compute_lay
+          router : router_compute_cost
+          expert_balanced : expert_compute_cost_balanced
+          expert_imbalanced : expert_compute_cost_imbalanced
+          shared_expert : shared_expert_compute_cost
     -
       name : SEL_REC_LAYER
       num_param_fun : *num_p_lay

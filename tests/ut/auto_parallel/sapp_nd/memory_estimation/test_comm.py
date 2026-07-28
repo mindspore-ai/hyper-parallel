@@ -46,7 +46,7 @@ from unittest.mock import MagicMock
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 
@@ -105,6 +105,7 @@ def _make_ccfg(
     ccfg.n_ffMM = n_ffMM
     ccfg.n_ffBMM = n_ffBMM
     ccfg.cp_algo = cp_algo
+    ccfg.comm_cp = comm_cp
     ccfg.tokens_per_expert = tokens_per_expert
 
     # rec_op mock
@@ -597,6 +598,245 @@ class TestCpCommNonExpRecFactor(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=4)
 
 
+
+
+class TestDpCommExpZeroReturn(unittest.TestCase):
+    """Test dp_comm_exp early return when exp_param_size == 0."""
+
+    def test_zero_exp_params_returns_zero(self):
+        """CM-D05: dp_comm_exp returns 0 when routed+shared == 0 (dense-only)."""
+        ccfg = _make_ccfg(comm_d_exp=2)
+        ctx = _make_ctx(num_p_result=(150.0, 0.0, 0.0))
+        result = EvalLayerComm.dp_comm_exp(ccfg, ctx)
+        self.assertEqual(result, 0)
+
+
+class TestTpCommNonExp(unittest.TestCase):
+    """Test tp_comm_non_exp (TP communication for non-expert parameters)."""
+
+    def test_dense_formula(self):
+        """CM-T03: Dense (n_exp=1) TP non-exp comm = 0.25 * n_gather * s * b * h * mb."""
+        ccfg = _make_ccfg(n_exp=1, n_gather=2, s=1024, b=4, h=4096,
+                          comm_t=1.0, cp=1, bytes_compute=2)
+        rec_op = MagicMock()
+        rec_op.gather = False
+        ccfg.rec_op = rec_op
+        ctx = _make_ctx(current_node=None)
+        mb = 1
+        result = EvalLayerComm.tp_comm_non_exp(ccfg, ctx, mb)
+        inner = 0.25 * 2 * 1024 * 4 * 4096 * 1
+        expected = 1 * 1.0 * inner / 1
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_moe_formula(self):
+        """CM-T04: MoE (n_exp>1) TP non-exp comm uses h*h*n_attMM formula."""
+        ccfg = _make_ccfg(n_exp=8, n_gather=2, h=4096, bytes_compute=2,
+                          n_attMM=2, comm_t=1.0, cp=1)
+        rec_op = MagicMock()
+        rec_op.gather = False
+        ccfg.rec_op = rec_op
+        ctx = _make_ctx(current_node=None)
+        mb = 1
+        result = EvalLayerComm.tp_comm_non_exp(ccfg, ctx, mb)
+        inner = 0.25 * 2 * 4096 * 4096 * 2 * 2
+        expected = 1 * 1.0 * inner / 1
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_cp_divides(self):
+        """CM-T05: CP degree divides TP non-exp comm volume."""
+        ccfg_cp1 = _make_ccfg(n_exp=1, n_gather=2, s=1024, b=4, h=4096,
+                              comm_t=1.0, cp=1, bytes_compute=2)
+        ccfg_cp2 = _make_ccfg(n_exp=1, n_gather=2, s=1024, b=4, h=4096,
+                              comm_t=1.0, cp=2, bytes_compute=2)
+        rec_op = MagicMock()
+        rec_op.gather = False
+        ccfg_cp1.rec_op = rec_op
+        ccfg_cp2.rec_op = rec_op
+        ctx = _make_ctx(current_node=None)
+        mb = 1
+        r1 = EvalLayerComm.tp_comm_non_exp(ccfg_cp1, ctx, mb)
+        r2 = EvalLayerComm.tp_comm_non_exp(ccfg_cp2, ctx, mb)
+        self.assertAlmostEqual(r1, r2 * 2, places=4)
+
+
+class TestTpCommLayer(unittest.TestCase):
+    """Test tp_comm_layer sums non_exp and exp."""
+
+    def test_layer_sums_both(self):
+        """CM-T06: tp_comm_layer = tp_comm_non_exp + tp_comm_exp."""
+        ccfg = _make_ccfg(n_exp=8, n_gather=2, h=4096, bytes_compute=2,
+                          n_attMM=2, n_ffMM=1, comm_t=1.0, cp=1)
+        rec_op = MagicMock()
+        rec_op.gather = False
+        ccfg.rec_op = rec_op
+        ctx = _make_ctx(current_node=None)
+        mb = 1
+        result = EvalLayerComm.tp_comm_layer(ccfg, ctx, mb)
+        non_exp = EvalLayerComm.tp_comm_non_exp(ccfg, ctx, mb)
+        exp = EvalLayerComm.tp_comm_exp(ccfg, ctx, mb)
+        self.assertAlmostEqual(result, non_exp + exp, places=0)
+
+
+class TestCpCommExp(unittest.TestCase):
+    """Test cp_comm_exp (CP communication for expert parameters)."""
+
+    def test_ring_returns_nonzero(self):
+        """CM-CE01: Ring CP expert comm is non-zero."""
+        ccfg = _make_ccfg(cp_algo="colossalai_cp", s=1024, b=4,
+                          hff=14336, n_ffMM=1, comm_cp=1.0, tp=1)
+        ctx = _make_ctx()
+        result = EvalLayerComm.cp_comm_exp(ccfg, ctx)
+        expected = 1.0 * 2 * 1024 * 4 * 1 * 14336 / 1
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_ulysses_returns_nonzero(self):
+        """CM-CE02: Ulysses CP expert comm uses same formula."""
+        ccfg = _make_ccfg(cp_algo="ulysses_cp", s=1024, b=4,
+                          hff=14336, n_ffMM=1, comm_cp=1.0, tp=1)
+        ctx = _make_ctx()
+        result = EvalLayerComm.cp_comm_exp(ccfg, ctx)
+        expected = 1.0 * 2 * 1024 * 4 * 1 * 14336 / 1
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_unknown_algo_returns_zero(self):
+        """CM-CE03: Unknown cp_algo returns 0 for expert comm."""
+        ccfg = _make_ccfg(cp_algo="unknown_algo", s=1024, b=4,
+                          hff=14336, n_ffMM=1, comm_cp=1.0, tp=1)
+        ctx = _make_ctx()
+        result = EvalLayerComm.cp_comm_exp(ccfg, ctx)
+        self.assertEqual(result, 0)
+
+
+class TestCpCommLayer(unittest.TestCase):
+    """Test cp_comm_layer sums non_exp and exp."""
+
+    def test_layer_sums_both(self):
+        """CM-CL01: cp_comm_layer = cp_comm_non_exp + cp_comm_exp."""
+        ccfg = _make_ccfg(cp_algo="colossalai_cp", p=1, s=1024, b=4,
+                          h=4096, hff=14336, n_attMM=2, n_ffMM=1,
+                          comm_cp=1.0, tp=1)
+        ctx = _make_ctx(current_node=None)
+        result = EvalLayerComm.cp_comm_layer(ccfg, ctx)
+        non_exp = EvalLayerComm.cp_comm_non_exp(ccfg, ctx)
+        exp = EvalLayerComm.cp_comm_exp(ccfg, ctx)
+        self.assertAlmostEqual(result, non_exp + exp, places=0)
+
+
+class TestEpCommLayerEarlyReturn(unittest.TestCase):
+    """Test ep_comm_layer early return when ep <= 1."""
+
+    def test_ep1_returns_zero(self):
+        """CM-E10: ep_comm_layer returns 0 when ep=1."""
+        ccfg = _make_ccfg(ep=1, comm_ep=1.0, tokens_per_expert=None)
+        ctx = _make_ctx()
+        result = EvalLayerComm.ep_comm_layer(ccfg, ctx, 1)
+        self.assertEqual(result, 0)
+
+    def test_comm_ep_zero_returns_zero(self):
+        """CM-E11: ep_comm_layer returns 0 when comm_ep=0."""
+        ccfg = _make_ccfg(ep=4, comm_ep=0, tokens_per_expert=None)
+        ctx = _make_ctx()
+        result = EvalLayerComm.ep_comm_layer(ccfg, ctx, 1)
+        self.assertEqual(result, 0)
+
+
+class TestCpCommBuffer(unittest.TestCase):
+    """Test cp_comm_buffer (CP communication buffer memory estimation)."""
+
+    def _make_ccfg_buffer(self, cp=2, s=1024, b=4, t=1, a=32,
+                          n_kv=32, dh=128, kv_lora_rank=0, h=4096,
+                          device_per_node=8, cp_algo="colossalai_cp"):
+        """Create a mock CostModelConfig for CP comm buffer tests."""
+        ccfg = MagicMock()
+        ccfg.cp = cp
+        ccfg.s = s
+        ccfg.b = b
+        ccfg.t = t
+        ccfg.a = a
+        ccfg.n_kv = n_kv
+        ccfg.dh = dh
+        ccfg.kv_lora_rank = kv_lora_rank
+        ccfg.h = h
+        ccfg.device_per_node = device_per_node
+        ccfg.cp_algo = cp_algo
+        return ccfg
+
+    def test_cp1_returns_zero(self):
+        """CM-CB01: cp=1 returns 0.0 (no CP → no buffer)."""
+        ccfg = self._make_ccfg_buffer(cp=1)
+        ctx = MagicMock()
+        result = EvalLayerComm.cp_comm_buffer(ccfg, ctx)
+        self.assertEqual(result, 0.0)
+
+    def test_ring_cp_intra_node(self):
+        """CM-CB02: Ring CP with cp <= device_per_node (intra-node only)."""
+        ccfg = self._make_ccfg_buffer(cp=4, device_per_node=8,
+                                      cp_algo="colossalai_cp")
+        ctx = MagicMock()
+        result = EvalLayerComm.cp_comm_buffer(ccfg, ctx)
+        # MHA: kv_dim = h/t = 4096/1 = 4096
+        # chunk = (s/cp) * b * kv_dim * kv_bytes = (1024/4) * 4 * 4096 * 4
+        kv_dim = 4096 / 1
+        chunk = (1024 / 4) * 4 * kv_dim * 4
+        intra_ranks = 4
+        extra_chunks = intra_ranks - 1  # 3
+        expected = extra_chunks * chunk
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_ring_cp_cross_node(self):
+        """CM-CB03: Ring CP with cp > device_per_node (cross-node)."""
+        ccfg = self._make_ccfg_buffer(cp=16, device_per_node=8,
+                                      cp_algo="colossalai_cp")
+        ctx = MagicMock()
+        result = EvalLayerComm.cp_comm_buffer(ccfg, ctx)
+        kv_dim = 4096 / 1
+        chunk = (1024 / 16) * 4 * kv_dim * 4
+        intra_ranks = 8  # min(16, 8)
+        extra_chunks = 2 * 8 - 1  # 15
+        expected = extra_chunks * chunk
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_ulysses_cp_intra_node(self):
+        """CM-CB04: Ulysses CP with cp <= device_per_node."""
+        ccfg = self._make_ccfg_buffer(cp=4, device_per_node=8,
+                                      cp_algo="ulysses_cp")
+        ctx = MagicMock()
+        result = EvalLayerComm.cp_comm_buffer(ccfg, ctx)
+        kv_dim = 4096 / 1
+        chunk = 1024 * 4 * (kv_dim / 4) * 4
+        intra_ranks = 4
+        extra_chunks = intra_ranks - 1  # 3
+        expected = extra_chunks * chunk
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_ulysses_cp_cross_node(self):
+        """CM-CB05: Ulysses CP with cp > device_per_node."""
+        ccfg = self._make_ccfg_buffer(cp=16, device_per_node=8,
+                                      cp_algo="ulysses_cp")
+        ctx = MagicMock()
+        result = EvalLayerComm.cp_comm_buffer(ccfg, ctx)
+        kv_dim = 4096 / 1
+        chunk = 1024 * 4 * (kv_dim / 16) * 4
+        intra_ranks = 8
+        extra_chunks = 2 * 8 - 1  # 15
+        expected = extra_chunks * chunk
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_mla_kv_dim(self):
+        """CM-CB06: MLA uses kv_lora_rank for kv_dim (not h/t)."""
+        ccfg_ring = self._make_ccfg_buffer(
+            cp=2, device_per_node=8, cp_algo="colossalai_cp",
+            kv_lora_rank=512, n_kv=32, dh=128)
+        ccfg_mha = self._make_ccfg_buffer(
+            cp=2, device_per_node=8, cp_algo="colossalai_cp",
+            kv_lora_rank=0, n_kv=32, dh=128)
+        ctx = MagicMock()
+        r_mla = EvalLayerComm.cp_comm_buffer(ccfg_ring, ctx)
+        r_mha = EvalLayerComm.cp_comm_buffer(ccfg_mha, ctx)
+        # MLA kv_dim=512, MHA kv_dim=4096 → different buffer sizes
+        self.assertNotAlmostEqual(r_mla, r_mha, places=0)
+
+
 class TestNodeCommEvalRepr(unittest.TestCase):
     """Test NodeCommEval __repr__ with _qname for None safety."""
 
@@ -630,6 +870,86 @@ class TestNodeCommEvalRepr(unittest.TestCase):
         """CM-Q04: _qname returns 'None' string for None."""
         from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import _qname
         self.assertEqual(_qname(None), "None")
+
+
+class TestNodeComputeEvalRepr(unittest.TestCase):
+    """Test NodeComputeEval and NodeDynEval __repr__ with compute field."""
+
+    def test_compute_repr_all_none(self):
+        """CT-Q01: NodeComputeEval with all None returns compute=None."""
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import NodeComputeEval
+        comp = NodeComputeEval()
+        self.assertEqual(repr(comp), "compute=None")
+
+    def test_compute_repr_with_router(self):
+        """CT-Q02: NodeComputeEval with router shows router qualname."""
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import NodeComputeEval
+
+        def router_flops():
+            return 0
+
+        comp = NodeComputeEval(router=router_flops)
+        repr_str = repr(comp)
+        self.assertIn("compute.router=", repr_str)
+        self.assertIn("router_flops", repr_str)
+        self.assertNotIn("expert_balanced", repr_str)
+
+    def test_compute_repr_all_set(self):
+        """CT-Q03: NodeComputeEval with all fields shows all names."""
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import NodeComputeEval
+
+        def r():
+            return 0
+
+        def eb():
+            return 0
+
+        def ei():
+            return 0
+
+        def se():
+            return 0
+
+        comp = NodeComputeEval(router=r, expert_balanced=eb,
+                               expert_imbalanced=ei, shared_expert=se)
+        repr_str = repr(comp)
+        self.assertIn("compute.router=", repr_str)
+        self.assertIn("compute.expert_balanced=", repr_str)
+        self.assertIn("compute.expert_imbalanced=", repr_str)
+        self.assertIn("compute.shared_expert=", repr_str)
+
+    def test_dyn_repr_with_compute(self):
+        """CT-Q04: NodeDynEval with compute includes compute in repr."""
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
+            NodeDynEval, NodeCommEval, NodeComputeEval,
+        )
+
+        def act():
+            return 0
+
+        comm = NodeCommEval(dp=lambda: 0, tp=lambda: 0, cp=lambda: 0, ep=lambda: 0)
+        compute = NodeComputeEval(router=lambda: 0)
+        dyn = NodeDynEval(activation=act, comm=comm, compute=compute)
+        repr_str = repr(dyn)
+        self.assertIn("dyn.activation=", repr_str)
+        self.assertIn("compute.router=", repr_str)
+
+    def test_dyn_repr_without_compute(self):
+        """CT-Q05: NodeDynEval without compute omits compute from repr."""
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
+            NodeDynEval, NodeCommEval,
+        )
+
+        def act():
+            return 0
+
+        comm = NodeCommEval(dp=lambda: 0, tp=lambda: 0, cp=lambda: 0, ep=lambda: 0)
+        dyn = NodeDynEval(activation=act, comm=comm, compute=None)
+        repr_str = repr(dyn)
+        self.assertIn("dyn.activation=", repr_str)
+        for field in ("compute.router=", "compute.expert_balanced=",
+                      "compute.expert_imbalanced=", "compute.shared_expert="):
+            self.assertNotIn(field, repr_str)
 
 
 if __name__ == "__main__":
