@@ -306,6 +306,7 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
     def test_forward_pre_hook_with_param_fqn_init(self):
         """_init_params_fqn assigns correct FQNs for a multi-layer nested model.
 
+        Feature: HSDP parameter FQN initialization from cached schedulers.
         Description:
             Build a two-level nested MindSpore Cell (root → layer1 → sub).
             Each submodule that has local parameters contributes mock hsdp_params
@@ -364,21 +365,21 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
             if local_params:
                 submodule_hsdp_params[cell] = [_FakeHSDPParam(p) for p in local_params]
 
-        def _fake_get_hsdp_state(module):
-            if module not in submodule_hsdp_params:
-                return None
-            return _FakeHSDPState(submodule_hsdp_params[module])
+        class _FakeHSDPScheduler:
+            """Minimal scheduler carrying a fake HSDP state."""
+
+            def __init__(self, hsdp_params: list) -> None:
+                """Initialize the fake scheduler with managed parameters."""
+                self.hsdp_state = _FakeHSDPState(hsdp_params)
 
         scheduler = _make_scheduler_stub()
         scheduler._is_root = True
         scheduler.scheduler_ctx.root_module = model
-
-        with patch(
-            "hyper_parallel.core.fully_shard.hsdp_scheduler.get_hsdp_state",
-            side_effect=_fake_get_hsdp_state,
-        ):
-            # pylint: disable=protected-access
-            scheduler._init_params_fqn()
+        scheduler.scheduler_ctx.all_hsdp_schedulers = [
+            _FakeHSDPScheduler(hsdp_params) for hsdp_params in submodule_hsdp_params.values()
+        ]
+        # pylint: disable=protected-access
+        scheduler._init_params_fqn()
 
         for cell, hsdp_params in submodule_hsdp_params.items():
             for hp in hsdp_params:
