@@ -133,8 +133,8 @@ class TrainerConfig:
 
     model: DeferredTarget[nn.Module]
     tokenizer: DeferredTarget[PreTrainedTokenizerBase]
-    optimizer: Optional[OptimizerConfig] = None
-    lr_scheduler: Optional[LRSchedulerConfig] = None
+    optimizer: OptimizerConfig
+    lr_scheduler: LRSchedulerConfig
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # parallelism configs
