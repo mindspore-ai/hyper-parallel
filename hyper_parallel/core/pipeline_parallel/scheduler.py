@@ -48,6 +48,7 @@ class MetaStepType(Enum):
     FSDP_UNSHARD = auto()
     FSDP_RESHARD = auto()
     FSDP_REDUCE_GRAD = auto()
+    FSDP_WAIT_REDUCE_GRAD = auto()
     SWAP_SET_GROUP = auto()
     SWAP_LAUNCH_OFFLOAD = auto()
     SWAP_WAIT_OFFLOAD = auto()
@@ -241,17 +242,23 @@ def _exec_fsdp_reshard(stage):
 
 
 def _exec_fsdp_reduce_grad(stage):
-    """Run the stage's FSDP post-backward gradient reduction."""
-    stage.execute_reduce_grad()
+    """Launch HSDP reduction after the stage's final backward."""
+    stage.launch_reduce_grad()
 
 
-# FSDP control MetaStep -> handler(stage).  Membership also marks which
+def _exec_fsdp_wait_reduce_grad(stage):
+    """Drain the final pending HSDP reduction tail."""
+    stage.wait_reduce_grad()
+
+
+# FSDP control MetaStep -> handler(stage). Membership also marks which
 # MetaStepTypes are FSDP control steps, so the runtime loop dispatches with a
 # single table lookup instead of re-switching on the step type.
 _FSDP_STEP_HANDLERS = {
     MetaStepType.FSDP_UNSHARD: _exec_fsdp_unshard,
     MetaStepType.FSDP_RESHARD: _exec_fsdp_reshard,
     MetaStepType.FSDP_REDUCE_GRAD: _exec_fsdp_reduce_grad,
+    MetaStepType.FSDP_WAIT_REDUCE_GRAD: _exec_fsdp_wait_reduce_grad,
 }
 
 
@@ -447,10 +454,10 @@ class PipelineScheduleRuntime(ABC):
     def _prepare_fsdp_backward(self):
         """Disable HSDP post-backward actions once for the current pipeline run.
 
-        Pipeline accumulates gradients across all micro-batches and executes
-        the reduction through ``FSDP_REDUCE_GRAD`` after the last backward.
-        ``execute_reduce_grad`` restores both flags, so they must be disabled
-        once again at the beginning of the next run.
+        Pipeline accumulates gradients through each stage's final backward.
+        ``FSDP_REDUCE_GRAD`` then restores gradient sync and launches the
+        reduction on the schedule thread. Reset the flags at the next run
+        boundary.
         """
         for stage in self.stages:
             if not stage.has_backward:
@@ -2472,11 +2479,12 @@ def add_fsdp_unshard_reshard(actions, managed_stage_indices, max_active_stages=3
 
 
 def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
-    """Insert FSDP reduce-grad actions after the last backward-like action of each stage."""
+    """Launch reduction after each final backward and drain after all local stages."""
     if not managed_stage_indices:
         return actions
 
     fsdp_actions = []
+    last_reduced_stage_index = None
     for action in actions:
         fsdp_actions.append(action)
         reduced_stage_indices = []
@@ -2490,5 +2498,16 @@ def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
             if leaf_step.stage_index not in reduced_stage_indices:
                 reduced_stage_indices.append(leaf_step.stage_index)
         for stage_index in reduced_stage_indices:
-            fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_REDUCE_GRAD, stage_index))
+            fsdp_actions.append(
+                MetaStep(None, MetaStepType.FSDP_REDUCE_GRAD, stage_index)
+            )
+            last_reduced_stage_index = stage_index
+    if last_reduced_stage_index is not None:
+        fsdp_actions.append(
+            MetaStep(
+                None,
+                MetaStepType.FSDP_WAIT_REDUCE_GRAD,
+                last_reduced_stage_index,
+            )
+        )
     return fsdp_actions

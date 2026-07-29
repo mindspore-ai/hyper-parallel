@@ -176,41 +176,31 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             HSDPSchedulerV2.root_bp_state = False
         if apply_final_reduce or force_reduce:
             with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
-                # Drain any pending async fused reduction from the last module's backward
-                comm_ctx = get_comm_ctx()
-                # Drain any pending pipelined HSDP reductions (comm_fusion=True)
-                if comm_ctx.all_reduce_param_group is not None:
-                    comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
-                    comm_ctx.all_reduce_param_group = None
-                if comm_ctx.pre_param_group is not None:
-                    comm_ctx.pre_param_group.apply_fusion_reduced_grad()
-                    comm_ctx.pre_param_group = None
+                self.wait_for_pending_reductions()
 
-                # Process the last module's reduce_scatter and allreduce (comm_fusion=False)
-                if TorchHSDPStateV2.pre_all_reduce_groups:
-                    for group in TorchHSDPStateV2.pre_all_reduce_groups:
-                        # Wait reduce_scatter
-                        for hsdp_param in group.hsdp_params:
-                            hsdp_param.reduce_scatter_output()
-                            hsdp_param.clear_reduce_scatter_output()
-                        # Accumulate existing gradients (from previous mini steps) to fused_buffer
-                        # This is for gradient accumulation scenario
-                        # where previous mini steps used pre_reduce_scatter_params.
-                        # The gradients in sharded_param.grad are reduce_scatter results (not allreduced)
-                        group.accumulate_existing_grads_to_buffer()
-                        # Issue allreduce
-                        group.issue_async_allreduce()
-                        TorchHSDPStateV2.pending_all_reduce_groups.append(group)
-                    TorchHSDPStateV2.pre_all_reduce_groups.clear()
+    def wait_for_pending_reductions(self) -> None:
+        """Drain every asynchronous gradient reduction queued by this backend."""
+        comm_ctx = get_comm_ctx()
+        if comm_ctx.all_reduce_param_group is not None:
+            comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
+            comm_ctx.all_reduce_param_group = None
+        if comm_ctx.pre_param_group is not None:
+            comm_ctx.pre_param_group.apply_fusion_reduced_grad()
+            comm_ctx.pre_param_group = None
 
-                # Apply gradients for params without all_reduce needs
-                self.hsdp_state.reduce_scattered_params()
-                # Finally, wait all allreduce and apply gradients
-                TorchHSDPStateV2.delay_apply_reduce_grads(self.hsdp_state.device)
+        if TorchHSDPStateV2.pre_all_reduce_groups:
+            for group in TorchHSDPStateV2.pre_all_reduce_groups:
+                for hsdp_param in group.hsdp_params:
+                    hsdp_param.reduce_scatter_output()
+                    hsdp_param.clear_reduce_scatter_output()
+                group.accumulate_existing_grads_to_buffer()
+                group.issue_async_allreduce()
+                TorchHSDPStateV2.pending_all_reduce_groups.append(group)
+            TorchHSDPStateV2.pre_all_reduce_groups.clear()
 
-                # Handle user config replicated_param
-                self.hsdp_state.reduce_params()
-
+        self.hsdp_state.reduce_scattered_params()
+        TorchHSDPStateV2.delay_apply_reduce_grads(self.hsdp_state.device)
+        self.hsdp_state.reduce_params()
 
     def _backward_hook(self):
         """Execute backward hook."""
@@ -219,11 +209,13 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_hook(self.cell, None, None)
 
     # pylint: disable=W0613
-    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:
+    @staticmethod
+    def _grouped_forward_pre_hook_skip(cell, args, kwargs) -> None:
         """Override base ``(args, kwargs)`` return; ``nn.Module`` pre-hook uses ``None`` for no-op."""
         return None
 
-    def _grouped_forward_post_hook_skip(self, outputs) -> None:
+    @staticmethod
+    def _grouped_forward_post_hook_skip(outputs) -> None:
         """Override base output pass-through; forward hook uses ``None`` for no-op."""
         return None
 

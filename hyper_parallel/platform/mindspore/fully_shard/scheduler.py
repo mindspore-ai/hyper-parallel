@@ -149,17 +149,13 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         wait in ``_root_post_backward_final_callback`` is likewise not gated on the
         per-group post-backward training state.
 
-        Gating the drain on ``scheduler_state != BACKWARD`` was unsafe for any unit that
-        acts as a root while being fed a differentiable activation: its input's
-        ``PostBackwardFunction`` drives ``scheduler_state == BACKWARD``, so the gate would
-        skip the drain and leak the last module's reduce-scatter into the next optimizer
-        step. This happens when ``fully_shard`` wraps only inner layers and not the root
-        module (each layer becomes its own root yet is fed a grad-requiring activation).
-        PP hit the same boundary and worked around it with ``force_reduce=True`` from
-        ``PipelineStage.execute_reduce_grad``; that call site keeps working -- the drain is
-        simply always performed now. PP per-micro-batch accumulation is unaffected because
-        each chunk's backward sets ``requires_gradient_sync=False``, leaving the reduce
-        queue empty here so this drain is a no-op until the explicit reduce step.
+        Gating the drain on ``scheduler_state != BACKWARD`` is unsafe for any unit
+        that acts as a root while being fed a differentiable activation: its input's
+        ``PostBackwardFunction`` drives ``scheduler_state == BACKWARD``, so the gate
+        would skip the drain and leak the last module's reduce-scatter into the next
+        optimizer step. Pipeline accumulation keeps the queues empty here, launches
+        reduction after each stage's final backward, and drains the final tail through
+        :meth:`wait_for_pending_reductions`.
 
         ``root_bp_state`` (top-level root backward in flight; gates forward prefetch during
         activation recompute) is independent of the drain and is cleared only by the root
@@ -168,6 +164,10 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         self._backward_hook()
         if self._is_root:
             HSDPSchedulerV2.root_bp_state = False
+        self.wait_for_pending_reductions()
+
+    def wait_for_pending_reductions(self) -> None:
+        """Drain every asynchronous gradient reduction queued by this backend."""
         comm_ctx = get_comm_ctx()
         if comm_ctx.all_reduce_param_group is not None:
             comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()

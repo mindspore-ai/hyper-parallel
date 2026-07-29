@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hyper_parallel.core.pipeline_parallel import scheduler as scheduler_module
+from hyper_parallel.core.pipeline_parallel import stage as stage_module
 from tests.common.mark_utils import arg_mark
 
 
@@ -28,6 +29,14 @@ class _FakeHSDPModule:
         self.set_reshard_after_forward = MagicMock()
         self.set_reshard_after_backward = MagicMock()
         self.set_requires_gradient_sync = MagicMock()
+        self.set_is_last_backward = MagicMock()
+        self.hsdp_scheduler = SimpleNamespace(
+            hsdp_state=SimpleNamespace(
+                post_backward=MagicMock(),
+                reduce_params=MagicMock(),
+            ),
+            wait_for_pending_reductions=MagicMock(),
+        )
 
 
 @arg_mark(
@@ -113,3 +122,147 @@ def test_fsdp_backward_configured_once_per_run_for_multiple_microbatches() -> No
     )
     fsdp_module.set_reshard_after_backward.assert_called_with(False)
     fsdp_module.set_requires_gradient_sync.assert_called_with(False)
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_reduce_grad_wraps_final_backwards_with_one_terminal_wait() -> None:
+    """Each chunk should launch reductions after backward and drain them once."""
+    last_micro = 3
+    actions = [
+        None,
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD, 0),
+    ]
+
+    result = scheduler_module.add_fsdp_reduce_grad(
+        actions,
+        managed_stage_indices={0, 8},
+        micro_batch_num=last_micro + 1,
+    )
+
+    assert [
+        None if step is None else step.type
+        for step in result
+    ] == [
+        None,
+        scheduler_module.MetaStepType.BWD,
+        scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+        scheduler_module.MetaStepType.BWD,
+        scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+        scheduler_module.MetaStepType.FSDP_WAIT_REDUCE_GRAD,
+    ]
+    assert [
+        None if step is None else step.stage_index
+        for step in result
+    ] == [None, 8, 8, 0, 0, 0]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_reduce_grad_launches_after_overlap_b_f_on_caller() -> None:
+    """A worker backward should finish before its HSDP collectives launch."""
+    last_micro = 3
+    overlap_step = scheduler_module.MetaStep(
+        None,
+        scheduler_module.MetaStepType.OVERLAP_B_F,
+        None,
+        sub_steps=(
+            scheduler_module.MetaStep(
+                last_micro,
+                scheduler_module.MetaStepType.BWD,
+                8,
+            ),
+            scheduler_module.MetaStep(
+                last_micro,
+                scheduler_module.MetaStepType.FWD,
+                0,
+            ),
+        ),
+    )
+    actions = [
+        overlap_step,
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD, 0),
+    ]
+
+    result = scheduler_module.add_fsdp_reduce_grad(
+        actions,
+        managed_stage_indices={0, 8},
+        micro_batch_num=last_micro + 1,
+    )
+
+    assert result == [
+        overlap_step,
+        scheduler_module.MetaStep(
+            None,
+            scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+            8,
+        ),
+        actions[1],
+        scheduler_module.MetaStep(
+            None,
+            scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+            0,
+        ),
+        scheduler_module.MetaStep(
+            None,
+            scheduler_module.MetaStepType.FSDP_WAIT_REDUCE_GRAD,
+            0,
+        ),
+    ]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_control_handlers_launch_and_wait_on_caller_thread() -> None:
+    """FSDP control actions should launch and drain backend work."""
+    stage = SimpleNamespace(
+        launch_reduce_grad=MagicMock(),
+        wait_reduce_grad=MagicMock(),
+    )
+
+    scheduler_module._exec_fsdp_reduce_grad(stage)
+    scheduler_module._exec_fsdp_wait_reduce_grad(stage)
+
+    stage.launch_reduce_grad.assert_called_once_with()
+    stage.wait_reduce_grad.assert_called_once_with()
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_stage_launches_deferred_reduction_and_delegates_terminal_wait() -> None:
+    """PipelineStage should launch reductions and delegate the terminal wait."""
+    root = _FakeHSDPModule()
+    stage = object.__new__(stage_module.PipelineStage)
+    stage.submodule = root
+
+    with patch.object(stage_module, "HSDPModule", _FakeHSDPModule), patch.object(
+        stage_module.platform,
+        "get_cells_and_names",
+        return_value=[("", root)],
+    ):
+        stage.launch_reduce_grad()
+        stage.wait_reduce_grad()
+
+    root.set_is_last_backward.assert_called_once_with(True)
+    root.set_reshard_after_backward.assert_called_once_with(True)
+    root.set_requires_gradient_sync.assert_called_once_with(True)
+    root.hsdp_scheduler.hsdp_state.post_backward.assert_called_once_with()
+    root.hsdp_scheduler.hsdp_state.reduce_params.assert_called_once_with()
+    root.hsdp_scheduler.wait_for_pending_reductions.assert_called_once_with()
