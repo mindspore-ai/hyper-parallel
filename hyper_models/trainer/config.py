@@ -15,12 +15,14 @@
 """Typed configuration tree produced by the HyperModels YAML resolver."""
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Generic, Literal, Optional, TypeVar
+
+import torch.nn as nn
+from transformers import PreTrainedTokenizerBase
 
 from hyper_models.components.checkpoint.config import CheckpointingConfig
 from hyper_models.components.datasets import DatasetConfig
-from hyper_models.components.loss import Loss
-from hyper_models.components.optim import LRScheduler, Optimizer
+from hyper_models.components.optim import LRSchedulerConfig, OptimizerConfig
 from hyper_parallel.trainer import config as legacy_config
 
 
@@ -104,13 +106,35 @@ class WandbConfig:
     entity: Optional[str] = None
 
 
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredTarget(Generic[_T]):
+    """One top-level callable whose invocation is delayed until runtime setup."""
+
+    target: Callable[..., _T]
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    result_type: Optional[type[Any]] = field(default=None, repr=False)
+
+    def build(self, **runtime_kwargs: Any) -> _T:
+        result = self.target(**self.kwargs, **runtime_kwargs)
+        if self.result_type is not None and not isinstance(result, self.result_type):
+            raise TypeError(
+                f"target returned {type(result).__name__}, "
+                f"expected {self.result_type.__name__}"
+            )
+        return result
+
+
 @dataclass
 class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
-    # model identity is the only required root component
-    model: ModelConfig
 
-    # general training configs
+    model: DeferredTarget[nn.Module]
+    tokenizer: DeferredTarget[PreTrainedTokenizerBase]
+    optimizer: Optional[OptimizerConfig] = None
+    lr_scheduler: Optional[LRSchedulerConfig] = None
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # parallelism configs
@@ -122,12 +146,8 @@ class TrainerConfig:
         default_factory=GradientCheckpointingConfig
     )
 
-    # training components
-    optimizer: Optional[Optimizer.Config] = None
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     dataloader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
-    lr_scheduler: Optional[LRScheduler.Config] = None
-    loss: Optional[Loss.Config] = None
 
     # callbacks
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
@@ -153,6 +173,7 @@ __all__ = [
     "DebugConfig",
     "DatasetConfig",
     "FSDPConfig",
+    "DeferredTarget",
     "GradientCheckpointingConfig",
     "MixedPrecisionConfig",
     "TrainerConfig",

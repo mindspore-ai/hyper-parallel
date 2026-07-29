@@ -12,46 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MaskedCrossEntropy — fp32 recast masked CE loss, following design doc §10.2."""
+"""Masked cross-entropy configuration."""
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import Literal, Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 
-class MaskedCrossEntropy(nn.Module):
-    """Cross-entropy loss with masked (ignored) target positions and optional fp32 upcast.
+@dataclass(kw_only=True, slots=True)
+class MaskedCrossEntropy:
+    """YAML-configurable masked cross-entropy."""
 
-    Designed to match the design doc §10.2: recasts bf16 logits to fp32 before
-    CE computation to avoid precision loss from large-vocabulary accumulations.
-    """
+    fp32_upcast: bool = True
+    ignore_index: int = -100
+    reduction: Literal["none", "mean", "sum"] = "sum"
 
-    def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100, reduction: str = "sum"):
-        super().__init__()
-        self.fp32_upcast = fp32_upcast
-        self.ignore_index = ignore_index
-        self.reduction = reduction
-
-    def forward(
+    def build(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         num_label_tokens: Optional[int] = None,
     ) -> torch.Tensor:
-        """Compute masked cross-entropy loss.
-
-        Args:
-            logits: [batch_size, seq_len, vocab_size] or [N, V] pre-flattened.
-            labels: [batch_size, seq_len] target indices.
-            mask: Optional mask tensor (1 = keep, 0 = ignore).
-            num_label_tokens: If provided, divide loss by this (for token-mean normalization).
-
-        Returns:
-            Scalar loss tensor.
-        """
+        """Compute the configured loss."""
         if labels.device != logits.device:
             labels = labels.to(logits.device)
 
@@ -63,18 +48,27 @@ class MaskedCrossEntropy(nn.Module):
                 if mask.device != labels.device:
                     mask = mask.to(labels.device)
                 labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
-                del mask
 
         if self.fp32_upcast:
             logits = logits.float()
 
-        loss = F.cross_entropy(logits, labels, reduction=self.reduction, ignore_index=self.ignore_index)
+        loss = F.cross_entropy(
+            logits,
+            labels,
+            reduction=self.reduction,
+            ignore_index=self.ignore_index,
+        )
 
         if num_label_tokens is not None:
             if self.reduction != "sum":
-                raise ValueError("num_label_tokens is only supported when reduction is 'sum'")
+                raise ValueError(
+                    "num_label_tokens is only supported when reduction is 'sum'"
+                )
             if num_label_tokens == 0:
                 return loss * 0.0
             loss = loss / num_label_tokens
 
         return loss
+
+
+__all__ = ["MaskedCrossEntropy"]
