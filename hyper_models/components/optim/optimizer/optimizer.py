@@ -12,81 +12,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""YAML-configurable optimizer components."""
+"""YAML-configurable optimizer implementations."""
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 
-class OptimizerConfig(ABC):
-    """Configuration contract for constructing runtime optimizers."""
+class AdamW(torch.optim.AdamW):
+    """AdamW optimizer with Hyper model parameter grouping."""
 
-    @abstractmethod
-    def build(
+    def __init__(
         self,
-        model: nn.Module,
         *,
-        device_mesh: Optional[Any] = None,
-    ) -> list[torch.optim.Optimizer]: ...
-
-
-@dataclass(kw_only=True, slots=True)
-class AdamW(OptimizerConfig):
-    """AdamW parameters and runtime construction."""
-
-    lr: float = 1e-4
-    weight_decay: float = 0.01
-    betas: tuple[float, float] = (0.9, 0.999)
-    eps: float = 1e-8
-    foreach: Optional[bool] = None
-    max_grad_norm: float = 1.0
-
-    def build(
-        self,
         model: nn.Module,
-        *,
-        device_mesh: Optional[Any] = None,
-    ) -> list[torch.optim.Optimizer]:
-        """Build one AdamW optimizer for each model part."""
-        optimizers = []
-        for part in getattr(model, "parts", [model]):
-            param_groups = _build_param_groups(part, self.weight_decay)
-            optimizers.append(
-                torch.optim.AdamW(
-                    param_groups,
-                    lr=self.lr,
-                    betas=self.betas,
-                    eps=self.eps,
-                    foreach=self.foreach if self.foreach is not None else True,
-                )
-            )
-        return optimizers
+        lr: float = 1e-4,
+        weight_decay: float = 0.01,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        foreach: Optional[bool] = None,
+    ) -> None:
+        """Initialize AdamW from a runtime model.
+
+        Args:
+            model: Runtime model injected by the trainer.
+            lr: Learning rate.
+            weight_decay: Weight decay for decay parameter groups.
+            betas: AdamW coefficient pair.
+            eps: AdamW numerical-stability term.
+            foreach: Whether to use the foreach implementation.
+        """
+        param_groups = _build_param_groups(model, weight_decay)
+        super().__init__(
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=betas,
+            eps=eps,
+            foreach=True if foreach is None else foreach,
+        )
 
 
 def _build_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
-    """Decay/no_decay parameter grouping.
-
-    Following design doc §9.5.
-    """
-    decay_params, no_decay_params = [], []
+    """Build decay and no-decay groups across all local model parts."""
+    decay_params = []
+    no_decay_params = []
     seen_ids = set()
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        param_id = id(param)
-        if param_id in seen_ids:
-            continue
-        seen_ids.add(param_id)
+    model_parts = getattr(model, "parts", None)
+    parts = model_parts if model_parts is not None else [model]
 
-        if _is_no_decay(name):
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
+    for part in parts:
+        for name, param in part.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            param_id = id(param)
+            if param_id in seen_ids:
+                continue
+            seen_ids.add(param_id)
+
+            if _is_no_decay(name):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
 
     return [
         {"params": decay_params, "weight_decay": weight_decay},
@@ -95,13 +85,9 @@ def _build_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
 
 
 def _is_no_decay(name: str) -> bool:
-    """Check if a parameter name should be excluded from weight decay.
-
-    Following design doc §9.5.
-    """
-    no_decay_patterns = ("bias", "norm", "rmsnorm", "layernorm", "ln_")
+    """Return whether a parameter should be excluded from weight decay."""
+    no_decay_patterns = ("bias", "norm", "ln_")
     return any(pattern in name.lower() for pattern in no_decay_patterns)
 
 
-
-__all__ = ["AdamW", "OptimizerConfig"]
+__all__ = ["AdamW"]

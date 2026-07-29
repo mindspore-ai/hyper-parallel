@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import inspect
 import types
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
-from typing import Sequence, Union, get_args, get_origin, get_type_hints
+from typing import Any, Sequence, Union, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -30,7 +31,7 @@ from hyper_models.config.resolver import (
     coerce_value,
     resolve_root,
 )
-from hyper_models.trainer.config import TrainerConfig
+from hyper_models.trainer.config import Target, TrainerConfig
 
 
 def _parse_override_tokens(tokens: Sequence[str]) -> list[tuple[str, str]]:
@@ -85,8 +86,84 @@ def _parse_cli_scalar(value: object, annotation: object) -> object:
     return value
 
 
+def _target_hints(target: object, *, path: str) -> dict[str, object]:
+    """Resolve annotations for one target function or class constructor."""
+    hint_source = target.__init__ if inspect.isclass(target) else target
+    try:
+        return get_type_hints(hint_source)
+    except (NameError, TypeError) as exc:
+        raise ConfigResolutionError(
+            f"CLI.{path}: could not resolve target type annotations: {exc}"
+        ) from exc
+
+
+def _replace_target_path(
+    config: Target[Any],
+    parts: list[str],
+    value: object,
+    *,
+    path: str,
+) -> Target[Any]:
+    """Return a target copy with one configured argument replaced."""
+    name = parts[0]
+    full_path = f"{path}.{name}" if path else name
+    if name == "_target_":
+        raise ConfigResolutionError(
+            f"CLI.{full_path}: changing _target_ through an override is not supported"
+        )
+
+    signature = inspect.signature(config._target_)
+    parameter = signature.parameters.get(name)
+    has_var_kwargs = any(
+        item.kind is inspect.Parameter.VAR_KEYWORD
+        for item in signature.parameters.values()
+    )
+    if parameter is None and not has_var_kwargs:
+        candidates = [
+            item.name
+            for item in signature.parameters.values()
+            if item.kind not in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            )
+        ]
+        matches = difflib.get_close_matches(name, candidates, n=1)
+        suggestion = f"; did you mean {matches[0]!r}?" if matches else ""
+        raise ConfigResolutionError(
+            f"CLI.{full_path}: unknown target argument {name!r}{suggestion}"
+        )
+
+    if len(parts) > 1:
+        try:
+            child = getattr(config, name)
+        except AttributeError as exc:
+            raise ConfigResolutionError(
+                f"CLI.{full_path}: target argument is not configured"
+            ) from exc
+        updated_child = _replace_path(child, parts[1:], value, path=full_path)
+        return config.replace(**{name: updated_child})
+
+    normalized = value
+    if parameter is not None:
+        annotation = _target_hints(config._target_, path=path).get(
+            name,
+            parameter.annotation,
+        )
+        if annotation not in (Any, object, inspect.Signature.empty):
+            normalized = coerce_value(
+                _parse_cli_scalar(value, annotation),
+                annotation,
+                path=f"CLI.{full_path}",
+            )
+    return config.replace(**{name: normalized})
+
+
 def _replace_path(config: object, parts: list[str], value: object, *, path: str) -> object:
-    """Return a dataclass copy with one typed dotted-path value replaced."""
+    """Return a config copy with one typed dotted-path value replaced."""
+
+    if isinstance(config, Target):
+        return _replace_target_path(config, parts, value, path=path)
 
     location = f"CLI.{path}" if path else "CLI"
     if not is_dataclass(config):
