@@ -14,16 +14,16 @@
 # ============================================================================
 """Typed configuration tree produced by the HyperModels YAML resolver."""
 
-from dataclasses import dataclass, field
+import inspect
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Callable, Generic, Literal, Optional, TypeVar
 
 import torch.nn as nn
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedTokenizerBase
 
 from hyper_models.components.checkpoint.config import CheckpointingConfig
-from hyper_models.components.datasets import DatasetConfig
-from hyper_models.components.optim import LRSchedulerConfig, OptimizerConfig
-from hyper_parallel.trainer import config as legacy_config
 
 
 @dataclass
@@ -35,22 +35,11 @@ class TrainingConfig:
     global_batch_size: int = 8
     micro_batch_size: int = 1
     backend: Literal["nccl", "hccl", "gloo"] = "nccl"
+    max_grad_norm: float = 1.0
     init_device: Literal["meta", "cpu", "cuda", "npu"] = "meta"
     loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"
     seed: Optional[int] = None
     enable_full_determinism: bool = False
-
-
-ModelConfig = legacy_config.ModelConfig
-
-
-@dataclass
-class DataLoaderConfig:
-    """DataLoader behavior consumed by the Trainer loop."""
-
-    shuffle: bool = True
-    drop_last: bool = True
-    use_background_prefetcher: bool = False
 
 
 @dataclass
@@ -109,32 +98,93 @@ class WandbConfig:
 _T = TypeVar("_T")
 
 
-@dataclass(frozen=True, slots=True)
-class DeferredTarget(Generic[_T]):
-    """One top-level callable whose invocation is delayed until runtime setup."""
+def _serialize_config_value(value: Any) -> Any:
+    """Convert one target argument to a plain serializable value."""
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {
+            key: _serialize_config_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_serialize_config_value(item) for item in value]
+    return value
 
-    target: Callable[..., _T]
-    kwargs: dict[str, Any] = field(default_factory=dict)
-    result_type: Optional[type[Any]] = field(default=None, repr=False)
+
+class Target(Generic[_T]):
+    """Configuration for one callable whose invocation is delayed until runtime."""
+
+    def __init__(
+        self,
+        _target_: Callable[..., _T],
+        *,
+        target_path: str,
+        **kwargs: Any,
+    ) -> None:
+        """Store the resolved callable, its source path, and configured arguments."""
+        if not callable(_target_):
+            raise TypeError("_target_ must be callable")
+        if not isinstance(target_path, str) or not target_path.strip():
+            raise ValueError("target_path must be a non-empty string")
+
+        self._target_ = _target_
+        self._target_path = target_path
+        self._kwargs = dict(kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        kwargs = object.__getattribute__(self, "_kwargs")
+        try:
+            return kwargs[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
 
     def build(self, **runtime_kwargs: Any) -> _T:
-        result = self.target(**self.kwargs, **runtime_kwargs)
-        if self.result_type is not None and not isinstance(result, self.result_type):
-            raise TypeError(
-                f"target returned {type(result).__name__}, "
-                f"expected {self.result_type.__name__}"
-            )
-        return result
+        """Invoke the target with configured and runtime arguments.
+
+        Args:
+            **runtime_kwargs: Runtime-owned arguments. These values override
+                configured arguments with the same names.
+
+        Returns:
+            The direct result of the configured target callable.
+        """
+        kwargs = dict(self._kwargs)
+        kwargs.update(runtime_kwargs)
+        inspect.signature(self._target_).bind(**kwargs)
+        return self._target_(**kwargs)
+
+    def replace(self, **changes: Any) -> "Target[_T]":
+        """Return a new target with selected configured arguments replaced."""
+        kwargs = dict(self._kwargs)
+        kwargs.update(changes)
+        return type(self)(
+            self._target_,
+            target_path=self._target_path,
+            **kwargs,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this target back to its YAML-compatible form."""
+        return {
+            "_target_": self._target_path,
+            **{
+                name: _serialize_config_value(value)
+                for name, value in self._kwargs.items()
+            },
+        }
 
 
 @dataclass
 class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
-    model: DeferredTarget[nn.Module]
-    tokenizer: DeferredTarget[PreTrainedTokenizerBase]
-    optimizer: OptimizerConfig
-    lr_scheduler: LRSchedulerConfig
+    model: Target[nn.Module]
+    tokenizer: Target[PreTrainedTokenizerBase]
+    optimizer: Target[Optimizer]
+    lr_scheduler: Target[LRScheduler]
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # parallelism configs
@@ -146,10 +196,11 @@ class TrainerConfig:
         default_factory=GradientCheckpointingConfig
     )
 
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    dataloader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
+    dataset: Optional[Target[Any]] = None
+    collate_fn: Optional[Target[Any]] = None
+    dataloader: Optional[Target[Any]] = None
+    packed_sequence: Optional[Any] = None
 
-    # callbacks
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
@@ -169,17 +220,14 @@ def save_configs(config: TrainerConfig, output_dir: str) -> None:
 
 __all__ = [
     "AcceleratorConfig",
-    "DataLoaderConfig",
     "DebugConfig",
-    "DatasetConfig",
     "FSDPConfig",
-    "DeferredTarget",
     "GradientCheckpointingConfig",
     "MixedPrecisionConfig",
+    "Target",
     "TrainerConfig",
     "TrainingConfig",
     "WandbConfig",
-    "ModelConfig",
     "save_configs",
     "CheckpointingConfig",
 ]
