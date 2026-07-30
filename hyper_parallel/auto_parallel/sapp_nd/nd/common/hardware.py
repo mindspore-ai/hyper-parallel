@@ -65,12 +65,16 @@ class Type:
                 return lvl
         return self.levels
 
-    def level_assign(self, dp=1, tp=1, cp=1, pp=1):
+    def level_assign(self, dp=1, tp=1, cp=1, pp=1, ep=1):
         """device assignment of the different parallel dimensions"""
-        device_number = dp * tp * cp * pp
-        logger.debug("DP = %d, TP = %d, CP = %d, PP = %d", dp, tp, cp, pp)
+        # EP borrows from DP, not counted in total devices; kept for
+        # topology tracking only — callers should NOT pass ep > 1
+        # unless they also account for EP-in-DP convention.
+        device_number = dp * tp * cp * pp * ep
+        logger.debug("DP = %d, TP = %d, EP = %d, CP = %d, PP = %d", dp, tp, ep, cp, pp)
         assignment = {}
         assignment[Dim.TP] = []
+        assignment[Dim.EP] = []
         assignment[Dim.CP] = []
         assignment[Dim.DP] = []
         assignment[Dim.PP] = []
@@ -87,6 +91,11 @@ class Type:
             assignment[Dim.TP].append(tp_level)
             tp = tp // tp_level
             remaining_devices = remaining_devices // tp_level
+
+            ep_level = min(ep, remaining_devices)
+            assignment[Dim.EP].append(ep_level)
+            ep = ep // ep_level
+            remaining_devices = remaining_devices // ep_level
 
             cp_level = min(cp, remaining_devices)
             assignment[Dim.CP].append(cp_level)

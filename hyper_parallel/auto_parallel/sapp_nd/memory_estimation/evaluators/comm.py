@@ -178,7 +178,7 @@ class EvalLayerComm:
 
     @staticmethod
     def ep_comm_layer_balanced(
-        ccfg: CostModelConfig, ctx: Context, mb: int
+        ccfg: CostModelConfig, ctx: Context, mb: int  # pylint: disable=unused-argument
     ) -> float:
         """EP comm for balanced token distribution (byte volume).
 

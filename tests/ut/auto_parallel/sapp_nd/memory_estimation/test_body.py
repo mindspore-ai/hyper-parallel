@@ -32,7 +32,7 @@ import os
 import unittest
 from unittest.mock import MagicMock, PropertyMock
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.layer_block import EvalFFn, EvalAttn, EvalNorm
@@ -359,6 +359,258 @@ class TestNumParamsSharedExpert(unittest.TestCase):
         shared = EvalFFn.num_params_shared_expert(ccfg, None)
         old = EvalFFn.num_params_ffn(ccfg, None)
         self.assertAlmostEqual(routed + shared, old, places=0)
+
+
+class TestLayerActiv(unittest.TestCase):
+    """Test EvalBody.layer_activ (no recompute / select recompute)."""
+
+    def _make_ctx(self, qkv=10.0, score=20.0, proj=30.0, ffn=100.0,
+                  moe=200.0, norm=5.0):
+        ctx = MagicMock()
+        ctx.attn_qkv_activ = lambda c, x: qkv
+        ctx.attn_score_activ = lambda c, x: score
+        ctx.attn_proj_activ = lambda c, x: proj
+        ctx.ffn_activ = lambda c, x: ffn
+        ctx.ffn_moe_activ = lambda c, x: moe
+        ctx.norm_activ = lambda c, x: norm
+        return ctx
+
+    def test_dense_layer_activ(self):
+        """BD-A01: Dense (n_exp=1) layer_activ = attn + ffn + norm."""
+        ccfg = _make_ccfg(n_exp=1)
+        ctx = self._make_ctx()
+        result = EvalBody.layer_activ(ccfg, ctx)
+        expected = (10 + 20 + 30) + 100 + 5
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_moe_layer_activ(self):
+        """BD-A02: MoE (n_exp>1) layer_activ = attn + moe + norm."""
+        ccfg = _make_ccfg(n_exp=8)
+        ctx = self._make_ctx()
+        result = EvalBody.layer_activ(ccfg, ctx)
+        expected = (10 + 20 + 30) + 200 + 5
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestFullrecLayerActiv(unittest.TestCase):
+    """Test EvalBody.fullrec_layer_activ (full recompute)."""
+
+    def test_basic_formula(self):
+        """BD-F01: fullrec_layer_activ = micro_factor * bytes_compute * s * b * h / shard_recompute_input."""
+        ccfg = _make_ccfg(h=4096)
+        ccfg.s = 1024
+        ccfg.b = 4
+        ccfg.bytes_compute = 2
+        ccfg.shard_recompute_input = 1.0
+        ctx = MagicMock()
+        ctx.micro_factor = 3
+        result = EvalBody.fullrec_layer_activ(ccfg, ctx)
+        expected = 3 * 2 * 1024 * 4 * 4096 / 1.0
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_shard_recompute_input_divides(self):
+        """BD-F02: shard_recompute_input > 1 reduces activation memory."""
+        ccfg = _make_ccfg(h=4096)
+        ccfg.s = 1024
+        ccfg.b = 4
+        ccfg.bytes_compute = 2
+        ccfg.shard_recompute_input = 2.0
+        ctx = MagicMock()
+        ctx.micro_factor = 3
+        result = EvalBody.fullrec_layer_activ(ccfg, ctx)
+        expected = 3 * 2 * 1024 * 4 * 4096 / 2.0
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestFullrecLayerActivGradclip(unittest.TestCase):
+    """Test EvalBody.fullrec_layer_activ_gradclip (gradient clipping)."""
+
+    def _make_ccfg_gradclip(self, has_clip=True, ep=1, **kwargs):
+        ccfg = _make_ccfg(ep=ep, **kwargs)
+        ccfg.has_clip = has_clip
+        ccfg.bytes_compute = 2
+        ccfg.s = 1024
+        ccfg.b = 4
+        ccfg.shard_recompute_input = 1.0
+        return ccfg
+
+    def _make_ctx_gradclip(self, non_exp=100.0, routed=0.0, shared=0.0,
+                           dp_comm=0.0):
+        ctx = MagicMock()
+        ctx.micro_factor = 1
+        ctx.eval = MagicMock()
+        ctx.eval.num_p = lambda c, x: (non_exp, routed, shared)
+        ctx.eval.dyn = MagicMock()
+        ctx.eval.dyn.comm = MagicMock()
+        ctx.eval.dyn.comm.dp = lambda c, x: dp_comm
+        return ctx
+
+    def test_no_clip_returns_forward(self):
+        """BD-GC01: has_clip=False → returns forward_activation directly."""
+        ccfg = self._make_ccfg_gradclip(has_clip=False)
+        ctx = self._make_ctx_gradclip()
+        result = EvalBody.fullrec_layer_activ_gradclip(ccfg, ctx)
+        forward = EvalBody.fullrec_layer_activ(ccfg, ctx)
+        self.assertAlmostEqual(result, forward, places=4)
+
+    def test_clip_returns_grad_clip_when_smaller(self):
+        """BD-GC02: grad_clip_mem < forward+dp → returns forward (clipping not enough)."""
+        # Make grad_clip_mem very small so forward + dp > grad_clip_mem
+        ccfg = self._make_ccfg_gradclip(has_clip=True, ep=1,
+                                        bytes_os=1, shard_p_os_exp=1,
+                                        shard_p_os_exp_partial=1,
+                                        shard_p_os_non_exp_partial=1)
+        ccfg.bytes_os = 1
+        ctx = self._make_ctx_gradclip(non_exp=0.001, dp_comm=0)
+        result = EvalBody.fullrec_layer_activ_gradclip(ccfg, ctx)
+        # forward is large (1*2*1024*4*4096), grad_clip_mem tiny → returns forward
+        forward = EvalBody.fullrec_layer_activ(ccfg, ctx)
+        self.assertAlmostEqual(result, forward, places=0)
+
+    def test_has_clip_zero_multiplier(self):
+        """BD-GC01b: int(has_clip=False) = 0 makes grad_clip_mem = 0."""
+        ccfg = self._make_ccfg_gradclip(has_clip=False)
+        ctx = self._make_ctx_gradclip()
+        result = EvalBody.fullrec_layer_activ_gradclip(ccfg, ctx)
+        forward = EvalBody.fullrec_layer_activ(ccfg, ctx)
+        # With has_clip=False, grad_clip_mem *= 0, so 0 < forward → returns forward
+        self.assertAlmostEqual(result, forward, places=4)
+
+
+class TestFullrecLayerCommGradclip(unittest.TestCase):
+    """Test EvalBody.fullrec_layer_comm_gradclip."""
+
+    def test_positive_activ_returns_dp_comm(self):
+        """BD-CG01: activation > 0 → returns dp_comm."""
+        ccfg = _make_ccfg(n_exp=1, bytes_os=12)
+        ccfg.has_clip = True
+        ccfg.bytes_compute = 2
+        ccfg.s = 1024
+        ccfg.b = 4
+        ccfg.shard_recompute_input = 1.0
+        ccfg.bytes_os = 12
+        ctx = MagicMock()
+        ctx.micro_factor = 1
+        ctx.eval = MagicMock()
+        ctx.eval.num_p = lambda c, x: (100.0, 0.0, 0.0)
+        ctx.eval.dyn = MagicMock()
+        ctx.eval.dyn.comm = MagicMock()
+        ctx.eval.dyn.comm.dp = lambda c, x: 50.0
+        result = EvalBody.fullrec_layer_comm_gradclip(ccfg, ctx)
+        self.assertAlmostEqual(result, 50.0, places=4)
+
+    def test_zero_activ_returns_zero(self):
+        """BD-CG02: activation = 0 → returns 0."""
+        ccfg = _make_ccfg(n_exp=1)
+        ccfg.has_clip = False
+        ccfg.bytes_compute = 0  # makes forward_activation = 0
+        ccfg.s = 0
+        ccfg.b = 0
+        ccfg.shard_recompute_input = 1.0
+        ctx = MagicMock()
+        ctx.micro_factor = 1
+        ctx.eval = MagicMock()
+        ctx.eval.num_p = lambda c, x: (0.0, 0.0, 0.0)
+        ctx.eval.dyn = MagicMock()
+        ctx.eval.dyn.comm = MagicMock()
+        ctx.eval.dyn.comm.dp = lambda c, x: 50.0
+        result = EvalBody.fullrec_layer_comm_gradclip(ccfg, ctx)
+        self.assertEqual(result, 0)
+
+
+class TestActCpLayer(unittest.TestCase):
+    """Test EvalBody.act_cp_layer (CP activation memory breakdown)."""
+
+    def _make_ccfg_cp(self, a=32, t=1, cp=2, s=1024, b=4,
+                       kv_lora_rank=0, n_kv=32, dh=128,
+                       cp_algo="colossalai_cp", device_per_node=8,
+                       h=4096):
+        """Create a mock CostModelConfig for CP activation tests."""
+        ccfg = MagicMock()
+        ccfg.a = a
+        ccfg.t = t
+        ccfg.cp = cp
+        ccfg.s = s
+        ccfg.b = b
+        ccfg.kv_lora_rank = kv_lora_rank
+        ccfg.n_kv = n_kv
+        ccfg.dh = dh
+        ccfg.h = h
+        ccfg.cp_algo = cp_algo
+        ccfg.device_per_node = device_per_node
+        return ccfg
+
+    def _make_ctx_cp(self, comm_buffer=0.0):
+        ctx = MagicMock()
+        # Mock EvalLayerComm.cp_comm_buffer
+        return ctx
+
+    def test_ring_cp_mha_basic(self):
+        """BD-CP01: Ring CP with MHA attention produces valid breakdown."""
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, cp_algo="colossalai_cp")
+        ctx = self._make_ctx_cp()
+        result = EvalBody.act_cp_layer(ccfg, ctx)
+        from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import CPMemoryBreakdown
+        self.assertIsInstance(result, CPMemoryBreakdown)
+        self.assertEqual(result.cp_degree, 2)
+        self.assertEqual(result.seq_len, 1024)
+        self.assertGreater(result.total_memory, 0)
+        self.assertGreater(result.kv_cache_memory, 0)
+
+    def test_ulysses_cp_mha_basic(self):
+        """BD-CP02: Ulysses CP with MHA produces valid breakdown."""
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, cp_algo="ulysses_cp")
+        ctx = self._make_ctx_cp()
+        result = EvalBody.act_cp_layer(ccfg, ctx)
+        self.assertEqual(result.cp_degree, 2)
+        self.assertGreater(result.total_memory, 0)
+
+    def test_ring_cp_reduces_vs_no_cp(self):
+        """BD-CP03: Ring CP s2_reduction > 0 (scores are divided by cp)."""
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=4, cp_algo="colossalai_cp")
+        ctx = self._make_ctx_cp()
+        result = EvalBody.act_cp_layer(ccfg, ctx)
+        self.assertGreater(result.s2_reduction, 0)
+        self.assertGreater(result.kv_reduction, 0)
+
+    def test_ulysses_reduces_per_rank_heads(self):
+        """BD-CP04: Ulysses CP divides heads by cp, reducing s2 items."""
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=4, cp_algo="ulysses_cp")
+        ctx = self._make_ctx_cp()
+        result = EvalBody.act_cp_layer(ccfg, ctx)
+        self.assertGreater(result.s2_reduction, 0)
+
+    def test_invalid_a_raises(self):
+        """BD-CP05: a <= 0 raises ValueError."""
+        ccfg = self._make_ccfg_cp(a=0)
+        ctx = self._make_ctx_cp()
+        with self.assertRaises(ValueError):
+            EvalBody.act_cp_layer(ccfg, ctx)
+
+    def test_invalid_cp_raises(self):
+        """BD-CP06: cp <= 0 raises ValueError."""
+        ccfg = self._make_ccfg_cp(cp=0)
+        ctx = self._make_ctx_cp()
+        with self.assertRaises(ValueError):
+            EvalBody.act_cp_layer(ccfg, ctx)
+
+    def test_mla_uses_kv_lora_rank(self):
+        """BD-CP07: MLA (kv_lora_rank > 0) uses kv_lora_rank for kv_dim."""
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, kv_lora_rank=512,
+                                   n_kv=32, dh=128, cp_algo="colossalai_cp")
+        ctx = self._make_ctx_cp()
+        result = EvalBody.act_cp_layer(ccfg, ctx)
+        # kv_dim = kv_lora_rank = 512 for MLA
+        self.assertGreater(result.kv_cache_memory, 0)
+
+    def test_gqa_kv_dim(self):
+        """BD-CP08: GQA (n_kv < a) uses n_kv * dh / t for kv_dim."""
+        ccfg = self._make_ccfg_cp(a=32, t=1, cp=2, kv_lora_rank=0,
+                                   n_kv=8, dh=128, cp_algo="colossalai_cp")
+        ctx = self._make_ctx_cp()
+        result = EvalBody.act_cp_layer(ccfg, ctx)
+        # kv_dim = 8 * 128 / 1 = 1024
+        self.assertGreater(result.kv_cache_memory, 0)
 
 
 class TestConfigOptimizerShard(unittest.TestCase):

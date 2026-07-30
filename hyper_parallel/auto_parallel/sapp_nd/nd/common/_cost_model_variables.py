@@ -51,7 +51,7 @@ class _CostModVar:
     t: float = 0
     p: float = 0
     cp: float = 0
-    ep: float = 0
+    ep: float = 1
     sp: float = 0
     vp: float = 0
     os_max_shard: float = 0
@@ -93,7 +93,7 @@ class _CostModVar:
     n_shared_exp: float = 0
     cap_fact: float = 0
     etp: float = 0
-    tokens_per_expert: list = None  # per-expert token count per mb (all EP, pre a2a); None=balanced
+    tokens_per_expert: list = None  # global per-expert token count per microbatch (all EP ranks combined, before all-to-all); None = balanced
 
     # CP modeling
     kv_lora_rank: float = 0
