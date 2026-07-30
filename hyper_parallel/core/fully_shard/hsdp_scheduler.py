@@ -154,6 +154,12 @@ class HSDPSchedulerV2:
             raise ValueError(f"requires_grad_sync should be a bool, got {type(requires_grad_sync)}")
         self.hsdp_state.set_requires_grad_sync(requires_grad_sync)
 
+    def wait_for_pending_reductions(self) -> None:
+        """Wait for all asynchronous gradient reductions owned by this backend."""
+        raise NotImplementedError(
+            "HSDPScheduler subclasses must implement wait_for_pending_reductions."
+        )
+
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, args, kwargs):
         """Forward pre hook to unsharded parameter for forward process."""

@@ -266,6 +266,38 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         MindSporeHSDPSchedulerV2._backward_hook(scheduler)
         scheduler._hsdp_backward_hook.assert_not_called()
 
+    def test_terminal_wait_drains_rs_before_waiting_all_reduces(self):
+        """The terminal action should launch the tail AR, then wait all ARs."""
+        scheduler = _make_scheduler()
+        order = []
+        group = SimpleNamespace(
+            accumulate_existing_grads_to_buffer=MagicMock(
+                side_effect=lambda: order.append("pack-ar")
+            ),
+            issue_async_allreduce=MagicMock(side_effect=lambda: order.append("launch-ar")),
+        )
+        scheduler.hsdp_state._wait_prev_reduce_scatter.return_value = [group]
+        scheduler.hsdp_state.reduce_scattered_params.side_effect = lambda: order.append(
+            "apply-rs"
+        )
+        scheduler.hsdp_state.reduce_params.side_effect = lambda: order.append("apply-direct-ar")
+        comm_ctx = SimpleNamespace(
+            all_reduce_param_group=None,
+            pre_param_group=None,
+        )
+
+        with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx), patch.object(
+            scheduler_mod.MindSporeHSDPStateV2,
+            "delay_apply_reduce_grads",
+            side_effect=lambda: order.append("wait-ar"),
+        ):
+            MindSporeHSDPSchedulerV2.wait_for_pending_reductions(scheduler)
+
+        self.assertEqual(
+            order,
+            ["pack-ar", "launch-ar", "apply-rs", "wait-ar", "apply-direct-ar"],
+        )
+
     def test_register_forward_backward_hooks_for_single_and_grouped_modules(self):
         """Hook registration should use grouped hooks only when the grouped marker exists."""
         scheduler = _make_scheduler()

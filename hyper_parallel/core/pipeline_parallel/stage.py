@@ -517,27 +517,26 @@ class PipelineStage(PipelineStageBase):
         rg_infos = [info for info in self.args_recv_info[micro_index] if info.requires_grad]
         return [("isend", cur_out, info.global_rank) for cur_out, info in zip(out, rg_infos)]
 
-    def execute_reduce_grad(self):
-        """Trigger FSDP post-backward gradient reduction and root hook for the stage submodule."""
+    def launch_reduce_grad(self) -> None:
+        """Launch HSDP reduction after this stage's final backward."""
         if not isinstance(self.submodule, HSDPModule):
             return
         fsdp_module = self.submodule
         fsdp_module.set_is_last_backward(True)
         fsdp_module.set_reshard_after_backward(True)
         fsdp_module.set_requires_gradient_sync(True)
-
-        for _, submod in platform.get_cells_and_names(fsdp_module):
-            if not isinstance(submod, HSDPModule):
+        for _, submodule in platform.get_cells_and_names(self.submodule):
+            if not isinstance(submodule, HSDPModule):
                 continue
-            sub_mod_state = submod.hsdp_scheduler.hsdp_state
-            sub_mod_state.post_backward()
-            sub_mod_state.reduce_params()
+            hsdp_state = submodule.hsdp_scheduler.hsdp_state
+            hsdp_state.post_backward()
+            hsdp_state.reduce_params()
 
-        # No public API exposes the root backward finalization; call the platform hook directly.
-        # force_reduce=True: the recv buffer's PostBackwardFunction has put the root into
-        # scheduler_state==BACKWARD, so the natural gate would skip the final drain and the
-        # last module's reduce-scatter would lag one optimizer step.
-        fsdp_module.hsdp_scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
+    def wait_reduce_grad(self) -> None:
+        """Wait for gradient reductions launched by the pipeline schedule."""
+        if not isinstance(self.submodule, HSDPModule):
+            return
+        self.submodule.hsdp_scheduler.wait_for_pending_reductions()
 
     def _build_padded_sens(self, micro_index):
         """Build an N-length sens list aligned with the forward output structure.
