@@ -192,9 +192,12 @@ class FinetuneRecipe(BaseRecipe):
             cfg.step_scheduler.local_batch_size,
         )
 
-        # ⑯ LR Scheduler —— typed: .build(optimizer, step_scheduler)
+        # ⑯ LR Scheduler —— typed: .build(optimizer, max_steps=...)
         self.lr_scheduler = (
-            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            self.cfg.lr_scheduler.build(
+                self.optimizer,
+                max_steps=self.step_scheduler.max_steps,
+            )
             if self.cfg.lr_scheduler is not None
             else None
         )

@@ -30,10 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 def build_model(
-    model_cfg,
-    peft_config=None,
+    model_cfg: Any,
+    peft_config: Any = None,
     distributed_setup: Optional[DistributedSetup] = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> tuple[nn.Module, Optional[OptimizerInit]]:
     """High-level build_model entry point.
 
@@ -48,7 +48,7 @@ def build_model(
     HyperAutoModel already provides an equivalent single-card path.
 
     Args:
-        model_cfg: ModelConfig or ConfigNode (with weights_path etc.)
+        model_cfg: ModelConfig or ConfigNode containing a model path.
         peft_config: PEFT configuration (optional).
         distributed_setup: Distributed topology and strategy.
         **kwargs: Extra args for model construction.
@@ -56,9 +56,16 @@ def build_model(
     Returns:
         (model, optimizer_init) tuple.
     """
-    pretrained_path = getattr(model_cfg, "weights_path", None) or getattr(
-        model_cfg, "pretrained_model_name_or_path", None
+    pretrained_path = (
+        getattr(model_cfg, "weights_path", None)
+        or getattr(model_cfg, "pretrained_model_name_or_path", None)
+        or getattr(model_cfg, "model_name_or_path", None)
     )
+    if not pretrained_path:
+        raise ValueError(
+            "model config must define model_name_or_path, weights_path, "
+            "or pretrained_model_name_or_path"
+        )
 
     model = HyperAutoModelForCausalLM.from_pretrained(
         pretrained_path,
