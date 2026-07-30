@@ -146,12 +146,14 @@ class PrecompiledBoundary:
         """Compile the input communication plan from in_src → in_dst (identity
         dimensions naturally compile to pass-through ops)."""
         plan = []
-        all_names = set(spec.in_src.keys()) | set(spec.in_dst.keys())
+        in_src = spec.in_src or {}   # None 容错：手写 spec（调试捷径）可能
+        in_dst = spec.in_dst or {}   # 未经 plan 规范化（"不写继承"输入侧语义）
+        all_names = set(in_src.keys()) | set(in_dst.keys())
         for name in sorted(all_names):
             src_p = tuple(resolve_placements(
-                spec.in_src.get(name, {}), mesh_dim_names))
+                in_src.get(name, {}), mesh_dim_names))
             dst_p = tuple(resolve_placements(
-                spec.in_dst.get(name, {}), mesh_dim_names))
+                in_dst.get(name, {}), mesh_dim_names))
             plan.append(RedistOp(
                 arg_name=name,
                 arg_index=None,

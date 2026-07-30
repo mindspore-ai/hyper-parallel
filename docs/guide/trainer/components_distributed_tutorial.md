@@ -1,13 +1,22 @@
 # hyper_models/components/distributed 双模式 DTensor 使用教程
 
+> **文档层级（2026-08-10）**：本教程与 [patch_injection_mechanism.md](../../patch_injection_mechanism.md)
+> 是使用/机制语义的**现行口径唯一权威**；其余设计文档与代码串讲为辅助
+> 材料，说法冲突时以这两份为准。
 > 适用组件：`hyper_models/components/distributed/`
-> 设计文档：`docs/detailed_design/05_dual_mode_dtensor_parallel_strategy.md`
-> 代码走读：`docs/refactor/guides/components_distributed_code_walkthrough.md`
+> 设计文档：[hyper_models_dual_mode_dtensor_design.md](../../hyper_models_dual_mode_dtensor_design.md)
+> 代码走读：[components_distributed_code_walkthrough.md](../../trainer/code_guides/components_distributed_code_walkthrough.md)；
+> FunctionModule 机制走读：[function_module_autograd_walkthrough.md](../../trainer/code_guides/function_module_autograd_walkthrough.md)
+> 场景配方：[examples/recipes/](../../../examples/recipes/README.md)（按 arch/拓扑可引用的 YAML 起点）
 
 本教程覆盖：**TP / CP / EP / FSDP 组合、production↔validate 双模式切换、
-自定义模块四接口（`use_local_map` / `local_compute_fn` / `inner_target` /
-`inner_wrapper`）**，并讲清 CP/EP 各自内置了哪些 wrapper、何时自动生效、
-如何显式固定或整体替换。
+自定义模块注入接口（`region_dispatch` / `local_compute_fn` / `inner_target` /
+`inner_wrapper` / `inner_out_src`）**，并讲清仓内为 CP/EP 提供了哪些参考
+实现函数、如何显式注入、如何显式固定或整体替换。
+
+**阅读路径**：§1-§2 跑通 → §3 建立双模式心智模型（含 region_dispatch
+一分钟判断）→ §4 用内省工具看懂自己模型的 plan → §5-§9 按需深入
+TP/CP/EP/FSDP/多维组合 → §10 自定义注入完整指南 → §11-§13 参考与排错。
 
 ---
 
@@ -15,16 +24,17 @@
 
 1. [组件概述](#1-组件概述)
 2. [五分钟快速开始（TP）](#2-五分钟快速开始tp)
-3. [核心 API 参考](#3-核心-api-参考)
-4. [双模式：validate 与 production](#4-双模式validate-与-production)
+3. [双模式：validate 与 production](#3-双模式validate-与-production)（含 region_dispatch 一分钟判断 §3.4）
+4. [看懂自己的 plan：内省与判定工具](#4-看懂自己的-plan内省与判定工具)（plan.explain() §4.1 与 check_dispatchable §4.2）
 5. [TP 教程](#5-tp-教程)
-6. [CP 教程（含内置 4 个 CP wrapper 详解）](#6-cp-教程)
-7. [EP 教程（含内置 EP wrapper 详解）](#7-ep-教程)
+6. [CP 教程（含仓内 4 个 CP wrapper 参考实现详解）](#6-cp-教程)
+7. [EP 教程（含仓内 EP compute 参考实现详解）](#7-ep-教程)
 8. [FSDP 组合（接口契约）](#8-fsdp-组合接口契约)
 9. [多维并行组合（mesh 布局）](#9-多维并行组合mesh-布局)
-10. [自定义模块完整指南](#10-自定义模块完整指南)
-11. [典型模型支持矩阵](#11-典型模型支持矩阵)
-12. [排错索引](#12-排错索引)
+10. [自定义模块完整指南](#10-自定义模块完整指南)（region_dispatch 公理 §10.1）
+11. [核心 API 参考](#11-核心-api-参考)
+12. [典型模型支持矩阵](#12-典型模型支持矩阵)
+13. [排错索引](#13-排错索引)
 
 ---
 
@@ -44,7 +54,7 @@ apply_sharding_plan(model, plan, mesh)   → (model, tp_grad_info)  # 双模式�
   out_src/out_dst`）。推导不满的地方用 `plan_overrides` 手写 spec 合并。
 - **Applier**：Phase A 参数分片 → Phase C 包装 forward（PrecompiledBoundary
   通信缝合 + local-region / inner-wrap 注入）→ Phase D tied weights。
-  同一个 plan 可按两种模式应用（§4）。
+  同一个 plan 可按两种模式应用（§3）。
 
 **用户代码恒工作在 local tensor 世界**：DTensor↔local 的缝合、边界通信
 （all-gather/reduce-scatter）由框架负责。
@@ -84,20 +94,29 @@ PYTHONPATH=. torchrun --nproc_per_node=2 examples/distributed/tp.py
 
 ### 2.1 示例目录一览
 
-[`examples/distributed/`](../../../examples/distributed/) 七个独立示例，均与单卡
+[`examples/distributed/`](../../../examples/distributed/) 十二个独立示例，均与单卡
 参考做数值对拍：
 
 | 示例 | 并行 | 演示点 |
 |---|---|---|
 | `tp.py` | TP=2 | 零配置自动推导 + 应用（本节代码的完整版） |
-| `cp.py` | CP=2 | `shard_batch_for_cp` + 内置 `"sdpa_hf"` wrapper + D-04 causal 修正（§6） |
-| `ep.py` | TP=2×EP=2 | HF 原生 MoE 零配置：D-09 堆叠 + D-10 TP-extend-EP + 内置 `_hf_native_ep_compute`（§7） |
+| `cp.py` | CP=2 | `shard_batch_for_cp` + 仓内参考 `"sdpa_hf"` wrapper + D-04 causal 修正（§6） |
+| `ep.py` | TP=2×EP=2 | HF 原生 MoE 一行显式注入：D-09 堆叠 + D-10 TP-extend-EP 分片 + 仓内默认 `hf_native_ep_compute_fn`（§7） |
 | `tp_cp_ep.py` | TP=2×CP=2×EP=2 | 三维组合：cp-major 序列布局（§6.6）+ plan 内省断言（`_ep_stack`/`_needs_cp_attn` 等） |
-| `nested_local_map.py` | TP=2（嵌套） | D-14 嵌套 spec：外层 local_map（根 fqn `""`）+ 内层 validate 孤岛，双模式对拍（§10.1） |
-| `custom_local_compute_fn.py` | TP=2 | 自研 MoE：`plan_overrides` + `local_compute_fn` 注入自定义 compute（§10.3） |
-| `custom_inner_wrapper.py` | CP=2 | 自研 attention：`inner_target` + 注册表命名 wrapper（§10.4） |
+| `nested_local_map.py` | TP=2（嵌套） | D-14 嵌套 spec：外层 local_map（根 fqn `""`）+ 内层 validate 孤岛，双模式对拍（§10.2） |
+| `multimodal_encoder_dp.py` | ViT dp=4 + LLM dp=2×tp=2×ep=4 | 多模态双 mesh：encoder_dp ViT（`params={}` 纯 FSDP 公民，dp 语义由 vit_mesh + 数据分配表达——plan 坐标系 = 单 dp 切片）+ 桥接边界 all-gather（out 边界 `Shard(0)→Replicate`，plan_overrides 注入）+ LLM 独立 plan/apply |
+| `custom_local_compute_fn.py` | TP=2 | 自研 MoE：`plan_overrides` + `local_compute_fn` 注入自定义 compute（§10.4） |
+| `custom_inner_wrapper.py` | CP=2 | 自研 attention：`inner_target` + 注册表命名 wrapper（§10.5） |
+| `custom_autograd_function.py` | TP=2 | 自定义 autograd.Function：第三方宿主裸调用 → `__class__` 替换 + `FunctionModule` + plan_overrides（§10.8） |
+| `plan_overrides_demo.py` | TP=2 | **plan_overrides 全场景**（YAML）：merge 注入 / 契约 DSL / 显式空 / `when` 条件 / insert 自声明——plan 内省逐场景断言（§10.2） |
+| `perf_replacement.py` | TP=2 | **YAML 性能替换双通道**：朴素实现 → 用户高性能 kernel——`local_compute_fn` 工厂（骨架托管）与 `inner_wrapper` 原地替换（双模适配器托管）对比；YAML→plan_overrides 全链路 + 脱糖打印（§6.3/§10.4） |
+| `programmatic_injection.py` | TP=2 | **编程式注入五形态**（不接 trainer/YAML）：装饰 callable 直传 / Target / 注册表名 / `@local_compute` 工厂直传 / 工厂 Target——一个 plan_overrides dict 全覆盖（§10.7） |
 
-**先 validate 再 production**（推荐工作流，详见 §4）：
+另有**场景配方库** [examples/recipes/](../../../examples/recipes/README.md)（2026-08-10）：
+按 arch/拓扑直接可引用的 YAML 起点（llama_tp / llama_tp_cp / qwen3moe_tp_ep /
+custom_ep_moe）——新用户的起点从"空白配置"变成"改一份能跑的最近配方"。
+
+**先 validate 再 production**（推荐工作流，详见 §3）：
 
 ```python
 # 同一份 plan，先跑 validate 校验契约/数值，再切 production 训练
@@ -106,61 +125,9 @@ model_v, _ = apply_sharding_plan(model, plan, mesh, validate_mode=True)
 
 ---
 
-## 3. 核心 API 参考
+## 3. 双模式：validate 与 production
 
-### 3.1 `ShardingPlanner().plan(...)`
-
-```python
-plan = planner.plan(
-    model, mesh,
-    tp_size=1,               # TP 组大小（>1 激活 TP 维）
-    cp_size=1,               # CP 组大小（>1 激活 CP 维，attention 注入 CP wrapper）
-    ep_size=1,               # 扩展 EP 组大小（>1 且命中 HF 原生 MoE 时激活 EP）
-    sequence_parallel=True,  # SP：norm 间激活按序列维 Shard(1)
-    loss_parallel=False,     # lm_head 输出 Shard(-1)（vocab 并行 loss）
-)
-```
-
-- 返回 `ShardingPlan`：`modules: {fqn: ModuleShardingSpec}` +
-  `mesh_dim_names` + `special_handlers` + `tied_pairs`。
-- size=1 的轴会被自动剔除（`plan.mesh_dim_names` 只含活跃轴）。
-- `ShardingPlanner(plan_overrides={fqn: spec})`：用户手写 spec 合并入口
-  （§10.1）。
-
-### 3.2 `apply_sharding_plan(...)`
-
-```python
-model, tp_grad_info = apply_sharding_plan(
-    model, plan, mesh,
-    validate_mode=False,     # True=validate 模式；默认 production
-)
-```
-
-- 返回 `(model, tp_grad_info)`；validate 下 `tp_grad_info is None`。
-- `model` 也可以是 **PP 多 part 列表**（`apply_sharding_plan([part0, part1], ...)`）。
-
-### 3.3 DeviceMesh 构建
-
-```python
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
-
-# TP=8
-mesh = init_device_mesh("npu", (8,), mesh_dim_names=("tp",))
-# CP=2 × TP=4（cp 外层、tp 内层——TP 组连续，通信局部性最好）
-mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("cp", "tp"))
-# TP=2 × EP=4（EP 显式轴；EP-aware 自研模块取 mesh["ep"] 用）
-mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("tp", "ep"))
-# DP=2 × CP=2 × TP=2
-mesh = init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
-```
-
-取子 mesh：`cp_mesh = mesh["cp"]`、`tp_mesh = mesh["tp"]`。
-
----
-
-## 4. 双模式：validate 与 production
-
-### 4.1 语义对照
+### 3.1 语义对照
 
 | | production（训练/推理） | validate（校验） |
 |---|---|---|
@@ -170,7 +137,7 @@ mesh = init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
 | 返回值 | `tp_grad_info`（供 FSDP） | `None` |
 | 用途 | 生产训练 | 分片正确性验证 / 调试新模型接入 |
 
-### 4.2 推荐工作流：先 validate 再 production
+### 3.2 推荐工作流：先 validate 再 production
 
 ```python
 plan = ShardingPlanner().plan(model, mesh, tp_size=4, cp_size=2)
@@ -189,7 +156,7 @@ model_p, tp_grad_info = apply_sharding_plan(model, plan, mesh)
 模式注入**同一份 wrapper** 显式重建该逻辑——区域内计算路径逐指令一致，
 因此双模式数值可达 kernel 级等价。
 
-### 4.3 validate 的声明式豁免清单
+### 3.3 validate 的声明式豁免清单
 
 - **attention（CP>1）**：`out_src` 为声明式——CP wrapper 出口按声明
   `from_local` 重包装（K/V all-gather 语义 dispatch 无法派生）；
@@ -197,6 +164,54 @@ model_p, tp_grad_info = apply_sharding_plan(model, plan, mesh)
   `in_src` 契约仍由 boundary 正常校验；
 - 其余模块（embed/norm/mlp/lm_head）：`out_src` 由 DTensor dispatch
   **派生校验**——这是 validate 的核心校验能力。
+
+### 3.4 注入与 region_dispatch：一分钟判断
+
+读到后面的 CP/EP 章节，你会在配置里遇到 `region_dispatch: false`——它
+回答的问题是"注入的计算函数能否被 DTensor dispatch 穿透"，决定 validate
+模式对该区域做**穿透真校验**还是**黑盒托管**。判断口诀：
+
+> 注入物含通信原语 / 自定义 kernel / 数据依赖分支 → `False`（黑盒托管）；
+> 纯 aten 标准算子 → `True`（穿透真校验）。
+> 拿不准时用 `check_dispatchable(fn, example_inputs, mesh)` 在开发期探明（§4.2）。
+
+规则只有两条：**声明注入（`local_compute_fn`/`inner_wrapper`）时必填、
+无默认**；未注入的普通边界不写（默认可穿透，多写 `True` 反而 fail-fast）。
+完整公理与语义见 §10.1；production 模式恒 local 直通，不受影响。
+
+---
+
+## 4. 看懂自己的 plan：内省与判定工具（2026-08-10）
+
+**推荐学习路径**：不必先从概念建模心智模型——先 `plan.explain()` 看懂
+自己模型的实际切分，再反推概念，快得多。
+
+### 4.1 `plan.explain(fqn=None)`：plan 内省报告器
+
+```python
+plan = planner.plan(model, mesh, tp_size=2, explain=True)  # 末尾 INFO 打出报告
+print(plan.explain())                    # 或独立调用；fqn= 只看单个边界
+```
+
+对每个边界打印：参数切分表（参数名 → placement）、**编译后的边界通信计划**
+（哪个张量、从什么布局到什么布局、对应什么集合通信——all_gather /
+reduce_scatter / 直通）、注入声明与解析结果（`region_dispatch` 的含义当场
+可见）、特殊处理器清单。insert 模式契约写不全时，fail-fast 报错会附带按
+forward 签名推导的**建议 spec 草稿**（改成你的布局即可用）。
+
+### 4.2 `check_dispatchable(fn, example_inputs, mesh)`：region_dispatch 判定工具
+
+```python
+from hyper_models.components.distributed import check_dispatchable
+report = check_dispatchable(my_compute_fn, [x_local, w_local], mesh)
+print(report)   # dispatchable=True/False + 首个失败算子 + 填写建议
+```
+
+写注入函数时拿不准 `region_dispatch` 填 True 还是 False？本工具用 DTensor
+试跑注入函数、记录 dispatch 轨迹：全程无异常 → 建议 `True`；任一算子失败
+（通信原语/未注册算子/数据依赖分支）→ 报告**首个失败算子**并建议 `False`。
+把试错从 apply 期提前到开发期。注意它只判定"能否 dispatch"，布局正确性仍由
+validate 模式的 out_src 真校验兜底。
 
 ---
 
@@ -252,7 +267,7 @@ ARCH_OVERRIDES["myarch"] = [
 # config.architectures=["MyArchForCausalLM"] 或 model_type="myarch" 即生效
 ```
 
-已内置 DeepSeek MLA 条目（§11）。
+已内置 DeepSeek MLA 条目（§12）。
 
 ### 5.6 attention 前向里的显式 `num_heads`（D-17 头数改写）
 
@@ -270,7 +285,7 @@ TP colwise 切分后每 rank 本地只有 `num_heads/tp` 个头。组件按"前�
 |---|---|---|
 | production | 全部 head-sharded 模块 | **自动改写**模块缓存的头数属性为本地值（`num_heads // tp`） |
 | validate | 普通 boundary（attention/mlp/norm） | **不改写**——DTensor dispatch 在全局逻辑形状上运行，显式全局头数天然正确，shape 自动推导 |
-| validate | local-region（`use_local_map`/`local_compute_fn`/EP） | **自动改写**（区域内两模式都是 local tensor） |
+| validate | local-region（声明了注入的边界：`local_compute_fn`/wrapper/EP） | **自动改写**（`region_dispatch=False` 时区域内两模式都是 local tensor） |
 
 要点：
 
@@ -314,11 +329,15 @@ batch = shard_batch_for_cp(batch, cp_mesh)   # 每个 rank 取自己的序列 ch
 - embed 的 CP 契约（D-05）：input 已被管道切好 → `in/out` CP 维
   `Shard(1)`，框架不会二次切分。
 
-### 6.2 内置 CP wrapper：注册表四路
+### 6.2 仓内 CP wrapper 参考实现：注册表四路
 
-CP 激活（`cp_size>1`）时，applier 对每个 attention 边界解析并注入一个
-inner wrapper。全部内置方案登记在 **`CP_WRAPPER_REGISTRY`**
-（`sharding_applier.py`）：
+inner-wrap 机制是**通用的"织入/替换 inner forward"通道**：声明即应用，
+本身不由 CP 门控。仓内为 CP 语义（K/V all-gather）提供了四个**参考实现
+函数**——它们与用户自己的 `@inner_wrapper` 函数地位完全平等，框架对它们
+**零特殊对待、零默认**（用不用、用哪个都由用户显式声明），只是顺手登记在
+**`INNER_WRAPPER_REGISTRY`**（`cp_wrappers.py`）里可按名引用；声明它们仍需
+活跃 cp 轴（无 cp 轴声明它们会在解析链 fail-fast——自定义 callable/Target
+不受此限，`cp_mesh` 传 `None`、语义自负）：
 
 | 注册表名 | 适用模块风格 | 机制 |
 |---|---|---|
@@ -334,12 +353,22 @@ inner wrapper。全部内置方案登记在 **`CP_WRAPPER_REGISTRY`**
 - **D-04 causal 修正**：`is_causal=True` 且 `cp_mesh.size()>1` 时，把
   is_causal 替换为 **offset-aware 显式 mask**——torch 的 is_causal 在
   q_len≠kv_len 时按左上角对齐，对 rank>0 的 CP chunk 是错的；
-- **双模式容错**：wrapper 内部对 DTensor 输入做 unwrap/rewrap，
-  production（local）与 validate（DTensor）共用同一份代码。
+- **local-only**：wrapper 只面向 local 张量——validate 的 DTensor 解包/
+  参数临时解包/输出重包由框架的**双模适配器**统一托管（§10.5.1），四路
+  仓内参考 wrapper 体内零 DTensor 代码；
+- **重包布局来自显式声明**：target=self（`sdpa_hf`/`flex_hf`）用边界
+  `out_src` 契约；inner 子模块（`sdpa_qkv`/`flex_qkv`）必须在 plan 里声明
+  `inner_out_src: "first_input"`（输出布局 == q 布局），未声明 fail-fast。
 
-### 6.3 缺省分派：启发式 2×2
+### 6.3 显式选择：无缺省分派（2026-08-04 改造）
 
-未显式指定时按 **模块风格 × attention 实现** 分派：
+**启发式 2×2 分派已删除**——框架不再替用户猜 wrapper，cp>1 时 attention
+边界必须显式声明 `inner_wrapper`；缺声明会在 apply 前被
+`_preflight_compute_injection` fail-fast（报错附可粘贴的配置片段）。
+**行为变化（inner-wrap 泛化后）**：以往 cp=1 时写了 `inner_wrapper` 会被
+静默忽略；现在声明即应用（自定义 wrapper 无 CP 也会真的包装），仓内参考
+CP 方案在无 cp 轴时 fail-fast 并指引改用 `local_compute_fn`。
+按 **模块风格 × attention 实现** 自行对照选择：
 
 ```
                 SDPA (config._attn_implementation="sdpa"/缺省)    FlexAttention
@@ -348,25 +377,121 @@ NeMo 风格        sdpa_qkv                                         flex_qkv
 ```
 
 （模块风格判定：有 `inner_attention`/`attn`/`attention` 属性 → NeMo；
-类名含 "Attention"/"SdpaAttention" 或结构持有 q/k/v_proj → HF。）
+类名含 "Attention"/"SdpaAttention" 或结构持有 q/k/v_proj → HF；
+`cp_wrappers.is_hf_style_attention` 等 helper 可程序化判定。）
+
+声明方式（三形态平权）：
+
+```python
+# ① plan_overrides glob merge（契约继承推导，只需注入字段；
+#    inner_target 与 inner_wrapper 必须成对显式声明——自动定位启发式
+#    已删除；解析结果回写 spec._resolved_inner_target 并打 INFO 日志）
+ShardingPlanner(plan_overrides={
+    "*.self_attn": ModuleShardingSpec(
+        inner_target="self", inner_wrapper="sdpa_hf",
+        region_dispatch=False)})   # 必填伴生声明：wrapper 内含 K/V all-gather
+# 注意：inner 子模块路径（sdpa_qkv/flex_qkv 或自定义 inner_target）必须
+# 额外声明 inner_out_src（框架对 inner 输出布局零推导零猜测），layout-
+# preserving 的 attention 写 "first_input" 即可：
+#   ModuleShardingSpec(inner_target="core_attention",
+#                      inner_wrapper="sdpa_qkv",
+#                      inner_out_src="first_input",
+#                      region_dispatch=False)
+# ② YAML（trainer 路径，plan_overrides 脱糖后走同一通道）
+#    plan_overrides:
+#      - match: "*.self_attn"
+#        when: cp            # 激活条件自述必要性：cp_size>1 才应用（缺省=总是）
+#        region_dispatch: false   # 必填：wrapper 内含通信，不可 dispatch
+#        inner_wrapper:
+#          _target_: hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper
+# ③ plan 后直接赋值（两字段都要补）：
+#    spec = plan.modules["...self_attn"]
+#    spec.inner_wrapper = "sdpa_hf"; spec.region_dispatch = False
+```
+
+YAML 形态（`plan_overrides`，2026-08-05 改名自 `sharding.injections`）
+还有三个独有字段：`when`（激活条件 `"cp"`/`"ep"`——自述 CP/EP 注入的
+必要性，条件不满足时跳过并打日志，一份配置跨拓扑复用）；契约字段
+`params`/`in_src`/`in_dst`/`out_src`/`out_dst`（placement 字符串 DSL
+`"replicate"`/`"partial"`/`"shard(N)"` + 哨兵 `"auto"`/`"none"`——insert
+模式因此可纯 YAML 表达；脱糖期闭集文法 fail-fast，plan 期
+`_validate_override_axes` 轴名拼写 fail-fast）。
+
+### 6.3.1 inner-wrap 也是性能替换通道（不限于 CP）
+
+inner-wrap 泛化后（2026-08-05），`inner_wrapper` 不再由 cp_mesh 门控——
+**声明即应用**，任何并行模式（含纯 TP/DP、无 CP）都会注入。它与
+`local_compute_fn` 形成两档替换通道：
+
+| | `local_compute_fn`（推荐） | `inner_wrapper` |
+|---|---|---|
+| 语义 | 整体接管边界计算 | 织入/替换 inner forward（可定位子模块） |
+| 张量形态 | local-region 骨架托管：参数解包 + I/O 契约，kernel 只见本地张量 | 双模适配器托管（§10.5.1）：替换后的 forward 只见本地张量，重包按声明（out_src / inner_out_src） |
+| 典型场景 | EP compute、整模块性能替换 | CP K/V gather、探针/日志织入、只换某个子模块 |
+
+最小完整示例（纯算子替换，与 CP 无关——框架填入的 `cp_mesh` 为
+None，签名里声明但不用）：
+
+```python
+@inner_wrapper
+def flash_attention_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """契约：fn(target_module, mesh, tp_mesh, cp_mesh, ep_mesh) -> None——
+    必选上下文缺一不可（用不到也声明）、不得有默认值、禁 *args/**kwargs；
+    原地替换 forward，返回值必须为 None。"""
+    def fast_forward(hidden_states, *args, **kwargs):
+        return flash_attn_op(target_module.q_proj(hidden_states), ...)
+    target_module.forward = fast_forward
+
+plan_overrides = {"*.self_attn": ModuleShardingSpec(
+    inner_target="self",                       # 成对必填：包装边界模块自身
+    inner_wrapper=flash_attention_wrapper,     # callable 直传（最常用）
+    region_dispatch=True)}                     # 纯算子无通信 → True（穿透真校验）
+```
+
+- 仓内四个 CP 参考方案仍**需要活跃 cp 轴**——无 cp 轴时框架填入的
+  `cp_mesh=None`，参考 wrapper 自检 fail-fast；自定义 wrapper 不受限
+  （收到 `cp_mesh=None`，语义自负）；
+- 同一边界两通道同时声明会**叠加**（inner-wrap 先替换 forward，
+  local_compute_fn 在区域内再被调用）——替换场景二选一；
+- 端到端对比示例（含 YAML 形态）：`examples/distributed/perf_replacement.py`
+  + `perf_replacement.yaml`（local_compute_fn 通道）+
+  `perf_replacement_inner_wrap.yaml`（inner_wrapper 通道）。
 
 ### 6.4 可观察性与安全网
 
+- **缺注入 fail-fast**：cp>1 而 attention 边界无 `inner_wrapper` → apply 前
+  `ValueError`（`_preflight_compute_injection`，报错含具体 fqn 与可粘贴
+  YAML 片段）；
 - **日志**：注入时 INFO 打印（边界 fqn、target、wrapper 名、来源：
-  启发式分派/显式指定/自定义 callable）；
-- **回写**：`spec._resolved_inner_wrapper = "sdpa_hf"` 等，plan 内省可查；
+  注册表/自定义 callable/Target）；
+- **回写**：`spec._resolved_inner_wrapper = "sdpa_hf"` 等（Target 形态回写
+  target_path），plan 内省可查；
 - **发火检测（misfire detection）**：`sdpa_hf`/`flex_hf` 拦截路在首次
   forward 检查是否真的拦到了原语调用——若模块内部根本没调
-  `F.sdpa`/`flex_attention`（启发式猜错），立即 `RuntimeError` 并给出
+  `F.sdpa`/`flex_attention`（wrapper 型号选错），立即 `RuntimeError` 并给出
   修复指引，**杜绝静默数值错误**；
-- **定位失败 fail-fast**：声明了 CP 但 inner attention 定位不到 →
-  `ValueError`，提示用 `inner_target` 显式指定（§10.4）。
+- **成对声明强制**：声明 `inner_wrapper` 必须同时显式声明
+  `inner_target`（`"self"` 或子模块属性名；自动定位启发式已删除），缺失
+  → `ValueError`；仅 `inner_target` 无 `inner_wrapper` 同样 fail-fast
+  （定位不能代替方案选择）；
+- **inner 输出布局强制声明**：inner 子模块路径未声明 `inner_out_src` →
+  apply 时 `ValueError`（报错给出可粘贴的声明写法）——框架对 inner 输出
+  布局零推导零猜测；
+- **注入纪律**：未装饰/种类不符/缺必选上下文/配置保留键/替换 forward
+  入参与原 forward 不兼容 → import 期或 apply 时 fail-fast（§10.5.1）。
 
 ### 6.5 端到端示例（TP×CP）
 
 ```python
 mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("cp", "tp"))
-plan = ShardingPlanner().plan(model, mesh, tp_size=4, cp_size=2)
+# HF 风格 attention 显式注入 "sdpa_hf"（glob merge，契约继承推导；
+# inner_target="self" 必填——与 inner_wrapper 成对显式声明，包装边界
+# 模块自身；region_dispatch=False 必填：wrapper 内含 K/V all-gather 通信）
+plan = ShardingPlanner(plan_overrides={
+    "*.self_attn": ModuleShardingSpec(
+        inner_target="self", inner_wrapper="sdpa_hf",
+        region_dispatch=False),
+}).plan(model, mesh, tp_size=4, cp_size=2)
 model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
 
 for batch in dataloader:
@@ -429,12 +554,14 @@ norm **自己不切分、零通信**：入口/出口 placement 完全相同，Pr
 
 ## 7. EP 教程
 
-EP（Expert Parallel）有两条接入路径，**内置 wrapper 只在路径 A 生效**。
+EP（Expert Parallel）有两条接入路径，**仓内参考实现 compute 只覆盖路径
+A，且需显式注入**（框架不做任何自动注入/默认——仓内函数与用户函数地位
+完全平等）。
 
-### 7.1 路径 A：HF 原生 MoE（自动识别 + 内置 wrapper 注入）
+### 7.1 路径 A：HF 原生 MoE（自动识别 + 显式注入仓内参考 compute）
 
 planner 识别 HF 原生 MoE 结构（`mlp.gate` router + `mlp.experts` 参数），
-当 `ep_size>1` 时自动：
+当 `ep_size>1` 时自动完成**参数侧**工作；**前向 compute 由用户显式注入**：
 
 1. **参数侧**：expert 权重按 `{EP: Shard(0)}` 在**派生 expert mesh
    `(edp, ep)`** 上分片（D-10 TP-extend-EP：EP 组 = flatten 连续 ep_size
@@ -445,13 +572,15 @@ planner 识别 HF 原生 MoE 结构（`mlp.gate` router + `mlp.experts` 参数�
    - batched 布局（`experts.gate_up_proj [E,2I,H]` +
      `experts.down_proj [E,H,I]`，HF 2025 重构后）：天生 stacked 直接
      分片（D-11）；
-2. **前向侧**：注入内置 wrapper **`_hf_native_ep_compute`**（经
-   local-region 解析链环 2，见 §10.3）——通信流与 Megatron
+2. **前向侧**：经统一 override 通道显式注入仓内参考 compute
+   **`hf_native_ep_compute_fn`**（ep_compute.py 公开工厂，走 local-region
+   解析链环 1，见 §10.4；**伴生声明 `region_dispatch=False`**——compute
+   内含 all-to-all 通信原语，区域内不可 dispatch）——通信流与 Megatron
    `MoEAlltoAllTokenDispatcher`（expert_tensor_parallel_size=1）同构：
 
    ```
    SP-in（本地 chunk）
-     → router（MOE_ROUTER_ADAPTERS 按 arch 选路由语义）
+     → router（内嵌 default softmax top-k——路由是注入函数的一部分）
      → dispatch all-to-all（token → 目标 expert rank）
      → 本地 expert 计算（SwiGLU，fused/分离三矩阵均支持）
      → combine all-to-all（结果回源 rank 加权求和）
@@ -461,17 +590,42 @@ planner 识别 HF 原生 MoE 结构（`mlp.gate` router + `mlp.experts` 参数�
    a2a 按后端分派：NCCL/HCCL 用不等长 `all_to_all`（零填充）；gloo 用
    pad-to-max `all_to_all_single`。
 
-3. **路由语义注册表 `MOE_ROUTER_ADAPTERS`**（ep_utils.py）：
-   `default`（softmax+topk）、`qwen3moe`/`qwen3_moe`、`mixtral`、
-   `deepseekv3`/`deepseek_v3`（sigmoid + e_score_correction_bias +
-   group-limited）、`glm4moe`/`glm4_moe`。自研路由可注册新 adapter。
+3. **路由内嵌纪律**：框架不决定用户的 router——spec 里没有路由提示字
+   段，工厂也不接受函数类型的配置参数。仓内参考工厂内嵌
+   `_softmax_topk_router`（softmax+topk）；路由不同的 MoE（Qwen3
+   TopKRouter 模块、DeepSeek sigmoid-group 等）**写自己的工厂**，路由选
+   择写在函数体内——`MOE_ROUTER_ADAPTERS`（ep_utils.py）保留为公开工
+   具库（`default`/`qwen3moe`/`mixtral`/`deepseekv3`/`glm4moe` 等），用
+   户工厂按名引用即可（示例见 ep_compute.py docstring 与
+   `tests/.../test_dist_s4_ep.py` 的 `_qwen3moe_ep_factory`）。
 
 ```python
-# 用户侧零配置：HF 模型 + ep_size>1 即全自动
+# 用户侧：一行显式注入（glob merge，params/契约继承推导）——零配置：
+# expert mesh 由框架在 apply 时统一派生（与专家参数分片共享同一对象，
+# 派生有 INFO 日志），经 ep_mesh 上下文传给工厂，用户只管使用
 mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "tp"))
-plan = ShardingPlanner().plan(model, mesh, tp_size=4, ep_size=8)
+plan = ShardingPlanner(plan_overrides={
+    "*.mlp": ModuleShardingSpec(
+        local_compute_fn=Target(
+            hf_native_ep_compute_fn,
+            target_path="hyper_models.components.distributed."
+                        "ep_compute.hf_native_ep_compute_fn"),
+        # 必填伴生声明：EP compute 内含 all-to-all 通信 → 区域内不可 dispatch
+        region_dispatch=False),
+}).plan(model, mesh, tp_size=4, ep_size=8)
 model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+# YAML（trainer 路径）等价写法：
+#   plan_overrides:
+#     - match: "*.mlp"
+#       when: ep
+#       local_compute_fn:
+#         _target_: hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
+#       region_dispatch: false   # 必填：compute 内含 a2a 通信，不可 dispatch
 ```
+
+缺注入时 apply 前 fail-fast（`_preflight_compute_injection`）：报错列出
+具体边界 fqn，并给出上面这段可粘贴的配置——不会带着错误的静默数值
+跑下去。
 
 **约束（plan 时校验，fail-fast）**：
 
@@ -482,9 +636,10 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
 ### 7.2 路径 B：EP-aware 自研 MoE 模块（自带 dispatcher）
 
 模块自身 forward 已实现 EP dispatch（如 Megatron 风格
-`MoEAlltoAllTokenDispatcher`）→ 声明 `use_local_map=True`（§10.2）走
-local-region 骨架，框架只做边界缝合。此时需自行设置模块的 EP 运行时
-状态（类比 Megatron `init_token_dispatcher`）：
+`MoEAlltoAllTokenDispatcher`）→ 声明 `region_dispatch=False`（§10.4，无
+注入时模块 forward 即区域 compute）走 local-region 骨架，框架只做边界
+缝合。此时需自行设置模块的 EP 运行时状态（类比 Megatron
+`init_token_dispatcher`）：
 
 ```python
 ep_mesh = mesh["ep"]
@@ -497,10 +652,10 @@ for layer in model.model.layers:
 
 | | 路径 A（HF 原生 MoE） | 路径 B（EP-aware 模块） |
 |---|---|---|
-| 触发 | planner 自动识别 + `ep_size>1` | `use_local_map=True` / `local_compute_fn` |
-| 前向 wrapper | **内置 `_hf_native_ep_compute`** | 模块自身 forward（或用户 fn） |
+| 触发 | planner 自动识别 + `ep_size>1`（仅参数侧）+ **显式注入** | `region_dispatch=False`（+ 可选 `local_compute_fn`） |
+| 前向 compute | **仓内参考 `hf_native_ep_compute_fn`（显式注入）** | 模块自身 forward（或用户 fn） |
 | expert 分片 | 框架 `{EP: Shard(0)}` | 模块自行管理 |
-| 适用 | qwen3_moe/glm4_moe/deepseek_v3 等 HF 模型开箱即用 | 自研 dispatcher（DeepEP 等） |
+| 适用 | qwen3_moe/glm4_moe/deepseek_v3 等 HF 模型一行注入即用 | 自研 dispatcher（DeepEP 等） |
 
 > 可运行示例：`examples/distributed/ep.py`（per-expert 布局 + D-09 堆叠 + TP=2×EP=2 双模式对拍）。
 
@@ -558,6 +713,7 @@ fully_shard(model, mesh=dp_mesh, ...)   # hyper_parallel/core/fully_shard
 | TP×EP | `(2, 4)` `("tp", "ep")` 或 `("dp","tp")` | `tp_size=2, ep_size=4` | D-10：EP 组从 dense 区域派生，无需专用 etp 轴 |
 | DP×CP×TP | `(2, 2, 2)` `("dp", "cp", "tp")` | `tp_size=2, cp_size=2` | dp 轴供 FSDP |
 | 全组合 | `(2, 2, 4)` `("dp", "cp", "tp")` | `tp_size=4, cp_size=2, ep_size=8` | EP 组跨 TP 组向 dp/cp 扩展 |
+| 多模态双 mesh | LLM: `(2, 2)` `("dp","tp")`；ViT: flatten 视图 `("encoder_dp",)` | 两次 plan + `plan_overrides` 桥接 | §9.1，示例 `multimodal_encoder_dp.py` |
 
 要点：
 
@@ -568,15 +724,108 @@ fully_shard(model, mesh=dp_mesh, ...)   # hyper_parallel/core/fully_shard
   mesh 里显式放 "ep" 轴仅路径 B（自研 EP-aware 模块取 `mesh["ep"]`）需要；
 - size=1 轴自动剔除，可写全 `(dp, cp, tp)` 再按需开 size。
 
+### 9.1 多模态双 mesh：encoder_dp ViT + LLM（桥接边界）
+
+场景：多模态模型的 ViT 与 LLM 想用**两套并行拓扑**——例如 4 卡下 ViT 走
+encoder_dp（dp=4，每 rank 编码不同图像，消除 TP 组内冗余编码），LLM 走
+dp=2×tp=2（+EP）。两者是容器下的兄弟模块，共享同一进程组但 mesh 视图不同：
+
+```python
+llm_mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+vit_mesh = llm_mesh._flatten("encoder_dp")   # dense 区域的 1-D 视图（dp=4）
+enc_rank = vit_mesh.get_local_rank()         # 数据管道按它分配各 rank 的图像子集
+```
+
+`vit_mesh` 的两个用途：数据管道按 `enc_rank` 分配图像 + 训练侧
+`fully_shard(vision_tower, mesh=vit_mesh)` 的 FSDP 权重域。**它不进任何
+plan**——坐标系约定（§11.1）下 plan 恒为单 dp 切片，ViT 对 DTensor 的唯一
+需求是"编码完的特征要在 LLM 的 TP 组内 all-gather"，这是一次边界重分布：
+
+```python
+# ① 桥接：vision_tower 的 out 边界 Shard(0)→Replicate = tp 组内 all-gather
+bridge = ModuleShardingSpec(
+    params={},                          # ViT 参数零 DTensor 分片（纯 FSDP 公民）
+    region_dispatch=False,              # ViT 内部不做 dispatch（自定义编码流程）
+    in_src={"pixel_values": {TP: Shard(0)}},   # 单 dp 切片内：tp 组间特征分片
+    in_dst={"pixel_values": {TP: Shard(0)}},   # identity
+    out_src={"output": {TP: Shard(0)}},
+    out_dst={"output": {TP: Replicate()}},     # ← tp 组内 all-gather
+)
+vit_plan = ShardingPlanner(plan_overrides={"": bridge},
+                           derive=False).plan(  # 关闭模板推导（见下）
+    model.vision_tower, llm_mesh, tp_size=2)   # 根 fqn ""（D-14）
+apply_sharding_plan(model.vision_tower, vit_plan, llm_mesh)
+
+# ② LLM：与纯 LLM 完全同构的独立 plan/apply
+llm_plan = ShardingPlanner().plan(
+    model.language_model, llm_mesh, tp_size=2, ep_size=4)
+model.language_model, tp_grad_info = apply_sharding_plan(
+    model.language_model, llm_plan, llm_mesh)
+```
+
+要点与约束：
+
+- **声明点必须在 vision_tower 的 out 边界**，不能是 LLM 的 in 边界：
+  特征 → `inputs_embeds` 之间有 merge glue（按序列位置散射），all-gather
+  是 dim 0 拼接，表达不了位置散射；gather 必须发生在 merge 之前；
+- **ViT 子树必须关闭模板推导**：encoder_dp 下各 rank 数据不同，ViT
+  内层任何 TP 集合通信（如行并行 all-reduce）会把不同样本的 partial
+  求和——数学错误。`derive=False` 让 planner 只做声明装配：plan 只含
+  plan_overrides 显式声明的 spec（全部 insert 模式，须完整自声明），
+  取代 `plan.modules = {"": plan.modules[""]}` 的后处理剪除写法；
+- **梯度语义**:fwd all-gather / bwd reduce-scatter-sum（边界通信 autograd
+  感知）——TP 组内 LLM 计算是分片的，梯度求和恰好补全各 rank 自己图像块
+  的完整梯度；ViT 参数梯度再由 dp=4 FSDP 域 all-reduce = 全局 batch 梯度；
+- **数据双布局**：文本按 LLM dp=2 切（TP 组内相同），图像按 encoder_dp=4
+  切（每 rank 编码本 shard 图像子集的 1/tp 份）；
+- **token 对齐约束**:all-gather 是静态形状集合通信，各 rank 视觉 token 数
+  必须一致——真实场景需数据管道做视觉 token 均衡/padding。
+
+完整可运行示例（双模式对拍 + gather 探针）:
+[`examples/distributed/multimodal_encoder_dp.py`](../../../examples/distributed/multimodal_encoder_dp.py)。
+
 ---
 
 ## 10. 自定义模块完整指南
 
-### 10.1 `plan_overrides`：手写 spec 合并入口
+### 10.1 `region_dispatch` 公理（2026-08-07 语义收敛）
 
-一切自定义声明都经 `ModuleShardingSpec` 字段，在 plan 时合并（替换语义：
-命中 planner 已生成的 fqn 则整体替换，结构标记从模板补齐；未命中且与
-所有派生边界无祖孙关系则插入并参与链式传播）：
+**区域计算默认可 dispatch 穿透**——普通边界（无注入）validate 恒在
+DTensor 上跑传播校验，无需任何声明；**一旦声明注入（`local_compute_fn`
+或 `inner_wrapper`），`region_dispatch` 必填、无默认**——框架不知道注入
+函数内部能不能被 DTensor dispatch，必须由作者显式回答：
+
+- `False`（最常见）：注入内含通信原语（all-gather / all-to-all 等）或
+  自定义 kernel / 数据依赖控制流 → 不可 dispatch。validate 下骨架/适配器
+  把区域当**黑盒孤岛**：入口 to_local、出口按声明（out_src/inner_out_src）
+  重包，区域内部跳过传播校验；仓内 CP wrapper 参考实现与
+  `hf_native_ep_compute_fn` 均属此类（内含通信，**必须** `False`）；
+- `True`：注入只是**纯标准算子替换/写法优化**（如融合 kernel 的等价
+  einsum/sdpa/silu 写法，无通信、无数据依赖分支）→ 可 dispatch。
+  validate **穿透**注入函数：DTensor 直接传入跑真实算子传播，出口
+  placements 与声明逐点比对——**out_src/inner_out_src 从"声明重包"升级为
+  "真校验基准"**，声明错了当场 PlacementMismatchError；dispatch 失败
+  （函数内部有 dispatch 不了的算子）会带着教学化报错提示改回 `False`；
+- 防呆：声明注入却未给 `region_dispatch` → apply 时 fail-fast；**未注入
+  却写 `region_dispatch=True`**（冗余）→ fail-fast 请删除。
+- production 完全不受影响：注入区域在生产模式恒为 local tensor 直通。
+
+拿不准填什么时，用 `check_dispatchable` 在开发期探明（§4.2）；判断口诀
+见 §3.4。
+
+### 10.2 `plan_overrides`：统一 override 通道（merge/insert/glob）
+
+一切自定义声明都经 `ModuleShardingSpec` 字段，在 plan 时合并。核心规则
+一句话——**「不写继承，写了照办」**（2026-08-05 语义收敛）：**merge**
+——命中推导边界时，未声明（`None`，即不写）的字段继承推导、写了的
+字段按字段粒度覆盖（**显式空 `{}` 也是"写了"**：清空推导，如
+`params={}` = 本边界不切参数的纯 I/O 缝合边界），哨兵 `"auto"`（显式
+继承，自文档）/`"none"`（显式清空，同 `{}`）；字段粒度替换使推导参数
+被丢弃时打 WARNING（列出参数名，不逐 key 合并）；**insert**——未命中
+且与所有派生边界无祖孙关系则插入，至少声明一项契约（显式 `{}` 也算
+声明），全部未声明或误用哨兵会 fail-fast；key 支持 **glob**
+（`"*.self_attn"` 一条覆盖所有层）；内部标记 `_ep_size`/`_needs_cp_attn`
+等恒继承）：
 
 ```python
 from hyper_models.components.distributed import ModuleShardingSpec
@@ -594,6 +843,37 @@ spec = ModuleShardingSpec(
 planner = ShardingPlanner(plan_overrides={"model.layers.0.self_attn": spec})
 ```
 
+**契约字段取值语义一览**（`params`/`in_src`/`in_dst`/`out_src`/`out_dst`）：
+
+| 写法 | merge（命中推导边界） | insert / `derive=False` |
+|---|---|---|
+| 不写（`None`） | 继承推导值 | 无可继承——全部字段未声明 → fail-fast |
+| `"auto"` | 显式继承（自文档，与不写同义） | fail-fast：没有推导值可继承（报错点名原因） |
+| `"none"` | 显式清空继承值（→ `{}` / `None`） | fail-fast：没有继承值可清空 |
+| `{}`（显式空） | 本边界不切参数/无该项契约（参数保持复制） | **同左——两种模式下唯一的"清空"写法** |
+| 具体 dict | 字段粒度替换（不逐 key 合并，丢弃推导参数会 WARNING） | 原样插入 |
+
+心智模型一句话：**`"auto"`/`"none"` 是"相对推导值"的修饰词**——继承
+它或清空它；`derive=False`（§9.1）关闭了模板推导，plan 里没有任何
+推导值，两个哨兵失去作用对象，因此只剩"显式声明"一种写法：要切分
+写具体 dict，不切写 `{}`（`params={}` = 本边界参数保持复制/纯 I/O
+缝合）。这也是 insert 模式报错会附赠契约草稿（按模块 forward 签名
+生成占位骨架）的原因——把"从零写契约"变成"改草稿"。
+
+insert 完整自声明示例（模板未覆盖的自研模块，纯 I/O 缝合边界——
+`params={}` 显式空即合法声明，本例 SP 布局下入口 all-gather、出口
+切回本地 chunk）：
+
+```python
+plan_overrides = {"model.aux": ModuleShardingSpec(
+    params={},                                # 本边界不切参数（保持复制）
+    region_dispatch=False,                    # 内部自研流程不可 dispatch
+    in_src={"x": {TP: Shard(1)}},             # 上游 SP chunk 到达
+    in_dst={"x": {TP: Replicate()}},          # ← 入口 all-gather
+    out_src={"output": {TP: Replicate()}},
+    out_dst={"output": {TP: Shard(1)}},       # ← 出口切回 SP chunk
+)}
+
 与上游 `out_dst` 不一致**不再检查**（D-14：链式校验已废除，各模块只
 断言自身策略传播，端到端正确性由双模式数值对拍兜底）；fqn
 拼写错误 → `ValueError` fail-fast；spec 缺 `in_src`（`in_dst` 非空时）
@@ -601,30 +881,40 @@ planner = ShardingPlanner(plan_overrides={"model.layers.0.self_attn": spec})
 
 **嵌套 spec（D-14，05 §13）**：override 的 fqn 可以是其他边界的祖先/
 后代——外层边界（如整个 decoder layer、整个 LM 的根 fqn `""`）与内层
-边界共存，常用于"外层只做 I/O 缝合（`params={}` + `use_local_map`），
-内层关键模块跑 validate 孤岛"（§13.4）。唯一约束是**参数唯一归属**：
+边界共存，常用于"外层只做 I/O 缝合（`params={}` + `region_dispatch=False`），
+内层关键模块跑 validate 孤岛"（05 §13.4）。唯一约束是**参数唯一归属**：
 每个参数只能被一个边界声明（外层不得声明内层边界子树的参数），冲突
 即 `ValueError`。想定制某个叶子（如 `self_attn.q_proj`），仍应直接
-覆盖它所属的边界（`self_attn`，替换语义，参数名相对于边界模块）。
+覆盖它所属的边界（`self_attn`，merge 语义，参数名相对于边界模块）。
 
 > 可运行示例：`examples/distributed/nested_local_map.py`（外层 local_map
 > + 内层 validate 孤岛，production/validate 双模式对拍）。
 
-### 10.2 四接口总览（两个家族）
+### 10.3 注入接口总览（两个家族 + 一个伴生声明）
 
 | 字段 | 签名 | 做什么 | 生效方式 |
 |---|---|---|---|
-| `use_local_map` | `bool` | **纯门控**：模块自身 forward 即数据相关逻辑 → 走 local-region 骨架 | local 解析链环 3 |
-| `local_compute_fn` | `fn(module, *args, **kw) -> Tensor` | 替换 local-region 骨架**内**的计算函数（边界缝合/双模式不变） | local 解析链环 1 |
-| `inner_target` | `str`（属性名 / `"self"`） | **纯位置**：指定 inner attention 子模块 | target 解析链环 1 |
-| `inner_wrapper` | `str`（注册表名）或 `fn(target, cp_mesh) -> None` | **纯行为**：固定内置 CP wrapper / 全自定义接管 | wrapper 解析链环 1-2 |
+| `region_dispatch` | `Optional[bool]`（**无默认——声明注入时必填**） | **区域 compute 是否可 dispatch 穿透**：`False` = 区域内含通信原语/自定义 kernel，不可 dispatch → validate 走骨架/适配器黑盒托管（to_local + 声明重包）；`True` = 纯标准算子可 dispatch → validate **穿透**注入函数跑真实 DTensor 传播（out_src/inner_out_src 成为真校验）；不注入的普通边界无需声明（公理：默认可穿透，§10.1） | 骨架/适配器分流 |
+| `local_compute_fn` | **`@local_compute` 工厂** `fn(mesh, tp_mesh, cp_mesh, ep_mesh, [module], <配置键...>) -> compute_fn`（callable 直传或 Target 载体） | 替换 local-region 骨架**内**的计算函数（边界缝合/双模式不变）。**唯一形态 = 区域计算工厂**：apply 时 build 一次（mesh 家族必选、框架填充、未激活轴为 None，**用不用随你**——统一接口规范；`module` 可选），须返回 compute fn（入参与原 forward 匹配，无需再装饰） | local 解析链环 1 |
+| `inner_target` | `str`（属性名 / `"self"`） | **纯位置**：指定 inner attention 子模块（单独声明无 inner_wrapper → fail-fast） | target 解析链环 1 |
+| `inner_wrapper` | `str`（注册表名）、`@inner_wrapper` callable 或 **Target** | **纯行为**：固定仓内参考 CP wrapper / 全自定义接管 / Target 引用仓内公开函数；`region_dispatch=False` 时替换后的 forward 只面向 local 张量（双模适配器托管，§10.5.1） | wrapper 解析链环 1-3 |
+| `inner_out_src` | `"first_input"` / `{axis: placement}` / `{name: {...}}` | **纯布局**：inner 子模块输出的重包声明——**`inner_target` 是子模块时必填**（未声明 apply 时 fail-fast，框架对 inner 输出布局零推导零猜测；layout-preserving 写 `"first_input"` 即可）；`inner_target="self"` 时不需要（用边界 out_src） | 适配器安装时 |
 
-**门控派生原则**：声明互不嵌套、不改写任何标记——设置
-`local_compute_fn` 后**不需要也不应**再设 `use_local_map`；applier 的
-解析链（`_resolve_local_compute_fn` / `_resolve_inner_wrapper`）解析非
-None 即注入。
+**注入纪律（injection.py）**：所有注入函数必须带模板装饰器（仅两个：
+`@local_compute` / `@inner_wrapper`）——import 期校验：**必选上下文缺一
+不可**（`@local_compute` 须声明 mesh 家族 `mesh`/`tp_mesh`/`cp_mesh`/
+`ep_mesh`；`@inner_wrapper` 在此之上还须声明 `target_module`）、上下文
+参数不得有默认值、禁止 `*args`/`**kwargs`；apply 期强制检查：未装饰/
+种类不符 fail-fast，配置键与保留上下文同名 fail-fast，工厂返回的
+compute fn / 替换后的 forward 的入参与原函数不匹配 fail-fast。配置键
+只携带数据值，不允许再传函数。
 
-### 10.3 local-region 族：`use_local_map` 与 `local_compute_fn`
+**门控派生原则**：声明互不嵌套、不改写任何标记——applier 的解析链
+（`_resolve_local_compute_fn` / `_resolve_inner_wrapper`）解析非 None 即
+注入；`region_dispatch` 只决定 validate 下该区域是"穿透真校验"还是
+"黑盒托管"。
+
+### 10.4 local-region 族：`region_dispatch` 与 `local_compute_fn`
 
 骨架结构（通信保留，§6/§7 的边界通信照常执行）：
 
@@ -633,139 +923,424 @@ None 即注入。
             → 按声明 out_src 重包装 → boundary出口(out_src→out_dst 通信) → 输出
 ```
 
-解析链（优先级递减）：
+解析链（优先级递减；**EP 自动注入链路已删除，2026-08-04**）：
 
-1. `spec.local_compute_fn` —— 用户自定义计算；
-2. planner EP 注入意图（HF 原生 MoE + `ep_size>1`）→ **内置
-   `_hf_native_ep_compute`**；
-3. `spec.use_local_map` —— 纯门控，compute 即模块自身 forward。
+1. `spec.local_compute_fn` —— 显式注入：**`@local_compute` 区域计算
+   工厂**（callable 直传或 Target 载体），apply 时 build 一次；mesh 家族
+   必选上下文框架填充（`ep_mesh` 与专家分片共享同一对象）、用不用随你；
+   仓内参考 `ep_compute.hf_native_ep_compute_fn` 即此形态。**伴生必填
+   `region_dispatch`**（§10.1 公理）；
+2. `spec.region_dispatch is False`（无用户 fn）—— compute 即模块自身
+   forward（自研 EP-aware MoE 等"forward 内含通信、不可 dispatch"的
+   模块走这里）。
 
-**示例 A：自研 MoE 自带 dispatch（纯门控）**
+环外防呆：`_ep_size>0`（专家已 EP 分片）而解析为 None → apply 前
+`_preflight_compute_injection` fail-fast；HF 原生 MoE（per-expert/
+batched 布局）的 `region_dispatch` 推导值已被 planner 清除为 None（其
+forward 非 EP-aware），必须经环 1 显式注入 + 声明 `region_dispatch=False`。
+
+**示例 A：自研 MoE 自带 dispatch（模块 forward 即 compute）**
 
 ```python
 spec = ModuleShardingSpec(
     params={...}, in_src=..., in_dst=..., out_src=..., out_dst=...,
-    use_local_map=True,    # 模块 forward 内含 a2a，骨架只负责缝合
+    region_dispatch=False,   # 模块 forward 内含 a2a 通信 → 不可 dispatch，骨架只负责缝合
 )
 ```
 
 **示例 B：注入自定义 dispatch（local_compute_fn）**
 
 ```python
-def my_deep_ep_compute(module, hidden_states):
+@local_compute
+def my_deep_ep_factory(mesh, tp_mesh, cp_mesh, ep_mesh):
     """在 local tensor 世界实现自定义 EP dispatch（如 DeepEP）。
 
-    契约：fn(module, *args, **kwargs) -> Tensor；输入输出均为 local tensor，
-    布局与 spec 的 in_dst/out_src 声明一致。区域内部可自由使用显式
-    process group 通信。"""
-    topk_idx, topk_w = module.router(hidden_states)
-    dispatched, recv_counts = deep_ep_dispatch(hidden_states, topk_idx,
-                                               group=module.ep_group)
-    expert_out = module.experts(dispatched)
-    return deep_ep_combine(expert_out, topk_w, recv_counts,
-                           group=module.ep_group)
+    契约：@local_compute 是区域计算工厂 fn(mesh, tp_mesh, cp_mesh,
+    ep_mesh, ...) -> compute_fn——mesh 家族四个必选（框架按名填充，
+    未激活轴填 None，用不用随你）、不得有默认值、禁止 *args/**kwargs；
+    可选锚点 module（边界模块）；其余具名形参是用户配置键（Target/YAML
+    按名绑定，拼写 fail-fast）。返回的 compute_fn(module, *args) 是普通
+    callable（无需再装饰），入参必须与原 forward 匹配（apply 时校验）；
+    region_dispatch=False 时其输入输出均为 local tensor，布局与 spec 的
+    in_dst/out_src 声明一致。"""
+    ep_group = ep_mesh.get_group("ep")     # apply 时建组一次，闭包固定
+
+    def compute_fn(module, hidden_states):
+        topk_idx, topk_w = module.router(hidden_states)
+        dispatched, recv_counts = deep_ep_dispatch(hidden_states, topk_idx,
+                                                   group=ep_group)
+        expert_out = module.experts(dispatched)
+        return deep_ep_combine(expert_out, topk_w, recv_counts,
+                               group=ep_group)
+    return compute_fn
 
 spec = ModuleShardingSpec(
-    params={...}, in_src=..., in_dst=..., out_src=..., out_dst=...,
-    local_compute_fn=my_deep_ep_compute,   # 链环 1：直接生效，无需 use_local_map
-)
+    local_compute_fn=my_deep_ep_factory,   # 链环 1：直接生效（callable 直传）
+    region_dispatch=False,   # 必填伴生声明：DeepEP dispatch 含通信原语，不可 dispatch
+)   # merge 语义：params/契约空 → 继承 planner 推导结果
 planner = ShardingPlanner(plan_overrides={"model.layers.3.mlp": spec})
+# 也可以用 glob 一条覆盖所有层：plan_overrides={"*.mlp": spec}
+# 需要配置键或 YAML 载体时用 Target：
+#   local_compute_fn=Target(my_deep_ep_factory,
+#                           target_path="my_pkg.my_deep_ep_factory",
+#                           block_size=128)
 ```
 
+**为什么 mesh 家族是必选声明、却又"用不用随你"**：骨架在 compute 之前
+已经完成了全部布局转换（边界入口通信 + to_local + 参数解包），区域内是
+纯 local tensor 世界——compute fn 每个 forward 都跑，不该在运行期从
+mesh 派生通信域（每次 `mesh.get_group()` / `new_group` 都是浪费甚至
+泄露）。所以 mesh 只在 **apply 期 build 工厂时**传一次（对象引用，零
+成本）：需要通信组的（典型：从 `ep_mesh` 建 a2a 通信组）在工厂体里建组
+一次、闭包固定，运行时零 mesh 开销；自含计算（融合 kernel 替换、自定义
+expert 排布、用模块上已有 process group 的 dispatch）声明了不用即可——
+mesh 家族是统一的接口规范，不是使用义务：
+
+```python
+@local_compute
+def my_fused_swiglu(mesh, tp_mesh, cp_mesh, ep_mesh):
+    """自含计算的工厂：mesh 家族必选声明（框架填充），本例不使用。"""
+
+    def compute_fn(module, hidden_states):
+        return module.down_proj(
+            F.silu(module.gate_proj(hidden_states))
+            * module.up_proj(hidden_states))
+    return compute_fn
+
+plan_overrides = {"*.mlp": ModuleShardingSpec(
+    local_compute_fn=my_fused_swiglu,      # callable 直传
+    region_dispatch=True)}   # 纯标准算子 → validate 穿透真校验（§10.1）
+```
+
+**`local_compute_fn` 只接受 `@local_compute` 工厂一种形态**（callable
+直传，或工厂的 `Target` 延迟引用——需要配置键/YAML 载体时）。裸函数
+（未装饰）或装饰器种类不符（如给工厂用 `@inner_wrapper`）都在 apply
+时 fail-fast 并指明正确的装饰器。
+
 骨架四步里只有 compute 被替换；in/out 边界的 all-gather/reduce-scatter
-照常执行（详见 §4.3 声明式豁免）。
+照常执行（详见 §3.3 声明式豁免）。
 
 > 可运行示例：`examples/distributed/custom_local_compute_fn.py`（自研 top-1
 > MoE + 自定义 batched expert 布局；含融合 gate_up 不可直接 Shard 的坑说明）。
 
-### 10.4 inner-wrap 族：`inner_target` 与 `inner_wrapper`
+### 10.5 inner-wrap 族：`inner_target` 与 `inner_wrapper`
 
 机制：**定位 inner 子模块 + 替换/包装其 forward**。机制本身通用（不限
-CP），CP（K/V all-gather）是第一个内置域。双解析链：
+CP、**不限 attention**——任何模块的任何子模块都可声明，声明即应用），
+CP（K/V all-gather）只是第一个仓内参考实现域。双解析链：
 
-- **target 链（纯位置）**：`inner_target` 指定 > `inner_attention`/`attn`/
-  `attention` 属性 > 类名判定 > q/k/v_proj 结构兜底；
-- **wrapper 链（纯行为）**：callable 自定义 > str 注册表名 > （声明了
-  inner_target 或命中 attention 模板时）启发式 2×2 分派 > 不注入。
+- **target 链（纯位置）**：`inner_target` **显式指定，无缺省**——
+  任意属性名或 `"self"`（边界模块自身），拼错 fail-fast。声明
+  `inner_wrapper` 时必须**成对**显式声明 `inner_target`（缺失 →
+  `ValueError`）：曾经的 attention 域自动定位启发式
+  （`inner_attention`/`attn`/`attention` 属性 > 类名判定 > q/k/v_proj
+  结构兜底）已删除——inner-wrap 是与 CP/attention 解耦的通用机制，
+  静默定位有包错目标风险，而包错目标是静默数值错误温床；
+- **wrapper 链（纯行为）**：Target > callable 自定义 > str 注册表名 >
+  不注入（**启发式分派已删除**；仅 `inner_target` 无 `inner_wrapper` →
+  fail-fast）。
 
-**示例 C：自动定位失败 → `inner_target` 指定**
+**示例 C：非标准属性名 → `inner_target` 指定**
 
 ```python
 spec = ModuleShardingSpec(
     ..., inner_target="core_attention",   # 属性名；"self" 表示模块本身
+    inner_wrapper="sdpa_qkv",             # 成对必填：inner_target 不能单独声明
+    inner_out_src="first_input",          # 子模块目标必填：输出布局显式声明
+    region_dispatch=False,                # 必填伴生声明（仓内 CP wrapper 内含通信）
 )
 ```
 
-**示例 D：启发式会猜错 → str 固定内置方案**
+**示例 D：显式固定仓内参考方案（无启发式缺省）**
 
 ```python
-# 自研 attention 是 HF 风格但内部调的是自研 sdpa 封装，
-# 强制走 (q,k,v) 替换路而不是拦截路
-spec = ModuleShardingSpec(..., inner_wrapper="sdpa_qkv")
+# 自研 attention 是 HF 风格但内部调的是自研 sdpa 封装（拦截路拦不到），
+# 显式走 (q,k,v) 替换路——inner 子模块目标必须声明 inner_out_src
+spec = ModuleShardingSpec(..., inner_target="core_attention",   # 成对必填
+                          inner_wrapper="sdpa_qkv",
+                          inner_out_src="first_input",
+                          region_dispatch=False)   # 必填：wrapper 内含 K/V all-gather 通信
 ```
 
 可选名：`"sdpa_qkv"` / `"sdpa_hf"` / `"flex_qkv"` / `"flex_hf"`（§6.2
-各自的机制与适用场景）。未知名 fail-fast 并列出可用名。
+各自的机制与适用场景——**四个参考实现都内含通信，一律
+`region_dispatch=False`**）。未知名 fail-fast 并列出可用名。
 
-**示例 E：内置四路覆盖不到 → callable 全自定义**
+**示例 E：仓内四路覆盖不到 → callable 全自定义（local-only）**
 
 ```python
-def my_flash_cp_wrapper(target, cp_mesh, *, spec=None, mesh=None,
-                        mesh_dim_names=()):
-    """契约：fn(target, cp_mesh, *, spec, mesh, mesh_dim_names) -> None。
+@inner_wrapper
+def my_flash_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """契约：@inner_wrapper fn(target_module, mesh, tp_mesh, cp_mesh,
+    ep_mesh) -> None——mesh 家族必选、框架填充、只用需要的；禁止
+    *args/**kwargs。
 
-    整体接管：原地替换 target.forward。内部自行完成 K/V all-gather
-    （cp_mesh.get_group()）与 causal mask 修正。双模式注意：validate 下
-    输入可能是 DTensor——做 unwrap/rewrap 容错（推荐），或在边界模块
-    声明 use_local_map 让骨架先转 local。"""
-    orig_forward = target.forward
+    整体接管：原地替换 target.forward。替换后的 forward **只面向 local
+    张量**（零 DTensor 代码）——validate 的解包/重包由双模适配器托管
+    （§10.5.1）；重包布局来自声明：target=self 用边界 out_src，inner
+    子模块用 inner_out_src。"""
+    orig_forward = target_module.forward
 
     def cp_forward(q, k, v, **kwargs):
-        was_dtensor = isinstance(q, DTensor)
-        if was_dtensor:
-            q, k, v = q.to_local(), k.to_local(), v.to_local()
-        k = all_gather_along_seq(k, cp_mesh.get_group())
-        v = all_gather_along_seq(v, cp_mesh.get_group())
-        out = flash_attn_varlen(q, k, v, causal=True, **kwargs)
-        return DTensor.from_local(out, ...) if was_dtensor else out
+        gk = all_gather_along_seq(k, cp_mesh.get_group())
+        gv = all_gather_along_seq(v, cp_mesh.get_group())
+        return flash_attn_varlen(q, gk, gv, causal=True, **kwargs)
 
-    target.forward = cp_forward
+    target_module.forward = cp_forward
 
 spec = ModuleShardingSpec(
     ..., inner_target="core_attention", inner_wrapper=my_flash_cp_wrapper,
+    inner_out_src="first_input",   # layout-preserving：输出布局 == q 布局
+    region_dispatch=False,         # 必填：wrapper 内含 all_gather 通信原语
 )
 ```
 
-`inner_target` 与 `inner_wrapper` 可独立使用：callable 缺省 target 为
-自动定位结果，定位不到时退化为边界模块本身（不会 fail-fast——用户
-callable 自己负责）。
+`inner_target` 与 `inner_wrapper` 必须**成对**出现（任一缺失 →
+fail-fast）。`inner_target="self"` 时按 self 情形用边界 out_src 重包，
+无需 `inner_out_src`。
 
 **示例 F：注册命名方案（团队共享）**
 
 ```python
-from hyper_models.components.distributed.sharding_applier import CP_WRAPPER_REGISTRY
+from hyper_models.components.distributed.cp_wrappers import INNER_WRAPPER_REGISTRY
 
-CP_WRAPPER_REGISTRY["my_flash"] = my_flash_cp_wrapper
-# 之后任意 spec 可写 inner_wrapper="my_flash"
+INNER_WRAPPER_REGISTRY["my_flash"] = my_flash_cp_wrapper   # 须已带 @inner_wrapper
+# 之后任意 spec 可写 inner_wrapper="my_flash"——仍需成对声明 inner_target
+# （包装自身写 "self"；子模块目标另需 inner_out_src）与 region_dispatch
 ```
 
-### 10.5 两个家族怎么选
+### 10.5.1 双模适配器：inner wrapper 的黑盒托管（`region_dispatch=False`）
+
+所有 inner wrapper（仓内参考/注册表/callable/Target）替换完 forward 后，
+由 `_wrap_inner_attention` 统一安装**双模适配器**。`region_dispatch=False`
+（含通信，最常见）时适配器做黑盒托管：
+
+- **入口**：validate（任一入参是 DTensor）→ DTensor 入参 to_local +
+  参数临时解包；production（无 DTensor 入参）→ 直通零开销；
+- **出口重包**：placements 全部显式声明，框架零推导零猜测——
+  target=self → 边界 `out_src`（多输出按 `out_names`）；inner 子模块 →
+  `inner_out_src`（`"first_input"` / 显式 placement / 多输出 dict）；
+- **validate 对 inner 区域跳过传播校验**：inner 是黑盒孤岛（原实现在
+  CP 下本就无法正确 dispatch，不存在拿它当校验基准的合法性）。安全网
+  在孤岛之外：重包接回后外层 dispatch 是真实传播（声明错了被边界
+  out_src 校验抓住）+ `from_local` 全局形状一致性 + 双模式数值对拍。
+
+**`region_dispatch=True`（纯标准算子 wrapper）时适配器改为穿透**：
+validate 下 DTensor 直接传入替换后的 forward 跑真实算子传播，出口
+placements 与 `inner_out_src`（或 `"first_input"` 规则）逐点比对——
+声明即真校验；链断了（返回非 DTensor）或布局不符当场报错。production
+行为不变（恒 local 直通）。
+
+### 10.6 两个家族怎么选
 
 | 场景 | 接口 |
 |---|---|
-| 模块 forward 内含数据相关逻辑（a2a/gather/mask），保持模块不变 | `use_local_map` |
-| 保持骨架（边界缝合/双模式），只换区域内部计算 | `local_compute_fn` |
-| attention 的 inner 子模块定位不到/有歧义 | `inner_target` |
-| 内置 CP 方案选错/要固定 | `inner_wrapper="..."` |
-| 内置四路不满足（flash_attn_varlen 直调等） | `inner_wrapper=callable` |
+| 模块 forward 内含数据相关逻辑（a2a/gather/mask），保持模块不变 | `region_dispatch=False`（模块 forward 即 compute） |
+| 保持骨架（边界缝合/双模式），只换区域内部计算（含通信/自定义 kernel） | `local_compute_fn` + `region_dispatch=False` |
+| 纯算子替换/写法优化（无通信、可 dispatch，想拿真校验） | `local_compute_fn`/`inner_wrapper` + `region_dispatch=True` |
+| 要包装的不是边界模块本身而是其某个子模块 | `inner_wrapper` + `inner_target="<属性名>"` |
+| 仓内参考 CP 方案选错/要固定 | `inner_wrapper="..."` + `region_dispatch=False` |
+| 仓内四路不满足（flash_attn_varlen 直调等） | `inner_wrapper=callable` + `region_dispatch=False` |
 
 > 可运行示例：`examples/distributed/custom_inner_wrapper.py`（非标准 inner
-> 属性名 + `CP_WRAPPER_REGISTRY` 注册命名方案 + `_resolved_inner_wrapper`
-> 回写断言）。
+> 属性名 + `INNER_WRAPPER_REGISTRY` 注册命名方案 + `_resolved_inner_wrapper`
+> 回写断言 + `inner_out_src` 声明）；`programmatic_injection.py`（五形态
+> 编程式注入汇总）。
+
+#### `inner_target="self"` + `inner_wrapper` vs `local_compute_fn`（`region_dispatch=False` 时）
+
+两者在 `region_dispatch=False` 下跑的是**同一个 local-region 骨架**（边界
+入口通信 → to_local + 参数解包 → compute → 按 out_src 重包 → 边界出口
+通信）——inner-wrap 情形下 compute 就是"已被用户替换的 target.forward"，
+双模适配器在骨架内直通。真正的区别在**替换姿态**：
+
+| | `local_compute_fn` | `inner_wrapper`（含 `inner_target="self"`） |
+|---|---|---|
+| 姿态 | **整体接管**：区域内计算完全由 fn 提供 | **织入/拦截**：拿到 `orig_forward` 引用后替换 forward |
+| 原 forward 的代码 | 不可复用（fn 里再调 `module.forward` 会递归进已包装的 forward） | 可复用——如 `sdpa_hf` 只拦截其中的 `F.sdpa` 调用，q/k/v 投影、RoPE、o_proj 等原代码原样保留 |
+| 签名 | 工厂 `fn(mesh, tp_mesh, cp_mesh, ep_mesh, ...) -> compute_fn`（框架管理的区域计算；compute_fn 为 `fn(module, *args) -> Tensor`） | `fn(target_module, mesh...) -> None`（原地替换，双模适配器托管 DTensor 转换） |
+| 目标 | 恒为边界模块区域本身 | 可指向任意子模块（`inner_target="<属性名>"`） |
+
+**判据**：要**保留原 forward 的大部分代码、只换其中一个算子/插一段通信**
+→ `inner_wrapper`（织入）；要**完全重写区域计算**（自研 kernel 序列、
+与原实现无共享代码）→ `local_compute_fn`（接管）。只想包装边界模块
+自身时两通道都能做，按上表姿态选；目标是子模块时只能走 inner-wrap。
+
+### 10.7 编程式注入：不接 trainer / YAML 的集成方式
+
+双模式 DTensor 能力可以脱离 trainer 单独使用——`ShardingPlanner` +
+`apply_sharding_plan` 两个对象就是全部入口，注入全部是普通 Python 对象
+（适合把本组件接入自研训练框架）：
+
+```python
+# region_dispatch 公理：声明注入就必须显式回答"区域内能否 dispatch"——
+# 纯标准算子（无通信、无数据依赖分支）→ True（validate 穿透真校验）；
+# 含通信原语/自定义 kernel → False（黑盒托管）。下面五形态都是纯算子示例。
+overrides = {
+    # ① @inner_wrapper 装饰的 callable 直传（最常用，不需要注册表）
+    "model.layers.0.self_attn": ModuleShardingSpec(
+        inner_target="self", inner_wrapper=my_wrapper, region_dispatch=True),
+    # ② Target 延迟引用 + 数据配置键（按名绑定到工厂形参）
+    "model.layers.1.self_attn": ModuleShardingSpec(
+        inner_target="self", region_dispatch=True,
+        inner_wrapper=Target(my_wrapper, target_path="my_pkg.my_wrapper",
+                             block_size=128)),
+    # ③ 注册表名（可选：按名共享 / YAML str 引用时才需要注册）
+    "model.layers.2.self_attn": ModuleShardingSpec(
+        inner_target="self", inner_wrapper="demo", region_dispatch=True),
+    # ④ glob + @local_compute 工厂 callable 直传（merge 语义：契约继承推导）
+    "*.mlp": ModuleShardingSpec(
+        local_compute_fn=my_factory, region_dispatch=True),
+    # ⑤ @local_compute 工厂 Target（配置键按名绑定；精确 key 覆盖 glob）
+    "model.layers.2.mlp": ModuleShardingSpec(
+        local_compute_fn=Target(
+            my_factory, target_path="my_pkg.my_factory", block_size=256),
+        region_dispatch=True),
+}
+# 注册表与 Target 都不是必需的——注入函数都可以直接传装饰后的函数对象；
+# INNER_WRAPPER_REGISTRY 仅为 YAML 字符串引用/团队按名共享而存在；
+# CP/EP 场景的注入内含通信 → 改传 region_dispatch=False（§6/§7）
+plan = ShardingPlanner(plan_overrides=overrides).plan(model, mesh, tp_size=2)
+model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+model(input_ids)   # production 训练 / validate 对拍（validate_mode=True）
+```
+
+可运行示例：`examples/distributed/programmatic_injection.py`（五形态一个
+dict 全覆盖，production/validate 双模式对拍单卡，计数器逐一断言生效）。
+
+### 10.8 自定义 autograd.Function 与第三方/HF 宿主
+
+**问题**：边界机制的作用粒度是 `nn.Module.forward`。自定义
+`autograd.Function` 以 `A.apply(...)` 裸调用（没有实例、不在模块树）时
+**没有 FQN**，spec 无处挂载——框架对它完全不可见。
+
+**解决**:`FunctionModule` 壳给它模块形态，之后走标准的 plan_overrides
+流程：
+
+```python
+from hyper_models.components.distributed import FunctionModule
+
+self.a_fn = FunctionModule(A)       # 挂在宿主 __init__：获得 FQN
+# forward 里：A.apply(x) → self.a_fn(x)
+
+plan_overrides={"...a_fn": ModuleShardingSpec(
+    params={},                      # Function 无参数
+    region_dispatch=False,          # 必须：自定义 Function 不在 dispatch 覆盖范围
+    in_src={"x": {TP: Shard(1)}},
+    in_dst={"x": {TP: Replicate()}},     # 入口 all-gather
+    out_src={"output": {TP: Replicate()}},
+    out_dst={"output": {TP: Shard(1)}},
+)}
+```
+
+- **契约 key 绑定**：单张量输入直接用壳的 `*args` 透传（单输入契约回退
+  绑定到第 0 个位置参数）；多输入（如额外权重张量）子类化壳并给显式
+  签名（`def forward(self, x, weight)`），契约 key = 形参名；
+- **梯度链**：边界通信 autograd 感知（fwd all-gather / bwd
+  reduce-scatter），A 自己的静态 backward 照常——布局归边界，计算归 A;
+- **DX guard**:plan() 检测到树上有 `FunctionModule` 但无 spec 覆盖 →
+  warning（未声明 = 静默无通信，必须显式选择）。
+
+> **机制原理**:`FunctionModule` 三行实现（持有 Function 类、forward 透传
+> `apply`）——挂载为宿主属性后经 `nn.Module.__setattr__` 登记进模块树，
+> 获得 FQN，边界包装才有作用点；壳无参数、无状态，反向仍走 A 自己的
+> 静态 `backward`（布局变换归边界通信的 autograd 段，数值计算归 A）。
+> ③ 中 `__class__` 替换之所以可行：Python **方法存于类、状态存于实例**
+> ——`forward` 沿实例的 `__class__` 指针解析，两个类都是 `nn.Module`
+> 子孙、无 `__slots__`（实例布局兼容），赋值只拨动方法解析指针，参数与
+> 父子引用零拷贝。它是 plan 之前的装配期结构变更（模块树可见、plan 可
+> 内省），与 patch 被 forward 闭包引用的 `A.apply` 有本质区别。
+
+**调用点在第三方/HF 代码里（不能改原文件）的决策顺序**：
+
+```
+通信能移到宿主边界？  ──是──→ ① plan_overrides + region_dispatch=False
+                              作用于宿主模块本身（零代码改动；A.apply 在
+                              local 区域内原样执行）
+        │否
+必须侵入宿主内部？    ──是──→ ② local_compute_fn 整体接管宿主 forward
+                              （D-09 HF 原生 MoE 的先例：区域内部通信
+                              自己写，骨架边界仍归框架）
+        │否（A 必须是独立边界）
+        └──→ ③ 子类化宿主类 + 实例级 __class__ 替换（不改第三方文件、
+               权重零拷贝），纪律：pin 依赖版本 + 原类 vs 子类单卡
+               smoke test（升级时大声失败）
+```
+
+框架不提供对裸函数调用的拦截（monkey-patch `A.apply`）：那会让通信脱离
+precompiled boundary（production 不预编译、validate 不断言、plan 不可
+内省、出错时静默）。
+
+> 可运行示例：`examples/distributed/custom_autograd_function.py`——模拟
+> 第三方宿主裸调用"全序列统计量"Function，演示 ③ 的完整纪律（smoke
+> test → `__class__` 替换 → plan_overrides → 双模式对拍）；Function 的
+> 语义故意选为布局错则数值必错，**对拍本身就是桥接探针**。
+> 代码级走读：[function_module_autograd_walkthrough.md](../../trainer/code_guides/function_module_autograd_walkthrough.md)。
 
 ---
 
-## 11. 典型模型支持矩阵
+## 11. 核心 API 参考
+
+### 11.1 `ShardingPlanner().plan(...)`
+
+```python
+plan = planner.plan(
+    model, mesh,
+    tp_size=1,               # TP 组大小（>1 激活 TP 维）
+    cp_size=1,               # CP 组大小（>1 激活 CP 维，attention 注入 CP wrapper）
+    ep_size=1,               # 扩展 EP 组大小（>1 且命中 HF 原生 MoE 时激活 EP）
+    sequence_parallel=True,  # SP：norm 间激活按序列维 Shard(1)
+    loss_parallel=False,     # lm_head 输出 Shard(-1)（vocab 并行 loss）
+    explain=False,           # True 时 plan 末尾 INFO 打出内省报告（§4.1）
+)
+```
+
+- 返回 `ShardingPlan`：`modules: {fqn: ModuleShardingSpec}` +
+  `mesh_dim_names` + `special_handlers` + `tied_pairs`。
+- **坐标系约定**:`plan.mesh_dim_names` 恒为 `tp/cp/ep` 子集，**永远不含
+  dp 轴**——plan 描述单个 dp 切片内的布局与通信；dp 维的数据切分归数据
+  管道、参数/梯度切分归 FSDP（05 §3.1.1）。在 `plan_overrides` 里声明 DP
+  placement 会被 `plan()` fail-first 拒绝（教学式报错）。
+- size=1 的轴会被自动剔除（`plan.mesh_dim_names` 只含活跃轴）。
+- `ShardingPlanner(plan_overrides={fqn 或 glob: spec})`：统一 override 通道
+  （merge 未写字段继承 / insert 完整自声明）
+  （§10.2）；`derive=False` 关闭模板推导——plan 只含 plan_overrides
+  显式声明的 spec（全部 insert 模式），用于自动推导语义错误的子树
+  （§9.1 encoder_dp ViT 桥接）。
+- 内省与判定工具：`plan.explain()`（§4.1）、`check_dispatchable`（§4.2）。
+
+### 11.2 `apply_sharding_plan(...)`
+
+```python
+model, tp_grad_info = apply_sharding_plan(
+    model, plan, mesh,
+    validate_mode=False,     # True=validate 模式；默认 production
+)
+```
+
+- 返回 `(model, tp_grad_info)`；validate 下 `tp_grad_info is None`。
+- `model` 也可以是 **PP 多 part 列表**（`apply_sharding_plan([part0, part1], ...)`）。
+
+### 11.3 DeviceMesh 构建
+
+```python
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+
+# TP=8
+mesh = init_device_mesh("npu", (8,), mesh_dim_names=("tp",))
+# CP=2 × TP=4（cp 外层、tp 内层——TP 组连续，通信局部性最好）
+mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("cp", "tp"))
+# TP=2 × EP=4（EP 显式轴；EP-aware 自研模块取 mesh["ep"] 用）
+mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("tp", "ep"))
+# DP=2 × CP=2 × TP=2
+mesh = init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
+```
+
+取子 mesh：`cp_mesh = mesh["cp"]`、`tp_mesh = mesh["tp"]`。
+
+---
+
+## 12. 典型模型支持矩阵
 
 已用 transformers 仓（v5.12.1）真实模型类验证（planner 全链路）：
 
@@ -787,21 +1362,37 @@ DeepSeek MLA 覆盖条目（D-14，`ARCH_OVERRIDES` 内置，v2/v3 两种拼写�
 
 ---
 
-## 12. 排错索引
+## 13. 排错索引
 
 | 报错/现象 | 原因 | 解法 |
 |---|---|---|
 | `ValueError: ... named_modules` | plan_overrides 的 fqn 拼写错误 | 对照 `dict(model.named_modules())` |
-| `ValueError: ... nests inside / ancestor / nested` | override 的 fqn 与派生边界（或另一 override）构成祖孙嵌套 | 改为覆盖所属边界本身（同 fqn 替换），见 §10.1 |
+| `ValueError: ... nests inside / ancestor / nested` | override 的 fqn 与派生边界（或另一 override）构成祖孙嵌套 | 改为覆盖所属边界本身（同 fqn 替换），见 §10.2 |
 | `PlacementMismatchError` | validate 模式 out_src/out_dst 校验失败，或参数分片声明与实际不符 | 对照报错中的模块名与 placement 检查 spec 声明 |
 | `chain contract mismatch`（警告） | 相邻模块 out_dst ≠ in_src | 边上有 reshape/transpose 属正常；否则检查声明并跑 validate 对拍 |
-| `ValueError: ... inner_target` | CP 声明了但 inner attention 定位失败 | `inner_target="<属性名>"` 显式指定 |
-| `ValueError: ... CP_WRAPPER_REGISTRY` | `inner_wrapper` str 未注册 | 用四个内置名之一，或先注册 |
-| `RuntimeError: 未拦到 F.scaled_dot_product_attention` | 发火检测：启发式选了 `sdpa_hf` 但模块内部不调 F.sdpa | 显式 `inner_wrapper="sdpa_qkv"`，或提供 callable |
+| `ValueError: ... 未显式声明 inner_target / inner_target 未声明` | 声明了 `inner_wrapper` 但未成对声明 `inner_target`（自动定位启发式已删除） | 包装模块自身 → `inner_target="self"`；包装子模块 → `inner_target="<属性名>"` |
+| `ValueError: spec.inner_target=... did not match` | `inner_target` 属性名拼错或目标无 forward | 对照 `dict(module.named_children())` 修正属性名 |
+| `ValueError: ... INNER_WRAPPER_REGISTRY` | `inner_wrapper` str 未注册 | 用四个仓内参考名之一，或先注册 |
+| `RuntimeError: 未拦到 F.scaled_dot_product_attention` | 发火检测：`sdpa_hf` 拦截路但模块内部不调 F.sdpa（wrapper 型号选错） | 改 `inner_wrapper="sdpa_qkv"`，或提供 callable |
+| `ValueError: ...未声明 inner_wrapper...` | cp>1 的 attention 边界无显式注入（preflight 防呆） | 按报错里的 YAML 片段配置 `plan_overrides` |
+| `ValueError: ...没有 local-region 计算来源...` | ep>1 的 MoE 边界无 `local_compute_fn` 且非 `region_dispatch=False`（preflight 防呆） | 注入 `hf_native_ep_compute_fn` 工厂（+ `region_dispatch: false`）/ 自研 EP-aware 模块声明 `region_dispatch: false` / 自定义 compute |
+| `ValueError: ...region_dispatch 未显式声明...` | 声明了注入（`local_compute_fn`/`inner_wrapper`）但没给 `region_dispatch`（无默认值） | 纯标准算子 → `True`；含通信原语/自定义 kernel → `False`（§10.1 公理） |
+| `ValueError: ...region_dispatch=True 冗余...` | 未注入的普通边界写了 `region_dispatch=True`（默认即可穿透） | 删除该字段 |
+| `...dispatch 失败...请改声明 region_dispatch=False` | `region_dispatch=True` 但 validate 穿透时函数内部有 dispatch 不了的算子/通信 | 改回 `False`（黑盒托管），或把不可 dispatch 的部分改写成标准算子 |
+| `ValueError: ...未声明的键...` | Target 配置了目标函数未声明的 kwargs 键（拼写错误） | 按报错列出的合法形参名改正键名 |
+| `TypeError: ...缺少 @local_compute/@inner_wrapper 装饰器` | 注入函数未按纪律装饰 | 按种类加装饰器（§10.3） |
+| `TypeError: ...缺少必选上下文参数` | mesh 家族/target_module 没声明全 | 补齐签名（用不用都要声明） |
+| `TypeError: ...上下文参数 ... 不得有默认值` | 上下文参数写了默认值 | 删默认值（框架必然填充） |
+| `ValueError: ...配置了框架保留上下文键` | Target/YAML 里配置了 mesh 家族/锚点 | 删除该配置键 |
+| `ValueError: ...未声明 inner_out_src` | wrapper 作用于 inner 子模块但未声明输出布局 | 按报错提示写 `"first_input"` 或显式 placement（§10.5.1） |
+| `TypeError: ...不存在同名项 / 不是同序子序列 / 必填参数 ... 未被接收` | compute fn 入参与原 forward 不匹配 | 对齐形参名/顺序/必填项 |
+| `TypeError: ...入参不兼容` | 替换后的 forward 接不住原 forward 入参 | 用 `*args/**kwargs` 透传或对齐签名 |
+| `ValueError: 仓内 CP wrapper 参考实现 ... 需要活跃的 cp mesh` | 无 cp 轴却声明了四个仓内参考 CP 方案之一（inner-wrap 泛化后声明即应用） | 改用自定义 callable/Target（收 `cp_mesh=None`），或 `local_compute_fn`（§6.3.1） |
+| `ValueError: spec.inner_target=... 只是定位` | 只给位置没给方案（启发式已删除） | 同时声明 `inner_wrapper` |
 | `ep_size (...) 必须不超过且整除 dense 区域` | EP 组超出 dp×cp×tp | 调小 ep_size 或扩大 dense 区域 |
 | `num_experts (...) 必须整除 ep_size` | expert 数不能均分 | 调整 ep_size |
-| `NotImplementedError: ... 仅支持 SwiGLU expert` | 内置 EP compute 只支持 SwiGLU 三矩阵 | 自研 expert 结构 → `local_compute_fn` |
-| validate 下自定义 inner_wrapper 报 DTensor 相关错 | wrapper 未做 DTensor 容错 | unwrap/rewrap（示例 E），或边界模块声明 `use_local_map` |
+| `NotImplementedError: ... 仅支持 SwiGLU expert` | 仓内参考 EP compute 只支持 SwiGLU 三矩阵 | 自研 expert 结构 → `local_compute_fn` |
+| inner wrapper 想拿 DTensor / 想做框架级布局推导 | 双模适配器已托管全部 DTensor 转换，用户 wrapper 只见 local 张量 | 不需要也不应该写 DTensor 逻辑；输出布局用 `inner_out_src`/out_src 声明（§10.5.1） |
 | production 前向 view/reshape shape mismatch（显式 `num_heads` 写法） | 模块 q/k/v 未被识别为 colwise（命名非标准），头数改写（D-17）未命中 | `ARCH_OVERRIDES` 注册命名规则（§5.5）使 q/k/v 归 COLWISE，或 `plan_overrides` 手写 spec |
 | `head-count adjustment: ... not divisible`（警告） | 模块头数属性不能被 tp_size 整除，已保持原值 | 调小 tp_size；确认该属性确为头数（否则可忽略） |
 | 参数未分片且无报错 | 命名不命中默认规则（落 SKIP，只有 warning） | `ARCH_OVERRIDES` 注册架构规则（§5.5） |
@@ -811,7 +1402,7 @@ DeepSeek MLA 覆盖条目（D-14，`ARCH_OVERRIDES` 内置，v2/v3 两种拼写�
 ## 附：运行测试
 
 ```bash
-python -m pytest tests/components/distributed/ -q   # 300 例
+python -m pytest tests/components/distributed/ -q   # 388 例
 ```
 
 单进程用例直接跑；多进程用例经 `run_dist`（spawn + gloo/CPU，macOS 可跑），

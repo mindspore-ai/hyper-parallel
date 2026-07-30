@@ -1,0 +1,28 @@
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Licensed under the Apache License, Version 2.0
+# ============================================================================
+# 配方：HF 原生 MoE（Qwen3-MoE 系：gate + 循环 experts + 可选
+# shared_experts）TP + EP（D-10 TP-extend-EP：无独立 ep 轴，EP 组从
+# dp×tp×cp 稠密区延展）。
+# 对应可跑示例：examples/distributed/ep.py / tp_cp_ep.py
+#
+# 要点：planner 自动识别 HF 原生 MoE 并切 expert 参数（{ep: shard(0)}），
+# 但 EP compute（token all-to-all + 专家计算 + 结果回收）必须显式注入 —
+# 仓内参考实现 hf_native_ep_compute_fn 覆盖 HF 路由（softmax+topk）；
+# 其内部含 all-to-all 通信 → region_dispatch: false。
+
+accelerator:
+  tp_size: 2
+  cp_size: 1
+  ep_size: 2          # TP-extend-EP：ep 组大小，从 dp×tp×cp 延展
+  pp_size: 1
+  sequence_parallel: true
+
+plan_overrides:
+  - match: "*.mlp"    # HF MoE 的 MoE 模块通常命名为 mlp；按实际 FQN 调整
+    when: ep
+    region_dispatch: false   # EP compute 内含 all-to-all，不可 dispatch
+    local_compute_fn:
+      _target_: hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
+      # 路由写在工厂体内（本参考实现内嵌 softmax top-k adapter）；自定义路由
+      # 的 MoE 写自己的工厂函数（体内引用 MOE_ROUTER_ADAPTERS 条目），在此指向它。

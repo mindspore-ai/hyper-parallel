@@ -206,6 +206,10 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
         )
     if origin is tuple or annotation is tuple:
         return _normalize_tuple(value, args, path=path)
+    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
+        # nested dataclass items (e.g. List[PlanOverride]) resolve as
+        # mappings, mirroring resolve_component's dataclass branch
+        return _resolve_dataclass(value, annotation, path=path)
     if isinstance(annotation, type):
         if isinstance(value, annotation):
             return value
@@ -218,17 +222,25 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
 
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:
     """Resolve one value against an Optional or general union."""
-    for member in get_args(annotation):
-        if member is type(None):
-            continue
+    non_none_members = [
+        member for member in get_args(annotation) if member is not type(None)
+    ]
+    if len(non_none_members) == 1:
+        # Single-member union (e.g. Optional[Target]): resolve directly so the
+        # member's specific error (e.g. an unexpected target argument) reaches
+        # the user instead of being swallowed by the generic union failure.
+        return resolve_component(node, expected_type=non_none_members[0], path=path)
+
+    last_error: ConfigResolutionError | None = None
+    for member in non_none_members:
         try:
             return resolve_component(node, expected_type=member, path=path)
-        except ConfigResolutionError:
-            continue
+        except ConfigResolutionError as exc:
+            last_error = exc
     raise _fail(
         path,
         f"expected {_type_name(annotation)}, got {type(node).__name__}",
-    )
+    ) from last_error
 
 
 def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:

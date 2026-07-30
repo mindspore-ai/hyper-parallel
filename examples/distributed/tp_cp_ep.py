@@ -9,14 +9,16 @@
 拓扑：mesh (cp=2, tp=2)，ep_size=2（D-10 TP-extend-EP：mesh 无 "ep" 轴，
 扩展 EP 组从 dense 区域 flatten 派生——本例 EP 组 == 各 CP 组内的 TP 组）。
 
-要点（三维各自职责在一个模型内叠加，用户侧仍零配置）：
+要点（三维各自职责在一个模型内叠加；compute 注入全部显式）：
 - TP=2：参数列/行切 + boundary 层 all-gather/reduce-scatter；SP 开启，
   序列维在 TP 轴上 Shard(1)；
 - CP=2：数据管道 shard_batch_for_cp 先按序列维外层粗切（D-05）；attention
-  内部由启发式分派的内置 "sdpa_hf" wrapper 完成 K/V all-gather + D-04
-  offset-aware causal mask；boundary 层 CP 维恒 identity（R8）；
+  内部由显式声明的 "sdpa_hf" wrapper 完成 K/V all-gather + D-04
+  offset-aware causal mask（改造后无启发式自动分派）；boundary 层 CP 维
+  恒 identity（R8）；
 - EP=2：HF 原生 MoE（gate + per-expert ModuleList）→ D-09 堆叠 +
-  {EP: Shard(0)} 分片 + 内置 `_hf_native_ep_compute`（a2a dispatch）；
+  {EP: Shard(0)} 分片由 planner 推导；EP compute（a2a dispatch）显式注入
+  —— local_compute_fn 指向仓内默认工厂 hf_native_ep_compute_fn；
 - 序列布局（05 §6.3.1/§6.3.2，教程 §6.6）：{TP: Shard(1), CP: Shard(1)}
   为 cp-major 嵌套切分——序列先按 cp 粗切、块内再按 tp 细切，
   rank (cp_i, tp_j) 持 chunk[cp_i*tp + tp_j]，长度 S/(cp*tp)。
@@ -32,10 +34,13 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from hyper_models.components.distributed import (
+    ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
+    hf_native_ep_compute_fn,
 )
 from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
+from hyper_models.trainer.config import Target
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
 S = 16          # 全局序列长：需整除 2*cp（数据管道 pad 约束）与 cp*tp（布局约束）
@@ -135,7 +140,7 @@ class TinyMoeModel(nn.Module):
                  inter=16, num_experts=4):
         super().__init__()
         self.config = type("Cfg", (), {
-            "architectures": ["TinyMoeForCausalLM"],  # arch → default router adapter
+            "architectures": ["TinyMoeForCausalLM"],
             "num_experts": num_experts,
             "num_experts_per_tok": 2,
         })()
@@ -177,7 +182,24 @@ def main():
     for mode in ("production", "validate"):
         torch.manual_seed(0)
         model = TinyMoeModel().eval()
-        plan = ShardingPlanner().plan(
+        # 显式注入：CP wrapper（"sdpa_hf" + inner_target="self"）+
+        # 仓内默认 EP compute（工厂 Target；expert mesh 由框架在 apply 时
+        # 统一派生并与参数分片共享，经 ep_mesh 上下文传入工厂）
+        planner = ShardingPlanner(plan_overrides={
+            "*.self_attn": ModuleShardingSpec(
+                inner_target="self", inner_wrapper="sdpa_hf",
+                # CP wrapper 内含 K/V all-gather 通信 → 不可 dispatch
+                region_dispatch=False),
+            "*.mlp": ModuleShardingSpec(
+                # EP compute 内含 all-to-all 通信 → 不可 dispatch
+                region_dispatch=False,
+                local_compute_fn=Target(
+                    hf_native_ep_compute_fn,
+                    target_path="hyper_models.components.distributed."
+                                "ep_compute.hf_native_ep_compute_fn"),
+            ),
+        })
+        plan = planner.plan(
             model, mesh, tp_size=tp_size, cp_size=cp_size, ep_size=ep_size)
 
         # plan 内省：三维各自的结构元数据
@@ -185,7 +207,8 @@ def main():
         assert moe_spec._ep_size == ep_size   # TP-extend-EP 元数据（D-10）
         assert moe_spec._ep_stack             # per-expert → Phase A 堆叠（D-09）
         attn_spec = plan.modules["model.layers.0.self_attn"]
-        assert attn_spec._needs_cp_attn       # CP wrapper 注入标记
+        assert attn_spec._needs_cp_attn       # CP 元数据标记（模板识别）
+        assert attn_spec.inner_wrapper == "sdpa_hf"   # 显式注入的 wrapper
         norm_spec = plan.modules["model.layers.0.input_layernorm"]
         io = norm_spec.in_dst["hidden_states"]   # norm：全 identity，零通信
 

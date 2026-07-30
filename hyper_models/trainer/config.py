@@ -15,8 +15,9 @@
 """Typed configuration tree produced by the HyperModels YAML resolver."""
 
 import inspect
+import logging
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Callable, Generic, Literal, Optional, TypeVar
+from typing import Any, Callable, Generic, List, Literal, Optional, TypeVar, Union
 
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -24,6 +25,8 @@ from transformers import PreTrainedTokenizerBase
 
 from hyper_models.components.checkpoint.config import CheckpointingConfig
 from hyper_models.components.distributed.config import FSDP2Config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -175,6 +178,231 @@ class Target(Generic[_T]):
 
 
 @dataclass
+class PlanOverride:
+    """One plan_overrides entry (YAML ``plan_overrides`` list item).
+
+    This is the **YAML transport form** of ``ShardingPlanner(plan_overrides=
+    {...})`` — the planner's single override interface. Placement objects are
+    not YAML-serializable, so contract fields use the string DSL
+    (``"replicate"`` / ``"partial"`` / ``"shard(N)"``) plus the sentinels
+    ``"auto"`` (explicit inherit) / ``"none"`` (explicit clear); they are
+    desugared to real objects in ``to_override()`` — the planner never sees
+    strings. The desugar happens trainer-side in
+    ``instantiate_infrastructure`` BEFORE planner construction.
+
+    Fields:
+        match: fqn or fqn glob matched (fnmatchcase) against the plan's
+            boundary FQNs — ``*`` spans dots, so ``"*.self_attn"`` hits
+            ``model.layers.0.self_attn``.
+        when: optional activation condition — ``"cp"`` (active when
+            cp_size>1) / ``"ep"`` (ep_size>1); omitted = always applied.
+            Self-documents CP/EP-required injections in the YAML and makes
+            one config reusable across parallel topologies (an inactive
+            entry is skipped with an INFO log, never silently applied).
+        local_compute_fn: a Target whose callable is a **factory** — must be
+            decorated ``@local_compute`` (injection discipline); the mesh
+            family ``mesh``/``tp_mesh``/``cp_mesh``/``ep_mesh`` is mandatory
+            context, all filled by the framework at apply time (``module``/
+            ``spec`` optional); the factory must return the region compute
+            fn ``fn(module, *local_args)`` (params validated against the
+            module's forward at apply time).
+            This is also the **performance-replacement** channel: point it at
+            any factory returning a faster compute fn (see
+            examples/distributed/perf_replacement.py). Shipped reference:
+            ``hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn``
+            (routing is embedded in the factory body — the default softmax
+            top-k adapter; a MoE with different routing writes its own
+            factory, referencing ``MOE_ROUTER_ADAPTERS`` entries by name).
+        inner_target: attribute name of the inner submodule whose forward is
+            wrapped (``"self"`` = the boundary module itself; default:
+            auto-location).
+        inner_wrapper: a ``INNER_WRAPPER_REGISTRY`` name (``"sdpa_qkv"`` /
+            ``"sdpa_hf"`` / ``"flex_qkv"`` / ``"flex_hf"``) or a Target
+            pointing at an ``@inner_wrapper``-decorated wrapper fn
+            ``fn(target_module, mesh, tp_mesh, cp_mesh, ep_mesh)``
+            — shipped defaults live in
+            ``hyper_models.components.distributed.cp_wrappers``. The
+            mechanism is not CP-gated (declaration == application), but the
+            four shipped names are CP schemes and require an active cp axis
+            (fail-fast otherwise); custom wrappers receive ``cp_mesh=None``
+            when no cp axis exists.
+        inner_out_src: required when inner_target points at a submodule
+            (not ``self``) — the inner output placement declaration:
+            the sentinel ``"first_input"`` (output layout == first DTensor
+            input's layout, for attention-style layout-preserving
+            wrappers), ``{axis: placement_str}`` (single output), or
+            ``{name: {axis: placement_str}}`` (multi-output). The framework
+            never derives inner output layouts — undeclared fails fast at
+            apply time.
+        region_dispatch: validate 执行模式声明（无默认——声明注入时必填）。
+            ``false`` = 区域计算（模块自身 forward 或注入函数）不可
+            dispatch：含通信原语/自定义 kernel（如自研 EP-aware MoE 的
+            all-to-all 在 forward 内、仓内 CP/EP 参考实现），走
+            local-region 骨架黑盒；``true`` = 注入物是纯标准算子（融合
+            kernel / 脚本写法优化），validate 下 dispatch 穿透 + out_src
+            真校验。无注入时不需要本字段（普通边界天然穿透）。
+        params / in_src / in_dst / out_src / out_dst: contract fields in the
+            YAML form ``{name: {axis: placement_str}}`` (out_* also accept
+            the scalar shorthand ``{axis: placement_str}``), or the sentinels
+            ``"auto"`` / ``"none"``. Merge mode (match hits a derived
+            boundary): usually omitted — empty inherits the derived contract;
+            insert mode (misses every boundary): all must be fully declared.
+    """
+
+    match: str
+    when: Optional[Literal["cp", "ep"]] = None
+    local_compute_fn: Optional[Target[Any]] = None
+    inner_target: Optional[str] = None
+    inner_wrapper: Optional[Union[str, Target[Any]]] = None
+    inner_out_src: Optional[Any] = None
+    region_dispatch: Optional[bool] = None
+    params: Optional[Any] = None
+    in_src: Optional[Any] = None
+    in_dst: Optional[Any] = None
+    out_src: Optional[Any] = None
+    out_dst: Optional[Any] = None
+
+    # 契约字段（字符串哨兵在 planner merge 时解析；insert 模式拒绝）
+    _CONTRACT_FIELDS = ("params", "in_src", "in_dst", "out_src", "out_dst")
+
+    def to_override(self) -> "tuple[str, Any]":
+        """Desugar to a ``(match, ModuleShardingSpec)`` plan_overrides entry.
+
+        Placement DSL strings become real Placement objects here; the
+        ``"auto"``/``"none"`` sentinels pass through AS STRINGS into the spec
+        (the planner's merge resolves them; insert rejects them). Imports are
+        lazy: trainer.config must not become an import-time dependency of
+        components.distributed (the zero-dependency boundary is guarded by
+        test_s5_zero_dep_lint).
+        """
+        from hyper_models.components.distributed.sharding_config import (
+            ModuleShardingSpec,
+        )
+
+        if not self.match:
+            raise ValueError(
+                "plan_overrides entry is missing 'match' (an fqn or "
+                "fqn glob such as '*.self_attn' or '*.mlp')")
+        spec = ModuleShardingSpec(
+            local_compute_fn=self.local_compute_fn,
+            inner_target=self.inner_target,
+            inner_wrapper=self.inner_wrapper,
+            inner_out_src=self._parse_inner_out_src(),
+            region_dispatch=self.region_dispatch,
+        )
+        for attr in self._CONTRACT_FIELDS:
+            raw = getattr(self, attr)
+            if raw is None:
+                continue
+            setattr(spec, attr, self._parse_contract_field(attr, raw))
+        return self.match, spec
+
+    def _parse_inner_out_src(self):
+        """inner_out_src 的 YAML 形态脱糖：哨兵 / 单输出 DSL / 多输出 DSL。"""
+        from hyper_models.components.distributed.sharding_config import (
+            parse_named_placement,
+        )
+
+        raw = self.inner_out_src
+        if raw is None:
+            return None
+        path = f"plan_overrides[{self.match!r}].inner_out_src"
+        if isinstance(raw, str):
+            if raw == "first_input":
+                return raw
+            raise ValueError(
+                f"{path}: 字符串值只接受哨兵 'first_input'（输出布局 == "
+                f"首个 DTensor 入参的布局），got {raw!r}")
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError(
+                f"{path}: 期望 'first_input'、{{axis: placement}} 或 "
+                f"{{name: {{axis: placement}}}}，got {raw!r}")
+        if all(isinstance(v, str) for v in raw.values()):
+            return parse_named_placement(raw, path=path)      # 单输出
+        return {name: parse_named_placement(named, path=f"{path}.{name}")
+                for name, named in raw.items()}               # 多输出
+
+    def _parse_contract_field(self, attr, raw):
+        """YAML form → spec field value (DSL parse / sentinel pass-through)."""
+        from hyper_models.components.distributed.sharding_config import (
+            parse_named_placement,
+        )
+
+        if isinstance(raw, str):
+            if raw in ("auto", "none"):
+                return raw
+            raise ValueError(
+                f"plan_overrides match={self.match!r} 的契约字段 {attr} 的字符串"
+                f"值只接受哨兵 'auto'（显式继承）/ 'none'（显式清空），"
+                f"got {raw!r}")
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"plan_overrides match={self.match!r} 的契约字段 {attr} 期望映射"
+                f"或哨兵字符串，got {raw!r}")
+        if not raw:
+            return {}        # 显式空（"写了照办"：清空/不切分），区别于不写
+        if attr in ("out_src", "out_dst") and all(
+                isinstance(v, str) for v in raw.values()):
+            # 标量简写 {axis: placement} —— 直接是 NamedPlacement（output 名由
+            # planner 的 _normalize_out_fields 统一补全）
+            return parse_named_placement(
+                raw, path=f"plan_overrides[{self.match!r}].{attr}")
+        return {
+            name: parse_named_placement(
+                named, path=f"plan_overrides[{self.match!r}].{attr}.{name}")
+            for name, named in raw.items()
+        }
+
+
+_WHEN_CONDITIONS = ("cp", "ep")
+
+
+def entries_to_plan_overrides(
+    entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
+) -> "dict[str, Any]":
+    """Desugar PlanOverride entries into a ``plan_overrides`` dict.
+
+    - ``when`` filter: an entry whose declared condition is inactive
+      (``when="cp"`` with cp_size==1 etc.) is SKIPPED with an INFO log —
+      declared gating, never silent application. An unknown ``when`` value
+      fails fast listing the valid conditions (programmatic construction
+      bypasses the resolver's Literal check);
+    - two entries sharing the same ``match`` are merged field-wise
+      (non-None fields, later entry wins) — the planner's interface is
+      exactly this dict.
+    """
+    overrides: dict[str, Any] = {}
+    for entry in entries:
+        if entry.when is not None:
+            if entry.when not in _WHEN_CONDITIONS:
+                raise ValueError(
+                    f"plan_overrides match={entry.match!r} 的 when="
+                    f"{entry.when!r} 不合法（合法值: {list(_WHEN_CONDITIONS)}；"
+                    f"缺省 = 总是应用）")
+            size = cp_size if entry.when == "cp" else ep_size
+            if size <= 1:
+                logger.info(
+                    "plan_overrides: match=%r skipped (when=%r but "
+                    "%s_size=%d — 声明式条件不满足，entry 不生效)",
+                    entry.match, entry.when, entry.when, size)
+                continue
+        match, spec = entry.to_override()
+        if match in overrides:
+            prev = overrides[match]
+            for name in ("local_compute_fn", "inner_target", "inner_wrapper",
+                         "inner_out_src", "params", "in_src", "in_dst",
+                         "out_src", "out_dst"):
+                value = getattr(spec, name)
+                if value is not None:
+                    setattr(prev, name, value)
+            if spec.region_dispatch is not None:
+                prev.region_dispatch = spec.region_dispatch
+        else:
+            overrides[match] = spec
+    return overrides
+
+
+@dataclass
 class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
@@ -187,7 +415,7 @@ class TrainerConfig:
     # parallelism configs
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     fsdp_config: FSDP2Config = field(default_factory=FSDP2Config)
-    plan_overhead: Optional[Target[Any]] = None
+    plan_overrides: List[PlanOverride] = field(default_factory=list)
     mixed_precision: MixedPrecisionConfig = field(
         default_factory=MixedPrecisionConfig
     )
