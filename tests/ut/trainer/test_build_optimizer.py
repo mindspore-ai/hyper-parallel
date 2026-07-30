@@ -21,6 +21,10 @@ from torch import nn
 from torch.optim import Optimizer
 
 from hyper_models.components.optim import AdamW
+from hyper_models.trainer.config import Target
+
+
+OPTIMIZER_TARGET = "hyper_models.components.optim.optimizer.optimizer.AdamW"
 
 
 class _MixedModel(nn.Module):
@@ -37,11 +41,15 @@ class TestAdamWTarget(unittest.TestCase):
     def test_returns_single_optimizer_with_decay_groups(self):
         model = _MixedModel()
 
-        optimizer = AdamW(
-            model=model,
-            device_mesh=object(),
+        target = Target(
+            AdamW,
+            target_path=OPTIMIZER_TARGET,
             lr=1e-3,
             weight_decay=0.07,
+        )
+        optimizer = target.build(
+            model=model,
+            device_mesh=object(),
         )
 
         self.assertIsInstance(optimizer, Optimizer)

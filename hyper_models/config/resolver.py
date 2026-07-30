@@ -185,8 +185,6 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
 
     if annotation in (Any, object):
         return value
-    if annotation is inspect.Signature.empty:
-        raise _fail(path, "target parameter has no type annotation")
     if isinstance(annotation, dataclasses.InitVar):
         return coerce_value(value, annotation.type, path=path)
     if value is None:
@@ -220,9 +218,6 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
 
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:
     """Resolve one value against an Optional or general union."""
-    if node is None:
-        return _coerce_none(annotation, path=path)
-
     for member in get_args(annotation):
         if member is type(None):
             continue
@@ -262,9 +257,9 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
         raise _fail(path, f"could not resolve configuration type annotations: {exc}") from exc
 
     resolved = {
-        name: resolve_component(
+        name: coerce_value(
             value,
-            expected_type=hints[name],
+            hints[name],
             path=f"{path}.{name}",
         )
         for name, value in node.items()
@@ -318,11 +313,7 @@ def _normalize_target_args(
         if (
             name in normalized
             or parameter.default is inspect.Signature.empty
-            or parameter.kind in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.VAR_POSITIONAL,
-                inspect.Parameter.VAR_KEYWORD,
-            )
+            or parameter.kind is inspect.Parameter.POSITIONAL_ONLY
         ):
             continue
         normalized[name] = parameter.default
@@ -385,7 +376,6 @@ def resolve_component(node: object, *, expected_type: object, path: str) -> obje
 
 def resolve_root(raw: object) -> TrainerConfig:
     """Resolve YAML root fields and construct ``TrainerConfig``."""
-
     if not isinstance(raw, Mapping):
         raise _fail("$", "YAML root must be a mapping")
 
