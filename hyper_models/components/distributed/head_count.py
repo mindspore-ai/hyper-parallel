@@ -27,8 +27,8 @@ forward sees local tensors in the current mode:
   every head-sharded module is rewritten;
 - validate: boundary modules run DTensor dispatch on the GLOBAL logical
   shape (a local count would break the reshape), so they are never
-  rewritten; local-region modules (``local_compute_fn`` / EP injection
-  intent / ``use_local_map``) unwrap to local inside the region in both
+  rewritten; local-region modules (``local_compute_fn`` /
+  ``region_dispatch=False``) unwrap to local inside the region in both
   modes, so they are rewritten in validate too.
 
 The config object is never touched (``head_dim`` / RoPE derivations keep

@@ -359,6 +359,48 @@ class TinyBatchedMoEForCausalLM(TinyLlamaForCausalLM):
 # fixtures
 # ────────────────────────────────────────────────────────────────────────────
 
+def _meta_mesh(shape, names):
+    """仅元数据的 mesh（planner/preflight 测试不需要真实进程组，但 DeviceMesh
+    构造需要默认 PG 存在——与 make_mesh 的 _ensure_pg 同理）。"""
+    _ensure_pg()
+    n = 1
+    for s in shape:
+        n *= s
+    return init_device_mesh("cpu", tuple(shape), mesh_dim_names=tuple(names),
+                            rank_list=tuple(range(n)), init_backend=False)
+
+
+def cp_sdpa_hf_injection(match="*.self_attn"):
+    """显式 CP 注入（改造后无启发式自动分派）：HF 风格 attention → "sdpa_hf"。
+
+    返回 plan_overrides 片段（{match: spec}），直接并入 ShardingPlanner 的
+    plan_overrides dict。"""
+    from hyper_models.components.distributed.sharding_config import (
+        ModuleShardingSpec,
+    )
+    return {match: ModuleShardingSpec(inner_target="self",
+                                        inner_wrapper="sdpa_hf",
+                                        region_dispatch=False)}
+
+
+def ep_hf_native_injection(match="*.mlp"):
+    """显式 EP 注入：仓内默认 TP-extend-EP compute 的工厂 Target（内嵌
+    default softmax top-k 路由；其他路由语义写自己的工厂）。
+
+    返回 plan_overrides 片段（{match: spec}）。"""
+    from hyper_models.components.distributed.ep_compute import (
+        hf_native_ep_compute_fn,
+    )
+    from hyper_models.components.distributed.sharding_config import (
+        ModuleShardingSpec,
+    )
+    from hyper_models.trainer.config import Target
+    return {match: ModuleShardingSpec(
+        local_compute_fn=Target(
+            hf_native_ep_compute_fn,
+            target_path="hyper_models.components.distributed."
+                        "ep_compute.hf_native_ep_compute_fn"), region_dispatch=False)}
+
 @pytest.fixture
 def tiny_llama():
     """2 层手写 Llama 风格模型（FQN: model.layers.N.self_attn.q_proj ...）。"""
@@ -448,6 +490,16 @@ def _dist_worker(rank, world_size, port, target, args, err_queue):
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+def _attach_ep(model, mesh, ep_size, num_experts=4):
+    """模拟 §6.4.3 init_token_dispatcher：设置 expert_offset + ep_group。"""
+    ep_mesh = mesh["ep"]
+    ep_rank = ep_mesh.get_local_rank()
+    n_local = num_experts // ep_size
+    for layer in model.model.layers:
+        layer.mlp.experts.expert_offset = ep_rank * n_local
+        layer.mlp.ep_group = ep_mesh.get_group()
 
 
 def run_dist(world_size, target, args=()):

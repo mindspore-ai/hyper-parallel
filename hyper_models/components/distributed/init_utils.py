@@ -35,7 +35,7 @@ def get_global_rank_safe() -> int:
     return 0
 
 def get_local_rank_safe() -> int:
-    """Return dist.get_rank() if initialized, else 0."""
+    """Return dist.get_node_local_rank() if initialized, else 0."""
     if dist.is_initialized():
         return dist.get_node_local_rank()
     return 0

@@ -355,6 +355,160 @@ class TestPureDataclassResolution(unittest.TestCase):
         )
 
 
+class TestPlanOverridesResolution(unittest.TestCase):
+    """``plan_overrides``: plan override 条目的 YAML 传输形态（注入字段 +
+    契约 DSL + when 条件）。"""
+
+    def test_plan_overrides_defaults_to_empty(self):
+        config = resolve_root(_root())
+
+        self.assertEqual(config.plan_overrides, [])
+
+    def test_entries_resolve_str_and_target_forms(self):
+        config = resolve_root(_root(plan_overrides=[
+            {"match": "*.self_attn", "when": "cp", "inner_wrapper": "sdpa_hf"},
+            {
+                "match": "*.mlp",
+                "when": "ep",
+                "local_compute_fn": {
+                    "_target_": "hyper_models.components.distributed."
+                                "ep_compute.hf_native_ep_compute_fn",
+                },
+            },
+        ]))
+
+        cp_entry, ep_entry = config.plan_overrides
+        self.assertEqual(cp_entry.match, "*.self_attn")
+        self.assertEqual(cp_entry.when, "cp")
+        self.assertEqual(cp_entry.inner_wrapper, "sdpa_hf")
+        self.assertIsNone(cp_entry.local_compute_fn)
+        self.assertIsInstance(ep_entry.local_compute_fn, Target)
+        self.assertTrue(
+            ep_entry.local_compute_fn._target_path.endswith(
+                "hf_native_ep_compute_fn"))
+
+    def test_inner_wrapper_target_form(self):
+        config = resolve_root(_root(plan_overrides=[
+            {
+                "match": "*.self_attn",
+                "inner_wrapper": {
+                    "_target_": "hyper_models.components.distributed."
+                                "cp_wrappers.sdpa_hf_cp_wrapper",
+                },
+            },
+        ]))
+
+        entry = config.plan_overrides[0]
+        self.assertIsInstance(entry.inner_wrapper, Target)
+        self.assertTrue(
+            entry.inner_wrapper._target_path.endswith("sdpa_hf_cp_wrapper"))
+
+    def test_region_dispatch_flag(self):
+        config = resolve_root(_root(plan_overrides=[
+            {"match": "*.mlp", "region_dispatch": False},
+        ]))
+
+        self.assertTrue(config.plan_overrides[0].region_dispatch is False)
+
+    def test_contract_fields_resolve_as_raw(self):
+        """契约字段按 Any 透传（DSL 解析在 to_override 脱糖时）。"""
+        config = resolve_root(_root(plan_overrides=[
+            {"match": "*.mlp",
+             "params": {"weight": {"tp": "shard(0)"}},
+             "in_src": "auto", "out_dst": "none"},
+        ]))
+
+        entry = config.plan_overrides[0]
+        self.assertEqual(entry.params, {"weight": {"tp": "shard(0)"}})
+        self.assertEqual(entry.in_src, "auto")
+        self.assertEqual(entry.out_dst, "none")
+
+    def test_when_invalid_value_rejected(self):
+        with self.assertRaisesRegex(ConfigResolutionError, "when"):
+            resolve_root(_root(plan_overrides=[
+                {"match": "*.mlp", "when": "context_parallel"},
+            ]))
+
+    def test_entry_missing_match_rejected(self):
+        with self.assertRaisesRegex(ConfigResolutionError, "match"):
+            resolve_root(_root(plan_overrides=[{"inner_wrapper": "sdpa_hf"}]))
+
+    def test_entry_unknown_field_rejected(self):
+        with self.assertRaisesRegex(ConfigResolutionError, "unknown"):
+            resolve_root(_root(plan_overrides=[
+                {"match": "*.mlp", "compute_fn": "not_a_field"},
+            ]))
+
+
+class TestPlanOverrideDesugar(unittest.TestCase):
+    """PlanOverride.to_override / entries_to_plan_overrides 脱糖语义。"""
+
+    def _entry(self, **kwargs):
+        from hyper_models.trainer.config import PlanOverride
+        return PlanOverride(match=kwargs.pop("match", "*.mlp"), **kwargs)
+
+    def test_placement_dsl_parsed(self):
+        from hyper_parallel.core.dtensor.placement_types import Shard
+        match, spec = self._entry(
+            params={"weight": {"tp": "shard(0)"}}).to_override()
+        self.assertEqual(match, "*.mlp")
+        self.assertEqual(spec.params["weight"]["tp"], Shard(0))
+
+    def test_out_scalar_shorthand_parsed(self):
+        """out_src 标量简写 {axis: str} → NamedPlacement（output 名归一化
+        交给 planner 的 _normalize_out_fields）。"""
+        _, spec = self._entry(
+            out_src={"tp": "partial"}).to_override()
+        self.assertIn("tp", spec.out_src)
+
+    def test_sentinel_passes_through(self):
+        _, spec = self._entry(in_src="auto", out_dst="none").to_override()
+        self.assertEqual(spec.in_src, "auto")
+        self.assertEqual(spec.out_dst, "none")
+
+    def test_bad_sentinel_rejected(self):
+        with self.assertRaisesRegex(ValueError, "auto"):
+            self._entry(in_src="inherited").to_override()
+
+    def test_bad_placement_dsl_rejected(self):
+        with self.assertRaisesRegex(ValueError, "shard"):
+            self._entry(params={"weight": {"tp": "shared(0)"}}).to_override()
+
+    def test_when_filter_skips_inactive(self):
+        from hyper_models.trainer.config import entries_to_plan_overrides
+        entries = [self._entry(when="cp", inner_wrapper="sdpa_hf")]
+        # cp_size=1 → 跳过（声明式门控，entry 不生效）
+        self.assertEqual(
+            entries_to_plan_overrides(entries, cp_size=1), {})
+        # cp_size=2 → 生效
+        active = entries_to_plan_overrides(entries, cp_size=2)
+        self.assertEqual(active["*.mlp"].inner_wrapper, "sdpa_hf")
+
+    def test_when_filter_ep(self):
+        from hyper_models.trainer.config import entries_to_plan_overrides
+        entries = [self._entry(when="ep", region_dispatch=False)]
+        self.assertEqual(entries_to_plan_overrides(entries, ep_size=1), {})
+        self.assertTrue(entries_to_plan_overrides(
+            entries, ep_size=2)["*.mlp"].region_dispatch is False)
+
+    def test_when_invalid_programmatic_rejected(self):
+        """绕过 resolver 直接构造（无 Literal 校验）→ 脱糖时 fail-fast。"""
+        from hyper_models.trainer.config import entries_to_plan_overrides
+        entries = [self._entry(when="context_parallel")]
+        with self.assertRaisesRegex(ValueError, "when"):
+            entries_to_plan_overrides(entries, cp_size=2)
+
+    def test_same_match_entries_merge(self):
+        from hyper_models.trainer.config import entries_to_plan_overrides
+        merged = entries_to_plan_overrides([
+            self._entry(inner_target="self"),
+            self._entry(inner_wrapper="sdpa_hf"),
+        ])
+        spec = merged["*.mlp"]
+        self.assertEqual(spec.inner_target, "self")
+        self.assertEqual(spec.inner_wrapper, "sdpa_hf")
+
+
 class TestTypedOverrides(unittest.TestCase):
     """Dotted CLI overrides update selected target kwargs and dataclass fields."""
 

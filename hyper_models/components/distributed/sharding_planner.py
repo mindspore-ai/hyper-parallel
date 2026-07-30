@@ -34,21 +34,25 @@ Registries:
 """
 
 import copy
+import fnmatch
+import inspect
 import logging
 import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
-from hyper_models.components.distributed.ep_utils import MOE_ROUTER_ADAPTERS
 from hyper_models.components.distributed.param_role import (
     ParameterClassifier,
     ParamRole,
     _match_any,
 )
+from hyper_models.components.distributed.function_module import FunctionModule
 from hyper_models.components.distributed.sharding_config import (
+    DP,
     EP,
     TP,
+    MeshAxisName,
     ModuleShardingSpec,
     NamedPlacement,
     ShardingPlan,
@@ -170,21 +174,60 @@ def _moe_expert_tp_placement(param_path: str, ndim: int,
 class ShardingPlanner:
     """Automatically derive a ShardingPlan from any HF-style model (05 §3.6.6).
 
-    ``plan_overrides``: {module_fqn: ModuleShardingSpec} — hand-written user
-    specs, which wholesale replace/insert entries before the Phase 5 chain
-    propagation (05 §3.6.7). Override specs still participate in adjacent
-    contract validation and terminal marking, which is safer than patching
-    after plan() returns.
+    ``plan_overrides``: {module_fqn | fqn_glob: ModuleShardingSpec} — the
+    SINGLE injection/override interface (05 §3.6.7 + the unification rework):
+
+    - **merge mode** (key hits a planner-derived boundary): empty contract
+      fields (``params``/``in_src``/``in_dst``/``out_src``/``out_dst``/
+      ``out_names``) INHERIT the derived values, non-empty ones replace
+      (field granularity); the string sentinels ``"auto"`` (explicit
+      inherit — self-documenting "derive per template") and ``"none"``
+      (explicit clear) are resolved at merge time and never reach the plan
+      output; the injection fields (``local_compute_fn`` /
+      ``inner_target`` / ``inner_wrapper`` non-None, ``region_dispatch=False``)
+      always win; internal flags (``_ep_size`` / ``_ep_stack`` /
+      ``_needs_cp_attn``) always inherit. This is how
+      CP/EP compute injection is declared — no need to re-declare contracts;
+    - **insert mode** (exact key misses every derived boundary): the spec is
+      inserted as-is and must be fully self-declared — an override with
+      empty params AND empty contracts fails fast ("no template matched");
+    - **glob keys** (containing ``*``/``?``/``[``): merge-applied to every
+      matching boundary; a pattern hitting nothing warns loudly. Glob keys
+      never insert new boundaries.
+
+    The YAML transport (``hyper_models.trainer.config.PlanOverride``) is
+    converted to this dict by ``entries_to_plan_overrides()`` on the trainer
+    side BEFORE the
+    planner is constructed — the planner itself has exactly one override
+    interface.
+
+    ``derive=False`` turns the planner into a pure declaration assembler:
+    template derivation (Phases 2-4) is skipped and the plan contains ONLY
+    the ``plan_overrides`` specs — every key is insert mode and must be
+    fully self-declared. Use it for subtrees where automatic derivation is
+    semantically wrong, e.g. the multimodal encoder_dp ViT bridge (each
+    rank encodes a different image shard, so any derived TP collective
+    inside the ViT would silently mix samples). This replaces the error-
+    prone post-hoc pruning idiom ``plan.modules = {"": plan.modules[""]}``.
     """
 
     def __init__(
         self,
         plan_overrides: Optional[Dict[str, ModuleShardingSpec]] = None,
+        *,
+        derive: bool = True,
     ):
         self._classifier = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
         self._templates = TEMPLATES
         self._special_handler_patterns = dict(_SPECIAL_HANDLER_PATTERNS)
         self._plan_overrides = dict(plan_overrides or {})
+        # derive=False: skip template derivation entirely — the plan contains
+        # ONLY the plan_overrides specs (every key is insert mode and must be
+        # fully self-declared). This replaces post-hoc pruning of
+        # ``plan.modules`` (e.g. the multimodal encoder_dp ViT bridge, where
+        # each rank encodes different images and ANY derived TP collective
+        # inside the ViT subtree would be a math error).
+        self._derive = derive
 
     # ── Main entry point ────────────────────────────────────────────────
 
@@ -198,6 +241,7 @@ class ShardingPlanner:
         ep_size: int = 1,
         sequence_parallel: bool = True,
         loss_parallel: bool = False,
+        explain: bool = False,
     ) -> ShardingPlan:
         """Derive a ShardingPlan from *model* and *mesh* (6-phase pipeline).
 
@@ -230,16 +274,24 @@ class ShardingPlanner:
                 sharded across TP (Shard(1) on the ``tp`` axis of activations).
             loss_parallel: When ``True``, lm_head output stays Shard(-1);
                 otherwise gathered to Replicate (cross-entropy compatibility).
+            explain: When ``True``, log the plan introspection report
+                (:meth:`ShardingPlan.explain`) at INFO level after planning —
+                per-boundary param sharding, compiled communication plans,
+                and injection resolutions. The same report is available
+                standalone via ``plan.explain(fqn=None)``.
 
         Returns:
             :class:`ShardingPlan`: module FQN → :class:`ModuleShardingSpec`.
 
         Raises:
             ValueError: If *tp_size* / *cp_size* / *ep_size* do not match the
-                corresponding mesh dimensions (fail-first), or if model-level
-                constraints are violated (head divisibility, expert count, etc.).
+                corresponding mesh dimensions (fail-first), if model-level
+                constraints are violated (head divisibility, expert count, etc.),
+                or if any ``plan_overrides`` spec declares a DP placement
+                (05 §3.1.1 坐标系约定: plan 恒为单个 dp 切片).
         """
         arch = self._get_architecture(model)
+        self._check_overrides_no_dp()   # fail-first：plan 坐标系 = 单 dp 切片
         mesh_dim_names = self._build_mesh_dim_names(mesh, tp_size, cp_size, ep_size)
         # D-10 TP-extend-EP (05 §6.4.8): ep_size is the extended EP group
         # size (the a2a communication domain, extended from the TP group to
@@ -263,8 +315,13 @@ class ShardingPlanner:
             sequence_parallel=sequence_parallel,
             loss_parallel=loss_parallel,
         )
-        inferred_templates: Dict[str, ShardingTemplate] = {}
-        for boundary_fqn, group in boundary_groups.items():
+        if not self._derive:
+            logger.info(
+                "derive=False: template derivation skipped — the plan will "
+                "contain only plan_overrides specs (all insert mode, fully "
+                "self-declared)")
+        for boundary_fqn, group in (boundary_groups.items() if self._derive
+                                    else ()):
             boundary_type = self._infer_boundary_type(boundary_fqn, group)
             template = self._templates.get(boundary_type)
             if template is None:
@@ -284,12 +341,13 @@ class ShardingPlanner:
                         ep_extend=ep_extend, mesh=mesh, model=model,
                         param_ndims=param_ndims)
                 plan.modules[boundary_fqn] = spec
-                inferred_templates[boundary_fqn] = template
 
-        # Phase 4.5: merge user plan_overrides (05 §3.6.7; must run before
-        # the D-14 checks — nested overrides are legal since D-14, subject to
-        # the param-uniqueness invariant)
-        self._merge_plan_overrides(plan, model, inferred_templates)
+        # Phase 4.5: unified override pass — merge mode (unset fields inherit
+        # the derived spec) / insert mode (fully self-declared only) / glob.
+        self._merge_plan_overrides(plan, model)
+        # plan 输出规范化：契约字段 None（未声明）→ {}——"不写继承，写了照办"
+        # 只存在于输入侧；plan 内的 spec 恒为具体值，下游消费者零分支
+        self._normalize_contract_fields(plan)
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
         # uniqueness (the only nesting check that remains)
@@ -302,8 +360,15 @@ class ShardingPlanner:
         # Phase 6: special parameter handling
         plan.special_handlers = self._collect_special_handlers(param_roles)
 
+        # DX guard: FunctionModule instances not covered by any spec run
+        # without any boundary communication — warn instead of silently passing
+        self._warn_uncovered_function_modules(model, plan)
+
         # tied-weight detection (embed <-> lm_head sharing storage)
         plan.tied_pairs = self._detect_tied_pairs(model)
+
+        if explain:
+            logger.info("ShardingPlan explain:\n%s", plan.explain())
 
         return plan
 
@@ -396,6 +461,12 @@ class ShardingPlanner:
         """Filter tp/cp/ep with mesh.mesh_dim_names as the authoritative
         order; fall back to (tp,cp,ep) when undeclared; drop size=1 axes.
 
+        dp* axes are ALWAYS stripped (05 §3 坐标系约定): the plan's
+        coordinate system is a single dp slice — dp semantics live in the
+        data pipeline (data assignment) and FSDP (weight/grad domain),
+        never in placements.  Overrides declaring DP placements are
+        rejected fail-first by :meth:`_check_overrides_no_dp`.
+
         Raises :class:`ValueError` when *tp_size* / *cp_size* do not match the
         corresponding mesh dimension sizes (fail-first before any planning work).
         """
@@ -408,7 +479,49 @@ class ShardingPlanner:
             return tuple(n for n in mesh_names if n in dtensor_axes and n in active)
         return tuple(ax for ax in dtensor_axes if ax in active)
 
+    def _check_overrides_no_dp(self) -> None:
+        """Fail-first: plan_overrides must not declare DP placements.
+
+        The plan's coordinate system is a single dp slice (05 §3 坐标系约定):
+        dp placements never drive boundary communication, and parameter dp
+        layout is owned by FSDP *after* the plan — a DP key here would be
+        silently dropped at resolve time, so reject it with a teaching
+        message instead of letting the misreading happen.
+        """
+
+        def _declares_dp(node) -> bool:
+            return isinstance(node, dict) and any(
+                k == DP or _declares_dp(v) for k, v in node.items())
+
+        for fqn, spec in self._plan_overrides.items():
+            if not isinstance(spec, ModuleShardingSpec):
+                continue   # 错误类型由 _merge_plan_overrides 报 TypeError
+            for field in ("params", "in_src", "in_dst", "out_src", "out_dst"):
+                if _declares_dp(getattr(spec, field)):
+                    raise ValueError(
+                        f'plan_overrides["{fqn}"].{field}: 不允许声明 DP placement。'
+                        "plan 的坐标系是单个 dp 切片（tp/cp/ep，05 §3 坐标系约定）"
+                        "——dp 的数据切分由数据管道表达、参数/梯度切分由 FSDP "
+                        "表达；多模态 encoder_dp 等场景的 dp 语义见 vit_mesh + "
+                        "数据分配 + fully_shard，I/O 契约只需声明 tp/cp/ep。"
+                    )
+
     # ── Phase 1 ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _warn_uncovered_function_modules(model, plan) -> None:
+        """DX guard: a FunctionModule without a boundary spec gets NO
+        redistribution communication (it is invisible to the planner's
+        derivation) — surface it instead of silently passing."""
+        uncovered = [fqn for fqn, m in model.named_modules()
+                     if isinstance(m, FunctionModule) and fqn not in plan.modules]
+        if uncovered:
+            logger.warning(
+                "FunctionModule %s has no boundary spec — no communication "
+                "will be inserted around it. Declare one via "
+                "plan_overrides (params={}, region_dispatch=False).",
+                uncovered,
+            )
 
     def _classify_all_params(self, model, arch: str) -> Dict[str, ParamRole]:
         return self._classifier.classify(model, arch)
@@ -539,7 +652,9 @@ class ShardingPlanner:
         """Template + ParamRole → ModuleShardingSpec (05 §3.5 Template Mapping)."""
         has_tp = "tp" in mesh_dim_names
         has_ep = "ep" in mesh_dim_names
-        spec = ModuleShardingSpec()
+        # 推导 spec 直接落具体 dict（None 是 override 输入侧的"未声明"语义，
+        # 推导产物恒为具体值）
+        spec = ModuleShardingSpec(params={})
 
         # Step 1: fill spec.params per ParamRole
         for param_fqn, role in group:
@@ -588,7 +703,7 @@ class ShardingPlanner:
             spec.out_src = _multi_dim(tp=Partial(), cp=Shard(1), ep=Replicate())
 
         # Step 3: special flags
-        spec.use_local_map = template.use_local_map
+        spec.region_dispatch = template.region_dispatch
         if template.needs_cp_attn:
             spec._needs_cp_attn = True
 
@@ -807,19 +922,30 @@ class ShardingPlanner:
                 spec.params[stacked] = _multi_dim(
                     tp=None, cp=Replicate(), ep=template.moe_expert_placement)
                 spec._ep_stack[stacked] = sources
+            # HF-native forward is NOT EP-aware: clear the template's
+            # region_dispatch (back to None) so the module never silently
+            # runs its own forward on sharded experts — an explicit
+            # local_compute_fn injection is required (apply-time preflight
+            # fails fast).
+            spec.region_dispatch = None
         elif batched:
             # Batched layout: already 3D, just mark {EP: Shard(0)}
             for rel in batched:
                 spec.params[rel] = _multi_dim(
                     tp=None, cp=Replicate(), ep=template.moe_expert_placement)
-        else:
+            # Same as above: HF-native forward is NOT EP-aware.
+            spec.region_dispatch = None
+        # else: custom naming (w1/w2/w3) — pre-stacked 3D by the module
+        # author; the template's region_dispatch=False is KEPT: such modules
+        # are EP-aware by construction (their own forward carries the a2a).
+        # An explicit local_compute_fn still overrides when declared.
+
+        if not stacks and not batched:
             # Custom naming (w1/w2/w3): pre-stacked 3D, mark {EP: Shard(0)}
             for param_fqn in expert_params:
                 rel = param_fqn[len(boundary_fqn) + 1:]
                 spec.params[rel] = _multi_dim(
                     tp=None, cp=Replicate(), ep=template.moe_expert_placement)
-
-        spec._moe_router = arch if arch in MOE_ROUTER_ADAPTERS else "default"
 
         # D-10: change the MoE boundary contract to SP-in identity
         # (Megatron MoE never gathers anyway; all communication is
@@ -834,83 +960,321 @@ class ShardingPlanner:
         spec.out_dst = {"output": copy.deepcopy(out_layout)}
         spec._ep_size = ep_extend
 
-    # ── Phase 4.5: user spec overrides (05 §3.6.7) ──────────────────────
+    # ── Phase 4.5: unified override pass (05 §3.6.7 + unification rework) ──
 
-    def _merge_plan_overrides(
-        self, plan: ShardingPlan, model,
-        inferred_templates: Dict[str, ShardingTemplate],
-    ) -> None:
-        """Merge hand-written user specs (plan_overrides), executed before
-        Phase 5.
+    _GLOB_CHARS = ("*", "?", "[")
 
-        Semantics:
-        - fqn already matches a planner-generated spec → wholesale
-          replacement (the user spec is authoritative);
-        - fqn not matched (planner missed it / no template / module
-          without parameters) → insertion;
-        - the structural flags ``use_local_map`` / ``_needs_cp_attn`` are
-          backfilled from the inferred template (they are module structural
-          properties, not I/O contracts: a missing MoE all-to-all or CP
-          K/V all-gather causes numerical errors, so they are force-set
-          whenever template inference yields True; the user spec neither
-          needs to nor should be responsible for them);
-        - the CP customization entries ``inner_target`` / ``inner_wrapper``
-          are user fields (preserved via deep copy) and no flag is
-          rewritten — inner-wrap gating is derived by the applier's
-          ``_resolve_inner_wrapper`` resolution chain (05 §4.4.2);
-        - ``local_compute_fn`` is a user field (preserved via deep copy)
-          and no flag is rewritten — local-region gating is derived by the
-          applier's ``_resolve_local_compute_fn`` resolution chain
-          (05 §4.4.3);
-        - ``out_src``/``out_dst`` scalar shorthand is normalized here;
-        - ``_is_terminal`` is uniformly marked by Phase 5; any user-preset
-          value is overwritten;
-        - the user spec is deep-copied — plan() can be called repeatedly
-          and chain propagation mutates in_src in place, so the caller's
-          held object must not be polluted.
+    @classmethod
+    def _is_glob_key(cls, key: str) -> bool:
+        return any(c in key for c in cls._GLOB_CHARS)
 
-        Nesting (ancestor/descendant FQNs) is **allowed** since D-14 (05
-        §13): the outer boundary may declare I/O contracts and params of its
-        own/intermediate modules, inner boundaries keep theirs. The only
-        remaining nesting check is the param-uniqueness invariant
-        (``_check_param_uniqueness``, fail-fast on double sharding); each
-        module's declaration is fully self-contained (chain fill removed),
-        and correctness is covered by validate-mode per-module propagation
-        assertions + dual-mode numerical equivalence.
+    def _merge_plan_overrides(self, plan: ShardingPlan, model) -> None:
+        """Unified override pass, executed before Phase 5 and the D-14 checks.
+
+        Three modes:
+
+        - **merge** (key hits an existing boundary — derived or previously
+          inserted): UNSET contract fields (``None``: ``params`` /
+          ``in_src`` / ``in_dst`` / ``out_src`` / ``out_dst`` /
+          ``out_names``) INHERIT, set ones replace at field granularity —
+          **an explicit empty dict {} is a SET value** (explicit "no
+          sharding / no contract", 2026-08-05 "不写继承，写了照办"); the
+          sentinels ``"auto"``/``"none"`` mean inherit/clear explicitly;
+          injection fields
+          (``local_compute_fn`` / ``inner_target`` / ``inner_wrapper``
+          non-None, ``region_dispatch=False``) always win; internal flags
+          (``_ep_size`` / ``_ep_stack`` / ``_needs_cp_attn`` /
+          ``_is_terminal``) always inherit — they are
+          planner/applier-owned metadata, not user contracts. This is how
+          CP/EP compute injection is declared: an injection-fields-only
+          spec (``ModuleShardingSpec(local_compute_fn=...)``) inherits the
+          whole derived contract;
+        - **insert** (exact key misses every boundary): the spec is
+          deep-copied and inserted as-is; at least one contract field must
+          be declared (an explicit {} counts — the pure I/O-stitch
+          boundary) — an override with EVERYTHING unset fails fast
+          ("no template/boundary matched"). Sentinels are rejected (nothing
+          to inherit/clear). Nesting (ancestor/descendant
+          FQNs) is **allowed** since D-14 (05 §13), subject only to the
+          param-uniqueness invariant (``_check_param_uniqueness``);
+        - **glob keys** (containing ``*``/``?``/``[``): merge-applied to
+          every matching boundary (fnmatchcase, ``*`` spans dots); a
+          pattern hitting nothing warns loudly. Glob keys never insert.
+
+        Notes:
+        - exact keys must exist in the model's ``named_modules`` (typo
+          fail-fast; PP scenarios plan each single-part model separately);
+        - ``out_src``/``out_dst`` scalar shorthand is normalized;
+        - user spec objects are never mutated (merge reads them, insert
+          deep-copies them) — plan() can be called repeatedly.
         """
-        if not self._plan_overrides:
+        entries: List[Tuple[str, ModuleShardingSpec, str]] = [
+            (fqn, spec, "plan_overrides")
+            for fqn, spec in self._plan_overrides.items()
+        ]
+        if not entries:
             return
+
         module_names = {name for name, _ in model.named_modules()}
-        for fqn, user_spec in self._plan_overrides.items():
+        for key, user_spec, source in entries:
             if not isinstance(user_spec, ModuleShardingSpec):
                 raise TypeError(
-                    f"plan_overrides[{fqn!r}] must be a ModuleShardingSpec, "
+                    f"{source}[{key!r}] must be a ModuleShardingSpec, "
                     f"got {type(user_spec).__name__}"
                 )
-            if fqn not in module_names:
+            self._validate_override_axes(key, user_spec, source, plan)
+            if not self._is_glob_key(key) and key not in module_names:
                 raise ValueError(
-                    f"plan_overrides FQN not found in the model's "
-                    f"named_modules: {fqn!r} (check spelling; in PP "
+                    f"{source} FQN not found in the model's "
+                    f"named_modules: {key!r} (check spelling; in PP "
                     f"scenarios plan each single-part model separately)"
                 )
-            spec = copy.deepcopy(user_spec)
-            template = inferred_templates.get(fqn)
-            if template is not None:
-                if template.use_local_map:
-                    # force-set when the template is True (guards against
-                    # numerical errors); modules the user explicitly set to
-                    # True (in-house data-dependent modules) are unaffected
-                    # by the template and are naturally preserved
-                    spec.use_local_map = True
-                if template.needs_cp_attn:
-                    spec._needs_cp_attn = True
-            # inner_target/inner_wrapper/local_compute_fn need no flag
-            # set: inner-wrap and local-region gating are derived by the
-            # applier's resolution chains (05 §4.4.2/§4.4.3)
-            _normalize_out_fields(spec)
-            action = "replace" if fqn in plan.modules else "insert"
-            logger.info("plan_overrides: %s the spec of module %s", action, fqn)
-            plan.modules[fqn] = spec
+
+        for key, user_spec, source in entries:
+            if self._is_glob_key(key):
+                hits = [fqn for fqn in plan.modules
+                        if fnmatch.fnmatchcase(fqn, key)]
+                if not hits:
+                    logger.warning(
+                        "%s match=%r hit no boundary spec — check the "
+                        "spelling (plan boundaries: %s)",
+                        source, key, sorted(plan.modules)[:8])
+                    continue
+                for fqn in hits:
+                    self._warn_dropped_params(
+                        source, key, fqn, plan.modules[fqn], user_spec)
+                    self._merge_into(plan.modules[fqn], user_spec)
+                    logger.info("%s: merge into %s (glob %r)",
+                                source, fqn, key)
+            elif key in plan.modules:
+                self._warn_dropped_params(
+                    source, key, key, plan.modules[key], user_spec)
+                self._merge_into(plan.modules[key], user_spec)
+                logger.info("%s: merge into the spec of module %s",
+                            source, key)
+            else:
+                self._insert_spec(plan, key, user_spec, source, model,
+                                  derive=self._derive)
+
+    _CONTRACT_FIELDS = ("params", "in_src", "in_dst",
+                        "out_src", "out_dst", "out_names")
+    # 契约字段在 plan_overrides 输入侧接受的字符串哨兵（仅在 merge 时解析，
+    # 绝不进入 plan 输出）：
+    #   "auto" —— 显式继承推导值（按模板推导；与缺省空值同义，自文档化）
+    #   "none" —— 显式清空（params/in_src/in_dst → {}，out_* → None）
+    _CONTRACT_SENTINELS = ("auto", "none")
+
+    @staticmethod
+    def _iter_named_placements(spec: ModuleShardingSpec):
+        """Yield (attr, name, named) for every concrete NamedPlacement in an
+        override spec (skips sentinel strings/None/empty; out_* scalar
+        shorthand yields the whole field as one NamedPlacement)."""
+        for attr in ("params", "in_src", "in_dst", "out_src", "out_dst"):
+            value = getattr(spec, attr)
+            if not value or isinstance(value, str):
+                continue
+            if not all(isinstance(v, dict) for v in value.values()):
+                yield attr, "output", value          # out_* 标量简写
+            else:
+                for name, named in value.items():
+                    yield attr, name, named
+
+    @classmethod
+    def _validate_override_axes(cls, key, user_spec, source, plan) -> None:
+        """Fail fast on typo'd placement axes / non-Placement values.
+
+        ``resolve_placements`` fills missing axes with Replicate() — so a
+        typo'd axis (``{"tp2": Shard(0)}``) would otherwise be silently
+        IGNORED. Allowed axes = the plan's mesh dims ∪ the canonical
+        ``MeshAxisName`` values (canonical-but-absent axes, e.g. CP
+        placements declared on a tp-only mesh, are tolerated — templates
+        declare all canonical dims and resolve_placements picks the mesh's
+        subset; "ep" is the virtual TP-extend-EP axis). Anything outside
+        both sets is a typo → fail fast. Placement values must already be
+        Placement objects (the YAML string DSL is parsed at desugar time).
+        """
+        from hyper_parallel.core.dtensor.placement_types import Placement
+
+        allowed = ({str(a) for a in plan.mesh_dim_names}
+                   | {axis.value for axis in MeshAxisName})
+        for attr, name, named in cls._iter_named_placements(user_spec):
+            for axis, placement in named.items():
+                if not isinstance(placement, Placement):
+                    raise TypeError(
+                        f"{source}[{key!r}] 契约字段 {attr}[{name!r}] 的轴 "
+                        f"{axis!r} 的值必须是 Placement 对象（Shard(N)/"
+                        f"Replicate()/Partial()；YAML 字符串 DSL 在脱糖时解析"
+                        f"为对象），got {type(placement).__name__} "
+                        f"{placement!r}")
+                # MeshAxisName 是 str 子类（hash/eq 与 plain str 一致），
+                # 直接用原值做成员判断——不能 str(axis)（枚举 __str__ 会
+                # 变成 "MeshAxisName.TP"）
+                if axis not in allowed:
+                    raise ValueError(
+                        f"{source}[{key!r}] 契约字段 {attr}[{name!r}] 使用了"
+                        f"未知轴 {axis!r} —— 合法轴 = mesh 轴 "
+                        f"{sorted(str(a) for a in plan.mesh_dim_names)} ∪ "
+                        f"规范轴 {sorted(axis.value for axis in MeshAxisName)}"
+                        f"。未知轴会被 resolve_placements 静默忽略，故 "
+                        f"fail-fast（疑似拼写错误）")
+
+    @classmethod
+    def _merge_contract_field(cls, derived: ModuleShardingSpec,
+                              user_spec: ModuleShardingSpec, attr: str) -> None:
+        """Merge one contract field: "不写继承，写了照办" (2026-08-05).
+
+        Precedence: ``None`` (unset) / ``"auto"`` → inherit derived;
+        ``"none"`` → explicit clear (a readable alias for the empty value);
+        a concrete dict — **including the empty dict {}** — replaces at field
+        granularity ({} = explicit "no sharding / no contract", the ViT
+        ``params={}`` pattern).
+        """
+        value = getattr(user_spec, attr)
+        if isinstance(value, str):
+            if value == "auto":
+                return                      # 显式继承（与缺省同义）
+            if value == "none":
+                setattr(derived, attr,
+                        {} if attr in ("params", "in_src", "in_dst") else None)
+                return                      # 显式清空
+            raise ValueError(
+                f"plan_overrides 契约字段 {attr} 的字符串值只接受哨兵 "
+                f"{cls._CONTRACT_SENTINELS}（'auto'=按模板推导继承，"
+                f"'none'=显式清空），got {value!r}")
+        if value is None:                   # 未声明 → 继承
+            return
+        setattr(derived, attr, copy.deepcopy(value))  # 含 {}：显式空（清空）
+
+    @staticmethod
+    def _warn_dropped_params(source, key, fqn, derived, user_spec) -> None:
+        """可见性防呆：merge 的 params 字段粒度替换会使未覆盖的参数失去推导
+        分片（保持复制）——可能是无意的笔误，WARNING 列出丢弃项。"""
+        user_params = user_spec.params
+        if (isinstance(user_params, dict) and user_params
+                and derived.params):
+            dropped = sorted(set(derived.params) - set(user_params))
+            if dropped:
+                logger.warning(
+                    "%s[%r] merge into %s: params 字段粒度替换使 %d 个参数失去"
+                    "推导分片，将保持复制：%s —— 若有误请把推导值一并写入"
+                    "（字段粒度替换，不逐 key 合并）；若有意去切分可忽略此警告"
+                    "（params={} 或 'none' 可显式清空全部）",
+                    source, key, fqn, len(dropped), dropped)
+
+    @staticmethod
+    def _merge_into(derived: ModuleShardingSpec,
+                    user_spec: ModuleShardingSpec) -> None:
+        """Merge one user spec into an existing boundary spec (in place).
+
+        Contract fields: None/"auto" → inherit, "none" → clear, concrete
+        dict (including {}) → replace (field granularity); injection fields
+        win when set; internal flags always inherit from *derived*.
+        """
+        for attr in ShardingPlanner._CONTRACT_FIELDS:
+            ShardingPlanner._merge_contract_field(derived, user_spec, attr)
+        for attr in ("local_compute_fn", "inner_target", "inner_wrapper",
+                     "inner_out_src", "region_dispatch"):
+            value = getattr(user_spec, attr)
+            if value is not None:
+                setattr(derived, attr, value)
+        _normalize_out_fields(derived)
+
+    @staticmethod
+    def _normalize_contract_fields(plan: ShardingPlan) -> None:
+        """plan 输出规范化：params/in_src/in_dst 的 None（未声明）→ {}。
+
+        "不写继承，写了照办"是输入侧语义；plan 内的 spec 恒为具体值，
+        applier / D-14 检查等下游消费者无需 None 分支。
+        """
+        for spec in plan.modules.values():
+            for attr in ("params", "in_src", "in_dst"):
+                if getattr(spec, attr) is None:
+                    setattr(spec, attr, {})
+
+    @staticmethod
+    def _suggest_insert_skeleton(model, fqn: str) -> str:
+        """Derive a draft contract skeleton from the module's forward
+        signature (input names) and direct parameters — turns "write a
+        contract from scratch" into "edit a draft". Best-effort: degrades
+        to a generic skeleton when the module/signature is unavailable."""
+        try:
+            module = dict(model.named_modules()).get(fqn)
+        except Exception:
+            module = None
+        in_names = ["hidden_states"]
+        param_names: List[str] = []
+        if module is not None:
+            try:
+                sig = inspect.signature(module.forward)
+                names = [
+                    p.name for p in sig.parameters.values()
+                    if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                  inspect.Parameter.KEYWORD_ONLY)
+                    and p.default is inspect.Parameter.empty  # 必填入参
+                ]
+                if names:
+                    in_names = names
+            except (TypeError, ValueError):
+                pass
+            param_names = [n for n, _ in module.named_parameters(recurse=False)]
+        axis = "tp"   # 草稿占位轴——按实际拓扑调整
+        lines = [f'  - match: "{fqn}"']
+        if param_names:
+            lines.append("    params:  # 逐参数选切分维（显式 {} = 本边界不切参数）")
+            lines.extend(f"      {n}: {{{axis}: \"shard(0)\"}}"
+                         for n in param_names)
+        else:
+            lines.append("    params: {}   # 无直接参数 / 纯 I/O 缝合边界")
+        in_entries = ", ".join(f'{n}: {{{axis}: "shard(1)"}}'
+                               for n in in_names)
+        lines.append(f"    in_src:  {{{in_entries}}}   # 入口现状 = 上游出口布局")
+        lines.append(f"    in_dst:  {{{in_entries}}}   # 与 in_src 不同则插入通信")
+        lines.append(f'    out_src: {{output: {{{axis}: "replicate"}}}}'
+                     "   # 多输出模块改成多键并补 out_names")
+        lines.append(f'    out_dst: {{output: {{{axis}: "replicate"}}}}')
+        return "\n".join(lines)
+
+    @staticmethod
+    def _insert_spec(plan: ShardingPlan, fqn: str,
+                     user_spec: ModuleShardingSpec, source: str,
+                     model=None, derive: bool = True) -> None:
+        """Insert a fully self-declared spec for a non-derived boundary."""
+        for attr in ShardingPlanner._CONTRACT_FIELDS:
+            value = getattr(user_spec, attr)
+            if isinstance(value, str):
+                reason = (
+                    "derive=False：模板推导已整体关闭，plan 里没有任何推导值——"
+                    if not derive else
+                    "insert（未命中任何推导边界）——")
+                raise ValueError(
+                    f"{source}[{fqn!r}] 契约字段 {attr}={value!r} 无意义："
+                    f"{reason}"
+                    "'auto'（继承推导）/'none'（清空继承值）哨兵只作用于 merge "
+                    "命中的推导边界，没有推导值就没有可继承/可清空的来源。"
+                    "请显式声明：具体 dict 给切分/契约，显式空 {} 表示本边界"
+                    "不切参数（参数保持复制）/无该项契约")
+        if all(getattr(user_spec, attr) is None for attr in
+               ("params", "in_src", "in_dst", "out_src", "out_dst")):
+            hint = ""
+            if model is not None:
+                hint = (
+                    "\n建议草稿（按模块 forward 签名/直接参数推导，placement "
+                    "为占位值，请按布局语义修正）:\n"
+                    + ShardingPlanner._suggest_insert_skeleton(model, fqn))
+            derive_note = (
+                "derive=False 已关闭模板推导——所有 override 都是 insert，"
+                "不存在可继承的推导值；" if not derive else "")
+            raise ValueError(
+                f"{source}[{fqn!r}] 未命中任何 planner 推导边界，且 params 与 "
+                "I/O 契约全部未声明——" + derive_note +
+                "空字段继承（merge）只对已推导边界生效；"
+                "插入新边界必须完整自声明契约（05 §3.6.7 / D-14；显式空 {} "
+                "也是合法声明，如 params={} 的纯 I/O 缝合边界），或检查 fqn 拼写"
+                + hint)
+        spec = copy.deepcopy(user_spec)
+        _normalize_out_fields(spec)
+        logger.info("%s: insert the spec of module %s", source, fqn)
+        plan.modules[fqn] = spec
 
     def _check_param_uniqueness(self, plan: ShardingPlan) -> None:
         """D-14 invariant 1 (05 §13.3): every parameter is sharded by exactly

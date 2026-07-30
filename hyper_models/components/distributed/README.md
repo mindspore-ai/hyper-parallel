@@ -39,7 +39,7 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应�
 
 - **attention（CP>1）**：out_src 为声明式——CP wrapper 出口按声明 `from_local`
   重包装（区域内 SDPA 对 K/V 做显式 all-gather，dispatch 无法派生该语义）。
-- **MoE（`use_local_map`）**：out_src 为声明式——all-to-all 的数据相关性使
+- **MoE（`region_dispatch=False`）**：out_src 为声明式——all-to-all 的数据相关性使
   placement 无法派生；in 契约仍由 boundary 正常校验。
 - 其余模块（embed/norm/mlp/lm_head）：out_src 由 DTensor dispatch 派生校验（核心校验）。
 
@@ -50,15 +50,16 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应�
 
 | 字段 | 签名 | 做什么 | 何时用 | 生效方式 |
 |---|---|---|---|---|
-| `use_local_map` | `bool` | **纯门控**：模块自身 forward 即数据相关逻辑 → 走 local-region 骨架（解析链末位来源） | 自研模块 forward 内含数据相关逻辑（如自带 a2a 的 EP-aware MoE） | 解析链环 3 |
-| `local_compute_fn` | `fn(module, *args, **kw) -> Tensor` | 替换骨架内的计算函数（骨架的边界缝合/双模式不变） | 自研 MoE 注入自定义 dispatch（自定义 router/expert 布局/DeepEP） | 解析链环 1，**不改写任何字段** |
-| `inner_target` | `str`（属性名/`"self"`） | **纯位置**：指定 inner attention 子模块（自动定位失败 fail-fast 时的指定入口） | 自研 attention 符合 (q,k,v) 或 HF 原语约定，但自动定位失败/有歧义 | target 链环 1，不改写任何字段 |
-| `inner_wrapper` | `str`（注册表名）或 `fn(target, cp_mesh) -> None` | **纯行为**：str 显式固定内置 CP wrapper（`"sdpa_qkv"/"sdpa_hf"/"flex_qkv"/"flex_hf"`，注册表 `CP_WRAPPER_REGISTRY` 开放注册）；callable 全自定义整体接管 | 启发式会猜错行为时 str 固定；内置四路覆盖不到（如内部直调 flash_attn_varlen）时 callable | wrapper 链环 1-2，不改写任何字段 |
+| `region_dispatch` | `bool`（注入时必填） | **区域计算的 validate 执行模式**：`False`=不可 dispatch（自身 forward 含数据依赖逻辑，或注入物含通信/自定义 kernel）→ 骨架/适配器黑盒；`True`=注入物纯标准算子可 dispatch → validate 穿透 + out_src 真校验 | 自研 EP-aware MoE 传 `False`；融合算子注入传 `True` | 解析链环 2 / 适配器分支 |
+| `local_compute_fn` | `@local_compute` 工厂 `fn(mesh, tp_mesh, cp_mesh, ep_mesh, [module], <配置键...>) -> compute_fn`（compute_fn 为 `fn(module, *args, **kw) -> Tensor`） | 替换骨架内的计算函数（骨架的边界缝合/双模式不变）；**唯一形态 = 区域计算工厂**，apply 期 build 一次，mesh 家族必选声明、框架填充、用不用随你 | 自研 MoE 注入自定义 dispatch（自定义 router/expert 布局/DeepEP） | 解析链环 1，**不改写任何字段** |
+| `inner_target` | `str`（属性名/`"self"`） | **纯位置**：指定被包装目标（`"self"`=边界模块自身/子模块属性名，拼错 fail-fast）；**与 `inner_wrapper` 成对必填**（自动定位启发式已删除） | 用 `inner_wrapper` 时必填——包装自身写 `"self"`，包装子模块写属性名 | target 链环 1，不改写任何字段 |
+| `inner_wrapper` | `str`（注册表名）或 callable/Target | **纯行为**：str 显式固定仓内 CP 参考 wrapper（`"sdpa_qkv"/"sdpa_hf"/"flex_qkv"/"flex_hf"`，注册表 `INNER_WRAPPER_REGISTRY` 开放注册）；callable/Target 自定义（原地替换 target.forward，织入/拦截姿态） | 仓内四路满足时 str 固定；覆盖不到（如内部直调 flash_attn_varlen）时 callable | wrapper 链环 1-2，不改写任何字段 |
 
-> **内置 wrapper 说明**：EP 侧内置 `_hf_native_ep_compute`（planner 识别 HF 原生
-> MoE 且 ep_size>1 时经 `_ep_size>0` 意图自动注入，local 链环 2）；CP 侧内置
-> 注册表四路（K/V all-gather + D-04 causal 修正 + 双模式容错，缺省按启发式
-> 2×2 分派，结果见 apply 日志与 `spec._resolved_inner_wrapper`，可用 str 固定）。
+> **仓内参考实现说明**：EP 侧仓内参考 `_hf_native_ep_compute`（planner 识别 HF 原生
+> MoE 且 ep_size>1 时经 `_ep_size>0` 意图自动注入，local 链环 2）；CP 侧仓内
+> 注册表四路（K/V all-gather + D-04 causal 修正 + 双模式容错），**须显式声明**
+> `inner_wrapper` + `inner_target`（无启发式分派），应用结果见 apply 日志与
+> `spec._resolved_inner_wrapper` / `spec._resolved_inner_target` 回写。
 > 门控均为**派生语义**：`_resolve_local_compute_fn` / `_resolve_inner_wrapper`
 > 解析非 None 即注入——声明互不嵌套（05 §4.4.2/§4.4.3/§8.6）。
 
@@ -74,14 +75,14 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应�
 | D-06 | MLP/MoE 的 CP 维全程 Shard(1)（pointwise，TP×CP 布局一致性） |
 | D-07 | lm_head 的 CP 维 Shard(1)（R8：boundary CP 维恒 identity；loss 在本地 chunk 计算） |
 | D-08 | MOE_EXPERT 的 TP placement 按参数 ndim 感知（3D [E,out,in]：colwise=Shard(1)、rowwise=Shard(2)） |
-| D-09 | HF 原生 MoE EP 直通（05 §6.4.7）：planner 识别 per-expert/batched 布局并生成 EP 元数据（`_ep_stack`/`_moe_router`/`_ep_size`），Phase A 前置 `_stack_moe_experts` 堆叠；`_hf_native_ep_compute` 经 local 链环 2 注入；a2a 按后端分派（NCCL/HCCL 不等长 `all_to_all` 零填充；gloo pad-to-max `all_to_all_single`） |
+| D-09 | HF 原生 MoE EP 直通（05 §6.4.7）：planner 识别 per-expert/batched 布局并生成 EP 元数据（`_ep_stack`/`_ep_size`），Phase A 前置 `_stack_moe_experts` 堆叠；`_hf_native_ep_compute` 经 local 链环 2 注入；a2a 按后端分派（NCCL/HCCL 不等长 `all_to_all` 零填充；gloo pad-to-max `all_to_all_single`） |
 | D-10 | TP-extend-EP（05 §6.4.8）：`ep_size` 即扩展 EP 组大小（无单独 etp 配置）；全 dense 区域重分区为派生 expert mesh `(edp, ep)`（EP 组 = flatten 连续 ep_size 个 rank，先跨完 TP 组再向 dp/cp 扩展）；expert 权重仅 `{EP: Shard(0)}`（每 rank 持完整 expert，无第二轴）；通信流与 Megatron `MoEAlltoAllTokenDispatcher` 同构，无 all_gather/reduce_scatter |
 | D-11 | fused batched expert 布局（HF 2025 重构后：`gate_up_proj [E,2I,H]` + `down_proj [E,H,I]`）天生 stacked 无需堆叠，直接标 `{EP: Shard(0)}`，计算侧 chunk 出 gate/up |
-| D-12 | inner-wrap 双解析链（`_resolve_inner_target`/`_resolve_inner_wrapper`）：target 定位 fail-fast + `CP_WRAPPER_REGISTRY` 注册表（str 固定/启发式分派/发火检测/日志与 `_resolved_inner_wrapper` 回写），门控派生不改写标记 |
-| D-13 | local-region compute_fn 单一解析链（`_resolve_local_compute_fn`）：`local_compute_fn` > EP 注入意图 > `use_local_map` 纯门控；骨架门控为解析结果的派生（非存储 bool），声明互不嵌套 |
+| D-12 | inner-wrap 双解析链（`_resolve_inner_target`/`_resolve_inner_wrapper`）：target 纯显式解析（`inner_target` 与 `inner_wrapper` 成对必填，自动定位启发式已删除）+ `INNER_WRAPPER_REGISTRY` 注册表（str 固定/发火检测/日志与 `_resolved_inner_wrapper`/`_resolved_inner_target` 回写），门控派生不改写标记 |
+| D-13 | local-region compute_fn 单一解析链（`_resolve_local_compute_fn`）：`local_compute_fn` > `region_dispatch=False` 门控（模块自身 forward）；骨架门控为解析结果的派生（非存储 bool），声明互不嵌套 |
 | D-14 | DeepSeek MLA 支持（v2/v3）：新增 `ParamRole.REPLICATED`（全维 Replicate，仅 `ARCH_OVERRIDES` 指派）——q_a/kv_a 下投影全复制、q_b/kv_b 上投影按 head 维 COLWISE，MLA attention 与标准 attention 模板同构（已用 transformers 仓真实 DeepseekV2/V3 模型验证 SKIP=0、attention 边界带 `cp_attn`） |
 | D-15 | Phase 5 链式契约比较由 `PlacementMismatchError` 降级为 `logger.warning`：该比较是 placement 值相等、无 shape 感知，边上 reshape/transpose 的合法场景（如 `[B,S,H]` Shard(1) fold 成 `[B*S,H]` Shard(0)）必然不等，报错会误杀合法配置；声明正确性由 validate 模式（DTensor dispatch + 数值对拍）兜底。填充缺省 in_src 与 `_is_terminal` 标记不变 |
-| D-16 | plan_overrides 嵌套 spec fail-fast（`_check_no_nested_overrides`）：override fqn 不得是派生边界（或另一 override）的祖先/后代，命中即 ValueError——边界假设扁平链（Phase 5 的 out_dst→in_src 参照只在模块出口成立，嵌套时内层实际看到祖先 in_dst），且同一参数会被切两次（production 静默错）；同树只支持同 fqn 替换 |
+| D-16 | plan_overrides 嵌套 spec 合法化（D-14，05 §13）：override fqn 可以是派生边界或另一 override 的祖先/后代（根 fqn `""` = 模型自身），常用于"外层纯 I/O 缝合 + 内层 validate 孤岛"；唯一保留的嵌套校验是参数唯一归属（`_check_param_uniqueness`：任一参数被 ≥2 个 spec 声明即 fail-fast，production 双重分片会静默错）。另有 `derive=False` 构造器开关：关闭模板推导，plan 只含 plan_overrides 显式声明的 spec（全部 insert 模式须完整自声明；`'auto'`/`'none'` 哨兵因无推导值可继承/清空而 fail-fast）——取代 plan.modules 后处理剪除（多模态 encoder_dp ViT 桥接） |
 | D-17 | TP 本地头数改写（`head_count.py`，AutoModel 同款语义）：兼容 HF 显式 `num_heads` reshape 写法——q/k/v colwise `Shard(0)` 的模块，凡前向看到 local tensor（production 全量 / validate 仅 local-region）即把缓存头数属性（`num_heads`/`num_attention_heads`/`n_heads` 等 Q 侧 7 名 + `num_key_value_heads`/`num_kv_heads`/`kv_heads` KV 侧 3 名，清单来自 transformers 全库调研）整除为本地值；不改 config/head_dim/num_key_value_groups，幂等（原值存 `_hp_full_head_counts`）；validate 普通 boundary 不改写（DTensor 全局逻辑形状下显式头数天然正确） |
 
 ## 目录
