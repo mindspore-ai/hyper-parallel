@@ -142,18 +142,19 @@ class Target(Generic[_T]):
             raise AttributeError(name) from exc
 
     def build(self, **runtime_kwargs: Any) -> _T:
-        """Invoke the target with configured and runtime arguments.
+        """Invoke the target with configured and applicable runtime arguments."""
+        signature = inspect.signature(self._target_)
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            runtime_kwargs = {
+                name: value
+                for name, value in runtime_kwargs.items()
+                if name in signature.parameters
+            }
 
-        Args:
-            **runtime_kwargs: Runtime-owned arguments. These values override
-                configured arguments with the same names.
-
-        Returns:
-            The direct result of the configured target callable.
-        """
-        kwargs = dict(self._kwargs)
-        kwargs.update(runtime_kwargs)
-        inspect.signature(self._target_).bind(**kwargs)
+        kwargs = {**self._kwargs, **runtime_kwargs}
         return self._target_(**kwargs)
 
     def replace(self, **changes: Any) -> "Target[_T]":

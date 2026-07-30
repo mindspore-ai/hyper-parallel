@@ -165,7 +165,10 @@ class TestTargetResolution(unittest.TestCase):
             path="$.component",
         )
 
-        self.assertEqual(target.build(), (1, {"extra": {"nested": True}}))
+        self.assertEqual(
+            target.build(runtime="injected"),
+            (1, {"extra": {"nested": True}, "runtime": "injected"}),
+        )
 
     def test_runtime_argument_is_optional_during_resolution_but_required_at_build(self):
         target = resolve_component(
@@ -176,7 +179,7 @@ class TestTargetResolution(unittest.TestCase):
 
         with self.assertRaisesRegex(
             TypeError,
-            r"missing a required (?:keyword-only )?argument: 'runtime'",
+            r"missing .*required keyword-only argument: 'runtime'",
         ):
             target.build()
         sentinel = object()
@@ -190,6 +193,15 @@ class TestTargetResolution(unittest.TestCase):
         )
 
         self.assertEqual(target.build(value=7), 7)
+
+    def test_unused_runtime_argument_is_ignored(self):
+        target = resolve_component(
+            {"_target_": f"{__name__}._strict_target", "count": 2},
+            expected_type=Target[Any],
+            path="$.component",
+        )
+
+        self.assertEqual(target.build(device_mesh=object()), 2)
 
     def test_to_dict_preserves_original_target_path(self):
         config = resolve_root(
