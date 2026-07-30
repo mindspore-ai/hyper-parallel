@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import (
 def cosine_with_warmup(
     *,
     optimizer: Optimizer,
-    total_steps: int,
+    train_steps: int,
     lr_warmup_steps: Optional[int] = None,
     lr_decay_steps: Optional[int] = None,
     init_lr: Optional[float] = None,
@@ -39,7 +39,7 @@ def cosine_with_warmup(
 
     Args:
         optimizer: Runtime optimizer injected by the trainer.
-        total_steps: Total number of optimizer steps.
+        train_steps: Total number of optimizer steps.
         lr_warmup_steps: Number of linear warmup steps.
         lr_decay_steps: Number of cosine decay steps. Defaults to the
             remaining steps after warmup.
@@ -53,15 +53,15 @@ def cosine_with_warmup(
     Raises:
         ValueError: If the configured step counts or warmup rates are invalid.
     """
-    if total_steps < 1:
-        raise ValueError("total_steps must be at least 1")
+    if train_steps < 1:
+        raise ValueError("train_steps must be at least 1")
 
     warmup_steps = 0 if lr_warmup_steps is None else lr_warmup_steps
     if warmup_steps < 0:
         raise ValueError("lr_warmup_steps must not be negative")
 
     decay_steps = (
-        total_steps - warmup_steps
+        train_steps - warmup_steps
         if lr_decay_steps is None
         else lr_decay_steps
     )
