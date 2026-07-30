@@ -14,8 +14,16 @@
 # ============================================================================
 """Learning-rate scheduler component configuration types — following design doc §9.6."""
 
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass, replace
+from typing import Optional
+
+from torch.optim import Optimizer as TorchOptimizer
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    LRScheduler as TorchLRScheduler,
+    SequentialLR,
+)
 
 from hyper_models.config.configurable import Configurable
 
@@ -76,7 +84,12 @@ class LRSchedulerConfig(LRScheduler.Config):
     use_checkpoint_opt_param_scheduler: bool = True
     override_opt_param_scheduler: bool = False
 
-    def build(self, optimizer, step_scheduler) -> list:
+    def build(
+        self,
+        optimizer: TorchOptimizer | list[TorchOptimizer],
+        *,
+        max_steps: int,
+    ) -> list[TorchLRScheduler]:
         """Build OptimizerParamScheduler list.
 
         Stub — returns a simple lambda scheduler that wraps torch.optim.lr_scheduler.
@@ -84,26 +97,48 @@ class LRSchedulerConfig(LRScheduler.Config):
 
         Args:
             optimizer: list[Optimizer] or single Optimizer.
-            step_scheduler: StepScheduler instance.
+            max_steps: Total number of optimizer updates in the training run.
 
         Returns:
             list of LR schedulers.
-        """
-        max_steps = step_scheduler.max_steps if step_scheduler.max_steps > 0 else 1000
-        lr_warmup_steps = self.lr_warmup_steps if self.lr_warmup_steps is not None else 0
-        lr_decay_steps = self.lr_decay_steps or (max_steps - lr_warmup_steps)
 
-        opt = optimizer if not isinstance(optimizer, list) else optimizer[0]
+        Raises:
+            ValueError: If no optimizer is provided or the configured step
+                counts are invalid.
+        """
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps <= 0:
+            raise ValueError(f"max_steps must be a positive integer, but got {max_steps!r}")
+
+        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+        if not optimizers:
+            raise ValueError("optimizer must contain at least one optimizer")
+
+        lr_warmup_steps = self.lr_warmup_steps if self.lr_warmup_steps is not None else 0
+        if lr_warmup_steps < 0 or lr_warmup_steps >= max_steps:
+            raise ValueError(
+                f"lr_warmup_steps must be in [0, max_steps), but got "
+                f"lr_warmup_steps={lr_warmup_steps}, max_steps={max_steps}"
+            )
+
+        lr_decay_steps = (
+            self.lr_decay_steps
+            if self.lr_decay_steps is not None
+            else max_steps - lr_warmup_steps
+        )
+        if lr_decay_steps <= 0:
+            raise ValueError(f"lr_decay_steps must be positive, but got {lr_decay_steps!r}")
+
+        opt = optimizers[0]
         init_lr = self.init_lr if self.init_lr is not None else opt.param_groups[0]["lr"]
         max_lr = self.max_lr if self.max_lr is not None else opt.param_groups[0]["lr"]
         min_lr = self.min_lr if self.min_lr is not None else 0.0
+        if lr_warmup_steps > 0 and max_lr <= 0:
+            raise ValueError(f"max_lr must be positive when warmup is enabled, but got {max_lr!r}")
 
         # Stub: use CosineAnnealingLR with linear warmup via LambdaLR
         schedulers = []
-        for single_opt in (optimizer if isinstance(optimizer, list) else [optimizer]):
+        for single_opt in optimizers:
             if lr_warmup_steps > 0:
-                from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
-
                 warmup_sch = LinearLR(
                     single_opt, start_factor=init_lr / max_lr,
                     end_factor=1.0, total_iters=lr_warmup_steps,
@@ -118,7 +153,6 @@ class LRSchedulerConfig(LRScheduler.Config):
                     milestones=[lr_warmup_steps],
                 ))
             else:
-                from torch.optim.lr_scheduler import CosineAnnealingLR
                 schedulers.append(CosineAnnealingLR(
                     single_opt, T_max=max(1, lr_decay_steps), eta_min=min_lr,
                 ))
@@ -133,13 +167,30 @@ class RatioBasedLRSchedulerConfig(LRSchedulerConfig):
     warmup_steps_ratio: float = 0.1
     min_lr_ratio: float = 0.0
 
-    def build(self, optimizer, step_scheduler):
-        self.lr_warmup_steps = int(step_scheduler.max_steps * self.warmup_steps_ratio) if step_scheduler.max_steps > 0 else 0
-        self.lr_decay_steps = step_scheduler.max_steps - self.lr_warmup_steps if step_scheduler.max_steps > 0 else 1000
-        opt = optimizer if not isinstance(optimizer, list) else optimizer[0]
-        max_lr = self.max_lr or opt.param_groups[0]["lr"]
-        self.min_lr = max_lr * self.min_lr_ratio
-        return super().build(optimizer, step_scheduler)
+    def build(
+        self,
+        optimizer: TorchOptimizer | list[TorchOptimizer],
+        *,
+        max_steps: int,
+    ) -> list[TorchLRScheduler]:
+        """Resolve ratio settings and build schedulers without mutating the config."""
+        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+        if not optimizers:
+            raise ValueError("optimizer must contain at least one optimizer")
+
+        lr_warmup_steps = int(max_steps * self.warmup_steps_ratio)
+        max_lr = self.max_lr if self.max_lr is not None else optimizers[0].param_groups[0]["lr"]
+        resolved_config = replace(
+            self,
+            lr_warmup_steps=lr_warmup_steps,
+            lr_decay_steps=max_steps - lr_warmup_steps,
+            min_lr=max_lr * self.min_lr_ratio,
+        )
+        return LRSchedulerConfig.build(
+            resolved_config,
+            optimizer,
+            max_steps=max_steps,
+        )
 
 
 __all__ = [

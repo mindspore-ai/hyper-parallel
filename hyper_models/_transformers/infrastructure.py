@@ -196,5 +196,8 @@ def apply_model_infrastructure(
             if b.dtype.is_floating_point:
                 torch.nn.init.zeros_(b)
         logger.info("Model moved from meta to %s", device)
+    elif device is not None:
+        model.to(device)
+        logger.info("Model moved to %s", device)
 
     return model

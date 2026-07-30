@@ -1,0 +1,85 @@
+# Trainer end-to-end demo.
+#
+# This example intentionally uses a generated tiny GPT-2 checkpoint and dummy
+# token IDs. It validates Trainer component construction and the optimizer
+# loop; it is not a meaningful language-model training workload.
+#
+# Run on four Ascend NPUs with:
+#   bash examples/training_demo/run.sh
+
+model:
+  _target_: hyper_models.trainer.config.ModelConfig
+  name: tiny_gpt2
+  weights_path: ./outputs/training_demo/tiny_model
+  tokenizer_path: ./outputs/training_demo/tiny_model
+
+training:
+  _target_: hyper_models.trainer.config.TrainingConfig
+  max_steps: 100
+  num_train_epochs: 1
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  seed: 42
+  enable_full_determinism: false
+
+accelerator:
+  _target_: hyper_models.trainer.config.AcceleratorConfig
+  dp_shard_size: 4
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+mixed_precision:
+  _target_: hyper_models.trainer.config.MixedPrecisionConfig
+  enabled: false
+
+gradient_checkpointing:
+  _target_: hyper_models.trainer.config.GradientCheckpointingConfig
+  activation_checkpoint: off
+
+dataset:
+  _target_: hyper_models.components.datasets.DatasetConfig
+  num_samples: 400
+  seq_len: 32
+  vocab_size: 1000
+
+dataloader:
+  _target_: hyper_models.trainer.config.DataLoaderConfig
+  shuffle: true
+  drop_last: true
+  use_background_prefetcher: false
+
+optimizer:
+  _target_: hyper_models.components.optim.AdamW.Config
+  lr: 1.0e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  foreach: false
+
+lr_scheduler:
+  _target_: hyper_models.components.optim.LRSchedulerConfig
+  lr_warmup_steps: 1
+  lr_decay_style: cosine
+  min_lr: 0.0
+
+loss:
+  _target_: hyper_models.components.loss.LossConfig
+  loss_aggregation: token_weighted
+
+checkpoint:
+  _target_: hyper_models.components.checkpoint.config.CheckpointingConfig
+  enabled: false
+  checkpoint_dir: ./outputs/training_demo/checkpoints
+
+debug:
+  _target_: hyper_models.trainer.config.DebugConfig
+  check_nan_inf: false
