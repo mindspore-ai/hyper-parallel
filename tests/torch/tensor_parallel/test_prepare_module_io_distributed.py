@@ -17,9 +17,9 @@
 Worker cases live in ``_test_prepare_module_io_distributed.py``. Port allocation
 (``sum(num_proc) <= 8`` per wave):
 
-  Wave 1 (``test_prepare_module_io_two_card_wave_one``): 10600–10603, four cases × 2 ranks
-  Wave 2 (``test_prepare_module_io_two_card_wave_two``): 10610–10613, four cases × 2 ranks
-  Wave 3 (``test_prepare_module_io_four_card_wave``):    10620–10621, two cases × 4 ranks
+  Wave 1 (``test_prepare_module_io_two_card_wave_one``): 10700–10703, four cases × 2 ranks
+  Wave 2 (``test_prepare_module_io_two_card_wave_two``): 10710–10713, four cases × 2 ranks
+  Wave 3 (``test_prepare_module_io_four_card_wave``):    10720–10721, two cases × 4 ranks
 
 Coverage: **eight** scenarios on **2** NPUs + **two** scenarios on **4** NPUs,
 including CPU / single-reference numerical checks (see worker docstrings).
@@ -52,10 +52,10 @@ def test_prepare_module_io_two_card_wave_one():
     Expectation: Run success.
     """
     _run_group(
-        ("test_prepare_module_input_identity_roundtrip_npu", 10600, 2),
-        ("test_prepare_module_output_replicate_to_shard_npu", 10601, 2),
-        ("test_prepare_module_input_output_chain_npu", 10602, 2),
-        ("test_prepare_module_input_then_colwise_linear_vs_cpu_npu", 10603, 2),
+        ("test_prepare_module_input_identity_roundtrip_npu", 10700, 2),
+        ("test_prepare_module_output_replicate_to_shard_npu", 10701, 2),
+        ("test_prepare_module_input_output_chain_npu", 10702, 2),
+        ("test_prepare_module_input_then_colwise_linear_vs_cpu_npu", 10703, 2),
     )
 
 
@@ -72,10 +72,10 @@ def test_prepare_module_io_two_card_wave_one_gloo():
     Expectation: Run success.
     """
     _run_group(
-        ("test_prepare_module_input_identity_roundtrip_npu", 10600, 2),
-        ("test_prepare_module_output_replicate_to_shard_npu", 10601, 2),
-        ("test_prepare_module_input_output_chain_npu", 10602, 2),
-        ("test_prepare_module_input_then_colwise_linear_vs_cpu_npu", 10603, 2),
+        ("test_prepare_module_input_identity_roundtrip_npu", 10700, 2),
+        ("test_prepare_module_output_replicate_to_shard_npu", 10701, 2),
+        ("test_prepare_module_input_output_chain_npu", 10702, 2),
+        ("test_prepare_module_input_then_colwise_linear_vs_cpu_npu", 10703, 2),
     )
 
 
@@ -92,10 +92,10 @@ def test_prepare_module_io_two_card_wave_two():
     Expectation: Run success.
     """
     _run_group(
-        ("test_prepare_module_output_after_rowwise_vs_cpu_npu", 10610, 2),
-        ("test_prepare_module_input_with_kwarg_scale_npu", 10611, 2),
-        ("test_prepare_module_input_none_placeholder_dual_arg_npu", 10612, 2),
-        ("test_prepare_module_output_tuple_with_none_slot_npu", 10613, 2),
+        ("test_prepare_module_output_after_rowwise_vs_cpu_npu", 10710, 2),
+        ("test_prepare_module_input_with_kwarg_scale_npu", 10711, 2),
+        ("test_prepare_module_input_none_placeholder_dual_arg_npu", 10712, 2),
+        ("test_prepare_module_output_tuple_with_none_slot_npu", 10713, 2),
     )
 
 
@@ -112,10 +112,10 @@ def test_prepare_module_io_two_card_wave_two_gloo():
     Expectation: Run success.
     """
     _run_group(
-        ("test_prepare_module_output_after_rowwise_vs_cpu_npu", 10610, 2),
-        ("test_prepare_module_input_with_kwarg_scale_npu", 10611, 2),
-        ("test_prepare_module_input_none_placeholder_dual_arg_npu", 10612, 2),
-        ("test_prepare_module_output_tuple_with_none_slot_npu", 10613, 2),
+        ("test_prepare_module_output_after_rowwise_vs_cpu_npu", 10710, 2),
+        ("test_prepare_module_input_with_kwarg_scale_npu", 10711, 2),
+        ("test_prepare_module_input_none_placeholder_dual_arg_npu", 10712, 2),
+        ("test_prepare_module_output_tuple_with_none_slot_npu", 10713, 2),
     )
 
 
@@ -130,8 +130,8 @@ def test_prepare_module_io_four_card_wave():
     Expectation: Run success.
     """
     _run_group(
-        ("test_prepare_module_input_colwise_pipeline_vs_cpu_npu", 10620, 4),
-        ("test_prepare_module_input_output_mlp_block_vs_cpu_npu", 10621, 4),
+        ("test_prepare_module_input_colwise_pipeline_vs_cpu_npu", 10720, 4),
+        ("test_prepare_module_input_output_mlp_block_vs_cpu_npu", 10721, 4),
     )
 
 
@@ -146,6 +146,6 @@ def test_prepare_module_io_four_card_wave_gloo():
     Expectation: Run success.
     """
     _run_group(
-        ("test_prepare_module_input_colwise_pipeline_vs_cpu_npu", 10620, 4),
-        ("test_prepare_module_input_output_mlp_block_vs_cpu_npu", 10621, 4),
+        ("test_prepare_module_input_colwise_pipeline_vs_cpu_npu", 10720, 4),
+        ("test_prepare_module_input_output_mlp_block_vs_cpu_npu", 10721, 4),
     )

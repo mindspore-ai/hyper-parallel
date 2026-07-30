@@ -12,27 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test utils"""
-import os
-import shutil
+"""MindSpore worker-side test utils (imports mindspore — not for launchers).
 
+For spawning ``msrun`` from a launcher / ``parallel_case`` wrapper, import
+:func:`tests.common.distributed_launcher.msrun_case` instead. That module
+intentionally avoids importing ``mindspore``.
+"""
 import pytest
 import mindspore as ms
 from packaging import version
-
-
-def msrun_case(glog_v, file_name, case_name, master_port, worker_num=8, local_worker_num=8):
-    """Run test case."""
-    filename = file_name.split(".py")[0]
-    log_path = f"./logs/{filename}/{case_name}"
-    if os.path.exists(log_path):
-        shutil.rmtree(log_path)
-    cmd = f"export GLOG_v={glog_v} && msrun --worker_num={worker_num} --local_worker_num={local_worker_num} " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir={log_path} pytest -s -v " \
-          f"{file_name}::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
 
 
 def skip_if_ms_version_lt(min_ms_version):

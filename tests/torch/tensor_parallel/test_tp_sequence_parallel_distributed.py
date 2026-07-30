@@ -14,10 +14,9 @@
 # ============================================================================
 """Pytest launchers for ``SequenceParallel`` NPU distributed tests.
 
-Two launcher waves (two ``parallel_run`` workers):
-
-* **Wave 1 — dual GPU:** four cases × 2 ranks (ports 10540–10543), sum ranks = 8.
-* **Wave 2 — quad GPU:** two cases × 4 ranks (ports 10550–10551), sum ranks = 8.
+Dual-GPU wave only here (ports 10540–10543). The 4-card LayerNorm fwd+bwd case
+is packed into ``test_tp_hybrid_distributed.test_tp_fsdp_hybrid_4card`` so two
+level0 4-card workers share one serial wave.
 
 Worker implementations compare against a **CPU single-device** reference (float32).
 """
@@ -38,13 +37,6 @@ def _run_dual_gpu_wave():
     ])
 
 
-def _run_quad_gpu_wave():
-    parallel_run([
-        TorchCase(_WORKER, "test_sequence_parallel_layernorm_forward_gather_full_vs_cpu_4gpu", 10550, 4),
-        TorchCase(_WORKER, "test_sequence_parallel_layernorm_backward_grad_vs_cpu_4gpu", 10551, 4),
-    ])
-
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_tp_sequence_parallel_dual_gpu_wave():
@@ -59,17 +51,7 @@ def test_tp_sequence_parallel_dual_gpu_wave():
           card_mark="allcards", essential_mark="essential")
 def test_tp_sequence_parallel_dual_gpu_wave_gloo():
     """
-    Feature: four ``SequenceParallel`` scenarios on **2** NPU ranks
+    Feature: four ``SequenceParallel`` scenarios on **2** ranks (gloo)
     Expectation: all four worker cases succeed.
     """
     _run_dual_gpu_wave()
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_tp_sequence_parallel_quad_gpu_wave():
-    """
-    Feature: two ``SequenceParallel`` scenarios on **4** NPU ranks
-    Expectation: both worker cases succeed.
-    """
-    _run_quad_gpu_wave()

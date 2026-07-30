@@ -16,7 +16,7 @@
 import os
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.distributed_launcher import msrun_case
 
 _FILE_NAME = os.path.join(os.path.dirname(__file__), "_pipeline_shard.py")
 

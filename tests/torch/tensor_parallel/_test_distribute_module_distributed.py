@@ -17,13 +17,11 @@
 Aligned with PyTorch ``test/distributed/tensor/test_api.py`` (``DTensorAPITest``):
 ``test_distribute_module``, ``test_distribute_module_input_fn_output_fn``.
 
-Launched from ``test_distribute_module_distributed.py`` via ``parallel_run``:
-functional cases use ``num_proc=2``; precision cases use ``num_proc=4`` and compare
-to ``F.linear`` on CPU (column- vs row-sharded weights via ``distribute_tensor``).
+Launched from ``test_distribute_module_distributed.py`` via ``parallel_run``
+(2-card functional cases). Linear precision ST lives in tp_styles.
 """
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 
 from hyper_parallel import DTensor, distribute_module, init_device_mesh
@@ -204,122 +202,3 @@ def test_distribute_module_input_output_hooks_npu():
     y = m(x)
     assert isinstance(y, torch.Tensor)
     assert not isinstance(y, DTensor)
-
-
-def _npu_precision_close(a: torch.Tensor, b: torch.Tensor) -> None:
-    """Assert NPU vs CPU reference within typical float32 tolerance (HCCL matmul)."""
-    torch.testing.assert_close(
-        a.cpu().float(),
-        b.cpu().float(),
-        rtol=1.5e-4,
-        atol=1e-5,
-    )
-
-
-def _distribute_linear_colwise_shard_fn(
-    mod_name: str, module: nn.Module, device_mesh, shard_out: list,
-) -> None:
-    """Shard ``nn.Linear`` weight/bias on output dim (dim 0 / dim 0)."""
-    del mod_name
-    if not isinstance(module, nn.Linear):
-        return
-    for pname, param in module.named_parameters(recurse=False):
-        if pname == "weight":
-            dist_tensor = distribute_tensor(param.data, device_mesh, shard_out)
-        elif pname == "bias":
-            dist_tensor = distribute_tensor(param.data, device_mesh, [Shard(0)])
-        else:
-            continue
-        module.register_parameter(pname, nn.Parameter(dist_tensor))
-
-
-def test_distribute_module_colwise_linear_precision_vs_pytorch_ref_npu():
-    """
-    Feature: ``distribute_module`` + column-sharded Linear matches CPU ``F.linear``
-    Description: ``partition_fn`` shards weight on dim0 and bias on dim0; input wrapped as
-        replicated ``DTensor`` (``("None", "None")``) so linear dispatch has layouts; gather
-        output via ``full_tensor`` for comparison.
-    Expectation: NPU result close to CPU float32 reference (launcher uses 4 ranks).
-    """
-    init_backend(_DEVICE_TYPE)
-    mesh = _make_1d_mesh_tp()
-    ws = dist.get_world_size()
-    torch.manual_seed(42)
-    if _DEVICE_TYPE == "npu":
-        torch.npu.manual_seed(42)
-    in_f, out_f, batch = 32, 64, 8
-    assert out_f % ws == 0
-    w = torch.randn(out_f, in_f, dtype=torch.float32)
-    b = torch.randn(out_f, dtype=torch.float32)
-    x = torch.randn(batch, in_f, dtype=torch.float32)
-    y_ref = F.linear(x, w, b)
-
-    linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
-    with torch.no_grad():
-        linear.weight.copy_(to_device(w, _DEVICE_TYPE))
-        linear.bias.copy_(to_device(b, _DEVICE_TYPE))
-
-    shard_w = [Shard(0)]
-
-    def partition_fn(mod_name: str, module: nn.Module, device_mesh) -> None:
-        _distribute_linear_colwise_shard_fn(mod_name, module, device_mesh, shard_w)
-
-    distribute_module(linear, mesh, partition_fn=partition_fn)
-    x_rep = DTensor.from_local(to_device(x, _DEVICE_TYPE), mesh, ("None", "None"))
-    y = linear(x_rep)
-    assert isinstance(y, DTensor), type(y)
-    y_hp = y.full_tensor()
-    _npu_precision_close(y_hp, y_ref)
-
-
-def test_distribute_module_rowwise_linear_precision_vs_pytorch_ref_npu():
-    """
-    Feature: ``distribute_module`` + row-sharded Linear matches CPU ``F.linear``
-    Description: Weight shard on dim1 (in_features); input ``DTensor`` shard on last
-        dim to match contracting layout; ``reduce_partial`` then compare.
-    Expectation: NPU result close to CPU float32 reference (launcher uses 4 ranks).
-    """
-    init_backend(_DEVICE_TYPE)
-    mesh = _make_1d_mesh_tp()
-    ws = dist.get_world_size()
-    rank = dist.get_rank()
-    torch.manual_seed(43)
-    if _DEVICE_TYPE == "npu":
-        torch.npu.manual_seed(43)
-    in_f, out_f, batch = 32, 24, 8
-    assert in_f % ws == 0
-    w = torch.randn(out_f, in_f, dtype=torch.float32)
-    b = torch.randn(out_f, dtype=torch.float32)
-    x = torch.randn(batch, in_f, dtype=torch.float32)
-    y_ref = F.linear(x, w, b)
-
-    per = in_f // ws
-    x_local = x[:, rank * per : (rank + 1) * per].contiguous()
-
-    linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
-    with torch.no_grad():
-        linear.weight.copy_(to_device(w, _DEVICE_TYPE))
-        linear.bias.copy_(to_device(b, _DEVICE_TYPE))
-
-    shard_w = [Shard(1)]
-
-    def partition_fn(mod_name: str, module: nn.Module, device_mesh) -> None:
-        del mod_name
-        if not isinstance(module, nn.Linear):
-            return
-        for pname, param in module.named_parameters(recurse=False):
-            if pname == "weight":
-                dist_tensor = distribute_tensor(param.data, device_mesh, shard_w)
-            elif pname == "bias":
-                dist_tensor = distribute_tensor(param.data, device_mesh, [Replicate()])
-            else:
-                continue
-            module.register_parameter(pname, nn.Parameter(dist_tensor))
-
-    distribute_module(linear, mesh, partition_fn=partition_fn)
-    x_dt = DTensor.from_local(to_device(x_local, _DEVICE_TYPE), mesh, [Shard(1)])
-    y = linear(x_dt)
-    assert isinstance(y, DTensor), type(y)
-    y_reduced = y.reduce_partial()
-    y_hp = y_reduced.full_tensor()
-    _npu_precision_close(y_hp, y_ref)

@@ -15,7 +15,7 @@
 """test TorchHSDPParamV2"""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
-from tests.torch.utils import torchrun_case
+from tests.common.distributed_launcher import torchrun_case
 
 _TEST_HSDP_PARAM = "_test_hsdp_param.py"
 

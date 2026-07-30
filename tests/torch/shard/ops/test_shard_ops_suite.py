@@ -21,16 +21,17 @@ whose ``tags`` intersect — cases declare routing with tags like
 
 ``fail_fast`` is wired per pytest function: level0 stops on the first
 failure, level1 runs every case.
+
+This launcher stays free of ``torch`` / ``torch_npu``: group planning uses
+AST metadata, and backend registration happens inside torchrun workers.
 """
 import os
 from fnmatch import fnmatchcase
 
 import pytest
 
-import tests.torch.shard.ops.framework  # pylint: disable=W0611  # register backends
 from tests.common.mark_utils import arg_mark
-from tests.shard_ops.framework import RUNNER, build_suite_groups
-from tests.shard_ops.framework.suite import GroupSpec
+from tests.shard_ops.framework.suite import GroupSpec, build_suite_groups
 
 CASES_PKG = "tests.torch.shard.ops.cases"
 
@@ -44,26 +45,14 @@ CASES_PKG = "tests.torch.shard.ops.cases"
 # separate groups automatically).
 _MAX_CASES_PER_GROUP = 256
 
-_GROUPS_CPU_LEVEL0 = build_suite_groups(
-    cases_pkg=CASES_PKG, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"),
-    max_cases_per_group=_MAX_CASES_PER_GROUP,
-    tag_include={"cpu_level0"}, fail_fast=True,
-)
-_GROUPS_CPU_LEVEL1 = build_suite_groups(
-    cases_pkg=CASES_PKG, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"),
-    max_cases_per_group=_MAX_CASES_PER_GROUP,
-    tag_include={"cpu_level1"}, fail_fast=False,
-)
-_GROUPS_ASCEND_LEVEL0 = build_suite_groups(
-    cases_pkg=CASES_PKG, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"),
-    max_cases_per_group=_MAX_CASES_PER_GROUP,
-    tag_include={"npu_level0"}, fail_fast=True,
-)
-_GROUPS_ASCEND_LEVEL1 = build_suite_groups(
-    cases_pkg=CASES_PKG, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"),
-    max_cases_per_group=_MAX_CASES_PER_GROUP,
-    tag_include={"npu_level1"}, fail_fast=False,
-)
+
+def _groups(tag_include, fail_fast):
+    """Build groups lazily so pytest collection does not touch case modules."""
+    return build_suite_groups(
+        cases_pkg=CASES_PKG, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"),
+        max_cases_per_group=_MAX_CASES_PER_GROUP,
+        tag_include=tag_include, fail_fast=fail_fast,
+    )
 
 
 def _run_groups(groups, framework, device_type, fail_fast):
@@ -74,6 +63,9 @@ def _run_groups(groups, framework, device_type, fail_fast):
     ``HYPER_PARALLEL_SHARD_CASE_FILTER`` env var (fnmatch glob) filters cases within groups;
     e.g. ``HP_CASE="sort_ops_*" pytest ... -vs`` runs only sort cases.
     """
+    # pylint: disable=C0415
+    from tests.shard_ops.framework.runner import RUNNER
+
     if not groups:
         pytest.skip("no shard-ops cases registered at this level yet")
     case_filter = os.environ.get("HYPER_PARALLEL_SHARD_CASE_FILTER")
@@ -100,25 +92,25 @@ def _run_groups(groups, framework, device_type, fail_fast):
           card_mark="allcards", essential_mark="essential")
 def test_shard_ops_cpu_level0():
     """Torch CPU (gloo) level0 — fail-fast for fast PR feedback."""
-    _run_groups(_GROUPS_CPU_LEVEL0, "torch", "cpu", fail_fast=True)
+    _run_groups(_groups({"cpu_level0"}, True), "torch", "cpu", fail_fast=True)
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_shard_ops_cpu_level1():
     """Torch CPU (gloo) level1 — run all cases, collect every failure."""
-    _run_groups(_GROUPS_CPU_LEVEL1, "torch", "cpu", fail_fast=False)
+    _run_groups(_groups({"cpu_level1"}, False), "torch", "cpu", fail_fast=False)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_shard_ops_ascend_level0():
     """Torch Ascend (hccl) level0 — fail-fast for critical ops."""
-    _run_groups(_GROUPS_ASCEND_LEVEL0, "torch", "npu", fail_fast=True)
+    _run_groups(_groups({"npu_level0"}, True), "torch", "npu", fail_fast=True)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_shard_ops_ascend_level1():
     """Torch Ascend (hccl) level1 — full coverage daily build."""
-    _run_groups(_GROUPS_ASCEND_LEVEL1, "torch", "npu", fail_fast=False)
+    _run_groups(_groups({"npu_level1"}, False), "torch", "npu", fail_fast=False)

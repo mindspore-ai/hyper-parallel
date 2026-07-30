@@ -12,40 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Pytest launchers for TP + FSDP hybrid parallelism NPU distributed tests.
+"""Pytest launchers for TP + FSDP hybrid and related 4-card NPU tests.
 
-Uses the real ``ColwiseParallel`` / ``RowwiseParallel`` with ``fully_shard`` on NPU.
+Packs two 4-rank workers into one wave (sum ranks = 8):
 
-Port allocation:
-  10600–10601  4-card TP+FSDP (forward + backward)
+  * TP + FSDP MLP forward+backward
+  * SequenceParallel LayerNorm forward+backward
+
+Port allocation: 10800 (hybrid), 10801 (sequence parallel).
 """
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-_WORKER = str(Path(__file__).resolve().parent / "_test_tp_hybrid_distributed.py")
-
-
-def _run_group(*cases):
-    """Launch a group of worker cases with ``parallel_run``."""
-    parallel_run([
-        TorchCase(_WORKER, case_name, master_port, num_proc)
-        for case_name, master_port, num_proc in cases
-    ])
+_HYBRID_WORKER = str(Path(__file__).resolve().parent / "_test_tp_hybrid_distributed.py")
+_SEQ_WORKER = str(Path(__file__).resolve().parent / "_test_tp_sequence_parallel_distributed.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_tp_fsdp_hybrid_4card():
     """
-    Feature: parallel_run launcher for 4-card TP + FSDP hybrid tests
+    Feature: 4-card TP+FSDP hybrid + SequenceParallel in one wave
     Description:
-        1. test_tp_fsdp_mlp_forward_precision_npu
-        2. test_tp_fsdp_mlp_backward_gradient_npu
+        1. test_tp_fsdp_mlp_fwd_bwd_precision_npu
+        2. test_sequence_parallel_layernorm_fwd_bwd_vs_cpu_4gpu
     Expectation: Run success.
     """
-    _run_group(
-        ("test_tp_fsdp_mlp_forward_precision_npu", 10600, 4),
-        ("test_tp_fsdp_mlp_backward_gradient_npu", 10601, 4),
-    )
+    parallel_run([
+        TorchCase(_HYBRID_WORKER, "test_tp_fsdp_mlp_fwd_bwd_precision_npu", 10800, 4),
+        TorchCase(_SEQ_WORKER, "test_sequence_parallel_layernorm_fwd_bwd_vs_cpu_4gpu", 10801, 4),
+    ])

@@ -14,18 +14,13 @@
 # ============================================================================
 """Distributed NPU worker tests for ``ColwiseParallel`` / ``RowwiseParallel``.
 
-Launched from ``test_tp_styles_distributed.py`` via ``parallel_run`` in **three**
-launcher waves: eight scenarios on **2** ranks (two waves of four cases), plus
-**Colwise/Rowwise linear forward** again on **4** ranks for a wider TP mesh.
-
-Each worker test uses ``dist.get_world_size()`` for divisibility checks; tensor
-shapes are chosen so the same case passes for both 2- and 4-rank runs where a
-case is scheduled twice (linear forward only on 4 ranks).
+Launched from ``test_tp_styles_distributed.py`` via ``parallel_run`` in **two**
+2-card waves. Col/Row Linear forward+backward share one ``torchrun`` each to
+cut process cold-start cost.
 
 Each test instantiates the real ``ColwiseParallel`` / ``RowwiseParallel`` style
 from ``hyper_parallel.core.tensor_parallel.style``, shards a module through
-``parallelize_module``, runs a forward (and optionally backward) pass on NPU,
-and compares results against a single-device CPU reference.
+``parallelize_module``, and compares results against a single-device CPU reference.
 """
 import pytest
 import torch
@@ -62,19 +57,19 @@ def _npu_precision_close(a: torch.Tensor, b: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_colwise_linear_forward_precision_npu():
+def test_colwise_linear_fwd_bwd_precision_npu():
     """
-    Feature: ColwiseParallel sharded Linear forward matches CPU F.linear reference
+    Feature: ColwiseParallel Linear forward + backward vs CPU reference (one torchrun)
     Description:
-        1. Create nn.Linear with known weight/bias on all ranks
-        2. Shard via ColwiseParallel (weight Shard(0), bias Shard(0))
-        3. Forward replicated input through sharded module
-        4. Compare output with CPU F.linear(x, w, b)
-    Expectation: NPU output close to CPU reference
+        1. Forward: shard Linear, compare all-gathered output with F.linear
+        2. Backward: new Linear, gather weight grads vs CPU reference
+    Expectation: Forward output and weight grads close to CPU reference
     """
     init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     world_size = dist.get_world_size()
+
+    # --- forward ---
     torch.manual_seed(42)
     if _DEVICE_TYPE == "npu":
         torch.npu.manual_seed(42)
@@ -98,25 +93,12 @@ def test_colwise_linear_forward_precision_npu():
     sharded = parallelize_module(linear, mesh, ColwiseParallel())
     with torch.no_grad():
         y_hp = sharded(x_npu)
-    # ColwiseParallel returns local shard; all-gather before comparing with full reference
     gathered = [torch.empty_like(y_hp) for _ in range(world_size)]
     dist.all_gather(gathered, y_hp)
     y_hp_full = torch.cat(gathered, dim=-1)
     _npu_precision_close(y_hp_full, y_ref)
 
-
-def test_colwise_linear_backward_gradient_npu():
-    """
-    Feature: ColwiseParallel backward produces correct gradients on NPU
-    Description:
-        1. Shard Linear via ColwiseParallel
-        2. Forward + backward with a scalar loss
-        3. Gather weight gradients from all ranks, compare with CPU reference
-    Expectation: Gathered weight grad close to CPU reference grad
-    """
-    init_backend(_DEVICE_TYPE)
-    mesh = _make_tp_mesh_1d()
-    world_size = dist.get_world_size()
+    # --- backward ---
     torch.manual_seed(100)
     if _DEVICE_TYPE == "npu":
         torch.npu.manual_seed(100)
@@ -130,13 +112,11 @@ def test_colwise_linear_backward_gradient_npu():
     b = torch.randn(out_f, dtype=torch.float32)
     x = torch.randn(batch, in_f, dtype=torch.float32)
 
-    # CPU reference
     w_ref = w.clone().requires_grad_(True)
     b_ref = b.clone().requires_grad_(True)
     y_ref = F.linear(x, w_ref, b_ref)
     y_ref.sum().backward()
 
-    # NPU sharded
     linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
     with torch.no_grad():
         linear.weight.copy_(to_device(w, _DEVICE_TYPE))
@@ -147,7 +127,6 @@ def test_colwise_linear_backward_gradient_npu():
     y_hp = sharded(x_npu)
     y_hp.sum().backward()
 
-    # Gather weight grad shards from all ranks
     local_wgrad = linear.weight.grad
     if isinstance(local_wgrad, tuple):
         local_wgrad = local_wgrad[0]
@@ -163,19 +142,19 @@ def test_colwise_linear_backward_gradient_npu():
 # ---------------------------------------------------------------------------
 
 
-def test_rowwise_linear_forward_precision_npu():
+def test_rowwise_linear_fwd_bwd_precision_npu():
     """
-    Feature: RowwiseParallel sharded Linear forward matches CPU F.linear reference
+    Feature: RowwiseParallel Linear forward + backward vs CPU reference (one torchrun)
     Description:
-        1. Create nn.Linear with known weight/bias on all ranks
-        2. Shard via RowwiseParallel (weight Shard(1), bias Replicate)
-        3. Forward sharded input through sharded module
-        4. Compare output (after all-reduce) with CPU F.linear(x, w, b)
-    Expectation: NPU output close to CPU reference
+        1. Forward: shard Linear, compare output with F.linear
+        2. Backward: gather weight grads (÷ world_size) vs CPU reference
+    Expectation: Forward output and weight grads close to CPU reference
     """
     init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     world_size = dist.get_world_size()
+
+    # --- forward ---
     torch.manual_seed(43)
     if _DEVICE_TYPE == "npu":
         torch.npu.manual_seed(43)
@@ -203,19 +182,7 @@ def test_rowwise_linear_forward_precision_npu():
         y_hp = sharded(x_npu)
     _npu_precision_close(y_hp, y_ref)
 
-
-def test_rowwise_linear_backward_gradient_npu():
-    """
-    Feature: RowwiseParallel backward produces correct gradients on NPU
-    Description:
-        1. Shard Linear via RowwiseParallel
-        2. Forward + backward with a scalar loss
-        3. Gather weight gradients from all ranks, compare with CPU reference
-    Expectation: Gathered weight grad close to CPU reference grad
-    """
-    init_backend(_DEVICE_TYPE)
-    mesh = _make_tp_mesh_1d()
-    world_size = dist.get_world_size()
+    # --- backward ---
     torch.manual_seed(101)
     if _DEVICE_TYPE == "npu":
         torch.npu.manual_seed(101)
@@ -229,13 +196,11 @@ def test_rowwise_linear_backward_gradient_npu():
     b = torch.randn(out_f, dtype=torch.float32)
     x = torch.randn(batch, in_f, dtype=torch.float32)
 
-    # CPU reference
     w_ref = w.clone().requires_grad_(True)
     b_ref = b.clone().requires_grad_(True)
     y_ref = F.linear(x, w_ref, b_ref)
     y_ref.sum().backward()
 
-    # NPU sharded
     linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
     with torch.no_grad():
         linear.weight.copy_(to_device(w, _DEVICE_TYPE))
@@ -248,9 +213,6 @@ def test_rowwise_linear_backward_gradient_npu():
     y_hp = sharded(x_npu)
     y_hp.sum().backward()
 
-    # Gather weight grad shards (sharded along dim 1)
-    # RowwiseParallel backward through all-reduce accumulates gradient from
-    # each rank, so divide by world_size to match the single-device reference.
     local_wgrad = linear.weight.grad
     if isinstance(local_wgrad, tuple):
         local_wgrad = local_wgrad[0]

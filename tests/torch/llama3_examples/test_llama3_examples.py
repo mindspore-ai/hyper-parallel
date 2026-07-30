@@ -23,7 +23,7 @@ from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
-from tests.torch.utils import torchrun_case
+from tests.common.distributed_launcher import torchrun_case
 
 # Resolve from this file so the worker path is independent of the launcher's
 # cwd (the gate runs pytest from the test file's directory, not the repo root,

@@ -14,20 +14,17 @@
 # ============================================================================
 """Pytest launchers for ``parallelize_module`` NPU distributed tests.
 
-- **Functional**: four 2-card worker cases in one ``parallel_run`` (8 ranks total).
-- **Precision**: two 4-card torchrun workers in one ``parallel_run`` (colwise / rowwise
-  linear vs CPU reference).
+Functional coverage only (2-card). Col/Row Linear numerical precision lives in
+``test_tp_styles_distributed`` — duplicate 4-card precision waves removed.
 
 Port allocation:
   10460–10463  2-card functional
-  10464–10465  4-card precision (colwise + rowwise linear)
 """
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-# Absolute path: torchrun inherits cwd (repo root or this dir); basename alone can fail.
 _WORKER = str(Path(__file__).resolve().parent / "_test_parallelize_module_distributed.py")
 
 
@@ -76,36 +73,4 @@ def test_parallelize_module_functional_2card_gloo():
         ("test_parallelize_module_dict_fnmatch_npu", 10461, 2),
         ("test_parallelize_module_src_data_rank_npu", 10462, 2),
         ("test_parallelize_module_single_style_root_npu", 10463, 2),
-    )
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_precision_4card():
-    """
-    Feature: parallel_run launcher for 4-card parallelize_module precision vs CPU reference
-    Description:
-        1. test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu
-        2. test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu
-    Expectation: Run success.
-    """
-    _run_group(
-        ("test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu", 10464, 4),
-        ("test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu", 10465, 4),
-    )
-
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_precision_4card_gloo():
-    """
-    Feature: parallel_run launcher for 4-card parallelize_module precision vs CPU reference
-    Description:
-        1. test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu
-        2. test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu
-    Expectation: Run success.
-    """
-    _run_group(
-        ("test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu", 10464, 4),
-        ("test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu", 10465, 4),
     )

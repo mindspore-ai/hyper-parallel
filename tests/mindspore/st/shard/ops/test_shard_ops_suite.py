@@ -20,16 +20,17 @@ routing with tags like ``("npu_level1",)``.
 ``fail_fast=True`` on level0 stops on first failure; level1 runs all.
 
 ``HYPER_PARALLEL_SHARD_CASE_FILTER`` env var (fnmatch glob) filters cases within groups.
+
+This launcher stays free of ``mindspore``: group planning uses AST metadata,
+and backend registration happens inside ``msrun`` workers (see entry.py).
 """
 import os
 from fnmatch import fnmatchcase
 
 import pytest
 
-import tests.mindspore.st.shard.ops.framework  # pylint: disable=W0611  # register backend
 from tests.common.mark_utils import arg_mark
-from tests.shard_ops.framework import RUNNER, build_suite_groups
-from tests.shard_ops.framework.suite import GroupSpec
+from tests.shard_ops.framework.suite import GroupSpec, build_suite_groups
 
 CASES_PKG = "tests.mindspore.st.shard.ops.cases"
 
@@ -38,20 +39,21 @@ CASES_PKG = "tests.mindspore.st.shard.ops.cases"
 # concurrency only when more groups exist.
 _MAX_CASES_PER_GROUP = 256
 
-_GROUPS_LEVEL0 = build_suite_groups(
-    cases_pkg=CASES_PKG, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"),
-    max_cases_per_group=_MAX_CASES_PER_GROUP,
-    tag_include={"npu_level0"}, fail_fast=True,
-)
-_GROUPS_LEVEL1 = build_suite_groups(
-    cases_pkg=CASES_PKG, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"),
-    max_cases_per_group=_MAX_CASES_PER_GROUP,
-    tag_include={"npu_level1"}, fail_fast=False,
-)
+
+def _groups(tag_include, fail_fast):
+    """Build groups lazily so pytest collection does not touch case modules."""
+    return build_suite_groups(
+        cases_pkg=CASES_PKG, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"),
+        max_cases_per_group=_MAX_CASES_PER_GROUP,
+        tag_include=tag_include, fail_fast=fail_fast,
+    )
 
 
 def _run_groups(groups, fail_fast):
     """Run groups with optional HYPER_PARALLEL_SHARD_CASE_FILTER filter."""
+    # pylint: disable=C0415
+    from tests.shard_ops.framework.runner import RUNNER
+
     if not groups:
         pytest.skip("no shard-ops cases registered at this level yet")
     case_filter = os.environ.get("HYPER_PARALLEL_SHARD_CASE_FILTER")
@@ -78,11 +80,11 @@ def _run_groups(groups, fail_fast):
           card_mark="allcards", essential_mark="essential")
 def test_shard_ops_ascend_level0():
     """MindSpore Ascend level0 — fail-fast for critical ops."""
-    _run_groups(_GROUPS_LEVEL0, fail_fast=True)
+    _run_groups(_groups({"npu_level0"}, fail_fast=True), fail_fast=True)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_shard_ops_ascend_level1():
     """MindSpore Ascend level1 — full coverage daily build."""
-    _run_groups(_GROUPS_LEVEL1, fail_fast=False)
+    _run_groups(_groups({"npu_level1"}, fail_fast=False), fail_fast=False)

@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """Case collection: ``register`` / ``register_op_family`` / loader."""
+import ast
 import importlib
 import inspect
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from tests.shard_ops.framework.case_spec import (
     CaseSpec,
@@ -133,3 +134,254 @@ def _drop_cached_submodules(pkg_path: str) -> None:
     stale = [m for m in sys.modules if m == pkg_path or m.startswith(prefix)]
     for m in stale:
         del sys.modules[m]
+
+
+class _NonLiteral(ValueError):
+    """Raised when an AST node is not a pure literal we can evaluate."""
+
+
+def _ast_literal(node):
+    """Evaluate a constant AST expression (numbers, strings, tuples, lists)."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_ast_literal(node.operand)
+    if isinstance(node, ast.Tuple):
+        return tuple(_ast_literal(elt) for elt in node.elts)
+    if isinstance(node, ast.List):
+        return [_ast_literal(elt) for elt in node.elts]
+    raise _NonLiteral(f"unsupported AST node: {type(node).__name__}")
+
+
+def _opshard_kwargs_from_call(call: ast.Call) -> Optional[dict]:
+    """Extract planning kwargs from an ``OpShardCase(...)`` call node."""
+    if not isinstance(call.func, ast.Name) or call.func.id != "OpShardCase":
+        return None
+    kwargs = {}
+    for kw in call.keywords:
+        if kw.arg in (
+            "name", "tags", "mesh_shape", "mesh_dim_names",
+            "num_proc", "needs_mesh", "solo_launcher",
+        ):
+            try:
+                kwargs[kw.arg] = _ast_literal(kw.value)
+            except _NonLiteral:
+                return None
+    if "name" not in kwargs or not isinstance(kwargs["name"], str):
+        return None
+    return kwargs
+
+
+def _append_plan_stub(
+        stubs: List[OpShardCase],
+        seen: set,
+        *,
+        name: str,
+        tags,
+        mesh_shape,
+        mesh_dim_names,
+        num_proc=None,
+        needs_mesh: bool = False,
+        solo_launcher: bool = False,
+        source_module: str = "",
+) -> None:
+    """Append one planning stub if ``name`` has not been seen yet."""
+    if name in seen:
+        return
+    seen.add(name)
+
+    def _stub_fn(*_a, **_k):
+        raise RuntimeError(
+            "planning stub OpShardCase.fn must not run in the parent process"
+        )
+
+    if isinstance(tags, list):
+        tags = tuple(tags)
+    if isinstance(mesh_shape, list):
+        mesh_shape = tuple(mesh_shape)
+    if isinstance(mesh_dim_names, list):
+        mesh_dim_names = tuple(mesh_dim_names)
+    stubs.append(OpShardCase(
+        name=name,
+        fn=_stub_fn,
+        inputs=(),
+        placements=(),
+        tags=tuple(tags) if tags else (),
+        mesh_shape=mesh_shape,
+        mesh_dim_names=mesh_dim_names,
+        num_proc=num_proc,
+        needs_mesh=needs_mesh,
+        solo_launcher=solo_launcher,
+        source_module=source_module,
+    ))
+
+
+def _register_opshard_call(node: ast.AST) -> Optional[ast.Call]:
+    """Return the ``OpShardCase(...)`` call inside ``register(...)``, if any."""
+    if not isinstance(node, ast.Call):
+        return None
+    if not (isinstance(node.func, ast.Name) and node.func.id == "register"):
+        return None
+    if not (node.args and isinstance(node.args[0], ast.Call)):
+        return None
+    call = node.args[0]
+    if not (isinstance(call.func, ast.Name) and call.func.id == "OpShardCase"):
+        return None
+    return call
+
+
+def _helper_spec_from_function(node: ast.FunctionDef) -> Optional[dict]:
+    """If ``node`` is a thin ``register(OpShardCase(...))`` wrapper, describe it."""
+    param_index = {arg.arg: i for i, arg in enumerate(node.args.args)}
+    for sub in ast.walk(node):
+        call = _register_opshard_call(sub)
+        if call is None:
+            continue
+        mapping = {}
+        tags_lit = ()
+        for kw in call.keywords:
+            if kw.arg == "tags":
+                try:
+                    tags_lit = _ast_literal(kw.value)
+                    if isinstance(tags_lit, list):
+                        tags_lit = tuple(tags_lit)
+                except _NonLiteral:
+                    tags_lit = ()
+            elif (
+                kw.arg in ("name", "mesh_shape", "mesh_dim_names")
+                and isinstance(kw.value, ast.Name)
+                and kw.value.id in param_index
+            ):
+                mapping[kw.arg] = param_index[kw.value.id]
+        if "name" not in mapping:
+            continue
+        return {
+            "name_i": mapping["name"],
+            "mesh_i": mapping.get("mesh_shape"),
+            "names_i": mapping.get("mesh_dim_names"),
+            "tags": tags_lit if isinstance(tags_lit, tuple) else (),
+        }
+    return None
+
+
+def _record_from_helper_call(node: ast.Call, meta: dict) -> Optional[dict]:
+    """Extract one planning record from a helper call site."""
+    try:
+        name = _ast_literal(node.args[meta["name_i"]])
+        mesh = (
+            _ast_literal(node.args[meta["mesh_i"]])
+            if meta["mesh_i"] is not None else None
+        )
+        names = (
+            _ast_literal(node.args[meta["names_i"]])
+            if meta["names_i"] is not None else None
+        )
+    except (IndexError, _NonLiteral):
+        return None
+    if not isinstance(name, str):
+        return None
+    return {
+        "name": name,
+        "tags": meta["tags"],
+        "mesh_shape": mesh,
+        "mesh_dim_names": names,
+    }
+
+
+def _helper_calls_from_tree(tree: ast.AST) -> List[dict]:
+    """Collect planning metadata from thin register helpers like ``_bsh`` / ``_reg``.
+
+    Pattern::
+
+        def _bsh(name, fn, pl, mesh, names):
+            register(OpShardCase(name=name, ..., mesh_shape=mesh,
+                                 mesh_dim_names=names, tags=("npu_level1",)))
+
+        _bsh("case_name", ..., (2,), ("dp",))
+    """
+    helpers = {}
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        spec = _helper_spec_from_function(node)
+        if spec is not None:
+            helpers[node.name] = spec
+
+    records = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id not in helpers:
+            continue
+        rec = _record_from_helper_call(node, helpers[node.func.id])
+        if rec is not None:
+            records.append(rec)
+    return records
+
+
+def load_case_plan_from_package(pkg_path: str) -> List[OpShardCase]:
+    """Build lightweight planning stubs by AST-parsing ``case_*.py``.
+
+    Parent-side suite launchers only need name / tags / mesh metadata to
+    bucket cases. Importing the real case modules would pull ``mindspore`` /
+    ``torch`` into the pytest parent (and into forked ``msrun``/``torchrun``
+    wrappers). Workers still call :func:`load_cases_from_package` and execute
+    the real ``fn``.
+
+    Resolves the package directory on disk without importing
+    ``tests.mindspore`` / ``tests.torch`` (their ``__init__`` side effects are
+    heavy).
+    """
+    from pathlib import Path  # pylint: disable=C0415
+
+    parts = pkg_path.split(".")
+    if parts[0] != "tests":
+        raise ValueError(
+            f"load_case_plan_from_package expects a tests.* package, got {pkg_path!r}"
+        )
+    # tests/shard_ops/framework/registry.py -> parents[2] == tests/
+    tests_root = Path(__file__).resolve().parents[2]
+    pkg_dir = tests_root.joinpath(*parts[1:])
+    if not pkg_dir.is_dir():
+        raise FileNotFoundError(f"case package directory not found: {pkg_dir}")
+
+    stubs: List[OpShardCase] = []
+    seen = set()
+
+    for path in sorted(pkg_dir.glob("case_*.py")):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        mod_name = f"{pkg_path}.{path.stem}"
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            candidates = []
+            if isinstance(node.func, ast.Name) and node.func.id == "register":
+                if node.args and isinstance(node.args[0], ast.Call):
+                    candidates.append(node.args[0])
+            candidates.append(node)
+            for call in candidates:
+                kwargs = _opshard_kwargs_from_call(call)
+                if kwargs is None:
+                    continue
+                _append_plan_stub(
+                    stubs, seen,
+                    name=kwargs["name"],
+                    tags=kwargs.get("tags", ()),
+                    mesh_shape=kwargs.get("mesh_shape"),
+                    mesh_dim_names=kwargs.get("mesh_dim_names"),
+                    num_proc=kwargs.get("num_proc"),
+                    needs_mesh=bool(kwargs.get("needs_mesh", False)),
+                    solo_launcher=bool(kwargs.get("solo_launcher", False)),
+                    source_module=mod_name,
+                )
+        for rec in _helper_calls_from_tree(tree):
+            _append_plan_stub(
+                stubs, seen,
+                name=rec["name"],
+                tags=rec["tags"],
+                mesh_shape=rec["mesh_shape"],
+                mesh_dim_names=rec["mesh_dim_names"],
+                source_module=mod_name,
+            )
+    return stubs

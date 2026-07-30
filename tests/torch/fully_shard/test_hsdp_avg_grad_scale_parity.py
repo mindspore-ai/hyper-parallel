@@ -14,7 +14,7 @@
 # ============================================================================
 """Launch Torch HSDP AVG gradient scaling parity ST."""
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.distributed_launcher import torchrun_case
 
 _FILE_NAME = "_test_hsdp_avg_grad_scale_parity.py"
 

@@ -22,7 +22,7 @@ gradient parity are checked against a full-model serial reference inside the wor
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.distributed_launcher import torchrun_case
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_pp_composite.py")
 

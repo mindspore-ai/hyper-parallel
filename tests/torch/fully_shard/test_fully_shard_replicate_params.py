@@ -14,7 +14,7 @@
 # ============================================================================
 """launch _test_fully_shard_ignore_params.py cases"""
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.distributed_launcher import torchrun_case
 
 file_name = "_test_fully_shard_replicate_params.py"
 

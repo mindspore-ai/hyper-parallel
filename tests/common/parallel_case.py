@@ -59,12 +59,15 @@ def run_case(visible_devices: list, case: Union[TorchCase, MindSporeCase]) -> No
     # set visible devices for current case
     os.environ['ASCEND_RT_VISIBLE_DEVICES'] = ','.join(map(str, visible_devices))
     if isinstance(case, TorchCase):
+        # Import the thin launcher only — never tests.torch.utils (imports torch /
+        # torch_npu) or tests.mindspore.st.utils (imports mindspore) in this
+        # wrapper process.
         # pylint: disable=C0415
-        from tests.torch.utils import torchrun_case
+        from tests.common.distributed_launcher import torchrun_case
         torchrun_case(case.file_name, case.case_name, case.master_port, case.num_proc)
     elif isinstance(case, MindSporeCase):
         # pylint: disable=C0415
-        from tests.mindspore.st.utils import msrun_case
+        from tests.common.distributed_launcher import msrun_case
         msrun_case(case.glog_v, case.file_name, case.case_name, case.master_port, case.num_proc, case.local_worker_num)
 
 
