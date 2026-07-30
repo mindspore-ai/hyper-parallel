@@ -43,7 +43,7 @@ class TestCosineWithWarmupTarget(unittest.TestCase):
     def test_zero_warmup_returns_single_cosine_scheduler(self):
         scheduler = cosine_with_warmup(
             optimizer=_optimizer(),
-            total_steps=10,
+            train_steps=10,
             lr_warmup_steps=0,
             min_lr=0.1,
         )
@@ -57,7 +57,7 @@ class TestCosineWithWarmupTarget(unittest.TestCase):
     def test_positive_warmup_returns_sequential_scheduler(self):
         scheduler = cosine_with_warmup(
             optimizer=_optimizer(),
-            total_steps=10,
+            train_steps=10,
             lr_warmup_steps=2,
             init_lr=0.1,
             max_lr=1.0,
@@ -77,22 +77,22 @@ class TestCosineWithWarmupTarget(unittest.TestCase):
             lr_warmup_steps=0,
         )
 
-        scheduler = target.build(optimizer=optimizer, total_steps=4)
+        scheduler = target.build(optimizer=optimizer, train_steps=4)
 
         self.assertIsInstance(scheduler, CosineAnnealingLR)
         self.assertIs(scheduler.optimizer, optimizer)
         self.assertEqual(scheduler.T_max, 4)
 
     def test_invalid_step_counts_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, r"total_steps must be at least 1"):
-            cosine_with_warmup(optimizer=_optimizer(), total_steps=0)
+        with self.assertRaisesRegex(ValueError, r"train_steps must be at least 1"):
+            cosine_with_warmup(optimizer=_optimizer(), train_steps=0)
         with self.assertRaisesRegex(
             ValueError,
             r"lr_warmup_steps must not be negative",
         ):
             cosine_with_warmup(
                 optimizer=_optimizer(),
-                total_steps=10,
+                train_steps=10,
                 lr_warmup_steps=-1,
             )
 

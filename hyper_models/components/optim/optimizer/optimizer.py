@@ -14,7 +14,7 @@
 # ============================================================================
 """YAML-configurable optimizer implementations."""
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ class AdamW(torch.optim.AdamW):
         self,
         *,
         model: nn.Module,
+        device_mesh: Any = None,
         lr: float = 1e-4,
         weight_decay: float = 0.01,
         betas: tuple[float, float] = (0.9, 0.999),
@@ -37,12 +38,14 @@ class AdamW(torch.optim.AdamW):
 
         Args:
             model: Runtime model injected by the trainer.
+            device_mesh: Runtime device mesh reserved for optimizer hooks.
             lr: Learning rate.
             weight_decay: Weight decay for decay parameter groups.
             betas: AdamW coefficient pair.
             eps: AdamW numerical-stability term.
             foreach: Whether to use the foreach implementation.
         """
+        del device_mesh
         param_groups = _build_param_groups(model, weight_decay)
         super().__init__(
             param_groups,

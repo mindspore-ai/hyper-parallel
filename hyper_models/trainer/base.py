@@ -460,8 +460,8 @@ class BaseTrainer(Stateful, ABC):
         config: TrainerConfig = self.config
         self.lr_scheduler = (
             config.lr_scheduler.build(
-                self.optimizer,
-                max_steps=config.training.max_steps,
+                optimizer=self.optimizer,
+                train_steps=self.train_steps,
             )
             if config.lr_scheduler is not None
             else None

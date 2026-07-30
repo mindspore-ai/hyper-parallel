@@ -37,7 +37,12 @@ class TestAdamWTarget(unittest.TestCase):
     def test_returns_single_optimizer_with_decay_groups(self):
         model = _MixedModel()
 
-        optimizer = AdamW(model=model, lr=1e-3, weight_decay=0.07)
+        optimizer = AdamW(
+            model=model,
+            device_mesh=object(),
+            lr=1e-3,
+            weight_decay=0.07,
+        )
 
         self.assertIsInstance(optimizer, Optimizer)
         self.assertNotIsInstance(optimizer, list)
