@@ -15,7 +15,7 @@ model:
   force_hf: true
 
 training:
-  max_steps: 100
+  max_steps: null
   num_train_epochs: 1
   global_batch_size: 16
   micro_batch_size: 1
@@ -47,6 +47,7 @@ dataset:
   num_samples: 400
   seq_len: 32
   vocab_size: 1000
+  seed: 42
 
 collate_fn:
   _target_: hyper_models.components.data.data_collator.MakeMicroBatchCollator

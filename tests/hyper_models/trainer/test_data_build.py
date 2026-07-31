@@ -16,6 +16,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from hyper_models.components.data import (
     DataLoader,
     DummyDataset,
@@ -122,6 +124,7 @@ def test_trainer_data_stages_return_micro_batches() -> None:
             num_samples=16,
             seq_len=6,
             vocab_size=19,
+            seed=23,
         ),
         collate_fn=Target(
             MakeMicroBatchCollator,
@@ -142,6 +145,7 @@ def test_trainer_data_stages_return_micro_batches() -> None:
     trainer._build_dataset()
     trainer._build_collate_fn()
     trainer._build_dataloader()
+    trainer._compute_train_steps()
 
     micro_batches = next(iter(trainer.train_dataloader))
 
@@ -152,3 +156,32 @@ def test_trainer_data_stages_return_micro_batches() -> None:
     assert len(micro_batches) == 2
     assert all(micro_batch["input_ids"].shape == (2, 6) for micro_batch in micro_batches)
     assert all(micro_batch["labels"].shape == (2, 6) for micro_batch in micro_batches)
+
+
+def test_trainer_computes_steps_from_dataloader_length() -> None:
+    """Derive total steps from finite dataloader length and epoch count."""
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.config = TrainerConfig(
+        model=_unused_target(),
+        optimizer=_unused_target(),
+        training=TrainingConfig(max_steps=None, num_train_epochs=3),
+    )
+    trainer.train_dataloader = [object(), object()]
+
+    trainer._compute_train_steps()
+
+    assert trainer.train_steps == 6
+
+
+def test_trainer_requires_max_steps_for_unsized_dataloader() -> None:
+    """Require an explicit step count when dataloader length is unavailable."""
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.config = TrainerConfig(
+        model=_unused_target(),
+        optimizer=_unused_target(),
+        training=TrainingConfig(max_steps=None),
+    )
+    trainer.train_dataloader = object()
+
+    with pytest.raises(ValueError, match="does not have a finite length"):
+        trainer._compute_train_steps()

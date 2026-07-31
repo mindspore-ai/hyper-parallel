@@ -55,6 +55,7 @@ class TextTrainer:
         self.base._build_dataset()
         self.base._build_collate_fn()
         self.base._build_dataloader()
+        self.base._compute_train_steps()
         self.base._build_optimizer()
         self.base._build_lr_scheduler()
         self.base._build_training_context()

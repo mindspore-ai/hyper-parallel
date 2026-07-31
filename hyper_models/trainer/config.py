@@ -29,7 +29,7 @@ from hyper_models.components.checkpoint.config import CheckpointingConfig
 class TrainingConfig:
     """Training-loop parameters exposed by the initial YAML schema."""
 
-    max_steps: int = 100
+    max_steps: Optional[int] = None
     num_train_epochs: int = 1
     global_batch_size: int = 8
     micro_batch_size: int = 1

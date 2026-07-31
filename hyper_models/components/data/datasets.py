@@ -26,7 +26,7 @@ class DummyDataset(Dataset):
         num_samples: int,
         seq_len: int,
         vocab_size: int,
-        seed: int,
+        seed: int = 42,
     ) -> None:
         """Initialize the generated dataset.
 
