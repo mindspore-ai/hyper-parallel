@@ -31,23 +31,19 @@ from hyper_parallel.auto_parallel.config_adapter._normalized_config import Norma
 
 logger = logging.getLogger(__name__)
 
-# Mapping from HuggingFace-style config_overrides keys to internal short names.
+# Mapping from HuggingFace-style config_overrides keys to internal names.
+# After field-name alignment, most HP YAML keys already match the internal
+# model_spec names.  Only ``seq_length`` (MF variant) needs remapping.
 _HP_TO_INTERNAL: Dict[str, str] = {
-    "num_hidden_layers": "n_layers",
-    "hidden_size": "dim",
-    "num_attention_heads": "n_heads",
-    "intermediate_size": "inter_dim",
-    "num_key_value_heads": "n_kv_heads",
-    "max_position_embeddings": "seq_len",
-    "seq_length": "seq_len",
+    "seq_length": "max_position_embeddings",
 }
 
 
 def _normalize_model_spec(model_spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Rename HuggingFace-style config overrides keys to internal short names.
+    """Rename non-standard config overrides keys to canonical names.
 
-    Only maps a key if the target short name is not already present, so
-    explicit short names in the YAML take precedence.
+    Only maps a key if the target name is not already present, so
+    explicit canonical names in the YAML take precedence.
     """
     for hf_key, internal_key in _HP_TO_INTERNAL.items():
         if hf_key in model_spec and internal_key not in model_spec:
@@ -76,6 +72,7 @@ _FIXED_DIM_MAP: Dict[str, str] = {
     "pp": "fixed_pp_degree",
     "cp": "fixed_cp_degree",
     "ep": "fixed_ep_degree",
+    "etp": "fixed_etp_degree",
     "micro_batch_num": "fixed_micro_batch_num",
 }
 
@@ -190,7 +187,7 @@ def _build_config_from_search_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     if search_model:
         model_spec.update(search_model)
 
-    model_spec.setdefault("seq_len", 4096)
+    model_spec.setdefault("max_position_embeddings", 4096)
     model_spec.setdefault("local_batch_size", 1)
 
     model_spec = _normalize_model_spec(model_spec)
@@ -328,7 +325,7 @@ def _build_config_from_hp_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     overrides = model_raw.get("config_overrides", {})
     if isinstance(overrides, dict):
         model_spec.update(overrides)
-    model_spec["seq_len"] = data_raw.get("max_seq_len", 4096)
+    model_spec["max_position_embeddings"] = data_raw.get("max_seq_len", 4096)
     model_spec["local_batch_size"] = train_raw.get("micro_batch_size", 1)
 
     # dtype from train.mixed_precision

@@ -105,7 +105,7 @@ class CostModelParserHyperV2(_CostModelParser):
         self.config_comm_flag(self.ccfg)
         self._init_shard()
         self.ccfg.layer_custom_config = [(self.ccfg.n_lay + self.ccfg.n_mtp, None)]
-        self.ccfg.offset = 0
+        self._init_offset()
         self.ccfg.overwrite_eval_functions = {}
 
     def _resolve_model_config_pipeline(self):
@@ -118,16 +118,12 @@ class CostModelParserHyperV2(_CostModelParser):
         """
         try:
             self._resolve_via_direct_import()
-        except ValueError:
+        except (ValueError, TypeError) as exc:
             logger.debug(
-                "Direct _build_config import failed; "
-                "falling back to config_overrides"
+                "Direct _build_config failed (%s); "
+                "falling back to config_overrides", exc
             )
             self._resolve_from_config_overrides()
-        except TypeError as exc:
-            raise ValueError(
-                f"Failed to build HyperTrainerConfig: {exc}"
-            ) from exc
 
     def _resolve_via_direct_import(self):
         """Import ``_build_config`` directly from the model module.
@@ -153,7 +149,7 @@ class CostModelParserHyperV2(_CostModelParser):
         try:
             mod = importlib.import_module(
                 f"hyper_parallel.models.{trainer_cfg.model.name}")
-        except ImportError as exc:
+        except (ImportError, OSError) as exc:
             raise ValueError(
                 f"Model module '{trainer_cfg.model.name}' not found: {exc}"
             ) from exc
@@ -211,6 +207,11 @@ class CostModelParserHyperV2(_CostModelParser):
             self.ccfg.gmm = True
 
         self.ccfg.n_mtp = int(getattr(model_config, "mtp_depth", 0))
+        # Match the MF parser: when ``mtp_depth > 0`` the MTP layers
+        # participate in pipeline offset balancing (default True); when there
+        # is no MTP (``n_mtp == 0``) they are excluded, mirroring the MF
+        # parser's ``num_nextn_predict_layers`` fallback which sets
+        # ``is_mtp_in_offset = False``.
         self.ccfg.is_mtp_in_offset = bool(self.ccfg.n_mtp)
         self.ccfg.multiple_of = int(getattr(model_config, "multiple_of", 256))
         self.ccfg.fdm = float(getattr(model_config, "ffn_dim_multiplier", 1.0))
@@ -277,9 +278,20 @@ class CostModelParserHyperV2(_CostModelParser):
                 self.ccfg.hff_exp = moe_inter
             self.ccfg.k_1st_dense = int(
                 self._get_cfg_attr(overrides, "first_k_dense_replace", 0))
-            self.ccfg.gmm = True
+            cap_val = (
+                self._get_cfg_attr(overrides, "capacity_factor", None)
+                or self._get_cfg_attr(overrides, "cap_fact", None)
+            )
+            if cap_val is not None:
+                self.ccfg.cap_fact = max(1, float(cap_val))
+            self.ccfg.gmm = (
+                self._get_cfg_attr(overrides, "use_gmm", False)
+                or self._get_cfg_attr(overrides, "gmm", False)
+            )
 
         self.ccfg.n_mtp = int(self._get_cfg_attr(overrides, "mtp_depth", 0))
+        # Match the MF parser's MTP-in-offset semantics; see
+        # _map_model_config_to_ccfg for the rationale.
         self.ccfg.is_mtp_in_offset = bool(self.ccfg.n_mtp)
         self.ccfg.multiple_of = int(
             self._get_cfg_attr(overrides, "multiple_of", 256))
@@ -336,7 +348,7 @@ class CostModelParserHyperV2(_CostModelParser):
         dtype_str = str(dtype_str)
         m = re.search(r"(\d+)", dtype_str)
         if m:
-            return max(2, int(m.group(1)) // 8)
+            return max(1, int(m.group(1)) // 8)
         return 4
 
     def _parse_parallelism(self):
@@ -426,14 +438,42 @@ class CostModelParserHyperV2(_CostModelParser):
                     "train.accelerator.context_parallel_algo explicitly "
                     "to 'ulysses_cp' if Ulysses CP is intended."
                 )
+        # Optimizer type — used by GlobalConfig.max_op to detect muon-based
+        # optimizers.  Matches the MF parser's
+        # ``self.ccfg.optimizer = self.config.optimizer.type``.
+        opt_type = self._get_cfg_attr(optimizer, "type", None)
+        if opt_type:
+            self.ccfg.optimizer = str(opt_type)
 
     def _parse_recompute(self):
-        """Parse recompute mode from ``train.gradient_checkpointing``."""
+        """Parse recompute mode.
+
+        Reads ``activation_checkpoint`` from ``train.gradient_checkpointing``
+        first.  When ``config_overrides`` supplies ``full_rec`` or ``sel_rec``
+        (Matching the MF parser's ``recompute_config.recompute`` /
+        ``recompute_config.select_recompute`` fields), those values take
+        precedence so that Hyper YAML demo files can express per-stage
+        recompute lists for side-by-side comparisons with MindFormers.
+        """
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        overrides = self._get_cfg_attr(model_raw, "config_overrides", Config({}))
+        full_rec_override = self._get_cfg_attr(overrides, "full_rec", None)
+        sel_rec_override = self._get_cfg_attr(overrides, "sel_rec", None)
+
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
         ac_mode = str(self._get_cfg_attr(gc, "activation_checkpoint", "none"))
-        self.ccfg.full_rec = ac_mode == "full"
-        self.ccfg.sel_rec = ac_mode == "selective"
+
+        if full_rec_override is not None:
+            self.ccfg.full_rec = full_rec_override
+        else:
+            self.ccfg.full_rec = ac_mode == "full"
+
+        if sel_rec_override is not None:
+            self.ccfg.sel_rec = sel_rec_override
+        else:
+            self.ccfg.sel_rec = ac_mode == "selective"
+
         self.ccfg.rec_op = Config({
             "attBMM": 1,
             "headCast": 1,
@@ -458,22 +498,129 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.bytes_norm = 4
 
     def _init_moe_strategy(self):
-        """Initialize MoE strategy variables via base helper."""
-        self.config_dp_tp_exp(self.ccfg)
+        """Initialize MoE strategy variables via base helper.
+
+        For MoE models (``n_exp > 1``), ``etp`` defaults to 1 when
+        absent from the YAML, matching the MF parser's
+        ``expert_model_parallel`` default.  For dense models the
+        existing ``etp=0`` path continues to produce ``t_exp = t,
+        d_exp = d``.
+
+        Catches invalid MoE combinations (e.g., ``d_exp = 0`` when
+        ``dp < ep``) so the search engine can proceed — invalid combos
+        will later be filtered by the memory budget check.
+        """
+        if self.ccfg.n_exp > 1 and self.ccfg.etp == 0:
+            self.ccfg.etp = 1
+        try:
+            self.config_dp_tp_exp(self.ccfg)
+        except TypeError:
+            logger.warning(
+                "MoE config_dp_tp_exp failed for d=%d t=%d ep=%d etp=%d "
+                "n_exp=%d — clamping to minimum values.",
+                self.ccfg.d, self.ccfg.t, self.ccfg.ep,
+                self.ccfg.etp, self.ccfg.n_exp,
+            )
+            self.ccfg.d_exp = max(1, self.ccfg.d_exp)
+            self.ccfg.t_exp = max(1, self.ccfg.t_exp)
+            self.ccfg.hff_exp = max(1, self.ccfg.hff_exp)
+            self.ccfg.n_exp = max(1, self.ccfg.n_exp)
+
+    def _init_offset(self):
+        """Initialize the pipeline offset.
+
+        The MF parser reads ``model.model_config.offset`` directly from the
+        YAML.  When it is a list (e.g. ``[1, 1, ..., -1]``),
+        ``CostModelConfig.is_consistent_pp_config`` requires
+        ``len(offset) == pp``, so strategies whose pipeline degree differs
+        are rejected until ``GlobalConfig.adapt_config`` regenerates a
+        matching offset.  A scalar ``0`` is always accepted.
+
+        To match the MF parser's *list*-based filtering behaviour (used by
+        DeepSeek-V3 and other models that declare an explicit offset), this
+        parser emits a list offset of length ``pp`` (all zeros = even
+        balancing) by default.  An explicit offset supplied via
+        ``config_overrides.offset`` overrides this — a list is used as-is,
+        and a non-zero int is broadcast to ``[int] * pp``.
+        """
+        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        overrides = self._get_cfg_attr(model_raw, "config_overrides", Config({}))
+        explicit = self._get_cfg_attr(overrides, "offset", None)
+        if isinstance(explicit, list):
+            self.ccfg.offset = list(explicit)
+        elif isinstance(explicit, int):
+            if explicit == 0:
+                self.ccfg.offset = 0
+            else:
+                self.ccfg.offset = [explicit] * self.ccfg.p
+        else:
+            self.ccfg.offset = [0] * self.ccfg.p
+
+    def config_shard_emb(self) -> None:
+        """Configure embedding sharding based on current parallelism.
+
+        Mirrors ``CostModelParserMindformers.config_shard_emb`` so that
+        ``set_strategy`` recomputes ``shard_embed`` whenever the parallel
+        configuration changes.  When ``vocab_emb_dp`` is enabled and pipeline
+        parallelism is disabled (``p == 1``), the embedding is sharded only
+        along the data-parallel dimension (``d``); otherwise it is sharded
+        along ``t * d``.
+
+        Without this method, ``CostModelConfig.set_strategy`` skips the
+        ``config_shard_emb`` call (guarded by ``hasattr``) and the initial
+        ``shard_embed`` value computed in ``_init_shard`` is never refreshed,
+        producing an embedding-memory mismatch versus the MF parser.
+        """
+        self.ccfg.shard_embed = (
+            self.ccfg.d
+            if (self.ccfg.vocab_emb_dp and self.ccfg.p == 1)
+            else (self.ccfg.t * self.ccfg.d)
+        )
+
+    def config_shard_recompute(self) -> None:
+        """Recompute ``shard_recompute_input`` after strategy changes.
+
+        When ``recompute_slice_activation`` is ``True``, the recompute input
+        is sharded by the current tensor-parallel degree ``t``; otherwise it
+        is not sharded (value ``1``).  This method is called by
+        ``set_strategy`` (via ``hasattr`` guard) so that changing ``t``
+        during search correctly updates the sharding factor.
+
+        Without this method, ``shard_recompute_input`` retains the value
+        computed at initial parse time (using the default ``t`` from the
+        YAML), causing memory-estimation errors when the search explores
+        strategies with different ``t`` values.
+        """
+        self.ccfg.shard_recompute_input = (
+            self.ccfg.t if self._recompute_slice_activation else 1
+        )
 
     def _init_shard(self):
         """Initialize sharding variables.
 
-        Note: ``shard_output_activ`` and ``shard_recompute_input`` are set to
-        ``ccfg.t`` directly instead of ``True`` (which would evaluate to 1).
-        This ensures activation memory is correctly divided by the tensor
-        parallel degree, matching the behavior of the MF parser.  The
-        ``custom_qwen`` arch hook (in ``arch_hooks.py``) would also set these
-        to ``ccfg.t`` via ``check_and_apply_custom_hook``, but relying on the
-        hook is fragile — it may fail silently when the model name convention
-        changes or when the ``set_ccfg`` mechanism is bypassed.
+        ``shard_embed`` is computed via :meth:`config_shard_emb` so the
+        initial value follows the same rule used on subsequent
+        ``set_strategy`` calls.  ``shard_output_activ`` defaults to 1 (no
+        sharding), matching the MF parser's default; the ``custom_qwen``
+        arch hook overrides it to ``ccfg.t`` for Qwen-family models via
+        ``check_and_apply_custom_hook``.
+
+        ``shard_recompute_input`` mirrors the MF parser's
+        ``recompute_config.recompute_slice_activation`` flag: when the flag
+        is ``True`` (DeepSeek-V3), activations are sharded by ``ccfg.t``;
+        when ``False`` (Qwen), they are not sharded.  The flag is stored
+        as ``self._recompute_slice_activation`` so that
+        :meth:`config_shard_recompute` can recompute the value after
+        ``set_strategy`` changes ``t``.  Per-model arch hooks
+        (e.g. ``custom_qwen``) may override this during ``EvaluatorV2``
+        initialisation.
         """
-        self.ccfg.shard_embed = self.ccfg.t * self.ccfg.d
-        self.ccfg.shard_output_activ = self.ccfg.t
-        self.ccfg.shard_recompute_input = self.ccfg.t
+        self.config_shard_emb()
+        self.ccfg.shard_output_activ = 1
+        train_raw = self._get_cfg_attr(self.config, "train", Config({}))
+        gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
+        self._recompute_slice_activation = bool(self._get_cfg_attr(
+            gc, "recompute_slice_activation", False
+        ))
+        self.config_shard_recompute()
         self.ccfg.is_shard_mtp_param = True

@@ -160,11 +160,12 @@ def validate_strict(config: NormalizedConfig) -> None:
 
 
 def _check_required_fields(errors: List[ValidationError], model: Dict) -> None:
-    """Check that required model fields (n_layers, dim, n_heads, vocab_size) are present and > 0."""
+    """Check required model fields (num_hidden_layers, hidden_size,
+    num_attention_heads, vocab_size) are present and > 0."""
     required = [
-        ("model.n_layers", model.get("n_layers", 0), "n_layers must be > 0"),
-        ("model.dim", model.get("dim", 0), "dim must be > 0"),
-        ("model.n_heads", model.get("n_heads", 0), "n_heads must be > 0"),
+        ("model.num_hidden_layers", model.get("num_hidden_layers", 0), "num_hidden_layers must be > 0"),
+        ("model.hidden_size", model.get("hidden_size", 0), "hidden_size must be > 0"),
+        ("model.num_attention_heads", model.get("num_attention_heads", 0), "num_attention_heads must be > 0"),
         ("model.vocab_size", model.get("vocab_size", 0), "vocab_size must be > 0"),
     ]
     for field_path, value, message in required:
@@ -215,25 +216,25 @@ def _check_tp_divisibility(
     search: Dict,
     constraint: Dict,
 ) -> None:
-    """Check that dim, n_heads, inter_dim are divisible by tp."""
+    """Check that hidden_size, num_attention_heads, intermediate_size are divisible by tp."""
     tp_list = _candidates_or_default(search, "tensor_parallel_degree", constraint, "tp")
-    dim = model.get("dim", 0)
-    n_heads = model.get("n_heads", 0)
-    inter_dim = model.get("inter_dim", 0)
+    dim = model.get("hidden_size", 0)
+    n_heads = model.get("num_attention_heads", 0)
+    inter_dim = model.get("intermediate_size", 0)
 
     for tp in tp_list:
         if tp <= 1:
             continue
         if dim > 0:
-            err = _check_divisibility("model.dim", dim, "tp", tp)
+            err = _check_divisibility("model.hidden_size", dim, "tp", tp)
             if err:
                 errors.append(err)
         if n_heads > 0:
-            err = _check_divisibility("model.n_heads", n_heads, "tp", tp)
+            err = _check_divisibility("model.num_attention_heads", n_heads, "tp", tp)
             if err:
                 errors.append(err)
         if inter_dim > 0:
-            err = _check_divisibility("model.inter_dim", inter_dim, "tp", tp)
+            err = _check_divisibility("model.intermediate_size", inter_dim, "tp", tp)
             if err:
                 errors.append(err)
 
@@ -244,15 +245,15 @@ def _check_cp_divisibility(
     search: Dict,
     constraint: Dict,
 ) -> None:
-    """Check that seq_len is divisible by cp."""
+    """Check that max_position_embeddings is divisible by cp."""
     cp_list = _candidates_or_default(search, "context_parallel_degree", constraint, "cp")
-    seq_len = model.get("seq_len", 0)
+    seq_len = model.get("max_position_embeddings", 0)
 
     for cp in cp_list:
         if cp <= 1:
             continue
         if seq_len > 0:
-            err = _check_divisibility("model.seq_len", seq_len, "cp", cp)
+            err = _check_divisibility("model.max_position_embeddings", seq_len, "cp", cp)
             if err:
                 errors.append(err)
 
@@ -308,14 +309,14 @@ def _check_pipeline_constraints(
     model: Dict,
     pp_cfg: Dict,
 ) -> None:
-    """Check pipeline stage count, n_layers, and stage_partition consistency."""
+    """Check pipeline stage count, num_hidden_layers, and stage_partition consistency."""
     pp_degree_raw = pp_cfg.get("pp_degree", 1)
     pp_values = pp_degree_raw if isinstance(pp_degree_raw, list) else [pp_degree_raw]
     pp_values = [v for v in pp_values if v > 1]
     if not pp_values:
         return
 
-    n_layers = model.get("n_layers", 0)
+    n_layers = model.get("num_hidden_layers", 0)
     if n_layers <= 0:
         return
 
@@ -361,7 +362,7 @@ def _check_layer_offset(
     model: Dict,
     pp_cfg: Dict,
 ) -> None:
-    """Check that layer_offset_range is valid and within n_layers bounds."""
+    """Check that layer_offset_range is valid and within num_hidden_layers bounds."""
     offset_range = pp_cfg.get("layer_offset_range", (0, 0))
     if not isinstance(offset_range, (tuple, list)):
         return
@@ -369,7 +370,7 @@ def _check_layer_offset(
     if lo_min == 0 and lo_max == 0:
         return
 
-    n_layers = model.get("n_layers", 0)
+    n_layers = model.get("num_hidden_layers", 0)
     if lo_min > lo_max:
         errors.append(_err(
             "pp_config.layer_offset_range",
@@ -389,12 +390,12 @@ def _check_layer_recompute(
     model: Dict,
     pp_cfg: Dict,
 ) -> None:
-    """Check that layer_recompute_layers indices are within [0, n_layers)."""
+    """Check that layer_recompute_layers indices are within [0, num_hidden_layers)."""
     recompute_layers = pp_cfg.get("layer_recompute_layers", [])
     if not recompute_layers:
         return
 
-    n_layers = model.get("n_layers", 0)
+    n_layers = model.get("num_hidden_layers", 0)
     if n_layers <= 0:
         return
 
