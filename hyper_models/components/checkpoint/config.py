@@ -18,7 +18,7 @@ Following design doc 04_checkpoint.md §4.
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 
 @dataclass
@@ -37,18 +37,3 @@ class CheckpointingConfig:
     staging_dir: Optional[str] = None
     best_metric_key: str = "default"
     restore_from: Optional[str] = None  # "LATEST" or specific path
-
-    def build(
-        self,
-        dp_rank: int = 0,
-        tp_rank: int = 0,
-        pp_rank: int = 0,
-        moe_mesh: Any = None,
-        process_group: Any = None,
-    ) -> "Checkpointer":
-        """Build Checkpointer from config.
-
-        Stub — returns a Checkpointer with this config.
-        """
-        from hyper_models.components.checkpoint.checkpointing import Checkpointer
-        return Checkpointer(config=self)
