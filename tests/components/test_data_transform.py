@@ -12,20 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Data collation and chat-template components."""
+"""Tests for basic data-transform components."""
 
-from hyper_models.components.data.data_collator import (
-    MakeMicroBatchCollator,
-    calculate_num_micro_batches,
-)
-from hyper_models.components.data.dataloader import DataLoader
-from hyper_models.components.data.datasets import DummyDataset
-from hyper_models.components.data.identity_transform import IdentityDataTransform
+from hyper_models.components.data import IdentityDataTransform
 
-__all__ = [
-    "DataLoader",
-    "DummyDataset",
-    "IdentityDataTransform",
-    "MakeMicroBatchCollator",
-    "calculate_num_micro_batches",
-]
+
+def test_identity_data_transform_retains_tokenizer_and_example() -> None:
+    """Retain the upstream tokenizer while leaving examples unchanged."""
+    tokenizer = object()
+    transform = IdentityDataTransform(tokenizer=tokenizer)
+    example = {"text": "hello"}
+
+    assert transform.tokenizer is tokenizer
+    assert transform(example) is example

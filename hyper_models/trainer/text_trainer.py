@@ -52,6 +52,7 @@ class TextTrainer:
 
         # Text-specific trainer-owned stages.
         self._build_model_assets()
+        self.base._build_data_transform()
         self.base._build_dataset()
         self.base._build_collate_fn()
         self.base._build_dataloader()

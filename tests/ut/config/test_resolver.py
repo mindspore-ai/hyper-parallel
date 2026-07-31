@@ -26,6 +26,7 @@ from hyper_models._transformers import HyperAutoModelForCausalLM
 from hyper_models.components.data import (
     DataLoader,
     DummyDataset,
+    IdentityDataTransform,
     MakeMicroBatchCollator,
 )
 from hyper_models.components.optim import AdamW, cosine_with_warmup
@@ -161,6 +162,12 @@ class TestTargetResolution(unittest.TestCase):
                     "seq_len": 8,
                     "vocab_size": 32,
                 },
+                data_transform={
+                    "_target_": (
+                        "hyper_models.components.data.identity_transform."
+                        "IdentityDataTransform"
+                    ),
+                },
                 collate_fn={
                     "_target_": (
                         "hyper_models.components.data.data_collator."
@@ -173,6 +180,7 @@ class TestTargetResolution(unittest.TestCase):
             )
         )
 
+        self.assertIs(config.data_transform._target_, IdentityDataTransform)
         self.assertIs(config.dataset._target_, DummyDataset)
         self.assertIs(config.collate_fn._target_, MakeMicroBatchCollator)
         self.assertIs(config.dataloader._target_, DataLoader)
