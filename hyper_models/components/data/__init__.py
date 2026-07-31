@@ -16,12 +16,14 @@
 
 from hyper_models.components.data.data_collator import (
     MakeMicroBatchCollator,
-    build_micro_batch_collator,
     calculate_num_micro_batches,
 )
+from hyper_models.components.data.dataloader import DataLoader
+from hyper_models.components.data.datasets import DummyDataset
 
 __all__ = [
+    "DataLoader",
+    "DummyDataset",
     "MakeMicroBatchCollator",
-    "build_micro_batch_collator",
     "calculate_num_micro_batches",
 ]

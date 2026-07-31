@@ -16,10 +16,12 @@
 
 from types import SimpleNamespace
 
-from hyper_models.components.data import build_micro_batch_collator
-from hyper_models.components.datasets import build_dummy_dataset
+from hyper_models.components.data import (
+    DataLoader,
+    DummyDataset,
+    MakeMicroBatchCollator,
+)
 from hyper_models.components.distributed.infrastructure import MeshContext
-from hyper_models.data import build_train_dataloader
 from hyper_models.trainer.base import BaseTrainer
 from hyper_models.trainer.config import Target, TrainerConfig, TrainingConfig
 
@@ -115,20 +117,19 @@ def test_trainer_data_stages_return_micro_batches() -> None:
             seed=17,
         ),
         dataset=Target(
-            build_dummy_dataset,
-            target_path="hyper_models.components.datasets.build_dummy_dataset",
+            DummyDataset,
+            target_path="hyper_models.components.data.datasets.DummyDataset",
             num_samples=16,
             seq_len=6,
+            vocab_size=19,
         ),
         collate_fn=Target(
-            build_micro_batch_collator,
-            target_path=(
-                "hyper_models.components.data.build_micro_batch_collator"
-            ),
+            MakeMicroBatchCollator,
+            target_path="hyper_models.components.data.data_collator.MakeMicroBatchCollator",
         ),
         dataloader=Target(
-            build_train_dataloader,
-            target_path="hyper_models.data.build_train_dataloader",
+            DataLoader,
+            target_path="hyper_models.components.data.dataloader.DataLoader",
             shuffle=True,
             drop_last=True,
             use_background_prefetcher=False,

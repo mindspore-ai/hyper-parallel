@@ -99,6 +99,8 @@ _T = TypeVar("_T")
 
 def _serialize_config_value(value: Any) -> Any:
     """Convert one target argument to a plain serializable value."""
+    if inspect.isroutine(value):
+        return f"{value.__module__}.{value.__qualname__}"
     if hasattr(value, "to_dict"):
         return value.to_dict()
     if is_dataclass(value):

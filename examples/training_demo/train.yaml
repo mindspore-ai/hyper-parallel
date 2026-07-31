@@ -43,16 +43,16 @@ gradient_checkpointing:
   activation_checkpoint: off
 
 dataset:
-  _target_: hyper_models.components.datasets.build_dummy_dataset
+  _target_: hyper_models.components.data.datasets.DummyDataset
   num_samples: 400
   seq_len: 32
   vocab_size: 1000
 
 collate_fn:
-  _target_: hyper_models.components.data.build_micro_batch_collator
+  _target_: hyper_models.components.data.data_collator.MakeMicroBatchCollator
 
 dataloader:
-  _target_: hyper_models.data.build_train_dataloader
+  _target_: hyper_models.components.data.dataloader.DataLoader
   shuffle: true
   drop_last: true
   use_background_prefetcher: false
