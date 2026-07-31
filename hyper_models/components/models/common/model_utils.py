@@ -18,15 +18,29 @@ Following design doc 01_hf_compatibility_layer.md §6.7.
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch.nn as nn
 
+from hyper_parallel import HSDPModule
+from hyper_parallel.trainer.config import ModelConfig
 from hyper_models._transformers import HyperAutoModelForCausalLM
 from hyper_models.components.distributed.infrastructure import DistributedSetup
-from hyper_models.components.optim.optimizer import OptimizerInit
+from hyper_models.components.optim.optimizer.optimizer import OptimizerInit
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelBuildResult:
+    """Runtime objects produced by the model component target."""
+
+    model: nn.Module
+    optimizer_init: Optional[OptimizerInit]
+    model_config: Any
+    model_parts: list[nn.Module]
+    hsdp_model_parts: list[nn.Module]
 
 
 def build_model(
@@ -82,3 +96,55 @@ def build_model(
     )
 
     return model, optimizer_init
+
+
+def build_model_component(
+    *,
+    distributed_setup: DistributedSetup,
+    peft_config: Any,
+    name: str = "qwen3_5",
+    weights_path: Optional[str] = None,
+    tokenizer_path: Optional[str] = None,
+    **model_kwargs: Any,
+) -> ModelBuildResult:
+    """Build all model-owned runtime state required by the trainer.
+
+    Args:
+        distributed_setup: Runtime distributed topology and sharding policy.
+        peft_config: Optional PEFT configuration supplied by the trainer.
+        name: Registered model name.
+        weights_path: Local or remote pretrained checkpoint path.
+        tokenizer_path: Tokenizer path retained in the model configuration.
+        **model_kwargs: Additional ``ModelConfig`` fields.
+
+    Returns:
+        Built model together with optimizer initialization and model metadata.
+    """
+    model_config = ModelConfig(
+        name=name,
+        weights_path=weights_path,
+        tokenizer_path=tokenizer_path,
+        **model_kwargs,
+    )
+    model, optimizer_init = build_model(
+        model_config,
+        peft_config,
+        distributed_setup=distributed_setup,
+    )
+    runtime_model_config = model.config
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    hsdp_model_parts = [
+        model_part
+        for model_part in model_parts
+        if isinstance(model_part, HSDPModule)
+    ]
+    return ModelBuildResult(
+        model=model,
+        optimizer_init=optimizer_init,
+        model_config=runtime_model_config,
+        model_parts=model_parts,
+        hsdp_model_parts=hsdp_model_parts,
+    )
+
+
+__all__ = ["ModelBuildResult", "build_model", "build_model_component"]

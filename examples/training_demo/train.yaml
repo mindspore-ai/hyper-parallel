@@ -8,13 +8,12 @@
 #   bash examples/training_demo/run.sh
 
 model:
-  _target_: hyper_models.trainer.config.ModelConfig
+  _target_: hyper_models.components.models.common.model_utils.build_model_component
   name: tiny_llama
   weights_path: ./outputs/training_demo/tiny_llama
   tokenizer_path: ./outputs/training_demo/tiny_llama
 
 training:
-  _target_: hyper_models.trainer.config.TrainingConfig
   max_steps: 100
   num_train_epochs: 1
   global_batch_size: 16
@@ -26,7 +25,6 @@ training:
   enable_full_determinism: false
 
 accelerator:
-  _target_: hyper_models.trainer.config.AcceleratorConfig
   dp_shard_size: 2
   dp_replicate_size: 1
   tp_size: 2
@@ -37,27 +35,28 @@ accelerator:
   loss_parallel: false
 
 mixed_precision:
-  _target_: hyper_models.trainer.config.MixedPrecisionConfig
   enabled: false
 
 gradient_checkpointing:
-  _target_: hyper_models.trainer.config.GradientCheckpointingConfig
   activation_checkpoint: off
 
 dataset:
-  _target_: hyper_models.components.datasets.DatasetConfig
+  _target_: hyper_models.components.datasets.build_dummy_dataset
   num_samples: 400
   seq_len: 32
   vocab_size: 1000
 
+collate_fn:
+  _target_: hyper_models.components.data.build_micro_batch_collator
+
 dataloader:
-  _target_: hyper_models.trainer.config.DataLoaderConfig
+  _target_: hyper_models.data.build_train_dataloader
   shuffle: true
   drop_last: true
   use_background_prefetcher: false
 
 optimizer:
-  _target_: hyper_models.components.optim.AdamW.Config
+  _target_: hyper_models.components.optim.optimizer.optimizer.AdamW
   lr: 1.0e-4
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -66,20 +65,13 @@ optimizer:
   foreach: false
 
 lr_scheduler:
-  _target_: hyper_models.components.optim.LRSchedulerConfig
+  _target_: hyper_models.components.optim.lr_scheduler.lr_scheduler.cosine_with_warmup
   lr_warmup_steps: 1
-  lr_decay_style: cosine
   min_lr: 0.0
 
-loss:
-  _target_: hyper_models.components.loss.LossConfig
-  loss_aggregation: token_weighted
-
 checkpoint:
-  _target_: hyper_models.components.checkpoint.config.CheckpointingConfig
   enabled: false
   checkpoint_dir: ./outputs/training_demo/checkpoints
 
 debug:
-  _target_: hyper_models.trainer.config.DebugConfig
   check_nan_inf: false

@@ -75,6 +75,10 @@ class TextTrainer:
     def _build_model_assets(self):
         config: TrainerConfig = self.base.config
         model_config = self.base.model_config
+        if config.tokenizer is None:
+            raise ValueError("config.tokenizer must define a build target")
+        if config.dataset is None:
+            raise ValueError("config.dataset must define a build target")
         self.base.tokenizer = config.tokenizer.build()
         if config.dataset.data_type == "plaintext":
             self.base.model_assets = [model_config, self.base.tokenizer]

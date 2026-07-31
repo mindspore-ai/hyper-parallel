@@ -16,7 +16,12 @@
 
 from hyper_models.data.build_dataloader import (
     build_dataloader,
+    build_train_dataloader,
     build_validation_dataloader,
 )
 
-__all__ = ["build_dataloader", "build_validation_dataloader"]
+__all__ = [
+    "build_dataloader",
+    "build_train_dataloader",
+    "build_validation_dataloader",
+]
