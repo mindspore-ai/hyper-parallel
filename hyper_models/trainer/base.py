@@ -301,6 +301,7 @@ class BaseTrainer(Stateful, ABC):
         self._build_dataset()
         self._build_collate_fn()
         self._build_dataloader()
+        self._compute_train_steps()
         self._build_optimizer()
         self._build_lr_scheduler()
         self._build_training_context()
@@ -380,13 +381,7 @@ class BaseTrainer(Stateful, ABC):
         """Build dataset-owned runtime state through the configured target."""
         if self.config.dataset is None:
             raise ValueError("config.dataset must define a build target")
-        seed = self.config.training.seed
-        if seed is None:
-            seed = self.default_seed
-        self.train_dataset = self.config.dataset.build(
-            seed=seed + self.mesh.dp_rank,
-        )
-        self.train_steps = self.config.training.max_steps
+        self.train_dataset = self.config.dataset.build()
 
     def _build_collate_fn(self):
         """Build the collator through the configured target."""
@@ -409,11 +404,50 @@ class BaseTrainer(Stateful, ABC):
         local_step_batch_size = (
             self.config.training.global_batch_size // self.mesh.dp_size
         )
+        seed = self.config.training.seed
+        if seed is None:
+            seed = self.default_seed
         self.train_dataloader = self.config.dataloader.build(
             dataset=self.train_dataset,
             collate_fn=self.collate_fn,
             batch_size=local_step_batch_size,
+            dp_world_size=self.mesh.dp_size,
+            dp_rank=self.mesh.dp_rank,
+            seed=seed,
         )
+
+    def _compute_train_steps(self) -> None:
+        """Resolve the total number of optimizer steps."""
+        training_config = self.config.training
+        max_steps = training_config.max_steps
+        if max_steps is not None:
+            if (
+                isinstance(max_steps, bool)
+                or not isinstance(max_steps, int)
+                or max_steps <= 0
+            ):
+                raise ValueError("training.max_steps must be a positive integer")
+            self.train_steps = max_steps
+            return
+
+        try:
+            steps_per_epoch = len(self.train_dataloader)
+        except TypeError as exc:
+            raise ValueError(
+                "training.max_steps must be configured when the dataloader "
+                "does not have a finite length"
+            ) from exc
+
+        if steps_per_epoch <= 0:
+            raise ValueError("train_dataloader must provide at least one step per epoch")
+        if (
+            isinstance(training_config.num_train_epochs, bool)
+            or not isinstance(training_config.num_train_epochs, int)
+            or training_config.num_train_epochs <= 0
+        ):
+            raise ValueError("training.num_train_epochs must be a positive integer")
+
+        self.train_steps = steps_per_epoch * training_config.num_train_epochs
 
     def _build_optimizer(self):
         config: TrainerConfig = self.config

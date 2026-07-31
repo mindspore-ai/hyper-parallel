@@ -325,6 +325,11 @@ class TestPureDataclassResolution(unittest.TestCase):
         self.assertEqual(config.training.max_grad_norm, 0.25)
         self.assertEqual(config.accelerator.tp_size, 1)
 
+    def test_training_max_steps_defaults_to_dataset_derived(self):
+        config = resolve_root(_root())
+
+        self.assertIsNone(config.training.max_steps)
+
 
 class TestTypedOverrides(unittest.TestCase):
     """Dotted CLI overrides update selected target kwargs and dataclass fields."""
