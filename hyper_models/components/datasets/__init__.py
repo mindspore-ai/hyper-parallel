@@ -12,19 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Dataset configuration compatibility types."""
+"""YAML-callable dataset factories."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
+
+from hyper_models.data.build_dataloader import DummyDataset
 
 
 @dataclass
-class DatasetConfig:
-    """Dummy dataset parameters used by the temporary Trainer data path."""
+class DatasetBuildResult:
+    """Dataset runtime state returned to the trainer."""
 
-    num_samples: int = 100
-    seq_len: int = 32
-    vocab_size: Optional[int] = None
+    dataset: Any
+    train_steps: int
 
 
-__all__ = ["DatasetConfig"]
+def build_dummy_dataset(
+    *,
+    model_config: Any,
+    seed: Optional[int],
+    dp_rank: int,
+    train_steps: int,
+    num_samples: int = 100,
+    seq_len: int = 32,
+    vocab_size: Optional[int] = None,
+    data_type: str = "mapping",
+    chat_template: Optional[str] = None,
+) -> DatasetBuildResult:
+    """Build the temporary rank-aware dataset used by Trainer.
+
+    Args:
+        model_config: Runtime model configuration used for the vocabulary size.
+        seed: Base random seed.
+        dp_rank: Data-parallel rank.
+        train_steps: Configured number of optimizer steps.
+        num_samples: Number of generated samples.
+        seq_len: Token sequence length.
+        vocab_size: Optional vocabulary-size override.
+        data_type: Dataset type retained for TextTrainer compatibility.
+        chat_template: Optional chat-template name retained for compatibility.
+
+    Returns:
+        Dataset and derived training-step state.
+    """
+    del data_type, chat_template
+    resolved_seed = 42 if seed is None else seed
+    model_vocab_size = getattr(model_config, "vocab_size", 1000)
+    dataset = DummyDataset(
+        num_samples=num_samples,
+        seq_len=seq_len,
+        vocab_size=vocab_size or model_vocab_size,
+        seed=resolved_seed + dp_rank,
+    )
+    return DatasetBuildResult(dataset=dataset, train_steps=train_steps)
+
+
+__all__ = ["DatasetBuildResult", "build_dummy_dataset"]

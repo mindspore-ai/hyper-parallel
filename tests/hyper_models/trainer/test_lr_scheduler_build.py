@@ -16,39 +16,52 @@
 
 import torch
 
-from hyper_models.components.optim import LRSchedulerConfig
+from hyper_models.components.optim import cosine_with_warmup
 from hyper_models.trainer.base import BaseTrainer
-from hyper_models.trainer.config import ModelConfig, TrainerConfig, TrainingConfig
+from hyper_models.trainer.config import Target, TrainerConfig, TrainingConfig
+
+
+def _unused_target() -> Target:
+    """Return a target required by ``TrainerConfig`` but unused in this test."""
+    return Target(lambda: None, target_path="tests.unused")
 
 
 def test_trainer_builds_lr_scheduler_from_training_max_steps() -> None:
-    """Pass only optimizer and Trainer update count to the LR builder."""
+    """Pass only optimizer and dataset-derived update count to the LR builder."""
     parameter = torch.nn.Parameter(torch.ones(1))
     optimizer = torch.optim.AdamW([parameter], lr=1e-3)
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.config = TrainerConfig(
-        model=ModelConfig(name="dummy"),
+        model=_unused_target(),
+        optimizer=_unused_target(),
         training=TrainingConfig(max_steps=7),
-        lr_scheduler=LRSchedulerConfig(lr_warmup_steps=1),
+        lr_scheduler=Target(
+            cosine_with_warmup,
+            target_path=(
+                "hyper_models.components.optim.lr_scheduler.lr_scheduler."
+                "cosine_with_warmup"
+            ),
+            lr_warmup_steps=1,
+        ),
     )
-    trainer.optimizer = [optimizer]
+    trainer.optimizer = optimizer
+    trainer.train_steps = trainer.config.training.max_steps
 
     trainer._build_lr_scheduler()
 
-    assert isinstance(trainer.lr_scheduler, list)
-    assert len(trainer.lr_scheduler) == 1
-    assert trainer.lr_scheduler[0].optimizer is optimizer
+    assert trainer.lr_scheduler.optimizer is optimizer
 
 
 def test_trainer_allows_lr_scheduler_to_be_disabled() -> None:
     """Keep the LR scheduler optional without creating another component."""
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.config = TrainerConfig(
-        model=ModelConfig(name="dummy"),
+        model=_unused_target(),
+        optimizer=_unused_target(),
         training=TrainingConfig(max_steps=7),
         lr_scheduler=None,
     )
-    trainer.optimizer = []
+    trainer.optimizer = object()
 
     trainer._build_lr_scheduler()
 

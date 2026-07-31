@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Masked cross-entropy configuration."""
+"""Directly configurable masked cross-entropy callable."""
 
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -23,20 +23,33 @@ import torch.nn.functional as F
 
 @dataclass(kw_only=True, slots=True)
 class MaskedCrossEntropy:
-    """YAML-configurable masked cross-entropy."""
+    """YAML-targeted masked cross-entropy callable."""
 
     fp32_upcast: bool = True
     ignore_index: int = -100
     reduction: Literal["none", "mean", "sum"] = "sum"
 
-    def build(
+    def __call__(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         num_label_tokens: Optional[int] = None,
     ) -> torch.Tensor:
-        """Compute the configured loss."""
+        """Compute the configured loss.
+
+        Args:
+            logits: Model logits whose final dimension is the vocabulary.
+            labels: Target token IDs.
+            mask: Optional mask where zero marks ignored target positions.
+            num_label_tokens: Optional normalization denominator.
+
+        Returns:
+            Masked cross-entropy loss.
+
+        Raises:
+            ValueError: If token normalization is requested for a non-sum loss.
+        """
         if labels.device != logits.device:
             labels = labels.to(logits.device)
 

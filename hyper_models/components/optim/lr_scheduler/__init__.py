@@ -12,16 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Data collation and chat-template components."""
+"""Learning-rate scheduler runtime targets."""
 
-from hyper_models.components.data.data_collator import (
-    MakeMicroBatchCollator,
-    build_micro_batch_collator,
-    calculate_num_micro_batches,
-)
+from .lr_scheduler import cosine_with_warmup
 
-__all__ = [
-    "MakeMicroBatchCollator",
-    "build_micro_batch_collator",
-    "calculate_num_micro_batches",
-]
+__all__ = ["cosine_with_warmup"]

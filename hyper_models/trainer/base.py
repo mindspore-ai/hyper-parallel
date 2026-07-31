@@ -26,15 +26,14 @@ Features:
     - Checkpointing
 """
 
-import logging
 import json
+import logging
 import os
 import queue
 import threading
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import asdict
 from typing import Any, Dict, List
 
 import torch
@@ -43,14 +42,13 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
 from torch.utils.checkpoint import set_checkpoint_debug_enabled
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
-from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
+from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
-from ..components.data import MakeMicroBatchCollator, calculate_num_micro_batches
 from ..components.data.chat_template import ChatTemplate
 from ..components.distributed.init_utils import get_local_rank_safe, get_global_rank_safe, get_world_size_safe
 from ..components.distributed.infrastructure import (
@@ -60,10 +58,8 @@ from ..components.distributed.infrastructure import (
     initialize_distributed,
 )
 from ..components.loss.loss_utils import count_loss_token, mean_global_loss
-from ..components.models.common.model_utils import build_model as build_hyper_model
 from ..components.utils import helper
 from ..components.utils.device import synchronize, get_torch_device, get_device_type
-from ..data.build_dataloader import _DummyDictDataset
 
 from .callbacks import TempLogCallback, TrainerState
 
@@ -322,7 +318,10 @@ class BaseTrainer(Stateful, ABC):
         self.world_size = get_world_size_safe()
 
         if self.global_rank == 0:
-            logger.info("Trainer config:\n%s", json.dumps(asdict(self.config), indent=2))
+            logger.info(
+                "Trainer config:\n%s",
+                json.dumps(self.config.to_dict(), indent=2),
+            )
 
         # init distributed environment
         device_str = f"{get_device_type()}:{self.local_rank}"
@@ -355,48 +354,17 @@ class BaseTrainer(Stateful, ABC):
         # set_checkpoint_debug_enabled(self.config.gradient_checkpointing.debug)
 
     def _build_model(self) -> None:
-        """Build and parallelize the model through one reserved AutoModel call.
-
-        Implementation owner:
-            ``../_transformers/auto_model.py`` selects the registered model and
-            calls ``HyperAutoModel*.from_pretrained``.
-            ``../_transformers/infrastructure.py`` owns meta materialization,
-            state-dict adaptation, checkpoint loading, PEFT/quantization, and
-            TP/CP/EP/FSDP2/PP application.
-
-        Input contract:
-            Pass ``self.distributed_setup`` as the sole topology/policy object.
-            The model checkpoint path and all declarative model options come
-            from ``self.config.model``. The adapter boundary is the shared
-            ``components.models.common.model_utils.build_model`` function.
-
-        Output contract:
-            Set ``self.model``, ``self.model_parts``, and
-            ``self.model_config``. For non-PP models, ``model_parts`` contains
-            exactly ``self.model``; for PP it contains the stage-local parts
-            exposed by AutoPipeline. The returned model is trainable
-            immediately: parameters are materialized, checkpoint weights are
-            loaded, and parallelization is complete. Optimizer construction
-            may start after this method returns.
-
-        Raises:
-            ValueError: If the model architecture, checkpoint, or requested
-                parallelism combination is unsupported, or if no model
-                checkpoint path is configured.
-        """
+        """Build model-owned runtime state through the configured target."""
         self.peft_config = self.config.peft
-        self.model, self.optimizer_init = build_hyper_model(
-            self.config.model,
-            self.peft_config,
+        result = self.config.model.build(
             distributed_setup=self.distributed_setup,
+            peft_config=self.peft_config,
         )
-        self.model_config = self.model.config
-        self.model_parts = self.model.parts if hasattr(self.model, "parts") else [self.model]
-        self.hsdp_model_parts = [
-            model_part
-            for model_part in self.model_parts
-            if isinstance(model_part, HSDPModule)
-        ]
+        self.model = result.model
+        self.optimizer_init = result.optimizer_init
+        self.model_config = result.model_config
+        self.model_parts = result.model_parts
+        self.hsdp_model_parts = result.hsdp_model_parts
 
     def _build_model_assets(self):
         """Build model assets for the temporary dummy-data training path."""
@@ -405,45 +373,37 @@ class BaseTrainer(Stateful, ABC):
         self.model_assets = [self.model_config]
 
     def _build_dataset(self):
-        """Build the Recipe-compatible dummy dataset."""
-        dataset_config = self.config.dataset
-        num_samples = getattr(dataset_config, "num_samples", 100)
-        seq_len = getattr(dataset_config, "seq_len", 32)
-        configured_vocab_size = getattr(dataset_config, "vocab_size", None)
-        model_vocab_size = getattr(self.model_config, "vocab_size", 1000)
-        seed = self.config.training.seed
-        if seed is None:
-            seed = self.default_seed
-
-        self.train_dataset = _DummyDictDataset(
-            num_samples=num_samples,
-            seq_len=seq_len,
-            vocab_size=configured_vocab_size or model_vocab_size,
-            seed=seed + self.mesh.dp_rank,
+        """Build dataset-owned runtime state through the configured target."""
+        if self.config.dataset is None:
+            raise ValueError("config.dataset must define a build target")
+        result = self.config.dataset.build(
+            model_config=self.model_config,
+            seed=self.config.training.seed,
+            dp_rank=self.mesh.dp_rank,
+            train_steps=self.config.training.max_steps,
         )
-        self.train_steps = self.config.training.max_steps
+        self.train_dataset = result.dataset
+        self.train_steps = result.train_steps
 
     def _build_collate_fn(self):
-        """Build the Trainer collator that groups one step into micro-batches."""
-        training_config = self.config.training
-        num_micro_batches = calculate_num_micro_batches(
-            global_batch_size=training_config.global_batch_size,
-            micro_batch_size=training_config.micro_batch_size,
+        """Build the collator through the configured target."""
+        if self.config.collate_fn is None:
+            raise ValueError("config.collate_fn must define a build target")
+        self.collate_fn = self.config.collate_fn.build(
+            global_batch_size=self.config.training.global_batch_size,
+            micro_batch_size=self.config.training.micro_batch_size,
             dp_world_size=self.mesh.dp_size,
         )
-        self.collate_fn = MakeMicroBatchCollator(num_micro_batch=num_micro_batches)
 
     def _build_dataloader(self):
-        """Build the Recipe-compatible DataLoader with Trainer collation."""
-        training_config = self.config.training
-        dataloader_config = self.config.dataloader
-        local_step_batch_size = training_config.global_batch_size // self.mesh.dp_size
-        self.train_dataloader = DataLoader(
-            self.train_dataset,
-            batch_size=local_step_batch_size,
-            shuffle=dataloader_config.shuffle,
-            drop_last=dataloader_config.drop_last,
+        """Build the training dataloader through the configured target."""
+        if self.config.dataloader is None:
+            raise ValueError("config.dataloader must define a build target")
+        self.train_dataloader = self.config.dataloader.build(
+            dataset=self.train_dataset,
             collate_fn=self.collate_fn,
+            global_batch_size=self.config.training.global_batch_size,
+            dp_world_size=self.mesh.dp_size,
         )
 
     def _build_optimizer(self):

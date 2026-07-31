@@ -20,7 +20,7 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 
-from hyper_models.components.optim import AdamW
+from hyper_models.components.optim import AdamW, OptimizerInit
 from hyper_models.trainer.config import Target
 
 
@@ -81,6 +81,19 @@ class TestAdamWTarget(unittest.TestCase):
         }
         self.assertNotIn(id(model.embed.weight), parameter_ids)
         self.assertIn(id(model.linear.weight), parameter_ids)
+
+    def test_configured_weight_decay_updates_model_owned_param_groups(self):
+        model = _MixedModel()
+        optimizer_init = OptimizerInit.from_distributed_setup(model=model)
+
+        optimizer = AdamW(
+            model=model,
+            optimizer_init=optimizer_init,
+            weight_decay=0.07,
+        )
+
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.07)
+        self.assertEqual(optimizer.param_groups[1]["weight_decay"], 0.0)
 
     def test_tied_parameter_is_deduplicated_across_model_parts(self):
         shared = nn.Parameter(torch.ones(2))

@@ -12,15 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for optimizer-bound learning-rate scheduler construction."""
+"""Tests for direct optimizer-bound learning-rate scheduler construction."""
 
 import pytest
 import torch
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR
 
-from hyper_models.components.optim import (
-    LRSchedulerConfig,
-    RatioBasedLRSchedulerConfig,
-)
+from hyper_models.components.optim import cosine_with_warmup
 
 
 def _build_optimizer() -> torch.optim.Optimizer:
@@ -28,35 +26,42 @@ def _build_optimizer() -> torch.optim.Optimizer:
     return torch.optim.AdamW([parameter], lr=1e-3)
 
 
-def test_lr_scheduler_builds_without_step_scheduler() -> None:
-    """Bind LR schedulers using only optimizer and total update count."""
-    optimizers = [_build_optimizer(), _build_optimizer()]
-    config = LRSchedulerConfig(lr_warmup_steps=1, min_lr=0.0)
-
-    schedulers = config.build(optimizers, max_steps=5)
-
-    assert len(schedulers) == len(optimizers)
-    assert all(scheduler.optimizer is optimizer for scheduler, optimizer in zip(schedulers, optimizers))
-
-
-def test_ratio_lr_scheduler_does_not_mutate_config() -> None:
-    """Resolve ratio settings on a copied configuration."""
+def test_lr_scheduler_builds_without_warmup() -> None:
+    """Bind one cosine scheduler directly to one optimizer."""
     optimizer = _build_optimizer()
-    config = RatioBasedLRSchedulerConfig(
-        warmup_steps_ratio=0.2,
-        min_lr_ratio=0.1,
+
+    scheduler = cosine_with_warmup(
+        optimizer=optimizer,
+        train_steps=5,
+        lr_warmup_steps=0,
+        min_lr=0.0,
     )
 
-    schedulers = config.build(optimizer, max_steps=10)
-
-    assert len(schedulers) == 1
-    assert config.lr_warmup_steps is None
-    assert config.lr_decay_steps is None
-    assert config.min_lr is None
+    assert isinstance(scheduler, CosineAnnealingLR)
+    assert scheduler.optimizer is optimizer
 
 
-@pytest.mark.parametrize("max_steps", [0, -1, True])
-def test_lr_scheduler_rejects_invalid_max_steps(max_steps: int) -> None:
-    """Reject missing or invalid optimizer-update counts."""
-    with pytest.raises(ValueError, match="max_steps must be a positive integer"):
-        LRSchedulerConfig().build(_build_optimizer(), max_steps=max_steps)
+def test_lr_scheduler_builds_with_warmup() -> None:
+    """Compose linear warmup and cosine decay without a config wrapper."""
+    optimizer = _build_optimizer()
+
+    scheduler = cosine_with_warmup(
+        optimizer=optimizer,
+        train_steps=10,
+        lr_warmup_steps=2,
+        init_lr=1e-4,
+        max_lr=1e-3,
+    )
+
+    assert isinstance(scheduler, SequentialLR)
+    assert scheduler.optimizer is optimizer
+
+
+@pytest.mark.parametrize("train_steps", [0, -1])
+def test_lr_scheduler_rejects_invalid_train_steps(train_steps: int) -> None:
+    """Reject invalid optimizer-update counts."""
+    with pytest.raises(ValueError, match="train_steps must be at least 1"):
+        cosine_with_warmup(
+            optimizer=_build_optimizer(),
+            train_steps=train_steps,
+        )

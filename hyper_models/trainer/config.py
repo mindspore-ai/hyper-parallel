@@ -15,10 +15,9 @@
 """Typed configuration tree produced by the HyperModels YAML resolver."""
 
 import inspect
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Any, Callable, Generic, Literal, Optional, TypeVar
 
-import torch.nn as nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedTokenizerBase
@@ -182,10 +181,10 @@ class Target(Generic[_T]):
 class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
-    model: Target[nn.Module]
-    tokenizer: Target[PreTrainedTokenizerBase]
+    model: Target[Any]
     optimizer: Target[Optimizer]
-    lr_scheduler: Target[LRScheduler]
+    tokenizer: Optional[Target[PreTrainedTokenizerBase]] = None
+    lr_scheduler: Optional[Target[LRScheduler]] = None
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # parallelism configs
@@ -207,6 +206,15 @@ class TrainerConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the resolved trainer configuration for logging."""
+        return {
+            config_field.name: _serialize_config_value(
+                getattr(self, config_field.name)
+            )
+            for config_field in fields(self)
+        }
 
 
 def save_configs(config: TrainerConfig, output_dir: str) -> None:
