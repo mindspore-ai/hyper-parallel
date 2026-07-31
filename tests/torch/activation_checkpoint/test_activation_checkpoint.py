@@ -15,6 +15,8 @@
 """test activation checkpoint"""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
+from tests.torch.activation_checkpoint import activation_checkpoint as activation_checkpoint_cases
+from tests.torch.activation_checkpoint import checkpoint_cases
 
 ACTIVATION_CHECKPOINT = "activation_checkpoint.py"
 
@@ -36,3 +38,39 @@ def test_ac_memory_group():
         TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_overlap_detection_cases", 12406, 1),
         TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_non_overlapping_allowed_cases", 12407, 1)
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_native_npu_rng_for_closure_only_tensor_is_not_restored():
+    """Verify native checkpoint does not restore closure-only NPU RNG state."""
+    activation_checkpoint_cases.test_native_npu_rng_for_closure_only_tensor_is_not_restored()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_hyper_npu_rng_for_closure_only_tensor_matches_native():
+    """Verify Hyper matches native closure-only NPU RNG behavior."""
+    activation_checkpoint_cases.test_hyper_npu_rng_for_closure_only_tensor_matches_native()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_scheduled_recompute_supports_dx_dw_split() -> None:
+    """Verify one prefired recomputation serves separate dx and dw autograd calls."""
+    activation_checkpoint_cases.test_scheduled_recompute_supports_dx_dw_split()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_scheduled_recompute_npu_preserves_rng_state() -> None:
+    """Verify scheduled NPU recomputation preserves random state."""
+    activation_checkpoint_cases.test_scheduled_recompute_npu_preserves_rng_state()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_scheduled_recompute_npu_restores_autocast() -> None:
+    """Verify scheduled NPU recomputation restores autocast settings."""
+    activation_checkpoint_cases.test_scheduled_recompute_npu_restores_autocast()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_checkpoint_npu_semantics() -> None:
+    """Run eager checkpoint semantics and scheduling coverage on NPU."""
+    checkpoint_cases.run_checkpoint_cases()

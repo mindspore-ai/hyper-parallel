@@ -1468,7 +1468,33 @@ class TorchPlatform(Platform):
 
     @property
     def checkpoint(self):
-        return torch.utils.checkpoint.checkpoint
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import checkpoint
+        return checkpoint
+
+    @staticmethod
+    def recompute_handle_collector_ctx():
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import recompute_handle_collector_ctx
+        return recompute_handle_collector_ctx()
+
+    @staticmethod
+    def recompute_handle(handle, session_id):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import recompute_handle
+        return recompute_handle(handle, session_id)
+
+    @staticmethod
+    def recompute_session_ctx(session_id, retain_on_unpack=False):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import recompute_session_ctx
+        return recompute_session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack)
+
+    @staticmethod
+    def clear_recompute_session(session_id):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import clear_recompute_session
+        return clear_recompute_session(session_id)
 
     @staticmethod
     def checkpoint_wrapper(module, **checkpoint_kwargs):

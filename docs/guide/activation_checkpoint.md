@@ -53,7 +53,23 @@ def context_fn():
     return forward_context(), recompute_context()
 
 output = checkpoint(model.layer, x, context_fn=context_fn)
+
+# 控制是否在产生全部 backward 所需 tensor 后提前停止重计算
+output = checkpoint(model.layer, x, early_stop=True)   # 默认值，减少无效尾部计算
+output = checkpoint(model.layer, x, early_stop=False)  # 完整执行整个重计算区域
 ```
+
+Torch eager 模式在 2.6、2.7 和 2.9 上统一使用 HyperParallel 的 non-reentrant 实现，并固定
+`use_reentrant=False`。`early_stop` 只通过 Hyper 的单次调用关键字或配置字典控制：
+
+```python
+checkpoint_kwargs = {"early_stop": False, "preserve_rng_state": True}
+output = checkpoint(model.layer, x, **checkpoint_kwargs)
+```
+
+外层的 `torch.utils.checkpoint.set_checkpoint_early_stop()` 不会覆盖 Hyper eager checkpoint 的参数。
+`checkpoint_wrapper(model.layer, early_stop=False)` 使用相同规则。图编译状态暂时回退到 Torch 原生
+non-reentrant checkpoint；完整的 compile/context_fn 组合适配不在当前版本范围内。
 
 ### 2. 函数式 swap
 

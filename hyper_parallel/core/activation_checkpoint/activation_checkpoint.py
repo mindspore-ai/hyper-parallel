@@ -108,6 +108,7 @@ def checkpoint(
     policy_fn: Optional[Callable] = None,
     context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
     group_swap: bool = False,
+    early_stop: bool = True,
     **kwargs,
 ):
     """
@@ -129,11 +130,17 @@ def checkpoint(
             order and exit in reverse.
         group_swap (bool, optional): Whether MUST_SWAP tensors participate in group copy fusion.
             Only effective when ``policy_fn`` is provided. Default: ``False``.
+        early_stop (bool, optional): Whether recomputation stops after all tensors needed by
+            backward have been produced. This per-call keyword is the only supported way to
+            configure early stop. Default: ``True``.
         **kwargs: Additional keyword arguments to pass to the function.
 
     Returns:
         The result of applying the function with checkpointing.
     """
+    if not isinstance(early_stop, bool):
+        raise ValueError(f"early_stop must be bool, but got {type(early_stop).__name__}.")
+
     factories: list = [create_recompute_contexts]
     if policy_fn is not None:
         factories.append(partial(plat.create_selective_checkpoint_contexts, policy_fn, group_swap=group_swap))
@@ -148,7 +155,12 @@ def checkpoint(
     context = partial(plat.async_save_on_cpu, group_swap=group_swap) if swap_inputs else contextlib.nullcontext
     with context():
         return plat.checkpoint(
-            function, *args, context_fn=composed_context_fn, use_reentrant=False, **kwargs
+            function,
+            *args,
+            context_fn=composed_context_fn,
+            use_reentrant=False,
+            early_stop=early_stop,
+            **kwargs,
         )
 
 

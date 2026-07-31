@@ -13,6 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """framework platform api"""
+# Backend platform modules intentionally import this abstraction to register
+# their implementations; the resulting import cycle is architectural.
+# pylint: disable=cyclic-import
 import os
 from datetime import timedelta
 from enum import auto, Enum
@@ -1548,15 +1551,19 @@ class Platform:
         """Context manager binding recompute unpack to a caller-provided session.
 
         Args:
-            session_id: Stable session key.  Recompute caches are keyed by this
-                instead of the transient autodiff engine id, so a re-run fired
-                under one engine can be reused by another.
+            session_id: Required stable session key. Recompute caches are keyed
+                by this instead of the transient autodiff engine id, so a re-run
+                fired under one engine can be reused by another. Must not be
+                ``None``.
             retain_on_unpack (bool): When ``True``, unpack returns recomputed
                 tensors without popping them, so a later backward can consume
                 them.  Default: ``False``.
 
         Returns:
             A context manager activating the session for its scope.
+
+        Yields:
+            The supplied session id.
         """
         raise NotImplementedError("Platform subclasses must implement recompute_session_ctx")
 
