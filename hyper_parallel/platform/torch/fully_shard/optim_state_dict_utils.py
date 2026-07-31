@@ -198,6 +198,67 @@ def _convert_state_scalar(
     return tensor
 
 
+def _determine_is_root(
+    full_state_dict: bool,
+    cpu_offload: bool,
+    dtensor_info: Optional[Tuple[Any, Any]],
+) -> bool:
+    """Determine if current rank is the replicate-group root."""
+    if full_state_dict and cpu_offload and dtensor_info is not None:
+        return _is_replicate_group_root(dtensor_info[0], dtensor_info[1])
+    if full_state_dict and cpu_offload:
+        return (not dist.is_initialized()) or (dist.get_rank() == 0)
+    return True
+
+
+def _convert_state_entries(
+    state: Dict[str, Any],
+    param: nn.Parameter,
+    full_state_dict: bool,
+    cpu_offload: bool,
+) -> Dict[str, Any]:
+    """Convert optimizer state entries for a single parameter."""
+    dtensor_info = _get_param_dtensor_info(param)
+    is_root = _determine_is_root(full_state_dict, cpu_offload, dtensor_info)
+    skip_non_root = full_state_dict and cpu_offload and not is_root
+
+    converted: Dict[str, Any] = {}
+    for key, value in state.items():
+        if isinstance(value, torch.Tensor):
+            if _is_scalar_state(key):
+                result = _convert_state_scalar(value, cpu_offload)
+                if not skip_non_root:
+                    converted[key] = result
+            else:
+                result = _convert_state_tensor(
+                    value, param, full_state_dict, cpu_offload, is_root,
+                )
+                if result is not None:
+                    converted[key] = result
+        else:
+            if not skip_non_root:
+                converted[key] = value
+    return converted
+
+
+def _build_result_param_groups(
+    optimizer: torch.optim.Optimizer,
+    raw_sd: Dict[str, Any],
+    saved_id_to_fqn: Dict[int, str],
+) -> List[Dict[str, Any]]:
+    """Build result param_groups with FQN keys from saved id-based groups."""
+    result_param_groups: List[Dict[str, Any]] = []
+    for saved_group in raw_sd["param_groups"]:
+        pg: Dict[str, Any] = {}
+        for k, v in saved_group.items():
+            if k == "params":
+                pg["params"] = [saved_id_to_fqn[sid] for sid in v]
+            else:
+                pg[k] = v
+        result_param_groups.append(pg)
+    return result_param_groups
+
+
 def _check_chained_optimizer(optimizer: Any) -> None:
     if type(optimizer).__name__ == "ChainedOptimizer":
         raise ValueError(
@@ -247,41 +308,15 @@ def get_optim_state_dict(
     for saved_id, state in raw_sd["state"].items():
         fqn = saved_id_to_fqn[saved_id]
         param = param_by_id[saved_id]
-        dtensor_info = _get_param_dtensor_info(param)
-        if full_state_dict and cpu_offload and dtensor_info is not None:
-            is_root = _is_replicate_group_root(dtensor_info[0], dtensor_info[1])
-        elif full_state_dict and cpu_offload:
-            is_root = (not dist.is_initialized()) or (dist.get_rank() == 0)
-        else:
-            is_root = True
-        converted: Dict[str, Any] = {}
-        for key, value in state.items():
-            if isinstance(value, torch.Tensor):
-                if _is_scalar_state(key):
-                    result = _convert_state_scalar(value, cpu_offload)
-                    if not (full_state_dict and cpu_offload and not is_root):
-                        converted[key] = result
-                else:
-                    result = _convert_state_tensor(
-                        value, param, full_state_dict, cpu_offload, is_root,
-                    )
-                    if result is not None:
-                        converted[key] = result
-            else:
-                if not (full_state_dict and cpu_offload and not is_root):
-                    converted[key] = value
+        converted = _convert_state_entries(
+            state, param, full_state_dict, cpu_offload,
+        )
         if converted:
             result_state[fqn] = converted
 
-    result_param_groups: List[Dict[str, Any]] = []
-    for runtime_group, saved_group in zip(optimizer.param_groups, raw_sd["param_groups"]):
-        pg: Dict[str, Any] = {}
-        for k, v in saved_group.items():
-            if k == "params":
-                pg["params"] = [saved_id_to_fqn[sid] for sid in v]
-            else:
-                pg[k] = v
-        result_param_groups.append(pg)
+    result_param_groups = _build_result_param_groups(
+        optimizer, raw_sd, saved_id_to_fqn,
+    )
 
     result: Dict[str, Any] = {
         "state": result_state,
@@ -292,6 +327,154 @@ def get_optim_state_dict(
         result = _flatten_optim_state_dict(result)
 
     return result
+
+
+def _check_strict_fqns(
+    source_fqns: set,
+    target_fqns: set,
+    strict: bool,
+) -> None:
+    """Validate FQN compatibility under strict mode."""
+    if not strict:
+        return
+    extra_fqns = source_fqns - target_fqns
+    if extra_fqns:
+        raise ValueError(
+            f"strict=True but checkpoint contains FQNs not in target "
+            f"optimizer: {sorted(extra_fqns)}"
+        )
+
+
+def _load_state_values(
+    source_state: Dict[str, Any],
+    param: nn.Parameter,
+    full_state_dict: bool,
+    cpu_offload: bool,
+    stores_dtensor: bool,
+) -> Dict[str, Any]:
+    """Convert and load state values for a single FQN."""
+    converted: Dict[str, Any] = {}
+    for key, value in source_state.items():
+        if isinstance(value, torch.Tensor):
+            if _is_scalar_state(key):
+                converted[key] = _convert_input_scalar_to_target(
+                    value, param, cpu_offload, stores_dtensor,
+                )
+            else:
+                converted[key] = _convert_input_tensor_to_target(
+                    value, param, full_state_dict, cpu_offload, stores_dtensor,
+                )
+        else:
+            converted[key] = value
+    return converted
+
+
+def _merge_param_groups(
+    source_param_groups: List[Dict[str, Any]],
+    target_raw_sd: Dict[str, Any],
+    target_fqn_to_saved_id: Dict[str, int],
+) -> None:
+    """Merge source param_group fields into target param_groups in-place."""
+    if not source_param_groups:
+        return
+    target_saved_id_to_fqn = {v: k for k, v in target_fqn_to_saved_id.items()}
+
+    target_pg_by_fqns: Dict[frozenset, Dict[str, Any]] = {}
+    for saved_group in target_raw_sd["param_groups"]:
+        fqns_in_group = frozenset(
+            target_saved_id_to_fqn.get(sid, "")
+            for sid in saved_group.get("params", [])
+        )
+        target_pg_by_fqns[fqns_in_group] = saved_group
+
+    for source_pg in source_param_groups:
+        source_fqn_set = frozenset(source_pg.get("params", []))
+        matched_target_pg = None
+        for target_fqn_set, target_pg in target_pg_by_fqns.items():
+            if source_fqn_set & target_fqn_set:
+                matched_target_pg = target_pg
+                break
+        if matched_target_pg is None:
+            continue
+        for k, v in source_pg.items():
+            if k == "params":
+                continue
+            matched_target_pg[k] = v
+
+
+def _build_target_fqn_mappings(
+    optimizer: torch.optim.Optimizer,
+    model: nn.Module,
+    param_by_fqn: Dict[str, nn.Parameter],
+) -> Tuple[Dict[str, int], set]:
+    """Build target FQN→saved_id mapping and identify DTensor state IDs.
+
+    Returns:
+        Tuple of (fqn_to_saved_id, dtensor_state_ids).
+    """
+    target_raw_sd = optimizer.state_dict()
+
+    target_id_to_param: Dict[int, nn.Parameter] = {}
+    for runtime_group, saved_group in zip(optimizer.param_groups, target_raw_sd["param_groups"]):
+        for parameter, saved_id in zip(runtime_group["params"], saved_group["params"]):
+            target_id_to_param[saved_id] = parameter
+
+    fqn_to_saved_id: Dict[str, int] = {}
+    for saved_id, param in target_id_to_param.items():
+        for name, p in model.named_parameters():
+            if p is param:
+                fqn_to_saved_id[name] = saved_id
+                break
+
+    dtensor_state_ids: set = set()
+    for saved_id, state in target_raw_sd["state"].items():
+        for value in state.values():
+            if isinstance(value, DTensor):
+                dtensor_state_ids.add(saved_id)
+                break
+
+    return fqn_to_saved_id, dtensor_state_ids
+
+
+def _load_fqn_states(
+    optim_state_dict: Dict[str, Any],
+    target_raw_sd: Dict[str, Any],
+    target_fqn_to_saved_id: Dict[str, int],
+    param_by_fqn: Dict[str, nn.Parameter],
+    dtensor_state_ids: set,
+    full_state_dict: bool,
+    cpu_offload: bool,
+    strict: bool,
+) -> Dict[int, Dict[str, Any]]:
+    """Load source FQN states into the target state dict format.
+
+    Returns:
+        Updated state dict with saved_id keys.
+    """
+    new_state: Dict[int, Dict[str, Any]] = dict(target_raw_sd["state"])
+
+    for fqn, source_state in optim_state_dict.get("state", {}).items():
+        if fqn not in target_fqn_to_saved_id:
+            if strict:
+                raise ValueError(
+                    f"strict=True but FQN '{fqn}' not found in target optimizer."
+                )
+            continue
+
+        target_saved_id = target_fqn_to_saved_id[fqn]
+        param = param_by_fqn[fqn]
+
+        if target_saved_id not in new_state:
+            new_state[target_saved_id] = {}
+
+        new_state[target_saved_id].update(
+            _load_state_values(
+                source_state, param, full_state_dict, cpu_offload,
+                target_saved_id in dtensor_state_ids,
+            )
+        )
+
+    return new_state
 
 
 def set_optim_state_dict(
@@ -347,102 +530,31 @@ def set_optim_state_dict(
             optim_state_dict, model, full_state_dict, cpu_offload,
         )
 
-    _, fqn_to_saved_id = _build_id_to_fqn(optimizer, model)
     param_by_fqn: Dict[str, nn.Parameter] = {}
     for name, param in model.named_parameters():
         param_by_fqn[name] = param
 
-    target_raw_sd = optimizer.state_dict()
-
-    target_id_to_param: Dict[int, nn.Parameter] = {}
-    for runtime_group, saved_group in zip(optimizer.param_groups, target_raw_sd["param_groups"]):
-        for parameter, saved_id in zip(runtime_group["params"], saved_group["params"]):
-            target_id_to_param[saved_id] = parameter
-
-    target_fqn_to_saved_id: Dict[str, int] = {}
-    for saved_id, param in target_id_to_param.items():
-        for name, p in model.named_parameters():
-            if p is param:
-                target_fqn_to_saved_id[name] = saved_id
-                break
-
-    dtensor_state_ids: set = set()
-    for saved_id, state in target_raw_sd["state"].items():
-        for value in state.values():
-            if isinstance(value, DTensor):
-                dtensor_state_ids.add(saved_id)
-                break
-
-    new_state: Dict[int, Dict[str, Any]] = dict(target_raw_sd["state"])
+    target_fqn_to_saved_id, dtensor_state_ids = _build_target_fqn_mappings(
+        optimizer, model, param_by_fqn,
+    )
 
     source_fqns = set(optim_state_dict.get("state", {}).keys())
     target_fqns = set(target_fqn_to_saved_id.keys())
+    _check_strict_fqns(source_fqns, target_fqns, strict)
 
-    if strict:
-        extra_fqns = source_fqns - target_fqns
-        if extra_fqns:
-            raise ValueError(
-                f"strict=True but checkpoint contains FQNs not in target "
-                f"optimizer: {sorted(extra_fqns)}"
-            )
-
-    for fqn, source_state in optim_state_dict.get("state", {}).items():
-        if fqn not in target_fqn_to_saved_id:
-            if strict:
-                raise ValueError(
-                    f"strict=True but FQN '{fqn}' not found in target optimizer."
-                )
-            continue
-
-        target_saved_id = target_fqn_to_saved_id[fqn]
-        param = param_by_fqn[fqn]
-
-        if target_saved_id not in new_state:
-            new_state[target_saved_id] = {}
-
-        for key, value in source_state.items():
-            if isinstance(value, torch.Tensor):
-                if _is_scalar_state(key):
-                    converted = _convert_input_scalar_to_target(
-                        value, param, cpu_offload,
-                        target_saved_id in dtensor_state_ids,
-                    )
-                else:
-                    converted = _convert_input_tensor_to_target(
-                        value, param, full_state_dict, cpu_offload,
-                        target_saved_id in dtensor_state_ids,
-                    )
-                new_state[target_saved_id][key] = converted
-            else:
-                new_state[target_saved_id][key] = value
+    target_raw_sd = optimizer.state_dict()
+    new_state = _load_fqn_states(
+        optim_state_dict, target_raw_sd, target_fqn_to_saved_id,
+        param_by_fqn, dtensor_state_ids, full_state_dict, cpu_offload, strict,
+    )
 
     target_raw_sd["state"] = new_state
 
-    source_param_groups = optim_state_dict.get("param_groups", [])
-    if source_param_groups:
-        target_saved_id_to_fqn = {v: k for k, v in target_fqn_to_saved_id.items()}
-
-        target_pg_by_fqns: Dict[frozenset, Dict[str, Any]] = {}
-        for saved_group in target_raw_sd["param_groups"]:
-            fqns_in_group = frozenset(
-                target_saved_id_to_fqn.get(sid, "")
-                for sid in saved_group.get("params", [])
-            )
-            target_pg_by_fqns[fqns_in_group] = saved_group
-
-        for source_pg in source_param_groups:
-            source_fqn_set = frozenset(source_pg.get("params", []))
-            matched_target_pg = None
-            for target_fqn_set, target_pg in target_pg_by_fqns.items():
-                if source_fqn_set & target_fqn_set:
-                    matched_target_pg = target_pg
-                    break
-            if matched_target_pg is None:
-                continue
-            for k, v in source_pg.items():
-                if k == "params":
-                    continue
-                matched_target_pg[k] = v
+    _merge_param_groups(
+        optim_state_dict.get("param_groups", []),
+        target_raw_sd,
+        target_fqn_to_saved_id,
+    )
 
     optimizer.load_state_dict(target_raw_sd)
 
@@ -626,6 +738,156 @@ def _get_broadcast_groups(
     }]
 
 
+def _broadcast_fqn_list(
+    is_root: bool,
+    fqns: List[str],
+    pg: dist.ProcessGroup,
+    src_rank: int,
+) -> List[str]:
+    """Broadcast FQN list from root to all ranks in the replicate group."""
+    fqn_list = fqns if is_root else []
+    obj = [fqn_list]
+    dist.broadcast_object_list(obj, src=src_rank, group=pg)
+    return obj[0]
+
+
+def _build_state_schema(
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build schema dict describing the types and shapes of state entries."""
+    schema: Dict[str, Any] = {}
+    for key, value in state.items():
+        if isinstance(value, torch.Tensor):
+            schema[key] = {
+                "shape": tuple(value.shape),
+                "dtype": str(value.dtype),
+                "is_scalar": _is_scalar_state(key),
+            }
+        else:
+            schema[key] = {"type": type(value).__name__, "value": value}
+    return schema
+
+
+def _broadcast_schema_per_fqn(
+    fqn_list: List[str],
+    optim_state_dict: Dict[str, Any],
+    is_root: bool,
+    pg: dist.ProcessGroup,
+    src_rank: int,
+) -> Dict[str, Dict[str, Any]]:
+    """Broadcast schema for each FQN from root to all ranks."""
+    fqn_schema: Dict[str, Dict[str, Any]] = {}
+    for fqn in fqn_list:
+        if is_root and fqn in optim_state_dict.get("state", {}):
+            schema = _build_state_schema(optim_state_dict["state"][fqn])
+        else:
+            schema = {}
+        schema_list = [schema] if is_root else [None]
+        dist.broadcast_object_list(schema_list, src=src_rank, group=pg)
+        fqn_schema[fqn] = schema_list[0]
+    return fqn_schema
+
+
+def _get_local_device() -> torch.device:
+    """Get the device for the current local rank."""
+    local_rank = dist.get_rank() if dist.is_initialized() else 0
+    if torch.npu.is_available():
+        return torch.device(f"npu:{local_rank}")
+    return torch.device(f"cuda:{local_rank}")
+
+
+def _broadcast_scalar_entry(
+    key: str,
+    fqn: str,
+    info: Dict[str, Any],
+    optim_state_dict: Dict[str, Any],
+    is_root: bool,
+    src_rank: int,
+    pg: dist.ProcessGroup,
+    cpu_offload: bool,
+) -> torch.Tensor:
+    """Broadcast a scalar state entry and return the result tensor."""
+    dtype_str = info.get("dtype", "torch.float32")
+    dtype = _resolve_dtype(dtype_str)
+    device = _get_local_device()
+
+    if is_root and fqn in optim_state_dict.get("state", {}):
+        scalar_val = optim_state_dict["state"][fqn][key]
+        t = scalar_val.clone() if isinstance(scalar_val, torch.Tensor) else torch.tensor(scalar_val)
+        if t.dim() == 0:
+            t = t.reshape(1)
+    else:
+        t = torch.zeros(1, dtype=dtype)
+
+    if t.device.type == "cpu":
+        t = t.to(device)
+    dist.broadcast(t, src=src_rank, group=pg)
+    return t.reshape(()).cpu() if cpu_offload else t.reshape(())
+
+
+def _broadcast_tensor_entry(
+    key: str,
+    fqn: str,
+    info: Dict[str, Any],
+    optim_state_dict: Dict[str, Any],
+    is_root: bool,
+    src_rank: int,
+    pg: dist.ProcessGroup,
+    full_state_dict: bool,
+    cpu_offload: bool,
+) -> torch.Tensor:
+    """Broadcast a tensor state entry and return the result tensor."""
+    shape = info.get("shape", ())
+    dtype_str = info.get("dtype", "torch.float32")
+    dtype = _resolve_dtype(dtype_str)
+    device = _get_local_device()
+
+    if is_root and fqn in optim_state_dict.get("state", {}):
+        src_tensor = optim_state_dict["state"][fqn][key]
+        if src_tensor.device.type == "cpu":
+            src_tensor = src_tensor.to(device)
+    else:
+        src_tensor = torch.zeros(shape, dtype=dtype, device=device)
+
+    dist.broadcast(src_tensor, src=src_rank, group=pg)
+
+    if full_state_dict and cpu_offload:
+        return src_tensor.cpu() if is_root else src_tensor
+    return src_tensor.cpu() if cpu_offload else src_tensor
+
+
+def _broadcast_tensor_data_per_fqn(
+    fqn_list: List[str],
+    fqn_schema: Dict[str, Dict[str, Any]],
+    optim_state_dict: Dict[str, Any],
+    is_root: bool,
+    src_rank: int,
+    pg: dist.ProcessGroup,
+    full_state_dict: bool,
+    cpu_offload: bool,
+) -> Dict[str, Dict[str, Any]]:
+    """Broadcast tensor data for each FQN from root to all ranks."""
+    result_state: Dict[str, Dict[str, Any]] = {}
+    for fqn in fqn_list:
+        schema = fqn_schema[fqn]
+        if not schema:
+            continue
+        result_state[fqn] = {}
+        for key, info in schema.items():
+            is_scalar = info.get("is_scalar", False)
+            if is_scalar:
+                result_state[fqn][key] = _broadcast_scalar_entry(
+                    key, fqn, info, optim_state_dict,
+                    is_root, src_rank, pg, cpu_offload,
+                )
+            else:
+                result_state[fqn][key] = _broadcast_tensor_entry(
+                    key, fqn, info, optim_state_dict,
+                    is_root, src_rank, pg, full_state_dict, cpu_offload,
+                )
+    return result_state
+
+
 def _broadcast_state_from_rank0(
     optim_state_dict: Dict[str, Any],
     model: nn.Module,
@@ -661,105 +923,24 @@ def _broadcast_state_from_rank0(
         }
 
     group = groups[0]
-    fqns = group["fqns"]
     pg = group["pg"]
     src_rank = group["src_rank"]
     is_root = group["is_root"]
-    param_by_fqn = group["param_by_fqn"]
+    fqns = group["fqns"]
 
-    # ---- Phase 1: broadcast FQN list within replicate group ------
-    # The root broadcasts the FQN list so that all ranks in the same
-    # replicate subgroup agree on the iteration order.  This is scoped
-    # to the replicate-dim process group, NOT dist.group.WORLD, so
-    # different PP stages with different FQNs broadcast independently.
-    if is_root:
-        fqn_list = fqns
-    else:
-        fqn_list = []
-    obj = [fqn_list]
-    dist.broadcast_object_list(obj, src=src_rank, group=pg)
-    fqn_list = obj[0]
+    fqn_list = _broadcast_fqn_list(is_root, fqns, pg, src_rank)
+    fqn_schema = _broadcast_schema_per_fqn(
+        fqn_list, optim_state_dict, is_root, pg, src_rank,
+    )
+    result_state = _broadcast_tensor_data_per_fqn(
+        fqn_list, fqn_schema, optim_state_dict,
+        is_root, src_rank, pg, full_state_dict, cpu_offload,
+    )
 
-    # ---- Phase 2: broadcast schema per-FQN -----------------------
-    fqn_schema: Dict[str, Dict[str, Any]] = {}
-
-    for fqn in fqn_list:
-        if is_root and fqn in optim_state_dict.get("state", {}):
-            schema: Dict[str, Any] = {}
-            state = optim_state_dict["state"][fqn]
-            for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    schema[key] = {
-                        "shape": tuple(value.shape),
-                        "dtype": str(value.dtype),
-                        "is_scalar": _is_scalar_state(key),
-                    }
-                else:
-                    schema[key] = {"type": type(value).__name__, "value": value}
-        else:
-            schema = {}
-
-        schema_list = [schema] if is_root else [None]
-        dist.broadcast_object_list(schema_list, src=src_rank, group=pg)
-        fqn_schema[fqn] = schema_list[0]
-
-    # ---- Phase 3: broadcast tensor data per-FQN ------------------
-    result: Dict[str, Any] = {
-        "state": {},
+    return {
+        "state": result_state,
         "param_groups": optim_state_dict.get("param_groups", []),
     }
-
-    for fqn in fqn_list:
-        schema = fqn_schema[fqn]
-        if not schema:
-            continue
-        result["state"][fqn] = {}
-
-        for key, info in schema.items():
-            is_scalar = info.get("is_scalar", False)
-            shape = info.get("shape", ())
-            dtype_str = info.get("dtype", "torch.float32")
-
-            try:
-                dtype = getattr(torch, dtype_str.replace("torch.", ""))
-            except AttributeError:
-                dtype = torch.float32
-
-            local_rank = dist.get_rank() if dist.is_initialized() else 0
-            device = torch.device(
-                f"npu:{local_rank}" if torch.npu.is_available() else f"cuda:{local_rank}"
-            )
-
-            if is_scalar:
-                if is_root and fqn in optim_state_dict.get("state", {}):
-                    scalar_val = optim_state_dict["state"][fqn][key]
-                    t = scalar_val.clone() if isinstance(scalar_val, torch.Tensor) else torch.tensor(scalar_val)
-                    if t.dim() == 0:
-                        t = t.reshape(1)
-                else:
-                    t = torch.zeros(1, dtype=dtype)
-
-                if t.device.type == "cpu":
-                    t = t.to(device)
-                dist.broadcast(t, src=src_rank, group=pg)
-                result["state"][fqn][key] = t.reshape(()).cpu() if cpu_offload else t.reshape(())
-
-            else:
-                if is_root and fqn in optim_state_dict.get("state", {}):
-                    src_tensor = optim_state_dict["state"][fqn][key]
-                    if src_tensor.device.type == "cpu":
-                        src_tensor = src_tensor.to(device)
-                else:
-                    src_tensor = torch.zeros(shape, dtype=dtype, device=device)
-
-                dist.broadcast(src_tensor, src=src_rank, group=pg)
-
-                if full_state_dict and cpu_offload:
-                    result["state"][fqn][key] = src_tensor.cpu() if is_root else src_tensor
-                else:
-                    result["state"][fqn][key] = src_tensor.cpu() if cpu_offload else src_tensor
-
-    return result
 
 
 def _flatten_optim_state_dict(
@@ -805,6 +986,107 @@ def _flatten_optim_state_dict(
     return flat
 
 
+def _check_inconsistent_pg_fields(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+    fqn: str,
+    strict: bool,
+) -> None:
+    """Check and raise/warn on inconsistent param_group fields."""
+    common_keys = set(existing.keys()) & set(incoming.keys())
+    for k in common_keys:
+        if existing[k] != incoming[k]:
+            if strict:
+                raise ValueError(
+                    f"strict=True but param_group field '{k}' is "
+                    f"inconsistent within the same group: "
+                    f"existing={existing[k]!r}, "
+                    f"incoming(from {fqn})={incoming[k]!r}"
+                )
+            logger.warning(
+                "param_group field '%s' is inconsistent within the "
+                "same group: existing=%r, incoming(from %s)=%r. "
+                "Keeping existing value (strict=False).",
+                k, existing[k], fqn, incoming[k],
+            )
+
+
+def _parse_unflatten_entries(
+    flat_dict: Dict[str, Any],
+    known_fqns_sorted: List[str],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Parse flat dict entries into state and param_group_fields dicts.
+
+    Returns:
+        Tuple of (state, param_group_fields).
+    """
+    state: Dict[str, Dict[str, Any]] = {}
+    param_group_fields: Dict[str, Dict[str, Any]] = {}
+
+    for key, value in flat_dict.items():
+        if key.startswith("state."):
+            remainder = key[len("state."):]
+            fqn = _match_fqn_from_remainder(remainder, known_fqns_sorted)
+            if fqn is None:
+                raise ValueError(
+                    f"Cannot match FQN from flat key '{key}'. "
+                    f"Known FQNs: {known_fqns_sorted}"
+                )
+            state_key = remainder[len(fqn) + 1:]
+            state.setdefault(fqn, {})[state_key] = value
+
+        elif key.startswith("param_group."):
+            remainder = key[len("param_group."):]
+            fqn = _match_fqn_from_remainder(remainder, known_fqns_sorted)
+            if fqn is None:
+                raise ValueError(
+                    f"Cannot match FQN from flat key '{key}'. "
+                    f"Known FQNs: {known_fqns_sorted}"
+                )
+            field_name = remainder[len(fqn) + 1:]
+            param_group_fields.setdefault(fqn, {})[field_name] = value
+
+    return state, param_group_fields
+
+
+def _assemble_param_groups(
+    known_fqns: List[str],
+    state: Dict[str, Dict[str, Any]],
+    param_group_fields: Dict[str, Dict[str, Any]],
+    strict: bool,
+) -> List[Dict[str, Any]]:
+    """Assemble param_groups list from FQN-based state and fields."""
+    param_groups: List[Dict[str, Any]] = []
+    current_group: Dict[str, Any] = {"params": []}
+
+    for fqn in known_fqns:
+        if fqn in param_group_fields or fqn in state:
+            fields = param_group_fields.get(fqn, {})
+            if not current_group["params"]:
+                current_group["params"].append(fqn)
+                current_group.update(fields)
+            else:
+                existing_fields = {
+                    k: v for k, v in current_group.items() if k != "params"
+                }
+                if existing_fields == fields or not fields:
+                    current_group["params"].append(fqn)
+                else:
+                    _check_inconsistent_pg_fields(existing_fields, fields, fqn, strict)
+                    current_group["params"].append(fqn)
+
+    if current_group["params"]:
+        param_groups.append(current_group)
+
+    if not param_groups:
+        raise UnsupportedConfigurationError(
+            "Cannot unflatten: empty param_group in flatten format. "
+            "Provide a stable group_name or use non-flatten format."
+        )
+
+    return param_groups
+
+
 def _unflatten_optim_state_dict(
     flat_dict: Dict[str, Any],
     model: nn.Module,
@@ -828,85 +1110,8 @@ def _unflatten_optim_state_dict(
     known_fqns = [name for name, _ in model.named_parameters()]
     known_fqns_sorted = sorted(known_fqns, key=len, reverse=True)
 
-    def _match_fqn(dotted_key: str) -> Optional[str]:
-        for fqn in known_fqns_sorted:
-            if dotted_key == fqn or dotted_key.startswith(fqn + "."):
-                return fqn
-        return None
-
-    state: Dict[str, Dict[str, Any]] = {}
-    param_group_fields: Dict[str, Dict[str, Any]] = {}
-
-    for key, value in flat_dict.items():
-        if key.startswith("state."):
-            remainder = key[len("state."):]
-            fqn = _match_fqn(remainder)
-            if fqn is None:
-                raise ValueError(
-                    f"Cannot match FQN from flat key '{key}'. "
-                    f"Known FQNs: {known_fqns}"
-                )
-            state_key = remainder[len(fqn) + 1:]
-            state.setdefault(fqn, {})[state_key] = value
-
-        elif key.startswith("param_group."):
-            remainder = key[len("param_group."):]
-            fqn = _match_fqn(remainder)
-            if fqn is None:
-                raise ValueError(
-                    f"Cannot match FQN from flat key '{key}'. "
-                    f"Known FQNs: {known_fqns}"
-                )
-            field_name = remainder[len(fqn) + 1:]
-            param_group_fields.setdefault(fqn, {})[field_name] = value
-
-    param_groups: List[Dict[str, Any]] = []
-    current_group: Dict[str, Any] = {"params": []}
-
-    def _check_inconsistent_fields(
-        existing: Dict[str, Any], incoming: Dict[str, Any], fqn: str,
-    ) -> None:
-        common_keys = set(existing.keys()) & set(incoming.keys())
-        for k in common_keys:
-            if existing[k] != incoming[k]:
-                if strict:
-                    raise ValueError(
-                        f"strict=True but param_group field '{k}' is "
-                        f"inconsistent within the same group: "
-                        f"existing={existing[k]!r}, "
-                        f"incoming(from {fqn})={incoming[k]!r}"
-                    )
-                logger.warning(
-                    "param_group field '%s' is inconsistent within the "
-                    "same group: existing=%r, incoming(from %s)=%r. "
-                    "Keeping existing value (strict=False).",
-                    k, existing[k], fqn, incoming[k],
-                )
-
-    for fqn in known_fqns:
-        if fqn in param_group_fields or fqn in state:
-            fields = param_group_fields.get(fqn, {})
-            if not current_group["params"]:
-                current_group["params"].append(fqn)
-                current_group.update(fields)
-            else:
-                existing_fields = {
-                    k: v for k, v in current_group.items() if k != "params"
-                }
-                if existing_fields == fields or not fields:
-                    current_group["params"].append(fqn)
-                else:
-                    _check_inconsistent_fields(existing_fields, fields, fqn)
-                    current_group["params"].append(fqn)
-
-    if current_group["params"]:
-        param_groups.append(current_group)
-
-    if not param_groups:
-        raise UnsupportedConfigurationError(
-            "Cannot unflatten: empty param_group in flatten format. "
-            "Provide a stable group_name or use non-flatten format."
-        )
+    state, param_group_fields = _parse_unflatten_entries(flat_dict, known_fqns_sorted)
+    param_groups = _assemble_param_groups(known_fqns, state, param_group_fields, strict)
 
     return {
         "state": state,
@@ -973,6 +1178,97 @@ def _resolve_dtype(dtype_str: str) -> torch.dtype:
         return torch.float32
 
 
+def _match_fqn_from_remainder(
+    remainder: str,
+    known_fqns_sorted: List[str],
+) -> Optional[str]:
+    """Match a remainder string against known FQNs using longest-prefix match."""
+    for fqn in known_fqns_sorted:
+        if remainder == fqn or remainder.startswith(fqn + "."):
+            return fqn
+    return None
+
+
+def _build_saved_id_to_fqn(
+    optimizer: torch.optim.Optimizer,
+    param_by_fqn: Dict[str, nn.Parameter],
+) -> Dict[int, str]:
+    """Build mapping from optimizer saved IDs to FQNs."""
+    raw_sd = optimizer.state_dict()
+    saved_id_to_fqn: Dict[int, str] = {}
+    for runtime_group, saved_group in zip(optimizer.param_groups, raw_sd["param_groups"]):
+        for parameter, saved_id in zip(runtime_group["params"], saved_group["params"]):
+            for name, p in param_by_fqn.items():
+                if p is parameter:
+                    saved_id_to_fqn[saved_id] = name
+                    break
+    return saved_id_to_fqn
+
+
+def _parse_nested_state_entry(
+    meta_key: str,
+    meta_val: Any,
+    param_by_fqn: Dict[str, nn.Parameter],
+    full_state_dict: bool,
+    cpu_offload: bool,
+) -> Optional[Tuple[str, str, torch.Tensor]]:
+    """Parse a state.* metadata entry and return (fqn, state_key, tensor) or None."""
+    from hyper_parallel.core.distributed_checkpoint.metadata import (
+        TensorStorageMetadata,
+    )
+
+    remainder = meta_key[len("state."):]
+    fqns_sorted = sorted(param_by_fqn.keys(), key=len, reverse=True)
+    matched_fqn = _match_fqn_from_remainder(remainder, fqns_sorted)
+    if matched_fqn is None:
+        return None
+
+    state_key = remainder[len(matched_fqn) + 1:] if len(remainder) > len(matched_fqn) else None
+    if state_key is None:
+        return None
+
+    if not isinstance(meta_val, TensorStorageMetadata):
+        return None
+
+    dtype = _resolve_dtype(meta_val.properties.dtype)
+    global_shape = meta_val.size
+    param = param_by_fqn.get(matched_fqn)
+
+    if _is_scalar_state(state_key):
+        device = torch.device("cpu")
+        t = torch.zeros(global_shape, dtype=dtype, device=device)
+    else:
+        t = _create_empty_state_tensor(param, global_shape, dtype, full_state_dict, cpu_offload)
+
+    return matched_fqn, state_key, t
+
+
+def _parse_nested_param_group_entry(
+    meta_key: str,
+    meta_val: Any,
+) -> Optional[Tuple[int, str, torch.Tensor]]:
+    """Parse a param_group.* metadata entry and return (group_idx, field_name, tensor) or None."""
+    from hyper_parallel.core.distributed_checkpoint.metadata import (
+        TensorStorageMetadata,
+    )
+
+    remainder = meta_key[len("param_group."):]
+    parts = remainder.split(".", 1)
+    if len(parts) < 2:
+        return None
+    try:
+        group_idx = int(parts[0])
+    except ValueError:
+        return None
+    field_name = parts[1]
+
+    if not isinstance(meta_val, TensorStorageMetadata):
+        return None
+
+    dtype = _resolve_dtype(meta_val.properties.dtype)
+    return group_idx, field_name, torch.zeros(meta_val.size, dtype=dtype)
+
+
 def _build_nested_template_from_metadata(
     metadata: Any,
     optimizer: torch.optim.Optimizer,
@@ -992,24 +1288,12 @@ def _build_nested_template_from_metadata(
             "param_groups": [ { "params": [...], "<field>": value, ... }, ... ]
         }
     """
-    from hyper_parallel.core.distributed_checkpoint.metadata import (
-        TensorStorageMetadata,
-    )
-
     state: Dict[str, Dict[str, Any]] = {}
     param_groups_raw: Dict[int, Dict[str, Any]] = {}
     param_groups_fqns: Dict[int, List[str]] = {}
 
-    fqn_list = list(param_by_fqn.keys())
-
+    saved_id_to_fqn = _build_saved_id_to_fqn(optimizer, param_by_fqn)
     raw_sd = optimizer.state_dict()
-    saved_id_to_fqn: Dict[int, str] = {}
-    for runtime_group, saved_group in zip(optimizer.param_groups, raw_sd["param_groups"]):
-        for parameter, saved_id in zip(runtime_group["params"], saved_group["params"]):
-            for name, p in param_by_fqn.items():
-                if p is parameter:
-                    saved_id_to_fqn[saved_id] = name
-                    break
 
     for group_idx, saved_group in enumerate(raw_sd["param_groups"]):
         param_groups_raw[group_idx] = {
@@ -1021,51 +1305,17 @@ def _build_nested_template_from_metadata(
 
     for meta_key, meta_val in metadata.state_dict_metadata.items():
         if meta_key.startswith("state."):
-            remainder = meta_key[len("state."):]
-            matched_fqn = None
-            for fqn in sorted(param_by_fqn.keys(), key=len, reverse=True):
-                if remainder == fqn or remainder.startswith(fqn + "."):
-                    matched_fqn = fqn
-                    break
-            if matched_fqn is None:
-                continue
-
-            state_key = remainder[len(matched_fqn) + 1:] if len(remainder) > len(matched_fqn) else None
-            if state_key is None:
-                continue
-
-            param = param_by_fqn.get(matched_fqn)
-            if isinstance(meta_val, TensorStorageMetadata):
-                dtype = _resolve_dtype(meta_val.properties.dtype)
-                global_shape = meta_val.size
-
-                if _is_scalar_state(state_key):
-                    device = torch.device("cpu") if cpu_offload else torch.device("cpu")
-                    t = torch.zeros(global_shape, dtype=dtype, device=device)
-                else:
-                    t = _create_empty_state_tensor(
-                        param, global_shape, dtype,
-                        full_state_dict, cpu_offload,
-                    )
-
-                state.setdefault(matched_fqn, {})[state_key] = t
-
+            result = _parse_nested_state_entry(
+                meta_key, meta_val, param_by_fqn, full_state_dict, cpu_offload,
+            )
+            if result is not None:
+                fqn, state_key, t = result
+                state.setdefault(fqn, {})[state_key] = t
         elif meta_key.startswith("param_group."):
-            remainder = meta_key[len("param_group."):]
-            parts = remainder.split(".", 1)
-            if len(parts) < 2:
-                continue
-            try:
-                group_idx = int(parts[0])
-            except ValueError:
-                continue
-            field_name = parts[1]
-
-            if isinstance(meta_val, TensorStorageMetadata):
-                dtype = _resolve_dtype(meta_val.properties.dtype)
-                param_groups_raw.setdefault(group_idx, {})[field_name] = torch.zeros(
-                    meta_val.size, dtype=dtype,
-                )
+            result = _parse_nested_param_group_entry(meta_key, meta_val)
+            if result is not None:
+                group_idx, field_name, t = result
+                param_groups_raw.setdefault(group_idx, {})[field_name] = t
 
     result_param_groups: List[Dict[str, Any]] = []
     for group_idx in sorted(param_groups_fqns.keys()):
@@ -1096,15 +1346,12 @@ def _build_flatten_template_from_metadata(
     )
 
     flat: Dict[str, Any] = {}
+    fqns_sorted = sorted(param_by_fqn.keys(), key=len, reverse=True)
 
     for meta_key, meta_val in metadata.state_dict_metadata.items():
         if meta_key.startswith("state."):
             remainder = meta_key[len("state."):]
-            matched_fqn = None
-            for fqn in sorted(param_by_fqn.keys(), key=len, reverse=True):
-                if remainder == fqn or remainder.startswith(fqn + "."):
-                    matched_fqn = fqn
-                    break
+            matched_fqn = _match_fqn_from_remainder(remainder, fqns_sorted)
             if matched_fqn is None:
                 continue
 

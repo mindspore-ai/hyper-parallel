@@ -1066,7 +1066,6 @@ class Platform:
         raise NotImplementedError(
             "Platform subclasses must implement set_optim_state_dict"
         )
-        )
 
     @staticmethod
     def save_checkpoint(cell, file_path: str, ckpt_format: str = "safetensors") -> None:
