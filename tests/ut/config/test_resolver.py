@@ -14,6 +14,7 @@
 # ============================================================================
 """Tests for deferred target resolution and typed CLI overrides."""
 
+import json
 import tempfile
 import textwrap
 import unittest
@@ -22,6 +23,11 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 from hyper_models._transformers import HyperAutoModelForCausalLM
+from hyper_models.components.data import (
+    DataLoader,
+    DummyDataset,
+    MakeMicroBatchCollator,
+)
 from hyper_models.components.optim import AdamW, cosine_with_warmup
 from hyper_models.config.manager import parse_training_args
 from hyper_models.config.resolver import (
@@ -145,6 +151,37 @@ class TestTargetResolution(unittest.TestCase):
         )
         self.assertEqual(target.pretrained_model_name_or_path, "./model")
         self.assertTrue(target.force_hf)
+
+    def test_data_class_targets_are_deferred_and_serializable(self):
+        config = resolve_root(
+            _root(
+                dataset={
+                    "_target_": "hyper_models.components.data.datasets.DummyDataset",
+                    "num_samples": 16,
+                    "seq_len": 8,
+                    "vocab_size": 32,
+                },
+                collate_fn={
+                    "_target_": (
+                        "hyper_models.components.data.data_collator."
+                        "MakeMicroBatchCollator"
+                    ),
+                },
+                dataloader={
+                    "_target_": "hyper_models.components.data.dataloader.DataLoader",
+                },
+            )
+        )
+
+        self.assertIs(config.dataset._target_, DummyDataset)
+        self.assertIs(config.collate_fn._target_, MakeMicroBatchCollator)
+        self.assertIs(config.dataloader._target_, DataLoader)
+        serialized = config.to_dict()
+        json.dumps(serialized)
+        self.assertEqual(
+            serialized["collate_fn"]["internal_data_collator"],
+            "torch.utils.data._utils.collate.default_collate",
+        )
 
     def test_annotated_arguments_are_coerced_and_defaults_are_exposed(self):
         config = resolve_root(

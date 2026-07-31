@@ -66,30 +66,6 @@ def calculate_num_micro_batches(
     return global_batch_size // samples_per_distributed_micro_batch
 
 
-def build_micro_batch_collator(
-    *,
-    global_batch_size: int,
-    micro_batch_size: int,
-    dp_world_size: int,
-) -> "MakeMicroBatchCollator":
-    """Build the Trainer collator from runtime batch topology.
-
-    Args:
-        global_batch_size: Number of samples in one global optimizer step.
-        micro_batch_size: Number of samples in one local forward/backward pass.
-        dp_world_size: Number of data-parallel ranks.
-
-    Returns:
-        Collator that splits one local optimizer batch into micro-batches.
-    """
-    num_micro_batches = calculate_num_micro_batches(
-        global_batch_size=global_batch_size,
-        micro_batch_size=micro_batch_size,
-        dp_world_size=dp_world_size,
-    )
-    return MakeMicroBatchCollator(num_micro_batch=num_micro_batches)
-
-
 @dataclass
 class MakeMicroBatchCollator:
     """Split one per-rank optimizer batch into collated micro-batches.
@@ -185,6 +161,5 @@ class MakeMicroBatchCollator:
 
 __all__ = [
     "MakeMicroBatchCollator",
-    "build_micro_batch_collator",
     "calculate_num_micro_batches",
 ]

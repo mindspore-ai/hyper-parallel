@@ -50,6 +50,7 @@ from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
 from ..components.data.chat_template import ChatTemplate
+from ..components.data.data_collator import calculate_num_micro_batches
 from ..components.distributed.init_utils import get_local_rank_safe, get_global_rank_safe, get_world_size_safe
 from ..components.distributed.infrastructure import (
     create_distributed_setup_from_config,
@@ -379,34 +380,39 @@ class BaseTrainer(Stateful, ABC):
         """Build dataset-owned runtime state through the configured target."""
         if self.config.dataset is None:
             raise ValueError("config.dataset must define a build target")
-        result = self.config.dataset.build(
-            model_config=self.model_config,
-            seed=self.config.training.seed,
-            dp_rank=self.mesh.dp_rank,
-            train_steps=self.config.training.max_steps,
+        seed = self.config.training.seed
+        if seed is None:
+            seed = self.default_seed
+        self.train_dataset = self.config.dataset.build(
+            seed=seed + self.mesh.dp_rank,
         )
-        self.train_dataset = result.dataset
-        self.train_steps = result.train_steps
+        self.train_steps = self.config.training.max_steps
 
     def _build_collate_fn(self):
         """Build the collator through the configured target."""
         if self.config.collate_fn is None:
             raise ValueError("config.collate_fn must define a build target")
-        self.collate_fn = self.config.collate_fn.build(
-            global_batch_size=self.config.training.global_batch_size,
-            micro_batch_size=self.config.training.micro_batch_size,
+        training_config = self.config.training
+        num_micro_batches = calculate_num_micro_batches(
+            global_batch_size=training_config.global_batch_size,
+            micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.mesh.dp_size,
+        )
+        self.collate_fn = self.config.collate_fn.build(
+            num_micro_batch=num_micro_batches,
         )
 
     def _build_dataloader(self):
         """Build the training dataloader through the configured target."""
         if self.config.dataloader is None:
             raise ValueError("config.dataloader must define a build target")
+        local_step_batch_size = (
+            self.config.training.global_batch_size // self.mesh.dp_size
+        )
         self.train_dataloader = self.config.dataloader.build(
             dataset=self.train_dataset,
             collate_fn=self.collate_fn,
-            global_batch_size=self.config.training.global_batch_size,
-            dp_world_size=self.mesh.dp_size,
+            batch_size=local_step_batch_size,
         )
 
     def _build_optimizer(self):
