@@ -189,11 +189,7 @@ def custom_deepseek3(ccfg):
     """deepseekv3"""
     saved = Config({})
     if ccfg.config_format == "yaml":
-        saved.hff = (
-            ccfg.config.model.model_config.intermediate_size
-            if ccfg.config.model.model_config.intermediate_size
-            else ccfg.parser.init_hff()
-        )
+        saved.hff = int(ccfg.hff)
     elif ccfg.config_format == "json":
         saved.hff = ccfg.ffn_hidden_size
     else:

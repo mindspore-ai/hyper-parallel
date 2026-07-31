@@ -35,13 +35,13 @@ def _make_full_config(**overrides) -> NormalizedConfig:
     """Create a fully populated NormalizedConfig for testing."""
     spec = {
         "name": "test-dense",
-        "n_layers": 32,
-        "dim": 4096,
-        "inter_dim": 11008,
-        "n_heads": 32,
-        "n_kv_heads": 8,
+        "num_hidden_layers": 32,
+        "hidden_size": 4096,
+        "intermediate_size": 11008,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
         "vocab_size": 128256,
-        "seq_len": 8192,
+        "max_position_embeddings": 8192,
         "local_batch_size": 1,
         "compute_dtype": "bfloat16",
     }
@@ -127,7 +127,7 @@ class TestValidateBeforeSearch(unittest.TestCase):
         """Missing 'dim' raises ValueError."""
         runner = self._get_runner()
         config = _make_full_config()
-        config.model_spec["dim"] = 0
+        config.model_spec["hidden_size"] = 0
         with self.assertRaises(ValueError):
             runner._validate_before_search(config)
 
@@ -220,10 +220,13 @@ class TestResolveSearchDimensions(unittest.TestCase):
         runner = self._get_runner()
         config = _make_full_config()
         config.search_space["tensor_parallel_degree"] = [1, 2, 4]
-        dims = runner._resolve_search_dimensions(config)
+        dims, candidate_dims = runner._resolve_search_dimensions(config)
         dim_names = [d.acronym for d in dims]
         self.assertIn("MP", dim_names)
         self.assertIn("DP", dim_names)
+        self.assertIn(
+            next(d for d in dims if d.acronym == "MP"), candidate_dims
+        )
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
@@ -241,8 +244,9 @@ class TestResolveSearchDimensions(unittest.TestCase):
             "expert_parallel_degree": [1],
             "micro_batch_num": [1],
         }
-        dims = runner._resolve_search_dimensions(config)
+        dims, candidate_dims = runner._resolve_search_dimensions(config)
         self.assertEqual(len(dims), 0)
+        self.assertEqual(len(candidate_dims), 0)
 
 
 class TestBuildMachine(unittest.TestCase):
@@ -361,7 +365,7 @@ class TestSearchStrategies(unittest.TestCase):
         return_value=_make_mock_dim_module(),
     )
     @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
-    def test_search_strategies_returns_result(self, mock_parallelize_cls, _):
+    def test_search_strategies_returns_result(self, mock_parallelize_cls, mock_get_dim):  # pylint: disable=unused-argument
         """search_strategies returns a dict with expected keys."""
         mock_dims = MagicMock()
         mock_dims.dims_val = {

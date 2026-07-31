@@ -886,6 +886,281 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(hyperparallel_instance.args[0], "hyperparallel2")
             self.assertEqual(hyperparallel_instance.args[1]["machine"], 4)
 
+    def test_run_nd_cli_hyper_v2_basic(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover run_nd CLI with ``-f hyper_v2`` and no search config,
+                     exercising the standard Parallelize path.
+        Expectation: ``Parallelize`` is invoked with framework ``hyper_v2`` and
+                     the yaml path as ``input_config``.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            argv = [
+                "run_nd.py",
+                "-f", "hyper_v2",
+                "-y", config_path,
+                "-d", "128",
+                "-l", "DP", "MP", "PP",
+                "-v", "0",
+            ]
+            with patch.object(sys, "argv", argv):
+                runpy.run_module(
+                    "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                    run_name="__main__",
+                )
+            instance = _FakeParallelize.instances[-1]
+            self.assertEqual(instance.args[0], "hyper_v2")
+            self.assertEqual(instance.args[1], config_path)
+            self.assertEqual(instance.args[2].number, 128)
+
+    def test_run_nd_cli_hyper_v2_with_search_config(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover run_nd CLI with ``-f hyper_v2 -s search.yaml``,
+                     exercising the config_adapter branch that writes
+                     ``resolved.yaml``.
+        Expectation: ``read_search_config``, ``validate``,
+                     ``search_strategies``, and ``write_resolved_yaml`` are
+                     called; the standard ``Parallelize`` path is bypassed.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml = os.path.join(tmp_dir, "train.yaml")
+            search_yaml = os.path.join(tmp_dir, "search.yaml")
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+
+            fake_config = SimpleNamespace(resolved_strategy=None)
+            fake_result = {
+                "dp": 2, "tp": 1, "pp": 1, "cp": 1, "ep": 1,
+                "micro_batch_num": 1, "memory_estimate_mb": 100.0,
+                "score": 1.0,
+            }
+
+            with patch(
+                "hyper_parallel.auto_parallel.config_adapter.read_search_config",
+                return_value=fake_config,
+            ) as mock_read, \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.validate",
+                        return_value=[],
+                    ) as mock_validate, \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                        return_value=fake_result,
+                    ) as mock_search, \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml",
+                    ) as mock_write, \
+                    patch.object(Par, "Parallelize", _FakeParallelize):
+                _FakeParallelize.instances = []
+                argv = [
+                    "run_nd.py",
+                    "-f", "hyper_v2",
+                    "-y", train_yaml,
+                    "-s", search_yaml,
+                    "-o", tmp_dir,
+                    "-v", "0",
+                ]
+                with patch.object(sys, "argv", argv):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module(
+                            "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                            run_name="__main__",
+                        )
+                self.assertEqual(exc_info.exception.code, 0)
+
+            mock_read.assert_called_once_with(search_yaml)
+            mock_validate.assert_called_once_with(fake_config)
+            mock_search.assert_called_once_with(fake_config)
+            mock_write.assert_called_once_with(
+                fake_config, train_yaml, os.path.join(tmp_dir, "resolved.yaml"),
+            )
+            self.assertEqual(fake_config.resolved_strategy, fake_result)
+            self.assertEqual(len(_FakeParallelize.instances), 0)
+
+    def test_run_nd_cli_hyper_v2_search_config_validation_error(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover run_nd CLI with ``-f hyper_v2 -s search.yaml`` when
+                     validation reports hard errors — ``parser.error`` should
+                     exit and ``search_strategies`` must not be called.
+        Expectation: ``SystemExit`` is raised and no resolved.yaml is written.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml = os.path.join(tmp_dir, "train.yaml")
+            search_yaml = os.path.join(tmp_dir, "search.yaml")
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+
+            fake_config = SimpleNamespace(resolved_strategy=None)
+            fake_error = SimpleNamespace(
+                severity="error", field_path="cluster", message="missing",
+            )
+
+            with patch(
+                "hyper_parallel.auto_parallel.config_adapter.read_search_config",
+                return_value=fake_config,
+            ), \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.validate",
+                        return_value=[fake_error],
+                    ), \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                    ) as mock_search, \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml",
+                    ) as mock_write:
+                argv = [
+                    "run_nd.py",
+                    "-f", "hyper_v2",
+                    "-y", train_yaml,
+                    "-s", search_yaml,
+                    "-o", tmp_dir,
+                    "-v", "0",
+                ]
+                with patch.object(sys, "argv", argv):
+                    with self.assertRaises(SystemExit):
+                        runpy.run_module(
+                            "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                            run_name="__main__",
+                        )
+
+            mock_search.assert_not_called()
+            mock_write.assert_not_called()
+
+    def test_run_nd_cli_hyper_v2_b_override_search_config(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover run_nd CLI with ``-f hyper_v2 -s search.yaml -b 512``,
+                     verifying that ``-b/--global-batch-size`` overrides search
+                     config ``constraint.global_batch_size`` (Req 5).
+        Expectation: ``search_cfg.constraint["global_batch_size"]`` is set to
+                     the CLI value before ``validate`` and ``search_strategies``
+                     are invoked.
+        """
+        constraint = {"global_batch_size": 2048}
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml = os.path.join(tmp_dir, "train.yaml")
+            search_yaml = os.path.join(tmp_dir, "search.yaml")
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+
+            fake_config = SimpleNamespace(
+                resolved_strategy=None,
+                constraint=constraint,
+                cluster_spec={},
+            )
+            fake_result = {"dp": 1, "tp": 1, "pp": 1, "cp": 1, "ep": 1,
+                           "micro_batch_num": 1, "memory_estimate_mb": 100.0,
+                           "score": 1.0}
+
+            with patch(
+                "hyper_parallel.auto_parallel.config_adapter.read_search_config",
+                return_value=fake_config,
+            ), \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.validate",
+                        return_value=[],
+                    ), \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                        return_value=fake_result,
+                    ) as mock_search, \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml",
+                    ):
+                argv = [
+                    "run_nd.py",
+                    "-f", "hyper_v2",
+                    "-y", train_yaml,
+                    "-s", search_yaml,
+                    "-b", "512",
+                    "-v", "0",
+                ]
+                with patch.object(sys, "argv", argv):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module(
+                            "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                            run_name="__main__",
+                        )
+                self.assertEqual(exc_info.exception.code, 0)
+            self.assertEqual(constraint["global_batch_size"], 512)
+            mock_search.assert_called_once()
+
+    def test_run_nd_cli_hyper_v2_d_override_search_config(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover run_nd CLI with ``-f hyper_v2 -s search.yaml -d 64``,
+                     verifying that ``-d/--devices`` overrides search config
+                     ``cluster_spec.num_nodes``.
+        Expectation: ``search_cfg.cluster_spec["num_nodes"]`` is recomputed to
+                     ``max(1, 64 // cards_per_node)`` before the search starts.
+        """
+        cluster_spec = {"num_nodes": 16, "cards_per_node": 8, "device_type": "A2"}
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            train_yaml = os.path.join(tmp_dir, "train.yaml")
+            search_yaml = os.path.join(tmp_dir, "search.yaml")
+            with open(train_yaml, "w", encoding="utf-8") as fh:
+                fh.write("model:\n  name: test\n")
+            with open(search_yaml, "w", encoding="utf-8") as fh:
+                fh.write("parallelism:\n  dp: [1, 2]\n")
+
+            fake_config = SimpleNamespace(
+                resolved_strategy=None,
+                constraint={},
+                cluster_spec=cluster_spec,
+            )
+            fake_result = {"dp": 1, "tp": 1, "pp": 1, "cp": 1, "ep": 1,
+                           "micro_batch_num": 1, "memory_estimate_mb": 100.0,
+                           "score": 1.0}
+
+            with patch(
+                "hyper_parallel.auto_parallel.config_adapter.read_search_config",
+                return_value=fake_config,
+            ), \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.validate",
+                        return_value=[],
+                    ), \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.search_strategies",
+                        return_value=fake_result,
+                    ) as mock_search, \
+                    patch(
+                        "hyper_parallel.auto_parallel.config_adapter.write_resolved_yaml",
+                    ):
+                argv = [
+                    "run_nd.py",
+                    "-f", "hyper_v2",
+                    "-y", train_yaml,
+                    "-s", search_yaml,
+                    "-d", "64",
+                    "-v", "0",
+                ]
+                with patch.object(sys, "argv", argv):
+                    with self.assertRaises(SystemExit) as exc_info:
+                        runpy.run_module(
+                            "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                            run_name="__main__",
+                        )
+                self.assertEqual(exc_info.exception.code, 0)
+            self.assertEqual(cluster_spec["num_nodes"], 8)
+            mock_search.assert_called_once()
+
     def test_debug_csv_and_correlation_helpers(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -1155,7 +1430,7 @@ class TestSappNDRunND(unittest.TestCase):
             Debug.PerfParts,
         )
 
-        def fake_bulk_layer(param, lccfgs, **kwargs: Any) -> tuple:
+        def fake_bulk_layer(param: Any, lccfgs: Any, **kwargs: Any) -> tuple:
             """Advance the bulk comm layer cursor without doing layer math."""
             del param, lccfgs
             return kwargs["layer_count"] + 1, kwargs["idx_lccfg"]
@@ -1485,20 +1760,7 @@ class TestSappNDRunND(unittest.TestCase):
             cost_cfg.set_strategy(dp=2)
         cost_cfg.offset = [[0, 0], [0, 0]]
 
-        child = copy.copy(cost_cfg)
-        child.model_name = "child"
-        child.multimodal = False
-        multimodal = object.__new__(CostModelConfig)
-        multimodal.__dict__.update(
-            model_name="multi",
-            multimodal=True,
-            mm_ccfgs={"child": child},
-        )
-        multimodal.set_strategy(model_name="child", dp=3)
-        self.assertEqual(multimodal.get_strategy()["child"]["dp"], 3)
-        multimodal.print_parallelism()
-        with self.assertRaises(TypeError):
-            multimodal.set_strategy(model_name="missing", dp=1)
+        self._test_multimodal_strategy(cost_cfg)
 
         hook_calls = []
 
@@ -1519,6 +1781,22 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(wrapped_hook.__name__, "original_hook_custom_hook")
         self.assertTrue(any(call[0] == "set_ccfg" for call in hook_calls))
 
+    def _test_multimodal_strategy(self, cost_cfg: CostModelConfig) -> None:
+        """Exercise set_strategy via model_name routing and error handling."""
+        child = copy.copy(cost_cfg)
+        child.model_name = "child"
+        child.multimodal = False
+        multimodal = object.__new__(CostModelConfig)
+        multimodal.__dict__.update(
+            model_name="multi",
+            multimodal=True,
+            mm_ccfgs={"child": child},
+        )
+        multimodal.set_strategy(model_name="child", dp=3)
+        self.assertEqual(multimodal.get_strategy()["child"]["dp"], 3)
+        multimodal.print_parallelism()
+        with self.assertRaises(TypeError):
+            multimodal.set_strategy(model_name="missing", dp=1)
     def test_parallelize_layer_control_flow_without_estimators(self) -> None:
         """
         Feature: TestSappNDRunND.
@@ -1548,6 +1826,7 @@ class TestSappNDRunND(unittest.TestCase):
             """Small validity-controlled parallel configuration."""
 
             def __init__(self, valid: bool = True) -> None:
+                """Initialize with configured validity."""
                 self.valid = valid
                 self.all_dims = [Dim.DP]
 

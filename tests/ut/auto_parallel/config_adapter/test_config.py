@@ -49,13 +49,13 @@ def _make_dense_model_spec(**overrides) -> Dict[str, Any]:
     """Create a default dense model spec dict for testing."""
     spec = {
         "name": "test-dense",
-        "n_layers": 32,
-        "dim": 4096,
-        "inter_dim": 11008,
-        "n_heads": 32,
-        "n_kv_heads": 8,
+        "num_hidden_layers": 32,
+        "hidden_size": 4096,
+        "intermediate_size": 11008,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
         "vocab_size": 128256,
-        "seq_len": 8192,
+        "max_position_embeddings": 8192,
         "local_batch_size": 1,
         "moe_enabled": False,
     }
@@ -159,13 +159,13 @@ def _dense_search_yaml_content() -> str:
     return """
 model:
   name: "test-dense"
-  n_layers: 32
-  dim: 4096
-  inter_dim: 11008
-  n_heads: 32
-  n_kv_heads: 8
+  num_hidden_layers: 32
+  hidden_size: 4096
+  intermediate_size: 11008
+  num_attention_heads: 32
+  num_key_value_heads: 8
   vocab_size: 128256
-  seq_len: 8192
+  max_position_embeddings: 8192
   local_batch_size: 1
 
 cluster:
@@ -202,9 +202,9 @@ def _dense_hp_yaml_content() -> str:
 model:
   name: "test-dense"
   config_overrides:
-    n_layers: 32
-    dim: 4096
-    n_heads: 32
+    num_hidden_layers: 32
+    hidden_size: 4096
+    num_attention_heads: 32
     vocab_size: 128256
 
 train:
@@ -235,12 +235,12 @@ class TestTypes(unittest.TestCase):
     def test_validation_error_full(self) -> None:
         """ValidationError stores field_path, message, severity."""
         err = ValidationError(
-            field_path="model.dim",
-            message="dim must be divisible by tp",
+            field_path="model.hidden_size",
+            message="hidden_size must be divisible by tp",
             severity="error",
         )
-        self.assertEqual(err.field_path, "model.dim",
-                         f"Expected 'model.dim', got {err.field_path!r}")
+        self.assertEqual(err.field_path, "model.hidden_size",
+                         f"Expected 'model.hidden_size', got {err.field_path!r}")
         self.assertEqual(err.severity, "error",
                          f"Expected 'error', got {err.severity!r}")
 
@@ -282,10 +282,10 @@ class TestSearchConfigReader(unittest.TestCase):
         path = os.path.join(self.tmpdir, "search.yaml")
         _write_yaml(path, _dense_search_yaml_content())
         config = read_search_config(path)
-        self.assertEqual(config.model_spec["dim"], 4096,
-                         f"Expected 4096, got {config.model_spec['dim']}")
-        self.assertEqual(config.model_spec["n_layers"], 32,
-                         f"Expected 32, got {config.model_spec['n_layers']}")
+        self.assertEqual(config.model_spec["hidden_size"], 4096,
+                         f"Expected 4096, got {config.model_spec['hidden_size']}")
+        self.assertEqual(config.model_spec["num_hidden_layers"], 32,
+                         f"Expected 32, got {config.model_spec['num_hidden_layers']}")
         self.assertEqual(config.cluster_spec["num_nodes"], 4,
                          f"Expected 4, got {config.cluster_spec['num_nodes']}")
         self.assertIn("data_parallel_replicate_degree", config.search_space,
@@ -297,9 +297,9 @@ class TestSearchConfigReader(unittest.TestCase):
         """Scalar parallelism value sets both constraint.fixed_* and search_space."""
         content = """
 model:
-  n_layers: 10
-  dim: 1024
-  n_heads: 8
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
   vocab_size: 32000
 parallelism:
   tp: 4
@@ -319,9 +319,9 @@ parallelism:
         """List parallelism values populate search_space."""
         content = """
 model:
-  n_layers: 10
-  dim: 1024
-  n_heads: 8
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
   vocab_size: 32000
 parallelism:
   tp: [1, 2, 4]
@@ -339,9 +339,9 @@ parallelism:
         """'auto' dimension produces neither constraint nor search_space entry."""
         content = """
 model:
-  n_layers: 10
-  dim: 1024
-  n_heads: 8
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
   vocab_size: 32000
 parallelism:
   pp: auto
@@ -358,16 +358,16 @@ parallelism:
         """Missing optional fields get default values."""
         content = """
 model:
-  n_layers: 20
-  dim: 2048
-  n_heads: 16
+  num_hidden_layers: 20
+  hidden_size: 2048
+  num_attention_heads: 16
   vocab_size: 50000
 """
         path = os.path.join(self.tmpdir, "minimal.yaml")
         _write_yaml(path, content)
         config = read_search_config(path)
-        self.assertEqual(config.model_spec["n_layers"], 20,
-                         f"Expected 20, got {config.model_spec['n_layers']}")
+        self.assertEqual(config.model_spec["num_hidden_layers"], 20,
+                         f"Expected 20, got {config.model_spec['num_hidden_layers']}")
         self.assertEqual(config.cluster_spec.get("num_nodes", 1), 1,
                          "cluster_spec should default")
         self.assertEqual(config.pp_config["stage_partition_mode"], "uniform",
@@ -398,9 +398,9 @@ model:
         """Top-level recompute field maps to estimator.recompute_strategy."""
         content = """
 model:
-  n_layers: 10
-  dim: 1024
-  n_heads: 8
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
   vocab_size: 32000
 recompute: "full"
 """
@@ -413,9 +413,9 @@ recompute: "full"
         """fsdp short name maps to data_parallel_shard_degree."""
         content = """
 model:
-  n_layers: 10
-  dim: 1024
-  n_heads: 8
+  num_hidden_layers: 10
+  hidden_size: 1024
+  num_attention_heads: 8
   vocab_size: 32000
 parallelism:
   fsdp: [1, 2]
@@ -461,10 +461,10 @@ data:
         config = read_search_config(search_path)
 
         # Model params from train.yaml (normalized to internal short names)
-        self.assertEqual(config.model_spec["n_layers"], 16,
-                         f"Expected 16, got {config.model_spec.get('n_layers')}")
-        self.assertEqual(config.model_spec["dim"], 2048,
-                         f"Expected 2048, got {config.model_spec.get('dim')}")
+        self.assertEqual(config.model_spec["num_hidden_layers"], 16,
+                         f"Expected 16, got {config.model_spec.get('num_hidden_layers')}")
+        self.assertEqual(config.model_spec["hidden_size"], 2048,
+                         f"Expected 2048, got {config.model_spec.get('hidden_size')}")
         # Cluster from search.yaml
         self.assertEqual(config.cluster_spec["num_nodes"], 2)
         # TP explicitly declared as search dim
@@ -497,8 +497,8 @@ class TestHpYamlReader(unittest.TestCase):
         path = os.path.join(self.tmpdir, "train.yaml")
         _write_yaml(path, _dense_hp_yaml_content())
         config = read_hp_yaml_config(path)
-        self.assertEqual(config.model_spec["n_layers"], 32)
-        self.assertEqual(config.model_spec["dim"], 4096)
+        self.assertEqual(config.model_spec["num_hidden_layers"], 32)
+        self.assertEqual(config.model_spec["hidden_size"], 4096)
         self.assertEqual(config.search_space["data_parallel_shard_degree"], [1])
         self.assertEqual(config.search_space["tensor_parallel_degree"], [4])
         self.assertEqual(config.search_space["pipeline_parallel_degree"], [2])
@@ -545,32 +545,32 @@ class TestValidator(unittest.TestCase):
                         f"Expected product-exceeds error, got errors: {errors}")
 
     def test_ap_cfg_05_hidden_size_not_divisible_by_tp(self) -> None:
-        """AP-CFG-05: dim not divisible by tp_degree -> ERROR."""
+        """AP-CFG-05: hidden_size not divisible by tp_degree -> ERROR."""
         config = _make_full_config()
-        config.model_spec["dim"] = 4096
+        config.model_spec["hidden_size"] = 4096
         config.search_space["tensor_parallel_degree"] = [3]
         errors = validate(config)
         has_div_error = any(
             "divisible" in e.message.lower()
-            and "dim" in e.field_path
+            and "hidden_size" in e.field_path
             for e in errors
         )
         self.assertTrue(has_div_error,
-                        f"Expected dim divisibility error, got errors: {errors}")
+                        f"Expected hidden_size divisibility error, got errors: {errors}")
 
     def test_ap_cfg_06_seq_length_not_divisible_by_cp(self) -> None:
-        """AP-CFG-06: seq_len not divisible by cp_degree -> ERROR."""
+        """AP-CFG-06: max_position_embeddings not divisible by cp_degree -> ERROR."""
         config = _make_full_config()
-        config.model_spec["seq_len"] = 8191
+        config.model_spec["max_position_embeddings"] = 8191
         config.search_space["context_parallel_degree"] = [2]
         errors = validate(config)
         has_div_error = any(
             "divisible" in e.message.lower()
-            and "seq_len" in e.field_path
+            and "max_position_embeddings" in e.field_path
             for e in errors
         )
         self.assertTrue(has_div_error,
-                        f"Expected seq_len divisibility error, got errors: {errors}")
+                        f"Expected max_position_embeddings divisibility error, got errors: {errors}")
 
     def test_ap_cfg_07_num_experts_not_divisible_by_ep(self) -> None:
         """AP-CFG-07: num_experts not divisible by ep_degree -> ERROR."""
@@ -590,7 +590,7 @@ class TestValidator(unittest.TestCase):
     def test_ap_cfg_08_pp_stage_partition_validation(self) -> None:
         """AP-CFG-08: PP stage_partition validation."""
         config = _make_full_config()
-        config.model_spec["n_layers"] = 4
+        config.model_spec["num_hidden_layers"] = 4
         config.pp_config["pp_degree"] = 2
         config.pp_config["stage_partition_mode"] = "manual"
         config.pp_config["stage_partition"] = [[0, 1], [2, 3]]
@@ -602,7 +602,7 @@ class TestValidator(unittest.TestCase):
     def test_ap_cfg_08_pp_stage_partition_list_pp_passes_pp1(self) -> None:
         """AP-CFG-08: stage_partition not checked when pp_degree list includes 1."""
         config = _make_full_config()
-        config.model_spec["n_layers"] = 4
+        config.model_spec["num_hidden_layers"] = 4
         config.pp_config["pp_degree"] = [1, 2]
         config.pp_config["stage_partition_mode"] = "manual"
         config.pp_config["stage_partition"] = [[0, 1], [2, 3]]
@@ -614,7 +614,7 @@ class TestValidator(unittest.TestCase):
     def test_ap_cfg_08_pp_stage_count_mismatch(self) -> None:
         """AP-CFG-08: stage_partition count mismatch with pp_degree."""
         config = _make_full_config()
-        config.model_spec["n_layers"] = 6
+        config.model_spec["num_hidden_layers"] = 6
         config.pp_config["pp_degree"] = 4
         config.pp_config["stage_partition_mode"] = "manual"
         config.pp_config["stage_partition"] = [[0, 1], [2, 3]]
@@ -628,7 +628,7 @@ class TestValidator(unittest.TestCase):
     def test_ap_cfg_08_pp_stage_count_mismatch_list_pp(self) -> None:
         """AP-CFG-08: stage_partition mismatch when pp_degree is a list."""
         config = _make_full_config()
-        config.model_spec["n_layers"] = 6
+        config.model_spec["num_hidden_layers"] = 6
         config.pp_config["pp_degree"] = [2, 4]
         config.pp_config["stage_partition_mode"] = "manual"
         config.pp_config["stage_partition"] = [[0], [1], [2]]
@@ -684,7 +684,10 @@ class TestValidator(unittest.TestCase):
     def test_validate_strict_raises(self) -> None:
         """validate_strict raises ValueError on errors."""
         config = NormalizedConfig()
-        config.model_spec = {"n_layers": 32, "dim": 4096, "n_heads": 32, "vocab_size": 32000}
+        config.model_spec = {
+            "num_hidden_layers": 32, "hidden_size": 4096,
+            "num_attention_heads": 32, "vocab_size": 32000,
+        }
         config.cluster_spec = _make_cluster_spec(num_nodes=1, cards_per_node=8)
         config.search_space["data_parallel_replicate_degree"] = [32]
         config.search_space["tensor_parallel_degree"] = [16]
@@ -766,9 +769,9 @@ class TestValidator(unittest.TestCase):
                         f"Expected FSDP batch divisibility error, got {errors}")
 
     def test_pp_degree_exceeds_layers(self) -> None:
-        """pp_degree must not exceed n_layers."""
+        """pp_degree must not exceed num_hidden_layers."""
         config = _make_full_config()
-        config.model_spec["n_layers"] = 4
+        config.model_spec["num_hidden_layers"] = 4
         config.pp_config["pp_degree"] = 8
         errors = validate(config)
         has_pp_error = any(
@@ -780,7 +783,7 @@ class TestValidator(unittest.TestCase):
     def test_stage_partition_extra_layers(self) -> None:
         """stage_partition must not reference non-existent layers."""
         config = _make_full_config()
-        config.model_spec["n_layers"] = 4
+        config.model_spec["num_hidden_layers"] = 4
         config.pp_config["pp_degree"] = 2
         config.pp_config["stage_partition_mode"] = "manual"
         config.pp_config["stage_partition"] = [[0, 1], [99]]
@@ -839,8 +842,8 @@ class TestWriter(unittest.TestCase):
         self.assertTrue(os.path.isfile(path), f"Output file not created: {path}")
         with open(path, "r", encoding="utf-8") as fh:
             raw = json.load(fh)
-        self.assertEqual(raw["model_spec"]["n_layers"], 32,
-                         f"Expected 32, got {raw['model_spec']['n_layers']}")
+        self.assertEqual(raw["model_spec"]["num_hidden_layers"], 32,
+                         f"Expected 32, got {raw['model_spec']['num_hidden_layers']}")
 
     def test_write_strategy_config_default_fmt_json(self) -> None:
         """write_strategy_config uses json by default."""
@@ -924,8 +927,8 @@ class TestWriter(unittest.TestCase):
         with open(path, "r", encoding="utf-8") as fh:
             raw = json.load(fh)
         self.assertIn("_hyper_model", raw, f"_hyper_model missing: {list(raw.keys())}")
-        self.assertEqual(raw["_hyper_model"]["n_layers"], 32,
-                         f"Expected 32, got {raw['_hyper_model']['n_layers']}")
+        self.assertEqual(raw["_hyper_model"]["num_hidden_layers"], 32,
+                         f"Expected 32, got {raw['_hyper_model']['num_hidden_layers']}")
 
     def test_write_ppb_config_creates_dir(self) -> None:
         """write_ppb_config creates parent directory."""
@@ -938,8 +941,8 @@ class TestWriter(unittest.TestCase):
         """normalized_to_summary produces a correct summary."""
         config = _make_full_config()
         summary = normalized_to_summary(config)
-        self.assertEqual(summary["model"]["n_layers"], 32,
-                         f"Expected 32, got {summary['model']['n_layers']}")
+        self.assertEqual(summary["model"]["num_hidden_layers"], 32,
+                         f"Expected 32, got {summary['model']['num_hidden_layers']}")
         self.assertEqual(summary["cluster"]["total_cards"], 32,
                          f"Expected 32, got {summary['cluster']['total_cards']}")
         self.assertIn("data_parallel_replicate_degree", summary["search_space"],
@@ -953,7 +956,7 @@ class TestWriter(unittest.TestCase):
         write_strategy_config(config, path)
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        self.assertEqual(data["model_spec"]["n_layers"], 32,
+        self.assertEqual(data["model_spec"]["num_hidden_layers"], 32,
                          f"Roundtrip failed: {data['model_spec']}")
 
     def test_resolve_pp_degree_list(self) -> None:
@@ -1112,7 +1115,7 @@ class TestEndToEnd(unittest.TestCase):
         validate_strict(config)
 
         summary = normalized_to_summary(config)
-        self.assertEqual(summary["model"]["n_layers"], 32)
+        self.assertEqual(summary["model"]["num_hidden_layers"], 32)
         self.assertEqual(summary["cluster"]["total_cards"], 32)
 
 

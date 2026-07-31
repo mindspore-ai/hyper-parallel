@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Search runner — bridges NormalizedConfig to the ND search engine.
+"""Search runner -- bridges NormalizedConfig to the ND search engine.
 
 Converts a :class:`NormalizedConfig` into a temporary HyperParallel
 ``train.yaml``, runs the ND search via :class:`Parallelize`,
@@ -22,11 +22,22 @@ post-filters by user candidate lists, and returns the optimal strategy.
 import logging
 import os
 import tempfile
-from typing import Any, Dict, List, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import yaml  # type: ignore[import-untyped]
 
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
+
+
+CONFIG_OVERRIDE_FIELDS = [
+    "hidden_size", "num_hidden_layers", "num_attention_heads", "vocab_size",
+    "intermediate_size", "num_key_value_heads", "max_position_embeddings",
+    "num_experts", "num_experts_per_tok", "num_shared_experts",
+    "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
+    "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
+    "qk_rope_head_dim", "v_head_dim", "capacity_factor", "offset",
+    "param_init_type", "compute_dtype", "softmax_compute_type",
+]
 
 if TYPE_CHECKING:
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
@@ -82,9 +93,9 @@ def _validate_before_search(config: NormalizedConfig) -> None:
     """
     model = config.model_spec
     required = {
-        "model_spec.n_layers": model.get("n_layers", 0),
-        "model_spec.dim": model.get("dim", 0),
-        "model_spec.n_heads": model.get("n_heads", 0),
+        "model_spec.num_hidden_layers": model.get("num_hidden_layers", 0),
+        "model_spec.hidden_size": model.get("hidden_size", 0),
+        "model_spec.num_attention_heads": model.get("num_attention_heads", 0),
         "model_spec.vocab_size": model.get("vocab_size", 0),
         "cluster_spec": config.cluster_spec,
     }
@@ -102,12 +113,38 @@ def _validate_before_search(config: NormalizedConfig) -> None:
         )
 
 
+def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the ``model`` section of the HP YAML from *model* spec.
+
+    All ``config_overrides`` field names in *model* already match the
+    HP YAML convention, so they are passed through directly without
+    any name mapping.
+
+    Args:
+        model: The ``model_spec`` dict from :class:`NormalizedConfig`.
+
+    Returns:
+        A dict suitable for the ``model`` key of a HP ``train.yaml``.
+    """
+    model_dict: Dict[str, Any] = {
+        "name": model.get("name", "custom"),
+        "config_overrides": {},
+    }
+    overrides = model_dict["config_overrides"]
+    for key in CONFIG_OVERRIDE_FIELDS:
+        val = model.get(key)
+        if val is not None:
+            overrides[key] = val
+
+    return model_dict
+
+
 def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     """Build a HyperParallel ``train.yaml`` dict from *config*.
 
     Fixed dimensions (``constraint.fixed_*_degree``) are written directly
     into ``train.accelerator``.  Dimensions with search-space candidates
-    use the first candidate as a placeholder — the actual search is driven
+    use the first candidate as a placeholder -- the actual search is driven
     by the ``dimensions`` parameter passed to :class:`Parallelize`.
     """
     model = config.model_spec
@@ -116,7 +153,7 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
 
     accel: Dict[str, Any] = {}
 
-    # Fixed dimensions → write actual value.
+    # Fixed dimensions -- write actual value.
     fixed_map = {
         "fixed_dp_degree": ("dp_replicate", "data_parallel_replicate_degree", [1]),
         "fixed_fsdp_degree": ("dp_shard", "data_parallel_shard_degree", [1]),
@@ -124,6 +161,7 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
         "fixed_pp_degree": ("pipeline_parallel_degree", "pipeline_parallel_degree", [1]),
         "fixed_cp_degree": ("context_parallel_degree", "context_parallel_degree", [1]),
         "fixed_ep_degree": ("expert_parallel_degree", "expert_parallel_degree", [1]),
+        "fixed_etp_degree": ("expert_tensor_parallel_degree", "expert_tensor_parallel_degree", [0]),
     }
     for constraint_key, (accel_key, space_key, default) in fixed_map.items():
         fixed_val = constraint.get(constraint_key)
@@ -141,42 +179,49 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     if cp_algo:
         accel["context_parallel_algo"] = cp_algo
 
+    # Optional accelerator fields that affect memory estimation.
+    owss = model.get("optimizer_weight_shard_size")
+    if owss and owss > 0:
+        accel["optimizer_weight_shard_size"] = owss
+
+    use_sp = model.get("use_seq_parallel", True)
+    accel.setdefault("use_seq_parallel", bool(use_sp))
+
     recompute = config.estimator.get("recompute_strategy", "none")
 
+    cluster = config.cluster_spec
+    device_mem_gb = cluster.get("device_memory_gb", 0)
+    context: Dict[str, Any] = {}
+    if device_mem_gb > 0:
+        context["max_device_memory"] = f"{device_mem_gb}GB"
+
+    gc_dict: Dict[str, Any] = {"activation_checkpoint": recompute}
+    recompute_slice = model.get("recompute_slice_activation")
+    if recompute_slice is not None:
+        gc_dict["recompute_slice_activation"] = bool(recompute_slice)
+
+    model_dict = _build_model_dict(model)
+
     hp_yaml: dict = {
-        "model": {
-            "name": model.get("name", "custom"),
-            "config_overrides": {
-                "hidden_size": model.get("dim", 4096),
-                "num_hidden_layers": model.get("n_layers", 32),
-                "num_attention_heads": model.get("n_heads", 32),
-                "vocab_size": model.get("vocab_size", 128256),
-            },
-        },
+        "model": model_dict,
         "train": {
-            "global_batch_size": constraint.get("global_batch_size", 0) or 1,
+            "global_batch_size": constraint.get("global_batch_size", 0),
             "micro_batch_size": model.get("local_batch_size", 1),
             "micro_batch_num": accel.pop("micro_batch_num", 1),
             "accelerator": accel,
-            "gradient_checkpointing": {
-                "activation_checkpoint": recompute,
-            },
+            "gradient_checkpointing": gc_dict,
             "mixed_precision": {
                 "enabled": True,
                 "param_dtype": model.get("compute_dtype", "bfloat16"),
             },
         },
         "data": {
-            "max_seq_len": model.get("seq_len", 4096),
+            "max_seq_len": model.get("max_position_embeddings", 4096),
         },
     }
 
-    # Optional model fields.
-    overrides = hp_yaml["model"]["config_overrides"]
-    if model.get("inter_dim"):
-        overrides["intermediate_size"] = model["inter_dim"]
-    if model.get("n_kv_heads"):
-        overrides["num_key_value_heads"] = model["n_kv_heads"]
+    if context:
+        hp_yaml["context"] = context
 
     return hp_yaml
 
@@ -206,35 +251,65 @@ def _build_machine(config: NormalizedConfig) -> Any:
     return hw_mod.Machine(total_devices, device_type)
 
 
-def _resolve_search_dimensions(config: NormalizedConfig) -> List[Any]:
-    """Return a list of ``Dim`` objects whose candidates contain >1 value.
+def _resolve_search_dimensions(config: NormalizedConfig) -> Tuple[List[Any], Set[Any]]:
+    """Return search dimensions and the set of dimensions with user candidates.
 
     List-valued entries in ``config.search_space`` are treated as
     **output** (search) dimensions.  Entries absent from
-    ``search_space`` (``"auto"`` in YAML) are also included — they
+    ``config.search_space`` (``"auto"`` in YAML) are also included -- they
     will be determined by ND's ``bound_space()``.
+
+    Returns:
+        A tuple ``(dims, candidate_dims)`` where *dims* is the list of
+        ``Dim`` objects to pass to ND and *candidate_dims* is the set of
+        Dim objects for which the user supplied an explicit candidate list
+        (used by :func:`_post_filter`).
     """
     dims: List[Any] = []
+    candidate_dims: Set[Any] = set()
     space = config.search_space
     for space_key, dim_obj in _search_dim_map().items():
         candidates = space.get(space_key)
         if candidates is not None and len(candidates) > 1:
             dims.append(dim_obj)
+            candidate_dims.add(dim_obj)
         elif space_key not in space:
             dims.append(dim_obj)
-    return dims
+    return dims, candidate_dims
 
 
 def _post_filter(
     scored_space: list,
     config: NormalizedConfig,
+    candidate_dims: Optional[Set[Any]] = None,
 ) -> list:
-    """Keep only entries whose dimension values are in the user's candidate lists."""
+    """Keep only entries whose dimension values are in the user's candidate lists.
+
+    Args:
+        scored_space: The scored strategy list from ND engine.
+        config: The normalized config containing ``search_space``.
+        candidate_dims: The set of Dim objects that have user-supplied
+            candidate lists with more than one value.  If *None*, the
+            set is derived from *config* (backward-compatible).
+
+    Returns:
+        A filtered list.  May be empty if no entry satisfies all
+        candidate constraints -- the caller decides how to handle this.
+    """
     space = config.search_space
+    if candidate_dims is None:
+        candidate_dims = set()
+        for space_key, dim_obj in _search_dim_map().items():
+            candidates = space.get(space_key)
+            if candidates is not None and len(candidates) > 1:
+                candidate_dims.add(dim_obj)
+
     candidate_map: Dict[Any, List[int]] = {}
     for space_key, dim_obj in _search_dim_map().items():
+        if dim_obj not in candidate_dims:
+            continue
         candidates = space.get(space_key)
-        if candidates is not None and len(candidates) > 1:
+        if candidates is not None:
             candidate_map[dim_obj] = candidates
 
     filtered = []
@@ -251,8 +326,8 @@ def _post_filter(
 
     if not filtered and scored_space:
         logger.warning(
-            "Post-filter removed ALL %d candidates. "
-            "Returning unfiltered best entry.",
+            "Post-filter removed ALL %d candidates; "
+            "no strategy matches the user's candidate constraints.",
             len(scored_space),
         )
         return scored_space[:1]
@@ -278,6 +353,8 @@ def _format_result(best_entry: tuple) -> Dict[str, Any]:
     for dim_obj, key in dim_to_key.items():
         if dim_obj in dims_val:
             result[key] = int(dims_val[dim_obj])
+    result.setdefault("cp", 1)
+    result.setdefault("ep", 1)
     return result
 
 
@@ -309,7 +386,7 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
 
     yaml_path = _write_temp_hp_yaml(config)
     machine = _build_machine(config)
-    dims = _resolve_search_dimensions(config)
+    dims, candidate_dims = _resolve_search_dimensions(config)
 
     import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as _Par  # pylint: disable=C0415
     try:
@@ -334,7 +411,7 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
     if not scored_space:
         raise ValueError("ND search returned no valid strategies.")
 
-    filtered = _post_filter(scored_space, config)
+    filtered = _post_filter(scored_space, config, candidate_dims)
     best = filtered[0]
     result = _format_result(best)
 

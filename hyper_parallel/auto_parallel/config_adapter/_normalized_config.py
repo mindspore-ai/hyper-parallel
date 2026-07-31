@@ -24,28 +24,31 @@ class NormalizedConfig:
 
     Holds all configuration sections as plain dicts for maximum
     compatibility with PR631's Config class (sapp_nd.nd.common.config).
-    The dict keys
-    follow PR631's HyperParallel TOML naming conventions.
+    The ``model_spec`` field names follow the HuggingFace-style
+    ``config_overrides`` convention (e.g. ``hidden_size``,
+    ``num_hidden_layers``), matching the HP ``train.yaml`` format.
 
-    **Required model_spec fields**: ``n_layers``, ``dim``, ``n_heads``,
-    ``vocab_size``.
+    **Required model_spec fields**: ``num_hidden_layers``, ``hidden_size``,
+    ``num_attention_heads``, ``vocab_size``.
 
-    **Optional model_spec fields**: ``inter_dim``, ``n_kv_heads``,
-    ``seq_len``, ``local_batch_size``, ``params_dtype``, ``compute_dtype``,
-    ``softmax_compute_dtype``, ``moe_enabled``, ``num_experts``,
-    ``num_experts_per_tok``, ``num_shared_experts``, ``moe_inter_dim``,
-    ``use_flash_attention``, ``use_clip_grad``, ``use_seq_parallel``,
-    ``vocab_emb_dp``, ``enable_parallel_optimizer``,
-    ``gradient_accumulation_shard``, ``optimizer_weight_shard_size``,
-    ``enable_weight_tying``, ``multiple_of``, ``ffn_dim_multiplier``,
-    ``mtp_depth``, ``n_dense_layers``, ``kv_lora_rank``, ``q_lora_rank``,
-    ``qk_rope_head_dim``, ``v_head_dim``, ``qk_nope_head_dim``,
-    ``capacity_factor``, ``first_k_dense_replace``, ``topk_group``,
-    ``n_group``, ``routed_scaling_factor``.
+    **Optional model_spec fields**: ``intermediate_size``,
+    ``num_key_value_heads``, ``max_position_embeddings``,
+    ``local_batch_size``, ``compute_dtype``,
+    ``softmax_compute_type``, ``moe_enabled``, ``num_experts``,
+    ``num_experts_per_tok``, ``num_shared_experts``, ``moe_intermediate_size``,
+    ``use_flash_attention``, ``use_seq_parallel``,
+    ``optimizer_weight_shard_size``,
+    ``enable_parallel_optimizer``,
+    ``multiple_of``, ``ffn_dim_multiplier``,
+    ``mtp_depth``, ``first_k_dense_replace``, ``kv_lora_rank``,
+    ``q_lora_rank``, ``qk_rope_head_dim``, ``v_head_dim``,
+    ``capacity_factor``, ``offset``,
+    ``param_init_type``, ``recompute_slice_activation``.
 
     Args:
         model_spec: Model architecture parameters. Must contain at least
-            ``n_layers``, ``dim``, ``n_heads``, ``vocab_size``.
+            ``num_hidden_layers``, ``hidden_size``, ``num_attention_heads``,
+            ``vocab_size``.
         cluster_spec: Hardware cluster description.
         search_space: Parallel dimension candidate values, e.g.
             ``{"dp": [1,2,4], "tp": [1,2,4,8], "pp": [1,2], "cp": [1], "ep": [1]}``.
