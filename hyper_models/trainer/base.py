@@ -46,7 +46,7 @@ from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
-from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
+from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
 from ..components.data.chat_template import ChatTemplate
@@ -354,17 +354,20 @@ class BaseTrainer(Stateful, ABC):
         # set_checkpoint_debug_enabled(self.config.gradient_checkpointing.debug)
 
     def _build_model(self) -> None:
-        """Build model-owned runtime state through the configured target."""
+        """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
-        result = self.config.model.build(
+        self.model = self.config.model.build(
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
         )
-        self.model = result.model
-        self.optimizer_init = result.optimizer_init
-        self.model_config = result.model_config
-        self.model_parts = result.model_parts
-        self.hsdp_model_parts = result.hsdp_model_parts
+        self.model_config = self.model.config
+        model_parts = getattr(self.model, "parts", None)
+        self.model_parts = list(model_parts) if model_parts is not None else [self.model]
+        self.hsdp_model_parts = [
+            model_part
+            for model_part in self.model_parts
+            if isinstance(model_part, HSDPModule)
+        ]
 
     def _build_model_assets(self):
         """Build model assets for the temporary dummy-data training path."""
@@ -408,11 +411,9 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_optimizer(self):
         config: TrainerConfig = self.config
-        # Build optimizer
         self.optimizer = config.optimizer.build(
             model=self.model,
             device_mesh=self.device_mesh,
-            optimizer_init=self.optimizer_init,
             is_peft=self.peft_config is not None,
         )
 
@@ -594,7 +595,10 @@ class BaseTrainer(Stateful, ABC):
         hsdp_sync_stream()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
-        grad_norm = clip_grad_norm_(self.model, config.optimizer.max_grad_norm)
+        grad_norm = clip_grad_norm_(
+            self.model,
+            config.training.max_grad_norm,
+        )
 
         # Optimizer and scheduler step
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]

@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""YAML-configurable optimizer implementations."""
+"""YAML-targeted optimizer implementations."""
 
-from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -33,10 +32,6 @@ class AdamW(torch.optim.AdamW):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         foreach: Optional[bool] = None,
-        max_grad_norm: float = 1.0,
-        optimizer_init: Optional["OptimizerInit"] = None,
-        device_mesh: Optional[Any] = None,
-        is_peft: bool = False,
     ) -> None:
         """Initialize AdamW from a runtime model.
 
@@ -47,17 +42,8 @@ class AdamW(torch.optim.AdamW):
             betas: AdamW coefficient pair.
             eps: AdamW numerical-stability term.
             foreach: Whether to use the foreach implementation.
-            max_grad_norm: Gradient clipping threshold exposed to the trainer.
-            optimizer_init: Model-owned optimizer parameter groups.
-            device_mesh: Runtime mesh reserved for optimizer-specific policies.
-            is_peft: Whether the model uses parameter-efficient fine-tuning.
         """
-        del max_grad_norm, device_mesh, is_peft
-        if optimizer_init is not None and optimizer_init.param_groups:
-            param_groups = [dict(group) for group in optimizer_init.param_groups]
-            param_groups[0]["weight_decay"] = weight_decay
-        else:
-            param_groups = _build_param_groups(model, weight_decay)
+        param_groups = _build_param_groups(model, weight_decay)
         super().__init__(
             param_groups,
             lr=lr,
@@ -104,52 +90,4 @@ def _is_no_decay(name: str) -> bool:
     return any(pattern in name.lower() for pattern in no_decay_patterns)
 
 
-@dataclass
-class OptimizerInit:
-    """Optimizer initialization data exported by the model builder."""
-
-    param_groups: list[dict]
-    device_mesh: Optional[Any] = None
-    is_peft: bool = False
-    tp_grad_info: Any = None
-
-    @classmethod
-    def from_distributed_setup(
-        cls,
-        *,
-        distributed_setup: Optional[Any] = None,
-        model: Optional[nn.Module] = None,
-        peft_config: Optional[Any] = None,
-        weight_decay: float = 0.0,
-    ) -> "OptimizerInit":
-        """Derive optimizer parameter groups from a built model.
-
-        Args:
-            distributed_setup: Distributed model setup, when available.
-            model: Materialized runtime model.
-            peft_config: PEFT configuration, when enabled.
-            weight_decay: Weight decay applied to decay parameter groups.
-
-        Returns:
-            Runtime optimizer initialization data.
-
-        Raises:
-            ValueError: If ``model`` is not provided.
-        """
-        if model is None:
-            raise ValueError("model must be provided to build optimizer initialization data")
-
-        mesh_context = (
-            getattr(distributed_setup, "mesh_context", None)
-            if distributed_setup is not None
-            else None
-        )
-        device_mesh = getattr(mesh_context, "device_mesh", None)
-        return cls(
-            param_groups=_build_param_groups(model, weight_decay),
-            device_mesh=device_mesh,
-            is_peft=peft_config is not None,
-        )
-
-
-__all__ = ["AdamW", "OptimizerInit"]
+__all__ = ["AdamW"]

@@ -14,6 +14,6 @@
 # ============================================================================
 """Optimizer runtime targets."""
 
-from .optimizer import AdamW, OptimizerInit
+from .optimizer import AdamW
 
-__all__ = ["AdamW", "OptimizerInit"]
+__all__ = ["AdamW"]
