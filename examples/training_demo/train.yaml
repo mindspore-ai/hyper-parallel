@@ -42,6 +42,9 @@ mixed_precision:
 gradient_checkpointing:
   activation_checkpoint: off
 
+data_transform:
+  _target_: hyper_models.components.data.identity_transform.IdentityDataTransform
+
 dataset:
   _target_: hyper_models.components.data.datasets.DummyDataset
   num_samples: 400

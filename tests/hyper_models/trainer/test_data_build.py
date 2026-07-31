@@ -21,6 +21,7 @@ import pytest
 from hyper_models.components.data import (
     DataLoader,
     DummyDataset,
+    IdentityDataTransform,
     MakeMicroBatchCollator,
 )
 from hyper_models.components.distributed.infrastructure import MeshContext
@@ -31,6 +32,11 @@ from hyper_models.trainer.config import Target, TrainerConfig, TrainingConfig
 def _unused_target() -> Target:
     """Return a target required by ``TrainerConfig`` but unused in this test."""
     return Target(lambda: None, target_path="tests.unused")
+
+
+def _value_target(*, value: object) -> object:
+    """Return a configured value for dependency-order tests."""
+    return value
 
 
 def _model_target(
@@ -108,15 +114,28 @@ def test_trainer_optimizer_stage_passes_runtime_context() -> None:
 
 def test_trainer_data_stages_return_micro_batches() -> None:
     """Build assets, dataset, collator, and dataloader in Trainer order."""
+    tokenizer = object()
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.config = TrainerConfig(
         model=_unused_target(),
         optimizer=_unused_target(),
+        tokenizer=Target(
+            _value_target,
+            target_path="tests.value_target",
+            value=tokenizer,
+        ),
         training=TrainingConfig(
             max_steps=3,
             global_batch_size=8,
             micro_batch_size=2,
             seed=17,
+        ),
+        data_transform=Target(
+            IdentityDataTransform,
+            target_path=(
+                "hyper_models.components.data.identity_transform."
+                "IdentityDataTransform"
+            ),
         ),
         dataset=Target(
             DummyDataset,
@@ -142,6 +161,7 @@ def test_trainer_data_stages_return_micro_batches() -> None:
     trainer.model_config = SimpleNamespace(vocab_size=19)
 
     trainer._build_model_assets()
+    trainer._build_data_transform()
     trainer._build_dataset()
     trainer._build_collate_fn()
     trainer._build_dataloader()
@@ -149,9 +169,12 @@ def test_trainer_data_stages_return_micro_batches() -> None:
 
     micro_batches = next(iter(trainer.train_dataloader))
 
-    assert trainer.tokenizer is None
     assert trainer.chat_template is None
-    assert trainer.model_assets == [trainer.model_config]
+    assert trainer.tokenizer is tokenizer
+    assert trainer.model_assets == [trainer.model_config, tokenizer]
+    assert isinstance(trainer.data_transform, IdentityDataTransform)
+    assert trainer.data_transform.tokenizer is tokenizer
+    assert trainer.train_dataset.transform is trainer.data_transform
     assert trainer.train_steps == 3
     assert len(micro_batches) == 2
     assert all(micro_batch["input_ids"].shape == (2, 6) for micro_batch in micro_batches)

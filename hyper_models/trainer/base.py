@@ -41,7 +41,6 @@ import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
-from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
@@ -298,6 +297,7 @@ class BaseTrainer(Stateful, ABC):
         # consumes that template; BaseTrainer neither defines nor interprets
         # model-specific chat protocols.
         self._build_model_assets()
+        self._build_data_transform()
         self._build_dataset()
         self._build_collate_fn()
         self._build_dataloader()
@@ -373,15 +373,35 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_model_assets(self):
         """Build model assets for the temporary dummy-data training path."""
-        self.tokenizer = None
+        self.tokenizer = (
+            self.config.tokenizer.build()
+            if self.config.tokenizer is not None
+            else None
+        )
         self.chat_template = None
         self.model_assets = [self.model_config]
+        if self.tokenizer is not None:
+            self.model_assets.append(self.tokenizer)
+
+    def _build_data_transform(self) -> None:
+        """Build the configured transform from model assets."""
+        if self.config.data_transform is None:
+            self.data_transform = None
+            return
+        self.data_transform = self.config.data_transform.build(
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            chat_template=self.chat_template,
+            model_config=self.model_config,
+        )
 
     def _build_dataset(self):
         """Build dataset-owned runtime state through the configured target."""
         if self.config.dataset is None:
             raise ValueError("config.dataset must define a build target")
-        self.train_dataset = self.config.dataset.build()
+        self.train_dataset = self.config.dataset.build(
+            transform=self.data_transform,
+        )
 
     def _build_collate_fn(self):
         """Build the collator through the configured target."""

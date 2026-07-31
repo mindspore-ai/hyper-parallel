@@ -14,6 +14,9 @@
 # ============================================================================
 """Dataset components used by Trainer targets."""
 
+from collections.abc import Callable
+from typing import Any, Optional
+
 import torch
 from torch.utils.data import Dataset
 
@@ -27,6 +30,7 @@ class DummyDataset(Dataset):
         seq_len: int,
         vocab_size: int,
         seed: int = 42,
+        transform: Optional[Callable[[Any], Any]] = None,
     ) -> None:
         """Initialize the generated dataset.
 
@@ -35,7 +39,11 @@ class DummyDataset(Dataset):
             seq_len: Number of tokens per sample.
             vocab_size: Exclusive upper bound for generated token IDs.
             seed: Random seed used by the local generator.
+            transform: Upstream data transform retained for pipeline
+                compatibility. Dummy samples are already model-ready, so the
+                transform is not applied.
         """
+        self.transform = transform
         generator = torch.Generator().manual_seed(seed)
         self.input_ids = torch.randint(
             0,

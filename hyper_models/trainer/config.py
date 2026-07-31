@@ -198,6 +198,7 @@ class TrainerConfig:
         default_factory=GradientCheckpointingConfig
     )
 
+    data_transform: Optional[Target[Any]] = None
     dataset: Optional[Target[Any]] = None
     collate_fn: Optional[Target[Any]] = None
     dataloader: Optional[Target[Any]] = None
