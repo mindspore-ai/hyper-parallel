@@ -79,6 +79,8 @@ def mean_global_loss(
         ValueError: If sequence parallelism is enabled without a TP device mesh.
     """
     loss_dict = {}
+    dp_cp_mesh = device_mesh.dp_cp_mesh
+    dp_cp_group = dp_cp_mesh.get_group() if dp_cp_mesh is not None else None
     sequence_parallel = device_mesh.sequence_parallel
     sequence_parallel_group = None
     sequence_parallel_size = 1
@@ -98,7 +100,11 @@ def mean_global_loss(
         if sequence_parallel:
             cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
 
-        all_reduced_len = all_reduce((micro_batches_token_len[f"{loss_name}_tokens"].item()), op="sum")
+        all_reduced_len = all_reduce(
+            micro_batches_token_len[f"{loss_name}_tokens"].item(),
+            op="sum",
+            group=dp_cp_group,
+        )
 
         if all_reduced_len != 0:
             cur_loss = cur_loss * cur_token_len / all_reduced_len * device_mesh.dp_size
