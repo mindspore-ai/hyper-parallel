@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Prepare the tiny local GPT-2 checkpoint used by the Trainer demo."""
+"""Prepare the tiny local Llama checkpoint used by the Trainer demo."""
 
 import logging
 from pathlib import Path
 
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import LlamaConfig, LlamaForCausalLM
 
 from hyper_models.config.manager import parse_training_args
 from hyper_models.trainer.config import TrainerConfig
@@ -35,22 +35,21 @@ def prepare_tiny_model(model_dir: Path) -> None:
         return
 
     model_dir.mkdir(parents=True, exist_ok=True)
-    config = GPT2Config(
+    config = LlamaConfig(
         vocab_size=1000,
-        n_positions=64,
-        n_embd=64,
-        n_layer=2,
-        n_head=4,
-        n_inner=256,
-        resid_pdrop=0.0,
-        embd_pdrop=0.0,
-        attn_pdrop=0.0,
+        hidden_size=64,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+        attention_dropout=0.0,
         bos_token_id=0,
         eos_token_id=0,
         pad_token_id=0,
     )
-    GPT2LMHeadModel(config).save_pretrained(model_dir)
-    logger.info("Wrote tiny GPT-2 checkpoint to %s", model_dir)
+    LlamaForCausalLM(config).save_pretrained(model_dir)
+    logger.info("Wrote tiny Llama checkpoint to %s", model_dir)
 
 
 def main() -> None:
