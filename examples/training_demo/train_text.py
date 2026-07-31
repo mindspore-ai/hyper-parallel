@@ -15,14 +15,14 @@
 """Run the Trainer path with the prepared tiny model and dummy data."""
 
 from hyper_models.config.manager import parse_training_args
-from hyper_models.trainer.base import BaseTrainer
 from hyper_models.trainer.config import TrainerConfig
+from hyper_models.trainer.text_trainer import TextTrainer
 
 
 def main() -> None:
     """Build every Trainer component and execute the configured training loop."""
     config: TrainerConfig = parse_training_args()
-    trainer = BaseTrainer(config)
+    trainer = TextTrainer(config)
     trainer.train()
 
 
