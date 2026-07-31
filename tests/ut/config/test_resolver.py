@@ -21,6 +21,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Literal, Optional
 
+from hyper_models._transformers import HyperAutoModelForCausalLM
 from hyper_models.components.optim import AdamW, cosine_with_warmup
 from hyper_models.config.manager import parse_training_args
 from hyper_models.config.resolver import (
@@ -33,6 +34,9 @@ from hyper_models.trainer.config import Target, TrainerConfig, TrainingConfig
 
 
 OPTIMIZER_TARGET = "hyper_models.components.optim.optimizer.optimizer.AdamW"
+MODEL_TARGET = (
+    "hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained"
+)
 SCHEDULER_TARGET = (
     "hyper_models.components.optim.lr_scheduler.lr_scheduler.cosine_with_warmup"
 )
@@ -124,6 +128,24 @@ class TestTargetResolution(unittest.TestCase):
             {"kind": "model", "name": "model"},
         )
 
+    def test_bound_model_classmethod_is_resolved_directly(self):
+        target = resolve_component(
+            {
+                "_target_": MODEL_TARGET,
+                "pretrained_model_name_or_path": "./model",
+                "force_hf": True,
+            },
+            expected_type=Target[Any],
+            path="$.model",
+        )
+
+        self.assertIs(
+            target._target_.__func__,
+            HyperAutoModelForCausalLM.from_pretrained.__func__,
+        )
+        self.assertEqual(target.pretrained_model_name_or_path, "./model")
+        self.assertTrue(target.force_hf)
+
     def test_annotated_arguments_are_coerced_and_defaults_are_exposed(self):
         config = resolve_root(
             _root(
@@ -140,6 +162,20 @@ class TestTargetResolution(unittest.TestCase):
         self.assertIsNone(config.optimizer.foreach)
         with self.assertRaises(AttributeError):
             _ = config.optimizer.model
+
+    def test_gradient_clipping_is_not_an_optimizer_argument(self):
+        with self.assertRaisesRegex(
+            ConfigResolutionError,
+            r"unexpected keyword argument 'max_grad_norm'",
+        ):
+            resolve_root(
+                _root(
+                    optimizer={
+                        "_target_": OPTIMIZER_TARGET,
+                        "max_grad_norm": 1.0,
+                    }
+                )
+            )
 
     def test_unknown_argument_is_rejected_without_var_kwargs(self):
         with self.assertRaisesRegex(

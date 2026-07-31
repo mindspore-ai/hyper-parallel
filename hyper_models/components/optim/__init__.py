@@ -15,10 +15,9 @@
 """Optimizer and learning-rate scheduler interfaces for HyperModels."""
 
 from .lr_scheduler.lr_scheduler import cosine_with_warmup
-from .optimizer.optimizer import AdamW, OptimizerInit
+from .optimizer.optimizer import AdamW
 
 __all__ = [
     "AdamW",
-    "OptimizerInit",
     "cosine_with_warmup",
 ]

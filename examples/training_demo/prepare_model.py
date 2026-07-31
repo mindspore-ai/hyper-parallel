@@ -56,7 +56,8 @@ def main() -> None:
     """Resolve the demo configuration and prepare its model checkpoint."""
     config: TrainerConfig = parse_training_args()
     model_dir = Path(
-        config.model.weights_path or "./outputs/training_demo/tiny_llama"
+        config.model.pretrained_model_name_or_path
+        or "./outputs/training_demo/tiny_llama"
     ).resolve()
     prepare_tiny_model(model_dir)
 

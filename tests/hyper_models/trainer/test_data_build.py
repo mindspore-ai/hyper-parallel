@@ -34,21 +34,30 @@ def _model_target(
     distributed_setup: object,
     peft_config: object,
 ) -> SimpleNamespace:
-    """Return a complete model-build result for delegation testing."""
-    model = object()
+    """Return a model object for delegation testing."""
     return SimpleNamespace(
-        model=model,
-        optimizer_init="optimizer-init",
-        model_config="model-config",
-        model_parts=[model],
-        hsdp_model_parts=[],
+        config=SimpleNamespace(model_type="fake"),
         distributed_setup=distributed_setup,
         peft_config=peft_config,
     )
 
 
+def _optimizer_target(
+    *,
+    model: object,
+    device_mesh: object,
+    is_peft: bool,
+) -> SimpleNamespace:
+    """Return the runtime context received by the optimizer target."""
+    return SimpleNamespace(
+        model=model,
+        device_mesh=device_mesh,
+        is_peft=is_peft,
+    )
+
+
 def test_trainer_model_stage_delegates_to_config_target() -> None:
-    """Inject runtime arguments and accept all state from the model target."""
+    """Build the model directly and derive Trainer-owned state."""
     distributed_setup = object()
     peft_config = object()
     trainer = BaseTrainer.__new__(BaseTrainer)
@@ -62,10 +71,35 @@ def test_trainer_model_stage_delegates_to_config_target() -> None:
     trainer._build_model()
 
     assert trainer.peft_config is peft_config
+    assert trainer.model.distributed_setup is distributed_setup
+    assert trainer.model.peft_config is peft_config
     assert trainer.model_parts == [trainer.model]
-    assert trainer.model_config == "model-config"
-    assert trainer.optimizer_init == "optimizer-init"
+    assert trainer.model_config is trainer.model.config
     assert trainer.hsdp_model_parts == []
+
+
+def test_trainer_optimizer_stage_passes_runtime_context() -> None:
+    """Pass model, mesh, and PEFT state to the configured optimizer target."""
+    model = object()
+    device_mesh = object()
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.config = TrainerConfig(
+        model=_unused_target(),
+        optimizer=Target(
+            _optimizer_target,
+            target_path="tests.optimizer_target",
+        ),
+        peft=object(),
+    )
+    trainer.model = model
+    trainer.device_mesh = device_mesh
+    trainer.peft_config = trainer.config.peft
+
+    trainer._build_optimizer()
+
+    assert trainer.optimizer.model is model
+    assert trainer.optimizer.device_mesh is device_mesh
+    assert trainer.optimizer.is_peft is True
 
 
 def test_trainer_data_stages_return_micro_batches() -> None:

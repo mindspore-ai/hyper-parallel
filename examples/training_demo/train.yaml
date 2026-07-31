@@ -8,10 +8,11 @@
 #   bash examples/training_demo/run.sh
 
 model:
-  _target_: hyper_models.components.models.common.model_utils.build_model_component
-  name: tiny_llama
-  weights_path: ./outputs/training_demo/tiny_llama
-  tokenizer_path: ./outputs/training_demo/tiny_llama
+  _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ./outputs/training_demo/tiny_llama
+  torch_dtype: auto
+  attn_implementation: sdpa
+  force_hf: true
 
 training:
   max_steps: 100
@@ -21,6 +22,7 @@ training:
   backend: hccl
   init_device: meta
   loss_aggregation: token_weighted
+  max_grad_norm: 1.0
   seed: 42
   enable_full_determinism: false
 
@@ -59,7 +61,6 @@ optimizer:
   _target_: hyper_models.components.optim.optimizer.optimizer.AdamW
   lr: 1.0e-4
   weight_decay: 0.01
-  max_grad_norm: 1.0
   betas: [0.9, 0.999]
   eps: 1.0e-8
   foreach: false

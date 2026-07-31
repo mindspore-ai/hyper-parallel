@@ -139,7 +139,10 @@ class TextTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
-        grad_norm = clip_grad_norm_(self.base.model.parameters(), config.optimizer.max_grad_norm)
+        grad_norm = clip_grad_norm_(
+            self.base.model.parameters(),
+            config.training.max_grad_norm,
+        )
 
         # Optimizer and scheduler step
         self.base.optimizer.step()
