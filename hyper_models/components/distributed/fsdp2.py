@@ -40,6 +40,9 @@ class FSDP2Manager:
         self.mesh_context = mesh_context
         self.device_mesh = getattr(mesh_context, "device_mesh", None)
         self.device = getattr(mesh_context, "device", "cuda")
+        # This manager is currently a no-op. Callers must not treat it as the
+        # owner of parameter placement until parallelize() actually wraps FSDP.
+        self.owns_parameter_placement = False
 
     def parallelize(
         self,

@@ -491,10 +491,12 @@ class TorchPlatform(Platform):
         Returns:
             str: The device type string ("npu" for NPU, "cuda" for GPU).
         """
-        device_handle = self.get_device_handle()
-        if device_handle == torch.npu:
+        npu = getattr(torch, "npu", None)
+        if npu is not None and npu.is_available():
             return "npu"
-        return "cuda"
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
 
     def device(self, device_idx=None):
         """

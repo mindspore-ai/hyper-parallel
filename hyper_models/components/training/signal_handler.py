@@ -23,7 +23,10 @@ import signal
 import torch
 import torch.distributed as dist
 
+from hyper_parallel import get_platform
+
 logger = logging.getLogger(__name__)
+platform = get_platform()
 
 
 class DistributedSignalHandler:
@@ -48,12 +51,13 @@ class DistributedSignalHandler:
     def signals_received(self) -> list[bool]:
         """all_gather: any rank received → all return True.
 
-        NCCL doesn't support CPU tensor collective — move to CUDA device first.
+        HCCL/NCCL do not support CPU tensor collectives, so use the active
+        platform device for the process group.
         """
         if not dist.is_initialized():
             return [self._signal_received]
 
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        device = platform.device()
         tensor = torch.tensor([int(self._signal_received)], dtype=torch.int32, device=device)
         gathered = [torch.zeros(1, dtype=torch.int32, device=device) for _ in range(dist.get_world_size())]
         torch.distributed.all_gather(gathered, tensor)

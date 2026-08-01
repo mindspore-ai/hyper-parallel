@@ -22,12 +22,13 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import torch
 import torch.distributed as dist
 
+from hyper_parallel import get_platform, init_device_mesh
 from hyper_models.components.distributed.config import FSDP2Config
 
 logger = logging.getLogger(__name__)
+platform = get_platform()
 
 
 # ── MeshContext (stub) ──
@@ -115,26 +116,39 @@ class DistributedSetup:
 
 # ── initialize_distributed (stub) ──
 
-def initialize_distributed(backend: str = "nccl") -> Any:
-    """Initialize torch.distributed process group.
+def _runtime_device_type() -> str:
+    """Resolve the active Torch accelerator without imposing an NPU runtime."""
+    try:
+        return platform.device_type()
+    except (AttributeError, RuntimeError):
+        return "cpu"
 
-    Stub — calls dist.init_process_group if not already initialized.
-    Falls back to gloo when the requested backend is unavailable (e.g. CPU).
-    Sets the current CUDA device from LOCAL_RANK when CUDA is available.
+
+def initialize_distributed(backend: str = "nccl") -> Any:
+    """Initialize the active accelerator's process group when launched distributed.
+
+    ``backend`` remains accepted for CUDA and CPU callers. Ascend A5 MXFP8
+    training requires HCCL, so NPU runs select ``hccl`` regardless of the
+    legacy CUDA default.
+
+    Returns:
+        The initialized ``torch.distributed`` module.
     """
+    if "WORLD_SIZE" not in os.environ and "RANK" not in os.environ:
+        return dist
+    device_type = _runtime_device_type()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if device_type in ("cuda", "npu"):
+        platform.get_device_handle(device_type).set_device(local_rank)
     if not dist.is_initialized():
-        effective_backend = backend
-        if backend == "nccl" and not torch.cuda.is_available():
+        effective_backend = "hccl" if device_type == "npu" else backend
+        if effective_backend == "nccl" and device_type != "cuda":
             effective_backend = "gloo"
             logger.warning(
                 "CUDA not available; falling back to '%s' backend for distributed.",
                 effective_backend,
             )
         dist.init_process_group(backend=effective_backend)
-
-    if torch.cuda.is_available():
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
 
     return dist
 
@@ -144,7 +158,8 @@ def initialize_distributed(backend: str = "nccl") -> Any:
 def _build_device_mesh_from_accelerator(
     accel: Any,
     world_size: int,
-) -> tuple[Any, tuple[str, ...]] | tuple[None, tuple[()]]:
+    device_type: str,
+) -> tuple[Optional[Any], tuple[str, ...]]:
     """Build a hyper_parallel DeviceMesh from accelerator topology.
 
     Returns (device_mesh, dim_names) when the topology matches world_size,
@@ -185,8 +200,6 @@ def _build_device_mesh_from_accelerator(
         return None, ()
 
     dim_names, mesh_shape = zip(*mesh_dims)
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    from hyper_parallel import init_device_mesh
     device_mesh = init_device_mesh(
         device_type=device_type,
         mesh_shape=mesh_shape,
@@ -219,11 +232,16 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     ep_size = max(1, getattr(accel, "ep_size", 1))
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    device_type = _runtime_device_type()
     device_mesh = None
     dim_names = ()
     if dist.is_initialized() and world_size > 1:
         try:
-            device_mesh, dim_names = _build_device_mesh_from_accelerator(accel, world_size)
+            device_mesh, dim_names = _build_device_mesh_from_accelerator(
+                accel,
+                world_size,
+                device_type,
+            )
         except Exception as exc:  # pragma: no cover
             logger.warning(
                 "Failed to build DeviceMesh from accelerator config: %s. "

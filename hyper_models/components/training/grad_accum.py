@@ -26,7 +26,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from hyper_parallel import get_platform
+
 logger = logging.getLogger(__name__)
+platform = get_platform()
 
 # FSDP2 wrapper — torch >= 2.4
 try:
@@ -131,11 +134,11 @@ def _dp_cp_all_reduce_sum(tensor, dp_cp_mesh) -> torch.Tensor:
 
     Accepts Python scalar (wrapped to tensor). Returns reduced tensor.
     """
+    device = platform.device()
     if not torch.is_tensor(tensor):
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         tensor = torch.tensor(tensor, device=device)
-    if tensor.device.type != "cuda" and torch.cuda.is_available():
-        tensor = tensor.cuda()
+    elif tensor.device.type != device.type:
+        tensor = tensor.to(device)
     if dp_cp_mesh is not None:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=dp_cp_mesh.get_group())
     elif dist.is_initialized():
@@ -145,11 +148,11 @@ def _dp_cp_all_reduce_sum(tensor, dp_cp_mesh) -> torch.Tensor:
 
 def _dp_all_reduce_avg(tensor, dp_mesh=None) -> torch.Tensor:
     """Pure-DP all-reduce mean (divide by dp_world_size). CP not involved."""
+    device = platform.device()
     if not torch.is_tensor(tensor):
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         tensor = torch.tensor(tensor, device=device)
-    if tensor.device.type != "cuda" and torch.cuda.is_available():
-        tensor = tensor.cuda()
+    elif tensor.device.type != device.type:
+        tensor = tensor.to(device)
     if dp_mesh is not None:
         group = dp_mesh.get_group()
         world_size = dp_mesh.size()

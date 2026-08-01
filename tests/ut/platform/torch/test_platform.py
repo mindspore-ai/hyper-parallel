@@ -111,23 +111,25 @@ class TestTorchPlatformCore(unittest.TestCase):
             [(fake_dtensor, "local-shard"), (fake_dtensor._local_tensor, "local-shard")],
         )
 
-    @mock.patch('hyper_parallel.platform.torch.platform.TorchPlatform.get_device_handle')
-    def test_device_type(self, mock_get_device_handle):
-        """Test device type detection logic.
-        
-        Verifies that the platform correctly identifies different device types
-        (NPU and CUDA) based on the device handle.
-        
-        Args:
-            mock_get_device_handle: Mock for the get_device_handle method.
-        """
-        # Test NPU device
-        mock_get_device_handle.return_value = torch.npu
-        self.assertEqual(self.platform.device_type(), "npu")
+    @mock.patch('torch.cuda.is_available')
+    def test_device_type(self, mock_cuda_available):
+        """Prefer an available NPU, then CUDA, and retain a CPU fallback."""
+        npu = getattr(torch, "npu", None)
+        if npu is not None:
+            with mock.patch.object(npu, "is_available", return_value=True):
+                self.assertEqual(self.platform.device_type(), "npu")
 
-        # Test CUDA device
-        mock_get_device_handle.return_value = torch.cuda
-        self.assertEqual(self.platform.device_type(), "cuda")
+        if npu is not None:
+            with mock.patch.object(npu, "is_available", return_value=False):
+                mock_cuda_available.return_value = True
+                self.assertEqual(self.platform.device_type(), "cuda")
+                mock_cuda_available.return_value = False
+                self.assertEqual(self.platform.device_type(), "cpu")
+        else:
+            mock_cuda_available.return_value = True
+            self.assertEqual(self.platform.device_type(), "cuda")
+            mock_cuda_available.return_value = False
+            self.assertEqual(self.platform.device_type(), "cpu")
 
     @mock.patch('hyper_parallel.platform.torch.platform._get_default_group')
     @mock.patch('torch.distributed.init_process_group')
