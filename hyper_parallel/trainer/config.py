@@ -102,9 +102,13 @@ class ModelConfig:
 class DataConfig:
     """``data.*`` — dataset, tokenizer/processor, sampler, batch shape.
 
-    - ``streaming``: only ``False`` supported today.
+    - ``streaming``: when ``True``, ``hf_datasets`` / ``json_file`` use
+      HuggingFace iterable streaming with DP-rank self-sharding.
     - ``num_workers``: keep ≥ 2 for real datasets.
     - ``shuffle``: when ``False``, sampler reads samples in dataset order.
+    - ``train_size``: in streaming mode, defines the logical global sample
+      budget per epoch when the source length is not statically known.
+    - ``processor_path``: optional HF processor path for real VL datasets.
     """
     type: str = "dummy"
     train_path: Optional[Any] = None
@@ -116,6 +120,7 @@ class DataConfig:
     template: str = "empty"
     image_key: str = "image"
     messages_key: str = "messages"
+    processor_path: Optional[str] = None
     image_token_id: int = 151655
     video_token_id: int = 151656
     vl_video: bool = False

@@ -1,0 +1,68 @@
+# HF streaming example for Qwen3.5-0.8B.
+# This example points to a local JSONL demo dataset so the data path is
+# reproducible inside the repository:
+# - ``data.type: json_file`` still uses HuggingFace ``load_dataset(...)``.
+# - ``data.streaming: true`` enables IterableDataset loading.
+# - ``data.train_size`` defines the logical GLOBAL sample budget per epoch.
+model:
+  name: qwen3_5
+  weights_path: /path/to/Qwen3.5-0.8B-Base
+  tokenizer_path: /path/to/Qwen3.5-0.8B-Base
+  config_overrides:
+    num_hidden_layers: 4
+
+data:
+  type: json_file
+  train_path: examples/qwen3_5_0_8b_base/demo_data/train_demo.jsonl
+  subset: null
+  text_key: text
+  max_seq_len: 64
+  streaming: true
+  train_size: 1024
+  shuffle: true
+  num_workers: 0
+  pin_memory: true
+
+train:
+  max_steps: 128
+  num_train_epochs: 1
+  global_batch_size: 4
+  micro_batch_size: 1
+  seed: 1234
+  backend: torch
+  init_device: meta
+
+  accelerator:
+    dp_shard: 4
+    comm_fusion: true
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 0.0
+    lr_decay_style: cosine
+    lr_warmup_ratio: 0.1
+    max_grad_norm: 1.0e9
+    weight_decay: 0.0
+    loss_aggregation: rank_average
+
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+
+  gradient_checkpointing:
+    activation_checkpoint: none
+
+  checkpoint:
+    output_dir: outputs/qwen3_5_hf_streaming
+    save_steps: 0
+    save_hf_weights: false
+
+  logging:
+    log_steps: 1
+    report_throughput: false
+
+  debug:
+    deterministic: true

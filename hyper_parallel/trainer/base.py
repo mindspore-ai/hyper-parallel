@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DistributedSampler
+from torch.utils.data import DistributedSampler, IterableDataset
 
 from hyper_parallel import (
     get_platform,
@@ -335,24 +335,16 @@ class BaseTrainer:
         """
         if getattr(self, "train_dataset", None) is not None:
             return
-        if self.args.data.streaming:
-            # ``DistributedSampler`` requires ``__len__``; an iterable path
-            # would need a sampler-less dataloader. Reject loudly until that
-            # path is wired so users see a clear error instead of a
-            # ``TypeError: object of type ... has no len()``.
-            raise NotImplementedError(
-                "data.streaming=True is not yet wired. The default "
-                "_build_dataloader uses DistributedSampler which requires "
-                "len(dataset); subclass _build_dataset + _build_dataloader "
-                "to emit an IterableDataset that self-shards via dp_rank/dp_size."
-            )
         data_type = self.args.data.type
+        dp_rank, dp_size = self._get_dp_shard_rank_and_size()
         self.train_dataset = build_dataset(
             data_type,
             base=self,
             args=self.args,
             tokenizer=getattr(self, "tokenizer", None),
             data_transform=getattr(self, "data_transform", None),
+            dp_rank=dp_rank,
+            dp_size=dp_size,
         )
 
     def _build_collate_fn(self):
@@ -424,25 +416,7 @@ class BaseTrainer:
         micro_bs = self.args.train.micro_batch_size
 
         # Sampler uses DP rank/size — TP/CP/PP/EP peers share data.
-        dp_size = self.parallel_dims.dp_size
-        non_dp = self.parallel_dims.non_dp_size
-        global_rank = platform.get_rank()
-        try:
-            dp_rank = self.mesh["dp"].get_local_rank()
-        except (KeyError, ValueError, RuntimeError):
-            dp_rank = global_rank // non_dp if non_dp > 1 else global_rank
-
-        shuffle = self.args.data.shuffle
-        sampler_seed = self.args.train.seed
-
-        self.sampler = DistributedSampler(
-            self.train_dataset,
-            num_replicas=dp_size,
-            rank=dp_rank,
-            shuffle=shuffle,
-            seed=sampler_seed,
-            drop_last=True,
-        )
+        dp_rank, dp_size = self._get_dp_shard_rank_and_size()
 
         # StatefulDataLoader supports state_dict() / load_state_dict()
         # for checkpoint resume (torchdata API, used by  + ).
@@ -459,14 +433,28 @@ class BaseTrainer:
             )
             num_workers = 0
 
+        is_iterable_dataset = isinstance(self.train_dataset, IterableDataset)
         loader_kwargs = {
             "batch_size": micro_bs,
-            "sampler": self.sampler,
             "collate_fn": self.collate_fn,
             "num_workers": num_workers,
             "pin_memory": pin_memory,
             "drop_last": True,
         }
+        if not is_iterable_dataset:
+            shuffle = self.args.data.shuffle
+            sampler_seed = self.args.train.seed
+            self.sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=dp_size,
+                rank=dp_rank,
+                shuffle=shuffle,
+                seed=sampler_seed,
+                drop_last=True,
+            )
+            loader_kwargs["sampler"] = self.sampler
+        elif hasattr(self, 'sampler'):
+            delattr(self, 'sampler')
         # prefetch_factor is only accepted when num_workers > 0
         if num_workers > 0 and prefetch_factor is not None:
             loader_kwargs["prefetch_factor"] = prefetch_factor
@@ -485,10 +473,20 @@ class BaseTrainer:
             1,
         )
 
-        logger.info_rank0(
-            "Dataloader built: micro_bs=%d, grad_accum=%d, dataset_size=%d",
-            micro_bs, self._grad_accum, len(self.train_dataset),
-        )
+        try:
+            dataset_size = len(self.train_dataset)
+        except TypeError:
+            dataset_size = None
+        if dataset_size is None:
+            logger.info_rank0(
+                "Dataloader built: micro_bs=%d, grad_accum=%d, dataset_size=streaming/unknown",
+                micro_bs, self._grad_accum,
+            )
+        else:
+            logger.info_rank0(
+                "Dataloader built: micro_bs=%d, grad_accum=%d, dataset_size=%d",
+                micro_bs, self._grad_accum, dataset_size,
+            )
 
     def _build_parallelized_model(self):
         """Step 9: Apply parallel strategies to the model.
@@ -1860,6 +1858,8 @@ class BaseTrainer:
             if self.state.global_step >= self.state.max_steps:
                 break
             self.state.epoch = epoch
+            if hasattr(self.train_dataset, 'set_epoch'):
+                self.train_dataset.set_epoch(epoch)
             if hasattr(self, 'sampler'):
                 self.sampler.set_epoch(epoch)
             self.on_epoch_begin()
@@ -1951,6 +1951,17 @@ class BaseTrainer:
             return self.mesh.get_group()
         except (ValueError, RuntimeError):
             return None
+
+    def _get_dp_shard_rank_and_size(self) -> tuple[int, int]:
+        """Return the DP rank/size used to partition training data."""
+        dp_size = self.parallel_dims.dp_size
+        non_dp = self.parallel_dims.non_dp_size
+        global_rank = platform.get_rank()
+        try:
+            dp_rank = self.mesh["dp"].get_local_rank()
+        except (KeyError, ValueError, RuntimeError):
+            dp_rank = global_rank // non_dp if non_dp > 1 else global_rank
+        return dp_rank, dp_size
 
     def _build_fsdp_kwargs(self) -> dict:
         """Build kwargs for ``fully_shard`` calls (dense parameters).

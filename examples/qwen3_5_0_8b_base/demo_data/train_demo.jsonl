@@ -1,0 +1,3 @@
+{"text": "HyperParallel now supports HuggingFace streaming datasets for text training."}
+{"text": "This local JSONL file is the minimal reproducible sample for the HF streaming example."}
+{"text": "Each row is plain text so the existing tokenizer transform can process it directly."}

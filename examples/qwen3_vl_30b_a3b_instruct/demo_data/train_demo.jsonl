@@ -1,0 +1,2 @@
+{"messages":[{"role":"user","content":[{"type":"image"},{"type":"text","text":"Describe the image in one sentence."}]},{"role":"assistant","content":[{"type":"text","text":"A small pink square with a darker center."}]}],"image":"examples/qwen3_vl_30b_a3b_instruct/demo_data/sample_image.png"}
+{"messages":[{"role":"user","content":[{"type":"image"},{"type":"text","text":"What is the dominant color in the picture?"}]},{"role":"assistant","content":[{"type":"text","text":"Pink is the dominant color."}]}],"image":"examples/qwen3_vl_30b_a3b_instruct/demo_data/sample_image.png"}

@@ -28,6 +28,8 @@ for the resolution rules (built-in vs. fully-qualified external package).
 # pylint: disable=wrong-import-position
 import os
 
+from ascend_bootstrap import maybe_import_torch_npu
+
 # Pin the backend before importing hyper_parallel because platform objects are
 # resolved at import time. Keep explicit user overrides intact.
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
@@ -35,6 +37,8 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 # Configure root logger BEFORE any other imports so module-level loggers in
 # downstream files pick up our format. ``init_logger`` is idempotent.
 from hyper_parallel.trainer.utils import init_logger
+
+maybe_import_torch_npu()
 
 init_logger()
 

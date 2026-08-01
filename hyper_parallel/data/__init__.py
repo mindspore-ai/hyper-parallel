@@ -20,7 +20,8 @@ Public API:
 - :data:`DATASET_REGISTRY`: registry instance; register custom formats
   with ``@DATASET_REGISTRY.register("<name>")``.
 - :class:`DummyDataset`, :class:`DummyVLDataset`, :class:`TokenizedDataset`,
-  :class:`PresetPtDataset`: first-party dataset classes.
+  :class:`StreamingTokenizedDataset`, :class:`PresetPtDataset`: first-party
+  dataset classes.
 - :class:`IndexedDataset`, :class:`IndexedDatasetBuilder`,
   :class:`GPTDataset`, :class:`BlendableDataset`: Megatron support.
 
@@ -30,7 +31,7 @@ External plugins can register additional builders by importing their
 modules before the trainer is constructed.
 """
 from hyper_parallel.data.dummy import DummyDataset
-from hyper_parallel.data.hf import TokenizedDataset
+from hyper_parallel.data.hf import StreamingTokenizedDataset, TokenizedDataset
 from hyper_parallel.data.megatron import (
     BlendableDataset,
     GPTDataset,
@@ -59,6 +60,7 @@ __all__ = [
     "IndexedDataset",
     "IndexedDatasetBuilder",
     "PresetPtDataset",
+    "StreamingTokenizedDataset",
     "TokenizedDataset",
     "build_dataset",
 ]

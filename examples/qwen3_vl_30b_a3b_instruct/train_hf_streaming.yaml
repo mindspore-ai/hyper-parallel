@@ -1,0 +1,74 @@
+# HF streaming real-data example for native Qwen3-VL training.
+# This is the streaming mutation of ``train_hf.yaml`` and it points to the
+# same repository-local demo dataset:
+# - ``data.streaming: true`` switches to HuggingFace IterableDataset loading.
+# - ``data.train_size`` defines the logical GLOBAL sample budget per epoch.
+model:
+  name: qwen3_vl_moe
+  weights_path: /path/to/Qwen3-VL-30B-A3B-Instruct
+  tokenizer_path: /path/to/Qwen3-VL-30B-A3B-Instruct
+  freeze_modules:
+    - model.visual
+  config_overrides:
+    vl: true
+    text_config:
+      num_hidden_layers: 4
+
+data:
+  type: json_file
+  train_path: examples/qwen3_vl_30b_a3b_instruct/demo_data/train_demo.jsonl
+  processor_path: /path/to/Qwen3-VL-30B-A3B-Instruct
+  messages_key: messages
+  image_key: image
+  max_seq_len: 4096
+  streaming: true
+  train_size: 1024
+  shuffle: true
+  num_workers: 0
+  pin_memory: true
+
+train:
+  max_steps: 128
+  num_train_epochs: 1
+  global_batch_size: 4
+  micro_batch_size: 1
+  seed: 1234
+  backend: torch
+  init_device: meta
+
+  accelerator:
+    dp_shard: 4
+    moe_token_dispatcher_type: all_to_all
+    npu_nums_per_device: 8
+    comm_fusion: true
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 0.0
+    lr_decay_style: cosine
+    lr_warmup_ratio: 0.1
+    max_grad_norm: 1.0e9
+    weight_decay: 0.0
+    loss_aggregation: rank_average
+
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+
+  gradient_checkpointing:
+    activation_checkpoint: full
+
+  checkpoint:
+    output_dir: outputs/qwen3_vl_hf_streaming
+    save_steps: 0
+    save_hf_weights: false
+
+  logging:
+    log_steps: 1
+    report_throughput: false
+
+  debug:
+    deterministic: true
