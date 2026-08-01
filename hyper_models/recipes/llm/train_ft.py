@@ -20,12 +20,14 @@ Following design doc 03_training_loop.md §5（setup）、§6（训练主循环�
 
 import logging
 import time
+from contextlib import nullcontext
+from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 
+from hyper_parallel import get_platform
 from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
 from hyper_models.components.distributed.infrastructure import (
     apply_cache_compatibility_patches,
@@ -62,6 +64,7 @@ except ImportError:  # pragma: no cover
     FSDPModule = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+platform = get_platform()
 
 
 class FinetuneRecipe(BaseRecipe):
@@ -89,14 +92,10 @@ class FinetuneRecipe(BaseRecipe):
         self.cfg = cfg
 
         # ① 分布式初始化
-        self.dist_env = initialize_distributed("nccl")
+        self.dist_env = initialize_distributed()
         # dist_env 为 torch.distributed 模块（infrastructure stub 返回）；
         # device / world_size 在此派生并缓存，供数据搬运与 MFU 计算使用。
-        self._device = (
-            torch.device("cuda", torch.cuda.current_device())
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
+        self._device = platform.device()
         self._world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # ② 日志 + 兼容性补丁
@@ -145,8 +144,29 @@ class FinetuneRecipe(BaseRecipe):
         self.model, self.optimizer_init = build_model(
             cfg.model, self.peft_config,
             distributed_setup=self.distributed_setup,
+            low_precision_config=cfg.low_precision,
         )
         self.model_parts = self.model.parts if hasattr(self.model, "parts") else [self.model]
+        self.precision_debug_session = None
+        if getattr(
+            getattr(cfg, "low_precision", None),
+            "precision_debug",
+            None,
+        ) is not None:
+            from hyper_models.components.training.low_precision.observer.bridge import (
+                install_precision_debug,
+            )
+
+            train_url = cfg.training.train_url
+            if not isinstance(train_url, str) or not train_url:
+                raise ValueError(
+                    "precision_debug requires a non-empty training.train_url"
+                )
+            self.precision_debug_session = install_precision_debug(
+                self.model,
+                cfg.low_precision.precision_debug,
+                output_root=Path(train_url) / "precision_debug",
+            )
 
         # ⑫ Optimizer —— typed: .build(model, device_mesh=...)
         #     返回 list[Optimizer]（canonical）
@@ -332,8 +352,13 @@ class FinetuneRecipe(BaseRecipe):
         total_loss_sum = 0.0      # 跨 microbatch 累加 CE sum
         total_label_tokens = 0    # 本 rank 累计 label token 数
 
+        diagnostics = (
+            self.precision_debug_session.paused()
+            if self.precision_debug_session is not None
+            else nullcontext()
+        )
         try:
-            with torch.no_grad():
+            with diagnostics, torch.no_grad():
                 for batch in val_dl:
                     # 数据 → GPU
                     batch = {
@@ -394,6 +419,9 @@ class FinetuneRecipe(BaseRecipe):
         Phase 3: 梯度裁剪 + optimizer.step + lr_scheduler.step
         """
         num_batches = len(batches)
+
+        if self.precision_debug_session is not None:
+            self.precision_debug_session.set_step(self.step_scheduler.step)
 
         self._step_start_time = time.time()  # Track step timing for throughput
 
@@ -458,6 +486,9 @@ class FinetuneRecipe(BaseRecipe):
         )
         for sch in schedulers:
             sch.step()
+
+        if self.precision_debug_session is not None:
+            self.precision_debug_session.flush()
 
         # ── Loss 聚合（logged loss = token-mean） ──
         # local_loss 为 raw ce_sum（未除 N，见 §8 Step 5）。

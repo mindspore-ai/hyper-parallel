@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyper-low-precision-observer"
+version = "0.1.0"
+description = "Framework-neutral metrics and reporting for low-precision GEMM observation"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.6"]
+
+[project.scripts]
+hyper-low-precision-report = "hyper_low_precision_observer.report:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.pyc", "__pycache__/*"]

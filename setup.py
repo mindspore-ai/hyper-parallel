@@ -182,8 +182,14 @@ def get_extra_requires() -> dict[str, list[str]]:
         "torch26": list(TORCH26_REQUIRES),
         "torch27": list(TORCH27_REQUIRES),
         "torch29": list(TORCH29_REQUIRES),
+        # Precision diagnostics is intentionally a separately published wheel.
+        # Keep it opt-in so regular training installations do not gain a hard
+        # dependency on its reporting stack.
+        "precision-debug": ["hyper-low-precision-observer==0.1.0"],
         "mindspore": list(MINDSPORE_REQUIRES),
-        "all": TORCH29_REQUIRES + MINDSPORE_REQUIRES,
+        "all": TORCH29_REQUIRES + MINDSPORE_REQUIRES + [
+            "hyper-low-precision-observer==0.1.0",
+        ],
     }
 
 

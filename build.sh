@@ -13,6 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT="${SCRIPT_DIR}"
+OBSERVER_PROJECT="${PROJECT_ROOT}/hyper_models/components/training/low_precision/precision_observer"
 
 MULTICORE_VALUE="mindspore"
 SHMEM_VALUE="all"
@@ -32,6 +33,8 @@ Options:
   --custom-ops VALUE         Build custom ops: on or off. Default: on.
   --strict VALUE             Fail when an optional native build step fails. Default: on.
                              Set to off to keep setup.py's warning-and-continue behavior.
+                             The build writes both Hyper-Parallel and
+                             hyper-low-precision-observer wheels to dist/.
   -h, --help                 Show this help message.
 
 Examples:
@@ -180,3 +183,7 @@ printf '  %-32s %s\n' "BUILD_CUSTOM_OPS_EXTENSION" "${BUILD_CUSTOM_OPS_EXTENSION
 printf '  %-32s %s\n' "HYPER_PARALLEL_BUILD_STRICT" "${HYPER_PARALLEL_BUILD_STRICT}"
 
 python setup.py bdist_wheel
+rm -rf "${OBSERVER_PROJECT}/build" "${OBSERVER_PROJECT}/src/hyper_low_precision_observer.egg-info"
+find "${OBSERVER_PROJECT}/src" -type d -name __pycache__ -prune -exec rm -rf {} +
+find "${OBSERVER_PROJECT}/src" -type f -name '*.pyc' -delete
+python -m pip wheel --no-deps --wheel-dir dist "${OBSERVER_PROJECT}"

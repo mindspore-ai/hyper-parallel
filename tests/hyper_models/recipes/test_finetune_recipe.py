@@ -14,6 +14,8 @@
 # ============================================================================
 """Integration tests for FinetuneRecipe — distributed deps mocked (03 §5-§6)."""
 
+from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -33,6 +35,7 @@ from hyper_models.components.training.callback import (
     CallbackManager,
     TrainingCallback,
 )
+from hyper_models.components.training.low_precision import LowPrecisionConfig
 from hyper_models.components.training.step_scheduler import (
     StepScheduler,
     StepSchedulerConfig,
@@ -116,7 +119,7 @@ def env(monkeypatch):
 
     cfg = SimpleNamespace(
         model=MagicMock(),
-        training=SimpleNamespace(seed=42),
+        training=SimpleNamespace(seed=42, train_url="/tmp/ut_train"),
         accelerator=SimpleNamespace(dp_shard_size=1, tp_size=1),
         step_scheduler=ss_cfg,
         loss=loss_cfg,
@@ -125,6 +128,7 @@ def env(monkeypatch):
         lr_scheduler=lr_scheduler_cfg,
         dataset=None, dataloader=None, packed_sequence=None,
         magi=None, peft=None, wandb=None,
+        low_precision=LowPrecisionConfig(),
     )
 
     mocks = SimpleNamespace(
@@ -206,6 +210,65 @@ def test_setup_builds_model(env):
     recipe.setup(cfg)
     assert recipe.model is mocks.model
     assert recipe.model_parts == [mocks.model]  # 无 .parts → [model]
+
+
+def test_setup_installs_precision_debug_under_train_url(env, monkeypatch):
+    _, cfg, mocks = env
+    session = MagicMock()
+    from hyper_models.components.training.low_precision.observer import bridge
+
+    install = MagicMock(return_value=session)
+    monkeypatch.setattr(bridge, "install_precision_debug", install)
+    cfg.low_precision = LowPrecisionConfig(
+        enabled=True,
+        precision_debug={
+            "sections": [{
+                "name": "fprop",
+                "observe": True,
+            }],
+        },
+    )
+
+    recipe = FinetuneRecipe()
+    recipe.setup(cfg)
+
+    assert recipe.precision_debug_session is session
+    install.assert_called_once_with(
+        mocks.model,
+        cfg.low_precision.precision_debug,
+        output_root=Path("/tmp/ut_train") / "precision_debug",
+    )
+
+
+def test_setup_rejects_empty_train_url_for_precision_debug(env):
+    _, cfg, _ = env
+    cfg.training.train_url = ""
+    cfg.low_precision = LowPrecisionConfig(
+        enabled=True,
+        precision_debug={"sections": [{"name": "fprop", "observe": True}]},
+    )
+
+    with pytest.raises(ValueError, match="training.train_url"):
+        FinetuneRecipe().setup(cfg)
+
+
+def test_validation_pauses_precision_debug(monkeypatch):
+    session = MagicMock()
+    session.paused.return_value = nullcontext()
+    monkeypatch.setattr(
+        train_ft,
+        "_dp_cp_all_reduce_sum",
+        lambda value, _mesh: torch.tensor(value),
+    )
+    recipe = SimpleNamespace(
+        model_parts=[MagicMock()],
+        precision_debug_session=session,
+        dp_cp_mesh=None,
+    )
+
+    FinetuneRecipe._run_validation_epoch(recipe, [])
+
+    session.paused.assert_called_once_with()
 
 
 def test_setup_builds_optimizer(env):
