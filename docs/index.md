@@ -20,6 +20,10 @@
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [Trainer YAML 配置](./guide/trainer/yaml_config.md) | typed TrainerConfig、CLI override、训练组件扩展 |
+| [NPU Trainer 运行时适配](./guide/npu_trainer_runtime.md) | NPU 设备选择、HCCL 初始化与信号同步 |
+| [Dense MXFP8 在线训练](./guide/dense_mxfp8_online_training.md) | A5 Dense Linear 在线量化训练、配置与限制 |
+| [可选精度诊断](./guide/precision_diagnostics.md) | Observer 安装、采样、报告与产物约束 |
+| [FSDP Local Tensor Extension](./guide/fsdp_local_tensor_extension.md) | 外部 Local Tensor 接入 fully_shard 的协议 |
 | [DCP 分布式检查点](./guide/distributed_checkpoint.md) | 检查点保存/加载、异步 staging、离线转换 |
 | [自动并行](./guide/auto_parallel.md) | SAPP-ND、SAPP-PPB |
 | [MoE 多核并行](./guide/multicore_moe.md) | 多核 MPMD、MoE 通算掩盖 |
