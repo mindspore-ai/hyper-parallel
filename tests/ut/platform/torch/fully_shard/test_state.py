@@ -337,6 +337,16 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         param_group.assert_called_once()
         self.assertEqual(supported.param_group, "group")
 
+    def test_init_param_group_treats_ordinary_param_as_fused(self):
+        """Ordinary parameters must not require the extension protocol."""
+        state = _new_state([_FakeHSDPParam()], comm_fusion=True)
+
+        with patch.object(TorchHSDPStateV2, "_comm_fusion_unsupported_reason", return_value=None):
+            with patch.object(state_mod, "HSDPParamGroup", return_value="group"):
+                TorchHSDPStateV2._init_param_group(state)
+
+        self.assertEqual(state.non_fused_hsdp_params, [])
+
     def test_init_param_group_reports_first_unsupported_parameter(self):
         """Param-group init should report the first unsupported fusion reason."""
         param = _FakeHSDPParam()

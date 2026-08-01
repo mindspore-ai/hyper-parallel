@@ -77,7 +77,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
     def test_init_all_gather_outputs_reuse_and_force_recreate(self):
         """All-gather buffers should be reused unless recreation is requested."""
         hsdp_param = _new_param()
-        existing = torch.empty(1)
+        existing = torch.empty(4)
         hsdp_param.all_gather_outputs = [existing]
 
         hsdp_param.init_all_gather_outputs([2], [torch.float32], 2, torch.device("cpu"))
@@ -88,6 +88,52 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         )
         self.assertEqual([t.numel() for t in hsdp_param.all_gather_outputs], [4, 2])
         self.assertEqual(hsdp_param.all_gather_outputs[1].dtype, torch.float16)
+
+    def test_init_all_gather_outputs_recreates_when_contract_changes(self):
+        """New extension physical tensors must not reuse stale gather buffers."""
+        hsdp_param = _new_param()
+        hsdp_param.all_gather_outputs = [torch.empty(4, dtype=torch.float32)]
+
+        hsdp_param.init_all_gather_outputs(
+            [2, 3], [torch.float32, torch.float16], 2, torch.device("cpu")
+        )
+
+        self.assertEqual([tensor.numel() for tensor in hsdp_param.all_gather_outputs], [4, 6])
+        self.assertEqual(hsdp_param.all_gather_outputs[1].dtype, torch.float16)
+
+    def test_init_all_gather_outputs_recreates_when_numel_changes(self):
+        """A same-dtype extension input with a new size needs a new buffer."""
+        hsdp_param = _new_param()
+        existing = torch.empty(4, dtype=torch.float32)
+        hsdp_param.all_gather_outputs = [existing]
+
+        hsdp_param.init_all_gather_outputs(
+            [3],
+            [torch.float32],
+            2,
+            torch.device("cpu"),
+        )
+
+        self.assertIsNot(hsdp_param.all_gather_outputs[0], existing)
+        self.assertEqual(hsdp_param.all_gather_outputs[0].numel(), 6)
+
+    def test_init_unsharded_param_refreshes_prior_gather_result(self):
+        """Each unshard cycle refreshes data without replacing optimizer state."""
+        hsdp_param = _new_param()
+        hsdp_param._get_unsharded_param_from_all_gather_output = MagicMock(
+            side_effect=[torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
+        )
+        del hsdp_param._unsharded_param
+
+        hsdp_param.init_unsharded_param()
+        first = hsdp_param.unsharded_param
+        hsdp_param.init_unsharded_param()
+
+        self.assertIs(hsdp_param.unsharded_param, first)
+        torch.testing.assert_close(
+            hsdp_param.unsharded_param,
+            torch.tensor([3.0, 4.0]),
+        )
 
     def test_get_unsharded_param_from_all_gather_output_plain_and_dtensor(self):
         """All-gather output should restore plain tensors and DTensor wrappers."""

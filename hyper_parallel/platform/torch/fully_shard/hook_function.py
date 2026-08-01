@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""add post backward hook function"""
+"""Post-backward autograd hook that preserves DTensor wrapper types."""
 import torch
 
 
@@ -35,22 +35,30 @@ class PostBackwardFunction(torch.autograd.Function):
     @classmethod
     def apply(cls, *args, **kwargs):
         """Override apply function to handle DTensor inputs"""
-        # pylint: disable=C0415
-        from hyper_parallel import DTensor
-
         input_args = []
-        input_layouts = []
+        input_wrappers = []
         for arg in args:
             if arg is None:
-                input_layouts.append(None)
+                input_wrappers.append(None)
                 input_args.append(arg)
                 continue
-            if not hasattr(arg, "_layout"):
-                input_layouts.append(None)
+            if not hasattr(arg, "layout") or not callable(getattr(arg, "to_local", None)):
+                input_wrappers.append(None)
                 input_args.append(arg)
             else:
                 layout = arg.layout
-                input_layouts.append(layout)
+                from_local = getattr(type(arg), "from_local", None)
+                if not callable(from_local):
+                    # Legacy DTensor-like wrappers carried only ``_layout``;
+                    # retain their historical reconstruction path while new
+                    # extension wrappers use their own class constructor.
+                    from hyper_parallel import DTensor  # pylint: disable=import-outside-toplevel
+                    from_local = DTensor.from_local
+                if not hasattr(layout, "mesh") or not hasattr(layout, "alias_placements"):
+                    raise TypeError(
+                        f"{type(arg).__name__}.layout must expose mesh and alias_placements."
+                    )
+                input_wrappers.append((from_local, layout))
                 input_args.append(arg.to_local())
 
         origin_output = super().apply(*input_args, **kwargs)
@@ -61,11 +69,13 @@ class PostBackwardFunction(torch.autograd.Function):
         if isinstance(origin_output, (tuple, list)):
             output = ()
             for i, output_item in enumerate(origin_output):
-                item_layout = input_layouts[i+1]
-                if item_layout is None:
+                wrapper = input_wrappers[i + 1]
+                if wrapper is None:
                     output += (output_item,)
                 else:
-
-                    output += (DTensor.from_local(output_item, item_layout.mesh, item_layout.alias_placements),)
+                    from_local, layout = wrapper
+                    output += (
+                        from_local(output_item, layout.mesh, layout.alias_placements),
+                    )
             return output
         return origin_output

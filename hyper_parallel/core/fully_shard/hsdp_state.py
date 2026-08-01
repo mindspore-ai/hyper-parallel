@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP cell state"""
-from typing import List, Tuple, Union
+from typing import Any, List, Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
@@ -83,6 +83,19 @@ class HSDPState:
         """move states to device"""
         raise NotImplementedError("HSDPState subclasses must implement _move_states_to_device")
 
+    def _set_all_gather_phase(self, phase: str) -> None:
+        """Validate the scheduler phase before a backend prepares all-gather context."""
+        if phase not in ("forward", "backward"):
+            raise ValueError(
+                "fully_shard all-gather phase must be 'forward' or 'backward', "
+                f"got {phase!r}."
+            )
+        self._all_gather_phase = phase
+        for param in self._iter_managed_params():
+            setter = getattr(param, "set_all_gather_phase", None)
+            if callable(setter):
+                setter(phase, self.config.reshard_after_forward)
+
     def _assert_replicate_params_unsharded(self) -> None:
         """Validate replicate params are already materialized when state says so."""
         for param in self.replicate_params:
@@ -112,7 +125,11 @@ class HSDPState:
                 param.to_sharded()
             self.is_replicate_shard = True
 
-    def unshard(self, async_op=False, unshard_replicate: bool = True):
+    def unshard(
+        self,
+        async_op: bool = False,
+        unshard_replicate: bool = True,
+    ) -> None:
         """change parameters to unsharded state"""
         logger.debug(
             "action=unshard module=%s async_op=%s shard_params=%s replicate_params=%s unshard_replicate=%s",
@@ -136,8 +153,14 @@ class HSDPState:
         if self.is_shard:
             if self.config.comm_fusion and self.param_group is not None:
                 self.param_group.unshard(async_op)
-            else:
+            if not self.config.comm_fusion:
                 for param in self.sharded_hsdp_params:
+                    param.unshard(async_op)
+            else:
+                non_fused_params = getattr(self, "non_fused_hsdp_params", None)
+                if non_fused_params is None and self.param_group is None:
+                    non_fused_params = self.sharded_hsdp_params
+                for param in non_fused_params or ():
                     param.unshard(async_op)
         if not async_op:
             self.wait_for_unshard(unshard_replicate)
@@ -153,7 +176,7 @@ class HSDPState:
         )
         self.unshard(async_op=True, unshard_replicate=unshard_replicate)
 
-    def wait_for_unshard(self, wait_for_replicate: bool = True):
+    def wait_for_unshard(self, wait_for_replicate: bool = True) -> None:
         """wait for all unshard parameters"""
         logger.debug(
             "action=wait_unshard module=%s shard_params=%s replicate_params=%s wait_for_replicate=%s",
@@ -176,12 +199,18 @@ class HSDPState:
         if self.is_shard:
             if self.config.comm_fusion and self.param_group is not None:
                 self.param_group.wait_for_unshard()
-            else:
+            if not self.config.comm_fusion:
                 for param in self.sharded_hsdp_params:
+                    param.wait_for_unshard()
+            else:
+                non_fused_params = getattr(self, "non_fused_hsdp_params", None)
+                if non_fused_params is None and self.param_group is None:
+                    non_fused_params = self.sharded_hsdp_params
+                for param in non_fused_params or ():
                     param.wait_for_unshard()
             self.is_shard = False
 
-    def set_gradient_scaling_factor(self, factor):
+    def set_gradient_scaling_factor(self, factor: Any) -> None:
         """Propagate the gradient scaling factor to the layer that applies it.
 
         The factor is consumed on the reduce input: ``param_group.foreach_reduce``
@@ -191,6 +220,10 @@ class HSDPState:
         param_group = getattr(self, "param_group", None)
         if param_group is not None:
             param_group.gradient_scaling_factor = factor
+            grouped_param_ids = {id(param) for param in param_group.hsdp_params}
+            for hsdp_param in self._iter_managed_params():
+                if id(hsdp_param) not in grouped_param_ids:
+                    hsdp_param.gradient_scaling_factor = factor
         else:
             for hsdp_param in self._iter_managed_params():
                 hsdp_param.gradient_scaling_factor = factor

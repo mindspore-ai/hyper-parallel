@@ -29,7 +29,12 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
     "limitations under the License.",
 )
 BACKEND_IMPORTS = {"torch", "mindspore"}
-PLATFORM_ALLOWED_PARTS = ("hyper_parallel/platform/", "tests/", "scripts/", ".agent/")
+PLATFORM_ALLOWED_PARTS = (
+    "hyper_parallel/platform/",
+    "tests/",
+    "scripts/",
+    ".agent/",
+)
 PUBLIC_MAGIC_ALLOWLIST = {
     "__init__", "__call__", "__enter__", "__exit__", "__iter__", "__next__",
     "__len__", "__getitem__", "__setitem__", "__delitem__", "__contains__",

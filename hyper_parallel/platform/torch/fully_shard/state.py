@@ -32,6 +32,7 @@ from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
 from hyper_parallel.platform.torch.fully_shard.pack_utils import build_rs_plan
 from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx, HSDPParamGroup, AllReduceParamGroup
+from hyper_parallel.platform.torch.fully_shard.extension import is_fsdp_flattenable
 
 logger = get_logger("FSDP")
 
@@ -154,10 +155,21 @@ class TorchHSDPStateV2(HSDPState):
         replacing the per-parameter communication pattern.
         """
         if self.config.comm_fusion:
+            self.non_fused_hsdp_params = [
+                param for param in self.hsdp_params
+                if getattr(param, "uses_fsdp_extension", False)
+                and not is_fsdp_flattenable(
+                    getattr(param, "_sharded_local_tensor", None)
+                )
+            ]
+            fused_hsdp_params = [
+                param for param in self.hsdp_params
+                if param not in self.non_fused_hsdp_params
+            ]
             unsupported_param = next(
                 (
                     hsdp_param
-                    for hsdp_param in self.hsdp_params
+                    for hsdp_param in fused_hsdp_params
                     if self._comm_fusion_unsupported_reason(hsdp_param) is not None
                 ),
                 None,
@@ -169,10 +181,10 @@ class TorchHSDPStateV2(HSDPState):
                     f"comm_fusion does not support parameter {param_fqn}: {reason}."
                 )
             self.param_group = None
-            if self.hsdp_params:
+            if fused_hsdp_params:
                 # pylint: disable=E1128
                 self.param_group = HSDPParamGroup(
-                    self.hsdp_params,
+                    fused_hsdp_params,
                     self.mesh_info,
                     self.device,
                     self.mp_policy,
@@ -320,6 +332,11 @@ class TorchHSDPStateV2(HSDPState):
             self.param_group.foreach_reduce(
                 reduce_scatter_reduce_op=self.reduce_op_type,
             )
+        for hsdp_param in getattr(self, "non_fused_hsdp_params", ()):
+            if not self._has_pending_unsharded_grad(hsdp_param):
+                continue
+            reduce_op = self._resolve_reduce_op(hsdp_param)
+            self._queue_reduce_scatter_then_all_reduce(hsdp_param, reduce_op)
         for hsdp_param in self.replicate_params:
             if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                 continue

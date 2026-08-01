@@ -185,11 +185,13 @@ class HSDPSchedulerV2:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             args = self.platform.apply_to_tensors(cast_fn, args)
             kwargs = self.platform.apply_to_tensors(cast_fn, kwargs)
+        self._set_all_gather_phase(self.hsdp_state, "forward")
         with self.platform.profiler_record(f"pre_forward unshard:{self.hsdp_state.module_name}"):
             logger.debug("hook=forward_pre action=unshard module=%s", self.hsdp_state)
             self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
             prefetch_state = prefetch_cell.hsdp_scheduler.hsdp_state
+            self._set_all_gather_phase(prefetch_state, "forward")
             with self.platform.profiler_record(f"pre_forward prefetch:"
                                                f"{prefetch_state.module_name}"):
                 logger.debug(
@@ -206,6 +208,13 @@ class HSDPSchedulerV2:
                 hsdp_state = get_hsdp_state(module)
                 if hsdp_state:
                     hsdp_state.lazy_init()
+
+    @staticmethod
+    def _set_all_gather_phase(state, phase: str) -> None:
+        """Set extension context only for states that implement the protocol."""
+        setter = getattr(state, "_set_all_gather_phase", None)
+        if callable(setter):
+            setter(phase)
 
     def _init_params_fqn(self):  # pylint: disable=W0212
         if not self._is_root or self.scheduler_ctx.root_module is None:
@@ -260,11 +269,13 @@ class HSDPSchedulerV2:
         logger.debug("hook=backward_pre enter module=%s", self.hsdp_state)
         self.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
         if self.reshard_after_forward:
+            self._set_all_gather_phase(self.hsdp_state, "backward")
             with self.platform.profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
                 logger.debug("hook=backward_pre action=unshard module=%s", self.hsdp_state)
                 self.hsdp_state.unshard(unshard_replicate=False)
         for prefetch_cell in self.backward_prefetch_cells:
             prefetch_state = prefetch_cell.hsdp_scheduler.hsdp_state
+            self._set_all_gather_phase(prefetch_state, "backward")
             with self.platform.profiler_record(f"pre_backward prefetch:"
                                                f"{prefetch_state.module_name}"):
                 logger.debug(
