@@ -19,18 +19,16 @@ Stub — provides from_pretrained/from_config as entry points.
 """
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
-import torch
-import torch.nn as nn
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     PreTrainedModel,
 )
 
+from hyper_parallel import get_platform
 from hyper_models._transformers.infrastructure import (
     apply_model_infrastructure,
     instantiate_infrastructure,
@@ -40,6 +38,7 @@ from hyper_models._transformers.registry import get_hf_config, get_is_hf_model
 from hyper_models.components.distributed.infrastructure import DistributedSetup
 
 logger = logging.getLogger(__name__)
+platform = get_platform()
 
 
 class _BaseHyperAutoModelClass:
@@ -71,6 +70,7 @@ class _BaseHyperAutoModelClass:
         validate_placement: bool = False,
         qat_config=None,
         fp8_config=None,
+        low_precision_config=None,
         compile_config=None,
         freeze_config=None,
         **kwargs,
@@ -93,7 +93,7 @@ class _BaseHyperAutoModelClass:
         # ② Instantiate infrastructure
         sharding_planner, fsdp2_manager, autopipeline = instantiate_infrastructure(
             distributed_setup=distributed_setup,
-            device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
+            device=platform.device(),
         )
 
         # ③ Get HF config
@@ -123,6 +123,7 @@ class _BaseHyperAutoModelClass:
             distributed_setup=distributed_setup,
             qat_config=qat_config,
             fp8_config=fp8_config,
+            low_precision_config=low_precision_config,
             compile_config=compile_config,
             freeze_config=freeze_config,
             **kwargs,
@@ -138,6 +139,7 @@ class _BaseHyperAutoModelClass:
         backend=None,
         torch_dtype="auto",
         attn_implementation="sdpa",
+        low_precision_config=None,
         **kwargs,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
@@ -151,7 +153,7 @@ class _BaseHyperAutoModelClass:
 
         sharding_planner, fsdp2_manager, autopipeline = instantiate_infrastructure(
             distributed_setup=distributed_setup,
-            device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
+            device=platform.device(),
         )
 
         is_hf_model = get_is_hf_model(config, force_hf=False)
@@ -172,6 +174,7 @@ class _BaseHyperAutoModelClass:
             validate_placement=False,
             load_base_model=False,
             distributed_setup=distributed_setup,
+            low_precision_config=low_precision_config,
             **kwargs,
         )
 
@@ -195,6 +198,7 @@ class _BaseHyperAutoModelClass:
         distributed_setup=None,
         qat_config=None,
         fp8_config=None,
+        low_precision_config=None,
         compile_config=None,
         freeze_config=None,
         **kwargs,
@@ -208,7 +212,12 @@ class _BaseHyperAutoModelClass:
         """
         from contextlib import nullcontext
         from transformers.modeling_utils import ContextManagers
-        from transformers.initialization import no_init_weights
+        try:
+            # Transformers 5.x
+            from transformers.initialization import no_init_weights
+        except ImportError:
+            # Transformers 4.x
+            from transformers.modeling_utils import no_init_weights
         from hyper_models.components.utils.model_utils import init_empty_weights
 
         # Step 1: Determine meta device
@@ -247,11 +256,12 @@ class _BaseHyperAutoModelClass:
             peft_config=peft_config,
             qat_config=qat_config,
             fp8_config=fp8_config,
+            low_precision_config=low_precision_config,
             freeze_config=freeze_config,
             compile_config=compile_config,
             is_meta_device=is_meta_device,
             is_hf_model=is_hf_model,
-            device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
+            device=platform.device(),
             load_base_model=load_base_model,
             pretrained_path=pretrained_model_name_or_path,
             validate_placement=validate_placement,

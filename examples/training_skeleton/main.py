@@ -18,7 +18,7 @@ This script demonstrates the full Hyper-Parallel training skeleton:
   - YAML config parsing
   - distributed initialization + DeviceMesh (TP/CP/DP/EP topology)
   - dummy data pipeline
-  - model build (tiny local GPT-2)
+  - model build (tiny local GPT-2 or Llama)
   - optimizer / LR scheduler / loss / step scheduler
   - FSDP2 (stub — called but no-op)
   - checkpoint save/load (stub — called but no-op)
@@ -38,60 +38,94 @@ import logging
 import sys
 from pathlib import Path
 
+import torch
 import torch.distributed as dist
+from transformers import (
+    GPT2Config,
+    GPT2LMHeadModel,
+    LlamaConfig,
+    LlamaForCausalLM,
+)
 
 # Make the repository root importable.
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
+OBSERVER_SOURCE = (
+    ROOT
+    / "hyper_models/components/training/low_precision/precision_observer/src"
+)
+if OBSERVER_SOURCE.is_dir():
+    sys.path.insert(0, str(OBSERVER_SOURCE))
 
 from hyper_models.components.distributed.infrastructure import initialize_distributed
 from hyper_models.config.manager import parse_training_args
 from hyper_models.recipes import RECIPE_REGISTRY
-from transformers import GPT2Config, GPT2LMHeadModel
 
 logger = logging.getLogger(__name__)
 
+TINY_VOCAB_SIZE = 1024
 
-def _ensure_tiny_model(model_dir: Path) -> None:
-    """Create a tiny local GPT-2 checkpoint on rank 0, barrier for others."""
+
+def _ensure_tiny_model(model_dir: Path, model_name: str) -> None:
+    """Create the requested tiny local checkpoint on rank 0."""
     if dist.is_initialized() and dist.get_rank() != 0:
         dist.barrier()
         return
 
     if not (model_dir / "config.json").exists():
         model_dir.mkdir(parents=True, exist_ok=True)
-        config = GPT2Config(
-            vocab_size=1000,
-            n_positions=64,
-            n_embd=64,
-            n_layer=2,
-            n_head=4,
-            n_inner=256,
-            resid_pdrop=0.0,
-            embd_pdrop=0.0,
-            attn_pdrop=0.0,
-            bos_token_id=0,
-            eos_token_id=0,
-            pad_token_id=0,
-        )
-        model = GPT2LMHeadModel(config)
+        if model_name == "tiny_llama":
+            config = LlamaConfig(
+                vocab_size=TINY_VOCAB_SIZE,
+                hidden_size=64,
+                intermediate_size=256,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                max_position_embeddings=64,
+                attention_dropout=0.0,
+                bos_token_id=0,
+                eos_token_id=0,
+                pad_token_id=0,
+            )
+            # The production MXFP8 path keeps model parameters and optimizer
+            # state in BF16; only GEMM operands are quantized online.
+            model = LlamaForCausalLM(config).to(dtype=torch.bfloat16)
+        else:
+            config = GPT2Config(
+                vocab_size=TINY_VOCAB_SIZE,
+                n_positions=64,
+                n_embd=64,
+                n_layer=2,
+                n_head=4,
+                n_inner=256,
+                resid_pdrop=0.0,
+                embd_pdrop=0.0,
+                attn_pdrop=0.0,
+                bos_token_id=0,
+                eos_token_id=0,
+                pad_token_id=0,
+            )
+            model = GPT2LMHeadModel(config)
         model.save_pretrained(model_dir)
-        logger.info("Wrote tiny GPT-2 checkpoint to %s", model_dir)
+        logger.info("Wrote %s checkpoint to %s", model_name, model_dir)
 
     if dist.is_initialized():
         dist.barrier()
 
 
 def main() -> None:
+    """Build the configured tiny model and run its Trainer recipe."""
+
     # Initialize distributed early so that rank 0 can prepare the checkpoint
     # and all ranks agree on the topology before building the recipe.
-    initialize_distributed("nccl")
+    initialize_distributed()
 
     cfg = parse_training_args()
 
     # Resolve the model path relative to the CWD / YAML location.
     model_dir = Path(cfg.model.weights_path or "./outputs/tiny_model").resolve()
-    _ensure_tiny_model(model_dir)
+    _ensure_tiny_model(model_dir, cfg.model.name)
     cfg.model.weights_path = str(model_dir)
     if cfg.model.tokenizer_path is None:
         cfg.model.tokenizer_path = str(model_dir)

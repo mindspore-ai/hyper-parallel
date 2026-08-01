@@ -51,6 +51,7 @@ checkpoint:
 training:
   _target_: hyper_models.trainer.config.TrainingConfig
   seed: 42
+  train_url: ./outputs/training_skeleton
 
 accelerator:
   _target_: hyper_models.trainer.config.AcceleratorConfig

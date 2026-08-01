@@ -28,6 +28,13 @@ from hyper_models.components.distributed.fsdp2 import FSDP2Manager, _instantiate
 from hyper_models.components.distributed.pipelining import _instantiate_pipeline
 from hyper_models.components.distributed.sharding_planner import ShardingPlanner
 from hyper_models.components.distributed.config import _resolve_strategy_config
+from hyper_models.components.training.low_precision import (
+    LowPrecisionConfig,
+    apply_low_precision,
+)
+from hyper_models.components.training.low_precision.ops import (
+    validate_npu_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +89,7 @@ def apply_model_infrastructure(
     peft_config=None,
     qat_config=None,
     fp8_config=None,
+    low_precision_config: Optional[LowPrecisionConfig] = None,
     freeze_config=None,
     compile_config=None,
     is_meta_device: bool = False,
@@ -109,6 +117,12 @@ def apply_model_infrastructure(
     plan: Optional[ShardingPlan] = None
     tp_grad_info: Optional[dict] = None
 
+    # Runtime capability validation must happen before PP/PEFT/conversion can
+    # mutate the model. The converter itself stays meta/CPU safe for tooling
+    # and unit tests; the production Trainer owns this fail-fast check.
+    if low_precision_config is not None and low_precision_config.enabled:
+        validate_npu_runtime()
+
     # Step 3: PP split (if autopipeline)
     if autopipeline is not None:
         # build() is in-place; model stays the original nn.Module
@@ -123,6 +137,8 @@ def apply_model_infrastructure(
         logger.warning("QAT not implemented in stub")
     if fp8_config is not None:
         logger.warning("FP8 not implemented in stub")
+    if low_precision_config is not None and low_precision_config.enabled:
+        model = apply_low_precision(model, low_precision_config)
 
     # Step 6: Parameter freezing (before sharding)
     if freeze_config is not None:
@@ -164,6 +180,18 @@ def apply_model_infrastructure(
             logger.info("Sharding plan applied; tp_grad_info keys=%d", len(tp_grad_info or {}))
         else:
             logger.warning("MeshContext has no device_mesh; skipping sharding")
+
+    # A manager may exist before it implements FSDP wrapping. Only an active
+    # wrapper that explicitly owns placement may keep parameters off-device.
+    # Otherwise a multi-card trainer would move batches to NPU while weights
+    # remain on CPU.
+    fsdp_owns_placement = bool(
+        fsdp2_manager is not None
+        and getattr(fsdp2_manager, "owns_parameter_placement", False)
+    )
+    if not is_meta_device and device is not None and not fsdp_owns_placement:
+        model.to(device)
+        logger.info("Model moved to %s", device)
 
     # Step 9: torch.compile
     if compile_config is not None:

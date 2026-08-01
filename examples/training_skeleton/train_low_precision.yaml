@@ -1,0 +1,59 @@
+# NPU A5 MXFP8 training skeleton.
+#
+# Requires Ascend 950PR/950DT with a torch_npu build exposing
+# npu_dynamic_mx_quant, npu_dynamic_mx_quant_with_dual_axis, and
+# npu_quant_matmul. Start from train.yaml and use this file in its place.
+
+model:
+  _target_: hyper_parallel.trainer.config.ModelConfig
+  name: tiny_llama
+  weights_path: ./outputs/tiny_model_mxfp8
+  tokenizer_path: ./outputs/tiny_model_mxfp8
+
+optimizer:
+  _target_: hyper_models.components.optim.AdamW.Config
+  lr: 1.0e-4
+
+loss:
+  _target_: hyper_models.components.loss.LossConfig
+  loss_aggregation: token_weighted
+
+step_scheduler:
+  _target_: hyper_models.components.training.step_scheduler.StepSchedulerConfig
+  max_steps: 4
+  num_train_epochs: 1
+  local_batch_size: 1
+  global_batch_size: 1
+
+training:
+  _target_: hyper_models.trainer.config.TrainingConfig
+  init_device: npu
+  train_url: ./outputs/training_skeleton_low_precision
+
+accelerator:
+  _target_: hyper_models.trainer.config.AcceleratorConfig
+  dp_shard_size: 1
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+
+low_precision:
+  _target_: hyper_models.components.training.low_precision.LowPrecisionConfig
+  enabled: true
+  format: mxfp8_e4m3
+  scaling: mx_block
+  # The skeleton model uses 64/256-aligned Dense layers; select all of them.
+  include_fqns: ["*"]
+  # Optional lhs/rhs quantization diagnostics. No GEMM-output observation.
+  precision_debug:
+    sections:
+      - name: fprop_operands
+        select:
+          module_name_regex: ".*"
+          gemm_roles: [fprop]
+        observe:
+          operands: [lhs, rhs]
+          schedule:
+            every_n_steps: 100

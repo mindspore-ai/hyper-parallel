@@ -20,6 +20,7 @@ from typing import Any, Literal, Optional
 from hyper_models.components.checkpoint.config import CheckpointingConfig
 from hyper_models.components.loss import Loss
 from hyper_models.components.optim import LRScheduler, Optimizer
+from hyper_models.components.training.low_precision import LowPrecisionConfig
 from hyper_models.components.training.step_scheduler import StepSchedulerConfig
 from hyper_parallel.trainer import config as legacy_config
 
@@ -34,6 +35,7 @@ class TrainingConfig:
     loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"
     # 随机种子（03 §5.3 ③：StatefulRNG(seed=cfg.training.seed, ranked=True)）
     seed: int = 42
+    train_url: str = "./outputs"
 
 
 @dataclass
@@ -96,6 +98,7 @@ class TrainerConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(
         default_factory=GradientCheckpointingConfig
     )
+    low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 
     # ── 训练循环扩展字段（03 §5.2/§13 规划 schema，随 Recipe 骨架落地） ──
@@ -122,6 +125,7 @@ __all__ = [
     "AcceleratorConfig",
     "DebugConfig",
     "GradientCheckpointingConfig",
+    "LowPrecisionConfig",
     "MixedPrecisionConfig",
     "TrainerConfig",
     "TrainingConfig",

@@ -27,6 +27,7 @@ from typing import Literal, Optional, Union
 
 from hyper_models.components.loss import CausalLMLoss
 from hyper_models.components.optim import AdamW, LRScheduler
+from hyper_models.components.training.low_precision import LowPrecisionConfig
 from hyper_models.config.manager import parse_training_args
 from hyper_models.config.resolver import (
     ConfigResolutionError,
@@ -174,6 +175,36 @@ class TestTrainingConfigResolution(unittest.TestCase):
         self.assertTrue(config.mixed_precision.enabled)
         self.assertIsInstance(config.debug, DebugConfig)
         self.assertTrue(config.debug.check_nan_inf)
+
+    def test_low_precision_yaml_accepts_precision_debug_mapping(self):
+        config = resolve_root({
+            "model": {
+                "_target_": f"{__name__}._required_model_factory",
+                "identifier": "test",
+            },
+            "low_precision": {
+                "_target_": (
+                    "hyper_models.components.training.low_precision."
+                    "LowPrecisionConfig"
+                ),
+                "enabled": True,
+                "include_fqns": ["model.layers.*.mlp"],
+                "precision_debug": {
+                    "sections": [{
+                        "name": "fprop_lhs",
+                        "select": {"gemm_roles": ["fprop"]},
+                        "observe": {"operands": ["lhs"]},
+                    }],
+                },
+            },
+        })
+
+        self.assertIsInstance(config.low_precision, LowPrecisionConfig)
+        self.assertTrue(config.low_precision.enabled)
+        self.assertEqual(
+            config.low_precision.precision_debug["sections"][0]["name"],
+            "fprop_lhs",
+        )
 
     def test_typed_fields_reject_invalid_values(self):
         model = {
@@ -411,6 +442,10 @@ class TestTrainingConfigResolution(unittest.TestCase):
         self.assertEqual(
             coerce_value([1, 2], list[int], path="test.layers"),
             [1, 2],
+        )
+        self.assertEqual(
+            coerce_value({"enabled": True}, dict[str, object], path="test.mapping"),
+            {"enabled": True},
         )
         self.assertIsNone(coerce_value(None, Optional[bool], path="test.foreach"))
         with self.assertRaisesRegex(ConfigResolutionError, r"expected bool"):

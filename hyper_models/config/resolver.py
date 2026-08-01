@@ -208,6 +208,18 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
         )
     if origin is tuple or annotation is tuple:
         return _normalize_tuple(value, args, path=path)
+    if origin in (dict, Mapping) or annotation in (dict, Mapping):
+        if not isinstance(value, Mapping):
+            raise _fail(path, f"expected mapping, got {type(value).__name__}")
+        key_type, value_type = args if len(args) == 2 else (Any, Any)
+        return {
+            coerce_value(key, key_type, path=f"{path}.<key>"): coerce_value(
+                item,
+                value_type,
+                path=f"{path}[{key!r}]",
+            )
+            for key, item in value.items()
+        }
     if isinstance(annotation, type):
         if isinstance(value, annotation):
             return value
