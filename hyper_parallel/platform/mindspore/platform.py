@@ -38,15 +38,6 @@ from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
 from mindspore.ops import communication as ops_comm
 from mindspore.ops.function import comm_func
-# Private MindSpore symbols used by ``_MSAsyncA2ALazyBwd._issue_async_a2a`` to
-# bypass the trailing reshape that ``comm_func.all_to_all_single`` performs on
-# the default compute stream before the async ``CommHandle.wait()`` fires —
-# see that helper's docstring for the full rationale.  If a future MindSpore
-# release moves or renames either symbol, this module will fail to import
-# loudly (intended — silently falling back to ``comm_func.all_to_all_single``
-# would re-introduce the race).
-from mindspore.ops.function.comm_func import _deal_comm_outputs
-from mindspore.ops.auto_generate.gen_ops_prim import inner_comm_all_to_all_v_op
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
 
@@ -152,6 +143,46 @@ def _mindspore_all_to_all_single(input_tensor: Tensor, output_shape, group, asyn
     if not async_op:
         return normalized_output, None
     return normalized_output, handle
+
+
+def _mindspore_variable_all_to_all_single(
+        input_tensor: Tensor, input_splits, output_splits, group, async_op=False
+) -> tuple[Tensor, object]:
+    """Launch a flat variable-split A2A into an exactly sized output tensor."""
+    output = mint.empty((sum(output_splits),), dtype=input_tensor.dtype)
+    handle = dist.all_to_all_single(
+        output=output,
+        input=input_tensor,
+        output_split_sizes=output_splits,
+        input_split_sizes=input_splits,
+        group=group,
+        async_op=async_op,
+    )
+    return output, handle if async_op else None
+
+
+def _encode_variable_all_to_all_metadata(input_splits, output_splits, group):
+    """Encode A2A split lists and group name as CPU tensors for autograd."""
+    if group is not None and not isinstance(group, str):
+        raise ValueError(
+            "MindSpore variable-split all-to-all requires group to be a string or None, "
+            f"but got {type(group)}."
+        )
+    group_bytes = np.frombuffer((group or "").encode("utf-8"), dtype=np.uint8).copy()
+    return (
+        Tensor(list(input_splits), dtype=mstype.int64, device="CPU"),
+        Tensor(list(output_splits), dtype=mstype.int64, device="CPU"),
+        Tensor(group_bytes, device="CPU"),
+    )
+
+
+def _decode_variable_all_to_all_metadata(saved_tensors):
+    """Decode CPU metadata tensors saved by a variable-split A2A forward."""
+    input_splits = next(saved_tensors).asnumpy().tolist()
+    output_splits = next(saved_tensors).asnumpy().tolist()
+    group_bytes = next(saved_tensors).asnumpy().tobytes()
+    group = group_bytes.decode("utf-8") if group_bytes else None
+    return input_splits, output_splits, group
 
 
 def _mindspore_all_gather_single(input_tensor: Tensor, output_shape, group, async_op=False) -> tuple[Tensor, object]:
@@ -502,6 +533,31 @@ class AsyncCollectiveTensor(Tensor):
         return iter(self._wait_and_unwrap())
 
 
+class _MSA2ABwd(_Function):
+    """Synchronous variable-split A2A with an exact output shape in both directions."""
+
+    @staticmethod
+    def forward(ctx, input_tensor, output_splits, input_splits, group):  # pylint: disable=arguments-differ
+        """Run the forward A2A and save its reverse communication metadata."""
+        ctx.save_for_backward(*_encode_variable_all_to_all_metadata(
+            input_splits, output_splits, group,
+        ))
+        output, _ = _mindspore_variable_all_to_all_single(
+            input_tensor, input_splits, output_splits, group,
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Run the reverse A2A with the forward split sizes swapped."""
+        saved_tensors = iter(ctx.saved_tensors)
+        input_splits, output_splits, group = _decode_variable_all_to_all_metadata(saved_tensors)
+        grad_input, _ = _mindspore_variable_all_to_all_single(
+            grad_output, output_splits, input_splits, group,
+        )
+        return grad_input, None, None, None
+
+
 class _MSAsyncA2ALazyBwd(_Function):
     """Async all-to-all whose forward and backward both return
     :class:`AsyncCollectiveTensor`, deferring ``CommHandle.wait()``
@@ -517,15 +573,10 @@ class _MSAsyncA2ALazyBwd(_Function):
     def _issue_async_a2a(flat_input, send_splits, recv_splits, group):
         """Issue an async all-to-all-v on a 1-D flat tensor.
 
-        Bypasses ``comm_func.all_to_all_single``: that wrapper appends an
-        unconditional ``result.reshape((-1,) + recv_shape_without_first_dim)``
-        on the default compute stream *before* the async ``CommHandle.wait()``
-        fires (the wait is deferred to the first consumer op via
-        :class:`AsyncCollectiveTensor`).  MindSpore's mem_pool race_checker
-        (``MS_ALLOC_CONF=memory_tracker:True``) flags that trailing reshape
-        as a cross-stream race on the HCCL output, even though for 1-D
-        inputs it is a metadata-only no-op.  Calling the inner primitive
-        directly skips the tracker-visible read on stream 0.
+        The caller-allocated output has exactly ``sum(recv_splits)`` elements,
+        including a true ``(0,)`` shape on ranks that receive no data. Using
+        ``mint.distributed`` also avoids the trailing reshape performed by the
+        legacy ``comm_func`` wrapper before the lazy wait fires.
 
         Args:
             flat_input:  1-D tensor — must already be flattened by the caller.
@@ -536,19 +587,9 @@ class _MSAsyncA2ALazyBwd(_Function):
         Returns:
             ``(output_tensor, CommHandle)`` — the 1-D output and the async handle.
         """
-        rank_size = get_group_size(group)
-        # Positional args follow the MS auto-generated primitive signature:
-        # ``(input, group, send_splits, recv_splits, rank_size, block)``.
-        # ``block=False`` selects the async path; the handle is returned in
-        # the raw tuple and unpacked by ``_deal_comm_outputs`` below.
-        raw = inner_comm_all_to_all_v_op(
-            flat_input, group, list(send_splits), list(recv_splits), rank_size,
-            False,
+        return _mindspore_variable_all_to_all_single(
+            flat_input, send_splits, recv_splits, group, async_op=True,
         )
-        # ``_deal_comm_outputs(raw, is_async=True)`` mirrors the async branch
-        # inside ``comm_func.all_to_all_single`` — unpacks the primitive's raw
-        # output into ``(tensor, handle)`` without the trailing reshape.
-        return _deal_comm_outputs(raw, True)
 
     @staticmethod
     def forward(ctx, input_tensor, output_splits, input_splits, group):  # pylint: disable=arguments-differ
@@ -559,9 +600,9 @@ class _MSAsyncA2ALazyBwd(_Function):
         translate splits beforehand — see
         :meth:`MindSporePlatform.differentiable_all_to_all_single_async`.
         """
-        ctx.input_splits = input_splits
-        ctx.output_splits = output_splits
-        ctx.group = group
+        ctx.save_for_backward(*_encode_variable_all_to_all_metadata(
+            input_splits, output_splits, group,
+        ))
         flat_input = input_tensor.reshape(-1)
         actual_output, work = _MSAsyncA2ALazyBwd._issue_async_a2a(
             flat_input, input_splits, output_splits, group,
@@ -571,13 +612,15 @@ class _MSAsyncA2ALazyBwd(_Function):
     @staticmethod
     def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Symmetric reverse a2a; returns :class:`AsyncCollectiveTensor`."""
+        saved_tensors = iter(ctx.saved_tensors)
+        input_splits, output_splits, group = _decode_variable_all_to_all_metadata(saved_tensors)
         # If grad_output is still lazy, force unwrap before issuing the
         # reverse a2a (which is itself a "real" op on the data).
         if isinstance(grad_output, AsyncCollectiveTensor):
             grad_output = grad_output._wait_and_unwrap()  # pylint: disable=W0212
         flat_grad = grad_output.reshape(-1)
         actual_grad, work = _MSAsyncA2ALazyBwd._issue_async_a2a(
-            flat_grad, ctx.output_splits, ctx.input_splits, ctx.group,
+            flat_grad, output_splits, input_splits, group,
         )
         lazy_grad = AsyncCollectiveTensor(actual_grad, work)
         return lazy_grad, None, None, None
@@ -1584,31 +1627,32 @@ class MindSporePlatform(Platform):
         return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
 
     @staticmethod
-    def differentiable_all_to_all_single(
-            input_tensor: Tensor,
-            input_splits: Sequence[int],
-            output_splits: Sequence[int],
-            group: str,
-    ) -> Tensor:
-        """Run a differentiable N-D variable all-to-all with dim-zero row splits."""
-        input_splits, output_splits = _validate_variable_row_splits(
-            input_tensor,
-            input_splits,
-            output_splits,
-            group,
+    def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
+        """Run a flat variable-split A2A with exact zero-length output support."""
+        MindSporePlatform._validate_variable_all_to_all_single(
+            input_tensor, input_splits, output_splits,
         )
-        return _MSDifferentiableAllToAllSingle.apply(
-            input_tensor,
-            output_splits,
-            input_splits,
-            group,
-        )
+        return _MSA2ABwd.apply(input_tensor, output_splits, input_splits, group)
 
     @staticmethod
     def differentiable_variable_all_gather(
             input_tensor: Tensor, output_splits: Sequence[int], group: str) -> Tensor:
         """Gather variable dim-zero row shards with native ``AllGatherV``."""
         return _mindspore_variable_all_gather(input_tensor, output_splits, group)
+
+    @staticmethod
+    def _validate_variable_all_to_all_single(input_tensor, input_splits, output_splits):
+        """Validate the MindSpore flat variable-split A2A contract."""
+        if input_tensor.ndim != 1:
+            raise ValueError(
+                "MindSporePlatform variable-split all-to-all requires a 1-D "
+                f"input_tensor, but got shape {tuple(input_tensor.shape)}."
+            )
+        if input_tensor.numel() != sum(input_splits):
+            raise ValueError(
+                f"A2A input has {input_tensor.numel()} elements, but input_splits "
+                f"sum to {sum(input_splits)}."
+            )
 
     @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
@@ -1656,17 +1700,13 @@ class MindSporePlatform(Platform):
             The 1-D + element-count contract diverges from the Torch
             implementation (which accepts N-D input + row-count splits).
             The divergence is intentional for now: it lets the MS path
-            call the inner primitive directly and avoid the cross-stream
-            race that ``comm_func.all_to_all_single``'s trailing reshape
-            triggers under ``MS_ALLOC_CONF=memory_tracker:True`` —
-            see :meth:`_MSAsyncA2ALazyBwd._issue_async_a2a`.
+            preallocate an exact flat output and avoid the cross-stream race
+            caused by ``comm_func.all_to_all_single``'s trailing reshape under
+            ``MS_ALLOC_CONF=memory_tracker:True``.
         """
-        if input_tensor.ndim != 1:
-            raise ValueError(
-                "MindSporePlatform.differentiable_all_to_all_single_async requires a 1-D "
-                f"input_tensor (got ndim={input_tensor.ndim}, shape={tuple(input_tensor.shape)}). "
-                "Flatten the tensor and convert row-count splits to element counts before calling."
-            )
+        MindSporePlatform._validate_variable_all_to_all_single(
+            input_tensor, input_splits, output_splits,
+        )
         return _MSAsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
 
     @staticmethod
