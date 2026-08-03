@@ -925,6 +925,19 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement parameters_dict")
 
     @staticmethod
+    def buffers_dict(cell: Any) -> Any:
+        """Get the named buffers of a cell/module.
+
+        Args:
+            cell: The cell or module to get buffers from.
+
+        Returns:
+            An iterable of ``(name, buffer)`` pairs, including non-persistent
+            buffers and buffers registered by child modules.
+        """
+        raise NotImplementedError("Platform subclasses must implement buffers_dict")
+
+    @staticmethod
     def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
         """Get the state dictionary of a model.
 

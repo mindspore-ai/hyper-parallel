@@ -266,6 +266,21 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         MindSporeHSDPSchedulerV2._backward_hook(scheduler)
         scheduler._hsdp_backward_hook.assert_not_called()
 
+    def test_gradient_accumulation_keeps_post_backward_hook(self):
+        """Ordinary no-sync accumulation must retain FSDP post-backward cleanup."""
+        scheduler = _make_scheduler()
+        scheduler.hsdp_state.reduce_grads = False
+        scheduler.hsdp_state.reshard_after_backward = False
+        args = (ms.Tensor([1.0]),)
+        args[0].requires_grad = True
+        kwargs = {}
+
+        with patch.object(scheduler_mod.PostBackwardFunction, "apply", return_value=args) as apply:
+            result = MindSporeHSDPSchedulerV2._register_post_backward_hook(scheduler, args, kwargs)
+
+        self.assertEqual(result, (args, kwargs))
+        apply.assert_called_once()
+
     def test_register_forward_backward_hooks_for_single_and_grouped_modules(self):
         """Hook registration should use grouped hooks only when the grouped marker exists."""
         scheduler = _make_scheduler()

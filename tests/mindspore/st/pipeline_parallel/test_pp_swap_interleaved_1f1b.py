@@ -12,35 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""msrun launcher for Interleaved 1F1B activation swap memory comparison."""
+"""msrun launchers for real-overlap activation-swap comparisons."""
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
-from typing import Optional
 import uuid
 
-from tests.common.port_utils import allocate_port
 from tests.common.mark_utils import arg_mark
+from tests.common.port_utils import allocate_port
 
 _TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_pp_swap_interleaved_1f1b.py")
-_RANK_MEM_FILE_PREFIX = os.path.join(tempfile.gettempdir(), "pp_swap_interleaved_1f1b_mem_no_swap")
-_MEMORY_ACTIVATION_MB = os.environ.get("PP_SWAP_INTERLEAVED_TEST_ACTIVATION_MB", "200")
-_ACCURACY_TOKENS_PER_MICRO = os.environ.get("PP_SWAP_INTERLEAVED_ACCURACY_TOKENS_PER_MICRO", "256")
+_BASELINE_PREFIX = os.path.join(tempfile.gettempdir(), "pp_swap_overlap_moe_baseline")
 
 
-def _rank_mem_file(tag: str, rank: int) -> str:
-    return f"{_RANK_MEM_FILE_PREFIX}_{tag}_rank{rank}.txt"
-
-
-def _cleanup_rank_mem_files(tag: str):
-    for rank in range(4):
-        try:
-            os.remove(_rank_mem_file(tag, rank))
-        except FileNotFoundError:
-            pass
+def _cleanup_baselines(tag: str) -> None:
+    for scenario in ("overlap_b_f", "overlap_b_f_dxdw"):
+        for rank in range(8):
+            try:
+                os.remove(f"{_BASELINE_PREFIX}_{tag}_{scenario}_rank{rank}.pkl")
+            except FileNotFoundError:
+                pass
 
 
 def _log_dir(log_label: str) -> str:
@@ -48,42 +43,36 @@ def _log_dir(log_label: str) -> str:
     return f"./logs/{filename}/{log_label}"
 
 
-def _allocate_hccl_ports():
-    base_port = 30000 + allocate_port()
-    return str(base_port), f"{base_port}-{base_port + 127}"
+def _allocate_hccl_ports() -> tuple[str, str]:
+    block_size = 128
+    base_port = 40000 + (allocate_port() % 90) * block_size
+    return str(base_port), f"{base_port}-{base_port + block_size - 1}"
 
 
-def _run_msrun_subprocess(
-        worker_case_name: str,
-        env_updates: dict[str, Optional[str]],
-        log_label: Optional[str] = None):
-    """Run one distributed worker case in a fresh process tree."""
-    log_label = log_label or worker_case_name
+def _run_msrun_subprocess(worker_case_name: str, env_updates: dict, log_label: str) -> None:
+    """Run one eight-card worker phase in a fresh process tree."""
     log_dir = _log_dir(log_label)
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
 
     env = os.environ.copy()
     env["GLOG_v"] = "3"
-    env.setdefault("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
+    env.setdefault("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
     hccl_base_port, hccl_socket_range = _allocate_hccl_ports()
     env.setdefault("HCCL_IF_BASE_PORT", hccl_base_port)
     env.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", hccl_socket_range)
-    for key, value in env_updates.items():
-        if value is None:
-            env.pop(key, None)
-        else:
-            env[key] = value
+    env.update(env_updates)
 
     cmd = [
         "msrun",
-        "--worker_num=4",
-        "--local_worker_num=4",
+        "--worker_num=8",
+        "--local_worker_num=8",
         "--master_addr=127.0.0.1",
         f"--master_port={allocate_port()}",
         "--join=True",
         f"--log_dir={log_dir}",
-        "pytest",
+        "--",
+        os.path.join(os.path.dirname(sys.executable), "pytest"),
         "-s",
         "-v",
         f"{_TEST_FILE}::{worker_case_name}",
@@ -99,70 +88,53 @@ def _run_msrun_subprocess(
     time.sleep(5)
 
 
-def _run_interleaved_swap_scenario(log_prefix: str, overlap_b_f: bool):
-    """Run baseline, swap-memory, and accuracy passes for one scheduler mode."""
-    mem_tag = uuid.uuid4().hex
-    overlap_env = {"PP_SWAP_INTERLEAVED_OVERLAP_B_F": "1" if overlap_b_f else None}
-    memory_env = {
-        "PP_SWAP_INTERLEAVED_ACTIVATION_MB": _MEMORY_ACTIVATION_MB,
-        "PP_SWAP_INTERLEAVED_MEM_TAG": mem_tag,
-        **overlap_env,
+def _run_scenario(scenario: str, enable_dxdw: bool) -> None:
+    """Run one three-step real-overlap no-swap/swap comparison."""
+    tag = uuid.uuid4().hex
+    env = {
+        "PP_OVERLAP_PP_SIZE": "4",
+        "PP_OVERLAP_EP_SIZE": "2",
+        "PP_SWAP_MOE_DXDW": "1" if enable_dxdw else "0",
+        "PP_SWAP_MOE_CHECK_STEPS": "3",
+        "PP_SWAP_INTERLEAVED_BASELINE_TAG": tag,
     }
-    accuracy_env = {
-        "PP_SWAP_INTERLEAVED_ACTIVATION_MB": None,
-        "PP_SWAP_ACTIVATION_MB": None,
-        "PP_SWAP_TOKENS_PER_MICRO": _ACCURACY_TOKENS_PER_MICRO,
-        "PP_SWAP_INTERLEAVED_MEM_TAG": f"{mem_tag}_accuracy",
-        **overlap_env,
-    }
-
     try:
-        _cleanup_rank_mem_files(mem_tag)
+        _cleanup_baselines(tag)
         _run_msrun_subprocess(
-            "test_interleaved_1f1b_no_swap",
-            memory_env,
-            log_label=f"{log_prefix}_no_swap",
+            "test_moe_overlap_b_f_no_swap",
+            env,
+            f"{scenario}_no_swap",
         )
         _run_msrun_subprocess(
-            "test_interleaved_1f1b_swap_memory",
-            memory_env,
-            log_label=f"{log_prefix}_swap_memory",
-        )
-        _run_msrun_subprocess(
-            "test_interleaved_1f1b_swap_accuracy",
-            accuracy_env,
-            log_label=f"{log_prefix}_swap_accuracy",
+            "test_moe_overlap_b_f_swap",
+            env,
+            f"{scenario}_swap",
         )
     finally:
-        _cleanup_rank_mem_files(mem_tag)
+        _cleanup_baselines(tag)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
-def test_interleaved_1f1b_pipeline_swap_memory():
+def test_interleaved_1f1b_pipeline_swap_overlap_b_f():
     """
-    Feature: Interleaved 1F1B activation swap device memory comparison.
-    Description: Run a four-rank Interleaved 1F1B schedule with two virtual
-        stages per rank, 8 micro-batches, 2048 hidden size, and 4-layer
-        DeepStage per virtual stage.  First record no-swap peak memory, then
-        run all virtual stages with activation swap in a separate process and
-        compare each rank. Run a small activation accuracy pass in another
-        process so the memory case is not polluted by the serial reference.
-    Expectation: swap device peak memory is less than no-swap on every rank,
-        and swap outputs/gradients match the serial reference.
+    Feature: Activation swap composed with real overlap.
+    Description: Run the existing PP=4 x EP=2 hook-coordinated overlap model
+                 for three no-swap steps and three swap steps.
+    Expectation: Every loss and local gradient matches, the backward work runs
+                 on overlap threads, and swap reduces steady peak memory.
     """
-    _run_interleaved_swap_scenario("test_interleaved_1f1b", overlap_b_f=False)
+    _run_scenario("real_overlap", enable_dxdw=False)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
-def test_interleaved_1f1b_overlap_b_f_pipeline_swap_memory():
+def test_interleaved_1f1b_pipeline_swap_overlap_b_f_dxdw():
     """
-    Feature: Interleaved 1F1B activation swap with OVERLAP_B_F composite steps.
-    Description: Run the same memory and accuracy workflow as the plain
-        interleaved swap case, but construct ScheduleInterleaved1F1B with
-        overlap_b_f=True so real FWD/BWD leaves live inside OVERLAP_B_F.
-    Expectation: swap device peak memory is less than no-swap on every rank,
-        and swap outputs/gradients match the serial reference.
+    Feature: Activation swap composed with real overlap and dx/dw split.
+    Description: Run the existing PP=4 x EP=2 hook-coordinated dxdw path for
+                 three no-swap steps and three swap steps.
+    Expectation: Every loss and local gradient matches, dx/dw completes on the
+                 overlap path, and swap reduces steady peak memory.
     """
-    _run_interleaved_swap_scenario("test_interleaved_1f1b_overlap_b_f", overlap_b_f=True)
+    _run_scenario("real_overlap_dxdw", enable_dxdw=True)

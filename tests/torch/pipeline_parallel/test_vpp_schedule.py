@@ -42,6 +42,24 @@ def test_vpp_schedule_group1():
     ])
 
 
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_vpp_pipeline_swap():
+    """
+    Feature: PyTorch pipeline activation swap under Interleaved 1F1B.
+    Description: Run paired no-swap/swap phases on the existing four-rank,
+        two-local-chunk VPP layout and compare outputs, gradients, and peak memory.
+    Expectation: Accuracy matches and swap reduces peak NPU memory on every rank.
+    """
+    parallel_run([
+        TorchCase(_VPP_SCHEDULE, "test_vpp_pipeline_swap", num_proc=4)
+    ])
+
+
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_vpp_schedule_group1_gloo():
     """

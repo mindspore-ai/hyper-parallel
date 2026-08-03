@@ -515,20 +515,17 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
     def _callback(step, ctx):
         bwd_step, fwd_step = step.sub_steps
         schedule = ctx.schedule
-        fwd_stage = schedule._stage_dict[fwd_step.stage_index]
         bwd_stage = schedule._stage_dict[bwd_step.stage_index]
-        fwd_mi, bwd_mi = fwd_step.micro_index, bwd_step.micro_index
+        bwd_mi = bwd_step.micro_index
 
         def fwd_fn():
-            schedule.wait_fwd_recv(fwd_stage.stage_index, fwd_mi)
             # ``forward_one_chunk`` fires the schedule's after-forward hook,
             # which issues the fwd-boundary P2P (p2p_transport="boundary")
             # while the backward is still running — no callback cooperation
             # needed here.  No-op under the default duplex transport.
-            out = fwd_stage.forward_one_chunk(
-                fwd_mi, ctx.arg_mbs[fwd_mi], ctx.kwarg_mbs[fwd_mi],
+            schedule.execute_fwd_leaf(
+                fwd_step, ctx.arg_mbs, ctx.kwarg_mbs, ctx.losses,
             )
-            schedule.update_losses(fwd_stage, out, ctx.losses)
 
         def bwd_fn():
             # MS PyNative's grad-enable flag is thread-local; the
@@ -548,13 +545,13 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
             # rank's trace, bwd_fn did not run for that (stage, micro).
             with platform.profiler_record(
                     f"dxdw/bwd_fn/stage_{bwd_stage.stage_index}/mi_{bwd_mi}"):
-                schedule.wait_bwd_recv(bwd_stage.stage_index, bwd_mi)
                 # Under enable_dxdw_split the schedule emits (BWD_INPUT, FWD)
                 # pairs (stage-0 pairs stay unified BWD: dx would be a no-op
                 # there), so dispatch on the sub-step type.  dx writes
                 # ``bwd_cache``; the gap's BWD_SEND and the standalone
                 # BWD_WEIGHT step that follow the overlap consume it on the
                 # main thread.
+                schedule.wait_bwd_recv(bwd_stage.stage_index, bwd_mi)
                 if bwd_step.type == MetaStepType.BWD_INPUT:
                     bwd_stage.backward_input_one_chunk(bwd_mi)
                 else:

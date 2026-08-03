@@ -184,7 +184,7 @@ def test_pp_overlap_moe_dxdw_accuracy():
                12357, worker_num=8, local_worker_num=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_recompute_save_a2a():
     """Chunk recompute that keeps (does not recompute) the EP all-to-all.
