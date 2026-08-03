@@ -24,7 +24,7 @@ from collections.abc import Mapping
 from dataclasses import MISSING, fields
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
-from hyper_models.trainer.config import TrainerConfig
+from hyper_models.trainer.config import Target, TrainerConfig
 
 
 class ConfigResolutionError(ValueError):
@@ -36,7 +36,7 @@ def _fail(path: str, message: str) -> ConfigResolutionError:
 
 
 def import_target(target_path: str, *, path: str) -> object:
-    """Import a dotted callable, including nested classes such as ``X.Config``."""
+    """Import a dotted callable, including nested callable attributes."""
 
     if not isinstance(target_path, str) or not target_path.strip():
         raise _fail(path, "_target_ must be a non-empty dotted path")
@@ -185,8 +185,6 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
 
     if annotation in (Any, object):
         return value
-    if annotation is inspect.Signature.empty:
-        raise _fail(path, "target parameter has no type annotation")
     if isinstance(annotation, dataclasses.InitVar):
         return coerce_value(value, annotation.type, path=path)
     if value is None:
@@ -218,103 +216,166 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
     raise _fail(path, f"unsupported type annotation {_type_name(annotation)}")
 
 
-def _annotation_assignable(source: object, expected: object) -> bool:
-    """Return whether a target result annotation fits a root field type."""
-
-    if expected in (Any, object):
-        return True
-    if source is Any:
-        return False
-    if _is_union(source):
-        return all(_annotation_assignable(item, expected) for item in get_args(source))
-    if _is_union(expected):
-        return any(_annotation_assignable(source, item) for item in get_args(expected))
-    source_origin = get_origin(source) or source
-    expected_origin = get_origin(expected) or expected
-    if isinstance(source_origin, type) and isinstance(expected_origin, type):
-        return issubclass(source_origin, expected_origin)
-    return source == expected
+def _resolve_union(node: object, annotation: object, *, path: str) -> object:
+    """Resolve one value against an Optional or general union."""
+    for member in get_args(annotation):
+        if member is type(None):
+            continue
+        try:
+            return resolve_component(node, expected_type=member, path=path)
+        except ConfigResolutionError:
+            continue
+    raise _fail(
+        path,
+        f"expected {_type_name(annotation)}, got {type(node).__name__}",
+    )
 
 
-def resolve_component(node: object, *, expected_type: object, path: str) -> object:
-    """Resolve one top-level YAML group to its declared component type."""
-
+def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
+    """Construct one pure-parameter dataclass from a YAML mapping."""
     if not isinstance(node, Mapping):
-        raise _fail(path, "component group must be a YAML mapping")
-    if "_target_" not in node:
-        raise _fail(path, "component group is missing required _target_")
+        raise _fail(path, "configuration section must be a YAML mapping")
 
-    target = import_target(node["_target_"], path=f"{path}._target_")
+    config_fields = {field.name: field for field in fields(config_type)}
+    unknown = sorted(set(node) - set(config_fields))
+    if unknown:
+        raise _fail(path, f"unknown configuration fields: {unknown}")
 
-    if inspect.isclass(target):
-        result_type = target
-        # Class-level hints (get_type_hints(target)) only cover dataclass
-        # fields; constructor parameters of plain classes live on __init__.
-        # Resolving from __init__ also handles modules using
-        # ``from __future__ import annotations``, where raw parameter
-        # annotations are unparsed strings.
-        hint_source = target.__init__
-    else:
-        hint_source = target
+    missing = [
+        field.name
+        for field in config_fields.values()
+        if field.name not in node
+        and field.default is MISSING
+        and field.default_factory is MISSING
+    ]
+    if missing:
+        raise _fail(path, f"missing required configuration fields: {missing}")
+
     try:
-        hints = get_type_hints(hint_source)
+        hints = get_type_hints(config_type)
+    except (NameError, TypeError) as exc:
+        raise _fail(path, f"could not resolve configuration type annotations: {exc}") from exc
+
+    resolved = {
+        name: coerce_value(
+            value,
+            hints[name],
+            path=f"{path}.{name}",
+        )
+        for name, value in node.items()
+    }
+    try:
+        return config_type(**resolved)
+    except TypeError as exc:
+        raise _fail(path, f"could not construct {config_type.__name__}: {exc}") from exc
+
+
+def _target_hints(target: object, *, path: str) -> dict[str, object]:
+    """Resolve annotations for a target function or class constructor."""
+    hint_source = target.__init__ if inspect.isclass(target) else target
+    try:
+        return get_type_hints(hint_source)
     except (NameError, TypeError) as exc:
         raise _fail(path, f"could not resolve target type annotations: {exc}") from exc
 
-    if not inspect.isclass(target):
-        result_type = hints.get("return", inspect.Signature.empty)
-        if result_type is inspect.Signature.empty:
-            raise _fail(path, "factory target must declare a return annotation")
 
-    if not _annotation_assignable(result_type, expected_type):
-        raise _fail(
-            path,
-            f"target returns {_type_name(result_type)}, expected {_type_name(expected_type)}",
-        )
+def _normalize_target_args(
+    raw_args: Mapping[str, object],
+    signature: inspect.Signature,
+    hints: Mapping[str, object],
+    *,
+    path: str,
+) -> dict[str, object]:
+    """Validate YAML target arguments and apply callable defaults."""
+    try:
+        signature.bind_partial(**raw_args)
+    except TypeError as exc:
+        raise _fail(path, f"target arguments are invalid: {exc}") from exc
 
+    normalized = {}
+    for name, value in raw_args.items():
+        parameter = signature.parameters.get(name)
+        if parameter is None:
+            normalized[name] = value
+            continue
+
+        annotation = hints.get(name, parameter.annotation)
+        if annotation in (Any, object, inspect.Signature.empty):
+            normalized[name] = value
+        else:
+            normalized[name] = coerce_value(
+                value,
+                annotation,
+                path=f"{path}.{name}",
+            )
+
+    for name, parameter in signature.parameters.items():
+        if (
+            name in normalized
+            or parameter.default is inspect.Signature.empty
+            or parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+        ):
+            continue
+        normalized[name] = parameter.default
+
+    return normalized
+
+
+def _resolve_target(node: object, *, path: str) -> Target[Any]:
+    """Resolve one YAML target without invoking its callable."""
+    if not isinstance(node, Mapping):
+        raise _fail(path, "target section must be a YAML mapping")
+    if "_target_" not in node:
+        raise _fail(path, "target section is missing required _target_")
+
+    target_path = node["_target_"]
+    target = import_target(target_path, path=f"{path}._target_")
     try:
         signature = inspect.signature(target)
     except (TypeError, ValueError) as exc:
         raise _fail(path, f"target signature is unavailable: {exc}") from exc
 
     for parameter in signature.parameters.values():
-        if parameter.kind in (
-            inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD,
+        if (
+            parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+            and parameter.default is inspect.Signature.empty
         ):
             raise _fail(
                 path,
-                f"target parameter {parameter.name!r} must have an explicit name",
+                f"target parameter {parameter.name!r} must be callable by keyword",
             )
 
     raw_args = {key: value for key, value in node.items() if key != "_target_"}
-    try:
-        bound = signature.bind(**raw_args)
-    except TypeError as exc:
-        raise _fail(path, f"target arguments are invalid: {exc}") from exc
+    normalized_args = _normalize_target_args(
+        raw_args,
+        signature,
+        _target_hints(target, path=path),
+        path=path,
+    )
+    return Target(
+        target,
+        target_path=target_path,
+        **normalized_args,
+    )
 
-    normalized_args = {}
-    for name, value in bound.arguments.items():
-        parameter = signature.parameters[name]
-        annotation = hints.get(name, parameter.annotation)
-        normalized_args[name] = coerce_value(
-            value,
-            annotation,
-            path=f"{path}.{name}",
-        )
 
-    try:
-        result = target(**normalized_args)
-    except Exception as exc:
-        raise _fail(path, f"target construction failed: {exc}") from exc
+def resolve_component(node: object, *, expected_type: object, path: str) -> object:
+    """Resolve one YAML value according to its declared configuration type."""
+    if node is None:
+        return _coerce_none(expected_type, path=path)
+    if _is_union(expected_type):
+        return _resolve_union(node, expected_type, path=path)
 
-    coerce_value(result, result_type, path=path)
-    return result
+    origin = get_origin(expected_type)
+    if origin is Target or expected_type is Target:
+        return _resolve_target(node, path=path)
+    if isinstance(expected_type, type) and dataclasses.is_dataclass(expected_type):
+        return _resolve_dataclass(node, expected_type, path=path)
+    return coerce_value(node, expected_type, path=path)
 
 
 def resolve_root(raw: object) -> TrainerConfig:
     """Resolve YAML root fields and construct ``TrainerConfig``."""
-
     if not isinstance(raw, Mapping):
         raise _fail("$", "YAML root must be a mapping")
 

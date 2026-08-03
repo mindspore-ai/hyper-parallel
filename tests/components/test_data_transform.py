@@ -12,8 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Checkpoint components."""
+"""Tests for basic data-transform components."""
 
-from hyper_models.components.checkpoint.config import CheckpointingConfig
+from hyper_models.components.data import IdentityDataTransform
 
-__all__ = ["CheckpointingConfig"]
+
+def test_identity_data_transform_retains_tokenizer_and_example() -> None:
+    """Retain the upstream tokenizer while leaving examples unchanged."""
+    tokenizer = object()
+    transform = IdentityDataTransform(tokenizer=tokenizer)
+    example = {"text": "hello"}
+
+    assert transform.tokenizer is tokenizer
+    assert transform(example) is example

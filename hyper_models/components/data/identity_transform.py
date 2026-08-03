@@ -12,8 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Checkpoint components."""
+"""Basic data-transform components used by Trainer targets."""
 
-from hyper_models.components.checkpoint.config import CheckpointingConfig
+from typing import Any
 
-__all__ = ["CheckpointingConfig"]
+
+class IdentityDataTransform:
+    """Return each input example unchanged."""
+
+    def __init__(self, tokenizer: Any = None) -> None:
+        """Initialize the transform with its upstream tokenizer dependency.
+
+        Args:
+            tokenizer: Tokenizer built before this transform. The identity
+                implementation retains it without using it.
+        """
+        self.tokenizer = tokenizer
+
+    def __call__(self, example: Any) -> Any:
+        """Return an example without modification."""
+        return example
+
+
+__all__ = ["IdentityDataTransform"]

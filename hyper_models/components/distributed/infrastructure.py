@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_models.components.distributed.config import FSDP2Config
+from hyper_models.components.utils.device import get_device_type, get_torch_device
 
 logger = logging.getLogger(__name__)
 
@@ -69,16 +70,17 @@ class MeshContext:
         if mesh is None:
             return None
         dim_names = mesh.mesh_dim_names
-        if "cp" in dim_names and "dp_shard_cp" in dim_names:
-            sub = mesh[("dp_shard_cp", "cp")]
-        elif "dp_shard_cp" in dim_names:
-            sub = mesh["dp_shard_cp"]
-        elif "dp" in dim_names:
-            sub = mesh[("dp", "cp")] if "cp" in dim_names else mesh["dp"]
-        elif "dp_replicate" in dim_names:
-            sub = mesh[("dp_replicate", "cp")] if "cp" in dim_names else mesh["dp_replicate"]
-        else:
+        selected_dims = tuple(
+            dim_name
+            for dim_name in ("dp_replicate", "dp_shard_cp", "dp", "cp")
+            if dim_name in dim_names
+        )
+        if not selected_dims:
             sub = mesh
+        elif len(selected_dims) == 1:
+            sub = mesh[selected_dims[0]]
+        else:
+            sub = mesh[selected_dims]
         if sub.ndim > 1:
             sub = sub._flatten("dp_cp")
         return sub
@@ -120,21 +122,26 @@ def initialize_distributed(backend: str = "nccl") -> Any:
 
     Stub — calls dist.init_process_group if not already initialized.
     Falls back to gloo when the requested backend is unavailable (e.g. CPU).
-    Sets the current CUDA device from LOCAL_RANK when CUDA is available.
+    Sets the current accelerator device from ``LOCAL_RANK`` before process
+    group initialization.
     """
+    device_type = get_device_type()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if device_type in ("cuda", "npu"):
+        get_torch_device().set_device(local_rank)
+
     if not dist.is_initialized():
         effective_backend = backend
-        if backend == "nccl" and not torch.cuda.is_available():
+        if backend == "nccl" and device_type == "npu":
+            effective_backend = "hccl"
+            logger.info("Using HCCL instead of NCCL on the NPU backend.")
+        elif backend == "nccl" and device_type == "cpu":
             effective_backend = "gloo"
             logger.warning(
                 "CUDA not available; falling back to '%s' backend for distributed.",
                 effective_backend,
             )
         dist.init_process_group(backend=effective_backend)
-
-    if torch.cuda.is_available():
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
 
     return dist
 
@@ -185,7 +192,7 @@ def _build_device_mesh_from_accelerator(
         return None, ()
 
     dim_names, mesh_shape = zip(*mesh_dims)
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    device_type = get_device_type()
     from hyper_parallel import init_device_mesh
     device_mesh = init_device_mesh(
         device_type=device_type,
@@ -236,15 +243,17 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     def _local_rank(dim: str) -> int:
         return device_mesh.get_local_rank(dim) if dim in dim_names else 0
 
+    dp_shard_rank = _local_rank("dp_shard_cp")
+    dp_replicate_rank = _local_rank("dp_replicate")
     mesh_ctx = MeshContext(
         device_mesh=device_mesh,
-        dp_size=dp_shard_size,
+        dp_size=dp_shard_size * dp_replicate_size,
         dp_replicate_size=dp_replicate_size,
         tp_size=tp_size,
         cp_size=cp_size,
         pp_size=pp_size,
         ep_size=ep_size,
-        dp_rank=_local_rank("dp_shard_cp"),
+        dp_rank=dp_replicate_rank * dp_shard_size + dp_shard_rank,
         tp_rank=_local_rank("tp"),
         cp_rank=_local_rank("cp"),
         pp_rank=_local_rank("pp"),
@@ -253,10 +262,14 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
         loss_parallel=bool(getattr(accel, "loss_parallel", False)),
     )
 
-    # Default to FSDP2 only when running multi-card distributed training.
-    # Single-card (world_size == 1) should not instantiate FSDP2Manager,
-    # otherwise every single-card run would see the FSDP2 stub warning.
-    strategy_config = FSDP2Config() if (dist.is_initialized() and world_size > 1) else None
+    # FSDP2 requires an actual shard dimension. Outer-only DP replication
+    # needs a DDP strategy, which this temporary Trainer path does not build.
+    if dp_replicate_size > 1 and dp_shard_size == 1:
+        raise ValueError(
+            "dp_replicate_size > 1 with dp_shard_size == 1 requires DDP, "
+            "which is not supported by the current Trainer path"
+        )
+    strategy_config = FSDP2Config() if (dist.is_initialized() and dp_shard_size > 1) else None
     return DistributedSetup(
         mesh_context=mesh_ctx,
         strategy_config=strategy_config,

@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Checkpoint components."""
+"""Learning-rate scheduler runtime targets."""
 
-from hyper_models.components.checkpoint.config import CheckpointingConfig
+from .lr_scheduler import cosine_with_warmup
 
-__all__ = ["CheckpointingConfig"]
+__all__ = ["cosine_with_warmup"]

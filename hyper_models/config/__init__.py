@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Typed configuration infrastructure for the HyperModels suite."""
+"""Typed YAML configuration resolution for HyperModels."""
 
-from .configurable import Configurable
-
-__all__ = ["Configurable"]
+__all__: list[str] = []

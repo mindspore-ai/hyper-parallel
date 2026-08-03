@@ -38,8 +38,17 @@ from hyper_models._transformers.infrastructure import (
 from hyper_models._transformers.model_init import _init_model
 from hyper_models._transformers.registry import get_hf_config, get_is_hf_model
 from hyper_models.components.distributed.infrastructure import DistributedSetup
+from hyper_models.components.utils.device import get_device_id, get_device_type
 
 logger = logging.getLogger(__name__)
+
+
+def _current_device() -> torch.device:
+    """Return the current accelerator device, or CPU when no accelerator exists."""
+    device_type = get_device_type()
+    if device_type == "cpu":
+        return torch.device("cpu")
+    return torch.device(device_type, get_device_id())
 
 
 class _BaseHyperAutoModelClass:
@@ -93,7 +102,7 @@ class _BaseHyperAutoModelClass:
         # ② Instantiate infrastructure
         sharding_planner, fsdp2_manager, autopipeline = instantiate_infrastructure(
             distributed_setup=distributed_setup,
-            device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
+            device=_current_device(),
         )
 
         # ③ Get HF config
@@ -151,7 +160,7 @@ class _BaseHyperAutoModelClass:
 
         sharding_planner, fsdp2_manager, autopipeline = instantiate_infrastructure(
             distributed_setup=distributed_setup,
-            device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
+            device=_current_device(),
         )
 
         is_hf_model = get_is_hf_model(config, force_hf=False)
@@ -251,7 +260,7 @@ class _BaseHyperAutoModelClass:
             compile_config=compile_config,
             is_meta_device=is_meta_device,
             is_hf_model=is_hf_model,
-            device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
+            device=_current_device(),
             load_base_model=load_base_model,
             pretrained_path=pretrained_model_name_or_path,
             validate_placement=validate_placement,

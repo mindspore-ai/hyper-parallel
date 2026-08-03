@@ -1,0 +1,82 @@
+# Trainer end-to-end demo.
+#
+# This example intentionally uses a generated tiny Llama checkpoint and dummy
+# token IDs. It validates Trainer component construction and the optimizer
+# loop; it is not a meaningful language-model training workload.
+#
+# Run on four Ascend NPUs with:
+#   bash examples/training_demo/run.sh
+
+model:
+  _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ./outputs/training_demo/tiny_llama
+  torch_dtype: auto
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  max_steps: null
+  num_train_epochs: 1
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+
+accelerator:
+  dp_shard_size: 2
+  dp_replicate_size: 1
+  tp_size: 2
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+mixed_precision:
+  enabled: false
+
+gradient_checkpointing:
+  activation_checkpoint: off
+
+data_transform:
+  _target_: hyper_models.components.data.identity_transform.IdentityDataTransform
+
+dataset:
+  _target_: hyper_models.components.data.datasets.DummyDataset
+  num_samples: 400
+  seq_len: 32
+  vocab_size: 1000
+  seed: 42
+
+collate_fn:
+  _target_: hyper_models.components.data.data_collator.MakeMicroBatchCollator
+
+dataloader:
+  _target_: hyper_models.components.data.dataloader.DataLoader
+  shuffle: true
+  drop_last: true
+  use_background_prefetcher: false
+
+optimizer:
+  _target_: hyper_models.components.optim.optimizer.optimizer.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  foreach: false
+
+lr_scheduler:
+  _target_: hyper_models.components.optim.lr_scheduler.lr_scheduler.cosine_with_warmup
+  lr_warmup_steps: 1
+  min_lr: 0.0
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: ./outputs/training_demo/checkpoints
+
+debug:
+  check_nan_inf: false

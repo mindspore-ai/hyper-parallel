@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Checkpoint components."""
+"""Optimizer runtime targets."""
 
-from hyper_models.components.checkpoint.config import CheckpointingConfig
+from .optimizer import AdamW
 
-__all__ = ["CheckpointingConfig"]
+__all__ = ["AdamW"]

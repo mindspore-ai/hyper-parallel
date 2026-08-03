@@ -130,7 +130,18 @@ def apply_model_infrastructure(
 
     # Step 7: ShardingPlanner.plan() → ShardingPlan
     # Step 8: apply_sharding_plan (includes _local_params_context unpack + wrapping)
-    if not is_hf_model and sharding_planner is not None and mesh is not None:
+    model_sharding_requested = (
+        mesh is not None
+        and any(
+            getattr(mesh, size_name, 1) > 1
+            for size_name in ("tp_size", "cp_size", "ep_size")
+        )
+    )
+    if (
+        sharding_planner is not None
+        and mesh is not None
+        and (not is_hf_model or model_sharding_requested)
+    ):
         device_mesh = getattr(mesh, "device_mesh", None)
         if device_mesh is not None:
             tp_size = getattr(mesh, "tp_size", 1)
@@ -196,5 +207,8 @@ def apply_model_infrastructure(
             if b.dtype.is_floating_point:
                 torch.nn.init.zeros_(b)
         logger.info("Model moved from meta to %s", device)
+    elif device is not None:
+        model.to(device)
+        logger.info("Model moved to %s", device)
 
     return model

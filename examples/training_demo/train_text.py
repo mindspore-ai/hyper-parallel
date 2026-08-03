@@ -12,8 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Checkpoint components."""
+"""Run the Trainer path with the prepared tiny model and dummy data."""
 
-from hyper_models.components.checkpoint.config import CheckpointingConfig
+from hyper_models.config.manager import parse_training_args
+from hyper_models.trainer.config import TrainerConfig
+from hyper_models.trainer.text_trainer import TextTrainer
 
-__all__ = ["CheckpointingConfig"]
+
+def main() -> None:
+    """Build every Trainer component and execute the configured training loop."""
+    config: TrainerConfig = parse_training_args()
+    trainer = TextTrainer(config)
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()

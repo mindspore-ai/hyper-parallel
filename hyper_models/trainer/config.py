@@ -14,26 +14,39 @@
 # ============================================================================
 """Typed configuration tree produced by the HyperModels YAML resolver."""
 
-from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+import inspect
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from typing import Any, Callable, Generic, Literal, Optional, TypeVar
+
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+from transformers import PreTrainedTokenizerBase
 
 from hyper_models.components.checkpoint.config import CheckpointingConfig
-from hyper_models.components.loss import Loss
-from hyper_models.components.optim import LRScheduler, Optimizer
-from hyper_models.components.training.step_scheduler import StepSchedulerConfig
-from hyper_parallel.trainer import config as legacy_config
 
 
 @dataclass
 class TrainingConfig:
     """Training-loop parameters exposed by the initial YAML schema."""
 
-    max_steps: int = 100
+    max_steps: Optional[int] = None
+    num_train_epochs: int = 1
     global_batch_size: int = 8
+    micro_batch_size: int = 1
+    backend: Literal["nccl", "hccl", "gloo"] = "nccl"
+    max_grad_norm: float = 1.0
     init_device: Literal["meta", "cpu", "cuda", "npu"] = "meta"
     loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"
-    # 随机种子（03 §5.3 ③：StatefulRNG(seed=cfg.training.seed, ranked=True)）
-    seed: int = 42
+    seed: Optional[int] = None
+    enable_full_determinism: bool = False
+
+
+@dataclass
+class FSDPConfig:
+    """FSDP runtime behavior used by the Trainer micro-batch loop."""
+
+    fsdp_mode: Literal["fsdp2"] = "fsdp2"
+    reshard_after_backward: bool = False
 
 
 @dataclass
@@ -48,6 +61,7 @@ class AcceleratorConfig:
     pp_size: int = 1
     sequence_parallel: bool = False
     loss_parallel: bool = False
+    fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
 
 
 @dataclass
@@ -80,15 +94,102 @@ class WandbConfig:
     entity: Optional[str] = None
 
 
+_T = TypeVar("_T")
+
+
+def _serialize_config_value(value: Any) -> Any:
+    """Convert one target argument to a plain serializable value."""
+    if inspect.isroutine(value):
+        return f"{value.__module__}.{value.__qualname__}"
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {
+            key: _serialize_config_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_serialize_config_value(item) for item in value]
+    return value
+
+
+class Target(Generic[_T]):
+    """Configuration for one callable whose invocation is delayed until runtime."""
+
+    def __init__(
+        self,
+        _target_: Callable[..., _T],
+        *,
+        target_path: str,
+        **kwargs: Any,
+    ) -> None:
+        """Store the resolved callable, its source path, and configured arguments."""
+        if not callable(_target_):
+            raise TypeError("_target_ must be callable")
+        if not isinstance(target_path, str) or not target_path.strip():
+            raise ValueError("target_path must be a non-empty string")
+
+        self._target_ = _target_
+        self._target_path = target_path
+        self._kwargs = dict(kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        kwargs = object.__getattribute__(self, "_kwargs")
+        try:
+            return kwargs[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def build(self, **runtime_kwargs: Any) -> _T:
+        """Invoke the target with configured and applicable runtime arguments."""
+        signature = inspect.signature(self._target_)
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            runtime_kwargs = {
+                name: value
+                for name, value in runtime_kwargs.items()
+                if name in signature.parameters
+            }
+
+        kwargs = {**self._kwargs, **runtime_kwargs}
+        return self._target_(**kwargs)
+
+    def replace(self, **changes: Any) -> "Target[_T]":
+        """Return a new target with selected configured arguments replaced."""
+        kwargs = dict(self._kwargs)
+        kwargs.update(changes)
+        return type(self)(
+            self._target_,
+            target_path=self._target_path,
+            **kwargs,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this target back to its YAML-compatible form."""
+        return {
+            "_target_": self._target_path,
+            **{
+                name: _serialize_config_value(value)
+                for name, value in self._kwargs.items()
+            },
+        }
+
+
 @dataclass
 class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
-    model: legacy_config.ModelConfig
-    optimizer: Optional[Optimizer.Config] = None
-    lr_scheduler: Optional[LRScheduler.Config] = None
-    loss: Optional[Loss.Config] = None
+    model: Target[Any]
+    optimizer: Target[Optimizer]
+    tokenizer: Optional[Target[PreTrainedTokenizerBase]] = None
+    lr_scheduler: Optional[Target[LRScheduler]] = None
     training: TrainingConfig = field(default_factory=TrainingConfig)
+
+    # parallelism configs
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     mixed_precision: MixedPrecisionConfig = field(
         default_factory=MixedPrecisionConfig
@@ -96,34 +197,49 @@ class TrainerConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(
         default_factory=GradientCheckpointingConfig
     )
-    debug: DebugConfig = field(default_factory=DebugConfig)
 
-    # ── 训练循环扩展字段（03 §5.2/§13 规划 schema，随 Recipe 骨架落地） ──
-    # Recipe 名称（03 §13：main() 经 RECIPE_REGISTRY 解析，默认 FinetuneRecipe）
-    recipe: str = "FinetuneRecipe"
-    # 训练节奏控制（03 §4.1：typed .build(dataloader, dp_size, local_bs)）
-    step_scheduler: StepSchedulerConfig = field(default_factory=StepSchedulerConfig)
-    # Checkpoint（04 §4：typed .build(dp_rank, tp_rank, ...)）
-    checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
-    # WandB 远程日志（03 §4.2.5）
-    wandb: WandbConfig = field(default_factory=WandbConfig)
-    # 以下字段由 02_data_pipeline.md 消费（build_dataloader 独立构建函数），
-    # 数据管道落地前保持弱类型（Any）。
-    dataset: Optional[Any] = None
-    dataloader: Optional[Any] = None
+    data_transform: Optional[Target[Any]] = None
+    dataset: Optional[Target[Any]] = None
+    collate_fn: Optional[Target[Any]] = None
+    dataloader: Optional[Target[Any]] = None
     packed_sequence: Optional[Any] = None
-    # MagiAttention 上下文（03 §5.3 ⑤；无配置时 setup_magi 返回 None）
+
+    checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
     magi: Optional[Any] = None
-    # PEFT 配置（03 §5.3 ⑨：传入 build_model 并用于判断 is_peft）
     peft: Optional[Any] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the resolved trainer configuration for logging."""
+        return {
+            config_field.name: _serialize_config_value(
+                getattr(self, config_field.name)
+            )
+            for config_field in fields(self)
+        }
+
+
+def save_configs(config: TrainerConfig, output_dir: str) -> None:
+    """Accept trainer config persistence requests without writing files.
+
+    Args:
+        config: Resolved trainer configuration.
+        output_dir: Intended configuration output directory.
+    """
+    del config, output_dir
 
 
 __all__ = [
     "AcceleratorConfig",
     "DebugConfig",
+    "FSDPConfig",
     "GradientCheckpointingConfig",
     "MixedPrecisionConfig",
+    "Target",
     "TrainerConfig",
     "TrainingConfig",
     "WandbConfig",
+    "save_configs",
+    "CheckpointingConfig",
 ]
