@@ -35,6 +35,7 @@ from hyper_parallel.custom_ops.experimental.experimental_ops import (  # noqa: E
     npu_dense_lightning_indexer_softmax_lse,
     npu_mhc_post,
     npu_mhc_pre_clamp_sinkhorn,
+    npu_mhc_pre_cmhc,
     npu_mhc_pre_sinkhorn,
     npu_sparse_flash_mla_grad,
     npu_sparse_lightning_indexer_grad_kl_loss,
@@ -359,6 +360,59 @@ class TestNpuMhcPreClampSinkhorn(unittest.TestCase):
         mock_platform.custom_ops.npu_mhc_pre_clamp_sinkhorn.assert_called_once_with(
             "x", "phi", "alpha", "bias",
             8, 10, 1e-4, 1e-5, False, -50.0, 50.0,
+        )
+
+
+class TestNpuMhcPreCmhc(unittest.TestCase):
+    """
+    Feature: npu_mhc_pre_cmhc wrapper.
+    Description: Required args and optional keyword args forwarded to platform.
+    Expectation: Platform method called once with the correct argument set.
+    """
+
+    @patch(_PATCH_TARGET)
+    def test_required_args_use_defaults(self, mock_platform):
+        """Required args only: optional kwargs default to their declared values."""
+        expected = tuple(MagicMock() for _ in range(7))
+        mock_platform.custom_ops.npu_mhc_pre_cmhc.return_value = expected
+
+        result = npu_mhc_pre_cmhc("x", "phi", "alpha", "bias", "perm_mats")
+
+        mock_platform.custom_ops.npu_mhc_pre_cmhc.assert_called_once_with(
+            "x", "phi", "alpha", "bias", "perm_mats",
+            1e-6, 1e-6,
+        )
+        self.assertIs(result, expected)
+
+    @patch(_PATCH_TARGET)
+    def test_custom_kwargs_forwarded(self, mock_platform):
+        """Custom keyword argument values are forwarded to the platform."""
+        mock_platform.custom_ops.npu_mhc_pre_cmhc.return_value = None
+
+        npu_mhc_pre_cmhc(
+            "x", "phi", "alpha", "bias", "perm_mats",
+            hc_eps=1e-4,
+            norm_eps=1e-5,
+        )
+
+        mock_platform.custom_ops.npu_mhc_pre_cmhc.assert_called_once_with(
+            "x", "phi", "alpha", "bias", "perm_mats",
+            1e-4, 1e-5,
+        )
+
+    @patch(_PATCH_TARGET)
+    def test_gamma_is_dropped(self, mock_platform):
+        """gamma is accepted but not forwarded to the platform (kernel ignores it)."""
+        mock_platform.custom_ops.npu_mhc_pre_cmhc.return_value = None
+
+        npu_mhc_pre_cmhc(
+            "x", "phi", "alpha", "bias", "perm_mats",
+            gamma="should_be_ignored",
+        )
+
+        mock_platform.custom_ops.npu_mhc_pre_cmhc.assert_called_once_with(
+            "x", "phi", "alpha", "bias", "perm_mats",
+            1e-6, 1e-6,
         )
 
 

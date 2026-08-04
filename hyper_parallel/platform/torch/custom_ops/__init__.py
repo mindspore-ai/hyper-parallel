@@ -70,6 +70,12 @@ class TorchCustomOps:
         )
 
     @staticmethod
+    def npu_mhc_pre_cmhc(*args, **kwargs):
+        raise NotImplementedError(
+            "npu_mhc_pre_cmhc is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
     def npu_lightning_indexer(*args, **kwargs):
         """NPU lightning indexer operator; not supported on PyTorch."""
         raise NotImplementedError(
