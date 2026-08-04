@@ -40,6 +40,8 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "mhc_pre_sinkhorn_backward.cc"),
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn.cc"),
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn_backward.cc"),
+    os.path.join(_CC_DIR, "mhc_pre_cmhc.cc"),
+    os.path.join(_CC_DIR, "mhc_pre_cmhc_backward.cc"),
     os.path.join(_CC_DIR, "lightning_indexer_v2.cc"),
     os.path.join(_CC_DIR, "sparse_flash_mla.cc"),
     os.path.join(_CC_DIR, "sparse_flash_mla_grad.cc"),
@@ -62,7 +64,7 @@ except ImportError:
     _custom_ops = _build_custom_ops()
 else:
     # Rebuild stale source-tree extensions that predate newly added symbols.
-    if not hasattr(_custom_ops, "npu_mhc_pre_clamp_sinkhorn"):
+    if not hasattr(_custom_ops, "npu_mhc_pre_cmhc"):
         _custom_ops = _build_custom_ops()
 
 
@@ -421,6 +423,74 @@ class NpuMhcPreClampSinkhornDFunction(DFunction):  # pylint: disable=W0221
             h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits,
             ctx.hc_eps, ctx.clamp_min, ctx.clamp_max)
         return tuple(grads[:4]) + _MHC_PRE_CLAMP_NONE_GRADS
+
+
+class NpuMhcPreCmhcDFunction(DFunction):  # pylint: disable=W0221
+    """DFunction wrapper for npu_mhc_pre_cmhc on MindSpore.
+
+    Forward returns 7 tensors (hin, h_post, h_res, inv_rms, h_mix, h_pre, coeff).
+    Backward consumes inv_rms/h_mix/h_pre/h_post/coeff + perm_mats (9 saved)
+    plus grad_h_in/grad_h_post/grad_h_res. Note: backward aclnn takes NEITHER
+    bias (grad_bias derived internally) NOR gamma (kernel (void)gamma); gamma
+    is constructed inside the .cc kernel to satisfy aclnn CheckGammaShape.
+    """
+
+    _op_name = "npu_mhc_pre_cmhc"
+
+    @staticmethod
+    def forward(ctx, x, phi, alpha, bias, perm_mats, gamma, hc_eps, norm_eps):
+        """Forward pass: delegates to the MindSpore Ascend CMHC custom kernel.
+
+        Args:
+            ctx: Autograd context.
+            x: Input tensor. dtype bfloat16/float16.
+            phi: mHC parameter matrix [n!+2n, n*d]. dtype float32.
+            alpha: mHC scaling parameters [3]. dtype float32.
+            bias: mHC bias parameters [n!+2n]. dtype float32.
+            perm_mats: Permutation matrices [n!, n, n] (gamma-blended). dtype float32.
+            gamma: RMSNorm gamma [n, d]. dtype float32. Kernel ignores (void)gamma.
+            hc_eps: H_pre sigmoid eps parameter.
+            norm_eps: RmsNorm eps parameter.
+
+        Returns:
+            tuple[Tensor, ...]: 7 output tensors
+                (h_in, h_post, h_res, inv_rms, h_mix, h_pre, coeff).
+        """
+        result = _custom_ops.npu_mhc_pre_cmhc(x, phi, alpha, bias, perm_mats, gamma, hc_eps, norm_eps)
+        _, h_post, _, inv_rms, h_mix, h_pre, coeff = result
+        ctx.save_for_backward(x, phi, alpha, perm_mats, gamma, inv_rms, h_mix, h_pre, h_post, coeff)
+        ctx.hc_eps = hc_eps
+        return result
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Backward pass: calls npu_mhc_pre_cmhc_backward kernel.
+
+        Args:
+            ctx: Autograd context.
+            grad_outputs: Upstream gradients for the 7 forward outputs.
+                grad_outputs[0]=grad_h_in, [1]=grad_h_post, [2]=grad_h_res;
+                [3..6] correspond to saved intermediates and are None.
+
+        Returns:
+            tuple: (grad_x, grad_phi, grad_alpha, grad_bias, None, None, None, None) --
+                gradients for the 8 forward inputs (perm_mats/gamma/hc_eps/norm_eps
+                have no gradient).
+        """
+        x, phi, alpha, perm_mats, gamma, inv_rms, h_mix, h_pre, h_post, coeff = ctx.saved_tensors
+        (grad_h_in, grad_h_post, grad_h_res,
+         x, phi, alpha, perm_mats, gamma, inv_rms, h_mix, h_pre, h_post, coeff) = _ensure_contiguous(
+            grad_outputs[0], grad_outputs[1], grad_outputs[2],
+            x, phi, alpha, perm_mats, gamma, inv_rms, h_mix, h_pre, h_post, coeff)
+        # h_res forward output is [B,S,n*n] (3D); backward aclnn expects [B,S,n,n] (4D).
+        n = x.shape[-2]
+        grad_h_res = ms.ops.reshape(grad_h_res, tuple(grad_h_res.shape[:-1]) + (n, n))
+        # inv_rms forward output is [B,S] (2D); backward tiling expects [B,S,1] (3D).
+        inv_rms = ms.ops.reshape(inv_rms, tuple(inv_rms.shape) + (1,))
+        grads = _custom_ops.npu_mhc_pre_cmhc_backward(
+            grad_h_in, grad_h_post, grad_h_res, x, phi, alpha,
+            h_pre, h_mix, inv_rms, h_post, gamma, perm_mats, coeff, ctx.hc_eps)
+        return tuple(grads[:4]) + (None, None, None, None)
 
 
 class NpuLightningIndexerDFunction(DFunction):  # pylint: disable=W0221
