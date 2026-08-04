@@ -19,7 +19,8 @@ which routes to the platform-specific Ascend NPU custom C++ kernel.
 """
 from typing import Optional, Tuple
 
-from mindspore import Tensor
+from mindspore import Tensor, mint
+import mindspore.common.dtype as mstype
 
 from hyper_parallel.platform import get_platform
 
@@ -221,6 +222,41 @@ def npu_mhc_pre_clamp_sinkhorn(
         hc_eps, norm_eps, out_flag,
         clamp_min, clamp_max,
     )
+
+
+def npu_mhc_pre_cmhc(
+        x,
+        phi,
+        alpha,
+        bias,
+        perm_mats,
+        *,
+        gamma=None,
+        hc_eps: float = 1e-6,
+        norm_eps: float = 1e-6,
+) -> Tuple:
+    """MHC pre-processing with CMHC permutation-softmax blend (fused).
+
+    Uses the fused aclnnMhcPreCmhc kernel: softmax over n! permutations plus
+    einsum with gamma-blended permutation matrices yields a doubly-stochastic
+    h_res. ``gamma`` is accepted for API completeness but ignored (the kernel
+    applies ``(void)gamma``, equivalent to gamma=1).
+
+    .. warning::
+        This is an experimental API that subject to change or deletion.
+
+    Returns:
+        tuple: 7 output tensors (hin, h_post, h_res, inv_rms, h_mix, h_pre, coeff).
+    """
+    if gamma is None:
+        # CANN tiling (GetWorkspaceSize) crashes when gamma=nullptr.
+        # Create a real gamma (ones = identity scale) with device memory.
+        # The kernel ignores gamma values ((void)gamma), so ones is safe.
+        n = x.shape[-2]
+        d = x.shape[-1]
+        gamma = mint.ones((n, d), dtype=mstype.float32)
+    return _platform.custom_ops.npu_mhc_pre_cmhc(
+        x, phi, alpha, bias, perm_mats, gamma, hc_eps, norm_eps)
 
 
 def npu_lightning_indexer(
