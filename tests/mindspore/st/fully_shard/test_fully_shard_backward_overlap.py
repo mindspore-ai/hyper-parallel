@@ -14,7 +14,7 @@
 # ============================================================================
 """Launch MindSpore fully_shard comm_fusion=False backward overlap ST."""
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.distributed_launcher import msrun_case
 
 _FILE_NAME = "_test_fully_shard_backward_overlap.py"
 

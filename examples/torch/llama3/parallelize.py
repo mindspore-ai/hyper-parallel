@@ -25,6 +25,8 @@ from torch import nn
 
 from hyper_parallel import (
     ColwiseParallel,
+    MC2ColwiseParallel,
+    MC2RowwiseParallel,
     PrepareModuleInput,
     RowwiseParallel,
     SequenceParallel,
@@ -35,12 +37,57 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 
 
+def _llama3_block_tp_plan(*, sp_layout: Shard, enable_mc2: bool) -> dict:
+    """Build the per-transformer-block TP plan for Llama3."""
+    rowwise_parallel = MC2RowwiseParallel if enable_mc2 else RowwiseParallel
+    rowwise_output_plan = rowwise_parallel(
+        input_layouts=Shard(-1),
+        output_layouts=sp_layout,
+        use_local_output=False,
+    )
+    # MC2 column path keeps sequence-sharded activations and fuses AllGather into matmul.
+    mlp_colwise_parallel = MC2ColwiseParallel if enable_mc2 else ColwiseParallel
+    mlp_colwise_kwargs = (
+        {"input_layouts": sp_layout, "use_local_output": False}
+        if enable_mc2
+        else {"use_local_output": False}
+    )
+    mlp_prepare_desired = (sp_layout,) if enable_mc2 else (Replicate(),)
+    norm_plan = SequenceParallel(sequence_dim=1, use_local_output=False)
+    return {
+        "attention_norm": norm_plan,
+        "attention": PrepareModuleInput(
+            input_layouts=(sp_layout, Replicate()),
+            desired_input_layouts=(Replicate(), Replicate()),
+            use_local_output=False,
+        ),
+        "attention.wq": ColwiseParallel(use_local_output=False),
+        "attention.wk": ColwiseParallel(use_local_output=False),
+        "attention.wv": ColwiseParallel(use_local_output=False),
+        "attention.wo": RowwiseParallel(
+            input_layouts=Shard(-1),
+            output_layouts=sp_layout,
+            use_local_output=False,
+        ),
+        "ffn_norm": norm_plan,
+        "feed_forward": PrepareModuleInput(
+            input_layouts=(sp_layout,),
+            desired_input_layouts=mlp_prepare_desired,
+            use_local_output=False,
+        ),
+        "feed_forward.w1": mlp_colwise_parallel(**mlp_colwise_kwargs),
+        "feed_forward.w2": rowwise_output_plan,
+        "feed_forward.w3": mlp_colwise_parallel(**mlp_colwise_kwargs),
+    }
+
+
 def parallelize_llama3(
     model: nn.Module,
     tp_mesh: DeviceMesh,
     *,
     enable_sequence_parallel: bool = True,
     enable_loss_parallel: bool = False,
+    enable_mc2: bool = False,
 ) -> nn.Module:
     """Apply 1-D tensor parallelism (TorchTitan-style TP plan).
 
@@ -50,11 +97,17 @@ def parallelize_llama3(
     Requires ``n_heads % tp_world_size == 0`` and ``n_kv_heads % tp_world_size == 0``.
 
     Args:
-        model: Model or PP stage chunk with ``cfg`` and ``layers`` attributes.
-        tp_mesh: One-dimensional :class:`~hyper_parallel.core.dtensor.device_mesh.DeviceMesh`.
-        enable_sequence_parallel: When ``True`` (default), use sequence parallelism on norms and
-            chain Shard(1) activations like TorchTitan ``apply_tp``. ``False`` is not implemented.
-        enable_loss_parallel: If ``True``, leave vocab shard on logits for fused CE (optional).
+        model (nn.Module): Model or PP stage chunk with ``cfg`` and ``layers``.
+        tp_mesh (DeviceMesh): One-dimensional TP device mesh.
+        enable_sequence_parallel (bool, optional): When ``True`` (default), use sequence
+            parallelism on norms and chain ``Shard(1)`` activations like TorchTitan
+            ``apply_tp``. ``False`` is not implemented.
+        enable_loss_parallel (bool, optional): If ``True``, leave vocab shard on logits
+            for fused CE. Default: ``False``.
+        enable_mc2 (bool, optional): If ``True``, use MC2 fused AllGather+MatMul /
+            MatMul+ReduceScatter on MLP linear layers (requires sequence parallelism).
+            Attention projections stay on the unfused Colwise/Rowwise path.
+            Default: ``False``.
 
     Returns:
         The same ``model`` instance after in-place parallelization.
@@ -63,6 +116,7 @@ def parallelize_llama3(
         raise NotImplementedError(
             "This demo only implements the TorchTitan-style path with sequence parallelism enabled."
         )
+    enable_mc2 = enable_mc2 and enable_sequence_parallel
 
     tp_world = tp_mesh.size()
     cfg = model.cfg
@@ -72,7 +126,6 @@ def parallelize_llama3(
         raise ValueError(f"n_kv_heads ({cfg.n_kv_heads}) must divide TP size ({tp_world}).")
 
     sp_layout = Shard(1)
-
     parallelize_module(
         model,
         tp_mesh,
@@ -91,37 +144,10 @@ def parallelize_llama3(
         },
     )
 
-    rowwise_output_plan = RowwiseParallel(
-        input_layouts=Shard(-1),
-        output_layouts=sp_layout,
-        use_local_output=False,
-    )
-    norm_plan = SequenceParallel(sequence_dim=1, use_local_output=False)
-
+    layer_plan = _llama3_block_tp_plan(sp_layout=sp_layout, enable_mc2=enable_mc2)
     for block in model.layers:
         block.attention.tp_mesh_size = tp_world
         block.attention.tp_mesh = tp_mesh
-        layer_plan = {
-            "attention_norm": norm_plan,
-            "attention": PrepareModuleInput(
-                input_layouts=(sp_layout, Replicate()),
-                desired_input_layouts=(Replicate(), Replicate()),
-                use_local_output=False,
-            ),
-            "attention.wq": ColwiseParallel(use_local_output=False),
-            "attention.wk": ColwiseParallel(use_local_output=False),
-            "attention.wv": ColwiseParallel(use_local_output=False),
-            "attention.wo": rowwise_output_plan,
-            "ffn_norm": norm_plan,
-            "feed_forward": PrepareModuleInput(
-                input_layouts=(sp_layout,),
-                desired_input_layouts=(Replicate(),),
-                use_local_output=False,
-            ),
-            "feed_forward.w1": ColwiseParallel(use_local_output=False),
-            "feed_forward.w2": rowwise_output_plan,
-            "feed_forward.w3": ColwiseParallel(use_local_output=False),
-        }
         parallelize_module(block, tp_mesh, layer_plan)
 
     return model

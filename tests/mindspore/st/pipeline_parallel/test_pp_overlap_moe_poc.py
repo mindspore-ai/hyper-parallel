@@ -20,7 +20,7 @@ CommComputeOverlap, OverlapExpertParallel, and AsyncCollectiveTensor
 chain runs end-to-end without deadlock and produces non-zero grads.
 """
 from tests.common.mark_utils import arg_mark  # pylint: disable=W0611
-from tests.mindspore.st.utils import msrun_case
+from tests.common.distributed_launcher import msrun_case
 
 PP_OVERLAP_MOE_POC = "pp_overlap_moe_poc.py"
 

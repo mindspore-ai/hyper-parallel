@@ -14,6 +14,11 @@
 # ============================================================================
 """Tensor parallel declarative APIs (parallel styles and module parallelization)."""
 from hyper_parallel.core.tensor_parallel.api import parallelize_module
+from hyper_parallel.core.tensor_parallel.mc2 import MC2Linear
+from hyper_parallel.core.tensor_parallel.mc2_style import (
+    MC2ColwiseParallel,
+    MC2RowwiseParallel,
+)
 from hyper_parallel.core.tensor_parallel.style import (
     ColwiseParallel,
     NoParallel,
@@ -32,6 +37,8 @@ from hyper_parallel.core.tensor_parallel.loss_parallel import (
 __all__ = [
     # Parallel styles
     "ColwiseParallel",
+    "MC2ColwiseParallel",
+    "MC2RowwiseParallel",
     "NoParallel",
     "ParallelStyle",
     "PrepareModuleInput",
@@ -39,6 +46,8 @@ __all__ = [
     "PrepareModuleOutput",
     "RowwiseParallel",
     "SequenceParallel",
+    # MC2 fused linear
+    "MC2Linear",
     # Module parallelization
     "parallelize_module",
     # Loss parallel

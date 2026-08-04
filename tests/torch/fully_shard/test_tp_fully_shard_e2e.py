@@ -16,7 +16,7 @@
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
-from tests.torch.utils import torchrun_case
+from tests.common.distributed_launcher import torchrun_case
 
 _TEST_TP_FULLY_SHARD_E2E = "_test_tp_fully_shard_e2e.py"
 

@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Torch test package setup."""
+"""Torch test package setup.
+
+Only sets ``HYPER_PARALLEL_PLATFORM``. Do **not** import ``hyper_parallel``
+here — that would pull ``torch`` into every pytest launcher under
+``tests.torch.*``.
+"""
 import os
 
-from hyper_parallel.platform import platform as platform_module
-
-
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-platform_module.platform = None

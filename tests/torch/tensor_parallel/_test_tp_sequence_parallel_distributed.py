@@ -243,11 +243,13 @@ def test_sequence_parallel_layernorm_no_affine_forward_vs_cpu_2gpu():
 # ---------------------------------------------------------------------------
 
 
-def test_sequence_parallel_layernorm_forward_gather_full_vs_cpu_4gpu():
+def test_sequence_parallel_layernorm_fwd_bwd_vs_cpu_4gpu():
     """
-    Feature: all_gather on 4 ranks vs CPU full reference
-    Description: Longer sequence (divisible by 4); reconstruct full output.
-    Expectation: Gathered NPU tensor matches CPU ``y_ref``.
+    Feature: SequenceParallel LayerNorm forward + backward on 4 ranks (one torchrun)
+    Description:
+        1. Forward: gather full output vs CPU LayerNorm
+        2. Backward: all-reduce weight/bias grads vs CPU
+    Expectation: Forward and grads close to CPU reference
     """
     init_backend(_DEVICE_TYPE)
     assert dist.get_world_size() == 4, "this case is scheduled with num_proc=4"
@@ -255,9 +257,9 @@ def test_sequence_parallel_layernorm_forward_gather_full_vs_cpu_4gpu():
     rank = dist.get_rank()
     ws = dist.get_world_size()
 
+    # --- forward ---
     bsz, seq_len, hidden = 2, 32, 40
     assert seq_len % ws == 0
-
     torch.manual_seed(301)
     if _DEVICE_TYPE == "npu":
         torch.npu.manual_seed(301)
@@ -270,40 +272,21 @@ def test_sequence_parallel_layernorm_forward_gather_full_vs_cpu_4gpu():
     ln_npu = to_device(nn.LayerNorm(hidden, elementwise_affine=True), _DEVICE_TYPE)
     with torch.no_grad():
         ln_npu.load_state_dict(ln_cpu.state_dict())
-
     sharded = parallelize_module(
         ln_npu, mesh,
         SequenceParallel(sequence_dim=1, use_local_output=True),
     )
     chunk = seq_len // ws
     sl = slice(rank * chunk, (rank + 1) * chunk)
-    x_local = to_device(x_cpu[:, sl, :], _DEVICE_TYPE)
-
     with torch.no_grad():
-        y_local = sharded(x_local)
-
+        y_local = sharded(to_device(x_cpu[:, sl, :], _DEVICE_TYPE))
     y_full = _gather_seq_dim1(y_local)
     if rank == 0:
         _npu_precision_close(y_full, y_ref)
 
-
-def test_sequence_parallel_layernorm_backward_grad_vs_cpu_4gpu():
-    """
-    Feature: weight/bias gradients vs CPU after sequence-parallel forward (4 ranks)
-    Description: CPU reference backward on full sequence; NPU backward on shards.
-        Replicated parameter shard-grads are summed via ``all_reduce`` and compared
-        to single-device CPU grads.
-    Expectation: Summed NPU grads close to CPU ``weight.grad`` / ``bias.grad``.
-    """
-    init_backend(_DEVICE_TYPE)
-    assert dist.get_world_size() == 4
-    mesh = _make_tp_mesh_1d()
-    rank = dist.get_rank()
-    ws = dist.get_world_size()
-
+    # --- backward ---
     bsz, seq_len, hidden = 2, 16, 28
     assert seq_len % ws == 0
-
     torch.manual_seed(302)
     if _DEVICE_TYPE == "npu":
         torch.npu.manual_seed(302)
@@ -317,24 +300,19 @@ def test_sequence_parallel_layernorm_backward_grad_vs_cpu_4gpu():
     ln_npu = to_device(nn.LayerNorm(hidden, elementwise_affine=True), _DEVICE_TYPE)
     with torch.no_grad():
         ln_npu.load_state_dict(ln_cpu.state_dict())
-
     sharded = parallelize_module(
         ln_npu, mesh,
         SequenceParallel(sequence_dim=1, use_local_output=True),
     )
-
     chunk = seq_len // ws
     sl = slice(rank * chunk, (rank + 1) * chunk)
     x_local = to_device(x_cpu[:, sl, :].clone(), _DEVICE_TYPE).requires_grad_(True)
-
-    y_loc = sharded(x_local)
-    y_loc.sum().backward()
+    sharded(x_local).sum().backward()
 
     w_grad = _param_grad_npu_tensor(ln_npu.weight).clone()
     b_grad = _param_grad_npu_tensor(ln_npu.bias).clone()
     dist.all_reduce(w_grad, op=dist.ReduceOp.SUM)
     dist.all_reduce(b_grad, op=dist.ReduceOp.SUM)
-
     if rank == 0:
         _npu_precision_close(w_grad, ln_cpu.weight.grad)
         _npu_precision_close(b_grad, ln_cpu.bias.grad)

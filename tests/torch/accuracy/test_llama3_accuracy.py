@@ -22,7 +22,7 @@ random seed and optimizer state.
 """
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
-from tests.torch.utils import torchrun_case
+from tests.common.distributed_launcher import torchrun_case
 
 _WORKER = "_test_llama3_accuracy.py"
 

@@ -16,7 +16,7 @@
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.distributed_launcher import msrun_case
 
 _WORKER = str(Path(__file__).resolve().parent / "mega_moe.py")
 

@@ -28,7 +28,8 @@ __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDP
            "AsyncDSAIndexerContextParallel", "AsyncDSAIndexerLossContextParallel",
            "AsyncDSASparseAttentionContextParallel",
            "DSAIndexerContextParallel", "DSAIndexerLossContextParallel", "DSASparseAttentionContextParallel",
-           "ColwiseParallel", "NoParallel", "RowwiseParallel", "SequenceParallel",
+           "ColwiseParallel", "MC2ColwiseParallel", "MC2RowwiseParallel", "MC2Linear",
+           "NoParallel", "RowwiseParallel", "SequenceParallel",
            "PrepareModuleInput", "PrepareModuleInputOutput", "PrepareModuleOutput",
            "ParallelStyle", "parallelize_module", "manual_seed"]
 
@@ -70,6 +71,9 @@ from hyper_parallel.core.context_parallel import (
 )
 from hyper_parallel.core.tensor_parallel import (
     ColwiseParallel,
+    MC2ColwiseParallel,
+    MC2Linear,
+    MC2RowwiseParallel,
     NoParallel,
     ParallelStyle,
     PrepareModuleInput,

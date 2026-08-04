@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple
 
 from tests.shard_ops.framework.case_spec import OpShardCase
-from tests.shard_ops.framework.registry import load_cases_from_package
+from tests.shard_ops.framework.registry import load_case_plan_from_package
 
 # Canonical mesh-axis names per ndim. For cases that do NOT reference axis
 # names at runtime (everything except ``needs_mesh`` MC2 ops), the names are
@@ -151,7 +151,7 @@ def build_suite_groups(
     ``fail_fast`` is forwarded onto each ``GroupSpec`` so the suite entry
     can stop on first failure (typically for level0 gates).
     """
-    all_cases = load_cases_from_package(cases_pkg)
+    all_cases = load_case_plan_from_package(cases_pkg)
     if tag_include:
         all_cases = [c for c in all_cases if set(c.tags) & tag_include]
 

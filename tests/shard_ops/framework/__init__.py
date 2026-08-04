@@ -26,6 +26,7 @@ from tests.shard_ops.framework.registry import (
     register,
     register_op_family,
     load_cases_from_package,
+    load_case_plan_from_package,
 )
 from tests.shard_ops.framework.suite import GroupSpec, build_suite_groups
 from tests.shard_ops.framework.runner import RUNNER
@@ -41,6 +42,7 @@ __all__ = [
     "register",
     "register_op_family",
     "load_cases_from_package",
+    "load_case_plan_from_package",
     "GroupSpec",
     "build_suite_groups",
     "RUNNER",

@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MindSpore test package setup."""
+"""MindSpore test package setup.
+
+Only sets ``HYPER_PARALLEL_PLATFORM``. Do **not** import ``hyper_parallel``
+here — that would pull heavy frameworks into every pytest launcher under
+``tests.mindspore.*`` (including shard ops suite planning).
+"""
 import os
 
-from hyper_parallel.platform import platform as platform_module
-
-
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
-platform_module.platform = None

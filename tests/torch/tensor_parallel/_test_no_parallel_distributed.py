@@ -14,7 +14,7 @@
 # ============================================================================
 """Distributed NPU worker tests for ``NoParallel`` (vs CPU single-device reference).
 
-Launched from ``test_no_parallel_distributed.py`` (2 ranks per case).
+Launched from ``test_tp_styles_distributed.test_tp_styles_two_card_wave_one`` (2 ranks).
 
 Scenarios:
 
@@ -61,23 +61,23 @@ def _npu_precision_close(a: torch.Tensor, b: torch.Tensor) -> None:
     )
 
 
-def test_no_parallel_linear_forward_precision_npu():
+def test_no_parallel_linear_and_redistribute_npu():
     """
-    Feature: NoParallel replicated Linear forward matches CPU reference
+    Feature: NoParallel Linear forward + SP→NoParallel redistribute (one torchrun)
     Description:
-        1. Create nn.Linear with known weight/bias on all ranks
-        2. Apply NoParallel (params become replicated DTensors)
-        3. Forward replicated input; output should be replicated DTensor
-        4. Compare output (via to_local) with CPU F.linear(x, w, b)
-    Expectation: NPU output close to CPU reference
+        1. Replicated Linear forward vs CPU F.linear
+        2. SequenceParallel then NoParallel desired_input=Replicate vs CPU
+    Expectation: Both scenarios match CPU reference
     """
     init_dist()
     mesh = _make_tp_mesh_1d()
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    # --- replicated Linear ---
     torch.manual_seed(50)
     torch.npu.manual_seed(50)
-
     in_f, out_f, batch = 32, 64, 8
-
     w = torch.randn(out_f, in_f, dtype=torch.float32)
     b = torch.randn(out_f, dtype=torch.float32)
     x = torch.randn(batch, in_f, dtype=torch.float32)
@@ -87,34 +87,16 @@ def test_no_parallel_linear_forward_precision_npu():
     with torch.no_grad():
         linear.weight.copy_(w.npu())
         linear.bias.copy_(b.npu())
-    x_npu = x.npu()
-
     sharded = parallelize_module(linear, mesh, NoParallel(use_local_output=False))
     with torch.no_grad():
-        y_hp = sharded(x_npu)
-
+        y_hp = sharded(x.npu())
     assert isinstance(y_hp, DTensor), "output should be a DTensor"
     assert y_hp.placements == (Replicate(),), "output should be Replicate()"
     _npu_precision_close(y_hp.to_local(), y_ref)
 
-
-def test_no_parallel_redistribute_sharded_input_npu():
-    """
-    Feature: NoParallel redistibutes sharded input to Replicate before compute
-    Description:
-        1. Apply SequenceParallel to a LayerNorm (produces Shard(1) output)
-        2. Apply NoParallel to a downstream Linear (desired_input_layout=Replicate())
-        3. The input hook should redistribute the Shard(1) DTensor to Replicate
-        4. Compare end-to-end output with CPU reference
-    Expectation: Correct redistribution; output matches CPU reference
-    """
-    init_dist()
-    mesh = _make_tp_mesh_1d()
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
+    # --- redistribute sharded input ---
     torch.manual_seed(53)
     torch.npu.manual_seed(53)
-
     bsz, seq_len, hidden, out_f = 4, 16, 32, 24
     assert seq_len % world_size == 0
 
@@ -130,7 +112,6 @@ def test_no_parallel_redistribute_sharded_input_npu():
     norm_cpu = nn.LayerNorm(hidden, elementwise_affine=True)
     linear_cpu = nn.Linear(hidden, out_f, bias=True)
     x_cpu = torch.randn(bsz, seq_len, hidden, dtype=torch.float32)
-
     with torch.no_grad():
         y_ref = linear_cpu(norm_cpu(x_cpu))
 
@@ -145,12 +126,8 @@ def test_no_parallel_redistribute_sharded_input_npu():
         "linear": NoParallel(desired_input_layout=Replicate(),
                              use_local_output=True),
     })
-
     chunk = seq_len // world_size
     sl = slice(rank * chunk, (rank + 1) * chunk)
-    x_local = x_cpu[:, sl, :].npu()
-
     with torch.no_grad():
-        y_local = model(x_local)
-
+        y_local = model(x_cpu[:, sl, :].npu())
     _npu_precision_close(y_local, y_ref)

@@ -20,7 +20,7 @@ Uses the real ``ColwiseParallel`` / ``RowwiseParallel`` from
 All tests compare distributed NPU output against single-device CPU reference.
 
 Port allocation (launched from ``test_tp_hybrid_distributed.py``):
-  10600–10601  4-card TP+FSDP
+  10800  hybrid fwd+bwd; sequence-parallel 4-card packed alongside in launcher
 """
 import torch
 import torch.distributed as dist
@@ -71,15 +71,13 @@ class MLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def test_tp_fsdp_mlp_forward_precision_npu():
+def test_tp_fsdp_mlp_fwd_bwd_precision_npu():
     """
-    Feature: ColwiseParallel + RowwiseParallel MLP with FSDP matches CPU reference
+    Feature: Colwise+Rowwise MLP with FSDP forward + backward vs CPU (one torchrun)
     Description:
-        1. Create 2D mesh (dp=2, tp=2), total 4 ranks
-        2. TP: w1=ColwiseParallel, w2=RowwiseParallel on tp_mesh
-        3. FSDP: fully_shard on dp_mesh
-        4. Compare output with CPU single-device MLP
-    Expectation: NPU output close to CPU reference
+        1. 2D mesh (dp=2, tp=2); TP then fully_shard; compare gathered forward
+        2. Rebuild with new seed; compare gathered w1 weight grad vs CPU
+    Expectation: Output and grads close to CPU reference
     """
     init_dist()
     world_size = dist.get_world_size()
@@ -89,96 +87,56 @@ def test_tp_fsdp_mlp_forward_precision_npu():
 
     tp_size = 2
     dp_size = world_size // tp_size
-    root_mesh = init_device_mesh(
-        device_type="npu",
-        mesh_shape=(dp_size, tp_size),
-        mesh_dim_names=("dp", "tp"),
-    )
-    dp_mesh = root_mesh["dp"]
-    tp_mesh = root_mesh["tp"]
 
+    def _meshes():
+        root_mesh = init_device_mesh(
+            device_type="npu",
+            mesh_shape=(dp_size, tp_size),
+            mesh_dim_names=("dp", "tp"),
+        )
+        return root_mesh, root_mesh["dp"], root_mesh["tp"]
+
+    # --- forward ---
+    root_mesh, dp_mesh, tp_mesh = _meshes()
     torch.manual_seed(42)
     torch.npu.manual_seed(42)
-
     in_f, hidden_f, out_f, batch = 32, 64, 24, 8
-    assert hidden_f % tp_size == 0, (
-        f"hidden_features {hidden_f} must be divisible by tp_size {tp_size}"
-    )
-    assert in_f % tp_size == 0, (
-        f"in_features {in_f} must be divisible by tp_size {tp_size}"
-    )
+    assert hidden_f % tp_size == 0
+    assert in_f % tp_size == 0
 
-    # Build same model for CPU reference and NPU distributed
     torch.manual_seed(100)
     ref_model = MLP(in_f, hidden_f, out_f)
-
     x = torch.randn(batch, in_f, dtype=torch.float32)
     y_ref = ref_model(x)
 
-    # NPU distributed model with same weights
     torch.manual_seed(100)
     dist_model = MLP(in_f, hidden_f, out_f).npu()
-
-    # Step 1: Apply TP on tp_mesh
     parallelize_module(
         dist_model,
         tp_mesh,
         {"w1": ColwiseParallel(), "w2": RowwiseParallel()},
     )
-
-    # Step 2: Apply FSDP on dp_mesh
     fully_shard(dist_model, mesh=dp_mesh)
 
-    # Split input across DP ranks
     dp_idx = root_mesh.get_coordinate()[0]
     local_batch = batch // dp_size
     x_local = x[dp_idx * local_batch : (dp_idx + 1) * local_batch].npu()
-
     with torch.no_grad():
         y_local = dist_model(x_local)
 
-    # Gather outputs from all DP ranks and compare with corresponding reference slice
     dp_group = root_mesh.get_group("dp")
     gathered = [torch.empty_like(y_local) for _ in range(dp_size)]
     dist.all_gather(gathered, y_local, group=dp_group)
-    y_full = torch.cat(gathered, dim=0)
+    _npu_precision_close(torch.cat(gathered, dim=0), y_ref)
 
-    _npu_precision_close(y_full, y_ref)
-
-
-def test_tp_fsdp_mlp_backward_gradient_npu():
-    """
-    Feature: TP + FSDP backward produces correct gradients
-    Description:
-        1. Same setup as forward test
-        2. Forward + backward with scalar loss
-        3. Compare gathered w1 weight grad with CPU reference
-    Expectation: Gradients match CPU reference
-    """
-    init_dist()
-    world_size = dist.get_world_size()
-    if world_size < 4 or world_size % 2 != 0:
-        print(f"Skip: need at least 4 ranks, got {world_size}")
-        return
-
-    tp_size = 2
-    dp_size = world_size // tp_size
-    root_mesh = init_device_mesh(
-        device_type="npu",
-        mesh_shape=(dp_size, tp_size),
-        mesh_dim_names=("dp", "tp"),
-    )
-    dp_mesh = root_mesh["dp"]
-    tp_mesh = root_mesh["tp"]
-
+    # --- backward ---
+    root_mesh, dp_mesh, tp_mesh = _meshes()
     torch.manual_seed(42)
     torch.npu.manual_seed(42)
-
     in_f, hidden_f, out_f, batch = 16, 32, 12, 4
     assert hidden_f % tp_size == 0
     assert in_f % tp_size == 0
 
-    # CPU reference
     torch.manual_seed(200)
     ref_model = MLP(in_f, hidden_f, out_f)
     x = torch.randn(batch, in_f, dtype=torch.float32)
@@ -186,7 +144,6 @@ def test_tp_fsdp_mlp_backward_gradient_npu():
     y_ref.sum().backward()
     ref_w1_grad = ref_model.w1.weight.grad.clone()
 
-    # NPU distributed
     torch.manual_seed(200)
     dist_model = MLP(in_f, hidden_f, out_f).npu()
     parallelize_module(
@@ -199,29 +156,20 @@ def test_tp_fsdp_mlp_backward_gradient_npu():
     dp_idx = root_mesh.get_coordinate()[0]
     local_batch = batch // dp_size
     x_local = x[dp_idx * local_batch : (dp_idx + 1) * local_batch].npu()
-
-    # Forward + backward (FSDP handles unshard/reshard automatically via hooks)
     y_local = dist_model(x_local)
     y_local.sum().backward()
 
-    # Gather w1 grad — must undo both FSDP reduce-scatter and TP sharding.
-    # FSDP reduce-scatters along dp dim, TP shards along dim 0 (ColwiseParallel).
-    # Both slice dim 0, so each rank holds a (hidden_f/(tp*dp), in_f) grad shard.
-    # Correct order: DP all-gather first (undo FSDP), then TP all-gather (undo TP).
     local_w1_grad = dist_model.w1.weight.grad
     if hasattr(local_w1_grad, 'to_local'):
         local_w1_grad = local_w1_grad.to_local()
 
-    # Step 1: All-gather across DP dimension (undo FSDP reduce-scatter)
     dp_group = root_mesh.get_group("dp")
     gathered_dp = [torch.empty_like(local_w1_grad) for _ in range(dp_size)]
     dist.all_gather(gathered_dp, local_w1_grad, group=dp_group)
     dp_full_grad = torch.cat(gathered_dp, dim=0)
 
-    # Step 2: All-gather across TP dimension (undo ColwiseParallel Shard(0))
     tp_group = root_mesh.get_group("tp")
     gathered_tp = [torch.empty_like(dp_full_grad) for _ in range(tp_size)]
     dist.all_gather(gathered_tp, dp_full_grad, group=tp_group)
     full_grad = torch.cat(gathered_tp, dim=0).cpu() / dp_size
-
     _npu_precision_close(full_grad, ref_w1_grad)
