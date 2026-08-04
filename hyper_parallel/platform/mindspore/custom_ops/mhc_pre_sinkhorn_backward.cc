@@ -39,16 +39,15 @@ std::vector<ms::Tensor> npu_mhc_pre_sinkhorn_backward(
   const ms::Tensor &hc_before_norm, const ms::Tensor &inv_rms, const ms::Tensor &sum_out, const ms::Tensor &norm_out,
   double hc_eps) {
   auto [grad_x, grad_phi, grad_alpha, grad_bias] = GenResultTensors(x, phi, alpha, bias);
-  auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MhcPreSinkhornBackward");
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMhcPreSinkhornBackward, grad_h_in, grad_h_post, grad_h_res, x, phi,
-                                          alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, hc_eps,
-                                          grad_x, grad_phi, grad_alpha, grad_bias));
-  runner->Run({grad_h_in, grad_h_post, grad_h_res, x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out,
-               norm_out},
-              {grad_x, grad_phi, grad_alpha, grad_bias});
+  ms::TensorToDevice(grad_h_in, grad_h_post, grad_h_res, x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out,
+                     norm_out);
+  ms::TensorAllocate({grad_x, grad_phi, grad_alpha, grad_bias});
+  MS_DISPATCH_ACLNN(aclnnMhcPreSinkhornBackward, grad_h_in, grad_h_post, grad_h_res, x, phi, alpha, bias, h_pre,
+                    hc_before_norm, inv_rms, sum_out, norm_out, hc_eps, grad_x, grad_phi, grad_alpha, grad_bias);
   return {grad_x, grad_phi, grad_alpha, grad_bias};
 }
 
+// cppcheck-suppress syntaxError
 MS_CUSTOM_OPS_EXTENSION_MODULE(m) {
   m.def("npu_mhc_pre_sinkhorn_backward", PYBOOST_CALLER(4, custom::npu_mhc_pre_sinkhorn_backward));
 }
