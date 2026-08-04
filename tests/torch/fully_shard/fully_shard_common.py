@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""fully_shard test common helpers"""
+"""fully_shard worker helpers (not a pytest module — do not name test_*.py)."""
 import time
 
 import torch

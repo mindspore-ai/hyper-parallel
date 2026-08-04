@@ -12,108 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Minimal tests for forward_and_gradfn grad storage behavior."""
-# pylint: disable=wrong-import-position
-import os
+"""Thin pytest entry (lazy-import). Impl: ``tests.mindspore.st._forward_and_gradfn_grad_storage_impl``."""
+from __future__ import annotations
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+import importlib
 
-import numpy as np
-import mindspore as ms
-from mindspore import Tensor, Parameter, nn, ops
+from tests.common.mark_utils import arg_mark  # noqa: F401
 
-from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
-from hyper_parallel.platform.mindspore.pipeline_parallel.backward import forward_and_gradfn
-from tests.common.mark_utils import arg_mark
+_IMPL = "tests.mindspore.st._forward_and_gradfn_grad_storage_impl"
 
 
-def _assert_param_grad_is_none(param):
-    assert param.grad is None
-    assert getattr(param, "_grad", None) is None
-
-
-def _assert_param_grad_allclose(param, expected):
-    assert param.grad is not None
-    np.testing.assert_allclose(param.grad.asnumpy(), np.array(expected, dtype=np.float32))
-
-
-class Net(nn.Cell):
-    """Minimal network for checking returned grads vs stored grads."""
-
-    def __init__(self):
-        super().__init__()
-        self.w = Parameter(Tensor(np.array([[2.0]], np.float32)), name="w")
-
-    def construct(self, x):
-        return ops.matmul(x, self.w)
+def _run(name: str):
+    # pylint: disable=C0415
+    return getattr(importlib.import_module(_IMPL), name)()
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_forward_and_gradfn_populates_parameter_grad():
-    """
-    Feature: forward_and_gradfn grad storage behavior.
-    Description: forward_and_gradfn should return gradients and write weight gradients into Parameter.grad.
-    Expectation: Returned dx/dw are correct and Parameter.grad is populated.
-    """
-    ms.set_context(mode=ms.PYNATIVE_MODE)
-    enable_mindspore_backward_compat()
-
-    x = Tensor(np.array([[3.0]], np.float32))
-
-    net = Net()
-    _assert_param_grad_is_none(net.w)
-
-    _, grad_fn = forward_and_gradfn(net, x, weights=(net.w,), grad_position=0)
-    dx, dw = grad_fn()
-
-    np.testing.assert_allclose(dx[0].asnumpy(), np.array([[2.0]], dtype=np.float32))
-    np.testing.assert_allclose(dw[0].asnumpy(), np.array([[3.0]], dtype=np.float32))
-    _assert_param_grad_allclose(net.w, [[3.0]])
-
-    net = Net()
-    _assert_param_grad_is_none(net.w)
-
-    _, grad_fn = forward_and_gradfn(net, x, weights=(net.w,), grad_position=0)
-    dx = grad_fn.compute_input_grad()
-    dw = grad_fn.compute_weight_grad()
-
-    np.testing.assert_allclose(dx.asnumpy(), np.array([[2.0]], dtype=np.float32))
-    np.testing.assert_allclose(dw[0].asnumpy(), np.array([[3.0]], dtype=np.float32))
-    _assert_param_grad_allclose(net.w, [[3.0]])
+    """See impl ``test_forward_and_gradfn_populates_parameter_grad``."""
+    return _run("test_forward_and_gradfn_populates_parameter_grad")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_forward_and_gradfn_parameter_grad_accumulates():
-    """
-    Feature: forward_and_gradfn grad accumulation.
-    Description: Repeated forward_and_gradfn backward passes should accumulate into Parameter.grad by default.
-    Expectation: Parameter.grad doubles after two identical backward passes.
-    """
-    ms.set_context(mode=ms.PYNATIVE_MODE)
-    enable_mindspore_backward_compat()
-
-    x = Tensor(np.array([[3.0]], np.float32))
-
-    net = Net()
-    _assert_param_grad_is_none(net.w)
-
-    _, grad_fn = forward_and_gradfn(net, x, weights=(net.w,), grad_position=0)
-    _ = grad_fn()
-    _assert_param_grad_allclose(net.w, [[3.0]])
-
-    _, grad_fn = forward_and_gradfn(net, x, weights=(net.w,), grad_position=0)
-    _ = grad_fn()
-    _assert_param_grad_allclose(net.w, [[6.0]])
-
-    net = Net()
-    _assert_param_grad_is_none(net.w)
-
-    _, grad_fn = forward_and_gradfn(net, x, weights=(net.w,), grad_position=0)
-    _ = grad_fn.compute_input_grad()
-    _ = grad_fn.compute_weight_grad()
-    _assert_param_grad_allclose(net.w, [[3.0]])
-
-    _, grad_fn = forward_and_gradfn(net, x, weights=(net.w,), grad_position=0)
-    _ = grad_fn.compute_input_grad()
-    _ = grad_fn.compute_weight_grad()
-    _assert_param_grad_allclose(net.w, [[6.0]])
+    """See impl ``test_forward_and_gradfn_parameter_grad_accumulates``."""
+    return _run("test_forward_and_gradfn_parameter_grad_accumulates")
