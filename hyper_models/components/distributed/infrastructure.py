@@ -25,7 +25,6 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
-from hyper_models.components.distributed.config import FSDP2Config
 from hyper_models.components.utils.device import get_device_type, get_torch_device
 
 logger = logging.getLogger(__name__)
@@ -43,6 +42,7 @@ class MeshContext:
     device_mesh: Any = None
     dp_size: int = 1
     dp_replicate_size: int = 1
+    dp_shard_size: int = 1
     tp_size: int = 1
     cp_size: int = 1
     pp_size: int = 1
@@ -72,7 +72,7 @@ class MeshContext:
         dim_names = mesh.mesh_dim_names
         selected_dims = tuple(
             dim_name
-            for dim_name in ("dp_replicate", "dp_shard_cp", "dp", "cp")
+            for dim_name in ("dp_replicate", "dp_shard", "dp", "cp")
             if dim_name in dim_names
         )
         if not selected_dims:
@@ -150,6 +150,8 @@ def initialize_distributed(backend: str = "nccl") -> Any:
 
 def _build_device_mesh_from_accelerator(
     accel: Any,
+    dp_shard_size: int,
+    dp_replicate_size: int,
     world_size: int,
 ) -> tuple[Any, tuple[str, ...]] | tuple[None, tuple[()]]:
     """Build a hyper_parallel DeviceMesh from accelerator topology.
@@ -157,36 +159,19 @@ def _build_device_mesh_from_accelerator(
     Returns (device_mesh, dim_names) when the topology matches world_size,
     otherwise (None, ()).
     """
-    dp_shard_size = max(1, getattr(accel, "dp_shard_size", 1))
-    dp_replicate_size = max(1, getattr(accel, "dp_replicate_size", 1))
     tp_size = max(1, getattr(accel, "tp_size", 1))
     cp_size = max(1, getattr(accel, "cp_size", 1))
-    pp_size = max(1, getattr(accel, "pp_size", 1))
-    ep_size = max(1, getattr(accel, "ep_size", 1))
-
-    requested_size = dp_shard_size * dp_replicate_size * tp_size * cp_size * pp_size * ep_size
-    if requested_size != world_size:
-        logger.warning(
-            "Accelerator topology (%d ranks requested) does not match world_size (%d). "
-            "Using stub MeshContext without a DeviceMesh.",
-            requested_size, world_size,
-        )
-        return None, ()
 
     mesh_dims = []
-    # Order matters for FSDP2/HSDP conventions: replicate -> shard -> cp -> tp -> pp.
+    # Order matters for FSDP2/HSDP conventions: replicate -> shard -> cp -> tp.
     if dp_replicate_size > 1:
         mesh_dims.append(("dp_replicate", dp_replicate_size))
     if dp_shard_size > 1:
-        mesh_dims.append(("dp_shard_cp", dp_shard_size))
+        mesh_dims.append(("dp_shard", dp_shard_size))
     if cp_size > 1:
         mesh_dims.append(("cp", cp_size))
     if tp_size > 1:
         mesh_dims.append(("tp", tp_size))
-    if pp_size > 1:
-        mesh_dims.append(("pp", pp_size))
-    if ep_size > 1:
-        mesh_dims.append(("ep", ep_size))
 
     if not mesh_dims:
         return None, ()
@@ -215,22 +200,40 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     that TP/CP/DP paths are exercised.
     """
     accel = getattr(cfg, "accelerator", None)
+    fsdp_cfg = getattr(cfg, "fsdp_config", None)
     if accel is None:
         return DistributedSetup(mesh_context=MeshContext())
 
-    dp_shard_size = max(1, getattr(accel, "dp_shard_size", 1))
-    dp_replicate_size = max(1, getattr(accel, "dp_replicate_size", 1))
+    dp_shard_size = max(1, getattr(fsdp_cfg, "dp_shard_size", 1))
     tp_size = max(1, getattr(accel, "tp_size", 1))
     cp_size = max(1, getattr(accel, "cp_size", 1))
     pp_size = max(1, getattr(accel, "pp_size", 1))
     ep_size = max(1, getattr(accel, "ep_size", 1))
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    non_dp_size = tp_size * cp_size
+    if world_size % non_dp_size != 0:
+        raise ValueError(
+            f"world_size {world_size} is not divisible by non-DP size "
+            f"{non_dp_size}"
+        )
+    dp_size = world_size // non_dp_size
+    if dp_size % dp_shard_size != 0:
+        raise ValueError(
+            f"dp_size {dp_size} is not divisible by FSDP shard size "
+            f"{dp_shard_size}"
+        )
+    dp_replicate_size = dp_size // dp_shard_size
     device_mesh = None
     dim_names = ()
     if dist.is_initialized() and world_size > 1:
         try:
-            device_mesh, dim_names = _build_device_mesh_from_accelerator(accel, world_size)
+            device_mesh, dim_names = _build_device_mesh_from_accelerator(
+                accel,
+                dp_shard_size,
+                dp_replicate_size,
+                world_size,
+            )
         except Exception as exc:  # pragma: no cover
             logger.warning(
                 "Failed to build DeviceMesh from accelerator config: %s. "
@@ -243,12 +246,13 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     def _local_rank(dim: str) -> int:
         return device_mesh.get_local_rank(dim) if dim in dim_names else 0
 
-    dp_shard_rank = _local_rank("dp_shard_cp")
+    dp_shard_rank = _local_rank("dp_shard")
     dp_replicate_rank = _local_rank("dp_replicate")
     mesh_ctx = MeshContext(
         device_mesh=device_mesh,
         dp_size=dp_shard_size * dp_replicate_size,
         dp_replicate_size=dp_replicate_size,
+        dp_shard_size=dp_shard_size,
         tp_size=tp_size,
         cp_size=cp_size,
         pp_size=pp_size,
@@ -257,19 +261,18 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
         tp_rank=_local_rank("tp"),
         cp_rank=_local_rank("cp"),
         pp_rank=_local_rank("pp"),
-        ep_rank=_local_rank("ep"),
         sequence_parallel=bool(getattr(accel, "sequence_parallel", False)),
         loss_parallel=bool(getattr(accel, "loss_parallel", False)),
     )
 
     # FSDP2 requires an actual shard dimension. Outer-only DP replication
     # needs a DDP strategy, which this temporary Trainer path does not build.
-    if dp_replicate_size > 1 and dp_shard_size == 1:
-        raise ValueError(
-            "dp_replicate_size > 1 with dp_shard_size == 1 requires DDP, "
-            "which is not supported by the current Trainer path"
-        )
-    strategy_config = FSDP2Config() if (dist.is_initialized() and dp_shard_size > 1) else None
+
+    fsdp_enabled = dist.is_initialized() and (
+        dp_shard_size > 1 or dp_replicate_size > 1
+                                              )
+    strategy_config = fsdp_cfg if fsdp_enabled else None
+       
     return DistributedSetup(
         mesh_context=mesh_ctx,
         strategy_config=strategy_config,

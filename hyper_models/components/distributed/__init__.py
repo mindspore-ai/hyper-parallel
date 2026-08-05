@@ -15,10 +15,7 @@
 """components.distributed: standalone DTensor sharding components (zero dependency on recipes/_transformers/models)."""
 
 from hyper_models.components.distributed.config import (
-    DDPConfig,
     FSDP2Config,
-    MegatronFSDPConfig,
-    _resolve_strategy_config,
 )
 from hyper_models.components.distributed.cp_utils import (
     flex_cp_allgather,
@@ -65,9 +62,7 @@ from hyper_models.components.distributed.tp_grad import build_tp_grad_info
 __all__ = [
     "ARCH_OVERRIDES",
     "AutoPipeline",
-    "DDPConfig",
     "FSDP2Config",
-    "MegatronFSDPConfig",
     "SPECIAL_HANDLERS",
     "TEMPLATES",
     "MeshAxisName",
@@ -83,7 +78,6 @@ __all__ = [
     "ShardingTemplate",
     "_instantiate_fsdp2",
     "_instantiate_pipeline",
-    "_resolve_strategy_config",
     "apply_sharding_plan",
     "build_tp_grad_info",
     "flex_cp_allgather",

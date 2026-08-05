@@ -47,7 +47,6 @@ class MeshAxisName(str, Enum):
     DP = "dp"
     DP_REPLICATE = "dp_replicate"
     DP_SHARD = "dp_shard"
-    DP_SHARD_CP = "dp_shard_cp"
     DP_CP = "dp_cp"
     EP_SHARD = "ep_shard"
 

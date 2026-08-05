@@ -141,14 +141,14 @@ class FSDP2Manager:
             )
 
         mesh_dim_names = self.device_mesh.mesh_dim_names
-        if "dp_shard_cp" not in mesh_dim_names:
+        if "dp_shard" not in mesh_dim_names:
             raise ValueError(
-                "FSDP2 requires a 'dp_shard_cp' DeviceMesh dimension, "
+                "FSDP2 requires a 'dp_shard' DeviceMesh dimension, "
                 f"but got {mesh_dim_names}"
             )
         fsdp_dim_names = tuple(
             dim_name
-            for dim_name in ("dp_replicate", "dp_shard_cp")
+            for dim_name in ("dp_replicate", "dp_shard")
             if dim_name in mesh_dim_names
         )
 
