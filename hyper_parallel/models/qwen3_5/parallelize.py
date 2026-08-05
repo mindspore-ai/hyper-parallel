@@ -19,6 +19,8 @@ parameter shards on ``head`` or ``feature`` dimensions and norms on the
 sequence axis so per-step gradients stay slice-faithful to the single-card
 run.
 """
+# Qwen3.5 is currently registered as a Torch model implementation.
+# pylint: disable=forbidden-backend-import
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Optional, TYPE_CHECKING
@@ -476,9 +478,14 @@ def qwen3_5_tp_load_transforms(
     return transforms
 
 
-def _apply_linear_attention_cp(module: nn.Module, cp_mesh: DeviceMesh, mode: str) -> None:
+def _apply_linear_attention_cp(
+    module: nn.Module,
+    cp_mesh: DeviceMesh,
+    mode: str,
+    backend: str,
+) -> None:
     """Apply CP to a Qwen3.5 linear-attention module."""
-    LinearAttentionContextParallel(mode=mode).apply(module, cp_mesh)
+    LinearAttentionContextParallel(mode=mode, backend=backend).apply(module, cp_mesh)
 
 
 def _validate_qwen3_5_tp_config(model: Qwen3_5ForCausalLM, tp_world: int) -> None:
@@ -680,6 +687,7 @@ def parallelize_qwen3_5_cp(
     *,
     ulysses_degree: Optional[int] = None,
     linear_attention_cp_mode: str = "ulysses",
+    linear_attention_gdn_backend: str = "eager",
 ) -> Qwen3_5ForCausalLM:
     """Apply context parallelism across the Qwen3.5 hybrid decoder.
 
@@ -697,11 +705,11 @@ def parallelize_qwen3_5_cp(
     rank ends up with the full sequence on a head-shard and a square causal
     mask is correct again.
 
-    Linear-attention (:class:`Qwen3_5GatedDeltaNet`) layers use a matching
-    pure-Ulysses execution wrapper: project local sequence shards, all-to-all
-    the projected Q/K/V/B/A tensors to full-sequence local-head shards, run
-    the per-head conv and gated delta rule on local heads, then all-to-all the
-    result back to sequence shards before the output projection.
+    Linear-attention (:class:`Qwen3_5GatedDeltaNet`) layers select Ulysses,
+    State-P2P, or all-gather execution with ``linear_attention_cp_mode``.
+    ``linear_attention_gdn_backend`` explicitly selects the eager or Triton
+    local GDN implementation; unsupported combinations fail instead of
+    silently falling back.
     """
     # Only pure Ulysses is wired here; a smaller ``ulysses_degree`` makes each
     # rank attend over gathered K/V with ``is_causal=True`` but without a
@@ -724,12 +732,18 @@ def parallelize_qwen3_5_cp(
             cp_plan.apply(block.self_attn.sdpa_core, cp_mesh)
             full_attached += 1
         else:
-            _apply_linear_attention_cp(block.linear_attn, cp_mesh, linear_attention_cp_mode)
+            _apply_linear_attention_cp(
+                block.linear_attn,
+                cp_mesh,
+                linear_attention_cp_mode,
+                linear_attention_gdn_backend,
+            )
             linear_attached += 1
     logger.info_rank0(
         "CP applied to Qwen3.5: cp_size=%d, ulysses_degree=%s, full-attn hooks=%d, "
-        "linear-attn %s hooks=%d",
-        cp_mesh.size(), ulysses_degree, full_attached, linear_attention_cp_mode, linear_attached,
+        "linear-attn %s/%s hooks=%d",
+        cp_mesh.size(), ulysses_degree, full_attached, linear_attention_cp_mode,
+        linear_attention_gdn_backend, linear_attached,
     )
     return model
 
@@ -1292,11 +1306,17 @@ def parallelize_qwen3_5(
             "linear_attention_cp_mode",
             "ulysses",
         )
+        linear_attention_gdn_backend = getattr(
+            cfg.train.accelerator,
+            "linear_attention_gdn_backend",
+            "eager",
+        )
         parallelize_qwen3_5_cp(
             model,
             cp_mesh,
             ulysses_degree=ulysses_degree,
             linear_attention_cp_mode=linear_attention_cp_mode,
+            linear_attention_gdn_backend=linear_attention_gdn_backend,
         )
 
     if cfg.train.accelerator.ep > 1:

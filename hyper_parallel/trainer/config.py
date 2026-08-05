@@ -192,6 +192,9 @@ class AcceleratorConfig:
     reshard_after_forward: bool = True
     async_cp: bool = False
     ulysses_degree: Optional[int] = None
+    # Qwen3.5 linear-attention CP execution and local GDN implementation.
+    linear_attention_cp_mode: str = "ulysses"
+    linear_attention_gdn_backend: str = "eager"
     # Bucketed reduce-scatter: single fused RS per FSDP unit, stable fp32
     # reduction order across runs.
     comm_fusion: bool = True
@@ -499,7 +502,10 @@ def _resolve_field_type(cls: Type, dot_path: str) -> Optional[Type]:
         # Unwrap Optional[X] → X
         origin = get_origin(field_type)
         if origin is Union:
-            unwrapped = [a for a in get_args(field_type) if a is not type(None)]
+            unwrapped = [
+                a for a in get_args(field_type)
+                if a is not type(None)  # pylint: disable=unidiomatic-typecheck
+            ]
             field_type = unwrapped[0] if len(unwrapped) == 1 else field_type
         current_cls = field_type
     return current_cls
@@ -627,7 +633,10 @@ def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
         # Unwrap Optional[X] → X
         origin = get_origin(field_type)
         if origin is Union:
-            unwrapped = [a for a in get_args(field_type) if a is not type(None)]
+            unwrapped = [
+                a for a in get_args(field_type)
+                if a is not type(None)  # pylint: disable=unidiomatic-typecheck
+            ]
             if len(unwrapped) == 1:
                 field_type = unwrapped[0]
 
