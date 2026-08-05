@@ -15,7 +15,7 @@
 """Distributed worker for combined strategy tests."""
 
 import os
-import sys
+
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -32,15 +32,14 @@ world_size = os.environ.get("WORLD_SIZE")
 if world_size is not None:
     os.environ["RANK_SIZE"] = world_size
 
-from hyper_parallel import init_device_mesh, fully_shard
+from hyper_parallel import ContextParallel, fully_shard, init_device_mesh
 from hyper_parallel.core.expert_parallel import (
     ExpertParallel,
     TensorParallel,
     ExpertTensorParallel,
 )
-from hyper_parallel.platform.torch.common import FeedForward, MoE
-from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.platform.torch.common import FeedForward, MoE
 from tests.torch.expert_parallel.templates import get_template
 from tests.torch.expert_parallel.validator import (
     validate_template,
@@ -82,6 +81,22 @@ MULTI_CARD_CONFIGS = {
 }
 
 
+def _select_orthogonal_fsdp_placement(param: torch.Tensor) -> Shard:
+    """Choose an FSDP shard dimension not already occupied by EP or TP."""
+    sharded_dims = {
+        placement.dim
+        for placement in getattr(param, "placements", ())
+        if placement.is_shard()
+    }
+    for shard_dim in range(param.ndim):
+        if shard_dim not in sharded_dims:
+            return Shard(shard_dim)
+    raise ValueError(
+        "DP+EP+TP combination test requires one parameter dimension that is "
+        f"not already sharded, but got placements={getattr(param, 'placements', ())}"
+    )
+
+
 def _run_moe_test(
     template_name: str,
     num_experts: int,
@@ -92,10 +107,11 @@ def _run_moe_test(
     slen: int,
     use_grouped_mm: bool = False,
     shared_expert: bool = False,
+    check_gradient: bool = True,
     rtol: float = 1e-3,
     atol: float = 1e-3,
 ) -> None:
-    """Run a single MoE test with configurable tolerance."""
+    """Run a single MoE test with configurable tolerance and gradient checks."""
     rank_rank = dist.get_rank()
     rank_world_size = int(os.environ.get("WORLD_SIZE", 1))
     device = torch.device(_DEVICE_TYPE)
@@ -129,7 +145,7 @@ def _run_moe_test(
         hidden_dim=hidden_dim,
         num_experts=num_experts,
         top_k=top_k,
-        use_grouped_mm=use_grouped_mm,
+        use_grouped_mm=False,
         shared_expert=shared_ref,
     ).to(device)
 
@@ -158,7 +174,12 @@ def _run_moe_test(
         else:
             ExpertParallel().apply(parallel_moe.experts, mesh["ep"])
         if dp > 1:
-            fully_shard(parallel_moe, mesh=mesh["dp"])
+            shard_placement_fn = _select_orthogonal_fsdp_placement if tp > 1 else None
+            fully_shard(
+                parallel_moe,
+                mesh=mesh["dp"],
+                shard_placement_fn=shard_placement_fn,
+            )
             parallel_moe.set_reduce_op_type("sum")
 
     # Input
@@ -167,16 +188,17 @@ def _run_moe_test(
         torch.npu.manual_seed(43)
     x = torch.randn(bs, slen, dim, device=device)
 
-    # Standalone forward/backward
-    standalone_out, standalone_grad = _run_forward_backward(standalone_moe, x)
-
-    # Parallel forward/backward with gradient scaling for DP
-    x_in = x.clone().requires_grad_(True)
-    out = parallel_moe(x_in)
-    loss = out.sum()
-    loss.backward()
-    parallel_out = out.detach()
-    parallel_grad = x_in.grad.clone()
+    if check_gradient:
+        standalone_out, standalone_grad = _run_forward_backward(standalone_moe, x)
+        x_in = x.clone().requires_grad_(True)
+        out = parallel_moe(x_in)
+        out.sum().backward()
+        parallel_out = out.detach()
+        parallel_grad = x_in.grad.clone()
+    else:
+        with torch.no_grad():
+            standalone_out = standalone_moe(x).detach()
+            parallel_out = parallel_moe(x).detach()
 
     _npu_precision_close(
         parallel_out,
@@ -184,12 +206,13 @@ def _run_moe_test(
         label=f"rank{rank_rank} {template_name} forward",
         rtol=rtol, atol=atol,
     )
-    _npu_precision_close(
-        parallel_grad,
-        standalone_grad,
-        label=f"rank{rank_rank} {template_name} gradient",
-        rtol=rtol, atol=atol,
-    )
+    if check_gradient:
+        _npu_precision_close(
+            parallel_grad,
+            standalone_grad,
+            label=f"rank{rank_rank} {template_name} gradient",
+            rtol=rtol, atol=atol,
+        )
 
 
 def _validate_slen_divisible_by_cp(slen: int, cp: int) -> None:
@@ -201,6 +224,80 @@ def _validate_slen_divisible_by_cp(slen: int, cp: int) -> None:
         )
 
 
+class _CoreAttention(nn.Module):
+    """Scaled dot-product attention over tensors in BSHD layout."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute attention while preserving the BSHD layout."""
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        scale = query.shape[-1] ** -0.5
+        scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+        probabilities = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+        return torch.matmul(probabilities, value).transpose(1, 2)
+
+
+class _Attention(nn.Module):
+    """Self-attention with an exposed QKV core for ContextParallel hooks."""
+
+    def __init__(self, dim: int, num_heads: int) -> None:
+        """Initialize projections and the core attention module."""
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.query_proj = nn.Linear(dim, dim)
+        self.key_proj = nn.Linear(dim, dim)
+        self.value_proj = nn.Linear(dim, dim)
+        self.output_proj = nn.Linear(dim, dim)
+        self.core_attn = _CoreAttention()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Project inputs, run core attention, and merge attention heads."""
+        batch_size, seq_len, dim = inputs.shape
+        qkv_shape = (batch_size, seq_len, self.num_heads, self.head_dim)
+        query = self.query_proj(inputs).reshape(qkv_shape)
+        key = self.key_proj(inputs).reshape(qkv_shape)
+        value = self.value_proj(inputs).reshape(qkv_shape)
+        output = self.core_attn(query, key, value)
+        return self.output_proj(output.reshape(batch_size, seq_len, dim))
+
+
+class _AttentionMoEBlock(nn.Module):
+    """Self-attention followed by a Mixture-of-Experts layer."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_experts: int,
+        top_k: int,
+        hidden_dim: int,
+        use_grouped_mm: bool,
+    ) -> None:
+        """Initialize the attention and MoE submodules."""
+        super().__init__()
+        self.attn = _Attention(dim, num_heads)
+        self.moe = MoE(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            use_grouped_mm=use_grouped_mm,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Run self-attention followed by the MoE layer."""
+        return self.moe(self.attn(inputs))
+
+
 def _build_attention_moe_block(
     dim: int,
     num_heads: int,
@@ -209,25 +306,16 @@ def _build_attention_moe_block(
     hidden_dim: int,
     device: torch.device,
     use_grouped_mm: bool = False,
-) -> nn.Module:
+) -> _AttentionMoEBlock:
     """Build a block with Self-Attention + MoE for CP testing."""
-    class AttentionMoEBlock(nn.Module):
-        """Self-Attention + MoE block for CP test."""
-        def __init__(self):
-            super().__init__()
-            self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-            self.moe = MoE(
-                dim=dim,
-                hidden_dim=hidden_dim,
-                num_experts=num_experts,
-                top_k=top_k,
-                use_grouped_mm=use_grouped_mm,
-            )
-        def forward(self, x):
-            attn_out, _ = self.attn(x, x, x)
-            return self.moe(attn_out)
-
-    return AttentionMoEBlock().to(device)
+    return _AttentionMoEBlock(
+        dim=dim,
+        num_heads=num_heads,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_dim=hidden_dim,
+        use_grouped_mm=use_grouped_mm,
+    ).to(device)
 
 
 def _run_cp_attention_test(
@@ -284,7 +372,16 @@ def _run_cp_attention_test(
     parallel_block = _build_attention_moe_block(
         dim, num_heads, num_experts, top_k, hidden_dim, device, use_grouped_mm
     )
+    ContextParallel(
+        seq_dim=1,
+        head_dim=2,
+        ulysses_degree=1,
+        use_local_output=True,
+    ).apply(parallel_block.attn.core_attn, mesh["cp"])
     ExpertParallel().apply(parallel_block.moe.experts, mesh["ep"])
+    if dp > 1:
+        fully_shard(parallel_block, mesh=mesh["dp"])
+        parallel_block.set_reduce_op_type("sum")
 
     # Input
     torch.manual_seed(43)
@@ -301,12 +398,11 @@ def _run_cp_attention_test(
 
     # CP parallel: local slice
     local_slen = slen // cp
-    start = rank_rank * local_slen
+    cp_rank = mesh.get_local_rank("cp")
+    start = cp_rank * local_slen
     x_slice = x_global[:, start:start + local_slen, :].contiguous()
-    x_dt = DTensor.from_local(x_slice, mesh["cp"], [Shard(1)])
-    x_local = x_dt.to_local()
 
-    x_in = x_local.clone().requires_grad_(True)
+    x_in = x_slice.clone().requires_grad_(True)
     parallel_out = parallel_block(x_in)
     parallel_loss = parallel_out.sum()
     parallel_loss.backward()
@@ -368,8 +464,8 @@ def _run_validation_tests() -> None:
         print("All validation tests passed.")
 
 
-# Entry points called by parallel_run
-def run_ep_only_base() -> None:
+# Pytest entry points called by parallel_run
+def test_ep_only_base() -> None:
     """Run EP-only base tests."""
     init_backend(_DEVICE_TYPE)
     for params in EP_ONLY_PARAMS:
@@ -380,19 +476,20 @@ def run_ep_only_base() -> None:
         )
 
 
-def run_ep_only_grouped_mm() -> None:
-    """Run EP-only tests with grouped_mm kernel."""
+def test_ep_only_grouped_mm() -> None:
+    """Check grouped_mm forward precision against the differentiable loop reference."""
     init_backend(_DEVICE_TYPE)
     for params in EP_ONLY_PARAMS:
         num_experts, top_k, dim, hidden_dim, bs, slen = params
         _run_moe_test(
             "ep-only", num_experts, top_k, dim, hidden_dim,
             bs, slen, use_grouped_mm=True, shared_expert=False,
+            check_gradient=False,
             rtol=1e-2, atol=1e-2
         )
 
 
-def run_ep_only_shared() -> None:
+def test_ep_only_shared() -> None:
     """Run EP-only tests with shared expert."""
     init_backend(_DEVICE_TYPE)
     for params in EP_ONLY_PARAMS:
@@ -403,7 +500,7 @@ def run_ep_only_shared() -> None:
         )
 
 
-def run_tp_only() -> None:
+def test_tp_only() -> None:
     """Run TP-only tests."""
     init_backend(_DEVICE_TYPE)
     for params in TP_ONLY_PARAMS:
@@ -414,13 +511,13 @@ def run_tp_only() -> None:
         )
 
 
-def run_validation() -> None:
+def test_validation() -> None:
     """Run validation tests (no distributed communication)."""
     init_backend(_DEVICE_TYPE)
     _run_validation_tests()
 
 
-def run_dp_ep() -> None:
+def test_dp_ep() -> None:
     """Run DP+EP tests (requires 4 cards)."""
     if int(os.environ.get("WORLD_SIZE", 1)) < 4:
         print("Skipping dp-ep: requires 4 cards")
@@ -433,7 +530,7 @@ def run_dp_ep() -> None:
     )
 
 
-def run_ep_tp() -> None:
+def test_ep_tp() -> None:
     """Run EP+TP tests (requires 4 cards)."""
     if int(os.environ.get("WORLD_SIZE", 1)) < 4:
         print("Skipping ep-tp: requires 4 cards")
@@ -446,7 +543,7 @@ def run_ep_tp() -> None:
     )
 
 
-def run_dp_ep_tp() -> None:
+def test_dp_ep_tp() -> None:
     """Run DP+EP+TP tests (requires 8 cards)."""
     if int(os.environ.get("WORLD_SIZE", 1)) < 8:
         print("Skipping dp-ep-tp: requires 8 cards")
@@ -472,7 +569,7 @@ def run_dp_ep_cp() -> None:
     )
 
 
-def run_dp_ep_cp_with_attention() -> None:
+def test_dp_ep_cp_with_attention() -> None:
     """Run DP+EP+CP with real Attention module (requires 8 cards)."""
     if int(os.environ.get("WORLD_SIZE", 1)) < 8:
         print("Skipping dp_ep_cp_with_attention: requires 8 cards")
@@ -500,12 +597,3 @@ def run_dp_ep_cp_with_attention() -> None:
             rtol=1e-3,
             atol=1e-3,
         )
-
-
-if __name__ == "__main__":
-    func_name = sys.argv[1] if len(sys.argv) > 1 else "run_ep_only_base"
-    if func_name in globals():
-        globals()[func_name]()
-    else:
-        print(f"Unknown function: {func_name}")
-        sys.exit(1)

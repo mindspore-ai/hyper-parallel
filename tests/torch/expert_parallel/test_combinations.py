@@ -28,8 +28,21 @@ _WORKER = str(Path(__file__).resolve().parent / "_test_combinations.py")
 # These ports are chosen to avoid conflicts with other test modules.
 
 
-def _run_group(*cases):
-    """Launch a group of worker cases with parallel_run."""
+def _run_group(*cases: tuple[str, int, int]) -> None:
+    """Launch a group of worker cases with parallel_run.
+
+    Args:
+        cases: Worker test name, rendezvous port, and process-count tuples.
+
+    Raises:
+        ValueError: If a worker name cannot be collected as a pytest test.
+    """
+    invalid_case_names = [case_name for case_name, _, _ in cases if not case_name.startswith("test_")]
+    if invalid_case_names:
+        raise ValueError(
+            "Worker case names must be pytest-collectable test functions, "
+            f"but got {invalid_case_names}"
+        )
     parallel_run([
         TorchCase(_WORKER, case_name, master_port, num_proc)
         for case_name, master_port, num_proc in cases
@@ -42,11 +55,12 @@ def _run_group(*cases):
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_2card_group1():
+def test_2card_group1() -> None:
+    """Run the 2-card EP-only combination cases."""
     _run_group(
-        ("run_ep_only_base", 10620, 2),
-        ("run_ep_only_grouped_mm", 10621, 2),
-        ("run_ep_only_shared", 10622, 2),
+        ("test_ep_only_base", 10620, 2),
+        ("test_ep_only_grouped_mm", 10621, 2),
+        ("test_ep_only_shared", 10622, 2),
     )
 
 
@@ -56,10 +70,11 @@ def test_2card_group1():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_2card_group2():
+def test_2card_group2() -> None:
+    """Run the 2-card TP and validation cases."""
     _run_group(
-        ("run_tp_only", 10623, 2),
-        ("run_validation", 10624, 2),
+        ("test_tp_only", 10623, 2),
+        ("test_validation", 10624, 2),
     )
 
 
@@ -69,10 +84,11 @@ def test_2card_group2():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_4card_group():
+def test_4card_group() -> None:
+    """Run the 4-card DP+EP and EP+TP cases."""
     _run_group(
-        ("run_dp_ep", 10625, 4),
-        ("run_ep_tp", 10626, 4),
+        ("test_dp_ep", 10625, 4),
+        ("test_ep_tp", 10626, 4),
     )
 
 
@@ -82,9 +98,10 @@ def test_4card_group():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_8card_1():
+def test_8card_1() -> None:
+    """Run the 8-card DP+EP+TP case."""
     _run_group(
-        ("run_dp_ep_tp", 10627, 8),
+        ("test_dp_ep_tp", 10627, 8),
     )
 
 
@@ -94,7 +111,8 @@ def test_8card_1():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_8card_2():
+def test_8card_2() -> None:
+    """Run the 8-card DP+EP+CP attention case."""
     _run_group(
-        ("run_dp_ep_cp_with_attention", 10628, 8),
+        ("test_dp_ep_cp_with_attention", 10628, 8),
     )
