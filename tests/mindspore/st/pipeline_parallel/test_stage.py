@@ -12,52 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for MindSpore pipeline stage integration with forward_and_gradfn."""
-# pylint: disable=wrong-import-position
-import os
+"""Thin pytest entry (lazy-import). Impl: ``tests.mindspore.st.pipeline_parallel._stage_impl``."""
+from __future__ import annotations
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+import importlib
 
-import numpy as np
-import mindspore as ms
-from mindspore import Tensor, Parameter, nn, ops
+from tests.common.mark_utils import arg_mark  # noqa: F401
 
-from hyper_parallel.core.pipeline_parallel.stage import PipelineStage
-from tests.common.mark_utils import arg_mark
+_IMPL = "tests.mindspore.st.pipeline_parallel._stage_impl"
 
 
-class CountNet(nn.Cell):
-    """Minimal network that counts how many forwards actually happen."""
-
-    def __init__(self):
-        super().__init__()
-        self.w = Parameter(Tensor(np.array([[2.0]], np.float32)), name="w")
-        self.forward_calls = 0
-
-    def construct(self, x):
-        self.forward_calls += 1
-        return ops.matmul(x, self.w)
+def _run(name: str):
+    # pylint: disable=C0415
+    return getattr(importlib.import_module(_IMPL), name)()
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_pipeline_stage_backward_reuses_forward_and_gradfn_result():
-    """
-    Feature: pipeline stage backward integration.
-    Description: backward_one_chunk should reuse the grad_fn created during forward_one_chunk.
-    Expectation: The stage runs forward only once and parameter grad is materialized correctly.
-    """
-    ms.set_context(mode=ms.PYNATIVE_MODE)
-
-    net = CountNet()
-    stage = PipelineStage(net, stage_index=0, stage_num=1, has_backward=True)
-    x = Tensor(np.array([[3.0]], np.float32))
-
-    out = stage.forward_one_chunk(0, args=(x,), kwargs={})
-    np.testing.assert_allclose(out.asnumpy(), np.array([[6.0]], dtype=np.float32))
-    assert net.forward_calls == 1
-
-    stage.backward_one_chunk(0)
-
-    assert net.forward_calls == 1
-    assert net.w.grad is not None
-    np.testing.assert_allclose(net.w.grad.asnumpy(), np.array([[3.0]], dtype=np.float32))
+    """See impl ``test_pipeline_stage_backward_reuses_forward_and_gradfn_result``."""
+    return _run("test_pipeline_stage_backward_reuses_forward_and_gradfn_result")

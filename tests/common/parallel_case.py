@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""parallel run case"""
+"""Cross-platform wrappers that spawn ``torchrun`` / ``msrun`` ST workers.
+
+Like :mod:`tests.common.distributed_launcher`, this module must stay free of
+``torch`` / ``mindspore`` / ``hyper_parallel`` imports so pytest parent
+launchers only pay the cost of forking the distributed runner. Worker bodies
+live in non-launcher modules and import frameworks as usual.
+"""
 import os
 import signal
 import multiprocessing as mp
