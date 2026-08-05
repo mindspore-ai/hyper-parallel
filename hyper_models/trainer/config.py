@@ -15,7 +15,7 @@
 """Typed configuration tree produced by the HyperModels YAML resolver."""
 
 import inspect
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Callable, Generic, Literal, Optional, TypeVar
 
 from torch.optim import Optimizer
@@ -23,6 +23,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedTokenizerBase
 
 from hyper_models.components.checkpoint.config import CheckpointingConfig
+from hyper_models.components.distributed.config import FSDP2Config
 
 
 @dataclass
@@ -42,26 +43,15 @@ class TrainingConfig:
 
 
 @dataclass
-class FSDPConfig:
-    """FSDP runtime behavior used by the Trainer micro-batch loop."""
-
-    fsdp_mode: Literal["fsdp2"] = "fsdp2"
-    reshard_after_backward: bool = False
-
-
-@dataclass
 class AcceleratorConfig:
-    """Parallel topology exposed by the initial YAML schema."""
+    """Parallel topology and target-selected strategy configurations."""
 
-    dp_shard_size: int = 1
-    dp_replicate_size: int = 1
     tp_size: int = 1
     cp_size: int = 1
     ep_size: int = 1
     pp_size: int = 1
     sequence_parallel: bool = False
     loss_parallel: bool = False
-    fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
 
 
 @dataclass
@@ -104,7 +94,12 @@ def _serialize_config_value(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return value.to_dict()
     if is_dataclass(value):
-        return asdict(value)
+        return {
+            config_field.name: _serialize_config_value(
+                getattr(value, config_field.name)
+            )
+            for config_field in fields(value)
+        }
     if isinstance(value, dict):
         return {
             key: _serialize_config_value(item)
@@ -191,6 +186,8 @@ class TrainerConfig:
 
     # parallelism configs
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
+    fsdp_config: FSDP2Config = field(default_factory=FSDP2Config)
+    plan_overhead: Optional[Target[Any]] = None
     mixed_precision: MixedPrecisionConfig = field(
         default_factory=MixedPrecisionConfig
     )
@@ -233,7 +230,7 @@ def save_configs(config: TrainerConfig, output_dir: str) -> None:
 __all__ = [
     "AcceleratorConfig",
     "DebugConfig",
-    "FSDPConfig",
+    "FSDP2Config",
     "GradientCheckpointingConfig",
     "MixedPrecisionConfig",
     "Target",

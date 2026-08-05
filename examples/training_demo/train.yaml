@@ -27,14 +27,24 @@ training:
   enable_full_determinism: false
 
 accelerator:
-  dp_shard_size: 2
-  dp_replicate_size: 1
   tp_size: 2
   cp_size: 1
   ep_size: 1
   pp_size: 1
   sequence_parallel: false
   loss_parallel: false
+
+fsdp_config:    
+  dp_shard_size: 2
+  replicate_params: []
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: true
+
+# plan_overhead:
+#   match: "*.self_attn"
+#   local_compute_fn:
+#     _target_: hyper_models.components.distributed.plan_overhead.PlanOverhead
+
 
 mixed_precision:
   enabled: false

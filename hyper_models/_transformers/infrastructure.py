@@ -27,7 +27,6 @@ import torch.nn as nn
 from hyper_models.components.distributed.fsdp2 import FSDP2Manager, _instantiate_fsdp2
 from hyper_models.components.distributed.pipelining import _instantiate_pipeline
 from hyper_models.components.distributed.sharding_planner import ShardingPlanner
-from hyper_models.components.distributed.config import _resolve_strategy_config
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +51,6 @@ def instantiate_infrastructure(
     mesh = getattr(distributed_setup, "mesh_context", None)
     strategy_cfg = getattr(distributed_setup, "strategy_config", None)
     if strategy_cfg is not None:
-        fsdp2_manager = _instantiate_fsdp2(config=strategy_cfg, mesh_context=mesh)
-    elif kwargs.get("strategy") is not None:
-        strategy_cfg = _resolve_strategy_config(kwargs["strategy"])
         fsdp2_manager = _instantiate_fsdp2(config=strategy_cfg, mesh_context=mesh)
 
     if fsdp2_manager is None:
