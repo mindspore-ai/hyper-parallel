@@ -338,6 +338,22 @@ class TestPureDataclassResolution(unittest.TestCase):
 
         self.assertIsNone(config.training.max_steps)
 
+    def test_fsdp_config_resolves_shard_size_and_replicated_parameter_fqns(self):
+        config = resolve_root(
+            _root(
+                fsdp_config={
+                    "dp_shard_size": 4,
+                    "replicate_params": ["model.embed_tokens.weight"],
+                }
+            )
+        )
+
+        self.assertEqual(config.fsdp_config.dp_shard_size, 4)
+        self.assertEqual(
+            config.fsdp_config.replicate_params,
+            ["model.embed_tokens.weight"],
+        )
+
 
 class TestTypedOverrides(unittest.TestCase):
     """Dotted CLI overrides update selected target kwargs and dataclass fields."""

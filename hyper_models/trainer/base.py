@@ -592,8 +592,7 @@ class BaseTrainer(Stateful, ABC):
         """Reshard model after backward pass."""
         config: TrainerConfig = self.config
         if (
-            config.accelerator.fsdp_config.fsdp_mode == "fsdp2"
-            and not config.accelerator.fsdp_config.reshard_after_backward
+            config.fsdp_config.reshard_after_backward is False
             and num_micro_steps > 1
         ):
             if micro_step == 0:
@@ -606,11 +605,11 @@ class BaseTrainer(Stateful, ABC):
     def _configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int):
         config: TrainerConfig = self.config
         if (
-            config.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            config.fsdp_config.dp_shard_size > 1
             and num_micro_steps > 1
         ):
             is_last_micro_batch = micro_step == num_micro_steps - 1
-            is_hsdp = config.accelerator.dp_replicate_size > 1
+            is_hsdp = self.mesh.dp_replicate_size > 1
             for model_part in self.hsdp_model_parts:
                 model_part.set_requires_gradient_sync(is_last_micro_batch)
                 model_part.set_is_last_backward(is_last_micro_batch)

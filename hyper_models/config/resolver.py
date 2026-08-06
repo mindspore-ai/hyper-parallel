@@ -257,9 +257,9 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
         raise _fail(path, f"could not resolve configuration type annotations: {exc}") from exc
 
     resolved = {
-        name: coerce_value(
+        name: resolve_component(
             value,
-            hints[name],
+            expected_type=hints[name],
             path=f"{path}.{name}",
         )
         for name, value in node.items()
