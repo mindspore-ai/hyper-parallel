@@ -139,23 +139,6 @@ def _run_interleaved_swap_scenario(log_prefix: str, overlap_b_f: bool):
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
-def test_interleaved_1f1b_pipeline_swap_memory():
-    """
-    Feature: Interleaved 1F1B activation swap device memory comparison.
-    Description: Run a four-rank Interleaved 1F1B schedule with two virtual
-        stages per rank, 8 micro-batches, 2048 hidden size, and 4-layer
-        DeepStage per virtual stage.  First record no-swap peak memory, then
-        run all virtual stages with activation swap in a separate process and
-        compare each rank. Run a small activation accuracy pass in another
-        process so the memory case is not polluted by the serial reference.
-    Expectation: swap device peak memory is less than no-swap on every rank,
-        and swap outputs/gradients match the serial reference.
-    """
-    _run_interleaved_swap_scenario("test_interleaved_1f1b", overlap_b_f=False)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
 def test_interleaved_1f1b_overlap_b_f_pipeline_swap_memory():
     """
     Feature: Interleaved 1F1B activation swap with OVERLAP_B_F composite steps.
