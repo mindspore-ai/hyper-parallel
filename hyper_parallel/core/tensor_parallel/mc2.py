@@ -87,6 +87,36 @@ def _require_torch_npu():
     return torch_npu
 
 
+def _normalize_sequence_dim(sequence_dim: int, ndim_leading: int) -> int:
+    """Resolve a possibly-negative sequence dim against leading-rank count."""
+    seq_dim = sequence_dim
+    if seq_dim < 0:
+        seq_dim += ndim_leading
+    if seq_dim < 0 or seq_dim >= ndim_leading:
+        raise RuntimeError(
+            f"MC2Linear sequence_dim={sequence_dim} is out of range "
+            f"for leading rank {ndim_leading}."
+        )
+    return seq_dim
+
+
+def _move_dim_to_front(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    """Permute ``dim`` to axis 0 so fused AG/RS on flattened dim-0 is SP-correct."""
+    if dim == 0:
+        return tensor
+    order = (dim,) + tuple(i for i in range(tensor.dim()) if i != dim)
+    return tensor.permute(*order).contiguous()
+
+
+def _move_front_to_dim(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    """Inverse of :func:`_move_dim_to_front`."""
+    if dim == 0:
+        return tensor
+    # front -> dim: [1..dim] + [0] + [dim+1..]
+    order = tuple(range(1, dim + 1)) + (0,) + tuple(range(dim + 1, tensor.dim()))
+    return tensor.permute(*order).contiguous()
+
+
 class AllGatherMatmulFunction(platform.Function):
     """Column-parallel fused all-gather + matmul with custom backward.
 
@@ -229,11 +259,23 @@ class MC2Linear(nn.Linear):
         return linear
 
     def _mc2_forward(self, input_: DTensor, weight: DTensor) -> DTensor:
-        """Run the configured fused kernel on local tensors."""
+        """Run the configured fused kernel on local tensors.
+
+        Ascend MC2 kernels all-gather / reduce-scatter the **flattened dim-0**
+        of a 2-D activation. That is only layout-correct when the SP sequence
+        axis is the outermost leading dim. For ``sequence_dim != 0`` (e.g.
+        batch-first ``[B, S, H]`` with ``Shard(1)``), move the sequence dim to
+        front before flatten, then restore after the fused op.
+        """
         input_local = input_.to_local()
         weight_local = weight.to_local()
         leading_global = tuple(int(s) for s in input_.shape[:-1])
-        input_2d = input_local.reshape(-1, input_local.shape[-1])
+        seq_dim = _normalize_sequence_dim(self.mc2_sequence_dim, len(leading_global))
+
+        # [..., S_local_or_full, ..., H] -> [S_*, *other_leading, H] -> 2-D
+        x_seq_first = _move_dim_to_front(input_local, seq_dim)
+        other_leading = tuple(x_seq_first.shape[1:-1])
+        input_2d = x_seq_first.reshape(-1, x_seq_first.shape[-1])
 
         bias_local = None
         if self.bias is not None:
@@ -248,10 +290,19 @@ class MC2Linear(nn.Linear):
                 self.mc2_world_size,
                 bias_local,
             )
-            # After AG on flattened leading dims, reshape with global leading shape.
-            output = output_2d.reshape(*leading_global, output_2d.shape[-1])
+            # AG expands the sequence dim; other leading dims stay local sizes.
+            seq_global = leading_global[seq_dim]
+            output = output_2d.reshape(seq_global, *other_leading, output_2d.shape[-1])
+            output = _move_front_to_dim(output, seq_dim)
             return DTensor.from_local(output, input_.device_mesh, (Shard(-1),))
 
+        seq_global = leading_global[seq_dim]
+        if seq_global % self.mc2_world_size != 0:
+            raise RuntimeError(
+                f"MC2Linear reduce_scatter requires sequence dim {seq_dim} "
+                f"(size {seq_global}) divisible by world_size "
+                f"{self.mc2_world_size}."
+            )
         output_2d = MatmulReduceScatterFunction.apply(
             input_2d,
             weight_local,
@@ -259,23 +310,9 @@ class MC2Linear(nn.Linear):
             self.mc2_world_size,
             bias_local,
         )
-        leading_local = list(leading_global)
-        seq_dim = self.mc2_sequence_dim
-        if seq_dim < 0:
-            seq_dim += len(leading_local)
-        if seq_dim < 0 or seq_dim >= len(leading_local):
-            raise RuntimeError(
-                f"MC2Linear sequence_dim={self.mc2_sequence_dim} is out of range "
-                f"for input rank {input_.dim()}."
-            )
-        if leading_local[seq_dim] % self.mc2_world_size != 0:
-            raise RuntimeError(
-                f"MC2Linear reduce_scatter requires sequence dim {seq_dim} "
-                f"(size {leading_local[seq_dim]}) divisible by world_size "
-                f"{self.mc2_world_size}."
-            )
-        leading_local[seq_dim] = leading_local[seq_dim] // self.mc2_world_size
-        output = output_2d.reshape(*leading_local, output_2d.shape[-1])
+        seq_local = seq_global // self.mc2_world_size
+        output = output_2d.reshape(seq_local, *other_leading, output_2d.shape[-1])
+        output = _move_front_to_dim(output, seq_dim)
         return DTensor.from_local(output, input_.device_mesh, (Shard(seq_dim),))
 
     def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
