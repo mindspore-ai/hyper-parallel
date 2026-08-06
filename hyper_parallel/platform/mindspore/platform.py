@@ -176,6 +176,40 @@ def _mindspore_reduce_scatter_single(
     return normalized_output, handle
 
 
+def _mindspore_p2p_exchange(tensor: Tensor, peer_rank: int, group=None) -> Tensor:
+    """Synchronously exchange one tensor with ``peer_rank``.
+
+    The send and receive are submitted as one batched HCCL operation so paired
+    ranks cannot deadlock by both entering a blocking send first.
+    """
+    recv_tensor = mint.empty_like(tensor)
+    p2p_ops = [
+        dist.P2POp("isend", tensor.contiguous(), peer_rank, group),
+        dist.P2POp("irecv", recv_tensor, peer_rank, group),
+    ]
+    handles = dist.batch_isend_irecv(p2p_ops)
+    for handle in handles:
+        handle.wait()
+    return recv_tensor
+
+
+class _MSP2PExchangeFunction(_Function):
+    """Autograd-safe symmetric peer exchange used by CP load balancing."""
+
+    @staticmethod
+    def forward(ctx, tensor, peer_rank, group):
+        ctx.peer_rank = peer_rank
+        ctx.group = group
+        return _mindspore_p2p_exchange(tensor, peer_rank, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = _mindspore_p2p_exchange(
+            grad_output.contiguous(), ctx.peer_rank, ctx.group
+        )
+        return grad_input, None, None
+
+
 class AsyncCollectiveTensor(Tensor):
     """MindSpore Tensor subclass that defers ``CommHandle.wait()`` to
     the first op that reads it.
@@ -1239,9 +1273,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):  # pylint: disable=unused-argument
-        raise NotImplementedError(
-            "p2p_exchange is not yet supported on the MindSpore platform."
-        )
+        return _MSP2PExchangeFunction.apply(tensor, peer_rank, group)
 
     @staticmethod
     def send_object_list(obj_list, dst=None, group=None):

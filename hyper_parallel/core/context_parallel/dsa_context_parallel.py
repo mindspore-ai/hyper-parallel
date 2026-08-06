@@ -43,6 +43,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import PlatformType
 
 platform = get_platform()
 Module = platform.Module
@@ -51,6 +52,58 @@ Module = platform.Module
 _SUPPORTED_LAYOUTS = ("BSND", "TND")
 _SUPPORTED_LOSS_VARIANTS = ("sparse", "dense")
 _DEFAULT_ARG_INDEX = object()
+
+
+def _local_tensor(value: Any) -> Any:
+    """Return the local tensor payload while preserving autograd edges."""
+    return value.to_local() if isinstance(value, DTensor) else value
+
+
+def _half_tensor(value: Any, seq_dim: int, tail: bool) -> Any:
+    """Select the head or tail half of a query-side tensor."""
+    if not _is_tensor_or_dtensor(value):
+        return value
+    value = _local_tensor(value)
+    half = value.shape[seq_dim] // 2
+    if value.shape[seq_dim] != 2 * half:
+        raise ValueError(
+            f"DSA CP load balance requires an even local sequence length, got {value.shape[seq_dim]}."
+        )
+    return value.narrow(seq_dim, half if tail else 0, half)
+
+
+def _exchange_tensor(value: Any, peer_rank: int) -> Any:
+    """Exchange one optional query-side tensor with the mirror CP rank."""
+    if not _is_tensor_or_dtensor(value):
+        return value
+    return platform.p2p_exchange(_local_tensor(value).contiguous(), peer_rank)
+
+
+def _cat_query_halves(head: Any, tail: Any, seq_dim: int) -> Any:
+    """Concatenate optional head/tail query outputs in original token order."""
+    if head is None:
+        return None
+    return platform.cat([_local_tensor(head), _local_tensor(tail)], dim=seq_dim)
+
+
+def _run_dense_indexer_subcall(original_forward, split_id: int, split_num: int, args, kwargs):
+    """Run one dense-indexer kernel with a logical 2*CP query position."""
+    from hyper_parallel.core.shard.ops.parallel_npu_dense_lightning_indexer_softmax_lse import (  # pylint: disable=import-outside-toplevel
+        _set_dense_indexer_cp_override,
+        _clear_dense_indexer_cp_override,
+    )
+    _set_dense_indexer_cp_override(split_id, split_num)
+    try:
+        return original_forward(*args, **kwargs)
+    finally:
+        _clear_dense_indexer_cp_override()
+
+
+def _replace_module_forward(module: Module, wrapper_factory) -> None:
+    """Replace ``construct`` on MindSpore and ``forward`` on PyTorch."""
+    method_name = "construct" if platform.platform_type == PlatformType.MINDSPORE else "forward"
+    original_forward = getattr(module, method_name)
+    setattr(module, method_name, wrapper_factory(original_forward))
 
 
 def _is_tensor_or_dtensor(value: Any) -> bool:
@@ -311,6 +364,7 @@ class DSAIndexerContextParallel(ParallelStyle):
             key_kwarg_name: Optional[str] = None,
             weights_kwarg_name: Optional[str] = None,
             use_local_output: bool = False,
+            load_balance: bool = False,
     ) -> None:
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
@@ -324,13 +378,70 @@ class DSAIndexerContextParallel(ParallelStyle):
         self.key_kwarg_name = key_kwarg_name
         self.weights_kwarg_name = weights_kwarg_name
         self.use_local_output = use_local_output
+        self.load_balance = load_balance
+        self.stats_seq_dim = _query_stats_seq_dim(layout)
+        if self.load_balance and self.layout != "BSND":
+            raise NotImplementedError("DSA indexer CP load balance currently supports BSND only.")
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"layout={self.layout!r}, mode={self.mode!r}, "
-            f"use_local_output={self.use_local_output})"
+            f"use_local_output={self.use_local_output}, load_balance={self.load_balance})"
         )
+
+    def _apply_load_balance(self, module: Module, cp_mesh: DeviceMesh) -> Module:
+        """Replace dense indexer forward with mirror-rank head-tail execution."""
+        rank_list = list(cp_mesh.rank_list)
+        local_idx = rank_list.index(platform.get_rank())
+        target_idx = len(rank_list) - 1 - local_idx
+        peer_rank = rank_list[target_idx]
+        ws = len(rank_list)
+
+        def _wrapper(original_forward):
+            def _balanced_forward(*args, **kwargs):
+                new_args = list(args)
+                query = _read_value(new_args, kwargs, self.query_index, self.query_kwarg_name)
+                key = _read_value(new_args, kwargs, self.key_index, self.key_kwarg_name)
+                weights = _read_value(new_args, kwargs, self.weights_index, self.weights_kwarg_name)
+                q_keep = _half_tensor(query, self.seq_dim, tail=False)
+                q_peer = _exchange_tensor(_half_tensor(query, self.seq_dim, tail=True), peer_rank)
+                w_keep = _half_tensor(weights, self.seq_dim, tail=False)
+                w_peer = _exchange_tensor(_half_tensor(weights, self.seq_dim, tail=True), peer_rank)
+                key_full = _to_sequence_replicate(key, cp_mesh, self.seq_dim)
+
+                def _subcall(q_half, w_half, logical_split):
+                    sub_args = list(new_args)
+                    sub_kwargs = dict(kwargs)
+                    replacements = (
+                        (self.query_index, self.query_kwarg_name,
+                         _to_sequence_shard(q_half, cp_mesh, self.seq_dim)),
+                        (self.key_index, self.key_kwarg_name, key_full),
+                        (self.weights_index, self.weights_kwarg_name,
+                         _to_sequence_shard(w_half, cp_mesh, self.seq_dim)),
+                    )
+                    for index, name, value in replacements:
+                        _maybe_replace_arg(sub_args, index, lambda _old, value=value: value)
+                        _maybe_replace_kwarg(sub_kwargs, name, lambda _old, value=value: value)
+                    return _run_dense_indexer_subcall(
+                        original_forward, logical_split, 2 * ws, tuple(sub_args), sub_kwargs
+                    )
+
+                out_keep = _subcall(q_keep, w_keep, 2 * local_idx)
+                out_peer = _subcall(q_peer, w_peer, 2 * target_idx + 1)
+                max_tail = _exchange_tensor(out_peer[2], peer_rank)
+                sum_tail = _exchange_tensor(out_peer[3], peer_rank)
+                return (
+                    None,
+                    None,
+                    _cat_query_halves(out_keep[2], max_tail, self.stats_seq_dim),
+                    _cat_query_halves(out_keep[3], sum_tail, self.stats_seq_dim),
+                )
+
+            return _balanced_forward
+
+        _replace_module_forward(module, _wrapper)
+        return module
 
     def _shard_query_side(self, value: Any, device_mesh: DeviceMesh) -> Any:
         return _to_sequence_shard(value, device_mesh, self.seq_dim)
@@ -369,6 +480,8 @@ class DSAIndexerContextParallel(ParallelStyle):
     def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
         """Register DSA indexer CP hooks on ``module`` and return it."""
         cp_mesh = _ensure_1d(device_mesh)
+        if self.load_balance:
+            return self._apply_load_balance(module, cp_mesh)
         specs = self._build_specs(
             cp_mesh,
             key_fn=lambda value: self._replicate_key_side(value, cp_mesh),
@@ -491,6 +604,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
             query_rope_kwarg_name: Optional[str] = None,
             key_rope_kwarg_name: Optional[str] = None,
             use_local_output: bool = False,
+            load_balance: bool = False,
     ) -> None:
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
@@ -526,14 +640,91 @@ class DSAIndexerLossContextParallel(ParallelStyle):
         self.query_rope_kwarg_name = query_rope_kwarg_name
         self.key_rope_kwarg_name = key_rope_kwarg_name
         self.use_local_output = use_local_output
+        self.load_balance = load_balance
+        if self.load_balance and (self.layout != "BSND" or self.loss_variant != "dense"):
+            raise NotImplementedError(
+                "DSA indexer-loss CP load balance currently supports dense BSND only."
+            )
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"layout={self.layout!r}, mode={self.mode!r}, "
             f"loss_variant={self.loss_variant!r}, "
-            f"use_local_output={self.use_local_output})"
+            f"use_local_output={self.use_local_output}, load_balance={self.load_balance})"
         )
+
+    def _apply_load_balance(self, module: Module, cp_mesh: DeviceMesh) -> Module:
+        """Replace dense KL forward with mirror-rank head-tail execution."""
+        rank_list = list(cp_mesh.rank_list)
+        local_idx = rank_list.index(platform.get_rank())
+        target_idx = len(rank_list) - 1 - local_idx
+        peer_rank = rank_list[target_idx]
+        ws = len(rank_list)
+        query_specs = (
+            (self.query_index, self.query_kwarg_name, self.seq_dim),
+            (self.query_indexer_index, self.query_indexer_kwarg_name, self.seq_dim),
+            (self.weights_index, self.weights_kwarg_name, self.seq_dim),
+            (self.topk_index, self.topk_kwarg_name, self.seq_dim),
+            (self.softmax_max_index, self.softmax_max_kwarg_name, self.stats_seq_dim),
+            (self.softmax_sum_index, self.softmax_sum_kwarg_name, self.stats_seq_dim),
+            (self.softmax_max_indexer_index, self.softmax_max_indexer_kwarg_name, self.stats_seq_dim),
+            (self.softmax_sum_indexer_index, self.softmax_sum_indexer_kwarg_name, self.stats_seq_dim),
+            (self.query_rope_index, self.query_rope_kwarg_name, self.seq_dim),
+        )
+
+        def _wrapper(original_forward):
+            def _balanced_forward(*args, **kwargs):
+                base_args = list(args)
+                base_kwargs = dict(kwargs)
+                keep_values = {}
+                peer_values = {}
+                for index, name, dim in query_specs:
+                    value = _read_value(base_args, base_kwargs, index, name)
+                    if not _is_tensor_or_dtensor(value):
+                        continue
+                    keep_values[(index, name)] = _half_tensor(value, dim, tail=False)
+                    peer_values[(index, name)] = _exchange_tensor(
+                        _half_tensor(value, dim, tail=True), peer_rank
+                    )
+
+                for index, name in (
+                        (self.key_index, self.key_kwarg_name),
+                        (self.key_indexer_index, self.key_indexer_kwarg_name),
+                        (self.key_rope_index, self.key_rope_kwarg_name)):
+                    value = _read_value(base_args, base_kwargs, index, name)
+                    if _is_tensor_or_dtensor(value):
+                        full = _to_sequence_replicate(value, cp_mesh, self.seq_dim)
+                        _maybe_replace_arg(base_args, index, lambda _old, full=full: full)
+                        _maybe_replace_kwarg(base_kwargs, name, lambda _old, full=full: full)
+
+                def _subcall(values, logical_split):
+                    sub_args = list(base_args)
+                    sub_kwargs = dict(base_kwargs)
+                    for index, name, dim in query_specs:
+                        value = values.get((index, name))
+                        if value is None:
+                            continue
+                        wrapped = (_to_query_stats_shard(value, cp_mesh, dim)
+                                   if dim == self.stats_seq_dim and index in {
+                                       self.softmax_max_index, self.softmax_sum_index,
+                                       self.softmax_max_indexer_index, self.softmax_sum_indexer_index,
+                                   }
+                                   else _to_sequence_shard(value, cp_mesh, dim))
+                        _maybe_replace_arg(sub_args, index, lambda _old, wrapped=wrapped: wrapped)
+                        _maybe_replace_kwarg(sub_kwargs, name, lambda _old, wrapped=wrapped: wrapped)
+                    return _run_dense_indexer_subcall(
+                        original_forward, logical_split, 2 * ws, tuple(sub_args), sub_kwargs
+                    )
+
+                loss_keep = _subcall(keep_values, 2 * local_idx)
+                loss_peer = _subcall(peer_values, 2 * target_idx + 1)
+                return _dtensor_to_local_reducing_partial(loss_keep + loss_peer)
+
+            return _balanced_forward
+
+        _replace_module_forward(module, _wrapper)
+        return module
 
     def _shard_query_side(self, value: Any, device_mesh: DeviceMesh) -> Any:
         return _to_sequence_shard(value, device_mesh, self.seq_dim)
@@ -657,6 +848,8 @@ class DSAIndexerLossContextParallel(ParallelStyle):
     def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
         """Register DSA indexer-loss CP hooks on ``module`` and return it."""
         cp_mesh = _ensure_1d(device_mesh)
+        if self.load_balance:
+            return self._apply_load_balance(module, cp_mesh)
 
         def replicate(value: Any) -> Any:
             return self._replicate_key_side(value, cp_mesh)

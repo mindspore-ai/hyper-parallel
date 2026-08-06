@@ -24,6 +24,7 @@ from .parallel_ops import DistributedOp
 from .parallel_npu_dense_lightning_indexer_softmax_lse import (
     _adjust_bsnd_key,
     _adjust_tnd_seq_lens,
+    _get_dense_indexer_cp_override,
 )
 
 platform = get_platform()
@@ -406,12 +407,14 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
                 local_q = args[0]
                 s1_local = local_q.shape[1]
                 s2_full = args[3].shape[1]
-                sliced_k = _adjust_bsnd_key(args[1], s1_local, split_id)
-                sliced_k_idx = _adjust_bsnd_key(args[3], s1_local, split_id)
+                override = _get_dense_indexer_cp_override()
+                logical_split_id = override[0] if override is not None else split_id
+                sliced_k = _adjust_bsnd_key(args[1], s1_local, logical_split_id)
+                sliced_k_idx = _adjust_bsnd_key(args[3], s1_local, logical_split_id)
                 if len(args) > 10:  # MindSpore: all 18 positional args
                     local_k_rope = args[11]
                     sliced_k_rope = (
-                        _adjust_bsnd_key(local_k_rope, s1_local, split_id)
+                        _adjust_bsnd_key(local_k_rope, s1_local, logical_split_id)
                         if local_k_rope is not None else None
                     )
                     outs = func(
@@ -426,7 +429,7 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
                     new_kwargs = dict(kwargs)
                     if new_kwargs.get('key_rope') is not None:
                         new_kwargs['key_rope'] = _adjust_bsnd_key(
-                            new_kwargs['key_rope'], s1_local, split_id
+                            new_kwargs['key_rope'], s1_local, logical_split_id
                         )
                     outs = func(*new_args, **new_kwargs)
                 d_q_idx, d_k_idx, d_w, loss = outs

@@ -14,6 +14,7 @@
 # ============================================================================
 """Distributed implementation for npu_dense_lightning_indexer_softmax_lse operator."""
 import copy
+import threading
 from typing import Callable, Optional, Tuple
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -25,6 +26,23 @@ from .parallel_ops import DistributedOp
 platform = get_platform()
 
 _MAX_INT64 = 9223372036854775807
+_DENSE_INDEXER_CP_OVERRIDE = threading.local()
+
+
+def _set_dense_indexer_cp_override(split_id: int, split_num: int) -> None:
+    """Override the logical query chunk for one load-balanced sub-call."""
+    _DENSE_INDEXER_CP_OVERRIDE.value = (split_id, split_num)
+
+
+def _clear_dense_indexer_cp_override() -> None:
+    """Clear the current thread's logical query-chunk override."""
+    if hasattr(_DENSE_INDEXER_CP_OVERRIDE, "value"):
+        del _DENSE_INDEXER_CP_OVERRIDE.value
+
+
+def _get_dense_indexer_cp_override():
+    """Return ``(split_id, split_num)`` for a load-balanced sub-call."""
+    return getattr(_DENSE_INDEXER_CP_OVERRIDE, "value", None)
 
 
 def _to_local_seq_len(t):
@@ -381,7 +399,9 @@ class NpuDenseLightningIndexerSoftmaxLseDistributedOp(DistributedOp):
 
             def _bsnd_cp_impl(*args, **kwargs):
                 local_q, local_k = args[0], args[1]
-                sliced_k = _adjust_bsnd_key(local_k, local_q.shape[1], split_id)
+                override = _get_dense_indexer_cp_override()
+                logical_split_id = override[0] if override is not None else split_id
+                sliced_k = _adjust_bsnd_key(local_k, local_q.shape[1], logical_split_id)
                 return func(local_q, sliced_k, *args[2:], **kwargs)
 
             return _bsnd_cp_impl
