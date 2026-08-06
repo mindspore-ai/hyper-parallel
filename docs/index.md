@@ -23,6 +23,7 @@
 | [自动并行](./guide/auto_parallel.md) | SAPP-ND、SAPP-PPB |
 | [MoE 多核并行](./guide/multicore_moe.md) | 多核 MPMD、MoE 通算掩盖 |
 | [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
+| [Hyper-RL](../hyper_parallel/rl/README.md) | Qwen3.5 + GRPO、算法 Recipe、按需 Critic、vLLM 与 Agentic RL |
 
 ## API 参考
 

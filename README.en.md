@@ -44,7 +44,7 @@ performance.
 
 ## Architecture Overview
 
-<div align="center"> <img src="./docs/images/HyperParallel.jpg" width = 60% /> </div>
+<div align="center"> <img src="./docs/images/HyperParallel.jpg" alt="HyperParallel architecture" width = 60% /> </div>
 
 ### HyperShard: Programming Model Evolution, System Optimisation Embedded in Model -> Decoupled Model and System Optimisation
 
@@ -199,6 +199,10 @@ performance.
     - [x] VLTrainer framework (visual-language)
     - [x] Callbacks (Logging / MoeMonitor)
     - [x] parallel_dims configuration
+
+- Hyper-RL
+    - [x] Minimal Qwen3.5 + GRPO training loop
+    - [x] Separate GRPO/PPO recipes, on-demand critic, vLLM registration, and Agentic RL extension points
 
 - Integration
     - [x] LlamaFactory integration (activation recompute & swap + HSDP)
@@ -400,6 +404,7 @@ For details, see the [MoE Multi-Core Parallelism Guide](./docs/guide/multicore_m
 - [Installation Guide](docs/installation.md) - Source build, dependencies
 - [Feature Guides](./docs/guide/) - 10 core feature usage guides
 - [API Reference](./docs/api/api_reference.md) - Interface descriptions organised by feature module
+- [Hyper-RL](./hyper_parallel/rl/) - Reinforcement learning runtime, examples, and design documents
 - [FAQ & Troubleshooting](./docs/faq.md) - Common issues and solutions
 - [AI-Assisted Development](./AGENTS.md) - AI-assisted development capabilities
 - [Contributing](./docs/contributing/) - Dev environment, testing, release process
