@@ -15,7 +15,13 @@
 """tensor_redistribution"""
 import logging
 
+from hyper_parallel.core.dtensor._ragged_utils import (
+    _compute_ragged_all_to_all_splits,
+    _compute_ragged_slice,
+    _compute_ragged_splits,
+)
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout, RaggedShardInfo
 from hyper_parallel.core.dtensor.redistribute_infer import RedistributionOperatorInfer
 from hyper_parallel.platform import get_platform
 platform = get_platform()
@@ -213,6 +219,51 @@ class TensorRedistribution:
             local_x = self._construct_op_operator[op[0]](local_x, *op[1])
         return local_x
 
+    @staticmethod
+    def _to_normal_layout(layout: Layout, tensor_dim: int) -> Layout:
+        """Build the normal view consumed by the legacy redistribution path."""
+        normal_layout = Layout.from_device_mesh(layout.mesh)
+        normal_layout.set_placements(layout.normal_placements)
+        normal_layout.placement_to_tensor_map(tensor_dim)
+        return normal_layout
+
+    def _redistribute_ragged(self, input_x: DTensor, to_layout: Layout) -> DTensor:
+        """Adapt RaggedShard layouts to the supported redistribution primitives."""
+        from_layout = input_x.layout
+        source_info = from_layout.ragged_shard
+        target_info = to_layout.ragged_shard
+        source_is_ragged = isinstance(source_info, RaggedShardInfo)
+        target_is_ragged = isinstance(target_info, RaggedShardInfo)
+        tensor_dim = len(input_x.shape)
+
+        if source_is_ragged and target_is_ragged:
+            source_normal_layout = self._to_normal_layout(from_layout, tensor_dim)
+            target_normal_layout = self._to_normal_layout(to_layout, tensor_dim)
+            if (
+                source_info.mesh_dim == target_info.mesh_dim
+                and source_info.placement.dims == target_info.placement.dims
+                and source_normal_layout == target_normal_layout
+            ):
+                return self.ragged_to_ragged(input_x, to_layout)
+            return self.ragged_to_ragged_via_replicate(
+                input_x,
+                source_normal_layout,
+                to_layout,
+            )
+
+        if source_is_ragged:
+            source_normal_layout = self._to_normal_layout(from_layout, tensor_dim)
+            normal = self.ragged_to_normal(input_x, source_normal_layout)
+            if normal.layout == to_layout:
+                return normal
+            return self._redistribution_normal(normal, to_layout)
+
+        target_normal_layout = self._to_normal_layout(to_layout, tensor_dim)
+        normal = input_x
+        if from_layout != target_normal_layout:
+            normal = self._redistribution_normal(normal, target_normal_layout)
+        return self.normal_to_ragged(normal, to_layout)
+
     def redistribution(self, input_x, to_layout):
         """tensor redistribution"""
         x_layout = input_x.layout
@@ -225,13 +276,23 @@ class TensorRedistribution:
                 x = self.reduce_partial(input_x, x_layout)
 
         from_layout = x.layout
-        if not self.is_init:
-            self.rank_id = platform.get_rank()
-            self.is_init = True
         if from_layout.rank_list != to_layout.rank_list:
             raise ValueError(f"The from_layout rank list: {from_layout.rank_list} is not equal to "
                              f"to_layout rank list: {to_layout.rank_list}")
-        key = from_layout.compact_str + to_layout.compact_str +  str(self.rank_id)
+        if isinstance(from_layout.ragged_shard, RaggedShardInfo) or isinstance(
+            to_layout.ragged_shard, RaggedShardInfo
+        ):
+            return self._redistribute_ragged(x, to_layout)
+        return self._redistribution_normal(x, to_layout)
+
+    def _redistribution_normal(self, input_x: DTensor, to_layout: Layout) -> DTensor:
+        """Run the existing redistribution path for normal layouts."""
+        from_layout = input_x.layout
+        x = input_x
+        if not self.is_init:
+            self.rank_id = platform.get_rank()
+            self.is_init = True
+        key = from_layout.compact_str + to_layout.compact_str + str(self.rank_id)
         if key in self._transform_cache:
             x = x.to_local()
             transform_operator_list = self._transform_cache[key]
@@ -259,6 +320,110 @@ class TensorRedistribution:
             for transform_operator in transform_operator_list:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
         return DTensor.from_local(x, to_layout.mesh, to_layout.alias_placements)
+
+    @staticmethod
+    def ragged_to_normal(input_x: DTensor, to_layout: Layout) -> DTensor:
+        """Gather one flat RaggedShard into its Replicate normal view."""
+        from_layout = input_x.layout
+        info = from_layout.ragged_shard
+        if not isinstance(info, RaggedShardInfo):
+            raise ValueError("ragged_to_normal requires a RaggedShard source layout")
+        global_shape = tuple(input_x.shape)
+        output_splits = _compute_ragged_splits(global_shape, from_layout)
+        local_tensor = input_x.to_local()
+        if len(output_splits) == 1:
+            gathered = local_tensor
+        else:
+            group = from_layout.mesh.get_group(info.mesh_dim)
+            gathered = platform.differentiable_variable_all_gather(
+                local_tensor,
+                output_splits,
+                group,
+            )
+        return DTensor.from_local_with_layout(
+            gathered.reshape(global_shape),
+            to_layout,
+            shape=global_shape,
+        )
+
+    @staticmethod
+    def normal_to_ragged(input_x: DTensor, to_layout: Layout) -> DTensor:
+        """Slice a normal-view tensor into the target flat RaggedShard."""
+        global_shape = tuple(input_x.shape)
+        local_slice = _compute_ragged_slice(global_shape, to_layout)
+        flat_tensor = input_x.to_local().reshape((-1,))
+        local_tensor = flat_tensor[
+            local_slice.flat_start:local_slice.flat_end
+        ].clone()
+        return DTensor.from_local_with_layout(
+            local_tensor,
+            to_layout,
+            shape=global_shape,
+        )
+
+    @staticmethod
+    def ragged_to_ragged_via_replicate(
+        input_x: DTensor,
+        replicate_layout: Layout,
+        to_layout: Layout,
+    ) -> DTensor:
+        """Redistribute different RaggedShard dims through a Replicate layout."""
+        from_layout = input_x.layout
+        if (
+            from_layout.mesh_shape != to_layout.mesh_shape
+            or from_layout.rank_list != to_layout.rank_list
+        ):
+            raise ValueError("ragged_to_ragged only supports changes on the same device mesh")
+        replicated = TensorRedistribution.ragged_to_normal(
+            input_x,
+            replicate_layout,
+        )
+        return TensorRedistribution.normal_to_ragged(replicated, to_layout)
+
+    @staticmethod
+    def ragged_to_ragged(input_x: DTensor, to_layout: Layout) -> DTensor:
+        """Redistribute a local-units-only RaggedShard change with variable all-to-all."""
+        from_layout = input_x.layout
+        source_info = from_layout.ragged_shard
+        if (
+            from_layout.mesh_shape != to_layout.mesh_shape
+            or from_layout.rank_list != to_layout.rank_list
+        ):
+            raise ValueError("ragged_to_ragged only supports local_units changes on the same device mesh")
+
+        global_shape = tuple(input_x.shape)
+        input_splits, output_splits = _compute_ragged_all_to_all_splits(
+            global_shape,
+            from_layout,
+            to_layout,
+        )
+        flat_input = input_x.to_local().reshape((-1,))
+
+        if flat_input.shape[0] != sum(input_splits):
+            raise ValueError(
+                "RaggedShard source storage does not match all-to-all splits, "
+                f"got local_numel={flat_input.shape[0]}, input_splits={input_splits!r}"
+            )
+        if len(input_splits) == 1:
+            flat_output = flat_input
+        else:
+            group = from_layout.mesh.get_group(source_info.mesh_dim)
+            flat_output = platform.differentiable_all_to_all_single(
+                flat_input,
+                input_splits,
+                output_splits,
+                group,
+            )
+        if flat_output.shape[0] != sum(output_splits):
+            raise ValueError(
+                "RaggedShard target storage does not match all-to-all splits, "
+                f"got local_numel={flat_output.shape[0]}, output_splits={output_splits!r}"
+            )
+        return DTensor.from_local_with_layout(
+            flat_output,
+            to_layout,
+            shape=global_shape,
+        )
 
     def _infer_transform_operator_list(self, from_layout, to_layout, from_full_shape, key, rank_list):
         """infer transform operator list"""

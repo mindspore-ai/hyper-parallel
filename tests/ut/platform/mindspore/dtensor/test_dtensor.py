@@ -33,12 +33,13 @@ from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 # pylint: disable=redefined-outer-name
 
 
-def _stub_init_data(self, local_tensor, device_mesh, placements, layout=None):
+def _stub_init_data(self, local_tensor, device_mesh, placements, layout=None, shape=None):
     """Stand-in for ``DTensor.__init_data__`` so DTensorBase can be tested in
     isolation, without going through the core ``DTensor`` subclass."""
     self._local_tensor = local_tensor
     self._device_mesh = device_mesh
     self._placements = tuple(placements) if placements is not None else None
+    self._global_shape = tuple(shape) if shape is not None else None
 
 
 def _stub_to_local(self):
@@ -126,11 +127,12 @@ def test_wrap_existing_dtensor_reuses_mesh_and_placements(fake_mesh, fake_placem
         alias_placements = tuple(fake_placements)
 
     init_t = initializer("zeros", (4, 4), ms.float32)
-    src = DTensorBase(init_t, fake_mesh, fake_placements)
+    src = DTensorBase(init_t, fake_mesh, fake_placements, shape=(8, 4))
     src._layout = _Layout()
 
     wrapped = DTensorBase(src)
 
     assert wrapped._device_mesh is src._device_mesh
     assert wrapped._placements == src._placements
+    assert wrapped._global_shape == src._global_shape
     assert wrapped._local_tensor is src._local_tensor

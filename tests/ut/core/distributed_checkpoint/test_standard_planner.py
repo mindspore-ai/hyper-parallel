@@ -18,6 +18,7 @@ import importlib
 import os
 import pickle
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -43,6 +44,11 @@ from hyper_parallel.core.distributed_checkpoint.standard_planner import (
     StandardSavePlanner,
     create_read_items_for_chunk_list,
 )
+from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import RaggedShard
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 
 class TestStandardPlanner(unittest.TestCase):
@@ -53,6 +59,23 @@ class TestStandardPlanner(unittest.TestCase):
         _platform_mod.platform = None
         importlib.reload(planner_mod)
         StandardSavePlanner._cached_save_result.clear()
+
+    @staticmethod
+    def _ragged_tensor(local, local_units=(1, 3)):
+        """Build a rank-zero RaggedShard DTensor without initializing a backend."""
+        _DEVICE_MESH_MAP.clear()
+        EXISTING_COMM_GROUPS.clear()
+        with patch(
+                "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+                return_value=0,
+        ):
+            mesh = Layout((2,), ("ragged",), init_backend=False).mesh
+            return DTensor.from_local(
+                local,
+                mesh,
+                (RaggedShard(dims=(0, 1), local_units=local_units),),
+                shape=(6, 4, 8),
+            )
 
     def test_save_planner_build_local_plan_for_tensors_and_bytes(self):
         """
@@ -117,6 +140,24 @@ class TestStandardPlanner(unittest.TestCase):
         self.assertFalse(data.requires_grad)
         torch.testing.assert_close(data, weight.detach().cpu())
 
+    def test_ragged_save_plan_emits_one_item_per_nd_box(self):
+        """A flat RaggedShard interval is saved as ordered standard N-D chunks."""
+        tensor = self._ragged_tensor(torch.arange(48))
+        planner = StandardSavePlanner(enable_plan_caching=True)
+        planner.configure_planner({"weight": tensor}, rank=0)
+
+        plan = planner.build_local_plan()
+
+        self.assertFalse(planner._enable_plan_caching)
+        self.assertEqual(
+            [item.index.offset for item in plan.items],
+            [(0, 0, 0), (1, 0, 0)],
+        )
+        self.assertEqual(
+            [tuple(planner.get_data(item).shape) for item in plan.items],
+            [(1, 4, 8), (1, 2, 8)],
+        )
+
     def test_save_planner_plan_cache_hit(self):
         """
         Feature: StandardSavePlanner plan caching.
@@ -167,6 +208,48 @@ class TestStandardPlanner(unittest.TestCase):
         read_item = plan.items[0]
         planner.apply_bytes(read_item, pickle.dumps(payload))
         self.assertEqual(state["opt_state"], payload)
+
+    def test_ragged_load_plan_reshards_saved_nd_chunks_into_flat_storage(self):
+        """Load source Ragged boxes into a target with different local units."""
+        target = self._ragged_tensor(torch.zeros(144, dtype=torch.int64), (3, 1))
+        saved_chunks = [
+            ChunkStorageMetadata((0, 0, 0), (1, 4, 8)),
+            ChunkStorageMetadata((1, 0, 0), (1, 2, 8)),
+            ChunkStorageMetadata((1, 2, 0), (1, 2, 8)),
+            ChunkStorageMetadata((2, 0, 0), (4, 4, 8)),
+        ]
+        metadata = Metadata(
+            state_dict_metadata={
+                "weight": TensorStorageMetadata(
+                    properties=TensorProperties(dtype="torch.int64"),
+                    size=(6, 4, 8),
+                    chunks=saved_chunks,
+                )
+            }
+        )
+        planner = StandardLoadPlanner()
+        planner.configure_planner({"weight": target}, metadata, rank=0)
+        global_tensor = torch.arange(192).reshape(6, 4, 8)
+
+        with patch(
+                "hyper_parallel.core.distributed_checkpoint.standard_planner.get_platform"
+        ) as mock_platform:
+            mock_platform.return_value.get_rank.return_value = 0
+            read_items = planner.build_local_plan().items
+
+        for item in read_items:
+            storage_chunk = saved_chunks[item.storage_index.index]
+            global_offsets = tuple(
+                base + relative
+                for base, relative in zip(storage_chunk.offsets, item.storage_offsets)
+            )
+            source_slices = tuple(
+                slice(offset, offset + length)
+                for offset, length in zip(global_offsets, item.lengths)
+            )
+            planner.acquire_tensor(item).copy_(global_tensor[source_slices])
+
+        torch.testing.assert_close(target.to_local(), torch.arange(144))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from hyper_parallel.platform.torch.platform import TorchPlatform
@@ -608,3 +609,82 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertTrue(torch.allclose(result["nested"]["tensor2"], torch.tensor([14.0, 16.0])))
         self.assertEqual(result["nested"]["value"], 10)  # Non-tensor values remain unchanged
         self.assertEqual(result["value"], 5)  # Non-tensor values remain unchanged
+
+
+def test_variable_all_gather_gloo_pads_and_trims_outputs() -> None:
+    """The CPU path gathers equal padded buffers and trims true row counts."""
+    local = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    sources = (
+        local,
+        torch.empty((0, 2)),
+        torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    )
+    output_shapes = []
+
+    def all_gather(outputs, input_tensor, group):
+        """Populate padded all-gather outputs."""
+        del input_tensor, group
+        output_shapes.extend(tuple(output.shape) for output in outputs)
+        for output, source in zip(outputs, sources):
+            output.zero_()
+            output[:source.shape[0]].copy_(source)
+
+    with patch(
+        "hyper_parallel.platform.torch.platform.dist.get_rank", return_value=0
+    ), patch(
+        "hyper_parallel.platform.torch.platform.dist.all_gather", side_effect=all_gather
+    ) as mock_all_gather:
+        actual = TorchPlatform.differentiable_variable_all_gather(
+            local, [2, 0, 4], object()
+        )
+
+    assert torch.equal(actual, torch.cat(sources, dim=0))
+    assert output_shapes == [(4, 2), (4, 2), (4, 2)]
+    mock_all_gather.assert_called_once()
+
+
+def test_variable_all_gather_gloo_backward_uses_all_reduce_and_slice() -> None:
+    """The Gloo compatibility path preserves variable all-gather gradients."""
+    local = torch.tensor([[1.0], [2.0]], requires_grad=True)
+
+    def all_gather(outputs, input_tensor, group):
+        """Populate two equal-size padded receive buffers."""
+        del group
+        outputs[0].zero_()
+        outputs[0][0, 0] = 5.0
+        outputs[1].copy_(input_tensor)
+
+    def all_reduce(tensor, op, group):
+        """Simulate the sum of full-output gradients from two ranks."""
+        del op, group
+        tensor.mul_(2.0)
+
+    with patch(
+        "hyper_parallel.platform.torch.platform.dist.get_rank", return_value=1
+    ), patch(
+        "hyper_parallel.platform.torch.platform.dist.all_gather", side_effect=all_gather
+    ), patch(
+        "hyper_parallel.platform.torch.platform.dist.all_reduce", side_effect=all_reduce
+    ) as mock_all_reduce:
+        gathered = TorchPlatform.differentiable_variable_all_gather(
+            local, [1, 2], object()
+        )
+        gathered.sum().backward()
+
+    assert torch.equal(local.grad, torch.full_like(local, 2.0))
+    mock_all_reduce.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "splits, message",
+    [([], "at least one"), ([1, -1], "non-negative")],
+)
+def test_variable_all_gather_rejects_invalid_metadata(splits, message) -> None:
+    """Invalid split metadata fails before communication."""
+    with patch(
+        "hyper_parallel.platform.torch.platform.dist.all_gather"
+    ) as mock_all_gather, pytest.raises(ValueError, match=message):
+        TorchPlatform.differentiable_variable_all_gather(
+            torch.ones(1, 2), splits, object()
+        )
+    mock_all_gather.assert_not_called()

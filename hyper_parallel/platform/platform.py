@@ -16,7 +16,7 @@
 import os
 from datetime import timedelta
 from enum import auto, Enum
-from typing import Optional, Any, Union
+from typing import Any, Optional, Sequence, Union
 
 import numpy as np
 
@@ -710,6 +710,26 @@ class Platform:
             NotImplementedError: Must be implemented by platform subclasses.
         """
         raise NotImplementedError("Platform subclasses must implement all_to_all_single")
+
+    @staticmethod
+    def differentiable_variable_all_gather(
+            input_tensor: Any, output_splits: Sequence[int], group: Any) -> Any:
+        """Gather variable dim-zero shards on every rank with gradient support.
+
+        Args:
+            input_tensor: Local input shaped ``[local_rows, *feature_dims]``.
+            output_splits: Dim-zero rows contributed by each group rank.
+            group: Raw platform process group.
+
+        Returns:
+            Tensor concatenated in group-rank order along dim zero.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement differentiable_variable_all_gather"
+        )
 
     @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,

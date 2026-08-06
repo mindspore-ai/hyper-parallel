@@ -15,6 +15,7 @@
 """File system storage implementations for checkpoint save and load."""
 import os
 import pickle
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -152,7 +153,9 @@ class FileSystemWriter(StorageWriter):
 
         return results
 
-    def _collect_tensors(self, plan: SavePlan, planner: SavePlanner) -> dict[str, Any]:
+    def _collect_tensors(
+            self, plan: SavePlan, planner: SavePlanner
+    ) -> tuple[dict[str, Any], dict[MetadataIndex, str]]:
         """
         Collect tensor data from planner runtime lookup.
 
@@ -161,31 +164,58 @@ class FileSystemWriter(StorageWriter):
             planner (SavePlanner): Save planner.
 
         Returns:
-            dict[str, Any]: Dictionary mapping FQN to tensor data.
+            tuple[dict[str, Any], dict[MetadataIndex, str]]: Tensor data keyed by
+                physical safetensors key, plus logical index-to-key mapping.
 
         Raises:
             RuntimeError: If tensor data cannot be resolved for an item.
         """
+        tensor_items = [
+            item for item in plan.items
+            if item.type.value == "tensor" and item.tensor_data
+        ]
+        fqn_counts = Counter(item.index.fqn for item in tensor_items)
+        reserved_keys = set(fqn_counts)
+        used_keys: set[str] = set()
+        next_chunk_index: dict[str, int] = {}
         tensor_dict: dict[str, Any] = {}
-        for item in plan.items:
-            if item.type.value == "tensor" and item.tensor_data:
-                tensor = planner.get_data(item)
-                if tensor is None:
-                    raise RuntimeError(
-                        f"Tensor data could not be resolved for index {item.index}. "
-                        f"FQN: {item.index.fqn}"
-                    )
-                fqn = item.index.fqn
-                tensor_dict[fqn] = tensor
-        return tensor_dict
+        tensor_keys: dict[MetadataIndex, str] = {}
 
-    def _write_tensors(self, plan: SavePlan, tensor_dict: dict[str, Any]) -> list[WriteResult]:
+        for item in tensor_items:
+            tensor = planner.get_data(item)
+            if tensor is None:
+                raise RuntimeError(
+                    f"Tensor data could not be resolved for index {item.index}. "
+                    f"FQN: {item.index.fqn}"
+                )
+
+            fqn = item.index.fqn
+            tensor_key = fqn
+            if fqn_counts[fqn] > 1:
+                chunk_index = next_chunk_index.get(fqn, 0)
+                next_chunk_index[fqn] = chunk_index + 1
+                tensor_key = f"{fqn}.__dcp_chunk_{chunk_index}"
+                while tensor_key in reserved_keys or tensor_key in used_keys:
+                    tensor_key += "_"
+
+            used_keys.add(tensor_key)
+            tensor_dict[tensor_key] = tensor
+            tensor_keys[item.index] = tensor_key
+        return tensor_dict, tensor_keys
+
+    def _write_tensors(
+            self,
+            plan: SavePlan,
+            tensor_dict: dict[str, Any],
+            tensor_keys: dict[MetadataIndex, str],
+    ) -> list[WriteResult]:
         """
         Write all tensors to safetensors file and create WriteResults.
 
         Args:
             plan (SavePlan): Save plan containing WriteItems.
-            tensor_dict (dict[str, Any]): Dictionary mapping FQN to tensor data.
+            tensor_dict (dict[str, Any]): Dictionary mapping physical keys to tensor data.
+            tensor_keys (dict[MetadataIndex, str]): Logical index-to-key mapping.
 
         Returns:
             list[WriteResult]: List of write results for tensor items.
@@ -207,6 +237,7 @@ class FileSystemWriter(StorageWriter):
                     relative_path=file_name,
                     offset=0,
                     length=-1,
+                    tensor_key=tensor_keys[item.index],
                 )
                 results.append(
                     WriteResult(
@@ -235,8 +266,8 @@ class FileSystemWriter(StorageWriter):
         results.extend(self._write_bytes_items(plan, planner))
 
         # Collect and write tensors
-        tensor_dict = self._collect_tensors(plan, planner)
-        results.extend(self._write_tensors(plan, tensor_dict))
+        tensor_dict, tensor_keys = self._collect_tensors(plan, planner)
+        results.extend(self._write_tensors(plan, tensor_dict, tensor_keys))
 
         return results
 
@@ -333,8 +364,93 @@ def _get_tensor_size(tensor: Any) -> Optional[tuple]:
     return getattr(tensor, "shape", None)
 
 
+def _get_storage_info(
+        req: ReadItem,
+        storage_data: dict[MetadataIndex, StorageInfo],
+) -> StorageInfo:
+    """Return physical storage metadata for one read request."""
+    storage_info = storage_data.get(req.storage_index)
+    if storage_info is None:
+        raise KeyError(f"StorageInfo not found for index {req.storage_index}")
+    return storage_info
+
+
+def _validate_and_copy_tensor(
+        req: ReadItem,
+        tensor: Any,
+        planner: LoadPlanner,
+) -> None:
+    """Validate a loaded tensor slice and copy it to its planner destination."""
+    target_tensor = planner.acquire_tensor(req)
+    if hasattr(target_tensor, "detach"):
+        target_tensor = target_tensor.detach()
+
+    target_size = _get_tensor_size(target_tensor)
+    tensor_size = _get_tensor_size(tensor)
+    if target_size is not None and tensor_size is not None and target_size != tensor_size:
+        raise AssertionError(
+            f"req {req.storage_index} mismatch sizes "
+            f"{target_size} vs {tensor_size}"
+        )
+    _copy_tensor_to_target(req, tensor, target_tensor, planner)
+
+
+def _load_torch_tensor_file(
+        path: str,
+        reqs: list[ReadItem],
+        planner: LoadPlanner,
+        storage_data: dict[MetadataIndex, StorageInfo],
+) -> None:
+    """Load tensor slices from a Torch safetensors file."""
+    with safe_open(path, framework="pt", device="cpu") as tensor_file:
+        available_keys = set(tensor_file.keys())
+        for req in reqs:
+            storage_info = _get_storage_info(req, storage_data)
+            tensor_key = storage_info.tensor_key or req.storage_index.fqn
+            if tensor_key not in available_keys:
+                raise KeyError(f"Key {tensor_key} not found in checkpoint file {path}")
+            tensor_slices = tuple(
+                slice(int(off), int(off) + int(length))
+                for off, length in zip(req.storage_offsets, req.lengths)
+            )
+            if tensor_slices:
+                tensor = tensor_file.get_slice(tensor_key)[tensor_slices]
+            else:
+                tensor = narrow_tensor_by_index(
+                    tensor_file.get_tensor(tensor_key),
+                    req.storage_offsets,
+                    req.lengths,
+                )
+            _validate_and_copy_tensor(req, tensor, planner)
+
+
+def _load_platform_tensor_file(
+        path: str,
+        reqs: list[ReadItem],
+        planner: LoadPlanner,
+        storage_data: dict[MetadataIndex, StorageInfo],
+        platform: Any,
+) -> None:
+    """Load tensor slices through the active non-Torch platform adapter."""
+    param_dict = platform.load_checkpoint(path)
+    for req in reqs:
+        storage_info = _get_storage_info(req, storage_data)
+        tensor_key = storage_info.tensor_key or req.storage_index.fqn
+        if tensor_key not in param_dict:
+            raise KeyError(f"Key {tensor_key} not found in checkpoint file {path}")
+        tensor = narrow_tensor_by_index(
+            param_dict[tensor_key],
+            req.storage_offsets,
+            req.lengths,
+        )
+        _validate_and_copy_tensor(req, tensor, planner)
+
+
 def _load_tensor_file(
-        path: str, reqs: list[ReadItem], planner: LoadPlanner
+        path: str,
+        reqs: list[ReadItem],
+        planner: LoadPlanner,
+        storage_data: dict[MetadataIndex, StorageInfo],
 ) -> None:
     """
     Load and process tensors from a safetensors file.
@@ -343,74 +459,13 @@ def _load_tensor_file(
         path (str): Path to the safetensors file.
         reqs (list[ReadItem]): List of ReadItems for this file.
         planner (LoadPlanner): Load planner for resolving and committing tensors.
+        storage_data (dict[MetadataIndex, StorageInfo]): Physical storage mapping.
     """
     platform = get_platform()
-
     if platform.platform_type == PlatformType.PYTORCH:
-        with safe_open(path, framework="pt", device="cpu") as tensor_file:
-            for req in reqs:
-                fqn = req.storage_index.fqn
-                if fqn not in tensor_file.keys():
-                    raise KeyError(f"Key {fqn} not found in checkpoint file {path}")
-                tensor_slices = tuple(
-                    slice(int(off), int(off) + int(length))
-                    for off, length in zip(req.storage_offsets, req.lengths)
-                )
-                if tensor_slices:
-                    tensor = tensor_file.get_slice(fqn)[tensor_slices]
-                else:
-                    tensor = narrow_tensor_by_index(
-                        tensor_file.get_tensor(fqn),
-                        req.storage_offsets,
-                        req.lengths,
-                    )
-
-                target_tensor = planner.acquire_tensor(req)
-                if hasattr(target_tensor, "detach"):
-                    target_tensor = target_tensor.detach()
-
-                # Size check (torch-aligned AssertionError)
-                target_size = _get_tensor_size(target_tensor)
-                tensor_size = _get_tensor_size(tensor)
-                if target_size is not None and tensor_size is not None:
-                    if target_size != tensor_size:
-                        raise AssertionError(
-                            f"req {req.storage_index} mismatch sizes "
-                            f"{target_size} vs {tensor_size}"
-                        )
-
-                # Copy data to target
-                _copy_tensor_to_target(req, tensor, target_tensor, planner)
+        _load_torch_tensor_file(path, reqs, planner, storage_data)
         return
-
-    param_dict = platform.load_checkpoint(path)
-    for req in reqs:
-        fqn = req.storage_index.fqn
-        if fqn not in param_dict:
-            raise KeyError(f"Key {fqn} not found in checkpoint file {path}")
-        full_tensor = param_dict[fqn]
-        tensor = narrow_tensor_by_index(
-            full_tensor,
-            req.storage_offsets,
-            req.lengths,
-        )
-
-        target_tensor = planner.acquire_tensor(req)
-        if hasattr(target_tensor, "detach"):
-            target_tensor = target_tensor.detach()
-
-        # Size check (torch-aligned AssertionError)
-        target_size = _get_tensor_size(target_tensor)
-        tensor_size = _get_tensor_size(tensor)
-        if target_size is not None and tensor_size is not None:
-            if target_size != tensor_size:
-                raise AssertionError(
-                    f"req {req.storage_index} mismatch sizes "
-                    f"{target_size} vs {tensor_size}"
-                )
-
-        # Copy data to target
-        _copy_tensor_to_target(req, tensor, target_tensor, planner)
+    _load_platform_tensor_file(path, reqs, planner, storage_data, platform)
 
 
 class FileSystemReader(StorageReader):
@@ -554,4 +609,4 @@ class FileSystemReader(StorageReader):
                 _load_bytes_file(path, reqs, planner, self.storage_data)
             else:
                 # TENSOR: one safetensors file per rank
-                _load_tensor_file(path, reqs, planner)
+                _load_tensor_file(path, reqs, planner, self.storage_data)

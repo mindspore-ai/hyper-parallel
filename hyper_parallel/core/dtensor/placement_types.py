@@ -50,6 +50,10 @@ class Placement:
         # pylint: disable=W0613
         return False
 
+    def is_ragged_shard(self) -> bool:
+        """Return whether this placement represents non-uniform contiguous sharding."""
+        return False
+
 
 class Shard(Placement):
     """
@@ -115,6 +119,82 @@ class StridedShard(Shard):
 
     def __str__(self) -> str:
         return f"SS({self._dim}, {self._split_factor})"
+
+
+class RaggedShard(Placement):
+    """Placement for non-uniform sharding of a contiguous tensor prefix.
+
+    Args:
+        dims: Non-empty prefix dimensions covered by the placement.
+        local_units: Relative non-negative allocation for ranks on one mesh axis.
+
+    Raises:
+        ValueError: If either tuple violates the phase-one RaggedShard contract.
+    """
+
+    def __init__(self, dims: tuple[int, ...], local_units: tuple[int, ...]) -> None:
+        """Initialize one validated phase-one RaggedShard placement."""
+        super().__init__()
+        if not isinstance(dims, tuple) or not dims:
+            raise ValueError(f"RaggedShard dims must be a non-empty tuple, got {dims!r}")
+        if any(not isinstance(dim, int) or isinstance(dim, bool) for dim in dims):
+            raise ValueError(f"RaggedShard dims must contain only integers, got dims={dims!r}")
+        if dims != tuple(range(len(dims))):
+            raise ValueError(
+                f"RaggedShard dims must be prefix dims in phase 1, got dims={dims!r}"
+            )
+        if not isinstance(local_units, tuple) or not local_units:
+            raise ValueError(
+                f"RaggedShard local_units must be a non-empty tuple, got {local_units!r}"
+            )
+        if any(not isinstance(unit, int) or isinstance(unit, bool) for unit in local_units):
+            raise ValueError(
+                f"RaggedShard local_units must contain only integers, got local_units={local_units!r}"
+            )
+        if any(unit < 0 for unit in local_units):
+            raise ValueError(
+                f"RaggedShard local_units must be non-negative, got local_units={local_units!r}"
+            )
+        if sum(local_units) <= 0:
+            raise ValueError(
+                f"RaggedShard local_units must have a positive sum, got local_units={local_units!r}"
+            )
+        self._dims = dims
+        self._local_units = local_units
+
+    @property
+    def dims(self) -> tuple[int, ...]:
+        """Return the prefix dimensions covered by this placement."""
+        return self._dims
+
+    @property
+    def local_units(self) -> tuple[int, ...]:
+        """Return the relative allocation for ranks on the ragged mesh axis."""
+        return self._local_units
+
+    def is_ragged_shard(self) -> bool:
+        """Return true for RaggedShard placements."""
+        return True
+
+    def __eq__(self, other: object) -> bool:
+        """Compare RaggedShard values by concrete type, dims, and units."""
+        return (
+            type(self) is type(other)
+            and self.dims == other.dims
+            and self.local_units == other.local_units
+        )
+
+    def __hash__(self) -> int:
+        """Return a hash that isolates different dims and local units."""
+        return hash((self._dims, self._local_units, "RaggedShard"))
+
+    def __repr__(self) -> str:
+        """Return an unambiguous constructor-style representation."""
+        return f"RaggedShard(dims={self.dims!r}, local_units={self.local_units!r})"
+
+    def __str__(self) -> str:
+        """Return a compact human-readable representation."""
+        return f"RS({self.dims}, {self.local_units})"
 
 
 class Replicate(Placement):
