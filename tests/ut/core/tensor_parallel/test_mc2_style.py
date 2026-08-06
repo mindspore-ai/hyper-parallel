@@ -26,6 +26,9 @@ from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.mc2 import (
     AllGatherMatmulFunction,
     MC2Linear,
+    _move_dim_to_front,
+    _move_front_to_dim,
+    _normalize_sequence_dim,
 )
 from hyper_parallel.core.tensor_parallel.mc2_style import (
     MC2ColwiseParallel,
@@ -239,6 +242,61 @@ class TestAllGatherMatmulBackwardFused(unittest.TestCase):
         self.assertEqual(kwargs.get("reduce_op"), "sum")
         self.assertIs(grad_x, fake_dx)
         self.assertEqual(tuple(grad_w.shape), (n_local, k))
+
+
+class TestMC2SequenceDimLayout(unittest.TestCase):
+    """SP sequence-dim helpers used before flatten + fused AG/RS."""
+
+    def test_normalize_sequence_dim(self):
+        """
+        Feature: sequence_dim normalization
+        Description: positive / negative dims and out-of-range
+        Expectation: resolved index or RuntimeError
+        """
+        self.assertEqual(_normalize_sequence_dim(1, 2), 1)
+        self.assertEqual(_normalize_sequence_dim(-1, 2), 1)
+        with self.assertRaises(RuntimeError):
+            _normalize_sequence_dim(2, 2)
+
+    def test_move_dim_roundtrip(self):
+        """
+        Feature: move sequence dim to front and back
+        Description: permute [B, S, H] <-> [S, B, H]
+        Expectation: round-trip equals original; front layout is seq-first
+        """
+        x = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+        y = _move_dim_to_front(x, 1)
+        self.assertEqual(tuple(y.shape), (4, 2, 3))
+        self.assertTrue(torch.equal(y[0], x[:, 0, :]))
+        self.assertTrue(torch.equal(_move_front_to_dim(y, 1), x))
+
+    def test_batch_first_all_gather_needs_seq_front(self):
+        """
+        Feature: flatten+AG layout for Shard(1) batch-first activations
+        Description: simulate 2-rank AG on dim0 after flatten; compare naive vs seq-front
+        Expectation: only seq-front path reconstructs global [B, S, H]
+        """
+        batch, seq, hidden, world = 2, 8, 4, 2
+        full = torch.arange(batch * seq * hidden, dtype=torch.float32).reshape(
+            batch, seq, hidden
+        )
+        seq_local = seq // world
+        shards = [
+            full[:, r * seq_local:(r + 1) * seq_local].contiguous() for r in range(world)
+        ]
+
+        # Naive flatten then cat (old MC2Linear bug): wrong token order.
+        naive = torch.cat([s.reshape(-1, hidden) for s in shards], dim=0)
+        naive_out = naive.reshape(batch, seq, hidden)
+        self.assertFalse(torch.equal(naive_out, full))
+
+        # Move seq to front, flatten, AG, reshape, restore (fixed path).
+        gathered = torch.cat(
+            [_move_dim_to_front(s, 1).reshape(-1, hidden) for s in shards], dim=0
+        )
+        seq_first = gathered.reshape(seq, batch, hidden)
+        fixed = _move_front_to_dim(seq_first, 1)
+        self.assertTrue(torch.equal(fixed, full))
 
 
 if __name__ == "__main__":
