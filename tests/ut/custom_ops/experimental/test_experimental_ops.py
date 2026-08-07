@@ -29,7 +29,7 @@ from unittest.mock import MagicMock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
-from hyper_parallel.custom_ops.experimental.experimental_ops import (  # noqa: E402
+from hyper_parallel.custom_ops.experimental.experimental_ops import (  # noqa: E402  # pylint: disable=C0413
     _MAX_INT64,
     npu_dense_lightning_indexer_grad_kl_loss,
     npu_dense_lightning_indexer_softmax_lse,
@@ -380,7 +380,7 @@ class TestNpuMhcPreCmhc(unittest.TestCase):
 
         mock_platform.custom_ops.npu_mhc_pre_cmhc.assert_called_once_with(
             "x", "phi", "alpha", "bias", "perm_mats",
-            1e-6, 1e-6,
+            None, 1e-6, 1e-6,
         )
         self.assertIs(result, expected)
 
@@ -397,12 +397,12 @@ class TestNpuMhcPreCmhc(unittest.TestCase):
 
         mock_platform.custom_ops.npu_mhc_pre_cmhc.assert_called_once_with(
             "x", "phi", "alpha", "bias", "perm_mats",
-            1e-4, 1e-5,
+            None, 1e-4, 1e-5,
         )
 
     @patch(_PATCH_TARGET)
-    def test_gamma_is_dropped(self, mock_platform):
-        """gamma is accepted but not forwarded to the platform (kernel ignores it)."""
+    def test_gamma_forwarded(self, mock_platform):
+        """gamma is forwarded as the 6th positional arg (kernel ignores its value)."""
         mock_platform.custom_ops.npu_mhc_pre_cmhc.return_value = None
 
         npu_mhc_pre_cmhc(
@@ -412,7 +412,7 @@ class TestNpuMhcPreCmhc(unittest.TestCase):
 
         mock_platform.custom_ops.npu_mhc_pre_cmhc.assert_called_once_with(
             "x", "phi", "alpha", "bias", "perm_mats",
-            1e-6, 1e-6,
+            "should_be_ignored", 1e-6, 1e-6,
         )
 
 
