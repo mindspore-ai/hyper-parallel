@@ -13,6 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for activation checkpoint module."""
+# The backend selector must be set before importing platform aliases.  The
+# local imports and patched platform fixture are intentional test setup.
+# pylint: disable=wrong-import-position,import-outside-toplevel,unused-argument
 import contextlib
 import os
 import unittest
@@ -160,6 +163,21 @@ class TestCheckpointFunction(unittest.TestCase):
         self.assertEqual(result, "result")
         call_args = mock_plat.checkpoint.call_args[0]
         self.assertIn(3, call_args)
+
+    def test_checkpoint_forwards_early_stop_keyword(self, mock_plat):
+        """Test checkpoint forwards the explicit early_stop control keyword."""
+        mock_plat.checkpoint.return_value = "result"
+
+        result = checkpoint(lambda value: value, 3, **{"early_stop": False})
+
+        self.assertEqual(result, "result")
+        self.assertFalse(mock_plat.checkpoint.call_args.kwargs["early_stop"])
+
+    def test_checkpoint_rejects_non_boolean_early_stop(self, mock_plat):
+        """Test checkpoint rejects ambiguous early_stop values."""
+        with self.assertRaisesRegex(ValueError, "early_stop must be bool"):
+            checkpoint(lambda value: value, 3, early_stop=1)
+        mock_plat.checkpoint.assert_not_called()
 
     def test_checkpoint_composes_recompute_state_and_user_contexts(self, mock_plat):
         """Unified recompute state should surround user checkpoint contexts."""

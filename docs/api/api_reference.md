@@ -845,6 +845,8 @@ checkpoint(
     swap_inputs: bool = False,
     policy_fn: Optional[Callable] = None,
     context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
+    group_swap: bool = False,
+    early_stop: bool = True,
     **kwargs,
 )
 ```
@@ -857,6 +859,12 @@ checkpoint(
 | `swap_inputs` | `bool` | `False` | 是否将 checkpoint 保存的输入 offload 到 CPU |
 | `policy_fn` | `callable` | `None` | SAC 逐算子策略：`(ctx, op, *args, **kwargs) -> CheckpointPolicy` |
 | `context_fn` | `callable` | `None` | 返回 `(forward_ctx, recompute_ctx)` 的无参工厂；可与 `policy_fn` 组合 |
+| `group_swap` | `bool` | `False` | 是否对 `MUST_SWAP` tensor 启用分组 copy 融合 |
+| `early_stop` | `bool` | `True` | 是否在产生全部 backward 所需 tensor 后提前停止重计算 |
+
+Torch 2.6、2.7、2.9 eager 模式统一使用 HyperParallel non-reentrant 实现。`early_stop` 只接受单次调用
+关键字或 `checkpoint_kwargs` 配置，不继承外层 `torch.utils.checkpoint.set_checkpoint_early_stop()`。
+Torch backend 还会消费 `preserve_rng_state`、`determinism_check` 和 `debug` 等 checkpoint 保留关键字。
 
 ---
 
@@ -890,7 +898,7 @@ swap(
 checkpoint_wrapper(module, **checkpoint_kwargs) -> CheckpointWrapper
 ```
 
-`checkpoint_kwargs` 与 `checkpoint` 一致，例如 `policy_fn`、`swap_inputs`。
+`checkpoint_kwargs` 与 `checkpoint` 一致，例如 `policy_fn`、`swap_inputs`、`early_stop`。
 
 ---
 

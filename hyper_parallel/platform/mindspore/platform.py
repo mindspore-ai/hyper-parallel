@@ -440,7 +440,7 @@ class _MSAsyncA2ALazyBwd(_Function):
         return AsyncCollectiveTensor(actual_output, work)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Symmetric reverse a2a; returns :class:`AsyncCollectiveTensor`."""
         # If grad_output is still lazy, force unwrap before issuing the
         # reverse a2a (which is itself a "real" op on the data).
@@ -612,7 +612,7 @@ class _MSSyncHookFunction(_Function):
         return _MSSyncHookFunction._passthrough(x)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Mirror of :meth:`forward` using ``_BWD_ROLES``."""
         hook_name = ctx.hook_name
         coordinator = ctx.coordinator
@@ -657,7 +657,7 @@ class _MSAsyncA2AFunction(_Function):
         return _a2a_reconstruct_ms(out_perm, concat_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Launch async head->seq A2A for backward overlap, or return zero grad."""
         if ctx.handle_box is not None:
             g = grad_output.contiguous()
@@ -695,7 +695,7 @@ class _MSAsyncAllGatherFunction(_Function):
         return _move_dim_from_front(out_perm, gather_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Launch reverse reduce-scatter for the all-gather."""
         grad_perm = _move_dim_to_front(grad_output.contiguous(), ctx.gather_dim)
         output_shape = list(grad_perm.shape)
@@ -1875,6 +1875,8 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def recompute_session_ctx(session_id, retain_on_unpack=False):
+        if session_id is None:
+            raise ValueError("session_id must not be None.")
         # pylint: disable=C0415
         from mindspore.common.recompute import _recompute_session_ctx
         return _recompute_session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack)
