@@ -1,4 +1,5 @@
 ---
+name: code-style
 description: Global coding style and conventions for HyperParallel
 ---
 
@@ -20,6 +21,7 @@ Use these rules as the default coding style and convention set for HyperParallel
 - Start inline comments with `#`.
 - Prefer one statement per line.
 - Do not leave vague `TODO` comments in committed code. If a `TODO` is necessary, make it specific and actionable.
+- **Inline comments (why only):** Prefer concise motivation for non-obvious constraints (~2–4 lines). Do not restate the next line of code. Do not leave job ids, commit hashes, one-off benchmark numbers, or machine-local paths. Upstream/issue/PR links are fine. Public APIs still use Google-style docstrings for contracts (`Args`/`Returns`/`Note`); inline `#` is for *why*, not a second docstring.
 
 ## Naming, Typing, And Documentation
 
@@ -169,12 +171,12 @@ When a check fails (pylint finding, UT failure, ST failure), **default to a posi
 
 ## Commit Convention
 
-Use the format `<type>: <description>`.
+Use Conventional Commits: `<type>: <description>` (optional scope: `<type>(<scope>): <description>`).
 
 Allowed types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`.
 
-Commit messages should describe business-side changes only.
-
+- **Subject:** imperative mood, **~80 characters**, no trailing period. (Code line length is ~120; do not confuse the two.)
+- Body (optional): explain *why*, wrap reasonably; keep business-side only.
 - Do not include AI-assistant or IDE attribution trailers such as `Made-with: <tool>` or `Co-authored-by: <AI assistant>`.
 - Do not include third-party AI tool/service names in commit messages.
-- `autogit` and the optional `commit-msg` hook enforce this rule.
+- Enforced by `autogit` and the optional git hook `.agent/hooks/commit-msg` (install into `.git/hooks/commit-msg`). Canonical detail also summarized in `AGENTS.md` § Git Workflow.

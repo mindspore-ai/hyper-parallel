@@ -1,4 +1,5 @@
 ---
+name: project-overview
 description: Global project context — hard rules that prevent common distributed bugs (canonical shortlist; link here instead of restating)
 ---
 
