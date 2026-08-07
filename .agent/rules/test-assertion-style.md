@@ -1,4 +1,5 @@
 ---
+name: test-assertion-style
 description: Assertion style rules for all test files. Covers f-string usage, line length, and formatting conventions.
 paths:
   - tests/**/*.py

@@ -1,4 +1,5 @@
 ---
+name: testing
 description: Testing conventions and patterns — ST launcher must stay free of torch/mindspore imports
 paths:
   - tests/**
@@ -8,7 +9,9 @@ paths:
 
 ## Framework
 
-pytest with custom markers defined in `tests/common/mark_utils.py`.
+- **Runner:** pytest with custom markers in `tests/common/mark_utils.py` (`@arg_mark`).
+- **Authoring:** prefer `unittest.TestCase` where existing UT/shard-op UT does. Pytest runs those classes; do not invent a second parallel style without cause.
+- Shard-op UT/ST extras: `.agent/rules/distributed-op-testing.md`. Assertion message style: `.agent/rules/test-assertion-style.md`. How-to for new UT: skill `add-unit-test`.
 
 ## Markers
 

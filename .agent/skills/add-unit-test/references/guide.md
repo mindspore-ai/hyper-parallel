@@ -1,29 +1,22 @@
----
-name: add-unit-test
-description: Guide for adding unit test cases to HyperParallel. Use when user wants to add test cases for new functionality or increase test coverage.
-paths:
-  - tests/ut/**
-  - "test_*.py"
----
-
 # HyperParallel Unit Tests Guide
 
-Add unit test cases to HyperParallel following the project's testing conventions.
+Procedural reference for the **add-unit-test** skill. Hard constraints:
+`.agent/rules/unit-test.md` and `.agent/rules/testing.md`.
 
 ## When to Use
 
-This guide is applicable when:
-
-- You need to add test cases for new or existing functionality in HyperParallel
-- You want to increase test coverage for existing code
-- You need to understand HyperParallel testing patterns
-- You want to write tests that don't rely on actual distributed communication or GPU/NPU hardware
+- Add UT for new or existing functionality / raise coverage
+- Write tests that do not need real distributed communication or GPU/NPU
 
 ## Step-by-Step Guide
 
 ### Step 1: Understand Test Structure
 
-HyperParallel uses Python's built-in `unittest` framework for its tests. The test structure follows:
+**Runner:** pytest. **Authoring:** write cases as `unittest.TestCase` (pytest
+discovers and runs them). Do not treat "unittest" and "pytest" as competing
+frameworks — one is the case style, the other is the runner.
+
+Layout:
 
 | Component | Description                                                                                                         | Location Pattern                        |
 | --------- |---------------------------------------------------------------------------------------------------------------------|-----------------------------------------|

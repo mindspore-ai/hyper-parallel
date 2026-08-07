@@ -24,6 +24,9 @@ pytest -vs tests/ut
 python3 .agent/skills/autogit/scripts/autogit.py check
 python3 .agent/skills/autogit/scripts/autogit.py commit -m "feat: ..."
 python3 .agent/skills/autogit/scripts/autogit.py pr
+
+# AGENTS.md Skills/Agents table vs disk (also in: autogit check / autogit commit)
+python3 .agent/scripts/check_agents_catalog.py
 ```
 
 Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.distributed_launcher`, or `parallel_case` (see `.agent/rules/testing.md`).
@@ -68,9 +71,10 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 
 ## Testing
 
-> Full details: `.agent/rules/testing.md`.
+> Full details: `.agent/rules/testing.md`. How-to for new UT: skill `add-unit-test`.
 
-- pytest + `@arg_mark` (`tests/common/mark_utils.py`)
+- **Runner:** pytest + `@arg_mark` (`tests/common/mark_utils.py`)
+- **Authoring:** prefer `unittest.TestCase` where existing UT does (pytest still runs them)
 - UT: `tests/ut/` — no distributed setup
 - ST: `torchrun_case` / `msrun_case` / `parallel_case` (multi-card) — **launchers must not import** `torch` / `mindspore` / `hyper_parallel` (see testing.md § ST launcher import rule)
 
@@ -78,7 +82,7 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 
 ## Key Implementation Notes
 
-> Canonical detail: `.agent/rules/distributed.md`. Patterns with examples: `.agent/skills/code-review/distributed-guidelines.md`.
+> Canonical detail: `.agent/rules/distributed.md`. Review examples: `.agent/skills/code-review/distributed-guidelines.md` (not a second SoT).
 
 Highest-risk reminders (see rules for full text):
 
@@ -90,8 +94,23 @@ Highest-risk reminders (see rules for full text):
 
 ## Git Workflow
 
-- Conventional Commits (`feat:` / `fix:` / `docs:`), ~80-char subject, imperative
+- Conventional Commits (`feat:` / `fix:` / `docs:`), **~80-char** subject, imperative (see `.agent/rules/code-style.md` § Commit Convention; code line width is ~120)
 - Squash WIP before opening PR; use **autogit** for GitCode fork + upstream
+- Optional git hook: copy `.agent/hooks/commit-msg` → `.git/hooks/commit-msg` (rejects AI attribution trailers; `autogit` also checks)
+
+---
+
+## Hooks (harness-specific)
+
+Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers). Scripts under `.agent/hooks/`:
+
+| Hook | When | Purpose |
+|------|------|---------|
+| `enforce-code-style.sh` | After Write/Edit | Style guard on edited files |
+| `check-op-yaml.sh` | After Write/Edit | Op YAML ↔ impl pairing checks |
+| `commit-msg` | git `commit-msg` (manual install) | Block AI attribution trailers |
+
+**Target harness today:** Claude Code–compatible agent settings consuming `.agent/settings.json`. Other IDEs may not run these hooks — treat **autogit check / pre-commit / CI** as the cross-tool fallback. Do not assume hooks fire outside that harness.
 
 ---
 
@@ -110,6 +129,7 @@ Highest-risk reminders (see rules for full text):
 | **platform-dev** | Platform APIs, FSDP/HSDP/PP, DTensorBase, collectives | `/skill platform-dev` |
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
+| **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 
 ### Commands
 
@@ -134,8 +154,8 @@ Highest-risk reminders (see rules for full text):
 | **fsdp-dev-expert** | FSDP/HSDP shard, grad reduce, memory lifecycle |
 | **pipeline-dev-expert** | PP schedule, micro-batch, activation swap hooks |
 | **ep-dev-expert** | Expert parallel / MoE routing |
-| **activation-dev** | Activation recompute/swap + LlamaFactory ordering |
-| **llamafactory-hp** | LlamaFactory integration surface |
+| **activation-dev** | Activation recompute/swap + LlamaFactory ordering (details in `activation-dev-guide.md`) |
+| **llamafactory-hp** | LlamaFactory integration surface (activation details → `activation-dev`) |
 | **parallel-strategy-analyzer** | Thin proxy → `skills/parallel-strategy-analyzer` |
 
 ### Rules (auto-applied by path)
@@ -146,6 +166,7 @@ Highest-risk reminders (see rules for full text):
 | **code-style** | Global |
 | **distributed** | `core/**`, `collectives/**`, `**/fully_shard/**` |
 | **platform** | `platform/**` |
-| **multi-platform-features** | Multi-backend / list APIs |
+| **multi-platform-features** | `core/**`, `platform/**` — multi-backend / list APIs |
 | **testing** | `tests/**` |
-| **distributed-op-dev** / **distributed-op-testing** / **unit_test** / **test-assertion-style** | Op impl & tests (scoped) |
+| **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
+| **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |

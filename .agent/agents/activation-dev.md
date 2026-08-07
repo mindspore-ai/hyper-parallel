@@ -42,3 +42,6 @@ General stream/memory rules: `.agent/rules/distributed.md`.
 
 Ordering bugs, CheckpointWrapper count 0, swap+FSDP BackwardHook views,
 freeze-tuning skip, multi-tower discovery, state_dict after wrap.
+
+For broader LlamaFactory / Accelerate / FSDP2 adapter surface (Trainer flow,
+args, checkpoint export), use **`llamafactory-hp`** — keep activation depth here.

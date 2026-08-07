@@ -1,5 +1,9 @@
 ---
+name: multi-platform-features
 description: Multi-platform and list/collection API consistency — apply when adding or changing APIs that exist on both Torch and MindSpore or accept list/collection inputs.
+paths:
+  - hyper_parallel/core/**
+  - hyper_parallel/platform/**
 ---
 
 ## Multi-Platform & List/Collection APIs

@@ -42,6 +42,7 @@ from api import (  # pylint: disable=wrong-import-position
 )
 from pr_content import generate_pr_content, prepare_pr_analysis  # pylint: disable=wrong-import-position
 from lint_check import (  # pylint: disable=wrong-import-position
+    run_agents_catalog_check,
     run_checks,
     run_pylint_review,
 )
@@ -275,6 +276,8 @@ def cmd_commit(message: Optional[str] = None) -> Dict[str, Any]:
 
     Lint runs via the repo's pre-commit git hook (installed by
     ``scripts/pre-commit/install.sh``) — autogit does not duplicate it.
+    AGENTS.md Skills/Agents catalog sync is enforced here (and in
+    ``autogit check``) because it is cheap and catches agent-doc drift.
     UT/ST live in ``autogit pr``, not here, because commits should be cheap.
 
     The only interactive step is the commit-message preview (tty) or the
@@ -299,6 +302,13 @@ def cmd_commit(message: Optional[str] = None) -> Dict[str, Any]:
         raise AutoGitError("No changes to commit after excluding cosmetic changes")
 
     _warn_if_pre_commit_hook_missing()
+
+    print("Running AGENTS catalog check...")
+    catalog_ok, catalog_report = run_agents_catalog_check()
+    if catalog_report.strip():
+        print(catalog_report.strip())
+    if not catalog_ok:
+        raise AutoGitError("AGENTS catalog check failed")
 
     if not message:
         changed_files = run_git("diff", "--cached", "--name-only").stdout.strip().split("\n")

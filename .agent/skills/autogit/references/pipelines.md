@@ -18,7 +18,7 @@ cp .agent/hooks/commit-msg .git/hooks/commit-msg && chmod +x .git/hooks/commit-m
 ## Pipeline A — `autogit commit` (per-commit, fast)
 
 ```
-preview commit-msg → git commit (pre-commit hook lint) → push
+preview commit-msg → AGENTS catalog check → git commit (pre-commit hook lint) → push
 ```
 
 No UT/ST gates here — keep commits cheap; regression at PR time.
