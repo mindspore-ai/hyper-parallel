@@ -134,6 +134,8 @@ def restore_torch_platform_for_ut() -> None:
             "hyper_parallel.core.expert_parallel.expert_parallel",
             *_FULLY_SHARD_PLATFORM_BIND_MODULES,
             "hyper_parallel.core.context_parallel.async_context_parallel",
+            "hyper_parallel.core.activation_checkpoint",
+            "hyper_parallel.core.activation_checkpoint.activation_checkpoint",
         )
     )
     try:
