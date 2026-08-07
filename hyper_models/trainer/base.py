@@ -363,15 +363,13 @@ class BaseTrainer(Stateful, ABC):
         if self.global_rank == 0:
             save_configs(self.config, self.config.checkpoint.checkpoint_dir)
 
-        # # Gradient checkpointing debug
-        # set_checkpoint_debug_enabled(self.config.gradient_checkpointing.debug)
-
     def _build_model(self) -> None:
         """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
         self.model = self.config.model.build(
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
+            activation_checkpoint=self.config.activation_checkpoint.mode,
         )
         self.model_config = self.model.config
         model_parts = getattr(self.model, "parts", None)
