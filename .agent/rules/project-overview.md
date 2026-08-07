@@ -1,5 +1,5 @@
 ---
-description: Global project context — hard rules that prevent common distributed bugs
+description: Global project context — hard rules that prevent common distributed bugs (canonical shortlist; link here instead of restating)
 ---
 
 ## Project Identity
@@ -7,6 +7,9 @@ description: Global project context — hard rules that prevent common distribut
 HyperParallel — distributed parallel library for Ascend NPU + Nvidia GPU, PyTorch + MindSpore backends.
 
 ## Hard Rules (violating these causes bugs)
+
+Canonical shortlist for always-on context. Full patterns:
+`.agent/rules/distributed.md`. Do **not** duplicate long explanations in agents/skills.
 
 - Never import `torch` or `mindspore` directly in platform-agnostic code — use `get_platform()`
 - `layout.is_partial()` is a **method**, not a property — must call with parentheses
