@@ -24,6 +24,7 @@ from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
     NpuLightningIndexerDFunction,
     NpuMhcPostDFunction,
     NpuMhcPreClampSinkhornDFunction,
+    NpuMhcPreCmhcDFunction,
     NpuMhcPreSinkhornDFunction,
     NpuSparseFlashMlaDFunction,
     NpuSparseLightningIndexerGradKlLossDFunction,
@@ -63,6 +64,11 @@ class MindSporeCustomOps:
     @staticmethod
     def npu_mhc_pre_clamp_sinkhorn(*args, **kwargs):
         return NpuMhcPreClampSinkhornDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_mhc_pre_cmhc(*args, **kwargs):
+        """Apply the NPU MHC pre-CMHC fused custom operator."""
+        return NpuMhcPreCmhcDFunction.apply(*args, **kwargs)
 
     @staticmethod
     def npu_lightning_indexer(*args, **kwargs):
