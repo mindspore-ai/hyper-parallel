@@ -1845,6 +1845,12 @@ class MindSporePlatform(Platform):
                                                     group_swap=group_swap)
 
     @staticmethod
+    def ignore_sac_ops(ops: list[object | None]) -> None:
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.activation_checkpoint.sac import ignore_sac_ops
+        ignore_sac_ops(ops)
+
+    @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import AsyncSaveOnCpu

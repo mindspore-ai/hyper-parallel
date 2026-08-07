@@ -95,8 +95,8 @@ fsdp_config:
 mixed_precision:
   enabled: false
 
-gradient_checkpointing:
-  activation_checkpoint: full
+activation_checkpoint:
+  mode: off # off, full, selective
 
 model_assets:
   datasets_type: pretokenized

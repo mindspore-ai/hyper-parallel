@@ -31,6 +31,9 @@ from hyper_models.components.distributed.fsdp2 import FSDP2Manager, _instantiate
 from hyper_models.components.distributed.pipelining import _instantiate_pipeline
 from hyper_models.components.distributed.sharding_applier import apply_sharding_plan
 from hyper_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_models.components.distributed.activation_checkpointing import (
+    _apply_activation_checkpointing as _apply_activation_checkpointing_impl,
+)
 from hyper_models.trainer.config import (
     entries_to_module_replacements,
     entries_to_plan_overrides,
@@ -61,6 +64,19 @@ class _TargetSnapshot:
     global_shape: tuple[int, ...]
     local_shape: tuple[int, ...]
     layout_id: int | None
+
+
+def _apply_activation_checkpointing(
+    model: nn.Module,
+    activation_checkpoint: Optional[str],
+    enable_compile: bool = False,
+) -> nn.Module:
+    """Compatibility wrapper for the distributed activation checkpoint helper."""
+    return _apply_activation_checkpointing_impl(
+        model,
+        activation_checkpoint,
+        enable_compile=enable_compile,
+    )
 
 
 def instantiate_infrastructure(
@@ -509,6 +525,7 @@ def apply_model_infrastructure(
     fp8_config=None,
     freeze_config=None,
     compile_config=None,
+    activation_checkpoint: Optional[str] = None,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device=None,
@@ -521,7 +538,8 @@ def apply_model_infrastructure(
 
     Following design doc 01 §8.3 canonical order:
         PP split → PEFT → QAT/FP8 → freeze → plan → apply_sharding_plan
-        → torch.compile → FSDP2 wrap → to_empty + load_base_model
+        → activation checkpoint → torch.compile → FSDP2 wrap
+        → to_empty + load_base_model
 
     D-01'': CP K/V all-gather is injected at apply_sharding_plan time;
            no extra CP hooks are registered here.
@@ -561,11 +579,20 @@ def apply_model_infrastructure(
         validate_placement,
     )
 
-    # Step 9: torch.compile
+    # Step 9: activation checkpointing. The whole-layer wrapper must enclose
+    # TP/EP transformations and remain inside the FSDP boundary.
+    if activation_checkpoint not in (None, "off"):
+        model = _apply_activation_checkpointing(
+            model,
+            activation_checkpoint,
+            enable_compile=compile_config is not None,
+        )
+
+    # Step 10: torch.compile
     if compile_config is not None:
         model = torch.compile(model, **compile_config)
 
-    # Steps 10-11: FSDP2 wrap, then materialize/move model storage.
+    # Steps 11-12: FSDP2 wrap, then materialize/move model storage.
     model = _apply_fsdp2(model, fsdp2_manager, tp_grad_info)
 
     # init model weights (either from base model or from model's own init)
