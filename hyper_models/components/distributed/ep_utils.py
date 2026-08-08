@@ -34,6 +34,8 @@ Three parts:
    expert_model_parallel_size homogeneous across TP).
 """
 
+import types
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -52,7 +54,7 @@ def _backend_supports_uneven_a2a(group) -> bool:
     return dist.get_backend(group) in _UNEVEN_A2A_BACKENDS
 
 
-class _EPAllToAllUneven(torch.autograd.Function):
+class _EPAllToAllUneven(torch.autograd.Function):  # pylint: disable=abstract-method
     """Ragged all_to_all (NCCL/HCCL production path): split by send/recv counts.
 
     forward:  split(x, send_counts) -> dist.all_to_all(out_list, in_list) -> cat
@@ -61,7 +63,7 @@ class _EPAllToAllUneven(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, send_counts, recv_counts, group):
+    def forward(ctx, x, send_counts, recv_counts, group):  # pylint: disable=arguments-differ
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
         ctx.group = group
@@ -71,13 +73,13 @@ class _EPAllToAllUneven(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         grad = _EPAllToAllUneven.apply(
             grad_output.contiguous(), ctx.recv_counts, ctx.send_counts, ctx.group)
         return grad, None, None, None
 
 
-class _EPAllToAllPadded(torch.autograd.Function):
+class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-method
     """pad-to-max + all_to_all_single (gloo test path).
 
     forward:  pad each dest chunk to the global max(counts) (a2a_single
@@ -114,11 +116,12 @@ class _EPAllToAllPadded(torch.autograd.Function):
         return torch.cat(pieces)
 
     @staticmethod
-    def forward(ctx, x, send_counts, recv_counts, group):
+    def forward(ctx, x, send_counts, recv_counts, group):  # pylint: disable=arguments-differ
+        """Exchange padded expert-token chunks and retain counts for backward."""
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
         ctx.group = group
-        local_max = max(max(send_counts), max(recv_counts), 1)
+        local_max = max([*send_counts, *recv_counts, 1])
         pad_to = x.new_tensor([local_max], dtype=torch.int64)
         dist.all_reduce(pad_to, op=dist.ReduceOp.MAX, group=group)
         ctx.pad_to = pad_to = int(pad_to.item())
@@ -126,7 +129,7 @@ class _EPAllToAllPadded(torch.autograd.Function):
         return _EPAllToAllPadded._unpad(recv, recv_counts, pad_to)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         # backward = reversed a2a: pad by recv_counts -> a2a_single -> unpad by send_counts
         recv = _EPAllToAllPadded._pad_and_exchange(
             grad_output.contiguous(), ctx.recv_counts, ctx.pad_to, ctx.group)
@@ -302,6 +305,81 @@ def _swiglu_weights(experts):
     return w_gate, w_up, w_down
 
 
+def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
+    """Compute dispatched tokens with the local stacked SwiGLU experts.
+
+    This function is installed as ``experts.forward`` for the HF-native EP
+    path. Calling the expert module, instead of indexing its parameters from
+    the parent MoE forward, allows nested FSDP forward hooks to unshard and
+    reshard expert parameters around the local computation.
+    """
+    gate_weight, up_weight, down_weight = _swiglu_weights(experts)
+    token_order = local_expert_indices.argsort()
+    sorted_states = dispatched_states[token_order]
+    local_expert_counts = torch.bincount(
+        local_expert_indices,
+        minlength=experts.local_expert_count,
+    )
+    sorted_outputs = []
+    token_start = 0
+    for local_expert_index in range(experts.local_expert_count):
+        expert_token_count = int(local_expert_counts[local_expert_index])
+        expert_states = sorted_states[token_start:token_start + expert_token_count]
+        if up_weight is None:
+            gate_states, up_states = F.linear(  # pylint: disable=not-callable
+                expert_states,
+                gate_weight[local_expert_index],
+            ).chunk(2, dim=-1)
+        else:
+            gate_states = F.linear(  # pylint: disable=not-callable
+                expert_states, gate_weight[local_expert_index]
+            )
+            up_states = F.linear(  # pylint: disable=not-callable
+                expert_states, up_weight[local_expert_index]
+            )
+        sorted_outputs.append(
+            F.linear(  # pylint: disable=not-callable
+                F.silu(gate_states) * up_states,
+                down_weight[local_expert_index],
+            )
+        )
+        token_start += expert_token_count
+
+    sorted_output = torch.cat(sorted_outputs)
+    output = torch.empty_like(sorted_output)
+    output[token_order] = sorted_output
+    return output
+
+
+def _get_global_expert_count(module):
+    """Return the model-level routed expert count for an MoE module."""
+    if hasattr(module.experts, "num_experts"):
+        return module.experts.num_experts
+    if hasattr(module, "num_experts"):
+        return module.num_experts
+    if hasattr(module, "config") and hasattr(module.config, "num_experts"):
+        return module.config.num_experts
+    if hasattr(module, "config") and hasattr(module.config, "n_routed_experts"):
+        return module.config.n_routed_experts
+    raise ValueError(
+        f"{type(module).__name__}: cannot determine the global routed expert count"
+    )
+
+
+def _bind_local_expert_forward(module, ep_size):
+    """Install the local expert compute entry used by TP-extend-EP."""
+    global_expert_count = _get_global_expert_count(module)
+    if global_expert_count % ep_size != 0:
+        raise ValueError(
+            f"num_experts ({global_expert_count}) must be divisible by ep_size ({ep_size})"
+        )
+    module.experts.local_expert_count = global_expert_count // ep_size
+    module.experts.forward = types.MethodType(
+        _local_swiglu_expert_forward,
+        module.experts,
+    )
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # TP-extend-EP forward (D-10, 05 §6.4.8, isomorphic to Megatron
 # MoEAlltoAllTokenDispatcher + expert_tensor_parallel_size=1)
@@ -329,68 +407,88 @@ def _hf_native_ep_compute(module, hidden_states, *, router_fn,
     expert dim -- each rank holds num_experts/ep_size complete experts, so
     there is no all_gather/reduce_scatter pair.
     """
-    w_gate, w_up, w_down = _swiglu_weights(module.experts)
     ep_size = ep_group.size()
     ep_rank = dist.get_rank(group=ep_group)
-    e_local = w_gate.shape[0]
-    e_global = e_local * ep_size
-    expert_offset = ep_rank * e_local
+    local_expert_count = module.experts.local_expert_count
+    global_expert_count = local_expert_count * ep_size
+    expert_offset = ep_rank * local_expert_count
 
-    b, s, h = hidden_states.shape
-    x = hidden_states.reshape(-1, h)
-    t = x.shape[0]
+    batch_size, sequence_length, hidden_size = hidden_states.shape
+    flattened_states = hidden_states.reshape(-1, hidden_size)
+    token_count = flattened_states.shape[0]
 
     # 1. router (local chunk): each rank's chunk differs -> no token duplication
-    topk_idx, topk_w = router_fn(module, hidden_states)      # [T, K]
-    k = topk_idx.shape[1]
-    flat_idx = topk_idx.reshape(-1)
-    flat_w = topk_w.reshape(-1).to(x.dtype)
-    token_of = torch.arange(t, device=x.device).repeat_interleave(k)
-    dest = torch.div(flat_idx, e_local, rounding_mode="floor")
+    topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
+    experts_per_token = topk_indices.shape[1]
+    flattened_expert_indices = topk_indices.reshape(-1)
+    flattened_expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+    source_token_indices = torch.arange(
+        token_count,
+        device=flattened_states.device,
+    ).repeat_interleave(experts_per_token)
+    destination_ranks = torch.div(
+        flattened_expert_indices,
+        local_expert_count,
+        rounding_mode="floor",
+    )
 
     # 2. sort by (dest, expert) + counts exchange (extended EP group)
-    perm = (dest * e_global + flat_idx).argsort()
-    send_x = x[token_of[perm]].contiguous()
-    send_eid = flat_idx[perm].unsqueeze(-1).contiguous()
-    send_counts_t = torch.bincount(dest, minlength=ep_size)
-    recv_counts_t = torch.empty_like(send_counts_t)
-    dist.all_to_all_single(recv_counts_t, send_counts_t, group=ep_group)
-    send_counts = send_counts_t.tolist()
-    recv_counts = recv_counts_t.tolist()
+    dispatch_order = (
+        destination_ranks * global_expert_count + flattened_expert_indices
+    ).argsort()
+    dispatched_states = flattened_states[source_token_indices[dispatch_order]].contiguous()
+    dispatched_expert_indices = flattened_expert_indices[
+        dispatch_order
+    ].unsqueeze(-1).contiguous()
+    send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
+    receive_counts_tensor = torch.empty_like(send_counts_tensor)
+    dist.all_to_all_single(
+        receive_counts_tensor,
+        send_counts_tensor,
+        group=ep_group,
+    )
+    send_counts = send_counts_tensor.tolist()
+    receive_counts = receive_counts_tensor.tolist()
 
     # 3. a2a dispatch over the extended EP group (tokens carry the full H,
     #    sent to the rank holding the expert)
-    recv_x = _ep_all_to_all(send_x, send_counts, recv_counts, ep_group)
-    recv_eid = _ep_all_to_all(
-        send_eid, send_counts, recv_counts, ep_group).squeeze(-1)
+    received_states = _ep_all_to_all(
+        dispatched_states,
+        send_counts,
+        receive_counts,
+        ep_group,
+    )
+    received_global_expert_indices = _ep_all_to_all(
+        dispatched_expert_indices,
+        send_counts,
+        receive_counts,
+        ep_group,
+    ).squeeze(-1)
 
-    # 4. local SwiGLU (complete expert weights) -> output complete (no Partial,
-    #    no reduction point)
-    order = recv_eid.argsort()
-    sorted_x = recv_x[order]
-    local_counts = torch.bincount(recv_eid - expert_offset, minlength=e_local)
-    ys, pos = [], 0
-    for i in range(e_local):
-        n = int(local_counts[i])
-        xi = sorted_x[pos:pos + n]
-        if w_up is None:
-            # fused layout (D-11): chunk gate/up out of gate_up_proj [E, 2I, H]
-            gate, up = F.linear(xi, w_gate[i]).chunk(2, dim=-1)
-            ys.append(F.linear(F.silu(gate) * up, w_down[i]))
-        else:
-            ys.append(F.linear(F.silu(F.linear(xi, w_gate[i]))
-                               * F.linear(xi, w_up[i]), w_down[i]))
-        pos += n
-    y_sorted = torch.cat(ys) if ys else recv_x.new_zeros((0, h))
-    y = torch.empty_like(y_sorted)
-    y[order] = y_sorted
+    # 4. Call the local expert module so nested FSDP hooks unshard before
+    #    accessing expert weights and reshard after the SwiGLU computation.
+    local_expert_outputs = module.experts(
+        received_states,
+        received_global_expert_indices - expert_offset,
+    )
 
     # 5. a2a combine over the extended EP group -> inverse perm -> weighted
     #    aggregation by topk_w
-    ret_x = _ep_all_to_all(y.contiguous(), recv_counts, send_counts, ep_group)
-    out_flat = torch.zeros_like(ret_x)
-    out_flat[perm] = ret_x
-    out = (out_flat * flat_w.unsqueeze(-1)).view(t, k, h).sum(1).view(b, s, h)
+    combined_expert_outputs = _ep_all_to_all(
+        local_expert_outputs.contiguous(),
+        receive_counts,
+        send_counts,
+        ep_group,
+    )
+    flattened_outputs = torch.zeros_like(combined_expert_outputs)
+    flattened_outputs[dispatch_order] = combined_expert_outputs
+    output = (
+        flattened_outputs * flattened_expert_weights.unsqueeze(-1)
+    ).view(token_count, experts_per_token, hidden_size).sum(1).view(
+        batch_size,
+        sequence_length,
+        hidden_size,
+    )
 
     # 6. shared_experts (if present): chunk x TP-sharded weights -> Partial ->
     #    TP-group reduction
@@ -400,7 +498,7 @@ def _hf_native_ep_compute(module, hidden_states, *, router_fn,
             raise RuntimeError(
                 "shared_experts on the EP path requires tp_group "
                 "(Partial reduction of the TP-sharded output)")
-        shared_out = shared(hidden_states)
-        dist.all_reduce(shared_out, group=tp_group)
-        out = out + shared_out
-    return out
+        shared_expert_output = shared(hidden_states)
+        dist.all_reduce(shared_expert_output, group=tp_group)
+        output = output + shared_expert_output
+    return output

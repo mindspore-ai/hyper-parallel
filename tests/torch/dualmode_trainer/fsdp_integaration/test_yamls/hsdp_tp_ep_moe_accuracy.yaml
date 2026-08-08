@@ -1,0 +1,40 @@
+# Dual-mode Trainer HSDP+TP+EP MoE accuracy configuration.
+# The worker constructs matching randomly initialized HF Qwen3 MoE models for
+# standalone and distributed per-step loss and gradient comparison.
+model:
+  _target_: torch.nn.Identity
+
+optimizer:
+  _target_: torch.optim.SGD
+  lr: 0.0001
+
+training:
+  backend: hccl
+  global_batch_size: 8
+  micro_batch_size: 2
+  seed: 31415
+
+accelerator:
+  tp_size: 2
+  cp_size: 1
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+plan_overrides:
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
+
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 2
+  reshard_after_forward: true
+  enable_fsdp2_prefetch: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  replicate_params:
+    - model.norm.weight

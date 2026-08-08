@@ -1,0 +1,32 @@
+# Dual-mode Trainer HSDP+TP accuracy configuration.
+# The model and optimizer targets are placeholders because the example keeps a
+# paired standalone model for per-step gradient comparison.
+model:
+  _target_: torch.nn.Identity
+
+optimizer:
+  _target_: torch.optim.SGD
+  lr: 0.0001
+
+training:
+  backend: hccl
+  global_batch_size: 8
+  micro_batch_size: 2
+  seed: 31415
+
+accelerator:
+  tp_size: 2
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 2
+  reshard_after_forward: true
+  enable_fsdp2_prefetch: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  replicate_params:
+    - model.norm.weight
