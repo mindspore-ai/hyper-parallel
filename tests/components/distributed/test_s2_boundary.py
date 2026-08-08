@@ -4,17 +4,22 @@
 
 """test_s2_boundary.py: 核心套件合并文件。
 
-来源: test_s2_boundary_compile.py, test_s2_boundary_io.py, test_s2_path_utils.py, test_s2_tp_grad_info.py, test_local_region.py
+来源: test_s2_boundary_compile.py, test_s2_boundary_io.py, test_s2_path_utils.py,
+test_s2_tp_grad_info.py, test_local_region.py
 """
+
+# Pytest injects fixtures through parameters that intentionally reuse fixture names.
+# pylint: disable=redefined-outer-name
+
+import logging
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.nn as nn
+from torch import nn
 from hyper_models.components.distributed.local_region import local_region
 from hyper_models.components.distributed.precompiled_boundary import (
     PrecompiledBoundary,
-    RedistOp,
     _get_arg,
     _set_arg,
 )
@@ -25,6 +30,7 @@ from hyper_models.components.distributed.sharding.apply import (
 )
 from hyper_models.components.distributed.sharding_config import (
     CP,
+    EP,
     ModuleShardingSpec,
     ShardingPlan,
     TP,
@@ -60,6 +66,8 @@ def _attention_spec():
 
 
 class TestCompileInputPlan:
+    """Validate compiled input redistribution plans."""
+
     def test_attention_cp_dim_identity(self):
         """attention CP 维 in_dst=Shard(1) identity 断言：in_plan 只有 TP all-gather。"""
         b = PrecompiledBoundary(_attention_spec(), _FakeMesh(), ("tp", "cp"))
@@ -80,6 +88,8 @@ class TestCompileInputPlan:
 
 
 class TestCompileOutputPlan:
+    """Validate compiled output redistribution plans."""
+
     def test_attention_out_cp_identity_skipped(self):
         """out_plan：CP 维 identity 不产生额外 op，仅 TP reduce-scatter。"""
         b = PrecompiledBoundary(_attention_spec(), _FakeMesh(), ("tp", "cp"))
@@ -92,7 +102,7 @@ class TestCompileOutputPlan:
             out_dst={"output": {TP: Shard(1)}},
         )
         b = PrecompiledBoundary(spec, _FakeMesh(), ("tp",))
-        assert b.out_plan == []
+        assert not b.out_plan
 
     def test_multi_output_arg_index_from_out_names(self):
         spec = ModuleShardingSpec(
@@ -116,12 +126,12 @@ class TestCompileOutputPlan:
     def test_out_src_none_no_out_plan(self):
         spec = ModuleShardingSpec(out_src=None, out_dst={"output": {TP: Shard(1)}})
         b = PrecompiledBoundary(spec, _FakeMesh(), ("tp",))
-        assert b.out_plan == []
+        assert not b.out_plan
 
     def test_out_dst_none_no_out_plan(self):
         spec = ModuleShardingSpec(out_src={"output": {TP: Partial()}}, out_dst=None)
         b = PrecompiledBoundary(spec, _FakeMesh(), ("tp",))
-        assert b.out_plan == []
+        assert not b.out_plan
 
 
 # ==========================================================================
@@ -138,6 +148,8 @@ def mesh():
 
 
 class TestGetSetArg:
+    """Validate positional and keyword argument helpers."""
+
     def test_kwargs_hit_priority(self):
         args, kwargs = (torch.tensor([1]),), {"x": torch.tensor([2])}
         got = _get_arg(args, kwargs, "x", 0)
@@ -168,12 +180,14 @@ class TestGetSetArg:
 
 
 class TestRedistributeIO:
+    """Validate runtime input and output redistribution."""
+
     def test_inputs_kwargs_hit(self, mesh):
         spec = ModuleShardingSpec(
             in_src={"x": {TP: Replicate()}}, in_dst={"x": {TP: Replicate()}})
         b = PrecompiledBoundary(spec, mesh, ("tp",))
         t = torch.tensor([1.0])
-        args, kwargs = b.redistribute_inputs((), {"x": t})
+        _, kwargs = b.redistribute_inputs((), {"x": t})
         assert kwargs["x"] is t  # identity 直通
 
     def test_inputs_missing_arg_skipped(self, mesh):
@@ -181,7 +195,7 @@ class TestRedistributeIO:
         spec = ModuleShardingSpec(
             in_src={"input": {TP: Replicate()}}, in_dst={"input": {TP: Replicate()}})
         b = PrecompiledBoundary(spec, mesh, ("tp",))
-        args, kwargs = b.redistribute_inputs((torch.tensor([1]),), {})
+        _, kwargs = b.redistribute_inputs((torch.tensor([1]),), {})
         assert "input" not in kwargs
 
     def test_outputs_single(self, mesh):
@@ -204,13 +218,13 @@ class TestRedistributeIO:
         assert isinstance(out, tuple) and out[0] is ta and out[1] is tb
 
     def test_outputs_index_out_of_range_warns_and_skips(self, mesh, caplog):
+        """Skip tuple outputs absent from the runtime result and log a warning."""
         spec = ModuleShardingSpec(
             out_src={"a": {TP: Shard(1)}, "b": {TP: Partial()}},
             out_dst={"a": {TP: Replicate()}, "b": {TP: Replicate()}},
             out_names=["a", "b"],
         )
         b = PrecompiledBoundary(spec, mesh, ("tp",))
-        import logging
         with caplog.at_level(logging.WARNING):
             out = b.redistribute_outputs((torch.tensor([[1.0]]),))
         assert "Skipping" in caplog.text
@@ -220,9 +234,9 @@ class TestRedistributeIO:
         spec = ModuleShardingSpec(
             in_src={"x": {TP: Replicate()}}, in_dst={"x": {TP: Replicate()}})
         b = PrecompiledBoundary(spec, mesh, ("tp",))
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-        args, kwargs = b.redistribute_inputs((), {"x": torch.tensor([1.0])},
-                                             as_dtensor=True)
+        _, kwargs = b.redistribute_inputs(
+            (), {"x": torch.tensor([1.0])}, as_dtensor=True
+        )
         assert isinstance(kwargs["x"], DTensor)
 
 
@@ -231,7 +245,7 @@ class TestRedistributeIO:
 # S2.1: 路径工具 _resolve_module / _get_attr_by_path / _set_param_by_path。
 # ==========================================================================
 
-class _Net(nn.Module):
+class _Net(nn.Module):  # pylint: disable=abstract-method
     def __init__(self):
         super().__init__()
         self.model = nn.Module()
@@ -240,6 +254,8 @@ class _Net(nn.Module):
 
 
 class TestPathUtils:
+    """Validate module and parameter path utilities."""
+
     def test_resolve_module_nested_modulelist(self):
         net = _Net()
         assert _resolve_module(net, "model.layers.0") is net.model.layers[0]
@@ -263,7 +279,7 @@ class TestPathUtils:
         _set_param_by_path(net, "model.layers.1.weight", new_w)
         assert net.model.layers[1].weight is new_w
         # register_parameter 路径：在 _parameters 中
-        assert net.model.layers[1]._parameters["weight"] is new_w
+        assert net.model.layers[1]._parameters["weight"] is new_w  # pylint: disable=protected-access
 
     def test_set_param_by_path_setattr_branch(self):
         class Plain:
@@ -303,11 +319,11 @@ def _plan():
 
 
 def test_reads_from_plan_not_dtensor():
-    mesh = _FakeTpMesh()
-    info = build_tp_grad_info(_plan(), mesh)
-    assert info["model.embed_tokens.weight"] == (Shard(0), mesh)
-    assert info["model.layers.0.input_layernorm.weight"] == (Replicate(), mesh)
-    assert info["lm_head.weight"] == (Shard(0), mesh)
+    tp_mesh = _FakeTpMesh()
+    info = build_tp_grad_info(_plan(), tp_mesh)
+    assert info["model.embed_tokens.weight"] == (Shard(0), tp_mesh)
+    assert info["model.layers.0.input_layernorm.weight"] == (Replicate(), tp_mesh)
+    assert info["lm_head.weight"] == (Shard(0), tp_mesh)
 
 
 def test_tied_consistent_placements_unchanged():
@@ -352,6 +368,52 @@ def test_no_tp_axis_mesh_none():
     assert info["m.w"][0] == Replicate()
 
 
+def test_tp_extend_ep_uses_real_expert_source_layout():
+    """Routed experts use Shard(0) on EP while dense parameters retain TP."""
+    plan = ShardingPlan(mesh_dim_names=("tp",))
+    moe_spec = ModuleShardingSpec(
+        params={
+            "experts.gate_proj": {EP: Shard(0)},
+            "gate.weight": {TP: Replicate()},
+        }
+    )
+    moe_spec._ep_size = 4  # pylint: disable=protected-access
+    plan.modules["model.layers.0.mlp"] = moe_spec
+    dense_tp_mesh = _FakeTpMesh()
+    expert_ep_mesh = _FakeTpMesh()
+
+    info = build_tp_grad_info(
+        plan,
+        dense_tp_mesh,
+        expert_source_mesh=expert_ep_mesh,
+    )
+
+    assert info["model.layers.0.mlp.experts.gate_proj"] == (
+        Shard(0),
+        expert_ep_mesh,
+    )
+    assert info["model.layers.0.mlp.gate.weight"] == (
+        Replicate(),
+        dense_tp_mesh,
+    )
+
+
+def test_tp_extend_ep_requires_expert_source_mesh():
+    """Routed-expert metadata requires the derived EP child mesh."""
+    plan = ShardingPlan(mesh_dim_names=("tp",))
+    moe_spec = ModuleShardingSpec(
+        params={"experts.gate_proj": {EP: Shard(0)}}
+    )
+    moe_spec._ep_size = 4  # pylint: disable=protected-access
+    plan.modules["model.layers.0.mlp"] = moe_spec
+
+    with pytest.raises(
+        ValueError,
+        match="Routed expert metadata requires an expert EP source mesh",
+    ):
+        build_tp_grad_info(plan, _FakeTpMesh())
+
+
 # ==========================================================================
 # 来源: test_local_region.py
 # local_region 单元测试（单进程，torch/cpu 平台）。
@@ -361,7 +423,6 @@ def test_no_tp_axis_mesh_none():
 def mesh__local_region():
     """单 rank mesh__local_region：world_size=1 时 Replicate 与任意 Shard 语义等价，
     足以验证包装/解包/autograd 逻辑（多进程数值归 distributed UT）。"""
-    import torch.distributed as dist
     if not dist.is_initialized():
         dist.init_process_group(
             "gloo", init_method="tcp://127.0.0.1:29511", rank=0, world_size=1
@@ -375,7 +436,10 @@ def _make_dtensor(mesh__local_region, data, requires_grad=False):
 
 
 class TestWrapUnwrap:
+    """Validate DTensor unwrap and output rewrap behavior."""
+
     def test_kwargs_input_and_output_wrap(self, mesh__local_region):
+        """Unwrap keyword DTensor input and wrap the tensor output."""
         def fn(hidden_states, scale=None):
             assert not isinstance(hidden_states, DTensor)  # 区域内是 local tensor
             return hidden_states * (scale or 2.0)
@@ -392,6 +456,7 @@ class TestWrapUnwrap:
         assert torch.allclose(out.to_local(), torch.tensor([3.0, 6.0, 9.0]))
 
     def test_positional_input_via_signature_binding(self, mesh__local_region):
+        """Bind and unwrap positional DTensor inputs using the callable signature."""
         def fn(x, y):
             return x + y
 
@@ -421,6 +486,7 @@ class TestWrapUnwrap:
         assert torch.allclose(out, torch.tensor([2.0, 4.0]))
 
     def test_mixed_dtensor_and_plain_args(self, mesh__local_region):
+        """Unwrap DTensor inputs while passing ordinary tensor inputs through."""
         def fn(x, bias):
             return x + bias
 
@@ -435,6 +501,7 @@ class TestWrapUnwrap:
         assert torch.allclose(out.to_local(), torch.tensor([101.0, 102.0]))
 
     def test_tuple_output_with_none_placeholder(self, mesh__local_region):
+        """Wrap tensor tuple entries and preserve metadata placeholders."""
         def fn(x):
             return x * 2.0, "meta"
 
@@ -449,6 +516,7 @@ class TestWrapUnwrap:
         assert meta == "meta"
 
     def test_output_already_dtensor_not_rewrapped(self, mesh__local_region):
+        """Return an existing DTensor output without a second wrapper."""
         def fn(x):
             return DTensor.from_local(x * 2.0, mesh__local_region, [Replicate()])
 
@@ -463,7 +531,10 @@ class TestWrapUnwrap:
 
 
 class TestContractValidation:
+    """Validate local-region output placement contracts."""
+
     def test_out_placements_count_mismatch(self, mesh__local_region):
+        """Reject placement counts that differ from the runtime output count."""
         def fn(x):
             return x, x
 
@@ -476,6 +547,7 @@ class TestContractValidation:
             wrapped(_make_dtensor(mesh__local_region, [1.0]))
 
     def test_flat_out_placements_rejected_for_multi_output(self, mesh__local_region):
+        """Reject a flat placement declaration for multiple tensor outputs."""
         def fn(x):
             return x, x
 
@@ -488,6 +560,7 @@ class TestContractValidation:
             wrapped(_make_dtensor(mesh__local_region, [1.0]))
 
     def test_tensor_output_with_none_placement_raises(self, mesh__local_region):
+        """Reject a None placement declaration for a tensor output."""
         def fn(x):
             return x
 
@@ -500,6 +573,7 @@ class TestContractValidation:
             wrapped(_make_dtensor(mesh__local_region, [1.0]))
 
     def test_out_placements_none_returns_raw(self, mesh__local_region):
+        """Return a raw local tensor when output placements are unspecified."""
         def fn(x):
             return x * 2.0
 
