@@ -14,8 +14,10 @@
 # ============================================================================
 """Unit tests for PyTorch activation swap platform implementation."""
 import contextlib
+import gc
 import os
 import unittest
+import weakref
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -132,6 +134,30 @@ class TestSwapWrapper(unittest.TestCase):
 
 class TestAsyncSaveOnCpu(unittest.TestCase):
     """Unit tests for AsyncSaveOnCpu."""
+
+    def test_packed_tensor_does_not_retain_original_after_storage_clear(self):
+        """Clearing swap storage should release the original while keeping packed data valid."""
+        expected = torch.tensor([1.0, 2.0])
+        original = expected.clone()
+        original_ref = weakref.ref(original)
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = "group0"
+
+        with patch.object(activation_swap, "SwapManager", return_value=fake_manager):
+            saved_tensors = AsyncSaveOnCpu(group_swap=True)
+            packed = saved_tensors.pack_hook(original)
+
+        self.assertIsNot(packed, original)
+        self.assertIs(saved_tensors.storage[0][0].val, packed)
+        del original
+
+        unpacked = saved_tensors.unpack_hook(packed)
+        gc.collect()
+
+        self.assertIsNone(saved_tensors.storage)
+        self.assertIsNone(original_ref())
+        self.assertIs(unpacked, packed)
+        self.assertTrue(torch.equal(unpacked, expected))
 
     def test_invalid_policy_raises_when_tensor_is_saved(self):
         """Saving tensors under an invalid policy should raise immediately."""
