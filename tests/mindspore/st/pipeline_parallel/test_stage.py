@@ -33,6 +33,12 @@ class CountNet(nn.Cell):
         super().__init__()
         self.w = Parameter(Tensor(np.array([[2.0]], np.float32)), name="w")
         self.forward_calls = 0
+        self.trainable_params_calls = 0
+
+    def trainable_params(self, recurse: bool = True) -> list[Parameter]:
+        """Count recursive parameter-tree walks performed by the pipeline stage."""
+        self.trainable_params_calls += 1
+        return super().trainable_params(recurse=recurse)
 
     def construct(self, x):
         self.forward_calls += 1
@@ -61,3 +67,22 @@ def test_pipeline_stage_backward_reuses_forward_and_gradfn_result():
     assert net.forward_calls == 1
     assert net.w.grad is not None
     np.testing.assert_allclose(net.w.grad.asnumpy(), np.array([[3.0]], dtype=np.float32))
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_pipeline_stage_caches_trainable_params_across_forward_chunks():
+    """Forward chunks should reuse one lazily collected trainable-parameter tuple."""
+    ms.set_context(mode=ms.PYNATIVE_MODE)
+
+    net = CountNet()
+    stage = PipelineStage(net, stage_index=0, stage_num=1, has_backward=True)
+
+    stage.forward_one_chunk(0, args=(Tensor(np.array([[3.0]], np.float32)),), kwargs={})
+    stage.forward_one_chunk(1, args=(Tensor(np.array([[4.0]], np.float32)),), kwargs={})
+
+    assert net.trainable_params_calls == 1

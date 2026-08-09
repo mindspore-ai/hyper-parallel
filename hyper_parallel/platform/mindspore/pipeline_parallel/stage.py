@@ -58,6 +58,9 @@ class PipelineStageBase:
         self.fwd_grad_fn_cache = {}
         self.bwd_cache = {}
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
+        # Lazily populated after the stage is first unsharded. HSDP keeps each
+        # unsharded Parameter identity stable across later shard/unshard cycles.
+        self._trainable_params = None
         # Set by the schedule (``PipelineScheduleRuntime._init_stages``); called
         # as ``hook(stage_index, micro_index)`` right after a forward chunk
         # completes.  Drives the fwd-boundary P2P issue without requiring the
@@ -127,13 +130,14 @@ class PipelineStageBase:
         composite_kwargs = kwargs or {}
         if self._has_backward:
             grad_position = self._grad_position_from_requires_grad(composite_args)
-            weights = tuple(self.submodule.trainable_params())
+            if self._trainable_params is None:
+                self._trainable_params = tuple(self.submodule.trainable_params())
             platform = get_platform()
             with platform.recompute_handle_collector_ctx() as handles:
                 out, grad_fn = forward_and_gradfn(
                     self.submodule,
                     *composite_args,
-                    weights=weights,
+                    weights=self._trainable_params,
                     grad_position=grad_position,
                     **composite_kwargs,
                 )
