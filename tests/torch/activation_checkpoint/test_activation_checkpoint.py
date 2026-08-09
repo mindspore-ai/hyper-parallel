@@ -30,13 +30,15 @@ def test_ac_memory_group():
         2. test_checkpoint_wrapper_accepts_func
         3. test_wrapper_overlap_detection_cases
         4. test_wrapper_non_overlapping_allowed_cases
+        5. test_rmsnorm_matmul_checkpoint_exclude_memory
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(ACTIVATION_CHECKPOINT, "test_ac_memory_comparison", 12404, 1),
         TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_wrapper_accepts_func", 12405, 1),
         TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_overlap_detection_cases", 12406, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_non_overlapping_allowed_cases", 12407, 1)
+        TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_non_overlapping_allowed_cases", 12407, 1),
+        TorchCase("checkpoint_exclude_matmul.py", "test_rmsnorm_matmul_checkpoint_exclude_memory", 12408, 1),
     ])
 
 

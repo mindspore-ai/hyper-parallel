@@ -97,6 +97,7 @@ SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 from hyper_parallel.core.activation_checkpoint import (
     CheckpointPolicy,
     SwapManager,
+    checkpoint_exclude_wrapper,
     checkpoint_wrapper,
     swap_wrapper,
 )
@@ -111,6 +112,12 @@ def recompute_policy(ctx, op, *args, **kwargs):
     return CheckpointPolicy.MUST_RECOMPUTE
 
 model.layers[1] = checkpoint_wrapper(model.layers[1], policy_fn=recompute_policy)
+
+# 连续 SAVE 区域只保留链尾输出；两个区域内部为 backward 保存的激活不受影响。
+model.expensive_a = checkpoint_exclude_wrapper(model.expensive_a, save_output=False)
+model.expensive_b = checkpoint_exclude_wrapper(model.expensive_b)
+
+# PyTorch eager 和 MindSpore PyNative 使用相同的配置及边界语义。
 
 # 用 swap_wrapper 替换模块：模块 forward 中保存的中间激活会按策略 offload 到 CPU
 def tensor_swap_policy(tensor):
