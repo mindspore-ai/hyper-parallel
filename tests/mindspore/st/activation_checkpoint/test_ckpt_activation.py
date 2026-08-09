@@ -36,5 +36,7 @@ def test_sac_group():
         MindSporeCase(BASE_SHARD, "test_inplace_modification", 11641, 1),
         MindSporeCase(BASE_SHARD, "test_wrapper_overlap_detection_cases", 11642, 1),
         MindSporeCase(BASE_SHARD, "test_wrapper_non_overlapping_allowed_cases", 11643, 1),
-        MindSporeCase("checkpoint_exclude_matmul.py", "test_rmsnorm_matmul_checkpoint_exclude_memory", 11644, 1),
+        MindSporeCase(
+            "checkpoint_exclude_matmul.py", "test_rmsnorm_matmul_checkpoint_exclude_memory", 11644, 1
+        ),
     ])

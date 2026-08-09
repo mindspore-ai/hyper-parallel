@@ -27,15 +27,17 @@ from tests.ut.platform.mindspore._ensure_mindspore_platform import (
 )
 
 ms = pytest.importorskip("mindspore")
-ParameterTuple = ms.ParameterTuple
 Parameter = ms.Parameter
 Tensor = ms.Tensor
 nn = ms.nn
 ops = ms.ops
-_Function = importlib.import_module("mindspore.common._grad_function")._Function
 _pynative_executor = importlib.import_module("mindspore.graph.api")._pynative_executor
 
 ensure_mindspore_platform_default()
+enable_mindspore_backward_compat = importlib.import_module(
+    "hyper_parallel.platform.mindspore.autograd_compat"
+).enable_mindspore_backward_compat
+enable_mindspore_backward_compat()
 
 activation_checkpoint = importlib.import_module("hyper_parallel.core.activation_checkpoint")
 checkpoint_wrapper = activation_checkpoint.checkpoint_wrapper
@@ -49,25 +51,6 @@ checkpoint_exclude_wrapper_module = importlib.import_module(
     "hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper"
 )
 CheckpointExcludeWrapper = checkpoint_exclude_wrapper_module.CheckpointExcludeWrapper
-
-
-class _SaveExactInput(_Function):
-    """Autograd function that saves its exact input for backward."""
-
-    calls = 0
-
-    @staticmethod
-    def forward(ctx: Any, tensor: Tensor) -> Tensor:
-        """Save the input and return its square."""
-        _SaveExactInput.calls += 1
-        ctx.save_for_backward(tensor)
-        return tensor * tensor
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tensor:
-        """Use the saved input to compute the square gradient."""
-        (tensor,) = ctx.saved_tensors
-        return grad_output * 2 * tensor
 
 
 class _FunctionBlock(nn.Cell):
@@ -126,7 +109,7 @@ class _SavedInputBlock(nn.Cell):
         def excluded(tensor: Tensor) -> Tensor:
             """Save the exact recomputed input without rerunning on replay."""
             self.calls["excluded"] += 1
-            return _SaveExactInput.apply(tensor)
+            return tensor * tensor
 
         self.excluded = checkpoint_exclude_wrapper(excluded)
 
@@ -134,6 +117,31 @@ class _SavedInputBlock(nn.Cell):
         """End the checkpoint body at the excluded region's scalar output."""
         self.calls["block"] += 1
         return self.excluded(tensor * 3).sum()
+
+
+class _MultiOutputSaveBlock(nn.Cell):
+    """Checkpointed block with two SAVE outputs consumed as one argument."""
+
+    def __init__(self, calls: dict) -> None:
+        """Initialize adjacent SAVE regions and their execution counters."""
+        super().__init__()
+
+        def first(tensor: Tensor) -> tuple:
+            """Return two differentiable outputs while saving the input."""
+            calls["first"] += 1
+            return tensor * tensor, tensor * tensor * tensor
+
+        def second(outputs: tuple) -> Tensor:
+            """Consume the complete structured output as one SAVE argument."""
+            calls["second"] += 1
+            return outputs[0] + outputs[1]
+
+        self.first = checkpoint_exclude_wrapper(first, save_output=False)
+        self.second = checkpoint_exclude_wrapper(second)
+
+    def construct(self, tensor: Tensor) -> Tensor:
+        """Return a loss depending on both outputs of the first SAVE region."""
+        return self.second(self.first(tensor)).sum()
 
 
 class _PrecisionMiddle(nn.Cell):
@@ -191,13 +199,19 @@ class _PrecisionBlock(nn.Cell):
 
 def _run_precision_sequence(net):
     """Run two different inputs through one network and collect all gradients."""
-    weights = ParameterTuple(net.trainable_params())
-    value_and_grad = ms.value_and_grad(net, grad_position=0, weights=weights)
+    weights = tuple(net.trainable_params())
     base_input = np.linspace(-1.5, 1.25, 24, dtype=np.float32).reshape(6, 4)
     results = []
     for scale in (1.0, 1.7):
-        value, (input_grad, param_grads) = value_and_grad(Tensor(base_input * scale))
+        tensor = Tensor(base_input * scale)
+        tensor.requires_grad = True
+        value = net(tensor)
+        value.backward()
+        input_grad = tensor.grad
+        param_grads = tuple(parameter.grad for parameter in weights)
         results.append((value, input_grad, tuple(param_grads)))
+        for parameter in weights:
+            parameter.grad = None
     return results
 
 
@@ -246,6 +260,7 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         """Clear PyNative autodiff state left by earlier same-process tests."""
         ensure_mindspore_platform_default()
         _pynative_executor.clear_res()
+        _pynative_executor.set_grad_flag(True)
 
     def tearDown(self) -> None:
         """Keep this test's PyNative autodiff state away from later tests."""
@@ -296,33 +311,37 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
 
         def apply_boundary(tensor: Tensor) -> Tensor:
             """Apply the boundary in a differentiable function."""
-            return checkpoint_exclude_wrapper_module._RecomputeBoundary.apply(tensor).sum()
+            trigger = checkpoint_exclude_wrapper_module._get_recompute_trigger()
+            return checkpoint_exclude_wrapper_module._RecomputeBoundary.apply(tensor, trigger).sum()
 
         tensor = Tensor(np.arange(4, dtype=np.float32))
+        tensor.requires_grad = True
         with ms.saved_tensors_hooks(pack_hook, unpack_hook):
-            _, grad = ms.value_and_grad(apply_boundary)(tensor)
+            value = apply_boundary(tensor)
+            value.backward()
 
         self.assertEqual(packed_shapes, [(0,)])
         self.assertEqual(unpacked_shapes, [(0,)])
-        np.testing.assert_array_equal(grad.asnumpy(), np.ones(4, dtype=np.float32))
+        np.testing.assert_array_equal(tensor.grad.asnumpy(), np.ones(4, dtype=np.float32))
 
-    def test_recompute_boundary_lazily_reuses_trigger(self):
-        """The boundary trigger should be created lazily and reused globally."""
-        get_trigger = checkpoint_exclude_wrapper_module._get_recompute_trigger
-        get_trigger.cache_clear()
+    def test_replay_placeholder_is_lazily_reused(self):
+        """Replay should reuse one zero-element placeholder."""
+        get_placeholder = checkpoint_exclude_wrapper_module._get_replay_placeholder
+        get_placeholder.cache_clear()
 
-        self.assertEqual(get_trigger.cache_info().currsize, 0)
-        trigger = get_trigger()
-        self.assertIs(trigger, get_trigger())
-        self.assertEqual(trigger.dtype, ms.float32)
-        self.assertEqual(tuple(trigger.shape), (0,))
-        self.assertEqual(get_trigger.cache_info().currsize, 1)
+        self.assertEqual(get_placeholder.cache_info().currsize, 0)
+        placeholder = get_placeholder()
+        self.assertIs(placeholder, get_placeholder())
+        self.assertEqual(tuple(placeholder.shape), (0,))
+        self.assertEqual(get_placeholder.cache_info().currsize, 1)
 
     def test_parameter_input_is_not_marked(self):
         """Parameter inputs should keep the existing saved-tensor behavior."""
         parameter = Parameter(Tensor(np.arange(4, dtype=np.float32)), name="exclude_parameter")
 
-        bindings, previous_handles = checkpoint_exclude_wrapper_module._mark_recompute_inputs((parameter,), {})
+        bindings, previous_handles = checkpoint_exclude_wrapper_module._mark_recompute_inputs(
+            object(), (parameter,), {}
+        )
 
         self.assertEqual(bindings, [])
         self.assertEqual(previous_handles, [])
@@ -340,7 +359,9 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         key = checkpoint_exclude_wrapper_module._RECOMPUTE_INPUT_HANDLE_KEY
 
         with self.assertRaisesRegex(RuntimeError, "nested traversal failed"):
-            checkpoint_exclude_wrapper_module._mark_recompute_inputs((tensor, _BrokenDict()), {})
+            checkpoint_exclude_wrapper_module._mark_recompute_inputs(
+                object(), (tensor, _BrokenDict()), {}
+            )
 
         self.assertIsNone(tensor._get_user_data(key))
 
@@ -351,14 +372,19 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         args = ({"items": [first]}, first)
         kwargs = {"second": second}
 
-        bindings, previous_handles = checkpoint_exclude_wrapper_module._mark_recompute_inputs(args, kwargs)
+        bindings, previous_handles = checkpoint_exclude_wrapper_module._mark_recompute_inputs(
+            object(), args, kwargs
+        )
         checkpoint_exclude_wrapper_module._restore_recompute_inputs(previous_handles)
         for binding in bindings:
             binding.handle.mark_used()
 
         replay_first = Tensor(np.array([5.0, 6.0], dtype=np.float32))
         replay_second = Tensor(np.array([7.0, 8.0], dtype=np.float32))
-        entry = checkpoint_exclude_wrapper_module._ExcludeCacheEntry(output=None, input_bindings=bindings)
+        entry = checkpoint_exclude_wrapper_module._ExcludeCacheEntry(
+            output=None,
+            input_bindings=bindings,
+        )
         checkpoint_exclude_wrapper_module._materialize_recompute_inputs(
             entry,
             ({"items": [replay_first]}, replay_first),
@@ -397,21 +423,78 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
     def test_recomputed_input_materializes_before_excluded_backward(self):
         """A terminal excluded region should recover its saved input from replay."""
         calls = {"block": 0, "excluded": 0}
-        _SaveExactInput.calls = 0
         net = checkpoint_wrapper(_SavedInputBlock(calls))
         tensor = Tensor(np.array([1.0, 2.0], dtype=np.float32))
+        tensor.requires_grad = True
 
-        value, grad = ms.value_and_grad(net, grad_position=0)(tensor)
+        value = net(tensor)
+        value.backward()
 
         np.testing.assert_allclose(value.asnumpy(), np.array(45.0, np.float32), atol=1e-6, rtol=1e-6)
         np.testing.assert_allclose(
-            grad.asnumpy(),
+            tensor.grad.asnumpy(),
             np.array([18.0, 36.0], np.float32),
             atol=1e-6,
             rtol=1e-6,
         )
         self.assertEqual(calls, {"block": 2, "excluded": 1})
-        self.assertEqual(_SaveExactInput.calls, 1)
+
+    def test_save_output_source_is_not_marked_for_recomputation(self):
+        """Inputs produced by SAVE regions should remain owned by their downstream pack."""
+        invocation_id = object()
+        tensor = Tensor(np.arange(4, dtype=np.float32))
+        tensor.requires_grad = True
+        output = checkpoint_exclude_wrapper_module._finalize_save_outputs(tensor, True, invocation_id)
+
+        bindings, previous_handles = checkpoint_exclude_wrapper_module._mark_recompute_inputs(
+            invocation_id, (output,), {}
+        )
+
+        self.assertEqual(bindings, [])
+        self.assertEqual(previous_handles, [])
+
+        bindings, previous_handles = checkpoint_exclude_wrapper_module._mark_recompute_inputs(
+            object(), (output,), {}
+        )
+        checkpoint_exclude_wrapper_module._restore_recompute_inputs(previous_handles)
+        self.assertEqual(len(bindings), 1)
+
+    def test_elided_output_cache_does_not_retain_tensor_storage(self):
+        """An elided SAVE output cache should not own the forward tensor."""
+        tensor = Tensor(np.arange(4, dtype=np.float32))
+        tensor_ref = weakref.ref(tensor)
+
+        entry = checkpoint_exclude_wrapper_module._ExcludeCacheEntry(
+            output=None,
+            input_bindings=[],
+        )
+        del tensor
+
+        self.assertIsNone(tensor_ref())
+        self.assertIsNone(entry.output)
+        placeholder = checkpoint_exclude_wrapper_module._get_replay_placeholder()
+        self.assertEqual(tuple(placeholder.shape), (0,))
+        self.assertEqual(placeholder.dtype, ms.float32)
+        self.assertFalse(placeholder._requires_grad)  # pylint: disable=protected-access
+
+    def test_elided_multi_output_replay_preserves_boundary_count(self):
+        """Replay should create one placeholder boundary for each forward Tensor output."""
+        calls = {"first": 0, "second": 0}
+        net = checkpoint_wrapper(_MultiOutputSaveBlock(calls))
+        tensor = Tensor(np.array([1.0, 2.0], dtype=np.float32))
+        tensor.requires_grad = True
+
+        value = net(tensor)
+        value.backward()
+
+        np.testing.assert_allclose(value.asnumpy(), np.array(14.0, np.float32), atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(
+            tensor.grad.asnumpy(),
+            np.array([5.0, 16.0], np.float32),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        self.assertEqual(calls, {"first": 1, "second": 1})
 
     def test_function_wrapper_skips_middle_recompute(self):
         """A wrapped function should run in forward and reuse its output in recompute."""
@@ -420,8 +503,12 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         net = checkpoint_wrapper(block)
         x = Tensor(np.arange(1, 5, dtype=np.float32))
         y = Tensor(np.full((4,), 2, dtype=np.float32))
+        x.requires_grad = True
+        y.requires_grad = True
 
-        value, grads = ms.value_and_grad(net, grad_position=(0, 1))(x, y)
+        value = net(x, y)
+        value.backward()
+        grads = (x.grad, y.grad)
 
         self.assertIsInstance(block.middle, CheckpointExcludeWrapper)
         self.assertEqual(calls["middle"], 1)
@@ -440,8 +527,10 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         calls = {"middle": 0}
         net = checkpoint_wrapper(_StateBlock(states, calls))
         x = Tensor(np.arange(1, 5, dtype=np.float32))
+        x.requires_grad = True
 
-        _ = ms.value_and_grad(net, grad_position=0)(x)
+        value = net(x)
+        value.backward()
 
         self.assertEqual(states, [False, True])
         self.assertEqual(calls["middle"], 1)
@@ -476,8 +565,12 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
 
         x = Tensor(np.arange(1, 5, dtype=np.float32))
         y = Tensor(np.full((4,), 2, dtype=np.float32))
+        x.requires_grad = True
+        y.requires_grad = True
 
-        value, grads = ms.value_and_grad(forward, grad_position=(0, 1))(x, y)
+        value = forward(x, y)
+        value.backward()
+        grads = (x.grad, y.grad)
 
         self.assertEqual(calls["middle"], 2)
         np.testing.assert_allclose(value.asnumpy(), np.array(216.0, np.float32), atol=1e-6, rtol=1e-6)
@@ -510,26 +603,34 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         net = checkpoint_wrapper(_FunctionBlock(calls), context_fn=context_fn)
         x = Tensor(np.arange(1, 5, dtype=np.float32))
         y = Tensor(np.full((4,), 2, dtype=np.float32))
+        x.requires_grad = True
+        y.requires_grad = True
 
-        value, grads = ms.value_and_grad(net, grad_position=(0, 1))(x, y)
+        value = net(x, y)
+        value.backward()
+        grads = (x.grad, y.grad)
 
         self.assertEqual(calls["middle"], 1)
         self.assertEqual(events, ["enter:forward", "exit:forward", "enter:recompute", "exit:recompute"])
         np.testing.assert_allclose(value.asnumpy(), np.array(80.0, np.float32), atol=1e-6, rtol=1e-6)
         np.testing.assert_allclose(grads[0].asnumpy(), np.full((4,), 8, np.float32), atol=1e-6, rtol=1e-6)
 
-    def test_platform_checkpoint_preserves_default_reentrant_behavior(self):
-        """The platform checkpoint API should retain MindSpore's reentrant default."""
+    def test_platform_checkpoint_supports_non_reentrant_compat_backward(self):
+        """The low-level checkpoint API should support compatibility backward."""
         calls = {"middle": 0}
         block = _FunctionBlock(calls)
         x = Tensor(np.arange(1, 5, dtype=np.float32))
         y = Tensor(np.full((4,), 2, dtype=np.float32))
+        x.requires_grad = True
+        y.requires_grad = True
 
         def forward(input_x: Tensor, input_y: Tensor) -> Tensor:
-            """Use the low-level platform checkpoint without checkpoint kwargs."""
-            return get_platform().checkpoint(block, input_x, input_y)
+            """Use the supported non-reentrant low-level checkpoint path."""
+            return get_platform().checkpoint(block, input_x, input_y, use_reentrant=False)
 
-        value, grads = ms.value_and_grad(forward, grad_position=(0, 1))(x, y)
+        value = forward(x, y)
+        value.backward()
+        grads = (x.grad, y.grad)
 
         self.assertEqual(calls["middle"], 2)
         np.testing.assert_allclose(value.asnumpy(), np.array(80.0, np.float32), atol=1e-6, rtol=1e-6)
@@ -539,6 +640,11 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         """The public wrapper should reject values that cannot be executed."""
         with self.assertRaisesRegex(ValueError, "Cell or callable"):
             checkpoint_exclude_wrapper(1)
+
+    def test_rejects_non_boolean_save_output(self):
+        """The save_output option should reject ambiguous truthy values."""
+        with self.assertRaisesRegex(ValueError, "save_output must be a bool"):
+            checkpoint_exclude_wrapper(lambda tensor: tensor, save_output=1)
 
     def test_cell_wrapper_preserves_repeated_step_precision(self):
         """Repeated calls should match non-checkpoint values and all gradients."""
