@@ -1599,6 +1599,23 @@ class TorchPlatform(Platform):
         return ckpt_wrapper(module, **checkpoint_kwargs)
 
     @staticmethod
+    def checkpoint_exclude_wrapper(module: Any, *, save_output: bool = True) -> Any:
+        """Wrap a module or callable whose activations should not be recomputed.
+
+        Args:
+            module: PyTorch Module or callable to exclude from checkpoint replay.
+            save_output: Whether to retain the excluded region output for replay.
+
+        Returns:
+            The platform-specific checkpoint exclusion wrapper.
+        """
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint_exclude_wrapper import (
+            checkpoint_exclude_wrapper,
+        )
+        return checkpoint_exclude_wrapper(module, save_output=save_output)
+
+    @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_wrapper

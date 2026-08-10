@@ -28,6 +28,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
     CheckpointPolicy,
     checkpoint,
+    checkpoint_exclude_wrapper,
     checkpoint_wrapper,
     swap,
 )
@@ -90,6 +91,16 @@ class TestCheckpointFunction(unittest.TestCase):
         with recompute_context:
             self.assertTrue(is_recomputing())
         self.assertFalse(is_recomputing())
+
+    def test_checkpoint_exclude_wrapper_forwards_save_output(self, mock_plat):
+        """The platform wrapper should receive the explicit output-retention policy."""
+        module = MagicMock()
+        mock_plat.checkpoint_exclude_wrapper.return_value = "wrapped"
+
+        result = checkpoint_exclude_wrapper(module, save_output=False)
+
+        self.assertEqual(result, "wrapped")
+        mock_plat.checkpoint_exclude_wrapper.assert_called_once_with(module, save_output=False)
 
     def test_checkpoint_with_swap_inputs(self, mock_plat):
         """Test checkpoint with swap_inputs=True."""

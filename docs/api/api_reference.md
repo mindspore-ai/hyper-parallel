@@ -908,11 +908,20 @@ checkpoint_wrapper(module, **checkpoint_kwargs) -> CheckpointWrapper
 重算阶段直接复用前向输出，以额外显存占用换取计算开销降低。
 
 ```python
-checkpoint_exclude_wrapper(module) -> CheckpointExcludeWrapper
+checkpoint_exclude_wrapper(
+    module,
+    *,
+    save_output: bool = True,
+) -> CheckpointExcludeWrapper
 ```
 
-当前仅支持 MindSpore PyNative 模式，并且需要在 HyperParallel 的 `checkpoint` 或
-`checkpoint_wrapper`（`use_reentrant=False`）内部使用。支持包装 MindSpore Cell 和普通 callable。
+支持 PyTorch eager 和 MindSpore PyNative 模式，并且需要在 HyperParallel 的 `checkpoint` 或
+`checkpoint_wrapper`（`use_reentrant=False`）内部使用。支持包装 Module/Cell 和普通 callable。
+
+`save_output=False` 用于连续 SAVE 区域的中间节点：该区域内部通过 saved-tensor hooks 保存的反向激活
+保持不变，但其边界输出不会为 replay 常驻显存。此时区域返回值必须作为一个参数整体直接传给另一个
+`checkpoint_exclude_wrapper`，不能在中间被解包、被 replay 中执行的普通算子读取，也不能作为 checkpoint
+的最终输出。
 
 ---
 

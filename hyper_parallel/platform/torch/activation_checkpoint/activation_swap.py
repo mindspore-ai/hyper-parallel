@@ -220,16 +220,19 @@ class ActivationWrapper(torch.nn.Module, ABC):
     Not meant to be instantiated directly.
     """
 
-    def __init__(self, module: Union[nn.Module, Callable]):
+    def __init__(self, module: Union[nn.Module, Callable], *, track_overlaps: bool = True):
+        """Initialize a wrapper and optionally participate in overlap tracking."""
         if callable(module) and not isinstance(module, nn.Module):
-            _check_and_mark_callable(module)
+            if track_overlaps:
+                _check_and_mark_callable(module)
             module = FuncModule(module)
-            _mark_wrapped(module)
-        else:
+            if track_overlaps:
+                _mark_wrapped(module)
+        elif track_overlaps:
             _check_and_mark_wrapped(module)
         super().__init__()
         self._swap_wrapped_module = module
-        self._is_wrapped = True
+        self._is_wrapped = track_overlaps
         # state_dict post hook to remove prefix to allow loading into a
         # non-swap wrapped module.
         self._register_state_dict_hook(self._post_state_dict_hook)
