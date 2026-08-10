@@ -113,6 +113,11 @@ class DistributedSetup:
     pipeline_config: Any = None
     moe_parallel_config: Any = None
     activation_checkpointing: Any = None
+    # TrainerConfig.plan_overrides (List[PlanOverride]) — plan_overrides 的
+    # YAML 传输形态（注入字段 + 契约 DSL + when 条件）；
+    # instantiate_infrastructure 在构造 planner 前经 entries_to_plan_overrides
+    # 脱糖（含 when 过滤）
+    plan_overrides: Any = None
 
 
 # ── initialize_distributed (stub) ──
@@ -276,6 +281,7 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     return DistributedSetup(
         mesh_context=mesh_ctx,
         strategy_config=strategy_config,
+        plan_overrides=getattr(cfg, "plan_overrides", None),
     )
 
 

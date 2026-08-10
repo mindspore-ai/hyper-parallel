@@ -3,24 +3,31 @@
 # ============================================================================
 """自定义模块示例 2：inner_target + inner_wrapper —— 自定义 CP wrapper。
 
+region_dispatch 判断口诀：注入物含通信原语/自定义 kernel/数据依赖分支 → False（黑盒托管）；纯 aten 标准算子 → True（validate 穿透真校验）。拿不准时用 check_dispatchable(fn, example_inputs, mesh) 在开发期探明。
+
 用法:
     PYTHONPATH=. torchrun --nproc_per_node=2 examples/distributed/custom_inner_wrapper.py
 
-场景：NeMo 风格自研 attention，inner 子模块名是非标准的 `core_attention`
-（自动定位失败），且想用自己的 CP wrapper（注册为命名方案）。
+场景：NeMo 风格自研 attention，inner 子模块名是非标准的 `core_attention`，
+且想用自己的 CP wrapper（注册为命名方案）。
 
 要点：
 - `inner_target="core_attention"`：纯位置——显式指定 inner 子模块
-  （自动定位失败时 fail-fast，此字段即指定入口）；
-- `inner_wrapper="demo_allgather"`：纯行为——str 引用 CP_WRAPPER_REGISTRY
+  （与 `inner_wrapper` 成对必填；自动定位启发式已删除，任何目标都须
+  显式声明，包装模块自身写 `"self"`）；
+- `inner_wrapper="demo_allgather"`：纯行为——str 引用 INNER_WRAPPER_REGISTRY
   里的命名方案（内置四路 "sdpa_qkv"/"sdpa_hf"/"flex_qkv"/"flex_hf"
-  之外的第 5 种出口）；也可以直接给 callable；
-- wrapper 契约：fn(target, cp_mesh, *, spec=None, mesh=None,
-  mesh_dim_names=()) -> None，原地替换 target.forward；
+  之外的第 5 种出口）；也可以直接给 callable 或 Target；
+- **统一 override 通道**：plan_overrides 命中推导边界时走 merge——
+  空字段（params/契约）继承模板推导结果，只需声明注入字段；glob key
+  "*.self_attn" 一条覆盖所有层；
+- wrapper 契约：@inner_wrapper fn(target_module, mesh, tp_mesh, cp_mesh,
+  ep_mesh) -> None（mesh 家族框架填充），原地替换 target.forward；
 - 本例 wrapper 只做 K/V all-gather（复用 flex_cp_allgather），语义与内置
-  "sdpa_qkv" 相同；非 causal 简化。若需支持 validate 模式（输入为
-  DTensor），wrapper 内要做 unwrap/rewrap 容错——参考内置
-  `_wrap_sdpa_for_cp` 的实现。
+  "sdpa_qkv" 相同；非 causal 简化。**local-only**：函数体内零 DTensor
+  代码——validate 的解包/重包由框架双模适配器托管（重包布局用声明的
+  inner_out_src="first_input"，即输出 == q 布局），production/validate
+  双模式对拍。
 """
 
 import torch
@@ -31,36 +38,44 @@ from hyper_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
+    inner_wrapper,
 )
 from hyper_models.components.distributed.cp_utils import (
     flex_cp_allgather,
     shard_batch_for_cp,
 )
-from hyper_models.components.distributed.sharding_applier import (
-    CP_WRAPPER_REGISTRY,
+from hyper_models.components.distributed.cp_wrappers import (
+    INNER_WRAPPER_REGISTRY,
 )
-from hyper_models.components.distributed.sharding_config import CP
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
-from hyper_parallel.core.dtensor.placement_types import Shard
 
 
 # ── 自定义 CP wrapper（注册为命名方案） ─────────────────────────────────────
 
-def demo_cp_wrapper(target, cp_mesh, *, spec=None, mesh=None, mesh_dim_names=()):
-    """在 target.forward(q, k, v) 前对 K/V 做 CP all-gather。
+@inner_wrapper
+def demo_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """在 target_module.forward(q, k, v) 前对 K/V 做 CP all-gather。
 
-    通信组取 cp_mesh.get_group()（DeviceMesh 缓存组，不得 new_group）。
+    @inner_wrapper 是强制纪律（injection.py）：target_module + mesh 家族
+    四个参数为必选上下文，apply 时全部由框架填充（本例只用 cp_mesh），
+    用户只管使用。**local-only**：替换后的 forward 只面向 local 张量——
+    DTensor 解包/参数临时解包/输出重包全部由框架的双模适配器托管（重包
+    用 plan 里显式声明的 inner_out_src，本例 "first_input" = 输出布局
+    与 q 一致）；本函数体内零 DTensor 代码。通信组取 cp_mesh.get_group()
+    （DeviceMesh 缓存组，不得 new_group）。替换后的 forward 必须能接收
+    原 forward 的全部入参（apply 时校验）。
     """
-    orig_forward = target.forward
+    orig_forward = target_module.forward
 
     def cp_forward(q, k, v, **kwargs):
-        k, v = flex_cp_allgather(k, v, 2, cp_mesh)   # [B, N, S_local, H] → S_full
-        return orig_forward(q, k, v, **kwargs)
+        gk, gv = flex_cp_allgather(
+            k.contiguous(), v.contiguous(), 2, cp_mesh)  # S_local → S_full
+        return orig_forward(q, gk, gv, **kwargs)
 
-    target.forward = cp_forward
+    target_module.forward = cp_forward
 
 
-CP_WRAPPER_REGISTRY["demo_allgather"] = demo_cp_wrapper
+INNER_WRAPPER_REGISTRY["demo_allgather"] = demo_cp_wrapper
 
 
 # ── 模型 ────────────────────────────────────────────────────────────────────
@@ -86,8 +101,8 @@ class CoreAttention(nn.Module):
 class MyNeMoAttention(nn.Module):
     """外层 attention：q/k/v/o 投影 + 非标准命名的 inner 子模块。
 
-    `core_attention` 不在自动定位的属性名单（inner_attention/attn/
-    attention）里——必须靠 inner_target 显式指定。
+    inner 子模块目标必须靠 `inner_target` 显式指定（自动定位启发式
+    已删除）——这里包装 `core_attention` 子模块。
     """
 
     def __init__(self, h, n_heads):
@@ -153,22 +168,21 @@ class TinyModel(nn.Module):
 
 
 def build_overrides(num_layers):
-    """attention 边界 spec：CP 契约 + inner_target/inner_wrapper 声明。
+    """attention 边界 spec：只需声明注入字段——merge 语义下 params 与 I/O
+    契约从 planner 推导结果继承（统一改造后无需重声明）。
 
-    CP 不切参数（params 空声明即全复制）；in/out 沿序列维 Shard(1)。
+    glob key "*.self_attn" 一条覆盖所有层（fnmatch，* 跨段匹配）。
     """
-    overrides = {}
-    for i in range(num_layers):
-        overrides[f"model.layers.{i}.self_attn"] = ModuleShardingSpec(
-            params={},
-            in_src={"hidden_states": {CP: Shard(1)}},
-            in_dst={"hidden_states": {CP: Shard(1)}},
-            out_src={CP: Shard(1)},
-            out_dst={CP: Shard(1)},
+    return {
+        "*.self_attn": ModuleShardingSpec(
             inner_target="core_attention",        # 纯位置：非标准属性名
             inner_wrapper="demo_allgather",       # 纯行为：注册表命名方案
-        )
-    return overrides
+            inner_out_src="first_input",          # 纯布局：输出 == q（inner
+                                                  # 子模块重包的显式声明）
+            region_dispatch=False,                # wrapper 内含 all-gather
+                                                  # 通信 → 不可 dispatch
+        ),
+    }
 
 
 def main():
@@ -186,25 +200,27 @@ def main():
     with torch.no_grad():
         expected = ref(input_ids)
 
-    torch.manual_seed(0)
-    model = TinyModel().eval()
-    planner = ShardingPlanner(plan_overrides=build_overrides(num_layers=2))
-    plan = planner.plan(model, mesh, cp_size=cp_size)
-    # 解析结果回写：可观察性（INFO 日志同样可见）
-    model, _ = apply_sharding_plan(model, plan, mesh)
-    spec = plan.modules["model.layers.0.self_attn"]
-    assert spec._resolved_inner_wrapper == "demo_allgather"
-
     local_ids = shard_batch_for_cp({"input_ids": input_ids}, cp_mesh)["input_ids"]
-    with torch.no_grad():
-        out_local = model(local_ids)
+    for mode in ("production", "validate"):
+        torch.manual_seed(0)
+        model = TinyModel().eval()
+        planner = ShardingPlanner(plan_overrides=build_overrides(num_layers=2))
+        plan = planner.plan(model, mesh, cp_size=cp_size)
+        model, _ = apply_sharding_plan(
+            model, plan, mesh, validate_mode=(mode == "validate"))
+        # 解析结果回写：可观察性（INFO 日志同样可见）
+        spec = plan.modules["model.layers.0.self_attn"]
+        assert spec._resolved_inner_wrapper == "demo_allgather"
 
-    gathered = [torch.empty_like(out_local) for _ in range(cp_size)]
-    dist.all_gather(gathered, out_local, group=cp_mesh.get_group())
-    out = torch.cat(gathered, dim=1)
-    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
-    print(f"[rank{rank}] custom inner_wrapper='demo_allgather' "
-          f"(inner_target='core_attention') output matches single-card reference")
+        with torch.no_grad():
+            out_local = model(local_ids)
+
+        gathered = [torch.empty_like(out_local) for _ in range(cp_size)]
+        dist.all_gather(gathered, out_local, group=cp_mesh.get_group())
+        out = torch.cat(gathered, dim=1)
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+        print(f"[rank{rank}] {mode}: custom inner_wrapper='demo_allgather' "
+              f"(inner_target='core_attention') matches single-card reference")
     dist.destroy_process_group()
 
 

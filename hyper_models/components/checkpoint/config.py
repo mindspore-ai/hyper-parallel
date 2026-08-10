@@ -18,7 +18,7 @@ Following design doc 04_checkpoint.md §4.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 
 @dataclass
@@ -31,7 +31,10 @@ class CheckpointingConfig:
     enabled: bool = True
     checkpoint_dir: str = "./checkpoints"
     model_save_format: str = "safetensors"
-    save_consolidated: str = "final"  # "none" | "final" | "every"
+    # 是否额外输出合并的 HF 权重："none"（从不）| "final"（仅训练结束）| "every"（每次保存）。
+    # 关闭档统一为 "none"（YAML 安全的 Literal 取值），替代旧设计枚举的 "false"
+    # （"false" 会被 PyYAML 解析为 bool，见 04_checkpoint.md §4.2 口径裁决）。
+    save_consolidated: Literal["none", "final", "every"] = "final"
     is_peft: bool = False
     is_async: bool = False
     staging_dir: Optional[str] = None

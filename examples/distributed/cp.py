@@ -3,14 +3,18 @@
 # ============================================================================
 """CP（Context Parallel）独立示例：CP=2，HF 风格 causal attention。
 
+region_dispatch 判断口诀：注入物含通信原语/自定义 kernel/数据依赖分支 → False（黑盒托管）；纯 aten 标准算子 → True（validate 穿透真校验）。拿不准时用 check_dispatchable(fn, example_inputs, mesh) 在开发期探明。
+
 用法:
     PYTHONPATH=. torchrun --nproc_per_node=2 examples/distributed/cp.py
 
 要点：
 - 数据管道先用 shard_batch_for_cp 把 batch 按序列维切到各 CP rank（D-05）；
-- attention 内部由内置 CP wrapper 完成 K/V all-gather——本例模块是 HF 风格
-  （forward(hidden_states) 内调 F.scaled_dot_product_attention），启发式
-  自动分派到注册表 "sdpa_hf"（拦截 F.sdpa 调用点）；
+- **显式注入**（改造后无启发式自动分派）：CP wrapper 通过
+  plan_overrides glob merge 声明——本例模块是
+  HF 风格（forward(hidden_states) 内调 F.scaled_dot_product_attention），
+  选择注册表方案 "sdpa_hf"（拦截 F.sdpa 调用点）；也可写成 Target 形式
+  指向 hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper；
 - is_causal=True 触发 D-04：cp_size>1 时 is_causal 被替换为 offset-aware
   显式 mask（torch is_causal 在 q_len≠kv_len 时左上角对齐，对 rank>0 的
   CP chunk 是错的）；
@@ -23,6 +27,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from hyper_models.components.distributed import (
+    ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
 )
@@ -129,7 +134,16 @@ def main():
     for mode in ("production", "validate"):
         torch.manual_seed(0)
         model = TinyModel().eval()
-        plan = ShardingPlanner().plan(model, mesh, cp_size=cp_size)
+        # 显式 CP 注入：HF 风格 attention（内部调 F.sdpa）→ "sdpa_hf" wrapper
+        # （glob merge：契约继承推导，只需声明注入字段；inner_target="self"
+        #  显式声明包装目标=attention 模块自身——不依赖自动定位）
+        planner = ShardingPlanner(plan_overrides={
+            "*.self_attn": ModuleShardingSpec(
+                inner_target="self", inner_wrapper="sdpa_hf",
+                # wrapper 内含 K/V all-gather 通信 → 不可 dispatch，显式 False
+                region_dispatch=False),
+        })
+        plan = planner.plan(model, mesh, cp_size=cp_size)
         model, _ = apply_sharding_plan(
             model, plan, mesh, validate_mode=(mode == "validate"))
 

@@ -1,0 +1,29 @@
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Licensed under the Apache License, Version 2.0
+# ============================================================================
+# 配方：稠密 LLM TP + CP（长序列）。
+# 对应可跑示例：examples/distributed/cp.py / tp_cp_ep.py
+#
+# 要点：CP 需要给 attention 注入 CP-aware wrapper（K/V 沿 cp 轴
+# all-gather）。框架零自动注入——必须显式声明 inner_wrapper；wrapper 内
+# 含通信原语 → region_dispatch: false（骨架黑盒托管：to_local → wrapper
+# local 执行 → 声明式重包）。when: cp 让同一份配置在 cp=1 调试时自动跳过。
+
+accelerator:
+  tp_size: 2
+  cp_size: 2          # 按实际卡数调整；tp*cp*dp = world_size
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: true
+
+plan_overrides:
+  # HF 风格 attention（forward(hidden_states)，内部 F.sdpa）→ sdpa_hf。
+  # NeMo 风格（forward(q, k, v) 分离入参）改用 sdpa_qkv；FlexAttention
+  # 用 flex_hf / flex_qkv。四个均为仓内参考实现，框架零特殊对待。
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false   # wrapper 内含 K/V all-gather 通信，不可 dispatch
+    inner_target: "self"     # 包装边界模块自身（与 inner_wrapper 成对显式声明）
+    inner_wrapper: sdpa_hf   # 注册名简写；等价于
+    # inner_wrapper:
+    #   _target_: hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper

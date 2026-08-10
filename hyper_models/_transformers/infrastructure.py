@@ -43,8 +43,24 @@ def instantiate_infrastructure(
     Returns:
         (sharding_planner, fsdp2_manager, autopipeline) tuple.
     """
-    # ShardingPlanner — already implemented in components/distributed
-    sharding_planner = ShardingPlanner()
+    # ShardingPlanner — already implemented in components/distributed.
+    # plan_overrides come from the resolved TrainerConfig (YAML
+    # plan_overrides → List[PlanOverride]) via DistributedSetup; they are
+    # desugared HERE (placement DSL → objects, when-filtered against the
+    # accelerator topology) so the planner has exactly one override
+    # interface.
+    entries = getattr(distributed_setup, "plan_overrides", None) or None
+    if entries is not None:
+        from hyper_models.trainer.config import entries_to_plan_overrides
+
+        mesh_ctx = getattr(distributed_setup, "mesh_context", None)
+        plan_overrides = entries_to_plan_overrides(
+            entries,
+            cp_size=getattr(mesh_ctx, "cp_size", 1),
+            ep_size=getattr(mesh_ctx, "ep_size", 1))
+    else:
+        plan_overrides = None
+    sharding_planner = ShardingPlanner(plan_overrides=plan_overrides)
 
     # FSDP2Manager: build from strategy config if available
     fsdp2_manager = None

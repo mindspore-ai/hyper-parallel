@@ -51,6 +51,32 @@ accelerator:
   tp_size: 2
   dp_shard_size: 4
 
+plan_overrides:            # ShardingPlanner 唯一 override 接口的 YAML 形态
+  - match: "*.self_attn"   # fqn glob；命中推导边界即 merge（契约继承）
+    when: cp               # 激活条件：cp_size>1 才应用（缺省=总是应用；
+                           # 条件不满足时跳过并打日志，配置可跨拓扑复用）
+    inner_wrapper:
+      _target_: hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper
+  - match: "*.mlp"
+    when: ep               # ep_size>1 时必需（缺注入 = 静默数值错误）
+    local_compute_fn:      # 工厂 Target：apply 时注入通用上下文（module/mesh/expert_mesh）
+      _target_: hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
+      router: qwen3_moe    # 可选；缺省回落 planner arch 提示 → "default"
+  # local_compute_fn 同时也是“性能替换”通道：_target_ 指向任何返回
+  # compute_fn(module, *local_args) 的工厂即可把该边界的实现整体换掉
+  # （如朴素 attention → flash kernel），完整端到端示例见
+  # examples/distributed/perf_replacement.py + perf_replacement.yaml。
+  # 契约字段（高级用法，merge 不写=继承推导，显式 {}=清空）使用 placement 字符串 DSL
+  # "replicate"/"partial"/"shard(N)"，或哨兵 "auto"（显式继承）/"none"（显式清空）：
+  # - match: "*.mlp"
+  #   params: {gate_proj.weight: {tp: "shard(0)"}}
+  #   in_dst: {hidden_states: {tp: "replicate"}}
+  #   out_src: {tp: "partial"}       # 标量简写 = {output: {...}}
+  # 未命中任何推导边界的条目进入 insert 模式：至少声明一项契约（显式 {}
+  # 也是合法声明）；全部未声明或误用哨兵（insert 无可继承值）会 fail-fast。
+  # 覆盖以上全部场景的端到端示例：examples/distributed/plan_overrides_demo.py
+  # + plan_overrides_demo.yaml（plan 内省逐场景断言 + 双模式对拍）。
+
 mixed_precision:
   _target_: hyper_models.trainer.config.MixedPrecisionConfig
   enabled: true

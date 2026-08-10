@@ -19,6 +19,7 @@ create another copy.
 """
 
 import logging
+from contextlib import contextmanager
 from typing import Dict, List
 
 import torch
@@ -91,6 +92,37 @@ def _local_params_context(model: nn.Module):
             _set_param_by_path(model, name, nn.Parameter(
                 param.to_local(), requires_grad=param.requires_grad))
     return tp_grad_records
+
+
+@contextmanager
+def _temp_local_params(module, exclude=()):
+    """Temporarily unwrap DTensor parameters inside a validate-mode local region (restored on exit).
+
+    Under production the parameters were already permanently unwrapped at build
+    time, so this context is unnecessary. A validate-mode local region (MoE
+    all-to-all / HF CP attention) computes on local tensors internally and
+    needs local parameters; after restoration the DTensor propagation chain is
+    unbroken.
+
+    exclude: relative FQN prefixes of nested-boundary subtrees whose
+    parameters must stay DTensors (D-14 invariant 3, 05 §13.3 — inner
+    validate islands dispatch via __torch_function__ and break if the outer
+    region unwraps their parameters).
+    """
+    excluded = tuple(e.rstrip(".") + "." for e in exclude)
+    saved = []
+    for name, param in list(module.named_parameters(recurse=True)):
+        if excluded and name.startswith(excluded):
+            continue
+        if isinstance(param, DTensor):
+            saved.append((name, param))
+            _set_param_by_path(module, name, nn.Parameter(
+                param.to_local(), requires_grad=param.requires_grad))
+    try:
+        yield
+    finally:
+        for name, param in saved:
+            _set_param_by_path(module, name, param)
 
 
 # ────────────────────────────────────────────────────────────────────────────

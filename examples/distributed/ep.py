@@ -3,18 +3,24 @@
 # ============================================================================
 """EP（Expert Parallel）独立示例：HF 原生 MoE + TP-extend-EP（D-09/D-10）。
 
+region_dispatch 判断口诀：注入物含通信原语/自定义 kernel/数据依赖分支 → False（黑盒托管）；纯 aten 标准算子 → True（validate 穿透真校验）。拿不准时用 check_dispatchable(fn, example_inputs, mesh) 在开发期探明。
+
 用法:
     PYTHONPATH=. torchrun --nproc_per_node=2 examples/distributed/ep.py
 
-要点（用户侧零配置）：
+要点（显式注入）：
 - 模型是 HF 原生风格 MoE：mlp.gate（router）+ mlp.experts（per-expert
-  ModuleList，forward 无 all_to_all）。planner 自动识别；
+  ModuleList，forward 无 all_to_all）。planner 自动识别布局；
 - ep_size>1 即激活 TP-extend-EP：Phase A 先把 per-expert 参数堆叠为
   [E, ...]（D-09），再在派生 expert mesh 上按 {EP: Shard(0)} 分片
-  （每 rank 持 num_experts/ep_size 个完整 expert）；
-- 前向由内置 wrapper `_hf_native_ep_compute` 注入（local-region 解析链
-  环 2）：router → dispatch all-to-all → 本地 expert → combine all-to-all，
-  与 Megatron MoEAlltoAllTokenDispatcher 同构；
+  （每 rank 持 num_experts/ep_size 个完整 expert）——参数分片是 planner
+  的声明式推导，无需配置；
+- **compute 必须显式注入**（改造后无自动注入）：local_compute_fn 指向
+  仓内默认实现的工厂 Target ——
+  hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
+  （router → dispatch all-to-all → 本地 expert → combine all-to-all，
+  与 Megatron MoEAlltoAllTokenDispatcher 同构）；不注入会在 apply 时
+  fail-fast（_preflight_compute_injection）；
 - 约束（plan 时 fail-fast）：ep_size ≤ 且整除 dense 区域（dp×cp×tp）；
   num_experts % ep_size == 0。
 """
@@ -24,9 +30,12 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from hyper_models.components.distributed import (
+    ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
+    hf_native_ep_compute_fn,
 )
+from hyper_models.trainer.config import Target
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
 
@@ -122,7 +131,7 @@ class TinyMoeModel(nn.Module):
                  inter=16, num_experts=4):
         super().__init__()
         self.config = type("Cfg", (), {
-            "architectures": ["TinyMoeForCausalLM"],  # arch → default router adapter
+            "architectures": ["TinyMoeForCausalLM"],
             "num_experts": num_experts,
             "num_experts_per_tok": 2,
         })()
@@ -158,8 +167,23 @@ def main():
     for mode in ("production", "validate"):
         torch.manual_seed(0)
         model = TinyMoeModel().eval()
-        # ep_size=world：扩展 EP 组大小（D-10），从 dense 区域派生 expert mesh
-        plan = ShardingPlanner().plan(model, mesh, tp_size=world, ep_size=world)
+        # ep_size=world：扩展 EP 组大小（D-10）。
+        # 显式注入仓内默认 EP compute（工厂 Target；路由内嵌 default
+        # softmax top-k——路由是注入函数的一部分，框架不参与选择；其他
+        # 路由语义写自己的工厂）。expert mesh 由框架在 apply 时统一派生
+        # （与专家参数分片共享同一对象，派生有 INFO 日志），经 ep_mesh
+        # 上下文传入工厂——用户只管使用
+        planner = ShardingPlanner(plan_overrides={
+            "*.mlp": ModuleShardingSpec(
+                # EP compute 内含 all-to-all 通信 → 不可 dispatch，显式 False
+                region_dispatch=False,
+                local_compute_fn=Target(
+                    hf_native_ep_compute_fn,
+                    target_path="hyper_models.components.distributed."
+                                "ep_compute.hf_native_ep_compute_fn"),
+            ),
+        })
+        plan = planner.plan(model, mesh, tp_size=world, ep_size=world)
         spec = plan.modules["model.layers.0.mlp"]
         assert spec._ep_size == world        # TP-extend-EP 元数据已生成
         assert spec._ep_stack                # per-expert 布局 → Phase A 堆叠（D-09）

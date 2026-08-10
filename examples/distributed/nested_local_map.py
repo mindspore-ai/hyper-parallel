@@ -3,6 +3,8 @@
 # ============================================================================
 """嵌套 spec（D-14）独立示例：外层 local_map + 内层策略传播校验（validate 孤岛）。
 
+region_dispatch 判断口诀：注入物含通信原语/自定义 kernel/数据依赖分支 → False（黑盒托管）；纯 aten 标准算子 → True（validate 穿透真校验）。拿不准时用 check_dispatchable(fn, example_inputs, mesh) 在开发期探明。
+
 用法:
     PYTHONPATH=. torchrun --nproc_per_node=2 examples/distributed/nested_local_map.py
 
@@ -12,7 +14,7 @@ forward 范围太大（embed/残差/glue 代码可能存在无 dispatch 实现�
 能跑 dispatch 级策略传播校验。
 
 做法（05 §13.4 validate 孤岛）：
-- 根 fqn "" 注入外层 spec：use_local_map=True，params={}，仅声明
+- 根 fqn "" 注入外层 spec：region_dispatch=False，params={}，仅声明
   input_ids / logits 的 I/O 契约——外层走 local-region 骨架，区域内
   全程 local tensor（glue 代码永远不碰 DTensor）；
 - 内层标准边界照常推导；validate 模式下每个内层边界自动成"孤岛"：
@@ -130,12 +132,12 @@ def main():
     with torch.no_grad():
         expected = ref(input_ids)
 
-    # 外层 spec：根 fqn ""（整个 LM），use_local_map=True，params={}，
+    # 外层 spec：根 fqn ""（整个 LM），region_dispatch=False，params={}，
     # 仅声明输入/输出契约——input_ids 全复制（各 rank 同 batch），
     # logits 经 lm_head（loss_parallel=False）TP 维全复制
     root_spec = ModuleShardingSpec(
         params={},
-        use_local_map=True,   # 外层走 local-region 骨架：区域内全 local
+        region_dispatch=False,  # 外层 glue 不可 dispatch → local-region 骨架
         in_src={"input_ids": {TP: Replicate()}},
         in_dst={"input_ids": {TP: Replicate()}},     # identity
         out_src={"output": {TP: Replicate()}},
