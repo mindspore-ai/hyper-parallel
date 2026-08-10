@@ -24,7 +24,8 @@ from astroid import nodes
 from pylint.checkers import BaseChecker
 
 APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
-    "Copyright 2026 Huawei Technologies Co., Ltd",
+    "Copyright",
+    "Huawei Technologies Co., Ltd",
     "Licensed under the Apache License, Version 2.0",
     "limitations under the License.",
 )

@@ -21,7 +21,7 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
 
 ## 架构简介
 
-<div align="center"> <img src="./docs/images/HyperParallel.jpg" width = 60% /> </div>
+<div align="center"> <img src="./docs/images/HyperParallel.jpg" alt="HyperParallel 架构" width = 60% /> </div>
 
 ### HyperShard：编程模型演进，系统优化内嵌到模型 -> 模型和系统优化解耦
 
@@ -171,6 +171,10 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
     - [x] Callbacks（Logging / MoeMonitor）
     - [x] parallel_dims 并行维度配置
 
+- Hyper-RL
+    - [x] Qwen3.5 + GRPO 最小训练闭环
+    - [x] 独立 GRPO/PPO Recipe、按需 Critic、vLLM 注册和 Agentic RL 扩展
+
 - Integration
     - [x] LlamaFactory集成（activation recompute & swap + HSDP）
 
@@ -308,6 +312,7 @@ model.layers[1] = swap_wrapper(model.layers[1])
 - [安装指南](docs/installation.md) — 源码构建、依赖安装
 - [特性使用指南](./docs/guide/) — 10 个核心特性使用指南
 - [API参考](./docs/api/api_reference.md) — 按特性模块组织的接口说明
+- [Hyper-RL](./hyper_parallel/rl/) — 强化学习运行时、示例与设计文档
 - [FAQ与故障排查](./docs/faq.md) — 常见问题与解决方案
 - [AI辅助开发](./AGENTS.md) — AI辅助开发能力说明
 - [社区贡献](./docs/contributing/) — 开发环境、测试规范、发布流程

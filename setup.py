@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# encoding: utf-8
 # Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -130,14 +128,14 @@ def _read_requirements(requirements_path: str) -> list[str]:
         ]
 
 
-def get_readme_content():
+def get_readme_content() -> str:
     """Read and return the contents of README.md for use as the package long description."""
     pwd = os.path.dirname(os.path.realpath(__file__))
     with open(os.path.join(pwd, 'README.md'), encoding='UTF-8') as f:
         return f.read()
 
 
-def get_platform():
+def get_platform() -> str:
     """
     Get platform name.
 
@@ -147,7 +145,7 @@ def get_platform():
     return f"{platform.system().strip().lower()}_{platform.machine().strip().lower()}"
 
 
-def get_description():
+def get_description() -> str:
     """
     Get description.
 
@@ -187,7 +185,18 @@ def get_extra_requires() -> dict[str, list[str]]:
     }
 
 
-def update_permissions(path):
+def get_packages() -> list[str]:
+    """Discover Hyper-Parallel packages and the nested Hyper-RL package."""
+    excluded = [
+        "*tests*",
+        "hyper_parallel.auto_parallel.fast-tuner",
+        "hyper_parallel.auto_parallel.fast-tuner.*",
+    ]
+    rl_project_root = os.path.join("hyper_parallel", "rl")
+    return find_packages(exclude=excluded) + find_packages(where=rl_project_root, exclude=excluded)
+
+
+def update_permissions(path: str) -> None:
     """
     Update permissions.
 
@@ -203,7 +212,7 @@ def update_permissions(path):
             os.chmod(file_fullpath, stat.S_IREAD | stat.S_IWRITE)
 
 
-def write_commit_id():
+def write_commit_id() -> None:
     """Write the current git branch name and latest commit hash to the .commit_id file."""
     ret_code = os.system("git rev-parse --abbrev-ref HEAD > ./hyper_parallel/.commit_id "
                          "&& git log --abbrev-commit -1 >> ./hyper_parallel/.commit_id")
@@ -217,7 +226,8 @@ def write_commit_id():
 class EggInfo(egg_info):
     """Egg info."""
 
-    def run(self):
+    def run(self) -> None:
+        """Regenerate egg metadata and normalize its permissions."""
         egg_info_dir = os.path.join(os.path.dirname(
             __file__), 'hyper_parallel.egg-info')
         shutil.rmtree(egg_info_dir, ignore_errors=True)
@@ -228,7 +238,8 @@ class EggInfo(egg_info):
 class BuildPy(build_py):
     """Build py files."""
 
-    def run(self):
+    def run(self) -> None:
+        """Build Python and optional native artifacts into the wheel tree."""
         strict_native_build = _is_strict_native_build()
         if strict_native_build:
             logger.info("Strict native build mode enabled.")
@@ -286,7 +297,8 @@ class BuildPy(build_py):
 class Install(install):
     """Install."""
 
-    def run(self):
+    def run(self) -> None:
+        """Install the package and normalize installed-file permissions."""
         super().run()
         if sys.argv[-1] == 'install':
             pip = import_module('pip')
@@ -339,9 +351,8 @@ if __name__ == '__main__':
         long_description=get_readme_content(),
         long_description_content_type="text/markdown",
         test_suite="tests",
-        packages=find_packages(exclude=["*tests*",
-                                        "hyper_parallel.auto_parallel.fast-tuner",
-                                        "hyper_parallel.auto_parallel.fast-tuner.*"]),
+        packages=get_packages(),
+        package_dir={"rl": os.path.join("hyper_parallel", "rl", "rl")},
         platforms=[get_platform()],
         include_package_data=True,
         package_data={
