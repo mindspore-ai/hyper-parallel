@@ -99,10 +99,9 @@ def run_from_local_checks(
     resolved_placements: Sequence[Placement],
     *,
     shape: Optional[Tuple[int, ...]] = None,
-    stride: Optional[Tuple[int, ...]] = None,
 ) -> None:
     """Validate local shards and align replicate placements before wrapping as DTensor."""
-    check_shape_stride = shape is None and stride is None
+    check_shape_stride = shape is None
     group, group_size = _mesh_check_group(device_mesh)
     check_tensor_meta(
         local_tensor,

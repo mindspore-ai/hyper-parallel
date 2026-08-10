@@ -14,7 +14,7 @@
 # ============================================================================
 """Torch platform api"""
 from datetime import timedelta
-from typing import Optional, Any, Union
+from typing import Any, Optional, Sequence, Union
 import dataclasses
 from collections import OrderedDict
 
@@ -376,6 +376,81 @@ class _TorchP2PExchangeFunction(torch.autograd.Function):
         for req in reqs:
             req.wait()
         return recv_buf, None, None
+
+
+class _TorchDifferentiableVariableAllGather(torch.autograd.Function):
+    """Variable dim-zero all-gather with an uneven reduce-scatter backward."""
+
+    @staticmethod
+    def forward(ctx, input_tensor, output_splits, group):  # pylint: disable=arguments-differ
+        """Gather each rank's true row count without replicating inputs for A2A."""
+        if input_tensor.ndim == 0:
+            raise ValueError("variable all-gather input must have at least one dimension")
+        splits = tuple(output_splits)
+        if not splits:
+            raise ValueError("output_splits must contain at least one group rank")
+        if any(not isinstance(rows, int) or isinstance(rows, bool) or rows < 0 for rows in splits):
+            raise ValueError(f"output_splits must contain non-negative integers, got {splits!r}")
+
+        group_rank = dist.get_rank(group=group)
+        if group_rank < 0 or group_rank >= len(splits):
+            raise ValueError(f"group rank must be in [0, {len(splits)}), got {group_rank}")
+        if input_tensor.shape[0] != splits[group_rank]:
+            raise ValueError(
+                "variable all-gather local rows must match output_splits at the group rank, "
+                f"got local_rows={input_tensor.shape[0]}, group_rank={group_rank}, "
+                f"output_splits={splits!r}"
+            )
+
+        input_tensor = input_tensor.contiguous()
+        feature_shape = tuple(input_tensor.shape[1:])
+        if input_tensor.device.type == "npu":
+            gathered = [input_tensor.new_empty((rows, *feature_shape)) for rows in splits]
+            dist.all_gather(gathered, input_tensor, group=group)
+        else:
+            max_rows = max(splits)
+            if max_rows == 0:
+                gathered = [input_tensor.new_empty((0, *feature_shape)) for _ in splits]
+            else:
+                padded = input_tensor.new_zeros((max_rows, *feature_shape))
+                if input_tensor.shape[0] > 0:
+                    padded[:input_tensor.shape[0]].copy_(input_tensor)
+                padded_outputs = [torch.empty_like(padded) for _ in splits]
+                dist.all_gather(padded_outputs, padded, group=group)
+                gathered = [
+                    output[:rows].contiguous()
+                    for output, rows in zip(padded_outputs, splits)
+                ]
+
+        ctx.output_splits = splits
+        ctx.group = group
+        ctx.group_rank = group_rank
+        return torch.cat(gathered, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Sum replicated output gradients and return this rank's uneven shard."""
+        output_rows = ctx.output_splits[ctx.group_rank]
+        output = grad_output.new_empty((output_rows, *grad_output.shape[1:]))
+        if sum(ctx.output_splits) == 0:
+            return output, None, None
+
+        grad_output = grad_output.contiguous()
+        if grad_output.device.type == "npu":
+            from torch_npu.distributed import reduce_scatter_tensor_uneven  # pylint: disable=C0415
+            reduce_scatter_tensor_uneven(
+                output,
+                grad_output,
+                input_split_sizes=list(ctx.output_splits),
+                op=dist.ReduceOp.SUM,
+                group=ctx.group,
+            )
+        else:
+            reduced = grad_output.clone()
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=ctx.group)
+            start = sum(ctx.output_splits[:ctx.group_rank])
+            output.copy_(reduced.narrow(0, start, output_rows))
+        return output, None, None
 
 
 # Mapping from string op names to torch.distributed.ReduceOp
@@ -1173,6 +1248,14 @@ class TorchPlatform(Platform):
             ``[sum(output_splits), *input_tensor.shape[1:]]``.
         """
         return _AsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
+
+    @staticmethod
+    def differentiable_variable_all_gather(
+            input_tensor: Tensor, output_splits: Sequence[int], group: Any) -> Tensor:
+        """Gather variable dim-zero shards on HCCL or Gloo with autograd support."""
+        return _TorchDifferentiableVariableAllGather.apply(
+            input_tensor, tuple(output_splits), group
+        )
 
     @staticmethod
     def wait_async_tensor(tensor):

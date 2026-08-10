@@ -21,7 +21,7 @@ from torch import Tensor
 class DTensorBase(Tensor):
     """torch dtensor base"""
 
-    def __new__(cls, local_tensor, device_mesh=None, placements=None, layout=None):
+    def __new__(cls, local_tensor, device_mesh=None, placements=None, layout=None, shape=None):
         """
         Create a new DTensorBase instance.
 
@@ -31,12 +31,18 @@ class DTensorBase(Tensor):
             placements: The placement strategy for each mesh dimension.
             layout: Optional pre-built Layout reused directly by ``__init_data__``
                 (skips ``_build_layout``; see ``DTensor.from_local_with_layout``).
+            shape: Optional logical global tensor shape.
         """
         if isinstance(local_tensor, DTensorBase):
             # Copy from existing DTensorBase — use alias_placements to preserve multi-axis ordering
             t = Tensor._make_subclass(cls, local_tensor._local_tensor, local_tensor._local_tensor.requires_grad)
             copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
-            t.__init_data__(local_tensor._local_tensor, local_tensor.device_mesh, copy_placements)
+            t.__init_data__(
+                local_tensor._local_tensor,
+                local_tensor.device_mesh,
+                copy_placements,
+                shape=getattr(local_tensor, "_global_shape", None),
+            )
             return t
 
         if device_mesh is None:
@@ -46,7 +52,7 @@ class DTensorBase(Tensor):
 
         # Create Tensor subclass instance, sharing local_tensor's underlying storage
         t = Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
-        t.__init_data__(local_tensor, device_mesh, placements, layout)
+        t.__init_data__(local_tensor, device_mesh, placements, layout, shape)
         return t
 
     # pylint: disable=W0613, G.NAM.05
@@ -164,7 +170,12 @@ class DTensorBase(Tensor):
             DTensorBase: A new DTensor with the same data but detached from the computation graph.
         """
         detached_local = self._local_tensor.detach()
-        return self.__class__(detached_local, device_mesh=self._device_mesh, placements=self._alias_placements())
+        return self.__class__(
+            detached_local,
+            device_mesh=self._device_mesh,
+            placements=self._alias_placements(),
+            shape=getattr(self, "_global_shape", None),
+        )
 
     def detach_(self):
         """
@@ -281,7 +292,12 @@ class DTensorBase(Tensor):
         if dtype is None:
             return self._local_tensor.type()
         new_local = self._local_tensor.to(dtype=dtype, non_blocking=non_blocking)
-        return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._alias_placements())
+        return self.__class__(
+            new_local,
+            device_mesh=self._device_mesh,
+            placements=self._alias_placements(),
+            shape=getattr(self, "_global_shape", None),
+        )
 
     def size(self, dim: Optional[int] = None):
         """
@@ -347,7 +363,12 @@ class DTensorBase(Tensor):
         """
         new_local = self._local_tensor.to(*args, **kwargs)
         new_dt = Tensor._make_subclass(type(self), new_local, new_local.requires_grad)
-        new_dt.__init_data__(new_local, self._device_mesh, self._alias_placements())
+        new_dt.__init_data__(
+            new_local,
+            self._device_mesh,
+            self._alias_placements(),
+            shape=getattr(self, "_global_shape", None),
+        )
         return new_dt
 
     def __repr__(self) -> str:

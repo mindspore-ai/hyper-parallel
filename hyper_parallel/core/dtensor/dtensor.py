@@ -21,9 +21,20 @@ from typing import Any, Callable, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 
-from hyper_parallel.core.dtensor.device_mesh import _mesh_resources
 from hyper_parallel.core.dtensor._collective_utils import mesh_broadcast, mesh_scatter
-from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
+from hyper_parallel.core.dtensor._ragged_utils import (
+    _compute_ragged_slice,
+    _layout_has_ragged_shard,
+    _normalize_global_shape,
+    _scatter_ragged_tensor,
+    _slice_ragged_tensor,
+)
+from hyper_parallel.core.dtensor.device_mesh import _mesh_resources
+from hyper_parallel.core.dtensor.layout import (
+    DeviceMesh,
+    Layout,
+    _get_slice_tensor_by_layout,
+)
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, StridedShard
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
@@ -238,17 +249,54 @@ class DTensor(DTensorBase):
         device_mesh: DeviceMesh,
         placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]],
         layout: Optional[Layout] = None,
+        shape: Optional[Tuple[int, ...]] = None,
     ):
         self._local_tensor = local_tensor
         self._device_mesh = device_mesh
+        tensor_dim = len(shape) if shape is not None else len(local_tensor.shape)
         # Fast path: when an already-built Layout is supplied (e.g. output layouts
         # cached by infer_layout and passed straight through wrap_output), reuse it
         # directly and skip _build_layout (which otherwise recomputes device_mesh.to_hash(),
         # tuple(placements) and a cache lookup on every single output construction).
         self._layout = layout if layout is not None else _build_layout(
-            device_mesh, placements, len(local_tensor.shape)
+            device_mesh, placements, tensor_dim
         )
         self._placements = tuple(self._layout.placements)
+        is_ragged = _layout_has_ragged_shard(self._layout)
+        if is_ragged and shape is None:
+            raise ValueError(
+                "DTensor.from_local with RaggedShard requires an explicit global shape"
+            )
+        if shape is not None:
+            self._global_shape = _normalize_global_shape(shape)
+        else:
+            self._global_shape = tuple(self._layout.get_global_shape(local_tensor.shape))
+        if (
+            shape is not None
+            and (
+                self._layout.tensor_map is None
+                or len(self._layout.tensor_map) != len(self._global_shape)
+            )
+        ):
+            raise ValueError(
+                "DTensor global shape rank must match layout tensor_map rank, "
+                f"got global_shape={self._global_shape!r}, tensor_map={self._layout.tensor_map!r}"
+            )
+        if is_ragged:
+            if hasattr(local_tensor, "is_contiguous") and not local_tensor.is_contiguous():
+                raise ValueError("RaggedShard local tensor must be contiguous")
+            if len(local_tensor.shape) != 1:
+                raise ValueError(
+                    "RaggedShard local tensor must use one-dimensional flat storage, "
+                    f"got local_shape={tuple(local_tensor.shape)!r}"
+                )
+            expected = _compute_ragged_slice(self._global_shape, self._layout)
+            if local_tensor.numel() != expected.local_numel:
+                raise ValueError(
+                    "RaggedShard local tensor numel does not match its allocation, "
+                    f"got actual={local_tensor.numel()}, expected={expected.local_numel}, "
+                    f"global_shape={self._global_shape!r}, placement={self._layout.ragged_shard.placement!r}"
+                )
 
     @property
     def device_mesh(self) -> DeviceMesh:
@@ -275,7 +323,6 @@ class DTensor(DTensorBase):
         *,
         run_check: bool = False,
         shape: Optional[Tuple[int, ...]] = None,
-        stride: Optional[Tuple[int, ...]] = None,
     ) -> 'DTensor':
         """
         Create a DTensor from a local tensor with device mesh and placements.
@@ -291,10 +338,8 @@ class DTensor(DTensorBase):
             run_check (bool, optional): When ``True``, perform cross-rank metadata
                 checks and broadcast replicate placements from the mesh source rank.
                 Default: ``False``.
-            shape (tuple[int, ...], optional): Global DTensor shape hint for uneven
-                sharding when ``run_check=True``. Reserved for future use.
-            stride (tuple[int, ...], optional): Global stride hint. Reserved for
-                future use together with ``shape``.
+            shape (tuple[int, ...], optional): Explicit logical global shape.
+                Required for RaggedShard.
 
         Returns:
             DTensor: A new DTensor instance.
@@ -308,18 +353,23 @@ class DTensor(DTensorBase):
         if run_check:
             # pylint: disable=C0415
             from hyper_parallel.core.dtensor._from_local_utils import run_from_local_checks
-            layout = _build_layout(device_mesh, placements, len(local_tensor.shape))
+            tensor_dim = len(shape) if shape is not None else len(local_tensor.shape)
+            layout = _build_layout(device_mesh, placements, tensor_dim)
             run_from_local_checks(
                 local_tensor,
                 device_mesh,
                 layout.placements,
                 shape=shape,
-                stride=stride,
             )
-        return DTensor(local_tensor, device_mesh, placements)
+        return DTensor(local_tensor, device_mesh, placements, shape=shape)
 
     @staticmethod
-    def from_local_with_layout(local_tensor: Tensor, layout: Layout) -> 'DTensor':
+    def from_local_with_layout(
+        local_tensor: Tensor,
+        layout: Layout,
+        *,
+        shape: Optional[Tuple[int, ...]] = None,
+    ) -> 'DTensor':
         """Fast DTensor construction from a local tensor and a pre-built Layout.
 
         Unlike :meth:`from_local`, this does NOT rebuild the layout via
@@ -333,7 +383,13 @@ class DTensor(DTensorBase):
         constructor's non-None check; ``__init_data__`` ignores it when ``layout``
         is supplied.
         """
-        return DTensor(local_tensor, layout.mesh, layout.placements, layout)
+        return DTensor(
+            local_tensor,
+            layout.mesh,
+            layout.placements,
+            layout,
+            shape=shape,
+        )
 
     def _alias_placements(self) -> Sequence[Placement]:
         """Return alias_placements from layout, falling back to _placements."""
@@ -344,8 +400,13 @@ class DTensor(DTensorBase):
     def _from_converted_local(self, local_tensor: Tensor) -> 'DTensor':
         """Rebuild converted DTensor data without preserving Parameter identity."""
         cls = DTensor if isinstance(self, platform.Parameter) else self.__class__
-        return cls(local_tensor, device_mesh=self._device_mesh,
-                   placements=self._alias_placements())
+        kwargs = {
+            "device_mesh": self._device_mesh,
+            "placements": self._alias_placements(),
+        }
+        if hasattr(self, "_global_shape"):
+            kwargs["shape"] = self._global_shape
+        return cls(local_tensor, **kwargs)
 
     def to(self, *args, **kwargs):
         """Move the DTensor to a different device or dtype.
@@ -742,7 +803,7 @@ class DTensor(DTensorBase):
         Returns:
             Tuple[int, ...]: The global tensor shape.
         """
-        return self._layout.get_global_shape(self._local_tensor.shape)
+        return self._global_shape
 
     def size(self, dim=None):
         """Return the global shape, consistent with .shape.
@@ -758,6 +819,15 @@ class DTensor(DTensorBase):
     def numel(self) -> int:
         """Return the number of elements in this DTensor."""
         return int(np.prod(self.shape))
+
+    @property
+    def ndim(self) -> int:
+        """Return the logical global tensor rank."""
+        return len(self._global_shape)
+
+    def dim(self) -> int:
+        """Return the logical global tensor rank."""
+        return len(self._global_shape)
 
     @property
     def local_shape(self) -> Tuple[int, ...]:
@@ -801,7 +871,7 @@ class DTensor(DTensorBase):
 
         # Build dst_layout from device_mesh and placements
         dst_layout = _build_layout(
-            device_mesh, placements, len(self._local_tensor.shape)
+            device_mesh, placements, len(self._global_shape)
         )
 
         # pylint: disable=C0415
@@ -853,7 +923,7 @@ class DTensor(DTensorBase):
         # Set all placements to Replicate and convert to tensor_map
         replicated_placements = [Replicate()] * len(replicated_layout.mesh_shape)
         replicated_layout.set_placements(replicated_placements)
-        replicated_layout.placement_to_tensor_map(len(self._local_tensor.shape))
+        replicated_layout.placement_to_tensor_map(len(self._global_shape))
 
         # Clear partial status from original layout since Replicate has no partial
         replicated_layout.reset_partial()
@@ -951,13 +1021,22 @@ def distribute_tensor(
         >>> dtensor = distribute_tensor(global_tensor, mesh, ("dp", "None"))
     """
     layout = _build_layout(device_mesh, placements, len(tensor.shape))
-    if src_data_rank is None:
+    if _layout_has_ragged_shard(layout):
+        if src_data_rank is None:
+            local_tensor = _slice_ragged_tensor(tensor, layout)
+        else:
+            local_tensor = _scatter_ragged_tensor(tensor, layout, src_data_rank)
+    elif src_data_rank is None:
         local_tensor = _get_slice_tensor_by_layout(tensor, layout)
     else:
         local_tensor = _distribute_tensor_with_communication(
             tensor, device_mesh, layout.placements, src_data_rank
         )
-    return DTensor(local_tensor, device_mesh, layout.alias_placements)
+    return DTensor.from_local_with_layout(
+        local_tensor,
+        layout,
+        shape=tuple(tensor.shape),
+    )
 
 
 def _distribute_module_param_source(param: Any) -> Tensor:
@@ -1191,6 +1270,13 @@ def _dtensor_init_helper(
         Returns:
             DTensor: The initialized distributed tensor.
     """
+    global_shape = (size,) if isinstance(size, int) else tuple(size)
+    layout = _build_layout(device_mesh, placements, len(global_shape))
+    if _layout_has_ragged_shard(layout):
+        raise NotImplementedError(
+            "RaggedShard tensor factories are not implemented in the DTensor metadata phase"
+        )
+
     # get local tensor shape
     local_shape = compute_local_shape_and_global_offset(
         size, device_mesh, placements
@@ -1212,7 +1298,7 @@ def _dtensor_init_helper(
             with _OP_DISPATCHER._rng_tracker._distribute_region(
                 device_mesh,
                 layout.placements,
-                size,
+                global_shape,
             ):
                 local_tensor = init_op(local_shape, **kwargs)
         else:

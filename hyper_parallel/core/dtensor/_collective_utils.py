@@ -15,7 +15,7 @@
 """Mesh-scoped collectives for :func:`distribute_tensor` (PyTorch DTensor parity)."""
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.platform import get_platform
@@ -54,6 +54,74 @@ def mesh_scatter(
         platform.scatter(output, list(contiguous_list), group=group, group_src=group_src)
     else:
         platform.scatter(output, None, group=group, group_src=group_src)
+    return output
+
+
+def mesh_scatter_ragged(
+    output: Tensor,
+    scatter_list: Optional[Sequence[Tensor]],
+    mesh: DeviceMesh,
+    mesh_dim: int,
+    *,
+    group_src: int = 0,
+) -> Tensor:
+    """Scatter variable-length flat tensors with point-to-point communication.
+
+    Args:
+        output: Preallocated receive buffer for the current rank.
+        scatter_list: Source-rank tensors ordered by group rank. Non-source ranks
+            may pass ``None``.
+        mesh: Device mesh containing the communication group.
+        mesh_dim: Mesh dimension along which to scatter.
+        group_src: Source rank relative to the mesh-dimension group.
+
+    Returns:
+        The populated current-rank output buffer.
+
+    Raises:
+        ValueError: If the source rank or source scatter list is invalid.
+    """
+    _ensure_mesh_process_groups(mesh)
+    group = mesh.get_group(mesh_dim)
+    group_size = mesh.size(mesh_dim)
+    if group_src < 0 or group_src >= group_size:
+        raise ValueError(
+            f"group_src must be in [0, {group_size}), but got {group_src}"
+        )
+
+    group_rank = platform.get_group_rank(group)
+    source_global_rank = platform.get_global_rank(group, group_src)
+    if group_rank == group_src:
+        if scatter_list is None or len(scatter_list) != group_size:
+            raise ValueError(
+                "source scatter_list length must equal the mesh dimension size, "
+                f"got scatter_list={scatter_list!r}, group_size={group_size}"
+            )
+        output.copy_(scatter_list[group_src])
+        works = []
+        for destination_group_rank, chunk in enumerate(scatter_list):
+            if destination_group_rank == group_src:
+                continue
+            destination_global_rank = platform.get_global_rank(
+                group, destination_group_rank
+            )
+            works.append(
+                platform.isend(
+                    chunk.contiguous(),
+                    dst=destination_global_rank,
+                    group=group,
+                )
+            )
+        for work in works:
+            work.wait()
+        return output
+
+    work = platform.irecv(
+        output,
+        src=source_global_rank,
+        group=group,
+    )
+    work.wait()
     return output
 
 

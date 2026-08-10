@@ -14,7 +14,7 @@
 # ============================================================================
 """MindSpore platform api"""
 from datetime import timedelta
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 import dataclasses
 from collections import OrderedDict
 
@@ -169,6 +169,124 @@ def _mindspore_reduce_scatter_single(
     if not async_op:
         return normalized_output, None
     return normalized_output, handle
+
+
+def _mindspore_variable_all_gather(
+        input_tensor: Tensor,
+        output_splits: Sequence[int],
+        group: str,
+) -> Tensor:
+    """Gather variable dim-zero rows with MindSpore ``AllGatherV``."""
+    if input_tensor.ndim == 0:
+        raise ValueError("variable all-gather input must have at least one dimension")
+    splits = tuple(output_splits)
+    if not splits:
+        raise ValueError("output_splits must contain at least one group rank")
+    if any(not isinstance(rows, int) or isinstance(rows, bool) or rows < 0 for rows in splits):
+        raise ValueError(f"output_splits must contain non-negative integers, got {splits!r}")
+
+    feature_shape = tuple(input_tensor.shape[1:])
+    feature_numel = int(np.prod(feature_shape, dtype=np.int64)) if feature_shape else 1
+    element_splits = [rows * feature_numel for rows in splits]
+    if sum(element_splits) == 0:
+        return input_tensor.reshape((0, *feature_shape))
+    element_splits_tensor = ms.Tensor(element_splits, dtype=ms.int64)
+    gathered = ms.ops.AllGatherV(group=group)(
+        input_tensor.reshape((-1,)),
+        element_splits_tensor,
+    )
+    return gathered.reshape((sum(splits), *feature_shape))
+
+
+def _validate_variable_row_splits(
+        input_tensor: Tensor,
+        input_splits: Sequence[int],
+        output_splits: Sequence[int],
+        group: str,
+) -> tuple[list[int], list[int]]:
+    """Validate dim-zero row splits for a variable all-to-all."""
+    normalized_input = list(input_splits)
+    normalized_output = list(output_splits)
+    if not normalized_input or len(normalized_input) != len(normalized_output):
+        raise ValueError(
+            "input_splits and output_splits must be non-empty and have the same length, "
+            f"got input_splits={normalized_input!r}, output_splits={normalized_output!r}"
+        )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in (*normalized_input, *normalized_output)
+    ):
+        raise ValueError(
+            "input_splits and output_splits must contain non-negative integers, "
+            f"got input_splits={normalized_input!r}, output_splits={normalized_output!r}"
+        )
+    if input_tensor.ndim == 0:
+        raise ValueError("variable all-to-all input_tensor must have at least one dimension")
+    if sum(normalized_input) != input_tensor.shape[0]:
+        raise ValueError(
+            "sum(input_splits) must equal input_tensor.shape[0], "
+            f"got sum={sum(normalized_input)}, shape={tuple(input_tensor.shape)!r}"
+        )
+    group_size = get_group_size(group)
+    if len(normalized_input) != group_size:
+        raise ValueError(
+            "split metadata length must equal the process-group size, "
+            f"got splits={len(normalized_input)}, group_size={group_size}"
+        )
+    return normalized_input, normalized_output
+
+
+def _mindspore_variable_all_to_all(
+        input_tensor: Tensor,
+        input_splits: Sequence[int],
+        output_splits: Sequence[int],
+        group: str,
+) -> Tensor:
+    """Run one synchronous N-D variable all-to-all using dim-zero row splits."""
+    output_shape = (sum(output_splits), *tuple(input_tensor.shape[1:]))
+    output, _ = comm_func.all_to_all_single(
+        output_shape,
+        input_tensor,
+        output_split_sizes=list(output_splits),
+        input_split_sizes=list(input_splits),
+        group=group,
+        async_op=False,
+    )
+    return output
+
+
+class _MSDifferentiableAllToAllSingle(_Function):
+    """Variable all-to-all with a symmetric reverse-A2A backward."""
+
+    @staticmethod
+    def forward(  # pylint: disable=arguments-differ
+            ctx: Any,
+            input_tensor: Tensor,
+            output_splits: Sequence[int],
+            input_splits: Sequence[int],
+            group: str,
+    ) -> Tensor:
+        """Exchange dim-zero rows and record the reverse split metadata."""
+        ctx.input_splits = input_splits
+        ctx.output_splits = output_splits
+        ctx.group = group
+        return _mindspore_variable_all_to_all(
+            input_tensor,
+            input_splits,
+            output_splits,
+            group,
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple:
+        """Route gradients through the reverse variable all-to-all."""
+        grad_input = _mindspore_variable_all_to_all(
+            grad_output,
+            ctx.output_splits,
+            ctx.input_splits,
+            ctx.group,
+        )
+        return grad_input, None, None, None
 
 
 class AsyncCollectiveTensor(Tensor):
@@ -1391,6 +1509,33 @@ class MindSporePlatform(Platform):
     @staticmethod
     def all_to_all_single(input_tensor, output_shape, group, async_op=False):
         return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
+
+    @staticmethod
+    def differentiable_all_to_all_single(
+            input_tensor: Tensor,
+            input_splits: Sequence[int],
+            output_splits: Sequence[int],
+            group: str,
+    ) -> Tensor:
+        """Run a differentiable N-D variable all-to-all with dim-zero row splits."""
+        input_splits, output_splits = _validate_variable_row_splits(
+            input_tensor,
+            input_splits,
+            output_splits,
+            group,
+        )
+        return _MSDifferentiableAllToAllSingle.apply(
+            input_tensor,
+            output_splits,
+            input_splits,
+            group,
+        )
+
+    @staticmethod
+    def differentiable_variable_all_gather(
+            input_tensor: Tensor, output_splits: Sequence[int], group: str) -> Tensor:
+        """Gather variable dim-zero row shards with native ``AllGatherV``."""
+        return _mindspore_variable_all_gather(input_tensor, output_splits, group)
 
     @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,

@@ -35,10 +35,12 @@ class StorageInfo:
         relative_path: Path relative to checkpoint root.
         offset: Byte offset within the file.
         length: Byte length of the data (best-effort, may be -1 for tensors).
+        tensor_key: Optional physical key used inside a tensor container file.
     """
     relative_path: str
     offset: int
     length: int
+    tensor_key: Optional[str] = None
 
 
 @dataclass

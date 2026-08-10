@@ -16,14 +16,53 @@
 
 import copy
 import functools
+from typing import NamedTuple, Optional, Sequence
+
 import numpy as np
 
 
-from hyper_parallel.core.dtensor.placement_types import Placement, Shard, StridedShard, Replicate, Partial
+from hyper_parallel.core.dtensor.placement_types import (
+    Partial,
+    Placement,
+    RaggedShard,
+    Replicate,
+    Shard,
+    StridedShard,
+)
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _create_device_mesh
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
+
+
+class RaggedShardInfo(NamedTuple):
+    """RaggedShard placement and its corresponding mesh dimension."""
+
+    mesh_dim: int
+    placement: RaggedShard
+
+
+def _extract_ragged_shard(placements: Sequence[Placement]) -> Optional[RaggedShardInfo]:
+    """Extract the single RaggedShard placement from a placement sequence."""
+    ragged_shard = None
+    for mesh_dim, placement in enumerate(placements):
+        if not placement.is_ragged_shard():
+            continue
+        if ragged_shard is not None:
+            raise ValueError(
+                "Layout supports at most one RaggedShard placement, "
+                f"but got placements={tuple(placements)!r}"
+            )
+        ragged_shard = RaggedShardInfo(mesh_dim, placement)
+    return ragged_shard
+
+
+def _replace_ragged_with_replicate(placements: Sequence[Placement]) -> tuple[Placement, ...]:
+    """Return placements with RaggedShard represented as Replicate."""
+    return tuple(
+        Replicate() if placement.is_ragged_shard() else placement
+        for placement in placements
+    )
 
 
 def _infer_slice_area_by_rank(mesh_shape, tensor_map, rank_id: int, full_shape: tuple):  # -> tuple[tuple[int]]:
@@ -155,6 +194,7 @@ class Layout:
         self._compact_str = self._to_compact_string()
         self._placements = None
         self.partial_ops = {}  # Initialized in _build_dim_map_from_placements()
+        self._ragged_shard = None
 
     @classmethod
     def from_device_mesh(cls, device_mesh: DeviceMesh) -> 'Layout':
@@ -181,6 +221,7 @@ class Layout:
         obj._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
         obj._alias_tensor_map = None
         obj._placements = None
+        obj._ragged_shard = None
         obj._compact_str = obj._to_compact_string()
         return obj
 
@@ -302,7 +343,7 @@ class Layout:
         """Handle the special case of zero-dimensional tensor."""
         self.set_tensor_map(())
         self._alias_tensor_map = ()
-        for mesh_idx, placement in enumerate(self.placements):
+        for mesh_idx, placement in enumerate(self.normal_placements):
             if isinstance(placement, Partial):
                 self._partial[mesh_idx] = self._extract_reduce_op(placement)
         return []
@@ -311,7 +352,7 @@ class Layout:
         """Build dimension map from placements."""
         dim_map = [-1] * dim
         self.partial_ops = {}
-        for mesh_idx, placement in enumerate(self.placements):
+        for mesh_idx, placement in enumerate(self.normal_placements):
             if isinstance(placement, Shard):
                 shard_dim = placement.dim
                 if shard_dim < -dim or shard_dim >= dim:
@@ -465,6 +506,8 @@ class Layout:
         for mesh_idx, op in enumerate(self.partial):
             if op is not None:
                 placements[mesh_idx] = Partial(reduce_op=op)
+        if self._ragged_shard is not None:
+            placements[self._ragged_shard.mesh_dim] = self._ragged_shard.placement
         self.set_placements(placements)
         self._alias_tensor_map = self._build_readable_tensor_map()
         self.update_compact_str()
@@ -540,6 +583,8 @@ class Layout:
         Use this property when constructing DTensors from an existing Layout
         to avoid the lossy Placement round-trip for multi-axis cases.
         """
+        if self._ragged_shard is not None:
+            return self._placements
         if self._alias_tensor_map is not None and any(
             isinstance(item, tuple) for item in self._alias_tensor_map
         ):
@@ -555,9 +600,24 @@ class Layout:
         """placements"""
         return self._placements
 
-    def set_placements(self, placements):
-        """Set placements."""
+    def set_placements(self, placements: Optional[Sequence[Placement]]) -> None:
+        """Set placements and retain the RaggedShard omitted from tensor_map."""
         self._placements = placements
+        self._ragged_shard = (
+            None if placements is None else _extract_ragged_shard(placements)
+        )
+
+    @property
+    def normal_placements(self) -> Optional[tuple[Placement, ...]]:
+        """Return placements with RaggedShard represented as Replicate."""
+        if self._placements is None:
+            return None
+        return _replace_ragged_with_replicate(self._placements)
+
+    @property
+    def ragged_shard(self) -> Optional[RaggedShardInfo]:
+        """Return the RaggedShard placement and its mesh dimension, if present."""
+        return self._ragged_shard
 
     @property
     def tensor_map(self):
