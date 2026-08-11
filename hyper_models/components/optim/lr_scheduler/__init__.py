@@ -14,6 +14,7 @@
 # ============================================================================
 """Learning-rate scheduler runtime targets."""
 
-from .lr_scheduler import cosine_with_warmup
+from .lr_scheduler import MultiLRScheduler
 
-__all__ = ["cosine_with_warmup"]
+# __all__ = ["cosine_with_warmup"]
+__all__ = ["MultiLRScheduler"]

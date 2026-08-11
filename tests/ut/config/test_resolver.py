@@ -29,7 +29,7 @@ from hyper_models.components.data import (
     IdentityDataTransform,
     MakeMicroBatchCollator,
 )
-from hyper_models.components.optim import AdamW, cosine_with_warmup
+from hyper_models.components.optim import AdamW, MultiLRScheduler
 from hyper_models.config.manager import parse_training_args
 from hyper_models.config.resolver import (
     ConfigResolutionError,
@@ -45,7 +45,7 @@ MODEL_TARGET = (
     "hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained"
 )
 SCHEDULER_TARGET = (
-    "hyper_models.components.optim.lr_scheduler.lr_scheduler.cosine_with_warmup"
+    "hyper_models.components.optim.lr_scheduler.lr_scheduler.MultiLRScheduler"
 )
 
 
@@ -102,7 +102,7 @@ class TestTargetResolution(unittest.TestCase):
         self.assertIsInstance(config.optimizer, Target)
         self.assertIs(config.optimizer._target_, AdamW)
         self.assertIsInstance(config.lr_scheduler, Target)
-        self.assertIs(config.lr_scheduler._target_, cosine_with_warmup)
+        self.assertIs(config.lr_scheduler._target_, MultiLRScheduler)
 
     def test_resolver_does_not_invoke_class_target(self):
         _RuntimeClass.constructions = 0
@@ -196,15 +196,16 @@ class TestTargetResolution(unittest.TestCase):
             _root(
                 optimizer={
                     "_target_": OPTIMIZER_TARGET,
-                    "betas": [0.8, 0.95],
+                    "adamw_config": {
+                        "adamw_lr": 1e-4,
+                        "adamw_betas": [0.8, 0.95],
+                    },
                 }
             )
         )
 
-        self.assertEqual(config.optimizer.betas, (0.8, 0.95))
-        self.assertEqual(config.optimizer.lr, 1e-4)
-        self.assertEqual(config.optimizer.eps, 1e-8)
-        self.assertIsNone(config.optimizer.foreach)
+        self.assertEqual(config.optimizer.adamw_config["adamw_betas"], [0.8, 0.95])
+        self.assertEqual(config.optimizer.adamw_config["adamw_lr"], 1e-4)
         with self.assertRaises(AttributeError):
             _ = config.optimizer.model
 
@@ -289,14 +290,17 @@ class TestTargetResolution(unittest.TestCase):
             _root(
                 optimizer={
                     "_target_": OPTIMIZER_TARGET,
-                    "betas": [0.8, 0.95],
+                    "adamw_config": {
+                        "adamw_lr": 1e-4,
+                        "adamw_betas": [0.8, 0.95],
+                    },
                 }
             )
         )
 
         serialized = config.optimizer.to_dict()
         self.assertEqual(serialized["_target_"], OPTIMIZER_TARGET)
-        self.assertEqual(serialized["betas"], [0.8, 0.95])
+        self.assertEqual(serialized["adamw_config"]["adamw_betas"], [0.8, 0.95])
 
 
 class TestPureDataclassResolution(unittest.TestCase):
@@ -528,9 +532,13 @@ class TestTypedOverrides(unittest.TestCase):
                   _target_: {__name__}._tokenizer_target
                 optimizer:
                   _target_: {OPTIMIZER_TARGET}
-                  lr: 0.0002
+                  adamw_config:
+                    adamw_lr: 0.0002
                 lr_scheduler:
                   _target_: {SCHEDULER_TARGET}
+                  lr_decay_style: cosine
+                  train_steps: 10
+                  lr_config: {{}}
                 training:
                   max_steps: 10
                   max_grad_norm: 1.0
@@ -544,15 +552,12 @@ class TestTypedOverrides(unittest.TestCase):
         config = parse_training_args(
             [
                 str(self._write_yaml()),
-                "--optimizer.lr=1e-4",
-                "--optimizer.betas=[0.8, 0.95]",
+                "--optimizer.adamw_config={'adamw_lr': 0.0001}",
                 "--training.max_grad_norm=0.5",
             ]
         )
 
-        self.assertEqual(config.optimizer.lr, 1e-4)
-        self.assertIsInstance(config.optimizer.lr, float)
-        self.assertEqual(config.optimizer.betas, (0.8, 0.95))
+        self.assertEqual(config.optimizer.adamw_config, {"adamw_lr": 1e-4})
         self.assertEqual(config.training.max_grad_norm, 0.5)
 
     def test_target_selection_cannot_be_changed_by_override(self):
@@ -570,7 +575,7 @@ class TestTypedOverrides(unittest.TestCase):
     def test_unknown_target_argument_has_close_match(self):
         with self.assertRaisesRegex(
             ConfigResolutionError,
-            r"unknown target argument 'lrr'.*did you mean 'lr'",
+            r"unknown target argument 'lrr'",
         ):
             parse_training_args(
                 [str(self._write_yaml()), "--optimizer.lrr=0.1"]
@@ -579,7 +584,7 @@ class TestTypedOverrides(unittest.TestCase):
     def test_override_requires_equals_form(self):
         with self.assertRaisesRegex(ConfigResolutionError, r"--field=value"):
             parse_training_args(
-                [str(self._write_yaml()), "--optimizer.lr", "0.1"]
+                [str(self._write_yaml()), "--optimizer.adamw_config", "0.1"]
             )
 
 

@@ -20,7 +20,6 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Callable, Generic, List, Literal, Optional, TypeVar, Union
 
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedTokenizerBase
 
 from hyper_models.components.checkpoint.config import CheckpointingConfig
@@ -118,7 +117,7 @@ class Target(Generic[_T]):
 
     def __init__(
         self,
-        _target_: Callable[..., _T],
+        _target_: Callable[..., _T],  # pylint: disable=invalid-name
         *,
         target_path: str,
         **kwargs: Any,
@@ -275,6 +274,8 @@ class PlanOverride:
         components.distributed (the zero-dependency boundary is guarded by
         test_s5_zero_dep_lint).
         """
+        # Keep trainer.config outside the distributed component's import-time dependency graph.
+        # pylint: disable-next=import-outside-toplevel
         from hyper_models.components.distributed.sharding_config import (
             ModuleShardingSpec,
         )
@@ -299,6 +300,8 @@ class PlanOverride:
 
     def _parse_inner_out_src(self):
         """inner_out_src 的 YAML 形态脱糖：哨兵 / 单输出 DSL / 多输出 DSL。"""
+        # Keep trainer.config outside the distributed component's import-time dependency graph.
+        # pylint: disable-next=import-outside-toplevel
         from hyper_models.components.distributed.sharding_config import (
             parse_named_placement,
         )
@@ -324,6 +327,8 @@ class PlanOverride:
 
     def _parse_contract_field(self, attr, raw):
         """YAML form → spec field value (DSL parse / sentinel pass-through)."""
+        # Keep trainer.config outside the distributed component's import-time dependency graph.
+        # pylint: disable-next=import-outside-toplevel
         from hyper_models.components.distributed.sharding_config import (
             parse_named_placement,
         )
@@ -408,8 +413,9 @@ class TrainerConfig:
 
     model: Target[Any]
     optimizer: Target[Optimizer]
+    lr_scheduler: Target[Any]
+
     tokenizer: Optional[Target[PreTrainedTokenizerBase]] = None
-    lr_scheduler: Optional[Target[LRScheduler]] = None
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # parallelism configs
