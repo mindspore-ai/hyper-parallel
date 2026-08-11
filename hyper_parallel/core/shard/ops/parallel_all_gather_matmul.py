@@ -192,7 +192,8 @@ class AllGatherMatmulDistributedOp(DistributedOp):
         k dim (contraction): when k is sharded, output carries Partial(sum) on the
           k-dim mesh axis; the caller must apply AllReduce to get the correct result.
 
-        gather_out layout: m is Replicate (-1); k follows x1's k-dim placement.
+        gather_out layout: when enabled, m is Replicate (-1) and k follows x1's
+        k-dim placement. When disabled, CANN's 1-D empty tensor is Replicate.
 
         Args:
             cache_values: [x1_layout, x2_layout, trans_x2, gather_output]
@@ -227,12 +228,13 @@ class AllGatherMatmulDistributedOp(DistributedOp):
         if k_placement != -1:
             self._set_partial_from_k(output_layout, k_placement)
 
-        # gather_out: gather_output=True → m Replicate (-1), k follows x1's k placement.
-        # gather_output=False → CANN returns a 1-D empty tensor; force all-Replicate so
-        # the layout is compatible with any tensor rank returned by the kernel.
+        # CANN returns a 1-D empty tensor when gather_output is disabled, so its
+        # layout rank must differ from the normal 2-D (m, k) gather output.
         gather_out_layout = Layout.from_device_mesh(x1_layout.mesh)
-        gather_k = k_placement if gather_output else -1
-        gather_out_layout.set_tensor_map((-1, gather_k))
+        if gather_output:
+            gather_out_layout.set_tensor_map((-1, k_placement))
+        else:
+            gather_out_layout.set_tensor_map((-1,))
         gather_out_layout.tensor_map_to_placement()
 
         return (copy.deepcopy(output_layout), copy.deepcopy(gather_out_layout)), None
