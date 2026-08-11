@@ -14,90 +14,62 @@
 # ============================================================================
 """YAML-callable learning-rate scheduler factories."""
 
-from typing import Optional
-
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import (
-    CosineAnnealingLR,
-    LinearLR,
-    LRScheduler,
-    SequentialLR,
-)
+from hyper_parallel.core.optimizer.lr_scheduler import LRSchedulersContainer, get_constant_schedule_with_warmup, \
+    get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 
-def cosine_with_warmup(
-    *,
-    optimizer: Optimizer,
-    train_steps: int,
-    lr_warmup_steps: Optional[int] = None,
-    lr_decay_steps: Optional[int] = None,
-    init_lr: Optional[float] = None,
-    max_lr: Optional[float] = None,
-    min_lr: Optional[float] = None,
-) -> LRScheduler:
-    """Create a cosine scheduler with an optional linear warmup.
+class MultiLRScheduler:
+    """Build one learning-rate scheduler for each child optimizer."""
 
-    Args:
-        optimizer: Runtime optimizer injected by the trainer.
-        train_steps: Total number of optimizer steps.
-        lr_warmup_steps: Number of linear warmup steps.
-        lr_decay_steps: Number of cosine decay steps. Defaults to the
-            remaining steps after warmup.
-        init_lr: Learning rate at the start of warmup.
-        max_lr: Learning rate used to normalize the warmup start factor.
-        min_lr: Minimum learning rate reached by cosine decay.
+    def __init__(self, optimizer, lr_decay_style, train_steps, lr_config):
+        self.config = lr_config
+        self.optimizer = optimizer
+        self.lr_decay_style = lr_decay_style
+        self.train_step = train_steps
 
-    Returns:
-        A single runtime learning-rate scheduler.
+        lr_warmup_ratio = self.config.get('lr_warmup_ratio', 0.0)
+        lr_warmup_steps = self.config.get('lr_warmup_steps')
+        if lr_warmup_steps is None:
+            lr_warmup_steps = int(train_steps * lr_warmup_ratio)
+        lr_start = self.config.get('lr_start', 0.0)
+        lr_decay_ratio = self.config.get('lr_decay_ratio', 1.0)
+        min_lr = self.config.get('min_lr', self.config.get('lr_min', 1e-7))
 
-    Raises:
-        ValueError: If the configured step counts or warmup rates are invalid.
-    """
-    if train_steps < 1:
-        raise ValueError("train_steps must be at least 1")
+        def build_scheduler(optimizer):
+            init_lr = optimizer.param_groups[0]["lr"]
+            if self.lr_decay_style == "constant":
+                return get_constant_schedule_with_warmup(
+                    optimizer=optimizer,
+                    num_warmup_steps=lr_warmup_steps,
+                    init_lr=init_lr,
+                    lr_start=lr_start,
+                )
+            if self.lr_decay_style == "linear":
+                return get_linear_schedule_with_warmup(
+                    optimizer=optimizer,
+                    num_warmup_steps=lr_warmup_steps,
+                    num_training_steps=train_steps,
+                    init_lr=init_lr,
+                    min_lr=min_lr,
+                    lr_start=lr_start,
+                )
+            if self.lr_decay_style == "cosine":
+                return get_cosine_schedule_with_warmup(
+                    optimizer=optimizer,
+                    num_warmup_steps=lr_warmup_steps,
+                    num_training_steps=train_steps,
+                    init_lr=init_lr,
+                    lr_decay_ratio=lr_decay_ratio,
+                    min_lr=min_lr,
+                    lr_start=lr_start,
+                )
+            raise ValueError(f"Unsupported lr_decay_style: {self.lr_decay_style!r}")
 
-    warmup_steps = 0 if lr_warmup_steps is None else lr_warmup_steps
-    if warmup_steps < 0:
-        raise ValueError("lr_warmup_steps must not be negative")
+        self.lr_scheduler = LRSchedulersContainer(
+            optimizers=self.optimizer,
+            scheduler=build_scheduler,
+        )
 
-    decay_steps = (
-        train_steps - warmup_steps
-        if lr_decay_steps is None
-        else lr_decay_steps
-    )
-    if decay_steps < 1:
-        raise ValueError("lr_decay_steps must be at least 1")
-
-    optimizer_lr = optimizer.param_groups[0]["lr"]
-    minimum_lr = 0.0 if min_lr is None else min_lr
-    cosine = CosineAnnealingLR(
-        optimizer,
-        T_max=decay_steps,
-        eta_min=minimum_lr,
-    )
-    if warmup_steps == 0:
-        return cosine
-
-    initial_lr = optimizer_lr if init_lr is None else init_lr
-    maximum_lr = optimizer_lr if max_lr is None else max_lr
-    if maximum_lr <= 0:
-        raise ValueError("max_lr must be positive when warmup is enabled")
-
-    start_factor = initial_lr / maximum_lr
-    if not 0.0 < start_factor <= 1.0:
-        raise ValueError("init_lr must be greater than 0 and no greater than max_lr")
-
-    warmup = LinearLR(
-        optimizer,
-        start_factor=start_factor,
-        end_factor=1.0,
-        total_iters=warmup_steps,
-    )
-    return SequentialLR(
-        optimizer,
-        schedulers=[warmup, cosine],
-        milestones=[warmup_steps],
-    )
-
-
-__all__ = ["cosine_with_warmup"]
+    def get_lr_scheduler(self):
+        """Return the scheduler container used by the trainer."""
+        return self.lr_scheduler

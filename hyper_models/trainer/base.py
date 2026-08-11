@@ -28,7 +28,6 @@ Features:
 
 import json
 import logging
-import os
 import queue
 import threading
 from abc import ABC
@@ -40,7 +39,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim.lr_scheduler import LRScheduler
-from torch.optim.optimizer import Optimizer
 from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
@@ -59,7 +57,7 @@ from ..components.distributed.infrastructure import (
 )
 from ..components.loss.loss_utils import count_loss_token, mean_global_loss
 from ..components.utils import helper
-from ..components.utils.device import synchronize, get_torch_device, get_device_type
+from ..components.utils.device import synchronize, get_torch_device, get_device_type  # pylint: disable=syntax-error
 
 from .callbacks import TempLogCallback, TrainerState
 
@@ -85,6 +83,7 @@ class BackgroundPrefetcher:
         self.thread.start()
 
     def _worker(self):
+        """Prefetch data and capture dataloader state in a background thread."""
         try:
             while not self.stop_event.is_set():
                 try:
@@ -98,8 +97,9 @@ class BackgroundPrefetcher:
                 # state_dict() should handle deepcopying if necessary.
                 state = self.original_state_dict() if self.original_state_dict else None
                 self.queue.put((item, state))
-        except Exception as e:
-            self.queue.put((e, None))
+        # The worker must transfer any producer failure back to the training thread.
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self.queue.put((exc, None))
 
     def __iter__(self):
         return self
@@ -114,12 +114,11 @@ class BackgroundPrefetcher:
                 raise item
             self.current_state = state
             return item
-        else:
-            if res is StopIteration:
-                raise StopIteration
-            if isinstance(res, Exception):
-                raise res
-            return res
+        if res is StopIteration:
+            raise StopIteration
+        if isinstance(res, Exception):
+            raise res
+        return res
 
     def state_dict(self):
         if self.current_state is not None:
@@ -129,6 +128,7 @@ class BackgroundPrefetcher:
         return {}
 
     def stop(self, timeout: float = 5.0):
+        """Stop the background worker and wait up to ``timeout`` seconds."""
         self.stop_event.set()
         try:
             while not self.queue.empty():
@@ -231,7 +231,7 @@ class BaseTrainer(Stateful, ABC):
     model_assets: List[Any] = []
 
     # Training components
-    optimizer: Optimizer = None
+    optimizer = None
     lr_scheduler: LRScheduler = None
 
     # Training context
@@ -308,6 +308,7 @@ class BaseTrainer(Stateful, ABC):
         self._init_callbacks()
 
     def _setup(self):
+        """Initialize logging, distributed state, and the local device."""
         # log args
         setup_logging()
 
@@ -469,24 +470,19 @@ class BaseTrainer(Stateful, ABC):
 
         self.train_steps = steps_per_epoch * training_config.num_train_epochs
 
-    def _build_optimizer(self):
+    def _build_optimizer(self) -> None:
+        """Build the configured optimizer with the runtime model context."""
         config: TrainerConfig = self.config
-        self.optimizer = config.optimizer.build(
-            model=self.model,
-            device_mesh=self.device_mesh,
-            is_peft=self.peft_config is not None,
-        )
+        optimizer = config.optimizer.build(model=self.model)
+        self.optimizer = optimizer.get_optimizer()
 
     def _build_lr_scheduler(self):
         config: TrainerConfig = self.config
-        self.lr_scheduler = (
-            config.lr_scheduler.build(
-                optimizer=self.optimizer,
-                train_steps=self.train_steps,
-            )
-            if config.lr_scheduler is not None
-            else None
+        lr_scheduler = config.lr_scheduler.build(
+            optimizer=self.optimizer,
+            train_steps=self.train_steps,
         )
+        self.lr_scheduler = lr_scheduler.get_lr_scheduler()
 
     def _build_training_context(self):
         """Build training context for distributed training."""
@@ -552,6 +548,7 @@ class BaseTrainer(Stateful, ABC):
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
+        del micro_batch
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             outputs.loss,
             self.micro_batch_token_len,
@@ -564,6 +561,7 @@ class BaseTrainer(Stateful, ABC):
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run forward and backward computation for one micro batch."""
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -603,6 +601,7 @@ class BaseTrainer(Stateful, ABC):
                     model_part.set_reshard_after_backward(True)
 
     def _configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int):
+        """Configure FSDP gradient synchronization for one micro step."""
         config: TrainerConfig = self.config
         if (
             config.fsdp_config.dp_shard_size > 1
@@ -620,6 +619,7 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
+        """Execute one optimizer update from the next dataloader batch."""
         config = self.config
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -692,14 +692,17 @@ class BaseTrainer(Stateful, ABC):
         destroy_process_group()
 
     def train(self):
+        """Run the configured training loop."""
         config: TrainerConfig = self.config
         self.on_train_begin()
         logger.info(
-            f"Rank{self.local_rank} Start training. "
-            f"Start step: {self.start_step}. "
-            f"Train steps: {self.train_steps}. "
-            f"Start epoch: {self.start_epoch}. "
-            f"Train epochs: {config.training.num_train_epochs}."
+            "Rank%s Start training. Start step: %s. Train steps: %s. "
+            "Start epoch: %s. Train epochs: %s.",
+            self.local_rank,
+            self.start_step,
+            self.train_steps,
+            self.start_epoch,
+            config.training.num_train_epochs,
         )
 
         for epoch in range(self.start_epoch, config.training.num_train_epochs):
@@ -720,7 +723,11 @@ class BaseTrainer(Stateful, ABC):
                 try:
                     self.train_step(self.data_iterator)
                 except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {config.dataloader.drop_last}")
+                    logger.info(
+                        "epoch:%s Dataloader finished with drop_last %s",
+                        epoch,
+                        config.dataloader.drop_last,
+                    )
                     break
 
             self.on_epoch_end()
