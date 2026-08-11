@@ -102,17 +102,28 @@ dataloader:
   use_background_prefetcher: false
 
 optimizer:
-  _target_: hyper_models.components.optim.optimizer.optimizer.AdamW
-  lr: 1.0e-4
-  weight_decay: 0.01
-  betas: [0.9, 0.999]
-  eps: 1.0e-8
-  foreach: false
+  _target_: hyper_models.components.optim.optimizer.Muon
+  extra_adamw_name_keywords: []
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 1.0e-3
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 1.0e-4
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
 
 lr_scheduler:
-  _target_: hyper_models.components.optim.lr_scheduler.lr_scheduler.cosine_with_warmup
-  lr_warmup_steps: 1
-  min_lr: 0.0
+  _target_: hyper_models.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
 
 checkpoint:
   enabled: false

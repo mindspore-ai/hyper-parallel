@@ -14,10 +14,11 @@
 # ============================================================================
 """Optimizer and learning-rate scheduler interfaces for HyperModels."""
 
-from .lr_scheduler.lr_scheduler import cosine_with_warmup
-from .optimizer.optimizer import AdamW
+from .lr_scheduler.lr_scheduler import MultiLRScheduler
+from .optimizer.optimizer import AdamW, Muon
 
 __all__ = [
     "AdamW",
-    "cosine_with_warmup",
+    "Muon",
+    "MultiLRScheduler",
 ]

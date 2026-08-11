@@ -24,7 +24,6 @@ from torch import nn
 import hyper_parallel.core.optimizer.utils  # noqa: F401 - install rank0 logging helpers on logging.Logger
 
 from hyper_parallel.core.optimizer.adamw import AdamW
-from hyper_parallel.core.optimizer.lr_scheduler import get_hyper_lr_scheduler
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
@@ -32,7 +31,7 @@ from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-__all__ = ['get_hyper_optimizer', 'get_hyper_lr_scheduler']
+__all__ = ['get_hyper_optimizer']
 
 
 def get_hyper_optimizer(
