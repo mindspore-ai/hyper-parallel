@@ -45,7 +45,11 @@ on local tensors inside the local-region skeleton; the returned fn's
 params are validated against the module's forward signature at apply time.
 """
 
+from typing import Any, Callable
+
 from hyper_models.components.distributed.ep_utils import (
+    MOE_ROUTER_ADAPTERS,
+    _bind_local_expert_forward,
     _hf_native_ep_compute,
     _softmax_topk_router,
 )
@@ -54,8 +58,47 @@ from hyper_models.components.distributed.injection import (
 )
 
 
+def _build_hf_native_ep_compute(
+    module: Any,
+    tp_mesh: Any,
+    ep_mesh: Any,
+    router_fn: Callable,
+    factory_name: str,
+) -> Callable:
+    """Build an HF-native EP compute function and its expert entry point."""
+    if ep_mesh is None:
+        raise ValueError(
+            f"{factory_name} was built without an ep_mesh — this factory must "
+            "be injected on an EP-sharded MoE boundary (ep_size > 1 so the "
+            "framework-derived expert mesh exists). If you meant TP-only "
+            "expert sharding, do not use this factory."
+        )
+    expert_parallel_mesh = ep_mesh["ep"]
+    _bind_local_expert_forward(module, expert_parallel_mesh.size())
+    ep_group = ep_mesh.get_group("ep")
+    tp_group = tp_mesh.get_group() if tp_mesh is not None else None
+
+    def compute_fn(module, hidden_states):
+        return _hf_native_ep_compute(
+            module,
+            hidden_states,
+            router_fn=router_fn,
+            ep_group=ep_group,
+            tp_group=tp_group,
+        )
+
+    return compute_fn
+
+
 @local_compute
-def hf_native_ep_compute_fn(*, mesh, tp_mesh, cp_mesh, ep_mesh):
+def hf_native_ep_compute_fn(
+    *,
+    module: Any,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+) -> Callable:
     """Factory for the built-in TP-extend-EP compute (D-10, 05 §6.4.8).
 
     Returns ``compute_fn(module, hidden_states)``: router (local chunk) ->
@@ -96,18 +139,31 @@ def hf_native_ep_compute_fn(*, mesh, tp_mesh, cp_mesh, ep_mesh):
             and the sharding domain agree by construction. None means the
             factory was mounted on a non-EP boundary -> configuration error.
     """
-    if ep_mesh is None:
-        raise ValueError(
-            "hf_native_ep_compute_fn was built without an ep_mesh — this "
-            "factory must be injected on an EP-sharded MoE boundary "
-            "(ep_size > 1 so the framework-derived expert mesh exists). If "
-            "you meant TP-only expert sharding, do not use this factory.")
-    ep_group = ep_mesh.get_group("ep")
-    tp_group = tp_mesh.get_group() if tp_mesh is not None else None
+    del mesh, cp_mesh
+    return _build_hf_native_ep_compute(
+        module,
+        tp_mesh,
+        ep_mesh,
+        _softmax_topk_router,
+        "hf_native_ep_compute_fn",
+    )
 
-    def compute_fn(module, hidden_states):
-        return _hf_native_ep_compute(
-            module, hidden_states, router_fn=_softmax_topk_router,
-            ep_group=ep_group, tp_group=tp_group)
 
-    return compute_fn
+@local_compute
+def qwen3moe_ep_compute_fn(
+    *,
+    module: Any,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+) -> Callable:
+    """Build explicit Qwen3-MoE EP compute using its TopKRouter contract."""
+    del mesh, cp_mesh
+    return _build_hf_native_ep_compute(
+        module,
+        tp_mesh,
+        ep_mesh,
+        MOE_ROUTER_ADAPTERS["qwen3moe"],
+        "qwen3moe_ep_compute_fn",
+    )

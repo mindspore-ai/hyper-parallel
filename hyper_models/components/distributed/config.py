@@ -39,6 +39,7 @@ class CPUOffloadPolicy:
 class FSDP2Config:
     """FSDP2 strategy configuration (06 §4.1)."""
     dp_shard_size: int = 1
+    edp_shard_size: int = 1
     replicate_params: list[str] = field(default_factory=list)
     activation_checkpointing: bool | str = False
     mp_policy: MixedPrecisionPolicy | None = None
@@ -53,11 +54,13 @@ class FSDP2Config:
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False
     comm_fusion_zero_copy: bool | None = None
-        
+
     def __post_init__(self) -> None:
         """Validate topology sizes and prefetch depths."""
         if self.dp_shard_size < 1:
             raise ValueError("dp_shard_size must be greater than or equal to 1")
+        if self.edp_shard_size < 1:
+            raise ValueError("edp_shard_size must be greater than or equal to 1")
         if self.backward_prefetch_depth < 0:
             raise ValueError("backward_prefetch_depth must be greater than or equal to 0")
         if self.forward_prefetch_depth < 0:

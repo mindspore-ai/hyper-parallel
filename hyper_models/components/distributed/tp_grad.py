@@ -23,8 +23,8 @@ information).
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 
 
-def build_tp_grad_info(plan, tp_mesh, *, tied_pairs=None):
-    """{param_fqn: (tp_placement, tp_mesh)}, tp_placement in {Shard, Replicate}.
+def build_tp_grad_info(plan, dense_tp_mesh, *, expert_source_mesh=None, tied_pairs=None):
+    """Build source metadata for dense and routed-expert parameters.
 
     tied_pairs: parameter pairs with shared storage (defaults to
     plan.tied_pairs). Both ends of a tied pair must map to the same
@@ -36,19 +36,17 @@ def build_tp_grad_info(plan, tp_mesh, *, tied_pairs=None):
     for fqn, spec in plan.modules.items():
         for param_name, named_placement in spec.params.items():
             full_fqn = f"{fqn}.{param_name}"
-            tp_placement = named_placement.get("tp", Replicate())
-            if getattr(spec, "_ep_size", 0) and param_name.startswith("experts."):
-                # D-10 TP-extend-EP: expert weights are sharded only along the
-                # expert dim on the derived expert mesh (edp, ep) — gradients
-                # are local shards that differ across ranks (different experts
-                # + tokens aggregated over the extended EP group), so no TP
-                # group sync is performed (Shard-marker semantics; defaulting
-                # to Replicate would make FSDP incorrectly all-reduce the
-                # sharded gradients)
-                tp_placement = Shard(1)
-            info[full_fqn] = (tp_placement, tp_mesh)
+            if spec._ep_size > 0 and param_name.startswith("experts."):  # pylint: disable=protected-access
+                if expert_source_mesh is None:
+                    raise ValueError(
+                        "Routed expert metadata requires an expert EP source mesh"
+                    )
+                info[full_fqn] = (Shard(0), expert_source_mesh)
+            else:
+                tp_placement = named_placement.get("tp", Replicate())
+                info[full_fqn] = (tp_placement, dense_tp_mesh)
 
-    pairs = tied_pairs if tied_pairs is not None else getattr(plan, "tied_pairs", None)
+    pairs = tied_pairs if tied_pairs is not None else plan.tied_pairs
     if pairs:
         for a, b in pairs:
             if a in info and b in info:
@@ -56,6 +54,6 @@ def build_tp_grad_info(plan, tp_mesh, *, tied_pairs=None):
                 pb, _ = info[b]
                 if pa != pb:
                     norm = pa if isinstance(pa, Shard) else pb
-                    info[a] = (norm, tp_mesh)
-                    info[b] = (norm, tp_mesh)
+                    info[a] = (norm, info[a][1])
+                    info[b] = (norm, info[b][1])
     return info

@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import hyper_models.components.distributed.infrastructure as infrastructure
+from hyper_models.components.distributed import infrastructure
 from hyper_models._transformers.infrastructure import instantiate_infrastructure
 from hyper_models.components.distributed.config import FSDP2Config
 from hyper_models.components.distributed.fsdp2 import FSDP2Manager
@@ -26,11 +26,14 @@ from hyper_models.trainer.config import AcceleratorConfig
 
 
 class _FakeDeviceMesh:
-    def __init__(self, mesh_dim_names):
+    def __init__(self, mesh_dim_names: tuple[str, ...]) -> None:
+        """Store dimension names exposed by the fake mesh."""
         self.mesh_dim_names = mesh_dim_names
 
     @staticmethod
-    def get_local_rank(_dim_name: str) -> int:
+    def get_local_rank(dim_name: str) -> int:
+        """Return rank zero for every mesh dimension."""
+        del dim_name
         return 0
 
 
@@ -42,23 +45,50 @@ def _config(*, dp_shard_size: int, **accelerator_kwargs):
 
 
 def _patch_distributed(monkeypatch, *, world_size: int, mesh_dim_names):
+    """Patch distributed state and construct a metadata-only mesh context."""
     monkeypatch.setattr(infrastructure.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
         infrastructure.dist,
         "get_world_size",
         lambda: world_size,
     )
+    def _build_mesh_context(
+        accelerator_config,
+        dp_shard_size,
+        dp_replicate_size,
+        current_world_size,
+        edp_shard_size,
+    ):
+        """Return the MeshContext contract produced by the real mesh builder."""
+        dp_size = current_world_size // (
+            accelerator_config.tp_size
+            * accelerator_config.cp_size
+            * accelerator_config.pp_size
+        )
+        return (
+            infrastructure.MeshContext(
+                device_mesh=_FakeDeviceMesh(mesh_dim_names),
+                dp_size=dp_size,
+                dp_replicate_size=dp_replicate_size,
+                dp_shard_size=dp_shard_size,
+                edp_shard_size=edp_shard_size,
+                tp_size=accelerator_config.tp_size,
+                cp_size=accelerator_config.cp_size,
+                pp_size=accelerator_config.pp_size,
+                ep_size=accelerator_config.ep_size,
+            ),
+            mesh_dim_names,
+        )
+
     monkeypatch.setattr(
         infrastructure,
         "_build_device_mesh_from_accelerator",
-        lambda _accel, _shard, _replicate, _world: (
-            _FakeDeviceMesh(mesh_dim_names),
-            mesh_dim_names,
-        ),
+        _build_mesh_context,
     )
 
 
 def test_create_distributed_setup_derives_fsdp_dp_size(monkeypatch) -> None:
+    """Derive the dense DP size from world size and non-DP topology."""
     _patch_distributed(
         monkeypatch,
         world_size=8,
@@ -75,6 +105,7 @@ def test_create_distributed_setup_derives_fsdp_dp_size(monkeypatch) -> None:
 
 
 def test_create_distributed_setup_derives_hsdp_replicate_size(monkeypatch) -> None:
+    """Derive the HSDP replicate size after fixing the shard size."""
     _patch_distributed(
         monkeypatch,
         world_size=16,
@@ -90,6 +121,7 @@ def test_create_distributed_setup_derives_hsdp_replicate_size(monkeypatch) -> No
 
 
 def test_ep_size_uses_the_existing_dense_rank_domain(monkeypatch) -> None:
+    """Keep EP within the dense rank domain instead of adding a world-mesh axis."""
     _patch_distributed(
         monkeypatch,
         world_size=8,
@@ -106,6 +138,7 @@ def test_ep_size_uses_the_existing_dense_rank_domain(monkeypatch) -> None:
 
 
 def test_instantiate_infrastructure_uses_distributed_strategy_config() -> None:
+    """Instantiate FSDP2 from the resolved distributed strategy config."""
     strategy_config = FSDP2Config(dp_shard_size=2)
     setup = infrastructure.DistributedSetup(
         mesh_context=infrastructure.MeshContext(),
