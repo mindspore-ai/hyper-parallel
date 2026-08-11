@@ -93,8 +93,9 @@ def _runtime_imports():
     from hyper_parallel.core.distributed_checkpoint.filesystem_storage import _load_tensor_file
     from hyper_parallel.core.distributed_checkpoint.metadata import MetadataIndex
     from hyper_parallel.core.distributed_checkpoint.planner import LoadItemType, ReadItem
+    from hyper_parallel.core.distributed_checkpoint.storage import StorageInfo
 
-    return _load_tensor_file, MetadataIndex, LoadItemType, ReadItem
+    return _load_tensor_file, MetadataIndex, LoadItemType, ReadItem, StorageInfo
 
 
 def _build_read_item(metadata_index_cls, load_item_type_cls, read_item_cls, storage_offsets=(), lengths=()):
@@ -108,6 +109,17 @@ def _build_read_item(metadata_index_cls, load_item_type_cls, read_item_cls, stor
     )
 
 
+def _build_storage_data(storage_info_cls, read_item):
+    return {
+        read_item.storage_index: storage_info_cls(
+            relative_path="dummy.safetensors",
+            offset=0,
+            length=-1,
+            tensor_key="layer.weight",
+        )
+    }
+
+
 def test_dcp_safe_open_lazy_tensor_lookup():
     """
     Feature: DCP tensor reader uses safe_open for torch safetensors.
@@ -115,8 +127,9 @@ def test_dcp_safe_open_lazy_tensor_lookup():
     Expectation: Tensor reader resolves the requested fqn through safe_open.get_tensor().
     """
     init_dist()
-    load_tensor_file, metadata_index_cls, load_item_type_cls, read_item_cls = _runtime_imports()
+    load_tensor_file, metadata_index_cls, load_item_type_cls, read_item_cls, storage_info_cls = _runtime_imports()
     req = _build_read_item(metadata_index_cls, load_item_type_cls, read_item_cls)
+    storage_data = _build_storage_data(storage_info_cls, req)
     planner = _DummyPlanner(target_shape=(2, 2))
     tensor_file = _FakeTensorFile(shape=(2, 2))
 
@@ -127,7 +140,7 @@ def test_dcp_safe_open_lazy_tensor_lookup():
         "hyper_parallel.platform.torch.platform.TorchPlatform.load_checkpoint",
         side_effect=AssertionError("safe_open path should not call load_checkpoint"),
     ):
-        load_tensor_file(str(Path("./dummy.safetensors")), [req], planner)
+        load_tensor_file(str(Path("./dummy.safetensors")), [req], planner, storage_data)
 
     assert tensor_file.tensor_calls == ["layer.weight"]
     assert planner.target.copied_from is not None
@@ -140,7 +153,7 @@ def test_dcp_safe_open_slice_lookup():
     Expectation: Tensor reader serves the request through safe_open.get_slice().
     """
     init_dist()
-    load_tensor_file, metadata_index_cls, load_item_type_cls, read_item_cls = _runtime_imports()
+    load_tensor_file, metadata_index_cls, load_item_type_cls, read_item_cls, storage_info_cls = _runtime_imports()
     req = _build_read_item(
         metadata_index_cls,
         load_item_type_cls,
@@ -148,6 +161,7 @@ def test_dcp_safe_open_slice_lookup():
         storage_offsets=(1, 2),
         lengths=(2, 3),
     )
+    storage_data = _build_storage_data(storage_info_cls, req)
     planner = _DummyPlanner(target_shape=(2, 3))
     tensor_file = _FakeSliceFile(shape=(8, 8))
 
@@ -158,7 +172,7 @@ def test_dcp_safe_open_slice_lookup():
         "hyper_parallel.platform.torch.platform.TorchPlatform.load_checkpoint",
         side_effect=AssertionError("safe_open path should not call load_checkpoint"),
     ):
-        load_tensor_file(str(Path("./dummy.safetensors")), [req], planner)
+        load_tensor_file(str(Path("./dummy.safetensors")), [req], planner, storage_data)
 
     assert tensor_file.slice_calls == ["layer.weight"]
     assert not tensor_file.tensor_calls
