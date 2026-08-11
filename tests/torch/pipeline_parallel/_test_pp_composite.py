@@ -19,7 +19,8 @@ Torch counterpart of ``tests/mindspore/st/pipeline_parallel/_test_pp_composite.p
 submesh instead of a 1-D FSDP mesh.  The point is to exercise the HSDP gradient
 *drain* (reduce-scatter over the shard dim **and** all-reduce over the replicate
 dim) when it is driven by the pipeline ``FSDP_REDUCE_GRAD`` MetaStep under
-``ScheduleInterleaved1F1B`` -- the path fixed by ``_root_backward_hook(force_reduce=True)``.
+``ScheduleInterleaved1F1B`` -- the path fixed by the unconditional drain in
+``_root_backward_hook``.
 
 Topology (default, 8 ranks): 3-D mesh ``(pp=2, dp=2, fsdp=2)``.
 
@@ -90,10 +91,12 @@ class MLPModule(nn.Module):
         super().__init__()
         self.net1 = nn.Linear(d_hid, d_hid)
         self.net2 = nn.Linear(d_hid, d_hid)
+        self.net2.output_scale_weight = nn.Parameter(torch.ones(d_hid + 1, d_hid))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the two dense layers."""
-        return self.net2(self.net1(x))
+        hidden_states = self.net2(self.net1(x))
+        return hidden_states * self.net2.output_scale_weight.mean(dim=0)
 
 
 class StageModel(nn.Module):
@@ -221,8 +224,10 @@ def _assert_grad_parity(
             )
         stage_grad = _to_numpy(stage_param.grad)
         ref_grad_full = _to_numpy(ref_param_map[fqn].grad)
-        shard = ref_grad_full.shape[0] // fsdp_size
-        ref_grad = ref_grad_full[fsdp_rank * shard : (fsdp_rank + 1) * shard]
+        dim0_shard_size = (ref_grad_full.shape[0] + fsdp_size - 1) // fsdp_size
+        shard_offset = min(fsdp_rank * dim0_shard_size, ref_grad_full.shape[0])
+        actual_shard_size = min(dim0_shard_size, ref_grad_full.shape[0] - shard_offset)
+        ref_grad = ref_grad_full[shard_offset : shard_offset + actual_shard_size]
         if not np.allclose(stage_grad, ref_grad, rtol=_RTOL, atol=_ATOL):
             abs_err = float(np.abs(stage_grad - ref_grad).max())
             raise AssertionError(

@@ -150,7 +150,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[str] = None,
-        param_mode: Optional[FullyShardParamMode] = None,
         enable_fsdp_shard: bool = True,
     ):
         self._module_info: ParamModuleInfo = module_info
@@ -178,7 +177,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._init_sharded_param(param, shard_placement_fn)
         self._init_group_infos()
         self._save_backward_hooks(param)
-        self.all_gather_outputs: List[ms.Tensor] = []
+        self.unsharded_param_buffers: List[ms.Tensor] = []
         self.unsharded_accumulated_grad = None
         self._unsharded_param: Optional[Parameter] = None
         self._param_fqn: Optional[str] = None
@@ -203,11 +202,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
     @accumulated_allreduced_grad.setter
     def accumulated_allreduced_grad(self, value: bool) -> None:
         self._accumulated_allreduced_grad = value
-
-    @property
-    def uses_param_shard(self) -> bool:
-        """Whether FSDP sharding is enabled for this parameter."""
-        return self.enable_fsdp_shard
 
     @property
     def is_dtensor_compat_mode(self) -> bool:
@@ -364,7 +358,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
 
-    def init_all_gather_outputs(
+    def init_unsharded_param_buffers(
         self,
         all_gather_input_numels: list[int],
         all_gather_input_dtypes: list[ms.Type],
@@ -372,9 +366,9 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         device: str,
         force_recreate: bool = False,
     ):
-        if not force_recreate and len(self.all_gather_outputs) > 0:
+        if not force_recreate and len(self.unsharded_param_buffers) > 0:
             return  # already initialized
-        self.all_gather_outputs = [
+        self.unsharded_param_buffers = [
             ms.mint.empty([numel * world_size], dtype=dtype, device=device.split(':')[0])
             for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
         ]
@@ -418,11 +412,11 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     def _get_unsharded_param_from_all_gather_output(self):
         """Reconstruct the full local parameter view from the packed all-gather output."""
-        if len(self.all_gather_outputs) != 1:
+        if len(self.unsharded_param_buffers) != 1:
             raise AssertionError(
-                f"Expected 1 all_gather_output, got {len(self.all_gather_outputs)}"
+                f"Expected 1 unsharded_param_buffer, got {len(self.unsharded_param_buffers)}"
             )
-        unsharded_tensor = self.all_gather_outputs[0]
+        unsharded_tensor = self.unsharded_param_buffers[0]
         plan = build_rs_plan(
             self,
             self._sharded_local_tensor,
@@ -510,8 +504,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             self.unsharded_accumulated_grad += self._to_local_unsharded_grad(self.unsharded_param.grad)
             self.unsharded_param.grad = None
 
-    def alloc_all_gather_outputs(self) -> None:
-        for tensor in self.all_gather_outputs:
+    def alloc_unsharded_param_buffers(self) -> None:
+        for tensor in self.unsharded_param_buffers:
             expected_size = tensor.numel() * tensor.itemsize
 
             storage = tensor.untyped_storage()
@@ -520,7 +514,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     def free_unsharded_param(self) -> None:
         for tensor in itertools.chain(
-            self.all_gather_outputs
+            self.unsharded_param_buffers
         ):
             storage = tensor.untyped_storage()
             if storage.size() != 0:
@@ -702,42 +696,42 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         # If parameter is not sharded (below threshold), no communication needed
         if not self.is_sharded:
-            self.init_all_gather_outputs(
+            self.init_unsharded_param_buffers(
                 all_gather_input_numels=[all_gather_input.numel()],
                 all_gather_input_dtypes=[all_gather_input.dtype],
                 world_size=1,
                 device=all_gather_input.device.split(':')[0],
             )
-            self.alloc_all_gather_outputs()
-            copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
-            return self.all_gather_outputs[0], None
+            self.alloc_unsharded_param_buffers()
+            copy_without_bumping_version(self.unsharded_param_buffers[0], all_gather_input)
+            return self.unsharded_param_buffers[0], None
 
         # Initialize output buffer
-        self.init_all_gather_outputs(
+        self.init_unsharded_param_buffers(
             all_gather_input_numels=[all_gather_input.numel()],
             all_gather_input_dtypes=[all_gather_input.dtype],
             world_size=self.shard_world_size,
             device=self._sharded_param_data.device.split(':')[0],
         )
-        self.alloc_all_gather_outputs()
+        self.alloc_unsharded_param_buffers()
 
         # Get communication group
         shard_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
 
         if shard_group is None or self.shard_world_size <= 1:
             # No communication needed, just copy
-            copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
-            return self.all_gather_outputs[0], None
+            copy_without_bumping_version(self.unsharded_param_buffers[0], all_gather_input)
+            return self.unsharded_param_buffers[0], None
 
         # Execute all_gather_into_tensor
         handle = dist.all_gather_into_tensor(
-            self.all_gather_outputs[0],
+            self.unsharded_param_buffers[0],
             all_gather_input,
             group=shard_group,
             async_op=async_op,
         )
 
-        return self.all_gather_outputs[0], handle
+        return self.unsharded_param_buffers[0], handle
 
     def unshard(self, async_op: bool = False) -> None:
         if self.prefetch_handle is not None:

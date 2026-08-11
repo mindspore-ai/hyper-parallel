@@ -26,7 +26,6 @@ import torch_npu
 
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.fully_shard.api import fully_shard
-from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.shard.api import shard_module
@@ -81,6 +80,65 @@ def mse_loss_sum(y_pred, y_true):
     return torch.sum(square_error)
 
 
+def _print_signed_error_summary(case_name, rank, value_name, expected_values, actual_values):
+    """Print signed numerical-error statistics across all training steps."""
+    expected_arrays = [np.asarray(value.numpy(), dtype=np.float64) for value in expected_values]
+    actual_arrays = [np.asarray(value.numpy(), dtype=np.float64) for value in actual_values]
+    signed_errors = [actual - expected for expected, actual in zip(expected_arrays, actual_arrays)]
+    flat_expected = np.concatenate([value.reshape(-1) for value in expected_arrays])
+    flat_errors = np.concatenate([value.reshape(-1) for value in signed_errors])
+    step_means = np.asarray([value.mean() for value in signed_errors], dtype=np.float64)
+    step_relative_l2 = np.asarray(
+        [
+            np.linalg.norm(error.reshape(-1))
+            / max(np.linalg.norm(expected.reshape(-1)), np.finfo(np.float64).tiny)
+            for expected, error in zip(expected_arrays, signed_errors)
+        ],
+        dtype=np.float64,
+    )
+    step_error_rms = np.asarray(
+        [np.sqrt(np.mean(np.square(error))) for error in signed_errors],
+        dtype=np.float64,
+    )
+    step_expected_rms = np.asarray(
+        [np.sqrt(np.mean(np.square(expected))) for expected in expected_arrays],
+        dtype=np.float64,
+    )
+    step_indices = np.arange(len(step_means), dtype=np.float64)
+    centered_indices = step_indices - step_indices.mean()
+    slope_denominator = np.dot(centered_indices, centered_indices)
+    step_mean_slope = (
+        np.dot(centered_indices, step_means - step_means.mean()) / slope_denominator
+        if slope_denominator > 0
+        else 0.0
+    )
+    step_relative_l2_slope = (
+        np.dot(centered_indices, step_relative_l2 - step_relative_l2.mean()) / slope_denominator
+        if slope_denominator > 0
+        else 0.0
+    )
+    window_size = max(1, len(step_relative_l2) // 5)
+    expected_l2 = np.linalg.norm(flat_expected)
+    relative_l2 = np.linalg.norm(flat_errors) / max(expected_l2, np.finfo(np.float64).tiny)
+    print(
+        f"SIGNED_ERROR case={case_name} rank={rank} value={value_name} count={flat_errors.size} "
+        f"mean={flat_errors.mean():.9e} std={flat_errors.std():.9e} "
+        f"min={flat_errors.min():.9e} max={flat_errors.max():.9e} "
+        f"rel_l2={relative_l2:.9e} pos={np.count_nonzero(flat_errors > 0)} "
+        f"neg={np.count_nonzero(flat_errors < 0)} zero={np.count_nonzero(flat_errors == 0)} "
+        f"step_min={step_means.min():.9e} step_max={step_means.max():.9e} "
+        f"step_slope={step_mean_slope:.9e} step_pos={np.count_nonzero(step_means > 0)} "
+        f"step_neg={np.count_nonzero(step_means < 0)} step_zero={np.count_nonzero(step_means == 0)} "
+        f"rel_head={step_relative_l2[:window_size].mean():.9e} "
+        f"rel_tail={step_relative_l2[-window_size:].mean():.9e} rel_max={step_relative_l2.max():.9e} "
+        f"rel_slope={step_relative_l2_slope:.9e} "
+        f"error_rms_head={step_error_rms[:window_size].mean():.9e} "
+        f"error_rms_tail={step_error_rms[-window_size:].mean():.9e} "
+        f"expected_rms_head={step_expected_rms[:window_size].mean():.9e} "
+        f"expected_rms_tail={step_expected_rms[-window_size:].mean():.9e}"
+    )
+
+
 def _build_mesh(world_size: int, tp_size: int = 2):
     """
     Build a 2D mesh for TP + fully_shard.
@@ -101,23 +159,23 @@ def _build_mesh(world_size: int, tp_size: int = 2):
     return root_mesh, root_mesh["dp"], root_mesh["tp"], dp_size
 
 
-def _build_tp_only_mesh(world_size: int):
+def _build_pure_tp_mesh(world_size: int):
     """
-    Build a pure-TP 1D mesh.
+    Build separate size-one DP and world-size TP submeshes.
 
     Input:
         world_size: total process count from torchrun.
     Expected output:
-        A 1D ``tp`` mesh that uses all ranks and does not add an explicit DP/FSDP dimension.
+        A root mesh shaped as ``(1, world_size)`` and its independent DP/TP submeshes.
     """
     if world_size < 2:
-        return None, None
-    tp_mesh = init_device_mesh(
+        return None, None, None
+    root_mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(world_size,),
-        mesh_dim_names=("tp",),
+        mesh_shape=(1, world_size),
+        mesh_dim_names=("dp", "tp"),
     )
-    return tp_mesh, world_size
+    return root_mesh, root_mesh["dp"], root_mesh["tp"]
 
 
 def _build_hsdp_tp_mesh(
@@ -459,6 +517,8 @@ def _assert_mixed_replicate_group_loss_and_grad_match_hsdp_tp_root_mesh(
         comm_fusion=comm_fusion,
     )
 
+    expected_weight_grads = []
+    expected_scale_grads = []
     for step_idx in range(steps):
         assert np.allclose(
             standalone_local_losses[step_idx].numpy(),
@@ -481,6 +541,8 @@ def _assert_mixed_replicate_group_loss_and_grad_match_hsdp_tp_root_mesh(
             root_mesh,
             fsdp_size,
         )
+        expected_weight_grads.append(expected_weight_grad)
+        expected_scale_grads.append(expected_scale_grad)
 
         assert np.allclose(
             expected_weight_grad.numpy(),
@@ -500,6 +562,22 @@ def _assert_mixed_replicate_group_loss_and_grad_match_hsdp_tp_root_mesh(
             f"{case_name}, rank {rank}, step {step_idx}: expected scale grad slice shape "
             f"{tuple(expected_scale_grad.shape)}, got {tuple(dist_grads[step_idx]['scale'].shape)}"
         )
+
+    _print_signed_error_summary(case_name, rank, "loss", standalone_local_losses, dist_losses)
+    _print_signed_error_summary(
+        case_name,
+        rank,
+        "weight_grad",
+        expected_weight_grads,
+        [grad_record["weight"] for grad_record in dist_grads],
+    )
+    _print_signed_error_summary(
+        case_name,
+        rank,
+        "scale_grad",
+        expected_scale_grads,
+        [grad_record["scale"] for grad_record in dist_grads],
+    )
 
     print(
         f"[Rank {rank}] {case_name} passed with root_mesh={root_mesh.mesh_shape}, "
@@ -588,6 +666,8 @@ def _assert_replicate_param_comm_fusion_loss_and_grad_match_hsdp_tp_root_mesh(
         comm_fusion=comm_fusion,
     )
 
+    expected_weight_grads = []
+    expected_scale_grads = []
     for step_idx in range(steps):
         assert np.allclose(
             standalone_local_losses[step_idx].numpy(),
@@ -606,6 +686,8 @@ def _assert_replicate_param_comm_fusion_loss_and_grad_match_hsdp_tp_root_mesh(
             built_tp_size,
         )
         expected_scale_grad = standalone_grads[step_idx]["scale"]
+        expected_weight_grads.append(expected_weight_grad)
+        expected_scale_grads.append(expected_scale_grad)
 
         assert np.allclose(
             expected_weight_grad.numpy(),
@@ -625,6 +707,22 @@ def _assert_replicate_param_comm_fusion_loss_and_grad_match_hsdp_tp_root_mesh(
             f"{case_name}, rank {rank}, step {step_idx}: expected scale grad slice shape "
             f"{tuple(expected_scale_grad.shape)}, got {tuple(dist_grads[step_idx]['scale'].shape)}"
         )
+
+    _print_signed_error_summary(case_name, rank, "loss", standalone_local_losses, dist_losses)
+    _print_signed_error_summary(
+        case_name,
+        rank,
+        "weight_grad",
+        expected_weight_grads,
+        [grad_record["weight"] for grad_record in dist_grads],
+    )
+    _print_signed_error_summary(
+        case_name,
+        rank,
+        "scale_grad",
+        expected_scale_grads,
+        [grad_record["scale"] for grad_record in dist_grads],
+    )
 
     print(
         f"[Rank {rank}] {case_name} passed with root_mesh={root_mesh.mesh_shape}, "
@@ -714,6 +812,8 @@ def _assert_complex_replicate_param_comm_fusion_match_hsdp_tp_root_mesh(
         comm_fusion=comm_fusion,
     )
 
+    grad_names = ("weight", "in_scale", "in_bias", "gate_scale", "gate_bias")
+    expected_grads = {grad_name: [] for grad_name in grad_names}
     for step_idx in range(steps):
         assert np.allclose(
             standalone_local_losses[step_idx].numpy(),
@@ -731,6 +831,7 @@ def _assert_complex_replicate_param_comm_fusion_match_hsdp_tp_root_mesh(
             fsdp_size,
             built_tp_size,
         )
+        expected_grads["weight"].append(expected_weight_grad)
         assert np.allclose(
             expected_weight_grad.numpy(),
             dist_grads[step_idx]["weight"].numpy(),
@@ -743,6 +844,7 @@ def _assert_complex_replicate_param_comm_fusion_match_hsdp_tp_root_mesh(
 
         for grad_name in ("in_scale", "in_bias", "gate_scale", "gate_bias"):
             expected_grad = standalone_grads[step_idx][grad_name]
+            expected_grads[grad_name].append(expected_grad)
             assert np.allclose(
                 expected_grad.numpy(),
                 dist_grads[step_idx][grad_name].numpy(),
@@ -752,6 +854,16 @@ def _assert_complex_replicate_param_comm_fusion_match_hsdp_tp_root_mesh(
                 f"{case_name}, rank {rank}, step {step_idx}: expected {grad_name} grad shape "
                 f"{tuple(expected_grad.shape)}, got {tuple(dist_grads[step_idx][grad_name].shape)}"
             )
+
+    _print_signed_error_summary(case_name, rank, "loss", standalone_local_losses, dist_losses)
+    for grad_name in grad_names:
+        _print_signed_error_summary(
+            case_name,
+            rank,
+            f"{grad_name}_grad",
+            expected_grads[grad_name],
+            [grad_record[grad_name] for grad_record in dist_grads],
+        )
 
     print(
         f"[Rank {rank}] {case_name} passed with root_mesh={root_mesh.mesh_shape}, "
@@ -774,10 +886,11 @@ def _assert_pure_tp_replicate_grad_managed_by_fully_shard(
     init_seed: int,
 ):
     """
-    Run one pure-TP replicate case and compare standalone vs fully_shard(mesh=None).
+    Run one pure-TP replicate case with an explicit size-one DP mesh.
 
     Input:
-        Weight and input placements are both ``Replicate()`` on a 1D TP mesh.
+        Weight and input placements are both ``Replicate()`` on the TP submesh;
+        fully_shard receives the independent size-one DP submesh.
     Expected output:
         1. Each training step produces the same loss as standalone.
         2. Each rank's reduced gradient matches the standalone full gradient.
@@ -785,8 +898,8 @@ def _assert_pure_tp_replicate_grad_managed_by_fully_shard(
     """
     rank, _ = init_dist()
     world_size = torch.distributed.get_world_size()
-    tp_mesh, tp_size = _build_tp_only_mesh(world_size)
-    if tp_mesh is None:
+    root_mesh, dp_mesh, tp_mesh = _build_pure_tp_mesh(world_size)
+    if root_mesh is None:
         print(f"[Rank {rank}] Skip {case_name} because world_size={world_size} is not multi-card.")
         return
 
@@ -813,20 +926,20 @@ def _assert_pure_tp_replicate_grad_managed_by_fully_shard(
     )
     dist_losses, dist_grads = _run_pure_tp_fully_shard_training(
         dist_model,
+        dp_mesh,
         tp_mesh,
         input_data,
         label_data,
         steps,
     )
 
-    managed_param = dist_model.hsdp_scheduler.hsdp_state.hsdp_params[0]
-    assert dist_model.hsdp_scheduler.hsdp_state.replicate_params == []
-    assert managed_param.param_mode == FullyShardParamMode.DTENSOR_COMPAT
-    assert managed_param.enable_fsdp_shard is True
-    assert managed_param.is_sharded is False
-    assert managed_param.shard_size == 1
-    assert managed_param.dp_size == tp_size
-    assert [repr(placement) for placement in managed_param._spmd_placements] == ["Replicate()"]
+    managed_params = dist_model.hsdp_scheduler.hsdp_state.hsdp_params
+    assert len(managed_params) == 1
+    managed_param = managed_params[0]
+    assert managed_param.shard_world_size == 1
+    assert managed_param._spmd_mesh.mesh_dim_names == ("dp", "tp")
+    assert tuple(managed_param._spmd_placements) == (Shard(0), Replicate())
+    assert tuple(managed_param._orig_dtensor_placements) == (Replicate(),)
 
     for step_idx in range(steps):
         assert np.allclose(
@@ -849,7 +962,7 @@ def _assert_pure_tp_replicate_grad_managed_by_fully_shard(
         )
 
     print(
-        f"[Rank {rank}] {case_name} passed with tp_mesh={tp_mesh.mesh_shape}, "
+        f"[Rank {rank}] {case_name} passed with root_mesh={root_mesh.mesh_shape}, "
         f"steps={steps}, grad_shape={tuple(dist_grads[-1].shape)}"
     )
 
@@ -883,13 +996,14 @@ def _run_standalone_training(model, x, y, steps, dp_size, dp_idx):
 
 def _run_pure_tp_fully_shard_training(
     model,
+    dp_mesh,
     tp_mesh,
     x,
     y,
     steps,
 ):
     """
-    Run pure-TP training with fully_shard(mesh=None) managing replicated DTensor gradients.
+    Run pure-TP training with a size-one DP mesh managing replicated DTensor gradients.
 
     Input:
         Weight and input are both replicated on the TP mesh.
@@ -907,7 +1021,7 @@ def _run_pure_tp_fully_shard_training(
     model = shard_module(model, device_mesh=tp_mesh, sharding_plan=sharding_plan)
     model = fully_shard(
         model,
-        mesh=None,
+        mesh=dp_mesh,
         reshard_after_forward=True,
         mp_policy=MixedPrecisionPolicy(
             param_dtype=torch.float32,
@@ -1460,14 +1574,13 @@ def test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone():
     """
     Feature: pure TP replicate parameters with fully_shard backward management.
     Description:
-        1. Build a 1D TP mesh only, without an explicit DP/FSDP mesh.
-        2. Keep the weight replicated on the TP mesh and wrap the model with
-           ``fully_shard(mesh=None)``.
+        1. Build independent size-one DP and world-size TP submeshes.
+        2. Keep the weight replicated on TP and pass the DP submesh to fully_shard.
         3. Compare per-step loss and reduced gradients with standalone.
     Expectation:
         1. Distributed loss equals standalone loss at each step.
         2. Each rank's gradient equals the standalone full gradient.
-        3. The parameter stays in ``hsdp_params`` and uses the compat all-reduce route.
+        3. The parameter stays in ``hsdp_params`` and TP all-reduce follows its placements.
     """
     _assert_pure_tp_replicate_grad_managed_by_fully_shard(
         case_name="pure_tp_replicate_fully_shard_case",

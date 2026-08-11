@@ -362,8 +362,8 @@ class TestMindSporeParamGroup(unittest.TestCase):
 
         HSDPParamGroup.wait_for_unshard(group)
 
-        hsdp_param.init_all_gather_outputs.assert_called_once()
-        hsdp_param.alloc_all_gather_outputs.assert_called_once()
+        hsdp_param.init_unsharded_param_buffers.assert_called_once()
+        hsdp_param.alloc_unsharded_param_buffers.assert_called_once()
         hsdp_param.init_unsharded_param.assert_called_once()
         hsdp_param.to_unsharded.assert_called_once()
         self.assertIsNone(group._result)
@@ -438,8 +438,8 @@ class TestMindSporeParamGroup(unittest.TestCase):
         HSDPParamGroup.foreach_all_gather_copy_out(group)
 
         handle.wait.assert_called_once()
-        hsdp_param.init_all_gather_outputs.assert_called_once()
-        hsdp_param.alloc_all_gather_outputs.assert_called_once()
+        hsdp_param.init_unsharded_param_buffers.assert_called_once()
+        hsdp_param.alloc_unsharded_param_buffers.assert_called_once()
         group.free_all_gather_output.assert_called_once()
         self.assertIsNone(group._result)
 
