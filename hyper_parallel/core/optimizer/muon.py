@@ -16,10 +16,11 @@
 """Muon optimizer with HSDP shard-group-aware communication."""
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from collections import defaultdict
+from dataclasses import dataclass
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -55,10 +56,31 @@ _NS_ASYM5_COEFFS: Tuple[Tuple[float, float, float], ...] = (
 )
 
 
+@dataclass
+class NSInputTransform:
+    """Prepared NS tensors and the callback that restores their updates."""
+
+    tensors: List[torch.Tensor]
+    restore: Callable[[List[torch.Tensor], torch.Tensor], None]
+
+
+@dataclass(frozen=True)
+class MuonPostUpdateContext:
+    """Context supplied to an optional parameter post-update callback."""
+
+    param_fqn: Optional[str]
+    logical_shape: Tuple[int, ...]
+    lr: float
+    weight_decay: float
+    step: int
+
+
 def zeropower_via_newtonschulz5(
         ns_inputs: torch.Tensor,
         steps: int,
         ns_variant: str = "asym5",
+        epsilon: float = 1e-10,
+        ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
 ) -> torch.Tensor:
     """Newton-Schulz orthogonalization with preallocated matmul buffers."""
     mat_x = ns_inputs
@@ -67,7 +89,7 @@ def zeropower_via_newtonschulz5(
         mat_x = mat_x.mT
 
     # Normalize input before Newton-Schulz iteration.
-    mat_x = mat_x / (mat_x.norm(dim=(-2, -1), keepdim=True) + 1e-10)
+    mat_x = mat_x / (mat_x.norm(dim=(-2, -1), keepdim=True) + epsilon)
 
     n_size = mat_x.size(-2)
     buf_a = torch.empty(mat_x.shape[:-2] + (n_size, n_size), dtype=mat_x.dtype, device=mat_x.device)
@@ -78,9 +100,17 @@ def zeropower_via_newtonschulz5(
         step_coeffs = [_NS_LEGACY_COEFFS] * steps
     elif ns_variant == "asym5":
         step_coeffs = _NS_ASYM5_COEFFS[:steps]
+    elif ns_variant == "custom":
+        if ns_coefficients is None:
+            raise ValueError("ns_coefficients must be provided when ns_variant='custom'")
+        if steps > len(ns_coefficients):
+            raise ValueError(
+                f"ns_steps={steps} exceeds the {len(ns_coefficients)} provided coefficient groups"
+            )
+        step_coeffs = tuple(ns_coefficients[:steps])
     else:
         raise ValueError(
-            f"ns_variant must be 'legacy' or 'asym5', got {ns_variant!r}"
+            f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
         )
 
     for coeff_a, coeff_b, coeff_c in step_coeffs:
@@ -100,8 +130,14 @@ def zeropower_via_newtonschulz5(
     return mat_x
 
 
-def compute_muon_slice_scale(slice_tensor: torch.Tensor, matched_adamw_rms: float) -> float:
+def compute_muon_slice_scale(
+        slice_tensor: torch.Tensor,
+        matched_adamw_rms: float,
+        zero_rms_scale_mode: str = "zero",
+) -> float:
     """Compute Muon scale from the logical matrix dims of a reshaped slice."""
+    if not matched_adamw_rms:
+        return 1.0 if zero_rms_scale_mode == "use_lr" else 0.0
     shape = tuple(slice_tensor.shape)
     if len(shape) == 3 and shape[1] == 1:
         logical_dims = (shape[0], shape[2])
@@ -128,13 +164,29 @@ class Muon(BaseDistributedOptimizer):
             nesterov: bool = True,
             ns_steps: int = 5,
             ns_variant: str = "asym5",
+            ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
+            ns_epsilon: float = 1e-10,
+            zeropower_fn: Optional[Callable[..., torch.Tensor]] = None,
+            momentum_update_fn: Optional[Callable[..., torch.Tensor]] = None,
             reshape_fn: Optional[Callable[..., Any]] = None,
+            ns_transform_fn: Optional[Callable[..., Optional[NSInputTransform]]] = None,
+            post_update_fn: Optional[Callable[..., None]] = None,
+            zero_rms_scale_mode: str = "zero",
+            apply_lr_in_update: bool = False,
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
     ):
-        if ns_variant not in ("legacy", "asym5"):
+        if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
-                f"ns_variant must be 'legacy' or 'asym5', got {ns_variant!r}"
+                f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
             )
+        if ns_epsilon < 0.0 or not math.isfinite(ns_epsilon):
+            raise ValueError(f"ns_epsilon must be a finite non-negative value, got {ns_epsilon}")
+        if zero_rms_scale_mode not in ("zero", "use_lr"):
+            raise ValueError(
+                "zero_rms_scale_mode must be 'zero' or 'use_lr', "
+                f"got {zero_rms_scale_mode!r}"
+            )
+        normalized_coefficients = self._validate_ns_coefficients(ns_variant, ns_steps, ns_coefficients)
         if not isinstance(momentum, (list, tuple)):
             momentum = [momentum]
         if len(momentum) == 1:
@@ -147,9 +199,17 @@ class Muon(BaseDistributedOptimizer):
             "nesterov": nesterov,
             "ns_steps": ns_steps,
             "ns_variant": ns_variant,
+            "ns_coefficients": normalized_coefficients,
+            "ns_epsilon": ns_epsilon,
+            "zero_rms_scale_mode": zero_rms_scale_mode,
+            "apply_lr_in_update": apply_lr_in_update,
         }
         super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
         self.reshape_fn = reshape_fn
+        self.zeropower_fn = zeropower_fn
+        self.momentum_update_fn = momentum_update_fn
+        self.ns_transform_fn = ns_transform_fn
+        self.post_update_fn = post_update_fn
 
         self._group_dtensor_by_mesh()
         self._build_param_shard_metadata()
@@ -162,6 +222,36 @@ class Muon(BaseDistributedOptimizer):
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
+
+    @staticmethod
+    def _validate_ns_coefficients(
+            ns_variant: str,
+            ns_steps: int,
+            ns_coefficients: Optional[Sequence[Tuple[float, float, float]]],
+    ) -> Optional[Tuple[Tuple[float, float, float], ...]]:
+        """Validate and normalize externally supplied Newton-Schulz coefficients."""
+        if ns_variant != "custom":
+            if ns_coefficients is not None:
+                raise ValueError("ns_coefficients can only be provided when ns_variant='custom'")
+            return None
+        if not ns_coefficients:
+            raise ValueError("ns_coefficients must be provided when ns_variant='custom'")
+        if ns_steps > len(ns_coefficients):
+            raise ValueError(
+                f"ns_steps={ns_steps} exceeds the {len(ns_coefficients)} provided coefficient groups"
+            )
+
+        normalized = []
+        for index, coefficients in enumerate(ns_coefficients):
+            if len(coefficients) != 3:
+                raise ValueError(
+                    f"ns_coefficients[{index}] must contain exactly three values, got {coefficients!r}"
+                )
+            normalized_coefficients = tuple(float(value) for value in coefficients)
+            if not all(math.isfinite(value) for value in normalized_coefficients):
+                raise ValueError(f"ns_coefficients[{index}] must contain only finite values")
+            normalized.append(normalized_coefficients)
+        return tuple(normalized)
 
     def __str__(self):
         return super().__repr__()
@@ -209,7 +299,10 @@ class Muon(BaseDistributedOptimizer):
         # Process no-comm params.
         for group_idx in range(num_groups):
             if no_comm_ns[group_idx]:
-                self._process_unshard_params(self.param_groups[group_idx], no_comm_ns[group_idx])
+                group = self.param_groups[group_idx]
+                self._process_unshard_params(group, no_comm_ns[group_idx])
+                if self.post_update_fn is not None:
+                    self._run_post_update_fn(group, no_comm_ns[group_idx].keys())
 
         # Flatten nested batch into a linear schedule.
         group_linear_batches: Dict[int, List[HSDPGroupAssignment]] = {}
@@ -243,12 +336,36 @@ class Muon(BaseDistributedOptimizer):
                         group, ns_inputs, [hsdp_assign], group_idx,
                         buffer_cache={},
                     )
+                if self.post_update_fn is not None:
+                    self._run_post_update_fn(group, ns_inputs.keys())
 
                 # Flush broadcasts after each assignment.
                 broadcaster.flush_group(hsdp_assign)
 
         broadcaster.wait_all()
         return loss
+
+    def _run_post_update_fn(
+            self,
+            group: Dict[str, Any],
+            params: Iterable[torch.nn.Parameter],
+    ) -> None:
+        """Run the optional model callback on updated owner parameters before broadcast."""
+        if self.post_update_fn is None:
+            return
+        context_values = {
+            "lr": group["lr"],
+            "weight_decay": group["weight_decay"],
+            "step": group["step"],
+        }
+        for param in params:
+            local_tensor = to_local_if_dtensor(param.data)
+            context = MuonPostUpdateContext(
+                param_fqn=getattr(param, "model_name", None),
+                logical_shape=tuple(param.shape),
+                **context_values,
+            )
+            self.post_update_fn(param, local_tensor, context)
 
     def _classify_parameters_for_step(self) -> None:
         """Classify params by whether the last two dims are sharded.
@@ -325,6 +442,24 @@ class Muon(BaseDistributedOptimizer):
         if not valid_params:
             return {}
 
+        if self.momentum_update_fn is not None:
+            local_grads = [to_local_if_dtensor(grad) for grad in grads]
+            local_bufs = [to_local_if_dtensor(buffer) for buffer in bufs]
+            custom_updates = list(self.momentum_update_fn(
+                local_grads,
+                local_bufs,
+                momentum1,
+                momentum2,
+                nesterov,
+            ))
+            if len(custom_updates) != len(valid_params):
+                raise ValueError(
+                    "momentum_update_fn must return one update tensor per input gradient, "
+                    f"got {len(custom_updates)} updates for {len(valid_params)} gradients"
+                )
+            custom_updates = [update.to(torch.bfloat16) for update in custom_updates]
+            return dict(zip(valid_params, custom_updates))
+
         # Match muon_update_core():
         # m_for_update = grad + momentum1 * m_old
         # m_new = grad + momentum2 * m_old
@@ -382,7 +517,8 @@ class Muon(BaseDistributedOptimizer):
                     # pylint: disable=protected-access
                     torch._foreach_mul_(local_params, 1 - lr * weight_decay)
                 # pylint: disable=protected-access
-                torch._foreach_add_(local_params, local_updates, alpha=-lr)
+                apply_alpha = 1.0 if group["apply_lr_in_update"] else -lr
+                torch._foreach_add_(local_params, local_updates, alpha=apply_alpha)
 
     def _gather_and_compute_shard_updates(
             self,
@@ -569,11 +705,60 @@ class Muon(BaseDistributedOptimizer):
 
         return working_input, reshaped_inputs
 
+    def _prepare_ns_transform(
+            self,
+            param: torch.nn.Parameter,
+            ns_input: torch.Tensor,
+    ) -> Tuple[torch.Tensor, NSInputTransform]:
+        """Route one parameter through custom, zero-copy, or identity NS preparation."""
+        working_input = ns_input if ns_input.is_contiguous() else ns_input.contiguous()
+        param_fqn = getattr(param, "model_name", None)
+        if self.ns_transform_fn is not None and param_fqn is not None:
+            transform = self.ns_transform_fn(param_fqn, working_input)
+            if transform is not None:
+                self._validate_ns_transform(transform, working_input)
+                return working_input, transform
+
+        _, reshaped_inputs = self._reshape_ns_input(param, working_input)
+
+        def restore_view_updates(updates: List[torch.Tensor], output: torch.Tensor) -> None:
+            """Write reshaped NS updates back into the views and the working input."""
+            for reshaped_input, update in zip(reshaped_inputs, updates):
+                reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
+            if output.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
+                output.copy_(working_input)
+
+        return working_input, NSInputTransform(tensors=reshaped_inputs, restore=restore_view_updates)
+
+    @staticmethod
+    def _validate_ns_transform(transform: NSInputTransform, working_input: torch.Tensor) -> None:
+        """Validate a model-provided reversible NS transform."""
+        if not isinstance(transform, NSInputTransform):
+            raise ValueError(
+                "ns_transform_fn must return NSInputTransform or None, "
+                f"got {type(transform).__name__}"
+            )
+        if not transform.tensors:
+            raise ValueError("NSInputTransform.tensors must not be empty")
+        for index, tensor in enumerate(transform.tensors):
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"NSInputTransform.tensors[{index}] must be a torch.Tensor")
+            if tensor.device != working_input.device:
+                raise ValueError("NSInputTransform tensors must be on the same device as the NS input")
+            if tensor.dtype != working_input.dtype:
+                raise ValueError("NSInputTransform tensors must have the same dtype as the NS input")
+            if tensor.dim() < 2:
+                raise ValueError("NSInputTransform tensors must have at least two dimensions")
+        if not callable(transform.restore):
+            raise ValueError("NSInputTransform.restore must be callable")
+
     def _compute_batched_ns_outputs_for_tensors(
             self,
             tensor_list: List[torch.Tensor],
             ns_steps: int,
             ns_variant: str = "asym5",
+            ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
+            ns_epsilon: float = 1e-10,
     ) -> List[torch.Tensor]:
         """Run batched NS on mixed-shape tensors and restore their original shapes."""
         if not tensor_list:
@@ -609,7 +794,16 @@ class Muon(BaseDistributedOptimizer):
         if squeeze_batch:
             merged_input = merged_input.squeeze(0)
 
-        merged_update = zeropower_via_newtonschulz5(merged_input, steps=ns_steps, ns_variant=ns_variant)
+        if self.zeropower_fn is None:
+            merged_update = zeropower_via_newtonschulz5(
+                merged_input,
+                steps=ns_steps,
+                ns_variant=ns_variant,
+                epsilon=ns_epsilon,
+                ns_coefficients=ns_coefficients,
+            )
+        else:
+            merged_update = self.zeropower_fn(merged_input, steps=ns_steps)
         del merged_input
 
         if squeeze_batch:
@@ -671,6 +865,74 @@ class Muon(BaseDistributedOptimizer):
             group: Dict[str, Any],
             no_shard: bool = False
     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
+        """Route batched NS through the native or reversible-transform path."""
+        if self.ns_transform_fn is None:
+            return self._compute_batched_ns_updates_fast(p_list, ns_inputs, group, no_shard)
+        return self._compute_batched_ns_updates_with_transform(p_list, ns_inputs, group, no_shard)
+
+    def _compute_batched_ns_updates_fast(
+            self,
+            p_list: List[torch.nn.Parameter],
+            ns_inputs: Dict[torch.nn.Parameter, torch.Tensor],
+            group: Dict[str, Any],
+            no_shard: bool = False,
+    ) -> Dict[torch.nn.Parameter, torch.Tensor]:
+        """Compute native reshape/view NS updates without transform bookkeeping."""
+        updates_dict = {}
+        if not p_list:
+            return updates_dict
+
+        reshape_groups: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
+        origin_shapes: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
+        working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
+
+        for param in p_list:
+            local_shape = getattr(param, "local_shape", None)
+            if local_shape is None:
+                local_shape = to_local_if_dtensor(param.data).shape
+            origin_shape = tuple(local_shape) if no_shard else tuple(param.shape)
+            ns_input = ns_inputs[param].view(origin_shape)
+            origin_shapes[param] = origin_shape
+            working_input, reshaped_inputs = self._reshape_ns_input(param, ns_input)
+            working_inputs[param] = working_input
+            for reshaped_input in reshaped_inputs:
+                core_shape = self._shape_to_core_shape(tuple(reshaped_input.shape))
+                reshape_groups[core_shape].append(reshaped_input)
+
+        for tensor_list in reshape_groups.values():
+            reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
+                tensor_list,
+                group["ns_steps"],
+                ns_variant=group["ns_variant"],
+                ns_coefficients=group["ns_coefficients"],
+                ns_epsilon=group["ns_epsilon"],
+            )
+            for reshaped_input, reshaped_update in zip(tensor_list, reshaped_updates):
+                slice_scale = compute_muon_slice_scale(
+                    reshaped_update,
+                    group["matched_adamw_rms"],
+                    zero_rms_scale_mode=group["zero_rms_scale_mode"],
+                )
+                if group["apply_lr_in_update"]:
+                    slice_scale *= -group["lr"]
+                reshaped_update.mul_(slice_scale)
+                reshaped_input.copy_(reshaped_update.contiguous().view_as(reshaped_input))
+
+        for param in p_list:
+            ns_input = ns_inputs[param].view(origin_shapes[param])
+            working_input = working_inputs[param]
+            if working_input.untyped_storage().data_ptr() != ns_input.untyped_storage().data_ptr():
+                ns_input.copy_(working_input)
+            updates_dict[param] = ns_input
+        return updates_dict
+
+    def _compute_batched_ns_updates_with_transform(
+            self,
+            p_list: List[torch.nn.Parameter],
+            ns_inputs: Dict[torch.nn.Parameter, torch.Tensor],
+            group: Dict[str, Any],
+            no_shard: bool = False,
+    ) -> Dict[torch.nn.Parameter, torch.Tensor]:
         """Batched Newton-Schulz update for mixed 2D / Conv3D / 3D parameters.
 
         Normalizes all inputs to 3D, concatenates along dim 0, runs a single
@@ -685,34 +947,57 @@ class Muon(BaseDistributedOptimizer):
         rms = group["matched_adamw_rms"]
         ns_steps = group["ns_steps"]
         ns_variant = group["ns_variant"]
+        ns_coefficients = group["ns_coefficients"]
+        ns_epsilon = group["ns_epsilon"]
+        zero_rms_scale_mode = group["zero_rms_scale_mode"]
+        apply_lr_in_update = group["apply_lr_in_update"]
 
-        reshape_groups: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
+        reshape_groups: Dict[Any, List[Tuple[torch.Tensor, int, int]]] = defaultdict(list)
         origin_shapes: Dict[torch.nn.Parameter, Tuple[int, ...]] = {}
         working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
+        transforms: List[NSInputTransform] = []
+        transform_updates: List[List[Optional[torch.Tensor]]] = []
 
         for p in p_list:
             origin_shape = tuple(to_local_if_dtensor(p.data).shape) if no_shard else tuple(p.shape)
             ns_input = ns_inputs[p].view(origin_shape)
             origin_shapes[p] = origin_shape
 
-            working_input, reshaped_inputs = self._reshape_ns_input(p, ns_input)
+            working_input, transform = self._prepare_ns_transform(p, ns_input)
             working_inputs[p] = working_input
-            for reshaped_input in reshaped_inputs:
-                core_shape = self._shape_to_core_shape(tuple(reshaped_input.shape))
-                reshape_groups[core_shape].append(reshaped_input)
+            transform_index = len(transforms)
+            transforms.append(transform)
+            transform_updates.append([None] * len(transform.tensors))
+            for tensor_index, transformed_input in enumerate(transform.tensors):
+                core_shape = self._shape_to_core_shape(tuple(transformed_input.shape))
+                reshape_groups[core_shape].append((transformed_input, transform_index, tensor_index))
 
-        for _, tensor_list in reshape_groups.items():
+        for _, tensor_records in reshape_groups.items():
+            tensor_list = [record[0] for record in tensor_records]
             reshaped_updates = self._compute_batched_ns_outputs_for_tensors(
                 tensor_list,
                 ns_steps,
                 ns_variant=ns_variant,
+                ns_coefficients=ns_coefficients,
+                ns_epsilon=ns_epsilon,
             )
 
             # scale updates
-            for reshaped_input, reshaped_update in zip(tensor_list, reshaped_updates):
-                slice_scale = compute_muon_slice_scale(reshaped_update, rms)
+            for (_, transform_index, tensor_index), reshaped_update in zip(tensor_records, reshaped_updates):
+                slice_scale = compute_muon_slice_scale(
+                    reshaped_update,
+                    rms,
+                    zero_rms_scale_mode=zero_rms_scale_mode,
+                )
+                if apply_lr_in_update:
+                    slice_scale *= -group["lr"]
                 reshaped_update.mul_(slice_scale)
-                reshaped_input.copy_(reshaped_update.contiguous().view_as(reshaped_input))
+                transform_updates[transform_index][tensor_index] = reshaped_update
+
+        for transform, updates, working_input in zip(transforms, transform_updates, working_inputs.values()):
+            if any(update is None for update in updates):
+                raise RuntimeError("Missing Newton-Schulz update for a transformed input")
+            transform.restore(updates, working_input)
 
         for p in p_list:
             ns_input = ns_inputs[p].view(origin_shapes[p])
@@ -807,7 +1092,8 @@ class Muon(BaseDistributedOptimizer):
 
         # Slice-wise Muon scaling has already been applied during NS postprocess.
         # pylint: disable=protected-access
-        torch._foreach_add_(all_local_params, all_update_shards, alpha=-lr)
+        apply_alpha = 1.0 if group["apply_lr_in_update"] else -lr
+        torch._foreach_add_(all_local_params, all_update_shards, alpha=apply_alpha)
 
     def _build_param_shard_metadata(self) -> None:
         """Build shard metadata once during optimizer init."""
