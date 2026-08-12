@@ -67,14 +67,20 @@ longer dispatches heuristically on them.
 """
 
 import functools
+import importlib
 import inspect
 import logging
 
-import torch
 import torch.nn.functional as F
 
 from hyper_models.components.distributed.cp_utils import (
+    _ULYSSES_WRAPPED_FLAG,
+    _UlyssesContext,
     _cp_offset_causal_mask,
+    _dsa_cp_alltoall,
+    _mla_cp_alltoall,
+    _mome_cp_halo_exchange,
+    _slice_sequence,
     flex_cp_allgather,
 )
 from hyper_models.components.distributed.injection import (
@@ -169,6 +175,7 @@ def sdpa_qkv_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     has no cp axis.
     """
 
+    del mesh, tp_mesh, ep_mesh
     if cp_mesh is None:
         raise ValueError(
             "仓内 CP wrapper 参考实现 'sdpa_qkv' 需要活跃的 cp 轴（K/V all-gather 的通信"
@@ -196,6 +203,7 @@ def flex_qkv_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     framework-filled context; fail fast when the plan has no cp axis.
     """
 
+    del mesh, tp_mesh, ep_mesh
     if cp_mesh is None:
         raise ValueError(
             "仓内 CP wrapper 参考实现 'flex_qkv' 需要活跃的 cp 轴（K/V all-gather 的通信"
@@ -232,6 +240,7 @@ def sdpa_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     immediately.
     """
 
+    del mesh, tp_mesh, ep_mesh
     if cp_mesh is None:
         raise ValueError(
             "仓内 CP wrapper 参考实现 'sdpa_hf' 需要活跃的 cp 轴（K/V all-gather 的通信"
@@ -285,6 +294,7 @@ def flex_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     intercepted, raise a RuntimeError.
     """
 
+    del mesh, tp_mesh, ep_mesh
     if cp_mesh is None:
         raise ValueError(
             "仓内 CP wrapper 参考实现 'flex_hf' 需要活跃的 cp 轴（K/V all-gather 的通信"
@@ -294,24 +304,26 @@ def flex_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
             "examples/distributed/perf_replacement.py）")
 
     original_forward = target_module.forward
-    from torch.nn.attention.flex_attention import flex_attention as _orig_flex
+    # FlexAttention is optional on older supported PyTorch versions.
+    flex_attention_module = importlib.import_module(
+        "torch.nn.attention.flex_attention")
+    original_flex_attention = flex_attention_module.flex_attention
 
     @functools.wraps(original_forward)
     def cp_forward(hidden_states, *args, **kwargs):
-        import torch.nn.attention.flex_attention as _flex_mod
         fired = {"hit": False}
 
         def cp_aware_flex(q, k, v, **kw):
             fired["hit"] = True
             global_k, global_v = flex_cp_allgather(
                 k.contiguous(), v.contiguous(), 2, cp_mesh)
-            return _orig_flex(q, global_k, global_v, **kw)
+            return original_flex_attention(q, global_k, global_v, **kw)
 
-        _flex_mod.flex_attention = cp_aware_flex
+        flex_attention_module.flex_attention = cp_aware_flex
         try:
             out = original_forward(hidden_states, *args, **kwargs)
         finally:
-            _flex_mod.flex_attention = _orig_flex
+            flex_attention_module.flex_attention = original_flex_attention
         if not fired["hit"]:
             raise RuntimeError(
                 f"CP wrapper 'flex_hf' did not intercept any flex_attention "
@@ -324,6 +336,126 @@ def flex_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
         return out
 
     target_module.forward = cp_forward
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# MLA/DSA Ulysses wrapper
+# ────────────────────────────────────────────────────────────────────────────
+
+def _input_cp_sharding(text_model, context):
+    """Configure CP-rank input slicing on a text model."""
+    if getattr(text_model, _ULYSSES_WRAPPED_FLAG, False):
+        return
+    original_forward = text_model.forward
+
+    @functools.wraps(original_forward)
+    def forward_with_sequence_sharding(*args, **kwargs):
+        if getattr(text_model, "_hyper_cp_inside_forward", False):
+            return original_forward(*args, **kwargs)
+        call_kwargs = kwargs.copy()
+        inputs_embeds = call_kwargs.get("inputs_embeds")
+        if inputs_embeds is None:
+            return original_forward(*args, **kwargs)
+        call_kwargs["inputs_embeds"] = _slice_sequence(inputs_embeds, 1, context)
+        position_ids = call_kwargs.get("position_ids")
+        if position_ids is not None:
+            call_kwargs["position_ids"] = _slice_sequence(
+                position_ids, position_ids.ndim - 1, context)
+        mome_mask = call_kwargs.get("mome_mask")
+        if mome_mask is not None:
+            call_kwargs["mome_mask"] = _slice_sequence(mome_mask, 1, context)
+        if call_kwargs.get("use_cache"):
+            raise ValueError("Ulysses CP requires use_cache=False")
+        call_kwargs["use_cache"] = False
+        setattr(text_model, "_hyper_cp_inside_forward", True)
+        try:
+            return original_forward(*args, **call_kwargs)
+        finally:
+            setattr(text_model, "_hyper_cp_inside_forward", False)
+
+    text_model.forward = forward_with_sequence_sharding
+    setattr(text_model, _ULYSSES_WRAPPED_FLAG, True)
+
+
+def _validate_ulysses_requirements(target_module, cp_size):
+    """Validate the model configuration supported by Ulysses CP."""
+    config = getattr(target_module, "config", None)
+    if config is None:
+        raise ValueError(
+            "MLA/DSA Ulysses wrapper requires target_module.config")
+    text_config = getattr(config, "text_config", config)
+    if text_config is None:
+        raise ValueError(
+            "MLA/DSA Ulysses wrapper requires a non-None text_config")
+    for name in ("num_attention_heads", "index_num_attention_heads"):
+        value = getattr(text_config, name, None)
+        if value is None:
+            raise ValueError(
+                "MLA/DSA Ulysses wrapper requires "
+                f"text_config.{name}")
+        count = int(value)
+        if count % cp_size:
+            raise ValueError(
+                f"{name}={count} is not divisible by CP size {cp_size}")
+    if getattr(text_config, "dsa_dense_warm_up", False):
+        raise ValueError("MLA/DSA CP does not support DSA dense warm-up")
+    if not getattr(text_config, "apply_FA_rescale", False):
+        raise ValueError("MLA/DSA CP requires apply_FA_rescale=True")
+    if getattr(text_config, "use_fused_sink_fa", False):
+        raise ValueError("MLA/DSA CP does not support fused sink FA")
+
+
+@inner_wrapper
+def mla_dsa_ulysses_cp_wrapper(
+        target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Configure input, MoME, MLA and DSA Ulysses adaptations."""
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            "MLA/DSA Ulysses wrapper requires an active CP mesh")
+    if getattr(target_module, _ULYSSES_WRAPPED_FLAG, False):
+        return
+    _validate_ulysses_requirements(target_module, cp_mesh.size())
+    context = _UlyssesContext(cp_mesh)
+
+    text_models = [module for name, module in target_module.named_modules()
+                   if name.rsplit(".", maxsplit=1)[-1] in {
+                       "text_model", "language_model"}]
+    if not text_models:
+        raise RuntimeError("Cannot find a text or language model")
+    for text_model in text_models:
+        _input_cp_sharding(text_model, context)
+
+    attention_modules = {
+        inspect.getmodule(module) for module in target_module.modules()
+        if getattr(module, "attention_type", None) in {"mla", "dsa"}}
+    attention_modules.discard(None)
+    if len(attention_modules) != 1:
+        names = sorted(module.__name__ for module in attention_modules)
+        raise RuntimeError(
+            f"Expected one MLA/DSA attention module, found {names}")
+    attention_module = next(iter(attention_modules))
+    attention_registries = [
+        value for value in vars(attention_module).values()
+        if isinstance(value, dict)
+        and {"npu_fa_rescale", "dsa_sparse_attention"} <= value.keys()]
+    if len(attention_registries) != 1:
+        raise RuntimeError(
+            "Expected one attention-function registry containing MLA and DSA backends")
+    attention_functions = attention_registries[0]
+    _mome_cp_halo_exchange(attention_module, context)
+    _mla_cp_alltoall(attention_functions, context)
+    _dsa_cp_alltoall(attention_module, attention_functions, context)
+
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def forward_with_ulysses_adapters(*args, **kwargs):
+        return original_forward(*args, **kwargs)
+
+    target_module.forward = forward_with_ulysses_adapters
+    setattr(target_module, "_hyper_ulysses_context", context)
+    setattr(target_module, _ULYSSES_WRAPPED_FLAG, True)
 
 
 # {registry_name: wrapper_fn} -- inner-wrapper 命名注册表（05 §4.4.2）。
@@ -339,4 +471,5 @@ INNER_WRAPPER_REGISTRY = {
     "sdpa_hf": sdpa_hf_cp_wrapper,    # HF convention + F.sdpa primitive interception (misfire detection)
     "flex_qkv": flex_qkv_cp_wrapper,
     "flex_hf": flex_hf_cp_wrapper,
+    "mla_dsa_ulysses": mla_dsa_ulysses_cp_wrapper,
 }

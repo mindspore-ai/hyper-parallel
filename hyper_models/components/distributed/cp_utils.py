@@ -19,6 +19,7 @@
 - ``shard_batch_for_cp``: data-pipeline CP sharding (aligned with the THD
   contract of the 02 collater);
 - ``_shard_seq_lens_for_cp``: recompute seq_lens/seq_lens_padded per CP rank.
+- Ulysses collectives and MoME/MLA/DSA model-side adaptations.
 
 Note (G5): the seq_len % (2*cp) padding constraint originates from the
 zigzag/ring load-balancing scheme; this design uses all-gather K/V +
@@ -27,8 +28,313 @@ equal-length and FLOPs are naturally balanced -- the constraint is redundant
 but harmless: the implementation is kept and documented here.
 """
 
+import contextvars
+import functools
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 import torch.distributed as dist
+from torch import Tensor
+from torch.distributed.nn.functional import all_gather as differentiable_all_gather
+
+
+_ULYSSES_WRAPPED_FLAG = "_hyper_ulysses_wrapped"
+
+
+class _SeqAllToAll(torch.autograd.Function):
+    """Autograd-aware exchange from one tensor dimension to another."""
+
+    @staticmethod
+    def forward(ctx, group, tensor, scatter_dim, gather_dim):
+        """Exchange tensor shards between the sequence and head dimensions."""
+        ctx.group = group
+        ctx.scatter_dim = scatter_dim
+        ctx.gather_dim = gather_dim
+        world_size = dist.get_world_size(group)
+        if tensor.size(scatter_dim) % world_size:
+            raise ValueError(
+                f"dimension {scatter_dim} size {tensor.size(scatter_dim)} "
+                f"is not divisible by CP size {world_size}")
+        inputs = [
+            part.contiguous()
+            for part in tensor.chunk(world_size, dim=scatter_dim)
+        ]
+        outputs = [torch.empty_like(inputs[0]) for _ in range(world_size)]
+        dist.all_to_all(outputs, inputs, group=group)
+        return torch.cat(outputs, dim=gather_dim).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = _SeqAllToAll.apply(
+            ctx.group, grad_output, ctx.gather_dim, ctx.scatter_dim)
+        return None, grad_input, None, None
+
+
+@dataclass(frozen=True)
+class _UlyssesContext:
+    """Communication context derived from the framework-owned CP mesh."""
+
+    cp_mesh: Any
+
+    @property
+    def group(self):
+        return self.cp_mesh.get_group()
+
+    @property
+    def size(self):
+        return self.cp_mesh.size()
+
+    @property
+    def rank(self):
+        return self.cp_mesh.get_local_rank()
+
+
+def _sequence_to_head(tensor, context):
+    """[B, S/CP, H, D] -> [B, S, H/CP, D]."""
+    return _SeqAllToAll.apply(context.group, tensor, 2, 1)
+
+
+def _head_to_sequence(tensor, context):
+    """[B, S, H/CP, D] -> [B, S/CP, H, D]."""
+    return _SeqAllToAll.apply(context.group, tensor, 1, 2)
+
+
+def _gather_sequence(tensor, context):
+    """Gather sequence shards and sum their gradients during backward."""
+    return torch.cat(
+        differentiable_all_gather(
+            tensor.contiguous(), group=context.group), dim=1)
+
+
+def _slice_sequence(tensor, dim, context):
+    if tensor.size(dim) % context.size:
+        raise ValueError(
+            f"sequence length {tensor.size(dim)} is not divisible by "
+            f"CP size {context.size}")
+    length = tensor.size(dim) // context.size
+    return tensor.narrow(
+        dim, context.rank * length, length).contiguous()
+
+
+def _global_seq_len(actual, length, device):
+    if actual is None:
+        return [length]
+    if isinstance(actual, Tensor):
+        return actual.to(device=device, dtype=torch.int32)
+    return actual
+
+
+def _slice_sink(tensor, context):
+    if tensor is None or tensor.size(2) == 1:
+        return tensor
+    if tensor.size(2) % context.size:
+        raise ValueError(
+            f"parameter-sink heads {tensor.size(2)} are not divisible by "
+            f"CP size {context.size}")
+    count = tensor.size(2) // context.size
+    start = context.rank * count
+    return tensor[:, :, start:start + count].contiguous()
+
+
+@dataclass
+class _DSATensorContext:
+    query: Tensor
+    key: Tensor
+    q_pe: Tensor
+    k_pe: Tensor
+
+
+_dsa_tensor_context = contextvars.ContextVar(
+    "hyper_dsa_tensor_context", default=None)
+
+
+def _mome_cp_halo_exchange(attention_module, context):
+    """Configure cross-rank halo exchange for MoME convolution."""
+    original = getattr(attention_module, "_apply_mome")
+    if getattr(original, _ULYSSES_WRAPPED_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def apply_mome_with_halo(hidden_states, mome_mask, conv, use_fused):
+        halo = conv.kernel_size[0] - 1
+        if halo == 0:
+            return original(hidden_states, mome_mask, conv, use_fused)
+        if hidden_states.size(1) < halo:
+            raise ValueError(
+                f"local sequence {hidden_states.size(1)} is shorter than "
+                f"MOME halo {halo}")
+        tails = differentiable_all_gather(
+            hidden_states[:, -halo:].contiguous(), group=context.group)
+        mask_tail = mome_mask[:, -halo:].to(
+            hidden_states.dtype).contiguous()
+        masks = differentiable_all_gather(mask_tail, group=context.group)
+        if context.rank == 0:
+            left_states = tails[-1] * 0
+            left_mask = torch.zeros_like(mask_tail, dtype=torch.bool)
+        else:
+            left_states = tails[context.rank - 1]
+            left_mask = masks[context.rank - 1].bool()
+        output = original(
+            torch.cat((left_states, hidden_states), dim=1),
+            torch.cat((left_mask, mome_mask.bool()), dim=1), conv, use_fused)
+        return output[:, halo:].contiguous()
+
+    setattr(apply_mome_with_halo, _ULYSSES_WRAPPED_FLAG, True)
+    setattr(attention_module, "_apply_mome", apply_mome_with_halo)
+
+
+def _mla_cp_alltoall(attention_functions, context):
+    """Configure CP all-to-all around the MLA backend."""
+    original = attention_functions["npu_fa_rescale"]
+    if getattr(original, _ULYSSES_WRAPPED_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def mla_with_sequence_head_exchange(
+            module, query, key, value, attention_mask, **kwargs):
+        if module.attention_type != "mla":
+            return original(
+                module, query, key, value, attention_mask, **kwargs)
+        if not module.apply_FA_rescale or module.use_fused_sink_fa:
+            raise ValueError(
+                "MLA CP supports only non-fused npu_fa_rescale")
+        local_shape = tuple(query.shape)
+        query = _sequence_to_head(query, context)
+        key = _sequence_to_head(key, context)
+        value = _sequence_to_head(value, context)
+        length = query.size(1)
+        call_kwargs = kwargs.copy()
+        call_kwargs.update(
+            seq_length=length,
+            n_head=query.size(2),
+            actual_q_len=_global_seq_len(
+                kwargs.get("actual_q_len"), length, query.device),
+            actual_kv_len=_global_seq_len(
+                kwargs.get("actual_kv_len"), length, query.device),
+            param_sink_key=_slice_sink(
+                kwargs.get("param_sink_key"), context),
+            param_sink_value=_slice_sink(
+                kwargs.get("param_sink_value"), context),
+        )
+        output = _head_to_sequence(
+            original(
+                module, query, key, value, attention_mask, **call_kwargs),
+            context)
+        if output.shape[:3] != torch.Size(local_shape[:3]):
+            raise RuntimeError(
+                f"MLA CP output {tuple(output.shape)} does not restore "
+                f"{local_shape}")
+        return output
+
+    setattr(mla_with_sequence_head_exchange, _ULYSSES_WRAPPED_FLAG, True)
+    attention_functions["npu_fa_rescale"] = mla_with_sequence_head_exchange
+
+
+def _dsa_cp_alltoall(attention_module, attention_functions, context):
+    """Configure CP all-to-all for the DSA indexer, attention, and KL loss."""
+    original_indexer = attention_module.dsa_lightning_indexer_forward
+    original_sparse = attention_functions["dsa_sparse_attention"]
+    original_kl = attention_module.SparseLightningIndexerKLLossTrainFunction
+
+    if not getattr(original_indexer, _ULYSSES_WRAPPED_FLAG, False):
+        @functools.wraps(original_indexer)
+        def index_with_gathered_sequence(
+                module, index_query, index_key, merge_weight,
+                actual_q_len, actual_kv_len):
+            index_query = _sequence_to_head(index_query, context)
+            merge_weight = _sequence_to_head(
+                merge_weight.unsqueeze(-1), context).squeeze(-1)
+            index_key = _gather_sequence(index_key, context)
+            length = index_query.size(1)
+            return original_indexer(
+                module, index_query, index_key, merge_weight,
+                _global_seq_len(
+                    actual_q_len, length, index_query.device),
+                _global_seq_len(
+                    actual_kv_len, length, index_query.device))
+
+        setattr(index_with_gathered_sequence, _ULYSSES_WRAPPED_FLAG, True)
+        attention_module.dsa_lightning_indexer_forward = (
+            index_with_gathered_sequence)
+
+    if not getattr(original_sparse, _ULYSSES_WRAPPED_FLAG, False):
+        @functools.wraps(original_sparse)
+        def sparse_attention_with_gathered_kv(
+                module, query, key, value, attention_mask, **kwargs):
+            del attention_mask
+            local_shape = tuple(query.shape)
+            query = _sequence_to_head(query, context)
+            q_pe = _sequence_to_head(kwargs["q_pe"], context)
+            key = _gather_sequence(key, context)
+            value = _gather_sequence(value, context)
+            k_pe = _gather_sequence(kwargs["k_pe"], context)
+            length = query.size(1)
+            call_kwargs = kwargs.copy()
+            call_kwargs.update(
+                q_pe=q_pe, k_pe=k_pe, seq_length=length,
+                n_head=query.size(2),
+                actual_q_len=_global_seq_len(
+                    kwargs.get("actual_q_len"), length, query.device),
+                actual_kv_len=_global_seq_len(
+                    kwargs.get("actual_kv_len"), length, query.device),
+            )
+            old_heads = module.num_heads
+            module.num_heads = query.size(2)
+            try:
+                output, softmax_max, softmax_sum = original_sparse(
+                    module, query, key, value, None, **call_kwargs)
+            finally:
+                module.num_heads = old_heads
+            if module.training and not module.freeze_dsa:
+                _dsa_tensor_context.set(_DSATensorContext(
+                    query=query, key=key, q_pe=q_pe, k_pe=k_pe))
+            output = _head_to_sequence(output, context)
+            if output.shape[:3] != torch.Size(local_shape[:3]):
+                raise RuntimeError(
+                    f"DSA CP output {tuple(output.shape)} does not restore "
+                    f"{local_shape}")
+            return output, softmax_max, softmax_sum
+
+        setattr(sparse_attention_with_gathered_kv, _ULYSSES_WRAPPED_FLAG, True)
+        attention_functions["dsa_sparse_attention"] = (
+            sparse_attention_with_gathered_kv)
+
+    if not getattr(original_kl, _ULYSSES_WRAPPED_FLAG, False):
+        class CPDSAKLLoss:
+            """Proxy the DSA KL loss with CP-transformed attention inputs."""
+
+            @staticmethod
+            def apply(index_query, index_key, merge_weight, query, key,
+                      topk_indices, softmax_max, softmax_sum, query_rope,
+                      key_rope, actual_seq_qlen, actual_seq_klen, scale,
+                      loss_coeff):
+                """Apply the original KL loss with saved global sequence tensors."""
+                saved = _dsa_tensor_context.get()
+                if saved is None:
+                    return original_kl.apply(
+                        index_query, index_key, merge_weight, query, key,
+                        topk_indices, softmax_max, softmax_sum, query_rope,
+                        key_rope, actual_seq_qlen, actual_seq_klen, scale,
+                        loss_coeff)
+                _dsa_tensor_context.set(None)
+                query_tnd, key_tnd, q_pe_tnd, k_pe_tnd = [
+                    tensor.flatten(0, 1) for tensor in
+                    (saved.query, saved.key, saved.q_pe, saved.k_pe)]
+                length = saved.query.size(1)
+                return original_kl.apply(
+                    index_query, index_key, merge_weight, query_tnd, key_tnd,
+                    topk_indices, softmax_max, softmax_sum, q_pe_tnd,
+                    k_pe_tnd,
+                    _global_seq_len(
+                        actual_seq_qlen, length, saved.query.device),
+                    _global_seq_len(
+                        actual_seq_klen, length, saved.query.device),
+                    scale, loss_coeff)
+
+        setattr(CPDSAKLLoss, _ULYSSES_WRAPPED_FLAG, True)
+        attention_module.SparseLightningIndexerKLLossTrainFunction = (
+            CPDSAKLLoss)
 
 
 class _AllGatherAlongDim(torch.autograd.Function):
@@ -106,7 +412,7 @@ def shard_batch_for_cp(batch: dict, cp_mesh) -> dict:
     hi = lo + chunk
     slc = slice(lo, hi)
 
-    _PAD_VALUE = {"labels": -100, "input_ids": 0, "attention_mask": 0}
+    pad_values = {"labels": -100, "input_ids": 0, "attention_mask": 0}
     padded = dict(batch)
     if pad_len > 0:
         for k, v in batch.items():
@@ -124,7 +430,7 @@ def shard_batch_for_cp(batch: dict, cp_mesh) -> dict:
             else:
                 shape = list(v.shape)
                 shape[-1] = pad_len
-                pad_block = torch.full(shape, _PAD_VALUE.get(k, 0),
+                pad_block = torch.full(shape, pad_values.get(k, 0),
                                        dtype=v.dtype, device=v.device)
             padded[k] = torch.cat([v, pad_block], dim=-1)
 
@@ -160,21 +466,21 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
     The output is shifted to the local coordinate system; when
     max_local_packs=0 it is set to 1 to avoid an empty tensor.
     """
-    B, _K = seq_lens.shape
+    batch_size = seq_lens.shape[0]
     lo = cp_rank * chunk
     hi = lo + chunk
     device = seq_lens.device
-    SENTINEL = -1000
+    sentinel = -1000
 
     local_lens_b, local_lens_padded_b = [], []
     max_local_packs = 0
-    for b in range(B):
+    for b in range(batch_size):
         row_lens = seq_lens[b].tolist()
         row_padded = seq_lens_padded[b].tolist()
         local_lens, local_padded = [], []
         offset = 0
         for raw_len, raw_pad in zip(row_lens, row_padded):
-            if raw_len == SENTINEL:
+            if raw_len == sentinel:
                 break
             pack_start = offset
             pack_end = offset + raw_pad
@@ -197,11 +503,11 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
     if max_local_packs == 0:
         max_local_packs = 1
 
-    out_lens = torch.full((B, max_local_packs), SENTINEL,
+    out_lens = torch.full((batch_size, max_local_packs), sentinel,
                           dtype=seq_lens.dtype, device=device)
-    out_padded = torch.full((B, max_local_packs), SENTINEL,
+    out_padded = torch.full((batch_size, max_local_packs), sentinel,
                             dtype=seq_lens_padded.dtype, device=device)
-    for b in range(B):
+    for b in range(batch_size):
         n = len(local_lens_b[b])
         if n > 0:
             out_lens[b, :n] = torch.tensor(
