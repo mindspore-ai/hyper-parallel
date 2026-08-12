@@ -8,7 +8,9 @@
 #
 # 要点：planner 自动识别 HF 原生 MoE 并切 expert 参数（{ep: shard(0)}），
 # 但 EP compute（token all-to-all + 专家计算 + 结果回收）必须显式注入 —
-# 仓内参考实现 hf_native_ep_compute_fn 覆盖 HF 路由（softmax+topk）；
+# 仓内内置 archetype 工厂覆盖典型 MoE 行为（完整语义：router /
+# shared expert / gate / merge 全部内聚，按 ep_compute.py 模块 docstring 的
+# archetype 表选择；选错会在 apply 期接口断言报错并列出模块实际子模块名）；
 # 其内部含 all-to-all 通信 → region_dispatch: false。
 
 accelerator:
@@ -23,6 +25,8 @@ plan_overrides:
     when: ep
     region_dispatch: false   # EP compute 内含 all-to-all，不可 dispatch
     local_compute_fn:
-      _target_: hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
-      # 路由写在工厂体内（本参考实现内嵌 softmax top-k adapter）；自定义路由
-      # 的 MoE 写自己的工厂函数（体内引用 MOE_ROUTER_ADAPTERS 条目），在此指向它。
+      _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
+      # Qwen3-MoE 对应 qwen3moe archetype（TopKRouter 路由内嵌）；其他模型按
+      # ep_compute.py 的 archetype 表选择（Mixtral → routed_only，Qwen2-MoE →
+      # qwen2moe，DeepSeek-V3/GLM-4-MoE → deepseekv3）；自定义路由的 MoE 写自己的
+      # 工厂函数（体内引用 MOE_ROUTER_ADAPTERS 条目），在此指向它。

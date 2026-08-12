@@ -220,8 +220,8 @@ class PrecompiledBoundary:
 
         as_dtensor_input=True → inputs are already DTensors (validate mode).
         """
-        is_tuple = isinstance(outputs, (tuple, list))
-        outputs_list = list(outputs) if is_tuple else [outputs]
+        is_sequence = isinstance(outputs, (tuple, list))
+        outputs_list = list(outputs) if is_sequence else [outputs]
         for op in self.out_plan:
             idx = op.arg_index if op.arg_index is not None else 0
             if idx >= len(outputs_list):
@@ -237,4 +237,8 @@ class PrecompiledBoundary:
             # as_dtensor_input=True (validate) → keep DTensors for out_dst
             # validation; otherwise return local (production / final boundary exit).
             outputs_list[idx] = op.execute(tensor, as_dtensor=as_dtensor_input)
-        return tuple(outputs_list) if is_tuple else outputs_list[0]
+        if isinstance(outputs, tuple):
+            return tuple(outputs_list)
+        if isinstance(outputs, list):
+            return outputs_list
+        return outputs_list[0]

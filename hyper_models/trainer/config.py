@@ -232,11 +232,15 @@ class PlanOverride:
             module's forward at apply time).
             This is also the **performance-replacement** channel: point it at
             any factory returning a faster compute fn (see
-            examples/distributed/perf_replacement.py). Shipped reference:
-            ``hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn``
-            (routing is embedded in the factory body — the default softmax
-            top-k adapter; a MoE with different routing writes its own
-            factory, referencing ``MOE_ROUTER_ADAPTERS`` entries by name).
+            examples/distributed/perf_replacement.py). Shipped EP archetype
+            factories (complete semantics, explicitly chosen — see the
+            archetype table in ep_compute.py):
+            ``hyper_models.components.distributed.ep_compute.qwen2moe_ep_compute_fn``
+            / ``qwen3moe_ep_compute_fn`` / ``mixtral_ep_compute_fn`` /
+            ``routed_only_ep_compute_fn`` / ``deepseekv3_ep_compute_fn``. A
+            MoE whose behavior matches no archetype writes its own factory,
+            referencing ``MOE_ROUTER_ADAPTERS`` entries by name (reference:
+            examples/distributed/ep_factories.py).
         inner_target: attribute name of the inner submodule whose forward is
             wrapped (``"self"`` = the boundary module itself; default:
             auto-location).
@@ -271,6 +275,10 @@ class PlanOverride:
             ``"auto"`` / ``"none"``. Merge mode (match hits a derived
             boundary): usually omitted — empty inherits the derived contract;
             insert mode (misses every boundary): all must be fully declared.
+        tp_divide_attrs: optional module-instance integer attributes divided
+            exactly by the active TP size when the module forward runs on
+            local tensors. Omit for no user adjustment; an explicit empty
+            list clears an inherited glob declaration.
     """
 
     match: Union[str, List[str]]
@@ -288,6 +296,7 @@ class PlanOverride:
     in_dst: Optional[Any] = None
     out_src: Optional[Any] = None
     out_dst: Optional[Any] = None
+    tp_divide_attrs: Optional[List[str]] = None
 
     # 契约字段（字符串哨兵在 planner merge 时解析；insert 模式拒绝）
     _CONTRACT_FIELDS = ("params", "in_src", "in_dst", "out_src", "out_dst")
@@ -318,6 +327,7 @@ class PlanOverride:
             inner_wrapper=self.inner_wrapper,
             inner_out_src=self._parse_inner_out_src(),
             region_dispatch=self.region_dispatch,
+            tp_divide_attrs=self._validate_tp_divide_attrs(),
         )
         for attr in self._CONTRACT_FIELDS:
             raw = getattr(self, attr)
@@ -325,6 +335,28 @@ class PlanOverride:
                 continue
             setattr(spec, attr, self._parse_contract_field(attr, raw))
         return self.match, spec
+
+    def _validate_tp_divide_attrs(self) -> Optional[List[str]]:
+        """Validate the YAML transport shape for TP-local attributes."""
+        attrs = self.tp_divide_attrs
+        if attrs is None:
+            return None
+        if not isinstance(attrs, list):
+            raise ValueError(
+                f"plan_overrides match={self.match!r} 的 tp_divide_attrs "
+                f"必须是属性名列表，got {type(attrs).__name__}")
+        seen = set()
+        for attr in attrs:
+            if not isinstance(attr, str) or not attr or not attr.isidentifier():
+                raise ValueError(
+                    f"plan_overrides match={self.match!r} 的 "
+                    f"tp_divide_attrs 只能包含合法属性名，got {attr!r}")
+            if attr in seen:
+                raise ValueError(
+                    f"plan_overrides match={self.match!r} 的 "
+                    f"tp_divide_attrs 包含重复属性 {attr!r}")
+            seen.add(attr)
+        return list(attrs)
 
     def _parse_inner_out_src(self):
         """inner_out_src 的 YAML 形态脱糖：哨兵 / 单输出 DSL / 多输出 DSL。"""
@@ -538,7 +570,7 @@ def entries_to_plan_overrides(
             prev = overrides[match]
             for name in ("local_compute_fn", "inner_target", "inner_wrapper",
                          "inner_out_src", "params", "in_src", "in_dst",
-                         "out_src", "out_dst"):
+                         "out_src", "out_dst", "tp_divide_attrs"):
                 value = getattr(spec, name)
                 if value is not None:
                     setattr(prev, name, value)

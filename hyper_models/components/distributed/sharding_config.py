@@ -64,6 +64,14 @@ DP = MeshAxisName.DP
 NamedPlacement = Dict[MeshAxisName, Placement]
 
 
+@dataclass(frozen=True)
+class TpLocalAttrPlan:
+    """Planner-generated TP-local module attribute adjustment plan."""
+
+    auto_divide: Tuple[str, ...] = ()
+    user_divide: Tuple[str, ...] = ()
+
+
 class PlacementMismatchError(ValueError):
     """DTensor propagation result is inconsistent with the ModuleShardingSpec declaration (05 §5.3)."""
 
@@ -128,6 +136,31 @@ class ModuleShardingSpec:
     # (RedistOp.arg_index). Defaults to the key order of out_src.
     out_names: Optional[List[str]] = None
 
+    # TP-local module-instance attributes explicitly declared by the user.
+    # None means "not declared" during override merge; [] explicitly clears
+    # an inherited glob declaration. The planner normalizes this field into
+    # _tp_local_attr_plan after all overrides have been merged.
+    tp_divide_attrs: Optional[List[str]] = None
+
+    # Internal planner output. init=False keeps it out of both the public
+    # programmatic constructor and the YAML transport interface.
+    _tp_local_attr_plan: Optional[TpLocalAttrPlan] = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+
+    # D-22 (rowwise bias defer): planner-computed tuple of bias param paths
+    # (relative to the boundary module, e.g. ("o_proj.bias",)) whose addition
+    # is deferred until AFTER the boundary exit TP reduction (Megatron
+    # RowParallelLinear semantics: the bias never enters F.linear inside the
+    # region, so the Partial reduce counts it exactly once). Internal — built
+    # by ShardingPlanner._finalize_deferred_biases after all overrides are
+    # merged (detection is anchored on the FINAL spec declarations, so
+    # derived / merge / insert / derive=False specs share one code path);
+    # user spec objects never carry this field.
+    _deferred_bias_params: Tuple[str, ...] = field(
+        default=(), init=False, repr=False, compare=False,
+    )
+
     # ── Boundary flag ──
     is_boundary: bool = True
 
@@ -152,8 +185,8 @@ class ModuleShardingSpec:
     # │   chain** (not a stored bool) by _resolve_local_compute_fn:      │
     # │     chain link 1  local_compute_fn (user-defined computation:    │
     # │                   callable, or a factory Target built at apply   │
-    # │                   time — e.g. the shipped reference              │
-    # │                   ep_compute.hf_native_ep_compute_fn)            │
+    # │                   time — e.g. a shipped EP archetype factory       │
+    # │                   (ep_compute.qwen2moe_ep_compute_fn))             │
     # │     chain link 2  region_dispatch=False (the module's own        │
     # │                   forward can't dispatch — it IS the compute)    │
     # │     none present → None (skeleton not used)                      │
@@ -322,8 +355,8 @@ class ModuleShardingSpec:
     # D-09 (05 §6.4.7): EP pass-through for HF-native MoE. A non-empty _ep_stack
     # means per-expert parameters must be pre-stacked into [E, ...] in Phase A.
     # Since the explicit-injection rework the compute side is NOT auto-injected:
-    # declare local_compute_fn explicitly (e.g. Target →
-    # ep_compute.hf_native_ep_compute_fn).
+    # declare local_compute_fn explicitly (e.g. Target → an EP archetype
+    # factory such as ep_compute.qwen2moe_ep_compute_fn).
     _ep_stack: Dict[str, List[str]] = field(default_factory=dict)
     # D-10 (05 §6.4.8): TP-extend-EP parameter-sharding marker. When >0 this is
     # the extended EP group size (= ep_size; the a2a communication domain
@@ -423,6 +456,21 @@ class ShardingPlan:
                     lines.append(f"    {pname}: {fmt_named(named)}")
             else:
                 lines.append("  参数切分: 无（{} = 本边界不切参数，仅 I/O 缝合）")
+            attr_plan = spec._tp_local_attr_plan
+            if attr_plan is not None and (
+                    attr_plan.auto_divide or attr_plan.user_divide):
+                lines.append("  TP-local 属性整除:")
+                if attr_plan.auto_divide:
+                    lines.append(
+                        "    auto(D-17): " + ", ".join(attr_plan.auto_divide))
+                if attr_plan.user_divide:
+                    lines.append(
+                        "    user(plan_overrides): "
+                        + ", ".join(attr_plan.user_divide))
+            if spec._deferred_bias_params:  # pylint: disable=protected-access
+                lines.append(
+                    "  后置 bias（D-22，区域内不带 bias，TP 归约后恰好加一次）: "
+                    + ", ".join(spec._deferred_bias_params))  # pylint: disable=protected-access
             # ── 边界通信计划（编译结果，mesh=None 仅取 RedistOp 描述） ──
             boundary = PrecompiledBoundary(spec, None, self.mesh_dim_names)
             if boundary.in_plan:

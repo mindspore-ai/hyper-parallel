@@ -473,3 +473,15 @@ INNER_WRAPPER_REGISTRY = {
     "flex_hf": flex_hf_cp_wrapper,
     "mla_dsa_ulysses": mla_dsa_ulysses_cp_wrapper,
 }
+
+# Static requirements for shipped wrappers. Custom registry entries own their
+# semantics; built-ins are known to contain CP collectives and therefore must
+# run as black-box local regions during placement validation.
+INNER_WRAPPER_REQUIREMENTS = {
+    name: {
+        "requires_cp": True,
+        "region_dispatch": False,
+        "forward_style": "hf_hidden_states" if name.endswith("_hf") else "qkv",
+    }
+    for name in INNER_WRAPPER_REGISTRY
+}

@@ -45,6 +45,8 @@ import torch.nn.functional as F
 from transformers import (
     LlamaConfig,
     LlamaForCausalLM,
+    Qwen2MoeConfig,
+    Qwen2MoeForCausalLM,
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
 )
@@ -83,6 +85,7 @@ _VOCAB_SIZE = 128
 _HIDDEN_SIZE = 64
 _INTERMEDIATE_SIZE = 128
 _NUM_LAYERS = 20
+_QWEN2_NUM_LAYERS = 2
 _NUM_HEADS = 4
 _NUM_KEY_VALUE_HEADS = 4
 _NUM_EXPERTS = 4
@@ -96,8 +99,30 @@ def _parse_config(config_name: str) -> TrainerConfig:
     return parse_training_args([str(_TEST_YAML_DIRECTORY / config_name)])
 
 
-def _build_model_config(use_moe: bool = False) -> LlamaConfig | Qwen3MoeConfig:
+def _build_model_config(
+    use_moe: bool = False,
+    use_qwen2_moe: bool = False,
+) -> LlamaConfig | Qwen2MoeConfig | Qwen3MoeConfig:
     """Return the small HF dense or MoE configuration used by both copies."""
+    if use_qwen2_moe:
+        return Qwen2MoeConfig(
+            vocab_size=_VOCAB_SIZE,
+            hidden_size=_HIDDEN_SIZE,
+            intermediate_size=_INTERMEDIATE_SIZE,
+            moe_intermediate_size=_INTERMEDIATE_SIZE,
+            shared_expert_intermediate_size=_INTERMEDIATE_SIZE,
+            num_hidden_layers=_QWEN2_NUM_LAYERS,
+            num_attention_heads=_NUM_HEADS,
+            num_key_value_heads=2,
+            num_experts=_NUM_EXPERTS,
+            num_experts_per_tok=_NUM_EXPERTS_PER_TOKEN,
+            num_experts_shared=1,
+            max_position_embeddings=_SEQUENCE_LENGTH,
+            qkv_bias=True,
+            attention_dropout=0.0,
+            tie_word_embeddings=False,
+            use_cache=False,
+        )
     if use_moe:
         return Qwen3MoeConfig(
             vocab_size=_VOCAB_SIZE,
@@ -132,24 +157,52 @@ def _build_model_config(use_moe: bool = False) -> LlamaConfig | Qwen3MoeConfig:
 def _build_standalone_model(
     device: torch.device,
     use_moe: bool = False,
-) -> LlamaForCausalLM | Qwen3MoeForCausalLM:
+    use_qwen2_moe: bool = False,
+) -> LlamaForCausalLM | Qwen2MoeForCausalLM | Qwen3MoeForCausalLM:
     """Build the unsharded reference model from the fixed initialization seed."""
     torch.manual_seed(_INIT_SEED)
-    model_config = _build_model_config(use_moe)
-    model_class = Qwen3MoeForCausalLM if use_moe else LlamaForCausalLM
-    return model_class(model_config).to(device=device).train()
+    model_config = _build_model_config(use_moe, use_qwen2_moe)
+    if use_qwen2_moe:
+        model_class = Qwen2MoeForCausalLM
+    else:
+        model_class = Qwen3MoeForCausalLM if use_moe else LlamaForCausalLM
+    model = model_class(model_config)
+    if use_qwen2_moe:
+        _install_qwen2_rowwise_bias(model)
+    return model.to(device=device).train()
+
+
+def _install_qwen2_rowwise_bias(model: torch.nn.Module) -> None:
+    """Add deterministic nonzero RowWise attention biases before sharding."""
+    for layer_index, layer in enumerate(model.model.layers):
+        projection = layer.self_attn.o_proj
+        values = torch.linspace(
+            -0.1,
+            0.1,
+            projection.out_features,
+            device=projection.weight.device,
+            dtype=projection.weight.dtype,
+        ) + layer_index * 1.0e-3
+        projection.bias = torch.nn.Parameter(values)
 
 
 def _build_dual_mode_model(
     distributed_setup: DistributedSetup,
     device: torch.device,
     use_moe: bool = False,
+    use_qwen2_moe: bool = False,
 ) -> tuple[torch.nn.Module, dict[str, tuple[Placement, DeviceMesh]]]:
     """Build and wrap the model through the dual-mode TP/FSDP infrastructure."""
     torch.manual_seed(_INIT_SEED)
-    model_config = _build_model_config(use_moe)
-    model_class = Qwen3MoeForCausalLM if use_moe else LlamaForCausalLM
-    model = model_class(model_config).to(device=device).train()
+    model_config = _build_model_config(use_moe, use_qwen2_moe)
+    if use_qwen2_moe:
+        model_class = Qwen2MoeForCausalLM
+    else:
+        model_class = Qwen3MoeForCausalLM if use_moe else LlamaForCausalLM
+    model = model_class(model_config)
+    if use_qwen2_moe:
+        _install_qwen2_rowwise_bias(model)
+    model = model.to(device=device).train()
 
     mesh_context = distributed_setup.mesh_context
     sharding_planner, fsdp_manager, _ = instantiate_infrastructure(
@@ -183,7 +236,9 @@ def _build_dual_mode_model(
         replicate_parameter,
         forward_prefetch_depth=fsdp_manager.config.forward_prefetch_depth,
         backward_prefetch_depth=fsdp_manager.config.backward_prefetch_depth,
-        expected_nested_unit_count=_NUM_LAYERS * (2 if use_moe else 1),
+        expected_nested_unit_count=(
+            _QWEN2_NUM_LAYERS if use_qwen2_moe else _NUM_LAYERS
+        ) * (2 if use_moe or use_qwen2_moe else 1),
     )
     return model, tp_grad_info_by_fqn
 
@@ -342,6 +397,158 @@ def _get_local_parameter(parameter: torch.nn.Parameter) -> torch.Tensor:
     return parameter_data.detach().cpu()
 
 
+def _get_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return one contiguous local shard while preserving its collective device."""
+    if isinstance(tensor, DTensor):
+        tensor = tensor.to_local()
+    return tensor.detach().contiguous()
+
+
+def _all_gather_cat(
+    local_tensor: torch.Tensor,
+    mesh: DeviceMesh,
+    dimension: int,
+) -> torch.Tensor:
+    """Gather equal-sized shards on one mesh axis and concatenate by mesh rank."""
+    mesh_size = mesh.mesh_shape[0]
+    if mesh_size == 1:
+        return local_tensor
+    gathered = [torch.empty_like(local_tensor) for _ in range(mesh_size)]
+    dist.all_gather(gathered, local_tensor, group=mesh.get_group())
+    normalized_dimension = dimension if dimension >= 0 else local_tensor.ndim + dimension
+    return torch.cat(gathered, dim=normalized_dimension)
+
+
+def _all_gather_shards(
+    local_tensor: torch.Tensor,
+    mesh: DeviceMesh,
+    dimension: int,
+    global_dimension_size: int,
+) -> torch.Tensor:
+    """Gather potentially empty or uneven shards and trim collective padding."""
+    mesh_size = mesh.mesh_shape[0]
+    if mesh_size == 1:
+        return local_tensor
+    normalized_dimension = dimension if dimension >= 0 else local_tensor.ndim + dimension
+    padded_size = (global_dimension_size + mesh_size - 1) // mesh_size
+    padded_shape = list(local_tensor.shape)
+    padded_shape[normalized_dimension] = padded_size
+    padded_tensor = local_tensor.new_zeros(padded_shape)
+    if local_tensor.numel() > 0:
+        padded_tensor.narrow(
+            normalized_dimension,
+            0,
+            local_tensor.shape[normalized_dimension],
+        ).copy_(local_tensor)
+    gathered_tensor = _all_gather_cat(padded_tensor, mesh, normalized_dimension)
+    return gathered_tensor.narrow(normalized_dimension, 0, global_dimension_size)
+
+
+def _reconstruct_global_tensor(
+    local_tensor: torch.Tensor,
+    expected_shape: torch.Size,
+    parameter_name: str,
+    tp_grad_info_by_fqn: dict[str, tuple[Placement, DeviceMesh]],
+    mesh_context: MeshContext,
+    replicate_parameter_name: str,
+) -> torch.Tensor:
+    """Invert FSDP and then TP/EP placement to recover a canonical Tensor."""
+    fsdp_non_moe_mesh = mesh_context.fsdp_non_moe_mesh
+    if fsdp_non_moe_mesh is None:
+        raise RuntimeError("global reconstruction requires a dense FSDP mesh")
+    placement, source_mesh = tp_grad_info_by_fqn.get(
+        parameter_name,
+        (Replicate(), fsdp_non_moe_mesh["tp"]),
+    )
+    global_tensor = _get_local_tensor(local_tensor)
+    post_fsdp_shape = list(expected_shape)
+    if isinstance(placement, Shard):
+        source_mesh_size = source_mesh.mesh_shape[0]
+        post_fsdp_shape[placement.dim] = (
+            post_fsdp_shape[placement.dim] + source_mesh_size - 1
+        ) // source_mesh_size
+    if parameter_name != replicate_parameter_name:
+        fsdp_shard_mesh = fsdp_non_moe_mesh["fsdp_shard"]
+        if mesh_context.fsdp_moe_mesh is not None and ".experts." in parameter_name:
+            fsdp_shard_mesh = mesh_context.fsdp_moe_mesh["edp_shard"]
+        global_tensor = _all_gather_shards(
+            global_tensor,
+            fsdp_shard_mesh,
+            0,
+            post_fsdp_shape[0],
+        )
+    if isinstance(placement, Shard):
+        global_tensor = _all_gather_shards(
+            global_tensor,
+            source_mesh,
+            placement.dim,
+            expected_shape[placement.dim],
+        )
+    elif not isinstance(placement, Replicate):
+        raise ValueError(
+            f"unsupported source placement {placement!r} for global parameter "
+            f"{parameter_name}"
+        )
+    return global_tensor
+
+
+def _compare_global_parameter_view(
+    stage: str,
+    standalone_model: torch.nn.Module,
+    distributed_model: torch.nn.Module,
+    tp_grad_info_by_fqn: dict[str, tuple[Placement, DeviceMesh]],
+    mesh_context: MeshContext,
+    replicate_parameter_name: str,
+    *,
+    gradients: bool,
+) -> float:
+    """Reconstruct and compare every distributed parameter or gradient."""
+    reference_parameters = dict(standalone_model.named_parameters())
+    distributed_parameters = dict(distributed_model.named_parameters())
+    maximum_error = 0.0
+    for parameter_name, reference_parameter in reference_parameters.items():
+        reference_tensor = reference_parameter.grad if gradients else reference_parameter
+        distributed_parameter = distributed_parameters[parameter_name]
+        distributed_tensor = distributed_parameter.grad if gradients else distributed_parameter
+        if reference_tensor is None or distributed_tensor is None:
+            raise AssertionError(
+                f"{stage}, parameter {parameter_name}: missing "
+                f"{'gradient' if gradients else 'value'}"
+            )
+        actual_global = _reconstruct_global_tensor(
+            distributed_tensor,
+            reference_tensor.shape,
+            parameter_name,
+            tp_grad_info_by_fqn,
+            mesh_context,
+            replicate_parameter_name,
+        )
+        expected_global = reference_tensor.detach()
+        if actual_global.shape != expected_global.shape:
+            raise AssertionError(
+                f"{stage}, parameter {parameter_name}: reconstructed global shape "
+                f"{tuple(actual_global.shape)} != reference shape {tuple(expected_global.shape)}"
+            )
+        try:
+            torch.testing.assert_close(
+                actual_global,
+                expected_global,
+                rtol=_RTOL if gradients else 1.0e-5,
+                atol=_ATOL if gradients else 1.0e-6,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                f"{stage}, parameter {parameter_name} global-view mismatch; "
+                f"actual norm={float(actual_global.norm()):.8f}, "
+                f"reference norm={float(expected_global.norm()):.8f}\n{error}"
+            ) from error
+        maximum_error = max(
+            maximum_error,
+            float(torch.max(torch.abs(actual_global - expected_global))),
+        )
+    return maximum_error
+
+
 def _write_step_log(
     log_file: TextIO,
     step_index: int,
@@ -377,8 +584,47 @@ def _compare_step(
     distributed_optimizer: torch.optim.Optimizer,
     standalone_log: TextIO | None,
     distributed_log: TextIO | None,
+    global_view_only: bool = False,
 ) -> tuple[float, float, float, float]:
     """Run one reference/distributed step and compare loss plus every gradient."""
+    activation_records: dict[str, dict[str, torch.Tensor]] = {
+        "standalone": {},
+        "distributed": {},
+    }
+    activation_hooks = []
+
+    def _record_activation(
+        path: str,
+        module: torch.nn.Module,
+        records: dict[str, torch.Tensor],
+    ) -> None:
+        def _pre_hook(unused_module, inputs, kwargs):
+            del unused_module
+            hidden_states = inputs[0] if inputs else kwargs["hidden_states"]
+            records[f"{path}.input"] = hidden_states.detach().clone()
+
+        def _forward_hook(unused_module, unused_inputs, unused_kwargs, output):
+            del unused_module, unused_inputs, unused_kwargs
+            main_output = output[0] if isinstance(output, (tuple, list)) else output
+            records[f"{path}.output"] = main_output.detach().clone()
+
+        activation_hooks.append(module.register_forward_pre_hook(_pre_hook, with_kwargs=True))
+        activation_hooks.append(module.register_forward_hook(_forward_hook, with_kwargs=True))
+
+    trace_qwen2 = step_index == 0 and hasattr(
+        standalone_model.model.layers[0].mlp,
+        "shared_expert_gate",
+    )
+    if trace_qwen2:
+        for model_name, model in (
+            ("standalone", standalone_model),
+            ("distributed", distributed_model),
+        ):
+            layer = model.model.layers[0]
+            records = activation_records[model_name]
+            _record_activation("attention", layer.self_attn, records)
+            _record_activation("moe", layer.mlp, records)
+
     standalone_optimizer.zero_grad(set_to_none=True)
     standalone_logits = standalone_model(input_ids=global_tokens).logits
     standalone_full_loss = _cross_entropy_sum(standalone_logits, global_targets)
@@ -397,6 +643,27 @@ def _compare_step(
         input_ids=local_tokens,
         position_ids=local_position_ids,
     ).logits
+    for hook in activation_hooks:
+        hook.remove()
+    if trace_qwen2:
+        for activation_name, full_activation in activation_records["standalone"].items():
+            actual_activation = activation_records["distributed"][activation_name]
+            activation_sequence_start = (
+                local_sequence_start + mesh_context.tp_rank * actual_activation.shape[1]
+            )
+            activation_sequence_end = activation_sequence_start + actual_activation.shape[1]
+            expected_activation = full_activation[
+                local_batch_start:local_batch_end,
+                activation_sequence_start:activation_sequence_end,
+            ]
+            absolute_error = torch.abs(actual_activation - expected_activation)
+            maximum_error = float(torch.max(absolute_error))
+            mean_error = float(torch.mean(absolute_error))
+            if maximum_error > 1.0e-3:
+                raise AssertionError(
+                    f"layer 0 {activation_name} is the first traced activation mismatch: "
+                    f"max_abs={maximum_error:.8e}, mean_abs={mean_error:.8e}"
+                )
     distributed_loss = _cross_entropy_sum(distributed_logits, local_targets)
     distributed_loss.backward(
         torch.tensor(
@@ -414,6 +681,14 @@ def _compare_step(
 
     maximum_gradient_error = 0.0
     for parameter_name, standalone_parameter in standalone_parameters.items():
+        if global_view_only:
+            continue
+        if ".experts." in parameter_name:
+            replica_size = mesh_context.fsdp_moe_mesh["edp_replicate"].mesh_shape[0]
+        else:
+            replica_size = mesh_context.fsdp_non_moe_mesh["fsdp_replicate"].mesh_shape[0]
+        if replica_size > 1:
+            continue
         expected_gradient = _expected_local_gradient(
             standalone_parameter.grad.detach().cpu(),
             parameter_name,
@@ -441,6 +716,18 @@ def _compare_step(
             maximum_gradient_error,
             float(torch.max(torch.abs(actual_gradient - expected_gradient))),
         )
+
+    if step_index == 0 or global_view_only:
+        global_gradient_error = _compare_global_parameter_view(
+            f"step {step_index} gradients",
+            standalone_model,
+            distributed_model,
+            tp_grad_info_by_fqn,
+            mesh_context,
+            replicate_parameter_name,
+            gradients=True,
+        )
+        maximum_gradient_error = max(maximum_gradient_error, global_gradient_error)
 
     standalone_loss_value = float(standalone_local_loss.detach().cpu())
     distributed_loss_value = float(distributed_loss.detach().cpu())
@@ -489,7 +776,20 @@ def _compare_step(
         standalone_optimizer.step()
         distributed_optimizer.step()
 
+    if step_index == 0 or global_view_only:
+        _compare_global_parameter_view(
+            f"step {step_index} updated weights",
+            standalone_model,
+            distributed_model,
+            tp_grad_info_by_fqn,
+            mesh_context,
+            replicate_parameter_name,
+            gradients=False,
+        )
+
     for parameter_name, standalone_parameter in standalone_parameters.items():
+        if global_view_only:
+            continue
         expected_parameter = _expected_local_gradient(
             standalone_parameter.detach().cpu(),
             parameter_name,
@@ -512,6 +812,7 @@ def _run_accuracy_case(
     config_name: str,
     case_name: str,
     use_moe: bool = False,
+    use_qwen2_moe: bool = False,
 ) -> None:
     """Compare one eight-card dual-mode FSDP case with standalone training."""
     config = _parse_config(config_name)
@@ -536,11 +837,12 @@ def _run_accuracy_case(
             f"pp_size={mesh_context.pp_size}"
         )
 
-    standalone_model = _build_standalone_model(device, use_moe)
+    standalone_model = _build_standalone_model(device, use_moe, use_qwen2_moe)
     distributed_model, tp_grad_info_by_fqn = _build_dual_mode_model(
         distributed_setup,
         device,
         use_moe,
+        use_qwen2_moe,
     )
     device_mesh = mesh_context.device_mesh
     fsdp_non_moe_mesh = mesh_context.fsdp_non_moe_mesh
@@ -548,13 +850,12 @@ def _run_accuracy_case(
         raise RuntimeError("dual-mode accuracy test requires device and dense FSDP meshes")
 
     tp_size = mesh_context.tp_size
-    if use_moe:
+    if use_moe or use_qwen2_moe:
         if mesh_context.fsdp_moe_mesh is None:
             raise RuntimeError("MoE accuracy test requires an expert FSDP mesh")
-        if mesh_context.fsdp_moe_mesh.mesh_shape != (2, 2, 2):
+        if mesh_context.fsdp_moe_mesh.mesh_shape[-1] != mesh_context.ep_size:
             raise AssertionError(
-                "MoE accuracy test expected expert mesh shape (2, 2, 2), got "
-                f"{mesh_context.fsdp_moe_mesh.mesh_shape}"
+                "MoE expert mesh EP dimension does not match ep_size"
             )
     if _BATCH_SIZE % mesh_context.dp_size != 0:
         raise ValueError(
@@ -573,8 +874,23 @@ def _run_accuracy_case(
     local_sequence_end = local_sequence_start + local_sequence_size
     replicate_parameter_name = "model.norm.weight"
 
-    standalone_optimizer = config.optimizer.build(model=standalone_model).get_optimizer()
-    distributed_optimizer = config.optimizer.build(model=distributed_model).get_optimizer()
+    if use_qwen2_moe:
+        _compare_global_parameter_view(
+            "initial weights",
+            standalone_model,
+            distributed_model,
+            tp_grad_info_by_fqn,
+            mesh_context,
+            replicate_parameter_name,
+            gradients=False,
+        )
+
+    if use_qwen2_moe:
+        standalone_optimizer = torch.optim.SGD(standalone_model.parameters(), lr=1.0e-4)
+        distributed_optimizer = torch.optim.SGD(distributed_model.parameters(), lr=1.0e-4)
+    else:
+        standalone_optimizer = config.optimizer.build(model=standalone_model).get_optimizer()
+        distributed_optimizer = config.optimizer.build(model=distributed_model).get_optimizer()
     standalone_log = None
     distributed_log = None
     if dist.get_rank() == 0:
@@ -625,6 +941,7 @@ def _run_accuracy_case(
             distributed_optimizer,
             standalone_log,
             distributed_log,
+            global_view_only=use_qwen2_moe,
         )
         step_loss_error = abs(standalone_loss - distributed_loss)
         maximum_loss_error = max(maximum_loss_error, step_loss_error)
@@ -676,4 +993,13 @@ def test_hsdp_tp_ep_moe_accuracy() -> None:
         "hsdp_tp_ep_moe_accuracy.yaml",
         "hsdp_tp_ep_moe_accuracy",
         use_moe=True,
+    )
+
+
+def test_qwen2_tp_cp_ep_fsdp_global_accuracy() -> None:
+    """Validate Qwen2-MoE TP×CP×EP×FSDP using reconstructed global views."""
+    _run_accuracy_case(
+        "qwen2_tp_cp_ep_fsdp_global_accuracy.yaml",
+        "qwen2_tp_cp_ep_fsdp_global_accuracy",
+        use_qwen2_moe=True,
     )

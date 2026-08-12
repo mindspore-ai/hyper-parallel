@@ -18,7 +18,7 @@
   恒 identity（R8）；
 - EP=2：HF 原生 MoE（gate + per-expert ModuleList）→ D-09 堆叠 +
   {EP: Shard(0)} 分片由 planner 推导；EP compute（a2a dispatch）显式注入
-  —— local_compute_fn 指向仓内默认工厂 hf_native_ep_compute_fn；
+  —— local_compute_fn 指向仓内默认工厂 routed_only_ep_compute_fn；
 - 序列布局（05 §6.3.1/§6.3.2，教程 §6.6）：{TP: Shard(1), CP: Shard(1)}
   为 cp-major 嵌套切分——序列先按 cp 粗切、块内再按 tp 细切，
   rank (cp_i, tp_j) 持 chunk[cp_i*tp + tp_j]，长度 S/(cp*tp)。
@@ -37,7 +37,7 @@ from hyper_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
-    hf_native_ep_compute_fn,
+    routed_only_ep_compute_fn,
 )
 from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
 from hyper_models.trainer.config import Target
@@ -194,9 +194,9 @@ def main():
                 # EP compute 内含 all-to-all 通信 → 不可 dispatch
                 region_dispatch=False,
                 local_compute_fn=Target(
-                    hf_native_ep_compute_fn,
+                    routed_only_ep_compute_fn,
                     target_path="hyper_models.components.distributed."
-                                "ep_compute.hf_native_ep_compute_fn"),
+                                "ep_compute.routed_only_ep_compute_fn"),
             ),
         })
         plan = planner.plan(

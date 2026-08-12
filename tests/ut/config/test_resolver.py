@@ -391,7 +391,7 @@ class TestPlanOverridesResolution(unittest.TestCase):
                 "when": "ep",
                 "local_compute_fn": {
                     "_target_": "hyper_models.components.distributed."
-                                "ep_compute.hf_native_ep_compute_fn",
+                                "ep_compute.routed_only_ep_compute_fn",
                 },
             },
         ]))
@@ -404,7 +404,7 @@ class TestPlanOverridesResolution(unittest.TestCase):
         self.assertIsInstance(ep_entry.local_compute_fn, Target)
         self.assertTrue(
             ep_entry.local_compute_fn._target_path.endswith(
-                "hf_native_ep_compute_fn"))
+                "routed_only_ep_compute_fn"))
 
     def test_inner_wrapper_target_form(self):
         config = resolve_root(_root(plan_overrides=[

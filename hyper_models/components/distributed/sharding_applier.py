@@ -27,6 +27,7 @@ local-region wrapper (D-01''/D-02/D-03').
 """
 
 import functools
+import importlib.metadata
 import inspect
 import logging
 
@@ -42,6 +43,7 @@ from hyper_parallel.core.dtensor.placement_types import (
 )
 from hyper_models.components.distributed.cp_wrappers import (
     INNER_WRAPPER_REGISTRY,
+    INNER_WRAPPER_REQUIREMENTS,
 )
 from hyper_models.components.distributed.injection import (
     INNER_WRAPPER,
@@ -67,7 +69,13 @@ from hyper_models.components.distributed.sharding_config import (
     _normalize_out_fields,
     resolve_placements,
 )
-from hyper_models.components.distributed.sharding_planner import SPECIAL_HANDLERS
+from hyper_models.components.distributed.sharding_planner import (
+    SPECIAL_HANDLERS,
+    ShardingPlanner,
+)
+from hyper_models.components.distributed.ep_compute import (
+    EP_ARCHETYPE_SUGGESTIONS,
+)
 from hyper_models.components.distributed.tp_grad import build_tp_grad_info
 from hyper_models.components.distributed.head_count import (
     maybe_update_head_counts,
@@ -121,7 +129,7 @@ def _check_target_config_keys(target, kind):
             f"合法形参: {sorted(bindable) or '(无)'}")
 
 
-def _preflight_compute_injection(plan, mesh):
+def _preflight_compute_injection(plan, mesh, model=None):
     """Fail-fast BEFORE any mutation: CP/EP sharding without an explicit
     compute injection is a silent numerical error (no auto-injection since
     the explicit-injection rework).
@@ -132,8 +140,68 @@ def _preflight_compute_injection(plan, mesh):
       destined for ``{EP: Shard(0)}``) needs ``local_compute_fn`` — or an
       explicit ``region_dispatch=False`` when the module's own forward is
       EP-aware (a2a inside forward).
+
+    ``model`` (optional) enables the arch-aware EP archetype suggestion in
+    the error message (accuracy_fix_plan.md §3 E2).
     """
+    transformers_version = importlib.metadata.version("transformers")
     cp_mesh = _get_cp_submesh(mesh, plan.mesh_dim_names)
+    for fqn, spec in plan.modules.items():
+        wrapper = getattr(spec, "inner_wrapper", None)
+        target = getattr(spec, "inner_target", None)
+        region_dispatch = getattr(spec, "region_dispatch", None)
+        if wrapper is None and target is not None:
+            raise ValueError(
+                f"Invalid inner-wrapper plan at boundary {fqn!r} "
+                f"(transformers={transformers_version}): inner_target={target!r} "
+                "locates a module but inner_wrapper is missing. Declare both "
+                "fields or remove inner_target."
+            )
+        if wrapper is not None and target is None:
+            raise ValueError(
+                f"Invalid inner-wrapper plan at boundary {fqn!r} "
+                f"(transformers={transformers_version}): "
+                f"inner_wrapper={wrapper!r}, inner_target=None, "
+                f"region_dispatch={region_dispatch!r}. Declare "
+                "inner_target='self' for the boundary module or an explicit "
+                "child attribute name."
+            )
+        requirements = (
+            INNER_WRAPPER_REQUIREMENTS.get(wrapper)
+            if isinstance(wrapper, str) else None
+        )
+        if requirements is not None:
+            required_dispatch = requirements["region_dispatch"]
+            if region_dispatch is not required_dispatch:
+                raise ValueError(
+                    f"Invalid built-in CP wrapper plan at boundary {fqn!r} "
+                    f"(transformers={transformers_version}): "
+                    f"inner_wrapper={wrapper!r} contains CP communication and "
+                    f"requires region_dispatch={required_dispatch}, got "
+                    f"{region_dispatch!r}. Suggested YAML:\n"
+                    f"  - match: {fqn!r}\n"
+                    "    when: cp\n"
+                    f"    region_dispatch: {str(required_dispatch).lower()}\n"
+                    f"    inner_target: {target!r}\n"
+                    f"    inner_wrapper: {wrapper}"
+                )
+            if requirements["requires_cp"] and (
+                    cp_mesh is None or cp_mesh.size() <= 1):
+                raise ValueError(
+                    f"Invalid built-in CP wrapper plan at boundary {fqn!r}: "
+                    f"inner_wrapper={wrapper!r} requires an active cp mesh, "
+                    "but the plan has no cp axis with size > 1"
+                )
+        if wrapper is not None and target != "self" and getattr(
+                spec, "inner_out_src", None) is None:
+            raise ValueError(
+                f"Invalid inner-wrapper plan at boundary {fqn!r}: wrapper "
+                f"{wrapper!r} targets child {target!r}, but inner_out_src is "
+                "missing. Declare inner_out_src='first_input' for a "
+                "layout-preserving single output, provide explicit output "
+                "placements, or use inner_target='self' to reuse boundary "
+                "out_src."
+            )
     if cp_mesh is not None and cp_mesh.size() > 1:
         for fqn, spec in plan.modules.items():
             if (spec.is_boundary and getattr(spec, "_needs_cp_attn", False)
@@ -157,23 +225,35 @@ def _preflight_compute_injection(plan, mesh):
         if (spec.is_boundary and getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
                 and getattr(spec, "local_compute_fn", None) is None
                 and getattr(spec, "region_dispatch", None) is not False):
+            suggestion = ""
+            if model is not None:
+                arch = ShardingPlanner._get_architecture(model)
+                archetype = EP_ARCHETYPE_SUGGESTIONS.get(arch)
+                if archetype is not None:
+                    suggestion = (
+                        f"检测到模型架构 {arch!r}，对应 archetype 可能是 "
+                        f"{archetype!r}（建议而非自动选择——请确认后显式配置；"
+                        "选错会在 apply 期接口断言报错并列出模块实际子模块名）。\n"
+                    )
             raise ValueError(
                 f"ep_size={spec._ep_size} 已生效（专家参数将按 {{EP: Shard(0)}} "  # pylint: disable=protected-access
                 f"分片），但边界 {fqn!r} 没有 local-region 计算来源 —— 专家计算与 "
                 "all-to-all 无人执行，框架不再自动注入任何实现。请选择其一：\n"
-                "  ① HF 原生 MoE → 注入仓内参考实现：\n"
+                f"{suggestion}"
+                "  ① 按模型行为选择内置 archetype 工厂（完整语义：router / "
+                "shared expert / gate / merge 全部内聚实现；可选 archetype 与"
+                "各自期望的模块接口见 ep_compute.py 模块 docstring）：\n"
                 "     plan_overrides:\n"
                 "       - match: \"*.mlp\"\n"
                 "         when: ep\n"
                 "         region_dispatch: false   # a2a 在区域内，不可 dispatch\n"
                 "         local_compute_fn:\n"
                 "           _target_: hyper_models.components.distributed."
-                "ep_compute.hf_native_ep_compute_fn\n"
-                "  ② 自研 EP-aware MoE（forward 内已含 all-to-all）→ 声明 "
-                "region_dispatch: false\n"
-                "  ③ 自定义 compute → local_compute_fn 指向 "
-                "fn(module, *local_args)（callable 或工厂 Target）+ 显式 "
-                "region_dispatch")
+                "ep_compute.qwen2moe_ep_compute_fn   # 按 archetype 表选择\n"
+                "  ② 非典型 MoE → 参照 examples/distributed/ep_factories.py "
+                "自写工厂（用 require_attrs 获得同样的构建期接口校验）\n"
+                "  ③ 自研 EP-aware MoE（forward 内已含 all-to-all）→ 声明 "
+                "region_dispatch: false")
 
 
 def _require_region_dispatch(spec, *, source):
@@ -387,7 +467,7 @@ def apply_sharding_plan(model, plan, mesh, *, validate_mode=False):
 
     # Explicit-injection guard: CP/EP sharding without an explicit compute
     # injection fails fast here, BEFORE any parameter is touched
-    _preflight_compute_injection(plan, mesh)
+    _preflight_compute_injection(plan, mesh, model=models[0])
 
     expert_mesh, dense_source_mesh, expert_source_mesh = (
         _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh)
@@ -544,6 +624,87 @@ def _shard_module_params(module, param_specs, mesh, mesh_dim_names):
 # Phase C: forward wrapping (05 §4.4)
 # ────────────────────────────────────────────────────────────────────────────
 
+def _install_bias_suppression(module, spec):
+    """D-22: make each defer-listed Linear run bias-free inside the region.
+
+    The bias Parameter itself is never touched (same FQN / same object /
+    state_dict / optimizer unchanged); the wrapper only hides it from
+    ``F.linear`` for the duration of the region forward, so the boundary
+    exit's Partial reduction sees a pure matmul contribution and the bias is
+    added exactly once afterwards by :func:`_maybe_add_deferred_biases`.
+    Both modes install the same wrapper (instruction-for-instruction
+    identity, D-01''); nesting the suppression is idempotent.
+    """
+    for param_path in spec._deferred_bias_params:  # pylint: disable=protected-access
+        owner_path = param_path.rpartition(".")[0]
+        owner = module.get_submodule(owner_path) if owner_path else module
+        original = owner.forward
+
+        @functools.wraps(original)
+        def bias_free_forward(*args, __original=original, __owner=owner,
+                              **kwargs):
+            bias = __owner.bias
+            try:
+                __owner.bias = None   # nn.Module allows None for a registered param
+                return __original(*args, **kwargs)
+            finally:
+                __owner.bias = bias
+
+        owner.forward = bias_free_forward
+
+
+def _add_bias_to_primary_output(output, bias, module_name):
+    """Add a deferred bias to the primary Tensor while preserving output structure."""
+    if isinstance(output, torch.Tensor):
+        primary_output = output
+        rebuild = None
+    elif isinstance(output, (tuple, list)):
+        if not output or not isinstance(output[0], torch.Tensor):
+            primary_type = type(output[0]).__name__ if output else "missing"
+            raise TypeError(
+                f"{module_name}: deferred bias requires output index 0 to be a Tensor, "
+                f"got {primary_type}"
+            )
+        primary_output = output[0]
+        rebuild = list(output)
+    else:
+        raise TypeError(
+            f"{module_name}: deferred bias requires a Tensor, tuple, or list output, "
+            f"got {type(output).__name__}"
+        )
+
+    if not isinstance(primary_output, DTensor) and isinstance(bias, DTensor):
+        bias = bias.to_local()
+    biased_output = primary_output + bias
+    if rebuild is None:
+        return biased_output
+    rebuild[0] = biased_output
+    return tuple(rebuild) if isinstance(output, tuple) else rebuild
+
+
+def _maybe_add_deferred_biases(module, spec, output):
+    """D-22: add each deferred bias exactly once AFTER the boundary exit.
+
+    The bias is read at forward time (never captured in a closure), so
+    production sees the unwrapped local tensor and validate sees the DTensor
+    — whichever form the boundary output currently has: nested validate keeps
+    the DTensor (dispatch add, Shard(1)+Replicate→Shard(1)); the outermost /
+    production / local-region exits are local, and a DTensor bias is
+    unwrapped to match. For structured attention outputs, index 0 is the
+    primary hidden-state Tensor; metadata/cache entries are preserved.
+    """
+    if not spec._deferred_bias_params:  # pylint: disable=protected-access
+        return output
+    for param_path in spec._deferred_bias_params:  # pylint: disable=protected-access
+        owner_path = param_path.rpartition(".")[0]
+        owner = module.get_submodule(owner_path) if owner_path else module
+        bias = owner.bias
+        if bias is None:
+            continue
+        output = _add_bias_to_primary_output(output, bias, type(module).__name__)
+    return output
+
+
 def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
     """Phase C: wrap forward (production/validate/moe/cp/vocab_embed, five paths).
 
@@ -566,6 +727,14 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         _require_region_dispatch(spec, source=f"boundary {module_fqn!r}")
         # 可观察性：注入选择结果即时可见（声明 → 后果 的反馈闭环）
         _log_injection_choice(module_fqn, spec)
+
+        # Step 0.5 (D-22): rowwise bias defer — install the bias-free region
+        # forward BEFORE inner-wrap/forward wrapping, in BOTH modes (the
+        # in-region computation stays instruction-for-instruction identical).
+        # The bias Parameter itself is untouched; it is added once after the
+        # boundary exit reduction by _maybe_add_deferred_biases.
+        if spec._deferred_bias_params:  # pylint: disable=protected-access
+            _install_bias_suppression(module, spec)
 
         # Step 1: inner-wrap —— 通用"织入/替换 inner forward"机制
         # (D-01'': production and validate inject the same wrapper, so the
@@ -605,17 +774,29 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
             # excludes nested-boundary subtrees — their parameters must stay
             # DTensors for the inner validate islands (dispatch needs
             # __torch_function__)
+            nested = _descendant_boundary_fqns(plan, module_fqn)
+            if nested:
+                # E5 (accuracy_fix_plan.md §3): make the nested-boundary call
+                # contract visible at apply time
+                logger.info(
+                    "local-region boundary %s: nested boundaries "
+                    "(communication_owner: nested_boundary): %s — their "
+                    "return values are already in the declared out_dst "
+                    "layout with TP communication sealed inside; the region "
+                    "compute MUST NOT apply compensating collectives "
+                    "(all-reduce/reduce-scatter/all-gather) to them",
+                    module_fqn, nested)
             _wrap_local_region_forward(
                 module, boundary, spec, mesh, mesh_dim_names,
                 validate_mode=validate_mode, compute_fn=compute_fn,
-                exclude_subtrees=_descendant_boundary_fqns(plan, module_fqn))
+                exclude_subtrees=nested)
         elif validate_mode:
             _wrap_validate_forward(module, boundary, spec, mesh_dim_names)
         else:
             # D-02: production vocab-parallel embedding masked wrapper
             if _is_vocab_parallel_embed(module, spec, tp_mesh):
                 _wrap_vocab_parallel_embedding(module, tp_mesh)
-            _wrap_production_forward(module, boundary)
+            _wrap_production_forward(module, boundary, spec)
 
 
 def _descendant_boundary_fqns(plan, module_fqn):
@@ -659,7 +840,7 @@ def _bind_input_indices(boundary, module):
         boundary.in_plan[0].arg_index = 0
 
 
-def _wrap_production_forward(module, boundary):
+def _wrap_production_forward(module, boundary, spec=None):
     """Production mode: pure local tensor computation + precompiled boundary communication (05 §4.4.1).
 
     _local_params_context was already invoked at the Phase C entry (parameters
@@ -671,7 +852,10 @@ def _wrap_production_forward(module, boundary):
     def production_forward(*args, **kwargs):
         args, kwargs = boundary.redistribute_inputs(args, kwargs)
         outputs = original_forward(*args, **kwargs)
-        return boundary.redistribute_outputs(outputs)
+        outputs = boundary.redistribute_outputs(outputs)
+        # D-22: deferred rowwise biases — added once after the exit reduction
+        return _maybe_add_deferred_biases(module, spec, outputs) \
+            if spec is not None else outputs
 
     module.forward = production_forward
 
@@ -709,6 +893,12 @@ def _wrap_validate_forward(module, boundary, spec, mesh_dim_names):
         # Step 5: [defensive validation] out_dst -- terminal modules only
         if spec._is_terminal and spec.out_dst is not None:  # pylint: disable=protected-access
             _validate_out_dst(outputs, spec, mesh_dim_names, module_name)
+
+        # D-22: deferred biases are added after the exit reduction while the
+        # output is still a DTensor (Shard/Replicate + Replicate bias dispatch
+        # add — the Partial reduction is already done, so every rank adds the
+        # bias exactly once); Step 6 then unwraps as usual.
+        outputs = _maybe_add_deferred_biases(module, spec, outputs)
 
         # Step 6: return local (isomorphic to production boundary outputs) --
         # but under an outer DTensor-propagating boundary (D-14 nesting, 05
@@ -818,7 +1008,7 @@ def _build_local_compute_factory(factory, module, mesh, mesh_dim_names,
             f"{source} returned {type(compute_fn).__name__}, not callable — "
             "the @local_compute factory must return the region compute fn "
             "fn(module, *local_args) (e.g. hyper_models.components.distributed."
-            "ep_compute.hf_native_ep_compute_fn)")
+            "ep_compute.qwen2moe_ep_compute_fn)")
     validate_local_compute_signature(
         compute_fn, module.forward,
         owner=f"{source!r} on {type(module).__name__}")
@@ -840,8 +1030,9 @@ def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
        @inner_wrapper). Accepted shapes: a ``@local_compute``-decorated
        factory callable (programmatic direct pass), or a Target wrapping one
        (config keys / YAML ``_target_`` reference); both are built at apply
-       time by _build_local_compute_factory (e.g. the shipped reference
-       ep_compute.hf_native_ep_compute_fn) — undecorated functions fail fast
+       time by _build_local_compute_factory (e.g. a shipped EP archetype
+       factory such as ep_compute.qwen2moe_ep_compute_fn) — undecorated
+       functions fail fast
        (injection discipline); the returned compute fn's params are
        validated against the module's forward (params must match the
        original function). Declaring it REQUIRES an explicit
@@ -880,6 +1071,54 @@ def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
     return None
 
 
+def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
+    """Wrap every declared local Tensor output with its ``out_src`` layout."""
+    declared = spec.out_src or {}
+    if not declared:
+        return output
+
+    is_sequence = isinstance(output, (tuple, list))
+    items = list(output) if is_sequence else [output]
+    out_names = list(getattr(spec, "out_names", None) or declared.keys())
+    name_to_idx = {name: index for index, name in enumerate(out_names)}
+
+    for out_name, named_placement in declared.items():
+        index = name_to_idx.get(out_name)
+        if index is None:
+            raise ValueError(
+                f"{module_name}: out_src declares output {out_name!r}, but "
+                f"out_names={out_names!r} does not contain it"
+            )
+        if index >= len(items):
+            raise ValueError(
+                f"{module_name}: out_src maps output {out_name!r} to index "
+                f"{index}, but forward returned only {len(items)} output(s)"
+            )
+        item = items[index]
+        if item is None:
+            continue
+        if isinstance(item, DTensor):
+            continue
+        if not isinstance(item, torch.Tensor):
+            raise TypeError(
+                f"{module_name}: declared output {out_name!r} at index "
+                f"{index} must be a Tensor or None, got {type(item).__name__}"
+            )
+        placements = tuple(resolve_placements(named_placement, mesh_dim_names))
+        items[index] = DTensor.from_local(item, mesh, placements)
+
+    if isinstance(output, tuple):
+        return tuple(items)
+    if isinstance(output, list):
+        return items
+    if len(items) != 1:
+        raise ValueError(
+            f"{module_name}: scalar forward output cannot satisfy "
+            f"{len(declared)} declared out_src entries"
+        )
+    return items[0]
+
+
 def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
                                *, validate_mode=False, compute_fn=None,
                                exclude_subtrees=()):
@@ -914,10 +1153,12 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
     if compute_fn is None:
         compute_fn = original_forward
 
+
     out_src_placements = None
     if spec.out_src:
         out_src_named = next(iter(spec.out_src.values()))
         out_src_placements = tuple(resolve_placements(out_src_named, mesh_dim_names))
+
     dispatch_through = bool(getattr(spec, "region_dispatch", None))
 
     @functools.wraps(original_forward)
@@ -958,8 +1199,9 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         # Step 3: local -> DTensor (re-wrap per the declared out_src, restoring
         # the DTensor metadata broken by all-to-all; under production the
         # boundary exit needs the same contract)
-        if out_src_placements is not None and not isinstance(output, DTensor):
-            output = DTensor.from_local(output, mesh, out_src_placements)
+        if not isinstance(output, DTensor):
+            output = _rewrap_local_outputs(
+                output, spec, mesh, mesh_dim_names, type(module).__name__)
 
         # Step 4: PrecompiledBoundary exit (e.g. TP reduce-scatter)
         output = boundary.redistribute_outputs(
@@ -968,7 +1210,8 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         # from_local wrap from Step 3 must also be unwrapped here)
         if isinstance(output, DTensor):
             output = output.to_local()
-        return output
+        # D-22: deferred rowwise biases — added once after the exit reduction
+        return _maybe_add_deferred_biases(module, spec, output)
 
     module.forward = local_region_forward
 

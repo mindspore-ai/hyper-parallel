@@ -17,7 +17,7 @@ region_dispatch 判断口诀：注入物含通信原语/自定义 kernel/数据�
   的声明式推导，无需配置；
 - **compute 必须显式注入**（改造后无自动注入）：local_compute_fn 指向
   仓内默认实现的工厂 Target ——
-  hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
+  hyper_models.components.distributed.ep_compute.routed_only_ep_compute_fn
   （router → dispatch all-to-all → 本地 expert → combine all-to-all，
   与 Megatron MoEAlltoAllTokenDispatcher 同构）；不注入会在 apply 时
   fail-fast（_preflight_compute_injection）；
@@ -33,7 +33,7 @@ from hyper_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
-    hf_native_ep_compute_fn,
+    routed_only_ep_compute_fn,
 )
 from hyper_models.trainer.config import Target
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
@@ -178,9 +178,9 @@ def main():
                 # EP compute 内含 all-to-all 通信 → 不可 dispatch，显式 False
                 region_dispatch=False,
                 local_compute_fn=Target(
-                    hf_native_ep_compute_fn,
+                    routed_only_ep_compute_fn,
                     target_path="hyper_models.components.distributed."
-                                "ep_compute.hf_native_ep_compute_fn"),
+                                "ep_compute.routed_only_ep_compute_fn"),
             ),
         })
         plan = planner.plan(model, mesh, tp_size=world, ep_size=world)
