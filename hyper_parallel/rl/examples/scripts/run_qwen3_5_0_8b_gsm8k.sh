@@ -8,7 +8,7 @@ hyper_rl_project_root="$(cd -- "${hyper_rl_example_root}/.." && pwd)"
 hyper_rl_repo_root="$(cd -- "${hyper_rl_project_root}/../.." && pwd)"
 
 hyper_rl_cann_env="${CANN_ENV_SCRIPT:-/usr/local/Ascend/cann-9.0.0/set_env.sh}"
-hyper_rl_torchrun="${TORCHRUN_BIN:-/home/mwl/envs/qwen_npu/bin/torchrun}"
+hyper_rl_torchrun="${TORCHRUN_BIN:-torchrun}"
 hyper_rl_config="${HYPER_RL_CONFIG:-${hyper_rl_example_root}/configs/qwen3_5_0_8b_gsm8k.yaml}"
 
 hyper_rl_nnodes="${NNODES:-1}"
@@ -21,7 +21,7 @@ if [[ ! -f "${hyper_rl_cann_env}" ]]; then
     echo "CANN environment script not found: ${hyper_rl_cann_env}" >&2
     exit 1
 fi
-if [[ ! -x "${hyper_rl_torchrun}" ]]; then
+if ! command -v "${hyper_rl_torchrun}" >/dev/null 2>&1; then
     echo "torchrun executable not found: ${hyper_rl_torchrun}" >&2
     exit 1
 fi

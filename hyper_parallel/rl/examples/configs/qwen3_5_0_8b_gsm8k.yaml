@@ -1,15 +1,15 @@
 model:
   registry_name: qwen3_5_0_8b
   name: qwen3_5
-  weights_path: /workspace/models/Qwen3.5-0.8B
-  tokenizer_path: /workspace/models/Qwen3.5-0.8B
+  weights_path: /workspace/models/Qwen3.5-0.8B-Base
+  tokenizer_path: /workspace/models/Qwen3.5-0.8B-Base
   config_overrides: null
 
 data:
-  train_path: /workspace/gsm8k/train-00000-of-00001.parquet
-  test_path: /workspace/gsm8k/test-00000-of-00001.parquet
-  prompt_column: question
-  answer_column: answer
+  train_path: /workspace/data/gsm8k/train.parquet
+  test_path: /workspace/data/gsm8k/test.parquet
+  prompt_column: prompt
+  answer_column: extra_info
   max_prompt_length: 256
   shuffle: true
   num_workers: 0

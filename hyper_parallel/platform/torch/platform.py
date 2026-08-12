@@ -925,17 +925,77 @@ class TorchPlatform(Platform):
         return cell.named_buffers()
 
     @staticmethod
-    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
+    def get_model_state_dict(
+        model: Any,
+        *,
+        options: Any = None,
+        full_state_dict: Optional[bool] = None,
+        cpu_offload: Optional[bool] = None,
+    ) -> dict[str, Any]:
         """Get the state dictionary of a model.
 
         Delegates to torch-specific implementation that handles DTensor
         gathering, CPU offloading and frozen-parameter filtering.
+
+        Args:
+            model: Model whose state is requested.
+            options: Optional Torch-native ``StateDictOptions``.
+            full_state_dict: Optional backend-neutral full-state selection.
+            cpu_offload: Optional backend-neutral output placement selection.
+
+        Returns:
+            The requested model state dictionary.
+
+        Raises:
+            ValueError: If native options and backend-neutral flags are mixed.
         """
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
             get_model_state_dict as _get_model_state_dict,
         )
+        if options is not None and (full_state_dict is not None or cpu_offload is not None):
+            raise ValueError(
+                "get_model_state_dict accepts either options or backend-neutral flags, not both"
+            )
+        if full_state_dict is not None or cpu_offload is not None:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions  # pylint: disable=C0415
+
+            options = StateDictOptions(
+                full_state_dict=bool(full_state_dict),
+                cpu_offload=bool(cpu_offload),
+            )
         return _get_model_state_dict(model, options=options)
+
+    @staticmethod
+    def get_tensor_ipc_rebuild_args(tensor: Any) -> tuple[Any, ...]:
+        """Share tensor storage and return Torch multiprocessing rebuild arguments."""
+        # pylint: disable=C0415
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        _, rebuild_args = reduce_tensor(tensor)
+        return rebuild_args
+
+    @staticmethod
+    def gather_state_dict(state_dict: dict[str, Any], *, cpu_offload: bool = False) -> dict[str, Any]:
+        """Gather a prevalidated Torch state dictionary on every rank."""
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import _gather_full_state_dict
+
+        return _gather_full_state_dict(state_dict, cpu_offload)
+
+    @staticmethod
+    def get_tensor_distribution_spec(tensor: Any) -> tuple[Any, ...]:
+        """Describe the mesh and placements that determine Torch collectives."""
+        if not isinstance(tensor, DTensorBase):
+            return ("tensor",)
+        mesh = tensor.device_mesh
+        return (
+            "dtensor",
+            str(mesh.device_type),
+            tuple(mesh.mesh_shape),
+            tuple(mesh.rank_list),
+            tuple(repr(placement) for placement in tensor.placements),
+        )
 
     @staticmethod
     def set_model_state_dict(model: Any, model_state_dict: dict[str, Any], *, options: Any = None) -> None:

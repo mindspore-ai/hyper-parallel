@@ -15,8 +15,10 @@
 """Synchronous requirements-driven Hyper-Parallel RL trainer."""
 
 import functools
+import json
 import logging
 import os
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -44,10 +46,12 @@ from rl.roles import (
     register_configured_model,
 )
 from rl.roles.rollout import PolicySnapshot, ROLLOUT_ENGINES, build_rollout_engine
+from rl.roles.rollout.vllm_policy import normalize_model_implementation
 from rl.roles.rollout.worker import RolloutManager
 from rl.utils.monitoring import TrainingTracker, sanitize_config
-from hyper_parallel import destroy_process_group, get_platform
+from hyper_parallel import HSDPModule, destroy_process_group, get_platform, hsdp_sync_stream
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load
+from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.callbacks.base import CheckpointCallback
 from hyper_parallel.trainer.config import (
@@ -69,6 +73,27 @@ _EXPECTED_TOP_LEVEL = frozenset(
     ("model", "data", "rollout", "agentic", "algorithm", "evaluation", "train", "logging")
 )
 _GIB = 1024 ** 3
+
+
+def _uses_colocated_vllm(config: Mapping[str, Any]) -> bool:
+    """Return whether the selected rollout deploys one server per trainer NPU."""
+    rollout = config.get("rollout", {})
+    if not isinstance(rollout, Mapping) or rollout.get("engine") != "vllm":
+        return False
+    vllm_config = rollout.get("vllm", {})
+    return isinstance(vllm_config, Mapping) and vllm_config.get("deployment", "disjoint") == "colocated"
+
+
+def _iter_state_tensors(value: Any):
+    """Yield tensors recursively from one optimizer state value."""
+    if platform.is_tensor(value):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_state_tensors(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_state_tensors(item)
 
 
 def _required_mapping(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -126,9 +151,15 @@ def _validate_training_sizes(
     algorithm: Any,
 ) -> None:
     """Validate update, mini-batch, response, and token counts."""
-    positive_train_fields = ("max_steps", "micro_batch_size", "response_mini_batch_size")
+    positive_train_fields = (
+        "max_steps",
+        "prompt_batch_size",
+        "micro_batch_size",
+        "response_mini_batch_size",
+    )
     for field in positive_train_fields:
-        value = int(train.get(field, 0))
+        default_value = 1 if field == "prompt_batch_size" else 0
+        value = int(train.get(field, default_value))
         if value <= 0:
             raise ValueError(f"train.{field} must be positive, got {value}")
     num_responses = int(rollout.get("num_return_sequences", 0))
@@ -139,10 +170,11 @@ def _validate_training_sizes(
             f"{minimum_responses} for algorithm '{algorithm.name}'"
         )
     mini_batch_size = int(train["response_mini_batch_size"])
-    if mini_batch_size > num_responses:
+    local_response_count = int(train.get("prompt_batch_size", 1)) * num_responses
+    if mini_batch_size > local_response_count:
         raise ValueError(
-            "train.response_mini_batch_size cannot exceed rollout.num_return_sequences: "
-            f"mini_batch={mini_batch_size}, responses={num_responses}"
+            "train.response_mini_batch_size cannot exceed the local rollout response count: "
+            f"mini_batch={mini_batch_size}, responses={local_response_count}"
         )
     if int(rollout.get("max_new_tokens", 0)) <= 0:
         raise ValueError("rollout.max_new_tokens must be positive")
@@ -150,6 +182,11 @@ def _validate_training_sizes(
         raise ValueError("data.max_prompt_length must be positive")
     if int(train.get("policy_update_epochs", 0)) <= 0:
         raise ValueError("train.policy_update_epochs must be positive")
+    learning_gate = train.get("learning_gate", {})
+    if not isinstance(learning_gate, Mapping):
+        raise ValueError("train.learning_gate must be a mapping")
+    if float(learning_gate.get("min_gradient_norm", 0.0)) < 0:
+        raise ValueError("train.learning_gate.min_gradient_norm must be non-negative")
 
 
 def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
@@ -170,6 +207,7 @@ def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
 def _validate_rollout_and_agentic(
     rollout: Mapping[str, Any],
     agentic: Mapping[str, Any],
+    accelerator: Mapping[str, Any],
 ) -> None:
     """Validate selected rollout and environment implementations."""
     engine_name = rollout.get("engine")
@@ -178,10 +216,87 @@ def _validate_rollout_and_agentic(
             f"Unknown rollout.engine '{engine_name}'; available={ROLLOUT_ENGINES.names}"
         )
     if engine_name == "vllm":
-        raise ValueError(
-            "The vLLM adapter is registered but not enabled in the synchronous trainer: "
-            "versioned actor-to-vLLM weight refit is not implemented; use rollout.engine=hyper"
-        )
+        if platform.platform_type != PlatformType.PYTORCH or platform.device_type() != "npu":
+            raise ValueError("The vLLM-Ascend rollout backend requires the Torch NPU platform")
+        vllm_config = _optional_mapping(rollout, "vllm")
+        deployment = str(vllm_config.get("deployment", "disjoint"))
+        if deployment not in ("disjoint", "colocated"):
+            raise ValueError(
+                "rollout.vllm.deployment must be 'disjoint' or 'colocated', "
+                f"got {deployment!r}"
+            )
+        rollout_tp = int(vllm_config.get("tensor_parallel_size", 1))
+        if rollout_tp <= 0:
+            raise ValueError("rollout.vllm.tensor_parallel_size must be positive")
+        if str(vllm_config.get("dtype", "bfloat16")) not in ("bfloat16", "bf16"):
+            raise ValueError("The Hyper Qwen3.5 vLLM adapter requires bfloat16")
+        host = str(vllm_config.get("host", "127.0.0.1"))
+        if host not in ("127.0.0.1", "localhost"):
+            raise ValueError("The external vLLM server must bind to loopback")
+        gpu_memory_utilization = float(vllm_config.get("gpu_memory_utilization", 0.9))
+        if not 0 < gpu_memory_utilization < 1:
+            raise ValueError("rollout.vllm.gpu_memory_utilization must be between 0 and 1")
+        if deployment == "colocated":
+            if rollout_tp != 1:
+                raise ValueError("The initial colocated rollout path supports tensor_parallel_size=1")
+            if int(accelerator.get("dp_shard", 1)) <= 1:
+                raise ValueError("Colocated rollout requires multi-rank FSDP with train.accelerator.dp_shard > 1")
+            if not bool(accelerator.get("cpu_offload", False)):
+                raise ValueError("Colocated rollout requires train.accelerator.cpu_offload=true")
+            if not bool(accelerator.get("reshard_after_forward", True)):
+                raise ValueError("Colocated rollout requires train.accelerator.reshard_after_forward=true")
+            if vllm_config.get("visible_devices") is not None:
+                raise ValueError(
+                    "Colocated rollout derives one physical NPU from each trainer rank; "
+                    "remove rollout.vllm.visible_devices"
+                )
+            base_port = vllm_config.get("port")
+            if base_port is None:
+                raise ValueError("Colocated rollout requires an explicit rollout.vllm.port base")
+            final_port = int(base_port) + int(accelerator.get("dp_shard", 1)) - 1
+            if int(base_port) <= 0 or final_port > 65535:
+                raise ValueError("rollout.vllm.port range exceeds valid TCP ports")
+        else:
+            if int(accelerator.get("dp_shard", 1)) != 1:
+                raise ValueError(
+                    "The external vLLM HCCL refitter currently supports train.accelerator.dp_shard=1"
+                )
+            visible_devices = vllm_config.get("visible_devices")
+            if visible_devices is None:
+                raise ValueError("rollout.vllm.visible_devices must select the external server NPUs")
+            device_ids = [device.strip() for device in str(visible_devices).split(",")]
+            if not all(device_ids) or len(device_ids) < rollout_tp:
+                raise ValueError(
+                    "rollout.vllm.visible_devices must contain at least one device ID per TP rank"
+                )
+            training_visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            if training_visible_devices:
+                training_device_ids = [
+                    device.strip() for device in training_visible_devices.split(",")
+                ]
+                if local_rank >= len(training_device_ids):
+                    raise ValueError(
+                        f"LOCAL_RANK={local_rank} exceeds ASCEND_RT_VISIBLE_DEVICES={training_visible_devices!r}"
+                    )
+                training_device_id = training_device_ids[local_rank]
+            else:
+                training_device_id = str(local_rank)
+            if training_device_id in device_ids:
+                raise ValueError(
+                    "The external vLLM server must use NPUs disjoint from the trainer: "
+                    f"training_device={training_device_id}, rollout_devices={device_ids}"
+                )
+        normalize_model_implementation(vllm_config.get("model_implementation", "hyper"))
+        request_concurrency = int(vllm_config.get("request_concurrency", 1))
+        if request_concurrency <= 0:
+            raise ValueError("rollout.vllm.request_concurrency must be positive")
+        for field in ("kv_cache_memory_bytes", "max_model_len", "max_num_seqs", "max_num_batched_tokens"):
+            if field in vllm_config and int(vllm_config[field]) <= 0:
+                raise ValueError(f"rollout.vllm.{field} must be positive")
+    rollout_seed = rollout.get("seed")
+    if rollout_seed is not None and int(rollout_seed) < 0:
+        raise ValueError("rollout.seed must be non-negative or null")
     environment_name = agentic.get("environment")
     if environment_name not in ENVIRONMENTS.names:
         raise ValueError(
@@ -270,6 +385,7 @@ class SyncTrainer(BaseTrainer):
         self.model_registration = register_configured_model(
             _required_mapping(self.resolved_config, "model")
         )
+        self._defer_checkpoint_errors = True
         base_config = self._build_base_config(self.resolved_config)
         discover_model_spec(base_config.model.name)
         super().__init__(base_config)
@@ -303,7 +419,7 @@ class SyncTrainer(BaseTrainer):
         _validate_model_and_data_paths(model, data, evaluation)
         _validate_training_sizes(train, rollout, data, algorithm)
         _validate_evaluation(evaluation)
-        _validate_rollout_and_agentic(rollout, agentic)
+        _validate_rollout_and_agentic(rollout, agentic, accelerator)
         _validate_topology(accelerator)
         _validate_checkpoint(checkpoint, algorithm)
         _validate_logging(logging_config)
@@ -322,12 +438,17 @@ class SyncTrainer(BaseTrainer):
         agentic_config = _required_mapping(config, "agentic")
 
         max_steps = int(train_config["max_steps"])
+        prompt_batch_size = int(train_config.get("prompt_batch_size", 1))
         save_final = bool(checkpoint_config.get("save_final", True))
         configured_save_steps = int(checkpoint_config.get("save_steps", 0))
         effective_save_steps = configured_save_steps
         if save_final and effective_save_steps == 0:
             effective_save_steps = max_steps
         dp_shard = int(accelerator_config["dp_shard"])
+        cpu_offload = bool(accelerator_config.get("cpu_offload", False))
+        comm_backend = train_config.get("comm_backend")
+        if cpu_offload and comm_backend in (None, "hccl"):
+            comm_backend = "cpu:gloo,npu:hccl"
         model = ModelConfig(
             name=str(model_config["name"]),
             weights_path=str(model_config["weights_path"]),
@@ -357,6 +478,7 @@ class SyncTrainer(BaseTrainer):
             etp=1,
             reshard_after_forward=bool(accelerator_config.get("reshard_after_forward", True)),
             comm_fusion=bool(accelerator_config.get("comm_fusion", True)),
+            cpu_offload=cpu_offload,
         )
         mixed_precision = MixedPrecisionConfig(
             enabled=bool(mixed_precision_config.get("enabled", True)),
@@ -386,12 +508,12 @@ class SyncTrainer(BaseTrainer):
         train = TrainConfig(
             max_steps=max_steps,
             num_train_epochs=1,
-            global_batch_size=dp_shard,
-            micro_batch_size=1,
+            global_batch_size=dp_shard * prompt_batch_size,
+            micro_batch_size=prompt_batch_size,
             seed=int(train_config.get("seed", 1234)),
             backend="torch",
             init_device=str(train_config.get("init_device", "meta")),
-            comm_backend=train_config.get("comm_backend"),
+            comm_backend=comm_backend,
             local_rank=int(os.environ.get("LOCAL_RANK", "0")),
             accelerator=accelerator,
             mixed_precision=mixed_precision,
@@ -409,6 +531,21 @@ class SyncTrainer(BaseTrainer):
                 f"torchrun world size must equal train.accelerator.dp_shard: "
                 f"world_size={world_size}, dp_shard={dp_shard}"
             )
+        if _uses_colocated_vllm(self.resolved_config):
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+            if local_world_size != world_size:
+                raise ValueError(
+                    "The initial colocated rollout DP path is single-node only: "
+                    f"world_size={world_size}, local_world_size={local_world_size}"
+                )
+            visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+            if visible_devices is not None:
+                device_ids = [device.strip() for device in visible_devices.split(",")]
+                if len(device_ids) < local_world_size or len(set(device_ids[:local_world_size])) != local_world_size:
+                    raise ValueError(
+                        "Colocated rollout requires one unique visible physical NPU per local trainer rank: "
+                        f"ASCEND_RT_VISIBLE_DEVICES={visible_devices!r}"
+                    )
 
     def _build_runtime(self) -> None:
         """Build tokenizer, data, requirement-selected roles, optimizers, and tracking."""
@@ -447,6 +584,11 @@ class SyncTrainer(BaseTrainer):
         }
         self.train_dataset = PromptDataset(
             parquet_path=str(data_config["train_path"]),
+            max_samples=(
+                None
+                if data_config.get("max_train_samples") is None
+                else int(data_config["max_train_samples"])
+            ),
             **dataset_kwargs,
         )
         self.test_dataset: Optional[PromptDataset] = None
@@ -521,6 +663,7 @@ class SyncTrainer(BaseTrainer):
             eos_token_id=int(self.tokenizer.eos_token_id),
             do_sample=True,
             collect_old_log_probs=self.algorithm.requirements.data.rollout_log_probs,
+            seed=(None if rollout_config.get("seed") is None else int(rollout_config["seed"])),
         )
         self._evaluation_batch_size = int(evaluation_config.get("batch_size", 1))
         self._evaluation_max_samples = evaluation_config.get("max_samples")
@@ -888,26 +1031,40 @@ class SyncTrainer(BaseTrainer):
     ) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Gather per-rank rollout statistics and bounded samples on rank zero."""
         response_lengths = rollout.action_mask.sum(dim=-1).detach().cpu().tolist()
+        reward_values = rollout.rewards.detach().cpu().tolist()
         rank = platform.get_rank()
+        batch_rows = {
+            str(int(sample_index)): row
+            for row, sample_index in enumerate(batch["sample_indices"])
+        }
         local_samples = []
         for index, response in enumerate(rollout.responses[:self._log_samples]):
+            trajectory = rollout.trajectories[index]
+            batch_row = batch_rows[trajectory.prompt_id]
             local_samples.append(
                 {
                     "step": step,
                     "rank": rank,
-                    "prompt": batch["prompts"][0],
+                    "prompt": batch["prompts"][batch_row],
                     "response": response,
-                    "ground_truth": batch["ground_truths"][0],
-                    "extracted_answer": rollout.trajectories[index].metadata.get(
-                        "extracted_answer"
-                    ),
-                    "reward": float(rollout.rewards[index].item()),
+                    "ground_truth": batch["ground_truths"][batch_row],
+                    "extracted_answer": trajectory.metadata.get("extracted_answer"),
+                    "reward": float(reward_values[index]),
                 }
             )
+        group_rewards: dict[str, list[float]] = {}
+        for trajectory, reward in zip(rollout.trajectories, reward_values):
+            group_id = trajectory.group_id or trajectory.prompt_id
+            group_rewards.setdefault(group_id, []).append(float(reward))
         local = {
-            "reward_sum": float(rollout.rewards.sum().item()),
-            "reward_count": int(rollout.rewards.numel()),
-            "zero_std_groups": int(float(rollout.rewards.std(unbiased=True).item()) == 0.0),
+            "reward_sum": float(sum(reward_values)),
+            "reward_count": len(reward_values),
+            "reward_min": float(min(reward_values)),
+            "reward_max": float(max(reward_values)),
+            "zero_std_groups": sum(
+                int(max(rewards) == min(rewards))
+                for rewards in group_rewards.values()
+            ),
             "length_sum": int(sum(response_lengths)),
             "length_max": int(max(response_lengths, default=0)),
             "generated_tokens": int(rollout.action_mask.sum().item()),
@@ -927,8 +1084,8 @@ class SyncTrainer(BaseTrainer):
         reward_mean = reward_sum / max(reward_count, 1)
         metrics = {
             "reward/mean": reward_mean,
-            "reward/min": float(reward_sum == reward_count),
-            "reward/max": float(reward_sum > 0),
+            "reward/min": min(record["reward_min"] for record in records),
+            "reward/max": max(record["reward_max"] for record in records),
             "reward/accuracy": reward_mean,
             "reward/zero_std_groups": float(sum(record["zero_std_groups"] for record in records)),
             "rollout/response_length_mean": length_sum / max(reward_count, 1),
@@ -1006,7 +1163,51 @@ class SyncTrainer(BaseTrainer):
                 }
             )
         metrics.update(self._system_memory_metrics())
+        policy_fingerprint = getattr(self.rollout_engine, "policy_fingerprint", None)
+        if policy_fingerprint is not None:
+            metrics["policy/version"] = float(self.rollout_engine.policy_version)
+            metrics["policy/fingerprint_changed"] = float(
+                bool(self.rollout_engine.policy_fingerprint_changed)
+            )
         return metrics
+
+    def _enforce_learning_gate(self, metrics: Mapping[str, float], step: int) -> None:
+        """Fail a numerical acceptance run when learning invariants are absent."""
+        train_config = _required_mapping(self.resolved_config, "train")
+        gate = train_config.get("learning_gate", {})
+        if not bool(gate.get("enabled", False)):
+            return
+
+        def validate() -> None:
+            """Validate globally reduced metrics only on rank zero."""
+            if platform.get_rank() != 0:
+                return
+            failures = []
+            gradient_norm = float(metrics["train/gradient_norm"])
+            minimum_gradient = float(gate.get("min_gradient_norm", 0.0))
+            if not gradient_norm > minimum_gradient:
+                failures.append(
+                    f"Learning gate requires gradient_norm > {minimum_gradient}, got {gradient_norm}"
+                )
+            reward_minimum = float(metrics.get("reward/min", 0.0))
+            reward_maximum = float(metrics.get("reward/max", 0.0))
+            if bool(gate.get("require_mixed_rewards", False)) and not reward_maximum > reward_minimum:
+                failures.append(
+                    "Learning gate requires nonzero global reward variance, "
+                    f"got reward/min={reward_minimum} and reward/max={reward_maximum}"
+                )
+            if bool(gate.get("require_fingerprint_change", False)) and not bool(
+                metrics.get("policy/fingerprint_changed", 0.0)
+            ):
+                failures.append("Learning gate requires a changed replicated norm probe")
+            if int(metrics.get("policy/version", -1)) != step:
+                failures.append(
+                    f"Learning gate expected policy version {step}, got {metrics.get('policy/version')}"
+                )
+            if failures:
+                raise RuntimeError("; ".join(failures))
+
+        self._run_rank_synchronized(f"learning gate step {step}", validate)
 
     def _checkpoint_dir(self, step: int) -> Path:
         """Return the deterministic DCP directory for one completed step."""
@@ -1022,7 +1223,10 @@ class SyncTrainer(BaseTrainer):
 
     def _write_checkpoint_config(self, checkpoint_dir: Path) -> None:
         """Persist resolved non-secret Hyper-RL configuration beside DCP state."""
-        if platform.get_rank() == 0:
+        def write_config() -> None:
+            """Write metadata only from rank zero."""
+            if platform.get_rank() != 0:
+                return
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             config_path = checkpoint_dir / "resolved_config.yaml"
             with config_path.open("w", encoding="utf-8") as handle:
@@ -1032,17 +1236,85 @@ class SyncTrainer(BaseTrainer):
                     sort_keys=False,
                     allow_unicode=True,
                 )
-        platform.barrier()
+            manifest_path = checkpoint_dir / "checkpoint_complete.json"
+            temporary_manifest = checkpoint_dir / f".{manifest_path.name}.{os.getpid()}.tmp"
+            with temporary_manifest.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "step": self.state.global_step,
+                        "world_size": platform.get_world_size(),
+                    },
+                    handle,
+                )
+            os.replace(temporary_manifest, manifest_path)
+
+        self._run_rank_synchronized("checkpoint config write", write_config)
 
     def _verify_checkpoint_reload(self, checkpoint_dir: Path) -> None:
         """Immediately load the final actor DCP state on every rank."""
-        if not checkpoint_dir.is_dir():
-            raise RuntimeError(f"Final checkpoint directory was not created: {checkpoint_dir}")
-        model_state = self.model.state_dict()
-        dcp_load(model_state, checkpoint_id=str(checkpoint_dir), use_collectives=False)
-        self.model.load_state_dict(model_state)
-        platform.barrier()
+        def reload_checkpoint() -> None:
+            """Reload one rank's model shard from the completed checkpoint."""
+            if not checkpoint_dir.is_dir():
+                raise RuntimeError(f"Final checkpoint directory was not created: {checkpoint_dir}")
+            model_state = self.model.state_dict()
+            dcp_load(model_state, checkpoint_id=str(checkpoint_dir), use_collectives=False)
+            self.model.load_state_dict(model_state)
+
+        self._run_rank_synchronized("checkpoint reload verification", reload_checkpoint)
         logger.info("rank=%d verified checkpoint reload from %s", platform.get_rank(), checkpoint_dir)
+
+    def _validate_checkpoint_for_resume(self) -> None:
+        """Reject incomplete or topology-incompatible checkpoints before loading."""
+        load_path = self.checkpoint_callback.load_path
+        if not load_path:
+            return
+
+        def validate_files() -> None:
+            """Validate shared and rank-local completion artifacts."""
+            checkpoint_dir = Path(load_path)
+            manifest_path = checkpoint_dir / "checkpoint_complete.json"
+            if not manifest_path.is_file():
+                raise RuntimeError(f"Checkpoint completion manifest is missing: {manifest_path}")
+            with manifest_path.open(encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            world_size = platform.get_world_size()
+            if int(manifest.get("world_size", -1)) != world_size:
+                raise RuntimeError(
+                    "Checkpoint world size does not match the active job: "
+                    f"checkpoint={manifest.get('world_size')}, active={world_size}"
+                )
+            rank = platform.get_rank()
+            required_paths = [
+                checkpoint_dir / "extra_state.json",
+                checkpoint_dir / f"rng_rank{rank}.pt",
+            ]
+            if self.optimizer is not None:
+                required_paths.append(checkpoint_dir / f"optimizer_rank{rank}.pt")
+            if self.lr_scheduler is not None:
+                required_paths.append(checkpoint_dir / "scheduler.pt")
+            if hasattr(self.train_dataloader, "state_dict"):
+                required_paths.append(checkpoint_dir / f"dataloader_rank{rank}.pt")
+            missing = [str(path) for path in required_paths if not path.is_file()]
+            if missing:
+                raise RuntimeError(f"Checkpoint is incomplete; missing artifacts={missing}")
+
+        self._run_rank_synchronized("checkpoint resume preflight", validate_files)
+
+    def _ensure_checkpoint_saved(self, step: int) -> None:
+        """Require every rank to finish all checkpoint artifacts for one step."""
+        self._run_rank_synchronized(
+            "checkpoint save",
+            lambda: self.checkpoint_callback.ensure_saved(step),
+        )
+
+    def _invalidate_checkpoint_manifest(self, step: int) -> None:
+        """Remove a prior completion marker before overwriting checkpoint artifacts."""
+        def invalidate() -> None:
+            """Invalidate an existing checkpoint only from rank zero."""
+            if platform.get_rank() == 0:
+                (self._checkpoint_dir(step) / "checkpoint_complete.json").unlink(missing_ok=True)
+
+        self._run_rank_synchronized("checkpoint manifest invalidation", invalidate)
 
     def _maybe_record_periodic_checkpoint(self) -> None:
         """Attach resolved configuration to a checkpoint saved on this step."""
@@ -1070,7 +1342,18 @@ class SyncTrainer(BaseTrainer):
                 step=self.state.global_step,
                 sample_tables={"validation/samples": validation_samples},
             )
-        self.checkpoint_callback.on_train_end(self.state)
+        if _uses_colocated_vllm(self.resolved_config):
+            if self.rollout_engine.phase == "rollout":
+                self.rollout_engine.prepare_for_training()
+                self._release_training_state_for_rollout()
+            elif self.rollout_engine.phase != "training":
+                raise RuntimeError(
+                    "Final checkpoint requires colocated vLLM in training residency, "
+                    f"got phase={self.rollout_engine.phase!r}"
+                )
+        self._invalidate_checkpoint_manifest(self.state.global_step)
+        self.checkpoint_callback.save_now(self.state)
+        self._ensure_checkpoint_saved(self.state.global_step)
         checkpoint_dir = self._checkpoint_dir(self.state.global_step)
         self._write_checkpoint_config(checkpoint_dir)
         if bool(checkpoint_config.get("verify_reload", False)):
@@ -1079,8 +1362,19 @@ class SyncTrainer(BaseTrainer):
     def _cleanup_distributed(self) -> None:
         """Close tracking and destroy the initialized process group."""
         if self._tracker is not None:
-            self._tracker.finish()
-            self._tracker = None
+            try:
+                self._tracker.finish()
+            except Exception as exc:  # pylint: disable=W0718
+                logger.warning("Tracking cleanup failed: %s", exc)
+            finally:
+                self._tracker = None
+        rollout_engine = getattr(self, "rollout_engine", None)
+        close_rollout = getattr(rollout_engine, "close", None)
+        if callable(close_rollout):
+            try:
+                close_rollout()
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                logger.warning("Rollout cleanup failed: %s", exc)
         if not self._runtime_started:
             return
         try:
@@ -1089,23 +1383,106 @@ class SyncTrainer(BaseTrainer):
             logger.warning("Distributed cleanup failed: %s", exc)
         self._runtime_started = False
 
+    @staticmethod
+    def _reshard_model(model: Optional[Any]) -> None:
+        """Explicitly release every nested full FSDP parameter allocation."""
+        if model is None:
+            return
+        module = getattr(model, "module", model)
+        seen = set()
+        for _, candidate in platform.get_cells_and_names(module):
+            if isinstance(candidate, HSDPModule) and id(candidate) not in seen:
+                candidate.reshard()
+                seen.add(id(candidate))
+
+    @staticmethod
+    def _validate_optimizer_cpu_residency(optimizer: Optional[Any], role: str) -> None:
+        """Fail if a colocated optimizer retains tensor state on the NPU."""
+        if optimizer is None:
+            return
+        device_states = [
+            str(tensor.device)
+            for state in optimizer.state.values()
+            for tensor in _iter_state_tensors(state)
+            if not str(tensor.device).startswith("cpu")
+        ]
+        if device_states:
+            raise RuntimeError(
+                f"Colocated {role} optimizer state must be CPU resident, got devices={sorted(set(device_states))}"
+            )
+
+    def _release_training_state_for_rollout(self) -> None:
+        """Reshard FSDP state and release allocator cache before waking vLLM."""
+        if not _uses_colocated_vllm(self.resolved_config):
+            return
+
+        def release_training_state() -> None:
+            """Release rank-local FSDP and optimizer residency."""
+            hsdp_sync_stream()
+            self._reshard_model(self.model)
+            self._reshard_model(self.reference_model)
+            self._reshard_model(self.critic_model)
+            self._validate_optimizer_cpu_residency(self.optimizer, "actor")
+            self._validate_optimizer_cpu_residency(self.critic_optimizer, "critic")
+            platform.get_current_stream().synchronize()
+
+        self._run_rank_synchronized("training-state release", release_training_state)
+
+        def release_allocator_cache() -> None:
+            """Release rank-local allocator cache after all models are sharded."""
+            device_handle = platform.get_device_handle(platform.device_type())
+            empty_cache = getattr(device_handle, "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
+            platform.get_current_stream().synchronize()
+
+        self._run_rank_synchronized("allocator-cache release", release_allocator_cache)
+
+    @staticmethod
+    def _run_rank_synchronized(operation: str, callback: Any) -> None:
+        """Run local work and make its failure visible on every training rank."""
+        local_error = None
+        try:
+            callback()
+        except Exception as error:  # pylint: disable=W0718
+            local_error = error
+        world_size = platform.get_world_size()
+        if world_size <= 1:
+            if local_error is not None:
+                raise local_error
+            return
+        errors: list[Optional[str]] = [None] * world_size
+        platform.all_gather_object(errors, None if local_error is None else str(local_error))
+        if any(error is not None for error in errors):
+            raise RuntimeError(f"{operation} failed on at least one rank: {errors}")
+
     def train(self) -> None:
         """Run exactly ``train.max_steps`` synchronous registered-algorithm updates."""
-        self.checkpoint_callback.on_train_begin(self.state)
-        if self.state.global_step > self.rollout_engine.policy_version:
-            self.rollout_engine.update_weights(
-                PolicySnapshot(
-                    version=self.state.global_step,
-                    model_name=self.model_registration.name,
-                    payload=self.model,
-                    metadata={"reason": "checkpoint_resume"},
-                )
-            )
-        if hasattr(self, "sampler"):
-            self.sampler.set_epoch(self.state.epoch)
-        data_iterator = iter(self.train_dataloader)
         completed = False
         try:
+            self._validate_checkpoint_for_resume()
+            self.checkpoint_callback.on_train_begin(self.state)
+            self._run_rank_synchronized(
+                "checkpoint resume",
+                self.checkpoint_callback.raise_if_load_failed,
+            )
+            if self.state.global_step > self.rollout_engine.policy_version:
+                self.rollout_engine.prepare_for_training()
+                self.rollout_engine.update_weights(
+                    PolicySnapshot(
+                        version=self.state.global_step,
+                        model_name=self.model_registration.name,
+                        payload=self.model,
+                        metadata={"reason": "checkpoint_resume"},
+                    )
+                )
+                self._release_training_state_for_rollout()
+                self.rollout_engine.prepare_for_rollout()
+            else:
+                self._release_training_state_for_rollout()
+            if hasattr(self, "sampler"):
+                self.sampler.set_epoch(self.state.epoch)
+            data_iterator = iter(self.train_dataloader)
             while self.state.global_step < self.state.max_steps:
                 batch, data_iterator = self._next_batch(data_iterator)
                 next_step = self.state.global_step + 1
@@ -1126,6 +1503,7 @@ class SyncTrainer(BaseTrainer):
                     ),
                     policy_version=self.state.global_step,
                 )
+                self.rollout_engine.prepare_for_training()
                 if rollout.old_log_probs is None:
                     raise RuntimeError("Training rollout did not produce old_log_probs")
                 experience = self.experience_builder.build(rollout)
@@ -1143,9 +1521,12 @@ class SyncTrainer(BaseTrainer):
                         metadata={"optimizer_steps": update.optimizer_steps},
                     )
                 )
+                self._release_training_state_for_rollout()
+                self.rollout_engine.prepare_for_rollout()
                 self.state.global_step = next_step
                 rollout_metrics, samples = self._rollout_statistics(rollout, batch, next_step)
                 metrics = self._build_metrics(update, rollout_metrics, critic_update)
+                self._enforce_learning_gate(metrics, next_step)
                 checkpoint_will_save = self._checkpoint_will_save(self.state.global_step)
                 validation_samples: list[dict[str, Any]] = []
                 if checkpoint_will_save and self._evaluation_enabled:
@@ -1164,12 +1545,32 @@ class SyncTrainer(BaseTrainer):
                         samples=samples,
                         sample_tables={"validation/samples": validation_samples},
                     )
+                if checkpoint_will_save and _uses_colocated_vllm(self.resolved_config):
+                    self.rollout_engine.prepare_for_training()
+                    self._release_training_state_for_rollout()
+                if (
+                    self.checkpoint_callback.save_steps > 0
+                    and self.state.global_step % self.checkpoint_callback.save_steps == 0
+                ):
+                    self._invalidate_checkpoint_manifest(self.state.global_step)
                 self.checkpoint_callback.on_step_end(
                     self.state,
                     loss=update.total_loss,
                     grad_norm=update.gradient_norm,
                 )
+                if (
+                    self.checkpoint_callback.save_steps > 0
+                    and self.state.global_step % self.checkpoint_callback.save_steps == 0
+                ):
+                    self._ensure_checkpoint_saved(self.state.global_step)
                 self._maybe_record_periodic_checkpoint()
+                if (
+                    checkpoint_will_save
+                    and _uses_colocated_vllm(self.resolved_config)
+                    and self.state.global_step < self.state.max_steps
+                ):
+                    self._release_training_state_for_rollout()
+                    self.rollout_engine.prepare_for_rollout()
             self._finalize_checkpoint()
             completed = True
         finally:

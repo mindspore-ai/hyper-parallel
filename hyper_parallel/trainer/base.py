@@ -1110,6 +1110,7 @@ class BaseTrainer:
         # Checkpoint runs after log writers are armed and before progress so
         # resumed ``global_step`` is reflected in the tqdm initial position.
         self.checkpoint_callback.on_train_begin(self.state)
+        self.checkpoint_callback.raise_if_load_failed()
         self.progress_callback.on_train_begin(self.state)
         for cb in self.user_callbacks:
             cb.on_train_begin(self.state)
@@ -1117,6 +1118,7 @@ class BaseTrainer:
     def on_train_end(self):
         """Dispatch on_train_end to all callbacks."""
         self.checkpoint_callback.on_train_end(self.state)
+        self.checkpoint_callback.raise_if_save_failed()
         self.hf_export_callback.on_train_end(self.state)
         self.progress_callback.on_train_end(self.state)
         self.training_state_monitor_callback.on_train_end(self.state)
@@ -1853,7 +1855,14 @@ class BaseTrainer:
         grad_norm_value = self._optimizer_step_after_backward(self._pp_clip_grad_norm)
         return {"loss": self._pp_reduce_reported_loss(outputs, n_valid), "grad_norm": grad_norm_value}
 
-    def train(self):
+    def train(self) -> None:
+        """Run training and always release the distributed process group."""
+        try:
+            self._run_training_loop()
+        finally:
+            destroy_process_group()
+
+    def _run_training_loop(self) -> None:
         """Main training loop: epoch → step → micro-batch.
 
         Dispatches callbacks at each lifecycle point (explicit mode).
@@ -1908,7 +1917,6 @@ class BaseTrainer:
             self.on_epoch_end()
 
         self.on_train_end()
-        destroy_process_group()
         logger.info_rank0("Training completed")
 
     # ------------------------------------------------------------------

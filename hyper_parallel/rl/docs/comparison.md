@@ -8,13 +8,13 @@
 |---|---|---|---|---|
 | 设计中心 | Hyper 原生最小同步闭环 | Megatron + SGLang 大规模吞吐与 Data Buffer | Ray-less、易读、FSDP/Megatron | agentic-first、Ray + vLLM + AutoModel/FSDP2 |
 | 训练引擎 | Hyper-Parallel FSDP | Megatron 主路径 | FSDP 或 Megatron | NVIDIA AutoModel + FSDP2 |
-| rollout | Hyper 已验证；vLLM 有版本/refitter 契约但无具体 refitter | 核心只选 SGLang，深度透传其能力 | SGLang async engine/router | vLLM，Ray 管理 engine 与 router |
+| rollout | Hyper 已验证；vLLM 使用 Hyper Qwen3.5 adapter 和外部 server | 核心只选 SGLang，深度透传其能力 | SGLang async engine/router | vLLM，Ray 管理 engine 与 router |
 | 调度 | `torchrun`、共卡、同步 | Ray placement + 同步/异步 rollout/Data Buffer | `torchrun`，无 Ray；管理本地 rollout 进程 | Ray placement、异步队列、partial rollout |
 | 算法扩展 | 完整 GRPO/PPO Recipe + requirements；Recipe 内复用组件 | 统一训练核，按 estimator/flags 分支 | 一个参数化在线 trainer，按 estimator/flags 分支 | advantage estimator 与 surrogate registry |
 | Critic | GRPO 不分配；PPO requirements 创建独立 Qwen value model | `advantage_estimator == "ppo"` 时启用 | `adv.estimator == "gae"` 时启用 | `advantage.estimator == "gae"` 时创建独立 Critic group |
 | 数据契约 | `PromptRecord → Trajectory → ExperienceBatch`，全序列多段 action mask | Sample/RolloutBatch；agent 路径另有 token/action-range Trajectory | tensor dict + `action_mask`/packed sequences | token-first Trajectory → Experience |
 | Agentic | AgentRunner（框架控制）+ ProgramAgentRunner（用户控制） | custom rollout/generate function、agent harness、sandbox | `env_path` async step 与 GEM | `Env`/`StepEnvRunner` 或 `ChatAgent` 两条一等路径 |
-| 权重同步 | Hyper 零拷贝版本发布；vLLM refitter 必须真实加载后才确认 | SGLang broadcast/disk/delta 等成熟路径 | actor `update_rollout()` | FSDP → vLLM broadcast/refit，支持 partial/async |
+| 权重同步 | Hyper 零拷贝发布；vLLM 分卡使用 HCCL、共卡 DP 使用 NPU IPC | SGLang broadcast/disk/delta 等成熟路径 | actor `update_rollout()` | FSDP → vLLM broadcast/refit，支持 partial/async |
 
 ## 不同算法是怎么处理的
 
@@ -54,7 +54,7 @@ Molt 是四者中 agentic 与 token-first 契约最完整的一种：用户选�
 
 算法上，Molt 对 advantage estimator 使用 registry，已有 GRPO、Dr.GRPO、RLOO、GAE 等；reference 在 KL 系数大于零时创建，Critic 在 estimator 为 GAE 时创建。它没有为每个 XPO 复制完整训练流程，而是在一个 actor-centric async runtime 中组合 estimator、policy surrogate、KL 和可选 Critic。
 
-这和 Hyper-RL 的方向最接近，但公开算法边界不同：Molt 更偏运行时组合 estimator/surrogate；Hyper-RL 选择完整 Recipe 作为用户 API、组件只在 Recipe 内复用。Molt 已包含 Ray placement、vLLM router、异步队列、partial rollout、真实权重广播和 MoE routing replay；Hyper-RL 仍是同步最小 runtime。
+这和 Hyper-RL 的方向最接近，但公开算法边界不同：Molt 更偏运行时组合 estimator/surrogate；Hyper-RL 选择完整 Recipe 作为用户 API、组件只在 Recipe 内复用。Molt 已包含 Ray placement、vLLM router、异步队列、partial rollout、高吞吐权重广播和 MoE routing replay；Hyper-RL 仍是强同步 runtime，vLLM 数据面支持单训练 rank 分卡 HCCL，以及单节点 FSDP 多 rank 到共卡 TP1 replicas 的 NPU IPC fan-out。
 
 ## 关键取舍
 
@@ -65,12 +65,12 @@ Hyper-RL 现在不是 Slime/RL2/Molt 的功能平替。本轮从 Molt 最值得�
 3. Agentic 同时支持框架拥有循环和用户拥有循环，最终统一为 Trajectory；
 4. rollout 绑定单调版本的 `PolicySnapshot`，vLLM 未真实 refit 就不能确认新版本。
 
-因此本次没有加入 Ray、异步队列、工具沙箱、partial rollout 或跨拓扑权重同步。这些能力过早加入会让“最小 Qwen + GRPO”重新变成基础设施项目，也无法在当前双卡环境中得到与代码同等强度的验证。
+因此本次没有加入 Ray、异步队列、工具沙箱或 partial rollout。外部 server、HCCL 和 NPU IPC refitter 保持 `PolicySnapshot` 接口不变；共卡推理 TP 仍需扩展 FSDP 到 TP shard mapping。
 
 ## 建议演进顺序
 
 1. 补 Critic checkpoint/save-resume，并跑 Qwen PPO NPU 端到端；
-2. 为选定 vLLM 部署拓扑实现真实 refitter，并增加两步以上版本测试；
+2. 扩展共卡 refitter 的 TP rank mapping，并增加跨拓扑版本测试；
 3. 在真实工具 Agent 上补超时、错误、资源边界和 chat-template 责任划分；
 4. 有真实吞吐瓶颈后，再引入异步队列、背压、partial rollout 与 off-policy 修正。
 

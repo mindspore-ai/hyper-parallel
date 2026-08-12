@@ -1,100 +1,117 @@
 # Hyper-RL
 
-Hyper-Parallel 原生的 LLM 强化学习运行时。当前以 Qwen3.5 + GRPO 为最小可运行主线，同时保留按需 Critic、vLLM 模型注册和 Agentic RL 扩展边界。
+Hyper-Parallel 原生 LLM 强化学习运行时。当前主线是 Qwen3.5-0.8B、GSM8K、GRPO 与 colocated vLLM 的
+单节点强同步训练闭环。
 
-## 状态
+## 当前状态
 
-| 能力 | 当前状态 |
+| 能力 | 状态 |
 |---|---|
-| Qwen3.5-0.8B + GSM8K + GRPO | 双 Ascend NPU 端到端验证 |
-| Hyper 原生训练与生成 | 默认路径 |
-| GRPO / PPO | 独立公开 Recipe，内部复用算法组件 |
-| Critic | 由 Recipe requirements 按需创建；GRPO 不创建 |
-| vLLM | 延迟注册和权重版本/refitter 契约已实现 |
-| Agentic RL | 框架控制与用户控制两种 runner，共用 Trajectory |
-| 异步、Ray、工具沙箱 | 暂未纳入最小版本 |
+| Qwen3.5-0.8B + GSM8K + GRPO | 双 Ascend NPU 端到端训练循环已验证 |
+| Colocated rollout | FSDP DP2 + vLLM DP2/TP1 + NPU IPC 已验证 |
+| 在线权重更新 | sleep、train、refit、wake 和 policy version 闭环已验证 |
+| Correctness | Hyper/native 两步学习门禁与 20-step soak 已通过 |
+| Production profile | 已实现；当前 batch-invariant canary 和完整 1,868-step 训练尚未运行 |
+| 精度对齐 | standalone A/B 仍有 sampled-token log-prob 差异，后续单独处理 |
+| PPO/Critic | CPU 数学和能力契约已覆盖，尚未声明 Qwen NPU 端到端完成 |
+| 多节点、colocated TP、异步训练 | 尚未实现 |
 
-## 快速运行
+“端到端训练循环已验证”表示已经真实执行 rollout、reward、backward、optimizer step、vLLM refit 和版本推进；
+不表示 checkpoint/resume、完整 GSM8K 训练或收敛已经完成。
 
-仓库、模型和数据放在同一父目录：
+## 运行环境
+
+已验证环境：
+
+- 2 张 Ascend 910B3 NPU；
+- CANN 9.0.0；
+- Docker 镜像 `hyper-parallel/unified-e2-dev:v0.22.1rc1`；
+- Torch/torch-npu 2.10.0；
+- vLLM 0.22.1、vLLM-Ascend 0.22.1rc1；
+- Qwen3.5-0.8B-Base；
+- 包含 `prompt` 和 `extra_info` 列的 GSM8K parquet 数据。
+
+建议目录：
 
 ```text
-workspace/
-├── hyper-parallel/
-├── models/Qwen3.5-0.8B/
-└── gsm8k/
-    ├── train-00000-of-00001.parquet
-    └── test-00000-of-00001.parquet
+<workspace>/
+├── hyper-rl/
+├── models/Qwen3.5-0.8B-Base/
+└── data/gsm8k/
+    ├── train.parquet
+    └── test.parquet
 ```
 
-快速 smoke 会生成每个 prompt 2 个 response、每条最多 32 tokens，用于验证完整链路：
+通用安装文档和旧 Hyper 内置生成环境不是本次 vLLM 验收环境。固定版本、镜像 ID、模型/数据哈希和插件要求见
+[Qwen3.5 vLLM 兼容与实验基线](docs/vllm_compatibility.md)。
+
+## 基础运行
+
+在仓库根目录设置统一 launcher 环境：
 
 ```bash
-cd hyper-parallel
-HYPER_RL_CONFIG=/workspace/hyper-parallel/hyper_parallel/rl/examples/configs/local_qwen3_5_0_8b_gsm8k_smoke.yaml \
-  ./hyper_parallel/rl/examples/scripts/run_qwen3_5_0_8b_gsm8k_docker.sh
+export HYPER_VLLM_IMAGE=hyper-parallel/unified-e2-dev:v0.22.1rc1
+export HYPER_VLLM_MODEL_ROOT="$(pwd)/../models/Qwen3.5-0.8B-Base"
+export HYPER_VLLM_DATA_ROOT="$(pwd)/../data/gsm8k"
+export HYPER_VLLM_RESULT_ROOT="$(pwd)/.rollout-results/qwen35-grpo"
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export HCCL_IF_BASE_PORT=62000
+export HCCL_NPU_SOCKET_PORT_RANGE=62000-62100
 ```
 
-有效更新 smoke 默认生成每个 prompt 6 个 response、每条最多 300 tokens：
+先运行最小 colocated 系统 smoke：
 
 ```bash
-./hyper_parallel/rl/examples/scripts/run_qwen3_5_0_8b_gsm8k_docker.sh
+./hyper_parallel/rl/examples/scripts/run_qwen3_5_vllm_docker.sh \
+  grpo-colocated-dp-smoke
 ```
 
-Docker launcher 会根据仓库目录名生成容器内路径；如果仓库不叫 `hyper-parallel`，可让 `HYPER_RL_CONFIG` 保持未设置，使用自动推导的默认配置。
+再准备 M3 固定数据并运行两步学习门禁：
 
-“6 份 rollout”是 GRPO 的 group size，不是 6 个 worker。快速配置用 2 验证链路，默认配置用 6 提供更有意义的组内相对奖励。
+```bash
+./hyper_parallel/rl/examples/scripts/run_qwen3_5_vllm_docker.sh grpo-m3-select
+./hyper_parallel/rl/examples/scripts/run_qwen3_5_vllm_docker.sh grpo-m3-2step
+```
 
-## 结构
+详细命令、并行作业隔离、20-step soak 和 experimental production profile 见
+[Qwen3.5 + GRPO 复现指南](docs/reproduce_grpo.md)。
+
+## 验收边界
+
+| Action | Exit 0 证明 | 不证明 |
+|---|---|---|
+| `grpo-colocated-dp-smoke` | sleep/train/IPC/refit 系统闭环 | 非零梯度或收敛 |
+| `grpo-m3-2step` | mixed reward、非零梯度、norm 探针变化和 version 1/2 | GSM8K 收敛 |
+| `grpo-m3-soak` | 20-step 生命周期稳定 | 每步梯度都非零 |
+| `production-benchmark` | standalone 并发数值与吞吐 A/B | colocated 完整训练可用 |
+| `grpo-production-canary` | production-shaped 单步生命周期 | 数值对齐或完整训练 |
+| `grpo-production` | 完整 profile 执行 | 当前尚无成功运行证据 |
+
+最新真实硬件结果、已知问题和未完成门禁见
+[vLLM 在线 Rollout 故障记录与验收状态](docs/vllm_online_rollout_status.md)。
+
+## 代码结构
 
 ```text
-hyper_parallel/
-└── rl/               # Hyper-RL 工程
-    ├── README.md
-    ├── rl/           # Python 包
-    │   ├── dataset/  # adapters、data source、batch builder
-    │   ├── roles/    # Policy、Rollout、WeightSync
-    │   ├── algorithm/# GRPO/PPO Recipe、组件与 reward
-    │   ├── agentic/  # Environment、AgentRunner、ProgramAgentRunner
-    │   ├── utils/    # monitoring 等公共工具
-    │   ├── trainer.py
-    │   └── async_trainer.py
-    ├── examples/
-    ├── tests/
-    └── docs/
+hyper_parallel/rl/
+├── rl/
+│   ├── algorithm/       # GRPO/PPO recipes
+│   ├── dataset/         # prompt data and batch construction
+│   ├── roles/rollout/   # Hyper/vLLM engines and weight refit
+│   ├── agentic/         # environments and runners
+│   └── trainer.py       # synchronous training lifecycle
+├── examples/
+├── tests/
+└── docs/
 ```
 
-核心数据流：
-
-```text
-PromptRecord
-  → AgentRunner / ProgramAgentRunner
-  → Trajectory
-  → ExperienceBuilder
-  → GRPOAlgorithm / PPOAlgorithm
-  → ActorManager (+ CriticManager when required)
-```
-
-算法是完整 Recipe，而不是用户任意拼装数学组件。Trainer 只读取 Recipe 的 requirements，因此新增 XPO 一般只需实现并注册 Recipe，不需要修改训练主循环。
-
-## 验证
-
-最终代码已通过：
-
-- 51 项 CPU/契约测试；
-- 双卡 Qwen3.5-0.8B + GRPO 快速 smoke；
-- 128 个 action token，1 次 optimizer step，峰值分配显存约 7.60 GiB；
-- 默认 6×300 配置曾得到非零 reward、policy gradient 和 optimizer update。
-
-短 smoke 的随机 batch 可能全部同奖励，此时 GRPO advantage 与梯度为零是正确结果；验证有效学习信号请运行默认配置。
-
-## 当前边界
-
-PPO/Critic 已覆盖 CPU 数学和能力契约，但尚未声明 Qwen PPO NPU 端到端完成。Critic checkpoint 未接入，因此 PPO 保存/恢复会 fail-fast。vLLM adapter 已注册，但同步 Trainer 会在没有真实部署 refitter 时拒绝多步在线训练，避免把未同步权重误标为新策略版本。
+旧 `run_qwen3_5_0_8b_gsm8k_docker.sh` 使用 `rollout.engine=hyper` 的 Hyper 内置生成后端，仍作为兼容入口保留，
+但不是当前 colocated vLLM 主线。这里的“内置生成”不表示 vLLM 的 `model_implementation=native`。
 
 ## 文档
 
 - [架构设计](docs/architecture.md)
 - [代码结构](docs/code_structure.md)
-- [与 Slime、RL2、Molt 对比](docs/comparison.md)
-- [Qwen3.5 + GRPO 复现](docs/reproduce_grpo.md)
+- [Qwen3.5 + GRPO 复现指南](docs/reproduce_grpo.md)
+- [Qwen3.5 vLLM 兼容与实验基线](docs/vllm_compatibility.md)
+- [vLLM 在线 Rollout 故障记录与验收状态](docs/vllm_online_rollout_status.md)

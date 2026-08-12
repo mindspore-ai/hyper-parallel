@@ -15,10 +15,14 @@
 """Contract tests for the minimal extensible architecture."""
 
 import asyncio
+import json
+import os
+from pathlib import Path
 import sys
 import types
 from typing import Any
 
+import pytest
 import torch
 
 from rl.agentic import (
@@ -41,7 +45,12 @@ from rl.roles.rollout import (
     PolicySnapshot,
     build_rollout_engine,
 )
-from rl.roles.rollout.vllm import VLLMGenerationEngine
+from rl.roles.rollout.vllm import (
+    CPUStateDictRefitter,
+    HCCLWeightRefitter,
+    VLLMGenerationEngine,
+)
+from rl.roles.rollout import vllm as vllm_backend
 
 
 def test_async_trainer_fails_fast_until_ray_runtime_exists() -> None:
@@ -69,6 +78,85 @@ def test_hyper_and_vllm_engines_are_registered_and_vllm_is_lazy() -> None:
     assert engine.client_initialized is False
 
 
+@pytest.mark.parametrize(
+    ("model_implementation", "expected_architecture"),
+    (
+        ("hyper", "HyperQwen3_5ForCausalLM"),
+        ("native", "Qwen3_5ForConditionalGeneration"),
+    ),
+)
+def test_vllm_server_selects_qwen_architecture(
+    monkeypatch,
+    model_implementation: str,
+    expected_architecture: str,
+) -> None:
+    """The unified server path must select the requested validated model."""
+    process_calls = []
+    client_calls = []
+
+    class Process:
+        """Capture process construction without launching vLLM."""
+
+    def popen(command: list[str], **kwargs: Any) -> Process:
+        process_calls.append((command, kwargs))
+        return Process()
+
+    class HTTPClient:
+        """Capture readiness configuration for the external server."""
+
+        def __init__(self, process: Process, base_url: str, model_name: str, request_timeout: float) -> None:
+            client_calls.append((process, base_url, model_name, request_timeout))
+
+        @staticmethod
+        def wait_ready(startup_timeout: float) -> None:
+            client_calls.append(("wait_ready", startup_timeout))
+
+        @staticmethod
+        def close() -> None:
+            raise AssertionError("A successful server startup must not close the client")
+
+    monkeypatch.setattr(vllm_backend.subprocess, "Popen", popen)
+    monkeypatch.setattr(vllm_backend, "_VLLMHTTPClient", HTTPClient)
+    monkeypatch.setattr(vllm_backend, "_open_port", lambda: 8123)
+    model = ModelRegistration("qwen", "qwen3_5", "/model", "/tokenizer")
+    engine = VLLMGenerationEngine(
+        model,
+        {
+            "vllm": {
+                "tensor_parallel_size": 2,
+                "gpu_memory_utilization": 0.4,
+                "visible_devices": "4,5",
+                "model_implementation": model_implementation,
+                "batch_invariant": True,
+                "skip_mm_profiling": True,
+            }
+        },
+    )
+
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("RANK", "0")
+    engine._ensure_client()  # pylint: disable=protected-access
+
+    command, process_kwargs = process_calls[0]
+    assert command[:5] == [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", "/model"]
+    assert command[command.index("--tokenizer") + 1] == "/tokenizer"
+    assert command[command.index("--tensor-parallel-size") + 1] == "2"
+    assert command[command.index("--gpu-memory-utilization") + 1] == "0.4"
+    assert "--skip-mm-profiling" in command
+    assert command[command.index("--hf-overrides") + 1] == json.dumps(
+        {"architectures": [expected_architecture]}
+    )
+    assert process_kwargs["env"]["ASCEND_RT_VISIBLE_DEVICES"] == "4,5"
+    assert process_kwargs["env"]["VLLM_BATCH_INVARIANT"] == "1"
+    assert "RANK" not in process_kwargs["env"]
+    assert process_kwargs["shell"] is False
+    assert process_kwargs["start_new_session"] is True
+    assert client_calls[0][1:] == ("http://127.0.0.1:8123", "qwen", 600.0)
+    assert client_calls[1] == ("wait_ready", 300.0)
+    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "0,1"
+    assert os.environ["RANK"] == "0"
+
+
 def test_vllm_adapter_returns_explicit_variable_length_mask(monkeypatch) -> None:
     """Verify that vLLM completions preserve their explicit valid-token masks."""
     class SamplingParams:
@@ -76,8 +164,14 @@ def test_vllm_adapter_returns_explicit_variable_length_mask(monkeypatch) -> None
             """Capture vLLM sampling keyword arguments."""
             self.kwargs = kwargs
 
+    class TokensPrompt:
+        def __init__(self, prompt_token_ids: list[int]) -> None:
+            """Capture one pre-tokenized vLLM prompt."""
+            self.prompt_token_ids = prompt_token_ids
+
     fake_module = types.ModuleType("vllm")
     fake_module.SamplingParams = SamplingParams
+    fake_module.TokensPrompt = TokensPrompt
     monkeypatch.setitem(sys.modules, "vllm", fake_module)
 
     def completion(tokens: list[int]) -> types.SimpleNamespace:
@@ -87,12 +181,14 @@ def test_vllm_adapter_returns_explicit_variable_length_mask(monkeypatch) -> None
     class Client:
         def generate(
             self,
-            prompt_token_ids: list[list[int]],
+            prompts: list[TokensPrompt],
             sampling_params: SamplingParams,
+            use_tqdm: bool,
         ) -> list[Any]:
             """Return deterministic variable-length completions."""
-            assert prompt_token_ids == [[1, 2], [3]]
+            assert [prompt.prompt_token_ids for prompt in prompts] == [[1, 2], [3]]
             assert sampling_params.kwargs["max_tokens"] == 4
+            assert use_tqdm is False
             return [
                 types.SimpleNamespace(outputs=[completion([7, 8])]),
                 types.SimpleNamespace(outputs=[completion([9])]),
@@ -131,6 +227,254 @@ def test_vllm_advances_version_only_after_a_real_refit() -> None:
     engine.update_weights(PolicySnapshot(1, "qwen", payload={"weight": 1}))
     assert calls == [(client, 1)]
     assert engine.policy_version == 1
+
+
+def test_vllm_cpu_refitter_reloads_workers_and_resets_cache() -> None:
+    """The initial online path must publish complete CPU tensors before acknowledgement."""
+    calls = []
+
+    class Client:
+        """Record the synchronous vLLM weight reload contract."""
+
+        @staticmethod
+        def collective_rpc(method: str, kwargs: dict[str, Any]) -> list[None]:
+            checkpoint = Path(kwargs["weights_path"]) / "model.safetensors"
+            calls.append((method, kwargs, checkpoint.is_file()))
+            return [None]
+
+        @staticmethod
+        def reset_prefix_cache(**kwargs: bool) -> bool:
+            calls.append(("reset_prefix_cache", kwargs))
+            return True
+
+    source = torch.tensor([1.0], requires_grad=True)
+    snapshot = PolicySnapshot(1, "qwen", payload={"weight": source})
+
+    CPUStateDictRefitter().refit(Client(), snapshot)
+
+    method, kwargs, checkpoint_existed = calls[0]
+    assert method == "reload_weights"
+    assert kwargs["is_checkpoint_format"] is True
+    assert checkpoint_existed is True
+    assert "weights_iterator" not in kwargs
+    assert calls[1] == (
+        "reset_prefix_cache",
+        {"reset_running_requests": True, "reset_connector": False},
+    )
+
+
+def test_vllm_cpu_refitter_gathers_the_unwrapped_actor(monkeypatch) -> None:
+    """FSDP publication must gather the native module rather than the generation facade."""
+    module = object()
+    actor = types.SimpleNamespace(module=module)
+    calls = []
+
+    def get_model_state_dict(model: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append((model, kwargs))
+        return {"weight": torch.tensor([2.0])}
+
+    monkeypatch.setattr(vllm_backend.platform, "get_model_state_dict", get_model_state_dict)
+
+    state_dict = CPUStateDictRefitter._cpu_state_dict(actor)  # pylint: disable=protected-access
+
+    assert state_dict["weight"].device.type == "cpu"
+    assert calls[0][0] is module
+    assert calls[0][1] == {"full_state_dict": True, "cpu_offload": False}
+
+
+def test_vllm_hccl_refitter_synchronizes_optimizer_stream(monkeypatch) -> None:
+    """Packed HCCL streams must not read parameters before optimizer writes finish."""
+    calls = []
+
+    class Tensor:
+        dtype = torch.bfloat16
+        shape = (1,)
+
+        @staticmethod
+        def numel() -> int:
+            return 1
+
+        @staticmethod
+        def element_size() -> int:
+            return 2
+
+    class Client(vllm_backend._VLLMHTTPClient):  # pylint: disable=protected-access
+        def __init__(self) -> None:
+            pass
+
+        @staticmethod
+        def pause() -> None:
+            calls.append("pause")
+
+        @staticmethod
+        def start_weight_update() -> None:
+            calls.append("start")
+
+        @staticmethod
+        def receive_weights(_update_info: dict[str, Any]) -> None:
+            calls.append("receive")
+
+        @staticmethod
+        def finish_weight_update() -> None:
+            calls.append("finish")
+
+        @staticmethod
+        def get_policy_weight_fingerprints(version: int) -> list[dict[str, Any]]:
+            calls.append(("fingerprint", version))
+            return [
+                {
+                    "algorithm": "qwen3_5_norms_f32_v1",
+                    "tensor_count": 1,
+                    "value_count": 1,
+                    "digest": "digest",
+                }
+            ]
+
+        @staticmethod
+        def resume() -> None:
+            calls.append("resume")
+
+    class TrainerArgs:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class TransferEngine:
+        @staticmethod
+        def trainer_send_weights(iterator: Any, trainer_args: TrainerArgs) -> None:
+            list(iterator)
+            assert trainer_args.kwargs["packed"] is True
+            calls.append("send")
+
+    transfer_module = types.ModuleType(
+        "vllm_ascend.distributed.weight_transfer.hccl_engine"
+    )
+    transfer_module.HCCLTrainerSendWeightsArgs = TrainerArgs
+    transfer_module.HCCLWeightTransferEngine = TransferEngine
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.distributed.weight_transfer.hccl_engine",
+        transfer_module,
+    )
+    monkeypatch.setattr(
+        vllm_backend.platform,
+        "get_current_stream",
+        lambda: types.SimpleNamespace(synchronize=lambda: calls.append("synchronize")),
+    )
+    monkeypatch.setattr(
+        HCCLWeightRefitter,
+        "_device_state_dict",
+        staticmethod(lambda _payload: {"weight": Tensor()}),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_policy_weight_fingerprint",
+        lambda _state_dict: {
+            "algorithm": "qwen3_5_norms_f32_v1",
+            "tensor_count": 1,
+            "value_count": 1,
+            "digest": "digest",
+        },
+    )
+    refitter = HCCLWeightRefitter()
+    refitter._group = object()  # pylint: disable=protected-access
+
+    refitter.refit(Client(), PolicySnapshot(1, "qwen", payload=object()))
+
+    assert calls.index("synchronize") < calls.index("send")
+    assert calls[-3:] == ["finish", ("fingerprint", 1), "resume"]
+
+
+def test_vllm_does_not_acknowledge_refit_when_cache_reset_fails() -> None:
+    """A stale prefix cache must prevent committing the next policy version."""
+    class Client:
+        """Accept weights but reject cache invalidation."""
+
+        @staticmethod
+        def collective_rpc(method: str, kwargs: dict[str, Any]) -> list[None]:
+            del method, kwargs
+            return [None]
+
+        @staticmethod
+        def reset_prefix_cache(**kwargs: bool) -> bool:
+            del kwargs
+            return False
+
+    model = ModelRegistration("qwen", "qwen3_5", "/model", "/model")
+    engine = VLLMGenerationEngine(
+        model,
+        {"vllm": {}},
+        client=Client(),
+        refitter=CPUStateDictRefitter(),
+    )
+
+    try:
+        engine.update_weights(
+            PolicySnapshot(1, "qwen", payload={"weight": torch.tensor([1.0])})
+        )
+    except RuntimeError as error:
+        assert "prefix cache" in str(error)
+    else:
+        raise AssertionError("A failed cache reset must reject the policy update")
+    assert engine.policy_version == 0
+
+
+def test_vllm_refit_stops_before_cache_reset_when_reload_fails() -> None:
+    """A worker reload error must keep the old version and skip cache mutation."""
+    calls = []
+
+    class Client:
+        """Reject weight loading before cache reset."""
+
+        @staticmethod
+        def collective_rpc(method: str, kwargs: dict[str, Any]) -> list[None]:
+            del method, kwargs
+            calls.append("reload")
+            raise RuntimeError("worker load failed")
+
+        @staticmethod
+        def reset_prefix_cache(**kwargs: bool) -> bool:
+            del kwargs
+            calls.append("reset")
+            return True
+
+    model = ModelRegistration("qwen", "qwen3_5", "/model", "/model")
+    engine = VLLMGenerationEngine(
+        model,
+        {"vllm": {}},
+        client=Client(),
+        refitter=CPUStateDictRefitter(),
+    )
+
+    try:
+        engine.update_weights(
+            PolicySnapshot(1, "qwen", payload={"weight": torch.tensor([1.0])})
+        )
+    except RuntimeError as error:
+        assert "worker load failed" in str(error)
+    else:
+        raise AssertionError("A failed worker reload must reject the policy update")
+    assert calls == ["reload"]
+    assert engine.policy_version == 0
+
+
+def test_vllm_refit_propagates_remote_rank_failure(monkeypatch) -> None:
+    """A successful local reload must not commit when another training rank failed."""
+    monkeypatch.setattr(vllm_backend.platform, "get_world_size", lambda: 2)
+
+    def all_gather_object(outputs: list[Any], local_error: Any) -> None:
+        outputs[:] = [local_error, "rank 1 failed"]
+
+    monkeypatch.setattr(vllm_backend.platform, "all_gather_object", all_gather_object)
+
+    try:
+        CPUStateDictRefitter._synchronize_error(  # pylint: disable=protected-access
+            None,
+            "weight reload",
+        )
+    except RuntimeError as error:
+        assert "rank 1 failed" in str(error)
+    else:
+        raise AssertionError("A remote refit error must fail the local rank")
 
 
 def test_vllm_refuses_to_acknowledge_unloaded_policy_version() -> None:

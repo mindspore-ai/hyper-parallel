@@ -30,6 +30,7 @@ class GenerationSettings:
     pad_token_id: int
     eos_token_id: int
     collect_log_probs: bool = False
+    seed: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -56,5 +57,11 @@ class GenerationEngine(Protocol):
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate responses for one backend-neutral request."""
 
+    def prepare_for_training(self) -> None:
+        """Release inference residency before the synchronous training phase."""
+
     def update_weights(self, snapshot: PolicySnapshot) -> None:
         """Load and acknowledge a strictly newer policy snapshot."""
+
+    def prepare_for_rollout(self) -> None:
+        """Restore inference residency after publishing the next policy."""

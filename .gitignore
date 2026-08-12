@@ -3,6 +3,7 @@ build/
 output/
 dist/
 *.egg-info/
+hyper_parallel/.commit_id
 *.ir
 st_tests
 kernel_meta/
@@ -27,7 +28,8 @@ vendors/
 venv/
 .ipynb_checkpoints/
 
-# Test results
+# Test and local run results
+.rollout-results/
 *.dot
 *.dat
 *.svg
