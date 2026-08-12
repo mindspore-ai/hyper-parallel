@@ -42,6 +42,11 @@ class TrainingConfig:
     loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"
     seed: Optional[int] = None
     enable_full_determinism: bool = False
+    gc_steps: int = 0
+    empty_cache_steps: int = 0
+    eval_steps: int = 0
+    eval_epochs: int = 0
+    logging_steps: int = 1
 
 
 @dataclass
@@ -413,9 +418,10 @@ class TrainerConfig:
 
     model: Target[Any]
     optimizer: Target[Optimizer]
-    lr_scheduler: Target[Any]
 
     tokenizer: Optional[Target[PreTrainedTokenizerBase]] = None
+    lr_scheduler: Optional[Target[Any]] = None
+    loss_fn: Optional[Target[Any]] = None
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # parallelism configs

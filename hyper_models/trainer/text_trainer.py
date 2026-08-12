@@ -41,6 +41,7 @@ class TextTrainer:
 
         self.base._setup()
         self.base._build_model()
+        self.base._build_loss()
 
         self._build_model_assets()
         self.base._build_data_transform()
