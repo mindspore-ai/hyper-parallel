@@ -291,10 +291,11 @@ class DTensor(DTensorBase):
             run_check (bool, optional): When ``True``, perform cross-rank metadata
                 checks and broadcast replicate placements from the mesh source rank.
                 Default: ``False``.
-            shape (tuple[int, ...], optional): Global DTensor shape hint for uneven
-                sharding when ``run_check=True``. Reserved for future use.
-            stride (tuple[int, ...], optional): Global stride hint. Reserved for
-                future use together with ``shape``.
+            shape (tuple[int, ...], optional): Explicit logical global shape.
+                This is required when local shard shapes do not evenly imply the
+                global shape.
+            stride (tuple[int, ...], optional): Explicit logical global stride.
+                Must be provided together with ``shape``.
 
         Returns:
             DTensor: A new DTensor instance.
@@ -305,10 +306,12 @@ class DTensor(DTensorBase):
             >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
             >>> dtensor = DTensor.from_local(local_tensor, mesh, ("dp", "None"))
         """
+        if (shape is None) != (stride is None):
+            raise ValueError("shape and stride must be provided together")
+        layout = _build_layout(device_mesh, placements, len(local_tensor.shape))
         if run_check:
             # pylint: disable=C0415
             from hyper_parallel.core.dtensor._from_local_utils import run_from_local_checks
-            layout = _build_layout(device_mesh, placements, len(local_tensor.shape))
             run_from_local_checks(
                 local_tensor,
                 device_mesh,
@@ -316,7 +319,10 @@ class DTensor(DTensorBase):
                 shape=shape,
                 stride=stride,
             )
-        return DTensor(local_tensor, device_mesh, placements)
+        if shape is not None:
+            layout = cp.deepcopy(layout)
+            layout.set_tensor_meta(shape, stride, local_tensor.dtype)
+        return DTensor(local_tensor, device_mesh, placements, layout)
 
     @staticmethod
     def from_local_with_layout(local_tensor: Tensor, layout: Layout) -> 'DTensor':
@@ -344,8 +350,21 @@ class DTensor(DTensorBase):
     def _from_converted_local(self, local_tensor: Tensor) -> 'DTensor':
         """Rebuild converted DTensor data without preserving Parameter identity."""
         cls = DTensor if isinstance(self, platform.Parameter) else self.__class__
-        return cls(local_tensor, device_mesh=self._device_mesh,
-                   placements=self._alias_placements())
+        if not isinstance(self._layout, Layout):
+            return cls(
+                local_tensor,
+                device_mesh=self._device_mesh,
+                placements=self._alias_placements(),
+            )
+        layout = cp.deepcopy(self._layout)
+        if layout.tensor_shape is not None:
+            layout.set_tensor_meta(layout.tensor_shape, layout.tensor_stride, local_tensor.dtype)
+        return cls(
+            local_tensor,
+            device_mesh=self._device_mesh,
+            placements=layout.placements,
+            layout=layout,
+        )
 
     def to(self, *args, **kwargs):
         """Move the DTensor to a different device or dtype.

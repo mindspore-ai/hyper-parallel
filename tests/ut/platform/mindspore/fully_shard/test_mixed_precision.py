@@ -62,9 +62,9 @@ from hyper_parallel.platform.mindspore.fully_shard.param import (
 
 
 def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
-    """Bare :class:`MindSporeHSDPParamV2` with ``all_gather_outputs`` initialized."""
+    """Bare :class:`MindSporeHSDPParamV2` with ``unsharded_param_buffers`` initialized."""
     obj = object.__new__(MindSporeHSDPParamV2)
-    obj.all_gather_outputs = []
+    obj.unsharded_param_buffers = []
     obj.enable_fsdp_shard = True
     obj.mp_policy = MixedPrecisionPolicy()
     return obj

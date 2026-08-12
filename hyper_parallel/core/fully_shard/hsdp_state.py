@@ -13,16 +13,19 @@
 # limitations under the License.
 # ============================================================================
 """HSDP cell state"""
-from typing import List, Tuple, Union
+from typing import List, Set, Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
-from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2, ShardedState
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy, CommFusionPolicy
 from hyper_parallel.tools.logging import get_logger
 
 logger = get_logger("FSDP")
 
 platform = get_platform()
+
+ModuleClass = platform.Module
+ParameterClass = platform.Parameter
 
 
 class HSDPState:
@@ -33,36 +36,61 @@ class HSDPState:
     pre_reduce_scatter_params = []
     pre_all_reduce_params = []
 
-    def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh_info,
-                 config: HSDPConfigV2, platform_impl, device=None):
+    def __init__(
+        self,
+        cell: Union[ModuleClass, Tuple[ModuleClass, ...]],
+        mesh,
+        shard_placement_fn,
+        comm_fusion_policy: CommFusionPolicy,
+        mp_policy: MixedPrecisionPolicy,
+        offload_policy: OffloadPolicy,
+        raw_ignored_params: Set[ParameterClass],
+        raw_replicate_params: set[ParameterClass],
+        platform_impl,
+        device=None,
+    ):
         """
         Initialize HSDPState.
 
         Args:
-            cell (platform.Module or Tuple[platform.Module, ...]): The module(s) whose parameters
-                are managed by this state. When a tuple is passed, all modules are
-                treated as one FSDP unit.
-            mesh_info: Mesh topology for shard/replicate dimensions.
-            config (HSDPConfigV2): HSDP configuration (mesh, mp_policy, offload_policy, etc.).
+            cell: Module or modules managed as one fully_shard unit.
+            mesh: Explicit data-parallel device mesh.
+            shard_placement_fn: Optional function selecting the parameter shard dimension.
+            comm_fusion_policy: Communication fusion configuration.
+            mp_policy: Mixed-precision policy.
+            offload_policy: Parameter offload policy.
+            raw_ignored_params: Parameters excluded from fully_shard management.
+            raw_replicate_params: Managed parameters that remain replicated.
             platform_impl: Platform abstraction layer (Torch or MindSpore).
-            device (torch.device, optional): Target device for parameters.
+            device: Optional target device for parameters.
         """
         self.modules = (cell,) if isinstance(cell, platform.Module) else tuple(cell)
         self.cell = self.modules[0]
-        self.mesh_info = mesh_info
-        self.config = config
-        self.mp_policy = config.mp_policy
-        self.offload_policy = config.offload_policy
+        self.mesh = mesh
+        self.shard_placement_fn = shard_placement_fn
+        self.mp_policy = mp_policy
+        self.offload_policy = offload_policy
+        self.comm_fusion_policy = comm_fusion_policy
+        self.raw_ignored_params = set(raw_ignored_params or ())
+        self.raw_replicate_params = set(raw_replicate_params or ())
         self.platform = platform_impl
         self.device = device
         self.hsdp_params: List[HSDPParamV2] = []
-        self.sharded_hsdp_params: List[HSDPParamV2] = []
-        self.replicate_params: List[HSDPParamV2] = []
+        self.param_group = None
         self._move_states_to_device()
         self._init_hsdp_params()
         self.is_shard = True
-        self.is_replicate_shard = True
         self.module_name = None
+        # requires_gradient_sync
+        self.reduce_grads = True
+        # Reshard parameter after backward
+        self.reshard_after_backward = True
+        # Requires AllReduce for grad When HSDP
+        self.requires_all_reduce = True
+        # Default reduce op is decided at the fully_shard-state level:
+        # if all parameters have source-layout metadata, use SUM; otherwise AVG.
+        self.reduce_op_type = self._resolve_default_reduce_op()
+        self._reset_sharded_params = False
 
     def __repr__(self) -> str:
         """Stable debug name used in log lines.
@@ -83,103 +111,63 @@ class HSDPState:
         """move states to device"""
         raise NotImplementedError("HSDPState subclasses must implement _move_states_to_device")
 
-    def _assert_replicate_params_unsharded(self) -> None:
-        """Validate replicate params are already materialized when state says so."""
-        for param in self.replicate_params:
-            sharded_state = getattr(param, "sharded_state", None)
-            if sharded_state != ShardedState.UNSHARDED:
-                param_fqn = getattr(param, "_param_fqn", "<unknown>")
-                raise AssertionError(
-                    f"Expected replicate parameter {param_fqn} to be "
-                    f"{ShardedState.UNSHARDED}, got {sharded_state}"
-                )
-
-    def shard(self, shard_replicate: bool = True):
+    def shard(self) -> None:
         """change parameters to sharded state"""
         logger.debug(
-            "action=reshard module=%s shard_params=%s replicate_params=%s shard_replicate=%s",
+            "action=reshard module=%s params=%s",
             self,
-            self.sharded_hsdp_params,
-            self.replicate_params,
-            shard_replicate,
+            self.hsdp_params,
         )
-        if not self.is_shard:
-            for param in self.sharded_hsdp_params:
-                param.to_sharded()
-            self.is_shard = True
-        if shard_replicate and not self.is_replicate_shard:
-            for param in self.replicate_params:
-                param.to_sharded()
-            self.is_replicate_shard = True
+        if self.is_shard:
+            return
+        for param in self.hsdp_params:
+            param.to_sharded()
+        self.is_shard = True
 
-    def unshard(self, async_op=False, unshard_replicate: bool = True):
+    def unshard(self, async_op: bool = False) -> None:
         """change parameters to unsharded state"""
         logger.debug(
-            "action=unshard module=%s async_op=%s shard_params=%s replicate_params=%s unshard_replicate=%s",
+            "action=unshard module=%s async_op=%s params=%s",
             self,
             async_op,
-            self.sharded_hsdp_params,
-            self.replicate_params,
-            unshard_replicate,
+            self.hsdp_params,
         )
-        if not self.is_shard and (not unshard_replicate or not self.is_replicate_shard):
-            if unshard_replicate:
-                self._assert_replicate_params_unsharded()
+        if not self.is_shard:
             return
 
-        if unshard_replicate:
-            if self.is_replicate_shard:
-                for param in self.replicate_params:
-                    param.unshard(async_op)
-            else:
-                self._assert_replicate_params_unsharded()
-        if self.is_shard:
-            if self.config.comm_fusion and self.param_group is not None:
-                self.param_group.unshard(async_op)
-            else:
-                for param in self.sharded_hsdp_params:
-                    param.unshard(async_op)
+        if self.comm_fusion_policy.enable_comm_fusion and self.param_group is not None:
+            self.param_group.unshard(async_op)
+        else:
+            for param in self.hsdp_params:
+                param.unshard(async_op)
         if not async_op:
-            self.wait_for_unshard(unshard_replicate)
+            self.wait_for_unshard()
 
-    def prefetch(self, unshard_replicate: bool = True):
+    def prefetch(self) -> None:
         """prefetch unsharded parameters"""
         logger.debug(
-            "action=prefetch module=%s shard_params=%s replicate_params=%s unshard_replicate=%s",
+            "action=prefetch module=%s params=%s",
             self,
-            self.sharded_hsdp_params,
-            self.replicate_params,
-            unshard_replicate,
+            self.hsdp_params,
         )
-        self.unshard(async_op=True, unshard_replicate=unshard_replicate)
+        self.unshard(async_op=True)
 
-    def wait_for_unshard(self, wait_for_replicate: bool = True):
+    def wait_for_unshard(self) -> None:
         """wait for all unshard parameters"""
         logger.debug(
-            "action=wait_unshard module=%s shard_params=%s replicate_params=%s wait_for_replicate=%s",
+            "action=wait_unshard module=%s params=%s",
             self,
-            self.sharded_hsdp_params,
-            self.replicate_params,
-            wait_for_replicate,
+            self.hsdp_params,
         )
-        if not self.is_shard and (not wait_for_replicate or not self.is_replicate_shard):
-            if wait_for_replicate:
-                self._assert_replicate_params_unsharded()
+        if not self.is_shard:
             return
-        if wait_for_replicate:
-            if self.is_replicate_shard:
-                for param in self.replicate_params:
-                    param.wait_for_unshard()
-                self.is_replicate_shard = False
-            else:
-                self._assert_replicate_params_unsharded()
-        if self.is_shard:
-            if self.config.comm_fusion and self.param_group is not None:
-                self.param_group.wait_for_unshard()
-            else:
-                for param in self.sharded_hsdp_params:
-                    param.wait_for_unshard()
-            self.is_shard = False
+
+        if self.comm_fusion_policy.enable_comm_fusion and self.param_group is not None:
+            self.param_group.wait_for_unshard()
+        else:
+            for param in self.hsdp_params:
+                param.wait_for_unshard()
+        self.is_shard = False
 
     def set_gradient_scaling_factor(self, factor):
         """Propagate the gradient scaling factor to the layer that applies it.
@@ -188,13 +176,14 @@ class HSDPState:
         for the fused (comm_fusion) path, or per-parameter ``reduce_scatter_grad``
         / ``all_reduce_grad`` otherwise. The state does not hold a copy.
         """
-        param_group = getattr(self, "param_group", None)
-        if param_group is not None:
-            param_group.gradient_scaling_factor = factor
+        if self.param_group is not None:
+            self.param_group.gradient_scaling_factor = factor
         else:
-            for hsdp_param in self._iter_managed_params():
+            for hsdp_param in self.hsdp_params:
                 hsdp_param.gradient_scaling_factor = factor
 
-    def _iter_managed_params(self):
-        """Return all fully_shard-managed parameters, including replicate_params."""
-        return [*self.hsdp_params, *self.replicate_params]
+    def set_requires_all_reduce(self, requires_all_reduce: bool) -> None:
+        """Propagate the HSDP all-reduce switch to the active communication path."""
+        self.requires_all_reduce = requires_all_reduce
+        if self.param_group is not None:
+            self.param_group.requires_all_reduce = requires_all_reduce

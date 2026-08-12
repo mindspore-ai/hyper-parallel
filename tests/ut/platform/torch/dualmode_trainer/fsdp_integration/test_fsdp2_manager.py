@@ -243,6 +243,7 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
 
     first_layer_metadata = fully_shard_calls[0][1]["tp_grad_infos"]
     assert first_layer_metadata[first_layer.proj.weight].placements == (Shard(0),)
+    assert first_layer_metadata[first_layer.proj.weight].origin_is_dtensor is False
     second_layer_metadata = fully_shard_calls[1][1]["tp_grad_infos"]
     assert second_layer_metadata[second_layer.proj.weight].placements == (Replicate(),)
 

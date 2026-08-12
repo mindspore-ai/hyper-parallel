@@ -60,7 +60,7 @@ def test_tp_fully_shard_typical_networks():
 def test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone():
     """
     Feature: fully_shard manages pure-TP replicated DTensor parameter gradients.
-    Description: Run a 1D TP-only case with fully_shard(mesh=None) and compare loss/grad with standalone.
+    Description: Run independent size-one DP and world-size TP submeshes and compare with standalone.
     Expectation: Distributed loss and gradients match standalone, without passing replicate_params.
     """
     master_port = 12375

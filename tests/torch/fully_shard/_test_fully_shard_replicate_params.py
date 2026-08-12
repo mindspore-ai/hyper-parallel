@@ -187,7 +187,7 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
 def shard_param_data_parallel(acc_grad=False, **fsdp_kwargs):
     """shard param data parallel"""
     rank, _ = init_dist()
-    step = 4
+    step = 20
     mesh: DeviceMesh = fsdp_kwargs['mesh']
     shard_size = mesh.mesh_shape[-1]
     standalone_loss, standalone_grad = get_standalone_result(step, acc_grad=acc_grad)

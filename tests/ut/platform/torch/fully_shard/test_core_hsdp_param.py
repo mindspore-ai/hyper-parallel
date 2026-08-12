@@ -35,7 +35,7 @@ from hyper_parallel.core.fully_shard.hsdp_param import (
 )
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
-from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState, FullyShardParamMode, ShardedState
+from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState, FullyShardParamMode
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo
 
 
@@ -147,14 +147,14 @@ class TestAbstractMethods(unittest.TestCase):
             partial(HSDPParamV2, None, None, None, None, None, None, None, None),
             partial(param._init_sharded_param, None, None),
             partial(param.init_dtype_attrs, None),
-            partial(param.init_all_gather_outputs, [], [], 1, "cpu"),
+            partial(param.init_unsharded_param_buffers, [], [], 1, "cpu"),
             param.init_unsharded_param,
             param.to_sharded,
             param.to_unsharded,
             partial(param.to_sharded_dtensor, None),
             param.to_accumulated_grad_if_needed,
             param.accumulate_unsharded_grad_if_needed,
-            param.alloc_all_gather_outputs,
+            param.alloc_unsharded_param_buffers,
             param.free_unsharded_param,
             param._get_unsharded_param_data,
             param.unshard,
@@ -360,21 +360,22 @@ class TestCoreState(unittest.TestCase):
     """Cover shared HSDPState transitions with simple parameter doubles."""
 
     def _state(self, *, is_shard):
-        """Create a core HSDPState double with matching shard flags."""
+        """Create a core HSDPState double with managed parameter mocks."""
         state = object.__new__(HSDPState)
         state.is_shard = is_shard
-        state.is_replicate_shard = is_shard
-        state.sharded_hsdp_params = [SimpleNamespace(to_sharded=MagicMock(), unshard=MagicMock(), wait_for_unshard=MagicMock())]
-        state.replicate_params = [
+        state.hsdp_params = [
             SimpleNamespace(
                 to_sharded=MagicMock(),
                 unshard=MagicMock(),
                 wait_for_unshard=MagicMock(),
-                sharded_state=ShardedState.UNSHARDED if not is_shard else ShardedState.SHARDED,
-            )
+            ),
+            SimpleNamespace(
+                to_sharded=MagicMock(),
+                unshard=MagicMock(),
+                wait_for_unshard=MagicMock(),
+            ),
         ]
-        state.hsdp_params = [SimpleNamespace(name="hsdp")]
-        state.config = SimpleNamespace(comm_fusion=False)
+        state.comm_fusion_policy = SimpleNamespace(enable_comm_fusion=False)
         state.param_group = None
         return state
 
@@ -391,48 +392,49 @@ class TestCoreState(unittest.TestCase):
         """Shard should no-op when already sharded and shard all managed params otherwise."""
         sharded = self._state(is_shard=True)
         self.assertIsNone(sharded.shard())
-        sharded.sharded_hsdp_params[0].to_sharded.assert_not_called()
+        for param in sharded.hsdp_params:
+            param.to_sharded.assert_not_called()
 
         unsharded = self._state(is_shard=False)
         unsharded.shard()
-        unsharded.sharded_hsdp_params[0].to_sharded.assert_called_once_with()
-        unsharded.replicate_params[0].to_sharded.assert_called_once_with()
+        for param in unsharded.hsdp_params:
+            param.to_sharded.assert_called_once_with()
         self.assertTrue(unsharded.is_shard)
-
-        unsharded = self._state(is_shard=False)
-        unsharded.shard(shard_replicate=False)
-        unsharded.replicate_params[0].to_sharded.assert_not_called()
 
     def test_unshard_prefetch_and_wait_cover_param_group_and_param_paths(self):
         """Unshard, prefetch, and wait should cover param-group and per-param paths."""
         state = self._state(is_shard=False)
         self.assertIsNone(state.unshard())
-        state.sharded_hsdp_params[0].unshard.assert_not_called()
+        for param in state.hsdp_params:
+            param.unshard.assert_not_called()
 
         state = self._state(is_shard=True)
         state.wait_for_unshard = MagicMock()
-        state.unshard(async_op=False, unshard_replicate=True)
-        state.replicate_params[0].unshard.assert_called_once_with(False)
-        state.sharded_hsdp_params[0].unshard.assert_called_once_with(False)
-        state.wait_for_unshard.assert_called_once_with(True)
+        state.unshard(async_op=False)
+        for param in state.hsdp_params:
+            param.unshard.assert_called_once_with(False)
+        state.wait_for_unshard.assert_called_once_with()
 
         state = self._state(is_shard=True)
-        state.config.comm_fusion = True
+        state.comm_fusion_policy.enable_comm_fusion = True
         state.param_group = SimpleNamespace(unshard=MagicMock(), wait_for_unshard=MagicMock())
-        state.prefetch(unshard_replicate=False)
-        state.replicate_params[0].unshard.assert_not_called()
+        state.prefetch()
+        for param in state.hsdp_params:
+            param.unshard.assert_not_called()
         state.param_group.unshard.assert_called_once_with(True)
 
-        state.wait_for_unshard(wait_for_replicate=False)
-        state.replicate_params[0].wait_for_unshard.assert_not_called()
+        state.wait_for_unshard()
+        for param in state.hsdp_params:
+            param.wait_for_unshard.assert_not_called()
         state.param_group.wait_for_unshard.assert_called_once_with()
         self.assertFalse(state.is_shard)
 
-    def test_wait_for_unshard_early_and_iter_managed_params(self):
-        """Wait-for-unshard should no-op when unsharded and iterate managed params."""
+    def test_wait_for_unshard_returns_early_when_already_unsharded(self):
+        """Wait-for-unshard should no-op when all parameters are unsharded."""
         state = self._state(is_shard=False)
         self.assertIsNone(state.wait_for_unshard())
-        self.assertEqual(state._iter_managed_params(), [*state.hsdp_params, *state.replicate_params])
+        for param in state.hsdp_params:
+            param.wait_for_unshard.assert_not_called()
 
 
 class TestCoreScheduler(unittest.TestCase):
@@ -550,18 +552,17 @@ class TestCoreScheduler(unittest.TestCase):
         hsdp_param = SimpleNamespace(sharded_param=sharded_param)
         hsdp_state = SimpleNamespace(
             lazy_init=MagicMock(),
-            _iter_managed_params=MagicMock(return_value=[hsdp_param]),
+            hsdp_params=[hsdp_param],
         )
+        scheduler.scheduler_ctx.all_hsdp_schedulers = [SimpleNamespace(hsdp_state=hsdp_state)]
 
-        with patch.object(hsdp_scheduler_mod.platform, "get_cells_and_names", return_value=[("root", "module")]):
-            with patch.object(hsdp_scheduler_mod, "get_hsdp_state", return_value=hsdp_state):
-                scheduler._lazy_init_all_states()
-                with patch.object(
-                    hsdp_scheduler_mod.platform,
-                    "parameters_dict",
-                    return_value=[("weight", sharded_param), ("alias", sharded_param)],
-                ):
-                    scheduler._init_params_fqn()
+        scheduler._lazy_init_all_states()
+        with patch.object(
+            hsdp_scheduler_mod.platform,
+            "parameters_dict",
+            return_value=[("weight", sharded_param), ("alias", sharded_param)],
+        ):
+            scheduler._init_params_fqn()
 
         hsdp_state.lazy_init.assert_called_once_with()
         self.assertEqual(hsdp_param._param_fqn, "weight")
@@ -576,13 +577,14 @@ class TestCoreScheduler(unittest.TestCase):
 
         output = scheduler._hsdp_forward_hook("cell", (), torch.ones(2, dtype=torch.float16))
         self.assertEqual(output.dtype, torch.float32)
-        scheduler.hsdp_state.shard.assert_called_once_with(shard_replicate=False)
+        scheduler.hsdp_state.shard.assert_called_once_with()
 
         prefetch_state = SimpleNamespace(module_name="prev", prefetch=MagicMock())
         scheduler.backward_prefetch_cells = [SimpleNamespace(hsdp_scheduler=SimpleNamespace(hsdp_state=prefetch_state))]
         scheduler._hsdp_backward_pre_hook("cell", None)
-        prefetch_state.prefetch.assert_called_once_with(unshard_replicate=False)
-        scheduler.hsdp_state.unshard.assert_called_with(unshard_replicate=False)
+        prefetch_state.prefetch.assert_called_once_with()
+        self.assertEqual(scheduler.hsdp_state.unshard.call_count, 2)
+        scheduler.hsdp_state.unshard.assert_called_with()
 
         scheduler._fsdp_group_post_pending = {object()}
         scheduler._hsdp_backward_hook("cell", None, None)

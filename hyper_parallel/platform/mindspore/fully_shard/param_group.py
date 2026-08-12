@@ -429,14 +429,14 @@ class HSDPParamGroup:
         if self.shard_world_size == 1:
             for hsdp_param in self.hsdp_params:
                 all_gather_input = hsdp_param.all_gather_inputs[0]
-                hsdp_param.init_all_gather_outputs(
+                hsdp_param.init_unsharded_param_buffers(
                     [all_gather_input.numel()],
                     [all_gather_input.dtype],
                     self.shard_world_size,
                     _normalize_device(self.device),
                 )
-                hsdp_param.alloc_all_gather_outputs()
-                copy_without_bumping_version(hsdp_param.all_gather_outputs[0], all_gather_input)
+                hsdp_param.alloc_unsharded_param_buffers()
+                copy_without_bumping_version(hsdp_param.unsharded_param_buffers[0], all_gather_input)
             self._result = None
         else:
             self.foreach_all_gather_copy_out()
@@ -518,14 +518,14 @@ class HSDPParamGroup:
         for input_numels, input_dtypes, hsdp_param in zip(
             metadata.param_input_numels, metadata.param_input_dtypes, self.hsdp_params
         ):
-            hsdp_param.init_all_gather_outputs(
+            hsdp_param.init_unsharded_param_buffers(
                 input_numels,
                 input_dtypes,
                 world_size,
                 _normalize_device(ag_output.device),
             )
-            hsdp_param.alloc_all_gather_outputs()
-            split_with_sizes_out.extend(hsdp_param.all_gather_outputs)
+            hsdp_param.alloc_unsharded_param_buffers()
+            split_with_sizes_out.extend(hsdp_param.unsharded_param_buffers)
         ag_output = ag_output.view(world_size, -1)
         out = [t.view(world_size, -1) for t in split_with_sizes_out]
         split_with_sizes_copy(ag_output, metadata.inp_split_sizes, dim=1, out=out)

@@ -21,15 +21,11 @@ import torch
 from tests.torch.utils import _DEVICE_TYPE, init_backend
 from tests.torch.common_net import DenseNet
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.fully_shard.hsdp_utils import (
-    FullyShardParamMode,
-    ShardedState,
-)
+from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
     FSDPMeshInfo,
     HSDPMeshInfo,
-    DDPMeshInfo,
 )
 from hyper_parallel.platform.torch.fully_shard.param import (
     TorchHSDPParamV2,
@@ -48,14 +44,9 @@ def _current_device():
 
 
 def _build_hsdp_param(**kwargs):
-    """Construct TorchHSDPParamV2 with param_mode defaults derived from test inputs."""
-    if "param_mode" not in kwargs:
-        param = kwargs.get("param")
-        if isinstance(param, DTensor):
-            kwargs["param_mode"] = FullyShardParamMode.DTENSOR_UNIFIED
-        else:
-            kwargs["param_mode"] = FullyShardParamMode.LOCAL_PARAM
+    """Construct TorchHSDPParamV2 from the parameter and explicit mesh metadata."""
     return TorchHSDPParamV2(**kwargs)
+
 
 def test_hsdp_param_v2_fsdp_1d_mesh():
     """
@@ -189,21 +180,21 @@ def test_hsdp_param_v2_sharded_state_transitions():
     # Initial state should be SHARDED
     assert hsdp_param.sharded_state == ShardedState.SHARDED
 
-    # Simulate all-gather by initializing all_gather_outputs
+    # Simulate all-gather by initializing unsharded_param_buffers
     sharded_numel = hsdp_param._sharded_param_data.numel()
     device = hsdp_param._sharded_param_data.device
     dtype = hsdp_param._sharded_param_data.dtype
 
-    hsdp_param.init_all_gather_outputs(
+    hsdp_param.init_unsharded_param_buffers(
         all_gather_input_numels=[sharded_numel],
         all_gather_input_dtypes=[dtype],
         world_size=world_size,
         device=device,
     )
 
-    # Fill all_gather_outputs with gathered data (simulating all-gather)
+    # Fill unsharded_param_buffers with gathered data (simulating all-gather)
     # In real scenario, this would be done by collective communication
-    all_gather_output = hsdp_param.all_gather_outputs[0]
+    all_gather_output = hsdp_param.unsharded_param_buffers[0]
     all_gather_output.fill_(1.0)  # Fill with test data
 
     # Initialize unsharded param
@@ -345,8 +336,10 @@ def test_hsdp_param_v2_all_gather_comm():
     assert hsdp_param.sharded_state == ShardedState.SHARDED
     assert hsdp_param.shard_world_size == world_size
 
-    # Execute all-gather
-    unsharded_data, handle = hsdp_param._get_unsharded_param_data(async_op=False)
+    # Execute all-gather through the public parameter lifecycle.
+    hsdp_param.unshard(async_op=False)
+    hsdp_param.wait_for_unshard()
+    unsharded_data = hsdp_param.unsharded_param
 
     # Verify output shape
     expected_numel = hsdp_param._sharded_param_data.numel() * world_size
@@ -386,15 +379,16 @@ def test_hsdp_param_v2_prefetch_unshard():
 
     # Test prefetch workflow
     assert hsdp_param.sharded_state == ShardedState.SHARDED
-    assert hsdp_param.prefetch_handle is None
+    assert hsdp_param.allgather_comm_ctx.allgather_handle is None
 
     hsdp_param.unshard(async_op=True)
+    assert hsdp_param.allgather_comm_ctx.allgather_handle is not None
     hsdp_param.wait_for_unshard()
 
     # Verify state transition
     assert hsdp_param.sharded_state == ShardedState.UNSHARDED
     assert hsdp_param.unsharded_param.shape == torch.Size([in_channels, hidden_size])
-    assert hsdp_param.prefetch_handle is None  # Should be cleared
+    assert hsdp_param.allgather_comm_ctx.allgather_handle is None
 
     print(f"[Rank {rank}] Prefetch unshard test passed")
 
@@ -551,18 +545,14 @@ def test_hsdp_param_v2_all_reduce_grad():
         device=hsdp_param._unsharded_param.device
     )
 
-    # Execute all-reduce on gradient
-    grad = hsdp_param._unsharded_param.grad.clone()
-    hsdp_param.all_reduce_grad(grad=grad, async_op=False, reduce_op=dist.ReduceOp.SUM)
+    # Execute the HSDP gradient pipeline: shard-dimension reduce-scatter first,
+    # then replicate-dimension all-reduce on its output.
+    hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
+    hsdp_param.all_reduce_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
     reduced_grad = hsdp_param.all_reduce_output()
     hsdp_param.clear_all_reduce_output()
-    # Calculate sum of ranks in the same replicate group
-    # Ranks in same replicate group share the same shard_idx
-    expected_sum = 0.0
-    shard_idx = rank % shard_size
-    for rep_idx in range(replicate_size):
-        group_rank = rep_idx * shard_size + shard_idx
-        expected_sum += float(group_rank)  # gradient value = rank
+    hsdp_param.clear_reduce_scatter_output()
+    expected_sum = sum(float(group_rank) for group_rank in range(world_size))
 
     assert torch.allclose(reduced_grad, torch.full_like(reduced_grad, expected_sum)), \
         f"Rank {rank}: Expected all values to be {expected_sum}, got {reduced_grad.flatten()[:5].tolist()}..."
@@ -674,7 +664,6 @@ def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
     )
 
     assert hsdp_param.sharded_state == ShardedState.SHARDED
@@ -727,7 +716,6 @@ def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
     )
 
     assert hsdp_param.sharded_state == ShardedState.SHARDED
@@ -781,7 +769,6 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
     )
 
     assert hsdp_param.sharded_state == ShardedState.SHARDED
@@ -801,25 +788,27 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
 def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
     """
     Feature: TorchHSDPParamV2.
-    Description: Test the DTensor compatibility mode without extra fully_shard parameter sharding.
-    Expectation: TP-replicated parameters are synchronized by all-reduce only.
+    Description: Test a size-one DP mesh with a TP-replicated DTensor parameter.
+    Expectation: The DP reduce-scatter is local and the TP replicate dimension is all-reduced.
     """
     init_backend(_DEVICE_TYPE)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    mesh = init_device_mesh(
+    root_mesh = init_device_mesh(
         device_type=_DEVICE_TYPE,
-        mesh_shape=(world_size,),
-        mesh_dim_names=("tp",),
+        mesh_shape=(1, world_size),
+        mesh_dim_names=("dp", "tp"),
     )
-    mesh_info = DDPMeshInfo(mesh=mesh, replicate_mesh_dim=0)
+    dp_mesh = root_mesh["dp"]
+    tp_mesh = root_mesh["tp"]
+    mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     local_weight = torch.full((in_channels, hidden_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
-        DTensor.from_local(local_weight, mesh, (Replicate(),))
+        DTensor.from_local(local_weight, tp_mesh, (Replicate(),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
 
@@ -828,24 +817,27 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        param_mode=FullyShardParamMode.DTENSOR_COMPAT,
     )
 
-    assert hsdp_param.is_sharded is False
-    assert hsdp_param.shard_size == 1
-    assert hsdp_param.dp_size == world_size
-    assert hsdp_param.unsharded_group_info.rank_size == world_size
+    assert hsdp_param.shard_world_size == 1
+    assert hsdp_param._spmd_mesh.mesh_dim_names == ("dp", "tp")
+    assert tuple(hsdp_param._spmd_placements) == (Shard(0), Replicate())
 
     grad = torch.full_like(local_weight, float(rank))
-    hsdp_param.all_reduce_grad(grad=grad, async_op=False, reduce_op=dist.ReduceOp.SUM)
-    reduced_grad = hsdp_param.all_reduce_output()
-    hsdp_param.clear_all_reduce_output()
+    hsdp_param.unshard()
+    hsdp_param.wait_for_unshard()
+    hsdp_param.unsharded_param.grad = grad
+    hsdp_param.shard()
+    hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
+    reduced_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.all_reduce_tp_replicate_grad_inplace(reduced_grad, dist.ReduceOp.SUM)
 
     expected_value = float(sum(range(world_size)))
     assert torch.allclose(
         reduced_grad,
         torch.full_like(reduced_grad, expected_value),
     ), f"Rank {rank}: expected {expected_value}, got {reduced_grad.flatten()[0].item()}"
+    hsdp_param.clear_reduce_scatter_output()
 
     print(f"[Rank {rank}] Pure TP no-param-shard all-reduce test passed")
 
@@ -853,25 +845,27 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
 def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
     """
     Feature: TorchHSDPParamV2.
-    Description: Test DTensor compatibility mode for already sharded distributed parameters.
-    Expectation: TP-sharded parameters do not create an all-reduce group in the compatibility path.
+    Description: Test a size-one DP mesh with a TP-sharded DTensor parameter.
+    Expectation: The TP-sharded dimension does not trigger replicate all-reduce.
     """
     init_backend(_DEVICE_TYPE)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    mesh = init_device_mesh(
+    root_mesh = init_device_mesh(
         device_type=_DEVICE_TYPE,
-        mesh_shape=(world_size,),
-        mesh_dim_names=("tp",),
+        mesh_shape=(1, world_size),
+        mesh_dim_names=("dp", "tp"),
     )
-    mesh_info = DDPMeshInfo(mesh=mesh, replicate_mesh_dim=0)
+    dp_mesh = root_mesh["dp"]
+    tp_mesh = root_mesh["tp"]
+    mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     local_weight = torch.full((in_channels, hidden_size // world_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
-        DTensor.from_local(local_weight, mesh, (Shard(1),))
+        DTensor.from_local(local_weight, tp_mesh, (Shard(1),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
 
@@ -880,19 +874,23 @@ def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        param_mode=FullyShardParamMode.DTENSOR_COMPAT,
     )
 
-    assert hsdp_param.is_sharded is False
-    assert hsdp_param.shard_size == 1
-    assert hsdp_param.dp_size == 1
-    assert hsdp_param.unsharded_group_info.rank_size == 1
+    assert hsdp_param.shard_world_size == 1
+    assert hsdp_param._spmd_mesh.mesh_dim_names == ("dp", "tp")
+    assert tuple(hsdp_param._spmd_placements) == (Shard(0), Shard(1))
 
     grad = torch.full_like(local_weight, float(rank))
-    reduced_grad, handle = hsdp_param.all_reduce_grad(grad=grad, async_op=False, reduce_op=dist.ReduceOp.SUM)
+    hsdp_param.unshard()
+    hsdp_param.wait_for_unshard()
+    hsdp_param.unsharded_param.grad = grad
+    hsdp_param.shard()
+    hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
+    reduced_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.all_reduce_tp_replicate_grad_inplace(reduced_grad, dist.ReduceOp.SUM)
 
-    assert handle is None
-    assert torch.allclose(reduced_grad, grad)
+    assert torch.allclose(reduced_grad.view_as(grad), grad)
+    hsdp_param.clear_reduce_scatter_output()
     print(f"[Rank {rank}] Pure TP sharded parameter skip all-reduce test passed")
 
 
@@ -933,7 +931,6 @@ def test_hsdp_param_v2_explicit_dp_mesh_prefixes_unified_layout():
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
     )
 
     assert hsdp_param._spmd_mesh.mesh_dim_names == ("dp", "fsdp", "tp")
@@ -953,7 +950,7 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
     """
     Feature: TorchHSDPParamV2.
     Description: Test DTensor unified layout keeps the explicit DP/FSDP dims on the unified mesh.
-    Expectation: shard/replicate mesh dims and unsharded group construction stay correct.
+    Expectation: Shard/replicate mesh dims, placements, and communication sizes stay correct.
     """
     init_backend(_DEVICE_TYPE)
     rank = dist.get_rank()
@@ -986,16 +983,15 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
     )
 
     assert hsdp_param._spmd_mesh.mesh_dim_names == ("dp", "fsdp", "tp")
     assert hsdp_param._spmd_replicate_mesh_dim == 0
     assert hsdp_param._spmd_shard_mesh_dim == 1
-    assert hsdp_param.sharded_group_info.rank_size == fsdp_size
-    assert hsdp_param.unsharded_group_info.rank_size == dp_size
-    assert hsdp_param.dp_size == dp_size
-    assert hsdp_param.shard_size == fsdp_size
+    assert hsdp_param.shard_world_size == fsdp_size
+    assert hsdp_param.replicate_world_size == dp_size
+    assert mesh_info.shard_mesh_size == fsdp_size
+    assert mesh_info.replicate_mesh_size == dp_size
 
     if tp_size > 1:
         assert hsdp_param._spmd_placements[0] == Replicate()
@@ -1045,7 +1041,6 @@ def test_hsdp_param_v2_non_dim0_unshard_round_trip():
         mesh_info=mesh_info,
         shard_placement_fn=custom_shard_fn,
         device=_current_device(),
-        param_mode=FullyShardParamMode.LOCAL_PARAM,
     )
 
     expected_local_shard = torch.chunk(full_weight, world_size, dim=1)[rank].contiguous()
@@ -1093,9 +1088,9 @@ def test_hsdp_param_v2_non_dim0_reduce_scatter_grad():
         mesh_info=mesh_info,
         shard_placement_fn=custom_shard_fn,
         device=_current_device(),
-        param_mode=FullyShardParamMode.LOCAL_PARAM,
     )
     hsdp_param.mp_policy = MixedPrecisionPolicy()
+    hsdp_param.init_dtype_attrs(hsdp_param.mp_policy)
 
     hsdp_param.unshard()
     hsdp_param.wait_for_unshard()
@@ -1107,16 +1102,17 @@ def test_hsdp_param_v2_non_dim0_reduce_scatter_grad():
     local_grad = grad_base + rank * 1000
     hsdp_param.unsharded_param.grad = local_grad
 
-    reduced_grad, _ = hsdp_param.reduce_scatter_grad(
+    hsdp_param.reduce_scatter_grad(
         async_op=False,
         reduce_op=dist.ReduceOp.SUM,
     )
+    reduced_grad = hsdp_param.reduce_scatter_output()
     expected_full_grad = grad_base * world_size
     expected_full_grad += sum(range(world_size)) * 1000
     expected_local_grad = torch.chunk(expected_full_grad, world_size, dim=1)[rank].contiguous()
 
     assert torch.equal(reduced_grad, expected_local_grad.reshape(-1))
-    hsdp_param.apply_reduced_grad(reduced_grad, None)
+    hsdp_param.apply_reduced_grad(reduced_grad)
     assert torch.equal(hsdp_param.sharded_param.grad.to_local(), expected_local_grad)
     print(f"[Rank {rank}] Non-dim0 RS test passed")
 
@@ -1163,9 +1159,9 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
         mesh_info=mesh_info,
         shard_placement_fn=lambda param: Shard(1),  # pylint: disable=unused-argument
         device=_current_device(),
-        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
     )
     hsdp_param.mp_policy = MixedPrecisionPolicy()
+    hsdp_param.init_dtype_attrs(hsdp_param.mp_policy)
 
     assert tuple(hsdp_param._spmd_placements) == (StridedShard(1, tp_size), Shard(1))
     expected_local_shard = torch.chunk(local_weight, dp_size, dim=1)[mesh_info.shard_mesh_rank].contiguous()
@@ -1185,10 +1181,11 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
     local_grad = grad_base + tp_rank * 100 + mesh_info.shard_mesh_rank * 1000
     hsdp_param.unsharded_param.grad = local_grad
 
-    reduced_grad, _ = hsdp_param.reduce_scatter_grad(
+    hsdp_param.reduce_scatter_grad(
         async_op=False,
         reduce_op=dist.ReduceOp.SUM,
     )
+    reduced_grad = hsdp_param.reduce_scatter_output()
     expected_full_grad = grad_base * dp_size
     expected_full_grad += tp_rank * 100 * dp_size
     expected_full_grad += sum(range(dp_size)) * 1000
@@ -1197,6 +1194,6 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
     )[mesh_info.shard_mesh_rank].contiguous()
 
     assert torch.equal(reduced_grad, expected_local_grad.reshape(-1))
-    hsdp_param.apply_reduced_grad(reduced_grad, None)
+    hsdp_param.apply_reduced_grad(reduced_grad)
     assert torch.equal(hsdp_param.sharded_param.grad.to_local(), expected_local_grad)
     print(f"[Rank {rank}] Same-dim non-dim0 StridedShard test passed")
