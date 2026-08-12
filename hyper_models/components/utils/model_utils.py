@@ -22,6 +22,7 @@ when available.
 from contextlib import contextmanager
 
 import torch
+from torch import nn
 
 
 @contextmanager
@@ -30,31 +31,30 @@ def init_empty_weights(include_buffers: bool = False):
 
     Stub implementation based on the standard "meta" dispatch trick.
     """
-    old_init = torch.nn.Module.__init__
-    old_reset_parameters = getattr(torch.nn.Module, "reset_parameters", None)
+    device = torch.device("meta")
+    old_register_parameter = nn.Module.register_parameter
 
-    def new_init(self, *args, **kwargs):
-        old_init(self, *args, **kwargs)
-        for name, param in self.named_parameters(recurse=False):
-            if param is not None:
-                self._parameters[name] = torch.nn.Parameter(
-                    torch.empty_like(param, device="meta"),
-                    requires_grad=param.requires_grad,
-                )
-        if include_buffers:
-            for name, buf in self.named_buffers(recurse=False):
-                if buf is not None:
-                    self._buffers[name] = torch.empty_like(buf, device="meta")
+    def register_empty_parameter(module, name, param):
+        old_register_parameter(module, name, param)
+        if param is not None:
+            param_cls = type(module._parameters[name])
 
-    def new_reset_parameters(self):
-        pass
+            # Standard nn.Parameter only accepts requires_grad, not arbitrary __dict__ attributes
+            # (e.g., TransformerEngine sets tensor_model_parallel on weights)
+            if param_cls is nn.Parameter:
+                kwargs = {"requires_grad": param.requires_grad}
+                is_hf_initialized = None
+            else:
+                kwargs = module._parameters[name].__dict__.copy()
+                kwargs["requires_grad"] = param.requires_grad
+                is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
 
-    torch.nn.Module.__init__ = new_init
-    if old_reset_parameters is not None:
-        torch.nn.Module.reset_parameters = new_reset_parameters
+            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            if is_hf_initialized is not None:
+                setattr(module._parameters[name], "_is_hf_initialized", is_hf_initialized)
+
     try:
+        nn.Module.register_parameter = register_empty_parameter
         yield
     finally:
-        torch.nn.Module.__init__ = old_init
-        if old_reset_parameters is not None:
-            torch.nn.Module.reset_parameters = old_reset_parameters
+        nn.Module.register_parameter = old_register_parameter

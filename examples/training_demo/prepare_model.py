@@ -12,54 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Prepare the tiny local Llama checkpoint used by the Trainer demo."""
+"""Prepare the local random Qwen3 checkpoint used by the Trainer demo."""
 
 import logging
 from pathlib import Path
 
-from transformers import LlamaConfig, LlamaForCausalLM
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from hyper_models.config.manager import parse_training_args
 from hyper_models.trainer.config import TrainerConfig
 
 logger = logging.getLogger(__name__)
 
+QWEN3_MODEL_ID = "Qwen/Qwen3-30B-A3B"
+_MODEL_WEIGHT_FILES = (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
 
-def prepare_tiny_model(model_dir: Path) -> None:
-    """Create the demo checkpoint when it does not already exist.
+
+def _checkpoint_is_complete(model_dir: Path) -> bool:
+    """Return whether the local model and tokenizer assets are complete."""
+    has_weights = any((model_dir / filename).exists() for filename in _MODEL_WEIGHT_FILES)
+    return (
+        (model_dir / "config.json").exists()
+        and (model_dir / "tokenizer_config.json").exists()
+        and has_weights
+    )
+
+
+def prepare_qwen3_checkpoint(model_dir: Path) -> None:
+    """Create a random Qwen3-30B-A3B checkpoint from its Hub config.
 
     Args:
-        model_dir: Directory that stores the generated checkpoint.
+        model_dir: Directory that stores the generated model and tokenizer.
     """
-    if (model_dir / "config.json").exists():
+    if _checkpoint_is_complete(model_dir):
+        logger.info("Reusing prepared Qwen3 checkpoint at %s", model_dir)
         return
 
     model_dir.mkdir(parents=True, exist_ok=True)
-    config = LlamaConfig(
-        vocab_size=1000,
-        hidden_size=64,
-        intermediate_size=256,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        max_position_embeddings=64,
-        attention_dropout=0.0,
-        bos_token_id=0,
-        eos_token_id=0,
-        pad_token_id=0,
+    logger.info("Preparing random %s checkpoint at %s", QWEN3_MODEL_ID, model_dir)
+    config = AutoConfig.from_pretrained(QWEN3_MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(QWEN3_MODEL_ID)
+    model = AutoModelForCausalLM.from_config(
+        config,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
     )
-    LlamaForCausalLM(config).save_pretrained(model_dir)
-    logger.info("Wrote tiny Llama checkpoint to %s", model_dir)
+    model.save_pretrained(
+        model_dir,
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
+    tokenizer.save_pretrained(model_dir)
+    logger.info("Wrote random Qwen3 checkpoint and tokenizer to %s", model_dir)
 
 
 def main() -> None:
-    """Resolve the demo configuration and prepare its model checkpoint."""
+    """Resolve the demo configuration and prepare its Qwen3 checkpoint."""
     config: TrainerConfig = parse_training_args()
     model_dir = Path(
         config.model.pretrained_model_name_or_path
-        or "./outputs/training_demo/tiny_llama"
+        or "./outputs/training_demo/qwen3_30b_a3b"
     ).resolve()
-    prepare_tiny_model(model_dir)
+    prepare_qwen3_checkpoint(model_dir)
 
 
 if __name__ == "__main__":

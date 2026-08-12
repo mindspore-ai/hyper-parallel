@@ -1,23 +1,28 @@
 # Trainer end-to-end demo.
 #
-# This example intentionally uses a generated tiny Llama checkpoint and dummy
-# token IDs. It validates Trainer component construction and the optimizer
-# loop; it is not a meaningful language-model training workload.
+# This example uses a random Qwen3-30B-A3B checkpoint generated from its Hub
+# config and tokenized WikiText-2 data. It validates the full Trainer component
+# path without downloading pretrained model weights.
 #
-# Run on four Ascend NPUs with:
+# Run on eight Ascend NPUs with:
 #   bash examples/training_demo/run.sh
 
 model:
   _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ./outputs/training_demo/tiny_llama
-  torch_dtype: auto
+  pretrained_model_name_or_path: ./outputs/training_demo/qwen3_30b_a3b
+  torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
 
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: ./outputs/training_demo/qwen3_30b_a3b
+  use_fast: true
+
 training:
-  max_steps: null
+  max_steps: 100
   num_train_epochs: 1
-  global_batch_size: 16
+  global_batch_size: 8
   micro_batch_size: 1
   backend: hccl
   init_device: meta
@@ -27,7 +32,7 @@ training:
   enable_full_determinism: false
 
 accelerator:
-  tp_size: 2
+  tp_size: 1
   cp_size: 1
   ep_size: 1
   pp_size: 1
@@ -35,10 +40,11 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
-  dp_shard_size: 2
+  dp_shard_size: 8
   replicate_params: []
   reshard_after_forward: true
   defer_fsdp_grad_sync: true
+  comm_fusion: true
 
 # plan_overrides: ShardingPlanner 唯一 override 接口的 YAML 形态（注入字段 +
 # 契约 DSL + when 条件）。CP/EP compute 注入在 cp_size>1 / ep_size>1 时是必需
@@ -83,14 +89,16 @@ gradient_checkpointing:
   activation_checkpoint: off
 
 data_transform:
-  _target_: hyper_models.components.data.identity_transform.IdentityDataTransform
+  _target_: examples.training_demo.data.PlainTextDataTransform
+  text_column: text
+  seq_len: 1024
+  append_eos: true
 
 dataset:
-  _target_: hyper_models.components.data.datasets.DummyDataset
-  num_samples: 400
-  seq_len: 32
-  vocab_size: 1000
-  seed: 42
+  _target_: examples.training_demo.data.load_tokenized_text_dataset
+  path: Salesforce/wikitext
+  name: wikitext-2-raw-v1
+  split: train
 
 collate_fn:
   _target_: hyper_models.components.data.data_collator.MakeMicroBatchCollator
