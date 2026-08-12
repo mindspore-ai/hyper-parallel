@@ -14,8 +14,8 @@
 # ============================================================================
 """Loss component interfaces for HyperModels — following design doc §10 + §10.0."""
 
-
 from .masked_ce import MaskedCrossEntropy
+from .model_output import ModelOutputLoss
 from .utils import calculate_loss, calculate_mtp_loss
 
 # FusedLinearCrossEntropy — optional, requires cut_cross_entropy
@@ -24,11 +24,9 @@ try:
 except ImportError:
     pass
 
-
-
-
 __all__ = [
     "MaskedCrossEntropy",
+    "ModelOutputLoss",
     "FusedLinearCrossEntropy",
     "calculate_loss",
     "calculate_mtp_loss",

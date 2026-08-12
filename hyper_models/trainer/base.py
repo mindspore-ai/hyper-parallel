@@ -33,7 +33,7 @@ import threading
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -56,10 +56,18 @@ from ..components.distributed.infrastructure import (
     initialize_distributed,
 )
 from ..components.loss.loss_utils import count_loss_token, mean_global_loss
+from ..components.loss.model_output import ModelOutputLoss
 from ..components.utils import helper
 from ..components.utils.device import synchronize, get_torch_device, get_device_type  # pylint: disable=syntax-error
 
-from .callbacks import TempLogCallback, TrainerState
+from .callbacks import (
+    EnvironMeterCallback,
+    EvaluateCallback,
+    GarbageCollectionCallback,
+    LoggingCallback,
+    TqdmCallback,
+    TrainerState,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -233,6 +241,7 @@ class BaseTrainer(Stateful, ABC):
     # Training components
     optimizer = None
     lr_scheduler: LRScheduler = None
+    loss_fn: Optional[torch.nn.Module] = None
 
     # Training context
     model_fwd_context: Any
@@ -289,6 +298,7 @@ class BaseTrainer(Stateful, ABC):
         #   - return a materialized, weight-loaded, already-parallelized model;
         #   - never call a second trainer-side ``build_parallelize_model``.
         self._build_model()
+        self._build_loss()
 
         # Trainer-owned components are constructed only after AutoModel has
         # finalized parameter identity, sharding, freezing, and tied weights.
@@ -371,6 +381,17 @@ class BaseTrainer(Stateful, ABC):
             for model_part in self.model_parts
             if isinstance(model_part, HSDPModule)
         ]
+
+    def _build_loss(self) -> None:
+        """Build the configured loss module or use the model-output default."""
+        loss_fn = (
+            self.config.loss_fn.build()
+            if self.config.loss_fn is not None
+            else ModelOutputLoss()
+        )
+        if not isinstance(loss_fn, torch.nn.Module):
+            raise ValueError("config.loss_fn must build a torch.nn.Module")
+        self.loss_fn = loss_fn
 
     def _build_model_assets(self):
         """Build model assets for the temporary dummy-data training path."""
@@ -490,11 +511,20 @@ class BaseTrainer(Stateful, ABC):
 
     def _init_callbacks(self):
         """Initialize callbacks."""
-        self.temp_log_callback = TempLogCallback(self)
-        self._callbacks = [
-            self.temp_log_callback,
-        ]
         self.state = TrainerState()
+        self.environ_meter_callback = EnvironMeterCallback(self)
+        self.tqdm_callback = TqdmCallback(self)
+        self.temp_log_callback = self.tqdm_callback
+        self.logging_callback = LoggingCallback(self)
+        self.evaluate_callback = EvaluateCallback(self)
+        self.garbage_collection_callback = GarbageCollectionCallback(self)
+        self._callbacks = [
+            self.environ_meter_callback,
+            self.logging_callback,
+            self.tqdm_callback,
+            self.evaluate_callback,
+            self.garbage_collection_callback,
+        ]
 
     def on_train_begin(self):
         for callback in self._callbacks:
@@ -545,12 +575,12 @@ class BaseTrainer(Stateful, ABC):
         return micro_batch
 
     def postforward(
-        self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
+        self, outputs: ModelOutput, labels: Optional[torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
-        del micro_batch
+        local_loss = self.loss_fn(model_output=outputs, labels=labels)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss,
+            local_loss,
             self.micro_batch_token_len,
             self.micro_batches_token_len,
             device_mesh=self.mesh,
@@ -570,6 +600,7 @@ class BaseTrainer(Stateful, ABC):
         )
         with micro_step_context:
             micro_batch = self.preforward(micro_batch)
+            labels = micro_batch.get("labels")
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
@@ -577,7 +608,7 @@ class BaseTrainer(Stateful, ABC):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
             # with use_parallel_state("base"):
-            loss, loss_dict = self.postforward(outputs, micro_batch)
+            loss, loss_dict = self.postforward(outputs, labels)
 
             # Backward pass
             with self.model_bwd_context:

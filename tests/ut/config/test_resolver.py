@@ -29,6 +29,7 @@ from hyper_models.components.data import (
     IdentityDataTransform,
     MakeMicroBatchCollator,
 )
+from hyper_models.components.loss import ModelOutputLoss
 from hyper_models.components.optim import AdamW, MultiLRScheduler
 from hyper_models.config.manager import parse_training_args
 from hyper_models.config.resolver import (
@@ -103,6 +104,20 @@ class TestTargetResolution(unittest.TestCase):
         self.assertIs(config.optimizer._target_, AdamW)
         self.assertIsInstance(config.lr_scheduler, Target)
         self.assertIs(config.lr_scheduler._target_, MultiLRScheduler)
+
+    def test_loss_module_target_is_deferred(self):
+        """Resolve a loss target without constructing it during config parsing."""
+        config = resolve_root(
+            _root(
+                loss_fn={
+                    "_target_": "hyper_models.components.loss.ModelOutputLoss",
+                }
+            )
+        )
+
+        self.assertIsInstance(config.loss_fn, Target)
+        self.assertIs(config.loss_fn._target_, ModelOutputLoss)
+        self.assertIsInstance(config.loss_fn.build(), ModelOutputLoss)
 
     def test_resolver_does_not_invoke_class_target(self):
         _RuntimeClass.constructions = 0

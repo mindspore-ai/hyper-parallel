@@ -41,6 +41,9 @@ class _FakeBaseTrainer:
     def _build_model(self) -> None:
         self._record("model")
 
+    def _build_loss(self) -> None:
+        self._record("loss")
+
     def _build_model_assets(self) -> None:
         self._record("model_assets")
 
@@ -88,6 +91,7 @@ def test_text_trainer_keeps_explicit_base_stage_order(monkeypatch) -> None:
     assert _FakeBaseTrainer.calls == [
         "setup",
         "model",
+        "loss",
         "model_assets",
         "data_transform",
         "dataset",
