@@ -47,6 +47,15 @@ Tensor = platform.Tensor
 logger = logging.getLogger(__name__)
 
 
+def _device_meshes_are_compatible(lhs: Any, rhs: Any) -> bool:
+    """Return whether two mesh objects describe the same device topology."""
+    if lhs is rhs:
+        return True
+    if not isinstance(lhs, DeviceMesh) or not isinstance(rhs, DeviceMesh):
+        return False
+    return lhs.device_type == rhs.device_type and lhs.to_hash() == rhs.to_hash()
+
+
 class SkipDTensorDispatch():
     """Context manager that disables DTensor op dispatch for the enclosed block.
 
@@ -728,7 +737,7 @@ class DTensor(DTensorBase):
         bumped and autograd edges are created when grad is enabled.
 
         Constraints on ``src``:
-            * must be a ``DTensor`` on the same ``DeviceMesh`` as ``self``;
+            * must be a ``DTensor`` on the same or an equivalent ``DeviceMesh`` topology as ``self``;
             * its placements must equal ``self.placements``, OR
               ``src._local_tensor.numel() == 1`` (single-element broadcast);
             * its local shape must equal or be broadcastable to
@@ -753,7 +762,7 @@ class DTensor(DTensorBase):
                 f"For DTensor.copy_, src should be a DTensor, but got {type(src).__name__}."
             )
         src_local = src.to_local()
-        if src.device_mesh is not self._device_mesh:
+        if not _device_meshes_are_compatible(src.device_mesh, self._device_mesh):
             raise ValueError(
                 f"For DTensor.copy_, src and self should share the same DeviceMesh, "
                 f"but got src.device_mesh={src.device_mesh!r}, "

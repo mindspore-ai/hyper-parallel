@@ -29,7 +29,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.core.dtensor.device_mesh import _mesh_resources
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources
 from hyper_parallel.core.dtensor import dtensor as _hp_dtensor_mod
 from hyper_parallel.core.dtensor.dtensor import DTensorBase, distribute_module
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
@@ -607,6 +607,37 @@ class TestCopyContractViolations:
     def test_mesh_mismatch_raises_value_error(self):
         dst, _ = _inplace_make_self(mesh="mesh_a")
         src = _inplace_make_src(mesh="mesh_b")
+
+        with pytest.raises(ValueError, match="DeviceMesh"):
+            _copy_fn(dst, src)
+
+    def test_equivalent_mesh_instances_are_allowed(self):
+        """Copy accepts distinct DeviceMesh instances with equivalent topology."""
+        dst_mesh = MagicMock(spec=DeviceMesh)
+        dst_mesh.device_type = "npu"
+        dst_mesh.to_hash.return_value = ((2,), ("dp",), (0, 1))
+        src_mesh = MagicMock(spec=DeviceMesh)
+        src_mesh.device_type = "npu"
+        src_mesh.to_hash.return_value = ((2,), ("dp",), (0, 1))
+        dst, _ = _inplace_make_self(mesh=dst_mesh)
+        src = _inplace_make_src(mesh=src_mesh)
+
+        result = _copy_fn(dst, src)
+
+        assert result is dst, (
+            f"Equivalent DeviceMesh instances should be accepted: expected={dst!r}, got={result!r}"
+        )
+
+    def test_equivalent_topology_with_different_device_type_raises(self):
+        """Copy rejects equivalent mesh topology when device types differ."""
+        dst_mesh = MagicMock(spec=DeviceMesh)
+        dst_mesh.device_type = "npu"
+        dst_mesh.to_hash.return_value = ((2,), ("dp",), (0, 1))
+        src_mesh = MagicMock(spec=DeviceMesh)
+        src_mesh.device_type = "cpu"
+        src_mesh.to_hash.return_value = ((2,), ("dp",), (0, 1))
+        dst, _ = _inplace_make_self(mesh=dst_mesh)
+        src = _inplace_make_src(mesh=src_mesh)
 
         with pytest.raises(ValueError, match="DeviceMesh"):
             _copy_fn(dst, src)
