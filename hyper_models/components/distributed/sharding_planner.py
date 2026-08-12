@@ -48,6 +48,7 @@ from hyper_models.components.distributed.param_role import (
     _match_any,
 )
 from hyper_models.components.distributed.function_module import FunctionModule
+from hyper_models.components.distributed.head_count import build_tp_local_attr_plan
 from hyper_models.components.distributed.sharding_config import (
     DP,
     EP,
@@ -80,11 +81,22 @@ _DEEPSEEK_MLA_OVERRIDES = [
     (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),
     (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
 ]
+# Qwen2-MoE (accuracy fix F2, accuracy_fix_plan.md §2): shared_expert_gate is
+# a scalar-gate Linear(H, 1) computed per token — "the parameter must be
+# replicated" ≠ "the module has router semantics", so it is forced to
+# REPLICATED (never MOE_GATE, which would anchor a spurious router boundary;
+# never SHARED_EXPERT, which would shard its single row — see
+# accuracy_problem.md 10.1).
+_QWEN2_MOE_OVERRIDES = [
+    (["shared_expert_gate"], ParamRole.REPLICATED),
+]
 ARCH_OVERRIDES: Dict[str, list] = {
     "llama": [],
     "qwen2": [],
     "qwen3": [],
     "mixtral": [],
+    "qwen2moe": _QWEN2_MOE_OVERRIDES,
+    "qwen2_moe": _QWEN2_MOE_OVERRIDES,
     "deepseekv2": _DEEPSEEK_MLA_OVERRIDES,
     "deepseekv3": _DEEPSEEK_MLA_OVERRIDES,
     "deepseek_v2": _DEEPSEEK_MLA_OVERRIDES,
@@ -125,10 +137,16 @@ _SPECIAL_HANDLER_PATTERNS: Dict[str, str] = {
 # Leaf-segment guard for projection/container segment names: these segment
 # names are not boundary containers themselves; inference returns unknown
 # and continues upward.
+# NOTE (accuracy fix F3): "shared_experts" was REMOVED from this guard —
+# the shared expert (singular or plural spelling) must surface as its own
+# nested "mlp" boundary (its boundary exit owns the RowWise Partial TP
+# reduction, accuracy_problem.md 10.3 方案A); keeping it in the guard would
+# merge it into the parent MoE boundary and silently leave the TP reduction
+# without an owner.
 _LEAF_SEGMENT_GUARD = frozenset({
     "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
     "qkv_proj", "fused_qkv", "gate_up_proj", "query_key_value",
-    "experts", "shared_experts", "gate", "linear", "proj",
+    "experts", "gate", "linear", "proj",
     "fc1", "fc2", "w1", "w2", "w3", "w13", "dense", "dense_h_to_4h", "dense_4h_to_h",
 })
 
@@ -216,6 +234,7 @@ class ShardingPlanner:
         plan_overrides: Optional[Dict[str, ModuleShardingSpec]] = None,
         *,
         derive: bool = True,
+        allow_uncovered_params: bool = False,
     ):
         self._classifier = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
         self._templates = TEMPLATES
@@ -228,6 +247,10 @@ class ShardingPlanner:
         # each rank encodes different images and ANY derived TP collective
         # inside the ViT subtree would be a math error).
         self._derive = derive
+        # F4b (accuracy_fix_plan.md §2): by default every trainable parameter
+        # must be covered by the plan (fail-fast). Set True ONLY for
+        # exploratory debugging to downgrade the hard error to a warning.
+        self._allow_uncovered_params = allow_uncovered_params
 
     # ── Main entry point ────────────────────────────────────────────────
 
@@ -310,6 +333,9 @@ class ShardingPlanner:
 
         # Phase 3+4: semantic inference + template-fills I/O
         param_ndims = {name: p.ndim for name, p in model.named_parameters()}
+        # F4a/F4b: full shapes + requires_grad for the plan-time lints
+        # (meta tensors carry shapes too — the zero-memory path is unaffected)
+        param_shapes = {name: tuple(p.shape) for name, p in model.named_parameters()}
         plan = ShardingPlan(
             mesh_dim_names=mesh_dim_names,
             sequence_parallel=sequence_parallel,
@@ -348,6 +374,10 @@ class ShardingPlanner:
         # plan 输出规范化：契约字段 None（未声明）→ {}——"不写继承，写了照办"
         # 只存在于输入侧；plan 内的 spec 恒为具体值，下游消费者零分支
         self._normalize_contract_fields(plan)
+        self._finalize_tp_local_attr_plans(
+            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names,
+        )
+        self._finalize_deferred_biases(plan, model, mesh_dim_names)
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
         # uniqueness (the only nesting check that remains)
@@ -359,6 +389,17 @@ class ShardingPlanner:
 
         # Phase 6: special parameter handling
         plan.special_handlers = self._collect_special_handlers(param_roles)
+
+        # F4 plan-time lints (accuracy_fix_plan.md §2 — after Phase 4.5
+        # overrides merge and Phase 6, so hand-written specs and special
+        # handlers are all accounted for):
+        # F4a: every Shard(dim) must divide the parameter shape — an empty
+        #      shard at apply time becomes a plan-time teaching error;
+        # F4b: every trainable parameter must be covered by the plan.
+        self._check_shard_divisibility(
+            plan, param_shapes, tp_size=tp_size, cp_size=cp_size,
+            ep_size=ep_size)
+        self._check_all_trainable_params_covered(plan, model)
 
         # DX guard: FunctionModule instances not covered by any spec run
         # without any boundary communication — warn instead of silently passing
@@ -374,7 +415,8 @@ class ShardingPlanner:
 
     # ── Architecture detection ──────────────────────────────────────────
 
-    def _get_architecture(self, model) -> str:
+    @staticmethod
+    def _get_architecture(model) -> str:
         """Detect the canonical architecture name:
         config.architectures[0] > config.model_type > class name;
         lowercased with ForCausalLM-style suffixes stripped."""
@@ -531,19 +573,25 @@ class ShardingPlanner:
     def _group_by_boundary(
         self, param_roles: Dict[str, ParamRole],
     ) -> Dict[str, List[Tuple[str, ParamRole]]]:
-        """Two-pass grouping (fixes the single-parameter group flaw in the
-        05 §3.6.6 pseudocode):
+        """Single deepest-first sweep over the module hierarchy:
 
         Pass 1: group by owning module FQN (strip the leaf parameter name).
-        Pass 2: depth-first work queue — when the group's roles are
-                complete, run boundary inference; on unknown, merge the
-                whole group's parameters upward into the parent module and
-                enqueue it (the parent is shallower and is therefore
-                processed later; sibling modules' parameters are merged
-                completely before inference, avoiding q_proj being
-                misjudged on its own). If still unknown after backtracking
-                to the root, attribute the group to the parameter's own
-                module (no template will match later → warning and skip).
+        Pass 2: materialize ALL ancestor modules upfront and sweep them in
+                strictly decreasing depth — every shallower ancestor is
+                therefore inferred only after ALL its descendants' parameters
+                have merged into it. On ``unknown`` the whole group's
+                parameters merge upward into the parent module. If still
+                unknown after backtracking to the root, attribute the group
+                to the parameter's own module (no template will match later
+                → warning and skip).
+
+        (Fix for the merge-ordering hazard of the former tail-enqueue work
+        queue: a parent enqueued by an early child — e.g. the MoE gate —
+        was inferred before later descendants — e.g. the experts subtree —
+        had merged into it, and the late parameters were then silently
+        dropped into an already-consumed module. Accuracy fix F3 made this
+        observable: a MOE_GATE-only ``mlp`` group must merge upward, which
+        stranded the experts params entirely.)
         """
         # Pass 1
         own: Dict[str, List[Tuple[str, ParamRole]]] = {}
@@ -552,27 +600,25 @@ class ShardingPlanner:
             own.setdefault(module_fqn, []).append((fqn, role))
 
         # Pass 2
+        all_modules = set(own)
+        for mfqn in own:
+            parts = mfqn.split(".")
+            for i in range(1, len(parts)):
+                all_modules.add(".".join(parts[:i]))
         merged: Dict[str, List[Tuple[str, ParamRole]]] = {
-            mfqn: list(params) for mfqn, params in own.items()
+            mfqn: list(own.get(mfqn, [])) for mfqn in all_modules
         }
-        pending = sorted(merged.keys(), key=lambda f: f.count("."), reverse=True)
-        consumed: set = set()
         groups: Dict[str, List[Tuple[str, ParamRole]]] = {}
-        i = 0
-        while i < len(pending):
-            mfqn = pending[i]
-            i += 1
-            if mfqn in consumed:
+        for mfqn in sorted(all_modules, key=lambda f: f.count("."),
+                           reverse=True):
+            params = merged[mfqn]
+            if not params:
                 continue
-            params = merged.get(mfqn, [])
             if self._infer_boundary_type(mfqn, params) != "unknown":
                 groups[mfqn] = params
             else:
                 parent = mfqn.rsplit(".", 1)[0] if "." in mfqn else ""
                 if parent:
-                    if parent not in merged:
-                        merged[parent] = []
-                        pending.append(parent)  # parent is shallower; tail-enqueue suffices
                     merged[parent].extend(params)
                 else:
                     # Still unknown after backtracking to the root:
@@ -580,7 +626,6 @@ class ShardingPlanner:
                     # will match later → skipped)
                     origin = ".".join(params[0][0].split(".")[:-1]) if params else mfqn
                     groups.setdefault(origin, params)
-            consumed.add(mfqn)
         return groups
 
     # ── Phase 3 ─────────────────────────────────────────────────────────
@@ -616,13 +661,29 @@ class ShardingPlanner:
         if seg.isdigit():
             return "unknown"
 
-        # 3. MoE roles: groups containing MOE_* roles aggregate upward into
-        # the moe container boundary
+        # 3. MoE roles (accuracy fix F3, accuracy_fix_plan.md §2):
+        # structural lint — a "moe_mlp" boundary must contain routed experts
+        # (MOE_EXPERT); a MOE_GATE-only group (e.g. a scalar gate Linear
+        # misclassified as router) must NOT anchor a MoE boundary. Container
+        # identity is judged on the module's OWN last segment, not a
+        # substring of the whole FQN (a parent path segment like "mlp" must
+        # not qualify a leaf Linear such as shared_expert_gate).
         roles = {r for _, r in group}
-        moe_roles = {ParamRole.MOE_EXPERT, ParamRole.SHARED_EXPERT, ParamRole.MOE_GATE}
-        if roles & moe_roles:
-            if _match_any(fqn_lower, list(_MOE_CONTAINER_PATTERNS)):
+        if ParamRole.MOE_EXPERT in roles:
+            if _match_any(_last_segment(fqn), list(_MOE_CONTAINER_PATTERNS)):
                 return "moe_mlp"
+            return "unknown"
+        if ParamRole.SHARED_EXPERT in roles:
+            # The shared expert submodule has dense-MLP semantics (colwise/
+            # rowwise TP, no EP, no use_local_map): an independent nested TP
+            # boundary whose exit performs the RowWise Partial reduction
+            # (accuracy_problem.md 10.3 方案A). Being a normal (dispatchable)
+            # boundary also means validate mode checks its out_src via real
+            # propagation instead of a declarative rewrap.
+            return "mlp"
+        if ParamRole.MOE_GATE in roles:
+            # Router-like params without routed experts: do not anchor a
+            # boundary; merge upward.
             return "unknown"
 
         # 4. Parameter role combinations
@@ -742,6 +803,9 @@ class ShardingPlanner:
             return _multi_dim(tp=tp_p if has_tp else None,
                               cp=Replicate(), ep=Replicate())
         if role == ParamRole.BIAS:
+            # Generic bias whose owning Linear role could not be inferred.
+            # Named colwise/rowwise Linear biases are classified with their
+            # weight role before reaching this fallback.
             return _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())
         if role == ParamRole.REPLICATED:
             # MLA down-projections etc. (explicitly assigned via
@@ -1173,11 +1237,159 @@ class ShardingPlanner:
         for attr in ShardingPlanner._CONTRACT_FIELDS:
             ShardingPlanner._merge_contract_field(derived, user_spec, attr)
         for attr in ("local_compute_fn", "inner_target", "inner_wrapper",
-                     "inner_out_src", "region_dispatch"):
+                     "inner_out_src", "region_dispatch", "tp_divide_attrs"):
             value = getattr(user_spec, attr)
             if value is not None:
                 setattr(derived, attr, value)
         _normalize_out_fields(derived)
+
+    @staticmethod
+    def _finalize_tp_local_attr_plans(
+        plan: ShardingPlan, model, *, tp_size: int,
+        mesh_dim_names: Tuple[str, ...],
+    ) -> None:
+        """Build internal auto/user TP-local attribute plans after overrides."""
+        modules = dict(model.named_modules())
+        for module_fqn, spec in plan.modules.items():
+            module = modules.get(module_fqn)
+            if module is None:
+                raise ValueError(
+                    f"Cannot finalize TP-local attributes: module "
+                    f"{module_fqn!r} is not present in model.named_modules()")
+            spec._tp_local_attr_plan = build_tp_local_attr_plan(
+                module, spec, module_fqn, tp_size, mesh_dim_names,
+            )
+
+    @staticmethod
+    def _finalize_deferred_biases(
+        plan: ShardingPlan, model, mesh_dim_names: Tuple[str, ...],
+    ) -> None:
+        """D-22: decide which Linear biases are deferred to after the boundary
+        exit TP reduction, and validate every bias against its sibling weight's
+        sharding direction.
+
+        Runs AFTER all plan_overrides are merged (next to
+        ``_finalize_tp_local_attr_plans``) and anchors detection on the FINAL
+        spec declarations plus the model structure — never on ParamRole — so
+        derived / merge / insert / derive=False specs (and ARCH_OVERRIDES
+        naming like ``wo``/``c_proj``) all share one code path.
+
+        Per boundary, for every physical ``X.bias`` parameter (scanned from
+        the module, regardless of whether spec.params declares it — a
+        physically present bias is fused by F.linear either way):
+
+        - sibling ``X.weight`` TP placement is ``Shard(weight.ndim - 1)``
+          (contraction-dim = rowwise) AND the boundary out_src reduces on TP
+          (Partial) → the fused bias would be counted once per TP rank by the
+          exit reduction → defer it (bias stays Replicate, added exactly once
+          after the reduction). Fail-fast guards: a declared non-Replicate
+          bias placement is rejected; a non-nn.Linear owner gets a WARNING
+          and is skipped (its forward semantics are not touched); a
+          multi-output boundary cannot attribute the bias to one output →
+          fail-fast (use local_compute_fn).
+        - sibling ``X.weight`` TP placement is an output-dim ``Shard(d)``
+          (colwise / lm_head / embed) → the bias must follow the same output
+          shard; Replicate / undeclared / wrong-dim → plan-time "模板不匹配"
+          error (typical: lm_head.bias), instead of a remote runtime
+          broadcast crash.
+        - out_src without a TP Partial (no boundary reduction, or the user
+          reduces inside the region) → the bias is already added exactly once
+          → no defer, no check.
+        """
+        from torch import nn  # local import: keep the planner torch-free at module level
+
+        has_tp = "tp" in mesh_dim_names
+        modules = dict(model.named_modules())
+        for module_fqn, spec in plan.modules.items():
+            spec._deferred_bias_params = ()  # pylint: disable=protected-access
+            if not has_tp or not spec.is_boundary:
+                continue
+            module = modules.get(module_fqn)
+            if module is None:
+                continue
+            named_params = dict(module.named_parameters())
+            out_src = spec.out_src or {}
+            partial_outputs = [
+                out_name for out_name, named in out_src.items()
+                if isinstance(named.get(TP), Partial)
+            ]
+            deferred: List[str] = []
+            for param_name, param in named_params.items():
+                if param_name == "bias":
+                    owner_path = ""      # 边界模块自身就是带 bias 的 Linear
+                elif param_name.endswith(".bias"):
+                    owner_path = param_name[: -len(".bias")]
+                else:
+                    continue
+                weight_path = f"{owner_path}.weight" if owner_path else "weight"
+                weight = named_params.get(weight_path)
+                weight_named = (spec.params or {}).get(weight_path)
+                if weight is None or weight_named is None:
+                    continue
+                tp_p = weight_named.get(TP)
+                if not isinstance(tp_p, Shard):
+                    continue
+                shard_dim = tp_p.dim if tp_p.dim >= 0 else tp_p.dim + weight.ndim
+                bias_named = spec.params.get(param_name)
+                bias_tp = bias_named.get(TP) if bias_named else None
+                if shard_dim == weight.ndim - 1:
+                    # contraction-dim shard (rowwise): a fused bias would be
+                    # counted once per TP rank by the boundary Partial
+                    # reduction — defer it past the reduction (D-22).
+                    if not partial_outputs:
+                        continue   # 边界无归约 → bias 本就只加一次
+                    if len(out_src) != 1:
+                        raise ValueError(
+                            f"boundary {module_fqn!r}: rowwise bias 后置（D-22）"
+                            f"v1 仅支持单输出边界——该边界 out_src 声明了 "
+                            f"{len(out_src)} 个输出且含 TP Partial 归约，框架无法"
+                            f"把 {param_name!r} 归因到唯一输出。请用 "
+                            f"local_compute_fn 接管该区域（自行在归约后加 bias）")
+                    if bias_tp is not None and not isinstance(bias_tp, Replicate):
+                        raise ValueError(
+                            f"boundary {module_fqn!r}: rowwise Linear "
+                            f"{owner_path!r} 的 bias 声明了非 Replicate 的 TP "
+                            f"placement（{bias_tp!r}）——D-22 后置加法要求 bias "
+                            f"保持 Replicate（TP 归约后整体恰好加一次）。请从 "
+                            f"spec.params 移除 {param_name!r}，或改为 "
+                            f"{{TP: replicate()}}")
+                    owner = (module.get_submodule(owner_path)
+                             if owner_path else module)
+                    if not isinstance(owner, nn.Linear):
+                        logger.warning(
+                            "boundary %s: rowwise Linear %r 带 bias 且边界 "
+                            "out_src 为 TP Partial——但 owner 类型是 %s（非 "
+                            "nn.Linear），框架不擅自修改其 forward 语义：bias 会在"
+                            " Partial 归约中被重复计数（production 输出 = 正确值 "
+                            "+ tp_size × bias）。请将 bias 移到边界通信之后、改用"
+                            " nn.Linear，或用 local_compute_fn 接管该区域",
+                            module_fqn, owner_path, type(owner).__name__)
+                        continue
+                    deferred.append(param_name)
+                else:
+                    # output-dim shard (colwise / lm_head / embed): the bias
+                    # must follow the same output-channel shard — a
+                    # replicated/undeclared bias here is the lm_head.bias
+                    # template mismatch (would crash as a remote broadcast
+                    # shape error at runtime).
+                    bias_dim = None
+                    if isinstance(bias_tp, Shard):
+                        bias_dim = (bias_tp.dim if bias_tp.dim >= 0
+                                    else bias_tp.dim + param.ndim)
+                    if bias_dim != shard_dim:
+                        declared = repr(bias_tp) if bias_named else "未声明"
+                        raise ValueError(
+                            f"boundary {module_fqn!r}: {weight_path!r} 沿输出维 "
+                            f"Shard({shard_dim}) 切分，但 {param_name!r} 未随输出"
+                            f"通道同样切分（{declared}）——模板不匹配（典型："
+                            f"lm_head.bias）。请用 plan_overrides 显式声明 "
+                            f"{{'{param_name}': {{TP: shard({shard_dim})}}}}，"
+                            f"或移除该 bias")
+            spec._deferred_bias_params = tuple(deferred)  # pylint: disable=protected-access
+            if deferred:
+                logger.info(
+                    "boundary %s: 后置 bias（D-22，TP 归约后恰好加一次）: %s",
+                    module_fqn, list(deferred))
 
     @staticmethod
     def _normalize_contract_fields(plan: ShardingPlan) -> None:
@@ -1308,6 +1520,141 @@ class ShardingPlanner:
                     f"chain fill was removed (D-14, 05 §13.2); declare in_src "
                     f"explicitly (keys must mirror in_dst)"
                 )
+
+    # ── F4 plan-time lints (accuracy_fix_plan.md §2) ─────────────────────
+
+    def _check_shard_divisibility(
+        self,
+        plan: ShardingPlan,
+        param_shapes: Dict[str, Tuple[int, ...]],
+        *,
+        tp_size: int,
+        cp_size: int,
+        ep_size: int,
+    ) -> None:
+        """F4a: every Shard(dim) in every spec.params must divide the
+        parameter's shape along that dim — fail at plan time with a teaching
+        error instead of producing an empty shard at apply time
+        (accuracy_problem.md 10.1: a (1, 64) scalar-gate weight misclassified
+        SHARED_EXPERT was Shard(0)'d over tp=2 into a (0, 64) empty shard,
+        surfacing only much later at weight reconstruction).
+
+        Runs after the Phase 4.5 override merge, so hand-written specs are
+        checked too. Stacked expert params (D-09/D-10 ``_ep_stack``) resolve
+        their shape as ``(num_experts, *source_shape)``; D-10 experts use
+        ``spec._ep_size`` as the EP axis size. Params not resolvable at plan
+        time (e.g. created later by an inner_target factory) are skipped.
+        """
+        for fqn, spec in plan.modules.items():
+            prefix = fqn + "." if fqn else ""
+            ep_stack = getattr(spec, "_ep_stack", None) or {}
+            # D-10: the EP axis lives on the derived expert mesh whose size
+            # is spec._ep_size; old-style EP uses the mesh "ep" axis (ep_size).
+            axis_sizes = {
+                "tp": tp_size,
+                "cp": cp_size,
+                "ep": getattr(spec, "_ep_size", 0) or ep_size,
+            }
+            for pname, placement in (spec.params or {}).items():
+                full = prefix + pname
+                shape = param_shapes.get(full)
+                if shape is None and pname in ep_stack:
+                    sources = ep_stack[pname]
+                    src_shape = (param_shapes.get(prefix + sources[0])
+                                 if sources else None)
+                    if src_shape is not None:
+                        shape = (len(sources), *src_shape)
+                if shape is None:
+                    continue  # created later (inner_target factory) — nothing to check
+                ndim = len(shape)
+                for axis, p in (placement or {}).items():
+                    if not isinstance(p, Shard):
+                        continue
+                    size = axis_sizes.get(axis, 1)
+                    if size <= 1:
+                        continue
+                    axis_name = getattr(axis, "value", axis)  # MeshAxisName → "tp"
+                    dim = p.dim + ndim if p.dim < 0 else p.dim
+                    if dim >= ndim:
+                        raise ValueError(
+                            f"plan-time shard check failed: {full!r} has shape "
+                            f"{tuple(shape)} but boundary {fqn!r} declares "
+                            f"{{{axis_name}: Shard({p.dim})}} — dim {p.dim} is out "
+                            f"of range for a {ndim}D parameter; fix the "
+                            f"plan_overrides declaration"
+                        )
+                    if shape[dim] % size != 0:
+                        raise ValueError(
+                            f"plan-time shard check failed: {full!r} has shape "
+                            f"{tuple(shape)} but boundary {fqn!r} declares "
+                            f"{{{axis_name}: Shard({p.dim})}} — shape[{dim}]={shape[dim]} "
+                            f"is not divisible by {axis_name} size {size} (it would "
+                            f"produce empty shards at apply time). This is most "
+                            f"often a parameter-classification error (e.g. a "
+                            f"replicated/gate parameter misclassified into a "
+                            f"sharded role — see accuracy_fix_plan.md §2): fix "
+                            f"the naming rule / ARCH_OVERRIDES entry, or correct "
+                            f"the plan_overrides declaration"
+                        )
+
+    def _check_all_trainable_params_covered(self, plan: ShardingPlan, model) -> None:
+        """F4b: every ``requires_grad=True`` parameter must appear in some
+        spec.params (resolved to a full FQN) or in special_handlers —
+        otherwise its gradient-sync semantics would be decided SILENTLY by
+        the consumer-side default (the same class of shape-legal/silent-wrong
+        hazard as accuracy_problem.md 10.1/10.2), so the plan must be a
+        complete declaration of every trainable parameter's layout.
+
+        Covered = spec.params ∪ _ep_stack sources ∪ special_handlers (a
+        param explicitly declared via plan_overrides therefore counts as
+        covered). Remediation paths, listed per parameter in the error:
+        ① classify it explicitly (naming rule / ARCH_OVERRIDES, e.g.
+          shared_expert_gate → REPLICATED);
+        ② declare it in a spec via plan_overrides (e.g. all-Replicate);
+        ③ mark it SPECIAL (special_handlers) or freeze it
+          (requires_grad=False).
+        Escape hatch for exploratory debugging:
+        ``ShardingPlanner(allow_uncovered_params=True)`` downgrades to a
+        warning. Skipped entirely under derive=False (pure declaration
+        assembler for subtrees — coverage is the caller's responsibility).
+        """
+        if not self._derive:
+            return
+        covered = set()
+        for fqn, spec in plan.modules.items():
+            prefix = fqn + "." if fqn else ""
+            for pname in (spec.params or {}):
+                covered.add(prefix + pname)
+            for sources in (getattr(spec, "_ep_stack", None) or {}).values():
+                covered.update(prefix + s for s in sources)
+        covered.update(plan.special_handlers or {})
+        uncovered = [
+            name for name, p in model.named_parameters()
+            if p.requires_grad and name not in covered
+        ]
+        if not uncovered:
+            return
+        lines = "\n".join(f"  - {n}" for n in uncovered[:20])
+        more = (f"  ... and {len(uncovered) - 20} more\n"
+                if len(uncovered) > 20 else "")
+        msg = (
+            f"plan-time coverage check failed: {len(uncovered)} trainable "
+            f"parameter(s) are not covered by any spec.params / "
+            f"special_handlers:\n{lines}\n{more}"
+            "An uncovered parameter is never sharded (kept replicated) AND is "
+            "absent from tp_grad_info — its gradient-sync semantics would be "
+            "decided silently by the consumer-side default. Resolve each "
+            "parameter explicitly: ① add a naming rule / ARCH_OVERRIDES entry "
+            "(e.g. shared_expert_gate → REPLICATED); ② declare it in a spec "
+            "via plan_overrides; ③ mark it SPECIAL or freeze it "
+            "(requires_grad=False). For exploratory debugging only, construct "
+            "ShardingPlanner(allow_uncovered_params=True) to downgrade this "
+            "error to a warning (accuracy_fix_plan.md §2 F4b)"
+        )
+        if self._allow_uncovered_params:
+            logger.warning("%s", msg)
+        else:
+            raise ValueError(msg)
 
     # ── Phase 5 ─────────────────────────────────────────────────────────
 

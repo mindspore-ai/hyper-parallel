@@ -45,7 +45,8 @@ class TinyConfig:
                  num_hidden_layers=2, vocab_size=32, intermediate_size=32,
                  num_experts=0, moe_intermediate_size=8,
                  tie_word_embeddings=False, architectures=None,
-                 model_type="tiny_llama", attn_implementation="sdpa"):
+                 model_type="tiny_llama", attn_implementation="sdpa",
+                 bias=False):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
@@ -58,6 +59,9 @@ class TinyConfig:
         self.architectures = architectures or ["TinyLlamaForCausalLM"]
         self.model_type = model_type
         self._attn_implementation = attn_implementation
+        # bias=True：q/k/v/o_proj 与 gate/up/down_proj 全部带 bias
+        # （OPT/GPT-NeoX 风格，D-22 rowwise bias 后置测试用）
+        self.bias = bias
 
 
 class TinyRMSNorm(nn.Module):
@@ -81,10 +85,10 @@ class TinyLlamaAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = h // self.num_heads
         self.causal = causal
-        self.q_proj = nn.Linear(h, h, bias=False)
-        self.k_proj = nn.Linear(h, h, bias=False)
-        self.v_proj = nn.Linear(h, h, bias=False)
-        self.o_proj = nn.Linear(h, h, bias=False)
+        self.q_proj = nn.Linear(h, h, bias=config.bias)
+        self.k_proj = nn.Linear(h, h, bias=config.bias)
+        self.v_proj = nn.Linear(h, h, bias=config.bias)
+        self.o_proj = nn.Linear(h, h, bias=config.bias)
 
     def forward(self, hidden_states, position_ids=None):
         b, s, _ = hidden_states.shape
@@ -102,9 +106,9 @@ class TinyLlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         h, inter = config.hidden_size, config.intermediate_size
-        self.gate_proj = nn.Linear(h, inter, bias=False)
-        self.up_proj = nn.Linear(h, inter, bias=False)
-        self.down_proj = nn.Linear(inter, h, bias=False)
+        self.gate_proj = nn.Linear(h, inter, bias=config.bias)
+        self.up_proj = nn.Linear(h, inter, bias=config.bias)
+        self.down_proj = nn.Linear(inter, h, bias=config.bias)
 
     def forward(self, hidden_states):
         return self.down_proj(F.silu(self.gate_proj(hidden_states))
@@ -383,13 +387,13 @@ def cp_sdpa_hf_injection(match="*.self_attn"):
                                         region_dispatch=False)}
 
 
-def ep_hf_native_injection(match="*.mlp"):
+def ep_archetype_injection(match="*.mlp"):
     """显式 EP 注入：仓内默认 TP-extend-EP compute 的工厂 Target（内嵌
     default softmax top-k 路由；其他路由语义写自己的工厂）。
 
     返回 plan_overrides 片段（{match: spec}）。"""
     from hyper_models.components.distributed.ep_compute import (
-        hf_native_ep_compute_fn,
+        routed_only_ep_compute_fn,
     )
     from hyper_models.components.distributed.sharding_config import (
         ModuleShardingSpec,
@@ -397,9 +401,9 @@ def ep_hf_native_injection(match="*.mlp"):
     from hyper_models.trainer.config import Target
     return {match: ModuleShardingSpec(
         local_compute_fn=Target(
-            hf_native_ep_compute_fn,
+            routed_only_ep_compute_fn,
             target_path="hyper_models.components.distributed."
-                        "ep_compute.hf_native_ep_compute_fn"), region_dispatch=False)}
+                        "ep_compute.routed_only_ep_compute_fn"), region_dispatch=False)}
 
 @pytest.fixture
 def tiny_llama():

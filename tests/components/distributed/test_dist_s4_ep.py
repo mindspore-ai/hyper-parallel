@@ -12,7 +12,7 @@ from hyper_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.ep_utils import _ep_all_to_all
+from hyper_models.components.distributed.ep_utils import ep_all_to_all
 from hyper_models.components.distributed.precompiled_boundary import PrecompiledBoundary
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -22,7 +22,7 @@ from tests.components.distributed.conftest import (
     TinyConfig,
     TinyHFNativeMoEForCausalLM,
     TinyLlamaForCausalLM,
-    ep_hf_native_injection,
+    ep_archetype_injection,
     run_dist,
 )
 
@@ -223,7 +223,7 @@ def _worker_ep_extend_e2e(rank, world_size):
         model = _build()
         # 显式注入仓内默认 EP compute（无自动注入；路由内嵌 default
         # softmax top-k）
-        planner = ShardingPlanner(plan_overrides=ep_hf_native_injection())
+        planner = ShardingPlanner(plan_overrides=ep_archetype_injection())
         plan = planner.plan(model, mesh, tp_size=2, ep_size=4)
         spec = plan.modules["model.layers.0.mlp"]
         assert spec._ep_size == 4   # ep_size 即扩展 EP 组大小
@@ -242,21 +242,22 @@ from hyper_models.components.distributed import local_compute as _cf
 
 
 @_cf
-def _qwen3moe_ep_factory(mesh, tp_mesh, cp_mesh, ep_mesh):
+def _qwen3moe_ep_factory(module, mesh, tp_mesh, cp_mesh, ep_mesh):
     """自定义 EP 工厂：路由是注入函数的一部分——qwen3moe 的 TopKRouter
     语义由本函数显式选择（MOE_ROUTER_ADAPTERS 按名引用），框架不参与。"""
     from hyper_models.components.distributed.ep_utils import (
         MOE_ROUTER_ADAPTERS,
-        _hf_native_ep_compute,
+        bind_local_expert_forward,
+        ep_routed_forward,
     )
     ep_group = ep_mesh.get_group("ep")
-    tp_group = tp_mesh.get_group() if tp_mesh is not None else None
+    bind_local_expert_forward(module, ep_mesh["ep"].size())
 
     def compute_fn(module, hidden_states):
-        return _hf_native_ep_compute(
+        return ep_routed_forward(
             module, hidden_states,
             router_fn=MOE_ROUTER_ADAPTERS["qwen3moe"],
-            ep_group=ep_group, tp_group=tp_group)
+            ep_group=ep_group)
     return compute_fn
 
 
@@ -321,12 +322,12 @@ def _worker_padded_a2a(rank, world_size):
         x = torch.tensor([[13.], [14.], [15.]]).repeat(1, h)
         expected = torch.tensor([[2.], [13.], [14.], [15.]]).repeat(1, h)
     x.requires_grad_(True)
-    out = _ep_all_to_all(x, send_counts, recv_counts, group)
+    out = ep_all_to_all(x, send_counts, recv_counts, group)
     torch.testing.assert_close(out, expected)
     out.sum().backward()
     # a2a 是跨 rank 置换：每行输入恰好流向一行输出 → grad 全 1
     torch.testing.assert_close(x.grad, torch.ones_like(x))
 
 
-def test_ep_all_to_all_padded_2proc():
+def testep_all_to_all_padded_2proc():
     run_dist(2, _worker_padded_a2a)

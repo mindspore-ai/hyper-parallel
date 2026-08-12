@@ -43,7 +43,7 @@ from tests.components.distributed.conftest import (
     TinyRMSNorm,
     _meta_mesh,
     cp_sdpa_hf_injection,
-    ep_hf_native_injection,
+    ep_archetype_injection,
     run_dist,
 )
 
@@ -238,9 +238,11 @@ class TestContractSentinels:
         mesh = make_mesh((1,), ("tp",))
         baseline = ShardingPlanner().plan(tiny_llama, mesh, tp_size=2)
         derived = baseline.modules["model.layers.0.mlp"]
+        # allow_uncovered_params：本用例刻意清空 mlp params（F4b 覆盖校验
+        # 的逃生舱，仅用于 override 机制单测）
         planner = ShardingPlanner(plan_overrides={
             "model.layers.0.mlp": ModuleShardingSpec(params="none"),
-        })
+        }, allow_uncovered_params=True)
         plan = planner.plan(tiny_llama, mesh, tp_size=2)
         spec = plan.modules["model.layers.0.mlp"]
         assert spec.params == {}                       # 已清空
@@ -676,8 +678,11 @@ class TestOverrideAxisValidation:
         from hyper_models.components.distributed.sharding_config import EP
         mesh = make_mesh((1,), ("tp",))
         spec = ModuleShardingSpec(params={"q_proj.weight": {EP: Shard(0)}})
+        # allow_uncovered_params：部分 params 替换使其余参数未覆盖（F4b
+        # 逃生舱，仅用于轴校验单测）
         ShardingPlanner(plan_overrides={
-            "*.self_attn": spec}).plan(tiny_llama, mesh, tp_size=2)
+            "*.self_attn": spec}, allow_uncovered_params=True).plan(
+            tiny_llama, mesh, tp_size=2)
 
     def test_non_placement_value_raises(self, tiny_llama, make_mesh):
         """placement 值不是 Placement 对象（如 Python 侧误传字符串）→ fail-fast。"""
@@ -692,7 +697,8 @@ class TestOverrideAxisValidation:
         mesh = make_mesh((1,), ("tp",))
         spec = ModuleShardingSpec(params={"q_proj.weight": {TP: Shard(0)}})
         plan = ShardingPlanner(plan_overrides={
-            "*.self_attn": spec}).plan(tiny_llama, mesh, tp_size=2)
+            "*.self_attn": spec}, allow_uncovered_params=True).plan(
+            tiny_llama, mesh, tp_size=2)
         assert plan.modules["model.layers.0.self_attn"].params[
             "q_proj.weight"][TP] == Shard(0)
 
@@ -759,7 +765,8 @@ class TestYamlDslEndToEnd:
             out_src={"output": {"tp": "shard(1)"}},
             out_dst={"output": {"tp": "shard(1)"}},
         )])
-        plan = ShardingPlanner(plan_overrides=overrides).plan(
+        plan = ShardingPlanner(plan_overrides=overrides,
+                               allow_uncovered_params=True).plan(
             tiny_llama, mesh, tp_size=2)
         inserted = plan.modules["model.layers.0.extra"]
         assert inserted.params["weight"][TP] == Replicate()
@@ -807,7 +814,7 @@ class TestUnsetVsExplicitEmpty:
         mesh = make_mesh((1,), ("tp",))
         plan = ShardingPlanner(plan_overrides={
             "*.self_attn": ModuleShardingSpec(params={}),
-        }).plan(tiny_llama, mesh, tp_size=2)
+        }, allow_uncovered_params=True).plan(tiny_llama, mesh, tp_size=2)
         assert plan.modules["model.layers.0.self_attn"].params == {}
         # I/O 契约未声明 → 仍继承推导
         assert "hidden_states" in plan.modules[
@@ -823,7 +830,8 @@ class TestUnsetVsExplicitEmpty:
             out_src={"output": {TP: Shard(1)}},
             out_dst={"output": {TP: Shard(1)}})
         plan = ShardingPlanner(plan_overrides={
-            "model.layers.0.extra": spec_in}).plan(tiny_llama, mesh, tp_size=2)
+            "model.layers.0.extra": spec_in}, allow_uncovered_params=True
+        ).plan(tiny_llama, mesh, tp_size=2)
         assert plan.modules["model.layers.0.extra"].params == {}
 
     def test_insert_all_unset_fails(self, tiny_llama, make_mesh):
@@ -842,7 +850,7 @@ class TestUnsetVsExplicitEmpty:
             ShardingPlanner(plan_overrides={
                 "*.self_attn": ModuleShardingSpec(
                     params={"q_proj.weight": {TP: Shard(0)}}),
-            }).plan(tiny_llama, mesh, tp_size=2)
+            }, allow_uncovered_params=True).plan(tiny_llama, mesh, tp_size=2)
         assert "失去推导分片" in caplog.text
         assert "o_proj.weight" in caplog.text
 
@@ -866,7 +874,8 @@ class TestUnsetVsExplicitEmpty:
         mesh = make_mesh((1,), ("tp",))
         overrides = entries_to_plan_overrides([
             PlanOverride(match="*.self_attn", params={})])
-        plan = ShardingPlanner(plan_overrides=overrides).plan(
+        plan = ShardingPlanner(plan_overrides=overrides,
+                               allow_uncovered_params=True).plan(
             tiny_llama, mesh, tp_size=2)
         assert plan.modules["model.layers.0.self_attn"].params == {}
 
@@ -888,6 +897,21 @@ class TestInjectionDesugar:
         assert spec.local_compute_fn is None
         assert spec.inner_target is None
         assert spec.region_dispatch is None
+        assert spec.tp_divide_attrs is None
+
+    def test_tp_divide_attrs_desugar(self):
+        _, spec = PlanOverride(
+            match="*.self_attn",
+            tp_divide_attrs=["hidden_size"],
+        ).to_override()
+        assert spec.tp_divide_attrs == ["hidden_size"]
+
+    @pytest.mark.parametrize("attrs", ["hidden_size", ["bad.name"], ["x", "x"]])
+    def test_tp_divide_attrs_invalid(self, attrs):
+        with pytest.raises(ValueError, match="tp_divide_attrs"):
+            PlanOverride(
+                match="*.self_attn", tp_divide_attrs=attrs,
+            ).to_override()
 
     def test_inner_out_src_desugar(self):
         """inner_out_src 脱糖：哨兵 / 单输出 DSL / 多输出 DSL / 非法值。"""
@@ -924,6 +948,16 @@ class TestInjectionDesugar:
         spec = overrides["*.mlp"]
         assert spec.region_dispatch is False
         assert spec.inner_target == "self"
+
+    def test_tp_divide_attrs_later_entry_replaces(self):
+        overrides = entries_to_plan_overrides([
+            PlanOverride(
+                match="*.self_attn", tp_divide_attrs=["hidden_size"],
+            ),
+            PlanOverride(match="*.self_attn", tp_divide_attrs=[]),
+        ])
+        assert overrides["*.self_attn"].tp_divide_attrs == []
+
 
     def test_desugared_entry_equivalent_to_handwritten(self, tiny_llama, make_mesh):
         """脱糖结果与手写 {match: spec} 走同一统一通道（glob merge、契约继承）。"""
@@ -992,6 +1026,53 @@ class TestInjectionDesugar:
             == "sdpa_hf"
 
 
+class TestTpLocalAttrPlan:
+    """Planner finalizes automatic and explicit TP-local attributes."""
+
+    def test_d17_auto_attrs_require_no_yaml(self, tiny_llama, make_mesh):
+        mesh = make_mesh((1,), ("tp",))
+        plan = ShardingPlanner().plan(tiny_llama, mesh, tp_size=2)
+        attr_plan = plan.modules[
+            "model.layers.0.self_attn"
+        ]._tp_local_attr_plan
+        assert "num_heads" in attr_plan.auto_divide
+        assert attr_plan.user_divide == ()
+
+    def test_explicit_width_attr(self, tiny_llama, make_mesh):
+        for layer in tiny_llama.model.layers:
+            layer.self_attn.hidden_size = 16
+        mesh = make_mesh((1,), ("tp",))
+        plan = ShardingPlanner(plan_overrides={
+            "*.self_attn": ModuleShardingSpec(
+                tp_divide_attrs=["hidden_size"],
+            ),
+        }).plan(tiny_llama, mesh, tp_size=2)
+        attr_plan = plan.modules[
+            "model.layers.0.self_attn"
+        ]._tp_local_attr_plan
+        assert attr_plan.user_divide == ("hidden_size",)
+
+    def test_redundant_auto_attr_fails(self, tiny_llama, make_mesh):
+        mesh = make_mesh((1,), ("tp",))
+        planner = ShardingPlanner(plan_overrides={
+            "*.self_attn": ModuleShardingSpec(
+                tp_divide_attrs=["num_heads"],
+            ),
+        })
+        with pytest.raises(ValueError, match="D-17"):
+            planner.plan(tiny_llama, mesh, tp_size=2)
+
+    def test_missing_user_attr_fails(self, tiny_llama, make_mesh):
+        mesh = make_mesh((1,), ("tp",))
+        planner = ShardingPlanner(plan_overrides={
+            "*.self_attn": ModuleShardingSpec(
+                tp_divide_attrs=["missing_width"],
+            ),
+        })
+        with pytest.raises(ValueError, match="plain int"):
+            planner.plan(tiny_llama, mesh, tp_size=2)
+
+
 class TestHfNativeMoeLocalMapCleared:
     def test_per_expert_layout_cleared(self, tiny_hf_native_moe):
         """HF 原生 per-expert 布局（D-10）：region_dispatch 被清除——模块自己的
@@ -1039,7 +1120,7 @@ class TestExplicitExpertMesh:
         "未声明的配置键"fail-fast 并列出合法形参（迁移信号明确）。"""
         from hyper_models.components.distributed import build_expert_mesh
         from hyper_models.components.distributed.ep_compute import (
-            hf_native_ep_compute_fn,
+            routed_only_ep_compute_fn,
         )
         from hyper_models.components.distributed.sharding_config import (
             ModuleShardingSpec,
@@ -1052,9 +1133,9 @@ class TestExplicitExpertMesh:
         user_mesh = build_expert_mesh(mesh, ep_size=4)
         overrides = {"*.mlp": ModuleShardingSpec(
             local_compute_fn=Target(
-                hf_native_ep_compute_fn,
+                routed_only_ep_compute_fn,
                 target_path="hyper_models.components.distributed."
-                            "ep_compute.hf_native_ep_compute_fn",
+                            "ep_compute.routed_only_ep_compute_fn",
                 expert_mesh=user_mesh), region_dispatch=False)}
         plan = ShardingPlanner(plan_overrides=overrides).plan(
             tiny_hf_native_moe, mesh, tp_size=2, ep_size=4)
@@ -1068,7 +1149,7 @@ class TestExplicitExpertMesh:
         """ep_mesh 是框架保留上下文键——用户配置即 fail-fast（框架统一派生，
         保证 a2a 通信域与专家参数分片域是同一对象）。"""
         from hyper_models.components.distributed.ep_compute import (
-            hf_native_ep_compute_fn,
+            routed_only_ep_compute_fn,
         )
         from hyper_models.components.distributed.sharding_config import (
             ModuleShardingSpec,
@@ -1080,9 +1161,9 @@ class TestExplicitExpertMesh:
         mesh = _meta_mesh((4, 2), ("dp", "tp"))
         overrides = {"*.mlp": ModuleShardingSpec(
             local_compute_fn=Target(
-                hf_native_ep_compute_fn,
+                routed_only_ep_compute_fn,
                 target_path="hyper_models.components.distributed."
-                            "ep_compute.hf_native_ep_compute_fn",
+                            "ep_compute.routed_only_ep_compute_fn",
                 ep_mesh="user-mesh"), region_dispatch=False)}
         plan = ShardingPlanner(plan_overrides=overrides).plan(
             tiny_hf_native_moe, mesh, tp_size=2, ep_size=4)
@@ -1109,6 +1190,34 @@ class TestPreflightFailFast:
         plan = planner.plan(tiny_llama, mesh, cp_size=2)
         _preflight_compute_injection(plan, mesh)   # 不抛错即通过
 
+    def test_builtin_cp_wrapper_rejects_dispatch_true(self, tiny_llama):
+        """Shipped CP wrappers contain collectives and require black-box validation."""
+        mesh = _meta_mesh((2,), ("cp",))
+        planner = ShardingPlanner(plan_overrides={
+            "*.self_attn": ModuleShardingSpec(
+                inner_target="self",
+                inner_wrapper="sdpa_hf",
+                region_dispatch=True,
+            )
+        })
+        plan = planner.plan(tiny_llama, mesh, cp_size=2)
+        with pytest.raises(ValueError, match="requires region_dispatch=False"):
+            _preflight_compute_injection(plan, mesh)
+
+    def test_child_wrapper_requires_inner_output_contract(self, tiny_llama):
+        """A child target cannot inherit the enclosing boundary output layout."""
+        mesh = _meta_mesh((2,), ("cp",))
+        planner = ShardingPlanner(plan_overrides={
+            "*.self_attn": ModuleShardingSpec(
+                inner_target="attention_core",
+                inner_wrapper="sdpa_hf",
+                region_dispatch=False,
+            )
+        })
+        plan = planner.plan(tiny_llama, mesh, cp_size=2)
+        with pytest.raises(ValueError, match="inner_out_src.*first_input"):
+            _preflight_compute_injection(plan, mesh)
+
     def test_cp_size1_no_check(self, tiny_llama, make_mesh):
         """cp 轴 size=1（plan 已过滤 cp 维）→ 无 preflight 要求。"""
         mesh = make_mesh((1,), ("tp",))
@@ -1125,7 +1234,7 @@ class TestPreflightFailFast:
 
     def test_ep_with_injection_passes_preflight(self, tiny_hf_native_moe):
         mesh = _meta_mesh((4, 2), ("dp", "tp"))
-        planner = ShardingPlanner(plan_overrides=ep_hf_native_injection())
+        planner = ShardingPlanner(plan_overrides=ep_archetype_injection())
         plan = planner.plan(tiny_hf_native_moe, mesh, tp_size=2, ep_size=2)
         spec = plan.modules["model.layers.0.mlp"]
         assert spec.local_compute_fn is not None   # Target 已 overlay
@@ -1146,7 +1255,7 @@ class TestPreflightFailFast:
         with pytest.raises(ValueError) as exc:
             apply_sharding_plan(tiny_hf_native_moe, plan, mesh)
         msg = str(exc.value)
-        assert "hf_native_ep_compute_fn" in msg
+        assert "ep_compute.qwen2moe_ep_compute_fn" in msg
         assert "region_dispatch" in msg
 
 

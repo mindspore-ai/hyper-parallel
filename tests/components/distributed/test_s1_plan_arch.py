@@ -9,9 +9,11 @@
 
 import logging
 import pytest
+import torch
 import torch.nn as nn
 from hyper_models.components.distributed.head_count import (
     _is_head_sharded,
+    _update_user_tp_attrs,
     update_module_head_counts,
 )
 from hyper_models.components.distributed.param_role import (
@@ -25,6 +27,9 @@ from hyper_models.components.distributed.sharding_config import (
     TEMPLATES,
     TP,
     resolve_placements,
+)
+from hyper_models.components.distributed.sharding_applier import (
+    _add_bias_to_primary_output,
 )
 from hyper_models.components.distributed.sharding_planner import (
     ARCH_OVERRIDES,
@@ -42,6 +47,27 @@ from tests.components.distributed.conftest import (
     TinyLlamaAttention,
     TinyLlamaForCausalLM,
 )
+
+
+def test_deferred_bias_preserves_attention_tuple_output():
+    """Deferred RowWise bias applies to hidden states without changing metadata."""
+    hidden_states = torch.zeros(2, 3, 4)
+    attention_weights = object()
+    bias = torch.arange(4, dtype=hidden_states.dtype)
+
+    output = _add_bias_to_primary_output(
+        (hidden_states, attention_weights), bias, "TinyAttention"
+    )
+
+    assert isinstance(output, tuple)
+    torch.testing.assert_close(output[0], hidden_states + bias)
+    assert output[1] is attention_weights
+
+
+def test_deferred_bias_rejects_non_tensor_primary_output():
+    """Malformed structured outputs fail before bias is applied to a wrong field."""
+    with pytest.raises(TypeError, match="output index 0 to be a Tensor"):
+        _add_bias_to_primary_output((None, torch.ones(4)), torch.ones(4), "TinyAttention")
 
 
 # ==========================================================================
@@ -238,6 +264,19 @@ class TestUpdateModuleHeadCounts:
         assert attn.num_heads == 4
         assert not hasattr(attn, "_hp_full_head_counts")
 
+    def test_user_tp_attr_divide_is_idempotent(self):
+        attn = TinyLlamaAttention(TinyConfig())
+        attn.hidden_size = 16
+        assert _update_user_tp_attrs(
+            attn, ("hidden_size",), 2, "self_attn") == 1
+        assert attn.hidden_size == 8
+        assert _update_user_tp_attrs(
+            attn, ("hidden_size",), 2, "self_attn") == 0
+        assert attn.hidden_size == 8
+        with pytest.raises(ValueError, match="incompatible with tp_size=4"):
+            _update_user_tp_attrs(
+                attn, ("hidden_size",), 4, "self_attn")
+
 
 # ==========================================================================
 # 来源: test_s1_role_mapping.py
@@ -259,7 +298,9 @@ T = TEMPLATES["attention"]
     (ParamRole.ROWWISE, "o_proj.weight", Shard(1)),
     (ParamRole.NORM, "weight", Replicate()),
     (ParamRole.MOE_GATE, "gate.weight", Replicate()),
-    (ParamRole.BIAS, "q_proj.bias", Replicate()),
+    (ParamRole.COLWISE, "q_proj.bias", Shard(0)),
+    (ParamRole.BIAS, "o_proj.bias", Replicate()),
+    (ParamRole.BIAS, "unmatched.bias", Replicate()),
 ])
 def test_role_to_tp_placement(role, path, tp_want):
     out = P._placement_for_role(path, role, T, has_tp=True, has_ep=False)
@@ -633,3 +674,236 @@ def test_sp_cp_dim(tiny_llama, make_mesh):
     """SP 开启时 embed out_dst / norm in_src 的 CP 维为 Shard(1)。"""
     spec = _plan(tiny_llama, make_mesh, True, False).modules["model.norm"]
     assert spec.in_src["hidden_states"][CP] == Shard(1)
+
+
+# ==========================================================================
+# 来源: test_s1_deferred_bias.py
+# S1.9: D-22 rowwise bias 后置——_deferred_bias_params 标记检测 / fail-fast /
+# WARNING（检测锚定最终 spec 声明 + 模型结构，与 ParamRole 无关）。
+# ==========================================================================
+
+class _TinyBiasAttention(nn.Module):
+    """q/k/v/o_proj 全部带 bias 的 toy attention（OPT/GPT-NeoX 风格）。"""
+
+    def __init__(self, h=8):
+        super().__init__()
+        self.q_proj = nn.Linear(h, h, bias=True)
+        self.k_proj = nn.Linear(h, h, bias=True)
+        self.v_proj = nn.Linear(h, h, bias=True)
+        self.o_proj = nn.Linear(h, h, bias=True)
+
+    def forward(self, hidden_states):
+        return self.o_proj(
+            self.q_proj(hidden_states) + self.k_proj(hidden_states)
+            + self.v_proj(hidden_states))
+
+
+class _TinyBiasAttnModel(nn.Module):
+    def __init__(self, h=8):
+        super().__init__()
+        self.config = _Cfg(architectures=["TinyBiasForCausalLM"],
+                           model_type="tiny_bias")
+        self.self_attn = _TinyBiasAttention(h)
+
+    def forward(self, hidden_states):
+        return self.self_attn(hidden_states)
+
+
+class _CustomLinear(nn.Module):
+    """非 nn.Linear 的带 bias 线性层（自研模块；D-22 WARNING + 跳过路径）。"""
+
+    def __init__(self, h=8):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(h, h))
+        self.bias = nn.Parameter(torch.randn(h))
+
+    def forward(self, x):
+        return x @ self.weight.t() + self.bias
+
+
+class _WoBlock(nn.Module):
+    """非标准命名的 rowwise Linear 容器（wo 命中不了任何角色规则）。"""
+
+    def __init__(self, h=8):
+        super().__init__()
+        self.wo = nn.Linear(h, h, bias=True)
+
+    def forward(self, x):
+        return self.wo(x)
+
+
+class _CustomLinearModel(nn.Module):
+    def __init__(self, h=8, block=None):
+        super().__init__()
+        self.config = _Cfg(architectures=["TinyBiasForCausalLM"],
+                           model_type="tiny_bias")
+        self.block = block if block is not None else _CustomLinear(h)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+def _rowwise_spec(weight_path, extra_params=None, out_src=None):
+    """自声明 rowwise 契约（insert/derive=False 形态）。"""
+    params = {weight_path: {TP: Shard(1)}}
+    params.update(extra_params or {})
+    return ModuleShardingSpec(
+        params=params,
+        in_src={"x": {TP: Replicate()}},
+        in_dst={"x": {TP: Replicate()}},
+        out_src=out_src or {TP: Partial()},
+        out_dst={TP: Replicate()},
+    )
+
+
+class TestDeferredBias:
+    """D-22 标记检测（模板推导路径）。"""
+
+    def test_rowwise_bias_deferred(self, make_mesh):
+        """o_proj.bias 被标记后置；q/k/v bias 随权重 COLWISE 不后置。"""
+        mesh = make_mesh((1,), ("tp",))
+        model = _TinyBiasAttnModel()
+        plan = ShardingPlanner().plan(model, mesh, tp_size=2)
+        spec = plan.modules["self_attn"]
+        assert spec._deferred_bias_params == ("o_proj.bias",)
+        # D-19：colwise bias 随权重沿输出通道切分（区域内本地加，不经归约）
+        for name in ("q_proj.bias", "k_proj.bias", "v_proj.bias"):
+            assert spec.params[name][TP] == Shard(0)
+        # rowwise bias 保持 Replicate（归约后整体加一次）
+        assert spec.params["o_proj.bias"][TP] == Replicate()
+
+    def test_explain_shows_deferred_bias(self, make_mesh):
+        mesh = make_mesh((1,), ("tp",))
+        plan = ShardingPlanner().plan(_TinyBiasAttnModel(), mesh, tp_size=2)
+        assert "后置 bias" in plan.explain()
+        assert "o_proj.bias" in plan.explain()
+
+    def test_no_tp_no_defer(self, make_mesh):
+        """无 tp 轴（tp_size=1）→ 无 Partial 归约 → 不后置。"""
+        mesh = make_mesh((1,), ("tp",))
+        plan = ShardingPlanner().plan(_TinyBiasAttnModel(), mesh, tp_size=1)
+        assert plan.modules["self_attn"]._deferred_bias_params == ()
+
+    def test_out_src_non_partial_no_defer(self, make_mesh):
+        """merge 覆盖 out_src 为非 Partial（无边界归约）→ bias 本就只加一次，不后置。"""
+        mesh = make_mesh((1,), ("tp",))
+        overrides = {"self_attn": ModuleShardingSpec(out_src={TP: Replicate()})}
+        plan = ShardingPlanner(plan_overrides=overrides).plan(
+            _TinyBiasAttnModel(), mesh, tp_size=2)
+        assert plan.modules["self_attn"]._deferred_bias_params == ()
+
+    def test_user_insert_spec_rowwise_bias(self, make_mesh):
+        """用户自声明 spec（insert，derive=False）：非标准命名 wo 也按声明判定，
+        且 bias 无需在 params 中声明（物理存在即被检测）。"""
+        mesh = make_mesh((1,), ("tp",))
+        overrides = {"block": _rowwise_spec("wo.weight")}
+        model = _CustomLinearModel(block=_WoBlock())
+        plan = ShardingPlanner(plan_overrides=overrides, derive=False).plan(
+            model, mesh, tp_size=2)
+        assert plan.modules["block"]._deferred_bias_params == ("wo.bias",)
+
+    def test_bias_declared_non_replicate_fails(self, make_mesh):
+        """rowwise 兄弟 + bias 显式声明非 Replicate → fail-fast。"""
+        mesh = make_mesh((1,), ("tp",))
+        overrides = {"block": _rowwise_spec(
+            "wo.weight", extra_params={"wo.bias": {TP: Shard(0)}})}
+        with pytest.raises(ValueError, match="Replicate"):
+            ShardingPlanner(plan_overrides=overrides, derive=False).plan(
+                _CustomLinearModel(block=_WoBlock()), mesh, tp_size=2)
+
+    def test_lm_head_bias_template_mismatch(self, make_mesh):
+        """lm_head 带 bias（权重沿输出维 Shard(0) 而 bias 被 BIAS 兜底为
+        Replicate）→ plan 期 fail-fast 模板不匹配，而不是运行期形状崩溃。"""
+        class _LmHeadBiasModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = _Cfg(architectures=["TinyBiasForCausalLM"],
+                                   model_type="tiny_bias")
+                self.lm_head = nn.Linear(8, 8, bias=True)
+
+            def forward(self, x):
+                return self.lm_head(x)
+
+        mesh = make_mesh((1,), ("tp",))
+        with pytest.raises(ValueError, match="模板不匹配"):
+            ShardingPlanner().plan(_LmHeadBiasModel(), mesh, tp_size=2)
+
+    def test_non_linear_owner_warns_and_skips(self, make_mesh, caplog):
+        """rowwise 契约 + Partial out_src，但 owner 非 nn.Linear → WARNING + 跳过。"""
+        mesh = make_mesh((1,), ("tp",))
+        overrides = {"block": _rowwise_spec("weight",
+                                            extra_params={"bias": {TP: Replicate()}})}
+        with caplog.at_level(logging.WARNING):
+            plan = ShardingPlanner(plan_overrides=overrides, derive=False).plan(
+                _CustomLinearModel(), mesh, tp_size=2)
+        assert plan.modules["block"]._deferred_bias_params == ()
+        assert any("非 nn.Linear" in r.message for r in caplog.records)
+
+    def test_multi_output_partial_fails(self, make_mesh):
+        """多输出 + Partial + rowwise bias：无法归因到唯一输出 → fail-fast。"""
+        mesh = make_mesh((1,), ("tp",))
+        spec = _rowwise_spec(
+            "weight",
+            out_src={"a": {TP: Partial()}, "b": {TP: Partial()}})
+        with pytest.raises(ValueError, match="单输出"):
+            ShardingPlanner(plan_overrides={"block": spec}, derive=False).plan(
+                _CustomLinearModel(), mesh, tp_size=2)
+
+
+# ==========================================================================
+# F2（accuracy_fix_plan.md §2）：Qwen2-MoE 架构覆盖 —— shared_expert_gate
+# 是逐 token 标量门 Linear(H, 1)，"必须复制" ≠ "路由语义"，显式 REPLICATED。
+# ==========================================================================
+
+class _TinyQwen2MoeMlp(nn.Module):
+    """Qwen2-MoE 结构：gate + experts + shared_expert + shared_expert_gate。"""
+
+    def __init__(self, hidden=8, inter=16):
+        super().__init__()
+        self.gate = nn.Linear(hidden, 4, bias=False)
+        self.experts = nn.Module()          # 容器即可（角色由命名规则判定）
+        self.experts.w1 = nn.Parameter(torch.randn(4, inter, hidden))
+        self.shared_expert = nn.Linear(hidden, inter, bias=False)
+        self.shared_expert_gate = nn.Linear(hidden, 1, bias=False)
+
+
+class _TinyQwen2Moe(nn.Module):
+    def __init__(self, architectures=("Qwen2MoeForCausalLM",),
+                 model_type="qwen2_moe"):
+        super().__init__()
+        self.config = _Cfg(architectures=list(architectures),
+                           model_type=model_type)
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList()
+        layer = nn.Module()
+        layer.mlp = _TinyQwen2MoeMlp()
+        self.model.layers.append(layer)
+
+
+class TestQwen2MoeArchOverride:
+    def test_arch_overrides_registered_both_spellings(self):
+        for key in ("qwen2moe", "qwen2_moe"):
+            assert key in ARCH_OVERRIDES
+            assert (["shared_expert_gate"], ParamRole.REPLICATED) in [
+                (pats, r) for pats, r in ARCH_OVERRIDES[key]]
+
+    def test_shared_expert_gate_replicated(self):
+        """shared_expert_gate.weight → REPLICATED（不是 MOE_GATE —— 不会
+        锚定虚假路由边界；不是 SHARED_EXPERT —— 不会把单行权重 Shard(0)
+        成空分片，accuracy_problem.md 10.1）。"""
+        model = _TinyQwen2Moe()
+        clf = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
+        roles = clf.classify(model, "qwen2moe")
+        p = "model.layers.0.mlp."
+        assert roles[p + "shared_expert_gate.weight"] == ParamRole.REPLICATED
+        assert roles[p + "shared_expert.weight"] == ParamRole.SHARED_EXPERT
+        assert roles[p + "gate.weight"] == ParamRole.MOE_GATE
+        assert roles[p + "experts.w1"] == ParamRole.MOE_EXPERT
+
+    def test_model_type_spelling(self):
+        """model_type 拼写（qwen2_moe）同样命中覆盖。"""
+        model = _TinyQwen2Moe(architectures=())
+        clf = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
+        roles = clf.classify(model, "qwen2_moe")
+        assert roles["model.layers.0.mlp.shared_expert_gate.weight"] == (
+            ParamRole.REPLICATED)

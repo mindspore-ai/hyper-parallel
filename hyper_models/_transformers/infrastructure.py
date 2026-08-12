@@ -107,7 +107,13 @@ def instantiate_infrastructure(
             ep_size=getattr(mesh_ctx, "ep_size", 1))
     else:
         plan_overrides = None
-    sharding_planner = ShardingPlanner(plan_overrides=plan_overrides)
+    sharding_planner = ShardingPlanner(
+        plan_overrides=plan_overrides,
+        # F4b escape hatch (accuracy_fix_plan.md §2): exploratory debugging
+        # only — downgrades the uncovered-trainable-param hard error to a
+        # warning. Defaults to fail-fast.
+        allow_uncovered_params=getattr(
+            distributed_setup, "allow_uncovered_params", False))
 
     # FSDP2Manager: build from strategy config if available
     fsdp2_manager = None

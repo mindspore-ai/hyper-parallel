@@ -42,7 +42,7 @@ class ParamRole(Enum):
     SHARED_EXPERT = auto()  # MoE shared expert → EP Replicate + TP colwise/rowwise
     FUSED_QKV = auto()      # fused QKV → Shard(0) (a later SpecialHandler may adjust)
     FUSED_GATE_UP = auto()  # fused gate/up → Shard(0)
-    BIAS = auto()           # bias → always Replicate
+    BIAS = auto()           # unmatched bias → Replicate; Linear bias follows its weight role
     REPLICATED = auto()     # linear-layer weights forced to be replicated
                             # (e.g. MLA q_a/kv_a down projections)
                             # → Replicate on all dims; assigned only explicitly via
@@ -56,30 +56,74 @@ def _match_any(name: str, patterns: List[str]) -> bool:
     return any(p in name for p in patterns)
 
 
-def _build_default_rules() -> List[Tuple[List[str], ParamRole]]:
-    """Default naming rules: list[(patterns, ParamRole)], first match wins.
+# Match modes for default naming rules (accuracy fix F1 — segment-aware
+# matching; the accuracy_problem.md 10.1 misclassification came from matching
+# "shared_expert" as a raw substring of the whole FQN, which also hits
+# "shared_expert_gate").
+SEGMENT_EXACT = "segment_exact"          # a full '.'-segment must equal the pattern
+SEGMENT_SUBSTRING = "segment_substring"  # pattern is a substring OF ONE segment
 
-    Ordering principle: more specific rules come first (shared_experts before
-    experts; dotted patterns of the MoE gate before the bare "gate" word; bias
-    before colwise/rowwise, otherwise q_proj.bias would be captured by
-    colwise). The "ln"/"norm"-style patterns do not misfire on
-    "linear"/"kernel" (neither contains them as a substring).
+
+def _match_pattern(name_lower: str, pattern: str, mode: str) -> bool:
+    """Match one pattern against a lower-cased parameter FQN.
+
+    Dotted patterns (e.g. ".mlp.gate.", "embed_tokens.weight", ".bias")
+    always keep the legacy dotted-path substring semantics. Dot-less patterns
+    are matched per segment according to the rule's declared mode:
+
+    - SEGMENT_EXACT: a whole segment must equal the pattern — for container
+      names ("shared_expert"/"shared_experts") where a longer sibling name
+      ("shared_expert_gate") must NOT match;
+    - SEGMENT_SUBSTRING: the pattern may be a fragment of one segment — for
+      leaf-name fragments ("norm" hits "input_layernorm"; "q_proj" hits
+      "q_proj"), while never spanning a '.' boundary.
+    """
+    if "." in pattern:
+        return pattern in name_lower
+    segments = name_lower.split(".")
+    if mode == SEGMENT_EXACT:
+        return any(seg == pattern for seg in segments)
+    return any(pattern in seg for seg in segments)
+
+
+def _match_rule(name_lower: str, patterns: List[str], mode: str) -> bool:
+    return any(_match_pattern(name_lower, p, mode) for p in patterns)
+
+
+def _build_default_rules() -> List[Tuple[List[str], ParamRole, str]]:
+    """Default naming rules: list[(patterns, ParamRole, match_mode)],
+    first match wins.
+
+    Ordering principle: more specific rules come first (shared_expert(s)
+    before experts; dotted patterns of the MoE gate before the bare "gate"
+    word). Colwise Linear-name rules intentionally precede the generic bias
+    fallback so their bias follows the output-channel shard. The fallback
+    precedes rowwise rules: rowwise bias is a full output vector and remains
+    replicated; adding it exactly once after TP reduction is an execution-
+    layer concern. The "ln"/"norm"-style patterns do not misfire on
+    "linear"/"kernel" (neither contains them within one segment).
+
+    Match modes (F1): MoE container names use SEGMENT_EXACT so that e.g.
+    "shared_expert_gate" is NOT classified SHARED_EXPERT (it is a scalar
+    gate Linear, not the shared expert body — see accuracy_fix_plan.md §2);
+    leaf-name fragments use SEGMENT_SUBSTRING; dotted patterns keep the
+    legacy path-substring semantics regardless of the declared mode.
     """
     return [
         (["embed_tokens.weight", "wte.weight", "tok_embeddings.weight",
-          "embed_in.weight", "word_embeddings.weight"], ParamRole.EMBED),
-        (["lm_head.weight", "embed_out.weight", "output_layer.weight"], ParamRole.LM_HEAD),
-        (["shared_expert"], ParamRole.SHARED_EXPERT),
-        (["experts"], ParamRole.MOE_EXPERT),
-        ([".mlp.gate.", ".router.", "moe_gate", "mlp.router"], ParamRole.MOE_GATE),
-        (["fused_qkv", "qkv_proj", "query_key_value"], ParamRole.FUSED_QKV),
-        (["gate_up_proj", "fused_gate_up", ".w13."], ParamRole.FUSED_GATE_UP),
-        (["a_log", "dt_bias", "gated_delta"], ParamRole.SPECIAL),
-        (["norm", "layernorm", "rmsnorm", "ln_"], ParamRole.NORM),
-        ([".bias"], ParamRole.BIAS),
+          "embed_in.weight", "word_embeddings.weight"], ParamRole.EMBED, SEGMENT_SUBSTRING),
+        (["lm_head.weight", "embed_out.weight", "output_layer.weight"], ParamRole.LM_HEAD, SEGMENT_SUBSTRING),
+        (["shared_expert", "shared_experts"], ParamRole.SHARED_EXPERT, SEGMENT_EXACT),
+        (["experts"], ParamRole.MOE_EXPERT, SEGMENT_SUBSTRING),
+        ([".mlp.gate.", ".router.", "moe_gate", "mlp.router"], ParamRole.MOE_GATE, SEGMENT_SUBSTRING),
+        (["fused_qkv", "qkv_proj", "query_key_value"], ParamRole.FUSED_QKV, SEGMENT_SUBSTRING),
+        (["gate_up_proj", "fused_gate_up", ".w13."], ParamRole.FUSED_GATE_UP, SEGMENT_SUBSTRING),
+        (["a_log", "dt_bias", "gated_delta"], ParamRole.SPECIAL, SEGMENT_SUBSTRING),
+        (["norm", "layernorm", "rmsnorm", "ln_"], ParamRole.NORM, SEGMENT_SUBSTRING),
         (["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", ".w1.", ".w3."],
-         ParamRole.COLWISE),
-        (["o_proj", "down_proj", ".w2."], ParamRole.ROWWISE),
+         ParamRole.COLWISE, SEGMENT_SUBSTRING),
+        ([".bias"], ParamRole.BIAS, SEGMENT_SUBSTRING),
+        (["o_proj", "down_proj", ".w2."], ParamRole.ROWWISE, SEGMENT_SUBSTRING),
     ]
 
 
@@ -87,9 +131,16 @@ class ParameterClassifier:
     """Classifies named_parameters into ParamRole by naming rules + arch overrides (05 §3.6.6).
 
     Rule sources (in decreasing priority):
-      1. ``arch_overrides[arch]`` — explicit (pattern | [patterns], ParamRole) overrides;
-      2. default naming rules (first match);
+      1. ``arch_overrides[arch]`` — explicit (pattern | [patterns], ParamRole)
+         overrides (legacy full-name substring semantics — they are explicit
+         user intent);
+      2. default naming rules (first match; each rule declares its match mode,
+         see ``_build_default_rules``);
       3. no match → ``ParamRole.SKIP``.
+
+    User-supplied ``name_rules`` may use either the current 3-tuple form
+    ``(patterns, role, mode)`` or the legacy 2-tuple form ``(patterns, role)``
+    (treated as full-name substring, the pre-F1 semantics).
     """
 
     def __init__(self, name_rules=None, arch_overrides=None):
@@ -116,8 +167,16 @@ class ParameterClassifier:
             if _match_any(name_lower, [p.lower() for p in patterns]):
                 return forced_role
         # 2. Default naming rules (first match)
-        for patterns, default_role in self._name_rules:
-            if _match_any(name_lower, patterns):
+        for rule in self._name_rules:
+            if len(rule) == 3:
+                patterns, default_role, mode = rule
+            else:  # legacy 2-tuple: full-name substring
+                patterns, default_role = rule
+                mode = None
+            if mode is None:
+                if _match_any(name_lower, patterns):
+                    return default_role
+            elif _match_rule(name_lower, patterns, mode):
                 return default_role
         # 3. Fallback
         return ParamRole.SKIP

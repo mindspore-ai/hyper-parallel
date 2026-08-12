@@ -17,14 +17,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from hyper_models.components.distributed import ep_compute
-from hyper_models.components.distributed.ep_compute import hf_native_ep_compute_fn
+from hyper_models.components.distributed.ep_compute import routed_only_ep_compute_fn
 from hyper_models.components.distributed.ep_utils import (
     MOE_ROUTER_ADAPTERS,
-    _bind_local_expert_forward,
-    _hf_native_ep_compute,
+    bind_local_expert_forward,
+    ep_routed_forward,
+    _local_swiglu_expert_forward,
     _sigmoid_group_router,
     _softmax_topk_router,
-    _swiglu_weights,
+    resolve_swiglu_weights,
     _topk_router_module,
 )
 from hyper_models.components.distributed.injection import (
@@ -38,6 +39,7 @@ from hyper_models.components.distributed.sharding.apply import (
 from hyper_models.components.distributed.sharding_applier import (
     _apply_phase_c,
     _expert_mesh_layout,
+    _rewrap_local_outputs,
     _resolve_local_compute_fn,
     _wrap_local_region_forward,
 )
@@ -91,6 +93,46 @@ def _identity_spec():
         out_src={TP: Shard(1)},
         out_dst={TP: Shard(1)},
     ))
+
+
+class TestRewrapLocalOutputs:
+    def test_preserves_list_and_wraps_all_declared_outputs(self, make_mesh, monkeypatch):
+        """Every declared Tensor output is wrapped and list remains list."""
+        mesh = make_mesh((1,), ("tp",))
+        spec = ModuleShardingSpec(
+            out_src={
+                "hidden": {TP: Replicate()},
+                "aux": {TP: Shard(0)},
+            },
+            out_names=["hidden", "aux", "metadata"],
+        )
+        calls = []
+
+        def fake_from_local(tensor, device_mesh, placements):
+            calls.append((tensor, device_mesh, placements))
+            return f"wrapped-{len(calls)}"
+
+        monkeypatch.setattr(
+            "hyper_models.components.distributed.sharding_applier.DTensor.from_local",
+            fake_from_local,
+        )
+        outputs = [torch.ones(2), torch.zeros(2), None]
+        result = _rewrap_local_outputs(outputs, spec, mesh, ("tp",), "TestModule")
+
+        assert isinstance(result, list)
+        assert result == ["wrapped-1", "wrapped-2", None]
+        assert len(calls) == 2
+
+    def test_declared_output_index_out_of_range_fails(self, make_mesh):
+        """A stale out_names contract fails with boundary context."""
+        mesh = make_mesh((1,), ("tp",))
+        spec = ModuleShardingSpec(
+            out_src={"aux": {TP: Replicate()}},
+            out_names=["hidden", "aux"],
+        )
+        with pytest.raises(ValueError, match="TestModule.*only 1 output"):
+            _rewrap_local_outputs(
+                (torch.ones(2),), spec, mesh, ("tp",), "TestModule")
 
 
 class TestResolveLocalComputeFn:
@@ -298,9 +340,9 @@ class TestTargetLocalComputeFn:
         形参——配置键按名绑定，拼错不得被静默吞掉。"""
         spec = _identity_spec()
         spec.local_compute_fn = Target(
-            hf_native_ep_compute_fn,
+            routed_only_ep_compute_fn,
             target_path="hyper_models.components.distributed."
-                        "ep_compute.hf_native_ep_compute_fn",
+                        "ep_compute.routed_only_ep_compute_fn",
             blok_size="oops")                     # 拼写错误：应为 block_size
         spec.region_dispatch = False
         with pytest.raises(ValueError, match="未声明的键"):
@@ -313,9 +355,9 @@ class TestTargetLocalComputeFn:
         （mesh 家族只能由框架填充）。"""
         spec = _identity_spec()
         spec.local_compute_fn = Target(
-            hf_native_ep_compute_fn,
+            routed_only_ep_compute_fn,
             target_path="hyper_models.components.distributed."
-                        "ep_compute.hf_native_ep_compute_fn",
+                        "ep_compute.routed_only_ep_compute_fn",
             mesh="oops")
         spec.region_dispatch = False
         with pytest.raises(ValueError, match="保留"):
@@ -500,9 +542,21 @@ class TestLocalRegionDispatchThrough:
         torch.testing.assert_close(out, x * 2)
 
 
-class TestHfNativeEpComputeFactory:
-    """内置 EP 工厂（ep_compute.hf_native_ep_compute_fn）：mesh 家族上下文
-    的使用 + 路由内嵌纪律。"""
+class _TinyMoeMod(nn.Module):
+    """Minimal MoE-shaped module for archetype factory tests (gate + experts
+    [+ shared_expert + shared_expert_gate])."""
+    def __init__(self, with_shared=False):
+        super().__init__()
+        self.gate = nn.Linear(4, 4, bias=False)
+        self.experts = nn.ModuleList([nn.Linear(4, 4) for _ in range(4)])
+        if with_shared:
+            self.shared_expert = nn.Linear(4, 4)
+            self.shared_expert_gate = nn.Linear(4, 1, bias=False)
+
+
+class TestEpArchetypeFactories:
+    """内置 EP archetype 工厂（ep_compute.py）：mesh 家族上下文的使用 +
+    路由显式选择 + apply 期接口断言（accuracy_fix_plan.md §3 E2）。"""
 
     class _FakeEpMesh:
         def __getitem__(self, name):
@@ -516,55 +570,67 @@ class TestHfNativeEpComputeFactory:
             return 2
 
     def _capture(self, monkeypatch):
-        """Patch EP helpers and return the metadata captured by their fakes."""
+        """Patch EP primitives and return the metadata captured by the fakes."""
         captured = {}
 
-        def fake_compute(module, hidden_states, *, router_fn, ep_group,
-                         tp_group):
-            captured.update(router_fn=router_fn, ep_group=ep_group,
-                            tp_group=tp_group)
+        def fake_compute(module, hidden_states, *, router_fn, ep_group):
+            captured.update(router_fn=router_fn, ep_group=ep_group)
             return hidden_states
 
         def fake_bind(module, ep_size):
             captured.update(bound_module=module, ep_size=ep_size)
 
-        monkeypatch.setattr(ep_compute, "_hf_native_ep_compute", fake_compute)
-        monkeypatch.setattr(ep_compute, "_bind_local_expert_forward", fake_bind)
+        monkeypatch.setattr(ep_compute, "ep_routed_forward", fake_compute)
+        monkeypatch.setattr(ep_compute, "bind_local_expert_forward", fake_bind)
         return captured
 
     def test_mesh_family_used_directly(self, make_mesh, monkeypatch):
-        """tp_group 回归：shared_experts 的 Partial 归约需要 tp_group——框架
-        传入 tp_mesh，工厂直接取 tp_mesh.get_group() 交给
-        _hf_native_ep_compute（改造初版丢失 tp_group 的回归）。"""
+        """ep_mesh 由框架填入，工厂直接取 ep_mesh.get_group("ep") 交给
+        ep_routed_forward；路由内嵌（默认 softmax top-k）；无 tp_group —
+        nested boundary 的 TP 通信由子边界自封（契约见 ep_utils）。"""
         mesh = make_mesh((1,), ("tp",))
-        module = _TinyMod()
+        module = _TinyMoeMod()
         captured = self._capture(monkeypatch)
-        compute_fn = ep_compute.hf_native_ep_compute_fn(
+        compute_fn = ep_compute.routed_only_ep_compute_fn(
             module=module, mesh=mesh, tp_mesh=mesh["tp"], cp_mesh=None,
             ep_mesh=self._FakeEpMesh())
         compute_fn(module, torch.randn(2, 4))
         assert captured["ep_group"] == "group-ep"
-        assert captured["tp_group"] is mesh["tp"].get_group()
         assert captured["bound_module"] is module
         assert captured["ep_size"] == 2
         # 路由内嵌：默认 softmax top-k（框架不决定 router，spec 无此字段）
         assert captured["router_fn"] is _softmax_topk_router
 
-    def test_tp_group_none_without_tp(self, monkeypatch):
-        """tp_mesh=None（无 tp 轴）→ tp_group=None（shared_experts 场景由
-        _hf_native_ep_compute fail-fast）。"""
+    def test_interface_assertion_fails_fast(self, monkeypatch):
+        """选错 archetype（模块缺 shared_expert/shared_expert_gate）→
+        apply 期 ValueError，报错列出模块实际子模块名。"""
+        self._capture(monkeypatch)
+        module = _TinyMoeMod(with_shared=False)
+        with pytest.raises(ValueError, match="shared_expert") as exc_info:
+            ep_compute.qwen2moe_ep_compute_fn(
+                module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+                ep_mesh=self._FakeEpMesh())
+        msg = str(exc_info.value)
+        assert "gate" in msg and "experts" in msg  # 实际子模块名可见
+
+    def test_qwen2moe_factory_combines_shared_and_gate(self, monkeypatch):
+        """qwen2moe archetype 合并公式：routed + sigmoid(gate(x)) * shared(x)
+        —— shared_expert 调用是普通子模块调用（nested boundary 契约），
+        不做任何补偿通信。"""
         captured = self._capture(monkeypatch)
-        mesh = type("M", (), {"mesh_dim_names": ("cp",)})()
-        module = _TinyMod()
-        compute_fn = ep_compute.hf_native_ep_compute_fn(
-            module=module, mesh=mesh, tp_mesh=None, cp_mesh=None,
+        module = _TinyMoeMod(with_shared=True)
+        compute_fn = ep_compute.qwen2moe_ep_compute_fn(
+            module=module, mesh=None, tp_mesh=None, cp_mesh=None,
             ep_mesh=self._FakeEpMesh())
-        compute_fn(module, torch.randn(2, 4))
-        assert captured["tp_group"] is None
+        x = torch.randn(2, 4)
+        out = compute_fn(module, x)
+        expected = x + torch.sigmoid(module.shared_expert_gate(x)) * module.shared_expert(x)
+        torch.testing.assert_close(out, expected)
+        assert captured["router_fn"] is MOE_ROUTER_ADAPTERS["qwen2moe"]
 
     def test_qwen3_factory_embeds_topk_router(self, monkeypatch):
         """Qwen3-MoE uses its explicit TopKRouter factory."""
-        module = _TinyMod()
+        module = _TinyMoeMod()
         captured = self._capture(monkeypatch)
         compute_fn = ep_compute.qwen3moe_ep_compute_fn(
             module=module,
@@ -578,6 +644,44 @@ class TestHfNativeEpComputeFactory:
         assert captured["router_fn"] is MOE_ROUTER_ADAPTERS["qwen3moe"]
         assert captured["bound_module"] is module
 
+    def test_mixtral_factory_uses_tuple_router_and_training_jitter(self, monkeypatch):
+        """Mixtral 5.12 uses its tuple router and jitters the expert input in training."""
+        module = _TinyMoeMod()
+        module.jitter_noise = 0.2
+        module.train()
+        captured = self._capture(monkeypatch)
+        compute_fn = ep_compute.mixtral_ep_compute_fn(
+            module=module,
+            mesh=None,
+            tp_mesh=None,
+            cp_mesh=None,
+            ep_mesh=self._FakeEpMesh(),
+        )
+        hidden_states = torch.ones(2, 4)
+        torch.manual_seed(17)
+        output = compute_fn(module, hidden_states)
+        torch.manual_seed(17)
+        expected = hidden_states * torch.empty_like(hidden_states).uniform_(0.8, 1.2)
+
+        torch.testing.assert_close(output, expected)
+        assert captured["router_fn"] is MOE_ROUTER_ADAPTERS["mixtral"]
+
+    def test_mixtral_factory_disables_jitter_in_eval(self, monkeypatch):
+        """Mixtral evaluation preserves hidden states even when jitter is configured."""
+        module = _TinyMoeMod()
+        module.jitter_noise = 0.2
+        module.eval()
+        self._capture(monkeypatch)
+        compute_fn = ep_compute.mixtral_ep_compute_fn(
+            module=module,
+            mesh=None,
+            tp_mesh=None,
+            cp_mesh=None,
+            ep_mesh=self._FakeEpMesh(),
+        )
+        hidden_states = torch.randn(2, 4)
+        torch.testing.assert_close(compute_fn(module, hidden_states), hidden_states)
+
     def test_custom_factory_embeds_its_router(self, make_mesh, monkeypatch):
         """路由是注入函数的一部分：自定义工厂按名引用 MOE_ROUTER_ADAPTERS
         的适配器并写进自己的 compute fn——框架不参与选择。"""
@@ -588,15 +692,15 @@ class TestHfNativeEpComputeFactory:
             ep_group = ep_mesh.get_group("ep")
 
             def compute_fn(module, hidden_states):
-                return ep_compute._hf_native_ep_compute(
+                return ep_compute.ep_routed_forward(
                     module, hidden_states,
                     router_fn=MOE_ROUTER_ADAPTERS["qwen3moe"],
-                    ep_group=ep_group, tp_group=None)
+                    ep_group=ep_group)
             return compute_fn
 
         fn = qwen3moe_ep_factory(
             mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=self._FakeEpMesh())
-        fn(_TinyMod(), torch.randn(2, 4))
+        fn(_TinyMoeMod(), torch.randn(2, 4))
         assert captured["router_fn"] is MOE_ROUTER_ADAPTERS["qwen3moe"]
         assert captured["ep_group"] == "group-ep"
 
@@ -604,8 +708,8 @@ class TestHfNativeEpComputeFactory:
         """非 EP 边界（框架填入 ep_mesh=None）→ 配置错误 fail-fast。"""
         mesh = type("M", (), {"mesh_dim_names": ("tp",)})()
         with pytest.raises(ValueError, match="ep_mesh"):
-            ep_compute.hf_native_ep_compute_fn(
-                module=_TinyMod(), mesh=mesh, tp_mesh=None, cp_mesh=None,
+            ep_compute.routed_only_ep_compute_fn(
+                module=_TinyMoeMod(), mesh=mesh, tp_mesh=None, cp_mesh=None,
                 ep_mesh=None)
 
 
@@ -768,7 +872,7 @@ def test_softmax_topk_router(tiny_hf_native_moe):
     assert MOE_ROUTER_ADAPTERS["default"] is _softmax_topk_router
 
 
-def test_swiglu_weights_two_naming_families():
+def testresolve_swiglu_weights_two_naming_families():
     """gate/up/down_proj 与 w1/w2/w3 两套命名均可解析；缺矩阵报错。"""
     class Holder(nn.Module):  # pylint: disable=abstract-method
         pass
@@ -777,21 +881,21 @@ def test_swiglu_weights_two_naming_families():
     h1.gate_proj = nn.Parameter(torch.randn(4, 8, 16))
     h1.up_proj = nn.Parameter(torch.randn(4, 8, 16))
     h1.down_proj = nn.Parameter(torch.randn(4, 16, 8))
-    g, u, d = _swiglu_weights(h1)
+    g, u, d = resolve_swiglu_weights(h1)
     assert g is h1.gate_proj and u is h1.up_proj and d is h1.down_proj
 
     h2 = Holder()
     h2.w1 = nn.Parameter(torch.randn(4, 8, 16))
     h2.w3 = nn.Parameter(torch.randn(4, 8, 16))
     h2.w2 = nn.Parameter(torch.randn(4, 16, 8))
-    g, u, d = _swiglu_weights(h2)
+    g, u, d = resolve_swiglu_weights(h2)
     assert g is h2.w1 and u is h2.w3 and d is h2.w2
 
     with pytest.raises(NotImplementedError, match="SwiGLU"):
-        _swiglu_weights(Holder())
+        resolve_swiglu_weights(Holder())
 
 
-def test_swiglu_weights_fused_layout():
+def testresolve_swiglu_weights_fused_layout():
     """D-11 fused 布局：gate_up_proj + down_proj → (fused, None, down)。"""
     class Holder(nn.Module):  # pylint: disable=abstract-method
         pass
@@ -799,24 +903,43 @@ def test_swiglu_weights_fused_layout():
     h = Holder()
     h.gate_up_proj = nn.Parameter(torch.randn(4, 16, 8))
     h.down_proj = nn.Parameter(torch.randn(4, 8, 8))
-    g, u, d = _swiglu_weights(h)
+    g, u, d = resolve_swiglu_weights(h)
     assert g is h.gate_up_proj and u is None and d is h.down_proj
 
     # automodel 命名（gate_and_up_projs/down_projs）同构
     h2 = Holder()
     h2.gate_and_up_projs = nn.Parameter(torch.randn(4, 16, 8))
     h2.down_projs = nn.Parameter(torch.randn(4, 8, 8))
-    g, u, d = _swiglu_weights(h2)
+    g, u, d = resolve_swiglu_weights(h2)
     assert g is h2.gate_and_up_projs and u is None and d is h2.down_projs
 
 
-def test_hf_native_ep_compute_calls_experts_forward(tiny_hf_batched_moe):
+def test_local_expert_forward_uses_declared_activation():
+    """EP expert computation honors the model activation instead of forcing SiLU."""
+    class Experts(nn.Module):  # pylint: disable=abstract-method
+        def __init__(self):
+            super().__init__()
+            self.local_expert_count = 1
+            self.gate_up_proj = nn.Parameter(torch.randn(1, 8, 4))
+            self.down_proj = nn.Parameter(torch.randn(1, 4, 4))
+            self._ep_act_fn = torch.tanh
+
+    experts = Experts()
+    hidden_states = torch.randn(3, 4)
+    expert_indices = torch.zeros(3, dtype=torch.long)
+    output = _local_swiglu_expert_forward(experts, hidden_states, expert_indices)
+    gate_states, up_states = F.linear(hidden_states, experts.gate_up_proj[0]).chunk(2, dim=-1)
+    expected = F.linear(torch.tanh(gate_states) * up_states, experts.down_proj[0])
+    torch.testing.assert_close(output, expected)
+
+
+def testep_routed_forward_calls_experts_forward(tiny_hf_batched_moe):
     """HF-native EP compute enters experts.__call__ for nested FSDP hooks."""
     _ensure_pg()
     mlp = tiny_hf_batched_moe.model.layers[0].mlp
     hidden_states = torch.randn(2, 3, 16)
     expected_output = mlp(hidden_states)
-    _bind_local_expert_forward(mlp, ep_size=1)
+    bind_local_expert_forward(mlp, ep_size=1)
     forward_call_count = 0
 
     def count_forward_call(unused_module, unused_inputs):
@@ -825,7 +948,7 @@ def test_hf_native_ep_compute_calls_experts_forward(tiny_hf_batched_moe):
         forward_call_count += 1
 
     hook = mlp.experts.register_forward_pre_hook(count_forward_call)
-    output = _hf_native_ep_compute(
+    output = ep_routed_forward(
         mlp,
         hidden_states,
         router_fn=MOE_ROUTER_ADAPTERS["qwen3moe"],
@@ -839,7 +962,7 @@ def test_hf_native_ep_compute_calls_experts_forward(tiny_hf_batched_moe):
 
 
 def test_topk_router_module_adapter(tiny_hf_batched_moe):
-    """qwen3moe adapter：直接取 TopKRouter 模块返回的 (indices, scores)。"""
+    """Qwen2/Qwen3/Mixtral adapter：直接取 TopKRouter 的 indices 和 scores。"""
     mlp = tiny_hf_batched_moe.model.layers[0].mlp
     torch.manual_seed(5)
     hidden = torch.randn(2, 3, 16)
@@ -847,7 +970,9 @@ def test_topk_router_module_adapter(tiny_hf_batched_moe):
     _, ref_w, ref_idx = mlp.gate(hidden)
     assert torch.equal(idx, ref_idx)
     torch.testing.assert_close(w, ref_w)
+    assert MOE_ROUTER_ADAPTERS["qwen2moe"] is _topk_router_module
     assert MOE_ROUTER_ADAPTERS["qwen3moe"] is _topk_router_module
+    assert MOE_ROUTER_ADAPTERS["mixtral"] is _topk_router_module
 
 
 def test_sigmoid_group_router_adapter():
