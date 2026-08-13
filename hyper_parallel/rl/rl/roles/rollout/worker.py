@@ -14,7 +14,7 @@
 # ============================================================================
 """Role-level facade around the default token-first AgentRunner."""
 
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 from rl.agentic import AgentRunner
 from rl.contracts import ExperienceBatch, PromptRecord
@@ -40,6 +40,7 @@ class RolloutManager:
         eos_token_id: int,
         do_sample: bool = True,
         collect_old_log_probs: bool = False,
+        seed: Optional[int] = None,
     ) -> None:
         """Initialize rollout orchestration and generation settings."""
         settings = GenerationSettings(
@@ -51,6 +52,7 @@ class RolloutManager:
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             collect_log_probs=collect_old_log_probs,
+            seed=seed,
         )
         self.agent_runner = AgentRunner(
             engine=engine,

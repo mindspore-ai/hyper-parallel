@@ -129,6 +129,47 @@ def test_dataset_supports_configurable_parquet_columns(tmp_path: Path) -> None:
     assert sample["ground_truth"] == "7"
 
 
+def test_dataset_supports_historical_gsm8k_chat_schema(tmp_path: Path) -> None:
+    """The retained parity dataset should preserve its existing chat instruction."""
+    parquet_path = tmp_path / "historical.parquet"
+    historical_prompt = f"Historical question? {PROMPT_INSTRUCTION}"
+    pd.DataFrame(
+        {
+            "prompt": [[{"role": "user", "content": historical_prompt}]],
+            "extra_info": [{"answer": "Reasoning\n#### 42", "split": "train", "index": 0}],
+        }
+    ).to_parquet(parquet_path)
+    dataset = PromptDataset(
+        str(parquet_path),
+        FakeTokenizer(),
+        max_prompt_length=128,
+        prompt_column="prompt",
+        answer_column="extra_info",
+    )
+
+    sample = dataset[0]
+
+    assert sample["source_prompt"] == historical_prompt
+    assert sample["prompt"] == historical_prompt
+    assert sample["prompt"].count(PROMPT_INSTRUCTION) == 1
+    assert sample["ground_truth"] == "42"
+
+
+def test_dataset_can_limit_training_prefix_for_smoke(tmp_path: Path) -> None:
+    """A smoke config should avoid exposing unused rows to the sampler."""
+    parquet_path = tmp_path / "train.parquet"
+    _write_prompt_parquet(parquet_path, rows=5)
+
+    dataset = PromptDataset(
+        str(parquet_path),
+        FakeTokenizer(),
+        max_prompt_length=128,
+        max_samples=2,
+    )
+
+    assert len(dataset) == 2
+
+
 def test_collate_left_pads_prompts(tmp_path: Path) -> None:
     """Verify collate produces aligned left-padded tensors and metadata lists."""
     parquet_path = tmp_path / "train.parquet"

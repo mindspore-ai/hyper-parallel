@@ -1502,12 +1502,20 @@ class MindSporePlatform(Platform):
         return _MicroBatch(micro_batch_num, args_batch_dim, kwargs_batch_dim)
 
     @staticmethod
-    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
+    def get_model_state_dict(
+        model: Any,
+        *,
+        options: Any = None,
+        full_state_dict: Optional[bool] = None,
+        cpu_offload: Optional[bool] = None,
+    ) -> dict[str, Any]:
         """Get the state dictionary of a model (not yet supported on MindSpore).
 
         Args:
             model: The model to extract state from.
             options: Optional configuration for state dict extraction.
+            full_state_dict: Optional backend-neutral full-state selection.
+            cpu_offload: Optional backend-neutral output placement selection.
 
         Returns:
             dict: The state dictionary containing model parameters and buffers.
@@ -1516,7 +1524,37 @@ class MindSporePlatform(Platform):
             NotImplementedError: MindSpore support is not yet implemented.
         """
         raise NotImplementedError(
-            "get_model_state_dict is not yet supported on MindSpore"
+            "get_model_state_dict is not yet supported on MindSpore: "
+            f"options={options}, full_state_dict={full_state_dict}, cpu_offload={cpu_offload}"
+        )
+
+    @staticmethod
+    def get_tensor_ipc_rebuild_args(tensor: Any) -> tuple[Any, ...]:
+        """Reject tensor IPC because MindSpore does not expose this transport."""
+        raise NotImplementedError(
+            f"Tensor IPC rebuild arguments are not supported on MindSpore: tensor={type(tensor)!r}"
+        )
+
+    @staticmethod
+    def gather_state_dict(state_dict: dict[str, Any], *, cpu_offload: bool = False) -> dict[str, Any]:
+        """Reject distributed state gathering because MindSpore does not support it yet."""
+        raise NotImplementedError(
+            "State-dict gathering is not supported on MindSpore: "
+            f"keys={list(state_dict)}, cpu_offload={cpu_offload}"
+        )
+
+    @staticmethod
+    def get_tensor_distribution_spec(tensor: Any) -> tuple[Any, ...]:
+        """Describe the mesh and placements that determine MindSpore collectives."""
+        if not isinstance(tensor, DTensorBase):
+            return ("tensor",)
+        mesh = tensor.device_mesh
+        return (
+            "dtensor",
+            str(mesh.device_type),
+            tuple(mesh.mesh_shape),
+            tuple(mesh.rank_list),
+            tuple(repr(placement) for placement in tensor.placements),
         )
 
     @staticmethod

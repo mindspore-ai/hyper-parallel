@@ -14,10 +14,10 @@
 - 通过 requirements 创建冻结 reference 和可选 Critic，GRPO 不创建 Critic；
 - 由 `dataset.ExperienceBuilder` 准备 reference log-probs、values、advantages/returns；
 - 单轮与多轮 rollout 都产出 token-first `Trajectory/ExperienceBatch`；
-- 注册 vLLM 适配器和版本化 refitter 契约，但在提供具体 refitter 前不允许 Trainer 选择；
+- 注册 Hyper Qwen3.5 vLLM adapter，并通过分卡 HCCL 或共卡 DP/NPU IPC refitter 完成同步 Trainer 版本闭环；
 - 同时提供框架控制的 `AgentRunner` 和用户控制的 `ProgramAgentRunner`。
 
-本次没有实现 Ray、异步队列、工具沙箱、partial rollout、具体 vLLM refitter 或 Critic checkpoint。PPO/Critic 已完成代码与 CPU 契约测试，但尚未做 Qwen PPO NPU 端到端声明。
+本次没有实现 Ray、异步队列、工具沙箱、partial rollout、共卡推理 TP 或 Critic checkpoint。PPO/Critic 已完成代码与 CPU 契约测试，但尚未做 Qwen PPO NPU 端到端声明。
 
 ## 2. 目录结构
 
@@ -35,7 +35,7 @@ hyper-parallel/
         │   ├── roles/                  # 训推引擎、并行角色与权重同步
         │   │   ├── model.py            # Hyper/vLLM 共享模型注册
         │   │   ├── policy/             # actor、按需 critic、value adapter
-        │   │   ├── rollout/            # worker、Hyper infer、vLLM、registry
+        │   │   ├── rollout/            # worker、Hyper/vLLM engines、Qwen adapter、plugin
         │   │   └── weight_sync/        # versioned PolicySnapshot
         │   ├── algorithm/
         │   │   ├── components/         # Recipe 内部数学复用
@@ -76,7 +76,7 @@ hyper-parallel/
 Trainer
  ├── Algorithm Registry ──► GRPOAlgorithm | PPOAlgorithm
  ├── Model Registry ──────► ModelRegistration
- ├── Engine Registry ─────► HyperGenerationEngine
+ ├── Engine Registry ─────► HyperGenerationEngine | VLLMGenerationEngine
  ├── RolloutManager ──────► AgentRunner ──────► Trajectory
  ├── dataset.ExperienceBuilder ─► requirements-driven ExperienceBatch
  ├── ActorManager ────────► algorithm.compute_actor_loss()
@@ -204,9 +204,9 @@ Action mask    required
 `GenerationEngine` 统一输入：padded token ids、attention mask、generation settings；统一输出：sequences、可选 rollout log-probs、耗时和可选显式 response mask。每个引擎还维护已加载的 `policy_version`，只接受单调递增的 `PolicySnapshot`。
 
 - Hyper：共用 actor，无权重复制；更新只推进 snapshot 版本；固定 decode 次数确保 FSDP ranks collective 对齐；已双卡验证。
-- vLLM：延迟 import、支持变长 mask 和采样 log-probs 适配；只有真实 `VLLMWeightRefitter.refit()` 成功后才推进版本。
+- vLLM：延迟启动独立 `vllm serve`、支持变长 mask 和采样 log-probs；分卡使用 `HCCLWeightRefitter`，共卡使用 FSDP CPU offload、sleep level 1 和 `NPUIPCWeightRefitter` 更新 rank-local TP1 replica。
 
-当前同步 Trainer 会拒绝 `rollout.engine=vllm`，原因是仓库没有绑定某一种 vLLM 部署拓扑的具体 refitter。版本与 stale-policy 校验已经存在，但不能用空 refitter 冒充已加载权重。
+同步 Trainer 允许选择 `rollout.engine=vllm`。训练进程只持有 HTTP/weight-transfer 代理，vLLM runtime 在独立进程中初始化。分卡 HCCL 路径限制为单训练 rank；共卡路径支持单节点多 rank FSDP 与一 rank 一 TP1 推理 replica。全部 replica 完成 refit、KV wake 和 resume 后才推进版本，任何一步失败都不确认新版本。adapter 的独立 rollout gate仍支持 TP1/TP2，但共卡在线 TP 尚未实现。
 
 ## 8. Agentic 最小主路径
 
@@ -245,7 +245,7 @@ CPU/契约测试覆盖：
 - group advantage、clipping、reference KL、梯度；
 - 多 mini-batch 使用更新后的 current policy；
 - Hyper engine 模式恢复与 old log-probs；
-- vLLM lazy registration、变长 response mask 与“refit 成功才推进版本”；
+- vLLM lazy server、设备环境隔离、变长 response mask、CPU/HCCL/NPU IPC refit 与“完整成功才推进版本”；
 - Trajectory/ExperienceBatch token alignment；
 - GSM8K Environment reward 与 close；
 - 两轮 AgentRunner、全序列多段 action mask 与 log-prob 对齐；
@@ -260,13 +260,15 @@ CPU/契约测试覆盖：
 - AgentRunner 主路径的快速 2×32 smoke；
 - AgentRunner 主路径的 6×300 有效 GRPO 更新，非零 reward、policy loss 和 gradient。
 
-复现命令和本次指标见 [docs/REPRODUCE_GRPO.md](docs/REPRODUCE_GRPO.md)。
+原生 GRPO 复现命令和指标见 [reproduce_grpo.md](reproduce_grpo.md)。vLLM 的固定基线见
+[vllm_compatibility.md](vllm_compatibility.md)，联合启动故障、外部 server + HCCL 修复和最新验收矩阵见
+[vllm_online_rollout_status.md](vllm_online_rollout_status.md)。
 
 ## 11. 下一步边界
 
 当前最值得借鉴的四点已落到代码：requirements-driven ExperienceBuilder、按需 Critic/PPO Recipe、用户拥有控制流的 ProgramAgentRunner、版本化 PolicySnapshot/refitter 契约。下一步严格按以下顺序继续：
 
 1. 补齐 Critic checkpoint/save-resume，并跑 Qwen PPO NPU 端到端；
-2. 为确定的 vLLM 部署方式实现真实 refitter，并增加两步 stale-policy 测试；
+2. 在已验证的共卡 DP/TP1 基础上实现推理 TP shard mapping，并增加多节点和故障恢复；
 3. 增加真实工具 Agent 的超时、错误和资源边界；
 4. 有吞吐证据后再做异步 queue、backpressure、partial rollout 与 off-policy correction。

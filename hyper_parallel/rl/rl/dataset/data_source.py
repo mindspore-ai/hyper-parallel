@@ -15,7 +15,7 @@
 """Stateful prompt sources and deterministic evaluation partitioning."""
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import pandas as pd
 
@@ -34,6 +34,7 @@ class PromptDataset:
         max_prompt_length: Maximum number of prompt tokens.
         prompt_column: Parquet column containing raw prompts.
         answer_column: Parquet column containing expected answers.
+        max_samples: Optional stable prefix size for fast smoke tests.
         prompt_formatter: Converts a raw prompt into the rollout prompt.
         ground_truth_extractor: Converts a raw answer into its canonical value.
     """
@@ -45,6 +46,7 @@ class PromptDataset:
         max_prompt_length: int,
         prompt_column: str = "question",
         answer_column: str = "answer",
+        max_samples: Optional[int] = None,
         prompt_formatter: Callable[[str], str] = format_prompt,
         ground_truth_extractor: Callable[[str], str] = extract_ground_truth,
     ) -> None:
@@ -62,8 +64,12 @@ class PromptDataset:
             raise ValueError(f"Prompt parquet is missing required columns: {sorted(missing)}")
         if frame.empty:
             raise ValueError(f"Prompt parquet contains no rows: {path}")
-        self._prompt_sources = frame[prompt_column].astype(str).tolist()
-        self._answer_sources = frame[answer_column].astype(str).tolist()
+        if max_samples is not None:
+            if max_samples <= 0:
+                raise ValueError(f"max_samples must be positive or null, got {max_samples}")
+            frame = frame.iloc[:max_samples]
+        self._prompt_sources = frame[prompt_column].tolist()
+        self._answer_sources = frame[answer_column].tolist()
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
         self._prompt_formatter = prompt_formatter
@@ -83,7 +89,37 @@ class PromptDataset:
             Prompt text, token tensors, ground truth, and stable sample index.
         """
         prompt_source = self._prompt_sources[index]
-        prompt = self._prompt_formatter(prompt_source)
+        if hasattr(prompt_source, "tolist"):
+            prompt_source = prompt_source.tolist()
+        if isinstance(prompt_source, str):
+            source_prompt = prompt_source
+            prompt = self._prompt_formatter(prompt_source)
+        elif isinstance(prompt_source, Sequence) and not isinstance(prompt_source, (str, bytes)):
+            messages = list(prompt_source)
+            if len(messages) != 1 or not isinstance(messages[0], Mapping):
+                raise ValueError(
+                    "Structured prompt sources must contain exactly one chat message"
+                )
+            role = messages[0].get("role")
+            content = messages[0].get("content")
+            if role != "user" or not isinstance(content, str) or not content.strip():
+                raise ValueError(
+                    "Structured prompt sources must contain one non-empty user message"
+                )
+            source_prompt = content.strip()
+            prompt = source_prompt
+        else:
+            raise ValueError(
+                f"Unsupported prompt source type at sample {index}: {type(prompt_source)!r}"
+            )
+
+        answer_source = self._answer_sources[index]
+        if isinstance(answer_source, Mapping):
+            answer_source = answer_source.get("answer")
+        if not isinstance(answer_source, str):
+            raise ValueError(
+                f"Answer source at sample {index} must be text or contain an 'answer' field"
+            )
         messages = [{"role": "user", "content": prompt}]
         encoded = self._tokenizer.apply_chat_template(
             messages,
@@ -108,9 +144,9 @@ class PromptDataset:
             )
         return {
             "sample_index": index,
-            "source_prompt": prompt_source,
+            "source_prompt": source_prompt,
             "prompt": prompt,
-            "ground_truth": self._ground_truth_extractor(self._answer_sources[index]),
+            "ground_truth": self._ground_truth_extractor(answer_source),
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }

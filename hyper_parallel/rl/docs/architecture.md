@@ -15,7 +15,7 @@
 
 本文同时描述目标架构与已经固定的公开边界。当前代码结构和验证状态参见 [代码结构](code_structure.md)。
 
-截至 2026-08-03，当前实现已有完整 GRPO/PPO Recipe、requirements-driven ExperienceBuilder、按需 Qwen Critic、两种 Agent runner、统一 Trajectory/action mask 和版本化 PolicySnapshot。GRPO 已完成双卡 NPU 闭环；PPO/Critic 目前完成 CPU 契约验证。Critic checkpoint、具体 vLLM refitter、真实 Tool Router 和异步训练仍属于后续阶段。
+截至 2026-08-10，当前实现已有完整 GRPO/PPO Recipe、requirements-driven ExperienceBuilder、按需 Qwen Critic、两种 Agent runner、统一 Trajectory/action mask 和版本化 PolicySnapshot。GRPO 已完成双卡 NPU 闭环；vLLM 已接入 Hyper Qwen3.5 adapter、独立 server、分卡 HCCL 和共卡 DP/NPU IPC refitter；PPO/Critic 目前完成 CPU 契约验证。Critic checkpoint、共卡推理 TP、真实 Tool Router 和异步训练仍属于后续阶段。
 
 ## 2. 设计原则
 
@@ -1632,7 +1632,7 @@ Checkpoint Save/Resume Determinism
 
 ## 22. 从当前 Demo 的迁移计划
 
-截至 2026-08-03 的状态：阶段一与统一 Trajectory 已完成；完整 GRPO/PPO Recipe、ExperienceBuilder、按需 Critic、双 Agent runner 和 PolicySnapshot 契约已落地。以下保留为演进检查表。
+截至 2026-08-10 的状态：阶段一与统一 Trajectory 已完成；完整 GRPO/PPO Recipe、ExperienceBuilder、按需 Critic、双 Agent runner、Hyper Qwen3.5 vLLM adapter、外部 server、分卡 HCCL 和共卡 DP/NPU IPC refitter 已落地。以下保留为演进检查表。
 
 ### 阶段一：建立边界，不改变行为
 

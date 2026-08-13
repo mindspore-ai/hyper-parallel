@@ -66,6 +66,45 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertIs(buffers["persistent"], module.persistent)
         self.assertIs(buffers["scratch"], module.scratch)
 
+    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.get_model_state_dict")
+    def test_get_model_state_dict_builds_backend_options(self, mock_get_state_dict):
+        """Backend-neutral flags are converted to Torch state-dict options."""
+        model = object()
+        mock_get_state_dict.return_value = {"weight": mock.sentinel.weight}
+
+        result = TorchPlatform.get_model_state_dict(
+            model,
+            full_state_dict=True,
+            cpu_offload=False,
+        )
+
+        self.assertEqual(result, {"weight": mock.sentinel.weight})
+        options = mock_get_state_dict.call_args.kwargs["options"]
+        self.assertTrue(options.full_state_dict)
+        self.assertFalse(options.cpu_offload)
+
+    @patch("torch.multiprocessing.reductions.reduce_tensor")
+    def test_get_tensor_ipc_rebuild_args_drops_rebuild_callable(self, mock_reduce_tensor):
+        """Tensor IPC exposes only the native rebuild argument tuple."""
+        tensor = torch.ones(1)
+        mock_reduce_tensor.return_value = (mock.sentinel.rebuild, ("storage", 1))
+
+        rebuild_args = TorchPlatform.get_tensor_ipc_rebuild_args(tensor)
+
+        self.assertEqual(rebuild_args, ("storage", 1))
+        mock_reduce_tensor.assert_called_once_with(tensor)
+
+    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils._gather_full_state_dict")
+    def test_gather_state_dict_delegates_prevalidated_mapping(self, mock_gather):
+        """Torch gathers the exact mapping already validated by the caller."""
+        state_dict = {"weight": mock.sentinel.weight}
+        mock_gather.return_value = {"weight": mock.sentinel.full_weight}
+
+        result = TorchPlatform.gather_state_dict(state_dict, cpu_offload=False)
+
+        self.assertEqual(result, {"weight": mock.sentinel.full_weight})
+        mock_gather.assert_called_once_with(state_dict, False)
+
     def test_dtensor_data_setter_updates_wrapper_and_local_tensor(self):
         """Assigning ``dtensor.data = x`` should synchronize wrapper and local tensor payloads."""
         class FakeDataDescriptor:

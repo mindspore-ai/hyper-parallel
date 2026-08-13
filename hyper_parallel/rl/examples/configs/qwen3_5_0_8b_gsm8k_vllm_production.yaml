@@ -1,32 +1,49 @@
 model:
   registry_name: qwen3_5_0_8b
   name: qwen3_5
-  weights_path: /workspace/models/Qwen3.5-0.8B-Base
-  tokenizer_path: /workspace/models/Qwen3.5-0.8B-Base
+  weights_path: /models/Qwen3.5-0.8B-Base
+  tokenizer_path: /models/Qwen3.5-0.8B-Base
   config_overrides: null
 
 data:
-  train_path: /workspace/data/gsm8k/train.parquet
-  test_path: /workspace/data/gsm8k/test.parquet
+  train_path: /data/gsm8k/train.parquet
+  test_path: /data/gsm8k/test.parquet
   prompt_column: prompt
   answer_column: extra_info
   max_prompt_length: 256
+  max_train_samples: null
   shuffle: true
   num_workers: 0
   prefetch_factor: null
   pin_memory: true
 
 rollout:
-  engine: hyper
-  num_return_sequences: 2
-  max_new_tokens: 32
+  engine: vllm
+  num_return_sequences: 6
+  max_new_tokens: 300
   temperature: 1.0
   top_p: 1.0
   top_k: 0
+  seed: 20260811
   vllm:
+    deployment: colocated
+    port: 8100
+    model_implementation: hyper
     tensor_parallel_size: 1
     dtype: bfloat16
-    trust_remote_code: true
+    trust_remote_code: false
+    enforce_eager: true
+    batch_invariant: true
+    enable_prefix_caching: false
+    skip_mm_profiling: true
+    gpu_memory_utilization: 0.5
+    kv_cache_memory_bytes: 2147483648
+    request_concurrency: 12
+    max_model_len: 640
+    max_num_seqs: 16
+    max_num_batched_tokens: 4096
+    startup_timeout: 600
+    request_timeout: 600
 
 agentic:
   environment: gsm8k
@@ -34,16 +51,16 @@ agentic:
   max_observation_tokens: 0
 
 evaluation:
-  enabled: false
-  batch_size: 1
-  max_samples: 2
-  max_new_tokens: 32
+  enabled: true
+  batch_size: 16
+  max_samples: 128
+  max_new_tokens: 300
   temperature: 1.0
   top_p: 1.0
   top_k: 0
   do_sample: false
-  log_samples: 0
-  progress_steps: 0
+  log_samples: 4
+  progress_steps: 4
 
 algorithm:
   name: grpo
@@ -56,13 +73,19 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
-  max_steps: 1
+  max_steps: 1868
   seed: 1234
-  micro_batch_size: 1
-  response_mini_batch_size: 2
+  prompt_batch_size: 2
+  micro_batch_size: 3
+  response_mini_batch_size: 12
   policy_update_epochs: 1
   init_device: meta
   comm_backend: hccl
+  learning_gate:
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+    require_fingerprint_change: false
   accelerator:
     dp_replicate: 1
     dp_shard: 2
@@ -71,6 +94,7 @@ train:
     pp: 1
     reshard_after_forward: true
     comm_fusion: true
+    cpu_offload: true
   mixed_precision:
     enabled: true
     param_dtype: bfloat16
@@ -87,19 +111,19 @@ train:
     betas: [0.9, 0.999]
     foreach: null
   checkpoint:
-    output_dir: outputs/hyper_rl/local_qwen3_5_0_8b_smoke
-    save_steps: 0
-    save_final: false
-    verify_reload: false
+    output_dir: /results/qwen3_5_0_8b_gsm8k_vllm_production/checkpoints
+    save_steps: 250
+    save_final: true
+    verify_reload: true
     load_path: null
 
 logging:
   backends: [console]
   project_name: hyper-rl
-  experiment_name: local_qwen3_5_0_8b_gsm8k_smoke
-  log_steps: 1
+  experiment_name: qwen3_5_0_8b_gsm8k_vllm_production
+  log_steps: 10
   log_samples: 2
   wandb:
     mode: disabled
     entity: null
-    directory: outputs/hyper_rl/wandb
+    directory: /results/qwen3_5_0_8b_gsm8k_vllm_production/wandb

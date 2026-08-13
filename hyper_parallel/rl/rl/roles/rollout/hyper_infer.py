@@ -95,6 +95,9 @@ class HyperGenerationEngine:
             self.actor.train(was_training)
         return GenerationResult(sequences, rollout_log_probs, elapsed)
 
+    def prepare_for_training(self) -> None:
+        """Keep the shared Hyper actor available for synchronous training."""
+
     def update_weights(self, snapshot: PolicySnapshot) -> None:
         """Publish a newer version of the already shared actor weights."""
         if snapshot.payload is not self.actor:
@@ -105,6 +108,9 @@ class HyperGenerationEngine:
                 f"received={snapshot.version}"
             )
         self.policy_version = snapshot.version
+
+    def prepare_for_rollout(self) -> None:
+        """Keep the already-shared actor available for the next rollout."""
 
 
 @ROLLOUT_ENGINES.register("hyper")

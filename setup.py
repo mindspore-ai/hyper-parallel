@@ -352,6 +352,7 @@ if __name__ == '__main__':
         long_description_content_type="text/markdown",
         test_suite="tests",
         packages=get_packages(),
+        py_modules=['hyper_parallel_vllm_plugin'],
         package_dir={"rl": os.path.join("hyper_parallel", "rl", "rl")},
         platforms=[get_platform()],
         include_package_data=True,
@@ -384,6 +385,12 @@ if __name__ == '__main__':
         python_requires='>=3.10,<3.13',
         install_requires=get_install_requires(),
         extras_require=get_extra_requires(),
+        entry_points={
+            'vllm.general_plugins': [
+                'hyper_parallel_models=hyper_parallel_vllm_plugin:register_hyper_models',
+                'hyper_rl_models=rl.roles.rollout.vllm_plugin:register_hyper_models',
+            ],
+        },
         classifiers=[
             'Development Status :: 4 - Beta',
             'Environment :: Console',

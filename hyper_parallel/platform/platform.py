@@ -938,12 +938,20 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement buffers_dict")
 
     @staticmethod
-    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
+    def get_model_state_dict(
+        model: Any,
+        *,
+        options: Any = None,
+        full_state_dict: Optional[bool] = None,
+        cpu_offload: Optional[bool] = None,
+    ) -> dict[str, Any]:
         """Get the state dictionary of a model.
 
         Args:
             model: The model to extract state from.
-            options: Optional configuration for state dict extraction.
+            options: Optional backend-native configuration for state dict extraction.
+            full_state_dict: Optional backend-neutral full-state selection.
+            cpu_offload: Optional backend-neutral output placement selection.
 
         Returns:
             dict: The state dictionary containing model parameters and buffers.
@@ -953,6 +961,56 @@ class Platform:
         """
         raise NotImplementedError(
             "Platform subclasses must implement get_model_state_dict"
+        )
+
+    @staticmethod
+    def get_tensor_ipc_rebuild_args(tensor: Any) -> tuple[Any, ...]:
+        """Return backend-native arguments for rebuilding a shared tensor.
+
+        Args:
+            tensor: Device tensor whose storage will be shared with another process.
+
+        Returns:
+            Backend-native tensor rebuild arguments.
+
+        Raises:
+            NotImplementedError: Platform subclasses must implement this method.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement get_tensor_ipc_rebuild_args"
+        )
+
+    @staticmethod
+    def gather_state_dict(state_dict: dict[str, Any], *, cpu_offload: bool = False) -> dict[str, Any]:
+        """Gather every distributed value in an already validated state dictionary.
+
+        Args:
+            state_dict: Rank-local state dictionary with matching key order on every rank.
+            cpu_offload: Whether gathered values should be offloaded to CPU.
+
+        Returns:
+            A state dictionary containing gathered values.
+
+        Raises:
+            NotImplementedError: Platform subclasses must implement this method.
+        """
+        raise NotImplementedError("Platform subclasses must implement gather_state_dict")
+
+    @staticmethod
+    def get_tensor_distribution_spec(tensor: Any) -> tuple[Any, ...]:
+        """Return stable metadata describing a tensor's collective layout.
+
+        Args:
+            tensor: Plain or distributed tensor to describe.
+
+        Returns:
+            A hashable tuple identifying whether and how the tensor is distributed.
+
+        Raises:
+            NotImplementedError: Platform subclasses must implement this method.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement get_tensor_distribution_spec"
         )
 
     @staticmethod
