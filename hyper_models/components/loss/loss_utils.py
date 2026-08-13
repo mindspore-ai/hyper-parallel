@@ -28,14 +28,14 @@ def count_loss_token(
     """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
     if isinstance(batches, dict):
         batches = [batches]
-    token_len = {
-        "foundation_tokens": torch.tensor(0),
-        "image_decoder_tokens": torch.tensor(0),
-    }
+    token_len: dict[str, torch.Tensor] = {}
 
     def _count(obj):
         if isinstance(obj, dict) and not obj.get("padding_flag", False):
-            token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
+            foundation_tokens = torch.sum(obj["labels"] != IGNORE_INDEX)
+            if "foundation_tokens" in token_len:
+                foundation_tokens = token_len["foundation_tokens"] + foundation_tokens
+            token_len["foundation_tokens"] = foundation_tokens  # text tokens
 
             for key in obj.keys():
                 if key.endswith("_labels"):
@@ -43,7 +43,10 @@ def count_loss_token(
                     token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
 
             if "image_output_mask" in obj:
-                token_len["image_decoder_tokens"] += torch.sum(obj["image_output_mask"])  # image generation tokens
+                image_decoder_tokens = torch.sum(obj["image_output_mask"])
+                if "image_decoder_tokens" in token_len:
+                    image_decoder_tokens = token_len["image_decoder_tokens"] + image_decoder_tokens
+                token_len["image_decoder_tokens"] = image_decoder_tokens  # image generation tokens
         elif isinstance(obj, (list, tuple)):
             for item in obj:
                 _count(item)
@@ -51,6 +54,8 @@ def count_loss_token(
             raise TypeError(f"Unsupported batch type: {type(obj)}")
 
     _count(batches)
+    foundation_tokens = token_len.setdefault("foundation_tokens", torch.tensor(0))
+    token_len.setdefault("image_decoder_tokens", foundation_tokens.new_zeros(()))
     return token_len
 
 

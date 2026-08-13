@@ -15,7 +15,7 @@
 """Text Trainer assembled from the shared BaseTrainer stages."""
 
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
@@ -24,7 +24,6 @@ from hyper_models.components.utils import helper
 from hyper_models.components.utils.device import synchronize
 from hyper_models.trainer.base import BaseTrainer, HyperIter
 from hyper_models.trainer.config import TrainerConfig
-
 
 logger = helper.create_logger(__name__)
 
@@ -44,15 +43,98 @@ class TextTrainer:
         self.base._build_loss()
 
         self._build_model_assets()
-        self.base._build_data_transform()
+        self._build_data_transform()
         self.base._build_dataset()
-        self.base._build_collate_fn()
+        self._build_collate_fn()
         self.base._build_dataloader()
+        self._build_get_batch()
         self.base._compute_train_steps()
+
         self.base._build_optimizer()
         self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
+
+    def _build_model_assets(self) -> None:
+        """Build tokenizer-backed assets for text training."""
+        from hyper_models.components.datasets.llm import build_chat_template
+        model_config = self.base.model_config
+        config: TrainerConfig = self.base.config
+        tokenizer_target = config.model_assets.tokenizer
+        if tokenizer_target is None:
+            self.base.tokenizer = None
+        elif hasattr(tokenizer_target, "pretrained_model_name_or_path"):
+            self.base.tokenizer = tokenizer_target.build()
+        else:
+            self.base.tokenizer = tokenizer_target.build(
+                pretrained_model_name_or_path=config.model.pretrained_model_name_or_path,
+            )
+
+        if config.model_assets.datasets_type in ["plaintext", 'pretokenized']:
+            self.base.model_assets = [model_config, self.base.tokenizer]
+            self.base.chat_template = None
+        else:
+            self.base.chat_template = build_chat_template(config.model_assets.chat_template, self.base.tokenizer)
+            self.base.model_assets = [model_config, self.base.chat_template]
+
+    def _build_data_transform(self) -> None:
+        """Build the configured text sample transform."""
+        if self.base.config.data_transform is None:
+            self.base.data_transform = None
+            return
+        self.base.data_transform = self.base.config.data_transform.build(
+            tokenizer=self.base.tokenizer,
+            chat_template=self.base.chat_template,
+        )
+
+    def _build_collate_fn(self) -> None:
+        """Build the text collator and gradient-accumulation batch count."""
+        from hyper_models.components.datasets.build_collate_fn import calculate_num_micro_batches
+
+        if self.base.config.collate_fn is None:
+            raise ValueError("collate_fn must define a build target")
+        training_config = self.base.config.training
+        self.base.num_micro_batches = calculate_num_micro_batches(
+            global_batch_size=training_config.global_batch_size,
+            micro_batch_size=training_config.micro_batch_size,
+            dp_world_size=self.base.mesh.dp_size,
+        )
+        self.base.collate_fn = self.base.config.collate_fn.build()
+
+    def _build_get_batch(self) -> None:
+        """Build the DataLoader-to-LLM batch adapter."""
+        from hyper_models.components.datasets.llm.get_batch import build_llm_get_batch
+        from hyper_models.components.datasets.parallel import create_batch_parallel_context
+
+        config = self.base.config
+        pp_shared_data = bool(getattr(config.dataloader, "pp_shared_data", False))
+        data_config = getattr(config.dataset, "data_config", {})
+        tokenizer = getattr(self.base, "tokenizer", None)
+        eod_token_id = getattr(
+            tokenizer,
+            "eod",
+            getattr(tokenizer, "eos_token_id", 0),
+        )
+        parallel_context = create_batch_parallel_context(
+            self.base.mesh,
+            pp_shared_data=pp_shared_data,
+        )
+        get_batch_builder = (
+            build_llm_get_batch
+            if config.get_batch is None
+            else config.get_batch.build
+        )
+        self.base.get_batch = get_batch_builder(
+            parallel_context=parallel_context,
+            device=self.base.device,
+            eod_token_id=eod_token_id,
+            reset_position_ids=bool(data_config.get("reset_position_ids", False)),
+            reset_attention_mask=bool(data_config.get("reset_attention_mask", False)),
+            eod_mask_loss=bool(data_config.get("eod_mask_loss", False)),
+            create_attention_mask=bool(
+                data_config.get("create_attention_mask_in_dataloader", True)
+            ),
+        )
 
     @property
     def distributed_setup(self) -> Any:
@@ -68,10 +150,6 @@ class TextTrainer:
     def dp_cp_mesh(self) -> Any:
         """Return the shared data/context-parallel mesh."""
         return self.base.dp_cp_mesh
-
-    def _build_model_assets(self) -> None:
-        """Build tokenizer assets through the shared Target-based stage."""
-        self.base._build_model_assets()
 
     def on_train_begin(self) -> None:
         """Dispatch the training-begin lifecycle hook."""
@@ -94,10 +172,10 @@ class TextTrainer:
         self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(
-        self,
-        loss: Any = None,
-        loss_dict: Any = None,
-        grad_norm: Any = None,
+            self,
+            loss: Any = None,
+            loss_dict: Any = None,
+            grad_norm: Any = None,
     ) -> None:
         """Dispatch the step-end lifecycle hook."""
         self.base.on_step_end(
@@ -107,29 +185,39 @@ class TextTrainer:
         )
 
     def train_step(
-        self,
-        data_iterator: Any,
+            self,
+            data_iterator: Any,
     ) -> Dict[str, float]:
         """Execute one text training step."""
         config = self.base.config
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        first_micro_batch = self.base.get_batch(data_iterator)
         self.base.state.global_step += 1
 
-        self.on_step_begin(micro_batches=micro_batches)
+        self.on_step_begin(micro_batches=None)
         synchronize()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
-        self.base.micro_batches_token_len = count_loss_token(micro_batches)
-        num_micro_steps = len(micro_batches)
+        num_micro_steps = self.base.num_micro_batches
 
-        for micro_step, micro_batch in enumerate(micro_batches):
+        for micro_step in range(num_micro_steps):
+            micro_batch = (
+                first_micro_batch
+                if micro_step == 0
+                else self.base.get_batch(data_iterator)
+            )
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base._configure_fsdp_gradient_sync(
                 micro_step,
                 num_micro_steps,
             )
-            self.base.micro_batch_token_len = count_loss_token(micro_batch)
+            self.base.micro_batch_token_len = count_loss_token(
+                micro_batch.loss_count_inputs()
+            )
+            self.base.micro_batches_token_len = {
+                name: token_count * num_micro_steps
+                for name, token_count in self.base.micro_batch_token_len.items()
+            }
             loss, loss_dict = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
@@ -190,8 +278,8 @@ class TextTrainer:
         )
 
         for epoch in range(
-            self.base.start_epoch,
-            config.training.num_train_epochs,
+                self.base.start_epoch,
+                config.training.num_train_epochs,
         ):
             if hasattr(self.base.train_dataloader, "set_epoch"):
                 self.base.train_dataloader.set_epoch(epoch)
@@ -231,10 +319,7 @@ class TextTrainer:
 
         self.on_train_end()
 
-        if (
-            hasattr(self.base, "data_iterator")
-            and config.dataloader.use_background_prefetcher
-        ):
+        if (hasattr(self.base, "data_iterator") and config.dataloader.use_background_prefetcher):
             self.base.data_iterator.stop()
 
         synchronize()

@@ -18,14 +18,24 @@ set -e
 
 cd "$(dirname "$0")/../.."
 
-NPROC=${NPROC:-8}
+NPROC=${NPROC:-4}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29501}
-export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
 
-python -m examples.training_demo.prepare_model \
-    examples/training_demo/train.yaml \
-    "$@"
+LABEL=${LABEL:-data}
+OUTPUT_DIR="${PWD}/output"
+export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 # 0,1,2,3,4,5,6,7
+
+export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
+export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
+export PYTHONPATH=../../hyper-parallel:$PYTHONPATH
+
+mkdir -p "${OUTPUT_DIR}"
+
+# python -m examples.training_demo.prepare_model \
+#     examples/training_demo/train.yaml \
+#     "$@"
 
 torchrun \
     --nproc_per_node="${NPROC}" \
@@ -34,4 +44,7 @@ torchrun \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --module examples.training_demo.train_text \
     examples/training_demo/train.yaml \
-    "$@"
+    "$@" \
+    2>&1 | tee "${OUTPUT_DIR}/run_${LABEL}.log"
+
+# $(date +%Y%m%d_%H%M%S)
