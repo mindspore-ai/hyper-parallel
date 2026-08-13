@@ -14,6 +14,16 @@
 # ============================================================================
 """Checkpoint components."""
 
+from hyper_models.components.checkpoint.checkpointer import (
+    CHECKPOINTER_REGISTRY,
+    CheckpointerBase,
+    build_checkpointer,
+)
 from hyper_models.components.checkpoint.config import CheckpointingConfig
 
-__all__ = ["CheckpointingConfig"]
+__all__ = [
+    "CHECKPOINTER_REGISTRY",
+    "CheckpointerBase",
+    "CheckpointingConfig",
+    "build_checkpointer",
+]
