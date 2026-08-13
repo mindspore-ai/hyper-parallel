@@ -69,9 +69,9 @@ class DataLoader(StatefulDataLoader):
             batch_sampler: External component that yields rank-local index lists.
             collate_fn: Runtime collator that creates one model micro-batch.
             batch_size: Direct batch size used by Online iterable Datasets.
-            dataloader_type: PanGu sampler scenario selected by the Trainer.
+            dataloader_type: sampler scenario selected by the Trainer.
             data_rearrange_map: Rearrangement configuration consumed by the Trainer.
-            data_sharding: PanGu cyclic sharding policy consumed by the Trainer.
+            data_sharding: cyclic sharding policy consumed by the Trainer.
             drop_last: Sampler policy retained in the target configuration.
             use_background_prefetcher: Trainer iterator policy retained in the
                 target configuration.
@@ -117,7 +117,7 @@ class DataLoader(StatefulDataLoader):
             set_epoch(epoch)
 
     def __iter__(self) -> Any:
-        """Repeat cyclic samplers indefinitely, matching PanGu's iterator wrapper."""
+        """Repeat cyclic samplers indefinitely, matching iterator wrapper."""
         if self.dataloader_type != "cyclic":
             yield from super().__iter__()
             return

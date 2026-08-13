@@ -78,6 +78,8 @@ def build_llm_dataset(
             parallel_context=parallel_context,
         )
     elif source_type == "online":
+        if data_path is None:
+            raise ValueError("Online Datasets require data_path")
         raw_dataset = build_online_dataset(
             data_path=data_path,
             data_config=data_config,

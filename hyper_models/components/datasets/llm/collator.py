@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""PanGu-style LLM micro-batch collation with reserved packing interfaces."""
+"""LLM micro-batch collation with reserved packing interfaces."""
 
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -28,8 +28,8 @@ from hyper_models.components.utils.constants import IGNORE_INDEX
 class LLMCollator:
     """Stack fixed-length text samples into one model micro-batch.
 
-    The active path follows PanGu: Dataset and data transform produce complete
-    fixed-length model samples, and the collator stacks them without changing
+    Dataset and data transform produce complete fixed-length model samples,
+    and the collator stacks them without changing
     labels, masks, position IDs, or sample order. VeOmni-style packing and
     field-specific policies are represented by constructor arguments but are
     intentionally deferred.
@@ -121,7 +121,7 @@ def build_llm_collator(
         ignore_index: int = IGNORE_INDEX,
         pad_to_length: int | None = None,
 ) -> LLMCollator:
-    """Build the PanGu-style LLM micro-batch collator.
+    """Build the LLM micro-batch collator.
 
     Args:
         packing: Reserved switch for VeOmni-style sequence packing.

@@ -57,7 +57,8 @@ class IndexedPretrainDatasetBuilder:
         """Store the inputs required by the indexed pretraining build.
 
         Args:
-            data_path: Indexed prefix, directory, or weighted paths.
+            data_path: Indexed prefix, directory, or weighted paths. May be
+                omitted when mock data is enabled.
             data_config: Indexed pretraining build options.
             train_valid_test_num_samples: Trainer-derived target sizes.
             parallel_context: Distributed Dataset construction callbacks.
@@ -76,7 +77,14 @@ class IndexedPretrainDatasetBuilder:
             Train, validation, and test datasets.
         """
         # Discover indexed files and add their default blend weights.
-        data_paths = self._resolve_data_paths()
+        # Mock Datasets generate their samples and do not need filesystem
+        # discovery. Real indexed Datasets still require an explicit path.
+        if bool(self.data_config.get("mock_data", False)):
+            data_paths = []
+        else:
+            if self.data_path is None:
+                raise ValueError("data_path is required when mock_data is false")
+            data_paths = self._resolve_data_paths()
 
         # Normalize Dataset options. Sample counts remain separate and are
         # passed directly to the split builder.
@@ -117,8 +125,7 @@ class IndexedPretrainDatasetBuilder:
     def _build_instruction_dataset_splits(self, config: GPTDatasetConfig) -> DatasetSplits:
         """Build packed instruction splits through the configured implementation.
 
-        The interface mirrors PanGu's ``build_instruction_dataset`` call while
-        keeping the concrete packed-dataset implementation outside this provider.
+        The concrete packed-dataset implementation remains outside this provider.
 
         Raises:
             NotImplementedError: If no instruction Dataset builder is configured.
@@ -147,6 +154,8 @@ class IndexedPretrainDatasetBuilder:
 
     def _resolve_data_paths(self) -> list[str]:
         """Delegate indexed path discovery to the config build module."""
+        if self.data_path is None:
+            raise ValueError("data_path is required when mock_data is false")
         data_paths = resolve_data_paths(
             self.data_path,
             distributed_walk=bool(self.data_config["distributed_walk"]),
@@ -192,7 +201,7 @@ class IndexedPretrainDatasetBuilder:
 
 def build_indexed_dataset(
         *,
-        data_path: DataPath,
+        data_path: DataPath = None,
         data_config: Mapping[str, Any],
         train_valid_test_num_samples: Sequence[int],
         parallel_context: DatasetParallelContext | None = None,
@@ -200,7 +209,8 @@ def build_indexed_dataset(
     """Build indexed pretraining datasets through the dedicated builder.
 
     Args:
-        data_path: Indexed prefix, directory, or weighted paths.
+        data_path: Indexed prefix, directory, or weighted paths. May be omitted
+            when mock data is enabled.
         data_config: Indexed pretraining build options.
         train_valid_test_num_samples: Trainer-derived target sizes.
         parallel_context: Distributed Dataset construction callbacks assembled

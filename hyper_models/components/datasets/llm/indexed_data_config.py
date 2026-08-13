@@ -110,9 +110,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         """Validate the blended Dataset fields followed by GPT-specific fields."""
         super().__post_init__()
 
-        if self.tokenizer is None:
+        if self.tokenizer is None and not self.mock:
             raise ValueError("Attribute 'tokenizer' must not be None")
-        
+
         if self.reset_position_ids is None:
             raise ValueError("Attribute 'reset_position_ids' must not be None")
         
@@ -138,7 +138,7 @@ def resolve_data_paths(
         Alternating weight and discovered prefix values, for example
         ``["1", "/data/a", "1", "/data/b"]``. If ``data_path`` is not a
         collection of discoverable indexed paths, return it unchanged so an
-        explicit PanGu weight/prefix blend can be parsed by the split builder.
+        explicit weight/prefix blend can be parsed by the split builder.
     """
     # 1. Normalize one path and multiple paths to the same traversal form.
     data_paths = [data_path] if isinstance(data_path, str) else list(data_path)
@@ -159,7 +159,7 @@ def resolve_data_paths(
             file_paths.append(current_path)
             continue
         if not os.path.isdir(current_path):
-            # PanGu keeps args.data_path unchanged when filesystem discovery
+            # Keep args.data_path unchanged when filesystem discovery
             # returns no files. This preserves explicit forms such as
             # ["30", prefix_a, "70", prefix_b] for the blend parser.
             original_paths = list(data_paths)

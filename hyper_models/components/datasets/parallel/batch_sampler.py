@@ -76,7 +76,7 @@ class _DatasetBatchSampler:
             raise ValueError("consumed_samples must be in [0, total_samples)")
 
     def __iter__(self) -> Iterator[list[int]]:
-        """Yield sequential rank-local indices for PanGu ``single`` mode."""
+        """Yield sequential rank-local indices for ``single`` mode."""
         while self.consumed_samples < self.total_samples:
             block_start = self.consumed_samples
             block_stop = min(block_start + self.global_micro_batch_size, self.total_samples)
@@ -165,17 +165,17 @@ class _DatasetBatchSampler:
 
 
 class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
-    """Yield a deterministic shuffled epoch for PanGu ``cyclic`` mode."""
+    """Yield a deterministic shuffled epoch for ``cyclic`` mode."""
 
     def __init__(self, *, data_sharding: bool, **sampler_options: Any) -> None:
-        """Store PanGu's cyclic data-sharding policy."""
+        """Store the cyclic data-sharding policy."""
         super().__init__(**sampler_options)
         if not self.drop_last:
             raise ValueError("cyclic sampling requires drop_last=True")
         self.data_sharding = data_sharding
 
     def _validate_consumed_samples(self, consumed_samples: int, total_samples: int) -> None:
-        """Allow PanGu's global consumed position to span multiple epochs."""
+        """Allow the global consumed position to span multiple epochs."""
         del total_samples
         if consumed_samples < 0:
             raise ValueError("cyclic consumed_samples must be non-negative")
@@ -188,7 +188,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         return remaining_samples // self.global_micro_batch_size
 
     def __iter__(self) -> Iterator[list[int]]:
-        """Reproduce PanGu's epoch permutation and DP slicing process."""
+        """Build the epoch permutation and DP slices."""
         active_samples = self._active_samples()
         self.epoch = self.consumed_samples // active_samples
         current_epoch_samples = self.consumed_samples % active_samples
@@ -197,8 +197,8 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
             raise ValueError("cyclic consumed_samples must align to a global micro-batch")
 
         if self.data_sharding:
-            # PanGu cyclic/data_sharding=True: shuffle inside one contiguous
-            # per-rank bucket, so every rank reads only its own Dataset region.
+            # Shuffle inside one contiguous per-rank bucket so every rank reads
+            # only its own Dataset region.
             bucket_size = (self.total_samples // self.global_micro_batch_size) * self.micro_batch_size
             bucket_offset = current_epoch_samples // self.dp_world_size
             bucket_start = self.dp_rank * bucket_size
@@ -208,7 +208,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
                 for offset in random_offsets[bucket_offset:]
             ]
         else:
-            # PanGu cyclic/data_sharding=False: shuffle globally, skip restored
+            # Shuffle globally, skip restored
             # positions, then distribute indices to DP ranks by striding.
             full_bucket_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
             shuffled_indices = platform.random_permutation(full_bucket_size, self.epoch)
@@ -224,7 +224,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
                 local_batch = []
 
     def set_epoch(self, epoch: int) -> None:
-        """Move to an explicit PanGu cyclic epoch without losing in-epoch progress."""
+        """Move to an explicit cyclic epoch without losing in-epoch progress."""
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ValueError("epoch must be a non-negative integer")
         active_samples = self._active_samples()
@@ -245,7 +245,7 @@ def _resolve_index_mapping(
         index_mapping: IndexMapping | None,
         data_rearrange_map: IndexMapping | str | os.PathLike[str] | None,
 ) -> IndexMapping | None:
-    """Resolve PanGu's optional rearrangement-map configuration."""
+    """Resolve the optional rearrangement-map configuration."""
     if index_mapping is not None and data_rearrange_map is not None:
         raise ValueError("configure only one of index_mapping and data_rearrange_map")
 
@@ -271,7 +271,7 @@ def build_dataset_batch_sampler(
         sampler_type: SamplerType = "single",
         data_sharding: bool = False,
 ) -> _DatasetBatchSampler:
-    """Build one of the PanGu-style Dataset batch-sampling scenarios.
+    """Build a Dataset batch sampler.
 
     The sampler groups logical indices into global DP blocks, gives each DP rank
     one contiguous micro-batch, and checkpoints the next global sample position.
@@ -281,7 +281,7 @@ def build_dataset_batch_sampler(
         - ``single``: Sample sequential Dataset indices.
         - ``single`` with ``data_rearrange_map``: Resolve indices through an
           in-memory mapping or a mapping checkpoint path.
-        - ``cyclic``: Reproduce PanGu's epoch-based ``randperm`` order, with
+        - ``cyclic``: Use epoch-based ``randperm`` order, with
           ``data_sharding=True/False`` and resumable sampler state.
         - ``external``: Handled by the Trainer because an external dataloader
           does not need a Dataset batch sampler.
@@ -294,11 +294,11 @@ def build_dataset_batch_sampler(
         consumed_samples: Global logical sample position restored from a checkpoint.
         drop_last: Whether to omit an incomplete global DP block.
         index_mapping: Optional logical-to-physical sample index mapping.
-        data_rearrange_map: PanGu-compatible mapping object or checkpoint path.
+        data_rearrange_map: Mapping object or checkpoint path.
         sampler_type: ``single`` for sequential sampling or ``cyclic`` for a
             deterministic shuffled epoch.
         data_sharding: Whether cyclic sampling shuffles an independent
-            contiguous bucket on each DP rank, matching PanGu.
+            contiguous bucket on each DP rank.
 
     Returns:
         A resumable iterable of rank-local index lists.
@@ -321,7 +321,7 @@ def build_dataset_batch_sampler(
         batch_sampler = _DatasetBatchSampler(**sampler_options)
         return batch_sampler
     if sampler_type == "cyclic":
-        # Scenario 3 — cyclic: reproduce PanGu's epoch-based randperm order,
+        # Scenario 3 — cyclic: use epoch-based randperm order,
         # support data_sharding=True/False, and checkpoint consumed_samples.
         if resolved_mapping is not None:
             raise ValueError("cyclic sampling does not support a rearrangement map")

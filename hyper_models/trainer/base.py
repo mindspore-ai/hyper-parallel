@@ -470,7 +470,7 @@ class BaseTrainer(Stateful, ABC):
         """Build and assign train, validation, and test Dataset runtime state.
 
         A conventional Dataset target returns one training Dataset. Indexed
-        Provider targets may instead return the PanGu-compatible three-split
+        Provider targets may instead return a three-split
         tuple ``(train, validation, test)``.
         """
         parallel_context = self._build_dataset_parallel_context()
@@ -484,7 +484,7 @@ class BaseTrainer(Stateful, ABC):
         self._assign_dataset_splits(dataset_result)
 
     def _get_train_valid_test_num_samples(self) -> tuple[int, int, int] | None:
-        """Calculate PanGu-style Dataset target sizes from the training plan."""
+        """Calculate Dataset target sizes from the training plan."""
         training_config = self.config.training
         global_batch_size = training_config.global_batch_size
 
@@ -540,10 +540,10 @@ class BaseTrainer(Stateful, ABC):
         raise NotImplementedError("Concrete Trainer must implement _build_collate_fn")
 
     def _build_dataloader(self) -> None:
-        """Build train, validation, and test PanGu-style dataloaders.
+        """Build train, validation, and test dataloaders.
 
         ``single`` reads sequential indices; ``single`` with
-        ``data_rearrange_map`` resolves mapped indices; ``cyclic`` uses PanGu's
+        ``data_rearrange_map`` resolves mapped indices; ``cyclic`` uses an
         epoch-based random order with optional data sharding and resume state;
         ``external`` directly uses the Dataset target's dataloader result.
         """
@@ -575,7 +575,7 @@ class BaseTrainer(Stateful, ABC):
             dataset: Any,
             consumed_samples: int,
     ) -> tuple[Any | None, Any | None]:
-        """Build one split DataLoader with PanGu's sampler and resume inputs."""
+        """Build one split DataLoader with sampler and resume inputs."""
         from ..components.datasets.parallel import build_dataset_batch_sampler
         from ..components.datasets.contracts import is_iterable_dataset
         if dataset is None:
@@ -599,7 +599,7 @@ class BaseTrainer(Stateful, ABC):
         if is_iterable_dataset(dataset):
             # Online iterable data is already shuffled and DP-sharded by its
             # upstream stream. StatefulDataLoader owns worker state and forms
-            # one PanGu-style micro-batch directly without an index sampler.
+            # one micro-batch directly without an index sampler.
             dataloader = self.config.dataloader.build(
                 dataset=dataset,
                 collate_fn=self.collate_fn,
