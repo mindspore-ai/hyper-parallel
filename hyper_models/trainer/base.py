@@ -68,6 +68,7 @@ from .callbacks import (
     LoggingCallback,
     ProfilingCallback,
     TqdmCallback,
+    CheckpointerCallback,
     TrainerState,
 )
 
@@ -490,6 +491,15 @@ class BaseTrainer(Stateful, ABC):
             self.garbage_collection_callback,
             self.profiling_callback,
         ]
+        # Registered to save, to restore, or both --- the two are independent, so
+        # a run that only loads an existing checkpoint still needs the callback.
+        if self.config.checkpoint.save_ckpt or self.config.checkpoint.restore_from is not None:
+            self._callbacks.append(CheckpointerCallback(self))
+        else:
+            logger.info(
+                "Checkpointing is inactive (save_ckpt=false, restore_from=None); "
+                "no checkpoint callback registered."
+            )
 
     def on_train_begin(self):
         for callback in self._callbacks:
