@@ -20,6 +20,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=wrong-import-position
@@ -151,6 +153,42 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         torch.testing.assert_close(hsdp_param.sharded_param.to_local(), loaded_local_tensor)
         torch.testing.assert_close(hsdp_param._sharded_param_data[:6], torch.full((6,), 9.0))
         torch.testing.assert_close(hsdp_param._sharded_param_data[6:], torch.zeros(3))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    def test_plain_tp_local_param_builds_global_fsdp_tp_layout(self, _mock_get_rank):
+        """Dual-mode TP metadata should restore the global shape before FSDP sharding."""
+        root_mesh = DeviceMesh(
+            "cpu",
+            np.array([[0, 1], [2, 3]]),
+            mesh_dim_names=("fsdp", "tp"),
+            _init_backend=False,
+        )
+        mesh_info = object.__new__(FSDPMeshInfo)
+        mesh_info.mesh = root_mesh["fsdp"]
+        mesh_info.shard_mesh_dim = 0
+        mesh_info.replicate_mesh_dim = None
+        mesh_info.shard_mesh_rank = 0
+        mesh_info.shard_mesh_size = 2
+        mesh_info.shard_process_group = None
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(torch.randn(128, 64))
+
+        hsdp_param = TorchHSDPParamV2(
+            module.weight,
+            ParamModuleInfo(module, "weight", [], []),
+            mesh_info,
+            mp_policy=MixedPrecisionPolicy(),
+            device=torch.device("cpu"),
+            tp_grad_info=TPShardMetaInfo(
+                root_mesh["tp"],
+                (Shard(0),),
+                origin_is_dtensor=False,
+            ),
+        )
+
+        self.assertEqual(hsdp_param.sharded_param.local_shape, torch.Size((64, 64)))
+        self.assertEqual(hsdp_param.sharded_param.shape, (256, 64))
+        self.assertEqual(hsdp_param._sharding_spec.tensor_shape, (256, 64))
 
     def test_dim0_smaller_than_world_size_preserves_empty_actual_shape(self):
         """Ranks past the last logical row should expose ``(0, *rest)`` over padded storage."""

@@ -8,9 +8,10 @@ model:
   force_hf: true
 
 training:
-  max_steps: null
+  train_iters: 2
+  eval_iters: 0
   num_train_epochs: 1
-  global_batch_size: 16
+  global_batch_size: 2
   micro_batch_size: 1
   backend: hccl
   init_device: meta
@@ -44,13 +45,14 @@ data_transform:
 
 dataset:
   _target_: hyper_models.components.data.datasets.DummyDataset
-  num_samples: 400
+  num_samples: 32
   seq_len: 32
   vocab_size: 1000
   seed: 42
 
 collate_fn:
-  _target_: hyper_models.components.data.data_collator.MakeMicroBatchCollator
+  _target_: hyper_models.components.datasets.llm.build_llm_collator
+  packing: false
 
 dataloader:
   _target_: hyper_models.components.data.dataloader.DataLoader

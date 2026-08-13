@@ -1,12 +1,17 @@
 # Dual-mode Trainer DP+CP+TP accuracy configuration.
-# The model and optimizer targets are placeholders because the worker keeps a
-# paired standalone model for per-step gradient comparison.
+# The model target is a placeholder because the worker keeps paired standalone
+# and distributed models for per-step AdamW accuracy comparison.
 model:
   _target_: torch.nn.Identity
 
 optimizer:
-  _target_: torch.optim.SGD
-  lr: 0.0001
+  _target_: hyper_models.components.optim.optimizer.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
 
 training:
   backend: hccl

@@ -242,6 +242,53 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
         return tuple(placements)
 
+    def _build_sharding_spec(
+        self,
+        source_param: nn.Parameter,
+        source_local_tensor: torch.Tensor,
+    ) -> Layout:
+        """Build the optimizer parameter layout from its source distribution.
+
+        A dual-mode production parameter is a plain tensor containing only its
+        TP/EP-local shard. Its shape therefore cannot be used as the logical
+        shape of the final FSDP+TP/EP layout. Source layout metadata restores
+        that logical shape before the FSDP placements are applied.
+
+        This method only constructs and returns a layout. It does not mutate
+        the parameter or this managed parameter's lifecycle state.
+
+        Args:
+            source_param: Parameter received by fully_shard before FSDP partitioning.
+            source_local_tensor: Local tensor that FSDP partitions.
+
+        Returns:
+            The layout for the sharded optimizer parameter.
+        """
+        logical_global_stride = None
+        if isinstance(source_param, DTensor):
+            logical_global_size = source_param.size()
+            logical_global_stride = source_param.layout.tensor_stride
+        elif self.tp_grad_info is not None:
+            source_sharding_spec = Layout.from_device_mesh(self.tp_grad_info.mesh)
+            source_sharding_spec.set_placements(self.tp_grad_info.placements)
+            source_sharding_spec.placement_to_tensor_map(source_local_tensor.ndim)
+            logical_global_size = source_sharding_spec.get_global_shape(source_local_tensor.size())
+        else:
+            logical_global_size = source_local_tensor.size()
+
+        if logical_global_stride is None:
+            logical_global_stride = make_contiguous_strides_for(logical_global_size)
+
+        sharding_spec = Layout.from_device_mesh(self._spmd_mesh)
+        sharding_spec.set_placements(self._spmd_placements)
+        sharding_spec.placement_to_tensor_map(source_local_tensor.ndim)
+        sharding_spec.set_tensor_meta(
+            logical_global_size,
+            logical_global_stride,
+            source_local_tensor.dtype,
+        )
+        return sharding_spec
+
     @property
     def reduce_partial_output(self) -> Optional[torch.Tensor]:
         """Return reduce-scatter results accumulated before the final micro-step."""
@@ -414,11 +461,6 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
         self._orig_size = param_data.size()
         self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
-        self._logical_global_size = param.size()
-        if isinstance(param, DTensor) and param.layout.tensor_stride is not None:
-            self._logical_global_stride = param.layout.tensor_stride
-        else:
-            self._logical_global_stride = make_contiguous_strides_for(self._logical_global_size)
 
         if isinstance(self.mesh_info, FSDPMeshInfo):
             self.shard_rank = self.mesh_info.shard_mesh_rank
@@ -479,14 +521,7 @@ class TorchHSDPParamV2(HSDPParamV2):
                 actual_shard_length,
             )
 
-        self._sharding_spec = Layout.from_device_mesh(self._spmd_mesh)
-        self._sharding_spec.set_placements(self._spmd_placements)
-        self._sharding_spec.placement_to_tensor_map(param.ndim)
-        self._sharding_spec.set_tensor_meta(
-            self._logical_global_size,
-            self._logical_global_stride,
-            param_data.dtype,
-        )
+        self._sharding_spec = self._build_sharding_spec(param, param_data)
 
         self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param))
         self.sharded_param._layout = self._sharding_spec
@@ -808,8 +843,8 @@ class TorchHSDPParamV2(HSDPParamV2):
                     "Expected sharded_param._local_tensor to be contiguous"
                 )
         self._sharding_spec.set_tensor_meta(
-            self._logical_global_size,
-            self._logical_global_stride,
+            self._sharding_spec.tensor_shape,
+            self._sharding_spec.tensor_stride,
             local_tensor.dtype,
         )
         self.sharded_param._layout = self._sharding_spec

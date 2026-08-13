@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import TextIO
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -68,13 +69,14 @@ from hyper_parallel import (
     hsdp_sync_stream,
 )
 from hyper_parallel.core.dtensor.placement_types import Placement, Replicate, Shard
+from hyper_parallel.core.utils import clip_grad_norm_
 
 
 _TEST_YAML_DIRECTORY = Path(__file__).with_name("test_yamls")
+_LOG_DIRECTORY = Path("outputs/dualmode_trainer/fsdp_accuracy/adamw")
 _INIT_SEED = 31415
 _DATA_SEED = 27182
 _TRAINING_STEPS = 100
-_LEARNING_RATE = 1.0e-4
 _BATCH_SIZE = 8
 _SEQUENCE_LENGTH = 8
 _VOCAB_SIZE = 128
@@ -334,6 +336,27 @@ def _get_local_gradient(parameter_name: str, parameter: torch.nn.Parameter) -> t
     return gradient.detach().cpu()
 
 
+def _get_local_parameter(parameter: torch.nn.Parameter) -> torch.Tensor:
+    """Return the optimizer parameter's current local value."""
+    parameter_data = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+    return parameter_data.detach().cpu()
+
+
+def _write_step_log(
+    log_file: TextIO,
+    step_index: int,
+    loss: float,
+    grad_norm: float,
+    **errors: float,
+) -> None:
+    """Write one parseable optimizer accuracy record and flush it immediately."""
+    error_fields = "".join(f" {name}={value:.9e}" for name, value in errors.items())
+    log_file.write(
+        f"step={step_index} loss={loss:.9e} grad_norm={grad_norm:.9e}{error_fields}\n"
+    )
+    log_file.flush()
+
+
 def _compare_step(
     step_index: int,
     standalone_model: torch.nn.Module,
@@ -352,7 +375,9 @@ def _compare_step(
     replicate_parameter_name: str,
     standalone_optimizer: torch.optim.Optimizer,
     distributed_optimizer: torch.optim.Optimizer,
-) -> tuple[float, float, float]:
+    standalone_log: TextIO | None,
+    distributed_log: TextIO | None,
+) -> tuple[float, float, float, float]:
     """Run one reference/distributed step and compare loss plus every gradient."""
     standalone_optimizer.zero_grad(set_to_none=True)
     standalone_logits = standalone_model(input_ids=global_tokens).logits
@@ -427,10 +452,60 @@ def _compare_step(
         err_msg=f"step {step_index} local loss mismatch",
     )
 
+    standalone_grad_norm = float(torch.nn.utils.clip_grad_norm_(
+        standalone_model.parameters(),
+        max_norm=float("inf"),
+    ))
+    distributed_grad_norm = float(clip_grad_norm_(
+        distributed_model,
+        max_norm=float("inf"),
+    ))
+    grad_norm_error = abs(distributed_grad_norm - standalone_grad_norm)
+    np.testing.assert_allclose(
+        distributed_grad_norm,
+        standalone_grad_norm,
+        rtol=_RTOL,
+        atol=_ATOL,
+        err_msg=f"step {step_index} gradient norm mismatch",
+    )
+    if standalone_log is not None and distributed_log is not None:
+        _write_step_log(
+            standalone_log,
+            step_index,
+            standalone_loss_value,
+            standalone_grad_norm,
+        )
+        _write_step_log(
+            distributed_log,
+            step_index,
+            distributed_loss_value,
+            distributed_grad_norm,
+            loss_error=abs(distributed_loss_value - standalone_loss_value),
+            grad_norm_error=grad_norm_error,
+            max_parameter_grad_error=maximum_gradient_error,
+        )
+
     with SkipDTensorDispatch():
         standalone_optimizer.step()
         distributed_optimizer.step()
-    return standalone_loss_value, distributed_loss_value, maximum_gradient_error
+
+    for parameter_name, standalone_parameter in standalone_parameters.items():
+        expected_parameter = _expected_local_gradient(
+            standalone_parameter.detach().cpu(),
+            parameter_name,
+            tp_grad_info_by_fqn,
+            mesh_context,
+            replicate_parameter_name,
+        )
+        actual_parameter = _get_local_parameter(distributed_parameters[parameter_name])
+        np.testing.assert_allclose(
+            actual_parameter.numpy(),
+            expected_parameter.numpy(),
+            rtol=_RTOL,
+            atol=_ATOL,
+            err_msg=f"step {step_index}, parameter {parameter_name} optimizer update mismatch",
+        )
+    return standalone_loss_value, distributed_loss_value, maximum_gradient_error, grad_norm_error
 
 
 def _run_accuracy_case(
@@ -498,10 +573,22 @@ def _run_accuracy_case(
     local_sequence_end = local_sequence_start + local_sequence_size
     replicate_parameter_name = "model.norm.weight"
 
-    standalone_optimizer = torch.optim.SGD(standalone_model.parameters(), lr=_LEARNING_RATE)
-    distributed_optimizer = torch.optim.SGD(distributed_model.parameters(), lr=_LEARNING_RATE)
+    standalone_optimizer = config.optimizer.build(model=standalone_model).get_optimizer()
+    distributed_optimizer = config.optimizer.build(model=distributed_model).get_optimizer()
+    standalone_log = None
+    distributed_log = None
+    if dist.get_rank() == 0:
+        _LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        parallel_mode = case_name.removesuffix("_accuracy")
+        standalone_log = (_LOG_DIRECTORY / f"{parallel_mode}_standalone_adamw.log").open(
+            "w", encoding="utf-8"
+        )
+        distributed_log = (_LOG_DIRECTORY / f"{parallel_mode}_dist_adamw.log").open(
+            "w", encoding="utf-8"
+        )
     maximum_loss_error = 0.0
     maximum_gradient_error = 0.0
+    maximum_grad_norm_error = 0.0
     for step_index in range(_TRAINING_STEPS):
         global_tokens, global_targets = _build_global_batch(step_index, device)
         local_batch = shard_batch_for_cp(
@@ -518,7 +605,7 @@ def _run_accuracy_case(
             local_sequence_end,
             device=device,
         ).unsqueeze(0).expand(local_batch_size, -1)
-        standalone_loss, distributed_loss, step_gradient_error = _compare_step(
+        standalone_loss, distributed_loss, step_gradient_error, step_grad_norm_error = _compare_step(
             step_index,
             standalone_model,
             distributed_model,
@@ -536,15 +623,19 @@ def _run_accuracy_case(
             replicate_parameter_name,
             standalone_optimizer,
             distributed_optimizer,
+            standalone_log,
+            distributed_log,
         )
         step_loss_error = abs(standalone_loss - distributed_loss)
         maximum_loss_error = max(maximum_loss_error, step_loss_error)
         maximum_gradient_error = max(maximum_gradient_error, step_gradient_error)
+        maximum_grad_norm_error = max(maximum_grad_norm_error, step_grad_norm_error)
         if dist.get_rank() == 0:
             print(
                 f"[{case_name} step {step_index}] standalone_loss={standalone_loss:.6f} "
                 f"distributed_loss={distributed_loss:.6f} "
                 f"loss_error={step_loss_error:.6e} "
+                f"grad_norm_error={step_grad_norm_error:.6e} "
                 f"max_grad_error={step_gradient_error:.6e} "
                 f"(dp={mesh_context.dp_size}, cp={mesh_context.cp_size}, "
                 f"fsdp_replicate={mesh_context.dp_replicate_size}, "
@@ -554,11 +645,16 @@ def _run_accuracy_case(
             )
         standalone_model.zero_grad(set_to_none=True)
 
+    if standalone_log is not None and distributed_log is not None:
+        standalone_log.close()
+        distributed_log.close()
+
     dist.barrier()
     if dist.get_rank() == 0:
         print(
             f"[{case_name}] passed all loss and parameter-gradient checks; "
             f"max_loss_error={maximum_loss_error:.6e}, "
+            f"max_grad_norm_error={maximum_grad_norm_error:.6e}, "
             f"max_grad_error={maximum_gradient_error:.6e}"
         )
     destroy_process_group()
