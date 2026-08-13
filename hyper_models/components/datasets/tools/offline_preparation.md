@@ -1,6 +1,6 @@
 # 离线数据预处理技术说明
 
-本文说明 `hyper_models/components/data/tools` 下的离线数据预处理工具，包括本地 JSON/JSONL、Hugging Face
+本文说明 `hyper_models/components/datasets/tools` 下的离线数据预处理工具，包括本地 JSON/JSONL、Hugging Face
 数据集、并行分区、Megatron indexed dataset 输出，以及可选的定长样本预切分功能。
 
 ## 1. 功能概览
@@ -376,7 +376,7 @@ flowchart LR
 ### 3.1 本地预处理入口
 
 ```bash
-python -m hyper_models.components.data.tools.offline_preparation \
+python -m hyper_models.components.datasets.tools.offline_preparation \
     --dataset-name-or-path ./download_datasets/wikitext \
     --output-prefix ./offline_datasets/wikitext/output \
     --json-keys text \
@@ -401,7 +401,7 @@ python -m hyper_models.components.data.tools.offline_preparation \
 ### 3.2 Hugging Face 入口
 
 ```bash
-python -m hyper_models.components.data.tools.huggingface_offline \
+python -m hyper_models.components.datasets.tools.huggingface_offline \
     --dataset Salesforce/wikitext \
     --dataset-subset wikitext-103-raw-v1 \
     --dataset-split train \
@@ -425,8 +425,8 @@ python -m hyper_models.components.data.tools.huggingface_offline \
 ### 3.3 程序化接口
 
 ```python
-from hyper_models.components.data.tools.offline_config import OfflinePreparationConfig
-from hyper_models.components.data.tools.offline_preparation import prepare_offline_dataset
+from hyper_models.components.datasets.tools.offline_config import OfflinePreparationConfig
+from hyper_models.components.datasets.tools.offline_preparation import prepare_offline_dataset
 
 config = OfflinePreparationConfig(
     dataset_name_or_path="./download_datasets/wikitext",

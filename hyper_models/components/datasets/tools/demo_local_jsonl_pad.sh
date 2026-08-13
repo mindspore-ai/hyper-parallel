@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Example: convert a directory of local JSONL files into fixed-length indexed data.
 #
-#   bash hyper_models/components/data/tools/demo_local_jsonl_pad.sh
+#   bash hyper_models/components/datasets/tools/demo_local_jsonl_pad.sh
 #
 # The input directory must contain JSON/JSONL files with one JSON object per line
 # and a string field named "text". Files are consumed in sorted path order.
@@ -15,7 +15,7 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
 
 cd "${PROJECT_ROOT}"
 
-python -m hyper_models.components.data.tools.offline_preparation \
+python -m hyper_models.components.datasets.tools.offline_preparation \
     --dataset-name-or-path ./download_datasets/wikitext-103-raw-v1 \
     --output-prefix ./offline_datasets/pad_local_jsonl/output \
     --json-keys text \

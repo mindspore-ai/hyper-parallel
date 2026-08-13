@@ -46,7 +46,7 @@ from transformers.modeling_outputs import ModelOutput
 from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
-from ..components.data.chat_template import ChatTemplate
+from ..components.datasets.llm.chat_template import ChatTemplate
 from ..components.data.data_collator import calculate_num_micro_batches
 from ..components.datasets.batch import PreparedBatch
 from ..components.distributed.init_utils import get_local_rank_safe, get_global_rank_safe, get_world_size_safe

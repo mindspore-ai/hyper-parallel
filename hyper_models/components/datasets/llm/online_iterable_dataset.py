@@ -29,14 +29,14 @@ from hyper_models.components.datasets.parallel import DatasetParallelContext, bu
 
 def build_online_iterable_dataset(
         *,
-        data_path: str | Sequence[str],
         data_config: Mapping[str, Any],
+        data_path: str | Sequence[str] | None = None,
         parallel_context: DatasetParallelContext | None = None,
 ) -> Any:
     """Build a shuffled, DP-sharded, stateful Online raw-record stream.
 
     Args:
-        data_path: Local JSON/JSONL/Parquet/CSV/Arrow paths.
+        data_path: Optional local JSON/JSONL/Parquet/CSV/Arrow paths.
         data_config: Streaming options including ``seed``, ``shuffle``,
             ``shuffle_buffer_size``, and ``split_by_data_parallel``.
         parallel_context: Dataset ownership and DP topology.

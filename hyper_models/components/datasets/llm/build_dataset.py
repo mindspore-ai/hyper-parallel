@@ -30,8 +30,8 @@ LLMSourceType = Literal["online", "offline"]
 
 def build_llm_dataset(
         *,
-        data_path: str | Sequence[str],
         data_config: Mapping[str, Any],
+        data_path: str | Sequence[str] | None = None,
         transform: SampleTransform | None = None,
         parallel_context: DatasetParallelContext | None = None,
         tokenizer: Any = None,
@@ -43,7 +43,7 @@ def build_llm_dataset(
     the same transform Dataset stage.
 
     Args:
-        data_path: One dataset path or a weighted/blended list of paths.
+        data_path: Optional Online local path or required Offline indexed path.
         data_config: Source type and all source-specific build options.
         transform: Callable built by ``Trainer._build_data_transform()``.
             Online uses a tokenizer/chat-template transform; Offline uses a
@@ -66,6 +66,8 @@ def build_llm_dataset(
         raise ValueError("data_config must contain 'source_type'") from error
 
     if source_type == "offline":
+        if data_path is None:
+            raise ValueError("Offline LLM Datasets require data_path")
         if train_valid_test_num_samples is None:
             raise ValueError("Offline indexed Datasets require Trainer-derived sample counts")
         indexed_data_config = dict(data_config)
@@ -78,8 +80,6 @@ def build_llm_dataset(
             parallel_context=parallel_context,
         )
     elif source_type == "online":
-        if data_path is None:
-            raise ValueError("Online Datasets require data_path")
         raw_dataset = build_online_dataset(
             data_path=data_path,
             data_config=data_config,
@@ -87,7 +87,12 @@ def build_llm_dataset(
         )
     else:
         raise ValueError(f"Unsupported LLM source type: {source_type!r}")
-    dataset = apply_llm_data_transform(raw_dataset, transform)
+    skip_invalid_samples = source_type == "online"
+    dataset = apply_llm_data_transform(
+        raw_dataset,
+        transform,
+        skip_invalid_samples=skip_invalid_samples,
+    )
     return dataset
 
 

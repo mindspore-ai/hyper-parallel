@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
+from hyper_models.components.distributed.infrastructure import OnlineDatasetBarrier
 from hyper_models.components.datasets.contracts import RawSample
 from hyper_models.components.datasets.llm.online_utils import (
     load_online_hf_dataset,
@@ -49,14 +51,14 @@ class OnlineMappingDataset:
 
 def build_online_mapping_dataset(
         *,
-        data_path: str | Sequence[str],
         data_config: Mapping[str, Any],
+        data_path: str | Sequence[str] | None = None,
         parallel_context: DatasetParallelContext | None = None,
 ) -> Any:
     """Build a finite Online Dataset that produces text RawSamples.
 
     Args:
-        data_path: Local JSON/JSONL/Parquet/CSV/Arrow paths.
+        data_path: Optional local JSON/JSONL/Parquet/CSV/Arrow paths.
         data_config: Namespace/cache options or ``hf_dataset_name``.
         parallel_context: Dataset rank ownership and synchronization policy.
 
@@ -64,6 +66,11 @@ def build_online_mapping_dataset(
         An Online mapping Dataset on TP rank zero, otherwise ``None``.
     """
     dataset_context = normalize_online_parallel_context(parallel_context)
+    if dataset_context.distributed_enabled:
+        dataset_context = replace(
+            dataset_context,
+            barrier=OnlineDatasetBarrier(),
+        )
 
     def dataset_factory() -> OnlineMappingDataset:
         """Load the raw source and attach its integer-index wrapper."""
@@ -78,6 +85,8 @@ def build_online_mapping_dataset(
     online_dataset = build_distributed_dataset(
         dataset_factory,
         dataset_context,
+        # Cache-builder ranks must finish the Hub download before the other
+        # owning ranks reopen the shared Hugging Face cache.
         barrier_needed=dataset_context.distributed_enabled,
     )
     return online_dataset
