@@ -117,7 +117,7 @@ class BlendedDataset:
         return sample
 
     def _build_indices(self) -> tuple[np.ndarray, np.ndarray]:
-        """Load or build PanGu's top-level blend index cache."""
+        """Load or build the top-level blend index cache."""
         cache_directory = self.config.path_to_cache
         if cache_directory is None:
             indices = self._build_indices_in_memory()
@@ -145,7 +145,7 @@ class BlendedDataset:
         return dataset_index, sample_index
 
     def _build_indices_in_memory(self) -> tuple[np.ndarray, np.ndarray]:
-        """Build PanGu's deterministic weighted source schedule."""
+        """Build a deterministic weighted source schedule."""
         dataset_index = np.empty(self.size, dtype=np.int16)
         sample_index = np.empty(self.size, dtype=np.int64)
         build_blending_indices(

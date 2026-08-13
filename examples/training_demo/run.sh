@@ -18,14 +18,14 @@ set -e
 
 cd "$(dirname "$0")/../.."
 
-NPROC=${NPROC:-4}
+NPROC=${NPROC:-8}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29501}
 
 LABEL=${LABEL:-data}
 OUTPUT_DIR="${PWD}/output"
 export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
-export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 # 0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 # 8,9,10,11,12,13,14,15 # 
 
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
@@ -33,9 +33,9 @@ export PYTHONPATH=../../hyper-parallel:$PYTHONPATH
 
 mkdir -p "${OUTPUT_DIR}"
 
-# python -m examples.training_demo.prepare_model \
-#     examples/training_demo/train.yaml \
-#     "$@"
+python -m examples.training_demo.prepare_model \
+    examples/training_demo/train.yaml \
+    "$@"
 
 torchrun \
     --nproc_per_node="${NPROC}" \

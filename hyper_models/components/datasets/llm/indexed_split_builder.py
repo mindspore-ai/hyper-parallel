@@ -260,7 +260,7 @@ def _build_splits_from_blend(
         parallel_context: DatasetParallelContext,
 ) -> DatasetSplits:
     """Parse one blend and dispatch it to the single- or multiple-source path."""
-    # PanGu selects the direct Mid-level path from the external blend shape,
+    # Select the direct Mid-level path from the external blend shape
     # before parsing weights. Only [prefix] bypasses Top-level blending;
     # ["1", prefix], including one automatically discovered source, retains
     # the standard margin and BlendedDataset cache protocol.
@@ -353,7 +353,7 @@ def _build_multiple_source_splits(
     # Stage 2: regroup the Mid-level Datasets by split, for example
     # [A_train, B_train, ...], and wrap each enabled group in a Top-level
     # BlendedDataset or SimpleBlendedDataset according to blend_mode.
-    # PanGu exposes the sum of the rounded per-source requests, including the
+    # Include the sum of rounded per-source requests and the
     # standard blend margin, so the top-level Dataset cannot undersupply the
     # training schedule after weighted rounding.
     blended_sizes = [sum(split_sizes) for split_sizes in zip(*source_sizes)]
@@ -608,7 +608,7 @@ def _assemble_blended_split(
 
 
 def _parse_blend(blend: Sequence[str]) -> tuple[list[str], list[float]]:
-    """Parse PanGu's alternating floating-point weight/prefix values."""
+    """Parse alternating floating-point weight/prefix values."""
     values = list(blend)
     if not values:
         raise ValueError("Dataset blend must not be empty")
@@ -623,7 +623,7 @@ def _parse_blend(blend: Sequence[str]) -> tuple[list[str], list[float]]:
 
 
 def _parse_simple_blend(blend: Sequence[str]) -> tuple[list[str], list[float]]:
-    """Parse the integer unit weights required by PanGu SimpleBlendedDataset."""
+    """Parse the integer unit weights required by SimpleBlendedDataset."""
     values = list(blend)
     if not values or len(values) % 2 != 0:
         raise ValueError("Simple blend must contain alternating weight/prefix pairs")

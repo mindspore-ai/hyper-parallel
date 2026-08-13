@@ -71,3 +71,6 @@ hyper_parallel/auto_parallel/SAPP-ND/paradise/output/
 hyper_parallel/auto_parallel/SAPP-ND/paradise/results/
 hyper_parallel/auto_parallel/SAPP-ND/**/*nd_to_ppb*.json
 *.xlsx
+
+# output
+outputs
