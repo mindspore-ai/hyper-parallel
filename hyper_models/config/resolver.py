@@ -210,10 +210,10 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
         if not isinstance(value, Mapping):
             raise _fail(path, f"expected mapping, got {type(value).__name__}")
         return dict(value)
-    # if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
-    #     # nested dataclass items (e.g. List[PlanOverride]) resolve as
-    #     # mappings, mirroring resolve_component's dataclass branch
-    #     return _resolve_dataclass(value, annotation, path=path)
+    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
+        # Nested dataclass items resolve from mappings in the same way as
+        # top-level dataclass components.
+        return _resolve_dataclass(value, annotation, path=path)
     if isinstance(annotation, type):
         if isinstance(value, annotation):
             return value

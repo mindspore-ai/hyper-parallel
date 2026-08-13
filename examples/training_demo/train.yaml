@@ -9,9 +9,8 @@
 
 model:
   _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ./outputs/training_demo/qwen3_30b_a3b
-  ignore_mismatched_sizes: true
-  torch_dtype: bfloat16
+  pretrained_model_name_or_path: ./outputs/training_demo/tiny_llama
+  torch_dtype: auto
   attn_implementation: sdpa
   force_hf: true
 
@@ -21,8 +20,8 @@ model:
 #   use_fast: true
 
 training:
-  train_iters: 10
-  eval_iters: 1
+  train_iters: 2
+  eval_iters: 0
 
   train_samples: null
   num_train_epochs: 1
@@ -33,7 +32,7 @@ training:
 
   # max_steps: 100
   # num_train_epochs: 1
-  global_batch_size: 8
+  global_batch_size: 4
   micro_batch_size: 1
 
   backend: hccl
@@ -44,7 +43,7 @@ training:
   enable_full_determinism: false
 
 accelerator:
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
   ep_size: 1
   pp_size: 1
@@ -52,7 +51,7 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
-  dp_shard_size: 8
+  dp_shard_size: 2
   replicate_params: []
   reshard_after_forward: true
   defer_fsdp_grad_sync: true
@@ -101,77 +100,29 @@ gradient_checkpointing:
   activation_checkpoint: off
 
 model_assets:
-  # _target_: hyper_models.trainer.text_trainer._build_model_assets
   datasets_type: pretokenized
-  chat_template: null #chatml
-  tokenizer: null # mock data
-  # tokenizer:
-  #   _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
-  #   pretrained_model_name_or_path: null
-  #   local_files_only: true
-  #   trust_remote_code: true
+  chat_template: null
+  tokenizer: null
 
 data_transform:
-  _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
-  data_type: 'pretokenized'
-  text_keys: 'text'
-  max_seq_len: 2048
+  _target_: hyper_models.components.data.identity_transform.IdentityDataTransform
 
 dataset:
-  _target_: hyper_models.components.datasets.llm.build_llm_dataset
-  data_path: null
-  data_config:
-    source_type: offline
-    mock_data: true # false
-
-    build_on_rank: null
-
-    seed: 1234
-    seq_length: 2048
-    split: '100, 0, 0'
-
-    # blend_per_split
-    train_data_path: null
-    valid_data_path: null
-    test_data_path: null
-    data_cache_path: null
-
-    distributed_walk: true
-    mmap_bin_files: true
-    reuse_idx: false
-    data_lazy_load: true
-
-    tokenizer: null
-    reset_position_ids: false
-    reset_attention_mask: false
-    eod_mask_loss: false
-    create_attention_mask_in_dataloader: true
-
-    dataset_margin: 1.005
-    skip_data_check: false
-
-    is_dataset_from_mr: false
-    simple_blend: 'no'
+  _target_: hyper_models.components.data.datasets.DummyDataset
+  num_samples: 32
+  seq_len: 32
+  vocab_size: 1000
+  seed: 42
 
 collate_fn:
   _target_: hyper_models.components.datasets.llm.build_llm_collator
   packing: false
 
 dataloader:
-  _target_: hyper_models.components.datasets.DataLoader
-  # single: sequential/rearranged; cyclic: deterministic shuffled epochs;
-  # external: the dataset target itself must return a complete dataloader.
-  dataloader_type: single
-  data_rearrange_map: null
-  data_sharding: false
+  _target_: hyper_models.components.data.dataloader.DataLoader
+  shuffle: true
   drop_last: true
   use_background_prefetcher: false
-  num_workers: 0
-  dataloader_pin_memory: false
-  prefetch_factor: null
-
-get_batch:
-  _target_: hyper_models.components.datasets.llm.build_llm_get_batch
 
 # data_transform:
 #   _target_: examples.training_demo.data.PlainTextDataTransform
