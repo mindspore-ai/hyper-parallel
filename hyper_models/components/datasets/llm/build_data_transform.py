@@ -125,7 +125,7 @@ class PretokenizedTransform:
     """Normalize one pretokenized indexed GPT record.
 
     Indexed Dataset code has already shifted labels. It may also provide loss
-    masks, position IDs, and an attention mask, but PanGu's MR path omits those
+    masks, position IDs, and an attention mask, omits those
     fields when ``create_attention_mask=False``. Runtime ``get_batch`` owns
     their final reconstruction for both forms.
     """
@@ -159,8 +159,8 @@ class PretokenizedTransform:
                 raise ValueError("Pretokenized samples must contain 'input_ids' or 'tokens'")
             normalized["input_ids"] = normalized.pop("tokens")
 
-        # Tokens and shifted labels are the common PanGu contract. GPTDataset
-        # may additionally return masks and positions, while GPTFromMRDataset
+        # Tokens and shifted labels.
+        # GPTDataset may additionally return masks and positions, while GPTFromMRDataset
         # intentionally omits them when attention-mask creation is disabled.
         required_fields = (
             "input_ids",

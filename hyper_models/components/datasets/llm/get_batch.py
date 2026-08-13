@@ -76,7 +76,7 @@ class LLMBatchProcessor:
     def normalize_source_batch(
             source_batch: Mapping[str, Any] | None,
     ) -> dict[str, Any] | None:
-        """Normalize PanGu ``tokens`` and HF ``input_ids`` at one boundary."""
+        """Normalize ``tokens`` and HF ``input_ids`` at one boundary."""
         if source_batch is None:
             return None
         normalized_batch = dict(source_batch)
@@ -128,7 +128,7 @@ class LLMBatchProcessor:
         return prepared_batch
 
     def _build_runtime_fields(self, batch: Mapping[str, Any]) -> dict[str, Any]:
-        """Rebuild PanGu's masks and positions after TP token transport."""
+        """Rebuild masks and positions after TP token transport."""
         input_ids = batch["input_ids"]
         labels = batch["labels"]
         loss_mask = labels >= 0

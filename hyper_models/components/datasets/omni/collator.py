@@ -54,7 +54,7 @@ class VLMCollator:
     """Stack fixed-shape VLM samples into one model micro-batch.
 
     Text fields are delegated to ``LLMCollator``. The active modality path
-    follows PanGu's fixed-shape behavior and uses PyTorch default collation.
+    uses fixed shapes and PyTorch default collation.
     VeOmni-style per-field packing and metadata generation remain explicit,
     deferred interfaces.
 

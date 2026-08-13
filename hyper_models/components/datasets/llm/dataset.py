@@ -30,7 +30,7 @@ LLMSourceType = Literal["online", "offline"]
 
 def build_llm_dataset(
         *,
-        data_path: str | Sequence[str],
+        data_path: str | Sequence[str] | None = None,
         data_config: Mapping[str, Any],
         transform: SampleTransform | None = None,
         parallel_context: DatasetParallelContext | None = None,
@@ -43,7 +43,8 @@ def build_llm_dataset(
     the same transform Dataset stage.
 
     Args:
-        data_path: One dataset path or a weighted/blended list of paths.
+        data_path: One dataset path or a weighted/blended list of paths. May be
+        omitted for offline mock data.        
         data_config: Source type and all source-specific build options.
         transform: Callable built by ``Trainer._build_data_transform()``.
             Online uses a tokenizer/chat-template transform; Offline uses a
@@ -78,6 +79,8 @@ def build_llm_dataset(
             parallel_context=parallel_context,
         )
     elif source_type == "online":
+        if data_path is None:
+            raise ValueError("Online Datasets require data_path")
         raw_dataset = build_online_dataset(
             data_path=data_path,
             data_config=data_config,

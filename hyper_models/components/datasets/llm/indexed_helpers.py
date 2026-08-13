@@ -34,7 +34,7 @@ def build_blending_indices(
     size: int,
     verbose: bool = False,
 ) -> None:
-    """Build PanGu-compatible deterministic weighted blend indices.
+    """Build deterministic weighted blend indices.
 
     Args:
         dataset_index: Output source-Dataset indices with shape ``(size,)``.
@@ -43,7 +43,7 @@ def build_blending_indices(
         weights: Normalized source-Dataset weights.
         num_datasets: Number of source Datasets.
         size: Number of blended samples to schedule.
-        verbose: Compatibility argument from PanGu's compiled helper.
+        verbose: Compatibility argument from the compiled helper.
 
     Raises:
         ValueError: If input sizes or output buffers are inconsistent.
