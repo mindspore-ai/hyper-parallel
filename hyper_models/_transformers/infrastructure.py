@@ -31,7 +31,10 @@ from hyper_models.components.distributed.fsdp2 import FSDP2Manager, _instantiate
 from hyper_models.components.distributed.pipelining import _instantiate_pipeline
 from hyper_models.components.distributed.sharding_applier import apply_sharding_plan
 from hyper_models.components.distributed.sharding_planner import ShardingPlanner
-from hyper_models.trainer.config import entries_to_plan_overrides
+from hyper_models.trainer.config import (
+    entries_to_module_replacements,
+    entries_to_plan_overrides,
+)
 from hyper_parallel import DTensor
 
 logger = logging.getLogger(__name__)
@@ -482,6 +485,19 @@ def _finalize_model_loading(
     return finalized_report
 
 
+def _apply_module_replacement_actions(model: nn.Module, distributed_setup) -> nn.Module:
+    """Apply explicit replacement rules before sharding sees the model."""
+
+    entries = getattr(distributed_setup, "plan_overrides", None) or []
+    from hyper_models.components.model_transform import (  # pylint: disable=import-outside-toplevel
+        apply_module_replacements,
+        compile_module_replacements,
+    )
+
+    plan = compile_module_replacements(model, entries_to_module_replacements(entries))
+    return apply_module_replacements(model, plan)
+
+
 def apply_model_infrastructure(
     model: nn.Module,
     mesh=None,
@@ -512,7 +528,7 @@ def apply_model_infrastructure(
 
     Stub — applies sharding plan if sharding_planner is provided.
     """
-    del kwargs
+    distributed_setup = kwargs.get("distributed_setup")
 
     # Step 3: PP split (if autopipeline)
     if autopipeline is not None:
@@ -528,6 +544,9 @@ def apply_model_infrastructure(
         logger.warning("QAT not implemented in stub")
     if fp8_config is not None:
         logger.warning("FP8 not implemented in stub")
+
+    # Step 5.5: structure-preserving replacement before plan derivation.
+    model = _apply_module_replacement_actions(model, distributed_setup)
 
     # Step 6: Parameter freezing (before sharding)
     if freeze_config is not None:
