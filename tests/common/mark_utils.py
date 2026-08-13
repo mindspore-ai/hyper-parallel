@@ -13,12 +13,17 @@
 # limitations under the License.
 # ============================================================================
 """define marks"""
+import inspect
 import pytest
+import shutil
+import subprocess
+
 from tests.common.random_generator import set_numpy_global_seed
 
 
-def arg_mark(plat_marks, level_mark, card_mark, essential_mark):
-    """Apply pytest marks for platform, level, card and essential."""
+def arg_mark(plat_marks, level_mark, card_mark, essential_mark, mem_peak=None,
+            disable_parallel=False):
+    """Apply pytest marks for platform, level, card, essential, mem_peak and disable_parallel."""
     optional_plat_marks = ['platform_ascend', 'platform_ascend910b', 'platform_ascend310p', 'platform_gpu',
                            'cpu_linux', 'cpu_windows', 'cpu_macos']
     optional_level_marks = ['level0', 'level1', 'level2', 'level3', 'level4']
@@ -39,6 +44,10 @@ def arg_mark(plat_marks, level_mark, card_mark, essential_mark):
         func = getattr(pytest.mark, level_mark)(func)
         func = getattr(pytest.mark, card_mark)(func)
         func = getattr(pytest.mark, essential_mark)(func)
+        if mem_peak is not None:
+            func = getattr(pytest.mark, "mem_peak")(mem_peak)(func)
+        if disable_parallel:
+            func = getattr(pytest.mark, "disable_parallel")(func)
         set_numpy_global_seed()
         return func
 

@@ -26,7 +26,7 @@ PP_OVERLAP_MOE_POC = "pp_overlap_moe_poc.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_end_to_end():
     """End-to-end PP+EP+overlap on MindSpore PyNative.
 
@@ -45,7 +45,7 @@ def test_pp_overlap_moe_end_to_end():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_recompute():
     """PP+EP+overlap + activation checkpoint via ``checkpoint_wrapper``.
 
@@ -68,7 +68,7 @@ def test_pp_overlap_moe_recompute():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_recompute_per_layer():
     """Per-layer (multi-segment) activation checkpoint under overlap_b_f.
 
@@ -89,7 +89,7 @@ def test_pp_overlap_moe_recompute_per_layer():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_recompute_mixed():
     """Mixed per-layer recompute (some layers recompute, some don't) under overlap_b_f.
 
@@ -110,7 +110,7 @@ def test_pp_overlap_moe_recompute_mixed():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_accuracy():
     """Numerical equivalence of overlap stack vs sync baseline.
 
@@ -135,7 +135,7 @@ def test_pp_overlap_moe_accuracy():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_variable_layers():
     """Heterogeneous per-chunk layer counts under overlap_b_f.
 
@@ -185,7 +185,7 @@ def test_pp_overlap_moe_dxdw_accuracy():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_recompute_save_a2a():
     """Chunk recompute that keeps (does not recompute) the EP all-to-all.
 
@@ -209,7 +209,7 @@ def test_pp_overlap_moe_recompute_save_a2a():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_recompute_save_a2a_dxdw():
     """Save-a2a chunk recompute combined with the dx/dw split.
 
@@ -231,7 +231,7 @@ def test_pp_overlap_moe_recompute_save_a2a_dxdw():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_accuracy_batch_p2p():
     """Same-peer duplex P2P batching — numerical equivalence vs sync baseline.
 
@@ -251,7 +251,7 @@ def test_pp_overlap_moe_accuracy_batch_p2p():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
-          card_mark="allcards", essential_mark="essential")
+          card_mark="allcards", essential_mark="essential", disable_parallel=True)
 def test_pp_overlap_moe_accuracy_boundary():
     """fwd-boundary batching (EXPERIMENTAL opt-in) — equivalence vs baseline.
 
