@@ -19,9 +19,17 @@ from hyper_models._transformers.auto_model import (
     HyperAutoModelForImageTextToText,
     HyperAutoModelForSequenceClassification,
 )
+from hyper_models._transformers.checkpoint_loader import (
+    CheckpointManager,
+    DCPBackend,
+    LoadReport,
+)
 
 __all__ = [
     "HyperAutoModelForCausalLM",
     "HyperAutoModelForImageTextToText",
     "HyperAutoModelForSequenceClassification",
+    "CheckpointManager",
+    "DCPBackend",
+    "LoadReport",
 ]
