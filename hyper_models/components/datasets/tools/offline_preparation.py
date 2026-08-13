@@ -112,14 +112,11 @@ def append_eod(args: argparse.Namespace, tokenizer: Any) -> int | None:
     return int(eod_id)
 
 
-class Encoder:
-    """Tokenize documents and optionally split them into sentences."""
+class Encoder(object):
     def __init__(self, args: argparse.Namespace) -> None:
-        """Store preprocessing arguments shared by worker methods."""
         self.args = args
 
     def initializer(self) -> None:
-        """Initialize tokenizer and sentence splitter in a worker process."""
         # Use Encoder class as a container for global data
         Encoder.tokenizer = build_tokenizer(self.args)
         if self.args.split_sentences:
@@ -134,7 +131,7 @@ class Encoder:
                 splitter = nltk.load(f"tokenizers/punkt/{self.args.lang}.pickle")
             if self.args.keep_newlines:
                 Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text=splitter._params,  # pylint: disable=protected-access
+                    train_text=splitter._params,
                     lang_vars=CustomLanguageVars(),
                 )
             else:
@@ -158,7 +155,6 @@ class Encoder:
         self,
         json_line: str,
     ) -> tuple[dict[str, list[int]], dict[str, list[int]], int]:
-        """Tokenize configured fields and return token and sentence lengths."""
         data = json.loads(json_line)
         ids = {}
         lens = {}
@@ -185,10 +181,8 @@ class Encoder:
         return ids, lens, len(json_line)
 
 
-class Partition:
-    """Process one input partition with a pool of tokenizer workers."""
+class Partition(object):
     def __init__(self, args: argparse.Namespace, workers: int) -> None:
-        """Configure processing arguments and worker count for a partition."""
         self.args = args
         self.workers = workers
         self.performance: list[float] = []
@@ -199,7 +193,6 @@ class Partition:
         proc_start: float,
         total_bytes_processed: int,
     ) -> None:
-        """Report throughput periodically and retain benchmark samples."""
         if count % self.args.log_interval != 0:
             return
         elapsed = time.time() - proc_start
@@ -221,9 +214,7 @@ class Partition:
         with open(input_file_name, "r", encoding="utf-8") as input_file, open(
             output_file_name, "w", encoding="utf-8",
         ) as output_file:
-            pool = multiprocessing.Pool(  # pylint: disable=consider-using-with
-                self.workers, initializer=encoder.initializer,
-            )
+            pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
             try:
                 split_docs = pool.imap(encoder.split, input_file, 32)
                 proc_start = time.time()
@@ -237,18 +228,14 @@ class Partition:
                 pool.join()
 
     def process_json_file(self, file_name: tuple[str, str]) -> list[float]:
-        """Tokenize a JSONL partition and write indexed dataset files."""
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
-        fin = open(  # pylint: disable=consider-using-with
-            input_file_name, 'r', encoding='utf-8',
-        )
+        fin = open(input_file_name, 'r', encoding='utf-8')
+
         startup_start = time.time()
         encoder = Encoder(self.args)
         tokenizer = build_tokenizer(self.args)
-        pool = multiprocessing.Pool(  # pylint: disable=consider-using-with
-            self.workers, initializer=encoder.initializer,
-        )
+        pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
         encoded_docs = pool.imap(encoder.encode, fin, 32)
 
         level = "sentence" if self.args.split_sentences else "document"
@@ -259,8 +246,10 @@ class Partition:
 
         keys = self.args.json_keys
         for key in keys:
-            output_bin_files[key] = f"{output_prefix}_{key}_{level}.bin"
-            output_idx_files[key] = f"{output_prefix}_{key}_{level}.idx"
+            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix,
+                                                          key, level)
+            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
+                                                          key, level)
             builders[key] = indexed_dataset.IndexedDatasetBuilder(
                 output_bin_files[key],
                 dtype=indexed_dataset.DType.optimal_dtype(len(tokenizer)),
@@ -296,6 +285,7 @@ class Partition:
 
         pool.close()
         pool.join()
+
         return self.performance
 
 

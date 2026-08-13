@@ -17,6 +17,7 @@
 Following design doc 06_distributed_infrastructure.md.
 """
 
+from datetime import timedelta
 import inspect
 import logging
 import math
@@ -33,6 +34,51 @@ from hyper_models.components.utils.device import (  # pylint: disable=syntax-err
 )
 
 logger = logging.getLogger(__name__)
+
+_DATASET_BARRIER_TIMEOUT = timedelta(hours=10)
+
+
+class OnlineDatasetBarrier:
+    """Synchronize long Online mapping builds through a diagnostic Gloo group."""
+
+    def __init__(self, timeout: timedelta = _DATASET_BARRIER_TIMEOUT) -> None:
+        """Store the timeout and defer auxiliary group creation."""
+        if timeout.total_seconds() <= 0:
+            raise ValueError("Online Dataset barrier timeout must be positive")
+        self.timeout = timeout
+        self._gloo_group: Any = None
+        self._gloo_unavailable = False
+
+    def __call__(self) -> None:
+        """Wait up to ten hours and identify missing ranks when supported."""
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+
+        if self._gloo_unavailable:
+            dist.barrier()
+            return
+
+        if self._gloo_group is None:
+            try:
+                self._gloo_group = dist.new_group(
+                    backend="gloo",
+                    timeout=self.timeout,
+                )
+            except (RuntimeError, ValueError) as error:
+                self._gloo_unavailable = True
+                logger.warning(
+                    "Online Dataset Gloo group is unavailable; falling back "
+                    "to the default process-group barrier: %s",
+                    error,
+                )
+                dist.barrier()
+                return
+
+        dist.monitored_barrier(
+            group=self._gloo_group,
+            timeout=self.timeout,
+            wait_all_ranks=True,
+        )
 
 
 def _init_topology_mesh(mesh_kwargs: dict[str, Any]) -> Any:

@@ -19,6 +19,7 @@ from typing import Any, Dict
 
 from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
+from hyper_models.components.datasets.llm import build_chat_template
 from hyper_models.components.loss.loss_utils import count_loss_token
 from hyper_models.components.utils import helper
 from hyper_models.components.utils.device import synchronize
@@ -57,10 +58,9 @@ class TextTrainer:
 
     def _build_model_assets(self) -> None:
         """Build tokenizer-backed assets for text training."""
-        from hyper_models.components.datasets.llm import build_chat_template
-        model_config = self.base.model_config
         config: TrainerConfig = self.base.config
-        tokenizer_target = config.model_assets.tokenizer
+        assets_config = config.model_assets
+        tokenizer_target = assets_config.tokenizer
         if tokenizer_target is None:
             self.base.tokenizer = None
         elif hasattr(tokenizer_target, "pretrained_model_name_or_path"):
@@ -70,12 +70,27 @@ class TextTrainer:
                 pretrained_model_name_or_path=config.model.pretrained_model_name_or_path,
             )
 
-        if config.model_assets.datasets_type in ["plaintext", 'pretokenized']:
-            self.base.model_assets = [model_config, self.base.tokenizer]
-            self.base.chat_template = None
-        else:
-            self.base.chat_template = build_chat_template(config.model_assets.chat_template, self.base.tokenizer)
-            self.base.model_assets = [model_config, self.base.chat_template]
+        self.base.chat_template = None
+        if assets_config.datasets_type == "conversation":
+            if self.base.tokenizer is None:
+                raise ValueError("model_assets.tokenizer is required for conversation data")
+            if assets_config.chat_template is None:
+                raise ValueError("model_assets.chat_template is required for conversation data")
+            if isinstance(assets_config.chat_template, str):
+                self.base.chat_template = build_chat_template(
+                    assets_config.chat_template,
+                    self.base.tokenizer,
+                )
+            else:
+                self.base.chat_template = assets_config.chat_template.build(
+                    tokenizer=self.base.tokenizer,
+                )
+
+        self.base.model_assets = [self.base.model_config]
+        if self.base.tokenizer is not None:
+            self.base.model_assets.append(self.base.tokenizer)
+        if self.base.chat_template is not None:
+            self.base.model_assets.append(self.base.chat_template)
 
     def _build_data_transform(self) -> None:
         """Build the configured text sample transform."""

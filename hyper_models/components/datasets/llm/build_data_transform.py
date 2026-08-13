@@ -80,7 +80,6 @@ class PlaintextTransform:
         if eos_token_id is not None:
             token_ids = [*token_ids, eos_token_id]
 
-        domain_name = sample.get("domain_name", sample.get("domain"))
         transformed = []
         for start in range(0, len(token_ids), self.max_seq_len):
             input_ids = torch.tensor(token_ids[start:start + self.max_seq_len], dtype=torch.long)
@@ -89,8 +88,6 @@ class PlaintextTransform:
                 "attention_mask": torch.ones_like(input_ids),
                 "labels": input_ids.clone(),
             }
-            if domain_name is not None:
-                model_sample["domain_name"] = str(domain_name)
             transformed.append(model_sample)
         return transformed
 
@@ -114,9 +111,6 @@ class ConversationTransform:
         messages = _get_record_value(sample, self.text_keys)
         encoded = self.chat_template.encode_messages(messages, max_seq_len=self.max_seq_len)
         model_sample = {field: torch.as_tensor(value) for field, value in encoded.items()}
-        domain_name = sample.get("domain_name", sample.get("domain"))
-        if domain_name is not None:
-            model_sample["domain_name"] = str(domain_name)
         return [model_sample]
 
 

@@ -17,11 +17,14 @@
 from __future__ import annotations
 
 import os
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
 from hyper_models.components.datasets.parallel import DatasetParallelContext
+
+logger = logging.getLogger(__name__)
 
 _ONLINE_FILE_FORMATS = {
     ".arrow": "arrow",
@@ -80,14 +83,15 @@ def resolve_online_data_files(data_path: str | Sequence[str]) -> tuple[list[str]
 
 def load_online_hf_dataset(
         *,
-        data_path: str | Sequence[str],
+        data_path: str | Sequence[str] | None = None,
         data_config: Mapping[str, Any],
-        streaming: bool,
+        streaming: bool = False,
 ) -> Any:
     """Load one local-file or Hugging Face Online Dataset.
 
     Args:
-        data_path: Local source paths. Ignored when ``hf_dataset_name`` is set.
+        data_path: Optional local source paths. Required unless
+            ``hf_dataset_name`` is set.
         data_config: Namespace, cache, and optional HF Dataset identifiers.
         streaming: Whether to request the Hugging Face streaming implementation.
 
@@ -96,9 +100,14 @@ def load_online_hf_dataset(
 
     Raises:
         ImportError: If the optional ``datasets`` package is unavailable.
+        ValueError: If neither ``data_path`` nor ``hf_dataset_name`` is set.
     """
     try:
-        from datasets import load_dataset  # pylint: disable=C0415
+        from datasets import (  # pylint: disable=C0415
+            disable_progress_bars,
+            enable_progress_bars,
+            load_dataset,
+        )
     except ImportError as error:
         raise ImportError(
             "Online LLM Dataset requires the optional 'datasets' package"
@@ -106,9 +115,20 @@ def load_online_hf_dataset(
 
     namespace = str(data_config.get("namespace", "train"))
     cache_directory = data_config.get("cache_dir")
+    if bool(data_config.get("show_progress", True)):
+        enable_progress_bars()
+    else:
+        disable_progress_bars()
     hf_dataset_name = data_config.get("hf_dataset_name")
     if hf_dataset_name is not None:
         hf_config_name = data_config.get("hf_config_name")
+        logger.info(
+            "Loading Hugging Face Dataset %s (config=%s, split=%s, streaming=%s)",
+            hf_dataset_name,
+            hf_config_name,
+            namespace,
+            streaming,
+        )
         dataset = load_dataset(
             str(hf_dataset_name),
             name=hf_config_name,
@@ -118,7 +138,18 @@ def load_online_hf_dataset(
         )
         return dataset
 
+    if data_path is None:
+        raise ValueError(
+            "data_path is required when hf_dataset_name is not configured"
+        )
     data_files, loader_format = resolve_online_data_files(data_path)
+    logger.info(
+        "Loading %d Online Dataset files (format=%s, split=%s, streaming=%s)",
+        len(data_files),
+        loader_format,
+        namespace,
+        streaming,
+    )
     dataset = load_dataset(
         loader_format,
         data_files=data_files,

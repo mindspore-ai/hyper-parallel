@@ -19,6 +19,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, TypeAlias
 
+from torch.utils.data import IterableDataset
+
 RawSample: TypeAlias = Mapping[str, Any]
 ModelSample: TypeAlias = Mapping[str, Any]
 TransformedSample: TypeAlias = ModelSample | Sequence[ModelSample]
@@ -67,6 +69,9 @@ def is_iterable_dataset(dataset: Any) -> bool:
         ``True`` when the object is iterable but does not expose
         ``__getitem__`` for mapping-style access.
     """
+    if isinstance(dataset, IterableDataset):
+        return True
+
     has_iterator = callable(getattr(dataset, "__iter__", None))
     has_index_access = callable(getattr(dataset, "__getitem__", None))
     return has_iterator and not has_index_access
