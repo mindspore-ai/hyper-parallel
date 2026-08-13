@@ -147,12 +147,14 @@ class ComputeMemory:
         if multi_run or (len(self.stages_a) < 5 and len(self.stages_b) < 5):
             memory_parameter_list = []
             for stage1 in self.stages_a:
-                if stage1.id_ not in [0, (self.number_of_stage_ - 1)]:
+                if stage1.id_ in [0, (self.number_of_stage_ - 1)]:
+                    continue
+                for stage2 in self.stages_a:
+                    if stage2.id_ in [0, (self.number_of_stage_ - 1), stage1.id_]:
+                        continue
                     mem_param = self._compute_memory_parameter_local_(stage1, stage2)
-                    for stage2 in self.stages_a:
-                        if (stage2.id_ not in [0, (self.number_of_stage_ - 1),
-                                               stage1.id_] and mem_param != 0):
-                            memory_parameter_list.append(mem_param)
+                    if mem_param != 0:
+                        memory_parameter_list.append(mem_param)
             for stage1 in self.stages_b:
                 if stage1.id_ not in [0, (self.number_of_stage_ - 1)]:
                     for stage2 in self.stages_b:

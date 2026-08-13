@@ -14,12 +14,14 @@
 # ============================================================================
 """find parallelization"""
 
+from contextlib import nullcontext
 import time
 import copy
 import multiprocessing as proc
 import json
 import os
 import logging
+from typing import Optional
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
@@ -30,7 +32,10 @@ import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
 from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_constraints
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import detect_attention_type
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
+    CostModelConfig,
+    detect_attention_type,
+)
 
 # logger = proc.log_to_stderr()
 # logger.setLevel(proc.SUBDEBUG)
@@ -243,12 +248,7 @@ class ParallelizeLayer:
                     logger.debug(
                         "before get: is ready ? %s", str(result.ready())
                     )
-                    logger.debug(
-                        "before get: is successful ? %s",
-                        str(result.successful()),
-                    )
-                    # if result.successful():
-                    peak_mem = result.get(1)
+                    peak_mem = result.get()
                     logger.debug(
                         "after get: is ready ? %s", str(result.ready())
                     )
@@ -381,56 +381,66 @@ class ParallelizeLayer:
             multiproc = True
         scored_space = []
         debug_parts = []
-        for config, mem in space:
-            self.config.set_parallel_config(config)
-            values = []
-            if multiproc:
-                with proc.Pool(processes=threads_num) as pool:
+        with (
+            proc.Pool(processes=threads_num)
+            if multiproc
+            else nullcontext()
+        ) as pool:
+            for config, mem in space:
+                self.config.set_parallel_config(config)
+                values = []
+                if multiproc:
                     score = pool.apply_async(
                         pool_estimate_performance,
                         args=(
-                            copy.deepcopy(self.config),
+                            copy.deepcopy(self.config.ccfg),
                             self.machine.device,
+                            mem,
                             cache_file,
                         ),
                     )
-            else:
-                if self.enable_debug:
-                    debugger = Debug.Debug(
-                        config,
-                        info_type=Debug.PerfParts,
-                        enable=self.enable_debug,
-                    )
-                    score = estimate_performance(
-                        self.config.ccfg,
-                        debugger=debugger,
-                        device_type=self.machine.device,
-                        memory=mem,
-                        cache_file=cache_file,
-                    )
-                    debugger.write()
-                    debug_parts = list(debugger.info.keys())
-                    values = list(debugger.info.values())
-                    del values[-2:]
-                    del debug_parts[-2:]
                 else:
-                    score = estimate_performance(
-                        self.config.ccfg,
-                        device_type=self.machine.device,
-                        memory=mem,
+                    if self.enable_debug:
+                        debugger = Debug.Debug(
+                            config,
+                            info_type=Debug.PerfParts,
+                            enable=self.enable_debug,
+                        )
+                        score = estimate_performance(
+                            self.config.ccfg,
+                            debugger=debugger,
+                            device_type=self.machine.device,
+                            memory=mem,
+                            cache_file=cache_file,
+                        )
+                        debugger.write()
+                        debug_parts = list(debugger.info.keys())
+                        values = list(debugger.info.values())
+                        del values[-2:]
+                        del debug_parts[-2:]
+                    else:
+                        score = estimate_performance(
+                            self.config.ccfg,
+                            device_type=self.machine.device,
+                            memory=mem,
+                        )
+                scored_space.append((config, mem, score, values))
+
+                if not multiproc:
+                    logger.info("config %s has score %f", str(config), score)
+
+            if multiproc:
+                new_scored_space = []
+                for config, mem, score, values in scored_space:
+                    score_value = score.get()
+                    logger.info(
+                        "config %s has score %f", str(config), score_value
                     )
-            scored_space.append((config, mem, score, values))
-
-            logger.info("config %s has score %f", str(config), score)
-
-        if multiproc:
-            new_scored_space = []
-            pool.close()
-            pool.join()
-            for config, mem, score, values in scored_space:
-                new_scored_space.append((config, mem, score.get(), values))
-        else:
-            new_scored_space = scored_space
+                    new_scored_space.append(
+                        (config, mem, score_value, values)
+                    )
+            else:
+                new_scored_space = scored_space
         return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
 
     def order_space_test_comm_classified(self, space, order_by=2):
@@ -721,11 +731,11 @@ def space_to_string(space, max_num=None, debug_parts=None):
     return s
 
 
-def pool_estimate_memory(config):
+def pool_estimate_memory(config: CostModelConfig) -> float:
     """Calls memory estimation for multiprocessing"""
     logger.debug("estimate_peak")
     # print("estimate_peak")
-    e = EvaluatorV2(config)
+    e = EvaluatorV2(None, ccfg=config)
     return e.estimate_peak()
 
 
@@ -735,6 +745,16 @@ def pool_estimate_memory(config):
 #     return evaluator.estimate_peak()
 
 
-def pool_estimate_performance(config, device):
+def pool_estimate_performance(
+    config: CostModelConfig,
+    device: Hard.Type,
+    memory: Optional[float] = None,
+    cache_file: Optional[str] = None,
+) -> float:
     """Calls performance estimation for multiprocessing"""
-    return estimate_performance(config, device_type=device)
+    return estimate_performance(
+        config,
+        device_type=device,
+        memory=memory,
+        cache_file=cache_file,
+    )
