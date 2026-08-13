@@ -2,6 +2,15 @@
 pipeline_config:
   pipeline_num: 16
   num_layer: 96
+  micro_batch_num: 16
+  num_of_interleave: 1
+  vpp_less_memory: false
+  optimization_level: 1
+  memory_limit: 44236
+  constant_memory: 0
+  enable_simulation: true
+  use_backward_time: false
+  sim_comm_time: 0.0
   offset: [-1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1]
 
 # time_config

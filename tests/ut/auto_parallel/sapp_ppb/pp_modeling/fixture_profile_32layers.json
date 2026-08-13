@@ -1,0 +1,38 @@
+{
+    "name": "fixture_32layers",
+    "pre_defined_layer": {
+        "HEAD": 0,
+        "TAIL": -1
+    },
+    "auto_partition_layer": {
+        "NumberOfLayers": 32
+    },
+    "layers_description": [
+        {
+            "name": "HEAD",
+            "type": "HEAD",
+            "model_name": "fixture_32layers",
+            "time": 10,
+            "nb_layer": 1,
+            "memory_parameter": 500
+        },
+        {
+            "name": "BODY",
+            "type": "BODY",
+            "model_name": "fixture_32layers",
+            "time": 3,
+            "nb_layer": 32,
+            "memory_parameter": 200,
+            "memory_activation": 100,
+            "memory_select_rec": 60
+        },
+        {
+            "name": "TAIL",
+            "type": "TAIL",
+            "model_name": "fixture_32layers",
+            "time": 20,
+            "nb_layer": 1,
+            "memory_parameter": 500
+        }
+    ]
+}

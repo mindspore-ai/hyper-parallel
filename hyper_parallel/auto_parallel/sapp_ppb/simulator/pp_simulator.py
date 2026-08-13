@@ -106,22 +106,25 @@ class PipelineSimulator:
                  layer_recompute: object = False, block_mem: object = 1,
                  block_mem_par: object = 0, constant_mem: float = 0,
                  backward_ratio: object = 2.,
+                 backward_time: object = 0,
                  sub_fig: object = None, **kwargs: object) -> None:
         """Delegate initialisation to :meth:`init` (kept as a named method for subclassing)."""
         self.init(block_time, micro_num, comm_time, layer_recompute, block_mem,
-                  block_mem_par, constant_mem, backward_ratio, sub_fig, *args, **kwargs)
+                  block_mem_par, constant_mem, backward_ratio, backward_time,
+                  sub_fig, *args, **kwargs)
 
     # pylint: disable=W0613
     def init(self, block_time: list, micro_num: int, comm_time: float,
              layer_recompute: object, block_mem: object, block_mem_par: object,
-             constant_mem: float, backward_ratio: object,
+             constant_mem: float, backward_ratio: object, backward_time: object,
              sub_fig: object, *args: object, **kwargs: object) -> None:
         """Build the block grid, statistics and communication graph for the simulator."""
         self.micro_num = micro_num
         self.pp, self.vp = self._base_init(block_time)
         self.block_num = 2 * self.vp * self.micro_num
         self.comm_time = comm_time
-        self._input_format(block_time, layer_recompute, block_mem, block_mem_par, backward_ratio)
+        self._input_format(block_time, layer_recompute, block_mem, block_mem_par,
+                           backward_ratio, backward_time)
         self.constant_mem = constant_mem
         self._statistic_init()
         self._comm = True
@@ -255,7 +258,8 @@ class PipelineSimulator:
             raise ValueError(f" `micro_num`({self.micro_num}) should equal or larger than `pp`({pp})")
         return pp, vp
 
-    def _input_format(self, block_time, layer_recompute, block_mem, block_mem_par, backward_ratio) -> None:
+    def _input_format(self, block_time, layer_recompute, block_mem, block_mem_par,
+                      backward_ratio, backward_time) -> None:
         r"""format inputs as 2d array"""
         self.block_time = format_2d_inputs(block_time, self.vp, self.pp)
         if isinstance(layer_recompute, bool):
@@ -274,17 +278,25 @@ class PipelineSimulator:
 
         self.backward_ratio = format_2d_inputs(backward_ratio, self.vp, self.pp)
 
+        if isinstance(backward_time, (int, float)) and backward_time == 0:
+            self._provided_backward_time = None
+        else:
+            self._provided_backward_time = format_2d_inputs(backward_time, self.vp, self.pp)
+
     def _statistic_init(self) -> None:
         r"""init statistic info"""
         self.forward_time = self.block_time
-        self.backward_time = self.block_time * self.backward_ratio + self.layer_recompute
+        if self._provided_backward_time is not None:
+            self.backward_time = self._provided_backward_time
+        else:
+            self.backward_time = self.block_time * self.backward_ratio + self.layer_recompute
         self.states = {'last_time': np.zeros(self.pp),
                        'warmup_time': np.zeros(self.pp),
                        'cooldown_time': np.zeros(self.pp),
                        'stable_free_time': (np.zeros((self.vp, self.pp)), np.zeros((self.vp, self.pp))),
                        'block_mem_list': [np.array([[0, 0]]) for _ in range(self.pp)]}
         self.model_compute_time = (np.sum(self.forward_time) + \
-                                   np.sum(self.forward_time * self.backward_ratio)) * self.micro_num
+                                   np.sum(self.backward_time - self.layer_recompute)) * self.micro_num
         self.hardware_compute_time = (np.sum(self.forward_time) + np.sum(self.backward_time)) * self.micro_num
         self.bubbles = {'real': 0,
                         'ideal': (self.pp - 1) / self.vp / self.micro_num,
@@ -310,25 +322,60 @@ class PipelineSimulator:
 
         self.bubbles['comm'] *= self.comm_time / self.model_compute_time
 
+    def _update_block_mem(self, block, current_mem, p):
+        r"""Update memory for one block and return (updated_block, current_mem) or None if skipped.
+
+        Args:
+            block: A simulation block (compute, recompute, or communication).
+            current_mem: Current memory usage in MB for stage *p*.
+            p: Stage index.
+
+        Returns:
+            ``(block, current_mem)`` if the block affected memory, or
+            ``(None, current_mem)`` if the block was skipped.
+        """
+        if block.type == 'c' and block.state == 'f':
+            current_mem += block.mem
+        elif block.type == 'c' and block.state == 'b':
+            if not self._comm or not block.rec_block:
+                current_mem -= block.mem
+            else:
+                return None, current_mem
+        elif block.type == 'r' and block.host.state == 'b':
+            current_mem -= block.host.mem
+            block = block.host
+        else:
+            return None, current_mem
+        self.states['block_mem_list'][p] = np.append(self.states['block_mem_list'][p],
+                                                     np.array([[block.end, current_mem]]), axis=0)
+        return block, current_mem
+
     def _statistic_info(self) -> None:
-        r"""compute statistic info"""
+        r"""Compute per-stage peak memory and pipeline step time.
+
+        Memory accounting starts from ``constant_mem + first_compute_block.mem_par``
+        (the parameter memory of the first compute block in the stage timeline).
+        When communication blocks are enabled (``self._comm``), the first block
+        in ``self.lines[p]`` may be a receive block rather than a compute block;
+        in that case using ``blocks[0].mem_par`` would be incorrect.  This
+        implementation explicitly finds the first compute block to ensure the
+        initial parameter memory is accounted correctly.
+
+        .. note::
+            For pipelines with ``comm=True`` where the first block in a stage's
+            timeline is a communication block, the reported ``peak_memory`` may
+            differ from earlier versions that used ``blocks[0].mem_par``.
+            This is a correctness fix — the previous behavior was accidentally
+            using a communication block's parameter memory instead of a compute
+            block's.
+        """
         for p in range(self.pp):
             blocks = self.lines[p] if self._comm else self.blocks[p]
-            current_mem = self.constant_mem + blocks[0].mem_par
+            first_compute = next((b for b in blocks if b.type == 'c'), None)
+            current_mem = self.constant_mem + (first_compute.mem_par if first_compute else 0)
 
             for block in blocks:
-                if block.type == 'c' and block.state == 'f':
-                    current_mem += block.mem
-                elif block.type == 'c' and block.state == 'b':
-                    if not self._comm or not block.rec_block:
-                        current_mem -= block.mem
-                elif block.type == 'r' and block.host.state == 'b':
-                    current_mem -= block.host.mem
-                    block = block.host
-                else:
-                    continue
-                self.states['block_mem_list'][p] = np.append(self.states['block_mem_list'][p],
-                                                             np.array([[block.end, current_mem]]), axis=0)
+                _, current_mem = self._update_block_mem(block, current_mem, p)
             self.states['block_mem_list'][p] = np.append(self.states['block_mem_list'][p],
                                                          np.array([[blocks[-1].end, current_mem]]), axis=0)
         self.peak_memory = [np.max((self.states['block_mem_list'][p].T)[1]) for p in range(self.pp)]
@@ -454,27 +501,36 @@ class PipelineSimulator:
         i_new = lines[p].index(self.blocks[p][b + distance]) + 1
         lines[p].insert(i_new, send_block)
 
+    def _process_swap_gap3(self, block, lines, p, b, i_b):
+        r"""process swap when gap == 3."""
+        if p % 2 == 0 and lines[p][i_b + 1].type == 'r' and lines[p][i_b + 2].type == 's':
+            lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
+        if p % 2 == 1 and lines[p][i_b + 1].type == 's' and lines[p][i_b + 2].type == 'r':
+            if block.phase == 'warmup' and self.blocks[p][b + 1].phase == 'cooldown':
+                return False
+            lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
+        if lines[p][i_b + 1].dual.stage == lines[p][i_b + 2].dual.stage:
+            pd = lines[p][i_b + 1].dual.stage
+            j_b1 = lines[pd].index(lines[p][i_b + 1].dual)
+            j_b2 = lines[pd].index(lines[p][i_b + 2].dual)
+            if j_b1 > j_b2:
+                lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
+        return True
+
+    def _process_swap_gap4(self, lines, p, i_b):
+        r"""process swap when gap == 4."""
+        if lines[p][i_b + 1].dual.stage == lines[p][i_b + 2].dual.stage and \
+            lines[p][i_b + 2].dual.stage == lines[p][i_b + 3].dual.stage:
+            if lines[p][i_b + 1].type == 's' and lines[p][i_b + 2].type == 's' \
+                and lines[p][i_b + 3].type == 'r':
+                lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
+
     def _process_swap(self, block, lines, p, b, i_b, i_bn) -> bool:
         r"""process swap in condition"""
         if i_bn - i_b == 3:
-            if p % 2 == 0 and lines[p][i_b + 1].type == 'r' and lines[p][i_b + 2].type == 's':
-                lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
-            if p % 2 == 1 and lines[p][i_b + 1].type == 's' and lines[p][i_b + 2].type == 'r':
-                if block.phase == 'warmup' and self.blocks[p][b + 1].phase == 'cooldown':
-                    return False
-                lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
-            if lines[p][i_b + 1].dual.stage == lines[p][i_b + 2].dual.stage:
-                pd = lines[p][i_b + 1].dual.stage
-                j_b1 = lines[pd].index(lines[p][i_b + 1].dual)
-                j_b2 = lines[pd].index(lines[p][i_b + 2].dual)
-                if j_b1 > j_b2:
-                    lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
+            return self._process_swap_gap3(block, lines, p, b, i_b)
         if i_bn - i_b == 4:
-            if lines[p][i_b + 1].dual.stage == lines[p][i_b + 2].dual.stage and \
-                lines[p][i_b + 2].dual.stage == lines[p][i_b + 3].dual.stage:
-                if lines[p][i_b + 1].type == 's' and lines[p][i_b + 2].type == 's' \
-                    and lines[p][i_b + 3].type == 'r':
-                    lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
+            self._process_swap_gap4(lines, p, i_b)
         return True
 
     def swap_send_rec(self, lines: list[list[BlockSim]]) -> list[list[BlockSim]]:

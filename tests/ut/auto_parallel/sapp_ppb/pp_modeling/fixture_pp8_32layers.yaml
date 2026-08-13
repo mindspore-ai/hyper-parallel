@@ -1,0 +1,12 @@
+# fixture: PP8 with 32 body layers
+pipeline_config:
+  pipeline_num: 8
+  num_layer: 32
+  micro_batch_num: 8
+  num_of_interleave: 1
+  vpp_less_memory: false
+  optimization_level: 1
+  memory_limit: 80000
+  constant_memory: 500
+  enable_simulation: true
+  sim_comm_time: 0.1
