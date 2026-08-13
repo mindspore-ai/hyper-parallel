@@ -15,6 +15,7 @@
 """Typed configuration tree produced by the HyperModels YAML resolver."""
 
 import inspect
+import importlib
 import logging
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Callable, Generic, List, Literal, Optional, TypeVar, Union
@@ -24,6 +25,7 @@ from transformers import PreTrainedTokenizerBase
 
 from hyper_models.components.checkpoint.config import CheckpointingConfig
 from hyper_models.components.distributed.config import FSDP2Config
+from hyper_models.components.model_transform import ModuleReplacementSpec, module_replacement
 
 logger = logging.getLogger(__name__)
 
@@ -203,14 +205,24 @@ class PlanOverride:
     ``instantiate_infrastructure`` BEFORE planner construction.
 
     Fields:
+        module_type: importable source ``nn.Module`` type required by
+            ``replace_module``. The symbol is resolved but never constructed.
+        exact_type: replacement type check mode. Defaults to subclass matching.
+        replace_module: Target factory decorated with ``@module_replacement``.
+            It receives ``module``, ``module_fqn``, and a read-only context,
+            and must return a structure-preserving replacement. A list
+            ``match`` is supported only for replacement-only entries.
         match: fqn or fqn glob matched (fnmatchcase) against the plan's
             boundary FQNs — ``*`` spans dots, so ``"*.self_attn"`` hits
             ``model.layers.0.self_attn``.
-        when: optional activation condition — ``"cp"`` (active when
-            cp_size>1) / ``"ep"`` (ep_size>1); omitted = always applied.
-            Self-documents CP/EP-required injections in the YAML and makes
-            one config reusable across parallel topologies (an inactive
-            entry is skipped with an INFO log, never silently applied).
+        when: optional activation condition for sharding actions — ``"cp"``
+            (active when cp_size>1) / ``"ep"`` (ep_size>1); omitted = always
+            applied. Self-documents CP/EP-required injections in the YAML
+            and makes one config reusable across parallel topologies (an
+            inactive entry is skipped with an INFO log, never silently
+            applied). Not supported on ``replace_module`` entries — module
+            replacements are structure-preserving substitutions, not
+            parallel-topology-conditioned injections.
         local_compute_fn: a Target whose callable is a **factory** — must be
             decorated ``@local_compute`` (injection discipline); the mesh
             family ``mesh``/``tp_mesh``/``cp_mesh``/``ep_mesh`` is mandatory
@@ -261,8 +273,11 @@ class PlanOverride:
             insert mode (misses every boundary): all must be fully declared.
     """
 
-    match: str
+    match: Union[str, List[str]]
     when: Optional[Literal["cp", "ep"]] = None
+    module_type: Optional[str] = None
+    exact_type: bool = False
+    replace_module: Optional[Target[Any]] = None
     local_compute_fn: Optional[Target[Any]] = None
     inner_target: Optional[str] = None
     inner_wrapper: Optional[Union[str, Target[Any]]] = None
@@ -375,6 +390,109 @@ class PlanOverride:
 _WHEN_CONDITIONS = ("cp", "ep")
 
 
+def _import_module_type(path: str) -> type:
+    """Import the source module type named by a replacement YAML entry."""
+
+    if not isinstance(path, str) or not path:
+        raise ValueError("plan_overrides.module_type must be a non-empty symbol path")
+    parts = path.split(".")
+    for split_at in range(len(parts), 0, -1):
+        module_name = ".".join(parts[:split_at])
+        try:
+            symbol = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or module_name.startswith(f"{exc.name}."):
+                continue
+            raise ValueError(
+                f"plan_overrides.module_type {path!r} failed while importing {exc.name!r}"
+            ) from exc
+        except ImportError as exc:
+            raise ValueError(
+                f"plan_overrides.module_type {path!r} failed while importing: {exc}"
+            ) from exc
+        for attribute in parts[split_at:]:
+            if not hasattr(symbol, attribute):
+                raise ValueError(
+                    f"plan_overrides.module_type {path!r} has no attribute {attribute!r}"
+                )
+            symbol = getattr(symbol, attribute)
+        if not isinstance(symbol, type):
+            raise TypeError(f"plan_overrides.module_type {path!r} must name a type")
+        return symbol
+    raise ValueError(f"plan_overrides.module_type {path!r} could not be imported")
+
+
+def _target_replacement_factory(target: Target[Any]):
+    """Bind a YAML Target's static args to the replacement factory protocol."""
+
+    if not getattr(target._target_, "_hp_module_replacement", False):
+        raise TypeError(
+            "plan_overrides replace_module target must be decorated with "
+            "@module_replacement"
+        )
+
+    @module_replacement
+    def factory(*, module, module_fqn, context):
+        return target.build(module=module, module_fqn=module_fqn, context=context)
+
+    return factory
+
+
+def entries_to_module_replacements(
+    entries: List[PlanOverride],
+) -> tuple[ModuleReplacementSpec, ...]:
+    """Desugar YAML replacement actions without involving the sharding planner."""
+
+    rules = []
+    for entry in entries:
+        if entry.replace_module is None:
+            continue
+        if entry.when is not None:
+            raise ValueError(
+                f"plan_overrides match={entry.match!r} uses replace_module and "
+                "does not support 'when' (module replacements are not "
+                "conditioned on parallel topology)"
+            )
+        if entry.module_type is None:
+            raise ValueError(
+                f"plan_overrides match={entry.match!r} uses replace_module but omits module_type"
+            )
+        if not isinstance(entry.replace_module, Target):
+            raise TypeError(
+                f"plan_overrides match={entry.match!r} replace_module must be a YAML Target"
+            )
+        patterns = (entry.match,) if isinstance(entry.match, str) else tuple(entry.match)
+        rules.append(
+            ModuleReplacementSpec(
+                match=patterns,
+                factory=_target_replacement_factory(entry.replace_module),
+                module_type=_import_module_type(entry.module_type),
+                exact_type=entry.exact_type,
+            )
+        )
+    return tuple(rules)
+
+
+def _has_sharding_action(entry: PlanOverride) -> bool:
+    return any(
+        getattr(entry, name) is not None
+        for name in (
+            "local_compute_fn", "inner_target", "inner_wrapper", "inner_out_src",
+            "region_dispatch", "params", "in_src", "in_dst", "out_src", "out_dst",
+        )
+    )
+
+
+def _validate_when(entry: PlanOverride) -> None:
+    """Validate programmatic when values that bypass the YAML Literal check."""
+
+    if entry.when is not None and entry.when not in _WHEN_CONDITIONS:
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} has invalid when={entry.when!r}; "
+            f"expected one of {list(_WHEN_CONDITIONS)}"
+        )
+
+
 def entries_to_plan_overrides(
         entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
 ) -> "dict[str, Any]":
@@ -391,12 +509,21 @@ def entries_to_plan_overrides(
     """
     overrides: dict[str, Any] = {}
     for entry in entries:
+        if isinstance(entry.match, list) and (
+            entry.replace_module is None or _has_sharding_action(entry)
+        ):
+            raise ValueError(
+                "plan_overrides match lists are supported only for replace_module "
+                "entries; use separate string matches for sharding actions"
+            )
+        if entry.replace_module is not None and entry.when is not None:
+            raise ValueError(
+                f"plan_overrides match={entry.match!r} uses replace_module and "
+                "does not support 'when' (module replacements are not "
+                "conditioned on parallel topology)"
+            )
+        _validate_when(entry)
         if entry.when is not None:
-            if entry.when not in _WHEN_CONDITIONS:
-                raise ValueError(
-                    f"plan_overrides match={entry.match!r} 的 when="
-                    f"{entry.when!r} 不合法（合法值: {list(_WHEN_CONDITIONS)}；"
-                    f"缺省 = 总是应用）")
             size = cp_size if entry.when == "cp" else ep_size
             if size <= 1:
                 logger.info(
@@ -404,6 +531,8 @@ def entries_to_plan_overrides(
                     "%s_size=%d — 声明式条件不满足，entry 不生效)",
                     entry.match, entry.when, entry.when, size)
                 continue
+        if entry.replace_module is not None and not _has_sharding_action(entry):
+            continue
         match, spec = entry.to_override()
         if match in overrides:
             prev = overrides[match]
