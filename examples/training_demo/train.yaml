@@ -1,16 +1,15 @@
 # Trainer end-to-end demo.
 #
-# This example uses a random Qwen3-30B-A3B checkpoint generated from its Hub
-# config and tokenized WikiText-2 data. It validates the full Trainer component
-# path without downloading pretrained model weights.
+# This example loads the pretrained Qwen3-30B-A3B checkpoint from Hugging Face
+# Hub and uses tokenized WikiText-2 data to validate the full Trainer path.
 #
 # Run on eight Ascend NPUs with:
 #   bash examples/training_demo/run.sh
 
 model:
   _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ./outputs/training_demo/tiny_llama
-  torch_dtype: auto
+  pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B"
+  torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
 
@@ -32,7 +31,7 @@ training:
 
   # max_steps: 100
   # num_train_epochs: 1
-  global_batch_size: 4
+  global_batch_size: 8
   micro_batch_size: 1
 
   backend: hccl
@@ -43,7 +42,7 @@ training:
   enable_full_determinism: false
 
 accelerator:
-  tp_size: 2
+  tp_size: 1
   cp_size: 1
   ep_size: 1
   pp_size: 1
@@ -51,11 +50,11 @@ accelerator:
   loss_parallel: false
 
 fsdp_config:
-  dp_shard_size: 2
+  dp_shard_size: 8
   replicate_params: []
   reshard_after_forward: true
   defer_fsdp_grad_sync: true
-  comm_fusion: true
+  comm_fusion: false
 
 # plan_overrides: ShardingPlanner 唯一 override 接口的 YAML 形态（注入字段 +
 # 契约 DSL + when 条件）。CP/EP compute 注入在 cp_size>1 / ep_size>1 时是必需
@@ -97,12 +96,16 @@ mixed_precision:
   enabled: false
 
 gradient_checkpointing:
-  activation_checkpoint: off
+  activation_checkpoint: full
 
 model_assets:
   datasets_type: pretokenized
-  chat_template: null
-  tokenizer: null
+  chat_template: null #chatml
+  tokenizer:
+    _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B"
+    local_files_only: true
+    trust_remote_code: true
 
 data_transform:
   _target_: hyper_models.components.data.identity_transform.IdentityDataTransform
@@ -123,27 +126,6 @@ dataloader:
   shuffle: true
   drop_last: true
   use_background_prefetcher: false
-
-# data_transform:
-#   _target_: examples.training_demo.data.PlainTextDataTransform
-#   text_column: text
-#   seq_len: 1024
-#   append_eos: true
-
-# dataset:
-#   _target_: examples.training_demo.data.load_tokenized_text_dataset
-#   path: Salesforce/wikitext
-#   name: wikitext-2-raw-v1
-#   split: train
-
-# collate_fn:
-#   _target_: hyper_models.components.data.data_collator.MakeMicroBatchCollator
-
-# dataloader:
-#   _target_: hyper_models.components.data.dataloader.DataLoader
-#   shuffle: true
-#   drop_last: true
-#   use_background_prefetcher: false
 
 optimizer:
   _target_: hyper_models.components.optim.optimizer.Muon
