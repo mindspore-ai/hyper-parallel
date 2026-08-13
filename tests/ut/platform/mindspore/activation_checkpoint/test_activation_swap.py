@@ -14,8 +14,10 @@
 # ============================================================================
 """Unit tests for MindSpore activation swap platform implementation."""
 import contextlib
+import gc
 import os
 import unittest
+import weakref
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -37,6 +39,7 @@ from mindspore.common.parameter import Parameter
 from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
 from hyper_parallel.platform.mindspore.activation_checkpoint import activation_swap
 from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import (
+    AsyncSaveOnCpu,
     FuncCell,
     SwapWrapper,
     _normalize_device,
@@ -44,7 +47,8 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap imp
     swap_tensor_wrapper,
     swap_wrapper,
 )
-
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+enable_mindspore_backward_compat()
 
 class _TinyCell(nn.Cell):
     """Small cell used by wrapper tests."""
@@ -196,6 +200,34 @@ class TestSwapWrapper(unittest.TestCase):
 
         self.assertEqual(wrapper.factor, 3)
         self.assertTrue(all("_ckpt_wrapped_module" not in name for name, _ in wrapper.parameters_and_names()))
+
+
+class TestAsyncSaveOnCpu(unittest.TestCase):
+    """Unit tests for AsyncSaveOnCpu."""
+
+    def test_packed_tensor_does_not_retain_original_after_storage_clear(self):
+        """Clearing swap storage should release the original while keeping packed data valid."""
+        expected = np.array([1.0, 2.0], np.float32)
+        original = ms.Tensor(expected)
+        original_ref = weakref.ref(original)
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = "group0"
+
+        with patch("hyper_parallel.core.activation_checkpoint.swap.SwapManager", return_value=fake_manager):
+            saved_tensors = AsyncSaveOnCpu(group_swap=True)
+            packed = saved_tensors.pack_hook(original)
+
+        self.assertIsNot(packed, original)
+        self.assertIs(saved_tensors.storage[0][0].val, packed)
+        del original
+
+        unpacked = saved_tensors.unpack_hook(packed)
+        gc.collect()
+
+        self.assertIsNone(saved_tensors.storage)
+        self.assertIsNone(original_ref())
+        self.assertIs(unpacked, packed)
+        np.testing.assert_array_equal(unpacked.asnumpy(), expected)
 
 
 class TestSwapTensorWrapper(unittest.TestCase):
