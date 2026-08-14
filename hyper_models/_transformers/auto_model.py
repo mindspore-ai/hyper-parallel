@@ -82,6 +82,7 @@ class _BaseHyperAutoModelClass:
         fp8_config=None,
         compile_config=None,
         freeze_config=None,
+        activation_checkpoint: Optional[str] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
@@ -134,6 +135,7 @@ class _BaseHyperAutoModelClass:
             fp8_config=fp8_config,
             compile_config=compile_config,
             freeze_config=freeze_config,
+            activation_checkpoint=activation_checkpoint,
             **kwargs,
         )
 
@@ -147,6 +149,7 @@ class _BaseHyperAutoModelClass:
         backend=None,
         torch_dtype="auto",
         attn_implementation="sdpa",
+        activation_checkpoint: Optional[str] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
@@ -181,6 +184,7 @@ class _BaseHyperAutoModelClass:
             validate_placement=False,
             load_base_model=False,
             distributed_setup=distributed_setup,
+            activation_checkpoint=activation_checkpoint,
             **kwargs,
         )
 
@@ -206,6 +210,7 @@ class _BaseHyperAutoModelClass:
         fp8_config=None,
         compile_config=None,
         freeze_config=None,
+        activation_checkpoint: Optional[str] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Core model building orchestration.
@@ -213,7 +218,8 @@ class _BaseHyperAutoModelClass:
         Following design doc 01 §6.3:
         Step 1: Determine meta device
         Step 2: Build model (meta or real device)
-        Step 3-11: apply_model_infrastructure (PP, PEFT, QAT, ShardingPlan, apply, compile, FSDP2, load)
+        Step 3-12: apply_model_infrastructure (PP, PEFT, QAT, ShardingPlan,
+        activation checkpoint, compile, FSDP2, load)
         """
         from contextlib import nullcontext
         from transformers.modeling_utils import ContextManagers
@@ -246,7 +252,7 @@ class _BaseHyperAutoModelClass:
                 **kwargs,
             )
 
-        # Step 3-11: Apply infrastructure
+        # Step 3-12: Apply infrastructure
         model = apply_model_infrastructure(
             model,
             mesh=mesh,
@@ -265,6 +271,7 @@ class _BaseHyperAutoModelClass:
             pretrained_path=pretrained_model_name_or_path,
             validate_placement=validate_placement,
             distributed_setup=distributed_setup,
+            activation_checkpoint=activation_checkpoint,
         )
 
         model.train()

@@ -45,6 +45,7 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.sac import (
     _VersionWrapper,
     _maybe_detach,
     create_selective_checkpoint_contexts,
+    ignore_sac_ops,
 )
 
 
@@ -98,6 +99,17 @@ class TestSacHelpers(unittest.TestCase):
         self.assertIs(entry.save.val, cached)
         self.assertIs(entry.swap.val, cached)
         self.assertTrue(entry.swap.group_swap)
+
+    def test_ignore_sac_ops_adds_available_operator_names(self):
+        """Runtime operator names should be added while unavailable entries are omitted."""
+        original_ignored_ops = set(sac.SAC_IGNORED_OPS)
+        self.addCleanup(sac.SAC_IGNORED_OPS.update, original_ignored_ops)
+        self.addCleanup(sac.SAC_IGNORED_OPS.intersection_update, original_ignored_ops)
+
+        ignore_sac_ops(["AllGather", None])
+
+        self.assertIn("AllGather", sac.SAC_IGNORED_OPS)
+        self.assertNotIn(None, sac.SAC_IGNORED_OPS)
 
 
 class TestCreateSelectiveCheckpointContexts(unittest.TestCase):

@@ -26,7 +26,12 @@ from hyper_models.components.data import (
 )
 from hyper_models.components.distributed.infrastructure import MeshContext
 from hyper_models.trainer.base import BaseTrainer
-from hyper_models.trainer.config import Target, TrainerConfig, TrainingConfig
+from hyper_models.trainer.config import (
+    ActivationCheckpointConfig,
+    Target,
+    TrainerConfig,
+    TrainingConfig,
+)
 
 
 def _unused_target() -> Target:
@@ -43,12 +48,14 @@ def _model_target(
     *,
     distributed_setup: object,
     peft_config: object,
+    activation_checkpoint: object,
 ) -> SimpleNamespace:
     """Return a model object for delegation testing."""
     return SimpleNamespace(
         config=SimpleNamespace(model_type="fake"),
         distributed_setup=distributed_setup,
         peft_config=peft_config,
+        activation_checkpoint=activation_checkpoint,
     )
 
 
@@ -75,6 +82,7 @@ def test_trainer_model_stage_delegates_to_config_target() -> None:
         model=Target(_model_target, target_path="tests.model_target"),
         optimizer=_unused_target(),
         peft=peft_config,
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
     )
     trainer.distributed_setup = distributed_setup
 
@@ -83,9 +91,25 @@ def test_trainer_model_stage_delegates_to_config_target() -> None:
     assert trainer.peft_config is peft_config
     assert trainer.model.distributed_setup is distributed_setup
     assert trainer.model.peft_config is peft_config
+    assert trainer.model.activation_checkpoint == "full"
     assert trainer.model_parts == [trainer.model]
     assert trainer.model_config is trainer.model.config
     assert trainer.hsdp_model_parts == []
+
+
+def test_trainer_model_stage_passes_off_activation_checkpointing_mode() -> None:
+    """Pass the disabled activation-checkpoint mode through unchanged."""
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.config = TrainerConfig(
+        model=Target(_model_target, target_path="tests.model_target"),
+        optimizer=_unused_target(),
+        activation_checkpoint=ActivationCheckpointConfig(mode="off"),
+    )
+    trainer.distributed_setup = object()
+
+    trainer._build_model()
+
+    assert trainer.model.activation_checkpoint == "off"
 
 
 def test_trainer_optimizer_stage_passes_runtime_context() -> None:

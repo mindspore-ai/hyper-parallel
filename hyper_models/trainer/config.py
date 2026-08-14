@@ -79,10 +79,10 @@ class MixedPrecisionConfig:
 
 
 @dataclass
-class GradientCheckpointingConfig:
+class ActivationCheckpointConfig:
     """Activation-checkpoint mode exposed by the initial YAML schema."""
 
-    activation_checkpoint: Literal["off", "none", "full", "selective"] = "off"
+    mode: Optional[Literal["off", "full", "selective"]] = "off"
 
 
 @dataclass
@@ -579,8 +579,8 @@ class TrainerConfig:
     mixed_precision: MixedPrecisionConfig = field(
         default_factory=MixedPrecisionConfig
     )
-    gradient_checkpointing: GradientCheckpointingConfig = field(
-        default_factory=GradientCheckpointingConfig
+    activation_checkpoint: ActivationCheckpointConfig = field(
+        default_factory=ActivationCheckpointConfig
     )
 
     # data
@@ -621,9 +621,9 @@ def save_configs(config: TrainerConfig, output_dir: str) -> None:
 
 __all__ = [
     "AcceleratorConfig",
+    "ActivationCheckpointConfig",
     "DebugConfig",
     "FSDP2Config",
-    "GradientCheckpointingConfig",
     "MixedPrecisionConfig",
     "Target",
     "TrainerConfig",

@@ -1510,6 +1510,12 @@ class TorchPlatform(Platform):
         return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation, group_swap)
 
     @staticmethod
+    def ignore_sac_ops(ops: list[object | None]) -> None:
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.sac import ignore_sac_ops
+        ignore_sac_ops(ops)
+
+    @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import AsyncSaveOnCpu
