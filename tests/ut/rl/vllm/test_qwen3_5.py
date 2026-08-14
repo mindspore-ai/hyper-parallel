@@ -41,14 +41,21 @@ from rl.roles.rollout.vllm_plugin import (
 )
 from rl.roles.rollout.vllm_qwen3_5 import (
     HyperQwen3_5ForCausalLM,
+    _alignment_enabled,
     _build_hyper_config,
-    _configure_gdn_numerical_profile,
-    _enable_gdn_activation_compatibility,
+    _configure_attention_alignment,
+    _enable_gdn_alignment,
     _map_weight_name,
     _reset_rope_inv_freq_from_cpu,
     _validate_adapter_config,
     _validate_loaded_weight_shards,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_alignment_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unrelated adapter tests independent of the caller environment."""
+    monkeypatch.delenv("HYPER_VLLM_ALIGNMENT", raising=False)
 
 
 def _vllm_config(**overrides):
@@ -111,6 +118,7 @@ def _vllm_config(**overrides):
         ),
         quant_config=None,
         speculative_config=None,
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
         compilation_config=SimpleNamespace(
             mode=CompilationMode.NONE,
             cudagraph_mode=CUDAGraphMode.NONE,
@@ -310,53 +318,106 @@ def test_validate_phase_one_uses_checkpoint_ssm_dtype() -> None:
     assert config.cache_config.mamba_ssm_cache_dtype == "float32"
 
 
-def test_enable_gdn_activation_compatibility_requires_backend_support() -> None:
+def test_alignment_rejects_speculative_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYPER_VLLM_ALIGNMENT", "true")
+    config = _vllm_config(speculative_config=SimpleNamespace())
+
+    with pytest.raises(ValueError, match="does not support speculative decoding"):
+        _validate_adapter_config(config)
+
+
+def test_alignment_rejects_prefix_caching(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYPER_VLLM_ALIGNMENT", "true")
+    config = _vllm_config()
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.mamba_cache_mode = "align"
+
+    with pytest.raises(ValueError, match="does not support prefix caching"):
+        _validate_adapter_config(config)
+
+
+def test_alignment_rejects_chunked_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYPER_VLLM_ALIGNMENT", "true")
+    config = _vllm_config()
+    config.scheduler_config.enable_chunked_prefill = True
+
+    with pytest.raises(ValueError, match="does not support chunked prefill"):
+        _validate_adapter_config(config)
+
+
+def test_alignment_rejects_graph_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYPER_VLLM_ALIGNMENT", "true")
+    config = _vllm_config()
+    config.compilation_config.cudagraph_mode = object()
+
+    with pytest.raises(ValueError, match="does not support graph capture"):
+        _validate_adapter_config(config)
+
+
+def test_alignment_gdn_selects_confirmed_compatible_ops() -> None:
     gdn = SimpleNamespace(
+        hyper_qwen3_5_alignment_api=1,
         supported_causal_conv_activation_modes={"fused", "separate_bf16"},
         supported_gdn_gating_modes={"fused", "torch"},
-        supported_gdn_qk_l2norm_modes={"fused", "torch_bf16"},
         supported_gdn_recurrence_modes={"fla", "torch"},
-        supported_gdn_norm_modes={"fused", "torch_bf16"},
+        gdn_gating_mode="fused",
+        gdn_recurrence_mode="fla",
     )
 
-    _enable_gdn_activation_compatibility(gdn)
+    _enable_gdn_alignment(gdn)
 
     assert gdn.causal_conv_activation_mode == "separate_bf16"
     assert gdn.gdn_gating_mode == "torch"
-    assert gdn.gdn_qk_l2norm_mode == "torch_bf16"
     assert gdn.gdn_recurrence_mode == "torch"
-    assert gdn.gdn_norm_mode == "torch_bf16"
 
 
-def test_enable_gdn_activation_compatibility_rejects_old_backend() -> None:
-    with pytest.raises(ValueError, match="requires vLLM-Ascend"):
-        _enable_gdn_activation_compatibility(SimpleNamespace())
+def test_alignment_gdn_requires_qwen3_5_patch_marker() -> None:
+    with pytest.raises(ValueError, match="Qwen3.5 causal-conv"):
+        _enable_gdn_alignment(SimpleNamespace())
 
 
-def test_functional_gdn_profile_uses_backend_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The default rollout profile must not require precision extensions."""
-    monkeypatch.delenv("HYPER_VLLM_NUMERICAL_PROFILE", raising=False)
-    gdn = SimpleNamespace(gdn_recurrence_mode="fla")
+def test_alignment_defaults_to_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HYPER_VLLM_ALIGNMENT", raising=False)
 
-    _configure_gdn_numerical_profile(gdn)
-
-    assert gdn.gdn_recurrence_mode == "fla"
+    assert _alignment_enabled() is False
 
 
-def test_parity_gdn_profile_requires_compatibility_patch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Parity remains available only as an explicit profile."""
-    monkeypatch.setenv("HYPER_VLLM_NUMERICAL_PROFILE", "parity")
+def test_alignment_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYPER_VLLM_ALIGNMENT", "unknown")
 
-    with pytest.raises(ValueError, match="requires vLLM-Ascend"):
-        _configure_gdn_numerical_profile(SimpleNamespace())
+    with pytest.raises(ValueError, match="must be true or false"):
+        _alignment_enabled()
 
 
-def test_gdn_profile_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Misspelled numerical profiles should fail before model execution."""
-    monkeypatch.setenv("HYPER_VLLM_NUMERICAL_PROFILE", "unknown")
+def test_alignment_attention_selects_fusion_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYPER_VLLM_ALIGNMENT", "true")
+    implementation = SimpleNamespace(
+        hyper_qwen3_5_alignment_api=1,
+        supported_prefill_attention_modes={"fia", "fusion"},
+        prefill_attention_mode="fia",
+    )
 
-    with pytest.raises(ValueError, match="must be 'functional' or 'parity'"):
-        _configure_gdn_numerical_profile(SimpleNamespace())
+    _configure_attention_alignment(SimpleNamespace(impl=implementation))
+
+    assert implementation.prefill_attention_mode == "fusion"
+
+
+def test_disabled_alignment_uses_backend_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HYPER_VLLM_ALIGNMENT", raising=False)
+    implementation = SimpleNamespace(prefill_attention_mode="fia")
+
+    _configure_attention_alignment(SimpleNamespace(impl=implementation))
+
+    assert implementation.prefill_attention_mode == "fia"
+
+
+def test_alignment_attention_requires_qwen3_5_patch_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HYPER_VLLM_ALIGNMENT", "true")
+
+    with pytest.raises(ValueError, match="Qwen3.5 fusion-prefill"):
+        _configure_attention_alignment(SimpleNamespace(impl=SimpleNamespace()))
 
 
 def test_reset_rope_inv_freq_uses_cpu_reference() -> None:

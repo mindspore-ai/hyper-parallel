@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -54,12 +55,10 @@ from hyper_parallel.models.qwen3_5.parallelize import (
 
 _GDN_ACTIVATION_COMPATIBILITY_MODE = "separate_bf16"
 _GDN_GATING_COMPATIBILITY_MODE = "torch"
-_GDN_QK_L2NORM_COMPATIBILITY_MODE = "torch_bf16"
 _GDN_RECURRENCE_COMPATIBILITY_MODE = "torch"
-_GDN_NORM_COMPATIBILITY_MODE = "torch_bf16"
-_NUMERICAL_PROFILE_ENV = "HYPER_VLLM_NUMERICAL_PROFILE"
-_FUNCTIONAL_PROFILE = "functional"
-_PARITY_PROFILE = "parity"
+_ATTENTION_PREFILL_ALIGNMENT_MODE = "fusion"
+_ALIGNMENT_API_VERSION = 1
+_ALIGNMENT_ENV = "HYPER_VLLM_ALIGNMENT"
 
 
 def _join_prefix(prefix: str, suffix: str) -> str:
@@ -146,6 +145,7 @@ def _validate_adapter_config(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     cache_config = vllm_config.cache_config
     hf_text_config = vllm_config.model_config.hf_text_config
+    alignment_enabled = _alignment_enabled()
 
     if vllm_config.model_config.dtype != torch.bfloat16:
         raise ValueError("HyperQwen3_5ForCausalLM currently supports only bfloat16")
@@ -157,6 +157,18 @@ def _validate_adapter_config(vllm_config: VllmConfig) -> None:
         raise ValueError("HyperQwen3_5ForCausalLM currently supports decode_context_parallel_size=1")
     if vllm_config.quant_config is not None:
         raise ValueError("HyperQwen3_5ForCausalLM requires an unquantized checkpoint")
+    if alignment_enabled and getattr(vllm_config, "speculative_config", None) is not None:
+        raise ValueError("HyperQwen3_5ForCausalLM alignment does not support speculative decoding")
+    if alignment_enabled and cache_config.enable_prefix_caching:
+        raise ValueError("HyperQwen3_5ForCausalLM alignment does not support prefix caching")
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    if alignment_enabled and bool(_config_value(scheduler_config, "enable_chunked_prefill", False)):
+        raise ValueError("HyperQwen3_5ForCausalLM alignment does not support chunked prefill")
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if alignment_enabled and _config_value(
+        compilation_config, "cudagraph_mode", CUDAGraphMode.NONE
+    ) != CUDAGraphMode.NONE:
+        raise ValueError("HyperQwen3_5ForCausalLM alignment does not support graph capture")
     mamba_cache_mode = _config_value(cache_config, "mamba_cache_mode", "none")
     if cache_config.enable_prefix_caching and mamba_cache_mode != "align":
         raise ValueError("Qwen3.5 prefix caching requires mamba_cache_mode='align'")
@@ -183,39 +195,49 @@ def _validate_adapter_config(vllm_config: VllmConfig) -> None:
             raise ValueError(f"Qwen3.5 {field_name}={field_value} must be divisible by TP size {tp_size}")
 
 
-def _enable_gdn_activation_compatibility(gdn: object) -> None:
+def _enable_gdn_alignment(gdn: object) -> None:
+    alignment_api = getattr(gdn, "hyper_qwen3_5_alignment_api", None)
     supported_modes = getattr(gdn, "supported_causal_conv_activation_modes", frozenset())
     supported_gating_modes = getattr(gdn, "supported_gdn_gating_modes", frozenset())
-    supported_l2norm_modes = getattr(gdn, "supported_gdn_qk_l2norm_modes", frozenset())
     supported_recurrence_modes = getattr(gdn, "supported_gdn_recurrence_modes", frozenset())
-    supported_norm_modes = getattr(gdn, "supported_gdn_norm_modes", frozenset())
     if (
-        _GDN_ACTIVATION_COMPATIBILITY_MODE not in supported_modes
+        alignment_api != _ALIGNMENT_API_VERSION
+        or _GDN_ACTIVATION_COMPATIBILITY_MODE not in supported_modes
         or _GDN_GATING_COMPATIBILITY_MODE not in supported_gating_modes
-        or _GDN_QK_L2NORM_COMPATIBILITY_MODE not in supported_l2norm_modes
         or _GDN_RECURRENCE_COMPATIBILITY_MODE not in supported_recurrence_modes
-        or _GDN_NORM_COMPATIBILITY_MODE not in supported_norm_modes
     ):
         raise ValueError(
-            "HyperQwen3_5ForCausalLM requires vLLM-Ascend GDN numerical compatibility support"
+            "HyperQwen3_5ForCausalLM alignment requires vLLM-Ascend "
+            "Qwen3.5 causal-conv activation, GDN gating, and recurrence support"
         )
     setattr(gdn, "causal_conv_activation_mode", _GDN_ACTIVATION_COMPATIBILITY_MODE)
     setattr(gdn, "gdn_gating_mode", _GDN_GATING_COMPATIBILITY_MODE)
-    setattr(gdn, "gdn_qk_l2norm_mode", _GDN_QK_L2NORM_COMPATIBILITY_MODE)
     setattr(gdn, "gdn_recurrence_mode", _GDN_RECURRENCE_COMPATIBILITY_MODE)
-    setattr(gdn, "gdn_norm_mode", _GDN_NORM_COMPATIBILITY_MODE)
 
 
-def _configure_gdn_numerical_profile(gdn: object) -> None:
-    profile = os.environ.get(_NUMERICAL_PROFILE_ENV, _FUNCTIONAL_PROFILE).strip().lower()
-    if profile == _FUNCTIONAL_PROFILE:
+def _alignment_enabled() -> bool:
+    value = os.environ.get(_ALIGNMENT_ENV, "false").strip().lower()
+    if value not in ("true", "false"):
+        raise ValueError(f"{_ALIGNMENT_ENV} must be true or false, got '{value}'")
+    return value == "true"
+
+
+def _configure_attention_alignment(attention: object) -> None:
+    if not _alignment_enabled():
         return
-    if profile == _PARITY_PROFILE:
-        _enable_gdn_activation_compatibility(gdn)
-        return
-    raise ValueError(
-        f"{_NUMERICAL_PROFILE_ENV} must be '{_FUNCTIONAL_PROFILE}' or '{_PARITY_PROFILE}', got '{profile}'"
-    )
+
+    implementation = attention.impl
+    alignment_api = getattr(implementation, "hyper_qwen3_5_alignment_api", None)
+    supported_modes = getattr(implementation, "supported_prefill_attention_modes", frozenset())
+    if (
+        alignment_api != _ALIGNMENT_API_VERSION
+        or _ATTENTION_PREFILL_ALIGNMENT_MODE not in supported_modes
+    ):
+        raise ValueError(
+            "HyperQwen3_5ForCausalLM alignment requires vLLM-Ascend "
+            "Qwen3.5 fusion-prefill attention support"
+        )
+    setattr(implementation, "prefill_attention_mode", _ATTENTION_PREFILL_ALIGNMENT_MODE)
 
 
 class _VllmAttentionCore(nn.Module):
@@ -242,6 +264,7 @@ class _VllmAttentionCore(nn.Module):
             quant_config=vllm_config.quant_config,
             prefix=prefix,
         )
+        _configure_attention_alignment(self.attention)
 
     def forward(
         self,
@@ -316,7 +339,8 @@ class _VllmGatedDeltaNet(nn.Module):
             prefix=prefix,
             gqa_interleaved_layout=False,
         )
-        _configure_gdn_numerical_profile(self.state_runtime)
+        if _alignment_enabled():
+            _enable_gdn_alignment(self.state_runtime)
         for name in ("conv1d", "in_proj_qkvz", "in_proj_ba", "norm", "out_proj"):
             self.state_runtime._modules.pop(name, None)  # pylint: disable=protected-access
         self.state_runtime._parameters.pop("dt_bias", None)  # pylint: disable=protected-access

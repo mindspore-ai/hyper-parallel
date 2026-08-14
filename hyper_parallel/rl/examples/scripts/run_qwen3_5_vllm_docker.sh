@@ -33,6 +33,7 @@ result_root=${HYPER_VLLM_RESULT_ROOT:-${repo_root}/.rollout-results/qwen35-grpo}
 network_mode=${HYPER_VLLM_NETWORK_MODE:-bridge}
 timeout_seconds=${HYPER_VLLM_TIMEOUT_SECONDS:-600}
 model_implementation=${HYPER_VLLM_MODEL_IMPLEMENTATION:-hyper}
+alignment_enabled=${HYPER_VLLM_ALIGNMENT:-false}
 detached=${HYPER_VLLM_DETACHED:-false}
 container_name=${HYPER_VLLM_CONTAINER_NAME:-hyper-vllm-${model_implementation}-${action}-$$}
 log_suffix=${HYPER_VLLM_LOG_SUFFIX:-}
@@ -43,7 +44,7 @@ production_canary_marker=${result_root}/.production-canary-${model_implementatio
 production_profile_identity=
 
 usage() {
-    printf 'Usage: %s {rollout-tp1|rollout-tp2|rollout-compare-tp1|refit|production-benchmark|grpo-smoke|grpo-colocated-dp-smoke|grpo-m3-select|grpo-m3-2step|grpo-m3-soak|grpo-production-canary|grpo-production}\n' "$0"
+    printf 'Usage: %s {rollout-tp1|rollout-tp2|rollout-compare-tp1|alignment-prefill-gate|refit|production-benchmark|grpo-smoke|grpo-colocated-dp-smoke|grpo-m3-select|grpo-m3-2step|grpo-m3-soak|grpo-production-canary|grpo-production}\n' "$0"
 }
 
 require_directory() {
@@ -71,7 +72,7 @@ compute_production_profile_identity() {
             "${data_root}/test.parquet"
     )
     read -r identity _ < <(
-        printf '%s\n' "${image_id}" "${model_implementation}" "${file_hashes}" | sha256sum
+        printf '%s\n' "${image_id}" "${model_implementation}" "${alignment_enabled}" "${file_hashes}" | sha256sum
     )
     printf '%s\n' "${identity}"
 }
@@ -82,6 +83,14 @@ compute_production_profile_identity() {
 }
 [[ "${model_implementation}" == "hyper" || "${model_implementation}" == "native" ]] || {
     printf 'HYPER_VLLM_MODEL_IMPLEMENTATION must be hyper or native, got: %s\n' "${model_implementation}" >&2
+    exit 1
+}
+[[ "${alignment_enabled}" == "true" || "${alignment_enabled}" == "false" ]] || {
+    printf 'HYPER_VLLM_ALIGNMENT must be true or false, got: %s\n' "${alignment_enabled}" >&2
+    exit 1
+}
+[[ "${alignment_enabled}" == "false" || "${model_implementation}" == "hyper" ]] || {
+    printf 'HYPER_VLLM_ALIGNMENT=true requires HYPER_VLLM_MODEL_IMPLEMENTATION=hyper\n' >&2
     exit 1
 }
 [[ "${detached}" == "true" || "${detached}" == "false" ]] || {
@@ -117,7 +126,26 @@ case "${action}" in
         test_script=tests/torch/rl/vllm/compare_qwen3_5_rollout_reports.py
         output_file=/results/native-hyper-tp1-comparison.json
         ;;
+    alignment-prefill-gate)
+        [[ "${alignment_enabled}" == "true" ]] || {
+            printf 'alignment-prefill-gate requires HYPER_VLLM_ALIGNMENT=true\n' >&2
+            exit 1
+        }
+        [[ "${detached}" == "false" ]] || {
+            printf 'alignment-prefill-gate does not support HYPER_VLLM_DETACHED=true\n' >&2
+            exit 1
+        }
+        test_script=tests/torch/rl/vllm/validate_qwen3_5_alignment.py
+        output_file=/results/qwen3_5-alignment-prefill-gate.json
+        if [[ -z "${HYPER_VLLM_TIMEOUT_SECONDS:-}" ]]; then
+            timeout_seconds=1800
+        fi
+        ;;
     refit)
+        [[ "${alignment_enabled}" == "false" ]] || {
+            printf 'refit does not support HYPER_VLLM_ALIGNMENT=true\n' >&2
+            exit 1
+        }
         test_script=tests/torch/rl/vllm/validate_qwen3_5_refit.py
         output_file=/results/${model_implementation}-refit-tp1.json
         ;;
@@ -189,7 +217,14 @@ case "${action}" in
         exit 1
         ;;
 esac
+if [[ "${alignment_enabled}" == "true" && "${action}" != "alignment-prefill-gate" ]]; then
+    printf 'WARNING: alignment for %s is experimental and is not covered by the bit-exact gate\n' \
+        "${action}" >&2
+fi
 mkdir -p "${result_root}"
+if [[ "${action}" == "alignment-prefill-gate" ]]; then
+    rm -f "${result_root}/qwen3_5-alignment-prefill-gate.json"
+fi
 if [[ "${action}" == "grpo-m3-2step" || "${action}" == "grpo-m3-soak" ]]; then
     m3_train_path=${result_root}/gsm8k-m3/train.parquet
     if [[ ! -f "${m3_train_path}" ]]; then
@@ -223,6 +258,16 @@ elif [[ "${action}" == "rollout-compare-tp1" ]]; then
     common_test_args=(
         --native /results/native-tp1.json
         --hyper /results/hyper-tp1.json
+        --output "${output_file}"
+    )
+elif [[ "${action}" == "alignment-prefill-gate" ]]; then
+    common_test_args=(
+        --model-path /models/Qwen3.5-0.8B-Base
+        --gsm8k-path /data/gsm8k/train.parquet
+        --gsm8k-index 170
+        --max-model-len 512
+        --gpu-memory-utilization 0.1
+        --kv-cache-memory-bytes 1073741824
         --output "${output_file}"
     )
 elif [[ "${action}" == "production-benchmark" ]]; then
@@ -301,7 +346,7 @@ docker run "${docker_lifecycle_args[@]}" --privileged --shm-size=12g --network="
     "${docker_wandb_args[@]}" \
     -e "ASCEND_RT_VISIBLE_DEVICES=${visible_devices}" \
     -e HYPER_PARALLEL_PLATFORM=torch \
-    -e HYPER_VLLM_NUMERICAL_PROFILE=functional \
+    -e "HYPER_VLLM_ALIGNMENT=${alignment_enabled}" \
     -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 \
     -e GLOO_SOCKET_IFNAME=lo \
@@ -330,6 +375,12 @@ docker run "${docker_lifecycle_args[@]}" --privileged --shm-size=12g --network="
             "${source_dir}/hyper_parallel/.commit_id"
         python -m pip install --no-build-isolation --no-deps --ignore-installed \
             --target "${site_dir}" -e "${source_dir}" >/dev/null
+        if [[ "${HYPER_VLLM_ALIGNMENT}" == "true" ]]; then
+            bash "${source_dir}/hyper_parallel/rl/examples/scripts/apply_qwen3_5_vllm_ascend_alignment_patch.sh" || {
+                printf "Failed to apply the Qwen3.5 vLLM-Ascend alignment patch\n" >&2
+                exit 1
+            }
+        fi
         export PYTHONPATH="${site_dir}:${source_dir}/hyper_parallel/rl:${source_dir}:/vllm-workspace/vllm:${PYTHONPATH:-}"
         log_file="/results/${HYPER_RUN_IMPLEMENTATION}-${HYPER_RUN_ACTION}${HYPER_RUN_LOG_SUFFIX}.log"
         if [[ "'"${action}"'" == "grpo-smoke" || "'"${action}"'" == "grpo-colocated-dp-smoke" \

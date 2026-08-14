@@ -61,6 +61,17 @@ def _compare_profile(
     """Compare token/log-prob accuracy and report measured throughput."""
     if native_run["sampling_options"] != hyper_run["sampling_options"]:
         raise ValueError("Native and Hyper sampling options differ")
+    native_requests = native_run["requests"]
+    hyper_requests = hyper_run["requests"]
+    if len(native_requests) != len(hyper_requests):
+        raise ValueError("Native and Hyper request counts differ")
+    for native_request, hyper_request in zip(native_requests, hyper_requests):
+        if native_request["prompt_token_ids"] != hyper_request["prompt_token_ids"]:
+            raise ValueError("Native and Hyper prompt token IDs differ")
+        native_response_length = len(native_request["response_token_ids"])
+        hyper_response_length = len(hyper_request["response_token_ids"])
+        if native_response_length != hyper_response_length:
+            raise ValueError("Native and Hyper per-request response lengths differ")
     native_tokens = _flatten(native_run, "response_token_ids")
     hyper_tokens = _flatten(hyper_run, "response_token_ids")
     native_logprobs = _flatten(native_run, "selected_logprobs")
@@ -97,14 +108,18 @@ def main() -> None:
     hyper_report = _load_report(args.hyper, "hyper")
     for field in (
         "model_fingerprint",
+        "transformers_version",
         "vllm_version",
-        "numerical_profile",
+        "vllm_ascend_version",
+        "alignment_enabled",
         "max_tokens",
         "termination",
         "tensor_parallel_size",
         "world_size",
     ):
-        if native_report.get(field) != hyper_report.get(field):
+        if field not in native_report or field not in hyper_report:
+            raise ValueError(f"Native and Hyper rollout reports require provenance field: {field}")
+        if native_report[field] != hyper_report[field]:
             raise ValueError(f"Native and Hyper rollout provenance differs: {field}")
     native_runs = _index_runs(native_report)
     hyper_runs = _index_runs(hyper_report)

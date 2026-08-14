@@ -12,7 +12,7 @@ Hyper-Parallel 原生 LLM 强化学习运行时。当前主线是 Qwen3.5-0.8B�
 | 在线权重更新 | sleep、train、refit、wake 和 policy version 闭环已验证 |
 | Correctness | Hyper/native 两步学习门禁与 20-step soak 已通过 |
 | Production profile | 已实现；当前 batch-invariant canary 和完整 1,868-step 训练尚未运行 |
-| 精度对齐 | standalone A/B 仍有 sampled-token log-prob 差异，后续单独处理 |
+| Qwen3.5 精度对齐 | 本地 Hyper TP1/BF16/batch-one fresh-prefill 门禁已观察到 bit-exact；decode、TP2 和多请求尚未验收 |
 | PPO/Critic | CPU 数学和能力契约已覆盖，尚未声明 Qwen NPU 端到端完成 |
 | 多节点、colocated TP、异步训练 | 尚未实现 |
 
@@ -26,13 +26,13 @@ Hyper-Parallel 原生 LLM 强化学习运行时。当前主线是 Qwen3.5-0.8B�
 - 2 张 Ascend 910B3 NPU；
 - CANN 9.0.0；
 - Docker 镜像 `hyper-parallel/unified-e2-dev:v0.22.1rc1`；
-- Torch/torch-npu 2.10.0；
+- Torch/torch-npu 2.10.0、Transformers 5.5.4；
 - vLLM 0.22.1、vLLM-Ascend 0.22.1rc1；
 - Qwen3.5-0.8B-Base；
 - 包含 `prompt` 和 `extra_info` 列的 GSM8K parquet 数据。
 
-通用安装文档和旧 Hyper 内置生成环境不是本次 vLLM 验收环境。固定版本、镜像 ID、模型/数据哈希和插件要求见
-[Qwen3.5 vLLM 兼容与实验基线](docs/vllm_compatibility.md)。
+通用安装环境和旧 Hyper 内置生成环境不是本次 vLLM 验收环境。Alignment patch 仅接受上述固定
+vLLM-Ascend 源文件版本，不匹配时会在启动前失败。
 
 ## 基础运行
 
@@ -62,8 +62,44 @@ export HCCL_NPU_SOCKET_PORT_RANGE=62000-62100
 ./hyper_parallel/rl/examples/scripts/run_qwen3_5_vllm_docker.sh grpo-m3-2step
 ```
 
-详细命令、并行作业隔离、20-step soak 和 experimental production profile 见
-[Qwen3.5 + GRPO 复现指南](docs/reproduce_grpo.md)。
+其他可用 action 可通过不带参数运行该脚本查看。并行作业应使用不同的 `HYPER_VLLM_RESULT_ROOT`、
+HCCL 端口范围和容器名。
+
+## Qwen3.5 Alignment
+
+Inference alignment 是默认关闭的实验性能力，用于让 Hyper Qwen3.5 与 canonical Hyper 模型在受控
+fresh-prefill 边界内逐层对齐。启用后，launcher 会严格校验并应用仓库内的 vLLM-Ascend patch，选择：
+
+- separate BF16 causal-conv/SiLU；
+- Torch FP32 GDN gating；
+- Transformers canonical Torch GDN recurrence；
+- fusion-attention fresh prefill。
+
+运行已验收的门禁：
+
+```bash
+export HYPER_VLLM_MODEL_IMPLEMENTATION=hyper
+export HYPER_VLLM_ALIGNMENT=true
+
+./hyper_parallel/rl/examples/scripts/run_qwen3_5_vllm_docker.sh \
+  alignment-prefill-gate
+```
+
+`HYPER_VLLM_ALIGNMENT` 只接受 `true` 或 `false`，默认为 `false`。旧的
+`HYPER_VLLM_NUMERICAL_PROFILE` 不再使用。Alignment 仅支持 Hyper Qwen3.5、BF16、非量化 checkpoint 和
+eager execution，不支持 prefix caching、chunked prefill、speculative decoding、graph capture 或 standalone
+`refit` action。Torch GDN recurrence 优先保证数值一致性，会明显降低吞吐。
+
+本地 bit-exact 观察严格限定为 Ascend 910B3、TP1、batch one、单个完整且无历史 cache 的 fresh prefill；
+24 层输出、final norm、BF16 full logits 和 FP32 full-vocabulary log-softmax 均 exact。该结果不能外推到
+decode、cache reuse、TP2、多请求调度或完整 RL 训练。为其他 action 设置 alignment 只用于继续实验，不代表
+这些路径已经通过 exact 验收。`VLLM_BATCH_INVARIANT` 是独立 inference 开关，门禁中保持关闭；Trainer
+Linear/MM batch-invariant 尚未接入当前分支。
+
+## 数据答案来源
+
+配置中的 `data.answer_column` 一旦显式设置即为权威答案来源。未设置时，数据集依次尝试
+`reward_model.ground_truth`，再自动推断 `extra_info`、`answer` 或 `solution` 列，避免自动 fallback 覆盖用户配置。
 
 ## 验收边界
 
@@ -72,12 +108,10 @@ export HCCL_NPU_SOCKET_PORT_RANGE=62000-62100
 | `grpo-colocated-dp-smoke` | sleep/train/IPC/refit 系统闭环 | 非零梯度或收敛 |
 | `grpo-m3-2step` | mixed reward、非零梯度、norm 探针变化和 version 1/2 | GSM8K 收敛 |
 | `grpo-m3-soak` | 20-step 生命周期稳定 | 每步梯度都非零 |
+| `alignment-prefill-gate` | TP1/BF16/batch-one fresh prefill 逐层和 full-logit bit-exact | decode、cache reuse、TP2 或多请求 exact |
 | `production-benchmark` | standalone 并发数值与吞吐 A/B | colocated 完整训练可用 |
 | `grpo-production-canary` | production-shaped 单步生命周期 | 数值对齐或完整训练 |
 | `grpo-production` | 完整 profile 执行 | 当前尚无成功运行证据 |
-
-最新真实硬件结果、已知问题和未完成门禁见
-[vLLM 在线 Rollout 故障记录与验收状态](docs/vllm_online_rollout_status.md)。
 
 ## 代码结构
 
@@ -99,8 +133,4 @@ hyper_parallel/rl/
 
 ## 文档
 
-- [架构设计](docs/architecture.md)
-- [代码结构](docs/code_structure.md)
-- [Qwen3.5 + GRPO 复现指南](docs/reproduce_grpo.md)
-- [Qwen3.5 vLLM 兼容与实验基线](docs/vllm_compatibility.md)
-- [vLLM 在线 Rollout 故障记录与验收状态](docs/vllm_online_rollout_status.md)
+- [架构重构记录](docs/architecture_refactor_plan.md)

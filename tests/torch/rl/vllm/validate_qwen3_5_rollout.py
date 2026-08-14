@@ -33,8 +33,7 @@ from rl.roles.rollout.vllm_plugin import register_hyper_models
 _LOGGER = logging.getLogger(__name__)
 _HYPER_ARCHITECTURE = "HyperQwen3_5ForCausalLM"
 _NATIVE_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
-_NUMERICAL_PROFILE_ENV = "HYPER_VLLM_NUMERICAL_PROFILE"
-_FUNCTIONAL_PROFILE = "functional"
+_ALIGNMENT_ENV = "HYPER_VLLM_ALIGNMENT"
 _SAMPLING_PROFILES = ("greedy", "temperature", "top-k", "top-p")
 _DEFAULT_PROMPTS = (
     "Explain why the sky appears blue in two sentences.",
@@ -109,6 +108,7 @@ def _create_llm(args: argparse.Namespace) -> LLM:
         "tensor_parallel_size": args.tensor_parallel_size,
         "enforce_eager": True,
         "enable_prefix_caching": False,
+        "enable_chunked_prefill": False,
         "max_num_seqs": len(args.prompts),
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -137,13 +137,11 @@ def _restore_output_ownership(path: Path) -> None:
     os.chown(path, int(host_uid), int(host_gid))
 
 
-def _validate_numerical_profile() -> str:
-    profile = os.environ.get(_NUMERICAL_PROFILE_ENV, _FUNCTIONAL_PROFILE).strip().lower()
-    if profile != _FUNCTIONAL_PROFILE:
-        raise ValueError(
-            f"Functional rollout requires {_NUMERICAL_PROFILE_ENV}='{_FUNCTIONAL_PROFILE}', got '{profile}'"
-        )
-    return profile
+def _alignment_enabled() -> bool:
+    value = os.environ.get(_ALIGNMENT_ENV, "false").strip().lower()
+    if value not in ("true", "false"):
+        raise ValueError(f"{_ALIGNMENT_ENV} must be true or false, got '{value}'")
+    return value == "true"
 
 
 def _sampling_options(sampling_profile: str) -> dict[str, Any]:
@@ -226,7 +224,9 @@ def main() -> None:
     )
     if args.termination == "eos" and sampling_profiles != ("greedy",):
         raise ValueError("EOS validation supports only --sampling-profile=greedy")
-    numerical_profile = _validate_numerical_profile()
+    alignment_enabled = _alignment_enabled()
+    if alignment_enabled and args.implementation != "hyper":
+        raise ValueError("HYPER_VLLM_ALIGNMENT=true requires --implementation=hyper")
     output_parent_existed = args.output.parent.exists()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if not output_parent_existed:
@@ -286,8 +286,10 @@ def main() -> None:
         "implementation": args.implementation,
         "model": args.model,
         "model_fingerprint": _model_fingerprint(Path(args.model)),
+        "transformers_version": package_version("transformers"),
         "vllm_version": package_version("vllm"),
-        "numerical_profile": numerical_profile,
+        "vllm_ascend_version": package_version("vllm-ascend"),
+        "alignment_enabled": alignment_enabled,
         "architecture": architecture,
         "tensor_parallel_size": args.tensor_parallel_size,
         "world_size": llm.llm_engine.vllm_config.parallel_config.world_size,

@@ -312,6 +312,21 @@ class VLLMGenerationEngine:
         self._model_implementation = normalize_model_implementation(
             self._config.get("model_implementation", "hyper")
         )
+        alignment_value = os.environ.get("HYPER_VLLM_ALIGNMENT", "false").strip().lower()
+        if alignment_value not in ("true", "false"):
+            raise ValueError(
+                "HYPER_VLLM_ALIGNMENT must be true or false, "
+                f"got '{alignment_value}'"
+            )
+        self._alignment_enabled = alignment_value == "true"
+        if self._alignment_enabled and self._model_implementation != "hyper":
+            raise ValueError("HYPER_VLLM_ALIGNMENT=true requires model_implementation='hyper'")
+        if self._alignment_enabled and self._model.hyper_model_name != "qwen3_5":
+            raise ValueError("HYPER_VLLM_ALIGNMENT=true currently supports only Qwen3.5")
+        if self._alignment_enabled and bool(self._config.get("enable_prefix_caching", False)):
+            raise ValueError("HYPER_VLLM_ALIGNMENT=true does not support prefix caching")
+        if self._alignment_enabled and not bool(self._config.get("enforce_eager", True)):
+            raise ValueError("HYPER_VLLM_ALIGNMENT=true requires enforce_eager=true")
         self._client = client
         self._weight_sync = ActorRolloutWeightSync(
             model.name,
@@ -399,6 +414,8 @@ class VLLMGenerationEngine:
             command.append("--enforce-eager")
         if bool(self._config.get("enable_prefix_caching", False)):
             command.append("--enable-prefix-caching")
+        if self._alignment_enabled:
+            command.append("--no-enable-chunked-prefill")
         if bool(self._config.get("skip_mm_profiling", False)):
             command.append("--skip-mm-profiling")
         if self._deployment == "colocated":
@@ -428,6 +445,7 @@ class VLLMGenerationEngine:
         server_environment.update(
             {
                 "ASCEND_RT_VISIBLE_DEVICES": str(visible_devices),
+                "HYPER_VLLM_ALIGNMENT": "true" if self._alignment_enabled else "false",
                 "VLLM_ASCEND_ENABLE_NZ": "0",
                 "VLLM_BATCH_INVARIANT": "1" if bool(self._config.get("batch_invariant", False)) else "0",
                 "VLLM_HOST_IP": "127.0.0.1",
