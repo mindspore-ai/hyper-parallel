@@ -132,6 +132,21 @@ class WandbConfig:
     entity: Optional[str] = None
 
 
+@dataclass
+class ProfilingConfig:
+    """Lightweight per-step profiler settings."""
+
+    enabled: bool = False
+    start_step: int = 3
+    end_step: int = 4
+    trace_dir: str = "./outputs/profiling"
+    record_shapes: bool = False
+    profile_memory: bool = False
+    with_stack: bool = False
+    with_modules: bool = False
+    rank: int = 0
+
+
 _T = TypeVar("_T")
 
 
@@ -709,6 +724,7 @@ class TrainerConfig:
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
 
@@ -746,6 +762,7 @@ __all__ = [
     "DebugConfig",
     "FSDP2Config",
     "MixedPrecisionConfig",
+    "ProfilingConfig",
     "Target",
     "TrainerConfig",
     "TrainingConfig",
