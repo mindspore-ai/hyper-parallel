@@ -17,12 +17,10 @@
 from rl.algorithm.reward import compute_rule_reward, extract_answer
 from rl.agentic.base import Action, Observation, Transition
 from rl.agentic.registry import ENVIRONMENTS
-from rl.contracts import PromptRecord
-
+from rl.dataset.contracts import PromptRecord
 
 class GSM8KEnvironment:
     """Treat math answer generation as a one-action agent episode."""
-
     def __init__(self, prompt: PromptRecord) -> None:
         """Initialize the episode for one prompt record."""
         self.prompt = prompt
@@ -40,7 +38,6 @@ class GSM8KEnvironment:
             token_ids=token_ids,
             metadata={"role": "user"},
         )
-
     async def step(self, action: Action) -> Transition:
         """Score the single generated answer and terminate the episode."""
         if self._stepped:
@@ -60,11 +57,9 @@ class GSM8KEnvironment:
                 "extracted_answer": extract_answer(action.content),
             },
         )
-
     async def close(self) -> None:
         """Close the stateless GSM8K environment."""
         return None
-
 
 @ENVIRONMENTS.register("gsm8k")
 def build_gsm8k_environment(prompt: PromptRecord) -> GSM8KEnvironment:

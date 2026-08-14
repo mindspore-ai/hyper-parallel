@@ -13,18 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """Rollout worker and registered generation-engine adapters."""
-
 from rl.roles.rollout.base import (
     GenerationEngine,
     GenerationRequest,
     GenerationResult,
     GenerationSettings,
 )
-from rl.roles.rollout import hyper_infer as _hyper_infer  # noqa: F401
 from rl.roles.rollout import vllm as _vllm  # noqa: F401
 from rl.roles.rollout.registry import ROLLOUT_ENGINES, build_rollout_engine
 from rl.roles.weight_sync import PolicySnapshot
-
 __all__ = [
     "GenerationEngine",
     "GenerationRequest",

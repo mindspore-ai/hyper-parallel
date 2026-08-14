@@ -13,19 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """Stateful token-first agent episode consumed by the batched runner."""
-
 from typing import Any, Optional
-
 from rl.agentic.base import Action, Environment, Observation
-from rl.contracts import PromptRecord, Trajectory, Turn
+from rl.dataset.contracts import PromptRecord, Trajectory, Turn
 from hyper_parallel import get_platform
-
 platform = get_platform()
-
-
 class AgentSession:
     """Own one Environment and accumulate its token-exact trajectory."""
-
     def __init__(
         self,
         prompt: PromptRecord,
@@ -56,19 +50,16 @@ class AgentSession:
         self.action_contents: list[str] = []
         self._started = False
         self._closed = False
-
     @property
     def active(self) -> bool:
         """Return whether the episode can accept another action."""
         return self._started and not self.done and not self.truncated
-
     @property
     def token_ids(self) -> Any:
         """Return all observation and action tokens accumulated so far."""
         if not self._token_parts:
             raise RuntimeError("AgentSession has not been started")
         return platform.cat(self._token_parts)
-
     async def start(self) -> None:
         """Reset the environment and append its initial observation."""
         if self._started:
@@ -78,7 +69,6 @@ class AgentSession:
         if observation.token_ids.numel() == 0:
             raise ValueError("The initial environment observation must not be empty")
         self._append_observation(observation, initial=True)
-
     def _append_observation(
         self,
         observation: Observation,
@@ -116,7 +106,6 @@ class AgentSession:
         if role not in {"system", "user", "tool", "environment"}:
             raise ValueError(f"Unsupported observation role: {role}")
         self.turns.append(Turn(role, observation.content, start, end, False))
-
     def _append_action(self, action: Action) -> None:
         """Append one trainable model action and its optional log-probabilities."""
         if action.token_ids.ndim != 1:
@@ -149,7 +138,6 @@ class AgentSession:
         )
         self.turns.append(Turn("assistant", action.content, start, end, True))
         self.action_contents.append(action.content)
-
     async def apply(self, action: Action) -> None:
         """Apply one action and accumulate its resulting transition."""
         if not self.active:
@@ -178,19 +166,16 @@ class AgentSession:
             self.terminal_reason = "done"
         elif self.truncated:
             self.terminal_reason = "environment_truncated"
-
     def finish_max_turns(self) -> None:
         """Truncate an active session after the configured turn limit."""
         if self.active:
             self.truncated = True
             self.terminal_reason = "max_turns"
-
     async def close(self) -> None:
         """Close the environment at most once."""
         if not self._closed:
             await self.environment.close()
             self._closed = True
-
     def build(self) -> Trajectory:
         """Build the immutable token-aligned trajectory for this episode."""
         if not self._started:

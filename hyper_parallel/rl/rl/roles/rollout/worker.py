@@ -13,17 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """Role-level facade around the default token-first AgentRunner."""
-
 from typing import Any, Optional, Sequence
-
 from rl.agentic import AgentRunner
-from rl.contracts import ExperienceBatch, PromptRecord
+from rl.dataset.contracts import ExperienceBatch, PromptRecord
 from rl.roles.rollout.base import GenerationEngine, GenerationSettings
-
-
 class RolloutManager:
     """Configure an AgentRunner for training or evaluation rollout."""
-
     def __init__(
         self,
         engine: GenerationEngine,
@@ -63,7 +58,6 @@ class RolloutManager:
             max_observation_tokens=max_observation_tokens,
             settings=settings,
         )
-
     def generate(
         self,
         prompt_records: Sequence[PromptRecord],

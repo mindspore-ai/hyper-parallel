@@ -13,15 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Model-specific adapters for token-value Critic capabilities."""
-
 from types import MethodType
 from typing import Any
-
-from hyper_parallel import HSDPModule, get_platform
-
-platform = get_platform()
-
-
 def attach_value_head(model: Any, model_name: str) -> Any:
     """Convert a supported causal LM instance into a token-value backbone.
 
@@ -48,16 +41,13 @@ def attach_value_head(model: Any, model_name: str) -> Any:
         dtype=parameter.dtype,
     )
     original_forward = model.forward
-
     def value_forward(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Run the backbone and project captured final hidden states to values."""
         captured: list[Any] = []
-
         def capture_hidden(module: Any, inputs: Any, output: Any) -> None:
             """Capture final normalized hidden states for the value head."""
             del module, inputs
             captured.append(output)
-
         handle = final_norm.register_forward_hook(capture_hidden)
         try:
             original_forward(*args, **kwargs)
@@ -66,40 +56,6 @@ def attach_value_head(model: Any, model_name: str) -> Any:
         if not captured:
             raise RuntimeError("qwen3_5 Critic did not expose final hidden states")
         return {"values": self.value_head(captured[-1]).squeeze(-1)}
-
     model.forward = MethodType(value_forward, model)
     return model
-
-
-class CriticModel(platform.Module):
-    """Expose token values around one independently parallelized backbone."""
-
-    def __init__(self, module: platform.Module) -> None:
-        """Wrap an independently allocated token-value backbone."""
-        platform.Module.__init__(self)
-        self.module = module
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Forward all arguments to the wrapped Critic backbone."""
-        return self.module(*args, **kwargs)
-
-    def sequence_values(
-        self,
-        sequences: platform.Tensor,
-        attention_mask: platform.Tensor,
-    ) -> platform.Tensor:
-        """Return float32 values aligned with next-token prediction positions."""
-        outputs = self(input_ids=sequences, attention_mask=attention_mask, use_cache=False)
-        values = outputs["values"] if isinstance(outputs, dict) else outputs.values
-        expected = (sequences.shape[0], sequences.shape[1])
-        if tuple(values.shape) != expected:
-            raise ValueError(
-                f"Critic values must have shape {expected}, got {tuple(values.shape)}"
-            )
-        return values[:, :-1].float()
-
-    def set_gradient_sync(self, is_last_micro_batch: bool) -> None:
-        """Enable HSDP gradient synchronization on the final micro-batch."""
-        if isinstance(self.module, HSDPModule):
-            self.module.set_requires_gradient_sync(is_last_micro_batch)
-            self.module.set_is_last_backward(is_last_micro_batch)
+__all__ = ["attach_value_head"]

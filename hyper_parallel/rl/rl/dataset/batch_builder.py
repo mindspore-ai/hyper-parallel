@@ -12,19 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Canonical trajectory batching and requirements-driven target preparation."""
-
+"""Canonical trajectory batching and model-free target preparation."""
 from dataclasses import replace
-from typing import Any, Mapping, Optional, Protocol
-
-from rl.algorithm.base import RLAlgorithm
-from rl.contracts import ExperienceBatch, Trajectory
+from typing import Any, Mapping, Optional
+from rl.algorithm.loss import RLAlgorithm
+from rl.dataset.contracts import ExperienceBatch, Trajectory
 from rl.roles.rollout.base import GenerationSettings
 from hyper_parallel import get_platform
-
 platform = get_platform()
-
-
 def build_experience_batch(
     trajectories: tuple[Trajectory, ...],
     generation_seconds: float,
@@ -87,101 +82,33 @@ def build_experience_batch(
         generation_seconds=generation_seconds,
         metadata=batch_metadata,
     )
-
-
-class LogProbabilityModel(Protocol):
-    """Minimal frozen-policy capability required by experience preparation."""
-
-    training: bool
-
-    def eval(self) -> Any:
-        """Switch the model to evaluation mode."""
-
-    def train(self, mode: bool = True) -> Any:
-        """Set the model training mode and return the model."""
-
-    def sequence_log_probs(self, sequences: Any, attention_mask: Any) -> Any:
-        """Return next-token log-probabilities for each sequence."""
-
-
-class ValueModel(Protocol):
-    """Minimal Critic capability required by experience preparation."""
-
-    training: bool
-
-    def eval(self) -> Any:
-        """Switch the model to evaluation mode."""
-
-    def train(self, mode: bool = True) -> Any:
-        """Set the model training mode and return the model."""
-
-    def sequence_values(self, sequences: Any, attention_mask: Any) -> Any:
-        """Return next-token values for each sequence."""
-
-
-class ExperienceBuilder:
-    """Populate only the data fields declared by a complete algorithm Recipe."""
-
-    def __init__(
-        self,
-        algorithm: RLAlgorithm,
-        reference: Optional[LogProbabilityModel] = None,
-        critic: Optional[ValueModel] = None,
-        micro_batch_size: int = 1,
-    ) -> None:
-        """Initialize requirements-driven frozen-model inference."""
-        if micro_batch_size <= 0:
-            raise ValueError("ExperienceBuilder micro_batch_size must be positive")
-        if algorithm.requirements.roles.reference and reference is None:
-            raise ValueError(f"Algorithm '{algorithm.name}' requires a reference model")
-        if algorithm.requirements.roles.critic and critic is None:
-            raise ValueError(f"Algorithm '{algorithm.name}' requires a Critic")
+class ExperiencePreparer:
+    """Combine completed role outputs into an immutable training batch."""
+    def __init__(self, algorithm: RLAlgorithm) -> None:
+        """Initialize target construction for one algorithm recipe."""
         self.algorithm = algorithm
-        self.reference = reference
-        self.critic = critic
-        self.micro_batch_size = micro_batch_size
-
-    def _chunked_inference(self, model: Any, method_name: str, experience: ExperienceBatch) -> Any:
-        """Run frozen model inference in response-sized micro-batches."""
-        was_training = model.training
-        model.eval()
-        chunks = []
-        try:
-            with platform.no_grad():
-                method = getattr(model, method_name)
-                for start in range(0, experience.sequences.shape[0], self.micro_batch_size):
-                    end = min(start + self.micro_batch_size, experience.sequences.shape[0])
-                    chunks.append(
-                        method(
-                            experience.sequences[start:end],
-                            experience.attention_mask[start:end],
-                        )
-                    )
-        finally:
-            model.train(was_training)
-        return platform.cat(chunks, dim=0).detach()
-
-    def build(self, rollout: ExperienceBatch) -> ExperienceBatch:
-        """Return an immutable batch with Recipe-required targets populated."""
+    def prepare(
+        self,
+        rollout: ExperienceBatch,
+        *,
+        reference_log_probs: Optional[Any] = None,
+        values: Optional[Any] = None,
+    ) -> ExperienceBatch:
+        """Validate role outputs and build algorithm-specific training targets."""
         requirements = self.algorithm.requirements
         if requirements.data.rollout_log_probs and rollout.old_log_probs is None:
             raise ValueError(
                 f"Algorithm '{self.algorithm.name}' requires rollout log-probabilities"
             )
-        reference_log_probs = rollout.reference_log_probs
-        if requirements.data.reference_log_probs:
-            if self.reference is None:
-                raise RuntimeError(
-                    f"Algorithm '{self.algorithm.name}' requires reference log-probabilities"
-                )
-            reference_log_probs = self._chunked_inference(
-                self.reference, "sequence_log_probs", rollout
+        if requirements.data.reference_log_probs and reference_log_probs is None:
+            raise ValueError(
+                f"Algorithm '{self.algorithm.name}' requires reference log-probabilities"
             )
-        values = rollout.values
-        if requirements.data.values:
-            if self.critic is None:
-                raise RuntimeError(f"Algorithm '{self.algorithm.name}' requires values")
-            values = self._chunked_inference(self.critic, "sequence_values", rollout)
+        if requirements.data.values and values is None:
+            raise ValueError(
+                f"Algorithm '{self.algorithm.name}' requires critic values"
+            )
+        detached_values = None if values is None else values.detach()
         group_ids = (
             tuple(trajectory.group_id for trajectory in rollout.trajectories)
             if rollout.trajectories
@@ -191,7 +118,7 @@ class ExperienceBuilder:
             rewards=rollout.rewards,
             action_mask=rollout.loss_action_mask,
             group_ids=group_ids,
-            values=values,
+            values=detached_values,
         )
         if requirements.data.returns and targets.returns is None:
             raise RuntimeError(
@@ -199,8 +126,10 @@ class ExperienceBuilder:
             )
         return replace(
             rollout,
-            reference_log_probs=reference_log_probs,
-            values=values,
+            reference_log_probs=(
+                None if reference_log_probs is None else reference_log_probs.detach()
+            ),
+            values=detached_values,
             advantages=targets.advantages.detach(),
             returns=None if targets.returns is None else targets.returns.detach(),
         )

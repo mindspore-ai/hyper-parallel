@@ -31,17 +31,6 @@ Hyper-Parallel 原生 LLM 强化学习运行时。当前主线是 Qwen3.5-0.8B�
 - Qwen3.5-0.8B-Base；
 - 包含 `prompt` 和 `extra_info` 列的 GSM8K parquet 数据。
 
-建议目录：
-
-```text
-<workspace>/
-├── hyper-rl/
-├── models/Qwen3.5-0.8B-Base/
-└── data/gsm8k/
-    ├── train.parquet
-    └── test.parquet
-```
-
 通用安装文档和旧 Hyper 内置生成环境不是本次 vLLM 验收环境。固定版本、镜像 ID、模型/数据哈希和插件要求见
 [Qwen3.5 vLLM 兼容与实验基线](docs/vllm_compatibility.md)。
 
@@ -97,7 +86,7 @@ hyper_parallel/rl/
 ├── rl/
 │   ├── algorithm/       # GRPO/PPO recipes
 │   ├── dataset/         # prompt data and batch construction
-│   ├── roles/rollout/   # Hyper/vLLM engines and weight refit
+│   ├── roles/rollout/   # vLLM engine, model adapters, and weight refit
 │   ├── agentic/         # environments and runners
 │   └── trainer.py       # synchronous training lifecycle
 ├── examples/
@@ -105,8 +94,8 @@ hyper_parallel/rl/
 └── docs/
 ```
 
-旧 `run_qwen3_5_0_8b_gsm8k_docker.sh` 使用 `rollout.engine=hyper` 的 Hyper 内置生成后端，仍作为兼容入口保留，
-但不是当前 colocated vLLM 主线。这里的“内置生成”不表示 vLLM 的 `model_implementation=native`。
+所有 RL rollout 统一使用 `rollout.engine=vllm`。`rollout.vllm.model_implementation=hyper|native`
+只选择 vLLM 进程内的模型实现，不代表两套 rollout backend。
 
 ## 文档
 

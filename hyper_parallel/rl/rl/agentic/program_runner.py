@@ -18,20 +18,16 @@ import asyncio
 import time
 from typing import Callable, Protocol, Sequence
 
-from rl.contracts import ExperienceBatch, PromptRecord, Trajectory
-from rl.dataset import build_experience_batch
+from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory
+from rl.dataset.batch_builder import build_experience_batch
 from rl.roles.rollout.base import GenerationSettings
-
 
 class AgentProgram(Protocol):
     """One user-defined episode, including its own tools and model calls."""
-
     async def run(self) -> Trajectory:
         """Execute one user-owned episode and return its trajectory."""
 
-
 AgentProgramFactory = Callable[[PromptRecord, int, int], AgentProgram]
-
 
 class ProgramAgentRunner:
     """Run user-owned agent programs and enforce only the data-plane contract.
@@ -40,7 +36,6 @@ class ProgramAgentRunner:
     owns the semantic loop and may call an external inference service, tools,
     or a sandbox.  Hyper-RL owns validation, batching, and downstream learning.
     """
-
     def __init__(
         self,
         program_factory: AgentProgramFactory,
@@ -53,7 +48,6 @@ class ProgramAgentRunner:
         self.program_factory = program_factory
         self.num_samples = num_samples
         self.settings = settings
-
     async def _run(
         self,
         prompt_records: Sequence[PromptRecord],
@@ -66,7 +60,6 @@ class ProgramAgentRunner:
             for sample_index in range(self.num_samples)
         ]
         return tuple(await asyncio.gather(*(program.run() for program in programs)))
-
     def rollout(
         self,
         prompt_records: Sequence[PromptRecord],

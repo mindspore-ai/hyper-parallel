@@ -13,18 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Synchronous batched engine driver for token-first AgentSessions."""
-
 import asyncio
 from typing import Any, Optional, Sequence
-
 from rl.agentic.base import Action
 from rl.agentic.registry import ENVIRONMENTS
 from rl.agentic.session import AgentSession
-from rl.contracts import ExperienceBatch, PromptRecord, Trajectory
-from rl.dataset import build_experience_batch
+from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory
+from rl.dataset.batch_builder import build_experience_batch
 from rl.roles.rollout.base import GenerationEngine, GenerationRequest, GenerationSettings
-
-
 class AgentRunner:
     """Drive N sampled environments through one batched generation engine.
 
@@ -32,7 +28,6 @@ class AgentRunner:
     Finished sessions receive discarded dummy generations, preserving FSDP
     collective ordering without introducing a distributed scheduler.
     """
-
     def __init__(
         self,
         engine: GenerationEngine,
@@ -57,7 +52,6 @@ class AgentRunner:
         self.max_turns = max_turns
         self.max_observation_tokens = max_observation_tokens
         self.settings = settings
-
     def _left_pad_sessions(
         self,
         sessions: Sequence[AgentSession],
@@ -75,7 +69,6 @@ class AgentRunner:
             input_ids[row, -tokens.numel() :] = tokens
             attention_mask[row, -tokens.numel() :] = 1
         return input_ids, attention_mask
-
     def _response_mask(self, response_ids: Any, explicit_mask: Any) -> Any:
         eos_prefix_mask = response_ids.eq(self.settings.eos_token_id).cumsum(dim=-1).eq(0)
         if explicit_mask is None:
@@ -83,7 +76,6 @@ class AgentRunner:
         if tuple(explicit_mask.shape) != tuple(response_ids.shape):
             raise ValueError("Generation response_mask must align with response IDs")
         return explicit_mask.bool() & eos_prefix_mask
-
     def _build_batch(
         self,
         trajectories: tuple[Trajectory, ...],
@@ -98,7 +90,6 @@ class AgentRunner:
                 "max_turns": self.max_turns,
             },
         )
-
     async def _run_sessions(
         self,
         sessions: Sequence[AgentSession],
@@ -141,7 +132,6 @@ class AgentRunner:
                     raise ValueError(
                         "Generation rollout_log_probs must align with response IDs"
                     )
-
                 active_sessions: list[AgentSession] = []
                 actions: list[Action] = []
                 for row, (session, was_active) in enumerate(
@@ -178,9 +168,7 @@ class AgentRunner:
                 session.finish_max_turns()
         finally:
             await asyncio.gather(*(session.close() for session in sessions))
-
         return tuple(session.build() for session in sessions), generation_seconds
-
     def rollout(
         self,
         prompt_records: Sequence[PromptRecord],

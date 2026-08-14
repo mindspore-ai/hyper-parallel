@@ -10,7 +10,7 @@ data:
   test_path: /data/gsm8k/test.parquet
   prompt_column: prompt
   answer_column: extra_info
-  max_prompt_length: 256
+  max_prompt_length: 512
   max_train_samples: null
   shuffle: true
   num_workers: 0
@@ -19,8 +19,8 @@ data:
 
 rollout:
   engine: vllm
-  num_return_sequences: 6
-  max_new_tokens: 300
+  num_return_sequences: 8
+  max_new_tokens: 512
   temperature: 1.0
   top_p: 1.0
   top_k: 0
@@ -28,7 +28,7 @@ rollout:
   vllm:
     deployment: colocated
     port: 8100
-    model_implementation: hyper
+    model_implementation: native
     tensor_parallel_size: 1
     dtype: bfloat16
     trust_remote_code: false
@@ -36,10 +36,10 @@ rollout:
     batch_invariant: true
     enable_prefix_caching: false
     skip_mm_profiling: true
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.35
     kv_cache_memory_bytes: 2147483648
     request_concurrency: 12
-    max_model_len: 640
+    max_model_len: 1024
     max_num_seqs: 16
     max_num_batched_tokens: 4096
     startup_timeout: 600
@@ -73,7 +73,7 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
-  max_steps: 1868
+  max_steps: 30
   seed: 1234
   prompt_batch_size: 2
   micro_batch_size: 3
@@ -118,12 +118,12 @@ train:
     load_path: null
 
 logging:
-  backends: [console]
+  backends: [console, wandb]
   project_name: hyper-rl
-  experiment_name: qwen3_5_0_8b_gsm8k_vllm_production
-  log_steps: 10
+  experiment_name: qwen3_5_0_8b_gsm8k_vllm_production_logprob_metrics
+  log_steps: 1
   log_samples: 2
   wandb:
-    mode: disabled
+    mode: online
     entity: null
     directory: /results/qwen3_5_0_8b_gsm8k_vllm_production/wandb

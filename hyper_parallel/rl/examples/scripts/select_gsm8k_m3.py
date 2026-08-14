@@ -23,7 +23,7 @@ from typing import Any
 import pandas as pd
 from vllm import LLM, SamplingParams, TokensPrompt
 
-from rl.algorithm.reward.gsm8k import compute_rule_reward, extract_answer
+from rl.algorithm.reward import compute_rule_reward, extract_answer
 from rl.dataset import PromptDataset
 from rl.roles.rollout.vllm_plugin import register_hyper_models
 from rl.roles.rollout.vllm_policy import architecture_for_implementation
@@ -69,8 +69,8 @@ def _generate(
     return records
 
 
-def main() -> None:
-    """Search a bounded source prefix and write a reproducible mixed-reward subset."""
+def _parse_args() -> argparse.Namespace:
+    """Parse and validate materialization arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
@@ -92,7 +92,11 @@ def main() -> None:
         raise ValueError("response-count must be at least 2")
     if args.max_prompt_length + args.max_tokens > args.max_model_len:
         raise ValueError("max-prompt-length plus max-tokens must not exceed max-model-len")
+    return args
 
+
+def _load_source(args: argparse.Namespace) -> tuple[pd.DataFrame, int]:
+    """Load and validate the bounded source prefix."""
     frame = pd.read_parquet(args.source)
     missing = {args.prompt_column, args.answer_column} - set(frame.columns)
     if missing:
@@ -102,9 +106,13 @@ def main() -> None:
         raise ValueError(
             f"GSM8K source provides only {candidate_count} candidates for {args.sample_count} samples"
         )
+    return frame, candidate_count
 
+
+def _build_llm(args: argparse.Namespace, candidate_count: int) -> LLM:
+    """Create the deterministic vLLM instance used for selection."""
     register_hyper_models()
-    llm = LLM(
+    return LLM(
         model=str(args.model),
         tokenizer=str(args.model),
         dtype="bfloat16",
@@ -118,6 +126,14 @@ def main() -> None:
             "architectures": [architecture_for_implementation(args.implementation)]
         },
     )
+
+
+def _build_candidates(
+    args: argparse.Namespace,
+    llm: LLM,
+    candidate_count: int,
+) -> list[dict[str, Any]]:
+    """Tokenize source rows and sort them in deterministic generation order."""
     tokenizer = llm.get_tokenizer()
     dataset = PromptDataset(
         str(args.source),
@@ -128,8 +144,7 @@ def main() -> None:
         max_samples=candidate_count,
     )
     candidates = []
-    for source_index in range(len(dataset)):
-        sample = dataset[source_index]
+    for source_index, sample in enumerate(dataset):
         candidates.append(
             {
                 "source_index": source_index,
@@ -144,6 +159,32 @@ def main() -> None:
             candidate["source_index"],
         )
     )
+    return candidates
+
+
+def _individual_responses(
+    llm: LLM,
+    candidate: dict[str, Any],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    """Generate one response at a time for batch-invariance validation."""
+    return [
+        _generate(
+            llm,
+            [candidate["prompt_token_ids"]],
+            args.seed + offset,
+            args.max_tokens,
+        )[0]
+        for offset in range(args.response_count)
+    ]
+
+
+def _select_candidates(
+    llm: LLM,
+    candidates: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    """Select rows with mixed rewards and reproducible individual decoding."""
     prompt_token_ids = [candidate["prompt_token_ids"] for candidate in candidates]
     generated = [
         _generate(llm, prompt_token_ids, args.seed + offset, args.max_tokens)
@@ -158,30 +199,14 @@ def main() -> None:
         ]
         if set(rewards) != {0.0, 1.0}:
             continue
-        individual_responses = [
-            _generate(
-                llm,
-                [candidate["prompt_token_ids"]],
-                args.seed + offset,
-                args.max_tokens,
-            )[0]
-            for offset in range(args.response_count)
-        ]
+        individual_responses = _individual_responses(llm, candidate, args)
         individual_rewards = [
             compute_rule_reward(record["text"], candidate["ground_truth"])
             for record in individual_responses
         ]
         if set(individual_rewards) != {0.0, 1.0}:
             continue
-        replay_responses = [
-            _generate(
-                llm,
-                [candidate["prompt_token_ids"]],
-                args.seed + offset,
-                args.max_tokens,
-            )[0]
-            for offset in range(args.response_count)
-        ]
+        replay_responses = _individual_responses(llm, candidate, args)
         if [record["token_ids"] for record in individual_responses] != [
             record["token_ids"] for record in replay_responses
         ]:
@@ -206,7 +231,15 @@ def main() -> None:
         raise RuntimeError(
             f"Found only {len(accepted)} mixed-reward rows in {len(candidates)} candidates"
         )
+    return accepted
 
+
+def _write_outputs(
+    args: argparse.Namespace,
+    frame: pd.DataFrame,
+    accepted: list[dict[str, Any]],
+) -> None:
+    """Write the selected parquet rows and their reproducibility manifest."""
     args.output_dir.mkdir(parents=True, exist_ok=True)
     source_indices = [record["source_index"] for record in accepted]
     output_frame = frame.iloc[source_indices]
@@ -229,6 +262,16 @@ def main() -> None:
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def main() -> None:
+    """Search a bounded source prefix and write a reproducible mixed-reward subset."""
+    args = _parse_args()
+    frame, candidate_count = _load_source(args)
+    llm = _build_llm(args, candidate_count)
+    candidates = _build_candidates(args, llm, candidate_count)
+    accepted = _select_candidates(llm, candidates, args)
+    _write_outputs(args, frame, accepted)
 
 
 if __name__ == "__main__":

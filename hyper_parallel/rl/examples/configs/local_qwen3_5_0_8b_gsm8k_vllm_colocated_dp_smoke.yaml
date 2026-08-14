@@ -28,13 +28,13 @@ rollout:
   vllm:
     deployment: colocated
     port: 8100
-    model_implementation: hyper
+    model_implementation: native
     tensor_parallel_size: 1
     dtype: bfloat16
     trust_remote_code: false
     enforce_eager: true
     enable_prefix_caching: false
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.35
     request_concurrency: 1
     max_model_len: 256
     max_num_seqs: 2
@@ -107,7 +107,7 @@ train:
     load_path: null
 
 logging:
-  backends: [console]
+  backends: [console,wandb]
   project_name: hyper-rl
   experiment_name: local_qwen3_5_0_8b_gsm8k_vllm_colocated_dp_smoke
   log_steps: 1

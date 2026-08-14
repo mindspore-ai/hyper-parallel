@@ -5,36 +5,57 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 # ============================================================================
-"""Algorithm registry and built-in GRPO recipe."""
-
-from rl.algorithm.base import (
+"""Stable algorithm construction and extension API."""
+from rl.algorithm.advantage import (
+    TargetOutput,
+    get_advantage_estimator,
+    register_advantage_estimator,
+)
+from rl.algorithm.loss import (
     AlgorithmRequirements,
     CriticLossOutput,
     DataRequirements,
+    GRPOAlgorithm,
+    GRPOConfig,
     LossOutput,
+    PPOAlgorithm,
+    PPOConfig,
+    RLAlgorithm,
     RoleRequirements,
-    TargetOutput,
+    build_algorithm,
+    get_policy_loss,
+    register_algorithm,
+    register_policy_loss,
 )
-from rl.algorithm.registry import ALGORITHMS, build_algorithm
-from rl.algorithm.grpo import GRPOAlgorithm
-from rl.algorithm.ppo import PPOAlgorithm
-
+from rl.algorithm.reward import (
+    RewardFunction,
+    compute_rule_reward,
+    extract_answer,
+    get_reward,
+    register_reward,
+)
 __all__ = [
-    "ALGORITHMS",
     "AlgorithmRequirements",
     "CriticLossOutput",
     "DataRequirements",
     "GRPOAlgorithm",
+    "GRPOConfig",
     "LossOutput",
-    "RoleRequirements",
     "PPOAlgorithm",
+    "PPOConfig",
+    "RLAlgorithm",
+    "RewardFunction",
+    "RoleRequirements",
     "TargetOutput",
     "build_algorithm",
+    "compute_rule_reward",
+    "extract_answer",
+    "get_advantage_estimator",
+    "get_policy_loss",
+    "get_reward",
+    "register_advantage_estimator",
+    "register_algorithm",
+    "register_policy_loss",
+    "register_reward",
 ]

@@ -12,23 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Prompt adapters, data sources, and canonical batch construction."""
-
-from rl.dataset.adapters import PROMPT_INSTRUCTION, extract_ground_truth, format_prompt
-from rl.dataset.batch_builder import ExperienceBuilder, build_experience_batch
+"""Prompt data, trajectories, and canonical training batches."""
+from rl.dataset.contracts import (
+    ExperienceBatch,
+    Message,
+    PromptRecord,
+    Trajectory,
+    Turn,
+)
+from rl.dataset.batch_builder import ExperiencePreparer, build_experience_batch
 from rl.dataset.data_source import (
+    PROMPT_INSTRUCTION,
     PromptDataset,
     build_padded_evaluation_batches,
     collate_prompt_samples,
 )
-
 __all__ = [
     "PROMPT_INSTRUCTION",
-    "ExperienceBuilder",
+    "ExperienceBatch",
+    "ExperiencePreparer",
+    "Message",
     "PromptDataset",
+    "PromptRecord",
+    "Trajectory",
+    "Turn",
     "build_experience_batch",
     "build_padded_evaluation_batches",
     "collate_prompt_samples",
-    "extract_ground_truth",
-    "format_prompt",
 ]
