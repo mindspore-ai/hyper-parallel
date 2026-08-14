@@ -66,6 +66,7 @@ from .callbacks import (
     EvaluateCallback,
     GarbageCollectionCallback,
     LoggingCallback,
+    ProfilingCallback,
     TqdmCallback,
     TrainerState,
 )
@@ -488,12 +489,14 @@ class BaseTrainer(Stateful, ABC):
         self.logging_callback = LoggingCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.garbage_collection_callback = GarbageCollectionCallback(self)
+        self.profiling_callback = ProfilingCallback(self)
         self._callbacks = [
             self.environ_meter_callback,
             self.logging_callback,
             self.tqdm_callback,
             self.evaluate_callback,
             self.garbage_collection_callback,
+            self.profiling_callback,
         ]
 
     def on_train_begin(self):
