@@ -19,12 +19,10 @@ Stub — provides from_pretrained/from_config as entry points.
 """
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 import torch
-import torch.nn as nn
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
@@ -38,7 +36,7 @@ from hyper_models._transformers.infrastructure import (
 from hyper_models._transformers.model_init import _init_model
 from hyper_models._transformers.registry import get_hf_config, get_is_hf_model
 from hyper_models.components.distributed.infrastructure import DistributedSetup
-from hyper_models.components.utils.device import get_device_id, get_device_type
+from hyper_models.components.utils.device import get_device_id, get_device_type  # pylint: disable=syntax-error
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +92,6 @@ class _BaseHyperAutoModelClass:
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
         """
-        from hyper_models.components.distributed.infrastructure import DistributedSetup
-
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
@@ -140,7 +136,7 @@ class _BaseHyperAutoModelClass:
         )
 
     @classmethod
-    def from_config(
+    def from_config(  # pylint: disable=unused-argument
         cls,
         config,
         *model_args,
@@ -157,7 +153,6 @@ class _BaseHyperAutoModelClass:
         Following design doc 01 §6.1.
         """
         if distributed_setup is None:
-            from hyper_models.components.distributed.infrastructure import DistributedSetup
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
 
@@ -219,7 +214,7 @@ class _BaseHyperAutoModelClass:
         Step 1: Determine meta device
         Step 2: Build model (meta or real device)
         Step 3-12: apply_model_infrastructure (PP, PEFT, QAT, ShardingPlan,
-        activation checkpoint, compile, FSDP2, load)
+        activation checkpoint, FSDP2, load, layer compile)
         """
         from contextlib import nullcontext
         from transformers.modeling_utils import ContextManagers
@@ -230,7 +225,9 @@ class _BaseHyperAutoModelClass:
         from hyper_models.components.utils.model_utils import init_empty_weights
 
         # Step 1: Determine meta device
-        from hyper_models.components.distributed.init_utils import get_world_size_safe
+        from hyper_models.components.distributed.init_utils import (  # pylint: disable=import-outside-toplevel
+            get_world_size_safe,
+        )
         is_meta_device = (
             get_world_size_safe() > 1 or not is_hf_model
         ) and kwargs.get("quantization_config") is None
@@ -286,14 +283,11 @@ class HyperAutoModelForCausalLM(_BaseHyperAutoModelClass, AutoModelForCausalLM):
 
     Following design doc 01 §6.1.
     """
-    pass
 
 
 class HyperAutoModelForImageTextToText(_BaseHyperAutoModelClass, AutoModelForImageTextToText):
     """Hyper-Parallel VLM — equivalent to AutoModelForImageTextToText."""
-    pass
 
 
 class HyperAutoModelForSequenceClassification(_BaseHyperAutoModelClass, AutoModelForSequenceClassification):
     """Hyper-Parallel SequenceClassification."""
-    pass
