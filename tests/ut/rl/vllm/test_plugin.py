@@ -20,6 +20,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import rl.roles.rollout.vllm_plugin as plugin
+from rl.roles.weight_sync import vllm_worker
+
 import hyper_parallel_vllm_plugin as legacy_plugin
 from rl.roles.rollout.vllm_plugin import (
     HYPER_QWEN3_5_ARCHITECTURE,
@@ -68,10 +70,10 @@ def test_register_hyper_models_is_lazy_and_idempotent(monkeypatch: pytest.Monkey
             "rl.roles.rollout.vllm_qwen3_5:HyperQwen3_5ForCausalLM",
         )
     ]
-    assert FakeWorkerBase.reload_weights is plugin._reload_weights  # pylint: disable=protected-access
+    assert FakeWorkerBase.reload_weights is vllm_worker.reload_weights
     assert (  # pylint: disable=protected-access
         FakeWorkerBase.get_policy_weight_fingerprint
-        is plugin._get_policy_weight_fingerprint
+        is vllm_worker.get_policy_weight_fingerprint
     )
 
 
@@ -125,9 +127,9 @@ def test_hyper_weight_update_bypasses_layerwise_wrapper(monkeypatch: pytest.Monk
     monkeypatch.setitem(sys.modules, "vllm_ascend", ascend_module)
     monkeypatch.setitem(sys.modules, "vllm_ascend.worker", worker_package)
     monkeypatch.setitem(sys.modules, "vllm_ascend.worker.worker", worker_module)
-    monkeypatch.setattr(plugin, "_HYPER_LIFECYCLE_PATCHED", False)
+    monkeypatch.setattr(vllm_worker, "_ASCEND_LIFECYCLE_PATCHED", False)
 
-    plugin._patch_ascend_weight_update_lifecycle()  # pylint: disable=protected-access
+    vllm_worker._patch_ascend_weight_update_lifecycle()  # pylint: disable=protected-access
     worker = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=[HYPER_QWEN3_5_ARCHITECTURE])
