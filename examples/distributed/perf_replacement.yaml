@@ -9,12 +9,11 @@
 # 纯性能 patch 无并行语义要求，不需要 when 字段（when 缺省 = 总是应用）；
 # CP/EP 必需注入应写 when: cp / when: ep（见 ep_compute/cp_wrappers 文档）。
 #
-# 也可以直接指向仓内内置实现，例如 EP 场景：
+# 也可以直接指向仓内内置 archetype 工厂，例如 EP 场景（Qwen3-MoE）：
 #   - match: "*.mlp"
 #     when: ep
 #     local_compute_fn:
-#       _target_: hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
-#       router: qwen3_moe
+#       _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
 plan_overrides:
   # 朴素 eager attention（显式 S×S scores）→ F.sdpa 融合 kernel
   - match: "*.self_attn"

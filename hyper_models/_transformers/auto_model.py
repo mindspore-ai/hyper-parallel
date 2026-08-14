@@ -223,7 +223,10 @@ class _BaseHyperAutoModelClass:
         """
         from contextlib import nullcontext
         from transformers.modeling_utils import ContextManagers
-        from transformers.initialization import no_init_weights
+        try:
+            from transformers.modeling_utils import no_init_weights
+        except ImportError:
+            from transformers.initialization import no_init_weights
         from hyper_models.components.utils.model_utils import init_empty_weights
 
         # Step 1: Determine meta device

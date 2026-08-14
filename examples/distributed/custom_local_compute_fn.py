@@ -9,7 +9,7 @@ region_dispatch 判断口诀：注入物含通信原语/自定义 kernel/数据�
     PYTHONPATH=. torchrun --nproc_per_node=2 examples/distributed/custom_local_compute_fn.py
 
 场景：自研 MoE（top-1 路由 + 自定义 batched expert 布局 w1/w3/w2），
-不用仓内默认实现（ep_compute.hf_native_ep_compute_fn），注入自己的
+不用仓内默认实现（ep_compute.routed_only_ep_compute_fn），注入自己的
 compute fn。
 
 要点：

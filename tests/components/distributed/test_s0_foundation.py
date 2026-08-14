@@ -12,6 +12,8 @@ import torch.nn as nn
 from hyper_models.components.distributed.param_role import (
     ParamRole,
     ParameterClassifier,
+    SEGMENT_EXACT,
+    SEGMENT_SUBSTRING,
     _build_default_rules,
 )
 from hyper_models.components.distributed.sharding_config import (
@@ -174,7 +176,7 @@ class TestParameterClassifier:
             "model.layers.0.mlp.shared_experts.w2": ParamRole.SHARED_EXPERT,
             "model.layers.0.attn.fused_qkv.weight": ParamRole.FUSED_QKV,
             "model.layers.0.mlp.gate_up_proj.weight": ParamRole.FUSED_GATE_UP,
-            "model.layers.0.self_attn.q_proj.bias": ParamRole.BIAS,
+            "model.layers.0.self_attn.q_proj.bias": ParamRole.COLWISE,
             "model.layers.0.gated_delta.a_log": ParamRole.SPECIAL,
             "model.rotary_emb.inv_freq": ParamRole.SKIP,
         }
@@ -206,8 +208,27 @@ class TestParameterClassifier:
 
     def test_default_rules_structure(self):
         rules = _build_default_rules()
-        assert all(isinstance(pats, list) and isinstance(r, ParamRole)
-                   for pats, r in rules)
+        for rule in rules:
+            # F1: 规则为 (patterns, role, mode) 三元组；mode ∈ 段感知常量
+            pats, r, mode = rule
+            assert isinstance(pats, list) and isinstance(r, ParamRole)
+            assert mode in (SEGMENT_EXACT, SEGMENT_SUBSTRING)
+
+    def test_shared_expert_gate_not_shared_expert(self):
+        """F1 段精确匹配：shared_expert_gate 段 ≠ shared_expert 段
+        （accuracy_problem.md 10.1 误判来源）；默认识别为 COLWISE（
+        qwen2moe 由 ARCH_OVERRIDES 显式覆盖为 REPLICATED）。"""
+        assert self._role("m.mlp.shared_expert_gate.weight") != ParamRole.SHARED_EXPERT
+        assert self._role("m.mlp.shared_expert.weight") == ParamRole.SHARED_EXPERT
+        assert self._role("m.mlp.shared_experts.weight") == ParamRole.SHARED_EXPERT
+
+    def test_dotted_pattern_keeps_path_substring(self):
+        """F1 兼容性：带点 pattern 保持旧的全路径子串语义。"""
+        assert self._role("model.layers.0.self_attn.q_proj.weight") == ParamRole.COLWISE
+
+    def test_segment_substring_within_one_segment(self):
+        """F1 段子串：fragment 命中单段内部（不跨段）。"""
+        assert self._role("m.mlp.experts.gate_up_proj.weight") == ParamRole.MOE_EXPERT
 
 
 # ==========================================================================

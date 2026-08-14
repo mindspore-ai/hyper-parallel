@@ -62,7 +62,7 @@ import torch.nn as nn
 from hyper_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
-    hf_native_ep_compute_fn,
+    routed_only_ep_compute_fn,
 )
 from hyper_models.components.distributed.sharding_config import (
     ModuleShardingSpec,
@@ -137,7 +137,7 @@ class TinyExpertMLP(nn.Module):
 class TinyNativeMoE(nn.Module):
     """HF 原生风格 MoE（同 ep.py/tp_cp_ep.py）：gate + per-expert ModuleList，
     D-09 堆叠 + D-10 TP-extend-EP 参数分片；EP compute 由 injections 显式
-    注入（仓内默认工厂 hf_native_ep_compute_fn）。"""
+    注入（仓内默认工厂 routed_only_ep_compute_fn）。"""
 
     def __init__(self, h, inter, num_experts, top_k=2):
         super().__init__()
@@ -292,9 +292,9 @@ def main():
             "*.mlp": ModuleShardingSpec(
                 region_dispatch=False,      # EP compute 内含 a2a → 不可 dispatch
                 local_compute_fn=Target(
-                    hf_native_ep_compute_fn,
+                    routed_only_ep_compute_fn,
                     target_path="hyper_models.components.distributed."
-                                "ep_compute.hf_native_ep_compute_fn"),
+                                "ep_compute.routed_only_ep_compute_fn"),
             ),
         }).plan(
             model.language_model, llm_mesh, tp_size=tp_size, ep_size=ep_size)

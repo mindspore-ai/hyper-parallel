@@ -54,3 +54,18 @@ def test_dp_cp_tp_accuracy() -> None:
 def test_hsdp_tp_ep_moe_accuracy() -> None:
     """Compare HF MoE HSDP+TP+EP training with its standalone reference."""
     torchrun_case(_WORKER, "test_hsdp_tp_ep_moe_accuracy", num_proc=8)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_qwen2_tp_cp_ep_fsdp_global_accuracy() -> None:
+    """Compare Qwen2-MoE TP+CP+EP+FSDP with reconstructed global views."""
+    torchrun_case(
+        _WORKER,
+        "test_qwen2_tp_cp_ep_fsdp_global_accuracy",
+        num_proc=8,
+    )

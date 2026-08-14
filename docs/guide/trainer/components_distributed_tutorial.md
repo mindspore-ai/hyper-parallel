@@ -11,7 +11,8 @@
 
 本教程覆盖：**TP / CP / EP / FSDP 组合、production↔validate 双模式切换、
 自定义模块注入接口（`region_dispatch` / `local_compute_fn` / `inner_target` /
-`inner_wrapper` / `inner_out_src`）**，并讲清仓内为 CP/EP 提供了哪些参考
+`inner_wrapper` / `inner_out_src`）、TP-local 属性整除（`tp_divide_attrs`，
+§5.7）**，并讲清仓内为 CP/EP 提供了哪些参考
 实现函数、如何显式注入、如何显式固定或整体替换。
 
 **阅读路径**：§1-§2 跑通 → §3 建立双模式心智模型（含 region_dispatch
@@ -196,7 +197,8 @@ print(plan.explain())                    # 或独立调用；fqn= 只看单个�
 对每个边界打印：参数切分表（参数名 → placement）、**编译后的边界通信计划**
 （哪个张量、从什么布局到什么布局、对应什么集合通信——all_gather /
 reduce_scatter / 直通）、注入声明与解析结果（`region_dispatch` 的含义当场
-可见）、特殊处理器清单。insert 模式契约写不全时，fail-fast 报错会附带按
+可见）、TP-local 属性整除计划（D-17/D-18，auto/user 分列，§5.6/§5.7）、
+特殊处理器清单。insert 模式契约写不全时，fail-fast 报错会附带按
 forward 签名推导的**建议 spec 草稿**（改成你的布局即可用）。
 
 ### 4.2 `check_dispatchable(fn, example_inputs, mesh)`：region_dispatch 判定工具
@@ -223,6 +225,33 @@ validate 模式的 out_src 真校验兜底。
 `o/down_proj` → ROWWISE（`Shard(1)`），norm/embed/lm_head 各归其位。
 融合权重也支持：`qkv_proj/fused_qkv/query_key_value`（FUSED_QKV）、
 `gate_up_proj`（FUSED_GATE_UP）均按 `Shard(0)`。
+
+**rowwise Linear 的执行方式（含 bias，D-19/D-22，2026-08-12）。**
+rowwise 投影（`o/down_proj`）的权重沿**输入维**切分（`Shard(1)`）：边界入口
+把激活 all-gather 成 `Replicate`（SP 下），每 rank 用本地的权重列块做
+matmul，产出 `Partial` 贡献，边界出口的归约通信（SP：reduce-scatter；
+非 SP：all-reduce）把各 rank 贡献求和——这就是输出。bias 的处理按归属
+分三种：
+
+| bias 归属 | placement | 加法位置 |
+|---|---|---|
+| colwise 投影（`q/k/v/gate/up_proj`） | `Shard(0)`（随权重、与输出通道同切，D-19） | 区域内本地 matmul 后直接加——结果随后被 rowwise 消费，不经过边界归约 |
+| **rowwise 投影（`o/down_proj`）** | **`Replicate`（不切——它是完整输出向量）** | **区域内抑制、边界归约之后恰好加一次（D-22，Megatron `RowParallelLinear` 同构）** |
+| 命名未命中规则的 bias（norm/router 等） | `Replicate` | 区域内（这些边界输出非 Partial，本就正确） |
+
+为什么 rowwise bias 必须后置：`F.linear` 会把 bias 融合加在 matmul 结果
+上，若放任不管，边界出口的求和归约会把它**累计 tp_size 次**（输出 =
+正确值 + tp×bias）。因此 planner 在 plan 期识别"权重 `Shard(1)` + 兄弟
+bias + 边界 out_src 为 Partial"的 nn.Linear（与用户自声明 spec、非标准
+命名如 `wo` 同样生效——判定锚定最终 spec 声明而非命名规则），apply 期
+让区域内 forward 暂时不带 bias（bias Parameter 原地保留，state_dict /
+optimizer 零影响），在边界出口归约完成后统一加回。该标记在
+`plan.explain()` 的"后置 bias"行可见。两个保护性规则：owner 不是
+`nn.Linear`（如 GPT-2 `Conv1D`、自研线性层）→ WARNING 并保持现状（请把
+bias 移到边界通信后、改用 nn.Linear 或用 `local_compute_fn` 接管）；
+**lm_head 带 bias**（权重沿输出维 `Shard(0)` 而 bias 无法随切）→ plan 期
+直接报错"模板不匹配"，按报错提示用 `plan_overrides` 显式声明
+`{"lm_head.bias": {TP: shard(0)}}`。
 
 ```python
 plan = ShardingPlanner().plan(model, mesh, tp_size=8)
@@ -302,6 +331,41 @@ TP colwise 切分后每 rank 本地只有 `num_heads/tp` 个头。组件按"前�
 - 局限：forward 里**直接读 `config.num_attention_heads`**（而非
   `__init__` 缓存到 `self.*`）的模型不覆盖——HF 主流模型均为缓存式。
 
+### 5.7 TP-local 属性整除：`tp_divide_attrs`（D-18）
+
+D-17 只覆盖框架已知的头数名。模型还有其他**随 TP 缩放的 int 实例属性**
+时（自定义头数别名、`__init__` 里缓存的宽度尺寸等），用
+`tp_divide_attrs` 显式声明，框架按与 D-17 完全相同的双模式时机
+（forward 看到 local tensor 处）把它们整除改写为本地值：
+
+```python
+# 编程式（plan_overrides merge：只写该字段，契约继承推导）
+ShardingPlanner(plan_overrides={
+    "*.self_attn": ModuleShardingSpec(tp_divide_attrs=["hidden_size"]),
+})
+# YAML（trainer 路径）等价写法：
+#   plan_overrides:
+#     - match: "*.self_attn"
+#       tp_divide_attrs: ["hidden_size"]
+```
+
+规则与防呆（全部 plan 期 fail-fast，报错点名 fqn 与属性）：
+
+- 属性必须在模块实例上**存在且为 plain int**（bool 拒绝）、**>0 且整除
+  tp_size**——用户显式声明不像 D-17 自动段那样"警告跳过"，写错即失败；
+- **保护清单**：`head_dim`/`attention_head_size`/`head_size`（头维度不被
+  切）、`num_key_value_groups`（GQA 比值，TP 不变量）、`training`/
+  `dtype`/`device`、`_hp_` 前缀（框架内部存储）不可声明；
+- **不要重复声明 D-17 头数名**（`num_heads` 等）——auto 段已自动覆盖，
+  重叠即报错，从 YAML 删除即可；
+- **幂等**：原值存 `module._hp_full_tp_local_attrs`，重复 apply no-op；
+  属性已被改写且与当前 tp_size 不兼容（同模块被不同 tp 的计划重复
+  apply）→ fail-fast；
+- merge 语义同其他声明字段：不写继承 glob 声明，显式 `[]` 清空继承；
+  同一 match 多条 YAML 声明时后者覆盖前者；
+- `plan.explain()` 的 "TP-local 属性整除" 段把 auto（D-17）/ user（本
+  字段）分列打印，声明结果当场可见（§4.1）。
+
 ---
 
 ## 6. CP 教程
@@ -335,9 +399,12 @@ inner-wrap 机制是**通用的"织入/替换 inner forward"通道**：声明即
 本身不由 CP 门控。仓内为 CP 语义（K/V all-gather）提供了四个**参考实现
 函数**——它们与用户自己的 `@inner_wrapper` 函数地位完全平等，框架对它们
 **零特殊对待、零默认**（用不用、用哪个都由用户显式声明），只是顺手登记在
-**`INNER_WRAPPER_REGISTRY`**（`cp_wrappers.py`）里可按名引用；声明它们仍需
-活跃 cp 轴（无 cp 轴声明它们会在解析链 fail-fast——自定义 callable/Target
-不受此限，`cp_mesh` 传 `None`、语义自负）：
+**`INNER_WRAPPER_REGISTRY`**（`cp_wrappers.py`）里可按名引用；四路内置
+wrapper 的静态要求由 **`INNER_WRAPPER_REQUIREMENTS`** 表记录并在 apply
+前置守门强制（D-20）：必须存在活跃 cp 轴（无 cp 轴声明它们会 fail-fast
+——自定义 callable/Target 不受此限，`cp_mesh` 传 `None`、语义自负）、
+`region_dispatch` 必须为 `False`（内含 CP 集合通信，误写 `True` 在 apply
+前即报错并附建议 YAML）：
 
 | 注册表名 | 适用模块风格 | 机制 |
 |---|---|---|
@@ -415,7 +482,9 @@ YAML 形态（`plan_overrides`，2026-08-05 改名自 `sharding.injections`）
 `params`/`in_src`/`in_dst`/`out_src`/`out_dst`（placement 字符串 DSL
 `"replicate"`/`"partial"`/`"shard(N)"` + 哨兵 `"auto"`/`"none"`——insert
 模式因此可纯 YAML 表达；脱糖期闭集文法 fail-fast，plan 期
-`_validate_override_axes` 轴名拼写 fail-fast）。
+`_validate_override_axes` 轴名拼写 fail-fast）；`tp_divide_attrs`
+（D-18 TP-local 属性整除，§5.7——不写继承 glob 声明、显式列表覆盖、
+`[]` 清空继承，同一 match 多条 YAML 声明后者覆盖前者）。
 
 ### 6.3.1 inner-wrap 也是性能替换通道（不限于 CP）
 
@@ -473,7 +542,10 @@ plan_overrides = {"*.self_attn": ModuleShardingSpec(
 - **成对声明强制**：声明 `inner_wrapper` 必须同时显式声明
   `inner_target`（`"self"` 或子模块属性名；自动定位启发式已删除），缺失
   → `ValueError`；仅 `inner_target` 无 `inner_wrapper` 同样 fail-fast
-  （定位不能代替方案选择）；
+  （定位不能代替方案选择）——两者均在 apply 前置守门（D-20）拦截；
+- **内置 wrapper 静态要求**（D-20）：仓内四路 CP wrapper 声明了
+  `region_dispatch: true`、或无活跃 cp 轴、或子模块 target 缺
+  `inner_out_src` → apply 前 `ValueError`（报错附可粘贴的建议 YAML）；
 - **inner 输出布局强制声明**：inner 子模块路径未声明 `inner_out_src` →
   apply 时 `ValueError`（报错给出可粘贴的声明写法）——框架对 inner 输出
   布局零推导零猜测；
@@ -591,13 +663,19 @@ planner 识别 HF 原生 MoE 结构（`mlp.gate` router + `mlp.experts` 参数�
    pad-to-max `all_to_all_single`。
 
 3. **路由内嵌纪律**：框架不决定用户的 router——spec 里没有路由提示字
-   段，工厂也不接受函数类型的配置参数。仓内参考工厂内嵌
-   `_softmax_topk_router`（softmax+topk）；路由不同的 MoE（Qwen3
-   TopKRouter 模块、DeepSeek sigmoid-group 等）**写自己的工厂**，路由选
-   择写在函数体内——`MOE_ROUTER_ADAPTERS`（ep_utils.py）保留为公开工
-   具库（`default`/`qwen3moe`/`mixtral`/`deepseekv3`/`glm4moe` 等），用
-   户工厂按名引用即可（示例见 ep_compute.py docstring 与
-   `tests/.../test_dist_s4_ep.py` 的 `_qwen3moe_ep_factory`）。
+   段，工厂也不接受函数类型的配置参数。仓内按 gate 形态提供三个参考工厂
+   （共享同一 a2a 骨架，按需选一个注入即可）：
+   - `hf_native_ep_compute_fn`：内嵌默认 `_softmax_topk_router`
+     （softmax+topk，gate 返回 logits 的旧式形态）；
+   - `hf_topk_router_ep_compute_fn`（2026-08-12）：gate 为 TopKRouter
+     模块、forward 返回 `(logits, scores, indices)` 三元组的形态
+     （HF 2025 重构后的 qwen3moe/mixtral 等）——直接注入，无需再写
+     工厂；`qwen3moe_ep_compute_fn` 是按名引用的等价变体；
+   - 路由语义不同的其他 MoE（DeepSeek sigmoid-group 等）**写自己的工厂**，
+     路由选择写在函数体内——`MOE_ROUTER_ADAPTERS`（ep_utils.py）保留为
+     公开工具库（`default`/`qwen3moe`/`mixtral`/`deepseekv3`/`glm4moe`
+     等），用户工厂按名引用即可（示例见 ep_compute.py docstring 与
+     `tests/.../test_dist_s4_ep.py` 的 `_qwen3moe_ep_factory`）。
 
 ```python
 # 用户侧：一行显式注入（glob merge，params/契约继承推导）——零配置：
@@ -899,6 +977,7 @@ plan_overrides = {"model.aux": ModuleShardingSpec(
 | `inner_target` | `str`（属性名 / `"self"`） | **纯位置**：指定 inner attention 子模块（单独声明无 inner_wrapper → fail-fast） | target 解析链环 1 |
 | `inner_wrapper` | `str`（注册表名）、`@inner_wrapper` callable 或 **Target** | **纯行为**：固定仓内参考 CP wrapper / 全自定义接管 / Target 引用仓内公开函数；`region_dispatch=False` 时替换后的 forward 只面向 local 张量（双模适配器托管，§10.5.1） | wrapper 解析链环 1-3 |
 | `inner_out_src` | `"first_input"` / `{axis: placement}` / `{name: {...}}` | **纯布局**：inner 子模块输出的重包声明——**`inner_target` 是子模块时必填**（未声明 apply 时 fail-fast，框架对 inner 输出布局零推导零猜测；layout-preserving 写 `"first_input"` 即可）；`inner_target="self"` 时不需要（用边界 out_src） | 适配器安装时 |
+| `tp_divide_attrs` | `Optional[List[str]]` | **TP-local 属性整除声明**（D-18，§5.7）：forward 见 local tensor 时把列出的 int 实例属性按 tp_size 整除改写（D-17 头数名的用户扩展）；plan 期校验（存在/plain int/整除/非保护属性/不与 D-17 自动清单重复）；`[]` 清空继承的 glob 声明 | Phase 4.6 定稿，apply 时改写 |
 
 **注入纪律（injection.py）**：所有注入函数必须带模板装饰器（仅两个：
 `@local_compute` / `@inner_wrapper`）——import 期校验：**必选上下文缺一
@@ -922,6 +1001,12 @@ compute fn / 替换后的 forward 的入参与原函数不匹配 fail-fast。配
 输入(in_src) → boundary入口(in_src→in_dst 通信) → 【compute_fn】
             → 按声明 out_src 重包装 → boundary出口(out_src→out_dst 通信) → 输出
 ```
+
+重包装是**逐输出**的（D-21）：多输出模块按 `out_names` 把 `out_src` 的
+每个声明映射到 tuple/list 对应位置、各自按声明布局 `from_local`，`None`
+与已是 DTensor 的输出跳过，返回类型保持（tuple 进 tuple 出、list 进 list
+出）；声明键不在 `out_names`、下标越界、或声明多输出而 forward 返回标量
+→ fail-fast。
 
 解析链（优先级递减；**EP 自动注入链路已删除，2026-08-04**）：
 
@@ -1348,7 +1433,7 @@ mesh = init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
 |---|---|---|---|
 | llama / qwen2 / qwen3 | ✅ 零 SKIP | ✅ | qwen3 的 q_norm/k_norm 归 NORM |
 | qwen3_moe | ✅ | ✅ `moe_mlp` + EP | batched experts（D-11），router adapter 已注册 |
-| glm4 | ✅ | ✅ | fused `gate_up_proj`；q/k/v bias 归 BIAS；两个额外 post norm 归 NORM |
+| glm4 | ✅ | ✅ | fused `gate_up_proj`；q/k/v bias 随权重归 COLWISE（D-19）；两个额外 post norm 归 NORM |
 | glm4_moe | ✅ | ✅ `moe_mlp` + EP | shared_experts 归 SHARED_EXPERT（EP 维 Replicate） |
 | deepseek_v2 / v3 | ✅（ARCH_OVERRIDES） | ✅ | **MLA**：q_a/kv_a 下投影 `REPLICATED`，q_b/kv_b 上投影 COLWISE；sigmoid router adapter 已注册 |
 | mixtral | ✅ | ✅ `moe_mlp` + EP | per-expert 布局走 D-09 堆叠 |
@@ -1385,6 +1470,13 @@ DeepSeek MLA 覆盖条目（D-14，`ARCH_OVERRIDES` 内置，v2/v3 两种拼写�
 | `TypeError: ...上下文参数 ... 不得有默认值` | 上下文参数写了默认值 | 删默认值（框架必然填充） |
 | `ValueError: ...配置了框架保留上下文键` | Target/YAML 里配置了 mesh 家族/锚点 | 删除该配置键 |
 | `ValueError: ...未声明 inner_out_src` | wrapper 作用于 inner 子模块但未声明输出布局 | 按报错提示写 `"first_input"` 或显式 placement（§10.5.1） |
+| `ValueError: Invalid built-in CP wrapper plan ... requires region_dispatch=False` | 仓内四路 CP wrapper 内含通信，却声明了 `region_dispatch: true`（D-20 静态要求表） | 改 `region_dispatch: false`（报错附建议 YAML，§6.2） |
+| `ValueError: ...tp_divide_attrs 必须是属性名列表 / 只能包含合法属性名 / 包含重复属性` | YAML `tp_divide_attrs` 形态错误（D-18） | 改为合法属性名列表（§5.7） |
+| `ValueError: ...tp_divide_attrs attribute ... must exist and be a plain int / must be positive and divisible by tp_size` | 声明的属性在模块实例上不存在、非 int、或不能整除 tp_size | 确认属性名拼写与取值；不整除就调 tp_size 或删声明（§5.7） |
+| `ValueError: ...tp_divide_attrs cannot adjust protected attribute` | 声明了保护属性（`head_dim`/`num_key_value_groups`/`training` 等） | 删除该属性——这些量不被 TP 切分（§5.7） |
+| `ValueError: ...redundantly declares D-17 automatic head attributes` | `tp_divide_attrs` 与 D-17 自动头数清单重复 | 从声明中删除（auto 段已自动覆盖） |
+| `ValueError: ...was already adjusted ... incompatible with tp_size` | 同一模块被不同 tp_size 的 plan 重复 apply | 每个模型实例只 apply 一次同一 plan |
+| `ValueError: ...out_src declares output ... out_names does not contain / forward returned only N output` | local-region 多输出重包契约与 forward 实际输出不符（D-21） | 对齐 `out_src`/`out_names` 声明与 forward 返回值（§10.4） |
 | `TypeError: ...不存在同名项 / 不是同序子序列 / 必填参数 ... 未被接收` | compute fn 入参与原 forward 不匹配 | 对齐形参名/顺序/必填项 |
 | `TypeError: ...入参不兼容` | 替换后的 forward 接不住原 forward 入参 | 用 `*args/**kwargs` 透传或对齐签名 |
 | `ValueError: 仓内 CP wrapper 参考实现 ... 需要活跃的 cp mesh` | 无 cp 轴却声明了四个仓内参考 CP 方案之一（inner-wrap 泛化后声明即应用） | 改用自定义 callable/Target（收 `cp_mesh=None`），或 `local_compute_fn`（§6.3.1） |
@@ -1393,16 +1485,20 @@ DeepSeek MLA 覆盖条目（D-14，`ARCH_OVERRIDES` 内置，v2/v3 两种拼写�
 | `num_experts (...) 必须整除 ep_size` | expert 数不能均分 | 调整 ep_size |
 | `NotImplementedError: ... 仅支持 SwiGLU expert` | 仓内参考 EP compute 只支持 SwiGLU 三矩阵 | 自研 expert 结构 → `local_compute_fn` |
 | inner wrapper 想拿 DTensor / 想做框架级布局推导 | 双模适配器已托管全部 DTensor 转换，用户 wrapper 只见 local 张量 | 不需要也不应该写 DTensor 逻辑；输出布局用 `inner_out_src`/out_src 声明（§10.5.1） |
-| production 前向 view/reshape shape mismatch（显式 `num_heads` 写法） | 模块 q/k/v 未被识别为 colwise（命名非标准），头数改写（D-17）未命中 | `ARCH_OVERRIDES` 注册命名规则（§5.5）使 q/k/v 归 COLWISE，或 `plan_overrides` 手写 spec |
+| production 前向 view/reshape shape mismatch（显式 `num_heads` 写法） | 模块 q/k/v 未被识别为 colwise（命名非标准），头数改写（D-17）未命中 | `ARCH_OVERRIDES` 注册命名规则（§5.5）使 q/k/v 归 COLWISE，或 `plan_overrides` 手写 spec；非头名的 TP 缩放属性用 `tp_divide_attrs` 声明（§5.7） |
 | `head-count adjustment: ... not divisible`（警告） | 模块头数属性不能被 tp_size 整除，已保持原值 | 调小 tp_size；确认该属性确为头数（否则可忽略） |
 | 参数未分片且无报错 | 命名不命中默认规则（落 SKIP，只有 warning） | `ARCH_OVERRIDES` 注册架构规则（§5.5） |
+| `ValueError: ... 模板不匹配（典型：lm_head.bias）` | 权重沿输出维 `Shard(0)` 而 bias 未随输出通道同切（D-22 检查，典型：lm_head 带 bias） | 按报错提示用 `plan_overrides` 声明 `{"lm_head.bias": {TP: shard(0)}}`，或移除该 bias（§5.1） |
+| `ValueError: ... D-22 后置加法要求 bias 保持 Replicate` | rowwise 兄弟权重下 bias 显式声明了非 Replicate 的 TP placement | 从 `spec.params` 移除该 bias 声明，或改为 `{TP: replicate()}`（§5.1） |
+| `ValueError: ... rowwise bias 后置（D-22）v1 仅支持单输出边界` | 多输出边界含 Partial 归约且带 rowwise bias，框架无法归因 | 用 `local_compute_fn` 接管该区域，自行在归约后加 bias（§5.1） |
+| `WARNING: ... 非 nn.Linear，框架不擅自修改其 forward 语义` | rowwise + Partial 边界上的带 bias 模块不是 nn.Linear（如 GPT-2 Conv1D），bias 会在归约中重复计数 | 把 bias 移到边界通信后 / 改用 nn.Linear / `local_compute_fn` 接管（§5.1） |
 
 ---
 
 ## 附：运行测试
 
 ```bash
-python -m pytest tests/components/distributed/ -q   # 388 例
+python -m pytest tests/components/distributed/ -q   # 447 例
 ```
 
 单进程用例直接跑；多进程用例经 `run_dist`（spawn + gloo/CPU，macOS 可跑），

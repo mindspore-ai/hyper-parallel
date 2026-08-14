@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""ep_utils: EP passthrough for HF-native MoE (05 §6.4.7, D-09).
+"""ep_utils: public EP primitives for MoE local-region compute (05 §6.4.7, D-09).
 
-Three parts:
-1. **Backend-dispatched all_to_all** (``_ep_all_to_all``): NCCL/HCCL use the
+The framework owns the MECHANISM; the semantic composition (which router,
+whether a shared expert exists, gate formulas, how branches merge) belongs to
+the explicitly-selected semantic implementation — a built-in archetype
+factory from ep_compute.py or a user-written factory (accuracy_fix_plan.md
+§3). Nothing in this module probes model structure with getattr fallback
+chains.
+
+Public primitives:
+1. **Backend-dispatched all_to_all** (``ep_all_to_all``): NCCL/HCCL use the
    ragged a2a (``_EPAllToAllUneven``, zero-padding); gloo and other backends
    that do not support ragged a2a use pad-to-max + ``all_to_all_single``
    (``_EPAllToAllPadded``). Both paths are numerically equivalent (padding
@@ -24,14 +31,19 @@ Three parts:
    are model-specific (softmax/sigmoid, top-k normalization, scaling), while
    the expert MLP structure is uniform (SwiGLU).
    ``(module, hidden) -> (topk_idx [T,K] int64, topk_w [T,K] float)``.
-3. **TP-extend-EP forward** (``_hf_native_ep_compute``, 05 §6.4.8): router
+   A factory picks an adapter BY NAME in its own code — the choice is
+   explicit, never inferred.
+3. **Routed-experts pipeline** (``ep_routed_forward``, 05 §6.4.8): router
    (local chunk) -> a2a dispatch (extended EP group) -> local SwiGLU
    (complete expert weights, no internal communication) -> a2a combine ->
-   weighted aggregation (+ shared_experts).
-   All local tensor, shared by production/validate dual-mode (local_region
-   tolerant semantics). No all_gather/reduce_scatter -- expert weights are
-   not TP-sharded (Megatron expert_tensor_parallel_size=1 +
-   expert_model_parallel_size homogeneous across TP).
+   weighted aggregation. SP-in -> SP-out, all communication cohesive inside.
+   NO shared-expert/gate branch — that composition is the caller's job.
+4. **Expert entry point** (``bind_local_expert_forward`` /
+   ``resolve_swiglu_weights``): installs ``experts.forward`` so nested FSDP
+   hooks unshard/reshard around the local SwiGLU.
+5. **Interface helpers** (``require_attrs`` / ``describe_moe_module``):
+   build-time interface assertions with teaching errors, and a structural
+   diagnostic for mapping a concrete MoE module to an archetype.
 """
 
 import types
@@ -137,7 +149,7 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         return grad, None, None, None
 
 
-def _ep_all_to_all(x, send_counts, recv_counts, group):
+def ep_all_to_all(x, send_counts, recv_counts, group):
     """Unified entry for EP token exchange (autograd-differentiable).
 
     send_counts/recv_counts: list[int], length ep_size, row counts per dest/src rank.
@@ -180,7 +192,7 @@ def _softmax_topk_router(module, hidden_states):
 
 
 def _topk_router_module(module, hidden_states):
-    """qwen3moe/mixtral adapter: gate is a TopKRouter module (after the HF 2025
+    """Qwen2/Qwen3/Mixtral adapter: gate is a TopKRouter module (after the HF 2025
     refactor); forward directly returns (logits, scores [T,K], indices [T,K])
     -- take the latter two."""
     gate = getattr(module, "gate", None)
@@ -252,12 +264,15 @@ def _sigmoid_group_router(module, hidden_states):
 
 
 # {adapter_name: (module, hidden) -> (topk_idx [T,K] int64, topk_w [T,K] float)}
-# The planner picks an adapter by arch name (unregistered archs fall back to
-# "default"). The arch name comes from _get_architecture (config.architectures
-# lowercased with suffix stripped, e.g. "qwen3moe"); underscored aliases cover
-# the config.model_type path (e.g. "qwen3_moe").
+# A compute factory picks an adapter BY NAME in its own code (the choice is
+# explicit — the framework never infers routing semantics). Keys use the
+# canonical arch spelling from ShardingPlanner._get_architecture
+# (config.architectures lowercased with suffix stripped, e.g. "qwen3moe");
+# underscored aliases cover the config.model_type path (e.g. "qwen3_moe").
 MOE_ROUTER_ADAPTERS = {
     "default": _softmax_topk_router,
+    "qwen2moe": _topk_router_module,
+    "qwen2_moe": _topk_router_module,
     "qwen3moe": _topk_router_module,
     "qwen3_moe": _topk_router_module,
     "mixtral": _topk_router_module,
@@ -272,7 +287,7 @@ MOE_ROUTER_ADAPTERS = {
 # EP forward for HF-native MoE (D-09c)
 # ────────────────────────────────────────────────────────────────────────────
 
-def _swiglu_weights(experts):
+def resolve_swiglu_weights(experts):
     """Resolve SwiGLU weights from the stacked holder (three layouts).
 
     Returns (w_gate, w_up, w_down):
@@ -313,7 +328,7 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     the parent MoE forward, allows nested FSDP forward hooks to unshard and
     reshard expert parameters around the local computation.
     """
-    gate_weight, up_weight, down_weight = _swiglu_weights(experts)
+    gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
     token_order = local_expert_indices.argsort()
     sorted_states = dispatched_states[token_order]
     local_expert_counts = torch.bincount(
@@ -337,9 +352,10 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
             up_states = F.linear(  # pylint: disable=not-callable
                 expert_states, up_weight[local_expert_index]
             )
+        activation = getattr(experts, "_ep_act_fn", F.silu)
         sorted_outputs.append(
             F.linear(  # pylint: disable=not-callable
-                F.silu(gate_states) * up_states,
+                activation(gate_states) * up_states,
                 down_weight[local_expert_index],
             )
         )
@@ -366,14 +382,35 @@ def _get_global_expert_count(module):
     )
 
 
-def _bind_local_expert_forward(module, ep_size):
-    """Install the local expert compute entry used by TP-extend-EP."""
+def bind_local_expert_forward(module, ep_size):
+    """Install the local expert compute entry used by TP-extend-EP.
+
+    Called by the EP compute factory (archetype or user-written) at apply
+    time: sets ``module.experts.local_expert_count`` and installs
+    ``experts.forward`` so nested FSDP hooks unshard/reshard around the
+    local SwiGLU computation.
+    """
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
         raise ValueError(
             f"num_experts ({global_expert_count}) must be divisible by ep_size ({ep_size})"
         )
     module.experts.local_expert_count = global_expert_count // ep_size
+    activation = getattr(module.experts, "act_fn", None)
+    if activation is None:
+        hidden_act = getattr(getattr(module, "config", None), "hidden_act", "silu")
+        activation = {
+            "gelu": F.gelu,
+            "relu": F.relu,
+            "silu": F.silu,
+            "swish": F.silu,
+        }.get(hidden_act)
+        if activation is None:
+            raise ValueError(
+                f"{type(module).__name__}: unsupported expert activation {hidden_act!r}; "
+                "provide experts.act_fn or extend the EP activation registry"
+            )
+    module.experts._ep_act_fn = activation
     module.experts.forward = types.MethodType(
         _local_swiglu_expert_forward,
         module.experts,
@@ -381,14 +418,31 @@ def _bind_local_expert_forward(module, ep_size):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# TP-extend-EP forward (D-10, 05 §6.4.8, isomorphic to Megatron
+# Routed-experts pipeline primitive (D-10, 05 §6.4.8, isomorphic to Megatron
 # MoEAlltoAllTokenDispatcher + expert_tensor_parallel_size=1)
 # ────────────────────────────────────────────────────────────────────────────
 
-def _hf_native_ep_compute(module, hidden_states, *, router_fn,
-                          ep_group, tp_group=None):
-    """TP-extend-EP forward: SP-in (local chunk) -> all communication inside
-    the region -> SP-out.
+def ep_routed_forward(module, hidden_states, *, router_fn, ep_group):
+    """Routed-experts pipeline: SP-in (local chunk) -> all communication
+    inside -> SP-out. **Routed branch only.**
+
+    This primitive deliberately does NOT handle shared experts / scalar
+    gates / branch merging — that composition is model semantics and belongs
+    to the caller (an ep_compute.py archetype or a user-written factory,
+    accuracy_fix_plan.md §3). There is no ``tp_group`` parameter: if the
+    caller invokes a nested-boundary submodule (e.g. ``module.shared_expert``),
+    that submodule's own boundary performs its TP communication — the
+    **nested-boundary call contract**:
+
+    1. the input is the parent local region's current logical local layout;
+    2. the nested boundary exclusively owns its parameter layout and its TP
+       communication (entry/exit via its own PrecompiledBoundary);
+    3. the return value is already the nested boundary's out_dst logical
+       layout (e.g. under SP: the complete per-token values of the local
+       sequence chunk);
+    4. the caller MUST NOT repeat any compensating collective
+       (all-reduce / reduce-scatter / all-gather) on the returned value
+       over the nested boundary's mesh.
 
     Communication flow (isomorphic to Megatron token_dispatcher.py
     MoEAlltoAllTokenDispatcher):
@@ -399,6 +453,9 @@ def _hf_native_ep_compute(module, hidden_states, *, router_fn,
 
     Input hidden [B, S/tp, H] (local sequence chunk, boundary identity);
     output [B, S/tp, H] (complete, boundary identity).
+
+    ``router_fn`` is supplied BY THE CALLER (explicit choice, e.g. an entry
+    of MOE_ROUTER_ADAPTERS picked by name in the factory code).
 
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to
@@ -452,13 +509,13 @@ def _hf_native_ep_compute(module, hidden_states, *, router_fn,
 
     # 3. a2a dispatch over the extended EP group (tokens carry the full H,
     #    sent to the rank holding the expert)
-    received_states = _ep_all_to_all(
+    received_states = ep_all_to_all(
         dispatched_states,
         send_counts,
         receive_counts,
         ep_group,
     )
-    received_global_expert_indices = _ep_all_to_all(
+    received_global_expert_indices = ep_all_to_all(
         dispatched_expert_indices,
         send_counts,
         receive_counts,
@@ -474,7 +531,7 @@ def _hf_native_ep_compute(module, hidden_states, *, router_fn,
 
     # 5. a2a combine over the extended EP group -> inverse perm -> weighted
     #    aggregation by topk_w
-    combined_expert_outputs = _ep_all_to_all(
+    combined_expert_outputs = ep_all_to_all(
         local_expert_outputs.contiguous(),
         receive_counts,
         send_counts,
@@ -489,16 +546,62 @@ def _hf_native_ep_compute(module, hidden_states, *, router_fn,
         sequence_length,
         hidden_size,
     )
-
-    # 6. shared_experts (if present): chunk x TP-sharded weights -> Partial ->
-    #    TP-group reduction
-    shared = getattr(module, "shared_experts", None)
-    if shared is not None:
-        if tp_group is None:
-            raise RuntimeError(
-                "shared_experts on the EP path requires tp_group "
-                "(Partial reduction of the TP-sharded output)")
-        shared_expert_output = shared(hidden_states)
-        dist.all_reduce(shared_expert_output, group=tp_group)
-        output = output + shared_expert_output
     return output
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Interface helpers (accuracy_fix_plan.md §3 E2): build-time interface
+# assertions with teaching errors + a structural diagnostic
+# ────────────────────────────────────────────────────────────────────────────
+
+def require_attrs(module, *names, owner: str = ""):
+    """Assert that ``module`` has every attribute in ``names``; raise a
+    teaching ValueError listing the module's ACTUAL children otherwise.
+
+    Used by EP compute factories (archetype or user-written) at apply time:
+    the factory body runs ONCE at apply time (before the wrapped forward
+    ever executes), so an interface mismatch fails the model build in
+    seconds instead of surfacing as a runtime AttributeError at step N.
+    The check is structural (the names the implementation will call exist);
+    it does not prove semantic correctness — that is vouched by numeric
+    verification.
+    """
+    missing = [n for n in names if not hasattr(module, n)]
+    if not missing:
+        return
+    children = [n for n, _ in module.named_children()]
+    who = f"{owner} " if owner else ""
+    raise ValueError(
+        f"{who}expects MoE module attribute(s) {missing} on "
+        f"{type(module).__name__}, but they do not exist; the module's "
+        f"actual children are {children}. Pick the matching EP archetype "
+        f"(see the archetype table in ep_compute.py), or write your own "
+        f"factory (reference: examples/distributed/ep_factories.py) — the "
+        f"names your compute_fn calls on module.<child> must match the "
+        f"model's actual attribute names"
+    )
+
+
+def describe_moe_module(module) -> str:
+    """Structural diagnostic for a MoE module: child submodules, direct
+    parameter shapes, and expert-related attributes — the facts needed to
+    pick an EP archetype or write a custom factory. Returns the report;
+    also logged at INFO."""
+    lines = [f"MoE module: {type(module).__name__}"]
+    children = list(module.named_children())
+    lines.append(f"children ({len(children)}):")
+    for name, child in children:
+        lines.append(f"  - {name}: {type(child).__name__}")
+    direct_params = list(module.named_parameters(recurse=False))
+    if direct_params:
+        lines.append("direct parameters:")
+        for name, p in direct_params:
+            lines.append(f"  - {name}: shape={tuple(p.shape)}")
+    experts = getattr(module, "experts", None)
+    if experts is not None:
+        lines.append(
+            f"experts: {type(experts).__name__}, "
+            f"local_expert_count={getattr(experts, 'local_expert_count', '<unset>')}"
+        )
+    report = "\n".join(lines)
+    return report

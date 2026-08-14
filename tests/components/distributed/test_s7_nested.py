@@ -32,7 +32,7 @@ from tests.components.distributed.conftest import (
     TinyHFNativeMoEForCausalLM,
     TinyLlamaForCausalLM,
     cp_sdpa_hf_injection,
-    ep_hf_native_injection,
+    ep_archetype_injection,
     run_dist,
 )
 
@@ -258,7 +258,7 @@ def _worker_nested_moe(rank, world_size):
         # 无自动注入，region_dispatch 已被 planner 清除）
         planner = ShardingPlanner(plan_overrides={
             "model.layers.0": _block_spec(region_dispatch=False),
-            **ep_hf_native_injection(),
+            **ep_archetype_injection(),
         })
         plan = planner.plan(
             model, mesh, tp_size=world_size, ep_size=world_size)

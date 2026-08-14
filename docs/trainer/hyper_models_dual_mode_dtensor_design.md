@@ -9,10 +9,10 @@
 > 代码位置：`hyper_models/components/distributed/`
 > 历史设计稿：`docs/trainer.local.bak/detailed_design/05_dual_mode_dtensor_parallel_strategy.md`（下称"05 文档"）。
 > 本文档以**当前代码为准**（canonical），覆盖 05 文档定稿后的全部设计修订
-> （D-01'' ~ D-17）与"显式注入重构"（explicit-injection rework）；与 05 文档
+> （D-01'' ~ D-22）与"显式注入重构"（explicit-injection rework）；与 05 文档
 > 冲突处以本文为准。修订清单见 §13。
 >
-> 日期：2026-08-07
+> 日期：2026-08-07（最近更新 2026-08-12：D-18 ~ D-22）
 
 ---
 
@@ -91,6 +91,7 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应�
                  │  Phase 3  语义角色推断（→ 7 种模板）
                  │  Phase 4  模板填充 spec（含 MoE EP 标记 D-09/D-10）
                  │  Phase 4.5 plan_overrides 合并（merge / insert / glob）
+                 │  Phase 4.6 TP-local 属性计划定稿（D-18：auto 头数 + 用户属性校验）
                  │  Phase 5  _is_terminal 标记（D-14：链式传播已删除）
                  │  Phase 6  特殊参数 handler 收集
                  ▼
@@ -100,9 +101,11 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应�
                  ▼
                  ┌──────────────────── 运行期（apply）─────────────────────┐
   apply_sharding_plan(model, plan, mesh, validate_mode=?)
-                 │  前置：_preflight_compute_injection（CP/EP 显式注入守门）
+                 │  前置：_preflight_compute_injection（CP/EP 显式注入守门
+                 │         + inner-wrapper 计划静态校验 D-20）
                  │  Phase 0  out_src/out_dst 标量简写规范化
-                 │  Phase A  参数分片（distribute_tensor；EP 堆叠/专家 mesh）
+                 │  Phase A  参数分片（distribute_tensor；EP 堆叠/专家 mesh；
+                 │          TP-local 属性改写 D-17/D-18）
                  │  Phase B  特殊参数 handler（SPECIAL_HANDLERS）
                  │  Phase C 入口 production 一次性解包 + build_tp_grad_info
                  │  Phase C  forward 包装（五路，post-order）
@@ -165,6 +168,13 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应�
   缝合公民，如 ViT `params={}` 模式）。
 - `out_names: List[str]`——多输出模块的输出名序，映射 `out_src/out_dst`
   的 key 到 tuple 位置（`RedistOp.arg_index`）。
+- `tp_divide_attrs: Optional[List[str]]`（D-18）——用户显式声明的
+  TP-local 整除属性：模块 forward 看到 local tensor 时，这些 int 实例属性
+  按 tp_size 整除改写；`None` = 未声明（merge 时继承），显式 `[]` = 清空
+  继承的 glob 声明。planner 在 override 合并后（Phase 4.6）将其与 D-17 自动
+  头数属性统一规范化/校验为内部字段 `_tp_local_attr_plan:
+  TpLocalAttrPlan(auto_divide, user_divide)`（frozen dataclass；plan 期
+  fail-fast，见 §12.2），plan dump/explain 可见。
 - `is_boundary: bool = True`。
 - 单输出模块允许 `out_src/out_dst` 写标量简写 `{TP: …}`，规范化阶段
   （`_normalize_out_fields`）包成 `{"output": …}`。
@@ -189,7 +199,7 @@ merge/insert 时解析，**绝不进入 plan 输出**——plan 内的 spec 恒�
 `_needs_cp_attn`（模板识别元数据，**不触发任何注入**）、
 `_resolved_inner_wrapper` / `_resolved_inner_target`（applier 回写，供
 introspection）、`_ep_stack`（D-09 堆叠元数据）、`_ep_size`（D-10 扩展 EP
-组大小）。
+组大小）、`_tp_local_attr_plan`（D-18 定稿的 TP-local 属性计划）。
 
 ### 4.4 `ShardingPlan`：模型级计划（05 §3.1）
 
@@ -243,15 +253,26 @@ colwise → `Shard(1)`，rowwise → `Shard(2)`；2D per-expert 布局保持
 | `MOE_EXPERT` | EP `Shard(0)` + TP colwise/rowwise（ndim 感知） | routed expert |
 | `SHARED_EXPERT` | EP `Replicate` + TP colwise/rowwise | shared expert |
 | `FUSED_QKV` / `FUSED_GATE_UP` | `Shard(0)` | 融合权重 |
-| `BIAS` | 恒 `Replicate` | |
+| `BIAS` | `Replicate` | 兜底角色（D-19）：命名未命中 colwise 规则的 bias（含 rowwise 的 o/down bias——完整输出向量，TP 归约后恰好加一次） |
 | `REPLICATED` | 全维 `Replicate` | **仅 ARCH_OVERRIDES 指派**（D-14：MLA q_a/kv_a 下投影） |
 | `SPECIAL` | Phase 6 SpecialHandler | gated_delta / a_log / dt_bias（SSM/Mamba 系） |
 | `SKIP` | 不进 spec.params | 默认兜底 |
 
 `ParameterClassifier` 优先级：**arch_overrides > 默认命名规则（first match）
 > SKIP**。默认规则排序原则：更具体的规则在前（shared_experts 先于
-experts；带点 pattern 的 MoE gate 先于裸 "gate"；bias 先于 colwise/rowwise，
-否则 `q_proj.bias` 会被 colwise 捕获）。
+experts；带点 pattern 的 MoE gate 先于裸 "gate"）。**D-19（2026-08-12）：
+colwise 规则先于 `.bias` 兜底**——q/k/v/gate/up 等 colwise Linear 的 bias
+跟随权重归 COLWISE（`Shard(0)`，与输出通道同切，本地 matmul 后直接相加）；
+`.bias` 兜底又先于 rowwise 规则——o/down 的 bias 是完整输出向量，归 BIAS
+保持 `Replicate`；命名完全未命中的 bias 同样落 BIAS `Replicate`。
+**D-22（2026-08-12）补齐执行侧**：rowwise bias 保持 Replicate 只是
+placement 声明——`F.linear` 会把 bias 融合进 matmul，边界出口的 Partial
+归约会把它累计 tp_size 次；因此 planner 在合并后统一 finalize pass
+（`_finalize_deferred_biases`，检测锚定最终 spec 声明而非角色命名，用户
+insert/merge/derive=False spec 与非标准命名同路径覆盖）标记
+`spec._deferred_bias_params`，applier 让区域内 forward 暂时不带 bias
+（参数身份不变），边界归约之后恰好加一次。完整设计见
+[d22_rowwise_bias_deferred_design.md](d22_rowwise_bias_deferred_design.md)。
 
 **ARCH_OVERRIDES**（D-14，DeepSeek MLA，v2/v3 同构）：`q_a_proj` /
 `kv_a_proj_with_mqa` 强制 `REPLICATED`（LoRA rank 维不切），`q_b_proj` /
@@ -292,10 +313,11 @@ CP 契约；`moe_mlp` 额外经 `_mark_hf_native_moe` 做 EP 标记（§10）。
 三种模式：
 
 - **merge**（key 命中推导边界）：契约字段 `None`/`"auto"` 继承、显式值
-  （含 `{}`）字段粒度替换、`"none"` 清空；注入字段（`local_compute_fn` /
-  `inner_target` / `inner_wrapper` / `region_dispatch` 非 None）恒胜；
-  内部标记恒继承。这是 CP/EP 计算注入的声明方式——只写注入字段即继承
-  整套推导契约；
+  （含 `{}`）字段粒度替换、`"none"` 清空；注入/声明字段
+  （`local_compute_fn` / `inner_target` / `inner_wrapper` /
+  `inner_out_src` / `region_dispatch` / `tp_divide_attrs` 非 None）恒胜
+  （`tp_divide_attrs` 的显式 `[]` = 清空继承的 glob 声明）；内部标记恒继承。
+  这是 CP/EP 计算注入的声明方式——只写注入字段即继承整套推导契约；
 - **insert**（精确 key 未命中任何边界）：spec 原样深拷贝插入，必须完整自
   声明（全部未声明 → fail-fast "no template matched"；哨兵非法——没有可
   继承的对象）；D-14 起允许嵌套（祖先/后代 FQN），仅受参数唯一性约束；
@@ -307,6 +329,22 @@ CP 契约；`moe_mlp` 额外经 `_mark_hf_native_moe` 做 EP 标记（§10）。
 被 `resolve_placements` 静默忽略，必须拦截）；`_warn_dropped_params` 对
 字段粒度替换丢弃的推导分片发 WARNING；用户 spec 对象永不被改写（merge 读、
 insert 深拷贝），`plan()` 可重复调用。
+
+### Phase 4.6：TP-local 属性计划定稿（D-18，`_finalize_tp_local_attr_plans`）
+
+override 全部合并后，对每个边界构建 `TpLocalAttrPlan`（写入
+`spec._tp_local_attr_plan`）：
+
+- **auto_divide**：D-17 自动头数属性——spec 头切分（q/k/v colwise
+  `Shard(0)`）时收集模块上实际存在的 Q/KV 头数名，零声明零配置；
+- **user_divide**：`normalize_tp_divide_attrs` 对 `tp_divide_attrs` 做
+  plan 期校验——合法标识符、非保护属性（`head_dim`/`num_key_value_groups`
+  等，§12.2）、无重复、模块实例上存在且为 plain int、>0 且整除 tp_size；
+- **auto ∩ user ≠ ∅ → fail-fast**（D-17 已自动覆盖，YAML 重复声明是配置
+  错误，必须删除）。
+
+spec 对应模块不在 `named_modules` 中 → fail-fast。定稿后 plan dump/explain
+打印 "TP-local 属性整除" 段（auto/user 分列）。
 
 ### Phase 4.5 之后的 D-14 不变量（05 §13.2/§13.3）
 
@@ -366,7 +404,9 @@ dst_placements, collective_type}`。
 
 运行期 `redistribute_inputs/outputs` 按序列直跑，**零分支**；arg 未找到
 （None）跳过（如 embed 的 in_src key `input` 与实际 kwargs 名 `input_ids`
-不同且为 identity）。
+不同且为 identity）。`redistribute_outputs` 保持输出序列类型（D-21）：
+tuple 进 tuple 出、list 进 list 出、标量进标量出——下游消费者对返回类型
+敏感（如 HF 的 list 输出）时不会被静默改型。
 
 ---
 
@@ -390,7 +430,9 @@ dst_placements, collective_type}`。
         均无 → None（不走骨架）
 [inner-wrap 家族] 子模块级：定位 + 替换 inner forward
     inner_target 回答"换谁"，inner_wrapper 回答"换成什么"
-    机制不 CP 门控（声明==应用）；四个仓内参考 CP wrapper 自检要求活跃 cp 轴
+    机制不 CP 门控（声明==应用）；四个仓内参考 CP wrapper 的静态要求
+    （INNER_WRAPPER_REQUIREMENTS，D-20）在 apply 前置守门强制：
+    要求活跃 cp 轴且 region_dispatch=False
 ```
 
 ### 8.2 注入纪律（`injection.py`）
@@ -453,6 +495,17 @@ dst_placements, collective_type}`。
 
 任何参数被触碰**之前** fail-fast：
 
+- **inner-wrapper 计划静态校验**（D-20，2026-08-12，对所有 spec 无条件
+  执行）：
+  - `inner_target` 与 `inner_wrapper` 必须成对——缺一即报错（定位不能
+    选方案、方案不能无定位）；
+  - **仓内参考 CP wrapper 查 `INNER_WRAPPER_REQUIREMENTS` 静态要求表**
+    （`cp_wrappers.py`，按注册名给出 `requires_cp` / `region_dispatch` /
+    `forward_style` 元数据；自定义注册项语义自负、不入表）：四个内置
+    wrapper 内含 CP 集合通信，`region_dispatch` 必须显式为 `False`
+    （写 `True` 即报错并附可粘贴的建议 YAML）、必须存在活跃 cp 轴；
+  - `inner_target` 指向子模块（非 `"self"`）时 `inner_out_src` 必填——
+    情形 B 的输出布局无法从边界 out_src 继承，框架零推导；
 - **CP**：活跃 cp mesh 下 `_needs_cp_attn=True` 的 attention 边界缺
   `inner_wrapper` → 报错并给出 YAML 示例；
 - **EP**：`_ep_size>0` 的边界缺 `local_compute_fn` 且非
@@ -481,7 +534,8 @@ dst_placements, collective_type}`。
    `[E, ...]`；`_ep_size>0` 时专家参数（`experts.*`）在 expert mesh 上分片、
    其余参数在主 mesh 上分片；`distribute_tensor` 幂等（已是 DTensor 且
    placement 一致则跳过，不一致 → `PlacementMismatchError`）；meta tensor
-   零内存路径保留。production 下随 Phase A 做 **D-17 头数改写**（§12.2）；
+   零内存路径保留。production 下随 Phase A 做 **D-17/D-18 TP-local 属性
+   改写**（§12.2）；
 6. **Phase B 特殊 handler**：按 `plan.special_handlers` 调
    `SPECIAL_HANDLERS[name](module, param_name, mesh)`；
 7. **Phase C 入口（production only）**：`_local_params_context` 一次性永久
@@ -508,7 +562,7 @@ Step 2 按模式分派：
 ```
 compute_fn = _resolve_local_compute_fn(...)   # 单一解析链（§8.1）
 if compute_fn is not None:                    # ── 路 1：local-region 骨架
-    validate 下对 local-region 模块补 D-17 头数改写
+    validate 下对 local-region 模块补 D-17/D-18 TP-local 属性改写
     _wrap_local_region_forward(..., exclude_subtrees=嵌套边界)
 elif validate_mode:                           # ── 路 2：validate 包装
     _wrap_validate_forward(...)
@@ -544,9 +598,14 @@ original_forward → boundary.redistribute_outputs`，纯 local tensor，参数�
 （validate：入参 to_local + `_temp_local_params(module,
 exclude=嵌套边界子树)` 临时解包参数——**D-14 不变量 3**：嵌套边界子树
 的参数必须保持 DTensor，供内层 validate 孤岛 dispatch 使用）→
-`compute_fn(*local_args)` → 按声明 out_src `from_local` 重包（数据相关模块
-的 out_src 是**声明式校验**——a2a 的数据相关性使 placement 无法派生，这是
-固有局限）→ 边界出口 → 最终恒解包为 local。两模式共享同一份 wrapper 代码。
+`compute_fn(*local_args)` → `_rewrap_local_outputs` 按声明 out_src **逐输出**
+`from_local` 重包（D-21，2026-08-12：多输出经 `out_names` 映射 tuple/list
+位置、每个声明输出按各自布局重包，`None` 与已是 DTensor 的输出跳过，
+tuple/list 形态保持；声明键不在 out_names / 下标越界 / 非标量输出对多声明
+→ fail-fast。取代旧版"取 out_src 首个声明值统一重包"——多输出不同布局
+的场景旧写法会静默包错）。数据相关模块的 out_src 是**声明式校验**——a2a
+的数据相关性使 placement 无法派生，这是固有局限 → 边界出口 → 最终恒解包为
+local。两模式共享同一份 wrapper 代码。
 
 **路 4 `_wrap_vocab_parallel_embedding`**（D-02）：Megatron 风格 masked
 embedding——本地 vocab 区间 `[lo, hi)` 外的 token 置零并平移下标，输出乘
@@ -637,13 +696,24 @@ forward **不是** EP-aware 的——planner 将其 `region_dispatch` 清除为 
 `local_compute_fn` 显式注入并伴生 `region_dispatch=False`（缺失则 apply
 前置守门 fail-fast）。
 
-**仓内参考 EP compute**（`ep_compute.hf_native_ep_compute_fn`，`@local_compute`）：
-router（本地 chunk）→ a2a dispatch（扩展 EP 组）→ 本地 SwiGLU（完整专家
-权重，无内部通信）→ a2a combine → 加权聚合（+ shared_experts，经 tp_group
-归约；无 tp 轴时 fail-fast）——与 Megatron `MoEAlltoAllTokenDispatcher`
-（expert_tensor_parallel_size=1）同构，无 all_gather/reduce_scatter。router
-是注入计算的一部分（注入纪律：框架不决定用户路由；仓内参考默认
-`_softmax_topk_router`，`MOE_ROUTER_ADAPTERS` 开放注册其他路由语义）。
+**仓内参考 EP compute**（`ep_compute.py`，`@local_compute` 工厂，共享
+`_build_hf_native_ep_compute` 骨架）：router（本地 chunk）→ a2a dispatch
+（扩展 EP 组）→ 本地 SwiGLU（完整专家权重，无内部通信）→ a2a combine →
+加权聚合（+ shared_experts，经 tp_group 归约；无 tp 轴时 fail-fast）——与
+Megatron `MoEAlltoAllTokenDispatcher`（expert_tensor_parallel_size=1）同构，
+无 all_gather/reduce_scatter。router 是注入计算的一部分（注入纪律：框架不
+决定用户路由）。三个路由变体按 gate 形态选择：
+
+- `hf_native_ep_compute_fn`：内嵌默认 `_softmax_topk_router`
+  （softmax + top-k，gate 返回 logits 的旧式 HF 形态）；
+- `hf_topk_router_ep_compute_fn`（2026-08-12）：gate 为 TopKRouter 模块、
+  forward 返回 `(logits, scores, indices)` 三元组（HF 2025 重构后的
+  qwen3moe/mixtral 形态，`_topk_router_module` 取后两个）；
+- `qwen3moe_ep_compute_fn`：经 `MOE_ROUTER_ADAPTERS["qwen3moe"]` 的按名
+  变体（与上一项同路由语义）。
+
+路由语义不同的其他 MoE（DeepSeek sigmoid-group 等）写自己的工厂，
+`MOE_ROUTER_ADAPTERS`（ep_utils.py）开放注册/按名复用。
 
 **a2a 后端分派**（`_ep_all_to_all`）：NCCL/HCCL 走不等长 a2a
 （`_EPAllToAllUneven`，零填充；反向交换 send/recv counts 再来一次——a2a
@@ -682,28 +752,56 @@ production apply 返回 `tp_grad_info: {param_fqn: (tp_placement, tp_mesh)}`，
 位置参数）；多输入需子类化给出显式签名。自定义 Function 不在 DTensor
 dispatch 覆盖范围，必须 `region_dispatch=False`。
 
-### 12.2 D-17：TP 本地头数改写（`head_count.py`）
+### 12.2 D-17/D-18：TP-local 属性改写（`head_count.py`）
 
 部分 HF modeling 代码用显式（全局）头数 reshape（`q.view(b, s,
 self.num_heads, self.head_dim)`）而非 TP 容忍的 `-1` 写法。q/k/v colwise
 `Shard(0)` 后每 rank 只有 `num_heads/tp` 个头，凡前向看到 local tensor 的
-模块都需要本地头数（AutoModel 同款语义）。
+模块都需要本地头数（AutoModel 同款语义）。D-18（2026-08-12）把该机制从
+"框架已知头数名"泛化为**两段式 TP-local 属性计划**（`TpLocalAttrPlan`）：
+
+- **auto_divide（D-17，零声明）**：spec 头切分时自动收集模块上存在的
+  Q/KV 头数名并改写；
+- **user_divide（D-18，显式声明）**：`spec.tp_divide_attrs`（plan_overrides
+  / YAML `PlanOverride` 同名字段）声明其他随 TP 缩放的 int 实例属性
+  （自定义头数别名、缓存的宽度尺寸等），与 auto 段同规则改写。
 
 **双模式规则**——模块的缓存属性仅当其 forward 在当前模式下看到 local
-tensor 时才改写：
+tensor 时才改写（auto 与 user 段同一时机，`maybe_update_head_counts`
+统一入口）：
 
 - production：参数永久解包 → 所有头切分模块都改写（Phase A）；
 - validate：普通边界模块跑 DTensor dispatch（全局逻辑形状，显式头数天然
   正确）→ **不改写**；local-region 模块区域内两模式都是 local → validate
   也改写（Phase C）。
 
-属性清单来自 transformers 全库调研（2026-07）：Q 侧 7 名
+**auto 段属性清单**来自 transformers 全库调研（2026-07）：Q 侧 7 名
 （`num_heads`×393 / `num_attention_heads`×122 / `n_heads`×50 /
 `num_attn_heads` / `n_head` / `heads` / `num_head`）+ KV 侧 3 名
 （`num_key_value_heads` / `num_kv_heads` / `kv_heads`）；排除 `head_dim` 类
 （头维度，永不被切）与 `num_key_value_groups`（比值，TP 不变量）。
 不改 config 对象；幂等（原值存 `module._hp_full_head_counts`，重复调用
 no-op）；不整除 → 大声警告并保持原值；MLA 的 `q_b_proj` 纳入 QKV 后缀清单。
+
+**user 段校验**（plan 期 `normalize_tp_divide_attrs` fail-fast，D-18）：
+
+- 必须是属性名列表，每项为合法 Python 标识符、无重复；
+- 保护清单拒绝：`head_dim` / `attention_head_size` / `head_size`（头维度
+  不被切）、`num_key_value_groups`（GQA 比值不变量）、`training` /
+  `dtype` / `device`（框架属性）、`_hp_` 前缀（框架内部存储）；
+- 属性必须在模块实例上存在且为 plain int（bool 拒绝）、>0 且整除
+  tp_size——与 auto 段的"警告跳过"不同，用户显式声明的错误配置直接
+  fail-fast；
+- 与 auto 段重叠 → fail-fast（重复声明是配置错误，从 YAML 删除即可）。
+
+**user 段幂等**：原值存 `module._hp_full_tp_local_attrs`；重复 apply 为
+no-op；若属性已被改写且与当前 tp_size 不兼容（同模块被不同 tp 的计划重复
+应用）→ fail-fast。改写记 INFO（`source=user`）。
+
+**merge/传输语义**：`None` = 未声明（merge 继承 glob 声明）；显式 `[]` =
+清空继承；YAML 同一 match 多条声明时后者覆盖前者
+（`entries_to_plan_overrides`）。手工装配、未经 `ShardingPlanner.plan()`
+定稿的 plan 走兼容路径（按 `spec.tp_divide_attrs` 原样校验改写）。
 
 ### 12.3 local_region（`local_region.py`）
 
@@ -738,6 +836,11 @@ autograd，梯度直落 local 参数分片，与 production 一致（对比 torc
 | D-15 | Phase 5 链式契约比较降级为 `logger.warning`（无 shape 感知的值相等比较会误杀 reshape/transpose 合法场景；正确性由 validate 模式兜底）——其后 D-14 进一步将链式传播整体删除 |
 | D-16 | plan_overrides 嵌套 spec fail-fast（`_check_no_nested_overrides`）——其后 D-14 放宽为允许嵌套、仅守参数唯一性 |
 | D-17 | TP 本地头数改写（`head_count.py`，AutoModel 同款语义；Q 侧 7 名 + KV 侧 3 名；幂等，原值存 `_hp_full_head_counts`；validate 仅 local-region 模块改写） |
+| D-18 | TP-local 属性改写泛化（2026-08-12）：D-17 自动头数之外开放用户声明 `tp_divide_attrs`（spec / YAML `PlanOverride` 同名字段）；planner Phase 4.6 定稿 `TpLocalAttrPlan(auto_divide/user_divide)`（plan 期校验：标识符/保护清单/存在且 plain int/整除 tp_size/与 auto 去重）；改写时机同 D-17 双模式规则，原值存 `_hp_full_tp_local_attrs` 幂等（tp_size 不兼容 fail-fast）；`[]` 显式清空继承的 glob 声明 |
+| D-19 | colwise Linear 的 bias 跟随权重角色（2026-08-12）：默认规则 colwise 先于 `.bias` 兜底——q/k/v/gate/up 的 bias 归 COLWISE `Shard(0)`（与输出通道同切）；`.bias` 兜底先于 rowwise——o/down bias 是完整输出向量（TP 归约后恰好加一次）保持 Replicate；未命中命名的 bias 仍归 BIAS Replicate |
+| D-20 | inner-wrapper 计划静态校验（2026-08-12）：`_preflight_compute_injection` 扩展——inner_target/inner_wrapper 成对强制前置到 preflight；新增 `INNER_WRAPPER_REQUIREMENTS` 静态要求表（仓内四路 CP wrapper：`requires_cp=True`、`region_dispatch=False`、`forward_style` 元数据；自定义注册项语义自负），违反即 fail-fast 并附建议 YAML；子模块 target 缺 `inner_out_src` 前置 fail-fast |
+| D-21 | local-region 多输出重包（2026-08-12）：`_rewrap_local_outputs` 取代"取 out_src 首个声明统一重包"——逐输出按 `out_names` 映射位置、各自声明布局 `from_local`，None/已是 DTensor 跳过，tuple/list 形态保持（`PrecompiledBoundary.redistribute_outputs` 同步保持 list 类型）；声明键缺失/下标越界/类型不符 fail-fast |
+| D-22 | rowwise bias 边界后置加法（2026-08-12）：修复"带 bias 的 rowwise Linear 在 production 下 bias 被边界 Partial 归约累计 tp_size 次"的精度缺陷（validate 因 dispatch contribution 修正恰好正确——双模式破口）。plan 期统一 finalize pass（`_finalize_deferred_biases`，合并后运行、锚定最终 spec 声明：兄弟权重 TP `Shard(contraction 维)` + out_src TP `Partial` + owner 为 nn.Linear）标记 `spec._deferred_bias_params`；apply 期 `_install_bias_suppression` 区域内隐藏 bias（参数身份/state_dict/optimizer 不变）+ 三条包装路径出口归约后 `_maybe_add_deferred_biases` 恰好加一次（Megatron RowParallelLinear 同构）。fail-fast：bias 声明非 Replicate、多输出边界含 Partial、输出维切分而 bias 未随切（lm_head.bias 模板不匹配）；非 nn.Linear owner WARNING + 跳过。专题设计：[d22_rowwise_bias_deferred_design.md](d22_rowwise_bias_deferred_design.md) |
 
 另有一次横切的**显式注入重构**（explicit-injection rework）：内置 EP
 compute 与 CP wrapper **永不自动注入**——`_needs_cp_attn` 退化为纯元数据、
@@ -759,19 +862,23 @@ hyper_models/components/distributed/
 ├── param_role.py           # ParamRole(14) + ParameterClassifier + 默认命名规则
 ├── sharding_planner.py     # ShardingPlanner 6-phase + ARCH_OVERRIDES +
 │                           #   SPECIAL_HANDLERS + validate_model_compatibility
-├── sharding_applier.py     # apply_sharding_plan + 前置守门 + Phase 0/A/B/C/D +
-│                           #   五路 forward 包装 + expert mesh 派生（D-10）
+├── sharding_applier.py     # apply_sharding_plan + 前置守门（含 D-20 静态校验）+
+│                           #   Phase 0/A/B/C/D + 五路 forward 包装 +
+│                           #   _rewrap_local_outputs（D-21）+ expert mesh 派生（D-10）
 ├── precompiled_boundary.py # PrecompiledBoundary/RedistOp/_classify_collective
 ├── injection.py            # @local_compute/@inner_wrapper +
 │                           #   上下文填充纪律 + 运行时签名校验
 ├── local_region.py         # DTensor→local→DTensor 局部区域（validate/独立使用）
 ├── cp_wrappers.py          # 仓内参考四路 CP inner wrapper + INNER_WRAPPER_REGISTRY
+│                           #   + INNER_WRAPPER_REQUIREMENTS（D-20 静态要求表）
 ├── cp_utils.py             # flex_cp_allgather + shard_batch_for_cp + D-04 mask
-├── ep_compute.py           # hf_native_ep_compute_fn（@local_compute，公开注入入口）
+├── ep_compute.py           # hf_native / hf_topk_router / qwen3moe EP compute
+│                           #   工厂（@local_compute，公开注入入口）
 ├── ep_utils.py             # _ep_all_to_all 后端分派 + MOE_ROUTER_ADAPTERS +
 │                           #   _hf_native_ep_compute（D-09/D-10）
 ├── tp_grad.py              # build_tp_grad_info + tied 归一化（D-10 专家语义）
-├── head_count.py           # D-17 TP 本地头数改写
+├── head_count.py           # D-17/D-18 TP-local 属性改写（auto 头数 +
+│                           #   tp_divide_attrs，TpLocalAttrPlan）
 ├── function_module.py      # FunctionModule（autograd.Function 的模块壳）
 ├── fsdp2.py                # FSDP2Manager（demo 级集成，识别示例 dummy 模型）
 ├── config.py               # FSDP2Config/DDPConfig/MixedPrecisionPolicy 等（06 占位）

@@ -8,6 +8,8 @@
 """
 
 from hyper_models.components.distributed.param_role import ParamRole
+import pytest
+import torch.nn as nn
 from hyper_models.components.distributed.sharding_config import (
     CP,
     EP,
@@ -283,7 +285,9 @@ class TestBoundaryGrouping:
         assert len(groups["model.layers.0.mlp"]) == 4
 
     def test_moe_params_fold_into_mlp(self):
-        """gate + experts 共享同一个 moe mlp 边界。"""
+        """gate + experts 共享同一个 moe mlp 边界；shared_experts 按 F3
+        成为独立的嵌套 mlp 边界（其边界出口持有 RowWise Partial 归约，
+        accuracy_fix_plan.md §2）。"""
         p = _planner()
         roles = {
             "model.layers.0.mlp.gate.weight": ParamRole.MOE_GATE,
@@ -292,8 +296,21 @@ class TestBoundaryGrouping:
             "model.layers.0.mlp.shared_experts.w1": ParamRole.SHARED_EXPERT,
         }
         groups = p._group_by_boundary(roles)
-        assert set(groups) == {"model.layers.0.mlp"}
-        assert len(groups["model.layers.0.mlp"]) == 4
+        assert set(groups) == {"model.layers.0.mlp",
+                               "model.layers.0.mlp.shared_experts"}
+        assert len(groups["model.layers.0.mlp"]) == 3
+        assert groups["model.layers.0.mlp.shared_experts"] == [
+            ("model.layers.0.mlp.shared_experts.w1", ParamRole.SHARED_EXPERT)]
+
+    def test_moe_gate_only_group_does_not_anchor(self):
+        """F3 结构 lint：MOE_GATE-only 组不锚定 MoE 边界（如标量 gate
+        Linear 误判路由），向上合并。"""
+        p = _planner()
+        roles = {
+            "model.layers.0.mlp.gate.weight": ParamRole.MOE_GATE,
+        }
+        groups = p._group_by_boundary(roles)
+        assert "model.layers.0.mlp" not in groups
 
     def test_tiny_llama_boundaries(self, tiny_llama):
         """tiny_llama 完整边界集合 == 期望。"""
@@ -308,3 +325,62 @@ class TestBoundaryGrouping:
             "model.layers.1.post_attention_layernorm", "model.layers.1.mlp",
         }
         assert set(groups) == expected
+
+
+# ==========================================================================
+# F4 plan 期 lint（accuracy_fix_plan.md §2）：分片整除校验 + 可训练参数覆盖。
+# ==========================================================================
+
+class _OddMlpModel(nn.Module):
+    """colwise 参数行数不整除 tp_size 的玩具模型（mlp 边界）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Module()
+        self.mlp.gate_proj = nn.Linear(8, 3, bias=False)  # (3, 8)：Shard(0) 不整除 tp=2
+        self.mlp.up_proj = nn.Linear(8, 4, bias=False)
+        self.mlp.down_proj = nn.Linear(4, 8, bias=False)
+
+
+class TestPlanTimeLints:
+    def test_shard_divisibility_fails_at_plan_time(self, make_mesh):
+        """F4a：(3, 8) Shard(0) over tp=2 → plan 期教学化报错（不再等 apply
+        期空分片，accuracy_problem.md 10.1 同类）。"""
+        mesh = make_mesh((1,), ("tp",))
+        with pytest.raises(ValueError, match="not divisible by tp size 2") as exc:
+            ShardingPlanner().plan(_OddMlpModel(), mesh, tp_size=2)
+        assert "classification" in str(exc.value)   # 指向最可能的分类错误根因
+
+    def test_uncovered_trainable_param_fails(self, tiny_llama, make_mesh):
+        """F4b：可训练参数不被任何 spec.params/special_handlers 覆盖 →
+        plan 期硬报错（梯度同步语义不允许被消费侧默认静默决定）。"""
+        tiny_llama.model.layers[0].extra = nn.Linear(4, 4)   # 无边界声明
+        mesh = make_mesh((1,), ("tp",))
+        with pytest.raises(ValueError, match="coverage check failed") as exc:
+            ShardingPlanner().plan(tiny_llama, mesh, tp_size=2)
+        msg = str(exc.value)
+        assert "model.layers.0.extra.weight" in msg
+        assert "allow_uncovered_params" in msg       # 逃生舱可见
+
+    def test_allow_uncovered_params_downgrades_to_warning(self, tiny_llama,
+                                                          make_mesh, caplog):
+        """F4b 逃生舱：allow_uncovered_params=True → 降级为 WARNING（仅限
+        探索性调试）。"""
+        import logging
+        tiny_llama.model.layers[0].extra = nn.Linear(4, 4)
+        mesh = make_mesh((1,), ("tp",))
+        with caplog.at_level(logging.WARNING):
+            plan = ShardingPlanner(allow_uncovered_params=True).plan(
+                tiny_llama, mesh, tp_size=2)
+        assert "coverage check failed" in caplog.text
+        assert "model.layers.0.extra.weight" in caplog.text
+        assert plan.modules  # plan 正常产出
+
+    def test_frozen_param_needs_no_coverage(self, tiny_llama, make_mesh):
+        """requires_grad=False 的参数不参与 F4b（冻结即显式语义）。"""
+        extra = nn.Linear(4, 4)
+        extra.weight.requires_grad_(False)
+        extra.bias.requires_grad_(False)
+        tiny_llama.model.layers[0].extra = extra
+        mesh = make_mesh((1,), ("tp",))
+        ShardingPlanner().plan(tiny_llama, mesh, tp_size=2)   # 不报错

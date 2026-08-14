@@ -74,17 +74,18 @@ fsdp_config:
 #     region_dispatch: false   # wrapper 内含 K/V all-gather 通信，不可 dispatch
 #     inner_wrapper:
 #       _target_: hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper
-#   # EP: HF-native MoE — the shipped TP-extend-EP reference implementation
-#   # (routing is embedded in the factory: _softmax_topk_router; a MoE with
-#   # different routing writes its own factory referencing MOE_ROUTER_ADAPTERS
-#   # entries by name). A custom EP-aware module whose forward already
-#   # carries the all-to-all declares `region_dispatch: false` alone (no
-#   # local_compute_fn — the module's own forward IS the region compute).
+#   # EP: HF-native MoE — shipped archetype factories (complete semantics:
+#   # router / shared expert / gate / merge all inside, explicitly chosen per
+#   # the archetype table in ep_compute.py; a wrong choice fails at apply time
+#   # with an interface assertion listing the module's actual children). A
+#   # custom EP-aware module whose forward already carries the all-to-all
+#   # declares `region_dispatch: false` alone (no local_compute_fn — the
+#   # module's own forward IS the region compute).
 #   - match: "*.mlp"
 #     when: ep
 #     region_dispatch: false   # EP compute 内含 all-to-all，不可 dispatch
 #     local_compute_fn:
-#       _target_: hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
+#       _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
 #   # 契约字段（高级用法，merge 缺省继承推导）：placement 字符串 DSL
 #   # "replicate"/"partial"/"shard(N)"，哨兵 "auto"（显式继承）/"none"（显式清空）：
 #   # - match: "*.mlp"
