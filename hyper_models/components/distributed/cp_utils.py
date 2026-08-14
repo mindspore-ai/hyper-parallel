@@ -16,6 +16,8 @@
 
 - ``flex_cp_allgather``: K/V all-gather along the CP dim (reuses
   cp_mesh.get_group(); new_group is forbidden);
+- ``ulysses_seq_to_head`` / ``ulysses_head_to_seq``: differentiable Pure
+  Ulysses all-to-all layout transforms;
 - ``shard_batch_for_cp``: data-pipeline CP sharding (aligned with the THD
   contract of the 02 collater);
 - ``_shard_seq_lens_for_cp``: recompute seq_lens/seq_lens_padded per CP rank.
@@ -38,8 +40,12 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.platform import get_platform
+
 
 _ULYSSES_WRAPPED_FLAG = "_hyper_ulysses_wrapped"
+platform = get_platform()
 
 
 class _SeqAllToAll(torch.autograd.Function):
@@ -335,6 +341,121 @@ def _dsa_cp_alltoall(attention_module, attention_functions, context):
         setattr(CPDSAKLLoss, _ULYSSES_WRAPPED_FLAG, True)
         attention_module.SparseLightningIndexerKLLossTrainFunction = (
             CPDSAKLLoss)
+
+
+def _normalize_dim(dim: int, ndim: int) -> int:
+    """Normalize and validate a tensor dimension."""
+    normalized = dim + ndim if dim < 0 else dim
+    if normalized < 0 or normalized >= ndim:
+        raise ValueError(f"dimension {dim} is out of range for a {ndim}D tensor")
+    return normalized
+
+
+def _reconstruct_all_to_all(output: Tensor, concat_dim: int) -> Tensor:
+    """Move the source-rank axis next to ``concat_dim`` and merge it."""
+    rank_axis_position = concat_dim + 1
+    permutation = (
+        list(range(1, rank_axis_position))
+        + [0]
+        + list(range(rank_axis_position, output.dim()))
+    )
+    reconstructed = output.permute(permutation).contiguous()
+    shape = list(reconstructed.shape)
+    merged = shape[concat_dim] * shape[concat_dim + 1]
+    return reconstructed.reshape(shape[:concat_dim] + [merged] + shape[concat_dim + 2:])
+
+
+def _ulysses_all_to_all(
+    tensor: Tensor,
+    *,
+    scatter_dim: int,
+    gather_dim: int,
+    cp_mesh: DeviceMesh,
+) -> Tensor:
+    """Split one tensor dimension and gather another through all-to-all."""
+    cp_size = cp_mesh.size()
+    if cp_size <= 1:
+        return tensor
+
+    ndim = tensor.dim()
+    scatter_dim = _normalize_dim(scatter_dim, ndim)
+    gather_dim = _normalize_dim(gather_dim, ndim)
+    if scatter_dim == gather_dim:
+        raise ValueError("Ulysses scatter_dim and gather_dim must be different")
+
+    shape = list(tensor.shape)
+    scatter_size = shape[scatter_dim]
+    if scatter_size % cp_size != 0:
+        raise ValueError(
+            f"tensor dimension {scatter_dim} size ({scatter_size}) must be "
+            f"divisible by Ulysses degree ({cp_size})"
+        )
+
+    split_shape = (
+        shape[:scatter_dim]
+        + [cp_size, scatter_size // cp_size]
+        + shape[scatter_dim + 1:]
+    )
+    split_ndim = ndim + 1
+    permutation = (
+        [scatter_dim]
+        + list(range(scatter_dim))
+        + list(range(scatter_dim + 1, split_ndim))
+    )
+    send = tensor.contiguous().reshape(split_shape).permute(permutation).contiguous()
+    received = platform.differentiable_all_to_all(
+        send, list(send.shape), cp_mesh.get_group())
+    return _reconstruct_all_to_all(received, gather_dim)
+
+
+def ulysses_seq_to_head(
+    tensor: Tensor,
+    seq_dim: int,
+    head_dim: int,
+    cp_mesh: DeviceMesh,
+) -> Tensor:
+    """Convert a sequence shard into a full-sequence head shard.
+
+    Args:
+        tensor: Local Q, K, or V tensor.
+        seq_dim: Sequence dimension to gather across the CP group.
+        head_dim: Head dimension to split across the CP group.
+        cp_mesh: One-dimensional CP DeviceMesh.
+
+    Returns:
+        Tensor with the sequence dimension gathered and head dimension sharded.
+    """
+    return _ulysses_all_to_all(
+        tensor,
+        scatter_dim=head_dim,
+        gather_dim=seq_dim,
+        cp_mesh=cp_mesh,
+    )
+
+
+def ulysses_head_to_seq(
+    tensor: Tensor,
+    seq_dim: int,
+    head_dim: int,
+    cp_mesh: DeviceMesh,
+) -> Tensor:
+    """Convert a full-sequence head shard back into a sequence shard.
+
+    Args:
+        tensor: Local attention output in Ulysses head-sharded layout.
+        seq_dim: Full sequence dimension to split across the CP group.
+        head_dim: Head dimension to gather across the CP group.
+        cp_mesh: One-dimensional CP DeviceMesh.
+
+    Returns:
+        Tensor restored to the original local sequence-sharded layout.
+    """
+    return _ulysses_all_to_all(
+        tensor,
+        scatter_dim=seq_dim,
+        gather_dim=head_dim,
+        cp_mesh=cp_mesh,
+    )
 
 
 class _AllGatherAlongDim(torch.autograd.Function):
