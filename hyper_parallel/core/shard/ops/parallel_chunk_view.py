@@ -16,6 +16,7 @@
 Distributed implementation for ChunkView operator.
 """
 
+import copy
 from typing import Tuple
 
 from .parallel_ops import DistributedOp
@@ -133,6 +134,5 @@ class ChunkViewDistributedOp(DistributedOp):
 
         output_num = self._calculate_output_count(input_shape[dim], chunks)
 
-        output_layouts = (input_layout,) * output_num
+        output_layouts = tuple(copy.deepcopy(input_layout) for _ in range(output_num))
         return (output_layouts, None)
-    
