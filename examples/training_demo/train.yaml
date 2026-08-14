@@ -19,8 +19,8 @@ model:
 #   use_fast: true
 
 training:
-  train_iters: 2
-  eval_iters: 0
+  train_iters: 10
+  eval_iters: 1
 
   train_samples: null
   num_train_epochs: 1
@@ -108,24 +108,66 @@ model_assets:
     trust_remote_code: true
 
 data_transform:
-  _target_: hyper_models.components.data.identity_transform.IdentityDataTransform
+  _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+  data_type: 'pretokenized'
+  text_keys: 'text'
+  max_seq_len: 2048
 
 dataset:
-  _target_: hyper_models.components.data.datasets.DummyDataset
-  num_samples: 32
-  seq_len: 32
-  vocab_size: 1000
-  seed: 42
+  _target_: hyper_models.components.datasets.llm.build_llm_dataset
+  data_path: null
+  data_config:
+    source_type: offline
+    mock_data: true # false
+
+    build_on_rank: null
+
+    seed: 1234
+    seq_length: 2048
+    split: '100, 0, 0'
+
+    # blend_per_split
+    train_data_path: null
+    valid_data_path: null
+    test_data_path: null
+    data_cache_path: null
+
+    distributed_walk: true
+    mmap_bin_files: true
+    reuse_idx: false
+    data_lazy_load: true
+
+    tokenizer: null
+    reset_position_ids: false
+    reset_attention_mask: false
+    eod_mask_loss: false
+    create_attention_mask_in_dataloader: true
+
+    dataset_margin: 1.005
+    skip_data_check: false
+
+    is_dataset_from_mr: false
+    simple_blend: 'no'
 
 collate_fn:
   _target_: hyper_models.components.datasets.llm.build_llm_collator
   packing: false
 
 dataloader:
-  _target_: hyper_models.components.data.dataloader.DataLoader
-  shuffle: true
+  _target_: hyper_models.components.datasets.DataLoader
+  # single: sequential/rearranged; cyclic: deterministic shuffled epochs;
+  # external: the dataset target itself must return a complete dataloader.
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
   drop_last: true
   use_background_prefetcher: false
+  num_workers: 0
+  dataloader_pin_memory: false
+  prefetch_factor: null
+
+get_batch:
+  _target_: hyper_models.components.datasets.llm.build_llm_get_batch
 
 optimizer:
   _target_: hyper_models.components.optim.optimizer.Muon
