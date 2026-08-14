@@ -15,7 +15,7 @@
 """cp_wrappers: built-in CP-aware inner attention wrappers (public, explicit injection).
 
 Since the explicit-injection rework the framework NEVER picks a CP wrapper
-automatically: the four built-ins below are referenced explicitly — by
+automatically: the built-ins below are referenced explicitly — by
 registry name (``spec.inner_wrapper="sdpa_hf"``), by callable, or by a YAML
 Target pointing at one of these functions:
 
@@ -54,6 +54,9 @@ forward's params (validated at apply time).
   intercepted);
 - ``flex_qkv_cp_wrapper`` / ``flex_hf_cp_wrapper``: the two isomorphic
   FlexAttention entries (block_mask must be built for the global kv length).
+- ``*_ulysses_cp_wrapper``: Pure Ulysses variants that exchange Q/K/V from
+  sequence shards to head shards before attention and restore the local
+  sequence shard afterward.
 
 Users may register their own named schemes::
 
@@ -82,6 +85,8 @@ from hyper_models.components.distributed.cp_utils import (
     _mome_cp_halo_exchange,
     _slice_sequence,
     flex_cp_allgather,
+    ulysses_head_to_seq,
+    ulysses_seq_to_head,
 )
 from hyper_models.components.distributed.injection import (
     inner_wrapper,
@@ -156,6 +161,52 @@ def _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kwargs):
         kwargs["attn_mask"] = _cp_offset_causal_mask(
             q.shape[cp_dim], global_k.shape[cp_dim], lo, q.device)
     return orig_sdpa(q, global_k, global_v, **kwargs)
+
+
+def _ulysses_attention_call(
+        attention_fn, cp_mesh, query, key, value, kwargs,
+        *, seq_dim=2, head_dim=1):
+    """Run attention in the Pure Ulysses full-sequence/head-sharded layout."""
+    query, key, value = (
+        ulysses_seq_to_head(tensor, seq_dim, head_dim, cp_mesh)
+        for tensor in (query, key, value)
+    )
+    output = attention_fn(query, key, value, **kwargs)
+    return ulysses_head_to_seq(output, seq_dim, head_dim, cp_mesh)
+
+
+def _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs):
+    """Preserve a QKV forward signature while applying Pure Ulysses."""
+    signature = inspect.signature(original_forward)
+    bound = signature.bind(*args, **kwargs)
+    names = list(signature.parameters)
+    if len(names) < 3:
+        raise TypeError("Ulysses QKV wrapper requires at least three forward inputs")
+    try:
+        query, key, value = (
+            bound.arguments[names[index]] for index in range(3)
+        )
+    except KeyError as exc:
+        raise TypeError(
+            "Ulysses QKV wrapper requires query, key, and value inputs"
+        ) from exc
+    query, key, value = (
+        ulysses_seq_to_head(tensor, 2, 1, cp_mesh)
+        for tensor in (query, key, value)
+    )
+    bound.arguments[names[0]] = query
+    bound.arguments[names[1]] = key
+    bound.arguments[names[2]] = value
+    output = original_forward(*bound.args, **bound.kwargs)
+    return ulysses_head_to_seq(output, 2, 1, cp_mesh)
+
+
+def _require_ulysses_cp_mesh(cp_mesh, wrapper_name):
+    """Validate the communication context required by Pure Ulysses."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            f"Ulysses wrapper {wrapper_name!r} requires an active CP mesh"
+        )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -339,6 +390,119 @@ def flex_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Pure Ulysses attention wrappers (explicit plan_overrides methods)
+# ────────────────────────────────────────────────────────────────────────────
+
+@inner_wrapper
+def sdpa_qkv_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Apply Pure Ulysses to a separated ``forward(query, key, value, ...)``."""
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "sdpa_qkv_ulysses")
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args, **kwargs):
+        return _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs)
+
+    target_module.forward = cp_forward
+
+
+@inner_wrapper
+def flex_qkv_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Apply Pure Ulysses to a separated FlexAttention QKV forward."""
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "flex_qkv_ulysses")
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args, **kwargs):
+        return _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs)
+
+    target_module.forward = cp_forward
+
+
+@inner_wrapper
+def sdpa_hf_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Apply Pure Ulysses by intercepting HF SDPA primitive calls."""
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "sdpa_hf_ulysses")
+    original_forward = target_module.forward
+    original_sdpa = F.scaled_dot_product_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args, **kwargs):
+        fired = {"hit": False}
+
+        def ulysses_sdpa(query, key, value, **attention_kwargs):
+            fired["hit"] = True
+            return _ulysses_attention_call(
+                original_sdpa,
+                cp_mesh,
+                query,
+                key,
+                value,
+                attention_kwargs,
+            )
+
+        F.scaled_dot_product_attention = ulysses_sdpa
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            F.scaled_dot_product_attention = original_sdpa
+        if not fired["hit"]:
+            raise RuntimeError(
+                "CP wrapper 'sdpa_hf_ulysses' did not intercept any "
+                "F.scaled_dot_product_attention call; the selected wrapper "
+                "does not match the module implementation"
+            )
+        return output
+
+    target_module.forward = cp_forward
+
+
+@inner_wrapper
+def flex_hf_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+    """Apply Pure Ulysses by intercepting HF FlexAttention primitive calls."""
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "flex_hf_ulysses")
+    original_forward = target_module.forward
+    flex_attention_module = importlib.import_module(
+        "torch.nn.attention.flex_attention"
+    )
+    original_flex_attention = flex_attention_module.flex_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args, **kwargs):
+        fired = {"hit": False}
+
+        def ulysses_flex(query, key, value, **attention_kwargs):
+            fired["hit"] = True
+            return _ulysses_attention_call(
+                original_flex_attention,
+                cp_mesh,
+                query,
+                key,
+                value,
+                attention_kwargs,
+            )
+
+        flex_attention_module.flex_attention = ulysses_flex
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            flex_attention_module.flex_attention = original_flex_attention
+        if not fired["hit"]:
+            raise RuntimeError(
+                "CP wrapper 'flex_hf_ulysses' did not intercept any "
+                "flex_attention call; the selected wrapper does not match "
+                "the module implementation"
+            )
+        return output
+
+    target_module.forward = cp_forward
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # MLA/DSA Ulysses wrapper
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -459,7 +623,7 @@ def mla_dsa_ulysses_cp_wrapper(
 
 
 # {registry_name: wrapper_fn} -- inner-wrapper 命名注册表（05 §4.4.2）。
-# 机制不 CP 门控（声明即应用）；四个仓内参考实现是 CP 语义（自检要求活跃 cp
+# 机制不 CP 门控（声明即应用）；仓内参考实现是 CP 语义（自检要求活跃 cp
 # 轴），用户可注册任意命名方案。
 # Contract: @inner_wrapper fn(target_module, mesh, tp_mesh, cp_mesh,
 # ep_mesh) replaces target_module.forward in place (K/V all-gather
@@ -471,6 +635,10 @@ INNER_WRAPPER_REGISTRY = {
     "sdpa_hf": sdpa_hf_cp_wrapper,    # HF convention + F.sdpa primitive interception (misfire detection)
     "flex_qkv": flex_qkv_cp_wrapper,
     "flex_hf": flex_hf_cp_wrapper,
+    "sdpa_qkv_ulysses": sdpa_qkv_ulysses_cp_wrapper,
+    "flex_qkv_ulysses": flex_qkv_ulysses_cp_wrapper,
+    "sdpa_hf_ulysses": sdpa_hf_ulysses_cp_wrapper,
+    "flex_hf_ulysses": flex_hf_ulysses_cp_wrapper,
     "mla_dsa_ulysses": mla_dsa_ulysses_cp_wrapper,
 }
 
