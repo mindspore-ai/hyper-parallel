@@ -20,27 +20,16 @@ import hashlib
 import json
 import logging
 import os
-import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
 
-from hyper_parallel.platform import get_platform
 from hyper_models.components.datasets.llm.indexed_data_config import GPTDatasetConfig
 from hyper_models.components.datasets.llm.indexed_helpers import build_blending_indices
 
 logger = logging.getLogger(__name__)
-platform = get_platform()
-
-
-def _get_rank() -> int:
-    """Return the current distributed rank for progress logging."""
-    try:
-        return int(platform.get_rank())
-    except (RuntimeError, ValueError):
-        return 0
 
 
 class BlendedDataset:
@@ -72,7 +61,7 @@ class BlendedDataset:
         self.unique_description = json.dumps(
             self.unique_identifiers,
             indent=4,
-            default=lambda value: getattr(value, "unique_identifiers", repr(value)),
+            default=lambda value: value.unique_identifiers,
         )
         self.unique_description_hash = hashlib.md5(
             self.unique_description.encode("utf-8")
@@ -80,29 +69,8 @@ class BlendedDataset:
         self.dataset_index, self.dataset_sample_index = self._build_indices()
 
     def _collect_dataset_identifiers(self) -> list[Any]:
-        """Collect component identities while reporting lazy-load progress."""
-        # total_datasets = len(self.datasets)
-        # # interval = max(1, total_datasets // 10)
-        # rank = _get_rank()
-        # started_at = time.monotonic()
-        # logger.info(
-        #     "Rank %d collecting identifiers for %d blended Dataset components",
-        #     rank,
-        #     total_datasets,
-        # )
-        identifiers = []
-        for dataset_index, dataset in enumerate(self.datasets):
-            identifiers.append(dataset.unique_identifiers)
-            # completed = dataset_index + 1
-        #     if dataset_index == 0 or completed == total_datasets or completed % interval == 0:
-        #         logger.info(
-        #             "Rank %d blend component progress: %d/%d (%.1f%%), elapsed=%.1fs",
-        #             rank,
-        #             completed,
-        #             total_datasets,
-        #             completed * 100.0 / total_datasets,
-        #             time.monotonic() - started_at,
-        #         )
+        """Collect component Dataset cache identities."""
+        identifiers = [dataset.unique_identifiers for dataset in self.datasets]
         return identifiers
 
     def __len__(self) -> int:
@@ -120,6 +88,10 @@ class BlendedDataset:
         """Load or build the top-level blend index cache."""
         cache_directory = self.config.path_to_cache
         if cache_directory is None:
+            logger.debug(
+                "Building blended indices in memory: size=%d, sources=%d, weights are %s",
+                self.size, len(self.weights), self.weights[:3],
+            )
             indices = self._build_indices_in_memory()
             return indices
 
@@ -132,6 +104,7 @@ class BlendedDataset:
         sample_index_path = f"{cache_prefix}-dataset_sample_index.npy"
         cache_paths = (description_path, dataset_index_path, sample_index_path)
         if all(os.path.isfile(path) for path in cache_paths):
+            logger.debug("Loading blended index cache: prefix=%s", cache_prefix)
             dataset_index = np.load(dataset_index_path, allow_pickle=True, mmap_mode="r")
             sample_index = np.load(sample_index_path, allow_pickle=True, mmap_mode="r")
             return dataset_index, sample_index
@@ -142,6 +115,7 @@ class BlendedDataset:
             description_file.write(self.unique_description)
         np.save(dataset_index_path, dataset_index, allow_pickle=True)
         np.save(sample_index_path, sample_index, allow_pickle=True)
+        logger.debug("Saved blended index cache: prefix=%s", cache_prefix)
         return dataset_index, sample_index
 
     def _build_indices_in_memory(self) -> tuple[np.ndarray, np.ndarray]:

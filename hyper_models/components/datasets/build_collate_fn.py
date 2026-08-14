@@ -14,6 +14,7 @@
 # ============================================================================
 """Public LLM and Omni collate-function build stage."""
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -24,6 +25,7 @@ Feature = Mapping[str, Any]
 CollatedBatch = Mapping[str, Any]
 InternalDataCollator = Callable[[Sequence[Feature]], CollatedBatch]
 _DataCollatorT = TypeVar("_DataCollatorT", bound=InternalDataCollator)
+logger = logging.getLogger(__name__)
 
 
 def build_collate_fn(
@@ -44,6 +46,7 @@ def build_collate_fn(
     if not callable(internal_data_collator):
         raise ValueError("internal_data_collator must be callable")
     collate_fn = internal_data_collator
+    logger.debug("Built collate function type=%s", type(collate_fn).__name__)
     return collate_fn
 
 
@@ -84,7 +87,12 @@ def calculate_num_micro_batches(
             f"global_batch_size ({global_batch_size}) must be divisible by "
             f"micro_batch_size * dp_world_size ({samples_per_distributed_micro_batch})"
         )
-    return global_batch_size // samples_per_distributed_micro_batch
+    num_micro_batches = global_batch_size // samples_per_distributed_micro_batch
+    logger.debug(
+        "Resolved micro-batches=%d from global_batch_size=%d, micro_batch_size=%d, dp_world_size=%d",
+        num_micro_batches, global_batch_size, micro_batch_size, dp_world_size,
+    )
+    return num_micro_batches
 
 
 @dataclass

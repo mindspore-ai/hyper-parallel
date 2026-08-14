@@ -24,7 +24,13 @@ from collections.abc import Mapping
 from dataclasses import MISSING, fields
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
-from hyper_models.trainer.config import Target, TrainerConfig
+from hyper_models.trainer.config import (
+    DataLoaderConfig,
+    DatasetConfig,
+    ModelAssetsConfig,
+    Target,
+    TrainerConfig,
+)
 
 
 class ConfigResolutionError(ValueError):
@@ -375,6 +381,75 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
     )
 
 
+def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
+    """Resolve a DataLoader target with nested collator and batch adapter."""
+    if not isinstance(node, Mapping):
+        raise _fail(path, "DataLoader configuration must be a YAML mapping")
+
+    target_node = dict(node)
+    collate_node = target_node.pop("collate_fn", None)
+    get_batch_node = target_node.pop("get_batch", None)
+    dataloader_type = coerce_value(
+        target_node.pop("dataloader_type", "single"),
+        Literal["single", "cyclic"],
+        path=f"{path}.dataloader_type",
+    )
+    data_rearrange_map = target_node.pop("data_rearrange_map", None)
+    data_sharding = coerce_value(
+        target_node.pop("data_sharding", False),
+        bool,
+        path=f"{path}.data_sharding",
+    )
+    target = _resolve_target(target_node, path=path)
+    collate_fn = (
+        None
+        if collate_node is None
+        else _resolve_target(collate_node, path=f"{path}.collate_fn")
+    )
+    get_batch = (
+        None
+        if get_batch_node is None
+        else _resolve_target(get_batch_node, path=f"{path}.get_batch")
+    )
+    return DataLoaderConfig(
+        target=target,
+        collate_fn=collate_fn,
+        get_batch=get_batch,
+        dataloader_type=dataloader_type,
+        data_rearrange_map=data_rearrange_map,
+        data_sharding=data_sharding,
+    )
+
+
+def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
+    """Resolve a Dataset target with its assets and sample transform."""
+    if not isinstance(node, Mapping):
+        raise _fail(path, "Dataset configuration must be a YAML mapping")
+
+    target_node = dict(node)
+    model_assets_node = target_node.pop("model_assets", {})
+    data_transform_node = target_node.pop("data_transform", None)
+    target = _resolve_target(target_node, path=path)
+    model_assets = resolve_component(
+        model_assets_node,
+        expected_type=ModelAssetsConfig,
+        path=f"{path}.model_assets",
+    )
+    data_transform = (
+        None
+        if data_transform_node is None
+        else _resolve_target(
+            data_transform_node,
+            path=f"{path}.data_transform",
+        )
+    )
+    return DatasetConfig(
+        target=target,
+        model_assets=model_assets,
+        data_transform=data_transform,
+    )
+
+
 def resolve_component(node: object, *, expected_type: object, path: str) -> object:
     """Resolve one YAML value according to its declared configuration type."""
     if node is None:
@@ -385,6 +460,10 @@ def resolve_component(node: object, *, expected_type: object, path: str) -> obje
     origin = get_origin(expected_type)
     if origin is Target or expected_type is Target:
         return _resolve_target(node, path=path)
+    if expected_type is DatasetConfig:
+        return _resolve_dataset_config(node, path=path)
+    if expected_type is DataLoaderConfig:
+        return _resolve_dataloader_config(node, path=path)
     if isinstance(expected_type, type) and dataclasses.is_dataclass(expected_type):
         return _resolve_dataclass(node, expected_type, path=path)
     return coerce_value(node, expected_type, path=path)

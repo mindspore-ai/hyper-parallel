@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
@@ -26,6 +27,7 @@ from hyper_models.components.datasets.contracts import ModelSample, RawSample, S
 
 LLMDataType = Literal["plaintext", "conversation", "pretokenized"]
 TextKeys: TypeAlias = str | Sequence[str]
+logger = logging.getLogger(__name__)
 
 
 def _get_record_value(sample: Mapping[str, Any], keys: TextKeys) -> Any:
@@ -116,13 +118,7 @@ class ConversationTransform:
 
 @dataclass
 class PretokenizedTransform:
-    """Normalize one pretokenized indexed GPT record.
-
-    Indexed Dataset code has already shifted labels. It may also provide loss
-    masks, position IDs, and an attention mask, omits those
-    fields when ``create_attention_mask=False``. Runtime ``get_batch`` owns
-    their final reconstruction for both forms.
-    """
+    """Normalize indexed GPT records with pre-shifted labels and optional runtime mask fields."""
 
     max_seq_len: int | None = None
 
@@ -134,37 +130,25 @@ class PretokenizedTransform:
         """Convert one pretokenized indexed record into one model sample.
 
         Args:
-            sample: Record containing ``tokens`` or ``input_ids`` and shifted
-                ``labels``. Runtime mask fields are optional.
+            sample: Record containing ``tokens`` or ``input_ids`` and shifted ``labels``.
 
         Returns:
-            The normalized model sample. A missing attention mask remains
-            missing so kernels can construct it when configured to do so.
+            The normalized model sample without reconstructing optional fields.
 
         Raises:
-            ValueError: If required fields are missing, sequence shapes are
-                inconsistent, or the indexed sequence exceeds ``max_seq_len``.
+            ValueError: If fields are missing, shapes are inconsistent, or the sequence is too long.
         """
-        # Keep the source record unchanged and expose source ``tokens`` through
-        # the model-facing ``input_ids`` name.
         normalized = dict(sample)
         if "input_ids" not in normalized:
             if "tokens" not in normalized:
                 raise ValueError("Pretokenized samples must contain 'input_ids' or 'tokens'")
             normalized["input_ids"] = normalized.pop("tokens")
 
-        # Tokens and shifted labels.
-        # GPTDataset may additionally return masks and positions, while GPTFromMRDataset
-        # intentionally omits them when attention-mask creation is disabled.
-        required_fields = (
-            "input_ids",
-            "labels",
-        )
+        required_fields = ("input_ids", "labels")
         missing_fields = [field for field in required_fields if field not in normalized]
         if missing_fields:
             raise ValueError(f"Pretokenized samples must contain fields: {missing_fields!r}")
 
-        # Normalize source dtypes without recomputing any field.
         field_dtypes = {
             "input_ids": torch.long,
             "labels": torch.long,
@@ -176,16 +160,20 @@ class PretokenizedTransform:
             if field in normalized:
                 normalized[field] = torch.as_tensor(normalized[field], dtype=dtype)
 
-        # Indexed data should already have the configured sequence length. Do
-        # not silently truncate because labels and masks must remain aligned.
+        # Temporarily truncate pre-cut records so short-sequence debug models can consume them.
         input_ids = normalized["input_ids"]
         if input_ids.ndim != 1:
             raise ValueError(f"Pretokenized field 'input_ids' must be one-dimensional, got {input_ids.shape}")
         sequence_length = input_ids.shape[0]
         if self.max_seq_len is not None and sequence_length > self.max_seq_len:
-            raise ValueError(
-                f"Pretokenized sequence length ({sequence_length}) exceeds max_seq_len ({self.max_seq_len})"
-            )
+            for field in ("input_ids", "labels", "loss_mask", "position_ids", "text_position_ids"):
+                if field in normalized:
+                    normalized[field] = normalized[field][:self.max_seq_len]
+            if "attention_mask" in normalized:
+                normalized["attention_mask"] = normalized["attention_mask"][
+                    :, :self.max_seq_len, :self.max_seq_len
+                ]
+            sequence_length = self.max_seq_len
 
         for field in ("labels", "loss_mask", "position_ids", "text_position_ids"):
             if field not in normalized:
@@ -196,8 +184,7 @@ class PretokenizedTransform:
                     f"Pretokenized field {field!r} must have shape ({sequence_length},), got {tuple(value.shape)}"
                 )
 
-        # ``attention_mask`` is optional when the attention kernel creates it.
-        # When present, preserve the [1, sequence, sequence] causal mask.
+        # Preserve optional [1, sequence, sequence] causal masks.
         if "attention_mask" in normalized:
             attention_mask = torch.as_tensor(normalized["attention_mask"], dtype=torch.bool)
             expected_shape = (1, sequence_length, sequence_length)
@@ -210,14 +197,8 @@ class PretokenizedTransform:
         return normalized
 
 
-def build_llm_data_transform(
-        data_type: LLMDataType,
-        *,
-        tokenizer: Any = None,
-        chat_template: Any = None,
-        max_seq_len: int,
-        text_keys: TextKeys = "text",
-) -> SampleTransform:
+def build_llm_data_transform(data_type: LLMDataType, *, tokenizer: Any = None, chat_template: Any = None,
+                             max_seq_len: int, text_keys: TextKeys = "text") -> SampleTransform:
     """Build the transform selected by the LLM data type.
 
     Args:
@@ -241,6 +222,7 @@ def build_llm_data_transform(
         data_transform = PretokenizedTransform(max_seq_len=max_seq_len)
     else:
         raise ValueError(f"Unsupported LLM data type: {data_type!r}")
+    logger.debug("Built LLM data transform: data_type=%s, transform=%s", data_type, type(data_transform).__name__)
     return data_transform
 
 

@@ -23,14 +23,12 @@ from torch.utils.data import IterableDataset
 
 RawSample: TypeAlias = Mapping[str, Any]
 ModelSample: TypeAlias = Mapping[str, Any]
-TransformedSample: TypeAlias = ModelSample | Sequence[ModelSample]
-MicroBatch: TypeAlias = dict[str, Any]
 
 
 class SampleTransform(Protocol):
     """Convert one source record into one model-facing sample."""
 
-    def __call__(self, sample: RawSample) -> TransformedSample:
+    def __call__(self, sample: RawSample) -> ModelSample | Sequence[ModelSample]:
         """Transform one raw sample.
 
         Args:
@@ -40,21 +38,6 @@ class SampleTransform(Protocol):
             One model-facing sample, or multiple samples when a transform
             splits one source record. Multi-sample results require a Dataset
             or packing stage that can flatten them.
-        """
-        raise NotImplementedError
-
-
-class BatchCollator(Protocol):
-    """Convert model-facing samples into one micro-batch."""
-
-    def __call__(self, samples: Sequence[ModelSample]) -> MicroBatch:
-        """Collate model samples.
-
-        Args:
-            samples: Model-facing samples selected for one micro-batch.
-
-        Returns:
-            A dictionary accepted by the model forward pass.
         """
         raise NotImplementedError
 
@@ -75,14 +58,3 @@ def is_iterable_dataset(dataset: Any) -> bool:
     has_iterator = callable(getattr(dataset, "__iter__", None))
     has_index_access = callable(getattr(dataset, "__getitem__", None))
     return has_iterator and not has_index_access
-
-
-__all__ = [
-    "BatchCollator",
-    "MicroBatch",
-    "ModelSample",
-    "RawSample",
-    "SampleTransform",
-    "TransformedSample",
-    "is_iterable_dataset",
-]

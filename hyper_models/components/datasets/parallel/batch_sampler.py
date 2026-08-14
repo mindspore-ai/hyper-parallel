@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import logging
 import operator
 import os
+import random
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Literal, Union, cast
 
@@ -25,7 +27,7 @@ from hyper_parallel.platform import get_platform
 
 IndexMapping = Union[Mapping[int, int], Sequence[int]]
 SamplerType = Literal["single", "cyclic"]
-
+logger = logging.getLogger(__name__)
 platform = get_platform()
 
 
@@ -197,21 +199,21 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
             raise ValueError("cyclic consumed_samples must align to a global micro-batch")
 
         if self.data_sharding:
-            # Shuffle inside one contiguous per-rank bucket so every rank reads
-            # only its own Dataset region.
+            # Shuffle one contiguous bucket per DP rank.
             bucket_size = (self.total_samples // self.global_micro_batch_size) * self.micro_batch_size
             bucket_offset = current_epoch_samples // self.dp_world_size
             bucket_start = self.dp_rank * bucket_size
-            random_offsets = platform.random_permutation(bucket_size, self.epoch)
+            random_offsets = list(range(bucket_size))
+            random.Random(self.epoch).shuffle(random_offsets)
             rank_indices = [
                 bucket_start + offset
                 for offset in random_offsets[bucket_offset:]
             ]
         else:
-            # Shuffle globally, skip restored
-            # positions, then distribute indices to DP ranks by striding.
+            # Shuffle globally, then stride across DP ranks.
             full_bucket_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
-            shuffled_indices = platform.random_permutation(full_bucket_size, self.epoch)
+            shuffled_indices = list(range(full_bucket_size))
+            random.Random(self.epoch).shuffle(shuffled_indices)
             active_indices = shuffled_indices[current_epoch_samples:]
             rank_indices = active_indices[self.dp_rank::self.dp_world_size]
 
@@ -283,8 +285,6 @@ def build_dataset_batch_sampler(
           in-memory mapping or a mapping checkpoint path.
         - ``cyclic``: Use epoch-based ``randperm`` order, with
           ``data_sharding=True/False`` and resumable sampler state.
-        - ``external``: Handled by the Trainer because an external dataloader
-          does not need a Dataset batch sampler.
 
     Args:
         total_samples: Number of logical samples in the Dataset.
@@ -304,6 +304,12 @@ def build_dataset_batch_sampler(
         A resumable iterable of rank-local index lists.
     """
     resolved_mapping = _resolve_index_mapping(index_mapping, data_rearrange_map)
+    logger.debug(
+        "Building Dataset sampler: type=%s, total_samples=%d, consumed_samples=%d, micro_batch_size=%d, "
+        "dp_rank=%d, dp_world_size=%d, drop_last=%s, data_sharding=%s, mapped=%s",
+        sampler_type, total_samples, consumed_samples, micro_batch_size, dp_rank, dp_world_size, drop_last,
+        data_sharding, resolved_mapping is not None,
+    )
     sampler_options = {
         "total_samples": total_samples,
         "consumed_samples": consumed_samples,
@@ -320,6 +326,7 @@ def build_dataset_batch_sampler(
         # is resolved through an in-memory mapping or mapping checkpoint.
         batch_sampler = _DatasetBatchSampler(**sampler_options)
         return batch_sampler
+
     if sampler_type == "cyclic":
         # Scenario 3 — cyclic: use epoch-based randperm order,
         # support data_sharding=True/False, and checkpoint consumed_samples.

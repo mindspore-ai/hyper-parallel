@@ -27,6 +27,7 @@ class BatchParallelContext:
     tp_group: Any = None
     cp_rank: int = 0
     cp_size: int = 1
+    cp_group: Any = None
     pp_rank: int = 0
     pp_size: int = 1
     pp_group: Any = None
@@ -67,6 +68,7 @@ def create_batch_parallel_context(
     """
     device_mesh = getattr(mesh_context, "device_mesh", None)
     tp_mesh = _get_submesh(device_mesh, "tp")
+    cp_mesh = _get_submesh(device_mesh, "cp")
     pp_mesh = _get_submesh(device_mesh, "pp")
     batch_context = BatchParallelContext(
         tp_rank=int(getattr(mesh_context, "tp_rank", 0)),
@@ -74,6 +76,7 @@ def create_batch_parallel_context(
         tp_group=tp_mesh.get_group() if tp_mesh is not None else None,
         cp_rank=int(getattr(mesh_context, "cp_rank", 0)),
         cp_size=int(getattr(mesh_context, "cp_size", 1)),
+        cp_group=cp_mesh.get_group() if cp_mesh is not None else None,
         pp_rank=int(getattr(mesh_context, "pp_rank", 0)),
         pp_size=int(getattr(mesh_context, "pp_size", 1)),
         pp_group=pp_mesh.get_group() if pp_mesh is not None else None,
