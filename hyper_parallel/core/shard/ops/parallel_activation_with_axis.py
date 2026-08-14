@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 Activation with axis distributed operator implementation.
 """
 
+import copy
 from typing import Tuple
 
 from .parallel_ops import DistributedOp
@@ -95,7 +96,7 @@ class ActivationWithAxisDistributedOp(DistributedOp):
                     f"Input a: {first_layout}, Input b: {layout}"
                 )
 
-        return (first_layout,), None
+        return (copy.deepcopy(first_layout),), None
 
     def check_layout(self, layouts, axis):
         """
