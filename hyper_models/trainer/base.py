@@ -47,8 +47,8 @@ from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
 from ..components.datasets.llm.chat_template import ChatTemplate
-from ..components.data.data_collator import calculate_num_micro_batches
-from ..components.datasets.batch import PreparedBatch
+from ..components.datasets.build_dataloader import build_dataloader
+from ..components.datasets import enable_dataset_debug_logging
 from ..components.distributed.init_utils import get_local_rank_safe, get_global_rank_safe, get_world_size_safe
 from ..components.distributed.infrastructure import (
     create_distributed_setup_from_config,
@@ -223,8 +223,6 @@ class BaseTrainer(Stateful, ABC):
 
     # Data
     train_dataset: Dataset
-    # collate_fn: DataCollator
-    # train_dataloader: DistributedDataloader
     collate_fn: Any
     train_dataloader: Any
 
@@ -260,10 +258,11 @@ class BaseTrainer(Stateful, ABC):
 
     # Training states
     train_steps: int = 0  # total training steps
+    steps_per_epoch: int | None = None
     start_epoch: int = 0  # start epoch
     start_step: int = 0  # start step
 
-    # default seed if deterministic is enabled but no seed is provided
+    # Default seed when training.seed is omitted.
     default_seed: int = 42
 
     def __init__(self, config: TrainerConfig):
@@ -300,17 +299,13 @@ class BaseTrainer(Stateful, ABC):
         self._build_model()
         self._build_loss()
 
-        # Trainer-owned components are constructed only after AutoModel has
-        # finalized parameter identity, sharding, freezing, and tied weights.
-        # ``_build_model_assets`` loads the tokenizer/processor together with
-        # their serialized chat template. The dataset/data-transform layer
-        # consumes that template; BaseTrainer neither defines nor interprets
-        # model-specific chat protocols.
+        # Build trainer-owned data components after the model finalizes parameters and sharding.
         self._build_model_assets()
         self._build_data_transform()
         self._build_dataset()
         self._build_collate_fn()
         self._build_dataloader()
+
         self._compute_train_steps()
         self._build_optimizer()
         self._build_lr_scheduler()
@@ -329,6 +324,11 @@ class BaseTrainer(Stateful, ABC):
         self.local_rank = get_local_rank_safe()
         self.global_rank = get_global_rank_safe()
         self.world_size = get_world_size_safe()
+        if self.config.debug.check_dataset:
+            enable_dataset_debug_logging()
+
+        if self.config.training.seed is None:
+            self.config.training.seed = self.default_seed
 
         if self.global_rank == 0:
             logger.info(
@@ -392,71 +392,6 @@ class BaseTrainer(Stateful, ABC):
             raise ValueError("config.loss_fn must build a torch.nn.Module")
         self.loss_fn = loss_fn
 
-    # def _build_model_assets(self):
-    #     """Build model assets for the temporary dummy-data training path."""
-    #     self.tokenizer = (
-    #         self.config.tokenizer.build()
-    #         if self.config.tokenizer is not None
-    #         else None
-    #     )
-    #     self.chat_template = None
-    #     self.model_assets = [self.model_config]
-    #     if self.tokenizer is not None:
-    #         self.model_assets.append(self.tokenizer)
-
-    # def _build_data_transform(self) -> None:
-    #     """Build the configured transform from model assets."""
-    #     if self.config.data_transform is None:
-    #         self.data_transform = None
-    #         return
-    #     self.data_transform = self.config.data_transform.build(
-    #         tokenizer=self.tokenizer,
-    #         processor=self.processor,
-    #         chat_template=self.chat_template,
-    #         model_config=self.model_config,
-    #     )
-
-    # def _build_dataset(self):
-    #     """Build dataset-owned runtime state through the configured target."""
-    #     if self.config.dataset is None:
-    #         raise ValueError("config.dataset must define a build target")
-    #     self.train_dataset = self.config.dataset.build(
-    #         transform=self.data_transform,
-    #     )
-
-    # def _build_collate_fn(self):
-    #     """Build the collator through the configured target."""
-    #     if self.config.collate_fn is None:
-    #         raise ValueError("config.collate_fn must define a build target")
-    #     training_config = self.config.training
-    #     num_micro_batches = calculate_num_micro_batches(
-    #         global_batch_size=training_config.global_batch_size,
-    #         micro_batch_size=training_config.micro_batch_size,
-    #         dp_world_size=self.mesh.dp_size,
-    #     )
-    #     self.collate_fn = self.config.collate_fn.build(
-    #         num_micro_batch=num_micro_batches,
-    #     )
-
-    # def _build_dataloader(self):
-    #     """Build the training dataloader through the configured target."""
-    #     if self.config.dataloader is None:
-    #         raise ValueError("config.dataloader must define a build target")
-    #     local_step_batch_size = (
-    #         self.config.training.global_batch_size // self.mesh.dp_size
-    #     )
-    #     seed = self.config.training.seed
-    #     if seed is None:
-    #         seed = self.default_seed
-    #     self.train_dataloader = self.config.dataloader.build(
-    #         dataset=self.train_dataset,
-    #         collate_fn=self.collate_fn,
-    #         batch_size=local_step_batch_size,
-    #         dp_world_size=self.mesh.dp_size,
-    #         dp_rank=self.mesh.dp_rank,
-    #         seed=seed,
-    #     )
-
     def _build_model_assets(self) -> None:
         """Require a concrete Trainer to build modality-specific model assets."""
         raise NotImplementedError("Concrete Trainer must implement _build_model_assets")
@@ -466,225 +401,65 @@ class BaseTrainer(Stateful, ABC):
         raise NotImplementedError("Concrete Trainer must implement _build_data_transform")
 
     def _build_dataset(self) -> None:
-        """Build and assign train, validation, and test Dataset runtime state.
-
-        A conventional Dataset target returns one training Dataset. Indexed
-        Provider targets may instead return a three-split
-        tuple ``(train, validation, test)``.
-        """
-        parallel_context = self._build_dataset_parallel_context()
-        train_valid_test_num_samples = self._get_train_valid_test_num_samples()
+        """Build and assign one Dataset or a train-validation-test tuple."""
         dataset_result = self.config.dataset.build(
             transform=self.data_transform,
-            parallel_context=parallel_context,
-            tokenizer=getattr(self, "tokenizer", None),
-            train_valid_test_num_samples=train_valid_test_num_samples,
+            tokenizer=self.tokenizer,
+            mesh_context=self.mesh,
+            training_config=self.config.training,
         )
-        self._assign_dataset_splits(dataset_result)
 
-    def _get_train_valid_test_num_samples(self) -> tuple[int, int, int] | None:
-        """Calculate Dataset target sizes from the training plan."""
-        training_config = self.config.training
-        global_batch_size = training_config.global_batch_size
-
-        if training_config.train_iters is not None:
-            train_iters = training_config.train_iters
-        elif training_config.train_samples:
-            train_iters = training_config.train_samples // global_batch_size
-        else:
-            raise ValueError('train_iters and train_samples could not be None at same time.')
-
-        if training_config.train_samples:
-            train_samples = training_config.train_samples
-        else:
-            train_samples = train_iters * global_batch_size
-
-        eval_iters = (
-            (train_iters // training_config.eval_iters + 1) * training_config.eval_iters
-            if training_config.eval_iters
-            else 0
-        )
-        test_iters = training_config.eval_iters
-        sizes = (train_samples, eval_iters * global_batch_size, test_iters * global_batch_size)
-        logger.info("Dataset target sizes: train=%d, validation=%d, test=%d", *sizes, )
-        return sizes
-
-    def _build_dataset_parallel_context(self) -> Any:
-        """Assemble indexed Dataset rank and cache policy from Trainer state."""
-        from ..components.datasets.parallel import (  # pylint: disable=import-outside-toplevel
-            create_dataset_parallel_context,
-        )
-        data_config = getattr(self.config.dataset, "data_config", {})
-        data_index_cache = bool(data_config.get("data_index_cache", False))
-        shared_storage = not bool(data_config.get("no_shared_storage", False))
-        parallel_context = create_dataset_parallel_context(
-            self.mesh,
-            data_index_cache=data_index_cache,
-            shared_storage=shared_storage,
-        )
-        return parallel_context
-
-    def _assign_dataset_splits(self, dataset_result: Any) -> None:
-        """Normalize one Dataset or a three-split Provider result onto Trainer state."""
         if isinstance(dataset_result, tuple) and len(dataset_result) == 3:
-            train_dataset, valid_dataset, test_dataset = dataset_result
-            self.train_dataset = train_dataset
-            self.valid_dataset = valid_dataset
-            self.test_dataset = test_dataset
+            self.train_dataset, self.valid_dataset, self.test_dataset = dataset_result
             return
 
         self.train_dataset = dataset_result
-        self.valid_dataset = None
-        self.test_dataset = None
+        self.valid_dataset = self.test_dataset = None
 
     def _build_collate_fn(self) -> None:
         """Require a concrete Trainer to build its micro-batch collator."""
         raise NotImplementedError("Concrete Trainer must implement _build_collate_fn")
 
     def _build_dataloader(self) -> None:
-        """Build train, validation, and test dataloaders.
-
-        ``single`` reads sequential indices; ``single`` with
-        ``data_rearrange_map`` resolves mapped indices; ``cyclic`` uses an
-        epoch-based random order with optional data sharding and resume state;
-        ``external`` directly uses the Dataset target's dataloader result.
-        """
-        training_config = self.config.training
-        split_inputs = (
-            ("train", getattr(self, "train_dataset", None), training_config.consumed_train_samples),
-            ("valid", getattr(self, "valid_dataset", None), training_config.consumed_valid_samples),
-            ("test", getattr(self, "test_dataset", None), 0),
+        """Build and assign train, validation, and test dataloaders."""
+        split_names = ("train", "valid", "test")
+        datasets = tuple(getattr(self, f"{split_name}_dataset", None) for split_name in split_names)
+        dataloaders, batch_samplers = build_dataloader(
+            self.config.dataloader,
+            datasets=datasets,
+            collate_fn=self.collate_fn,
+            mesh_context=self.mesh,
+            training_config=self.config.training,
+            default_seed=self.default_seed,
         )
-        if all(dataset is None for _, dataset, _ in split_inputs):
-            for split_name, _, _ in split_inputs:
-                setattr(self, f"{split_name}_dataloader", None)
-                setattr(self, f"{split_name}_batch_sampler", None)
-            return
-        if self.config.dataloader is None:
-            raise ValueError("dataloader must define a build target")
-
-        for split_name, dataset, consumed_samples in split_inputs:
-            dataloader, batch_sampler = self._build_split_dataloader(
-                dataset=dataset,
-                consumed_samples=consumed_samples,
-            )
+        for split_name, dataloader, batch_sampler in zip(split_names, dataloaders, batch_samplers):
             setattr(self, f"{split_name}_dataloader", dataloader)
             setattr(self, f"{split_name}_batch_sampler", batch_sampler)
 
-    def _build_split_dataloader(
-            self,
-            *,
-            dataset: Any,
-            consumed_samples: int,
-    ) -> tuple[Any | None, Any | None]:
-        """Build one split DataLoader with sampler and resume inputs."""
-        from ..components.datasets.parallel import (  # pylint: disable=import-outside-toplevel
-            build_dataset_batch_sampler,
-        )
-        from ..components.datasets.contracts import (  # pylint: disable=import-outside-toplevel
-            is_iterable_dataset,
-        )
-        if dataset is None:
-            return None, None
-
-        dataloader_type = getattr(self.config.dataloader, "dataloader_type", "single")
-        if dataloader_type == "external":
-            # Scenario 4 — external: the Dataset target already returned a
-            # complete dataloader. This assembly stage does not create a sampler
-            # or attach the configured collator to another DataLoader.
-            if not hasattr(dataset, "__iter__"):
-                raise ValueError("external dataloader must be iterable")
-            dataloader = dataset
-            return dataloader, None
-
-        micro_batch_size = self.config.training.micro_batch_size
-        random_seed = self.config.training.seed
-        if random_seed is None:
-            random_seed = self.default_seed
-        drop_last = bool(getattr(self.config.dataloader, "drop_last", True))
-        if is_iterable_dataset(dataset):
-            # Online iterable data is already shuffled and DP-sharded by its
-            # upstream stream. StatefulDataLoader owns worker state and forms
-            # one micro-batch directly without an index sampler.
-            dataloader = self.config.dataloader.build(
-                dataset=dataset,
-                collate_fn=self.collate_fn,
-                batch_sampler=None,
-                batch_size=micro_batch_size,
-                seed=random_seed,
-            )
-            return dataloader, None
-        data_rearrange_map = getattr(
-            self.config.dataloader,
-            "data_rearrange_map",
-            None,
-        )
-        data_sharding = bool(getattr(self.config.dataloader, "data_sharding", False))
-        batch_sampler = build_dataset_batch_sampler(
-            total_samples=len(dataset),
-            consumed_samples=consumed_samples,
-            micro_batch_size=micro_batch_size,
-            dp_world_size=self.mesh.dp_size,
-            dp_rank=self.mesh.dp_rank,
-            drop_last=drop_last,
-            data_rearrange_map=data_rearrange_map,
-            sampler_type=dataloader_type,
-            data_sharding=data_sharding,
-        )
-        dataloader = self.config.dataloader.build(
-            dataset=dataset,
-            collate_fn=self.collate_fn,
-            batch_sampler=batch_sampler,
-            seed=random_seed,
-        )
-        return dataloader, batch_sampler
-
     def _compute_train_steps(self) -> None:
-        """Resolve the total number of optimizer steps."""
+        """Resolve epoch length and the effective global optimizer-step limit."""
         training_config = self.config.training
-        train_iters = training_config.train_iters
-        train_samples = training_config.train_samples
-        if train_iters is not None:
-            if (
-                    isinstance(train_iters, bool)
-                    or not isinstance(train_iters, int)
-                    or train_iters <= 0
-            ):
-                raise ValueError("training.train_iters must be a positive integer")
-            self.train_steps = train_iters
-            return
+        if training_config.train_steps is not None and training_config.train_samples is not None:
+            raise ValueError("configure only one of training.train_steps and training.train_samples")
 
-        if train_samples is not None:
-            if (
-                    isinstance(train_samples, bool)
-                    or not isinstance(train_samples, int)
-                    or train_samples <= 0
-            ):
-                raise ValueError("training.train_samples must be a positive integer")
-            global_batch_size = training_config.global_batch_size
-            self.train_steps = train_samples // global_batch_size
-            if self.train_steps <= 0:
-                raise ValueError("training.train_samples must be at least training.global_batch_size")
-            return
+        step_limit = training_config.train_steps
+        if training_config.train_samples is not None:
+            step_limit = training_config.train_samples // training_config.global_batch_size
 
         try:
-            steps_per_epoch = len(self.train_dataloader)
-        except TypeError as exc:
-            raise ValueError(
-                "training.train_iters must be configured when the dataloader "
-                "does not have a finite length"
-            ) from exc
+            self.steps_per_epoch = len(self.train_dataloader) // getattr(self, "num_micro_batches", 1)
+        except TypeError:
+            self.steps_per_epoch = None
+        if self.steps_per_epoch is None:
+            if step_limit is None:
+                raise ValueError("training.train_steps or training.train_samples is required for an unsized dataloader")
+            self.train_steps = step_limit
+        else:
+            epoch_step_limit = self.steps_per_epoch * training_config.num_train_epochs
+            self.train_steps = epoch_step_limit if step_limit is None else min(step_limit, epoch_step_limit)
 
-        if steps_per_epoch <= 0:
-            raise ValueError("train_dataloader must provide at least one step per epoch")
-        if (
-                isinstance(training_config.num_train_epochs, bool)
-                or not isinstance(training_config.num_train_epochs, int)
-                or training_config.num_train_epochs <= 0
-        ):
-            raise ValueError("training.num_train_epochs must be a positive integer")
-
-        self.train_steps = steps_per_epoch * training_config.num_train_epochs
+        if self.train_steps <= 0:
+            raise ValueError("training configuration must produce at least one train step")
 
     def _build_optimizer(self) -> None:
         """Build the configured optimizer with the runtime model context."""
@@ -776,19 +551,17 @@ class BaseTrainer(Stateful, ABC):
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
-            self.micro_batch_token_len,
-            self.micro_batches_token_len,
+            self.current_token_counts,
+            self.step_token_counts,
             device_mesh=self.mesh,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
     def forward_backward_step(
-            self, micro_batch: PreparedBatch | dict[str, torch.Tensor]
+            self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Run forward and backward computation for one micro batch."""
-        if isinstance(micro_batch, PreparedBatch):
-            micro_batch = micro_batch.model_inputs
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -862,7 +635,7 @@ class BaseTrainer(Stateful, ABC):
         total_loss_dict = defaultdict(int)
 
         # token num for fixed_ce_loss in postforward
-        self.micro_batches_token_len = count_loss_token(micro_batches)
+        self.step_token_counts = count_loss_token(micro_batches)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
@@ -871,7 +644,7 @@ class BaseTrainer(Stateful, ABC):
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.micro_batch_token_len = count_loss_token(micro_batch)
+            self.current_token_counts = count_loss_token(micro_batch)
             loss, loss_dict = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
@@ -945,7 +718,8 @@ class BaseTrainer(Stateful, ABC):
                 self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
             )
 
-            for _ in range(self.start_step, self.train_steps):
+            epoch_steps = self.steps_per_epoch or self.train_steps - self.state.global_step
+            for _ in range(self.start_step, epoch_steps):
                 if self.state.global_step >= self.train_steps:
                     break
                 try:

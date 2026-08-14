@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -25,6 +26,8 @@ from hyper_models.components.datasets.llm.online_utils import (
     split_online_dataset_by_dp,
 )
 from hyper_models.components.datasets.parallel import DatasetParallelContext, build_distributed_dataset
+
+logger = logging.getLogger(__name__)
 
 
 def build_online_iterable_dataset(
@@ -37,7 +40,7 @@ def build_online_iterable_dataset(
 
     Args:
         data_path: Optional local JSON/JSONL/Parquet/CSV/Arrow paths.
-        data_config: Streaming options including ``seed``, ``shuffle``,
+        data_config: Streaming options including ``shuffle``,
             ``shuffle_buffer_size``, and ``split_by_data_parallel``.
         parallel_context: Dataset ownership and DP topology.
 
@@ -54,7 +57,7 @@ def build_online_iterable_dataset(
             streaming=True,
         )
         if bool(data_config.get("shuffle", True)):
-            random_seed = int(data_config.get("seed", 42))
+            random_seed = int(data_config.get("random_seed", 42))
             buffer_size = int(data_config.get("shuffle_buffer_size", 10_000))
             if buffer_size <= 0:
                 raise ValueError("Online shuffle_buffer_size must be positive")
@@ -62,8 +65,13 @@ def build_online_iterable_dataset(
                 seed=random_seed,
                 buffer_size=buffer_size,
             )
+            logger.debug("Enabled online iterable shuffle: seed=%d, buffer_size=%d", random_seed, buffer_size)
         if bool(data_config.get("split_by_data_parallel", True)):
             online_dataset = split_online_dataset_by_dp(online_dataset, dataset_context)
+            logger.debug(
+                "Split online iterable Dataset by DP: rank=%d, world_size=%d",
+                dataset_context.dp_rank, dataset_context.dp_world_size,
+            )
         return online_dataset
 
     online_dataset = build_distributed_dataset(

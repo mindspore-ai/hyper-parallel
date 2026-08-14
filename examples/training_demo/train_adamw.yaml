@@ -8,7 +8,7 @@ model:
   force_hf: true
 
 training:
-  train_iters: 2
+  train_steps: 2
   eval_iters: 0
   num_train_epochs: 1
   global_batch_size: 2
@@ -40,22 +40,22 @@ mixed_precision:
 gradient_checkpointing:
   activation_checkpoint: off
 
-data_transform:
-  _target_: hyper_models.components.data.identity_transform.IdentityDataTransform
-
 dataset:
+  data_transform:
+    _target_: hyper_models.components.data.identity_transform.IdentityDataTransform
   _target_: hyper_models.components.data.datasets.DummyDataset
   num_samples: 32
   seq_len: 32
   vocab_size: 1000
   seed: 42
 
-collate_fn:
-  _target_: hyper_models.components.datasets.llm.build_llm_collator
-  packing: false
-
 dataloader:
   _target_: hyper_models.components.data.dataloader.DataLoader
+  collate_fn:
+    _target_: hyper_models.components.datasets.llm.build_llm_collator
+    packing: false
+  get_batch:
+    _target_: hyper_models.components.datasets.llm.build_llm_get_batch
   shuffle: true
   drop_last: true
   use_background_prefetcher: false

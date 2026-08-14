@@ -8,7 +8,8 @@
 
 model:
   _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B"
+  pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B" # tiny-random-LlamaForCausalLMB # 
+  ignore_mismatched_sizes: true
   torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
@@ -19,18 +20,10 @@ model:
 #   use_fast: true
 
 training:
-  train_iters: 10
-  eval_iters: 1
-
+  train_steps: 5
   train_samples: null
   num_train_epochs: 1
-  # global_batch_size: 16
-  # micro_batch_size: 1
-  consumed_train_samples: 0
-  consumed_valid_samples: 0
 
-  # max_steps: 100
-  # num_train_epochs: 1
   global_batch_size: 8
   micro_batch_size: 1
 
@@ -39,7 +32,7 @@ training:
   loss_aggregation: token_weighted
   max_grad_norm: 1.0
   seed: 42
-  enable_full_determinism: false
+  enable_full_determinism: true # false
 
 accelerator:
   tp_size: 1
@@ -108,90 +101,71 @@ compile:
   options: {}
   dynamo_cache_size_limit: 256
 
-model_assets:
-  datasets_type: pretokenized
-  chat_template: null #chatml
-  tokenizer:
-    _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B"
-    local_files_only: true
-    trust_remote_code: true
-
-data_transform:
-  _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
-  data_type: 'pretokenized'
-  text_keys: 'text'
-  max_seq_len: 2048
-
+# Megatron indexed Dataset. data_path is the shared .bin/.idx prefix; the
+# provider builds train/validation/test together from the configured split.
 dataset:
+  model_assets:
+    datasets_type: pretokenized
+    chat_template: null
+    tokenizer:
+
+  data_transform:
+    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    data_type: pretokenized
+    max_seq_len: 4096 #64
+
   _target_: hyper_models.components.datasets.llm.build_llm_dataset
-  data_path: null
+  data_path:
   data_config:
     source_type: offline
-    mock_data: true # false
+    seq_length: 4096 #64
+    split: "1, 0.0, 0.00"  # train, validation, test
 
-    build_on_rank: null
-
-    seed: 1234
-    seq_length: 2048
-    split: '100, 0, 0'
-
-    # blend_per_split
-    train_data_path: null
-    valid_data_path: null
-    test_data_path: null
-    data_cache_path: null
-
+    # Indexed-Dataset reader and sample-index options.
+    mock_data: True # false
     distributed_walk: true
-    mmap_bin_files: true
-    reuse_idx: false
+    is_dataset_from_mr: false # true #
+    simple_blend: 'no' # inter #
     data_lazy_load: true
-
-    tokenizer: null
-    reset_position_ids: false
-    reset_attention_mask: false
-    eod_mask_loss: false
-    create_attention_mask_in_dataloader: true
-
-    dataset_margin: 1.005
-    skip_data_check: false
-
-    is_dataset_from_mr: false
-    simple_blend: 'no'
-
-collate_fn:
-  _target_: hyper_models.components.datasets.llm.build_llm_collator
-  packing: false
+    skip_data_check: true
 
 dataloader:
+  # StatefulDataLoader adapter; sampling order is controlled by dataloader_type,
+  # so do not configure torch DataLoader's shuffle option here.
   _target_: hyper_models.components.datasets.DataLoader
-  # single: sequential/rearranged; cyclic: deterministic shuffled epochs;
-  # external: the dataset target itself must return a complete dataloader.
-  dataloader_type: single
+
+  collate_fn:
+    _target_: hyper_models.components.datasets.llm.build_llm_collator
+    packing: false
+
+  get_batch:
+    _target_: hyper_models.components.datasets.llm.build_llm_get_batch
+
+  # single: sequential/rearranged; cyclic: deterministic shuffled epochs.
+  dataloader_type: single # cyclic # 
+
+  # Defaults.
   data_rearrange_map: null
   data_sharding: false
   drop_last: true
   use_background_prefetcher: false
   num_workers: 0
-  dataloader_pin_memory: false
+  pin_memory: false
   prefetch_factor: null
-
-get_batch:
-  _target_: hyper_models.components.datasets.llm.build_llm_get_batch
 
 optimizer:
   _target_: hyper_models.components.optim.optimizer.Muon
   extra_adamw_name_keywords: []
-  no_decay_params: [bias, norm, ln_]
+  no_decay_params: #[bias, norm, ln_]
   muon_config:
-    muon_lr: 1.0e-3
+    muon_lr: 1.0e-2
     muon_weight_decay: 0.0
     muon_momentum: 0.95
     muon_nesterov: true
     muon_ns_steps: 5
     muon_ns_variant: asym5
   adamw_config:
-    adamw_lr: 1.0e-4
+    adamw_lr: 1.0e-3
     adamw_weight_decay: 0.01
     adamw_betas: [0.9, 0.999]
     adamw_eps: 1.0e-8
@@ -205,7 +179,8 @@ lr_scheduler:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: ./outputs/training_demo/checkpoints
+  checkpoint_dir: '' #./outputs/training_demo/checkpoints
 
 debug:
   check_nan_inf: false
+  check_dataset: false

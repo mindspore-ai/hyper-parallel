@@ -26,31 +26,19 @@ from hyper_models.components.utils.constants import IGNORE_INDEX
 
 
 class LLMCollator:
-    """Stack fixed-length text samples into one model micro-batch.
-
-    Dataset and data transform produce complete fixed-length model samples,
-    and the collator stacks them without changing
-    labels, masks, position IDs, or sample order. VeOmni-style packing and
-    field-specific policies are represented by constructor arguments but are
-    intentionally deferred.
+    """Stack fixed-length text samples without changing fields or sample order.
 
     Args:
-        packing: Reserved switch for VeOmni-style sequence packing.
-        field_specs: Reserved field-specific collation policies.
-        pad_token_id: Reserved padding value for packed input IDs.
-        ignore_index: Reserved label value excluded from packed loss.
-        pad_to_length: Reserved packed sequence length.
+        packing: Reserved packing switch.
+        field_specs: Reserved field-specific policies.
+        pad_token_id: Reserved input padding value.
+        ignore_index: Reserved label padding value.
+        pad_to_length: Reserved padded sequence length.
     """
 
-    def __init__(
-            self,
-            *,
-            packing: bool = False,
-            field_specs: Mapping[str, FieldCollateSpec] | None = None,
-            pad_token_id: int = 0,
-            ignore_index: int = IGNORE_INDEX,
-            pad_to_length: int | None = None,
-    ) -> None:
+    def __init__(self, *, packing: bool = False, field_specs: Mapping[str, FieldCollateSpec] | None = None,
+                 pad_token_id: int = 0, ignore_index: int = IGNORE_INDEX,
+                 pad_to_length: int | None = None) -> None:
         self.packing = packing
         self.field_specs = dict(field_specs) if field_specs is not None else None
         self.pad_token_id = pad_token_id
@@ -77,9 +65,7 @@ class LLMCollator:
         input_ids = self._as_tensor(normalized[input_field], input_field)
         labels = self._as_tensor(normalized["labels"], "labels")
         if input_ids.shape[-1] != labels.shape[-1]:
-            raise ValueError(
-                f"LLM sample {index} input tokens and labels must have the same sequence length"
-            )
+            raise ValueError(f"LLM sample {index} input tokens and labels must have the same sequence length")
 
         normalized[input_field] = input_ids
         normalized["labels"] = labels
@@ -95,8 +81,7 @@ class LLMCollator:
             Stacked fixed-length model inputs.
 
         Raises:
-            NotImplementedError: If packing, padding, or field-specific
-                collation is requested.
+            NotImplementedError: If an unsupported collation option is enabled.
         """
         if self.packing:
             raise NotImplementedError("LLM packing is not implemented yet")
@@ -105,45 +90,28 @@ class LLMCollator:
         if self.field_specs is not None:
             raise NotImplementedError("LLM field-specific collation is not implemented yet")
 
-        normalized = [
-            self._normalize_sample(sample, index)
-            for index, sample in enumerate(samples)
-        ]
-        micro_batch = default_collate(normalized)
-        return micro_batch
+        normalized = [self._normalize_sample(sample, index) for index, sample in enumerate(samples)]
+        return default_collate(normalized)
 
 
-def build_llm_collator(
-        *,
-        packing: bool = False,
-        field_specs: Mapping[str, FieldCollateSpec] | None = None,
-        pad_token_id: int = 0,
-        ignore_index: int = IGNORE_INDEX,
-        pad_to_length: int | None = None,
-) -> LLMCollator:
+def build_llm_collator(*, packing: bool = False, field_specs: Mapping[str, FieldCollateSpec] | None = None,
+                       pad_token_id: int = 0, ignore_index: int = IGNORE_INDEX,
+                       pad_to_length: int | None = None) -> LLMCollator:
     """Build the LLM micro-batch collator.
 
     Args:
-        packing: Reserved switch for VeOmni-style sequence packing.
-        field_specs: Reserved field-specific collation policies.
-        pad_token_id: Reserved padding value for input IDs.
-        ignore_index: Reserved label value excluded from loss computation.
-        pad_to_length: Reserved packed sequence length.
+        packing: Reserved packing switch.
+        field_specs: Reserved field-specific policies.
+        pad_token_id: Reserved input padding value.
+        ignore_index: Reserved label padding value.
+        pad_to_length: Reserved padded sequence length.
 
     Returns:
-        A collator producing one model micro-batch dictionary.
+        The configured micro-batch collator.
     """
-    internal_collator = LLMCollator(
-        packing=packing,
-        field_specs=field_specs,
-        pad_token_id=pad_token_id,
-        ignore_index=ignore_index,
-        pad_to_length=pad_to_length,
-    )
-    collate_fn = build_collate_fn(
-        internal_data_collator=internal_collator,
-    )
-    return collate_fn
+    internal_collator = LLMCollator(packing=packing, field_specs=field_specs, pad_token_id=pad_token_id,
+                                    ignore_index=ignore_index, pad_to_length=pad_to_length)
+    return build_collate_fn(internal_data_collator=internal_collator)
 
 
 __all__ = ["build_llm_collator"]

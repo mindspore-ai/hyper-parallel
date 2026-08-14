@@ -15,9 +15,14 @@
 """Build and cache document, sample, and shuffle indices for GPT sampling."""
 
 import os
+import time
 
 import numpy as np
 from numpy.random import RandomState
+
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
+
+logger = get_dataset_logger(__name__)
 
 
 def build_document_sample_shuffle_indices(
@@ -53,12 +58,15 @@ def build_document_sample_shuffle_indices(
         "shuffle": os.path.join(cache_directory, f"{cache_key}-shuffle_index.npy"),
     }
     if all(os.path.isfile(path) for path in paths.values()):
-        return (
+        logger.debug("Loading indexed sample cache: key=%s, directory=%s", cache_key, cache_directory, enabled=True)
+        cached_indices = (
             np.load(paths["document"], allow_pickle=True, mmap_mode="r"),
             np.load(paths["sample"], allow_pickle=True, mmap_mode="r"),
             np.load(paths["shuffle"], allow_pickle=True, mmap_mode="r"),
         )
+        return cached_indices
 
+    start_time = time.time()
     num_tokens_per_epoch = int(np.sum(sequence_lengths[indices]))
     if num_tokens_per_epoch <= 1:
         raise ValueError("The selected indexed split must contain at least two tokens")
@@ -69,7 +77,6 @@ def build_document_sample_shuffle_indices(
     while accumulated_tokens < requested_tokens:
         num_epochs += 1
         accumulated_tokens += num_tokens_per_epoch
-
     if num_epochs == 1:
         separate_final_epoch = False
         samples_without_final_epoch = 0
@@ -118,6 +125,10 @@ def build_document_sample_shuffle_indices(
     np.save(paths["document"], document_index, allow_pickle=True)
     np.save(paths["sample"], sample_index, allow_pickle=True)
     np.save(paths["shuffle"], shuffle_index, allow_pickle=True)
+    logger.debug(
+        "Built indexed sample cache: split_elements=%d, samples=%d, epochs=%d, elapsed=%.4f seconds, directory=%s",
+        len(indices), num_samples, num_epochs, time.time() - start_time, cache_directory,
+    )
     return document_index, sample_index, shuffle_index
 
 

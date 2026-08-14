@@ -256,3 +256,26 @@ Trainer.train_step()
 | `llm/omni collator.py` | 模态字段合并 | 数据读取 |
 
 所有新数据代码和配置 target 必须使用 `hyper_models.components.datasets` 路径。
+
+## 八、调试日志
+
+Dataset 关键构建日志统一使用 `DEBUG` 级别，默认不输出。通过 Trainer 配置开启时，默认只由 rank 0 输出：
+
+```yaml
+debug:
+  check_dataset: true
+  check_nan_inf: false
+```
+
+需要指定输出 rank 时，可在 Trainer 初始化前使用接口：
+
+```python
+from hyper_models.components.datasets import enable_dataset_debug_logging
+
+enable_dataset_debug_logging()          # rank 0
+enable_dataset_debug_logging(ranks=(1, 3))
+enable_dataset_debug_logging(ranks=None)  # all ranks
+```
+
+该 logger 会覆盖 Dataset、DataLoader、Sampler、Indexed cache 和 Online source 等子模块。日志只记录构建决策、
+类型、数量与缓存状态，不记录样本内容，也不在 `__getitem__` 热路径输出。

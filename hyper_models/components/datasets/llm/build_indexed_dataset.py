@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Any, TypeAlias
@@ -30,13 +31,14 @@ from hyper_models.components.datasets.llm.indexed_pretrain_dataset import (
     GPTFromMRDataset,
     MockGPTDataset,
 )
-from hyper_models.components.datasets.llm.indexed_split_builder import build_dataset_splits
+from hyper_models.components.datasets.llm.indexed_split_builder import IndexedDatasetSplitBuilder
 from hyper_models.components.datasets.parallel import DatasetParallelContext
 
 DataPath: TypeAlias = str | Sequence[str]
 DatasetSplits: TypeAlias = tuple[Any | None, Any | None, Any | None]
 SplitBuilder: TypeAlias = Callable[..., DatasetSplits]
 InstructionSplitBuilder: TypeAlias = Callable[..., Sequence[Any | None]]
+logger = logging.getLogger(__name__)
 
 
 class IndexedPretrainDatasetBuilder:
@@ -69,6 +71,7 @@ class IndexedPretrainDatasetBuilder:
         self.parallel_context = parallel_context or DatasetParallelContext(
             data_index_cache=bool(data_config.get("data_index_cache", False))
         )
+        self.split_builder = IndexedDatasetSplitBuilder(self.parallel_context)
 
     def build(self) -> DatasetSplits:
         """Build train, validation, and test indexed datasets.
@@ -79,7 +82,9 @@ class IndexedPretrainDatasetBuilder:
         # Discover indexed files and add their default blend weights.
         # Mock Datasets generate their samples and do not need filesystem
         # discovery. Real indexed Datasets still require an explicit path.
-        if bool(self.data_config.get("mock_data", False)):
+        mock_data = bool(self.data_config.get("mock_data", False))
+        logger.debug("Building indexed Dataset: mock=%s, data_path=%s", mock_data, self.data_path)
+        if mock_data:
             data_paths = []
         else:
             if self.data_path is None:
@@ -89,15 +94,22 @@ class IndexedPretrainDatasetBuilder:
         # Normalize Dataset options. Sample counts remain separate and are
         # passed directly to the split builder.
         config = self._build_gpt_dataset_config(data_paths)
+        logger.debug(
+            "Indexed Dataset config: simple_blend=%s, lazy=%s, shared_blend=%s, independent_blends=%s",
+            config.simple_blend, config.data_lazy_load, bool(config.blend), bool(config.blend_per_split),
+        )
 
         # Follow the Provider boundary: instruction and pretraining datasets
         # share one public entry but own separate construction pipelines.
         dataset_splits = self._build_dataset_splits(config)
+        split_types = tuple(type(split).__name__ if split is not None else None for split in dataset_splits)
+        logger.debug("Built indexed Dataset splits=%s", split_types)
         return dataset_splits
 
     def _build_dataset_splits(self, config: GPTDatasetConfig) -> DatasetSplits:
         """Select the instruction or indexed-pretraining Dataset pipeline."""
         if bool(self.data_config.get("is_instruction_dataset", False)):
+            logger.debug("Selecting instruction Dataset pipeline")
             dataset_splits = self._build_instruction_dataset_splits(config)
             return dataset_splits
 
@@ -107,17 +119,16 @@ class IndexedPretrainDatasetBuilder:
     def _build_pretrain_dataset_splits(self, config: GPTDatasetConfig) -> DatasetSplits:
         """Build GPT pretraining splits through the selected Dataset and blend types."""
         # Select GPTDataset / MockGPTDataset / GPTFromMRDataset.
-        # logger.info(f'Iolan, config {config}')
         dataset_type = self._select_dataset_type(config)
 
         # Select the standard or simple blended Dataset builder.
         split_builder = self._select_split_builder(config)
+        logger.debug("Selected indexed Dataset: type=%s, split_mode=%s", dataset_type.__name__, config.simple_blend)
 
         # Build train, validation, and test datasets.
         datasets = split_builder(
             dataset_type=dataset_type,
             train_valid_test_num_samples=self.train_valid_test_num_samples,
-            parallel_context=self.parallel_context,
             config=config,
         )
         return datasets
@@ -175,27 +186,23 @@ class IndexedPretrainDatasetBuilder:
             return GPTFromMRDataset
         return GPTDataset
 
-    @staticmethod
-    def _select_split_builder(config: GPTDatasetConfig) -> SplitBuilder:
+    def _select_split_builder(self, config: GPTDatasetConfig) -> SplitBuilder:
         """
         Select the standard or simple train/valid/test builder.
             "no": BlendedDataset
             "inter/intra": SimpleBlendedDataset
         """
         if config.simple_blend == "no":
-            split_builder = partial(build_dataset_splits, blend_mode="no")
+            split_builder = partial(self.split_builder.build, blend_mode="no")
             return split_builder
 
         if not config.is_dataset_from_mr:
-            raise ValueError(
-                "simple_blend values other than 'no' require is_dataset_from_mr=True"
-            )
+            raise ValueError("simple_blend values other than 'no' require is_dataset_from_mr=True")
         if config.simple_blend not in {"inter", "intra"}:
-            raise ValueError(
-                "simple_blend must be one of 'no', 'inter', or 'intra'; "
-                f"got {config.simple_blend!r}"
-            )
-        split_builder = partial(build_dataset_splits, blend_mode=config.simple_blend)
+            raise ValueError("simple_blend must be one of 'no', 'inter', or 'intra'; "
+                             f"got {config.simple_blend!r}"
+                             )
+        split_builder = partial(self.split_builder.build, blend_mode=config.simple_blend)
         return split_builder
 
 

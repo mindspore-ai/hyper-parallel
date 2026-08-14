@@ -22,8 +22,10 @@ from functools import partial
 from typing import Any
 
 from hyper_parallel.platform import get_platform
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 
 platform = get_platform()
+logger = get_dataset_logger(__name__)
 
 
 def _always_build() -> bool:
@@ -95,6 +97,7 @@ def create_dataset_parallel_context(
     distributed_enabled = device_mesh is not None and world_size > 1
     if not distributed_enabled:
         parallel_context = DatasetParallelContext(data_index_cache=data_index_cache)
+        logger.debug("Created standalone Dataset context: data_index_cache=%s", data_index_cache)
         return parallel_context
 
     build_on_rank = partial(_is_tp_rank_zero, mesh_context)
@@ -107,6 +110,10 @@ def create_dataset_parallel_context(
         data_index_cache=data_index_cache,
         dp_rank=int(getattr(mesh_context, "dp_rank", 0)),
         dp_world_size=int(getattr(mesh_context, "dp_size", 1)),
+    )
+    logger.debug(
+        "Created distributed Dataset context: dp_rank=%d, dp_world_size=%d, data_index_cache=%s, shared_storage=%s",
+        parallel_context.dp_rank, parallel_context.dp_world_size, data_index_cache, shared_storage,
     )
     return parallel_context
 
@@ -126,6 +133,11 @@ def build_distributed_dataset(
 
     Returns:
         The Dataset on owning ranks, otherwise ``None``.
+
+    Note:
+        With shared storage, the cache-builder rank (rank 0) calls ``dataset_factory`` first. Missing
+        document, sample, and shuffle indices are computed and saved before the barrier. Other Dataset
+        ranks wait at the barrier, then call ``dataset_factory`` and memory-map the completed cache files.
     """
     if not parallel_context.distributed_enabled:
         dataset = dataset_factory()
@@ -134,6 +146,13 @@ def build_distributed_dataset(
     dataset = None
     builds_cache_first = parallel_context.build_cache_on_rank()
     should_build = parallel_context.data_index_cache or parallel_context.build_on_rank()
+
+    logger.debug(
+        "Distributed Dataset synchronization: should_build=%s, builds_cache_first=%s",
+        should_build, builds_cache_first,
+        enabled=should_build,
+    )
+
     if builds_cache_first and should_build:
         dataset = dataset_factory()
 

@@ -22,45 +22,40 @@ from typing import Any
 from hyper_parallel.platform import get_platform
 from hyper_models.components.datasets.parallel.batch_context import BatchParallelContext
 
-
 platform = get_platform()
 
 
 class DistributedBatchTransport:
-    """Move and distribute one source batch within its TP group.
-
-    Pipeline field routing is intentionally reserved. In particular, Omni
-    inputs must eventually route raw modality fields to encoder ranks, encoded
-    features to the first LLM stage, and loss fields to the last LLM stage.
-    Broadcasting the complete batch across PP would obscure that contract and
-    waste bandwidth.
-    """
+    """Read allowed fields on the source rank, move their tensors to the target device, and broadcast them in TP."""
 
     def __init__(
-        self,
-        *,
-        parallel_context: BatchParallelContext,
-        device: Any,
-        field_names: Collection[str] | None = None,
+            self,
+            *,
+            parallel_context: BatchParallelContext,
+            device: Any,
+            field_names: Collection[str] | None = None,
     ) -> None:
         """Store runtime topology and destination device."""
         if parallel_context.tp_size <= 0:
             raise ValueError("tp_size must be positive")
+
         if not 0 <= parallel_context.tp_rank < parallel_context.tp_size:
             raise ValueError(
                 f"tp_rank must be in [0, {parallel_context.tp_size}), "
                 f"got {parallel_context.tp_rank}"
             )
+
         if parallel_context.tp_size > 1 and parallel_context.tp_group is None:
             raise ValueError("TP batch transport requires a TP process group")
+
         self.parallel_context = parallel_context
         self.device = device
         self.field_names = frozenset(field_names) if field_names is not None else None
 
     def read_source_batch(
-        self,
-        data_iterator: Any,
-        external_batch: Mapping[str, Any] | None = None,
+            self,
+            data_iterator: Any,
+            external_batch: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, bool]:
         """Read only on the configured TP/PP source rank.
 
@@ -73,27 +68,33 @@ class DistributedBatchTransport:
         """
         if not self.parallel_context.reads_data():
             return None, False
+
         if external_batch is not None:
             if not isinstance(external_batch, Mapping):
                 raise ValueError("external_batch must be a mapping")
+
             source_batch = dict(external_batch)
             return source_batch, False
+
         if data_iterator is None:
             raise ValueError("data_iterator is required on the batch source rank")
+
         try:
             raw_batch = next(data_iterator)
         except StopIteration:
             return None, True
+
         if not isinstance(raw_batch, Mapping):
             raise ValueError("DataLoader must yield a mapping batch")
+
         source_batch = dict(raw_batch)
         return source_batch, False
 
     def broadcast_batch(
-        self,
-        source_batch: Mapping[str, Any] | None,
-        *,
-        source_exhausted: bool,
+            self,
+            source_batch: Mapping[str, Any] | None,
+            *,
+            source_exhausted: bool,
     ) -> dict[str, Any]:
         """Move source tensors to device and broadcast them across TP.
 
@@ -110,8 +111,10 @@ class DistributedBatchTransport:
         if self.parallel_context.tp_size <= 1:
             if source_exhausted:
                 raise StopIteration
+
             if source_batch is None:
                 raise ValueError("source batch is required when TP is disabled")
+
             device_batch = self._move_batch_to_device(source_batch)
             return device_batch
 
@@ -124,19 +127,21 @@ class DistributedBatchTransport:
         )
         if distributed_exhausted:
             raise StopIteration
+
         if distributed_batch is None:
             raise ValueError("batch source rank did not provide a batch")
+
         device_batch = distributed_batch
         return device_batch
 
     def _broadcast_over_group(
-        self,
-        source_batch: Mapping[str, Any] | None,
-        *,
-        source_exhausted: bool,
-        group: Any,
-        group_size: int,
-        group_rank: int,
+            self,
+            source_batch: Mapping[str, Any] | None,
+            *,
+            source_exhausted: bool,
+            group: Any,
+            group_size: int,
+            group_rank: int,
     ) -> tuple[dict[str, Any] | None, bool]:
         """Broadcast a dynamically shaped batch from group rank zero."""
         owns_source = group_rank == 0
@@ -146,14 +151,11 @@ class DistributedBatchTransport:
             owns_source=owns_source,
         )
         gathered_payloads = [None] * group_size
-        platform.all_gather_object(
-            gathered_payloads,
-            payload,
-            group=group,
-        )
+        platform.all_gather_object(gathered_payloads, payload, group=group, )
         source_payload = gathered_payloads[0]
         if not isinstance(source_payload, dict):
             raise ValueError("batch source rank did not provide batch metadata")
+
         if source_payload.get("exhausted", False):
             return None, True
 
@@ -166,17 +168,19 @@ class DistributedBatchTransport:
         return device_batch, False
 
     def _build_source_payload(
-        self,
-        source_batch: Mapping[str, Any] | None,
-        source_exhausted: bool,
-        *,
-        owns_source: bool,
+            self,
+            source_batch: Mapping[str, Any] | None,
+            source_exhausted: bool,
+            *,
+            owns_source: bool,
     ) -> dict[str, Any] | None:
         """Describe source tensors and carry non-tensor values."""
         if not owns_source:
             return None
+
         if source_exhausted:
             return {"exhausted": True}
+
         if source_batch is None:
             raise ValueError("source batch cannot be None before TP broadcast")
 
@@ -185,6 +189,7 @@ class DistributedBatchTransport:
         for field_name, field_value in source_batch.items():
             if self.field_names is not None and field_name not in self.field_names:
                 continue
+
             if platform.is_tensor(field_value):
                 tensor_schema[field_name] = {
                     "shape": tuple(field_value.shape),
@@ -200,12 +205,8 @@ class DistributedBatchTransport:
         return payload
 
     def _materialize_and_broadcast(
-        self,
-        source_batch: Mapping[str, Any] | None,
-        source_payload: Mapping[str, Any],
-        *,
-        owns_source: bool,
-        group: Any,
+            self, source_batch: Mapping[str, Any] | None, source_payload: Mapping[str, Any],
+            *, owns_source: bool, group: Any,
     ) -> dict[str, Any]:
         """Allocate peer tensors and execute process-group broadcasts."""
         object_values = source_payload.get("object_values", {})
@@ -215,22 +216,11 @@ class DistributedBatchTransport:
             if owns_source:
                 if source_batch is None:
                     raise ValueError("source batch disappeared during broadcast")
-                field_tensor = platform.move_to_device(
-                    source_batch[field_name],
-                    self.device,
-                    non_blocking=True,
-                )
+
+                field_tensor = platform.move_to_device(source_batch[field_name], self.device, non_blocking=True)
             else:
-                field_tensor = platform.empty(
-                    field_schema["shape"],
-                    dtype=field_schema["dtype"],
-                    device=self.device,
-                )
-            platform.broadcast(
-                field_tensor,
-                group=group,
-                group_src=0,
-            )
+                field_tensor = platform.empty(field_schema["shape"], dtype=field_schema["dtype"], device=self.device)
+            platform.broadcast(field_tensor, group=group, group_src=0)
             device_batch[field_name] = field_tensor
         return device_batch
 
@@ -239,11 +229,7 @@ class DistributedBatchTransport:
         device_batch = {}
         for field_name, field_value in batch.items():
             if platform.is_tensor(field_value):
-                device_batch[field_name] = platform.move_to_device(
-                    field_value,
-                    self.device,
-                    non_blocking=True,
-                )
+                device_batch[field_name] = platform.move_to_device(field_value, self.device, non_blocking=True)
             else:
                 device_batch[field_name] = field_value
         return device_batch
