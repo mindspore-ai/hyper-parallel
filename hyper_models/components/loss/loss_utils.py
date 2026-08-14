@@ -68,8 +68,8 @@ def mean_global_loss(
     # FIXME: VeOmni version -> HyperModels version
     """Calculate the global mean loss using explicit mesh information.
 
-    FSDP divides gradients by its shard-group size, so each micro-batch loss is
-    multiplied by ``device_mesh.dp_size`` after token-weighted normalization.
+    FSDP divides gradients over its flattened DP+CP domain, so each local loss
+    is weighted by valid tokens and multiplied by ``dp_size * cp_size``.
 
     Args:
         losses: A loss tensor or mapping of named loss tensors.
@@ -112,7 +112,15 @@ def mean_global_loss(
         )
 
         if all_reduced_len != 0:
-            cur_loss = cur_loss * cur_token_len / all_reduced_len * device_mesh.dp_size
+            local_weighted_loss = cur_loss * cur_token_len
+            backward_loss = local_weighted_loss / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
+            global_weighted_loss = all_reduce(
+                local_weighted_loss.detach().item(),
+                op="sum",
+                group=dp_cp_group,
+            )
+            global_mean = cur_loss.new_tensor(global_weighted_loss / all_reduced_len)
+            cur_loss = backward_loss + global_mean - backward_loss.detach()
         else:
             if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
                 raise ValueError(

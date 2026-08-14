@@ -34,6 +34,7 @@ class _FakeMeshContext:
     def __init__(self, group: Any) -> None:
         self.dp_cp_mesh = _FakeSubmesh(group)
         self.dp_size = 2
+        self.cp_size = 2
         self.sequence_parallel = False
 
 
@@ -46,14 +47,25 @@ def test_mean_global_loss_reduces_tokens_over_dp_cp_only() -> None:
 
     with patch(
         "hyper_models.components.loss.loss_utils.all_reduce",
-        return_value=512,
+        side_effect=[512, 384],
     ) as mock_all_reduce:
+        local_loss = torch.tensor(6.0, requires_grad=True)
         result = mean_global_loss(
-            torch.tensor(6.0),
+            local_loss,
             micro_tokens,
             step_tokens,
             device_mesh=mesh,
         )
 
-    mock_all_reduce.assert_called_once_with(256, op="sum", group=dp_cp_group)
+    assert mock_all_reduce.call_args_list == [
+        ((256,), {"op": "sum", "group": dp_cp_group}),
+        ((192.0,), {"op": "sum", "group": dp_cp_group}),
+    ], (
+        f"Unexpected DP+CP reductions: got={mock_all_reduce.call_args_list}"
+    )
     assert torch.allclose(result["foundation_loss"], torch.tensor(0.75))
+    result["foundation_loss"].backward()
+    assert torch.allclose(local_loss.grad, torch.tensor(0.25)), (
+        f"DP*CP gradient scale mismatch: expected={torch.tensor(0.25)}, "
+        f"got={local_loss.grad}"
+    )
