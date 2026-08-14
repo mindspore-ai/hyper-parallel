@@ -93,7 +93,16 @@ def _normalize_ground_truth(answer_source: Any, index: int) -> str:
     if not ground_truth:
         raise ValueError(f"Ground truth at sample {index} must not be empty")
     return ground_truth
-def _select_answer_source(record: Mapping[str, Any], answer_column: Optional[str], index: int) -> Any:
+def _select_answer_source(
+    record: Mapping[str, Any],
+    answer_column: Optional[str],
+    index: int,
+    *,
+    answer_column_is_explicit: bool,
+) -> Any:
+    """Select an explicit answer column before inferred answer sources."""
+    if answer_column_is_explicit and answer_column is not None:
+        return record[answer_column]
     reward_model = _to_builtin(record.get("reward_model"))
     if isinstance(reward_model, Mapping) and reward_model.get("ground_truth") is not None:
         return reward_model["ground_truth"]
@@ -130,6 +139,7 @@ class PromptDataset:
         self._answer_column = _pick_column(
             columns, answer_column, _ANSWER_COLUMN_CANDIDATES, "answer", False
         )
+        self._answer_column_is_explicit = answer_column is not None
         if self._answer_column is None and "reward_model" not in columns:
             raise ValueError(
                 "Prompt parquet is missing required columns: no ground-truth source "
@@ -180,7 +190,12 @@ class PromptDataset:
         """Return one formatted and tokenized prompt sample."""
         record = self._records[index]
         source_prompt, prompt = _normalize_prompt(record[self._prompt_column], index)
-        answer_source = _select_answer_source(record, self._answer_column, index)
+        answer_source = _select_answer_source(
+            record,
+            self._answer_column,
+            index,
+            answer_column_is_explicit=self._answer_column_is_explicit,
+        )
         input_ids, attention_mask = self._tokenize(prompt, index)
         return {
             "sample_index": index,
