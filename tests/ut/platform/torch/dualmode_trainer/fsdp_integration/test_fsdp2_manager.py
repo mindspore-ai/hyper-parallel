@@ -214,7 +214,11 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
 
     monkeypatch.setattr(fsdp2_module, "fully_shard", _fake_fully_shard)
 
-    result = manager.parallelize(model, tp_grad_info)
+    result = manager.parallelize(
+        model,
+        tp_grad_info,
+        compile_hooks_enabled=True,
+    )
 
     assert result is model
     assert [call[0] for call in fully_shard_calls] == [
@@ -223,8 +227,10 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
     ]
     for layer, kwargs in fully_shard_calls[:-1]:
         assert kwargs["reshard_after_forward"] is True
+        assert kwargs["compile_hooks_enabled"] is True
         assert set(kwargs["tp_grad_infos"]) == set(layer.parameters())
     assert fully_shard_calls[-1][1]["reshard_after_forward"] is False
+    assert fully_shard_calls[-1][1]["compile_hooks_enabled"] is True
     assert set(fully_shard_calls[-1][1]["tp_grad_infos"]) == {
         model.model.embed_tokens.weight,
         model.lm_head.weight,
@@ -277,3 +283,11 @@ def test_parallelize_resolves_replicate_parameter_fqns(
     assert fully_shard_calls[-1][1]["replicate_params"] == {
         model.model.embed_tokens.weight,
     }
+
+
+def test_parallelize_rejects_non_bool_compile_hook_flag() -> None:
+    """Reject ambiguous values before any FSDP units are created."""
+    manager = _make_manager()
+
+    with pytest.raises(ValueError, match="compile_hooks_enabled must be a bool"):
+        manager.parallelize(_FakeCausalLM(), compile_hooks_enabled=1)

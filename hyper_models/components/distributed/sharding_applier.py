@@ -56,6 +56,9 @@ from hyper_models.components.distributed.injection import (
 from hyper_models.components.distributed.precompiled_boundary import (
     PrecompiledBoundary,
 )
+from hyper_models.components.distributed.tp_collective_lowering import (
+    create_tp_collective_lowerer,
+)
 from hyper_models.components.distributed.sharding.apply import (
     _get_attr_by_path,
     _local_params_context,
@@ -716,12 +719,22 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
     mesh_dim_names = plan.mesh_dim_names
     cp_mesh = _get_cp_submesh(mesh, mesh_dim_names)
     tp_mesh = _get_tp_submesh(mesh, mesh_dim_names)
+    boundary_op_lowerer = (
+        None
+        if validate_mode
+        else create_tp_collective_lowerer(mesh, mesh_dim_names)
+    )
     for module_fqn, spec in sorted(
             plan.modules.items(), key=lambda kv: -kv[0].count(".")):
         if not spec.is_boundary:
             continue
         module = _resolve_module(model, module_fqn)
-        boundary = PrecompiledBoundary(spec, mesh, mesh_dim_names)
+        boundary = PrecompiledBoundary(
+            spec,
+            mesh,
+            mesh_dim_names,
+            op_lowerer=boundary_op_lowerer,
+        )
         _bind_input_indices(boundary, module)
         # 注入纪律：声明注入必须显式 region_dispatch；无注入声明 True 是冗余
         _require_region_dispatch(spec, source=f"boundary {module_fqn!r}")

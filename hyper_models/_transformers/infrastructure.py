@@ -27,6 +27,7 @@ import torch
 from torch import nn
 
 from hyper_models._transformers.checkpoint_loader import CheckpointManager, LoadReport
+from hyper_models.components.distributed.compile import apply_compile
 from hyper_models.components.distributed.fsdp2 import FSDP2Manager, _instantiate_fsdp2
 from hyper_models.components.distributed.pipelining import _instantiate_pipeline
 from hyper_models.components.distributed.sharding_applier import apply_sharding_plan
@@ -35,6 +36,7 @@ from hyper_models.components.distributed.activation_checkpointing import (
     _apply_activation_checkpointing as _apply_activation_checkpointing_impl,
 )
 from hyper_models.trainer.config import (
+    CompileConfig,
     entries_to_module_replacements,
     entries_to_plan_overrides,
 )
@@ -71,7 +73,7 @@ def _apply_activation_checkpointing(
     activation_checkpoint: Optional[str],
     enable_compile: bool = False,
 ) -> nn.Module:
-    """Compatibility wrapper for the distributed activation checkpoint helper."""
+    """Forward activation checkpointing to the distributed implementation."""
     return _apply_activation_checkpointing_impl(
         model,
         activation_checkpoint,
@@ -188,14 +190,23 @@ def _plan_and_apply_sharding(
     return model, tp_grad_info
 
 
-def _apply_fsdp2(model: nn.Module, fsdp2_manager, tp_grad_info) -> nn.Module:
-    """Apply FSDP2 after planning and compile have finalized the model graph."""
+def _apply_fsdp2(
+    model: nn.Module,
+    fsdp2_manager,
+    tp_grad_info,
+    compile_for_execution: bool = False,
+) -> nn.Module:
+    """Apply FSDP2 and keep its hooks outside Dynamo during execution compile."""
     if fsdp2_manager is None:
         return model
     if not isinstance(fsdp2_manager, FSDP2Manager):
         logger.warning("fsdp2_manager is not an FSDP2Manager instance")
         return model
-    model = fsdp2_manager.parallelize(model, tp_grad_info=tp_grad_info)
+    model = fsdp2_manager.parallelize(
+        model,
+        tp_grad_info=tp_grad_info,
+        compile_hooks_enabled=compile_for_execution,
+    )
     logger.info("FSDP2 wrap applied")
     return model
 
@@ -540,23 +551,28 @@ def apply_model_infrastructure(
     validate_placement: bool = False,
     **kwargs,
 ) -> nn.Module:
-    """Apply model infrastructure (sharding, PEFT, FSDP2, weight loading).
+    """Apply model infrastructure (sharding, recompute, FSDP2, and compile).
 
-    Following design doc 01 §8.3 canonical order:
-        PP split → PEFT → QAT/FP8 → freeze → plan → apply_sharding_plan
-        → activation checkpoint → torch.compile → FSDP2 wrap
-        → to_empty + load_base_model
-
-    D-01'': CP K/V all-gather is injected at apply_sharding_plan time;
-           no extra CP hooks are registered here.
-
-    Stub — applies sharding plan if sharding_planner is provided.
+    The execution order is: parallel layout -> recompute wrappers -> FSDP2 ->
+    materialization/loading -> per-layer compile. Placement validation keeps
+    the DTensor placement path and skips FSDP2 and compile.
     """
     distributed_setup = kwargs.get("distributed_setup")
 
+    if isinstance(compile_config, dict):
+        compile_config = CompileConfig(enabled=True, **compile_config)
+    if compile_config is not None and not isinstance(compile_config, CompileConfig):
+        raise TypeError("compile_config must be a CompileConfig, mapping, or None")
+    compile_for_execution = bool(
+        not validate_placement
+        and compile_config is not None
+        and compile_config.enabled
+    )
+    if validate_placement and compile_config is not None and compile_config.enabled:
+        logger.info("Skipping decoder-layer compile during placement validation")
+
     # Step 3: PP split (if autopipeline)
     if autopipeline is not None:
-        # build() is in-place; model stays the original nn.Module
         autopipeline.build(model)
 
     # Step 4: PEFT injection (before sharding)
@@ -585,23 +601,27 @@ def apply_model_infrastructure(
         validate_placement,
     )
 
-    # Step 9: activation checkpointing. The whole-layer wrapper must enclose
-    # TP/EP transformations and remain inside the FSDP boundary.
+    # Step 9: activation checkpointing remains inside the FSDP boundary.
     if activation_checkpoint not in (None, "off"):
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
-            enable_compile=compile_config is not None,
+            enable_compile=compile_for_execution,
         )
 
-    # Step 10: torch.compile
-    if compile_config is not None:
-        model = torch.compile(model, **compile_config)
+    # Step 10: FSDP2 is execution-only; validation retains DTensor placement.
+    if validate_placement:
+        if fsdp2_manager is not None:
+            logger.info("Skipping FSDP2 wrap during placement validation")
+    else:
+        model = _apply_fsdp2(
+            model,
+            fsdp2_manager,
+            tp_grad_info,
+            compile_for_execution=compile_for_execution,
+        )
 
-    # Steps 11-12: FSDP2 wrap, then materialize/move model storage.
-    model = _apply_fsdp2(model, fsdp2_manager, tp_grad_info)
-
-    # init model weights (either from base model or from model's own init)
+    # Steps 11-12: materialize model storage, then load or initialize weights.
     model = _move_model_to_device(model, is_meta_device, device)
     if is_meta_device:
         if load_base_model:
@@ -609,5 +629,9 @@ def apply_model_infrastructure(
             _finalize_model_loading(model, load_report, strict=True)
         else:
             _initialize_model_weights(model)
+
+    # Step 13: compile only the execution model, after FSDP and loading.
+    if compile_for_execution:
+        model = apply_compile(model, compile_config)
 
     return model

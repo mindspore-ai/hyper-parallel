@@ -84,6 +84,43 @@ class ActivationCheckpointConfig:
 
 
 @dataclass
+class CompileConfig:
+    """Decoder-layer ``torch.compile`` options exposed by the Trainer."""
+
+    enabled: bool = False
+    mode: str = "default"
+    fullgraph: bool = False
+    dynamic: bool = False
+    backend: Optional[str] = None
+    options: Optional[dict[str, Any]] = None
+    dynamo_cache_size_limit: int = 256
+
+    def __post_init__(self) -> None:
+        """Validate values that the YAML resolver cannot express precisely."""
+        for name in ("enabled", "fullgraph", "dynamic"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"compile.{name} must be a bool")
+        if not isinstance(self.mode, str) or not self.mode.strip():
+            raise ValueError("compile.mode must be a non-empty string")
+        if self.backend is not None and (
+            not isinstance(self.backend, str) or not self.backend.strip()
+        ):
+            raise ValueError("compile.backend must be None or a non-empty string")
+        if self.options is not None and not isinstance(self.options, dict):
+            raise TypeError("compile.options must be a mapping or None")
+        if self.options and self.mode != "default":
+            raise ValueError(
+                "compile.options cannot be combined with a non-default compile.mode"
+            )
+        if (
+            isinstance(self.dynamo_cache_size_limit, bool)
+            or not isinstance(self.dynamo_cache_size_limit, int)
+            or self.dynamo_cache_size_limit <= 0
+        ):
+            raise ValueError("compile.dynamo_cache_size_limit must be a positive integer")
+
+
+@dataclass
 class DebugConfig:
     """Debug parameters exposed by the initial YAML schema."""
 
@@ -455,7 +492,7 @@ def _import_module_type(path: str) -> type:
 def _target_replacement_factory(target: Target[Any]):
     """Bind a YAML Target's static args to the replacement factory protocol."""
 
-    if not getattr(target._target_, "_hp_module_replacement", False):
+    if not getattr(target._target_, "_hp_module_replacement", False):  # pylint: disable=protected-access
         raise TypeError(
             "plan_overrides replace_module target must be decorated with "
             "@module_replacement"
@@ -611,6 +648,7 @@ class TrainerConfig:
     activation_checkpoint: ActivationCheckpointConfig = field(
         default_factory=ActivationCheckpointConfig
     )
+    compile: CompileConfig = field(default_factory=CompileConfig)
 
     # data
     model_assets: ModelAssetsConfig = field(default_factory=ModelAssetsConfig)
@@ -626,6 +664,11 @@ class TrainerConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
+
+    def __post_init__(self) -> None:
+        """Validate compile combinations that span multiple config sections."""
+        if self.compile.enabled and self.accelerator.pp_size > 1:
+            raise ValueError("compile is not supported together with pipeline parallelism")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the resolved trainer configuration for logging."""
@@ -650,6 +693,7 @@ def save_configs(config: TrainerConfig, output_dir: str) -> None:
 __all__ = [
     "AcceleratorConfig",
     "ActivationCheckpointConfig",
+    "CompileConfig",
     "DebugConfig",
     "FSDP2Config",
     "MixedPrecisionConfig",

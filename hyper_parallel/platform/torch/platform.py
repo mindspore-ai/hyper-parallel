@@ -14,7 +14,7 @@
 # ============================================================================
 """Torch platform api"""
 from datetime import timedelta
-from typing import Optional, Any, Union
+from typing import Optional, Any, Callable, Union
 import dataclasses
 from collections import OrderedDict
 
@@ -401,8 +401,10 @@ else:
 
 def _ensure_contiguous(x):
     """Return a contiguous copy of *x* if not already contiguous."""
+    if torch.compiler.is_compiling():
+        return x.contiguous()
     if not x.is_contiguous() or x.storage_offset() != 0:
-        x = x.contiguous()
+        return x.contiguous()
     return x
 
 
@@ -1476,6 +1478,11 @@ class TorchPlatform(Platform):
         return torch.utils.checkpoint.checkpoint
 
     @staticmethod
+    def is_compiling() -> bool:
+        """Return whether execution is currently captured by ``torch.compile``."""
+        return torch.compiler.is_compiling()
+
+    @staticmethod
     def checkpoint_wrapper(module, **checkpoint_kwargs):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.checkpoint_wrapper import ckpt_wrapper
@@ -1514,6 +1521,15 @@ class TorchPlatform(Platform):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.sac import ignore_sac_ops
         ignore_sac_ops(ops)
+
+    @staticmethod
+    def create_native_selective_checkpoint_contexts(policy_fn: Callable) -> Any:
+        """Create Torch-native selective-checkpoint contexts for compile."""
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.native_compile import (
+            create_native_selective_checkpoint_contexts,
+        )
+        return create_native_selective_checkpoint_contexts(policy_fn)
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):

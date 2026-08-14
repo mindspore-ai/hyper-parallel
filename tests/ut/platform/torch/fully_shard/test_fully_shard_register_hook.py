@@ -470,6 +470,7 @@ class TestTorchSchedulerSetup(unittest.TestCase):
     """Unit tests for Torch scheduler setup helpers and hook registration."""
 
     def _make_scheduler(self, mesh=None):
+        """Build a minimally initialized scheduler for hook tests."""
         scheduler = object.__new__(TorchHSDPSchedulerV2)
         scheduler.modules = (nn.Linear(2, 2),)
         scheduler.mesh = mesh
@@ -482,7 +483,29 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         scheduler.platform = MagicMock()
         scheduler.device = torch.device("cpu")
         scheduler.tp_grad_infos = None
+        scheduler.compile_hooks_enabled = False
         return scheduler
+
+    def test_scheduler_init_stores_per_instance_compile_hook_flag(self):
+        """Scheduler construction should not depend on class-level hook state."""
+        with patch.object(TorchHSDPSchedulerV2, "_init_platform"), patch.object(
+            TorchHSDPSchedulerV2, "_new_cell_state"
+        ), patch.object(TorchHSDPSchedulerV2, "_register_hooks"):
+            scheduler = TorchHSDPSchedulerV2(
+                cell=nn.Linear(2, 2),
+                mesh=MagicMock(),
+                reshard_after_forward=True,
+                shard_placement_fn=None,
+                mp_policy=MagicMock(),
+                offload_policy=MagicMock(),
+                ignored_params=set(),
+                replicate_params=set(),
+                device=torch.device("cpu"),
+                comm_fusion=False,
+                compile_hooks_enabled=True,
+            )
+
+        self.assertIs(scheduler.compile_hooks_enabled, True)
 
     @patch("hyper_parallel.platform.torch.fully_shard.scheduler.TorchHSDPStateV2")
     def test_new_cell_state_forwards_scheduler_configuration(self, mock_state_ctor):
@@ -548,8 +571,12 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         scheduler._fsdp_group_post_pending = set()
         scheduler._register_forward_module_hook = MagicMock()
         scheduler._register_forward_backward_hooks()
-        module_a.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
-        module_b.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
+        module_a.register_forward_pre_hook.assert_called_once_with(
+            scheduler._grouped_forward_pre_hook, with_kwargs=True
+        )
+        module_b.register_forward_pre_hook.assert_called_once_with(
+            scheduler._grouped_forward_pre_hook, with_kwargs=True
+        )
         self.assertEqual(scheduler._register_forward_module_hook.call_count, 2)
 
 

@@ -99,6 +99,15 @@ mixed_precision:
 activation_checkpoint:
   mode: off # off, full, selective
 
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
 model_assets:
   datasets_type: pretokenized
   chat_template: null #chatml

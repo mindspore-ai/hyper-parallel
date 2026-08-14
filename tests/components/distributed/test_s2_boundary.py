@@ -36,6 +36,10 @@ from hyper_models.components.distributed.sharding_config import (
     TP,
 )
 from hyper_models.components.distributed.tp_grad import build_tp_grad_info
+from hyper_models.components.distributed.tp_collective_lowering import (
+    TPExecutionOp,
+    create_tp_collective_lowerer,
+)
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import DeviceMesh
@@ -53,6 +57,39 @@ from hyper_parallel.core.dtensor.placement_types import (
 
 class _FakeMesh:
     mesh_dim_names = ("tp", "cp")
+
+
+class _FakeTPMesh:
+    """Minimal TP mesh used to verify production lowering without distributed init."""
+
+    mesh_dim_names = ("tp",)
+    rank_list = (0, 1)
+
+    def __init__(self):
+        """Create a distinct fake process group."""
+        self.group = object()
+
+    def get_group(self):
+        """Return the fake process group."""
+        return self.group
+
+    @staticmethod
+    def size():
+        """Return the fake TP group size."""
+        return 2
+
+    @staticmethod
+    def get_local_rank():
+        """Return the fake rank inside the TP group."""
+        return 1
+
+
+def _set_fake_group_ranks(monkeypatch, ranks=(0, 1)):
+    monkeypatch.setattr(
+        "hyper_models.components.distributed.tp_collective_lowering."
+        "platform.get_process_group_ranks",
+        lambda _group: list(ranks),
+    )
 
 
 def _attention_spec():
@@ -85,6 +122,129 @@ class TestCompileInputPlan:
         b = PrecompiledBoundary(spec, _FakeMesh(), ("tp",))
         assert len(b.in_plan) == 1
         assert b.in_plan[0].collective_type == "identity"
+
+    @pytest.mark.parametrize(
+        ("src", "dst", "kind", "tensor_dim"),
+        [
+            (Shard(1), Replicate(), "all_gather", 1),
+            (Partial(), Replicate(), "all_reduce", None),
+            (Partial(), Shard(1), "reduce_scatter", 1),
+        ],
+    )
+    def test_execution_lowers_tp_transition(self, monkeypatch, src, dst, kind, tensor_dim):
+        """Production plans lower common TP transitions before the first forward."""
+        _set_fake_group_ranks(monkeypatch)
+        spec = ModuleShardingSpec(
+            in_src={"x": {TP: src}},
+            in_dst={"x": {TP: dst}},
+        )
+        boundary = PrecompiledBoundary(
+            spec,
+            _FakeTPMesh(),
+            ("tp",),
+            op_lowerer=create_tp_collective_lowerer(
+                _FakeTPMesh(), ("tp",), collective_backend="hccl"
+            ),
+        )
+
+        execution_op = boundary.in_plan[0].execution_op
+        assert isinstance(execution_op, TPExecutionOp)
+        assert execution_op.kind == kind
+        assert execution_op.tensor_dim == tensor_dim
+
+    def test_gloo_reduce_scatter_uses_differentiable_fallback(self, monkeypatch):
+        """Gloo lacks reduce-scatter; use all-reduce followed by local chunking."""
+        _set_fake_group_ranks(monkeypatch)
+        spec = ModuleShardingSpec(
+            in_src={"x": {TP: Partial()}},
+            in_dst={"x": {TP: Shard(1)}},
+        )
+        boundary = PrecompiledBoundary(
+            spec,
+            _FakeTPMesh(),
+            ("tp",),
+            op_lowerer=create_tp_collective_lowerer(
+                _FakeTPMesh(), ("tp",), collective_backend="gloo"
+            ),
+        )
+
+        execution_op = boundary.in_plan[0].execution_op
+        assert isinstance(execution_op, TPExecutionOp)
+        assert execution_op.kind == "all_reduce_shard"
+
+    def test_validate_plan_does_not_lower_tp_transition(self):
+        """Placement validation keeps the DTensor redistribution path."""
+        spec = ModuleShardingSpec(
+            in_src={"x": {TP: Shard(1)}},
+            in_dst={"x": {TP: Replicate()}},
+        )
+        boundary = PrecompiledBoundary(spec, _FakeTPMesh(), ("tp",))
+
+        assert boundary.in_plan[0].execution_op is None
+
+    def test_replicate_to_shard_is_not_lowered(self, monkeypatch):
+        """Local slicing stays generic until its backward all-gather is explicit."""
+        _set_fake_group_ranks(monkeypatch)
+        spec = ModuleShardingSpec(
+            in_src={"x": {TP: Replicate()}},
+            in_dst={"x": {TP: Shard(1)}},
+        )
+        boundary = PrecompiledBoundary(
+            spec,
+            _FakeTPMesh(),
+            ("tp",),
+            op_lowerer=create_tp_collective_lowerer(
+                _FakeTPMesh(), ("tp",), collective_backend="hccl"
+            ),
+        )
+
+        assert boundary.in_plan[0].execution_op is None
+
+    def test_non_tp_difference_is_not_lowered(self, monkeypatch):
+        """A boundary that also changes CP remains on the generic redistribution path."""
+        _set_fake_group_ranks(monkeypatch)
+
+        class _FakeTPAndCPMesh(_FakeTPMesh):
+            mesh_dim_names = ("tp", "cp")
+
+            def __getitem__(self, name):
+                """Return the fake submesh for every requested axis."""
+                del name
+                return self
+
+        mesh = _FakeTPAndCPMesh()
+        spec = ModuleShardingSpec(
+            in_src={"x": {TP: Shard(1), CP: Shard(1)}},
+            in_dst={"x": {TP: Replicate(), CP: Replicate()}},
+        )
+        boundary = PrecompiledBoundary(
+            spec,
+            mesh,
+            ("tp", "cp"),
+            op_lowerer=create_tp_collective_lowerer(
+                mesh, ("tp", "cp"), collective_backend="hccl"
+            ),
+        )
+
+        assert boundary.in_plan[0].execution_op is None
+
+    def test_rank_order_mismatch_is_not_lowered(self, monkeypatch):
+        """Explicit collectives require process-group order to match TP placement order."""
+        _set_fake_group_ranks(monkeypatch, ranks=(1, 0))
+        spec = ModuleShardingSpec(
+            in_src={"x": {TP: Shard(1)}},
+            in_dst={"x": {TP: Replicate()}},
+        )
+        boundary = PrecompiledBoundary(
+            spec,
+            _FakeTPMesh(),
+            ("tp",),
+            op_lowerer=create_tp_collective_lowerer(
+                _FakeTPMesh(), ("tp",), collective_backend="hccl"
+            ),
+        )
+
+        assert boundary.in_plan[0].execution_op is None
 
 
 class TestCompileOutputPlan:
@@ -238,6 +398,39 @@ class TestRedistributeIO:
             (), {"x": torch.tensor([1.0])}, as_dtensor=True
         )
         assert isinstance(kwargs["x"], DTensor)
+
+    def test_execution_tp_path_does_not_construct_dtensor(self, monkeypatch):
+        """Explicit TP execution communicates directly on the local tensor."""
+        _set_fake_group_ranks(monkeypatch)
+        mesh = _FakeTPMesh()
+        spec = ModuleShardingSpec(
+            in_src={"x": {TP: Shard(1)}},
+            in_dst={"x": {TP: Replicate()}},
+        )
+        boundary = PrecompiledBoundary(
+            spec,
+            mesh,
+            ("tp",),
+            op_lowerer=create_tp_collective_lowerer(
+                mesh, ("tp",), collective_backend="hccl"
+            ),
+        )
+        tensor = torch.randn(2, 3)
+        gathered = torch.randn(2, 6)
+        monkeypatch.setattr(
+            "hyper_models.components.distributed.tp_collective_lowering."
+            "platform.differentiable_all_gather_concat",
+            lambda *_args, **_kwargs: gathered,
+        )
+        monkeypatch.setattr(
+            DTensor,
+            "from_local",
+            lambda *_args, **_kwargs: pytest.fail("execution TP path constructed a DTensor"),
+        )
+
+        _, kwargs = boundary.redistribute_inputs((), {"x": tensor})
+
+        assert kwargs["x"] is gathered
 
 
 # ==========================================================================

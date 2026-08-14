@@ -432,8 +432,7 @@ def test_activation_checkpoint_is_after_sharding_and_before_fsdp() -> None:
 
     with (
         patch(
-            "hyper_models.components.distributed.sharding_applier."
-            "apply_sharding_plan",
+            "hyper_models._transformers.infrastructure.apply_sharding_plan",
             side_effect=_apply_sharding,
         ),
         patch(

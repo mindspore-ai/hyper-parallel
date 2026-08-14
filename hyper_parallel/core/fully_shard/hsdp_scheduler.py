@@ -22,7 +22,6 @@ from hyper_parallel.core.fully_shard.utils import CommFusionPolicy, TPShardMetaI
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FSDPSchedulerState,
     get_managed_modules_parameters,
-    get_hsdp_state
 )
 from hyper_parallel.tools.logging import get_logger
 
@@ -39,6 +38,9 @@ class HSDPSchedulerContext:
         self.is_last_backward: bool = True
         # flag to identify "root_module"
         self.root_module = None
+        # Compile tracing may enter the root more than once; initialize shared
+        # parameter state only on the first real forward.
+        self.lazy_init_done: bool = False
         # all_hsdp_schedulers (for one module tree structure), deduplicated at
         # registration time because ``fully_shard`` may be given a module list
         # whose modules share one scheduler.
@@ -66,11 +68,14 @@ class HSDPSchedulerV2:
         comm_fusion,
         comm_fusion_zero_copy=False,
         tp_grad_infos: Optional[Mapping[platform.Parameter, TPShardMetaInfo]] = None,
+        compile_hooks_enabled: bool = False,
     ):
         """init hsdp scheduler.
 
         Args:
             cell: A single platform.Module or tuple of platform.Module to manage as one FSDP unit.
+            compile_hooks_enabled: Whether platform scheduler hooks should stay
+                outside compiled regions.
         """
         self.modules = (cell,) if isinstance(cell, platform.Module) else tuple(cell)
         self.cell = self.modules[0]
@@ -90,6 +95,12 @@ class HSDPSchedulerV2:
         self._backup_forward_fetch = None
         # Flag to identify root module.
         self._is_root = False
+        if not isinstance(compile_hooks_enabled, bool):
+            raise ValueError(
+                "compile_hooks_enabled must be a bool, got "
+                f"{type(compile_hooks_enabled).__name__}"
+            )
+        self.compile_hooks_enabled = compile_hooks_enabled
         # module and its all sub-modules share one same 'HSDPSchedulerContext'
         self.scheduler_ctx = HSDPSchedulerContext()
         # When ``fully_shard`` is given multiple root modules, forward pre/post hooks coordinate
@@ -195,8 +206,10 @@ class HSDPSchedulerV2:
                     self.scheduler_ctx.all_hsdp_schedulers.append(submod_scheduler)
 
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
-        self._init_params_fqn()
-        self._lazy_init_all_states()
+        if self._is_root and not self.scheduler_ctx.lazy_init_done:
+            self._init_params_fqn()
+            self._lazy_init_all_states()
+            self.scheduler_ctx.lazy_init_done = True
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             args = self.platform.apply_to_tensors(cast_fn, args)
@@ -226,7 +239,7 @@ class HSDPSchedulerV2:
     def _init_params_fqn(self):  # pylint: disable=W0212
         if not self._is_root or self.scheduler_ctx.root_module is None:
             return
-        if self.scheduler_ctx._param_fqn_initialized:
+        if self.scheduler_ctx._param_fqn_initialized:  # pylint: disable=protected-access
             return
         # Build a map from original (sharded) parameter tensor to its HSDPParam wrapper.
         param_to_hsdp_param = {}
@@ -251,7 +264,7 @@ class HSDPSchedulerV2:
             hsdp_param = param_to_hsdp_param.get(parameter)
             if hsdp_param is not None:
                 hsdp_param._param_fqn = param_name  # pylint: disable=W0212
-        self.scheduler_ctx._param_fqn_initialized = True
+        self.scheduler_ctx._param_fqn_initialized = True  # pylint: disable=protected-access
 
     # pylint: disable=W0613, R1710
     def _hsdp_forward_hook(self, cell, inputs, outputs):

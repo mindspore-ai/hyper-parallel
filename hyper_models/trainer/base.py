@@ -370,6 +370,7 @@ class BaseTrainer(Stateful, ABC):
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
             activation_checkpoint=self.config.activation_checkpoint.mode,
+            compile_config=self.config.compile,
         )
         self.model_config = self.model.config
         model_parts = getattr(self.model, "parts", None)
@@ -499,7 +500,10 @@ class BaseTrainer(Stateful, ABC):
             train_samples = train_iters * global_batch_size
 
         eval_iters = (
-                                 train_iters // training_config.eval_iters + 1) * training_config.eval_iters if training_config.eval_iters else 0
+            (train_iters // training_config.eval_iters + 1) * training_config.eval_iters
+            if training_config.eval_iters
+            else 0
+        )
         test_iters = training_config.eval_iters
         sizes = (train_samples, eval_iters * global_batch_size, test_iters * global_batch_size)
         logger.info("Dataset target sizes: train=%d, validation=%d, test=%d", *sizes, )
@@ -507,7 +511,7 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_dataset_parallel_context(self) -> Any:
         """Assemble indexed Dataset rank and cache policy from Trainer state."""
-        from ..components.datasets.parallel import (
+        from ..components.datasets.parallel import (  # pylint: disable=import-outside-toplevel
             create_dataset_parallel_context,
         )
         data_config = getattr(self.config.dataset, "data_config", {})
@@ -574,8 +578,12 @@ class BaseTrainer(Stateful, ABC):
             consumed_samples: int,
     ) -> tuple[Any | None, Any | None]:
         """Build one split DataLoader with sampler and resume inputs."""
-        from ..components.datasets.parallel import build_dataset_batch_sampler
-        from ..components.datasets.contracts import is_iterable_dataset
+        from ..components.datasets.parallel import (  # pylint: disable=import-outside-toplevel
+            build_dataset_batch_sampler,
+        )
+        from ..components.datasets.contracts import (  # pylint: disable=import-outside-toplevel
+            is_iterable_dataset,
+        )
         if dataset is None:
             return None, None
 

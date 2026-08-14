@@ -133,7 +133,8 @@ class HSDPModule:
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
                   comm_fusion, comm_fusion_zero_copy: Optional[bool] = None,
-                  tp_grad_infos: Optional[Mapping[ParameterClass, TPShardMetaInfo]] = None):
+                  tp_grad_infos: Optional[Mapping[ParameterClass, TPShardMetaInfo]] = None,
+                  compile_hooks_enabled: bool = False):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -161,6 +162,7 @@ class HSDPModule:
                                               comm_fusion,
                                               resolved_comm_fusion_zero_copy,
                                               tp_grad_infos=tp_grad_infos,
+                                              compile_hooks_enabled=compile_hooks_enabled,
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
@@ -693,6 +695,7 @@ def fully_shard(
         comm_fusion: bool = False,
         comm_fusion_zero_copy: Optional[bool] = None,
         tp_grad_infos: Optional[Mapping[ParameterClass, TPShardMetaInfo]] = None,
+        compile_hooks_enabled: bool = False,
 ) -> Union[ModuleClass, List[ModuleClass]]:
 
     """
@@ -766,11 +769,21 @@ def fully_shard(
             Source TP/EP mesh and placements for the plain-parameter dual mode.
             This interface is currently supported by the Torch backend only.
 
+        compile_hooks_enabled (bool, default=False):
+            Whether the Torch scheduler should wrap FSDP forward hooks with
+            ``torch._dynamo.disable`` so they remain outside compiled regions.
+
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
     """
     platform_type = platform.platform_type
     _validate_module_for_fully_shard(module, platform_type)
+
+    if not isinstance(compile_hooks_enabled, bool):
+        raise ValueError(
+            "compile_hooks_enabled must be a bool, got "
+            f"{type(compile_hooks_enabled).__name__}"
+        )
 
     if tp_grad_infos is not None and platform_type != PlatformType.PYTORCH:
         raise NotImplementedError("tp_grad_infos is currently supported only on the Torch backend")
@@ -820,6 +833,7 @@ def fully_shard(
         comm_fusion,
         comm_fusion_zero_copy,
         tp_grad_infos=tp_grad_infos,
+        compile_hooks_enabled=compile_hooks_enabled,
     )
     # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
     if len(modules) > 1:
