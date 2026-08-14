@@ -17,16 +17,25 @@ data:
   pin_memory: true
 
 rollout:
-  engine: hyper
+  engine: vllm
   num_return_sequences: 6
   max_new_tokens: 300
   temperature: 1.0
   top_p: 1.0
   top_k: 0
   vllm:
+    deployment: colocated
+    port: 8100
+    model_implementation: hyper
     tensor_parallel_size: 1
     dtype: bfloat16
     trust_remote_code: true
+    enforce_eager: true
+    enable_prefix_caching: false
+    gpu_memory_utilization: 0.35
+    request_concurrency: 1
+    max_model_len: 640
+    max_num_seqs: 6
 
 agentic:
   environment: gsm8k
@@ -71,6 +80,7 @@ train:
     pp: 1
     reshard_after_forward: true
     comm_fusion: true
+    cpu_offload: true
   mixed_precision:
     enabled: true
     param_dtype: bfloat16

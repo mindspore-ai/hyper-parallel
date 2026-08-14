@@ -19,20 +19,26 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../../.." && pwd)
 workspace_root=$(cd -- "${repo_root}/.." && pwd)
+default_model_root=/home/mwl/ckpt/Qwen3.5-0.8B
+default_data_root=/home/mwl/dataset/gsm8k/main
+[[ -d "${default_model_root}" ]] || default_model_root=${workspace_root}/models/Qwen3.5-0.8B-Base
+[[ -d "${default_data_root}" ]] || default_data_root=${workspace_root}/data/gsm8k
 
 action=${1:-}
+[[ "${action}" == "qwen3_5_0_8b_gsm8k_vllm_production" ]] && action=grpo-production
 image=${HYPER_VLLM_IMAGE:-hyper-parallel/unified-e2-dev:v0.22.1rc1}
-model_root=${HYPER_VLLM_MODEL_ROOT:-${workspace_root}/models/Qwen3.5-0.8B-Base}
-data_root=${HYPER_VLLM_DATA_ROOT:-${workspace_root}/data/gsm8k}
-result_root=${HYPER_VLLM_RESULT_ROOT:-${repo_root}/.rollout-results}
+model_root=${HYPER_VLLM_MODEL_ROOT:-${default_model_root}}
+data_root=${HYPER_VLLM_DATA_ROOT:-${default_data_root}}
+result_root=${HYPER_VLLM_RESULT_ROOT:-${repo_root}/.rollout-results/qwen35-grpo}
 network_mode=${HYPER_VLLM_NETWORK_MODE:-bridge}
 timeout_seconds=${HYPER_VLLM_TIMEOUT_SECONDS:-600}
 model_implementation=${HYPER_VLLM_MODEL_IMPLEMENTATION:-hyper}
 detached=${HYPER_VLLM_DETACHED:-false}
 container_name=${HYPER_VLLM_CONTAINER_NAME:-hyper-vllm-${model_implementation}-${action}-$$}
 log_suffix=${HYPER_VLLM_LOG_SUFFIX:-}
-hccl_if_base_port=${HCCL_IF_BASE_PORT:-}
-hccl_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE:-}
+hccl_if_base_port=${HCCL_IF_BASE_PORT:-62000}
+hccl_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE:-62000-62100}
+requested_visible_devices=${HYPER_VLLM_VISIBLE_DEVICES:-}
 production_canary_marker=${result_root}/.production-canary-${model_implementation}
 production_profile_identity=
 
@@ -54,7 +60,7 @@ compute_production_profile_identity() {
     image_id=$(docker image inspect --format '{{.Id}}' "${image}")
     file_hashes=$(
         while IFS= read -r -d '' file; do
-            sha256sum "${repo_root}/${file}"
+            [[ -f "${repo_root}/${file}" ]] && sha256sum "${repo_root}/${file}"
         done < <(git -C "${repo_root}" ls-files --cached --others --exclude-standard -z)
         sha256sum \
             "${model_root}/config.json" \
@@ -86,10 +92,15 @@ compute_production_profile_identity() {
     printf 'HYPER_VLLM_LOG_SUFFIX contains unsupported characters: %s\n' "${log_suffix}" >&2
     exit 1
 }
+[[ -z "${requested_visible_devices}" || "${requested_visible_devices}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+    printf 'HYPER_VLLM_VISIBLE_DEVICES must be a comma-separated NPU list, got: %s\n' \
+        "${requested_visible_devices}" >&2
+    exit 1
+}
 require_directory "${model_root}"
 require_directory "${data_root}"
 
-visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-0}
+visible_devices=${requested_visible_devices:-0}
 tensor_parallel_size=1
 test_script=tests/torch/rl/vllm/validate_qwen3_5_rollout.py
 output_file=/results/${model_implementation}-tp1.json
@@ -98,7 +109,7 @@ grpo_config=hyper_parallel/rl/examples/configs/local_qwen3_5_0_8b_gsm8k_vllm_smo
 case "${action}" in
     rollout-tp1) ;;
     rollout-tp2)
-        visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-0,1}
+        visible_devices=${requested_visible_devices:-0,1}
         tensor_parallel_size=2
         output_file=/results/${model_implementation}-tp2.json
         ;;
@@ -118,20 +129,23 @@ case "${action}" in
         fi
         ;;
     grpo-smoke)
-        visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-0,1}
+        visible_devices=${requested_visible_devices:-0,1}
         test_script=hyper_parallel/rl/examples/train_rl.py
         ;;
     grpo-colocated-dp-smoke)
-        visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-0,1}
+        visible_devices=${requested_visible_devices:-0,1}
         test_script=hyper_parallel/rl/examples/train_rl.py
         nproc_per_node=2
         grpo_config=hyper_parallel/rl/examples/configs/local_qwen3_5_0_8b_gsm8k_vllm_colocated_dp_smoke.yaml
         ;;
     grpo-m3-select)
         test_script=hyper_parallel/rl/examples/scripts/select_gsm8k_m3.py
+        if [[ -z "${HYPER_VLLM_TIMEOUT_SECONDS:-}" ]]; then
+            timeout_seconds=3600
+        fi
         ;;
     grpo-m3-2step|grpo-m3-soak)
-        visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-0,1}
+        visible_devices=${requested_visible_devices:-0,1}
         test_script=hyper_parallel/rl/examples/train_rl.py
         nproc_per_node=2
         grpo_config=hyper_parallel/rl/examples/configs/local_qwen3_5_0_8b_gsm8k_vllm_m3.yaml
@@ -160,7 +174,7 @@ case "${action}" in
                 exit 1
             }
         fi
-        visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-0,1}
+        visible_devices=${requested_visible_devices:-0,1}
         test_script=hyper_parallel/rl/examples/train_rl.py
         nproc_per_node=2
         grpo_config=hyper_parallel/rl/examples/configs/qwen3_5_0_8b_gsm8k_vllm_production.yaml
@@ -176,6 +190,20 @@ case "${action}" in
         ;;
 esac
 mkdir -p "${result_root}"
+if [[ "${action}" == "grpo-m3-2step" || "${action}" == "grpo-m3-soak" ]]; then
+    m3_train_path=${result_root}/gsm8k-m3/train.parquet
+    if [[ ! -f "${m3_train_path}" ]]; then
+        printf 'M3 training parquet is missing: %s\n' "${m3_train_path}" >&2
+        printf 'Generating it first with grpo-m3-select. This can take several minutes.\n' >&2
+        HYPER_VLLM_TIMEOUT_SECONDS="${HYPER_VLLM_TIMEOUT_SECONDS:-3600}" \
+            "${BASH_SOURCE[0]}" grpo-m3-select
+    fi
+    [[ -f "${m3_train_path}" ]] || {
+        printf 'M3 training parquet is still missing after grpo-m3-select: %s\n' \
+            "${m3_train_path}" >&2
+        exit 1
+    }
+fi
 
 common_test_args=(
     --model /models/Qwen3.5-0.8B-Base
@@ -217,7 +245,7 @@ elif [[ "${action}" == "grpo-smoke" || "${action}" == "grpo-colocated-dp-smoke" 
         rollout_visible_device=${visible_devices#*,}
         rollout_visible_device=${rollout_visible_device%%,*}
         [[ "${rollout_visible_device}" != "${visible_devices}" && -n "${rollout_visible_device}" ]] || {
-            printf 'grpo-smoke requires at least two ASCEND_RT_VISIBLE_DEVICES\n' >&2
+            printf 'grpo-smoke requires at least two visible devices; set HYPER_VLLM_VISIBLE_DEVICES=0,1\n' >&2
             exit 1
         }
         common_test_args+=(
@@ -260,9 +288,17 @@ fi
 if [[ -n "${hccl_socket_port_range}" ]]; then
     docker_hccl_args+=(-e "HCCL_NPU_SOCKET_PORT_RANGE=${hccl_socket_port_range}")
 fi
+docker_wandb_args=()
+if [[ -f "${HOME}/.netrc" ]]; then
+    docker_wandb_args+=(-v "${HOME}/.netrc:/root/.netrc:ro")
+fi
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+    docker_wandb_args+=(-e "WANDB_API_KEY=${WANDB_API_KEY}")
+fi
 
 docker run "${docker_lifecycle_args[@]}" --privileged --shm-size=12g --network="${network_mode}" \
     "${docker_hccl_args[@]}" \
+    "${docker_wandb_args[@]}" \
     -e "ASCEND_RT_VISIBLE_DEVICES=${visible_devices}" \
     -e HYPER_PARALLEL_PLATFORM=torch \
     -e HYPER_VLLM_NUMERICAL_PROFILE=functional \
@@ -304,7 +340,7 @@ docker run "${docker_lifecycle_args[@]}" --privileged --shm-size=12g --network="
                 "${source_dir}/'"${test_script}"'" '"${common_test_args[*]}"' 2>&1 | tee "${log_file}"
             status="${PIPESTATUS[0]}"
             if [[ "${HYPER_RUN_ACTION}" == "grpo-production-canary" && "${status}" -eq 0 ]]; then
-                printf '%s\n' "${HYPER_PRODUCTION_PROFILE_IDENTITY}" \
+                printf "%s\n" "${HYPER_PRODUCTION_PROFILE_IDENTITY}" \
                     > "/results/.production-canary-${HYPER_RUN_IMPLEMENTATION}"
             fi
             exit "${status}"

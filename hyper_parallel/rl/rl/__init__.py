@@ -13,7 +13,5 @@
 # limitations under the License.
 # ============================================================================
 """Public cross-module contracts for the Hyper-RL runtime."""
-
-from rl.contracts import ExperienceBatch, Message, PromptRecord, Trajectory, Turn
-
+from rl.dataset.contracts import ExperienceBatch, Message, PromptRecord, Trajectory, Turn
 __all__ = ["ExperienceBatch", "Message", "PromptRecord", "Trajectory", "Turn"]

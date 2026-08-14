@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Reusable advantage estimators hidden behind public algorithm Recipes."""
-
+"""MOLT-style advantage registry and built-in target estimators."""
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
-
-from rl.algorithm.base import TargetOutput
+from typing import Any, Callable, Optional, Protocol
 from hyper_parallel import get_platform
-
+from rl.registry import Registry
 platform = get_platform()
-
-
+AdvantageEstimatorBuilder = Callable[..., "AdvantageEstimator"]
+@dataclass(frozen=True)
+class TargetOutput:
+    """Token-aligned training targets prepared before optimizer execution."""
+    advantages: Any
+    returns: Optional[Any] = None
 class AdvantageEstimator(Protocol):
-    """Internal target-estimation seam selected by a complete Recipe."""
-
+    """Target-estimation component selected by a complete algorithm recipe."""
     def estimate(
         self,
         rewards: Any,
@@ -34,8 +34,15 @@ class AdvantageEstimator(Protocol):
         values: Optional[Any] = None,
     ) -> TargetOutput:
         """Estimate token-aligned advantages and optional returns."""
-
-
+ADVANTAGE_ESTIMATORS = Registry[AdvantageEstimatorBuilder]("advantage estimator")
+def register_advantage_estimator(
+    name: str,
+) -> Callable[[AdvantageEstimatorBuilder], AdvantageEstimatorBuilder]:
+    """Register an advantage estimator constructor under a stable name."""
+    return ADVANTAGE_ESTIMATORS.register(name)
+def get_advantage_estimator(name: str, **kwargs: Any) -> AdvantageEstimator:
+    """Instantiate a registered advantage estimator."""
+    return ADVANTAGE_ESTIMATORS.build(name, **kwargs)
 def compute_group_advantages(
     rewards: Any,
     epsilon: float = 1.0e-6,
@@ -46,14 +53,11 @@ def compute_group_advantages(
     mean = rewards.mean(dim=-1, keepdim=True)
     std = rewards.std(dim=-1, keepdim=True, unbiased=True)
     return (rewards - mean) / (std + epsilon)
-
-
+@register_advantage_estimator("grpo")
 @dataclass(frozen=True)
 class GroupRelativeAdvantageEstimator:
     """Compute per-group reward normalization and broadcast it to action tokens."""
-
     epsilon: float = 1.0e-6
-
     def estimate(
         self,
         rewards: Any,
@@ -85,17 +89,14 @@ class GroupRelativeAdvantageEstimator:
         return TargetOutput(
             advantages=token_advantages * action_mask.to(token_advantages.dtype),
         )
-
-
+@register_advantage_estimator("gae")
 @dataclass(frozen=True)
 class GAEAdvantageEstimator:
     """Generalized advantage estimation over trainable action positions only."""
-
     gamma: float = 1.0
     gae_lambda: float = 0.95
     normalize: bool = True
     epsilon: float = 1.0e-6
-
     def estimate(
         self,
         rewards: Any,

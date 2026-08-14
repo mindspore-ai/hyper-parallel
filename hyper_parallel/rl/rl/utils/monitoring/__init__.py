@@ -13,8 +13,29 @@
 # limitations under the License.
 # ============================================================================
 """Monitoring fan-out and built-in backends for Hyper-RL."""
-
 from rl.utils.monitoring.config import sanitize_config
+from rl.utils.monitoring.metrics import (
+    ActorMetricAccumulator,
+    ActorMicroBatchMetrics,
+    ActorUpdateMetrics,
+    CriticUpdateMetrics,
+    build_training_metrics,
+    enforce_learning_gate,
+    select_round_robin_samples,
+    summarize_rollout,
+    summarize_training_diagnostics,
+)
 from rl.utils.monitoring.tracker import TrainingTracker
-
-__all__ = ["TrainingTracker", "sanitize_config"]
+__all__ = [
+    "ActorMetricAccumulator",
+    "ActorMicroBatchMetrics",
+    "ActorUpdateMetrics",
+    "CriticUpdateMetrics",
+    "TrainingTracker",
+    "build_training_metrics",
+    "enforce_learning_gate",
+    "sanitize_config",
+    "select_round_robin_samples",
+    "summarize_rollout",
+    "summarize_training_diagnostics",
+]

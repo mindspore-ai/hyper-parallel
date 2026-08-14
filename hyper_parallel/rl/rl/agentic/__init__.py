@@ -13,15 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """Agent episode control flow and environment contracts."""
-
 from rl.agentic.base import Action, Environment, Observation, Transition
 from rl.agentic.gsm8k import GSM8KEnvironment
 from rl.agentic.program_runner import AgentProgram, ProgramAgentRunner
 from rl.agentic.registry import ENVIRONMENTS
 from rl.agentic.runner import AgentRunner
 from rl.agentic.session import AgentSession
-from rl.algorithm.reward import compute_rule_reward, compute_rule_rewards, extract_answer
-
+from rl.algorithm.reward import compute_rule_reward, extract_answer
 __all__ = [
     "Action",
     "AgentRunner",
@@ -34,6 +32,5 @@ __all__ = [
     "ProgramAgentRunner",
     "Transition",
     "compute_rule_reward",
-    "compute_rule_rewards",
     "extract_answer",
 ]

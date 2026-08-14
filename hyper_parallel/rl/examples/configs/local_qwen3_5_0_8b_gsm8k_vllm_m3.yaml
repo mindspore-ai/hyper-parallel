@@ -34,7 +34,7 @@ rollout:
     trust_remote_code: false
     enforce_eager: true
     enable_prefix_caching: false
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.35
     kv_cache_memory_bytes: 1073741824
     request_concurrency: 1
     max_model_len: 384
@@ -78,10 +78,10 @@ train:
   init_device: meta
   comm_backend: hccl
   learning_gate:
-    enabled: true
-    min_gradient_norm: 1.0e-8
-    require_mixed_rewards: true
-    require_fingerprint_change: true
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+    require_fingerprint_change: false
   accelerator:
     dp_replicate: 1
     dp_shard: 2

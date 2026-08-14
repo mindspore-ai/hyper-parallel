@@ -12,8 +12,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Explicit policy publication and rollout weight synchronization contracts."""
-
-from rl.roles.weight_sync.policy import PolicySnapshot
-
-__all__ = ["PolicySnapshot"]
+"""Policy Actor-to-rollout weight synchronization."""
+from rl.roles.weight_sync.sync import (
+    ActorRolloutWeightSync,
+    POLICY_FINGERPRINT_ALGORITHM,
+    PolicySnapshot,
+    VLLMWeightSyncClientMixin,
+    aggregate_policy_fingerprint,
+    canonical_policy_weight_name,
+    is_policy_fingerprint_weight,
+    policy_fingerprint_header,
+    policy_tensor_fingerprint,
+    policy_weight_fingerprint,
+    synchronized_call,
+    synchronize_error,
+    verify_policy_fingerprints,
+)
+from rl.roles.weight_sync.transfer import (
+    CPUStateDictRefitter,
+    CPUWeightTransfer,
+    HCCLWeightRefitter,
+    HCCLWeightTransfer,
+    HYPER_MODEL_IMPLEMENTATION,
+    HYPER_QWEN3_5_ARCHITECTURE,
+    NATIVE_MODEL_IMPLEMENTATION,
+    NATIVE_QWEN3_5_ARCHITECTURE,
+    NPUIPCWeightRefitter,
+    NPUIPCWeightTransfer,
+    SUPPORTED_MODEL_IMPLEMENTATIONS,
+    VLLMWeightRefitter,
+    WeightTransfer,
+    architecture_for_implementation,
+    build_weight_transfer,
+    map_actor_state_dict,
+    map_policy_state_dict,
+    normalize_model_implementation,
+)
+__all__ = [
+    "ActorRolloutWeightSync",
+    "CPUStateDictRefitter",
+    "CPUWeightTransfer",
+    "HCCLWeightRefitter",
+    "HCCLWeightTransfer",
+    "HYPER_MODEL_IMPLEMENTATION",
+    "HYPER_QWEN3_5_ARCHITECTURE",
+    "NATIVE_MODEL_IMPLEMENTATION",
+    "NATIVE_QWEN3_5_ARCHITECTURE",
+    "NPUIPCWeightRefitter",
+    "NPUIPCWeightTransfer",
+    "PolicySnapshot",
+    "SUPPORTED_MODEL_IMPLEMENTATIONS",
+    "VLLMWeightRefitter",
+    "VLLMWeightSyncClientMixin",
+    "WeightTransfer",
+    "aggregate_policy_fingerprint",
+    "architecture_for_implementation",
+    "build_weight_transfer",
+    "canonical_policy_weight_name",
+    "is_policy_fingerprint_weight",
+    "map_actor_state_dict",
+    "map_policy_state_dict",
+    "normalize_model_implementation",
+    "policy_fingerprint_header",
+    "policy_tensor_fingerprint",
+    "policy_weight_fingerprint",
+    "synchronized_call",
+    "synchronize_error",
+    "verify_policy_fingerprints",
+]
