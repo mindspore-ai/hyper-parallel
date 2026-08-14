@@ -31,14 +31,14 @@ _ONLINE_DATASET_BUILDERS: dict[str, Callable[..., Any]] = {
 
 def build_online_dataset(
         *,
-        data_path: str | Sequence[str],
         data_config: Mapping[str, Any],
+        data_path: str | Sequence[str] | None = None,
         parallel_context: DatasetParallelContext | None = None,
 ) -> Any:
     """Select an online Dataset interface that produces RawSamples.
 
     Args:
-        data_path: Online source path or ordered paths.
+        data_path: Optional local source path or ordered paths.
         data_config: Online options containing ``dataset_type``.
         parallel_context: Optional Dataset rank ownership policy.
 

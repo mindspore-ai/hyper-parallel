@@ -17,7 +17,7 @@
 
 This module is both importable and runnable as a CLI entry point::
 
-    python -m hyper_models.components.data.tools.huggingface_offline \\
+    python -m hyper_models.components.datasets.tools.huggingface_offline \\
         --dataset Salesforce/wikitext \\
         --dataset-subset wikitext-103-raw-v1 \\
         --output-prefix ./offline_datasets/my_dataset \\
@@ -32,8 +32,8 @@ import os
 from pathlib import Path
 from typing import Any, List
 
-from hyper_models.components.data.tools.offline_config import OfflinePreparationConfig
-from hyper_models.components.data.tools.offline_preparation import (
+from hyper_models.components.datasets.tools.offline_config import OfflinePreparationConfig
+from hyper_models.components.datasets.tools.offline_preparation import (
     prepare_offline_dataset,
 )
 

@@ -74,6 +74,7 @@ def create_dataset_parallel_context(
         *,
         data_index_cache: bool = False,
         shared_storage: bool = True,
+        barrier: Callable[[], None] | None = None,
 ) -> DatasetParallelContext:
     """Create Dataset construction policy from the Trainer topology.
 
@@ -81,6 +82,7 @@ def create_dataset_parallel_context(
         mesh_context: Trainer mesh state that provides TP rank and device mesh.
         data_index_cache: Whether every Dataset rank may consume an existing index cache.
         shared_storage: Whether Dataset index caches are visible to every process.
+        barrier: Optional Dataset-specific long-wait synchronization callback.
 
     Returns:
         Rank ownership, cache ownership, and synchronization callbacks.
@@ -100,7 +102,7 @@ def create_dataset_parallel_context(
     parallel_context = DatasetParallelContext(
         build_on_rank=build_on_rank,
         build_cache_on_rank=build_cache_on_rank,
-        barrier=platform.barrier,
+        barrier=barrier or platform.barrier,
         distributed_enabled=True,
         data_index_cache=data_index_cache,
         dp_rank=int(getattr(mesh_context, "dp_rank", 0)),

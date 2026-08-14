@@ -18,7 +18,7 @@ from hyper_models.components.datasets.llm.build_data_transform import build_llm_
 from hyper_models.components.datasets.llm.build_tokenizer import AutoTokenizer, build_tokenizer
 from hyper_models.components.datasets.llm.chat_template import ChatTemplate, build_chat_template
 from hyper_models.components.datasets.llm.collator import build_llm_collator
-from hyper_models.components.datasets.llm.dataset import build_llm_dataset
+from hyper_models.components.datasets.llm.build_dataset import build_llm_dataset
 from hyper_models.components.datasets.llm.get_batch import (
     LLMBatchProcessor,
     LLMGetBatch,

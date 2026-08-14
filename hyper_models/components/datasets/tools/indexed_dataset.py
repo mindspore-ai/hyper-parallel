@@ -23,7 +23,7 @@ pairs, plus optional streaming readers for object storage (S3 and MSC).
 
 All three calls below are equivalent for local data:
 
-    from hyper_models.components.data.tools.indexed_dataset import IndexedDataset
+    from hyper_models.components.datasets.tools.indexed_dataset import IndexedDataset
 
     ds = IndexedDataset("/path/to/shard_00_text_document")
     print(len(ds), ds[0][:20])
@@ -86,7 +86,9 @@ def safe_import(module, *, msg=None, alt=None):
         return True, importlib.import_module(module)
     except ImportError:
         exception_text = traceback.format_exc()
-        logger.debug("Import of %s failed with: %s", module, exception_text)
+        logger.debug(f"Import of {module} failed with: {exception_text}")
+    except Exception:
+        raise
     if msg is None:
         msg = f"{module} could not be imported"
     if alt is None:
@@ -194,7 +196,7 @@ def _cache_index_file(remote_path: str, local_path: str) -> None:
 _INDEX_HEADER = b"MMIDIDX\x00\x00"
 
 
-class DType(Enum):  # pylint: disable=invalid-name
+class DType(Enum):
     """The NumPy data type Enum for reading the IndexedDataset indices"""
 
     uint8 = 1
@@ -245,9 +247,10 @@ class DType(Enum):  # pylint: disable=invalid-name
         """
         if isinstance(key, int):
             return cls.dtype_from_code(key)().itemsize
-        if numpy.number in key.__mro__:
+        elif numpy.number in key.__mro__:
             return key().itemsize
-        raise ValueError("Invalid key passed to DType.size()")
+        else:
+            raise ValueError("Invalid key passed to DType.size()")
 
     @classmethod
     def optimal_dtype(cls, cardinality: Optional[int]) -> Type[numpy.number]:
@@ -264,7 +267,7 @@ class DType(Enum):  # pylint: disable=invalid-name
         return numpy.int32
 
 
-class _IndexWriter:
+class _IndexWriter(object):
     """Object class to write the index (.idx) file
 
     Args:
@@ -274,7 +277,6 @@ class _IndexWriter:
     """
 
     def __init__(self, idx_path: str, dtype: Type[numpy.number]) -> None:
-        """Store the output path and element type for the index."""
         self.idx_path = idx_path
         self.dtype = dtype
 
@@ -312,6 +314,7 @@ class _IndexWriter:
             Optional[bool]: Whether to silence the exception
         """
         self.idx_writer.close()
+        return None
 
     def write(
         self,
@@ -379,7 +382,6 @@ class _IndexReader:
     """
 
     def __init__(self, idx_path: str, multimodal: bool) -> None:
-        """Map an index file and expose its sequence metadata."""
         logger.info("Loading index file %s", idx_path)
 
         with open(idx_path, "rb") as f:
@@ -489,7 +491,7 @@ class _BinReader(ABC):
             numpy.ndarray: An array with `count` items and data-type `dtype` constructed from
                 reading bytes from the data file starting at `offset`.
         """
-        raise NotImplementedError
+        pass
 
 
 class _MMapBinReader(_BinReader):
@@ -501,8 +503,7 @@ class _MMapBinReader(_BinReader):
         Args:
             bin_path (str): The path to the data (.bin) file.
         """
-        # The file must remain open for the lifetime of its memory map.
-        self._file = open(bin_path, "rb")  # pylint: disable=consider-using-with
+        self._file = open(bin_path, "rb")
         self._mmap = numpy.memmap(self._file, mode="r", order="C")
         self._buffer = memoryview(self._mmap.data)
 
@@ -571,9 +572,7 @@ class _S3BinReader(_BinReader):
     reads outside the current chunk trigger a new ranged ``GetObject``.
     """
 
-    def __init__(
-        self, bin_path: str, object_storage_config: ObjectStorageConfig,
-    ) -> None:
+    def __init__(self, bin_path: str, object_storage_config: ObjectStorageConfig) -> None:
         if not HAS_BOTO3:
             raise ImportError("boto3 is required to read s3:// datasets. Install via `pip install boto3`.")
         if object_storage_config.bin_chunk_nbytes <= 0:
@@ -586,7 +585,6 @@ class _S3BinReader(_BinReader):
         self._cache: Optional[bytes] = None
 
     def _extract_from_cache(self, offset: int, size: int) -> bytes:
-        """Return a requested byte range from the current cache window."""
         if self._cache is None:
             raise RuntimeError("Cache is empty; cannot extract before first read")
         start = offset - self._cache_bytes_start
@@ -618,16 +616,14 @@ class _S3BinReader(_BinReader):
     def __del__(self) -> None:
         try:
             self._client.close()
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             pass
 
 
 class _MultiStorageClientBinReader(_BinReader):
     """Read ``.bin`` data via NVIDIA's :mod:`multi_storage_client`."""
 
-    def __init__(  # pylint: disable=unused-argument
-        self, bin_path: str, object_storage_config: ObjectStorageConfig,
-    ) -> None:
+    def __init__(self, bin_path: str, object_storage_config: ObjectStorageConfig) -> None:
         if not HAS_MSC:
             raise ImportError(
                 "multi_storage_client is required to read msc:// datasets. "
@@ -643,6 +639,7 @@ class _MultiStorageClientBinReader(_BinReader):
             byte_range=multi_storage_client.types.Range(offset=offset, size=size),
         )
         return numpy.frombuffer(buffer, dtype=dtype)
+
 
 OBJECT_STORAGE_BIN_READERS: Dict[str, Type[_BinReader]] = {
     "s3": _S3BinReader,
@@ -693,7 +690,6 @@ class IndexedDataset(torch.utils.data.Dataset):
         mmap: bool,
         object_storage_config: Optional[ObjectStorageConfig] = None,
     ) -> None:
-        """Initialize the index and binary readers for the dataset."""
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
 
@@ -720,7 +716,6 @@ class IndexedDataset(torch.utils.data.Dataset):
         self.index = index_reader
 
     def __len__(self) -> int:
-        """Return the number of indexed sequences."""
         return len(self.index)
 
     def __getitem__(
@@ -731,14 +726,13 @@ class IndexedDataset(torch.utils.data.Dataset):
         List[numpy.ndarray],
         Tuple[List[numpy.ndarray], numpy.ndarray],
     ]:
-        """Read one sequence or a contiguous slice of sequences."""
         if isinstance(idx, (int, numpy.integer)):
             ptr, length, mode = self.index[idx]
             seq = self.bin_reader.read(self.index.dtype, length, ptr)
             return (seq, mode) if mode is not None else seq
 
-        if isinstance(idx, slice):
-            start, _, step = idx.indices(len(self))
+        elif isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
             if step != 1:
                 raise ValueError("Slices into IndexedDataset must be contiguous (step=1)")
             lengths = self.index.sequence_lengths[idx]
@@ -752,12 +746,12 @@ class IndexedDataset(torch.utils.data.Dataset):
             sequences = numpy.split(buffer, offsets[:-1])
             return (sequences, modes) if modes is not None else sequences
 
-        raise TypeError(f"Unexpected index type {type(idx)}")
+        else:
+            raise TypeError(f"Unexpected index type {type(idx)}")
 
     def get(
         self, idx: int, offset: int = 0, length: Optional[int] = None
     ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, Any]]:
-        """Read part of one sequence using an element offset and length."""
         ptr, seq_len, mode = self.index[idx]
         length = seq_len - offset if length is None else length
         ptr += offset * DType.size(self.index.dtype)
@@ -765,24 +759,21 @@ class IndexedDataset(torch.utils.data.Dataset):
         return (seq, mode) if mode is not None else seq
 
     @property
-    def sequence_lengths(self) -> numpy.ndarray:  # numpy.ndarray[int32]
-        """Return the number of elements in every sequence."""
+    def sequence_lengths(self):  # numpy.ndarray[int32]
         return self.index.sequence_lengths
 
     @property
-    def document_indices(self) -> numpy.ndarray:  # numpy.ndarray[int64]
-        """Return sequence boundaries for every document."""
+    def document_indices(self):  # numpy.ndarray[int64]
         return self.index.document_indices
 
     @staticmethod
     def exists(path_prefix: str) -> bool:
-        """Return whether a local dataset exists or a remote path is valid."""
         if _is_object_storage_path(path_prefix):
             return True  # existence check deferred to download time
         return os.path.exists(get_idx_path(path_prefix)) and os.path.exists(get_bin_path(path_prefix))
 
 
-class IndexedDatasetBuilder:
+class IndexedDatasetBuilder(object):
     """Builder class for the IndexedDataset class
 
     Args:
@@ -794,9 +785,7 @@ class IndexedDatasetBuilder:
     """
 
     def __init__(self, bin_path: str, dtype: Type[numpy.number] = numpy.int32, multimodal: bool = False) -> None:
-        """Create a builder that appends encoded sequences to ``bin_path``."""
-        # Kept open until finalize() because items are appended incrementally.
-        self.data_file = open(bin_path, "wb")  # pylint: disable=consider-using-with
+        self.data_file = open(bin_path, "wb")
         self.dtype = dtype
         self.multimodal = multimodal
 

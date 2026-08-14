@@ -21,8 +21,6 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Callable, Generic, List, Literal, Optional, TypeVar, Union
 
 from torch.optim import Optimizer
-from transformers import PreTrainedTokenizerBase
-
 from hyper_models.components.checkpoint.config import CheckpointingConfig
 from hyper_models.components.distributed.config import FSDP2Config
 from hyper_models.components.model_transform import ModuleReplacementSpec, module_replacement
@@ -556,7 +554,7 @@ class ModelAssetsConfig:
     datasets_type: Literal["plaintext", "conversation", "pretokenized"] = (
         "pretokenized"
     )
-    chat_template: Optional[str] = None
+    chat_template: Optional[Union[str, Target[Any]]] = None
     tokenizer: Optional[Target[Any]] = None
 
 
@@ -567,7 +565,6 @@ class TrainerConfig:
     model: Target[Any]
     optimizer: Target[Optimizer]
 
-    tokenizer: Optional[Target[PreTrainedTokenizerBase]] = None
     lr_scheduler: Optional[Target[Any]] = None
     loss_fn: Optional[Target[Any]] = None
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -584,7 +581,6 @@ class TrainerConfig:
     )
 
     # data
-    tokenizer: Optional[Target[Any]] = None
     model_assets: ModelAssetsConfig = field(default_factory=ModelAssetsConfig)
     data_transform: Optional[Target[Any]] = None
     dataset: Optional[Target[Any]] = None
