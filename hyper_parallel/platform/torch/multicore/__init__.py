@@ -14,6 +14,8 @@
 # ============================================================================
 """PyTorch multicore handler for hyper-parallel."""
 
+from typing import Any, Callable, NoReturn
+
 
 class TorchMulticoreHandler:
     """PyTorch platform handler for MoE-FFN multicore operators."""
@@ -23,6 +25,15 @@ class TorchMulticoreHandler:
         # runs now (sets ASCEND_CUSTOM_OPP_PATH, preloads ctypes libs).
         # Must happen before torch_npu is imported anywhere else in the process.
         import hyper_parallel.core.multicore.platform.torch  # noqa: F401  # pylint: disable=C0415,W0611
+
+    @staticmethod
+    def measure_mega_kernel_memory(
+            kernel_name: str, kernel_call: Callable[[], Any]) -> NoReturn:
+        """Report that MindSpore-style compile simulation is unavailable."""
+        del kernel_name, kernel_call
+        raise NotImplementedError(
+            "dynamic mega-kernel dryrun memory measurement is only supported by MindSpore"
+        )
 
     @staticmethod
     def mega_moe(

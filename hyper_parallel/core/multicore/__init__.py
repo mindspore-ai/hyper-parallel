@@ -12,13 +12,86 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MoE-FFN multicore operator entry point with platform dispatch."""
-__all__ = ["mega_moe", "mega_moe_grad"]
+"""MoE-FFN multicore APIs with lazy platform dispatch."""
 
+from typing import Any, Callable
+
+from hyper_parallel.core.multicore.dryrun_memory import MegaKernelMemoryUsage
+from hyper_parallel.core.multicore.memory_estimation import (
+    MemoryCategory,
+    MemoryComponent,
+    MegaKernelMemoryEstimate,
+    MegaMoeGradMemorySpec,
+    MegaMoeMemorySpec,
+    estimate_mega_kernel_peak_memory,
+    estimate_mega_moe_grad_peak_memory,
+    estimate_mega_moe_peak_memory,
+    register_mega_kernel_memory_estimator,
+)
 from hyper_parallel.platform import get_platform
 
-_platform = get_platform()
-_multicore_handler = _platform.get_multicore_handler()
+__all__ = [
+    "MemoryCategory", "MemoryComponent", "MegaKernelMemoryEstimate", "MegaKernelMemoryUsage",
+    "MegaMoeGradMemorySpec", "MegaMoeMemorySpec", "estimate_mega_kernel_peak_memory",
+    "estimate_mega_moe_grad_peak_memory", "estimate_mega_moe_peak_memory",
+    "measure_mega_kernel_memory", "measure_mega_moe_grad_memory",
+    "measure_mega_moe_memory", "mega_moe", "mega_moe_grad",
+    "register_mega_kernel_memory_estimator",
+]
+
+
+def _get_multicore_handler():
+    """Return the backend handler only when a kernel is actually invoked."""
+    return get_platform().get_multicore_handler()
+
+
+def measure_mega_kernel_memory(
+        kernel_name: str, kernel_call: Callable[[], Any]) -> MegaKernelMemoryUsage:
+    """Dynamically measure a mega kernel through the active backend's dryrun.
+
+    The callable is executed once through the normal framework and ACLNN
+    workspace-planning path, while the device kernel launch is skipped.
+
+    Args:
+        kernel_name: Logical name used in the returned measurement.
+        kernel_call: Zero-argument callable that invokes one mega kernel.
+
+    Returns:
+        Dynamic peak-memory measurement.
+
+    Raises:
+        ValueError: If ``kernel_name`` is empty.
+        TypeError: If ``kernel_call`` is not callable.
+        NotImplementedError: If the active backend has no dryrun support.
+        RuntimeError: If global MindSpore compile simulation is enabled.
+    """
+    if not isinstance(kernel_name, str) or not kernel_name.strip():
+        raise ValueError("kernel_name must be a non-empty string")
+    if not callable(kernel_call):
+        raise TypeError("kernel_call must be callable")
+    return _get_multicore_handler().measure_mega_kernel_memory(
+        kernel_name.strip(), kernel_call
+    )
+
+
+def measure_mega_moe_memory(*args: Any, **kwargs: Any) -> MegaKernelMemoryUsage:
+    """Measure one ``mega_moe`` call dynamically without launching its kernel.
+
+    Positional and keyword arguments are forwarded unchanged to :func:`mega_moe`.
+    Use :func:`measure_mega_kernel_memory` directly for future mega kernels.
+    """
+    return measure_mega_kernel_memory("mega_moe", lambda: mega_moe(*args, **kwargs))
+
+
+def measure_mega_moe_grad_memory(*args: Any, **kwargs: Any) -> MegaKernelMemoryUsage:
+    """Measure one ``mega_moe_grad`` call without launching its device kernel.
+
+    Positional and keyword arguments are forwarded unchanged to
+    :func:`mega_moe_grad`.
+    """
+    return measure_mega_kernel_memory(
+        "mega_moe_grad", lambda: mega_moe_grad(*args, **kwargs)
+    )
 
 
 def mega_moe(
@@ -34,7 +107,7 @@ def mega_moe(
     hidden_size: int, seq_size: int,
 ):
     """MoE-FFN forward operator (platform-dispatched)."""
-    return _multicore_handler.mega_moe(
+    return _get_multicore_handler().mega_moe(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,
@@ -61,7 +134,7 @@ def mega_moe_grad(
     hidden_size: int, seq_size: int,
 ):
     """MoE-FFN backward operator (platform-dispatched)."""
-    return _multicore_handler.mega_moe_grad(
+    return _get_multicore_handler().mega_moe_grad(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw,

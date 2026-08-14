@@ -61,8 +61,8 @@
 #include <memory>
 #include <vector>
 
+#include "c_api/common/mega_kernel_aclnn_op_runner.h"
 #include "framework/module.h"
-#include "include/kernel/ascend/custom/pyboost_impl/aclnn_op_runner.h"
 
 namespace ms_multicore {
 
@@ -99,9 +99,9 @@ std::vector<ms::Tensor> npu_mega_moe_grad(
     const ms::Tensor &all_event_counters,  // pos 28
     int64_t rank_id, int64_t ep, int64_t expert_num,
     int64_t hidden_size, int64_t seq_size) {
-  auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MoeBwd");
+  auto runner = std::make_shared<MegaKernelAclnnOpRunner>("MoeBwd");
   MS_EXCEPTION_IF_NULL(runner);
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMegaMoeGrad,
+  SET_MEGA_KERNEL_ACLNN_FUNC(runner, aclnnMegaMoeGrad,
       dispatch_target, dispatch_target_off,
       dy, dispatch_src_off, dispatch_size,
       hidden, hidden_dw,
@@ -113,7 +113,7 @@ std::vector<ms::Tensor> npu_mega_moe_grad(
       act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
       swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
       runtime_config, all_event_counters,
-      rank_id, ep, expert_num, hidden_size, seq_size));
+      rank_id, ep, expert_num, hidden_size, seq_size);
 
   std::vector<ms::Tensor> inputs = {
       dispatch_target, dispatch_target_off,

@@ -14,6 +14,12 @@
 # ============================================================================
 """MindSpore multicore handler for hyper-parallel."""
 
+import threading
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from hyper_parallel.core.multicore.dryrun_memory import MegaKernelMemoryUsage
+
 
 class MSMulticoreHandler:
     """MindSpore platform handler for MoE-FFN multicore operators."""
@@ -27,6 +33,55 @@ class MSMulticoreHandler:
         # Note: platform/mindspore/__init__.py itself does NOT import mindspore at
         # module level, so this import is safe to call early.
         import hyper_parallel.core.multicore.platform.mindspore  # noqa: F401  # pylint: disable=C0415,W0611
+
+    _dryrun_lock = threading.Lock()
+
+    @classmethod
+    def measure_mega_kernel_memory(
+            cls, kernel_name: str, kernel_call: Callable[[], Any]) -> "MegaKernelMemoryUsage":
+        """Measure a mega kernel while skipping only its device launch."""
+        # pylint: disable=C0415
+        import os
+        import mindspore as ms
+        from hyper_parallel.core.multicore.dryrun_memory import MegaKernelMemoryUsage
+        from hyper_parallel.platform.mindspore.symmetric_memory import MSSymmetricMemoryHandler
+
+        simulation_level = os.environ.get("MS_SIMULATION_LEVEL", "")
+        if simulation_level in {"0", "1", "2"}:
+            raise RuntimeError(
+                "kernel-level dryrun cannot run inside MindSpore compile simulation; "
+                "start Python without MS_SIMULATION_LEVEL"
+            )
+
+        with cls._dryrun_lock:
+            allocated_before = int(ms.runtime.memory_allocated())
+            ms.runtime.reset_peak_memory_stats()
+            previous_dryrun = os.environ.get("HP_MEGA_KERNEL_DRY_RUN")
+            os.environ["HP_MEGA_KERNEL_DRY_RUN"] = "1"
+            try:
+                kernel_call()
+                ms.runtime.synchronize()
+            finally:
+                if previous_dryrun is None:
+                    os.environ.pop("HP_MEGA_KERNEL_DRY_RUN", None)
+                else:
+                    os.environ["HP_MEGA_KERNEL_DRY_RUN"] = previous_dryrun
+            allocated_after = int(ms.runtime.memory_allocated())
+            allocator_peak = max(
+                allocated_before,
+                allocated_after,
+                int(ms.runtime.max_memory_allocated()),
+            )
+            external_reserved, external_logical = MSSymmetricMemoryHandler.dryrun_memory_stats()
+
+        return MegaKernelMemoryUsage(
+            kernel_name=kernel_name,
+            allocated_before_bytes=allocated_before,
+            allocated_after_bytes=allocated_after,
+            allocator_peak_bytes=allocator_peak,
+            external_reserved_bytes=external_reserved,
+            external_logical_bytes=external_logical,
+        )
 
     @staticmethod
     def mega_moe(

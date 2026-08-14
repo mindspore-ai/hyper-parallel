@@ -13,7 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Symmetric Memory"""
+import math
 import os
+import weakref
 import mindspore as ms
 from mindspore.runtime import Stream, StreamCtx, Event
 from hyper_parallel.platform import get_platform
@@ -31,7 +33,13 @@ class MSSymmetricMemoryHandler:
 
     _is_init = False
     _mem_pool = None
+    _symmetric_tensors = []
     streamlist = []
+
+    @staticmethod
+    def _is_compile_simulation():
+        """Return whether this process uses MindSpore compile simulation."""
+        return os.environ.get("MS_SIMULATION_LEVEL", "") in {"0", "1", "2"}
 
     @classmethod
     def _init_shmem(cls):
@@ -48,13 +56,36 @@ class MSSymmetricMemoryHandler:
         """Check whether the symmetric memory shared library is available on this host."""
         return _is_shmem_available
 
-    @staticmethod
-    def empty(size, dtype):
+    @classmethod
+    def empty(cls, size, dtype):
         """Allocate an uninitialized symmetric memory tensor of the given size and dtype."""
-        if not MSSymmetricMemoryHandler._is_init:
-            MSSymmetricMemoryHandler._init_shmem()
-        with ms.runtime.use_mem_pool(MSSymmetricMemoryHandler._mem_pool):
-            return ms.mint.empty(size, dtype=dtype)
+        shape = size if isinstance(size, (tuple, list)) else (size,)
+        tensor_bytes = math.prod(shape) * int(ms.Tensor([], dtype=dtype).itemsize)
+        if cls._is_compile_simulation():
+            tensor = ms.mint.empty(size, dtype=dtype)
+        else:
+            if not cls._is_init:
+                cls._init_shmem()
+            with ms.runtime.use_mem_pool(cls._mem_pool):
+                tensor = ms.mint.empty(size, dtype=dtype)
+        cls._symmetric_tensors.append((weakref.ref(tensor), tensor_bytes))
+        return tensor
+
+    @classmethod
+    def dryrun_memory_stats(cls):
+        """Return external heap reservation and allocator-backed logical bytes."""
+        heap_bytes = int(os.environ.get("SYMMETRIC_MEMORY_HEAP_SIZE", str(1024 ** 3)))
+        cls._symmetric_tensors = [
+            (tensor_ref, size)
+            for tensor_ref, size in cls._symmetric_tensors
+            if tensor_ref() is not None
+        ]
+        logical_bytes = sum(size for _, size in cls._symmetric_tensors)
+        if logical_bytes > heap_bytes:
+            raise RuntimeError(
+                "dryrun symmetric-memory tensors exceed SYMMETRIC_MEMORY_HEAP_SIZE"
+            )
+        return heap_bytes, logical_bytes
 
     @staticmethod
     def rendezvous(tensor, group):
@@ -121,6 +152,8 @@ class MSSymmetricMemoryHandler:
     @staticmethod
     def barrier():
         """Synchronize all ranks with a distributed barrier."""
+        if MSSymmetricMemoryHandler._is_compile_simulation():
+            return
         ms.mint.distributed.barrier()
 
     @classmethod

@@ -58,8 +58,8 @@
 #include <memory>
 #include <vector>
 
+#include "c_api/common/mega_kernel_aclnn_op_runner.h"
 #include "framework/module.h"
-#include "include/kernel/ascend/custom/pyboost_impl/aclnn_op_runner.h"
 
 namespace ms_multicore {
 
@@ -89,14 +89,14 @@ std::vector<ms::Tensor> npu_mega_moe(
     const ms::Tensor &all_event_counters,   // pos 21
     int64_t rank_id, int64_t ep, int64_t expert_num,
     int64_t hidden_size, int64_t seq_size) {
-  auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MoeFwd");
+  auto runner = std::make_shared<MegaKernelAclnnOpRunner>("MoeFwd");
   MS_EXCEPTION_IF_NULL(runner);
   // LAUNCH_ACLNN_FUNC captures all args via Arg() helpers (ms::Tensor →
   // TensorPtr, scalars pass through), then LAUNCH_ACLNN internally:
   //   1. calls aclnnMegaMoeGetWorkspaceSize (via dynamic lookup + cache)
   //   2. allocates workspace through MindSpore's device memory manager
   //   3. dispatches aclnnMegaMoe asynchronously on the current stream
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMegaMoe,
+  SET_MEGA_KERNEL_ACLNN_FUNC(runner, aclnnMegaMoe,
       dispatch_target, dispatch_target_off,
       dispatch_src, dispatch_src_off, dispatch_size,
       up_proj_weight, up_proj_glist,
@@ -105,7 +105,7 @@ std::vector<ms::Tensor> npu_mega_moe(
       combine_target, combine_target_off, combine_src_off, combine_size,
       gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
       runtime_config, all_event_counters,
-      rank_id, ep, expert_num, hidden_size, seq_size));
+      rank_id, ep, expert_num, hidden_size, seq_size);
 
   // All 22 tensors passed as inputs so the framework prepares their device
   // addresses before the async launch.
