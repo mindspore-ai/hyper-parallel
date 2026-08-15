@@ -224,6 +224,20 @@ class TestTargetResolution(unittest.TestCase):
         with self.assertRaises(AttributeError):
             _ = config.optimizer.model
 
+    def test_activation_swap_defaults_to_none_and_accepts_attention(self):
+        default_config = resolve_root(_root())
+        attention_config = resolve_root(_root(activation_swap="attention"))
+
+        self.assertEqual(default_config.activation_swap, "none")
+        self.assertEqual(attention_config.activation_swap, "attention")
+
+    def test_activation_swap_rejects_unknown_mode(self):
+        with self.assertRaisesRegex(
+            ConfigResolutionError,
+            r"\$\.activation_swap: expected one of \('none', 'attention'\)",
+        ):
+            resolve_root(_root(activation_swap="all"))
+
     def test_gradient_clipping_is_not_an_optimizer_argument(self):
         with self.assertRaisesRegex(
             ConfigResolutionError,

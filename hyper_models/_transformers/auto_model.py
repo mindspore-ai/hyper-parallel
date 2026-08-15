@@ -81,6 +81,7 @@ class _BaseHyperAutoModelClass:
         compile_config=None,
         freeze_config=None,
         activation_checkpoint: Optional[str] = None,
+        activation_swap: str = "none",
         **kwargs,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
@@ -132,6 +133,7 @@ class _BaseHyperAutoModelClass:
             compile_config=compile_config,
             freeze_config=freeze_config,
             activation_checkpoint=activation_checkpoint,
+            activation_swap=activation_swap,
             **kwargs,
         )
 
@@ -146,6 +148,7 @@ class _BaseHyperAutoModelClass:
         torch_dtype="auto",
         attn_implementation="sdpa",
         activation_checkpoint: Optional[str] = None,
+        activation_swap: str = "none",
         **kwargs,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
@@ -180,6 +183,7 @@ class _BaseHyperAutoModelClass:
             load_base_model=False,
             distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
+            activation_swap=activation_swap,
             **kwargs,
         )
 
@@ -206,6 +210,7 @@ class _BaseHyperAutoModelClass:
         compile_config=None,
         freeze_config=None,
         activation_checkpoint: Optional[str] = None,
+        activation_swap: str = "none",
         **kwargs,
     ) -> PreTrainedModel:
         """Core model building orchestration.
@@ -270,8 +275,8 @@ class _BaseHyperAutoModelClass:
             load_base_model=load_base_model,
             pretrained_path=pretrained_model_name_or_path,
             validate_placement=validate_placement,
-            distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
+            activation_swap=activation_swap,
         )
 
         model.train()

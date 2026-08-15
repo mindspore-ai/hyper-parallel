@@ -30,6 +30,10 @@ from hyper_models._transformers.checkpoint_loader import CheckpointManager, Load
 from hyper_models.components.activation_checkpoint import (
     _apply_activation_checkpointing as _apply_activation_checkpointing_impl,
 )
+from hyper_models.components.activation_swap.attention_swap import (
+    apply_qwen3_moe_attention_swap,
+    validate_attention_swap,
+)
 from hyper_models.components.compile import apply_compile
 from hyper_models.components.distributed.fsdp2 import FSDP2Manager, _instantiate_fsdp2
 from hyper_models.components.distributed.pipelining import _instantiate_pipeline
@@ -549,6 +553,7 @@ def apply_model_infrastructure(
     freeze_config=None,
     compile_config=None,
     activation_checkpoint: Optional[str] = None,
+    activation_swap: str = "none",
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device=None,
@@ -563,6 +568,7 @@ def apply_model_infrastructure(
     materialization/loading -> per-layer compile. Placement validation keeps
     the DTensor placement path and skips FSDP2 and compile.
     """
+
     distributed_setup = kwargs.get("distributed_setup")
 
     if isinstance(compile_config, dict):
@@ -607,13 +613,24 @@ def apply_model_infrastructure(
         validate_placement,
     )
 
-    # Step 9: activation checkpointing remains inside the FSDP boundary.
+    # Step 9-1: activation checkpointing remains inside the FSDP boundary.
     if activation_checkpoint not in (None, "off"):
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
             enable_compile=compile_for_execution,
         )
+
+    # Step 9-2:activation swap.
+    validate_attention_swap(
+        activation_swap,
+        activation_checkpoint=activation_checkpoint,
+        enable_compile=compile_for_execution,
+        pp_size=getattr(mesh, "pp_size", 1),
+    )
+    if activation_swap != "none":
+        model = apply_qwen3_moe_attention_swap(model, activation_swap)
+
 
     # Step 10: FSDP2 is execution-only; validation retains DTensor placement.
     if validate_placement:
