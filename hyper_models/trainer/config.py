@@ -698,6 +698,7 @@ class TrainerConfig:
     activation_checkpoint: ActivationCheckpointConfig = field(
         default_factory=ActivationCheckpointConfig
     )
+    activation_swap: Literal["none", "attention"] = "none"
     compile: CompileConfig = field(default_factory=CompileConfig)
 
     # data
