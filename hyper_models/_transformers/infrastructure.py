@@ -229,19 +229,25 @@ def _move_model_to_device(
 
 
 def _initialize_model_weights(model: nn.Module) -> None:
-    """Initialize a materialized model built through from_config."""
+    """Initialize materialized state through the model's native contract."""
+    for module in model.modules():
+        module._is_hf_initialized = False  # pylint: disable=W0212
+    for tensor in (*model.parameters(), *model.buffers()):
+        tensor._is_hf_initialized = False  # pylint: disable=W0212
+
     initialize_weights = getattr(model, "initialize_weights", None)
     if callable(initialize_weights):
         initialize_weights()
-        return
-    init_weights = getattr(model, "init_weights", None)
-    if callable(init_weights):
-        init_weights()
-        return
-    for module in model.modules():
-        reset_parameters = getattr(module, "reset_parameters", None)
-        if callable(reset_parameters):
-            reset_parameters()
+    else:
+        init_weights = getattr(model, "init_weights", None)
+        if callable(init_weights):
+            init_weights()
+        else:
+            for module in model.modules():
+                reset_parameters = getattr(module, "reset_parameters", None)
+                if callable(reset_parameters):
+                    reset_parameters()
+    logger.info("Initialized model state with model-native random initialization")
 
 
 def _join_fqn(module_name: str, tensor_name: str) -> str:

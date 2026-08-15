@@ -192,12 +192,18 @@ class TextTrainer:
         first_training_batch = self.base.get_batch(data_iterator)
         self.base.state.global_step += 1
 
-        self.on_step_begin(micro_batches=None)
+        num_micro_steps = self.base.num_micro_batches
+        micro_batches = [first_micro_batch]
+        micro_batches.extend(
+            self.base.get_batch(data_iterator)
+            for _ in range(1, num_micro_steps)
+        )
+
+        self.on_step_begin(micro_batches=micro_batches)
         synchronize()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
-        num_micro_steps = self.base.num_micro_batches
 
         for micro_step in range(num_micro_steps):
             model_inputs, loss_inputs = first_training_batch if micro_step == 0 else self.base.get_batch(data_iterator)

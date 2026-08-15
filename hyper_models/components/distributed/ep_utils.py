@@ -52,6 +52,10 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from hyper_models.components.ops.npu_grouped_swiglu import (
+    npu_grouped_swiglu,
+)
+
 # ────────────────────────────────────────────────────────────────────────────
 # Backend-dispatched all_to_all
 # ────────────────────────────────────────────────────────────────────────────
@@ -335,6 +339,21 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         local_expert_indices,
         minlength=experts.local_expert_count,
     )
+    if getattr(experts, "_ep_use_grouped_gemm", False):
+        if up_weight is not None:
+            raise ValueError(
+                "EP grouped GEMM currently requires packed gate_up_proj weights"
+            )
+        sorted_output = npu_grouped_swiglu(
+            sorted_states,
+            gate_weight,
+            down_weight,
+            local_expert_counts,
+        )
+        output = torch.empty_like(sorted_output)
+        output[token_order] = sorted_output
+        return output
+
     sorted_outputs = []
     token_start = 0
     for local_expert_index in range(experts.local_expert_count):
@@ -382,7 +401,7 @@ def _get_global_expert_count(module):
     )
 
 
-def bind_local_expert_forward(module, ep_size):
+def bind_local_expert_forward(module, ep_size, use_grouped_gemm=False):
     """Install the local expert compute entry used by TP-extend-EP.
 
     Called by the EP compute factory (archetype or user-written) at apply
@@ -411,6 +430,7 @@ def bind_local_expert_forward(module, ep_size):
                 "provide experts.act_fn or extend the EP activation registry"
             )
     module.experts._ep_act_fn = activation
+    module.experts._ep_use_grouped_gemm = use_grouped_gemm
     module.experts.forward = types.MethodType(
         _local_swiglu_expert_forward,
         module.experts,
@@ -537,11 +557,24 @@ def ep_routed_forward(module, hidden_states, *, router_fn, ep_group):
         send_counts,
         ep_group,
     )
-    flattened_outputs = torch.zeros_like(combined_expert_outputs)
-    flattened_outputs[dispatch_order] = combined_expert_outputs
-    output = (
-        flattened_outputs * flattened_expert_weights.unsqueeze(-1)
-    ).view(token_count, experts_per_token, hidden_size).sum(1).view(
+    weighted_expert_outputs = combined_expert_outputs * flattened_expert_weights[
+        dispatch_order
+    ].unsqueeze(-1)
+    # ``dispatch_order`` is globally expert-major, so index-add accumulates a
+    # token's selected experts in ascending expert order. This matches the HF
+    # Qwen3 expert loop and avoids BF16 drift from summing in router top-k order.
+    output = torch.zeros(
+        token_count,
+        hidden_size,
+        dtype=weighted_expert_outputs.dtype,
+        device=weighted_expert_outputs.device,
+    )
+    output.index_add_(
+        0,
+        source_token_indices[dispatch_order],
+        weighted_expert_outputs,
+    )
+    output = output.view(
         batch_size,
         sequence_length,
         hidden_size,
