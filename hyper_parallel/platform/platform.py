@@ -876,6 +876,29 @@ class Platform:
         )
 
     @staticmethod
+    def random_permutation(size: int, seed: int) -> list[int]:
+        """Return a deterministic host-side permutation for data sampling.
+
+        Keeping sampler indices on the host avoids device initialization and
+        gives Torch and MindSpore the same epoch order.
+
+        Args:
+            size: Number of indices to permute.
+            seed: Epoch seed used to initialize the random generator.
+
+        Returns:
+            A permutation containing every integer in ``[0, size)`` once.
+
+        Raises:
+            ValueError: If ``size`` or ``seed`` is not a non-negative integer.
+        """
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError("size must be a non-negative integer")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        return np.random.default_rng(seed).permutation(size).tolist()
+
+    @staticmethod
     def arange(start, end=None, step=1, dtype=None, device=None):
         """Create a 1-D tensor with evenly spaced values.
 

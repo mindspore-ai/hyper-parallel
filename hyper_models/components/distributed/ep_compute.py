@@ -139,6 +139,7 @@ def _build_ep_compute(
     archetype_key: str,
     expected_attrs,
     combine: Callable,
+    use_grouped_gemm: bool = False,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -150,7 +151,16 @@ def _build_ep_compute(
     """
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
-    bind_local_expert_forward(module, ep_mesh["ep"].size())
+    if use_grouped_gemm:
+        bind_local_expert_forward(
+            module,
+            ep_mesh["ep"].size(),
+            use_grouped_gemm=True,
+        )
+    else:
+        # Keep the established call contract unchanged for every reference
+        # archetype and for Qwen3 when grouped GEMM is disabled.
+        bind_local_expert_forward(module, ep_mesh["ep"].size())
 
     def compute_fn(module, hidden_states):
         routed = ep_routed_forward(
@@ -231,6 +241,7 @@ def qwen3moe_ep_compute_fn(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
+    use_grouped_gemm: bool = False,
 ) -> Callable:
     """Archetype ``qwen3moe_topk_router``: TopKRouter module returning
     (logits, scores, indices), no shared expert (Qwen3-MoE).
@@ -245,6 +256,7 @@ def qwen3moe_ep_compute_fn(
         archetype_key="qwen3moe_topk_router",
         expected_attrs=["gate", "experts"],
         combine=lambda module, hidden_states, routed: routed,
+        use_grouped_gemm=use_grouped_gemm,
     )
 
 
