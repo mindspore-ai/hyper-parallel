@@ -1689,6 +1689,20 @@ class MindSporePlatform(Platform):
         return _no_grad()
 
     @staticmethod
+    def backward(
+            tensors: Any,
+            gradients: Any = None,
+            retain_graph: bool = False,
+            create_graph: bool = False,
+            inputs: Any = None,
+    ) -> Any:
+        """Run MindSpore backward for one or more explicit roots."""
+        from hyper_parallel.platform.mindspore.autograd_compat import (  # pylint: disable=C0415
+            backward_tensors,
+        )
+        return backward_tensors(tensors, gradients, retain_graph, create_graph, inputs)
+
+    @staticmethod
     def preserve_version_counter(tensor):
         from mindspore.common.api import _unsafe_preserve_version_counter  # pylint: disable=C0415
         return _unsafe_preserve_version_counter(tensor)

@@ -23,6 +23,7 @@ import mindspore as ms
 from mindspore import Tensor, Parameter, nn, ops
 
 from hyper_parallel.core.pipeline_parallel.stage import PipelineStage
+from hyper_parallel.core.backward_target import AuxiliaryOutput, BackwardTarget
 from tests.common.mark_utils import arg_mark
 
 
@@ -43,6 +44,22 @@ class CountNet(nn.Cell):
     def construct(self, x):
         self.forward_calls += 1
         return ops.matmul(x, self.w)
+
+
+class StageLocalTargetNet(nn.Cell):
+    """Return a display value whose backward root is a separate local loss."""
+
+    def __init__(self) -> None:
+        """Create one trainable parameter used only by the explicit target."""
+        super().__init__()
+        self.w = Parameter(Tensor(np.array([[2.0]], np.float32)), name="target_w")
+
+    def construct(self, x: Tensor) -> AuxiliaryOutput:
+        """Return a forward-only value and one independently scaled loss root."""
+        target_value = ops.matmul(x, self.w)
+        target_loss = ops.square(target_value).sum()
+        target = BackwardTarget(target_loss, Tensor(0.5, ms.float32))
+        return AuxiliaryOutput(x + 1, (target,))
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
@@ -67,6 +84,29 @@ def test_pipeline_stage_backward_reuses_forward_and_gradfn_result():
     assert net.forward_calls == 1
     assert net.w.grad is not None
     np.testing.assert_allclose(net.w.grad.asnumpy(), np.array([[3.0]], dtype=np.float32))
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_pipeline_stage_executes_explicit_local_target() -> None:
+    """The stage sends its regular value but differentiates its stage-local target."""
+    ms.set_context(mode=ms.PYNATIVE_MODE)
+
+    net = StageLocalTargetNet()
+    stage = PipelineStage(net, stage_index=0, stage_num=1, has_backward=True)
+    x = Tensor(np.array([[3.0]], np.float32))
+    x._requires_grad = True  # pylint: disable=protected-access
+    out = stage.forward_one_chunk(0, args=(x,), kwargs={})
+
+    assert not isinstance(out, AuxiliaryOutput)
+    assert not out.requires_grad
+    np.testing.assert_allclose(out.asnumpy(), np.array([[4.0]], dtype=np.float32))
+    stage.backward_one_chunk(0)
+    np.testing.assert_allclose(net.w.grad.asnumpy(), np.array([[18.0]], dtype=np.float32))
 
 
 @arg_mark(

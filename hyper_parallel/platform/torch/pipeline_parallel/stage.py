@@ -17,6 +17,12 @@ import torch
 import torch.distributed as dist
 
 import hyper_parallel
+from hyper_parallel.core.backward_target import split_backward_targets
+
+
+def _detach_backward_value(value):
+    """Detach Tensor leaves whose backward roots were declared explicitly."""
+    return value.detach() if torch.is_tensor(value) else value
 
 
 class PipelineStageBase:
@@ -48,12 +54,14 @@ class PipelineStageBase:
         self.stage_index = stage_index
         self.stage_num = stage_num
         self.fwd_outputs_cache = {}
+        self.backward_targets_cache = {}
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
 
     def clear_cache(self):
         """clear cache."""
         self.fwd_outputs_cache.clear()
         self.bwd_cache.clear()
+        self.backward_targets_cache.clear()
         self._meta_cache.clear()
 
     @staticmethod
@@ -95,6 +103,10 @@ class PipelineStageBase:
                                     is executed before the Receive operation. micro is {micro_index}.")
         composite_kwargs = kwargs or {}
         out = self.submodule(*composite_args, **composite_kwargs)
+        out, backward_targets = split_backward_targets(out)
+        if backward_targets:
+            self.backward_targets_cache[micro_index] = backward_targets
+            out = hyper_parallel.get_platform().tree_map(_detach_backward_value, out)
         out_tuple = out if isinstance(out, tuple) else (out,)
         self.fwd_cache[micro_index] = out_tuple
         self.fwd_outputs_cache[micro_index] = out_tuple
@@ -152,7 +164,11 @@ class PipelineStageBase:
         fwd_output = self.fwd_cache.pop(micro_index)
         if self.is_last_stage:
             self.fwd_outputs_cache.pop(micro_index, None)
-        local_output = self._filter_grad_outputs(fwd_output)
+        backward_targets = self.backward_targets_cache.pop(micro_index, ())
+        if backward_targets:
+            local_output = [target.tensor for target in backward_targets]
+        else:
+            local_output = self._filter_grad_outputs(fwd_output)
 
         if not local_output:
             # Nothing to backprop through (e.g. all forward outputs detached).
@@ -160,7 +176,10 @@ class PipelineStageBase:
             self._clear_recv_buffer(self.args_recv_info, micro_index)
             return
 
-        grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
+        if backward_targets:
+            grad_tensors = [target.gradient for target in backward_targets]
+        else:
+            grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
         torch.autograd.backward(local_output, grad_tensors=grad_tensors)
 
         if not self.is_first_stage:
