@@ -12,7 +12,7 @@ model:
   force_hf: true
 
 training:
-  train_iters: 10
+  train_steps: 10
   eval_iters: 1
   train_samples: null
   num_train_epochs: 1
@@ -43,8 +43,8 @@ fsdp_config:
 mixed_precision:
   enabled: false
 
-gradient_checkpointing:
-  activation_checkpoint: off
+activation_checkpoint:
+  mode: off
 
 dataset:
   model_assets:

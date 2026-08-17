@@ -522,7 +522,7 @@ class TestReduceBuckets(unittest.TestCase):
         # parameter: accumulation must not fall back to per-parameter views.
         self.assertEqual(len(param_group.reduce_partial_outputs), 1)
         self.assertIsNone(hsdp_param.reduce_partial_output)
-        hsdp_param.all_reduce_tp_replicate_grad_inplace.assert_not_called()
+        hsdp_param.all_reduce_source_replicate_grad_inplace.assert_not_called()
 
         param_group.requires_all_reduce = True
         _set_unsharded_grad(hsdp_param, torch.ones(4))

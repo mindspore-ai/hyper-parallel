@@ -1,0 +1,110 @@
+# TP×CP×EP×FSDP end-to-end demo with an online map-style Dataset.
+
+model:
+  _target_: examples.tp_cp_ep_demo.model_factory.load_qwen2_moe_with_rowwise_bias
+  pretrained_model_name_or_path: ./outputs/tp_cp_ep_demo/tiny_qwen2moe
+  torch_dtype: auto
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_steps: 2
+  eval_iters: 0
+  num_train_epochs: 1
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+
+accelerator:
+  tp_size: 2
+  cp_size: 2
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 2
+  replicate_params:
+    - model.layers.0.mlp.shared_expert_gate.weight
+    - model.layers.1.mlp.shared_expert_gate.weight
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: true
+  comm_fusion: false
+
+plan_overrides:
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper: sdpa_hf
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_models.components.distributed.ep_compute.qwen2moe_ep_compute_fn
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: off
+
+dataset:
+  model_assets:
+    datasets_type: pretokenized
+    chat_template: null
+    tokenizer: null
+  data_transform:
+    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    data_type: pretokenized
+    max_seq_len: 32
+  _target_: hyper_models.components.datasets.llm.build_llm_dataset
+  data_path: ./outputs/training_demo/parallel_data/parallel_online.jsonl
+  data_config:
+    source_type: online
+    dataset_type: mapping
+    hf_dataset_name: null
+    namespace: train
+    show_progress: false
+    create_attention_mask_in_dataloader: false
+
+dataloader:
+  _target_: hyper_models.components.datasets.DataLoader
+  collate_fn:
+    _target_: hyper_models.components.datasets.llm.build_llm_collator
+    packing: false
+  get_batch:
+    _target_: hyper_models.components.datasets.llm.build_llm_get_batch
+  dataloader_type: cyclic
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+
+optimizer:
+  _target_: hyper_models.components.optim.optimizer.AdamW
+  adamw_config:
+    adamw_lr: 1.0e-4
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_models.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: ./outputs/training_demo/parallel_checkpoints
+
+debug:
+  check_nan_inf: false

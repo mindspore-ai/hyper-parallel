@@ -20,6 +20,7 @@ import argparse
 import difflib
 import inspect
 import types
+from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence, Union, get_args, get_origin, get_type_hints
@@ -165,6 +166,18 @@ def _replace_path(config: object, parts: list[str], value: object, *, path: str)
     if isinstance(config, Target):
         return _replace_target_path(config, parts, value, path=path)
 
+    if isinstance(config, Mapping):
+        name = parts[0]
+        full_path = f"{path}.{name}" if path else name
+        if name not in config:
+            raise ConfigResolutionError(f"CLI.{path}: unknown mapping key {name!r}")
+        updated = dict(config)
+        if len(parts) == 1:
+            updated[name] = value
+        else:
+            updated[name] = _replace_path(config[name], parts[1:], value, path=full_path)
+        return updated
+
     location = f"CLI.{path}" if path else "CLI"
     if not is_dataclass(config):
         raise ConfigResolutionError(
@@ -174,6 +187,10 @@ def _replace_path(config: object, parts: list[str], value: object, *, path: str)
     config_fields = {field.name: field for field in fields(config)}
     name = parts[0]
     if name not in config_fields:
+        target = getattr(config, "target", None)
+        if isinstance(target, Target):
+            updated_target = _replace_target_path(target, parts, value, path=path)
+            return replace(config, target=updated_target)
         matches = difflib.get_close_matches(name, config_fields, n=1)
         suggestion = f"; did you mean {matches[0]!r}?" if matches else ""
         raise ConfigResolutionError(

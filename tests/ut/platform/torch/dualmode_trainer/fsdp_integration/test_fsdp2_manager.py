@@ -33,7 +33,7 @@ from hyper_models.components.distributed.infrastructure import MeshContext
 
 
 @dataclass(frozen=True)
-class _FakeTPShardMetaInfo:
+class _FakeSourceShardMetaInfo:
     """Mirror the core metadata contract supplied by the FSDP core PR."""
 
     mesh: object
@@ -108,15 +108,15 @@ class _FakeCausalLM(nn.Module):  # pylint: disable=abstract-method
 
 
 @pytest.fixture(name="core_metadata")
-def _core_metadata(monkeypatch: pytest.MonkeyPatch) -> type[_FakeTPShardMetaInfo]:
-    """Install the TPShardMetaInfo supplied by the dependent core change."""
+def _core_metadata(monkeypatch: pytest.MonkeyPatch) -> type[_FakeSourceShardMetaInfo]:
+    """Install the SourceShardMetaInfo supplied by the dependent core change."""
     monkeypatch.setattr(
         fsdp2_module.fully_shard_utils,
-        "TPShardMetaInfo",
-        _FakeTPShardMetaInfo,
+        "SourceShardMetaInfo",
+        _FakeSourceShardMetaInfo,
         raising=False,
     )
-    return _FakeTPShardMetaInfo
+    return _FakeSourceShardMetaInfo
 
 
 def _make_manager(**config_changes) -> FSDP2Manager:
@@ -162,7 +162,7 @@ def test_parallelize_rejects_tied_layout_conflict(
     core_metadata,
 ) -> None:
     """Resolve FQNs internally and reject conflicting tied-alias layouts."""
-    assert core_metadata is _FakeTPShardMetaInfo
+    assert core_metadata is _FakeSourceShardMetaInfo
     manager = _make_manager()
     model = _FakeCausalLM(tied=True)
     tp_mesh = manager.mesh_context.device_mesh["tp"]
@@ -171,8 +171,8 @@ def test_parallelize_rejects_tied_layout_conflict(
         manager.parallelize(
             model,
             {
-                "model.embed_tokens.weight": (Shard(0), tp_mesh),
-                "lm_head.weight": (Replicate(), tp_mesh),
+                "model.embed_tokens.weight": ((Shard(0),), tp_mesh),
+                "lm_head.weight": ((Replicate(),), tp_mesh),
             },
         )
 
@@ -193,7 +193,7 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
     core_metadata,
 ) -> None:
     """Wrap child blocks then root with owned metadata and configured depths."""
-    assert core_metadata is _FakeTPShardMetaInfo
+    assert core_metadata is _FakeSourceShardMetaInfo
     monkeypatch.setattr(fsdp2_module, "DeviceMesh", _FakeDeviceMesh)
     manager = _make_manager(
         reshard_after_forward=True,
@@ -202,7 +202,7 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
     )
     model = _FakeCausalLM(num_layers=3)
     tp_mesh = manager.mesh_context.device_mesh["tp"]
-    tp_grad_info = {"model.layers.0.proj.weight": (Shard(0), tp_mesh)}
+    source_shard_info = {"model.layers.0.proj.weight": ((Shard(0),), tp_mesh)}
     fully_shard_calls = []
 
     def _fake_fully_shard(module: nn.Module, **kwargs: object) -> nn.Module:
@@ -216,7 +216,7 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
 
     result = manager.parallelize(
         model,
-        tp_grad_info,
+        source_shard_info,
         compile_hooks_enabled=True,
     )
 
@@ -228,10 +228,10 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
     for layer, kwargs in fully_shard_calls[:-1]:
         assert kwargs["reshard_after_forward"] is True
         assert kwargs["compile_hooks_enabled"] is True
-        assert set(kwargs["tp_grad_infos"]) == set(layer.parameters())
+        assert set(kwargs["source_shard_infos"]) == set(layer.parameters())
     assert fully_shard_calls[-1][1]["reshard_after_forward"] is False
     assert fully_shard_calls[-1][1]["compile_hooks_enabled"] is True
-    assert set(fully_shard_calls[-1][1]["tp_grad_infos"]) == {
+    assert set(fully_shard_calls[-1][1]["source_shard_infos"]) == {
         model.model.embed_tokens.weight,
         model.lm_head.weight,
     }
@@ -247,10 +247,10 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
         [second_layer, first_layer]
     )
 
-    first_layer_metadata = fully_shard_calls[0][1]["tp_grad_infos"]
+    first_layer_metadata = fully_shard_calls[0][1]["source_shard_infos"]
     assert first_layer_metadata[first_layer.proj.weight].placements == (Shard(0),)
     assert first_layer_metadata[first_layer.proj.weight].origin_is_dtensor is False
-    second_layer_metadata = fully_shard_calls[1][1]["tp_grad_infos"]
+    second_layer_metadata = fully_shard_calls[1][1]["source_shard_infos"]
     assert second_layer_metadata[second_layer.proj.weight].placements == (Replicate(),)
 
 
@@ -259,7 +259,7 @@ def test_parallelize_resolves_replicate_parameter_fqns(
     core_metadata,
 ) -> None:
     """Resolve configured replicate FQNs inside the root parallelize call."""
-    assert core_metadata is _FakeTPShardMetaInfo
+    assert core_metadata is _FakeSourceShardMetaInfo
     monkeypatch.setattr(fsdp2_module, "DeviceMesh", _FakeDeviceMesh)
     manager = _make_manager(replicate_params=["model.embed_tokens.weight"])
     model = _FakeCausalLM(num_layers=1)
@@ -276,7 +276,7 @@ def test_parallelize_resolves_replicate_parameter_fqns(
 
     manager.parallelize(
         model,
-        {"model.layers.0.proj.weight": (Shard(0), manager.mesh_context.device_mesh["tp"])},
+        {"model.layers.0.proj.weight": ((Shard(0),), manager.mesh_context.device_mesh["tp"])},
     )
 
     assert fully_shard_calls[-1][0] is model

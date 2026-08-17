@@ -43,7 +43,7 @@ from hyper_parallel.platform.mindspore.fully_shard.state import (
 from tests.ut.platform.mindspore.fully_shard.conftest import MindSporeFullyShardUnitTest
 
 
-def _fake_param(*, shard_size=2, replicate_size=1, grad=True, tp_grad_info=None):
+def _fake_param(*, shard_size=2, replicate_size=1, grad=True, source_shard_info=None):
     """Build the facts consumed by state communication methods."""
     hsdp_param = MagicMock()
     mesh_cls = HSDPMeshInfo if replicate_size > 1 and shard_size > 1 else (
@@ -57,7 +57,7 @@ def _fake_param(*, shard_size=2, replicate_size=1, grad=True, tp_grad_info=None)
     hsdp_param.mesh_info = mesh_info
     hsdp_param.shard_world_size = shard_size
     hsdp_param.replicate_world_size = replicate_size
-    hsdp_param.tp_grad_info = tp_grad_info
+    hsdp_param.source_shard_info = source_shard_info
     hsdp_param.orig_dtype = ms.float32
     hsdp_param.reduce_dtype = ms.float32
     hsdp_param.reduce_comm_dtype.return_value = ms.float32
@@ -181,9 +181,9 @@ class TestParameterInitialization(MindSporeFullyShardUnitTest):
 
     def test_default_reduce_op_uses_tp_metadata_contract(self):
         """All source-layout-aware params default to SUM; other states default to AVG."""
-        state = _new_state([_fake_param(tp_grad_info=object())])
+        state = _new_state([_fake_param(source_shard_info=object())])
         self.assertEqual(state._resolve_default_reduce_op(), "sum")
-        state.hsdp_params.append(_fake_param(tp_grad_info=None))
+        state.hsdp_params.append(_fake_param(source_shard_info=None))
         self.assertEqual(state._resolve_default_reduce_op(), "avg")
 
 

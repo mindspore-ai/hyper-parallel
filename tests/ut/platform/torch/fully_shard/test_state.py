@@ -103,7 +103,7 @@ class _FakeHSDPParam:
         self.clear_reduce_scatter_output = MagicMock(side_effect=self._clear_reduce_scatter_output)
         self.clear_all_reduce_output = MagicMock(side_effect=self._clear_all_reduce_output)
         self.apply_reduced_grad = MagicMock(return_value=False)
-        self.all_reduce_tp_replicate_grad_inplace = MagicMock()
+        self.all_reduce_source_replicate_grad_inplace = MagicMock()
         self.allgather_comm_ctx = SimpleNamespace(
             allgather_output=None,
             allgather_handle=None,
@@ -440,7 +440,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
                 scheduler._finalize_comm_fusion_reductions()
                 scheduler.launch_tp_replicate_reduce_and_apply()
 
-                param.all_reduce_tp_replicate_grad_inplace.assert_called_once_with(
+                param.all_reduce_source_replicate_grad_inplace.assert_called_once_with(
                     current_output,
                     torch.distributed.ReduceOp.AVG,
                 )
@@ -556,7 +556,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         scheduler._finalize_comm_fusion_reductions()
         scheduler.launch_tp_replicate_reduce_and_apply()
 
-        param.all_reduce_tp_replicate_grad_inplace.assert_called_once_with(
+        param.all_reduce_source_replicate_grad_inplace.assert_called_once_with(
             reduced_grad,
             torch.distributed.ReduceOp.AVG,
         )
@@ -578,7 +578,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
             scheduler._finalize_per_param_reductions()
             scheduler.launch_tp_replicate_reduce_and_apply()
 
-        param.all_reduce_tp_replicate_grad_inplace.assert_called_once_with(
+        param.all_reduce_source_replicate_grad_inplace.assert_called_once_with(
             reduced_grad,
             torch.distributed.ReduceOp.AVG,
         )
@@ -616,7 +616,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
             return False
 
         param.reduce_scatter_output.side_effect = wait_reduce_scatter
-        param.all_reduce_tp_replicate_grad_inplace.side_effect = launch_tp_reduce
+        param.all_reduce_source_replicate_grad_inplace.side_effect = launch_tp_reduce
         param.apply_reduced_grad.side_effect = apply_reduced_grad
         non_fused_state = _new_state([param], comm_fusion=False)
         fused_root_state = _new_state([], comm_fusion=True)

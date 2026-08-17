@@ -29,7 +29,7 @@ from hyper_parallel.core.fully_shard.utils import (
     DDPMeshInfo,
     FSDPMeshInfo,
     HSDPMeshInfo,
-    TPShardMetaInfo,
+    SourceShardMetaInfo,
 )
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -178,7 +178,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[str] = None,
-        tp_grad_info: Optional[TPShardMetaInfo] = None,
+        source_shard_info: Optional[SourceShardMetaInfo] = None,
     ):
         self._module_info: ParamModuleInfo = module_info
         self.mesh_info = mesh_info
@@ -195,19 +195,19 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.grad_offload_event: Optional[ms.runtime.Event] = None
         dtensor_payload = unwrap_dtensor_param(param)
         if (dtensor_payload is not None) != (
-            tp_grad_info is not None and tp_grad_info.origin_is_dtensor
+            source_shard_info is not None and source_shard_info.origin_is_dtensor
         ):
             raise ValueError(
-                "tp_grad_info.origin_is_dtensor must be True exactly for native DTensor parameters, "
-                f"got parameter type {type(param).__name__} and tp_grad_info={tp_grad_info}"
+                "source_shard_info.origin_is_dtensor must be True exactly for native DTensor parameters, "
+                f"got parameter type {type(param).__name__} and source_shard_info={source_shard_info}"
             )
-        self.tp_grad_info = tp_grad_info
+        self.source_shard_info = source_shard_info
         self._orig_param_is_dtensor = (
-            tp_grad_info is not None and tp_grad_info.origin_is_dtensor
+            source_shard_info is not None and source_shard_info.origin_is_dtensor
         )
-        self._orig_dtensor_mesh = tp_grad_info.mesh if self._orig_param_is_dtensor else None
+        self._orig_dtensor_mesh = source_shard_info.mesh if self._orig_param_is_dtensor else None
         self._orig_dtensor_placements = (
-            tuple(tp_grad_info.placements) if self._orig_param_is_dtensor else None
+            tuple(source_shard_info.placements) if self._orig_param_is_dtensor else None
         )
         self._spmd_shard_mesh_dim = self.mesh_info.shard_mesh_dim
         self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
@@ -261,12 +261,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     def _get_base_spmd_placements(self) -> tuple:
         """Return source-layout placements prefixed by explicit data-parallel axes."""
-        if self.tp_grad_info is not None:
+        if self.source_shard_info is not None:
             self._spmd_mesh = DeviceMesh.concatenate(
-                [self.mesh_info.mesh, self.tp_grad_info.mesh]
+                [self.mesh_info.mesh, self.source_shard_info.mesh]
             )
             dp_prefix = tuple(Replicate() for _ in range(self.mesh_info.mesh.ndim))
-            return dp_prefix + tuple(self.tp_grad_info.placements)
+            return dp_prefix + tuple(self.source_shard_info.placements)
         self._spmd_mesh = self.mesh_info.mesh
         return tuple(Replicate() for _ in range(self._spmd_mesh.ndim))
 
@@ -1083,12 +1083,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         reduce_op: str,
     ) -> None:
         """All-reduce a final gradient over replicated source-layout axes."""
-        if self.tp_grad_info is None or not self.tp_grad_info.placements:
+        if self.source_shard_info is None or not self.source_shard_info.placements:
             return
-        source_mesh = self.tp_grad_info.mesh
+        source_mesh = self.source_shard_info.mesh
         replicate_mesh_dims = tuple(
             mesh_dim
-            for mesh_dim, placement in enumerate(self.tp_grad_info.placements)
+            for mesh_dim, placement in enumerate(self.source_shard_info.placements)
             if placement.is_replicate()
         )
         if not replicate_mesh_dims:

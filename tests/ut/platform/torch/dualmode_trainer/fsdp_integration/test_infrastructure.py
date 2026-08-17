@@ -78,7 +78,7 @@ def test_fsdp_parallelize_receives_tp_fqns_before_compile(monkeypatch) -> None:
     """
     manager = FSDP2Manager(FSDP2Config(), MeshContext())
     model = nn.Linear(4, 4)
-    tp_grad_info_by_fqn = {"weight": object()}
+    source_shard_info_by_fqn = {"weight": object()}
     call_order = []
 
     def _compile_model(input_model: nn.Module, config: object) -> nn.Module:
@@ -90,13 +90,13 @@ def test_fsdp_parallelize_receives_tp_fqns_before_compile(monkeypatch) -> None:
 
     def _parallelize(
         input_model: nn.Module,
-        tp_grad_info: dict | None,
+        source_shard_info: dict | None,
         *,
         compile_hooks_enabled: bool = False,
     ) -> nn.Module:
         """Record FSDP wrapping."""
         assert input_model is model
-        assert tp_grad_info is tp_grad_info_by_fqn
+        assert source_shard_info is source_shard_info_by_fqn
         assert compile_hooks_enabled
         call_order.append("parallelize")
         return input_model
@@ -112,7 +112,7 @@ def test_fsdp_parallelize_receives_tp_fqns_before_compile(monkeypatch) -> None:
         "apply_sharding_plan",
         lambda input_model, plan, input_mesh, validate_mode: (
             input_model,
-            tp_grad_info_by_fqn,
+            source_shard_info_by_fqn,
         ),
     )
 

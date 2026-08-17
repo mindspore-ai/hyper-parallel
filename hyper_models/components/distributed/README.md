@@ -16,7 +16,7 @@ from hyper_models.components.distributed import ShardingPlanner, apply_sharding_
 mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("tp",))
 planner = ShardingPlanner()
 plan = planner.plan(model, mesh, tp_size=4)          # 编译期推导（6-phase）
-model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应用
+model, source_shard_info = apply_sharding_plan(model, plan, mesh)   # production 应用
 # validate 校验：apply_sharding_plan(model, plan, mesh, validate_mode=True)
 ```
 
@@ -29,7 +29,7 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应�
 | 参数 | build 期永久解包为 plain local tensor | 保持 DTensor |
 | 前向 | 纯 local tensor + PrecompiledBoundary | DTensor dispatch 传播 + out_src/out_dst 校验 |
 | 反向 | local autograd（梯度落 local 分片） | local autograd（同左，05 §1.0） |
-| tp_grad_info | 返回（供 FSDP2 fully_shard） | None |
+| source_shard_info | 返回（供 FSDP2 fully_shard） | None |
 
 **架构约束（双模式等价可达 kernel 级精度）**：凡 DTensor dispatch 隐含或无法表达
 数据相关逻辑的模块（embedding mask、attention K/V gather、MoE all-to-all），两模式
@@ -94,7 +94,7 @@ param_role.py         # ParamRole(14) + ParameterClassifier + 默认命名规则
 sharding_planner.py   # ShardingPlanner 6-phase + ARCH_OVERRIDES + SPECIAL_HANDLERS
 sharding_applier.py   # apply_sharding_plan + Phase 0/A/B/C/D + 五路 forward 包装
 precompiled_boundary.py # PrecompiledBoundary/RedistOp/_classify_collective
-tp_grad.py            # build_tp_grad_info + tied 归一化
+source_shard.py            # build_source_shard_info + tied 归一化
 head_count.py         # D-17 TP 本地头数改写（显式 num_heads 写法兼容）
 cp_utils.py           # flex_cp_allgather + shard_batch_for_cp + _shard_seq_lens_for_cp
 ep_utils.py           # _ep_all_to_all 后端分派 + MOE_ROUTER_ADAPTERS + _hf_native_ep_compute（D-09/D-10）

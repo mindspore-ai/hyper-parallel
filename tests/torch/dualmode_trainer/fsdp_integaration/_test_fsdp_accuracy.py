@@ -221,7 +221,7 @@ def _build_dual_mode_model(
         sequence_parallel=mesh_context.sequence_parallel,
         loss_parallel=mesh_context.loss_parallel,
     )
-    model, tp_grad_info_by_fqn = apply_sharding_plan(
+    model, source_shard_info_by_fqn = apply_sharding_plan(
         model,
         sharding_plan,
         mesh_context,
@@ -230,7 +230,7 @@ def _build_dual_mode_model(
     # the HSDP shard mesh. The FQN is configured under fsdp_config and resolved
     # by FSDP2Manager before it applies the root fully_shard call.
     replicate_parameter = model.model.norm.weight
-    fsdp_manager.parallelize(model, tp_grad_info_by_fqn)
+    fsdp_manager.parallelize(model, source_shard_info_by_fqn)
     _assert_runtime_fsdp_configuration(
         model,
         replicate_parameter,
@@ -240,7 +240,7 @@ def _build_dual_mode_model(
             _QWEN2_NUM_LAYERS if use_qwen2_moe else _NUM_LAYERS
         ) * (2 if use_moe or use_qwen2_moe else 1),
     )
-    return model, tp_grad_info_by_fqn
+    return model, source_shard_info_by_fqn
 
 
 def _assert_runtime_fsdp_configuration(
@@ -338,7 +338,7 @@ def _slice_along_dimension(
 def _expected_local_gradient(
     full_gradient: torch.Tensor,
     parameter_name: str,
-    tp_grad_info_by_fqn: dict[str, tuple[Placement, DeviceMesh]],
+    source_shard_info_by_fqn: dict[str, tuple[tuple[Placement, ...], DeviceMesh]],
     mesh_context: MeshContext,
     replicate_parameter_name: str,
 ) -> torch.Tensor:
@@ -346,10 +346,11 @@ def _expected_local_gradient(
     fsdp_non_moe_mesh = mesh_context.fsdp_non_moe_mesh
     if fsdp_non_moe_mesh is None:
         raise RuntimeError("gradient comparison requires a dense FSDP mesh")
-    placement, source_mesh = tp_grad_info_by_fqn.get(
+    placements, source_mesh = source_shard_info_by_fqn.get(
         parameter_name,
-        (Replicate(), fsdp_non_moe_mesh["tp"]),
+        ((Replicate(),), fsdp_non_moe_mesh["tp"]),
     )
+    placement = placements[0]
     local_gradient = full_gradient
     if isinstance(placement, Shard):
         source_mesh_dim = source_mesh.mesh_dim_names[0]
@@ -448,7 +449,7 @@ def _reconstruct_global_tensor(
     local_tensor: torch.Tensor,
     expected_shape: torch.Size,
     parameter_name: str,
-    tp_grad_info_by_fqn: dict[str, tuple[Placement, DeviceMesh]],
+    source_shard_info_by_fqn: dict[str, tuple[tuple[Placement, ...], DeviceMesh]],
     mesh_context: MeshContext,
     replicate_parameter_name: str,
 ) -> torch.Tensor:
@@ -456,10 +457,11 @@ def _reconstruct_global_tensor(
     fsdp_non_moe_mesh = mesh_context.fsdp_non_moe_mesh
     if fsdp_non_moe_mesh is None:
         raise RuntimeError("global reconstruction requires a dense FSDP mesh")
-    placement, source_mesh = tp_grad_info_by_fqn.get(
+    placements, source_mesh = source_shard_info_by_fqn.get(
         parameter_name,
-        (Replicate(), fsdp_non_moe_mesh["tp"]),
+        ((Replicate(),), fsdp_non_moe_mesh["tp"]),
     )
+    placement = placements[0]
     global_tensor = _get_local_tensor(local_tensor)
     post_fsdp_shape = list(expected_shape)
     if isinstance(placement, Shard):
@@ -496,7 +498,7 @@ def _compare_global_parameter_view(
     stage: str,
     standalone_model: torch.nn.Module,
     distributed_model: torch.nn.Module,
-    tp_grad_info_by_fqn: dict[str, tuple[Placement, DeviceMesh]],
+    source_shard_info_by_fqn: dict[str, tuple[tuple[Placement, ...], DeviceMesh]],
     mesh_context: MeshContext,
     replicate_parameter_name: str,
     *,
@@ -519,7 +521,7 @@ def _compare_global_parameter_view(
             distributed_tensor,
             reference_tensor.shape,
             parameter_name,
-            tp_grad_info_by_fqn,
+            source_shard_info_by_fqn,
             mesh_context,
             replicate_parameter_name,
         )
@@ -577,7 +579,7 @@ def _compare_step(
     local_batch_end: int,
     local_sequence_start: int,
     local_sequence_end: int,
-    tp_grad_info_by_fqn: dict[str, tuple[Placement, DeviceMesh]],
+    source_shard_info_by_fqn: dict[str, tuple[tuple[Placement, ...], DeviceMesh]],
     mesh_context: MeshContext,
     replicate_parameter_name: str,
     standalone_optimizer: torch.optim.Optimizer,
@@ -692,7 +694,7 @@ def _compare_step(
         expected_gradient = _expected_local_gradient(
             standalone_parameter.grad.detach().cpu(),
             parameter_name,
-            tp_grad_info_by_fqn,
+            source_shard_info_by_fqn,
             mesh_context,
             replicate_parameter_name,
         )
@@ -722,7 +724,7 @@ def _compare_step(
             f"step {step_index} gradients",
             standalone_model,
             distributed_model,
-            tp_grad_info_by_fqn,
+            source_shard_info_by_fqn,
             mesh_context,
             replicate_parameter_name,
             gradients=True,
@@ -781,7 +783,7 @@ def _compare_step(
             f"step {step_index} updated weights",
             standalone_model,
             distributed_model,
-            tp_grad_info_by_fqn,
+            source_shard_info_by_fqn,
             mesh_context,
             replicate_parameter_name,
             gradients=False,
@@ -793,7 +795,7 @@ def _compare_step(
         expected_parameter = _expected_local_gradient(
             standalone_parameter.detach().cpu(),
             parameter_name,
-            tp_grad_info_by_fqn,
+            source_shard_info_by_fqn,
             mesh_context,
             replicate_parameter_name,
         )
@@ -838,7 +840,7 @@ def _run_accuracy_case(
         )
 
     standalone_model = _build_standalone_model(device, use_moe, use_qwen2_moe)
-    distributed_model, tp_grad_info_by_fqn = _build_dual_mode_model(
+    distributed_model, source_shard_info_by_fqn = _build_dual_mode_model(
         distributed_setup,
         device,
         use_moe,
@@ -879,7 +881,7 @@ def _run_accuracy_case(
             "initial weights",
             standalone_model,
             distributed_model,
-            tp_grad_info_by_fqn,
+            source_shard_info_by_fqn,
             mesh_context,
             replicate_parameter_name,
             gradients=False,
@@ -934,7 +936,7 @@ def _run_accuracy_case(
             local_batch_end,
             local_sequence_start,
             local_sequence_end,
-            tp_grad_info_by_fqn,
+            source_shard_info_by_fqn,
             mesh_context,
             replicate_parameter_name,
             standalone_optimizer,

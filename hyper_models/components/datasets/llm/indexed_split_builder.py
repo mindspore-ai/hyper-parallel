@@ -290,6 +290,16 @@ class IndexedDatasetSplitBuilder:
            config: GPTDatasetConfig,
    ) -> DatasetSplits:
        """Build each mid-level split from one low-level indexed Dataset."""
+       if (
+               config.data_lazy_load
+               and self.parallel_context.distributed_enabled
+               and not (
+                   self.parallel_context.data_index_cache
+                   or self.parallel_context.build_on_rank()
+               )
+       ):
+           return cast(DatasetSplits, (None, None, None))
+
        low_level_dataset = None
        split_indices: list[np.ndarray | None] = [None] * len(split_matrix)
        if not config.data_lazy_load:

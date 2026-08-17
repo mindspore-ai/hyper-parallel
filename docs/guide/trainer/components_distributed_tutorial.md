@@ -46,7 +46,7 @@ TP/CP/EP/FSDP/多维组合 → §10 自定义注入完整指南 → §11-§13 �
 
 ```
 ShardingPlanner.plan(model, mesh, ...)   → ShardingPlan   # 编译期推导（6-phase）
-apply_sharding_plan(model, plan, mesh)   → (model, tp_grad_info)  # 双模式应用
+apply_sharding_plan(model, plan, mesh)   → (model, source_shard_info)  # 双模式应用
 ```
 
 - **Planner**：遍历 `named_parameters()`，按命名规则（`ParamRole`）+ 语义
@@ -81,7 +81,7 @@ planner = ShardingPlanner()
 plan = planner.plan(model, mesh, tp_size=dist.get_world_size())
 
 # 3) 应用分片（production 模式）
-model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+model, source_shard_info = apply_sharding_plan(model, plan, mesh)
 
 # 4) 正常训练/推理——前向输出与单卡逐位一致
 out = model(input_ids)
@@ -135,7 +135,7 @@ model_v, _ = apply_sharding_plan(model, plan, mesh, validate_mode=True)
 | 参数 | build 期**永久解包**为 plain local tensor | 保持 **DTensor** |
 | 前向 | 纯 local tensor + PrecompiledBoundary 通信 | DTensor dispatch 传播 + out_src/out_dst **契约校验** |
 | 反向 | local autograd（梯度落 local 分片） | local autograd（同左） |
-| 返回值 | `tp_grad_info`（供 FSDP） | `None` |
+| 返回值 | `source_shard_info`（供 FSDP） | `None` |
 | 用途 | 生产训练 | 分片正确性验证 / 调试新模型接入 |
 
 ### 3.2 推荐工作流：先 validate 再 production
@@ -149,7 +149,7 @@ out_v = model_v(batch)
 torch.testing.assert_close(out_v, ref_out, rtol=1e-5, atol=1e-5)
 
 # Step 2: 同一份 plan 切 production——零 DTensor dispatch 开销
-model_p, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+model_p, source_shard_info = apply_sharding_plan(model, plan, mesh)
 ```
 
 **架构约束（双模式等价的关键）**：凡 DTensor dispatch 无法表达数据相关
@@ -278,7 +278,7 @@ vocab 并行 CE loss（上游 loss 侧消费）。默认 `False` 时 lm_head 出
 
 `embed_tokens.weight` ↔ `lm_head.weight` 共享存储时，planner 自动检测
 （`plan.tied_pairs`），applier Phase D 归一化两端 placement（Shard 优先
-于 Replicate），`tp_grad_info` 中 tied 对映射到同一 placement——无需
+于 Replicate），`source_shard_info` 中 tied 对映射到同一 placement——无需
 用户处理。
 
 ### 5.5 非标准命名 → ARCH_OVERRIDES
@@ -564,7 +564,7 @@ plan = ShardingPlanner(plan_overrides={
         inner_target="self", inner_wrapper="sdpa_hf",
         region_dispatch=False),
 }).plan(model, mesh, tp_size=4, cp_size=2)
-model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+model, source_shard_info = apply_sharding_plan(model, plan, mesh)
 
 for batch in dataloader:
     batch = shard_batch_for_cp(batch, mesh["cp"])   # 数据管道 CP 切分
@@ -691,7 +691,7 @@ plan = ShardingPlanner(plan_overrides={
         # 必填伴生声明：EP compute 内含 all-to-all 通信 → 区域内不可 dispatch
         region_dispatch=False),
 }).plan(model, mesh, tp_size=4, ep_size=8)
-model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+model, source_shard_info = apply_sharding_plan(model, plan, mesh)
 # YAML（trainer 路径）等价写法：
 #   plan_overrides:
 #     - match: "*.mlp"
@@ -743,12 +743,12 @@ for layer in model.model.layers:
 
 TP/CP/EP 切完后的 **dense 参数**由上游 FSDP（`hyper_parallel/core/
 fully_shard` 的 `fully_shard`，FSDP2 语义）再做数据并行分片。组件与
-FSDP 的接口是 **`tp_grad_info`**——production 模式 `apply_sharding_plan`
+FSDP 的接口是 **`source_shard_info`**——production 模式 `apply_sharding_plan`
 的第二个返回值：
 
 ```python
-model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
-# tp_grad_info: {param_fqn: (tp_placement, tp_mesh)}
+model, source_shard_info = apply_sharding_plan(model, plan, mesh)
+# source_shard_info: {param_fqn: (tp_placement, tp_mesh)}
 ```
 
 契约：
@@ -766,16 +766,16 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
 
 ```python
 # 上游训练流程：apply_sharding_plan 之后、fully_shard 之前
-model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+model, source_shard_info = apply_sharding_plan(model, plan, mesh)
 
-for fqn, (tp_placement, tp_mesh) in tp_grad_info.items():
+for fqn, (tp_placement, tp_mesh) in source_shard_info.items():
     param = get_param_by_fqn(model, fqn)
     register_grad_sync_semantics(param, tp_placement, tp_mesh)  # 上游接口
 
 fully_shard(model, mesh=dp_mesh, ...)   # hyper_parallel/core/fully_shard
 ```
 
-> 说明：`tp_grad_info` 从 **plan** 而非 DTensor 读取（production 下参数
+> 说明：`source_shard_info` 从 **plan** 而非 DTensor 读取（production 下参数
 > 已解包，plan 是唯一保留完整 placement 信息的地方）。
 
 ---
@@ -837,7 +837,7 @@ apply_sharding_plan(model.vision_tower, vit_plan, llm_mesh)
 # ② LLM：与纯 LLM 完全同构的独立 plan/apply
 llm_plan = ShardingPlanner().plan(
     model.language_model, llm_mesh, tp_size=2, ep_size=4)
-model.language_model, tp_grad_info = apply_sharding_plan(
+model.language_model, source_shard_info = apply_sharding_plan(
     model.language_model, llm_plan, llm_mesh)
 ```
 
@@ -1286,7 +1286,7 @@ overrides = {
 # INNER_WRAPPER_REGISTRY 仅为 YAML 字符串引用/团队按名共享而存在；
 # CP/EP 场景的注入内含通信 → 改传 region_dispatch=False（§6/§7）
 plan = ShardingPlanner(plan_overrides=overrides).plan(model, mesh, tp_size=2)
-model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+model, source_shard_info = apply_sharding_plan(model, plan, mesh)
 model(input_ids)   # production 训练 / validate 对拍（validate_mode=True）
 ```
 
@@ -1397,13 +1397,13 @@ plan = planner.plan(
 ### 11.2 `apply_sharding_plan(...)`
 
 ```python
-model, tp_grad_info = apply_sharding_plan(
+model, source_shard_info = apply_sharding_plan(
     model, plan, mesh,
     validate_mode=False,     # True=validate 模式；默认 production
 )
 ```
 
-- 返回 `(model, tp_grad_info)`；validate 下 `tp_grad_info is None`。
+- 返回 `(model, source_shard_info)`；validate 下 `source_shard_info is None`。
 - `model` 也可以是 **PP 多 part 列表**（`apply_sharding_plan([part0, part1], ...)`）。
 
 ### 11.3 DeviceMesh 构建

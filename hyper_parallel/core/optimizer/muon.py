@@ -691,7 +691,7 @@ class Muon(BaseDistributedOptimizer):
         working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
 
         for p in p_list:
-            origin_shape = tuple(getattr(p, 'local_shape', None) or p.to_local().shape) if no_shard else tuple(p.shape)
+            origin_shape = tuple(to_local_if_dtensor(p.data).shape) if no_shard else tuple(p.shape)
             ns_input = ns_inputs[p].view(origin_shape)
             origin_shapes[p] = origin_shape
 

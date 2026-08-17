@@ -1,0 +1,16 @@
+{"messages":[{"role":"user","content":"What does HyperParallel test?"},{"role":"assistant","content":"Distributed model training."}]}
+{"messages":[{"role":"user","content":"Why use local data?"},{"role":"assistant","content":"It makes validation deterministic."}]}
+{"messages":[{"role":"user","content":"What does FSDP shard?"},{"role":"assistant","content":"Parameters, gradients, and optimizer state."}]}
+{"messages":[{"role":"user","content":"What does TP mean?"},{"role":"assistant","content":"Tensor parallelism."}]}
+{"messages":[{"role":"user","content":"What does CP mean?"},{"role":"assistant","content":"Context parallelism."}]}
+{"messages":[{"role":"user","content":"What does EP mean?"},{"role":"assistant","content":"Expert parallelism."}]}
+{"messages":[{"role":"user","content":"How many devices are used?"},{"role":"assistant","content":"Eight devices."}]}
+{"messages":[{"role":"user","content":"Is this a smoke test?"},{"role":"assistant","content":"Yes, it runs one complete step."}]}
+{"messages":[{"role":"user","content":"Where is the model stored?"},{"role":"assistant","content":"In the local validation cache."}]}
+{"messages":[{"role":"user","content":"Does the collator pad batches?"},{"role":"assistant","content":"Yes, when sequence lengths differ."}]}
+{"messages":[{"role":"user","content":"Is a network required?"},{"role":"assistant","content":"No, this fixture is local."}]}
+{"messages":[{"role":"user","content":"What framework runs the model?"},{"role":"assistant","content":"PyTorch on Ascend NPU."}]}
+{"messages":[{"role":"user","content":"What follows forward?"},{"role":"assistant","content":"Backward and optimizer update."}]}
+{"messages":[{"role":"user","content":"Are the weights large?"},{"role":"assistant","content":"No, the validation model is tiny."}]}
+{"messages":[{"role":"user","content":"Why include sixteen records?"},{"role":"assistant","content":"To cover global batching with drop-last."}]}
+{"messages":[{"role":"user","content":"What is validated at the end?"},{"role":"assistant","content":"A successful distributed training step."}]}

@@ -190,23 +190,19 @@ class TextTrainer:
         """Execute one text training step."""
         config = self.base.config
         first_training_batch = self.base.get_batch(data_iterator)
+        num_micro_steps = self.base.num_micro_batches
+        training_batches = [first_training_batch]
+        for _ in range(1, num_micro_steps):
+            training_batches.append(self.base.get_batch(data_iterator))
         self.base.state.global_step += 1
 
-        num_micro_steps = self.base.num_micro_batches
-        micro_batches = [first_micro_batch]
-        micro_batches.extend(
-            self.base.get_batch(data_iterator)
-            for _ in range(1, num_micro_steps)
-        )
-
-        self.on_step_begin(micro_batches=micro_batches)
+        self.on_step_begin(micro_batches=training_batches)
         synchronize()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step in range(num_micro_steps):
-            model_inputs, loss_inputs = first_training_batch if micro_step == 0 else self.base.get_batch(data_iterator)
+        for micro_step, (model_inputs, loss_inputs) in enumerate(training_batches):
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base._configure_fsdp_gradient_sync(
                 micro_step,
@@ -282,7 +278,11 @@ class TextTrainer:
             self.base.state.epoch = epoch
             self.on_epoch_begin()
 
-            data_iterator = iter(self.base.train_dataloader)
+            data_iterator = (
+                iter(self.base.train_dataloader)
+                if self.base.train_dataloader is not None
+                else None
+            )
 
             epoch_steps = self.base.steps_per_epoch or self.base.train_steps - self.base.state.global_step
             for _ in range(self.base.start_step, epoch_steps):

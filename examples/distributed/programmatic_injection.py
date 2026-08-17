@@ -250,7 +250,7 @@ def main():
         # 只需两行：plan + apply——没有 trainer、没有 YAML
         plan = ShardingPlanner(plan_overrides=build_overrides()).plan(
             model, mesh, tp_size=tp_size)
-        model, tp_grad_info = apply_sharding_plan(
+        model, source_shard_info = apply_sharding_plan(
             model, plan, mesh, validate_mode=(mode == "validate"))
 
         with torch.no_grad():

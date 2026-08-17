@@ -5,7 +5,7 @@
 """test_s2_boundary.py: 核心套件合并文件。
 
 来源: test_s2_boundary_compile.py, test_s2_boundary_io.py, test_s2_path_utils.py,
-test_s2_tp_grad_info.py, test_local_region.py
+test_s2_source_shard_info.py, test_local_region.py
 """
 
 # Pytest injects fixtures through parameters that intentionally reuse fixture names.
@@ -35,7 +35,7 @@ from hyper_models.components.distributed.sharding_config import (
     ShardingPlan,
     TP,
 )
-from hyper_models.components.distributed.tp_grad import build_tp_grad_info
+from hyper_models.components.distributed.source_shard import build_source_shard_info
 from hyper_models.components.distributed.tp_collective_lowering import (
     TPExecutionOp,
     create_tp_collective_lowerer,
@@ -492,8 +492,8 @@ class TestPathUtils:
 
 
 # ==========================================================================
-# 来源: test_s2_tp_grad_info.py
-# S2.9: build_tp_grad_info + tied 归一化（单进程，mock mesh）。
+# 来源: test_s2_source_shard_info.py
+# S2.9: build_source_shard_info + tied 归一化（单进程，mock mesh）。
 # ==========================================================================
 
 class _FakeTpMesh:
@@ -513,18 +513,18 @@ def _plan():
 
 def test_reads_from_plan_not_dtensor():
     tp_mesh = _FakeTpMesh()
-    info = build_tp_grad_info(_plan(), tp_mesh)
-    assert info["model.embed_tokens.weight"] == (Shard(0), tp_mesh)
-    assert info["model.layers.0.input_layernorm.weight"] == (Replicate(), tp_mesh)
-    assert info["lm_head.weight"] == (Shard(0), tp_mesh)
+    info = build_source_shard_info(_plan(), tp_mesh)
+    assert info["model.embed_tokens.weight"] == ((Shard(0),), tp_mesh)
+    assert info["model.layers.0.input_layernorm.weight"] == ((Replicate(),), tp_mesh)
+    assert info["lm_head.weight"] == ((Shard(0),), tp_mesh)
 
 
 def test_tied_consistent_placements_unchanged():
     plan = _plan()
     plan.tied_pairs = [("model.embed_tokens.weight", "lm_head.weight")]
-    info = build_tp_grad_info(plan, _FakeTpMesh())
-    assert info["model.embed_tokens.weight"][0] == Shard(0)
-    assert info["lm_head.weight"][0] == Shard(0)
+    info = build_source_shard_info(plan, _FakeTpMesh())
+    assert info["model.embed_tokens.weight"][0] == (Shard(0),)
+    assert info["lm_head.weight"][0] == (Shard(0),)
 
 
 def test_tied_inconsistent_shard_wins():
@@ -533,32 +533,41 @@ def test_tied_inconsistent_shard_wins():
     plan.modules["lm_head"] = ModuleShardingSpec(
         params={"weight": {TP: Replicate()}})
     plan.tied_pairs = [("model.embed_tokens.weight", "lm_head.weight")]
-    info = build_tp_grad_info(plan, _FakeTpMesh())
-    assert info["model.embed_tokens.weight"][0] == Shard(0)
-    assert info["lm_head.weight"][0] == Shard(0)  # 归一化为 Shard
+    info = build_source_shard_info(plan, _FakeTpMesh())
+    assert info["model.embed_tokens.weight"][0] == (Shard(0),)
+    assert info["lm_head.weight"][0] == (Shard(0),)  # 归一化为 Shard
 
 
 def test_tied_pair_not_in_plan_ignored():
     plan = _plan()
     plan.tied_pairs = [("ghost.a", "ghost.b")]
-    info = build_tp_grad_info(plan, _FakeTpMesh())
+    info = build_source_shard_info(plan, _FakeTpMesh())
     assert "ghost.a" not in info
 
 
 def test_explicit_tied_pairs_override():
     plan = _plan()
-    info = build_tp_grad_info(
+    info = build_source_shard_info(
         plan, _FakeTpMesh(),
         tied_pairs=[("model.embed_tokens.weight", "lm_head.weight")])
-    assert info["lm_head.weight"][0] == Shard(0)
+    assert info["lm_head.weight"][0] == (Shard(0),)
 
 
 def test_no_tp_axis_mesh_none():
     plan = ShardingPlan(mesh_dim_names=("cp",))
     plan.modules["m"] = ModuleShardingSpec(params={"w": {"cp": Replicate()}})
-    info = build_tp_grad_info(plan, None)
-    # 无 tp 键 → 默认 Replicate
-    assert info["m.w"][0] == Replicate()
+    info = build_source_shard_info(plan, None)
+    # cp 轴归 FSDP 所有 → source 维为空，无 placements 可记录
+    assert info["m.w"][0] == ()
+
+
+def test_fsdp_owned_axis_shard_rejected():
+    """权重在 FSDP 占有轴（如 cp）上声明 Shard → fail-fast。"""
+    plan = ShardingPlan(mesh_dim_names=("cp", "tp"))
+    plan.modules["m"] = ModuleShardingSpec(
+        params={"w": {"cp": Shard(1), TP: Shard(0)}})
+    with pytest.raises(ValueError, match="conflicts with FSDP ownership"):
+        build_source_shard_info(plan, _FakeTpMesh())
 
 
 def test_tp_extend_ep_uses_real_expert_source_layout():
@@ -575,18 +584,18 @@ def test_tp_extend_ep_uses_real_expert_source_layout():
     dense_tp_mesh = _FakeTpMesh()
     expert_ep_mesh = _FakeTpMesh()
 
-    info = build_tp_grad_info(
+    info = build_source_shard_info(
         plan,
         dense_tp_mesh,
         expert_source_mesh=expert_ep_mesh,
     )
 
     assert info["model.layers.0.mlp.experts.gate_proj"] == (
-        Shard(0),
+        (Shard(0),),
         expert_ep_mesh,
     )
     assert info["model.layers.0.mlp.gate.weight"] == (
-        Replicate(),
+        (Replicate(),),
         dense_tp_mesh,
     )
 
@@ -604,7 +613,7 @@ def test_tp_extend_ep_requires_expert_source_mesh():
         ValueError,
         match="Routed expert metadata requires an expert EP source mesh",
     ):
-        build_tp_grad_info(plan, _FakeTpMesh())
+        build_source_shard_info(plan, _FakeTpMesh())
 
 
 # ==========================================================================

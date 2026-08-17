@@ -180,20 +180,20 @@ def _plan_and_apply_sharding(
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
     )
-    model, tp_grad_info = apply_sharding_plan(
+    model, source_shard_info = apply_sharding_plan(
         model,
         plan,
         mesh,
         validate_mode=validate_placement,
     )
-    logger.info("Sharding plan applied; tp_grad_info keys=%d", len(tp_grad_info or {}))
-    return model, tp_grad_info
+    logger.info("Sharding plan applied; source_shard_info keys=%d", len(source_shard_info or {}))
+    return model, source_shard_info
 
 
 def _apply_fsdp2(
     model: nn.Module,
     fsdp2_manager,
-    tp_grad_info,
+    source_shard_info,
     compile_for_execution: bool = False,
 ) -> nn.Module:
     """Apply FSDP2 and keep its hooks outside Dynamo during execution compile."""
@@ -204,7 +204,7 @@ def _apply_fsdp2(
         return model
     model = fsdp2_manager.parallelize(
         model,
-        tp_grad_info=tp_grad_info,
+        source_shard_info=source_shard_info,
         compile_hooks_enabled=compile_for_execution,
     )
     logger.info("FSDP2 wrap applied")
@@ -599,7 +599,7 @@ def apply_model_infrastructure(
         logger.warning("Parameter freezing not implemented in stub")
 
     # Steps 7-8: plan and apply parameter/activation layouts.
-    model, tp_grad_info = _plan_and_apply_sharding(
+    model, source_shard_info = _plan_and_apply_sharding(
         model,
         mesh,
         sharding_planner,
@@ -623,7 +623,7 @@ def apply_model_infrastructure(
         model = _apply_fsdp2(
             model,
             fsdp2_manager,
-            tp_grad_info,
+            source_shard_info,
             compile_for_execution=compile_for_execution,
         )
 

@@ -15,7 +15,7 @@
 """testing.grad_equiv: M_D.15a dual-mode gradient equivalence utilities (05 §5.5 revised).
 
 The in-house DTensor is forward-only (05 §1.0): the backward of both
-production (FSDP/tp_grad_info bypass) and validate (local autograd, direct
+production (FSDP/source_shard_info bypass) and validate (local autograd, direct
 output) follows the **local tensor path** — there is no "DTensor backward"
 control group. Dual-mode gradient equivalence therefore compares gradients
 parameter by parameter directly:
@@ -25,7 +25,7 @@ parameter by parameter directly:
 - TP-Replicate parameters: gradients in both modes are likewise Partial
   contributions, equal rank by rank; before comparing against the
   single-card reference gradient they must first go through the
-  tp_grad_info bypass all-reduce (this module provides a simulation; the
+  source_shard_info bypass all-reduce (this module provides a simulation; the
   real FSDP2 fork path is part of the M_M.2a joint integration).
 """
 
@@ -58,7 +58,7 @@ def assert_grad_equivalence(prod_grads, val_grads, *, rtol=1e-3, atol=1e-5):
 
 
 def simulate_tp_replicate_grad_sync(grad, tp_group):
-    """Simulate the tp_grad_info bypass: TP all-reduce of TP-Replicate parameter gradients.
+    """Simulate the source_shard_info bypass: TP all-reduce of TP-Replicate parameter gradients.
 
     The real path is implemented by the FSDP2 fork's all_reduce_grad
     (M_M.2a joint integration); this is used for gradient equivalence

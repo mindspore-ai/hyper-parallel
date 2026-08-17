@@ -92,7 +92,7 @@ from hyper_models.components.distributed.sharding_planner import (
     ShardingPlanner,
     validate_model_compatibility,
 )
-from hyper_models.components.distributed.tp_grad import build_tp_grad_info
+from hyper_models.components.distributed.source_shard import build_source_shard_info
 
 __all__ = [
     "ARCH_OVERRIDES",
@@ -122,7 +122,7 @@ __all__ = [
     "apply_sharding_plan",
     "bind_local_expert_forward",
     "build_expert_mesh",
-    "build_tp_grad_info",
+    "build_source_shard_info",
     "check_dispatchable",
     "deepseekv3_ep_compute_fn",
     "mixtral_ep_compute_fn",

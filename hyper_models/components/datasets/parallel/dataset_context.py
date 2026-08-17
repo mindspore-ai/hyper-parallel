@@ -54,10 +54,11 @@ class DatasetParallelContext:
     dp_world_size: int = 1
 
 
-def _is_tp_rank_zero(mesh_context: Any) -> bool:
-    """Return whether the current rank is rank zero in its TP group."""
+def _is_batch_source_rank(mesh_context: Any) -> bool:
+    """Return whether the rank owns the DataLoader for its DP replica."""
     tp_rank = int(getattr(mesh_context, "tp_rank", 0))
-    return tp_rank == 0
+    cp_rank = int(getattr(mesh_context, "cp_rank", 0))
+    return tp_rank == 0 and cp_rank == 0
 
 
 def _is_global_cache_builder_rank(shared_storage: bool) -> bool:
@@ -100,7 +101,7 @@ def create_dataset_parallel_context(
         logger.debug("Created standalone Dataset context: data_index_cache=%s", data_index_cache)
         return parallel_context
 
-    build_on_rank = partial(_is_tp_rank_zero, mesh_context)
+    build_on_rank = partial(_is_batch_source_rank, mesh_context)
     build_cache_on_rank = partial(_is_global_cache_builder_rank, shared_storage)
     parallel_context = DatasetParallelContext(
         build_on_rank=build_on_rank,

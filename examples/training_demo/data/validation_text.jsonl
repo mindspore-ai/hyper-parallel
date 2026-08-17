@@ -1,0 +1,16 @@
+{"text":"HyperParallel validates an online mapping dataset on eight devices."}
+{"text":"A local fixture keeps the end-to-end smoke test deterministic."}
+{"text":"The tokenizer converts plain text before the collator pads it."}
+{"text":"Each data-parallel rank receives one sample in this validation step."}
+{"text":"Streaming and mapping datasets use different loading strategies."}
+{"text":"The model checkpoint is deliberately tiny for fast NPU validation."}
+{"text":"This sentence provides another independent training document."}
+{"text":"The final record completes one global batch across eight ranks."}
+{"text":"A second global batch keeps drop-last behavior well defined."}
+{"text":"Local JSON input avoids coupling validation to network availability."}
+{"text":"The Trainer builds masks and positions after batch transport."}
+{"text":"FSDP shards model parameters across the data-parallel mesh."}
+{"text":"One optimizer step exercises loading forward backward and update."}
+{"text":"The example remains readable as a plain Hugging Face JSON source."}
+{"text":"Short records are sufficient for functional distributed testing."}
+{"text":"All validation records stay within the tiny tokenizer vocabulary."}

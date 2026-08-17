@@ -13,7 +13,7 @@ gate/up/down_proj 全部带 bias，OPT/GPT-NeoX 风格），TP=2：
 - 双模式梯度等价 + 与单卡参考梯度对拍（SP 下）：
   colwise bias（q_proj/gate_proj，Shard(0) 随权重）本地分片切片对拍；
   rowwise deferred bias（o_proj/down_proj，保持 Replicate）模拟
-  tp_grad_info 旁路 all-reduce 后对拍；
+  source_shard_info 旁路 all-reduce 后对拍；
 - 参数身份不变：apply 后 state_dict 键集合与 apply 前完全一致。
 """
 
@@ -91,7 +91,7 @@ def _worker(rank, world_size):
 
         if not sp:
             # nosp 下每 rank 持全量输出，Replicate 参数的局部梯度已是全量
-            # 贡献的冗余拷贝，不经 tp_grad_info 旁路——梯度对拍限定 SP 形态
+            # 贡献的冗余拷贝，不经 source_shard_info 旁路——梯度对拍限定 SP 形态
             # （与既有 grad_equiv 套件口径一致）
             continue
         for mode in ("production", "validate"):
@@ -110,7 +110,7 @@ def _worker(rank, world_size):
                     rank * chunk_i:(rank + 1) * chunk_i],
                 rtol=1e-3, atol=1e-5)
             # rowwise deferred bias（保持 Replicate）：Partial 贡献需
-            # tp_grad_info 旁路 all-reduce 后与参考一致（两 rank 相等）
+            # source_shard_info 旁路 all-reduce 后与参考一致（两 rank 相等）
             for name in ("model.layers.0.self_attn.o_proj.bias",
                          "model.layers.0.mlp.down_proj.bias"):
                 synced = simulate_tp_replicate_grad_sync(g[name], tp_group)
