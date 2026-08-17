@@ -71,7 +71,7 @@ class TextTrainer:
         tokenizer_target = assets_config.tokenizer
         if tokenizer_target is None:
             self.base.tokenizer = None
-        elif hasattr(tokenizer_target, "pretrained_model_name_or_path"):
+        elif getattr(tokenizer_target, "pretrained_model_name_or_path", None):
             self.base.tokenizer = tokenizer_target.build()
         else:
             self.base.tokenizer = tokenizer_target.build(
