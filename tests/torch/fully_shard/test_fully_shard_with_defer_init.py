@@ -32,21 +32,3 @@ def test_fully_shard_meta_init():
         TorchCase(_TEST_FULLY_SHARD_WITH_DEFER_INIT, "test_fully_shard_meta_init", 12360, 4),
         TorchCase(_TEST_FULLY_SHARD_WITH_DEFER_INIT, "test_fully_shard_init_empty_weights_with_prefetch", 12361, 4),
     ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_meta_init_comm_fusion():
-    """
-    Feature: Test fully_shard deferred init with comm_fusion
-    Description:
-        1.test_fully_shard_meta_init_comm_fusion_matches_nonfusion
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(
-            _TEST_FULLY_SHARD_WITH_DEFER_INIT,
-            "test_fully_shard_meta_init_comm_fusion_matches_nonfusion",
-            12362,
-            4,
-        ),
-    ])

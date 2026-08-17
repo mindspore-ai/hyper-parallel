@@ -20,6 +20,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 # pylint: disable=C0413
 from typing import List, Tuple
 
+import pytest
 import torch
 from torch import nn, Tensor
 from torch import optim
@@ -133,7 +134,11 @@ def _clone_local_parameters(model: nn.Module) -> dict[str, torch.Tensor]:
     return local_parameters
 
 
-def _assert_meta_init_matches_standalone(hidden_size: int, mesh: DeviceMesh) -> None:
+def _assert_meta_init_matches_standalone(
+    hidden_size: int,
+    mesh: DeviceMesh,
+    comm_fusion: bool,
+) -> None:
     """Train a meta-initialized model and compare its trajectory with standalone."""
     with torch.device("meta"):
         model = MetaInitNet(hidden_size)
@@ -142,6 +147,7 @@ def _assert_meta_init_matches_standalone(hidden_size: int, mesh: DeviceMesh) -> 
         mesh=mesh,
         reshard_after_forward=True,
         mp_policy=_make_mp_policy(),
+        comm_fusion=comm_fusion,
     )
     model.to_empty(device="npu")
     torch.manual_seed(20260701)
@@ -187,6 +193,8 @@ def _assert_meta_init_matches_standalone(hidden_size: int, mesh: DeviceMesh) -> 
         shard_offset = min(shard_rank * dim0_shard_size, standalone_parameter.size(0))
         actual_shard_size = min(dim0_shard_size, standalone_parameter.size(0) - shard_offset)
         expected_parameter = standalone_parameter.narrow(0, shard_offset, actual_shard_size)
+        if fully_shard_local_parameter.ndim == 1:
+            expected_parameter = expected_parameter.view(-1)
         torch.testing.assert_close(
             fully_shard_local_parameter.cpu(), expected_parameter.cpu(), rtol=1e-5, atol=1e-5
         )
@@ -245,7 +253,12 @@ def _assert_comm_fusion_flat_buffer_aliases(model: nn.Module) -> None:
 # Test cases
 # ---------------------------------------------------------------------------
 
-def test_fully_shard_meta_init():
+@pytest.mark.parametrize(
+    "comm_fusion",
+    [False, True],
+    ids=["per_param", "param_group"],
+)
+def test_fully_shard_meta_init(comm_fusion):
     """
     Feature: Test FSDP and HSDP with meta device initialization.
     Description: Materialize a meta-initialized model on NPU, then compare each training
@@ -265,50 +278,15 @@ def test_fully_shard_meta_init():
             mesh_shape=mesh_shape,
             mesh_dim_names=mesh_dim_names,
         )
-        _assert_meta_init_matches_standalone(hidden_size, mesh)
+        _assert_meta_init_matches_standalone(hidden_size, mesh, comm_fusion)
 
 
-def test_fully_shard_meta_init_comm_fusion_matches_nonfusion():
-    """
-    Feature: deferred initialization with comm_fusion zero-copy.
-    Description: Build two meta-initialized fully_shard models, one using the
-        per-parameter path and one using comm_fusion. Materialize via to_empty,
-        trigger lazy_init on first forward, then compare losses and local shards.
-    Expectation: comm_fusion matches non-fusion numerically and all sharded
-        parameter views alias the fused flat buffer after lazy initialization.
-    """
-    rank, _ = init_dist()
-    hidden_size = 32
-    world_size = dist.get_world_size()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
-
-    torch.manual_seed(20260702 + rank)
-    input_list = [(torch.rand(4, hidden_size).npu(),) for _ in range(2)]
-    no_fusion_model = _build_meta_init_model(hidden_size, mesh, comm_fusion=False)
-    fusion_model = _build_meta_init_model(hidden_size, mesh, comm_fusion=True)
-
-    with SkipDTensorDispatch():
-        no_fusion_losses, no_fusion_local_parameters = _train_and_collect_losses_and_local_parameters(
-            no_fusion_model, input_list
-        )
-        fusion_losses, fusion_local_parameters = _train_and_collect_losses_and_local_parameters(
-            fusion_model, input_list
-        )
-
-    for no_fusion_loss, fusion_loss in zip(no_fusion_losses, fusion_losses):
-        torch.testing.assert_close(fusion_loss.cpu(), no_fusion_loss.cpu(), rtol=1e-5, atol=1e-5)
-    assert fusion_local_parameters.keys() == no_fusion_local_parameters.keys()
-    for parameter_name, fusion_local_parameter in fusion_local_parameters.items():
-        torch.testing.assert_close(
-            fusion_local_parameter.cpu(),
-            no_fusion_local_parameters[parameter_name].cpu(),
-            rtol=1e-5,
-            atol=1e-5,
-        )
-    _assert_comm_fusion_flat_buffer_aliases(fusion_model)
-
-
-def test_fully_shard_init_empty_weights_with_prefetch():
+@pytest.mark.parametrize(
+    "comm_fusion",
+    [False, True],
+    ids=["per_param", "param_group"],
+)
+def test_fully_shard_init_empty_weights_with_prefetch(comm_fusion):
     """
     Feature: init_empty_weights + fully_shard + prefetch
     Description: Build a multi-layer model inside init_empty_weights context,
@@ -329,10 +307,28 @@ def test_fully_shard_init_empty_weights_with_prefetch():
 
     fsdp_layers = []
     for layer in model.layers:
-        fully_shard(layer, mesh=mesh, reshard_after_forward=True, mp_policy=mp_policy)
+        fully_shard(
+            layer,
+            mesh=mesh,
+            reshard_after_forward=True,
+            mp_policy=mp_policy,
+            comm_fusion=comm_fusion,
+        )
         fsdp_layers.append(layer)
-    fully_shard(model.head, mesh=mesh, reshard_after_forward=True, mp_policy=mp_policy)
-    fully_shard(model, mesh=mesh, reshard_after_forward=True, mp_policy=mp_policy)
+    fully_shard(
+        model.head,
+        mesh=mesh,
+        reshard_after_forward=True,
+        mp_policy=mp_policy,
+        comm_fusion=comm_fusion,
+    )
+    fully_shard(
+        model,
+        mesh=mesh,
+        reshard_after_forward=True,
+        mp_policy=mp_policy,
+        comm_fusion=comm_fusion,
+    )
 
     for i in range(len(fsdp_layers) - 1):
         fsdp_layers[i].set_modules_to_forward_prefetch([fsdp_layers[i + 1]])

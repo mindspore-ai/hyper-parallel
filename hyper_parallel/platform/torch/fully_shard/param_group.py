@@ -31,10 +31,11 @@ communication groups or element types:
   rebased onto, so the gather reads parameter storage directly.
 - ``ReduceScatterBucket``: one fused reduce-scatter, keyed by (shard group,
   reduce dtype). Packs gradients whose shard dim may differ per parameter.
-- ``AllReduceBucket``: one fused HSDP replicate all-reduce, keyed by
-  (replicate group, reduced-grad dtype), built from completed RS outputs.
+- ``AllReduceBucket``: the optional HSDP/replicate stage paired with one
+  reduce-scatter bucket; it takes over the completed RS output and reduces it
+  in place without per-parameter repacking.
 
-``CommContext`` tracks which ``HSDPParamGroup`` owns each in-flight backward
+``ParamGroupCommCtx`` tracks which ``HSDPParamGroup`` owns each in-flight backward
 stage so the next module's backward can wait on it, giving the three-way
 overlap: layer N reduce-scatter with layer N-1 backward compute, and layer N
 all-reduce with layer N-1 reduce-scatter.
@@ -47,6 +48,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.fully_shard.hsdp_utils import apply_gradient_scaling_factor
+from hyper_parallel.core.fully_shard.hsdp_scheduler import ParamGroupCommCtx
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
 
@@ -240,78 +242,106 @@ class AllGatherBucket:
         self.all_gather_result = None
 
 
+@dataclass
+class GradientBucketLayout:
+    """Describe the shared per-parameter layout of an RS-to-AR bucket chain."""
+
+    hsdp_params: list[TorchHSDPParamV2]
+    param_offsets: list[int]
+    param_numels: list[int]
+    total_numel: int
+
 
 @dataclass
 class ReduceScatterBucket:
     """Own one fused reduce-scatter operation and its temporary buffers.
 
-    ``(id(shard_group), dtype)`` is this bucket's identity across micro-steps and
-    is the key under which ``HSDPParamGroup.reduce_partial_outputs`` parks the
-    output of a non-synchronizing micro-step.
+    Bucket construction records only communication metadata and the source
+    gradients. Buffer preparation, gradient scaling, collective launch, and
+    final result placement are separate execution phases on ``HSDPParamGroup``.
+
+    The shard group plus reduce dtype is this bucket's identity across
+    micro-steps and keys its parked partial output.
     """
 
-    hsdp_params: list[TorchHSDPParamV2]
+    layout: GradientBucketLayout
+    unsharded_grads: list[torch.Tensor]
     shard_group: Optional[dist.ProcessGroup]
     shard_world_size: int
     dtype: torch.dtype
     reduce_op: dist.ReduceOp
     needs_avg_div: bool
-    param_offsets: list[int]
-    reduce_scatter_input: Optional[torch.Tensor]
-    reduce_scatter_output: Optional[torch.Tensor]
-    handle: Optional[dist.Work]
+    reduce_scatter_input: Optional[torch.Tensor] = None
+    reduce_scatter_output: Optional[torch.Tensor] = None
+    handle: Optional[dist.Work] = None
+
+    @property
+    def hsdp_params(self) -> list[TorchHSDPParamV2]:
+        """Return parameters in their fused-buffer order."""
+        return self.layout.hsdp_params
+
+    @property
+    def param_offsets(self) -> list[int]:
+        """Return parameter offsets in the reduce-scatter output."""
+        return self.layout.param_offsets
 
     @property
     def bucket_key(self) -> tuple:
-        """Identity of this bucket's (process group, dtype) fusion class."""
+        """Identity of this bucket's reduce-scatter fusion class."""
         return (id(self.shard_group), self.dtype)
+
+    @property
+    def uses_collective(self) -> bool:
+        """Return whether this bucket needs an actual reduce-scatter call."""
+        return self.shard_group is not None and self.shard_world_size > 1
+
+    def move_reducescatter_output(self) -> torch.Tensor:
+        """Transfer exclusive ownership of the completed output to the next stage."""
+        if self.reduce_scatter_output is None:
+            raise RuntimeError("Reduce-scatter output has already been released.")
+        reduce_scatter_output = self.reduce_scatter_output
+        self.reduce_scatter_output = None
+        return reduce_scatter_output
 
 
 @dataclass
 class AllReduceBucket:
-    """Own one fused HSDP all-reduce operation and its temporary buffer."""
+    """Own the final stage of one fused RS-to-AR bucket chain.
 
-    hsdp_params: list[TorchHSDPParamV2]
-    param_numels: list[int]
+    The bucket shares its parameter layout with exactly one source
+    reduce-scatter bucket. Once RS completes, it takes over that bucket's whole
+    output tensor and all-reduces it in place without per-parameter repacking.
+    """
+
+    layout: GradientBucketLayout
+    source_reduce_scatter_bucket: ReduceScatterBucket
     replicate_group: dist.ProcessGroup
     replicate_world_size: int
     dtype: torch.dtype
     reduce_op: dist.ReduceOp
     needs_avg_div: bool
-    param_offsets: list[int]
     all_reduce_output: Optional[torch.Tensor] = None
     handle: Optional[dist.Work] = None
 
+    @property
+    def hsdp_params(self) -> list[TorchHSDPParamV2]:
+        """Return parameters in their fused-buffer order."""
+        return self.layout.hsdp_params
 
-@dataclass
-class CommContext:
-    """Track the two ParamGroup stages in the fused backward pipeline.
+    @property
+    def param_numels(self) -> list[int]:
+        """Return padded parameter sizes in the all-reduce output."""
+        return self.layout.param_numels
 
-    Backward reduction is split into two stages so each can overlap the next
-    module's compute:
+    @property
+    def param_offsets(self) -> list[int]:
+        """Return parameter offsets in the all-reduce output."""
+        return self.layout.param_offsets
 
-    - ``pre_param_group``: has an in-flight fused reduce-scatter. The next
-      module's post-backward waits it and issues that group's all-reduce.
-    - ``all_reduce_param_group``: has an in-flight fused all-reduce. The next
-      post-backward waits it and saves the per-parameter gradient views.
-
-    Both fields are process-local and hold at most one group each, so a group
-    parked here is guaranteed to be drained by either the next module's
-    post-backward or the root backward hook. Leaving a group parked past the end
-    of backward would leak its communication buffers, which is why
-    ``reset_iter_state`` clears both.
-    """
-
-    pre_param_group: Optional["HSDPParamGroup"] = None
-    all_reduce_param_group: Optional["HSDPParamGroup"] = None
-
-
-comm_ctx = CommContext()
-
-
-def get_comm_ctx() -> CommContext:
-    """Return the process-local fused communication context."""
-    return comm_ctx
+    @property
+    def uses_collective(self) -> bool:
+        """Return whether this bucket needs an actual all-reduce call."""
+        return self.replicate_world_size > 1
 
 
 def get_all_gather_metadata(hsdp_params: list[TorchHSDPParamV2]) -> AllGatherMetadata:
@@ -406,8 +436,8 @@ def reduce_scatter_copy_in(
 class HSDPParamGroup:
     """Fuse communication for the managed parameters in one fully_shard unit.
 
-    Packs parameter shards into contiguous buckets so each collective is issued
-    once per (group, dtype) instead of once per parameter.
+    Packs parameter shards into contiguous buckets so communication is issued
+    once per compatible route and dtype instead of once per parameter.
 
     Lifecycle within one training iteration:
         1. Forward -- ``unshard()`` builds the all-gather buckets on first use
@@ -416,7 +446,7 @@ class HSDPParamGroup:
            the gathered data out into the per-parameter unsharded buffers.
         3. Backward -- ``foreach_reduce()`` packs the unsharded gradients and
            issues one fused ``reduce_scatter_tensor`` per bucket, then parks
-           itself on ``CommContext`` so a later module's backward waits for it.
+           itself on ``ParamGroupCommCtx`` so a later module's backward waits for it.
         4. Backward (finalize) -- ``wait_reduce_scatter_and_issue_all_reduce()``
            waits the RS buckets and launches the HSDP all-reduces;
            ``wait_all_reduce_and_save_grad()`` waits those and exposes each
@@ -442,9 +472,11 @@ class HSDPParamGroup:
         hsdp_params: list[TorchHSDPParamV2],
         device: Optional[torch.device] = None,
         enable_zero_copy: bool = True,
+        comm_ctx: Optional[ParamGroupCommCtx] = None,
     ) -> None:
         self.device = device
         self.hsdp_params = hsdp_params
+        self.comm_ctx = comm_ctx or ParamGroupCommCtx()
         self.enable_zero_copy = enable_zero_copy
         self.gradient_scaling_factor = None
         self.requires_all_reduce = True
@@ -479,6 +511,13 @@ class HSDPParamGroup:
                 [hsdp_param._sharded_param_data.numel()] for hsdp_param in hsdp_params
             ]
             inp_split_sizes = [input_numels[0] for input_numels in param_input_numels]
+            allgather_metadata = AllGatherMetadata(
+                                    param_input_dtypes=[[bucket_key[1]] for _ in hsdp_params],
+                                    param_input_numels=param_input_numels,
+                                    dtype=bucket_key[1],
+                                    inp_split_sizes=inp_split_sizes,
+                                    total_input_numel=sum(inp_split_sizes),
+                                )
             self.all_gather_buckets.append(
                 AllGatherBucket(
                     hsdp_params=hsdp_params,
@@ -486,13 +525,7 @@ class HSDPParamGroup:
                     shard_rank=shard_group.rank(),
                     shard_world_size=shard_group.size(),
                     dtype=bucket_key[1],
-                    metadata=AllGatherMetadata(
-                        param_input_dtypes=[[bucket_key[1]] for _ in hsdp_params],
-                        param_input_numels=param_input_numels,
-                        dtype=bucket_key[1],
-                        inp_split_sizes=inp_split_sizes,
-                        total_input_numel=sum(inp_split_sizes),
-                    ),
+                    metadata=allgather_metadata,
                 )
             )
 
@@ -501,6 +534,7 @@ class HSDPParamGroup:
         if self.all_gather_buckets and any(
             bucket.all_gather_result is not None for bucket in self.all_gather_buckets
         ):
+            # already triggered by pre_module.prefetch(), return directly.
             return
         self.foreach_all_gather(async_op)
 
@@ -511,6 +545,7 @@ class HSDPParamGroup:
             self._init_all_gather_buckets()
         for hsdp_param in self.hsdp_params:
             if hsdp_param.shard_world_size <= 1:
+                # fast path, skip copy_in process.
                 hsdp_param.unshard(async_op)
         for all_gather_bucket in self.all_gather_buckets:
             if all_gather_bucket.all_gather_result is not None:
@@ -558,18 +593,18 @@ class HSDPParamGroup:
         for all_gather_bucket in self.all_gather_buckets:
             all_gather_bucket.copy_out()
         for hsdp_param in self.hsdp_params:
-            if hsdp_param.shard_world_size <= 1:
-                hsdp_param.wait_for_unshard()
-            else:
-                hsdp_param.init_unsharded_param()
-                hsdp_param.to_unsharded()
+            hsdp_param.wait_for_unshard()
 
     def _build_reduce_scatter_buckets(
         self,
         reduce_scatter_reduce_op: dist.ReduceOp,
-        async_op: bool,
     ) -> list[ReduceScatterBucket]:
-        """Pack and launch ordered reduce-scatter buckets for active gradients."""
+        """Build ordered reduce-scatter metadata for active gradients.
+
+        This method deliberately has no tensor or communication side effects:
+        it does not allocate buffers, pack gradients, apply scaling, clear
+        source gradients, or launch collectives.
+        """
         params_by_bucket = {}
         grads_by_bucket = {}
         bucket_groups = {}
@@ -600,65 +635,136 @@ class HSDPParamGroup:
         for bucket_key, hsdp_params in params_by_bucket.items():
             shard_group = bucket_groups[bucket_key]
             shard_world_size = hsdp_params[0].shard_world_size
-            reduce_scatter_input_numel = sum(
-                hsdp_param.padded_sharded_param_size.numel() * shard_world_size
+            if any(
+                hsdp_param.shard_world_size != shard_world_size
                 for hsdp_param in hsdp_params
-            )
-            reduce_scatter_input = torch.empty(
-                reduce_scatter_input_numel,
-                dtype=bucket_key[1],
-                device=grads_by_bucket[bucket_key][0].device,
-            )
-            reduce_scatter_copy_in(
-                hsdp_params,
-                grads_by_bucket[bucket_key],
-                reduce_scatter_input,
-                shard_world_size,
-            )
-            apply_gradient_scaling_factor(reduce_scatter_input, self.gradient_scaling_factor)
+            ):
+                raise ValueError("A reduce-scatter bucket must use one shard world size.")
             needs_avg_div = reduce_scatter_reduce_op == dist.ReduceOp.AVG
             communication_op = dist.ReduceOp.SUM if needs_avg_div else reduce_scatter_reduce_op
-            if shard_group is None or shard_world_size <= 1:
-                reduce_scatter_output = reduce_scatter_input
-                handle = None
-            else:
-                reduce_scatter_output = reduce_scatter_input.new_empty(
-                    reduce_scatter_input_numel // shard_world_size
-                )
-                handle = dist.reduce_scatter_tensor(
-                    output=reduce_scatter_output,
-                    input=reduce_scatter_input,
-                    group=shard_group,
-                    op=communication_op,
-                    async_op=async_op,
-                )
             param_offsets = []
+            param_numels = []
             flat_offset = 0
             for hsdp_param in hsdp_params:
+                param_numel = hsdp_param.padded_sharded_param_size.numel()
                 param_offsets.append(flat_offset)
-                flat_offset += hsdp_param.padded_sharded_param_size.numel()
-                if hsdp_param.unsharded_accumulated_grad is not None:
-                    hsdp_param.unsharded_accumulated_grad = None
-                else:
-                    hsdp_param.unsharded_param.grad = None
+                param_numels.append(param_numel)
+                flat_offset += param_numel
             reduce_scatter_buckets.append(
                 ReduceScatterBucket(
-                    hsdp_params=hsdp_params,
+                    layout=self._build_gradient_bucket_layout_from(hsdp_params),
+                    unsharded_grads=grads_by_bucket[bucket_key],
                     shard_group=shard_group,
                     shard_world_size=shard_world_size,
                     dtype=bucket_key[1],
                     reduce_op=communication_op,
                     needs_avg_div=needs_avg_div,
-                    param_offsets=param_offsets,
-                    reduce_scatter_input=reduce_scatter_input,
-                    reduce_scatter_output=reduce_scatter_output,
-                    handle=handle,
                 )
             )
         return reduce_scatter_buckets
 
+    def _build_gradient_bucket_layout_from(self, hsdp_params):
+        param_offsets = []
+        param_numels = []
+        flat_offset = 0
+        for hsdp_param in hsdp_params:
+            param_numel = hsdp_param.padded_sharded_param_size.numel()
+            param_offsets.append(flat_offset)
+            param_numels.append(param_numel)
+            flat_offset += param_numel
+        return GradientBucketLayout(
+                hsdp_params,
+                param_offsets,
+                param_numels,
+                flat_offset
+                )
+
+    @staticmethod
+    def _build_all_reduce_buckets(
+        reduce_scatter_buckets: list[ReduceScatterBucket],
+    ) -> list[AllReduceBucket]:
+        """Build one optional all-reduce stage for each RS bucket."""
+        all_reduce_buckets = []
+        for reduce_scatter_bucket in reduce_scatter_buckets:
+            representative_param = reduce_scatter_bucket.hsdp_params[0]
+            if not isinstance(representative_param.mesh_info, DDPMeshInfo):
+                # FSDP, no need allreduce on replicate mesh dim. skip build relative allreduce-bucket.
+                if any(
+                    isinstance(hsdp_param.mesh_info, DDPMeshInfo)
+                    for hsdp_param in reduce_scatter_bucket.hsdp_params[1:]
+                ):
+                    raise ValueError(
+                        "A reduce-scatter bucket cannot mix parameters with and without "
+                        "a subsequent all-reduce."
+                    )
+                continue
+            replicate_group = representative_param.mesh_info.replicate_process_group
+            replicate_world_size = representative_param.replicate_world_size
+            for hsdp_param in reduce_scatter_bucket.hsdp_params[1:]:
+                if (
+                    not isinstance(hsdp_param.mesh_info, DDPMeshInfo)
+                    or hsdp_param.mesh_info.replicate_process_group is not replicate_group
+                    or hsdp_param.replicate_world_size != replicate_world_size
+                ):
+                    raise ValueError(
+                        "All parameters in a reduce-scatter bucket must share one "
+                        "subsequent all-reduce group."
+                    )
+            all_reduce_buckets.append(
+                AllReduceBucket(
+                    layout=reduce_scatter_bucket.layout,
+                    source_reduce_scatter_bucket=reduce_scatter_bucket,
+                    replicate_group=replicate_group,
+                    replicate_world_size=replicate_world_size,
+                    dtype=reduce_scatter_bucket.dtype,
+                    reduce_op=reduce_scatter_bucket.reduce_op,
+                    needs_avg_div=reduce_scatter_bucket.needs_avg_div,
+                )
+            )
+        return all_reduce_buckets
+
+    def _issue_reduce_scatter_buckets(self, async_op: bool) -> None:
+        """Prepare RS buffers, release source gradients, and launch communication."""
+        for reduce_scatter_bucket in self.reduce_scatter_buckets:
+            reduce_scatter_input = torch.empty(
+                reduce_scatter_bucket.layout.total_numel * reduce_scatter_bucket.shard_world_size,
+                dtype=reduce_scatter_bucket.dtype,
+                device=reduce_scatter_bucket.unsharded_grads[0].device,
+            )
+            reduce_scatter_copy_in(
+                reduce_scatter_bucket.hsdp_params,
+                reduce_scatter_bucket.unsharded_grads,
+                reduce_scatter_input,
+                reduce_scatter_bucket.shard_world_size,
+            )
+            apply_gradient_scaling_factor(reduce_scatter_input, self.gradient_scaling_factor)
+            reduce_scatter_bucket.reduce_scatter_input = reduce_scatter_input
+            if not reduce_scatter_bucket.uses_collective:
+                reduce_scatter_bucket.reduce_scatter_output = reduce_scatter_input
+            else:
+                reduce_scatter_bucket.reduce_scatter_output = reduce_scatter_input.new_empty(
+                    reduce_scatter_bucket.layout.total_numel
+                )
+
+            for hsdp_param in reduce_scatter_bucket.hsdp_params:
+                if hsdp_param.unsharded_accumulated_grad is not None:
+                    hsdp_param.unsharded_accumulated_grad = None
+                else:
+                    hsdp_param.unsharded_param.grad = None
+            reduce_scatter_bucket.unsharded_grads = []
+            if not reduce_scatter_bucket.uses_collective:
+                reduce_scatter_bucket.handle = None
+                continue
+            reduce_scatter_bucket.handle = dist.reduce_scatter_tensor(
+                output=reduce_scatter_bucket.reduce_scatter_output,
+                input=reduce_scatter_bucket.reduce_scatter_input,
+                group=reduce_scatter_bucket.shard_group,
+                op=reduce_scatter_bucket.reduce_op,
+                async_op=async_op,
+            )
+
     @torch.no_grad()
-    def foreach_reduce(
+    def foreach_reducescatter(
         self,
         reduce_scatter_reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG,
         async_op: bool = True,
@@ -666,191 +772,108 @@ class HSDPParamGroup:
         """Launch fused reduce-scatter buckets for this module's gradients."""
         self.reduce_scatter_buckets = self._build_reduce_scatter_buckets(
             reduce_scatter_reduce_op,
-            async_op,
         )
         if not self.reduce_scatter_buckets:
-            return None
+            return
+        self.all_reduce_buckets = self._build_all_reduce_buckets(self.reduce_scatter_buckets)
+        self._issue_reduce_scatter_buckets(async_op)
         if async_op:
-            comm_ctx.pre_param_group = self
+            self.comm_ctx.pre_param_group = self
         else:
             self.wait_reduce_scatter_and_issue_all_reduce(async_op=False)
             self.wait_all_reduce_and_save_grad()
-        return None
+        return
 
-    @staticmethod
-    def _reduced_grad_view(
-        reduce_scatter_bucket: ReduceScatterBucket,
-        param_index: int,
-    ) -> torch.Tensor:
-        """Return one padded parameter view from a completed RS output."""
-        if reduce_scatter_bucket.reduce_scatter_output is None:
-            raise RuntimeError("Reduce-scatter output has already been released.")
-        hsdp_param = reduce_scatter_bucket.hsdp_params[param_index]
-        return reduce_scatter_bucket.reduce_scatter_output.narrow(
-            0,
-            reduce_scatter_bucket.param_offsets[param_index],
-            hsdp_param.padded_sharded_param_size.numel(),
-        )
-
-    def _build_all_reduce_buckets(self) -> list[AllReduceBucket]:
-        """Wait RS buckets and organize completed grads by replicate group and dtype.
-
-        A non-synchronizing micro-step (``requires_all_reduce=False``) returns no
-        all-reduce buckets: each RS output is parked whole in
-        ``reduce_partial_outputs`` and added back by the next synchronizing
-        micro-step. Accumulation therefore costs one ``add_`` per bucket, and the
-        parked buffer is the only copy of those gradients until then -- it must
-        outlive this call, so it is excluded from the RS-output release below.
-
-        The all-reduce buffer is the reduce-scatter output itself whenever a whole
-        RS bucket maps onto a single AR bucket: the reduced shards are already
-        contiguous there in the same order, so all-reducing in place saves one
-        full-size allocation and one full copy per bucket per micro-step. A fresh
-        buffer is packed only when an AR bucket draws from more than one RS bucket,
-        which happens when RS grouped by ``(shard group, dtype)`` splits parameters
-        that share a replicate group.
-
-        HSDP issues both collectives at one reduce dtype, so an AR bucket inherits
-        its source RS bucket's ``dtype``, ``reduce_op`` and ``needs_avg_div``
-        rather than re-deriving them.
-        """
-        params_by_bucket = {}
-        grads_by_bucket = {}
-        bucket_groups = {}
-        reduce_ops = {}
-        needs_avg_div = {}
-        source_buckets_by_key = {}
+    def _wait_reduce_scatter_buckets(self) -> None:
+        """Wait prepared RS buckets and finish shard-dimension averaging."""
         for reduce_scatter_bucket in self.reduce_scatter_buckets:
             if reduce_scatter_bucket.handle is not None:
                 reduce_scatter_bucket.handle.wait()
                 reduce_scatter_bucket.handle = None
             reduce_scatter_bucket.reduce_scatter_input = None
-            if reduce_scatter_bucket.needs_avg_div:
+            if reduce_scatter_bucket.reduce_scatter_output is None:
+                raise RuntimeError("Reduce-scatter bucket has not been prepared.")
+            if reduce_scatter_bucket.needs_avg_div and reduce_scatter_bucket.shard_world_size > 1:
                 reduce_scatter_bucket.reduce_scatter_output.div_(
                     reduce_scatter_bucket.shard_world_size
                 )
-            bucket_key = reduce_scatter_bucket.bucket_key
-            if not self.requires_all_reduce:
-                reduce_partial_output = self.reduce_partial_outputs.get(bucket_key)
-                if reduce_partial_output is None:
-                    self.reduce_partial_outputs[bucket_key] = (
-                        reduce_scatter_bucket.reduce_scatter_output
-                    )
-                else:
-                    reduce_partial_output.add_(reduce_scatter_bucket.reduce_scatter_output)
-                continue
-            reduce_partial_output = self.reduce_partial_outputs.pop(bucket_key, None)
-            if reduce_partial_output is not None:
-                reduce_scatter_bucket.reduce_scatter_output.add_(reduce_partial_output)
-            for param_index, hsdp_param in enumerate(reduce_scatter_bucket.hsdp_params):
-                reduced_grad = self._reduced_grad_view(reduce_scatter_bucket, param_index)
-                replicate_group = (
-                    hsdp_param.mesh_info.replicate_process_group
-                    if isinstance(hsdp_param.mesh_info, DDPMeshInfo)
-                    else None
-                )
-                if replicate_group is None or hsdp_param.replicate_world_size <= 1:
-                    hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = reduced_grad
-                    continue
-                all_reduce_key = (id(replicate_group), reduce_scatter_bucket.dtype)
-                if all_reduce_key not in params_by_bucket:
-                    params_by_bucket[all_reduce_key] = []
-                    grads_by_bucket[all_reduce_key] = []
-                    bucket_groups[all_reduce_key] = replicate_group
-                    reduce_ops[all_reduce_key] = reduce_scatter_bucket.reduce_op
-                    needs_avg_div[all_reduce_key] = reduce_scatter_bucket.needs_avg_div
-                    source_buckets_by_key[all_reduce_key] = []
-                params_by_bucket[all_reduce_key].append(hsdp_param)
-                grads_by_bucket[all_reduce_key].append(reduced_grad)
-                if reduce_scatter_bucket not in source_buckets_by_key[all_reduce_key]:
-                    source_buckets_by_key[all_reduce_key].append(reduce_scatter_bucket)
-        drained_reduce_scatter_buckets = self.reduce_scatter_buckets
-        self.reduce_scatter_buckets = []
 
-        all_reduce_buckets = []
-        for bucket_key, hsdp_params in params_by_bucket.items():
-            replicate_group = bucket_groups[bucket_key]
-            reduced_grads = grads_by_bucket[bucket_key]
-            param_offsets = []
-            flat_offset = 0
-            for reduced_grad in reduced_grads:
-                param_offsets.append(flat_offset)
-                flat_offset += reduced_grad.numel()
-            param_numels = [reduced_grad.numel() for reduced_grad in reduced_grads]
-            all_reduce_output = self._reuse_reduce_scatter_output(
-                source_buckets_by_key[bucket_key],
-                hsdp_params,
-                flat_offset,
-            )
-            if all_reduce_output is None:
-                all_reduce_output = torch.empty(
-                    flat_offset,
-                    dtype=bucket_key[1],
-                    device=reduced_grads[0].device,
-                )
-                for reduced_grad, param_offset in zip(reduced_grads, param_offsets):
-                    all_reduce_output.narrow(0, param_offset, reduced_grad.numel()).copy_(reduced_grad)
-            all_reduce_buckets.append(
-                AllReduceBucket(
-                    hsdp_params=hsdp_params,
-                    param_numels=param_numels,
-                    replicate_group=replicate_group,
-                    replicate_world_size=replicate_group.size(),
-                    dtype=bucket_key[1],
-                    reduce_op=reduce_ops[bucket_key],
-                    needs_avg_div=needs_avg_div[bucket_key],
-                    param_offsets=param_offsets,
-                    all_reduce_output=all_reduce_output,
-                )
-            )
-        retained_output_ids = {
-            id(all_reduce_bucket.all_reduce_output) for all_reduce_bucket in all_reduce_buckets
-        }
-        retained_output_ids.update(
-            id(reduce_partial_output) for reduce_partial_output in self.reduce_partial_outputs.values()
-        )
-        for reduce_scatter_bucket in drained_reduce_scatter_buckets:
-            if id(reduce_scatter_bucket.reduce_scatter_output) not in retained_output_ids:
-                reduce_scatter_bucket.reduce_scatter_output = None
-        return all_reduce_buckets
 
     @staticmethod
-    def _reuse_reduce_scatter_output(
-        source_buckets: list["ReduceScatterBucket"],
-        hsdp_params: list[TorchHSDPParamV2],
-        flat_offset: int,
-    ) -> Optional[torch.Tensor]:
-        """Return the RS output usable as this AR bucket's buffer, else ``None``.
-
-        Reuse is only sound when one RS bucket contributed every parameter of this
-        AR bucket, in the same order and covering the whole RS output: the AR then
-        reduces exactly the region the RS wrote, so it can run in place and skip a
-        full-size allocation plus a full copy. Any parameter routed elsewhere (no
-        replicate group, or the replicate group split across RS buckets) breaks
-        that correspondence and forces a freshly packed buffer.
-        """
-        if len(source_buckets) != 1:
-            return None
-        source_bucket = source_buckets[0]
-        if source_bucket.hsdp_params != hsdp_params:
-            return None
-        reduce_scatter_output = source_bucket.reduce_scatter_output
-        if reduce_scatter_output.numel() != flat_offset:
-            return None
-        return reduce_scatter_output
-
-    def wait_reduce_scatter_and_issue_all_reduce(self, async_op: bool = True) -> None:
-        """Wait all RS buckets and launch the resulting HSDP all-reduces."""
-        self.all_reduce_buckets = self._build_all_reduce_buckets()
-        for all_reduce_bucket in self.all_reduce_buckets:
+    def _issue_all_reduce_buckets(
+        all_reduce_buckets: list[AllReduceBucket],
+        async_op: bool,
+    ) -> None:
+        """Launch in-place AR for bucket outputs transferred from RS."""
+        for all_reduce_bucket in all_reduce_buckets:
+            if all_reduce_bucket.all_reduce_output is None:
+                raise RuntimeError("All-reduce bucket has not received its reduce-scatter output.")
+            if not all_reduce_bucket.uses_collective:
+                all_reduce_bucket.handle = None
+                continue
             all_reduce_bucket.handle = dist.all_reduce(
                 all_reduce_bucket.all_reduce_output,
                 group=all_reduce_bucket.replicate_group,
                 op=all_reduce_bucket.reduce_op,
                 async_op=async_op,
             )
+
+    def wait_reduce_scatter_and_issue_all_reduce(self, async_op: bool = True) -> None:
+        """Wait all RS buckets and launch the resulting HSDP all-reduces."""
+        self._wait_reduce_scatter_buckets()
+        # Step1: get fianal reduce_scatter output
+        if not self.requires_all_reduce:
+            # if set_requires_all_reduce is False, accmu grad into reduce_partial_ouptut.
+            for reduce_scatter_bucket in self.reduce_scatter_buckets:
+                bucket_key = reduce_scatter_bucket.bucket_key
+                current_output = reduce_scatter_bucket.move_reducescatter_output()
+                reduce_partial_output = self.reduce_partial_outputs.get(bucket_key)
+                if reduce_partial_output is None:
+                    self.reduce_partial_outputs[bucket_key] = current_output
+                else:
+                    reduce_partial_output.add_(current_output)
+            self.reduce_scatter_buckets = []
+            self.all_reduce_buckets = []
+            return
+
+        for reduce_scatter_bucket in self.reduce_scatter_buckets:
+            reduce_partial_output = self.reduce_partial_outputs.pop(
+                reduce_scatter_bucket.bucket_key,
+                None,
+            )
+            if reduce_partial_output is not None:
+                # current reduce-scattered grad add accmulated grad
+                reduce_scatter_bucket.reduce_scatter_output.add_(reduce_partial_output)
+        # Step2: moving reducescatter bucket lifecycle
+        # Step2.1 build mapping from rs_bucket -> ar_bucket
+        all_reduce_by_source = {
+            id(all_reduce_bucket.source_reduce_scatter_bucket): all_reduce_bucket
+            for all_reduce_bucket in self.all_reduce_buckets
+        }
+        for reduce_scatter_bucket in self.reduce_scatter_buckets:
+            all_reduce_bucket = all_reduce_by_source.get(id(reduce_scatter_bucket))
+            if all_reduce_bucket is not None:
+                # Step2.2-A: need allreduce when HSDP
+                all_reduce_bucket.all_reduce_output = reduce_scatter_bucket.move_reducescatter_output()
+                continue
+            # Step2.2-B: FSDP only, scatter fused result to each hsdp_param manage.
+            reduce_scatter_output = reduce_scatter_bucket.move_reducescatter_output()
+            # reduce_scatter_bucket.reducescatter_output ref decrease in move method.
+            for hsdp_param, param_numel, param_offset in zip(
+                reduce_scatter_bucket.hsdp_params,
+                reduce_scatter_bucket.layout.param_numels,
+                reduce_scatter_bucket.param_offsets,
+            ):
+                hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = reduce_scatter_output.narrow(
+                    0,
+                    param_offset,
+                    param_numel,
+                )
+        self.reduce_scatter_buckets = []
+        # Step3: luanch async allreduce buckets
+        self._issue_all_reduce_buckets(self.all_reduce_buckets, async_op)
         if self.all_reduce_buckets:
-            comm_ctx.all_reduce_param_group = self
+            self.comm_ctx.all_reduce_param_group = self
 
     def wait_all_reduce_and_save_grad(self) -> None:
         """Wait HSDP all-reduces and expose their per-parameter output views."""
@@ -858,7 +881,9 @@ class HSDPParamGroup:
             if all_reduce_bucket.handle is not None:
                 all_reduce_bucket.handle.wait()
                 all_reduce_bucket.handle = None
-            if all_reduce_bucket.needs_avg_div:
+            if all_reduce_bucket.all_reduce_output is None:
+                raise RuntimeError("All-reduce output has already been released.")
+            if all_reduce_bucket.needs_avg_div and all_reduce_bucket.replicate_world_size > 1:
                 all_reduce_bucket.all_reduce_output.div_(all_reduce_bucket.replicate_world_size)
             for hsdp_param, param_numel, param_offset in zip(
                 all_reduce_bucket.hsdp_params,
@@ -872,8 +897,8 @@ class HSDPParamGroup:
                 )
             all_reduce_bucket.all_reduce_output = None
         self.all_reduce_buckets = []
-        if comm_ctx.all_reduce_param_group is self:
-            comm_ctx.all_reduce_param_group = None
+        if self.comm_ctx.all_reduce_param_group is self:
+            self.comm_ctx.all_reduce_param_group = None
 
     def reset_iter_state(self) -> None:
         """Drop communication references after a completed iteration."""
@@ -884,6 +909,7 @@ class HSDPParamGroup:
                 all_gather_bucket.all_gather_result.handle = None
                 all_gather_bucket.all_gather_result = None
         for reduce_scatter_bucket in self.reduce_scatter_buckets:
+            reduce_scatter_bucket.unsharded_grads = []
             reduce_scatter_bucket.reduce_scatter_input = None
             reduce_scatter_bucket.reduce_scatter_output = None
             reduce_scatter_bucket.handle = None
@@ -893,10 +919,10 @@ class HSDPParamGroup:
         self.reduce_scatter_buckets = []
         self.all_reduce_buckets = []
         self.reduce_partial_outputs.clear()
-        if comm_ctx.pre_param_group is self:
-            comm_ctx.pre_param_group = None
-        if comm_ctx.all_reduce_param_group is self:
-            comm_ctx.all_reduce_param_group = None
+        if self.comm_ctx.pre_param_group is self:
+            self.comm_ctx.pre_param_group = None
+        if self.comm_ctx.all_reduce_param_group is self:
+            self.comm_ctx.all_reduce_param_group = None
 
 
 class AllReduceParamGroup:

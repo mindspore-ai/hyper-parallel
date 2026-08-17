@@ -20,8 +20,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import numpy as np
-
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=wrong-import-position
@@ -29,7 +27,7 @@ import torch
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo, ShardedState
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy, TPShardMetaInfo
 from hyper_parallel.platform.torch.fully_shard.param import (
@@ -62,6 +60,7 @@ def _new_param():
     hsdp_param.padded_sharded_param_size = torch.Size((2,))
     hsdp_param.contiguous_sharded_stride = (1,)
     hsdp_param._sharding_spec = SimpleNamespace(mesh="mesh", placements=(Shard(0),))
+    hsdp_param._spmd_placements = (Shard(0),)
     hsdp_param.sharded_param = SimpleNamespace(
         shape=torch.Size((2,)),
         grad=None,
@@ -102,8 +101,8 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         hsdp_param.reduce_dtype = torch.float16
         self.assertEqual(hsdp_param.reduce_comm_dtype(grad), torch.float16)
 
-    def test_dim0_uneven_init_and_reset_keep_actual_view_on_padded_storage(self):
-        """Parameter lifecycle should expose the actual shard while retaining zero padding."""
+    def test_dim0_uneven_init_and_reset_keep_actual_shape_on_padded_storage(self):
+        """Parameter lifecycle should expose the N-D shard while retaining zero padding."""
         module = torch.nn.Module()
         module.weight = torch.nn.Parameter(torch.arange(15, dtype=torch.float32).view(5, 3))
         module_info = ParamModuleInfo(module, "weight", [], [])
@@ -111,7 +110,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
             mesh_info.mesh = DeviceMesh(
                 "cpu",
-                [0, 1],
+                [1, 0],
                 mesh_dim_names=("fsdp",),
                 _init_backend=False,
             )
@@ -133,6 +132,10 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         self.assertEqual(hsdp_param.padded_sharded_param_size, torch.Size((3, 3)))
         self.assertEqual(hsdp_param.sharded_param.local_shape, torch.Size((2, 3)))
         self.assertEqual(hsdp_param.sharded_param.shape, (5, 3))
+        self.assertEqual(
+            hsdp_param.sharded_param.placements,
+            (Shard(0, uneven_shard=True),),
+        )
         torch.testing.assert_close(hsdp_param._sharded_param_data[-3:], torch.zeros(3))
         self.assertEqual(
             hsdp_param.sharded_param._local_tensor.untyped_storage().data_ptr(),
@@ -140,12 +143,9 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         )
 
         loaded_local_tensor = torch.full((2, 3), 9.0)
-        loaded_dtensor = DTensor.from_local(
+        loaded_dtensor = DTensor.from_local_with_layout(
             loaded_local_tensor,
-            hsdp_param._spmd_mesh,
-            hsdp_param._spmd_placements,
-            shape=(5, 3),
-            stride=(3, 1),
+            hsdp_param._sharding_spec,
         )
         module._parameters["weight"] = torch.nn.Parameter(loaded_dtensor)
         hsdp_param.reset_sharded_param()
@@ -154,41 +154,59 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         torch.testing.assert_close(hsdp_param._sharded_param_data[:6], torch.full((6,), 9.0))
         torch.testing.assert_close(hsdp_param._sharded_param_data[6:], torch.zeros(3))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
-    def test_plain_tp_local_param_builds_global_fsdp_tp_layout(self, _mock_get_rank):
-        """Dual-mode TP metadata should restore the global shape before FSDP sharding."""
-        root_mesh = DeviceMesh(
-            "cpu",
-            np.array([[0, 1], [2, 3]]),
-            mesh_dim_names=("fsdp", "tp"),
-            _init_backend=False,
-        )
+    def test_reset_materialized_local_tensor_swaps_dtensor_storage(self):
+        """Materialization should align both DTensor storage references without replacing the Parameter."""
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(torch.empty(4, device="meta"))
+        module_info = ParamModuleInfo(module, "weight", [], [])
         mesh_info = object.__new__(FSDPMeshInfo)
-        mesh_info.mesh = root_mesh["fsdp"]
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+            mesh_info.mesh = DeviceMesh(
+                "cpu",
+                [0, 1],
+                mesh_dim_names=("fsdp",),
+                _init_backend=False,
+            )
         mesh_info.shard_mesh_dim = 0
         mesh_info.replicate_mesh_dim = None
         mesh_info.shard_mesh_rank = 0
         mesh_info.shard_mesh_size = 2
         mesh_info.shard_process_group = None
-        module = torch.nn.Module()
-        module.weight = torch.nn.Parameter(torch.randn(128, 64))
-
         hsdp_param = TorchHSDPParamV2(
             module.weight,
-            ParamModuleInfo(module, "weight", [], []),
+            module_info,
             mesh_info,
             mp_policy=MixedPrecisionPolicy(),
             device=torch.device("cpu"),
-            tp_grad_info=TPShardMetaInfo(
-                root_mesh["tp"],
-                (Shard(0),),
-                origin_is_dtensor=False,
-            ),
         )
+        original_sharded_param = hsdp_param.sharded_param
+        materialized_local_tensor = torch.ones(2)
+        original_sharded_param._local_tensor = materialized_local_tensor
 
-        self.assertEqual(hsdp_param.sharded_param.local_shape, torch.Size((64, 64)))
-        self.assertEqual(hsdp_param.sharded_param.shape, (256, 64))
-        self.assertEqual(hsdp_param._sharding_spec.tensor_shape, (256, 64))
+        with patch.object(torch._C, "_swap_tensor_impl", wraps=torch._C._swap_tensor_impl) as swap_tensor_impl:
+            hsdp_param.reset_sharded_param()
+
+        swap_tensor_impl.assert_called_once()
+        self.assertIs(hsdp_param.sharded_param, original_sharded_param)
+        self.assertIs(module.weight, original_sharded_param)
+        self.assertFalse(original_sharded_param._local_tensor.is_meta)
+        self.assertEqual(original_sharded_param._local_tensor.device, materialized_local_tensor.device)
+        self.assertEqual(
+            original_sharded_param._local_tensor.untyped_storage().data_ptr(),
+            materialized_local_tensor.untyped_storage().data_ptr(),
+        )
+        with torch._C.DisableTorchFunctionSubclass():
+            tensor_impl_storage = original_sharded_param.untyped_storage()
+        local_tensor_storage = original_sharded_param._local_tensor.untyped_storage()
+        self.assertEqual(tensor_impl_storage.device, local_tensor_storage.device)
+        self.assertEqual(tensor_impl_storage.data_ptr(), local_tensor_storage.data_ptr())
+        self.assertEqual(
+            hsdp_param._sharded_param_data.untyped_storage().data_ptr(),
+            local_tensor_storage.data_ptr(),
+        )
+        with patch.object(torch._C, "_swap_tensor_impl") as swap_tensor_impl:
+            hsdp_param.reset_sharded_param()
+        swap_tensor_impl.assert_not_called()
 
     def test_dim0_smaller_than_world_size_preserves_empty_actual_shape(self):
         """Ranks past the last logical row should expose ``(0, *rest)`` over padded storage."""
@@ -199,7 +217,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
             mesh_info.mesh = DeviceMesh(
                 "cpu",
-                [0, 1, 2, 3],
+                [1, 2, 3, 0],
                 mesh_dim_names=("fsdp",),
                 _init_backend=False,
             )
@@ -221,7 +239,91 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         self.assertEqual(hsdp_param.padded_sharded_param_size, torch.Size((1, 3)))
         self.assertEqual(hsdp_param.sharded_param.local_shape, torch.Size((0, 3)))
         self.assertEqual(hsdp_param.sharded_param.shape, (2, 3))
+        self.assertEqual(
+            hsdp_param.sharded_param.placements,
+            (Shard(0, uneven_shard=True),),
+        )
         torch.testing.assert_close(hsdp_param._sharded_param_data, torch.zeros(3))
+
+    def test_hsdp_dim0_uneven_uses_replicate_and_marked_shard(self):
+        """Uneven HSDP should retain replication and mark ceil-chunk geometry."""
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(torch.arange(15, dtype=torch.float32).view(5, 3))
+        module_info = ParamModuleInfo(module, "weight", [], [])
+        mesh_info = object.__new__(HSDPMeshInfo)
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+            mesh_info.mesh = DeviceMesh(
+                "cpu",
+                [[1, 0], [3, 2]],
+                mesh_dim_names=("replicate", "shard"),
+                _init_backend=False,
+            )
+        mesh_info.shard_mesh_dim = 1
+        mesh_info.replicate_mesh_dim = 0
+        mesh_info.shard_mesh_rank = 1
+        mesh_info.shard_mesh_size = 2
+        mesh_info.shard_process_group = None
+        mesh_info.replicate_mesh_rank = 0
+        mesh_info.replicate_mesh_size = 2
+        mesh_info.replicate_process_group = None
+
+        hsdp_param = TorchHSDPParamV2(
+            module.weight,
+            module_info,
+            mesh_info,
+            mp_policy=MixedPrecisionPolicy(),
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(
+            hsdp_param.sharded_param.placements,
+            (Replicate(), Shard(0, uneven_shard=True)),
+        )
+        self.assertEqual(hsdp_param.sharded_param.local_shape, torch.Size((2, 3)))
+
+    def test_tp_shard_with_uneven_fsdp_dim0_builds_combined_layout(self):
+        """Uneven FSDP should preserve TP sharding in the final parameter layout."""
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(torch.arange(15, dtype=torch.float32).view(5, 3))
+        module_info = ParamModuleInfo(module, "weight", [], [])
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+            root_mesh = DeviceMesh(
+                "cpu",
+                [[0, 1], [2, 3]],
+                mesh_dim_names=("fsdp", "tp"),
+                _init_backend=False,
+            )
+            fsdp_mesh = root_mesh["fsdp"]
+            tp_mesh = root_mesh["tp"]
+        mesh_info = object.__new__(FSDPMeshInfo)
+        mesh_info.mesh = fsdp_mesh
+        mesh_info.shard_mesh_dim = 0
+        mesh_info.replicate_mesh_dim = None
+        mesh_info.shard_mesh_rank = 0
+        mesh_info.shard_mesh_size = 2
+        mesh_info.shard_process_group = None
+        tp_grad_info = TPShardMetaInfo(tp_mesh, (Shard(0),), origin_is_dtensor=False)
+
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+            hsdp_param = TorchHSDPParamV2(
+                module.weight,
+                module_info,
+                mesh_info,
+                mp_policy=MixedPrecisionPolicy(),
+                device=torch.device("cpu"),
+                tp_grad_info=tp_grad_info,
+            )
+
+        expected_placements = (
+            StridedShard(0, split_factor=2, uneven_shard=True),
+            Shard(0),
+        )
+        self.assertEqual(hsdp_param.sharded_param.placements, expected_placements)
+        self.assertEqual(hsdp_param.sharded_param.shape, (10, 3))
+        self.assertEqual(hsdp_param.sharded_param.local_shape, torch.Size((3, 3)))
+        self.assertEqual(hsdp_param.sharded_param.layout.tensor_shape, (10, 3))
+        self.assertEqual(hsdp_param.sharded_param.layout.tensor_stride, (3, 1))
+        self.assertEqual(hsdp_param.sharded_param.layout.tensor_dtype, torch.float32)
 
     def test_init_unsharded_param_buffers_reuse_and_force_recreate(self):
         """All-gather buffers should be reused unless recreation is requested."""
@@ -250,18 +352,9 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         del hsdp_param._unsharded_param
         hsdp_param.unsharded_param_buffers = [torch.arange(4, dtype=torch.float32)]
         hsdp_param._contiguous_orig_stride = (1,)
-        hsdp_param.tp_grad_info = TPShardMetaInfo(
-            "mesh",
-            (Shard(0),),
-            origin_is_dtensor=False,
-        )
 
-        with patch("hyper_parallel.platform.torch.fully_shard.param.DTensor.from_local") as mock_from:
-            hsdp_param.init_unsharded_param()
-        self.assertIsInstance(hsdp_param.unsharded_param, torch.nn.Parameter)
-        self.assertNotIsInstance(hsdp_param.unsharded_param, DTensor)
+        hsdp_param.init_unsharded_param()
         torch.testing.assert_close(hsdp_param.unsharded_param, torch.arange(4, dtype=torch.float32))
-        mock_from.assert_not_called()
 
         del hsdp_param._unsharded_param
         hsdp_param.tp_grad_info = TPShardMetaInfo(

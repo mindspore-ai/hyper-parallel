@@ -26,8 +26,8 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     ChunkInfo
 )
 from hyper_parallel.core.distributed_checkpoint.planner import SavePlan, WriteItem
-from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 from hyper_parallel.platform import get_platform
 
 
@@ -150,11 +150,10 @@ def create_chunk_list_for_tensor(obj: Union[Tensor, DTensor]) -> list[ChunkStora
 
         inner_rank_id = rank_list.index(current_rank)
         full_shape = obj.shape
-        slice_area = infer_slice_area_by_rank(
-            mesh_shape=mesh_shape,
-            tensor_map=tensor_map,
-            rank_id=inner_rank_id,
-            full_shape=full_shape,
+        slice_area = infer_slice_area_by_layout(
+            layout,
+            inner_rank_id,
+            full_shape,
         )
         offsets = tuple(s for s, _ in slice_area)
         sizes = tuple(e - s for s, e in slice_area)

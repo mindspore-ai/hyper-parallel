@@ -45,7 +45,14 @@ def _current_device():
 
 
 def _build_hsdp_param(**kwargs):
-    """Construct TorchHSDPParamV2 from the parameter and explicit mesh metadata."""
+    """Construct TorchHSDPParamV2 with the metadata supplied by its owning state."""
+    param = kwargs["param"]
+    if isinstance(param, DTensor):
+        kwargs["tp_grad_info"] = TPShardMetaInfo(
+            mesh=param.device_mesh,
+            placements=tuple(param.placements),
+            origin_is_dtensor=True,
+        )
     return TorchHSDPParamV2(**kwargs)
 
 
@@ -659,18 +666,12 @@ def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
         DTensor.from_local(local_weight, tp_mesh, (Shard(1),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    tp_grad_info = TPShardMetaInfo(
-        mesh=tp_mesh,
-        placements=(Shard(1),),
-        origin_is_dtensor=True,
-    )
 
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        tp_grad_info=tp_grad_info,
     )
 
     assert hsdp_param.sharded_state == ShardedState.SHARDED
@@ -717,24 +718,18 @@ def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
         DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    tp_grad_info = TPShardMetaInfo(
-        mesh=tp_mesh,
-        placements=(Shard(0),),
-        origin_is_dtensor=True,
-    )
 
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        tp_grad_info=tp_grad_info,
     )
 
     assert hsdp_param.sharded_state == ShardedState.SHARDED
     assert hsdp_param.sharded_size == torch.Size((in_channels // (dp_size * tp_size), hidden_size))
     assert tuple(hsdp_param._spmd_placements) == (StridedShard(0, tp_size), Shard(0))
-    assert hsdp_param._sharding_spec.tensor_map == ((0, 1), -1)
+    assert hsdp_param.sharded_param.layout.tensor_map == ((0, 1), -1)
 
     hsdp_param.unshard()
     hsdp_param.wait_for_unshard()
@@ -776,18 +771,12 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
         DTensor.from_local(local_weight, tp_ep_mesh, (Shard(1), Replicate()))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    tp_grad_info = TPShardMetaInfo(
-        mesh=tp_ep_mesh,
-        placements=(Shard(1), Replicate()),
-        origin_is_dtensor=True,
-    )
 
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        tp_grad_info=tp_grad_info,
     )
 
     assert hsdp_param.sharded_state == ShardedState.SHARDED
@@ -830,18 +819,12 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
         DTensor.from_local(local_weight, tp_mesh, (Replicate(),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    tp_grad_info = TPShardMetaInfo(
-        mesh=tp_mesh,
-        placements=(Replicate(),),
-        origin_is_dtensor=True,
-    )
 
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        tp_grad_info=tp_grad_info,
     )
 
     assert hsdp_param.shard_world_size == 1
@@ -893,18 +876,12 @@ def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
         DTensor.from_local(local_weight, tp_mesh, (Shard(1),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    tp_grad_info = TPShardMetaInfo(
-        mesh=tp_mesh,
-        placements=(Shard(1),),
-        origin_is_dtensor=True,
-    )
 
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        tp_grad_info=tp_grad_info,
     )
 
     assert hsdp_param.shard_world_size == 1
@@ -957,17 +934,11 @@ def test_hsdp_param_v2_explicit_dp_mesh_prefixes_unified_layout():
         DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    tp_grad_info = TPShardMetaInfo(
-        mesh=tp_mesh,
-        placements=(Shard(0),),
-        origin_is_dtensor=True,
-    )
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        tp_grad_info=tp_grad_info,
     )
 
     assert hsdp_param._spmd_mesh.mesh_dim_names == ("dp", "fsdp", "tp")
@@ -1015,17 +986,11 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
         DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    tp_grad_info = TPShardMetaInfo(
-        mesh=tp_mesh,
-        placements=(Shard(0),),
-        origin_is_dtensor=True,
-    )
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         device=_current_device(),
-        tp_grad_info=tp_grad_info,
     )
 
     assert hsdp_param._spmd_mesh.mesh_dim_names == ("dp", "fsdp", "tp")
@@ -1196,18 +1161,12 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
         DTensor.from_local(local_weight, tp_mesh, (Shard(1),))
     )
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    tp_grad_info = TPShardMetaInfo(
-        mesh=tp_mesh,
-        placements=(Shard(1),),
-        origin_is_dtensor=True,
-    )
     hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         shard_placement_fn=lambda param: Shard(1),  # pylint: disable=unused-argument
         device=_current_device(),
-        tp_grad_info=tp_grad_info,
     )
     hsdp_param.mp_policy = MixedPrecisionPolicy()
     hsdp_param.init_dtype_attrs(hsdp_param.mp_policy)

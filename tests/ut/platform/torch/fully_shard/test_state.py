@@ -29,11 +29,10 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, DDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.core.fully_shard.api import HSDPModule, _extend_module_with_hsdp_interface
-from hyper_parallel.platform.torch.fully_shard import scheduler as scheduler_mod
 from hyper_parallel.platform.torch.fully_shard import state as state_mod
 from hyper_parallel.platform.torch.fully_shard.param_group import AllReduceParamGroup
 from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
@@ -138,7 +137,6 @@ class _FakeHSDPParam:
     def _clear_reduce_scatter_output(self) -> None:
         """Clear the fake reduce-scatter output like the production parameter."""
         self.reduce_scatter_comm_ctx.reduce_scatter_output = None
-        self._grad = None
 
     def _clear_all_reduce_output(self) -> None:
         """Clear the fake all-reduce output like the production parameter."""
@@ -155,12 +153,12 @@ def _new_state(hsdp_params=None, replicate_params=None, *, comm_fusion=False, of
     state.modules = ()
     state.hsdp_params = list(hsdp_params or [])
     state.replicate_params = list(replicate_params or [])
-    state.config = SimpleNamespace(comm_fusion=comm_fusion, comm_fusion_zero_copy=False)
     state.comm_fusion_policy = SimpleNamespace(
         enable_comm_fusion=comm_fusion,
         comm_fusion_zero_copy=False,
     )
     state.platform = SimpleNamespace()
+    state.scheduler_ctx = HSDPSchedulerContext()
     state.device = torch.device("cpu")
     state.mp_policy = None
     state.offload_policy = offload_policy
@@ -180,7 +178,8 @@ def _new_root_scheduler(state):
     """Create a root scheduler double that finalizes one state."""
     scheduler = object.__new__(TorchHSDPSchedulerV2)
     scheduler.hsdp_state = state
-    scheduler.scheduler_ctx = SimpleNamespace(all_hsdp_schedulers=[scheduler])
+    scheduler.scheduler_ctx = state.scheduler_ctx
+    scheduler.scheduler_ctx.all_hsdp_schedulers = [scheduler]
     return scheduler
 
 
@@ -325,12 +324,6 @@ class TestUnifiedParamTransitionState(unittest.TestCase):
 class TestTorchHSDPStateV2(unittest.TestCase):
     """Unit tests for TorchHSDPStateV2 branch helpers."""
 
-    def tearDown(self):
-        HSDPState.pre_reduce_scatter_params.clear()
-        HSDPState.pre_all_reduce_params.clear()
-        TorchHSDPStateV2.pre_all_reduce_groups.clear()
-        TorchHSDPStateV2.all_reduce_work_groups.clear()
-
     def test_init_param_group_skips_when_disabled_and_constructs_when_enabled(self):
         """Param-group init should include sharded and replicate-only parameters."""
         disabled = _new_state([_FakeHSDPParam()], comm_fusion=False)
@@ -414,7 +407,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         state.requires_all_reduce = False
 
         for _ in range(2):
-            HSDPState.pre_reduce_scatter_params.append(param)
+            state.scheduler_ctx.pre_reduce_scatter_params.append(param)
             state._wait_prev_reduce_scatter_without_all_reduce()
 
         torch.testing.assert_close(
@@ -436,7 +429,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
                 param.reduce_scatter_comm_ctx.reduce_scatter_output = current_output
                 state = _new_state([param])
 
-                HSDPState.pre_reduce_scatter_params.append(param)
+                state.scheduler_ctx.pre_reduce_scatter_params.append(param)
                 state._wait_prev_reduce_scatter_without_all_reduce()
 
                 self.assertIsNone(param.reduce_partial_output)
@@ -444,8 +437,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
                 param.apply_reduced_grad.assert_not_called()
 
                 scheduler = _new_root_scheduler(state)
-                scheduler._finalize_per_param_reductions()
-                param.apply_reduced_grad.assert_not_called()
+                scheduler._finalize_comm_fusion_reductions()
                 scheduler.launch_tp_replicate_reduce_and_apply()
 
                 param.all_reduce_tp_replicate_grad_inplace.assert_called_once_with(
@@ -491,11 +483,12 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         param.apply_reduced_grad.side_effect = apply_reduced_grad
         state = _new_state([param])
 
-        HSDPState.pre_reduce_scatter_params.append(param)
+        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
         state._wait_prev_reduce_scatter_without_all_reduce()
         scheduler = _new_root_scheduler(state)
-        scheduler.launch_tp_replicate_reduce_and_apply()
-        scheduler.launch_tp_replicate_reduce_and_apply()
+        for _ in range(2):
+            scheduler._finalize_comm_fusion_reductions()
+            scheduler.launch_tp_replicate_reduce_and_apply()
 
         torch.testing.assert_close(param.sharded_param.grad, torch.tensor([14.0, 16.0]))
         param.apply_reduced_grad.assert_called_once_with(current_output)
@@ -524,13 +517,13 @@ class TestTorchHSDPStateV2(unittest.TestCase):
 
         sharded.reduce_scatter_grad.assert_called_once()
         replicated.reduce_scatter_grad.assert_called_once()
-        self.assertEqual(len(TorchHSDPStateV2.pre_all_reduce_groups), 2)
+        self.assertEqual(len(state.scheduler_ctx.pre_all_reduce_groups), 2)
         state.shard.assert_called_once()
 
     def test_post_backward_for_comm_fusion_drains_context_and_launches_param_group(self):
         """Comm-fusion post-backward should drain prior groups before launching this group."""
         replicate = _FakeHSDPParam(unsharded_grad=torch.ones(2), shard_size=1)
-        param_group = SimpleNamespace(foreach_reduce=MagicMock())
+        param_group = SimpleNamespace(foreach_reducescatter=MagicMock())
         state = _new_state([replicate], comm_fusion=True)
         state.param_group = param_group
         previous_all_reduce = SimpleNamespace(wait_all_reduce_and_save_grad=MagicMock())
@@ -539,13 +532,13 @@ class TestTorchHSDPStateV2(unittest.TestCase):
             all_reduce_param_group=previous_all_reduce,
             pre_param_group=previous_reduce_scatter,
         )
+        state.scheduler_ctx.param_group_comm_ctx = comm_ctx
 
-        with patch.object(state_mod, "get_comm_ctx", return_value=comm_ctx):
-            TorchHSDPStateV2.post_backward_for_comm_fusion(state)
+        TorchHSDPStateV2.post_backward_for_comm_fusion(state)
 
         previous_all_reduce.wait_all_reduce_and_save_grad.assert_called_once()
         previous_reduce_scatter.wait_reduce_scatter_and_issue_all_reduce.assert_called_once()
-        param_group.foreach_reduce.assert_called_once_with(
+        param_group.foreach_reducescatter.assert_called_once_with(
             reduce_scatter_reduce_op=torch.distributed.ReduceOp.AVG
         )
         replicate.reduce_scatter_grad.assert_not_called()
@@ -560,14 +553,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         param.all_reduce_comm_ctx.all_reduce_output = reduced_grad
         state = _new_state([param], comm_fusion=True)
         scheduler = _new_root_scheduler(state)
-        comm_ctx = SimpleNamespace(
-            all_reduce_param_group=None,
-            pre_param_group=None,
-        )
-
-        with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx):
-            scheduler._finalize_comm_fusion_reductions()
-        param.apply_reduced_grad.assert_not_called()
+        scheduler._finalize_comm_fusion_reductions()
         scheduler.launch_tp_replicate_reduce_and_apply()
 
         param.all_reduce_tp_replicate_grad_inplace.assert_called_once_with(
@@ -588,13 +574,9 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         state._issue_prev_fused_all_reduce = MagicMock()
         scheduler = _new_root_scheduler(state)
 
-        with patch.object(
-            TorchHSDPStateV2,
-            "wait_and_split_all_reduce_work_groups",
-        ):
+        with patch.object(state, "wait_and_split_all_reduce_work_groups"):
             scheduler._finalize_per_param_reductions()
-        param.apply_reduced_grad.assert_not_called()
-        scheduler.launch_tp_replicate_reduce_and_apply()
+            scheduler.launch_tp_replicate_reduce_and_apply()
 
         param.all_reduce_tp_replicate_grad_inplace.assert_called_once_with(
             reduced_grad,
@@ -603,68 +585,63 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         param.apply_reduced_grad.assert_called_once_with(reduced_grad)
         torch.testing.assert_close(param.sharded_param.grad, existing_grad)
 
-    def test_comm_fusion_drain_does_not_consume_non_fusion_output(self):
-        """Fusion queue draining must leave per-parameter RS outputs for their own wait path."""
+    def test_mixed_comm_fusion_root_waits_non_fused_reduce_scatter_before_apply(self):
+        """A fused root must drain a non-fused child's RS before applying its output."""
         reduced_grad = torch.tensor([1.0, 2.0])
+        source_grad = torch.tensor([3.0, 4.0])
+        handle = MagicMock()
+        events = []
         param = _FakeHSDPParam()
-        param._grad = torch.tensor([3.0, 4.0])
+        param._grad = source_grad
         param.reduce_scatter_comm_ctx.reduce_scatter_output = reduced_grad
-        param.reduce_scatter_comm_ctx.reduce_scatter_handle = MagicMock()
-        state = _new_state([param], comm_fusion=False)
-        scheduler = _new_root_scheduler(state)
-        comm_ctx = SimpleNamespace(
-            all_reduce_param_group=None,
-            pre_param_group=None,
+        param.reduce_scatter_comm_ctx.reduce_scatter_handle = handle
+
+        def wait_reduce_scatter():
+            self.assertIs(param._grad, source_grad)
+            events.append("wait_rs")
+            handle.wait()
+            param.reduce_scatter_comm_ctx.reduce_scatter_handle = None
+            param._grad = None
+            return reduced_grad
+
+        def launch_tp_reduce(grad, reduce_op):
+            self.assertIs(grad, reduced_grad)
+            self.assertEqual(reduce_op, torch.distributed.ReduceOp.AVG)
+            events.append("tp_reduce")
+
+        def apply_reduced_grad(grad):
+            self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_handle)
+            self.assertIs(grad, reduced_grad)
+            events.append("apply")
+            return False
+
+        param.reduce_scatter_output.side_effect = wait_reduce_scatter
+        param.all_reduce_tp_replicate_grad_inplace.side_effect = launch_tp_reduce
+        param.apply_reduced_grad.side_effect = apply_reduced_grad
+        non_fused_state = _new_state([param], comm_fusion=False)
+        fused_root_state = _new_state([], comm_fusion=True)
+        non_fused_state.scheduler_ctx = fused_root_state.scheduler_ctx
+        fused_root_state.module_name = "root"
+        scheduler = _new_root_scheduler(fused_root_state)
+        scheduler._is_root = True
+        scheduler._backward_hook = MagicMock()
+
+        def launch_child_reduce_scatter():
+            events.append("launch_rs")
+            fused_root_state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+
+        child_backward_hook = MagicMock(side_effect=launch_child_reduce_scatter)
+        child_scheduler = SimpleNamespace(
+            hsdp_state=non_fused_state,
+            _backward_hook=child_backward_hook,
         )
+        scheduler.scheduler_ctx.all_hsdp_schedulers.append(child_scheduler)
+        scheduler._root_backward_hook()
 
-        with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx):
-            scheduler._finalize_comm_fusion_reductions()
-
-        param.apply_reduced_grad.assert_not_called()
-        param.clear_reduce_scatter_output.assert_not_called()
-        self.assertIs(param.reduce_scatter_comm_ctx.reduce_scatter_output, reduced_grad)
-        self.assertIsNotNone(param.reduce_scatter_comm_ctx.reduce_scatter_handle)
-        self.assertIsNotNone(param._grad)
-
-    def test_root_finalization_drains_and_applies_mixed_fusion_modes(self):
-        """A fused root should drain both DP paths and apply outputs from non-fused children."""
-        fusion_output = torch.tensor([1.0, 2.0])
-        per_param_output = torch.tensor([3.0, 4.0])
-        fusion_param = _FakeHSDPParam()
-        fusion_param.all_reduce_comm_ctx.all_reduce_output = fusion_output
-        per_param = _FakeHSDPParam()
-        per_param.reduce_scatter_comm_ctx.reduce_scatter_output = per_param_output
-        fusion_state = _new_state([fusion_param], comm_fusion=True)
-        per_param_state = _new_state([per_param], comm_fusion=False)
-        fusion_state._wait_prev_reduce_scatter = MagicMock(return_value=[])
-        fusion_state._wait_prev_reduce_scatter_without_all_reduce = MagicMock()
-        fusion_state._issue_prev_fused_all_reduce = MagicMock()
-        root_scheduler = _new_root_scheduler(fusion_state)
-        child_scheduler = _new_root_scheduler(per_param_state)
-        scheduler_ctx = SimpleNamespace(
-            all_hsdp_schedulers=[root_scheduler, child_scheduler],
-        )
-        root_scheduler.scheduler_ctx = scheduler_ctx
-        child_scheduler.scheduler_ctx = scheduler_ctx
-        previous_all_reduce = SimpleNamespace(wait_all_reduce_and_save_grad=MagicMock())
-        previous_reduce_scatter = SimpleNamespace(wait_reduce_scatter_and_issue_all_reduce=MagicMock())
-        comm_ctx = SimpleNamespace(
-            all_reduce_param_group=previous_all_reduce,
-            pre_param_group=previous_reduce_scatter,
-        )
-
-        with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx):
-            root_scheduler._finalize_comm_fusion_reductions()
-        root_scheduler._finalize_per_param_reductions()
-        root_scheduler.launch_tp_replicate_reduce_and_apply()
-
-        previous_all_reduce.wait_all_reduce_and_save_grad.assert_called_once_with()
-        previous_reduce_scatter.wait_reduce_scatter_and_issue_all_reduce.assert_called_once_with()
-        fusion_state._wait_prev_reduce_scatter.assert_called_once_with()
-        fusion_state._wait_prev_reduce_scatter_without_all_reduce.assert_called_once_with()
-        fusion_state._issue_prev_fused_all_reduce.assert_called_once_with([])
-        fusion_param.apply_reduced_grad.assert_called_once_with(fusion_output)
-        per_param.apply_reduced_grad.assert_called_once_with(per_param_output)
+        self.assertEqual(events, ["launch_rs", "wait_rs", "tp_reduce", "apply"])
+        child_backward_hook.assert_called_once_with()
+        handle.wait.assert_called_once_with()
+        self.assertIsNone(param._grad)
 
     def test_state_reset_releases_iteration_state_and_preserves_optimizer_grads(self):
         """State reset should release communication storage but preserve optimizer gradients."""
@@ -690,18 +667,18 @@ class TestTorchHSDPStateV2(unittest.TestCase):
 
         pre_group = SimpleNamespace()
         work_group = SimpleNamespace()
-        HSDPState.pre_reduce_scatter_params.append(param)
-        HSDPState.pre_all_reduce_params.append(param)
-        TorchHSDPStateV2.pre_all_reduce_groups.append(pre_group)
-        TorchHSDPStateV2.all_reduce_work_groups.append(work_group)
+        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+        state.scheduler_ctx.pre_all_reduce_params.append(param)
+        state.scheduler_ctx.pre_all_reduce_groups.append(pre_group)
+        state.scheduler_ctx.pending_all_reduce_groups.append(work_group)
 
         state.reset_iter_state()
 
         state.param_group.reset_iter_state.assert_called_once_with()
-        self.assertEqual(HSDPState.pre_reduce_scatter_params, [])
-        self.assertEqual(HSDPState.pre_all_reduce_params, [])
-        self.assertEqual(TorchHSDPStateV2.pre_all_reduce_groups, [])
-        self.assertEqual(TorchHSDPStateV2.all_reduce_work_groups, [])
+        self.assertEqual(state.scheduler_ctx.pre_reduce_scatter_params, [])
+        self.assertEqual(state.scheduler_ctx.pre_all_reduce_params, [])
+        self.assertEqual(state.scheduler_ctx.pre_all_reduce_groups, [])
+        self.assertEqual(state.scheduler_ctx.pending_all_reduce_groups, [])
         self.assertIsNone(param.allgather_comm_ctx.allgather_output)
         self.assertIsNone(param.allgather_comm_ctx.allgather_handle)
         self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
@@ -728,13 +705,17 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         other_state = _new_state([other_param])
         other_state.param_group = MagicMock()
 
-        HSDPState.pre_reduce_scatter_params.extend([current_param, other_param])
-        HSDPState.pre_all_reduce_params.extend([current_param, other_param])
+        current_state.scheduler_ctx.pre_reduce_scatter_params.append(current_param)
+        current_state.scheduler_ctx.pre_all_reduce_params.append(current_param)
+        other_state.scheduler_ctx.pre_reduce_scatter_params.append(other_param)
+        other_state.scheduler_ctx.pre_all_reduce_params.append(other_param)
 
         current_state.reset_iter_state()
 
-        self.assertEqual(HSDPState.pre_reduce_scatter_params, [])
-        self.assertEqual(HSDPState.pre_all_reduce_params, [])
+        self.assertEqual(current_state.scheduler_ctx.pre_reduce_scatter_params, [])
+        self.assertEqual(current_state.scheduler_ctx.pre_all_reduce_params, [])
+        self.assertEqual(other_state.scheduler_ctx.pre_reduce_scatter_params, [other_param])
+        self.assertEqual(other_state.scheduler_ctx.pre_all_reduce_params, [other_param])
         self.assertIsNone(current_param.reduce_scatter_comm_ctx.reduce_scatter_output)
         self.assertIs(other_param.reduce_scatter_comm_ctx.reduce_scatter_output, other_reduce_scatter_output)
         self.assertIs(other_param.all_reduce_comm_ctx.all_reduce_output, other_all_reduce_output)
@@ -749,22 +730,23 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         scheduler._backup_forward_fetch = ["prefetch"]
         scheduler.forward_prefetch_cells = []
         scheduler.hsdp_state = MagicMock()
-        comm_ctx = SimpleNamespace(
-            pre_param_group=object(),
-            all_reduce_param_group=object(),
-        )
-        HSDPSchedulerV2.root_bp_state = True
+        scheduler.scheduler_ctx = HSDPSchedulerContext()
+        comm_ctx = scheduler.scheduler_ctx.param_group_comm_ctx
+        comm_ctx.pre_param_group = object()
+        comm_ctx.all_reduce_param_group = object()
+        comm_ctx.comm_handle = object()
+        scheduler.scheduler_ctx.root_bp_state = True
 
-        with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx):
-            scheduler.reset_iter_state()
+        scheduler.reset_iter_state()
 
-        self.assertFalse(HSDPSchedulerV2.root_bp_state)
+        self.assertFalse(scheduler.scheduler_ctx.root_bp_state)
         self.assertIsNone(scheduler.scheduler_state)
         self.assertEqual(scheduler._fsdp_group_post_pending, set())
         self.assertEqual(scheduler.forward_prefetch_cells, ["prefetch"])
         self.assertIsNone(scheduler._backup_forward_fetch)
         self.assertIsNone(comm_ctx.pre_param_group)
         self.assertIsNone(comm_ctx.all_reduce_param_group)
+        self.assertIsNone(comm_ctx.comm_handle)
         scheduler.hsdp_state.reset_iter_state.assert_called_once_with()
 
     def test_module_reset_iter_state_respects_recursive_scope(self):

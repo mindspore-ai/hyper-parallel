@@ -364,10 +364,17 @@ def shard_param_data_parallel(
         shard_offset = min(shard_rank * dim0_shard_size, standalone_grad.size(0))
         actual_shard_length = min(dim0_shard_size, standalone_grad.size(0) - shard_offset)
         expected_grad = standalone_grad.narrow(0, shard_offset, actual_shard_length)
-        assert expected_grad.shape == dist_grads[param_name].shape, param_name
+        dist_grad = dist_grads[param_name]
+        assert expected_grad.shape == dist_grad.shape, (
+            f"Gradient shape mismatch for {param_name}: "
+            f"expected={expected_grad.shape}, actual={dist_grad.shape}"
+        )
         assert np.allclose(expected_grad.cpu().detach().numpy(),
-                           dist_grads[param_name].cpu().detach().numpy(),
-                           0.001, 0.001), param_name
+                           dist_grad.cpu().detach().numpy(),
+                           0.001, 0.001), (
+            f"Gradient values mismatch for {param_name}: "
+            f"expected={expected_grad}, actual={dist_grad}"
+        )
 
 
 @pytest.mark.parametrize(

@@ -15,10 +15,10 @@
 """MindSpore ST for fully_shard replicate_params.
 
 ``replicate_params`` keeps the listed parameters un-sharded on every rank and reduces their
-gradients with all-reduce (ZeRO-1 style) instead of reduce-scatter. Two cases: (1) precision
-of a model that mixes replicate weights (all-reduce) and sharded biases (reduce-scatter)
-under forward/backward prefetch, also asserting the mixed UNSHARDED/SHARDED prefetch state
-that used to trigger a double-unshard; (2) a TP-sharded DTensor state kept as replicate_params.
+gradients with all-reduce (ZeRO-1 style) instead of reduce-scatter. This test covers a model
+that mixes replicate weights (all-reduce) and sharded biases (reduce-scatter) under forward
+and backward prefetch. A separate case verifies that a TP-sharded, non-trainable state can be
+ignored when its forward performs an in-place update.
 """
 # pylint: disable=wrong-import-position
 import os
@@ -67,18 +67,13 @@ def _setup_prefetch(net):
 
 
 def _assert_mixed_prefetch_state(module):
-    """After forward, a prefetched child must hold replicate params UNSHARDED and sharded params SHARDED."""
+    """After forward, the prefetched child must return all managed params to SHARDED."""
     hsdp_state = get_hsdp_state(module)
     assert hsdp_state is not None, "Expected fully_shard child to expose hsdp_state"
-    replicate_states = [param.sharded_state for param in hsdp_state.replicate_params]
-    sharded_states = [param.sharded_state for param in hsdp_state.sharded_hsdp_params]
-    assert replicate_states, "Expected at least one replicate_param in the prefetched child"
-    assert sharded_states, "Expected at least one sharded param in the prefetched child"
-    assert all(state == ShardedState.UNSHARDED for state in replicate_states), (
-        f"Expected replicate_params to stay UNSHARDED after forward, got {replicate_states}"
-    )
-    assert all(state == ShardedState.SHARDED for state in sharded_states), (
-        f"Expected non-replicated params to be SHARDED after forward, got {sharded_states}"
+    managed_states = [param.sharded_state for param in hsdp_state.hsdp_params]
+    assert managed_states, "Expected the prefetched child to manage parameters"
+    assert all(state == ShardedState.SHARDED for state in managed_states), (
+        f"Expected all managed parameters to be SHARDED after forward, got {managed_states}"
     )
 
 
@@ -179,11 +174,12 @@ class ReplicateStateNet(nn.Cell):
         return self.dense(x)
 
 
-def test_ms_fully_shard_replicate_dtensor_state():
+def test_ms_fully_shard_ignored_dtensor_state():
     """
-    Feature: replicate_params holding a TP-sharded DTensor state on a (dp, tp) mesh.
-    Description: max_logits_val is sharded on the tp sub-mesh, managed by fully_shard on the dp sub-mesh, and
-                 updated in forward; fully_shard must switch back to the sharded param so the value stays visible.
+    Feature: ignored_params holding a TP-sharded DTensor state on a (dp, tp) mesh.
+    Description: max_logits_val is sharded on the TP sub-mesh and updated in forward with no-grad + in-place.
+                 It is excluded from fully_shard because the unsharded-parameter lifecycle does not support
+                 forward-side in-place state updates.
     Expectation: max_logits_val reads back greater than zero after backward.
     """
     ms.set_context(mode=ms.PYNATIVE_MODE)
@@ -191,7 +187,7 @@ def test_ms_fully_shard_replicate_dtensor_state():
     rank_id = get_rank()
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     net = ReplicateStateNet(mesh["tp"])
-    fully_shard(net, mesh=mesh["dp"], mp_policy=_fp32_policy(), replicate_params={net.max_logits_val})
+    fully_shard(net, mesh=mesh["dp"], mp_policy=_fp32_policy(), ignored_params={net.max_logits_val})
 
     loss_fn = nn.CrossEntropyLoss()
     data = Tensor(np.random.randn(8, 32).astype(np.float32))
@@ -202,4 +198,4 @@ def test_ms_fully_shard_replicate_dtensor_state():
     max_logits_sum = float(net.max_logits_val.sum().asnumpy())
     assert max_logits_sum > 0, "Expected callback-style max_logits_val read to be non-zero after backward"
     if rank_id == 0:
-        print(f"replicate_params DTensor state after backward: {max_logits_sum}")
+        print(f"ignored_params DTensor state after backward: {max_logits_sum}")

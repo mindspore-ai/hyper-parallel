@@ -231,6 +231,11 @@ class TensorRedistribution:
         if from_layout.rank_list != to_layout.rank_list:
             raise ValueError(f"The from_layout rank list: {from_layout.rank_list} is not equal to "
                              f"to_layout rank list: {to_layout.rank_list}")
+        if from_layout.has_uneven_shard or to_layout.has_uneven_shard:
+            # FSDP uneven shard/unshard uses its private padded collectives.
+            raise NotImplementedError(
+                "DTensor redistribution does not support uneven chunk-sharded layouts."
+            )
         key = from_layout.compact_str + to_layout.compact_str +  str(self.rank_id)
         if key in self._transform_cache:
             x = x.to_local()

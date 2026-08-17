@@ -26,12 +26,8 @@ from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.fully_shard.api import _extend_module_with_hsdp_interface
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
-from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
-from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx
 from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
-from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
 from tests.torch.utils import init_dist_gloo
 
 
@@ -65,7 +61,7 @@ class _TracingTorchHSDPScheduler(TorchHSDPSchedulerV2):
         print(
             f"FSDP_STATE_TRACE rank={dist.get_rank()} scenario={self.scenario} "
             f"event={event} before={before_name} after={after_name} "
-            f"root_bp_state={HSDPSchedulerV2.root_bp_state}",
+            f"root_bp_state={self.scheduler_ctx.root_bp_state}",
             flush=True,
         )
 
@@ -99,21 +95,8 @@ class _TracingTorchHSDPScheduler(TorchHSDPSchedulerV2):
         self._record("root_backward_exit", before)
 
 
-def _reset_global_state() -> None:
-    HSDPSchedulerV2.root_bp_state = False
-    HSDPState.pre_reduce_scatter_params.clear()
-    HSDPState.pre_all_reduce_params.clear()
-    TorchHSDPStateV2.pre_direct_all_reduce_grads.clear()
-    TorchHSDPStateV2.pre_all_reduce_groups.clear()
-    TorchHSDPStateV2.all_reduce_work_groups.clear()
-    comm_ctx = get_comm_ctx()
-    comm_ctx.comm_handle = None
-    comm_ctx.all_reduce_handle = None
-    comm_ctx.pre_param_group = None
-    comm_ctx.all_reduce_param_group = None
-
-
 def _build_model(scenario: str, mesh) -> tuple[nn.Module, _TracingTorchHSDPScheduler]:
+    """Build a traced scheduler model for one hook-state scenario."""
     model = _Block()
     _extend_module_with_hsdp_interface(model)
     scheduler = _TracingTorchHSDPScheduler(
@@ -134,7 +117,7 @@ def _build_model(scenario: str, mesh) -> tuple[nn.Module, _TracingTorchHSDPSched
 
 
 def _run_scenario(scenario: str, mesh) -> list[tuple[str, str, str]]:
-    _reset_global_state()
+    """Run one hook-state scenario and return its scheduler transition trace."""
     model, scheduler = _build_model(scenario, mesh)
     inputs = torch.arange(8, dtype=torch.float32).view(2, 4) / 8
 

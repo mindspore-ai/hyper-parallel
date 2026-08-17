@@ -30,11 +30,6 @@ ParameterClass = platform.Parameter
 
 class HSDPState:
     """HSDP state for cell"""
-    # Record pending per-parameter reduce-scatter/all-reduce work across
-    # fully_shard states so later backward hooks/root drains can materialize
-    # gradients launched by earlier states.
-    pre_reduce_scatter_params = []
-    pre_all_reduce_params = []
 
     def __init__(
         self,
@@ -47,6 +42,7 @@ class HSDPState:
         raw_ignored_params: Set[ParameterClass],
         raw_replicate_params: set[ParameterClass],
         platform_impl,
+        scheduler_ctx,
         device=None,
     ):
         """
@@ -62,6 +58,7 @@ class HSDPState:
             raw_ignored_params: Parameters excluded from fully_shard management.
             raw_replicate_params: Managed parameters that remain replicated.
             platform_impl: Platform abstraction layer (Torch or MindSpore).
+            scheduler_ctx: Scheduler context shared by this module tree.
             device: Optional target device for parameters.
         """
         self.modules = (cell,) if isinstance(cell, platform.Module) else tuple(cell)
@@ -74,6 +71,7 @@ class HSDPState:
         self.raw_ignored_params = set(raw_ignored_params or ())
         self.raw_replicate_params = set(raw_replicate_params or ())
         self.platform = platform_impl
+        self.scheduler_ctx = scheduler_ctx
         self.device = device
         self.hsdp_params: List[HSDPParamV2] = []
         self.param_group = None

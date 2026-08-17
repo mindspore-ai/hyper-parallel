@@ -31,7 +31,7 @@ import mindspore.nn as msnn
 import numpy as np
 
 from mindspore.common.api import _no_grad
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
 from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
 
@@ -212,9 +212,6 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
 class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
     """Unit tests for forward-prefetch suppression during activation recompute."""
 
-    def tearDown(self):
-        HSDPSchedulerV2.root_bp_state = False
-
     def test_forward_pre_hook_disables_prefetch_during_recompute(self):
         """_hsdp_forward_pre_hook clears prefetch targets when root_bp_state is True.
 
@@ -249,7 +246,7 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
         scheduler._lazy_init_all_states = MagicMock()
         scheduler._register_post_backward_hook = MagicMock(return_value=("wrapped_args", "wrapped_kwargs"))
 
-        HSDPSchedulerV2.root_bp_state = True
+        scheduler.scheduler_ctx.root_bp_state = True
 
         result = scheduler._forward_pre_hook(MagicMock(), ("arg",), {"k": "v"})
 
@@ -269,7 +266,7 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
         scheduler._register_backward_pre_hook = MagicMock()
         scheduler._hsdp_forward_hook = MagicMock()
 
-        HSDPSchedulerV2.root_bp_state = True
+        scheduler.scheduler_ctx.root_bp_state = True
 
         result = scheduler._forward_hook(MagicMock(), MagicMock(), outputs)
 
@@ -353,10 +350,7 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
 
         class _FakeHSDPState:
             def __init__(self, hsdp_params):
-                self._hsdp_params = hsdp_params
-
-            def _iter_managed_params(self):
-                return self._hsdp_params
+                self.hsdp_params = hsdp_params
 
         submodule_hsdp_params = {}
         for _, cell in model.cells_and_names():
@@ -364,21 +358,16 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
             if local_params:
                 submodule_hsdp_params[cell] = [_FakeHSDPParam(p) for p in local_params]
 
-        def _fake_get_hsdp_state(module):
-            if module not in submodule_hsdp_params:
-                return None
-            return _FakeHSDPState(submodule_hsdp_params[module])
-
         scheduler = _make_scheduler_stub()
         scheduler._is_root = True
         scheduler.scheduler_ctx.root_module = model
+        scheduler.scheduler_ctx.all_hsdp_schedulers = [
+            MagicMock(hsdp_state=_FakeHSDPState(hsdp_params))
+            for hsdp_params in submodule_hsdp_params.values()
+        ]
 
-        with patch(
-            "hyper_parallel.core.fully_shard.hsdp_scheduler.get_hsdp_state",
-            side_effect=_fake_get_hsdp_state,
-        ):
-            # pylint: disable=protected-access
-            scheduler._init_params_fqn()
+        # pylint: disable=protected-access
+        scheduler._init_params_fqn()
 
         for cell, hsdp_params in submodule_hsdp_params.items():
             for hp in hsdp_params:

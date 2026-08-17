@@ -88,6 +88,27 @@ class _MockedTestCase(unittest.TestCase):
         return Layout(mesh_shape, alias_name, rank_list=rank_list, init_backend=False)
 
 
+class TestUnevenShardRedistribution(_MockedTestCase):
+    """Tests for the intentionally unsupported live uneven-shard path."""
+
+    def test_redistribution_rejects_uneven_shard_layout(self):
+        """Live redistribution should defer uneven shards to FSDP collectives."""
+        from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+        from hyper_parallel.core.dtensor.tensor_redistribution import TensorRedistribution
+
+        source_layout = self._make_layout((2,), ("fsdp",), rank_list=(0, 1))
+        source_layout.set_placements((Shard(0, uneven_shard=True),))
+        source_layout.placement_to_tensor_map(dim=1)
+        target_layout = self._make_layout((2,), ("fsdp",), rank_list=(0, 1))
+        target_layout.set_placements((Replicate(),))
+        target_layout.placement_to_tensor_map(dim=1)
+        input_tensor = MagicMock()
+        input_tensor.layout = source_layout
+
+        with self.assertRaisesRegex(NotImplementedError, "uneven chunk-sharded"):
+            TensorRedistribution().redistribution(input_tensor, target_layout)
+
+
 # ===========================================================================
 # TensorRedistribution method tests
 # ===========================================================================
