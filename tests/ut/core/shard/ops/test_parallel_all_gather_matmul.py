@@ -110,6 +110,52 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
             msg=f"Expected AllGatherMatmulDistributedOp, got {type(op)}"
         )
 
+    def test_set_partial_from_k_ignores_replicated_tuple_entries(self):
+        """A mixed k placement should mark only its sharded mesh axes as Partial."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "cp", "tp")
+
+        AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, (1, -1, 0))
+
+        self.assertEqual(
+            output_layout.set_partial_by_dev_axis.call_args_list,
+            [unittest.mock.call("cp", "sum"), unittest.mock.call("tp", "sum")],
+        )
+
+    def test_set_partial_from_k_ignores_fully_replicated_tuple(self):
+        """A tuple containing only replicated entries should not set Partial."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "tp")
+
+        AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, (-1, -1))
+
+        output_layout.set_partial_by_dev_axis.assert_not_called()
+
+    def test_set_partial_from_k_rejects_invalid_tuple_axis(self):
+        """A tuple containing an out-of-range mesh axis should raise ValueError."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "tp")
+
+        with self.assertRaisesRegex(ValueError, r"axis -2.*expected -1 or an integer in \[0, 1\]"):
+            AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, (0, -2))
+        output_layout.set_partial_by_dev_axis.assert_not_called()
+
+    def test_set_partial_from_k_rejects_invalid_scalar_axis(self):
+        """A scalar mesh axis outside the mesh rank should raise ValueError."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "tp")
+
+        with self.assertRaisesRegex(ValueError, r"axis 2.*expected -1 or an integer in \[0, 1\]"):
+            AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, 2)
+
+    def test_set_partial_from_k_rejects_boolean_axis(self):
+        """A boolean should not be accepted as an integer mesh axis."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "tp")
+
+        with self.assertRaisesRegex(ValueError, r"axis True.*expected -1 or an integer in \[0, 1\]"):
+            AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, True)
+
     # ------------------------------------------------------------------
     # infer_layout — positive cases
     # cache_values format: [x1_layout, x2_layout, trans_x2, gather_output]

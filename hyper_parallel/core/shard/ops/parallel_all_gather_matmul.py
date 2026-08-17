@@ -133,11 +133,21 @@ class AllGatherMatmulDistributedOp(DistributedOp):
         """
         alias = output_layout.alias_name
         n = len(alias)
-        if isinstance(k_placement, tuple):
-            for v in k_placement:
-                output_layout.set_partial_by_dev_axis(alias[n - 1 - v], op)
-        else:
-            output_layout.set_partial_by_dev_axis(alias[n - 1 - k_placement], op)
+        mesh_axes = k_placement if isinstance(k_placement, tuple) else (k_placement,)
+        # Validate all axes before mutating the layout to avoid leaving partial state on failure.
+        for mesh_axis in mesh_axes:
+            if mesh_axis == -1:
+                continue
+            if (not isinstance(mesh_axis, int) or isinstance(mesh_axis, bool)
+                    or mesh_axis < 0 or mesh_axis >= n):
+                raise ValueError(
+                    f"Invalid k-dim tensor_map axis {mesh_axis!r}; expected -1 or "
+                    f"an integer in [0, {n - 1}]."
+                )
+        for mesh_axis in mesh_axes:
+            if mesh_axis == -1:
+                continue
+            output_layout.set_partial_by_dev_axis(alias[n - 1 - mesh_axis], op)
 
     @staticmethod
     def _validate_input_layouts(
