@@ -45,6 +45,7 @@ from hyper_parallel.core.fully_shard.utils import (
     OffloadPolicy,
     TPShardMetaInfo,
 )
+from hyper_parallel.core.utils import compute_local_shape_and_global_offset_by_ceil_chunk
 
 
 def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -247,22 +248,20 @@ class TorchHSDPParamV2(HSDPParamV2):
         source_param: nn.Parameter,
         source_local_tensor: torch.Tensor,
     ) -> Layout:
-        """Build the optimizer parameter layout from its source distribution.
+        """Build the final layout after data and model parallel sharding.
 
-        A dual-mode production parameter is a plain tensor containing only its
-        TP/EP-local shard. Its shape therefore cannot be used as the logical
-        shape of the final FSDP+TP/EP layout. Source layout metadata restores
-        that logical shape before the FSDP placements are applied.
-
-        This method only constructs and returns a layout. It does not mutate
-        the parameter or this managed parameter's lifecycle state.
+        A dual-mode parameter is a plain tensor containing only its TP/EP-local
+        shard, so its local shape cannot represent the final logical shape.
+        Source distribution metadata restores that shape before the FSDP
+        placements are applied. This method only constructs the layout and has
+        no parameter lifecycle side effects.
 
         Args:
-            source_param: Parameter received by fully_shard before FSDP partitioning.
-            source_local_tensor: Local tensor that FSDP partitions.
+            source_param: Parameter received before FSDP partitioning.
+            source_local_tensor: Local tensor partitioned by FSDP.
 
         Returns:
-            The layout for the sharded optimizer parameter.
+            Layout containing all FSDP, TP, and EP placements.
         """
         logical_global_stride = None
         if isinstance(source_param, DTensor):
@@ -272,7 +271,9 @@ class TorchHSDPParamV2(HSDPParamV2):
             source_sharding_spec = Layout.from_device_mesh(self.tp_grad_info.mesh)
             source_sharding_spec.set_placements(self.tp_grad_info.placements)
             source_sharding_spec.placement_to_tensor_map(source_local_tensor.ndim)
-            logical_global_size = source_sharding_spec.get_global_shape(source_local_tensor.size())
+            logical_global_size = source_sharding_spec.get_global_shape(
+                source_local_tensor.size()
+            )
         else:
             logical_global_size = source_local_tensor.size()
 
@@ -353,6 +354,12 @@ class TorchHSDPParamV2(HSDPParamV2):
         """Clear the all-reduce output tensor to free memory."""
         self.all_reduce_comm_ctx.all_reduce_output = None
 
+    def clear_unsharded_source_grad(self):
+        if self.unsharded_accumulated_grad_data is not None:
+            self.unsharded_accumulated_grad = None
+        elif self.unsharded_param.grad is not None:
+            self.unsharded_param.grad = None
+
     def apply_reduced_grad(self, reduced_grad: torch.Tensor) -> bool:
         """
         Apply reduced gradient to the sharded parameter.
@@ -367,13 +374,6 @@ class TorchHSDPParamV2(HSDPParamV2):
 
         Returns:
             Whether the current stream must synchronize for CPU offload.
-
-        Note:
-            Gradient scaling (``gradient_scaling_factor``) is applied earlier on
-            the reduce input (see ``reduce_scatter_grad`` /
-            ``_build_reduce_scatter_buckets``), never here, so accumulation stays
-            ``sum_i(g_i * factor)`` rather than re-scaling an already-accumulated
-            gradient.
         """
         sharded_grad = None
         if not self.mp_policy.apply_grad_on_fp32_main_grad:
@@ -382,15 +382,10 @@ class TorchHSDPParamV2(HSDPParamV2):
             if not hasattr(self.sharded_param, "main_grad"):
                 self.sharded_param.main_grad = None
             sharded_grad = self.sharded_param.main_grad
-        sharded_param_local_shape = (
-            self.sharded_param.local_shape
-            if isinstance(self.sharded_param, DTensor)
-            else self.sharded_param.shape
-        )
         reduced_grad = (
             reduced_grad.reshape(-1)
             .narrow(0, 0, self.sharded_size.numel())
-            .view(sharded_param_local_shape)
+            .view(self.sharded_size)
         )
         if (
             not self.mp_policy.apply_grad_on_fp32_main_grad
@@ -423,12 +418,12 @@ class TorchHSDPParamV2(HSDPParamV2):
             self.unsharded_param.grad = None
         return need_synchronize
 
-    @torch.no_grad()
-    def _init_sharded_param(
+    def _resolve_hsdp_placement(
         self,
         param: nn.Parameter,
         shard_placement_fn: Optional[Callable],
-    ) -> None:
+    ) -> Shard:
+        """Validate and normalize the fully_shard placement for one parameter."""
         if param.device != self.device and param.device.type != "meta":
             raise AssertionError(
                 f"Expects the parameter to already be moved to device {self.device} but got {param.device}"
@@ -445,12 +440,17 @@ class TorchHSDPParamV2(HSDPParamV2):
             raise AssertionError(
                 f"Expected Shard, got {type(hsdp_placement)}: {hsdp_placement}"
             )
+        return hsdp_placement
 
+    def _init_shard_metadata(
+        self,
+        param: nn.Parameter,
+        hsdp_placement: Shard,
+    ) -> tuple[list, torch.Tensor, int, int]:
+        """Initialize parameter shape and mesh metadata used by sharding."""
         self.hsdp_placement = hsdp_placement
         base_placements = list(self._get_base_spmd_placements())
-        self._spmd_placements = self._apply_data_parallel_placements(base_placements, hsdp_placement)
         param_data = param.to_local() if self._orig_param_is_dtensor else param
-
         shard_dim = hsdp_placement.dim
         if param_data.ndim == 0:
             raise ValueError("fully_shard does not support scalar parameters")
@@ -461,7 +461,6 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
         self._orig_size = param_data.size()
         self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
-
         if isinstance(self.mesh_info, FSDPMeshInfo):
             self.shard_rank = self.mesh_info.shard_mesh_rank
             self.shard_world_size = self.mesh_info.shard_mesh_size
@@ -477,16 +476,58 @@ class TorchHSDPParamV2(HSDPParamV2):
             isinstance(self.mesh_info, DDPMeshInfo)
             and not isinstance(self.mesh_info, HSDPMeshInfo)
         )
+        dim_shard_size = (param_data.size(shard_dim) + self.shard_world_size - 1) // self.shard_world_size
+        return base_placements, param_data, shard_dim, dim_shard_size
 
+    def _init_shard_placements(
+        self,
+        param_data: torch.Tensor,
+        shard_dim: int,
+        base_placements: list,
+    ) -> None:
+        """Build data-parallel placements for the local shard."""
         if shard_dim != 0 and param_data.size(shard_dim) % self.shard_world_size != 0:
             raise NotImplementedError(
                 f"fully_shard only supports uneven sharding on dim=0, but parameter "
                 f"{self._module_info.param_name} has shape {tuple(param_data.shape)}, "
                 f"shard dim {shard_dim}, and world size {self.shard_world_size}"
             )
-        dim_shard_size = (param_data.size(shard_dim) + self.shard_world_size - 1) // self.shard_world_size
-        actual_shard_offset = min(self.shard_rank * dim_shard_size, param_data.size(shard_dim))
-        actual_shard_length = min(dim_shard_size, param_data.size(shard_dim) - actual_shard_offset)
+        spmd_placements = list(
+            self._apply_data_parallel_placements(
+                base_placements,
+                self.hsdp_placement,
+            )
+        )
+        if param_data.size(shard_dim) % self.shard_world_size != 0:
+            if self._spmd_shard_mesh_dim is None:
+                raise AssertionError("Uneven FSDP sharding requires a shard mesh dimension")
+            fsdp_placement = spmd_placements[self._spmd_shard_mesh_dim]
+            if isinstance(fsdp_placement, StridedShard):
+                fsdp_placement = StridedShard(
+                    fsdp_placement.dim,
+                    fsdp_placement.split_factor,
+                    uneven_shard=True,
+                )
+            else:
+                fsdp_placement = Shard(fsdp_placement.dim, uneven_shard=True)
+            spmd_placements[self._spmd_shard_mesh_dim] = fsdp_placement
+        self._spmd_placements = tuple(spmd_placements)
+
+    def _build_sharded_param_data(
+        self,
+        param_data: torch.Tensor,
+        shard_dim: int,
+        dim_shard_size: int,
+    ) -> torch.Tensor:
+        """Create the actual local shard and its fixed-size communication storage."""
+        local_shape, global_offset = compute_local_shape_and_global_offset_by_ceil_chunk(
+            param_data.size(),
+            shard_dim,
+            self.shard_world_size,
+            self.shard_rank,
+        )
+        actual_shard_offset = global_offset[shard_dim]
+        actual_shard_length = local_shape[shard_dim]
         sharded_param = param_data.narrow(
             shard_dim,
             actual_shard_offset,
@@ -520,7 +561,30 @@ class TorchHSDPParamV2(HSDPParamV2):
                 0,
                 actual_shard_length,
             )
+        return sharded_param
 
+    @torch.no_grad()
+    def _init_sharded_param(
+        self,
+        param: nn.Parameter,
+        shard_placement_fn: Optional[Callable],
+    ) -> None:
+        """Initialize the persistent sharded parameter and communication storage."""
+        hsdp_placement = self._resolve_hsdp_placement(param, shard_placement_fn)
+        base_placements, param_data, shard_dim, dim_shard_size = self._init_shard_metadata(
+            param,
+            hsdp_placement,
+        )
+        self._init_shard_placements(
+            param_data,
+            shard_dim,
+            base_placements,
+        )
+        sharded_param = self._build_sharded_param_data(
+            param_data,
+            shard_dim,
+            dim_shard_size,
+        )
         self._sharding_spec = self._build_sharding_spec(param, param_data)
 
         self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param))
@@ -668,6 +732,8 @@ class TorchHSDPParamV2(HSDPParamV2):
             tensor,
             self._sharding_spec.mesh,
             self._sharding_spec.placements,
+            shape=self._sharding_spec.tensor_shape,
+            stride=self._sharding_spec.tensor_stride,
         )
         sharded_dtensor._layout = self._sharding_spec
         sharded_dtensor._placements = tuple(self._sharding_spec.placements)
@@ -730,6 +796,11 @@ class TorchHSDPParamV2(HSDPParamV2):
         return [sharded_param_data]
 
     @property
+    def _sharded_local_tensor(self) -> torch.Tensor:
+        """Return the local tensor backing the persistent sharded DTensor."""
+        return self.sharded_param._local_tensor
+
+    @property
     def unsharded_param(self) -> nn.Parameter:
         """Return the full unsharded parameter after all-gather."""
         return self._unsharded_param
@@ -780,6 +851,72 @@ class TorchHSDPParamV2(HSDPParamV2):
         # only its _local_tensor / _sharded_param_data are refreshed below.
         return new_param
 
+    def _is_same_sharded_local_tensor(self, local_tensor: torch.Tensor) -> bool:
+        """Return whether communication storage already aliases the local tensor."""
+        if not isinstance(self._sharded_param_data, torch.Tensor):
+            return False
+        sharded_data_ptr = self._sharded_param_data.untyped_storage().data_ptr()
+        return (
+            # Empty shards may have a zero data pointer and must still be rebuilt.
+            sharded_data_ptr > 0
+            and sharded_data_ptr == local_tensor.untyped_storage().data_ptr()
+        )
+
+    def _validate_reset_local_tensor(
+        self,
+        local_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Validate the actual local shape after parameter conversion."""
+        if local_tensor.size() != self.sharded_size:
+            raise AssertionError(
+                f"Expected sharded_size to be {self.sharded_size}, got {local_tensor.size()}"
+            )
+        return local_tensor
+
+    def _pin_reset_local_tensor_if_needed(
+        self,
+        local_tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, bool]:
+        """Move reset storage to pinned CPU memory when the policy requires it."""
+        if self.pin_memory and not local_tensor.is_pinned():
+            return local_tensor.cpu().pin_memory(), True
+        return local_tensor, False
+
+    def _refresh_sharded_local_tensor(
+        self,
+        local_tensor: torch.Tensor,
+        shard_dim: int,
+    ) -> None:
+        """Rebuild padded communication storage and refresh the DTensor local view."""
+        actual_shard_length = self.sharded_size[shard_dim]
+        if self.sharded_size == self.padded_sharded_param_size:
+            local_tensor = local_tensor.contiguous()
+            self._sharded_param_data = local_tensor.view(-1)
+            local_view = local_tensor.detach()
+        else:
+            padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
+            if self.pin_memory:
+                padded_local_tensor = padded_local_tensor.pin_memory()
+            if local_tensor.numel() > 0:
+                padded_local_tensor.narrow(
+                    shard_dim,
+                    0,
+                    actual_shard_length,
+                ).copy_(local_tensor)
+            self._sharded_param_data = padded_local_tensor.view(-1)
+            local_view = padded_local_tensor.narrow(
+                shard_dim,
+                0,
+                actual_shard_length,
+            ).detach()
+        set_requires_grad_if_needed(self.sharded_param, local_view)
+        self.sharded_param._local_tensor = local_view
+        self._update_shardedparam_storage_forcely()
+        if not self.sharded_param._local_tensor.is_contiguous():
+            raise AssertionError(
+                "Expected sharded_param._local_tensor to be contiguous"
+            )
+
     def reset_sharded_param(self) -> None:
         """Reset sharded param after load_state_dict."""
         new_param = self._resolve_reset_param()
@@ -793,55 +930,15 @@ class TorchHSDPParamV2(HSDPParamV2):
         # 2nd time shouldn't be no-op if people call model.load_state_dict(...) before lazy_init
         # this makes it possible for trainer to call `sd = model.state_dict()` before the training loop
         # and use `sd` without calling .state_dict() per iteration
-        same_local_tensor = False
-        if isinstance(self._sharded_param_data, torch.Tensor):
-            same_local_tensor = (
-                # when sharding param with shape (1, ...) over 2 ranks
-                # local_tensor on rank 1 can be size 0, data_ptr() can be 0
-                self._sharded_param_data.untyped_storage().data_ptr() > 0
-                and self._sharded_param_data.untyped_storage().data_ptr()
-                == local_tensor.untyped_storage().data_ptr()
-            )
+        same_local_tensor = self._is_same_sharded_local_tensor(local_tensor)
         shard_dim = self.hsdp_placement.dim
         if not same_local_tensor:
-            if local_tensor.size() != self.sharded_size:
-                raise AssertionError(
-                    f"Expected sharded_size to be {self.sharded_size}, got {local_tensor.size()}"
-                )
-        pinned_local_tensor = False
-        if self.pin_memory and not local_tensor.is_pinned():
-            local_tensor = local_tensor.cpu().pin_memory()
-            pinned_local_tensor = True
+            local_tensor = self._validate_reset_local_tensor(local_tensor)
+        local_tensor, pinned_local_tensor = self._pin_reset_local_tensor_if_needed(local_tensor)
         if not isinstance(self.sharded_param, DTensor):
             raise AssertionError(f"Expected DTensor, got {type(self.sharded_param)}")
         if not same_local_tensor or pinned_local_tensor:
-            actual_shard_length = self.sharded_size[shard_dim]
-            if self.sharded_size == self.padded_sharded_param_size:
-                local_tensor = local_tensor.contiguous()
-                self._sharded_param_data = local_tensor.view(-1)
-                local_view = local_tensor.detach()
-            else:
-                padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
-                if self.pin_memory:
-                    padded_local_tensor = padded_local_tensor.pin_memory()
-                if local_tensor.numel() > 0:
-                    padded_local_tensor.narrow(
-                        shard_dim,
-                        0,
-                        actual_shard_length,
-                    ).copy_(local_tensor)
-                self._sharded_param_data = padded_local_tensor.view(-1)
-                local_view = padded_local_tensor.narrow(
-                    shard_dim,
-                    0,
-                    actual_shard_length,
-                ).detach()
-            set_requires_grad_if_needed(self.sharded_param, local_view)
-            self.sharded_param._local_tensor = local_view
-            if not self.sharded_param._local_tensor.is_contiguous():
-                raise AssertionError(
-                    "Expected sharded_param._local_tensor to be contiguous"
-                )
+            self._refresh_sharded_local_tensor(local_tensor, shard_dim)
         self._sharding_spec.set_tensor_meta(
             self._sharding_spec.tensor_shape,
             self._sharding_spec.tensor_stride,
@@ -854,6 +951,19 @@ class TorchHSDPParamV2(HSDPParamV2):
         # hooks see the correct object.  Idempotent when the module already
         # holds ``self.sharded_param`` (same data_ptr → no-op in practice).
         self._setattr_on_modules(self.sharded_param)
+
+    def _update_shardedparam_storage_forcely(self,):
+        sharded_param_data = self.sharded_param.data
+        local_tensor_data = self.sharded_param._local_tensor.data
+        if (
+            sharded_param_data.device != local_tensor_data.device
+            or sharded_param_data.data_ptr() != local_tensor_data.data_ptr()
+        ):
+            local_tensor_data.requires_grad_(self.sharded_param.requires_grad)
+            # TensorImpl keeps storage_ptr, storage_offset, sizes, strides, dtype and metadatas
+            # so swap TensorImpl can make self.sharded_param ref the self.sharded_param._local_tensor's TensorImpl
+            # local_tensor_data TensorImpl will deconstruct after this function finish.
+            torch._C._swap_tensor_impl(self.sharded_param, local_tensor_data)  # pylint: disable=W0212
 
     @torch.no_grad()
     def _get_unsharded_param_data(self, async_op: bool = False) -> None:

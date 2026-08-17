@@ -120,7 +120,7 @@ def _owned_virtual_stages(pp_rank: int) -> List[int]:
 
 def _to_numpy(tensor) -> np.ndarray:
     """Convert a Tensor / DTensor gradient to a host numpy array."""
-    local = tensor.to_local() if hasattr(tensor, "to_local") else tensor
+    local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
     return local.detach().float().cpu().numpy()
 
 
@@ -228,6 +228,11 @@ def _assert_grad_parity(
         shard_offset = min(fsdp_rank * dim0_shard_size, ref_grad_full.shape[0])
         actual_shard_size = min(dim0_shard_size, ref_grad_full.shape[0] - shard_offset)
         ref_grad = ref_grad_full[shard_offset : shard_offset + actual_shard_size]
+        if stage_grad.shape != ref_grad.shape:
+            raise AssertionError(
+                f"{case_name}: rank {rank} step {step} param {fqn!r} grad shape mismatch "
+                f"(actual={stage_grad.shape}, expected={ref_grad.shape})."
+            )
         if not np.allclose(stage_grad, ref_grad, rtol=_RTOL, atol=_ATOL):
             abs_err = float(np.abs(stage_grad - ref_grad).max())
             raise AssertionError(

@@ -25,7 +25,6 @@ from hyper_parallel.tools.logging import get_logger
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
 from hyper_parallel.platform.torch.fully_shard.hook_function import PostBackwardFunction
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
-from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx
 
 logger = get_logger("FSDP")
 
@@ -61,6 +60,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             self.ignored_params,
             self.replicate_params,
             self.platform,
+            self.scheduler_ctx,
             self.device,
             tp_grad_infos=self.tp_grad_infos,
         )
@@ -118,7 +118,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
         self._register_backward_pre_hook(outputs)
-        if HSDPSchedulerV2.root_bp_state:
+        if self.scheduler_ctx.root_bp_state:
             self._restore_forward_prefetch_after_recompute()
             return
         return self._hsdp_forward_hook(cell, inputs, outputs)
@@ -130,7 +130,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             return grad
         if self._is_root:
             Variable._execution_engine.queue_callback(self._root_backward_hook)
-        HSDPSchedulerV2.root_bp_state = True
+        self.scheduler_ctx.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
@@ -140,8 +140,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
             hsdp_scheduler._backward_hook()
-        self._backward_hook()
-        HSDPSchedulerV2.root_bp_state = False
+        self.scheduler_ctx.root_bp_state = False
         with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
             logger.debug(
                 "hook=root_backward_hook action=final_reduce module=%s",
@@ -153,7 +152,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _finalize_comm_fusion_reductions(self) -> None:
         """Drain the comm_fusion=True RS/AR pipeline."""
-        comm_ctx = get_comm_ctx()
+        comm_ctx = self.scheduler_ctx.param_group_comm_ctx
         if comm_ctx.all_reduce_param_group is not None:
             logger.debug(
                 "hook=root_backward_hook wait=comm_fusion_all_reduce module=%s",
@@ -173,12 +172,12 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             comm_ctx.all_reduce_param_group = None
 
     def _finalize_per_param_reductions(self) -> None:
-        """Drain the class-level comm_fusion=False RS/AR queues."""
-        # A fused root may own non-fused children, so always drain shared queues.
+        """Drain the module-tree-local comm_fusion=False RS/AR queues."""
+        # A fused root may own non-fused children, so always drain the tree queues.
         last_all_reduce_groups = self.hsdp_state._wait_prev_reduce_scatter()
         self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce()
         self.hsdp_state._issue_prev_fused_all_reduce(last_all_reduce_groups)
-        TorchHSDPStateV2.wait_and_split_all_reduce_work_groups()
+        self.hsdp_state.wait_and_split_all_reduce_work_groups()
 
     def launch_tp_replicate_reduce_and_apply(self) -> None:
         """Run final TP replicate reductions and apply gradients for all states."""
@@ -206,7 +205,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         """Reset Torch fully_shard iteration state after communication is complete."""
         super().reset_iter_state()
         self.hsdp_state.reset_iter_state()
-        comm_ctx = get_comm_ctx()
+        comm_ctx = self.scheduler_ctx.param_group_comm_ctx
         comm_ctx.pre_param_group = None
         comm_ctx.all_reduce_param_group = None
 
@@ -217,11 +216,13 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_hook(self.cell, None, None)
 
     # pylint: disable=W0613
-    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:  # pylint: disable=arguments-differ
+    @staticmethod
+    def _grouped_forward_pre_hook_skip(cell, args, kwargs) -> None:
         """Override base ``(args, kwargs)`` return; ``nn.Module`` pre-hook uses ``None`` for no-op."""
         return None
 
-    def _grouped_forward_post_hook_skip(self, outputs) -> None:  # pylint: disable=arguments-differ
+    @staticmethod
+    def _grouped_forward_post_hook_skip(outputs) -> None:
         """Override base output pass-through; forward hook uses ``None`` for no-op."""
         return None
 

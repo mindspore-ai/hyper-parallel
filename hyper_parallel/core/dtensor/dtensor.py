@@ -238,17 +238,24 @@ class DTensor(DTensorBase):
         device_mesh: DeviceMesh,
         placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]],
         layout: Optional[Layout] = None,
+        shape: Optional[Tuple[int, ...]] = None,
     ):
         self._local_tensor = local_tensor
         self._device_mesh = device_mesh
+        tensor_dim = len(shape) if shape is not None else len(local_tensor.shape)
         # Fast path: when an already-built Layout is supplied (e.g. output layouts
         # cached by infer_layout and passed straight through wrap_output), reuse it
         # directly and skip _build_layout (which otherwise recomputes device_mesh.to_hash(),
         # tuple(placements) and a cache lookup on every single output construction).
         self._layout = layout if layout is not None else _build_layout(
-            device_mesh, placements, len(local_tensor.shape)
+            device_mesh, placements, tensor_dim
         )
         self._placements = tuple(self._layout.placements)
+        self._global_shape = (
+            tuple(shape)
+            if shape is not None
+            else tuple(self._layout.get_global_shape(local_tensor.shape))
+        )
 
     @property
     def device_mesh(self) -> DeviceMesh:
@@ -308,7 +315,8 @@ class DTensor(DTensorBase):
         """
         if (shape is None) != (stride is None):
             raise ValueError("shape and stride must be provided together")
-        layout = _build_layout(device_mesh, placements, len(local_tensor.shape))
+        tensor_dim = len(shape) if shape is not None else len(local_tensor.shape)
+        layout = _build_layout(device_mesh, placements, tensor_dim)
         if run_check:
             # pylint: disable=C0415
             from hyper_parallel.core.dtensor._from_local_utils import run_from_local_checks
@@ -319,13 +327,24 @@ class DTensor(DTensorBase):
                 shape=shape,
                 stride=stride,
             )
-        if shape is not None:
+        if shape is not None and stride is not None:
             layout = cp.deepcopy(layout)
             layout.set_tensor_meta(shape, stride, local_tensor.dtype)
-        return DTensor(local_tensor, device_mesh, placements, layout)
+        return DTensor(
+            local_tensor,
+            device_mesh,
+            layout.placements,
+            layout,
+            shape=shape,
+        )
 
     @staticmethod
-    def from_local_with_layout(local_tensor: Tensor, layout: Layout) -> 'DTensor':
+    def from_local_with_layout(
+        local_tensor: Tensor,
+        layout: Layout,
+        *,
+        shape: Optional[Tuple[int, ...]] = None,
+    ) -> 'DTensor':
         """Fast DTensor construction from a local tensor and a pre-built Layout.
 
         Unlike :meth:`from_local`, this does NOT rebuild the layout via
@@ -339,7 +358,13 @@ class DTensor(DTensorBase):
         constructor's non-None check; ``__init_data__`` ignores it when ``layout``
         is supplied.
         """
-        return DTensor(local_tensor, layout.mesh, layout.placements, layout)
+        return DTensor(
+            local_tensor,
+            layout.mesh,
+            layout.placements,
+            layout,
+            shape=shape,
+        )
 
     def _alias_placements(self) -> Sequence[Placement]:
         """Return alias_placements from layout, falling back to _placements."""
@@ -351,11 +376,13 @@ class DTensor(DTensorBase):
         """Rebuild converted DTensor data without preserving Parameter identity."""
         cls = DTensor if isinstance(self, platform.Parameter) else self.__class__
         if not isinstance(self._layout, Layout):
-            return cls(
-                local_tensor,
-                device_mesh=self._device_mesh,
-                placements=self._alias_placements(),
-            )
+            constructor_kwargs = {
+                "device_mesh": self._device_mesh,
+                "placements": self._alias_placements(),
+            }
+            if hasattr(self, "_global_shape"):
+                constructor_kwargs["shape"] = self._global_shape
+            return cls(local_tensor, **constructor_kwargs)
         layout = cp.deepcopy(self._layout)
         if layout.tensor_shape is not None:
             layout.set_tensor_meta(layout.tensor_shape, layout.tensor_stride, local_tensor.dtype)
@@ -364,6 +391,7 @@ class DTensor(DTensorBase):
             device_mesh=self._device_mesh,
             placements=layout.placements,
             layout=layout,
+            shape=getattr(self, "_global_shape", None),
         )
 
     def to(self, *args, **kwargs):
@@ -761,7 +789,7 @@ class DTensor(DTensorBase):
         Returns:
             Tuple[int, ...]: The global tensor shape.
         """
-        return self._layout.get_global_shape(self._local_tensor.shape)
+        return self._global_shape
 
     def size(self, dim=None):
         """Return the global shape, consistent with .shape.
@@ -777,6 +805,15 @@ class DTensor(DTensorBase):
     def numel(self) -> int:
         """Return the number of elements in this DTensor."""
         return int(np.prod(self.shape))
+
+    @property
+    def ndim(self) -> int:
+        """Return the logical global tensor rank."""
+        return len(self._global_shape)
+
+    def dim(self) -> int:
+        """Return the logical global tensor rank."""
+        return len(self._global_shape)
 
     @property
     def local_shape(self) -> Tuple[int, ...]:
@@ -820,7 +857,7 @@ class DTensor(DTensorBase):
 
         # Build dst_layout from device_mesh and placements
         dst_layout = _build_layout(
-            device_mesh, placements, len(self._local_tensor.shape)
+            device_mesh, placements, len(self._global_shape)
         )
 
         # pylint: disable=C0415
@@ -872,7 +909,7 @@ class DTensor(DTensorBase):
         # Set all placements to Replicate and convert to tensor_map
         replicated_placements = [Replicate()] * len(replicated_layout.mesh_shape)
         replicated_layout.set_placements(replicated_placements)
-        replicated_layout.placement_to_tensor_map(len(self._local_tensor.shape))
+        replicated_layout.placement_to_tensor_map(len(self._global_shape))
 
         # Clear partial status from original layout since Replicate has no partial
         replicated_layout.reset_partial()

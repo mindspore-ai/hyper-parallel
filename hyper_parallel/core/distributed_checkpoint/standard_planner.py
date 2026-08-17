@@ -38,7 +38,7 @@ from hyper_parallel.core.distributed_checkpoint.planner import (
     ReadItem,
     LoadItemType
 )
-from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank, infer_intersection
+from hyper_parallel.core.distributed_checkpoint.reshard import infer_intersection
 from hyper_parallel.core.distributed_checkpoint.util import (
     narrow_tensor_by_index,
     chunk_to_area,
@@ -48,7 +48,7 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     set_element,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.layout import Layout, infer_slice_area_by_layout
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -153,12 +153,10 @@ class StandardSavePlanner(SavePlanner):
                     f"Current rank {current_rank} not found in layout's rank_list {dtensor_layout.rank_list}")
 
             inner_rank_id = dtensor_layout.rank_list.index(current_rank)
-            # Calculate slice area using infer_slice_area_by_rank
-            slice_area = infer_slice_area_by_rank(
-                mesh_shape=dtensor_layout.mesh_shape,
-                tensor_map=dtensor_layout.tensor_map,
-                rank_id=inner_rank_id,
-                full_shape=global_shape
+            slice_area = infer_slice_area_by_layout(
+                dtensor_layout,
+                inner_rank_id,
+                global_shape,
             )
             # Extract offsets (start values) from slice_area
             return tuple(start for start, _ in slice_area)

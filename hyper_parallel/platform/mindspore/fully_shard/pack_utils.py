@@ -23,6 +23,7 @@ from typing import Any, Literal, Optional
 import mindspore as ms
 
 from hyper_parallel.core.dtensor.placement_types import StridedShard
+from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,7 @@ def _resolve_same_dim_strided_context(
 ) -> Optional[_SameDimStridedLayoutContext]:
     if not _has_strided_shard_layout(hsdp_param):
         return None
-    if not getattr(hsdp_param, "uses_param_shard", False):
+    if not isinstance(getattr(hsdp_param, "mesh_info", None), FSDPMeshInfo):
         return None
     if not getattr(hsdp_param, "_orig_param_is_dtensor", False):
         return None

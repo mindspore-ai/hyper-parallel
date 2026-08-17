@@ -26,7 +26,7 @@ class DTensorBase(Tensor):
     device mesh and placement specifications.
     """
 
-    def __new__(cls, local_tensor, device_mesh=None, placements=None, layout=None):
+    def __new__(cls, local_tensor, device_mesh=None, placements=None, layout=None, shape=None):
         """
         Create a new DTensorBase instance.
 
@@ -37,7 +37,7 @@ class DTensorBase(Tensor):
             layout: Optional pre-built Layout. When supplied, ``__init_data__``
                 reuses it directly and skips ``_build_layout`` (hot-path fast
                 construction, see ``DTensor.from_local_with_layout``).
-            device: The device type (default: "Ascend").
+            shape: Optional logical global tensor shape.
         """
         # Fast path: a pre-built layout is only ever supplied by the internal
         # wrap_output / from_local_with_layout hot path, where local_tensor is a
@@ -48,7 +48,10 @@ class DTensorBase(Tensor):
         # None guards, and the device-placement guard — all pure per-output overhead.
         if layout is not None:
             t = Tensor._make_subclass(cls, local_tensor)
-            t.__init_data__(local_tensor, device_mesh, placements, layout)
+            if shape is None:
+                t.__init_data__(local_tensor, device_mesh, placements, layout)
+            else:
+                t.__init_data__(local_tensor, device_mesh, placements, layout, shape)
             return t
 
         npu_device = "Ascend"
@@ -57,6 +60,7 @@ class DTensorBase(Tensor):
             local_tensor = src.to_local()
             device_mesh = src.device_mesh
             placements = src._alias_placements()
+            shape = getattr(src, "_global_shape", None)
         else:
             if local_tensor is None:
                 raise ValueError(
@@ -79,7 +83,10 @@ class DTensorBase(Tensor):
                 local_tensor = local_tensor.to(npu_device)
 
         t = Tensor._make_subclass(cls, local_tensor)
-        t.__init_data__(local_tensor, device_mesh, placements, layout)
+        if shape is None:
+            t.__init_data__(local_tensor, device_mesh, placements, layout)
+        else:
+            t.__init_data__(local_tensor, device_mesh, placements, layout, shape)
         return t
 
     def asnumpy(self):
@@ -122,14 +129,16 @@ class DTensorBase(Tensor):
                 type(self),
                 initializer(self._local_tensor.init, self._local_tensor.shape, self._local_tensor.dtype),
                 device_mesh,
-                placements
+                placements,
+                shape=getattr(self, "_global_shape", None),
             )
         else:
             obj = DTensorBase.__new__(
                 type(self),
                 self._local_tensor.clone(),
                 device_mesh,
-                placements
+                placements,
+                shape=getattr(self, "_global_shape", None),
             )
         filtered_dict = {k: v for k, v in self.__dict__.items() if k != '_local_tensor'}
         obj.__dict__.update(filtered_dict)
@@ -192,6 +201,7 @@ class DTensorBase(Tensor):
             self._device_mesh = data.device_mesh
             self._placements = data.placements
             self._layout = data.layout
+            self._global_shape = getattr(data, "_global_shape", tuple(data.shape))
             self._update_data(self._local_tensor)
             return
 
@@ -278,5 +288,10 @@ class DTensorBase(Tensor):
         """
         new_local = self._local_tensor.to(*args, **kwargs)
         new_dt = Tensor._make_subclass(type(self), new_local)
-        new_dt.__init_data__(new_local, self._device_mesh, self._alias_placements())
+        new_dt.__init_data__(
+            new_local,
+            self._device_mesh,
+            self._alias_placements(),
+            shape=getattr(self, "_global_shape", None),
+        )
         return new_dt

@@ -131,8 +131,9 @@ def _assert_comm_fusion_false(model: _StackedMLP) -> None:
     for mod in modules:
         scheduler = mod.hsdp_scheduler
         state = scheduler.hsdp_state
-        assert state.config.comm_fusion is False, (
-            f"{type(mod).__name__}: expected comm_fusion=False, got {state.config.comm_fusion}"
+        actual = state.comm_fusion_policy.enable_comm_fusion
+        assert actual is False, (
+            f"{type(mod).__name__}: expected comm_fusion=False, got {actual}"
         )
         assert getattr(state, "param_group", None) is None, (
             f"{type(mod).__name__}: comm_fusion=False must not allocate fusion param_group"
