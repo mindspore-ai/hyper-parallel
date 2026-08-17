@@ -217,11 +217,11 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_hook(self.cell, None, None)
 
     # pylint: disable=W0613
-    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:
+    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:  # pylint: disable=arguments-differ
         """Override base ``(args, kwargs)`` return; ``nn.Module`` pre-hook uses ``None`` for no-op."""
         return None
 
-    def _grouped_forward_post_hook_skip(self, outputs) -> None:
+    def _grouped_forward_post_hook_skip(self, outputs) -> None:  # pylint: disable=arguments-differ
         """Override base output pass-through; forward hook uses ``None`` for no-op."""
         return None
 
@@ -235,11 +235,22 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook on all managed modules."""
+        if self.compile_hooks_enabled:
+            forward_pre_hook = torch._dynamo.disable(self._forward_pre_hook)
+            forward_hook = torch._dynamo.disable(self._forward_hook)
+            grouped_forward_pre_hook = torch._dynamo.disable(self._grouped_forward_pre_hook)
+        else:
+            forward_pre_hook = self._forward_pre_hook
+            forward_hook = self._forward_hook
+            grouped_forward_pre_hook = self._grouped_forward_pre_hook
         if self._fsdp_group_post_pending is None:
             for mod in self.modules:
-                mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-                mod.register_forward_hook(self._forward_hook)
+                mod.register_forward_pre_hook(forward_pre_hook, with_kwargs=True)
+                mod.register_forward_hook(forward_hook)
             return
         for mod in self.modules:
-            mod.register_forward_pre_hook(self._grouped_forward_pre_hook, with_kwargs=True)
-            self._register_forward_module_hook(mod, self._make_grouped_forward_post_hook(mod))
+            mod.register_forward_pre_hook(grouped_forward_pre_hook, with_kwargs=True)
+            grouped_forward_hook = self._make_grouped_forward_post_hook(mod)
+            if self.compile_hooks_enabled:
+                grouped_forward_hook = torch._dynamo.disable(grouped_forward_hook)
+            self._register_forward_module_hook(mod, grouped_forward_hook)

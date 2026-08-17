@@ -407,6 +407,28 @@ class TestFullyShardListAPI(unittest.TestCase):
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_compile_hook_flag_is_forwarded_by_fully_shard(self, mock_platform, mock_get_device):
+        """The per-call compile hook flag reaches scheduler initialization."""
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_get_device.return_value = self.device
+        module = SimpleLinear(2, 2)
+        mesh = self._create_mock_mesh()
+
+        with patch.object(HSDPModule, "hsdp_init") as mock_hsdp_init:
+            fully_shard(module, mesh=mesh, compile_hooks_enabled=True)
+
+        self.assertIs(mock_hsdp_init.call_args.kwargs["compile_hooks_enabled"], True)
+
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_compile_hook_flag_rejects_non_bool(self, mock_platform):
+        """The public fully_shard boundary rejects ambiguous flag values."""
+        mock_platform.platform_type = PlatformType.PYTORCH
+
+        with self.assertRaisesRegex(ValueError, "compile_hooks_enabled must be a bool"):
+            fully_shard(SimpleLinear(2, 2), compile_hooks_enabled=1)
+
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_single_module_returns_module(self, mock_platform, mock_get_device):
         """fully_shard with single module returns the same module (in-place).
 

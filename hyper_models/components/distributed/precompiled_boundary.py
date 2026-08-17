@@ -15,10 +15,9 @@
 """precompiled_boundary: compile-time communication planning (05 §4.3).
 
 RedistOp / PrecompiledBoundary compile the placement differences of
-in_src→in_dst and out_src→out_dst into sequences of RedistOps; at runtime
-they execute directly with zero branching. All non-identity communication
-goes uniformly through DTensor.redistribute() (the in-house DTensor
-internally picks the optimal collective based on (src, dst)).
+in_src→in_dst and out_src→out_dst into sequences of RedistOps. An optional
+lowerer may attach local-tensor execution operations while the boundary keeps
+the generic DTensor redistribution fallback.
 
 API adaptation (differences from the 05 doc pseudocode; actual in-house
 DTensor signatures):
@@ -28,7 +27,7 @@ DTensor signatures):
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Protocol, Sequence, Tuple
 
 import torch
 
@@ -43,9 +42,9 @@ def _classify_collective(src, dst) -> str:
     """Derive the communication type from placements (a debug/profiling label,
     not a communication-path selector).
 
-    Only differing dimensions are compared — identity dims (e.g. the CP dim
-    Shard(1)→Shard(1) of attention) do not participate in classification, so
-    a TP-dim Shard→Replicate is correctly classified as all_gather.
+    Only differing dimensions are compared. Identity placement dimensions do
+    not participate in classification, so a Shard-to-Replicate transition is
+    classified as all_gather.
     """
     if tuple(src) == tuple(dst):
         return "identity"
@@ -88,12 +87,26 @@ def _set_arg(args, kwargs, name, idx, value):
     return args, kwargs
 
 
+class BoundaryExecutionOp(Protocol):
+    """Operation attached by a boundary lowerer and executed on local tensors."""
+
+    def execute(self, tensor: Any) -> Any:
+        """Execute one pre-lowered placement transition."""
+
+
+BoundaryOpLowerer = Callable[
+    [Sequence[Placement], Sequence[Placement]],
+    Optional[BoundaryExecutionOp],
+]
+
+
 @dataclass
 class RedistOp:
     """A single precompiled redistribute operation (05 §4.3.1).
 
-    collective_type is a debug/profiling label; all communication goes
-    uniformly through DTensor.redistribute().
+    ``collective_type`` is a debug/profiling label. Validation and transitions
+    rejected by the injected lowerer use ``DTensor.redistribute()``; accepted
+    transitions use ``execution_op`` directly on local tensors.
     """
     arg_name: str
     arg_index: Optional[int]
@@ -101,6 +114,7 @@ class RedistOp:
     src_placements: Tuple[Placement, ...]
     dst_placements: Tuple[Placement, ...]
     collective_type: str
+    execution_op: Optional[BoundaryExecutionOp] = None
 
     def execute(self, tensor: torch.Tensor, *, as_dtensor: bool = False):
         """Execute the communication.
@@ -121,6 +135,10 @@ class RedistOp:
                     tensor, self.mesh, tuple(self.src_placements))
             return tensor
 
+        if not as_dtensor and self.execution_op is not None:
+            local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+            return self.execution_op.execute(local_tensor)
+
         # Unified path: zero-copy wrap → redistribute → optional to_local
         if isinstance(tensor, DTensor):
             dt = tensor
@@ -133,12 +151,24 @@ class RedistOp:
 class PrecompiledBoundary:
     """Compile-time communication plan (05 §4.3.3): two RedistOp sequences, in_plan/out_plan."""
 
-    def __init__(self, spec, mesh, mesh_dim_names):
+    def __init__(
+        self,
+        spec,
+        mesh,
+        mesh_dim_names,
+        *,
+        op_lowerer: Optional[BoundaryOpLowerer] = None,
+    ):
         self.spec = spec
         self.mesh = mesh
         self.mesh_dim_names = tuple(mesh_dim_names)
+        self._op_lowerer = op_lowerer
         self.in_plan = self._compile_input_plan(spec, mesh, self.mesh_dim_names)
         self.out_plan = self._compile_output_plan(spec, mesh, self.mesh_dim_names)
+
+    def _lower_execution_op(self, src, dst) -> Optional[BoundaryExecutionOp]:
+        """Delegate optional execution lowering without owning backend details."""
+        return self._op_lowerer(src, dst) if self._op_lowerer is not None else None
 
     # ── Compilation ─────────────────────────────────────────────────────
 
@@ -161,6 +191,7 @@ class PrecompiledBoundary:
                 src_placements=src_p,
                 dst_placements=dst_p,
                 collective_type=_classify_collective(src_p, dst_p),
+                execution_op=self._lower_execution_op(src_p, dst_p),
             ))
         return plan
 
@@ -194,6 +225,7 @@ class PrecompiledBoundary:
                 src_placements=src_p,
                 dst_placements=dst_p,
                 collective_type=_classify_collective(src_p, dst_p),
+                execution_op=self._lower_execution_op(src_p, dst_p),
             ))
         return plan
 

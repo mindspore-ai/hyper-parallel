@@ -67,10 +67,17 @@ class FSDP2Manager:
         model: ModuleClass,
         tp_grad_info: TPGradInfoByFQN | None,
     ) -> TPGradInfoByParam | None:
-        """Resolve FQN metadata to parameter identities before compile/AC.
+        """Resolve stable FQNs to parameter identities after model rewrites.
+
+        Activation-checkpoint wrappers may add an internal child-module prefix,
+        but the supported wrapper contract removes that prefix from
+        ``named_modules``/``named_parameters``. Therefore planner metadata
+        produced before checkpointing remains resolvable here, while FSDP still
+        receives the final parameter objects that it will manage.
 
         Args:
-            model: Model before compile or activation-checkpoint rewrites.
+            model: Model after sharding and checkpoint rewrites, before layer
+                compile is installed.
             tp_grad_info: Source-layout metadata produced by the TP planner.
 
         Returns:
@@ -122,7 +129,7 @@ class FSDP2Manager:
         self,
         model: ModuleClass,
     ) -> set[ParameterClass] | None:
-        """Resolve configured replicate-parameter FQNs before compile/AC rewrites."""
+        """Resolve configured replicate-parameter FQNs on the final model."""
         if not self.config.replicate_params:
             return None
 
@@ -418,6 +425,8 @@ class FSDP2Manager:
         self,
         model: ModuleClass,
         tp_grad_info: TPGradInfoByFQN | None = None,
+        *,
+        compile_hooks_enabled: bool = False,
     ) -> ModuleClass:
         """Apply configured child FSDP units, root FSDP, and prefetch links.
 
@@ -426,6 +435,8 @@ class FSDP2Manager:
             tp_grad_info: FQN-keyed source-layout metadata returned by
                 ``apply_sharding_plan``. The manager resolves parameter
                 identities before applying nested FSDP units.
+            compile_hooks_enabled: Whether scheduler forward hooks should stay
+                outside Dynamo capture for decoder-layer compilation.
 
         Returns:
             The model enhanced with the HyperParallel HSDPModule interface.
@@ -434,6 +445,11 @@ class FSDP2Manager:
             ValueError: If TP is enabled without FQN metadata or configured
                 parameter FQNs cannot be resolved.
         """
+        if not isinstance(compile_hooks_enabled, bool):
+            raise ValueError(
+                "compile_hooks_enabled must be a bool, got "
+                f"{type(compile_hooks_enabled).__name__}"
+            )
         metadata_by_parameter = self._build_tp_grad_info_by_param(
             model,
             tp_grad_info,
@@ -467,6 +483,7 @@ class FSDP2Manager:
             fully_shard(  # pylint: disable=unexpected-keyword-arg
                 wrap_module.module,
                 tp_grad_infos=managed_tp_grad_info,
+                compile_hooks_enabled=compile_hooks_enabled,
                 replicate_params=self._build_managed_replicate_params(
                     wrap_module.module,
                     owner_by_parameter,
@@ -487,6 +504,7 @@ class FSDP2Manager:
         fully_shard(  # pylint: disable=unexpected-keyword-arg
             model,
             tp_grad_infos=root_tp_grad_info,
+            compile_hooks_enabled=compile_hooks_enabled,
             replicate_params=self._build_managed_replicate_params(
                 model,
                 owner_by_parameter,

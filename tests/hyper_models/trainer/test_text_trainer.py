@@ -16,6 +16,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -94,7 +95,7 @@ def test_text_trainer_keeps_explicit_base_stage_order(monkeypatch) -> None:
         monkeypatch.setattr(
             text_trainer_module.TextTrainer,
             method_name,
-            lambda self, stage=stage: self.base._record(stage),
+            lambda self, stage=stage: self.base._record(stage),  # pylint: disable=protected-access
         )
 
     trainer = text_trainer_module.TextTrainer(config)
@@ -135,6 +136,7 @@ def test_text_train_step_uses_base_distributed_runtime(monkeypatch) -> None:
             training=SimpleNamespace(max_grad_norm=1.0),
         ),
         state=SimpleNamespace(global_step=0),
+        mesh=SimpleNamespace(cp_size=2),
         model=object(),
         optimizer=optimizer,
         lr_scheduler=None,
@@ -182,7 +184,7 @@ def test_text_train_step_uses_base_distributed_runtime(monkeypatch) -> None:
     assert metrics == {"loss": 2.0, "grad_norm": 0.5}
     assert base.state.global_step == 1
     base.model_reshard.assert_called_once_with(0, 1)
-    base._configure_fsdp_gradient_sync.assert_called_once_with(0, 1)
+    base._configure_fsdp_gradient_sync.assert_called_once_with(0, 1)  # pylint: disable=protected-access
     get_batch.assert_called_once()
     assert sync_calls == ["hsdp"]
     optimizer.step.assert_called_once_with()
@@ -194,10 +196,14 @@ def test_text_train_step_does_not_advance_after_dataloader_end() -> None:
     trainer = text_trainer_module.TextTrainer.__new__(
         text_trainer_module.TextTrainer
     )
+    def get_batch(data_iterator: Any) -> Any:
+        """Read one batch so exhaustion propagates to the training step."""
+        return next(data_iterator)
+
     trainer.base = SimpleNamespace(
         config=SimpleNamespace(),
         state=SimpleNamespace(global_step=3),
-        get_batch=lambda data_iterator: next(data_iterator),
+        get_batch=get_batch,
     )
 
     with pytest.raises(StopIteration):

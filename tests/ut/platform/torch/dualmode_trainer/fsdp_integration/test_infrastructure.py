@@ -70,36 +70,39 @@ class _DeferredModel(nn.Module):
     card_mark="onecard",
     essential_mark="essential",
 )
-def test_fsdp_parallelize_receives_tp_fqns_after_compile(monkeypatch) -> None:
+def test_fsdp_parallelize_receives_tp_fqns_before_compile(monkeypatch) -> None:
     """
     Feature: Dual-mode compile and FSDP integration order.
-    Description: Pass FQN-keyed TP metadata through compilation into FSDP parallelize.
-    Expectation: Compilation runs first and FSDP receives the unchanged metadata mapping.
+    Description: Pass FQN-keyed TP metadata into FSDP before layer compilation.
+    Expectation: FSDP receives the unchanged metadata mapping before compilation.
     """
     manager = FSDP2Manager(FSDP2Config(), MeshContext())
     model = nn.Linear(4, 4)
     tp_grad_info_by_fqn = {"weight": object()}
     call_order = []
 
-    def _compile_model(input_model: nn.Module, **kwargs: object) -> nn.Module:
+    def _compile_model(input_model: nn.Module, config: object) -> nn.Module:
         """Record model compilation."""
+        del config
         assert input_model is model
-        assert not kwargs
         call_order.append("compile")
         return input_model
 
     def _parallelize(
         input_model: nn.Module,
         tp_grad_info: dict | None,
+        *,
+        compile_hooks_enabled: bool = False,
     ) -> nn.Module:
         """Record FSDP wrapping."""
         assert input_model is model
         assert tp_grad_info is tp_grad_info_by_fqn
+        assert compile_hooks_enabled
         call_order.append("parallelize")
         return input_model
 
     manager.parallelize = Mock(side_effect=_parallelize)
-    monkeypatch.setattr(infrastructure_module.torch, "compile", _compile_model)
+    monkeypatch.setattr(infrastructure_module, "apply_compile", _compile_model)
 
     sharding_planner = Mock()
     sharding_planner.plan.return_value = object()
@@ -122,7 +125,7 @@ def test_fsdp_parallelize_receives_tp_fqns_after_compile(monkeypatch) -> None:
     )
 
     assert result is model
-    assert call_order == ["compile", "parallelize"]
+    assert call_order == ["parallelize", "compile"]
 
 
 @arg_mark(
