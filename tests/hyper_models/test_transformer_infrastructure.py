@@ -50,7 +50,8 @@ def test_generic_yaml_replacement_runs_without_feature_specific_runtime():
     ]
     model = nn.Sequential(nn.Linear(4, 8))
 
-    assert _apply_module_replacement_actions(model, setup) is model
+    replaced_model, _ = _apply_module_replacement_actions(model, setup)
+    assert replaced_model is model
 
 
 def test_invalid_fqn_fails_during_pre_sharding_replacement_compilation():
