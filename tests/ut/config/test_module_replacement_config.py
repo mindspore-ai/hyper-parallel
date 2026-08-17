@@ -53,7 +53,6 @@ def _declared_replacement(*, module, module_fqn, context):
 def _root(plan_overrides):
     return {
         "model": {"_target_": f"{__name__}._model_target"},
-        "tokenizer": {"_target_": f"{__name__}._tokenizer_target"},
         "optimizer": {"_target_": f"{__name__}._optimizer_target"},
         "plan_overrides": plan_overrides,
     }

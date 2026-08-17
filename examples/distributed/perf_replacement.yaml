@@ -1,11 +1,12 @@
 # Copyright 2025-2026 Huawei Technologies Co., Ltd
 # Licensed under the Apache License, Version 2.0
 # ============================================================================
-# 性能替换注入示例：把 planner 推导边界上的朴素实现替换为用户高性能 kernel。
+# 性能替换示例：同时展示计算注入和带 checkpoint mapping 的模块替换。
 #
-# match 命中的是 planner 已推导的边界（merge 模式）——params 切分与 I/O
-# 契约全部继承推导结果，YAML 只需声明 local_compute_fn 一个字段。
-# _target_ 指向用户 kernel 模块中的工厂函数（须在 PYTHONPATH 上可 import）。
+# 前两项 match 命中 planner 已推导边界（merge 模式），params 切分与 I/O
+# 契约继承推导结果，只需声明 local_compute_fn。第三项 replace_module 在
+# 分片规划前替换完整模块，并由 replacement 声明相对 checkpoint key 映射。
+# _target_ 指向用户 kernel 模块中的可调用对象（须在 PYTHONPATH 上可 import）。
 # 纯性能 patch 无并行语义要求，不需要 when 字段（when 缺省 = 总是应用）；
 # CP/EP 必需注入应写 when: cp / when: ep（见 ep_compute/cp_wrappers 文档）。
 #
@@ -27,3 +28,9 @@ plan_overrides:
     region_dispatch: true        # F.silu/mul/线性层均可 dispatch
     local_compute_fn:
       _target_: perf_kernels.fused_swiglu_factory
+  # 模块对象替换，并声明相对于该模块的 checkpoint key 映射。
+  - match: "model.layers.0.mlp.down_proj"
+    module_type: torch.nn.Linear
+    exact_type: true
+    replace_module:
+      _target_: perf_kernels.CheckpointMappedLinear

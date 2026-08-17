@@ -181,8 +181,14 @@ def _build_load_groups(
     model: nn.Module,
     checkpoint_index: _CheckpointIndex,
     targets: dict[str, torch.Tensor],
-) -> tuple[tuple[_LoadGroup, ...], tuple[str, ...], list[WeightRenaming | WeightConverter]]:
-    weight_mapping = get_model_conversion_mapping(model, key_mapping=None, hf_quantizer=None)
+    *,
+    weights_mapping: list[WeightRenaming | WeightConverter],
+) -> tuple[
+    tuple[_LoadGroup, ...],
+    tuple[str, ...],
+    list[WeightRenaming | WeightConverter],
+]:
+    weight_mapping = weights_mapping
     unsupported = [
         transform
         for transform in weight_mapping
@@ -314,10 +320,17 @@ class CheckpointManager:
         pretrained_path: str,
         *,
         strict: bool = True,
+        weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
     ) -> LoadReport:
         """Load complete Hugging Face weights into the finalized model."""
         if not pretrained_path:
             raise ValueError("pretrained_path must be provided when load_base_model=True")
+        if weights_mapping is None:
+            weights_mapping = get_model_conversion_mapping(
+                self.model,
+                key_mapping=None,
+                hf_quantizer=None,
+            )
 
         checkpoint_index = _resolve_checkpoint_index(pretrained_path)
         targets = _build_load_targets(self.model)
@@ -325,6 +338,7 @@ class CheckpointManager:
             self.model,
             checkpoint_index,
             targets,
+            weights_mapping=weights_mapping,
         )
         aliases_by_target = _alias_names_by_target(targets)
         loaded_keys = set()

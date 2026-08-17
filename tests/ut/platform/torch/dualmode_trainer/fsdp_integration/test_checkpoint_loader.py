@@ -16,15 +16,25 @@
 
 from __future__ import annotations
 
+import importlib
+from pathlib import Path
+from types import SimpleNamespace
+from typing import List
 from unittest.mock import Mock
 
 import pytest
 import torch
+import yaml
 from safetensors.torch import save_file
 from torch import nn  # pylint: disable=forbidden-backend-import
+from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+from transformers.conversion_mapping import get_model_conversion_mapping
 from transformers.core_model_loading import Chunk, WeightConverter, WeightRenaming
 
 import hyper_models._transformers.checkpoint_loader as checkpoint_loader
+import hyper_models._transformers.infrastructure as infrastructure_module
+from hyper_models.config.resolver import resolve_component
+from hyper_models.trainer.config import PlanOverride, entries_to_module_replacements
 from tests.common.mark_utils import arg_mark
 
 
@@ -95,6 +105,182 @@ def test_load_pretrained_weights_applies_renaming(tmp_path, monkeypatch) -> None
     checkpoint_loader.load_pretrained_weights(model, str(tmp_path))
 
     assert torch.equal(model.proj.weight, expected)
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_yaml_replacement_weight_mapping_is_consumed_by_checkpoint_loader(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """
+    Feature: YAML replacement checkpoint mapping.
+    Description: Resolve the example replacement and load its legacy checkpoint key.
+    Expectation: The YAML-derived mapping reaches checkpoint loading without a second lookup.
+    """
+    examples_dir = Path(__file__).resolve().parents[6] / "examples" / "distributed"
+    monkeypatch.syspath_prepend(str(examples_dir))
+    perf_kernels = importlib.import_module("perf_kernels")
+    perf_replacement = importlib.import_module("perf_replacement")
+    with (examples_dir / "perf_replacement.yaml").open(encoding="utf-8") as yaml_file:
+        raw = yaml.safe_load(yaml_file)
+    entries = resolve_component(
+        raw["plan_overrides"],
+        expected_type=List[PlanOverride],
+        path="plan_overrides",
+    )
+    specs = entries_to_module_replacements(entries)
+    assert len(specs) == 1
+
+    model = perf_replacement.TinyModel(vocab=8, h=4, n_heads=1, n_layers=1)
+    model.config = SimpleNamespace()
+    target = model.model.layers[0].mlp.down_proj.weight
+    expected = torch.arange(target.numel(), dtype=target.dtype).reshape_as(target)
+    save_file(
+        {"model.layers.0.mlp.down_proj.weight": expected},
+        str(tmp_path / "model.safetensors"),
+    )
+    weights_mapping = []
+
+    model, weights_mapping = infrastructure_module._apply_module_replacement_actions(
+        model,
+        SimpleNamespace(plan_overrides=entries),
+        weights_mapping,
+    )
+    mapping_lookup = Mock(side_effect=AssertionError("mapping must not be recomputed"))
+    monkeypatch.setattr(checkpoint_loader, "get_model_conversion_mapping", mapping_lookup)
+
+    report = checkpoint_loader.CheckpointManager(model).load_checkpoint(
+        str(tmp_path),
+        strict=False,
+        weights_mapping=weights_mapping,
+    )
+
+    assert isinstance(
+        model.model.layers[0].mlp.down_proj,
+        perf_kernels.CheckpointMappedLinear,
+    )
+    assert len(weights_mapping) == 1
+    assert weights_mapping[0].scope_prefix == "model.layers.0.mlp.down_proj"
+    assert torch.equal(model.model.layers[0].mlp.down_proj.packed_weight, expected)
+    inputs = torch.arange(32, dtype=expected.dtype).reshape(2, 16)
+    torch.testing.assert_close(
+        model.model.layers[0].mlp.down_proj(inputs),
+        torch.nn.functional.linear(inputs, expected),
+    )
+    assert "weight" not in model.model.layers[0].mlp.down_proj._parameters
+    assert "model.layers.0.mlp.down_proj.packed_weight" in report.loaded_keys
+    mapping_lookup.assert_not_called()
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_qwen3_moe_replacement_converts_raw_expert_checkpoint(tmp_path) -> None:
+    """Qwen's generic expert merge must feed the replacement's layout transpose."""
+    config = Qwen3MoeConfig(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        moe_intermediate_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        num_experts=2,
+        num_experts_per_tok=1,
+    )
+    model = Qwen3MoeForCausalLM(config)
+    raw_entry = {
+        "match": "*.mlp",
+        "module_type": (
+            "transformers.models.qwen3_moe.modeling_qwen3_moe."
+            "Qwen3MoeSparseMoeBlock"
+        ),
+        "replace_module": {
+            "_target_": "examples.distributed.perf_kernels.NpuGroupedMoe",
+        },
+    }
+    entries = resolve_component(
+        [raw_entry],
+        expected_type=List[PlanOverride],
+        path="plan_overrides",
+    )
+    weights_mapping = get_model_conversion_mapping(model)
+    model, weights_mapping = infrastructure_module._apply_module_replacement_actions(
+        model,
+        SimpleNamespace(plan_overrides=entries),
+        weights_mapping,
+    )
+    gate_up_mapping = next(
+        transform
+        for transform in weights_mapping
+        if isinstance(transform, WeightConverter)
+        and transform.scope_prefix == "model.layers.0.mlp"
+        and transform.target_patterns == ["experts.gate_up_proj"]
+    )
+    down_mapping = next(
+        transform
+        for transform in weights_mapping
+        if isinstance(transform, WeightConverter)
+        and transform.scope_prefix == "model.layers.0.mlp"
+        and transform.target_patterns == ["experts.down_proj"]
+    )
+    assert gate_up_mapping.source_patterns == [
+        "experts.*.gate_proj.weight",
+        "experts.*.up_proj.weight",
+    ]
+    assert down_mapping.source_patterns == ["experts.*.down_proj.weight"]
+    assert [type(operation).__name__ for operation in gate_up_mapping.operations] == [
+        "MergeModulelist",
+        "Concatenate",
+        "Transpose",
+    ]
+    assert [type(operation).__name__ for operation in down_mapping.operations] == [
+        "MergeModulelist",
+        "Transpose",
+    ]
+
+    gate_weights = []
+    up_weights = []
+    down_weights = []
+    checkpoint = {}
+    for expert in range(config.num_experts):
+        gate = torch.arange(32, dtype=torch.float32).reshape(4, 8) + expert * 100
+        up = gate + 1000
+        down = torch.arange(32, dtype=torch.float32).reshape(8, 4) + expert * 2000
+        gate_weights.append(gate)
+        up_weights.append(up)
+        down_weights.append(down)
+        prefix = f"model.layers.0.mlp.experts.{expert}"
+        checkpoint[f"{prefix}.gate_proj.weight"] = gate
+        checkpoint[f"{prefix}.up_proj.weight"] = up
+        checkpoint[f"{prefix}.down_proj.weight"] = down
+    save_file(checkpoint, str(tmp_path / "model.safetensors"))
+
+    report = checkpoint_loader.CheckpointManager(model).load_checkpoint(
+        str(tmp_path),
+        strict=False,
+        weights_mapping=weights_mapping,
+    )
+
+    expected_gate_up = torch.cat(
+        [torch.stack(gate_weights), torch.stack(up_weights)],
+        dim=1,
+    ).transpose(1, 2).contiguous()
+    expected_down = torch.stack(down_weights).transpose(1, 2).contiguous()
+    experts = model.model.layers[0].mlp.experts
+    torch.testing.assert_close(experts.gate_up_proj, expected_gate_up)
+    torch.testing.assert_close(experts.down_proj, expected_down)
+    assert "model.layers.0.mlp.experts.gate_up_proj" in report.loaded_keys
+    assert "model.layers.0.mlp.experts.down_proj" in report.loaded_keys
 
 
 @arg_mark(

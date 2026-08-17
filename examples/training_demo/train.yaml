@@ -63,7 +63,7 @@ plan_overrides:
   - match: "*.mlp"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
     replace_module:
-      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_sparse_moe
+      _target_: examples.distributed.perf_kernels.NpuGroupedMoe
 
 mixed_precision:
   enabled: false

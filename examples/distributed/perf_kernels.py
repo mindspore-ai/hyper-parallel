@@ -5,7 +5,7 @@
 
 真实场景中这是用户自己的 kernel 包（flash-attn、融合算子等），只要在
 PYTHONPATH 上可 import，就能被 YAML 的 ``_target_`` 引用。本文件演示两条
-注入通道的 kernel 形态：
+计算注入通道和一条模块替换通道：
 
 - **local_compute_fn 工厂契约**（`flash_attention_factory` /
   `fused_swiglu_factory`）：apply 时框架以通用上下文（module/mesh/
@@ -14,23 +14,185 @@ PYTHONPATH 上可 import，就能被 YAML 的 ``_target_`` 引用。本文件演
   参数解包与 I/O 契约由骨架托管，kernel 只需关注计算本身；
 - **inner_wrapper 契约**（`flash_attention_wrapper`）：
   ``@inner_wrapper fn(target_module, mesh, tp_mesh, cp_mesh, ep_mesh)``
-  原地替换 target.forward。两个 kernel 都是纯标准算子（可 dispatch），
+  原地替换 target.forward。上述计算 kernel 都是纯标准算子（可 dispatch），
   示例声明 region_dispatch=True——validate 下 dispatch 穿透注入实现，
-  out_src 真校验（不再是适配器 to_local + 声明式重包的黑盒路径）。
+  out_src 真校验（不再是适配器 to_local + 声明式重包的黑盒路径）；
+- **replace_module 契约**（`CheckpointMappedLinear` / `NpuGroupedMoe`）：
+  替换完整 `nn.Module`，并由 replacement 的 `make_transforms()` 声明相对
+  checkpoint key 重命名或 load-time 布局转换。
 
 两个计数器（FLASH_CALLS/FUSED_CALLS）用于证明替换真正生效。
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
+from transformers.core_model_loading import (
+    Concatenate,
+    MergeModulelist,
+    Transpose,
+    WeightConverter,
+    WeightRenaming,
+)
 
 from hyper_models.components.distributed.injection import (
     inner_wrapper,
     local_compute,
 )
+from hyper_models.components.model_transform import module_replacement
 
 FLASH_CALLS = {"n": 0}
 FUSED_CALLS = {"n": 0}
+
+
+@module_replacement
+class CheckpointMappedLinear(nn.Module):
+    """Linear implementation with a replacement-specific parameter schema."""
+
+    def __init__(self, *, module, module_fqn, context):
+        super().__init__()
+        del module_fqn, context
+        self.in_features = module.in_features
+        self.out_features = module.out_features
+        self.register_parameter("packed_weight", module.weight)
+        self.register_parameter("bias", module.bias)
+        self.train(module.training)
+
+    def forward(self, input):
+        return F.linear(input, self.packed_weight, self.bias)
+
+    def make_transforms(self):
+        return [WeightRenaming("weight", "packed_weight")]
+
+
+class _GroupedMatmul(torch.autograd.Function):
+    """Autograd wrapper consuming checkpoint-transposed ``[E, K, N]`` weights."""
+
+    @staticmethod
+    def forward(ctx, inputs, weight, tokens_per_expert):
+        import torch_npu  # pylint: disable=import-outside-toplevel
+
+        ctx.save_for_backward(inputs, weight)
+        ctx.tokens_per_expert = tokens_per_expert
+        return torch_npu.npu_grouped_matmul(
+            [inputs],
+            [weight],
+            bias=None,
+            group_list=tokens_per_expert,
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+        )[0]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        import torch_npu  # pylint: disable=import-outside-toplevel
+
+        inputs, weight = ctx.saved_tensors
+        tokens_per_expert = ctx.tokens_per_expert
+        grad_inputs = torch_npu.npu_grouped_matmul(
+            [grad_output],
+            [weight.transpose(1, 2).contiguous()],
+            bias=None,
+            group_list=tokens_per_expert,
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+        )[0]
+        grad_weight = torch_npu.npu_grouped_matmul(
+            [inputs.transpose(0, 1)],
+            [grad_output],
+            bias=None,
+            group_list=tokens_per_expert,
+            split_item=3,
+            group_type=2,
+            group_list_type=1,
+        )[0]
+        return grad_inputs, grad_weight, None
+
+
+@module_replacement
+class NpuGroupedMoe(nn.Module):
+    """Complete MoE replacement holding checkpoint-transposed expert parameters."""
+
+    def __init__(self, *, module, module_fqn, context):
+        super().__init__()
+        del module_fqn, context
+        self.gate = module.gate
+        self.experts = nn.Module()
+        self.experts.num_experts = module.experts.num_experts
+
+        gate_up_proj = module.experts.gate_up_proj
+        self.experts.gate_up_proj = nn.Parameter(
+            gate_up_proj.detach().transpose(1, 2).contiguous(),
+            requires_grad=gate_up_proj.requires_grad,
+        )
+
+        down_proj = module.experts.down_proj
+        self.experts.down_proj = nn.Parameter(
+            down_proj.detach().transpose(1, 2).contiguous(),
+            requires_grad=down_proj.requires_grad,
+        )
+        self.train(module.training)
+
+    def forward(self, hidden_states):
+        import torch_npu  # pylint: disable=import-outside-toplevel
+
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        _, routing_weights, selected_experts = self.gate(hidden_states)
+        permuted_states, row_ids_map = torch_npu.npu_moe_token_permute(
+            hidden_states,
+            selected_experts.to(torch.int32),
+        )
+        tokens_per_expert = torch.histc(
+            selected_experts,
+            bins=self.experts.num_experts,
+            min=0,
+            max=self.experts.num_experts,
+        ).to(torch.int64)
+        gate_up_output = _GroupedMatmul.apply(
+            permuted_states,
+            self.experts.gate_up_proj,
+            tokens_per_expert,
+        )
+        activated_states = torch_npu.npu_swiglu(gate_up_output, dim=-1)
+        expert_output = _GroupedMatmul.apply(
+            activated_states,
+            self.experts.down_proj,
+            tokens_per_expert,
+        )
+        output = torch_npu.npu_moe_token_unpermute(
+            expert_output,
+            row_ids_map,
+            probs=routing_weights,
+        )
+        return output.reshape(batch_size, sequence_length, hidden_dim)
+
+    def make_transforms(self):
+        return [
+            WeightConverter(
+                source_patterns=[
+                    "experts.*.gate_proj.weight",
+                    "experts.*.up_proj.weight",
+                ],
+                target_patterns="experts.gate_up_proj",
+                operations=[
+                    MergeModulelist(dim=0),
+                    Concatenate(dim=1),
+                    Transpose(dim0=1, dim1=2),
+                ],
+            ),
+            WeightConverter(
+                source_patterns="experts.*.down_proj.weight",
+                target_patterns="experts.down_proj",
+                operations=[
+                    MergeModulelist(dim=0),
+                    Transpose(dim0=1, dim1=2),
+                ],
+            ),
+        ]
 
 
 def _fast_attention(module, hidden_states):
