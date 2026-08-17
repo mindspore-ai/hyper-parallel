@@ -28,16 +28,19 @@ import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel.platform import get_platform
 from hyper_models.components.distributed.config import FSDP2Config
 from hyper_models.components.distributed.infrastructure import MeshContext
+from hyper_models.components.distributed.source_shard import FSDP_OWNED_DIMS
 
 logger = logging.getLogger(__name__)
 platform = get_platform()
 ModuleClass = platform.Module
 ParameterClass = platform.Parameter
 
-TPGradInfoByFQN: TypeAlias = Mapping[str, tuple[Placement, DeviceMesh]]  # pylint: disable=invalid-name
-TPGradInfoByParam: TypeAlias = dict[  # pylint: disable=invalid-name
+SourceShardInfoByFQN: TypeAlias = Mapping[  # pylint: disable=invalid-name
+    str, tuple[tuple[Placement, ...], DeviceMesh]
+]
+SourceShardInfoByParam: TypeAlias = dict[  # pylint: disable=invalid-name
     ParameterClass,
-    "fully_shard_utils.TPShardMetaInfo",
+    "fully_shard_utils.SourceShardMetaInfo",
 ]
 
 
@@ -47,6 +50,11 @@ class _WrapModuleInfo:
 
     fqn: str
     module: ModuleClass
+
+
+def _is_expert_source_mesh(mesh: DeviceMesh | None) -> bool:
+    """Whether a source mesh carries the expert (EP) axis."""
+    return mesh is not None and "ep" in (getattr(mesh, "mesh_dim_names", None) or ())
 
 
 class FSDP2Manager:
@@ -62,11 +70,11 @@ class FSDP2Manager:
         self.config = config
         self.mesh_context = mesh_context
 
-    def _build_tp_grad_info_by_param(
+    def _build_source_shard_info_by_param(
         self,
         model: ModuleClass,
-        tp_grad_info: TPGradInfoByFQN | None,
-    ) -> TPGradInfoByParam | None:
+        source_shard_info: SourceShardInfoByFQN | None,
+    ) -> SourceShardInfoByParam | None:
         """Resolve stable FQNs to parameter identities after model rewrites.
 
         Activation-checkpoint wrappers may add an internal child-module prefix,
@@ -78,7 +86,7 @@ class FSDP2Manager:
         Args:
             model: Model after sharding and checkpoint rewrites, before layer
                 compile is installed.
-            tp_grad_info: Source-layout metadata produced by the TP planner.
+            source_shard_info: Source-layout metadata produced by the TP planner.
 
         Returns:
             Parameter-keyed metadata for later ``fully_shard`` calls, or
@@ -88,41 +96,41 @@ class FSDP2Manager:
             ValueError: If TP metadata is missing, references an unknown FQN,
                 contains ``Partial``, or gives tied aliases conflicting layouts.
         """
-        if tp_grad_info is None:
+        if source_shard_info is None:
             if self.mesh_context.tp_size > 1:
-                raise ValueError("TP is enabled but tp_grad_info is missing")
+                raise ValueError("TP is enabled but source_shard_info is missing")
             return None
-        if self.mesh_context.tp_size > 1 and not tp_grad_info:
-            raise ValueError("TP is enabled but tp_grad_info is empty")
+        if self.mesh_context.tp_size > 1 and not source_shard_info:
+            raise ValueError("TP is enabled but source_shard_info is empty")
 
         parameters_by_fqn = dict(model.named_parameters(remove_duplicate=False))
-        metadata_by_parameter: TPGradInfoByParam = {}
-        for parameter_fqn, (placement, source_mesh) in tp_grad_info.items():
+        metadata_by_parameter: SourceShardInfoByParam = {}
+        for parameter_fqn, (placements, source_mesh) in source_shard_info.items():
             parameter = parameters_by_fqn.get(parameter_fqn)
             if parameter is None:
                 raise ValueError(
-                    f"tp_grad_info contains unknown parameter FQN: {parameter_fqn}"
+                    f"source_shard_info contains unknown parameter FQN: {parameter_fqn}"
                 )
-            if isinstance(placement, Partial):
+            if any(isinstance(placement, Partial) for placement in placements):
                 raise ValueError(
-                    f"tp_grad_info does not support Partial placement: {parameter_fqn}"
+                    f"source_shard_info does not support Partial placement: {parameter_fqn}"
                 )
 
-            tp_shard_info = fully_shard_utils.TPShardMetaInfo(  # pylint: disable=no-member
+            source_shard_info = fully_shard_utils.SourceShardMetaInfo(  # pylint: disable=no-member
                 mesh=source_mesh,
-                placements=(placement,),
+                placements=tuple(placements),
                 origin_is_dtensor=False,
             )
-            previous_tp_shard_info = metadata_by_parameter.get(parameter)
-            if previous_tp_shard_info is not None and (
-                previous_tp_shard_info.mesh is not tp_shard_info.mesh
-                or previous_tp_shard_info.placements != tp_shard_info.placements
+            previous_source_shard_info = metadata_by_parameter.get(parameter)
+            if previous_source_shard_info is not None and (
+                previous_source_shard_info.mesh is not source_shard_info.mesh
+                or previous_source_shard_info.placements != source_shard_info.placements
             ):
                 raise ValueError(
                     "Tied parameter aliases have conflicting source layouts; "
                     f"conflict found at {parameter_fqn}"
                 )
-            metadata_by_parameter[parameter] = tp_shard_info
+            metadata_by_parameter[parameter] = source_shard_info
         return metadata_by_parameter
 
     def _resolve_replicate_params(
@@ -244,17 +252,16 @@ class FSDP2Manager:
     def _find_expert_wrap_modules(
         self,
         model: ModuleClass,
-        metadata_by_parameter: TPGradInfoByParam | None,
+        metadata_by_parameter: SourceShardInfoByParam | None,
         wrapped_module_ids: set[int],
     ) -> list[_WrapModuleInfo]:
         """Find nested expert containers whose parameters use the expert mesh."""
         if metadata_by_parameter is None or self.mesh_context.fsdp_moe_mesh is None:
             return []
-        expert_source_mesh = self.mesh_context.fsdp_moe_mesh["ep"]
         expert_parameters = {
             parameter
-            for parameter, tp_shard_info in metadata_by_parameter.items()
-            if tp_shard_info.mesh is expert_source_mesh
+            for parameter, source_shard_info in metadata_by_parameter.items()
+            if _is_expert_source_mesh(source_shard_info.mesh)
         }
         expert_module_fqns = {
             parameter_fqn.split(".experts.", 1)[0] + ".experts"
@@ -276,7 +283,7 @@ class FSDP2Manager:
     def _find_wrap_modules(
         self,
         model: ModuleClass,
-        metadata_by_parameter: TPGradInfoByParam | None = None,
+        metadata_by_parameter: SourceShardInfoByParam | None = None,
     ) -> list[_WrapModuleInfo]:
         """Find HF transformer blocks selected by ``transformer_block`` policy."""
         wrap_modules, wrapped_module_ids = self._find_transformer_block_modules(model)
@@ -323,58 +330,76 @@ class FSDP2Manager:
                 owner_by_parameter[parameter] = model
         return owner_by_parameter
 
-    def _get_tp_mesh(self) -> DeviceMesh:
-        """Return the planner's TP submesh used for default Replicate metadata."""
+    def _get_default_source_shard_info(self) -> "fully_shard_utils.SourceShardMetaInfo":
+        """Build all-Replicate source metadata covering every non-FSDP mesh axis.
+
+        Used to complete source_shard_info for parameters the plan does not mention;
+        the axis set must match the per-parameter entries so that all parameters
+        in one ``fully_shard`` unit share the same source-mesh dimensionality.
+        """
         world_mesh = self.mesh_context.fsdp_non_moe_mesh or self.mesh_context.device_mesh
         if world_mesh is None or world_mesh.mesh_dim_names is None:
             raise ValueError("TP metadata completion requires a named world mesh")
-        if "tp" not in world_mesh.mesh_dim_names:
-            raise ValueError("TP is enabled but the world mesh has no tp dimension")
-        return world_mesh["tp"]
+        source_dim_names = tuple(
+            dim_name
+            for dim_name in world_mesh.mesh_dim_names
+            if dim_name not in FSDP_OWNED_DIMS
+        )
+        if not source_dim_names:
+            raise ValueError(
+                "TP is enabled but the world mesh has no non-FSDP source dimension"
+            )
+        source_mesh = (
+            world_mesh
+            if tuple(world_mesh.mesh_dim_names) == source_dim_names
+            else world_mesh[source_dim_names[0]]
+            if len(source_dim_names) == 1
+            else world_mesh[source_dim_names]
+        )
+        return fully_shard_utils.SourceShardMetaInfo(  # pylint: disable=no-member
+            mesh=source_mesh,
+            placements=tuple(Replicate() for _ in source_dim_names),
+            origin_is_dtensor=False,
+        )
 
-    def _uses_expert_mesh(self, metadata_by_parameter: TPGradInfoByParam | None) -> bool:
+    def _uses_expert_mesh(self, metadata_by_parameter: SourceShardInfoByParam | None) -> bool:
         """Return whether one FSDP unit owns routed-expert source metadata."""
         if metadata_by_parameter is None or self.mesh_context.fsdp_moe_mesh is None:
             return False
-        expert_source_mesh = self.mesh_context.fsdp_moe_mesh["ep"]
         return any(
-            tp_shard_info.mesh is expert_source_mesh
-            for tp_shard_info in metadata_by_parameter.values()
+            _is_expert_source_mesh(source_shard_info.mesh)
+            for source_shard_info in metadata_by_parameter.values()
         )
 
-    def _build_managed_tp_grad_info(
+    def _build_managed_source_shard_info(
         self,
         owner: ModuleClass,
         owner_by_parameter: Mapping[ParameterClass, ModuleClass],
-        metadata_by_parameter: TPGradInfoByParam | None,
-    ) -> TPGradInfoByParam | None:
+        metadata_by_parameter: SourceShardInfoByParam | None,
+    ) -> SourceShardInfoByParam | None:
         """Select and complete metadata for parameters managed by one wrap call."""
         if metadata_by_parameter is None:
             return None
 
-        default_tp_shard_info = None
+        default_source_shard_info = None
         if (
             self.mesh_context.fsdp_non_moe_mesh is not None
             or self.mesh_context.device_mesh is not None
         ):
-            default_tp_shard_info = fully_shard_utils.TPShardMetaInfo(  # pylint: disable=no-member
-                mesh=self._get_tp_mesh(),
-                placements=(Replicate(),),
-                origin_is_dtensor=False,
-            )
-        managed_tp_grad_info = {}
+            default_source_shard_info = self._get_default_source_shard_info()
+        managed_source_shard_info = {}
         for parameter, parameter_owner in owner_by_parameter.items():
             if parameter_owner is not owner:
                 continue
-            tp_shard_info = metadata_by_parameter.get(parameter)
-            if tp_shard_info is None:
-                if default_tp_shard_info is None:
+            source_shard_info = metadata_by_parameter.get(parameter)
+            if source_shard_info is None:
+                if default_source_shard_info is None:
                     raise ValueError(
-                        "tp_grad_info is present but does not cover an FSDP-managed parameter"
+                        "source_shard_info is present but does not cover an FSDP-managed parameter"
                     )
-                tp_shard_info = default_tp_shard_info
-            managed_tp_grad_info[parameter] = tp_shard_info
-        return managed_tp_grad_info
+                source_shard_info = default_source_shard_info
+            managed_source_shard_info[parameter] = source_shard_info
+        return managed_source_shard_info
 
     @staticmethod
     def _build_managed_replicate_params(
@@ -394,7 +419,7 @@ class FSDP2Manager:
     def _configure_source_layout_gradient_scaling(
         self,
         hsdp_module: HSDPModule,
-        managed_tp_grad_info: TPGradInfoByParam | None,
+        managed_source_shard_info: SourceShardInfoByParam | None,
     ) -> bool:
         """Restore global-mean gradients for one source-layout FSDP unit.
 
@@ -407,7 +432,7 @@ class FSDP2Manager:
             Whether a gradient scaling factor was configured for the unit.
         """
         dp_size = self.mesh_context.dp_size
-        if dp_size <= 1 or not managed_tp_grad_info:
+        if dp_size <= 1 or not managed_source_shard_info:
             return False
         hsdp_module.set_gradient_scaling_factor(1.0 / dp_size)
         return True
@@ -445,7 +470,7 @@ class FSDP2Manager:
     def parallelize(
         self,
         model: ModuleClass,
-        tp_grad_info: TPGradInfoByFQN | None = None,
+        source_shard_info: SourceShardInfoByFQN | None = None,
         *,
         compile_hooks_enabled: bool = False,
     ) -> ModuleClass:
@@ -453,7 +478,7 @@ class FSDP2Manager:
 
         Args:
             model: Model to wrap in place.
-            tp_grad_info: FQN-keyed source-layout metadata returned by
+            source_shard_info: FQN-keyed source-layout metadata returned by
                 ``apply_sharding_plan``. The manager resolves parameter
                 identities before applying nested FSDP units.
             compile_hooks_enabled: Whether scheduler forward hooks should stay
@@ -471,9 +496,9 @@ class FSDP2Manager:
                 "compile_hooks_enabled must be a bool, got "
                 f"{type(compile_hooks_enabled).__name__}"
             )
-        metadata_by_parameter = self._build_tp_grad_info_by_param(
+        metadata_by_parameter = self._build_source_shard_info_by_param(
             model,
-            tp_grad_info,
+            source_shard_info,
         )
         replicate_params = self._resolve_replicate_params(model)
 
@@ -490,13 +515,13 @@ class FSDP2Manager:
         )
         gradient_scaled_units = 0
         for wrap_module in wrapping_order:
-            managed_tp_grad_info = self._build_managed_tp_grad_info(
+            managed_source_shard_info = self._build_managed_source_shard_info(
                 wrap_module.module,
                 owner_by_parameter,
                 metadata_by_parameter,
             )
             fsdp_sublayer_kwargs = dense_fsdp_kwargs
-            if self._uses_expert_mesh(managed_tp_grad_info):
+            if self._uses_expert_mesh(managed_source_shard_info):
                 if self.mesh_context.fsdp_moe_mesh is None:
                     raise ValueError("Expert TP metadata requires MeshContext.fsdp_moe_mesh")
                 fsdp_sublayer_kwargs, _ = self._build_fully_shard_kwargs(
@@ -504,7 +529,7 @@ class FSDP2Manager:
                 )
             fully_shard(  # pylint: disable=unexpected-keyword-arg
                 wrap_module.module,
-                tp_grad_infos=managed_tp_grad_info,
+                source_shard_infos=managed_source_shard_info,
                 compile_hooks_enabled=compile_hooks_enabled,
                 replicate_params=self._build_managed_replicate_params(
                     wrap_module.module,
@@ -515,22 +540,22 @@ class FSDP2Manager:
             )
             if self._configure_source_layout_gradient_scaling(
                 wrap_module.module,
-                managed_tp_grad_info,
+                managed_source_shard_info,
             ):
                 gradient_scaled_units += 1
 
-        root_tp_grad_info = self._build_managed_tp_grad_info(
+        root_source_shard_info = self._build_managed_source_shard_info(
             model,
             owner_by_parameter,
             metadata_by_parameter,
         )
-        if self._uses_expert_mesh(root_tp_grad_info):
+        if self._uses_expert_mesh(root_source_shard_info):
             raise ValueError(
                 "Routed expert parameters must belong to a nested experts FSDP unit"
             )
         fully_shard(  # pylint: disable=unexpected-keyword-arg
             model,
-            tp_grad_infos=root_tp_grad_info,
+            source_shard_infos=root_source_shard_info,
             compile_hooks_enabled=compile_hooks_enabled,
             replicate_params=self._build_managed_replicate_params(
                 model,
@@ -539,7 +564,7 @@ class FSDP2Manager:
             ),
             **dense_root_kwargs,
         )
-        if self._configure_source_layout_gradient_scaling(model, root_tp_grad_info):
+        if self._configure_source_layout_gradient_scaling(model, root_source_shard_info):
             gradient_scaled_units += 1
         if gradient_scaled_units:
             logger.info(
