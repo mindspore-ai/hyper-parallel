@@ -14,7 +14,7 @@
 # limitations under the License.
 # ============================================================================
 
-set -euo pipefail
+set -e
 
 cd "$(dirname "$0")/../.."
 
@@ -22,13 +22,16 @@ NPROC=${NPROC:-8}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29501}
 
-LABEL=${LABEL:-$(date +%Y%m%d_%H%M%S)}
-OUTPUT_DIR="$(dirname "$0")/output"
-mkdir -p "${OUTPUT_DIR}"
-
+LABEL=${LABEL:-data}
+OUTPUT_DIR="./output"
 export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 # 8,9,10,11,12,13,14,15 # 
+
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
+export PYTHONPATH=../../hyper-parallel:$PYTHONPATH
+
+mkdir -p "${OUTPUT_DIR}"
 
 torchrun \
     --nproc_per_node="${NPROC}" \
@@ -39,3 +42,5 @@ torchrun \
     examples/training_demo/train.yaml \
     "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_${LABEL}.log"
+
+# $(date +%Y%m%d_%H%M%S)

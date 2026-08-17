@@ -19,7 +19,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Protocol
 
-from hyper_models.components.datasets.batch import PreparedBatch
 from hyper_models.components.datasets.parallel.batch_context import BatchParallelContext
 from hyper_models.components.datasets.parallel.batch_transport import DistributedBatchTransport
 from hyper_models.components.datasets.parallel.pipeline_router import PipelineBatchRouter
@@ -34,7 +33,7 @@ class BatchProcessor(Protocol):
     ) -> dict[str, Any] | None:
         """Normalize the Dataset field contract before communication."""
 
-    def prepare_batch(self, batch: Mapping[str, Any]) -> PreparedBatch:
+    def prepare_batch(self, batch: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         """Apply model-specific sharding and classify runtime fields."""
 
 
@@ -68,7 +67,7 @@ class RuntimeBatchAdapter:
         data_iterator: Any,
         *,
         external_batch: Mapping[str, Any] | None = None,
-    ) -> PreparedBatch:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build one distributed, model-ready micro-batch.
 
         Args:
@@ -76,7 +75,7 @@ class RuntimeBatchAdapter:
             external_batch: Optional batch supplied without advancing an iterator.
 
         Returns:
-            Model inputs, loss inputs, and auxiliary metadata.
+            Model inputs and loss inputs.
         """
         source_batch, source_exhausted = self.transport.read_source_batch(
             data_iterator,
@@ -92,6 +91,6 @@ class RuntimeBatchAdapter:
             normalized_batch,
             source_exhausted=source_exhausted,
         )
-        prepared_batch = self.processor.prepare_batch(distributed_batch)
-        return prepared_batch
+        model_inputs, loss_inputs = self.processor.prepare_batch(distributed_batch)
+        return model_inputs, loss_inputs
 

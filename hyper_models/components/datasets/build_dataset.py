@@ -14,11 +14,14 @@
 # ============================================================================
 """Public LLM and Omni dataset build stage."""
 
+import logging
 from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
 
 
 def build_dataset(
@@ -43,10 +46,12 @@ def build_dataset(
     """
     if dataset_target is None:
         raise ValueError("dataset_target must define a build target")
+    logger.debug("Building Dataset with target=%s", type(dataset_target).__name__)
     dataset = dataset_target.build(
         transform=transform,
         parallel_context=parallel_context,
     )
+    logger.debug("Dataset target returned type=%s", type(dataset).__name__)
     return dataset
 
 

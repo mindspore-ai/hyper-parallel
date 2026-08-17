@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -27,6 +28,8 @@ from hyper_models.components.datasets.contracts import (
     is_iterable_dataset,
 )
 from hyper_models.components.utils.constants import IGNORE_INDEX
+
+logger = logging.getLogger(__name__)
 
 
 def _has_trainable_labels(model_sample: Mapping[str, Any]) -> bool:
@@ -44,6 +47,7 @@ def _normalize_transformed_samples(transformed_sample: Any) -> list[ModelSample]
     """Normalize a transform result without recomputing it."""
     if isinstance(transformed_sample, Mapping):
         return [dict(transformed_sample)]
+
     if isinstance(transformed_sample, Sequence) and not isinstance(transformed_sample, (str, bytes)):
         model_samples = []
         for model_sample in transformed_sample:
@@ -51,6 +55,7 @@ def _normalize_transformed_samples(transformed_sample: Any) -> list[ModelSample]
                 raise ValueError("Every transformed LLM sample must be a mapping")
             model_samples.append(dict(model_sample))
         return model_samples
+
     raise ValueError("An LLM transform must return a mapping or a sequence of mappings")
 
 
@@ -175,17 +180,14 @@ def _wrap_llm_dataset(
         *,
         skip_invalid_samples: bool = False,
 ) -> Any:
-    if (
-            is_iterable_dataset(dataset)
-            and callable(getattr(dataset, "map", None))
-            and not skip_invalid_samples
-    ):
+    if (is_iterable_dataset(dataset) and callable(getattr(dataset, "map", None)) and not skip_invalid_samples):
         transform_callable = _OnlineIterableTransform(transform)
         column_names = getattr(dataset, "column_names", None)
         map_options = {}
         if column_names:
             map_options["remove_columns"] = column_names
         transformed_dataset = dataset.map(transform_callable, **map_options)
+        logger.debug("Wrapped map-capable iterable Dataset with transform=%s", type(transform).__name__)
         return transformed_dataset
 
     if hasattr(dataset, "__getitem__") and hasattr(dataset, "__len__"):
@@ -194,6 +196,7 @@ def _wrap_llm_dataset(
             transform,
             skip_invalid_samples=skip_invalid_samples,
         )
+        logger.debug("Wrapped mapping Dataset with transform=%s", type(transform).__name__)
         return transformed_dataset
 
     if hasattr(dataset, "__iter__"):
@@ -202,6 +205,7 @@ def _wrap_llm_dataset(
             transform,
             skip_invalid_samples=skip_invalid_samples,
         )
+        logger.debug("Wrapped iterable Dataset with transform=%s", type(transform).__name__)
         return transformed_dataset
 
     raise ValueError("LLM source Dataset must be map-style or iterable")
@@ -235,8 +239,10 @@ def apply_llm_data_transform(
             for dataset in dataset_result
         )
         return transformed_splits
+
     if dataset_result is None:
         return None
+
     transformed_dataset = _wrap_llm_dataset(
         dataset_result,
         transform,

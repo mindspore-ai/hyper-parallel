@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
@@ -27,6 +28,8 @@ from hyper_models.components.datasets.llm.online_utils import (
     normalize_online_parallel_context,
 )
 from hyper_models.components.datasets.parallel import DatasetParallelContext, build_distributed_dataset
+
+logger = logging.getLogger(__name__)
 
 
 class OnlineMappingDataset:
@@ -80,6 +83,7 @@ def build_online_mapping_dataset(
             streaming=False,
         )
         online_dataset = OnlineMappingDataset(source_dataset)
+        logger.debug("Loaded online mapping Dataset records=%d", len(online_dataset))
         return online_dataset
 
     online_dataset = build_distributed_dataset(

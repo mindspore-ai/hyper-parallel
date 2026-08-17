@@ -19,11 +19,12 @@ from typing import Any, Dict
 
 from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
-from hyper_models.components.datasets.llm import build_chat_template
+from hyper_models.components.datasets import calculate_num_micro_batches
+from hyper_models.components.datasets.llm import build_chat_template, build_llm_get_batch
 from hyper_models.components.loss.loss_utils import count_loss_token
 from hyper_models.components.utils import helper
 from hyper_models.components.utils.device import synchronize
-from hyper_models.trainer.base import BaseTrainer, HyperIter
+from hyper_models.trainer.base import BaseTrainer
 from hyper_models.trainer.config import TrainerConfig
 
 logger = helper.create_logger(__name__)
@@ -43,11 +44,16 @@ class TextTrainer:
         self.base._build_model()
         self.base._build_loss()
 
+        # datasets
         self._build_model_assets()
         self._build_data_transform()
         self.base._build_dataset()
+
+        # dataloader
         self._build_collate_fn()
         self.base._build_dataloader()
+
+        # get_batch
         self._build_get_batch()
         self.base._compute_train_steps()
 
@@ -59,7 +65,9 @@ class TextTrainer:
     def _build_model_assets(self) -> None:
         """Build tokenizer-backed assets for text training."""
         config: TrainerConfig = self.base.config
-        assets_config = config.model_assets
+        if config.dataset is None:
+            raise ValueError("dataset must define a build target")
+        assets_config = config.dataset.model_assets
         tokenizer_target = assets_config.tokenizer
         if tokenizer_target is None:
             self.base.tokenizer = None
@@ -73,9 +81,9 @@ class TextTrainer:
         self.base.chat_template = None
         if assets_config.datasets_type == "conversation":
             if self.base.tokenizer is None:
-                raise ValueError("model_assets.tokenizer is required for conversation data")
+                raise ValueError("dataset.model_assets.tokenizer is required for conversation data")
             if assets_config.chat_template is None:
-                raise ValueError("model_assets.chat_template is required for conversation data")
+                raise ValueError("dataset.model_assets.chat_template is required for conversation data")
             if isinstance(assets_config.chat_template, str):
                 self.base.chat_template = build_chat_template(
                     assets_config.chat_template,
@@ -94,61 +102,40 @@ class TextTrainer:
 
     def _build_data_transform(self) -> None:
         """Build the configured text sample transform."""
-        if self.base.config.data_transform is None:
+        dataset_config = self.base.config.dataset
+        if dataset_config is None:
+            raise ValueError("dataset must define a build target")
+        if dataset_config.data_transform is None:
             self.base.data_transform = None
             return
-        self.base.data_transform = self.base.config.data_transform.build(
+        self.base.data_transform = dataset_config.data_transform.build(
             tokenizer=self.base.tokenizer,
             chat_template=self.base.chat_template,
         )
 
     def _build_collate_fn(self) -> None:
         """Build the text collator and gradient-accumulation batch count."""
-        from hyper_models.components.datasets.build_collate_fn import calculate_num_micro_batches
-
-        if self.base.config.collate_fn is None:
-            raise ValueError("collate_fn must define a build target")
+        dataloader_config = self.base.config.dataloader
+        if dataloader_config is None or dataloader_config.collate_fn is None:
+            raise ValueError("dataloader.collate_fn must define a build target")
         training_config = self.base.config.training
         self.base.num_micro_batches = calculate_num_micro_batches(
             global_batch_size=training_config.global_batch_size,
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
         )
-        self.base.collate_fn = self.base.config.collate_fn.build()
+        self.base.collate_fn = dataloader_config.collate_fn.build()
 
     def _build_get_batch(self) -> None:
         """Build the DataLoader-to-LLM batch adapter."""
-        from hyper_models.components.datasets.llm.get_batch import build_llm_get_batch
-        from hyper_models.components.datasets.parallel import create_batch_parallel_context
-
         config = self.base.config
-        pp_shared_data = bool(getattr(config.dataloader, "pp_shared_data", False))
-        data_config = getattr(config.dataset, "data_config", {})
-        tokenizer = getattr(self.base, "tokenizer", None)
-        eod_token_id = getattr(
-            tokenizer,
-            "eod",
-            getattr(tokenizer, "eos_token_id", 0),
-        )
-        parallel_context = create_batch_parallel_context(
-            self.base.mesh,
-            pp_shared_data=pp_shared_data,
-        )
-        get_batch_builder = (
-            build_llm_get_batch
-            if config.get_batch is None
-            else config.get_batch.build
-        )
+        get_batch_builder = config.dataloader.get_batch.build if config.dataloader.get_batch else build_llm_get_batch
         self.base.get_batch = get_batch_builder(
-            parallel_context=parallel_context,
+            mesh_context=self.base.mesh,
             device=self.base.device,
-            eod_token_id=eod_token_id,
-            reset_position_ids=bool(data_config.get("reset_position_ids", False)),
-            reset_attention_mask=bool(data_config.get("reset_attention_mask", False)),
-            eod_mask_loss=bool(data_config.get("eod_mask_loss", False)),
-            create_attention_mask=bool(
-                data_config.get("create_attention_mask_in_dataloader", True)
-            ),
+            tokenizer=self.base.tokenizer,
+            data_config=getattr(config.dataset, "data_config", {}),
+            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
 
     @property
@@ -199,13 +186,10 @@ class TextTrainer:
             grad_norm=grad_norm,
         )
 
-    def train_step(
-            self,
-            data_iterator: Any,
-    ) -> Dict[str, float]:
+    def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one text training step."""
         config = self.base.config
-        first_micro_batch = self.base.get_batch(data_iterator)
+        first_training_batch = self.base.get_batch(data_iterator)
         self.base.state.global_step += 1
 
         self.on_step_begin(micro_batches=None)
@@ -216,24 +200,18 @@ class TextTrainer:
         num_micro_steps = self.base.num_micro_batches
 
         for micro_step in range(num_micro_steps):
-            micro_batch = (
-                first_micro_batch
-                if micro_step == 0
-                else self.base.get_batch(data_iterator)
-            )
+            model_inputs, loss_inputs = first_training_batch if micro_step == 0 else self.base.get_batch(data_iterator)
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base._configure_fsdp_gradient_sync(
                 micro_step,
                 num_micro_steps,
             )
-            self.base.micro_batch_token_len = count_loss_token(
-                micro_batch.loss_count_inputs()
-            )
-            self.base.micro_batches_token_len = {
+            self.base.current_token_counts = count_loss_token(loss_inputs)
+            self.base.step_token_counts = {
                 name: token_count * num_micro_steps
-                for name, token_count in self.base.micro_batch_token_len.items()
+                for name, token_count in self.base.current_token_counts.items()
             }
-            loss, loss_dict = self.base.forward_backward_step(micro_batch)
+            loss, loss_dict = self.base.forward_backward_step(model_inputs)
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
@@ -292,50 +270,32 @@ class TextTrainer:
             config.training.num_train_epochs,
         )
 
-        for epoch in range(
-                self.base.start_epoch,
-                config.training.num_train_epochs,
-        ):
+        for epoch in range(self.base.start_epoch, config.training.num_train_epochs):
             if hasattr(self.base.train_dataloader, "set_epoch"):
                 self.base.train_dataloader.set_epoch(epoch)
             self.base.state.epoch = epoch
             self.on_epoch_begin()
 
-            self.base.data_iterator = HyperIter(
-                self.base.train_dataloader,
-                use_background_prefetcher=(
-                    config.dataloader.use_background_prefetcher
-                ),
-            )
+            data_iterator = iter(self.base.train_dataloader)
 
-            for _ in range(self.base.start_step, self.base.train_steps):
+            epoch_steps = self.base.steps_per_epoch or self.base.train_steps - self.base.state.global_step
+            for _ in range(self.base.start_step, epoch_steps):
                 if self.base.state.global_step >= self.base.train_steps:
                     break
                 try:
-                    self.train_step(self.base.data_iterator)
+                    self.train_step(data_iterator)
                 except StopIteration:
-                    logger.info(
-                        "epoch:%s Dataloader finished with drop_last %s",
-                        epoch,
-                        config.dataloader.drop_last,
-                    )
+                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {config.dataloader.drop_last}")
                     break
 
             self.on_epoch_end()
             self.base.start_step = 0
-            helper.print_device_mem_info(
-                f"VRAM usage after epoch {epoch + 1}"
-            )
+            helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
-            if config.dataloader.use_background_prefetcher:
-                self.base.data_iterator.stop()
             if self.base.state.global_step >= self.base.train_steps:
                 break
 
         self.on_train_end()
-
-        if (hasattr(self.base, "data_iterator") and config.dataloader.use_background_prefetcher):
-            self.base.data_iterator.stop()
 
         synchronize()
         self.base.destroy_distributed()

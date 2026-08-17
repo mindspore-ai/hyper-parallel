@@ -32,13 +32,9 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     """Training-loop parameters exposed by the initial YAML schema."""
 
-    train_iters: Optional[int] = None
+    train_steps: Optional[int] = None
     train_samples: Optional[int] = None
     eval_iters: int = 0
-
-    consumed_train_samples: int = 0
-    consumed_valid_samples: int = 0
-    # max_steps: Optional[int] = None
 
     num_train_epochs: int = 1
     global_batch_size: int = 8
@@ -124,6 +120,7 @@ class CompileConfig:
 class DebugConfig:
     """Debug parameters exposed by the initial YAML schema."""
 
+    check_dataset: bool = False
     check_nan_inf: bool = False
 
 
@@ -628,6 +625,60 @@ class ModelAssetsConfig:
 
 
 @dataclass
+class DatasetConfig:
+    """Dataset target with its model assets and sample transform."""
+
+    target: Target[Any]
+    model_assets: ModelAssetsConfig = field(default_factory=ModelAssetsConfig)
+    data_transform: Optional[Target[Any]] = None
+
+    def build(self, **runtime_kwargs: Any) -> Any:
+        """Build the Dataset target with runtime Trainer arguments."""
+        return self.target.build(**runtime_kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Expose configured Dataset options through the wrapped target."""
+        return getattr(self.target, name)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize Dataset components in their compact nested YAML shape."""
+        config = self.target.to_dict()
+        config["model_assets"] = _serialize_config_value(self.model_assets)
+        config["data_transform"] = _serialize_config_value(self.data_transform)
+        return config
+
+
+@dataclass
+class DataLoaderConfig:
+    """DataLoader target and its text-batch assembly components."""
+
+    target: Target[Any]
+    collate_fn: Optional[Target[Any]] = None
+    get_batch: Optional[Target[Any]] = None
+    dataloader_type: Literal["single", "cyclic"] = "single"
+    data_rearrange_map: Any = None
+    data_sharding: bool = False
+
+    def build(self, **runtime_kwargs: Any) -> Any:
+        """Build the DataLoader target with runtime Dataset arguments."""
+        return self.target.build(**runtime_kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Expose configured DataLoader options through the wrapped target."""
+        return getattr(self.target, name)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize components in their compact nested YAML shape."""
+        config = self.target.to_dict()
+        config["collate_fn"] = _serialize_config_value(self.collate_fn)
+        config["get_batch"] = _serialize_config_value(self.get_batch)
+        config["dataloader_type"] = self.dataloader_type
+        config["data_rearrange_map"] = _serialize_config_value(self.data_rearrange_map)
+        config["data_sharding"] = self.data_sharding
+        return config
+
+
+@dataclass
 class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
@@ -651,12 +702,8 @@ class TrainerConfig:
     compile: CompileConfig = field(default_factory=CompileConfig)
 
     # data
-    model_assets: ModelAssetsConfig = field(default_factory=ModelAssetsConfig)
-    data_transform: Optional[Target[Any]] = None
-    dataset: Optional[Target[Any]] = None
-    collate_fn: Optional[Target[Any]] = None
-    dataloader: Optional[Target[Any]] = None
-    get_batch: Optional[Target[Any]] = None
+    dataset: Optional[DatasetConfig] = None
+    dataloader: Optional[DataLoaderConfig] = None
     packed_sequence: Optional[Any] = None
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
@@ -694,6 +741,8 @@ __all__ = [
     "AcceleratorConfig",
     "ActivationCheckpointConfig",
     "CompileConfig",
+    "DataLoaderConfig",
+    "DatasetConfig",
     "DebugConfig",
     "FSDP2Config",
     "MixedPrecisionConfig",

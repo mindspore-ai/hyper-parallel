@@ -15,8 +15,6 @@ training:
   eval_iters: 1
   train_samples: null
   num_train_epochs: 1
-  consumed_train_samples: 0
-  consumed_valid_samples: 0
   global_batch_size: 8
   micro_batch_size: 1
   backend: nccl
@@ -47,23 +45,21 @@ mixed_precision:
 gradient_checkpointing:
   activation_checkpoint: off
 
-model_assets:
-  datasets_type: conversation
-  chat_template:
-    _target_: hyper_models.components.datasets.llm.chat_template.ChatmlTemplate
-  tokenizer:
-    _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: ./qwen3.5-0.8B
-    use_fast: true
-    trust_remote_code: true
-
-data_transform:
-  _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
-  data_type: conversation
-  text_keys: messages
-  max_seq_len: 2048
-
 dataset:
+  model_assets:
+    datasets_type: conversation
+    chat_template:
+      _target_: hyper_models.components.datasets.llm.chat_template.ChatmlTemplate
+    tokenizer:
+      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: ./qwen3.5-0.8B
+      use_fast: true
+      trust_remote_code: true
+  data_transform:
+    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    data_type: conversation
+    text_keys: messages
+    max_seq_len: 2048
   _target_: hyper_models.components.datasets.llm.build_llm_dataset
   # Kept for the common Dataset target contract. hf_dataset_name selects the
   # Hub source, so this value is not interpreted as a local path.
@@ -77,23 +73,22 @@ dataset:
     cache_dir: null
     show_progress: true
 
-collate_fn:
-  _target_: hyper_models.components.datasets.llm.build_llm_collator
-  packing: false
-
 dataloader:
+  # StatefulDataLoader adapter; use dataloader_type instead of shuffle.
   _target_: hyper_models.components.datasets.DataLoader
+  collate_fn:
+    _target_: hyper_models.components.datasets.llm.build_llm_collator
+    packing: false
+  get_batch:
+    _target_: hyper_models.components.datasets.llm.build_llm_get_batch
   dataloader_type: single
   data_rearrange_map: null
   data_sharding: false
   drop_last: true
   use_background_prefetcher: false
   num_workers: 0
-  dataloader_pin_memory: false
+  pin_memory: false
   prefetch_factor: null
-
-get_batch:
-  _target_: hyper_models.components.datasets.llm.build_llm_get_batch
 
 optimizer:
   _target_: hyper_models.components.optim.optimizer.AdamW

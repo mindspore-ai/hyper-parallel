@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
@@ -122,7 +122,7 @@ def load_online_hf_dataset(
     hf_dataset_name = data_config.get("hf_dataset_name")
     if hf_dataset_name is not None:
         hf_config_name = data_config.get("hf_config_name")
-        logger.info(
+        logger.debug(
             "Loading Hugging Face Dataset %s (config=%s, split=%s, streaming=%s)",
             hf_dataset_name,
             hf_config_name,
@@ -143,7 +143,7 @@ def load_online_hf_dataset(
             "data_path is required when hf_dataset_name is not configured"
         )
     data_files, loader_format = resolve_online_data_files(data_path)
-    logger.info(
+    logger.debug(
         "Loading %d Online Dataset files (format=%s, split=%s, streaming=%s)",
         len(data_files),
         loader_format,

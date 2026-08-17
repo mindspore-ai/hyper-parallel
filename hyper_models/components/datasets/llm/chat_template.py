@@ -95,7 +95,7 @@ class DefaultTemplate(ChatTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("tokenizer")
 class TokenizerTemplate(ChatTemplate):
-    """使用 tokenizer 自带的 chat template，并只训练指定消息。"""
+    """Use the tokenizer's native chat template and train only selected messages."""
 
     def _update_prefix_labels(
             self,
@@ -103,7 +103,7 @@ class TokenizerTemplate(ChatTemplate):
             current_ids: List[int],
             labels: List[int],
     ) -> None:
-        """确保追加消息后，之前已经生成的 token 前缀没有被改写。"""
+        """Ensure appending a message does not rewrite the existing token prefix."""
         previous_length = len(previous_ids)
         if current_ids[:previous_length] != previous_ids:
             raise ValueError(
@@ -158,7 +158,7 @@ class TokenizerTemplate(ChatTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("gpt_oss")
 class GptOssTokenizerTemplate(TokenizerTemplate):
-    """兼容 GPT-OSS 对话末尾的 <|return|> 到 <|end|> 改写。"""
+    """Support GPT-OSS terminal rewrites from <|return|> to <|end|>."""
 
     def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
         super().__init__(tokenizer)

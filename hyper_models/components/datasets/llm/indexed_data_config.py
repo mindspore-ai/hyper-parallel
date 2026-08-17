@@ -27,7 +27,6 @@ import numpy as np
 
 from hyper_parallel.platform import get_platform
 
-
 logger = logging.getLogger(__name__)
 platform = get_platform()
 
@@ -72,13 +71,19 @@ class BlendedMegatronDatasetConfig:
         split_values.extend([0.0] * (3 - len(split_values)))
         if len(split_values) != 3:
             raise ValueError(f"split length {len(split_values)} does not match expected 3")
-        
+
         if not all(value >= 0.0 for value in split_values):
             raise ValueError("all split values must be non-negative")
-        
+
         normalized_values = (
-            np.asarray(split_values, dtype=np.float64) / np.sum(split_values)
+                np.asarray(split_values, dtype=np.float64) / np.sum(split_values)
         ).tolist()
+        canonical_values = []
+        for value in normalized_values:
+            rounded_value = round(value, 12)
+            precision = 2 if rounded_value == round(rounded_value, 2) else 12
+            canonical_values.append(f"{rounded_value:.{precision}f}")
+        self.split = ", ".join(canonical_values)
 
         # Convert normalized ratios into non-overlapping ranges. A zero-sized
         # split is represented by None.
@@ -94,9 +99,9 @@ class BlendedMegatronDatasetConfig:
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration required to build indexed GPT Dataset splits."""
 
-    reset_position_ids: bool | None = None
-    reset_attention_mask: bool | None = None
-    eod_mask_loss: bool | None = None
+    reset_position_ids: bool = False
+    reset_attention_mask: bool = False
+    eod_mask_loss: bool = False
     create_attention_mask: bool = True
     dataset_margin: float = 1.005
     skip_data_check: bool = False
@@ -113,32 +118,21 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         if self.tokenizer is None and not self.mock:
             raise ValueError("Attribute 'tokenizer' must not be None")
 
-        if self.reset_position_ids is None:
-            raise ValueError("Attribute 'reset_position_ids' must not be None")
-        
-        if self.reset_attention_mask is None:
-            raise ValueError("Attribute 'reset_attention_mask' must not be None")
-        
-        if self.eod_mask_loss is None:
-            raise ValueError("Attribute 'eod_mask_loss' must not be None")
-
 
 def resolve_data_paths(
-    data_path: str | Sequence[str],
-    *,
-    distributed_walk: bool = True,
+        data_path: str | Sequence[str],
+        *,
+        distributed_walk: bool = True,
 ) -> list[str]:
-    """Find ``.bin`` files and return weighted indexed prefixes.
+    """Find ``.bin`` files and return indexed prefixes with optional weights.
 
     Args:
         data_path: One indexed prefix or a sequence of directories/prefixes.
         distributed_walk: Whether initialized ranks divide directory walking.
 
     Returns:
-        Alternating weight and discovered prefix values, for example
-        ``["1", "/data/a", "1", "/data/b"]``. If ``data_path`` is not a
-        collection of discoverable indexed paths, return it unchanged so an
-        explicit weight/prefix blend can be parsed by the split builder.
+        One prefix directly, or alternating weight/prefix values for multiple sources. If ``data_path`` is not a
+        collection of discoverable indexed paths, return it unchanged so an explicit blend can be parsed.
     """
     # 1. Normalize one path and multiple paths to the same traversal form.
     data_paths = [data_path] if isinstance(data_path, str) else list(data_path)
@@ -202,6 +196,9 @@ def resolve_data_paths(
     if not file_paths:
         raise ValueError(f"data_path {data_paths!r} has no data file ending with .bin")
 
+    if len(file_paths) == 1:
+        return file_paths
+
     # 4. Prefer the numeric shard order encoded by the corpus filenames.
     # Unknown naming schemes remain usable in their original walk order.
     try:
@@ -220,8 +217,8 @@ def resolve_data_paths(
 
 
 def build_gpt_dataset_config(
-    data_paths: Sequence[str],
-    data_config: Mapping[str, Any],
+        data_paths: Sequence[str],
+        data_config: Mapping[str, Any],
 ) -> GPTDatasetConfig:
     """Build a GPT Dataset config from provider fields.
 
@@ -244,34 +241,36 @@ def build_gpt_dataset_config(
     ]
     has_independent_blends = any(blend_per_split)
     try:
+        mock_data = bool(data_config["mock_data"])
+        tokenizer = data_config.get("tokenizer")
+        if tokenizer is None and not mock_data:
+            raise ValueError("tokenizer is required when mock_data is false")
+
         config = GPTDatasetConfig(
-            random_seed=data_config["seed"],
+            random_seed=data_config["random_seed"],
             sequence_length=data_config["seq_length"],
+            tokenizer=tokenizer,
+            mock=mock_data,
             blend=None if has_independent_blends else list(data_paths),
-            blend_per_split=blend_per_split,
+            blend_per_split=blend_per_split if has_independent_blends else None,
             split=None if has_independent_blends else data_config["split"],
             path_to_cache=data_config.get("data_cache_path"),
-            mock=data_config["mock_data"],
-            mmap_bin_files=data_config["mmap_bin_files"],
-            tokenizer=data_config["tokenizer"],
-            reset_position_ids=data_config["reset_position_ids"],
-            reset_attention_mask=data_config["reset_attention_mask"],
-            eod_mask_loss=data_config["eod_mask_loss"],
-            create_attention_mask=data_config["create_attention_mask_in_dataloader"],
-            dataset_margin=data_config["dataset_margin"],
-            skip_data_check=data_config["skip_data_check"],
-            reuse_idx=data_config["reuse_idx"],
+            mmap_bin_files=data_config.get("mmap_bin_files", True),
+            reuse_idx=data_config.get("reuse_idx", False),
             data_lazy_load=data_config["data_lazy_load"],
+            reset_position_ids=data_config.get("reset_position_ids", False),
+            reset_attention_mask=data_config.get("reset_attention_mask", False),
+            eod_mask_loss=data_config.get("eod_mask_loss", False),
+            create_attention_mask=data_config.get("create_attention_mask_in_dataloader", True),
+            dataset_margin=data_config.get("dataset_margin", 1.005),
+            skip_data_check=data_config.get("skip_data_check", False),
             is_dataset_from_mr=data_config["is_dataset_from_mr"],
             simple_blend=data_config["simple_blend"],
         )
     except KeyError as error:
         raise ValueError(f"Missing indexed Dataset build option: {error.args[0]}") from error
-    logger.info(
-        "Resolved %d indexed path entries; first four: %s",
-        len(data_paths),
-        list(data_paths[:4]),
-    )
+    source_paths = list(data_paths) if len(data_paths) <= 1 else list(data_paths[1::2])
+    logger.debug("Resolved indexed sources=%d, first four=%s", len(source_paths), source_paths[:4])
     return config
 
 

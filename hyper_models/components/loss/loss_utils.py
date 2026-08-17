@@ -61,8 +61,8 @@ def count_loss_token(
 
 def mean_global_loss(
     losses: Union[dict[str, torch.Tensor], torch.Tensor],
-    micro_batch_token_len: dict[str, torch.Tensor],
-    micro_batches_token_len: dict[str, torch.Tensor],
+    current_token_counts: dict[str, torch.Tensor],
+    step_token_counts: dict[str, torch.Tensor],
     device_mesh: MeshContext,
 ) -> dict[str, torch.Tensor]:
     # FIXME: VeOmni version -> HyperModels version
@@ -73,8 +73,8 @@ def mean_global_loss(
 
     Args:
         losses: A loss tensor or mapping of named loss tensors.
-        micro_batch_token_len: Token counts for the current micro batch.
-        micro_batches_token_len: Token counts for all local micro batches.
+        current_token_counts: Token counts for the current micro batch.
+        step_token_counts: Token counts for the local optimizer step.
         device_mesh: Trainer mesh context containing parallel sizes and groups.
 
     Returns:
@@ -101,12 +101,12 @@ def mean_global_loss(
     for key, cur_loss in losses.items():
         loss_name = key.split("_loss")[0]  # foundation/image_decoder/**
 
-        cur_token_len = micro_batch_token_len[f"{loss_name}_tokens"]
+        cur_token_len = current_token_counts[f"{loss_name}_tokens"]
         if sequence_parallel:
             cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
 
         all_reduced_len = all_reduce(
-            micro_batches_token_len[f"{loss_name}_tokens"].item(),
+            step_token_counts[f"{loss_name}_tokens"].item(),
             op="sum",
             group=dp_cp_group,
         )

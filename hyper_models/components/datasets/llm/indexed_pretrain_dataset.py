@@ -59,13 +59,10 @@ class _IndexedPretrainDataset(ABC):
                 self.config,
             )
 
-            # The original tokenizer exposes unique_identifiers. The fallback
-            # keeps the current Hugging Face tokenizer usable until its wrapper
-            # provides the same cache identity contract.
             self.unique_description = json.dumps(
                 self.unique_identifiers,
                 indent=4,
-                default=lambda value: getattr(value, "unique_identifiers", repr(value)),
+                default=lambda value: value.unique_identifiers,
             )
             self.unique_description_hash = hashlib.md5(
                 self.unique_description.encode("utf-8")

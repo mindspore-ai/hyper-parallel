@@ -16,12 +16,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hyper_models.components.datasets.llm.online_iterable_dataset import build_online_iterable_dataset
 from hyper_models.components.datasets.llm.online_mapping_dataset import build_online_mapping_dataset
 from hyper_models.components.datasets.parallel import DatasetParallelContext
+
+logger = logging.getLogger(__name__)
 
 _ONLINE_DATASET_BUILDERS: dict[str, Callable[..., Any]] = {
     "mapping": build_online_mapping_dataset,
@@ -57,9 +60,11 @@ def build_online_dataset(
         raise ValueError(
             f"Unsupported online dataset_type {dataset_type!r}; expected one of {supported_types!r}"
         ) from error
+    logger.debug("Selected online Dataset type=%s, data_path=%s", dataset_type, data_path)
     online_dataset = online_dataset_builder(
         data_path=data_path,
         data_config=data_config,
         parallel_context=parallel_context,
     )
+    logger.debug("Built online Dataset type=%s", type(online_dataset).__name__)
     return online_dataset

@@ -20,7 +20,6 @@ from collections.abc import Mapping
 from typing import Any
 
 from hyper_parallel.platform import get_platform
-from hyper_models.components.datasets.batch import PreparedBatch
 from hyper_models.components.datasets.batch_adapter import RuntimeBatchAdapter
 from hyper_models.components.datasets.parallel.batch_context import BatchParallelContext
 from hyper_models.components.datasets.parallel.batch_transport import DistributedBatchTransport
@@ -111,31 +110,15 @@ class OmniBatchProcessor:
         if not platform.is_tensor(loss_mask) or tuple(loss_mask.shape) != tuple(input_ids.shape):
             raise ValueError("Omni 'loss_mask' must be a tensor with the same shape as 'input_ids'")
 
-    def prepare_batch(self, batch: Mapping[str, Any]) -> PreparedBatch:
+    def prepare_batch(self, batch: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         """CP-shard text while preserving modality fields for the Omni model."""
         sharded_batch = self.cp_sharder.shard(batch, CP_TEXT_SEQUENCE_FIELDS)
         model_field_names = TEXT_MODEL_INPUT_FIELDS | MODAL_MODEL_INPUT_FIELDS
-        model_inputs = {
-            field_name: field_value
-            for field_name, field_value in sharded_batch.items()
-            if field_name in model_field_names
-        }
-        loss_inputs = {
-            field_name: field_value
-            for field_name, field_value in sharded_batch.items()
-            if field_name in LOSS_INPUT_FIELDS
-        }
-        metadata = {
-            field_name: field_value
-            for field_name, field_value in sharded_batch.items()
-            if field_name not in model_field_names and field_name not in LOSS_INPUT_FIELDS
-        }
-        prepared_batch = PreparedBatch(
-            model_inputs=model_inputs,
-            loss_inputs=loss_inputs,
-            metadata=metadata,
-        )
-        return prepared_batch
+        model_inputs = {field_name: field_value for field_name, field_value in sharded_batch.items()
+                        if field_name in model_field_names}
+        loss_inputs = {field_name: field_value for field_name, field_value in sharded_batch.items()
+                       if field_name in LOSS_INPUT_FIELDS}
+        return model_inputs, loss_inputs
 
 
 class OmniGetBatch(RuntimeBatchAdapter):
