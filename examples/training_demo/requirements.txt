@@ -1,0 +1,21 @@
+# Python dependencies for the HyperParallel Trainer demos on Ascend NPU.
+#
+# Use Python 3.10-3.12. Install the matching NPU driver and CANN separately.
+torch==2.9.0
+torch-npu==2.9.0
+torchdata==0.11.0
+
+# Trainer configuration, data loading, monitoring, and package installation.
+numpy==1.26.4
+PyYAML==6.0.3
+datasets==4.5.0
+psutil==7.2.2
+tqdm==4.70.0
+setuptools==82.0.1
+
+# The checkpoint loader uses the Transformers 5.10+ base_model_prefix API.
+# Pin the reference version for reproducible Qwen3/Qwen3.5 model loading.
+transformers==5.13.0
+safetensors==0.8.0
+huggingface-hub==1.22.0
+tokenizers==0.22.2

@@ -14,18 +14,31 @@
 # limitations under the License.
 # ============================================================================
 
-set -e
+set -eo pipefail
 
 cd "$(dirname "$0")/../.."
 
-NPROC=${NPROC:-8}
+NPROC=${1:-8}
+if [[ "${NPROC}" != "8" && "${NPROC}" != "16" ]]; then
+    echo "Usage: $0 [8|16] [training overrides...]" >&2
+    exit 1
+fi
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29501}
+CONFIG=${CONFIG:-examples/training_demo/train.yaml}
 
 LABEL=${LABEL:-data}
 OUTPUT_DIR="./output"
 export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 # 8,9,10,11,12,13,14,15 # 
+if [[ "${NPROC}" == "8" ]]; then
+    export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+else
+    export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+fi
 
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
@@ -39,7 +52,9 @@ torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --module examples.training_demo.train_text \
-    examples/training_demo/train.yaml \
+    --training.global_batch_size="${NPROC}" \
+    --fsdp_config.dp_shard_size="${NPROC}" \
+    "${CONFIG}" \
     "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_${LABEL}.log"
 

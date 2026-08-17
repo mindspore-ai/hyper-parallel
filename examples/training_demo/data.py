@@ -102,6 +102,7 @@ def load_tokenized_text_dataset(
     name: str,
     split: str,
     transform: PlainTextDataTransform,
+    data_config: Mapping[str, Any] | None = None,
 ) -> Any:
     """Load a Hugging Face text dataset and lazily cache tokenized rows.
 
@@ -110,6 +111,7 @@ def load_tokenized_text_dataset(
         name: Dataset subset/configuration name.
         split: Dataset split to load.
         transform: Batched tokenizer and fixed-length grouping transform.
+        data_config: Runtime batch policy retained for the Trainer batch adapter.
 
     Returns:
         A map-style Hugging Face dataset containing model-ready rows.
