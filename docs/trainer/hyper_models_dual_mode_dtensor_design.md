@@ -46,7 +46,7 @@ placement/dispatch 系统——反向不走 DTensor（无 DTensor autograd），
 | 参数 | build 期一次性永久解包为 plain local tensor（`_local_params_context`） | 保持 DTensor |
 | 前向 | 纯 local tensor + `PrecompiledBoundary` 通信 | DTensor dispatch 传播 + out_src/out_dst 校验 |
 | 反向 | local autograd（梯度落 local 分片） | local autograd（同左，05 §1.0） |
-| 返回值 | `(model, tp_grad_info)`（供 FSDP2 `fully_shard`） | `(model, None)` |
+| 返回值 | `(model, source_shard_info)`（供 FSDP2 `fully_shard`） | `(model, None)` |
 | 用途 | 训练主路径 | 接入新模型/新配置时的正确性校验与数值对拍 |
 
 ### 1.3 架构约束（双模式等价的前提）
@@ -75,7 +75,7 @@ from hyper_models.components.distributed import ShardingPlanner, apply_sharding_
 
 mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("tp",))
 plan = ShardingPlanner().plan(model, mesh, tp_size=4)          # 编译期推导（6-phase）
-model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应用
+model, source_shard_info = apply_sharding_plan(model, plan, mesh)   # production 应用
 # validate 校验：apply_sharding_plan(model, plan, mesh, validate_mode=True)
 ```
 
@@ -107,11 +107,11 @@ model, tp_grad_info = apply_sharding_plan(model, plan, mesh)   # production 应�
                  │  Phase A  参数分片（distribute_tensor；EP 堆叠/专家 mesh；
                  │          TP-local 属性改写 D-17/D-18）
                  │  Phase B  特殊参数 handler（SPECIAL_HANDLERS）
-                 │  Phase C 入口 production 一次性解包 + build_tp_grad_info
+                 │  Phase C 入口 production 一次性解包 + build_source_shard_info
                  │  Phase C  forward 包装（五路，post-order）
                  │  Phase D  tied weights 存储共享
                  ▼
-        (model, tp_grad_info)  ──► FSDP2 fully_shard（dp 语义）
+        (model, source_shard_info)  ──► FSDP2 fully_shard（dp 语义）
 ```
 
 关键分层：**plan 管"声明"，applier 管"执行"，DTensor 只做通信原语**
@@ -539,7 +539,7 @@ tuple 进 tuple 出、list 进 list 出、标量进标量出——下游消费�
 6. **Phase B 特殊 handler**：按 `plan.special_handlers` 调
    `SPECIAL_HANDLERS[name](module, param_name, mesh)`；
 7. **Phase C 入口（production only）**：`_local_params_context` 一次性永久
-   解包全部 DTensor 参数为 local tensor，并 `build_tp_grad_info(plan,
+   解包全部 DTensor 参数为 local tensor，并 `build_source_shard_info(plan,
    tp_mesh)`（§11）；
 8. **Phase C forward 包装**（§9.2）；
 9. **Phase D tied weights**：`_broadcast_tied_param`——**rank 内** B 端共享
@@ -723,15 +723,19 @@ Megatron `MoEAlltoAllTokenDispatcher`（expert_tensor_parallel_size=1）同构�
 
 ---
 
-## 11. 与 FSDP2 的衔接（`tp_grad.py` / Phase C 入口）
+## 11. 与 FSDP2 的衔接（`source_shard.py` / Phase C 入口）
 
-production apply 返回 `tp_grad_info: {param_fqn: (tp_placement, tp_mesh)}`，
-供 FSDP2 `fully_shard` 决定梯度的 TP 组同步语义：
+production apply 返回 `source_shard_info: {param_fqn: (placements, source_mesh)}`，
+其中 `placements` 是该参数在**全部非 FSDP source 轴**上的 placement 元组
+（缺轴补 `Replicate()`；dense 参数源自 dense-FSDP mesh、专家参数源自
+expert mesh，FSDP 占有轴 dp/cp/fsdp_*/edp_*/pp 被剥离，权重在这些轴上
+声明 Shard 会 fail-fast），供 FSDP2 `fully_shard` 决定梯度的 TP 组同步语义
+并拼出覆盖 FSDP 维 + source 维的完备参数布局：
 
 - 数据源是 **plan**（不是 DTensor——production 下参数已解包，只有 plan
   保留完整 placement 信息）；
-- `tp_placement ∈ {Shard, Replicate}`：Shard → 梯度各 rank 不同（需
-  reduce-scatter 语义），Replicate → 需 all-reduce；
+- 每个 source 轴的 placement ∈ {Shard, Replicate}：Shard → 梯度各 rank
+  不同（需 reduce-scatter 语义），Replicate → 需 all-reduce；
 - **D-10 专家参数**：标 `Shard(1)`——专家梯度是扩展 EP 组上不同专家 +
   不同 token 的本地分片，**不做 TP 组同步**（默认 Replicate 会让 FSDP 错误
   all-reduce 已分片的梯度）；
@@ -876,7 +880,7 @@ hyper_models/components/distributed/
 │                           #   工厂（@local_compute，公开注入入口）
 ├── ep_utils.py             # _ep_all_to_all 后端分派 + MOE_ROUTER_ADAPTERS +
 │                           #   _hf_native_ep_compute（D-09/D-10）
-├── tp_grad.py              # build_tp_grad_info + tied 归一化（D-10 专家语义）
+├── source_shard.py              # build_source_shard_info + tied 归一化（D-10 专家语义）
 ├── head_count.py           # D-17/D-18 TP-local 属性改写（auto 头数 +
 │                           #   tp_divide_attrs，TpLocalAttrPlan）
 ├── function_module.py      # FunctionModule（autograd.Function 的模块壳）

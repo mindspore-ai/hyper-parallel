@@ -43,7 +43,7 @@ from hyper_parallel.core.fully_shard.utils import (
     HSDPMeshInfo,
     MixedPrecisionPolicy,
     OffloadPolicy,
-    TPShardMetaInfo,
+    SourceShardMetaInfo,
 )
 from hyper_parallel.core.utils import compute_local_shape_and_global_offset_by_ceil_chunk
 
@@ -126,7 +126,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
-        tp_grad_info: Optional[TPShardMetaInfo] = None,
+        source_shard_info: Optional[SourceShardMetaInfo] = None,
     ):
         """
         Initialize TorchHSDPParamV2 and shard the parameter.
@@ -140,12 +140,12 @@ class TorchHSDPParamV2(HSDPParamV2):
             mp_policy (MixedPrecisionPolicy, optional): Mixed precision dtype policy.
             offload_policy (OffloadPolicy, optional): CPU offload policy.
             device (torch.device, optional): Target device for the sharded parameter.
-            tp_grad_info (TPShardMetaInfo, optional): Source TP/EP layout metadata, built by
+            source_shard_info (SourceShardMetaInfo, optional): Source TP/EP layout metadata, built by
                 the owning ``HSDPState``. Must be supplied (with ``origin_is_dtensor=True``)
                 whenever ``param`` is a native DTensor, and omitted otherwise.
 
         Raises:
-            ValueError: If ``tp_grad_info.origin_is_dtensor`` disagrees with whether
+            ValueError: If ``source_shard_info.origin_is_dtensor`` disagrees with whether
                 ``param`` is a native DTensor.
         """
         self._module_info: ParamModuleInfo = module_info
@@ -160,25 +160,25 @@ class TorchHSDPParamV2(HSDPParamV2):
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
         self._parameter_hook_migrator = ParameterHookMigrator()
-        # ``tp_grad_info`` is built and validated by the owning state
-        # (``_build_param_tp_grad_info``): for a native DTensor parameter it always
+        # ``source_shard_info`` is built and validated by the owning state
+        # (``_build_param_source_shard_info``): for a native DTensor parameter it always
         # describes that parameter's own mesh/placements. Only the agreement
         # between the two is re-checked here, because it is the invariant the
         # sharding math below depends on.
         if isinstance(param, DTensor) != (
-            tp_grad_info is not None and tp_grad_info.origin_is_dtensor
+            source_shard_info is not None and source_shard_info.origin_is_dtensor
         ):
             raise ValueError(
-                "tp_grad_info.origin_is_dtensor must be True exactly for native DTensor parameters, "
-                f"got parameter type {type(param).__name__} and tp_grad_info={tp_grad_info}"
+                "source_shard_info.origin_is_dtensor must be True exactly for native DTensor parameters, "
+                f"got parameter type {type(param).__name__} and source_shard_info={source_shard_info}"
             )
-        self.tp_grad_info = tp_grad_info
+        self.source_shard_info = source_shard_info
         self._orig_param_is_dtensor = (
-            tp_grad_info is not None and tp_grad_info.origin_is_dtensor
+            source_shard_info is not None and source_shard_info.origin_is_dtensor
         )
-        self._orig_dtensor_mesh = tp_grad_info.mesh if self._orig_param_is_dtensor else None
+        self._orig_dtensor_mesh = source_shard_info.mesh if self._orig_param_is_dtensor else None
         self._orig_dtensor_placements = (
-            tuple(tp_grad_info.placements) if self._orig_param_is_dtensor else None
+            tuple(source_shard_info.placements) if self._orig_param_is_dtensor else None
         )
         self._spmd_shard_mesh_dim = self.mesh_info.shard_mesh_dim
         self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
@@ -202,12 +202,12 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.gradient_scaling_factor = None
 
     def _get_base_spmd_placements(self) -> tuple:
-        if self.tp_grad_info is not None:
+        if self.source_shard_info is not None:
             # Preserve the source distributed layout and prefix the explicit
             # DP/FSDP mesh dimensions on the unified mesh.
-            self._spmd_mesh = DeviceMesh.concatenate([self.mesh_info.mesh, self.tp_grad_info.mesh])
+            self._spmd_mesh = DeviceMesh.concatenate([self.mesh_info.mesh, self.source_shard_info.mesh])
             dp_prefix_placements = tuple(Replicate() for _ in range(self.mesh_info.mesh.ndim))
-            return dp_prefix_placements + tuple(self.tp_grad_info.placements)
+            return dp_prefix_placements + tuple(self.source_shard_info.placements)
 
         self._spmd_mesh = self.mesh_info.mesh
         return tuple(Replicate() for _ in range(self._spmd_mesh.ndim))
@@ -267,9 +267,9 @@ class TorchHSDPParamV2(HSDPParamV2):
         if isinstance(source_param, DTensor):
             logical_global_size = source_param.size()
             logical_global_stride = source_param.layout.tensor_stride
-        elif self.tp_grad_info is not None:
-            source_sharding_spec = Layout.from_device_mesh(self.tp_grad_info.mesh)
-            source_sharding_spec.set_placements(self.tp_grad_info.placements)
+        elif self.source_shard_info is not None:
+            source_sharding_spec = Layout.from_device_mesh(self.source_shard_info.mesh)
+            source_sharding_spec.set_placements(self.source_shard_info.placements)
             source_sharding_spec.placement_to_tensor_map(source_local_tensor.ndim)
             logical_global_size = source_sharding_spec.get_global_shape(
                 source_local_tensor.size()
@@ -682,11 +682,11 @@ class TorchHSDPParamV2(HSDPParamV2):
             stride=self._contiguous_orig_stride,
             storage_offset=0,
         )
-        if self.tp_grad_info is not None and self.tp_grad_info.origin_is_dtensor:
+        if self.source_shard_info is not None and self.source_shard_info.origin_is_dtensor:
             unsharded_param = DTensor.from_local(
                 unsharded_param,
-                self.tp_grad_info.mesh,
-                self.tp_grad_info.placements,
+                self.source_shard_info.mesh,
+                self.source_shard_info.placements,
             )
         self._unsharded_param = nn.Parameter(
             unsharded_param,
@@ -1161,7 +1161,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         )
         self.all_reduce_comm_ctx.all_reduce_output = grad
 
-    def all_reduce_tp_replicate_grad_inplace(
+    def all_reduce_source_replicate_grad_inplace(
         self,
         reduced_grad: torch.Tensor,
         reduce_op: dist.ReduceOp,
@@ -1177,10 +1177,10 @@ class TorchHSDPParamV2(HSDPParamV2):
             reduced_grad: Final local gradient after FSDP/HSDP reduction.
             reduce_op: Reduction operation shared with the DP communication path.
         """
-        if self.tp_grad_info is None or not self.tp_grad_info.placements:
+        if self.source_shard_info is None or not self.source_shard_info.placements:
             return
-        source_mesh = self.tp_grad_info.mesh
-        source_placements = self.tp_grad_info.placements
+        source_mesh = self.source_shard_info.mesh
+        source_placements = self.source_shard_info.placements
         replicate_mesh_dims = tuple(
             mesh_dim
             for mesh_dim, placement in enumerate(source_placements)

@@ -15,7 +15,7 @@
 """sharding_applier: runtime application of ShardingPlan (05 §4 canonical).
 
 apply_sharding_plan: Phase 0 normalization -> A parameter sharding -> B special
-handlers -> C entry unpack + tp_grad_info -> C forward wrapping
+handlers -> C entry unpack + source_shard_info -> C forward wrapping
 (production/validate/moe/cp/vocab_embed, five paths) -> D tied weights.
 
 Dual-mode architecture constraint (05 §1.4): production has zero DTensor
@@ -79,7 +79,7 @@ from hyper_models.components.distributed.sharding_planner import (
 from hyper_models.components.distributed.ep_compute import (
     EP_ARCHETYPE_SUGGESTIONS,
 )
-from hyper_models.components.distributed.tp_grad import build_tp_grad_info
+from hyper_models.components.distributed.source_shard import build_source_shard_info
 from hyper_models.components.distributed.head_count import (
     maybe_update_head_counts,
 )
@@ -333,13 +333,15 @@ def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
             "and FSDP source metadata",
             dict(zip(tuple(expert_mesh.mesh_dim_names), tuple(expert_mesh.mesh_shape))),
         )
+    # Pass the full region meshes: build_source_shard_info strips the FSDP-owned
+    # axes itself and records the complete source (non-FSDP) layout.
     dense_source_mesh = (
-        mesh_context.fsdp_non_moe_mesh["tp"]
+        mesh_context.fsdp_non_moe_mesh
         if mesh_context is not None and mesh_context.fsdp_non_moe_mesh is not None
         else tp_mesh
     )
     expert_source_mesh = (
-        expert_mesh["ep"]
+        expert_mesh
         if expert_mesh is not None and "ep" in expert_mesh.mesh_dim_names
         else None
     )
@@ -412,7 +414,7 @@ def _apply_plan_special_handlers(models, plan, mesh):
             handler(_resolve_module(model, module_fqn), param_name, mesh)
 
 
-def _build_runtime_tp_grad_info(
+def _build_runtime_source_shard_info(
     models,
     plan,
     dense_source_mesh,
@@ -422,14 +424,14 @@ def _build_runtime_tp_grad_info(
     """Unwrap production parameters and build FSDP source-layout metadata."""
     if validate_mode:
         return None
-    tp_grad_records = {}
+    source_shard_records = {}
     for model in models:
-        tp_grad_records.update(_local_params_context(model))
-    if not tp_grad_records:
+        source_shard_records.update(_local_params_context(model))
+    if not source_shard_records:
         return None
     if dense_source_mesh is None and expert_source_mesh is None:
         return None
-    return build_tp_grad_info(
+    return build_source_shard_info(
         plan,
         dense_source_mesh,
         expert_source_mesh=expert_source_mesh,
@@ -443,12 +445,14 @@ def _build_runtime_tp_grad_info(
 def apply_sharding_plan(model, plan, mesh, *, validate_mode=False):
     """Apply a ShardingPlan using a DeviceMesh or MeshContext.
 
-    Returns (model, tp_grad_info):
+    Returns (model, source_shard_info):
     - production: at the Phase C entry, a one-shot `_local_params_context` permanently
-      unwraps DTensor parameters into plain local tensors, and builds tp_grad_info
-      for fully_shard to use. With MeshContext, dense entries reference the
-      dense-FSDP TP child and routed experts reference the expert EP child;
-    - validate: no unwrap (parameters remain DTensors); tp_grad_info is None.
+      unwraps DTensor parameters into plain local tensors, and builds source_shard_info
+      for fully_shard to use. Entries record the complete source layout:
+      ``{param_fqn: (placements_tuple, source_sub_mesh)}`` with one placement per
+      non-FSDP source axis (dense entries derive from the dense-FSDP mesh, routed
+      experts from the expert mesh);
+    - validate: no unwrap (parameters remain DTensors); source_shard_info is None.
     """
     mesh_context = mesh if isinstance(mesh, MeshContext) else None
     if mesh_context is None:
@@ -487,7 +491,7 @@ def apply_sharding_plan(model, plan, mesh, *, validate_mode=False):
     _apply_plan_special_handlers(models, plan, mesh)
 
     # ====== Phase C entry: one-shot unpack at build time (production only) ======
-    tp_grad_info = _build_runtime_tp_grad_info(
+    source_shard_info = _build_runtime_source_shard_info(
         models,
         plan,
         dense_source_mesh,
@@ -504,7 +508,7 @@ def apply_sharding_plan(model, plan, mesh, *, validate_mode=False):
     for part in models:
         _replicate_tied_weights(part, tied_pairs)
 
-    return model, tp_grad_info
+    return model, source_shard_info
 
 
 def _get_active_mesh(mesh, mesh_dim_names):

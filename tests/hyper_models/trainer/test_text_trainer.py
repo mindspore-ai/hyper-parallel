@@ -23,7 +23,6 @@ import pytest
 import torch
 
 import hyper_models.trainer.text_trainer as text_trainer_module
-from hyper_models.components.datasets.batch import PreparedBatch
 
 
 class _FakeBaseTrainer:
@@ -125,12 +124,12 @@ def test_text_trainer_keeps_explicit_base_stage_order(monkeypatch) -> None:
 def test_text_train_step_uses_base_distributed_runtime(monkeypatch) -> None:
     """Use BaseTrainer FSDP synchronization and optional scheduler behavior."""
     optimizer = SimpleNamespace(step=Mock(), zero_grad=Mock())
-    get_batch = Mock(
-        side_effect=lambda data_iterator: PreparedBatch(
-            model_inputs=next(data_iterator),
-            loss_inputs={},
-        )
-    )
+
+    def _get_batch(data_iterator: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        batch = next(data_iterator)
+        return batch, {"labels": batch["labels"]}
+
+    get_batch = Mock(side_effect=_get_batch)
     base = SimpleNamespace(
         config=SimpleNamespace(
             training=SimpleNamespace(max_grad_norm=1.0),
@@ -204,9 +203,10 @@ def test_text_train_step_does_not_advance_after_dataloader_end() -> None:
         config=SimpleNamespace(),
         state=SimpleNamespace(global_step=3),
         get_batch=get_batch,
+        num_micro_batches=2,
     )
 
     with pytest.raises(StopIteration):
-        trainer.train_step(iter(()))
+        trainer.train_step(iter(({"input_ids": torch.ones(1, 2)},)))
 
     assert trainer.base.state.global_step == 3

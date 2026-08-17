@@ -70,18 +70,18 @@ def _worker(rank, world_size):
     for mode in ("production", "validate"):
         model = _build()
         plan = ShardingPlanner().plan(model, mesh, tp_size=world_size)
-        model, tp_grad_info = apply_sharding_plan(
+        model, source_shard_info = apply_sharding_plan(
             model, plan, mesh, validate_mode=(mode == "validate"))
         # 返回二元组结构
         assert isinstance(model, nn.Module)
         if mode == "production":
-            assert tp_grad_info is not None
-            # tp_grad_info 覆盖所有 spec 参数
-            assert "model.layers.0.self_attn.q_proj.weight" in tp_grad_info
-            assert tp_grad_info["model.layers.0.self_attn.q_proj.weight"][0] == Shard(0)
-            assert tp_grad_info["model.layers.0.input_layernorm.weight"][0] == Replicate()
+            assert source_shard_info is not None
+            # source_shard_info 覆盖所有 spec 参数
+            assert "model.layers.0.self_attn.q_proj.weight" in source_shard_info
+            assert source_shard_info["model.layers.0.self_attn.q_proj.weight"][0] == (Shard(0),)
+            assert source_shard_info["model.layers.0.input_layernorm.weight"][0] == (Replicate(),)
         else:
-            assert tp_grad_info is None
+            assert source_shard_info is None
         with torch.no_grad():
             outs[mode] = model(x)
 
@@ -303,8 +303,8 @@ def _worker_pass(rank, world_size):
     mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("tp",))
     model = _build__s2_validate_fwd()
     plan = ShardingPlanner().plan(model, mesh, tp_size=world_size)
-    model, tp_grad_info = apply_sharding_plan(model, plan, mesh, validate_mode=True)
-    assert tp_grad_info is None  # validate 模式无 tp_grad_info
+    model, source_shard_info = apply_sharding_plan(model, plan, mesh, validate_mode=True)
+    assert source_shard_info is None  # validate 模式无 source_shard_info
     with torch.no_grad():
         out = model(x)
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)

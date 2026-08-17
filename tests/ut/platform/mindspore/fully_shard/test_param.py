@@ -75,7 +75,7 @@ class TestPlacementConstruction(MindSporeFullyShardUnitTest):
         dp_mesh = MagicMock(ndim=1)
         source_mesh = MagicMock()
         hsdp_param.mesh_info = SimpleNamespace(mesh=dp_mesh)
-        hsdp_param.tp_grad_info = SimpleNamespace(
+        hsdp_param.source_shard_info = SimpleNamespace(
             mesh=source_mesh,
             placements=(Shard(1), Replicate()),
         )
@@ -259,7 +259,7 @@ class TestCommunicationContexts(MindSporeFullyShardUnitTest):
         replicate_mesh.get_group.return_value = "tp-replicate"
         source_mesh = MagicMock(mesh_dim_names=("tp", "cp"))
         source_mesh.__getitem__.return_value.flatten.return_value = replicate_mesh
-        hsdp_param.tp_grad_info = SimpleNamespace(
+        hsdp_param.source_shard_info = SimpleNamespace(
             mesh=source_mesh,
             placements=(Shard(0), Replicate()),
         )

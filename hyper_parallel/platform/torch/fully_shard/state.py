@@ -31,7 +31,7 @@ from hyper_parallel.core.fully_shard.utils import (
     DDPMeshInfo,
     FSDPMeshInfo,
     HSDPMeshInfo,
-    TPShardMetaInfo,
+    SourceShardMetaInfo,
 )
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
 from hyper_parallel.platform.torch.fully_shard.param_group import HSDPParamGroup, AllReduceParamGroup
@@ -68,7 +68,7 @@ class TorchHSDPStateV2(HSDPState):
         platform,
         scheduler_ctx,
         device,
-        tp_grad_infos: Optional[Mapping[torch.nn.Parameter, TPShardMetaInfo]] = None,
+        source_shard_infos: Optional[Mapping[torch.nn.Parameter, SourceShardMetaInfo]] = None,
     ):
         """
         Initialize TorchHSDPStateV2.
@@ -82,7 +82,7 @@ class TorchHSDPStateV2(HSDPState):
             platform (TorchPlatform): Torch platform abstraction.
             device (torch.device): Target device.
         """
-        self.tp_grad_infos = tp_grad_infos
+        self.source_shard_infos = source_shard_infos
         super().__init__(
             cell,
             mesh,
@@ -131,23 +131,23 @@ class TorchHSDPStateV2(HSDPState):
                     continue
                 buffer.data = buffer.to(self.device)
 
-    def _build_param_tp_grad_info(
+    def _build_param_source_shard_info(
         self, param: torch.nn.Parameter
-    ) -> Optional[TPShardMetaInfo]:
+    ) -> Optional[SourceShardMetaInfo]:
         """Build normalized source-layout metadata for one managed parameter."""
         if isinstance(param, DTensor):
-            if self.tp_grad_infos is not None:
+            if self.source_shard_infos is not None:
                 raise ValueError(
-                    "tp_grad_infos cannot be provided when fully_shard manages a native DTensor parameter"
+                    "source_shard_infos cannot be provided when fully_shard manages a native DTensor parameter"
                 )
-            return TPShardMetaInfo(
+            return SourceShardMetaInfo(
                 mesh=param.device_mesh,
                 placements=tuple(param.placements),
                 origin_is_dtensor=True,
             )
-        if self.tp_grad_infos is None:
+        if self.source_shard_infos is None:
             return None
-        return self.tp_grad_infos.get(param)
+        return self.source_shard_infos.get(param)
 
     def _init_hsdp_params(self):
         """Initialize all fully_shard-managed parameters for the module."""
@@ -176,7 +176,7 @@ class TorchHSDPStateV2(HSDPState):
                     mp_policy=self.mp_policy,
                     offload_policy=self.offload_policy,
                     device=self.device,
-                    tp_grad_info=self._build_param_tp_grad_info(param),
+                    source_shard_info=self._build_param_source_shard_info(param),
                 )
             )
 
@@ -270,12 +270,12 @@ class TorchHSDPStateV2(HSDPState):
 
     def _resolve_default_reduce_op(self):
         """Resolve the default reduce op for the whole fully_shard state."""
-        all_params_have_tp_grad_info = bool(self.hsdp_params) and all(
-            hsdp_param.tp_grad_info is not None for hsdp_param in self.hsdp_params
+        all_params_have_source_shard_info = bool(self.hsdp_params) and all(
+            hsdp_param.source_shard_info is not None for hsdp_param in self.hsdp_params
         )
         return (
             torch.distributed.ReduceOp.SUM
-            if all_params_have_tp_grad_info
+            if all_params_have_source_shard_info
             else torch.distributed.ReduceOp.AVG
         )
 

@@ -378,6 +378,7 @@ class ShardingPlanner:
             plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names,
         )
         self._finalize_deferred_biases(plan, model, mesh_dim_names)
+        self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
         # uniqueness (the only nesting check that remains)
@@ -863,6 +864,15 @@ class ShardingPlanner:
     _BATCHED_EXPERT_RE = re.compile(
         r"^experts\.(gate_up_proj|gate_and_up_projs|down_proj|down_projs"
         r"|gate_proj|up_proj)$")
+    # Fused (gate|up merged into ONE parameter, chunk-split inside forward)
+    # expert weight pattern — covers both the batched 3D layout
+    # (``experts.gate_up_proj [E, 2I, H]``) and the per-expert 2D layout
+    # (``experts.<idx>.gate_up_proj.weight [2I, H]``). Such weights are
+    # incompatible with contiguous-block TP Shard on the fused dim; see
+    # _finalize_fused_expert_tp_guard.
+    _FUSED_EXPERT_WEIGHT_RE = re.compile(
+        r"^experts\.(?:\d+\.)?(?:gate_up_proj|gate_and_up_projs"
+        r"|fused_gate_up|w13)(?:\.weight)?$")
 
     def _mark_hf_native_moe(
         self, spec: ModuleShardingSpec, group, boundary_fqn: str,
@@ -1261,6 +1271,105 @@ class ShardingPlanner:
             )
 
     @staticmethod
+    def _finalize_fused_expert_tp_guard(plan: ShardingPlan, *, tp_size: int) -> None:
+        """Fail fast on fused expert weights TP-sharded without D-10 EP.
+
+        A fused expert weight (gate/up merged into ONE parameter — e.g.
+        ``experts.gate_up_proj [E, 2I, H]`` — and chunk-split inside the
+        module's forward) is incompatible with the framework's
+        contiguous-block TP ``Shard`` on the fused dim: after Phase A each
+        rank holds a contiguous slice of the fused dim (tp=2 → rank0 all
+        gate, rank1 all up), so the runtime ``chunk`` result is NOT
+        equivalent to the non-TP semantics (Megatron solves this with
+        chunk-aware sharding, which the framework does not support). The
+        error is silent: the MoE boundary is local-region black-box hosted
+        in BOTH modes, so production and validate run the same (wrong)
+        local forward and the dual-mode comparison cannot expose it.
+
+        Runs AFTER all plan_overrides are merged (next to
+        ``_finalize_deferred_biases``) and anchors detection on the FINAL
+        spec declarations, so an explicit TP-Replicate override on the
+        fused params legitimately clears the hazard. D-10 TP-extend-EP
+        (``_ep_size > 0``) removes the TP key from expert weights entirely
+        (each rank holds complete experts), so it is exempt.
+        """
+        if tp_size <= 1:
+            return
+        offenders = []
+        for fqn, spec in plan.modules.items():
+            if getattr(spec, "_ep_size", 0):  # pylint: disable=protected-access
+                # D-10 TP-extend-EP: expert weights carry no TP shard — the
+                # fused dim stays complete per rank, chunk is correct.
+                continue
+            for param_name, named in (spec.params or {}).items():
+                if not isinstance(named, dict):
+                    continue
+                if ShardingPlanner._FUSED_EXPERT_WEIGHT_RE.match(param_name) is None:
+                    continue
+                if isinstance(named.get(TP), Shard):
+                    offenders.append((fqn, param_name, named[TP]))
+        if not offenders:
+            return
+        listing = "\n".join(
+            f"  - {fqn}.{param_name}  →  {{TP: {placement}, ...}}"
+            for fqn, param_name, placement in offenders[:8])
+        more = (f"\n  ... and {len(offenders) - 8} more"
+                if len(offenders) > 8 else "")
+        boundary_fqn, example_param, _ = offenders[0]
+        raise ValueError(
+            f"Detected {len(offenders)} fused MoE expert weight(s) (gate/up "
+            "merged into a single parameter, chunk-split inside forward) "
+            "declared with TP sharding:\n"
+            f"{listing}{more}\n"
+            "This pattern is incompatible with the framework's contiguous-"
+            "block TP Shard: after Phase A shards the fused dim contiguously, "
+            "each rank holds a slice whose gate/up layout is misordered, so "
+            "the runtime chunk is NOT equivalent to the non-TP semantics "
+            "(Megatron handles this with chunk-aware sharding, which the "
+            "framework does not support). Worse, the error is silent: the "
+            "MoE boundary is local-region black-box hosted in BOTH modes, so "
+            "production and validate run the same (wrong) local forward and "
+            "the dual-mode comparison cannot expose the accuracy corruption. "
+            "Choose one of:\n"
+            "  (1) Enable ep_size (recommended): "
+            "ShardingPlanner().plan(..., ep_size=N) with N>1, N dividing the "
+            "dense region dp*cp*tp and dividing num_experts. Enabling ep_size "
+            "takes the TP-extend-EP path (design revision D-10): the dense "
+            "region is re-partitioned into the derived expert mesh "
+            "(edp_shard, ep), and expert weights are sharded ONLY as "
+            "{EP: Shard(0)} along the expert dim with NO TP key — every rank "
+            "holds complete experts, so the gate/up produced by the runtime "
+            "chunk matches the non-parallel semantics. Note: the MoE "
+            "boundary must then also declare local_compute_fn explicitly "
+            "(EP compute injection; the apply-time preflight checks this and "
+            "prints a YAML example).\n"
+            "  (2) Keep ep=1: override the fused weight to TP Replicate via "
+            "plan_overrides (it then opts out of TP sharding and saves no "
+            "memory for that weight), e.g.:\n"
+            "     ShardingPlanner(plan_overrides={\n"
+            f"       {boundary_fqn!r}: ModuleShardingSpec(\n"
+            "         params={\n"
+            f"           {example_param!r}: "
+            "{TP: Replicate(), CP: Replicate()},\n"
+            "           # ...declare ALL params of this boundary too "
+            "(experts.down_proj / gate.weight etc.) — params merge replaces "
+            "the field wholesale (no per-key merge)\n"
+            "         },\n"
+            "         # out_src TP must ALSO be changed from the template-"
+            "derived Partial to Replicate: with replicated weights each "
+            "rank's MoE output is already complete (not Partial); keeping "
+            "Partial would make the boundary exit reduction count the "
+            "output tp_size times\n"
+            "         out_src={'output': {TP: Replicate(), CP: Replicate()}},"
+            "  # keep the template-derived CP value (Shard(1) when "
+            "sequence_parallel is on)\n"
+            "       ),\n"
+            "     })\n"
+            "  (3) Switch to separate w1/w3 expert weights (gate_proj and "
+            "up_proj as independent parameters) — natively supported, no "
+            "override needed.")
+
+    @staticmethod
     def _finalize_deferred_biases(
         plan: ShardingPlan, model, mesh_dim_names: Tuple[str, ...],
     ) -> None:
@@ -1642,7 +1751,7 @@ class ShardingPlanner:
             f"parameter(s) are not covered by any spec.params / "
             f"special_handlers:\n{lines}\n{more}"
             "An uncovered parameter is never sharded (kept replicated) AND is "
-            "absent from tp_grad_info — its gradient-sync semantics would be "
+            "absent from source_shard_info — its gradient-sync semantics would be "
             "decided silently by the consumer-side default. Resolve each "
             "parameter explicitly: ① add a naming rule / ARCH_OVERRIDES entry "
             "(e.g. shared_expert_gate → REPLICATED); ② declare it in a spec "

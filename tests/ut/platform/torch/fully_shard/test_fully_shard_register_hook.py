@@ -533,7 +533,7 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         scheduler.platform = MagicMock()
         scheduler.scheduler_ctx = HSDPSchedulerContext()
         scheduler.device = torch.device("cpu")
-        scheduler.tp_grad_infos = None
+        scheduler.source_shard_infos = None
         scheduler.compile_hooks_enabled = False
         return scheduler
 
@@ -577,7 +577,7 @@ class TestTorchSchedulerSetup(unittest.TestCase):
             scheduler.platform,
             scheduler.scheduler_ctx,
             scheduler.device,
-            tp_grad_infos=None,
+            source_shard_infos=None,
         )
 
     def test_grouped_hook_skip_returns_torch_noop(self):

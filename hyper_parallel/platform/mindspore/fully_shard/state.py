@@ -26,7 +26,7 @@ from hyper_parallel.core.fully_shard.utils import (
     DDPMeshInfo,
     FSDPMeshInfo,
     HSDPMeshInfo,
-    TPShardMetaInfo,
+    SourceShardMetaInfo,
 )
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
 from hyper_parallel.platform.mindspore.fully_shard.param_group import (
@@ -109,12 +109,12 @@ class MindSporeHSDPStateV2(HSDPState):
                 buffer.data = buffer.to(self.device)
 
     @staticmethod
-    def _build_param_tp_grad_info(param):
+    def _build_param_source_shard_info(param):
         """Build normalized source-layout metadata for a native DTensor parameter."""
         dtensor_payload = unwrap_dtensor_param(param)
         if dtensor_payload is None:
             return None
-        return TPShardMetaInfo(
+        return SourceShardMetaInfo(
             mesh=dtensor_payload.device_mesh,
             placements=tuple(dtensor_payload.placements),
             origin_is_dtensor=True,
@@ -146,7 +146,7 @@ class MindSporeHSDPStateV2(HSDPState):
                     mp_policy=self.mp_policy,
                     offload_policy=self.offload_policy,
                     device=self.device,
-                    tp_grad_info=self._build_param_tp_grad_info(param),
+                    source_shard_info=self._build_param_source_shard_info(param),
                 )
             )
 
@@ -241,10 +241,10 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def _resolve_default_reduce_op(self):
         """Resolve the default reduction operation for this fully_shard unit."""
-        all_params_have_tp_grad_info = bool(self.hsdp_params) and all(
-            hsdp_param.tp_grad_info is not None for hsdp_param in self.hsdp_params
+        all_params_have_source_shard_info = bool(self.hsdp_params) and all(
+            hsdp_param.source_shard_info is not None for hsdp_param in self.hsdp_params
         )
-        return "sum" if all_params_have_tp_grad_info else "avg"
+        return "sum" if all_params_have_source_shard_info else "avg"
 
     def _resolve_reduce_op(self) -> str:
         """Return the active mint reduction operation."""

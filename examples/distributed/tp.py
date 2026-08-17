@@ -129,16 +129,16 @@ def main():
         plan = planner.plan(model, mesh, tp_size=dist.get_world_size())
 
         # 2. 应用分片（production：零 DTensor dispatch；validate：DTensor 对拍）
-        model, tp_grad_info = apply_sharding_plan(
+        model, source_shard_info = apply_sharding_plan(
             model, plan, mesh, validate_mode=(mode == "validate"))
 
         # 3. 前向——输出与单卡一致
         with torch.no_grad():
             out = model(x)
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
-        n_grad = len(tp_grad_info) if tp_grad_info is not None else 0
+        n_grad = len(source_shard_info) if source_shard_info is not None else 0
         print(f"[rank{rank}] {mode}: TP={dist.get_world_size()} output matches "
-              f"single-card reference; tp_grad_info entries: {n_grad}")
+              f"single-card reference; source_shard_info entries: {n_grad}")
     dist.destroy_process_group()
 
 

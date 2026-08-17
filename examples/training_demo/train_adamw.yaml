@@ -37,8 +37,8 @@ fsdp_config:
 mixed_precision:
   enabled: false
 
-gradient_checkpointing:
-  activation_checkpoint: off
+activation_checkpoint:
+  mode: off
 
 dataset:
   data_transform:

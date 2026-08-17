@@ -32,35 +32,30 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 # log and data
 LABEL=${LABEL:-data}
 OUTPUT_DIR="./output"
-DEMO_ROOT="${PROJECT_ROOT}/outputs/training_demo/tiny_llama_wikitext2"
-TOKENIZER_DIR="${DEMO_ROOT}/tokenizer"
+DEMO_ROOT="${PROJECT_ROOT}/outputs/training_demo/qwen3_0.6b_wikitext2"
 DATA_OUTPUT_PREFIX="${DEMO_ROOT}/data/wikitext2_real"
 DATA_PREFIX="${DATA_OUTPUT_PREFIX}_text_document"
 DATA_WORKERS=${DATA_WORKERS:-8}
-TOKENIZER_SOURCE=${TOKENIZER_SOURCE:-Qwen/Qwen3-0.6B}
-mkdir -p "${OUTPUT_DIR}"
-
-# Download the tokenizer only, then create a tiny random Llama checkpoint. Existing files are reused.
-python -m examples.training_demo.prepare_model \
-    --output-dir "${TOKENIZER_DIR}" \
-    --tokenizer-source "${TOKENIZER_SOURCE}"
-
-if [[ ! -f "${TOKENIZER_DIR}/tokenizer.json" ]]; then
-    echo "Missing demo tokenizer: ${TOKENIZER_DIR}/tokenizer.json" >&2
-    exit 1
-fi
+MODEL_SOURCE=${MODEL_SOURCE:-Qwen/Qwen3-0.6B}
+HF_DATASET=${HF_DATASET:-Salesforce/wikitext}
+HF_DATASET_SUBSET=${HF_DATASET_SUBSET:-wikitext-2-raw-v1}
+HF_DATASET_SPLIT=${HF_DATASET_SPLIT:-train}
+HF_CACHE_DIR=${HF_CACHE_DIR:-"${HF_HOME:-${HOME}/.cache/huggingface}"}
+export HF_HOME="${HF_CACHE_DIR}"
+mkdir -p "${OUTPUT_DIR}" "${HF_CACHE_DIR}"
 
 # Download and prepare indexed WikiText-2 only when either output file is missing.
 if [[ ! -f "${DATA_PREFIX}.bin" || ! -f "${DATA_PREFIX}.idx" ]]; then
-    mkdir -p "${DEMO_ROOT}/data" "${DEMO_ROOT}/raw"
+    mkdir -p "${DEMO_ROOT}/data" "${DEMO_ROOT}/raw" "${HF_CACHE_DIR}"
     python -m hyper_models.components.datasets.tools.huggingface_offline \
-        --dataset Salesforce/wikitext \
-        --dataset-subset wikitext-2-raw-v1 \
-        --dataset-split train \
+        --dataset "${HF_DATASET}" \
+        --dataset-subset "${HF_DATASET_SUBSET}" \
+        --dataset-split "${HF_DATASET_SPLIT}" \
+        --cache-dir "${HF_CACHE_DIR}" \
         --download-dir "${DEMO_ROOT}/raw" \
         --json-keys text \
         --output-prefix "${DATA_OUTPUT_PREFIX}" \
-        --tokenizer "${TOKENIZER_DIR}" \
+        --tokenizer "${MODEL_SOURCE}" \
         --workers "${DATA_WORKERS}" \
         --append-eod \
         --pad-to-seq-len 64
@@ -73,6 +68,11 @@ torchrun \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --module examples.training_demo.train_text \
     examples/training_demo/train_idx_dataset.yaml \
+    --model.pretrained_model_name_or_path="${MODEL_SOURCE}" \
+    --model.cache_dir="${HF_CACHE_DIR}" \
+    --dataset.model_assets.tokenizer.pretrained_model_name_or_path="${MODEL_SOURCE}" \
+    --dataset.model_assets.tokenizer.cache_dir="${HF_CACHE_DIR}" \
+    --dataset.data_path="${DATA_PREFIX}" \
     "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_${LABEL}.log"
 

@@ -112,6 +112,18 @@ def append_eod(args: argparse.Namespace, tokenizer: Any) -> int | None:
     return int(eod_id)
 
 
+def _pad_token_buffer(token_buffer: list[int], chunk_size: int, tokenizer: Any) -> list[int]:
+    """Pad a non-empty final token buffer to one fixed-size indexed sample."""
+    if not token_buffer:
+        return []
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_token_id is None:
+        raise ValueError("pad_to_seq_len requires the tokenizer to define pad_token_id or eos_token_id")
+    return [*token_buffer, *([int(pad_token_id)] * (chunk_size - len(token_buffer)))]
+
+
 class Encoder(object):
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -281,6 +293,9 @@ class Partition(object):
         fin.close()
         keys = self.args.json_keys
         for key in keys:
+            if chunk_size is not None and token_buffers[key]:
+                chunk = _pad_token_buffer(token_buffers[key], chunk_size, tokenizer)
+                builders[key].add_document(chunk, [chunk_size])
             builders[key].finalize(output_idx_files[key])
 
         pool.close()

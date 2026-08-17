@@ -48,7 +48,7 @@ from hyper_parallel.core.fully_shard.utils import (
     DDPMeshInfo,
     CPUOffloadPolicy,
     CommFusionPolicy,
-    TPShardMetaInfo,
+    SourceShardMetaInfo,
 )
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FullyShardParamMode,
@@ -541,7 +541,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)
         param_v2.mesh_info.mesh = dp_mesh
-        param_v2.tp_grad_info = TPShardMetaInfo(
+        param_v2.source_shard_info = SourceShardMetaInfo(
             orig_mesh,
             (Replicate(),),
             origin_is_dtensor=True,
@@ -563,7 +563,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)
         param_v2.mesh_info.mesh = dp_mesh
-        param_v2.tp_grad_info = TPShardMetaInfo(tp_mesh, (Shard(1),), origin_is_dtensor=False)
+        param_v2.source_shard_info = SourceShardMetaInfo(tp_mesh, (Shard(1),), origin_is_dtensor=False)
         param_v2._orig_param_is_dtensor = False
 
         with patch.object(DeviceMesh, "concatenate", return_value=unified_mesh) as mock_concatenate:
@@ -649,7 +649,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2.shard_world_size = 2
         param_v2.hsdp_placement = Shard(1)
         param_v2._orig_size = grad.shape
-        param_v2.tp_grad_info = TPShardMetaInfo(
+        param_v2.source_shard_info = SourceShardMetaInfo(
             MagicMock(),
             (Shard(1),),
             origin_is_dtensor=True,
@@ -949,7 +949,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         mock_instance = MagicMock()
         mock_instance._orig_param_is_dtensor = False
-        mock_instance.tp_grad_info = None
+        mock_instance.source_shard_info = None
         mock_instance.sharded_param.requires_grad = True
         mock_hsdp_param_cls.return_value = mock_instance
 
@@ -976,23 +976,23 @@ class TestFullyShardMeshUtils(unittest.TestCase):
             )
 
         passed_mesh_infos = [call.args[2] for call in mock_hsdp_param_cls.call_args_list]
-        passed_tp_grad_infos = [
-            call.kwargs["tp_grad_info"] for call in mock_hsdp_param_cls.call_args_list
+        passed_source_shard_infos = [
+            call.kwargs["source_shard_info"] for call in mock_hsdp_param_cls.call_args_list
         ]
         self.assertEqual(state.hsdp_params, [mock_instance, mock_instance])
         self.assertIsInstance(passed_mesh_infos[0], DDPMeshInfo)
         self.assertIs(passed_mesh_infos[0].mesh, mesh)
         self.assertIsInstance(passed_mesh_infos[1], FSDPMeshInfo)
         self.assertIs(passed_mesh_infos[1].mesh, mesh)
-        self.assertIsNone(passed_tp_grad_infos[0])
-        self.assertIsInstance(passed_tp_grad_infos[1], TPShardMetaInfo)
-        self.assertIs(passed_tp_grad_infos[1].mesh, mesh)
-        self.assertEqual(passed_tp_grad_infos[1].placements, (Replicate(),))
-        self.assertTrue(passed_tp_grad_infos[1].origin_is_dtensor)
+        self.assertIsNone(passed_source_shard_infos[0])
+        self.assertIsInstance(passed_source_shard_infos[1], SourceShardMetaInfo)
+        self.assertIs(passed_source_shard_infos[1].mesh, mesh)
+        self.assertEqual(passed_source_shard_infos[1].placements, (Replicate(),))
+        self.assertTrue(passed_source_shard_infos[1].origin_is_dtensor)
 
     @patch("hyper_parallel.platform.torch.fully_shard.state.TorchHSDPParamV2")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
-    def test_state_passes_tp_grad_info_to_each_parameter(self, mock_get_rank, mock_hsdp_param_cls):
+    def test_state_passes_source_shard_info_to_each_parameter(self, mock_get_rank, mock_hsdp_param_cls):
         """The state should pass parameter-identity metadata into each Torch wrapper."""
         mesh = DeviceMesh(
             "cpu",
@@ -1003,9 +1003,9 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         module = nn.Module()
         parameter = nn.Parameter(torch.randn(4, 4))
         module.register_parameter("weight", parameter)
-        metadata = TPShardMetaInfo(mesh, (Replicate(),))
+        metadata = SourceShardMetaInfo(mesh, (Replicate(),))
         mock_instance = MagicMock()
-        mock_instance.tp_grad_info = metadata
+        mock_instance.source_shard_info = metadata
         mock_instance.sharded_param.requires_grad = True
         mock_hsdp_param_cls.return_value = mock_instance
 
@@ -1029,10 +1029,10 @@ class TestFullyShardMeshUtils(unittest.TestCase):
                 MagicMock(),
                 HSDPSchedulerContext(),
                 torch.device("cpu"),
-                tp_grad_infos={parameter: metadata},
+                source_shard_infos={parameter: metadata},
             )
 
-        self.assertIs(mock_hsdp_param_cls.call_args.kwargs["tp_grad_info"], metadata)
+        self.assertIs(mock_hsdp_param_cls.call_args.kwargs["source_shard_info"], metadata)
 
     @patch("hyper_parallel.platform.torch.fully_shard.state.DDPMeshInfo")
     def test_replicate_param_flattens_2d_mesh_for_ddp(self, mock_ddp_mesh_info):
@@ -1057,9 +1057,9 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         """Verify default gradient reduction op is chosen once for the whole fully_shard state."""
         state = object.__new__(TorchHSDPStateV2)
         local_param = MagicMock()
-        local_param.tp_grad_info = None
+        local_param.source_shard_info = None
         dtensor_param = MagicMock()
-        dtensor_param.tp_grad_info = TPShardMetaInfo(MagicMock(), (Shard(0),), origin_is_dtensor=True)
+        dtensor_param.source_shard_info = SourceShardMetaInfo(MagicMock(), (Shard(0),), origin_is_dtensor=True)
 
         state.hsdp_params = [local_param]
         self.assertEqual(
@@ -1084,8 +1084,8 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state = object.__new__(TorchHSDPStateV2)
         first = MagicMock()
         second = MagicMock()
-        first.tp_grad_info = TPShardMetaInfo(MagicMock(), (Shard(0),))
-        second.tp_grad_info = TPShardMetaInfo(MagicMock(), (Replicate(),))
+        first.source_shard_info = SourceShardMetaInfo(MagicMock(), (Shard(0),))
+        second.source_shard_info = SourceShardMetaInfo(MagicMock(), (Replicate(),))
         state.hsdp_params = [first, second]
 
         self.assertEqual(
@@ -1167,7 +1167,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         mock_instance = MagicMock()
         mock_instance._orig_param_is_dtensor = False
-        mock_instance.tp_grad_info = None
+        mock_instance.source_shard_info = None
         mock_instance.sharded_param.requires_grad = True
         mock_hsdp_param_cls.return_value = mock_instance
 
@@ -1220,7 +1220,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         mock_instance = MagicMock()
         mock_instance._orig_param_is_dtensor = False
-        mock_instance.tp_grad_info = None
+        mock_instance.source_shard_info = None
         mock_instance.sharded_param.requires_grad = True
         mock_hsdp_param_cls.return_value = mock_instance
 

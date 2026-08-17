@@ -93,7 +93,7 @@ def _worker(rank, world_size):
             g["model.layers.0.mlp.gate_proj.weight"],
             ref_grads["model.layers.0.mlp.gate_proj.weight"][rank * chunk_i:(rank + 1) * chunk_i],
             rtol=1e-3, atol=1e-5)
-        # N10：TP-Replicate 参数（norm）——Partial 贡献需 tp_grad_info 旁路
+        # N10：TP-Replicate 参数（norm）——Partial 贡献需 source_shard_info 旁路
         # all-reduce 后与参考一致（两 rank 相等）
         norm_name = "model.layers.0.input_layernorm.weight"
         synced = simulate_tp_replicate_grad_sync(g[norm_name], tp_group)

@@ -1,6 +1,6 @@
 # Online Hugging Face Dataset training demo for Qwen3-1.7B.
 #
-# The model and WikiText data are downloaded from Hugging Face on first use.
+# The local model is reused and WikiText is downloaded from Hugging Face on first use.
 # Run with: bash examples/training_demo/run_online_wikitext.sh
 
 model:
@@ -11,7 +11,7 @@ model:
   force_hf: true
 
 training:
-  train_iters: 10
+  train_steps: 10
   eval_iters: 1
   train_samples: null
   num_train_epochs: 1
@@ -42,8 +42,8 @@ fsdp_config:
 mixed_precision:
   enabled: false
 
-gradient_checkpointing:
-  activation_checkpoint: off
+activation_checkpoint:
+  mode: off
 
 dataset:
   model_assets:

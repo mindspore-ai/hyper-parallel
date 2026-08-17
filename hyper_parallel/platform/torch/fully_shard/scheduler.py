@@ -62,7 +62,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             self.platform,
             self.scheduler_ctx,
             self.device,
-            tp_grad_infos=self.tp_grad_infos,
+            source_shard_infos=self.source_shard_infos,
         )
 
     def _register_post_backward_hook(self, args, kwargs):
@@ -192,7 +192,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
                     reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
                 if reduced_grad is None:
                     continue
-                hsdp_param.all_reduce_tp_replicate_grad_inplace(
+                hsdp_param.all_reduce_source_replicate_grad_inplace(
                     reduced_grad,
                     hsdp_state.reduce_op_type,
                 )

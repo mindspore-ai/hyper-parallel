@@ -18,7 +18,7 @@ from typing import Any, List, Mapping, Optional, Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.core.fully_shard.utils import CommFusionPolicy, TPShardMetaInfo
+from hyper_parallel.core.fully_shard.utils import CommFusionPolicy, SourceShardMetaInfo
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FSDPSchedulerState,
     get_managed_modules_parameters,
@@ -82,7 +82,7 @@ class HSDPSchedulerV2:
         device,
         comm_fusion,
         comm_fusion_zero_copy=False,
-        tp_grad_infos: Optional[Mapping[platform.Parameter, TPShardMetaInfo]] = None,
+        source_shard_infos: Optional[Mapping[platform.Parameter, SourceShardMetaInfo]] = None,
         compile_hooks_enabled: bool = False,
     ):
         """init hsdp scheduler.
@@ -103,7 +103,7 @@ class HSDPSchedulerV2:
         self.replicate_params = replicate_params
         self.device = device
         self.reshard_after_forward = reshard_after_forward
-        self.tp_grad_infos = tp_grad_infos
+        self.source_shard_infos = source_shard_infos
         self.scheduler_state = None
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []

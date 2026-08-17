@@ -38,7 +38,7 @@ class BatchParallelContext:
         # ``pp_shared_data`` is retained for the future stage-aware router.
         # RuntimeBatchAdapter rejects this mode unless a router is supplied.
         reads_pipeline_data = not self.pp_shared_data or self.pp_rank == 0
-        return self.tp_rank == 0 and reads_pipeline_data
+        return self.tp_rank == 0 and self.cp_rank == 0 and reads_pipeline_data
 
 
 def _get_submesh(device_mesh: Any, dimension: str) -> Any:

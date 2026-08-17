@@ -29,7 +29,7 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo, ShardedState
-from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy, TPShardMetaInfo
+from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy, SourceShardMetaInfo
 from hyper_parallel.platform.torch.fully_shard.param import (
     AllGatherCommCtx,
     AllReduceCommCtx,
@@ -54,7 +54,7 @@ def _new_param():
     hsdp_param._orig_param_is_dtensor = False
     hsdp_param._orig_dtensor_mesh = None
     hsdp_param._orig_dtensor_placements = None
-    hsdp_param.tp_grad_info = None
+    hsdp_param.source_shard_info = None
     hsdp_param._sharded_param_data = torch.tensor([1.0, 2.0])
     hsdp_param.sharded_size = torch.Size((2,))
     hsdp_param.padded_sharded_param_size = torch.Size((2,))
@@ -302,7 +302,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         mesh_info.shard_mesh_rank = 0
         mesh_info.shard_mesh_size = 2
         mesh_info.shard_process_group = None
-        tp_grad_info = TPShardMetaInfo(tp_mesh, (Shard(0),), origin_is_dtensor=False)
+        source_shard_info = SourceShardMetaInfo(tp_mesh, (Shard(0),), origin_is_dtensor=False)
 
         with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
             hsdp_param = TorchHSDPParamV2(
@@ -311,7 +311,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
                 mesh_info,
                 mp_policy=MixedPrecisionPolicy(),
                 device=torch.device("cpu"),
-                tp_grad_info=tp_grad_info,
+                source_shard_info=source_shard_info,
             )
 
         expected_placements = (
@@ -352,12 +352,17 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         del hsdp_param._unsharded_param
         hsdp_param.unsharded_param_buffers = [torch.arange(4, dtype=torch.float32)]
         hsdp_param._contiguous_orig_stride = (1,)
+        hsdp_param.source_shard_info = SourceShardMetaInfo(
+            "mesh",
+            (Shard(0),),
+            origin_is_dtensor=False,
+        )
 
         hsdp_param.init_unsharded_param()
         torch.testing.assert_close(hsdp_param.unsharded_param, torch.arange(4, dtype=torch.float32))
 
         del hsdp_param._unsharded_param
-        hsdp_param.tp_grad_info = TPShardMetaInfo(
+        hsdp_param.source_shard_info = SourceShardMetaInfo(
             "mesh",
             (Shard(0),),
             origin_is_dtensor=True,
@@ -557,7 +562,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         )
 
     @patch("hyper_parallel.platform.torch.fully_shard.param.dist.all_reduce")
-    def test_all_reduce_tp_replicate_grad_inplace_uses_original_replicated_axes(
+    def test_all_reduce_source_replicate_grad_inplace_uses_original_replicated_axes(
         self,
         mock_all_reduce,
     ):
@@ -570,14 +575,14 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         replicate_mesh.size.return_value = 4
         replicate_mesh.get_group.return_value = "tp-replicate-group"
         orig_mesh.__getitem__.return_value = replicate_submesh
-        hsdp_param.tp_grad_info = TPShardMetaInfo(
+        hsdp_param.source_shard_info = SourceShardMetaInfo(
             orig_mesh,
             (Shard(0), Replicate(), Replicate()),
             origin_is_dtensor=True,
         )
         reduced_grad = torch.tensor([1.0, 2.0])
 
-        hsdp_param.all_reduce_tp_replicate_grad_inplace(
+        hsdp_param.all_reduce_source_replicate_grad_inplace(
             reduced_grad,
             torch.distributed.ReduceOp.SUM,
         )
@@ -592,7 +597,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         )
 
     @patch("hyper_parallel.platform.torch.fully_shard.param.dist.all_reduce")
-    def test_all_reduce_tp_replicate_grad_inplace_uses_plain_parameter_metadata(self, mock_all_reduce):
+    def test_all_reduce_source_replicate_grad_inplace_uses_plain_parameter_metadata(self, mock_all_reduce):
         """Dual-mode gradients should all-reduce over replicated source mesh axes."""
         hsdp_param = _new_param()
         source_mesh = MagicMock()
@@ -602,14 +607,14 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         replicate_mesh.size.return_value = 2
         replicate_mesh.get_group.return_value = "replicate-group"
         source_mesh.__getitem__.return_value = replicate_submesh
-        hsdp_param.tp_grad_info = TPShardMetaInfo(
+        hsdp_param.source_shard_info = SourceShardMetaInfo(
             source_mesh,
             (Shard(0), Replicate()),
             origin_is_dtensor=False,
         )
         reduced_grad = torch.tensor([1.0, 2.0])
 
-        hsdp_param.all_reduce_tp_replicate_grad_inplace(
+        hsdp_param.all_reduce_source_replicate_grad_inplace(
             reduced_grad,
             torch.distributed.ReduceOp.SUM,
         )

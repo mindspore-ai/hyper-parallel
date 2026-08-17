@@ -82,16 +82,16 @@ def _local_params_context(model: nn.Module):
     the original DTensor (same data_ptr).
 
     Returns a {fqn: placements} snapshot of the placements before unwrapping
-    (diagnostic use only; the canonical source for tp_grad_info is the
-    ShardingPlan, see build_tp_grad_info).
+    (diagnostic use only; the canonical source for source_shard_info is the
+    ShardingPlan, see build_source_shard_info).
     """
-    tp_grad_records = {}
+    source_shard_records = {}
     for name, param in list(model.named_parameters()):
         if isinstance(param, DTensor):
-            tp_grad_records[name] = param.placements
+            source_shard_records[name] = param.placements
             _set_param_by_path(model, name, nn.Parameter(
                 param.to_local(), requires_grad=param.requires_grad))
-    return tp_grad_records
+    return source_shard_records
 
 
 @contextmanager
