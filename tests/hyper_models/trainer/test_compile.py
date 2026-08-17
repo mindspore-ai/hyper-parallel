@@ -29,12 +29,12 @@ import torch
 from torch import nn
 
 from hyper_models._transformers import infrastructure
-from hyper_models.components.distributed.compile import (
-    _install_dynamo_mapping_get_polyfill,
+from hyper_models.components.compile import (
     apply_compile,
     get_compile_layers,
     resolve_compile_kwargs,
 )
+from hyper_models.components.compile.compile import _install_dynamo_mapping_get_polyfill
 from hyper_models.config.manager import parse_training_args
 from hyper_models.trainer.config import CompileConfig
 
