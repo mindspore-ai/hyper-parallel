@@ -82,18 +82,23 @@ class EnvironMeterCallback(Callback):
     @classmethod
     def _batch_tokens(cls, batch: Mapping[str, Any]) -> int:
         """Count text tokens in one micro-batch without mutating it."""
+        labels = batch.get("labels")
+        if labels is not None and callable(getattr(labels, "sum", None)):
+            return int((labels != IGNORE_INDEX).sum().item())
+
         attention_mask = batch.get("attention_mask")
-        if attention_mask is not None and callable(getattr(attention_mask, "sum", None)):
+        attention_mask_shape = getattr(attention_mask, "shape", ())
+        if (
+            len(attention_mask_shape) <= 2
+            and attention_mask is not None
+            and callable(getattr(attention_mask, "sum", None))
+        ):
             return int(attention_mask.sum().item())
 
         input_ids = batch.get("input_ids")
         input_numel = cls._tensor_numel(input_ids)
         if input_numel is not None:
             return input_numel
-
-        labels = batch.get("labels")
-        if labels is not None and callable(getattr(labels, "sum", None)):
-            return int((labels != IGNORE_INDEX).sum().item())
         return 0
 
     @staticmethod
@@ -110,14 +115,31 @@ class EnvironMeterCallback(Callback):
         return int(shape[0])
 
     @staticmethod
-    def _micro_batches(value: Any) -> list[Mapping[str, Any]]:
+    def _batch_mapping(value: Any) -> Mapping[str, Any] | None:
+        """Return metric inputs for a mapping or prepared runtime batch."""
+        if isinstance(value, Mapping):
+            return value
+        loss_count_inputs = getattr(value, "loss_count_inputs", None)
+        if not callable(loss_count_inputs):
+            return None
+        metric_inputs = loss_count_inputs()
+        return metric_inputs if isinstance(metric_inputs, Mapping) else None
+
+    @classmethod
+    def _micro_batches(cls, value: Any) -> list[Mapping[str, Any]]:
         """Normalize callback input into a list of mapping micro-batches."""
         if value is None:
             return []
-        if isinstance(value, Mapping):
-            return [value]
+        batch = cls._batch_mapping(value)
+        if batch is not None:
+            return [batch]
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            return [batch for batch in value if isinstance(batch, Mapping)]
+            batches = []
+            for item in value:
+                batch = cls._batch_mapping(item)
+                if batch is not None:
+                    batches.append(batch)
+            return batches
         return []
 
     def _metric_group(self) -> Any:

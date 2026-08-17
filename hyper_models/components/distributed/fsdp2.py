@@ -391,6 +391,27 @@ class FSDP2Manager:
             if parameter_owner is owner and parameter in replicate_params
         }
 
+    def _configure_source_layout_gradient_scaling(
+        self,
+        hsdp_module: HSDPModule,
+        managed_tp_grad_info: TPGradInfoByParam | None,
+    ) -> bool:
+        """Restore global-mean gradients for one source-layout FSDP unit.
+
+        ``fully_shard`` defaults units whose parameters all have source-layout
+        metadata to SUM reduction. The dual-mode Trainer's token-weighted loss
+        is multiplied by ``dp_size`` to compensate normal FSDP AVG reduction,
+        so a SUM-reduced unit must apply the inverse factor exactly once.
+
+        Returns:
+            Whether a gradient scaling factor was configured for the unit.
+        """
+        dp_size = self.mesh_context.dp_size
+        if dp_size <= 1 or not managed_tp_grad_info:
+            return False
+        hsdp_module.set_gradient_scaling_factor(1.0 / dp_size)
+        return True
+
     def _configure_prefetch(self, hsdp_modules: list[HSDPModule]) -> None:
         """Configure forward and backward prefetch targets by list depth."""
         for module_index, hsdp_module in enumerate(hsdp_modules):
@@ -467,6 +488,7 @@ class FSDP2Manager:
             key=lambda wrap_module: wrap_module.fqn.count("."),
             reverse=True,
         )
+        gradient_scaled_units = 0
         for wrap_module in wrapping_order:
             managed_tp_grad_info = self._build_managed_tp_grad_info(
                 wrap_module.module,
@@ -491,6 +513,11 @@ class FSDP2Manager:
                 ),
                 **fsdp_sublayer_kwargs,
             )
+            if self._configure_source_layout_gradient_scaling(
+                wrap_module.module,
+                managed_tp_grad_info,
+            ):
+                gradient_scaled_units += 1
 
         root_tp_grad_info = self._build_managed_tp_grad_info(
             model,
@@ -512,6 +539,14 @@ class FSDP2Manager:
             ),
             **dense_root_kwargs,
         )
+        if self._configure_source_layout_gradient_scaling(model, root_tp_grad_info):
+            gradient_scaled_units += 1
+        if gradient_scaled_units:
+            logger.info(
+                "Applied DP gradient scaling factor %s to %d source-layout FSDP2 units",
+                1.0 / self.mesh_context.dp_size,
+                gradient_scaled_units,
+            )
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
         if self.config.enable_fsdp2_prefetch:
             self._configure_prefetch(
