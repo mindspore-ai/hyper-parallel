@@ -27,14 +27,14 @@ import torch
 from torch import nn
 
 from hyper_models._transformers.checkpoint_loader import CheckpointManager, LoadReport
-from hyper_models.components.distributed.compile import apply_compile
+from hyper_models.components.activation_checkpoint import (
+    _apply_activation_checkpointing as _apply_activation_checkpointing_impl,
+)
+from hyper_models.components.compile import apply_compile
 from hyper_models.components.distributed.fsdp2 import FSDP2Manager, _instantiate_fsdp2
 from hyper_models.components.distributed.pipelining import _instantiate_pipeline
 from hyper_models.components.distributed.sharding_applier import apply_sharding_plan
 from hyper_models.components.distributed.sharding_planner import ShardingPlanner
-from hyper_models.components.distributed.activation_checkpointing import (
-    _apply_activation_checkpointing as _apply_activation_checkpointing_impl,
-)
 from hyper_models.trainer.config import (
     CompileConfig,
     entries_to_module_replacements,
