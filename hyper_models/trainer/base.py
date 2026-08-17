@@ -256,12 +256,6 @@ class BaseTrainer(Stateful, ABC):
     # Callback system
     state: TrainerState
 
-    # Training states
-    train_steps: int = 0  # total training steps
-    steps_per_epoch: int | None = None
-    start_epoch: int = 0  # start epoch
-    start_step: int = 0  # start step
-
     # Default seed when training.seed is omitted.
     default_seed: int = 42
 
@@ -305,8 +299,8 @@ class BaseTrainer(Stateful, ABC):
         self._build_dataset()
         self._build_collate_fn()
         self._build_dataloader()
+        self._compute_train_iters()
 
-        self._compute_train_steps()
         self._build_optimizer()
         self._build_lr_scheduler()
         self._build_training_context()
@@ -436,30 +430,27 @@ class BaseTrainer(Stateful, ABC):
             setattr(self, f"{split_name}_dataloader", dataloader)
             setattr(self, f"{split_name}_batch_sampler", batch_sampler)
 
-    def _compute_train_steps(self) -> None:
-        """Resolve epoch length and the effective global optimizer-step limit."""
+    def _compute_train_iters(self) -> None:
+        """Resolve the required global training limit into a common rank-local epoch layout."""
         training_config = self.config.training
-        if training_config.train_steps is not None and training_config.train_samples is not None:
-            raise ValueError("configure only one of training.train_steps and training.train_samples")
+        if training_config.train_iters is not None and training_config.train_samples is not None:
+            raise ValueError("configure only one of training.train_iters and training.train_samples")
 
-        step_limit = training_config.train_steps
+        if training_config.train_iters is None and training_config.train_samples is None:
+            raise ValueError("configure one of training.train_iters or training.train_samples")
+
+        train_iters = training_config.train_iters
         if training_config.train_samples is not None:
-            step_limit = training_config.train_samples // training_config.global_batch_size
+            train_iters = training_config.train_samples // training_config.global_batch_size
 
-        try:
-            self.steps_per_epoch = len(self.train_dataloader) // getattr(self, "num_micro_batches", 1)
-        except TypeError:
-            self.steps_per_epoch = None
-        if self.steps_per_epoch is None:
-            if step_limit is None:
-                raise ValueError("training.train_steps or training.train_samples is required for an unsized dataloader")
-            self.train_steps = step_limit
-        else:
-            epoch_step_limit = self.steps_per_epoch * training_config.num_train_epochs
-            self.train_steps = epoch_step_limit if step_limit is None else min(step_limit, epoch_step_limit)
+        train_steps = train_iters
 
-        if self.train_steps <= 0:
-            raise ValueError("training configuration must produce at least one train step")
+        if train_iters <= 0:
+            raise ValueError("training configuration must produce at least one train iteration")
+
+        self.train_iters = train_iters
+        self.train_steps = train_steps
+        self.train_epochs = (self.train_iters + self.train_steps - 1) // self.train_steps
 
     def _build_optimizer(self) -> None:
         """Build the configured optimizer with the runtime model context."""
@@ -471,7 +462,7 @@ class BaseTrainer(Stateful, ABC):
         config: TrainerConfig = self.config
         lr_scheduler = config.lr_scheduler.build(
             optimizer=self.optimizer,
-            train_steps=self.train_steps,
+            train_iters=self.train_iters,
         )
         self.lr_scheduler = lr_scheduler.get_lr_scheduler()
 
@@ -696,32 +687,28 @@ class BaseTrainer(Stateful, ABC):
         """Run the configured training loop."""
         config: TrainerConfig = self.config
         self.on_train_begin()
+        self.data_iterator = HyperIter(
+            self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
+        )
         logger.info(
-            "Rank%s Start training. Start step: %s. Train steps: %s. "
-            "Start epoch: %s. Train epochs: %s.",
-            self.local_rank,
-            self.start_step,
-            self.train_steps,
-            self.start_epoch,
-            config.training.num_train_epochs,
+            "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
+            self.local_rank, self.state.global_step, self.train_iters, self.state.epoch, self.train_epochs,
         )
 
-        for epoch in range(self.start_epoch, config.training.num_train_epochs):
-            if hasattr(self.train_dataloader, "set_epoch"):
+        start_epoch = self.state.epoch
+        for epoch in range(start_epoch, self.train_epochs):
+            if epoch != start_epoch:
                 self.train_dataloader.set_epoch(epoch)
+                self.data_iterator = HyperIter(
+                    self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
+                )
             self.state.epoch = epoch
 
             self.on_epoch_begin()
 
-            # Create a batch generator
-            self.data_iterator = HyperIter(
-                self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-            )
-
-            epoch_steps = self.steps_per_epoch or self.train_steps - self.state.global_step
-            for _ in range(self.start_step, epoch_steps):
-                if self.state.global_step >= self.train_steps:
-                    break
+            start_step = self.state.global_step - epoch * self.train_steps
+            train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)
+            for _ in range(start_step, train_steps):
                 try:
                     self.train_step(self.data_iterator)
                 except StopIteration:
@@ -733,20 +720,16 @@ class BaseTrainer(Stateful, ABC):
                     break
 
             self.on_epoch_end()
-
-            self.start_step = 0
+            self.state.epoch = epoch + 1
 
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
             if config.dataloader.use_background_prefetcher:
                 self.data_iterator.stop()
 
-            if self.state.global_step >= self.train_steps:
-                break
-
         self.on_train_end()
 
-        if "data_iterator" in locals() and config.dataloader.use_background_prefetcher:
+        if config.dataloader.use_background_prefetcher:
             self.data_iterator.stop()
 
         synchronize()

@@ -55,7 +55,7 @@ class TextTrainer:
 
         # get_batch
         self._build_get_batch()
-        self.base._compute_train_steps()
+        self.base._compute_train_iters()
 
         self.base._build_optimizer()
         self.base._build_lr_scheduler()
@@ -194,7 +194,6 @@ class TextTrainer:
         training_batches = [first_training_batch]
         for _ in range(1, num_micro_steps):
             training_batches.append(self.base.get_batch(data_iterator))
-        self.base.state.global_step += 1
 
         self.on_step_begin(micro_batches=training_batches)
         synchronize()
@@ -253,6 +252,9 @@ class TextTrainer:
             loss_dict=total_loss_dict,
             grad_norm=grad_norm_value,
         )
+
+        self.base.state.global_step += 1
+
         return {
             "loss": total_loss,
             "grad_norm": grad_norm_value,
@@ -263,42 +265,38 @@ class TextTrainer:
         config = self.base.config
         self.on_train_begin()
         logger.info(
-            "Rank%s Start training. Start step: %s. Train steps: %s. "
-            "Start epoch: %s. Train epochs: %s.",
+            "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
             self.base.local_rank,
-            self.base.start_step,
-            self.base.train_steps,
-            self.base.start_epoch,
-            config.training.num_train_epochs,
+            self.base.state.global_step,
+            self.base.train_iters,
+            self.base.state.epoch,
+            self.base.train_epochs,
         )
 
-        for epoch in range(self.base.start_epoch, config.training.num_train_epochs):
-            if hasattr(self.base.train_dataloader, "set_epoch"):
-                self.base.train_dataloader.set_epoch(epoch)
-            self.base.state.epoch = epoch
+        # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
+        for epoch in range(self.base.state.epoch, self.base.train_epochs):
+            train_dataloader = self.base.train_dataloader
+
+            if hasattr(train_dataloader, "set_epoch"):
+                train_dataloader.set_epoch(epoch)
+
             self.on_epoch_begin()
+            data_iterator = iter(train_dataloader) if train_dataloader is not None else None
 
-            data_iterator = (
-                iter(self.base.train_dataloader)
-                if self.base.train_dataloader is not None
-                else None
-            )
-
-            epoch_steps = self.base.steps_per_epoch or self.base.train_steps - self.base.state.global_step
-            for _ in range(self.base.start_step, epoch_steps):
-                if self.base.state.global_step >= self.base.train_steps:
-                    break
+            start_step = self.base.state.global_step - epoch * self.base.train_steps
+            train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+            for _ in range(start_step, train_steps):
                 try:
                     self.train_step(data_iterator)
                 except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {config.dataloader.drop_last}")
+                    logger.info("epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last)
                     break
 
             self.on_epoch_end()
-            self.base.start_step = 0
+            self.base.state.epoch = epoch + 1
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
-            if self.base.state.global_step >= self.base.train_steps:
+            if self.base.state.global_step >= self.base.train_iters:
                 break
 
         self.on_train_end()

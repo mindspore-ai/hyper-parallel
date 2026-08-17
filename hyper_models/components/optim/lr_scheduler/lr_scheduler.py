@@ -21,16 +21,16 @@ from hyper_parallel.core.optimizer.lr_scheduler import LRSchedulersContainer, ge
 class MultiLRScheduler:
     """Build one learning-rate scheduler for each child optimizer."""
 
-    def __init__(self, optimizer, lr_decay_style, train_steps, lr_config):
+    def __init__(self, optimizer, lr_decay_style, train_iters, lr_config):
         self.config = lr_config
         self.optimizer = optimizer
         self.lr_decay_style = lr_decay_style
-        self.train_step = train_steps
+        self.train_iters = train_iters
 
         lr_warmup_ratio = self.config.get('lr_warmup_ratio', 0.0)
         lr_warmup_steps = self.config.get('lr_warmup_steps')
         if lr_warmup_steps is None:
-            lr_warmup_steps = int(train_steps * lr_warmup_ratio)
+            lr_warmup_steps = int(train_iters * lr_warmup_ratio)
         lr_start = self.config.get('lr_start', 0.0)
         lr_decay_ratio = self.config.get('lr_decay_ratio', 1.0)
         min_lr = self.config.get('min_lr', self.config.get('lr_min', 1e-7))
@@ -48,7 +48,7 @@ class MultiLRScheduler:
                 return get_linear_schedule_with_warmup(
                     optimizer=optimizer,
                     num_warmup_steps=lr_warmup_steps,
-                    num_training_steps=train_steps,
+                    num_training_steps=train_iters,
                     init_lr=init_lr,
                     min_lr=min_lr,
                     lr_start=lr_start,
@@ -57,7 +57,7 @@ class MultiLRScheduler:
                 return get_cosine_schedule_with_warmup(
                     optimizer=optimizer,
                     num_warmup_steps=lr_warmup_steps,
-                    num_training_steps=train_steps,
+                    num_training_steps=train_iters,
                     init_lr=init_lr,
                     lr_decay_ratio=lr_decay_ratio,
                     min_lr=min_lr,
