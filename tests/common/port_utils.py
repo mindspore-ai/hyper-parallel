@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Port allocation utilities for distributed test cases."""
+"""Port allocation utilities for distributed test cases. CI probe: comment-only."""
 import fcntl
 import os
 import tempfile
