@@ -52,3 +52,18 @@ pytest -s test_llama3_accuracy.py::test_llama3_tp_cp_fully_shard_accuracy
 ```
 
 精度比较的容差为 `rtol=1e-3, atol=1e-3`；任一步重建出的全局 loss 偏离单卡基线即会断言失败。
+
+## Qwen3-VL-MoE PP / MPipe trainer 精度测试
+
+`test_qwen3_vl_moe_trainer_accuracy.py` 采用与上面相同的 `arg_mark` launcher 结构，但 worker
+不是本目录下的 `_test_*.py`，而是真实的训练入口 `scripts/train_vl.py`：`trainer_align_utils.py`
+为每个用例生成临时 YAML 并用 `torchrun` 端到端拉起 trainer，比较各并行配置的逐步训练 loss
+（`atol=2e-3`，20 步确定性 `vl_dummy` 数据）。
+
+| 文件 | 说明 |
+|------|------|
+| `trainer_align_utils.py` | 共享 runner：`base_config` 生成配置、`run_trainer_losses` 起 torchrun 子进程并解析 loss 轨迹、`assert_trajectories_match` 逐步比对。 |
+| `test_qwen3_vl_moe_trainer_accuracy.py` | PP / MPipe 最小用例集：PP=2 1F1B 与 FSDP-2 基线比对，MPipe 冻结塔（生产形态）、`data.load: single`、stage-0 backward、owner-does-backward 分别与 FSDP / 1F1B 基线比对。 |
+
+依赖磁盘上的 `Qwen3-VL-30B-A3B` 真实权重（`HP_QWEN3_VL_MOE_CKPT` 可覆盖路径）；权重缺失或
+NPU 不足时用例跳过（exit 0）。

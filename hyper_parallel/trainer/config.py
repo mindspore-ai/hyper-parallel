@@ -145,6 +145,7 @@ class DataConfig:
     - ``shuffle``: when ``False``, sampler reads samples in dataset order.
     """
     type: str = "dummy"
+    load: Optional[str] = None
     train_path: Optional[Any] = None
     subset: Optional[str] = None
     max_seq_len: int = 2048
@@ -209,7 +210,9 @@ class AcceleratorConfig:
     # divisible by it. Defaults to 1 (no micro-batching).
     pp_micro_batch_num: int = 1
     # Pipeline schedule when ``pp > 1``: ``"gpipe"`` (all-forward then
-    # all-backward) or ``"1f1b"`` (one-forward-one-backward steady state).
+    # all-backward), ``"1f1b"`` (one-forward-one-backward steady state), or
+    # ``"mpipe"``/``"mpipe_transpose"`` (transpose the preprocess block to shrink
+    # the warmup bubble).
     # ``None`` keeps each model's default (dense → gpipe, MoE → 1f1b).
     pp_schedule: Optional[str] = None
     # Virtual-pipeline (VPP) degree: number of non-contiguous stage chunks each
@@ -217,11 +220,31 @@ class AcceleratorConfig:
     # ``>1`` builds ``pp * pp_vpp`` interleaved global stages (rank ``r`` owns
     # stages ``r, r+pp, r+2*pp, ...``) and drives them with interleaved 1F1B.
     pp_vpp: int = 1
+    # Shallow-warmup ("less memory") interleaved 1F1B: cap each stage's warmup
+    # at the plain-1F1B stagger instead of the classic doubled one, so early
+    # stages hold up to ``pp - 1`` fewer in-flight micro-batch activations.
+    # Applies to the interleaved schedule (``pp_vpp > 1``) and to the mpipe
+    # body; ignored by gpipe/1f1b. Off by default (classic Megatron warmup).
+    # Wired for the Qwen3-VL-MoE model only.
+    pp_less_memory: bool = False
     # Per-global-stage decoder-layer counts (length ``pp * pp_vpp``, summing to
     # ``num_hidden_layers``). ``None`` (default) keeps the even split with the
     # remainder on the later stages. Lets users rebalance stages whose extra
     # modules (embed / visual tower / lm_head) dominate memory or latency.
     pp_layer_split: Optional[List[int]] = None
+    # What MPipe (``pp_schedule="mpipe"``) transposes: 0 = dataload-only,
+    # N > 0 = the first N layers, "visual" = the whole (VL) visual tower.
+    # Ignored for other schedules.
+    pp_mpipe_transpose_layers: Union[int, str] = 1
+    # MPipe owner-does-backward (opt-in, torch backend, TRAINABLE transposed
+    # tower only): the owner rank keeps the tower forward graph and runs the
+    # tower backward in its cooldown bubble instead of stage 0 recomputing it
+    # serially; tower grads are SUM-reduced to stage 0. cp>1 not supported.
+    pp_mpipe_owner_backward: bool = False
+    # Distribution of M > NT overflow micros: "full" = round-robin across all
+    # owner ranks (balanced, more P2P); "min" = rank 0 absorbs the overflow
+    # inline.
+    pp_mpipe_transpose_overflow: str = "full"
     ep: int = 1
     etp: int = 1
     moe_token_dispatcher_type: str = "all_to_all"
@@ -239,6 +262,13 @@ class AcceleratorConfig:
     # Offload sharded params, grads, and optimizer states to CPU so large
     # checkpoints can fit without device-resident master weights and Adam state.
     cpu_offload: bool = False
+    # FSDP all-gather / compute overlap: prefetch depth in wrapped units
+    # (0 = off, today's behaviour; 1 = standard). Depth d keeps up to d extra
+    # units unsharded, so it costs memory; units with
+    # ``reshard_after_forward=False`` (pipeline stages) are skipped.
+    # Wired for the Qwen3-VL-MoE model only.
+    fsdp_forward_prefetch: int = 0
+    fsdp_backward_prefetch: int = 0
 
 
 @dataclass
@@ -261,8 +291,17 @@ class GradientCheckpointingConfig:
     """``train.gradient_checkpointing.*`` — activation recomputation.
 
     . Modes: ``"off"``, ``"full"``, or ``"selective"``.
+
+    ``num_layers``: recompute depth of the text decoder layers — ``None``
+    wraps every layer, an ``int`` wraps the first N per stage, a list follows
+    the ``pp_layer_split`` convention (per global stage). ``visual_num_layers``:
+    same forms for the trainable visual tower (ignored while
+    ``activation_checkpoint`` is off or the visual is frozen). Both depth keys
+    are honored by the qwen3_vl_moe path only.
     """
     activation_checkpoint: str = "off"
+    num_layers: Optional[Union[int, List[int]]] = None
+    visual_num_layers: Optional[Union[int, List[int]]] = None
 
 
 @dataclass

@@ -180,7 +180,11 @@ class PipelineStageBase:
             return
 
         grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
-        torch.autograd.backward(local_output, grad_tensors=grad_tensors)
+        # MPipe owner-backward shares the tower's all-gather node across micro
+        # graphs, so freeing it on the first backward breaks the later ones.
+        retain_graph = getattr(self, "retain_backward_graph", False)
+        torch.autograd.backward(local_output, grad_tensors=grad_tensors,
+                                retain_graph=retain_graph)
 
         if not self.is_first_stage:
             self._populate_bwd_cache(micro_index)

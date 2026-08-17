@@ -252,7 +252,8 @@ class OpDispatcher:
                                     "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__",
                                     "register_hook",
                                     "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim",
-                                    "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous"})
+                                    "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous",
+                                    "get_device"})
 
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
         # frozenset so the aclop-normalization gate in _dispatch_layout_infer is O(1).

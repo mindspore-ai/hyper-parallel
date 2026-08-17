@@ -271,6 +271,28 @@ def test_vpp():
                        pp_model[1].mlp_layers[str(stage_index+4)].weight.cpu().detach().numpy())
 
 
+def test_vpp_deep_warmup():
+    """
+    Feature: Interleaved 1F1B deep-warmup regression (zero-width DATA_LOAD).
+    Description: Same pp=4 x vpp=2 topology as ``test_vpp`` but with
+        micro_batch_num=12 (M = 3*PP), a classic-warmup shape whose last-rank
+        BWD_RECV was mis-scheduled after its consuming BWD when the in-schedule
+        DATA_LOAD steps occupied their own schedule columns.
+    Expectation: Losses and weights match the standalone reference.
+    """
+    micro = 12
+    standalone_model = SimpleMLP(8, 16, 16)
+    standalone_loss = run_standalone(micro, standalone_model)
+    pp_loss, pp_model = run_parallel(micro)
+    stage_index = get_stage_index(4)
+    if stage_index == 3:
+        assert np.allclose(standalone_loss.cpu().detach().numpy(), pp_loss[0].cpu().detach().numpy())
+    assert np.allclose(standalone_model.mlp_layers[str(stage_index)].weight.cpu().detach().numpy(),
+                       pp_model[0].mlp_layers[str(stage_index)].weight.cpu().detach().numpy())
+    assert np.allclose(standalone_model.mlp_layers[str(stage_index+4)].weight.cpu().detach().numpy(),
+                       pp_model[1].mlp_layers[str(stage_index+4)].weight.cpu().detach().numpy())
+
+
 def test_vpp_dynamic_batch_p2p_cold_start():
     """
     Feature: Dynamic-shape VPP with batched P2P on cold PP subgroups.

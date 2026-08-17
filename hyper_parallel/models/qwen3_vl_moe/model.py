@@ -35,6 +35,10 @@ from hyper_parallel.models.qwen3_vl_vision import (
     Qwen3VLMoeVisionModel,
     Qwen3VLMoeVisionOutput,
 )
+from hyper_parallel.tools.logging import get_logger
+
+# INFO via ``HP_LOG_CONFIG=HP:INFO`` to see the [v1-kernels] lines.
+_hp_logger = get_logger("HP")
 
 
 def _shifted_ce_loss(logits, labels):
@@ -48,21 +52,64 @@ def _shifted_ce_loss(logits, labels):
     )
 
 
+_V1_KERNELS_LOGGED = False
+_V1_DISPATCH_LOGGED = False
+
+
 def _use_v1_kernels() -> bool:
     """True when ``HYPER_USE_V1_KERNELS=1`` and ``torch_npu`` is importable.
 
-    When set, ``Qwen3VLMoeTextSparseMoE``
-    and ``Qwen3VLMoeTextExperts`` dispatch to ``torch_npu.npu_moe_token_permute`` /
-    ``npu_grouped_matmul`` / ``npu_swiglu`` / ``npu_moe_token_unpermute`` instead
-    of the eager per-expert loop.
+    When set, the MoE experts dispatch to the fused ``npu_grouped_matmul``
+    path instead of the eager per-expert loop. Logs the negative cases once;
+    the positive "ON" line comes from :func:`_log_v1_dispatch_once` at the
+    dispatch site, so it prints only when the fused branch actually executes.
     """
-    if os.environ.get("HYPER_USE_V1_KERNELS", "0") != "1":
-        return False
-    try:
-        import torch_npu  # pylint: disable=C0415,W0611
-        return True
-    except ImportError:
-        return False
+    global _V1_KERNELS_LOGGED
+    requested = os.environ.get("HYPER_USE_V1_KERNELS", "0") == "1"
+    available = False
+    if requested:
+        try:
+            import torch_npu  # pylint: disable=C0415,W0611
+            available = True
+        except ImportError:
+            available = False
+    if not _V1_KERNELS_LOGGED:
+        _V1_KERNELS_LOGGED = True
+        if not requested:
+            _hp_logger.info(
+                "[v1-kernels] OFF (HYPER_USE_V1_KERNELS!=1) -- using the eager "
+                "per-expert MoE path (slow backward).")
+        elif not available:
+            _hp_logger.warning(
+                "[v1-kernels] REQUESTED (HYPER_USE_V1_KERNELS=1) but torch_npu "
+                "import FAILED -- falling back to the eager per-expert MoE path "
+                "(slow backward).")
+        # requested AND available: stay quiet here; the dispatch announces "ON"
+        # only when the fused branch is genuinely entered on NPU tensors.
+    return requested and available
+
+
+def _log_v1_dispatch_once(hidden_states: "torch.Tensor") -> None:
+    """Emit the one-time ``[v1-kernels] ON`` line when the fused MoE branch runs.
+
+    Downgrades to ``WARNING`` for non-bfloat16 inputs: the bf16-oriented fused
+    NPU ops have no cast guard and may error or silently downcast.
+    """
+    global _V1_DISPATCH_LOGGED
+    if _V1_DISPATCH_LOGGED:
+        return
+    _V1_DISPATCH_LOGGED = True
+    dtype = hidden_states.dtype
+    if dtype == torch.bfloat16:
+        _hp_logger.info(
+            "[v1-kernels] ON -- fused npu_grouped_matmul MoE path executing "
+            "(dtype=%s).", dtype)
+    else:
+        _hp_logger.warning(
+            "[v1-kernels] ON but dtype=%s (expected bfloat16) -- fp32/other is "
+            "passed straight into the bf16-oriented fused NPU ops, which may "
+            "error or silently downcast; use param_dtype=bfloat16 with v1 kernels.",
+            dtype)
 
 
 class _GmmFunction(torch.autograd.Function):
@@ -310,6 +357,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         """Forward pass."""
         # pylint: disable=W0613  # interface conformance
         if _use_v1_kernels() and hidden_states.device.type == "npu":
+            _log_v1_dispatch_once(hidden_states)
             return self._npu_v1_forward(hidden_states, routing_weights, router_indices)
         num_tokens, hidden_dim = hidden_states.shape
         num_top_k = router_indices.size(-1)
@@ -445,6 +493,7 @@ class Qwen3VLMoeTextSparseMoE(nn.Module):
         router_logits, routing_weights, router_indices = self.gate(hidden_states_2d)
         del router_logits
         if _use_v1_kernels() and hidden_states.device.type == "npu":
+            _log_v1_dispatch_once(hidden_states)
             # NPU path: pass sparse (T, top_k) routing_weights — consumed
             # directly by ``npu_moe_token_unpermute(probs=...)``.
             next_states = self.experts(
@@ -1125,6 +1174,36 @@ class Qwen3VLMoeForConditionalGeneration(nn.Module):
         return {"loss": loss, "logits": logits}
 
 
+class Qwen3VLMoeVisualPreprocess(nn.Module):
+    """MPipe-Transpose preprocess: run the (frozen) visual tower and return its
+    payload as a flat tuple ``(image_embeds, *deepstack_features)`` for the
+    transpose transport.
+
+    Duck-types :meth:`Qwen3VLMoeModel.get_image_features` (only ``self.visual``
+    is needed). Holds the visual tower so it is present and broadcast-free on
+    every rank (the tower is frozen, so MPipe ships only its output).
+    """
+
+    def __init__(self, visual):
+        super().__init__()
+        self.visual = visual
+
+    def forward(self, *args, pixel_values=None, image_grid_thw=None, **kwargs):  # pylint: disable=unused-argument
+        """Encode this rank's images into the transposed visual payload."""
+        image_outputs = Qwen3VLMoeModel.get_image_features(self, pixel_values, image_grid_thw)
+        image_embeds = torch.cat(image_outputs.pooler_output, dim=0)
+        return (image_embeds, *image_outputs.deepstack_features)
+
+
+class Qwen3VLMoeIdentityPreprocess(nn.Module):
+    """Dataload-only MPipe preprocess: returns ``input_ids`` unchanged (the
+    visual tower stays on stage 0). The param-free, ship-only baseline."""
+
+    def forward(self, input_ids, **kwargs):  # pylint: disable=unused-argument
+        """Pass the raw inputs through (dataload-only transpose, T=0)."""
+        return input_ids
+
+
 class Qwen3VLMoeStageModule(nn.Module):
     """One pipeline-parallel stage of Qwen3-VL-MoE.
 
@@ -1198,6 +1277,7 @@ class Qwen3VLMoeStageModule(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        mpipe_visual: Optional[tuple] = None,
     ):
         """Run this stage.
 
@@ -1207,6 +1287,12 @@ class Qwen3VLMoeStageModule(nn.Module):
         ``targets``) else logits. ``deepstack_embeds_in`` (positional, from the
         predecessor's relay) covers global layers ``[layer_start,
         deepstack_len)``.
+
+        ``mpipe_visual`` carries a MPipe-Transpose precomputed visual payload
+        ``(image_embeds, *deepstack_features)`` (the frozen visual tower run on
+        another rank). When provided, stage 0 injects it instead of running its
+        own ``get_image_features`` — the 3D-mrope position-ids are still computed
+        locally from ``image_grid_thw``.
         """
         # Per-stage view of the DeepStack features: ``deepstack_embeds[i]``
         # injects after global layer ``layer_start + i``.
@@ -1214,15 +1300,19 @@ class Qwen3VLMoeStageModule(nn.Module):
         if self.embed_tokens is not None:  # stage 0: ``hidden_states`` is ``input_ids``
             input_ids = hidden_states
             inputs_embeds = self.embed_tokens(input_ids)
-            if pixel_values is not None:
-                # PP micro-batching splits pixel_values and image_grid_thw
-                # independently on dim 0 (the schedule's per-kwarg BatchDimSpec).
-                # That is only sample-aligned when every micro-chunk's grids own
-                # exactly its pixel rows, i.e. the uniform layout the splitter
-                # assumes. A ragged batch (samples with differing image/patch
-                # counts) lands the grid / pixel cuts on mismatched boundaries;
-                # fail fast here with a clear cause instead of a cryptic
-                # torch.split / vision-tower shape error deeper in.
+            if mpipe_visual is not None:
+                image_embeds = mpipe_visual[0].to(inputs_embeds.device, inputs_embeds.dtype)
+                deepstack_embeds = list(mpipe_visual[1:]) or None
+                image_mask = Qwen3VLMoeModel.get_placeholder_mask(
+                    self, input_ids, inputs_embeds, image_features=image_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                # uint8 from the start: P2P meta rejects bool, and keeping one
+                # dtype on every relay hop lets later stages forward it as-is.
+                visual_pos_masks = image_mask[..., 0].to(torch.uint8)
+            elif pixel_values is not None:
+                # The two are split independently on dim 0, which is only
+                # sample-aligned for a uniform batch; fail fast on ragged ones.
                 expected_rows = int(image_grid_thw.prod(-1).sum())
                 if expected_rows != pixel_values.shape[0]:
                     raise NotImplementedError(
@@ -1257,6 +1347,13 @@ class Qwen3VLMoeStageModule(nn.Module):
                     self, input_ids=input_ids, mm_token_type_ids=mm_token_type_ids,
                     image_grid_thw=image_grid_thw, attention_mask=attention_mask,
                 )
+            if position_ids is None:
+                # Image-free micro-batch: mRoPE collapses to plain 1D RoPE. Never emit a ``None``
+                # activation; it crosses the stage boundary and the send path needs a tensor.
+                bsz_, seq_ = input_ids.shape
+                position_ids = torch.arange(
+                    seq_, device=input_ids.device, dtype=torch.long,
+                ).view(1, -1).expand(bsz_, -1)
             hidden_states = inputs_embeds
 
         bsz, seq_len = hidden_states.shape[0], hidden_states.shape[1]
@@ -1270,6 +1367,8 @@ class Qwen3VLMoeStageModule(nn.Module):
             layer_mask = Qwen3VLMoeTextModel._build_causal_mask(  # pylint: disable=W0212
                 attention_mask, bsz, seq_len, hidden_states,
             )
+        # uint8 mask -> bool for local indexing; the uint8 buffer is kept intact so
+        # it can be relayed to downstream stages unchanged.
         inject_mask = (
             visual_pos_masks.to(torch.bool) if visual_pos_masks is not None else None
         )

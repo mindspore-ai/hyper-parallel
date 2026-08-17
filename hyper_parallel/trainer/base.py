@@ -46,6 +46,10 @@ from hyper_parallel import (
 )
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.pipeline_parallel.mpipe.sampler import (
+    PPRankOwnedSampler,
+    mpipe_owned_micros,
+)
 # ``_resolve_local_tensor`` is the canonical shard resolver used by
 # ``HSDPModule.load_state_dict``; reused (rather than duplicated) to load a
 # checkpoint into a model that holds DTensor params but is not itself an
@@ -452,6 +456,8 @@ class BaseTrainer:
             drop_last=True,
         )
 
+        self._update_dataloader_sampler_for_mpipe()
+
         # StatefulDataLoader supports state_dict() / load_state_dict()
         # for checkpoint resume (torchdata API, used by  + ).
         num_workers = self.args.data.num_workers
@@ -507,6 +513,57 @@ class BaseTrainer:
             micro_bs, self._grad_accum, len(self.train_dataset),
             str(self._share_samples_across_dp()),
         )
+
+    def _update_dataloader_sampler_for_mpipe(self):
+        """Sub-Step 8: Build distributed stateful dataloader.
+
+        In case of mpipe schedule update the Sampler to select only
+        his owned data to load
+        """
+        # Only for MPipe's in-schedule dataload; every other PP path expects
+        # the full step batch on each rank's dataloader.
+        load_mode = getattr(self.args.data, "load", None)
+        pp_size = int(getattr(self.parallel_dims, "pp", 1))
+        pp_schedule = str(getattr(self.args.train.accelerator, "pp_schedule", "")).lower()
+        if load_mode == "single" and pp_size > 1 and pp_schedule in ("mpipe", "mpipe_transpose"):
+            micro_bs = self.args.train.micro_batch_size
+            dp_size = self.parallel_dims.dp_size
+            pp_micro_batch_num = int(getattr(self.args.train.accelerator, "pp_micro_batch_num", 1))
+            overflow_mode = str(getattr(self.args.train.accelerator,
+                                        "pp_mpipe_transpose_overflow", "full"))
+            pp_rank = torch.distributed.get_rank(group=self.mesh["pp"].get_group())
+            owned = mpipe_owned_micros(pp_size, pp_micro_batch_num, pp_rank,
+                                       mode=overflow_mode)
+            if not owned:
+                raise ValueError(
+                    f"data.load='single': PP rank {pp_rank} owns no micros "
+                    f"(M={pp_micro_batch_num} < PP={pp_size}). "
+                    "Configure pp_micro_batch_num >= pp."
+                )
+            self.sampler = PPRankOwnedSampler(
+                base_sampler=self.sampler,
+                owned_micros=owned,
+                micro_batch_size=micro_bs,
+                pp_micro_batch_num=pp_micro_batch_num,
+            )
+
+            # Fail on an undersized dataset here rather than mid-run.
+            base_len = len(self.sampler.base)
+            step_chunk = self.sampler.step_size
+            available_steps = base_len // step_chunk if step_chunk else 0
+            max_steps = int(getattr(self.args.train, "max_steps", 0))
+            if max_steps and available_steps < max_steps:
+                per_step = pp_micro_batch_num * micro_bs * dp_size
+                raise ValueError(
+                    f"data.load='single': dataset feeds only {available_steps} "
+                    f"step(s)/epoch (base sampler has {base_len} samples, "
+                    f"step chunk={step_chunk}) but max_steps={max_steps}. Each "
+                    f"step consumes pp_micro_batch_num*micro_batch_size*dp_size "
+                    f"= {pp_micro_batch_num}*{micro_bs}*{dp_size} = {per_step} "
+                    f"samples globally. Set global_batch_size == {per_step} so "
+                    f"the dataset (max_steps*global_batch_size) is large enough, "
+                    f"or lower max_steps to {available_steps}."
+                )
 
     def _build_parallelized_model(self):
         """Step 9: Apply parallel strategies to the model.
@@ -587,14 +644,15 @@ class BaseTrainer:
                 f"adjust global_batch_size / micro_batch_size / pp_micro_batch_num."
             )
 
-        # The PP path bypasses ``parallelize_fn`` and replaces the full model
-        # with a stage fragment, so AC and HF-weight export are not yet wired.
+        # The PP path bypasses ``parallelize_fn``, so for models whose
+        # ``pipelining_fn`` does not apply AC the setting would silently no-op.
         ac_mode = self.args.train.gradient_checkpointing.activation_checkpoint
-        if ac_mode not in ("off", "none", None, False, ""):
+        if (ac_mode not in ("off", "none", None, False, "")
+                and not self.spec.pp_applies_activation_checkpoint):
             raise NotImplementedError(
                 f"activation_checkpoint={ac_mode!r} is not yet wired for the "
-                f"trainer PP path; set gradient_checkpointing.activation_checkpoint "
-                f"to 'none' for pp>1."
+                f"trainer PP path of model {self.spec.name!r}; set "
+                f"gradient_checkpointing.activation_checkpoint to 'none' for pp>1."
             )
         if self.args.train.checkpoint.save_hf_weights:
             raise NotImplementedError(
@@ -1842,10 +1900,11 @@ class BaseTrainer:
     def _pp_train_step(self, data_iterator):
         """Pipeline-parallel training step (``pp > 1``).
 
-        Only the first stage reads the dataloader; the last stage's ``targets``
-        and the all-stage ``attention_mask`` are broadcast across the pipeline
-        group so non-first stages never load (and, for VL, never decode) the
-        identical batch. Heavy vision inputs stay on stage 0.
+        Dataload flavors: default — only the first stage reads the dataloader
+        and targets/attention_mask are broadcast; ``requires_all_rank_input``
+        (MPipe Transpose) — every rank reads the full step batch;
+        ``data.load='single'`` (MPipe) — the dataload runs inside the schedule
+        and each rank's sampler yields only its owned micros.
 
         ``ScheduleGPipe`` owns micro-batching and the forward/backward, so the
         trainer feeds it the **full** global batch (the grad-accum micro-batches
@@ -1857,17 +1916,60 @@ class BaseTrainer:
         (:meth:`_pp_clip_grad_norm`) so every stage scales by the same
         coefficient — required so the tied embed / lm_head copies stay in sync.
         """
-        batch, targets, stop = self._pp_load_first_stage_batch(data_iterator)
-        targets, attention_mask, has_attn = self._pp_prepare_broadcast_inputs(batch, targets, stop)
-        self.state.global_step += 1
-        self._pp_validate_rank_average_targets(targets)
-        n_valid = self._pp_count_valid_tokens(targets)
-        outputs = self._pp_run_schedule(batch, targets, attention_mask, has_attn)
+        if getattr(self.args.data, "load", None) == "single":
+            # ``last_local_tokens`` carries only this rank's micros, so PP
+            # all-reduce for the cross-stage global count.
+            outputs = self.pp_schedule.run_with_dataiterator(
+                data_iterator,
+                getattr(self, "_pp_fsdp_composed", False),
+                dp_group_info=getattr(self, "_dp_group_info", None),
+            )
+            self.state.global_step += 1
+            nt = platform.full((1,), self.pp_schedule.last_local_tokens).to(self.device)
+            platform.all_reduce(nt, self._pp_group_info)
+            n_valid = max(int(nt.item()), 1)
+            self._last_global_tokens = n_valid
+        elif getattr(self.pp_schedule, "requires_all_rank_input", False):
+            outputs, n_valid = self._pp_run_all_rank_input_step(data_iterator)
+        else:
+            batch, targets, stop = self._pp_load_first_stage_batch(data_iterator)
+            targets, attention_mask, has_attn = self._pp_prepare_broadcast_inputs(batch, targets, stop)
+            self.state.global_step += 1
+            self._pp_validate_rank_average_targets(targets)
+            n_valid = self._pp_count_valid_tokens(targets)
+            outputs = self._pp_run_schedule(batch, targets, attention_mask, has_attn)
         self._pp_post_schedule_grad_reduce()
         self._pp_average_plain_dp_grads()
         self._pp_normalize_grads(n_valid)
         grad_norm_value = self._optimizer_step_after_backward(self._pp_clip_grad_norm)
         return {"loss": self._pp_reduce_reported_loss(outputs, n_valid), "grad_norm": grad_norm_value}
+
+    def _pp_run_all_rank_input_step(self, data_iterator):
+        """Load the full step batch on every rank and run an all-rank-fed schedule.
+
+        MPipe Transpose runs the transposed preprocess on every rank, so the
+        heavy (vision) inputs must be present everywhere.
+        """
+        micro_batches = next(data_iterator)
+        batch = self._pp_concat_micro_batches(micro_batches)
+        # End-of-epoch partial grad-accum group: end the epoch.
+        if batch["input_ids"].shape[0] % self.pp_micro_batch_num != 0:
+            raise StopIteration
+        self.state.global_step += 1
+        batch = {
+            key: (value.to(self.device, non_blocking=True) if hasattr(value, "to") else value)
+            for key, value in batch.items()
+        }
+        labels = batch["labels"]
+        targets = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
+        self._pp_validate_rank_average_targets(targets)
+        n_valid = self._pp_count_valid_tokens(targets)
+        run_kwargs = {"targets": targets}
+        for key in self.pp_schedule.kwargs_batch_dim:
+            if key != "targets" and key in batch:
+                run_kwargs[key] = batch[key]
+        outputs = self.pp_schedule.run(batch["input_ids"], **run_kwargs)
+        return outputs, n_valid
 
     def train(self):
         """Main training loop: epoch → step → micro-batch.
@@ -1938,14 +2040,17 @@ class BaseTrainer:
         gradient accumulation. The underlying ``StatefulDataLoader`` tracks
         iteration position, so checkpoint/resume skips consumed batches.
         """
-        batch_buffer = []
-        for batch in self.train_dataloader:
-            batch_buffer.append(batch)
-            if len(batch_buffer) >= self._grad_accum:
+        if getattr(self.args.data, "load", False) == "single":
+            yield from self.train_dataloader
+        else:
+            batch_buffer = []
+            for batch in self.train_dataloader:
+                batch_buffer.append(batch)
+                if len(batch_buffer) >= self._grad_accum:
+                    yield batch_buffer
+                    batch_buffer = []
+            if batch_buffer:
                 yield batch_buffer
-                batch_buffer = []
-        if batch_buffer:
-            yield batch_buffer
 
     def _get_layers(self) -> list:
         """Return the repeating layers for FSDP/AC wrapping.

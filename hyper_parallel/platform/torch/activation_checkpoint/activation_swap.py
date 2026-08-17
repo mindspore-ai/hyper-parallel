@@ -143,6 +143,10 @@ def _check_and_mark_wrapped(module: nn.Module) -> None:
         if getattr(submodule, '_is_wrapped', False):
             if wrapped_callable is not None:
                 _raise_callable_already_wrapped(wrapped_callable)
+            # A param-free module shared across siblings (one rotary embedding
+            # per decoder layer) is never its own region; skip, do not flag.
+            if next(submodule.parameters(recurse=True), None) is None:
+                continue
             warnings.warn(
                 f"Submodule '{getattr(submodule, '_swap_wrapped_module', submodule).__class__.__name__}' of "
                 f"'{module.__class__.__name__}' is already wrapped. "

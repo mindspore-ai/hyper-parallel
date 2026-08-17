@@ -55,3 +55,59 @@ def test_mpipe_transpose_dist_gloo():
     parallel_run([
         TorchCase(_MPIPE_WORKER, "test_mpipe_transpose", num_proc=2)
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
+def test_mpipe_transpose_owner_backward_dist():
+    """
+    Feature: parallel run case in pipeline_parallel.
+    Description: Run ``test_mpipe_transpose_owner_backward`` (MPipe Transpose,
+        owner-does-backward, PP=2, MB=4, trainable T=2) across two NPU ranks.
+    Expectation: every rank's reduced tower gradient + per-stage grads + summed
+        loss match a single-process reference; run success.
+    """
+    parallel_run([
+        TorchCase(_MPIPE_WORKER, "test_mpipe_transpose_owner_backward", num_proc=2)
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_mpipe_transpose_owner_backward_dist_gloo():
+    """
+    Feature: parallel run case in pipeline_parallel.
+    Description: Run ``test_mpipe_transpose_owner_backward`` (MPipe Transpose,
+        owner-does-backward, PP=2, MB=4, trainable T=2) across two gloo/CPU ranks.
+    Expectation: every rank's reduced tower gradient + per-stage grads + summed
+        loss match a single-process reference; run success.
+    """
+    parallel_run([
+        TorchCase(_MPIPE_WORKER, "test_mpipe_transpose_owner_backward", num_proc=2)
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
+def test_mpipe_transpose_owner_backward_accum_dist():
+    """
+    Feature: parallel run case in pipeline_parallel.
+    Description: Run ``test_mpipe_transpose_owner_backward_accum`` (owner-backward,
+        PP=2, 2 gradient-accumulation passes) across two NPU ranks.
+    Expectation: the accumulated tower gradient matches the 2-pass reference (no
+        re-reduce of earlier accumulation passes); run success.
+    """
+    parallel_run([
+        TorchCase(_MPIPE_WORKER, "test_mpipe_transpose_owner_backward_accum", num_proc=2)
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_mpipe_transpose_owner_backward_accum_dist_gloo():
+    """
+    Feature: parallel run case in pipeline_parallel.
+    Description: Run ``test_mpipe_transpose_owner_backward_accum`` (owner-backward,
+        PP=2, 2 gradient-accumulation passes) across two gloo/CPU ranks.
+    Expectation: the accumulated tower gradient matches the 2-pass reference (no
+        re-reduce of earlier accumulation passes); run success.
+    """
+    parallel_run([
+        TorchCase(_MPIPE_WORKER, "test_mpipe_transpose_owner_backward_accum", num_proc=2)
+    ])

@@ -30,6 +30,12 @@ class ModelSpec:
         clip_grad_fn: Optional custom gradient clipping callable.
             When ``None``, hyper's DTensor-aware ``clip_grad_norm_`` is used.
         pipelining_fn: Optional PP setup ``(model, mesh, cfg) -> (schedule, stages)``.
+        pp_applies_activation_checkpoint: Whether ``pipelining_fn`` applies
+            activation checkpointing to the stage it builds. The PP path bypasses
+            ``parallelize_fn``, so the trainer rejects
+            ``gradient_checkpointing.activation_checkpoint`` under ``pp>1``
+            unless the model declares it here; otherwise the setting would
+            silently do nothing.
         state_dict_adapter: Optional class for checkpoint ↔ hyper weight key translation.
         prepare_batch_fn: Optional model-specific transform ``(batch, model) -> batch``
             applied before token counting and forward.
@@ -68,6 +74,7 @@ class ModelSpec:
     parallelize_fn: Optional[Callable] = None
     clip_grad_fn: Optional[Callable] = None
     pipelining_fn: Optional[Callable] = None
+    pp_applies_activation_checkpoint: bool = False
     state_dict_adapter: Optional[Type] = None
     prepare_batch_fn: Optional[Callable] = None
     tp_load_transform_fn: Optional[Callable] = None
