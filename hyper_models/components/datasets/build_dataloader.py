@@ -64,6 +64,9 @@ def build_dataloader(
     micro_batch_size = training_config.micro_batch_size
     random_seed = training_config.seed if training_config.seed is not None else default_seed
     drop_last = bool(getattr(dataloader_target, "drop_last", True))
+    if dataloader_type == "single" and not drop_last:
+        raise ValueError("single sampling currently requires dataloader.drop_last=True")
+
     data_rearrange_map = getattr(dataloader_target, "data_rearrange_map", None)
     data_sharding = bool(getattr(dataloader_target, "data_sharding", False))
     dataloaders = []
@@ -98,12 +101,14 @@ def build_dataloader(
         batch_sampler = build_dataset_batch_sampler(
             total_samples=total_samples,
             micro_batch_size=micro_batch_size,
+            global_batch_size=training_config.global_batch_size,
             dp_world_size=mesh_context.dp_size,
             dp_rank=mesh_context.dp_rank,
             drop_last=drop_last,
             data_rearrange_map=data_rearrange_map,
             sampler_type=dataloader_type,
             data_sharding=data_sharding,
+            seed=random_seed,
         )
         logger.debug(
             "Built batch sampler split=%s, dataset=%s, total_samples=%d, sampler=%s",
@@ -171,6 +176,5 @@ class DataLoader(StatefulDataLoader):
         set_epoch = getattr(self.batch_sampler, "set_epoch", None)
         if callable(set_epoch):
             set_epoch(epoch)
-
 
 __all__ = ["DataLoader", "build_dataloader"]

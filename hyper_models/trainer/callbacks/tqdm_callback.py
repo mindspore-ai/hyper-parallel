@@ -117,7 +117,7 @@ class TqdmCallback(Callback):
         if getattr(self.trainer, "global_rank", 0) != 0:
             return
         self._progress_bar = self._create_progress_bar(
-            total=self.trainer.train_steps,
+            total=self.trainer.train_iters,
             initial=state.global_step,
         )
 

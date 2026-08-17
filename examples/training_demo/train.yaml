@@ -15,12 +15,10 @@ model:
   force_hf: true
 
 training:
-  train_steps: 60
+  train_iters: 5
   train_samples: null
-  # WikiText-2 yields about 37 global steps at 4096 tokens and 16 ranks, so a
-  # second pass lets the default 60-step performance run reach its limit.
-  num_train_epochs: 2
-  global_batch_size: 16
+
+  global_batch_size: 8
   micro_batch_size: 1
   backend: hccl
   init_device: meta
@@ -119,7 +117,7 @@ dataloader:
     _target_: hyper_models.components.datasets.llm.build_llm_get_batch
 
   # single: sequential/rearranged; cyclic: deterministic shuffled epochs.
-  dataloader_type: single # cyclic # 
+  dataloader_type: single # cyclic
 
   # Defaults.
   data_rearrange_map: null
