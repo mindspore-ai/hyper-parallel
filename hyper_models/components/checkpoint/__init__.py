@@ -20,10 +20,26 @@ from hyper_models.components.checkpoint.checkpointer import (
     build_checkpointer,
 )
 from hyper_models.components.checkpoint.config import CheckpointingConfig
+from hyper_models.components.checkpoint.conversion_ops import (
+    AddScalar,
+    ConcatenateWithSections,
+    DeinterleaveGateQKV,
+    DeinterleaveQKV,
+    InterleaveGateQKV,
+    InterleaveQKV,
+    Split,
+)
 
 __all__ = [
+    "AddScalar",
     "CHECKPOINTER_REGISTRY",
     "CheckpointerBase",
     "CheckpointingConfig",
+    "ConcatenateWithSections",
+    "DeinterleaveGateQKV",
+    "DeinterleaveQKV",
+    "InterleaveGateQKV",
+    "InterleaveQKV",
+    "Split",
     "build_checkpointer",
 ]

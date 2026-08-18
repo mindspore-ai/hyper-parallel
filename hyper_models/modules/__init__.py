@@ -14,6 +14,17 @@
 # ============================================================================
 """Public high-performance module interfaces."""
 
-from hyper_models.modules.rms_norm import RMSNorm
+from hyper_models.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
+from hyper_models.modules.gqa_attention import GatedGQAAttention, GQAAttention
+from hyper_models.modules.mla_attention import MLAAttention
+from hyper_models.modules.rms_norm import OffsetRMSNorm, RMSNorm
 
-__all__ = ["RMSNorm"]
+__all__ = [
+    "DeepseekV32DSAAttention",
+    "GQAAttention",
+    "GatedGQAAttention",
+    "MLAAttention",
+    "OffsetRMSNorm",
+    "DSAAttention",
+    "RMSNorm",
+]

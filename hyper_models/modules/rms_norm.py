@@ -14,8 +14,16 @@
 # ============================================================================
 """Root mean square normalization module."""
 
-import torch  # pylint: disable=forbidden-backend-import
+from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
+import torch  # pylint: disable=forbidden-backend-import
+from transformers.core_model_loading import WeightConverter
+
+from hyper_models.components.checkpoint.conversion_ops import AddScalar
+from hyper_models.components.model_transform import module_replacement
 from hyper_models.ops import rms_norm
 
 
@@ -35,4 +43,53 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply NPU-accelerated RMS normalization."""
+        return rms_norm(x, self.weight, self.eps)
+
+
+@module_replacement
+class OffsetRMSNorm(torch.nn.Module):
+    """High-performance replacement for RMSNorm using ``1 + weight``."""
+
+    def __init__(
+        self,
+        *,
+        module: torch.nn.Module,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Build a direct-scale RMSNorm from a unit-offset source module."""
+        super().__init__()
+        del module_fqn, context
+        if not hasattr(module, "weight") or not hasattr(module, "eps"):
+            raise TypeError(
+                "OffsetRMSNorm source module must expose weight and eps"
+            )
+        self.eps = module.eps
+        weight = (
+            torch.empty_like(module.weight)
+            if module.weight.is_meta
+            else module.weight.detach() + 1.0
+        )
+        self.weight = torch.nn.Parameter(
+            weight,
+            requires_grad=module.weight.requires_grad,
+        )
+        self.train(module.training)
+
+    def reset_parameters(self) -> None:
+        """Initialize the direct scale used by randomly initialized models."""
+        torch.nn.init.ones_(self.weight)
+
+    def make_transforms(self) -> list[WeightConverter]:
+        """Convert the unit-offset weight to the NPU operator's direct scale."""
+        return [
+            WeightConverter(
+                source_patterns=["weight"],
+                target_patterns="weight",
+                operations=[AddScalar(1.0)],
+            )
+        ]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply unit-offset RMSNorm with the NPU operator."""
         return rms_norm(x, self.weight, self.eps)
