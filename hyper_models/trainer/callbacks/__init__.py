@@ -23,6 +23,7 @@ from .environ_meter_callback import EnvironMeterCallback
 from .evaluate_callback import EvaluateCallback
 from .garbage_collection_callback import GarbageCollectionCallback
 from .logging_callback import LoggingCallback
+from .profiling_callback import ProfilingCallback
 from .temp_log_callback import TempLogCallback
 from .tqdm_callback import TqdmCallback
 
@@ -33,6 +34,7 @@ __all__ = [
     "EvaluateCallback",
     "GarbageCollectionCallback",
     "LoggingCallback",
+    "ProfilingCallback",
     "TempLogCallback",
     "TqdmCallback",
     "TrainerState",

@@ -346,8 +346,11 @@ def create_profiler(
         profile_memory (bool): Whether to profile the memory usage.
         with_stack (bool): Whether to include the stack trace.
     """
-    import hdfs_io
-    from hdfs_io import copy
+    copy = None
+    if trace_dir.startswith("hdfs://"):
+        # hdfs_io is an optional dependency needed only for remote trace output.
+        import hdfs_io  # pylint: disable=import-outside-toplevel
+        from hdfs_io import copy  # pylint: disable=import-outside-toplevel
 
     def handler_fn(p):
         time = int(datetime.datetime.now().timestamp())
@@ -373,10 +376,13 @@ def create_profiler(
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        get_torch_device().memory._dump_snapshot(gpu_memory_file)
-        logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
+        if profile_memory:
+            get_torch_device().memory._dump_snapshot(gpu_memory_file)
+            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
+            if copy is None:
+                raise ValueError("hdfs_io.copy is required for an HDFS profiling trace directory")
             copy(trace_file, trace_dir)
             logger.info(f"Profiling result uploaded to {trace_dir}.")
 

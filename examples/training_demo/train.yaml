@@ -153,3 +153,14 @@ checkpoint:
 debug:
   check_nan_inf: false
   check_dataset: false
+
+profiling:
+  enabled: false
+  start_step: 3
+  end_step: 4
+  trace_dir: ./outputs/training_demo/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  rank: 0
