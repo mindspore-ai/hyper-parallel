@@ -216,14 +216,17 @@ class TestUpdateModuleHeadCounts:
     def test_divide_and_preserve_invariants(self):
         attn = TinyLlamaAttention(TinyConfig())   # num_heads=4, head_dim=4
         attn.num_key_value_heads = 4
+        attn.num_index_heads = 8
         n = update_module_head_counts(attn, 2, "self_attn")
-        assert n == 2
+        assert n == 3
         assert attn.num_heads == 2
         assert attn.num_key_value_heads == 2
+        assert attn.num_index_heads == 4
         assert attn.head_dim == 4                     # 头维不切
         assert attn.config.num_attention_heads == 4   # config 不改写
         assert attn._hp_full_head_counts == {
-            "num_heads": 4, "num_key_value_heads": 4}
+            "num_heads": 4, "num_index_heads": 8,
+            "num_key_value_heads": 4}
 
     def test_name_variants(self):
         attn = _NamedAttrAttention()

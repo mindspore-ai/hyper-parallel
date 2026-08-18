@@ -320,9 +320,13 @@ TP colwise 切分后每 rank 本地只有 `num_heads/tp` 个头。组件按"前�
 
 - **检测**：plan 中 q/k/v 类投影（含 MLA 的 `q_b_proj`）在 TP 维 colwise
   `Shard(0)` 即命中，与模块类名无关；
+- **嵌套叶子边界**：架构模板可用 `_head_count_owner` 把叶子投影的切分
+  关联到持有 head 属性的父 attention；内置 OpenPangu DSA 模板据此处理
+  `linear_qb`，无需 trainer 再手动除头数；
 - **改写清单**（transformers 全库调研）：Q 侧 `num_heads`/
   `num_attention_heads`/`n_heads`/`num_attn_heads`/`n_head`/`heads`/
-  `num_head`，KV 侧 `num_key_value_heads`/`num_kv_heads`/`kv_heads`；
+  `num_head`/`num_index_heads`，KV 侧 `num_key_value_heads`/
+  `num_kv_heads`/`kv_heads`；
 - **绝不动**：`config`（RoPE 的 `head_dim` 推导不受影响）、`head_dim`
   （不切的维）、`num_key_value_groups`（GQA 比值，TP 不变量）；
 - **幂等**：原值存于 `module._hp_full_head_counts`，重复 apply 不会二次

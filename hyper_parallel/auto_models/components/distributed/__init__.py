@@ -73,6 +73,10 @@ from hyper_parallel.auto_models.components.distributed.param_role import (
     ParameterClassifier,
     ParamRole,
 )
+from hyper_models.components.distributed.openpangu_dsa_template import (
+    OPENPANGU_DSA_ARCHITECTURES,
+    build_openpangu_dsa_specs,
+)
 from hyper_parallel.auto_models.components.distributed.pipelining import (
     AutoPipeline,
     _instantiate_pipeline,
@@ -118,6 +122,7 @@ __all__ = [
     "MeshAxisName",
     "ModuleShardingSpec",
     "NamedPlacement",
+    "OPENPANGU_DSA_ARCHITECTURES",
     "ParameterClassifier",
     "ParamRole",
     "PlacementMismatchError",
@@ -132,6 +137,7 @@ __all__ = [
     "bind_local_expert_forward",
     "build_expert_mesh",
     "build_source_shard_info",
+    "build_openpangu_dsa_specs",
     "check_dispatchable",
     "deepseekv3_ep_compute_fn",
     "mixtral_ep_compute_fn",

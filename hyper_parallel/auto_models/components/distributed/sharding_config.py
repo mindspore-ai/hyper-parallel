@@ -382,6 +382,11 @@ class ModuleShardingSpec:
     # "self" when the boundary module itself is wrapped. Nothing is located
     # silently: the resolved target is always visible here and in the INFO log.
     _resolved_inner_target: Optional[str] = None
+    # Architecture templates whose TP head-sharded projection is represented
+    # by a nested leaf boundary can point at the module that owns the cached
+    # head-count attributes.  The applier adjusts that owner after sharding
+    # the tagged leaf (D-17); None keeps the normal same-boundary detection.
+    _head_count_owner: Optional[str] = None
     # D-09 (05 §6.4.7): EP pass-through for HF-native MoE. A non-empty _ep_stack
     # means per-expert parameters must be pre-stacked into [E, ...] in Phase A.
     # Since the explicit-injection rework the compute side is NOT auto-injected:
