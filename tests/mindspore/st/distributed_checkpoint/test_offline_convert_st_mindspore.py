@@ -12,22 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test DCP async save + load"""
+"""Thin entry for MindSpore offline checkpoint ST (lazy import)."""
+from __future__ import annotations
 
-from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
-
-DCP_ASYNC_SAVE = "dcp_async_save.py"
+import importlib
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_dcp_async_save_load():
-    """
-    Feature: parallel run case in checkpoint
-    Description:
-        1.test_dcp_async_save_load
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(DCP_ASYNC_SAVE, "test_dcp_async_save_load", 12404, 4),
-    ])
+def test_offline_convert_checkpoint_roundtrip_suite_mindspore():
+    """See impl suite."""
+    # pylint: disable=C0415
+    mod = importlib.import_module(
+        "tests.mindspore.st.distributed_checkpoint._offline_convert_st_mindspore_impl")
+    return mod.test_offline_convert_checkpoint_roundtrip_suite_mindspore()

@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+
 """Standard planner implementations for checkpoint save and load."""
+
 from dataclasses import dataclass
 import dataclasses
 import pickle
@@ -24,6 +26,7 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     MetadataIndex,
     ChunkStorageMetadata,
     ChunkInfo,
+    BroadcastInfo,
     TensorStorageMetadata,
     TensorProperties,
     BytesStorageMetadata
@@ -48,15 +51,16 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     chunk_to_area,
     create_chunk_list_for_tensor,
     remove_redundant_plans,
+    infer_same_shard_ranks_for_dtensor,
     flatten_state_dict,
     set_element,
+    dcp_timer_decorator,
+    BROADCAST_INFO,
+    platform,
+    Tensor,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout, infer_slice_area_by_layout
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
-Tensor = platform.Tensor
 
 
 @dataclass(frozen=True)
@@ -70,7 +74,7 @@ class CachedSaveResult:
 class StandardSavePlanner(SavePlanner):
     """Standard implementation of SavePlanner for distributed checkpoint saving."""
 
-    _cached_save_result: dict[str, CachedSaveResult] = {}
+    cached_save_result: dict[str, CachedSaveResult] = {}
 
     def __init__(
             self,
@@ -124,9 +128,10 @@ class StandardSavePlanner(SavePlanner):
         self._cached_plans_key = self._build_cache_key(state_dict)
 
     def _build_cache_key(self, state_dict: dict[str, Any]) -> str:
-        """Build a stable cache namespace from sorted state_dict keys."""
+        """Build a stable cache namespace from state_dict keys."""
         return f"{self.__class__.__name__}:{'||'.join(state_dict.keys())}"
 
+    @dcp_timer_decorator
     def build_local_plan(self) -> SavePlan:
         """
         Create local save plan.
@@ -250,6 +255,7 @@ class StandardSavePlanner(SavePlanner):
             plan.planner_data = self.name_mapping
         return plan
 
+    @dcp_timer_decorator
     def build_global_plan(self, all_plans: list[SavePlan]) -> tuple[list[SavePlan], Metadata]:
         """
         Build global plan from all local plans.
@@ -284,7 +290,9 @@ class StandardSavePlanner(SavePlanner):
 
                     # Validate consistency across ranks
                     if fqn in fqn_to_chunks and (fqn_to_properties[fqn] != properties or fqn_to_size[fqn] != size):
-                        raise ValueError(f"The {fqn} in different rank has different properties and size.")
+                        raise ValueError(f"The {fqn} in different rank has different properties and size, "
+                                         f"properties: {fqn_to_properties[fqn]} != {properties}, "
+                                         f"size: or {fqn_to_size[fqn]} != {size}.")
 
                     # Initialize FQN entry if not exists
                     if fqn not in fqn_to_chunks:
@@ -338,16 +346,16 @@ class StandardSavePlanner(SavePlanner):
         """Return cached finalized plan and metadata when plan caching is enabled."""
         if (
             not self._enable_plan_caching
-            or self._cached_plans_key not in StandardSavePlanner._cached_save_result
+            or self._cached_plans_key not in StandardSavePlanner.cached_save_result
         ):
             return None
-        return StandardSavePlanner._cached_save_result[self._cached_plans_key]
+        return StandardSavePlanner.cached_save_result[self._cached_plans_key]
 
     def cache_result(self, final_plan: SavePlan, metadata: Metadata) -> None:
         """Store finalized plan and metadata in the class-level planner cache."""
         if not self._enable_plan_caching:
             return
-        StandardSavePlanner._cached_save_result[self._cached_plans_key] = CachedSaveResult(
+        StandardSavePlanner.cached_save_result[self._cached_plans_key] = CachedSaveResult(
             final_plan=final_plan,
             metadata=metadata,
         )
@@ -437,17 +445,24 @@ class StandardLoadPlanner(LoadPlanner):
     Iterate state_dict and creates load plans via chunk list for resharding support.
     """
 
-    def __init__(self, allow_partial_load: bool = False):
+    def __init__(self, allow_partial_load: bool = False, broadcast_from_minimum_rank: bool = False):
         """
         Args:
             allow_partial_load (bool): If True, allow loading when checkpoint has fewer keys than state_dict.
                 Default False.
+            broadcast_from_minimum_rank (bool): If True, only the lowest rank holding a
+                shard reads it and the rest receive it by broadcast. Off by default to
+                match :func:`load` and :class:`FileSystemReader`: enabling it on the
+                planner alone makes every other rank skip its read while no broadcast
+                ever runs, leaving those ranks with unloaded tensors.
+                ``configure_planner`` overrides this from :func:`load`.
         """
         self.state_dict: Optional[dict[str, Any]] = None
         self.metadata: Optional[Metadata] = None
         self.is_coordinator: bool = False
         self.rank: int = 0
         self.allow_partial_load = allow_partial_load
+        self.broadcast_from_minimum_rank: bool = broadcast_from_minimum_rank
         self.flatten_state_dict: bool = True
 
     def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
@@ -463,11 +478,80 @@ class StandardLoadPlanner(LoadPlanner):
         self.metadata = metadata
         self.is_coordinator = kwargs.get("is_coordinator", False)
         self.rank = kwargs.get("rank", 0)
+        self.broadcast_from_minimum_rank = kwargs.get("broadcast_from_minimum_rank", self.broadcast_from_minimum_rank)
         self.flatten_state_dict = kwargs.get("flatten_state_dict", True)
         self.original_state_dict = state_dict
         if self.flatten_state_dict:
             state_dict, self.name_mapping = flatten_state_dict(state_dict)
         self.state_dict = state_dict
+
+    def should_load_shard(self, tensor):
+        """
+        Check whether the current rank has to read ``tensor`` from the storage.
+
+        When several ranks hold the same shard, only the minimum rank of the group reads it and
+        the group is recorded on the tensor as ``BROADCAST_INFO``, so that the remaining ranks
+        get their copy through :func:`broadcast_loaded_tensors` instead of the storage.
+
+        Recording the group is a side effect, so call this only for entries the load plan does
+        read: an entry marked here and then skipped is broadcast from a source rank that never
+        loaded it, which overwrites the value every other rank of the group already holds.
+
+        Args:
+            tensor (Any): State dict entry, a DTensor or a tensor carrying ``CHUNK_INFO``.
+
+        Returns:
+            bool: True if this rank reads the shard, False if it receives it by broadcast.
+
+        Raises:
+            ValueError: If the chunk info has an unexpected type, or if the shard group is
+                empty, or if the current rank is not a member of the shard group.
+        """
+        if isinstance(tensor, DTensor):
+            group_ranks = infer_same_shard_ranks_for_dtensor(tensor)
+        elif hasattr(tensor, CHUNK_INFO):
+            if not isinstance(getattr(tensor, CHUNK_INFO), ChunkInfo):
+                raise ValueError(f"The chunk info attached to tensor must be of type {ChunkInfo}")
+            group_ranks = getattr(tensor, CHUNK_INFO).replica_rank_list
+            if group_ranks is None:
+                return True
+        else:
+            return True
+
+        if not group_ranks:
+            raise ValueError("The tensor must be distributed on at least one rank.")
+        if self.rank not in group_ranks:
+            raise ValueError(f"Current rank {self.rank} is not in the same shard group {group_ranks}.")
+
+        load_rank = min(group_ranks)
+        if len(group_ranks) > 1:
+            setattr(tensor, BROADCAST_INFO, BroadcastInfo(group_ranks, load_rank))
+        return self.rank == load_rank
+
+    def _rank_owns_dtensor_shard(self, obj: Any) -> bool:
+        """
+        Check whether the current rank appears in the rank list of a DTensor layout.
+
+        Objects that are not DTensors, and DTensors whose layout does not carry a rank list,
+        are always owned by the current rank.
+
+        Args:
+            obj (Any): State dict entry to check.
+
+        Returns:
+            bool: False only when the layout has a rank list the current rank is absent from.
+        """
+        if not isinstance(obj, DTensor):
+            return True
+        layout = getattr(obj, "layout", None)
+        if layout is None:
+            return True
+        rank_list = getattr(layout, "rank_list", None) if layout else None
+        if rank_list is None:
+            rank_list = getattr(layout, "_rank_list", None)
+        if rank_list is None:
+            return True
+        return self.rank in rank_list
 
     def build_local_plan(self) -> LoadPlan:
         """
@@ -498,14 +582,10 @@ class StandardLoadPlanner(LoadPlanner):
                     raise ValueError(
                         f"Size mismatch between saved {md.size} and current: {obj_size} for {fqn}",
                     )
-                if isinstance(obj, DTensor):
-                    layout = getattr(obj, "layout", None)
-                    rank_list = getattr(layout, "rank_list", None) if layout else None
-                    if rank_list is None and layout is not None:
-                        rank_list = getattr(layout, "_rank_list", None)
-                    if layout is not None and rank_list is not None:
-                        if get_platform().get_rank() not in rank_list:
-                            continue
+                if not self._rank_owns_dtensor_shard(obj):
+                    continue
+                if self.broadcast_from_minimum_rank and not self.should_load_shard(obj):
+                    continue
                 # Both DTensor and platform.Tensor: create local chunks and read items
                 local_chunks = create_chunk_list_for_tensor(obj)
                 requests += create_read_items_for_chunk_list(fqn, md, local_chunks)
@@ -593,24 +673,15 @@ class StandardLoadPlanner(LoadPlanner):
         """
         Apply tensor after reading.
 
-        After read_data copies into the slice, this is no-op when tensor is the
-        same slice. When the backend has no copy_ (e.g. mindspore), read_data
-        passes the loaded slice here; we copy it into the destination slice.
+        Nothing to do: ``_copy_tensor_to_target`` already wrote the loaded slice into the
+        destination, through ``copy_`` when the backend has one and through ``[...]``
+        otherwise, so by the time this runs the state dict entry already holds the data.
+        Kept as the hook other planners override.
 
         Args:
             read_item (ReadItem): The read item that was processed.
             tensor (Any): The tensor data to apply (tensor-like object).
         """
-        if tensor is None:
-            return
-        dest_slice = self.acquire_tensor(read_item)
-        if dest_slice is tensor:
-            return
-        if hasattr(dest_slice, "copy_"):
-            dest_slice.copy_(tensor)
-        else:
-            # Fallback: assign into state_dict if supported
-            dest_slice[...] = tensor
 
     def apply_bytes(self, read_item: ReadItem, value: bytes) -> None:
         """

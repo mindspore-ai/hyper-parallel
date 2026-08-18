@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,10 @@ from typing import Any, Optional, Union
 
 from safetensors import safe_open
 
-from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
+from hyper_parallel.core.distributed_checkpoint.metadata import (
+    Metadata,
+    MetadataIndex,
+)
 from hyper_parallel.core.distributed_checkpoint.planner import (
     LoadPlan,
     LoadPlanner,
@@ -37,9 +40,34 @@ from hyper_parallel.core.distributed_checkpoint.storage import (
     WriteResult,
     METADATA_FILE_NAME,
 )
-from hyper_parallel.core.distributed_checkpoint.util import narrow_tensor_by_index
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
+from hyper_parallel.core.distributed_checkpoint.util import (
+    narrow_tensor_by_index,
+    broadcast_loaded_tensors,
+    dcp_timer_decorator,
+    platform,
+)
+
+from hyper_parallel.platform.platform import (
+    PlatformType,
+)
+
+
+class _MetadataUnpickler(pickle.Unpickler):
+    """Unpickler for the metadata file, remapping module names while loading.
+
+    ``_FOREIGN_MODULE_MAP`` maps a module name recorded in the pickle to the module to import
+    in its place, so that metadata written by a tree where these classes live under other
+    module names still loads. Add an entry per renamed module to support such a tree. It
+    is empty here: metadata written by this tree names bare ``hyper_parallel.*`` modules,
+    which are imported as they are.
+    """
+
+    _FOREIGN_MODULE_MAP = {}
+
+    def find_class(self, module: str, name: str) -> Any:
+        if module in _MetadataUnpickler._FOREIGN_MODULE_MAP:
+            module = _MetadataUnpickler._FOREIGN_MODULE_MAP[module]
+        return super().find_class(module, name)
 
 
 class FileSystemWriter(StorageWriter):
@@ -77,7 +105,7 @@ class FileSystemWriter(StorageWriter):
             **kwargs: Additional keyword arguments (e.g., rank, use_collectives).
         """
         self.is_coordinator = is_coordinator
-        self.rank = kwargs.get("rank") if "rank" in kwargs else get_platform().get_rank()
+        self.rank = kwargs.get("rank") if "rank" in kwargs else platform.get_rank()
         self.use_collectives = kwargs.get("use_collectives", True)
 
     def optimize_local_plan(self, plan: SavePlan) -> SavePlan:
@@ -113,6 +141,7 @@ class FileSystemWriter(StorageWriter):
         return pickle.dumps(data)
 
 
+    @dcp_timer_decorator
     def _write_bytes_items(self, plan: SavePlan, planner: SavePlanner) -> list[WriteResult]:
         """
         Write all BYTE_IO items into one per-rank bytes file.
@@ -203,6 +232,7 @@ class FileSystemWriter(StorageWriter):
             tensor_keys[item.index] = tensor_key
         return tensor_dict, tensor_keys
 
+    @dcp_timer_decorator
     def _write_tensors(
             self,
             plan: SavePlan,
@@ -223,7 +253,6 @@ class FileSystemWriter(StorageWriter):
         if not tensor_dict:
             return []
 
-        platform = get_platform()
         file_name = f"_rank{self.rank}_.safetensors"
         file_path = self.checkpoint_dir / file_name
         platform.save_checkpoint(tensor_dict, str(file_path))
@@ -247,6 +276,7 @@ class FileSystemWriter(StorageWriter):
                 )
         return results
 
+    @dcp_timer_decorator
     def execute_write(self, plan: SavePlan, planner: SavePlanner) -> list[WriteResult]:
         """
         Write data to storage and return per-item storage metadata.
@@ -316,11 +346,11 @@ def _copy_tensor_to_target(
         planner (LoadPlanner): Load planner for committing.
     """
     if hasattr(target_tensor, "copy_"):
+        # for torch and ms, call 'copy_' to copy data to target tensor
         target_tensor.copy_(tensor)
-        planner.apply_tensor(req, target_tensor)
     else:
-        # mindspore or non-tensor: copy via commit path
-        planner.apply_tensor(req, tensor)
+        target_tensor[...] = tensor
+    planner.apply_tensor(req, target_tensor)
 
 
 def _load_bytes_file(
@@ -416,22 +446,20 @@ def _load_torch_tensor_file(
             if tensor_slices:
                 tensor = tensor_file.get_slice(tensor_key)[tensor_slices]
             else:
-                tensor = narrow_tensor_by_index(
-                    tensor_file.get_tensor(tensor_key),
-                    req.storage_offsets,
-                    req.lengths,
-                )
+                # Scalar entries (rank-0 tensors such as the AdamW ``step``) have no slices to
+                # narrow by, and safetensors before 0.4.3 rejects the empty index with
+                # "too many indices for tensor of dimension 0" - read the whole tensor instead.
+                tensor = tensor_file.get_tensor(tensor_key)
             _validate_and_copy_tensor(req, tensor, planner)
 
 
-def _load_platform_tensor_file(
+def _load_ms_tensor_file(
         path: str,
         reqs: list[ReadItem],
         planner: LoadPlanner,
         storage_data: dict[MetadataIndex, StorageInfo],
-        platform: Any,
 ) -> None:
-    """Load tensor slices through the active non-Torch platform adapter."""
+    """Load tensor slices through the ms platform adapter."""
     param_dict = platform.load_checkpoint(path)
     for req in reqs:
         storage_info = _get_storage_info(req, storage_data)
@@ -461,11 +489,10 @@ def _load_tensor_file(
         planner (LoadPlanner): Load planner for resolving and committing tensors.
         storage_data (dict[MetadataIndex, StorageInfo]): Physical storage mapping.
     """
-    platform = get_platform()
     if platform.platform_type == PlatformType.PYTORCH:
         _load_torch_tensor_file(path, reqs, planner, storage_data)
-        return
-    _load_platform_tensor_file(path, reqs, planner, storage_data, platform)
+    else:
+        _load_ms_tensor_file(path, reqs, planner, storage_data)
 
 
 class FileSystemReader(StorageReader):
@@ -479,9 +506,10 @@ class FileSystemReader(StorageReader):
     def __init__(self, checkpoint_dir: Union[Path, str]):
         self.checkpoint_dir = Path(checkpoint_dir) if isinstance(checkpoint_dir, str) else checkpoint_dir
         # Cached storage layout: MetadataIndex -> StorageInfo (torch-aligned)
-        self.storage_data: Optional[dict[MetadataIndex, StorageInfo]] = None
+        self.storage_data: dict[MetadataIndex, StorageInfo] = {}
         self.rank: int = 0
         self.is_coordinator: bool = False
+        self.broadcast_from_minimum_rank = False
 
     def initialize_reader(self, checkpoint_id: Optional[Union[Path, str]] = None) -> None:
         """
@@ -493,6 +521,7 @@ class FileSystemReader(StorageReader):
         if checkpoint_id:
             self.checkpoint_dir = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
 
+    @dcp_timer_decorator
     def load_metadata(self, **kwargs) -> Metadata:
         """
         Load checkpoint metadata from file.
@@ -516,7 +545,7 @@ class FileSystemReader(StorageReader):
         if not metadata_file.exists():
             raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
         with open(metadata_file, "rb") as f:
-            metadata = pickle.load(f)
+            metadata = _MetadataUnpickler(f).load()
         return metadata
 
     def configure_reader(self, metadata: Metadata, is_coordinator: bool, **kwargs) -> None:
@@ -525,7 +554,10 @@ class FileSystemReader(StorageReader):
         # This mirrors torch.filesystem, where reader keeps a storage_data dict.
         self.storage_data = getattr(metadata, "storage_data", None)
         self.is_coordinator = is_coordinator
-        self.rank = kwargs.get("rank") if "rank" in kwargs else get_platform().get_rank()
+        # Do not evaluate get_rank() when an offline caller supplies rank. The
+        # default process group is intentionally not initialized by converters.
+        self.rank = kwargs["rank"] if "rank" in kwargs else platform.get_rank()
+        self.broadcast_from_minimum_rank = kwargs.get("broadcast_from_minimum_rank", self.broadcast_from_minimum_rank)
 
     def optimize_local_plan(self, plan: LoadPlan) -> LoadPlan:
         """
@@ -584,7 +616,13 @@ class FileSystemReader(StorageReader):
             per_file.setdefault(path, []).append(read_item)
         return per_file
 
-    def execute_read(self, plan: LoadPlan, planner: LoadPlanner) -> None:
+    @dcp_timer_decorator
+    def execute_read(
+        self,
+        plan: LoadPlan,
+        planner: LoadPlanner,
+        broadcast_groups: Optional[dict[tuple, Any]] = None,
+    ) -> None:
         """
         Read data from storage.
 
@@ -595,6 +633,9 @@ class FileSystemReader(StorageReader):
         Args:
             plan (LoadPlan): Load plan containing ReadItems.
             planner (LoadPlanner): Load planner for resolving and committing tensors.
+            broadcast_groups (Optional[dict]): Communication groups for broadcast.
+                Only consulted when this reader was configured with
+                ``broadcast_from_minimum_rank``; omit it for a plain read.
         """
         # Group ReadItems by storage file path (like torch per_file)
         per_file = self._group_items_by_file(plan)
@@ -610,3 +651,6 @@ class FileSystemReader(StorageReader):
             else:
                 # TENSOR: one safetensors file per rank
                 _load_tensor_file(path, reqs, planner, self.storage_data)
+
+        if self.broadcast_from_minimum_rank:
+            broadcast_loaded_tensors(planner.state_dict, broadcast_groups)

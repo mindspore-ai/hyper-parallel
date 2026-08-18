@@ -56,7 +56,7 @@ class TraceMinimalCacheSavePlanner(StandardSavePlanner):
     @classmethod
     def clear_cache(cls) -> None:
         """Clear class-level cache for test isolation."""
-        cls._cached_save_result.clear()
+        cls.cached_save_result.clear()
 
 
 def _init_dist_for_case() -> tuple[int, int]:

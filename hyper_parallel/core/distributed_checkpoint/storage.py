@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+
 """Storage interfaces for checkpoint save and load."""
+
 import abc
 from dataclasses import dataclass
 from pathlib import Path
@@ -195,11 +197,19 @@ class StorageReader(abc.ABC):
         """
 
     @abc.abstractmethod
-    def execute_read(self, plan: LoadPlan, planner: LoadPlanner) -> None:
+    def execute_read(
+        self,
+        plan: LoadPlan,
+        planner: LoadPlanner,
+        broadcast_groups: Optional[dict] = None,
+    ) -> None:
         """
         Execute read operation from storage according to the load plan.
 
         Args:
             plan (LoadPlan): The load plan to execute.
             planner (LoadPlanner): The load planner instance for applying loaded data.
+            broadcast_groups (Optional[dict]): Communication groups for broadcast.
+                Only consulted when the reader was configured with
+                ``broadcast_from_minimum_rank``; omit it for a plain read.
         """

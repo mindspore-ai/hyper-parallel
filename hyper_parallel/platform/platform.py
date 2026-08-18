@@ -1103,6 +1103,26 @@ class Platform:
         """Load data into a parameter, handling framework-specific semantics."""
         raise NotImplementedError("Platform subclasses must implement load_into_param")
 
+    @staticmethod
+    def new_group(rank_list):
+        """Create a new communication group with the specified ranks.
+
+        Unlike :meth:`create_group`, the returned group is neither looked up in nor
+        registered to the global group cache, so the caller owns its lifetime and can
+        drop it once the communication through it is done.
+
+        Note:
+            Creating a group is a collective call, so every rank must invoke this with
+            the same groups in the same order.
+
+        Args:
+            rank_list (list): List of ranks to include in the group.
+
+        Returns:
+            The newly created communication group.
+        """
+        raise NotImplementedError("Platform subclasses must implement new_group")
+
     def create_group(self, rank_list):
         """Create or retrieve a communication group with the specified ranks.
 

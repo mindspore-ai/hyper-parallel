@@ -12,14 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Thin entry for PyTorch offline checkpoint ST (lazy import)."""
-from __future__ import annotations
+"""test saver loader"""
+from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
-import importlib
+SAVER_LOADER = "saver_loader.py"
 
 
-def test_offline_convert_checkpoint_roundtrip_suite_torch():
-    """See impl suite."""
-    # pylint: disable=C0415
-    mod = importlib.import_module("tests.torch.checkpoint._offline_convert_st_torch_impl")
-    return mod.test_offline_convert_checkpoint_roundtrip_suite_torch()
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+def test_save_load_checkpoint():
+    """
+    Feature: parallel run case in distributed_checkpoint
+    Description:
+        1.test_save_load_checkpoint
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(SAVER_LOADER, "test_save_load_checkpoint", 12403, 1)
+    ])

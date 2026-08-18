@@ -1069,6 +1069,21 @@ class TorchPlatform(Platform):
         if input_tensor.is_leaf:
             input_tensor.requires_grad = True
 
+    @staticmethod
+    def new_group(rank_list):
+        """Create a brand new process group by calling ``torch.distributed.new_group`` directly.
+
+        The group is not cached in ``EXISTING_COMM_GROUPS``, so the caller owns it and can
+        release it once the communication through it is done.
+
+        Args:
+            rank_list (list): List of global ranks to include in the group.
+
+        Returns:
+            ProcessGroup: The newly created process group.
+        """
+        return dist.new_group(ranks=list(rank_list))
+
     def _create_group(self, rank_list):
         normalized_rank_list = tuple(sorted(rank_list))
         world_rank_list = tuple(range(self.get_world_size()))

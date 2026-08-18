@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,9 +59,28 @@ class ChunkInfo:
     Attributes:
         chunk: Offsets in the global tensor for each dimension.
         global_shape: Sizes of the chunk for each dimension.
+        replica_rank_list: Have the same sharded tensor ranks list.
     """
     chunk: ChunkStorageMetadata
-    global_shape: tuple
+    global_shape: tuple[int]
+    replica_rank_list: Optional[tuple[int]] = None
+
+
+@dataclass(frozen=True)
+class BroadcastInfo:
+    """
+    Info for one same-shard broadcast.
+
+    Attached to a state dict entry by the load planner when several ranks hold the same
+    shard: only ``src_rank`` reads it from storage and the rest of ``group_ranks``
+    receive it through a broadcast.
+
+    Attributes:
+        group_ranks: Rank list within the broadcast domain.
+        src_rank: Rank ID for data transmission within a broadcast domain
+    """
+    group_ranks: tuple
+    src_rank: int
 
 
 @dataclass(frozen=True)

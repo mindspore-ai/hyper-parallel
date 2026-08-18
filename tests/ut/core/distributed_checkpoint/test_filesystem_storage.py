@@ -67,7 +67,7 @@ class TestFilesystemStorage(unittest.TestCase):
         _platform_mod.platform = None
         importlib.reload(planner_mod)
         importlib.reload(fs_mod)
-        planner_mod.StandardSavePlanner._cached_save_result.clear()
+        planner_mod.StandardSavePlanner.cached_save_result.clear()
 
     def test_get_tensor_size_torch_tensor(self):
         """
@@ -200,10 +200,12 @@ class TestFilesystemStorage(unittest.TestCase):
                 )
                 reader = FileSystemReader(ckpt_dir)
                 reader.configure_reader(loaded_md, is_coordinator=True, rank=0)
+                # The rank lookup happens on the shared ``platform`` object
+                # imported from util; patch the method on it.
                 with patch(
-                    "hyper_parallel.core.distributed_checkpoint.standard_planner.get_platform"
-                ) as mock_platform:
-                    mock_platform.return_value.get_rank.return_value = 0
+                    "hyper_parallel.core.distributed_checkpoint.util.platform.get_rank",
+                    return_value=0,
+                ):
                     load_plan = load_planner.build_local_plan()
                 reader.execute_read(load_plan, load_planner)
 

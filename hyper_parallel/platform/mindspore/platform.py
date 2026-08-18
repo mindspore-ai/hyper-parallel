@@ -1440,6 +1440,20 @@ class MindSporePlatform(Platform):
         except (ImportError, RuntimeError, TypeError, ValueError):
             new_group(rank_ids=rank_list, group=group_name)
 
+    @staticmethod
+    def new_group(rank_list):
+        """Create a new communication group (not yet supported on MindSpore).
+
+        Args:
+            rank_list (list): List of global ranks to include in the group.
+
+        Raises:
+            NotImplementedError: MindSpore support is not yet implemented.
+        """
+        raise NotImplementedError(
+            "new_group is not yet supported on MindSpore"
+        )
+
     def _create_group(self, rank_list, pg_options: Any = None):
         world_group = self._maybe_reuse_world_group(rank_list)
         if world_group is not None:

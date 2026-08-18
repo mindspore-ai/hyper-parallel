@@ -43,7 +43,7 @@ class _DummyPlanner:
 
 
 class _FakeSliceFile:
-    """Fake safetensors handle that only supports slice reads."""
+    """Fake safetensors handle recording which read API the reader picks."""
 
     def __init__(self, shape):
         self.shape = shape
@@ -56,21 +56,6 @@ class _FakeSliceFile:
     def get_slice(self, key):
         self.slice_calls.append(key)
         return _FakeTensor(self.shape)
-
-    def get_tensor(self, key):
-        self.tensor_calls.append(key)
-        raise AssertionError("slice path should not call get_tensor")
-
-
-class _FakeTensorFile:
-    """Fake safetensors handle that only supports full-tensor reads."""
-
-    def __init__(self, shape):
-        self.shape = shape
-        self.tensor_calls = []
-
-    def keys(self):
-        return ["layer.weight"]
 
     def get_tensor(self, key):
         self.tensor_calls.append(key)
@@ -123,15 +108,22 @@ def _build_storage_data(storage_info_cls, read_item):
 def test_dcp_safe_open_lazy_tensor_lookup():
     """
     Feature: DCP tensor reader uses safe_open for torch safetensors.
-    Description: Replace whole-file load with lazy key lookup on the safetensors handle.
-    Expectation: Tensor reader resolves the requested fqn through safe_open.get_tensor().
+    Description: A read item with no offsets and no lengths, which is what the planner emits
+        for a zero-dimensional tensor (an optimizer ``step``, say): the slice tuple comes out
+        empty and the whole tensor is wanted. Every other tensor is read through a full range
+        slice per dimension, so this is the one shape that exercises the empty slice.
+    Expectation: The reader still resolves the fqn through the ``safe_open`` handle and never
+        falls back to loading the entire file with ``load_checkpoint``. It asks for the whole
+        tensor with ``get_tensor()`` instead of indexing a slice with the empty tuple, which
+        safetensors below 0.4.3 rejects outright for a scalar and answers with a wrongly shaped
+        tensor for anything else.
     """
     init_dist()
     load_tensor_file, metadata_index_cls, load_item_type_cls, read_item_cls, storage_info_cls = _runtime_imports()
     req = _build_read_item(metadata_index_cls, load_item_type_cls, read_item_cls)
     storage_data = _build_storage_data(storage_info_cls, req)
     planner = _DummyPlanner(target_shape=(2, 2))
-    tensor_file = _FakeTensorFile(shape=(2, 2))
+    tensor_file = _FakeSliceFile(shape=(2, 2))
 
     with patch(
         "hyper_parallel.core.distributed_checkpoint.filesystem_storage.safe_open",
@@ -143,7 +135,9 @@ def test_dcp_safe_open_lazy_tensor_lookup():
         load_tensor_file(str(Path("./dummy.safetensors")), [req], planner, storage_data)
 
     assert tensor_file.tensor_calls == ["layer.weight"]
+    assert not tensor_file.slice_calls
     assert planner.target.copied_from is not None
+    assert planner.target.shape == (2, 2)
 
 
 def test_dcp_safe_open_slice_lookup():
