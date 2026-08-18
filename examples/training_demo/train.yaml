@@ -40,7 +40,7 @@ fsdp_config:
   replicate_params: []
   reshard_after_forward: true
   reshard_after_backward: false
-  defer_fsdp_grad_sync: true
+  requires_grad_sync: true
   enable_fsdp2_prefetch: true
   forward_prefetch_depth: 1
   backward_prefetch_depth: 1

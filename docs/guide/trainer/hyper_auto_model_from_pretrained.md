@@ -171,7 +171,7 @@ def build_parallelize_config() -> DistributedSetup:
         fsdp_config=FSDP2Config(
             dp_shard_size=world_size,
             reshard_after_forward=True,
-            defer_fsdp_grad_sync=True,
+            requires_grad_sync=True,
         ),
         plan_overrides=[],
     )
@@ -282,7 +282,7 @@ fsdp_config:
   dp_shard_size: 8
   replicate_params: []
   reshard_after_forward: true
-  defer_fsdp_grad_sync: true
+  requires_grad_sync: true
 ```
 
 完整示例见 `examples/training_demo/train.yaml`。

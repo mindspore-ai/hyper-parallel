@@ -604,9 +604,13 @@ class BaseTrainer(Stateful, ABC):
                 and num_micro_steps > 1
         ):
             is_last_micro_batch = micro_step == num_micro_steps - 1
+            requires_gradient_sync = (
+                config.fsdp_config.requires_grad_sync
+                or is_last_micro_batch
+            )
             is_hsdp = self.mesh.dp_replicate_size > 1
             for model_part in self.hsdp_model_parts:
-                model_part.set_requires_gradient_sync(is_last_micro_batch)
+                model_part.set_requires_gradient_sync(requires_gradient_sync)
                 model_part.set_is_last_backward(is_last_micro_batch)
                 if is_hsdp:
                     model_part.set_requires_all_reduce(is_last_micro_batch)

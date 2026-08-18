@@ -35,7 +35,7 @@ fsdp_config:
   dp_shard_size: 8
   replicate_params: []
   reshard_after_forward: true
-  defer_fsdp_grad_sync: true
+  requires_grad_sync: true
   comm_fusion: true
 
 mixed_precision:
