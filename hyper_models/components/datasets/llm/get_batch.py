@@ -129,7 +129,7 @@ class LLMBatchProcessor:
         """Rebuild masks and positions after TP token transport."""
         input_ids = batch["input_ids"]
         labels = batch["labels"]
-        loss_mask = labels >= 0
+        loss_mask = batch["loss_mask"] != 0 if "loss_mask" in batch else labels >= 0
         if self.eod_mask_loss:
             loss_mask = loss_mask & (input_ids != self.eod_token_id)
 

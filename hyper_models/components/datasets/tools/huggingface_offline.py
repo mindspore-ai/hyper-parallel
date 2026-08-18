@@ -27,17 +27,17 @@ This module is both importable and runnable as a CLI entry point::
 """
 
 import argparse
-import logging
 import os
 from pathlib import Path
 from typing import Any, List
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.tools.offline_config import OfflinePreparationConfig
 from hyper_models.components.datasets.tools.offline_preparation import (
     prepare_offline_dataset,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 
 def _download_jsonl(config: OfflinePreparationConfig) -> Path:

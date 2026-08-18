@@ -16,20 +16,20 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
 from hyper_models.components.distributed.infrastructure import OnlineDatasetBarrier
 from hyper_models.components.datasets.contracts import RawSample
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.llm.online_utils import (
     load_online_hf_dataset,
     normalize_online_parallel_context,
 )
 from hyper_models.components.datasets.parallel import DatasetParallelContext, build_distributed_dataset
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 
 class OnlineMappingDataset:

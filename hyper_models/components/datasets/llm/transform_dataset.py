@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -27,9 +26,10 @@ from hyper_models.components.datasets.contracts import (
     SampleTransform,
     is_iterable_dataset,
 )
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.utils.constants import IGNORE_INDEX
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 
 def _has_trainable_labels(model_sample: Mapping[str, Any]) -> bool:

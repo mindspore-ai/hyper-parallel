@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 import operator
 import os
 import random
@@ -24,10 +23,12 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Literal, Union, cast
 
 from hyper_parallel.platform import get_platform
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 
 IndexMapping = Union[Mapping[int, int], Sequence[int]]
 SamplerType = Literal["single", "cyclic"]
-logger = logging.getLogger(__name__)
+
+logger = get_dataset_logger(__name__)
 platform = get_platform()
 
 
@@ -38,7 +39,13 @@ def _validate_positive_integer(value: int, name: str) -> None:
 
 
 class _DatasetBatchSampler:
-    """Share validation, DP slicing, epoch, and checkpoint state."""
+    """Share validation, DP slicing, epoch, and checkpoint state.
+
+    BatchSampler splits one global batch across DP ranks
+    → each rank receives its logical Dataset index
+    → Dataset.__getitem__(index)
+    → shuffle_index maps the logical index to a random packed sample
+    """
 
     def __init__(
             self,

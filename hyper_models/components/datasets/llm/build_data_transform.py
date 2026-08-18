@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
@@ -24,10 +23,11 @@ from typing import Any, Literal, TypeAlias
 import torch
 
 from hyper_models.components.datasets.contracts import ModelSample, RawSample, SampleTransform
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 
 LLMDataType = Literal["plaintext", "conversation", "pretokenized"]
 TextKeys: TypeAlias = str | Sequence[str]
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 
 def _get_record_value(sample: Mapping[str, Any], keys: TextKeys) -> Any:

@@ -14,18 +14,19 @@
 # ============================================================================
 """Public LLM and Omni collate-function build stage."""
 
-import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from torch.utils.data import default_collate
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
+
 Feature = Mapping[str, Any]
 CollatedBatch = Mapping[str, Any]
 InternalDataCollator = Callable[[Sequence[Feature]], CollatedBatch]
 _DataCollatorT = TypeVar("_DataCollatorT", bound=InternalDataCollator)
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 
 def build_collate_fn(

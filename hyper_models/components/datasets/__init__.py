@@ -16,10 +16,10 @@
 
 from hyper_models.components.datasets.build_collate_fn import calculate_num_micro_batches
 from hyper_models.components.datasets.build_dataloader import DataLoader
-from hyper_models.components.datasets.dataset_logging import enable_dataset_debug_logging
+from hyper_models.components.datasets.dataset_logging import enable_dataset_logging
 
 __all__ = [
     "DataLoader",
     "calculate_num_micro_batches",
-    "enable_dataset_debug_logging",
+    "enable_dataset_logging",
 ]

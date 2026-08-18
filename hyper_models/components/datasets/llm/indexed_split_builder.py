@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from collections.abc import Callable, Sequence
 from enum import Enum
@@ -25,13 +24,14 @@ from typing import Any, Literal, TypeAlias, cast
 
 import numpy as np
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.llm.indexed_blended_dataset import BlendedDataset
 from hyper_models.components.datasets.llm.indexed_data_config import GPTDatasetConfig
 from hyper_models.components.datasets.llm.indexed_lazy_dataset import LazyDatasetProxy
 from hyper_models.components.datasets.llm.indexed_simple_blended_dataset import SimpleBlendedDataset
 from hyper_models.components.datasets.parallel import DatasetParallelContext, build_distributed_dataset
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 BlendMode: TypeAlias = Literal["no", "inter", "intra"]
 DatasetSplits: TypeAlias = tuple[Any | None, Any | None, Any | None]
@@ -193,7 +193,10 @@ class IndexedDatasetSplitBuilder:
            config: GPTDatasetConfig,
            blend_mode: BlendMode,
    ) -> DatasetSplits:
-       """Parse one blend and dispatch it to the single- or multiple-source path."""
+       """
+       Parse one blend and dispatch it to the single- or multiple-source path.
+       Low level: Index -> Mid level: GPTDataset -> Final: Blend.
+       """
        if len(blend) == 1:
            return self._build_mid_level_dataset_splits(dataset_type, blend[0], split_matrix, sizes, config)
 
@@ -289,14 +292,9 @@ class IndexedDatasetSplitBuilder:
            sizes_for_source: Sequence[int],
            config: GPTDatasetConfig,
    ) -> DatasetSplits:
-       """Build each mid-level split from one low-level indexed Dataset."""
-       if (
-               config.data_lazy_load
-               and self.parallel_context.distributed_enabled
-               and not (
-                   self.parallel_context.data_index_cache
-                   or self.parallel_context.build_on_rank()
-               )
+       """ Build each mid-level split from one low-level indexed Dataset. """
+       if (config.data_lazy_load and self.parallel_context.distributed_enabled and not (
+           self.parallel_context.data_index_cache or self.parallel_context.build_on_rank())
        ):
            return cast(DatasetSplits, (None, None, None))
 
