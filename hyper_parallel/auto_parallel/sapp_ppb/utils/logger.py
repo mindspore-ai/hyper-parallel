@@ -17,6 +17,7 @@ import logging
 
 DEFAULT_STDOUT_FORMAT = '%(levelname)s %(asctime)s %(filename)s:%(lineno)d - %(message)s'
 FORMATTER = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+_HANDLER_NAME = 'sapp_ppb_stream_handler'
 
 
 def setup_logger(name: str, level: int = logging.DEBUG) -> logging.Logger:
@@ -29,10 +30,6 @@ def setup_logger(name: str, level: int = logging.DEBUG) -> logging.Logger:
     Returns:
         The configured :class:`logging.Logger` instance.
     """
-    ch = logging.StreamHandler()
-    ch.setLevel(level)
-    ch.setFormatter(FORMATTER)
-
     def output(self: logging.Logger, message: str, *args: object) -> None:
         """Emit ``message`` at the warning level."""
         self.warning(message, *args)
@@ -40,7 +37,16 @@ def setup_logger(name: str, level: int = logging.DEBUG) -> logging.Logger:
     logging.Logger.output = output
     ppb_logger = logging.getLogger(name)
     ppb_logger.setLevel(level)
-    ppb_logger.addHandler(ch)
+    handler = next(
+        (item for item in ppb_logger.handlers if item.get_name() == _HANDLER_NAME),
+        None,
+    )
+    if handler is None:
+        handler = logging.StreamHandler()
+        handler.set_name(_HANDLER_NAME)
+        ppb_logger.addHandler(handler)
+    handler.setLevel(level)
+    handler.setFormatter(FORMATTER)
 
     return ppb_logger
 
