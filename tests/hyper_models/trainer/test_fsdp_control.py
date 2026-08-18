@@ -14,6 +14,9 @@
 # ============================================================================
 """Tests for BaseTrainer FSDP controls during gradient accumulation."""
 
+# The tests intentionally exercise BaseTrainer's micro-step control helper.
+# pylint: disable=protected-access
+
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -21,12 +24,19 @@ from hyper_models.components.distributed.config import FSDP2Config
 from hyper_models.trainer.base import BaseTrainer
 
 
-def _trainer(*, dp_shard_size: int, dp_replicate_size: int):
+def _trainer(
+        *,
+        dp_shard_size: int,
+        dp_replicate_size: int,
+        requires_grad_sync: bool = True,
+) -> BaseTrainer:
+    """Build a minimal trainer instance for FSDP control tests."""
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.config = SimpleNamespace(
         fsdp_config=FSDP2Config(
             dp_shard_size=dp_shard_size,
             reshard_after_backward=False,
+            requires_grad_sync=requires_grad_sync,
         )
     )
     trainer.mesh = SimpleNamespace(dp_replicate_size=dp_replicate_size)
@@ -47,8 +57,13 @@ def test_model_reshard_defers_until_last_micro_batch() -> None:
     ]
 
 
-def test_fsdp_gradient_sync_runs_only_on_last_micro_batch() -> None:
-    trainer = _trainer(dp_shard_size=2, dp_replicate_size=1)
+def test_fsdp_gradient_sync_runs_only_on_last_micro_batch_when_disabled() -> None:
+    """Verify disabled FSDP synchronization resumes on the final micro batch."""
+    trainer = _trainer(
+        dp_shard_size=2,
+        dp_replicate_size=1,
+        requires_grad_sync=False,
+    )
     model_part = trainer.hsdp_model_parts[0]
 
     trainer._configure_fsdp_gradient_sync(0, 2)
@@ -65,8 +80,54 @@ def test_fsdp_gradient_sync_runs_only_on_last_micro_batch() -> None:
     model_part.set_requires_all_reduce.assert_not_called()
 
 
-def test_hsdp_all_reduce_runs_only_on_last_micro_batch() -> None:
-    trainer = _trainer(dp_shard_size=2, dp_replicate_size=2)
+def test_fsdp_gradient_sync_runs_on_every_micro_batch_when_enabled() -> None:
+    """Verify enabled FSDP synchronization runs on every micro batch."""
+    trainer = _trainer(
+        dp_shard_size=2,
+        dp_replicate_size=1,
+        requires_grad_sync=True,
+    )
+    model_part = trainer.hsdp_model_parts[0]
+
+    trainer._configure_fsdp_gradient_sync(0, 2)
+    trainer._configure_fsdp_gradient_sync(1, 2)
+
+    assert model_part.set_requires_gradient_sync.call_args_list == [
+        call(True),
+        call(True),
+    ]
+    assert model_part.set_is_last_backward.call_args_list == [
+        call(False),
+        call(True),
+    ]
+    model_part.set_requires_all_reduce.assert_not_called()
+
+
+def test_hsdp_all_reduce_runs_only_on_last_micro_batch_when_grad_sync_disabled() -> None:
+    """Verify HSDP all-reduce runs on the final micro batch when grad sync is disabled."""
+    trainer = _trainer(
+        dp_shard_size=2,
+        dp_replicate_size=2,
+        requires_grad_sync=False,
+    )
+    model_part = trainer.hsdp_model_parts[0]
+
+    trainer._configure_fsdp_gradient_sync(0, 2)
+    trainer._configure_fsdp_gradient_sync(1, 2)
+
+    assert model_part.set_requires_all_reduce.call_args_list == [
+        call(False),
+        call(True),
+    ]
+
+
+def test_hsdp_all_reduce_runs_only_on_last_micro_batch_when_grad_sync_enabled() -> None:
+    """Verify HSDP all-reduce remains limited to the final micro batch."""
+    trainer = _trainer(
+        dp_shard_size=2,
+        dp_replicate_size=2,
+        requires_grad_sync=True,
+    )
     model_part = trainer.hsdp_model_parts[0]
 
     trainer._configure_fsdp_gradient_sync(0, 2)

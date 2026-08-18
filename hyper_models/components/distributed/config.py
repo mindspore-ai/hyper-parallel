@@ -45,8 +45,8 @@ class FSDP2Config:
     mp_policy: MixedPrecisionPolicy | None = None
     offload_policy: CPUOffloadPolicy | None = None
     reshard_after_forward: bool = True
-    reshard_after_backward: bool = False
-    defer_fsdp_grad_sync: bool = True
+    reshard_after_backward: bool = True
+    requires_grad_sync: bool = True
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
     enable_fsdp2_prefetch: bool = False
