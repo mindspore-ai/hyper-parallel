@@ -130,6 +130,16 @@ SAC_IGNORED_OPS = {
 } | set(torch._subclasses.functional_tensor.FunctionalTensor.metadata_fns)
 
 
+def ignore_sac_ops(ignore_ops: List[Optional[object]]) -> None:
+    """Add available operators to the selective-checkpoint ignore set.
+
+    Args:
+        ops (List[Optional[object]]): Operators to execute without selective-AC replay accounting.
+            ``None`` entries are ignored for optional-version compatibility.
+    """
+    SAC_IGNORED_OPS.update(op for op in ignore_ops if op is not None)
+
+
 class _CachingTorchDispatchMode(TorchDispatchMode):
     # Used together with _CachedTorchDispatchMode to implement SAC.
     def __init__(self, policy_fn, swap_storage, storage, group_swap=False):
