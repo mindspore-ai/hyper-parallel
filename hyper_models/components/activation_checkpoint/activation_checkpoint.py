@@ -335,6 +335,26 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     )
 
 
+def _make_selective_checkpoint_policy_fn() -> Callable:
+    """Create an isolated selective activation checkpointing policy."""
+    matmul_counts = {False: 0, True: 0}
+
+    def selective_checkpointing_policy(ctx, func, *args, **kwargs):
+        del args, kwargs
+        if func in _SELECTIVE_AC_FORCE_RECOMPUTE_OPS:
+            return CheckpointPolicy.MUST_RECOMPUTE
+        if func in _SELECTIVE_AC_MATMUL_OPS:
+            matmul_counts[ctx.is_recompute] += 1
+            if matmul_counts[ctx.is_recompute] % 2:
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.MUST_RECOMPUTE
+        if func in _SELECTIVE_AC_MUST_SAVE_OPS:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.MUST_RECOMPUTE
+
+    return selective_checkpointing_policy
+
+
 def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]]:
     """Create a per-checkpoint-region selective activation policy context.
 
@@ -350,23 +370,8 @@ def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]
     ensure_fsdp_ops_sac_ignored()
 
     def selective_checkpoint_context_fn():
-        matmul_counts = {False: 0, True: 0}
-
-        def selective_checkpointing_policy(ctx, func, *args, **kwargs):
-            del args, kwargs
-            if func in _SELECTIVE_AC_FORCE_RECOMPUTE_OPS:
-                return CheckpointPolicy.MUST_RECOMPUTE
-            if func in _SELECTIVE_AC_MATMUL_OPS:
-                matmul_counts[ctx.is_recompute] += 1
-                if matmul_counts[ctx.is_recompute] % 2:
-                    return CheckpointPolicy.MUST_SAVE
-                return CheckpointPolicy.MUST_RECOMPUTE
-            if func in _SELECTIVE_AC_MUST_SAVE_OPS:
-                return CheckpointPolicy.MUST_SAVE
-            return CheckpointPolicy.MUST_RECOMPUTE
-
         return platform.create_selective_checkpoint_contexts(
-            selective_checkpointing_policy
+            _make_selective_checkpoint_policy_fn()
         )
 
     return selective_checkpoint_context_fn
@@ -719,11 +724,26 @@ def _apply_activation_checkpointing(
             )
             apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
         else:
-            wrapped_count = _wrap_layer_containers(
-                containers,
-                checkpoint_wrapper,
-                context_fn=make_selective_checkpoint_context_fn(),
-            )
+            if enable_compile:
+                ensure_profiler_ops_sac_ignored()
+                ensure_fsdp_ops_sac_ignored()
+
+                def compile_checkpoint_wrapper(layer):
+                    return checkpoint_wrapper(
+                        layer,
+                        policy_fn=_make_selective_checkpoint_policy_fn(),
+                    )
+
+                wrapped_count = _wrap_layer_containers(
+                    containers,
+                    compile_checkpoint_wrapper,
+                )
+            else:
+                wrapped_count = _wrap_layer_containers(
+                    containers,
+                    checkpoint_wrapper,
+                    context_fn=make_selective_checkpoint_context_fn(),
+                )
             logger.info(
                 "Selective activation checkpointing applied to %d layer(s) in: %s",
                 wrapped_count,
