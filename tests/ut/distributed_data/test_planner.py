@@ -1,0 +1,69 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Unit tests for global-step batch planning."""
+
+import unittest
+
+from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
+from hyper_parallel.distributed_data.schema import SampleMeta, WorkloadCost
+
+
+def _metadata(sample_id: str, encoder_cost: float) -> SampleMeta:
+    return SampleMeta(
+        sample_id=sample_id,
+        source_id="source",
+        data_ref=int(sample_id),
+        modality="image_text",
+        cost_hint=WorkloadCost(encoder=encoder_cost),
+    )
+
+
+class TestDistributedBatchPlanner(unittest.TestCase):
+    """Validate deterministic whole-step planning and balancing."""
+
+    def test_balances_all_microbatches_in_one_optimizer_step(self) -> None:
+        """Heavy samples should be spread across both microbatches."""
+        planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=2, micro_batch_count=2)
+        candidates = [_metadata("0", 8.0), _metadata("1", 7.0), _metadata("2", 1.0), _metadata("3", 1.0)]
+
+        plan = planner.plan(candidates, step=0, cursor_start=0)
+
+        costs = []
+        for micro_batch_index in range(2):
+            samples = plan.samples_for(0, micro_batch_index)
+            costs.append(sum(sample.cost.encoder for sample in samples))
+        self.assertEqual(sorted(costs), [8.0, 9.0])
+        self.assertEqual({sample.meta.sample_id for sample in plan.samples}, {"0", "1", "2", "3"})
+
+    def test_same_metadata_produces_same_replay_id_and_placements(self) -> None:
+        """Planning must be byte-stable for checkpoint replay."""
+        planner = DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=2)
+        candidates = [_metadata(str(index), float(index + 1)) for index in range(4)]
+
+        first = planner.plan(candidates, step=3, cursor_start=6)
+        second = planner.plan(candidates, step=3, cursor_start=6)
+
+        self.assertEqual(first, second)
+        self.assertFalse(hasattr(first, "version"))
+        self.assertEqual(first.replay_id, second.replay_id)
+        for micro_batch_index in range(2):
+            for data_rank in range(2):
+                self.assertEqual(len(first.samples_for(data_rank, micro_batch_index)), 1)
+
+    def test_rejects_incomplete_global_candidate_set(self) -> None:
+        """A planner must never silently construct a partial optimizer step."""
+        planner = DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=2)
+        with self.assertRaisesRegex(ValueError, "requires 4 candidates"):
+            planner.plan([_metadata("0", 1.0)], step=0, cursor_start=0)

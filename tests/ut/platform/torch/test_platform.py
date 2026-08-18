@@ -688,3 +688,30 @@ def test_variable_all_gather_rejects_invalid_metadata(splits, message) -> None:
             torch.ones(1, 2), splits, object()
         )
     mock_all_gather.assert_not_called()
+
+
+def test_variable_all_to_all_single_forwards_splits_and_async_handle() -> None:
+    """Non-differentiable variable A2A should allocate and forward exact splits."""
+    input_tensor = torch.arange(6, dtype=torch.uint8).reshape(3, 2)
+    work = object()
+    with patch(
+        "hyper_parallel.platform.torch.platform.dist.all_to_all_single",
+        return_value=work,
+    ) as mock_all_to_all:
+        output, result_work = TorchPlatform.variable_all_to_all_single(
+            input_tensor,
+            [1, 2],
+            [2, 1],
+            group=mock.sentinel.group,
+            async_op=True,
+        )
+
+    assert output.shape == (3, 2)
+    assert output.dtype == torch.uint8
+    assert result_work is work
+    assert mock_all_to_all.call_args.kwargs == {
+        "output_split_sizes": [2, 1],
+        "input_split_sizes": [1, 2],
+        "group": mock.sentinel.group,
+        "async_op": True,
+    }

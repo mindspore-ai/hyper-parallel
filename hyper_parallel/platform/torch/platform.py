@@ -1201,6 +1201,31 @@ class TorchPlatform(Platform):
         return output, work
 
     @staticmethod
+    def variable_all_to_all_single(
+        input_tensor: Any,
+        input_splits: Sequence[int],
+        output_splits: Sequence[int],
+        group: Any,
+        async_op: bool = False,
+    ) -> tuple[Any, Any]:
+        """Run a non-differentiable variable-split tensor all-to-all."""
+        output = torch.empty(
+            sum(output_splits),
+            *input_tensor.shape[1:],
+            device=input_tensor.device,
+            dtype=input_tensor.dtype,
+        )
+        work = dist.all_to_all_single(
+            output,
+            input_tensor,
+            output_split_sizes=list(output_splits),
+            input_split_sizes=list(input_splits),
+            group=group,
+            async_op=async_op,
+        )
+        return output, work
+
+    @staticmethod
     def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
         """Variable-split all-to-all with autograd support for EP token dispatch/combine."""
         out_total = sum(output_splits)

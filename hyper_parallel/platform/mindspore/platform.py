@@ -243,16 +243,34 @@ def _mindspore_variable_all_to_all(
         group: str,
 ) -> Tensor:
     """Run one synchronous N-D variable all-to-all using dim-zero row splits."""
+    output, _ = _mindspore_variable_all_to_all_single(
+        input_tensor,
+        input_splits,
+        output_splits,
+        group,
+        async_op=False,
+    )
+    return output
+
+
+def _mindspore_variable_all_to_all_single(
+        input_tensor: Tensor,
+        input_splits: Sequence[int],
+        output_splits: Sequence[int],
+        group: str,
+        async_op: bool = False,
+) -> tuple[Tensor, object]:
+    """Launch one N-D variable all-to-all using dim-zero row splits."""
     output_shape = (sum(output_splits), *tuple(input_tensor.shape[1:]))
-    output, _ = comm_func.all_to_all_single(
+    output, handle = comm_func.all_to_all_single(
         output_shape,
         input_tensor,
         output_split_sizes=list(output_splits),
         input_split_sizes=list(input_splits),
         group=group,
-        async_op=False,
+        async_op=async_op,
     )
-    return output
+    return output, handle
 
 
 class _MSDifferentiableAllToAllSingle(_Function):
@@ -1509,6 +1527,29 @@ class MindSporePlatform(Platform):
     @staticmethod
     def all_to_all_single(input_tensor, output_shape, group, async_op=False):
         return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
+
+    @staticmethod
+    def variable_all_to_all_single(
+        input_tensor: Any,
+        input_splits: Sequence[int],
+        output_splits: Sequence[int],
+        group: Any,
+        async_op: bool = False,
+    ) -> tuple[Any, Any]:
+        """Run a non-differentiable variable-split tensor all-to-all."""
+        input_splits, output_splits = _validate_variable_row_splits(
+            input_tensor,
+            input_splits,
+            output_splits,
+            group,
+        )
+        return _mindspore_variable_all_to_all_single(
+            input_tensor,
+            input_splits,
+            output_splits,
+            group,
+            async_op=async_op,
+        )
 
     @staticmethod
     def differentiable_all_to_all_single(

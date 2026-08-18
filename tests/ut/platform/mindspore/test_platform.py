@@ -168,6 +168,32 @@ def test_variable_all_to_all_allocates_nd_output_from_row_splits():
     }
 
 
+def test_variable_all_to_all_single_forwards_splits_and_async_handle() -> None:
+    """The non-differentiable API should preserve row splits and the work handle."""
+    input_tensor = _tensor()
+    expected = _tensor()
+    work = object()
+    with mock.patch(
+        "hyper_parallel.platform.mindspore.platform.get_group_size", return_value=2
+    ), mock.patch(
+        "hyper_parallel.platform.mindspore.platform.comm_func.all_to_all_single",
+        return_value=(expected, work),
+    ) as mock_all_to_all:
+        output, result_work = MindSporePlatform.variable_all_to_all_single(
+            input_tensor,
+            [1, 2],
+            [2, 1],
+            "group",
+            async_op=True,
+        )
+
+    assert output is expected
+    assert result_work is work
+    assert mock_all_to_all.call_args.kwargs["input_split_sizes"] == [1, 2]
+    assert mock_all_to_all.call_args.kwargs["output_split_sizes"] == [2, 1]
+    assert mock_all_to_all.call_args.kwargs["async_op"] is True
+
+
 def test_variable_all_to_all_backward_swaps_splits():
     """Backward routes gradients through the exact reverse A2A."""
     grad_output = _tensor()

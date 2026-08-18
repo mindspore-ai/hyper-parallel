@@ -715,6 +715,29 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement all_to_all_single")
 
     @staticmethod
+    def variable_all_to_all_single(
+        input_tensor: Any,
+        input_splits: Sequence[int],
+        output_splits: Sequence[int],
+        group: Any,
+        async_op: bool = False,
+    ) -> tuple[Any, Any]:
+        """Run a non-differentiable variable-split all-to-all.
+
+        Args:
+            input_tensor: Input shaped ``[sum(input_splits), *feature_dims]``.
+            input_splits: Dim-zero rows sent to each group rank.
+            output_splits: Dim-zero rows received from each group rank.
+            group: Process group used by the collective.
+            async_op: Whether to return before communication completes.
+
+        Returns:
+            Tuple ``(output, work)``. Call ``work.wait()`` before reading an
+            asynchronous output.
+        """
+        raise NotImplementedError("Platform subclasses must implement variable_all_to_all_single")
+
+    @staticmethod
     def differentiable_variable_all_gather(
             input_tensor: Any, output_splits: Sequence[int], group: Any) -> Any:
         """Gather variable dim-zero shards on every rank with gradient support.
