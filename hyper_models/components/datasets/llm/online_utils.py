@@ -16,15 +16,15 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.parallel import DatasetParallelContext
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 _ONLINE_FILE_FORMATS = {
     ".arrow": "arrow",

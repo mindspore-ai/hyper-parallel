@@ -16,15 +16,15 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.llm.online_iterable_dataset import build_online_iterable_dataset
 from hyper_models.components.datasets.llm.online_mapping_dataset import build_online_mapping_dataset
 from hyper_models.components.datasets.parallel import DatasetParallelContext
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 _ONLINE_DATASET_BUILDERS: dict[str, Callable[..., Any]] = {
     "mapping": build_online_mapping_dataset,

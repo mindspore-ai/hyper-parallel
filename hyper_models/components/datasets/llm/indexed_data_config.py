@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -26,8 +25,9 @@ from typing import Any
 import numpy as np
 
 from hyper_parallel.platform import get_platform
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 platform = get_platform()
 
 
@@ -103,6 +103,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     reset_attention_mask: bool = False
     eod_mask_loss: bool = False
     create_attention_mask: bool = True
+    drop_last_partial_validation_sequence: bool = True
+    add_extra_token_to_sequence: bool = True
+    allow_ambiguous_pad_tokens: bool = False
     dataset_margin: float = 1.005
     skip_data_check: bool = False
     reuse_idx: bool = False
@@ -115,6 +118,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         """Validate the blended Dataset fields followed by GPT-specific fields."""
         super().__post_init__()
 
+        if self.sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
         if self.tokenizer is None and not self.mock:
             raise ValueError("Attribute 'tokenizer' must not be None")
 
@@ -262,6 +267,9 @@ def build_gpt_dataset_config(
             reset_attention_mask=data_config.get("reset_attention_mask", False),
             eod_mask_loss=data_config.get("eod_mask_loss", False),
             create_attention_mask=data_config.get("create_attention_mask_in_dataloader", True),
+            drop_last_partial_validation_sequence=data_config.get("drop_last_partial_validation_sequence", True),
+            add_extra_token_to_sequence=data_config.get("add_extra_token_to_sequence", True),
+            allow_ambiguous_pad_tokens=data_config.get("allow_ambiguous_pad_tokens", False),
             dataset_margin=data_config.get("dataset_margin", 1.005),
             skip_data_check=data_config.get("skip_data_check", False),
             is_dataset_from_mr=data_config["is_dataset_from_mr"],

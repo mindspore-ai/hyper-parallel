@@ -20,63 +20,75 @@ from collections.abc import Sequence
 
 import numpy as np
 
-try:
-    from hyper_models.components.datasets.llm import _indexed_helpers_cpp
-except ImportError:  # The native helper is optional for source-only and test environments.
-    _indexed_helpers_cpp = None
+from hyper_models.components.datasets.llm._indexed_helpers_cpp import (
+    build_blending_indices as _build_blending_indices_cpp,
+    build_sample_index_int32,
+    build_sample_index_int64,
+)
+
+
+def build_sample_index(
+    sequence_lengths: np.ndarray,
+    document_index: np.ndarray,
+    sequence_length: int,
+    num_epochs: int,
+    num_tokens_per_epoch: int,
+    drop_last_partial_sequence: bool,
+    add_extra_token_to_sequence: bool,
+) -> np.ndarray:
+    """Build the 2-D sample index using the properly typed templated C++ helper.
+
+    Args:
+        sequence_lengths (np.ndarray): The 1-D array of document lengths.
+
+        document_index (np.ndarray): The 1-D array of document indices.
+
+        sequence_length (int): The sequence length.
+
+        num_epochs (int): The number of epochs.
+
+        num_tokens_per_epoch (int): The number of tokens per epoch.
+
+        drop_last_partial_sequence (bool): Whether to omit the last partial sequence in the sample
+            index should it exist.
+
+        add_extra_token_to_sequence (bool): Whether to build samples with sequence length
+            ``sequence_length + 1``.
+
+    Returns:
+        np.ndarray: The 2-D sample index.
+    """
+    sample_index_max = max(document_index.shape[0], int(sequence_lengths.max()))
+    sample_index_builder = (
+        build_sample_index_int32 if sample_index_max <= np.iinfo(np.int32).max else build_sample_index_int64
+    )
+    sample_index = sample_index_builder(
+        sequence_lengths,
+        document_index,
+        sequence_length,
+        num_epochs,
+        num_tokens_per_epoch,
+        drop_last_partial_sequence,
+        add_extra_token_to_sequence,
+    )
+    return sample_index
 
 
 def build_blending_indices(
     dataset_index: np.ndarray,
     dataset_sample_index: np.ndarray,
     weights: Sequence[float],
-    num_datasets: int,
-    size: int,
-    verbose: bool = False,
 ) -> None:
     """Build deterministic weighted blend indices.
 
     Args:
-        dataset_index: Output source-Dataset indices with shape ``(size,)``.
-        dataset_sample_index: Output per-source sample indices with shape
-            ``(size,)``.
+        dataset_index: Output source-Dataset ID for each blended sample.
+        dataset_sample_index: Output per-source sample ID for each blended sample.
         weights: Normalized source-Dataset weights.
-        num_datasets: Number of source Datasets.
-        size: Number of blended samples to schedule.
-        verbose: Compatibility argument from the compiled helper.
-
-    Raises:
-        ValueError: If input sizes or output buffers are inconsistent.
     """
-    if num_datasets <= 0 or len(weights) != num_datasets:
-        raise ValueError("num_datasets must be positive and match weights")
-    if size < 0:
-        raise ValueError("size must be non-negative")
-    if dataset_index.shape != (size,) or dataset_sample_index.shape != (size,):
-        raise ValueError("blend index output buffers must have shape (size,)")
-    if dataset_index.dtype != np.int16 or dataset_sample_index.dtype != np.int64:
-        raise ValueError("blend index output buffers must use int16 and int64 dtypes")
-
-    if _indexed_helpers_cpp is not None:
-        weight_array = np.asarray(weights, dtype=np.float64)
-        _indexed_helpers_cpp.build_blending_indices(
-            dataset_index=dataset_index,
-            dataset_sample_index=dataset_sample_index,
-            weights=weight_array,
-            num_datasets=num_datasets,
-            size=size,
-            verbose=verbose,
-        )
-        return
-
-    # Extended precision preserves the same tie-breaking observed from
-    # the compiled helper for decimal weights such as 0.1/0.2/0.7.
-    weight_array = np.asarray(weights, dtype=np.longdouble)
-    current_samples = np.zeros(num_datasets, dtype=np.int64)
-    for sample_index in range(size):
-        sample_position = max(float(sample_index), 1.0)
-        sampling_errors = weight_array * sample_position - current_samples
-        dataset_id = int(np.argmax(sampling_errors))
-        dataset_index[sample_index] = dataset_id
-        dataset_sample_index[sample_index] = current_samples[dataset_id]
-        current_samples[dataset_id] += 1
+    weight_array = np.asarray(weights, dtype=np.float64)
+    _build_blending_indices_cpp(
+        dataset_index=dataset_index,
+        dataset_sample_index=dataset_sample_index,
+        weights=weight_array,
+    )

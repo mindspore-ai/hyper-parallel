@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
+
+logger = get_dataset_logger(__name__)
 
 
 class LazyDatasetProxy:

@@ -19,11 +19,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from hyper_parallel.platform import get_platform
 
 RankCondition = bool | Callable[[], bool]
+DatasetLogLevel = Literal["debug", "info", "warn"]
 _DATASET_LOGGER_NAME = "hyper_models.components.datasets"
 _DATASET_LOG_FORMAT = (
     "[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d] "
@@ -96,17 +97,22 @@ def get_dataset_logger(name: str) -> DatasetLogger:
     return DatasetLogger(logging.getLogger(name), {})
 
 
-def enable_dataset_debug_logging(ranks: Iterable[int] | None = (0,)) -> None:
-    """Enable uniformly formatted Dataset DEBUG logs on selected ranks.
+def enable_dataset_logging(level: DatasetLogLevel, ranks: Iterable[int] | None = (0,)) -> None:
+    """Enable uniformly formatted Dataset logs at the configured level.
 
     Args:
+        level: Minimum Dataset log level: ``debug``, ``info``, or ``warn``.
         ranks: Global ranks allowed to emit Dataset DEBUG records. Pass
             ``None`` to allow every rank. Dataset records above DEBUG remain
             visible on every rank.
 
     Raises:
-        ValueError: If ``ranks`` is empty or contains an invalid rank.
+        ValueError: If ``level`` is unsupported, or ``ranks`` is invalid.
     """
+    log_levels = {"debug": logging.DEBUG, "info": logging.INFO, "warn": logging.WARNING}
+    if level not in log_levels:
+        raise ValueError(f"Unsupported Dataset log level: {level!r}")
+
     if ranks is None:
         selected_ranks = None
     else:
@@ -117,12 +123,14 @@ def enable_dataset_debug_logging(ranks: Iterable[int] | None = (0,)) -> None:
 
     _DEBUG_RANK_FILTER.ranks = selected_ranks
     dataset_logger = logging.getLogger(_DATASET_LOGGER_NAME)
-    dataset_logger.setLevel(logging.DEBUG)
+    dataset_logger.setLevel(log_levels[level])
     dataset_logger.propagate = False
     dataset_handlers = [handler for handler in dataset_logger.handlers if _DEBUG_RANK_FILTER in handler.filters]
     if not dataset_handlers:
         dataset_handler = logging.StreamHandler()
-        dataset_handler.setLevel(logging.DEBUG)
         dataset_handler.setFormatter(_DatasetLogFormatter(_DATASET_LOG_FORMAT, datefmt=_DATASET_DATE_FORMAT))
         dataset_handler.addFilter(_DEBUG_RANK_FILTER)
         dataset_logger.addHandler(dataset_handler)
+        dataset_handlers.append(dataset_handler)
+    for dataset_handler in dataset_handlers:
+        dataset_handler.setLevel(log_levels[level])

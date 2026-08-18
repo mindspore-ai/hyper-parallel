@@ -522,7 +522,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             is_shard=is_shard_for_ns,
             layout_spec=hsdp_group.layout_spec,
         )
-        logger.info_rank0(f'[Hyper-optimizer] hsdp_assign: {hsdp_assign}')
+        logger.debug_rank0(f'[Hyper-optimizer] hsdp_assign: {hsdp_assign}')
 
         # Build broadcast reverse mapping for replicated groups
         if hsdp_assign.is_replicated and hsdp_assign.replicate_pgs:

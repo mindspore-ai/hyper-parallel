@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 
+PYTHON ?= python3
 CXXFLAGS += -O3 -Wall -Wextra -shared -std=c++11 -fPIC -fdiagnostics-color
-CPPFLAGS += $(shell python3 -m pybind11 --includes)
+CPPFLAGS += $(shell $(PYTHON) -m pybind11 --includes)
 LIBRARY_NAME = _indexed_helpers_cpp
-LIBRARY_EXTENSION = $(shell python3-config --extension-suffix)
+LIBRARY_EXTENSION = $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 OUTPUT = ../$(LIBRARY_NAME)$(LIBRARY_EXTENSION)
 
 .PHONY: all clean
