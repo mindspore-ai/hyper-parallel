@@ -70,6 +70,10 @@ from hyper_parallel.auto_models.components.distributed.sharding_config import (
     _multi_dim,
     _normalize_out_fields,
 )
+from hyper_parallel.auto_models.components.distributed.openpangu_dsa_template import (
+    OPENPANGU_DSA_ARCHITECTURES,
+    build_openpangu_dsa_specs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -324,9 +328,10 @@ class ShardingPlanner:
         *,
         tp_size: int,
         mesh_dim_names: Tuple[str, ...],
+        arch: Optional[str] = None,
     ) -> None:
         """Normalize overrides and finish placement-dependent boundary metadata."""
-        self._merge_plan_overrides(plan, model)
+        self._merge_plan_overrides(plan, model, arch=arch)
         self._normalize_contract_fields(plan)
         self._finalize_tp_local_attr_plans(plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names)
         self._finalize_deferred_biases(plan, model, mesh_dim_names)
@@ -444,7 +449,8 @@ class ShardingPlanner:
         # Phase 4.5: unified override pass — merge mode (unset fields inherit
         # the derived spec) / insert mode (fully self-declared only) / glob.
         self._finalize_boundary_specs(
-            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names
+            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names,
+            arch=arch,
         )
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
@@ -1121,7 +1127,7 @@ class ShardingPlanner:
     def _is_glob_key(cls, key: str) -> bool:
         return any(c in key for c in cls._GLOB_CHARS)
 
-    def _merge_plan_overrides(self, plan: ShardingPlan, model) -> None:
+    def _merge_plan_overrides(self, plan: ShardingPlan, model, arch=None) -> None:
         """Unified override pass, executed before Phase 5 and the D-14 checks.
 
         Three modes:
@@ -1162,10 +1168,20 @@ class ShardingPlanner:
         - user spec objects are never mutated (merge reads them, insert
           deep-copies them) — plan() can be called repeatedly.
         """
-        entries: List[Tuple[str, ModuleShardingSpec, str]] = [
+        entries: List[Tuple[str, ModuleShardingSpec, str]] = []
+        # ``derive=False`` is the pure declaration mode: only explicit
+        # plan_overrides may enter the plan.  Architecture templates are a
+        # form of derivation as well, and leaking the OpenPangu DSA template
+        # here makes activation-only CP plans unexpectedly own parameters.
+        if self._derive and arch in OPENPANGU_DSA_ARCHITECTURES:
+            entries.extend(
+                (fqn, spec, "openpangu_dsa_template")
+                for fqn, spec in build_openpangu_dsa_specs(model).items()
+            )
+        entries.extend([
             (fqn, spec, "plan_overrides")
             for fqn, spec in self._plan_overrides.items()
-        ]
+        ])
         if not entries:
             return
 
@@ -1338,7 +1354,7 @@ class ShardingPlanner:
         for attr in ShardingPlanner._CONTRACT_FIELDS:
             ShardingPlanner._merge_contract_field(derived, user_spec, attr)
         for attr in ("local_compute_fn", "inner_target", "inner_wrapper",
-                     "inner_out_src", "region_dispatch", "tp_divide_attrs"):
+                     "inner_out_src", "region_dispatch", "tp_divide_attrs", "_head_count_owner"):
             value = getattr(user_spec, attr)
             if value is not None:
                 setattr(derived, attr, value)

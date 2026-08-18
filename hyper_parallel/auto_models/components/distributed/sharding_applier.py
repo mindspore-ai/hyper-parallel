@@ -84,6 +84,7 @@ from hyper_parallel.auto_models.components.distributed.ep_compute import (
 from hyper_parallel.auto_models.components.distributed.source_shard import build_source_shard_info
 from hyper_parallel.auto_models.components.distributed.head_count import (
     maybe_update_head_counts,
+    update_module_head_counts,
 )
 from hyper_parallel.auto_models.components.distributed.infrastructure import MeshContext
 from hyper_parallel.auto_models.components.distributed.local_compute_context import (
@@ -434,6 +435,13 @@ def _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode):
                     mesh,
                     plan.mesh_dim_names,
                 )
+                # TODO(liuluobin): 集成到maybe_update_head_counts里
+                head_count_owner = getattr(spec, "_head_count_owner", None)
+                if head_count_owner is not None:
+                    owner = _resolve_module(part, head_count_owner)
+                    update_module_head_counts(
+                        owner, tp_mesh.size() if tp_mesh is not None else 1,
+                        head_count_owner)
 
 
 def _apply_plan_special_handlers(models, plan, mesh):
@@ -1277,11 +1285,6 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         compute_fn = original_forward
 
 
-    out_src_placements = None
-    if spec.out_src:
-        out_src_named = next(iter(spec.out_src.values()))
-        out_src_placements = tuple(resolve_placements(out_src_named, mesh_dim_names))
-
     dispatch_through = bool(getattr(spec, "region_dispatch", None))
     if validate_mode and not dispatch_through:
         install_local_compute_forward_adapters(module, exclude=exclude_subtrees)
@@ -1343,6 +1346,12 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         # from_local wrap from Step 3 must also be unwrapped here)
         if isinstance(output, DTensor):
             output = output.to_local()
+        elif isinstance(output, (tuple, list)):
+            local_output = [
+                value.to_local() if isinstance(value, DTensor) else value
+                for value in output
+            ]
+            output = tuple(local_output) if isinstance(output, tuple) else local_output
         # D-22: deferred rowwise biases — added once after the exit reduction
         return _maybe_add_deferred_biases(module, spec, output)
 

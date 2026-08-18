@@ -296,7 +296,7 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[Optional[Tensor], ...]:
-        """Backward pass (vectorized implementation)."""
+        """Backward pass without advanced indexing writes."""
         (
             _,
             log_probs_local,
@@ -309,23 +309,16 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
 
         reduction = ctx.reduction
         ignore_index = ctx.ignore_index
-        _ = ctx.local_vocab_size
         vocab_start = ctx.vocab_start
-        vocab_end = ctx.vocab_end
-        _ = ctx.mesh
-        _ = ctx.mesh_dim
-
-        batch_size = target.numel()
         target_flat = target.flatten()
-
         softmax_local = log_probs_local.exp()
-
         ignore_mask = target_flat != ignore_index
 
         if weight is not None:
-            sample_weights = weight[target_flat]
+            safe_target = torch.where(ignore_mask, target_flat, torch.zeros_like(target_flat))
+            sample_weights = weight[safe_target]
         else:
-            sample_weights = None
+            sample_weights = torch.ones_like(target_flat, dtype=softmax_local.dtype)
 
         if reduction == "mean":
             grad_scale = grad_output / total_weight.clamp(min=1e-12)
@@ -334,40 +327,14 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
         else:
             grad_scale = grad_output.flatten()
 
-        in_vocab_mask = (target_flat >= vocab_start) & (target_flat < vocab_end) & ignore_mask
-
-        if reduction == "none":
-            grad_scale_expanded = grad_scale.unsqueeze(-1)
-            if sample_weights is not None:
-                grad_scale_expanded = grad_scale_expanded * sample_weights.unsqueeze(-1)
-            grad_input = softmax_local * grad_scale_expanded
-        else:
-            if sample_weights is not None:
-                grad_scale = grad_scale * sample_weights.unsqueeze(-1)
-            grad_input = softmax_local * grad_scale.unsqueeze(-1)
-
-        local_targets = torch.where(in_vocab_mask, target_flat - vocab_start, torch.zeros_like(target_flat))
-
-        if in_vocab_mask.any():
-            row_indices = torch.arange(batch_size, device=target.device, dtype=torch.long)
-
-            if reduction == "none":
-                if sample_weights is not None:
-                    grad_values = -grad_scale * sample_weights
-                else:
-                    grad_values = -grad_scale
-            else:
-                grad_values = -grad_scale.expand_as(target_flat)
-
-            grad_input = grad_input.contiguous()
-            grad_input[row_indices[in_vocab_mask], local_targets[in_vocab_mask]] += grad_values[in_vocab_mask]
-
-        if not ignore_mask.all():
-            if reduction == "none":
-                grad_input[~ignore_mask] = 0.0
-            else:
-                ignore_indices_expanded = (~ignore_mask).unsqueeze(-1).expand_as(grad_input)
-                grad_input[ignore_indices_expanded] = 0.0
+        local_vocab_indices = torch.arange(
+            ctx.local_vocab_size,
+            dtype=target_flat.dtype,
+            device=target_flat.device,
+        )
+        local_target_mask = target_flat.unsqueeze(-1) == (local_vocab_indices + vocab_start)
+        row_scale = grad_scale * sample_weights * ignore_mask.to(softmax_local.dtype)
+        grad_input = (softmax_local - local_target_mask.to(softmax_local.dtype)) * row_scale.unsqueeze(-1)
 
         return grad_input, None, None, None, None, None, None, None
 
@@ -381,6 +348,8 @@ def distributed_cross_entropy(
     reduce: Optional[bool] = None,
     reduction: str = "mean",
     label_smoothing: float = 0.0,
+    mesh: DeviceMesh = None,
+    vocab_size: int = None,
 ) -> Tensor:
     """Distributed cross_entropy main entry (PyTorch version).
 
@@ -398,8 +367,6 @@ def distributed_cross_entropy(
         Loss tensor.
     """
     input_dtensor = None
-    mesh = None
-    vocab_size = None
 
     if _is_dtensor(input_tensor):
         if not _is_shard_on_last_dim(input_tensor):
@@ -426,21 +393,24 @@ def distributed_cross_entropy(
         _is_floating_torch,
     )
 
+    input_local = input_tensor
     if input_dtensor is not None:
         input_local = _get_local_tensor(input_dtensor)
-        local_vocab_size = input_local.shape[-1]
 
-        if input_dtensor.ndim > 2:
-            input_local = input_local.reshape(-1, local_vocab_size)
-            target = target.reshape(-1)
-    else:
-        raise ValueError(
-            "input must be a DTensor when using loss_parallel. "
-            f"Got type: {type(input_tensor)}"
-        )
+    local_vocab_size = input_local.shape[-1]
 
-    strict = _get_loss_parallel_strict()
-    _validate_mesh_and_shard(input_dtensor, strict)  # type: ignore
+    if input_local.ndim > 2:
+        input_local = input_local.reshape(-1, local_vocab_size)
+        target = target.reshape(-1)
+    # else:
+    #     raise ValueError(
+    #         "input must be a DTensor when using loss_parallel. "
+    #         f"Got type: {type(input_tensor)}"
+    #     )
+
+
+    # strict = _get_loss_parallel_strict()
+    # _validate_mesh_and_shard(input_dtensor, strict)  # type: ignore
 
     mesh_dim = 0
 
