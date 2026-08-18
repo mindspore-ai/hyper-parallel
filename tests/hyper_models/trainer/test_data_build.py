@@ -49,6 +49,7 @@ def _model_target(
     distributed_setup: object,
     peft_config: object,
     activation_checkpoint: object,
+    activation_swap: str,
 ) -> SimpleNamespace:
     """Return a model object for delegation testing."""
     return SimpleNamespace(
@@ -56,6 +57,7 @@ def _model_target(
         distributed_setup=distributed_setup,
         peft_config=peft_config,
         activation_checkpoint=activation_checkpoint,
+        activation_swap=activation_swap,
     )
 
 
@@ -92,6 +94,7 @@ def test_trainer_model_stage_delegates_to_config_target() -> None:
     assert trainer.model.distributed_setup is distributed_setup
     assert trainer.model.peft_config is peft_config
     assert trainer.model.activation_checkpoint == "full"
+    assert trainer.model.activation_swap == "none"
     assert trainer.model_parts == [trainer.model]
     assert trainer.model_config is trainer.model.config
     assert trainer.hsdp_model_parts == []
@@ -110,6 +113,7 @@ def test_trainer_model_stage_passes_off_activation_checkpointing_mode() -> None:
     trainer._build_model()
 
     assert trainer.model.activation_checkpoint == "off"
+    assert trainer.model.activation_swap == "none"
 
 
 def test_trainer_optimizer_stage_passes_runtime_context() -> None:

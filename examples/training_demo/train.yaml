@@ -69,6 +69,8 @@ mixed_precision:
 activation_checkpoint:
   mode: full
 
+activation_swap: none # attention, none
+
 compile:
   enabled: false
   mode: default
