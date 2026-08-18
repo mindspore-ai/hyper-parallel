@@ -35,16 +35,16 @@ def _get_train_valid_test_num_samples(training_config: Any) -> tuple[int, int, i
         raise ValueError("Offline indexed Datasets require a training configuration")
 
     global_batch_size = training_config.global_batch_size
-    if training_config.train_steps is not None:
-        train_steps = training_config.train_steps
+    if training_config.train_iters is not None:
+        train_iters = training_config.train_iters
     elif training_config.train_samples:
-        train_steps = training_config.train_samples // global_batch_size
+        train_iters = training_config.train_samples // global_batch_size
     else:
-        raise ValueError("training.train_steps and training.train_samples cannot both be None")
+        raise ValueError("training.train_iters and training.train_samples cannot both be None")
 
-    train_samples = training_config.train_samples or train_steps * global_batch_size
+    train_samples = training_config.train_samples or train_iters * global_batch_size
     eval_iters = training_config.eval_iters
-    valid_iters = (train_steps // eval_iters + 1) * eval_iters if eval_iters else 0
+    valid_iters = (train_iters // eval_iters + 1) * eval_iters if eval_iters else 0
     sizes = (train_samples, valid_iters * global_batch_size, eval_iters * global_batch_size)
     logger.debug("Dataset target sizes: train=%d, validation=%d, test=%d", *sizes)
     return sizes

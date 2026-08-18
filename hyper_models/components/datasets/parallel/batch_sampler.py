@@ -33,7 +33,7 @@ platform = get_platform()
 
 def _validate_positive_integer(value: int, name: str) -> None:
     """Validate an integer boundary shared by sampler options."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if value <= 0:
         raise ValueError(f"{name} must be a positive integer")
 
 
@@ -46,20 +46,18 @@ class _DatasetBatchSampler:
             total_samples: int,
             consumed_samples: int,
             micro_batch_size: int,
+            global_batch_size: int,
             dp_rank: int,
             dp_world_size: int,
             drop_last: bool,
             index_mapping: IndexMapping | None,
     ) -> None:
         """Validate and store DP slicing and checkpoint state."""
+        _validate_positive_integer(total_samples, "total_samples")
         _validate_positive_integer(micro_batch_size, "micro_batch_size")
         _validate_positive_integer(dp_world_size, "dp_world_size")
-        if isinstance(total_samples, bool) or not isinstance(total_samples, int) or total_samples <= 0:
-            raise ValueError("total_samples must be a positive integer")
-        if isinstance(consumed_samples, bool) or not isinstance(consumed_samples, int):
-            raise ValueError("consumed_samples must be a non-negative integer")
         self._validate_consumed_samples(consumed_samples, total_samples)
-        if isinstance(dp_rank, bool) or not isinstance(dp_rank, int) or not 0 <= dp_rank < dp_world_size:
+        if not 0 <= dp_rank < dp_world_size:
             raise ValueError(f"dp_rank must be in [0, {dp_world_size}), but got {dp_rank!r}")
 
         self.total_samples = total_samples
@@ -70,12 +68,17 @@ class _DatasetBatchSampler:
         self.drop_last = drop_last
         self.index_mapping = index_mapping
         self.global_micro_batch_size = micro_batch_size * dp_world_size
+        _validate_positive_integer(global_batch_size, "global_batch_size")
+        if global_batch_size % self.global_micro_batch_size != 0:
+            raise ValueError("global_batch_size must be divisible by micro_batch_size * dp_world_size")
+
+        self.global_batch_size = global_batch_size
         self.epoch = 0
 
     def _validate_consumed_samples(self, consumed_samples: int, total_samples: int) -> None:
-        """Require sequential sampling to retain at least one unread sample."""
-        if not 0 <= consumed_samples < total_samples:
-            raise ValueError("consumed_samples must be in [0, total_samples)")
+        """Allow sequential sampling to stop exactly at the epoch boundary."""
+        if not 0 <= consumed_samples <= total_samples:
+            raise ValueError("consumed_samples must be in [0, total_samples]")
 
     def __iter__(self) -> Iterator[list[int]]:
         """Yield sequential rank-local indices for ``single`` mode."""
@@ -111,23 +114,21 @@ class _DatasetBatchSampler:
         """Apply an optional logical-to-physical sample index mapping."""
         if self.index_mapping is None:
             return logical_index
-        try:
-            resolved_index = self.index_mapping[logical_index]
-        except (IndexError, KeyError, TypeError) as exc:
-            raise ValueError(f"index_mapping does not define logical index {logical_index}") from exc
+
+        resolved_index = self.index_mapping[logical_index]
         if isinstance(resolved_index, bool):
-            raise ValueError(f"index_mapping[{logical_index}] must be an integer")
-        try:
-            physical_index = operator.index(resolved_index)
-        except TypeError as exc:
-            raise ValueError(f"index_mapping[{logical_index}] must be an integer") from exc
+            raise TypeError(f"index_mapping[{logical_index}] must be an integer")
+
+        physical_index = operator.index(resolved_index)
         return physical_index
 
     def state_dict(self) -> dict[str, int]:
-        """Return the global sample position needed to resume iteration."""
+        """Return the absolute Dataset position needed to resume iteration."""
         sampler_state = {
             "consumed_samples": self.consumed_samples,
             "epoch": self.epoch,
+            "global_batch_size": self.global_batch_size,
+            "dp_world_size": self.dp_world_size,
         }
         return sampler_state
 
@@ -140,15 +141,16 @@ class _DatasetBatchSampler:
         Raises:
             ValueError: If the checkpoint does not contain a valid sample position.
         """
-        consumed_samples = state_dict.get("consumed_samples")
-        if isinstance(consumed_samples, bool) or not isinstance(consumed_samples, int):
-            raise ValueError("sampler state must contain integer 'consumed_samples'")
+        consumed_samples = state_dict["consumed_samples"]
         self._validate_consumed_samples(consumed_samples, self.total_samples)
-        epoch = state_dict.get("epoch", 0)
-        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
-            raise ValueError("sampler state 'epoch' must be a non-negative integer")
+        if state_dict["global_batch_size"] != self.global_batch_size:
+            raise ValueError("elastic DP resume requires an unchanged global_batch_size")
+
+        if consumed_samples % self.global_batch_size != 0:
+            raise ValueError("sampler state must align to a global optimizer batch")
+
         self.consumed_samples = consumed_samples
-        self.epoch = epoch
+        self.epoch = state_dict["epoch"]
 
     def set_epoch(self, epoch: int) -> None:
         """Start a new epoch while preserving progress in the restored epoch.
@@ -161,6 +163,7 @@ class _DatasetBatchSampler:
         """
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ValueError("epoch must be a non-negative integer")
+
         if epoch != self.epoch:
             self.consumed_samples = 0
             self.epoch = epoch
@@ -169,18 +172,27 @@ class _DatasetBatchSampler:
 class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
     """Yield a deterministic shuffled epoch for ``cyclic`` mode."""
 
-    def __init__(self, *, data_sharding: bool, **sampler_options: Any) -> None:
+    def __init__(self, *, data_sharding: bool, seed: int, **sampler_options: Any) -> None:
         """Store the cyclic data-sharding policy."""
         super().__init__(**sampler_options)
         if not self.drop_last:
             raise ValueError("cyclic sampling requires drop_last=True")
+
         self.data_sharding = data_sharding
+        self.seed = seed
 
     def _validate_consumed_samples(self, consumed_samples: int, total_samples: int) -> None:
         """Allow the global consumed position to span multiple epochs."""
         del total_samples
         if consumed_samples < 0:
             raise ValueError("cyclic consumed_samples must be non-negative")
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """Restore a fixed-GBS cursor, repartitioning only global shuffle order."""
+        if self.data_sharding and state_dict["dp_world_size"] != self.dp_world_size:
+            raise ValueError("elastic DP resume requires data_sharding=False")
+
+        super().load_state_dict(state_dict)
 
     def __len__(self) -> int:
         """Return the number of local micro-batches remaining in this epoch."""
@@ -195,16 +207,13 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         self.epoch = self.consumed_samples // active_samples
         current_epoch_samples = self.consumed_samples % active_samples
 
-        if current_epoch_samples % self.global_micro_batch_size != 0:
-            raise ValueError("cyclic consumed_samples must align to a global micro-batch")
-
         if self.data_sharding:
             # Shuffle one contiguous bucket per DP rank.
             bucket_size = (self.total_samples // self.global_micro_batch_size) * self.micro_batch_size
             bucket_offset = current_epoch_samples // self.dp_world_size
             bucket_start = self.dp_rank * bucket_size
             random_offsets = list(range(bucket_size))
-            random.Random(self.epoch).shuffle(random_offsets)
+            random.Random(self.seed + self.epoch).shuffle(random_offsets)
             rank_indices = [
                 bucket_start + offset
                 for offset in random_offsets[bucket_offset:]
@@ -213,7 +222,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
             # Shuffle globally, then stride across DP ranks.
             full_bucket_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
             shuffled_indices = list(range(full_bucket_size))
-            random.Random(self.epoch).shuffle(shuffled_indices)
+            random.Random(self.seed + self.epoch).shuffle(shuffled_indices)
             active_indices = shuffled_indices[current_epoch_samples:]
             rank_indices = active_indices[self.dp_rank::self.dp_world_size]
 
@@ -222,6 +231,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
             local_batch.append(index)
             if len(local_batch) == self.micro_batch_size:
                 self.consumed_samples += self.global_micro_batch_size
+                self.epoch = self.consumed_samples // active_samples
                 yield local_batch
                 local_batch = []
 
@@ -229,6 +239,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         """Move to an explicit cyclic epoch without losing in-epoch progress."""
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ValueError("epoch must be a non-negative integer")
+
         active_samples = self._active_samples()
         current_epoch = self.consumed_samples // active_samples
         if epoch != current_epoch:
@@ -240,6 +251,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         active_samples = self.total_samples - self.total_samples % self.global_micro_batch_size
         if active_samples <= 0:
             raise ValueError("cyclic Dataset must contain one complete global micro-batch")
+
         return active_samples
 
 
@@ -264,6 +276,7 @@ def build_dataset_batch_sampler(
         *,
         total_samples: int,
         micro_batch_size: int,
+        global_batch_size: int,
         dp_rank: int,
         dp_world_size: int,
         consumed_samples: int = 0,
@@ -272,6 +285,7 @@ def build_dataset_batch_sampler(
         data_rearrange_map: IndexMapping | str | os.PathLike[str] | None = None,
         sampler_type: SamplerType = "single",
         data_sharding: bool = False,
+        seed: int = 0,
 ) -> _DatasetBatchSampler:
     """Build a Dataset batch sampler.
 
@@ -289,6 +303,7 @@ def build_dataset_batch_sampler(
     Args:
         total_samples: Number of logical samples in the Dataset.
         micro_batch_size: Samples consumed by one DP rank per micro-step.
+        global_batch_size: Fixed samples consumed globally by one optimizer step.
         dp_rank: Rank inside the data-parallel group.
         dp_world_size: Number of ranks in the data-parallel group.
         consumed_samples: Global logical sample position restored from a checkpoint.
@@ -299,6 +314,7 @@ def build_dataset_batch_sampler(
             deterministic shuffled epoch.
         data_sharding: Whether cyclic sampling shuffles an independent
             contiguous bucket on each DP rank.
+        seed: Base seed used by cyclic epoch shuffling.
 
     Returns:
         A resumable iterable of rank-local index lists.
@@ -314,6 +330,7 @@ def build_dataset_batch_sampler(
         "total_samples": total_samples,
         "consumed_samples": consumed_samples,
         "micro_batch_size": micro_batch_size,
+        "global_batch_size": global_batch_size,
         "dp_rank": dp_rank,
         "dp_world_size": dp_world_size,
         "drop_last": drop_last,
@@ -332,8 +349,10 @@ def build_dataset_batch_sampler(
         # support data_sharding=True/False, and checkpoint consumed_samples.
         if resolved_mapping is not None:
             raise ValueError("cyclic sampling does not support a rearrangement map")
+
         batch_sampler = _CyclicDatasetBatchSampler(
             data_sharding=data_sharding,
+            seed=seed,
             **sampler_options,
         )
         return batch_sampler

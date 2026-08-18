@@ -32,11 +32,10 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     """Training-loop parameters exposed by the initial YAML schema."""
 
-    train_steps: Optional[int] = None
+    train_iters: Optional[int] = None
     train_samples: Optional[int] = None
     eval_iters: int = 0
 
-    num_train_epochs: int = 1
     global_batch_size: int = 8
     micro_batch_size: int = 1
 

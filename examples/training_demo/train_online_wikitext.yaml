@@ -14,7 +14,6 @@ training:
   train_steps: 10
   eval_iters: 1
   train_samples: null
-  num_train_epochs: 1
   global_batch_size: 8
   micro_batch_size: 1
   backend: nccl

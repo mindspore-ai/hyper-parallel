@@ -20,9 +20,8 @@ model:
 #   use_fast: true
 
 training:
-  train_steps: 5
+  train_iters: 5
   train_samples: null
-  num_train_epochs: 1
 
   global_batch_size: 8
   micro_batch_size: 1
@@ -100,8 +99,8 @@ dataloader:
   get_batch:
     _target_: hyper_models.components.datasets.llm.build_llm_get_batch
 
-  # single: sequential/rearranged; cyclic: deterministic shuffled epochs.
-  dataloader_type: cyclic # single
+  # Pretrain consumes the prepared indexed Dataset once without sampler-level reshuffling.
+  dataloader_type: single
 
   # Defaults.
   data_rearrange_map: null

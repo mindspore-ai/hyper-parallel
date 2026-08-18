@@ -8,9 +8,8 @@ model:
   force_hf: true
 
 training:
-  train_steps: 2
+  train_iters: 2
   eval_iters: 0
-  num_train_epochs: 1
   global_batch_size: 2
   micro_batch_size: 1
   backend: hccl
