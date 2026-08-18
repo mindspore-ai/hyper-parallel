@@ -1,12 +1,17 @@
-# Alignment-regression config: validated 1c↔FSDP4 ≤0.005 step-loss diff
-# (≤1 bf16 ULP at small-loss reporting precision); text num_hidden_layers=4
-# + frozen visual tower, vl_dummy synthetic batches.
+# Qwen3-VL-MoE training template:
+# visual Encoder DP/CP, save/resume, and 100-step alignment baseline.
 model:
   name: qwen3_vl_moe
   weights_path: /path/to/Qwen3-VL-30B-A3B-Instruct
   tokenizer_path: /path/to/Qwen3-VL-30B-A3B-Instruct
   freeze_modules:
     - model.visual
+  vision_parallel:
+    dp_shard: 1
+    cp: 2
+    ulysses_degree: 1
+    reuse_dp_shard_mesh: true
+    share_samples_across_dp: true
   config_overrides:
     vl: true
     text_config:
@@ -20,7 +25,7 @@ data:
   vl_grid_w: 2
 
 train:
-  max_steps: 20
+  max_steps: 100
   num_train_epochs: 1
   global_batch_size: 4
   micro_batch_size: 1
@@ -55,8 +60,10 @@ train:
 
   checkpoint:
     output_dir: outputs/qwen3_vl_moe
-    save_steps: 0
+    save_steps: 50
+    load_path: null
     save_hf_weights: false
+    save_async: false
 
   logging:
     log_steps: 1
