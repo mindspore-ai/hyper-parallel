@@ -64,6 +64,44 @@ DP = MeshAxisName.DP
 NamedPlacement = Dict[MeshAxisName, Placement]
 
 
+class PackedShard(Shard):
+    """Shard multiple logical projections independently along one tensor dimension.
+
+    ``PackedShard(dim=1, parts=2)`` on ``[E, 2I, H]`` means that the gate and
+    up halves are each sharded over TP, then the two local shards are joined
+    back into ``[E, 2I/TP, H]``.  It is a plan-level specialization of
+    :class:`Shard`; runtime parameter loading and gathering must preserve the
+    logical-part ordering.
+
+    Args:
+        dim: Packed tensor dimension.
+        parts: Number of equally sized logical projections in that dimension.
+    """
+
+    def __init__(self, dim: int, parts: int = 2):
+        super().__init__(dim)
+        if not isinstance(parts, int) or isinstance(parts, bool) or parts < 2:
+            raise ValueError(f"parts must be an integer greater than one, got {parts!r}")
+        self._parts = parts
+
+    @property
+    def parts(self) -> int:
+        """Return the number of packed logical projections."""
+        return self._parts
+
+    def __eq__(self, other: object) -> bool:
+        return type(self) is type(other) and self.dim == other.dim and self.parts == other.parts
+
+    def __hash__(self) -> int:
+        return hash((self.dim, self.parts, "PackedShard"))
+
+    def __repr__(self) -> str:
+        return f"PackedShard(dim={self.dim}, parts={self.parts})"
+
+    def __str__(self) -> str:
+        return f"PS({self.dim}, {self.parts})"
+
+
 @dataclass(frozen=True)
 class TpLocalAttrPlan:
     """Planner-generated TP-local module attribute adjustment plan."""

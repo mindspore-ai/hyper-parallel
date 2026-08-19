@@ -59,6 +59,39 @@ def count_loss_token(
     return token_len
 
 
+def scale_tp_replicated_loss_gradient(
+    losses: dict[str, torch.Tensor],
+    tp_size: int,
+) -> dict[str, torch.Tensor]:
+    """Scale gradients from a loss replicated across tensor-parallel ranks.
+
+    Ordinary cross entropy runs independently on every TP rank after logits
+    have been redistributed to a replicated layout. Differentiable TP
+    collectives sum those replicated upstream gradients during backward, so
+    each loss gradient must contribute ``1 / tp_size``. The detached term
+    preserves the forward values used for logging.
+
+    Args:
+        losses: Named loss tensors replicated across TP ranks.
+        tp_size: Tensor-parallel group size.
+
+    Returns:
+        Loss tensors with unchanged forward values and scaled gradients.
+
+    Raises:
+        ValueError: If ``tp_size`` is less than one.
+    """
+    if tp_size < 1:
+        raise ValueError(f"tp_size must be at least 1, got {tp_size}")
+    if tp_size == 1:
+        return losses
+    gradient_scale = 1.0 / tp_size
+    return {
+        name: loss * gradient_scale + loss.detach() * (1.0 - gradient_scale)
+        for name, loss in losses.items()
+    }
+
+
 def mean_global_loss(
     losses: Union[dict[str, torch.Tensor], torch.Tensor],
     current_token_counts: dict[str, torch.Tensor],

@@ -89,8 +89,10 @@ def _local_params_context(model: nn.Module):
     for name, param in list(model.named_parameters()):
         if isinstance(param, DTensor):
             source_shard_records[name] = param.placements
-            _set_param_by_path(model, name, nn.Parameter(
-                param.to_local(), requires_grad=param.requires_grad))
+            local_param = nn.Parameter(
+                param.to_local(), requires_grad=param.requires_grad)
+            local_param._sharding_spec = param.layout  # pylint: disable=W0212
+            _set_param_by_path(model, name, local_param)
     return source_shard_records
 
 

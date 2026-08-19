@@ -223,8 +223,11 @@ validate 模式的 out_src 真校验兜底。
 
 默认命名规则自动识别：`q/k/v/gate/up_proj` → COLWISE（`Shard(0)`），
 `o/down_proj` → ROWWISE（`Shard(1)`），norm/embed/lm_head 各归其位。
-融合权重也支持：`qkv_proj/fused_qkv/query_key_value`（FUSED_QKV）、
-`gate_up_proj`（FUSED_GATE_UP）均按 `Shard(0)`。
+融合 QKV 权重 `qkv_proj/fused_qkv/query_key_value`（FUSED_QKV）按
+`Shard(0)`。gate/up 融合权重需要区分布局：普通连续 `Shard` 会破坏
+forward 内的 `chunk(2)` 语义；batched MoE 的
+`experts.gate_up_proj [E,2I,H]` 使用标准
+`PackedShard(dim=1, parts=2)`，分别切 gate/up 后再拼成本地参数。
 
 **rowwise Linear 的执行方式（含 bias，D-19/D-22，2026-08-12）。**
 rowwise 投影（`o/down_proj`）的权重沿**输入维**切分（`Shard(1)`）：边界入口

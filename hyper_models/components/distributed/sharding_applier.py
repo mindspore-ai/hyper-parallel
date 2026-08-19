@@ -56,6 +56,7 @@ from hyper_models.components.distributed.injection import (
 from hyper_models.components.distributed.precompiled_boundary import (
     PrecompiledBoundary,
 )
+from hyper_models.components.distributed.packed_shard import pack_tensor_for_placements
 from hyper_models.components.distributed.tp_collective_lowering import (
     create_tp_collective_lowerer,
 )
@@ -621,6 +622,7 @@ def _shard_module_params(module, param_specs, mesh, mesh_dim_names):
             continue
 
         src = param.data if hasattr(param, "data") else param
+        src = pack_tensor_for_placements(src, placements, mesh)
         dt = distribute_tensor(src, mesh, placements)
         requires_grad = getattr(param, "requires_grad", True)
         _set_param_by_path(module, param_path,

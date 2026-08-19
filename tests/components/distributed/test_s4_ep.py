@@ -47,6 +47,7 @@ from hyper_models.components.distributed.sharding_config import (
     CP,
     EP,
     ModuleShardingSpec,
+    PackedShard,
     ShardingPlan,
     TEMPLATES,
     TP,
@@ -1096,28 +1097,13 @@ def test_planner_batched_contract(tiny_hf_batched_moe):
 
 
 def test_planner_batched_ep1_no_mark(tiny_hf_batched_moe, make_mesh):
-    """batched 布局 ep=1 → 不标记（_ep_size == 0）。
-
-    融合权重裸 TP Shard(1) 的写法（D-08 旧语义）已被
-    _finalize_fused_expert_tp_guard fail-fast——连续块切分与 forward 内
-    chunk 不兼容；合法配置需 override 为 TP Replicate（守门解法②，
-    须同步把 out_src 的 TP 从模板推导的 Partial 改为 Replicate）。
-    """
-    rep = lambda: {TP: Replicate(), CP: Replicate()}  # noqa: E731
-    overrides = {"*.mlp": ModuleShardingSpec(
-        params={
-            "gate.weight": rep(),
-            "experts.gate_up_proj": rep(),
-            "experts.down_proj": rep(),
-        },
-        out_src={"output": rep()},
-    )}
+    """Batched ep=1 experts use standard packed TP without an override."""
     mesh = make_mesh((1,), ("tp",))
-    plan = ShardingPlanner(plan_overrides=overrides).plan(
-        tiny_hf_batched_moe, mesh, tp_size=2)
+    plan = ShardingPlanner().plan(tiny_hf_batched_moe, mesh, tp_size=2)
     spec = plan.modules["model.layers.0.mlp"]
     assert spec._ep_size == 0
-    assert spec.params["experts.gate_up_proj"][TP] == Replicate()
+    assert spec.params["experts.gate_up_proj"][TP] == PackedShard(1, parts=2)
+    assert spec.params["experts.down_proj"][TP] == Shard(2)
 
 
 def test_expert_mesh_layout_mapping():

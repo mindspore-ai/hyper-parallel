@@ -56,6 +56,7 @@ from hyper_models.components.distributed.sharding_config import (
     MeshAxisName,
     ModuleShardingSpec,
     NamedPlacement,
+    PackedShard,
     ShardingPlan,
     ShardingTemplate,
     TEMPLATES,
@@ -167,8 +168,12 @@ def _infer_colwise_vs_rowwise(param_path: str, template: ShardingTemplate):
     return template.colwise_placement
 
 
-def _moe_expert_tp_placement(param_path: str, ndim: int,
-                             template: ShardingTemplate):
+def _moe_expert_tp_placement(
+    param_path: str,
+    ndim: int,
+    template: ShardingTemplate,
+    param_shape: Optional[Tuple[int, ...]] = None,
+):
     """TP placement for MOE_EXPERT (revision D-08, ndim-aware per parameter).
 
     When expert weights use a batched 3D layout [E, H_out, H_in] (ndim>=3),
@@ -184,7 +189,13 @@ def _moe_expert_tp_placement(param_path: str, ndim: int,
     """
     name = param_path.lower()
     is_rowwise = any(k in name for k in ("w2", "down_proj", "down."))
+    is_packed_gate_up = bool(ShardingPlanner._FUSED_EXPERT_WEIGHT_RE.match(param_path))
     if ndim >= 3:
+        if is_packed_gate_up:
+            # HF stores gate_up_proj as [E, 2I, H].  The grouped-GEMM spelling
+            # gate_and_up_projs used by AutoModel stores [E, H, 2I].
+            packed_dim = 2 if "gate_and_up_projs" in name else 1
+            return PackedShard(packed_dim, parts=2)
         return Shard(2) if is_rowwise else Shard(1)
     return template.rowwise_placement if is_rowwise else template.colwise_placement
 
@@ -359,6 +370,7 @@ class ShardingPlanner:
                 boundary_fqn, group, template,
                 sequence_parallel, loss_parallel, mesh_dim_names,
                 param_ndims=param_ndims,
+                param_shapes=param_shapes,
             )
             if spec is not None:
                 if boundary_type == "moe_mlp":
@@ -710,6 +722,7 @@ class ShardingPlanner:
         self, boundary_fqn: str, group: List[Tuple[str, ParamRole]],
         template: ShardingTemplate, sequence_parallel: bool, loss_parallel: bool,
         mesh_dim_names: Tuple[str, ...], param_ndims: Optional[Dict[str, int]] = None,
+        param_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
     ) -> Optional[ModuleShardingSpec]:
         """Template + ParamRole → ModuleShardingSpec (05 §3.5 Template Mapping)."""
         has_tp = "tp" in mesh_dim_names
@@ -722,8 +735,10 @@ class ShardingPlanner:
         for param_fqn, role in group:
             param_path = param_fqn[len(boundary_fqn) + 1:]
             ndim = (param_ndims or {}).get(param_fqn, 2)
+            param_shape = (param_shapes or {}).get(param_fqn)
             placement = self._placement_for_role(param_path, role, template,
-                                                 has_tp, has_ep, ndim=ndim)
+                                                 has_tp, has_ep, ndim=ndim,
+                                                 param_shape=param_shape)
             if placement is not None:
                 spec.params[param_path] = placement
 
@@ -776,6 +791,7 @@ class ShardingPlanner:
     def _placement_for_role(
         param_path: str, role: ParamRole, template: ShardingTemplate,
         has_tp: bool, has_ep: bool, ndim: int = 2,
+        param_shape: Optional[Tuple[int, ...]] = None,
     ) -> Optional[NamedPlacement]:
         """13 roles → placement mapping (05 §3.5 mapping table + D-08
         ndim-aware)."""
@@ -794,7 +810,8 @@ class ShardingPlanner:
             # (rather than omitting the TP key).
             # D-08: the TP dim of a 3D expert weight [E, H_out, H_in] is
             # shifted according to ndim.
-            tp_p = (_moe_expert_tp_placement(param_path, ndim, template)
+            tp_p = (_moe_expert_tp_placement(
+                param_path, ndim, template, param_shape=param_shape)
                     if has_tp else Replicate())
             return _multi_dim(tp=tp_p, cp=Replicate(),
                               ep=template.moe_expert_placement if has_ep else None)
@@ -1306,7 +1323,7 @@ class ShardingPlanner:
                     continue
                 if ShardingPlanner._FUSED_EXPERT_WEIGHT_RE.match(param_name) is None:
                     continue
-                if isinstance(named.get(TP), Shard):
+                if isinstance(named.get(TP), Shard) and not isinstance(named.get(TP), PackedShard):
                     offenders.append((fqn, param_name, named[TP]))
         if not offenders:
             return
@@ -1692,11 +1709,22 @@ class ShardingPlanner:
                             f"of range for a {ndim}D parameter; fix the "
                             f"plan_overrides declaration"
                         )
-                    if shape[dim] % size != 0:
+                    logical_dim_size = shape[dim]
+                    if isinstance(p, PackedShard):
+                        if logical_dim_size % p.parts != 0:
+                            raise ValueError(
+                                f"plan-time packed shard check failed: {full!r} has shape "
+                                f"{tuple(shape)} but PackedShard(dim={p.dim}, parts={p.parts}) "
+                                f"requires shape[{dim}]={logical_dim_size} to divide evenly into "
+                                f"{p.parts} logical projections"
+                            )
+                        logical_dim_size //= p.parts
+                    if logical_dim_size % size != 0:
                         raise ValueError(
                             f"plan-time shard check failed: {full!r} has shape "
                             f"{tuple(shape)} but boundary {fqn!r} declares "
-                            f"{{{axis_name}: Shard({p.dim})}} — shape[{dim}]={shape[dim]} "
+                            f"{{{axis_name}: {p!r}}} — logical shard size "
+                            f"{logical_dim_size} derived from shape[{dim}]={shape[dim]} "
                             f"is not divisible by {axis_name} size {size} (it would "
                             f"produce empty shards at apply time). This is most "
                             f"often a parameter-classification error (e.g. a "

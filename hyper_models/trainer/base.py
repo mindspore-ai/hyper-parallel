@@ -56,7 +56,11 @@ from ..components.distributed.infrastructure import (
     setup_logging,
     initialize_distributed,
 )
-from ..components.loss.loss_utils import count_loss_token, mean_global_loss
+from ..components.loss.loss_utils import (
+    count_loss_token,
+    mean_global_loss,
+    scale_tp_replicated_loss_gradient,
+)
 from ..components.loss.model_output import ModelOutputLoss
 from ..components.utils import helper
 from ..components.utils.device import synchronize, get_torch_device, get_device_type  # pylint: disable=syntax-error
@@ -555,6 +559,11 @@ class BaseTrainer(Stateful, ABC):
             self.step_token_counts,
             device_mesh=self.mesh,
         )
+        if self.mesh.tp_size > 1 and not self.mesh.loss_parallel:
+            loss_dict = scale_tp_replicated_loss_gradient(
+                loss_dict,
+                self.mesh.tp_size,
+            )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 

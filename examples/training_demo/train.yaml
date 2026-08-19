@@ -41,7 +41,7 @@ fsdp_config:
   dp_shard_size: 16
   replicate_params: []
   reshard_after_forward: true
-  reshard_after_backward: false
+  reshard_after_backward: true
   requires_grad_sync: true
   enable_fsdp2_prefetch: true
   forward_prefetch_depth: 1

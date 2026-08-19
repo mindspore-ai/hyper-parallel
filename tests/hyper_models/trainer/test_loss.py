@@ -24,6 +24,7 @@ from torch import nn
 
 import hyper_models.trainer.base as base_module
 from hyper_models.components.loss import ModelOutputLoss
+from hyper_models.components.loss.loss_utils import scale_tp_replicated_loss_gradient
 from hyper_models.trainer.base import BaseTrainer
 from hyper_models.trainer.config import Target, TrainerConfig
 
@@ -170,6 +171,67 @@ def test_trainer_rejects_configured_loss_that_is_not_module() -> None:
         trainer._build_loss()
 
 
+@pytest.mark.parametrize(
+    ("tp_size", "expected_gradient"),
+    ((1, 1.0), (2, 0.5), (4, 0.25)),
+)
+def test_tp_replicated_loss_preserves_value_and_scales_gradient(
+    tp_size: int,
+    expected_gradient: float,
+) -> None:
+    """Keep reported loss unchanged while scaling its TP-replicated gradient."""
+    loss = torch.tensor(3.0, requires_grad=True)
+
+    scaled = scale_tp_replicated_loss_gradient(
+        {"foundation_loss": loss},
+        tp_size,
+    )["foundation_loss"]
+    scaled.backward()
+
+    assert scaled.item() == pytest.approx(3.0)
+    assert loss.grad is not None
+    assert loss.grad.item() == pytest.approx(expected_gradient)
+
+
+def test_tp_replicated_loss_rejects_invalid_tp_size() -> None:
+    """Reject a non-positive tensor-parallel group size."""
+    with pytest.raises(ValueError, match="tp_size must be at least 1"):
+        scale_tp_replicated_loss_gradient({"loss": torch.tensor(1.0)}, 0)
+
+
+@pytest.mark.parametrize(
+    ("loss_parallel", "expected_gradient"),
+    ((False, 0.5), (True, 1.0)),
+)
+def test_postforward_scales_only_ordinary_tp_loss(
+    loss_parallel: bool,
+    expected_gradient: float,
+    monkeypatch,
+) -> None:
+    """Scale replicated ordinary CE but leave Loss Parallel unchanged."""
+    loss = torch.tensor(3.0, requires_grad=True)
+    monkeypatch.setattr(
+        base_module,
+        "mean_global_loss",
+        lambda *args, **kwargs: {"foundation_loss": args[0]},
+    )
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.loss_fn = ModelOutputLoss()
+    trainer.current_token_counts = {"foundation_tokens": torch.tensor(1)}
+    trainer.step_token_counts = {"foundation_tokens": torch.tensor(1)}
+    trainer.mesh = SimpleNamespace(tp_size=2, loss_parallel=loss_parallel)
+
+    actual, loss_dict = trainer.postforward(
+        SimpleNamespace(loss=loss),
+        labels=torch.tensor([1]),
+    )
+    actual.backward()
+
+    assert loss_dict["foundation_loss"].item() == pytest.approx(3.0)
+    assert loss.grad is not None
+    assert loss.grad.item() == pytest.approx(expected_gradient)
+
+
 def test_forward_passes_full_batch_to_model_and_labels_to_loss(
     monkeypatch,
 ) -> None:
@@ -198,9 +260,9 @@ def test_forward_passes_full_batch_to_model_and_labels_to_loss(
     trainer.loss_fn = _RecordingLoss()
     trainer.model_fwd_context = nullcontext()
     trainer.model_bwd_context = nullcontext()
-    trainer.micro_batch_token_len = {"foundation_tokens": torch.tensor(4)}
-    trainer.micro_batches_token_len = {"foundation_tokens": torch.tensor(4)}
-    trainer.mesh = object()
+    trainer.current_token_counts = {"foundation_tokens": torch.tensor(4)}
+    trainer.step_token_counts = {"foundation_tokens": torch.tensor(4)}
+    trainer.mesh = SimpleNamespace(tp_size=1, loss_parallel=False)
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
         "attention_mask": torch.ones(1, 4),
