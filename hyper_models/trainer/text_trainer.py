@@ -17,6 +17,8 @@
 from collections import defaultdict
 from typing import Any, Dict
 
+import torch
+
 from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_models.components.datasets import calculate_num_micro_batches
@@ -195,6 +197,10 @@ class TextTrainer:
         for _ in range(1, num_micro_steps):
             training_batches.append(self.base.get_batch(data_iterator))
 
+        # Advance first: callbacks and checkpoints read state.global_step as the
+        # number of completed optimizer updates, which is what resume replays from.
+        self.base.state.global_step += 1
+
         self.on_step_begin(micro_batches=training_batches)
         synchronize()
 
@@ -230,7 +236,7 @@ class TextTrainer:
             else [self.base.optimizer]
         )
         for optimizer in optimizers:
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()
 
@@ -252,8 +258,6 @@ class TextTrainer:
             loss_dict=total_loss_dict,
             grad_norm=grad_norm_value,
         )
-
-        self.base.state.global_step += 1
 
         return {
             "loss": total_loss,

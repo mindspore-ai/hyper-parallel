@@ -8,14 +8,14 @@
 
 model:
   _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B" # tiny-random-LlamaForCausalLMB # 
+  pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B" # tiny-random-LlamaForCausalLMB #
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
 
 training:
-  train_iters: 5
+  train_iters: 25
   train_samples: null
 
   global_batch_size: 8
@@ -147,8 +147,29 @@ lr_scheduler:
     min_lr: 1.0e-6
 
 checkpoint:
-  enabled: false
-  checkpoint_dir: '' #./outputs/training_demo/checkpoints
+  # Gates saving only; loading is controlled by restore_from below, so
+  # save_ckpt=false with a restore_from set means "start here, write nothing".
+  save_ckpt: true
+  checkpoint_dir: ./outputs/training_demo/checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  # Where the per-step training state (step/epoch, lr_scheduler, dataloader
+  # position, RNG) is written.
+  #   true  - one torch.save file per rank under extra_state/. Always correct.
+  #   false - embedded in the DCP state dict; fewer files, but DCP deduplicates
+  #           entries sharing an FQN across ranks, so it is only valid when that
+  #           state is identical on every rank. Restore auto-detects either
+  #           layout, so this can be flipped between runs.
+  save_extra_state_per_rank: false
+
+  # Resume with:  bash examples/training_demo/run.sh --checkpoint.restore_from=LATEST
+  # or point at one directory: --checkpoint.restore_from=./outputs/training_demo/checkpoints/global_step_10
+  restore_from: LATEST
+  restore_optimizer: true
+  restore_train_state: true
 
 debug:
   check_nan_inf: false

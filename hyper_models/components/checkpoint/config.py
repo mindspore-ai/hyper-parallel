@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CheckpointingConfig — typed config for checkpoint save/load.
+"""CheckpointingConfig typed config for checkpoint save/load.
 
-Following design doc 04_checkpoint.md §4.
+Following design doc 04_checkpoint.md.
 """
 
 from dataclasses import dataclass
@@ -26,17 +26,47 @@ class CheckpointingConfig:
     """Checkpointing typed config.
 
     Following design doc 04_checkpoint.md.
+
+    ``model_save_format``, ``save_consolidated``, ``staging_dir`` and
+    ``best_metric_key`` are declared by the design doc but not yet consumed by
+    :class:`~hyper_models.trainer.callbacks.checkpoint_callback.CheckpointerCallback`;
+    they are reserved for the consolidated HuggingFace-format export.
     """
 
-    enabled: bool = True
+    # Master switch for the *write* path only. Restoring is governed solely by
+    # ``restore_from``, so ``save_ckpt=false`` with a ``restore_from`` set means
+    # "start from this checkpoint but do not write any more" rather than
+    # silently doing nothing.
+    save_ckpt: bool = True
     checkpoint_dir: str = "./checkpoints"
+    save_steps: int = 0  # save every N optimizer steps (0 = disabled)
+    save_epochs: int = 1  # save every N epochs
+    is_async: bool = False
+    is_peft: bool = False  # persist trainable (adapter) weights only
+    save_optimizer: bool = True
+    save_train_state: bool = True
+    # Where the per-step training state (step/epoch, lr_scheduler, dataloader
+    # position, RNG) is written:
+    #   True  --- one torch.save file per rank under ``extra_state/``. Always
+    #             correct, and the only safe choice when any of that state
+    #             differs across ranks.
+    #   False --- embedded in the DCP state dict. Fewer files, but DCP
+    #             deduplicates entries that share an FQN across ranks, so every
+    #             rank restores whichever rank's copy won. Only use this when the
+    #             extra state is rank-invariant (deterministic training, uniform
+    #             input shapes).
+    # The load side auto-detects which layout a checkpoint used, so this flag can
+    # be flipped between runs.
+    save_extra_state_per_rank: bool = True
+
+    restore_from: Optional[str] = None  # "LATEST" or specific path
+    restore_optimizer: bool = True
+    restore_train_state: bool = True  # step/epoch, lr_scheduler, dataloader, RNG
+
     model_save_format: str = "safetensors"
     # 是否额外输出合并的 HF 权重："none"（从不）| "final"（仅训练结束）| "every"（每次保存）。
     # 关闭档统一为 "none"（YAML 安全的 Literal 取值），替代旧设计枚举的 "false"
     # （"false" 会被 PyYAML 解析为 bool，见 04_checkpoint.md §4.2 口径裁决）。
     save_consolidated: Literal["none", "final", "every"] = "final"
-    is_peft: bool = False
-    is_async: bool = False
     staging_dir: Optional[str] = None
     best_metric_key: str = "default"
-    restore_from: Optional[str] = None  # "LATEST" or specific path

@@ -105,6 +105,33 @@ def set_device(device: torch.types.Device) -> None:
     get_torch_device().set_device(device)
 
 
+def get_device_rng_state() -> Any:
+    """Return the current accelerator RNG state, or ``None`` when unavailable.
+
+    Checkpointing needs the device RNG alongside the CPU one: dropout,
+    ``torch.randn`` initializers and any device-side sampling draw from it, so a
+    resume that only restores ``torch.get_rng_state()`` diverges from the
+    original run.
+    """
+    if get_device_type() == "cpu":
+        return None
+    get_rng_state = getattr(get_torch_device(), "get_rng_state", None)
+    if get_rng_state is None:
+        return None
+    return get_rng_state()
+
+
+def set_device_rng_state(state: Any) -> None:
+    """Restore an accelerator RNG state captured by :func:`get_device_rng_state`."""
+    if state is None or get_device_type() == "cpu":
+        return
+    set_rng_state = getattr(get_torch_device(), "set_rng_state", None)
+    if set_rng_state is None:
+        logger.warning("Device namespace has no set_rng_state; device RNG not restored.")
+        return
+    set_rng_state(state)
+
+
 def is_nccl_backend(backend: str | None = None) -> bool:
     """Check if the distributed communication backend is NCCL."""
     return (backend or get_dist_comm_backend()) == "nccl"
