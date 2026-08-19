@@ -194,7 +194,7 @@ def test_p1_pp_only_optim_state_dict_fqn_roundtrip():
     a training step without NaN, and FQN keys in the state dict correspond
     to the stage model's named_parameters.
     """
-    stage_model, _, schedule, device, pp_rank, is_first_stage = (
+    stage_model, _, schedule, device, _, is_first_stage = (
         _build_pp_only_model_and_stage()
     )
     optimizer = torch.optim.AdamW(stage_model.parameters(), lr=_LR)
