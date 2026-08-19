@@ -269,8 +269,6 @@ def test_u7_empty_param_group_flatten_error():
     format. This makes it impossible to reconstruct the empty group during
     unflatten, so UnsupportedConfigurationError is raised.
     """
-    _model = _SimpleNet()
-
     nested_sd = {
         "state": {
             "linear1.weight": {

@@ -161,7 +161,7 @@ def _fsdp_ep_train_step(moe, optimizer, x, grad_scale):
 # =====================================================================
 def test_e1_ep_optim_state_dict_fqn_roundtrip():
     """EP-only: get_optim_state_dict (default) -> set_optim_state_dict -> step."""
-    moe, _mesh, device = _make_ep_model()
+    moe, _, device = _make_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -178,7 +178,7 @@ def test_e1_ep_optim_state_dict_fqn_roundtrip():
                     f"state.{fqn}.{key} should be plain Tensor, got DTensor"
                 )
 
-    moe2, _mesh2, _device2 = _make_ep_model()
+    moe2, _, _ = _make_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _ep_train_step(moe2, optimizer2, x)
 
@@ -194,7 +194,7 @@ def test_e1_ep_optim_state_dict_fqn_roundtrip():
 # =====================================================================
 def test_e2_ep_optim_state_dict_cpu_offload():
     """EP-only: get with cpu_offload -> set -> step."""
-    moe, _mesh, device = _make_ep_model()
+    moe, _, device = _make_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -211,7 +211,7 @@ def test_e2_ep_optim_state_dict_cpu_offload():
                     f"state.{fqn}.{key} should be on CPU, got {value.device}"
                 )
 
-    moe2, _mesh2, _device2 = _make_ep_model()
+    moe2, _, _ = _make_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _ep_train_step(moe2, optimizer2, x)
 
@@ -239,7 +239,7 @@ def test_e2_ep_optim_state_dict_cpu_offload():
 # =====================================================================
 def test_e3_fsdp_ep_optim_state_dict_fqn_roundtrip():
     """FSDP+EP: get_optim_state_dict (default) -> set_optim_state_dict -> step."""
-    moe, _mesh, device, grad_scale = _make_fsdp_ep_model()
+    moe, _, device, grad_scale = _make_fsdp_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -256,7 +256,7 @@ def test_e3_fsdp_ep_optim_state_dict_fqn_roundtrip():
                     f"state.{fqn}.{key} should be plain Tensor, got DTensor"
                 )
 
-    moe2, _mesh2, _device2, grad_scale2 = _make_fsdp_ep_model()
+    moe2, _, _, grad_scale2 = _make_fsdp_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
 
@@ -272,7 +272,7 @@ def test_e3_fsdp_ep_optim_state_dict_fqn_roundtrip():
 # =====================================================================
 def test_e4_fsdp_ep_optim_state_dict_full_cpu_broadcast():
     """FSDP+EP: get with full_state_dict+cpu_offload -> set with broadcast -> step."""
-    moe, _mesh, device, grad_scale = _make_fsdp_ep_model()
+    moe, _, device, grad_scale = _make_fsdp_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -289,7 +289,7 @@ def test_e4_fsdp_ep_optim_state_dict_full_cpu_broadcast():
                     f"state.{fqn}.{key} should be on CPU, got {value.device}"
                 )
 
-    moe2, _mesh2, _device2, grad_scale2 = _make_fsdp_ep_model()
+    moe2, _, _, grad_scale2 = _make_fsdp_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
 
@@ -309,7 +309,7 @@ def test_e4_fsdp_ep_optim_state_dict_full_cpu_broadcast():
 # =====================================================================
 def test_e5_fsdp_ep_optim_state_dict_flatten():
     """FSDP+EP: get with flatten_optimizer_state_dict=True -> set -> step."""
-    moe, _mesh, device, grad_scale = _make_fsdp_ep_model()
+    moe, _, device, grad_scale = _make_fsdp_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -324,7 +324,7 @@ def test_e5_fsdp_ep_optim_state_dict_flatten():
             f"flat key '{key}' should start with 'state.' or 'param_group.'"
         )
 
-    moe2, _mesh2, _device2, grad_scale2 = _make_fsdp_ep_model()
+    moe2, _, _, grad_scale2 = _make_fsdp_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
 
@@ -340,7 +340,7 @@ def test_e5_fsdp_ep_optim_state_dict_flatten():
 # =====================================================================
 def test_e6_fsdp_ep_local_shape_correctness():
     """Verify optimizer state tensors have correct local shard shape under FSDP+EP."""
-    moe, _mesh, device, grad_scale = _make_fsdp_ep_model()
+    moe, _, device, grad_scale = _make_fsdp_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 

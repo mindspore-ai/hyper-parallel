@@ -194,12 +194,11 @@ def _train_step(model, optimizer, x):
 # =====================================================================
 def test_c1_cp_fsdp_optim_state_dict_fqn_roundtrip():
     """CP+FSDP: get_optim_state_dict (default) -> set_optim_state_dict -> step."""
-    model, mesh, _fsdp_mesh, device = _make_cp_fsdp_model()
+    model, _, _, device = _make_cp_fsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
 
     cp_size = 2
     local_slen = SEQ_LEN // cp_size
-    _cp_rank = mesh.get_local_rank("cp")
     x = torch.randn(BATCH, local_slen, DIM, device=device)
 
     for _ in range(2):
@@ -214,7 +213,7 @@ def test_c1_cp_fsdp_optim_state_dict_fqn_roundtrip():
                     f"state.{fqn}.{key} should be plain Tensor, got DTensor"
                 )
 
-    model2, _mesh2, _fsdp_mesh2, _device2 = _make_cp_fsdp_model()
+    model2, _, _, _ = _make_cp_fsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _train_step(model2, optimizer2, x)
 
@@ -230,7 +229,7 @@ def test_c1_cp_fsdp_optim_state_dict_fqn_roundtrip():
 # =====================================================================
 def test_c2_cp_fsdp_optim_state_dict_full_cpu_broadcast():
     """CP+FSDP: get with full_state_dict+cpu_offload -> set with broadcast -> step."""
-    model, _mesh, _fsdp_mesh, device = _make_cp_fsdp_model()
+    model, _, _, device = _make_cp_fsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
 
     cp_size = 2
@@ -250,7 +249,7 @@ def test_c2_cp_fsdp_optim_state_dict_full_cpu_broadcast():
                     f"state.{fqn}.{key} should be on CPU, got {value.device}"
                 )
 
-    model2, _mesh2, _fsdp_mesh2, _device2 = _make_cp_fsdp_model()
+    model2, _, _, _ = _make_cp_fsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _train_step(model2, optimizer2, x)
 
@@ -270,7 +269,7 @@ def test_c2_cp_fsdp_optim_state_dict_full_cpu_broadcast():
 # =====================================================================
 def test_c3_cp_fsdp_optim_state_dict_flatten():
     """CP+FSDP: get with flatten_optimizer_state_dict=True -> set -> step."""
-    model, _mesh, _fsdp_mesh, device = _make_cp_fsdp_model()
+    model, _, _, device = _make_cp_fsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
 
     cp_size = 2
@@ -288,7 +287,7 @@ def test_c3_cp_fsdp_optim_state_dict_flatten():
             f"flat key '{key}' should start with 'state.' or 'param_group.'"
         )
 
-    model2, _mesh2, _fsdp_mesh2, _device2 = _make_cp_fsdp_model()
+    model2, _, _, _ = _make_cp_fsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _train_step(model2, optimizer2, x)
 
@@ -304,7 +303,7 @@ def test_c3_cp_fsdp_optim_state_dict_flatten():
 # =====================================================================
 def test_c4_cp_fsdp_local_shape_correctness():
     """Verify optimizer state tensors have correct local shard shape under CP+FSDP."""
-    model, _mesh, _fsdp_mesh, device = _make_cp_fsdp_model()
+    model, _, _, device = _make_cp_fsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
 
     cp_size = 2
@@ -315,7 +314,6 @@ def test_c4_cp_fsdp_local_shape_correctness():
         _train_step(model, optimizer, x)
 
     sd = get_optim_state_dict(model, optimizer)
-    _fsdp_size = 4
 
     for fqn, state in sd["state"].items():
         for key, value in state.items():
