@@ -576,7 +576,8 @@ def apply_model_infrastructure(
 
     The execution order is: parallel layout -> recompute wrappers -> FSDP2 ->
     materialization/loading -> per-layer compile. Placement validation keeps
-    the DTensor placement path and skips FSDP2 and compile.
+    the DTensor placement path and skips compile, while FSDP2 consumes DTensor
+    parameter layouts in both modes.
     """
 
     distributed_setup = kwargs.get("distributed_setup")
@@ -656,16 +657,13 @@ def apply_model_infrastructure(
         model = apply_attention_swap(model, activation_swap)
 
 
-    # Step 10: FSDP2 is execution-only; validation retains DTensor placement.
-    if validate_placement:
-        if fsdp2_manager is not None:
-            logger.info("Skipping FSDP2 wrap during placement validation")
-    else:
-        model = _apply_fsdp2(
-            model,
-            fsdp2_manager,
-            source_shard_info,
-        )
+    # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
+    # as DTensors, and FSDP derives their source layouts directly.
+    model = _apply_fsdp2(
+        model,
+        fsdp2_manager,
+        source_shard_info,
+    )
 
     # Steps 11-12: materialize model storage, then load or initialize weights.
     model = _move_model_to_device(model, is_meta_device, device)

@@ -163,7 +163,7 @@ def test_compile_layers_are_stable_and_compile_in_place() -> None:
 
 @pytest.mark.parametrize(
     ("validate_placement", "expected_compile", "expected_fsdp_calls"),
-    [(True, False, 0), (False, True, 1)],
+    [(True, False, 1), (False, True, 1)],
 )
 def test_model_infrastructure_compiles_only_for_execution(
     monkeypatch: pytest.MonkeyPatch,
@@ -171,7 +171,7 @@ def test_model_infrastructure_compiles_only_for_execution(
     expected_compile: bool,
     expected_fsdp_calls: int,
 ) -> None:
-    """Compile only the execution model and keep validation free of FSDP/compile calls."""
+    """Apply FSDP in both modes while compiling only the production model."""
     model = _TinyDecoder()
     fsdp2_manager = _FakeFSDP2Manager()
     compile_calls = []

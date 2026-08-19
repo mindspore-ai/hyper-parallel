@@ -84,6 +84,10 @@ from hyper_models.components.distributed.head_count import (
     maybe_update_head_counts,
 )
 from hyper_models.components.distributed.infrastructure import MeshContext
+from hyper_models.components.distributed.local_compute_context import (
+    install_local_compute_forward_adapters,
+    local_compute_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -652,10 +656,10 @@ def _install_bias_suppression(module, spec):
                               **kwargs):
             bias = __owner.bias
             try:
-                __owner.bias = None   # nn.Module allows None for a registered param
+                __owner._parameters["bias"] = None  # pylint: disable=protected-access
                 return __original(*args, **kwargs)
             finally:
-                __owner.bias = bias
+                __owner._parameters["bias"] = bias  # pylint: disable=protected-access
 
         owner.forward = bias_free_forward
 
@@ -739,6 +743,7 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
             mesh_dim_names,
             op_lowerer=boundary_op_lowerer,
         )
+        keep_output_dtensor = _keep_loss_parallel_output(plan, spec)
         _bind_input_indices(boundary, module)
         # 注入纪律：声明注入必须显式 region_dispatch；无注入声明 True 是冗余
         _require_region_dispatch(spec, source=f"boundary {module_fqn!r}")
@@ -767,7 +772,7 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         _wrap_inner_attention(
             module, cp_mesh, spec=spec, mesh=mesh,
             mesh_dim_names=mesh_dim_names, tp_mesh=tp_mesh,
-            ep_mesh=expert_mesh,
+            ep_mesh=expert_mesh, validate_mode=validate_mode,
         )
 
         # Step 2: forward wrapping
@@ -808,12 +813,34 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 validate_mode=validate_mode, compute_fn=compute_fn,
                 exclude_subtrees=nested)
         elif validate_mode:
-            _wrap_validate_forward(module, boundary, spec, mesh_dim_names)
+            _wrap_validate_forward(
+                module,
+                boundary,
+                spec,
+                mesh_dim_names,
+                keep_output_dtensor=keep_output_dtensor,
+            )
         else:
             # D-02: production vocab-parallel embedding masked wrapper
             if _is_vocab_parallel_embed(module, spec, tp_mesh):
                 _wrap_vocab_parallel_embedding(module, tp_mesh)
-            _wrap_production_forward(module, boundary, spec)
+            _wrap_production_forward(
+                module,
+                boundary,
+                spec,
+                keep_output_dtensor=keep_output_dtensor,
+            )
+
+
+def _keep_loss_parallel_output(plan, spec):
+    """Return whether a terminal vocab-sharded output must remain a DTensor."""
+    if not plan.loss_parallel or not spec._is_terminal:  # pylint: disable=protected-access
+        return False
+    output_placements = (spec.out_dst or {}).get("output", {})
+    return any(
+        isinstance(placement, Shard) and placement.dim == -1
+        for placement in output_placements.values()
+    )
 
 
 def _descendant_boundary_fqns(plan, module_fqn):
@@ -857,7 +884,8 @@ def _bind_input_indices(boundary, module):
         boundary.in_plan[0].arg_index = 0
 
 
-def _wrap_production_forward(module, boundary, spec=None):
+def _wrap_production_forward(
+        module, boundary, spec=None, keep_output_dtensor=False):
     """Production mode: pure local tensor computation + precompiled boundary communication (05 §4.4.1).
 
     _local_params_context was already invoked at the Phase C entry (parameters
@@ -869,7 +897,10 @@ def _wrap_production_forward(module, boundary, spec=None):
     def production_forward(*args, **kwargs):
         args, kwargs = boundary.redistribute_inputs(args, kwargs)
         outputs = original_forward(*args, **kwargs)
-        outputs = boundary.redistribute_outputs(outputs)
+        outputs = boundary.redistribute_outputs(
+            outputs,
+            as_dtensor_input=keep_output_dtensor,
+        )
         # D-22: deferred rowwise biases — added once after the exit reduction
         return _maybe_add_deferred_biases(module, spec, outputs) \
             if spec is not None else outputs
@@ -877,7 +908,8 @@ def _wrap_production_forward(module, boundary, spec=None):
     module.forward = production_forward
 
 
-def _wrap_validate_forward(module, boundary, spec, mesh_dim_names):
+def _wrap_validate_forward(
+        module, boundary, spec, mesh_dim_names, keep_output_dtensor=False):
     """Validate mode: DTensor propagation end to end -> validate out_src (core) + out_dst (terminal modules only).
 
     The in-house DTensor is forward-only: validation covers only forward
@@ -921,7 +953,7 @@ def _wrap_validate_forward(module, boundary, spec, mesh_dim_names):
         # but under an outer DTensor-propagating boundary (D-14 nesting, 05
         # §13.4) keep the DTensor so the outer forward's dispatch chain is
         # unbroken; the outermost boundary exit unwraps.
-        if nested:
+        if nested or keep_output_dtensor:
             return outputs
         if isinstance(outputs, DTensor):
             outputs = outputs.to_local()
@@ -1177,6 +1209,8 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         out_src_placements = tuple(resolve_placements(out_src_named, mesh_dim_names))
 
     dispatch_through = bool(getattr(spec, "region_dispatch", None))
+    if validate_mode and not dispatch_through:
+        install_local_compute_forward_adapters(module, exclude=exclude_subtrees)
 
     @functools.wraps(original_forward)
     def local_region_forward(*args, **kwargs):
@@ -1208,8 +1242,9 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
                 k: (v.to_local() if isinstance(v, DTensor) else v)
                 for k, v in kwargs.items()
             }
-            with _temp_local_params(module, exclude=exclude_subtrees):
-                output = compute_fn(*local_args, **local_kwargs)
+            with local_compute_context():
+                with _temp_local_params(module, exclude=exclude_subtrees):
+                    output = compute_fn(*local_args, **local_kwargs)
         else:
             output = compute_fn(*args, **kwargs)
 
@@ -1304,13 +1339,14 @@ def _validate_inner_dispatch_output(
     if expected_placements is None:
         return
     outputs = list(output) if isinstance(output, (tuple, list)) else [output]
-    if len(outputs) != len(expected_placements):
+    tensor_outputs = [tensor for tensor in outputs if isinstance(tensor, torch.Tensor)]
+    if len(tensor_outputs) != len(expected_placements):
         raise RuntimeError(
-            f"inner_wrapper {wrapper_name!r}: 输出数量 {len(outputs)} 与声明的 "
+            f"inner_wrapper {wrapper_name!r}: 张量输出数量 {len(tensor_outputs)} 与声明的 "
             f"{len(expected_placements)} 个 placement 不符——多输出契约必须逐名"
             "声明且数量一致"
         )
-    for tensor, placements in zip(outputs, expected_placements):
+    for tensor, placements in zip(tensor_outputs, expected_placements):
         if not isinstance(tensor, DTensor):
             raise RuntimeError(
                 f"inner_wrapper {wrapper_name!r} [region_dispatch=True]: "
@@ -1335,19 +1371,24 @@ def _rewrap_inner_tensor(tensor, placements, mesh):
 
 
 def _rewrap_inner_outputs(output, out_placements, mesh, wrapper_name):
-    """Rewrap one or multiple local outputs using explicit placements."""
+    """Rewrap tensor outputs while preserving auxiliary non-tensor outputs."""
     if not isinstance(output, (tuple, list)):
         return _rewrap_inner_tensor(output, out_placements[0], mesh)
-    if len(output) != len(out_placements):
+    tensor_output_count = sum(isinstance(value, torch.Tensor) for value in output)
+    if tensor_output_count != len(out_placements):
         raise RuntimeError(
-            f"inner_wrapper {wrapper_name!r}: 替换 forward 返回了 {len(output)} "
-            f"个输出，与声明的 {len(out_placements)} 个 placement 不符——多输出"
+            f"inner_wrapper {wrapper_name!r}: 替换 forward 返回了 {tensor_output_count} 个张量输出，"
+            f"与声明的 {len(out_placements)} 个 placement 不符——多输出"
             "契约必须逐名声明且数量一致"
         )
-    return tuple(
-        _rewrap_inner_tensor(tensor, placements, mesh)
-        for tensor, placements in zip(output, out_placements)
-    )
+    placement_iter = iter(out_placements)
+    wrapped = [
+        _rewrap_inner_tensor(value, next(placement_iter), mesh)
+        if isinstance(value, torch.Tensor)
+        else value
+        for value in output
+    ]
+    return tuple(wrapped) if isinstance(output, tuple) else wrapped
 
 
 def _resolve_inner_output_placements(
@@ -1399,7 +1440,7 @@ def _resolve_inner_output_placements(
 
 
 def _install_inner_adapter(target, user_fwd, boundary_module, spec, mesh,
-                           mesh_dim_names, wrapper_name):
+                           mesh_dim_names, wrapper_name, validate_mode=False):
     """统一双模适配器：安装期解析重包规则，运行期零决策（05 §4.4.2 + D-01''）。
 
     用户 wrapper 的替换 forward 只面向 local 张量。适配器负责：
@@ -1424,6 +1465,8 @@ def _install_inner_adapter(target, user_fwd, boundary_module, spec, mesh,
         mesh_dim_names,
         wrapper_name,
     )
+    if validate_mode and not getattr(spec, "region_dispatch", None):
+        install_local_compute_forward_adapters(target)
 
     @functools.wraps(user_fwd)
     def adapted(*args, **kwargs):
@@ -1459,8 +1502,9 @@ def _install_inner_adapter(target, user_fwd, boundary_module, spec, mesh,
             a.to_local() if isinstance(a, DTensor) else a for a in args)
         local_kwargs = {k: (v.to_local() if isinstance(v, DTensor) else v)
                         for k, v in kwargs.items()}
-        with _temp_local_params(target):
-            out = user_fwd(*local_args, **local_kwargs)
+        with local_compute_context():
+            with _temp_local_params(target):
+                out = user_fwd(*local_args, **local_kwargs)
 
         if first_input_rule:
             if isinstance(out, (tuple, list)):
@@ -1567,7 +1611,8 @@ def _resolve_inner_wrapper(module, spec, cp_mesh, mesh, tp_mesh=None,
 
 
 def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
-                          mesh_dim_names=(), tp_mesh=None, ep_mesh=None):
+                          mesh_dim_names=(), tp_mesh=None, ep_mesh=None,
+                          validate_mode=False):
     """Inject an inner forward wrapper (one-shot replacement at apply time, 05 §4.4.2).
 
     General "weave into / replace the inner forward" mechanism — **not gated
@@ -1614,7 +1659,8 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
         # 转换与声明式重包由适配器托管（local_map 语义；validate 对
         # inner 区域跳过传播校验，安全网在边界层）
         _install_inner_adapter(
-            target, new_forward, module, spec, mesh, mesh_dim_names, name)
+            target, new_forward, module, spec, mesh, mesh_dim_names, name,
+            validate_mode=validate_mode)
     target_name = _inner_target_name(module, target)
     if spec is not None:
         spec._resolved_inner_wrapper = name  # pylint: disable=protected-access

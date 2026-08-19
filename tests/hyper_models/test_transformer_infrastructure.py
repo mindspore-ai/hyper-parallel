@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 from torch import nn
 
+from hyper_models._transformers import auto_model as auto_model_module
 from hyper_models._transformers.infrastructure import _apply_module_replacement_actions
 from hyper_models.components.model_transform import module_replacement
 from hyper_models.trainer.config import PlanOverride, Target
@@ -73,3 +74,50 @@ def test_invalid_fqn_fails_during_pre_sharding_replacement_compilation():
         assert "matched no module" in str(exc)
     else:
         raise AssertionError("invalid replacement FQN must fail before sharding")
+
+
+def test_build_model_forwards_distributed_setup_to_infrastructure(monkeypatch):
+    setup = _setup()
+    model = nn.Linear(4, 8)
+    captured = {}
+
+    monkeypatch.setattr(
+        "hyper_models.components.distributed.init_utils.get_world_size_safe",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        auto_model_module,
+        "_init_model",
+        lambda *args, **kwargs: (False, model),
+    )
+    monkeypatch.setattr(auto_model_module, "_current_device", lambda: "cpu")
+
+    def _apply_model_infrastructure(input_model, **kwargs):
+        captured.update(kwargs)
+        return input_model
+
+    monkeypatch.setattr(
+        auto_model_module,
+        "apply_model_infrastructure",
+        _apply_model_infrastructure,
+    )
+
+    result = auto_model_module.HyperAutoModelForCausalLM._build_model(
+        "unused",
+        is_hf_model=True,
+        hf_config=object(),
+        mesh=None,
+        sharding_planner=None,
+        fsdp2_manager=None,
+        autopipeline=None,
+        backend=None,
+        peft_config=None,
+        torch_dtype="auto",
+        attn_implementation="sdpa",
+        validate_placement=False,
+        load_base_model=False,
+        distributed_setup=setup,
+    )
+
+    assert result is model
+    assert captured["distributed_setup"] is setup
