@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for Qwen3-30B-A3B attention activation swapping."""
+"""Tests for Qwen3 attention activation swapping."""
 
 import os
 from types import SimpleNamespace
@@ -30,8 +30,8 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 
 from hyper_models.components.activation_swap.attention_swap import (
-    apply_qwen3_moe_attention_swap,
-    qwen3_attention_swap_policy,
+    apply_attention_swap,
+    attention_swap_policy,
     validate_attention_swap,
 )
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy
@@ -89,11 +89,11 @@ def test_attention_swap_policy_filters_unsafe_or_small_tensors() -> None:
     shared_storage_view = base[:512]
     large = torch.empty(512, 512, requires_grad=True)
 
-    assert qwen3_attention_swap_policy(no_grad) is CheckpointPolicy.MUST_SAVE
-    assert qwen3_attention_swap_policy(one_dimensional) is CheckpointPolicy.MUST_SAVE
-    assert qwen3_attention_swap_policy(small) is CheckpointPolicy.MUST_SAVE
-    assert qwen3_attention_swap_policy(shared_storage_view) is CheckpointPolicy.MUST_SAVE
-    assert qwen3_attention_swap_policy(large) is CheckpointPolicy.MUST_SWAP
+    assert attention_swap_policy(no_grad) is CheckpointPolicy.MUST_SAVE
+    assert attention_swap_policy(one_dimensional) is CheckpointPolicy.MUST_SAVE
+    assert attention_swap_policy(small) is CheckpointPolicy.MUST_SAVE
+    assert attention_swap_policy(shared_storage_view) is CheckpointPolicy.MUST_SAVE
+    assert attention_swap_policy(large) is CheckpointPolicy.MUST_SWAP
 
 
 @pytest.mark.parametrize(
@@ -120,7 +120,7 @@ def test_attention_swap_only_wraps_attention_and_schedules_local_layers() -> Non
         "hyper_models.components.activation_swap.attention_swap.SwapManager",
         return_value=manager,
     ):
-        result = apply_qwen3_moe_attention_swap(model, "attention")
+        result = apply_attention_swap(model, "attention")
 
     assert result is model
     assert all(isinstance(layer.self_attn, SwapWrapper) for layer in model.model.layers)
@@ -128,3 +128,57 @@ def test_attention_swap_only_wraps_attention_and_schedules_local_layers() -> Non
     assert [layer.mlp for layer in model.model.layers] == mlps
     assert set(model.state_dict()) == state_dict_keys
     assert manager.set_forward_prefetch_layer.call_count == 47
+
+
+class _ComputeBlock(nn.Module):
+    """Lightweight stand-in for an attention implementation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(2, 2)
+
+
+class _Qwen3StyleLayer(nn.Module):
+    """Lightweight Qwen3-style layer exposing ``self_attn``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.self_attn = _ComputeBlock()
+        self.attention = _ComputeBlock()
+        self.attn = _ComputeBlock()
+        self.mlp = nn.Linear(2, 2)
+
+
+class _NestedQwen3StyleModel(nn.Module):
+    """Qwen3-style layers under a non-standard outer module path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = nn.Module()
+        self.backbone.blocks = nn.Sequential(_Qwen3StyleLayer(), _Qwen3StyleLayer())
+
+
+def test_attention_swap_finds_self_attn_without_fixed_model_structure() -> None:
+    model = _NestedQwen3StyleModel()
+    manager = MagicMock()
+
+    with patch(
+        "hyper_models.components.activation_swap.attention_swap.SwapManager",
+        return_value=manager,
+    ):
+        result = apply_attention_swap(model, "attention")
+
+    assert result is model
+    for layer in model.backbone.blocks:
+        assert isinstance(layer.self_attn, SwapWrapper)
+        assert not isinstance(layer.attention, SwapWrapper)
+        assert not isinstance(layer.attn, SwapWrapper)
+        assert not isinstance(layer.mlp, SwapWrapper)
+    assert manager.set_forward_prefetch_layer.call_count == 1
+
+
+def test_attention_swap_rejects_model_without_self_attn() -> None:
+    model = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
+
+    with pytest.raises(ValueError, match="found no self_attn modules"):
+        apply_attention_swap(model, "attention")
