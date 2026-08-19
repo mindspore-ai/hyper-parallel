@@ -34,15 +34,16 @@ Key design decisions for TP optimizer state dict testing:
     all-reduce/all-gather), so optimizer states should be identical across
     ranks. For TP+FSDP, DP ranks within the same TP group shard the model.
 """
+import math
 import os
 import shutil
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-import torch_npu  # noqa: F401,E402
+import torch_npu  # noqa: F401,E402  # pylint: disable=unused-import
 from torch import nn  # noqa: E402
 from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E402
 
@@ -55,18 +56,10 @@ from hyper_parallel import (  # noqa: E402
     parallelize_module,
     set_optim_state_dict,
 )
-from hyper_parallel.core.distributed_checkpoint import (  # noqa: E402
-    FileSystemReader,
-    save,
-    load,
-)
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.fully_shard.api import fully_shard  # noqa: E402
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy  # noqa: E402
-from hyper_parallel.platform.torch.fully_shard.optim_state_dict_utils import (  # noqa: E402
-    _build_optim_state_dict_load_template,
-)
-from tests.torch.utils import init_dist  # noqa: E402
+from tests.torch.utils import init_dist  # noqa: E402  # pylint: enable=wrong-import-position
 
 IN_F = 32
 HIDDEN_F = 64
@@ -85,6 +78,7 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(hidden_f, out_f, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: two-layer MLP with ReLU activation."""
         return self.w2(F.relu(self.w1(x)))
 
 
@@ -182,7 +176,7 @@ def _tp_fsdp_train_step(model, optimizer, x):
 # =====================================================================
 def test_t1_tp_optim_state_dict_fqn_roundtrip():
     """TP-only: get_optim_state_dict (default) -> set_optim_state_dict -> step."""
-    model, mesh = _make_tp_model()
+    model, _mesh = _make_tp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     x = torch.randn(BATCH, IN_F).npu()
 
@@ -198,13 +192,13 @@ def test_t1_tp_optim_state_dict_fqn_roundtrip():
                     f"state.{fqn}.{key} should be plain Tensor, got DTensor"
                 )
 
-    model2, mesh2 = _make_tp_model()
+    model2, _mesh2 = _make_tp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _tp_train_step(model2, optimizer2, x)
 
     set_optim_state_dict(model2, optimizer2, sd)
     loss_after = _tp_train_step(model2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after roundtrip step: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after roundtrip step: {loss_after}"
 
     print(f"[rank{_rank()}] T1 PASS: TP-only FQN roundtrip (loss={loss_after:.4f})")
 
@@ -214,7 +208,7 @@ def test_t1_tp_optim_state_dict_fqn_roundtrip():
 # =====================================================================
 def test_t2_tp_optim_state_dict_cpu_offload():
     """TP-only: get with cpu_offload -> set -> step."""
-    model, mesh = _make_tp_model()
+    model, _mesh = _make_tp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     x = torch.randn(BATCH, IN_F).npu()
 
@@ -231,7 +225,7 @@ def test_t2_tp_optim_state_dict_cpu_offload():
                     f"state.{fqn}.{key} should be on CPU, got {value.device}"
                 )
 
-    model2, mesh2 = _make_tp_model()
+    model2, _mesh2 = _make_tp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _tp_train_step(model2, optimizer2, x)
 
@@ -249,7 +243,7 @@ def test_t2_tp_optim_state_dict_cpu_offload():
             )
 
     loss_after = _tp_train_step(model2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after cpu_offload roundtrip: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after cpu_offload roundtrip: {loss_after}"
 
     print(f"[rank{_rank()}] T2 PASS: TP-only cpu_offload roundtrip (loss={loss_after:.4f})")
 
@@ -259,7 +253,7 @@ def test_t2_tp_optim_state_dict_cpu_offload():
 # =====================================================================
 def test_t3_tp_fsdp_optim_state_dict_fqn_roundtrip():
     """TP+FSDP: get_optim_state_dict (default) -> set_optim_state_dict -> step."""
-    model, mesh, dp_mesh, tp_mesh = _make_tp_fsdp_model()
+    model, _mesh, _dp_mesh, _tp_mesh = _make_tp_fsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     x = torch.randn(BATCH, IN_F).npu()
 
@@ -275,13 +269,13 @@ def test_t3_tp_fsdp_optim_state_dict_fqn_roundtrip():
                     f"state.{fqn}.{key} should be plain Tensor, got DTensor"
                 )
 
-    model2, mesh2, dp_mesh2, tp_mesh2 = _make_tp_fsdp_model()
+    model2, _mesh2, _dp_mesh2, _tp_mesh2 = _make_tp_fsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _tp_fsdp_train_step(model2, optimizer2, x)
 
     set_optim_state_dict(model2, optimizer2, sd)
     loss_after = _tp_fsdp_train_step(model2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after roundtrip step: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after roundtrip step: {loss_after}"
 
     print(f"[rank{_rank()}] T3 PASS: TP+FSDP FQN roundtrip (loss={loss_after:.4f})")
 
@@ -291,7 +285,7 @@ def test_t3_tp_fsdp_optim_state_dict_fqn_roundtrip():
 # =====================================================================
 def test_t4_tp_fsdp_optim_state_dict_full_cpu_broadcast():
     """TP+FSDP: get with full_state_dict+cpu_offload -> set with broadcast -> step."""
-    model, mesh, dp_mesh, tp_mesh = _make_tp_fsdp_model()
+    model, _mesh, _dp_mesh, _tp_mesh = _make_tp_fsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     x = torch.randn(BATCH, IN_F).npu()
 
@@ -308,7 +302,7 @@ def test_t4_tp_fsdp_optim_state_dict_full_cpu_broadcast():
                     f"state.{fqn}.{key} should be on CPU, got {value.device}"
                 )
 
-    model2, mesh2, dp_mesh2, tp_mesh2 = _make_tp_fsdp_model()
+    model2, _mesh2, _dp_mesh2, _tp_mesh2 = _make_tp_fsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _tp_fsdp_train_step(model2, optimizer2, x)
 
@@ -318,7 +312,7 @@ def test_t4_tp_fsdp_optim_state_dict_full_cpu_broadcast():
     set_optim_state_dict(model2, optimizer2, sd, options=opts_set)
 
     loss_after = _tp_fsdp_train_step(model2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after full+cpu+broadcast: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after full+cpu+broadcast: {loss_after}"
 
     print(f"[rank{_rank()}] T4 PASS: TP+FSDP full+cpu+broadcast (loss={loss_after:.4f})")
 
@@ -328,7 +322,7 @@ def test_t4_tp_fsdp_optim_state_dict_full_cpu_broadcast():
 # =====================================================================
 def test_t5_tp_fsdp_optim_state_dict_flatten():
     """TP+FSDP: get with flatten_optimizer_state_dict=True -> set -> step."""
-    model, mesh, dp_mesh, tp_mesh = _make_tp_fsdp_model()
+    model, _mesh, _dp_mesh, _tp_mesh = _make_tp_fsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     x = torch.randn(BATCH, IN_F).npu()
 
@@ -343,13 +337,13 @@ def test_t5_tp_fsdp_optim_state_dict_flatten():
             f"flat key '{key}' should start with 'state.' or 'param_group.'"
         )
 
-    model2, mesh2, dp_mesh2, tp_mesh2 = _make_tp_fsdp_model()
+    model2, _mesh2, _dp_mesh2, _tp_mesh2 = _make_tp_fsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _tp_fsdp_train_step(model2, optimizer2, x)
 
     set_optim_state_dict(model2, optimizer2, sd, options=opts)
     loss_after = _tp_fsdp_train_step(model2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after flatten roundtrip: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after flatten roundtrip: {loss_after}"
 
     print(f"[rank{_rank()}] T5 PASS: TP+FSDP flatten roundtrip (loss={loss_after:.4f})")
 
@@ -359,7 +353,7 @@ def test_t5_tp_fsdp_optim_state_dict_flatten():
 # =====================================================================
 def test_t6_tp_fsdp_local_shape_correctness():
     """Verify optimizer state tensors have correct local shard shape under TP+FSDP."""
-    model, mesh, dp_mesh, tp_mesh = _make_tp_fsdp_model()
+    model, _mesh, _dp_mesh, _tp_mesh = _make_tp_fsdp_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     x = torch.randn(BATCH, IN_F).npu()
 
@@ -369,7 +363,7 @@ def test_t6_tp_fsdp_local_shape_correctness():
     sd = get_optim_state_dict(model, optimizer)
 
     dp_size = 2
-    tp_size = 2
+    _tp_size = 2
 
     for fqn, state in sd["state"].items():
         for key, value in state.items():

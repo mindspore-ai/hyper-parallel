@@ -1775,7 +1775,6 @@ class MindSporePlatform(Platform):
         raise NotImplementedError(
             "issue240 optimizer state_dict adapter is currently supported only on Torch backend"
         )
-        )
 
     @staticmethod
     def save_checkpoint(cell: Union[Cell, dict], file_path: str, ckpt_format: str = "safetensors") -> None:

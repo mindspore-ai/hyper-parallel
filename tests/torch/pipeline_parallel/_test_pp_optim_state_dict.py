@@ -41,15 +41,16 @@ Key design decisions for PP optimizer state dict testing:
     step directly.  ``SkipDTensorDispatch`` is required for
     ``optimizer.step()`` on DTensor parameters (PP+HSDP tests).
 """
+import math
 import os
 import shutil
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import copy  # noqa: E402
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
-import torch_npu  # noqa: F401,E402
+import torch_npu  # noqa: F401,E402  # pylint: disable=unused-import
 from torch import nn  # noqa: E402
 from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E402
 
@@ -75,6 +76,7 @@ from hyper_parallel.platform.torch.fully_shard.optim_state_dict_utils import (  
     _build_optim_state_dict_load_template,
 )
 from tests.torch.utils import init_dist  # noqa: E402
+# pylint: enable=wrong-import-position
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -138,7 +140,7 @@ def _build_pp_only_model_and_stage():
     internally; after ``schedule.run()`` the gradients are already
     populated on each stage's parameters.
     """
-    rank, device_id = init_dist()
+    _rank_val, device_id = init_dist()
     device = torch.device("npu", device_id)
     pp_size = 2
     pp_rank = _rank()
@@ -192,7 +194,7 @@ def test_p1_pp_only_optim_state_dict_fqn_roundtrip():
     a training step without NaN, and FQN keys in the state dict correspond
     to the stage model's named_parameters.
     """
-    stage_model, pipeline_stage, schedule, device, pp_rank, is_first_stage = (
+    stage_model, _pipeline_stage, schedule, device, _pp_rank, is_first_stage = (
         _build_pp_only_model_and_stage()
     )
     optimizer = torch.optim.AdamW(stage_model.parameters(), lr=_LR)
@@ -218,7 +220,7 @@ def test_p1_pp_only_optim_state_dict_fqn_roundtrip():
                 )
 
     # Roundtrip: create new model + optimizer, load state dict, verify step
-    stage_model2, pipeline_stage2, schedule2, _, _, is_first2 = (
+    stage_model2, _pipeline_stage2, schedule2, _, _, is_first2 = (
         _build_pp_only_model_and_stage()
     )
     optimizer2 = torch.optim.AdamW(stage_model2.parameters(), lr=_LR)
@@ -234,7 +236,7 @@ def test_p1_pp_only_optim_state_dict_fqn_roundtrip():
             activation = sub_loss[0] if isinstance(sub_loss, (list, tuple)) else sub_loss
             total_loss = total_loss + activation.sum()
         loss_val = total_loss.item()
-        assert not (loss_val != loss_val), f"loss is NaN after roundtrip step: {loss_val}"
+        assert not math.isnan(loss_val), f"loss is NaN after roundtrip step: {loss_val}"
 
     print(f"[rank{_rank()}] P1 PASS: PP-only FQN roundtrip")
 
@@ -254,7 +256,7 @@ def test_p2_pp_only_cpu_offload_roundtrip():
     broadcast mechanism is only meaningful within a data-parallel group
     where all ranks share the same model (see P4 for PP+HSDP).
     """
-    stage_model, pipeline_stage, schedule, device, pp_rank, is_first_stage = (
+    stage_model, _pipeline_stage, schedule, device, _pp_rank_val, is_first_stage = (
         _build_pp_only_model_and_stage()
     )
     optimizer = torch.optim.AdamW(stage_model.parameters(), lr=_LR)
@@ -274,7 +276,7 @@ def test_p2_pp_only_cpu_offload_roundtrip():
                     f"state.{fqn}.{key} should be on CPU, got {value.device}"
                 )
 
-    stage_model2, pipeline_stage2, schedule2, _, _, is_first2 = (
+    stage_model2, _pipeline_stage2, schedule2, _, _, is_first2 = (
         _build_pp_only_model_and_stage()
     )
     optimizer2 = torch.optim.AdamW(stage_model2.parameters(), lr=_LR)
@@ -301,7 +303,7 @@ def test_p2_pp_only_cpu_offload_roundtrip():
             activation = sub_loss[0] if isinstance(sub_loss, (list, tuple)) else sub_loss
             total_loss = total_loss + activation.sum()
         loss_val = total_loss.item()
-        assert not (loss_val != loss_val), f"loss is NaN after cpu_offload roundtrip: {loss_val}"
+        assert not math.isnan(loss_val), f"loss is NaN after cpu_offload roundtrip: {loss_val}"
 
     print(f"[rank{_rank()}] P2 PASS: PP-only cpu_offload roundtrip")
 
@@ -327,7 +329,7 @@ def _build_pp_hsdp_stages():
     Each pp_rank owns 2 virtual stages (single-layer each).
     The 2-D ``(dp, fsdp)`` HSDP submesh drives ``fully_shard``.
     """
-    rank, device_id = init_dist()
+    _rank_val, device_id = init_dist()
     device = torch.device("npu", device_id)
 
     mesh = init_device_mesh(
@@ -394,7 +396,7 @@ def test_p3_pp_hsdp_optim_state_dict_fqn_roundtrip():
     Each stage has its own optimizer; FQNs are stage-local (e.g., layers.0.net1.weight).
     After roundtrip, the restored optimizer must produce a training step without NaN.
     """
-    stages, pipeline_stages, schedule, stage_optimizers, device, pp_rank, mesh, hsdp_mesh = (
+    stages, _pipeline_stages, schedule, stage_optimizers, device, pp_rank, _mesh, _hsdp_mesh = (
         _build_pp_hsdp_stages()
     )
     x = torch.randn(_NUM_MICROBATCHES, _D_HID, device=device)
@@ -416,7 +418,7 @@ def test_p3_pp_hsdp_optim_state_dict_fqn_roundtrip():
         all_sd.append(sd)
 
     # Build fresh model+optimizers, train one step, load state dict
-    stages2, pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
+    stages2, _pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
         _build_pp_hsdp_stages()
     )
     _pp_hsdp_train_step(schedule2, stage_optimizers2, x, pp_rank)
@@ -433,7 +435,7 @@ def test_p3_pp_hsdp_optim_state_dict_fqn_roundtrip():
             activation = sub_loss[0] if isinstance(sub_loss, (list, tuple)) else sub_loss
             total_loss = total_loss + activation.sum()
         loss_val = total_loss.item()
-        assert not (loss_val != loss_val), f"loss is NaN after roundtrip step: {loss_val}"
+        assert not math.isnan(loss_val), f"loss is NaN after roundtrip step: {loss_val}"
 
     print(f"[rank{_rank()}] P3 PASS: PP+HSDP FQN roundtrip")
 
@@ -454,7 +456,7 @@ def test_p4_pp_hsdp_full_cpu_restore_to_device():
     broadcast_from_rank0`` works correctly under PP+HSDP, where the
     replicate root is NOT global rank 0 for the second PP stage.
     """
-    stages, pipeline_stages, schedule, stage_optimizers, device, pp_rank, mesh, hsdp_mesh = (
+    stages, _pipeline_stages, schedule, stage_optimizers, device, pp_rank, _mesh, _hsdp_mesh = (
         _build_pp_hsdp_stages()
     )
     x = torch.randn(_NUM_MICROBATCHES, _D_HID, device=device)
@@ -477,7 +479,7 @@ def test_p4_pp_hsdp_full_cpu_restore_to_device():
         all_full_sd.append(sd)
 
     # Build fresh model+optimizers, train one step, then load full+cpu state
-    stages2, pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
+    stages2, _pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
         _build_pp_hsdp_stages()
     )
     _pp_hsdp_train_step(schedule2, stage_optimizers2, x, pp_rank)
@@ -509,7 +511,7 @@ def test_p4_pp_hsdp_full_cpu_restore_to_device():
             activation = sub_loss[0] if isinstance(sub_loss, (list, tuple)) else sub_loss
             total_loss = total_loss + activation.sum()
         loss_val = total_loss.item()
-        assert not (loss_val != loss_val), f"loss is NaN after roundtrip: {loss_val}"
+        assert not math.isnan(loss_val), f"loss is NaN after roundtrip: {loss_val}"
 
     print(f"[rank{_rank()}] P4 PASS: PP+HSDP full+cpu restore to correct device")
 
@@ -523,7 +525,7 @@ def test_p5_pp_hsdp_local_shape_correctness():
     Each parameter is sharded dim-0 over the fsdp dim (size 2), so local shape
     should have dim0 = _D_HID // _FSDP_SIZE.
     """
-    stages, pipeline_stages, schedule, stage_optimizers, device, pp_rank, mesh, hsdp_mesh = (
+    stages, _pipeline_stages, schedule, stage_optimizers, device, pp_rank, _mesh, _hsdp_mesh = (
         _build_pp_hsdp_stages()
     )
     x = torch.randn(_NUM_MICROBATCHES, _D_HID, device=device)
@@ -568,7 +570,7 @@ def test_p6_pp_hsdp_dcp_save_load_nested():
     saves a different stage's state dict.  ``no_dist=True`` sidesteps this
     by letting each rank save independently.
     """
-    stages, pipeline_stages, schedule, stage_optimizers, device, pp_rank, mesh, hsdp_mesh = (
+    stages, _pipeline_stages, schedule, stage_optimizers, device, pp_rank, _mesh, _hsdp_mesh = (
         _build_pp_hsdp_stages()
     )
     x = torch.randn(_NUM_MICROBATCHES, _D_HID, device=device)
@@ -590,7 +592,7 @@ def test_p6_pp_hsdp_dcp_save_load_nested():
         save(optim_sd, checkpoint_id=ckpt_path, no_dist=True)
 
     # Build fresh model+optimizers
-    stages2, pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
+    stages2, _pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
         _build_pp_hsdp_stages()
     )
 
@@ -620,7 +622,7 @@ def test_p6_pp_hsdp_dcp_save_load_nested():
             activation = sub_loss[0] if isinstance(sub_loss, (list, tuple)) else sub_loss
             total_loss = total_loss + activation.sum()
         loss_val = total_loss.item()
-        assert not (loss_val != loss_val), f"loss is NaN after DCP load: {loss_val}"
+        assert not math.isnan(loss_val), f"loss is NaN after DCP load: {loss_val}"
 
     print(f"[rank{_rank()}] P6 PASS: PP+HSDP DCP save/load + load template (nested)")
     _cleanup_ckpt(_CKPT_DIR_NESTED)
@@ -631,7 +633,7 @@ def test_p6_pp_hsdp_dcp_save_load_nested():
 # =====================================================================
 def test_p7_pp_hsdp_flatten_roundtrip():
     """PP+HSDP: get_optim_state_dict with flatten_optimizer_state_dict=True -> set -> step."""
-    stages, pipeline_stages, schedule, stage_optimizers, device, pp_rank, mesh, hsdp_mesh = (
+    stages, _pipeline_stages, schedule, stage_optimizers, device, pp_rank, _mesh, _hsdp_mesh = (
         _build_pp_hsdp_stages()
     )
     x = torch.randn(_NUM_MICROBATCHES, _D_HID, device=device)
@@ -650,7 +652,7 @@ def test_p7_pp_hsdp_flatten_roundtrip():
             )
         all_sd.append(sd)
 
-    stages2, pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
+    stages2, _pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
         _build_pp_hsdp_stages()
     )
     _pp_hsdp_train_step(schedule2, stage_optimizers2, x, pp_rank)
@@ -666,7 +668,7 @@ def test_p7_pp_hsdp_flatten_roundtrip():
             activation = sub_loss[0] if isinstance(sub_loss, (list, tuple)) else sub_loss
             total_loss = total_loss + activation.sum()
         loss_val = total_loss.item()
-        assert not (loss_val != loss_val), f"loss is NaN after flatten roundtrip: {loss_val}"
+        assert not math.isnan(loss_val), f"loss is NaN after flatten roundtrip: {loss_val}"
 
     print(f"[rank{_rank()}] P7 PASS: PP+HSDP flatten roundtrip")
 
@@ -695,7 +697,7 @@ def _build_asym_pp_hsdp_stages():
     ``broadcast_from_rank0`` must be scoped to each stage's HSDP
     subgroup — not broadcast stage 0's FQNs to stage 1.
     """
-    rank, device_id = init_dist()
+    _rank_val, device_id = init_dist()
     device = torch.device("npu", device_id)
 
     mesh = init_device_mesh(
@@ -762,7 +764,7 @@ def test_p4b_pp_hsdp_asymmetric_fqn_isolation_and_broadcast():
          produces a training step without NaN.
       5. Optimizer state tensors are on NPU after set.
     """
-    stage_model, pipeline_stage, schedule, optimizer, device, pp_rank, mesh, hsdp_mesh = (
+    stage_model, _pipeline_stage, schedule, optimizer, device, pp_rank, _mesh, _hsdp_mesh = (
         _build_asym_pp_hsdp_stages()
     )
     x = torch.randn(_NUM_MICROBATCHES, _D_HID, device=device)
@@ -812,7 +814,7 @@ def test_p4b_pp_hsdp_asymmetric_fqn_isolation_and_broadcast():
         )
 
     # (3) Roundtrip: build fresh model, load with broadcast
-    stage_model2, pipeline_stage2, schedule2, optimizer2, _, _, _, _ = (
+    stage_model2, _pipeline_stage2, schedule2, optimizer2, _, _, _, _ = (
         _build_asym_pp_hsdp_stages()
     )
     _asym_pp_hsdp_train_step(schedule2, optimizer2, x, pp_rank)
@@ -855,7 +857,7 @@ def test_p7b_pp_hsdp_flatten_dcp_cross_rank_key_consistency():
       3. DCP save with no_dist=True + flatten format -> load template -> load
          -> set_optim_state_dict -> training step without NaN.
     """
-    stages, pipeline_stages, schedule, stage_optimizers, device, pp_rank, mesh, hsdp_mesh = (
+    stages, _pipeline_stages, schedule, stage_optimizers, device, pp_rank, _mesh, _hsdp_mesh = (
         _build_pp_hsdp_stages()
     )
     x = torch.randn(_NUM_MICROBATCHES, _D_HID, device=device)
@@ -903,7 +905,7 @@ def test_p7b_pp_hsdp_flatten_dcp_cross_rank_key_consistency():
         ckpt_path = os.path.join(_CKPT_DIR_FLATTEN_DCP, f"pp{pp_rank}_vstage{v_stage}")
         save(all_sd[local_idx], checkpoint_id=ckpt_path, no_dist=True)
 
-    stages2, pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
+    stages2, _pipeline_stages2, schedule2, stage_optimizers2, _, _, _, _ = (
         _build_pp_hsdp_stages()
     )
 
@@ -926,7 +928,7 @@ def test_p7b_pp_hsdp_flatten_dcp_cross_rank_key_consistency():
             activation = sub_loss[0] if isinstance(sub_loss, (list, tuple)) else sub_loss
             total_loss = total_loss + activation.sum()
         loss_val = total_loss.item()
-        assert not (loss_val != loss_val), f"loss is NaN after flatten DCP roundtrip: {loss_val}"
+        assert not math.isnan(loss_val), f"loss is NaN after flatten DCP roundtrip: {loss_val}"
 
     print(f"[rank{_rank()}] P7b PASS: flatten DCP + key structure verification")
     _cleanup_ckpt(_CKPT_DIR_FLATTEN_DCP)

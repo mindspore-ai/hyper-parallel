@@ -26,7 +26,7 @@ Covers:
 """
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
@@ -38,7 +38,7 @@ from hyper_parallel.platform.torch.fully_shard.optim_state_dict_utils import (  
     _check_chained_optimizer,
     _flatten_optim_state_dict,
     _unflatten_optim_state_dict,
-)
+)  # pylint: enable=wrong-import-position
 
 
 class _DottedFQNNet(nn.Module):
@@ -49,6 +49,7 @@ class _DottedFQNNet(nn.Module):
         self.layer = nn.ModuleDict({"0": nn.Linear(hidden, hidden)})
 
     def forward(self, x):
+        """Forward pass through ModuleDict layer."""
         return self.layer["0"](x).sum()
 
 
@@ -61,6 +62,7 @@ class _SimpleNet(nn.Module):
         self.linear2 = nn.Linear(hidden, hidden)
 
     def forward(self, x):
+        """Forward pass: two linear layers with ReLU."""
         x = self.linear1(x)
         x = torch.relu(x)
         return self.linear2(x).sum()
@@ -267,7 +269,7 @@ def test_u7_empty_param_group_flatten_error():
     format. This makes it impossible to reconstruct the empty group during
     unflatten, so UnsupportedConfigurationError is raised.
     """
-    model = _SimpleNet()
+    _model = _SimpleNet()
 
     nested_sd = {
         "state": {
@@ -294,7 +296,8 @@ def test_u7_empty_param_group_flatten_error():
         },
         "param_groups": [
             {"params": [], "lr": 0.001, "initial_lr": 0.001},
-            {"params": ["linear1.weight", "linear1.bias", "linear2.weight", "linear2.bias"], "lr": 0.01, "initial_lr": 0.01},
+            {"params": ["linear1.weight", "linear1.bias", "linear2.weight", "linear2.bias"],
+             "lr": 0.01, "initial_lr": 0.01},
         ],
     }
 
@@ -310,7 +313,6 @@ def test_u8_chained_optimizer_rejection():
 
     class ChainedOptimizer:
         """Fake ChainedOptimizer for testing rejection."""
-        pass
 
     model = _SimpleNet()
     fake_optimizer = ChainedOptimizer()
@@ -367,7 +369,7 @@ def test_u10_unflatten_strict_false_inconsistent_fields():
         "param_group.linear2.bias.lr": 0.001,
     }
 
-    import logging
+    import logging  # pylint: disable=import-outside-toplevel
 
     class _LogCapture(logging.Handler):
         def __init__(self):

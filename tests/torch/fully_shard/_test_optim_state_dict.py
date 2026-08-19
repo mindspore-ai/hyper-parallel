@@ -26,14 +26,15 @@ Verified scenarios:
   O9 (4-card): HSDP local shape correctness after set_optim_state_dict
   O10 (4-card): full_state_dict + cpu_offload restore to correct device
 """
+import math
 import os
 import shutil
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
-import torch_npu  # noqa: F401,E402
+import torch_npu  # noqa: F401,E402  # pylint: disable=unused-import
 from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E402
 
 from hyper_parallel import (  # noqa: E402
@@ -54,7 +55,7 @@ from hyper_parallel.platform.torch.fully_shard.optim_state_dict_utils import (  
     _build_optim_state_dict_load_template,
 )
 from tests.torch.common_net import FullyShardTestNet  # noqa: E402
-from tests.torch.utils import init_dist  # noqa: E402
+from tests.torch.utils import init_dist  # noqa: E402  # pylint: enable=wrong-import-position
 
 HIDDEN = 32
 LAYERS = 2
@@ -90,6 +91,7 @@ def _is_replicate_root(mesh):
 
 
 def _make_hsdp_model():
+    """Build an HSDP model on 4-card 2-D mesh."""
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2),
@@ -150,7 +152,11 @@ def test_o1_optim_state_dict_fqn_roundtrip():
     source_exp_avg_norms = {}
     for pid, state in source_raw_sd["state"].items():
         if "step" in state:
-            source_step_vals[pid] = state["step"].item() if isinstance(state["step"], torch.Tensor) else float(state["step"])
+            source_step_vals[pid] = (
+                state["step"].item()
+                if isinstance(state["step"], torch.Tensor)
+                else float(state["step"])
+            )
         if "exp_avg" in state:
             source_exp_avg_norms[pid] = state["exp_avg"].norm().item()
 
@@ -161,23 +167,27 @@ def test_o1_optim_state_dict_fqn_roundtrip():
     set_optim_state_dict(model2, optimizer2, sd)
 
     target_raw_sd = optimizer2.state_dict()
-    for pid in source_step_vals:
+    for pid, source_step_val in source_step_vals.items():
         if pid in target_raw_sd["state"]:
             target_step = target_raw_sd["state"][pid]["step"]
-            target_step_val = target_step.item() if isinstance(target_step, torch.Tensor) else float(target_step)
-            assert target_step_val == source_step_vals[pid], (
-                f"step mismatch for pid={pid}: source={source_step_vals[pid]}, target={target_step_val}"
+            target_step_val = (
+                target_step.item()
+                if isinstance(target_step, torch.Tensor)
+                else float(target_step)
+            )
+            assert target_step_val == source_step_val, (
+                f"step mismatch for pid={pid}: source={source_step_val}, target={target_step_val}"
             )
 
-    for pid in source_exp_avg_norms:
+    for pid, source_exp_avg_norm in source_exp_avg_norms.items():
         if pid in target_raw_sd["state"] and "exp_avg" in target_raw_sd["state"][pid]:
             target_norm = target_raw_sd["state"][pid]["exp_avg"].norm().item()
-            assert abs(target_norm - source_exp_avg_norms[pid]) < 1e-5, (
-                f"exp_avg norm mismatch for pid={pid}: source={source_exp_avg_norms[pid]}, target={target_norm}"
+            assert abs(target_norm - source_exp_avg_norm) < 1e-5, (
+                f"exp_avg norm mismatch for pid={pid}: source={source_exp_avg_norm}, target={target_norm}"
             )
 
     loss_after = _train_step_with_optim(model2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after roundtrip step: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after roundtrip step: {loss_after}"
 
     print(f"[rank{_rank()}] O1 PASS: FQN roundtrip (loss={loss_after:.4f}, step/state verified)")
 
@@ -238,7 +248,7 @@ def test_o2_optim_state_dict_full_cpu():
             )
 
     loss_after = _train_step_with_optim(model2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after full+cpu roundtrip step: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after full+cpu roundtrip step: {loss_after}"
 
     print(f"[rank{_rank()}] O2 PASS: full + cpu_offload -> set -> step (loss={loss_after:.4f})")
 
@@ -346,7 +356,7 @@ def test_o5_optim_state_dict_strict_false():
         )
 
     loss_after = _train_step_with_optim(model2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after strict=False step: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after strict=False step: {loss_after}"
 
     print(f"[rank{_rank()}] O5 PASS: strict=False -> step (loss={loss_after:.4f})")
 
@@ -606,7 +616,7 @@ def test_o11_dcp_load_trained_optimizer():
     set_optim_state_dict(model2, optimizer2, target_sd)
 
     loss_after = _train_step_with_optim(model2, optimizer2, x)
-    assert not (loss_after != loss_after), (
+    assert not math.isnan(loss_after), (
         f"loss is NaN after trained optimizer DCP load step: {loss_after}"
     )
 

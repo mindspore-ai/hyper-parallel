@@ -33,14 +33,15 @@ Key design decisions for EP optimizer state dict testing:
     optimizer state dict. broadcast_from_rank0 only makes sense within DP groups
     where the same FQNs are present.
 """
+import math
 import os
 import shutil
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"  # pylint: disable=wrong-import-position
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
-import torch_npu  # noqa: F401,E402
+import torch_npu  # noqa: F401,E402  # pylint: disable=unused-import
 from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E402
 
 from hyper_parallel import (  # noqa: E402
@@ -48,20 +49,12 @@ from hyper_parallel import (  # noqa: E402
     init_device_mesh,
     set_optim_state_dict,
 )
-from hyper_parallel.core.distributed_checkpoint import (  # noqa: E402
-    FileSystemReader,
-    save,
-    load,
-)
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel  # noqa: E402
 from hyper_parallel.core.fully_shard.api import fully_shard  # noqa: E402
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy  # noqa: E402
 from hyper_parallel.platform.torch.common import MoE  # noqa: E402
-from hyper_parallel.platform.torch.fully_shard.optim_state_dict_utils import (  # noqa: E402
-    _build_optim_state_dict_load_template,
-)
-from tests.torch.utils import init_dist  # noqa: E402
+from tests.torch.utils import init_dist  # noqa: E402  # pylint: enable=wrong-import-position
 
 DIM = 64
 HIDDEN_DIM = 128
@@ -168,7 +161,7 @@ def _fsdp_ep_train_step(moe, optimizer, x, grad_scale):
 # =====================================================================
 def test_e1_ep_optim_state_dict_fqn_roundtrip():
     """EP-only: get_optim_state_dict (default) -> set_optim_state_dict -> step."""
-    moe, mesh, device = _make_ep_model()
+    moe, _mesh, device = _make_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -185,13 +178,13 @@ def test_e1_ep_optim_state_dict_fqn_roundtrip():
                     f"state.{fqn}.{key} should be plain Tensor, got DTensor"
                 )
 
-    moe2, mesh2, device2 = _make_ep_model()
+    moe2, _mesh2, _device2 = _make_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _ep_train_step(moe2, optimizer2, x)
 
     set_optim_state_dict(moe2, optimizer2, sd)
     loss_after = _ep_train_step(moe2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after roundtrip step: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after roundtrip step: {loss_after}"
 
     print(f"[rank{_rank()}] E1 PASS: EP-only FQN roundtrip (loss={loss_after:.4f})")
 
@@ -201,7 +194,7 @@ def test_e1_ep_optim_state_dict_fqn_roundtrip():
 # =====================================================================
 def test_e2_ep_optim_state_dict_cpu_offload():
     """EP-only: get with cpu_offload -> set -> step."""
-    moe, mesh, device = _make_ep_model()
+    moe, _mesh, device = _make_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -218,7 +211,7 @@ def test_e2_ep_optim_state_dict_cpu_offload():
                     f"state.{fqn}.{key} should be on CPU, got {value.device}"
                 )
 
-    moe2, mesh2, device2 = _make_ep_model()
+    moe2, _mesh2, _device2 = _make_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _ep_train_step(moe2, optimizer2, x)
 
@@ -236,7 +229,7 @@ def test_e2_ep_optim_state_dict_cpu_offload():
             )
 
     loss_after = _ep_train_step(moe2, optimizer2, x)
-    assert not (loss_after != loss_after), f"loss is NaN after cpu_offload roundtrip: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after cpu_offload roundtrip: {loss_after}"
 
     print(f"[rank{_rank()}] E2 PASS: EP-only cpu_offload roundtrip (loss={loss_after:.4f})")
 
@@ -246,7 +239,7 @@ def test_e2_ep_optim_state_dict_cpu_offload():
 # =====================================================================
 def test_e3_fsdp_ep_optim_state_dict_fqn_roundtrip():
     """FSDP+EP: get_optim_state_dict (default) -> set_optim_state_dict -> step."""
-    moe, mesh, device, grad_scale = _make_fsdp_ep_model()
+    moe, _mesh, device, grad_scale = _make_fsdp_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -263,13 +256,13 @@ def test_e3_fsdp_ep_optim_state_dict_fqn_roundtrip():
                     f"state.{fqn}.{key} should be plain Tensor, got DTensor"
                 )
 
-    moe2, mesh2, device2, grad_scale2 = _make_fsdp_ep_model()
+    moe2, _mesh2, _device2, grad_scale2 = _make_fsdp_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
 
     set_optim_state_dict(moe2, optimizer2, sd)
     loss_after = _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
-    assert not (loss_after != loss_after), f"loss is NaN after roundtrip step: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after roundtrip step: {loss_after}"
 
     print(f"[rank{_rank()}] E3 PASS: FSDP+EP FQN roundtrip (loss={loss_after:.4f})")
 
@@ -279,7 +272,7 @@ def test_e3_fsdp_ep_optim_state_dict_fqn_roundtrip():
 # =====================================================================
 def test_e4_fsdp_ep_optim_state_dict_full_cpu_broadcast():
     """FSDP+EP: get with full_state_dict+cpu_offload -> set with broadcast -> step."""
-    moe, mesh, device, grad_scale = _make_fsdp_ep_model()
+    moe, _mesh, device, grad_scale = _make_fsdp_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -296,7 +289,7 @@ def test_e4_fsdp_ep_optim_state_dict_full_cpu_broadcast():
                     f"state.{fqn}.{key} should be on CPU, got {value.device}"
                 )
 
-    moe2, mesh2, device2, grad_scale2 = _make_fsdp_ep_model()
+    moe2, _mesh2, _device2, grad_scale2 = _make_fsdp_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
 
@@ -306,7 +299,7 @@ def test_e4_fsdp_ep_optim_state_dict_full_cpu_broadcast():
     set_optim_state_dict(moe2, optimizer2, sd, options=opts_set)
 
     loss_after = _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
-    assert not (loss_after != loss_after), f"loss is NaN after full+cpu+broadcast: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after full+cpu+broadcast: {loss_after}"
 
     print(f"[rank{_rank()}] E4 PASS: FSDP+EP full+cpu+broadcast (loss={loss_after:.4f})")
 
@@ -316,7 +309,7 @@ def test_e4_fsdp_ep_optim_state_dict_full_cpu_broadcast():
 # =====================================================================
 def test_e5_fsdp_ep_optim_state_dict_flatten():
     """FSDP+EP: get with flatten_optimizer_state_dict=True -> set -> step."""
-    moe, mesh, device, grad_scale = _make_fsdp_ep_model()
+    moe, _mesh, device, grad_scale = _make_fsdp_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
@@ -331,13 +324,13 @@ def test_e5_fsdp_ep_optim_state_dict_flatten():
             f"flat key '{key}' should start with 'state.' or 'param_group.'"
         )
 
-    moe2, mesh2, device2, grad_scale2 = _make_fsdp_ep_model()
+    moe2, _mesh2, _device2, grad_scale2 = _make_fsdp_ep_model()
     optimizer2 = torch.optim.SGD(moe2.parameters(), lr=0.01, momentum=0.9)
     _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
 
     set_optim_state_dict(moe2, optimizer2, sd, options=opts)
     loss_after = _fsdp_ep_train_step(moe2, optimizer2, x, grad_scale2)
-    assert not (loss_after != loss_after), f"loss is NaN after flatten roundtrip: {loss_after}"
+    assert not math.isnan(loss_after), f"loss is NaN after flatten roundtrip: {loss_after}"
 
     print(f"[rank{_rank()}] E5 PASS: FSDP+EP flatten roundtrip (loss={loss_after:.4f})")
 
@@ -347,7 +340,7 @@ def test_e5_fsdp_ep_optim_state_dict_flatten():
 # =====================================================================
 def test_e6_fsdp_ep_local_shape_correctness():
     """Verify optimizer state tensors have correct local shard shape under FSDP+EP."""
-    moe, mesh, device, grad_scale = _make_fsdp_ep_model()
+    moe, _mesh, device, grad_scale = _make_fsdp_ep_model()
     optimizer = torch.optim.SGD(moe.parameters(), lr=0.01, momentum=0.9)
     x = torch.randn(BS, SLEN, DIM, device=device)
 
