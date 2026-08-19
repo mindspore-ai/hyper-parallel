@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
-from hyper_parallel import DeviceMesh, HSDPModule, Replicate, fully_shard
+from hyper_parallel import DTensor, DeviceMesh, HSDPModule, Replicate, fully_shard
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel.platform import get_platform
@@ -98,7 +98,22 @@ class FSDP2Manager:
         """
         if source_shard_info is None:
             if self.mesh_context.tp_size > 1:
-                raise ValueError("TP is enabled but source_shard_info is missing")
+                parameters = list(model.parameters())
+                if not parameters or not all(
+                    isinstance(parameter, DTensor) for parameter in parameters
+                ):
+                    raise ValueError(
+                        "TP is enabled but source_shard_info is missing and "
+                        "not all model parameters are DTensors"
+                    )
+                return {
+                    parameter: fully_shard_utils.SourceShardMetaInfo(  # pylint: disable=no-member
+                        mesh=parameter.device_mesh,
+                        placements=tuple(parameter.placements),
+                        origin_is_dtensor=True,
+                    )
+                    for parameter in parameters
+                }
             return None
         if self.mesh_context.tp_size > 1 and not source_shard_info:
             raise ValueError("TP is enabled but source_shard_info is empty")
@@ -411,6 +426,23 @@ class FSDP2Manager:
         return managed_source_shard_info
 
     @staticmethod
+    def _source_infos_for_fully_shard(
+        managed_source_shard_info: SourceShardInfoByParam | None,
+    ) -> SourceShardInfoByParam | None:
+        """Return explicit metadata only for plain source-layout parameters.
+
+        Validate-mode parameters remain native DTensors. The platform FSDP
+        state derives their source layouts from each parameter directly and
+        rejects duplicate explicit metadata.
+        """
+        if managed_source_shard_info and all(
+            source_shard_info.origin_is_dtensor
+            for source_shard_info in managed_source_shard_info.values()
+        ):
+            return None
+        return managed_source_shard_info
+
+    @staticmethod
     def _build_managed_replicate_params(
         owner: ModuleClass,
         owner_by_parameter: Mapping[ParameterClass, ModuleClass],
@@ -433,17 +465,29 @@ class FSDP2Manager:
         """Restore global-mean gradients for one source-layout FSDP unit.
 
         ``fully_shard`` defaults units whose parameters all have source-layout
-        metadata to SUM reduction. The dual-mode Trainer's token-weighted loss
-        is multiplied by ``dp_size`` to compensate normal FSDP AVG reduction,
-        so a SUM-reduced unit must apply the inverse factor exactly once.
+        metadata to SUM reduction. The token-weighted backward loss is scaled
+        by the FSDP data domain (DP x CP), so a source-layout SUM-reduced unit
+        must apply its inverse exactly once. With loss parallelism, TP ranks
+        hold shards or partial contributions to one logical loss and TP is not
+        another averaging axis. Without loss parallelism, logits and the loss
+        are replicated over TP, so the SUM path also accumulates ``tp_size``
+        identical loss replicas and must divide by TP. EP is excluded because
+        expert ranks own different parameters.
 
         Returns:
             Whether a gradient scaling factor was configured for the unit.
         """
-        dp_size = self.mesh_context.dp_size
-        if dp_size <= 1 or not managed_source_shard_info:
+        tp_loss_replica_size = (
+            1 if self.mesh_context.loss_parallel else self.mesh_context.tp_size
+        )
+        source_gradient_domain_size = (
+            self.mesh_context.dp_size
+            * self.mesh_context.cp_size
+            * tp_loss_replica_size
+        )
+        if source_gradient_domain_size <= 1 or not managed_source_shard_info:
             return False
-        hsdp_module.set_gradient_scaling_factor(1.0 / dp_size)
+        hsdp_module.set_gradient_scaling_factor(1.0 / source_gradient_domain_size)
         return True
 
     def _configure_prefetch(self, hsdp_modules: list[HSDPModule]) -> None:
@@ -529,7 +573,9 @@ class FSDP2Manager:
                 )
             fully_shard(  # pylint: disable=unexpected-keyword-arg
                 wrap_module.module,
-                source_shard_infos=managed_source_shard_info,
+                source_shard_infos=self._source_infos_for_fully_shard(
+                    managed_source_shard_info
+                ),
                 replicate_params=self._build_managed_replicate_params(
                     wrap_module.module,
                     owner_by_parameter,
@@ -554,7 +600,9 @@ class FSDP2Manager:
             )
         fully_shard(  # pylint: disable=unexpected-keyword-arg
             model,
-            source_shard_infos=root_source_shard_info,
+            source_shard_infos=self._source_infos_for_fully_shard(
+                root_source_shard_info
+            ),
             replicate_params=self._build_managed_replicate_params(
                 model,
                 owner_by_parameter,
@@ -565,9 +613,20 @@ class FSDP2Manager:
         if self._configure_source_layout_gradient_scaling(model, root_source_shard_info):
             gradient_scaled_units += 1
         if gradient_scaled_units:
+            source_gradient_domain_size = (
+                self.mesh_context.dp_size
+                * self.mesh_context.cp_size
+                * (1 if self.mesh_context.loss_parallel else self.mesh_context.tp_size)
+            )
             logger.info(
-                "Applied DP gradient scaling factor %s to %d source-layout FSDP2 units",
-                1.0 / self.mesh_context.dp_size,
+                "Applied source-layout SUM gradient scaling: dp_size=%d, "
+                "cp_size=%d, tp_size=%d, source_gradient_domain_size=%d, "
+                "factor=%s, units=%d",
+                self.mesh_context.dp_size,
+                self.mesh_context.cp_size,
+                self.mesh_context.tp_size,
+                source_gradient_domain_size,
+                1.0 / source_gradient_domain_size,
                 gradient_scaled_units,
             )
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)

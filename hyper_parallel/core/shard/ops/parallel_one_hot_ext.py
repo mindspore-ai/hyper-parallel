@@ -309,6 +309,7 @@ class OneHotExtDistributedOp(DistributedOp):
         out_layout.set_alias_tensor_map(
             self._tensor_map_to_alias_tensor_map(base_layout, out_tensor_map)
         )
+        out_layout.tensor_map_to_placement()
         out_layout.update_compact_str()
         return out_layout
 

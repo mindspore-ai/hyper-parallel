@@ -32,7 +32,7 @@ case "${DATA_MODE}" in
         ;;
     offline)
         CONFIG_PATH=examples/training_demo/train_parallel_offline.yaml
-        DATA_PATH="${DATA_DIR}/parallel_offline_text_document"
+        DATA_PATH="${DATA_DIR}/wikitext103_qwen3_4k_text_document"
         ;;
     *)
         echo "DATA_MODE must be 'online' or 'offline', got '${DATA_MODE}'" >&2
@@ -45,8 +45,12 @@ export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 
 mkdir -p "${OUTPUT_DIR}"
-python -m examples.tp_cp_ep_demo.prepare_model "${CONFIG_PATH}" "$@"
-python -m examples.training_demo.prepare_parallel_data --output-dir "${DATA_DIR}"
+if [[ "${DATA_MODE}" == "online" ]]; then
+    python -m examples.training_demo.prepare_parallel_data --output-dir "${DATA_DIR}"
+elif [[ ! -f "${DATA_PATH}.bin" || ! -f "${DATA_PATH}.idx" ]]; then
+    echo "Offline IndexedDataset is missing: ${DATA_PATH}.{bin,idx}" >&2
+    exit 2
+fi
 
 torchrun \
     --nproc_per_node="${NPROC}" \

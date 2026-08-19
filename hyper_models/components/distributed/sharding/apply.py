@@ -116,8 +116,11 @@ def _temp_local_params(module, exclude=()):
             continue
         if isinstance(param, DTensor):
             saved.append((name, param))
-            _set_param_by_path(module, name, nn.Parameter(
-                param.to_local(), requires_grad=param.requires_grad))
+            *path, leaf = name.split(".")
+            owner = module
+            for part in path:
+                owner = owner[int(part)] if part.isdigit() else getattr(owner, part)
+            owner._parameters[leaf] = param.to_local()  # pylint: disable=protected-access
     try:
         yield
     finally:

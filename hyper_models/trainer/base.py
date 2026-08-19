@@ -33,6 +33,7 @@ import threading
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -44,6 +45,7 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
+from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
 from ..components.datasets.llm.chat_template import ChatTemplate
@@ -57,6 +59,7 @@ from ..components.distributed.infrastructure import (
     initialize_distributed,
 )
 from ..components.loss.loss_utils import count_loss_token, mean_global_loss
+from ..components.loss.loss_parallel import causal_lm_loss_parallel
 from ..components.loss.model_output import ModelOutputLoss
 from ..components.utils import helper
 from ..components.utils.device import synchronize, get_torch_device, get_device_type  # pylint: disable=syntax-error
@@ -370,6 +373,8 @@ class BaseTrainer(Stateful, ABC):
             compile_config=self.config.compile,
         )
         self.model_config = self.model.config
+        if self.config.accelerator.loss_parallel:
+            self.model.loss_function = causal_lm_loss_parallel
         model_parts = getattr(self.model, "parts", None)
         self.model_parts = list(model_parts) if model_parts is not None else [self.model]
         self.hsdp_model_parts = [
@@ -471,7 +476,12 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_training_context(self):
         """Build training context for distributed training."""
-        self.model_fwd_context, self.model_bwd_context = nullcontext(), nullcontext()
+        if self.config.accelerator.loss_parallel:
+            tp_mesh = self.device_mesh["tp"]
+            self.model_fwd_context = partial(loss_parallel, mesh=tp_mesh)
+        else:
+            self.model_fwd_context = nullcontext()
+        self.model_bwd_context = nullcontext()
 
     def _init_callbacks(self):
         """Initialize callbacks."""
@@ -579,11 +589,22 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
-            with self.model_fwd_context:
+            model_fwd_context = (
+                self.model_fwd_context()
+                if callable(self.model_fwd_context)
+                else self.model_fwd_context
+            )
+            with model_fwd_context:
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
             # with use_parallel_state("base"):
             loss, loss_dict = self.postforward(outputs, labels)
+            # The loss graph owns everything required for backward. Releasing
+            # the model output here avoids retaining large vocabulary logits
+            # until the whole backward pass finishes.
+            del outputs
+            if self.config.training.empty_cache_before_backward:
+                helper.empty_cache()
 
             # Backward pass
             with self.model_bwd_context:

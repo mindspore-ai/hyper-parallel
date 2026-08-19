@@ -580,6 +580,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             (Shard(0), Replicate(), Replicate()),
             origin_is_dtensor=True,
         )
+        hsdp_param._storage_source_layout = hsdp_param._build_storage_source_layout()
         reduced_grad = torch.tensor([1.0, 2.0])
 
         hsdp_param.all_reduce_source_replicate_grad_inplace(
@@ -597,6 +598,47 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         )
 
     @patch("hyper_parallel.platform.torch.fully_shard.param.dist.all_reduce")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    def test_all_reduce_source_replicate_grad_excludes_native_fsdp_axes(
+        self,
+        _mock_get_rank,
+        mock_all_reduce,
+    ):
+        """Native DTensor DP/CP axes already reduced by FSDP must not be reduced twice."""
+        hsdp_param = _new_param()
+        # World layout (dp, cp, tp) with rank 0 at coordinate (0, 0, 0); the
+        # FSDP domain owns the flattened/renamed (dp, cp) plane at tp=0.
+        source_mesh = DeviceMesh(
+            "cpu",
+            [[[0, 1], [2, 3]], [[4, 5], [6, 7]]],
+            mesh_dim_names=("dp", "cp", "tp"),
+            _init_backend=False,
+        )
+        hsdp_param.mesh_info.mesh = DeviceMesh(
+            "cpu",
+            [[0, 2], [4, 6]],
+            mesh_dim_names=("fsdp_replicate", "fsdp_shard"),
+            _init_backend=False,
+        )
+        hsdp_param.source_shard_info = SourceShardMetaInfo(
+            source_mesh,
+            (Replicate(), Replicate(), Shard(0)),
+            origin_is_dtensor=True,
+        )
+        hsdp_param._storage_source_layout = hsdp_param._build_storage_source_layout()
+        reduced_grad = torch.tensor([1.0, 2.0])
+
+        hsdp_param.all_reduce_source_replicate_grad_inplace(
+            reduced_grad,
+            torch.distributed.ReduceOp.SUM,
+        )
+
+        storage_mesh, storage_placements = hsdp_param._storage_source_layout
+        self.assertEqual(storage_mesh.mesh_dim_names, ("tp",))
+        self.assertEqual(storage_placements, (Shard(0),))
+        mock_all_reduce.assert_not_called()
+
+    @patch("hyper_parallel.platform.torch.fully_shard.param.dist.all_reduce")
     def test_all_reduce_source_replicate_grad_inplace_uses_plain_parameter_metadata(self, mock_all_reduce):
         """Dual-mode gradients should all-reduce over replicated source mesh axes."""
         hsdp_param = _new_param()
@@ -612,6 +654,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             (Shard(0), Replicate()),
             origin_is_dtensor=False,
         )
+        hsdp_param._storage_source_layout = hsdp_param._build_storage_source_layout()
         reduced_grad = torch.tensor([1.0, 2.0])
 
         hsdp_param.all_reduce_source_replicate_grad_inplace(

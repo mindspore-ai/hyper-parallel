@@ -180,6 +180,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self._orig_dtensor_placements = (
             tuple(source_shard_info.placements) if self._orig_param_is_dtensor else None
         )
+        self._storage_source_layout = self._build_storage_source_layout()
         self._spmd_shard_mesh_dim = self.mesh_info.shard_mesh_dim
         self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
         self._init_sharded_param(param, shard_placement_fn)
@@ -205,12 +206,93 @@ class TorchHSDPParamV2(HSDPParamV2):
         if self.source_shard_info is not None:
             # Preserve the source distributed layout and prefix the explicit
             # DP/FSDP mesh dimensions on the unified mesh.
-            self._spmd_mesh = DeviceMesh.concatenate([self.mesh_info.mesh, self.source_shard_info.mesh])
+            source_mesh, source_placements = self._storage_source_layout
+            self._spmd_mesh = DeviceMesh.concatenate([self.mesh_info.mesh, source_mesh])
             dp_prefix_placements = tuple(Replicate() for _ in range(self.mesh_info.mesh.ndim))
-            return dp_prefix_placements + tuple(self.source_shard_info.placements)
+            return dp_prefix_placements + source_placements
 
         self._spmd_mesh = self.mesh_info.mesh
         return tuple(Replicate() for _ in range(self._spmd_mesh.ndim))
+
+    def _build_storage_source_layout(self) -> tuple[Optional[DeviceMesh], tuple]:
+        """Build the immutable source layout used by FSDP storage and reduction.
+
+        Native DTensor parameters may already describe data-parallel axes that
+        are also covered by ``mesh_info.mesh``. Exclude those axes from the
+        concatenated storage mesh without changing ``source_shard_info``, whose
+        mesh and placements always retain the original compute-layout meaning.
+        Explicit metadata for plain production-mode parameters already contains
+        only its TP/EP source layout and must remain unchanged.
+
+        Ownership is derived from rank topology rather than dimension names:
+        a source axis is redundant exactly when varying it at this rank's own
+        coordinate never leaves the FSDP domain's rank set. Name matching
+        cannot express this because trainer meshes rename flattened data
+        axes (e.g. ``dp``/``cp`` become ``fsdp_replicate``/``fsdp_shard``).
+
+        Returns:
+            Source mesh and placements to append to the FSDP mesh, or an empty
+            layout when this parameter has no source-layout metadata.
+        """
+        if self.source_shard_info is None:
+            return None, ()
+        source_mesh = self.source_shard_info.mesh
+        source_placements = tuple(self.source_shard_info.placements)
+        if not self.source_shard_info.origin_is_dtensor:
+            return source_mesh, source_placements
+
+        source_mesh_dim_names = source_mesh.mesh_dim_names or ()
+        fsdp_ranks = self._fsdp_domain_ranks()
+        coordinate = source_mesh.get_coordinate() if fsdp_ranks is not None else None
+        if coordinate is None:
+            # Rank topology is unavailable (e.g. a topology-only mesh), so no
+            # axis can be proven redundant. Keep the full layout, matching the
+            # pre-dedup behavior.
+            return source_mesh, source_placements
+
+        storage_dim_names = tuple(
+            dim_name
+            for dim_index, dim_name in enumerate(source_mesh_dim_names)
+            if not self._source_dim_covered_by_fsdp(
+                source_mesh, dim_index, coordinate, fsdp_ranks
+            )
+        )
+        if not storage_dim_names or storage_dim_names == source_mesh_dim_names:
+            return source_mesh, source_placements
+
+        placement_by_dim = dict(zip(source_mesh_dim_names, source_placements))
+        return (
+            source_mesh[storage_dim_names],
+            tuple(placement_by_dim[dim_name] for dim_name in storage_dim_names),
+        )
+
+    def _fsdp_domain_ranks(self) -> Optional[frozenset]:
+        """Ranks owned by this FSDP unit's data-parallel domain.
+
+        Returns ``None`` when the mesh carries no usable rank topology, in
+        which case no source axis can be proven redundant.
+        """
+        mesh = getattr(self.mesh_info, "mesh", None)
+        mesh_tensor = getattr(mesh, "mesh", None)
+        if not isinstance(mesh_tensor, torch.Tensor):
+            return None
+        return frozenset(int(rank) for rank in mesh_tensor.flatten().tolist())
+
+    @staticmethod
+    def _source_dim_covered_by_fsdp(source_mesh, dim_index, coordinate, fsdp_ranks) -> bool:
+        """Whether varying one source dim stays inside the FSDP rank domain.
+
+        The fiber is taken at this rank's own coordinate: peer ranks reached
+        by varying a data-parallel axis share this rank's other coordinates
+        (e.g. its TP slot), which is exactly the population FSDP reduces over.
+        """
+        index = list(coordinate)
+        mesh_tensor = source_mesh.mesh
+        for extent in range(source_mesh.size(dim_index)):
+            index[dim_index] = extent
+            if int(mesh_tensor[tuple(index)]) not in fsdp_ranks:
+                return False
+        return True
 
     def _apply_data_parallel_placements(self, placements: list, shard_placement: Shard) -> tuple:
         if len(placements) != self._spmd_mesh.ndim:
@@ -1179,8 +1261,10 @@ class TorchHSDPParamV2(HSDPParamV2):
         """
         if self.source_shard_info is None or not self.source_shard_info.placements:
             return
-        source_mesh = self.source_shard_info.mesh
-        source_placements = self.source_shard_info.placements
+        # Use the same deduplicated source layout as sharded storage. Native
+        # DTensor compute metadata can include DP/CP axes already reduced by
+        # FSDP; reducing those axes again would multiply validate-mode grads.
+        source_mesh, source_placements = self._storage_source_layout
         replicate_mesh_dims = tuple(
             mesh_dim
             for mesh_dim, placement in enumerate(source_placements)
@@ -1195,7 +1279,8 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
         replicate_mesh_dim_names = tuple(mesh_dim_names[mesh_dim] for mesh_dim in replicate_mesh_dims)
         replicate_mesh = source_mesh[replicate_mesh_dim_names].flatten()
-        if replicate_mesh.size() <= 1:
+        replicate_world_size = replicate_mesh.size()
+        if replicate_world_size <= 1:
             return
         dist.all_reduce(
             reduced_grad,

@@ -537,6 +537,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         dp_mesh = MagicMock(spec=DeviceMesh)
         dp_mesh.ndim = 1
         orig_mesh = MagicMock(spec=DeviceMesh)
+        orig_mesh.mesh_dim_names = ("tp",)
         unified_mesh = MagicMock(spec=DeviceMesh)
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)
@@ -546,6 +547,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             (Replicate(),),
             origin_is_dtensor=True,
         )
+        param_v2._storage_source_layout = param_v2._build_storage_source_layout()
 
         with patch.object(DeviceMesh, "concatenate", return_value=unified_mesh) as mock_concatenate:
             placements = TorchHSDPParamV2._get_base_spmd_placements(param_v2)
@@ -565,6 +567,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2.mesh_info.mesh = dp_mesh
         param_v2.source_shard_info = SourceShardMetaInfo(tp_mesh, (Shard(1),), origin_is_dtensor=False)
         param_v2._orig_param_is_dtensor = False
+        param_v2._storage_source_layout = param_v2._build_storage_source_layout()
 
         with patch.object(DeviceMesh, "concatenate", return_value=unified_mesh) as mock_concatenate:
             placements = TorchHSDPParamV2._get_base_spmd_placements(param_v2)
@@ -572,6 +575,79 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         mock_concatenate.assert_called_once_with([dp_mesh, tp_mesh])
         self.assertIs(param_v2._spmd_mesh, unified_mesh)
         self.assertEqual(placements, (Replicate(), Shard(1)))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    def test_storage_source_layout_filters_native_dtensor_fsdp_axes(self, _mock_get_rank):
+        """Storage composition should exclude FSDP-owned axes without mutating compute metadata."""
+        # World layout (dp, cp, tp) with rank 0 at coordinate (0, 0, 0). The
+        # FSDP domain flattens and renames (dp, cp), so only rank topology —
+        # not dimension names — can prove the axes redundant.
+        source_mesh = DeviceMesh(
+            "cpu",
+            [[[0, 1], [2, 3]], [[4, 5], [6, 7]]],
+            mesh_dim_names=("dp", "cp", "tp"),
+            _init_backend=False,
+        )
+        fsdp_mesh = DeviceMesh(
+            "cpu",
+            [[0, 2], [4, 6]],
+            mesh_dim_names=("fsdp_replicate", "fsdp_shard"),
+            _init_backend=False,
+        )
+        source_placements = (Replicate(), Replicate(), Shard(0))
+        source_shard_info = SourceShardMetaInfo(
+            source_mesh,
+            source_placements,
+            origin_is_dtensor=True,
+        )
+        param_v2 = object.__new__(TorchHSDPParamV2)
+        param_v2.source_shard_info = source_shard_info
+        param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)
+        param_v2.mesh_info.mesh = fsdp_mesh
+
+        storage_mesh, storage_placements = param_v2._build_storage_source_layout()
+
+        self.assertEqual(storage_mesh.mesh_dim_names, ("tp",))
+        self.assertEqual(storage_placements, (Shard(0),))
+        self.assertIs(source_shard_info.mesh, source_mesh)
+        self.assertEqual(source_shard_info.placements, source_placements)
+
+    def test_storage_source_layout_keeps_full_layout_without_rank_topology(self):
+        """Topology-only meshes cannot prove redundancy, so no axis is filtered."""
+        source_mesh = MagicMock(spec=DeviceMesh)
+        source_mesh.mesh_dim_names = ("dp", "cp", "tp")
+        source_placements = (Replicate(), Replicate(), Shard(0))
+        param_v2 = object.__new__(TorchHSDPParamV2)
+        param_v2.source_shard_info = SourceShardMetaInfo(
+            source_mesh,
+            source_placements,
+            origin_is_dtensor=True,
+        )
+        param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)  # .mesh is a mock, not a tensor
+
+        storage_mesh, storage_placements = param_v2._build_storage_source_layout()
+
+        self.assertIs(storage_mesh, source_mesh)
+        self.assertEqual(storage_placements, source_placements)
+        source_mesh.__getitem__.assert_not_called()
+
+    def test_storage_source_layout_preserves_plain_parameter_metadata(self):
+        """Production plain-parameter metadata must not be filtered by DTensor compatibility logic."""
+        source_mesh = MagicMock(spec=DeviceMesh)
+        source_mesh.mesh_dim_names = ("dp", "tp")
+        source_placements = (Replicate(), Shard(0))
+        param_v2 = object.__new__(TorchHSDPParamV2)
+        param_v2.source_shard_info = SourceShardMetaInfo(
+            source_mesh,
+            source_placements,
+            origin_is_dtensor=False,
+        )
+
+        storage_mesh, storage_placements = param_v2._build_storage_source_layout()
+
+        self.assertIs(storage_mesh, source_mesh)
+        self.assertEqual(storage_placements, source_placements)
+        source_mesh.__getitem__.assert_not_called()
 
     def test_unsharded_grad_data_returns_plain_tensor_grad(self):
         """Verify gradient communication consumes the ordinary Tensor attached by Hyper autograd."""
