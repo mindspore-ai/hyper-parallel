@@ -76,6 +76,12 @@ class TorchCustomOps:
         )
 
     @staticmethod
+    def npu_situ_glu(*args, **kwargs):
+        raise NotImplementedError(
+            "npu_situ_glu is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
     def npu_lightning_indexer(*args, **kwargs):
         """NPU lightning indexer operator; not supported on PyTorch."""
         raise NotImplementedError(

@@ -42,6 +42,8 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn_backward.cc"),
     os.path.join(_CC_DIR, "mhc_pre_cmhc.cc"),
     os.path.join(_CC_DIR, "mhc_pre_cmhc_backward.cc"),
+    os.path.join(_CC_DIR, "situ_glu.cc"),
+    os.path.join(_CC_DIR, "situ_glu_grad.cc"),
     os.path.join(_CC_DIR, "lightning_indexer_v2.cc"),
     os.path.join(_CC_DIR, "sparse_flash_mla.cc"),
     os.path.join(_CC_DIR, "sparse_flash_mla_grad.cc"),
@@ -64,7 +66,7 @@ except ImportError:
     _custom_ops = _build_custom_ops()
 else:
     # Rebuild stale source-tree extensions that predate newly added symbols.
-    if not hasattr(_custom_ops, "npu_mhc_pre_cmhc"):
+    if not hasattr(_custom_ops, "npu_situ_glu"):
         _custom_ops = _build_custom_ops()
 
 
@@ -491,6 +493,68 @@ class NpuMhcPreCmhcDFunction(DFunction):  # pylint: disable=W0221
             grad_h_in, grad_h_post, grad_h_res, x, phi, alpha,
             h_pre, h_mix, inv_rms, h_post, None, perm_mats, coeff, ctx.hc_eps)
         return tuple(grads[:4]) + (None, None, None, None)
+
+
+class NpuSituGluDFunction(DFunction):  # pylint: disable=W0221
+    """DFunction wrapper for npu_situ_glu on MindSpore.
+
+    Wraps the fused aclnnSituGlu kernel: chunk + SiTU gate + tanh up + multiply
+    in one launch. ``activate_left`` is pinned to True to match the mindformers
+    SiTUGLU Cell's chunk(x, 2, dim) gate=front semantics.
+
+    Forward: (x, dim, beta, linear_beta, activate_left) -> out.
+    Backward: aclnnSituGluGrad(gradY, x, dim, beta, linearBeta, activateLeft,
+    grad_x). Only x has a gradient; dim/beta/linear_beta/activate_left are
+    attrs and return None.
+    """
+
+    _op_name = "npu_situ_glu"
+
+    @staticmethod
+    def forward(ctx, x, dim, beta, linear_beta, activate_left):
+        """Forward pass: delegates to the MindSpore Ascend SiTU-GLU kernel.
+
+        Args:
+            ctx: Autograd context.
+            x: Input tensor. dtype float32/float16/bfloat16. The kernel casts to
+                float32 internally and casts back on return.
+            dim: Axis along which x is split into gate/up halves. Range
+                [-x.dim(), x.dim()-1]; x on this axis must be even.
+            beta: Gate-branch soft-cap (SiTU: beta * tanh(g/beta) * sigmoid(g)).
+            linear_beta: Up-branch soft-cap. When <= 0 the up branch is
+                unchanged; otherwise linear_beta * tanh(up/linear_beta).
+            activate_left: True -> gate is the front half (matches chunk
+                semantics); False -> gate is the back half.
+
+        Returns:
+            Tensor: output y, same dtype as x; dim axis halved.
+        """
+        out = _custom_ops.npu_situ_glu(x, dim, beta, linear_beta, activate_left)
+        ctx.save_for_backward(x)
+        ctx.dim = dim
+        ctx.beta = beta
+        ctx.linear_beta = linear_beta
+        ctx.activate_left = activate_left
+        return out
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Backward pass: calls npu_situ_glu_grad kernel.
+
+        Args:
+            ctx: Autograd context.
+            grad_outputs: Upstream gradient for the single forward output
+                (grad_outputs[0] == grad_y).
+
+        Returns:
+            tuple: (grad_x, None, None, None, None) -- gradient for the 5
+                forward inputs; only x has a gradient.
+        """
+        x, = ctx.saved_tensors
+        grad_y, x = _ensure_contiguous(grad_outputs[0], x)
+        grad_x = _custom_ops.npu_situ_glu_grad(
+            grad_y, x, ctx.dim, ctx.beta, ctx.linear_beta, ctx.activate_left)
+        return (grad_x, None, None, None, None)
 
 
 class NpuLightningIndexerDFunction(DFunction):  # pylint: disable=W0221
