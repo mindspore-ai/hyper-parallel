@@ -165,6 +165,24 @@ def test_selective_activation_checkpoint_wraps_layers_with_context_fn() -> None:
     assert [layer.forward_calls for layer in original_layers] == [2, 2]
 
 
+def test_compile_selective_checkpointing_uses_policy_fn() -> None:
+    model = _Model(num_layers=2)
+    original_layers = list(model.model.layers)
+    wrapper_calls = []
+
+    with patch(
+        "hyper_models.components.activation_checkpoint."
+        "activation_checkpoint.checkpoint_wrapper",
+        side_effect=lambda layer, **kwargs: wrapper_calls.append((layer, kwargs)) or layer,
+    ):
+        _apply_activation_checkpointing(model, "selective", enable_compile=True)
+
+    assert [layer for layer, _ in wrapper_calls] == original_layers
+    assert all(set(kwargs) == {"policy_fn"} for _, kwargs in wrapper_calls)
+    assert all(callable(kwargs["policy_fn"]) for _, kwargs in wrapper_calls)
+    assert wrapper_calls[0][1]["policy_fn"] is not wrapper_calls[1][1]["policy_fn"]
+
+
 def test_selective_checkpoint_recomputes_mutated_topk_output() -> None:
     def router_loss(hidden_states: torch.Tensor) -> torch.Tensor:
         router_probs = torch.softmax(hidden_states, dim=-1)
