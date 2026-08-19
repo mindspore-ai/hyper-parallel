@@ -31,7 +31,7 @@ from hyper_models.components.activation_checkpoint import (
     _apply_activation_checkpointing as _apply_activation_checkpointing_impl,
 )
 from hyper_models.components.activation_swap.attention_swap import (
-    apply_qwen3_moe_attention_swap,
+    apply_attention_swap,
     validate_attention_swap,
 )
 from hyper_models.components.compile import apply_compile
@@ -629,7 +629,7 @@ def apply_model_infrastructure(
         pp_size=getattr(mesh, "pp_size", 1),
     )
     if activation_swap != "none":
-        model = apply_qwen3_moe_attention_swap(model, activation_swap)
+        model = apply_attention_swap(model, activation_swap)
 
 
     # Step 10: FSDP2 is execution-only; validation retains DTensor placement.
