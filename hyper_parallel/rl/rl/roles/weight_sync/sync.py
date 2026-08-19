@@ -22,7 +22,8 @@ from typing import Any, Callable, Mapping, Optional
 from urllib import parse as urllib_parse
 from hyper_parallel import get_platform
 platform = get_platform()
-POLICY_FINGERPRINT_ALGORITHM = "qwen3_5_norms_f32_v2"
+POLICY_FINGERPRINT_ALGORITHM = "qwen_norms_f32_v3"
+KEEP_SCHEDULER_PAUSED_TAG = "_hyper_keep_scheduler_paused"
 @dataclass(frozen=True)
 class PolicySnapshot:
     """One immutable publication of policy Actor weights."""
@@ -143,17 +144,23 @@ def policy_weight_fingerprint(state_dict: Mapping[str, Any]) -> dict[str, Any]:
 def verify_policy_fingerprints(
     expected: Mapping[str, Any],
     actual: list[Mapping[str, Any]],
+    expected_version: Optional[int] = None,
 ) -> None:
     """Require every rollout worker fingerprint to match the policy Actor."""
     if not actual:
         raise RuntimeError("vLLM policy fingerprint returned no worker results")
     fields = ("algorithm", "tensor_count", "value_count", "digest")
+    version_mismatches = [
+        result.get("version")
+        for result in actual
+        if expected_version is not None and result.get("version") != expected_version
+    ]
     mismatches = [
         {field: result.get(field) for field in fields}
         for result in actual
         if any(result.get(field) != expected.get(field) for field in fields)
     ]
-    if not mismatches:
+    if not mismatches and not version_mismatches:
         return
     expected_tensors = expected.get("tensors", {})
     tensor_mismatches = []
@@ -176,6 +183,7 @@ def verify_policy_fingerprints(
     raise RuntimeError(
         "vLLM policy fingerprint mismatch: "
         f"expected={expected_summary}, actual={mismatches}, "
+        f"expected_version={expected_version}, version_mismatches={version_mismatches}, "
         f"tensor_mismatches={tensor_mismatches}"
     )
 class VLLMWeightSyncClientMixin:
@@ -207,13 +215,24 @@ class VLLMWeightSyncClientMixin:
         )
     def pause(self) -> None:
         """Pause generation and invalidate request caches before transfer."""
-        self._request("POST", "pause?mode=abort&clear_cache=true")
+        status = self._request("POST", "pause?mode=abort&clear_cache=true").get("status")
+        if status != "paused":
+            raise RuntimeError(f"vLLM /pause returned invalid status {status!r}")
+
+    def is_paused(self) -> bool:
+        """Return whether generation admission is closed."""
+        value = self._request("GET", "is_paused").get("is_paused")
+        if not isinstance(value, bool):
+            raise RuntimeError("vLLM /is_paused did not return a boolean state")
+        return value
     def sleep(self, level: int = 1, mode: str = "wait") -> None:
         """Drain generation and release tagged vLLM device memory."""
         self._request("POST", f"sleep?level={level}&mode={mode}")
     def wake_up(self, tags: tuple[str, ...]) -> None:
-        """Restore selected vLLM memory tags without admitting requests."""
-        query = urllib_parse.urlencode([("tags", tag) for tag in tags])
+        """Restore executor memory without letting EngineCore resume scheduling."""
+        query = urllib_parse.urlencode(
+            [("tags", tag) for tag in (*tags, KEEP_SCHEDULER_PAUSED_TAG)]
+        )
         self._request("POST", f"wake_up?{query}")
     def is_sleeping(self) -> bool:
         """Return the server's combined scheduler/device sleep state."""
@@ -224,21 +243,29 @@ class VLLMWeightSyncClientMixin:
     def start_weight_update(self) -> None:
         """Start loading checkpoint-format Actor weights."""
         self._request("POST", "start_weight_update", {"is_checkpoint_format": True})
-    def receive_weights(self, update_info: Mapping[str, Any]) -> None:
+    def receive_weights(self, update_info: Mapping[str, Any], policy_version: int) -> None:
         """Block until the server receives all HCCL weight buffers."""
+        versioned_update = dict(update_info)
+        versioned_update["_hyper_policy_version"] = policy_version
         self._request(
             "POST",
             "update_weights",
-            {"update_info": dict(update_info)},
+            {"update_info": versioned_update},
             timeout=600,
         )
-    def receive_ipc_weights(self, base_url: str, update_info: Any) -> None:
+    def receive_ipc_weights(
+        self,
+        base_url: str,
+        update_info: Any,
+        policy_version: int,
+    ) -> None:
         """Send one merged NPU IPC handle set to a rollout replica."""
         update_fields = asdict(update_info)
         ipc_handles = update_fields.pop("ipc_handles")
         update_fields["ipc_handles_pickled"] = base64.b64encode(
             pickle.dumps(ipc_handles)
         ).decode("ascii")
+        update_fields["_hyper_policy_version"] = policy_version
         self._request(
             "POST",
             "update_weights",
@@ -249,22 +276,54 @@ class VLLMWeightSyncClientMixin:
     def finish_weight_update(self) -> None:
         """Commit one completed Actor-to-rollout weight transfer."""
         self._request("POST", "finish_weight_update")
-    def get_policy_weight_fingerprints(
+    def collective_rpc(
         self,
-        version: int,
-        base_url: Optional[str] = None,
-    ) -> list[Mapping[str, Any]]:
-        """Return one post-transfer fingerprint per vLLM worker."""
+        method: str,
+        kwargs: Optional[Mapping[str, Any]] = None,
+    ) -> list[Any]:
+        """Invoke one registered worker method on every inference rank."""
         response = self._request(
             "POST",
             "collective_rpc",
-            {
-                "method": "get_policy_weight_fingerprint",
-                "kwargs": {"version": str(version)},
-            },
-            base_url=base_url,
+            {"method": method, "kwargs": dict(kwargs or {})},
         )
         results = response.get("results")
+        if not isinstance(results, list):
+            raise RuntimeError("vLLM collective RPC returned invalid worker results")
+        return results
+    def reset_prefix_cache(
+        self,
+        *,
+        reset_running_requests: bool,
+        reset_connector: bool,
+    ) -> bool:
+        """Invalidate cached prefixes after loading a new policy."""
+        query = urllib_parse.urlencode(
+            {
+                "reset_running_requests": str(reset_running_requests).lower(),
+                "reset_external": str(reset_connector).lower(),
+            }
+        )
+        self._request("POST", f"reset_prefix_cache?{query}")
+        return True
+    def get_policy_weight_fingerprints(
+        self,
+        base_url: Optional[str] = None,
+    ) -> list[Mapping[str, Any]]:
+        """Return one post-transfer fingerprint per vLLM worker."""
+        if base_url is None:
+            results = self.collective_rpc("get_policy_weight_fingerprint")
+        else:
+            response = self._request(
+                "POST",
+                "collective_rpc",
+                {
+                    "method": "get_policy_weight_fingerprint",
+                    "kwargs": {},
+                },
+                base_url=base_url,
+            )
+            results = response.get("results")
         if not isinstance(results, list) or not all(
             isinstance(result, Mapping) for result in results
         ):
@@ -272,7 +331,9 @@ class VLLMWeightSyncClientMixin:
         return results
     def resume(self) -> None:
         """Resume rollout admission after a completed transfer."""
-        self._request("POST", "resume")
+        status = self._request("POST", "resume").get("status")
+        if status != "resumed":
+            raise RuntimeError(f"vLLM /resume returned invalid status {status!r}")
 class ActorRolloutWeightSync:
     """Move policy Actor weights into rollout and publish versions atomically."""
     def __init__(
@@ -282,6 +343,7 @@ class ActorRolloutWeightSync:
         client_provider: Callable[[], Any],
         weight_transfer: Optional[Any],
     ) -> None:
+        """Initialize one controller-owned policy publication transaction."""
         self._model_name = model_name
         self._deployment = deployment
         self._client_provider = client_provider
@@ -293,15 +355,19 @@ class ActorRolloutWeightSync:
         self._phase = "rollout"
     @property
     def policy_version(self) -> int:
+        """Return the policy version admitted for generation."""
         return self._policy_version
     @property
     def policy_fingerprint(self) -> Optional[str]:
+        """Return the fingerprint admitted for generation."""
         return self._policy_fingerprint
     @property
     def policy_fingerprint_changed(self) -> bool:
+        """Return whether the last transfer changed the policy fingerprint."""
         return self._policy_fingerprint_changed
     @property
     def phase(self) -> str:
+        """Return the current residency and publication phase."""
         return self._phase
     def _capture_initial_policy_fingerprint(self, client: Any) -> None:
         """Capture and verify the policy fingerprint loaded at startup."""
@@ -310,11 +376,43 @@ class ActorRolloutWeightSync:
             or not isinstance(client, VLLMWeightSyncClientMixin)
         ):
             return
-        fingerprints = client.get_policy_weight_fingerprints(self._policy_version)
+        fingerprints = client.get_policy_weight_fingerprints()
         if not fingerprints:
             raise RuntimeError("vLLM initial policy fingerprint returned no worker results")
-        verify_policy_fingerprints(fingerprints[0], fingerprints)
+        verify_policy_fingerprints(
+            fingerprints[0],
+            fingerprints,
+            expected_version=self._policy_version,
+        )
         self._policy_fingerprint = str(fingerprints[0]["digest"])
+
+    def generation_identity(self, client: Any) -> tuple[int, str]:
+        """Verify and return the worker-owned identity serving the next request."""
+        if self._phase != "rollout" or self._pending_policy_version is not None:
+            raise RuntimeError(
+                "Cannot generate from an unpublished rollout policy: "
+                f"phase={self._phase!r}, pending={self._pending_policy_version}"
+            )
+        if not isinstance(client, VLLMWeightSyncClientMixin):
+            raise RuntimeError("Consistency-profile generation requires the owned vLLM HTTP client")
+        fingerprints = client.get_policy_weight_fingerprints()
+        if not fingerprints:
+            raise RuntimeError("vLLM generation identity returned no worker results")
+        expected = fingerprints[0]
+        verify_policy_fingerprints(
+            expected,
+            fingerprints,
+            expected_version=self._policy_version,
+        )
+        digest = str(expected["digest"])
+        if self._policy_fingerprint is None:
+            self._policy_fingerprint = digest
+        elif digest != self._policy_fingerprint:
+            raise RuntimeError(
+                "vLLM generation fingerprint differs from the published policy: "
+                f"expected={self._policy_fingerprint}, actual={digest}"
+            )
+        return self._policy_version, digest
     def prepare_for_training(self) -> None:
         """Sleep colocated rollout before policy Actor training starts."""
         if self._deployment != "colocated":
@@ -325,6 +423,7 @@ class ActorRolloutWeightSync:
         if client is None:
             raise RuntimeError("vLLM server startup failed without a synchronized error")
         def sleep_rollout() -> None:
+            """Capture identity and release rollout residency on every rank."""
             self._capture_initial_policy_fingerprint(client)
             client.sleep(level=1, mode="wait")
             if not client.is_sleeping():
@@ -350,10 +449,16 @@ class ActorRolloutWeightSync:
             )
         if self._deployment == "colocated" and self._phase != "training":
             raise RuntimeError(f"Cannot refit colocated vLLM from phase {self._phase!r}")
-        client = self._client_provider()
+        client = synchronized_call("server startup", self._client_provider)
+        if client is None:
+            raise RuntimeError("vLLM server startup failed without a synchronized error")
         transfer = getattr(self._weight_transfer, "transfer", None)
         if transfer is None:
             transfer = getattr(self._weight_transfer, "refit")
+        transactional_client = isinstance(client, VLLMWeightSyncClientMixin)
+        if transactional_client:
+            self._pending_policy_version = snapshot.version
+            self._phase = "refit"
         transfer(client, snapshot)
         fingerprint = getattr(self._weight_transfer, "last_policy_fingerprint", None)
         if fingerprint is not None:
@@ -363,8 +468,16 @@ class ActorRolloutWeightSync:
             )
             self._policy_fingerprint = digest
         if self._deployment == "colocated":
-            self._pending_policy_version = snapshot.version
-            self._phase = "refit"
+            return
+        if transactional_client:
+            try:
+                synchronized_call("resume rollout admission", client.resume)
+            except Exception:
+                synchronized_call("compensating rollout pause", client.pause)
+                raise
+            self._policy_version = snapshot.version
+            self._pending_policy_version = None
+            self._phase = "rollout"
         else:
             self._policy_version = snapshot.version
     def prepare_for_rollout(self) -> None:
@@ -375,14 +488,47 @@ class ActorRolloutWeightSync:
             raise RuntimeError(f"Cannot prepare vLLM for rollout from phase {self._phase!r}")
         if self._phase == "refit" and self._pending_policy_version is None:
             raise RuntimeError("Colocated refit completed without a pending policy version")
-        client = self._client_provider()
-        def wake_rollout() -> None:
-            tags = ("kv_cache",) if self._phase == "refit" else ("weights", "kv_cache")
-            client.wake_up(tags)
-            client.resume()
-            if client.is_sleeping():
-                raise RuntimeError("vLLM remained sleeping after KV-cache wake and resume")
-        synchronized_call("wake before rollout", wake_rollout)
+        client = synchronized_call("server startup", self._client_provider)
+        if client is None:
+            raise RuntimeError("vLLM server startup failed without a synchronized error")
+        is_refit = self._phase == "refit"
+        tags = ("kv_cache",) if is_refit else ("weights", "kv_cache")
+        synchronized_call("wake before rollout", lambda: client.wake_up(tags))
+        if is_refit:
+            def reset_post_refit_caches() -> None:
+                """Invalidate request caches while admission remains closed."""
+                client.pause()
+                if not client.is_paused():
+                    raise RuntimeError("vLLM did not remain paused after post-refit cache reset")
+            synchronized_call("post-refit cache reset", reset_post_refit_caches)
+            expected_version = self._pending_policy_version
+            def verify_pending_identity() -> None:
+                """Verify worker-owned identity before opening admission."""
+                fingerprints = client.get_policy_weight_fingerprints()
+                if not fingerprints:
+                    raise RuntimeError("vLLM pending policy fingerprint returned no worker results")
+                verify_policy_fingerprints(
+                    fingerprints[0],
+                    fingerprints,
+                    expected_version=expected_version,
+                )
+                digest = str(fingerprints[0]["digest"])
+                if digest != self._policy_fingerprint:
+                    raise RuntimeError(
+                        "vLLM pending fingerprint differs from the transferred policy: "
+                        f"expected={self._policy_fingerprint}, actual={digest}"
+                    )
+            synchronized_call("pending rollout identity", verify_pending_identity)
+        try:
+            synchronized_call("resume rollout admission", client.resume)
+            def verify_rollout_residency() -> None:
+                """Require both scheduler and device memory to be ready."""
+                if client.is_paused() or client.is_sleeping():
+                    raise RuntimeError("vLLM remained paused or sleeping after resume")
+            synchronized_call("rollout residency check", verify_rollout_residency)
+        except Exception:
+            synchronized_call("compensating rollout pause", client.pause)
+            raise
         if self._pending_policy_version is not None:
             self._policy_version = self._pending_policy_version
         self._pending_policy_version = None
@@ -396,6 +542,7 @@ class ActorRolloutWeightSync:
             close_transfer()
 __all__ = [
     "ActorRolloutWeightSync",
+    "KEEP_SCHEDULER_PAUSED_TAG",
     "POLICY_FINGERPRINT_ALGORITHM",
     "PolicySnapshot",
     "VLLMWeightSyncClientMixin",

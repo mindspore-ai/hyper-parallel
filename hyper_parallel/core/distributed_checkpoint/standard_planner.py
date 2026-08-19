@@ -15,6 +15,7 @@
 """Standard planner implementations for checkpoint save and load."""
 from dataclasses import dataclass
 import dataclasses
+import hashlib
 import pickle
 from typing import Any, Optional, Union
 
@@ -73,7 +74,8 @@ class StandardSavePlanner(SavePlanner):
             enable_plan_caching: bool = True,
             remove_redundancy: bool = True,
             save_to_minimum_rank: bool = False,
-    ):
+    ) -> None:
+        """Initialize save planning and optional structural plan caching."""
         self.state_dict: Optional[dict[str, Any]] = None
         self.is_coordinator: bool = False
         self.rank: int = 0
@@ -83,7 +85,7 @@ class StandardSavePlanner(SavePlanner):
         self._enable_plan_caching: bool = enable_plan_caching
         self._cached_plans_key: str = self.__class__.__name__
 
-    def configure_planner(self, state_dict: dict[str, Any], **kwargs) -> None:
+    def configure_planner(self, state_dict: dict[str, Any], **kwargs: Any) -> None:
         """
         Configure planner.
 
@@ -111,8 +113,29 @@ class StandardSavePlanner(SavePlanner):
         self._cached_plans_key = self._build_cache_key(state_dict)
 
     def _build_cache_key(self, state_dict: dict[str, Any]) -> str:
-        """Build a stable cache namespace from sorted state_dict keys."""
-        return f"{self.__class__.__name__}:{'||'.join(state_dict.keys())}"
+        """Build a stable cache namespace from checkpoint structure and tensor layouts."""
+        entries = []
+        for name, value in state_dict.items():
+            if isinstance(value, DTensor):
+                descriptor = (
+                    "dtensor",
+                    str(value.dtype),
+                    tuple(value.shape),
+                    value.layout.compact_str,
+                    repr(getattr(value, CHUNK_INFO, None)),
+                )
+            elif isinstance(value, Tensor):
+                descriptor = (
+                    "tensor",
+                    str(value.dtype),
+                    tuple(value.shape),
+                    repr(getattr(value, CHUNK_INFO, None)),
+                )
+            else:
+                descriptor = (type(value).__module__, type(value).__qualname__)
+            entries.append((name, descriptor))
+        digest = hashlib.sha256(pickle.dumps(entries)).hexdigest()
+        return f"{self.__class__.__name__}:{digest}"
 
     def build_local_plan(self) -> SavePlan:
         """
@@ -420,7 +443,7 @@ class StandardLoadPlanner(LoadPlanner):
     Iterate state_dict and creates load plans via chunk list for resharding support.
     """
 
-    def __init__(self, allow_partial_load: bool = False):
+    def __init__(self, allow_partial_load: bool = False) -> None:
         """
         Args:
             allow_partial_load (bool): If True, allow loading when checkpoint has fewer keys than state_dict.
@@ -433,7 +456,12 @@ class StandardLoadPlanner(LoadPlanner):
         self.allow_partial_load = allow_partial_load
         self.flatten_state_dict: bool = True
 
-    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
+    def configure_planner(
+        self,
+        state_dict: dict[str, Any],
+        metadata: Metadata,
+        **kwargs: Any,
+    ) -> None:
         """
         Configure planner with state dict and metadata.
 
@@ -607,9 +635,16 @@ class _DcpMergeLoadPlanner(StandardLoadPlanner):
     """Load planner that builds distributed checkpoint from dcp into fully ``state_dict`` (in-place)."""
 
     def __init__(self) -> None:
+        """Initialize a load planner that reconstructs every checkpoint entry."""
         super().__init__()
 
-    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
+    def configure_planner(
+        self,
+        state_dict: dict[str, Any],
+        metadata: Metadata,
+        **kwargs: Any,
+    ) -> None:
+        """Populate an empty destination from checkpoint metadata before loading."""
         if len(state_dict) > 0:
             raise ValueError(
                 "state_dict must be empty for _DcpMergeLoadPlanner; "

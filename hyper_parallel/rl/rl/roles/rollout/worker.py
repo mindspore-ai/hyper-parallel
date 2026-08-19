@@ -36,6 +36,7 @@ class RolloutManager:
         do_sample: bool = True,
         collect_old_log_probs: bool = False,
         seed: Optional[int] = None,
+        eos_token_ids: Sequence[int] = (),
     ) -> None:
         """Initialize rollout orchestration and generation settings."""
         settings = GenerationSettings(
@@ -46,6 +47,7 @@ class RolloutManager:
             do_sample=do_sample,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
+            eos_token_ids=tuple(eos_token_ids),
             collect_log_probs=collect_old_log_probs,
             seed=seed,
         )

@@ -36,7 +36,12 @@ class DTensorBase(Tensor):
             # Copy from existing DTensorBase — use alias_placements to preserve multi-axis ordering
             t = Tensor._make_subclass(cls, local_tensor._local_tensor, local_tensor._local_tensor.requires_grad)
             copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
-            t.__init_data__(local_tensor._local_tensor, local_tensor.device_mesh, copy_placements)
+            t.__init_data__(
+                local_tensor._local_tensor,
+                local_tensor.device_mesh,
+                copy_placements,
+                local_tensor.layout,
+            )
             return t
 
         if device_mesh is None:

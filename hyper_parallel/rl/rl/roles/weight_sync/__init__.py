@@ -13,6 +13,17 @@
 # limitations under the License.
 # ============================================================================
 """Policy Actor-to-rollout weight synchronization."""
+from rl.roles.model import (
+    HYPER_MODEL_IMPLEMENTATION,
+    HYPER_QWEN3_ARCHITECTURE,
+    HYPER_QWEN3_5_ARCHITECTURE,
+    NATIVE_MODEL_IMPLEMENTATION,
+    NATIVE_QWEN3_ARCHITECTURE,
+    NATIVE_QWEN3_5_ARCHITECTURE,
+    SUPPORTED_MODEL_IMPLEMENTATIONS,
+    architecture_for_implementation,
+    normalize_model_implementation,
+)
 from rl.roles.weight_sync.sync import (
     ActorRolloutWeightSync,
     POLICY_FINGERPRINT_ALGORITHM,
@@ -33,20 +44,13 @@ from rl.roles.weight_sync.transfer import (
     CPUWeightTransfer,
     HCCLWeightRefitter,
     HCCLWeightTransfer,
-    HYPER_MODEL_IMPLEMENTATION,
-    HYPER_QWEN3_5_ARCHITECTURE,
-    NATIVE_MODEL_IMPLEMENTATION,
-    NATIVE_QWEN3_5_ARCHITECTURE,
     NPUIPCWeightRefitter,
     NPUIPCWeightTransfer,
-    SUPPORTED_MODEL_IMPLEMENTATIONS,
     VLLMWeightRefitter,
     WeightTransfer,
-    architecture_for_implementation,
     build_weight_transfer,
     map_actor_state_dict,
     map_policy_state_dict,
-    normalize_model_implementation,
 )
 __all__ = [
     "ActorRolloutWeightSync",
@@ -55,8 +59,10 @@ __all__ = [
     "HCCLWeightRefitter",
     "HCCLWeightTransfer",
     "HYPER_MODEL_IMPLEMENTATION",
+    "HYPER_QWEN3_ARCHITECTURE",
     "HYPER_QWEN3_5_ARCHITECTURE",
     "NATIVE_MODEL_IMPLEMENTATION",
+    "NATIVE_QWEN3_ARCHITECTURE",
     "NATIVE_QWEN3_5_ARCHITECTURE",
     "NPUIPCWeightRefitter",
     "NPUIPCWeightTransfer",

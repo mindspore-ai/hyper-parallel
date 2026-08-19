@@ -48,7 +48,7 @@ from hyper_parallel.platform.mindspore.fully_shard.param import (
 def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
     """Build a bare :class:`MindSporeHSDPParamV2` with fields ``__init__`` normally sets."""
     obj = object.__new__(MindSporeHSDPParamV2)
-    obj.all_gather_outputs = []
+    obj.unsharded_param_buffers = []
     obj.gradient_scaling_factor = None
     obj.mp_policy = MixedPrecisionPolicy()
     return obj
@@ -303,7 +303,7 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param = _new_hsdp_param_v2()
         hsdp_param.is_sharded = False
         hsdp_param.sharded_state = MagicMock()
-        hsdp_param.all_gather_outputs = []
+        hsdp_param.unsharded_param_buffers = []
         hsdp_param.reset_sharded_param = MagicMock()
         cast_input = MagicMock()
         cast_input.numel.return_value = 8
@@ -311,12 +311,12 @@ class TestMindSporeParam(unittest.TestCase):
         cast_input.device = "npu:0"
         output = MagicMock()
 
-        hsdp_param.init_all_gather_outputs = MagicMock(
+        hsdp_param.init_unsharded_param_buffers = MagicMock(
             side_effect=lambda **kwargs: setattr(
-                hsdp_param, "all_gather_outputs", [output]
+                hsdp_param, "unsharded_param_buffers", [output]
             )
         )
-        hsdp_param.alloc_all_gather_outputs = MagicMock()
+        hsdp_param.alloc_unsharded_param_buffers = MagicMock()
 
         with patch.object(
             MindSporeHSDPParamV2,
@@ -326,13 +326,13 @@ class TestMindSporeParam(unittest.TestCase):
         ):
             gathered, handle = MindSporeHSDPParamV2._get_unsharded_param_data(hsdp_param)
 
-        hsdp_param.init_all_gather_outputs.assert_called_once_with(
+        hsdp_param.init_unsharded_param_buffers.assert_called_once_with(
             all_gather_input_numels=[8],
             all_gather_input_dtypes=["float16"],
             world_size=1,
             device="npu",
         )
-        hsdp_param.alloc_all_gather_outputs.assert_called_once()
+        hsdp_param.alloc_unsharded_param_buffers.assert_called_once()
         output.copy_.assert_not_called()
         output.data.copy_.assert_called_once_with(cast_input)
         self.assertIs(gathered, output)
@@ -390,13 +390,13 @@ class TestMindSporeParam(unittest.TestCase):
 
         storage.resize_.assert_not_called()
 
-    def test_init_all_gather_outputs_reuses_existing_buffers(self):
+    def test_init_unsharded_param_buffers_reuses_existing_buffers(self):
         """Existing all-gather outputs should be reused unless recreation is forced."""
         hsdp_param = _new_hsdp_param_v2()
         existing_output = MagicMock()
-        hsdp_param.all_gather_outputs = [existing_output]
+        hsdp_param.unsharded_param_buffers = [existing_output]
 
-        MindSporeHSDPParamV2.init_all_gather_outputs(
+        MindSporeHSDPParamV2.init_unsharded_param_buffers(
             hsdp_param,
             [4],
             [ms.float32],
@@ -404,14 +404,14 @@ class TestMindSporeParam(unittest.TestCase):
             device="Ascend:0",
         )
 
-        self.assertEqual(hsdp_param.all_gather_outputs, [existing_output])
+        self.assertEqual(hsdp_param.unsharded_param_buffers, [existing_output])
 
-    def test_init_all_gather_outputs_force_recreates_buffers(self):
+    def test_init_unsharded_param_buffers_force_recreates_buffers(self):
         """force_recreate should allocate buffers using the normalized device string."""
         hsdp_param = _new_hsdp_param_v2()
-        hsdp_param.all_gather_outputs = [MagicMock()]
+        hsdp_param.unsharded_param_buffers = [MagicMock()]
 
-        MindSporeHSDPParamV2.init_all_gather_outputs(
+        MindSporeHSDPParamV2.init_unsharded_param_buffers(
             hsdp_param,
             [4, 2],
             [ms.float32, ms.float16],
@@ -420,15 +420,15 @@ class TestMindSporeParam(unittest.TestCase):
             force_recreate=True,
         )
 
-        self.assertEqual(len(hsdp_param.all_gather_outputs), 2)
-        self.assertEqual(hsdp_param.all_gather_outputs[0].numel(), 8)
-        self.assertEqual(hsdp_param.all_gather_outputs[1].numel(), 4)
+        self.assertEqual(len(hsdp_param.unsharded_param_buffers), 2)
+        self.assertEqual(hsdp_param.unsharded_param_buffers[0].numel(), 8)
+        self.assertEqual(hsdp_param.unsharded_param_buffers[1].numel(), 4)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.DTensor.from_local")
     def test_get_unsharded_param_from_all_gather_output_restores_dtensor_wrapper(self, mock_from_local):
         """DTensor-origin params should wrap the unpacked local tensor with the original layout."""
         hsdp_param = _new_hsdp_param_v2()
-        hsdp_param.all_gather_outputs = [ms.Tensor(np.arange(16, dtype=np.float32))]
+        hsdp_param.unsharded_param_buffers = [ms.Tensor(np.arange(16, dtype=np.float32))]
         hsdp_param.sharded_param = SimpleNamespace(
             _local_tensor=ms.Tensor(np.arange(8, dtype=np.float32).reshape(2, 4))
         )
@@ -452,7 +452,7 @@ class TestMindSporeParam(unittest.TestCase):
     def test_get_unsharded_param_from_all_gather_output_requires_single_output(self):
         """Per-param all-gather reconstruction expects one fused output buffer."""
         hsdp_param = _new_hsdp_param_v2()
-        hsdp_param.all_gather_outputs = []
+        hsdp_param.unsharded_param_buffers = []
 
         with self.assertRaisesRegex(AssertionError, "Expected 1 all_gather_output"):
             MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output(hsdp_param)

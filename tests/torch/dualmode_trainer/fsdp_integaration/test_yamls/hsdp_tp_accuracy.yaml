@@ -1,0 +1,37 @@
+# Dual-mode Trainer HSDP+TP accuracy configuration.
+# The model target is a placeholder because the worker keeps paired standalone
+# and distributed models for per-step AdamW accuracy comparison.
+model:
+  _target_: torch.nn.Identity
+
+optimizer:
+  _target_: hyper_models.components.optim.optimizer.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+training:
+  backend: hccl
+  global_batch_size: 8
+  micro_batch_size: 2
+  seed: 31415
+
+accelerator:
+  tp_size: 2
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 2
+  reshard_after_forward: true
+  enable_fsdp2_prefetch: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  replicate_params:
+    - model.norm.weight

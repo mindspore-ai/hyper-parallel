@@ -30,6 +30,8 @@ venv/
 
 # Test and local run results
 .rollout-results/
+hyper_parallel/rl/AGENTS.md
+hyper_parallel/rl/local_docs/
 *.dot
 *.dat
 *.svg
@@ -73,3 +75,6 @@ hyper_parallel/auto_parallel/SAPP-ND/paradise/output/
 hyper_parallel/auto_parallel/SAPP-ND/paradise/results/
 hyper_parallel/auto_parallel/SAPP-ND/**/*nd_to_ppb*.json
 *.xlsx
+
+# output
+outputs

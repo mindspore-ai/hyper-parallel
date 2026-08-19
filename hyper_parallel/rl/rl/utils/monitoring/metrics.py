@@ -16,8 +16,8 @@
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
-from hyper_parallel import get_platform
 from rl.dataset.contracts import ExperienceBatch
+from hyper_parallel import get_platform
 platform = get_platform()
 _GIB = 1024 ** 3
 @dataclass(frozen=True)
@@ -53,6 +53,7 @@ class CriticUpdateMetrics:
 class ActorMetricAccumulator:
     """Accumulate detached Actor statistics without controlling optimization."""
     def __init__(self, totals: Any, dp_group_info: Any, dp_size: int) -> None:
+        """Initialize detached metric totals and data-parallel reduction metadata."""
         self._totals = totals
         self._dp_group_info = dp_group_info
         self._dp_size = dp_size
@@ -175,8 +176,8 @@ def _local_statistics(values: Any) -> tuple[int, float, float, float, float]:
         return 0, 0.0, 0.0, math.inf, -math.inf
     return (
         count,
-        float(values.sum().item()),
-        float(values.square().sum().item()),
+        float(values.sum(dim=0).item()),
+        float(values.square().sum(dim=0).item()),
         float(values.min().item()),
         float(values.max().item()),
     )
@@ -262,9 +263,9 @@ def _local_training_diagnostics(
         ),
         "actor_probability": _local_statistics(actor_probabilities),
         "rollout_probability": _local_statistics(rollout_probabilities),
-        "log_cross_sum": float((actor * rollout).sum().item()),
+        "log_cross_sum": float((actor * rollout).sum(dim=0).item()),
         "probability_cross_sum": float(
-            (actor_probabilities * rollout_probabilities).sum().item()
+            (actor_probabilities * rollout_probabilities).sum(dim=0).item()
         ),
         "advantages": _masked_statistics(experience.advantages, mask),
         "returns": _masked_statistics(experience.returns, mask),
@@ -275,8 +276,8 @@ def _local_training_diagnostics(
             else experience.returns - experience.values,
             mask,
         ),
-        "action_tokens": int(mask.sum().item()),
-        "total_tokens": int(experience.attention_mask.sum().item()),
+        "action_tokens": int(mask.flatten().sum(dim=0).item()),
+        "total_tokens": int(experience.attention_mask.flatten().sum(dim=0).item()),
     }
 
 
@@ -461,7 +462,7 @@ def _local_rollout_record(
         "truncated_count": sum(
             int(trajectory.truncated) for trajectory in rollout.trajectories
         ),
-        "generated_tokens": int(rollout.action_mask.sum().item()),
+        "generated_tokens": int(rollout.action_mask.flatten().sum(dim=0).item()),
         "generation_seconds": float(rollout.generation_seconds),
         "samples": samples,
     }
@@ -548,6 +549,7 @@ def enforce_learning_gate(
     if not bool(config.get("enabled", False)):
         return
     def validate() -> None:
+        """Validate rank-zero learning evidence before synchronized publication."""
         if platform.get_rank() != 0:
             return
         failures = []

@@ -15,7 +15,6 @@
 """Distributed evaluation for the synchronous RL trainer."""
 import logging
 from typing import Any, Callable, Optional
-from hyper_parallel import get_platform
 from rl.dataset.data_source import (
     PromptDataset,
     build_padded_evaluation_batches,
@@ -23,6 +22,7 @@ from rl.dataset.data_source import (
 )
 from rl.roles.rollout.worker import RolloutManager
 from rl.utils.monitoring.metrics import select_round_robin_samples
+from hyper_parallel import get_platform
 platform = get_platform()
 logger = logging.getLogger(__name__)
 class Evaluator:
@@ -39,6 +39,7 @@ class Evaluator:
         log_samples: int,
         progress_steps: int,
     ) -> None:
+        """Initialize evaluation data, rollout runtime, and progress settings."""
         self.dataset = dataset
         self.collate_fn = collate_fn
         self.rollout_manager = rollout_manager
@@ -151,7 +152,7 @@ class Evaluator:
             if not valid:
                 continue
             reward = float(rollout.rewards[local_index].item())
-            response_length = int(rollout.action_mask[local_index].sum().item())
+            response_length = int(rollout.action_mask[local_index].sum(dim=0).item())
             record["correct"] += reward
             record["total"] += 1
             record["generated_tokens"] += response_length

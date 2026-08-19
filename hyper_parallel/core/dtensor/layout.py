@@ -16,6 +16,8 @@
 
 import copy
 import functools
+from typing import Any, Optional, Sequence
+
 import numpy as np
 
 
@@ -150,6 +152,9 @@ class Layout:
         self._partial = [None] * len(mesh_shape)  # partial status for each dev dim
         self._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
         self._alias_tensor_map = None
+        self._tensor_shape = None
+        self._tensor_stride = None
+        self._tensor_dtype = None
         self._mesh = _create_device_mesh("npu", mesh_shape, mesh_dim_names=alias_name, rank_list=self._rank_list,
                                          init_backend=init_backend)
         self._compact_str = self._to_compact_string()
@@ -180,6 +185,9 @@ class Layout:
         obj._partial = [None] * len(device_mesh.mesh_shape)
         obj._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
         obj._alias_tensor_map = None
+        obj._tensor_shape = None
+        obj._tensor_stride = None
+        obj._tensor_dtype = None
         obj._placements = None
         obj._compact_str = obj._to_compact_string()
         return obj
@@ -560,6 +568,38 @@ class Layout:
         self._placements = placements
 
     @property
+    def tensor_shape(self) -> Optional[tuple[int, ...]]:
+        """Return the explicit logical tensor shape, if one was provided."""
+        return self._tensor_shape
+
+    @property
+    def tensor_stride(self) -> Optional[tuple[int, ...]]:
+        """Return the explicit logical tensor stride, if one was provided."""
+        return self._tensor_stride
+
+    @property
+    def tensor_dtype(self) -> Optional[Any]:
+        """Return the explicit logical tensor dtype, if one was provided."""
+        return self._tensor_dtype
+
+    def set_tensor_meta(
+        self,
+        shape: Sequence[int],
+        stride: Sequence[int],
+        dtype: Any,
+    ) -> None:
+        """Set logical tensor metadata independently from local shard storage.
+
+        Args:
+            shape: Logical global tensor shape.
+            stride: Logical global tensor stride.
+            dtype: Logical tensor dtype.
+        """
+        self._tensor_shape = tuple(shape)
+        self._tensor_stride = tuple(stride)
+        self._tensor_dtype = dtype
+
+    @property
     def tensor_map(self):
         """tensor map"""
         return self._tensor_map
@@ -686,6 +726,8 @@ class Layout:
 
     def get_global_shape(self, slice_shape):
         """get global shape"""
+        if self._tensor_shape is not None:
+            return self._tensor_shape
         return self._mesh.get_global_shape(slice_shape, self._tensor_map)
 
     def get_devices_for_axis(self, axis, rank):

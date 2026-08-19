@@ -1524,6 +1524,11 @@ class TorchPlatform(Platform):
         device = self.get_device_handle()
         return device.current_stream()
 
+    @staticmethod
+    def move_to_device(tensor, device, non_blocking=False):
+        """Move a tensor to the target device."""
+        return tensor.to(device=device, non_blocking=non_blocking)
+
     def new_event(self):
         device = self.get_device_handle()
         return device.Event()
@@ -1568,6 +1573,12 @@ class TorchPlatform(Platform):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.sac import create_selective_checkpoint_contexts
         return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation, group_swap)
+
+    @staticmethod
+    def ignore_sac_ops(ops: list[object | None]) -> None:
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.sac import ignore_sac_ops
+        ignore_sac_ops(ops)
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):

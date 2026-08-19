@@ -14,6 +14,9 @@
 # ============================================================================
 """Critic model execution and algorithm-neutral value optimization."""
 from typing import Any, Optional
+from rl.algorithm.loss import RLAlgorithm
+from rl.dataset.contracts import ExperienceBatch
+from rl.utils.monitoring.metrics import CriticUpdateMetrics
 from hyper_parallel import (
     HSDPModule,
     SkipDTensorDispatch,
@@ -21,9 +24,6 @@ from hyper_parallel import (
     hsdp_sync_stream,
 )
 from hyper_parallel.core.utils import clip_grad_norm_
-from rl.algorithm.loss import RLAlgorithm
-from rl.dataset.contracts import ExperienceBatch
-from rl.utils.monitoring.metrics import CriticUpdateMetrics
 platform = get_platform()
 class Critic(platform.Module):
     """Own a value model and its optimization runtime."""
@@ -41,6 +41,7 @@ class Critic(platform.Module):
         update_epochs: int,
         max_grad_norm: float,
     ) -> None:
+        """Initialize the trainable Critic and its distributed optimizer settings."""
         platform.Module.__init__(self)
         if not algorithm.requirements.roles.critic:
             raise ValueError(f"Algorithm '{algorithm.name}' does not require a Critic")
@@ -187,7 +188,7 @@ class Critic(platform.Module):
     def _global_token_count(self, action_mask: Any) -> int:
         """Return the data-parallel count of valid response tokens."""
         count = platform.tensor(
-            [float(action_mask.sum().item())],
+            [float(action_mask.flatten().sum(dim=0).item())],
             dtype=platform.tensor_dtype.float32,
             device=self._device,
         )

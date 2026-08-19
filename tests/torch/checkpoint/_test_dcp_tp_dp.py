@@ -526,7 +526,7 @@ def test_dcp_async_save_with_optimizer_tp_dp():
         "model": model2.state_dict(),
         "optimizer": optimizer2.state_dict(),
     }
-    load(load_state_async, checkpoint_id=checkpoint_path_async, use_collectives=True)
+    load(load_state_async, checkpoint_id=checkpoint_path_async, use_collectives=False)
     dist.barrier()
     _assert_sd_tensors_close(save_state["model"], load_state_async["model"])
     _assert_sd_tensors_close(save_state["optimizer"], load_state_async["optimizer"])

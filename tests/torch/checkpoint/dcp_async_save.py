@@ -107,7 +107,7 @@ def test_dcp_async_save_load():
     """
     Feature: ``async_save`` + ``load`` with ``fully_shard`` (1-D mesh) and a multi-parameter model.
 
-    Staging runs in the training process; persistence runs in a child process; ``load`` uses collectives.
+    Staging runs in the training process; persistence and load use rank-local metadata.
     """
     init_dist()
     rank = dist.get_rank()
@@ -133,7 +133,7 @@ def test_dcp_async_save_load():
 
     model_for_load = _build_sharded_demo_model(world)
     load_data = {"model_state_dict": model_for_load.state_dict()}
-    dcp_load(load_data, checkpoint_id=ckpt_dir, use_collectives=True)
+    dcp_load(load_data, checkpoint_id=ckpt_dir, use_collectives=False)
     dist.barrier()
 
     for key in save_data["model_state_dict"]:

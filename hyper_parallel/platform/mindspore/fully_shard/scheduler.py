@@ -140,8 +140,7 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
-    # pylint: disable=W0613
-    def _root_backward_hook(self, force_reduce=False):
+    def _root_backward_hook(self):
         """Finalize the outermost backward: drain pending reductions and apply grads.
 
         The drain is unconditional. Every step below is self-limiting -- the fused
@@ -158,7 +157,7 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         skip the drain and leak the last module's reduce-scatter into the next optimizer
         step. This happens when ``fully_shard`` wraps only inner layers and not the root
         module (each layer becomes its own root yet is fed a grad-requiring activation).
-        PP hit the same boundary and worked around it with ``force_reduce=True`` from
+        PP hit the same boundary and worked around it with an explicit force flag from
         ``PipelineStage.execute_reduce_grad``; that call site keeps working -- the drain is
         simply always performed now. PP per-micro-batch accumulation is unaffected because
         each chunk's backward sets ``requires_gradient_sync=False``, leaving the reduce
