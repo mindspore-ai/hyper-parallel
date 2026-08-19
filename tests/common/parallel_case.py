@@ -52,6 +52,14 @@ class MindSporeCase:
         self.local_worker_num = local_worker_num
 
 
+def _parallel_run_context():
+    """Use spawn for CPU shards to avoid inheriting fork-only state."""
+    device_type = os.environ.get("HYPER_PARALLEL_TEST_DEVICE_TYPE", "").strip().lower()
+    if device_type == "cpu":
+        return mp.get_context("spawn")
+    return mp.get_context()
+
+
 def run_case(visible_devices: list, case: Union[TorchCase, MindSporeCase]) -> None:
     """Run a single test case in a child process with device visibility set.
 
@@ -62,8 +70,11 @@ def run_case(visible_devices: list, case: Union[TorchCase, MindSporeCase]) -> No
     # become the leader of a new process group so that os.killpg on timeout
     # kills torchrun/msrun worker sub-processes as well as this wrapper
     os.setsid()
-    # set visible devices for current case
-    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = ','.join(map(str, visible_devices))
+    if os.environ.get("HYPER_PARALLEL_TEST_DEVICE_TYPE", "").strip().lower() == "cpu":
+        os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+    else:
+        # set visible devices for current case
+        os.environ['ASCEND_RT_VISIBLE_DEVICES'] = ','.join(map(str, visible_devices))
     if isinstance(case, TorchCase):
         # Import the thin launcher only — never tests.torch.utils (imports torch /
         # torch_npu) or tests.mindspore.st.utils (imports mindspore) in this
@@ -122,8 +133,9 @@ def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_
     # create child process (run_case calls os.setsid to own a process group,
     # so os.killpg on timeout kills torchrun/msrun workers too)
     processes = []
+    ctx = _parallel_run_context()
     for _, (case, devices) in enumerate(zip(cases, assignments)):
-        p = mp.Process(target=run_case, args=(devices, case))
+        p = ctx.Process(target=run_case, args=(devices, case))
         p.start()
         processes.append(p)
 

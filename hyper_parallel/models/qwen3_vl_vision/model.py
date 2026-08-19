@@ -26,15 +26,26 @@ from typing import List
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-    eager_attention_forward as _transformers_eager_attention_forward,
-)
 
 
 def _gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
+
+
+def _flash_attention_forward(*args, **kwargs):
+    """Run the optional Transformers flash-attention implementation."""
+    # ``transformers`` is optional because the default eager path is native.
+    # pylint: disable=C0415
+    try:
+        from transformers.modeling_flash_attention_utils import (
+            _flash_attention_forward as transformers_flash_attention_forward,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "The vision flash_attention_2 implementation requires the optional "
+            "transformers package.",
+        ) from exc
+    return transformers_flash_attention_forward(*args, **kwargs)
 
 def _activation(name: str):
     if name in ("silu", "swish"):
@@ -62,9 +73,8 @@ class Qwen3VLMoeVisionConfig:
     out_hidden_size: int = 2048
     num_position_embeddings: int = 2304
     deepstack_visual_indexes: List[int] = field(default_factory=lambda: [8, 16, 24])
-    # ``"flash_attention_2"`` uses ``torch_npu.npu_fusion_attention``;
-    # ``"sdpa"`` / ``"eager"`` chunk-split q/k/v by cu_seqlens and dispatch
-    # through Transformers' attention interface.
+    # ``"flash_attention_2"`` uses the optional Transformers implementation;
+    # ``"sdpa"`` / ``"eager"`` use the native local core-attention path.
     _attn_implementation: str = "eager"
 
 
@@ -135,16 +145,6 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
-def _eager_attention_forward(*args, **kwargs):
-    """Eager attention forward used by the vision and text attention paths.
-
-    Reusing the imported eager implementation keeps the Python call-stack
-    identity stable; the NPU kernel-cache key is sensitive to the calling
-    function frame, and a local copy can produce small bf16 divergence in the
-    first vision attention block.
-    """
-    return _transformers_eager_attention_forward(*args, **kwargs)
-
 class Qwen3VLMoeVisionAttention(nn.Module):
     """Vision self-attention for Qwen3-VL-MoE."""
 
@@ -160,6 +160,16 @@ class Qwen3VLMoeVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        self._context_parallel_enabled = False
+        self._async_context_parallel_enabled = False
+        self.q_cp_boundary = nn.Identity()
+        self.k_cp_boundary = nn.Identity()
+        self.v_cp_boundary = nn.Identity()
+        self.sdpa_core = Qwen3VLMoeVisionSdpaCore(
+            config,
+            scaling=self.scaling,
+            attention_dropout=self.attention_dropout,
+        )
 
     def forward(
         self,
@@ -185,25 +195,21 @@ class Qwen3VLMoeVisionAttention(nn.Module):
             query_states, key_states, cos, sin,
         )
 
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
+        query_states = query_states.unsqueeze(0)
+        key_states = key_states.unsqueeze(0)
+        value_states = value_states.unsqueeze(0)
 
         # fa2 path uses full-batch query + ``cu_seq_lens_q/k``; other
         # implementations chunk-split q/k/v by ``cu_seqlens``.
         attn_impl = getattr(self.config, "_attn_implementation", "eager")
-        if attn_impl == "flash_attention_2":
+        if attn_impl == "flash_attention_2" and not self._context_parallel_enabled:
             # Keep ``max_seqlen`` as a tensor: ``.item()`` forces a CPU-NPU
             # sync that perturbs the CANN kernel cache.
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            # ``_flash_attention_forward`` consumes (B, S, H, D).
-            q_for_fa = query_states.transpose(1, 2)
-            k_for_fa = key_states.transpose(1, 2)
-            v_for_fa = value_states.transpose(1, 2)
             attn_output = _flash_attention_forward(
-                q_for_fa, k_for_fa, v_for_fa,
+                query_states, key_states, value_states,
                 attention_mask=None,
-                query_length=q_for_fa.shape[1],
+                query_length=query_states.shape[1],
                 is_causal=False,
                 dropout=0.0 if not self.training else self.attention_dropout,
                 softmax_scale=self.scaling,
@@ -214,27 +220,20 @@ class Qwen3VLMoeVisionAttention(nn.Module):
                 attn_implementation="flash_attention_2",
             )
         else:
-            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-                attn_impl, _eager_attention_forward,
-            )
-            # Eager path: process each variable-length chunk separately.
+            # Eager path, and CP-enabled FA2 path: process each variable-length
+            # chunk independently through an explicit core-attention boundary.
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
-                torch.split(tensor, lengths.tolist(), dim=2)
+                torch.split(tensor, lengths.tolist(), dim=1)
                 for tensor in (query_states, key_states, value_states)
             ]
             attn_outputs = [
-                attention_interface(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
+                self.sdpa_core(
+                    self.q_cp_boundary(q),
+                    self.k_cp_boundary(k),
+                    self.v_cp_boundary(v),
                     **kwargs,
-                )[0]
+                )
                 for q, k, v in zip(*splits)
             ]
             attn_output = torch.cat(attn_outputs, dim=1)
@@ -242,6 +241,70 @@ class Qwen3VLMoeVisionAttention(nn.Module):
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
         return attn_output
+
+
+class Qwen3VLMoeVisionSdpaCore(nn.Module):
+    """Core vision attention boundary for ContextParallel registration.
+
+    Inputs and outputs use BSHD layout so visual Encoder CP can shard the
+    sequence dimension independently from the text decoder path.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3VLMoeVisionConfig,
+        scaling: float,
+        attention_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.config = config
+        self.scaling = scaling
+        self.attention_dropout = attention_dropout
+        self.is_causal = False
+        self.num_key_value_groups = 1
+
+    def forward(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run one non-causal vision attention chunk in BSHD layout."""
+        attn_impl = getattr(self.config, "_attn_implementation", "eager")
+        if attn_impl == "flash_attention_2":
+            del kwargs
+            return _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=None,
+                query_length=query_states.shape[1],
+                is_causal=False,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                softmax_scale=self.scaling,
+                attn_implementation="flash_attention_2",
+            )
+
+        del kwargs
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        key_states = _repeat_kv(key_states, self.num_key_value_groups)
+        value_states = _repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(
+            query_states,
+            key_states.transpose(2, 3),
+        ) * self.scaling
+        attn_weights = torch.softmax(attn_weights.float(), dim=-1).to(query_states.dtype)
+        attn_weights = F.dropout(
+            attn_weights,
+            p=0.0 if not self.training else self.attention_dropout,
+            training=self.training,
+        )
+        attn_output = torch.matmul(attn_weights, value_states)
+        return attn_output.transpose(1, 2).contiguous()
 
 class Qwen3VLMoeVisionMLP(nn.Module):
     """Vision MLP matching HF Qwen3VLMoeVisionMLP names."""
@@ -311,7 +374,12 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype))
+        # Keep Conv3d parameter names/layout for checkpoint compatibility, but
+        # execute the equivalent patch projection through linear. This avoids
+        # the unstable Conv3d backward path observed on Ascend A2 torch-npu.
+        hidden_states = hidden_states.to(dtype=target_dtype).flatten(1)
+        weight = self.proj.weight.view(self.embed_dim, -1)
+        hidden_states = F.linear(hidden_states, weight, self.proj.bias)
         return hidden_states.view(-1, self.embed_dim)
 
 class Qwen3VLMoeVisionPatchMerger(nn.Module):

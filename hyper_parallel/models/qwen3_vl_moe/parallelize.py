@@ -25,7 +25,13 @@ from typing import Optional, TYPE_CHECKING
 
 import torch
 
-from hyper_parallel import DTensor, HSDPModule, fully_shard
+from hyper_parallel import (
+    AsyncContextParallel,
+    ContextParallel,
+    DTensor,
+    HSDPModule,
+    fully_shard,
+)
 from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
@@ -51,6 +57,7 @@ from hyper_parallel.models.qwen3_5_moe.parallelize import (  # pylint: disable=C
     parallelize_qwen3_5_moe_ep,
     parallelize_qwen3_5_moe_tp,
 )
+from hyper_parallel.trainer.config import get_vision_parallel_config
 
 if TYPE_CHECKING:
     from hyper_parallel.trainer.config import HyperTrainerConfig
@@ -232,6 +239,7 @@ def _build_fsdp_kwargs(module, dp_mesh, cfg) -> dict:
                 shard_dim_overrides[id(param)] = shardable_dim
             else:
                 replicate_params.add(param)
+        _extend_visual_replicate_params(module, dp_mesh, cfg, shard_size, replicate_params)
     if shard_dim_overrides:
         overrides = shard_dim_overrides
 
@@ -254,6 +262,23 @@ def _without_forward_input_cast(fsdp_kwargs: dict) -> dict:
     return boundary_kwargs
 
 
+def _extend_visual_replicate_params(module, mesh, cfg, shard_size: int, replicate_params) -> None:
+    """Keep visual params replicated when ``vision_parallel.dp_shard=1`` is requested."""
+    if shard_size <= 1:
+        return
+    if not _get_model_extra(cfg).get("vl", False):
+        return
+    if not (hasattr(module, "model") and hasattr(module.model, "visual")):
+        return
+    if _resolve_vision_dp_shard_size(mesh, cfg) != 1:
+        return
+    replicate_params.update(module.model.visual.parameters())
+    logger.info_rank0(
+        "VL visual params routed through replicate_params for encoder-only DP "
+        "(vision_parallel.dp_shard=1)."
+    )
+
+
 def _resolve_dp_mesh(mesh):
     try:
         return mesh["fsdp"]
@@ -263,6 +288,88 @@ def _resolve_dp_mesh(mesh):
         return mesh["dp_shard"]
     except (KeyError, TypeError):
         return mesh
+
+
+def _get_model_extra(cfg) -> dict:
+    """Return model.config_overrides as a plain dict."""
+    extra = getattr(cfg.model, "config_overrides", None)
+    return extra if isinstance(extra, dict) else {}
+
+
+def _get_vision_parallel_cfg(cfg) -> dict:
+    """Return visual Encoder local parallel config when present."""
+    return get_vision_parallel_config(cfg.model)
+
+
+def _mesh_size(mesh) -> int:
+    """Return mesh size when available, otherwise treat it as single rank."""
+    try:
+        return int(mesh.size())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return 1
+
+
+def _resolve_vision_dp_shard_size(mesh, cfg) -> int:
+    """Resolve visual Encoder DP shard size from config or global DP."""
+    vision_parallel = _get_vision_parallel_cfg(cfg)
+    dp_mesh = _resolve_dp_mesh(mesh)
+    global_dp_size = _mesh_size(dp_mesh)
+    requested = vision_parallel.get("dp_shard", None)
+    if requested in (None, "", 0, "0"):
+        return global_dp_size
+
+    requested_size = int(requested)
+    if requested_size <= 0:
+        raise ValueError(f"vision_parallel.dp_shard must be >= 1, got {requested_size}.")
+    if requested_size not in (1, global_dp_size):
+        raise ValueError(
+            "Current qwen3_vl_moe visual Encoder DP supports only "
+            f"vision_parallel.dp_shard in {{1, {global_dp_size}}}, got {requested_size}."
+        )
+    return requested_size
+
+
+def _resolve_vision_cp_mesh(mesh, cfg):
+    """Resolve visual Encoder CP mesh, including explicit dp_shard reuse mode."""
+    vision_parallel = _get_vision_parallel_cfg(cfg)
+    cp_size = int(vision_parallel.get("cp", 1) or 1)
+    if cp_size <= 1:
+        return None
+
+    global_cp = int(getattr(cfg.train.accelerator, "cp", 1) or 1)
+    if global_cp > 1:
+        try:
+            cp_mesh = mesh["cp"]
+        except (KeyError, TypeError):
+            cp_mesh = mesh
+        actual_size = _mesh_size(cp_mesh)
+        if actual_size != cp_size:
+            raise ValueError(
+                f"vision_parallel.cp={cp_size} but train.accelerator.cp mesh size is {actual_size}."
+            )
+        return cp_mesh
+
+    dp_mesh = _resolve_dp_mesh(mesh)
+    actual_size = _mesh_size(dp_mesh)
+    if actual_size != cp_size:
+        raise ValueError(
+            "vision_parallel.cp requires either train.accelerator.cp > 1 with a matching "
+            f"cp mesh, or a dp_shard mesh of the same size. Requested cp={cp_size}, got "
+            f"dp_shard mesh size={actual_size}."
+        )
+    if not vision_parallel.get("reuse_dp_shard_mesh", False):
+        raise ValueError(
+            "vision_parallel.cp requested encoder-only CP on the dp_shard mesh while "
+            "train.accelerator.cp=1. This path may aggregate attention states across "
+            "different DP samples, so it requires explicit opt-in via "
+            "model.vision_parallel.reuse_dp_shard_mesh=true."
+        )
+    logger.warning_rank0(
+        "VL vision CP is reusing the dp_shard mesh because train.accelerator.cp=1. "
+        "This mode is intended for targeted 2-card validation; ranks may hold "
+        "different samples unless vision_parallel.share_samples_across_dp=true."
+    )
+    return dp_mesh
 
 
 def _resolve_qwen3_vl_moe_dp_sizes(mesh, cfg) -> tuple[int, int]:
@@ -311,6 +418,8 @@ def _resolve_qwen3_vl_moe_fsdp_mesh(mesh, cfg, cp_size: int):
 
 def _resolve_visual_fsdp_mesh(mesh, cfg):
     """Return the data-parallel mesh used to shard the frozen visual tower."""
+    if _resolve_vision_dp_shard_size(mesh, cfg) <= 1:
+        return None
     replicate_size, shard_size = _resolve_qwen3_vl_moe_dp_sizes(mesh, cfg)
     if replicate_size * shard_size > 1:
         return _resolve_qwen3_vl_moe_dp_mesh(mesh, cfg)
@@ -322,6 +431,68 @@ def _resolve_visual_fsdp_mesh(mesh, cfg):
     if _is_single_rank_without_parallel_axes(cfg):
         return mesh
     return None
+
+
+def _apply_vl_visual_cp(model, mesh, cfg) -> None:
+    """Apply encoder-only ContextParallel to the visual attention core."""
+    visual = _resolve_visual_tower(model, cfg)
+    if visual is None:
+        return
+
+    cp_mesh = _resolve_vision_cp_mesh(mesh, cfg)
+    if cp_mesh is None:
+        return
+
+    vision_parallel = _get_vision_parallel_cfg(cfg)
+    ulysses_degree = vision_parallel.get("ulysses_degree", 1)
+    async_cp = bool(
+        vision_parallel.get("async_cp", getattr(cfg.train.accelerator, "async_cp", False))
+    )
+    cp_cls = AsyncContextParallel if async_cp else ContextParallel
+    cp_plan = cp_cls(
+        seq_dim=1,
+        head_dim=2,
+        ulysses_degree=ulysses_degree,
+    )
+
+    block_count = 0
+    for block in getattr(visual, "blocks", ()):
+        sdpa_core = getattr(getattr(block, "attn", None), "sdpa_core", None)
+        if sdpa_core is None:
+            raise ValueError(
+                "vision_parallel.cp requires visual attention modules to expose "
+                "an sdpa_core boundary."
+            )
+        if async_cp:
+            missing = [
+                name for name in ("q_cp_boundary", "k_cp_boundary", "v_cp_boundary")
+                if not hasattr(block.attn, name)
+            ]
+            if missing:
+                raise ValueError(
+                    "vision_parallel.async_cp requires visual attention modules to expose "
+                    f"CP projection boundaries: missing {missing}."
+                )
+            cp_plan.apply(
+                sdpa_core,
+                cp_mesh,
+                q_proj=block.attn.q_cp_boundary,
+                k_proj=block.attn.k_cp_boundary,
+                v_proj=block.attn.v_cp_boundary,
+            )
+        else:
+            cp_plan.apply(sdpa_core, cp_mesh)
+        setattr(block.attn, "_context_parallel_enabled", True)
+        setattr(block.attn, "_async_context_parallel_enabled", async_cp)
+        block_count += 1
+
+    logger.info_rank0(
+        "VL vision CP applied: blocks=%d cp=%d ulysses_degree=%s async_cp=%s",
+        block_count,
+        _mesh_size(cp_mesh),
+        str(ulysses_degree),
+        str(async_cp),
+    )
 
 
 def _apply_full_sequence_input_cp_gather(module, cp_mesh: DeviceMesh) -> None:
@@ -699,9 +870,15 @@ def _apply_vl_visual_tower(model, mesh, cfg) -> None:
     single_frozen_visual = _is_single_rank_without_parallel_axes(cfg) and frozen_visual
     dp_mesh = _resolve_visual_fsdp_mesh(mesh, cfg)
     if dp_mesh is None:
-        logger.info_rank0(
-            "Qwen3-VL-MoE visual tower is replicated for pure model-parallel axes."
-        )
+        if _resolve_vision_dp_shard_size(mesh, cfg) <= 1:
+            logger.info_rank0(
+                "VL visual tower kept replicated under root FSDP "
+                "(vision_parallel.dp_shard=1)."
+            )
+        else:
+            logger.info_rank0(
+                "Qwen3-VL-MoE visual tower is replicated for pure model-parallel axes."
+            )
         return
     fsdp_kwargs = _build_fsdp_kwargs(visual, dp_mesh, cfg)
     if single_frozen_visual:
@@ -948,6 +1125,7 @@ def parallelize_qwen3_vl_moe(
     _resolve_qwen3_vl_moe_fsdp_mesh(
         mesh, cfg, int(cfg.train.accelerator.cp or 1),
     )
+    _apply_vl_visual_cp(model, mesh, cfg)
     if not _should_skip_single_rank_fsdp(cfg):
         _apply_vl_visual_tower(model, mesh, cfg)
     _apply_deterministic_moe_sort(model, cfg)

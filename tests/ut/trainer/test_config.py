@@ -56,6 +56,7 @@ from hyper_parallel.trainer.config import (
     _resolve_field_type,
     _string_to_bool,
     _validate_top_level,
+    get_vision_parallel_config,
     parse_args,
 )
 
@@ -242,6 +243,53 @@ class TestHyperTrainerConfigPostInit(unittest.TestCase):
         self.assertFalse(cfg.train.monitor.monitor_on)
         self.assertEqual(cfg.train.monitor.dump_path, "./dump")
         self.assertEqual(cfg.train.monitor.step_interval, 1)
+
+
+class TestVisionParallelConfig(unittest.TestCase):
+    """``model.vision_parallel`` parsing is centralized in the config layer."""
+
+    def test_preferred_field_normalizes_bool_aliases(self):
+        """Test preferred ``vision_parallel`` field normalizes bool aliases."""
+        cfg = ModelConfig(
+            vision_parallel={
+                "cp": 2,
+                "reuse_dp_shard_mesh": "yes",
+                "share_samples_across_dp": 1,
+            }
+        )
+        vision_parallel = get_vision_parallel_config(cfg)
+        self.assertEqual(vision_parallel["cp"], 2)
+        self.assertTrue(vision_parallel["reuse_dp_shard_mesh"])
+        self.assertTrue(vision_parallel["share_samples_across_dp"])
+
+    def test_legacy_config_overrides_location_remains_supported(self):
+        """Test legacy ``config_overrides`` location remains supported."""
+        cfg = ModelConfig(
+            config_overrides={
+                "vision_parallel": {
+                    "reuse_dp_shard_mesh": "off",
+                    "share_samples_across_dp": "false",
+                }
+            }
+        )
+        vision_parallel = get_vision_parallel_config(cfg)
+        self.assertFalse(vision_parallel["reuse_dp_shard_mesh"])
+        self.assertFalse(vision_parallel["share_samples_across_dp"])
+
+    def test_preferred_field_wins_over_legacy_location(self):
+        """Test preferred ``vision_parallel`` field overrides legacy location."""
+        cfg = ModelConfig(
+            vision_parallel={"reuse_dp_shard_mesh": True},
+            config_overrides={"vision_parallel": {"reuse_dp_shard_mesh": False}},
+        )
+        vision_parallel = get_vision_parallel_config(cfg)
+        self.assertTrue(vision_parallel["reuse_dp_shard_mesh"])
+
+    def test_invalid_bool_alias_raises(self):
+        """Test invalid bool aliases raise configuration errors."""
+        cfg = ModelConfig(vision_parallel={"share_samples_across_dp": "maybe"})
+        with self.assertRaises(ValueError):
+            get_vision_parallel_config(cfg)
 
 
 class TestParseArgs(unittest.TestCase):

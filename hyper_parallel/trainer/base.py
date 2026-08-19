@@ -55,6 +55,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data import build_dataset
 from hyper_parallel.models.spec.registry import get_spec
+from hyper_parallel.trainer.config import get_vision_parallel_config
 from hyper_parallel.trainer.parallel_dims import ParallelDims
 from hyper_parallel.trainer.utils.loss import count_loss_token, mean_global_loss
 from hyper_parallel.trainer.callbacks.base import (
@@ -166,6 +167,12 @@ class BaseTrainer:
     def _cp_size(self) -> int:
         """Return configured context-parallel size."""
         return self._parallel_dim_size("cp")
+
+    def _share_samples_across_dp(self) -> bool:
+        """Return whether the visual validation path reuses samples across DP."""
+        return get_vision_parallel_config(self.args.model).get(
+            "share_samples_across_dp", False,
+        )
 
     def _setup(self):
         """Step 1: Initialize distributed environment, device mesh, and seed.
@@ -436,11 +443,10 @@ class BaseTrainer:
 
         shuffle = self.args.data.shuffle
         sampler_seed = self.args.train.seed
-
         self.sampler = DistributedSampler(
             self.train_dataset,
-            num_replicas=dp_size,
-            rank=dp_rank,
+            num_replicas=1 if self._share_samples_across_dp() else dp_size,
+            rank=0 if self._share_samples_across_dp() else dp_rank,
             shuffle=shuffle,
             seed=sampler_seed,
             drop_last=True,
@@ -483,13 +489,23 @@ class BaseTrainer:
 
         # Use dp_size (not world_size) — TP/CP/PP ranks share data, not split it.
         self._grad_accum = max(
-            self.args.train.global_batch_size // (micro_bs * dp_size),
+            self.args.train.global_batch_size // (
+                micro_bs * (1 if self._share_samples_across_dp() else dp_size)
+            ),
             1,
         )
 
+        if self._share_samples_across_dp():
+            logger.warning_rank0(
+                "vision_parallel.share_samples_across_dp=true. Use this only for "
+                "validation/self-consistency checks; normal training should keep "
+                "distinct samples across DP ranks."
+            )
         logger.info_rank0(
-            "Dataloader built: micro_bs=%d, grad_accum=%d, dataset_size=%d",
+            "Dataloader built: micro_bs=%d, grad_accum=%d, dataset_size=%d, "
+            "share_samples_across_dp=%s",
             micro_bs, self._grad_accum, len(self.train_dataset),
+            str(self._share_samples_across_dp()),
         )
 
     def _build_parallelized_model(self):
@@ -2103,6 +2119,7 @@ class BaseTrainer:
                     if local is not None and local.is_meta:
                         new_local = torch.empty_like(local, device=device_type)
                         hsdp_param.sharded_param._local_tensor = new_local  # pylint: disable=W0212
+                        hsdp_param._sharded_param_data = new_local.view(-1)  # pylint: disable=W0212
 
     def _init_local_shards(self) -> int:
         """Init local shard of every param (kaiming for >=2D, zero else); zero buffers."""
