@@ -25,6 +25,8 @@ from typing import Any, Optional
 
 import torch
 from torch import nn
+from transformers.conversion_mapping import get_model_conversion_mapping
+from transformers.core_model_loading import WeightConverter, WeightRenaming
 
 from hyper_models._transformers.checkpoint_loader import CheckpointManager, LoadReport
 from hyper_models.components.activation_checkpoint import (
@@ -528,9 +530,15 @@ def _finalize_model_loading(
     return finalized_report
 
 
-def _apply_module_replacement_actions(model: nn.Module, distributed_setup) -> nn.Module:
+def _apply_module_replacement_actions(
+    model: nn.Module,
+    distributed_setup,
+    weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
+) -> tuple[nn.Module, list[WeightRenaming | WeightConverter]]:
     """Apply explicit replacement rules before sharding sees the model."""
 
+    if weights_mapping is None:
+        weights_mapping = get_model_conversion_mapping(model)
     entries = getattr(distributed_setup, "plan_overrides", None) or []
     from hyper_models.components.model_transform import (  # pylint: disable=import-outside-toplevel
         apply_module_replacements,
@@ -538,7 +546,11 @@ def _apply_module_replacement_actions(model: nn.Module, distributed_setup) -> nn
     )
 
     plan = compile_module_replacements(model, entries_to_module_replacements(entries))
-    return apply_module_replacements(model, plan)
+    return apply_module_replacements(
+        model,
+        plan,
+        weights_mapping=weights_mapping,
+    )
 
 
 def apply_model_infrastructure(
@@ -598,7 +610,12 @@ def apply_model_infrastructure(
         logger.warning("FP8 not implemented in stub")
 
     # Step 5.5: structure-preserving replacement before plan derivation.
-    model = _apply_module_replacement_actions(model, distributed_setup)
+    weights_mapping = get_model_conversion_mapping(model)
+    model, weights_mapping = _apply_module_replacement_actions(
+        model,
+        distributed_setup,
+        weights_mapping,
+    )
 
     # Step 6: Parameter freezing (before sharding)
     if freeze_config is not None:
@@ -648,7 +665,11 @@ def apply_model_infrastructure(
     model = _move_model_to_device(model, is_meta_device, device)
     if is_meta_device:
         if load_base_model:
-            load_report = CheckpointManager(model).load_checkpoint(pretrained_path, strict=False)
+            load_report = CheckpointManager(model).load_checkpoint(
+                pretrained_path,
+                strict=False,
+                weights_mapping=weights_mapping,
+            )
             _finalize_model_loading(model, load_report, strict=True)
         else:
             _initialize_model_weights(model)

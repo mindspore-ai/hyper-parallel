@@ -17,6 +17,7 @@
 import unittest
 
 from torch import nn
+from transformers.core_model_loading import WeightRenaming
 
 from hyper_models.components.model_transform import (
     ModuleReplacementSpec,
@@ -181,6 +182,46 @@ class TestModuleReplacementPlan(unittest.TestCase):
 
         self.assertEqual(received_context, [{"policy": "low_precision"}])
         self.assertIsInstance(model[0], _ReplacementLinear)
+
+    def test_replacement_make_transforms_takes_no_model_config(self):
+        calls = []
+
+        @module_replacement
+        class MappedLinear(nn.Module):
+            def __init__(self, *, module, module_fqn, context):
+                super().__init__()
+                del module_fqn, context
+                self.in_features = module.in_features
+                self.out_features = module.out_features
+                self.register_parameter("packed_weight", module.weight)
+
+            def forward(self, input):
+                return nn.functional.linear(input, self.packed_weight)
+
+            def make_transforms(self):
+                calls.append("make_transforms")
+                return [WeightRenaming("weight", "packed_weight")]
+
+        model = nn.Sequential(nn.Linear(4, 8, bias=False))
+        spec = ModuleReplacementSpec(
+            match=("0",),
+            factory=MappedLinear,
+            module_type=nn.Linear,
+            exact_type=True,
+        )
+        weights_mapping = []
+
+        plan = compile_module_replacements(model, [spec])
+        model, weights_mapping = apply_module_replacements(
+            model,
+            plan,
+            weights_mapping=weights_mapping,
+        )
+
+        self.assertEqual(calls, ["make_transforms"])
+        self.assertEqual(len(weights_mapping), 1)
+        self.assertEqual(weights_mapping[0].source_patterns, ["weight"])
+        self.assertEqual(weights_mapping[0].target_patterns, ["packed_weight"])
 
     def test_rejects_hooks_that_cannot_be_migrated(self):
         model = nn.Sequential(nn.Linear(4, 8))

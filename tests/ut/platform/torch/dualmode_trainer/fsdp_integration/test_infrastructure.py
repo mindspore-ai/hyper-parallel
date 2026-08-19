@@ -21,6 +21,7 @@ from unittest.mock import Mock
 import pytest
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from transformers.core_model_loading import WeightRenaming
 
 import hyper_models._transformers.infrastructure as infrastructure_module
 from hyper_models.components.distributed.config import FSDP2Config
@@ -143,6 +144,12 @@ def test_meta_pretrained_model_loads_weights_after_materialization(monkeypatch) 
     meta_model = nn.Linear(2, 2, device="meta")
     materialized_model = nn.Linear(2, 2)
     calls = []
+    expected_mapping = [WeightRenaming("legacy.weight", "weight")]
+    monkeypatch.setattr(
+        infrastructure_module,
+        "get_model_conversion_mapping",
+        lambda model: expected_mapping,
+    )
 
     def _move_model(model: nn.Module, is_meta_device: bool, device: object) -> nn.Module:
         """Record model materialization."""
@@ -153,10 +160,16 @@ def test_meta_pretrained_model_loads_weights_after_materialization(monkeypatch) 
 
     checkpoint_manager = Mock()
 
-    def _load_weights(pretrained_path: str, *, strict: bool) -> infrastructure_module.LoadReport:
+    def _load_weights(
+        pretrained_path: str,
+        *,
+        strict: bool,
+        weights_mapping,
+    ) -> infrastructure_module.LoadReport:
         """Record deferred checkpoint loading."""
         assert pretrained_path == "checkpoint"
         assert not strict
+        assert weights_mapping is expected_mapping
         calls.append("load")
         return infrastructure_module.LoadReport((), (), ())
 
@@ -175,7 +188,11 @@ def test_meta_pretrained_model_loads_weights_after_materialization(monkeypatch) 
     assert result is materialized_model
     assert calls == ["materialize", "load"]
     manager_type.assert_called_once_with(materialized_model)
-    checkpoint_manager.load_checkpoint.assert_called_once_with("checkpoint", strict=False)
+    checkpoint_manager.load_checkpoint.assert_called_once_with(
+        "checkpoint",
+        strict=False,
+        weights_mapping=expected_mapping,
+    )
 
 
 @arg_mark(

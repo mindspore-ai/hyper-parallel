@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
 from torch import nn
+from transformers.core_model_loading import WeightConverter, WeightRenaming
 
 
 ModuleReplacementFactory = Callable[..., nn.Module]
@@ -237,25 +238,32 @@ def _validate_forward_compatibility(
         ) from error
 
 
-def _validate_replacement(source: nn.Module, replacement: nn.Module, fqn: str) -> None:
+def _validate_replacement(
+    source: nn.Module,
+    replacement: nn.Module,
+    fqn: str,
+    *,
+    has_weight_transforms: bool = False,
+) -> None:
     if not isinstance(replacement, nn.Module):
         raise TypeError(f"replacement factory for {fqn!r} must return nn.Module")
     if source.training != replacement.training:
         raise ValueError(f"replacement for {fqn!r} must preserve training state")
-    if _registered_names(source) != _registered_names(replacement):
-        raise ValueError(f"replacement for {fqn!r} changed registered module/parameter/buffer names")
-    for kind in ("parameter", "buffer"):
-        source_identities = _named_identities(source, kind=kind)
-        replacement_identities = _named_identities(replacement, kind=kind)
-        if tuple(source_identities) != tuple(replacement_identities):
-            raise ValueError(f"replacement for {fqn!r} changed {kind} names")
-        for name, source_value in source_identities.items():
-            if replacement_identities[name] is not source_value:
-                raise ValueError(
-                    f"replacement for {fqn!r} must preserve {kind} {name!r} identity"
-                )
-    if tuple(source.state_dict()) != tuple(replacement.state_dict()):
-        raise ValueError(f"replacement for {fqn!r} changed state_dict keys")
+    if not has_weight_transforms:
+        if _registered_names(source) != _registered_names(replacement):
+            raise ValueError(f"replacement for {fqn!r} changed registered module/parameter/buffer names")
+        for kind in ("parameter", "buffer"):
+            source_identities = _named_identities(source, kind=kind)
+            replacement_identities = _named_identities(replacement, kind=kind)
+            if tuple(source_identities) != tuple(replacement_identities):
+                raise ValueError(f"replacement for {fqn!r} changed {kind} names")
+            for name, source_value in source_identities.items():
+                if replacement_identities[name] is not source_value:
+                    raise ValueError(
+                        f"replacement for {fqn!r} must preserve {kind} {name!r} identity"
+                    )
+        if tuple(source.state_dict()) != tuple(replacement.state_dict()):
+            raise ValueError(f"replacement for {fqn!r} changed state_dict keys")
     _validate_forward_compatibility(source, replacement, fqn)
     hook_registries = {
         name: value for name, value in vars(source).items()
@@ -269,19 +277,39 @@ def apply_module_replacements(
     model: nn.Module,
     plan: ModuleReplacementPlan,
     *,
+    weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
     context: Mapping[str, Any] | None = None,
-) -> nn.Module:
+) -> tuple[nn.Module, list[WeightRenaming | WeightConverter] | None]:
     """Build all replacements, validate them, then install them atomically."""
 
     factory_context = MappingProxyType(dict(context or {}))
     prepared: list[tuple[ModuleReplacementTarget, nn.Module]] = []
+    extra_transforms: list[WeightRenaming | WeightConverter] = []
     for target in plan.targets:
         replacement = target.spec.factory(
             module=target.source,
             module_fqn=target.module_fqns[0],
             context=factory_context,
         )
-        _validate_replacement(target.source, replacement, target.module_fqns[0])
+        make_transforms = getattr(replacement, "make_transforms", None)
+        transforms = [] if make_transforms is None else make_transforms()
+        if not isinstance(transforms, list) or any(
+            not isinstance(transform, (WeightRenaming, WeightConverter))
+            for transform in transforms
+        ):
+            raise TypeError(
+                "replacement make_transforms() must return "
+                "list[WeightRenaming | WeightConverter]"
+            )
+        for transform in transforms:
+            transform.scope_prefix = target.module_fqns[0]
+            extra_transforms.append(transform)
+        _validate_replacement(
+            target.source,
+            replacement,
+            target.module_fqns[0],
+            has_weight_transforms=bool(transforms),
+        )
         prepared.append((target, replacement))
 
     for target, _ in prepared:
@@ -289,8 +317,14 @@ def apply_module_replacements(
             parent, name = _parent_and_name(model, fqn)
             if parent._modules[name] is not target.source:
                 raise ValueError(f"replacement target {fqn!r} changed while plan was being applied")
+    if extra_transforms:
+        if weights_mapping is None:
+            raise ValueError(
+                "weights_mapping is required when a replacement defines make_transforms()"
+            )
+        weights_mapping[:0] = extra_transforms
     for target, replacement in prepared:
         for fqn in target.module_fqns:
             parent, name = _parent_and_name(model, fqn)
             parent._modules[name] = replacement
-    return model
+    return model, weights_mapping
