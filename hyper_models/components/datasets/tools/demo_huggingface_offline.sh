@@ -18,4 +18,4 @@ python -m hyper_models.components.datasets.tools.huggingface_offline \
     --output-prefix ./offline_datasets/hyper_models_preprocess/wikitext-103-train-gpt2 \
     --tokenizer gpt2 \
     --workers 8 \
-    --append-eod
+    --append-eod true

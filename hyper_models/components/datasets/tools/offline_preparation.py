@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import traceback
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,12 @@ class CustomLanguageVars(PunktLanguageVars):
 
 def build_tokenizer(args: argparse.Namespace) -> Any:
     """Build the tokenizer configured for offline preprocessing."""
-    # only supports HuggingFace tokenizer for now
+    warnings.warn(
+        "Only Hugging Face tokenizers loaded through AutoTokenizer are currently supported; custom tokenizer "
+        "classes are not supported.",
+        UserWarning,
+        stacklevel=2,
+    )
     return build_huggingface_tokenizer(args)
 
 
@@ -110,18 +116,6 @@ def append_eod(args: argparse.Namespace, tokenizer: Any) -> int | None:
             "append_eod requires the tokenizer to define eos_token_id or sep_token_id"
         )
     return int(eod_id)
-
-
-def _pad_token_buffer(token_buffer: list[int], chunk_size: int, tokenizer: Any) -> list[int]:
-    """Pad a non-empty final token buffer to one fixed-size indexed sample."""
-    if not token_buffer:
-        return []
-    pad_token_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_token_id is None:
-        pad_token_id = getattr(tokenizer, "eos_token_id", None)
-    if pad_token_id is None:
-        raise ValueError("pad_to_seq_len requires the tokenizer to define pad_token_id or eos_token_id")
-    return [*token_buffer, *([int(pad_token_id)] * (chunk_size - len(token_buffer)))]
 
 
 class Encoder(object):
@@ -271,8 +265,8 @@ class Partition(object):
         proc_start = time.time()
         total_bytes_processed = 0
         print("Time to startup:", startup_end - startup_start)
-        pad_to_seq_len = getattr(self.args, "pad_to_seq_len", None)
-        chunk_size = pad_to_seq_len + 1 if pad_to_seq_len is not None else None
+        pack_to_seq_len = getattr(self.args, "pack_to_seq_len", None)
+        chunk_size = pack_to_seq_len + 1 if pack_to_seq_len is not None else None
         token_buffers = {key: [] for key in keys}
         for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
             if self.args.find_optimal_num_workers and i > self.args.max_documents:
@@ -293,9 +287,6 @@ class Partition(object):
         fin.close()
         keys = self.args.json_keys
         for key in keys:
-            if chunk_size is not None and token_buffers[key]:
-                chunk = _pad_token_buffer(token_buffers[key], chunk_size, tokenizer)
-                builders[key].add_document(chunk, [chunk_size])
             builders[key].finalize(output_idx_files[key])
 
         pool.close()
@@ -386,11 +377,12 @@ def get_args() -> argparse.Namespace:
     )
     group.add_argument(
         "--append-eod",
-        action="store_true",
-        help="Append the tokenizer EOS, or SEP fallback, to each non-empty document.",
+        type=_parse_bool,
+        default=True,
+        help="Append the tokenizer EOS, or SEP fallback, to each non-empty document (default: %(default)s).",
     )
     group.add_argument(
-        "--pad-to-seq-len",
+        "--pack-to-seq-len",
         type=int,
         default=None,
         help="Pack documents into fixed samples of this sequence length plus one target token.",
@@ -662,9 +654,16 @@ def prepare_offline_dataset(args: argparse.Namespace) -> None:
         raise ValueError("log_interval must be greater than zero")
     if args.max_documents <= 0:
         raise ValueError("max_documents must be greater than zero")
-    pad_to_seq_len = getattr(args, "pad_to_seq_len", None)
-    if pad_to_seq_len is not None and pad_to_seq_len <= 0:
-        raise ValueError("pad_to_seq_len must be greater than zero")
+    pack_to_seq_len = getattr(args, "pack_to_seq_len", None)
+    if pack_to_seq_len is not None and pack_to_seq_len <= 0:
+        raise ValueError("pack_to_seq_len must be greater than zero")
+    if pack_to_seq_len is not None and not args.append_eod:
+        warnings.warn(
+            "pack_to_seq_len is enabled while append_eod is disabled; packed samples will not contain EOD tokens "
+            "at original document boundaries.",
+            UserWarning,
+            stacklevel=2,
+        )
     if not args.output_prefix:
         raise ValueError("output_prefix must be provided")
     if not args.tokenizer_name_or_path:

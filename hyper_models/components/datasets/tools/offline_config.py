@@ -35,6 +35,7 @@ class OfflinePreparationConfig:
 
     dataset_name_or_path: str
     output_prefix: str
+    tokenizer_name_or_path: str
     download_dir: Optional[str] = None
     dataset_subset_name: Optional[str] = None
     dataset_split: str = "train"
@@ -43,8 +44,7 @@ class OfflinePreparationConfig:
     data_dir: Optional[str] = None
     data_files: Optional[_DatasetDataFiles] = None
     num_proc: Optional[int] = None
-    json_keys: Union[str, List[str]] = "text"
-    tokenizer_name_or_path: Optional[str] = None
+    json_keys: Union[str, List[str]] = field(default_factory=lambda: ["text"])
     tokenizer_use_fast: bool = True
     trust_remote_code: bool = False
     chat_template: Optional[str] = None
@@ -52,10 +52,10 @@ class OfflinePreparationConfig:
     split_sentences: bool = False
     keep_newlines: bool = False
     lang: str = "english"
-    workers: int = 1
+    workers: int = 8
     partitions: int = 1
     append_eod: bool = True
-    pad_to_seq_len: Optional[int] = None
+    pack_to_seq_len: Optional[int] = None
     keep_sequential_samples: bool = True
     keep_partition_files: bool = False
     find_optimal_num_workers: bool = False
@@ -167,7 +167,7 @@ class OfflinePreparationConfig:
             keep_newlines=self.keep_newlines,
             lang=self.lang,
             append_eod=self.append_eod,
-            pad_to_seq_len=self.pad_to_seq_len,
+            pack_to_seq_len=self.pack_to_seq_len,
             keep_sequential_samples=self.keep_sequential_samples,
             keep_partition_files=self.keep_partition_files,
             workers=self.workers,
