@@ -15,13 +15,13 @@
 """Model-specific activation swap support."""
 
 from hyper_models.components.activation_swap.attention_swap import (
-    apply_qwen3_moe_attention_swap,
-    qwen3_attention_swap_policy,
+    apply_attention_swap,
+    attention_swap_policy,
     validate_attention_swap,
 )
 
 __all__ = [
-    "apply_qwen3_moe_attention_swap",
-    "qwen3_attention_swap_policy",
+    "apply_attention_swap",
+    "attention_swap_policy",
     "validate_attention_swap",
 ]
