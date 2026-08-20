@@ -16,17 +16,17 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from hyper_models.components.datasets.contracts import SampleTransform
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.llm.build_indexed_dataset import build_indexed_dataset
 from hyper_models.components.datasets.llm.online_dataset import build_online_dataset
 from hyper_models.components.datasets.llm.transform_dataset import apply_llm_data_transform
 from hyper_models.components.datasets.parallel import DatasetParallelContext, create_dataset_parallel_context
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 
 def _get_train_valid_test_num_samples(training_config: Any) -> tuple[int, int, int]:

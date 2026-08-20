@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Any, TypeAlias
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.llm.indexed_data_config import (
     GPTDatasetConfig,
     build_gpt_dataset_config,
@@ -38,7 +38,7 @@ DataPath: TypeAlias = str | Sequence[str]
 DatasetSplits: TypeAlias = tuple[Any | None, Any | None, Any | None]
 SplitBuilder: TypeAlias = Callable[..., DatasetSplits]
 InstructionSplitBuilder: TypeAlias = Callable[..., Sequence[Any | None]]
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 
 class IndexedPretrainDatasetBuilder:

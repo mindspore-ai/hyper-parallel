@@ -66,7 +66,7 @@ hyper_models/components/datasets/
 │   ├── indexed_simple_blended_dataset.py
 │   ├── indexed_lazy_dataset.py
 │   ├── indexed_data_reader.py
-│   ├── indexed_sample_index.py
+│   ├── indexed_helpers.py
 │   ├── indexed_pretrain_dataset.py
 │   ├── collator.py
 │   └── get_batch.py
@@ -183,9 +183,9 @@ Online 数据依赖作为可选安装项提供：`pip install 'hyper-parallel[da
 路径解析和构建参数归一化；`indexed_split_builder.py` 构建 train/validation/test，并处理 shared blend 与
 per-split blend；`indexed_blended_dataset.py` 和 `indexed_simple_blended_dataset.py` 分别实现标准权重混合与
 MR inter/intra 混合；`indexed_lazy_dataset.py` 延迟到首次访问再构建真实 Dataset；
-`indexed_data_reader.py` 读取 `.idx/.bin`；`indexed_sample_index.py` 构建并缓存
-document/sample/shuffle 三类采样索引；`indexed_pretrain_dataset.py` 承载 GPT、Mock 和预切分记录三种运行期
-Dataset。
+`indexed_data_reader.py` 读取 `.idx/.bin`；`indexed_helpers.py` 调用 C++ 扩展构建采样索引；
+`indexed_pretrain_dataset.py` 构建和缓存 document/sample/shuffle 索引，并承载 GPT、Mock 和预切分记录三种
+运行期 Dataset。
 
 ## 五、Omni 私有阶段
 
@@ -259,22 +259,22 @@ Trainer.train_step()
 
 ## 八、调试日志
 
-Dataset 关键构建日志统一使用 `DEBUG` 级别，默认不输出。通过 Trainer 配置开启时，默认只由 rank 0 输出：
+Dataset logger 默认跟随全局日志级别，可通过 Trainer 配置选择最低输出级别：
 
 ```yaml
 debug:
-  check_dataset: true
+  check_dataset: debug  # debug、info、warn；null 表示跟随全局日志级别
   check_nan_inf: false
 ```
 
 需要指定输出 rank 时，可在 Trainer 初始化前使用接口：
 
 ```python
-from hyper_models.components.datasets import enable_dataset_debug_logging
+from hyper_models.components.datasets import enable_dataset_logging
 
-enable_dataset_debug_logging()          # rank 0
-enable_dataset_debug_logging(ranks=(1, 3))
-enable_dataset_debug_logging(ranks=None)  # all ranks
+enable_dataset_logging("debug")                    # rank 0 输出 DEBUG
+enable_dataset_logging("debug", ranks=(1, 3))
+enable_dataset_logging("debug", ranks=None)        # 所有 rank 输出 DEBUG
 ```
 
 该 logger 会覆盖 Dataset、DataLoader、Sampler、Indexed cache 和 Online source 等子模块。日志只记录构建决策、

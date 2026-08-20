@@ -15,11 +15,12 @@
 """Build the tokenizer used by the private LLM data stages."""
 
 import json
-import logging
 from collections import OrderedDict
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
+
+logger = get_dataset_logger(__name__)
 
 
 class _DatasetTokenizer:
@@ -30,6 +31,7 @@ class _DatasetTokenizer:
             *tokenizer_paths: str,
             vocab_size: int | None = None,
             eod_token_id: int | None = None,
+            pad_token_id: int | None = None,
             **tokenizer_options: Any,
     ) -> None:
         if (vocab_size is None) != (eod_token_id is None):
@@ -39,8 +41,12 @@ class _DatasetTokenizer:
                 raise ValueError("vocab_size must be positive")
             if not 0 <= eod_token_id < vocab_size:
                 raise ValueError("eod_token_id must be within the tokenizer vocabulary")
+            if pad_token_id is not None and not 0 <= pad_token_id < vocab_size:
+                raise ValueError("pad_token_id must be within the tokenizer vocabulary")
             tokenizer_options["vocab_size"] = vocab_size
             tokenizer_options["eod_token_id"] = eod_token_id
+            if pad_token_id is not None:
+                tokenizer_options["pad_token_id"] = pad_token_id
 
         self.unique_identifiers = OrderedDict()
         self.unique_identifiers["class"] = type(self).__name__
@@ -52,11 +58,24 @@ class _DatasetTokenizer:
             self.vocab_size = vocab_size
             self.eod = eod_token_id
             self.eos_token_id = eod_token_id
-            self.pad_token_id = eod_token_id
+            self.pad_token_id = pad_token_id
 
     def __len__(self) -> int:
         """Return the configured tokenizer vocabulary size."""
         return self.vocab_size
+
+    @property
+    def eos(self) -> int:
+        """Return the end-of-sequence token ID."""
+        return self.eos_token_id
+
+    @property
+    def pad(self) -> int:
+        """Return the padding token ID."""
+        if self.pad_token_id is None:
+            raise AttributeError("The tokenizer does not define a padding token ID")
+
+        return self.pad_token_id
 
 
 class _HFAutoTokenizer(_DatasetTokenizer):
@@ -141,6 +160,7 @@ class AutoTokenizer:
             tokenizer_type: str | None = None,
             vocab_size: int | None = None,
             eod_token_id: int | None = None,
+            pad_token_id: int | None = None,
             **kwargs,
     ) -> Any:
         """
@@ -151,9 +171,10 @@ class AutoTokenizer:
             force_default: If True, always use NeMoAutoTokenizerWithBosEosEnforced
             force_hf: If True, build a wrapped Hugging Face tokenizer.
             trust_remote_code: Whether to trust remote code when loading config
-            tokenizer_type: Use ``pretokenized`` for an already-tokenized corpus.
+            tokenizer_type: Use ``hf`` to load a Hugging Face tokenizer or ``pretokenized`` for metadata only.
             vocab_size: Pretokenized-corpus vocabulary size.
             eod_token_id: Pretokenized-corpus end-of-document token ID.
+            pad_token_id: Pretokenized-corpus padding token ID, when one exists.
             **kwargs: Additional arguments passed to the tokenizer's from_pretrained
 
         Returns:
@@ -162,31 +183,39 @@ class AutoTokenizer:
         if tokenizer_type == "pretokenized":
             if pretrained_model_name_or_path is None:
                 raise ValueError("pretrained_model_name_or_path is required for a pretokenized Dataset")
-            return _DatasetTokenizer(
+            tokenizer = _DatasetTokenizer(
                 pretrained_model_name_or_path,
                 vocab_size=vocab_size,
                 eod_token_id=eod_token_id,
+                pad_token_id=pad_token_id,
             )
-        if tokenizer_type is not None:
+        elif tokenizer_type not in (None, "hf"):
             raise ValueError(f"Unsupported tokenizer_type: {tokenizer_type!r}")
+        else:
+            if vocab_size is not None or eod_token_id is not None or pad_token_id is not None:
+                raise ValueError("vocab_size, eod_token_id, and pad_token_id require tokenizer_type='pretokenized'")
+            if pretrained_model_name_or_path is None:
+                raise ValueError("pretrained_model_name_or_path is required for a Hugging Face tokenizer")
+            if tokenizer_type != "hf" and not force_hf:
+                raise ValueError("Only the Hugging Face tokenizer backend is currently supported")
 
-        if vocab_size is not None or eod_token_id is not None:
-            raise ValueError("vocab_size and eod_token_id are only valid for tokenizer_type='pretokenized'")
-
-        if pretrained_model_name_or_path is None:
-            raise ValueError("pretrained_model_name_or_path is required for a Hugging Face tokenizer")
-
-        # If force_hf, use the Hugging Face tokenizer through the Dataset identity adapter.
-        if force_hf:
+            # Explicit ``hf`` and the legacy ``force_hf`` switch select the same backend.
             tokenizer = _HFAutoTokenizer(
                 pretrained_model_name_or_path,
                 *args,
                 trust_remote_code=trust_remote_code,
                 **kwargs,
             )
-            return tokenizer
 
-        raise ValueError("Only the Hugging Face tokenizer backend is currently supported")
+        backend = getattr(tokenizer, "tokenizer", tokenizer)
+        logger.debug(
+            "Built Dataset tokenizer: type=%s, backend=%s, path=%s, vocab_size=%d, "
+            "eod_token_id=%s, eos_token_id=%s, pad_token_id=%s",
+            type(tokenizer).__name__, type(backend).__name__, pretrained_model_name_or_path, len(tokenizer),
+            getattr(tokenizer, "eod", None), getattr(tokenizer, "eos_token_id", None),
+            getattr(tokenizer, "pad_token_id", None),
+        )
+        return tokenizer
 
 
 def build_tokenizer(pretrained_model_name_or_path: str, **kwargs: Any) -> Any:

@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import struct
 import time
@@ -25,7 +24,8 @@ from typing import ClassVar
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
+logger = get_dataset_logger(__name__)
 
 _INDEX_HEADER = b"MMIDIDX\x00\x00"
 _INDEX_VERSION = 1

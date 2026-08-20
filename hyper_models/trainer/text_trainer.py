@@ -171,9 +171,9 @@ class TextTrainer:
         """Dispatch the epoch-end lifecycle hook."""
         self.base.on_epoch_end()
 
-    def on_step_begin(self, micro_batches: Any = None) -> None:
+    def on_step_begin(self) -> None:
         """Dispatch the step-begin lifecycle hook."""
-        self.base.on_step_begin(micro_batches=micro_batches)
+        self.base.on_step_begin()
 
     def on_step_end(
             self,
@@ -201,7 +201,7 @@ class TextTrainer:
         # number of completed optimizer updates, which is what resume replays from.
         self.base.state.global_step += 1
 
-        self.on_step_begin(micro_batches=training_batches)
+        self.on_step_begin()
         synchronize()
 
         total_loss = 0.0
@@ -279,6 +279,8 @@ class TextTrainer:
 
         # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
         for epoch in range(self.base.state.epoch, self.base.train_epochs):
+            if epoch > 1:
+                break
             train_dataloader = self.base.train_dataloader
 
             if hasattr(train_dataloader, "set_epoch"):

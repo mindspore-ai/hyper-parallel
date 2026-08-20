@@ -48,7 +48,7 @@ from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
 from ..components.datasets.llm.chat_template import ChatTemplate
 from ..components.datasets.build_dataloader import build_dataloader
-from ..components.datasets import enable_dataset_debug_logging
+from ..components.datasets import enable_dataset_logging
 from ..components.distributed.init_utils import get_local_rank_safe, get_global_rank_safe, get_world_size_safe
 from ..components.distributed.infrastructure import (
     create_distributed_setup_from_config,
@@ -321,7 +321,7 @@ class BaseTrainer(Stateful, ABC):
         self.global_rank = get_global_rank_safe()
         self.world_size = get_world_size_safe()
         if self.config.debug.check_dataset:
-            enable_dataset_debug_logging()
+            enable_dataset_logging(self.config.debug.check_dataset)
 
         if self.config.training.seed is None:
             self.config.training.seed = self.default_seed
@@ -517,9 +517,9 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_epoch_end(self.state)
 
-    def on_step_begin(self, micro_batches=None, **kwargs):
+    def on_step_begin(self, **kwargs):
         for callback in self._callbacks:
-            callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
+            callback.on_step_begin(self.state, **kwargs)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         for callback in self._callbacks:

@@ -14,14 +14,15 @@
 # ============================================================================
 """Public LLM and Omni dataset build stage."""
 
-import logging
 from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
 from torch.utils.data import Dataset
 
-logger = logging.getLogger(__name__)
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
+
+logger = get_dataset_logger(__name__)
 
 
 def build_dataset(

@@ -24,6 +24,7 @@ import stat
 import platform
 import subprocess
 from importlib import import_module
+from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup, find_packages, Distribution
 from setuptools.command.egg_info import egg_info
 from setuptools.command.build_py import build_py
@@ -66,6 +67,13 @@ NATIVE_BUILD_VALUES = {
 
 STRICT_NATIVE_BUILD_TRUE_VALUES = {"1", "true", "on", "yes"}
 STRICT_NATIVE_BUILD_FALSE_VALUES = {"", "0", "false", "off", "no"}
+
+INDEXED_DATASET_HELPER_EXTENSION = Pybind11Extension(
+    "hyper_models.components.datasets.llm._indexed_helpers_cpp",
+    ["hyper_models/components/datasets/llm/csrc/indexed_helpers.cpp"],
+    cxx_std=11,
+    extra_compile_args=["-O3", "-Wall", "-Wextra"],
+)
 
 
 def _check_gcc_version():
@@ -320,6 +328,7 @@ if __name__ == '__main__':
     write_commit_id()
 
     _cmdclass = {
+        'build_ext': build_ext,
         'egg_info': EggInfo,
         'build_py': BuildPy,
         'install': Install,
@@ -344,6 +353,7 @@ if __name__ == '__main__':
                                         "hyper_parallel.auto_parallel.fast-tuner.*"]),
         platforms=[get_platform()],
         include_package_data=True,
+        ext_modules=[INDEXED_DATASET_HELPER_EXTENSION],
         package_data={
             'hyper_parallel': ['.commit_id',
                        'lib/*.so',

@@ -15,17 +15,17 @@
 """Chat-template implementations used by LLM conversation transforms."""
 
 from abc import ABC, abstractmethod
-import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Sequence
 import torch
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.utils.constants import IGNORE_INDEX
 from hyper_models.components.utils.registry import Registry
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 ROLE_SUPPORTED = ["system", "user", "assistant", "tool"]
 CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")

@@ -43,7 +43,6 @@ For object-storage data, pass an :class:`ObjectStorageConfig`:
 from __future__ import annotations
 
 import gc
-import logging
 import os
 import shutil
 import struct
@@ -60,8 +59,9 @@ import traceback
 import numpy
 import torch
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 def safe_import(module, *, msg=None, alt=None):
     """

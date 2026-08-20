@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import os
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -26,10 +25,11 @@ from typing import Any
 
 import numpy as np
 
+from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.llm.indexed_data_config import GPTDatasetConfig
 from hyper_models.components.datasets.llm.indexed_helpers import build_blending_indices
 
-logger = logging.getLogger(__name__)
+logger = get_dataset_logger(__name__)
 
 
 class BlendedDataset:
@@ -126,9 +126,6 @@ class BlendedDataset:
             dataset_index=dataset_index,
             dataset_sample_index=sample_index,
             weights=self.weights,
-            num_datasets=len(self.datasets),
-            size=self.size,
-            verbose=False,
         )
         requested_counts = np.bincount(dataset_index, minlength=len(self.datasets))
         for dataset_id, requested_count in enumerate(requested_counts):
