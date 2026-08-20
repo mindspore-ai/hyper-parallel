@@ -72,7 +72,7 @@ from hyper_parallel.core.pipeline_parallel import PipelineStage, ScheduleGPipe  
 from hyper_parallel.core.pipeline_parallel.scheduler import (  # noqa: E402
     ScheduleInterleaved1F1B,
 )
-from hyper_parallel.platform.torch.fully_shard.optim_state_dict_utils import (  # noqa: E402
+from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (  # noqa: E402
     _build_optim_state_dict_load_template,
 )
 from tests.torch.utils import init_dist  # noqa: E402
