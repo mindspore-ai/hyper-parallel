@@ -67,21 +67,19 @@ class _TinyDecoder(nn.Module):
 
 
 class _FakeFSDP2Manager:
-    """Record the compile-aware hook mode used during FSDP parallelization."""
+    """Record FSDP parallelization calls made by model infrastructure."""
 
     def __init__(self) -> None:
-        """Initialize an unset compile mode and an observation list."""
-        self.compile_flags = []
+        """Initialize the FSDP call counter."""
+        self.calls = 0
 
     def parallelize(
         self,
         model: nn.Module,
-        *,
-        compile_hooks_enabled: bool = False,
         **_kwargs: Any,
     ) -> nn.Module:
-        """Return the model unchanged after recording the configured mode."""
-        self.compile_flags.append(compile_hooks_enabled)
+        """Return the model unchanged after recording one FSDP call."""
+        self.calls += 1
         return model
 
 
@@ -198,5 +196,21 @@ def test_model_infrastructure_compiles_only_for_execution(
     )
 
     assert result is model
-    assert fsdp2_manager.compile_flags == [expected_compile] * expected_fsdp_calls
+    assert fsdp2_manager.calls == expected_fsdp_calls
     assert len(compile_calls) == int(expected_compile)
+
+
+def test_fsdp_compile_rejects_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject fullgraph before FSDP hooks create an intentional eager boundary."""
+    model = _TinyDecoder()
+    fsdp2_manager = _FakeFSDP2Manager()
+    monkeypatch.setattr(infrastructure, "FSDP2Manager", _FakeFSDP2Manager)
+
+    with pytest.raises(ValueError, match="fullgraph=True is incompatible with FSDP hooks"):
+        infrastructure.apply_model_infrastructure(
+            model,
+            fsdp2_manager=fsdp2_manager,
+            compile_config=CompileConfig(enabled=True, backend="aot_eager", fullgraph=True),
+        )
+
+    assert fsdp2_manager.calls == 0

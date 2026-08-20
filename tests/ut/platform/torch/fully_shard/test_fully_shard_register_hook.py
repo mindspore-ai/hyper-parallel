@@ -30,7 +30,7 @@ import torch
 from torch import nn
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
-from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
+from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2, _dynamo_disable
 
 
 def _make_scheduler_stub() -> TorchHSDPSchedulerV2:
@@ -534,29 +534,41 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         scheduler.scheduler_ctx = HSDPSchedulerContext()
         scheduler.device = torch.device("cpu")
         scheduler.source_shard_infos = None
-        scheduler.compile_hooks_enabled = False
         return scheduler
 
-    def test_scheduler_init_stores_per_instance_compile_hook_flag(self):
-        """Scheduler construction should not depend on class-level hook state."""
-        with patch.object(TorchHSDPSchedulerV2, "_init_platform"), patch.object(
-            TorchHSDPSchedulerV2, "_new_cell_state"
-        ), patch.object(TorchHSDPSchedulerV2, "_register_hooks"):
-            scheduler = TorchHSDPSchedulerV2(
-                cell=nn.Linear(2, 2),
-                mesh=MagicMock(),
-                reshard_after_forward=True,
-                shard_placement_fn=None,
-                mp_policy=MagicMock(),
-                offload_policy=MagicMock(),
-                ignored_params=set(),
-                replicate_params=set(),
-                device=torch.device("cpu"),
-                comm_fusion=False,
-                compile_hooks_enabled=True,
-            )
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.torch._dynamo.disable")
+    def test_dynamo_disable_uses_fsdp_runtime_boundary(self, mock_disable):
+        """The local decorator should match the Torch 2.12 FSDP hook boundary."""
+        def original(value):
+            """Return one incremented value."""
+            return value + 1
 
-        self.assertIs(scheduler.compile_hooks_enabled, True)
+        mock_disable.return_value = original
+        decorated = _dynamo_disable(original)
+
+        self.assertEqual(decorated(2), 3)
+        self.assertEqual(decorated.__name__, original.__name__)
+        self.assertIs(decorated.__wrapped__, original)
+        mock_disable.assert_called_once_with(
+            original,
+            recursive=True,
+            reason="skipping HyperParallel FSDP hooks",
+        )
+
+    def test_fsdp_runtime_hooks_are_dynamo_disabled(self):
+        """All FSDP runtime scheduler entries should carry the local decorator."""
+        hook_names = (
+            "_forward_pre_hook",
+            "_forward_hook",
+            "_backward_pre_hook",
+            "_root_backward_hook",
+            "_backward_hook",
+            "_grouped_forward_pre_hook",
+            "reset_iter_state",
+        )
+
+        for hook_name in hook_names:
+            self.assertTrue(hasattr(getattr(TorchHSDPSchedulerV2, hook_name), "__wrapped__"), hook_name)
 
     @patch("hyper_parallel.platform.torch.fully_shard.scheduler.TorchHSDPStateV2")
     def test_new_cell_state_forwards_scheduler_configuration(self, mock_state_ctor):
@@ -626,6 +638,8 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         module_a.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
         module_b.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
         self.assertEqual(scheduler._register_forward_module_hook.call_count, 2)
+        for call in scheduler._register_forward_module_hook.call_args_list:
+            self.assertTrue(hasattr(call.args[1], "__wrapped__"))
 
 
 if __name__ == "__main__":

@@ -92,13 +92,10 @@ def test_fsdp_parallelize_receives_tp_fqns_before_compile(monkeypatch) -> None:
     def _parallelize(
         input_model: nn.Module,
         source_shard_info: dict | None,
-        *,
-        compile_hooks_enabled: bool = False,
     ) -> nn.Module:
         """Record FSDP wrapping."""
         assert input_model is model
         assert source_shard_info is source_shard_info_by_fqn
-        assert compile_hooks_enabled
         call_order.append("parallelize")
         return input_model
 
