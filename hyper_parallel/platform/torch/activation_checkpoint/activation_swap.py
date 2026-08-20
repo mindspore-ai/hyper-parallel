@@ -35,6 +35,15 @@ _SWAP_WRAPPED_MODULE = "_swap_wrapped_module"
 _SWAP_PREFIX = _SWAP_WRAPPED_MODULE + "."
 
 
+def _raise_if_compiling(feature_name: str) -> None:
+    """Reject HyperParallel activation-swap extensions during Torch capture."""
+    if torch.compiler.is_compiling():
+        raise ValueError(
+            f"HyperParallel {feature_name} is not supported in compile mode. "
+            "Use Torch-native non-reentrant checkpointing with SAVE/RECOMPUTE policies."
+        )
+
+
 class FuncModule(nn.Module):
     """
     Thin :class:`~torch.nn.Module` adapter that wraps a plain callable.
@@ -175,6 +184,7 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
     Context manager to offload tensors to CPU during forward pass.
     """
     def __init__(self, policy_fn=None, group_swap: bool = False) -> None:
+        _raise_if_compiling("AsyncSaveOnCpu")
         self.add_to_storage = False
         self.storage = Storage()
         self.count_idx = 0
@@ -359,6 +369,7 @@ class SwapWrapper(ActivationWrapper):
 
     def forward(self, *args, **kwargs):
         """Run the wrapped module inside an AsyncSaveOnCpu context for activation swapping."""
+        _raise_if_compiling("swap_wrapper")
         with AsyncSaveOnCpu(policy_fn=self.policy_fn, group_swap=self.group_swap):
             return self._swap_wrapped_module(*args, **kwargs)
 
@@ -379,6 +390,7 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = Fa
     participates in the existing swap scheduling managed by ``SwapManager``.
     It preserves the input structure and returns the original tensors.
     """
+    _raise_if_compiling("swap_tensor_wrapper")
     swap_manager = SwapManager()
     group_name = swap_manager.get_current_group_name()
     if not group_name:
