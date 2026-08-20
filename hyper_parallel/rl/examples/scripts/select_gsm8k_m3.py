@@ -75,24 +75,40 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--implementation", choices=("native", "hyper"), default="hyper")
+    parser.add_argument("--implementation", choices=("native", "hyper"), default="native")
+    parser.add_argument("--architecture", default=None)
     parser.add_argument("--prompt-column", default="prompt")
     parser.add_argument("--answer-column", default="extra_info")
+    parser.add_argument("--candidate-offset", type=int, default=0)
     parser.add_argument("--candidate-limit", type=int, default=512)
     parser.add_argument("--sample-count", type=int, default=4)
+    parser.add_argument("--output-repeats", type=int, default=1)
     parser.add_argument("--response-count", type=int, default=4)
     parser.add_argument("--max-prompt-length", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=384)
     parser.add_argument("--seed", type=int, default=20260811)
     args = parser.parse_args()
-    if args.sample_count <= 0 or args.candidate_limit < args.sample_count:
-        raise ValueError("candidate-limit must be at least the positive sample-count")
+    if args.sample_count <= 0:
+        raise ValueError("sample-count must be positive")
+    if args.output_repeats <= 0:
+        raise ValueError("output-repeats must be positive")
+    if args.candidate_offset < 0:
+        raise ValueError("candidate-offset must be non-negative")
+    if args.candidate_limit - args.candidate_offset < args.sample_count:
+        raise ValueError(
+            "candidate-limit minus candidate-offset must be at least sample-count"
+        )
     if args.response_count < 2:
         raise ValueError("response-count must be at least 2")
     if args.max_prompt_length + args.max_tokens > args.max_model_len:
         raise ValueError("max-prompt-length plus max-tokens must not exceed max-model-len")
     return args
+
+
+def _architecture(args: argparse.Namespace) -> str:
+    """Resolve the vLLM architecture override for the selected model."""
+    return args.architecture or architecture_for_implementation(args.implementation)
 
 
 def _load_source(args: argparse.Namespace) -> tuple[pd.DataFrame, int]:
@@ -102,9 +118,11 @@ def _load_source(args: argparse.Namespace) -> tuple[pd.DataFrame, int]:
     if missing:
         raise ValueError(f"GSM8K source is missing columns: {sorted(missing)}")
     candidate_count = min(len(frame), args.candidate_limit)
-    if candidate_count < args.sample_count:
+    if candidate_count - args.candidate_offset < args.sample_count:
         raise ValueError(
-            f"GSM8K source provides only {candidate_count} candidates for {args.sample_count} samples"
+            "GSM8K source provides only "
+            f"{max(0, candidate_count - args.candidate_offset)} candidates after offset "
+            f"{args.candidate_offset} for {args.sample_count} samples"
         )
     return frame, candidate_count
 
@@ -119,11 +137,12 @@ def _build_llm(args: argparse.Namespace, candidate_count: int) -> LLM:
         tensor_parallel_size=1,
         enforce_eager=True,
         enable_prefix_caching=False,
-        max_num_seqs=min(64, candidate_count),
+        skip_mm_profiling=True,
+        max_num_seqs=min(64, candidate_count - args.candidate_offset),
         max_model_len=args.max_model_len,
         gpu_memory_utilization=0.7,
         hf_overrides={
-            "architectures": [architecture_for_implementation(args.implementation)]
+            "architectures": [_architecture(args)]
         },
     )
 
@@ -145,6 +164,8 @@ def _build_candidates(
     )
     candidates = []
     for source_index, sample in enumerate(dataset):
+        if source_index < args.candidate_offset:
+            continue
         candidates.append(
             {
                 "source_index": source_index,
@@ -243,16 +264,24 @@ def _write_outputs(
     args.output_dir.mkdir(parents=True, exist_ok=True)
     source_indices = [record["source_index"] for record in accepted]
     output_frame = frame.iloc[source_indices]
+    if args.output_repeats > 1:
+        output_frame = pd.concat(
+            [output_frame] * args.output_repeats,
+            ignore_index=True,
+        )
     dataset_path = args.output_dir / "train.parquet"
     output_frame.to_parquet(dataset_path, index=False)
     manifest = {
         "implementation": args.implementation,
-        "architecture": architecture_for_implementation(args.implementation),
+        "architecture": _architecture(args),
         "source": str(args.source),
         "source_sha256": _file_sha256(args.source),
         "dataset_sha256": _file_sha256(dataset_path),
         "model": str(args.model),
+        "output_repeats": args.output_repeats,
         "seed": args.seed,
+        "candidate_offset": args.candidate_offset,
+        "candidate_limit": args.candidate_limit,
         "response_count": args.response_count,
         "max_prompt_length": args.max_prompt_length,
         "max_tokens": args.max_tokens,

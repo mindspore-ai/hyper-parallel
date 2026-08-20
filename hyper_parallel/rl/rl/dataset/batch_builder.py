@@ -69,8 +69,16 @@ def build_experience_batch(
         "\n".join(turn.content for turn in trajectory.turns if turn.role == "assistant")
         for trajectory in trajectories
     )
+    worker_versions = {trajectory.worker_policy_version for trajectory in trajectories}
+    worker_fingerprints = {
+        trajectory.worker_policy_fingerprint for trajectory in trajectories
+    }
+    if len(worker_versions) != 1 or len(worker_fingerprints) != 1:
+        raise ValueError(
+            "Trajectories must carry one consistent worker policy version and fingerprint"
+        )
     batch_metadata = dict(metadata)
-    batch_metadata["generated_action_tokens"] = int(action_mask.sum().item())
+    batch_metadata["generated_action_tokens"] = int(action_mask.flatten().sum(dim=0).item())
     return ExperienceBatch(
         trajectories=trajectories,
         sequences=sequences,
@@ -80,6 +88,8 @@ def build_experience_batch(
         old_log_probs=old_log_probs,
         responses=responses,
         generation_seconds=generation_seconds,
+        worker_policy_version=worker_versions.pop(),
+        worker_policy_fingerprint=worker_fingerprints.pop(),
         metadata=batch_metadata,
     )
 class ExperiencePreparer:

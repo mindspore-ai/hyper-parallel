@@ -17,7 +17,21 @@ from concurrent.futures import ThreadPoolExecutor
 import socket
 import tempfile
 from typing import Any, Mapping, Optional, Protocol
-from hyper_parallel import get_platform
+
+from rl.roles.model import (
+    HYPER_MODEL_IMPLEMENTATION,
+    HYPER_QWEN3_ARCHITECTURE,
+    HYPER_QWEN3_5_ARCHITECTURE,
+    NATIVE_MODEL_IMPLEMENTATION,
+    NATIVE_QWEN3_ARCHITECTURE,
+    NATIVE_QWEN3_5_ARCHITECTURE,
+    SUPPORTED_MODEL_IMPLEMENTATIONS,
+    ModelRegistration,
+    VLLMModelRegistration,
+    architecture_for_implementation,
+    normalize_model_implementation,
+    resolve_vllm_model,
+)
 from rl.roles.weight_sync.sync import (
     POLICY_FINGERPRINT_ALGORITHM,
     PolicySnapshot,
@@ -32,15 +46,11 @@ from rl.roles.weight_sync.sync import (
     synchronize_error,
     verify_policy_fingerprints,
 )
+
+from hyper_parallel import get_platform
 platform = get_platform()
-HYPER_MODEL_IMPLEMENTATION = "hyper"
-NATIVE_MODEL_IMPLEMENTATION = "native"
-SUPPORTED_MODEL_IMPLEMENTATIONS = (
-    HYPER_MODEL_IMPLEMENTATION,
-    NATIVE_MODEL_IMPLEMENTATION,
-)
-HYPER_QWEN3_5_ARCHITECTURE = "HyperQwen3_5ForCausalLM"
-NATIVE_QWEN3_5_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
+
+
 def _state_dict(payload: Any, *, full: bool, operation: str) -> dict[str, Any]:
     """Extract one model state dict and validate its tensor-only contract."""
     state_dict = (
@@ -63,36 +73,16 @@ def _state_dict(payload: Any, *, full: bool, operation: str) -> dict[str, Any]:
             f"{operation} state entry {name!r} must be a tensor, got {type(value)!r}"
         )
     return state_dict
-def normalize_model_implementation(value: Any) -> str:
-    """Validate one rollout-side vLLM model implementation."""
-    implementation = str(value or HYPER_MODEL_IMPLEMENTATION).strip().lower()
-    if implementation not in SUPPORTED_MODEL_IMPLEMENTATIONS:
-        raise ValueError(
-            "rollout.vllm.model_implementation must be 'hyper' or 'native', "
-            f"got {value!r}"
-        )
-    return implementation
-def architecture_for_implementation(implementation: str) -> str:
-    """Return the vLLM architecture selected for rollout."""
-    normalized = normalize_model_implementation(implementation)
-    if normalized == HYPER_MODEL_IMPLEMENTATION:
-        return HYPER_QWEN3_5_ARCHITECTURE
-    return NATIVE_QWEN3_5_ARCHITECTURE
 def map_actor_state_dict(
     state_dict: Mapping[str, Any],
-    implementation: str,
+    model: VLLMModelRegistration,
 ) -> dict[str, Any]:
     """Map policy Actor names to the selected rollout model namespace."""
-    normalized = normalize_model_implementation(implementation)
     mapped = {}
     for name, tensor in state_dict.items():
-        mapped_name = name
-        if (
-            normalized == NATIVE_MODEL_IMPLEMENTATION
-            and name.startswith("model.")
-            and not name.startswith("model.language_model.")
-        ):
-            mapped_name = f"model.language_model.{name.removeprefix('model.')}"
+        mapped_name = model.actor_weight_name(name)
+        if mapped_name is None:
+            continue
         if mapped_name in mapped:
             raise ValueError(
                 f"vLLM policy-name mapping collision: {name!r} maps to {mapped_name!r}"
@@ -105,12 +95,20 @@ class WeightTransfer(Protocol):
         """Load one policy snapshot into rollout."""
 class _RefitCompatibleTransfer:
     """Keep the previous refitter entrypoint without duplicating it per backend."""
+
+    def transfer(self, client: Any, snapshot: PolicySnapshot) -> None:
+        """Load one policy snapshot into rollout."""
+        raise NotImplementedError
+
     def refit(self, client: Any, snapshot: PolicySnapshot) -> None:
+        """Route the historical refit verb to the canonical transfer operation."""
         self.transfer(client, snapshot)
 class CPUWeightTransfer(_RefitCompatibleTransfer):
     """Stage full Actor weights on CPU and reload every rollout worker."""
-    def __init__(self, model_implementation: str = "hyper") -> None:
-        self._model_implementation = normalize_model_implementation(model_implementation)
+    def __init__(self, model: VLLMModelRegistration) -> None:
+        """Validate and store the rollout model identity."""
+        self._model = model
+        self.last_policy_fingerprint: Optional[dict[str, Any]] = None
     @staticmethod
     def _cpu_state_dict(payload: Any) -> dict[str, Any]:
         state_dict = _state_dict(payload, full=True, operation="vLLM refit")
@@ -126,10 +124,12 @@ class CPUWeightTransfer(_RefitCompatibleTransfer):
         """Reload a complete CPU snapshot and invalidate rollout caches."""
         cpu_state_dict = map_actor_state_dict(
             self._cpu_state_dict(snapshot.payload),
-            self._model_implementation,
+            self._model,
         )
         checkpoint_dir = None
         try:
+            if isinstance(client, VLLMWeightSyncClientMixin):
+                synchronized_call("CPU refit pause", client.pause)
             staging_error = None
             try:
                 from safetensors.torch import save_file  # pylint: disable=C0415
@@ -147,10 +147,27 @@ class CPUWeightTransfer(_RefitCompatibleTransfer):
                     kwargs={
                         "weights_path": checkpoint_dir.name,
                         "is_checkpoint_format": True,
+                        "policy_version": snapshot.version,
                     },
                 ),
             )
+            synchronized_call(
+                "weight reload commit",
+                lambda: client.collective_rpc(
+                    "commit_reloaded_weights",
+                    kwargs={"policy_version": snapshot.version},
+                ),
+            )
+            if isinstance(client, VLLMWeightSyncClientMixin):
+                expected_fingerprint = policy_weight_fingerprint(cpu_state_dict)
+                verify_policy_fingerprints(
+                    expected_fingerprint,
+                    client.get_policy_weight_fingerprints(),
+                    expected_version=snapshot.version,
+                )
+                self.last_policy_fingerprint = expected_fingerprint
             def reset_prefix_cache() -> None:
+                """Invalidate requests that could observe stale policy state."""
                 result = client.reset_prefix_cache(
                     reset_running_requests=True,
                     reset_connector=False,
@@ -171,8 +188,9 @@ def _open_port() -> int:
         return int(listener.getsockname()[1])
 class HCCLWeightTransfer(_RefitCompatibleTransfer):
     """Transfer full Actor weights to a disjoint rollout server over HCCL."""
-    def __init__(self, model_implementation: str = "hyper") -> None:
-        self._model_implementation = normalize_model_implementation(model_implementation)
+    def __init__(self, model: VLLMModelRegistration) -> None:
+        """Validate identity and defer creation of the HCCL transfer group."""
+        self._model = model
         self._group = None
         self.last_policy_fingerprint: Optional[dict[str, Any]] = None
     _policy_fingerprint = staticmethod(policy_weight_fingerprint)
@@ -231,7 +249,7 @@ class HCCLWeightTransfer(_RefitCompatibleTransfer):
             raise ValueError("HCCLWeightRefitter requires an external vLLM HTTP client")
         state_dict = map_actor_state_dict(
             self._device_state_dict(snapshot.payload),
-            self._model_implementation,
+            self._model,
         )
         try:
             group = self._ensure_group(client)
@@ -262,7 +280,11 @@ class HCCLWeightTransfer(_RefitCompatibleTransfer):
                 HCCLWeightTransferEngine,
             )
             with ThreadPoolExecutor(max_workers=1) as executor:
-                server_update = executor.submit(client.receive_weights, update_info)
+                server_update = executor.submit(
+                    client.receive_weights,
+                    update_info,
+                    snapshot.version,
+                )
                 HCCLWeightTransferEngine.trainer_send_weights(
                     iterator=iter(state_dict.items()),
                     trainer_args=HCCLTrainerSendWeightsArgs(
@@ -277,18 +299,20 @@ class HCCLWeightTransfer(_RefitCompatibleTransfer):
             expected_fingerprint = self._policy_fingerprint(state_dict)
             self._verify_fingerprints(
                 expected_fingerprint,
-                client.get_policy_weight_fingerprints(snapshot.version),
+                client.get_policy_weight_fingerprints(),
+                expected_version=snapshot.version,
             )
             self.last_policy_fingerprint = expected_fingerprint
-            client.resume()
         finally:
             state_dict.clear()
     def close(self) -> None:
+        """Release the cached transfer-group reference."""
         self._group = None
 class NPUIPCWeightTransfer(_RefitCompatibleTransfer):
     """Transfer full FSDP Actor weights to colocated rollout replicas."""
-    def __init__(self, model_implementation: str = "hyper") -> None:
-        self._model_implementation = normalize_model_implementation(model_implementation)
+    def __init__(self, model: VLLMModelRegistration) -> None:
+        """Validate identity and initialize failed-transfer tensor ownership."""
+        self._model = model
         self._failed_state_dict: dict[str, Any] = {}
         self.last_policy_fingerprint: Optional[dict[str, Any]] = None
     _policy_fingerprint = staticmethod(policy_weight_fingerprint)
@@ -347,13 +371,17 @@ class NPUIPCWeightTransfer(_RefitCompatibleTransfer):
         )
         self._validate_metadata(local_state_dict)
         def stage_state_dict() -> dict[str, Any]:
+            """Gather full policy tensors and map them to rollout names."""
             full_state_dict = platform.gather_state_dict(
                 local_state_dict,
                 cpu_offload=False,
             )
             try:
                 return self._device_state_dict(
-                    map_actor_state_dict(full_state_dict, self._model_implementation)
+                    map_actor_state_dict(
+                        full_state_dict,
+                        self._model,
+                    )
                 )
             finally:
                 full_state_dict.clear()
@@ -370,6 +398,7 @@ class NPUIPCWeightTransfer(_RefitCompatibleTransfer):
             self._run_control("IPC refit pause", client.pause)
             self._run_control("IPC refit start", client.start_weight_update)
             def setup_transport() -> tuple[Any, Any]:
+                """Synchronize the producer stream before importing IPC helpers."""
                 platform.get_current_stream().synchronize()
                 from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (  # pylint: disable=C0415
                     NPUIPCWeightTransferUpdateInfo,
@@ -387,6 +416,7 @@ class NPUIPCWeightTransfer(_RefitCompatibleTransfer):
             ]
             shapes = [list(tensor.shape) for tensor in state_dict.values()]
             def build_local_handles() -> list[dict[Any, Any]]:
+                """Export one producer-side IPC handle per policy tensor."""
                 npu_uuid = generate_uuid()
                 return [
                     {npu_uuid: platform.get_tensor_ipc_rebuild_args(tensor)}
@@ -424,6 +454,7 @@ class NPUIPCWeightTransfer(_RefitCompatibleTransfer):
                                 client.receive_ipc_weights,
                                 endpoint,
                                 update_info,
+                                snapshot.version,
                             )
                             for endpoint in endpoints
                         ]
@@ -447,36 +478,156 @@ class NPUIPCWeightTransfer(_RefitCompatibleTransfer):
                 lambda: self._policy_fingerprint(state_dict),
             )
             def verify_local_fingerprint() -> None:
+                """Compare every rollout worker against the transferred policy."""
                 self._verify_fingerprints(
                     expected_fingerprint,
-                    client.get_policy_weight_fingerprints(snapshot.version),
+                    client.get_policy_weight_fingerprints(),
+                    expected_version=snapshot.version,
                 )
             self._run_control("IPC policy fingerprint", verify_local_fingerprint)
             self.last_policy_fingerprint = expected_fingerprint
         finally:
             state_dict.clear()
     def close(self) -> None:
+        """Release tensors retained after a failed asynchronous transfer."""
         self._failed_state_dict.clear()
 def build_weight_transfer(
     deployment: str,
-    model_implementation: str,
+    model: VLLMModelRegistration,
 ) -> WeightTransfer:
     """Build the transport selected by the rollout deployment."""
     if deployment == "colocated":
-        return NPUIPCWeightTransfer(model_implementation)
-    return HCCLWeightTransfer(model_implementation)
-# Stable aliases for callers that still use the previous refitter terminology.
-CPUStateDictRefitter = CPUWeightTransfer
-HCCLWeightRefitter = HCCLWeightTransfer
-NPUIPCWeightRefitter = NPUIPCWeightTransfer
+        return NPUIPCWeightTransfer(model)
+    return HCCLWeightTransfer(model)
+
+
+def _legacy_vllm_model(
+    implementation: str,
+    model_family: str,
+    tie_word_embeddings: bool,
+    native_uses_language_model_prefix: bool,
+) -> VLLMModelRegistration:
+    """Translate the retained refitter API into the canonical model contract."""
+    if model_family == "qwen3":
+        hf_architecture = "Qwen3ForCausalLM"
+        model_type = "qwen3"
+        text_model_type = "qwen3"
+    elif model_family == "qwen3_5":
+        hf_architecture = (
+            "Qwen3_5ForConditionalGeneration"
+            if native_uses_language_model_prefix
+            else "Qwen3_5ForCausalLM"
+        )
+        model_type = "qwen3_5" if native_uses_language_model_prefix else "qwen3_5_text"
+        text_model_type = "qwen3_5_text"
+    else:
+        raise ValueError(f"Unsupported vLLM model family: {model_family!r}")
+    registration = ModelRegistration(
+        name=model_family,
+        hyper_model_name=model_family,
+        weights_path="",
+        tokenizer_path="",
+        hf_architecture=hf_architecture,
+        model_type=model_type,
+        text_model_type=text_model_type,
+        tie_word_embeddings=tie_word_embeddings,
+    )
+    return resolve_vllm_model(registration, implementation)
+
+
+class CPUStateDictRefitter(CPUWeightTransfer):
+    """Compatibility wrapper for the previous CPU refitter constructor."""
+
+    def __init__(
+        self,
+        model_implementation: str = NATIVE_MODEL_IMPLEMENTATION,
+        model_family: str = "qwen3_5",
+        tie_word_embeddings: bool = True,
+        native_uses_language_model_prefix: bool = True,
+    ) -> None:
+        """Translate legacy CPU refitter arguments to the model contract."""
+        super().__init__(
+            _legacy_vllm_model(
+                model_implementation,
+                model_family,
+                tie_word_embeddings,
+                native_uses_language_model_prefix,
+            )
+        )
+
+
+class HCCLWeightRefitter(HCCLWeightTransfer):
+    """Compatibility wrapper for the previous HCCL refitter constructor."""
+
+    def __init__(
+        self,
+        model_implementation: str = NATIVE_MODEL_IMPLEMENTATION,
+        model_family: str = "qwen3_5",
+        tie_word_embeddings: bool = True,
+        native_uses_language_model_prefix: bool = True,
+    ) -> None:
+        """Translate legacy HCCL refitter arguments to the model contract."""
+        super().__init__(
+            _legacy_vllm_model(
+                model_implementation,
+                model_family,
+                tie_word_embeddings,
+                native_uses_language_model_prefix,
+            )
+        )
+
+
+class NPUIPCWeightRefitter(NPUIPCWeightTransfer):
+    """Compatibility wrapper for the previous NPU IPC refitter constructor."""
+
+    def __init__(
+        self,
+        model_implementation: str = NATIVE_MODEL_IMPLEMENTATION,
+        model_family: str = "qwen3_5",
+        tie_word_embeddings: bool = True,
+        native_uses_language_model_prefix: bool = True,
+    ) -> None:
+        """Translate legacy IPC refitter arguments to the model contract."""
+        super().__init__(
+            _legacy_vllm_model(
+                model_implementation,
+                model_family,
+                tie_word_embeddings,
+                native_uses_language_model_prefix,
+            )
+        )
+
+
 VLLMWeightRefitter = WeightTransfer
-map_policy_state_dict = map_actor_state_dict
+
+
+def map_policy_state_dict(
+    state_dict: Mapping[str, Any],
+    implementation: str,
+    model_family: str = "qwen3_5",
+    tie_word_embeddings: bool = True,
+    native_uses_language_model_prefix: bool = True,
+) -> dict[str, Any]:
+    """Map policy names through the retained pre-refactor function signature."""
+    return map_actor_state_dict(
+        state_dict,
+        _legacy_vllm_model(
+            implementation,
+            model_family,
+            tie_word_embeddings,
+            native_uses_language_model_prefix,
+        ),
+    )
+
+
 __all__ = [
     "CPUWeightTransfer",
     "HCCLWeightTransfer",
     "HYPER_MODEL_IMPLEMENTATION",
+    "HYPER_QWEN3_ARCHITECTURE",
     "HYPER_QWEN3_5_ARCHITECTURE",
     "NATIVE_MODEL_IMPLEMENTATION",
+    "NATIVE_QWEN3_ARCHITECTURE",
     "NATIVE_QWEN3_5_ARCHITECTURE",
     "NPUIPCWeightTransfer",
     "POLICY_FINGERPRINT_ALGORITHM",
@@ -488,6 +639,7 @@ __all__ = [
     "canonical_policy_weight_name",
     "is_policy_fingerprint_weight",
     "map_actor_state_dict",
+    "map_policy_state_dict",
     "normalize_model_implementation",
     "policy_fingerprint_header",
     "policy_tensor_fingerprint",

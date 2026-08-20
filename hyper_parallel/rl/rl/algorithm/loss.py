@@ -15,9 +15,9 @@
 """MOLT-style loss and algorithm registries with built-in GRPO/PPO recipes."""
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Protocol
-from hyper_parallel import get_platform
 from rl.algorithm.advantage import TargetOutput, get_advantage_estimator
 from rl.registry import Registry
+from hyper_parallel import get_platform
 platform = get_platform()
 @dataclass(frozen=True)
 class RoleRequirements:
@@ -177,12 +177,12 @@ def _actor_loss(
     numeric_mask = action_mask.to(dtype=current_log_probs.dtype)
     old_policy_kl = low_variance_kl(current_log_probs, old_log_probs)
     return LossOutput(
-        total_loss_sum=((policy.loss + regularization) * numeric_mask).sum(),
-        policy_loss_sum=(policy.loss * numeric_mask).sum(),
-        regularization_loss_sum=(reference_kl * numeric_mask).sum(),
-        valid_token_count=numeric_mask.sum().detach(),
-        old_policy_kl_sum=(old_policy_kl * numeric_mask).sum().detach(),
-        clipped_token_count=(policy.clipped * numeric_mask).sum().detach(),
+        total_loss_sum=((policy.loss + regularization) * numeric_mask).flatten().sum(dim=0),
+        policy_loss_sum=(policy.loss * numeric_mask).flatten().sum(dim=0),
+        regularization_loss_sum=(reference_kl * numeric_mask).flatten().sum(dim=0),
+        valid_token_count=numeric_mask.flatten().sum(dim=0).detach(),
+        old_policy_kl_sum=(old_policy_kl * numeric_mask).flatten().sum(dim=0).detach(),
+        clipped_token_count=(policy.clipped * numeric_mask).flatten().sum(dim=0).detach(),
     )
 AlgorithmBuilder = Callable[[Mapping[str, Any]], RLAlgorithm]
 ALGORITHMS = Registry[AlgorithmBuilder]("algorithm")
@@ -215,10 +215,10 @@ PPO_REQUIREMENTS = AlgorithmRequirements(
 def masked_mean(values: Any, mask: Any) -> Any:
     """Return the mean over elements selected by a non-empty mask."""
     numeric_mask = mask.to(dtype=values.dtype)
-    count = numeric_mask.sum()
+    count = numeric_mask.flatten().sum(dim=0)
     if count.item() <= 0:
         raise ValueError("masked_mean requires at least one valid element")
-    return (values * numeric_mask).sum() / count
+    return (values * numeric_mask).flatten().sum(dim=0) / count
 @dataclass(frozen=True)
 class GRPOConfig:
     """Validated hyperparameters for the complete GRPO recipe."""
@@ -426,8 +426,8 @@ class PPOAlgorithm:
         loss = 0.5 * current_error.maximum(clipped_error)
         numeric_mask = action_mask.to(dtype=current_values.dtype)
         return CriticLossOutput(
-            loss_sum=(loss * numeric_mask).sum(),
-            valid_token_count=numeric_mask.sum().detach(),
+            loss_sum=(loss * numeric_mask).flatten().sum(dim=0),
+            valid_token_count=numeric_mask.flatten().sum(dim=0).detach(),
         )
 @register_algorithm("ppo")
 def build_ppo(config: Mapping[str, Any]) -> PPOAlgorithm:

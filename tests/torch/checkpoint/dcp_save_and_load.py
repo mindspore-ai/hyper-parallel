@@ -180,10 +180,9 @@ def _run_dcp_async_save_load_test(
     seed: int = 1,
     scalar_values: Optional[dict[str, Any]] = None,
     tensor_values: Optional[dict[str, tuple[int, ...]]] = None,
-    use_collectives: bool = True,
 ) -> None:
     """
-    Same as :func:`_run_dcp_save_load_test` but persists via :func:`async_save` and ``persist_completion``.
+    Exercise rank-local :func:`async_save` persistence and ``persist_completion``.
     """
     init_backend(_DEVICE_TYPE)
     torch.manual_seed(seed)
@@ -259,7 +258,7 @@ def _run_dcp_async_save_load_test(
         for tensor_name, tensor_shape in tensor_values.items():
             load_state_dict[tensor_name] = to_device(torch.zeros(*tensor_shape), _DEVICE_TYPE)
 
-    load(load_state_dict, checkpoint_id=checkpoint_path, use_collectives=use_collectives)
+    load(load_state_dict, checkpoint_id=checkpoint_path, use_collectives=False)
 
     for param_config in param_configs:
         param_name = param_config['name']
@@ -296,8 +295,8 @@ def test_dcp_async_save_and_load_with_dtensor_and_tensor_and_scalar() -> None:
     """
     Feature: ``async_save`` + ``load`` with DTensor, scalars, and dense tensors (same layout as group1 sync test).
 
-    Description: Same mesh and state_dict shapes as ``test_dcp_save_and_load_with_dtensor_and_tensor_and_scalar``
-        (collectives path only); persistence uses :func:`async_save`.
+    Description: Same mesh and state_dict shapes as ``test_dcp_save_and_load_with_dtensor_and_tensor_and_scalar``;
+        persistence is rank-local because the async child cannot reuse parent-process collectives.
     Expectation: Run success; loaded values match originals.
     """
     checkpoint_path = Path("./test_dcp_save_and_load_async")

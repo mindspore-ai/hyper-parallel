@@ -13,26 +13,32 @@
 # limitations under the License.
 # ============================================================================
 """Compatibility exports for policy weight naming and fingerprints."""
-from rl.roles.weight_sync.transfer import (
+from rl.roles.model import (
     HYPER_MODEL_IMPLEMENTATION,
+    HYPER_QWEN3_ARCHITECTURE,
     HYPER_QWEN3_5_ARCHITECTURE,
     NATIVE_MODEL_IMPLEMENTATION,
+    NATIVE_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_5_ARCHITECTURE,
-    POLICY_FINGERPRINT_ALGORITHM,
     SUPPORTED_MODEL_IMPLEMENTATIONS,
-    aggregate_policy_fingerprint,
     architecture_for_implementation,
+    normalize_model_implementation,
+)
+from rl.roles.weight_sync.transfer import (
+    POLICY_FINGERPRINT_ALGORITHM,
+    aggregate_policy_fingerprint,
     canonical_policy_weight_name,
     is_policy_fingerprint_weight,
     map_policy_state_dict,
-    normalize_model_implementation,
     policy_fingerprint_header,
     policy_tensor_fingerprint,
 )
 __all__ = [
     "HYPER_MODEL_IMPLEMENTATION",
+    "HYPER_QWEN3_ARCHITECTURE",
     "HYPER_QWEN3_5_ARCHITECTURE",
     "NATIVE_MODEL_IMPLEMENTATION",
+    "NATIVE_QWEN3_ARCHITECTURE",
     "NATIVE_QWEN3_5_ARCHITECTURE",
     "POLICY_FINGERPRINT_ALGORITHM",
     "SUPPORTED_MODEL_IMPLEMENTATIONS",

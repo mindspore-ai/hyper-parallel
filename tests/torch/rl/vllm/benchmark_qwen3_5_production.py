@@ -212,6 +212,10 @@ def main() -> None:
         "qwen3_5",
         str(args.model),
         str(args.model),
+        "Qwen3_5ForConditionalGeneration",
+        "qwen3_5",
+        "qwen3_5_text",
+        True,
     )
     engine = VLLMGenerationEngine(
         model,

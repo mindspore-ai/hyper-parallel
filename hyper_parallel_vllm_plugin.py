@@ -15,8 +15,13 @@
 """Compatibility entry point for pinned images with legacy plugin metadata."""
 
 from rl.roles.rollout.vllm_plugin import (
+    HYPER_QWEN3_ARCHITECTURE,
     HYPER_QWEN3_5_ARCHITECTURE,
     register_hyper_models,
 )
 
-__all__ = ["HYPER_QWEN3_5_ARCHITECTURE", "register_hyper_models"]
+__all__ = [
+    "HYPER_QWEN3_ARCHITECTURE",
+    "HYPER_QWEN3_5_ARCHITECTURE",
+    "register_hyper_models",
+]

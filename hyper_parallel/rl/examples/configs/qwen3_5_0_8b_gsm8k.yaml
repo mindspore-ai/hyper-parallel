@@ -26,12 +26,13 @@ rollout:
   vllm:
     deployment: colocated
     port: 8100
-    model_implementation: hyper
+    model_implementation: native
     tensor_parallel_size: 1
     dtype: bfloat16
     trust_remote_code: true
     enforce_eager: true
     enable_prefix_caching: false
+    skip_mm_profiling: true
     gpu_memory_utilization: 0.35
     request_concurrency: 1
     max_model_len: 640

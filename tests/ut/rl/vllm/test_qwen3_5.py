@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Contract tests for the Hyper Qwen3.5 vLLM adapter."""
+"""Contract tests for the Transformers-based Hyper Qwen3.5 vLLM adapter."""
 
 import os
 from types import SimpleNamespace
@@ -25,83 +25,111 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 pytest.importorskip("vllm")
 
+from transformers import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5ForCausalLM as TransformersQwen3_5ForCausalLM,
+    Qwen3_5MLP,
+    Qwen3_5RMSNormGated,
+)
 from vllm import ModelRegistry
-from vllm.config.compilation import CUDAGraphMode, CompilationMode
+from vllm.config.compilation import CompilationMode
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 import rl.roles.rollout.vllm_qwen3_5 as qwen3_5_adapter
-from hyper_parallel.models.modules.feed_forward import SwiGLUMLP
-from hyper_parallel.models.qwen3_5.model import Qwen3_5Attention
-from hyper_parallel.models.qwen3_5.parallelize import (
-    _TP_PROFILE_INFERENCE_REPLICATED,
-    _build_qwen3_5_tp_plans,
-)
 from rl.roles.rollout.vllm_plugin import (
     HYPER_QWEN3_5_ARCHITECTURE,
     register_hyper_models,
 )
 from rl.roles.rollout.vllm_qwen3_5 import (
     HyperQwen3_5ForCausalLM,
-    _build_hyper_config,
-    _configure_gdn_numerical_profile,
-    _enable_gdn_activation_compatibility,
+    _VLLMQwen3_5Attention,
+    _VLLMQwen3_5GatedDeltaNet,
     _map_weight_name,
-    _reset_rope_inv_freq_from_cpu,
     _validate_adapter_config,
-    _validate_loaded_weight_shards,
 )
 
 
-def _vllm_config(**overrides):
-    text_config = SimpleNamespace(
-        model_type="qwen3_5_text",
-        vocab_size=64,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=4,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        hidden_act="silu",
-        max_position_embeddings=128,
-        rms_norm_eps=1e-6,
-        attention_bias=False,
-        attention_dropout=0.0,
-        head_dim=8,
-        rope_parameters={
-            "rope_theta": 1_000_000.0,
-            "partial_rotary_factor": 0.75,
-            "mrope_section": [1, 1, 1],
-        },
-        layer_types=[
+class _FakeAttention(nn.Module):
+    """Minimal vLLM attention leaf used by CPU adapter tests."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__()
+        self.kwargs = kwargs
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a correctly shaped deterministic attention placeholder."""
+        del key, value
+        return query
+
+
+class _FakeGdnRuntime(nn.Module):
+    """Parameter-free stand-in for vLLM's request-state runtime."""
+
+    def __init__(
+        self,
+        config: object,
+        vllm_config: object,
+        prefix: str,
+        **kwargs: object,
+    ) -> None:
+        super().__init__()
+        del config, vllm_config, kwargs
+        self.prefix = prefix
+
+
+def _vllm_config(
+    *,
+    layer_types: list[str] | None = None,
+    tensor_parallel_size: int = 1,
+    tie_word_embeddings: bool = False,
+) -> SimpleNamespace:
+    if layer_types is None:
+        layer_types = [
             "linear_attention",
             "linear_attention",
             "linear_attention",
             "full_attention",
-        ],
-        full_attention_interval=4,
-        attn_output_gate=True,
+        ]
+    text_config = Qwen3_5TextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=len(layer_types),
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        max_position_embeddings=128,
+        tie_word_embeddings=tie_word_embeddings,
+        attention_dropout=0.0,
         linear_conv_kernel_dim=4,
         linear_key_head_dim=4,
         linear_value_head_dim=4,
         linear_num_key_heads=2,
         linear_num_value_heads=2,
-        mamba_ssm_dtype="float32",
+        layer_types=layer_types,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 1_000_000.0,
+            "partial_rotary_factor": 0.75,
+            "mrope_section": [1, 1, 1],
+        },
     )
-    hf_config = SimpleNamespace(
-        tie_word_embeddings=True,
-        image_token_id=60,
-        video_token_id=61,
-        vision_start_token_id=62,
-        vision_end_token_id=63,
-    )
-    config = SimpleNamespace(
+    text_config.mamba_ssm_dtype = "float32"
+    return SimpleNamespace(
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             hf_text_config=text_config,
-            hf_config=hf_config,
         ),
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
+            tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
         ),
         cache_config=SimpleNamespace(
             enable_prefix_caching=False,
@@ -111,14 +139,17 @@ def _vllm_config(**overrides):
         ),
         quant_config=None,
         speculative_config=None,
-        compilation_config=SimpleNamespace(
-            mode=CompilationMode.NONE,
-            cudagraph_mode=CUDAGraphMode.NONE,
-        ),
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
     )
-    for name, value in overrides.items():
-        setattr(config, name, value)
-    return config
+
+
+def _build_model(
+    monkeypatch: pytest.MonkeyPatch,
+    **config_kwargs: object,
+) -> HyperQwen3_5ForCausalLM:
+    monkeypatch.setattr(qwen3_5_adapter, "Attention", _FakeAttention)
+    monkeypatch.setattr(qwen3_5_adapter, "QwenGatedDeltaNetAttention", _FakeGdnRuntime)
+    return HyperQwen3_5ForCausalLM(vllm_config=_vllm_config(**config_kwargs))
 
 
 def test_registry_inspects_hybrid_text_model() -> None:
@@ -133,243 +164,120 @@ def test_registry_inspects_hybrid_text_model() -> None:
     assert not model_info.supports_pp
 
 
-def test_build_hyper_config_uses_checkpoint_geometry() -> None:
-    """The adapter should preserve Qwen3.5 geometry and RoPE fields."""
-    config = _build_hyper_config(_vllm_config())
+def test_adapter_uses_transformers_modules_and_vllm_state_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only stateful attention and GDN execution should leave Transformers."""
+    model = _build_model(monkeypatch)
+    linear_layer = model.model.layers[0]
+    attention_layer = model.model.layers[-1]
 
-    assert config.hidden_size == 16
-    assert config.layer_types[-1] == "full_attention"
-    assert config.rope_theta == 1_000_000.0
-    assert config.partial_rotary_factor == 0.75
-    assert config.mrope_section == [1, 1, 1]
-    assert config.tie_word_embeddings
+    assert isinstance(model, TransformersQwen3_5ForCausalLM)
+    assert isinstance(linear_layer.mlp, Qwen3_5MLP)
+    assert isinstance(linear_layer.linear_attn, _VLLMQwen3_5GatedDeltaNet)
+    assert isinstance(linear_layer.linear_attn.norm, Qwen3_5RMSNormGated)
+    assert isinstance(attention_layer.mlp, Qwen3_5MLP)
+    assert isinstance(attention_layer.self_attn, _VLLMQwen3_5Attention)
+    assert isinstance(attention_layer.self_attn.attention, _FakeAttention)
+    assert model.get_input_embeddings() is model.model.embed_tokens
+    assert not list(linear_layer.linear_attn.state_runtime.parameters())
+
+    linear_layer.linear_attn.to_empty(device="meta")
+    assert linear_layer.linear_attn.state_runtime.conv1d is linear_layer.linear_attn.conv1d
+    assert linear_layer.linear_attn.state_runtime.dt_bias is linear_layer.linear_attn.dt_bias
+    assert linear_layer.linear_attn.state_runtime.A_log is linear_layer.linear_attn.A_log
+
+
+def test_full_attention_adapter_runs_packed_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HF projections, partial MRoPE, output gate, and LM head should compose."""
+    model = _build_model(monkeypatch, layer_types=["full_attention", "full_attention"])
+    input_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+    positions = torch.arange(3, dtype=torch.long)
+
+    hidden_states = model(input_ids, positions)
+
+    assert hidden_states.shape == (3, model.config.hidden_size)
+    assert model.compute_logits(hidden_states).shape == (3, model.config.vocab_size)
 
 
 @pytest.mark.parametrize(
-    "source_name,target_name,shard_id",
+    "source_name,target_name",
     [
         (
             "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
             "model.layers.0.linear_attn.in_proj_qkv.weight",
-            None,
-        ),
-        (
-            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
-            "model.layers.0.linear_attn.in_proj_z.weight",
-            None,
-        ),
-        (
-            "model.language_model.layers.0.linear_attn.in_proj_b.weight",
-            "model.layers.0.linear_attn.in_proj_b.weight",
-            None,
         ),
         (
             "model.language_model.layers.3.self_attn.q_proj.weight",
             "model.layers.3.self_attn.q_proj.weight",
-            None,
         ),
-        (
-            "model.language_model.layers.3.mlp.up_proj.weight",
-            "model.layers.3.mlp.up_proj.weight",
-            None,
-        ),
+        ("model.visual.patch_embed.proj.weight", None),
+        ("model.language_model.rotary_emb.inv_freq", None),
     ],
 )
-def test_map_weight_name(
-    source_name: str,
-    target_name: str,
-    shard_id: int | tuple[int, ...] | None,
+def test_map_weight_name(source_name: str, target_name: str | None) -> None:
+    """Composite text weights should map without admitting vision state."""
+    assert _map_weight_name(source_name) == target_name
+
+
+def test_adapter_strictly_loads_canonical_actor_weights(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Checkpoint parameters should retain native Hyper module names."""
-    assert _map_weight_name(source_name) == (target_name, shard_id)
+    """Initial load and online refit should share the canonical Actor namespace."""
+    model = _build_model(monkeypatch)
+    weights = [(name, torch.randn_like(parameter)) for name, parameter in model.named_parameters()]
+
+    loaded = model.load_weights(iter(weights))
+
+    assert loaded == {name for name, _ in model.named_parameters()}
+    with pytest.raises(ValueError, match="missing parameters"):
+        model.load_weights(iter(()))
 
 
-def test_validate_adapter_accepts_compatible_tensor_parallelism() -> None:
-    """The adapter should accept TP sizes that divide every sharded dimension."""
-    config = _vllm_config()
-    config.model_config.hf_text_config.num_key_value_heads = 2
-    config.parallel_config.tensor_parallel_size = 2
+def test_adapter_strictly_loads_composite_checkpoint_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Composite checkpoint prefixes should resolve to the text-only HF model."""
+    model = _build_model(monkeypatch)
+    weights = []
+    for name, parameter in model.named_parameters():
+        source_name = (
+            "model.language_model." + name.removeprefix("model.")
+            if name.startswith("model.")
+            else name
+        )
+        weights.append((source_name, torch.randn_like(parameter)))
+    weights.append(("model.visual.patch_embed.proj.weight", torch.ones(1)))
 
-    _validate_adapter_config(config)
+    loaded = model.load_weights(iter(weights))
 
-
-def test_validate_adapter_rejects_incompatible_tensor_parallelism() -> None:
-    """The adapter should reject TP sizes that cannot partition Qwen3.5 heads."""
-    config = _vllm_config()
-    config.parallel_config.tensor_parallel_size = 3
-
-    with pytest.raises(ValueError, match="must be divisible by TP size 3"):
-        _validate_adapter_config(config)
-
-
-def test_validate_adapter_rejects_incompatible_kv_head_topology() -> None:
-    """Native Hyper TP does not silently replicate KV heads."""
-    config = _vllm_config()
-    config.model_config.hf_text_config.num_attention_heads = 6
-    config.model_config.hf_text_config.num_key_value_heads = 3
-    config.model_config.hf_text_config.intermediate_size = 30
-    config.model_config.hf_text_config.linear_num_key_heads = 6
-    config.model_config.hf_text_config.linear_num_value_heads = 6
-    config.parallel_config.tensor_parallel_size = 2
-
-    with pytest.raises(ValueError, match="num_key_value_heads=3 must be divisible"):
-        _validate_adapter_config(config)
+    assert loaded == {name for name, _ in model.named_parameters()}
 
 
-def test_inference_tp_plan_keeps_boundaries_replicated() -> None:
-    """Inference TP should shard features without Sequence Parallelism."""
-    plans = _build_qwen3_5_tp_plans(_TP_PROFILE_INFERENCE_REPLICATED)
+def test_gdn_keeps_checkpoint_fp32_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BF16 model construction must not narrow recurrent or gated-norm state."""
+    with set_default_torch_dtype(torch.bfloat16):
+        model = _build_model(monkeypatch)
 
-    assert plans.root["model.embed_tokens"].output_layouts[0].is_replicate()
-    assert plans.root["lm_head"].output_layouts[0].is_replicate()
-    assert plans.full_attention["self_attn.q_proj"].output_layouts[0].is_shard()
-    assert plans.full_attention["self_attn.o_proj"].output_layouts[0].is_replicate()
-    assert plans.linear_attention["linear_attn.out_proj"].output_layouts[0].is_replicate()
-
-
-def test_tp_mesh_reuses_vllm_device_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The Hyper mesh must retain vLLM's exact device process group."""
-    process_group = object()
-    tp_group = SimpleNamespace(device_group=process_group, ranks=[2, 3])
-    mesh = SimpleNamespace(
-        rank_list=(2, 3),
-        get_group=lambda: process_group,
-    )
-    marked_groups = []
-    mesh_calls = []
-
-    def fake_from_group(group: object, **kwargs: object) -> object:
-        mesh_calls.append((group, kwargs))
-        return mesh
-
-    monkeypatch.setattr(qwen3_5_adapter, "get_tp_group", lambda: tp_group)
-    monkeypatch.setattr(qwen3_5_adapter, "mark_created_groups", marked_groups.append)
-    monkeypatch.setattr(
-        qwen3_5_adapter.DeviceMesh,
-        "from_group",
-        fake_from_group,
-    )
-
-    result = qwen3_5_adapter._device_mesh_from_vllm_tp()
-
-    assert result is mesh
-    assert marked_groups == [process_group]
-    assert mesh_calls[0][0] is process_group
+    linear_attention = model.model.layers[0].linear_attn
+    assert linear_attention.A_log.dtype == torch.float32
+    assert linear_attention.norm.weight.dtype == torch.float32
+    assert linear_attention.dt_bias.dtype == torch.bfloat16
+    assert linear_attention.in_proj_qkv.weight.dtype == torch.bfloat16
 
 
-def test_adapter_preserves_native_hyper_components(monkeypatch: pytest.MonkeyPatch) -> None:
-    """vLLM leaves must not replace Hyper embedding, Attention, MLP, or LM head."""
-    class FakeAttention(nn.Module):
-        """Minimal paged-attention stand-in for adapter construction."""
-
-        def __init__(self, **kwargs: object) -> None:
-            super().__init__()
-            self.kwargs = kwargs
-
-    class FakeGdnRuntime(nn.Module):
-        """Parameter-free stand-in for vLLM's request-state runtime."""
-
-        def __init__(self, config: object, vllm_config: object, prefix: str, **kwargs: object) -> None:
-            super().__init__()
-            del config, vllm_config, kwargs
-            self.prefix = prefix
-            self.tp_size = 1
-
-    monkeypatch.setattr(qwen3_5_adapter, "Attention", FakeAttention)
-    monkeypatch.setattr(qwen3_5_adapter, "QwenGatedDeltaNetAttention", FakeGdnRuntime)
-
-    model = HyperQwen3_5ForCausalLM(vllm_config=_vllm_config())
-    full_attention_layer = model.model.layers[-1]
-    linear_attention_layer = model.model.layers[0]
-
-    assert isinstance(model.model.embed_tokens, nn.Embedding)
-    assert isinstance(model.lm_head, nn.Linear)
-    assert isinstance(full_attention_layer.self_attn, Qwen3_5Attention)
-    assert isinstance(full_attention_layer.mlp, SwiGLUMLP)
-    assert isinstance(full_attention_layer.self_attn.q_proj, nn.Linear)
-    assert isinstance(linear_attention_layer.mlp, SwiGLUMLP)
-    assert isinstance(linear_attention_layer.linear_attn.in_proj_qkv, nn.Linear)
-    assert not list(linear_attention_layer.linear_attn.state_runtime.parameters())
-    linear_attention_layer.linear_attn.to_empty(device="meta")
-    assert (
-        linear_attention_layer.linear_attn.state_runtime.dt_bias
-        is linear_attention_layer.linear_attn.dt_bias
-    )
-    assert (
-        linear_attention_layer.linear_attn.state_runtime.A_log
-        is linear_attention_layer.linear_attn.A_log
-    )
+def test_validate_adapter_rejects_tensor_parallelism() -> None:
+    """The Transformers-owned adapter must fail closed outside TP1."""
+    with pytest.raises(ValueError, match="tensor_parallel_size=1"):
+        _validate_adapter_config(_vllm_config(tensor_parallel_size=2))
 
 
-def test_validate_phase_one_uses_checkpoint_ssm_dtype() -> None:
-    """The unique Hyper architecture should retain Qwen3.5's canonical FP32 state."""
-    config = _vllm_config()
-
-    _validate_adapter_config(config)
-
-    assert config.cache_config.mamba_ssm_cache_dtype == "float32"
-
-
-def test_enable_gdn_activation_compatibility_requires_backend_support() -> None:
-    gdn = SimpleNamespace(
-        supported_causal_conv_activation_modes={"fused", "separate_bf16"},
-        supported_gdn_gating_modes={"fused", "torch"},
-        supported_gdn_qk_l2norm_modes={"fused", "torch_bf16"},
-        supported_gdn_recurrence_modes={"fla", "torch"},
-        supported_gdn_norm_modes={"fused", "torch_bf16"},
-    )
-
-    _enable_gdn_activation_compatibility(gdn)
-
-    assert gdn.causal_conv_activation_mode == "separate_bf16"
-    assert gdn.gdn_gating_mode == "torch"
-    assert gdn.gdn_qk_l2norm_mode == "torch_bf16"
-    assert gdn.gdn_recurrence_mode == "torch"
-    assert gdn.gdn_norm_mode == "torch_bf16"
-
-
-def test_enable_gdn_activation_compatibility_rejects_old_backend() -> None:
-    with pytest.raises(ValueError, match="requires vLLM-Ascend"):
-        _enable_gdn_activation_compatibility(SimpleNamespace())
-
-
-def test_functional_gdn_profile_uses_backend_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The default rollout profile must not require precision extensions."""
-    monkeypatch.delenv("HYPER_VLLM_NUMERICAL_PROFILE", raising=False)
-    gdn = SimpleNamespace(gdn_recurrence_mode="fla")
-
-    _configure_gdn_numerical_profile(gdn)
-
-    assert gdn.gdn_recurrence_mode == "fla"
-
-
-def test_parity_gdn_profile_requires_compatibility_patch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Parity remains available only as an explicit profile."""
-    monkeypatch.setenv("HYPER_VLLM_NUMERICAL_PROFILE", "parity")
-
-    with pytest.raises(ValueError, match="requires vLLM-Ascend"):
-        _configure_gdn_numerical_profile(SimpleNamespace())
-
-
-def test_gdn_profile_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Misspelled numerical profiles should fail before model execution."""
-    monkeypatch.setenv("HYPER_VLLM_NUMERICAL_PROFILE", "unknown")
-
-    with pytest.raises(ValueError, match="must be 'functional' or 'parity'"):
-        _configure_gdn_numerical_profile(SimpleNamespace())
-
-
-def test_reset_rope_inv_freq_uses_cpu_reference() -> None:
-    rope = SimpleNamespace(dim=4, theta=10_000.0, inv_freq=torch.zeros(2))
-
-    _reset_rope_inv_freq_from_cpu(rope, torch.bfloat16)
-
-    expected = 1.0 / (rope.theta ** (torch.arange(0, rope.dim, 2).float() / rope.dim))
-    assert torch.equal(rope.inv_freq, expected.to(torch.bfloat16).float())
-
-
-def test_mamba_state_dtype_uses_checkpoint_before_model_init() -> None:
-    """Hybrid cache sizing should see the checkpoint FP32 state before construction."""
+def test_mamba_state_dtype_uses_checkpoint_value() -> None:
+    """The custom architecture should preserve Qwen3.5's FP32 recurrent state."""
     config = _vllm_config()
 
     state_dtypes = HyperQwen3_5ForCausalLM.get_mamba_state_dtype_from_config(config)
@@ -377,37 +285,13 @@ def test_mamba_state_dtype_uses_checkpoint_before_model_init() -> None:
     assert state_dtypes == (torch.bfloat16, torch.float32)
 
 
-def test_validate_loaded_weight_shards_requires_every_fused_input() -> None:
-    """Strict loading should reject a missing native GDN parameter."""
-    parameter_name = "model.layers.0.linear_attn.in_proj_qkv.weight"
-
-    with pytest.raises(ValueError, match="expected shards"):
-        _validate_loaded_weight_shards(
-            {parameter_name},
-            {},
-        )
-
-    _validate_loaded_weight_shards(
-        {parameter_name},
-        {parameter_name: {None}},
-    )
-
-
-def test_reload_synthesizes_layerwise_untied_lm_head() -> None:
-    """Layerwise reload should restore a temporary lm-head copy from tied embeddings."""
+def test_text_only_mrope_positions() -> None:
+    """Text requests should use equal temporal, height, and width positions."""
     model = HyperQwen3_5ForCausalLM.__new__(HyperQwen3_5ForCausalLM)
-    nn.Module.__init__(model)
-    model.model = nn.Module()
-    model.model.embed_tokens = nn.Embedding(4, 2)
-    model.lm_head = nn.Linear(2, 4, bias=False)
-    model.config = SimpleNamespace(tie_word_embeddings=True)
-    model._tp_load_transforms = {}
-    embedding_weight = torch.arange(8, dtype=torch.float32).view(4, 2)
 
-    loaded = model.load_weights(
-        [("model.language_model.embed_tokens.weight", embedding_weight)]
-    )
+    positions, delta = model.get_mrope_input_positions([4, 5, 6], [])
 
-    assert loaded == {"model.embed_tokens.weight", "lm_head.weight"}
-    assert torch.equal(model.model.embed_tokens.weight, embedding_weight)
-    assert torch.equal(model.lm_head.weight, embedding_weight)
+    assert positions.tolist() == [[0, 1, 2], [0, 1, 2], [0, 1, 2]]
+    assert delta == 0
+    with pytest.raises(ValueError, match="text-only"):
+        model.get_mrope_input_positions([4], [object()])

@@ -7,4 +7,4 @@
 # The rules are applied from top to bottom, and the last matching rule will take effect.
 
 # If the file in PR does not match rule, the default maintainers will be designated to conduct code review.
-* @liuchongming74 @bj-wang
+* @changzherui1 @yao_yf

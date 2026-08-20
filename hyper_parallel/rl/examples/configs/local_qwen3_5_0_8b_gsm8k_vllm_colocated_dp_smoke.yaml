@@ -34,10 +34,12 @@ rollout:
     trust_remote_code: false
     enforce_eager: true
     enable_prefix_caching: false
+    skip_mm_profiling: true
     gpu_memory_utilization: 0.35
     request_concurrency: 1
     max_model_len: 256
     max_num_seqs: 2
+    startup_timeout: 600
 
 agentic:
   environment: gsm8k

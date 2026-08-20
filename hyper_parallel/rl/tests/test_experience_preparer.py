@@ -14,11 +14,13 @@
 # ============================================================================
 """CPU tests for model-free experience target preparation."""
 
+from typing import Optional
+
 import pytest
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.dataset.contracts import ExperienceBatch
+from rl.dataset.contracts import ExperienceBatch, Trajectory
 from rl.dataset import ExperiencePreparer
 
 
@@ -28,8 +30,8 @@ def _algorithm(name: str):
 
 
 def _rollout(
-    rewards: list[float] | None = None,
-    old_log_probs: torch.Tensor | None = None,
+    rewards: Optional[list[float]] = None,
+    old_log_probs: Optional[torch.Tensor] = None,
     include_old_log_probs: bool = True,
 ) -> ExperienceBatch:
     """Return a minimal rollout batch with two trainable response tokens."""
@@ -67,6 +69,77 @@ def _rollout(
         responses=("", "", "", ""),
         generation_seconds=0.0,
     )
+
+
+def _trajectory() -> Trajectory:
+    """Return one trajectory with a closed worker-owned policy identity."""
+    return Trajectory(
+        trajectory_id="trajectory-0",
+        prompt_id="prompt-0",
+        group_id="group-0",
+        policy_version=1,
+        turns=(),
+        token_ids=torch.tensor([1, 2, 3]),
+        attention_mask=torch.ones(3, dtype=torch.bool),
+        action_mask=torch.tensor([False, True, True]),
+        rollout_log_probs=torch.zeros(2),
+        reward=1.0,
+        reward_components={},
+        done=True,
+        truncated=False,
+        terminal_reason="done",
+        worker_policy_version=1,
+        worker_policy_fingerprint="digest-v1",
+    )
+
+
+def test_trajectory_rejects_a_different_worker_policy_version() -> None:
+    """A generated trajectory cannot claim a worker version other than its request."""
+    values = {**_trajectory().__dict__, "worker_policy_version": 2}
+
+    with pytest.raises(ValueError, match="must match its requested policy version"):
+        Trajectory(**values)
+
+
+def test_trajectory_rejects_action_mask_on_padding() -> None:
+    """A trajectory cannot classify an unobserved padding token as an action."""
+    trajectory = _trajectory()
+    values = {
+        **trajectory.__dict__,
+        "attention_mask": torch.tensor([True, True, False]),
+    }
+
+    with pytest.raises(ValueError, match="must not select padding tokens"):
+        Trajectory(**values)
+
+
+def test_experience_rejects_action_mask_on_padding() -> None:
+    """A batch cannot make padded zero logprobs participate in policy loss."""
+    rollout = _rollout()
+    rollout.action_mask[0, -1] = True
+    rollout.attention_mask[0, -1] = False
+
+    with pytest.raises(ValueError, match="must not select padding tokens"):
+        ExperienceBatch(**rollout.__dict__)
+
+
+def test_experience_rejects_identity_different_from_trajectory() -> None:
+    """Batch-level identity cannot overwrite the worker identity on its trajectories."""
+    trajectory = _trajectory()
+
+    with pytest.raises(ValueError, match="must match every trajectory"):
+        ExperienceBatch(
+            trajectories=(trajectory,),
+            sequences=trajectory.token_ids.unsqueeze(0),
+            attention_mask=trajectory.attention_mask.unsqueeze(0),
+            action_mask=trajectory.action_mask.unsqueeze(0),
+            rewards=torch.tensor([trajectory.reward]),
+            old_log_probs=trajectory.rollout_log_probs.unsqueeze(0),
+            responses=("",),
+            generation_seconds=0.0,
+            worker_policy_version=1,
+            worker_policy_fingerprint="different-digest",
+        )
 
 
 def test_grpo_preparer_adds_reference_log_probs_and_advantages_only() -> None:

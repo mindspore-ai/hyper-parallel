@@ -32,7 +32,7 @@ data_root=${HYPER_VLLM_DATA_ROOT:-${default_data_root}}
 result_root=${HYPER_VLLM_RESULT_ROOT:-${repo_root}/.rollout-results/qwen35-grpo}
 network_mode=${HYPER_VLLM_NETWORK_MODE:-bridge}
 timeout_seconds=${HYPER_VLLM_TIMEOUT_SECONDS:-600}
-model_implementation=${HYPER_VLLM_MODEL_IMPLEMENTATION:-hyper}
+model_implementation=${HYPER_VLLM_MODEL_IMPLEMENTATION:-native}
 detached=${HYPER_VLLM_DETACHED:-false}
 container_name=${HYPER_VLLM_CONTAINER_NAME:-hyper-vllm-${model_implementation}-${action}-$$}
 log_suffix=${HYPER_VLLM_LOG_SUFFIX:-}
@@ -43,7 +43,7 @@ production_canary_marker=${result_root}/.production-canary-${model_implementatio
 production_profile_identity=
 
 usage() {
-    printf 'Usage: %s {rollout-tp1|rollout-tp2|rollout-compare-tp1|refit|production-benchmark|grpo-smoke|grpo-colocated-dp-smoke|grpo-m3-select|grpo-m3-2step|grpo-m3-soak|grpo-production-canary|grpo-production}\n' "$0"
+    printf 'Usage: %s {rollout-tp1|rollout-tp2|refit|production-benchmark|grpo-smoke|grpo-colocated-dp-smoke|grpo-m3-select|grpo-m3-2step|grpo-m3-soak|grpo-production-canary|grpo-production}\n' "$0"
 }
 
 require_directory() {
@@ -102,7 +102,7 @@ require_directory "${data_root}"
 
 visible_devices=${requested_visible_devices:-0}
 tensor_parallel_size=1
-test_script=tests/torch/rl/vllm/validate_qwen3_5_rollout.py
+test_script=tests/torch/rl/vllm/validate_qwen_rollout.py
 output_file=/results/${model_implementation}-tp1.json
 nproc_per_node=1
 grpo_config=hyper_parallel/rl/examples/configs/local_qwen3_5_0_8b_gsm8k_vllm_smoke.yaml
@@ -113,12 +113,8 @@ case "${action}" in
         tensor_parallel_size=2
         output_file=/results/${model_implementation}-tp2.json
         ;;
-    rollout-compare-tp1)
-        test_script=tests/torch/rl/vllm/compare_qwen3_5_rollout_reports.py
-        output_file=/results/native-hyper-tp1-comparison.json
-        ;;
     refit)
-        test_script=tests/torch/rl/vllm/validate_qwen3_5_refit.py
+        test_script=tests/torch/rl/vllm/validate_qwen_refit.py
         output_file=/results/${model_implementation}-refit-tp1.json
         ;;
     production-benchmark)
@@ -219,12 +215,6 @@ if [[ "${action}" == "grpo-m3-select" ]]; then
         --output-dir /results/gsm8k-m3
         --implementation "${model_implementation}"
     )
-elif [[ "${action}" == "rollout-compare-tp1" ]]; then
-    common_test_args=(
-        --native /results/native-tp1.json
-        --hyper /results/hyper-tp1.json
-        --output "${output_file}"
-    )
 elif [[ "${action}" == "production-benchmark" ]]; then
     common_test_args=(
         --source /data/gsm8k/train.parquet
@@ -301,7 +291,6 @@ docker run "${docker_lifecycle_args[@]}" --privileged --shm-size=12g --network="
     "${docker_wandb_args[@]}" \
     -e "ASCEND_RT_VISIBLE_DEVICES=${visible_devices}" \
     -e HYPER_PARALLEL_PLATFORM=torch \
-    -e HYPER_VLLM_NUMERICAL_PROFILE=functional \
     -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 \
     -e GLOO_SOCKET_IFNAME=lo \

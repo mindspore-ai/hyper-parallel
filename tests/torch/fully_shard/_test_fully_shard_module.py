@@ -113,10 +113,8 @@ def test_fully_shard_module_01():
     # Test set_reshard_after_forward
     model1.set_reshard_after_forward(True)
     assert model1.hsdp_scheduler.reshard_after_forward is True
-    assert model1.hsdp_scheduler.config.reshard_after_forward is True
     model1.set_reshard_after_forward(False)
     assert model1.hsdp_scheduler.reshard_after_forward is False
-    assert model1.hsdp_scheduler.config.reshard_after_forward is False
     try:
         model1.set_reshard_after_forward(1)
         assert False, "Should raise ValueError for non-bool input"

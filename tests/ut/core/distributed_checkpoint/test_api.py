@@ -16,6 +16,7 @@
 # pylint: disable=wrong-import-position
 import importlib
 import os
+import pickle
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +37,7 @@ importlib.reload(api_mod)
 
 from hyper_parallel.core.distributed_checkpoint.api import (
     _gather_from_all_ranks,
+    _raise_if_stage_failed,
     load,
     save,
 )
@@ -46,6 +48,7 @@ class TestApi(unittest.TestCase):
     """Tests for distributed checkpoint save/load API."""
 
     def setUp(self) -> None:
+        """Reset the selected platform and checkpoint planner cache."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
         importlib.reload(planner_mod)
@@ -84,9 +87,9 @@ class TestApi(unittest.TestCase):
             load(loaded, checkpoint_id=tmpdir, no_dist=True)
             torch.testing.assert_close(loaded["weight"], weight)
             self.assertEqual(loaded["step"], step)
-        mock_barrier.assert_called()
-        mock_rank.assert_called()
-        mock_world_size.assert_called()
+        mock_barrier.assert_not_called()
+        mock_rank.assert_not_called()
+        mock_world_size.assert_not_called()
 
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
@@ -100,9 +103,9 @@ class TestApi(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             metadata = save({"weight": torch.zeros(2, 2)}, checkpoint_id=tmpdir, no_dist=True)
             self.assertIn("weight", metadata.state_dict_metadata)
-        mock_barrier.assert_called_once()
-        mock_rank.assert_called()
-        mock_world_size.assert_called()
+        mock_barrier.assert_not_called()
+        mock_rank.assert_not_called()
+        mock_world_size.assert_not_called()
 
     def test_gather_from_all_ranks_single_process(self):
         """
@@ -122,15 +125,48 @@ class TestApi(unittest.TestCase):
         """
         expected = [{"a": 1}, {"a": 2}]
 
-        def gather_side_effect(out, local_obj):
-            del local_obj
-            out[0] = expected[0]
-            out[1] = expected[1]
+        def _gather_side_effect(out, local_obj):
+            if local_obj is None:
+                out[:] = [None, None]
+            else:
+                out[:] = [pickle.dumps(value) for value in expected]
 
-        mock_all_gather.side_effect = gather_side_effect
+        mock_all_gather.side_effect = _gather_side_effect
         result = _gather_from_all_ranks({"a": 1}, world_size=2, use_collectives=True)
-        mock_all_gather.assert_called_once()
+        self.assertEqual(mock_all_gather.call_count, 3)
         self.assertEqual(result, expected)
+
+    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.all_gather_object")
+    def test_gather_propagates_payload_serialization_failure(self, mock_all_gather):
+        """
+        Feature: Collective payload serialization failure propagation.
+        Description: The local rank cannot pickle its plan before collective exchange.
+        Expectation: Every rank can fail in the status collective before payload exchange.
+        """
+
+        def _gather_side_effect(out, local_error):
+            out[:] = [local_error, None]
+
+        mock_all_gather.side_effect = _gather_side_effect
+        with self.assertRaisesRegex(RuntimeError, "payload serialization"):
+            _gather_from_all_ranks(lambda: None, world_size=2, use_collectives=True)
+        mock_all_gather.assert_called_once()
+
+    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.all_gather_object")
+    def test_stage_failure_from_peer_is_raised_on_healthy_rank(self, mock_all_gather):
+        """
+        Feature: Distributed checkpoint phase failure propagation.
+        Description: A peer reports setup failure while the local rank succeeds.
+        Expectation: The healthy rank raises before entering the next checkpoint phase.
+        """
+
+        def _gather_side_effect(out, local_error):
+            self.assertIsNone(local_error)
+            out[:] = ["rank 0 failed", None]
+
+        mock_all_gather.side_effect = _gather_side_effect
+        with self.assertRaisesRegex(RuntimeError, "planning setup"):
+            _raise_if_stage_failed(None, "planning setup", 2, True)
 
 
 if __name__ == "__main__":

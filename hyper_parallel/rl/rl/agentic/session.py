@@ -41,6 +41,8 @@ class AgentSession:
         self._action_mask_parts: list[Any] = []
         self._log_prob_parts: list[Any] = []
         self._collecting_log_probs: Optional[bool] = None
+        self._worker_policy_version: Optional[int] = None
+        self._worker_policy_fingerprint: Optional[str] = None
         self.reward = 0.0
         self.reward_components: dict[str, float] = {}
         self.metadata: dict[str, Any] = {}
@@ -138,6 +140,24 @@ class AgentSession:
         )
         self.turns.append(Turn("assistant", action.content, start, end, True))
         self.action_contents.append(action.content)
+    def record_worker_policy_identity(
+        self,
+        version: Optional[int],
+        fingerprint: Optional[str],
+    ) -> None:
+        """Record one stable worker-owned identity across every generated turn."""
+        if (version is None) != (fingerprint is None):
+            raise ValueError("Worker policy version and fingerprint must be provided together")
+        if version is None:
+            return
+        identity = (int(version), str(fingerprint))
+        current = (self._worker_policy_version, self._worker_policy_fingerprint)
+        if self._worker_policy_version is not None and identity != current:
+            raise RuntimeError(
+                "AgentSession observed multiple rollout policy identities: "
+                f"current={current}, received={identity}"
+            )
+        self._worker_policy_version, self._worker_policy_fingerprint = identity
     async def apply(self, action: Action) -> None:
         """Apply one action and accumulate its resulting transition."""
         if not self.active:
@@ -206,5 +226,7 @@ class AgentSession:
             done=self.done,
             truncated=self.truncated,
             terminal_reason=self.terminal_reason,
+            worker_policy_version=self._worker_policy_version,
+            worker_policy_fingerprint=self._worker_policy_fingerprint,
             metadata={**self.metadata, "num_actions": len(self.action_contents)},
         )

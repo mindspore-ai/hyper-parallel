@@ -586,7 +586,6 @@ class PipelineStage(PipelineStageBase):
 
         for scheduler in fsdp_schedulers:
             scheduler.hsdp_state.post_backward()
-            scheduler.hsdp_state.reduce_params()
 
         # A plain pipeline-stage root may contain one or more independently
         # wrapped HSDP child roots. Finalize every runtime root so each context
@@ -600,9 +599,9 @@ class PipelineStage(PipelineStageBase):
         if not root_schedulers:
             root_schedulers = fsdp_schedulers[:1]
         for scheduler in root_schedulers:
-            # No public API exposes root backward finalization. force_reduce=True
-            # ensures a differentiable PP input cannot defer the final drain.
-            scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
+            # No public API exposes root backward finalization. The hook drains
+            # unconditionally, so a differentiable PP input cannot defer it.
+            scheduler._root_backward_hook()  # pylint: disable=protected-access
 
     def _build_padded_sens(self, micro_index):
         """Build an N-length sens list aligned with the forward output structure.

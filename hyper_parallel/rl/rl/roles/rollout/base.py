@@ -31,6 +31,19 @@ class GenerationSettings:
     eos_token_id: int
     collect_log_probs: bool = False
     seed: Optional[int] = None
+    eos_token_ids: tuple[int, ...] = ()
+    ignore_eos: bool = False
+
+    def __post_init__(self) -> None:
+        """Normalize the primary and additional terminal token IDs."""
+        normalized_ids = tuple(
+            dict.fromkeys(
+                (int(self.eos_token_id), *(int(token_id) for token_id in self.eos_token_ids))
+            )
+        )
+        if any(token_id < 0 for token_id in normalized_ids):
+            raise ValueError(f"EOS token IDs must be non-negative, got {normalized_ids}")
+        object.__setattr__(self, "eos_token_ids", normalized_ids)
 
 
 @dataclass(frozen=True)
@@ -46,6 +59,8 @@ class GenerationResult:
     rollout_log_probs: Optional[Any]
     generation_seconds: float
     response_mask: Optional[Any] = None
+    worker_policy_version: Optional[int] = None
+    worker_policy_fingerprint: Optional[str] = None
 
 
 class GenerationEngine(Protocol):
@@ -56,6 +71,9 @@ class GenerationEngine(Protocol):
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate responses for one backend-neutral request."""
+
+    def synchronize_error(self, local_error: Optional[Exception], operation: str) -> None:
+        """Propagate one local rollout orchestration failure to every rank."""
 
     def prepare_for_training(self) -> None:
         """Release inference residency before the synchronous training phase."""

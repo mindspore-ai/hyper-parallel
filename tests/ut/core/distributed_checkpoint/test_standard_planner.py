@@ -31,6 +31,7 @@ import hyper_parallel.core.distributed_checkpoint.standard_planner as planner_mo
 importlib.reload(planner_mod)
 
 from hyper_parallel.core.distributed_checkpoint.metadata import (
+    BytesStorageMetadata,
     ChunkStorageMetadata,
     Metadata,
     MetadataIndex,
@@ -49,6 +50,7 @@ class TestStandardPlanner(unittest.TestCase):
     """Tests for StandardSavePlanner and StandardLoadPlanner."""
 
     def setUp(self) -> None:
+        """Reset the selected platform and save-plan cache."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
         importlib.reload(planner_mod)
@@ -115,7 +117,7 @@ class TestStandardPlanner(unittest.TestCase):
         tensor_item = next(i for i in plan.items if i.type == WriteItemType.TENSOR)
         data = planner.get_data(tensor_item)
         self.assertFalse(data.requires_grad)
-        torch.testing.assert_close(data, weight.detach().cpu())
+        torch.testing.assert_close(data, weight.data.cpu())
 
     def test_save_planner_plan_cache_hit(self):
         """
@@ -132,6 +134,20 @@ class TestStandardPlanner(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertIs(cached.final_plan, plan)
         self.assertIs(cached.metadata, metadata)
+
+    def test_save_planner_cache_misses_when_tensor_schema_changes(self):
+        """
+        Feature: StandardSavePlanner structural cache key.
+        Description: Reconfigure a planner with the same FQN but a different tensor shape.
+        Expectation: The previous plan is not reused for an incompatible tensor schema.
+        """
+        planner = StandardSavePlanner(enable_plan_caching=True)
+        planner.configure_planner({"w": torch.zeros(1)}, rank=0, use_collectives=True)
+        planner.cache_result(SavePlan(items=[]), Metadata(state_dict_metadata={}))
+
+        planner.configure_planner({"w": torch.zeros(2)}, rank=0, use_collectives=True)
+
+        self.assertIsNone(planner.get_cached())
 
     def test_create_read_items_for_chunk_list_overlap(self):
         """
@@ -155,8 +171,6 @@ class TestStandardPlanner(unittest.TestCase):
         Description: Load planner configured with BYTE_IO metadata entry.
         Expectation: Local plan has BYTE_IO ReadItem; apply_bytes restores Python object.
         """
-        from hyper_parallel.core.distributed_checkpoint.metadata import BytesStorageMetadata
-
         payload = {"lr": 0.01}
         state = {"opt_state": None}
         metadata = Metadata(state_dict_metadata={"opt_state": BytesStorageMetadata()})

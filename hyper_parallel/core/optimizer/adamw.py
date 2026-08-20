@@ -18,9 +18,6 @@ from typing import List
 
 import torch
 
-from hyper_parallel.core.optimizer.utils import get_current_device
-
-
 def adamw(
         params: List[torch.Tensor],
         grads: List[torch.Tensor],
@@ -40,8 +37,7 @@ def adamw(
     r"""Functional API that performs AdamW algorithm computation.
     See :class:`~torch.optim.AdamW` for details.
     """
-    device = get_current_device()
-    step_tensor = torch.tensor(step, dtype=torch.int64, device=device)
+    step_tensor = torch.tensor(step, dtype=torch.int64, device=params[0].device)
     state_steps = [step_tensor] * len(params)
 
     torch._fused_adamw_(  # pylint: disable=protected-access

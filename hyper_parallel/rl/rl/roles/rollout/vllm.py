@@ -24,20 +24,19 @@ import time
 from typing import Any, Mapping, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from rl.roles.model import ModelRegistration
+from rl.roles.model import (
+    ModelRegistration,
+    VLLMModelRegistration,
+    resolve_vllm_model,
+)
 from rl.roles.rollout.base import GenerationRequest, GenerationResult
 from rl.roles.rollout.registry import ROLLOUT_ENGINES
 from rl.roles.weight_sync import (
     ActorRolloutWeightSync,
-    CPUWeightTransfer,
-    HCCLWeightTransfer,
-    NPUIPCWeightTransfer,
     PolicySnapshot,
     VLLMWeightSyncClientMixin,
     WeightTransfer,
-    architecture_for_implementation,
     build_weight_transfer,
-    normalize_model_implementation,
     policy_weight_fingerprint,
     synchronize_error,
     verify_policy_fingerprints,
@@ -93,9 +92,11 @@ def _policy_weight_fingerprint(state_dict: Mapping[str, Any]) -> dict[str, Any]:
 def _verify_policy_fingerprints(
     expected: Mapping[str, Any],
     actual: list[Mapping[str, Any]],
+    *,
+    expected_version: Optional[int] = None,
 ) -> None:
     """Compatibility wrapper around rollout fingerprint verification."""
-    verify_policy_fingerprints(expected, actual)
+    verify_policy_fingerprints(expected, actual, expected_version=expected_version)
 class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
     """Synchronous token and RL control client for one vLLM server process."""
     def __init__(
@@ -157,7 +158,7 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
             if return_code is not None:
                 raise RuntimeError(f"vLLM server exited during startup with code {return_code}")
             try:
-                self._request("GET", "health", timeout=2)
+                self._request("GET", "health", payload=None, timeout=2)
                 return
             except RuntimeError as error:
                 last_error = error
@@ -181,8 +182,10 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
             "top_k": settings.top_k if settings.top_k > 0 else -1,
             "n": 1,
             "logprobs": 1 if settings.collect_log_probs else None,
+            "ignore_eos": settings.ignore_eos,
             "return_token_ids": True,
             "add_special_tokens": False,
+            "stop_token_ids": list(settings.eos_token_ids),
         }
         if seed is not None:
             payload["seed"] = seed
@@ -271,30 +274,6 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
             except ProcessLookupError:
                 pass
 VLLMWeightRefitter = WeightTransfer
-class CPUStateDictRefitter(CPUWeightTransfer):
-    """Compatibility name for the weight-sync CPU transfer."""
-class HCCLWeightRefitter(HCCLWeightTransfer):
-    """Compatibility name for the weight-sync HCCL transfer."""
-    @staticmethod
-    def _policy_fingerprint(state_dict: Mapping[str, Any]) -> dict[str, Any]:
-        return _policy_weight_fingerprint(state_dict)
-    @staticmethod
-    def _verify_fingerprints(
-        expected: Mapping[str, Any],
-        actual: list[Mapping[str, Any]],
-    ) -> None:
-        _verify_policy_fingerprints(expected, actual)
-class NPUIPCWeightRefitter(NPUIPCWeightTransfer):
-    """Compatibility name for the weight-sync NPU IPC transfer."""
-    @staticmethod
-    def _policy_fingerprint(state_dict: Mapping[str, Any]) -> dict[str, Any]:
-        return _policy_weight_fingerprint(state_dict)
-    @staticmethod
-    def _verify_fingerprints(
-        expected: Mapping[str, Any],
-        actual: list[Mapping[str, Any]],
-    ) -> None:
-        _verify_policy_fingerprints(expected, actual)
 class VLLMGenerationEngine:
     """Adapt optional vLLM generation to the shared rollout contract."""
     name = "vllm"
@@ -304,13 +283,15 @@ class VLLMGenerationEngine:
         config: Mapping[str, Any],
         client: Optional[Any] = None,
         refitter: Optional[VLLMWeightRefitter] = None,
+        rollout_model: Optional[VLLMModelRegistration] = None,
     ) -> None:
         """Initialize the lazy vLLM client and policy synchronization."""
         self._model = model
         self._config = dict(config.get("vllm", {}))
         self._deployment = str(self._config.get("deployment", "disjoint"))
-        self._model_implementation = normalize_model_implementation(
-            self._config.get("model_implementation", "hyper")
+        self._rollout_model = rollout_model or resolve_vllm_model(
+            model,
+            self._config.get("model_implementation", "native"),
         )
         self._client = client
         self._weight_sync = ActorRolloutWeightSync(
@@ -382,23 +363,30 @@ class VLLMGenerationEngine:
             str(int(self._config.get("tensor_parallel_size", 1))),
             "--dtype",
             str(self._config.get("dtype", "bfloat16")),
-            "--hf-overrides",
-            json.dumps(
-                {
-                    "architectures": [
-                        architecture_for_implementation(self._model_implementation)
-                    ]
-                }
-            ),
             "--weight-transfer-config",
             json.dumps({"backend": weight_transfer_backend}),
         ]
+        if self._rollout_model.is_hyper:
+            command.extend(
+                (
+                    "--hf-overrides",
+                    json.dumps(
+                        {
+                            "architectures": [self._rollout_model.architecture]
+                        }
+                    ),
+                )
+            )
         if bool(self._config.get("trust_remote_code", True)):
             command.append("--trust-remote-code")
         if bool(self._config.get("enforce_eager", True)):
             command.append("--enforce-eager")
-        if bool(self._config.get("enable_prefix_caching", False)):
-            command.append("--enable-prefix-caching")
+        for key, option in (
+            ("enable_prefix_caching", "--enable-prefix-caching"),
+            ("enable_chunked_prefill", "--enable-chunked-prefill"),
+        ):
+            if key in self._config:
+                command.append(option if bool(self._config[key]) else f"--no-{option[2:]}")
         if bool(self._config.get("skip_mm_profiling", False)):
             command.append("--skip-mm-profiling")
         if self._deployment == "colocated":
@@ -410,14 +398,20 @@ class VLLMGenerationEngine:
                 )
             )
         for key, option in (
+            ("attention_backend", "--attention-backend"),
             ("gpu_memory_utilization", "--gpu-memory-utilization"),
             ("kv_cache_memory_bytes", "--kv-cache-memory-bytes"),
             ("max_model_len", "--max-model-len"),
             ("max_num_seqs", "--max-num-seqs"),
             ("max_num_batched_tokens", "--max-num-batched-tokens"),
+            ("block_size", "--block-size"),
+            ("logprobs_mode", "--logprobs-mode"),
         ):
             if key in self._config:
                 command.extend((option, str(self._config[key])))
+        profiler_config = self._config.get("profiler_config")
+        if profiler_config is not None:
+            command.extend(("--profiler-config", json.dumps(profiler_config)))
         return command
 
     def _server_environment(self, visible_devices: str) -> dict[str, str]:
@@ -425,6 +419,7 @@ class VLLMGenerationEngine:
         server_environment = os.environ.copy()
         for variable in _DISTRIBUTED_ENVIRONMENT_VARIABLES:
             server_environment.pop(variable, None)
+        server_environment.pop("HYPER_RL_CONSISTENCY_PROFILE", None)
         server_environment.update(
             {
                 "ASCEND_RT_VISIBLE_DEVICES": str(visible_devices),
@@ -435,6 +430,9 @@ class VLLMGenerationEngine:
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             }
         )
+        consistency_profile = self._config.get("consistency_profile")
+        if consistency_profile is not None:
+            server_environment["HYPER_RL_CONSISTENCY_PROFILE"] = str(consistency_profile)
         if self._deployment == "colocated":
             server_environment["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
             server_environment.pop("PYTORCH_NPU_ALLOC_CONF", None)
@@ -465,11 +463,6 @@ class VLLMGenerationEngine:
         """Return the existing client or launch a process-isolated vLLM server."""
         if self._client is not None:
             return self._client
-        if self._model.hyper_model_name != "qwen3_5":
-            raise ValueError(
-                "The Hyper vLLM backend currently supports only hyper model 'qwen3_5', "
-                f"got {self._model.hyper_model_name!r}"
-            )
         visible_devices, host, port = self._server_endpoint()
         client = self._launch_client(visible_devices, host, port)
         self._client = client
@@ -523,6 +516,8 @@ class VLLMGenerationEngine:
             top_k=settings.top_k if settings.top_k > 0 else -1,
             logprobs=1 if settings.collect_log_probs else None,
             seed=settings.seed,
+            stop_token_ids=list(settings.eos_token_ids),
+            ignore_eos=settings.ignore_eos,
         )
         prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids]
         outputs = client.generate(prompts, sampling_params=sampling, use_tqdm=False)
@@ -557,6 +552,8 @@ class VLLMGenerationEngine:
         request: GenerationRequest,
         completion_records: list[tuple[list[int], Optional[list[float]]]],
         elapsed: float,
+        worker_policy_version: Optional[int],
+        worker_policy_fingerprint: Optional[str],
     ) -> GenerationResult:
         """Pad variable-length completions into the rollout tensor contract."""
         settings = request.settings
@@ -583,11 +580,24 @@ class VLLMGenerationEngine:
                     completion_log_probs[: len(tokens)]
                 )
         sequences = platform.cat((request.input_ids, response_ids), dim=-1)
-        return GenerationResult(sequences, rollout_log_probs, elapsed, response_mask)
+        return GenerationResult(
+            sequences=sequences,
+            rollout_log_probs=rollout_log_probs,
+            generation_seconds=elapsed,
+            response_mask=response_mask,
+            worker_policy_version=worker_policy_version,
+            worker_policy_fingerprint=worker_policy_fingerprint,
+        )
 
     def _generate(self, request: GenerationRequest) -> GenerationResult:
         """Execute one local variable-length generation request."""
         client = self._ensure_client()
+        worker_policy_version = None
+        worker_policy_fingerprint = None
+        if self._config.get("consistency_profile") is not None:
+            worker_policy_version, worker_policy_fingerprint = (
+                self._weight_sync.generation_identity(client)
+            )
         prompt_token_ids = [
             ids[mask.bool()].detach().cpu().tolist()
             for ids, mask in zip(request.input_ids, request.attention_mask)
@@ -598,10 +608,20 @@ class VLLMGenerationEngine:
             prompt_token_ids,
             request.settings,
         )
+        if worker_policy_version is not None:
+            served_identity = self._weight_sync.generation_identity(client)
+            expected_identity = (worker_policy_version, worker_policy_fingerprint)
+            if served_identity != expected_identity:
+                raise RuntimeError(
+                    "vLLM policy identity changed while serving a generation request: "
+                    f"before={expected_identity}, after={served_identity}"
+                )
         return self._build_generation_result(
             request,
             completion_records,
             time.perf_counter() - started,
+            worker_policy_version,
+            worker_policy_fingerprint,
         )
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate locally and make colocated replica failures globally fatal."""
@@ -611,13 +631,16 @@ class VLLMGenerationEngine:
             result = self._generate(request)
         except Exception as error:  # pylint: disable=W0718
             local_error = error
-        if self._deployment == "colocated":
-            _synchronize_error(local_error, "generation")
-        elif local_error is not None:
-            raise local_error
+        self.synchronize_error(local_error, "generation")
         if result is None:
             raise RuntimeError("vLLM generation failed without a synchronized error")
         return result
+    def synchronize_error(self, local_error: Optional[Exception], operation: str) -> None:
+        """Propagate rollout and postprocessing failures across colocated ranks."""
+        if self._deployment == "colocated":
+            _synchronize_error(local_error, operation)
+        elif local_error is not None:
+            raise local_error
     def update_weights(self, snapshot: PolicySnapshot) -> None:
         """Transfer and publish a strictly newer policy snapshot."""
         self._weight_sync.update_weights(snapshot)
@@ -638,8 +661,17 @@ def build_vllm_engine(
     """Build the registered optional vLLM generation engine."""
     vllm_config = config.get("vllm", {})
     deployment = vllm_config.get("deployment", "disjoint")
-    model_implementation = normalize_model_implementation(
-        vllm_config.get("model_implementation", "hyper")
+    rollout_model = resolve_vllm_model(
+        model,
+        vllm_config.get("model_implementation", "native")
     )
-    weight_transfer = build_weight_transfer(deployment, model_implementation)
-    return VLLMGenerationEngine(model, config, refitter=weight_transfer)
+    weight_transfer = build_weight_transfer(
+        deployment,
+        rollout_model,
+    )
+    return VLLMGenerationEngine(
+        model,
+        config,
+        refitter=weight_transfer,
+        rollout_model=rollout_model,
+    )

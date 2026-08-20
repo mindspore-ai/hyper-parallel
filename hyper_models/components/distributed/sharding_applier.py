@@ -1,0 +1,1724 @@
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""sharding_applier: runtime application of ShardingPlan (05 §4 canonical).
+
+apply_sharding_plan: Phase 0 normalization -> A parameter sharding -> B special
+handlers -> C entry unpack + tp_grad_info -> C forward wrapping
+(production/validate/moe/cp/vocab_embed, five paths) -> D tied weights.
+
+Dual-mode architecture constraint (05 §1.4): production has zero DTensor
+dispatch (build-time unpack + PrecompiledBoundary); the only difference between
+validate and production is the boundary stitching method -- for any module whose
+DTensor dispatch hides data-dependent logic (embedding mask / attention K/V
+gather / MoE all-to-all), both modes explicitly reconstruct it with the same
+local-region wrapper (D-01''/D-02/D-03').
+"""
+
+import functools
+import importlib.metadata
+import inspect
+import logging
+
+import numpy as np
+import torch
+from torch import nn
+
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import (
+    Placement,
+    Shard,
+)
+from hyper_models.components.distributed.cp_wrappers import (
+    INNER_WRAPPER_REGISTRY,
+    INNER_WRAPPER_REQUIREMENTS,
+)
+from hyper_models.components.distributed.injection import (
+    INNER_WRAPPER,
+    LOCAL_COMPUTE,
+    fill_context_kwargs,
+    require_injection_meta,
+    validate_local_compute_signature,
+    validate_wrapped_forward,
+)
+from hyper_models.components.distributed.precompiled_boundary import (
+    PrecompiledBoundary,
+)
+from hyper_models.components.distributed.sharding.apply import (
+    _get_attr_by_path,
+    _local_params_context,
+    _resolve_module,
+    _set_param_by_path,
+    _stack_moe_experts,
+    _temp_local_params,
+)
+from hyper_models.components.distributed.sharding_config import (
+    PlacementMismatchError,
+    _normalize_out_fields,
+    resolve_placements,
+)
+from hyper_models.components.distributed.sharding_planner import (
+    SPECIAL_HANDLERS,
+    ShardingPlanner,
+)
+from hyper_models.components.distributed.ep_compute import (
+    EP_ARCHETYPE_SUGGESTIONS,
+)
+from hyper_models.components.distributed.tp_grad import build_tp_grad_info
+from hyper_models.components.distributed.head_count import (
+    maybe_update_head_counts,
+)
+from hyper_models.components.distributed.infrastructure import MeshContext
+
+logger = logging.getLogger(__name__)
+
+
+def _is_delayed_target(obj) -> bool:
+    """Duck-typed check for a config Target (avoids a components -> trainer
+    import): a Target carries ``build()`` and ``_target_`` and is itself NOT
+    the compute/wrapper callable — it must be built at apply time."""
+    return hasattr(obj, "build") and hasattr(obj, "_target_")
+
+
+def _check_target_config_keys(target, kind):
+    """Fail fast on configured Target kwargs the callable would never bind.
+
+    Target kwargs are bound BY NAME at build time
+    (``{**configured, **runtime}`` -> ``fn(**kwargs)``). When the target
+    callable accepts VAR_KEYWORD (e.g. ``**_context``, there to tolerate the
+    framework-filled generic context), a misspelled configured key is
+    swallowed SILENTLY — the user's value never takes effect and the
+    framework may even auto-fill the intended parameter instead. Guard: any
+    configured key that is not an explicitly declared (keyword-bindable)
+    parameter fails fast with the valid parameter names. A callable whose
+    signature cannot be introspected skips the check (the call itself will
+    surface any mismatch).
+    """
+    configured = getattr(target, "_kwargs", None)
+    if not configured:
+        return
+    fn = getattr(target, "_target_", None)
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return
+    bindable = {
+        name for name, p in params.items()
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                      inspect.Parameter.KEYWORD_ONLY)
+    }
+    unknown = sorted(set(configured) - bindable)
+    if unknown:
+        raise ValueError(
+            f"{kind} Target {getattr(target, '_target_path', fn)!r} 配置了未声明的"
+            f"键 {unknown} —— Target 的 kwargs 按名绑定到目标函数的关键字形参，"
+            f"这些键不在 {getattr(fn, '__name__', fn)} 的显式形参列表中，会被 "
+            f"**kwargs 静默吞掉、不会生效（疑似拼写错误）。"
+            f"合法形参: {sorted(bindable) or '(无)'}")
+
+
+def _preflight_compute_injection(plan, mesh, model=None):
+    """Fail-fast BEFORE any mutation: CP/EP sharding without an explicit
+    compute injection is a silent numerical error (no auto-injection since
+    the explicit-injection rework).
+
+    - CP: an attention boundary (``_needs_cp_attn`` metadata from the
+      template) under an active cp mesh needs ``inner_wrapper``;
+    - EP: a TP-extend-EP boundary (``_ep_size > 0``, expert params already
+      destined for ``{EP: Shard(0)}``) needs ``local_compute_fn`` — or an
+      explicit ``region_dispatch=False`` when the module's own forward is
+      EP-aware (a2a inside forward).
+
+    ``model`` (optional) enables the arch-aware EP archetype suggestion in
+    the error message (accuracy_fix_plan.md §3 E2).
+    """
+    transformers_version = importlib.metadata.version("transformers")
+    cp_mesh = _get_cp_submesh(mesh, plan.mesh_dim_names)
+    for fqn, spec in plan.modules.items():
+        wrapper = getattr(spec, "inner_wrapper", None)
+        target = getattr(spec, "inner_target", None)
+        region_dispatch = getattr(spec, "region_dispatch", None)
+        if wrapper is None and target is not None:
+            raise ValueError(
+                f"Invalid inner-wrapper plan at boundary {fqn!r} "
+                f"(transformers={transformers_version}): inner_target={target!r} "
+                "locates a module but inner_wrapper is missing. Declare both "
+                "fields or remove inner_target."
+            )
+        if wrapper is not None and target is None:
+            raise ValueError(
+                f"Invalid inner-wrapper plan at boundary {fqn!r} "
+                f"(transformers={transformers_version}): "
+                f"inner_wrapper={wrapper!r}, inner_target=None, "
+                f"region_dispatch={region_dispatch!r}. Declare "
+                "inner_target='self' for the boundary module or an explicit "
+                "child attribute name."
+            )
+        requirements = (
+            INNER_WRAPPER_REQUIREMENTS.get(wrapper)
+            if isinstance(wrapper, str) else None
+        )
+        if requirements is not None:
+            required_dispatch = requirements["region_dispatch"]
+            if region_dispatch is not required_dispatch:
+                raise ValueError(
+                    f"Invalid built-in CP wrapper plan at boundary {fqn!r} "
+                    f"(transformers={transformers_version}): "
+                    f"inner_wrapper={wrapper!r} contains CP communication and "
+                    f"requires region_dispatch={required_dispatch}, got "
+                    f"{region_dispatch!r}. Suggested YAML:\n"
+                    f"  - match: {fqn!r}\n"
+                    "    when: cp\n"
+                    f"    region_dispatch: {str(required_dispatch).lower()}\n"
+                    f"    inner_target: {target!r}\n"
+                    f"    inner_wrapper: {wrapper}"
+                )
+            if requirements["requires_cp"] and (
+                    cp_mesh is None or cp_mesh.size() <= 1):
+                raise ValueError(
+                    f"Invalid built-in CP wrapper plan at boundary {fqn!r}: "
+                    f"inner_wrapper={wrapper!r} requires an active cp mesh, "
+                    "but the plan has no cp axis with size > 1"
+                )
+        if wrapper is not None and target != "self" and getattr(
+                spec, "inner_out_src", None) is None:
+            raise ValueError(
+                f"Invalid inner-wrapper plan at boundary {fqn!r}: wrapper "
+                f"{wrapper!r} targets child {target!r}, but inner_out_src is "
+                "missing. Declare inner_out_src='first_input' for a "
+                "layout-preserving single output, provide explicit output "
+                "placements, or use inner_target='self' to reuse boundary "
+                "out_src."
+            )
+    if cp_mesh is not None and cp_mesh.size() > 1:
+        for fqn, spec in plan.modules.items():
+            if (spec.is_boundary and getattr(spec, "_needs_cp_attn", False)
+                    and getattr(spec, "inner_wrapper", None) is None):
+                raise ValueError(
+                    f"cp_size={cp_mesh.size()} 已生效，attention 边界 {fqn!r} 需要 "
+                    "CP-aware 内部 forward（K/V all-gather），但未声明 "
+                    "inner_wrapper —— 框架不再启发式自动选择。请显式注入：\n"
+                    "  plan_overrides:\n"
+                    "    - match: \"*.self_attn\"\n"
+                    "      when: cp\n"
+                    "      region_dispatch: false   # wrapper 内含通信，不可 dispatch\n"
+                    "      inner_wrapper:\n"
+                    "        _target_: hyper_models.components.distributed."
+                    "cp_wrappers.sdpa_hf_cp_wrapper\n"
+                    f"（注册表 {sorted(INNER_WRAPPER_REGISTRY)} 可按 str 名引用；"
+                    "NeMo 风格 (q,k,v) 签名用 sdpa_qkv，HF 风格 "
+                    "forward(hidden_states) 用 sdpa_hf；或给 callable/"
+                    "Target 自定义实现）")
+    for fqn, spec in plan.modules.items():
+        if (spec.is_boundary and getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
+                and getattr(spec, "local_compute_fn", None) is None
+                and getattr(spec, "region_dispatch", None) is not False):
+            suggestion = ""
+            if model is not None:
+                arch = ShardingPlanner._get_architecture(model)
+                archetype = EP_ARCHETYPE_SUGGESTIONS.get(arch)
+                if archetype is not None:
+                    suggestion = (
+                        f"检测到模型架构 {arch!r}，对应 archetype 可能是 "
+                        f"{archetype!r}（建议而非自动选择——请确认后显式配置；"
+                        "选错会在 apply 期接口断言报错并列出模块实际子模块名）。\n"
+                    )
+            raise ValueError(
+                f"ep_size={spec._ep_size} 已生效（专家参数将按 {{EP: Shard(0)}} "  # pylint: disable=protected-access
+                f"分片），但边界 {fqn!r} 没有 local-region 计算来源 —— 专家计算与 "
+                "all-to-all 无人执行，框架不再自动注入任何实现。请选择其一：\n"
+                f"{suggestion}"
+                "  ① 按模型行为选择内置 archetype 工厂（完整语义：router / "
+                "shared expert / gate / merge 全部内聚实现；可选 archetype 与"
+                "各自期望的模块接口见 ep_compute.py 模块 docstring）：\n"
+                "     plan_overrides:\n"
+                "       - match: \"*.mlp\"\n"
+                "         when: ep\n"
+                "         region_dispatch: false   # a2a 在区域内，不可 dispatch\n"
+                "         local_compute_fn:\n"
+                "           _target_: hyper_models.components.distributed."
+                "ep_compute.qwen2moe_ep_compute_fn   # 按 archetype 表选择\n"
+                "  ② 非典型 MoE → 参照 examples/distributed/ep_factories.py "
+                "自写工厂（用 require_attrs 获得同样的构建期接口校验）\n"
+                "  ③ 自研 EP-aware MoE（forward 内已含 all-to-all）→ 声明 "
+                "region_dispatch: false")
+
+
+def _require_region_dispatch(spec, *, source):
+    """注入纪律：声明注入（local_compute_fn / inner_wrapper）必须显式给出
+    region_dispatch（无默认——可 dispatch 的纯算子注入传 True，含通信/
+    自定义 kernel 的传 False；教程与示例逐一说明原因）。"""
+    rd = getattr(spec, "region_dispatch", None)
+    has_injection = (getattr(spec, "local_compute_fn", None) is not None
+                     or getattr(spec, "inner_wrapper", None) is not None)
+    if rd is None:
+        if has_injection:
+            raise ValueError(
+                f"{source}: 声明了注入但 region_dispatch 未显式声明（无默认值）"
+                "——注入物是纯标准算子、validate 可 dispatch 穿透（融合算子/"
+                "脚本写法优化）→ region_dispatch=True（区域内策略传播 + "
+                "out_src 真校验）；注入物含通信原语/自定义 kernel（CP K/V "
+                "all-gather、EP all-to-all、量化 GEMM 等）→ "
+                "region_dispatch=False（骨架/适配器黑盒托管 local 执行 + "
+                "声明式重包）")
+        return
+    if rd is True and not has_injection:
+        raise ValueError(
+            f"{source}: region_dispatch=True 但未声明任何注入——普通边界的 "
+            "forward 天然 dispatch 穿透（公理缺省），该声明是冗余的，请删除")
+
+
+def _log_injection_choice(module_fqn, spec):
+    """可观察性补强：注入边界的选择结果即时可见（一行 INFO/边界），形成
+    "声明 → 看到后果"的反馈闭环。必须在 _require_region_dispatch 之后调用
+    （此处注入 + region_dispatch 组合已合法）。"""
+    rd = getattr(spec, "region_dispatch", None)
+    has_fn = getattr(spec, "local_compute_fn", None) is not None
+    has_wrap = getattr(spec, "inner_wrapper", None) is not None
+    if not (has_fn or has_wrap or rd is not None):
+        return   # 普通边界：无注入、公理缺省穿透，不刷屏
+    what = "+".join(
+        [x for x, ok in (("local_compute_fn", has_fn),
+                         ("inner_wrapper", has_wrap)) if ok]
+    ) or "模块自身 forward（未注入 fn，region_dispatch=False 声明）"
+    if rd is True:
+        effect = "validate 穿透真校验已启用（区域内策略传播 + out_src 真校验）"
+    else:  # False（None+注入已被 _require_region_dispatch 拦截）
+        effect = "黑盒托管（区域内 local 执行、跳过传播校验、声明式重包）"
+    logger.info(
+        "boundary %s: 注入[%s], region_dispatch=%s → %s",
+        module_fqn, what, rd, effect)
+
+
+def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
+    """Resolve dense TP and routed-expert source meshes for one sharding plan."""
+    ep_size = next(
+        (
+            spec._ep_size  # pylint: disable=protected-access
+            for spec in plan.modules.values()
+            if spec._ep_size > 0  # pylint: disable=protected-access
+        ),
+        0,
+    )
+    if mesh_context is not None:
+        expert_mesh = mesh_context.fsdp_moe_mesh
+    elif ep_size > 0:
+        expert_mesh = _build_expert_mesh(
+            full_mesh,
+            full_mesh.mesh_dim_names,
+            ep_size,
+        )
+    else:
+        expert_mesh = None
+    if ep_size > 0 and expert_mesh is None:
+        raise ValueError("Routed expert plan requires MeshContext.fsdp_moe_mesh")
+    if expert_mesh is not None:
+        logger.info(
+            "expert mesh: using %s for parameter sharding, explicit compute injection, "
+            "and FSDP source metadata",
+            dict(zip(tuple(expert_mesh.mesh_dim_names), tuple(expert_mesh.mesh_shape))),
+        )
+    dense_source_mesh = (
+        mesh_context.fsdp_non_moe_mesh["tp"]
+        if mesh_context is not None and mesh_context.fsdp_non_moe_mesh is not None
+        else tp_mesh
+    )
+    expert_source_mesh = (
+        expert_mesh["ep"]
+        if expert_mesh is not None and "ep" in expert_mesh.mesh_dim_names
+        else None
+    )
+    return expert_mesh, dense_source_mesh, expert_source_mesh
+
+
+def _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode):
+    """Shard dense and expert parameters, then update local attention metadata."""
+    for model in models:
+        for module_fqn, spec in plan.modules.items():
+            module = _resolve_module(model, module_fqn)
+            # Runtime planner metadata is internal to the sharding pipeline.
+            if spec._ep_stack:  # pylint: disable=protected-access
+                _stack_moe_experts(
+                    module,
+                    spec._ep_stack,  # pylint: disable=protected-access
+                )
+            if spec._ep_size > 0:  # pylint: disable=protected-access
+                expert_params = {
+                    name: placement
+                    for name, placement in spec.params.items()
+                    if name.startswith("experts.")
+                }
+                dense_params = {
+                    name: placement
+                    for name, placement in spec.params.items()
+                    if not name.startswith("experts.")
+                }
+                _shard_module_params(
+                    module,
+                    expert_params,
+                    expert_mesh,
+                    expert_mesh.mesh_dim_names,
+                )
+                _shard_module_params(
+                    module,
+                    dense_params,
+                    mesh,
+                    plan.mesh_dim_names,
+                )
+            else:
+                _shard_module_params(
+                    module,
+                    spec.params,
+                    mesh,
+                    plan.mesh_dim_names,
+                )
+            if not validate_mode:
+                maybe_update_head_counts(
+                    module,
+                    spec,
+                    module_fqn,
+                    mesh,
+                    plan.mesh_dim_names,
+                )
+
+
+def _apply_plan_special_handlers(models, plan, mesh):
+    """Run parameter handlers declared by the sharding plan."""
+    for model in models:
+        for param_ref, handler_name in plan.special_handlers.items():
+            handler = SPECIAL_HANDLERS.get(handler_name)
+            if handler is None:
+                logger.warning(
+                    "SPECIAL_HANDLERS has no registered handler: %s",
+                    handler_name,
+                )
+                continue
+            module_fqn, param_name = param_ref.rsplit(".", 1)
+            handler(_resolve_module(model, module_fqn), param_name, mesh)
+
+
+def _build_runtime_tp_grad_info(
+    models,
+    plan,
+    dense_source_mesh,
+    expert_source_mesh,
+    validate_mode,
+):
+    """Unwrap production parameters and build FSDP source-layout metadata."""
+    if validate_mode:
+        return None
+    tp_grad_records = {}
+    for model in models:
+        tp_grad_records.update(_local_params_context(model))
+    if not tp_grad_records:
+        return None
+    if dense_source_mesh is None and expert_source_mesh is None:
+        return None
+    return build_tp_grad_info(
+        plan,
+        dense_source_mesh,
+        expert_source_mesh=expert_source_mesh,
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Main entry (05 §4.1)
+# ────────────────────────────────────────────────────────────────────────────
+
+def apply_sharding_plan(model, plan, mesh, *, validate_mode=False):
+    """Apply a ShardingPlan using a DeviceMesh or MeshContext.
+
+    Returns (model, tp_grad_info):
+    - production: at the Phase C entry, a one-shot `_local_params_context` permanently
+      unwraps DTensor parameters into plain local tensors, and builds tp_grad_info
+      for fully_shard to use. With MeshContext, dense entries reference the
+      dense-FSDP TP child and routed experts reference the expert EP child;
+    - validate: no unwrap (parameters remain DTensors); tp_grad_info is None.
+    """
+    mesh_context = mesh if isinstance(mesh, MeshContext) else None
+    if mesh_context is None:
+        device_mesh = mesh
+    else:
+        device_mesh = mesh_context.device_mesh
+    if device_mesh is None:
+        raise ValueError("apply_sharding_plan requires a DeviceMesh")
+
+    mesh_dim_names = plan.mesh_dim_names
+    # Active sub-mesh: the planner strips size=1 axes (plan.mesh_dim_names), but the
+    # passed-in mesh may still contain those axes -- placements are resolved against
+    # plan.mesh_dim_names, so the dimensionality must align with the mesh, otherwise
+    # distribute_tensor will silently shard along the wrong axis.
+    full_mesh = device_mesh
+    mesh = _get_active_mesh(device_mesh, mesh_dim_names)
+    tp_mesh = _get_tp_submesh(mesh, mesh_dim_names)
+    models = model if isinstance(model, list) else [model]
+
+    # Explicit-injection guard: CP/EP sharding without an explicit compute
+    # injection fails fast here, BEFORE any parameter is touched
+    _preflight_compute_injection(plan, mesh, model=models[0])
+
+    expert_mesh, dense_source_mesh, expert_source_mesh = (
+        _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh)
+    )
+
+    # ====== Phase 0: normalize out_src/out_dst scalar shorthand (idempotent, covers user-injected paths) ======
+    for spec in plan.modules.values():
+        _normalize_out_fields(spec)
+
+    # ====== Phase A: parameter sharding ======
+    _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode)
+
+    # ====== Phase B: special handlers ======
+    _apply_plan_special_handlers(models, plan, mesh)
+
+    # ====== Phase C entry: one-shot unpack at build time (production only) ======
+    tp_grad_info = _build_runtime_tp_grad_info(
+        models,
+        plan,
+        dense_source_mesh,
+        expert_source_mesh,
+        validate_mode,
+    )
+
+    # ====== Phase C: wrap forward ======
+    for part in models:
+        _apply_phase_c(part, plan, mesh, validate_mode, expert_mesh=expert_mesh)
+
+    # ====== Phase D: tied weights ======
+    tied_pairs = list(plan.tied_pairs) or detect_tied_weights(models[0])
+    for part in models:
+        _replicate_tied_weights(part, tied_pairs)
+
+    return model, tp_grad_info
+
+
+def _get_active_mesh(mesh, mesh_dim_names):
+    """Return the active sub-mesh aligned with plan.mesh_dim_names (the dimension set after stripping size=1 axes)."""
+    names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
+    if names == tuple(mesh_dim_names):
+        return mesh
+    if mesh_dim_names and names and all(n in names for n in mesh_dim_names):
+        return mesh[tuple(mesh_dim_names)]
+    return mesh
+
+
+def _get_tp_submesh(mesh, mesh_dim_names):
+    if "tp" not in mesh_dim_names:
+        return None
+    return mesh["tp"]
+
+
+def _get_cp_submesh(mesh, mesh_dim_names):
+    if "cp" not in mesh_dim_names:
+        return None
+    return mesh["cp"]
+
+
+def _get_ep_submesh(mesh, mesh_dim_names):
+    if "ep" not in mesh_dim_names:
+        return None
+    return mesh["ep"]
+
+
+def _expert_mesh_layout(mesh, mesh_dim_names, ep_size):
+    """(shape, dim_names, rank_list) of the derived expert mesh (pure mapping; no process group is created).
+
+    D-10 TP-extend-EP (05 §6.4.8 / 06 §4.5.1): the expert domain = the full
+    dense region (all ranks on the non-pp axes of the mesh, i.e.
+    dp_replicate x dp_cp x tp). After a row-major flatten in mesh axis order,
+    it is re-sliced as (edp = D/ep_size, ep = ep_size):
+    - EP groups (inner, the a2a communication domain): ep_size consecutive
+      ranks in flatten order -- tp is usually the innermost axis, so an EP
+      group first spans the entire TP group and then extends to adjacent
+      dp/cp ranks (isomorphic to MindSpeed TP-extend-EP / Megatron etp=1 with
+      ep spanning TP).
+      Example: mesh (dp=4, tp=2), ep_size=4 -> EP groups {0,1,2,3} / {4,5,6,7};
+    - edp groups (outer): expert data-parallel degree = D/ep_size.
+    Expert weights are only Shard(0) on the ep axis (the expert dim); there is
+    no second-axis sharding.
+    """
+    if "pp" in mesh_dim_names:
+        raise NotImplementedError(
+            "D-10 TP-extend-EP v1 does not yet support the pp axis (call after splitting the mesh by stage)")
+    arr = np.array(mesh.rank_list).reshape(mesh.mesh_shape)
+    domain = int(np.prod(arr.shape))
+    if ep_size <= 0 or domain % ep_size != 0:
+        raise ValueError(
+            f"ep_size ({ep_size}) must divide the dense region ({domain})"
+        )
+    edp = domain // ep_size
+    derived = arr.reshape(edp, ep_size)
+    return (edp, ep_size), ("edp", "ep"), tuple(
+        int(r) for r in derived.flatten())
+
+
+def _build_expert_mesh(mesh, mesh_dim_names, ep_size):
+    """D-10 (05 §6.4.8 / 06 §4.5.1): repartition the full dense region into the derived expert mesh (edp, ep)."""
+    shape, names, rank_list = _expert_mesh_layout(mesh, mesh_dim_names, ep_size)
+    # Propagate the no-backend (metadata-only) mode of the source mesh —
+    # a meta mesh has no _dim_group_names (no process groups were created).
+    return init_device_mesh(mesh.device_type, shape, mesh_dim_names=names,
+                            rank_list=rank_list,
+                            init_backend=hasattr(mesh, "_dim_group_names"))
+
+
+def build_expert_mesh(mesh, ep_size: int):
+    """Public: derive the D-10 TP-extend-EP expert mesh (edp, ep) from *mesh*
+    (the FULL mesh — the dense region must include dp/cp axes).
+
+    Standalone helper for introspection and for custom code that needs the
+    expert domain outside the injection path. Injected factories/wrappers do
+    NOT need to call this: the framework derives the expert mesh once at
+    apply time (shared by parameter sharding and injected compute) and hands
+    it to them as the ``ep_mesh`` context.
+    """
+    return _build_expert_mesh(mesh, tuple(mesh.mesh_dim_names), ep_size)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Phase A: parameter sharding (05 §4.2)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _shard_module_params(module, param_specs, mesh, mesh_dim_names):
+    """distribute_tensor() converts parameters into DTensors.
+
+    - meta tensor -> DTensor: _local_tensor remains meta (zero-memory path);
+    - real tensor -> DTensor: physically split; each rank holds a local shard;
+    - already a DTensor: skipped if the placement matches, otherwise raises
+      PlacementMismatchError.
+    """
+    for param_path, named in param_specs.items():
+        param = _get_attr_by_path(module, param_path)
+        placements = tuple(resolve_placements(named, mesh_dim_names))
+        if not placements:
+            continue  # no active DTensor axes (all size 1) -- no sharding needed
+
+        if isinstance(param, DTensor):
+            if tuple(param.placements) != placements:
+                raise PlacementMismatchError(
+                    f"{type(module).__name__}.{param_path}",
+                    placements, tuple(param.placements), "params",
+                )
+            continue
+
+        src = param.data if hasattr(param, "data") else param
+        dt = distribute_tensor(src, mesh, placements)
+        requires_grad = getattr(param, "requires_grad", True)
+        _set_param_by_path(module, param_path,
+                           nn.Parameter(dt, requires_grad=requires_grad))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Phase C: forward wrapping (05 §4.4)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _install_bias_suppression(module, spec):
+    """D-22: make each defer-listed Linear run bias-free inside the region.
+
+    The bias Parameter itself is never touched (same FQN / same object /
+    state_dict / optimizer unchanged); the wrapper only hides it from
+    ``F.linear`` for the duration of the region forward, so the boundary
+    exit's Partial reduction sees a pure matmul contribution and the bias is
+    added exactly once afterwards by :func:`_maybe_add_deferred_biases`.
+    Both modes install the same wrapper (instruction-for-instruction
+    identity, D-01''); nesting the suppression is idempotent.
+    """
+    for param_path in spec._deferred_bias_params:  # pylint: disable=protected-access
+        owner_path = param_path.rpartition(".")[0]
+        owner = module.get_submodule(owner_path) if owner_path else module
+        original = owner.forward
+
+        @functools.wraps(original)
+        def bias_free_forward(*args, __original=original, __owner=owner,
+                              **kwargs):
+            bias = __owner.bias
+            try:
+                __owner.bias = None   # nn.Module allows None for a registered param
+                return __original(*args, **kwargs)
+            finally:
+                __owner.bias = bias
+
+        owner.forward = bias_free_forward
+
+
+def _add_bias_to_primary_output(output, bias, module_name):
+    """Add a deferred bias to the primary Tensor while preserving output structure."""
+    if isinstance(output, torch.Tensor):
+        primary_output = output
+        rebuild = None
+    elif isinstance(output, (tuple, list)):
+        if not output or not isinstance(output[0], torch.Tensor):
+            primary_type = type(output[0]).__name__ if output else "missing"
+            raise TypeError(
+                f"{module_name}: deferred bias requires output index 0 to be a Tensor, "
+                f"got {primary_type}"
+            )
+        primary_output = output[0]
+        rebuild = list(output)
+    else:
+        raise TypeError(
+            f"{module_name}: deferred bias requires a Tensor, tuple, or list output, "
+            f"got {type(output).__name__}"
+        )
+
+    if not isinstance(primary_output, DTensor) and isinstance(bias, DTensor):
+        bias = bias.to_local()
+    biased_output = primary_output + bias
+    if rebuild is None:
+        return biased_output
+    rebuild[0] = biased_output
+    return tuple(rebuild) if isinstance(output, tuple) else rebuild
+
+
+def _maybe_add_deferred_biases(module, spec, output):
+    """D-22: add each deferred bias exactly once AFTER the boundary exit.
+
+    The bias is read at forward time (never captured in a closure), so
+    production sees the unwrapped local tensor and validate sees the DTensor
+    — whichever form the boundary output currently has: nested validate keeps
+    the DTensor (dispatch add, Shard(1)+Replicate→Shard(1)); the outermost /
+    production / local-region exits are local, and a DTensor bias is
+    unwrapped to match. For structured attention outputs, index 0 is the
+    primary hidden-state Tensor; metadata/cache entries are preserved.
+    """
+    if not spec._deferred_bias_params:  # pylint: disable=protected-access
+        return output
+    for param_path in spec._deferred_bias_params:  # pylint: disable=protected-access
+        owner_path = param_path.rpartition(".")[0]
+        owner = module.get_submodule(owner_path) if owner_path else module
+        bias = owner.bias
+        if bias is None:
+            continue
+        output = _add_bias_to_primary_output(output, bias, type(module).__name__)
+    return output
+
+
+def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
+    """Phase C: wrap forward (production/validate/moe/cp/vocab_embed, five paths).
+
+    D-14 invariant 2 (05 §13.3): boundaries are wrapped in post-order (deepest
+    FQN first) — an outer boundary's local_compute_fn may cache inner forwards,
+    and the unpack-scope exclusion (invariant 3) requires inner wrappers to be
+    installed first.
+    """
+    mesh_dim_names = plan.mesh_dim_names
+    cp_mesh = _get_cp_submesh(mesh, mesh_dim_names)
+    tp_mesh = _get_tp_submesh(mesh, mesh_dim_names)
+    for module_fqn, spec in sorted(
+            plan.modules.items(), key=lambda kv: -kv[0].count(".")):
+        if not spec.is_boundary:
+            continue
+        module = _resolve_module(model, module_fqn)
+        boundary = PrecompiledBoundary(spec, mesh, mesh_dim_names)
+        _bind_input_indices(boundary, module)
+        # 注入纪律：声明注入必须显式 region_dispatch；无注入声明 True 是冗余
+        _require_region_dispatch(spec, source=f"boundary {module_fqn!r}")
+        # 可观察性：注入选择结果即时可见（声明 → 后果 的反馈闭环）
+        _log_injection_choice(module_fqn, spec)
+
+        # Step 0.5 (D-22): rowwise bias defer — install the bias-free region
+        # forward BEFORE inner-wrap/forward wrapping, in BOTH modes (the
+        # in-region computation stays instruction-for-instruction identical).
+        # The bias Parameter itself is untouched; it is added once after the
+        # boundary exit reduction by _maybe_add_deferred_biases.
+        if spec._deferred_bias_params:  # pylint: disable=protected-access
+            _install_bias_suppression(module, spec)
+
+        # Step 1: inner-wrap —— 通用"织入/替换 inner forward"机制
+        # (D-01'': production and validate inject the same wrapper, so the
+        # in-region computation is instruction-for-instruction identical).
+        # NOT gated on cp_mesh since the generalization: the derived gate is
+        # the resolution chain itself (explicit inner_wrapper declaration ->
+        # applied; nothing declared -> None -> no-op). cp_mesh may be None
+        # (no cp axis) — the four shipped CP wrappers self-guard and fail
+        # fast then; custom callables/Targets receive None and own their
+        # semantics.
+        # (_preflight_compute_injection has already failed fast when a CP
+        # attention boundary declares nothing)
+        _wrap_inner_attention(
+            module, cp_mesh, spec=spec, mesh=mesh,
+            mesh_dim_names=mesh_dim_names, tp_mesh=tp_mesh,
+            ep_mesh=expert_mesh,
+        )
+
+        # Step 2: forward wrapping
+        # local region path (D-03'): the gate is derived from the compute_fn
+        # resolution chain (non-None means take the skeleton) — the remaining
+        # sources after the explicit-injection rework are user
+        # local_compute_fn (callable or factory Target) and the
+        # region_dispatch=False gate; the built-in EP auto-injection link
+        # was REMOVED (05 §4.4.3)
+        compute_fn = _resolve_local_compute_fn(
+            module, spec, mesh, mesh_dim_names, expert_mesh)
+        if compute_fn is not None:
+            if validate_mode:
+                # D-17: inside the local region the module sees local
+                # tensors in both modes -- validate rewrites cached head
+                # counts only for local-region modules (boundary modules
+                # keep global counts for DTensor dispatch)
+                maybe_update_head_counts(
+                    module, spec, module_fqn, mesh, mesh_dim_names)
+            # D-14 invariant 3 (05 §13.3): the region's temp-unwrap scope
+            # excludes nested-boundary subtrees — their parameters must stay
+            # DTensors for the inner validate islands (dispatch needs
+            # __torch_function__)
+            nested = _descendant_boundary_fqns(plan, module_fqn)
+            if nested:
+                # E5 (accuracy_fix_plan.md §3): make the nested-boundary call
+                # contract visible at apply time
+                logger.info(
+                    "local-region boundary %s: nested boundaries "
+                    "(communication_owner: nested_boundary): %s — their "
+                    "return values are already in the declared out_dst "
+                    "layout with TP communication sealed inside; the region "
+                    "compute MUST NOT apply compensating collectives "
+                    "(all-reduce/reduce-scatter/all-gather) to them",
+                    module_fqn, nested)
+            _wrap_local_region_forward(
+                module, boundary, spec, mesh, mesh_dim_names,
+                validate_mode=validate_mode, compute_fn=compute_fn,
+                exclude_subtrees=nested)
+        elif validate_mode:
+            _wrap_validate_forward(module, boundary, spec, mesh_dim_names)
+        else:
+            # D-02: production vocab-parallel embedding masked wrapper
+            if _is_vocab_parallel_embed(module, spec, tp_mesh):
+                _wrap_vocab_parallel_embedding(module, tp_mesh)
+            _wrap_production_forward(module, boundary, spec)
+
+
+def _descendant_boundary_fqns(plan, module_fqn):
+    """Relative FQNs of boundaries nested inside *module_fqn* (D-14).
+
+    Returned relative to module_fqn (matching the name space of
+    module.named_parameters(recurse=True)); the root spec (fqn "") treats
+    every other boundary as a descendant.
+    """
+    if module_fqn == "":
+        return [f for f in plan.modules if f]
+    prefix = module_fqn + "."
+    return [f[len(prefix):] for f in plan.modules if f.startswith(prefix)]
+
+
+def _bind_input_indices(boundary, module):
+    """Bind the arg_name of in_plan to the positional index of the forward signature.
+
+    Inter-module calls are mostly positional (self.mlp(x) inside a layer), so
+    RedistOp's kwargs lookup by name would miss -- the signature index is bound
+    at compile time, and at runtime _get_arg checks kwargs first, then args.
+    """
+    try:
+        sig = inspect.signature(module.forward)
+    except (TypeError, ValueError):
+        sig = None
+    if sig is not None:
+        positional = [
+            name for name, p in sig.parameters.items()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        name_to_idx = {name: i for i, name in enumerate(positional)}
+        for op in boundary.in_plan:
+            if op.arg_index is None and op.arg_name in name_to_idx:
+                op.arg_index = name_to_idx[op.arg_name]
+    # Positional fallback: a single-input contract (in_plan has only 1 op) is
+    # bound to the first positional parameter -- covers cases where the
+    # template key (e.g. "hidden_states") differs from the leaf module's
+    # signature (nn.Linear.forward(input)).
+    if len(boundary.in_plan) == 1 and boundary.in_plan[0].arg_index is None:
+        boundary.in_plan[0].arg_index = 0
+
+
+def _wrap_production_forward(module, boundary, spec=None):
+    """Production mode: pure local tensor computation + precompiled boundary communication (05 §4.4.1).
+
+    _local_params_context was already invoked at the Phase C entry (parameters
+    permanently unpacked).
+    """
+    original_forward = module.forward
+
+    @functools.wraps(original_forward)
+    def production_forward(*args, **kwargs):
+        args, kwargs = boundary.redistribute_inputs(args, kwargs)
+        outputs = original_forward(*args, **kwargs)
+        outputs = boundary.redistribute_outputs(outputs)
+        # D-22: deferred rowwise biases — added once after the exit reduction
+        return _maybe_add_deferred_biases(module, spec, outputs) \
+            if spec is not None else outputs
+
+    module.forward = production_forward
+
+
+def _wrap_validate_forward(module, boundary, spec, mesh_dim_names):
+    """Validate mode: DTensor propagation end to end -> validate out_src (core) + out_dst (terminal modules only).
+
+    The in-house DTensor is forward-only: validation covers only forward
+    placement propagation; backward is local autograd in both modes (05 §1.0),
+    and gradient equivalence is guaranteed by testing/grad_equiv.py.
+    """
+    original_forward = module.forward
+    module_name = type(module).__name__
+
+    @functools.wraps(original_forward)
+    def validate_forward(*args, **kwargs):
+        # D-14 nesting (05 §13.4): detect whether the call arrives from an
+        # outer DTensor-propagating boundary BEFORE Step 1 wraps everything
+        # into DTensors (Step 1 would make the check useless).
+        nested = any(isinstance(a, DTensor) for a in args) or any(
+            isinstance(v, DTensor) for v in kwargs.values())
+        # Step 1: inputs -> DTensor
+        args, kwargs = boundary.redistribute_inputs(args, kwargs, as_dtensor=True)
+
+        # Step 2: parameters stay DTensors; placement propagates via __torch_function__ dispatch
+        outputs = original_forward(*args, **kwargs)
+
+        # Step 3: [core validation] out_src -- native DTensor-propagated output vs declaration
+        if spec.out_src is not None:
+            _validate_out_src(outputs, spec, mesh_dim_names, module_name)
+
+        # Step 4: redistribute to out_dst
+        outputs = boundary.redistribute_outputs(outputs, as_dtensor_input=True)
+
+        # Step 5: [defensive validation] out_dst -- terminal modules only
+        if spec._is_terminal and spec.out_dst is not None:  # pylint: disable=protected-access
+            _validate_out_dst(outputs, spec, mesh_dim_names, module_name)
+
+        # D-22: deferred biases are added after the exit reduction while the
+        # output is still a DTensor (Shard/Replicate + Replicate bias dispatch
+        # add — the Partial reduction is already done, so every rank adds the
+        # bias exactly once); Step 6 then unwraps as usual.
+        outputs = _maybe_add_deferred_biases(module, spec, outputs)
+
+        # Step 6: return local (isomorphic to production boundary outputs) --
+        # but under an outer DTensor-propagating boundary (D-14 nesting, 05
+        # §13.4) keep the DTensor so the outer forward's dispatch chain is
+        # unbroken; the outermost boundary exit unwraps.
+        if nested:
+            return outputs
+        if isinstance(outputs, DTensor):
+            outputs = outputs.to_local()
+        elif isinstance(outputs, (tuple, list)):
+            outputs = tuple(
+                t.to_local() if isinstance(t, DTensor) else t for t in outputs
+            )
+        return outputs
+
+    module.forward = validate_forward
+
+
+def _validate_out_src(outputs, spec, mesh_dim_names, module_name):
+    _validate_outputs(outputs, spec, mesh_dim_names, module_name, "out_src")
+
+
+def _validate_out_dst(outputs, spec, mesh_dim_names, module_name):
+    _validate_outputs(outputs, spec, mesh_dim_names, module_name, "out_dst")
+
+
+def _normalize_placements_ndim(placements, ndim):
+    """Normalize negative dims like Shard(-1) against the tensor ndim (Shard(-1) == Shard(ndim-1))."""
+    out = []
+    for p in placements:
+        if isinstance(p, Shard) and p.dim < 0:
+            out.append(Shard(p.dim + ndim))
+        else:
+            out.append(p)
+    return tuple(out)
+
+
+def _validate_outputs(outputs, spec, mesh_dim_names, module_name, stage):
+    """Placement validation for single/multi outputs (shared by out_src / out_dst).
+
+    Multi outputs are mapped to tuple positions via spec.out_names (falling
+    back to declaration key order); outputs that are not returned or are not
+    DTensors are skipped. Declared and actual placements are
+    negative-dim-normalized before comparison.
+    """
+    declared = getattr(spec, stage)
+    if isinstance(outputs, (tuple, list)):
+        out_names = getattr(spec, "out_names", None) or list(declared.keys())
+        name_to_idx = {name: i for i, name in enumerate(out_names)}
+        items = list(outputs)
+    else:
+        name_to_idx = {name: 0 for name in declared}
+        items = [outputs]
+    for out_name, expected_named in declared.items():
+        idx = name_to_idx.get(out_name)
+        if idx is None or idx >= len(items):
+            continue
+        tensor = items[idx]
+        if not isinstance(tensor, DTensor):
+            continue
+        ndim = len(tensor.shape)
+        expected = _normalize_placements_ndim(
+            tuple(resolve_placements(expected_named, mesh_dim_names)), ndim)
+        actual = _normalize_placements_ndim(tuple(tensor.placements), ndim)
+        if expected != actual:
+            suffix = f"[{out_name}]" if len(declared) > 1 else ""
+            raise PlacementMismatchError(
+                module_name, expected, actual, f"{stage}{suffix}"
+            )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Phase C: MoE EP local region (05 §4.4.3 + D-03')
+# ────────────────────────────────────────────────────────────────────────────
+
+def _build_local_compute_factory(factory, module, mesh, mesh_dim_names,
+                                 expert_mesh, *, configured=None, source):
+    """Build a ``@local_compute`` factory into the region compute_fn (apply-time).
+
+    The factory is invoked ONCE with the framework context filled BY NAME per
+    its declared context (``meta.context``): the mesh family ``mesh`` /
+    ``tp_mesh`` / ``cp_mesh`` / ``ep_mesh`` (mandatory declarations; None when
+    the axis is inactive), plus the optional anchor ``module``. Context keys
+    are RESERVED — a user-configured same-name key fails fast
+    (fill_context_kwargs); every fill is logged at INFO. Behavior choices
+    (routing, layouts, ...) are written INTO the factory — config keys carry
+    data only, never functions.
+    The returned compute fn is validated against the module's forward
+    signature (validate_local_compute_signature: params must match the
+    original forward) and bound to *module* by the caller.
+    """
+    meta = require_injection_meta(factory, LOCAL_COMPUTE, source=source)
+    context = {
+        "module": module,
+        "mesh": mesh,
+        "tp_mesh": _get_tp_submesh(mesh, mesh_dim_names),
+        "cp_mesh": _get_cp_submesh(mesh, mesh_dim_names),
+        "ep_mesh": expert_mesh,
+    }
+    build_kwargs = fill_context_kwargs(
+        meta, context, configured or {}, source=source)
+    # {**configured, **context}：与 Target.build 的绑定次序一致（上下文键是
+    # 保留名，fill_context_kwargs 已拒绝 configured 里的同名键）
+    compute_fn = factory(**{**(configured or {}), **build_kwargs})
+    if not callable(compute_fn):
+        raise TypeError(
+            f"{source} returned {type(compute_fn).__name__}, not callable — "
+            "the @local_compute factory must return the region compute fn "
+            "fn(module, *local_args) (e.g. hyper_models.components.distributed."
+            "ep_compute.qwen2moe_ep_compute_fn)")
+    validate_local_compute_signature(
+        compute_fn, module.forward,
+        owner=f"{source!r} on {type(module).__name__}")
+    return compute_fn
+
+
+def _resolve_local_compute_fn(module, spec, mesh, mesh_dim_names,
+                              expert_mesh):
+    """Resolve the compute_fn of the local region (**single resolution chain**, 05 §4.4.3).
+
+    Whether a module takes the local-region skeleton is derived by this chain
+    (a non-None return means it does) -- the gate is not a stored bool but the
+    resolution result. Since the explicit-injection rework the built-in EP
+    auto-injection link is REMOVED; the remaining sources:
+    1. spec.local_compute_fn: a user-defined FACTORY — single form since
+       2026-08-10 (the direct compute-fn form was retired: every injection
+       fn is invoked once at apply time with the mesh family filled by the
+       framework, use-it-or-not being the user's choice — same discipline as
+       @inner_wrapper). Accepted shapes: a ``@local_compute``-decorated
+       factory callable (programmatic direct pass), or a Target wrapping one
+       (config keys / YAML ``_target_`` reference); both are built at apply
+       time by _build_local_compute_factory (e.g. a shipped EP archetype
+       factory such as ep_compute.qwen2moe_ep_compute_fn) — undecorated
+       functions fail fast
+       (injection discipline); the returned compute fn's params are
+       validated against the module's forward (params must match the
+       original function). Declaring it REQUIRES an explicit
+       ``region_dispatch`` (no default — True: dispatchable pure-ops
+       injection, validate dispatches through it and truly validates
+       out_src; False: comm/custom-kernel injection, the skeleton runs it
+       as a black box on local tensors);
+    2. spec.region_dispatch=False without inner_wrapper: the module's own
+       forward cannot dispatch (it IS the data-dependent logic, e.g. an
+       EP-aware in-house MoE with the a2a already inside forward) — the
+       skeleton runs it on local tensors. An explicit inner_wrapper owns the
+       local computation instead and therefore does not select this path;
+    3. none of the above -> None (ordinary module; takes the
+       validate/production path — and an EP-sharded boundary hitting this
+       was already failed fast by _preflight_compute_injection).
+    """
+    custom = getattr(spec, "local_compute_fn", None)
+    if custom is not None:
+        _require_region_dispatch(spec, source="spec.local_compute_fn")
+        if _is_delayed_target(custom):
+            _check_target_config_keys(custom, "local_compute_fn")
+            factory = getattr(custom, "_target_", None)
+            source = (f"local_compute_fn factory "
+                      f"{getattr(custom, '_target_path', custom)}")
+            configured = getattr(custom, "_kwargs", {})
+        else:
+            factory = custom
+            source = "spec.local_compute_fn"
+            configured = None
+        compute_fn = _build_local_compute_factory(
+            factory, module, mesh, mesh_dim_names, expert_mesh,
+            configured=configured, source=source)
+        return functools.partial(compute_fn, module)
+    if spec.region_dispatch is False and spec.inner_wrapper is None:
+        return module.forward
+    return None
+
+
+def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
+    """Wrap every declared local Tensor output with its ``out_src`` layout."""
+    declared = spec.out_src or {}
+    if not declared:
+        return output
+
+    is_sequence = isinstance(output, (tuple, list))
+    items = list(output) if is_sequence else [output]
+    out_names = list(getattr(spec, "out_names", None) or declared.keys())
+    name_to_idx = {name: index for index, name in enumerate(out_names)}
+
+    for out_name, named_placement in declared.items():
+        index = name_to_idx.get(out_name)
+        if index is None:
+            raise ValueError(
+                f"{module_name}: out_src declares output {out_name!r}, but "
+                f"out_names={out_names!r} does not contain it"
+            )
+        if index >= len(items):
+            raise ValueError(
+                f"{module_name}: out_src maps output {out_name!r} to index "
+                f"{index}, but forward returned only {len(items)} output(s)"
+            )
+        item = items[index]
+        if item is None:
+            continue
+        if isinstance(item, DTensor):
+            continue
+        if not isinstance(item, torch.Tensor):
+            raise TypeError(
+                f"{module_name}: declared output {out_name!r} at index "
+                f"{index} must be a Tensor or None, got {type(item).__name__}"
+            )
+        placements = tuple(resolve_placements(named_placement, mesh_dim_names))
+        items[index] = DTensor.from_local(item, mesh, placements)
+
+    if isinstance(output, tuple):
+        return tuple(items)
+    if isinstance(output, list):
+        return items
+    if len(items) != 1:
+        raise ValueError(
+            f"{module_name}: scalar forward output cannot satisfy "
+            f"{len(declared)} declared out_src entries"
+        )
+    return items[0]
+
+
+def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
+                               *, validate_mode=False, compute_fn=None,
+                               exclude_subtrees=()):
+    """Generic local-region forward wrapper (D-03', formerly the _wrap_moe_forward skeleton).
+
+    Structure: boundary entry -> local region -> re-wrap per the declared
+    out_src -> boundary exit. Applies to any module containing data-dependent
+    logic that DTensor dispatch cannot express (e.g. MoE all-to-all) --
+    injected by _apply_phase_c when _resolve_local_compute_fn resolves to
+    non-None (derived gate, 05 §4.4.3).
+
+    production: parameters were permanently unpacked at build time and inputs
+    are local (boundary passthrough); validate: inputs are DTensors ->
+    to_local -> temporarily unwrap parameters -> local computation -> re-wrap
+    the output per the declared out_src via from_local (for data-dependent
+    modules out_src is declarative validation -- the data dependence of
+    all-to-all makes the placement underivable; this is an inherent
+    limitation). Both modes share the same wrapper code (local_region
+    tolerant passthrough semantics).
+
+    compute_fn: the function actually executed inside the region; defaults to
+    the module's own forward. Resolved uniformly by
+    _resolve_local_compute_fn (user local_compute_fn / region_dispatch=False
+    gate), independent of the original forward.
+
+    spec.region_dispatch=True (dispatchable pure-ops injection): validate
+    feeds the DTensors straight into compute_fn — strategy propagation runs
+    THROUGH the injected fn and out_src is TRULY validated (propagated vs
+    declared); production is unchanged (always local passthrough).
+    """
+    original_forward = module.forward
+    if compute_fn is None:
+        compute_fn = original_forward
+
+
+    out_src_placements = None
+    if spec.out_src:
+        out_src_named = next(iter(spec.out_src.values()))
+        out_src_placements = tuple(resolve_placements(out_src_named, mesh_dim_names))
+
+    dispatch_through = bool(getattr(spec, "region_dispatch", None))
+
+    @functools.wraps(original_forward)
+    def local_region_forward(*args, **kwargs):
+        # Step 1: PrecompiledBoundary entry (e.g. TP all-gather; identity passthrough)
+        args, kwargs = boundary.redistribute_inputs(
+            args, kwargs, as_dtensor=validate_mode)
+
+        # Step 2: local region -- the data-dependent computation (e.g. EP
+        # dispatch/combine) executes on local tensors; region_dispatch=True
+        # instead dispatches THROUGH the injected fn (pure standard ops) so
+        # validate's strategy propagation covers it
+        if validate_mode and dispatch_through:
+            try:
+                output = compute_fn(*args, **kwargs)
+            except Exception as exc:
+                raise type(exc)(
+                    f"{exc}\n[region_dispatch=True] validate 穿透注入函数时"
+                    " dispatch 失败——注入物含不可 dispatch 的通信原语/自定义"
+                    " kernel？请改声明 region_dispatch=False（骨架黑盒托管）"
+                ) from exc
+            # 真校验：传播结果 vs out_src 声明（声明错即 fail-fast）
+            if spec.out_src is not None:
+                _validate_out_src(output, spec, mesh_dim_names,
+                                  type(module).__name__)
+        elif validate_mode:
+            local_args = tuple(
+                a.to_local() if isinstance(a, DTensor) else a for a in args)
+            local_kwargs = {
+                k: (v.to_local() if isinstance(v, DTensor) else v)
+                for k, v in kwargs.items()
+            }
+            with _temp_local_params(module, exclude=exclude_subtrees):
+                output = compute_fn(*local_args, **local_kwargs)
+        else:
+            output = compute_fn(*args, **kwargs)
+
+        # Step 3: local -> DTensor (re-wrap per the declared out_src, restoring
+        # the DTensor metadata broken by all-to-all; under production the
+        # boundary exit needs the same contract)
+        if not isinstance(output, DTensor):
+            output = _rewrap_local_outputs(
+                output, spec, mesh, mesh_dim_names, type(module).__name__)
+
+        # Step 4: PrecompiledBoundary exit (e.g. TP reduce-scatter)
+        output = boundary.redistribute_outputs(
+            output, as_dtensor_input=validate_mode)
+        # The final boundary exit is always local (when out_plan is empty, the
+        # from_local wrap from Step 3 must also be unwrapped here)
+        if isinstance(output, DTensor):
+            output = output.to_local()
+        # D-22: deferred rowwise biases — added once after the exit reduction
+        return _maybe_add_deferred_biases(module, spec, output)
+
+    module.forward = local_region_forward
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Phase C: CP inner attention wrapper (05 §4.4.2 + D-01'' + D-04)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _resolve_inner_target(module, spec=None):
+    """Resolve the inner-wrap target -- pure location resolution.
+
+    ``inner_target`` is MANDATORY when ``inner_wrapper`` is declared (the
+    pairing is enforced in _resolve_inner_wrapper before this is called):
+    "self" means the boundary module itself, otherwise resolved by attribute
+    name -- fail-fast if the attribute does not exist or has no forward (a
+    typo must not silently degrade). The attention-domain auto-location
+    heuristic (inner_attention/attn/attention attributes, class-name
+    matching, q/k/v_proj structural fallback) was REMOVED (2026-08-10): the
+    inner-wrap mechanism is generic (any module, any submodule), and a
+    silently located target is a silent wrong-target hazard.
+    """
+    explicit = getattr(spec, "inner_target", None) if spec is not None else None
+    if explicit is None:
+        raise ValueError(
+            "inner_target 未声明——声明 inner_wrapper 时必须成对显式声明 "
+            "inner_target（\"self\" 或子模块属性名；自动定位启发式已删除）")
+    if explicit == "self":
+        return module
+    inner = getattr(module, explicit, None)
+    if inner is not None and hasattr(inner, "forward"):
+        return inner
+    raise ValueError(
+        f"spec.inner_target={explicit!r} did not match anything on "
+        f"{type(module).__name__} (attribute missing or has no forward) "
+        f"-- check the spelling in plan_overrides")
+
+
+def _apply_custom_inner_wrapper(custom_fn, context):
+    """Apply a user-defined inner_wrapper (@inner_wrapper callable).
+
+    Contract: custom_fn must be decorated ``@inner_wrapper``; it is invoked
+    with its declared context (anchor target_module + the mandatory mesh
+    family, filled by name) and replaces target.forward in place. The
+    replacement forward runs in a LOCAL-TENSOR world — the dual-mode
+    adapter installed by _wrap_inner_attention owns all DTensor
+    conversion (to_local / _temp_local_params / from_local rewrap per the
+    declared placements), so custom wrappers never touch DTensor.
+    """
+    meta = require_injection_meta(
+        custom_fn, INNER_WRAPPER, source="spec.inner_wrapper")
+    custom_fn(**{k: context[k] for k in sorted(meta.context)})
+
+
+def _find_dtensor_argument(args, kwargs):
+    """Return the first DTensor positional or keyword argument."""
+    return next(
+        (
+            value
+            for value in (*args, *kwargs.values())
+            if isinstance(value, DTensor)
+        ),
+        None,
+    )
+
+
+def _validate_inner_dispatch_output(
+    output,
+    expected_placements,
+    boundary_module,
+    wrapper_name,
+):
+    """Validate DTensor outputs produced through a dispatchable inner wrapper."""
+    if expected_placements is None:
+        return
+    outputs = list(output) if isinstance(output, (tuple, list)) else [output]
+    if len(outputs) != len(expected_placements):
+        raise RuntimeError(
+            f"inner_wrapper {wrapper_name!r}: 输出数量 {len(outputs)} 与声明的 "
+            f"{len(expected_placements)} 个 placement 不符——多输出契约必须逐名"
+            "声明且数量一致"
+        )
+    for tensor, placements in zip(outputs, expected_placements):
+        if not isinstance(tensor, DTensor):
+            raise RuntimeError(
+                f"inner_wrapper {wrapper_name!r} [region_dispatch=True]: "
+                f"穿透传播的输出不是 DTensor（{type(tensor).__name__}）——注入物"
+                "疑似脱离 dispatch 链，无法完成真校验"
+            )
+        if tuple(tensor.placements) != tuple(placements):
+            raise PlacementMismatchError(
+                f"{type(boundary_module).__name__} "
+                f"(inner_wrapper {wrapper_name!r})",
+                tuple(placements),
+                tuple(tensor.placements),
+                "inner_out_src",
+            )
+
+
+def _rewrap_inner_tensor(tensor, placements, mesh):
+    """Wrap one local tensor with its declared layout and pass other values through."""
+    if not isinstance(tensor, torch.Tensor) or isinstance(tensor, DTensor):
+        return tensor
+    return DTensor.from_local(tensor, mesh, placements)
+
+
+def _rewrap_inner_outputs(output, out_placements, mesh, wrapper_name):
+    """Rewrap one or multiple local outputs using explicit placements."""
+    if not isinstance(output, (tuple, list)):
+        return _rewrap_inner_tensor(output, out_placements[0], mesh)
+    if len(output) != len(out_placements):
+        raise RuntimeError(
+            f"inner_wrapper {wrapper_name!r}: 替换 forward 返回了 {len(output)} "
+            f"个输出，与声明的 {len(out_placements)} 个 placement 不符——多输出"
+            "契约必须逐名声明且数量一致"
+        )
+    return tuple(
+        _rewrap_inner_tensor(tensor, placements, mesh)
+        for tensor, placements in zip(output, out_placements)
+    )
+
+
+def _resolve_inner_output_placements(
+    spec,
+    boundary_module,
+    target,
+    mesh_dim_names,
+    wrapper_name,
+):
+    """Resolve the declared placement rule for an injected inner forward."""
+    if target is boundary_module:
+        if spec is None or not spec.out_src:
+            return False, None
+        out_names = list(spec.out_names or spec.out_src.keys())
+        missing = [name for name in out_names if name not in spec.out_src]
+        if missing:
+            raise ValueError(
+                f"inner_wrapper {wrapper_name!r}: out_names {missing} 在 "
+                "out_src 中无声明——多输出契约必须逐名声明"
+            )
+        return False, [
+            tuple(resolve_placements(spec.out_src[name], mesh_dim_names))
+            for name in out_names
+        ]
+
+    declared = getattr(spec, "inner_out_src", None) if spec is not None else None
+    if declared is None:
+        raise ValueError(
+            f"inner_wrapper {wrapper_name!r} 作用于 "
+            f"{type(boundary_module).__name__} 的 inner 子模块，但未声明 "
+            "inner_out_src——框架对 inner 输出布局零推导零猜测。请二选一："
+            "① layout-preserving wrapper 配置 inner_out_src: \"first_input\"；"
+            "② 显式声明 placement；③ 或用 inner_target=\"self\" 复用边界 "
+            "out_src 契约"
+        )
+    if isinstance(declared, str):
+        if declared != "first_input":
+            raise ValueError(
+                "inner_out_src 的字符串值只接受哨兵 'first_input'，"
+                f"got {declared!r}"
+            )
+        return True, None
+    if all(isinstance(value, Placement) for value in declared.values()):
+        return False, [tuple(resolve_placements(declared, mesh_dim_names))]
+    return False, [
+        tuple(resolve_placements(named, mesh_dim_names))
+        for named in declared.values()
+    ]
+
+
+def _install_inner_adapter(target, user_fwd, boundary_module, spec, mesh,
+                           mesh_dim_names, wrapper_name):
+    """统一双模适配器：安装期解析重包规则，运行期零决策（05 §4.4.2 + D-01''）。
+
+    用户 wrapper 的替换 forward 只面向 local 张量。适配器负责：
+    - validate（任一入参是 DTensor）：所有 DTensor 入参 to_local（非张量透
+      传）+ ``_temp_local_params(target)`` 临时解包参数 → 调用用户
+      forward → 按声明重包回 DTensor（传播链接回，边界校验继续）；
+    - production（无 DTensor 入参）：直通，零转换开销。
+
+    重包 placements 来源（框架零推导零猜测，全部显式声明）：
+    - 情形 A（target 是边界模块自身）：边界 ``spec.out_src`` 声明（多输出
+      按 ``out_names``/声明键序逐位置）；
+    - 情形 B（inner 子模块）：``spec.inner_out_src`` 显式声明——哨兵
+      ``"first_input"``（输出布局 == 首个 DTensor 入参的运行时布局，
+      layout-preserving wrapper 用，仅单输出合法）或 NamedPlacement /
+      {name: NamedPlacement}（多输出按声明键序对 tuple 位置）；
+      未声明 → 安装时 fail-fast。
+    """
+    first_input_rule, out_placements = _resolve_inner_output_placements(
+        spec,
+        boundary_module,
+        target,
+        mesh_dim_names,
+        wrapper_name,
+    )
+
+    @functools.wraps(user_fwd)
+    def adapted(*args, **kwargs):
+        source_dtensor = _find_dtensor_argument(args, kwargs)
+        if source_dtensor is None:
+            return user_fwd(*args, **kwargs)          # production：直通
+        if getattr(spec, "region_dispatch", None):
+            # validate 穿透（region_dispatch=True）：注入物是纯标准算子——
+            # DTensor 直入，dispatch 传播穿透 inner 区域；声明的重包规则
+            # 升级为真校验基准（传播结果 vs 声明，不符即 fail-fast）
+            try:
+                out = user_fwd(*args, **kwargs)
+            except Exception as exc:
+                raise type(exc)(
+                    f"{exc}\n[region_dispatch=True] validate 穿透 inner_wrapper "
+                    f"{wrapper_name!r} 时 dispatch 失败——注入物含不可 "
+                    "dispatch 的通信原语/自定义 kernel？请改声明 "
+                    "region_dispatch=False（适配器黑盒托管）") from exc
+            expected = (
+                [tuple(source_dtensor.placements)]
+                if first_input_rule
+                else out_placements
+            )
+            _validate_inner_dispatch_output(
+                out,
+                expected,
+                boundary_module,
+                wrapper_name,
+            )
+            return out
+        # validate：统一转 local（参数临时解包，退出恢复）
+        local_args = tuple(
+            a.to_local() if isinstance(a, DTensor) else a for a in args)
+        local_kwargs = {k: (v.to_local() if isinstance(v, DTensor) else v)
+                        for k, v in kwargs.items()}
+        with _temp_local_params(target):
+            out = user_fwd(*local_args, **local_kwargs)
+
+        if first_input_rule:
+            if isinstance(out, (tuple, list)):
+                raise RuntimeError(
+                    f"inner_wrapper {wrapper_name!r}: inner_out_src="
+                    "'first_input' 仅支持单输出——多输出请显式声明 "
+                    "inner_out_src 的 {name: {axis: placement}} 形态")
+            return _rewrap_inner_tensor(
+                out,
+                tuple(source_dtensor.placements),
+                source_dtensor.device_mesh,
+            )
+        if out_placements is None:
+            return out                   # 情形 A 且无 out_src 声明：不重包
+        return _rewrap_inner_outputs(out, out_placements, mesh, wrapper_name)
+
+    target.forward = adapted
+
+
+def _resolve_inner_wrapper(module, spec, cp_mesh, mesh, tp_mesh=None,
+                           ep_mesh=None):
+    """Resolve one explicit inner-wrapper declaration without mutating modules.
+
+    Resolution accepts a delayed Target, a decorated callable, or a registry
+    name and returns ``(name, target, apply_fn)``. ``inner_target`` and
+    ``inner_wrapper`` must be declared together; absent declarations return
+    ``None``. The mesh family is framework-filled for every wrapper.
+    """
+    custom = getattr(spec, "inner_wrapper", None) if spec is not None else None
+    inner_target = getattr(spec, "inner_target", None) if spec is not None else None
+    if custom is None:
+        if inner_target is not None:
+            raise ValueError(
+                f"spec.inner_target={inner_target!r} 只是定位（replace whom）——"
+                "改造后不再启发式选择包装方案，必须同时显式声明 "
+                f"inner_wrapper：注册表名 {sorted(INNER_WRAPPER_REGISTRY)}、"
+                "@inner_wrapper 装饰的 callable，或指向仓内参考实现的 "
+                "Target（hyper_models.components.distributed.cp_wrappers.*）")
+        return None
+
+    _require_region_dispatch(spec, source="spec.inner_wrapper")
+    if inner_target is None:
+        raise ValueError(
+            f"声明了 inner_wrapper={custom!r} 但未显式声明 inner_target——"
+            "attention 域自动定位启发式已删除（inner-wrap 是通用机制，静默"
+            "定位有包错目标风险）。两字段必须成对显式声明：包装边界模块自身 "
+            "→ inner_target=\"self\"；包装子模块 → inner_target=\"<属性名>\"")
+    target = _resolve_inner_target(module, spec)
+    context = {
+        "target_module": target,
+        "mesh": mesh,
+        "tp_mesh": tp_mesh,
+        "cp_mesh": cp_mesh,
+        "ep_mesh": ep_mesh,
+    }
+    if _is_delayed_target(custom):
+        fn = getattr(custom, "_target_", None)
+        source = (f"inner_wrapper Target "
+                  f"{getattr(custom, '_target_path', custom)}")
+        meta = require_injection_meta(fn, INNER_WRAPPER, source=source)
+        _check_target_config_keys(custom, "inner_wrapper")
+
+        def _apply_target():
+            build_kwargs = fill_context_kwargs(
+                meta, context, getattr(custom, "_kwargs", {}), source=source)
+            result = custom.build(**build_kwargs)
+            if result is None:
+                return   # in-place forward replacement (registry-style fn)
+            if callable(result):
+                _apply_custom_inner_wrapper(result, context)
+                return
+            raise TypeError(
+                f"inner_wrapper Target "
+                f"{getattr(custom, '_target_path', custom)!r} returned "
+                f"{type(result).__name__} — expected None (in-place forward "
+                "replacement) or an @inner_wrapper decorated callable")
+
+        name = getattr(custom, "_target_path", None) or "custom"
+        return (name, target, _apply_target)
+
+    if callable(custom):
+        require_injection_meta(
+            custom, INNER_WRAPPER, source="spec.inner_wrapper")
+        return ("custom", target,
+                lambda: _apply_custom_inner_wrapper(custom, context))
+
+    if isinstance(custom, str):
+        fn = INNER_WRAPPER_REGISTRY.get(custom)
+        if fn is None:
+            raise ValueError(
+                f"inner_wrapper={custom!r} is not registered in "
+                f"INNER_WRAPPER_REGISTRY (available: {sorted(INNER_WRAPPER_REGISTRY)})"
+                f" -- check the spelling, or first register "
+                f"INNER_WRAPPER_REGISTRY[{custom!r}] = your_fn")
+        meta = require_injection_meta(
+            fn, INNER_WRAPPER, source=f"INNER_WRAPPER_REGISTRY[{custom!r}]")
+        context["target_module"] = target
+        return (custom, target,
+                lambda: fn(**{k: context[k] for k in sorted(meta.context)}))
+
+    raise TypeError(
+        f"inner_wrapper must be a registry name (str), an @inner_wrapper "
+        f"decorated callable, or a Target — got {type(custom).__name__}")
+
+
+def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
+                          mesh_dim_names=(), tp_mesh=None, ep_mesh=None):
+    """Inject an inner forward wrapper (one-shot replacement at apply time, 05 §4.4.2).
+
+    General "weave into / replace the inner forward" mechanism — **not gated
+    on CP**: whenever ``spec.inner_wrapper`` is declared the wrapper is
+    applied (declaration == application; the resolution chain is the derived
+    gate). The shipped CP wrappers (INNER_WRAPPER_REGISTRY) are its first-class
+    built-in use case and still require an active cp axis (fail-fast in the
+    resolution chain otherwise); custom callables/Targets receive
+    ``cp_mesh=None`` when no cp axis exists and own their semantics.
+
+    Resolution (_resolve_inner_wrapper, a pure function of the chain) is
+    separated from application; when resolution returns None (no explicit
+    declaration), this returns None and injects nothing. Returns the resolved
+    wrapper name (or None).
+
+    D-01'': production and validate inject **the same** wrapper, so the
+    in-region computation is instruction-for-instruction identical
+    (kernel-level equivalence).
+    D-04: when is_causal and CP is active, replace it with an offset-aware
+    explicit mask.
+    Nothing is located silently: after injection an INFO log records the
+    target/wrapper/source, and spec._resolved_inner_wrapper +
+    spec._resolved_inner_target are written back for plan introspection.
+    """
+    resolved = _resolve_inner_wrapper(
+        module, spec, cp_mesh, mesh, tp_mesh=tp_mesh, ep_mesh=ep_mesh)
+    if resolved is None:
+        return None
+    name, target, apply_fn = resolved
+    orig_forward = target.forward
+    apply_fn()
+    # 检测"真的发生了替换"：绑定方法每次取属性都是新对象，`is` 比较恒为
+    # 真——必须比较底层函数对象（__func__），否则纯探针 wrapper（不替换
+    # forward）也会被误装适配器、被强求 inner_out_src 声明
+    new_forward = target.forward
+    replaced = (getattr(new_forward, "__func__", new_forward)
+                is not getattr(orig_forward, "__func__", orig_forward))
+    if replaced:
+        # 原则 1：替换后的 forward 必须能接收原 forward 的全部入参
+        validate_wrapped_forward(
+            orig_forward, new_forward,
+            owner=f"inner_wrapper {name!r} on {type(module).__name__}")
+        # 统一安装双模适配器：用户 wrapper 只面向 local 张量，DTensor
+        # 转换与声明式重包由适配器托管（local_map 语义；validate 对
+        # inner 区域跳过传播校验，安全网在边界层）
+        _install_inner_adapter(
+            target, new_forward, module, spec, mesh, mesh_dim_names, name)
+    target_name = _inner_target_name(module, target)
+    if spec is not None:
+        spec._resolved_inner_wrapper = name  # pylint: disable=protected-access
+        spec._resolved_inner_target = target_name  # pylint: disable=protected-access
+    if name == "custom":
+        source = "custom callable"
+    elif spec is not None and isinstance(
+            getattr(spec, "inner_wrapper", None), str):
+        source = "explicitly specified (registry)"
+    else:
+        source = "explicitly specified (Target)"
+    logger.info("inner-wrap: %s target=%s <- wrapper %r (%s)",
+                type(module).__name__, target_name, name, source)
+    return name
+
+
+def _inner_target_name(attn_module, target) -> str:
+    """Readable name of the located inner-wrap target: child attribute name,
+    or "self" when the boundary module itself is the target."""
+    if target is attn_module:
+        return "self"
+    for child_name, child in attn_module.named_children():
+        if child is target:
+            return child_name
+    return type(target).__name__
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Phase C: D-02 vocab-parallel embedding wrapper
+# ────────────────────────────────────────────────────────────────────────────
+
+def _is_vocab_parallel_embed(module, spec, tp_mesh) -> bool:
+    """production embed boundary check: nn.Embedding + weight Shard(0) on TP + TP>1."""
+    if tp_mesh is None or tp_mesh.size() <= 1:
+        return False
+    if not isinstance(module, nn.Embedding):
+        return False
+    weight_named = spec.params.get("weight", {})
+    return weight_named.get("tp") == Shard(0)
+
+
+def _wrap_vocab_parallel_embedding(module, tp_mesh):
+    """D-02: Megatron-style masked embedding (injected at the production embed boundary).
+
+    The vocab-range mask logic of DTensor dispatch is lost after the
+    parameter unwrap -- HF native F.embedding would index out of range when
+    given global token ids. The wrapper: tokens outside the local vocab
+    interval [lo, hi) are zeroed and indices are shifted by the offset, so the
+    output is naturally a Partial contribution and the boundary exit's
+    Partial->Shard(1) reduction is unchanged.
+    """
+    original_forward = module.forward
+    v_local = module.weight.shape[0]
+    lo = tp_mesh.get_local_rank() * v_local
+    hi = lo + v_local
+
+    @functools.wraps(original_forward)
+    def masked_embedding_forward(input_ids, *args, **kwargs):
+        mask = (input_ids >= lo) & (input_ids < hi)
+        local_ids = torch.where(mask, input_ids - lo, torch.zeros_like(input_ids))
+        out = original_forward(local_ids, *args, **kwargs)
+        return out * mask.unsqueeze(-1).to(out.dtype)
+
+    module.forward = masked_embedding_forward
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Phase D: tied weights
+# ────────────────────────────────────────────────────────────────────────────
+
+def detect_tied_weights(model):
+    """Detect tied-weight pairs (embed_tokens.weight <-> lm_head.weight).
+
+    In PP scenarios cross-stage pairs cannot be detected; the user must
+    explicitly declare plan.tied_pairs.
+    """
+    tied = []
+    if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+        embed_fqn = lm_head_fqn = None
+        # remove_duplicate=False: under the default dedup of named_parameters
+        # a tied parameter appears only once; duplicates must be explicitly
+        # retained to discover the FQNs of both ends.
+        for name, _ in model.named_parameters(remove_duplicate=False):
+            if name.endswith("embed_tokens.weight"):
+                embed_fqn = name
+            elif name.endswith("lm_head.weight"):
+                lm_head_fqn = name
+        if embed_fqn and lm_head_fqn:
+            tied.append((embed_fqn, lm_head_fqn))
+    return tied
+
+
+def _broadcast_tied_param(model, tied_pair):
+    """A tied-weight pair shares storage within this rank (end A's storage is authoritative; end B shares it).
+
+    Cross-rank broadcast would be **wrong**: a tied pair (embed/lm_head) is
+    usually Shard(0)-sharded on both ends, and each rank's local shard carries
+    a different vocab interval -- broadcasting rank0's shard to rank1 would
+    corrupt rank1's sharding. Tied semantics require that **within the same
+    rank** the two ends are the same physical parameter (shared gradients),
+    not cross-rank consistency (sharding is naturally consistent: same global
+    source, same placement).
+    """
+    fqn_a, fqn_b = tied_pair
+    try:
+        param_a = _get_attr_by_path(model, fqn_a)
+        param_b = _get_attr_by_path(model, fqn_b)
+    except AttributeError:
+        return
+    if param_a is None or param_b is None:
+        return
+    tensor_a = param_a.to_local() if isinstance(param_a, DTensor) else param_a.data
+    # B shares storage with A (a tied weight is the same physical parameter)
+    if isinstance(param_b, DTensor):
+        param_b._local_tensor = tensor_a  # pylint: disable=protected-access
+    else:
+        param_b.data = tensor_a
+
+
+def _replicate_tied_weights(model, tied_pairs=None):
+    """Phase D: replicate tied weights across ranks."""
+    for tied_pair in (tied_pairs if tied_pairs is not None
+                      else detect_tied_weights(model)):
+        _broadcast_tied_param(model, tied_pair)

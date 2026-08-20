@@ -16,18 +16,30 @@
 import functools
 import logging
 import os
+import random
 import subprocess
 import time
 from copy import deepcopy
-from typing import Any, Mapping, Optional
+from dataclasses import dataclass
+from typing import Any, Iterator, Mapping, Optional
+
+from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
+
 from rl.algorithm.loss import build_algorithm
 from rl.config import (
-    build_base_config,
     build_model_registration,
+    build_runtime_config,
     required_mapping,
     uses_colocated_vllm,
     validate_config,
+)
+from rl.consistency import (
+    CONSISTENCY_PROFILE_OFF,
+    configure_consistency_profile,
+    install_trainer_consistency_profile,
+    validate_consistency_forward_inputs,
+    validate_pre_update_consistency,
 )
 from rl.dataset.batch_builder import ExperiencePreparer
 from rl.dataset.contracts import ExperienceBatch
@@ -39,7 +51,11 @@ from rl.dataset.data_source import (
 from rl.evaluation import Evaluator
 from rl.roles.policy.actor import Actor
 from rl.roles.policy.critic import Critic
-from rl.roles.policy.value import attach_value_head
+from rl.roles.model import (
+    build_role_model,
+    build_role_optimizer,
+    iter_hsdp_roots,
+)
 from rl.roles.rollout.registry import build_rollout_engine
 from rl.roles.rollout.worker import RolloutManager
 from rl.roles.weight_sync.checkpoint import RLCheckpointManager
@@ -51,11 +67,86 @@ from rl.utils.monitoring.metrics import (
     summarize_training_diagnostics,
 )
 from rl.utils.monitoring.tracker import TrainingTracker
-from hyper_parallel import HSDPModule, destroy_process_group, get_platform, hsdp_sync_stream
-from hyper_parallel.trainer.base import BaseTrainer
-from hyper_parallel.trainer.utils.discovery import discover_model_spec
+
+from hyper_models.components.distributed.infrastructure import (
+    create_distributed_setup_from_config,
+    destroy_process_group,
+    initialize_distributed,
+)
+from hyper_parallel import get_platform, hsdp_sync_stream
+from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
+
 platform = get_platform()
 logger = logging.getLogger(__name__)
+
+
+def _resolve_eos_token_ids(model: Any, tokenizer: Any) -> tuple[int, ...]:
+    """Return every model EOS ID with the tokenizer EOS as a fallback."""
+    generation_config = getattr(model, "generation_config", None)
+    configured_ids = getattr(generation_config, "eos_token_id", None)
+    if configured_ids is None:
+        candidates = []
+    elif isinstance(configured_ids, (list, tuple)):
+        candidates = [int(token_id) for token_id in configured_ids]
+    else:
+        candidates = [int(configured_ids)]
+    tokenizer_eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer_eos_token_id is not None:
+        candidates.append(int(tokenizer_eos_token_id))
+    normalized_ids = tuple(dict.fromkeys(candidates))
+    if not normalized_ids:
+        raise ValueError("Model or tokenizer must define at least one EOS token ID")
+    return normalized_ids
+
+
+@dataclass
+class RLTrainerState:
+    """Mutable state owned by the synchronous RL orchestration loop."""
+
+    max_steps: int
+    global_step: int = 0
+    epoch: int = 0
+    consumed_samples: int = 0
+    consumed_tokens: int = 0
+
+
+class _DistributedPromptSampler:
+    """Deterministically shard prompt indices across data-parallel ranks."""
+
+    def __init__(
+        self,
+        dataset_size: int,
+        *,
+        rank: int,
+        world_size: int,
+        seed: int,
+        shuffle: bool,
+    ) -> None:
+        """Store deterministic rank-local sampling parameters."""
+        self.dataset_size = dataset_size
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+
+    def __iter__(self) -> Iterator[int]:
+        """Yield this rank's deterministic, equally sized index shard."""
+        indices = list(range(self.dataset_size))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(indices)
+        usable_size = self.dataset_size - self.dataset_size % self.world_size
+        return iter(indices[:usable_size][self.rank::self.world_size])
+
+    def __len__(self) -> int:
+        """Return the number of complete samples owned by this rank."""
+        return self.dataset_size // self.world_size
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select the deterministic shuffle order for one data epoch."""
+        self.epoch = int(epoch)
+
+
 def _iter_state_tensors(value: Any):
     """Yield tensors recursively from one optimizer state value."""
     if platform.is_tensor(value):
@@ -66,8 +157,8 @@ def _iter_state_tensors(value: Any):
     elif isinstance(value, (list, tuple)):
         for item in value:
             yield from _iter_state_tensors(item)
-class SyncTrainer(BaseTrainer):
-    """Minimal RL trainer extending Hyper-Parallel's model/FSDP skeleton.
+class SyncTrainer:
+    """Synchronous RL orchestrator composed from HyperModels role runtimes.
 
     Args:
         resolved_config: Fully merged Hyper-RL YAML configuration.
@@ -75,25 +166,50 @@ class SyncTrainer(BaseTrainer):
     def __init__(self, resolved_config: Mapping[str, Any]) -> None:
         """Validate configuration and build the complete distributed runtime."""
         self.resolved_config = deepcopy(dict(resolved_config))
+        self._consistency_profile = configure_consistency_profile(self.resolved_config)
         self.algorithm = build_algorithm(
             required_mapping(self.resolved_config, "algorithm")
         )
         validate_config(self.resolved_config, self.algorithm)
+        install_trainer_consistency_profile(self.resolved_config)
         self.model_registration = build_model_registration(self.resolved_config)
-        self._defer_checkpoint_errors = True
-        base_config = build_base_config(self.resolved_config)
-        discover_model_spec(base_config.model.name)
-        super().__init__(base_config)
+        self.runtime_config = build_runtime_config(self.resolved_config)
+        self.state = RLTrainerState(max_steps=self.runtime_config.training.train_iters)
         self._runtime_started = False
         self._tracker: Optional[TrainingTracker] = None
         try:
-            self._setup()
-            self._runtime_started = True
+            self._setup_runtime()
             self._validate_runtime_topology()
             self._build_runtime()
         except Exception:
             self._cleanup_distributed()
             raise
+
+    def _setup_runtime(self) -> None:
+        """Initialize one process group, device, mesh, and seed for every role."""
+        initialize_distributed(self.runtime_config.training.backend)
+        self._runtime_started = True
+        self.distributed_setup = create_distributed_setup_from_config(
+            self.runtime_config
+        )
+        self.parallel_dims = self.distributed_setup.mesh_context
+        self.mesh = self.parallel_dims.device_mesh
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.device = platform.device(local_rank)
+        self.device_handle = platform.get_device_handle(platform.device_type())
+        self.device_handle.set_device(local_rank)
+        dp_mesh = self.parallel_dims.dp_cp_mesh
+        dp_group = None
+        if dp_mesh is not None and self.parallel_dims.dp_size > 1:
+            dp_group = dp_mesh.get_group()
+        self._dp_group_info = GroupInfo(
+            group_name="rl_dp",
+            group=dp_group,
+            rank_size=self.parallel_dims.dp_size,
+        )
+        seed = int(self.runtime_config.training.seed)
+        random.seed(seed)
+        platform.manual_seed(seed)
     def train(self) -> None:
         """Run synchronous rollout, learning, publication, and checkpointing."""
         completed = False
@@ -163,10 +279,35 @@ class SyncTrainer(BaseTrainer):
         """Run required role inference and build immutable training targets."""
         requirements = self.algorithm.requirements.data
         actor_log_probs = None
-        if collect_diagnostics:
+        consistency_gate_enabled = self._consistency_profile != CONSISTENCY_PROFILE_OFF
+        if consistency_gate_enabled:
+            validate_consistency_forward_inputs(
+                rollout,
+                group=self._dp_group_info.group,
+                group_size=self.parallel_dims.dp_size,
+                operation="pre-update",
+            )
+        if collect_diagnostics or consistency_gate_enabled:
             stage_started = time.perf_counter()
-            actor_log_probs = self.actor.compute_log_probs(rollout)
+            actor_log_probs = self._run_rank_synchronized(
+                "pre-update Actor log-probabilities",
+                lambda: self.actor.compute_log_probs(rollout),
+            )
+            if actor_log_probs is None:
+                raise RuntimeError(
+                    "Pre-update Actor log-probability computation failed without a synchronized error"
+                )
             timings["old_log_prob"] = time.perf_counter() - stage_started
+        consistency_metrics = {}
+        if consistency_gate_enabled:
+            consistency_metrics = validate_pre_update_consistency(
+                rollout,
+                actor_log_probs,
+                expected_policy_version=self.state.global_step,
+                expected_policy_fingerprint=self.rollout_engine.policy_fingerprint,
+                group=self._dp_group_info.group,
+                group_size=self.parallel_dims.dp_size,
+            )
         reference_log_probs = None
         if requirements.reference_log_probs:
             if self.reference_actor is None:
@@ -195,6 +336,7 @@ class SyncTrainer(BaseTrainer):
             if actor_log_probs is None
             else summarize_training_diagnostics(experience, actor_log_probs)
         )
+        diagnostic_metrics.update(consistency_metrics)
         return experience, diagnostic_metrics
 
     def _publish_policy(self, next_step: int, actor_update: Any) -> None:
@@ -224,8 +366,14 @@ class SyncTrainer(BaseTrainer):
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
         stage_started = time.perf_counter()
+        prompt_records = self._run_rank_synchronized(
+            "prompt record construction",
+            lambda: build_prompt_records(batch, input_ids, attention_mask),
+        )
+        if prompt_records is None:
+            raise RuntimeError("Prompt record construction failed without a synchronized error")
         rollout = self.rollout_manager.generate(
-            prompt_records=build_prompt_records(batch, input_ids, attention_mask),
+            prompt_records=prompt_records,
             policy_version=self.state.global_step,
         )
         timings["gen"] = time.perf_counter() - stage_started
@@ -338,7 +486,7 @@ class SyncTrainer(BaseTrainer):
     def _validate_runtime_topology(self) -> None:
         """Validate torchrun world size against the requested FSDP shard count."""
         world_size = platform.get_world_size()
-        dp_shard = int(self.args.train.accelerator.dp_shard)
+        dp_shard = int(self.runtime_config.fsdp_config.dp_shard_size)
         if world_size != dp_shard:
             raise ValueError(
                 f"torchrun world size must equal train.accelerator.dp_shard: "
@@ -375,7 +523,6 @@ class SyncTrainer(BaseTrainer):
             self.resolved_config,
             self._run_rank_synchronized,
         )
-        self.checkpoint_callback = self.checkpoints.callback
         self._build_tracker()
     def _build_tokenizer_and_data(self) -> None:
         """Build the shared tokenizer, train split, and optional evaluation split."""
@@ -430,6 +577,37 @@ class SyncTrainer(BaseTrainer):
             pad_token_id=int(self.tokenizer.pad_token_id),
         )
         self._build_dataloader()
+
+    def _build_dataloader(self) -> None:
+        """Build the stateful prompt loader over the RL data-parallel domain."""
+        data_config = required_mapping(self.resolved_config, "data")
+        train_config = required_mapping(self.resolved_config, "train")
+        dp_size = int(self.parallel_dims.dp_size)
+        dp_rank = int(self.parallel_dims.dp_rank)
+        self.sampler = _DistributedPromptSampler(
+            len(self.train_dataset),
+            rank=dp_rank,
+            world_size=dp_size,
+            seed=int(self.runtime_config.training.seed),
+            shuffle=bool(data_config.get("shuffle", True)),
+        )
+        num_workers = int(data_config.get("num_workers", 0))
+        loader_kwargs = {
+            "batch_size": int(train_config.get("prompt_batch_size", 1)),
+            "sampler": self.sampler,
+            "collate_fn": self.collate_fn,
+            "num_workers": num_workers,
+            "pin_memory": bool(data_config.get("pin_memory", True)),
+            "drop_last": True,
+        }
+        prefetch_factor = data_config.get("prefetch_factor")
+        if num_workers > 0 and prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+        self.train_dataloader = StatefulDataLoader(
+            self.train_dataset,
+            **loader_kwargs,
+        )
+
     def _build_models_and_optimizers(self) -> None:
         """Build requirement-selected models and their independent optimizers."""
         train_config = required_mapping(self.resolved_config, "train")
@@ -440,7 +618,10 @@ class SyncTrainer(BaseTrainer):
             reference_model = self._build_one_parallel_model(frozen=True)
         critic_model = None
         if self.algorithm.requirements.roles.critic:
-            critic_model = self._build_one_critic_model()
+            raise NotImplementedError(
+                "Critic construction is not available in the initial HyperModels "
+                "migration; use a critic-free algorithm such as GRPO"
+            )
         actor_optimizer, actor_lr_scheduler = self._build_optimizer_for(actor_model)
         critic_optimizer = None
         critic_lr_scheduler = None
@@ -487,18 +668,13 @@ class SyncTrainer(BaseTrainer):
                 ),
                 max_grad_norm=float(optimizer_config.get("max_grad_norm", 1.0)),
             )
-        self.model = self.actor
+        self.model = self.actor.actor_model
         self.optimizer = self.actor.optimizer
         self.lr_scheduler = self.actor.lr_scheduler
-        self._build_training_context()
+
     def _build_optimizer_for(self, model: Any) -> tuple[Any, Any]:
-        """Build BaseTrainer optimizer state for one role-owned model."""
-        self.model = model
-        self.optimizer = None
-        self.lr_scheduler = None
-        self._build_optimizer()
-        self._build_lr_scheduler()
-        return self.optimizer, self.lr_scheduler
+        """Build independent HyperModels optimizer state for one role model."""
+        return build_role_optimizer(self.runtime_config, model)
     def _build_rollout_runtime(self) -> None:
         """Build the selected generation engine and train/evaluation rollout managers."""
         rollout_config = required_mapping(self.resolved_config, "rollout")
@@ -508,6 +684,7 @@ class SyncTrainer(BaseTrainer):
             rollout_config,
             self.model_registration,
         )
+        eos_token_ids = _resolve_eos_token_ids(self.model, self.tokenizer)
         manager_kwargs = {
             "engine": self.rollout_engine,
             "tokenizer": self.tokenizer,
@@ -515,7 +692,8 @@ class SyncTrainer(BaseTrainer):
             "max_turns": int(agentic_config["max_turns"]),
             "max_observation_tokens": int(agentic_config["max_observation_tokens"]),
             "pad_token_id": int(self.tokenizer.pad_token_id),
-            "eos_token_id": int(self.tokenizer.eos_token_id),
+            "eos_token_id": eos_token_ids[0],
+            "eos_token_ids": eos_token_ids,
         }
         self.rollout_manager = RolloutManager(
             num_return_sequences=int(rollout_config["num_return_sequences"]),
@@ -551,21 +729,12 @@ class SyncTrainer(BaseTrainer):
                 progress_steps=int(evaluation_config.get("progress_steps", 0)),
             )
     def _build_one_parallel_model(self, frozen: bool) -> platform.Module:
-        """Build, optionally freeze, FSDP-wrap, materialize, and load one model."""
-        self._build_model()
-        if frozen:
-            for parameter in self.model.parameters():
-                parameter.requires_grad_(False)
-        self._build_parallelized_model()
-        if frozen:
-            self.model.eval()
-        return self.model
-    def _build_one_critic_model(self) -> platform.Module:
-        """Build an independent backbone and attach its registered value capability."""
-        self._build_model()
-        attach_value_head(self.model, str(self.model_registration.hyper_model_name))
-        self._build_parallelized_model()
-        return self.model
+        """Build, freeze when requested, parallelize, materialize, and load one model."""
+        return build_role_model(
+            self.runtime_config,
+            self.distributed_setup,
+            frozen=frozen,
+        )
     def _build_tracker(self) -> None:
         """Initialize console/W&B tracking on global rank zero only."""
         logging_config = required_mapping(self.resolved_config, "logging")
@@ -596,12 +765,6 @@ class SyncTrainer(BaseTrainer):
             self.sampler.set_epoch(self.state.epoch)
             data_iterator = iter(self.train_dataloader)
             return next(data_iterator), data_iterator
-    def dispatch_save_event(self, checkpoint_dir: str) -> None:
-        """Handle BaseTrainer's checkpoint event without its unused callbacks."""
-        logger.info("rank=%d checkpoint event: saved %s", platform.get_rank(), checkpoint_dir)
-    def dispatch_load_event(self, checkpoint_dir: str) -> None:
-        """Handle BaseTrainer's resume event without its unused callbacks."""
-        logger.info("rank=%d checkpoint event: loaded %s", platform.get_rank(), checkpoint_dir)
     def _cleanup_distributed(self) -> None:
         """Close tracking and destroy the initialized process group."""
         if self._tracker is not None:
@@ -630,19 +793,18 @@ class SyncTrainer(BaseTrainer):
         """Explicitly release every nested full FSDP parameter allocation."""
         if model is None:
             return
-        seen = set()
-        for _, candidate in platform.get_cells_and_names(model):
-            if isinstance(candidate, HSDPModule) and id(candidate) not in seen:
-                candidate.reshard()
-                seen.add(id(candidate))
+        for hsdp_root in iter_hsdp_roots(model):
+            hsdp_root.reshard()
     @staticmethod
     def _validate_optimizer_cpu_residency(optimizer: Optional[Any], role: str) -> None:
         """Fail if a colocated optimizer retains tensor state on the NPU."""
         if optimizer is None:
             return
+        optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
         device_states = [
             str(tensor.device)
-            for state in optimizer.state.values()
+            for component in optimizers
+            for state in component.state.values()
             for tensor in _iter_state_tensors(state)
             if not str(tensor.device).startswith("cpu")
         ]
@@ -682,19 +844,21 @@ class SyncTrainer(BaseTrainer):
             platform.get_current_stream().synchronize()
         self._run_rank_synchronized("allocator-cache release", release_allocator_cache)
     @staticmethod
-    def _run_rank_synchronized(operation: str, callback: Any) -> None:
+    def _run_rank_synchronized(operation: str, callback: Any) -> Any:
         """Run local work and make its failure visible on every training rank."""
+        result = None
         local_error = None
         try:
-            callback()
+            result = callback()
         except Exception as error:  # pylint: disable=W0718
             local_error = error
         world_size = platform.get_world_size()
         if world_size <= 1:
             if local_error is not None:
                 raise local_error
-            return
+            return result
         errors: list[Optional[str]] = [None] * world_size
         platform.all_gather_object(errors, None if local_error is None else str(local_error))
         if any(error is not None for error in errors):
             raise RuntimeError(f"{operation} failed on at least one rank: {errors}")
+        return result

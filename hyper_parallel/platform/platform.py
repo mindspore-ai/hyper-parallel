@@ -1575,6 +1575,16 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement create_selective_checkpoint_contexts")
 
     @staticmethod
+    def ignore_sac_ops(ops: list[object | None]) -> None:
+        """Exclude backend operators from selective-checkpoint replay accounting.
+
+        Args:
+            ops: Iterable of backend-native operator identifiers. Unavailable
+                optional operators may be represented by ``None``.
+        """
+        raise NotImplementedError("Platform subclasses must implement ignore_sac_ops")
+
+    @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
         """Create an async CPU offload context for activation checkpointing.
 

@@ -14,15 +14,16 @@
 # ============================================================================
 """Actor model execution and algorithm-neutral policy optimization."""
 from typing import Any, Optional
-from hyper_parallel import HSDPModule, SkipDTensorDispatch, get_platform, hsdp_sync_stream
-from hyper_parallel.core.utils import clip_grad_norm_
 from rl.algorithm.loss import RLAlgorithm
+from rl.consistency import trainer_sequence_log_probs
 from rl.dataset.contracts import ExperienceBatch
 from rl.utils.monitoring.metrics import (
     ActorMetricAccumulator,
     ActorMicroBatchMetrics,
     ActorUpdateMetrics,
 )
+from hyper_parallel import HSDPModule, SkipDTensorDispatch, get_platform, hsdp_sync_stream
+from hyper_parallel.core.utils import clip_grad_norm_
 platform = get_platform()
 class Actor(platform.Module):
     """Own one policy model and, when trainable, its optimization runtime."""
@@ -83,6 +84,13 @@ class Actor(platform.Module):
         """Compute chosen-token log-probabilities at each next-token position."""
         if tuple(attention_mask.shape) != tuple(sequences.shape):
             raise ValueError("attention_mask must align with sequences")
+        packed_log_probs = trainer_sequence_log_probs(
+            self.actor_model,
+            sequences,
+            attention_mask,
+        )
+        if packed_log_probs is not None:
+            return packed_log_probs
         outputs = self.actor_model(
             input_ids=sequences,
             attention_mask=attention_mask,
@@ -169,7 +177,7 @@ class Actor(platform.Module):
             old_policy_kl_sum=output.old_policy_kl_sum.detach(),
             log_ratio_abs_sum=(
                 (current_log_probs.detach() - old_log_probs).abs() * numeric_mask
-            ).sum(),
+            ).flatten().sum(dim=0),
             clipped_token_count=output.clipped_token_count.detach(),
         )
     def update(self, experience: ExperienceBatch) -> ActorUpdateMetrics:
@@ -267,7 +275,7 @@ class Actor(platform.Module):
     def _global_token_count(self, action_mask: platform.Tensor) -> int:
         """All-reduce the valid action-token count used for loss scaling."""
         count = platform.tensor(
-            [float(action_mask.sum().item())],
+            [float(action_mask.flatten().sum(dim=0).item())],
             dtype=platform.tensor_dtype.float32,
             device=self._device,
         )
