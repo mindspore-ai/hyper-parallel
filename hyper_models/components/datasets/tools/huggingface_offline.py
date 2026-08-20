@@ -241,11 +241,12 @@ def _get_args(argv: List[str] | None = None) -> argparse.Namespace:
     )
     group.add_argument(
         "--append-eod",
-        action="store_true",
-        help="Append the tokenizer EOS (or SEP fallback) to each non-empty document.",
+        type=_parse_bool,
+        default=True,
+        help="Append the tokenizer EOS (or SEP fallback) to each non-empty document (default: %(default)s).",
     )
     group.add_argument(
-        "--pad-to-seq-len",
+        "--pack-to-seq-len",
         type=int,
         default=None,
         help="Pack documents into fixed samples of this sequence length plus one target token.",
@@ -333,7 +334,7 @@ def main(argv: List[str] | None = None) -> None:
         workers=args.workers,
         partitions=args.partitions,
         append_eod=args.append_eod,
-        pad_to_seq_len=args.pad_to_seq_len,
+        pack_to_seq_len=args.pack_to_seq_len,
         keep_sequential_samples=args.keep_sequential_samples,
         keep_partition_files=args.keep_partition_files,
         find_optimal_num_workers=args.find_optimal_num_workers,

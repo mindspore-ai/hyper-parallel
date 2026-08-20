@@ -23,5 +23,5 @@ python -m hyper_models.components.datasets.tools.offline_preparation \
     --workers 8 \
     --partitions 2 \
     --keep-sequential-samples \
-    --append-eod \
-    --pad-to-seq-len 4096
+    --append-eod true \
+    --pack-to-seq-len 4096

@@ -58,7 +58,7 @@ if [[ ! -f "${DATA_PREFIX}.bin" || ! -f "${DATA_PREFIX}.idx" ]]; then
         --tokenizer "${MODEL_SOURCE}" \
         --workers "${DATA_WORKERS}" \
         --append-eod \
-        --pad-to-seq-len 64
+        --pack-to-seq-len 64
 fi
 
 torchrun \

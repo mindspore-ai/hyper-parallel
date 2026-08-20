@@ -16,4 +16,4 @@ python -m hyper_models.components.datasets.tools.offline_preparation \
     --json-keys text \
     --tokenizer-name-or-path gpt2 \
     --workers 8 \
-    --append-eod
+    --append-eod true

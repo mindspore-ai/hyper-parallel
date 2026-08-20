@@ -23,5 +23,5 @@ python -m hyper_models.components.datasets.tools.huggingface_offline \
     --workers 64 \
     --partitions 16 \
     --keep-sequential-samples \
-    --append-eod \
-    --pad-to-seq-len 4096
+    --append-eod true \
+    --pack-to-seq-len 4096
