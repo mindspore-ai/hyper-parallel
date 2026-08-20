@@ -1,0 +1,47 @@
+model:
+  name: qwen_image_dit
+  in_channels: 64
+  out_channels: 64
+  hidden_size: 3072
+  num_attention_heads: 24
+  attention_head_dim: 128
+  num_layers: 2
+  patch_size: 2
+  joint_attention_dim: 3584
+  height: 256
+  width: 256
+
+data:
+  type: coco_parquet
+  train_path: /data/veomni_cache/train.parquet
+  max_seq_len: 4096
+
+train:
+  accelerator:
+    dp_shard: -1
+    fsdp_config:      # ← 恢复 FSDP
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+  global_batch_size: 1
+  micro_batch_size: 1
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.95]
+    lr_warmup_ratio: 0.0
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  init_device: npu
+  max_steps: 100
+  num_train_epochs: 1
+  seed: 42
+  checkpoint:
+    output_dir: dit-qwen-image-dummy
+    manager: dcp
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
