@@ -50,9 +50,18 @@ class TestHyperParallelLogging(unittest.TestCase):
         hp_logging._warned_unknown.clear()
         hp_logging._LOG_FORMAT = self._saved_format
         hp_logging._DATE_FORMAT = self._saved_datefmt
-        # Re-apply the restored format to surviving handlers so a test that
-        # called set_format() does not leak its formatter into later tests.
-        set_format()
+        # Re-apply the restored format only to handlers owned by this module.
+        # pytest 9.1 attaches capture handlers to non-propagating loggers;
+        # changing their formatter would make ordinary records require the
+        # module-specific ``hp_component`` field.
+        formatter = hp_logging._build_formatter()
+        for component_logger in hp_logging._registry.values():
+            for handler in component_logger.handlers:
+                if any(
+                    isinstance(item, hp_logging._ContextFilter)
+                    for item in handler.filters
+                ):
+                    handler.setFormatter(formatter)
         os.environ.pop(HP_LOG_CONFIG_ENV, None)
 
     def test_get_logger_is_stable_and_namespaced(self):
@@ -127,7 +136,29 @@ class TestHyperParallelLogging(unittest.TestCase):
         stream = io.StringIO()
         log.handlers[0].stream = stream
         set_level("UnitH", "INFO")
-        set_format(fmt="HP|%(hp_component)s|%(message)s")
+
+        # pytest 9.1 attaches its capture handler to existing non-propagating
+        # loggers. Keep those external handlers out of the registry while
+        # exercising set_format(), so the test cannot mutate pytest state.
+        detached = {}
+        for component_logger in hp_logging._registry.values():
+            owned = [
+                handler
+                for handler in component_logger.handlers
+                if any(
+                    isinstance(item, hp_logging._ContextFilter)
+                    for item in handler.filters
+                )
+            ]
+            detached[component_logger] = [
+                handler for handler in component_logger.handlers if handler not in owned
+            ]
+            component_logger.handlers = owned
+        try:
+            set_format(fmt="HP|%(hp_component)s|%(message)s")
+        finally:
+            for component_logger, handlers in detached.items():
+                component_logger.handlers.extend(handlers)
 
         log.info("hi")
 
