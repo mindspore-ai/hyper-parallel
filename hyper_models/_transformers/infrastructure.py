@@ -200,9 +200,8 @@ def _apply_fsdp2(
     model: nn.Module,
     fsdp2_manager,
     source_shard_info,
-    compile_for_execution: bool = False,
 ) -> nn.Module:
-    """Apply FSDP2 and keep its hooks outside Dynamo during execution compile."""
+    """Apply FSDP2; Torch scheduler hooks remain outside Dynamo by design."""
     if fsdp2_manager is None:
         return model
     if not isinstance(fsdp2_manager, FSDP2Manager):
@@ -211,7 +210,6 @@ def _apply_fsdp2(
     model = fsdp2_manager.parallelize(
         model,
         source_shard_info=source_shard_info,
-        compile_hooks_enabled=compile_for_execution,
     )
     logger.info("FSDP2 wrap applied")
     return model
@@ -594,6 +592,15 @@ def apply_model_infrastructure(
     )
     if validate_placement and compile_config is not None and compile_config.enabled:
         logger.info("Skipping decoder-layer compile during placement validation")
+    if (
+        compile_for_execution
+        and compile_config.fullgraph
+        and isinstance(fsdp2_manager, FSDP2Manager)
+    ):
+        raise ValueError(
+            "compile.fullgraph=True is incompatible with FSDP hooks kept eager "
+            "by _dynamo_disable; set compile.fullgraph=False"
+        )
 
     # Step 3: PP split (if autopipeline)
     if autopipeline is not None:
@@ -658,7 +665,6 @@ def apply_model_infrastructure(
             model,
             fsdp2_manager,
             source_shard_info,
-            compile_for_execution=compile_for_execution,
         )
 
     # Steps 11-12: materialize model storage, then load or initialize weights.
