@@ -1,0 +1,23 @@
+# YAML watchdog: fsdp_config section -> FSDP2Config -> FSDP2Manager
+# Kept in the same directory as test_fsdp2_config_yaml.py for cohesion.
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 1
+  replicate_params:
+    - model.embed_tokens.weight
+    - lm_head.weight
+  activation_checkpointing: selective
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+  enable_offload: true
+  reshard_after_forward: false
+  reshard_after_backward: true
+  requires_grad_sync: true
+  enable_async_tensor_parallel: false
+  enable_compile: false
+  backward_prefetch_depth: 2
+  forward_prefetch_depth: 1
+  comm_fusion: true
+  comm_fusion_zero_copy: true

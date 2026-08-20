@@ -123,7 +123,6 @@ def _make_manager(**config_changes) -> FSDP2Manager:
     """Build a manager with the fake dense topology used by these tests."""
     config = FSDP2Config(
         dp_shard_size=2,
-        enable_fsdp2_prefetch=True,
         **config_changes,
     )
     mesh_context = MeshContext(

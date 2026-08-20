@@ -191,25 +191,34 @@ class FSDP2Manager:
             return shard_mesh
         return DeviceMesh.concatenate([world_mesh["dp_replicate"], shard_mesh])
 
+    def _build_mixed_precision_policy(self) -> fully_shard_utils.MixedPrecisionPolicy:
+        """Resolve the configured dtype strings to platform dtypes.
+
+        Dtype strings stay YAML-friendly; ``float32`` resolves to the
+        framework's ``float32`` dtype object. Fully-sharded params without an
+        explicit param dtype fall back to the framework default.
+        """
+        mix_precision = self.config.mix_precision
+        dtypes = {
+            name: getattr(platform.tensor_dtype, mix_precision.__getattribute__(name))
+            for name in ("param_dtype", "reduce_dtype", "output_dtype")
+            if mix_precision.__getattribute__(name) is not None
+        }
+        return fully_shard_utils.MixedPrecisionPolicy(**dtypes)
+
+    def _build_offload_policy(self) -> fully_shard_utils.OffloadPolicy:
+        """Return CPU offload when enabled, otherwise the default no-offload policy."""
+        if not self.config.enable_offload:
+            return fully_shard_utils.OffloadPolicy()
+        return fully_shard_utils.CPUOffloadPolicy()
+
     def _build_fully_shard_kwargs(
         self,
         fsdp_mesh: DeviceMesh,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build shared sublayer kwargs and the root-specialized copy."""
-        if self.config.mp_policy is None:
-            mp_policy = fully_shard_utils.MixedPrecisionPolicy()
-        else:
-            mp_policy = fully_shard_utils.MixedPrecisionPolicy(
-                param_dtype=self.config.mp_policy.param_dtype,
-                reduce_dtype=self.config.mp_policy.reduce_dtype,
-                output_dtype=self.config.mp_policy.output_dtype,
-            )
-        if self.config.offload_policy is None:
-            offload_policy = fully_shard_utils.OffloadPolicy()
-        else:
-            offload_policy = fully_shard_utils.CPUOffloadPolicy(
-                pin_memory=self.config.offload_policy.pin_memory
-            )
+        mp_policy = self._build_mixed_precision_policy()
+        offload_policy = self._build_offload_policy()
 
         fsdp_sublayer_kwargs = {
             "mesh": fsdp_mesh,
@@ -562,10 +571,9 @@ class FSDP2Manager:
                 gradient_scaled_units,
             )
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
-        if self.config.enable_fsdp2_prefetch:
-            self._configure_prefetch(
-                [wrap_module.module for wrap_module in ordered_wrap_modules]
-            )
+        self._configure_prefetch(
+            [wrap_module.module for wrap_module in ordered_wrap_modules]
+        )
         logger.info(
             "Applied FSDP2 to %d transformer blocks and the root module",
             len(wrap_modules),
