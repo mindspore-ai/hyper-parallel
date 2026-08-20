@@ -18,21 +18,22 @@ Full implementation will move to this module from infrastructure.py.
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass
-class MixedPrecisionPolicy:
-    """FSDP2 mixed precision policy stub."""
-    param_dtype: Any = None
-    reduce_dtype: Any = None
-    output_dtype: Any = None
+class FSDP2MixedPrecisionConfig:
+    """FSDP2 mixed-precision policy expressed in YAML-friendly strings.
 
+    All dtypes default to None, which means no mixed precision at all;
+    the core ``MixedPrecisionPolicy`` then falls back to framework
+    defaults. Dtype strings are resolved to platform dtypes when the
+    FSDP2 manager builds the core policy.
+    """
 
-@dataclass
-class CPUOffloadPolicy:
-    """FSDP2 CPU offload policy stub."""
-    pin_memory: bool = False
+    param_dtype: Literal["bfloat16", "float16", "float32"] | None = None
+    reduce_dtype: Literal["bfloat16", "float16", "float32"] | None = None
+    output_dtype: Literal["bfloat16", "float16", "float32"] | None = None
 
 
 @dataclass
@@ -42,14 +43,15 @@ class FSDP2Config:
     edp_shard_size: int = 1
     replicate_params: list[str] = field(default_factory=list)
     activation_checkpointing: bool | str = False
-    mp_policy: MixedPrecisionPolicy | None = None
-    offload_policy: CPUOffloadPolicy | None = None
+    mix_precision: FSDP2MixedPrecisionConfig = field(
+        default_factory=FSDP2MixedPrecisionConfig
+    )
+    enable_offload: bool = False
     reshard_after_forward: bool = True
     reshard_after_backward: bool = True
     requires_grad_sync: bool = True
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
-    enable_fsdp2_prefetch: bool = False
     backward_prefetch_depth: int = 1
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False
