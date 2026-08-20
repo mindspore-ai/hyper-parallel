@@ -1424,6 +1424,13 @@ class BaseTrainer:
                     local["position_ids"] = torch.arange(
                         start, start + shard, device=input_ids.device, dtype=torch.long,
                     ).view(1, -1).expand(input_ids.shape[0], -1)
+            mm_token_type_ids = micro_batch.get("mm_token_type_ids")
+            if mm_token_type_ids is not None:
+                mm_slice = [slice(None)] * mm_token_type_ids.dim()
+                mm_slice[-1] = seq_slice
+                local["mm_token_type_ids"] = mm_token_type_ids[
+                    tuple(mm_slice)
+                ].contiguous()
             labels = micro_batch.get("labels")
             if labels is not None:
                 shifted = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:]

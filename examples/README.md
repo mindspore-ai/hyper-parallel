@@ -6,6 +6,7 @@ This directory contains usage examples for the HyperParallel distributed trainin
 
 ```text
 examples/
+├── qwen3_vl_30b_a3b_instruct/ # Qwen3-VL-MoE VL trainer template
 ├── torch/              # PyTorch examples
 │   ├── fully_shard/    # FSDP (Fully Sharded Data Parallel) examples
 │   ├── llama3/         # Llama3-style tensor parallel + sequence parallel
@@ -34,6 +35,10 @@ examples/
 | torch & torch_npu | 2.6.0 |
 | CANN | 8.3.0 |
 | HyperParallel | [nightly (202603)](https://repo.mindspore.cn/mindspore/hyper-parallel/version/202603/20260322/master_20260322020005_823f1bea890db254d9cf8ed554fde675137d940b_newest/any/hyper_parallel-0.1.0-py3-none-any.whl) |
+
+## Qwen3-VL-MoE Example
+
+The `qwen3_vl_30b_a3b_instruct/train.yaml` file provides a VL trainer template for Qwen3-VL-MoE. It keeps the visual tower frozen by default and can be adapted for Visual Encoder DP/CP or async CP through `model.vision_parallel`; CP modes use the existing `train.accelerator.cp` mesh.
 
 ## PyTorch MoE Examples
 
