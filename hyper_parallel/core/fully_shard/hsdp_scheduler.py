@@ -83,14 +83,11 @@ class HSDPSchedulerV2:
         comm_fusion,
         comm_fusion_zero_copy=False,
         source_shard_infos: Optional[Mapping[platform.Parameter, SourceShardMetaInfo]] = None,
-        compile_hooks_enabled: bool = False,
     ):
         """init hsdp scheduler.
 
         Args:
             cell: A single platform.Module or tuple of platform.Module to manage as one FSDP unit.
-            compile_hooks_enabled: Whether platform scheduler hooks should stay
-                outside compiled regions.
         """
         self.modules = (cell,) if isinstance(cell, platform.Module) else tuple(cell)
         self.cell = self.modules[0]
@@ -110,12 +107,6 @@ class HSDPSchedulerV2:
         self._backup_forward_fetch = None
         # Flag to identify root module.
         self._is_root = True
-        if not isinstance(compile_hooks_enabled, bool):
-            raise ValueError(
-                "compile_hooks_enabled must be a bool, got "
-                f"{type(compile_hooks_enabled).__name__}"
-            )
-        self.compile_hooks_enabled = compile_hooks_enabled
         # module and its all sub-modules share one same 'HSDPSchedulerContext'
         self.scheduler_ctx = HSDPSchedulerContext()
         # When ``fully_shard`` is given multiple root modules, forward pre/post hooks coordinate

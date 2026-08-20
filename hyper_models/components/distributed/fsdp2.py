@@ -471,8 +471,6 @@ class FSDP2Manager:
         self,
         model: ModuleClass,
         source_shard_info: SourceShardInfoByFQN | None = None,
-        *,
-        compile_hooks_enabled: bool = False,
     ) -> ModuleClass:
         """Apply configured child FSDP units, root FSDP, and prefetch links.
 
@@ -481,8 +479,6 @@ class FSDP2Manager:
             source_shard_info: FQN-keyed source-layout metadata returned by
                 ``apply_sharding_plan``. The manager resolves parameter
                 identities before applying nested FSDP units.
-            compile_hooks_enabled: Whether scheduler forward hooks should stay
-                outside Dynamo capture for decoder-layer compilation.
 
         Returns:
             The model enhanced with the HyperParallel HSDPModule interface.
@@ -491,11 +487,6 @@ class FSDP2Manager:
             ValueError: If TP is enabled without FQN metadata or configured
                 parameter FQNs cannot be resolved.
         """
-        if not isinstance(compile_hooks_enabled, bool):
-            raise ValueError(
-                "compile_hooks_enabled must be a bool, got "
-                f"{type(compile_hooks_enabled).__name__}"
-            )
         metadata_by_parameter = self._build_source_shard_info_by_param(
             model,
             source_shard_info,
@@ -530,7 +521,6 @@ class FSDP2Manager:
             fully_shard(  # pylint: disable=unexpected-keyword-arg
                 wrap_module.module,
                 source_shard_infos=managed_source_shard_info,
-                compile_hooks_enabled=compile_hooks_enabled,
                 replicate_params=self._build_managed_replicate_params(
                     wrap_module.module,
                     owner_by_parameter,
@@ -556,7 +546,6 @@ class FSDP2Manager:
         fully_shard(  # pylint: disable=unexpected-keyword-arg
             model,
             source_shard_infos=root_source_shard_info,
-            compile_hooks_enabled=compile_hooks_enabled,
             replicate_params=self._build_managed_replicate_params(
                 model,
                 owner_by_parameter,
