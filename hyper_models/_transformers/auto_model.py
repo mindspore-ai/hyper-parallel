@@ -275,6 +275,7 @@ class _BaseHyperAutoModelClass:
             load_base_model=load_base_model,
             pretrained_path=pretrained_model_name_or_path,
             validate_placement=validate_placement,
+            distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
             activation_swap=activation_swap,
         )
