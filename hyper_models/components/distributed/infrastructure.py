@@ -292,6 +292,9 @@ class DistributedSetup:
     # instantiate_infrastructure 在构造 planner 前经 entries_to_plan_overrides
     # 脱糖（含 when 过滤）
     plan_overrides: Any = None
+    # TrainingConfig.training.low_precision. Kept on the setup so model
+    # construction and sharding consume one resolved policy object.
+    low_precision_config: Any = None
 
 
 # ── initialize_distributed (stub) ──
@@ -468,6 +471,11 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
         mesh_context=mesh_context,
         strategy_config=strategy_config,
         plan_overrides=getattr(cfg, "plan_overrides", None),
+        low_precision_config=getattr(
+            getattr(cfg, "training", None),
+            "low_precision",
+            None,
+        ),
     )
 
 
