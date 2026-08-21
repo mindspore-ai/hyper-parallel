@@ -309,7 +309,9 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state.hsdp_params = [hsdp_param]
         MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
 
-        state.post_backward()
+        # Tensor.zero_ is Ascend-only; this CPU UT only verifies reduction bookkeeping.
+        with patch.object(ms.Tensor, "zero_"):
+            state.post_backward()
 
         hsdp_param.reduce_scatter_grad.assert_called_once()
         call_kw = hsdp_param.reduce_scatter_grad.call_args.kwargs
