@@ -1,16 +1,16 @@
 # TP×CP×EP×FSDP end-to-end demo with a Megatron IndexedDataset.
 
 model:
-  _target_: examples.tp_cp_ep_demo.model_factory.load_qwen2_moe_with_rowwise_bias
-  pretrained_model_name_or_path: ./outputs/tp_cp_ep_demo/tiny_qwen2moe
-  torch_dtype: auto
+  _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  torch_dtype: bfloat16
   attn_implementation: sdpa
   force_hf: true
 
 training:
-  train_steps: 2
+  train_iters: 2
+  train_samples: null
   eval_iters: 0
-  num_train_epochs: 1
   global_batch_size: 4
   micro_batch_size: 1
   backend: hccl
@@ -18,7 +18,7 @@ training:
   loss_aggregation: token_weighted
   max_grad_norm: 1.0
   seed: 42
-  enable_full_determinism: false
+  enable_full_determinism: true
 
 accelerator:
   tp_size: 2
@@ -30,24 +30,40 @@ accelerator:
 
 fsdp_config:
   dp_shard_size: 2
-  replicate_params:
-    - model.layers.0.mlp.shared_expert_gate.weight
-    - model.layers.1.mlp.shared_expert_gate.weight
+  edp_shard_size: 2
+  replicate_params: []
   reshard_after_forward: true
-  defer_fsdp_grad_sync: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  enable_fsdp2_prefetch: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
   comm_fusion: false
 
 plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - "model.norm"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
+    replace_module:
+      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
+  - match: "*.self_attn"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+    replace_module:
+      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_flash_attention
   - match: "*.self_attn"
     when: cp
     region_dispatch: false
     inner_target: self
-    inner_wrapper: sdpa_hf
+    inner_wrapper:
+      _target_: hyper_models.components.models.qwen3_moe_fusions.qwen3_moe_flash_attention_cp_wrapper
   - match: "*.mlp"
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_models.components.distributed.ep_compute.qwen2moe_ep_compute_fn
+      _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
+      use_grouped_gemm: true
 mixed_precision:
   enabled: false
 
@@ -60,19 +76,19 @@ dataset:
     chat_template: null
     tokenizer:
       _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
-      pretrained_model_name_or_path: ./outputs/training_demo/parallel_data/parallel_offline_text_document
+      pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
       tokenizer_type: pretokenized
-      vocab_size: 256
-      eod_token_id: 0
+      vocab_size: 151936
+      eod_token_id: 151645
   data_transform:
     _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
     data_type: pretokenized
-    max_seq_len: 32
+    max_seq_len: 4096
   _target_: hyper_models.components.datasets.llm.build_llm_dataset
-  data_path: ./outputs/training_demo/parallel_data/parallel_offline_text_document
+  data_path: ./outputs/training_demo/parallel_data/wikitext103_qwen3_4k_text_document
   data_config:
     source_type: offline
-    seq_length: 32
+    seq_length: 4096
     split: "1, 0, 0"
     mock_data: false
     distributed_walk: true
@@ -80,6 +96,9 @@ dataset:
     simple_blend: "no"
     data_lazy_load: true
     skip_data_check: true
+    # IndexedDataset already emits text[1:] targets. Forward them through the
+    # Transformers pre-shifted-label contract to avoid a second causal shift.
+    labels_are_shifted: true
     create_attention_mask_in_dataloader: false
 
 dataloader:
@@ -97,9 +116,17 @@ dataloader:
   pin_memory: false
 
 optimizer:
-  _target_: hyper_models.components.optim.optimizer.AdamW
+  _target_: hyper_models.components.optim.optimizer.Muon
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 3.0e-5
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
   adamw_config:
-    adamw_lr: 1.0e-4
+    adamw_lr: 1.0e-5
     adamw_weight_decay: 0.01
     adamw_betas: [0.9, 0.999]
     adamw_eps: 1.0e-8
@@ -112,7 +139,8 @@ lr_scheduler:
     min_lr: 0.0
 
 checkpoint:
-  enabled: false
+  save_ckpt: false
+  restore_from: null
   checkpoint_dir: ./outputs/training_demo/parallel_checkpoints
 
 debug:

@@ -707,7 +707,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         Note: dimensions within a single buffer are still sequential (dim N+1
         depends on dim N completing), but different buffers can overlap.
         """
-        handles: List[dist.Work] = []
+        broadcast_ops: List[Tuple[dist.ProcessGroup, int]] = []
 
         for dim_idx, pg in enumerate(replicate_pgs):
             if pg is None:
@@ -724,10 +724,20 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
 
             src_rank_in_pg = src_coord[dim_idx]
             global_src_rank = dist.get_global_rank(pg, src_rank_in_pg)
+            broadcast_ops.append((pg, global_src_rank))
+
+        handles: List[dist.Work] = []
+        for op_idx, (pg, global_src_rank) in enumerate(broadcast_ops):
             handle = dist.broadcast(
                 batch_buffer, src=global_src_rank, group=pg, async_op=True,
             )
-            handles.append(handle)
+            if op_idx + 1 < len(broadcast_ops):
+                # The next mesh dimension relays the data received here.
+                # It must not read the shared buffer until this hop finishes.
+                handle.wait()
+            else:
+                # Only the final hop may overlap with subsequent computation.
+                handles.append(handle)
 
         return handles
 

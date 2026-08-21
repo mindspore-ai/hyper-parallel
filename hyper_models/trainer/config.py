@@ -47,6 +47,7 @@ class TrainingConfig:
     enable_full_determinism: bool = False
     gc_steps: int = 0
     empty_cache_steps: int = 0
+    empty_cache_before_backward: bool = False
     eval_steps: int = 0
     eval_epochs: int = 0
     logging_steps: int = 1

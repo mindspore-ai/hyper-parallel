@@ -22,6 +22,7 @@ Tests compare:
 import os
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -32,6 +33,7 @@ from hyper_parallel import init_device_mesh  # pylint: disable=C0413
 from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413
 from hyper_parallel.core.dtensor.placement_types import Shard  # pylint: disable=C0413
 from hyper_parallel.core.tensor_parallel import loss_parallel, is_loss_parallel_active  # pylint: disable=C0413
+from hyper_models.components.loss.loss_parallel import causal_lm_loss_parallel  # pylint: disable=C0413
 
 
 np.random.seed(42)
@@ -191,6 +193,124 @@ class TestLossParallelAccuracyPyTorch:
         print(f"[Rank {rank}] Input gradient norm: {input_shard.grad.norm().item():.6f}")
         print(f"[Rank {rank}] Gradient test passed")
 
+    def test_multidimensional_cp_tp_mesh(self):
+        """Use the TP mesh dimension when CP and TP both shard logits."""
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        if world_size != 4:
+            pytest.skip("CP2 x TP2 validation requires four processes")
+
+        cp_size = 2
+        tp_size = 2
+        batch_size = 2
+        sequence_length = 6
+        vocab_size = 12
+        mesh = init_device_mesh(
+            "cpu",
+            (cp_size, tp_size),
+            mesh_dim_names=("cp", "tp"),
+        )
+        cp_rank = mesh.get_local_rank(0)
+        tp_rank = mesh.get_local_rank(1)
+
+        torch.manual_seed(2026)
+        full_logits = torch.randn(batch_size, sequence_length, vocab_size)
+        full_targets = torch.randint(0, vocab_size, (batch_size, sequence_length))
+        sequence_chunk = sequence_length // cp_size
+        vocab_chunk = vocab_size // tp_size
+        sequence_slice = slice(cp_rank * sequence_chunk, (cp_rank + 1) * sequence_chunk)
+        vocab_slice = slice(tp_rank * vocab_chunk, (tp_rank + 1) * vocab_chunk)
+
+        reference_logits = full_logits[:, sequence_slice, :].clone().requires_grad_(True)
+        local_targets = full_targets[:, sequence_slice].contiguous()
+        reference_loss = F.cross_entropy(
+            reference_logits.reshape(-1, vocab_size),
+            local_targets.reshape(-1),
+        )
+        reference_loss.backward()
+
+        local_logits = (
+            full_logits[:, sequence_slice, vocab_slice]
+            .clone()
+            .contiguous()
+            .requires_grad_(True)
+        )
+        logits_dtensor = DTensor.from_local(
+            local_logits,
+            mesh,
+            [Shard(1), Shard(-1)],
+        )
+        with loss_parallel(mesh=mesh["tp"]):
+            distributed_loss = causal_lm_loss_parallel(
+                logits_dtensor,
+                local_targets,
+                vocab_size,
+                shift_labels=local_targets,
+            )
+        distributed_loss.backward()
+
+        torch.testing.assert_close(distributed_loss.squeeze(), reference_loss)
+        torch.testing.assert_close(
+            local_logits.grad,
+            reference_logits.grad[:, :, vocab_slice],
+        )
+
+    def test_causal_lm_loss_wraps_local_logits_on_tp_mesh(self):
+        """Reconstruct vocab-sharded logits returned by production mode."""
+        world_size = dist.get_world_size()
+        if world_size != 4:
+            pytest.skip("CP2 x TP2 validation requires four processes")
+
+        cp_size = 2
+        tp_size = 2
+        batch_size = 1
+        sequence_length = 6
+        vocab_size = 12
+        mesh = init_device_mesh(
+            "cpu",
+            (cp_size, tp_size),
+            mesh_dim_names=("cp", "tp"),
+        )
+        cp_rank = mesh.get_local_rank(0)
+        tp_rank = mesh.get_local_rank(1)
+
+        torch.manual_seed(2027)
+        full_logits = torch.randn(batch_size, sequence_length, vocab_size)
+        full_targets = torch.randint(0, vocab_size, (batch_size, sequence_length))
+        sequence_chunk = sequence_length // cp_size
+        vocab_chunk = vocab_size // tp_size
+        sequence_slice = slice(cp_rank * sequence_chunk, (cp_rank + 1) * sequence_chunk)
+        vocab_slice = slice(tp_rank * vocab_chunk, (tp_rank + 1) * vocab_chunk)
+
+        reference_logits = full_logits[:, sequence_slice, :].clone().requires_grad_(True)
+        local_targets = full_targets[:, sequence_slice].contiguous()
+        reference_loss = F.cross_entropy(
+            reference_logits.reshape(-1, vocab_size),
+            local_targets.reshape(-1),
+        )
+        reference_loss.backward()
+
+        local_logits = (
+            full_logits[:, sequence_slice, vocab_slice]
+            .clone()
+            .contiguous()
+            .requires_grad_(True)
+        )
+        with loss_parallel(mesh=mesh["tp"]):
+            distributed_loss = causal_lm_loss_parallel(
+                local_logits,
+                local_targets,
+                vocab_size,
+                shift_labels=local_targets,
+            )
+        distributed_loss.backward()
+
+        torch.testing.assert_close(distributed_loss.squeeze(), reference_loss)
+        torch.testing.assert_close(
+            local_logits.grad,
+            reference_logits.grad[:, :, vocab_slice],
+        )
+
 
 def test_single_vs_multi_card_loss_parity():
     """Wrapper for pytest."""
@@ -205,6 +325,12 @@ def test_loss_parallel_context_correctness():
 def test_gradient_correctness_with_loss_parallel():
     """Wrapper for pytest."""
     TestLossParallelAccuracyPyTorch().test_gradient_correctness_with_loss_parallel()
+
+
+def test_multidimensional_cp_tp_mesh():
+    """Run CP2 x TP2 loss tests for DTensor and local-logits boundaries."""
+    TestLossParallelAccuracyPyTorch().test_multidimensional_cp_tp_mesh()
+    TestLossParallelAccuracyPyTorch().test_causal_lm_loss_wraps_local_logits_on_tp_mesh()
 
 
 if __name__ == "__main__":

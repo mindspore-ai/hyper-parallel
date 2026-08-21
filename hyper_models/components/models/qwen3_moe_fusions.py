@@ -18,12 +18,18 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
+from functools import wraps
 from types import MethodType
 from typing import Any, Callable
 
 import torch
 from torch import nn
 
+from hyper_models.components.distributed.cp_utils import (
+    _cp_offset_causal_mask,
+    flex_cp_allgather,
+)
+from hyper_models.components.distributed.injection import inner_wrapper
 from hyper_models.components.model_transform import module_replacement
 
 _COMPRESSED_CAUSAL_MASK_SIZE = 2048
@@ -123,7 +129,7 @@ def qwen3_moe_fused_rms_norm_forward(
     return _fused_rms_norm(hidden_states, module.weight, module.variance_epsilon)
 
 
-def qwen3_moe_flash_attention_forward(
+def _run_qwen3_moe_flash_attention(
     module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -174,15 +180,18 @@ def qwen3_moe_flash_attention_forward(
     return attention_output.transpose(1, 2).contiguous(), None
 
 
-def qwen3_moe_fused_attention_forward(
+def _prepare_qwen3_moe_attention_states(
     module: nn.Module,
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    attention_mask: torch.Tensor | None,
     past_key_values: Any | None = None,
-    **kwargs: Any,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run Qwen3-MoE attention with fused q/k RMSNorm and rotary embedding."""
+) -> tuple[
+    tuple[int, ...],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Project and position Qwen3-MoE query, key, and value states."""
     # torch_npu is optional outside Ascend environments.
     import torch_npu  # pylint: disable=C0415
 
@@ -216,7 +225,38 @@ def qwen3_moe_fused_attention_forward(
             module.layer_idx,
         )
 
-    attention_output, attention_weights = qwen3_moe_flash_attention_forward(
+    return input_shape, query_states, key_states, value_states
+
+
+def _project_qwen3_moe_attention_output(
+    module: nn.Module,
+    attention_output: torch.Tensor,
+    input_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Restore the hidden shape and apply the output projection."""
+    attention_output = attention_output.reshape(*input_shape, -1).contiguous()
+    return module.o_proj(attention_output)
+
+
+def qwen3_moe_flash_attention_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Any | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the non-CP Qwen3-MoE fused attention module implementation."""
+    input_shape, query_states, key_states, value_states = (
+        _prepare_qwen3_moe_attention_states(
+            module,
+            hidden_states,
+            position_embeddings,
+            past_key_values,
+        )
+    )
+
+    attention_output, attention_weights = _run_qwen3_moe_flash_attention(
         module,
         query_states,
         key_states,
@@ -227,8 +267,10 @@ def qwen3_moe_fused_attention_forward(
         sliding_window=module.sliding_window,
         **kwargs,
     )
-    attention_output = attention_output.reshape(*input_shape, -1).contiguous()
-    return module.o_proj(attention_output), attention_weights
+    return (
+        _project_qwen3_moe_attention_output(module, attention_output, input_shape),
+        attention_weights,
+    )
 
 
 def qwen3_moe_grouped_moe_forward(
@@ -279,6 +321,92 @@ def _replace_forward(module: nn.Module, forward: Callable) -> nn.Module:
     return replacement
 
 
+@inner_wrapper
+def qwen3_moe_flash_attention_cp_wrapper(
+    target_module: nn.Module,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+) -> None:
+    """Replace the exact Qwen3-MoE fused attention forward with its CP version."""
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            "qwen3_moe_flash_attention_cp_wrapper requires an active CP mesh"
+        )
+
+    original_forward = target_module.forward
+    installed_forward = getattr(original_forward, "__func__", original_forward)
+    if installed_forward is not qwen3_moe_flash_attention_forward:
+        raise ValueError(
+            "qwen3_moe_flash_attention_cp_wrapper can only replace "
+            "qwen3_moe_flash_attention_forward; apply "
+            "replace_qwen3_moe_flash_attention first"
+        )
+
+    @wraps(original_forward)
+    def cp_forward(
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Any | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if attention_mask is not None:
+            raise ValueError(
+                "Qwen3-MoE fused CP attention currently requires an implicit "
+                "causal mask; configure create_attention_mask_in_dataloader=false"
+            )
+        input_shape, query_states, key_states, value_states = (
+            _prepare_qwen3_moe_attention_states(
+                target_module,
+                hidden_states,
+                position_embeddings,
+                past_key_values,
+            )
+        )
+        query_length = query_states.shape[-2]
+        query_offset = cp_mesh.get_local_rank() * query_length
+        key_states, value_states = flex_cp_allgather(
+            key_states.contiguous(),
+            value_states.contiguous(),
+            2,
+            cp_mesh,
+        )
+        cp_causal_mask = _cp_offset_causal_mask(
+            query_length,
+            key_states.shape[-2],
+            query_offset,
+            query_states.device,
+        )
+        attention_output, attention_weights = _run_qwen3_moe_flash_attention(
+            target_module,
+            query_states,
+            key_states,
+            value_states,
+            cp_causal_mask,
+            dropout=(
+                0.0
+                if not target_module.training
+                else target_module.attention_dropout
+            ),
+            scaling=target_module.scaling,
+            sliding_window=target_module.sliding_window,
+            **kwargs,
+        )
+        return (
+            _project_qwen3_moe_attention_output(
+                target_module,
+                attention_output,
+                input_shape,
+            ),
+            attention_weights,
+        )
+
+    target_module.forward = cp_forward
+
+
 @module_replacement
 def replace_qwen3_moe_rms_norm(
     *,
@@ -300,7 +428,7 @@ def replace_qwen3_moe_flash_attention(
 ) -> nn.Module:
     """Build a structure-preserving Qwen3-MoE Flash Attention replacement."""
     del module_fqn, context
-    return _replace_forward(module, qwen3_moe_fused_attention_forward)
+    return _replace_forward(module, qwen3_moe_flash_attention_forward)
 
 
 @module_replacement

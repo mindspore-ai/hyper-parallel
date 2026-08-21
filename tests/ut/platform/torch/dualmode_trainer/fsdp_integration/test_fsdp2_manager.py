@@ -30,6 +30,10 @@ import hyper_models.components.distributed.fsdp2 as fsdp2_module
 from hyper_models.components.distributed.config import FSDP2Config
 from hyper_models.components.distributed.fsdp2 import FSDP2Manager
 from hyper_models.components.distributed.infrastructure import MeshContext
+from hyper_models.components.distributed.local_compute_context import (
+    install_local_compute_forward_adapters,
+    local_compute_context,
+)
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,37 @@ def test_actual_expert_mesh_uses_edp_replicate_and_shard_axes() -> None:
     assert fsdp_actual_mesh.mesh_dim_names == ("edp_replicate", "edp_shard")
 
 
+def test_source_layout_gradient_scaling_includes_tp_loss_replicas() -> None:
+    """Average TP replicas when every TP rank evaluates the complete loss."""
+    manager = _make_manager()
+    manager.mesh_context.dp_size = 4
+    hsdp_module = Mock()
+
+    configured = manager._configure_source_layout_gradient_scaling(
+        hsdp_module,
+        {Mock(): Mock()},
+    )
+
+    assert configured is True
+    hsdp_module.set_gradient_scaling_factor.assert_called_once_with(1.0 / 16)
+
+
+def test_source_layout_gradient_scaling_excludes_loss_parallel_tp_shards() -> None:
+    """Do not average TP shards that jointly evaluate one distributed loss."""
+    manager = _make_manager()
+    manager.mesh_context.dp_size = 4
+    manager.mesh_context.loss_parallel = True
+    hsdp_module = Mock()
+
+    configured = manager._configure_source_layout_gradient_scaling(
+        hsdp_module,
+        {Mock(): Mock()},
+    )
+
+    assert configured is True
+    hsdp_module.set_gradient_scaling_factor.assert_called_once_with(1.0 / 8)
+
+
 def test_parallelize_rejects_tied_layout_conflict(
     core_metadata,
 ) -> None:
@@ -206,6 +241,7 @@ def test_parallelize_distributes_metadata_and_configures_prefetch(
 
     def _fake_fully_shard(module: nn.Module, **kwargs: object) -> nn.Module:
         """Record one fully_shard call and install prefetch spies."""
+        module.set_gradient_scaling_factor = Mock()
         module.set_modules_to_forward_prefetch = Mock()
         module.set_modules_to_backward_prefetch = Mock()
         fully_shard_calls.append((module, kwargs))
@@ -260,6 +296,7 @@ def test_parallelize_resolves_replicate_parameter_fqns(
 
     def _fake_fully_shard(module: nn.Module, **kwargs: object) -> nn.Module:
         """Record each fully_shard invocation."""
+        module.set_gradient_scaling_factor = Mock()
         module.set_modules_to_forward_prefetch = Mock()
         module.set_modules_to_backward_prefetch = Mock()
         fully_shard_calls.append((module, kwargs))
@@ -276,3 +313,58 @@ def test_parallelize_resolves_replicate_parameter_fqns(
     assert fully_shard_calls[-1][1]["replicate_params"] == {
         model.model.embed_tokens.weight,
     }
+
+
+def test_local_compute_adapter_converts_during_forward_and_restores_afterward(
+    monkeypatch,
+) -> None:
+    """Trainer forward wrapper exposes a local view only within local compute."""
+    class FakeDTensor:
+        """Minimal DTensor stand-in with an observable local view."""
+
+        def __init__(self, local_tensor) -> None:
+            self.local_tensor = local_tensor
+
+        def to_local(self):
+            return self.local_tensor
+
+    class FakeModule:
+        """Provide a minimal module tree and observable forward."""
+
+        def __init__(self, parameter=None, child=None) -> None:
+            self._parameters = {"weight": parameter}
+            self.child = child
+
+        def named_parameters(self, recurse=True):
+            del recurse
+            return tuple(
+                (name, parameter)
+                for name, parameter in self._parameters.items()
+                if parameter is not None
+            )
+
+        def named_modules(self):
+            if self.child is None:
+                return (("", self),)
+            return (("", self), ("child", self.child))
+
+        def forward(self):
+            if self.child is not None:
+                return self.child.forward()
+            return self._parameters["weight"]
+
+    local_tensor = object()
+    unsharded_dtensor = FakeDTensor(local_tensor)
+    child = FakeModule(unsharded_dtensor)
+    module = FakeModule(child=child)
+    monkeypatch.setattr(
+        "hyper_models.components.distributed.local_compute_context.DTensor",
+        FakeDTensor,
+    )
+
+    install_local_compute_forward_adapters(module)
+
+    with local_compute_context():
+        assert module.forward() is local_tensor
+    assert child._parameters["weight"] is unsharded_dtensor
+    assert module.forward() is unsharded_dtensor

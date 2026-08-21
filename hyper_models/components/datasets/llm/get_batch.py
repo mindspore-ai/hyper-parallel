@@ -35,6 +35,7 @@ platform = get_platform()
 MODEL_INPUT_FIELDS = {
     "input_ids",
     "labels",
+    "shift_labels",
     "attention_mask",
     "position_ids",
 }
@@ -46,6 +47,7 @@ LOSS_INPUT_FIELDS = {
 CP_SEQUENCE_FIELDS = {
     "input_ids",
     "labels",
+    "shift_labels",
     "loss_mask",
     "stream_loss_mask",
     "position_ids",
@@ -68,6 +70,7 @@ class LLMBatchProcessor:
             reset_attention_mask: bool,
             eod_mask_loss: bool,
             create_attention_mask: bool,
+            labels_are_shifted: bool = False,
     ) -> None:
         """Store Dataset mask policy and the shared CP sharding capability."""
         self.cp_sharder = cp_sharder
@@ -76,6 +79,7 @@ class LLMBatchProcessor:
         self.reset_attention_mask = reset_attention_mask
         self.eod_mask_loss = eod_mask_loss
         self.create_attention_mask = create_attention_mask
+        self.labels_are_shifted = labels_are_shifted
 
     @staticmethod
     def normalize_source_batch(
@@ -138,6 +142,8 @@ class LLMBatchProcessor:
             "labels": abs(labels),
             "loss_mask": loss_mask,
         }
+        if self.labels_are_shifted:
+            runtime_batch["shift_labels"] = abs(labels)
         for field_name in ("seq_lens", "seq_lens_padded"):
             if field_name in batch:
                 runtime_batch[field_name] = batch[field_name]
@@ -500,6 +506,7 @@ def build_llm_get_batch(
         reset_attention_mask=bool(data_config.get("reset_attention_mask", False)),
         eod_mask_loss=bool(data_config.get("eod_mask_loss", False)),
         create_attention_mask=bool(data_config.get("create_attention_mask_in_dataloader", True)),
+        labels_are_shifted=bool(data_config.get("labels_are_shifted", False)),
     )
     get_batch = LLMGetBatch(parallel_context=parallel_context, transport=transport, processor=processor,
                             cp_distributor=cp_distributor, pipeline_router=pipeline_router)
