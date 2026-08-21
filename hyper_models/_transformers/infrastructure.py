@@ -112,7 +112,15 @@ def instantiate_infrastructure(
         plan_overrides = entries_to_plan_overrides(
             entries,
             cp_size=getattr(mesh_ctx, "cp_size", 1),
-            ep_size=getattr(mesh_ctx, "ep_size", 1))
+            ep_size=getattr(mesh_ctx, "ep_size", 1),
+            low_precision_enabled=bool(
+                getattr(
+                    getattr(distributed_setup, "low_precision_config", None),
+                    "enabled",
+                    False,
+                )
+            ),
+        )
     else:
         plan_overrides = None
     sharding_planner = ShardingPlanner(
@@ -532,22 +540,63 @@ def _apply_module_replacement_actions(
     model: nn.Module,
     distributed_setup,
     weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
+    low_precision_config=None,
 ) -> tuple[nn.Module, list[WeightRenaming | WeightConverter]]:
     """Apply explicit replacement rules before sharding sees the model."""
 
     if weights_mapping is None:
         weights_mapping = get_model_conversion_mapping(model)
     entries = getattr(distributed_setup, "plan_overrides", None) or []
+    mesh_context = getattr(distributed_setup, "mesh_context", None)
+    if low_precision_config is None:
+        low_precision_config = getattr(
+            distributed_setup,
+            "low_precision_config",
+            None,
+        )
+    low_precision_enabled = bool(
+        getattr(low_precision_config, "enabled", False)
+    )
+    context = {
+        "low_precision": low_precision_config if low_precision_enabled else None,
+        "tp": getattr(mesh_context, "tp_size", 1) > 1,
+        "cp": getattr(mesh_context, "cp_size", 1) > 1,
+        "ep": getattr(mesh_context, "ep_size", 1) > 1,
+        "pp": getattr(mesh_context, "pp_size", 1) > 1,
+    }
+    active_model_parallel_axes = [
+        axis.upper()
+        for axis in ("tp", "cp", "ep", "pp")
+        if context[axis]
+    ]
+    if low_precision_enabled and active_model_parallel_axes:
+        raise NotImplementedError(
+            "Low-precision online training currently requires TP=CP=EP=PP=1; "
+            f"active axes: {active_model_parallel_axes}."
+        )
     from hyper_models.components.model_transform import (  # pylint: disable=import-outside-toplevel
         apply_module_replacements,
         compile_module_replacements,
     )
 
-    plan = compile_module_replacements(model, entries_to_module_replacements(entries))
+    rules = entries_to_module_replacements(
+        entries,
+        low_precision_enabled=low_precision_enabled,
+    )
+    if low_precision_enabled and not any(
+        entry.replace_module is not None and entry.when == "low_precision"
+        for entry in entries
+    ):
+        raise ValueError(
+            "low_precision is enabled but no low-precision module replacement "
+            "is configured"
+        )
+    plan = compile_module_replacements(model, rules)
     return apply_module_replacements(
         model,
         plan,
         weights_mapping=weights_mapping,
+        context=context,
     )
 
 
@@ -570,6 +619,7 @@ def apply_model_infrastructure(
     load_base_model: bool = False,
     pretrained_path: Optional[str] = None,
     validate_placement: bool = False,
+    low_precision_config=None,
     **kwargs,
 ) -> nn.Module:
     """Apply model infrastructure (sharding, recompute, FSDP2, and compile).
@@ -622,6 +672,7 @@ def apply_model_infrastructure(
         model,
         distributed_setup,
         weights_mapping,
+        low_precision_config=low_precision_config,
     )
 
     # Step 6: Parameter freezing (before sharding)

@@ -24,6 +24,7 @@ from torch.optim import Optimizer
 from hyper_models.components.checkpoint.config import CheckpointingConfig
 from hyper_models.components.distributed.config import FSDP2Config
 from hyper_models.components.model_transform import ModuleReplacementSpec, module_replacement
+from hyper_models.components.training.low_precision.config import LowPrecisionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class TrainingConfig:
     eval_steps: int = 0
     eval_epochs: int = 0
     logging_steps: int = 1
+    low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
 
 
 @dataclass
@@ -261,14 +263,11 @@ class PlanOverride:
         match: fqn or fqn glob matched (fnmatchcase) against the plan's
             boundary FQNs — ``*`` spans dots, so ``"*.self_attn"`` hits
             ``model.layers.0.self_attn``.
-        when: optional activation condition for sharding actions — ``"cp"``
-            (active when cp_size>1) / ``"ep"`` (ep_size>1); omitted = always
-            applied. Self-documents CP/EP-required injections in the YAML
-            and makes one config reusable across parallel topologies (an
-            inactive entry is skipped with an INFO log, never silently
-            applied). Not supported on ``replace_module`` entries — module
-            replacements are structure-preserving substitutions, not
-            parallel-topology-conditioned injections.
+        when: optional activation condition. Sharding actions accept ``"cp"``
+            (active when cp_size>1), ``"ep"`` (ep_size>1), or
+            ``"low_precision"`` (active when online low precision is
+            enabled). A replacement action accepts only ``"low_precision"``;
+            module replacement must not depend on the parallel topology.
         local_compute_fn: a Target whose callable is a **factory** — must be
             decorated ``@local_compute`` (injection discipline); the mesh
             family ``mesh``/``tp_mesh``/``cp_mesh``/``ep_mesh`` is mandatory
@@ -328,7 +327,7 @@ class PlanOverride:
     """
 
     match: Union[str, List[str]]
-    when: Optional[Literal["cp", "ep"]] = None
+    when: Optional[Literal["cp", "ep", "low_precision"]] = None
     module_type: Optional[str] = None
     exact_type: bool = False
     replace_module: Optional[Target[Any]] = None
@@ -465,7 +464,7 @@ class PlanOverride:
         }
 
 
-_WHEN_CONDITIONS = ("cp", "ep")
+_WHEN_CONDITIONS = ("cp", "ep", "low_precision")
 
 
 def _import_module_type(path: str) -> type:
@@ -518,19 +517,23 @@ def _target_replacement_factory(target: Target[Any]):
 
 def entries_to_module_replacements(
     entries: List[PlanOverride],
+    *,
+    low_precision_enabled: bool = False,
 ) -> tuple[ModuleReplacementSpec, ...]:
-    """Desugar YAML replacement actions without involving the sharding planner."""
+    """Desugar active YAML replacement actions without involving sharding."""
 
     rules = []
     for entry in entries:
         if entry.replace_module is None:
             continue
-        if entry.when is not None:
+        if entry.when not in (None, "low_precision"):
             raise ValueError(
                 f"plan_overrides match={entry.match!r} uses replace_module and "
-                "does not support 'when' (module replacements are not "
-                "conditioned on parallel topology)"
+                "does not support 'when' values other than 'low_precision' "
+                "(module replacements are not conditioned on parallel topology)"
             )
+        if entry.when == "low_precision" and not low_precision_enabled:
+            continue
         if entry.module_type is None:
             raise ValueError(
                 f"plan_overrides match={entry.match!r} uses replace_module but omits module_type"
@@ -573,6 +576,7 @@ def _validate_when(entry: PlanOverride) -> None:
 
 def entries_to_plan_overrides(
         entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
+        low_precision_enabled: bool = False,
 ) -> "dict[str, Any]":
     """Desugar PlanOverride entries into a ``plan_overrides`` dict.
 
@@ -594,20 +598,27 @@ def entries_to_plan_overrides(
                 "plan_overrides match lists are supported only for replace_module "
                 "entries; use separate string matches for sharding actions"
             )
-        if entry.replace_module is not None and entry.when is not None:
+        if entry.replace_module is not None and entry.when not in (
+            None,
+            "low_precision",
+        ):
             raise ValueError(
                 f"plan_overrides match={entry.match!r} uses replace_module and "
-                "does not support 'when' (module replacements are not "
-                "conditioned on parallel topology)"
+                "does not support 'when' values other than 'low_precision' "
+                "(module replacements are not conditioned on parallel topology)"
             )
         _validate_when(entry)
         if entry.when is not None:
-            size = cp_size if entry.when == "cp" else ep_size
-            if size <= 1:
+            active = {
+                "cp": cp_size > 1,
+                "ep": ep_size > 1,
+                "low_precision": low_precision_enabled,
+            }[entry.when]
+            if not active:
                 logger.info(
-                    "plan_overrides: match=%r skipped (when=%r but "
-                    "%s_size=%d — 声明式条件不满足，entry 不生效)",
-                    entry.match, entry.when, entry.when, size)
+                    "plan_overrides: match=%r skipped because condition %r "
+                    "is inactive",
+                    entry.match, entry.when)
                 continue
         if entry.replace_module is not None and not _has_sharding_action(entry):
             continue
