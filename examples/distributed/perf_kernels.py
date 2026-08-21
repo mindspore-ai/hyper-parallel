@@ -19,7 +19,7 @@ PYTHONPATH 上可 import，就能被 YAML 的 ``_target_`` 引用。本文件演
   out_src 真校验（不再是适配器 to_local + 声明式重包的黑盒路径）；
 - **replace_module 契约**（`CheckpointMappedLinear` / `NpuGroupedMoe`）：
   替换完整 `nn.Module`，并由 replacement 的 `make_transforms()` 声明相对
-  checkpoint key 重命名或 load-time 布局转换。
+  source module 到 replacement 的参数重命名或布局转换。
 
 两个计数器（FLASH_CALLS/FUSED_CALLS）用于证明替换真正生效。
 """
@@ -28,13 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers.core_model_loading import (
-    Concatenate,
-    MergeModulelist,
-    Transpose,
-    WeightConverter,
-    WeightRenaming,
-)
+from transformers.core_model_loading import Transpose, WeightConverter, WeightRenaming
 
 from hyper_parallel.auto_models.components.distributed.injection import (
     inner_wrapper,
@@ -173,24 +167,14 @@ class NpuGroupedMoe(nn.Module):
     def make_transforms(self):
         return [
             WeightConverter(
-                source_patterns=[
-                    "experts.*.gate_proj.weight",
-                    "experts.*.up_proj.weight",
-                ],
+                source_patterns="experts.gate_up_proj",
                 target_patterns="experts.gate_up_proj",
-                operations=[
-                    MergeModulelist(dim=0),
-                    Concatenate(dim=1),
-                    Transpose(dim0=1, dim1=2),
-                ],
+                operations=[Transpose(dim0=1, dim1=2)],
             ),
             WeightConverter(
-                source_patterns="experts.*.down_proj.weight",
+                source_patterns="experts.down_proj",
                 target_patterns="experts.down_proj",
-                operations=[
-                    MergeModulelist(dim=0),
-                    Transpose(dim0=1, dim1=2),
-                ],
+                operations=[Transpose(dim0=1, dim1=2)],
             ),
         ]
 

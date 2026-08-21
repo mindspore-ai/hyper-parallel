@@ -653,7 +653,14 @@ def test_dsa_attention_runs_real_custom_ops_forward_and_backward() -> None:
         hidden_states,
         (cos, sin),
         None,
-        actual_seq_len=[sequence_length],
+        packed_seq_params={
+            "cu_seq_lens_q": torch.tensor(
+                [0, sequence_length], device="npu", dtype=torch.int32
+            ),
+            "cu_seq_lens_k": torch.tensor(
+                [0, sequence_length], device="npu", dtype=torch.int32
+            ),
+        },
         return_bias=True,
     )
     assert output.shape == hidden_states.shape

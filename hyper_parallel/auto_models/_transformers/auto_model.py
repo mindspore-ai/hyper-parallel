@@ -43,6 +43,12 @@ from hyper_parallel.auto_models.trainer.config import CompileConfig
 logger = logging.getLogger(__name__)
 
 
+def _has_module_replacements(distributed_setup: Any) -> bool:
+    """Return whether the distributed setup declares module replacement."""
+    entries = getattr(distributed_setup, "plan_overrides", None) or []
+    return any(getattr(entry, "replace_module", None) is not None for entry in entries)
+
+
 def _current_device() -> torch.device:
     """Return the current accelerator device, or CPU when no accelerator exists."""
     device_type = get_device_type()
@@ -67,6 +73,11 @@ class _BaseHyperAutoModelClass:
         # Mixin: `super()` resolves to the HF AutoModel base at runtime (see
         # HyperAutoModelForCausalLM etc. below), which provides from_pretrained.
         return super().from_pretrained(*args, **kwargs)  # pylint: disable=E1101
+
+    @classmethod
+    def _from_config_parent_class(cls, *args, **kwargs):
+        """Delegate to the parent Hugging Face AutoModel ``from_config`` path."""
+        return super().from_config(*args, **kwargs)  # pylint: disable=no-member
 
     @classmethod
     def from_pretrained(
@@ -243,7 +254,9 @@ class _BaseHyperAutoModelClass:
             get_world_size_safe,
         )
         is_meta_device = (
-            get_world_size_safe() > 1 or not is_hf_model
+            get_world_size_safe() > 1
+            or not is_hf_model
+            or _has_module_replacements(distributed_setup)
         ) and kwargs.get("quantization_config") is None
 
         init_ctx = (
@@ -253,10 +266,15 @@ class _BaseHyperAutoModelClass:
         )
 
         # Step 2: Build model
+        # Distributed construction only needs the model structure here.  The
+        # checkpoint is loaded into the finalized shards in step 12; invoking
+        # Hugging Face ``from_pretrained`` under a meta context would make every
+        # rank read the full checkpoint before that distributed load.
+        model_init_path = None if is_meta_device else pretrained_model_name_or_path
         with init_ctx:
             is_custom_model, model = _init_model(
                 cls,
-                pretrained_model_name_or_path,
+                model_init_path,
                 hf_config,
                 attn_implementation,
                 torch_dtype,

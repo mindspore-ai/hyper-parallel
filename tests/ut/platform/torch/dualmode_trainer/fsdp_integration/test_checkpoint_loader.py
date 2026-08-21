@@ -29,7 +29,13 @@ from safetensors.torch import save_file
 from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 from transformers.conversion_mapping import get_model_conversion_mapping
-from transformers.core_model_loading import Chunk, WeightConverter, WeightRenaming
+from transformers.core_model_loading import (
+    Chunk,
+    ConversionOps,
+    Transpose,
+    WeightConverter,
+    WeightRenaming,
+)
 
 import hyper_parallel.auto_models._transformers.checkpoint_loader as checkpoint_loader
 import hyper_parallel.auto_models._transformers.infrastructure as infrastructure_module
@@ -53,6 +59,23 @@ class _QKModel(nn.Module):
         super().__init__()
         self.q_proj = nn.Parameter(torch.zeros(2, 2))
         self.k_proj = nn.Parameter(torch.zeros(2, 2))
+
+
+class _AddScalar(ConversionOps):
+    """Minimal converter used to distinguish repeated scoped patterns."""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        del kwargs
+        tensor = input_dict[source_patterns[0]]
+        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        return {target_patterns[0]: tensor + self.value}
+
+    @property
+    def reverse_op(self):
+        return _AddScalar(-self.value)
 
 
 @arg_mark(
@@ -233,18 +256,12 @@ def test_qwen3_moe_replacement_converts_raw_expert_checkpoint(tmp_path) -> None:
         and transform.scope_prefix == "model.layers.0.mlp"
         and transform.target_patterns == ["experts.down_proj"]
     )
-    assert gate_up_mapping.source_patterns == [
-        "experts.*.gate_proj.weight",
-        "experts.*.up_proj.weight",
-    ]
-    assert down_mapping.source_patterns == ["experts.*.down_proj.weight"]
+    assert gate_up_mapping.source_patterns == ["experts.gate_up_proj"]
+    assert down_mapping.source_patterns == ["experts.down_proj"]
     assert [type(operation).__name__ for operation in gate_up_mapping.operations] == [
-        "MergeModulelist",
-        "Concatenate",
         "Transpose",
     ]
     assert [type(operation).__name__ for operation in down_mapping.operations] == [
-        "MergeModulelist",
         "Transpose",
     ]
 
@@ -289,6 +306,78 @@ def test_qwen3_moe_replacement_converts_raw_expert_checkpoint(tmp_path) -> None:
     card_mark="onecard",
     essential_mark="essential",
 )
+def test_replacement_fuses_inverse_checkpoint_transposes(tmp_path, monkeypatch) -> None:
+    """An official transpose followed by its replacement inverse is eliminated."""
+    checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    save_file({"proj.weight": checkpoint_weight}, str(tmp_path / "model.safetensors"))
+    model = nn.Module()
+    model.proj = nn.Linear(2, 3, bias=False)
+
+    replacement = WeightConverter("weight", "weight", [Transpose(0, 1)])
+    replacement.scope_prefix = "proj"
+    official = WeightConverter(
+        "proj.weight",
+        "proj.weight",
+        [Transpose(0, 1, check_dims=True)],
+    )
+    model._hp_checkpoint_source_shapes = {"proj.weight": (2, 3)}
+    model._hp_replacement_weight_conversions = [replacement]
+
+    monkeypatch.setattr(
+        Transpose,
+        "convert",
+        Mock(side_effect=AssertionError("inverse transposes should be eliminated")),
+    )
+    checkpoint_loader.CheckpointManager(model).load_checkpoint(
+        str(tmp_path),
+        weights_mapping=[replacement, official],
+    )
+
+    torch.testing.assert_close(model.proj.weight, checkpoint_weight, rtol=0.0, atol=0.0)
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_replacement_transposes_checkpoint_in_source_layout(tmp_path) -> None:
+    """A checkpoint already in the source layout needs only the replacement transpose."""
+    checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    save_file({"proj.weight": checkpoint_weight}, str(tmp_path / "model.safetensors"))
+    model = nn.Module()
+    model.proj = nn.Linear(2, 3, bias=False)
+
+    replacement = WeightConverter("weight", "weight", [Transpose(0, 1)])
+    replacement.scope_prefix = "proj"
+    official = WeightConverter(
+        "proj.weight",
+        "proj.weight",
+        [Transpose(0, 1, check_dims=True)],
+    )
+    model._hp_checkpoint_source_shapes = {"proj.weight": (2, 3)}
+    model._hp_replacement_weight_conversions = [replacement]
+
+    checkpoint_loader.CheckpointManager(model).load_checkpoint(
+        str(tmp_path),
+        weights_mapping=[replacement, official],
+    )
+
+    torch.testing.assert_close(
+        model.proj.weight,
+        checkpoint_weight.transpose(0, 1).contiguous(),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
 def test_load_pretrained_weights_applies_converter(tmp_path, monkeypatch) -> None:
     """
     Feature: Transformers weight conversion.
@@ -315,6 +404,35 @@ def test_load_pretrained_weights_applies_converter(tmp_path, monkeypatch) -> Non
 
     assert torch.equal(model.q_proj, fused[:2])
     assert torch.equal(model.k_proj, fused[2:])
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_load_selects_converter_by_scope_when_patterns_repeat(tmp_path) -> None:
+    """Repeated local patterns must use the converter for their module scope."""
+    model = nn.Sequential(_SingleWeightModel(), _SingleWeightModel())
+    checkpoint = {
+        "0.proj.weight": torch.zeros(2, 2),
+        "1.proj.weight": torch.zeros(2, 2),
+    }
+    save_file(checkpoint, str(tmp_path / "model.safetensors"))
+    mapping = []
+    for scope, value in (("0.proj", 1.0), ("1.proj", 2.0)):
+        converter = WeightConverter("weight", "weight", [_AddScalar(value)])
+        converter.scope_prefix = scope
+        mapping.append(converter)
+
+    checkpoint_loader.CheckpointManager(model).load_checkpoint(
+        str(tmp_path),
+        weights_mapping=mapping,
+    )
+
+    torch.testing.assert_close(model[0].proj.weight, torch.ones(2, 2))
+    torch.testing.assert_close(model[1].proj.weight, torch.full((2, 2), 2.0))
 
 
 @arg_mark(

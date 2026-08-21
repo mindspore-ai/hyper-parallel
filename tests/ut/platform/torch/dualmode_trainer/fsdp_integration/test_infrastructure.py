@@ -247,6 +247,30 @@ def test_initialize_model_weights_avoids_retying_parameters() -> None:
     card_mark="onecard",
     essential_mark="essential",
 )
+def test_initialize_model_weights_resets_replacement_specific_state() -> None:
+    """Initialize state owned by a replacement after native model initialization."""
+    calls = []
+    replacement = nn.Module()
+    replacement._hp_reset_after_materialization = True
+    replacement.reset_parameters = Mock(
+        side_effect=lambda: calls.append("replacement")
+    )
+    model = nn.Sequential(replacement)
+    model.initialize_weights = Mock(side_effect=lambda: calls.append("native"))
+
+    infrastructure_module._initialize_model_weights(model)
+
+    model.initialize_weights.assert_called_once_with()
+    replacement.reset_parameters.assert_called_once_with()
+    assert calls == ["native", "replacement"]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
 def test_finalize_model_loading_initializes_derived_buffer_without_changing_loaded_weight() -> None:
     """
     Feature: Deferred pretrained finalization.
