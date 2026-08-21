@@ -31,6 +31,9 @@ from hyper_models.ops.rotary_embedding import (
     apply_rotary_pos_emb_interleave,
 )
 from hyper_models.ops.sink_attention import sink_attention
+from hyper_models.ops.mhc_post import mhc_post, mhc_post_process
+from hyper_models.ops.mhc_pre import hc_split_sinkhorn_torch, mhc_pre
+from hyper_models.ops.sinkhorn import sinkhorn, sinkhorn_knopps
 from hyper_models.ops.swiglu import swiglu
 
 __all__ = [
@@ -50,5 +53,11 @@ __all__ = [
     "rms_norm",
     "set_aux_loss_scale",
     "sink_attention",
+    "hc_split_sinkhorn_torch",
+    "mhc_post",
+    "mhc_post_process",
+    "mhc_pre",
+    "sinkhorn",
+    "sinkhorn_knopps",
     "swiglu",
 ]

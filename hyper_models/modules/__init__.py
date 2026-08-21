@@ -20,6 +20,8 @@ from hyper_models.modules.grouped_experts import GroupedExperts
 from hyper_models.modules.mla_attention import MLAAttention
 from hyper_models.modules.rms_norm import OffsetRMSNorm, RMSNorm
 from hyper_models.modules.shared_expert import SharedExpert
+from hyper_models.modules.mhc import MhcPostModule, MhcPostProcessModule, MhcPreModule
+from hyper_models.modules.swiglu_mlp import SwiGLUMLP
 
 __all__ = [
     "DeepseekV32DSAAttention",
@@ -31,4 +33,8 @@ __all__ = [
     "OffsetRMSNorm",
     "RMSNorm",
     "SharedExpert",
+    "MhcPostModule",
+    "MhcPostProcessModule",
+    "MhcPreModule",
+    "SwiGLUMLP",
 ]
