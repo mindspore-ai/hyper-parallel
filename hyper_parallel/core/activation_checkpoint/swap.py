@@ -100,13 +100,15 @@ class SwapTensor:
     STATE_H2D = "h2d"
     STATE_NON_TENSOR = "non_tensor"
 
-    def __init__(self, val: Any, funcname: str, group_swap: bool = False) -> None:
+    def __init__(self, val: Any, funcname: str, group_swap: bool = False, cpu_pool=None) -> None:
         self.val = val
         self.funcname = funcname
         self._keep_on_device = False
         self._duplicate_swap = False
         self._group_managed = False # True when this tensor is handled by SwapGroup bulk copy
         self.group_swap = group_swap # opt-in for group copy fusion (MUST_SWAP tensors only)
+        self.cpu_pool = cpu_pool
+        self._cpu_pool_buffer = None
         if isinstance(val, platform.Tensor) and str(val.device).lower() != 'cpu':
             self.ver = val._version
             self._state = self.STATE_DEVICE
@@ -189,7 +191,7 @@ class SwapTensor:
         if self.val_cpu is None:
             raise ValueError("val_cpu must not be None during async_load")
         with platform.preserve_version_counter(self.val):
-            if self.is_slice_tensor:
+            if self.cpu_pool is not None or self.is_slice_tensor:
                 self.val.data.copy_(self.val_cpu, non_blocking=True)
             else:
                 self.val.untyped_storage().copy_(self.val_cpu.untyped_storage(), non_blocking=True)
@@ -216,7 +218,16 @@ class SwapTensor:
             self.val.copy_(source.reshape(self.val.shape), non_blocking=True)
         self._state = self.STATE_H2D
 
-    def wait_load(self):
+    def release_cpu_buffer(self, event=None):
+        """Release an explicitly pooled host buffer exactly once."""
+        if self.cpu_pool is None or self._cpu_pool_buffer is None:
+            return
+        release_tensor = self.val_cpu if self.val_cpu is not None else self._cpu_pool_buffer
+        self.cpu_pool.release(release_tensor, event=event)
+        self._cpu_pool_buffer = None
+        self.val_cpu = None
+
+    def wait_load(self, release_event=None):
         """change state to device after async load is done"""
         if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
             return
@@ -230,6 +241,9 @@ class SwapTensor:
             )
             return
         self._state = self.STATE_DEVICE
+        self.release_cpu_buffer(release_event)
+        if self.cpu_pool is None:
+            self.val_cpu = None
 
     def async_offload(self):
         """async offload tensor from device to host"""
@@ -257,13 +271,30 @@ class SwapTensor:
             )
 
         if self.val_cpu is None:
-            self.val_cpu = platform.empty_like(
-                self.val, device="cpu", pin_memory=True
-            )
-        if self.is_slice_tensor:
-            self.val_cpu.copy_(self.val, non_blocking=True)
-        else:
-            self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
+            if self.cpu_pool is None:
+                self.val_cpu = platform.empty_like(
+                    self.val, device="cpu", pin_memory=True
+                )
+            else:
+                logical_bytes = self.val.numel() * platform.get_element_size(self.val)
+                self._cpu_pool_buffer = self.cpu_pool.acquire(logical_bytes)
+                try:
+                    self.val_cpu = self._cpu_pool_buffer.view(self.val.dtype).reshape(self.val.shape)
+                except Exception:
+                    self.release_cpu_buffer()
+                    raise
+        try:
+            if self.cpu_pool is not None or self.is_slice_tensor:
+                self.val_cpu.copy_(self.val, non_blocking=True)
+            else:
+                self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
+        except Exception:
+            if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
+                release_event = platform.new_event()
+                release_event.record(platform.get_current_stream())
+                self.release_cpu_buffer(release_event)
+            self.val_cpu = None
+            raise
         self._state = self.STATE_D2H
 
     def wait_offload(self):
@@ -382,17 +413,28 @@ class Storage:
             for item in storage_list:
                 platform.tree_map(_resize, item)
 
-    def wait_load(self):
+    def wait_load(self, release_event=None):
         """wait load for all tensors in swap storage"""
         def _wait_load(x):
             if isinstance(x, SwapTensor):
-                x.wait_load()
+                x.wait_load(release_event=release_event)
             return x
 
         for storage_list in self.values():
             for item in storage_list:
                 platform.tree_map(_wait_load, item)
         self.clear()
+
+    def release_cpu_buffers(self, event=None):
+        """Release all explicitly pooled host buffers held by this storage."""
+        def _release(x):
+            if isinstance(x, SwapTensor):
+                x.release_cpu_buffer(event=event)
+            return x
+
+        for storage_list in self.values():
+            for item in storage_list:
+                platform.tree_map(_release, item)
 
     def wait_offload(self):
         """wait offload for all tensors in swap storage"""
@@ -513,18 +555,19 @@ class SwapGroup:
                     f"There is a tensor from {x.funcname} cannot be SWAPPED! In-place modification happened "
                     f"preversion:{x.ver}, current version:{x.val._version}"
                 )
-            dtype_key = str(x.val.dtype)
+            dtype_key = (str(x.val.dtype), id(x.cpu_pool))
             dtype_buckets = candidate_buckets.setdefault(dtype_key, [])
             if (not dtype_buckets or
                     dtype_buckets[-1]["total_bytes"] + x.storage_size > _GROUP_SWAP_MAX_BULK_COPY_BYTES):
                 dtype_buckets.append({
                     "bucket_key": f"{dtype_key}#{len(dtype_buckets)}",
                     "dtype": x.val.dtype,
-                    "dtype_key": dtype_key,
+                    "dtype_key": str(x.val.dtype),
                     "device": x.val.device,
                     "tensors": [],
                     "total_bytes": 0,
                     "total_numel": 0,
+                    "cpu_pool": x.cpu_pool,
                 })
             bucket = dtype_buckets[-1]
             bucket["tensors"].append(x)
@@ -548,6 +591,8 @@ class SwapGroup:
                     "dtype_key": candidate_bucket["dtype_key"],
                     "device": candidate_bucket["device"],
                     "total_numel": candidate_bucket["total_numel"],
+                    "total_bytes": candidate_bucket["total_bytes"],
+                    "cpu_pool": candidate_bucket["cpu_pool"],
                 }
                 element_offset = 0
                 for tensor in tensors:
@@ -589,12 +634,32 @@ class SwapGroup:
 
             if total_bytes > 0:
                 # One-shot D2H per packed bucket. MindSpore requires tensor/storage dtype consistency.
-                for bucket_key, bucket in self._packed_buckets.items():
-                    dtype_key = bucket["dtype_key"]
-                    numel = bucket["total_numel"]
-                    cpu_buf = _get_cpu_pinned_buf(dtype_key, numel, bucket["dtype"])
-                    group_cpu_bufs[bucket_key] = cpu_buf
-                    cpu_buf[:numel].copy_(group_device_bufs[bucket_key], non_blocking=True)
+                try:
+                    for bucket_key, bucket in self._packed_buckets.items():
+                        dtype_key = bucket["dtype_key"]
+                        numel = bucket["total_numel"]
+                        cpu_pool = bucket["cpu_pool"]
+                        if cpu_pool is None:
+                            cpu_buf = _get_cpu_pinned_buf(dtype_key, numel, bucket["dtype"])
+                        else:
+                            raw_buf = cpu_pool.acquire(bucket["total_bytes"])
+                            try:
+                                cpu_buf = raw_buf.view(bucket["dtype"])
+                            except Exception:
+                                cpu_pool.release(raw_buf)
+                                raise
+                        group_cpu_bufs[bucket_key] = cpu_buf
+                        cpu_buf[:numel].copy_(group_device_bufs[bucket_key], non_blocking=True)
+                except Exception:
+                    release_event = platform.new_event()
+                    release_event.record(copy_stream)
+                    for bucket_key, cpu_buf in group_cpu_bufs.items():
+                        bucket = self._packed_buckets[bucket_key]
+                        if bucket["cpu_pool"] is not None:
+                            bucket["cpu_pool"].release(cpu_buf, event=release_event)
+                        else:
+                            _return_cpu_pinned_buf(cpu_buf)
+                    raise
                 self._group_device_buf = group_device_bufs
                 self._group_cpu_buf = group_cpu_bufs
 
@@ -669,6 +734,18 @@ class SwapGroup:
                 storage.launch_load()    # Only copy, no resize
             self._load_event.record(copy_stream)
 
+    def release_cpu_buffers(self, event=None):
+        """Release staging buffers immediately or defer until ``event`` completes."""
+        if self._group_cpu_buf is None:
+            return
+        for bucket_key, buf in self._group_cpu_buf.items():
+            bucket = self._packed_buckets.get(bucket_key)
+            if bucket is not None and bucket["cpu_pool"] is not None:
+                bucket["cpu_pool"].release(buf, event=event)
+            else:
+                _return_cpu_pinned_buf(buf)
+        self._group_cpu_buf = None
+
     def wait_load(self):
         """Wait for grouped H2D and D2D loads to complete."""
         if self._load_event is None:
@@ -676,25 +753,21 @@ class SwapGroup:
                 f"SwapGroup '{self.group_name}' wait_load() called before launch_load()."
             )
         compute_stream = platform.get_current_stream()
+        load_event = self._load_event
         stream_context = platform.get_stream_context()
         with platform.no_grad(), stream_context(compute_stream):
-            self._load_event.wait(compute_stream)
-            self._load_event = None
+            load_event.wait(compute_stream)
             for storage in self._storages:
-                storage.wait_load()
+                storage.wait_load(release_event=load_event)
+            self._load_event = None
         self._storages.clear()
-        # Return CPU pinned buffers to the pool.  By the time wait_load
-        # returns, _load_event has fired on the compute stream, which
-        # means the copy stream's H2D transfer has completed and the CPU
-        # buffer is no longer being read by the DMA engine.  The next
-        # launch_offload (start of the following iteration) will pop these
-        # buffers from the pool, well after the current H2D is done.
-        if self._group_cpu_buf is not None:
-            for buf in self._group_cpu_buf.values():
-                _return_cpu_pinned_buf(buf)
-        self._group_cpu_buf = None
-        # D2D unpack has restored each original storage, so the staging device
-        # buffers can be released after the load event reaches the compute stream.
+        # Keep explicit-pool buffers pending until the copy event completes;
+        # legacy buffers retain their existing immediate-reuse behavior.
+        self.release_cpu_buffers(event=load_event)
+        # Device buffer: the pool holds the staging reference; just drop
+        # the local reference.  Tensors aliasing _group_device_buf's
+        # storage keep it alive via their own storage references until
+        # they are consumed in backward.
         self._group_device_buf = None
         self._packed_tensor_info = []
         self._packed_buckets = {}
@@ -794,6 +867,9 @@ class SwapManager:
         for event in (group._offload_event, group._load_event):
             if event is not None:
                 event.synchronize()
+        for storage in group._storages:
+            storage.release_cpu_buffers()
+        group.release_cpu_buffers()
         group._storages.clear()
 
     def get_current_group_name(self) -> str:

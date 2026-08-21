@@ -187,12 +187,13 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
     """
     Context manager to offload tensors to CPU during forward pass.
     """
-    def __init__(self, policy_fn=None, group_swap: bool = False) -> None:
+    def __init__(self, policy_fn=None, group_swap: bool = False, cpu_pool=None) -> None:
         _raise_if_compiling("AsyncSaveOnCpu")
         self.add_to_storage = False
         self.storage = Storage()
         self.count_idx = 0
         self.policy_fn = policy_fn
+        self.cpu_pool = cpu_pool
 
         # Cache per-context-manager state once to avoid per-tensor singleton lookups.
         swap_manager = SwapManager()
@@ -214,7 +215,7 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
             funcname = f"{group_name}::{tensor.shape}"
             detached = tensor.detach()
             self.storage[self.count_idx].append(
-                SwapTensor(detached, funcname, group_swap=group_swap)
+                SwapTensor(detached, funcname, group_swap=group_swap, cpu_pool=cpu_pool)
             )
             self.count_idx += 1
             return detached
@@ -366,15 +367,22 @@ class SwapWrapper(ActivationWrapper):
         mod: Union[nn.Module, Callable],
         policy_fn: Optional[Callable] = None,
         group_swap: bool = False,
+        cpu_pool=None,
     ):
         super().__init__(mod)
         self.policy_fn = policy_fn
         self.group_swap = group_swap
+        self.cpu_pool = cpu_pool
 
     def forward(self, *args, **kwargs):
         """Run the wrapped module inside an AsyncSaveOnCpu context for activation swapping."""
         _raise_if_compiling("swap_wrapper")
-        with AsyncSaveOnCpu(policy_fn=self.policy_fn, group_swap=self.group_swap):
+        async_kwargs = {
+            "policy_fn": self.policy_fn,
+            "group_swap": self.group_swap,
+            "cpu_pool": self.cpu_pool,
+        }
+        with AsyncSaveOnCpu(**async_kwargs):
             return self._swap_wrapped_module(*args, **kwargs)
 
 
@@ -382,17 +390,37 @@ def swap_wrapper(
     module: Union[nn.Module, Callable],
     policy_fn: Optional[Callable] = None,
     group_swap: bool = False,
+    cpu_pool=None,
 ) -> SwapWrapper:
-    """Wrap a module or callable with activation swap functionality."""
-    return SwapWrapper(module, policy_fn, group_swap)
+    """Wrap a module or callable with activation swap functionality.
+
+    Args:
+        module: Module or callable to wrap.
+        policy_fn: Optional per-tensor swap policy.
+        group_swap: Whether tensors participate in group copy fusion.
+        cpu_pool: Optional pinned host memory pool for swapped tensors.
+
+    Returns:
+        Configured activation swap wrapper.
+    """
+    return SwapWrapper(module, policy_fn, group_swap, cpu_pool)
 
 
-def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = False):
+def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = False, cpu_pool=None):
     """Register selected tensors into the current swap group.
 
     This helper is intended to be used inside a forward path that already
     participates in the existing swap scheduling managed by ``SwapManager``.
     It preserves the input structure and returns the original tensors.
+
+    Args:
+        target: Tensor or nested tensor structure to register.
+        tag: Optional debug tag.
+        group_swap: Whether tensors participate in group copy fusion.
+        cpu_pool: Optional pinned host memory pool for swapped tensors.
+
+    Returns:
+        The registered tensor structure.
     """
     _raise_if_compiling("swap_tensor_wrapper")
     swap_manager = SwapManager()
@@ -415,7 +443,9 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = Fa
 
         tensor_tag = tag or f"{group_name}_swap_tensor"
         funcname = f"{tensor_tag}::{tuple(tensor.shape)}"
-        storage[count_idx].append(SwapTensor(tensor, funcname, group_swap=group_swap))
+        storage[count_idx].append(
+            SwapTensor(tensor, funcname, group_swap=group_swap, cpu_pool=cpu_pool)
+        )
         count_idx += 1
         return tensor
 
