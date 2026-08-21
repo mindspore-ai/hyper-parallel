@@ -426,6 +426,34 @@ def test_grouped_experts_weight_conversion_loads_target_and_reverses() -> None:
     card_mark="onecard",
     essential_mark="essential",
 )
+def test_grouped_experts_random_initialization_uses_model_config() -> None:
+    """Random initialization must follow the source module's initializer."""
+    config = _tiny_config()
+    source = modeling.Qwen3_5MoeExperts(config)
+    replacement = GroupedExperts(module=source)
+
+    torch.manual_seed(19)
+    expected_gate_up = torch.empty_like(replacement.gate_up_proj).normal_(
+        mean=0.0,
+        std=config.initializer_range,
+    )
+    expected_down = torch.empty_like(replacement.down_proj).normal_(
+        mean=0.0,
+        std=config.initializer_range,
+    )
+    torch.manual_seed(19)
+    replacement.reset_parameters()
+
+    torch.testing.assert_close(replacement.gate_up_proj, expected_gate_up)
+    torch.testing.assert_close(replacement.down_proj, expected_down)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
 def test_shared_expert_weight_conversion_loads_target_and_reverses() -> None:
     """Separate shared projections must load and restore their original layout."""
     source = _SeparateSharedSource()

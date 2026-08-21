@@ -17,8 +17,12 @@
 from typing import Any, Optional, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as functional  # pylint: disable=forbidden-backend-import
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
+
+try:
+    import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+except ImportError:
+    omni_training_custom_ops = None
 
 
 class _MhcPost(torch.autograd.Function):
@@ -33,6 +37,8 @@ class _MhcPost(torch.autograd.Function):
         h_post: torch.Tensor,
     ) -> torch.Tensor:
         """Run the NPU MHC post forward operator."""
+        if omni_training_custom_ops is None:
+            raise ImportError("MHC AscendC requires omni_training_custom_ops")
         ctx.save_for_backward(x, h_res, h_out, h_post)
         return torch.ops.custom.npu_ai_infra_manifold_constrained_hyper_connection_post(
             x,
@@ -127,10 +133,10 @@ def mhc_post_process(
     x = x.float()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
     if gamma is not None:
-        weight = functional.linear(x * rsqrt * gamma, phi)
+        weight = F.linear(x * rsqrt * gamma, phi)  # pylint: disable=not-callable
     else:
-        weight = functional.linear(x, phi) * rsqrt
-    h_pre = functional.sigmoid(
+        weight = F.linear(x, phi) * rsqrt  # pylint: disable=not-callable
+    h_pre = torch.sigmoid(
         weight * branch_alpha + branch_beta.unsqueeze(0).unsqueeze(0)
     ) + hc_eps
     if hpre_renorm:

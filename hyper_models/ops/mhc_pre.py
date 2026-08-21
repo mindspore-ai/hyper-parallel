@@ -17,8 +17,12 @@
 from typing import Any, Optional, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as functional  # pylint: disable=forbidden-backend-import
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
+
+try:
+    import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+except ImportError:
+    omni_training_custom_ops = None
 
 from hyper_models.ops.sinkhorn import sinkhorn, sinkhorn_knopps
 
@@ -39,6 +43,8 @@ class _MhcPre(torch.autograd.Function):
         hc_eps: float = 1e-6,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the NPU MHC pre forward operator."""
+        if omni_training_custom_ops is None:
+            raise ImportError("MHC AscendC requires omni_training_custom_ops")
         hin, h_post, h_comb_before, inv_rms, h_mix, h_pre = (
             torch.ops.custom.npu_manifold_constrained_hyper_connection_pre(
                 x,
@@ -53,6 +59,7 @@ class _MhcPre(torch.autograd.Function):
         )
         ctx.save_for_backward(x, phi, alpha, gamma, h_post, inv_rms, h_mix, h_pre)
         ctx.hc_eps = hc_eps
+        ctx.has_gamma = gamma is not None
         return hin, h_pre, h_post, h_comb_before, x
 
     @staticmethod
@@ -65,6 +72,7 @@ class _MhcPre(torch.autograd.Function):
         dh_x: torch.Tensor,
     ) -> tuple:
         """Run the NPU MHC pre backward operator."""
+        del dh_pre
         x, phi, alpha, gamma, h_post, inv_rms, h_mix, h_pre = ctx.saved_tensors
         hc_eps = ctx.hc_eps
         dx, dphi, dalpha, dbias, dgamma = (
@@ -84,6 +92,8 @@ class _MhcPre(torch.autograd.Function):
                 grad_x_post=dh_x,
             )
         )
+        if not ctx.has_gamma:
+            dgamma = None
         grads = [dx, dphi, dalpha, dbias, dgamma, None, None, None]
         return tuple(grads)
 
@@ -114,11 +124,11 @@ def hc_split_sinkhorn_torch(
 
     hpre_input_alpha = h_pre * branch_alpha[0]
     hpre_input_beta = branch_beta[:num_stream].unsqueeze(0).unsqueeze(0)
-    h_pre = functional.sigmoid(hpre_input_alpha + hpre_input_beta) + eps
+    h_pre = torch.sigmoid(hpre_input_alpha + hpre_input_beta) + eps
 
     hpost_input_alpha = h_post * branch_alpha[1]
     hpost_input_beta = branch_beta[num_stream:2 * num_stream].unsqueeze(0).unsqueeze(0)
-    h_post = 2 * functional.sigmoid(hpost_input_alpha + hpost_input_beta)
+    h_post = 2 * torch.sigmoid(hpost_input_alpha + hpost_input_beta)
 
     hres_input_alpha = h_res * branch_alpha[2]
     hres_input_beta = branch_beta[2 * num_stream:].view(num_stream, num_stream).unsqueeze(0).unsqueeze(0)
@@ -181,9 +191,9 @@ def mhc_pre(
     x = x.float()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
     if gamma is not None:
-        weight = functional.linear(x * rsqrt * gamma, phi)
+        weight = F.linear(x * rsqrt * gamma, phi)  # pylint: disable=not-callable
     else:
-        weight = functional.linear(x, phi) * rsqrt
+        weight = F.linear(x, phi) * rsqrt  # pylint: disable=not-callable
     h_pre, h_post, h_res = hc_split_sinkhorn_torch(
         weight, branch_alpha, branch_beta, num_stream, sinkhorn_iters, hc_eps
     )

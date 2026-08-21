@@ -14,6 +14,8 @@
 # ============================================================================
 """Reusable manifold-constrained hyper-connection replacement modules."""
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -21,7 +23,8 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_models.components.model_transform import module_replacement
-from hyper_models.ops import mhc_post, mhc_post_process, mhc_pre
+from hyper_models.ops import mhc_post, mhc_pre
+from hyper_models.ops.mhc_post import mhc_post_process
 
 
 def _required_attribute(module: nn.Module, name: str) -> Any:
@@ -152,6 +155,7 @@ class MhcPreModule(nn.Module):
         )
 
 
+@module_replacement
 class MhcPostModule(nn.Module):
     """Combine transformed and residual streams after an MHC-wrapped block."""
 
@@ -194,6 +198,7 @@ class MhcPostModule(nn.Module):
         )
 
 
+@module_replacement
 class MhcPostProcessModule(nn.Module):
     """Merge all residual streams at the end of an MHC stack."""
 

@@ -26,13 +26,63 @@ modeling = pytest.importorskip(
 
 pytest.importorskip("torch_npu")
 
-from hyper_models.modules import OffsetRMSNorm
+from hyper_models.modules import OffsetRMSNorm, RMSNorm
 from tests.common.mark_utils import arg_mark
 
 
 pytestmark = pytest.mark.skipif(
     not torch.npu.is_available(), reason="Ascend NPU is required"
 )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_qwen3_vl_moe_rms_norm_matches_transformers(dtype: torch.dtype) -> None:
+    """Match Qwen3-VL-MoE direct-scale RMSNorm forward and gradients."""
+    qwen3_vl_moe_modeling = pytest.importorskip(
+        "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe"
+    )
+    torch.manual_seed(5)
+    source = qwen3_vl_moe_modeling.Qwen3VLMoeTextRMSNorm(256, eps=1e-6).to(
+        device="npu", dtype=dtype
+    )
+    replacement_source = qwen3_vl_moe_modeling.Qwen3VLMoeTextRMSNorm(
+        256, eps=1e-6
+    ).to(device="npu", dtype=dtype)
+    with torch.no_grad():
+        replacement_source.weight.copy_(source.weight)
+    replacement = RMSNorm(module=replacement_source)
+
+    expected_input = torch.randn(
+        2, 17, 256, device="npu", dtype=dtype, requires_grad=True
+    )
+    actual_input = expected_input.detach().clone().requires_grad_(True)
+    expected = source(expected_input)
+    actual = replacement(actual_input)
+
+    output_tolerance = 4.76837158203125e-7 if dtype == torch.float32 else 0.0
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=output_tolerance)
+    expected.sum().backward()
+    actual.sum().backward()
+    input_grad_tolerance = 2.384185791015625e-7 if dtype == torch.float32 else 0.0
+    weight_grad_tolerance = 7.62939453125e-6 if dtype == torch.float32 else 0.0625
+    torch.testing.assert_close(
+        actual_input.grad,
+        expected_input.grad,
+        rtol=0.0,
+        atol=input_grad_tolerance,
+    )
+    torch.testing.assert_close(
+        replacement.weight.grad,
+        source.weight.grad,
+        rtol=0.0,
+        atol=weight_grad_tolerance,
+    )
 
 
 @arg_mark(
