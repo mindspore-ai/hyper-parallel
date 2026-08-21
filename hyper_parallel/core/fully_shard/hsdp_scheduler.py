@@ -39,6 +39,9 @@ class HSDPSchedulerContext:
         self.is_last_backward: bool = True
         # flag to identify "root_module"
         self.root_module = None
+        # Compile tracing may enter the root more than once; initialize shared
+        # parameter state only on the first real forward.
+        self.lazy_init_done: bool = False
 
 
 class HSDPSchedulerV2:
@@ -179,8 +182,10 @@ class HSDPSchedulerV2:
                     self.hsdp_state.module_name = module_name
                     break
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
-        self._init_params_fqn()
-        self._lazy_init_all_states()
+        if self._is_root and not self.scheduler_ctx.lazy_init_done:
+            self._init_params_fqn()
+            self._lazy_init_all_states()
+            self.scheduler_ctx.lazy_init_done = True
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             args = self.platform.apply_to_tensors(cast_fn, args)

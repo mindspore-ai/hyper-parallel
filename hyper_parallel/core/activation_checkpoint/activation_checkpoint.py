@@ -141,27 +141,48 @@ def checkpoint(
     if not isinstance(early_stop, bool):
         raise ValueError(f"early_stop must be bool, but got {type(early_stop).__name__}.")
 
-    factories: list = [create_recompute_contexts]
-    if policy_fn is not None:
-        factories.append(partial(plat.create_selective_checkpoint_contexts, policy_fn, group_swap=group_swap))
-    if context_fn is not None:
-        factories.append(context_fn)
-
-    if len(factories) == 1:
-        composed_context_fn = factories[0]
+    is_compiling = getattr(plat, "is_compiling", None)
+    checkpoint_compile = callable(is_compiling) and is_compiling() is True  # pylint: disable=not-callable
+    if checkpoint_compile:
+        unsupported = []
+        if swap_inputs:
+            unsupported.append("swap_inputs")
+        if group_swap:
+            unsupported.append("group_swap")
+        if context_fn is not None:
+            unsupported.append("custom context_fn")
+        if kwargs.get("use_reentrant", False):
+            unsupported.append("use_reentrant=True")
+        if unsupported:
+            raise ValueError(
+                "HyperParallel checkpoint compile mode does not support: "
+                + ", ".join(unsupported)
+                + ". Use Torch-native non-reentrant checkpointing with optional "
+                "SAVE/RECOMPUTE selective policies."
+            )
+        composed_context_fn = (
+            partial(plat.create_native_selective_checkpoint_contexts, policy_fn)
+            if policy_fn is not None
+            else None
+        )
     else:
-        composed_context_fn = _compose_context_fns(tuple(factories))
+        factories: list = [create_recompute_contexts]
+        if policy_fn is not None:
+            factories.append(partial(plat.create_selective_checkpoint_contexts, policy_fn, group_swap=group_swap))
+        if context_fn is not None:
+            factories.append(context_fn)
+
+        if len(factories) == 1:
+            composed_context_fn = factories[0]
+        else:
+            composed_context_fn = _compose_context_fns(tuple(factories))
 
     context = partial(plat.async_save_on_cpu, group_swap=group_swap) if swap_inputs else contextlib.nullcontext
     with context():
-        return plat.checkpoint(
-            function,
-            *args,
-            context_fn=composed_context_fn,
-            use_reentrant=False,
-            early_stop=early_stop,
-            **kwargs,
-        )
+        checkpoint_kwargs = {**kwargs, "use_reentrant": False, "early_stop": early_stop}
+        if composed_context_fn is not None:
+            checkpoint_kwargs["context_fn"] = composed_context_fn
+        return plat.checkpoint(function, *args, **checkpoint_kwargs)
 
 
 def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
@@ -190,6 +211,12 @@ def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
     Example:
         >>> output = swap(layer, x, policy_fn=lambda t: CheckpointPolicy.MUST_SAVE)
     """
+    is_compiling = getattr(plat, "is_compiling", None)
+    if callable(is_compiling) and is_compiling() is True:  # pylint: disable=not-callable
+        raise ValueError(
+            "HyperParallel activation swap is not supported in compile mode. "
+            "Use Torch-native non-reentrant checkpointing with SAVE/RECOMPUTE policies."
+        )
     with plat.async_save_on_cpu(policy_fn=policy_fn, group_swap=group_swap):
         return function(*args, **kwargs)
 

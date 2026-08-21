@@ -13,11 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Torch HSDP scheduler"""
+import functools
 import inspect
+from typing import Callable, List, ParamSpec, TypeVar
+
 import torch
-from typing import List
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
+
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.tools.logging import get_logger
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
@@ -28,6 +31,22 @@ from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx
 from hyper_parallel.platform import get_platform
 
 logger = get_logger("FSDP")
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _dynamo_disable(func: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Disable Dynamo tracing while an FSDP runtime hook executes."""
+
+    @functools.wraps(func)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        return torch._dynamo.disable(
+            func,
+            recursive=True,
+        )(*args, **kwargs)
+
+    return wrapper
 
 
 class TorchHSDPSchedulerV2(HSDPSchedulerV2):
@@ -106,6 +125,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         kwargs = tree_unflatten(kwargs_list, kwargs_spec)
         return args, kwargs
 
+    @_dynamo_disable
     def _forward_pre_hook(self, cell, args, kwargs):
         """Execute forward pre hook and set up backward hook."""
         args, kwargs = self._hsdp_forward_pre_hook(cell, args, kwargs)
@@ -130,6 +150,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
                 handle_ref[0] = handle
         return outputs
 
+    @_dynamo_disable
     def _forward_hook(self, cell, inputs, outputs):  # pylint: disable=R1710
         """Execute forward hook."""
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
@@ -141,6 +162,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         return self._hsdp_forward_hook(cell, inputs, outputs)
 
     # pylint: disable=W0212
+    @_dynamo_disable
     def _backward_pre_hook(self, grad):
         """Execute backward pre hook."""
         Variable._execution_engine.queue_callback(self._root_backward_hook)
@@ -150,6 +172,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
+    @_dynamo_disable
     def _root_backward_hook(self, force_reduce=False):
         """Finalize gradient reduction for the outermost HSDP module after backward.
 
@@ -238,6 +261,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
                 self.hsdp_state.reduce_params()
 
 
+    @_dynamo_disable
     def _backward_hook(self):
         """Execute backward hook."""
         if self.scheduler_state == FSDPSchedulerState.BACKWARD:
@@ -245,13 +269,18 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_hook(self.cell, None, None)
 
     # pylint: disable=W0613
-    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:
+    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:  # pylint: disable=arguments-differ
         """Override base ``(args, kwargs)`` return; ``nn.Module`` pre-hook uses ``None`` for no-op."""
         return None
 
-    def _grouped_forward_post_hook_skip(self, outputs) -> None:
+    def _grouped_forward_post_hook_skip(self, outputs) -> None:  # pylint: disable=arguments-differ
         """Override base output pass-through; forward hook uses ``None`` for no-op."""
         return None
+
+    @_dynamo_disable
+    def _grouped_forward_pre_hook(self, cell, args, kwargs):
+        """Run the grouped FSDP pre-forward hook outside Dynamo tracing."""
+        return super()._grouped_forward_pre_hook(cell, args, kwargs)
 
     def _register_forward_module_hook(self, mod, hook) -> None:
         """Register forward hook; use ``always_call=True`` when supported (matches PyTorch FSDP)."""
@@ -270,4 +299,5 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             return
         for mod in self.modules:
             mod.register_forward_pre_hook(self._grouped_forward_pre_hook, with_kwargs=True)
-            self._register_forward_module_hook(mod, self._make_grouped_forward_post_hook(mod))
+            grouped_forward_hook = _dynamo_disable(self._make_grouped_forward_post_hook(mod))
+            self._register_forward_module_hook(mod, grouped_forward_hook)
