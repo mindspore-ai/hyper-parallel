@@ -16,8 +16,14 @@
 
 from hyper_models.ops.aggregate_hidden import aggregate_hidden
 from hyper_models.ops.attention_rescale import attention_rescale
+from hyper_models.ops.aux_loss import aux_loss_auto_scale, set_aux_loss_scale
 from hyper_models.ops.dsa_indexer import dsa_indexer
 from hyper_models.ops.dsa_kl_loss import dsa_kl_loss
+from hyper_models.ops.dsa_sparse_attention import dsa_sparse_attention
+from hyper_models.ops.dsa_sparse_attention_rescale import dsa_sparse_attention_rescale
+from hyper_models.ops.grouped_matmul import grouped_matmul
+from hyper_models.ops.moe_token_permute import moe_token_permute
+from hyper_models.ops.moe_token_unpermute import moe_token_unpermute
 from hyper_models.ops.npu_fusion_attention import npu_fusion_attention_forward
 from hyper_models.ops.rms_norm import rms_norm
 from hyper_models.ops.rotary_embedding import (
@@ -25,19 +31,24 @@ from hyper_models.ops.rotary_embedding import (
     apply_rotary_pos_emb_interleave,
 )
 from hyper_models.ops.sink_attention import sink_attention
-from hyper_models.ops.dsa_sparse_attention import dsa_sparse_attention
-from hyper_models.ops.dsa_sparse_attention_rescale import dsa_sparse_attention_rescale
+from hyper_models.ops.swiglu import swiglu
 
 __all__ = [
     "aggregate_hidden",
     "apply_rotary_pos_emb",
     "apply_rotary_pos_emb_interleave",
     "attention_rescale",
+    "aux_loss_auto_scale",
     "dsa_indexer",
     "dsa_kl_loss",
     "dsa_sparse_attention",
     "dsa_sparse_attention_rescale",
+    "grouped_matmul",
+    "moe_token_permute",
+    "moe_token_unpermute",
     "npu_fusion_attention_forward",
     "rms_norm",
+    "set_aux_loss_scale",
     "sink_attention",
+    "swiglu",
 ]
