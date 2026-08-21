@@ -41,7 +41,6 @@ def _dynamo_disable(func: Callable[_P, _R]) -> Callable[_P, _R]:
         return torch._dynamo.disable(
             func,
             recursive=True,
-            reason="skipping HyperParallel FSDP hooks",
         )(*args, **kwargs)
 
     return wrapper

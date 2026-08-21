@@ -538,7 +538,7 @@ class TestTorchSchedulerSetup(unittest.TestCase):
 
     @patch("hyper_parallel.platform.torch.fully_shard.scheduler.torch._dynamo.disable")
     def test_dynamo_disable_uses_fsdp_runtime_boundary(self, mock_disable):
-        """The local decorator should match the Torch 2.12 FSDP hook boundary."""
+        """The local decorator should use a version-compatible FSDP hook boundary."""
         def original(value):
             """Return one incremented value."""
             return value + 1
@@ -552,7 +552,6 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         mock_disable.assert_called_once_with(
             original,
             recursive=True,
-            reason="skipping HyperParallel FSDP hooks",
         )
 
     def test_fsdp_runtime_hooks_are_dynamo_disabled(self):
