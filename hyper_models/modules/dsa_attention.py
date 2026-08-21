@@ -27,7 +27,7 @@ from torch.nn import functional as F
 from transformers.core_model_loading import WeightConverter
 
 from hyper_models.components.checkpoint import ConcatenateWithSections
-from hyper_models.ops import aggregate_hidden
+from hyper_models.ops import aggregate_hidden, aux_loss_auto_scale
 from hyper_models.ops import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
 from hyper_models.ops import (
     dsa_indexer,
@@ -69,30 +69,6 @@ def apply_mome(
         mixed_states = convolution(padded_states.transpose(1, 2)).transpose(1, 2)
         mixed_states = mixed_states * mome_mask.unsqueeze(-1).to(mixed_states.dtype)
     return hidden_states + mixed_states
-
-
-class _AuxLossAutoScaler(torch.autograd.Function):
-    """Inject the auxiliary DSA loss gradient without changing output."""
-
-    main_loss_backward_scale = torch.tensor(1.0)
-
-    @staticmethod
-    def forward(ctx: Any, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
-        """Return the main output and retain the auxiliary loss for backward."""
-        ctx.save_for_backward(aux_loss)
-        return output
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pass through the main gradient and inject the auxiliary gradient."""
-        (aux_loss,) = ctx.saved_tensors
-        scale = _AuxLossAutoScaler.main_loss_backward_scale
-        return grad_output, torch.ones_like(aux_loss) * scale
-
-    @staticmethod
-    def set_loss_scale(scale: torch.Tensor) -> None:
-        """Set the loss scale used for the injected auxiliary gradient."""
-        _AuxLossAutoScaler.main_loss_backward_scale = scale
 
 
 class DeepseekV32DSAAttention(nn.Module):
@@ -477,7 +453,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 sparse_scale,
                 self.dsa_loss_coeff,
             )
-            attn_output = _AuxLossAutoScaler.apply(attn_output, aux_loss)
+            attn_output = aux_loss_auto_scale(attn_output, aux_loss)
 
         attn_output = attn_output[..., : self.kv_lora_rank]
         value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
@@ -813,7 +789,7 @@ class DSAAttention(nn.Module):
                 sparse_scale,
                 self.dsa_loss_coeff,
             )
-            attn_output = _AuxLossAutoScaler.apply(attn_output, aux_loss)
+            attn_output = aux_loss_auto_scale(attn_output, aux_loss)
 
         attn_output = attn_output[..., : self.kv_lora_rank]
         value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)

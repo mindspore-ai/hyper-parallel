@@ -22,99 +22,18 @@ from typing import Any
 # This package provides PyTorch-specific high-performance modules.
 # pylint: disable=forbidden-backend-import
 import torch  # pylint: disable=forbidden-backend-import
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 from transformers.core_model_loading import (
-    ConversionOps,
     WeightConverter,
     WeightRenaming,
 )
 
+from hyper_models.components.checkpoint import ConcatenateWithSections
+from hyper_models.components.model_transform import module_replacement
 from hyper_models.ops import swiglu
 
-try:
-    import torch_npu  # pylint: disable=unused-import
-
-    HAS_NPU = True
-except ImportError:
-    HAS_NPU = False
-
-
-def _one_tensor(value: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
-    """Return the only tensor collected for one checkpoint pattern."""
-    if isinstance(value, list):
-        if len(value) != 1:
-            raise ValueError("SwiGLU projection conversion expects one tensor per source pattern")
-        return value[0]
-    return value
-
-
-class _PackGateUpProjection(ConversionOps):
-    """Pack separate Gate and Up projections into the high-performance layout."""
-
-    def __init__(self, intermediate_size: int) -> None:
-        """Record the size of each projection in the packed dimension."""
-        self.intermediate_size = intermediate_size
-
-    @torch.no_grad()
-    def convert(
-        self,
-        input_dict: dict[str, torch.Tensor | list[torch.Tensor]],
-        source_patterns: list[str],
-        target_patterns: list[str],
-        **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:
-        """Concatenate Gate and Up tensors along their output dimension."""
-        del kwargs
-        if len(source_patterns) != 2:
-            raise ValueError("packing SwiGLU projections requires Gate and Up source patterns")
-        if len(target_patterns) != 1:
-            raise ValueError("packing SwiGLU projections requires exactly one target pattern")
-        gate = _one_tensor(input_dict[source_patterns[0]])
-        up = _one_tensor(input_dict[source_patterns[1]])
-        if gate.shape[0] != self.intermediate_size or up.shape[0] != self.intermediate_size:
-            raise ValueError("Gate and Up tensors must match the configured intermediate size")
-        return {target_patterns[0]: torch.cat((gate, up), dim=0).contiguous()}
-
-    @property
-    def reverse_op(self) -> ConversionOps:
-        """Return the inverse projection-layout conversion."""
-        return _UnpackGateUpProjection(self.intermediate_size)
-
-
-class _UnpackGateUpProjection(ConversionOps):
-    """Restore separate Gate and Up projections from the packed layout."""
-
-    def __init__(self, intermediate_size: int) -> None:
-        """Record the size of each restored projection."""
-        self.intermediate_size = intermediate_size
-
-    @torch.no_grad()
-    def convert(
-        self,
-        input_dict: dict[str, torch.Tensor | list[torch.Tensor]],
-        source_patterns: list[str],
-        target_patterns: list[str],
-        **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:
-        """Split a packed Gate/Up tensor along its output dimension."""
-        del kwargs
-        if len(source_patterns) != 1:
-            raise ValueError("unpacking SwiGLU projections requires exactly one source pattern")
-        if len(target_patterns) != 2:
-            raise ValueError("unpacking SwiGLU projections requires Gate and Up target patterns")
-        packed = _one_tensor(input_dict[source_patterns[0]])
-        if packed.shape[0] != 2 * self.intermediate_size:
-            raise ValueError("packed Gate/Up tensor must contain two intermediate-size projections")
-        gate, up = torch.split(packed, self.intermediate_size, dim=0)
-        return {target_patterns[0]: gate.contiguous(), target_patterns[1]: up.contiguous()}
-
-    @property
-    def reverse_op(self) -> ConversionOps:
-        """Return the inverse projection-layout conversion."""
-        return _PackGateUpProjection(self.intermediate_size)
-
-
+@module_replacement
 class SwiGLUMLP(nn.Module):
     """Transformers-compatible SwiGLU MLP using one fused Gate/Up matmul."""
 
@@ -175,7 +94,7 @@ class SwiGLUMLP(nn.Module):
         self.hidden_size = gate_proj.in_features
         self.intermediate_size = gate_proj.out_features
 
-        pack = _PackGateUpProjection(self.intermediate_size)
+        pack = ConcatenateWithSections((self.intermediate_size, self.intermediate_size))
         packed_weight = pack.convert(
             {"gate": gate_proj.weight.detach(), "up": up_proj.weight.detach()},
             ["gate", "up"],
@@ -220,7 +139,9 @@ class SwiGLUMLP(nn.Module):
             WeightConverter(
                 source_patterns=["gate_proj.weight", "up_proj.weight"],
                 target_patterns="linear_fc1.weight",
-                operations=[_PackGateUpProjection(self.intermediate_size)],
+                operations=[
+                    ConcatenateWithSections((self.intermediate_size, self.intermediate_size))
+                ],
             )
         ]
         if self.linear_fc1.bias is not None:
@@ -228,7 +149,9 @@ class SwiGLUMLP(nn.Module):
                 WeightConverter(
                     source_patterns=["gate_proj.bias", "up_proj.bias"],
                     target_patterns="linear_fc1.bias",
-                    operations=[_PackGateUpProjection(self.intermediate_size)],
+                    operations=[
+                        ConcatenateWithSections((self.intermediate_size, self.intermediate_size))
+                    ],
                 )
             )
         transforms.append(WeightRenaming("down_proj.weight", "linear_fc2.weight"))
@@ -236,23 +159,12 @@ class SwiGLUMLP(nn.Module):
             transforms.append(WeightRenaming("down_proj.bias", "linear_fc2.bias"))
         return transforms
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the fused Gate/Up projection, SwiGLU, and Down projection."""
-        intermediate_parallel = torch.matmul(
-            hidden_states,
-            self.linear_fc1.weight.t().contiguous(),
-        )
-        if self.linear_fc1.bias is not None:
-            intermediate_parallel = intermediate_parallel + self.linear_fc1.bias
-        if HAS_NPU and intermediate_parallel.device.type != "cpu":
+        intermediate_parallel = self.linear_fc1(x)
+        if intermediate_parallel.device.type == "npu":
             intermediate_parallel = swiglu(intermediate_parallel)
         else:
-            intermediate_parallel = torch.chunk(intermediate_parallel, 2, dim=-1)
-            intermediate_parallel = F.silu(intermediate_parallel[0]) * intermediate_parallel[1]
-        output = torch.matmul(
-            intermediate_parallel,
-            self.linear_fc2.weight.t().contiguous(),
-        )
-        if self.linear_fc2.bias is not None:
-            output = output + self.linear_fc2.bias
-        return output
+            gate, up = intermediate_parallel.chunk(2, dim=-1)
+            intermediate_parallel = F.silu(gate) * up
+        return self.linear_fc2(intermediate_parallel)

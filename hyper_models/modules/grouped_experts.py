@@ -59,6 +59,7 @@ class GroupedExperts(nn.Module):
         del module_fqn, context
         config = getattr(module, "config", None)
         self.config = config
+        self.initializer_range = getattr(config, "initializer_range", None)
         if bool(getattr(module, "has_bias", False)):
             raise ValueError("GroupedExperts does not support source modules with has_bias=True")
         gated_linear_unit = bool(
@@ -301,6 +302,19 @@ class GroupedExperts(nn.Module):
             raise ValueError("GroupedExperts requires concatenated gate/up expert weights")
         self.is_transposed = True
         self.train(module.training)
+
+    def reset_parameters(self) -> None:
+        """Initialize grouped weights with the source model's configured standard deviation."""
+        if self.initializer_range is None:
+            raise ValueError(
+                "GroupedExperts random initialization requires config.initializer_range"
+            )
+        target_fc1 = self.gate_up_proj if self.has_gate else self.up_proj
+        nn.init.normal_(target_fc1, mean=0.0, std=self.initializer_range)
+        nn.init.normal_(self.down_proj, mean=0.0, std=self.initializer_range)
+        if self.add_bias:
+            nn.init.zeros_(self.bias1)
+            nn.init.zeros_(self.bias2)
 
     def make_transforms(self) -> list[WeightRenaming | WeightConverter]:
         """Describe reversible source-checkpoint to high-performance conversion."""

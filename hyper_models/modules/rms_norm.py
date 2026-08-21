@@ -27,23 +27,56 @@ from hyper_models.components.model_transform import module_replacement
 from hyper_models.ops import rms_norm
 
 
+@module_replacement
 class RMSNorm(torch.nn.Module):
-    """NPU-accelerated root mean square normalization module."""
+    """NPU-accelerated replacement for direct-scale RMSNorm."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-5) -> None:
-        """Initialize the RMSNorm weight.
+    def __init__(
+        self,
+        hidden_size: int | None = None,
+        eps: float = 1e-5,
+        *,
+        module: torch.nn.Module | None = None,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Build a direct-scale RMSNorm or replace an existing module.
 
         Args:
-            hidden_size: Size of the normalized dimension.
+            hidden_size: Size of the normalized dimension for direct construction.
             eps: Epsilon added to the variance.
+            module: Optional source module whose parameter layout is preserved.
+            module_fqn: Fully qualified source-module name supplied by replacement.
+            context: Replacement context supplied by Trainer.
+
+        Raises:
+            TypeError: If the source module does not expose a supported RMSNorm contract.
+            ValueError: If neither a source module nor a positive hidden size is supplied.
         """
         super().__init__()
+        del module_fqn, context
+        if module is not None:
+            if not isinstance(getattr(module, "weight", None), torch.nn.Parameter):
+                raise TypeError("RMSNorm source module must expose an nn.Parameter weight")
+            source_eps = getattr(module, "eps", None)
+            if source_eps is None:
+                source_eps = getattr(module, "variance_epsilon", None)
+            if source_eps is None:
+                raise TypeError(
+                    "RMSNorm source module must expose eps or variance_epsilon"
+                )
+            self.eps = float(source_eps)
+            self.weight = module.weight
+            self.train(module.training)
+            return
+        if hidden_size is None or hidden_size <= 0:
+            raise ValueError("RMSNorm hidden_size must be a positive integer")
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(hidden_size))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply NPU-accelerated RMS normalization."""
-        return rms_norm(x, self.weight, self.eps)
+        return rms_norm(hidden_states, self.weight, self.eps)
 
 
 @module_replacement

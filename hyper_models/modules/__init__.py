@@ -17,10 +17,10 @@
 from hyper_models.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
 from hyper_models.modules.gqa_attention import GatedGQAAttention, GQAAttention
 from hyper_models.modules.grouped_experts import GroupedExperts
+from hyper_models.modules.mhc import MhcPostModule, MhcPostProcessModule, MhcPreModule
 from hyper_models.modules.mla_attention import MLAAttention
 from hyper_models.modules.rms_norm import OffsetRMSNorm, RMSNorm
 from hyper_models.modules.shared_expert import SharedExpert
-from hyper_models.modules.mhc import MhcPostModule, MhcPostProcessModule, MhcPreModule
 from hyper_models.modules.swiglu_mlp import SwiGLUMLP
 
 __all__ = [
@@ -29,12 +29,12 @@ __all__ = [
     "GQAAttention",
     "GatedGQAAttention",
     "GroupedExperts",
+    "MhcPostModule",
+    "MhcPostProcessModule",
+    "MhcPreModule",
     "MLAAttention",
     "OffsetRMSNorm",
     "RMSNorm",
     "SharedExpert",
-    "MhcPostModule",
-    "MhcPostProcessModule",
-    "MhcPreModule",
     "SwiGLUMLP",
 ]

@@ -17,7 +17,11 @@
 from typing import Any, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+
+try:
+    import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+except ImportError:
+    omni_training_custom_ops = None
 
 
 class _Sinkhorn(torch.autograd.Function):
@@ -31,6 +35,8 @@ class _Sinkhorn(torch.autograd.Function):
         eps: float = 1e-6,
     ) -> torch.Tensor:
         """Run the NPU Sinkhorn forward operator."""
+        if omni_training_custom_ops is None:
+            raise ImportError("NPU Sinkhorn requires omni_training_custom_ops")
         output, norm_out, sum_out = torch.ops.custom.npu_sinkhorn(
             h_res,
             out_flag=1,
