@@ -20,6 +20,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_models.components.model_transform import module_replacement
 from hyper_models.ops import mhc_post, mhc_post_process, mhc_pre
 
 
@@ -65,6 +66,7 @@ def _validate_parameter_layout(phi: nn.Linear, parameters: tuple[nn.Parameter, .
             raise ValueError("MHC projection and branch parameters must share device and dtype")
 
 
+@module_replacement
 class MhcPreModule(nn.Module):
     """Prepare hidden states and mixing coefficients for an MHC-wrapped block."""
 
