@@ -1,0 +1,90 @@
+# HyperParallel Ascend NPU Environment
+# ===================================
+# Build-time defaults follow the CANN base image and docs/installation.md:
+#   Python 3.12, torch 2.10, torch-npu 2.10, CANN 9.1.
+#
+# The native extensions are disabled by default because the MindSpore
+# dependency is only needed for selected native build combinations.
+
+ARG CANN_QUAY_URL="quay.io/ascend/cann"
+ARG CANN_VERSION="9.1.0"
+ARG BASE_OS="ubuntu22.04"
+FROM ${CANN_QUAY_URL}:${CANN_VERSION}-a3-${BASE_OS}-py3.12
+
+LABEL maintainer="jianzhnie"
+LABEL description="HyperParallel Ascend NPU development environment"
+LABEL version="cann9.1.0-python3.12"
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+ARG HP_EXTRA="torch29"
+ARG BUILD_MULTICORE_EXTENSION="off"
+ARG BUILD_SHMEM_EXTENSION="off"
+ARG BUILD_CUSTOM_OPS_EXTENSION="off"
+ARG HYPER_PARALLEL_BUILD_STRICT="off"
+
+ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    BUILD_MULTICORE_EXTENSION=${BUILD_MULTICORE_EXTENSION} \
+    BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION} \
+    BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION} \
+    HYPER_PARALLEL_BUILD_STRICT=${HYPER_PARALLEL_BUILD_STRICT} 
+
+WORKDIR /workspace/hyper-parallel
+
+RUN if [ ! -e /usr/local/Ascend/cann ] \
+        && [ -d /usr/local/Ascend/ascend-toolkit ]; then \
+        ln -s /usr/local/Ascend/ascend-toolkit /usr/local/Ascend/cann; \
+    fi \
+    && test -f /usr/local/Ascend/cann/set_env.sh \
+    && . /usr/local/Ascend/cann/set_env.sh \
+    && echo "export ASCEND_HOME_PATH=${ASCEND_HOME_PATH}" >> /etc/profile.d/hyper-parallel-ascend.sh \
+    && echo "export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${ASCEND_HOME_PATH}/aarch64-linux/devlib" \
+        >> /etc/profile.d/hyper-parallel-ascend.sh \
+    && echo "export PATH=${PATH}" >> /etc/profile.d/hyper-parallel-ascend.sh
+
+# Source the CANN environment in interactive shells as well as native builds.
+RUN printf '%s\n' \
+        'if [ -f /usr/local/Ascend/cann/set_env.sh ]; then' \
+        '    source /usr/local/Ascend/cann/set_env.sh' \
+        'fi' \
+    >> /root/.bashrc
+
+COPY . /workspace/hyper-parallel
+
+RUN if [ -f /usr/local/Ascend/cann/set_env.sh ]; then \
+        . /usr/local/Ascend/cann/set_env.sh; \
+    fi \
+    && python3 -m pip install --upgrade pip setuptools wheel safetensors \
+    && case "${HP_EXTRA}" in \
+        "") \
+            python3 -m pip install --no-cache-dir -e . --no-build-isolation ;; \
+        mindspore) \
+            python3 -m pip install --no-cache-dir \
+                --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
+                -e ".[mindspore]" \
+                --no-build-isolation ;; \
+        torch26|torch27|torch29|torch) \
+            python3 -m pip install --no-cache-dir \
+                --extra-index-url https://download.pytorch.org/whl/cpu \
+                -e ".[${HP_EXTRA}]" \
+                --no-build-isolation ;; \
+        all) \
+            python3 -m pip install --no-cache-dir \
+                --extra-index-url https://download.pytorch.org/whl/cpu \
+                --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
+                -e ".[all]" \
+                --no-build-isolation ;; \
+        *) \
+            python3 -m pip install --no-cache-dir -e ".[${HP_EXTRA}]" --no-build-isolation ;; \
+    esac
+
+RUN if [ -f /usr/local/Ascend/cann/set_env.sh ]; then \
+        . /usr/local/Ascend/cann/set_env.sh; \
+    fi \
+    && python3 -c \
+        "import hyper_parallel as hp; print('hyper_parallel platform:', hp.get_platform())"
+
+CMD ["/bin/bash", "-l"]
