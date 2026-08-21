@@ -16,15 +16,19 @@
 
 from hyper_models.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
 from hyper_models.modules.gqa_attention import GatedGQAAttention, GQAAttention
+from hyper_models.modules.grouped_experts import GroupedExperts
 from hyper_models.modules.mla_attention import MLAAttention
 from hyper_models.modules.rms_norm import OffsetRMSNorm, RMSNorm
+from hyper_models.modules.shared_expert import SharedExpert
 
 __all__ = [
     "DeepseekV32DSAAttention",
+    "DSAAttention",
     "GQAAttention",
     "GatedGQAAttention",
+    "GroupedExperts",
     "MLAAttention",
     "OffsetRMSNorm",
-    "DSAAttention",
     "RMSNorm",
+    "SharedExpert",
 ]
