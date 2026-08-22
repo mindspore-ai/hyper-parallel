@@ -40,24 +40,20 @@ from hyper_parallel.distributed_data.topology import DataTopology
 
 
 @dataclass(frozen=True)
-class _PreparedOwnerStep:
-    plan: BatchPlan
-    micro_batches: tuple[Any, ...]
-
-
-@dataclass(frozen=True)
-class _PreparedOnlineWindow:
+class _ReservedStep:
     step: int
     cursor_start: int
-    samples: tuple[LoadedSample, ...]
+    cursor_end: int
+    plan: BatchPlan | None
 
 
 class DistributedDataset(Iterator[DistributedDataStep]):
-    """Plan globally, materialize on data owners, and distribute per step.
+    """Plan optimizer steps and materialize one local microbatch at a time.
 
-    The iterator yields one :class:`DistributedDataStep`, containing all
-    local microbatches for one optimizer step. Call :meth:`commit` only after
-    that optimizer step succeeds.
+    Sidecar metadata enables whole-step balancing before any payload read.
+    Online metadata reads one global microbatch of candidates at a time and
+    balances only within that microbatch. Call :meth:`commit` only after every
+    microbatch and the corresponding optimizer step succeed.
     """
 
     def __init__(
@@ -109,7 +105,12 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             if pin_memory and topology.is_data_owner
             else None
         )
-        self._prepared_steps: deque[Future[_PreparedOwnerStep | _PreparedOnlineWindow] | None] = deque()
+        self._prepared_steps: deque[_ReservedStep] = deque()
+        self._active_step: DistributedDataStep | None = None
+        self._active_reservation: _ReservedStep | None = None
+        self._owner_future: Future[Any] | None = None
+        self._next_micro_batch_index = 0
+        self._step_plan_replay_id: str | None = None
         self._closed = False
 
     def __len__(self) -> int:
@@ -121,23 +122,28 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         return self
 
     def __next__(self) -> DistributedDataStep:
-        """Return the next planned optimizer step."""
+        """Return the next lazy optimizer-step iterator."""
         if self._closed:
             raise StopIteration
-        if self._state.has_delivered_unconsumed:
-            raise ValueError("Commit the current DistributedDataStep before requesting the next step.")
+        if self._active_step is not None:
+            raise ValueError("Fully consume and commit the current DistributedDataStep before requesting another.")
         self._fill_prefetch()
         if not self._prepared_steps:
             raise StopIteration
-        prepared_future = self._prepared_steps.popleft()
-        prepared = prepared_future.result() if prepared_future is not None else None
-        if isinstance(prepared, _PreparedOnlineWindow):
-            prepared = self._plan_online_window(prepared)
-            if self._pin_executor is not None:
-                prepared = self._pin_executor.submit(self._pin_owner_step, prepared).result()
-        step = self._distribute_step(prepared)
-        self._state.mark_delivered(step.plan)
-        return step
+        reservation = self._prepared_steps.popleft()
+        self._active_reservation = reservation
+        self._next_micro_batch_index = 0
+        self._step_plan_replay_id = None
+        self._schedule_owner_microbatch(0)
+        self._active_step = DistributedDataStep(
+            step=reservation.step,
+            cursor_start=reservation.cursor_start,
+            cursor_end=reservation.cursor_end,
+            micro_batch_count=self._planner.micro_batch_count,
+            load_micro_batch=self._consume_active_microbatch,
+            on_complete=self._complete_active_step,
+        )
+        return self._active_step
 
     @property
     def consumed_offset(self) -> int:
@@ -146,12 +152,19 @@ class DistributedDataset(Iterator[DistributedDataStep]):
 
     @property
     def prepared_offset(self) -> int:
-        """Return the offset reserved for bounded data preparation."""
+        """Return the offset reserved for bounded planning look-ahead."""
         return self._state.prepared_offset
 
     def commit(self, replay_id: str) -> None:
-        """Commit one delivered plan after optimizer-step success."""
+        """Commit one fully consumed step after optimizer-step success."""
+        if self._active_step is None or not self._active_step.is_complete:
+            raise ValueError("Consume every microbatch before committing the distributed-data step.")
         self._state.commit(replay_id)
+        self._active_step = None
+        self._active_reservation = None
+        self._owner_future = None
+        self._next_micro_batch_index = 0
+        self._step_plan_replay_id = None
         self._fill_prefetch()
 
     def state_dict(self) -> dict[str, int]:
@@ -160,18 +173,21 @@ class DistributedDataset(Iterator[DistributedDataStep]):
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore the consumed offset before iteration starts."""
-        if self._prepared_steps:
+        if self._prepared_steps or self._active_step is not None:
             raise ValueError("Cannot restore distributed dataset state after data preparation has started.")
         self._state.load_state_dict(state_dict)
 
     def close(self) -> None:
-        """Wait for current prefetch work and close the producer thread."""
+        """Wait for current prefetch work and close the producer threads."""
         if self._closed:
             return
         self._executor.shutdown(wait=True, cancel_futures=True)
         if self._pin_executor is not None:
             self._pin_executor.shutdown(wait=True, cancel_futures=True)
         self._prepared_steps.clear()
+        self._active_step = None
+        self._active_reservation = None
+        self._owner_future = None
         self._closed = True
 
     def __enter__(self) -> "DistributedDataset":
@@ -185,98 +201,167 @@ class DistributedDataset(Iterator[DistributedDataStep]):
     def _fill_prefetch(self) -> None:
         while self._state.can_prefetch and self._state.can_reserve_full_step():
             step, cursor_start, cursor_end = self._state.reserve()
-            if self._topology.is_data_owner:
-                if self._metadata_source is not None:
-                    local_metadata = tuple(
-                        self._metadata_source.get(index)
-                        for index in range(cursor_start, cursor_end)
-                    )
-                    candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.owner_ranks)
-                    plan = self._planner.plan(candidates, step=step, cursor_start=cursor_start)
-                    prepared_future = self._executor.submit(self._materialize_plan, plan)
-                    if self._pin_executor is not None:
-                        prepared_future = self._pin_executor.submit(self._pin_materialized_step, prepared_future)
-                    self._prepared_steps.append(prepared_future)
-                else:
-                    self._prepared_steps.append(
-                        self._executor.submit(self._load_online_window, step, cursor_start, cursor_end)
-                    )
-            else:
-                self._prepared_steps.append(None)
+            plan = None
+            if self._topology.is_data_owner and self._metadata_source is not None:
+                local_metadata = tuple(
+                    self._metadata_source.get(index)
+                    for index in range(cursor_start, cursor_end)
+                )
+                candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.owner_ranks)
+                plan = self._planner.plan(candidates, step=step, cursor_start=cursor_start)
+            self._prepared_steps.append(_ReservedStep(step, cursor_start, cursor_end, plan))
 
-    def _load_online_window(self, step: int, cursor_start: int, cursor_end: int) -> _PreparedOnlineWindow:
-        if self._online_sample_source is None:
-            raise ValueError("Online sample source is not configured.")
-        samples = tuple(self._online_sample_source.get(index) for index in range(cursor_start, cursor_end))
-        return _PreparedOnlineWindow(step, cursor_start, samples)
-
-    def _plan_online_window(self, window: _PreparedOnlineWindow) -> _PreparedOwnerStep:
-        if self._owner_payload_redistributor is None:
-            raise ValueError("Online owner payload redistribution is not configured.")
-        local_metadata = tuple(sample.metadata for sample in window.samples)
-        candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.owner_ranks)
-        plan = self._planner.plan(candidates, step=window.step, cursor_start=window.cursor_start)
-        payload_by_position = self._owner_payload_redistributor.redistribute(
-            tuple(sample.payload for sample in window.samples),
-            plan,
-            self._topology,
-        )
-        micro_batches = []
-        for micro_batch_index in range(self._planner.micro_batch_count):
-            planned_samples = plan.samples_for(self._topology.data_rank, micro_batch_index)
-            samples = [payload_by_position[sample.source_position] for sample in planned_samples]
-            micro_batches.append(self._rank_materializer.collate(samples))
-        return _PreparedOwnerStep(plan, tuple(micro_batches))
-
-    def _materialize_plan(self, plan: BatchPlan) -> _PreparedOwnerStep:
-        micro_batches = []
-        for micro_batch_index in range(self._planner.micro_batch_count):
-            owner_payload = self._rank_materializer.materialize(
-                plan,
+    def _schedule_owner_microbatch(self, micro_batch_index: int) -> None:
+        self._owner_future = None
+        if not self._topology.is_data_owner:
+            return
+        reservation = self._require_active_reservation()
+        if self._metadata_source is not None:
+            if reservation.plan is None:
+                raise ValueError("Sidecar metadata did not produce a data-owner BatchPlan.")
+            owner_future = self._executor.submit(
+                self._rank_materializer.materialize,
+                reservation.plan,
                 self._topology.data_rank,
                 micro_batch_index,
             )
-            micro_batches.append(owner_payload)
-        return _PreparedOwnerStep(plan, tuple(micro_batches))
+            if self._pin_executor is not None:
+                owner_future = self._pin_executor.submit(self._pin_materialized_microbatch, owner_future)
+            self._owner_future = owner_future
+            return
+
+        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
+        cursor_end = cursor_start + self._planner.micro_batch_size
+        self._owner_future = self._executor.submit(self._load_online_microbatch, cursor_start, cursor_end)
+
+    def _load_online_microbatch(self, cursor_start: int, cursor_end: int) -> tuple[LoadedSample, ...]:
+        if self._online_sample_source is None:
+            raise ValueError("Online sample source is not configured.")
+        return tuple(self._online_sample_source.get(index) for index in range(cursor_start, cursor_end))
+
+    def _consume_active_microbatch(self, micro_batch_index: int) -> tuple[BatchPlan, RankPayload]:
+        if self._closed:
+            raise ValueError("Cannot consume microbatches from a closed DistributedDataset.")
+        reservation = self._require_active_reservation()
+        if micro_batch_index != self._next_micro_batch_index:
+            raise ValueError(
+                f"Expected microbatch {self._next_micro_batch_index}, but got {micro_batch_index}."
+            )
+
+        owner_input = None
+        if self._topology.is_data_owner:
+            if self._owner_future is None:
+                raise ValueError("Data owner has no prepared microbatch future.")
+            owner_input = self._owner_future.result()
+        self._owner_future = None
+
+        if self._metadata_source is not None:
+            plan = reservation.plan if self._topology.is_data_owner else None
+            owner_payload = owner_input
+        elif self._topology.is_data_owner:
+            plan, owner_payload = self._plan_online_microbatch(
+                reservation,
+                micro_batch_index,
+                owner_input,
+            )
+        else:
+            plan, owner_payload = None, None
+
+        if owner_payload is not None and self._prepare_payload is not None:
+            owner_payload = self._prepare_payload(owner_payload)
+        received_plan, rank_data = self._payload_distributor.distribute(
+            owner_payload,
+            plan,
+            self._topology,
+        )
+        self._validate_received_plan(received_plan, reservation, micro_batch_index)
+        planned_samples = received_plan.samples_for(self._topology.data_rank, micro_batch_index)
+        payload = RankPayload(
+            replay_id=received_plan.replay_id,
+            global_rank=self._topology.global_rank,
+            data_rank=self._topology.data_rank,
+            cp_rank=self._topology.cp_rank,
+            micro_batch_index=micro_batch_index,
+            sample_ids=tuple(sample.meta.sample_id for sample in planned_samples),
+            data=rank_data,
+        )
+
+        self._next_micro_batch_index += 1
+        if self._next_micro_batch_index < self._planner.micro_batch_count:
+            self._schedule_owner_microbatch(self._next_micro_batch_index)
+        return received_plan, payload
+
+    def _plan_online_microbatch(
+        self,
+        reservation: _ReservedStep,
+        micro_batch_index: int,
+        owner_input: Any,
+    ) -> tuple[BatchPlan, Any]:
+        if self._owner_payload_redistributor is None:
+            raise ValueError("Online metadata requires an owner payload redistributor.")
+        if not isinstance(owner_input, tuple) or any(not isinstance(sample, LoadedSample) for sample in owner_input):
+            raise ValueError("Online microbatch preparation returned invalid loaded samples.")
+        local_metadata = tuple(sample.metadata for sample in owner_input)
+        candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.owner_ranks)
+        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
+        plan = self._planner.plan_microbatch(
+            candidates,
+            step=reservation.step,
+            cursor_start=cursor_start,
+            micro_batch_index=micro_batch_index,
+        )
+        payload_by_position = self._owner_payload_redistributor.redistribute(
+            tuple(sample.payload for sample in owner_input),
+            plan,
+            self._topology,
+        )
+        planned_samples = plan.samples_for(self._topology.data_rank, micro_batch_index)
+        samples = [payload_by_position[sample.source_position] for sample in planned_samples]
+        owner_payload = self._rank_materializer.collate(samples)
+        if self._pin_executor is not None:
+            owner_payload = self._pin_executor.submit(_pin_memory_batch, owner_payload).result()
+        return plan, owner_payload
+
+    def _validate_received_plan(
+        self,
+        plan: BatchPlan,
+        reservation: _ReservedStep,
+        micro_batch_index: int,
+    ) -> None:
+        if plan.step != reservation.step:
+            raise ValueError(f"Expected optimizer step {reservation.step}, but received plan step {plan.step}.")
+        dimensions_match = (
+            plan.data_world_size == self._planner.data_world_size
+            and plan.micro_batch_size == self._planner.micro_batch_size
+        )
+        if not dimensions_match:
+            raise ValueError("Received BatchPlan dimensions do not match the distributed dataset planner.")
+        if self._metadata_source is not None:
+            expected_window = (reservation.cursor_start, reservation.cursor_end, 0, self._planner.micro_batch_count)
+            if self._step_plan_replay_id is None:
+                self._step_plan_replay_id = plan.replay_id
+            elif plan.replay_id != self._step_plan_replay_id:
+                raise ValueError("Sidecar microbatches received inconsistent whole-step BatchPlan replay IDs.")
+        else:
+            cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
+            expected_window = (cursor_start, cursor_start + self._planner.micro_batch_size, micro_batch_index, 1)
+        actual_window = (plan.cursor_start, plan.cursor_end, plan.micro_batch_start, plan.micro_batch_count)
+        if actual_window != expected_window:
+            raise ValueError(f"Received BatchPlan window {actual_window} does not match expected {expected_window}.")
+
+    def _complete_active_step(self, step: DistributedDataStep, replay_id: str) -> None:
+        if step is not self._active_step:
+            raise ValueError("Completed DistributedDataStep is not the dataset's active step.")
+        reservation = self._require_active_reservation()
+        if self._next_micro_batch_index != self._planner.micro_batch_count:
+            raise ValueError("Cannot complete a DistributedDataStep before every microbatch is produced.")
+        self._state.mark_delivered(replay_id, reservation.cursor_start, reservation.cursor_end)
+
+    def _require_active_reservation(self) -> _ReservedStep:
+        if self._active_reservation is None:
+            raise ValueError("DistributedDataset has no active optimizer-step reservation.")
+        return self._active_reservation
 
     @staticmethod
-    def _pin_owner_step(prepared: _PreparedOwnerStep) -> _PreparedOwnerStep:
-        micro_batches = tuple(_pin_memory_batch(batch) for batch in prepared.micro_batches)
-        return _PreparedOwnerStep(prepared.plan, micro_batches)
-
-    @classmethod
-    def _pin_materialized_step(cls, prepared_future: Future[_PreparedOwnerStep]) -> _PreparedOwnerStep:
-        return cls._pin_owner_step(prepared_future.result())
-
-    def _distribute_step(self, prepared: _PreparedOwnerStep | None) -> DistributedDataStep:
-        plan = prepared.plan if prepared is not None else None
-        payloads = []
-        received_plan = plan
-        for micro_batch_index in range(self._planner.micro_batch_count):
-            owner_payload = prepared.micro_batches[micro_batch_index] if prepared is not None else None
-            if owner_payload is not None and self._prepare_payload is not None:
-                owner_payload = self._prepare_payload(owner_payload)
-            current_plan, rank_data = self._payload_distributor.distribute(
-                owner_payload,
-                plan,
-                self._topology,
-            )
-            if received_plan is not None and received_plan.replay_id != current_plan.replay_id:
-                raise ValueError("Payload microbatches received inconsistent BatchPlan replay IDs.")
-            received_plan = current_plan
-            planned_samples = current_plan.samples_for(self._topology.data_rank, micro_batch_index)
-            payloads.append(
-                RankPayload(
-                    replay_id=current_plan.replay_id,
-                    global_rank=self._topology.global_rank,
-                    data_rank=self._topology.data_rank,
-                    cp_rank=self._topology.cp_rank,
-                    micro_batch_index=micro_batch_index,
-                    sample_ids=tuple(sample.meta.sample_id for sample in planned_samples),
-                    data=rank_data,
-                )
-            )
-
-        if received_plan is None:
-            raise ValueError("Payload distributor did not provide a BatchPlan.")
-        return DistributedDataStep(received_plan, tuple(payloads))
+    def _pin_materialized_microbatch(owner_future: Future[Any]) -> Any:
+        return _pin_memory_batch(owner_future.result())

@@ -67,3 +67,23 @@ class TestDistributedBatchPlanner(unittest.TestCase):
         planner = DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=2)
         with self.assertRaisesRegex(ValueError, "requires 4 candidates"):
             planner.plan([_metadata("0", 1.0)], step=0, cursor_start=0)
+
+    def test_online_plan_balances_only_one_global_microbatch(self) -> None:
+        """Online planning should preserve the optimizer microbatch position without later metadata."""
+        planner = DistributedBatchPlanner(data_world_size=2, micro_batch_size=2, micro_batch_count=3)
+        candidates = [_metadata(str(index), float(index + 1)) for index in range(4)]
+
+        plan = planner.plan_microbatch(
+            candidates,
+            step=5,
+            cursor_start=2,
+            micro_batch_index=1,
+        )
+
+        self.assertEqual(plan.micro_batch_start, 1)
+        self.assertEqual(plan.micro_batch_count, 1)
+        self.assertEqual((plan.cursor_start, plan.cursor_end), (2, 4))
+        for data_rank in range(2):
+            self.assertEqual(len(plan.samples_for(data_rank, 1)), 2)
+        with self.assertRaisesRegex(ValueError, "micro_batch_index must be in"):
+            plan.samples_for(0, 0)

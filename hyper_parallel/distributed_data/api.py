@@ -53,8 +53,10 @@ class DistributedDatasetConfig:
 
     ``packed_bytes_a2a`` accepts nested byte records and JSON scalar values.
     ``direct_tensor_a2a`` requires every owner sample to be one tensor with a
-    globally identical shape and dtype. ``pin_memory`` copies collated Host
-    tensor leaves into pinned memory on a dedicated data-owner thread.
+    globally identical shape and dtype. ``prefetch_steps`` bounds lightweight
+    step-plan look-ahead; payload look-ahead is always one microbatch.
+    ``pin_memory`` copies collated Host tensor leaves into pinned memory on a
+    dedicated data-owner thread.
     """
 
     micro_batch_size: int
@@ -98,17 +100,19 @@ def build_distributed_dataset(
     Groups must come from the training mesh; this API never creates an
     independent communication world. ``metadata_group`` contains exactly one
     data owner per DP coordinate. ``payload_group`` contains all model peers
-    sharing the current DP coordinate. Online metadata is the default path;
-    an explicit sidecar ``metadata`` sequence enables plan-before-read.
+    sharing the current DP coordinate. Online metadata is the default path and
+    balances one global microbatch at a time. An explicit sidecar ``metadata``
+    sequence enables whole-step inter-microbatch planning before payload reads.
 
     Args:
-        dataset: Shared map-style dataset. Online mode should return raw Host
-            payloads so only the planned data rank performs heavyweight decode.
+        dataset: Shared map-style dataset. Online mode reads only one local
+            microbatch of raw Host candidates at a time and redistributes them
+            before heavyweight target-rank decode.
         mesh: Named root training mesh.
         config: Batch planning, prefetch, and owner A2A transport configuration.
-        metadata_fn: Derive ``SampleMeta`` from ``(raw_sample, data_ref)``.
-            Required when ``metadata`` is not provided.
-        metadata: Optional shared lightweight sidecar for plan-before-read.
+        metadata_fn: Derive ``SampleMeta`` from ``(raw_sample, data_ref)`` for
+            microbatch-local online planning. Required without ``metadata``.
+        metadata: Optional shared lightweight sidecar for whole-step planning.
         collate_fn: Target-owner transform and collation function. In online
             mode it receives the raw samples retained or received after planning.
         metadata_group: Existing process group containing all data owners.

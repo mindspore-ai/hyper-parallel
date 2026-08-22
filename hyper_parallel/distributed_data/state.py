@@ -20,8 +20,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-from hyper_parallel.distributed_data.schema import BatchPlan
-
 
 @dataclass(frozen=True)
 class DistributedDatasetState:
@@ -134,19 +132,21 @@ class DatasetStateTracker:
         self._pending.append(_PendingWindow(start, end))
         return step, start, end
 
-    def mark_delivered(self, plan: BatchPlan) -> None:
-        """Attach a completed plan to the oldest scheduled window."""
+    def mark_delivered(self, replay_id: str, cursor_start: int, cursor_end: int) -> None:
+        """Attach a completed replay ID to the oldest scheduled window."""
         if not self._pending:
-            raise ValueError("Cannot deliver a plan when no prefetch window is pending.")
+            raise ValueError("Cannot deliver a step when no prefetch window is pending.")
         window = self._pending[0]
         if window.delivered:
             raise ValueError("The current prefetched step was already delivered and must be committed first.")
-        if plan.cursor_start != window.cursor_start or plan.cursor_end != window.cursor_end:
+        if not isinstance(replay_id, str) or not replay_id:
+            raise ValueError(f"replay_id must be a non-empty string, but got {replay_id!r}.")
+        if cursor_start != window.cursor_start or cursor_end != window.cursor_end:
             raise ValueError(
-                f"Plan cursor [{plan.cursor_start}, {plan.cursor_end}) does not match reserved window "
+                f"Delivered cursor [{cursor_start}, {cursor_end}) does not match reserved window "
                 f"[{window.cursor_start}, {window.cursor_end})."
             )
-        window.replay_id = plan.replay_id
+        window.replay_id = replay_id
         window.delivered = True
 
     def commit(self, replay_id: str) -> None:

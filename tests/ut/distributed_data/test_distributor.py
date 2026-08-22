@@ -243,7 +243,12 @@ class TestPayloadSharding(unittest.TestCase):
                 cost_hint=WorkloadCost(encoder=2.0),
             ),
         ]
-        plan = DistributedBatchPlanner(2, 1, 1).plan(metadata, step=0, cursor_start=0)
+        plan = DistributedBatchPlanner(2, 1, 2).plan_microbatch(
+            metadata,
+            step=0,
+            cursor_start=1,
+            micro_batch_index=1,
+        )
         topology = DataTopology.from_layout(
             mesh_shape=(2,),
             mesh_dim_names=("dp_shard",),

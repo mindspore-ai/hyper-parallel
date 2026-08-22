@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Iterator
 
 
 @dataclass(frozen=True)
@@ -158,7 +160,7 @@ class PlannedSample:
 
 @dataclass(frozen=True)
 class BatchPlan:
-    """Deterministic plan for every microbatch in one optimizer step."""
+    """Deterministic plan for a contiguous optimizer-step microbatch window."""
 
     replay_id: str
     step: int
@@ -169,6 +171,7 @@ class BatchPlan:
     micro_batch_count: int
     samples: tuple[PlannedSample, ...]
     cp_shards: tuple[TensorShardSpec, ...] = ()
+    micro_batch_start: int = 0
 
     def __post_init__(self) -> None:
         if not self.replay_id:
@@ -185,14 +188,23 @@ class BatchPlan:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"BatchPlan.{name} must be a positive integer, but got {value!r}.")
+        if (
+            not isinstance(self.micro_batch_start, int)
+            or isinstance(self.micro_batch_start, bool)
+            or self.micro_batch_start < 0
+        ):
+            raise ValueError(
+                f"BatchPlan.micro_batch_start must be a non-negative integer, but got {self.micro_batch_start!r}."
+            )
         expected = self.data_world_size * self.micro_batch_size * self.micro_batch_count
         if len(self.samples) != expected:
             raise ValueError(f"BatchPlan expected {expected} planned samples, but got {len(self.samples)}.")
         slot_positions: dict[tuple[int, int], set[int]] = {}
+        micro_batch_end = self.micro_batch_start + self.micro_batch_count
         for sample in self.samples:
             if sample.target_data_rank < 0 or sample.target_data_rank >= self.data_world_size:
                 raise ValueError(f"Planned sample has invalid target_data_rank={sample.target_data_rank}.")
-            if sample.micro_batch_index < 0 or sample.micro_batch_index >= self.micro_batch_count:
+            if sample.micro_batch_index < self.micro_batch_start or sample.micro_batch_index >= micro_batch_end:
                 raise ValueError(f"Planned sample has invalid micro_batch_index={sample.micro_batch_index}.")
             slot = (sample.target_data_rank, sample.micro_batch_index)
             slot_positions.setdefault(slot, set()).add(sample.position_in_micro_batch)
@@ -208,9 +220,11 @@ class BatchPlan:
         """Return samples assigned to one data rank and microbatch."""
         if data_rank < 0 or data_rank >= self.data_world_size:
             raise ValueError(f"data_rank must be in [0, {self.data_world_size}), but got {data_rank}.")
-        if micro_batch_index < 0 or micro_batch_index >= self.micro_batch_count:
+        micro_batch_end = self.micro_batch_start + self.micro_batch_count
+        if micro_batch_index < self.micro_batch_start or micro_batch_index >= micro_batch_end:
             raise ValueError(
-                f"micro_batch_index must be in [0, {self.micro_batch_count}), but got {micro_batch_index}."
+                f"micro_batch_index must be in [{self.micro_batch_start}, {micro_batch_end}), "
+                f"but got {micro_batch_index}."
             )
         selected = (
             sample
@@ -222,7 +236,7 @@ class BatchPlan:
 
 @dataclass(frozen=True)
 class RankPayload:
-    """Materialized payload consumed by one rank for one microbatch."""
+    """Materialized payload and its planning-window replay ID for one rank."""
 
     replay_id: str
     global_rank: int
@@ -233,13 +247,101 @@ class RankPayload:
     data: Any
 
 
-@dataclass(frozen=True)
-class DistributedDataStep:
-    """One optimizer step containing all local microbatch payloads."""
+class DistributedDataStep(Iterator[RankPayload]):
+    """One optimizer step that materializes local microbatches lazily."""
 
-    plan: BatchPlan
-    payloads: tuple[RankPayload, ...]
+    def __init__(
+        self,
+        *,
+        step: int,
+        cursor_start: int,
+        cursor_end: int,
+        micro_batch_count: int,
+        load_micro_batch: Callable[[int], tuple[BatchPlan, RankPayload]],
+        on_complete: Callable[["DistributedDataStep", str], None],
+    ) -> None:
+        """Initialize a single-use optimizer-step iterator.
 
-    def micro_batches(self) -> list[Any]:
-        """Return payload data in microbatch execution order."""
-        return [payload.data for payload in self.payloads]
+        Args:
+            step: Logical optimizer-step index.
+            cursor_start: Per-owner candidate cursor before this step.
+            cursor_end: Per-owner candidate cursor after this step.
+            micro_batch_count: Number of local microbatches in the step.
+            load_micro_batch: Runtime callback that produces one planned payload.
+            on_complete: Callback invoked after the final payload is produced.
+        """
+        for name, value in (
+            ("step", step),
+            ("cursor_start", cursor_start),
+            ("cursor_end", cursor_end),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
+        if cursor_end < cursor_start:
+            raise ValueError(f"cursor_end={cursor_end} must not precede cursor_start={cursor_start}.")
+        if not isinstance(micro_batch_count, int) or isinstance(micro_batch_count, bool) or micro_batch_count < 1:
+            raise ValueError(f"micro_batch_count must be a positive integer, but got {micro_batch_count!r}.")
+        if not callable(load_micro_batch) or not callable(on_complete):
+            raise ValueError("load_micro_batch and on_complete must be callable.")
+        self.step = step
+        self.cursor_start = cursor_start
+        self.cursor_end = cursor_end
+        self.micro_batch_count = micro_batch_count
+        self._load_micro_batch: Callable[[int], tuple[BatchPlan, RankPayload]] | None = load_micro_batch
+        self._on_complete: Callable[["DistributedDataStep", str], None] | None = on_complete
+        self._micro_batch_index = 0
+        self._plan_replay_ids: list[str] = []
+        self._replay_id: str | None = None
+
+    def __iter__(self) -> "DistributedDataStep":
+        """Return this single-use microbatch iterator."""
+        return self
+
+    def __next__(self) -> RankPayload:
+        """Materialize and return the next local microbatch payload."""
+        if self._micro_batch_index >= self.micro_batch_count:
+            raise StopIteration
+        if self._load_micro_batch is None:
+            raise ValueError("DistributedDataStep is no longer attached to its dataset runtime.")
+        plan, payload = self._load_micro_batch(self._micro_batch_index)
+        if payload.micro_batch_index != self._micro_batch_index:
+            raise ValueError(
+                f"Expected microbatch {self._micro_batch_index}, but runtime returned {payload.micro_batch_index}."
+            )
+        self._plan_replay_ids.append(plan.replay_id)
+        self._micro_batch_index += 1
+        if self._micro_batch_index == self.micro_batch_count:
+            self._replay_id = self._build_replay_id()
+            on_complete = self._on_complete
+            self._load_micro_batch = None
+            self._on_complete = None
+            if on_complete is None:
+                raise ValueError("DistributedDataStep completion callback is unavailable.")
+            on_complete(self, self._replay_id)
+        return payload
+
+    @property
+    def replay_id(self) -> str:
+        """Return the optimizer-step replay ID after all microbatches are produced."""
+        if self._replay_id is None:
+            raise ValueError("Consume every microbatch before requesting the optimizer-step replay ID.")
+        return self._replay_id
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether every local microbatch has been produced."""
+        return self._micro_batch_index == self.micro_batch_count
+
+    def micro_batches(self) -> Iterator[RankPayload]:
+        """Return the single-use lazy microbatch iterator."""
+        return self
+
+    def _build_replay_id(self) -> str:
+        stable_step = {
+            "step": self.step,
+            "cursor_start": self.cursor_start,
+            "cursor_end": self.cursor_end,
+            "plan_replay_ids": self._plan_replay_ids,
+        }
+        encoded = json.dumps(stable_step, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:24]

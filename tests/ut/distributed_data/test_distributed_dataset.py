@@ -183,7 +183,8 @@ class _SyntheticOwnerPayloadRedistributor:
 
     def __init__(self) -> None:
         """Initialize an empty redistribution record."""
-        self.local_payloads: tuple[Any, ...] = ()
+        self.local_payload_batches: list[tuple[Any, ...]] = []
+        self.plans: list[BatchPlan] = []
 
     def redistribute(
         self,
@@ -192,13 +193,17 @@ class _SyntheticOwnerPayloadRedistributor:
         topology: DataTopology,
     ) -> dict[int, Any]:
         """Return payloads planned for data rank zero."""
-        self.local_payloads = tuple(local_payloads)
+        local_payloads = tuple(local_payloads)
+        self.local_payload_batches.append(local_payloads)
+        self.plans.append(plan)
+        local_count = len(local_payloads)
+        source_start = topology.data_rank * local_count
         available = {
-            0: local_payloads[0],
-            1: local_payloads[1],
-            2: "peer-2",
-            3: "peer-3",
+            source_start + local_index: payload
+            for local_index, payload in enumerate(local_payloads)
         }
+        for sample in plan.samples:
+            available.setdefault(sample.source_position, f"peer-{sample.meta.data_ref}")
         return {
             sample.source_position: available[sample.source_position]
             for sample in plan.samples
@@ -226,6 +231,28 @@ class _ReceivingPayloadDistributor:
         result = f"received-{self._micro_batch_index}"
         self._micro_batch_index += 1
         return self._plan, result
+
+
+class _ReceivingPlanSequenceDistributor:
+    """Return one remote online microbatch plan per distribution call."""
+
+    def __init__(self, plans: Sequence[BatchPlan]) -> None:
+        """Initialize the ordered remote plan sequence."""
+        self._plans = tuple(plans)
+        self._micro_batch_index = 0
+
+    def distribute(
+        self,
+        payload: Any | None,
+        plan: BatchPlan | None,
+        topology: DataTopology,
+    ) -> tuple[BatchPlan, Any]:
+        """Return the next remote plan while asserting non-owner behavior."""
+        if payload is not None or plan is not None or topology.is_data_owner:
+            raise AssertionError("Non-owner online distribution received owner-only inputs.")
+        index = self._micro_batch_index
+        self._micro_batch_index += 1
+        return self._plans[index], f"received-online-{index}"
 
 
 def _build_loader(prefetch_steps: int = 2):
@@ -311,29 +338,37 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
 class TestDistributedDataset(unittest.TestCase):
     """Validate owner-only reads, bounded look-ahead, and exact resume."""
 
-    def test_yields_all_local_microbatches_and_requires_commit(self) -> None:
-        """One iterator item should represent a complete optimizer step."""
+    def test_materializes_one_microbatch_at_a_time_and_requires_commit(self) -> None:
+        """A step should plan globally but retain at most one look-ahead microbatch."""
         loader, materializer = _build_loader()
         try:
             step = next(loader)
 
-            self.assertEqual(len(step.payloads), 2)
-            self.assertEqual([payload.micro_batch_index for payload in step.payloads], [0, 1])
-            self.assertGreaterEqual(len(materializer.data_refs), 2)
-            self.assertLessEqual(len(materializer.data_refs), 4)
+            self.assertLessEqual(len(materializer.data_refs), 1)
             self.assertEqual(loader.consumed_offset, 0)
             self.assertEqual(loader.prepared_offset, 4)
-            with self.assertRaisesRegex(ValueError, "Commit the current"):
+            with self.assertRaisesRegex(ValueError, "Fully consume and commit"):
                 next(loader)
+            with self.assertRaisesRegex(ValueError, "Consume every microbatch"):
+                loader.commit("not-ready")
 
-            loader.commit(step.plan.replay_id)
+            first = next(step)
+            with self.assertRaisesRegex(ValueError, "Consume every microbatch"):
+                _ = step.replay_id
+            second = next(step)
+
+            self.assertEqual([first.micro_batch_index, second.micro_batch_index], [0, 1])
+            self.assertEqual(first.replay_id, second.replay_id)
+            self.assertTrue(step.is_complete)
+            self.assertFalse(hasattr(step, "payloads"))
+            loader.commit(step.replay_id)
             self.assertEqual(loader.consumed_offset, 2)
         finally:
             loader.close()
 
-    def test_online_metadata_reuses_owner_loaded_raw_payloads(self) -> None:
-        """Online planning should extract metadata and avoid rereading local samples."""
-        dataset = _RecordingMapDataset(["raw-0", "raw-1", "raw-2", "raw-3"])
+    def test_online_metadata_balances_and_redistributes_one_microbatch_at_a_time(self) -> None:
+        """Unavailable metadata must restrict planning and payload reads to each microbatch."""
+        dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
 
         def metadata_fn(payload: str, data_ref: int) -> SampleMeta:
             """Derive deterministic online cost metadata from one raw sample."""
@@ -356,13 +391,13 @@ class TestDistributedDataset(unittest.TestCase):
             metadata_fn,
             shard_rank=0,
             num_shards=2,
-            max_entries=2,
+            max_entries=3,
         )
         redistributor = _SyntheticOwnerPayloadRedistributor()
         loader = DistributedDataset(
             topology=topology,
             metadata_source=None,
-            planner=DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=2),
+            planner=DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=3),
             rank_materializer=RankMaterializer(_FailMaterializer(), tuple),
             metadata_synchronizer=_PeerMetadataSynchronizer(),
             payload_distributor=LocalPayloadDistributor(),
@@ -374,13 +409,22 @@ class TestDistributedDataset(unittest.TestCase):
             self.assertEqual(len(loader), 1)
             step = next(loader)
 
-            self.assertEqual(dataset.data_refs, [0, 2])
-            self.assertEqual(redistributor.local_payloads, ("raw-0", "raw-2"))
-            for payload in step.payloads:
-                planned = step.plan.samples_for(0, payload.micro_batch_index)
-                source_position = planned[0].source_position
-                expected = ("raw-0", "raw-2", "peer-2", "peer-3")[source_position]
-                self.assertEqual(payload.data, (expected,))
+            self.assertLessEqual(len(dataset.data_refs), 1)
+            first = next(step)
+            self.assertEqual(len(redistributor.local_payload_batches), 1)
+            self.assertLessEqual(len(dataset.data_refs), 2)
+
+            remaining = list(step)
+            payloads = [first, *remaining]
+            self.assertEqual([payload.micro_batch_index for payload in payloads], [0, 1, 2])
+            self.assertEqual(dataset.data_refs, [0, 2, 4])
+            self.assertEqual(
+                redistributor.local_payload_batches,
+                [("raw-0",), ("raw-2",), ("raw-4",)],
+            )
+            self.assertEqual([plan.micro_batch_start for plan in redistributor.plans], [0, 1, 2])
+            self.assertTrue(all(plan.micro_batch_count == 1 for plan in redistributor.plans))
+            loader.commit(step.replay_id)
         finally:
             loader.close()
 
@@ -395,7 +439,8 @@ class TestDistributedDataset(unittest.TestCase):
                 ]
                 loader = _build_pinning_loader(samples, online=online, pin_memory=True)
                 try:
-                    batch = next(loader).payloads[0].data
+                    step = next(loader)
+                    batch = next(step).data
 
                     self.assertEqual(
                         batch,
@@ -415,7 +460,8 @@ class TestDistributedDataset(unittest.TestCase):
         samples = [_PinnableValue("zero", thread_names)]
         loader = _build_pinning_loader(samples, online=False, pin_memory=False)
         try:
-            batch = next(loader).payloads[0].data
+            step = next(loader)
+            batch = next(step).data
 
             self.assertIs(batch["values"][0], samples[0])
             self.assertEqual(thread_names, [])
@@ -427,8 +473,9 @@ class TestDistributedDataset(unittest.TestCase):
         samples = [_PinnableValue("zero", [], fail=True)]
         loader = _build_pinning_loader(samples, online=False, pin_memory=True)
         try:
+            step = next(loader)
             with self.assertRaisesRegex(RuntimeError, "synthetic pin failure"):
-                next(loader)
+                next(step)
         finally:
             loader.close()
 
@@ -439,7 +486,8 @@ class TestDistributedDataset(unittest.TestCase):
             step = next(loader)
             before_commit = loader.state_dict()
             self.assertEqual(before_commit["consumed_offset"], 0)
-            loader.commit(step.plan.replay_id)
+            list(step)
+            loader.commit(step.replay_id)
             consumed_state = loader.state_dict()
             self.assertEqual(consumed_state["consumed_offset"], 2)
         finally:
@@ -449,8 +497,8 @@ class TestDistributedDataset(unittest.TestCase):
         try:
             restored.load_state_dict(consumed_state)
             resumed_step = next(restored)
-            self.assertEqual(resumed_step.plan.cursor_start, 2)
-            self.assertEqual(resumed_step.plan.step, 1)
+            self.assertEqual(resumed_step.cursor_start, 2)
+            self.assertEqual(resumed_step.step, 1)
         finally:
             restored.close()
 
@@ -479,7 +527,52 @@ class TestDistributedDataset(unittest.TestCase):
         )
         try:
             step = next(loader)
-            self.assertEqual(step.micro_batches(), ["received-0", "received-1"])
+            self.assertEqual([payload.data for payload in step], ["received-0", "received-1"])
+        finally:
+            loader.close()
+
+    def test_online_tp_peer_receives_microbatch_plans_without_reading_dataset(self) -> None:
+        """Non-owner model peers should receive online plans without candidate I/O."""
+        dataset = _RecordingMapDataset(["raw-0", "raw-1"])
+
+        def metadata_fn(payload: str, data_ref: int) -> SampleMeta:
+            """Build metadata that must remain unused on the non-owner peer."""
+            return SampleMeta(sample_id=payload, source_id="source", data_ref=data_ref)
+
+        topology = DataTopology.from_layout(
+            mesh_shape=(2,),
+            mesh_dim_names=("tp",),
+            rank_list=(0, 1),
+            global_rank=1,
+        )
+        planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=2)
+        plans = [
+            planner.plan_microbatch(
+                [SampleMeta(sample_id=str(index), source_id="source", data_ref=index)],
+                step=0,
+                cursor_start=index,
+                micro_batch_index=index,
+            )
+            for index in range(2)
+        ]
+        loader = DistributedDataset(
+            topology=topology,
+            metadata_source=None,
+            planner=planner,
+            rank_materializer=RankMaterializer(_FailMaterializer()),
+            metadata_synchronizer=LocalMetadataSynchronizer(),
+            payload_distributor=_ReceivingPlanSequenceDistributor(plans),
+            prefetch_steps=1,
+            online_sample_source=StridedOnlineSampleSource(dataset, metadata_fn, shard_rank=0, num_shards=1),
+            owner_payload_redistributor=LocalOwnerPayloadRedistributor(),
+        )
+        try:
+            step = next(loader)
+            payloads = list(step)
+
+            self.assertEqual([payload.data for payload in payloads], ["received-online-0", "received-online-1"])
+            self.assertEqual(dataset.data_refs, [])
+            loader.commit(step.replay_id)
         finally:
             loader.close()
 

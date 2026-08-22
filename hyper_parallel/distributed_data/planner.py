@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Global-step batch planning from lightweight sample metadata."""
+"""Whole-step and online-microbatch planning from lightweight metadata."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from hyper_parallel.distributed_data.schema import BatchPlan, PlannedSample, Sam
 
 
 class DistributedBatchPlanner:
-    """Plan all DP-rank microbatches for one optimizer step."""
+    """Plan DP-rank slots across a whole step or one online microbatch."""
 
     def __init__(
         self,
@@ -80,11 +80,65 @@ class DistributedBatchPlanner:
         Returns:
             A deterministic :class:`BatchPlan`.
         """
+        return self._plan(
+            candidates,
+            step=step,
+            cursor_start=cursor_start,
+            micro_batch_start=0,
+            micro_batch_count=self.micro_batch_count,
+        )
+
+    def plan_microbatch(
+        self,
+        candidates: Sequence[SampleMeta],
+        *,
+        step: int,
+        cursor_start: int,
+        micro_batch_index: int,
+    ) -> BatchPlan:
+        """Build one online microbatch plan when later metadata is unavailable.
+
+        Args:
+            candidates: Metadata for one complete global microbatch.
+            step: Logical optimizer-step index.
+            cursor_start: Per-owner candidate cursor before this microbatch.
+            micro_batch_index: Microbatch position within the optimizer step.
+
+        Returns:
+            A deterministic one-microbatch :class:`BatchPlan`.
+        """
+        if (
+            not isinstance(micro_batch_index, int)
+            or isinstance(micro_batch_index, bool)
+            or micro_batch_index < 0
+            or micro_batch_index >= self.micro_batch_count
+        ):
+            raise ValueError(
+                f"micro_batch_index must be in [0, {self.micro_batch_count}), but got {micro_batch_index!r}."
+            )
+        return self._plan(
+            candidates,
+            step=step,
+            cursor_start=cursor_start,
+            micro_batch_start=micro_batch_index,
+            micro_batch_count=1,
+        )
+
+    def _plan(
+        self,
+        candidates: Sequence[SampleMeta],
+        *,
+        step: int,
+        cursor_start: int,
+        micro_batch_start: int,
+        micro_batch_count: int,
+    ) -> BatchPlan:
         if step < 0 or cursor_start < 0:
             raise ValueError(f"step and cursor_start must be non-negative, but got {step} and {cursor_start}.")
-        if len(candidates) != self.global_samples_per_step:
+        expected_candidates = self.data_world_size * self.micro_batch_size * micro_batch_count
+        if len(candidates) != expected_candidates:
             raise ValueError(
-                f"Planner requires {self.global_samples_per_step} candidates for one global step, "
+                f"Planner requires {expected_candidates} candidates for this planning window, "
                 f"but got {len(candidates)}."
             )
         sample_keys = [(metadata.source_id, metadata.sample_id) for metadata in candidates]
@@ -95,12 +149,12 @@ class DistributedBatchPlanner:
             BalanceItem(metadata=metadata, source_position=position, cost=self.cost_model.estimate(metadata))
             for position, metadata in enumerate(candidates)
         )
-        slot_count = self.data_world_size * self.micro_batch_count
+        slot_count = self.data_world_size * micro_batch_count
         slots = self.balancer.balance(items, slot_count, self.micro_batch_size)
 
         planned_samples = []
         for slot_index, slot in enumerate(slots):
-            micro_batch_index = slot_index // self.data_world_size
+            micro_batch_index = micro_batch_start + slot_index // self.data_world_size
             target_data_rank = slot_index % self.data_world_size
             for position_in_micro_batch, item in enumerate(slot):
                 planned_samples.append(
@@ -114,8 +168,14 @@ class DistributedBatchPlanner:
                     )
                 )
 
-        cursor_end = cursor_start + self.local_samples_per_step
-        replay_id = self._replay_id(step, cursor_start, tuple(planned_samples))
+        cursor_end = cursor_start + self.micro_batch_size * micro_batch_count
+        replay_id = self._replay_id(
+            step,
+            cursor_start,
+            micro_batch_start,
+            micro_batch_count,
+            tuple(planned_samples),
+        )
         return BatchPlan(
             replay_id=replay_id,
             step=step,
@@ -123,15 +183,18 @@ class DistributedBatchPlanner:
             cursor_end=cursor_end,
             data_world_size=self.data_world_size,
             micro_batch_size=self.micro_batch_size,
-            micro_batch_count=self.micro_batch_count,
+            micro_batch_count=micro_batch_count,
             samples=tuple(planned_samples),
             cp_shards=self.cp_shards,
+            micro_batch_start=micro_batch_start,
         )
 
     def _replay_id(
         self,
         step: int,
         cursor_start: int,
+        micro_batch_start: int,
+        micro_batch_count: int,
         samples: tuple[PlannedSample, ...],
     ) -> str:
         stable_plan = {
@@ -139,7 +202,8 @@ class DistributedBatchPlanner:
             "cursor_start": cursor_start,
             "data_world_size": self.data_world_size,
             "micro_batch_size": self.micro_batch_size,
-            "micro_batch_count": self.micro_batch_count,
+            "micro_batch_start": micro_batch_start,
+            "micro_batch_count": micro_batch_count,
             "samples": [
                 {
                     "source_id": sample.meta.source_id,
