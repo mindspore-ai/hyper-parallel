@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for MindSpore fully_shard scheduler compatibility behavior."""
+"""Unit tests for MindSpore fully_shard scheduler hooks and root finalization."""
 
 # pylint: disable=protected-access
 
@@ -35,7 +35,7 @@ ensure_mindspore_platform_for_fully_shard()
 
 import mindspore as ms
 
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
 from hyper_parallel.platform.mindspore.fully_shard import scheduler as scheduler_mod
 from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
@@ -51,28 +51,25 @@ def _make_scheduler():
     scheduler.modules = []
     scheduler.platform = "platform"
     scheduler.device = UT_RUNTIME_DEVICE
-    scheduler.config = SimpleNamespace(mesh=None)
-    scheduler.mesh = None
+    scheduler.scheduler_ctx = HSDPSchedulerContext()
+    scheduler.mesh = SimpleNamespace(ndim=1)
+    scheduler.shard_placement_fn = None
+    scheduler.comm_fusion_policy = MagicMock()
+    scheduler.mp_policy = MagicMock()
+    scheduler.offload_policy = None
+    scheduler.ignored_params = set()
+    scheduler.replicate_params = set()
     scheduler._get_managed_params = MagicMock(return_value=[])
     scheduler.hsdp_state = MagicMock()
     scheduler.scheduler_state = FSDPSchedulerState.PRE_FORWARD
+    scheduler._is_root = True
     scheduler.cell = "cell"
     scheduler._fsdp_group_post_pending = None
     return scheduler
 
 
-class FakeMesh:
-    """Minimal mesh stub exposing only the hash used by compatibility mode."""
-
-    def __init__(self, mesh_hash):
-        self._mesh_hash = mesh_hash
-
-    def to_hash(self):
-        return self._mesh_hash
-
-
 class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
-    """Test scheduler compatibility-mode mesh resolution and hook wrapping."""
+    """Test scheduler state creation, hook wrapping, and root drain ordering."""
 
     def test_zero_grad_register_hooks_and_platform_validation(self):
         """Small delegating methods should use existing state/platform extension points."""
@@ -90,76 +87,23 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
                 MindSporeHSDPSchedulerV2._init_platform(scheduler)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler.MindSporeHSDPStateV2")
-    @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler.DDPMeshInfo")
-    def test_new_cell_state_uses_compat_mesh_for_mesh_none(self, mock_ddp_mesh_info, mock_state_ctor):
-        """mesh=None should reuse the shared DTensor mesh carried by managed parameters."""
+    def test_new_cell_state_passes_explicit_mesh_to_state(self, mock_state_ctor):
+        """State owns parameter-level FSDP/DDP mesh selection from one explicit DP mesh."""
         scheduler = _make_scheduler()
-        compat_mesh = FakeMesh("mesh-hash")
-        scheduler._get_managed_params.return_value = ["p0", "p1"]
-        mock_ddp_mesh_info.return_value = "compat-mesh-info"
-
-        with patch(
-            "hyper_parallel.platform.mindspore.fully_shard.scheduler.get_dtensor_managed_mesh",
-            side_effect=[compat_mesh, compat_mesh],
-        ):
-            MindSporeHSDPSchedulerV2._new_cell_state(scheduler)
-
-        mock_ddp_mesh_info.assert_called_once_with(mesh=compat_mesh, replicate_mesh_dim=0)
+        MindSporeHSDPSchedulerV2._new_cell_state(scheduler)
         mock_state_ctor.assert_called_once_with(
             scheduler.modules,
-            "compat-mesh-info",
-            scheduler.config,
+            scheduler.mesh,
+            scheduler.shard_placement_fn,
+            scheduler.comm_fusion_policy,
+            scheduler.mp_policy,
+            scheduler.offload_policy,
+            scheduler.ignored_params,
+            scheduler.replicate_params,
             scheduler.platform,
+            scheduler.scheduler_ctx,
             scheduler.device,
         )
-        self.assertEqual(scheduler.mesh_info, "compat-mesh-info")
-
-    @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler.MindSporeHSDPStateV2")
-    def test_new_cell_state_uses_explicit_1d_2d_mesh_and_rejects_others(self, mock_state_ctor):
-        """Explicit meshes should map to FSDP/HSDP mesh info based on dimensionality."""
-        scheduler = _make_scheduler()
-        scheduler.mesh = SimpleNamespace(ndim=1)
-        with patch.object(scheduler_mod, "FSDPMeshInfo", return_value="fsdp-info") as fsdp_info:
-            MindSporeHSDPSchedulerV2._new_cell_state(scheduler)
-        fsdp_info.assert_called_once_with(mesh=scheduler.mesh, shard_mesh_dim=0)
-        mock_state_ctor.assert_called_with(
-            scheduler.modules,
-            "fsdp-info",
-            scheduler.config,
-            scheduler.platform,
-            scheduler.device,
-        )
-
-        scheduler.mesh = SimpleNamespace(ndim=2)
-        with patch.object(scheduler_mod, "HSDPMeshInfo", return_value="hsdp-info") as hsdp_info:
-            MindSporeHSDPSchedulerV2._new_cell_state(scheduler)
-        hsdp_info.assert_called_once_with(mesh=scheduler.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
-        self.assertEqual(scheduler.mesh_info, "hsdp-info")
-
-        scheduler.mesh = SimpleNamespace(ndim=3)
-        with self.assertRaisesRegex(ValueError, "only supports"):
-            MindSporeHSDPSchedulerV2._new_cell_state(scheduler)
-
-    def test_new_cell_state_rejects_mesh_none_without_dtensor_mesh(self):
-        """Compatibility mode needs at least one DTensor-managed mesh."""
-        scheduler = _make_scheduler()
-        scheduler._get_managed_params.return_value = ["param"]
-        with patch.object(scheduler_mod, "get_dtensor_managed_mesh", return_value=None):
-            with self.assertRaisesRegex(ValueError, "without a DTensor"):
-                MindSporeHSDPSchedulerV2._new_cell_state(scheduler)
-
-    def test_new_cell_state_rejects_mixed_compat_meshes(self):
-        """mesh=None compatibility mode should reject DTensor params with different meshes."""
-        scheduler = _make_scheduler()
-        mesh_a = FakeMesh("mesh-a")
-        mesh_b = FakeMesh("mesh-b")
-        scheduler._get_managed_params.return_value = ["p0", "p1"]
-
-        with patch(
-            "hyper_parallel.platform.mindspore.fully_shard.scheduler.get_dtensor_managed_mesh",
-            side_effect=[mesh_a, mesh_b],
-        ), self.assertRaisesRegex(ValueError, "share the same mesh"):
-            MindSporeHSDPSchedulerV2._new_cell_state(scheduler)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler.PostBackwardFunction.apply")
     def test_register_post_backward_hook_wraps_only_grad_tensors(self, mock_apply):
@@ -222,25 +166,25 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         scheduler._register_backward_pre_hook = MagicMock(return_value="registered")
         scheduler._restore_forward_prefetch_after_recompute = MagicMock(return_value=True)
         scheduler._hsdp_forward_hook = MagicMock(return_value="hooked")
-        HSDPSchedulerV2.root_bp_state = True
+        scheduler.scheduler_ctx.root_bp_state = True
         self.assertIsNone(MindSporeHSDPSchedulerV2._forward_hook(scheduler, "cell", (), "out"))
         scheduler._restore_forward_prefetch_after_recompute.assert_called_once_with()
         scheduler._hsdp_forward_hook.assert_not_called()
 
-        HSDPSchedulerV2.root_bp_state = False
+        scheduler.scheduler_ctx.root_bp_state = False
         self.assertEqual(MindSporeHSDPSchedulerV2._forward_hook(scheduler, "cell", (), "out"), "hooked")
 
         scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
         with patch.object(scheduler_mod._pynative_executor, "queue_backward_final_callback") as queue_callback:
             self.assertEqual(MindSporeHSDPSchedulerV2._backward_pre_hook(scheduler, "grad"), "grad")
-        queue_callback.assert_called_once_with(scheduler._root_backward_hook)
+        queue_callback.assert_not_called()
 
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
         scheduler._hsdp_backward_pre_hook = MagicMock()
         with patch.object(scheduler_mod._pynative_executor, "queue_backward_final_callback"):
             MindSporeHSDPSchedulerV2._backward_pre_hook(scheduler, "grad")
         scheduler._hsdp_backward_pre_hook.assert_called_once_with(scheduler.cell, None)
-        self.assertTrue(HSDPSchedulerV2.root_bp_state)
+        self.assertTrue(scheduler.scheduler_ctx.root_bp_state)
 
     def test_root_backward_and_backward_hook_drain_comm_context(self):
         """Root backward should finish staged fused groups and state reductions once."""
@@ -248,18 +192,23 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
         scheduler._is_root = True
         scheduler._hsdp_backward_hook = MagicMock()
-        all_reduce_group = SimpleNamespace(wait_all_reduce_and_apply_grad=MagicMock())
-        pre_group = SimpleNamespace(apply_fusion_reduced_grad=MagicMock())
+        scheduler.scheduler_ctx.all_hsdp_schedulers = [scheduler]
+        all_reduce_group = SimpleNamespace(wait_all_reduce_and_save_grad=MagicMock())
+        pre_group = SimpleNamespace(wait_reduce_scatter_and_issue_all_reduce=MagicMock())
         comm_ctx = SimpleNamespace(all_reduce_param_group=all_reduce_group, pre_param_group=pre_group)
+        scheduler.scheduler_ctx.param_group_comm_ctx = comm_ctx
+        scheduler.hsdp_state._wait_prev_reduce_scatter.return_value = []
+        scheduler.hsdp_state.hsdp_params = []
 
-        with patch.object(scheduler_mod, "get_comm_ctx", return_value=comm_ctx):
-            MindSporeHSDPSchedulerV2._root_backward_hook(scheduler)
+        MindSporeHSDPSchedulerV2._root_backward_hook(scheduler)
 
         scheduler._hsdp_backward_hook.assert_called_once_with(scheduler.cell, None, None)
-        all_reduce_group.wait_all_reduce_and_apply_grad.assert_called_once_with()
-        pre_group.apply_fusion_reduced_grad.assert_called_once_with()
-        scheduler.hsdp_state.reduce_params.assert_called_once_with()
-        self.assertFalse(HSDPSchedulerV2.root_bp_state)
+        all_reduce_group.wait_all_reduce_and_save_grad.assert_called_once_with()
+        pre_group.wait_reduce_scatter_and_issue_all_reduce.assert_called_once_with()
+        scheduler.hsdp_state._wait_prev_reduce_scatter.assert_called_once_with()
+        scheduler.hsdp_state._wait_prev_reduce_scatter_without_all_reduce.assert_called_once_with()
+        scheduler.hsdp_state.wait_and_split_all_reduce_work_groups.assert_called_once_with()
+        self.assertFalse(scheduler.scheduler_ctx.root_bp_state)
 
         scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
         scheduler._hsdp_backward_hook.reset_mock()
@@ -330,16 +279,64 @@ class TestCoreScheduler(unittest.TestCase):
     def _make_core_scheduler(self):
         """Create a core scheduler instance with mocked state and hooks."""
         scheduler = object.__new__(HSDPSchedulerV2)
-        scheduler.config = SimpleNamespace(reshard_after_forward=True)
+        scheduler.reshard_after_forward = True
         scheduler.hsdp_state = MagicMock()
+        scheduler.scheduler_ctx = HSDPSchedulerContext()
         scheduler.forward_prefetch_cells = []
         scheduler.backward_prefetch_cells = []
         scheduler._backup_forward_fetch = None
         scheduler._fsdp_group_post_pending = None
+        scheduler.scheduler_state = None
         scheduler._forward_pre_hook = MagicMock(return_value=("args", {"kw": "v"}))
         scheduler._forward_hook = MagicMock(return_value="outputs")
         scheduler.modules = []
         return scheduler
+
+    def test_reset_iter_state_only_clears_current_module_tree(self):
+        """Reset should clear scheduler, queue, and comm state without touching another tree."""
+        scheduler = self._make_core_scheduler()
+        other_scheduler = self._make_core_scheduler()
+        current_ctx = scheduler.scheduler_ctx
+        other_ctx = other_scheduler.scheduler_ctx
+        current_ctx.root_bp_state = True
+        other_ctx.root_bp_state = True
+        current_ctx.pre_reduce_scatter_params.append("current-rs")
+        current_ctx.pre_all_reduce_params.append("current-ar")
+        current_ctx.pre_direct_all_reduce_grads.append("current-direct-ar")
+        current_ctx.pre_all_reduce_groups.append("current-pre-group")
+        current_ctx.pending_all_reduce_groups.append("current-pending-group")
+        current_ctx.param_group_comm_ctx.pre_param_group = "current-pre-param-group"
+        current_ctx.param_group_comm_ctx.all_reduce_param_group = "current-ar-param-group"
+        current_ctx.param_group_comm_ctx.comm_handle = "current-rs-handle"
+        other_ctx.pre_reduce_scatter_params.append("other-rs")
+        other_ctx.pre_all_reduce_params.append("other-ar")
+        other_ctx.pre_direct_all_reduce_grads.append("other-direct-ar")
+        other_ctx.pre_all_reduce_groups.append("other-pre-group")
+        other_ctx.pending_all_reduce_groups.append("other-pending-group")
+        other_ctx.param_group_comm_ctx.pre_param_group = "other-pre-param-group"
+        other_ctx.param_group_comm_ctx.all_reduce_param_group = "other-ar-param-group"
+        other_ctx.param_group_comm_ctx.comm_handle = "other-rs-handle"
+
+        scheduler.reset_iter_state()
+
+        self.assertFalse(current_ctx.root_bp_state)
+        self.assertEqual(current_ctx.pre_reduce_scatter_params, [])
+        self.assertEqual(current_ctx.pre_all_reduce_params, [])
+        self.assertEqual(current_ctx.pre_direct_all_reduce_grads, [])
+        self.assertEqual(current_ctx.pre_all_reduce_groups, [])
+        self.assertEqual(current_ctx.pending_all_reduce_groups, [])
+        self.assertIsNone(current_ctx.param_group_comm_ctx.pre_param_group)
+        self.assertIsNone(current_ctx.param_group_comm_ctx.all_reduce_param_group)
+        self.assertIsNone(current_ctx.param_group_comm_ctx.comm_handle)
+        self.assertTrue(other_ctx.root_bp_state)
+        self.assertEqual(other_ctx.pre_reduce_scatter_params, ["other-rs"])
+        self.assertEqual(other_ctx.pre_all_reduce_params, ["other-ar"])
+        self.assertEqual(other_ctx.pre_direct_all_reduce_grads, ["other-direct-ar"])
+        self.assertEqual(other_ctx.pre_all_reduce_groups, ["other-pre-group"])
+        self.assertEqual(other_ctx.pending_all_reduce_groups, ["other-pending-group"])
+        self.assertEqual(other_ctx.param_group_comm_ctx.pre_param_group, "other-pre-param-group")
+        self.assertEqual(other_ctx.param_group_comm_ctx.all_reduce_param_group, "other-ar-param-group")
+        self.assertEqual(other_ctx.param_group_comm_ctx.comm_handle, "other-rs-handle")
 
     def test_setters_update_config_and_state(self):
         """Scheduler setters should validate bool inputs and update owned state."""
@@ -351,10 +348,9 @@ class TestCoreScheduler(unittest.TestCase):
         scheduler.set_requires_grad_sync(True)
 
         self.assertFalse(scheduler.reshard_after_forward)
-        self.assertFalse(scheduler.config.reshard_after_forward)
         scheduler.hsdp_state.set_requires_grad_sync.assert_called_once_with(True)
         self.assertTrue(scheduler.hsdp_state.reshard_after_backward)
-        self.assertFalse(scheduler.hsdp_state.requires_all_reduce)
+        scheduler.hsdp_state.set_requires_all_reduce.assert_called_once_with(False)
         for method, value in [
             (scheduler.set_reshard_after_forward, 1),
             (scheduler.set_reshard_after_backward, 1),

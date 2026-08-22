@@ -180,18 +180,10 @@ def test_ms_fully_shard_module_01():
         f"Expected reshard_after_forward=True, "
         f"got {model1.hsdp_scheduler.reshard_after_forward}"
     )
-    assert model1.hsdp_scheduler.config.reshard_after_forward is True, (
-        f"Expected config.reshard_after_forward=True, "
-        f"got {model1.hsdp_scheduler.config.reshard_after_forward}"
-    )
     model1.set_reshard_after_forward(False)
     assert model1.hsdp_scheduler.reshard_after_forward is False, (
         f"Expected reshard_after_forward=False, "
         f"got {model1.hsdp_scheduler.reshard_after_forward}"
-    )
-    assert model1.hsdp_scheduler.config.reshard_after_forward is False, (
-        f"Expected config.reshard_after_forward=False, "
-        f"got {model1.hsdp_scheduler.config.reshard_after_forward}"
     )
     try:
         model1.set_reshard_after_forward(1)

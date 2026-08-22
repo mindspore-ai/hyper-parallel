@@ -162,6 +162,42 @@ class TestPlacementConversion(unittest.TestCase):
         self.assertEqual(placements[0], StridedShard(0, split_factor=2))
         self.assertEqual(placements[1], Shard(0))
 
+    def test_uneven_shard_marker_value_semantics(self):
+        """Test uneven markers participate in placement identity and representation."""
+        marked_shard = Shard(0, uneven_shard=True)
+        same_marked_shard = Shard(0, uneven_shard=True)
+        balanced_shard = Shard(0)
+        marked_strided_shard = StridedShard(0, split_factor=2, uneven_shard=True)
+
+        self.assertEqual(marked_shard, same_marked_shard)
+        self.assertEqual(hash(marked_shard), hash(same_marked_shard))
+        self.assertNotEqual(marked_shard, balanced_shard)
+        self.assertNotEqual(hash(marked_shard), hash(balanced_shard))
+        self.assertEqual(repr(marked_shard), "Shard(dim=0, uneven_shard=True)")
+        self.assertEqual(
+            repr(marked_strided_shard),
+            "StridedShard(dim=0, split_factor=2, uneven_shard=True)",
+        )
+        with self.assertRaisesRegex(TypeError, "uneven_shard must be bool"):
+            Shard(0, uneven_shard=1)
+
+    def test_uneven_shard_layout_round_trip(self):
+        """Test tensor-map reconstruction retains the marked FSDP mesh placement."""
+        layout = Layout((2, 2), ("fsdp", "tp"), init_backend=False)
+        expected_placements = [
+            StridedShard(0, split_factor=2, uneven_shard=True),
+            Shard(0),
+        ]
+
+        layout.set_placements(expected_placements)
+        tensor_map = layout.placement_to_tensor_map(dim=2)
+        rebuilt_placements = layout.tensor_map_to_placement()
+
+        self.assertEqual(tuple(tensor_map), ((0, 1), -1))
+        self.assertEqual(rebuilt_placements, expected_placements)
+        self.assertEqual(layout.uneven_shard_mesh_dims, (0,))
+        self.assertTrue(layout.has_uneven_shard)
+
     def test_ragged_shard(self):
         """Test RaggedShard value semantics and phase-one constructor validation."""
         placement = RaggedShard(dims=(0, 1), local_units=(1, 2, 0))

@@ -22,13 +22,11 @@ from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.platform import get_platform
 from hyper_parallel.tools.logging import get_logger
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
-from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, DDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.platform.torch.fully_shard.hook_function import PostBackwardFunction
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
-from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx
-from hyper_parallel.platform import get_platform
 
 logger = get_logger("FSDP")
 
@@ -70,35 +68,19 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _new_cell_state(self):
         """Create a new cell state for torch."""
-        params = self._get_managed_params()
-        if self.mesh is None:
-            compat_meshes = [
-                param.device_mesh for param in params if isinstance(param, DTensor)
-            ]
-            compat_mesh = compat_meshes[0] if compat_meshes else None
-            if compat_mesh is None:
-                raise ValueError(
-                    "Cannot build fully_shard compatibility mesh_info "
-                    "without a DTensor parameter mesh."
-                )
-            compat_mesh_hash = compat_mesh.to_hash()
-            for param_mesh in compat_meshes[1:]:
-                if param_mesh.to_hash() != compat_mesh_hash:
-                    raise ValueError(
-                        "fully_shard compatibility mode requires all DTensor parameters to share the same mesh."
-                    )
-            self.mesh_info = DDPMeshInfo(mesh=compat_mesh, replicate_mesh_dim=0)
-        elif self.mesh.ndim == 1:
-            self.mesh_info = FSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=0)
-        elif self.mesh.ndim == 2:
-            self.mesh_info = HSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
-        else:
-            raise ValueError(
-                "fully_shard only supports explicit 1D DP/FSDP meshes or 2D HSDP meshes. "
-                f"Got mesh.ndim={self.mesh.ndim}."
-            )
         self.hsdp_state = TorchHSDPStateV2(
-            self.modules, self.mesh_info, self.config, self.platform, self.device
+            self.modules,
+            self.mesh,
+            self.shard_placement_fn,
+            self.comm_fusion_policy,
+            self.mp_policy,
+            self.offload_policy,
+            self.ignored_params,
+            self.replicate_params,
+            self.platform,
+            self.scheduler_ctx,
+            self.device,
+            source_shard_infos=self.source_shard_infos,
         )
 
     def _register_post_backward_hook(self, args, kwargs):
@@ -156,7 +138,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
         self._register_backward_pre_hook(outputs)
-        if HSDPSchedulerV2.root_bp_state:
+        if self.scheduler_ctx.root_bp_state:
             self._restore_forward_prefetch_after_recompute()
             return
         return self._hsdp_forward_hook(cell, inputs, outputs)
@@ -165,101 +147,90 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
     @_dynamo_disable
     def _backward_pre_hook(self, grad):
         """Execute backward pre hook."""
-        Variable._execution_engine.queue_callback(self._root_backward_hook)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
-        HSDPSchedulerV2.root_bp_state = True
+        if self._is_root:
+            Variable._execution_engine.queue_callback(self._root_backward_hook)
+        self.scheduler_ctx.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
     @_dynamo_disable
-    def _root_backward_hook(self, force_reduce=False):
-        """Finalize gradient reduction for the outermost HSDP module after backward.
-
-        ``apply_final_reduce`` selects between two cases, distinguished by whether
-        this unit's forward input was differentiable:
-
-        * input ``requires_grad=False`` (the common case): no ``PostBackwardFunction``
-          is inserted on the input, so ``scheduler_state != BACKWARD`` and this hook
-          owns the finalization -- it drains the pending reductions (comm_fusion=True
-          via ``CommContext``; comm_fusion=False via the last module's reduce_scatter
-          + allreduce) and applies the per-parameter gradients.
-        * input ``requires_grad=True`` (a boundary case where the unit is fed a
-          differentiable activation from an enclosing graph): the input's
-          ``PostBackwardFunction`` drives ``scheduler_state == BACKWARD``, so the
-          natural path does not finalize here. ``force_reduce`` lets a caller that
-          owns that backward boundary demand the drain happen now rather than have it
-          deferred a step.
-
-        ``root_bp_state`` -- whether the top-level root module's backward is still in
-        flight, used to gate forward prefetch during activation recompute -- is
-        independent of the reduce branch: it is cleared only by the root module's own
-        hook, keyed on ``_is_root``.
-        """
+    def _root_backward_hook(self):
+        """Drain all DP pipelines, then run final TP reduction and apply gradients."""
         logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
-        apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
-        self._backward_hook()
-        if self._is_root:
-            HSDPSchedulerV2.root_bp_state = False
-        if apply_final_reduce or force_reduce:
-            with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
-                logger.debug(
-                    "hook=root_backward_hook action=final_reduce module=%s",
-                    self.hsdp_state,
+        for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            # let modules which are not triggered backward_hook launch backward communication.
+            hsdp_scheduler._backward_hook()
+        self.scheduler_ctx.root_bp_state = False
+        with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
+            logger.debug(
+                "hook=root_backward_hook action=final_reduce module=%s",
+                self.hsdp_state,
+            )
+            self._finalize_comm_fusion_reductions()
+            self._finalize_per_param_reductions()
+            self.launch_tp_replicate_reduce_and_apply()
+
+    def _finalize_comm_fusion_reductions(self) -> None:
+        """Drain the comm_fusion=True RS/AR pipeline."""
+        comm_ctx = self.scheduler_ctx.param_group_comm_ctx
+        if comm_ctx.all_reduce_param_group is not None:
+            logger.debug(
+                "hook=root_backward_hook wait=comm_fusion_all_reduce module=%s",
+                self.hsdp_state,
+            )
+            comm_ctx.all_reduce_param_group.wait_all_reduce_and_save_grad()
+            comm_ctx.all_reduce_param_group = None
+        if comm_ctx.pre_param_group is not None:
+            logger.debug(
+                "hook=root_backward_hook wait=comm_fusion_reduce_scatter module=%s",
+                self.hsdp_state,
+            )
+            comm_ctx.pre_param_group.wait_reduce_scatter_and_issue_all_reduce()
+            comm_ctx.pre_param_group = None
+        if comm_ctx.all_reduce_param_group is not None:
+            comm_ctx.all_reduce_param_group.wait_all_reduce_and_save_grad()
+            comm_ctx.all_reduce_param_group = None
+
+    def _finalize_per_param_reductions(self) -> None:
+        """Drain the module-tree-local comm_fusion=False RS/AR queues."""
+        # A fused root may own non-fused children, so always drain the tree queues.
+        last_all_reduce_groups = self.hsdp_state._wait_prev_reduce_scatter()
+        self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce()
+        self.hsdp_state._issue_prev_fused_all_reduce(last_all_reduce_groups)
+        self.hsdp_state.wait_and_split_all_reduce_work_groups()
+
+    def launch_tp_replicate_reduce_and_apply(self) -> None:
+        """Run final TP replicate reductions and apply gradients for all states."""
+        for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            hsdp_state = hsdp_scheduler.hsdp_state
+            if hsdp_state is None:
+                continue
+            need_synchronize = False
+            for hsdp_param in hsdp_state.hsdp_params:
+                reduced_grad = hsdp_param.all_reduce_comm_ctx.all_reduce_output
+                if reduced_grad is None:
+                    reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
+                if reduced_grad is None:
+                    continue
+                hsdp_param.all_reduce_source_replicate_grad_inplace(
+                    reduced_grad,
+                    hsdp_state.reduce_op_type,
                 )
-                # Drain any pending async fused reduction from the last module's backward
-                comm_ctx = get_comm_ctx()
-                # Drain any pending pipelined HSDP reductions (comm_fusion=True)
-                if comm_ctx.all_reduce_param_group is not None:
-                    logger.debug(
-                        "hook=root_backward_hook wait=comm_fusion_all_reduce module=%s",
-                        self.hsdp_state,
-                    )
-                    comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
-                    comm_ctx.all_reduce_param_group = None
-                if comm_ctx.pre_param_group is not None:
-                    logger.debug(
-                        "hook=root_backward_hook apply=comm_fusion_reduce_scatter module=%s",
-                        self.hsdp_state,
-                    )
-                    comm_ctx.pre_param_group.apply_fusion_reduced_grad()
-                    comm_ctx.pre_param_group = None
+                need_synchronize = hsdp_param.apply_reduced_grad(reduced_grad) or need_synchronize
+                hsdp_param.clear_all_reduce_output()
+                hsdp_param.clear_reduce_scatter_output()
+            hsdp_state._sync_current_stream_if_needed(need_synchronize)
 
-                # Process the last module's reduce_scatter and allreduce (comm_fusion=False)
-                if TorchHSDPStateV2.pre_all_reduce_groups:
-                    for group in TorchHSDPStateV2.pre_all_reduce_groups:
-                        logger.debug(
-                            "hook=root_backward_hook wait=pre_reduce_scatter group_size=%s module=%s",
-                            len(group.hsdp_params),
-                            self.hsdp_state,
-                        )
-                        # Wait reduce_scatter
-                        for hsdp_param in group.hsdp_params:
-                            hsdp_param.reduce_scatter_output()
-                            hsdp_param.clear_reduce_scatter_output()
-                        # Accumulate existing gradients (from previous mini steps) to fused_buffer
-                        # This is for gradient accumulation scenario
-                        # where previous mini steps used pre_reduce_scatter_params.
-                        # The gradients in sharded_param.grad are reduce_scatter results (not allreduced)
-                        group.accumulate_existing_grads_to_buffer()
-                        # Issue allreduce
-                        logger.debug(
-                            "hook=root_backward_hook launch=fused_all_reduce group_size=%s module=%s",
-                            len(group.hsdp_params),
-                            self.hsdp_state,
-                        )
-                        group.issue_async_allreduce()
-                        TorchHSDPStateV2.pending_all_reduce_groups.append(group)
-                    TorchHSDPStateV2.pre_all_reduce_groups.clear()
-
-                # Apply gradients for params without all_reduce needs
-                self.hsdp_state.reduce_scattered_params()
-                # Finally, wait all allreduce and apply gradients
-                TorchHSDPStateV2.delay_apply_reduce_grads(self.hsdp_state.device)
-
-                # Handle user config replicated_param
-                self.hsdp_state.reduce_params()
-
+    @_dynamo_disable
+    def reset_iter_state(self) -> None:
+        """Reset Torch fully_shard iteration state after communication is complete."""
+        super().reset_iter_state()
+        self.hsdp_state.reset_iter_state()
+        comm_ctx = self.scheduler_ctx.param_group_comm_ctx
+        comm_ctx.pre_param_group = None
+        comm_ctx.all_reduce_param_group = None
 
     @_dynamo_disable
     def _backward_hook(self):
@@ -269,11 +240,13 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_hook(self.cell, None, None)
 
     # pylint: disable=W0613
-    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:  # pylint: disable=arguments-differ
+    @staticmethod
+    def _grouped_forward_pre_hook_skip(cell, args, kwargs) -> None:
         """Override base ``(args, kwargs)`` return; ``nn.Module`` pre-hook uses ``None`` for no-op."""
         return None
 
-    def _grouped_forward_post_hook_skip(self, outputs) -> None:  # pylint: disable=arguments-differ
+    @staticmethod
+    def _grouped_forward_post_hook_skip(outputs) -> None:
         """Override base output pass-through; forward hook uses ``None`` for no-op."""
         return None
 

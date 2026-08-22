@@ -65,6 +65,12 @@ class TestParallelOneHotExt(unittest.TestCase):
         assert output_layout.tensor_map == expected_map, (
             f"OneHotExt failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
+        expected_placements = [Replicate() for _ in output_layout.mesh.mesh_dim_names]
+        mesh_ndim = len(expected_placements)
+        for tensor_dim, tensor_map_value in enumerate(expected_map):
+            if tensor_map_value != -1:
+                expected_placements[mesh_ndim - 1 - tensor_map_value] = Shard(tensor_dim)
+        assert output_layout.placements == expected_placements
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_one_hot_ext_1d_axis_minus1_data_parallel_1(self, mock_platform):

@@ -12,32 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""HSDP parameter"""
-from typing import List, Callable, Optional, cast, Tuple
+"""MindSpore fully_shard parameter lifecycle and gradient communication."""
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Tuple, cast
 import itertools
 import mindspore as ms
 from mindspore import nn
 from mindspore.common.api import _no_grad
-from mindspore import ops, Parameter
+from mindspore import Parameter
 import mindspore.mint.distributed as dist
-from mindspore.ops.function.comm_func import CommHandle
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
     CPUOffloadPolicy,
     OffloadPolicy,
+    DataParallelMeshInfo,
+    DDPMeshInfo,
     FSDPMeshInfo,
     HSDPMeshInfo,
+    SourceShardMetaInfo,
 )
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     ShardedState,
-    FullyShardParamMode,
     apply_gradient_scaling_factor,
     unwrap_dtensor_param,
 )
-from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
 from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
@@ -77,9 +80,9 @@ def make_contiguous_strides_for(shape, row_major=True):
 
     Args:
         shape (tuple of int): The shape of the tensor. Each dimension must be a non-negative integer.
-        row_major (bool): 
+        row_major (bool):
             - If True (default), returns C-style (row-major) strides: last dimension changes fastest.
-            - If False, returns strides where the last two dimensions are Fortran-style 
+            - If False, returns strides where the last two dimensions are Fortran-style
               (i.e., for batched matrix operations in BLAS/LAPACK): second-to-last dim changes fastest.
 
     Returns:
@@ -136,6 +139,31 @@ def make_contiguous_strides_for(shape, row_major=True):
     return c_strides[:-2] + (1, max(shape[-2], 1))
 
 
+@dataclass
+class ReduceScatterCommCtx:
+    """Per-parameter reduce-scatter output and asynchronous work."""
+
+    reduce_scatter_output: Optional[ms.Tensor] = None
+    reduce_scatter_handle: Optional[Any] = None
+
+
+@dataclass
+class AllReduceCommCtx:
+    """Per-parameter all-reduce output and asynchronous work."""
+
+    all_reduce_output: Optional[ms.Tensor] = None
+    all_reduce_handle: Optional[Any] = None
+
+
+@dataclass
+class AllGatherCommCtx:
+    """Per-parameter all-gather buffers and asynchronous work."""
+
+    allgather_input: Optional[ms.Tensor] = None
+    allgather_output: Optional[ms.Tensor] = None
+    allgather_handle: Optional[Any] = None
+
+
 class MindSporeHSDPParamV2(HSDPParamV2):
     """
     MindSpore HSDP parameter.
@@ -145,22 +173,20 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self,
         param: Parameter,
         module_info: ParamModuleInfo,
-        mesh_info: FSDPMeshInfo,
+        mesh_info: DataParallelMeshInfo,
         shard_placement_fn: Optional[Callable[[Parameter], Optional[Shard]]] = None,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[str] = None,
-        param_mode: Optional[FullyShardParamMode] = None,
-        enable_fsdp_shard: bool = True,
+        source_shard_info: Optional[SourceShardMetaInfo] = None,
     ):
         self._module_info: ParamModuleInfo = module_info
         self.mesh_info = mesh_info
         self.mp_policy = mp_policy
         self.device = device
-        if param_mode is None:
-            raise AssertionError("param_mode must be resolved before MindSporeHSDPParamV2 initialization.")
-        self.param_mode = param_mode
-        self.enable_fsdp_shard = enable_fsdp_shard
+        self.orig_dtype = None
+        self.param_dtype = None
+        self.reduce_dtype = None
         self.offload_to_cpu: bool = isinstance(offload_policy, CPUOffloadPolicy)
         self.pin_memory = (
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
@@ -168,27 +194,35 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._orig_param_hooks: List[Callable] = []
         self.grad_offload_event: Optional[ms.runtime.Event] = None
         dtensor_payload = unwrap_dtensor_param(param)
-        self._orig_param_is_dtensor = dtensor_payload is not None
-        self._orig_dtensor_mesh = dtensor_payload.device_mesh if dtensor_payload is not None else None
-        self._orig_dtensor_placements = (
-            tuple(dtensor_payload.placements) if dtensor_payload is not None else None
+        if (dtensor_payload is not None) != (
+            source_shard_info is not None and source_shard_info.origin_is_dtensor
+        ):
+            raise ValueError(
+                "source_shard_info.origin_is_dtensor must be True exactly for native DTensor parameters, "
+                f"got parameter type {type(param).__name__} and source_shard_info={source_shard_info}"
+            )
+        self.source_shard_info = source_shard_info
+        self._orig_param_is_dtensor = (
+            source_shard_info is not None and source_shard_info.origin_is_dtensor
         )
-        self._spmd_shard_mesh_dim = getattr(self.mesh_info, "shard_mesh_dim", None)
-        self._spmd_replicate_mesh_dim = getattr(self.mesh_info, "replicate_mesh_dim", None)
+        self._orig_dtensor_mesh = source_shard_info.mesh if self._orig_param_is_dtensor else None
+        self._orig_dtensor_placements = (
+            tuple(source_shard_info.placements) if self._orig_param_is_dtensor else None
+        )
+        self._spmd_shard_mesh_dim = self.mesh_info.shard_mesh_dim
+        self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
         self._init_sharded_param(param, shard_placement_fn)
-        self._init_group_infos()
         self._save_backward_hooks(param)
-        self.all_gather_outputs: List[ms.Tensor] = []
+        self.unsharded_param_buffers: List[ms.Tensor] = []
         self.unsharded_accumulated_grad = None
         self._unsharded_param: Optional[Parameter] = None
         self._param_fqn: Optional[str] = None
         # Communication attributes for prefetch pattern
-        self.prefetch_handle: Optional[CommHandle] = None
-        self._reduce_scatter_output = None
-        self.reduce_scatter_handle: Optional[CommHandle] = None
-        self._all_reduce_output = None
-        self.all_reduce_handle: Optional[CommHandle] = None
+        self.allgather_comm_ctx = AllGatherCommCtx()
+        self.reduce_scatter_comm_ctx = ReduceScatterCommCtx()
+        self.all_reduce_comm_ctx = AllReduceCommCtx()
         self._accumulated_allreduced_grad = True
+        self._reduce_partial_output = None
         self._post_load_hook_handle = (
             module_info.module.register_load_state_dict_post_hook(
                 lambda *args, **kwargs: self.reset_sharded_param()
@@ -205,14 +239,57 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._accumulated_allreduced_grad = value
 
     @property
-    def uses_param_shard(self) -> bool:
-        """Whether FSDP sharding is enabled for this parameter."""
-        return self.enable_fsdp_shard
+    def reduce_partial_output(self) -> Optional[ms.Tensor]:
+        """Return reduce-scatter results accumulated before the final micro-step."""
+        return self._reduce_partial_output
 
-    @property
-    def is_dtensor_compat_mode(self) -> bool:
-        """Whether this parameter uses DTensor compatibility mode."""
-        return self.param_mode == FullyShardParamMode.DTENSOR_COMPAT
+    @reduce_partial_output.setter
+    def reduce_partial_output(self, value: Optional[ms.Tensor]) -> None:
+        self._reduce_partial_output = value
+
+    def reduce_comm_dtype(self, grad: Optional[ms.Tensor] = None):
+        """Resolve the communication dtype owned by this parameter."""
+        if self.reduce_dtype is not None:
+            return self.reduce_dtype
+        if grad is not None:
+            return grad.dtype
+        if self.unsharded_accumulated_grad is not None:
+            return self.unsharded_accumulated_grad_data.dtype
+        if self.unsharded_param is not None and self.unsharded_param.grad is not None:
+            return self.unsharded_grad_data.dtype
+        return self.orig_dtype
+
+    def _get_base_spmd_placements(self) -> tuple:
+        """Return source-layout placements prefixed by explicit data-parallel axes."""
+        if self.source_shard_info is not None:
+            self._spmd_mesh = DeviceMesh.concatenate(
+                [self.mesh_info.mesh, self.source_shard_info.mesh]
+            )
+            dp_prefix = tuple(Replicate() for _ in range(self.mesh_info.mesh.ndim))
+            return dp_prefix + tuple(self.source_shard_info.placements)
+        self._spmd_mesh = self.mesh_info.mesh
+        return tuple(Replicate() for _ in range(self._spmd_mesh.ndim))
+
+    def _apply_data_parallel_placements(
+        self, placements: list, shard_placement: Shard
+    ) -> tuple:
+        """Apply the parameter-specific DDP/FSDP layout to source placements."""
+        if len(placements) != self._spmd_mesh.ndim:
+            raise AssertionError(
+                f"Expected {self._spmd_mesh.ndim} unified placements, got "
+                f"{len(placements)}: {placements}"
+            )
+        if (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and self._spmd_replicate_mesh_dim is not None
+            and not self._orig_param_is_dtensor
+        ):
+            placements[self._spmd_replicate_mesh_dim] = Replicate()
+        if isinstance(self.mesh_info, FSDPMeshInfo) and self._spmd_shard_mesh_dim is not None:
+            placements[self._spmd_shard_mesh_dim] = self._get_data_parallel_shard_placement(
+                placements, shard_placement
+            )
+        return tuple(placements)
 
     def _get_data_parallel_shard_placement(self, placements: list, shard_placement: Shard):
         """Return the explicit fully_shard placement on the unified SPMD mesh."""
@@ -319,22 +396,29 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._orig_size = param_data.shape
         self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
 
-        if self.uses_param_shard and isinstance(self.mesh_info, FSDPMeshInfo):  # FSDP or HSDP
-            shard_rank = self.mesh_info.shard_mesh_rank
-            shard_world_size = self.mesh_info.shard_mesh_size
-        else:  # DDP
-            shard_rank = 0
-            shard_world_size = 1
+        if isinstance(self.mesh_info, FSDPMeshInfo):
+            self.shard_rank = self.mesh_info.shard_mesh_rank
+            self.shard_world_size = self.mesh_info.shard_mesh_size
+        else:
+            self.shard_rank = 0
+            self.shard_world_size = 1
+        if isinstance(self.mesh_info, DDPMeshInfo):
+            self.replicate_world_size = self.mesh_info.replicate_mesh_size
+        else:
+            self.replicate_world_size = 1
+        self.is_replicate_param = (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and not isinstance(self.mesh_info, HSDPMeshInfo)
+        )
+        self.is_sharded = self.shard_world_size > 1
 
-        self.is_sharded = bool(self.uses_param_shard and shard_world_size > 1)
-
-        if param_data.shape[shard_dim] % shard_world_size != 0:
+        if param_data.shape[shard_dim] % self.shard_world_size != 0:
             raise NotImplementedError(
                 f"Uneven sharding on dim {shard_dim} not supported: "
-                f"shape={param_data.shape}, world_size={shard_world_size}"
+                f"shape={param_data.shape}, world_size={self.shard_world_size}"
             )
-        chunks = ms.mint.chunk(param_data, shard_world_size, dim=shard_dim)
-        sharded_param = chunks[shard_rank].clone().contiguous()
+        chunks = ms.mint.chunk(param_data, self.shard_world_size, dim=shard_dim)
+        sharded_param = chunks[self.shard_rank].clone().contiguous()
         self.sharded_size = sharded_param.shape
         self.contiguous_sharded_stride = make_contiguous_strides_for(self.sharded_size)
         self._sharded_param_data = sharded_param.view(-1)
@@ -364,7 +448,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
 
-    def init_all_gather_outputs(
+    def init_unsharded_param_buffers(
         self,
         all_gather_input_numels: list[int],
         all_gather_input_dtypes: list[ms.Type],
@@ -372,9 +456,9 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         device: str,
         force_recreate: bool = False,
     ):
-        if not force_recreate and len(self.all_gather_outputs) > 0:
+        if not force_recreate and len(self.unsharded_param_buffers) > 0:
             return  # already initialized
-        self.all_gather_outputs = [
+        self.unsharded_param_buffers = [
             ms.mint.empty([numel * world_size], dtype=dtype, device=device.split(':')[0])
             for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
         ]
@@ -418,11 +502,11 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     def _get_unsharded_param_from_all_gather_output(self):
         """Reconstruct the full local parameter view from the packed all-gather output."""
-        if len(self.all_gather_outputs) != 1:
+        if len(self.unsharded_param_buffers) != 1:
             raise AssertionError(
-                f"Expected 1 all_gather_output, got {len(self.all_gather_outputs)}"
+                f"Expected 1 unsharded_param_buffer, got {len(self.unsharded_param_buffers)}"
             )
-        unsharded_tensor = self.all_gather_outputs[0]
+        unsharded_tensor = self.unsharded_param_buffers[0]
         plan = build_rs_plan(
             self,
             self._sharded_local_tensor,
@@ -438,15 +522,11 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         return unsharded_param
 
     def to_sharded(self) -> None:
-        if not self.uses_param_shard and self._unsharded_param is not None:
-            # Replicate params keep the same local shape across shard/unshard,
-            # so persist forward-time state updates before switching objects.
-            src = self._unsharded_param.to_local() if isinstance(self._unsharded_param, DTensor) \
-                else self._unsharded_param
-            dst = self.sharded_param.to_local() if isinstance(self.sharded_param, DTensor) else self.sharded_param
-            copy_without_bumping_version(dst, src)
         self._setattr_on_modules(self.sharded_param)
         self.free_unsharded_param()
+        self.allgather_comm_ctx.allgather_input = None
+        self.allgather_comm_ctx.allgather_output = None
+        self.allgather_comm_ctx.allgather_handle = None
         self.sharded_state = ShardedState.SHARDED
 
     def to_unsharded(self) -> None:
@@ -499,7 +579,10 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         if self.unsharded_accumulated_grad is None:
             self.unsharded_accumulated_grad = unsharded_grad
         else:
-            self.unsharded_accumulated_grad += unsharded_grad
+            self.unsharded_accumulated_grad = ms.mint.add(
+                self.unsharded_accumulated_grad,
+                unsharded_grad,
+            )
 
     def accumulate_unsharded_grad_if_needed(self) -> None:
         if (
@@ -507,11 +590,14 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             and self.unsharded_param.grad is not None
         ):
             # need to handle the gradient
-            self.unsharded_accumulated_grad += self._to_local_unsharded_grad(self.unsharded_param.grad)
+            self.unsharded_accumulated_grad = ms.mint.add(
+                self.unsharded_accumulated_grad,
+                self._to_local_unsharded_grad(self.unsharded_param.grad),
+            )
             self.unsharded_param.grad = None
 
-    def alloc_all_gather_outputs(self) -> None:
-        for tensor in self.all_gather_outputs:
+    def alloc_unsharded_param_buffers(self) -> None:
+        for tensor in self.unsharded_param_buffers:
             expected_size = tensor.numel() * tensor.itemsize
 
             storage = tensor.untyped_storage()
@@ -520,7 +606,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     def free_unsharded_param(self) -> None:
         for tensor in itertools.chain(
-            self.all_gather_outputs
+            self.unsharded_param_buffers
         ):
             storage = tensor.untyped_storage()
             if storage.size() != 0:
@@ -574,20 +660,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         if isinstance(dtype, ms.Type):
             return dtype
         return None
-
-    @property
-    def shard_world_size(self) -> int:
-        """Get the world size for shard dimension."""
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            return self.mesh_info.shard_mesh_size
-        return 1
-
-    @property
-    def replicate_world_size(self) -> int:
-        """Get the world size for replicate dimension (HSDP only)."""
-        if isinstance(self.mesh_info, HSDPMeshInfo):
-            return self.mesh_info.replicate_mesh_size
-        return 1
 
     def _assert_in_states(self, *states: ShardedState) -> None:
         """Assert current state is one of expected states."""
@@ -684,7 +756,10 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._sharding_spec = cast(DTensor, self.sharded_param).layout
 
     @_no_grad()
-    def _get_unsharded_param_data(self, async_op: bool = False) -> Tuple[ms.Tensor, Optional[CommHandle]]:
+    def _get_unsharded_param_data(
+        self,
+        async_op: bool = False,
+    ) -> Tuple[ms.Tensor, ms.Tensor, Optional[Any]]:
         """
         Perform all-gather to get unsharded parameter data.
 
@@ -692,7 +767,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             async_op: Whether to execute asynchronously.
 
         Returns:
-            (unsharded_param, handle): Unsharded parameter data and communication handle.
+            (all_gather_input, unsharded_param, handle): Communication input,
+            unsharded parameter data, and communication handle.
         """
         # Optimizer steps may refresh the underlying local tensor storage. Re-sync
         # the cached flat shard view before reading all_gather_inputs for the next
@@ -702,57 +778,60 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         # If parameter is not sharded (below threshold), no communication needed
         if not self.is_sharded:
-            self.init_all_gather_outputs(
+            self.init_unsharded_param_buffers(
                 all_gather_input_numels=[all_gather_input.numel()],
                 all_gather_input_dtypes=[all_gather_input.dtype],
                 world_size=1,
                 device=all_gather_input.device.split(':')[0],
             )
-            self.alloc_all_gather_outputs()
-            copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
-            return self.all_gather_outputs[0], None
+            self.alloc_unsharded_param_buffers()
+            copy_without_bumping_version(self.unsharded_param_buffers[0], all_gather_input)
+            return all_gather_input, self.unsharded_param_buffers[0], None
 
         # Initialize output buffer
-        self.init_all_gather_outputs(
+        self.init_unsharded_param_buffers(
             all_gather_input_numels=[all_gather_input.numel()],
             all_gather_input_dtypes=[all_gather_input.dtype],
             world_size=self.shard_world_size,
             device=self._sharded_param_data.device.split(':')[0],
         )
-        self.alloc_all_gather_outputs()
+        self.alloc_unsharded_param_buffers()
 
         # Get communication group
         shard_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
 
         if shard_group is None or self.shard_world_size <= 1:
             # No communication needed, just copy
-            copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
-            return self.all_gather_outputs[0], None
+            copy_without_bumping_version(self.unsharded_param_buffers[0], all_gather_input)
+            return all_gather_input, self.unsharded_param_buffers[0], None
 
         # Execute all_gather_into_tensor
         handle = dist.all_gather_into_tensor(
-            self.all_gather_outputs[0],
+            self.unsharded_param_buffers[0],
             all_gather_input,
             group=shard_group,
             async_op=async_op,
         )
 
-        return self.all_gather_outputs[0], handle
+        return all_gather_input, self.unsharded_param_buffers[0], handle
 
     def unshard(self, async_op: bool = False) -> None:
-        if self.prefetch_handle is not None:
+        if self.allgather_comm_ctx.allgather_output is not None:
             # Already triggered by HSDPState.prefetch(), so return directly.
             return  # no-op
 
-        _, handle = self._get_unsharded_param_data(async_op=async_op)
-        self.prefetch_handle = handle
+        all_gather_input, output, handle = self._get_unsharded_param_data(async_op=async_op)
+        self.allgather_comm_ctx.allgather_input = all_gather_input
+        self.allgather_comm_ctx.allgather_output = output
+        self.allgather_comm_ctx.allgather_handle = handle
 
     def wait_for_unshard(self) -> None:
         self._assert_in_states(ShardedState.SHARDED)
 
-        if self.prefetch_handle is not None:
-            self.prefetch_handle.wait()
-            self.prefetch_handle = None
+        if self.allgather_comm_ctx.allgather_handle is not None:
+            self.allgather_comm_ctx.allgather_handle.wait()
+            self.allgather_comm_ctx.allgather_handle = None
+        self.allgather_comm_ctx.allgather_input = None
 
         self.init_unsharded_param()
         self.to_unsharded()
@@ -766,22 +845,22 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     def reduce_scatter_output(self):
         """Return cached reduce-scatter output after waiting pending async work."""
-        if self.reduce_scatter_handle is not None:
-            self.reduce_scatter_handle.wait()
-            self.reduce_scatter_handle = None
-        return self._reduce_scatter_output
+        if self.reduce_scatter_comm_ctx.reduce_scatter_handle is not None:
+            self.reduce_scatter_comm_ctx.reduce_scatter_handle.wait()
+            self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
+        return self.reduce_scatter_comm_ctx.reduce_scatter_output
 
     def clear_reduce_scatter_output(self):
         """Clear cached reduce-scatter output."""
-        self._reduce_scatter_output = None
+        self.reduce_scatter_comm_ctx.reduce_scatter_output = None
 
     def reduce_scatter_grad(
         self,
         async_op: bool = True,
         dtype: Optional[ms.Type] = None,
-        reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.AVG,
+        reduce_op: str = "avg",
         output_buffer: Optional[ms.Tensor] = None,
-    ) -> Tuple[ms.Tensor, Optional[CommHandle]]:
+    ) -> None:
         """
         Perform reduce-scatter on gradient to reduce and shard the full gradient.
 
@@ -791,17 +870,15 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             reduce_op: do reduce-scatter avg or sum.
             output_buffer: Optional pre-allocated output for fused all-reduce groups.
 
-        Returns:
-            (sharded_grad, handle): Sharded gradient and communication handle.
+        The output and optional asynchronous handle are stored in
+        ``reduce_scatter_comm_ctx``.
         """
-        self._assert_in_states(ShardedState.UNSHARDED)
-
         # Choose gradient source based on use_accumulated_grad flag
         if self.unsharded_accumulated_grad is not None:
             grad = self.unsharded_accumulated_grad_data
         else:
             grad = self.unsharded_grad_data
-        reduce_dtype = dtype or grad.dtype
+        reduce_dtype = dtype or self.reduce_comm_dtype(grad)
         grad = grad.to(reduce_dtype)
         grad = grad.contiguous()
         shard_group_info = getattr(self, "sharded_group_info", None)
@@ -823,20 +900,20 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         if not self.is_sharded:
             if output_buffer is not None:
                 copy_without_bumping_version(output_buffer, grad_flat)
-                self._reduce_scatter_output = output_buffer
+                self.reduce_scatter_comm_ctx.reduce_scatter_output = output_buffer
             else:
-                self._reduce_scatter_output = grad_flat
-            self.reduce_scatter_handle = None
-            return self._reduce_scatter_output, None
+                self.reduce_scatter_comm_ctx.reduce_scatter_output = grad_flat
+            self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
+            return
 
         if shard_group is None or shard_group_size <= 1:
             if output_buffer is not None:
                 copy_without_bumping_version(output_buffer, grad_flat)
-                self._reduce_scatter_output = output_buffer
+                self.reduce_scatter_comm_ctx.reduce_scatter_output = output_buffer
             else:
-                self._reduce_scatter_output = grad_flat
-            self.reduce_scatter_handle = None
-            return self._reduce_scatter_output, None
+                self.reduce_scatter_comm_ctx.reduce_scatter_output = grad_flat
+            self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
+            return
 
         # Calculate output size
         output_numel = grad_flat.numel() // shard_group_size
@@ -849,9 +926,9 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 raise ValueError(
                     f"output_buffer dtype mismatch: expected {reduce_dtype}, got {output_buffer.dtype}"
                 )
-            self._reduce_scatter_output = output_buffer
+            self.reduce_scatter_comm_ctx.reduce_scatter_output = output_buffer
         else:
-            self._reduce_scatter_output = ms.mint.empty(
+            self.reduce_scatter_comm_ctx.reduce_scatter_output = ms.mint.empty(
                 output_numel, dtype=reduce_dtype, device=grad.device.split(":")[0]
             )
 
@@ -863,15 +940,13 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         grad_flat = grad_flat.contiguous()
 
         # Execute reduce_scatter_tensor
-        self.reduce_scatter_handle = dist.reduce_scatter_tensor(
-            self._reduce_scatter_output,
+        self.reduce_scatter_comm_ctx.reduce_scatter_handle = dist.reduce_scatter_tensor(
+            self.reduce_scatter_comm_ctx.reduce_scatter_output,
             grad_flat,
             op=reduce_op,
             group=shard_group,
             async_op=async_op,
         )
-
-        return self._reduce_scatter_output, self.reduce_scatter_handle
 
     def zero_grad(self):
         """Reset the sharded parameter's gradient buffers to None."""
@@ -881,53 +956,33 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     def all_reduce_grad(
         self,
-        grad: Optional[ms.Tensor] = None,
-        dtype: Optional[ms.Type] = None,
         async_op: bool = True,
-        reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM,
-    ) -> Tuple[ms.Tensor, Optional[CommHandle]]:
+        reduce_op: str = "avg",
+    ) -> None:
         """
         Perform all-reduce on gradient (across replicate dimension in HSDP mode).
 
         Args:
-            grad: Gradient tensor to reduce. If None, this is a pure all-reduce
-                path (no preceding reduce-scatter): the unsharded grad is fetched
-                here and ``gradient_scaling_factor`` is applied in this leg. If a
-                grad is passed in, it is the already-scaled output of
-                ``reduce_scatter_grad`` (chained HSDP all-reduce) and is not
-                scaled again. Whether the grad is fetched here is therefore the
-                signal for which leg owns the scaling -- no extra flag needed.
             async_op: Whether to execute asynchronously.
-            reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM.
+            reduce_op: Reduction operation accepted by ``mint.distributed``.
 
-        Returns:
-            (reduced_grad, handle): Reduced gradient and communication handle.
+        The output and optional asynchronous handle are stored in
+        ``all_reduce_comm_ctx``.
         """
-        # grad is None => pure all-reduce path: fetch the unsharded grad and own
-        # the scaling here, since it never went through reduce_scatter_grad.
-        scale_here = grad is None
+        grad = self.reduce_scatter_comm_ctx.reduce_scatter_output
         if grad is None:
-            if self.unsharded_accumulated_grad is not None:
-                grad = self.unsharded_accumulated_grad_data
-            else:
-                grad = self.unsharded_grad_data
-        else:
-            grad = self._to_local_unsharded_grad(grad)
-
-        if dtype is not None and dtype != grad.dtype:
-            grad = grad.to(dtype)
-        if scale_here:
-            # all-reduce below is in-place on grad, so scaling in-place here keeps
-            # the same semantics: reduce(g_i * factor) == factor * reduce(g_i).
-            apply_gradient_scaling_factor(grad, self.gradient_scaling_factor)
-        reduce_group_info = self.unsharded_group_info
-        if reduce_group_info.rank_size <= 1:
-            self._all_reduce_output = grad
-            self.all_reduce_handle = None
-            return grad, None
-        reduce_group = reduce_group_info.group
-        if reduce_group is None:
-            raise RuntimeError("Expected a valid unsharded all-reduce group when rank_size > 1")
+            raise RuntimeError("all_reduce_grad requires a completed reduce-scatter output.")
+        if self.reduce_dtype is not None and self.reduce_dtype != grad.dtype:
+            grad = grad.to(self.reduce_dtype)
+        reduce_group = (
+            self.mesh_info.replicate_process_group
+            if isinstance(self.mesh_info, DDPMeshInfo)
+            else None
+        )
+        if reduce_group is None or self.replicate_world_size <= 1:
+            self.all_reduce_comm_ctx.all_reduce_output = grad
+            self.all_reduce_comm_ctx.all_reduce_handle = None
+            return
 
         # Ascend HCCL DistCommAllReduce rejects non-contiguous tensors.
         # ``grad`` here may be a view returned by ``_to_local_unsharded_grad``
@@ -938,27 +993,33 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         # non-contig views from DTensor on this MS version).
         grad = grad.contiguous()
 
-        self._all_reduce_output = grad
-        self.all_reduce_handle = dist.all_reduce(
+        self.all_reduce_comm_ctx.all_reduce_output = grad
+        self.all_reduce_comm_ctx.all_reduce_handle = dist.all_reduce(
             grad,
             op=reduce_op,
             group=reduce_group,
-            async_op=async_op
+            async_op=async_op,
         )
-        return self._all_reduce_output, self.all_reduce_handle
 
     def all_reduce_output(self):
         """Return cached all-reduce output after waiting pending async work."""
-        if self.all_reduce_handle is not None:
-            self.all_reduce_handle.wait()
-            self.all_reduce_handle = None
-        return self._all_reduce_output
+        if self.all_reduce_comm_ctx.all_reduce_handle is not None:
+            self.all_reduce_comm_ctx.all_reduce_handle.wait()
+            self.all_reduce_comm_ctx.all_reduce_handle = None
+        return self.all_reduce_comm_ctx.all_reduce_output
 
     def clear_all_reduce_output(self):
         """Clear cached all-reduce output."""
-        self._all_reduce_output = None
+        self.all_reduce_comm_ctx.all_reduce_output = None
 
-    def apply_reduced_grad(self, reduced_grad, param_type):
+    def clear_unsharded_source_grad(self) -> None:
+        """Release the unsharded gradient after its communication input is safe."""
+        if self.unsharded_accumulated_grad is not None:
+            self.unsharded_accumulated_grad = None
+        if self.unsharded_param is not None and self.unsharded_param.grad is not None:
+            self.unsharded_param.grad = None
+
+    def apply_reduced_grad(self, reduced_grad):
         """
         Apply reduced gradient to the sharded parameter.
 
@@ -968,7 +1029,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         Args:
             reduced_grad (ms.Tensor): Gradient after reduce-scatter
                 and/or all-reduce.
-            param_type (Optional[ms.Type]): Target dtype for the gradient.
         """
         if self.mp_policy.apply_grad_on_fp32_main_grad:
             if not hasattr(self.sharded_param, "main_grad"):
@@ -977,11 +1037,11 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         else:
             sharded_grad = self.sharded_param.grad
 
-        reduced_grad = reduced_grad.view(self.sharded_size)
+        reduced_grad = reduced_grad.reshape(-1).narrow(
+            0, 0, self._sharded_local_tensor.numel()
+        ).view(self.sharded_size)
         if not self.mp_policy.apply_grad_on_fp32_main_grad:
-            # Cast to state-level orig dtype first, then align with the sharded param's
-            # actual storage dtype (issue #215: fp32 reduced grad vs bf16 master weights).
-            reduced_grad = _to_dtype_if_needed(reduced_grad, param_type)
+            reduced_grad = _to_dtype_if_needed(reduced_grad, self.orig_dtype)
             reduced_grad = _to_dtype_if_needed(
                 reduced_grad, self._sharded_param_storage_dtype()
             )
@@ -1001,19 +1061,55 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)
         else:
             if self.mp_policy.apply_grad_on_fp32_main_grad:
-                self.sharded_param.main_grad._local_tensor += reduced_grad
+                accumulated_grad = ms.mint.add(
+                    self.sharded_param.main_grad._local_tensor,
+                    reduced_grad,
+                )
+                self.sharded_param.main_grad = self.to_sharded_dtensor(accumulated_grad)
                 self.sharded_param.grad = None
             else:
-                self.sharded_param.grad._local_tensor += reduced_grad
+                accumulated_grad = ms.mint.add(
+                    self.sharded_param.grad._local_tensor,
+                    reduced_grad,
+                )
+                self.sharded_param.grad = self.to_sharded_dtensor(accumulated_grad)
 
-        if self.unsharded_accumulated_grad_data is not None:
-            self.unsharded_accumulated_grad = None
-        elif self._unsharded_param is not None and self.unsharded_param.grad is not None:
-            # The direct DTENSOR_COMPAT all-reduce path applies the reduced grad
-            # straight onto sharded_param (main_grad) while _unsharded_param is None,
-            # so guard the unsharded cleanup against that case.
-            self.unsharded_param.grad = None
+        self.clear_unsharded_source_grad()
         return need_synchronize
+
+    def all_reduce_tp_replicate_grad_inplace(
+        self,
+        reduced_grad: ms.Tensor,
+        reduce_op: str,
+    ) -> None:
+        """All-reduce a final gradient over replicated source-layout axes."""
+        if self.source_shard_info is None or not self.source_shard_info.placements:
+            return
+        source_mesh = self.source_shard_info.mesh
+        replicate_mesh_dims = tuple(
+            mesh_dim
+            for mesh_dim, placement in enumerate(self.source_shard_info.placements)
+            if placement.is_replicate()
+        )
+        if not replicate_mesh_dims:
+            return
+        if source_mesh.mesh_dim_names is None:
+            raise ValueError(
+                "TP shard mesh must define mesh_dim_names to all-reduce replicated gradients."
+            )
+        replicate_dim_names = tuple(
+            source_mesh.mesh_dim_names[mesh_dim]
+            for mesh_dim in replicate_mesh_dims
+        )
+        replicate_mesh = source_mesh[replicate_dim_names].flatten()
+        if replicate_mesh.size() <= 1:
+            return
+        dist.all_reduce(
+            reduced_grad,
+            op=reduce_op,
+            group=replicate_mesh.get_group(),
+            async_op=False,
+        )
 
 
 def set_requires_grad_if_needed(

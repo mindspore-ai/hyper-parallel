@@ -24,13 +24,11 @@ def test_gradient_scaling_factor_group1():
     """
     Feature: parallel run case for HSDPModule.set_gradient_scaling_factor
     Description:
-        1.test_gradient_scaling_factor_no_fusion (per-parameter reduce path)
-        2.test_gradient_scaling_factor_comm_fusion (fused reduce path)
+        Parameterize per-parameter and parameter-group reduce paths in one torchrun.
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(_TEST_GRADIENT_SCALING_FACTOR, "test_gradient_scaling_factor_no_fusion", 12380, 4),
-        TorchCase(_TEST_GRADIENT_SCALING_FACTOR, "test_gradient_scaling_factor_comm_fusion", 12381, 4),
+        TorchCase(_TEST_GRADIENT_SCALING_FACTOR, "test_gradient_scaling_factor", 12380, 4),
     ])
 
 

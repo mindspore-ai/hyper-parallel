@@ -559,23 +559,24 @@ class TestResidencyManagerClearAndSync(unittest.TestCase):
         self._exit_stack = contextlib.ExitStack()
         self._exit_stack.enter_context(_mock_accelerator_if_needed())
         self.manager = ResidencyManager(max_host_bytes=1024 * 1024)
-        self._copy_stream_patch = None
-        if not torch.cuda.is_available() and not (
-            hasattr(torch, "npu") and torch.npu.is_available()
-        ):
-            self._copy_stream_mock = unittest.mock.MagicMock()
-            self._copy_stream_mock.device = torch.device("meta")
-            self._copy_stream_mock.__enter__.return_value = self._copy_stream_mock
-            self._copy_stream_patch = patch.object(
-                self.manager,
-                "_get_copy_stream",
-                return_value=self._copy_stream_mock,
-            )
-            self._copy_stream_patch.start()
+        self._copy_stream_mock = unittest.mock.MagicMock()
+        self._copy_stream_mock.device = torch.device("meta")
+        self._copy_stream_mock.__enter__.return_value = self._copy_stream_mock
+        self._current_stream_patch = patch(
+            "torch.accelerator.current_stream",
+            return_value=_MockStream(),
+        )
+        self._copy_stream_patch = patch.object(
+            self.manager,
+            "_get_copy_stream",
+            return_value=self._copy_stream_mock,
+        )
+        self._current_stream_patch.start()
+        self._copy_stream_patch.start()
 
     def tearDown(self) -> None:
-        if self._copy_stream_patch is not None:
-            self._copy_stream_patch.stop()
+        self._copy_stream_patch.stop()
+        self._current_stream_patch.stop()
         self._exit_stack.close()
 
     def test_clear_runtime_removes_all(self) -> None:

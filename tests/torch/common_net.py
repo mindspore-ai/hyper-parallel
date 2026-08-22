@@ -135,11 +135,19 @@ class MetaInitNet(nn.Module):
         super().__init__()
         self.linear1 = nn.Linear(hidden_size, hidden_size)
         self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear2.output_scale_weight = nn.Parameter(
+            torch.ones(hidden_size + 1, hidden_size)
+        )
+
+    def reset_parameters(self) -> None:
+        """Reset the parameter added directly to the output projection."""
+        nn.init.ones_(self.linear2.output_scale_weight)
 
     def forward(self, x):
         x = self.linear1(x)
         x = torch.relu(x)
         x = self.linear2(x)
+        x = x * self.linear2.output_scale_weight.mean(dim=0)
         return torch.sum(x)
 
 

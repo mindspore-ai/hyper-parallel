@@ -100,7 +100,7 @@ def _gather_full(model, attr="grad", include_replicate=False):
                 tensor._local_tensor  # pylint: disable=W0212
                 if isinstance(tensor, DTensor) else tensor
             )
-            if hp.is_sharded:
+            if hp.shard_world_size > 1:
                 gathered = [
                     torch.zeros_like(local)
                     for _ in range(hp.shard_world_size)

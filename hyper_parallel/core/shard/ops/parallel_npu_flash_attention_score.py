@@ -721,6 +721,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         """Create default softmax layout."""
         softmax_layout = Layout.from_device_mesh(query_layout.mesh)
         softmax_layout.set_tensor_map((-1, -1, -1, -1))
+        softmax_layout.tensor_map_to_placement()
         return softmax_layout
 
     @staticmethod

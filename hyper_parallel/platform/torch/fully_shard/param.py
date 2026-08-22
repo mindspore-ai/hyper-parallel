@@ -17,7 +17,8 @@
 # ============================================================================
 """HSDP parameter"""
 # pylint: disable=W0212
-from typing import Callable, List, Optional, Tuple, Union, cast
+from dataclasses import dataclass
+from typing import Callable, List, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -30,30 +31,21 @@ from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import (
-    FullyShardParamMode,
-    GroupInfo,
     ParamModuleInfo,
     ShardedState,
     apply_gradient_scaling_factor,
-    get_rank_list_for_axes,
-    get_split_rank_lists_for_axes,
 )
 from hyper_parallel.core.fully_shard.utils import (
     CPUOffloadPolicy,
+    DataParallelMeshInfo,
     DDPMeshInfo,
     FSDPMeshInfo,
+    HSDPMeshInfo,
     MixedPrecisionPolicy,
     OffloadPolicy,
+    SourceShardMetaInfo,
 )
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.torch.fully_shard.pack_utils import (
-    build_rs_plan,
-    pack_for_reduce_scatter,
-    unpack_from_all_gather,
-)
-
-_GROUP_INFO_CACHE = {}
-platform = get_platform()
+from hyper_parallel.core.utils import compute_local_shape_and_global_offset_by_ceil_chunk
 
 
 def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -63,40 +55,61 @@ def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
         dst.copy_(src)
 
 
-def _build_group_info_from_rank_list(
-    group_name: str,
-    rank_list,
-) -> GroupInfo:
-    """Create group metadata from an explicit rank list."""
-    normalized_rank_list = tuple(sorted(int(rank) for rank in rank_list))
-    if len(normalized_rank_list) <= 1:
-        return GroupInfo(f"{group_name}_invalid", None, 1)
-    if normalized_rank_list in _GROUP_INFO_CACHE:
-        cached_group = _GROUP_INFO_CACHE[normalized_rank_list]
-        return GroupInfo(str(normalized_rank_list), cached_group, len(normalized_rank_list))
-    try:
-        group = platform.create_group(list(normalized_rank_list))
-    except (RuntimeError, ValueError):  # pragma: no cover - UT may run without dist init
-        group = None
-    _GROUP_INFO_CACHE[normalized_rank_list] = group
-    return GroupInfo(str(normalized_rank_list), group, len(normalized_rank_list))
+@dataclass
+class ReduceScatterCommCtx:
+    """Per-parameter reduce-scatter output and asynchronous work."""
+
+    reduce_scatter_output: Optional[torch.Tensor] = None
+    reduce_scatter_handle: Optional[dist.Work] = None
 
 
-def _build_group_info_from_process_group(
-    group_name: str,
-    process_group,
-    rank_size: int,
-) -> GroupInfo:
-    """Create group metadata from an existing process group."""
-    if process_group is None or rank_size <= 1:
-        return GroupInfo(f"{group_name}_invalid", None, 1)
-    try:
-        rank_list = dist.get_process_group_ranks(process_group)
-        resolved_group_name = str(tuple(sorted(rank_list)))
-    except (AssertionError, AttributeError, KeyError, RuntimeError, TypeError, ValueError):
-        # pragma: no cover - best-effort naming / mocked process groups in UT
-        resolved_group_name = group_name
-    return GroupInfo(resolved_group_name, process_group, rank_size)
+@dataclass
+class AllReduceCommCtx:
+    """Per-parameter all-reduce output and asynchronous work."""
+
+    all_reduce_output: Optional[torch.Tensor] = None
+    all_reduce_handle: Optional[dist.Work] = None
+
+
+@dataclass
+class AllGatherCommCtx:
+    """Per-parameter all-gather output and asynchronous work."""
+
+    allgather_output: Optional[torch.Tensor] = None
+    allgather_handle: Optional[dist.Work] = None
+
+
+class ParameterHookMigrator:
+    """Preserve parameter backward hooks across HSDP parameter replacement."""
+
+    def __init__(self) -> None:
+        self._orig_param_hooks: List[Callable] = []
+        self._saved_hook_ids: set[int] = set()
+
+    def _save_backward_hooks(self, param: nn.Parameter) -> None:
+        """Save backward hooks from a parameter, deduplicated by hook identity."""
+        if not hasattr(param, "_backward_hooks") or param._backward_hooks is None:
+            return
+
+        for _, hook_func in param._backward_hooks.items():
+            hook_func_id = id(hook_func)
+            if hook_func_id not in self._saved_hook_ids:
+                self._orig_param_hooks.append(hook_func)
+                self._saved_hook_ids.add(hook_func_id)
+
+    def _migrate_backward_hooks(self, new_param: nn.Parameter) -> None:
+        """Register saved backward hooks on a replacement parameter once."""
+        if not self._orig_param_hooks or hasattr(new_param, "migrate_backward_hooks_run_once"):
+            return
+
+        for hook_func in self._orig_param_hooks:
+            try:
+                if new_param.requires_grad:
+                    new_param.register_hook(hook_func)
+            except RuntimeError:
+                # Skip hook registration if the parameter does not require gradients.
+                pass
+        new_param.migrate_backward_hooks_run_once = True
 
 
 class TorchHSDPParamV2(HSDPParamV2):
@@ -108,13 +121,12 @@ class TorchHSDPParamV2(HSDPParamV2):
         self,
         param: nn.Parameter,
         module_info: ParamModuleInfo,
-        mesh_info: FSDPMeshInfo,
+        mesh_info: DataParallelMeshInfo,
         shard_placement_fn: Optional[Callable[[nn.Parameter], Optional[Shard]]] = None,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
-        param_mode: Optional[FullyShardParamMode] = None,
-        enable_fsdp_shard: bool = True,
+        source_shard_info: Optional[SourceShardMetaInfo] = None,
     ):
         """
         Initialize TorchHSDPParamV2 and shard the parameter.
@@ -122,21 +134,24 @@ class TorchHSDPParamV2(HSDPParamV2):
         Args:
             param (nn.Parameter): The original full parameter to shard.
             module_info (ParamModuleInfo): Ownership and shared-weight metadata.
-            mesh_info (FSDPMeshInfo): Mesh topology for shard/replicate dimensions.
+            mesh_info (DataParallelMeshInfo): Mesh topology for shard/replicate dimensions.
             shard_placement_fn (Callable, optional): Returns a Shard placement for the parameter,
                 or None to use default (Shard(0)).
             mp_policy (MixedPrecisionPolicy, optional): Mixed precision dtype policy.
             offload_policy (OffloadPolicy, optional): CPU offload policy.
             device (torch.device, optional): Target device for the sharded parameter.
+            source_shard_info (SourceShardMetaInfo, optional): Source TP/EP layout metadata, built by
+                the owning ``HSDPState``. Must be supplied (with ``origin_is_dtensor=True``)
+                whenever ``param`` is a native DTensor, and omitted otherwise.
+
+        Raises:
+            ValueError: If ``source_shard_info.origin_is_dtensor`` disagrees with whether
+                ``param`` is a native DTensor.
         """
         self._module_info: ParamModuleInfo = module_info
         self.mesh_info = mesh_info
         self.mp_policy = mp_policy
         self.device = device
-        if param_mode is None:
-            raise AssertionError("param_mode must be resolved before TorchHSDPParamV2 initialization.")
-        self.param_mode = param_mode
-        self.enable_fsdp_shard = enable_fsdp_shard
         self.orig_dtype = None
         self.param_dtype = None
         self.reduce_dtype = None
@@ -144,58 +159,140 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.pin_memory = (
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
-        self._orig_param_hooks: List[Callable] = []
-        self.grad_offload_event: Optional[torch.Event] = None
-        self._orig_param_is_dtensor = isinstance(param, DTensor)
-        self._orig_dtensor_mesh = param.device_mesh if self._orig_param_is_dtensor else None
-        self._orig_dtensor_placements = tuple(param.placements) if self._orig_param_is_dtensor else None
+        self._parameter_hook_migrator = ParameterHookMigrator()
+        # ``source_shard_info`` is built and validated by the owning state
+        # (``_build_param_source_shard_info``): for a native DTensor parameter it always
+        # describes that parameter's own mesh/placements. Only the agreement
+        # between the two is re-checked here, because it is the invariant the
+        # sharding math below depends on.
+        if isinstance(param, DTensor) != (
+            source_shard_info is not None and source_shard_info.origin_is_dtensor
+        ):
+            raise ValueError(
+                "source_shard_info.origin_is_dtensor must be True exactly for native DTensor parameters, "
+                f"got parameter type {type(param).__name__} and source_shard_info={source_shard_info}"
+            )
+        self.source_shard_info = source_shard_info
+        self._orig_param_is_dtensor = (
+            source_shard_info is not None and source_shard_info.origin_is_dtensor
+        )
+        self._orig_dtensor_mesh = source_shard_info.mesh if self._orig_param_is_dtensor else None
+        self._orig_dtensor_placements = (
+            tuple(source_shard_info.placements) if self._orig_param_is_dtensor else None
+        )
+        self._storage_source_layout = self._build_storage_source_layout()
         self._spmd_shard_mesh_dim = self.mesh_info.shard_mesh_dim
         self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
         self._init_sharded_param(param, shard_placement_fn)
-        self._init_group_infos()
-        self.all_gather_outputs: List[torch.Tensor] = []
         self.unsharded_accumulated_grad = None
         self._param_fqn: Optional[str] = None
-        # Communication attributes for prefetch pattern
-        self.prefetch_handle: Optional[dist.Work] = None
+        self.unsharded_param_buffers: List[torch.Tensor] = []
+        self.allgather_comm_ctx = AllGatherCommCtx()
         self._post_load_hook_handle = (
             module_info.module.register_load_state_dict_post_hook(
                 lambda *args, **kwargs: self.reset_sharded_param()
             )
         )
-        self._reduce_scatter_output = None
-        self.reduce_scatter_handle = None
-        self._all_reduce_output = None
-        self.all_reduce_handle = None
-        self._save_backward_hooks(param)
+        self.reduce_scatter_comm_ctx = ReduceScatterCommCtx()
+        self.all_reduce_comm_ctx = AllReduceCommCtx()
+        self._parameter_hook_migrator._save_backward_hooks(param)
         self._grad = None
-        self._accumulated_allreduced_grad = True
+        # Keep reduce-scatter accumulation in reduce_dtype until the final
+        # micro-step performs the optional replicate all-reduce.
+        self._reduce_partial_output = None
         self.gradient_scaling_factor = None
 
-    @property
-    def uses_param_shard(self) -> bool:
-        """Whether fully_shard should physically shard parameter storage for this param."""
-        return self.enable_fsdp_shard
-
-    @property
-    def is_dtensor_compat_mode(self) -> bool:
-        """Whether the parameter is managed through the DTensor compatibility path only."""
-        return self.param_mode == FullyShardParamMode.DTENSOR_COMPAT
-
     def _get_base_spmd_placements(self) -> tuple:
-        if self.param_mode == FullyShardParamMode.DTENSOR_UNIFIED and self._orig_param_is_dtensor:
-            # DTENSOR_UNIFIED keeps the original distributed layout and prefixes
-            # explicit DP/FSDP mesh dimensions ahead of it on the unified mesh.
-            self._spmd_mesh = DeviceMesh.concatenate([self.mesh_info.mesh, self._orig_dtensor_mesh])
+        if self.source_shard_info is not None:
+            # Preserve the source distributed layout and prefix the explicit
+            # DP/FSDP mesh dimensions on the unified mesh.
+            source_mesh, source_placements = self._storage_source_layout
+            self._spmd_mesh = DeviceMesh.concatenate([self.mesh_info.mesh, source_mesh])
             dp_prefix_placements = tuple(Replicate() for _ in range(self.mesh_info.mesh.ndim))
-            return dp_prefix_placements + tuple(self._orig_dtensor_placements)
-
-        if self.is_dtensor_compat_mode and self._orig_param_is_dtensor:
-            self._spmd_mesh = self._orig_dtensor_mesh
-            return tuple(self._orig_dtensor_placements)
+            return dp_prefix_placements + source_placements
 
         self._spmd_mesh = self.mesh_info.mesh
         return tuple(Replicate() for _ in range(self._spmd_mesh.ndim))
+
+    def _build_storage_source_layout(self) -> tuple[Optional[DeviceMesh], tuple]:
+        """Build the immutable source layout used by FSDP storage and reduction.
+
+        Native DTensor parameters may already describe data-parallel axes that
+        are also covered by ``mesh_info.mesh``. Exclude those axes from the
+        concatenated storage mesh without changing ``source_shard_info``, whose
+        mesh and placements always retain the original compute-layout meaning.
+        Explicit metadata for plain production-mode parameters already contains
+        only its TP/EP source layout and must remain unchanged.
+
+        Ownership is derived from rank topology rather than dimension names:
+        a source axis is redundant exactly when varying it at this rank's own
+        coordinate never leaves the FSDP domain's rank set. Name matching
+        cannot express this because trainer meshes rename flattened data
+        axes (e.g. ``dp``/``cp`` become ``fsdp_replicate``/``fsdp_shard``).
+
+        Returns:
+            Source mesh and placements to append to the FSDP mesh, or an empty
+            layout when this parameter has no source-layout metadata.
+        """
+        if self.source_shard_info is None:
+            return None, ()
+        source_mesh = self.source_shard_info.mesh
+        source_placements = tuple(self.source_shard_info.placements)
+        if not self.source_shard_info.origin_is_dtensor:
+            return source_mesh, source_placements
+
+        source_mesh_dim_names = source_mesh.mesh_dim_names or ()
+        fsdp_ranks = self._fsdp_domain_ranks()
+        coordinate = source_mesh.get_coordinate() if fsdp_ranks is not None else None
+        if coordinate is None:
+            # Rank topology is unavailable (e.g. a topology-only mesh), so no
+            # axis can be proven redundant. Keep the full layout, matching the
+            # pre-dedup behavior.
+            return source_mesh, source_placements
+
+        storage_dim_names = tuple(
+            dim_name
+            for dim_index, dim_name in enumerate(source_mesh_dim_names)
+            if not self._source_dim_covered_by_fsdp(
+                source_mesh, dim_index, coordinate, fsdp_ranks
+            )
+        )
+        if not storage_dim_names or storage_dim_names == source_mesh_dim_names:
+            return source_mesh, source_placements
+
+        placement_by_dim = dict(zip(source_mesh_dim_names, source_placements))
+        return (
+            source_mesh[storage_dim_names],
+            tuple(placement_by_dim[dim_name] for dim_name in storage_dim_names),
+        )
+
+    def _fsdp_domain_ranks(self) -> Optional[frozenset]:
+        """Ranks owned by this FSDP unit's data-parallel domain.
+
+        Returns ``None`` when the mesh carries no usable rank topology, in
+        which case no source axis can be proven redundant.
+        """
+        mesh = getattr(self.mesh_info, "mesh", None)
+        mesh_tensor = getattr(mesh, "mesh", None)
+        if not isinstance(mesh_tensor, torch.Tensor):
+            return None
+        return frozenset(int(rank) for rank in mesh_tensor.flatten().tolist())
+
+    @staticmethod
+    def _source_dim_covered_by_fsdp(source_mesh, dim_index, coordinate, fsdp_ranks) -> bool:
+        """Whether varying one source dim stays inside the FSDP rank domain.
+
+        The fiber is taken at this rank's own coordinate: peer ranks reached
+        by varying a data-parallel axis share this rank's other coordinates
+        (e.g. its TP slot), which is exactly the population FSDP reduces over.
+        """
+        index = list(coordinate)
+        mesh_tensor = source_mesh.mesh
+        for extent in range(source_mesh.size(dim_index)):
+            index[dim_index] = extent
+            if int(mesh_tensor[tuple(index)]) not in fsdp_ranks:
+                return False
+        return True
 
     def _apply_data_parallel_placements(self, placements: list, shard_placement: Shard) -> tuple:
         if len(placements) != self._spmd_mesh.ndim:
@@ -209,8 +306,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         ):
             placements[self._spmd_replicate_mesh_dim] = Replicate()
         if (
-            self.uses_param_shard
-            and isinstance(self.mesh_info, FSDPMeshInfo)
+            isinstance(self.mesh_info, FSDPMeshInfo)
             and self._spmd_shard_mesh_dim is not None
         ):
             # If TP/EP already shards the same tensor dimension, fully_shard must
@@ -229,171 +325,124 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
         return tuple(placements)
 
-    def _init_group_infos(self) -> None:
-        if self.uses_param_shard and self.is_sharded and isinstance(self.mesh_info, FSDPMeshInfo):
-            self.sharded_group_info = _build_group_info_from_process_group(
-                "fully_shard_sharded_group",
-                self.mesh_info.shard_process_group,
-                self.mesh_info.shard_mesh_size,
+    def _build_sharding_spec(
+        self,
+        source_param: nn.Parameter,
+        source_local_tensor: torch.Tensor,
+    ) -> Layout:
+        """Build the final layout after data and model parallel sharding.
+
+        A dual-mode parameter is a plain tensor containing only its TP/EP-local
+        shard, so its local shape cannot represent the final logical shape.
+        Source distribution metadata restores that shape before the FSDP
+        placements are applied. This method only constructs the layout and has
+        no parameter lifecycle side effects.
+
+        Args:
+            source_param: Parameter received before FSDP partitioning.
+            source_local_tensor: Local tensor partitioned by FSDP.
+
+        Returns:
+            Layout containing all FSDP, TP, and EP placements.
+        """
+        logical_global_stride = None
+        if isinstance(source_param, DTensor):
+            logical_global_size = source_param.size()
+            logical_global_stride = source_param.layout.tensor_stride
+        elif self.source_shard_info is not None:
+            source_sharding_spec = Layout.from_device_mesh(self.source_shard_info.mesh)
+            source_sharding_spec.set_placements(self.source_shard_info.placements)
+            source_sharding_spec.placement_to_tensor_map(source_local_tensor.ndim)
+            logical_global_size = source_sharding_spec.get_global_shape(
+                source_local_tensor.size()
             )
         else:
-            self.sharded_group_info = GroupInfo("fully_shard_sharded_group_invalid", None, 1)
+            logical_global_size = source_local_tensor.size()
 
-        # The all-reduce group is always derived from the final materialized layout.
-        # This keeps replicate_params, DTensor compat, and unified multi-dim layouts
-        # on a single source of truth.
-        self.unsharded_group_info = self._build_layout_driven_group_info()
+        if logical_global_stride is None:
+            logical_global_stride = make_contiguous_strides_for(logical_global_size)
 
-        self.shard_size = self.sharded_group_info.rank_size
-        self.dp_size = self.unsharded_group_info.rank_size
-        self.rank_size = max(1, self.shard_size * self.dp_size)
-
-    def _build_layout_driven_group_info(self):
-        group_axes = [
-            axis
-            for axis, placement in enumerate(self._spmd_placements)
-            if placement.is_replicate()
-        ]
-        if self.uses_param_shard and self._spmd_shard_mesh_dim is not None:
-            group_axes = [axis for axis in group_axes if axis != self._spmd_shard_mesh_dim]
-        if not group_axes:
-            return GroupInfo("fully_shard_unsharded_group_invalid", None, 1)
-        group_dim_names = getattr(self._spmd_mesh, "mesh_dim_names", None)
-        if group_dim_names:
-            try:
-                mesh_axis_names = tuple(group_dim_names[axis] for axis in group_axes)
-                if len(mesh_axis_names) == 1:
-                    axis_name = mesh_axis_names[0]
-                    process_group = self._spmd_mesh.get_group(axis_name)
-                    if process_group is not None:
-                        rank_size = self._spmd_mesh.mesh_shape[group_dim_names.index(axis_name)]
-                        return _build_group_info_from_process_group(
-                            "fully_shard_unsharded_group",
-                            process_group,
-                            rank_size,
-                        )
-
-                split_rank_lists = get_split_rank_lists_for_axes(self._spmd_mesh, group_axes)
-                process_group = platform.split_group(split_ranks=split_rank_lists)
-                if process_group is not None:
-                    rank_size = 1
-                    for axis in group_axes:
-                        rank_size *= self._spmd_mesh.mesh_shape[axis]
-                    return _build_group_info_from_process_group(
-                        "fully_shard_unsharded_group",
-                        process_group,
-                        rank_size,
-                    )
-            except (
-                AssertionError,
-                AttributeError,
-                KeyError,
-                RuntimeError,
-                TypeError,
-                ValueError,
-            ):
-                # Fall back to the explicit rank-list path for mocked meshes in UT
-                # or when a mesh implementation cannot materialize a reusable group.
-                pass
-
-        rank_list = get_rank_list_for_axes(self._spmd_mesh, group_axes)
-        return _build_group_info_from_rank_list("fully_shard_unsharded_group", rank_list)
-
-    def _to_local_unsharded_grad(self, grad):
-        """Normalize a pending gradient to a local tensor expected by fully_shard collectives."""
-        if not isinstance(grad, DTensor):
-            return grad
-
-        if any(placement.is_partial() for placement in grad.placements):
-            grad = grad.reduce_partial()
-
-        mesh_mismatch = (
-            self._orig_dtensor_mesh is not None
-            and grad.device_mesh.to_hash() != self._orig_dtensor_mesh.to_hash()
+        sharding_spec = Layout.from_device_mesh(self._spmd_mesh)
+        sharding_spec.set_placements(self._spmd_placements)
+        sharding_spec.placement_to_tensor_map(source_local_tensor.ndim)
+        sharding_spec.set_tensor_meta(
+            logical_global_size,
+            logical_global_stride,
+            source_local_tensor.dtype,
         )
-        placement_mismatch = (
-            self._orig_dtensor_placements is not None
-            and tuple(grad.placements) != tuple(self._orig_dtensor_placements)
-        )
-        if mesh_mismatch or placement_mismatch:
-            grad = grad.redistribute(self._orig_dtensor_mesh, self._orig_dtensor_placements)
-        return grad.to_local()
+        return sharding_spec
 
     @property
-    def accumulated_allreduced_grad(self) -> bool:
-        """Whether the parameter has accumulated all-reduced gradient."""
-        return self._accumulated_allreduced_grad
+    def reduce_partial_output(self) -> Optional[torch.Tensor]:
+        """Return reduce-scatter results accumulated before the final micro-step."""
+        return self._reduce_partial_output
 
-    @accumulated_allreduced_grad.setter
-    def accumulated_allreduced_grad(self, value: bool) -> None:
-        self._accumulated_allreduced_grad = value
+    @reduce_partial_output.setter
+    def reduce_partial_output(self, value: Optional[torch.Tensor]) -> None:
+        self._reduce_partial_output = value
 
-    def _save_backward_hooks(self, param: nn.Parameter) -> None:
-        """Save the backward hooks of the original parameter"""
-        if not hasattr(param, '_backward_hooks') or param._backward_hooks is None:
-            return
+    def reduce_comm_dtype(self, grad: Optional[torch.Tensor] = None) -> torch.dtype:
+        """Resolve the communication dtype owned by this parameter.
 
-        # Get the set of saved hook function IDs for deduplication
-        if not hasattr(self, '_saved_hook_ids'):
-            object.__setattr__(self, '_saved_hook_ids', set())
+        Args:
+            grad: Optional gradient used when no mixed-precision reduction dtype
+                is configured.
 
-        for _, hook_func in param._backward_hooks.items():
-            # Use the id of hook_func to avoid adding the same function object repeatedly
-            hook_func_id = id(hook_func)
-            if hook_func_id not in self._saved_hook_ids:
-                self._orig_param_hooks.append(hook_func)
-                self._saved_hook_ids.add(hook_func_id)
+        Returns:
+            The dtype used by reduce-scatter and all-reduce buffers.
+        """
+        if self.reduce_dtype is not None:
+            return self.reduce_dtype
+        if grad is not None:
+            return grad.dtype
+        if self.unsharded_accumulated_grad is not None:
+            return self.unsharded_accumulated_grad_data.dtype
+        if self.unsharded_param.grad is not None:
+            return self.unsharded_grad_data.dtype
+        return self.orig_dtype
 
-    def _migrate_backward_hooks(self, new_param: nn.Parameter) -> None:
-        """Migrate backward hooks from the original parameter to the new parameter"""
-        if not self._orig_param_hooks or hasattr(new_param, "migrate_backward_hooks_run_once"):
-            return
-
-        # Properly register each hook using the register_hook method
-        for hook_func in self._orig_param_hooks:
-            try:
-                if new_param.requires_grad:
-                    new_param.register_hook(hook_func)
-            except RuntimeError:
-                # Skip hook registration if the parameter does not require gradients
-                pass
-        new_param.migrate_backward_hooks_run_once = True
-
-    def reduce_scatter_output(self):
+    def reduce_scatter_output(self) -> Optional[torch.Tensor]:
         """
         Get the reduce-scatter output tensor and wait for asynchronous operation to complete.
 
         Returns:
             torch.Tensor: The sharded gradient tensor after reduce-scatter operation.
         """
-        if self.reduce_scatter_handle is not None:
-            self.reduce_scatter_handle.wait()
+        if self.reduce_scatter_comm_ctx.reduce_scatter_handle is not None:
+            self.reduce_scatter_comm_ctx.reduce_scatter_handle.wait()
             self._grad.untyped_storage().resize_(0)
             self._grad = None
-            self.reduce_scatter_handle = None
-        return self._reduce_scatter_output
+            self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
+        return self.reduce_scatter_comm_ctx.reduce_scatter_output
 
-    def clear_reduce_scatter_output(self):
+    def clear_reduce_scatter_output(self) -> None:
         """Clear the reduce-scatter output tensor to free memory."""
-        self._reduce_scatter_output = None
+        self.reduce_scatter_comm_ctx.reduce_scatter_output = None
+        self._grad = None
 
-    def all_reduce_output(self):
+    def all_reduce_output(self) -> Optional[torch.Tensor]:
         """
         Get the all-reduce output tensor and wait for asynchronous operation to complete.
 
         Returns:
             torch.Tensor: The reduced gradient tensor after all-reduce operation.
         """
-        if self.all_reduce_handle is not None:
-            self.all_reduce_handle.wait()
-            self.all_reduce_handle = None
-        return self._all_reduce_output
+        if self.all_reduce_comm_ctx.all_reduce_handle is not None:
+            self.all_reduce_comm_ctx.all_reduce_handle.wait()
+            self.all_reduce_comm_ctx.all_reduce_handle = None
+        return self.all_reduce_comm_ctx.all_reduce_output
 
-    def clear_all_reduce_output(self):
+    def clear_all_reduce_output(self) -> None:
         """Clear the all-reduce output tensor to free memory."""
-        self._all_reduce_output = None
+        self.all_reduce_comm_ctx.all_reduce_output = None
 
-    def apply_reduced_grad(self, reduced_grad, param_type):
+    def clear_unsharded_source_grad(self):
+        if self.unsharded_accumulated_grad_data is not None:
+            self.unsharded_accumulated_grad = None
+        elif self.unsharded_param.grad is not None:
+            self.unsharded_param.grad = None
+
+    def apply_reduced_grad(self, reduced_grad: torch.Tensor) -> bool:
         """
         Apply reduced gradient to the sharded parameter.
 
@@ -401,16 +450,12 @@ class TorchHSDPParamV2(HSDPParamV2):
         offloads to CPU, then accumulates or assigns onto
         ``hsdp_param.sharded_param.grad``.
 
-        Note:
-            Gradient scaling (``gradient_scaling_factor``) is applied earlier on
-            the reduce input (see ``reduce_scatter_grad`` / ``foreach_reduce``),
-            never here, so accumulation stays ``sum_i(g_i * factor)`` rather than
-            scaling the already-accumulated grad again.
-
         Args:
             reduced_grad (torch.Tensor): Gradient after reduce-scatter
                 and/or all-reduce.
-            param_type (Optional[torch.dtype]): Target dtype for the gradient (if conversion is needed).
+
+        Returns:
+            Whether the current stream must synchronize for CPU offload.
         """
         sharded_grad = None
         if not self.mp_policy.apply_grad_on_fp32_main_grad:
@@ -419,15 +464,16 @@ class TorchHSDPParamV2(HSDPParamV2):
             if not hasattr(self.sharded_param, "main_grad"):
                 self.sharded_param.main_grad = None
             sharded_grad = self.sharded_param.main_grad
-        sharded_param_local_shape = (
-            self.sharded_param.local_shape
-            if isinstance(self.sharded_param, DTensor)
-            else self.sharded_param.shape
+        reduced_grad = (
+            reduced_grad.reshape(-1)
+            .narrow(0, 0, self.sharded_size.numel())
+            .view(self.sharded_size)
         )
-        reduced_grad = reduced_grad.view(sharded_param_local_shape)
-        if (not self.mp_policy.apply_grad_on_fp32_main_grad and param_type is not None
-                and reduced_grad.dtype != param_type):
-            reduced_grad = reduced_grad.to(param_type)
+        if (
+            not self.mp_policy.apply_grad_on_fp32_main_grad
+            and reduced_grad.dtype != self.orig_dtype
+        ):
+            reduced_grad = reduced_grad.to(self.orig_dtype)
         to_accumulate_grad = sharded_grad is not None
         need_synchronize = False
         if self.offload_to_cpu:
@@ -454,12 +500,12 @@ class TorchHSDPParamV2(HSDPParamV2):
             self.unsharded_param.grad = None
         return need_synchronize
 
-    @torch.no_grad()
-    def _init_sharded_param(
+    def _resolve_hsdp_placement(
         self,
         param: nn.Parameter,
         shard_placement_fn: Optional[Callable],
-    ) -> None:
+    ) -> Shard:
+        """Validate and normalize the fully_shard placement for one parameter."""
         if param.device != self.device and param.device.type != "meta":
             raise AssertionError(
                 f"Expects the parameter to already be moved to device {self.device} but got {param.device}"
@@ -476,56 +522,165 @@ class TorchHSDPParamV2(HSDPParamV2):
             raise AssertionError(
                 f"Expected Shard, got {type(hsdp_placement)}: {hsdp_placement}"
             )
+        return hsdp_placement
 
+    def _init_shard_metadata(
+        self,
+        param: nn.Parameter,
+        hsdp_placement: Shard,
+    ) -> tuple[list, torch.Tensor, int, int]:
+        """Initialize parameter shape and mesh metadata used by sharding."""
         self.hsdp_placement = hsdp_placement
         base_placements = list(self._get_base_spmd_placements())
-        self._spmd_placements = self._apply_data_parallel_placements(base_placements, hsdp_placement)
         param_data = param.to_local() if self._orig_param_is_dtensor else param
-
         shard_dim = hsdp_placement.dim
+        if param_data.ndim == 0:
+            raise ValueError("fully_shard does not support scalar parameters")
+        if shard_dim < 0 or shard_dim >= param_data.ndim:
+            raise ValueError(
+                f"Invalid fully_shard dim {shard_dim} for parameter "
+                f"{self._module_info.param_name} with shape {tuple(param_data.shape)}"
+            )
         self._orig_size = param_data.size()
         self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
-
-        if self.uses_param_shard and isinstance(self.mesh_info, FSDPMeshInfo):
-            shard_rank = self.mesh_info.shard_mesh_rank
-            shard_world_size = self.mesh_info.shard_mesh_size
+        if isinstance(self.mesh_info, FSDPMeshInfo):
+            self.shard_rank = self.mesh_info.shard_mesh_rank
+            self.shard_world_size = self.mesh_info.shard_mesh_size
         else:
-            shard_rank = 0
-            shard_world_size = 1
+            self.shard_rank = 0
+            self.shard_world_size = 1
 
-        if isinstance(param_data, DTensor) and isinstance(self.mesh_info, DDPMeshInfo):
-            param_data.data = param_data.full_tensor()
+        if isinstance(self.mesh_info, DDPMeshInfo):
+            self.replicate_world_size = self.mesh_info.replicate_mesh_size
+        else:
+            self.replicate_world_size = 1
+        self.is_replicate_param = (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and not isinstance(self.mesh_info, HSDPMeshInfo)
+        )
+        dim_shard_size = (param_data.size(shard_dim) + self.shard_world_size - 1) // self.shard_world_size
+        return base_placements, param_data, shard_dim, dim_shard_size
 
-        self.is_sharded = bool(self.uses_param_shard and shard_world_size > 1)
-
-        if param_data.size(shard_dim) % shard_world_size != 0:
+    def _init_shard_placements(
+        self,
+        param_data: torch.Tensor,
+        shard_dim: int,
+        base_placements: list,
+    ) -> None:
+        """Build data-parallel placements for the local shard."""
+        if shard_dim != 0 and param_data.size(shard_dim) % self.shard_world_size != 0:
             raise NotImplementedError(
-                f"Uneven sharding on dim {shard_dim} not supported: "
-                f"shape={param_data.shape}, world_size={shard_world_size}"
+                f"fully_shard only supports uneven sharding on dim=0, but parameter "
+                f"{self._module_info.param_name} has shape {tuple(param_data.shape)}, "
+                f"shard dim {shard_dim}, and world size {self.shard_world_size}"
             )
-        chunks = torch.chunk(param_data, shard_world_size, dim=shard_dim)
-        sharded_param = chunks[shard_rank].clone().contiguous()
+        spmd_placements = list(
+            self._apply_data_parallel_placements(
+                base_placements,
+                self.hsdp_placement,
+            )
+        )
+        if param_data.size(shard_dim) % self.shard_world_size != 0:
+            if self._spmd_shard_mesh_dim is None:
+                raise AssertionError("Uneven FSDP sharding requires a shard mesh dimension")
+            fsdp_placement = spmd_placements[self._spmd_shard_mesh_dim]
+            if isinstance(fsdp_placement, StridedShard):
+                fsdp_placement = StridedShard(
+                    fsdp_placement.dim,
+                    fsdp_placement.split_factor,
+                    uneven_shard=True,
+                )
+            else:
+                fsdp_placement = Shard(fsdp_placement.dim, uneven_shard=True)
+            spmd_placements[self._spmd_shard_mesh_dim] = fsdp_placement
+        self._spmd_placements = tuple(spmd_placements)
+
+    def _build_sharded_param_data(
+        self,
+        param_data: torch.Tensor,
+        shard_dim: int,
+        dim_shard_size: int,
+    ) -> torch.Tensor:
+        """Create the actual local shard and its fixed-size communication storage."""
+        local_shape, global_offset = compute_local_shape_and_global_offset_by_ceil_chunk(
+            param_data.size(),
+            shard_dim,
+            self.shard_world_size,
+            self.shard_rank,
+        )
+        actual_shard_offset = global_offset[shard_dim]
+        actual_shard_length = local_shape[shard_dim]
+        sharded_param = param_data.narrow(
+            shard_dim,
+            actual_shard_offset,
+            actual_shard_length,
+        ).clone().contiguous()
         self.sharded_size = sharded_param.size()
         self.contiguous_sharded_stride = make_contiguous_strides_for(self.sharded_size)
+        padded_sharded_size = list(param_data.size())
+        padded_sharded_size[shard_dim] = dim_shard_size
+        self.padded_sharded_param_size = torch.Size(padded_sharded_size)
         if self.offload_to_cpu and not sharded_param.is_meta:
             sharded_param = sharded_param.cpu()
             if self.pin_memory:
                 sharded_param = sharded_param.pin_memory()
-        self._sharded_param_data = sharded_param.view(-1)
 
-        self._sharding_spec = Layout.from_device_mesh(self._spmd_mesh)
-        self._sharding_spec.set_placements(self._spmd_placements)
-        self._sharding_spec.placement_to_tensor_map(param.ndim)
+        if self.sharded_size == self.padded_sharded_param_size:
+            self._sharded_param_data = sharded_param.view(-1)
+        else:
+            padded_sharded_param = sharded_param.new_zeros(self.padded_sharded_param_size)
+            if self.pin_memory and not padded_sharded_param.is_meta:
+                padded_sharded_param = padded_sharded_param.pin_memory()
+            if sharded_param.numel() > 0:
+                padded_sharded_param.narrow(
+                    shard_dim,
+                    0,
+                    actual_shard_length,
+                ).copy_(sharded_param)
+            self._sharded_param_data = padded_sharded_param.view(-1)
+            sharded_param = padded_sharded_param.narrow(
+                shard_dim,
+                0,
+                actual_shard_length,
+            )
+        return sharded_param
 
-        self.sharded_param = nn.Parameter(DTensor.from_local(sharded_param, self._spmd_mesh, self._spmd_placements))
+    @torch.no_grad()
+    def _init_sharded_param(
+        self,
+        param: nn.Parameter,
+        shard_placement_fn: Optional[Callable],
+    ) -> None:
+        """Initialize the persistent sharded parameter and communication storage."""
+        hsdp_placement = self._resolve_hsdp_placement(param, shard_placement_fn)
+        base_placements, param_data, shard_dim, dim_shard_size = self._init_shard_metadata(
+            param,
+            hsdp_placement,
+        )
+        self._init_shard_placements(
+            param_data,
+            shard_dim,
+            base_placements,
+        )
+        sharded_param = self._build_sharded_param_data(
+            param_data,
+            shard_dim,
+            dim_shard_size,
+        )
+        self._sharding_spec = self._build_sharding_spec(param, param_data)
+
+        self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param))
+        self.sharded_param._layout = self._sharding_spec
+        self.sharded_param._placements = tuple(self._sharding_spec.placements)
         self.sharded_param.requires_grad_(param.requires_grad)
         self._setattr_on_modules(self.sharded_param)
         # after init, self.sharded_param replaces original param, gradients must accumulate to this Parameter's grad
         self.sharded_param._hsdp_param_initialized = True
         self.sharded_state = ShardedState.SHARDED
         self.param_dtype = None
+        self.reduce_dtype = None
 
-    def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy):
+    def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy) -> None:
         """Initialize param_dtype and reduce_dtype from the mixed precision policy."""
         param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
         self.orig_dtype = self.sharded_param.dtype
@@ -536,7 +691,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
 
-    def init_all_gather_outputs(
+    def init_unsharded_param_buffers(
         self,
         all_gather_input_numels: list[int],
         all_gather_input_dtypes: list[torch.dtype],
@@ -545,7 +700,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         force_recreate: bool = False,
     ):
         """
-        Allocate output buffers for all-gather communication.
+        Allocate buffers that hold unsharded parameter data.
 
         Args:
             all_gather_input_numels: Number of elements per input shard.
@@ -554,70 +709,76 @@ class TorchHSDPParamV2(HSDPParamV2):
             device: Device on which to allocate the output buffers.
             force_recreate: If True, always recreate buffers even if already initialized.
         """
-        if not force_recreate and len(self.all_gather_outputs) > 0:
+        if not force_recreate and len(self.unsharded_param_buffers) > 0:
             return  # already initialized
-        self.all_gather_outputs = [
+        if force_recreate and hasattr(self, "_unsharded_param"):
+            raise RuntimeError(
+                "Cannot recreate unsharded_param_buffers after initializing the stable "
+                "unsharded parameter."
+            )
+        self.unsharded_param_buffers = [
             torch.empty(torch.Size([numel * world_size]), dtype=dtype, device=device)
             for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
         ]
 
-    def init_unsharded_param(self):
-        """
-        Initialize unsharded parameter from all-gather outputs.
+    def init_unsharded_param(self) -> None:
+        """Initialize the stable unsharded parameter from its final output storage."""
+        if len(self.unsharded_param_buffers) != 1:
+            raise AssertionError(
+                f"Expected 1 unsharded_param_buffer, got {len(self.unsharded_param_buffers)}"
+            )
 
-        This reconstructs the full parameter after all-gather by unpacking the
-        gathered flat buffer back to the original tensor layout.
-        """
-        unsharded_param = self._get_unsharded_param_from_all_gather_output()
-        # Always refresh the unsharded Parameter from the latest all-gather output.
-        # Non-dim0 unpack currently materializes a contiguous tensor copy, so
-        # keeping stale .data would otherwise reuse old weights after optimizer.step()
-        # mutates only the sharded local shard. Preserve the Parameter object identity
-        # so autograd-facing module state stays stable across unshard cycles.
+        if self.allgather_comm_ctx.allgather_output is not None:
+            packed_shape = list(self.sharded_size)
+            packed_shape[0] *= self.shard_world_size
+            chunks = torch.chunk(
+                self.allgather_comm_ctx.allgather_output.view(packed_shape),
+                self.shard_world_size,
+                dim=0,
+            )
+            # pylint: disable=W0212
+            with torch.autograd._unsafe_preserve_version_counter(
+                self.unsharded_param_buffers[0]
+            ):
+                torch.cat(
+                    chunks,
+                    dim=self.hsdp_placement.dim,
+                    out=self.unsharded_param_buffers[0].view(self._orig_size),
+                )
+            self.allgather_comm_ctx.allgather_output.untyped_storage().resize_(0)
+            self.allgather_comm_ctx.allgather_output = None
+
         if hasattr(self, "_unsharded_param"):
-            # pylint: disable=access-member-before-definition
-            self._unsharded_param.data = unsharded_param
-            self._unsharded_param.requires_grad_(self.sharded_param.requires_grad)
-            self._unsharded_param.grad = None
+            # Keep one stable ``_unsharded_param`` object across unshard cycles:
+            # autograd-facing module state captured during forward must still be
+            # the same object in backward. Only its storage is refreshed above,
+            # which also avoids reusing stale weights after ``optimizer.step()``
+            # mutates the sharded local shard alone (the non-dim-0 unpack path
+            # materializes a contiguous copy, so a stale ``.data`` would not see
+            # the update).
             return
+
+        unsharded_param = torch.as_strided(
+            self.unsharded_param_buffers[0],
+            size=self._orig_size,
+            stride=self._contiguous_orig_stride,
+            storage_offset=0,
+        )
+        if self.source_shard_info is not None and self.source_shard_info.origin_is_dtensor:
+            unsharded_param = DTensor.from_local(
+                unsharded_param,
+                self.source_shard_info.mesh,
+                self.source_shard_info.placements,
+            )
         self._unsharded_param = nn.Parameter(
             unsharded_param,
             requires_grad=self.sharded_param.requires_grad,
         )
 
-    def _get_unsharded_param_from_all_gather_output(self) -> torch.Tensor:
-        """Reconstruct the full local parameter view from the packed all-gather output."""
-        if len(self.all_gather_outputs) != 1:
-            raise AssertionError(
-                f"Expected 1 all_gather_output, got {len(self.all_gather_outputs)}"
-            )
-        unsharded_tensor = self.all_gather_outputs[0]
-        plan = build_rs_plan(
-            self,
-            self._sharded_local_tensor,
-            self.shard_world_size if self.is_sharded else 1,
-        )
-        unsharded_param = unpack_from_all_gather(unsharded_tensor, plan)
-        if self._orig_param_is_dtensor:
-            # Rebuild the original DTensor view after all-gather so gradient
-            # consumers keep seeing the source DTensor layout.
-            unsharded_param = DTensor.from_local(
-                unsharded_param,
-                self._orig_dtensor_mesh,
-                self._orig_dtensor_placements,
-            )
-        return unsharded_param
-
     def to_sharded(self) -> None:
-        if not self.uses_param_shard and self._unsharded_param is not None:
-            # Replicate params keep the same local shape across shard/unshard,
-            # so persist forward-time state updates before switching objects.
-            src = self._unsharded_param.to_local() if isinstance(self._unsharded_param, DTensor) \
-                else self._unsharded_param
-            dst = self.sharded_param.to_local() if isinstance(self.sharded_param, DTensor) else self.sharded_param
-            _copy_without_bumping_version(dst, src)
         self._setattr_on_modules(self.sharded_param)
-        self.free_unsharded_param()
+        if self.unsharded_param_buffers[0] is not self._sharded_param_data:
+            self.free_unsharded_param()
         self.sharded_state = ShardedState.SHARDED
 
     def to_unsharded(self) -> None:
@@ -633,8 +794,8 @@ class TorchHSDPParamV2(HSDPParamV2):
         else:
             # slow path
             setattr(self._module_info.module, self._module_info.param_name, param)
-        self._save_backward_hooks(self.sharded_param)
-        self._migrate_backward_hooks(param)
+        self._parameter_hook_migrator._save_backward_hooks(self.sharded_param)
+        self._parameter_hook_migrator._migrate_backward_hooks(param)
         # Iterate through all modules that share this parameter to prevent pointer desync.
         for shared_module, shared_param_name in zip(
             self._module_info.shared_modules, self._module_info.shared_param_names
@@ -649,11 +810,16 @@ class TorchHSDPParamV2(HSDPParamV2):
         Converts a local tensor representing either the sharded parameter or
         sharded gradient to DTensor.
         """
-        return DTensor.from_local(
+        sharded_dtensor = DTensor.from_local(
             tensor,
             self._sharding_spec.mesh,
-            self._sharding_spec.placements
+            self._sharding_spec.placements,
+            shape=self._sharding_spec.tensor_shape,
+            stride=self._sharding_spec.tensor_stride,
         )
+        sharded_dtensor._layout = self._sharding_spec
+        sharded_dtensor._placements = tuple(self._sharding_spec.placements)
+        return sharded_dtensor
 
     def to_accumulated_grad_if_needed(self) -> None:
         if self._unsharded_param.grad is None:
@@ -677,20 +843,23 @@ class TorchHSDPParamV2(HSDPParamV2):
             grad = self.unsharded_param.grad
             if self.reduce_dtype is not None and grad.dtype != self.reduce_dtype:
                 grad = grad.to(self.reduce_dtype)
-            self.unsharded_accumulated_grad += grad
             self.unsharded_param.grad = None
+            self.unsharded_accumulated_grad += grad
 
-    def alloc_all_gather_outputs(self) -> None:
-        """Resize all-gather output buffers to their full capacity for communication."""
-        for tensor in self.all_gather_outputs:
+    def alloc_unsharded_param_buffers(self) -> None:
+        """
+        Restore unsharded parameter buffers to their full capacity.
+        unsharded_param_buffer is the final storage which should be reffereced by self._unsharded_param
+        """
+        for tensor in self.unsharded_param_buffers:
             expected_size = tensor.numel() * tensor.itemsize
             storage = tensor.untyped_storage()
             if storage.size() != expected_size:
                 storage.resize_(expected_size)
 
     def free_unsharded_param(self) -> None:
-        """Release storage of all-gather outputs to free device memory."""
-        for tensor in self.all_gather_outputs:
+        """Release storage of the unsharded parameter buffers."""
+        for tensor in self.unsharded_param_buffers:
             storage = tensor.untyped_storage()
             if storage.size() != 0:
                 storage.resize_(0)
@@ -709,6 +878,11 @@ class TorchHSDPParamV2(HSDPParamV2):
         return [sharded_param_data]
 
     @property
+    def _sharded_local_tensor(self) -> torch.Tensor:
+        """Return the local tensor backing the persistent sharded DTensor."""
+        return self.sharded_param._local_tensor
+
+    @property
     def unsharded_param(self) -> nn.Parameter:
         """Return the full unsharded parameter after all-gather."""
         return self._unsharded_param
@@ -718,33 +892,14 @@ class TorchHSDPParamV2(HSDPParamV2):
         """
         Get the unsharded gradient data as a local tensor.
         """
-        grad = self.unsharded_param.grad
-        if grad is None:
-            raise AssertionError("Expects unsharded_param.grad to not be None")
-        return self._to_local_unsharded_grad(grad)
+        return self._unsharded_param.grad
 
     @property
     def unsharded_accumulated_grad_data(self) -> torch.Tensor:
         """
         Get the unsharded accumulated gradient data as a local tensor.
         """
-        grad = self.unsharded_accumulated_grad
-        return self._to_local_unsharded_grad(grad)
-
-    @property
-    def _sharded_local_tensor(self) -> torch.Tensor:
-        """Return the underlying local tensor of the sharded DTensor parameter."""
-        return cast(DTensor, self.sharded_param)._local_tensor
-
-    @property
-    def shard_world_size(self) -> int:
-        """Get the world size for shard dimension."""
-        return self.shard_size
-
-    @property
-    def replicate_world_size(self) -> int:
-        """Get the world size for replicate dimension (HSDP only)."""
-        return self.dp_size
+        return self.unsharded_accumulated_grad
 
     def _assert_in_states(self, *states: ShardedState) -> None:
         """Assert current state is one of expected states."""
@@ -778,13 +933,78 @@ class TorchHSDPParamV2(HSDPParamV2):
         # only its _local_tensor / _sharded_param_data are refreshed below.
         return new_param
 
+    def _is_same_sharded_local_tensor(self, local_tensor: torch.Tensor) -> bool:
+        """Return whether communication storage already aliases the local tensor."""
+        if not isinstance(self._sharded_param_data, torch.Tensor):
+            return False
+        sharded_data_ptr = self._sharded_param_data.untyped_storage().data_ptr()
+        return (
+            # Empty shards may have a zero data pointer and must still be rebuilt.
+            sharded_data_ptr > 0
+            and sharded_data_ptr == local_tensor.untyped_storage().data_ptr()
+        )
+
+    def _validate_reset_local_tensor(
+        self,
+        local_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Validate the actual local shape after parameter conversion."""
+        if local_tensor.size() != self.sharded_size:
+            raise AssertionError(
+                f"Expected sharded_size to be {self.sharded_size}, got {local_tensor.size()}"
+            )
+        return local_tensor
+
+    def _pin_reset_local_tensor_if_needed(
+        self,
+        local_tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, bool]:
+        """Move reset storage to pinned CPU memory when the policy requires it."""
+        if self.pin_memory and not local_tensor.is_pinned():
+            return local_tensor.cpu().pin_memory(), True
+        return local_tensor, False
+
+    def _refresh_sharded_local_tensor(
+        self,
+        local_tensor: torch.Tensor,
+        shard_dim: int,
+    ) -> None:
+        """Rebuild padded communication storage and refresh the DTensor local view."""
+        actual_shard_length = self.sharded_size[shard_dim]
+        if self.sharded_size == self.padded_sharded_param_size:
+            local_tensor = local_tensor.contiguous()
+            self._sharded_param_data = local_tensor.view(-1)
+            local_view = local_tensor.detach()
+        else:
+            padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
+            if self.pin_memory:
+                padded_local_tensor = padded_local_tensor.pin_memory()
+            if local_tensor.numel() > 0:
+                padded_local_tensor.narrow(
+                    shard_dim,
+                    0,
+                    actual_shard_length,
+                ).copy_(local_tensor)
+            self._sharded_param_data = padded_local_tensor.view(-1)
+            local_view = padded_local_tensor.narrow(
+                shard_dim,
+                0,
+                actual_shard_length,
+            ).detach()
+        set_requires_grad_if_needed(self.sharded_param, local_view)
+        self.sharded_param._local_tensor = local_view
+        self._update_shardedparam_storage_forcely()
+        if not self.sharded_param._local_tensor.is_contiguous():
+            raise AssertionError(
+                "Expected sharded_param._local_tensor to be contiguous"
+            )
+
     def reset_sharded_param(self) -> None:
         """Reset sharded param after load_state_dict."""
         new_param = self._resolve_reset_param()
         local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
         if local_tensor.is_meta:
             return
-        updated_local_tensor = False
         # local_tensor can be padded twice
         # 1st time in fully_shard(model)
         # 2nd time in model(input) lazy_init
@@ -792,114 +1012,108 @@ class TorchHSDPParamV2(HSDPParamV2):
         # 2nd time shouldn't be no-op if people call model.load_state_dict(...) before lazy_init
         # this makes it possible for trainer to call `sd = model.state_dict()` before the training loop
         # and use `sd` without calling .state_dict() per iteration
-        same_local_tensor = False
-        if isinstance(self._sharded_param_data, torch.Tensor):
-            same_local_tensor = (
-                # when sharding param with shape (1, ...) over 2 ranks
-                # local_tensor on rank 1 can be size 0, data_ptr() can be 0
-                self._sharded_param_data.untyped_storage().data_ptr() > 0
-                and self._sharded_param_data.untyped_storage().data_ptr()
-                == local_tensor.untyped_storage().data_ptr()
-            )
-        sharded_size = self.sharded_size
+        same_local_tensor = self._is_same_sharded_local_tensor(local_tensor)
         shard_dim = self.hsdp_placement.dim
-        length = local_tensor.size(shard_dim) if local_tensor.numel() > 0 else 0
         if not same_local_tensor:
-            if local_tensor.size() != sharded_size:
-                raise AssertionError(
-                    f"Expected sharded_size to be {sharded_size}, got {local_tensor.size()}"
-                )
-            updated_local_tensor = True
-        if self.pin_memory and not local_tensor.is_pinned():
-            local_tensor = local_tensor.cpu().pin_memory()
-            updated_local_tensor = True
-        if not same_local_tensor:
-            self._sharded_param_data = local_tensor.view(-1)
+            local_tensor = self._validate_reset_local_tensor(local_tensor)
+        local_tensor, pinned_local_tensor = self._pin_reset_local_tensor_if_needed(local_tensor)
         if not isinstance(self.sharded_param, DTensor):
             raise AssertionError(f"Expected DTensor, got {type(self.sharded_param)}")
-        if updated_local_tensor:
-            # Only change the local tensor object if needed.
-            # detach to an off-graph leaf sharing storage, so later grad-mode in-place
-            # edits (weight load / upcast) don't trip the is_leaf check.
-            local_view = local_tensor.narrow(dim=shard_dim, start=0, length=length).detach()
-            set_requires_grad_if_needed(self.sharded_param, local_view)
-            self.sharded_param._local_tensor = local_view
-            if not self.sharded_param._local_tensor.is_contiguous():
-                raise AssertionError(
-                    "Expected sharded_param._local_tensor to be contiguous"
-                )
-        self._sharding_spec = cast(DTensor, self.sharded_param).layout
+        if not same_local_tensor or pinned_local_tensor:
+            self._refresh_sharded_local_tensor(local_tensor, shard_dim)
+        self._sharding_spec.set_tensor_meta(
+            self._sharding_spec.tensor_shape,
+            self._sharding_spec.tensor_stride,
+            local_tensor.dtype,
+        )
+        self.sharded_param._layout = self._sharding_spec
+        self.sharded_param._placements = tuple(self._sharding_spec.placements)
         # After ``to_empty`` replaces the module parameter with a plain tensor,
         # re-install the DTensor ``nn.Parameter`` so the optimizer and forward
         # hooks see the correct object.  Idempotent when the module already
         # holds ``self.sharded_param`` (same data_ptr → no-op in practice).
         self._setattr_on_modules(self.sharded_param)
 
+    def _update_shardedparam_storage_forcely(self,):
+        sharded_param_data = self.sharded_param.data
+        local_tensor_data = self.sharded_param._local_tensor.data
+        if (
+            sharded_param_data.device != local_tensor_data.device
+            or sharded_param_data.data_ptr() != local_tensor_data.data_ptr()
+        ):
+            local_tensor_data.requires_grad_(self.sharded_param.requires_grad)
+            # TensorImpl keeps storage_ptr, storage_offset, sizes, strides, dtype and metadatas
+            # so swap TensorImpl can make self.sharded_param ref the self.sharded_param._local_tensor's TensorImpl
+            # local_tensor_data TensorImpl will deconstruct after this function finish.
+            torch._C._swap_tensor_impl(self.sharded_param, local_tensor_data)  # pylint: disable=W0212
+
     @torch.no_grad()
-    def _get_unsharded_param_data(self, async_op: bool = False) -> Tuple[torch.Tensor, Optional[dist.Work]]:
+    def _get_unsharded_param_data(self, async_op: bool = False) -> None:
         """
         Perform all-gather to get unsharded parameter data.
 
         Args:
             async_op: Whether to execute asynchronously.
 
-        Returns:
-            (unsharded_param, handle): Unsharded parameter data and communication handle.
+        The output buffer and optional asynchronous handle are stored in the
+        parameter communication context.
         """
-        # If parameter is not sharded (below threshold), no communication needed
-        if not self.is_sharded:
-            all_gather_input = self.all_gather_inputs[0]
-            self.init_all_gather_outputs(
-                all_gather_input_numels=[all_gather_input.numel()],
-                all_gather_input_dtypes=[all_gather_input.dtype],
-                world_size=1,
-                device=self.device,
-            )
-            self.alloc_all_gather_outputs()
-            _copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
-            return self.all_gather_outputs[0], None
-
-        # Get input data
         all_gather_input = self.all_gather_inputs[0]
 
-        # Initialize output buffer
-        self.init_all_gather_outputs(
+        if self.shard_world_size <= 1 or self.mesh_info.shard_process_group is None:
+            if len(self.unsharded_param_buffers) == 0:
+                self.unsharded_param_buffers = [all_gather_input]
+            elif self.unsharded_param_buffers[0] is not all_gather_input:
+                # if param_dtype cast or tensor.to caused by cpu_offload
+                self.alloc_unsharded_param_buffers()
+                _copy_without_bumping_version(self.unsharded_param_buffers[0], all_gather_input)
+            self.allgather_comm_ctx.allgather_output = None
+            self.allgather_comm_ctx.allgather_handle = None
+            return
+
+        self.init_unsharded_param_buffers(
             all_gather_input_numels=[all_gather_input.numel()],
             all_gather_input_dtypes=[all_gather_input.dtype],
             world_size=self.shard_world_size,
             device=self.device,
         )
-        self.alloc_all_gather_outputs()
+        self.alloc_unsharded_param_buffers()
 
-        if self.sharded_group_info.group is None or self.shard_world_size <= 1:
-            # No communication needed, just copy
-            _copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
-            return self.all_gather_outputs[0], None
+        self.allgather_comm_ctx.allgather_output = self.unsharded_param_buffers[0]
+        if self.hsdp_placement.dim != 0:
+            # Non-dim-0 sharding uses an extra all-gather buffer before
+            # restoring the original dimension with chunk + cat.
+            self.allgather_comm_ctx.allgather_output = torch.empty_like(
+                self.unsharded_param_buffers[0]
+            )
+        # pylint: disable=W0212
+        with torch.autograd._unsafe_preserve_version_counter(
+            self.allgather_comm_ctx.allgather_output
+        ):
+            self.allgather_comm_ctx.allgather_handle = dist.all_gather_into_tensor(
+                self.allgather_comm_ctx.allgather_output,
+                all_gather_input,
+                group=self.mesh_info.shard_process_group,
+                async_op=async_op,
+            )
 
-        # Execute all_gather_into_tensor
-        handle = dist.all_gather_into_tensor(
-            self.all_gather_outputs[0],
-            all_gather_input,
-            group=self.sharded_group_info.group,
-            async_op=async_op,
-        )
+        if self.allgather_comm_ctx.allgather_output is self.unsharded_param_buffers[0]:
+            self.allgather_comm_ctx.allgather_output = None
 
-        return self.all_gather_outputs[0], handle
 
     def unshard(self, async_op: bool = False) -> None:
-        if self.prefetch_handle is not None:
+        if self.allgather_comm_ctx.allgather_handle is not None:
             # Already triggered by HSDPState.prefetch(), so return directly.
             return  # no-op
+        self._get_unsharded_param_data(async_op=async_op)
 
-        _, handle = self._get_unsharded_param_data(async_op=async_op)
-        self.prefetch_handle = handle
 
     def wait_for_unshard(self) -> None:
         self._assert_in_states(ShardedState.SHARDED)
 
-        if self.prefetch_handle is not None:
-            self.prefetch_handle.wait()
-            self.prefetch_handle = None
+        if self.allgather_comm_ctx.allgather_handle is not None:
+            self.allgather_comm_ctx.allgather_handle.wait()
+            self.allgather_comm_ctx.allgather_handle = None
 
         self.init_unsharded_param()
         self.to_unsharded()
@@ -914,138 +1128,166 @@ class TorchHSDPParamV2(HSDPParamV2):
     def reduce_scatter_grad(
         self,
         async_op: bool = True,
-        dtype: Optional[torch.dtype] = None,
         reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG,
         output_buffer: Optional[torch.Tensor] = None,
-    ) -> Union[None, Tuple[torch.Tensor, Optional[dist.Work]]]:
+    ) -> None:
         """
         Perform reduce-scatter on gradient to reduce and shard the full gradient.
 
         Args:
             async_op: Whether to execute asynchronously.
-            dtype: reduce dtype.
             reduce_op: do reduce-scatter avg or sum.
             output_buffer: Optional pre-allocated output buffer for fused all-reduce.
                           When provided, reduce_scatter writes directly into this buffer,
                           enabling zero-copy fusion with subsequent all_reduce operations.
-                          The buffer must have the correct size (sharded_size.numel()) and dtype.
+                          The buffer must have ``padded_sharded_param_size.numel()`` elements
+                          and the reduction dtype.
 
-        Returns:
-            (sharded_grad, handle): Sharded gradient and communication handle.
+        The output and optional asynchronous work are stored in
+        ``reduce_scatter_comm_ctx``.
         """
-        self._assert_in_states(ShardedState.UNSHARDED)
-
-        # Choose gradient source based on use_accumulated_grad flag
         if self.unsharded_accumulated_grad is not None:
             grad = self.unsharded_accumulated_grad_data
         else:
             grad = self.unsharded_grad_data
-        reduce_dtype = dtype or grad.dtype
-        self._grad = grad.to(reduce_dtype)
-        plan_world_size = (
-            self.shard_world_size
-            if self.is_sharded
-            and self.sharded_group_info.group is not None
-            and self.shard_world_size > 1
-            else 1
-        )
-        plan = build_rs_plan(self, self._grad, plan_world_size)
-        grad_flat = pack_for_reduce_scatter(self._grad, plan).reshape(-1)
-        # apply gradient_scaling_factor (reduce-scatter leg)
-        apply_gradient_scaling_factor(grad_flat, self.gradient_scaling_factor)
-        # If parameter is not sharded (below threshold), no reduce-scatter needed
-        if not self.is_sharded:
-            if output_buffer is not None:
-                output_buffer.copy_(grad_flat)
-                self._reduce_scatter_output = output_buffer
-            else:
-                self._reduce_scatter_output = grad_flat
-            self.reduce_scatter_handle = None
-            return grad_flat, None
+        self._grad = grad.to(self.reduce_comm_dtype(grad))
+        shard_dim = self.hsdp_placement.dim
+        if self.shard_world_size <= 1:
+            self._grad = self._grad.view(-1)
+        elif shard_dim != 0:
+            grad_chunks = torch.chunk(self._grad, self.shard_world_size, dim=shard_dim)
+            self._grad = torch.cat(grad_chunks, dim=0).contiguous().view(-1)
+        else:
+            padded_unsharded_dim0 = self.padded_sharded_param_size[0] * self.shard_world_size
+            if self._grad.size(0) != padded_unsharded_dim0:
+                padded_unsharded_size = torch.Size((padded_unsharded_dim0, *self._grad.shape[1:]))
+                padded_grad = self._grad.new_zeros(padded_unsharded_size)
+                padded_grad.narrow(0, 0, self._grad.size(0)).copy_(self._grad)
+                self._grad = padded_grad
+            self._grad = self._grad.view(-1)
+        apply_gradient_scaling_factor(self._grad, self.gradient_scaling_factor)
 
-        if self.sharded_group_info.group is None or self.shard_world_size <= 1:
+        shard_process_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
+        if shard_process_group is None or self.shard_world_size <= 1:
             if output_buffer is not None:
-                output_buffer.copy_(grad_flat)
-                self._reduce_scatter_output = output_buffer
+                output_buffer.copy_(self._grad)
+                self.reduce_scatter_comm_ctx.reduce_scatter_output = output_buffer
             else:
-                self._reduce_scatter_output = grad_flat
-            self.reduce_scatter_handle = None
-            # No communication needed
-            return grad_flat, None
+                self.reduce_scatter_comm_ctx.reduce_scatter_output = self._grad
+            self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
+            return
 
         # Calculate output size
-        output_numel = grad_flat.numel() // self.shard_world_size
+        output_numel = self._grad.numel() // self.shard_world_size
         # Use provided output buffer or allocate a new one
         if output_buffer is not None:
             if output_buffer.numel() != output_numel:
                 raise ValueError(
                     f"output_buffer size mismatch: expected {output_numel}, got {output_buffer.numel()}"
                 )
-            if output_buffer.dtype != reduce_dtype:
+            if output_buffer.dtype != self._grad.dtype:
                 raise ValueError(
-                    f"output_buffer dtype mismatch: expected {reduce_dtype}, got {output_buffer.dtype}"
+                    f"output_buffer dtype mismatch: expected {self._grad.dtype}, got {output_buffer.dtype}"
                 )
-            self._reduce_scatter_output = output_buffer
+            self.reduce_scatter_comm_ctx.reduce_scatter_output = output_buffer
         else:
-            self._reduce_scatter_output = torch.empty(output_numel, dtype=reduce_dtype, device=self._grad.device)
+            self.reduce_scatter_comm_ctx.reduce_scatter_output = torch.empty(
+                output_numel,
+                dtype=self._grad.dtype,
+                device=self._grad.device,
+            )
         # Execute reduce_scatter_tensor
-        self.reduce_scatter_handle = dist.reduce_scatter_tensor(
-            self._reduce_scatter_output,
-            grad_flat,
+        self.reduce_scatter_comm_ctx.reduce_scatter_handle = dist.reduce_scatter_tensor(
+            self.reduce_scatter_comm_ctx.reduce_scatter_output,
+            self._grad,
             op=reduce_op,
-            group=self.sharded_group_info.group,
+            group=shard_process_group,
             async_op=async_op,
         )
-        return self._reduce_scatter_output, self.reduce_scatter_handle
 
     def all_reduce_grad(
         self,
-        grad: Optional[torch.Tensor] = None,
-        dtype: Optional[torch.dtype] = None,
         async_op: bool = True,
         reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG,
-    ) -> Union[None, Tuple[torch.Tensor, Optional[dist.Work]]]:
+    ) -> None:
         """
-        Perform all-reduce on gradient (across replicate dimension in HSDP mode).
+        All-reduce the current reduce-scatter output across the replicate mesh.
 
         Args:
-            grad: Gradient tensor to reduce. If None, this is a pure all-reduce
-                path (no preceding reduce-scatter): the unsharded grad is fetched
-                here and ``gradient_scaling_factor`` is applied in this leg. If a
-                grad is passed in, it is the already-scaled output of
-                ``reduce_scatter_grad`` (chained HSDP all-reduce) and is not
-                scaled again. Whether the grad is fetched here is therefore the
-                signal for which leg owns the scaling -- no extra flag needed.
             async_op: Whether to execute asynchronously.
-            reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG.
+            reduce_op: Reduction operation for the replicate dimension.
 
-        Returns:
-            (reduced_grad, handle): Reduced gradient and communication handle.
+        The output and optional asynchronous work are stored in
+        ``all_reduce_comm_ctx``.
         """
-        # grad is None => pure all-reduce path: fetch the unsharded grad and own
-        # the scaling here, since it never went through reduce_scatter_grad.
-        scale_here = grad is None
+        grad = self.reduce_scatter_comm_ctx.reduce_scatter_output
         if grad is None:
-            if self.unsharded_accumulated_grad is not None:
-                grad = self.unsharded_accumulated_grad_data
-            else:
-                grad = self.unsharded_grad_data
+            raise RuntimeError("all_reduce_grad requires a completed reduce-scatter output.")
+        reduce_dtype = self.reduce_comm_dtype(grad)
+        if grad.dtype != reduce_dtype:
+            grad = grad.to(reduce_dtype)
 
-        if dtype is not None and dtype != grad.dtype:
-            grad = grad.to(dtype)
+        replicate_process_group = (
+            self.mesh_info.replicate_process_group if isinstance(self.mesh_info, DDPMeshInfo) else None
+        )
+        if replicate_process_group is None or self.replicate_world_size <= 1:
+            self.all_reduce_comm_ctx.all_reduce_output = grad
+            self.all_reduce_comm_ctx.all_reduce_handle = None
+            return
 
-        if scale_here:
-            # all-reduce below is in-place on grad, so scaling in-place here keeps
-            # the same semantics: reduce(g_i * factor) == factor * reduce(g_i).
-            apply_gradient_scaling_factor(grad, self.gradient_scaling_factor)
+        self.all_reduce_comm_ctx.all_reduce_handle = dist.all_reduce(
+            grad,
+            op=reduce_op,
+            group=replicate_process_group,
+            async_op=async_op,
+        )
+        self.all_reduce_comm_ctx.all_reduce_output = grad
 
-        if self.unsharded_group_info.group is None or self.replicate_world_size <= 1:
-            return grad, None
+    def all_reduce_source_replicate_grad_inplace(
+        self,
+        reduced_grad: torch.Tensor,
+        reduce_op: dist.ReduceOp,
+    ) -> None:
+        """All-reduce a final gradient over replicated source-layout axes, in place.
 
-        self.all_reduce_handle = dist.all_reduce(grad, op=reduce_op,
-                                                 group=self.unsharded_group_info.group, async_op=async_op)
-        self._all_reduce_output = grad
-        return grad, self.all_reduce_handle
+        ``reduced_grad`` is modified in place; the caller keeps using its own
+        reference and must not expect a returned tensor. No-op when the source
+        layout has no replicated mesh axis, so callers may invoke it
+        unconditionally.
+
+        Args:
+            reduced_grad: Final local gradient after FSDP/HSDP reduction.
+            reduce_op: Reduction operation shared with the DP communication path.
+        """
+        if self.source_shard_info is None or not self.source_shard_info.placements:
+            return
+        # Use the same deduplicated source layout as sharded storage. Native
+        # DTensor compute metadata can include DP/CP axes already reduced by
+        # FSDP; reducing those axes again would multiply validate-mode grads.
+        source_mesh, source_placements = self._storage_source_layout
+        replicate_mesh_dims = tuple(
+            mesh_dim
+            for mesh_dim, placement in enumerate(source_placements)
+            if placement.is_replicate()
+        )
+        if not replicate_mesh_dims:
+            return
+        mesh_dim_names = source_mesh.mesh_dim_names
+        if mesh_dim_names is None:
+            raise ValueError(
+                "TP shard mesh must define mesh_dim_names to all-reduce replicated gradients."
+            )
+        replicate_mesh_dim_names = tuple(mesh_dim_names[mesh_dim] for mesh_dim in replicate_mesh_dims)
+        replicate_mesh = source_mesh[replicate_mesh_dim_names].flatten()
+        replicate_world_size = replicate_mesh.size()
+        if replicate_world_size <= 1:
+            return
+        dist.all_reduce(
+            reduced_grad,
+            op=reduce_op,
+            group=replicate_mesh.get_group(),
+            async_op=False,
+        )
 
 
 def set_requires_grad_if_needed(

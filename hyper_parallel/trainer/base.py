@@ -841,6 +841,7 @@ class BaseTrainer:
                     local,
                     device_mesh=data.device_mesh,
                     placements=data.placements,
+                    shape=tuple(data.shape),
                 )
             else:
                 param.data = local
@@ -867,35 +868,16 @@ class BaseTrainer:
             hsdp_param.reduce_dtype = (
                 None if target_reduce_dtype == target_dtype else target_reduce_dtype
             )
-            hsdp_param.all_gather_outputs = []
-            param = getattr(hsdp_param, 'sharded_param', None)
-            if param is not None:
-                local = _get_param_local_tensor(param)
-                if not local.is_contiguous():
-                    local = local.contiguous()
-                    _set_param_local_tensor(param, local)
-                # HSDP all-gather reads this cached flat view, so it must be
-                # rebound after any post-load Parameter dtype cast.
-                hsdp_param._sharded_param_data = local.view(-1)  # pylint: disable=protected-access
+            hsdp_param.unsharded_param_buffers = []
+            hsdp_param.reset_sharded_param()
             if hasattr(hsdp_param, "_unsharded_param"):
                 delattr(hsdp_param, "_unsharded_param")
 
         def _refresh_hsdp_state_dtype(state) -> None:
-            reduce_dtype = None if target_reduce_dtype == target_dtype else target_reduce_dtype
-            if hasattr(state, '_orig_dtype'):
-                state._orig_dtype = target_dtype  # pylint: disable=protected-access
-            if hasattr(state, '_reduce_dtype'):
-                state._reduce_dtype = reduce_dtype  # pylint: disable=protected-access
-            param_group = getattr(state, 'param_group', None)
-            if param_group is None:
+            if state.param_group is None:
                 return
-            param_group._orig_dtype = target_dtype  # pylint: disable=protected-access
-            param_group._reduce_dtype = reduce_dtype  # pylint: disable=protected-access
-            param_group._flat_param_buffer = None  # pylint: disable=protected-access
-            param_group._flat_cast_buffer = None  # pylint: disable=protected-access
-            param_group.ag_output = None
-            param_group.metadata_cache = None
-            param_group._result = None  # pylint: disable=protected-access
+            state.param_group.reset_iter_state()
+            state.param_group.all_gather_buckets = []
 
         for state in self._iter_hsdp_states():
             buckets = (

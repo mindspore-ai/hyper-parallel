@@ -16,7 +16,7 @@
 
 import copy
 import functools
-from typing import NamedTuple, Optional, Sequence
+from typing import Any, NamedTuple, Optional, Sequence
 
 import numpy as np
 
@@ -65,52 +65,111 @@ def _replace_ragged_with_replicate(placements: Sequence[Placement]) -> tuple[Pla
     )
 
 
-def _infer_slice_area_by_rank(mesh_shape, tensor_map, rank_id: int, full_shape: tuple):  # -> tuple[tuple[int]]:
-    """Return the range of each axis from full tensor for slice in current rank."""
+def infer_balanced_chunk_range(
+    tensor_size: int,
+    shard_count: int,
+    shard_rank: int,
+) -> tuple[int, int]:
+    """Return one balanced half-open shard range."""
+    shard_size, remainder = divmod(tensor_size, shard_count)
+    chunk_start = shard_rank * shard_size + min(shard_rank, remainder)
+    chunk_end = chunk_start + shard_size + int(shard_rank < remainder)
+    return chunk_start, chunk_end
 
-    def _get_dev_num_alone_dim(mesh_shape, dim):
-        """_get_dev_num_alone_dim."""
-        return mesh_shape[-dim - 1] if dim != -1 else 1
 
-    def _rank_id_to_dev_id_list(mesh_shape, rank_id):
-        """Infer dev id list by rank_id and mesh_shape"""
-        dims = len(mesh_shape)
-        dev_id_list = [0] * dims
-        for i in range(dims - 1, -1, -1):
-            dev_id_list[i] = rank_id % mesh_shape[i]
-            rank_id = rank_id // mesh_shape[i]
-        return dev_id_list
+def infer_ceil_chunk_range(
+    tensor_size: int,
+    shard_count: int,
+    shard_rank: int,
+) -> tuple[int, int]:
+    """Return one ceil-chunk range, including empty trailing ranks."""
+    chunk_size = (tensor_size + shard_count - 1) // shard_count
+    chunk_start = min(shard_rank * chunk_size, tensor_size)
+    chunk_end = min(chunk_start + chunk_size, tensor_size)
+    return chunk_start, chunk_end
 
-    dev_id_list = _rank_id_to_dev_id_list(mesh_shape, rank_id)
 
-    dims = len(full_shape)
-    area = []
-    for axis in range(dims):
-        mapping = tensor_map[axis]
-        if isinstance(mapping, int):
-            mapping = (mapping,)
-        split_num = 1
-        for dim in mapping:
-            split_num *= _get_dev_num_alone_dim(mesh_shape, dim)
+def _infer_slice_area_by_rank(
+    mesh_shape: tuple[int, ...],
+    tensor_map: Sequence,
+    rank_id: int,
+    full_shape: Sequence[int],
+    uneven_shard_mesh_dims: set[int],
+) -> tuple[tuple[int, int], ...]:
+    """Return one rank's slice using placement-specific shard geometry."""
+    mesh_coordinate = [0] * len(mesh_shape)
+    remaining_rank = rank_id
+    for mesh_dim in range(len(mesh_shape) - 1, -1, -1):
+        mesh_coordinate[mesh_dim] = remaining_rank % mesh_shape[mesh_dim]
+        remaining_rank //= mesh_shape[mesh_dim]
 
-        slice_id = 0
-        coef = 1
-        for dim in reversed(mapping):
-            if dim == -1:
+    slice_area = []
+    for tensor_dim, global_size in enumerate(full_shape):
+        tensor_mapping = tensor_map[tensor_dim]
+        if isinstance(tensor_mapping, int):
+            tensor_mapping = (tensor_mapping,)
+
+        slice_start = 0
+        slice_end = global_size
+        for mapped_mesh_dim in tensor_mapping:
+            if mapped_mesh_dim == -1:
                 continue
-            slice_id += dev_id_list[-dim - 1] * coef
-            coef *= _get_dev_num_alone_dim(mesh_shape, dim)
-        slice_size = full_shape[axis] // split_num
-        start = slice_id * slice_size
-        end = start + slice_size
-        area.append((start, end))
-    return area
+            mesh_dim = len(mesh_shape) - mapped_mesh_dim - 1
+            shard_count = mesh_shape[mesh_dim]
+            shard_rank = mesh_coordinate[mesh_dim]
+            current_size = slice_end - slice_start
+            infer_chunk_range = (
+                infer_ceil_chunk_range
+                if mesh_dim in uneven_shard_mesh_dims
+                else infer_balanced_chunk_range
+            )
+            chunk_start, chunk_end = infer_chunk_range(
+                current_size,
+                shard_count,
+                shard_rank,
+            )
+            slice_end = slice_start + chunk_end
+            slice_start += chunk_start
+        slice_area.append((slice_start, slice_end))
+    return tuple(slice_area)
+
+
+def infer_slice_area_by_rank(
+    mesh_shape: tuple[int, ...],
+    tensor_map: Sequence,
+    rank_id: int,
+    full_shape: Sequence[int],
+    uneven_shard_mesh_dims: Optional[Sequence[int]] = None,
+) -> tuple[tuple[int, int], ...]:
+    """Return one rank's global slice using placement-specific shard semantics."""
+    return _infer_slice_area_by_rank(
+        mesh_shape,
+        tensor_map,
+        rank_id,
+        full_shape,
+        set(uneven_shard_mesh_dims or ()),
+    )
+
+
+def infer_slice_area_by_layout(
+    layout: "Layout",
+    rank_id: int,
+    full_shape: Sequence[int],
+) -> tuple[tuple[int, int], ...]:
+    """Return one rank's slice using ``uneven_shard`` placement markers."""
+    return infer_slice_area_by_rank(
+        layout.mesh_shape,
+        layout.tensor_map,
+        rank_id,
+        full_shape,
+        layout.uneven_shard_mesh_dims,
+    )
 
 
 def _get_slice_tensor_by_layout(global_tensor, layout):
     """Transfer global tensor to local tensor by layout"""
     inner_rank_id = layout.rank_list.index(layout.mesh.rank)
-    slice_area = _infer_slice_area_by_rank(layout.mesh_shape, layout.tensor_map, inner_rank_id, global_tensor.shape)
+    slice_area = infer_slice_area_by_layout(layout, inner_rank_id, global_tensor.shape)
 
     def get_slice_data(full_data, offset):
         area = ()
@@ -124,16 +183,9 @@ def _get_slice_tensor_by_layout(global_tensor, layout):
 
 def _infer_slice_shape_by_layout(global_shape, layout):
     """Infer slice shape from global_shape and layout"""
-    slice_shape = list(global_shape)
-    alias_tensor_map = layout.alias_tensor_map
-    for i in range(len(global_shape)):
-        axis_name = alias_tensor_map[i]
-        if isinstance(axis_name, str):
-            axis_name = (axis_name,)
-        for sub_axis_name in axis_name:
-            if sub_axis_name != "None":
-                slice_shape[i] = slice_shape[i] // layout.mesh.get_device_num_along_axis(sub_axis_name)
-    return slice_shape
+    inner_rank_id = layout.rank_list.index(layout.mesh.rank)
+    slice_area = infer_slice_area_by_layout(layout, inner_rank_id, global_shape)
+    return [end - start for start, end in slice_area]
 
 
 class Layout:
@@ -189,12 +241,15 @@ class Layout:
         self._partial = [None] * len(mesh_shape)  # partial status for each dev dim
         self._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
         self._alias_tensor_map = None
+        self._tensor_shape = None
+        self._tensor_stride = None
+        self._tensor_dtype = None
         self._mesh = _create_device_mesh("npu", mesh_shape, mesh_dim_names=alias_name, rank_list=self._rank_list,
                                          init_backend=init_backend)
-        self._compact_str = self._to_compact_string()
         self._placements = None
         self.partial_ops = {}  # Initialized in _build_dim_map_from_placements()
         self._ragged_shard = None
+        self._compact_str = self._to_compact_string()
 
     @classmethod
     def from_device_mesh(cls, device_mesh: DeviceMesh) -> 'Layout':
@@ -220,6 +275,9 @@ class Layout:
         obj._partial = [None] * len(device_mesh.mesh_shape)
         obj._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
         obj._alias_tensor_map = None
+        obj._tensor_shape = None
+        obj._tensor_stride = None
+        obj._tensor_dtype = None
         obj._placements = None
         obj._ragged_shard = None
         obj._compact_str = obj._to_compact_string()
@@ -485,6 +543,11 @@ class Layout:
         """
         if self._tensor_map is None:
             raise ValueError("The tensor_map is None, cannot transform to placements.")
+        uneven_shard_dims = {
+            mesh_idx: placement.dim
+            for mesh_idx, placement in enumerate(self.placements or ())
+            if isinstance(placement, Shard) and placement.uneven_shard
+        }
         mesh_ndim = len(self.mesh_shape)
         placements = [Replicate()] * mesh_ndim
         for tensor_dim, mapping in enumerate(self._tensor_map):
@@ -497,10 +560,15 @@ class Layout:
             )
             for mesh_idx in shard_axes:
                 split_factor = expected_split_factors[mesh_idx]
+                uneven_shard = uneven_shard_dims.get(mesh_idx) == tensor_dim
                 placement = (
-                    StridedShard(dim=tensor_dim, split_factor=split_factor)
+                    StridedShard(
+                        dim=tensor_dim,
+                        split_factor=split_factor,
+                        uneven_shard=uneven_shard,
+                    )
                     if split_factor > 1
-                    else Shard(dim=tensor_dim)
+                    else Shard(dim=tensor_dim, uneven_shard=uneven_shard)
                 )
                 placements[mesh_idx] = placement
         for mesh_idx, op in enumerate(self.partial):
@@ -606,6 +674,53 @@ class Layout:
         self._ragged_shard = (
             None if placements is None else _extract_ragged_shard(placements)
         )
+
+    @property
+    def tensor_shape(self) -> Optional[tuple[int, ...]]:
+        """Return the explicit logical global shape, if present."""
+        return self._tensor_shape
+
+    @property
+    def tensor_stride(self) -> Optional[tuple[int, ...]]:
+        """Return the explicit logical global stride, if present."""
+        return self._tensor_stride
+
+    @property
+    def tensor_dtype(self) -> Optional[Any]:
+        """Return the explicit logical dtype, if present."""
+        return self._tensor_dtype
+
+    @property
+    def uneven_shard_mesh_dims(self) -> tuple[int, ...]:
+        """Return mesh dimensions carrying FSDP ceil-chunk placements."""
+        return tuple(
+            mesh_dim
+            for mesh_dim, placement in enumerate(self._placements or ())
+            if isinstance(placement, Shard) and placement.uneven_shard
+        )
+
+    @property
+    def has_uneven_shard(self) -> bool:
+        """Return whether any placement uses FSDP ceil-chunk geometry."""
+        return bool(self.uneven_shard_mesh_dims)
+
+    def set_tensor_meta(
+        self,
+        shape: Sequence[int],
+        stride: Sequence[int],
+        dtype: Any,
+    ) -> None:
+        """Set logical tensor metadata independently from local shard storage.
+
+        Args:
+            shape: Logical global tensor shape.
+            stride: Logical global tensor stride.
+            dtype: Logical tensor dtype.
+        """
+        self._tensor_shape = tuple(shape)
+        self._tensor_stride = tuple(stride)
+        self._tensor_dtype = dtype
+        self.update_compact_str()
 
     @property
     def normal_placements(self) -> Optional[tuple[Placement, ...]]:
@@ -746,6 +861,8 @@ class Layout:
 
     def get_global_shape(self, slice_shape):
         """get global shape"""
+        if self._tensor_shape is not None:
+            return self._tensor_shape
         return self._mesh.get_global_shape(slice_shape, self._tensor_map)
 
     def get_devices_for_axis(self, axis, rank):
@@ -799,7 +916,14 @@ class Layout:
             str: string for compact
         """
         mesh_key = self._mesh.to_hash()
-        hash_key = (self._tensor_map, self.partial)
+        hash_key = (
+            self._tensor_map,
+            self.partial,
+            self.uneven_shard_mesh_dims,
+            self._tensor_shape,
+            self._tensor_stride,
+            str(self._tensor_dtype),
+        )
         hash_key += mesh_key
         return str(hash_key)
 
@@ -876,11 +1000,19 @@ class Layout:
             self.alias_name,
             self.partial,
             self.rank_list,
+            self.uneven_shard_mesh_dims,
+            self.tensor_shape,
+            self.tensor_stride,
+            self.tensor_dtype,
         ) == (
             other.mesh_shape,
             other.alias_name,
             other.partial,
             other.rank_list,
+            other.uneven_shard_mesh_dims,
+            other.tensor_shape,
+            other.tensor_stride,
+            other.tensor_dtype,
         )
         if not same_layout_attrs:
             return False

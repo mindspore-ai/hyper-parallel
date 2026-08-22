@@ -68,16 +68,16 @@ def test_fully_shard_under_tensor_parallel() -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_tp_fsdp_mesh_none() -> None:
+def test_tp_size_one_fsdp() -> None:
     """
-    Feature: TP + fully_shard(mesh=None) compatibility mode.
+    Feature: TP + fully_shard on an explicit size-one FSDP submesh.
     Description:
-        1. TP-sharded DTensor compatibility mode local loss/grad parity.
-        2. Pure-TP replicated DTensor gradients managed by fully_shard(mesh=None).
+        1. TP-sharded DTensor local loss/grad parity with size-one FSDP ownership.
+        2. Pure-TP replicated DTensor gradients managed by size-one FSDP.
     Expectation: 2-card cases run in parallel and match standalone references.
     """
     _run_tp_fully_shard_group([
-        "test_tp_plus_fully_shard_mesh_none_compat_match_standalone",
+        "test_tp_plus_fully_shard_size_one_fsdp_match_standalone",
         "test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone",
     ], worker_num=2)
 

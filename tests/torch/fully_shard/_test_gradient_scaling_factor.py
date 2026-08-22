@@ -18,6 +18,7 @@ import os
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import numpy as np
+import pytest
 import torch
 import torch_npu
 from hyper_parallel import DTensor, init_device_mesh, SkipDTensorDispatch
@@ -51,7 +52,9 @@ def _run_one_step_grad(model, data):
         loss.backward(torch.ones_like(loss))
         grad = model.weight.grad
         assert isinstance(grad, DTensor), f"Expected DTensor grad, got {type(grad)}"
-        return grad.to_local().detach().clone().cpu().numpy()
+        local_grad = grad.to_local().detach().clone().cpu().numpy()
+    model.reset_iter_state()
+    return local_grad
 
 
 def _assert_scaled(baseline, scaled, factor):
@@ -71,10 +74,9 @@ def _get_gradient_scaling_factor(model):
     factor is write-only on the public API.
     """
     state = model.hsdp_scheduler.hsdp_state
-    param_group = getattr(state, "param_group", None)
-    if param_group is not None:
-        return param_group.gradient_scaling_factor
-    for hsdp_param in state._iter_managed_params():  # pylint: disable=protected-access
+    if state.param_group is not None:
+        return state.param_group.gradient_scaling_factor
+    for hsdp_param in state.hsdp_params:
         return hsdp_param.gradient_scaling_factor
     return None
 
@@ -125,24 +127,18 @@ def _run_scaling_check(comm_fusion: bool):
     )
 
 
-def test_gradient_scaling_factor_no_fusion():
+@pytest.mark.parametrize(
+    "comm_fusion",
+    [False, True],
+    ids=["per_param", "param_group"],
+)
+def test_gradient_scaling_factor(comm_fusion):
     """
-    Feature: HSDPModule.set_gradient_scaling_factor (non-comm_fusion path)
-    Description: Verify the factor scales the post-reduce gradient on the
-        per-parameter reduce-scatter/all-reduce path.
+    Feature: HSDPModule.set_gradient_scaling_factor
+    Description: Verify the factor on per-parameter and parameter-group paths.
     Expectation: Scaled grad equals baseline * factor for float, int and tensor.
     """
-    _run_scaling_check(comm_fusion=False)
-
-
-def test_gradient_scaling_factor_comm_fusion():
-    """
-    Feature: HSDPModule.set_gradient_scaling_factor (comm_fusion path)
-    Description: Verify the factor scales the fused reduce-scatter output
-        before it is written into sharded_param.grad.
-    Expectation: Scaled grad equals baseline * factor for float, int and tensor.
-    """
-    _run_scaling_check(comm_fusion=True)
+    _run_scaling_check(comm_fusion)
 
 
 def test_gradient_scaling_factor_validation():
@@ -172,3 +168,4 @@ def test_gradient_scaling_factor_validation():
     # Valid types must not raise.
     for good in (None, 1.0, 2, torch.tensor(0.25, device="npu")):
         model.set_gradient_scaling_factor(good)
+    model.reset_iter_state()
