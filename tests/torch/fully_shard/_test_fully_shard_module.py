@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test fully_shard module api"""
+"""Test the fully_shard module API."""
 # pylint: disable=W0611,C0413,C0412,W0613,W0612,W0212
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -113,10 +113,8 @@ def test_fully_shard_module_01():
     # Test set_reshard_after_forward
     model1.set_reshard_after_forward(True)
     assert model1.hsdp_scheduler.reshard_after_forward is True
-    assert model1.hsdp_scheduler.config.reshard_after_forward is True
     model1.set_reshard_after_forward(False)
     assert model1.hsdp_scheduler.reshard_after_forward is False
-    assert model1.hsdp_scheduler.config.reshard_after_forward is False
     try:
         model1.set_reshard_after_forward(1)
         assert False, "Should raise ValueError for non-bool input"

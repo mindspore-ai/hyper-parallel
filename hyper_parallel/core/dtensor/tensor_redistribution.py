@@ -283,6 +283,11 @@ class TensorRedistribution:
             to_layout.ragged_shard, RaggedShardInfo
         ):
             return self._redistribute_ragged(x, to_layout)
+        if from_layout.has_uneven_shard or to_layout.has_uneven_shard:
+            # FSDP uneven shard/unshard uses its private padded collectives.
+            raise NotImplementedError(
+                "DTensor redistribution does not support uneven chunk-sharded layouts."
+            )
         return self._redistribution_normal(x, to_layout)
 
     def _redistribution_normal(self, input_x: DTensor, to_layout: Layout) -> DTensor:

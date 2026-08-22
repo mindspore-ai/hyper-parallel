@@ -116,7 +116,7 @@ def _get_gradient_scaling_factor(model):
     param_group = getattr(state, "param_group", None)
     if param_group is not None:
         return param_group.gradient_scaling_factor
-    for hsdp_param in state._iter_managed_params():  # pylint: disable=protected-access
+    for hsdp_param in state.hsdp_params:
         return hsdp_param.gradient_scaling_factor
     return None
 

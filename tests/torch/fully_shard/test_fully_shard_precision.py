@@ -89,15 +89,3 @@ def test_fully_shard_precision_list_unit():
     parallel_run([
         TorchCase(_TEST_FULLY_SHARD_PRECISION_LIST, "test_list_unit_precision_zero3", 12350, 4),
     ])
-
-
-def test_zero3_fully_shard_comm_fusion():
-    """
-    Feature: Test_zero3_fully_shard_comm_fusion.
-    Description: Test_zero3_fully_shard with comm fusion.
-    Expectation: case run successfully.
-    """
-    parallel_run([
-        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_fully_shard_comm_fusion", 12315, 4),
-        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_partial_shard_comm_fusion", 12314, 4)
-    ])

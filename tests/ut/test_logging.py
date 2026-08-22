@@ -164,6 +164,20 @@ class TestHyperParallelLogging(unittest.TestCase):
 
         self.assertIn("HP|UnitH|hi", stream.getvalue())
 
+    def test_set_format_preserves_external_handler_formatter(self):
+        """Changing the HP format does not overwrite externally attached handlers."""
+        log = get_logger("FSDP")
+        external_handler = logging.StreamHandler(io.StringIO())
+        external_formatter = logging.Formatter("external|%(message)s")
+        external_handler.setFormatter(external_formatter)
+        log.addHandler(external_handler)
+
+        try:
+            set_format(fmt="HP|%(hp_component)s|%(message)s")
+            self.assertIs(external_handler.formatter, external_formatter)
+        finally:
+            log.removeHandler(external_handler)
+
     def test_invalid_level_rejected(self):
         """An unknown level name fails loudly."""
         with self.assertRaisesRegex(ValueError, "Invalid logging level"):

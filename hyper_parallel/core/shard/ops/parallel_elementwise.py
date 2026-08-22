@@ -630,6 +630,7 @@ class ElementWiseDistributedOp(DistributedOp):
                 )
 
         new_layout.set_alias_tensor_map(tuple(alias_tensor_map))
+        new_layout.tensor_map_to_placement()
 
         # Set partial status if provided
         if partial_list:

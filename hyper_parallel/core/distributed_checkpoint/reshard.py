@@ -14,9 +14,14 @@
 # ============================================================================
 """resharding tensor"""
 import operator
-from typing import Any, Optional, Union
+from typing import Any, Optional
 from functools import reduce
 import numpy as np
+
+from hyper_parallel.core.dtensor.layout import (
+    Layout,
+    infer_slice_area_by_rank,
+)
 
 
 def check_layout(layout: Optional[Any], name: str) -> None:
@@ -131,62 +136,6 @@ def infer_intersection(
     return tuple(intersection)
 
 
-def infer_slice_area_by_rank(
-        mesh_shape: tuple[int, ...],
-        tensor_map: Union[list[int], tuple[int, ...]],
-        rank_id: int,
-        full_shape: tuple[int, ...]
-) -> tuple[tuple[int, int], ...]:
-    """
-    Calculates the tensor slice boundaries for a specific rank.
-
-    Args:
-        mesh_shape (tuple[int, ...]): Shape of the mesh shape.
-        tensor_map (Union[list[int], tuple[int, ...]]): Mapping of tensor dimensions to device dimensions.
-        rank_id (int): Rank ID to calculate slice for.
-        full_shape (tuple[int, ...]): Complete shape of the original tensor.
-
-    Returns:
-        tuple[tuple[int, int], ...]: Tuple of (start, end) boundaries for each tensor dimension.
-    """
-    # Helper to get device count along a dimension
-    def _get_dev_num_along_dim(dim: int) -> int:
-        return mesh_shape[-dim - 1] if dim != -1 else 1
-
-    dims = len(full_shape)
-    dev_id_list = rank_id_to_dev_id_list(mesh_shape, rank_id)
-    area: list[tuple[int, int]] = []
-
-    for axis in range(dims):
-        mapping = tensor_map[axis]
-        if isinstance(mapping, int):
-            mapping = (mapping,)  # Convert to tuple for consistent handling
-
-        # Calculate total number of splits for this axis
-        split_num = 1
-        for dim in mapping:
-            split_num *= _get_dev_num_along_dim(dim)
-
-        # Calculate slice ID for this rank
-        slice_id = 0
-        coef = 1
-        for dim in reversed(mapping):
-            if dim == -1:
-                continue
-            slice_id += dev_id_list[-dim - 1] * coef
-            coef *= _get_dev_num_along_dim(dim)
-
-        # Calculate start/end indices for this slice
-        if full_shape[axis] % split_num != 0:
-            raise ValueError(f"Shape can not divided along dimension {axis} by {split_num} dev.")
-        slice_size = full_shape[axis] // split_num
-        start = slice_id * slice_size
-        end = start + slice_size
-        area.append((start, end))
-
-    return tuple(area)
-
-
 class ReshardHandler:
     """
     Handles tensor resharding between different distributed layouts.
@@ -224,6 +173,16 @@ class ReshardHandler:
         # Initialize basic attributes
         self.param_name = param_name
         self.full_shape = full_shape
+        self.from_uneven_shard_mesh_dims = (
+            from_layout.uneven_shard_mesh_dims
+            if isinstance(from_layout, Layout)
+            else ()
+        )
+        self.to_uneven_shard_mesh_dims = (
+            to_layout.uneven_shard_mesh_dims
+            if isinstance(to_layout, Layout)
+            else ()
+        )
 
         # Process source layout configuration
         if from_layout is None:
@@ -317,7 +276,8 @@ class ReshardHandler:
             self.to_mesh_shape,
             self.to_tensor_map,
             self.inner_to_rank_id,
-            self.full_shape
+            self.full_shape,
+            self.to_uneven_shard_mesh_dims,
         )
 
         # Calculate required slices from each source rank
@@ -330,7 +290,8 @@ class ReshardHandler:
                 self.from_mesh_shape,
                 self.from_tensor_map,
                 inner_rank_id,
-                self.full_shape
+                self.full_shape,
+                self.from_uneven_shard_mesh_dims,
             )
 
             # Find overlapping area between source and target

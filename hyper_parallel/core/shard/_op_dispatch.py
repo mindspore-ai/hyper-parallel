@@ -87,14 +87,39 @@ _debug_mode_observer: ContextVar = ContextVar('_debug_mode_observer', default=No
 
 _RAGGED_ELEMENTWISE_OPS = {
     "abs": "unary", "absolute": "unary", "clone": "unary", "cos": "unary",
-    "exp": "unary", "gelu": "unary", "isinf": "unary", "isnan": "unary",
+    "conj": "unary", "empty_like": "unary", "exp": "unary", "gelu": "unary",
+    "isinf": "unary", "isnan": "unary",
     "log": "unary", "neg": "unary", "negative": "unary", "relu": "unary",
     "rsqrt": "unary", "sigmoid": "unary", "silu": "unary", "sin": "unary",
-    "sqrt": "unary", "square": "unary",
-    "add": "binary", "div": "binary", "mul": "binary", "pow": "binary",
-    "real_div": "binary", "sub": "binary", "__rsub__": "binary",
-    "__rpow__": "binary", "true_divide": "binary",
+    "sqrt": "unary", "square": "unary", "zeros_like": "unary",
+    "add": "binary", "add_": "binary", "addcdiv_": "binary",
+    "addcmul_": "binary", "div": "binary", "lerp_": "binary",
+    "mul": "binary", "mul_": "binary", "pow": "binary", "real_div": "binary",
+    "sub": "binary", "__rsub__": "binary", "__rpow__": "binary",
+    "true_divide": "binary",
 }
+
+_RAGGED_INPLACE_ELEMENTWISE_OPS = frozenset({
+    "add_",
+    "addcdiv_",
+    "addcmul_",
+    "lerp_",
+    "mul_",
+})
+
+# Tensor subclass bookkeeping must stay available when a Ragged DTensor is
+# wrapped as a Parameter. These operations only inspect or update the local
+# autograd wrapper and do not reinterpret the logical distributed shape.
+_RAGGED_METADATA_BYPASS_OPS = frozenset({
+    "requires_grad_",
+    "__get__",
+    "__set__",
+    "register_hook",
+    "_has_compatible_shallow_copy_type",
+    "is_complex",
+    "is_floating_point",
+    "is_contiguous",
+})
 
 
 def get_no_skip_ops() -> FrozenSet[str]:
@@ -584,6 +609,13 @@ class OpDispatcher:
         local_args = tuple(self._unwrap_args(args))
         local_kwargs = self._unwrap_kwargs(kwargs)
         py_output = op_call(*local_args, **local_kwargs)
+        op_name = platform.get_op_name(op_call)
+        if op_name in _RAGGED_INPLACE_ELEMENTWISE_OPS:
+            if not args or not isinstance(args[0], DTensor):
+                raise ValueError(
+                    f"Ragged in-place operator {op_name!r} requires a DTensor first argument"
+                )
+            return args[0]
         return DTensor.from_local_with_layout(
             py_output,
             copy.deepcopy(reference.layout),
@@ -977,7 +1009,6 @@ class OpDispatcher:
             Result of the dispatched op call.
         """
         op_name = platform.get_op_name(op_call)
-        ragged_dtensor = self._validate_ragged_dispatch(op_name, args, kwargs)
         if logger.isEnabledFor(logging.DEBUG):
             log_dispatch_enter(op_name, args, kwargs)
 
@@ -987,12 +1018,17 @@ class OpDispatcher:
 
         result = None
         try:
+            should_bypass = self._should_bypass_dispatch(op_name)
+            ragged_dtensor = None
+            if not should_bypass or op_name not in _RAGGED_METADATA_BYPASS_OPS:
+                ragged_dtensor = self._validate_ragged_dispatch(op_name, args, kwargs)
             if ragged_dtensor is not None:
                 result = self._dispatch_ragged_elementwise(
                     op_call, args, kwargs, ragged_dtensor
                 )
                 return result
-            if self._should_bypass_dispatch(op_name):
+
+            if should_bypass:
                 self._validate_inplace_partial_inputs(op_name, args, kwargs)
                 result = op_call(*self._unwrap_args(args), **self._unwrap_kwargs(kwargs))
                 if op_name in self._INPLACE_BYPASS_OPS and args and isinstance(args[0], DTensor):

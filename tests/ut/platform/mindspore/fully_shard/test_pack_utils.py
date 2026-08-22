@@ -33,6 +33,7 @@ ensure_mindspore_platform_for_fully_shard()
 import mindspore as ms
 
 from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard
+from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo
 from hyper_parallel.platform.mindspore.fully_shard.pack_utils import (
     ReduceScatterPlan,
     build_rs_plan,
@@ -131,7 +132,7 @@ class TestMindSporePackUtils(unittest.TestCase):
     def test_supports_same_dim_strided_layout(self):
         """The helper should recognize the supported V1 same-dim StridedShard subset."""
         hsdp_param = SimpleNamespace(
-            uses_param_shard=True,
+            mesh_info=object.__new__(FSDPMeshInfo),
             _orig_param_is_dtensor=True,
             hsdp_placement=Shard(1),
             _spmd_shard_mesh_dim=0,
@@ -144,7 +145,7 @@ class TestMindSporePackUtils(unittest.TestCase):
     def test_same_dim_strided_dim0_uses_identity_layout(self):
         """Supported same-dim StridedShard on dim0 has a distinct identity marker."""
         hsdp_param = SimpleNamespace(
-            uses_param_shard=True,
+            mesh_info=object.__new__(FSDPMeshInfo),
             _orig_param_is_dtensor=True,
             hsdp_placement=Shard(0),
             _spmd_shard_mesh_dim=0,
@@ -162,7 +163,7 @@ class TestMindSporePackUtils(unittest.TestCase):
     def test_same_dim_strided_non_dim0_uses_chunk_cat_layout(self):
         """Supported same-dim StridedShard on non-dim0 should use chunk-cat packing."""
         hsdp_param = SimpleNamespace(
-            uses_param_shard=True,
+            mesh_info=object.__new__(FSDPMeshInfo),
             _orig_param_is_dtensor=True,
             hsdp_placement=Shard(1),
             _spmd_shard_mesh_dim=0,
@@ -180,7 +181,7 @@ class TestMindSporePackUtils(unittest.TestCase):
     def test_build_rs_plan_rejects_unsupported_strided_layout(self):
         """Unsupported StridedShard layouts should fail fast instead of packing a wrong buffer."""
         hsdp_param = SimpleNamespace(
-            uses_param_shard=True,
+            mesh_info=object.__new__(FSDPMeshInfo),
             _orig_param_is_dtensor=True,
             hsdp_placement=Shard(0),
             _spmd_shard_mesh_dim=0,
@@ -198,16 +199,16 @@ class TestMindSporePackUtils(unittest.TestCase):
         incomplete_params = [
             SimpleNamespace(_spmd_placements=()),
             SimpleNamespace(
-                uses_param_shard=False,
+                mesh_info=object(),
                 _spmd_placements=(StridedShard(1, split_factor=2), Shard(1)),
             ),
             SimpleNamespace(
-                uses_param_shard=True,
+                mesh_info=object.__new__(FSDPMeshInfo),
                 _orig_param_is_dtensor=False,
                 _spmd_placements=(StridedShard(1, split_factor=2), Shard(1)),
             ),
             SimpleNamespace(
-                uses_param_shard=True,
+                mesh_info=object.__new__(FSDPMeshInfo),
                 _orig_param_is_dtensor=True,
                 hsdp_placement=Shard(1),
                 _spmd_shard_mesh_dim=4,

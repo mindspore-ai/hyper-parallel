@@ -25,6 +25,7 @@ failing case points at one feature. The full-form (deferred-sync) accumulation i
 """
 # pylint: disable=wrong-import-position
 import os
+from unittest.mock import patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
@@ -42,6 +43,7 @@ from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+from hyper_parallel.platform.mindspore.fully_shard import param_group as param_group_module
 from tests.mindspore.st.common_net import SlimLeNet16
 from tests.mindspore.st.fully_shard._fsdp_precision_common import assert_shard_matches_reference, _to_numpy
 
@@ -92,8 +94,9 @@ def _assert_comm_fusion_state(net, enabled):
     found_fused_group = False
     for mod in modules:
         state = mod.hsdp_scheduler.hsdp_state
-        assert state.config.comm_fusion == enabled, (
-            f"{type(mod).__name__} comm_fusion mismatch: expected {enabled}, got {state.config.comm_fusion}"
+        actual = state.comm_fusion_policy.enable_comm_fusion
+        assert actual == enabled, (
+            f"{type(mod).__name__} comm_fusion mismatch: expected {enabled}, got {actual}"
         )
         param_group = getattr(state, "param_group", None)  # absent when comm_fusion is off
         if not enabled:
@@ -105,60 +108,20 @@ def _assert_comm_fusion_state(net, enabled):
         assert found_fused_group, "expected at least one fused param_group when comm_fusion=True"
 
 
-def _tensor_storage_info(tensor):
-    """Return raw storage pointer and byte size for a MindSpore tensor."""
-    storage = tensor.untyped_storage()
-    return storage.data_ptr(), storage.size()
-
-
-def _assert_comm_fusion_flat_buffer_memory(net, optimizer):
-    """Verify comm_fusion keeps each sharded parameter storage in its flat buffer."""
+def _assert_comm_fusion_copy_fallback(net):
+    """Verify MindSpore disables zero-copy and does not allocate a flat parameter buffer."""
     modules = [net, net.dense_relu_sequential[0], net.dense_relu_sequential[2], net.dense_relu_sequential[4]]
-    optimizer_param_ids = {id(param) for param in optimizer.parameters}
-    found_flat_buffer = False
-
-    ms.runtime.synchronize()
-    allocated = ms.runtime.memory_allocated()
+    found_param_group = False
     for mod in modules:
         state = mod.hsdp_scheduler.hsdp_state
         param_group = getattr(state, "param_group", None)
         if param_group is None or not state.hsdp_params:
             continue
-        flat_buffer = param_group._flat_param_buffer  # pylint: disable=protected-access
-        if flat_buffer is None:
-            continue
+        found_param_group = True
+        assert param_group.enable_zero_copy is False, "MindSpore must fall back to the all-gather copy-in path"
+        assert not hasattr(param_group, "_flat_param_buffer"), "MindSpore must not create a flat parameter buffer"
 
-        found_flat_buffer = True
-        flat_ptr, flat_nbytes = _tensor_storage_info(flat_buffer)
-        unique_storage_nbytes = {flat_ptr: flat_nbytes}
-        non_flat_storages = []
-        for hsdp_param in state.hsdp_params:
-            param_fqn = getattr(hsdp_param, "_param_fqn", "<unknown>")
-            if id(hsdp_param.sharded_param) not in optimizer_param_ids:
-                raise AssertionError(f"Optimizer does not hold managed parameter {param_fqn}.")
-
-            local_tensor = hsdp_param.sharded_param._local_tensor  # pylint: disable=protected-access
-            checked_tensors = (
-                ("_sharded_param_data", hsdp_param._sharded_param_data),  # pylint: disable=protected-access
-                ("sharded_param._local_tensor", local_tensor),
-                ("sharded_param", hsdp_param.sharded_param),
-            )
-            for label, tensor in checked_tensors:
-                storage_ptr, storage_nbytes = _tensor_storage_info(tensor)
-                unique_storage_nbytes[storage_ptr] = storage_nbytes
-                if storage_ptr != flat_ptr:
-                    non_flat_storages.append((param_fqn, label, storage_ptr, storage_nbytes))
-
-        param_storage_nbytes = sum(unique_storage_nbytes.values())
-        if non_flat_storages or param_storage_nbytes != flat_nbytes:
-            raise AssertionError(
-                "MindSpore comm_fusion zero-copy should leave managed sharded parameter storage backed only by "
-                f"flat_param_buffer after fully_shard. memory_allocated={allocated}, "
-                f"flat_param_buffer_nbytes={flat_nbytes}, managed_param_storage_nbytes={param_storage_nbytes}, "
-                f"unique_storage_nbytes={unique_storage_nbytes}, non_flat_storages={non_flat_storages}."
-            )
-
-    assert found_flat_buffer, "expected at least one flat_param_buffer when comm_fusion=True"
+    assert found_param_group, "expected at least one fused param_group when comm_fusion=True"
 
 
 def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion, comm_fusion_zero_copy=None):
@@ -192,8 +155,8 @@ def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion, comm_fus
     return net
 
 
-def _assert_comm_fusion_zero_copy_lazy_init_memory(state_dict, mesh, rank_slice):
-    """Exercise MindSpore comm_fusion zero-copy lazy init and assert flat-buffer storage ownership."""
+def _assert_comm_fusion_zero_copy_falls_back_to_copy_in(state_dict, mesh, rank_slice):
+    """Exercise a zero-copy request and verify MindSpore uses all-gather copy-in."""
     zero_copy_net = _build_fully_shard_net(
         state_dict,
         mesh,
@@ -201,10 +164,15 @@ def _assert_comm_fusion_zero_copy_lazy_init_memory(state_dict, mesh, rank_slice)
         comm_fusion=True,
         comm_fusion_zero_copy=True,
     )
-    zero_copy_optimizer = nn.SGD(zero_copy_net.trainable_params(), learning_rate=_LR)
+    _assert_comm_fusion_copy_fallback(zero_copy_net)
     images, labels = _step_batch(0, get_group_size())
-    _fully_shard_backward(zero_copy_net, images[rank_slice], labels[rank_slice])
-    _assert_comm_fusion_flat_buffer_memory(zero_copy_net, zero_copy_optimizer)
+    with patch.object(
+        param_group_module,
+        "all_gather_copy_in",
+        wraps=param_group_module.all_gather_copy_in,
+    ) as mock_copy_in:
+        _fully_shard_backward(zero_copy_net, images[rank_slice], labels[rank_slice])
+    assert mock_copy_in.call_count > 0, "MindSpore fused all-gather did not use the copy-in path"
     zero_copy_net.zero_grad()
 
 
@@ -271,7 +239,7 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
     local_bs = _GLOBAL_BS // world_size
     rank_slice = slice(rank * local_bs, (rank + 1) * local_bs)
     if comm_fusion and not hsdp and not recompute:
-        _assert_comm_fusion_zero_copy_lazy_init_memory(state_dict, mesh, rank_slice)
+        _assert_comm_fusion_zero_copy_falls_back_to_copy_in(state_dict, mesh, rank_slice)
 
     for step in range(_NUM_STEPS):
         images, labels = _step_batch(step, world_size)

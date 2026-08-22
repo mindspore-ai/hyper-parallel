@@ -42,7 +42,6 @@ from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, MixedPrecisionPo
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 from hyper_parallel.platform.mindspore.fully_shard import _version_utils
 from hyper_parallel.platform.mindspore.fully_shard import param as fsdp_param_module
-from hyper_parallel.platform.mindspore.fully_shard import state as fsdp_state_module
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
 from hyper_parallel.platform.mindspore.fully_shard.param_group import AllReduceParamGroup
 
@@ -73,7 +72,6 @@ class _BackwardPerfStats:
     rs_with_output_buffer: int
     rs_output_buffer_copy_path: int
     copy_without_bump_calls: int
-    direct_compat_ar: int
     fused_ar_issues: int
 
 
@@ -180,13 +178,11 @@ def _instrument_overlap_paths():
         "rs_with_output_buffer": 0,
         "rs_output_buffer_copy_path": 0,
         "copy_without_bump_calls": 0,
-        "direct_compat_ar": 0,
         "fused_ar_issues": 0,
     }
     orig_copy = _version_utils.copy_without_bumping_version
     orig_param_copy = fsdp_param_module.copy_without_bumping_version
     orig_rs = MindSporeHSDPParamV2.reduce_scatter_grad
-    orig_direct = fsdp_state_module.MindSporeHSDPStateV2._queue_direct_compat_all_reduce
     orig_fused_ar = AllReduceParamGroup.issue_async_allreduce
 
     def counting_copy(dst, src) -> None:
@@ -201,10 +197,6 @@ def _instrument_overlap_paths():
                 counter["rs_output_buffer_copy_path"] += 1
         return orig_rs(self, *args, **kwargs)
 
-    def wrapping_direct(state_self, hsdp_param) -> None:
-        counter["direct_compat_ar"] += 1
-        return orig_direct(state_self, hsdp_param)
-
     def wrapping_fused_ar(group_self) -> None:
         counter["fused_ar_issues"] += 1
         return orig_fused_ar(group_self)
@@ -214,7 +206,6 @@ def _instrument_overlap_paths():
     _version_utils.copy_without_bumping_version = counting_copy
     fsdp_param_module.copy_without_bumping_version = counting_copy
     MindSporeHSDPParamV2.reduce_scatter_grad = wrapping_rs
-    fsdp_state_module.MindSporeHSDPStateV2._queue_direct_compat_all_reduce = wrapping_direct
     AllReduceParamGroup.issue_async_allreduce = wrapping_fused_ar
     try:
         yield counter
@@ -222,7 +213,6 @@ def _instrument_overlap_paths():
         _version_utils.copy_without_bumping_version = orig_copy
         fsdp_param_module.copy_without_bumping_version = orig_param_copy
         MindSporeHSDPParamV2.reduce_scatter_grad = orig_rs
-        fsdp_state_module.MindSporeHSDPStateV2._queue_direct_compat_all_reduce = orig_direct
         AllReduceParamGroup.issue_async_allreduce = orig_fused_ar
 
 
@@ -279,7 +269,6 @@ def _measure_plain_hsdp(model: _StackedMLP) -> _BackwardPerfStats:
         rs_with_output_buffer=counter["rs_with_output_buffer"],
         rs_output_buffer_copy_path=counter["rs_output_buffer_copy_path"],
         copy_without_bump_calls=counter["copy_without_bump_calls"],
-        direct_compat_ar=counter["direct_compat_ar"],
         fused_ar_issues=counter["fused_ar_issues"],
     )
     _validate_overlap_counters(stats)
@@ -371,7 +360,6 @@ def _measure_tp_fsdp_bundle(
         rs_with_output_buffer=counter["rs_with_output_buffer"],
         rs_output_buffer_copy_path=counter["rs_output_buffer_copy_path"],
         copy_without_bump_calls=counter["copy_without_bump_calls"],
-        direct_compat_ar=counter["direct_compat_ar"],
         fused_ar_issues=counter["fused_ar_issues"],
     )
     _validate_overlap_counters(stats)
@@ -394,7 +382,6 @@ def _print_stats(label: str, stats: _BackwardPerfStats) -> None:
         f"rs_with_output_buffer={stats.rs_with_output_buffer} "
         f"rs_output_buffer_copy_path={stats.rs_output_buffer_copy_path} "
         f"copy_without_bump_calls={stats.copy_without_bump_calls} "
-        f"direct_compat_ar={stats.direct_compat_ar} "
         f"fused_ar_issues={stats.fused_ar_issues}"
     )
 
@@ -557,6 +544,5 @@ def test_ms_hsdp_tp_vs_pure_hsdp_backward_perf():
         print(
             "ms HSDP+TP vs pure HSDP backward perf passed: "
             f"slowdown={slowdown:.2f}x "
-            f"output_buffer_copy_path={composite_stats.rs_output_buffer_copy_path} "
-            f"direct_compat_ar={composite_stats.direct_compat_ar}"
+            f"output_buffer_copy_path={composite_stats.rs_output_buffer_copy_path}"
         )

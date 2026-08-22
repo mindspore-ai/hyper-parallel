@@ -121,13 +121,21 @@ class TestRaggedDTensor(unittest.TestCase):
         self.assertEqual(tuple(result.local_shape), (0,))
         self.assertEqual(tuple(result.shape), (0,))
 
-    def test_from_local_rejects_non_flat_or_wrong_size_storage(self):
-        """Reject local tensors that violate the phase-one flat storage contract."""
+    def test_from_local_flattens_natural_shape_and_rejects_invalid_storage(self):
+        """Accept a natural local shape while preserving the flat internal contract."""
         mesh = self._mesh()
         ragged = RaggedShard(dims=(0, 1), local_units=(1, 2))
 
-        with self.assertRaisesRegex(ValueError, "one-dimensional flat storage"):
-            DTensor.from_local(torch.ones(8, 8), mesh, (ragged,), shape=(6, 4, 8))
+        local = torch.arange(64).view(8, 8)
+        result = DTensor.from_local(local, mesh, (ragged,), shape=(6, 4, 8))
+
+        self.assertEqual(tuple(result.local_shape), (64,))
+        self.assertEqual(
+            result.to_local().untyped_storage().data_ptr(),
+            local.untyped_storage().data_ptr(),
+        )
+        with self.assertRaisesRegex(ValueError, "must be contiguous"):
+            DTensor.from_local(local.t(), mesh, (ragged,), shape=(6, 4, 8))
         with self.assertRaisesRegex(ValueError, "numel does not match"):
             DTensor.from_local(torch.ones(63), mesh, (ragged,), shape=(6, 4, 8))
 
@@ -235,6 +243,73 @@ class TestRaggedDTensor(unittest.TestCase):
         self.assertTrue(torch.equal(result.to_local(), expected))
         result.to_local().sum().backward()
         self.assertIsNotNone(local.grad)
+
+    def test_ragged_dtensor_supports_parameter_autograd_metadata(self):
+        """Ragged DTensors should support Parameter wrapping and local hooks."""
+        mesh = self._mesh()
+        source = DTensor.from_local(
+            torch.arange(64, dtype=torch.float32),
+            mesh,
+            (RaggedShard(dims=(0, 1), local_units=(1, 2)),),
+            shape=(6, 4, 8),
+        )
+
+        parameter = torch.nn.Parameter(source)
+        hook = parameter.register_hook(lambda grad: grad)
+
+        self.assertTrue(parameter.requires_grad)
+        self.assertIsNotNone(parameter._local_tensor._backward_hooks)
+        self.assertIs(parameter._backward_hooks, parameter._local_tensor._backward_hooks)
+        hook.remove()
+
+    def test_empty_like_materializes_local_shard_and_preserves_ragged_layout(self):
+        """Materialize a Ragged meta shard locally without changing its logical layout."""
+        mesh = self._mesh()
+        source = DTensor.from_local(
+            torch.empty(64, device="meta"),
+            mesh,
+            (RaggedShard(dims=(0, 1), local_units=(1, 2)),),
+            shape=(6, 4, 8),
+        )
+
+        result = torch.empty_like(source, device="cpu")
+
+        self.assertEqual(tuple(result.shape), (6, 4, 8))
+        self.assertEqual(tuple(result.local_shape), (64,))
+        self.assertEqual(tuple(result.placements), tuple(source.placements))
+        self.assertEqual(result.to_local().device.type, "cpu")
+
+        zeros = torch.zeros_like(result)
+        self.assertEqual(tuple(zeros.shape), (6, 4, 8))
+        self.assertEqual(tuple(zeros.local_shape), (64,))
+        self.assertEqual(tuple(zeros.placements), tuple(source.placements))
+        self.assertFalse(torch.is_complex(zeros))
+
+    def test_adam_updates_ragged_parameter_with_flat_local_state(self):
+        """Adam state and in-place updates should preserve the Ragged DTensor wrapper."""
+        mesh = self._mesh()
+        source = DTensor.from_local(
+            torch.arange(64, dtype=torch.float32).view(8, 8),
+            mesh,
+            (RaggedShard(dims=(0, 1), local_units=(1, 2)),),
+            shape=(6, 4, 8),
+        )
+        parameter = torch.nn.Parameter(source)
+        gradient = DTensor.from_local(
+            torch.ones(8, 8),
+            mesh,
+            source.placements,
+            shape=tuple(source.shape),
+        )
+        parameter.grad = gradient
+        optimizer = torch.optim.Adam([parameter], lr=0.01, foreach=False)
+
+        optimizer.step()
+
+        self.assertIsInstance(parameter, DTensor)
+        self.assertEqual(tuple(parameter.local_shape), (64,))
+        self.assertEqual(tuple(optimizer.state[parameter]["exp_avg"].local_shape), (64,))
+        self.assertEqual(tuple(optimizer.state[parameter]["exp_avg_sq"].local_shape), (64,))
 
     def test_elementwise_does_not_prevalidate_misaligned_ragged_inputs(self):
         """Whitelisted elementwise ops do not add a separate Ragged validation layer."""
