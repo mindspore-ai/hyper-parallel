@@ -31,6 +31,7 @@ from hyper_parallel.distributed_data.materializer import (
     MetadataSource,
     OnlineSampleSource,
     RankMaterializer,
+    _pin_memory_batch,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
 from hyper_parallel.distributed_data.schema import BatchPlan, DistributedDataStep, RankPayload
@@ -69,6 +70,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         metadata_synchronizer: MetadataSynchronizer,
         payload_distributor: PayloadDistributor,
         prefetch_steps: int = 2,
+        pin_memory: bool = False,
         prepare_payload: Callable[[Any], Any] | None = None,
         online_sample_source: OnlineSampleSource | None = None,
         owner_payload_redistributor: OwnerPayloadRedistributor | None = None,
@@ -83,6 +85,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             raise ValueError("Configure exactly one of metadata_source and online_sample_source.")
         if online_sample_source is not None and owner_payload_redistributor is None:
             raise ValueError("Online metadata requires an owner_payload_redistributor.")
+        if not isinstance(pin_memory, bool):
+            raise ValueError(f"pin_memory must be a boolean, but got {pin_memory!r}.")
         self._topology = topology
         self._metadata_source = metadata_source
         self._online_sample_source = online_sample_source
@@ -100,6 +104,11 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             prefetch_steps,
         )
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hp-data-prefetch")
+        self._pin_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="hp-data-pin")
+            if pin_memory and topology.is_data_owner
+            else None
+        )
         self._prepared_steps: deque[Future[_PreparedOwnerStep | _PreparedOnlineWindow] | None] = deque()
         self._closed = False
 
@@ -124,6 +133,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         prepared = prepared_future.result() if prepared_future is not None else None
         if isinstance(prepared, _PreparedOnlineWindow):
             prepared = self._plan_online_window(prepared)
+            if self._pin_executor is not None:
+                prepared = self._pin_executor.submit(self._pin_owner_step, prepared).result()
         step = self._distribute_step(prepared)
         self._state.mark_delivered(step.plan)
         return step
@@ -158,6 +169,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         if self._closed:
             return
         self._executor.shutdown(wait=True, cancel_futures=True)
+        if self._pin_executor is not None:
+            self._pin_executor.shutdown(wait=True, cancel_futures=True)
         self._prepared_steps.clear()
         self._closed = True
 
@@ -180,7 +193,10 @@ class DistributedDataset(Iterator[DistributedDataStep]):
                     )
                     candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.owner_ranks)
                     plan = self._planner.plan(candidates, step=step, cursor_start=cursor_start)
-                    self._prepared_steps.append(self._executor.submit(self._materialize_plan, plan))
+                    prepared_future = self._executor.submit(self._materialize_plan, plan)
+                    if self._pin_executor is not None:
+                        prepared_future = self._pin_executor.submit(self._pin_materialized_step, prepared_future)
+                    self._prepared_steps.append(prepared_future)
                 else:
                     self._prepared_steps.append(
                         self._executor.submit(self._load_online_window, step, cursor_start, cursor_end)
@@ -222,6 +238,15 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             )
             micro_batches.append(owner_payload)
         return _PreparedOwnerStep(plan, tuple(micro_batches))
+
+    @staticmethod
+    def _pin_owner_step(prepared: _PreparedOwnerStep) -> _PreparedOwnerStep:
+        micro_batches = tuple(_pin_memory_batch(batch) for batch in prepared.micro_batches)
+        return _PreparedOwnerStep(prepared.plan, micro_batches)
+
+    @classmethod
+    def _pin_materialized_step(cls, prepared_future: Future[_PreparedOwnerStep]) -> _PreparedOwnerStep:
+        return cls._pin_owner_step(prepared_future.result())
 
     def _distribute_step(self, prepared: _PreparedOwnerStep | None) -> DistributedDataStep:
         plan = prepared.plan if prepared is not None else None

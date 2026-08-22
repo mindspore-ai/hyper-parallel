@@ -16,12 +16,17 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 from typing import Any, Sequence
 
 from hyper_parallel import distributed_data
 from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
-from hyper_parallel.distributed_data.distributor import LocalPayloadDistributor
+from hyper_parallel.distributed_data.distributor import (
+    LocalMetadataSynchronizer,
+    LocalOwnerPayloadRedistributor,
+    LocalPayloadDistributor,
+)
 from hyper_parallel.distributed_data.materializer import (
     RankMaterializer,
     StridedMetadataSource,
@@ -84,6 +89,12 @@ class TestDistributedDataPublicApi(unittest.TestCase):
                 micro_batch_count=1,
                 owner_payload_transport="object_p2p",
             )
+        with self.assertRaisesRegex(ValueError, "pin_memory must be a boolean"):
+            distributed_data.DistributedDatasetConfig(
+                micro_batch_size=1,
+                micro_batch_count=1,
+                pin_memory=1,
+            )
 
 
 class _PeerMetadataSynchronizer:
@@ -113,7 +124,7 @@ class _PeerMetadataSynchronizer:
 class _RecordingMaterializer:
     """Record which heavyweight entries the current owner actually reads."""
 
-    def __init__(self, dataset: list[str]) -> None:
+    def __init__(self, dataset: list[Any]) -> None:
         """Initialize recording over a small map-style dataset."""
         self._dataset = dataset
         self.data_refs = []
@@ -122,6 +133,23 @@ class _RecordingMaterializer:
         """Record and return one sample payload."""
         self.data_refs.append(metadata.data_ref)
         return self._dataset[metadata.data_ref]
+
+
+class _PinnableValue:
+    """Record the thread used to pin one synthetic tensor leaf."""
+
+    def __init__(self, value: str, thread_names: list[str], *, fail: bool = False) -> None:
+        """Initialize one synthetic tensor-like value."""
+        self.value = value
+        self._thread_names = thread_names
+        self._fail = fail
+
+    def pin_memory(self) -> str:
+        """Return a pinned marker or raise a synthetic allocation error."""
+        self._thread_names.append(threading.current_thread().name)
+        if self._fail:
+            raise RuntimeError("synthetic pin failure")
+        return f"pinned-{self.value}"
 
 
 class _FailMaterializer:
@@ -231,6 +259,55 @@ def _build_loader(prefetch_steps: int = 2):
     return loader, materializer
 
 
+def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool) -> DistributedDataset:
+    topology = DataTopology.from_layout(
+        mesh_shape=(1,),
+        mesh_dim_names=("dp_shard",),
+        rank_list=(0,),
+        global_rank=0,
+    )
+    planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=len(samples), micro_batch_count=1)
+
+    def collate_fn(values: list[Any]) -> dict[str, Any]:
+        """Create a nested batch that exercises recursive pinning."""
+        return {"values": values, "nested": (values[0], ["text"])}
+
+    if online:
+        def metadata_fn(payload: Any, data_ref: int) -> SampleMeta:
+            """Build online metadata for one synthetic raw sample."""
+            del payload
+            return SampleMeta(sample_id=str(data_ref), source_id="source", data_ref=data_ref)
+
+        online_source = StridedOnlineSampleSource(samples, metadata_fn, shard_rank=0, num_shards=1)
+        return DistributedDataset(
+            topology=topology,
+            metadata_source=None,
+            planner=planner,
+            rank_materializer=RankMaterializer(_FailMaterializer(), collate_fn),
+            metadata_synchronizer=LocalMetadataSynchronizer(),
+            payload_distributor=LocalPayloadDistributor(),
+            prefetch_steps=1,
+            pin_memory=pin_memory,
+            online_sample_source=online_source,
+            owner_payload_redistributor=LocalOwnerPayloadRedistributor(),
+        )
+
+    metadata = [
+        SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+        for index in range(len(samples))
+    ]
+    return DistributedDataset(
+        topology=topology,
+        metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
+        planner=planner,
+        rank_materializer=RankMaterializer(_RecordingMaterializer(samples), collate_fn),
+        metadata_synchronizer=LocalMetadataSynchronizer(),
+        payload_distributor=LocalPayloadDistributor(),
+        prefetch_steps=1,
+        pin_memory=pin_memory,
+    )
+
+
 class TestDistributedDataset(unittest.TestCase):
     """Validate owner-only reads, bounded look-ahead, and exact resume."""
 
@@ -304,6 +381,54 @@ class TestDistributedDataset(unittest.TestCase):
                 source_position = planned[0].source_position
                 expected = ("raw-0", "raw-2", "peer-2", "peer-3")[source_position]
                 self.assertEqual(payload.data, (expected,))
+        finally:
+            loader.close()
+
+    def test_pin_memory_uses_dedicated_thread_after_collation(self) -> None:
+        """Both metadata paths should recursively pin collated batches off the consumer thread."""
+        for online in (False, True):
+            with self.subTest(online=online):
+                thread_names: list[str] = []
+                samples = [
+                    _PinnableValue("zero", thread_names),
+                    _PinnableValue("one", thread_names),
+                ]
+                loader = _build_pinning_loader(samples, online=online, pin_memory=True)
+                try:
+                    batch = next(loader).payloads[0].data
+
+                    self.assertEqual(
+                        batch,
+                        {
+                            "values": ["pinned-zero", "pinned-one"],
+                            "nested": ("pinned-zero", ["text"]),
+                        },
+                    )
+                    self.assertTrue(thread_names)
+                    self.assertTrue(all(name.startswith("hp-data-pin") for name in thread_names))
+                finally:
+                    loader.close()
+
+    def test_pin_memory_is_disabled_by_default(self) -> None:
+        """Leaving pinning disabled should preserve collated object identity."""
+        thread_names: list[str] = []
+        samples = [_PinnableValue("zero", thread_names)]
+        loader = _build_pinning_loader(samples, online=False, pin_memory=False)
+        try:
+            batch = next(loader).payloads[0].data
+
+            self.assertIs(batch["values"][0], samples[0])
+            self.assertEqual(thread_names, [])
+        finally:
+            loader.close()
+
+    def test_pin_memory_errors_reach_the_consumer(self) -> None:
+        """Pinning failures should not be swallowed by the background thread."""
+        samples = [_PinnableValue("zero", [], fail=True)]
+        loader = _build_pinning_loader(samples, online=False, pin_memory=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "synthetic pin failure"):
+                next(loader)
         finally:
             loader.close()
 

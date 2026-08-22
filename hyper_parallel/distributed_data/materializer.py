@@ -166,6 +166,18 @@ def _identity_collate(samples: list[Any]) -> list[Any]:
     return samples
 
 
+def _pin_memory_batch(batch: Any) -> Any:
+    """Recursively copy tensor-like batch leaves into pinned Host memory."""
+    if isinstance(batch, dict):
+        return {key: _pin_memory_batch(value) for key, value in batch.items()}
+    if isinstance(batch, list):
+        return [_pin_memory_batch(value) for value in batch]
+    if isinstance(batch, tuple):
+        return tuple(_pin_memory_batch(value) for value in batch)
+    pin_memory = getattr(batch, "pin_memory", None)
+    return pin_memory() if callable(pin_memory) else batch
+
+
 class RankMaterializer:
     """Materialize and collate one planned data-rank microbatch."""
 

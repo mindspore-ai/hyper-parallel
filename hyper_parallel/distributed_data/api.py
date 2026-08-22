@@ -53,7 +53,8 @@ class DistributedDatasetConfig:
 
     ``packed_bytes_a2a`` accepts nested byte records and JSON scalar values.
     ``direct_tensor_a2a`` requires every owner sample to be one tensor with a
-    globally identical shape and dtype.
+    globally identical shape and dtype. ``pin_memory`` copies collated Host
+    tensor leaves into pinned memory on a dedicated data-owner thread.
     """
 
     micro_batch_size: int
@@ -62,12 +63,15 @@ class DistributedDatasetConfig:
     owner_payload_transport: str = "packed_bytes_a2a"
     dp_dim_names: tuple[str, ...] | None = None
     cp_shards: tuple[TensorShardSpec, ...] = ()
+    pin_memory: bool = False
 
     def __post_init__(self) -> None:
         for name in ("micro_batch_size", "micro_batch_count", "prefetch_steps"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
+        if not isinstance(self.pin_memory, bool):
+            raise ValueError(f"pin_memory must be a boolean, but got {self.pin_memory!r}.")
         if self.owner_payload_transport not in _OWNER_PAYLOAD_TRANSPORTS:
             raise ValueError(
                 f"owner_payload_transport must be one of {_OWNER_PAYLOAD_TRANSPORTS}, "
@@ -197,6 +201,7 @@ def build_distributed_dataset(
         metadata_synchronizer=metadata_synchronizer,
         payload_distributor=payload_distributor,
         prefetch_steps=config.prefetch_steps,
+        pin_memory=config.pin_memory,
         prepare_payload=prepare_payload,
         online_sample_source=online_sample_source,
         owner_payload_redistributor=owner_payload_redistributor,
