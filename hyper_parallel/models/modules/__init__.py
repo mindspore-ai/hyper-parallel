@@ -17,6 +17,8 @@
 __all__ = [
     "GroupQueryAttention",
     "GatedDeltaNet",
+    "KimiDeltaAttention",
+    "KimiRMSNormGated",
     "SwiGLUMLP",
     "MoE",
     "MoEExperts",
@@ -33,6 +35,10 @@ __all__ = [
 from hyper_parallel.models.modules.attention import GroupQueryAttention
 from hyper_parallel.models.modules.feed_forward import SwiGLUMLP
 from hyper_parallel.models.modules.linear_attention import GatedDeltaNet
+from hyper_parallel.models.modules.kimi_delta_attention import (
+    KimiDeltaAttention,
+    KimiRMSNormGated,
+)
 from hyper_parallel.models.modules.moe import MoE, MoEExperts, SharedExpertMoE, TopKRouter
 from hyper_parallel.models.modules.rmsnorm import RMSNorm, RMSNormGated
 from hyper_parallel.models.modules.rope import (

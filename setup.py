@@ -223,6 +223,11 @@ if __name__ == '__main__':
         package_data={
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
             'hyper_parallel.platform.torch.custom_ops.gdn': ['LICENSE'],
+            'hyper_parallel.platform.torch.custom_ops.kda': [
+                'LICENSE',
+                'LICENSE-LIGER-BSD-2-CLAUSE',
+                'THIRD_PARTY_NOTICES.md',
+            ],
             'hyper_parallel.platform.mindspore.custom_ops': ['lib/*.so', 'lib/*_auto_generate/*.py'],
             'hyper_parallel.core.multicore': ['lib/**/*'],
             'hyper_parallel.core.symmetric_memory': ['lib/**/*'],
