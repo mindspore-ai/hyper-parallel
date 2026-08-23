@@ -14,9 +14,9 @@
 # ============================================================================
 """Omni dataset selection and composition."""
 
+from collections.abc import Callable
 from typing import Any, Literal
 
-from hyper_models.components.datasets.contracts import SampleTransform
 from hyper_models.components.datasets.omni.offline_dataset import build_offline_dataset
 from hyper_models.components.datasets.omni.online_dataset import build_online_dataset
 
@@ -27,7 +27,7 @@ def build_omni_dataset(
         source_type: OmniSourceType,
         *,
         data_path: str,
-        transform: SampleTransform | None = None,
+        transform: Callable[[Any], Any] | None = None,
         **dataset_options: Any,
 ) -> Any:
     """Build an Omni dataset from an online or offline source."""
@@ -44,6 +44,3 @@ def build_omni_dataset(
             **dataset_options,
         )
     raise ValueError(f"Unsupported Omni source type: {source_type!r}")
-
-
-__all__ = ["build_omni_dataset"]

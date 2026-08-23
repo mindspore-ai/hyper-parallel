@@ -139,7 +139,7 @@ class OfflinePreparationConfig:
         return self.download_root() / file_name
 
     def resolved_output_prefix(self) -> Path:
-        """Resolve the Megatron output file prefix.
+        """Resolve the indexed dataset output prefix.
 
         Returns:
             Output prefix without the ``.bin/.idx`` suffixes.
@@ -177,6 +177,3 @@ class OfflinePreparationConfig:
             max_documents=self.max_documents,
             log_interval=self.log_interval,
         )
-
-
-__all__ = ["OfflinePreparationConfig"]

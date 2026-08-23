@@ -41,7 +41,7 @@ except ImportError:
     PunktLanguageVars = object
     NLTK_AVAILABLE = False
 
-# Use Megatron-compatible indexed datasets for the generated ``.bin/.idx`` files.
+# Store generated samples in the indexed ``.bin/.idx`` format.
 if __package__:
     from . import indexed_dataset
 else:
@@ -108,8 +108,8 @@ def append_eod(args: argparse.Namespace, tokenizer: Any) -> int | None:
         return None
     eod_id = getattr(tokenizer, "eos_token_id", None)
     if eod_id is None:
-        # Megatron's Hugging Face wrapper only treats EOS as EOD. This SEP fallback
-        # additionally supports BERT-family tokenizers that do not define EOS.
+        # Prefer EOS as the document boundary and fall back to SEP for tokenizers
+        # that do not define an EOS token.
         eod_id = getattr(tokenizer, "sep_token_id", None)
     if eod_id is None:
         raise ValueError(
@@ -430,7 +430,7 @@ def get_args() -> argparse.Namespace:
         help="Pack documents into fixed samples of this sequence length plus one target token.",
     )
 
-    # Distributed partitioning options.
+    # Configure dataset partitioning and preprocessing workers.
     group.add_argument(
         "--keep-sequential-samples",
         action="store_true",

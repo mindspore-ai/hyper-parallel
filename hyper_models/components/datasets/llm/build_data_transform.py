@@ -12,37 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build LLM plaintext, conversation, and pretokenized data transforms."""
+"""Build LLM plaintext and conversation data transforms."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal
 
 import torch
 
-from hyper_models.components.datasets.contracts import ModelSample, RawSample, SampleTransform
 from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 
-LLMDataType = Literal["plaintext", "conversation", "pretokenized"]
-TextKeys: TypeAlias = str | Sequence[str]
+LLMDataType = Literal["plaintext", "conversation"]
 logger = get_dataset_logger(__name__)
 
 
-def _get_record_value(sample: Mapping[str, Any], keys: TextKeys) -> Any:
-    """Read the text field named by one key or the first matching candidate key.
-
-    Args:
-        sample: Raw source record.
-        keys: One field name or an ordered list of candidate field names.
-
-    Returns:
-        The value of the resolved text field.
-
-    Raises:
-        ValueError: If none of the configured fields exist in the sample.
-    """
+def _get_record_value(sample: Mapping[str, Any], keys: str | Sequence[str]) -> Any:
     if isinstance(keys, str):
         try:
             return sample[keys]
@@ -78,7 +64,7 @@ class PlaintextTransform:
 
     tokenizer: Any
     max_seq_len: int
-    text_keys: TextKeys = "text"
+    text_keys: str | Sequence[str] = "text"
 
     def __post_init__(self) -> None:
         """Validate the tokenizer and sequence length configuration."""
@@ -87,7 +73,7 @@ class PlaintextTransform:
         if self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive")
 
-    def __call__(self, sample: RawSample) -> list[dict[str, Any]]:
+    def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Tokenize and chunk one plaintext record."""
         text = _get_record_value(sample, self.text_keys)
         token_ids = self.tokenizer.encode(text, add_special_tokens=False)
@@ -100,7 +86,6 @@ class PlaintextTransform:
             input_ids = torch.tensor(token_ids[start:start + self.max_seq_len], dtype=torch.long)
             model_sample = {
                 "input_ids": input_ids,
-                "attention_mask": torch.ones_like(input_ids),
                 "labels": input_ids.clone(),
             }
             transformed.append(model_sample)
@@ -108,12 +93,12 @@ class PlaintextTransform:
 
 
 @dataclass
-class ConversationTransform:
+class TextConversationTransform:
     """Encode conversation records with a configured chat template."""
 
     chat_template: Any
     max_seq_len: int
-    text_keys: TextKeys = "conversation"
+    text_keys: str | Sequence[str] = "conversation"
 
     def __post_init__(self) -> None:
         """Validate the chat template and sequence length configuration."""
@@ -122,102 +107,23 @@ class ConversationTransform:
         if self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive")
 
-    def __call__(self, sample: RawSample) -> list[dict[str, Any]]:
+    def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Encode one conversation record."""
         messages = _get_record_value(sample, self.text_keys)
         encoded = self.chat_template.encode_messages(messages, max_seq_len=self.max_seq_len)
-        model_sample = {field: torch.as_tensor(value) for field, value in encoded.items()}
+        model_sample = {
+            "input_ids": torch.as_tensor(encoded["input_ids"], dtype=torch.long),
+            "labels": torch.as_tensor(encoded["labels"], dtype=torch.long),
+        }
         return [model_sample]
 
 
-@dataclass
-class PretokenizedTransform:
-    """Normalize indexed GPT records with pre-shifted labels and optional runtime mask fields."""
-
-    max_seq_len: int | None = None
-
-    def __post_init__(self) -> None:
-        """Validate the optional sequence length limit."""
-        if self.max_seq_len is not None and self.max_seq_len <= 0:
-            raise ValueError("max_seq_len must be positive or None")
-
-    def __call__(self, sample: RawSample) -> ModelSample:
-        """Convert one pretokenized indexed record into one model sample.
-
-        Args:
-            sample: Record containing ``tokens`` or ``input_ids`` and shifted ``labels``.
-
-        Returns:
-            The normalized model sample without reconstructing optional fields.
-
-        Raises:
-            ValueError: If fields are missing, shapes are inconsistent, or the sequence is too long.
-        """
-        normalized = dict(sample)
-        if "input_ids" not in normalized:
-            if "tokens" not in normalized:
-                raise ValueError("Pretokenized samples must contain 'input_ids' or 'tokens'")
-            normalized["input_ids"] = normalized.pop("tokens")
-
-        required_fields = ("input_ids", "labels")
-        missing_fields = [field for field in required_fields if field not in normalized]
-        if missing_fields:
-            raise ValueError(f"Pretokenized samples must contain fields: {missing_fields!r}")
-
-        field_dtypes = {
-            "input_ids": torch.long,
-            "labels": torch.long,
-            "loss_mask": torch.float,
-            "position_ids": torch.long,
-            "text_position_ids": torch.long,
-        }
-        for field, dtype in field_dtypes.items():
-            if field in normalized:
-                normalized[field] = torch.as_tensor(normalized[field], dtype=dtype)
-
-        # Temporarily truncate pre-cut records so short-sequence debug models can consume them.
-        input_ids = normalized["input_ids"]
-        if input_ids.ndim != 1:
-            raise ValueError(f"Pretokenized field 'input_ids' must be one-dimensional, got {input_ids.shape}")
-        sequence_length = input_ids.shape[0]
-        if self.max_seq_len is not None and sequence_length > self.max_seq_len:
-            for field in ("input_ids", "labels", "loss_mask", "position_ids", "text_position_ids"):
-                if field in normalized:
-                    normalized[field] = normalized[field][:self.max_seq_len]
-            if "attention_mask" in normalized:
-                normalized["attention_mask"] = normalized["attention_mask"][
-                    :, :self.max_seq_len, :self.max_seq_len
-                ]
-            sequence_length = self.max_seq_len
-
-        for field in ("labels", "loss_mask", "position_ids", "text_position_ids"):
-            if field not in normalized:
-                continue
-            value = normalized[field]
-            if value.ndim != 1 or value.shape[0] != sequence_length:
-                raise ValueError(
-                    f"Pretokenized field {field!r} must have shape ({sequence_length},), got {tuple(value.shape)}"
-                )
-
-        # Preserve optional [1, sequence, sequence] causal masks.
-        if "attention_mask" in normalized:
-            attention_mask = torch.as_tensor(normalized["attention_mask"], dtype=torch.bool)
-            expected_shape = (1, sequence_length, sequence_length)
-            if tuple(attention_mask.shape) != expected_shape:
-                raise ValueError(
-                    f"Pretokenized field 'attention_mask' must have shape {expected_shape}, "
-                    f"got {tuple(attention_mask.shape)}"
-                )
-            normalized["attention_mask"] = attention_mask
-        return normalized
-
-
 def build_llm_data_transform(data_type: LLMDataType, *, tokenizer: Any = None, chat_template: Any = None,
-                             max_seq_len: int, text_keys: TextKeys = "text") -> SampleTransform:
+                             max_seq_len: int, text_keys: str | Sequence[str] = "text") -> Callable[[Any], Any]:
     """Build the transform selected by the LLM data type.
 
     Args:
-        data_type: Plaintext, conversation, or pretokenized input format.
+        data_type: Plaintext or conversation input format.
         tokenizer: Tokenizer used by plaintext transforms.
         chat_template: Chat template used by conversation transforms.
         max_seq_len: Maximum model sequence length.
@@ -232,13 +138,8 @@ def build_llm_data_transform(data_type: LLMDataType, *, tokenizer: Any = None, c
     if data_type == "plaintext":
         data_transform = PlaintextTransform(tokenizer, max_seq_len, text_keys)
     elif data_type == "conversation":
-        data_transform = ConversationTransform(chat_template, max_seq_len, text_keys)
-    elif data_type == "pretokenized":
-        data_transform = PretokenizedTransform(max_seq_len=max_seq_len)
+        data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys)
     else:
         raise ValueError(f"Unsupported LLM data type: {data_type!r}")
     logger.debug("Built LLM data transform: data_type=%s, transform=%s", data_type, type(data_transform).__name__)
     return data_transform
-
-
-__all__ = ["build_llm_data_transform"]

@@ -48,9 +48,9 @@ from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
-from ..components.datasets.llm.chat_template import ChatTemplate
-from ..components.datasets.build_dataloader import build_dataloader
 from ..components.datasets import enable_dataset_logging
+from ..components.datasets.batching import build_dataloader
+from ..components.datasets.llm.chat_template import ChatTemplate
 from ..components.distributed.init_utils import get_local_rank_safe, get_global_rank_safe, get_world_size_safe
 from ..components.distributed.infrastructure import (
     create_distributed_setup_from_config,
@@ -441,6 +441,7 @@ class BaseTrainer(Stateful, ABC):
             collate_fn=self.collate_fn,
             mesh_context=self.mesh,
             training_config=self.config.training,
+            max_seq_len=getattr(self.data_transform, "max_seq_len", None),
             default_seed=self.default_seed,
         )
         for split_name, dataloader, batch_sampler in zip(split_names, dataloaders, batch_samplers):
@@ -448,7 +449,7 @@ class BaseTrainer(Stateful, ABC):
             setattr(self, f"{split_name}_batch_sampler", batch_sampler)
 
     def _compute_train_iters(self) -> None:
-        """Resolve the required global training limit into a common rank-local epoch layout."""
+        """Resolve the run limit and the optimizer steps available per Dataset epoch."""
         training_config = self.config.training
         if training_config.train_iters is not None and training_config.train_samples is not None:
             raise ValueError("configure only one of training.train_iters and training.train_samples")
@@ -460,10 +461,22 @@ class BaseTrainer(Stateful, ABC):
         if training_config.train_samples is not None:
             train_iters = training_config.train_samples // training_config.global_batch_size
 
-        train_steps = train_iters
-
         if train_iters <= 0:
             raise ValueError("training configuration must produce at least one train iteration")
+
+        try:
+            micro_batches_per_epoch = len(self.train_dataloader)
+        except TypeError:
+            micro_batches_per_epoch = 0
+
+        if micro_batches_per_epoch:
+            train_steps = micro_batches_per_epoch // self.num_micro_batches
+            if train_steps <= 0:
+                raise ValueError("train DataLoader must provide one complete optimizer step per epoch")
+        else:
+            # Streaming and dynamic DataLoaders define an epoch only when their
+            # source iterator is exhausted.
+            train_steps = train_iters
 
         self.train_iters = train_iters
         self.train_steps = train_steps

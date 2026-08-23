@@ -12,9 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public fixed and dynamic batching interfaces."""
+"""Public Dataset batching and DataLoader interfaces."""
 
-from hyper_models.components.datasets.batching.dynamic import build_dynamic_batching
-from hyper_models.components.datasets.batching.fixed import build_fixed_batching
-
-__all__ = ["build_dynamic_batching", "build_fixed_batching"]
+from hyper_models.components.datasets.batching.attention_runtime import AttentionRuntimeAdapter
+from hyper_models.components.datasets.batching.build_collate_fn import (
+    DataCollator,
+    MainCollator,
+    TextPackingCollator,
+    build_indexed_collate_fn,
+    build_online_text_collate_fn,
+)
+from hyper_models.components.datasets.batching.build_dataloader import (
+    DynamicBatchDataLoader,
+    FixedBatchDataLoader,
+    TextTokenBatcher,
+    build_dataloader,
+    calculate_num_micro_batches,
+)
+from hyper_models.components.datasets.batching.get_batch import ParallelBatch
+from hyper_models.components.datasets.batching.sequence_boundaries import (
+    IndexedBoundaryResolver,
+    OnlineBoundaryResolver,
+)

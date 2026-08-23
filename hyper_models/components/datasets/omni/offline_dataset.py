@@ -14,13 +14,12 @@
 # ============================================================================
 """Omni offline dataset interface."""
 
+from collections.abc import Callable
 from typing import Any, Optional
-
-from hyper_models.components.datasets.contracts import SampleTransform
 
 
 def build_offline_dataset(
-        *, data_path: str, transform: Optional[SampleTransform] = None, **kwargs: Any
+        *, data_path: str, transform: Optional[Callable[[Any], Any]] = None, **kwargs: Any
 ) -> Any:
     """Build an Omni offline dataset."""
     raise NotImplementedError("Omni offline datasets are not implemented")

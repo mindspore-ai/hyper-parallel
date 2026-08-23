@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build pretraining LLM datasets stored in ``.idx/.bin`` files."""
+"""Indexed pretraining LLM datasets stored in ``.idx/.bin`` files."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from hyper_models.components.datasets.llm.indexed_pretrain_dataset import (
     MockGPTDataset,
 )
 from hyper_models.components.datasets.llm.indexed_split_builder import IndexedDatasetSplitBuilder
-from hyper_models.components.datasets.parallel import DatasetParallelContext
+from hyper_models.components.datasets.parallel import DataLoaderParallelContext
 
 DataPath: TypeAlias = str | Sequence[str]
 DatasetSplits: TypeAlias = tuple[Any | None, Any | None, Any | None]
@@ -54,7 +54,7 @@ class IndexedPretrainDatasetBuilder:
             data_path: DataPath,
             data_config: Mapping[str, Any],
             train_valid_test_num_samples: Sequence[int],
-            parallel_context: DatasetParallelContext | None = None,
+            dataloader_context: DataLoaderParallelContext | None = None,
     ) -> None:
         """Store the inputs required by the indexed pretraining build.
 
@@ -63,15 +63,15 @@ class IndexedPretrainDatasetBuilder:
                 omitted when mock data is enabled.
             data_config: Indexed pretraining build options.
             train_valid_test_num_samples: Trainer-derived target sizes.
-            parallel_context: Distributed Dataset construction callbacks.
+            dataloader_context: DataLoader ownership and synchronization policy.
         """
         self.data_path = data_path
         self.data_config = data_config
         self.train_valid_test_num_samples = train_valid_test_num_samples
-        self.parallel_context = parallel_context or DatasetParallelContext(
+        self.dataloader_context = dataloader_context or DataLoaderParallelContext(
             data_index_cache=bool(data_config.get("data_index_cache", False))
         )
-        self.split_builder = IndexedDatasetSplitBuilder(self.parallel_context)
+        self.split_builder = IndexedDatasetSplitBuilder(self.dataloader_context)
 
     def build(self) -> DatasetSplits:
         """Build train, validation, and test indexed datasets.
@@ -89,6 +89,7 @@ class IndexedPretrainDatasetBuilder:
         else:
             if self.data_path is None:
                 raise ValueError("data_path is required when mock_data is false")
+
             data_paths = self._resolve_data_paths()
 
         # Normalize Dataset options. Sample counts remain separate and are
@@ -147,6 +148,7 @@ class IndexedPretrainDatasetBuilder:
             raise NotImplementedError(
                 "is_instruction_dataset=True requires an instruction_dataset_builder"
             )
+
         instruction_split_builder: InstructionSplitBuilder = instruction_builder
 
         data_prefix = config.blend if config.blend is not None else self.data_path
@@ -160,6 +162,7 @@ class IndexedPretrainDatasetBuilder:
         )
         if not isinstance(datasets, Sequence) or len(datasets) != 3:
             raise ValueError("instruction_dataset_builder must return train, validation, and test")
+
         dataset_splits = (datasets[0], datasets[1], datasets[2])
         return dataset_splits
 
@@ -167,6 +170,7 @@ class IndexedPretrainDatasetBuilder:
         """Delegate indexed path discovery to the config build module."""
         if self.data_path is None:
             raise ValueError("data_path is required when mock_data is false")
+
         data_paths = resolve_data_paths(
             self.data_path,
             distributed_walk=bool(self.data_config["distributed_walk"]),
@@ -182,8 +186,10 @@ class IndexedPretrainDatasetBuilder:
         """Select GPT, Mock GPT, or MR GPT Dataset."""
         if config.mock:
             return MockGPTDataset
+
         if config.is_dataset_from_mr:
             return GPTFromMRDataset
+
         return GPTDataset
 
     def _select_split_builder(self, config: GPTDatasetConfig) -> SplitBuilder:
@@ -198,10 +204,12 @@ class IndexedPretrainDatasetBuilder:
 
         if not config.is_dataset_from_mr:
             raise ValueError("simple_blend values other than 'no' require is_dataset_from_mr=True")
+
         if config.simple_blend not in {"inter", "intra"}:
             raise ValueError("simple_blend must be one of 'no', 'inter', or 'intra'; "
                              f"got {config.simple_blend!r}"
                              )
+
         split_builder = partial(self.split_builder.build, blend_mode=config.simple_blend)
         return split_builder
 
@@ -211,7 +219,7 @@ def build_indexed_dataset(
         data_path: DataPath = None,
         data_config: Mapping[str, Any],
         train_valid_test_num_samples: Sequence[int],
-        parallel_context: DatasetParallelContext | None = None,
+        dataloader_context: DataLoaderParallelContext | None = None,
 ) -> DatasetSplits:
     """Build indexed pretraining datasets through the dedicated builder.
 
@@ -220,8 +228,7 @@ def build_indexed_dataset(
             when mock data is enabled.
         data_config: Indexed pretraining build options.
         train_valid_test_num_samples: Trainer-derived target sizes.
-        parallel_context: Distributed Dataset construction callbacks assembled
-            by the Trainer.
+        dataloader_context: DataLoader ownership and synchronization policy.
 
     Returns:
         Train, validation, and test datasets.
@@ -230,7 +237,7 @@ def build_indexed_dataset(
         data_path=data_path,
         data_config=data_config,
         train_valid_test_num_samples=train_valid_test_num_samples,
-        parallel_context=parallel_context,
+        dataloader_context=dataloader_context,
     )
     datasets = builder.build()
     return datasets

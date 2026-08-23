@@ -12,27 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""LLM dataset selection and composition."""
+"""Public Online and Indexed text Dataset builders."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from hyper_models.components.datasets.contracts import SampleTransform
 from hyper_models.components.datasets.dataset_logging import get_dataset_logger
-from hyper_models.components.datasets.llm.build_indexed_dataset import build_indexed_dataset
-from hyper_models.components.datasets.llm.online_dataset import build_online_dataset
+from hyper_models.components.datasets.llm.indexed_dataset import (
+    build_indexed_dataset as _build_indexed_dataset,
+)
+from hyper_models.components.datasets.llm.online_dataset import (
+    build_online_dataset as _build_online_dataset,
+)
 from hyper_models.components.datasets.llm.transform_dataset import apply_llm_data_transform
-from hyper_models.components.datasets.parallel import DatasetParallelContext, create_dataset_parallel_context
+from hyper_models.components.datasets.parallel import (
+    DataLoaderParallelContext,
+    create_dataloader_parallel_context,
+)
 
 logger = get_dataset_logger(__name__)
 
 
-def _get_train_valid_test_num_samples(training_config: Any) -> tuple[int, int, int]:
-    """Calculate indexed dataset sizes."""
+def _build_dataloader_context(
+        mesh_context: Any,
+        data_config: Mapping[str, Any],
+) -> DataLoaderParallelContext | None:
+    """Build DataLoader ownership from the runtime mesh when available."""
+    if mesh_context is None:
+        return None
+
+    dataloader_context = create_dataloader_parallel_context(
+        mesh_context,
+        data_index_cache=bool(data_config.get("data_index_cache", False)),
+        shared_storage=not bool(data_config.get("no_shared_storage", False)),
+    )
+    return dataloader_context
+
+
+def _get_indexed_split_sizes(training_config: Any) -> tuple[int, int, int]:
+    """Calculate Indexed Dataset target sizes from the training plan."""
     if training_config is None:
-        raise ValueError("Offline indexed Datasets require a training configuration")
+        raise ValueError("Indexed Dataset requires a training configuration")
 
     global_batch_size = training_config.global_batch_size
     if training_config.train_iters is not None:
@@ -45,92 +67,104 @@ def _get_train_valid_test_num_samples(training_config: Any) -> tuple[int, int, i
     train_samples = training_config.train_samples or train_iters * global_batch_size
     eval_iters = training_config.eval_iters
     valid_iters = (train_iters // eval_iters + 1) * eval_iters if eval_iters else 0
-    sizes = (train_samples, valid_iters * global_batch_size, eval_iters * global_batch_size)
-    logger.debug("Dataset target sizes: train=%d, validation=%d, test=%d", *sizes)
-    return sizes
+    split_sizes = (train_samples, valid_iters * global_batch_size, eval_iters * global_batch_size)
+    logger.debug("Indexed Dataset target sizes: train=%d, validation=%d, test=%d", *split_sizes)
+    return split_sizes
 
 
-def _build_dataset_parallel_context(
-    mesh_context: Any,
-    data_config: Mapping[str, Any],
-) -> DatasetParallelContext:
-    """Build the dataset parallel context."""
-    return create_dataset_parallel_context(
-        mesh_context,
-        data_index_cache=bool(data_config.get("data_index_cache", False)),
-        shared_storage=not bool(data_config.get("no_shared_storage", False)),
-    )
-
-
-def build_llm_dataset(
-    *,
-    data_config: Mapping[str, Any],
-    data_path: str | Sequence[str] | None = None,
-    transform: SampleTransform | None = None,
-    parallel_context: DatasetParallelContext | None = None,
-    tokenizer: Any = None,
-    train_valid_test_num_samples: Sequence[int] | None = None,
-    mesh_context: Any = None,
-    training_config: Any = None,
+def build_online_text_dataset(
+        *,
+        data_config: Mapping[str, Any],
+        data_path: str | Sequence[str] | None = None,
+        transform: Callable[[Any], Any] | None = None,
+        dataloader_context: DataLoaderParallelContext | None = None,
+        mesh_context: Any = None,
+        training_config: Any = None,
 ) -> Any:
-    """Build and transform an online or offline LLM dataset.
+    """Build an Online source and apply its text transform.
 
     Args:
-        data_config: Source and build options.
-        data_path: Online path or offline indexed-data path.
-        transform: Sample transform.
-        parallel_context: Distributed dataset context.
-        tokenizer: Tokenizer used by offline GPT datasets.
-        train_valid_test_num_samples: Explicit split sizes.
-        mesh_context: Mesh used to build the parallel context.
-        training_config: Training plan used to calculate split sizes.
+        data_config: Online mapping or iterable source options.
+        data_path: Optional local source path or ordered paths.
+        transform: Plaintext or conversation sample transform.
+        dataloader_context: Optional explicit DataLoader ownership context.
+        mesh_context: Runtime mesh used to derive DataLoader ownership.
+        training_config: Training plan providing the random seed.
 
     Returns:
-        A dataset or a train/validation/test tuple.
+        A transformed Online Dataset on each DataLoader-owning rank.
 
     Raises:
-        ValueError: If the source configuration is invalid.
+        ValueError: If no Online text transform is configured.
     """
-    try:
-        source_type = data_config["source_type"]
-    except KeyError as error:
-        raise ValueError("data_config must contain 'source_type'") from error
+    if transform is None:
+        raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
+    if dataloader_context is None:
+        dataloader_context = _build_dataloader_context(mesh_context, dataset_config)
 
-    if parallel_context is None and mesh_context is not None:
-        parallel_context = _build_dataset_parallel_context(mesh_context, dataset_config)
-
-    logger.debug("Building LLM Dataset: source_type=%s, data_path=%s", source_type, data_path)
-    if source_type == "offline":
-        if data_path is None and not bool(dataset_config.get("mock_data", False)):
-            raise ValueError("Offline LLM Datasets require data_path")
-
-        if train_valid_test_num_samples is None:
-            train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
-
-        indexed_data_config = dict(dataset_config)
-        if tokenizer is not None:
-            indexed_data_config["tokenizer"] = tokenizer
-        raw_dataset = build_indexed_dataset(
-            data_path=data_path,
-            data_config=indexed_data_config,
-            train_valid_test_num_samples=train_valid_test_num_samples,
-            parallel_context=parallel_context,
-        )
-    elif source_type == "online":
-        raw_dataset = build_online_dataset(
-            data_path=data_path,
-            data_config=dataset_config,
-            parallel_context=parallel_context,
-        )
-    else:
-        raise ValueError(f"Unsupported LLM source type: {source_type!r}")
-    dataset = apply_llm_data_transform(raw_dataset, transform, skip_invalid_samples=source_type == "online")
-    logger.debug("Built LLM Dataset: source_type=%s, result_type=%s", source_type, type(dataset).__name__)
-    return dataset
+    online_dataset = _build_online_dataset(
+        data_path=data_path,
+        data_config=dataset_config,
+        dataloader_context=dataloader_context,
+    )
+    transformed_dataset = apply_llm_data_transform(
+        online_dataset,
+        transform,
+        skip_invalid_samples=True,
+    )
+    return transformed_dataset
 
 
-__all__ = ["build_llm_dataset"]
+def build_indexed_text_dataset(
+        *,
+        data_config: Mapping[str, Any],
+        data_path: str | Sequence[str] | None = None,
+        tokenizer: Any = None,
+        train_valid_test_num_samples: Sequence[int] | None = None,
+        dataloader_context: DataLoaderParallelContext | None = None,
+        mesh_context: Any = None,
+        training_config: Any = None,
+) -> Any:
+    """Build train, validation, and test Datasets from Indexed token files.
+
+    Args:
+        data_config: Indexed Dataset and split options.
+        data_path: Indexed prefix, directory, or ordered paths.
+        tokenizer: Tokenizer providing vocabulary and EOD metadata.
+        train_valid_test_num_samples: Optional explicit split sizes.
+        dataloader_context: Optional explicit DataLoader ownership context.
+        mesh_context: Runtime mesh used to derive DataLoader ownership.
+        training_config: Training plan used to derive split sizes and seed.
+
+    Returns:
+        Train, validation, and test Indexed Datasets.
+
+    Raises:
+        ValueError: If required path or training information is missing.
+    """
+    dataset_config = dict(data_config)
+    training_seed = getattr(training_config, "seed", None)
+    dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
+    if tokenizer is not None:
+        dataset_config["tokenizer"] = tokenizer
+
+    if data_path is None and not bool(dataset_config.get("mock_data", False)):
+        raise ValueError("Indexed Dataset requires data_path")
+
+    if train_valid_test_num_samples is None:
+        train_valid_test_num_samples = _get_indexed_split_sizes(training_config)
+
+    if dataloader_context is None:
+        dataloader_context = _build_dataloader_context(mesh_context, dataset_config)
+
+    indexed_datasets = _build_indexed_dataset(
+        data_path=data_path,
+        data_config=dataset_config,
+        train_valid_test_num_samples=train_valid_test_num_samples,
+        dataloader_context=dataloader_context,
+    )
+    return indexed_datasets

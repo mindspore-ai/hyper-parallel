@@ -15,25 +15,9 @@
 """Private LLM implementations for the shared dataset build pipeline."""
 
 from hyper_models.components.datasets.llm.build_data_transform import build_llm_data_transform
+from hyper_models.components.datasets.llm.build_dataset import (
+    build_indexed_text_dataset,
+    build_online_text_dataset,
+)
 from hyper_models.components.datasets.llm.build_tokenizer import AutoTokenizer, build_tokenizer
 from hyper_models.components.datasets.llm.chat_template import ChatTemplate, build_chat_template
-from hyper_models.components.datasets.llm.collator import build_llm_collator
-from hyper_models.components.datasets.llm.build_dataset import build_llm_dataset
-from hyper_models.components.datasets.llm.get_batch import (
-    LLMBatchProcessor,
-    LLMGetBatch,
-    build_llm_get_batch,
-)
-
-__all__ = [
-    "AutoTokenizer",
-    "ChatTemplate",
-    "LLMBatchProcessor",
-    "LLMGetBatch",
-    "build_chat_template",
-    "build_llm_collator",
-    "build_llm_data_transform",
-    "build_llm_dataset",
-    "build_llm_get_batch",
-    "build_tokenizer",
-]

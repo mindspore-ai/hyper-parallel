@@ -30,6 +30,3 @@ def build_tokenizer(pretrained_model_name_or_path: str, **kwargs: Any) -> Any:
         The constructed tokenizer.
     """
     return AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-
-__all__ = ["build_tokenizer"]
