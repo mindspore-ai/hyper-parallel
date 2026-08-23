@@ -255,14 +255,3 @@ def build_tokenizer(pretrained_model_name_or_path: str, **kwargs: Any) -> Any:
         The constructed tokenizer.
     """
     return AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-
-__all__ = [
-    "AutoTokenizer",
-    "build_tokenizer",
-]
-
-
-def __dir__():
-    """Limit module autocompletion to the public API."""
-    return sorted(__all__)

@@ -22,16 +22,56 @@
 - `is_dataset_from_mr: true`：输入必须已经离线 packing，每条记录严格包含 `seq_length + 1` 个 token；不足一条记录的
   尾部必须丢弃，数据中不能包含 PAD。tokenizer 如果定义了 PAD，其 ID 必须与 EOD/EOS 不同。
 
-两种模式的 Collator 都配置为：
+两种 Indexed 模式都使用固定样本数组批。Dataset 已经返回固定长度或预先 packing 的样本，DataLoader 只负责按
+`training.micro_batch_size` 选择 N 条样本，`default_collate` 再将各个 `[S]` 字段堆叠为 `[N, S]`：
 
 ```yaml
-collate_fn:
-  _target_: hyper_models.components.datasets.llm.build_llm_collator
-  packing: false
+training:
+  global_batch_size: 8
+  micro_batch_size: 1
+
+dataset:
+  data_config:
+    # loss_mask、position_ids 和 attention_mask 由 get_batch 统一重建。
+    create_ltor_fields_in_dataloader: false
+
+dataloader:
+  # Fixed Indexed：每个 FB step 固定选择 micro_batch_size=N 条样本。
+  _target_: hyper_models.components.datasets.FixedBatchDataLoader
+
+  # Indexed Dataset 已经完成 fixed-length/pre-packed 处理，这里只做字段堆叠。
+  collate_fn:
+    _target_: hyper_models.components.datasets.build_indexed_collate_fn
+
+  # single/cyclic 只控制 Mapping Dataset 的采样顺序，不表示动态组批。
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
 ```
 
-这里的 `packing: false` 表示 Collator 不再次 packing。当前 Collator 的运行时 packing 尚未实现；离线 packing
-由数据转换工具完成，普通 `GPTDataset` 的动态 packing 由 sample index 完成。
+完整的数据流为：
+
+```text
+GPTDataset / GPTFromMRDataset
+  -> N 个固定长度样本（tokens、labels）
+  -> build_indexed_collate_fn（PyTorch default_collate）
+  -> tokens [N, S] / labels [N, S]
+  -> get_batch 将 tokens 规范为 input_ids，并构建运行时字段
+```
+
+`create_ltor_fields_in_dataloader` 默认为 `false`。只有兼容不使用统一 `get_batch` 的旧流程时才显式设为 `true`；
+此时 Dataset 会额外生成并返回 `loss_mask`、`position_ids` 和 `attention_mask`。
+
+Indexed 样本不经过 Online 使用的 text transform。其长度和 packing 已由 `GPTDataset` 或离线数据阶段确定，
+Indexed Dataset 直接返回 `tokens` 和 `labels`；字段规范化统一在 `get_batch` 完成。
+
+这里的 Fixed 表示每个 FB step 的样本数 N 固定。它不会在 Collator 中再次 packing：离线 packing 由数据转换工具
+完成，普通 `GPTDataset` 的样本组成则由 sample index 完成。
 
 ## 2. `.bin/.idx` 保存什么
 
@@ -122,7 +162,7 @@ python -m hyper_models.components.datasets.tools.huggingface_offline \
   --output-prefix /path/to/indexed/train \
   --tokenizer /path/to/tokenizer \
   --workers 8 \
-  --append-eod
+  --append-eod true
 ```
 
 输出 prefix 为：
@@ -131,14 +171,14 @@ python -m hyper_models.components.datasets.tools.huggingface_offline \
 /path/to/indexed/train_text_document
 ```
 
-该命令包含两个关键约定：
+该命令包含三个关键约定：
 
-- 未传 `--pad-to-seq-len`：不在离线阶段 packing 或补齐定长记录，每个非空原始文档独立保存，因此 sequence
+- 未传 `--pack-to-seq-len`：不在离线阶段 packing 或补齐定长记录，每个非空原始文档独立保存，因此 sequence
   长度可以不同。
-- 传入 `--pad-to-seq-len N`：连续 packing 为长度 `N + 1` 的完整记录，输入结束时不足一条记录的尾部直接丢弃，
+- 传入 `--pack-to-seq-len N`：连续 packing 为长度 `N + 1` 的完整记录，输入结束时不足一条记录的尾部直接丢弃，
   不写入 PAD。
-- 传入 `--append-eod`：在每个非空原始文档末尾追加 tokenizer 定义的 EOD/EOS token，用于在连续 token 流中
-  保留文档边界。
+- 传入 `--append-eod true`（默认值）：在每个非空原始文档末尾追加 tokenizer 定义的 EOD/EOS token，用于在连续
+  token 流中保留文档边界。
 
 超过 tokenizer `model_max_length` 的转换 warning 不会截断数据；训练侧稍后按 `seq_length` 重新组成样本。
 
@@ -149,7 +189,6 @@ python -m hyper_models.components.datasets.tools.huggingface_offline \
 ```yaml
 dataset:
   model_assets:
-    datasets_type: pretokenized
     tokenizer:
       _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /path/to/tokenizer
@@ -157,18 +196,17 @@ dataset:
       use_fast: true
       local_files_only: true
 
-  data_transform:
-    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
-    data_type: pretokenized
-    max_seq_len: 2048
-
-  _target_: hyper_models.components.datasets.llm.build_llm_dataset
+  _target_: hyper_models.components.datasets.llm.build_indexed_text_dataset
   data_path: /path/to/indexed/train_text_document
   data_config:
-    source_type: offline
     seq_length: 2048
     split: "1, 0, 0"
     is_dataset_from_mr: false
+
+dataloader:
+  get_batch:
+    _target_: hyper_models.components.datasets.ParallelBatch
+    source_type: indexed
 ```
 
 Non-packed 数据必须使用 `is_dataset_from_mr: false`，由 `GPTDataset` 根据 sample index 动态组成定长训练样本；如果
@@ -262,7 +300,6 @@ i
 ```yaml
 dataset:
   model_assets:
-    datasets_type: pretokenized
     tokenizer:
       _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /path/to/tokenizer-identity
@@ -270,19 +307,18 @@ dataset:
       vocab_size: 32000
       eod_token_id: 2
 
-  data_transform:
-    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
-    data_type: pretokenized
-    max_seq_len: 2048
-
-  _target_: hyper_models.components.datasets.llm.build_llm_dataset
+  _target_: hyper_models.components.datasets.llm.build_indexed_text_dataset
   data_path: /path/to/shards
   data_config:
-    source_type: offline
     seq_length: 2048
     split: "1, 0, 0"
     is_dataset_from_mr: true
     skip_data_check: false
+
+dataloader:
+  get_batch:
+    _target_: hyper_models.components.datasets.ParallelBatch
+    source_type: indexed
 ```
 
 `is_dataset_from_mr: true` 在当前实现中表示使用 `GPTFromMRDataset` 直接读取固定的 `seq_length + 1` 记录。

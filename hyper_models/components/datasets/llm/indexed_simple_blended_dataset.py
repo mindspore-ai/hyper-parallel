@@ -63,6 +63,8 @@ class SimpleBlendedDataset:
                 for sample_id in range(len(dataset))
             ]
             return locations
+
+        # mode = inter
         locations = self._build_interleaved_locations()
         return locations
 

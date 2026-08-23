@@ -659,9 +659,6 @@ def entries_to_plan_overrides(
 class ModelAssetsConfig:
     """Tokenizer and chat-template configuration for text datasets."""
 
-    datasets_type: Literal["plaintext", "conversation", "pretokenized"] = (
-        "pretokenized"
-    )
     chat_template: Optional[Union[str, Target[Any]]] = None
     tokenizer: Optional[Target[Any]] = None
 

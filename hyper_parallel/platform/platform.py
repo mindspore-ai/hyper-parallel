@@ -919,6 +919,23 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement arange")
 
     @staticmethod
+    def ones(size, dtype=None, device=None):
+        """Create a one-filled tensor of the given shape.
+
+        Args:
+            size: Shape of the tensor (a single tuple/list).
+            dtype: Desired data type. ``None`` uses the framework default.
+            device: Target device. ``None`` uses the framework default.
+
+        Returns:
+            One-filled tensor of the specified shape.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError("Platform subclasses must implement ones")
+
+    @staticmethod
     def zeros(size, dtype=None, device=None):
         """Create a zero-filled tensor of the given shape.
 

@@ -16,7 +16,7 @@
 # - NVIDIA NeMo AutoModel
 # - NVIDIA Megatron-LM
 
-"""A self-contained port of Megatron-Core's indexed dataset loader.
+"""Load indexed datasets from paired binary and index files.
 
 Supports the original mmap and file-pointer readers for local *.bin / *.idx
 pairs, plus optional streaming readers for object storage (S3 and MSC).
@@ -679,7 +679,7 @@ OBJECT_STORAGE_BIN_READERS: Dict[str, Type[_BinReader]] = {
 
 
 class IndexedDataset(torch.utils.data.Dataset):
-    """A fast, on-disk dataset backed by Megatron-style index + binary files."""
+    """A fast, on-disk dataset backed by paired index and binary files."""
 
     def __init__(
         self,
@@ -957,12 +957,12 @@ class IndexedDatasetBuilder:
 
 
 def get_idx_path(path_prefix: str) -> str:
-    """Return the index-file path for a Megatron dataset prefix."""
+    """Return the index-file path for an indexed dataset prefix."""
     return path_prefix + ".idx"
 
 
 def get_bin_path(path_prefix: str) -> str:
-    """Return the binary-data path for a Megatron dataset prefix."""
+    """Return the binary-data path for an indexed dataset prefix."""
     return path_prefix + ".bin"
 
 

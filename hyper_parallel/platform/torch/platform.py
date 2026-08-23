@@ -561,18 +561,19 @@ class TorchPlatform(Platform):
         return torch.manual_seed(seed)
 
     @staticmethod
-    def ones(size, dtype=None):
+    def ones(size, dtype=None, device=None):
         """
         Create a tensor filled with ones.
 
         Args:
             size (tuple): The shape of the output tensor.
             dtype (Optional[torch.dtype]): The desired data type.
+            device (Optional[torch.device]): The device to create the tensor on.
 
         Returns:
             Tensor: A tensor filled with ones.
         """
-        return torch.ones(size, dtype=dtype)
+        return torch.ones(size, dtype=dtype, device=device)
 
     @staticmethod
     def zeros(size, dtype=None, device=None):

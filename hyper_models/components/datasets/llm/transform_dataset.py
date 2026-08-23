@@ -12,24 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Common transform Dataset for online and offline LLM sources."""
+"""Lazy plaintext or conversation transforms for Online LLM sources."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, TypeAlias
 
 from torch.utils.data import IterableDataset
 
-from hyper_models.components.datasets.contracts import (
-    ModelSample,
-    SampleTransform,
-    is_iterable_dataset,
-)
 from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.utils.constants import IGNORE_INDEX
 
 logger = get_dataset_logger(__name__)
+ModelSample: TypeAlias = Mapping[str, Any]
+SampleTransform: TypeAlias = Callable[[Any], Any]
+
+
+def _supports_output_index_for_resume(dataset: Any) -> bool:
+    """Return whether a Dataset can emit and rebuild stable output indices."""
+    get_item = getattr(dataset, "get_item", None)
+    return callable(get_item) and hasattr(dataset, "output_index_for_resume")
 
 
 def _has_trainable_labels(model_sample: Mapping[str, Any]) -> bool:
@@ -46,40 +49,26 @@ def _has_trainable_labels(model_sample: Mapping[str, Any]) -> bool:
 def _normalize_transformed_samples(transformed_sample: Any) -> list[ModelSample]:
     """Normalize a transform result without recomputing it."""
     if isinstance(transformed_sample, Mapping):
-        return [dict(transformed_sample)]
+        model_samples = [dict(transformed_sample)]
+        return model_samples
 
     if isinstance(transformed_sample, Sequence) and not isinstance(transformed_sample, (str, bytes)):
         model_samples = []
         for model_sample in transformed_sample:
             if not isinstance(model_sample, Mapping):
                 raise ValueError("Every transformed LLM sample must be a mapping")
+
             model_samples.append(dict(model_sample))
         return model_samples
 
     raise ValueError("An LLM transform must return a mapping or a sequence of mappings")
 
 
-def _transform_sample(raw_sample: Any, transform: SampleTransform | None) -> ModelSample:
-    """Apply the transform and require exactly one model sample per record.
-
-    Args:
-        raw_sample: Source record read from the underlying Dataset.
-        transform: Optional Trainer-built sample transform.
-
-    Returns:
-        The single normalized model sample.
-
-    Raises:
-        ValueError: If the transform produces zero or multiple model samples.
-    """
+def _transform_samples(raw_sample: Any, transform: SampleTransform | None) -> list[ModelSample]:
+    """Transform one source item into its ordered ModelSamples."""
     transformed_sample = transform(raw_sample) if transform is not None else raw_sample
     model_samples = _normalize_transformed_samples(transformed_sample)
-    if len(model_samples) != 1:
-        raise ValueError(
-            "An LLM transform must currently produce exactly one model sample per source record; "
-            "multi-sample expansion requires the deferred packing Dataset stage"
-        )
-    return model_samples[0]
+    return model_samples
 
 
 class _LLMTransformDataset:
@@ -99,14 +88,11 @@ class _LLMTransformDataset:
 
     def __len__(self) -> int:
         """Return the source Dataset length."""
-        return len(self.source_dataset)
+        dataset_length = len(self.source_dataset)
+        return dataset_length
 
-    def __getitem__(self, index: int) -> ModelSample:
-        """Read one RawSample and normalize one transformed ModelSample."""
-        if not self.skip_invalid_samples:
-            raw_sample = self.source_dataset[index]
-            return _transform_sample(raw_sample, self.transform)
-
+    def get_item(self, index: int) -> list[ModelSample]:
+        """Transform one source index into its ordered trainable ModelSamples."""
         dataset_length = len(self.source_dataset)
         if index < 0:
             index += dataset_length
@@ -116,17 +102,24 @@ class _LLMTransformDataset:
         for offset in range(dataset_length):
             source_index = (index + offset) % dataset_length
             raw_sample = self.source_dataset[source_index]
-            transformed_sample = self.transform(raw_sample) if self.transform is not None else raw_sample
-            model_samples = _normalize_transformed_samples(transformed_sample)
+            model_samples = _transform_samples(raw_sample, self.transform)
+            if not self.skip_invalid_samples:
+                return model_samples
             trainable_samples = [sample for sample in model_samples if _has_trainable_labels(sample)]
-            if len(trainable_samples) == 1:
-                return trainable_samples[0]
-            if len(trainable_samples) > 1:
-                raise ValueError(
-                    "An LLM transform must currently produce exactly one trainable model sample per source record; "
-                    "multi-sample expansion requires the deferred packing Dataset stage"
-                )
+            if trainable_samples:
+                return trainable_samples
         raise ValueError("LLM Dataset contains no samples with trainable labels")
+
+    def __getitem__(self, index: int) -> ModelSample:
+        """Return one ModelSample for fixed-size DataLoader consumers."""
+        model_samples = self.get_item(index)
+        if len(model_samples) != 1:
+            raise ValueError(
+                "A multi-sample source item requires DynamicBatchDataLoader"
+            )
+
+        model_sample = model_samples[0]
+        return model_sample
 
 
 class _LLMIterableTransformDataset(IterableDataset):
@@ -144,13 +137,59 @@ class _LLMIterableTransformDataset(IterableDataset):
         self.transform = transform
         self.skip_invalid_samples = skip_invalid_samples
 
+    @property
+    def output_index_for_resume(self) -> bool:
+        """Return whether the upstream source emits an output index with each item."""
+        if not _supports_output_index_for_resume(self.source_dataset):
+            raise AttributeError("The upstream iterable does not support output-index resume")
+
+        return bool(self.source_dataset.output_index_for_resume)
+
+    @output_index_for_resume.setter
+    def output_index_for_resume(self, value: bool) -> None:
+        """Forward output-index mode to a replayable upstream source."""
+        if not _supports_output_index_for_resume(self.source_dataset):
+            raise ValueError("The upstream iterable does not support output-index resume")
+
+        self.source_dataset.output_index_for_resume = value
+
+    def get_item(self, output_index: Any) -> list[ModelSample]:
+        """Rebuild and transform one upstream item from its stable output index."""
+        if not _supports_output_index_for_resume(self.source_dataset):
+            raise AttributeError("The upstream iterable does not support get_item")
+
+        raw_sample = self.source_dataset.get_item(output_index)
+        model_samples = self._prepare_model_samples(raw_sample)
+        return model_samples
+
+    def _prepare_model_samples(self, raw_sample: Any) -> list[ModelSample]:
+        """Transform and filter one upstream item without changing its order."""
+        model_samples = _transform_samples(raw_sample, self.transform)
+        if self.skip_invalid_samples:
+            model_samples = [sample for sample in model_samples if _has_trainable_labels(sample)]
+        return model_samples
+
     def __iter__(self) -> Any:
         """Transform RawSamples lazily while preserving upstream order."""
-        for raw_sample in self.source_dataset:
-            model_sample = _transform_sample(raw_sample, self.transform)
-            if self.skip_invalid_samples and not _has_trainable_labels(model_sample):
+        output_index_enabled = (
+            _supports_output_index_for_resume(self.source_dataset)
+            and bool(self.source_dataset.output_index_for_resume)
+        )
+        for source_item in self.source_dataset:
+            if output_index_enabled:
+                raw_sample, output_index = source_item
+            else:
+                raw_sample = source_item
+
+            model_samples = self._prepare_model_samples(raw_sample)
+            if not model_samples:
                 continue
-            yield model_sample
+            if output_index_enabled:
+                yield model_samples, output_index
+            elif len(model_samples) == 1:
+                yield model_samples[0]
+            else:
+                yield model_samples
 
     def state_dict(self) -> dict[str, Any]:
         """Forward checkpoint state to a stateful upstream stream."""
@@ -164,6 +203,7 @@ class _LLMIterableTransformDataset(IterableDataset):
         state_loader = getattr(self.source_dataset, "load_state_dict", None)
         if not callable(state_loader):
             raise ValueError("Online iterable source does not support load_state_dict")
+
         state_loader(state_dict["source_dataset"])
 
     def set_epoch(self, epoch: int) -> None:
@@ -173,48 +213,12 @@ class _LLMIterableTransformDataset(IterableDataset):
             epoch_setter(epoch)
 
 
-class _OnlineIterableTransform:
-    """Pickleable Hugging Face map callable for one Online RawSample."""
-
-    def __init__(self, transform: SampleTransform | None) -> None:
-        """Store the common LLM transform."""
-        self.transform = transform
-
-    def __call__(self, raw_sample: Any) -> ModelSample:
-        """Convert one streaming RawSample into one ModelSample."""
-        model_sample = _transform_sample(raw_sample, self.transform)
-        return model_sample
-
-
 def _wrap_llm_dataset(
         dataset: Any,
         transform: SampleTransform | None,
         *,
         skip_invalid_samples: bool = False,
 ) -> Any:
-    """Wrap one source Dataset with the appropriate LLM transform wrapper.
-
-    Args:
-        dataset: Map-style or iterable source Dataset.
-        transform: Optional Trainer-built sample transform.
-        skip_invalid_samples: Whether to skip records without trainable labels.
-
-    Returns:
-        The wrapped Dataset applying ``transform`` to each source record.
-
-    Raises:
-        ValueError: If the source Dataset is neither map-style nor iterable.
-    """
-    if (is_iterable_dataset(dataset) and callable(getattr(dataset, "map", None)) and not skip_invalid_samples):
-        transform_callable = _OnlineIterableTransform(transform)
-        column_names = getattr(dataset, "column_names", None)
-        map_options = {}
-        if column_names:
-            map_options["remove_columns"] = column_names
-        transformed_dataset = dataset.map(transform_callable, **map_options)
-        logger.debug("Wrapped map-capable iterable Dataset with transform=%s", type(transform).__name__)
-        return transformed_dataset
-
     if hasattr(dataset, "__getitem__") and hasattr(dataset, "__len__"):
         transformed_dataset = _LLMTransformDataset(
             dataset,
@@ -242,12 +246,11 @@ def apply_llm_data_transform(
         *,
         skip_invalid_samples: bool = False,
 ) -> Any:
-    """Apply the common transform stage to one Dataset or three indexed splits.
+    """Apply the common transform stage to an Online Dataset result.
 
     Args:
-        dataset_result: Online RawSample Dataset or offline indexed splits.
-        transform: Plaintext/conversation transform for Online, or
-            ``PretokenizedTransform`` for Offline.
+        dataset_result: Online RawSample Dataset or split tuple.
+        transform: Plaintext or conversation Online transform.
         skip_invalid_samples: Whether to skip records whose transformed sample
             has no trainable label after causal shifting.
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 
-"""Download a Hugging Face dataset and convert it to Megatron indexed data.
+"""Download a Hugging Face dataset and convert it to indexed binary data.
 
 This module is both importable and runnable as a CLI entry point::
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""VeOmni-style Online mapping Dataset source."""
+"""Online mapping dataset source."""
 
 from __future__ import annotations
 
@@ -21,13 +21,15 @@ from dataclasses import replace
 from typing import Any
 
 from hyper_models.components.distributed.infrastructure import OnlineDatasetBarrier
-from hyper_models.components.datasets.contracts import RawSample
 from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.llm.online_utils import (
     load_online_hf_dataset,
-    normalize_online_parallel_context,
+    normalize_online_dataloader_context,
 )
-from hyper_models.components.datasets.parallel import DatasetParallelContext, build_distributed_dataset
+from hyper_models.components.datasets.parallel import (
+    DataLoaderParallelContext,
+    build_dataset_for_dataloader,
+)
 
 logger = get_dataset_logger(__name__)
 
@@ -43,7 +45,7 @@ class OnlineMappingDataset:
         """Return the finite raw-record count."""
         return len(self.source_dataset)
 
-    def __getitem__(self, index: int) -> RawSample:
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
         """Read and validate one RawSample."""
         raw_sample = self.source_dataset[index]
         if not isinstance(raw_sample, Mapping):
@@ -56,22 +58,22 @@ def build_online_mapping_dataset(
         *,
         data_config: Mapping[str, Any],
         data_path: str | Sequence[str] | None = None,
-        parallel_context: DatasetParallelContext | None = None,
+        dataloader_context: DataLoaderParallelContext | None = None,
 ) -> Any:
     """Build a finite Online Dataset that produces text RawSamples.
 
     Args:
         data_path: Optional local JSON/JSONL/Parquet/CSV/Arrow paths.
-        data_config: Namespace/cache options or ``hf_dataset_name``.
-        parallel_context: Dataset rank ownership and synchronization policy.
+        data_config: Cache options or ``hf_dataset_name``.
+        dataloader_context: DataLoader ownership and synchronization policy.
 
     Returns:
         An Online mapping Dataset on TP rank zero, otherwise ``None``.
     """
-    dataset_context = normalize_online_parallel_context(parallel_context)
-    if dataset_context.distributed_enabled:
-        dataset_context = replace(
-            dataset_context,
+    normalized_context = normalize_online_dataloader_context(dataloader_context)
+    if normalized_context.distributed_enabled:
+        normalized_context = replace(
+            normalized_context,
             barrier=OnlineDatasetBarrier(),
         )
 
@@ -86,11 +88,11 @@ def build_online_mapping_dataset(
         logger.debug("Loaded online mapping Dataset records=%d", len(online_dataset))
         return online_dataset
 
-    online_dataset = build_distributed_dataset(
+    online_dataset = build_dataset_for_dataloader(
         dataset_factory,
-        dataset_context,
+        normalized_context,
         # Cache-builder ranks must finish the Hub download before the other
         # owning ranks reopen the shared Hugging Face cache.
-        barrier_needed=dataset_context.distributed_enabled,
+        barrier_needed=normalized_context.distributed_enabled,
     )
     return online_dataset

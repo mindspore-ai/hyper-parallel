@@ -107,7 +107,7 @@ from hyper_models.components.distributed.injection import (
 )
 from hyper_models.components.models.qwen3_moe_fusions import (
     _fused_rms_norm,
-    qwen3_moe_flash_attention_forward,
+    _run_qwen3_moe_flash_attention,
 )
 
 logger = logging.getLogger(__name__)
@@ -1307,7 +1307,7 @@ def _run_qwen3_moe_fused_attention(
     attention_mask,
     kwargs,
 ):
-    return qwen3_moe_flash_attention_forward(
+    return _run_qwen3_moe_flash_attention(
         module,
         query,
         key,

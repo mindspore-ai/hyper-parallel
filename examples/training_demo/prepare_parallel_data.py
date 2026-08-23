@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Prepare deterministic online and indexed data for the parallel training demo."""
+"""Prepare deterministic Online text and Indexed token data for the parallel demo."""
 
 import argparse
 import json
@@ -25,7 +25,7 @@ from hyper_models.components.datasets.tools.indexed_dataset import IndexedDatase
 
 
 def prepare_parallel_data(output_dir: Path, *, num_samples: int = 64, seq_length: int = 32) -> None:
-    """Write equivalent JSONL and Megatron indexed datasets.
+    """Write Online plaintext JSONL and Indexed token datasets.
 
     Args:
         output_dir: Directory containing the generated validation data.
@@ -47,7 +47,7 @@ def prepare_parallel_data(output_dir: Path, *, num_samples: int = 64, seq_length
     documents = []
     for sample_index in range(num_samples):
         tokens = [((sample_index * seq_length + offset) % 250) + 1 for offset in range(seq_length + 1)]
-        records.append({"input_ids": tokens[:-1], "labels": tokens[1:]})
+        records.append({"text": f"training sample {sample_index}"})
         documents.append(tokens)
 
     with json_path.open("w", encoding="utf-8") as json_file:

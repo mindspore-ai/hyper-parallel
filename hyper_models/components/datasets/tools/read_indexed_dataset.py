@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """
-Inspect token sequences stored in a Megatron indexed Dataset.
+Inspect token sequences stored in an indexed dataset.
 
 python -m hyper_models.components.datasets.tools.read_indexed_dataset \
   --path outputs/training_demo/tiny_llama_wikitext2/data_no_pack/wikitext2_real_text_document.idx \
@@ -40,7 +40,7 @@ def _path_prefix(path: str) -> str:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse indexed Dataset inspection arguments."""
-    parser = argparse.ArgumentParser(description="Inspect a Megatron indexed Dataset")
+    parser = argparse.ArgumentParser(description="Inspect an indexed dataset")
     parser.add_argument("--path", required=True, help="Dataset prefix or its .bin/.idx path")
     parser.add_argument("--tokenizer", help="Local Hugging Face tokenizer path or repository")
     parser.add_argument(

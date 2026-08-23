@@ -16,15 +16,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
-
-from hyper_models.components.datasets.contracts import SampleTransform
 
 
 def build_online_dataset(
         *,
         data_path: str,
-        transform: SampleTransform | None = None,
+        transform: Callable[[Any], Any] | None = None,
         **dataset_options: Any,
 ) -> Any:
     """Reserve the modality-aware Online Omni Dataset implementation."""
