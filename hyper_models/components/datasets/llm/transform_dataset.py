@@ -60,6 +60,18 @@ def _normalize_transformed_samples(transformed_sample: Any) -> list[ModelSample]
 
 
 def _transform_sample(raw_sample: Any, transform: SampleTransform | None) -> ModelSample:
+    """Apply the transform and require exactly one model sample per record.
+
+    Args:
+        raw_sample: Source record read from the underlying Dataset.
+        transform: Optional Trainer-built sample transform.
+
+    Returns:
+        The single normalized model sample.
+
+    Raises:
+        ValueError: If the transform produces zero or multiple model samples.
+    """
     transformed_sample = transform(raw_sample) if transform is not None else raw_sample
     model_samples = _normalize_transformed_samples(transformed_sample)
     if len(model_samples) != 1:
@@ -180,6 +192,19 @@ def _wrap_llm_dataset(
         *,
         skip_invalid_samples: bool = False,
 ) -> Any:
+    """Wrap one source Dataset with the appropriate LLM transform wrapper.
+
+    Args:
+        dataset: Map-style or iterable source Dataset.
+        transform: Optional Trainer-built sample transform.
+        skip_invalid_samples: Whether to skip records without trainable labels.
+
+    Returns:
+        The wrapped Dataset applying ``transform`` to each source record.
+
+    Raises:
+        ValueError: If the source Dataset is neither map-style nor iterable.
+    """
     if (is_iterable_dataset(dataset) and callable(getattr(dataset, "map", None)) and not skip_invalid_samples):
         transform_callable = _OnlineIterableTransform(transform)
         column_names = getattr(dataset, "column_names", None)

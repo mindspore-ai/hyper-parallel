@@ -206,7 +206,7 @@ class TestMergeInheritance:
             "model.layers.0": ModuleShardingSpec(inner_target="self", inner_wrapper="sdpa_hf",
                                      region_dispatch=False),
         })
-        with pytest.raises(ValueError, match="未命中任何 planner 推导边界"):
+        with pytest.raises(ValueError, match="hit no planner-derived boundary"):
             planner.plan(tiny_llama, mesh, tp_size=2)
 
 
@@ -327,7 +327,7 @@ class TestDeriveFalse:
         """derive=False 下无推导可继承：注入字段-only 的 spec → insert 模式
         fail-fast（全未声明）。"""
         mesh = make_mesh((1,), ("tp",))
-        with pytest.raises(ValueError, match="未命中任何 planner 推导边界"):
+        with pytest.raises(ValueError, match="hit no planner-derived boundary"):
             ShardingPlanner(
                 plan_overrides={
                     "model.layers.0.self_attn": ModuleShardingSpec(
@@ -623,7 +623,7 @@ def test_override_dp_declaration_raises(tiny_llama, make_mesh):
         planner = ShardingPlanner(plan_overrides={
             "model.layers.0.self_attn": ModuleShardingSpec(**kwargs),
         })
-        with pytest.raises(ValueError, match="不允许声明 DP placement"):
+        with pytest.raises(ValueError, match="declaring a DP placement is not allowed"):
             planner.plan(tiny_llama, mesh, tp_size=2)
 
 
@@ -669,7 +669,7 @@ class TestOverrideAxisValidation:
         """轴名拼写错误（tp2）→ fail-fast（否则被 resolve_placements 静默忽略）。"""
         mesh = make_mesh((1,), ("tp",))
         spec = ModuleShardingSpec(params={"q_proj.weight": {"tp2": Shard(0)}})
-        with pytest.raises(ValueError, match="未知轴"):
+        with pytest.raises(ValueError, match="unknown axis"):
             ShardingPlanner(plan_overrides={
                 "*.self_attn": spec}).plan(tiny_llama, mesh, tp_size=2)
 
@@ -838,7 +838,7 @@ class TestUnsetVsExplicitEmpty:
         """insert 模式：全部未声明（全 None）→ fail-fast。"""
         tiny_llama.model.layers[0].extra = nn.Linear(4, 4)
         mesh = make_mesh((1,), ("tp",))
-        with pytest.raises(ValueError, match="未命中任何 planner 推导边界"):
+        with pytest.raises(ValueError, match="hit no planner-derived boundary"):
             ShardingPlanner(plan_overrides={
                 "model.layers.0.extra": ModuleShardingSpec(),
             }).plan(tiny_llama, mesh, tp_size=2)
@@ -851,7 +851,7 @@ class TestUnsetVsExplicitEmpty:
                 "*.self_attn": ModuleShardingSpec(
                     params={"q_proj.weight": {TP: Shard(0)}}),
             }, allow_uncovered_params=True).plan(tiny_llama, mesh, tp_size=2)
-        assert "失去推导分片" in caplog.text
+        assert "strips the derived sharding" in caplog.text
         assert "o_proj.weight" in caplog.text
 
     def test_full_params_replace_no_warn(self, tiny_llama, make_mesh, caplog):
@@ -863,7 +863,7 @@ class TestUnsetVsExplicitEmpty:
             ShardingPlanner(plan_overrides={
                 "*.self_attn": ModuleShardingSpec(params=full),
             }).plan(tiny_llama, mesh, tp_size=2)
-        assert "失去推导分片" not in caplog.text
+        assert "strips the derived sharding" not in caplog.text
 
     def test_yaml_empty_dict_is_explicit_clear(self, tiny_llama, make_mesh):
         """YAML 形态 params: {} → 显式清空（不再被拒绝）。"""
@@ -1169,7 +1169,7 @@ class TestExplicitExpertMesh:
             tiny_hf_native_moe, mesh, tp_size=2, ep_size=4)
         spec = plan.modules["model.layers.0.mlp"]
         mlp = tiny_hf_native_moe.model.layers[0].mlp
-        with pytest.raises(ValueError, match="保留"):
+        with pytest.raises(ValueError, match="framework-reserved context keys"):
             _resolve_local_compute_fn(
                 mlp, spec, mesh, plan.mesh_dim_names, expert_mesh=None)
 

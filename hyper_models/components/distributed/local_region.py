@@ -48,7 +48,7 @@ DTensor-contract stitching) and standalone use.
 
 import functools
 import inspect
-from typing import Callable, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import torch
 
@@ -138,7 +138,7 @@ def local_region(
     Returns:
         The wrapped function, with the same signature as func.
 
-    Examples:
+    Example:
         >>> # validate-mode MoE module: boundary DTensor contract preserved,
         >>> # internal local all-to-all
         >>> wrapped = local_region(
@@ -156,10 +156,12 @@ def local_region(
         ...     return x + bias
     """
     def decorator(fn: Callable) -> Callable:
+        """Build the local-region wrapper around one concrete function."""
         name_to_idx = None  # lazily cached signature mapping
 
         @functools.wraps(fn)
-        def wrapped(*args, **kwargs):
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            """Unwrap DTensor inputs to local, run fn, and re-wrap outputs."""
             nonlocal name_to_idx
             if name_to_idx is None:
                 name_to_idx = _bind_arg_names(fn)

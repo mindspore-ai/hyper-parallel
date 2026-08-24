@@ -54,7 +54,13 @@ class _SeqAllToAll(torch.autograd.Function):
     """Autograd-aware exchange from one tensor dimension to another."""
 
     @staticmethod
-    def forward(ctx, group, tensor, scatter_dim, gather_dim):
+    def forward(
+        ctx: Any,
+        group: Any,
+        tensor: Tensor,
+        scatter_dim: int,
+        gather_dim: int,
+    ) -> Tensor:
         """Exchange tensor shards between the sequence and head dimensions."""
         ctx.group = group
         ctx.scatter_dim = scatter_dim
@@ -73,7 +79,11 @@ class _SeqAllToAll(torch.autograd.Function):
         return torch.cat(outputs, dim=gather_dim).contiguous()
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(
+        ctx: Any,
+        grad_output: Tensor,
+    ) -> tuple[None, Tensor, None, None]:
+        """Apply the inverse all-to-all to the output gradient."""
         grad_input = _SeqAllToAll.apply(
             ctx.group, grad_output, ctx.gather_dim, ctx.scatter_dim)
         return None, grad_input, None, None
@@ -86,15 +96,18 @@ class _UlyssesContext:
     cp_mesh: Any
 
     @property
-    def group(self):
+    def group(self) -> Any:
+        """Process group of the CP mesh."""
         return self.cp_mesh.get_group()
 
     @property
-    def size(self):
+    def size(self) -> int:
+        """Number of ranks in the CP mesh."""
         return self.cp_mesh.size()
 
     @property
-    def rank(self):
+    def rank(self) -> int:
+        """Local rank of this process within the CP mesh."""
         return self.cp_mesh.get_local_rank()
 
 
@@ -164,7 +177,13 @@ def _mome_cp_halo_exchange(attention_module, context):
         return
 
     @functools.wraps(original)
-    def apply_mome_with_halo(hidden_states, mome_mask, conv, use_fused):
+    def apply_mome_with_halo(
+        hidden_states: Tensor,
+        mome_mask: Tensor,
+        conv: Any,
+        use_fused: bool,
+    ) -> Tensor:
+        """Run MoME convolution with the previous rank's halo rows prepended."""
         halo = conv.kernel_size[0] - 1
         if halo == 0:
             return original(hidden_states, mome_mask, conv, use_fused)
@@ -200,7 +219,9 @@ def _mla_cp_alltoall(attention_functions, context):
 
     @functools.wraps(original)
     def mla_with_sequence_head_exchange(
-            module, query, key, value, attention_mask, **kwargs):
+            module: Any, query: Tensor, key: Tensor, value: Tensor,
+            attention_mask: Any, **kwargs: Any) -> Tensor:
+        """Run the MLA backend with Q/K/V exchanged to head-sharded layout."""
         if module.attention_type != "mla":
             return original(
                 module, query, key, value, attention_mask, **kwargs)
@@ -248,8 +269,10 @@ def _dsa_cp_alltoall(attention_module, attention_functions, context):
     if not getattr(original_indexer, _ULYSSES_WRAPPED_FLAG, False):
         @functools.wraps(original_indexer)
         def index_with_gathered_sequence(
-                module, index_query, index_key, merge_weight,
-                actual_q_len, actual_kv_len):
+                module: Any, index_query: Tensor, index_key: Tensor,
+                merge_weight: Tensor,
+                actual_q_len: Any, actual_kv_len: Any) -> Any:
+            """Run the DSA indexer on the CP-exchanged sequence layout."""
             index_query = _sequence_to_head(index_query, context)
             merge_weight = _sequence_to_head(
                 merge_weight.unsqueeze(-1), context).squeeze(-1)
@@ -269,7 +292,9 @@ def _dsa_cp_alltoall(attention_module, attention_functions, context):
     if not getattr(original_sparse, _ULYSSES_WRAPPED_FLAG, False):
         @functools.wraps(original_sparse)
         def sparse_attention_with_gathered_kv(
-                module, query, key, value, attention_mask, **kwargs):
+                module: Any, query: Tensor, key: Tensor, value: Tensor,
+                attention_mask: Any, **kwargs: Any) -> tuple[Tensor, Any, Any]:
+            """Run DSA sparse attention with head-sharded Q and gathered K/V."""
             del attention_mask
             local_shape = tuple(query.shape)
             query = _sequence_to_head(query, context)
@@ -313,10 +338,13 @@ def _dsa_cp_alltoall(attention_module, attention_functions, context):
             """Proxy the DSA KL loss with CP-transformed attention inputs."""
 
             @staticmethod
-            def apply(index_query, index_key, merge_weight, query, key,
-                      topk_indices, softmax_max, softmax_sum, query_rope,
-                      key_rope, actual_seq_qlen, actual_seq_klen, scale,
-                      loss_coeff):
+            def apply(index_query: Any, index_key: Any, merge_weight: Any,
+                      query: Any, key: Any,
+                      topk_indices: Any, softmax_max: Any, softmax_sum: Any,
+                      query_rope: Any,
+                      key_rope: Any, actual_seq_qlen: Any, actual_seq_klen: Any,
+                      scale: Any,
+                      loss_coeff: Any) -> Any:
                 """Apply the original KL loss with saved global sequence tensors."""
                 saved = _dsa_tensor_context.get()
                 if saved is None:
@@ -704,7 +732,14 @@ class _AllGatherAlongDim(torch.autograd.Function):
     ranks, then take this rank's chunk)."""
 
     @staticmethod
-    def forward(ctx, t, cp_dim, group, cp_size):
+    def forward(
+        ctx: Any,
+        t: Tensor,
+        cp_dim: int,
+        group: Any,
+        cp_size: int,
+    ) -> Tensor:
+        """All-gather the tensor along cp_dim in CP-rank order."""
         ctx.cp_dim = cp_dim
         ctx.group = group
         ctx.cp_size = cp_size
@@ -714,7 +749,11 @@ class _AllGatherAlongDim(torch.autograd.Function):
         return torch.cat(world_t, dim=cp_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(
+        ctx: Any,
+        grad_output: Tensor,
+    ) -> tuple[Tensor, None, None, None]:
+        """Sum the gradient across ranks and take this rank's chunk."""
         # reduce-scatter: sum the gradient across ranks, take this rank's chunk
         grad = grad_output.contiguous().clone()
         dist.all_reduce(grad, group=ctx.group)
@@ -723,7 +762,12 @@ class _AllGatherAlongDim(torch.autograd.Function):
         return local.contiguous(), None, None, None
 
 
-def flex_cp_allgather(k, v, cp_dim: int, cp_mesh):
+def flex_cp_allgather(
+    k: Tensor,
+    v: Tensor,
+    cp_dim: int,
+    cp_mesh: DeviceMesh,
+) -> tuple[Tensor, Tensor]:
     """All-gather K/V along CP dimension for context parallel attention.
 
     Forward: all-gather K/V along cp_dim (each rank ends up holding the full K/V).
@@ -881,7 +925,7 @@ def head_tail_load_balance_attention(
     return platform.cat([keep_output, tail_output], dim=2)
 
 
-def shard_batch_for_cp(batch: dict, cp_mesh) -> dict:
+def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, Any]:
     """Shard the sequence-dim tensors of a batch along the CP mesh
     (05 §6.3.4 canonical).
 

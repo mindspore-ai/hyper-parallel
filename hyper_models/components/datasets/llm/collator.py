@@ -39,6 +39,7 @@ class LLMCollator:
     def __init__(self, *, packing: bool = False, field_specs: Mapping[str, FieldCollateSpec] | None = None,
                  pad_token_id: int = 0, ignore_index: int = IGNORE_INDEX,
                  pad_to_length: int | None = None) -> None:
+        """Store the collation policy described by the class docstring."""
         self.packing = packing
         self.field_specs = dict(field_specs) if field_specs is not None else None
         self.pad_token_id = pad_token_id
@@ -47,6 +48,7 @@ class LLMCollator:
 
     @staticmethod
     def _as_tensor(value: Any, field: str) -> torch.Tensor:
+        """Convert one sample field to a tensor, raising a field-aware error."""
         if isinstance(value, torch.Tensor):
             return value
         try:
@@ -55,6 +57,7 @@ class LLMCollator:
             raise ValueError(f"Sample field {field!r} must be tensor-like") from exc
 
     def _normalize_sample(self, sample: Mapping[str, Any], index: int) -> dict[str, Any]:
+        """Validate and tensorize the token and label fields of one sample."""
         normalized = dict(sample)
         input_field = "input_ids" if "input_ids" in normalized else "tokens"
         if input_field not in normalized:

@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from typing import Dict, List
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 

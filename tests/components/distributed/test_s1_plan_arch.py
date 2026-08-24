@@ -775,7 +775,7 @@ class TestDeferredBias:
     def test_explain_shows_deferred_bias(self, make_mesh):
         mesh = make_mesh((1,), ("tp",))
         plan = ShardingPlanner().plan(_TinyBiasAttnModel(), mesh, tp_size=2)
-        assert "后置 bias" in plan.explain()
+        assert "deferred bias" in plan.explain()
         assert "o_proj.bias" in plan.explain()
 
     def test_no_tp_no_defer(self, make_mesh):
@@ -825,7 +825,7 @@ class TestDeferredBias:
                 return self.lm_head(x)
 
         mesh = make_mesh((1,), ("tp",))
-        with pytest.raises(ValueError, match="模板不匹配"):
+        with pytest.raises(ValueError, match="template mismatch"):
             ShardingPlanner().plan(_LmHeadBiasModel(), mesh, tp_size=2)
 
     def test_non_linear_owner_warns_and_skips(self, make_mesh, caplog):
@@ -837,7 +837,7 @@ class TestDeferredBias:
             plan = ShardingPlanner(plan_overrides=overrides, derive=False).plan(
                 _CustomLinearModel(), mesh, tp_size=2)
         assert plan.modules["block"]._deferred_bias_params == ()
-        assert any("非 nn.Linear" in r.message for r in caplog.records)
+        assert any("not nn.Linear" in r.message for r in caplog.records)
 
     def test_multi_output_partial_fails(self, make_mesh):
         """多输出 + Partial + rowwise bias：无法归因到唯一输出 → fail-fast。"""
@@ -845,7 +845,7 @@ class TestDeferredBias:
         spec = _rowwise_spec(
             "weight",
             out_src={"a": {TP: Partial()}, "b": {TP: Partial()}})
-        with pytest.raises(ValueError, match="单输出"):
+        with pytest.raises(ValueError, match="single-output"):
             ShardingPlanner(plan_overrides={"block": spec}, derive=False).plan(
                 _CustomLinearModel(), mesh, tp_size=2)
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Private LLM implementations for the shared dataset build stages."""
+"""Private LLM implementations for the shared dataset build pipeline."""
 
 from hyper_models.components.datasets.llm.build_data_transform import build_llm_data_transform
 from hyper_models.components.datasets.llm.build_tokenizer import AutoTokenizer, build_tokenizer

@@ -25,6 +25,8 @@ import torch
 from torch import Tensor
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_strict
+from hyper_parallel.platform import get_platform
 from hyper_models.components.loss.loss_parallel_ops_common import (
     _is_dtensor,
     _is_shard_on_last_dim,
@@ -34,8 +36,6 @@ from hyper_models.components.loss.loss_parallel_ops_common import (
     _check_context_and_layout,
     _validate_mesh_and_shard,
 )
-from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_strict
-from hyper_parallel.platform import get_platform
 
 platform = get_platform()
 

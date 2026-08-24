@@ -29,11 +29,18 @@ parameter by parameter directly:
   real FSDP2 fork path is part of the M_M.2a joint integration).
 """
 
+from typing import Any, Optional
+
 import torch
 import torch.distributed as dist
 
 
-def run_one_step(model, input_ids, labels, vocab_size):
+def run_one_step(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    vocab_size: int,
+) -> tuple[torch.Tensor, dict[str, Optional[torch.Tensor]]]:
     """Single forward+backward step, returns {param_fqn: grad}."""
     model.zero_grad()
     logits = model(input_ids)
@@ -46,7 +53,13 @@ def run_one_step(model, input_ids, labels, vocab_size):
     }
 
 
-def assert_grad_equivalence(prod_grads, val_grads, *, rtol=1e-3, atol=1e-5):
+def assert_grad_equivalence(
+    prod_grads: dict[str, Optional[torch.Tensor]],
+    val_grads: dict[str, Optional[torch.Tensor]],
+    *,
+    rtol: float = 1e-3,
+    atol: float = 1e-5,
+) -> None:
     """Dual-mode per-parameter assert_close on gradients (parameters missing on both sides are skipped)."""
     for name, gp in prod_grads.items():
         gv = val_grads.get(name)
@@ -57,7 +70,7 @@ def assert_grad_equivalence(prod_grads, val_grads, *, rtol=1e-3, atol=1e-5):
         torch.testing.assert_close(gp, gv, rtol=rtol, atol=atol)
 
 
-def simulate_tp_replicate_grad_sync(grad, tp_group):
+def simulate_tp_replicate_grad_sync(grad: torch.Tensor, tp_group: Any) -> torch.Tensor:
     """Simulate the source_shard_info bypass: TP all-reduce of TP-Replicate parameter gradients.
 
     The real path is implemented by the FSDP2 fork's all_reduce_grad

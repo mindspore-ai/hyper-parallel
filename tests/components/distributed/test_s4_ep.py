@@ -330,7 +330,7 @@ class TestTargetLocalComputeFn:
         spec = _identity_spec()
         spec.local_compute_fn = bad_compute
         spec.region_dispatch = False
-        with pytest.raises(TypeError, match="同名"):
+        with pytest.raises(TypeError, match="same-named"):
             _resolve_local_compute_fn(
                 _TinyMod(), spec, make_mesh((1,), ("tp",)), ("tp",),
                 expert_mesh=None)
@@ -345,7 +345,7 @@ class TestTargetLocalComputeFn:
                         "ep_compute.routed_only_ep_compute_fn",
             blok_size="oops")                     # 拼写错误：应为 block_size
         spec.region_dispatch = False
-        with pytest.raises(ValueError, match="未声明的键"):
+        with pytest.raises(ValueError, match="undeclared keys"):
             _resolve_local_compute_fn(
                 _TinyMod(), spec, make_mesh((1,), ("tp",)), ("tp",),
                 expert_mesh=None)
@@ -360,7 +360,7 @@ class TestTargetLocalComputeFn:
                         "ep_compute.routed_only_ep_compute_fn",
             mesh="oops")
         spec.region_dispatch = False
-        with pytest.raises(ValueError, match="保留"):
+        with pytest.raises(ValueError, match="framework-reserved context keys"):
             _resolve_local_compute_fn(
                 _TinyMod(), spec, make_mesh((1,), ("tp",)), ("tp",),
                 expert_mesh=None)
@@ -452,7 +452,7 @@ class TestRegionDispatchDeclaration:
         spec.region_dispatch = True
         mesh = make_mesh((1,), ("tp",))
         plan = ShardingPlan(modules={"mod": spec}, mesh_dim_names=("tp",))
-        with pytest.raises(ValueError, match="冗余"):
+        with pytest.raises(ValueError, match="redundant"):
             _apply_phase_c(model, plan, mesh, validate_mode=False)
 
 

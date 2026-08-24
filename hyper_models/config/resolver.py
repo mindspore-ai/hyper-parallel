@@ -127,8 +127,8 @@ def _normalize_tuple(value: object, item_types: tuple, *, path: str) -> tuple:
 def _coerce_none(annotation: object, *, path: str) -> None:
     """Accept ``None`` only when the annotation permits it."""
 
-    if annotation is type(None) or (
-        _is_union(annotation) and type(None) in get_args(annotation)
+    if annotation is types.NoneType or (
+        _is_union(annotation) and types.NoneType in get_args(annotation)
     ):
         return None
     raise _fail(path, f"expected {_type_name(annotation)}, got None")
@@ -138,7 +138,7 @@ def _coerce_union(value: object, annotation: object, *, path: str) -> object:
     """Normalize a value against an ``Optional`` or general union."""
 
     members = get_args(annotation)
-    non_none_members = tuple(member for member in members if member is not type(None))
+    non_none_members = tuple(member for member in members if member is not types.NoneType)
     if len(non_none_members) == 1 and len(non_none_members) != len(members):
         return coerce_value(value, non_none_members[0], path=path)
 
@@ -233,7 +233,7 @@ def coerce_value(value: object, annotation: object, *, path: str) -> object:
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:
     """Resolve one value against an Optional or general union."""
     non_none_members = [
-        member for member in get_args(annotation) if member is not type(None)
+        member for member in get_args(annotation) if member is not types.NoneType
     ]
     if len(non_none_members) == 1:
         # Single-member union (e.g. Optional[Target]): resolve directly so the

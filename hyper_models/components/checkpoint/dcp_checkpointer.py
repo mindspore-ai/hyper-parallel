@@ -97,7 +97,7 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
 
-    def build_local_plan(self):
+    def build_local_plan(self) -> Any:
         """Validate model coverage, then defer to the standard planner."""
         if self.state_dict is None or self.metadata is None:
             return super().build_local_plan()

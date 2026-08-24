@@ -41,7 +41,7 @@ _DTYPES = {
 }
 
 
-class _IndexReader(object):
+class _IndexReader:
     """Memory-map the compact sequence metadata stored in an index file."""
 
     def __init__(self, idx_path: str) -> None:

@@ -98,7 +98,7 @@ def _tp_degree(mesh, mesh_dim_names) -> int:
     return mesh["tp"].size()
 
 
-def update_module_head_counts(module, tp_size, module_fqn="") -> int:
+def update_module_head_counts(module: Any, tp_size: int, module_fqn: str = "") -> int:
     """Divide a module's cached head-count attributes by tp_size (idempotent).
 
     Only plain-int attributes whose name is in Q_HEAD_ATTRS / KV_HEAD_ATTRS
@@ -249,7 +249,13 @@ def _update_user_tp_attrs(
     return count
 
 
-def maybe_update_head_counts(module, spec, module_fqn, mesh, mesh_dim_names) -> None:
+def maybe_update_head_counts(
+    module: Any,
+    spec: Any,
+    module_fqn: str,
+    mesh: Any,
+    mesh_dim_names: Sequence[str],
+) -> None:
     """Adjust cached head counts when the spec head-shards the module.
 
     Called by the applier exactly where the module's forward is guaranteed to

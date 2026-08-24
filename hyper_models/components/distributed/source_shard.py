@@ -26,8 +26,13 @@ final sharded parameter carries the full distributed layout (FSDP dims +
 source dims) for downstream consumers such as distributed checkpointing.
 """
 
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_models.components.distributed.sharding_config import resolve_placements
+from typing import Any, Dict, List, Optional, Tuple
+
+from hyper_parallel.core.dtensor.placement_types import Placement, Shard
+from hyper_models.components.distributed.sharding_config import (
+    ShardingPlan,
+    resolve_placements,
+)
 
 # Mesh dimensions whose sharding semantics belong to FSDP (or to other
 # parallelism concerns), never to the source layout recorded here:
@@ -84,7 +89,13 @@ def _check_fsdp_owned_axes(full_fqn, named_placement):
             )
 
 
-def build_source_shard_info(plan, dense_source_mesh, *, expert_source_mesh=None, tied_pairs=None):
+def build_source_shard_info(
+    plan: ShardingPlan,
+    dense_source_mesh: Any,
+    *,
+    expert_source_mesh: Any = None,
+    tied_pairs: Optional[List[Tuple[str, str]]] = None,
+) -> Dict[str, Tuple[Tuple[Placement, ...], Any]]:
     """Build complete source-layout metadata for dense and routed-expert parameters.
 
     Args:

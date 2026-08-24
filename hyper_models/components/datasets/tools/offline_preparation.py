@@ -118,11 +118,19 @@ def append_eod(args: argparse.Namespace, tokenizer: Any) -> int | None:
     return int(eod_id)
 
 
-class Encoder(object):
+class Encoder:
+    """Encode JSON text fields into token ids and sentence lengths."""
+
     def __init__(self, args: argparse.Namespace) -> None:
+        """Store the preprocessing arguments shared with worker processes.
+
+        Args:
+            args: Parsed offline preprocessing arguments.
+        """
         self.args = args
 
     def initializer(self) -> None:
+        """Build the tokenizer and sentence splitter in each worker process."""
         # Use Encoder class as a container for global data
         Encoder.tokenizer = build_tokenizer(self.args)
         if self.args.split_sentences:
@@ -161,6 +169,14 @@ class Encoder(object):
         self,
         json_line: str,
     ) -> tuple[dict[str, list[int]], dict[str, list[int]], int]:
+        """Tokenize one JSON record into per-key token ids and sentence lengths.
+
+        Args:
+            json_line: One serialized JSON record.
+
+        Returns:
+            Per-key token ids, per-key sentence lengths, and the input byte length.
+        """
         data = json.loads(json_line)
         ids = {}
         lens = {}
@@ -187,8 +203,16 @@ class Encoder(object):
         return ids, lens, len(json_line)
 
 
-class Partition(object):
+class Partition:
+    """Process one dataset partition with a pool of worker processes."""
+
     def __init__(self, args: argparse.Namespace, workers: int) -> None:
+        """Store the partition configuration.
+
+        Args:
+            args: Parsed offline preprocessing arguments.
+            workers: Number of worker processes used by this partition.
+        """
         self.args = args
         self.workers = workers
         self.performance: list[float] = []
@@ -199,6 +223,13 @@ class Partition(object):
         proc_start: float,
         total_bytes_processed: int,
     ) -> None:
+        """Report encoding throughput at the configured log interval.
+
+        Args:
+            count: Number of documents processed so far.
+            proc_start: Timestamp when processing started.
+            total_bytes_processed: Total input bytes processed so far.
+        """
         if count % self.args.log_interval != 0:
             return
         elapsed = time.time() - proc_start
@@ -220,7 +251,9 @@ class Partition(object):
         with open(input_file_name, "r", encoding="utf-8") as input_file, open(
             output_file_name, "w", encoding="utf-8",
         ) as output_file:
-            pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
+            # multiprocessing.Pool must be shut down with close()+join() so
+            # in-flight tasks finish; a 'with' block would terminate() them.
+            pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)  # pylint: disable=R1732
             try:
                 split_docs = pool.imap(encoder.split, input_file, 32)
                 proc_start = time.time()
@@ -234,15 +267,23 @@ class Partition(object):
                 pool.join()
 
     def process_json_file(self, file_name: tuple[str, str]) -> list[float]:
+        """Tokenize one JSONL partition into indexed dataset .bin/.idx files.
+
+        Args:
+            file_name: Input JSONL path and output prefix pair.
+
+        Returns:
+            Throughput measurements collected while benchmarking workers.
+        """
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
 
         startup_start = time.time()
         encoder = Encoder(self.args)
         tokenizer = build_tokenizer(self.args)
-        pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
-        encoded_docs = pool.imap(encoder.encode, fin, 32)
+        # multiprocessing.Pool must be shut down with close()+join() so
+        # in-flight tasks finish; a 'with' block would terminate() them.
+        pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)  # pylint: disable=R1732
 
         level = "sentence" if self.args.split_sentences else "document"
 
@@ -268,23 +309,24 @@ class Partition(object):
         pack_to_seq_len = getattr(self.args, "pack_to_seq_len", None)
         chunk_size = pack_to_seq_len + 1 if pack_to_seq_len is not None else None
         token_buffers = {key: [] for key in keys}
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-            if self.args.find_optimal_num_workers and i > self.args.max_documents:
-                break
-            total_bytes_processed += bytes_processed
-            for key in keys:
-                if chunk_size is None:
-                    builders[key].add_document(doc[key], sentence_lens[key])
-                    continue
-                token_buffers[key].extend(doc[key])
-                complete_length = len(token_buffers[key]) // chunk_size * chunk_size
-                for offset in range(0, complete_length, chunk_size):
-                    chunk = token_buffers[key][offset:offset + chunk_size]
-                    builders[key].add_document(chunk, [chunk_size])
-                del token_buffers[key][:complete_length]
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
+        with open(input_file_name, 'r', encoding='utf-8') as fin:
+            encoded_docs = pool.imap(encoder.encode, fin, 32)
+            for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+                if self.args.find_optimal_num_workers and i > self.args.max_documents:
+                    break
+                total_bytes_processed += bytes_processed
+                for key in keys:
+                    if chunk_size is None:
+                        builders[key].add_document(doc[key], sentence_lens[key])
+                        continue
+                    token_buffers[key].extend(doc[key])
+                    complete_length = len(token_buffers[key]) // chunk_size * chunk_size
+                    for offset in range(0, complete_length, chunk_size):
+                        chunk = token_buffers[key][offset:offset + chunk_size]
+                        builders[key].add_document(chunk, [chunk_size])
+                    del token_buffers[key][:complete_length]
+                self.print_processing_stats(i, proc_start, total_bytes_processed)
 
-        fin.close()
         keys = self.args.json_keys
         for key in keys:
             builders[key].finalize(output_idx_files[key])
@@ -388,7 +430,7 @@ def get_args() -> argparse.Namespace:
         help="Pack documents into fixed samples of this sequence length plus one target token.",
     )
 
-    #分布式逻辑
+    # Distributed partitioning options.
     group.add_argument(
         "--keep-sequential-samples",
         action="store_true",

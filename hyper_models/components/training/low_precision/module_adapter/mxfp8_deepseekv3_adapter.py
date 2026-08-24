@@ -98,8 +98,13 @@ class MXFP8GroupedExperts(nn.Module):
                 f"gate_up={tuple(gate_up_proj.shape)}, down={tuple(down_proj.shape)}."
             )
 
-        converted = cls.__new__(cls)
-        nn.Module.__init__(converted)
+        # Create a no-allocation shell: cls.__new__(cls) resolves to
+        # object.__new__ (a staticmethod), so passing cls explicitly is correct;
+        # pylint mis-infers the binding of __new__ on a classmethod's cls.
+        converted = cls.__new__(cls)  # pylint: disable=no-value-for-parameter
+        # Deliberately invoke nn.Module.__init__ directly so the shell does not
+        # re-run this class's allocating __init__.
+        nn.Module.__init__(converted)  # pylint: disable=unnecessary-dunder-call
         for name, parameter in source._parameters.items():  # pylint: disable=protected-access
             converted.register_parameter(name, parameter)
         for name, buffer in source._buffers.items():  # pylint: disable=protected-access

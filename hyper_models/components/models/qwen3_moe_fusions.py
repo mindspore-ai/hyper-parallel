@@ -353,6 +353,25 @@ def qwen3_moe_flash_attention_cp_wrapper(
         past_key_values: Any | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """CP-aware replacement forward for Qwen3-MoE fused attention.
+
+        All-gathers key/value states across the CP mesh and evaluates the
+        fused attention with a CP-offset causal mask.
+
+        Args:
+            hidden_states: Local sequence shard of hidden states.
+            position_embeddings: Rotary position embedding tuple.
+            attention_mask: Must be None; only the implicit causal mask is
+                supported.
+            past_key_values: Optional cached key/value states.
+            **kwargs: Additional attention arguments.
+
+        Returns:
+            The attention output and attention weights (always None).
+
+        Raises:
+            ValueError: If an explicit attention mask is provided.
+        """
         if attention_mask is not None:
             raise ValueError(
                 "Qwen3-MoE fused CP attention currently requires an implicit "

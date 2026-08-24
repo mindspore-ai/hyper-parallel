@@ -34,6 +34,15 @@ CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
 
 
 def build_chat_template(template_name: str, tokenizer: "PreTrainedTokenizer") -> "ChatTemplate":
+    """Build the registered chat template for the given tokenizer.
+
+    Args:
+        template_name: Name registered in ``CHAT_TEMPLATE_REGISTRY``.
+        tokenizer: Tokenizer bound to the chat template.
+
+    Returns:
+        The chat template instance for ``template_name``.
+    """
     return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer)
 
 
@@ -43,9 +52,19 @@ class ChatTemplate(ABC):
     """
 
     def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
+        """Bind the tokenizer used to encode chat messages.
+
+        Args:
+            tokenizer: Tokenizer providing ``encode`` and special tokens.
+        """
         self.tokenizer = tokenizer
 
     def save_pretrained(self, output_dir: str) -> None:
+        """Save the tokenizer together with this template's Jinja template.
+
+        Args:
+            output_dir: Directory passed to ``tokenizer.save_pretrained``.
+        """
         self.tokenizer.chat_template = self.get_jinja_template()
         try:
             self.tokenizer.save_pretrained(output_dir)
@@ -57,19 +76,26 @@ class ChatTemplate(ABC):
         """
         Encodes messages to a dictionary of input_ids, attention_mask, and labels.
         """
-        ...
 
     @abstractmethod
     def get_jinja_template(self) -> str:
         """
         Gets the jinja template for the chat template.
         """
-        ...
 
 
 @CHAT_TEMPLATE_REGISTRY.register("default")
 class DefaultTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        """Encode messages with a simple ``Role: content`` text format.
+
+        Args:
+            messages: Chat messages with ``role``, ``content``, and ``loss_mask``.
+            max_seq_len: Maximum sequence length kept from the end.
+
+        Returns:
+            Dictionary of ``input_ids``, ``attention_mask``, and ``labels``.
+        """
         input_ids, attention_mask, labels = [], [], []
         for message in messages:
             content_str = message["role"].title() + ": " + message["content"].strip() + self.tokenizer.eos_token + "\n"
@@ -86,6 +112,7 @@ class DefaultTemplate(ChatTemplate):
         return model_inputs
 
     def get_jinja_template(self) -> str:
+        """Return the Jinja template matching the default text format."""
         return (
             "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}"
             "{% for message in messages %}"
@@ -101,6 +128,7 @@ class TokenizerTemplate(ChatTemplate):
 
     def _update_prefix_labels(self, previous_ids: List[int], current_ids: List[int], labels: List[int]) -> None:
         """Validate that adding a message preserved the previously rendered prefix."""
+        del labels  # only the GPT-OSS override rewrites labels
         previous_length = len(previous_ids)
         if current_ids[:previous_length] != previous_ids:
             raise ValueError(
@@ -109,6 +137,20 @@ class TokenizerTemplate(ChatTemplate):
             )
 
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        """Encode messages with the tokenizer's native, prefix-stable template.
+
+        Args:
+            messages: Chat messages with ``role`` and ``content``; an optional
+                ``loss_mask`` defaults to loss on assistant messages only.
+            max_seq_len: Maximum sequence length kept from the end.
+
+        Returns:
+            Dictionary of ``input_ids``, ``attention_mask``, and ``labels``.
+
+        Raises:
+            ValueError: If the template does not render monotonically growing,
+                prefix-stable conversations.
+        """
         input_ids: List[int] = []
         labels: List[int] = []
         previous_length = 0
@@ -145,6 +187,11 @@ class TokenizerTemplate(ChatTemplate):
         }
 
     def get_jinja_template(self) -> str:
+        """Return the tokenizer's native chat template.
+
+        Raises:
+            ValueError: If the tokenizer does not define a chat template.
+        """
         if not self.tokenizer.chat_template:
             raise ValueError("The tokenizer does not define a native chat template.")
         return self.tokenizer.chat_template
@@ -155,10 +202,18 @@ class GptOssTokenizerTemplate(TokenizerTemplate):
     """GPT-OSS native template with its terminal assistant-token rewrite."""
 
     def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
+        """Resolve the GPT-OSS terminal token ids from the tokenizer.
+
+        Args:
+            tokenizer: Tokenizer that must define ``<|return|>`` and ``<|end|>``.
+
+        Raises:
+            ValueError: If either terminal token is missing from the vocabulary.
+        """
         super().__init__(tokenizer)
         self.return_token_id = tokenizer.convert_tokens_to_ids("<|return|>")
         self.end_token_id = tokenizer.convert_tokens_to_ids("<|end|>")
-        if self.return_token_id == tokenizer.unk_token_id or self.end_token_id == tokenizer.unk_token_id:
+        if tokenizer.unk_token_id in (self.return_token_id, self.end_token_id):
             raise ValueError("The GPT-OSS chat template requires <|return|> and <|end|> tokenizer tokens.")
 
     def _update_prefix_labels(self, previous_ids: List[int], current_ids: List[int], labels: List[int]) -> None:
@@ -187,6 +242,18 @@ class GptOssTokenizerTemplate(TokenizerTemplate):
 @CHAT_TEMPLATE_REGISTRY.register("llama2")
 class Llama2Template(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        """Encode messages with the Llama-2 ``[INST]`` instruction format.
+
+        Args:
+            messages: Chat messages with ``role``, ``content``, and ``loss_mask``.
+            max_seq_len: Maximum sequence length kept from the end.
+
+        Returns:
+            Dictionary of ``input_ids``, ``attention_mask``, and ``labels``.
+
+        Raises:
+            ValueError: If a message role is not supported.
+        """
         input_ids, attention_mask, labels = [], [], []
         for message in messages:
             if message["role"] == "system":
@@ -215,6 +282,7 @@ class Llama2Template(ChatTemplate):
         return model_inputs
 
     def get_jinja_template(self) -> str:
+        """Return the Jinja template matching the Llama-2 format."""
         return (
             "{% if messages[0]['role'] == 'system' %}"
             "{{ '<<SYS>>\n' + messages[0]['content'] | trim + '\n<</SYS>>\n\n' }}"
@@ -240,6 +308,20 @@ class JanusTemplate(ChatTemplate):
     def encode_messages(
         self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192, task_type: str = ""
     ) -> Dict[str, List[int]]:
+        """Encode messages with the Janus role format and image masks.
+
+        Args:
+            messages: Chat messages with ``role``, ``content``, and ``loss_mask``.
+            max_seq_len: Maximum sequence length kept from the end.
+            task_type: Optional task selector enabling generation-mode formats.
+
+        Returns:
+            Dictionary of ``input_ids``, ``attention_mask``, ``labels``,
+            ``images_seq_mask``, and ``images_emb_mask``.
+
+        Raises:
+            ValueError: If a message role is not supported by this template.
+        """
         input_ids, attention_mask, labels = [], [], []
         images_seq_mask, images_emb_mask = [], []
         seps = ["\n\n", "<｜end▁of▁sentence｜>"]
@@ -270,6 +352,10 @@ class JanusTemplate(ChatTemplate):
                 )
             elif "system" in message["role"]:
                 content_str = message["content"].strip() + seps[0]
+            else:
+                raise ValueError(
+                    f"Unknown role {message['role']}, should be one of {{system, user, assistant}}."
+                )
             if "system" in message["role"]:
                 content_ids = self.tokenizer.encode(content_str)
             else:
@@ -309,6 +395,7 @@ class JanusTemplate(ChatTemplate):
         return model_inputs
 
     def get_jinja_template(self) -> str:
+        """Return the ChatML-style Jinja template for the Janus format."""
         return (
             "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}"
             "{% for message in messages %}"
@@ -321,6 +408,16 @@ class JanusTemplate(ChatTemplate):
 @CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        """Encode messages with the ChatML ``<|im_start|>`` format.
+
+        Args:
+            messages: Chat messages with ``role`` and ``content``; an optional
+                ``loss_mask`` defaults to loss on assistant messages only.
+            max_seq_len: Maximum sequence length kept from the end.
+
+        Returns:
+            Dictionary of ``input_ids``, ``attention_mask``, and ``labels``.
+        """
         input_ids, attention_mask, labels = [], [], []
         for message in messages:
             content_str = "<|im_start|>" + message["role"] + "\n" + message["content"].strip() + "<|im_end|>\n"
@@ -342,6 +439,7 @@ class ChatmlTemplate(ChatTemplate):
         return model_inputs
 
     def get_jinja_template(self) -> str:
+        """Return the Jinja template matching the ChatML format."""
         return (
             "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}"
             "{% for message in messages %}"

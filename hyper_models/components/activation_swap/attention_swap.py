@@ -105,6 +105,11 @@ def _find_attention_targets(model: nn.Module) -> list[_AttentionTarget]:
     visited_modules: set[int] = set()
 
     def visit(parent: nn.Module) -> None:
+        """Recursively record ``self_attn`` children, deduplicating shared modules.
+
+        Args:
+            parent: Module whose children are inspected.
+        """
         parent_id = id(parent)
         if parent_id in visited_modules:
             return

@@ -119,7 +119,12 @@ def compile_module_replacements(
             )
             if not matched_patterns:
                 continue
-            type_matches = type(module) is spec.module_type if spec.exact_type else isinstance(module, spec.module_type)
+            # exact_type deliberately requires an exact type match, so the
+            # type() comparison is intentional and must not become isinstance().
+            type_matches = (
+                type(module) is spec.module_type  # pylint: disable=unidiomatic-typecheck
+                if spec.exact_type else isinstance(module, spec.module_type)
+            )
             if not type_matches:
                 raise TypeError(
                     f"module replacement {spec.match} selected {fqns[0]!r} "

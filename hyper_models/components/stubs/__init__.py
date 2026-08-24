@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components.stubs: 并行开发接口 stub（parallel_plan §二）。
+"""components.stubs: interface stubs for parallel development (parallel_plan section 2).
 
-各 stub 文件只 re-export canonical 定义，不复制字段——保证 stub 与实现
-永不漂移。所有消费者只 import stub，不 import 实现路径。
+Each stub file only re-exports the canonical definitions without copying any
+fields, guaranteeing that stubs and implementations never drift apart. All
+consumers import from the stubs only, never from the implementation paths.
 """

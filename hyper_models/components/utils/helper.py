@@ -20,23 +20,23 @@ import gc
 import logging as builtin_logging
 import os
 import random
-import subprocess
 import sys
 import warnings
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import psutil
 import torch
 import torch.distributed as dist
-import torch.nn as nn
+from torch import nn
 import transformers
 from transformers import set_seed as set_seed_func
 
 from .device import (
     IS_CUDA_AVAILABLE,
     IS_NPU_AVAILABLE,
+    empty_cache as _device_empty_cache,
     get_device_type,
     get_torch_device,
 )
@@ -50,7 +50,17 @@ VALID_CONFIG_TYPE = None
 FlopsCounter = None
 
 
-def convert_hdfs_fuse_path(*args, **kwargs):
+def convert_hdfs_fuse_path(*args: Any, **kwargs: Any) -> Any:
+    """Return the HDFS fuse path from positional or keyword arguments.
+
+    Args:
+        *args: Positional arguments; the first one is returned when present.
+        **kwargs: Keyword arguments; ``path`` is returned when no positional
+            argument is given.
+
+    Returns:
+        The resolved path, or ``None`` when neither is provided.
+    """
     if len(args) > 0:
         return args[0]
     return kwargs.get("path", None)
@@ -67,7 +77,7 @@ def _info_rank0(message: str) -> None:
         logger.info(message)
 
 
-def enable_high_precision_for_bf16():
+def enable_high_precision_for_bf16() -> None:
     """
     Set high accumulation dtype for matmul and reduction.
     """
@@ -80,7 +90,7 @@ def enable_high_precision_for_bf16():
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
 
-def enable_full_determinism(seed: int):
+def enable_full_determinism(seed: int) -> None:
     """
     Helper function for reproducibility in distributed training.
     See https://pytorch.org/docs/stable/notes/randomness.html for details.
@@ -127,16 +137,16 @@ def create_logger(name: Optional[str] = None) -> "logging._Logger":
     """
     Creates a pretty logger for the third-party program.
     """
-    logger = builtin_logging.getLogger(name)
+    new_logger = builtin_logging.getLogger(name)
     formatter = builtin_logging.Formatter(
         fmt="[%(levelname)s|%(pathname)s:%(lineno)s] %(asctime)s >> %(message)s", datefmt="%m/%d/%Y %H:%M:%S"
     )
     handler = builtin_logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(builtin_logging.INFO)
-    logger.propagate = False
-    return logger
+    new_logger.addHandler(handler)
+    new_logger.setLevel(builtin_logging.INFO)
+    new_logger.propagate = False
+    return new_logger
 
 
 def enable_third_party_logging() -> None:
@@ -152,7 +162,9 @@ def disable_warning() -> None:
     """
     Enables warning filter.
     """
-    from pyiceberg.metrics import LoggingMetricsReporter
+    # pyiceberg is an optional dependency; import lazily so that importing this
+    # module does not require it.
+    from pyiceberg.metrics import LoggingMetricsReporter  # pylint: disable=import-outside-toplevel
 
     builtin_logging.basicConfig(level=builtin_logging.ERROR)
     warnings.simplefilter("ignore")
@@ -174,7 +186,8 @@ def print_device_mem_info(prompt: str = "VRAM usage") -> None:
         _info_rank0(f"{prompt}: cur {memory_allocated:.2f}GB, max {max_memory_allocated:.2f}GB.")
 
 
-def print_cpu_memory_info():
+def print_cpu_memory_info() -> None:
+    """Log CPU usage and system memory information on global rank zero."""
     cpu_usage = psutil.cpu_percent(interval=1)  # sampling for 1 sec
     _info_rank0(f"CPU Usage: {cpu_usage}%")
 
@@ -192,9 +205,7 @@ def empty_cache() -> None:
     gc.collect()
 
     if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
-        from ..utils.device import empty_cache
-
-        empty_cache()
+        _device_empty_cache()
 
 
 def get_cache_dir(path: Optional[str] = None) -> str:
@@ -244,8 +255,7 @@ def unwrap_model(model: "nn.Module") -> "nn.Module":
     """
     if hasattr(model, "module"):
         return unwrap_model(model.module)
-    else:
-        return model
+    return model
 
 
 def print_example(example: Dict[str, "torch.Tensor"], rank: int, print_tensor: bool = True) -> None:
@@ -274,7 +284,7 @@ def print_example(example: Dict[str, "torch.Tensor"], rank: int, print_tensor: b
             _log(key, value)
 
 
-def dict2device(input_dict: dict):
+def dict2device(input_dict: dict) -> dict:
     """
     Move a dict of Tensor to GPUs.
     """
@@ -289,8 +299,17 @@ def dict2device(input_dict: dict):
     return output_dict
 
 
-def make_list(item):
-    if isinstance(item, List) or isinstance(item, np.ndarray):
+def make_list(item: Any) -> Any:
+    """Return ``item`` itself if it is already a list/ndarray, else wrap it in a list.
+
+    Args:
+        item: The value to normalize.
+
+    Returns:
+        ``item`` unchanged when it is a list or numpy array, otherwise
+        ``[item]``.
+    """
+    if isinstance(item, (List, np.ndarray)):
         return item
     return [item]
 
@@ -298,27 +317,37 @@ def make_list(item):
 class ProfilerWithMem:
     """Thin wrapper that toggles CUDA-allocator tracing around profiler.step()"""
 
-    def __init__(self, inner):
+    def __init__(self, inner: Any) -> None:
+        """Initialize the wrapper around an underlying profiler instance.
+
+        Args:
+            inner: The wrapped torch/torch_npu profiler.
+        """
         self._p = inner
 
     # delegate ctx-manager behaviour
-    def __enter__(self):
+    def __enter__(self) -> Any:
+        """Enter the wrapped profiler's context manager."""
         return self._p.__enter__()
 
-    def __exit__(self, *a):
+    def __exit__(self, *a: Any) -> Any:
+        """Exit the wrapped profiler's context manager."""
         return self._p.__exit__(*a)
 
-    def start(self):
+    def start(self) -> Any:
+        """Start profiling and begin recording the allocator history."""
         out = self._p.start()
         get_torch_device().memory._record_memory_history()
         return out
 
-    def stop(self):
+    def stop(self) -> Any:
+        """Stop profiling and stop recording the allocator history."""
         out = self._p.stop()
         get_torch_device().memory._record_memory_history(enabled=None)  # step recording memory snapshot
         return out
 
-    def step(self, *a, **kw):
+    def step(self, *a: Any, **kw: Any) -> Any:
+        """Advance the wrapped profiler by one step."""
         return self._p.step(*a, **kw)
 
 
@@ -331,7 +360,7 @@ def create_profiler(
     with_stack: bool,
     with_modules: bool,
     global_rank: int,
-):
+) -> Any:
     """
     Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
     Profile steps in [start_step, end_step).
@@ -352,7 +381,12 @@ def create_profiler(
         import hdfs_io  # pylint: disable=import-outside-toplevel
         from hdfs_io import copy  # pylint: disable=import-outside-toplevel
 
-    def handler_fn(p):
+    def handler_fn(p: Any) -> None:
+        """Export the trace (and memory snapshot) when a profiling trace is ready.
+
+        Args:
+            p: The profiler instance that produced the trace.
+        """
         time = int(datetime.datetime.now().timestamp())
 
         trace_file_extention = "pt.trace.json.gz"
@@ -425,8 +459,7 @@ def create_profiler(
     )
     if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and profile_memory:
         return ProfilerWithMem(base_profiler)
-    else:
-        return base_profiler
+    return base_profiler
 
 
 if os.getenv("DISABLE_WARNINGS", "0").lower() in ["true", "1"]:

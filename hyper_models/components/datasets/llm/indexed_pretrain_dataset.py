@@ -339,6 +339,7 @@ class GPTDataset(_IndexedPretrainDataset):
         self.cached_position_ids = None
 
     def _finalize(self) -> None:
+        """Build the document, sample, and shuffle indices for the token stream."""
         if self.dataset is None or self.indices is None:
             raise ValueError("GPTDataset requires a low-level Dataset and split indices")
 
@@ -535,7 +536,7 @@ class GPTDataset(_IndexedPretrainDataset):
         """Get the text (token ids) and document ids for a given index
 
         Args:
-            idx (int): The index into the dataset
+            index (int): The index into the dataset
 
         Returns:
             The text ids, document ids, and per-document token counts (before any padding).
@@ -632,6 +633,7 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
         self.cached_position_ids = None
 
     def _finalize(self) -> None:
+        """Validate the low-level Dataset and the pre-cut record lengths."""
         if self.dataset is None or self.indices is None:
             raise ValueError("GPTFromMRDataset requires a low-level Dataset and split indices")
 
@@ -742,15 +744,15 @@ def _get_ltor_masks_and_position_ids(
     Build causal attention, loss, and position arrays for one token sequence.
 
     Args:
-        tokens (torch.Tensor): The data tenor that holds the tokens from the dataset
+        tokens (np.ndarray): The data array that holds the tokens from the dataset
         config (GPTDatasetConfig): The dataset config.
 
     Returns:
-        torch.Tensor: Attention mask needed to be used for Attention
+        np.ndarray | None: Attention mask needed to be used for Attention
 
-        torch.Tensor: The mask used for loss value during training
+        np.ndarray: The mask used for loss value during training
 
-        torch.Tensor: The position ID's of the token
+        np.ndarray: The position ID's of the token
     """
     seq_length = tokens.size
     eod_token = config.tokenizer.eod

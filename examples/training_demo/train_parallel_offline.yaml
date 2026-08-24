@@ -35,7 +35,6 @@ fsdp_config:
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true
-  enable_fsdp2_prefetch: true
   forward_prefetch_depth: 1
   backward_prefetch_depth: 1
   comm_fusion: false

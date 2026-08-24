@@ -20,8 +20,7 @@ Following design doc 01_hf_compatibility_layer.md §7.
 import logging
 from typing import Optional
 
-import torch
-from transformers import AutoModelForCausalLM, PreTrainedModel
+from transformers import PreTrainedModel
 
 from hyper_models._transformers.registry import _resolve_custom_model_cls
 
@@ -51,12 +50,14 @@ def _init_model(
         torch_dtype: "auto" / "bfloat16" / etc.
         is_hf_model: True = HF native, False = custom implementation.
         *model_args: Extra positional args for model constructor.
-        backend: Backend configuration (optional).
+        backend: Backend configuration (reserved for interface compatibility
+            with HyperAutoModel.from_pretrained; not used yet).
         **kwargs: Extra keyword args.
 
     Returns:
         (is_custom_model, model)
     """
+    _ = backend  # Reserved for interface compatibility; not used yet.
     architectures = getattr(hf_config, "architectures", []) or []
     arch_name = architectures[0] if architectures else ""
 

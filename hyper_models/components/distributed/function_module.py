@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""FunctionModule — autograd.Function 的模块壳（教程 §10.8）。
+"""FunctionModule — a module shell for autograd.Function (tutorial §10.8).
 
-边界机制的作用粒度是 ``nn.Module.forward``；自定义 ``autograd.Function``
-以 ``A.apply(...)`` 裸调用时对框架不可见（没有 FQN 就没有 spec 挂载点）。
-``FunctionModule`` 给 Function 一个模块形态：无参数、无状态，forward 透传
-``fn.apply``，backward 走 Function 自己的静态 backward——壳对 autograd
-透明。
+The boundary mechanism acts at the granularity of ``nn.Module.forward``; a
+custom ``autograd.Function`` invoked as a bare ``A.apply(...)`` call is
+invisible to the framework (no FQN means no spec mount point).
+``FunctionModule`` gives a Function a module form: parameterless, stateless,
+forward passes through to ``fn.apply``, and backward goes through the
+Function's own static backward — the shell is transparent to autograd.
 
-用法（plan_overrides 声明边界；自定义 Function 不在 DTensor dispatch 覆盖
-范围，必须 ``region_dispatch=False``）::
+Usage (declare the boundary in plan_overrides; custom Functions are not
+covered by DTensor dispatch overrides, so ``region_dispatch=False`` is
+required)::
 
     self.a_fn = FunctionModule(A)
     plan_overrides={"...a_fn": ModuleShardingSpec(
@@ -29,17 +31,20 @@
         in_src={"x": ...}, in_dst={"x": ...},
         out_src={...}, out_dst={...})}
 
-契约 key 绑定（与所有边界一致，``_bind_input_indices``）：先按壳 forward
-的形参名绑定；**单输入契约回退绑定到第 0 个位置参数**——因此单张量输入
-直接用本壳的 ``*args`` 透传即可。多输入（如额外权重张量）请子类化并给出
-显式签名::
+Contract key binding (same as all boundaries, ``_bind_input_indices``): first
+bind by the shell forward's parameter names; **a single-input contract falls
+back to binding to the 0th positional argument** — so a single-tensor input
+can be passed straight through this shell's ``*args``. For multiple inputs
+(e.g. an extra weight tensor), subclass and provide an explicit signature::
 
     class SeqNormWithWeight(FunctionModule):
         def forward(self, x, weight):
             return self._fn.apply(x, weight)
 """
 
-import torch.nn as nn
+from typing import Any
+
+from torch import nn
 
 
 class FunctionModule(nn.Module):
@@ -47,12 +52,15 @@ class FunctionModule(nn.Module):
     mount point).  Transparent to autograd: backward is the Function's own
     static ``backward``."""
 
-    def __init__(self, fn):
+    def __init__(self, fn: type) -> None:
+        """Store the ``autograd.Function`` class wrapped by this module."""
         super().__init__()
         self._fn = fn
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Invoke the wrapped Function's ``apply`` with the given inputs."""
         return self._fn.apply(*args, **kwargs)
 
     def extra_repr(self) -> str:
+        """Show the wrapped Function class name in the module repr."""
         return f"fn={self._fn.__name__}"
