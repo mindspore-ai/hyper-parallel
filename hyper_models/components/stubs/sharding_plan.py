@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""I4+I5 stub：ShardingPlan / ModuleShardingSpec / NamedPlacement（P4 提供，所有人消费）。
+"""I4+I5 stub: ShardingPlan / ModuleShardingSpec / NamedPlacement (provided by P4, consumed by everyone).
 
-canonical 定义在 ``components/distributed/sharding_config.py``；本 stub 直接
-re-export，字段名/类型与 05 §3.1-3.2 完全一致（re-export 而非复制，杜绝漂移）。
+The canonical definitions live in ``components/distributed/sharding_config.py``;
+this stub re-exports them directly, with field names and types exactly matching
+sections 3.1-3.2 of design doc 05 (re-export instead of copy, so they can never
+drift apart).
 """
 
 from hyper_models.components.distributed.sharding_config import (

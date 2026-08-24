@@ -17,13 +17,16 @@
 import inspect
 import importlib
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Callable, Generic, List, Literal, Optional, TypeVar, Union
 
+from torch import nn
 from torch.optim import Optimizer
 from hyper_models.components.checkpoint.config import CheckpointingConfig
 from hyper_models.components.distributed.config import FSDP2Config
 from hyper_models.components.model_transform import ModuleReplacementSpec, module_replacement
+from hyper_models.components.model_transform.replacement import ModuleReplacementFactory
 from hyper_models.components.training.low_precision.config import LowPrecisionConfig
 
 logger = logging.getLogger(__name__)
@@ -128,7 +131,7 @@ class DebugConfig:
 
 @dataclass
 class WandbConfig:
-    """WandB remote-logging parameters (03 §4.2.5：build_callback_manager 读取）。"""
+    """WandB remote-logging parameters (03 §4.2.5: read by build_callback_manager)."""
 
     enabled: bool = False
     project: str = ""
@@ -308,13 +311,18 @@ class PlanOverride:
             ``{name: {axis: placement_str}}`` (multi-output). The framework
             never derives inner output layouts — undeclared fails fast at
             apply time.
-        region_dispatch: validate 执行模式声明（无默认——声明注入时必填）。
-            ``false`` = 区域计算（模块自身 forward 或注入函数）不可
-            dispatch：含通信原语/自定义 kernel（如自研 EP-aware MoE 的
-            all-to-all 在 forward 内、仓内 CP/EP 参考实现），走
-            local-region 骨架黑盒；``true`` = 注入物是纯标准算子（融合
-            kernel / 脚本写法优化），validate 下 dispatch 穿透 + out_src
-            真校验。无注入时不需要本字段（普通边界天然穿透）。
+        region_dispatch: validate execution-mode declaration (no default —
+            required when declaring an injection). ``false`` = the region
+            computation (the module's own forward or the injected function)
+            cannot be dispatched: it contains communication primitives /
+            custom kernels (e.g. an in-house EP-aware MoE all-to-all inside
+            forward, or the in-repo CP/EP reference implementations), so it
+            runs as a local-region skeleton black box; ``true`` = the
+            injected code is pure standard operators (fused kernels /
+            scripted-style optimizations), so under validate the dispatch
+            passes through and out_src is genuinely checked. This field is
+            not needed without an injection (ordinary boundaries pass through
+            naturally).
         params / in_src / in_dst / out_src / out_dst: contract fields in the
             YAML form ``{name: {axis: placement_str}}`` (out_* also accept
             the scalar shorthand ``{axis: placement_str}``), or the sentinels
@@ -344,7 +352,8 @@ class PlanOverride:
     out_dst: Optional[Any] = None
     tp_divide_attrs: Optional[List[str]] = None
 
-    # 契约字段（字符串哨兵在 planner merge 时解析；insert 模式拒绝）
+    # Contract fields (string sentinels are resolved at planner merge time;
+    # insert mode rejects them)
     _CONTRACT_FIELDS = ("params", "in_src", "in_dst", "out_src", "out_dst")
 
     def to_override(self) -> "tuple[str, Any]":
@@ -389,23 +398,23 @@ class PlanOverride:
             return None
         if not isinstance(attrs, list):
             raise ValueError(
-                f"plan_overrides match={self.match!r} 的 tp_divide_attrs "
-                f"必须是属性名列表，got {type(attrs).__name__}")
+                f"plan_overrides match={self.match!r}: tp_divide_attrs "
+                f"must be a list of attribute names, got {type(attrs).__name__}")
         seen = set()
         for attr in attrs:
             if not isinstance(attr, str) or not attr or not attr.isidentifier():
                 raise ValueError(
-                    f"plan_overrides match={self.match!r} 的 "
-                    f"tp_divide_attrs 只能包含合法属性名，got {attr!r}")
+                    f"plan_overrides match={self.match!r}: "
+                    f"tp_divide_attrs may only contain valid attribute names, got {attr!r}")
             if attr in seen:
                 raise ValueError(
-                    f"plan_overrides match={self.match!r} 的 "
-                    f"tp_divide_attrs 包含重复属性 {attr!r}")
+                    f"plan_overrides match={self.match!r}: "
+                    f"tp_divide_attrs contains duplicate attribute {attr!r}")
             seen.add(attr)
         return list(attrs)
 
     def _parse_inner_out_src(self):
-        """inner_out_src 的 YAML 形态脱糖：哨兵 / 单输出 DSL / 多输出 DSL。"""
+        """Desugar the YAML form of inner_out_src: sentinel / single-output DSL / multi-output DSL."""
         # Keep trainer.config outside the distributed component's import-time dependency graph.
         # pylint: disable-next=import-outside-toplevel
         from hyper_models.components.distributed.sharding_config import (
@@ -420,16 +429,16 @@ class PlanOverride:
             if raw == "first_input":
                 return raw
             raise ValueError(
-                f"{path}: 字符串值只接受哨兵 'first_input'（输出布局 == "
-                f"首个 DTensor 入参的布局），got {raw!r}")
+                f"{path}: string value only accepts the sentinel 'first_input' "
+                f"(output layout == layout of the first DTensor input), got {raw!r}")
         if not isinstance(raw, dict) or not raw:
             raise ValueError(
-                f"{path}: 期望 'first_input'、{{axis: placement}} 或 "
-                f"{{name: {{axis: placement}}}}，got {raw!r}")
+                f"{path}: expected 'first_input', {{axis: placement}} or "
+                f"{{name: {{axis: placement}}}}, got {raw!r}")
         if all(isinstance(v, str) for v in raw.values()):
-            return parse_named_placement(raw, path=path)  # 单输出
+            return parse_named_placement(raw, path=path)  # single output
         return {name: parse_named_placement(named, path=f"{path}.{name}")
-                for name, named in raw.items()}  # 多输出
+                for name, named in raw.items()}  # multi-output
 
     def _parse_contract_field(self, attr, raw):
         """YAML form → spec field value (DSL parse / sentinel pass-through)."""
@@ -443,19 +452,20 @@ class PlanOverride:
             if raw in ("auto", "none"):
                 return raw
             raise ValueError(
-                f"plan_overrides match={self.match!r} 的契约字段 {attr} 的字符串"
-                f"值只接受哨兵 'auto'（显式继承）/ 'none'（显式清空），"
-                f"got {raw!r}")
+                f"plan_overrides match={self.match!r}: string value of contract "
+                f"field {attr} only accepts the sentinels 'auto' (explicit "
+                f"inherit) / 'none' (explicit clear), got {raw!r}")
         if not isinstance(raw, dict):
             raise ValueError(
-                f"plan_overrides match={self.match!r} 的契约字段 {attr} 期望映射"
-                f"或哨兵字符串，got {raw!r}")
+                f"plan_overrides match={self.match!r}: contract field {attr} "
+                f"expects a mapping or a sentinel string, got {raw!r}")
         if not raw:
-            return {}  # 显式空（"写了照办"：清空/不切分），区别于不写
+            return {}  # explicit empty ("as written": clear / no sharding), unlike omitting the field
         if attr in ("out_src", "out_dst") and all(
                 isinstance(v, str) for v in raw.values()):
-            # 标量简写 {axis: placement} —— 直接是 NamedPlacement（output 名由
-            # planner 的 _normalize_out_fields 统一补全）
+            # Scalar shorthand {axis: placement} — already a NamedPlacement
+            # (the output name is filled in uniformly by the planner's
+            # _normalize_out_fields)
             return parse_named_placement(
                 raw, path=f"plan_overrides[{self.match!r}].{attr}")
         return {
@@ -500,7 +510,7 @@ def _import_module_type(path: str) -> type:
     raise ValueError(f"plan_overrides.module_type {path!r} could not be imported")
 
 
-def _target_replacement_factory(target: Target[Any]):
+def _target_replacement_factory(target: Target[Any]) -> ModuleReplacementFactory:
     """Bind a YAML Target's static args to the replacement factory protocol."""
 
     if not getattr(target._target_, "_hp_module_replacement", False):  # pylint: disable=protected-access
@@ -510,7 +520,13 @@ def _target_replacement_factory(target: Target[Any]):
         )
 
     @module_replacement
-    def factory(*, module, module_fqn, context):
+    def factory(
+        *,
+        module: nn.Module,
+        module_fqn: str,
+        context: Mapping[str, Any],
+    ) -> nn.Module:
+        """Build one replacement module by delegating to the bound YAML Target."""
         return target.build(module=module, module_fqn=module_fqn, context=context)
 
     return factory

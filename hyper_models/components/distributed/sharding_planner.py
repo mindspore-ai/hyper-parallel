@@ -38,10 +38,18 @@ import fnmatch
 import inspect
 import logging
 import re
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from torch import nn
+
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
-from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
+from hyper_parallel.core.dtensor.placement_types import (
+    Partial,
+    Placement,
+    Replicate,
+    Shard,
+)
 from hyper_models.components.distributed.param_role import (
     ParameterClassifier,
     ParamRole,
@@ -51,7 +59,6 @@ from hyper_models.components.distributed.function_module import FunctionModule
 from hyper_models.components.distributed.head_count import build_tp_local_attr_plan
 from hyper_models.components.distributed.sharding_config import (
     DP,
-    EP,
     TP,
     MeshAxisName,
     ModuleShardingSpec,
@@ -61,7 +68,6 @@ from hyper_models.components.distributed.sharding_config import (
     TEMPLATES,
     _multi_dim,
     _normalize_out_fields,
-    resolve_placements,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,8 +119,6 @@ def _shard_gated_delta(module, param_name, mesh):
     a standard Shard(0) fallback; the head-aligned fine-grained sharding is
     left to be completed when a concrete model is onboarded.
     """
-    import torch.nn as nn
-
     param = getattr(module, param_name, None)
     if param is None:
         return
@@ -140,7 +144,7 @@ _SPECIAL_HANDLER_PATTERNS: Dict[str, str] = {
 # NOTE (accuracy fix F3): "shared_experts" was REMOVED from this guard —
 # the shared expert (singular or plural spelling) must surface as its own
 # nested "mlp" boundary (its boundary exit owns the RowWise Partial TP
-# reduction, accuracy_problem.md 10.3 方案A); keeping it in the guard would
+# reduction, accuracy_problem.md 10.3 Option A); keeping it in the guard would
 # merge it into the parent MoE boundary and silently leave the TP reduction
 # without an owner.
 _LEAF_SEGMENT_GUARD = frozenset({
@@ -235,7 +239,20 @@ class ShardingPlanner:
         *,
         derive: bool = True,
         allow_uncovered_params: bool = False,
-    ):
+    ) -> None:
+        """Create a ShardingPlanner.
+
+        Args:
+            plan_overrides: ``{module_fqn | fqn_glob: ModuleShardingSpec}`` —
+                the single injection/override interface (05 §3.6.7); see the
+                class docstring for merge/insert/glob semantics.
+            derive: When ``False``, template derivation (Phases 2-4) is
+                skipped and the plan contains ONLY the ``plan_overrides``
+                specs (every key is insert mode, fully self-declared).
+            allow_uncovered_params: When ``True``, downgrade the F4b
+                "every trainable parameter must be covered by the plan"
+                hard error to a warning (exploratory debugging only).
+        """
         self._classifier = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
         self._templates = TEMPLATES
         self._special_handler_patterns = dict(_SPECIAL_HANDLER_PATTERNS)
@@ -256,8 +273,8 @@ class ShardingPlanner:
 
     def plan(
         self,
-        model,
-        mesh,
+        model: Any,
+        mesh: DeviceMesh,
         *,
         tp_size: int = 1,
         cp_size: int = 1,
@@ -311,10 +328,11 @@ class ShardingPlanner:
                 corresponding mesh dimensions (fail-first), if model-level
                 constraints are violated (head divisibility, expert count, etc.),
                 or if any ``plan_overrides`` spec declares a DP placement
-                (05 §3.1.1 坐标系约定: plan 恒为单个 dp 切片).
+                (05 §3.1.1 coordinate-system convention: the plan is always a
+                single dp slice).
         """
         arch = self._get_architecture(model)
-        self._check_overrides_no_dp()   # fail-first：plan 坐标系 = 单 dp 切片
+        self._check_overrides_no_dp()   # fail-first: the plan's coordinate system = a single dp slice
         mesh_dim_names = self._build_mesh_dim_names(mesh, tp_size, cp_size, ep_size)
         # D-10 TP-extend-EP (05 §6.4.8): ep_size is the extended EP group
         # size (the a2a communication domain, extended from the TP group to
@@ -371,8 +389,10 @@ class ShardingPlanner:
         # Phase 4.5: unified override pass — merge mode (unset fields inherit
         # the derived spec) / insert mode (fully self-declared only) / glob.
         self._merge_plan_overrides(plan, model)
-        # plan 输出规范化：契约字段 None（未声明）→ {}——"不写继承，写了照办"
-        # 只存在于输入侧；plan 内的 spec 恒为具体值，下游消费者零分支
+        # Plan output normalization: contract-field None (undeclared) → {} —
+        # "unset inherits, written is honored" only exists on the input side;
+        # specs inside the plan always hold concrete values, so downstream
+        # consumers need no branching.
         self._normalize_contract_fields(plan)
         self._finalize_tp_local_attr_plans(
             plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names,
@@ -504,7 +524,7 @@ class ShardingPlanner:
         """Filter tp/cp/ep with mesh.mesh_dim_names as the authoritative
         order; fall back to (tp,cp,ep) when undeclared; drop size=1 axes.
 
-        dp* axes are ALWAYS stripped (05 §3 坐标系约定): the plan's
+        dp* axes are ALWAYS stripped (05 §3 coordinate-system convention): the plan's
         coordinate system is a single dp slice — dp semantics live in the
         data pipeline (data assignment) and FSDP (weight/grad domain),
         never in placements.  Overrides declaring DP placements are
@@ -525,7 +545,7 @@ class ShardingPlanner:
     def _check_overrides_no_dp(self) -> None:
         """Fail-first: plan_overrides must not declare DP placements.
 
-        The plan's coordinate system is a single dp slice (05 §3 坐标系约定):
+        The plan's coordinate system is a single dp slice (05 §3 coordinate-system convention):
         dp placements never drive boundary communication, and parameter dp
         layout is owned by FSDP *after* the plan — a DP key here would be
         silently dropped at resolve time, so reject it with a teaching
@@ -538,15 +558,19 @@ class ShardingPlanner:
 
         for fqn, spec in self._plan_overrides.items():
             if not isinstance(spec, ModuleShardingSpec):
-                continue   # 错误类型由 _merge_plan_overrides 报 TypeError
+                continue   # wrong types are reported as TypeError by _merge_plan_overrides
             for field in ("params", "in_src", "in_dst", "out_src", "out_dst"):
                 if _declares_dp(getattr(spec, field)):
                     raise ValueError(
-                        f'plan_overrides["{fqn}"].{field}: 不允许声明 DP placement。'
-                        "plan 的坐标系是单个 dp 切片（tp/cp/ep，05 §3 坐标系约定）"
-                        "——dp 的数据切分由数据管道表达、参数/梯度切分由 FSDP "
-                        "表达；多模态 encoder_dp 等场景的 dp 语义见 vit_mesh + "
-                        "数据分配 + fully_shard，I/O 契约只需声明 tp/cp/ep。"
+                        f'plan_overrides["{fqn}"].{field}: declaring a DP '
+                        "placement is not allowed. The plan's coordinate "
+                        "system is a single dp slice (tp/cp/ep, 05 §3 "
+                        "coordinate-system convention) — dp data sharding is "
+                        "expressed by the data pipeline, parameter/gradient "
+                        "sharding by FSDP; for scenarios such as multimodal "
+                        "encoder_dp the dp semantics live in vit_mesh + data "
+                        "assignment + fully_shard, and the I/O contract only "
+                        "needs to declare tp/cp/ep."
                     )
 
     # ── Phase 1 ─────────────────────────────────────────────────────────
@@ -678,7 +702,7 @@ class ShardingPlanner:
             # The shared expert submodule has dense-MLP semantics (colwise/
             # rowwise TP, no EP, no use_local_map): an independent nested TP
             # boundary whose exit performs the RowWise Partial reduction
-            # (accuracy_problem.md 10.3 方案A). Being a normal (dispatchable)
+            # (accuracy_problem.md 10.3 Option A). Being a normal (dispatchable)
             # boundary also means validate mode checks its out_src via real
             # propagation instead of a declarative rewrap.
             return "mlp"
@@ -714,8 +738,9 @@ class ShardingPlanner:
         """Template + ParamRole → ModuleShardingSpec (05 §3.5 Template Mapping)."""
         has_tp = "tp" in mesh_dim_names
         has_ep = "ep" in mesh_dim_names
-        # 推导 spec 直接落具体 dict（None 是 override 输入侧的"未声明"语义，
-        # 推导产物恒为具体值）
+        # The derived spec is materialized directly with concrete dicts (None
+        # is the "undeclared" semantics on the override input side; derived
+        # artifacts always hold concrete values).
         spec = ModuleShardingSpec(params={})
 
         # Step 1: fill spec.params per ParamRole
@@ -912,6 +937,10 @@ class ShardingPlanner:
         In D-10 mode all three layouts are supported; in old-style EP mode
         only per-expert needs stacking (batched and custom are already 3D).
         """
+        # ``arch`` is part of the dispatch-interface signature shared with the
+        # other boundary post-processors; the EP mode is decided by the mesh
+        # and layout alone, so it is intentionally unused here.
+        _ = arch
         if not ep_extend:
             return
         expert_params = [fqn for fqn, r in group if r == ParamRole.MOE_EXPERT]
@@ -1052,7 +1081,8 @@ class ShardingPlanner:
           ``in_src`` / ``in_dst`` / ``out_src`` / ``out_dst`` /
           ``out_names``) INHERIT, set ones replace at field granularity —
           **an explicit empty dict {} is a SET value** (explicit "no
-          sharding / no contract", 2026-08-05 "不写继承，写了照办"); the
+          sharding / no contract", 2026-08-05 "unset inherits, written is
+          honored"); the
           sentinels ``"auto"``/``"none"`` mean inherit/clear explicitly;
           injection fields
           (``local_compute_fn`` / ``inner_target`` / ``inner_wrapper``
@@ -1132,10 +1162,11 @@ class ShardingPlanner:
 
     _CONTRACT_FIELDS = ("params", "in_src", "in_dst",
                         "out_src", "out_dst", "out_names")
-    # 契约字段在 plan_overrides 输入侧接受的字符串哨兵（仅在 merge 时解析，
-    # 绝不进入 plan 输出）：
-    #   "auto" —— 显式继承推导值（按模板推导；与缺省空值同义，自文档化）
-    #   "none" —— 显式清空（params/in_src/in_dst → {}，out_* → None）
+    # String sentinels accepted on the plan_overrides input side for contract
+    # fields (resolved at merge time only; they never reach the plan output):
+    #   "auto" — explicitly inherit the derived value (derive per template;
+    #            synonymous with the default unset value, self-documenting)
+    #   "none" — explicitly clear (params/in_src/in_dst → {}, out_* → None)
     _CONTRACT_SENTINELS = ("auto", "none")
 
     @staticmethod
@@ -1148,7 +1179,7 @@ class ShardingPlanner:
             if not value or isinstance(value, str):
                 continue
             if not all(isinstance(v, dict) for v in value.values()):
-                yield attr, "output", value          # out_* 标量简写
+                yield attr, "output", value          # out_* scalar shorthand
             else:
                 for name, named in value.items():
                     yield attr, name, named
@@ -1167,35 +1198,38 @@ class ShardingPlanner:
         both sets is a typo → fail fast. Placement values must already be
         Placement objects (the YAML string DSL is parsed at desugar time).
         """
-        from hyper_parallel.core.dtensor.placement_types import Placement
-
         allowed = ({str(a) for a in plan.mesh_dim_names}
                    | {axis.value for axis in MeshAxisName})
         for attr, name, named in cls._iter_named_placements(user_spec):
             for axis, placement in named.items():
                 if not isinstance(placement, Placement):
                     raise TypeError(
-                        f"{source}[{key!r}] 契约字段 {attr}[{name!r}] 的轴 "
-                        f"{axis!r} 的值必须是 Placement 对象（Shard(N)/"
-                        f"Replicate()/Partial()；YAML 字符串 DSL 在脱糖时解析"
-                        f"为对象），got {type(placement).__name__} "
+                        f"{source}[{key!r}]: the value of axis "
+                        f"{axis!r} in contract field {attr}[{name!r}] must "
+                        f"be a Placement object (Shard(N)/"
+                        f"Replicate()/Partial(); the YAML string DSL is "
+                        f"parsed into objects at desugar time), "
+                        f"got {type(placement).__name__} "
                         f"{placement!r}")
-                # MeshAxisName 是 str 子类（hash/eq 与 plain str 一致），
-                # 直接用原值做成员判断——不能 str(axis)（枚举 __str__ 会
-                # 变成 "MeshAxisName.TP"）
+                # MeshAxisName is a str subclass (hash/eq consistent with a
+                # plain str), so use the raw value for the membership test —
+                # do NOT str(axis) (the enum __str__ would produce
+                # "MeshAxisName.TP")
                 if axis not in allowed:
                     raise ValueError(
-                        f"{source}[{key!r}] 契约字段 {attr}[{name!r}] 使用了"
-                        f"未知轴 {axis!r} —— 合法轴 = mesh 轴 "
+                        f"{source}[{key!r}] contract field "
+                        f"{attr}[{name!r}] uses the unknown axis {axis!r} — "
+                        f"legal axes = mesh axes "
                         f"{sorted(str(a) for a in plan.mesh_dim_names)} ∪ "
-                        f"规范轴 {sorted(axis.value for axis in MeshAxisName)}"
-                        f"。未知轴会被 resolve_placements 静默忽略，故 "
-                        f"fail-fast（疑似拼写错误）")
+                        f"canonical axes "
+                        f"{sorted(axis.value for axis in MeshAxisName)}. "
+                        f"An unknown axis is silently ignored by "
+                        f"resolve_placements, so fail fast (suspected typo)")
 
     @classmethod
     def _merge_contract_field(cls, derived: ModuleShardingSpec,
                               user_spec: ModuleShardingSpec, attr: str) -> None:
-        """Merge one contract field: "不写继承，写了照办" (2026-08-05).
+        """Merge one contract field: "unset inherits, written is honored" (2026-08-05).
 
         Precedence: ``None`` (unset) / ``"auto"`` → inherit derived;
         ``"none"`` → explicit clear (a readable alias for the empty value);
@@ -1206,33 +1240,40 @@ class ShardingPlanner:
         value = getattr(user_spec, attr)
         if isinstance(value, str):
             if value == "auto":
-                return                      # 显式继承（与缺省同义）
+                return                      # explicit inherit (same as the default unset)
             if value == "none":
                 setattr(derived, attr,
                         {} if attr in ("params", "in_src", "in_dst") else None)
-                return                      # 显式清空
+                return                      # explicit clear
             raise ValueError(
-                f"plan_overrides 契约字段 {attr} 的字符串值只接受哨兵 "
-                f"{cls._CONTRACT_SENTINELS}（'auto'=按模板推导继承，"
-                f"'none'=显式清空），got {value!r}")
-        if value is None:                   # 未声明 → 继承
+                f"the string value of plan_overrides contract field {attr} "
+                f"only accepts the sentinels "
+                f"{cls._CONTRACT_SENTINELS} ('auto'=inherit the "
+                f"template-derived value, 'none'=explicit clear), "
+                f"got {value!r}")
+        if value is None:                   # undeclared → inherit
             return
-        setattr(derived, attr, copy.deepcopy(value))  # 含 {}：显式空（清空）
+        setattr(derived, attr, copy.deepcopy(value))  # including {}: explicit empty (clear)
 
     @staticmethod
     def _warn_dropped_params(source, key, fqn, derived, user_spec) -> None:
-        """可见性防呆：merge 的 params 字段粒度替换会使未覆盖的参数失去推导
-        分片（保持复制）——可能是无意的笔误，WARNING 列出丢弃项。"""
+        """Visibility safeguard: a field-granularity replacement of ``params``
+        during merge strips the derived sharding from every parameter not
+        covered by the override (they stay replicated) — possibly an
+        unintended typo, so a WARNING lists the dropped entries."""
         user_params = user_spec.params
         if (isinstance(user_params, dict) and user_params
                 and derived.params):
             dropped = sorted(set(derived.params) - set(user_params))
             if dropped:
                 logger.warning(
-                    "%s[%r] merge into %s: params 字段粒度替换使 %d 个参数失去"
-                    "推导分片，将保持复制：%s —— 若有误请把推导值一并写入"
-                    "（字段粒度替换，不逐 key 合并）；若有意去切分可忽略此警告"
-                    "（params={} 或 'none' 可显式清空全部）",
+                    "%s[%r] merge into %s: the field-granularity params "
+                    "replacement strips the derived sharding from %d "
+                    "parameter(s), which will stay replicated: %s — if "
+                    "unintended, write the derived values in too "
+                    "(field-granularity replacement, no per-key merge); if "
+                    "the de-sharding is intentional, ignore this warning "
+                    "(params={} or 'none' explicitly clears all)",
                     source, key, fqn, len(dropped), dropped)
 
     @staticmethod
@@ -1398,15 +1439,14 @@ class ShardingPlanner:
           fail-fast (use local_compute_fn).
         - sibling ``X.weight`` TP placement is an output-dim ``Shard(d)``
           (colwise / lm_head / embed) → the bias must follow the same output
-          shard; Replicate / undeclared / wrong-dim → plan-time "模板不匹配"
+          shard; Replicate / undeclared / wrong-dim → plan-time "template
+          mismatch"
           error (typical: lm_head.bias), instead of a remote runtime
           broadcast crash.
         - out_src without a TP Partial (no boundary reduction, or the user
           reduces inside the region) → the bias is already added exactly once
           → no defer, no check.
         """
-        from torch import nn  # local import: keep the planner torch-free at module level
-
         has_tp = "tp" in mesh_dim_names
         modules = dict(model.named_modules())
         for module_fqn, spec in plan.modules.items():
@@ -1425,7 +1465,7 @@ class ShardingPlanner:
             deferred: List[str] = []
             for param_name, param in named_params.items():
                 if param_name == "bias":
-                    owner_path = ""      # 边界模块自身就是带 bias 的 Linear
+                    owner_path = ""      # the boundary module itself is the bias-carrying Linear
                 elif param_name.endswith(".bias"):
                     owner_path = param_name[: -len(".bias")]
                 else:
@@ -1446,32 +1486,41 @@ class ShardingPlanner:
                     # counted once per TP rank by the boundary Partial
                     # reduction — defer it past the reduction (D-22).
                     if not partial_outputs:
-                        continue   # 边界无归约 → bias 本就只加一次
+                        continue   # no boundary reduction → the bias is added exactly once anyway
                     if len(out_src) != 1:
                         raise ValueError(
-                            f"boundary {module_fqn!r}: rowwise bias 后置（D-22）"
-                            f"v1 仅支持单输出边界——该边界 out_src 声明了 "
-                            f"{len(out_src)} 个输出且含 TP Partial 归约，框架无法"
-                            f"把 {param_name!r} 归因到唯一输出。请用 "
-                            f"local_compute_fn 接管该区域（自行在归约后加 bias）")
+                            f"boundary {module_fqn!r}: rowwise bias "
+                            f"deferral (D-22) v1 only supports single-output "
+                            f"boundaries — this boundary's out_src declares "
+                            f"{len(out_src)} outputs with a TP Partial "
+                            f"reduction, so the framework cannot attribute "
+                            f"{param_name!r} to a unique output. Take over "
+                            f"the region with local_compute_fn (add the bias "
+                            f"yourself after the reduction)")
                     if bias_tp is not None and not isinstance(bias_tp, Replicate):
                         raise ValueError(
-                            f"boundary {module_fqn!r}: rowwise Linear "
-                            f"{owner_path!r} 的 bias 声明了非 Replicate 的 TP "
-                            f"placement（{bias_tp!r}）——D-22 后置加法要求 bias "
-                            f"保持 Replicate（TP 归约后整体恰好加一次）。请从 "
-                            f"spec.params 移除 {param_name!r}，或改为 "
+                            f"boundary {module_fqn!r}: the bias of rowwise "
+                            f"Linear {owner_path!r} declares a non-Replicate "
+                            f"TP placement ({bias_tp!r}) — D-22 deferred "
+                            f"addition requires the bias to stay Replicate "
+                            f"(added exactly once as a whole after the TP "
+                            f"reduction). Remove {param_name!r} from "
+                            f"spec.params, or change it to "
                             f"{{TP: replicate()}}")
                     owner = (module.get_submodule(owner_path)
                              if owner_path else module)
                     if not isinstance(owner, nn.Linear):
                         logger.warning(
-                            "boundary %s: rowwise Linear %r 带 bias 且边界 "
-                            "out_src 为 TP Partial——但 owner 类型是 %s（非 "
-                            "nn.Linear），框架不擅自修改其 forward 语义：bias 会在"
-                            " Partial 归约中被重复计数（production 输出 = 正确值 "
-                            "+ tp_size × bias）。请将 bias 移到边界通信之后、改用"
-                            " nn.Linear，或用 local_compute_fn 接管该区域",
+                            "boundary %s: rowwise Linear %r carries a bias "
+                            "and the boundary out_src is TP Partial — but "
+                            "the owner type is %s (not nn.Linear), so the "
+                            "framework does not touch its forward semantics: "
+                            "the bias will be counted multiple times by the "
+                            "Partial reduction (production output = correct "
+                            "value + tp_size × bias). Move the bias after "
+                            "the boundary communication, switch to "
+                            "nn.Linear, or take over the region with "
+                            "local_compute_fn",
                             module_fqn, owner_path, type(owner).__name__)
                         continue
                     deferred.append(param_name)
@@ -1486,26 +1535,32 @@ class ShardingPlanner:
                         bias_dim = (bias_tp.dim if bias_tp.dim >= 0
                                     else bias_tp.dim + param.ndim)
                     if bias_dim != shard_dim:
-                        declared = repr(bias_tp) if bias_named else "未声明"
+                        declared = repr(bias_tp) if bias_named else "undeclared"
                         raise ValueError(
-                            f"boundary {module_fqn!r}: {weight_path!r} 沿输出维 "
-                            f"Shard({shard_dim}) 切分，但 {param_name!r} 未随输出"
-                            f"通道同样切分（{declared}）——模板不匹配（典型："
-                            f"lm_head.bias）。请用 plan_overrides 显式声明 "
-                            f"{{'{param_name}': {{TP: shard({shard_dim})}}}}，"
-                            f"或移除该 bias")
+                            f"boundary {module_fqn!r}: {weight_path!r} is "
+                            f"sharded along the output dim as "
+                            f"Shard({shard_dim}), but {param_name!r} is not "
+                            f"sharded along the output channels the same way "
+                            f"({declared}) — template mismatch (typical: "
+                            f"lm_head.bias). Declare it explicitly via "
+                            f"plan_overrides as "
+                            f"{{'{param_name}': {{TP: shard({shard_dim})}}}}, "
+                            f"or remove the bias")
             spec._deferred_bias_params = tuple(deferred)  # pylint: disable=protected-access
             if deferred:
                 logger.info(
-                    "boundary %s: 后置 bias（D-22，TP 归约后恰好加一次）: %s",
+                    "boundary %s: deferred bias (D-22, added exactly once "
+                    "after the TP reduction): %s",
                     module_fqn, list(deferred))
 
     @staticmethod
     def _normalize_contract_fields(plan: ShardingPlan) -> None:
-        """plan 输出规范化：params/in_src/in_dst 的 None（未声明）→ {}。
+        """Plan output normalization: None (undeclared) of
+        params/in_src/in_dst → {}.
 
-        "不写继承，写了照办"是输入侧语义；plan 内的 spec 恒为具体值，
-        applier / D-14 检查等下游消费者无需 None 分支。
+        "Unset inherits, written is honored" is input-side semantics; specs
+        inside the plan always hold concrete values, so downstream consumers
+        (the applier, the D-14 checks, etc.) need no None branches.
         """
         for spec in plan.modules.values():
             for attr in ("params", "in_src", "in_dst"):
@@ -1531,27 +1586,32 @@ class ShardingPlanner:
                     p.name for p in sig.parameters.values()
                     if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
                                   inspect.Parameter.KEYWORD_ONLY)
-                    and p.default is inspect.Parameter.empty  # 必填入参
+                    and p.default is inspect.Parameter.empty  # required input parameters
                 ]
                 if names:
                     in_names = names
             except (TypeError, ValueError):
                 pass
             param_names = [n for n, _ in module.named_parameters(recurse=False)]
-        axis = "tp"   # 草稿占位轴——按实际拓扑调整
+        axis = "tp"   # draft placeholder axis — adjust to the actual topology
         lines = [f'  - match: "{fqn}"']
         if param_names:
-            lines.append("    params:  # 逐参数选切分维（显式 {} = 本边界不切参数）")
+            lines.append("    params:  # choose a shard dim per parameter "
+                         "(explicit {} = this boundary shards no params)")
             lines.extend(f"      {n}: {{{axis}: \"shard(0)\"}}"
                          for n in param_names)
         else:
-            lines.append("    params: {}   # 无直接参数 / 纯 I/O 缝合边界")
+            lines.append("    params: {}   # no direct parameters / pure "
+                         "I/O-stitch boundary")
         in_entries = ", ".join(f'{n}: {{{axis}: "shard(1)"}}'
                                for n in in_names)
-        lines.append(f"    in_src:  {{{in_entries}}}   # 入口现状 = 上游出口布局")
-        lines.append(f"    in_dst:  {{{in_entries}}}   # 与 in_src 不同则插入通信")
+        lines.append(f"    in_src:  {{{in_entries}}}   "
+                     "# entry status quo = upstream exit layout")
+        lines.append(f"    in_dst:  {{{in_entries}}}   "
+                     "# differing from in_src inserts communication")
         lines.append(f'    out_src: {{output: {{{axis}: "replicate"}}}}'
-                     "   # 多输出模块改成多键并补 out_names")
+                     "   # multi-output modules: use multiple keys and add "
+                     "out_names")
         lines.append(f'    out_dst: {{output: {{{axis}: "replicate"}}}}')
         return "\n".join(lines)
 
@@ -1564,33 +1624,43 @@ class ShardingPlanner:
             value = getattr(user_spec, attr)
             if isinstance(value, str):
                 reason = (
-                    "derive=False：模板推导已整体关闭，plan 里没有任何推导值——"
+                    "derive=False: template derivation is disabled "
+                    "entirely, so the plan holds no derived values — "
                     if not derive else
-                    "insert（未命中任何推导边界）——")
+                    "insert (no derived boundary was hit) — ")
                 raise ValueError(
-                    f"{source}[{fqn!r}] 契约字段 {attr}={value!r} 无意义："
-                    f"{reason}"
-                    "'auto'（继承推导）/'none'（清空继承值）哨兵只作用于 merge "
-                    "命中的推导边界，没有推导值就没有可继承/可清空的来源。"
-                    "请显式声明：具体 dict 给切分/契约，显式空 {} 表示本边界"
-                    "不切参数（参数保持复制）/无该项契约")
+                    f"{source}[{fqn!r}] contract field {attr}={value!r} is "
+                    f"meaningless: {reason}"
+                    "the 'auto' (inherit the derivation) / 'none' (clear "
+                    "the inherited value) sentinels only apply to derived "
+                    "boundaries hit by a merge; with no derived value there "
+                    "is nothing to inherit/clear. Declare explicitly: a "
+                    "concrete dict for the sharding/contract, an explicit "
+                    "empty {} for a boundary that shards no params (params "
+                    "stay replicated) / has no such contract")
         if all(getattr(user_spec, attr) is None for attr in
                ("params", "in_src", "in_dst", "out_src", "out_dst")):
             hint = ""
             if model is not None:
                 hint = (
-                    "\n建议草稿（按模块 forward 签名/直接参数推导，placement "
-                    "为占位值，请按布局语义修正）:\n"
+                    "\nSuggested draft (derived from the module forward "
+                    "signature/direct parameters; placements are "
+                    "placeholders — fix them per the layout semantics):\n"
                     + ShardingPlanner._suggest_insert_skeleton(model, fqn))
             derive_note = (
-                "derive=False 已关闭模板推导——所有 override 都是 insert，"
-                "不存在可继承的推导值；" if not derive else "")
+                "derive=False has disabled template derivation — every "
+                "override is an insert and there are no derived values to "
+                "inherit; " if not derive else "")
             raise ValueError(
-                f"{source}[{fqn!r}] 未命中任何 planner 推导边界，且 params 与 "
-                "I/O 契约全部未声明——" + derive_note +
-                "空字段继承（merge）只对已推导边界生效；"
-                "插入新边界必须完整自声明契约（05 §3.6.7 / D-14；显式空 {} "
-                "也是合法声明，如 params={} 的纯 I/O 缝合边界），或检查 fqn 拼写"
+                f"{source}[{fqn!r}] hit no planner-derived boundary and "
+                "leaves params and the I/O contract all undeclared — "
+                + derive_note +
+                "empty-field inheritance (merge) only applies to derived "
+                "boundaries; inserting a new boundary requires a fully "
+                "self-declared contract (05 §3.6.7 / D-14; an explicit "
+                "empty {} is also a valid declaration, e.g. the pure "
+                "I/O-stitch boundary with params={}), or check the fqn "
+                "spelling"
                 + hint)
         spec = copy.deepcopy(user_spec)
         _normalize_out_fields(spec)
@@ -1846,7 +1916,7 @@ class ShardingPlanner:
 
 
 def validate_model_compatibility(
-    model, *, tp_size: int = 1, cp_size: int = 1, ep_size: int = 1,
+    model: Any, *, tp_size: int = 1, cp_size: int = 1, ep_size: int = 1,
     seq_len: Optional[int] = None,
 ) -> None:
     """Model-side compatibility validation (05 §6.5; division of labor

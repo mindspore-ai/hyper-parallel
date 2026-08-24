@@ -20,7 +20,7 @@ AutoPipeline splits the model into PP stages in-place (model.parts).
 import logging
 from typing import Any
 
-import torch.nn as nn
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -28,15 +28,18 @@ logger = logging.getLogger(__name__)
 class AutoPipeline:
     """Pipeline Parallelism manager stub."""
 
-    def __init__(self, pipeline_config: Any, mesh_context: Any):
+    def __init__(self, pipeline_config: Any, mesh_context: Any) -> None:
+        """Store the pipeline config and mesh context for a later build."""
         self.config = pipeline_config
         self.mesh_context = mesh_context
 
     def build(self, model: nn.Module, loss_fn: nn.Module | None = None) -> None:
         """Split model into PP stages in-place.
 
-        Stub: logs a warning and leaves model unchanged.
+        Stub: logs a warning and leaves model unchanged. `model` and
+        `loss_fn` are accepted for interface compatibility only.
         """
+        _ = (model, loss_fn)  # Stub: accepted for interface compatibility.
         logger.warning("AutoPipeline.build is a stub; PP stage splitting not implemented")
 
 

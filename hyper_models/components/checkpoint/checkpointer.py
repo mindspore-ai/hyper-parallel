@@ -131,7 +131,9 @@ class CheckpointerBase(ABC):
 @CHECKPOINTER_REGISTRY.register("dcp")
 def _dcp_checkpointer(**kwargs: Any) -> CheckpointerBase:
     """Construct the distributed-checkpoint (DCP) backend."""
-    from hyper_models.components.checkpoint.dcp_checkpointer import (
+    # Imported lazily: dcp_checkpointer imports CheckpointerBase from this
+    # module, so a top-level import here would be circular.
+    from hyper_models.components.checkpoint.dcp_checkpointer import (  # pylint: disable=import-outside-toplevel
         DistributedCheckpointer,
     )
 

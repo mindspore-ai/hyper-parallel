@@ -215,9 +215,9 @@ class FSDP2Manager:
         """
         mix_precision = self.config.mix_precision
         dtypes = {
-            name: getattr(platform.tensor_dtype, mix_precision.__getattribute__(name))
+            name: getattr(platform.tensor_dtype, getattr(mix_precision, name))
             for name in ("param_dtype", "reduce_dtype", "output_dtype")
-            if mix_precision.__getattribute__(name) is not None
+            if getattr(mix_precision, name) is not None
         }
         return fully_shard_utils.MixedPrecisionPolicy(**dtypes)
 

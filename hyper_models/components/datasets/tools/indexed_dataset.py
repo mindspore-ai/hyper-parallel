@@ -63,7 +63,12 @@ from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
 
-def safe_import(module, *, msg=None, alt=None):
+def safe_import(
+    module: str,
+    *,
+    msg: Optional[str] = None,
+    alt: Optional[Any] = None,
+) -> Tuple[bool, Optional[Any]]:
     """
     A function used to import modules that may not be available.
 
@@ -87,8 +92,6 @@ def safe_import(module, *, msg=None, alt=None):
     except ImportError:
         exception_text = traceback.format_exc()
         logger.debug(f"Import of {module} failed with: {exception_text}")
-    except Exception:
-        raise
     if msg is None:
         msg = f"{module} could not be imported"
     if alt is None:
@@ -247,10 +250,9 @@ class DType(Enum):
         """
         if isinstance(key, int):
             return cls.dtype_from_code(key)().itemsize
-        elif numpy.number in key.__mro__:
+        if numpy.number in key.__mro__:
             return key().itemsize
-        else:
-            raise ValueError("Invalid key passed to DType.size()")
+        raise ValueError("Invalid key passed to DType.size()")
 
     @classmethod
     def optimal_dtype(cls, cardinality: Optional[int]) -> Type[numpy.number]:
@@ -267,7 +269,7 @@ class DType(Enum):
         return numpy.int32
 
 
-class _IndexWriter(object):
+class _IndexWriter:
     """Object class to write the index (.idx) file
 
     Args:
@@ -277,6 +279,13 @@ class _IndexWriter(object):
     """
 
     def __init__(self, idx_path: str, dtype: Type[numpy.number]) -> None:
+        """Initialize the _IndexWriter
+
+        Args:
+            idx_path (str): The path to the index file.
+
+            dtype (Type[numpy.number]): The dtype of the index file.
+        """
         self.idx_path = idx_path
         self.dtype = dtype
 
@@ -314,7 +323,6 @@ class _IndexWriter(object):
             Optional[bool]: Whether to silence the exception
         """
         self.idx_writer.close()
-        return None
 
     def write(
         self,
@@ -382,6 +390,13 @@ class _IndexReader:
     """
 
     def __init__(self, idx_path: str, multimodal: bool) -> None:
+        """Initialize the _IndexReader
+
+        Args:
+            idx_path (str): The path to the index file.
+
+            multimodal (bool): Whether the dataset is multimodal.
+        """
         logger.info("Loading index file %s", idx_path)
 
         with open(idx_path, "rb") as f:
@@ -491,7 +506,6 @@ class _BinReader(ABC):
             numpy.ndarray: An array with `count` items and data-type `dtype` constructed from
                 reading bytes from the data file starting at `offset`.
         """
-        pass
 
 
 class _MMapBinReader(_BinReader):
@@ -503,7 +517,8 @@ class _MMapBinReader(_BinReader):
         Args:
             bin_path (str): The path to the data (.bin) file.
         """
-        self._file = open(bin_path, "rb")
+        # The file must stay open for the reader's lifetime; it is closed in __del__.
+        self._file = open(bin_path, "rb")  # pylint: disable=R1732
         self._mmap = numpy.memmap(self._file, mode="r", order="C")
         self._buffer = memoryview(self._mmap.data)
 
@@ -573,6 +588,13 @@ class _S3BinReader(_BinReader):
     """
 
     def __init__(self, bin_path: str, object_storage_config: ObjectStorageConfig) -> None:
+        """Initialize the _S3BinReader
+
+        Args:
+            bin_path (str): The ``s3://bucket/key`` URI of the data (.bin) object.
+
+            object_storage_config (ObjectStorageConfig): Chunked-read configuration.
+        """
         if not HAS_BOTO3:
             raise ImportError("boto3 is required to read s3:// datasets. Install via `pip install boto3`.")
         if object_storage_config.bin_chunk_nbytes <= 0:
@@ -624,6 +646,15 @@ class _MultiStorageClientBinReader(_BinReader):
     """Read ``.bin`` data via NVIDIA's :mod:`multi_storage_client`."""
 
     def __init__(self, bin_path: str, object_storage_config: ObjectStorageConfig) -> None:
+        """Initialize the _MultiStorageClientBinReader
+
+        Args:
+            bin_path (str): The ``msc://`` URI of the data (.bin) object.
+
+            object_storage_config (ObjectStorageConfig): Accepted for constructor
+                parity with the other object-storage bin readers; unused here.
+        """
+        del object_storage_config
         if not HAS_MSC:
             raise ImportError(
                 "multi_storage_client is required to read msc:// datasets. "
@@ -690,6 +721,15 @@ class IndexedDataset(torch.utils.data.Dataset):
         mmap: bool,
         object_storage_config: Optional[ObjectStorageConfig] = None,
     ) -> None:
+        """Open the index and data readers for a dataset prefix.
+
+        Args:
+            path_prefix (str): The index (.idx) and data (.bin) prefix.
+            multimodal (bool): Whether the dataset is multimodal.
+            mmap (bool): Whether to mmap the .bin files.
+            object_storage_config (Optional[ObjectStorageConfig]): Object-storage
+                configuration used for ``s3://``/``msc://`` prefixes.
+        """
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
 
@@ -716,6 +756,11 @@ class IndexedDataset(torch.utils.data.Dataset):
         self.index = index_reader
 
     def __len__(self) -> int:
+        """Get the number of sequences in the dataset
+
+        Returns:
+            int: The number of sequences in the dataset
+        """
         return len(self.index)
 
     def __getitem__(
@@ -726,12 +771,23 @@ class IndexedDataset(torch.utils.data.Dataset):
         List[numpy.ndarray],
         Tuple[List[numpy.ndarray], numpy.ndarray],
     ]:
+        """Read one sequence or a contiguous slice of sequences.
+
+        Args:
+            idx (Union[int, numpy.integer, slice]): The index or contiguous
+                (step=1) slice into the dataset.
+
+        Returns:
+            Union[numpy.ndarray, Tuple[numpy.ndarray, Any], List[numpy.ndarray],
+                Tuple[List[numpy.ndarray], numpy.ndarray]]: The sequence(s), each
+                paired with its mode when the dataset is multimodal.
+        """
         if isinstance(idx, (int, numpy.integer)):
             ptr, length, mode = self.index[idx]
             seq = self.bin_reader.read(self.index.dtype, length, ptr)
             return (seq, mode) if mode is not None else seq
 
-        elif isinstance(idx, slice):
+        if isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             if step != 1:
                 raise ValueError("Slices into IndexedDataset must be contiguous (step=1)")
@@ -746,12 +802,23 @@ class IndexedDataset(torch.utils.data.Dataset):
             sequences = numpy.split(buffer, offsets[:-1])
             return (sequences, modes) if modes is not None else sequences
 
-        else:
-            raise TypeError(f"Unexpected index type {type(idx)}")
+        raise TypeError(f"Unexpected index type {type(idx)}")
 
     def get(
         self, idx: int, offset: int = 0, length: Optional[int] = None
     ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, Any]]:
+        """Read a sub-range of one sequence.
+
+        Args:
+            idx (int): The index into the dataset.
+            offset (int): Number of leading elements to skip. Defaults to 0.
+            length (Optional[int]): Number of elements to read; defaults to the
+                remainder of the sequence.
+
+        Returns:
+            Union[numpy.ndarray, Tuple[numpy.ndarray, Any]]: The sequence
+                sub-range, paired with its mode for multimodal datasets.
+        """
         ptr, seq_len, mode = self.index[idx]
         length = seq_len - offset if length is None else length
         ptr += offset * DType.size(self.index.dtype)
@@ -759,21 +826,32 @@ class IndexedDataset(torch.utils.data.Dataset):
         return (seq, mode) if mode is not None else seq
 
     @property
-    def sequence_lengths(self):  # numpy.ndarray[int32]
+    def sequence_lengths(self) -> numpy.ndarray:
+        """The length of each sequence in the dataset (numpy.int32 array)."""
         return self.index.sequence_lengths
 
     @property
-    def document_indices(self):  # numpy.ndarray[int64]
+    def document_indices(self) -> numpy.ndarray:
+        """The sequence indices demarcating documents (numpy.int64 array)."""
         return self.index.document_indices
 
     @staticmethod
     def exists(path_prefix: str) -> bool:
+        """Return whether the .idx and .bin files exist for a dataset prefix.
+
+        Args:
+            path_prefix (str): The index (.idx) and data (.bin) prefix.
+
+        Returns:
+            bool: Whether both files exist; object-storage prefixes always
+                return ``True`` and defer the check to download time.
+        """
         if _is_object_storage_path(path_prefix):
             return True  # existence check deferred to download time
         return os.path.exists(get_idx_path(path_prefix)) and os.path.exists(get_bin_path(path_prefix))
 
 
-class IndexedDatasetBuilder(object):
+class IndexedDatasetBuilder:
     """Builder class for the IndexedDataset class
 
     Args:
@@ -785,7 +863,19 @@ class IndexedDatasetBuilder(object):
     """
 
     def __init__(self, bin_path: str, dtype: Type[numpy.number] = numpy.int32, multimodal: bool = False) -> None:
-        self.data_file = open(bin_path, "wb")
+        """Initialize the IndexedDatasetBuilder
+
+        Args:
+            bin_path (str): The path to the data (.bin) file.
+
+            dtype (Type[numpy.number], optional): The dtype of the index file.
+                Defaults to numpy.int32.
+
+            multimodal (bool, optional): Whether the dataset is multimodal.
+                Defaults to False.
+        """
+        # The data file must stay open until finalize(); it is closed there.
+        self.data_file = open(bin_path, "wb")  # pylint: disable=R1732
         self.dtype = dtype
         self.multimodal = multimodal
 

@@ -16,10 +16,10 @@
 
 import logging
 from collections.abc import Callable
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
     CheckpointPolicy,
@@ -84,7 +84,7 @@ def _default_compute_intensive_ops() -> tuple:
     """Get PyTorch's compute-intensive operator list when the private API exists."""
     try:
         # This private PyTorch API is unavailable on some supported versions.
-        from torch._functorch.partitioners import get_default_op_list
+        from torch._functorch.partitioners import get_default_op_list  # pylint: disable=import-outside-toplevel
 
         return tuple(op.default for op in get_default_op_list().compute_intensive_ops)
     except (ImportError, AttributeError, RuntimeError):
@@ -339,7 +339,27 @@ def _make_selective_checkpoint_policy_fn() -> Callable:
     """Create an isolated selective activation checkpointing policy."""
     matmul_counts = {False: 0, True: 0}
 
-    def selective_checkpointing_policy(ctx, func, *args, **kwargs):
+    def selective_checkpointing_policy(
+        ctx: Any,
+        func: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> CheckpointPolicy:
+        """Decide whether ``func``'s output is saved or recomputed.
+
+        Follows the selective-activation-checkpointing policy contract: matmuls
+        alternate between save and recompute, expensive/communication ops are
+        always saved, and everything else is recomputed.
+
+        Args:
+            ctx: Checkpoint context carrying the ``is_recompute`` phase flag.
+            func: The operator being traced.
+            *args: Operator arguments (unused).
+            **kwargs: Operator keyword arguments (unused).
+
+        Returns:
+            The checkpoint policy for ``func``.
+        """
         del args, kwargs
         if func in _SELECTIVE_AC_FORCE_RECOMPUTE_OPS:
             return CheckpointPolicy.MUST_RECOMPUTE
@@ -369,7 +389,13 @@ def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]
     ensure_profiler_ops_sac_ignored()
     ensure_fsdp_ops_sac_ignored()
 
-    def selective_checkpoint_context_fn():
+    def selective_checkpoint_context_fn() -> tuple[object, object]:
+        """Create a fresh pair of forward/recompute selective-AC contexts.
+
+        Returns:
+            The ``(forward_context, recompute_context)`` pair expected by the
+            non-reentrant checkpointing ``context_fn`` contract.
+        """
         return platform.create_selective_checkpoint_contexts(
             _make_selective_checkpoint_policy_fn()
         )
@@ -516,7 +542,9 @@ def _should_use_hf_native_gradient_checkpointing(
         return False
 
     try:
-        from transformers.modeling_layers import GradientCheckpointingLayer
+        # Guarded import: transformers is optional and older versions may not
+        # expose GradientCheckpointingLayer.
+        from transformers.modeling_layers import GradientCheckpointingLayer  # pylint: disable=import-outside-toplevel
     except ImportError:
         return False
 
@@ -728,7 +756,15 @@ def _apply_activation_checkpointing(
                 ensure_profiler_ops_sac_ignored()
                 ensure_fsdp_ops_sac_ignored()
 
-                def compile_checkpoint_wrapper(layer):
+                def compile_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
+                    """Wrap ``layer`` with selective-AC policy for compile mode.
+
+                    Args:
+                        layer: Transformer layer to wrap.
+
+                    Returns:
+                        The checkpoint-wrapped layer.
+                    """
                     return checkpoint_wrapper(
                         layer,
                         policy_fn=_make_selective_checkpoint_policy_fn(),

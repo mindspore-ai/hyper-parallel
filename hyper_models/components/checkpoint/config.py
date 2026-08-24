@@ -64,9 +64,11 @@ class CheckpointingConfig:
     restore_train_state: bool = True  # step/epoch, lr_scheduler, dataloader, RNG
 
     model_save_format: str = "safetensors"
-    # 是否额外输出合并的 HF 权重："none"（从不）| "final"（仅训练结束）| "every"（每次保存）。
-    # 关闭档统一为 "none"（YAML 安全的 Literal 取值），替代旧设计枚举的 "false"
-    # （"false" 会被 PyYAML 解析为 bool，见 04_checkpoint.md §4.2 口径裁决）。
+    # Whether to additionally export merged HF weights: "none" (never) |
+    # "final" (only at the end of training) | "every" (on every save).
+    # The disabled setting is uniformly "none" (a YAML-safe Literal value),
+    # replacing the old design's "false" enum value ("false" would be parsed
+    # as a bool by PyYAML; see the decision in 04_checkpoint.md section 4.2).
     save_consolidated: Literal["none", "final", "every"] = "final"
     staging_dir: Optional[str] = None
     best_metric_key: str = "default"

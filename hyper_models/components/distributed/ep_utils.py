@@ -47,6 +47,7 @@ Public primitives:
 """
 
 import types
+from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -79,7 +80,14 @@ class _EPAllToAllUneven(torch.autograd.Function):  # pylint: disable=abstract-me
     """
 
     @staticmethod
-    def forward(ctx, x, send_counts, recv_counts, group):  # pylint: disable=arguments-differ
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        send_counts: list[int],
+        recv_counts: list[int],
+        group: Any,
+    ) -> torch.Tensor:  # pylint: disable=arguments-differ
+        """Run the ragged all_to_all and retain the counts for backward."""
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
         ctx.group = group
@@ -89,7 +97,11 @@ class _EPAllToAllUneven(torch.autograd.Function):  # pylint: disable=abstract-me
         return out
 
     @staticmethod
-    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None]:  # pylint: disable=arguments-differ
+        """Swap send/recv counts and re-run the self-inverse ragged all_to_all."""
         grad = _EPAllToAllUneven.apply(
             grad_output.contiguous(), ctx.recv_counts, ctx.send_counts, ctx.group)
         return grad, None, None, None
@@ -132,7 +144,13 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         return torch.cat(pieces)
 
     @staticmethod
-    def forward(ctx, x, send_counts, recv_counts, group):  # pylint: disable=arguments-differ
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        send_counts: list[int],
+        recv_counts: list[int],
+        group: Any,
+    ) -> torch.Tensor:  # pylint: disable=arguments-differ
         """Exchange padded expert-token chunks and retain counts for backward."""
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
@@ -145,7 +163,11 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         return _EPAllToAllPadded._unpad(recv, recv_counts, pad_to)
 
     @staticmethod
-    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None]:  # pylint: disable=arguments-differ
+        """Reverse the exchange: pad by recv_counts, a2a_single, unpad by send_counts."""
         # backward = reversed a2a: pad by recv_counts -> a2a_single -> unpad by send_counts
         recv = _EPAllToAllPadded._pad_and_exchange(
             grad_output.contiguous(), ctx.recv_counts, ctx.pad_to, ctx.group)
@@ -153,7 +175,12 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         return grad, None, None, None
 
 
-def ep_all_to_all(x, send_counts, recv_counts, group):
+def ep_all_to_all(
+    x: torch.Tensor,
+    send_counts: list[int],
+    recv_counts: list[int],
+    group: Any,
+) -> torch.Tensor:
     """Unified entry for EP token exchange (autograd-differentiable).
 
     send_counts/recv_counts: list[int], length ep_size, row counts per dest/src rank.
@@ -291,7 +318,9 @@ MOE_ROUTER_ADAPTERS = {
 # EP forward for HF-native MoE (D-09c)
 # ────────────────────────────────────────────────────────────────────────────
 
-def resolve_swiglu_weights(experts):
+def resolve_swiglu_weights(
+    experts: Any,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Resolve SwiGLU weights from the stacked holder (three layouts).
 
     Returns (w_gate, w_up, w_down):
@@ -401,7 +430,11 @@ def _get_global_expert_count(module):
     )
 
 
-def bind_local_expert_forward(module, ep_size, use_grouped_gemm=False):
+def bind_local_expert_forward(
+    module: Any,
+    ep_size: int,
+    use_grouped_gemm: bool = False,
+) -> None:
     """Install the local expert compute entry used by TP-extend-EP.
 
     Called by the EP compute factory (archetype or user-written) at apply
@@ -442,7 +475,13 @@ def bind_local_expert_forward(module, ep_size, use_grouped_gemm=False):
 # MoEAlltoAllTokenDispatcher + expert_tensor_parallel_size=1)
 # ────────────────────────────────────────────────────────────────────────────
 
-def ep_routed_forward(module, hidden_states, *, router_fn, ep_group):
+def ep_routed_forward(
+    module: Any,
+    hidden_states: torch.Tensor,
+    *,
+    router_fn: Callable,
+    ep_group: Any,
+) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
 
@@ -587,7 +626,7 @@ def ep_routed_forward(module, hidden_states, *, router_fn, ep_group):
 # assertions with teaching errors + a structural diagnostic
 # ────────────────────────────────────────────────────────────────────────────
 
-def require_attrs(module, *names, owner: str = ""):
+def require_attrs(module: Any, *names: str, owner: str = "") -> None:
     """Assert that ``module`` has every attribute in ``names``; raise a
     teaching ValueError listing the module's ACTUAL children otherwise.
 
@@ -615,7 +654,7 @@ def require_attrs(module, *names, owner: str = ""):
     )
 
 
-def describe_moe_module(module) -> str:
+def describe_moe_module(module: Any) -> str:
     """Structural diagnostic for a MoE module: child submodules, direct
     parameter shapes, and expert-related attributes — the facts needed to
     pick an EP archetype or write a custom factory. Returns the report;

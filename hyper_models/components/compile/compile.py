@@ -141,7 +141,9 @@ def _install_dynamo_mapping_get_polyfill() -> None:
     replaces the implementation while Dynamo inlines it; eager execution
     continues to use the original method.
     """
-    global _MAPPING_GET_POLYFILL_INSTALLED
+    # Module-level idempotency flag: the polyfill must be installed at most
+    # once per process, so a global statement is required here.
+    global _MAPPING_GET_POLYFILL_INSTALLED  # pylint: disable=global-statement
     if _MAPPING_GET_POLYFILL_INSTALLED:
         return
 

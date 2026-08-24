@@ -30,12 +30,13 @@ import functools
 import importlib.metadata
 import inspect
 import logging
+from typing import Any, Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import nn
 
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import (
     Placement,
@@ -69,6 +70,7 @@ from hyper_models.components.distributed.sharding.apply import (
 )
 from hyper_models.components.distributed.sharding_config import (
     PlacementMismatchError,
+    ShardingPlan,
     _normalize_out_fields,
     resolve_placements,
 )
@@ -129,11 +131,13 @@ def _check_target_config_keys(target, kind):
     unknown = sorted(set(configured) - bindable)
     if unknown:
         raise ValueError(
-            f"{kind} Target {getattr(target, '_target_path', fn)!r} 配置了未声明的"
-            f"键 {unknown} —— Target 的 kwargs 按名绑定到目标函数的关键字形参，"
-            f"这些键不在 {getattr(fn, '__name__', fn)} 的显式形参列表中，会被 "
-            f"**kwargs 静默吞掉、不会生效（疑似拼写错误）。"
-            f"合法形参: {sorted(bindable) or '(无)'}")
+            f"{kind} Target {getattr(target, '_target_path', fn)!r} "
+            f"configures undeclared keys {unknown} — Target kwargs are "
+            f"bound by name to the keyword parameters of the target "
+            f"callable; these keys are not in the explicit parameter list "
+            f"of {getattr(fn, '__name__', fn)} and would be silently "
+            f"swallowed by **kwargs without taking effect (suspected "
+            f"typo). Valid parameters: {sorted(bindable) or '(none)'}")
 
 
 def _preflight_compute_injection(plan, mesh, model=None):
@@ -214,20 +218,24 @@ def _preflight_compute_injection(plan, mesh, model=None):
             if (spec.is_boundary and getattr(spec, "_needs_cp_attn", False)
                     and getattr(spec, "inner_wrapper", None) is None):
                 raise ValueError(
-                    f"cp_size={cp_mesh.size()} 已生效，attention 边界 {fqn!r} 需要 "
-                    "CP-aware 内部 forward（K/V all-gather），但未声明 "
-                    "inner_wrapper —— 框架不再启发式自动选择。请显式注入：\n"
+                    f"cp_size={cp_mesh.size()} is active, so attention "
+                    f"boundary {fqn!r} needs a CP-aware inner forward "
+                    "(K/V all-gather), but no inner_wrapper is declared — "
+                    "the framework no longer picks one heuristically. "
+                    "Inject explicitly:\n"
                     "  plan_overrides:\n"
                     "    - match: \"*.self_attn\"\n"
                     "      when: cp\n"
-                    "      region_dispatch: false   # wrapper 内含通信，不可 dispatch\n"
+                    "      region_dispatch: false   # the wrapper contains "
+                    "communication; must not dispatch\n"
                     "      inner_wrapper:\n"
                     "        _target_: hyper_models.components.distributed."
                     "cp_wrappers.sdpa_hf_cp_wrapper\n"
-                    f"（注册表 {sorted(INNER_WRAPPER_REGISTRY)} 可按 str 名引用；"
-                    "NeMo 风格 (q,k,v) 签名用 sdpa_qkv，HF 风格 "
-                    "forward(hidden_states) 用 sdpa_hf；或给 callable/"
-                    "Target 自定义实现）")
+                    f"(the registry {sorted(INNER_WRAPPER_REGISTRY)} can be "
+                    "referenced by str name; use sdpa_qkv for the "
+                    "NeMo-style (q,k,v) signature, sdpa_hf for the "
+                    "HF-style forward(hidden_states); or provide a custom "
+                    "callable/Target implementation)")
     for fqn, spec in plan.modules.items():
         if (spec.is_boundary and getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
                 and getattr(spec, "local_compute_fn", None) is None
@@ -238,74 +246,97 @@ def _preflight_compute_injection(plan, mesh, model=None):
                 archetype = EP_ARCHETYPE_SUGGESTIONS.get(arch)
                 if archetype is not None:
                     suggestion = (
-                        f"检测到模型架构 {arch!r}，对应 archetype 可能是 "
-                        f"{archetype!r}（建议而非自动选择——请确认后显式配置；"
-                        "选错会在 apply 期接口断言报错并列出模块实际子模块名）。\n"
+                        f"Detected model architecture {arch!r}; the "
+                        f"matching archetype is likely {archetype!r} (a "
+                        "suggestion, not an automatic choice — confirm and "
+                        "configure it explicitly; a wrong pick fails the "
+                        "apply-time interface assertion and lists the "
+                        "module's actual submodule names).\n"
                     )
             raise ValueError(
-                f"ep_size={spec._ep_size} 已生效（专家参数将按 {{EP: Shard(0)}} "  # pylint: disable=protected-access
-                f"分片），但边界 {fqn!r} 没有 local-region 计算来源 —— 专家计算与 "
-                "all-to-all 无人执行，框架不再自动注入任何实现。请选择其一：\n"
+                f"ep_size={spec._ep_size} is active (expert parameters "  # pylint: disable=protected-access
+                f"will be sharded as {{EP: Shard(0)}}), but boundary "
+                f"{fqn!r} has no local-region compute source — nothing "
+                "executes the expert compute and all-to-all, and the "
+                "framework no longer injects any implementation "
+                "automatically. Choose one of:\n"
                 f"{suggestion}"
-                "  ① 按模型行为选择内置 archetype 工厂（完整语义：router / "
-                "shared expert / gate / merge 全部内聚实现；可选 archetype 与"
-                "各自期望的模块接口见 ep_compute.py 模块 docstring）：\n"
+                "  ① Pick a built-in archetype factory per the model's "
+                "behavior (full semantics: router / shared expert / gate / "
+                "merge all implemented cohesively; see the ep_compute.py "
+                "module docstring for the available archetypes and the "
+                "module interface each one expects):\n"
                 "     plan_overrides:\n"
                 "       - match: \"*.mlp\"\n"
                 "         when: ep\n"
-                "         region_dispatch: false   # a2a 在区域内，不可 dispatch\n"
+                "         region_dispatch: false   # a2a is inside the "
+                "region; must not dispatch\n"
                 "         local_compute_fn:\n"
                 "           _target_: hyper_models.components.distributed."
-                "ep_compute.qwen2moe_ep_compute_fn   # 按 archetype 表选择\n"
-                "  ② 非典型 MoE → 参照 examples/distributed/ep_factories.py "
-                "自写工厂（用 require_attrs 获得同样的构建期接口校验）\n"
-                "  ③ 自研 EP-aware MoE（forward 内已含 all-to-all）→ 声明 "
-                "region_dispatch: false")
+                "ep_compute.qwen2moe_ep_compute_fn   # pick per the "
+                "archetype table\n"
+                "  ② Atypical MoE → write your own factory following "
+                "examples/distributed/ep_factories.py (use require_attrs "
+                "for the same build-time interface validation)\n"
+                "  ③ In-house EP-aware MoE (all-to-all already inside "
+                "forward) → declare region_dispatch: false")
 
 
 def _require_region_dispatch(spec, *, source):
-    """注入纪律：声明注入（local_compute_fn / inner_wrapper）必须显式给出
-    region_dispatch（无默认——可 dispatch 的纯算子注入传 True，含通信/
-    自定义 kernel 的传 False；教程与示例逐一说明原因）。"""
+    """Injection discipline: declaring an injection (local_compute_fn /
+    inner_wrapper) requires an explicit region_dispatch (no default — pass
+    True for a dispatchable pure-ops injection, False for one containing
+    communication primitives / custom kernels; the tutorials and examples
+    explain the reasons case by case)."""
     rd = getattr(spec, "region_dispatch", None)
     has_injection = (getattr(spec, "local_compute_fn", None) is not None
                      or getattr(spec, "inner_wrapper", None) is not None)
     if rd is None:
         if has_injection:
             raise ValueError(
-                f"{source}: 声明了注入但 region_dispatch 未显式声明（无默认值）"
-                "——注入物是纯标准算子、validate 可 dispatch 穿透（融合算子/"
-                "脚本写法优化）→ region_dispatch=True（区域内策略传播 + "
-                "out_src 真校验）；注入物含通信原语/自定义 kernel（CP K/V "
-                "all-gather、EP all-to-all、量化 GEMM 等）→ "
-                "region_dispatch=False（骨架/适配器黑盒托管 local 执行 + "
-                "声明式重包）")
+                f"{source}: an injection is declared but region_dispatch "
+                "is not explicitly declared (no default) — if the "
+                "injected fn is pure standard ops that validate can "
+                "dispatch through (fused-op/scripting-style optimizations) "
+                "→ region_dispatch=True (in-region strategy propagation + "
+                "true out_src validation); if it contains communication "
+                "primitives/custom kernels (CP K/V all-gather, EP "
+                "all-to-all, quantized GEMM, etc.) → "
+                "region_dispatch=False (skeleton/adapter black-box hosted "
+                "local execution + declarative rewrap)")
         return
     if rd is True and not has_injection:
         raise ValueError(
-            f"{source}: region_dispatch=True 但未声明任何注入——普通边界的 "
-            "forward 天然 dispatch 穿透（公理缺省），该声明是冗余的，请删除")
+            f"{source}: region_dispatch=True but no injection is declared "
+            "— an ordinary boundary's forward dispatches through natively "
+            "(the axiomatic default), so this declaration is redundant; "
+            "remove it")
 
 
 def _log_injection_choice(module_fqn, spec):
-    """可观察性补强：注入边界的选择结果即时可见（一行 INFO/边界），形成
-    "声明 → 看到后果"的反馈闭环。必须在 _require_region_dispatch 之后调用
-    （此处注入 + region_dispatch 组合已合法）。"""
+    """Observability enhancement: the resolution chosen for an injection
+    boundary is immediately visible (one INFO line per boundary), closing
+    the "declare → see the consequence" feedback loop. Must be called after
+    _require_region_dispatch (the injection + region_dispatch combination is
+    already validated as legal at this point)."""
     rd = getattr(spec, "region_dispatch", None)
     has_fn = getattr(spec, "local_compute_fn", None) is not None
     has_wrap = getattr(spec, "inner_wrapper", None) is not None
     if not (has_fn or has_wrap or rd is not None):
-        return   # 普通边界：无注入、公理缺省穿透，不刷屏
+        return   # ordinary boundary: no injection, axiomatic default dispatch-through — do not spam the log
     what = "+".join(
         [x for x, ok in (("local_compute_fn", has_fn),
                          ("inner_wrapper", has_wrap)) if ok]
-    ) or "模块自身 forward（未注入 fn，region_dispatch=False 声明）"
+    ) or "the module's own forward (no fn injected, region_dispatch=False declared)"
     if rd is True:
-        effect = "validate 穿透真校验已启用（区域内策略传播 + out_src 真校验）"
-    else:  # False（None+注入已被 _require_region_dispatch 拦截）
-        effect = "黑盒托管（区域内 local 执行、跳过传播校验、声明式重包）"
+        effect = ("validate dispatch-through true validation enabled "
+                  "(in-region strategy propagation + true out_src "
+                  "validation)")
+    else:  # False (None + injection was already intercepted by _require_region_dispatch)
+        effect = ("black-box hosting (local execution inside the region, "
+                  "propagation checks skipped, declarative rewrap)")
     logger.info(
-        "boundary %s: 注入[%s], region_dispatch=%s → %s",
+        "boundary %s: injection[%s], region_dispatch=%s → %s",
         module_fqn, what, rd, effect)
 
 
@@ -446,8 +477,23 @@ def _build_runtime_source_shard_info(
 # Main entry (05 §4.1)
 # ────────────────────────────────────────────────────────────────────────────
 
-def apply_sharding_plan(model, plan, mesh, *, validate_mode=False):
+def apply_sharding_plan(
+    model: Any,
+    plan: ShardingPlan,
+    mesh: Any,
+    *,
+    validate_mode: bool = False,
+) -> Tuple[Any, Optional[Any]]:
     """Apply a ShardingPlan using a DeviceMesh or MeshContext.
+
+    Args:
+        model: The model to shard (an HF-style ``nn.Module``, or a list of
+            per-part models in PP scenarios).
+        plan: The :class:`ShardingPlan` produced by the planner.
+        mesh: A ``DeviceMesh`` or a :class:`MeshContext` carrying one.
+        validate_mode: When ``True``, keep parameters as DTensors and wrap
+            forwards for placement-propagation validation instead of the
+            production local-tensor path.
 
     Returns (model, source_shard_info):
     - production: at the Phase C entry, a one-shot `_local_params_context` permanently
@@ -585,7 +631,7 @@ def _build_expert_mesh(mesh, mesh_dim_names, ep_size):
                             init_backend=hasattr(mesh, "_dim_group_names"))
 
 
-def build_expert_mesh(mesh, ep_size: int):
+def build_expert_mesh(mesh: DeviceMesh, ep_size: int) -> DeviceMesh:
     """Public: derive the D-10 TP-extend-EP expert mesh (edp, ep) from *mesh*
     (the FULL mesh — the dense region must include dp/cp axes).
 
@@ -594,6 +640,13 @@ def build_expert_mesh(mesh, ep_size: int):
     NOT need to call this: the framework derives the expert mesh once at
     apply time (shared by parameter sharding and injected compute) and hands
     it to them as the ``ep_mesh`` context.
+
+    Args:
+        mesh: The full device mesh (dense region including dp/cp axes).
+        ep_size: The expert-parallel group size.
+
+    Returns:
+        The derived ``(edp, ep)`` expert mesh.
     """
     return _build_expert_mesh(mesh, tuple(mesh.mesh_dim_names), ep_size)
 
@@ -652,8 +705,18 @@ def _install_bias_suppression(module, spec):
         original = owner.forward
 
         @functools.wraps(original)
-        def bias_free_forward(*args, __original=original, __owner=owner,
-                              **kwargs):
+        def bias_free_forward(
+            *args: Any,
+            __original: Callable[..., Any] = original,
+            __owner: nn.Module = owner,
+            **kwargs: Any,
+        ) -> Any:
+            """Run the owner's forward with its bias temporarily hidden.
+
+            The bias Parameter object is restored on exit (even on error), so
+            state_dict/optimizer visibility is unchanged; only ``F.linear``
+            inside the region sees a bias-free Linear.
+            """
             bias = __owner.bias
             try:
                 __owner._parameters["bias"] = None  # pylint: disable=protected-access
@@ -745,9 +808,11 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         )
         keep_output_dtensor = _keep_loss_parallel_output(plan, spec)
         _bind_input_indices(boundary, module)
-        # 注入纪律：声明注入必须显式 region_dispatch；无注入声明 True 是冗余
+        # Injection discipline: a declared injection requires an explicit
+        # region_dispatch; declaring True without any injection is redundant
         _require_region_dispatch(spec, source=f"boundary {module_fqn!r}")
-        # 可观察性：注入选择结果即时可见（声明 → 后果 的反馈闭环）
+        # Observability: the injection choice is immediately visible (the
+        # "declare → consequence" feedback loop)
         _log_injection_choice(module_fqn, spec)
 
         # Step 0.5 (D-22): rowwise bias defer — install the bias-free region
@@ -758,7 +823,8 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         if spec._deferred_bias_params:  # pylint: disable=protected-access
             _install_bias_suppression(module, spec)
 
-        # Step 1: inner-wrap —— 通用"织入/替换 inner forward"机制
+        # Step 1: inner-wrap — the generic "weave into / replace the inner
+        # forward" mechanism
         # (D-01'': production and validate inject the same wrapper, so the
         # in-region computation is instruction-for-instruction identical).
         # NOT gated on cp_mesh since the generalization: the derived gate is
@@ -894,7 +960,9 @@ def _wrap_production_forward(
     original_forward = module.forward
 
     @functools.wraps(original_forward)
-    def production_forward(*args, **kwargs):
+    def production_forward(*args: Any, **kwargs: Any) -> Any:
+        """Production boundary forward: precompiled entry communication,
+        local computation, exit redistribution, then D-22 deferred biases."""
         args, kwargs = boundary.redistribute_inputs(args, kwargs)
         outputs = original_forward(*args, **kwargs)
         outputs = boundary.redistribute_outputs(
@@ -920,7 +988,10 @@ def _wrap_validate_forward(
     module_name = type(module).__name__
 
     @functools.wraps(original_forward)
-    def validate_forward(*args, **kwargs):
+    def validate_forward(*args: Any, **kwargs: Any) -> Any:
+        """Validate boundary forward: wrap inputs as DTensors, propagate
+        placements through the original forward, validate out_src, then
+        redistribute to out_dst."""
         # D-14 nesting (05 §13.4): detect whether the call arrives from an
         # outer DTensor-propagating boundary BEFORE Step 1 wraps everything
         # into DTensors (Step 1 would make the check useless).
@@ -1049,8 +1120,9 @@ def _build_local_compute_factory(factory, module, mesh, mesh_dim_names,
     }
     build_kwargs = fill_context_kwargs(
         meta, context, configured or {}, source=source)
-    # {**configured, **context}：与 Target.build 的绑定次序一致（上下文键是
-    # 保留名，fill_context_kwargs 已拒绝 configured 里的同名键）
+    # {**configured, **context}: same binding order as Target.build (context
+    # keys are reserved names; fill_context_kwargs already rejects same-name
+    # keys in configured)
     compute_fn = factory(**{**(configured or {}), **build_kwargs})
     if not callable(compute_fn):
         raise TypeError(
@@ -1213,7 +1285,10 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         install_local_compute_forward_adapters(module, exclude=exclude_subtrees)
 
     @functools.wraps(original_forward)
-    def local_region_forward(*args, **kwargs):
+    def local_region_forward(*args: Any, **kwargs: Any) -> Any:
+        """Local-region forward: boundary entry → local region computation →
+        re-wrap per the declared out_src → boundary exit (both modes share
+        this wrapper)."""
         # Step 1: PrecompiledBoundary entry (e.g. TP all-gather; identity passthrough)
         args, kwargs = boundary.redistribute_inputs(
             args, kwargs, as_dtensor=validate_mode)
@@ -1227,11 +1302,15 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
                 output = compute_fn(*args, **kwargs)
             except Exception as exc:
                 raise type(exc)(
-                    f"{exc}\n[region_dispatch=True] validate 穿透注入函数时"
-                    " dispatch 失败——注入物含不可 dispatch 的通信原语/自定义"
-                    " kernel？请改声明 region_dispatch=False（骨架黑盒托管）"
+                    f"{exc}\n[region_dispatch=True] dispatch failed while "
+                    "validate was dispatching through the injected "
+                    "function — does the injection contain "
+                    "non-dispatchable communication primitives/custom "
+                    "kernels? Declare region_dispatch=False instead "
+                    "(skeleton black-box hosting)"
                 ) from exc
-            # 真校验：传播结果 vs out_src 声明（声明错即 fail-fast）
+            # True validation: propagated result vs the out_src declaration
+            # (a wrong declaration fails fast)
             if spec.out_src is not None:
                 _validate_out_src(output, spec, mesh_dim_names,
                                   type(module).__name__)
@@ -1288,8 +1367,10 @@ def _resolve_inner_target(module, spec=None):
     explicit = getattr(spec, "inner_target", None) if spec is not None else None
     if explicit is None:
         raise ValueError(
-            "inner_target 未声明——声明 inner_wrapper 时必须成对显式声明 "
-            "inner_target（\"self\" 或子模块属性名；自动定位启发式已删除）")
+            "inner_target is not declared — declaring inner_wrapper "
+            "requires an explicit paired inner_target (\"self\" or a "
+            "submodule attribute name; the auto-location heuristic was "
+            "removed)")
     if explicit == "self":
         return module
     inner = getattr(module, explicit, None)
@@ -1342,16 +1423,20 @@ def _validate_inner_dispatch_output(
     tensor_outputs = [tensor for tensor in outputs if isinstance(tensor, torch.Tensor)]
     if len(tensor_outputs) != len(expected_placements):
         raise RuntimeError(
-            f"inner_wrapper {wrapper_name!r}: 张量输出数量 {len(tensor_outputs)} 与声明的 "
-            f"{len(expected_placements)} 个 placement 不符——多输出契约必须逐名"
-            "声明且数量一致"
+            f"inner_wrapper {wrapper_name!r}: tensor output count "
+            f"{len(tensor_outputs)} does not match the "
+            f"{len(expected_placements)} declared placements — a "
+            "multi-output contract must be declared name by name with "
+            "matching counts"
         )
     for tensor, placements in zip(tensor_outputs, expected_placements):
         if not isinstance(tensor, DTensor):
             raise RuntimeError(
                 f"inner_wrapper {wrapper_name!r} [region_dispatch=True]: "
-                f"穿透传播的输出不是 DTensor（{type(tensor).__name__}）——注入物"
-                "疑似脱离 dispatch 链，无法完成真校验"
+                f"the dispatch-propagated output is not a DTensor "
+                f"({type(tensor).__name__}) — the injection appears to "
+                "have left the dispatch chain, so true validation cannot "
+                "complete"
             )
         if tuple(tensor.placements) != tuple(placements):
             raise PlacementMismatchError(
@@ -1377,9 +1462,11 @@ def _rewrap_inner_outputs(output, out_placements, mesh, wrapper_name):
     tensor_output_count = sum(isinstance(value, torch.Tensor) for value in output)
     if tensor_output_count != len(out_placements):
         raise RuntimeError(
-            f"inner_wrapper {wrapper_name!r}: 替换 forward 返回了 {tensor_output_count} 个张量输出，"
-            f"与声明的 {len(out_placements)} 个 placement 不符——多输出"
-            "契约必须逐名声明且数量一致"
+            f"inner_wrapper {wrapper_name!r}: the replacement forward "
+            f"returned {tensor_output_count} tensor outputs, which does "
+            f"not match the {len(out_placements)} declared placements — "
+            "a multi-output contract must be declared name by name with "
+            "matching counts"
         )
     placement_iter = iter(out_placements)
     wrapped = [
@@ -1406,8 +1493,9 @@ def _resolve_inner_output_placements(
         missing = [name for name in out_names if name not in spec.out_src]
         if missing:
             raise ValueError(
-                f"inner_wrapper {wrapper_name!r}: out_names {missing} 在 "
-                "out_src 中无声明——多输出契约必须逐名声明"
+                f"inner_wrapper {wrapper_name!r}: out_names {missing} "
+                "have no declaration in out_src — a multi-output contract "
+                "must be declared name by name"
             )
         return False, [
             tuple(resolve_placements(spec.out_src[name], mesh_dim_names))
@@ -1417,18 +1505,20 @@ def _resolve_inner_output_placements(
     declared = getattr(spec, "inner_out_src", None) if spec is not None else None
     if declared is None:
         raise ValueError(
-            f"inner_wrapper {wrapper_name!r} 作用于 "
-            f"{type(boundary_module).__name__} 的 inner 子模块，但未声明 "
-            "inner_out_src——框架对 inner 输出布局零推导零猜测。请二选一："
-            "① layout-preserving wrapper 配置 inner_out_src: \"first_input\"；"
-            "② 显式声明 placement；③ 或用 inner_target=\"self\" 复用边界 "
-            "out_src 契约"
+            f"inner_wrapper {wrapper_name!r} targets an inner submodule "
+            f"of {type(boundary_module).__name__}, but inner_out_src is "
+            "not declared — the framework infers and guesses nothing "
+            "about inner output layouts. Choose one of: "
+            "① a layout-preserving wrapper sets "
+            "inner_out_src: \"first_input\"; ② declare the placements "
+            "explicitly; ③ or use inner_target=\"self\" to reuse the "
+            "boundary out_src contract"
         )
     if isinstance(declared, str):
         if declared != "first_input":
             raise ValueError(
-                "inner_out_src 的字符串值只接受哨兵 'first_input'，"
-                f"got {declared!r}"
+                "the string value of inner_out_src only accepts the "
+                f"sentinel 'first_input', got {declared!r}"
             )
         return True, None
     if all(isinstance(value, Placement) for value in declared.values()):
@@ -1441,22 +1531,30 @@ def _resolve_inner_output_placements(
 
 def _install_inner_adapter(target, user_fwd, boundary_module, spec, mesh,
                            mesh_dim_names, wrapper_name, validate_mode=False):
-    """统一双模适配器：安装期解析重包规则，运行期零决策（05 §4.4.2 + D-01''）。
+    """Unified dual-mode adapter: rewrap rules are resolved at install time,
+    with zero runtime decisions (05 §4.4.2 + D-01'').
 
-    用户 wrapper 的替换 forward 只面向 local 张量。适配器负责：
-    - validate（任一入参是 DTensor）：所有 DTensor 入参 to_local（非张量透
-      传）+ ``_temp_local_params(target)`` 临时解包参数 → 调用用户
-      forward → 按声明重包回 DTensor（传播链接回，边界校验继续）；
-    - production（无 DTensor 入参）：直通，零转换开销。
+    The replacement forward of a user wrapper only faces local tensors. The
+    adapter handles:
+    - validate (any input is a DTensor): every DTensor input is to_local'd
+      (non-tensors pass through) + ``_temp_local_params(target)`` temporarily
+      unwraps the parameters → call the user forward → rewrap the outputs
+      back into DTensors per the declaration (the propagation chain is
+      re-linked and boundary validation continues);
+    - production (no DTensor inputs): straight passthrough, zero conversion
+      overhead.
 
-    重包 placements 来源（框架零推导零猜测，全部显式声明）：
-    - 情形 A（target 是边界模块自身）：边界 ``spec.out_src`` 声明（多输出
-      按 ``out_names``/声明键序逐位置）；
-    - 情形 B（inner 子模块）：``spec.inner_out_src`` 显式声明——哨兵
-      ``"first_input"``（输出布局 == 首个 DTensor 入参的运行时布局，
-      layout-preserving wrapper 用，仅单输出合法）或 NamedPlacement /
-      {name: NamedPlacement}（多输出按声明键序对 tuple 位置）；
-      未声明 → 安装时 fail-fast。
+    Source of the rewrap placements (the framework infers and guesses
+    nothing — everything is explicitly declared):
+    - case A (target is the boundary module itself): the boundary
+      ``spec.out_src`` declaration (multiple outputs positionally per
+      ``out_names``/declaration key order);
+    - case B (an inner submodule): the explicit ``spec.inner_out_src``
+      declaration — the sentinel ``"first_input"`` (output layout == the
+      runtime layout of the first DTensor input; for layout-preserving
+      wrappers, single output only) or NamedPlacement /
+      {name: NamedPlacement} (multiple outputs mapped to tuple positions per
+      declaration key order); undeclared → fail-fast at install time.
     """
     first_input_rule, out_placements = _resolve_inner_output_placements(
         spec,
@@ -1469,22 +1567,34 @@ def _install_inner_adapter(target, user_fwd, boundary_module, spec, mesh,
         install_local_compute_forward_adapters(target)
 
     @functools.wraps(user_fwd)
-    def adapted(*args, **kwargs):
+    def adapted(*args: Any, **kwargs: Any) -> Any:
+        """Dual-mode adapter around the user's replacement forward.
+
+        production (no DTensor input): straight passthrough; validate:
+        unwrap DTensor inputs/parameters to local, run the user forward, and
+        rewrap outputs per the declaration resolved at install time (or, with
+        region_dispatch=True, dispatch through and truly validate instead).
+        """
         source_dtensor = _find_dtensor_argument(args, kwargs)
         if source_dtensor is None:
-            return user_fwd(*args, **kwargs)          # production：直通
+            return user_fwd(*args, **kwargs)          # production: straight passthrough
         if getattr(spec, "region_dispatch", None):
-            # validate 穿透（region_dispatch=True）：注入物是纯标准算子——
-            # DTensor 直入，dispatch 传播穿透 inner 区域；声明的重包规则
-            # 升级为真校验基准（传播结果 vs 声明，不符即 fail-fast）
+            # Validate dispatch-through (region_dispatch=True): the injection
+            # is pure standard ops — DTensors go straight in and dispatch
+            # propagation runs through the inner region; the declared rewrap
+            # rules are promoted to the true-validation baseline (propagated
+            # result vs declaration, a mismatch fails fast).
             try:
                 out = user_fwd(*args, **kwargs)
             except Exception as exc:
                 raise type(exc)(
-                    f"{exc}\n[region_dispatch=True] validate 穿透 inner_wrapper "
-                    f"{wrapper_name!r} 时 dispatch 失败——注入物含不可 "
-                    "dispatch 的通信原语/自定义 kernel？请改声明 "
-                    "region_dispatch=False（适配器黑盒托管）") from exc
+                    f"{exc}\n[region_dispatch=True] dispatch failed "
+                    f"while validate was dispatching through "
+                    f"inner_wrapper {wrapper_name!r} — does the injection "
+                    "contain non-dispatchable communication "
+                    "primitives/custom kernels? Declare "
+                    "region_dispatch=False instead (adapter black-box "
+                    "hosting)") from exc
             expected = (
                 [tuple(source_dtensor.placements)]
                 if first_input_rule
@@ -1497,7 +1607,8 @@ def _install_inner_adapter(target, user_fwd, boundary_module, spec, mesh,
                 wrapper_name,
             )
             return out
-        # validate：统一转 local（参数临时解包，退出恢复）
+        # validate: uniformly convert to local (parameters temporarily
+        # unwrapped, restored on exit)
         local_args = tuple(
             a.to_local() if isinstance(a, DTensor) else a for a in args)
         local_kwargs = {k: (v.to_local() if isinstance(v, DTensor) else v)
@@ -1510,15 +1621,16 @@ def _install_inner_adapter(target, user_fwd, boundary_module, spec, mesh,
             if isinstance(out, (tuple, list)):
                 raise RuntimeError(
                     f"inner_wrapper {wrapper_name!r}: inner_out_src="
-                    "'first_input' 仅支持单输出——多输出请显式声明 "
-                    "inner_out_src 的 {name: {axis: placement}} 形态")
+                    "'first_input' only supports a single output — for "
+                    "multiple outputs declare inner_out_src explicitly in "
+                    "the {name: {axis: placement}} form")
             return _rewrap_inner_tensor(
                 out,
                 tuple(source_dtensor.placements),
                 source_dtensor.device_mesh,
             )
         if out_placements is None:
-            return out                   # 情形 A 且无 out_src 声明：不重包
+            return out                   # case A with no out_src declaration: no rewrap
         return _rewrap_inner_outputs(out, out_placements, mesh, wrapper_name)
 
     target.forward = adapted
@@ -1538,20 +1650,26 @@ def _resolve_inner_wrapper(module, spec, cp_mesh, mesh, tp_mesh=None,
     if custom is None:
         if inner_target is not None:
             raise ValueError(
-                f"spec.inner_target={inner_target!r} 只是定位（replace whom）——"
-                "改造后不再启发式选择包装方案，必须同时显式声明 "
-                f"inner_wrapper：注册表名 {sorted(INNER_WRAPPER_REGISTRY)}、"
-                "@inner_wrapper 装饰的 callable，或指向仓内参考实现的 "
-                "Target（hyper_models.components.distributed.cp_wrappers.*）")
+                f"spec.inner_target={inner_target!r} only locates "
+                "(replace whom) — after the rework the wrapping scheme is "
+                "no longer chosen heuristically, so inner_wrapper must be "
+                "declared explicitly too: a registry name "
+                f"{sorted(INNER_WRAPPER_REGISTRY)}, an @inner_wrapper "
+                "decorated callable, or a Target pointing to an in-repo "
+                "reference implementation "
+                "(hyper_models.components.distributed.cp_wrappers.*)")
         return None
 
     _require_region_dispatch(spec, source="spec.inner_wrapper")
     if inner_target is None:
         raise ValueError(
-            f"声明了 inner_wrapper={custom!r} 但未显式声明 inner_target——"
-            "attention 域自动定位启发式已删除（inner-wrap 是通用机制，静默"
-            "定位有包错目标风险）。两字段必须成对显式声明：包装边界模块自身 "
-            "→ inner_target=\"self\"；包装子模块 → inner_target=\"<属性名>\"")
+            f"inner_wrapper={custom!r} is declared but inner_target is "
+            "not — the attention-domain auto-location heuristic was "
+            "removed (inner-wrap is a generic mechanism; silently "
+            "locating risks wrapping the wrong target). The two fields "
+            "must be declared as an explicit pair: to wrap the boundary "
+            "module itself → inner_target=\"self\"; to wrap a submodule "
+            "→ inner_target=\"<attribute name>\"")
     target = _resolve_inner_target(module, spec)
     context = {
         "target_module": target,
@@ -1644,20 +1762,26 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
     name, target, apply_fn = resolved
     orig_forward = target.forward
     apply_fn()
-    # 检测"真的发生了替换"：绑定方法每次取属性都是新对象，`is` 比较恒为
-    # 真——必须比较底层函数对象（__func__），否则纯探针 wrapper（不替换
-    # forward）也会被误装适配器、被强求 inner_out_src 声明
+    # Detect "a replacement really happened": attribute access on a bound
+    # method creates a new object each time, so an `is` comparison is always
+    # true — the underlying function objects (__func__) must be compared,
+    # otherwise a pure-probe wrapper (which does not replace forward) would
+    # also get an adapter installed by mistake and be forced to declare
+    # inner_out_src
     new_forward = target.forward
     replaced = (getattr(new_forward, "__func__", new_forward)
                 is not getattr(orig_forward, "__func__", orig_forward))
     if replaced:
-        # 原则 1：替换后的 forward 必须能接收原 forward 的全部入参
+        # Principle 1: the replaced forward must accept all inputs of the
+        # original forward
         validate_wrapped_forward(
             orig_forward, new_forward,
             owner=f"inner_wrapper {name!r} on {type(module).__name__}")
-        # 统一安装双模适配器：用户 wrapper 只面向 local 张量，DTensor
-        # 转换与声明式重包由适配器托管（local_map 语义；validate 对
-        # inner 区域跳过传播校验，安全网在边界层）
+        # Uniformly install the dual-mode adapter: the user wrapper only
+        # faces local tensors; DTensor conversion and declarative rewrap are
+        # managed by the adapter (local_map semantics; validate skips
+        # propagation checks for the inner region — the safety net is at the
+        # boundary layer)
         _install_inner_adapter(
             target, new_forward, module, spec, mesh, mesh_dim_names, name,
             validate_mode=validate_mode)
@@ -1718,7 +1842,12 @@ def _wrap_vocab_parallel_embedding(module, tp_mesh):
     hi = lo + v_local
 
     @functools.wraps(original_forward)
-    def masked_embedding_forward(input_ids, *args, **kwargs):
+    def masked_embedding_forward(
+        input_ids: torch.Tensor, *args: Any, **kwargs: Any,
+    ) -> torch.Tensor:
+        """Masked vocab-parallel embedding forward: zero out-of-range token
+        ids, shift indices by the local vocab offset, and mask the output so
+        it is a pure Partial contribution."""
         mask = (input_ids >= lo) & (input_ids < hi)
         local_ids = torch.where(mask, input_ids - lo, torch.zeros_like(input_ids))
         out = original_forward(local_ids, *args, **kwargs)
@@ -1731,11 +1860,18 @@ def _wrap_vocab_parallel_embedding(module, tp_mesh):
 # Phase D: tied weights
 # ────────────────────────────────────────────────────────────────────────────
 
-def detect_tied_weights(model):
+def detect_tied_weights(model: Any) -> List[Tuple[str, str]]:
     """Detect tied-weight pairs (embed_tokens.weight <-> lm_head.weight).
 
     In PP scenarios cross-stage pairs cannot be detected; the user must
     explicitly declare plan.tied_pairs.
+
+    Args:
+        model: The model to inspect (an HF-style ``nn.Module`` with a
+            ``config`` carrying ``tie_word_embeddings``).
+
+    Returns:
+        A list of ``(embed_fqn, lm_head_fqn)`` tied-parameter FQN pairs.
     """
     tied = []
     if getattr(getattr(model, "config", None), "tie_word_embeddings", False):

@@ -127,17 +127,19 @@ def _attn_implementation(module):
     return impl
 
 
-def is_sdpa_attention(module) -> bool:
+def is_sdpa_attention(module: Any) -> bool:
+    """True when the module is configured for or named as SDPA attention."""
     impl = _attn_implementation(module)
     return (impl == "sdpa") or ("SdpaAttention" in type(module).__name__)
 
 
-def is_flex_attention(module) -> bool:
+def is_flex_attention(module: Any) -> bool:
+    """True when the module is configured for or named as FlexAttention."""
     impl = _attn_implementation(module)
     return (impl == "flex_attention") or ("FlexAttention" in type(module).__name__)
 
 
-def is_hf_style_attention(module) -> bool:
+def is_hf_style_attention(module: Any) -> bool:
     """HF style (forward(hidden_states,...), projections inside forward) -> the primitive-interception path."""
     has_proj = (hasattr(module, "q_proj") and hasattr(module, "k_proj")
                 and hasattr(module, "v_proj"))
@@ -341,7 +343,9 @@ def _bind_qkv_invocation(
 # ────────────────────────────────────────────────────────────────────────────
 
 @inner_wrapper
-def sdpa_qkv_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+def sdpa_qkv_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """NeMo/Megatron SDPA path (registry "sdpa_qkv"): explicit all-gather K/V.
 
     Assumes the inner_attention.forward(q,k,v,...) signature convention.
@@ -356,23 +360,28 @@ def sdpa_qkv_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     del mesh, tp_mesh, ep_mesh
     if cp_mesh is None:
         raise ValueError(
-            "仓内 CP wrapper 参考实现 'sdpa_qkv' 需要活跃的 cp 轴（K/V all-gather 的通信"
-            "域），但框架填入的 cp_mesh 为 None（当前 plan 无 cp 轴）——无 CP "
-            "时请改用自定义 @inner_wrapper wrapper（cp_mesh 为 None 语义自"
-            "负），或改用 local_compute_fn 通道（见 "
-            "examples/distributed/perf_replacement.py）")
+            "The in-repo CP wrapper reference implementation 'sdpa_qkv' requires an "
+            "active cp axis (the communication domain for K/V all-gather), but the "
+            "framework-filled cp_mesh is None (the current plan has no cp axis) — "
+            "without CP, use a custom @inner_wrapper wrapper instead (the "
+            "cp_mesh=None semantics are then your own responsibility), or use the "
+            "local_compute_fn channel (see "
+            "examples/distributed/perf_replacement.py)")
 
     original_forward = target_module.forward
 
     @functools.wraps(original_forward)
-    def cp_forward(q, k, v, **kwargs):
+    def cp_forward(q: Any, k: Any, v: Any, **kwargs: Any) -> Any:
+        """All-gather K/V along CP, then run the original QKV SDPA forward."""
         return _cp_sdpa_call(original_forward, cp_mesh, q, k, v, kwargs)
 
     target_module.forward = cp_forward
 
 
 @inner_wrapper
-def flex_qkv_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+def flex_qkv_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """NeMo/Megatron FlexAttention path (registry "flex_qkv"): explicit all-gather K/V.
 
     **Local-only** (see sdpa_qkv_cp_wrapper); requires
@@ -384,16 +393,19 @@ def flex_qkv_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     del mesh, tp_mesh, ep_mesh
     if cp_mesh is None:
         raise ValueError(
-            "仓内 CP wrapper 参考实现 'flex_qkv' 需要活跃的 cp 轴（K/V all-gather 的通信"
-            "域），但框架填入的 cp_mesh 为 None（当前 plan 无 cp 轴）——无 CP "
-            "时请改用自定义 @inner_wrapper wrapper（cp_mesh 为 None 语义自"
-            "负），或改用 local_compute_fn 通道（见 "
-            "examples/distributed/perf_replacement.py）")
+            "The in-repo CP wrapper reference implementation 'flex_qkv' requires an "
+            "active cp axis (the communication domain for K/V all-gather), but the "
+            "framework-filled cp_mesh is None (the current plan has no cp axis) — "
+            "without CP, use a custom @inner_wrapper wrapper instead (the "
+            "cp_mesh=None semantics are then your own responsibility), or use the "
+            "local_compute_fn channel (see "
+            "examples/distributed/perf_replacement.py)")
 
     original_forward = target_module.forward
 
     @functools.wraps(original_forward)
-    def cp_forward(q, k, v, **kwargs):
+    def cp_forward(q: Any, k: Any, v: Any, **kwargs: Any) -> Any:
+        """All-gather K/V along CP, then run the original QKV Flex forward."""
         global_k, global_v = flex_cp_allgather(
             k.contiguous(), v.contiguous(), 2, cp_mesh)
         return original_forward(q, global_k, global_v, **kwargs)
@@ -402,7 +414,9 @@ def flex_qkv_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
 
 
 @inner_wrapper
-def sdpa_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+def sdpa_hf_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """HF standard SDPA path: forward(hidden_states,...) -> primitive interception (05 §4.4.2).
 
     **Local-only** (see sdpa_qkv_cp_wrapper): the adapter handles DTensor
@@ -421,20 +435,24 @@ def sdpa_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     del mesh, tp_mesh, ep_mesh
     if cp_mesh is None:
         raise ValueError(
-            "仓内 CP wrapper 参考实现 'sdpa_hf' 需要活跃的 cp 轴（K/V all-gather 的通信"
-            "域），但框架填入的 cp_mesh 为 None（当前 plan 无 cp 轴）——无 CP "
-            "时请改用自定义 @inner_wrapper wrapper（cp_mesh 为 None 语义自"
-            "负），或改用 local_compute_fn 通道（见 "
-            "examples/distributed/perf_replacement.py）")
+            "The in-repo CP wrapper reference implementation 'sdpa_hf' requires an "
+            "active cp axis (the communication domain for K/V all-gather), but the "
+            "framework-filled cp_mesh is None (the current plan has no cp axis) — "
+            "without CP, use a custom @inner_wrapper wrapper instead (the "
+            "cp_mesh=None semantics are then your own responsibility), or use the "
+            "local_compute_fn channel (see "
+            "examples/distributed/perf_replacement.py)")
 
     original_forward = target_module.forward
     orig_sdpa = F.scaled_dot_product_attention
 
     @functools.wraps(original_forward)
-    def cp_forward(hidden_states, *args, **kwargs):
+    def cp_forward(hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run the HF forward with F.sdpa temporarily replaced by the CP-aware one."""
         fired = {"hit": False}
 
-        def cp_aware_sdpa(q, k, v, **kw):
+        def cp_aware_sdpa(q: Any, k: Any, v: Any, **kw: Any) -> Any:
+            """CP-aware SDPA replacement: all-gather K/V plus the D-04 mask."""
             fired["hit"] = True
             return _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kw)
 
@@ -459,7 +477,9 @@ def sdpa_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
 
 
 @inner_wrapper
-def flex_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+def flex_hf_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """HF standard FlexAttention path: intercept flex_attention (same structure as the SDPA path).
 
     **Local-only** (see sdpa_qkv_cp_wrapper). Constraint:
@@ -475,11 +495,13 @@ def flex_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     del mesh, tp_mesh, ep_mesh
     if cp_mesh is None:
         raise ValueError(
-            "仓内 CP wrapper 参考实现 'flex_hf' 需要活跃的 cp 轴（K/V all-gather 的通信"
-            "域），但框架填入的 cp_mesh 为 None（当前 plan 无 cp 轴）——无 CP "
-            "时请改用自定义 @inner_wrapper wrapper（cp_mesh 为 None 语义自"
-            "负），或改用 local_compute_fn 通道（见 "
-            "examples/distributed/perf_replacement.py）")
+            "The in-repo CP wrapper reference implementation 'flex_hf' requires an "
+            "active cp axis (the communication domain for K/V all-gather), but the "
+            "framework-filled cp_mesh is None (the current plan has no cp axis) — "
+            "without CP, use a custom @inner_wrapper wrapper instead (the "
+            "cp_mesh=None semantics are then your own responsibility), or use the "
+            "local_compute_fn channel (see "
+            "examples/distributed/perf_replacement.py)")
 
     original_forward = target_module.forward
     # FlexAttention is optional on older supported PyTorch versions.
@@ -488,10 +510,12 @@ def flex_hf_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     original_flex_attention = flex_attention_module.flex_attention
 
     @functools.wraps(original_forward)
-    def cp_forward(hidden_states, *args, **kwargs):
+    def cp_forward(hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run the HF forward with flex_attention temporarily replaced."""
         fired = {"hit": False}
 
-        def cp_aware_flex(q, k, v, **kw):
+        def cp_aware_flex(q: Any, k: Any, v: Any, **kw: Any) -> Any:
+            """CP-aware FlexAttention replacement: all-gather K/V first."""
             fired["hit"] = True
             global_k, global_v = flex_cp_allgather(
                 k.contiguous(), v.contiguous(), 2, cp_mesh)
@@ -631,35 +655,43 @@ def sdpa_hf_load_balance_cp_wrapper(
 # ────────────────────────────────────────────────────────────────────────────
 
 @inner_wrapper
-def sdpa_qkv_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+def sdpa_qkv_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """Apply Pure Ulysses to a separated ``forward(query, key, value, ...)``."""
     del mesh, tp_mesh, ep_mesh
     _require_ulysses_cp_mesh(cp_mesh, "sdpa_qkv_ulysses")
     original_forward = target_module.forward
 
     @functools.wraps(original_forward)
-    def cp_forward(*args, **kwargs):
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the original QKV forward in the Ulysses head-sharded layout."""
         return _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs)
 
     target_module.forward = cp_forward
 
 
 @inner_wrapper
-def flex_qkv_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+def flex_qkv_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """Apply Pure Ulysses to a separated FlexAttention QKV forward."""
     del mesh, tp_mesh, ep_mesh
     _require_ulysses_cp_mesh(cp_mesh, "flex_qkv_ulysses")
     original_forward = target_module.forward
 
     @functools.wraps(original_forward)
-    def cp_forward(*args, **kwargs):
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the original FlexAttention QKV forward in the Ulysses layout."""
         return _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs)
 
     target_module.forward = cp_forward
 
 
 @inner_wrapper
-def sdpa_hf_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+def sdpa_hf_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """Apply Pure Ulysses by intercepting HF SDPA primitive calls."""
     del mesh, tp_mesh, ep_mesh
     _require_ulysses_cp_mesh(cp_mesh, "sdpa_hf_ulysses")
@@ -667,10 +699,14 @@ def sdpa_hf_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     original_sdpa = F.scaled_dot_product_attention
 
     @functools.wraps(original_forward)
-    def cp_forward(*args, **kwargs):
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the HF forward with F.sdpa temporarily Ulysses-exchanged."""
         fired = {"hit": False}
 
-        def ulysses_sdpa(query, key, value, **attention_kwargs):
+        def ulysses_sdpa(
+                query: Any, key: Any, value: Any,
+                **attention_kwargs: Any) -> Any:
+            """Run one intercepted SDPA call in the Ulysses layout."""
             fired["hit"] = True
             return _ulysses_attention_call(
                 original_sdpa,
@@ -698,7 +734,9 @@ def sdpa_hf_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
 
 
 @inner_wrapper
-def flex_hf_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+def flex_hf_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """Apply Pure Ulysses by intercepting HF FlexAttention primitive calls."""
     del mesh, tp_mesh, ep_mesh
     _require_ulysses_cp_mesh(cp_mesh, "flex_hf_ulysses")
@@ -709,10 +747,14 @@ def flex_hf_ulysses_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
     original_flex_attention = flex_attention_module.flex_attention
 
     @functools.wraps(original_forward)
-    def cp_forward(*args, **kwargs):
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the HF forward with flex_attention temporarily Ulysses-exchanged."""
         fired = {"hit": False}
 
-        def ulysses_flex(query, key, value, **attention_kwargs):
+        def ulysses_flex(
+                query: Any, key: Any, value: Any,
+                **attention_kwargs: Any) -> Any:
+            """Run one intercepted FlexAttention call in the Ulysses layout."""
             fired["hit"] = True
             return _ulysses_attention_call(
                 original_flex_attention,
@@ -943,7 +985,8 @@ def _input_cp_sharding(text_model, context):
     original_forward = text_model.forward
 
     @functools.wraps(original_forward)
-    def forward_with_sequence_sharding(*args, **kwargs):
+    def forward_with_sequence_sharding(*args: Any, **kwargs: Any) -> Any:
+        """Slice sequence-dim inputs to this CP rank before the forward."""
         if getattr(text_model, "_hyper_cp_inside_forward", False):
             return original_forward(*args, **kwargs)
         call_kwargs = kwargs.copy()
@@ -1001,7 +1044,8 @@ def _validate_ulysses_requirements(target_module, cp_size):
 
 @inner_wrapper
 def mla_dsa_ulysses_cp_wrapper(
-        target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> None:
     """Configure input, MoME, MLA and DSA Ulysses adaptations."""
     del mesh, tp_mesh, ep_mesh
     if cp_mesh is None or cp_mesh.size() <= 1:
@@ -1044,7 +1088,8 @@ def mla_dsa_ulysses_cp_wrapper(
     original_forward = target_module.forward
 
     @functools.wraps(original_forward)
-    def forward_with_ulysses_adapters(*args, **kwargs):
+    def forward_with_ulysses_adapters(*args: Any, **kwargs: Any) -> Any:
+        """Pass the forward through; the adapters are installed out of band."""
         return original_forward(*args, **kwargs)
 
     target_module.forward = forward_with_ulysses_adapters
@@ -1427,9 +1472,10 @@ def qwen3_moe_async_hybrid_cp_wrapper(
     )
 
 
-# {registry_name: wrapper_fn} -- inner-wrapper 命名注册表（05 §4.4.2）。
-# 机制不 CP 门控（声明即应用）；仓内参考实现是 CP 语义（自检要求活跃 cp
-# 轴），用户可注册任意命名方案。
+# {registry_name: wrapper_fn} -- inner-wrapper named registry (05 §4.4.2).
+# The mechanism is not CP-gated (declaration means application); the in-repo
+# reference implementations carry CP semantics (their self-checks require an
+# active cp axis); users may register arbitrary named schemes.
 # Contract: @inner_wrapper fn(target_module, mesh, tp_mesh, cp_mesh,
 # ep_mesh) replaces target_module.forward in place (K/V all-gather
 # + dual-mode tolerance). Users may register their own named schemes:

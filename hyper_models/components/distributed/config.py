@@ -18,7 +18,7 @@ Full implementation will move to this module from infrastructure.py.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 
 @dataclass

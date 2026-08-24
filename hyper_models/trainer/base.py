@@ -84,7 +84,8 @@ class BackgroundPrefetcher:
     with GPU computation. Synchronizes dataloader state for correct checkpointing.
     """
 
-    def __init__(self, dataloader, maxsize=1):
+    def __init__(self, dataloader: Any, maxsize: int = 1) -> None:
+        """Start the background worker prefetching from ``dataloader``."""
         self.dataloader = dataloader
         self.iterator = iter(dataloader)
         self.queue = queue.Queue(maxsize=maxsize)
@@ -114,10 +115,12 @@ class BackgroundPrefetcher:
         except Exception as exc:  # pylint: disable=broad-exception-caught
             self.queue.put((exc, None))
 
-    def __iter__(self):
+    def __iter__(self) -> "BackgroundPrefetcher":
+        """Return this prefetcher as its own iterator."""
         return self
 
-    def __next__(self):
+    def __next__(self) -> Any:
+        """Return the next prefetched item, re-raising worker failures."""
         res = self.queue.get()
         if isinstance(res, tuple) and len(res) == 2:
             item, state = res
@@ -133,14 +136,15 @@ class BackgroundPrefetcher:
             raise res
         return res
 
-    def state_dict(self):
+    def state_dict(self) -> Dict[str, Any]:
+        """Return the dataloader state captured alongside the current item."""
         if self.current_state is not None:
             return self.current_state
         if self.original_state_dict:
             return self.original_state_dict()
         return {}
 
-    def stop(self, timeout: float = 5.0):
+    def stop(self, timeout: float = 5.0) -> None:
         """Stop the background worker and wait up to ``timeout`` seconds."""
         self.stop_event.set()
         try:
@@ -159,7 +163,8 @@ class HyperIter:
     A unified iterator wrapper that handles both standard iteration and background prefetching.
     """
 
-    def __init__(self, dataloader, use_background_prefetcher: bool = False, maxsize: int = 1):
+    def __init__(self, dataloader: Any, use_background_prefetcher: bool = False, maxsize: int = 1) -> None:
+        """Wrap ``dataloader`` in either direct iteration or background prefetching."""
         self.dataloader = dataloader
         self.use_background_prefetcher = use_background_prefetcher
         if use_background_prefetcher:
@@ -167,17 +172,21 @@ class HyperIter:
         else:
             self.iterator = iter(dataloader)
 
-    def __iter__(self):
+    def __iter__(self) -> "HyperIter":
+        """Return this wrapper as its own iterator."""
         return self
 
-    def __next__(self):
+    def __next__(self) -> Any:
+        """Return the next batch from the underlying iterator."""
         return next(self.iterator)
 
-    def stop(self, timeout: float = 5.0):
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop the background prefetch worker when one is active."""
         if self.use_background_prefetcher and hasattr(self.iterator, "stop"):
             self.iterator.stop(timeout=timeout)
 
-    def state_dict(self):
+    def state_dict(self) -> Dict[str, Any]:
+        """Return the underlying dataloader or prefetcher state for checkpointing."""
         if self.use_background_prefetcher and hasattr(self.iterator, "state_dict"):
             return self.iterator.state_dict()
         if hasattr(self.dataloader, "state_dict"):
@@ -264,7 +273,7 @@ class BaseTrainer(Stateful, ABC):
     # Default seed when training.seed is omitted.
     default_seed: int = 42
 
-    def __init__(self, config: TrainerConfig):
+    def __init__(self, config: TrainerConfig) -> None:
         """
         Initialize the trainer.
 
@@ -512,27 +521,38 @@ class BaseTrainer(Stateful, ABC):
                 "no checkpoint callback registered."
             )
 
-    def on_train_begin(self):
+    def on_train_begin(self) -> None:
+        """Run all registered callbacks at the start of training."""
         for callback in self._callbacks:
             callback.on_train_begin(self.state)
 
-    def on_train_end(self):
+    def on_train_end(self) -> None:
+        """Run all registered callbacks at the end of training."""
         for callback in self._callbacks:
             callback.on_train_end(self.state)
 
-    def on_epoch_begin(self):
+    def on_epoch_begin(self) -> None:
+        """Run all registered callbacks at the start of an epoch."""
         for callback in self._callbacks:
             callback.on_epoch_begin(self.state)
 
-    def on_epoch_end(self):
+    def on_epoch_end(self) -> None:
+        """Run all registered callbacks at the end of an epoch."""
         for callback in self._callbacks:
             callback.on_epoch_end(self.state)
 
-    def on_step_begin(self, **kwargs):
+    def on_step_begin(self, **kwargs: Any) -> None:
+        """Run all registered callbacks at the start of a training step."""
         for callback in self._callbacks:
             callback.on_step_begin(self.state, **kwargs)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+    def on_step_end(
+        self,
+        loss: Optional[float] = None,
+        loss_dict: Optional[Dict[str, Any]] = None,
+        grad_norm: Optional[float] = None,
+    ) -> None:
+        """Run all registered callbacks at the end of a training step."""
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
@@ -614,7 +634,7 @@ class BaseTrainer(Stateful, ABC):
             del micro_batch
             return loss, loss_dict
 
-    def model_reshard(self, micro_step: int, num_micro_steps: int):
+    def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
         """Reshard model after backward pass."""
         config: TrainerConfig = self.config
         if (
@@ -713,7 +733,8 @@ class BaseTrainer(Stateful, ABC):
             "grad_norm": grad_norm_value,
         }
 
-    def destroy_distributed(self):
+    def destroy_distributed(self) -> None:
+        """Synchronize all ranks and tear down the distributed process group."""
         if not dist.is_available() or not dist.is_initialized():
             return
 
@@ -723,7 +744,7 @@ class BaseTrainer(Stateful, ABC):
         synchronize()
         destroy_process_group()
 
-    def train(self):
+    def train(self) -> None:
         """Run the configured training loop."""
         config: TrainerConfig = self.config
         self.on_train_begin()

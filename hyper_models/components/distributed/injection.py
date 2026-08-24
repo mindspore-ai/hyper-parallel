@@ -12,79 +12,104 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""injection: 注入函数的模板装饰器与签名校验（显式注入机制的入口纪律）。
+"""injection: template decorators and signature validation for injected
+functions (the entry-point discipline of the explicit injection mechanism).
 
-设计原则：**注入函数 = apply 期被调用一次、必选声明 mesh 家族（框架
-按名填充，未激活轴为 None）、用不用随你**。两个装饰器覆盖全部注入
-通道，形态各自唯一（2026-08-10 起 local_compute_fn 的直传 compute fn
-形态退役，统一为工厂形态——与 inner_wrapper 同一规范：mesh 家族永远
-传入，是否使用是用户自己的选择）：
+Design principle: **an injected function is called exactly once at apply
+time, must declare the mesh family (filled by the framework by name; axes
+that are not active are filled with None), and may use them or not**. Two
+decorators cover all injection channels, each with a single canonical form
+(since 2026-08-10 the direct compute-fn form of local_compute_fn is
+retired; everything is unified into the factory form -- the same
+specification as inner_wrapper: the mesh family is always passed in, and
+whether to use it is the user's own choice):
 
-- ``@local_compute``：区域计算**工厂**，``fn(mesh, tp_mesh, cp_mesh,
-  ep_mesh, [module], <配置键...>) -> compute_fn``——apply 时 build 一次
-  （典型：从 ep_mesh 建通信组闭包固定，运行时零 mesh 开销），返回的
-  compute fn ``fn(module, *原forward入参)`` 无需再装饰（签名校验见下）；
-- ``@inner_wrapper``：inner forward 包装，``fn(target_module, mesh,
-  tp_mesh, cp_mesh, ep_mesh) -> None``——原地替换 target.forward。
+- ``@local_compute``: a regional-compute **factory**,
+  ``fn(mesh, tp_mesh, cp_mesh, ep_mesh, [module], <config keys...>)
+  -> compute_fn`` -- built once at apply time (typically building
+  communication-group closures from ep_mesh so the runtime incurs zero
+  mesh overhead). The returned compute fn ``fn(module,
+  *original_forward_args)`` needs no further decoration (see signature
+  validation below);
+- ``@inner_wrapper``: an inner-forward wrapper, ``fn(target_module, mesh,
+  tp_mesh, cp_mesh, ep_mesh) -> None`` -- replaces ``target.forward`` in
+  place.
 
-框架上下文全集（保留名，语义由框架定义，不可被用户配置）：
-- 锚点：``target_module``（inner_wrapper 被包装的模块，必选）/
-  ``module``（@local_compute 的边界模块，可选声明）——注入的作用对象；
-- mesh 家族（**必选**，四类全声明、全由框架填充；对应轴未激活时为
-  None）：``mesh``（当前 plan 坐标系的 active DTensor mesh，dp 已剥离，
-  与 PrecompiledBoundary / resolve_placements 的坐标系一致）、
-  ``tp_mesh`` / ``cp_mesh`` / ``ep_mesh``（D-10 TP-extend-EP 派生的
-  (edp, ep) expert mesh——它同时是专家参数的分片域，由框架统一派生，
-  保证 a2a 通信域与分片域严格一致）；
+The full set of framework context (reserved names whose semantics are
+defined by the framework and cannot be configured by users):
+- Anchors: ``target_module`` (the module wrapped by inner_wrapper,
+  required) / ``module`` (the boundary module of @local_compute, optional
+  declaration) -- the object the injection acts upon;
+- Mesh family (**required**: all four must be declared and all are filled
+  by the framework; the corresponding entry is None when the axis is not
+  active): ``mesh`` (the active DTensor mesh of the current plan's
+  coordinate system, with dp stripped -- consistent with the coordinate
+  system of PrecompiledBoundary / resolve_placements), ``tp_mesh`` /
+  ``cp_mesh`` / ``ep_mesh`` (the (edp, ep) expert mesh derived by D-10
+  TP-extend-EP -- it is also the sharding domain of expert parameters,
+  uniformly derived by the framework so that the a2a communication domain
+  and the sharding domain are strictly identical);
 
-装饰器的硬性规则（import 期即 fail-fast）：
-- 必选上下文缺一不可：两个装饰器都必须声明
-  ``mesh``/``tp_mesh``/``cp_mesh``/``ep_mesh``；``@inner_wrapper`` 在此
-  之上还必须声明 ``target_module``；
-- 上下文参数**不得有默认值**（框架必然填充，默认值无意义），用户在
-  Target/YAML 里配置同名保留键 → fail-fast（保留名不可配置）；
-- 注入函数禁止 ``*args`` / ``**kwargs``——签名必须是显式形参列表，这
-  是"配置键按名绑定、拼写错误不得被静默吞掉"制度的前提；
-- 其余具名参数是**用户配置键**，全部来自 YAML/Target 的显式配置，框
-  架不做任何自动填充；配置键只接受数据值——**不允许再往注入函数里传
-  函数**（函数套函数无穷无尽；需要自定义行为就写自己的注入函数，路由/
-  排布等逻辑直接写死在函数体内）。
+Hard rules enforced by the decorators (fail-fast at import time):
+- Required context must be declared in full: both decorators must declare
+  ``mesh``/``tp_mesh``/``cp_mesh``/``ep_mesh``; ``@inner_wrapper`` must
+  additionally declare ``target_module``;
+- Context parameters **must not have default values** (the framework
+  always fills them, so a default would be meaningless); a user
+  configuring a reserved key of the same name in Target/YAML triggers
+  fail-fast (reserved names are not configurable);
+- Injected functions forbid ``*args`` / ``**kwargs`` -- the signature must
+  be an explicit parameter list. This is the prerequisite for the policy
+  "config keys are bound by name and typos must not be silently
+  swallowed";
+- All other named parameters are **user config keys**, coming entirely
+  from explicit YAML/Target configuration with no automatic filling by
+  the framework; config keys only accept data values -- **passing
+  functions into an injected function is not allowed** (functions
+  wrapping functions never ends; if you need custom behavior, write your
+  own injected function and hard-code routing/layout logic in its body).
 
-运行时层校验（apply 时 fail-fast）：
-- ``validate_local_compute_signature``: 工厂返回的 compute fn 的每个
-  入参必须在原 forward 中有同名形参、位置序一致、forward 的必填参数
-  必须全部被接住——"注入函数的入参与原函数匹配"；
-- ``validate_wrapped_forward``: inner_wrapper 替换后的 forward 必须能绑
-  定原 forward 的全部入参（dummy bind 试探；替换侧允许 *args/**kwargs
-  宽容透传）。
+Runtime-layer validation (fail-fast at apply time):
+- ``validate_local_compute_signature``: every parameter of the compute fn
+  returned by the factory must have a same-named parameter in the
+  original forward, appear in the same positional order, and catch all
+  required parameters of forward -- "the injected function's arguments
+  must match the original function's";
+- ``validate_wrapped_forward``: the forward replaced by inner_wrapper must
+  be able to bind all arguments of the original forward (a dummy-bind
+  probe; the replacement side may pass through tolerantly with
+  *args/**kwargs).
 """
 
 import inspect
 import logging
 from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# 注入种类（meta.kind）
-LOCAL_COMPUTE = "local_compute"        # 区域计算工厂（local_compute_fn 唯一形态）
-INNER_WRAPPER = "inner_wrapper"        # inner forward 包装
+# Injection kinds (meta.kind)
+LOCAL_COMPUTE = "local_compute"        # regional-compute factory (the only form of local_compute_fn)
+INNER_WRAPPER = "inner_wrapper"        # inner-forward wrapper
 
-# 各种类的框架上下文保留名（声明即由框架按名填充；配置同名键报错）
+# Reserved framework-context names per kind (declaring one means the
+# framework fills it by name; configuring a key with the same name errors)
 _MESH_FAMILY = frozenset({"mesh", "tp_mesh", "cp_mesh", "ep_mesh"})
 FACTORY_CONTEXT = frozenset({"module"}) | _MESH_FAMILY
 WRAPPER_CONTEXT = frozenset({"target_module"}) | _MESH_FAMILY
 
-# 各种类的必选上下文（装饰器强制声明齐全——mesh 家族全由框架传入，
-# 用户只管使用；对应轴未激活时框架填 None）
+# Required context per kind (the decorators enforce full declaration --
+# the mesh family is always passed by the framework and the user merely
+# uses it; the framework fills None for axes that are not active)
 FACTORY_REQUIRED = _MESH_FAMILY
 WRAPPER_REQUIRED = frozenset({"target_module"}) | _MESH_FAMILY
 
 _ALLOWED_CONTEXT = {
-    LOCAL_COMPUTE: FACTORY_CONTEXT,    # module 锚点可选 + mesh 家族
+    LOCAL_COMPUTE: FACTORY_CONTEXT,    # optional module anchor + mesh family
     INNER_WRAPPER: WRAPPER_CONTEXT,
 }
 _REQUIRED_CONTEXT = {
-    LOCAL_COMPUTE: FACTORY_REQUIRED,   # mesh 家族必选
+    LOCAL_COMPUTE: FACTORY_REQUIRED,   # mesh family is required
     INNER_WRAPPER: WRAPPER_REQUIRED,
 }
 
@@ -96,47 +121,81 @@ _DECORATOR_NAMES = {
 
 @dataclass(frozen=True)
 class InjectionMeta:
-    """装饰器写在注入函数对象上的元数据（``fn._injection_meta``）。"""
+    """Metadata written by the decorators onto the injected function object
+    (``fn._injection_meta``).
+
+    Attributes:
+        kind: The injection kind (LOCAL_COMPUTE / INNER_WRAPPER).
+        context: The declared framework-context keys.
+    """
     kind: str                 # LOCAL_COMPUTE / INNER_WRAPPER
-    context: frozenset        # 声明的框架上下文键
+    context: frozenset        # declared framework-context keys
 
 
-def _make_decorator(kind):
+def _make_decorator(kind: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Build the template decorator for one injection kind.
+
+    Args:
+        kind: The injection kind (LOCAL_COMPUTE or INNER_WRAPPER).
+
+    Returns:
+        A decorator that validates the injected function's signature at
+        import time and stamps it with :class:`InjectionMeta`.
+    """
     allowed = _ALLOWED_CONTEXT[kind]
     required = _REQUIRED_CONTEXT[kind]
 
-    def decorator(fn):
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        """Validate ``fn`` against the injection discipline and stamp its meta.
+
+        Args:
+            fn: The injected function to decorate.
+
+        Returns:
+            The same function, with ``_injection_meta`` attached.
+
+        Raises:
+            TypeError: If the signature cannot be introspected, uses
+                *args/**kwargs, gives a context parameter a default value,
+                or omits required context parameters.
+        """
         fname = getattr(fn, "__name__", fn)
         try:
             sig = inspect.signature(fn)
         except (TypeError, ValueError) as exc:
             raise TypeError(
-                f"{_DECORATOR_NAMES[kind]}: 无法内省 {fn!r} 的签名（注入函数"
-                "必须是可内省的普通 callable）") from exc
+                f"{_DECORATOR_NAMES[kind]}: cannot introspect the signature of "
+                f"{fn!r} (an injected function must be an introspectable "
+                "plain callable)") from exc
         context = []
         for name, p in sig.parameters.items():
             if p.kind in (inspect.Parameter.VAR_POSITIONAL,
                           inspect.Parameter.VAR_KEYWORD):
                 raise TypeError(
-                    f"{_DECORATOR_NAMES[kind]} 注入函数 {fname}"
-                    f" 不允许 *args/**kwargs（形参 {name!r}）——注入函数的签名"
-                    "必须是显式形参列表：上下文按名声明由框架填充，配置键按名"
-                    "绑定，**kwargs 会把拼写错误静默吞掉（与 "
-                    "_check_target_config_keys 制度冲突）")
+                    f"{_DECORATOR_NAMES[kind]} injected function {fname}"
+                    f" must not use *args/**kwargs (parameter {name!r}) -- "
+                    "the signature of an injected function must be an explicit "
+                    "parameter list: context is declared by name and filled by "
+                    "the framework, config keys are bound by name, and "
+                    "**kwargs would silently swallow typos (conflicting with "
+                    "the _check_target_config_keys policy)")
             if name in allowed:
                 if p.default is not inspect.Parameter.empty:
                     raise TypeError(
-                        f"{_DECORATOR_NAMES[kind]} 注入函数 {fname} 的上下文"
-                        f"参数 {name!r} 不得有默认值——上下文是框架保留名，"
-                        "必然由框架按名填充，默认值永远不会生效")
+                        f"{_DECORATOR_NAMES[kind]} injected function {fname}: "
+                        f"context parameter {name!r} must not have a default "
+                        "value -- context names are reserved by the framework "
+                        "and are always filled by name, so a default would "
+                        "never take effect")
                 context.append(name)
         missing = sorted(required - set(context))
         if missing:
             raise TypeError(
-                f"{_DECORATOR_NAMES[kind]} 注入函数 {fname} 缺少必选上下文"
-                f"参数 {missing}——注入纪律要求显式接收 "
-                f"{sorted(required)}（全部由框架在 apply 时按名填充，用户只管使用"
-                "——用户只管使用）")
+                f"{_DECORATOR_NAMES[kind]} injected function {fname} is "
+                f"missing required context parameters {missing} -- the "
+                "injection discipline requires explicitly receiving "
+                f"{sorted(required)} (all filled by the framework by name at "
+                "apply time; the user merely uses them)")
         fn._injection_meta = InjectionMeta(kind=kind, context=frozenset(context))
         return fn
 
@@ -147,83 +206,146 @@ local_compute = _make_decorator(LOCAL_COMPUTE)
 inner_wrapper = _make_decorator(INNER_WRAPPER)
 
 
-def require_injection_meta(fn, kind, *, source):
-    """取注入函数的元数据；未装饰 / 种类不符 → fail-fast（教学式报错）。"""
+def require_injection_meta(fn: Callable[..., Any], kind: str, *, source: str) -> InjectionMeta:
+    """Fetch an injected function's metadata; fail-fast (with an instructive
+    error) if it is undecorated or of the wrong kind.
+
+    Args:
+        fn: The function expected to carry injection metadata.
+        kind: The expected injection kind.
+        source: Call-site label prepended to error messages.
+
+    Returns:
+        The :class:`InjectionMeta` attached to ``fn``.
+
+    Raises:
+        TypeError: If ``fn`` lacks the template decorator or its decorator
+            kind does not match ``kind``.
+    """
     meta = getattr(fn, "_injection_meta", None)
     name = getattr(fn, "__name__", fn)
     if meta is None:
         raise TypeError(
-            f"{source}: 注入函数 {name} 缺少 {_DECORATOR_NAMES[kind]} 装饰器"
-            "——显式注入纪律要求所有注入函数带模板装饰器（装饰器声明所需的"
-            "框架上下文并保证签名可校验）：local_compute_fn 的运行时 fn 用 "
-            "@local_compute（区域计算工厂），inner_wrapper 用 "
-            "@inner_wrapper（hyper_models.components.distributed 导出）")
+            f"{source}: injected function {name} is missing the "
+            f"{_DECORATOR_NAMES[kind]} decorator -- the explicit-injection "
+            "discipline requires every injected function to carry a template "
+            "decorator (the decorator declares the framework context it needs "
+            "and guarantees the signature is validatable): use @local_compute "
+            "for the runtime fn of local_compute_fn (a regional-compute "
+            "factory) and @inner_wrapper for inner_wrapper (exported by "
+            "hyper_models.components.distributed)")
     if meta.kind != kind:
         raise TypeError(
-            f"{source}: 注入函数 {name} 的装饰器种类不匹配——got "
-            f"{_DECORATOR_NAMES[meta.kind]}，期望 {_DECORATOR_NAMES[kind]}")
+            f"{source}: injected function {name} has the wrong decorator "
+            f"kind -- got {_DECORATOR_NAMES[meta.kind]}, expected "
+            f"{_DECORATOR_NAMES[kind]}")
     return meta
 
 
-def fill_context_kwargs(meta, context, configured=None, *, source=""):
-    """按 meta 声明的上下文键取框架填充的 kwargs（极简、无隐藏行为）。
+def fill_context_kwargs(meta: InjectionMeta,
+                        context: Dict[str, Any],
+                        configured: Optional[Dict[str, Any]] = None,
+                        *,
+                        source: str = "") -> Dict[str, Any]:
+    """Collect the framework-filled kwargs for the context keys declared in
+    ``meta`` (minimal, no hidden behavior).
 
-    - 填充集合 == 声明集合，一个不多一个不少（每次填充记 INFO）；
-    - 上下文键是框架保留名：用户在 Target/YAML 里配置了同名键 →
-      fail-fast（上下文参数无默认值，YAML resolver 不会回填它们，因此
-      出现在 configured 里的保留键一定是用户显式写的）。
+    - The filled set equals the declared set, no more and no less (each fill
+      is logged at INFO);
+    - Context keys are framework-reserved names: a user configuring a
+      same-named key in Target/YAML triggers fail-fast (context parameters
+      have no defaults and the YAML resolver never back-fills them, so any
+      reserved key appearing in ``configured`` was definitely written
+      explicitly by the user).
+
+    Args:
+        meta: The injection metadata whose declared context keys are filled.
+        context: The framework-provided context values keyed by name.
+        configured: User-configured keys, checked against reserved names.
+        source: Call-site label prepended to log and error messages.
+
+    Returns:
+        The kwargs dict mapping each declared context key to its
+        framework-provided value.
+
+    Raises:
+        ValueError: If ``configured`` contains framework-reserved context
+            keys.
     """
     configured = configured or {}
     reserved = sorted(set(configured) & meta.context)
     if reserved:
         raise ValueError(
-            f"{source}: 配置了框架保留上下文键 {reserved}——上下文由框架按"
-            "声明填充，不可配置；你的配置键不能与保留名同名")
+            f"{source}: framework-reserved context keys {reserved} were "
+            "configured -- context is filled by the framework according to "
+            "the declaration and is not configurable; your config keys must "
+            "not collide with reserved names")
     kwargs = {}
     for key in sorted(meta.context):
         kwargs[key] = context[key]
-        logger.info("%s: 上下文键 %s 由框架填充 (%s)",
+        logger.info("%s: context key %s filled by framework (%s)",
                     source, key, type(context[key]).__name__)
     return kwargs
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 运行时层签名校验（原则 1：注入函数的入参必须与原函数匹配）
+# Runtime-layer signature validation (principle 1: the injected function's
+# arguments must match the original function's)
 # ────────────────────────────────────────────────────────────────────────────
 
-def _is_subsequence(sub, full) -> bool:
+def _is_subsequence(sub: List[str], full: List[str]) -> bool:
+    """Return True if ``sub`` is an in-order subsequence of ``full``."""
     it = iter(full)
     return all(name in it for name in sub)
 
 
-def validate_local_compute_signature(compute_fn, forward, *, owner):
-    """校验区域 compute fn 的入参与原 forward 匹配（apply 时 fail-fast）。
+def validate_local_compute_signature(compute_fn: Callable[..., Any],
+                                     forward: Callable[..., Any],
+                                     *,
+                                     owner: str) -> None:
+    """Validate that a regional compute fn's arguments match the original
+    forward (fail-fast at apply time).
 
-    规则（compute_fn 首参是 module，forward 首参 self，均跳过）：
-    1. compute fn 不得有 *args/**kwargs（骨架按 forward 实参透传，吞参会
-       掩盖不匹配）；
-    2. compute fn 的每个入参必须在 forward 中有**同名**形参（骨架会以
-       kwarg 透传，名字对不上即运行期 TypeError）；
-    3. compute fn 的位置参数序列必须是 forward 位置参数序列的**子序列**
-       （位置透传不得乱序）；
-    4. forward 的全部必填参数（无默认值）compute fn 必须接得住。
+    Rules (compute_fn's first parameter is module and forward's first
+    parameter is self; both are skipped):
+    1. The compute fn must not have *args/**kwargs (the skeleton forwards
+       the actual forward arguments, and swallowing them would hide
+       mismatches);
+    2. Every compute-fn parameter must have a **same-named** parameter in
+       forward (the skeleton forwards by kwarg, so a name mismatch is a
+       runtime TypeError);
+    3. The compute fn's positional-parameter sequence must be an in-order
+       **subsequence** of forward's positional-parameter sequence
+       (positional forwarding must not reorder);
+    4. All required (defaultless) parameters of forward must be accepted by
+       the compute fn.
+
+    Args:
+        compute_fn: The compute fn returned by the @local_compute factory.
+        forward: The original module forward being replaced.
+        owner: Call-site label prepended to error messages.
+
+    Raises:
+        TypeError: If any of the rules above is violated.
     """
     try:
         fn_params = list(inspect.signature(compute_fn).parameters.values())
     except (TypeError, ValueError) as exc:
         raise TypeError(
-            f"{owner}: 无法内省注入 compute fn 的签名") from exc
+            f"{owner}: cannot introspect the signature of the injected "
+            "compute fn") from exc
     if not fn_params:
         raise TypeError(
-            f"{owner}: compute fn 至少需要 module 首参——契约是 "
-            "fn(module, *forward_args)")
-    fn_params = fn_params[1:]                     # 跳过 module
+            f"{owner}: a compute fn needs at least the module first "
+            "parameter -- the contract is fn(module, *forward_args)")
+    fn_params = fn_params[1:]                     # skip module
     for p in fn_params:
         if p.kind in (inspect.Parameter.VAR_POSITIONAL,
                       inspect.Parameter.VAR_KEYWORD):
             raise TypeError(
-                f"{owner}: compute fn 不允许 *args/**kwargs（形参 {p.name!r}）"
-                "——入参必须与原 forward 显式匹配")
+                f"{owner}: a compute fn must not use *args/**kwargs "
+                f"(parameter {p.name!r}) -- its arguments must explicitly "
+                "match the original forward")
 
     fwd_params = list(inspect.signature(forward).parameters.values())
     fwd_names = {p.name for p in fwd_params
@@ -233,10 +355,12 @@ def validate_local_compute_signature(compute_fn, forward, *, owner):
     for p in fn_params:
         if p.name not in fwd_names:
             raise TypeError(
-                f"{owner}: compute fn 的入参 {p.name!r} 在原 forward 的形参 "
-                f"{sorted(fwd_names)} 中不存在同名项——注入函数的入参必须与"
-                "原函数匹配（骨架按 forward 实参透传，名字对不上会在运行期"
-                " TypeError）")
+                f"{owner}: compute-fn parameter {p.name!r} has no "
+                f"same-named entry among the original forward parameters "
+                f"{sorted(fwd_names)} -- the injected function's arguments "
+                "must match the original function's (the skeleton forwards "
+                "the actual forward arguments, so a name mismatch becomes a "
+                "runtime TypeError)")
     fwd_pos = [p.name for p in fwd_params
                if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
                              inspect.Parameter.POSITIONAL_OR_KEYWORD)]
@@ -245,8 +369,10 @@ def validate_local_compute_signature(compute_fn, forward, *, owner):
                             inspect.Parameter.POSITIONAL_OR_KEYWORD)]
     if not _is_subsequence(fn_pos, fwd_pos):
         raise TypeError(
-            f"{owner}: compute fn 的位置参数 {fn_pos} 不是原 forward 位置"
-            f"参数 {fwd_pos} 的同序子序列——骨架按位置透传实参，乱序会接错")
+            f"{owner}: the compute fn's positional parameters {fn_pos} are "
+            f"not an in-order subsequence of the original forward's "
+            f"positional parameters {fwd_pos} -- the skeleton forwards "
+            "arguments positionally, so a reordering would bind them wrong")
     required = [p.name for p in fwd_params
                 if p.default is inspect.Parameter.empty
                 and p.kind not in (inspect.Parameter.VAR_POSITIONAL,
@@ -254,23 +380,41 @@ def validate_local_compute_signature(compute_fn, forward, *, owner):
     missing = [n for n in required if n not in fn_names]
     if missing:
         raise TypeError(
-            f"{owner}: 原 forward 的必填参数 {missing} 未被 compute fn 接收"
-            "（compute fn 声明的入参必须覆盖原函数的必填项）")
+            f"{owner}: the original forward's required parameters {missing} "
+            "are not accepted by the compute fn (the compute fn's declared "
+            "arguments must cover the original function's required ones)")
 
 
-def validate_wrapped_forward(orig_forward, new_forward, *, owner):
-    """校验 inner_wrapper 替换后的 forward 能接收原 forward 的全部入参。
+def validate_wrapped_forward(orig_forward: Callable[..., Any],
+                             new_forward: Callable[..., Any],
+                             *,
+                             owner: str) -> None:
+    """Validate that the forward replaced by inner_wrapper can receive all
+    arguments of the original forward.
 
-    用原签名构造一次 dummy bind 试探（*args/**kwargs 参数无法伪造，跳
-    过）；替换侧允许 *args/**kwargs 宽容透传（它必须把不关心的实参传给
-    原实现），但原 forward 的具名参数必须全部可按名绑定。
+    A dummy-bind probe is constructed from the original signature
+    (*args/**kwargs parameters cannot be forged and are skipped); the
+    replacement side may pass through tolerantly with *args/**kwargs (it
+    must forward arguments it does not care about to the original
+    implementation), but every named parameter of the original forward must
+    remain bindable by name.
+
+    Args:
+        orig_forward: The original module forward.
+        new_forward: The replacement forward installed by the wrapper.
+        owner: Call-site label prepended to error messages.
+
+    Raises:
+        TypeError: If the replacement signature cannot be introspected or
+            cannot bind the original arguments.
     """
     orig_sig = inspect.signature(orig_forward)
     try:
         new_sig = inspect.signature(new_forward, follow_wrapped=False)
     except (TypeError, ValueError) as exc:
         raise TypeError(
-            f"{owner}: 无法内省注入 wrapper 替换后的 forward 签名") from exc
+            f"{owner}: cannot introspect the signature of the forward "
+            "replaced by the injected wrapper") from exc
     args, kwargs = [], {}
     for p in orig_sig.parameters.values():
         if p.kind in (inspect.Parameter.VAR_POSITIONAL,
@@ -279,14 +423,18 @@ def validate_wrapped_forward(orig_forward, new_forward, *, owner):
         if p.kind is inspect.Parameter.POSITIONAL_ONLY:
             args.append(None)
         else:
-            # POSITIONAL_OR_KEYWORD 按名（kwarg）试探——名称维度的契约才是
-            # 注入纪律关心的；可选位置实参的纯位置传法不做要求
+            # Probe POSITIONAL_OR_KEYWORD by name (kwarg) -- the
+            # name-dimension contract is what the injection discipline
+            # cares about; purely positional passing of optional positional
+            # arguments is not required
             kwargs[p.name] = None
     try:
         new_sig.bind(*args, **kwargs)
     except TypeError as exc:
         raise TypeError(
-            f"{owner}: 注入 wrapper 替换后的 forward 与原 forward 入参不兼容"
-            f"（{exc}）——原签名 {orig_sig}，替换后签名 {new_sig}；替换后的 "
-            "forward 必须能接收原 forward 的全部入参（可用 *args/**kwargs "
-            "宽容透传）") from exc
+            f"{owner}: the forward replaced by the injected wrapper is "
+            f"incompatible with the original forward's arguments ({exc}) -- "
+            f"original signature {orig_sig}, replacement signature {new_sig}; "
+            "the replacement forward must be able to receive all arguments "
+            "of the original forward (it may pass through tolerantly with "
+            "*args/**kwargs)") from exc

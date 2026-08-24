@@ -378,7 +378,7 @@ class TestNoCpGeneralization:
         """内置 CP 方案（callable 直传）+ 无 cp 轴 → fail-fast。"""
         spec = ModuleShardingSpec(inner_target="inner_attention",
                                   inner_wrapper=sdpa_qkv_cp_wrapper, region_dispatch=False)
-        with pytest.raises(ValueError, match="cp 轴"):
+        with pytest.raises(ValueError, match="active cp axis"):
             _wrap_inner_attention(NeMoAttention(), None, spec=spec)
 
     def test_builtin_target_without_cp_raises(self):
@@ -388,7 +388,7 @@ class TestNoCpGeneralization:
             sdpa_qkv_cp_wrapper,
             target_path="hyper_models.components.distributed."
                         "cp_wrappers.sdpa_qkv_cp_wrapper"), region_dispatch=False)
-        with pytest.raises(ValueError, match="cp 轴"):
+        with pytest.raises(ValueError, match="active cp axis"):
             _wrap_inner_attention(NeMoAttention(), None, spec=spec)
 
 
@@ -504,21 +504,21 @@ class TestInjectionDiscipline:
 
         spec = ModuleShardingSpec(inner_target="self",
                                   inner_wrapper=my_compute, region_dispatch=False)
-        with pytest.raises(TypeError, match="种类不匹配"):
+        with pytest.raises(TypeError, match="wrong decorator kind"):
             _resolve_inner_wrapper(
                 NeMoAttention(), spec, _FakeCpMesh(), None, ())
 
     def test_decorator_requires_mesh_family(self):
         """装饰器强制必选上下文：缺 mesh/tp_mesh/cp_mesh/ep_mesh 任一个
         都在 import 期 fail-fast。"""
-        with pytest.raises(TypeError, match="必选上下文"):
+        with pytest.raises(TypeError, match="missing required context parameters"):
             @inner_wrapper
             def bad(target_module, mesh):   # 缺 tp_mesh/cp_mesh/ep_mesh
                 pass
 
     def test_decorator_rejects_context_default(self):
         """上下文参数不得有默认值（框架必然填充，默认值无意义）。"""
-        with pytest.raises(TypeError, match="不得有默认值"):
+        with pytest.raises(TypeError, match="must not have a default"):
             @inner_wrapper
             def bad(target_module, mesh, tp_mesh, cp_mesh, ep_mesh=None):
                 pass
@@ -543,7 +543,7 @@ class TestInjectionDiscipline:
         spec = ModuleShardingSpec(inner_target="inner_attention",
                                   inner_wrapper=bad_wrapper,
                                   inner_out_src="first_input", region_dispatch=False)
-        with pytest.raises(TypeError, match="入参不兼容"):
+        with pytest.raises(TypeError, match="incompatible with the original forward"):
             _wrap_inner_attention(m, _FakeCpMesh(), spec=spec)
 
     def test_undecorated_registry_entry_raises(self):
@@ -752,7 +752,7 @@ class TestDualModeAdapter:
         _wrap_inner_attention(m, None, spec=spec, mesh=mesh,
                               mesh_dim_names=("tp",))
         q = self._dtensor(mesh, torch.randn(1, 2, 4, 8))
-        with pytest.raises(RuntimeError, match="单输出"):
+        with pytest.raises(RuntimeError, match="only supports a single output"):
             m.inner_attention(q, q, q)
 
 
@@ -831,7 +831,7 @@ class TestAdapterDispatchThrough:
         _wrap_inner_attention(m, None, spec=spec, mesh=mesh,
                               mesh_dim_names=("tp",))
         q = self._dtensor(mesh, torch.randn(1, 2, 4, 8))
-        with pytest.raises(RuntimeError, match="不是 DTensor"):
+        with pytest.raises(RuntimeError, match="not a DTensor"):
             m.inner_attention(q, q, q)
 
     def test_wrapper_without_region_dispatch_fails(self):

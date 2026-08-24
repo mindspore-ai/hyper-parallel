@@ -25,7 +25,7 @@ semantic role (attention/mlp/...).
 
 import logging
 from enum import Enum, auto
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,7 @@ def _match_pattern(name_lower: str, pattern: str, mode: str) -> bool:
 
 
 def _match_rule(name_lower: str, patterns: List[str], mode: str) -> bool:
+    """Return True when any pattern of one rule matches the lower-cased FQN."""
     return any(_match_pattern(name_lower, p, mode) for p in patterns)
 
 
@@ -143,22 +144,55 @@ class ParameterClassifier:
     (treated as full-name substring, the pre-F1 semantics).
     """
 
-    def __init__(self, name_rules=None, arch_overrides=None):
+    def __init__(
+        self,
+        name_rules: Optional[List[tuple]] = None,
+        arch_overrides: Optional[Dict[str, list]] = None,
+    ) -> None:
+        """Initialize the classifier.
+
+        Args:
+            name_rules: Custom naming rules; falls back to
+                ``_build_default_rules()`` when None.
+            arch_overrides: ``{arch: [(pattern | [patterns], ParamRole)]}``
+                per-architecture overrides; empty when None.
+        """
         self._name_rules = (
             name_rules if name_rules is not None else _build_default_rules()
         )
         self._arch_overrides = arch_overrides if arch_overrides is not None else {}
 
-    def classify(self, model, arch: str = "") -> Dict[str, ParamRole]:
-        """Iterate over all named parameters and return {param_fqn: ParamRole}."""
+    def classify(self, model: Any, arch: str = "") -> Dict[str, ParamRole]:
+        """Iterate over all named parameters and return {param_fqn: ParamRole}.
+
+        Args:
+            model: The model whose ``named_parameters()`` are classified.
+            arch: Architecture key selecting the ``arch_overrides`` entry.
+
+        Returns:
+            Mapping of parameter FQN to its classified ParamRole.
+        """
         roles: Dict[str, ParamRole] = {}
         overrides = self._arch_overrides.get(arch, [])
         for name, _ in model.named_parameters():
             roles[name] = self.classify_param(name, overrides)
         return roles
 
-    def classify_param(self, name: str, overrides=None) -> ParamRole:
-        """Classify a single parameter (arch overrides are not applied when overrides is omitted)."""
+    def classify_param(
+        self,
+        name: str,
+        overrides: Optional[List[Tuple[Any, ParamRole]]] = None,
+    ) -> ParamRole:
+        """Classify a single parameter (arch overrides are not applied when overrides is omitted).
+
+        Args:
+            name: The parameter FQN to classify.
+            overrides: Explicit ``(pattern | [patterns], ParamRole)`` override
+                rules checked before the default naming rules.
+
+        Returns:
+            The matched ParamRole; ``ParamRole.SKIP`` when nothing matches.
+        """
         name_lower = name.lower()
         # 1. Explicit arch overrides (three forms: exact FQN / substring /
         #    list-of-patterns)

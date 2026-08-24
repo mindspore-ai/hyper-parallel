@@ -74,10 +74,9 @@ def get_dist_comm_backend() -> str:
     """Return distributed communication backend type based on device type."""
     if IS_CUDA_AVAILABLE:
         return "nccl"
-    elif IS_NPU_AVAILABLE:
+    if IS_NPU_AVAILABLE:
         return "hccl"
-    else:
-        raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
+    raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
 
 
 def synchronize() -> None:
@@ -155,7 +154,7 @@ def is_sm90_or_above() -> bool:
     return get_gpu_compute_capability() >= 90
 
 
-def get_compute_units():
+def get_compute_units() -> int:
     """
     Returns the number of streaming multiprocessors (SMs) or equivalent compute units
     for the available accelerator. Assigns the value to NUM_SMS.
