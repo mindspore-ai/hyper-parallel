@@ -55,3 +55,26 @@ def test_adamw_builds_core_optimizer_from_prefixed_config() -> None:
     assert build_core.call_args.kwargs["adamw_kwargs"] is config
     groups = build_core.call_args.kwargs["adamw_params"]
     assert [group["weight_decay"] for group in groups] == [0.01, 0.0]
+
+
+def test_adamw_logging_does_not_depend_on_core_monkey_patch() -> None:
+    """Use standard logging and suppress parameter details outside rank zero."""
+    model = _Model()
+    config = {"adamw_lr": 1e-4, "adamw_weight_decay": 0.01}
+
+    with (
+        patch(
+            "hyper_parallel.auto_models.components.optim.optimizer.optimizer.get_hyper_optimizer",
+            return_value=object(),
+        ),
+        patch(
+            "hyper_parallel.auto_models.components.optim.optimizer.optimizer.get_global_rank_safe",
+            return_value=1,
+        ),
+        patch(
+            "hyper_parallel.auto_models.components.optim.optimizer.optimizer.logger.info"
+        ) as log_info,
+    ):
+        AdamW(model=model, adamw_config=config, no_decay_params=["bias", "norm"])
+
+    log_info.assert_not_called()
