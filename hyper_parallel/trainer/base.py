@@ -2145,10 +2145,14 @@ class BaseTrainer:
         try:
             if os.path.isdir(weights_path):
                 hf_index = os.path.join(weights_path, "model.safetensors.index.json")
+                has_safetensors = any(
+                    name.endswith(".safetensors")
+                    for name in os.listdir(weights_path)
+                )
                 # Delegate model-specific renaming / expert-splitting to
                 # the per-spec ``state_dict_adapter``.
                 adapter_cls = getattr(self.spec, "state_dict_adapter", None)
-                if os.path.isfile(hf_index) and adapter_cls is not None:
+                if (os.path.isfile(hf_index) or has_safetensors) and adapter_cls is not None:
                     self._load_hf_safetensors(weights_path, adapter_cls)
                 else:
                     self._load_hyper_dcp(weights_path)

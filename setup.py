@@ -36,16 +36,19 @@ logger = logging.getLogger(__name__)
 TORCH26_REQUIRES = [
     "torch==2.6.0",
     "torch-npu==2.6.0.post3",
+    "torchdata>=0.8.0",
 ]
 
 TORCH27_REQUIRES = [
     "torch==2.7.1",
     "torch-npu==2.7.1",
+    "torchdata>=0.8.0",
 ]
 
 TORCH29_REQUIRES = [
     "torch==2.9.1",
     "torch-npu==2.9.1",
+    "torchdata>=0.8.0",
 ]
 
 MINDSPORE_REQUIRES = [
