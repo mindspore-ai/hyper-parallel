@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Metadata and payload communication over injected training groups."""
+"""Metadata, sample, and microbatch communication over injected training groups."""
 
 from __future__ import annotations
 
@@ -41,28 +41,28 @@ class MetadataSynchronizer(Protocol):
         """Gather candidates in deterministic data-owner order."""
 
 
-class PayloadDistributor(Protocol):
+class MicroBatchDistributor(Protocol):
     """Distribute one owner-materialized microbatch to model-parallel peers."""
 
     def distribute(
         self,
-        payload: Any | None,
+        micro_batch: Any | None,
         plan: BatchPlan | None,
         topology: DataTopology,
     ) -> tuple[BatchPlan, Any]:
-        """Return the shared plan and current rank's CP-sharded payload."""
+        """Return the shared plan and current rank's CP-sharded microbatch."""
 
 
-class OwnerPayloadRedistributor(Protocol):
+class SampleRedistributor(Protocol):
     """Move owner-loaded raw samples to their planned DP data ranks."""
 
     def redistribute(
         self,
-        local_payloads: Sequence[Any],
+        local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
     ) -> dict[int, Any]:
-        """Return local target payloads keyed by global source position."""
+        """Return local target samples keyed by global source position."""
 
 
 class LocalMetadataSynchronizer:
@@ -79,19 +79,19 @@ class LocalMetadataSynchronizer:
         return tuple(local_metadata)
 
 
-class LocalOwnerPayloadRedistributor:
+class LocalSampleRedistributor:
     """Keep online raw samples local when there is one DP data owner."""
 
     def redistribute(
         self,
-        local_payloads: Sequence[Any],
+        local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
     ) -> dict[int, Any]:
         """Return the single owner's raw samples without communication."""
-        outgoing, _ = _build_owner_payload_routes(local_payloads, plan, topology)
+        outgoing, _ = _build_sample_routes(local_samples, plan, topology)
         if len(outgoing) != 1:
-            raise ValueError("Local owner payload redistribution requires one data rank.")
+            raise ValueError("Local sample redistribution requires one data rank.")
         return dict(outgoing[0])
 
 
@@ -132,7 +132,7 @@ class TorchMetadataAllGather:
 
 
 class TorchPackedBytesRedistributor:
-    """Exchange nested raw byte payloads with variable-split tensor all-to-all."""
+    """Exchange nested raw byte samples with variable-split tensor all-to-all."""
 
     def __init__(self, group: Any, *, communication_device: Any = None) -> None:
         """Initialize packed-byte A2A over the data-owner group."""
@@ -143,13 +143,13 @@ class TorchPackedBytesRedistributor:
 
     def redistribute(
         self,
-        local_payloads: Sequence[Any],
+        local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
     ) -> dict[int, Any]:
         """Encode raw samples, exchange packed uint8 tensors, and decode local samples."""
         group_data_ranks = _owner_group_data_ranks(self._group, topology)
-        outgoing, received_positions = _build_owner_payload_routes(local_payloads, plan, topology)
+        outgoing, received_positions = _build_sample_routes(local_samples, plan, topology)
         outgoing = tuple(outgoing[data_rank] for data_rank in group_data_ranks)
         received_positions = tuple(received_positions[data_rank] for data_rank in group_data_ranks)
         segments = tuple(_pack_payload_segment(items) for items in outgoing)
@@ -173,25 +173,25 @@ class TorchPackedBytesRedistributor:
             raise ValueError(f"Packed-byte A2A received invalid byte splits {output_splits}.")
 
         send_tensor = _bytes_to_tensor(b"".join(segments), communication_device)
-        received_tensor, payload_work = platform.variable_all_to_all_single(
+        received_tensor, data_work = platform.variable_all_to_all_single(
             send_tensor,
             input_splits,
             output_splits,
             self._group,
             async_op=True,
         )
-        _wait_collective(payload_work)
+        _wait_collective(data_work)
         received_bytes = platform.tensor_to_numpy(received_tensor).tobytes()
 
-        payload_by_position = {}
+        samples_by_position = {}
         cursor = 0
         for source_data_rank, segment_size in enumerate(output_splits):
             segment = received_bytes[cursor:cursor + segment_size]
-            payload_by_position.update(_unpack_payload_segment(segment, received_positions[source_data_rank]))
+            samples_by_position.update(_unpack_payload_segment(segment, received_positions[source_data_rank]))
             cursor += segment_size
         if cursor != len(received_bytes):
             raise ValueError("Packed-byte A2A output contains unconsumed bytes.")
-        return payload_by_position
+        return samples_by_position
 
 
 class TorchTensorRedistributor:
@@ -206,32 +206,32 @@ class TorchTensorRedistributor:
 
     def redistribute(
         self,
-        local_payloads: Sequence[Any],
+        local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
     ) -> dict[int, Any]:
         """Exchange tensor samples without Host serialization."""
         group_data_ranks = _owner_group_data_ranks(self._group, topology)
-        outgoing, received_positions = _build_owner_payload_routes(local_payloads, plan, topology)
+        outgoing, received_positions = _build_sample_routes(local_samples, plan, topology)
         outgoing = tuple(outgoing[data_rank] for data_rank in group_data_ranks)
         received_positions = tuple(received_positions[data_rank] for data_rank in group_data_ranks)
         prepared = _prepare_uniform_tensors(
-            local_payloads,
+            local_samples,
             self._group,
             self._communication_device,
             topology.data_world_size,
         )
-        payload_by_position = {
+        samples_by_position = {
             source_position: prepared[local_index]
             for local_index, source_position in enumerate(
                 range(
-                    topology.data_rank * len(local_payloads),
-                    (topology.data_rank + 1) * len(local_payloads),
+                    topology.data_rank * len(local_samples),
+                    (topology.data_rank + 1) * len(local_samples),
                 )
             )
         }
         ordered_tensors = [
-            payload_by_position[source_position]
+            samples_by_position[source_position]
             for target_items in outgoing
             for source_position, _ in target_items
         ]
@@ -262,24 +262,24 @@ class TorchTensorRedistributor:
         }
 
 
-class LocalPayloadDistributor:
-    """Identity payload distribution with optional local CP slicing."""
+class LocalMicroBatchDistributor:
+    """Identity microbatch distribution with optional local CP slicing."""
 
     def distribute(
         self,
-        payload: Any | None,
+        micro_batch: Any | None,
         plan: BatchPlan | None,
         topology: DataTopology,
     ) -> tuple[BatchPlan, Any]:
-        """Return the owner's payload after applying plan-defined CP shards."""
-        if payload is None or plan is None:
-            raise ValueError("Local payload distribution requires both payload and plan on the data owner.")
-        sharded = shard_payload(payload, plan.cp_shards, topology.cp_rank, topology.cp_size)
+        """Return the owner's microbatch after applying plan-defined CP shards."""
+        if micro_batch is None or plan is None:
+            raise ValueError("Local distribution requires both micro_batch and plan on the data owner.")
+        sharded = shard_micro_batch(micro_batch, plan.cp_shards, topology.cp_rank, topology.cp_size)
         return plan, sharded
 
 
-class TorchPayloadDistributor:
-    """Broadcast an owner payload over an injected model-consumer group.
+class TorchMicroBatchDistributor:
+    """Broadcast an owner microbatch over an injected model-consumer group.
 
     Tensor structure metadata is exchanged separately from tensor storage.
     Tensors themselves use the backend collective, so an HCCL group requires
@@ -287,41 +287,42 @@ class TorchPayloadDistributor:
     """
 
     def __init__(self, group: Any, *, communication_device: Any = None) -> None:
-        """Initialize payload broadcast over an existing consumer group."""
+        """Initialize microbatch broadcast over an existing consumer group."""
         if platform.platform_type != PlatformType.PYTORCH:
-            raise ValueError("TorchPayloadDistributor is supported only on the PyTorch platform.")
+            raise ValueError("TorchMicroBatchDistributor is supported only on the PyTorch platform.")
         self._group = group
         self._communication_device = communication_device
 
     def distribute(
         self,
-        payload: Any | None,
+        micro_batch: Any | None,
         plan: BatchPlan | None,
         topology: DataTopology,
     ) -> tuple[BatchPlan, Any]:
-        """Broadcast one nested payload, then apply this rank's CP slicing."""
+        """Broadcast one nested microbatch, then apply this rank's CP slicing."""
         group_ranks = tuple(platform.get_process_group_ranks(self._group))
         if set(group_ranks) != set(topology.consumer_ranks):
             raise ValueError(
-                f"payload_group ranks must be {topology.consumer_ranks}, but got {group_ranks}."
+                f"consumer_group ranks must be {topology.consumer_ranks}, but got {group_ranks}."
             )
         is_source = topology.global_rank == topology.data_owner_rank
         backend = str(platform.get_backend(self._group)).lower()
         accelerator_backend = "hccl" in backend or "nccl" in backend
-        if is_source and (payload is None or plan is None):
-            raise ValueError("The data owner must provide both payload and plan.")
-        if not is_source and payload is not None:
-            raise ValueError("Only the data owner may provide a payload for distribution.")
+        if is_source and (micro_batch is None or plan is None):
+            raise ValueError("The data owner must provide both micro_batch and plan.")
+        if not is_source and micro_batch is not None:
+            raise ValueError("Only the data owner may provide a microbatch for distribution.")
         if not is_source and accelerator_backend and self._communication_device is None:
-            raise ValueError("communication_device is required to receive tensors over an HCCL/NCCL payload group.")
+            raise ValueError("communication_device is required to receive tensors over an HCCL/NCCL consumer group.")
 
         descriptor = None
         tensors = []
         if is_source:
-            descriptor, tensors = _encode_payload(payload)
+            descriptor, tensors = _encode_payload(micro_batch)
             if accelerator_backend and any(str(tensor.device).lower().startswith("cpu") for tensor in tensors):
                 raise ValueError(
-                    "HCCL/NCCL payload tensors must be moved to the accelerator by prepare_payload before broadcast."
+                    "HCCL/NCCL microbatch tensors must be moved to the accelerator by "
+                    "prepare_micro_batch before broadcast."
                 )
         header = (plan, descriptor) if is_source else None
         gathered_headers: list[Any] = [None] * len(group_ranks)
@@ -329,18 +330,18 @@ class TorchPayloadDistributor:
         source_index = group_ranks.index(topology.data_owner_rank)
         source_header = gathered_headers[source_index]
         if not isinstance(source_header, tuple) or len(source_header) != 2:
-            raise ValueError(f"Data owner {topology.data_owner_rank} did not publish a valid payload header.")
+            raise ValueError(f"Data owner {topology.data_owner_rank} did not publish a valid microbatch header.")
         received_plan, received_descriptor = source_header
         if not isinstance(received_plan, BatchPlan):
-            raise ValueError("The distributed payload header does not contain a valid BatchPlan.")
+            raise ValueError("The distributed microbatch header does not contain a valid BatchPlan.")
 
         if not is_source:
-            payload, tensors = _decode_payload(received_descriptor, self._communication_device)
+            micro_batch, tensors = _decode_payload(received_descriptor, self._communication_device)
         for tensor in tensors:
             platform.broadcast(tensor, topology.data_owner_rank, self._group, async_op=False)
 
-        sharded = shard_payload(
-            payload,
+        sharded = shard_micro_batch(
+            micro_batch,
             received_plan.cp_shards,
             topology.cp_rank,
             topology.cp_size,
@@ -359,7 +360,7 @@ def _collective_device(group: Any, communication_device: Any) -> Any:
     backend = str(platform.get_backend(group)).lower()
     if "hccl" in backend or "nccl" in backend:
         if communication_device is None:
-            raise ValueError("communication_device is required for HCCL/NCCL owner payload A2A.")
+            raise ValueError("communication_device is required for HCCL/NCCL sample A2A.")
         return communication_device
     return None
 
@@ -369,33 +370,33 @@ def _wait_collective(work: Any) -> None:
         work.wait()
 
 
-def _build_owner_payload_routes(
-    local_payloads: Sequence[Any],
+def _build_sample_routes(
+    local_samples: Sequence[Any],
     plan: BatchPlan,
     topology: DataTopology,
 ) -> tuple[tuple[tuple[tuple[int, Any], ...], ...], tuple[tuple[int, ...], ...]]:
     if not topology.is_data_owner:
-        raise ValueError("Only data owners may redistribute online raw payloads.")
+        raise ValueError("Only data owners may redistribute online raw samples.")
     if plan.data_world_size != topology.data_world_size:
         raise ValueError(
             f"Plan data_world_size={plan.data_world_size} does not match topology "
             f"data_world_size={topology.data_world_size}."
         )
     local_count = plan.micro_batch_size * plan.micro_batch_count
-    if len(local_payloads) != local_count:
-        raise ValueError(f"Expected {local_count} local raw payloads, but got {len(local_payloads)}.")
+    if len(local_samples) != local_count:
+        raise ValueError(f"Expected {local_count} local raw samples, but got {len(local_samples)}.")
     planned_by_position = {sample.source_position: sample for sample in plan.samples}
     if len(planned_by_position) != len(plan.samples):
-        raise ValueError("BatchPlan source positions must be unique for raw payload redistribution.")
+        raise ValueError("BatchPlan source positions must be unique for raw sample redistribution.")
 
     source_start = topology.data_rank * local_count
     outgoing: list[list[tuple[int, Any]]] = [[] for _ in range(topology.data_world_size)]
-    for local_index, payload in enumerate(local_payloads):
+    for local_index, sample in enumerate(local_samples):
         source_position = source_start + local_index
         planned_sample = planned_by_position.get(source_position)
         if planned_sample is None:
             raise ValueError(f"BatchPlan is missing source position {source_position}.")
-        outgoing[planned_sample.target_data_rank].append((source_position, payload))
+        outgoing[planned_sample.target_data_rank].append((source_position, sample))
 
     received_positions: list[list[int]] = [[] for _ in range(topology.data_world_size)]
     for planned_sample in plan.samples:
@@ -412,17 +413,17 @@ def _build_owner_payload_routes(
 
 
 def _prepare_uniform_tensors(
-    local_payloads: Sequence[Any],
+    local_samples: Sequence[Any],
     group: Any,
     communication_device: Any,
     data_world_size: int,
 ) -> tuple[Any, ...]:
-    if not local_payloads or any(not platform.is_tensor(payload) for payload in local_payloads):
-        raise ValueError("direct_tensor_a2a requires every online payload to be a tensor.")
-    sample_shape = tuple(local_payloads[0].shape)
-    sample_dtype = local_payloads[0].dtype
-    if any(tuple(payload.shape) != sample_shape or payload.dtype != sample_dtype for payload in local_payloads):
-        raise ValueError("direct_tensor_a2a requires identical payload shapes and dtypes on each data owner.")
+    if not local_samples or any(not platform.is_tensor(sample) for sample in local_samples):
+        raise ValueError("direct_tensor_a2a requires every online sample to be a tensor.")
+    sample_shape = tuple(local_samples[0].shape)
+    sample_dtype = local_samples[0].dtype
+    if any(tuple(sample.shape) != sample_shape or sample.dtype != sample_dtype for sample in local_samples):
+        raise ValueError("direct_tensor_a2a requires identical sample shapes and dtypes on each data owner.")
 
     local_schema = (sample_shape, str(sample_dtype))
     gathered_schemas: list[Any] = [None] * data_world_size
@@ -433,8 +434,8 @@ def _prepare_uniform_tensors(
     backend = str(platform.get_backend(group)).lower()
     accelerator_backend = "hccl" in backend or "nccl" in backend
     prepared = []
-    for payload in local_payloads:
-        tensor = payload.contiguous()
+    for sample in local_samples:
+        tensor = sample.contiguous()
         if accelerator_backend and communication_device is not None:
             tensor = tensor.to(communication_device, non_blocking=True)
         elif accelerator_backend and str(tensor.device).lower().startswith("cpu"):
@@ -546,8 +547,8 @@ def _unpack_payload_segment(segment: bytes, source_positions: Sequence[int]) -> 
     return payload_by_position
 
 
-def shard_payload(
-    payload: Any,
+def shard_micro_batch(
+    micro_batch: Any,
     shard_specs: tuple[TensorShardSpec, ...],
     cp_rank: int,
     cp_size: int,
@@ -555,18 +556,18 @@ def shard_payload(
     """Shard selected nested tensor fields for one CP rank.
 
     Args:
-        payload: Nested batch structure.
+        micro_batch: Nested batch structure.
         shard_specs: Plan-defined tensor paths and shard dimensions.
         cp_rank: Local rank in the CP group.
         cp_size: CP group size.
 
     Returns:
-        Payload with selected tensor leaves replaced by local CP shards.
+        Microbatch with selected tensor leaves replaced by local CP shards.
     """
     if cp_size < 1 or cp_rank < 0 or cp_rank >= cp_size:
         raise ValueError(f"cp_rank must be in [0, {cp_size}), but got {cp_rank}.")
     if cp_size == 1 or not shard_specs:
-        return payload
+        return micro_batch
     spec_by_path = {spec.path: spec for spec in shard_specs}
     if len(spec_by_path) != len(shard_specs):
         raise ValueError("BatchPlan.cp_shards must not contain duplicate tensor paths.")
@@ -576,7 +577,7 @@ def shard_payload(
         spec = spec_by_path.get(path)
         if spec is not None:
             if not platform.is_tensor(value):
-                raise ValueError(f"CP shard path {path} does not address a tensor payload leaf.")
+                raise ValueError(f"CP shard path {path} does not address a tensor microbatch leaf.")
             dimension = spec.dim + len(value.shape) if spec.dim < 0 else spec.dim
             if dimension < 0 or dimension >= len(value.shape):
                 raise ValueError(f"CP shard dim {spec.dim} is invalid for tensor at {path} with shape {value.shape}.")
@@ -595,10 +596,10 @@ def shard_payload(
             return tuple(_apply(child, path + (index,)) for index, child in enumerate(value))
         return value
 
-    result = _apply(payload, ())
+    result = _apply(micro_batch, ())
     missing_paths = set(spec_by_path) - seen_paths
     if missing_paths:
-        raise ValueError(f"CP shard paths were not found in payload: {sorted(missing_paths, key=repr)}.")
+        raise ValueError(f"CP shard paths were not found in microbatch: {sorted(missing_paths, key=repr)}.")
     return result
 
 

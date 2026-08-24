@@ -200,9 +200,9 @@ class DataTopology:
         """Validate that a metadata group contains exactly the data owners."""
         self._validate_group(group, self.owner_ranks, "metadata_group")
 
-    def validate_payload_group(self, group: Any) -> None:
-        """Validate that a payload group contains consumers of this DP coordinate."""
-        self._validate_group(group, self.consumer_ranks, "payload_group")
+    def validate_consumer_group(self, group: Any) -> None:
+        """Validate that a process group contains consumers of this DP coordinate."""
+        self._validate_group(group, self.consumer_ranks, "consumer_group")
 
     @staticmethod
     def _validate_group(group, expected_ranks: tuple[int, ...], name: str) -> None:

@@ -25,9 +25,9 @@ from unittest.mock import patch
 from hyper_parallel import distributed_data
 from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
 from hyper_parallel.distributed_data.distributor import (
+    LocalMicroBatchDistributor,
     LocalMetadataSynchronizer,
-    LocalOwnerPayloadRedistributor,
-    LocalPayloadDistributor,
+    LocalSampleRedistributor,
 )
 from hyper_parallel.distributed_data.materializer import (
     RankMaterializer,
@@ -62,7 +62,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             "DataTopology",
             "DatasetStateTracker",
             "DistributedBatchPlanner",
-            "TorchPayloadDistributor",
+            "TorchMicroBatchDistributor",
         ):
             self.assertFalse(hasattr(distributed_data, internal_name))
 
@@ -70,9 +70,9 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         """The public builder should require exactly one metadata path."""
         config = distributed_data.DistributedDatasetConfig(micro_batch_size=1, micro_batch_count=1)
 
-        def metadata_fn(payload: Any, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: Any, data_ref: int) -> SampleMeta:
             """Build unused metadata for boundary validation."""
-            del payload
+            del sample
             return SampleMeta(sample_id=str(data_ref), source_id="source", data_ref=data_ref)
 
         with self.assertRaisesRegex(ValueError, "requires metadata_fn"):
@@ -85,11 +85,11 @@ class TestDistributedDataPublicApi(unittest.TestCase):
                 metadata_fn=metadata_fn,
                 metadata=[],
             )
-        with self.assertRaisesRegex(ValueError, "owner_payload_transport"):
+        with self.assertRaisesRegex(ValueError, "sample_transport"):
             distributed_data.DistributedDatasetConfig(
                 micro_batch_size=1,
                 micro_batch_count=1,
-                owner_payload_transport="object_p2p",
+                sample_transport="object_p2p",
             )
         with self.assertRaisesRegex(ValueError, "pin_memory must be a boolean"):
             distributed_data.DistributedDatasetConfig(
@@ -145,7 +145,7 @@ class _RecordingMaterializer:
         self.data_refs = []
 
     def materialize(self, metadata: SampleMeta) -> Any:
-        """Record and return one sample payload."""
+        """Record and return one sample."""
         self.data_refs.append(metadata.data_ref)
         return self._dataset[metadata.data_ref]
 
@@ -193,31 +193,31 @@ class _RecordingMapDataset:
         return self._samples[data_ref]
 
 
-class _SyntheticOwnerPayloadRedistributor:
-    """Provide peer payloads while recording owner-loaded raw samples."""
+class _SyntheticSampleRedistributor:
+    """Provide peer samples while recording owner-loaded raw samples."""
 
     def __init__(self) -> None:
         """Initialize an empty redistribution record."""
-        self.local_payload_batches: list[tuple[Any, ...]] = []
+        self.local_sample_batches: list[tuple[Any, ...]] = []
         self.plans: list[BatchPlan] = []
         self.thread_names: list[str] = []
 
     def redistribute(
         self,
-        local_payloads: Sequence[Any],
+        local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
     ) -> dict[int, Any]:
-        """Return payloads planned for data rank zero."""
+        """Return samples planned for data rank zero."""
         self.thread_names.append(threading.current_thread().name)
-        local_payloads = tuple(local_payloads)
-        self.local_payload_batches.append(local_payloads)
+        local_samples = tuple(local_samples)
+        self.local_sample_batches.append(local_samples)
         self.plans.append(plan)
-        local_count = len(local_payloads)
+        local_count = len(local_samples)
         source_start = topology.data_rank * local_count
         available = {
-            source_start + local_index: payload
-            for local_index, payload in enumerate(local_payloads)
+            source_start + local_index: sample
+            for local_index, sample in enumerate(local_samples)
         }
         for sample in plan.samples:
             available.setdefault(sample.source_position, f"peer-{sample.meta.data_ref}")
@@ -228,8 +228,8 @@ class _SyntheticOwnerPayloadRedistributor:
         }
 
 
-class _ReceivingPayloadDistributor:
-    """Stand in for owner-to-TP-peer payload communication."""
+class _ReceivingMicroBatchDistributor:
+    """Stand in for owner-to-TP-peer microbatch communication."""
 
     def __init__(self, plan: BatchPlan) -> None:
         """Initialize the plan that a remote owner publishes."""
@@ -239,13 +239,13 @@ class _ReceivingPayloadDistributor:
 
     def distribute(
         self,
-        payload: Any | None,
+        micro_batch: Any | None,
         plan: BatchPlan | None,
         topology: DataTopology,
     ) -> tuple[BatchPlan, Any]:
-        """Return a synthetic payload while asserting owner-only reads."""
-        if payload is not None or plan is not None or topology.is_data_owner:
-            raise AssertionError("Non-owner payload distribution received owner-only inputs.")
+        """Return a synthetic microbatch while asserting owner-only reads."""
+        if micro_batch is not None or plan is not None or topology.is_data_owner:
+            raise AssertionError("Non-owner distribution received owner-only inputs.")
         self.thread_names.append(threading.current_thread().name)
         result = f"received-{self._micro_batch_index}"
         self._micro_batch_index += 1
@@ -262,19 +262,19 @@ class _ReceivingPlanSequenceDistributor:
 
     def distribute(
         self,
-        payload: Any | None,
+        micro_batch: Any | None,
         plan: BatchPlan | None,
         topology: DataTopology,
     ) -> tuple[BatchPlan, Any]:
         """Return the next remote plan while asserting non-owner behavior."""
-        if payload is not None or plan is not None or topology.is_data_owner:
+        if micro_batch is not None or plan is not None or topology.is_data_owner:
             raise AssertionError("Non-owner online distribution received owner-only inputs.")
         index = self._micro_batch_index
         self._micro_batch_index += 1
         return self._plans[index], f"received-online-{index}"
 
 
-class _BlockingPayloadDistributor:
+class _BlockingMicroBatchDistributor:
     """Block selected full-pipeline distribution calls for overlap assertions."""
 
     def __init__(self, blocked_calls: tuple[int, ...]) -> None:
@@ -288,7 +288,7 @@ class _BlockingPayloadDistributor:
 
     def distribute(
         self,
-        payload: Any | None,
+        micro_batch: Any | None,
         plan: BatchPlan | None,
         topology: DataTopology,
     ) -> tuple[BatchPlan, Any]:
@@ -301,7 +301,7 @@ class _BlockingPayloadDistributor:
             self.started[call_index].set()
             if not self.release[call_index].wait(timeout=5):
                 raise RuntimeError(f"Timed out releasing synthetic distribution call {call_index}.")
-        return LocalPayloadDistributor().distribute(payload, plan, topology)
+        return LocalMicroBatchDistributor().distribute(micro_batch, plan, topology)
 
     def release_all(self) -> None:
         """Release every synthetic blocked distribution call."""
@@ -381,8 +381,8 @@ def _build_loader(
     prefetch_steps: int = 2,
     *,
     double_buffer: bool = False,
-    payload_distributor: Any | None = None,
-    prepare_payload: Any | None = None,
+    micro_batch_distributor: Any | None = None,
+    prepare_micro_batch: Any | None = None,
     data_stream: Any = None,
 ):
     metadata = [
@@ -409,10 +409,10 @@ def _build_loader(
         planner=planner,
         rank_materializer=RankMaterializer(materializer, tuple),
         metadata_synchronizer=_PeerMetadataSynchronizer(),
-        payload_distributor=payload_distributor or LocalPayloadDistributor(),
+        micro_batch_distributor=micro_batch_distributor or LocalMicroBatchDistributor(),
         prefetch_steps=prefetch_steps,
         double_buffer=double_buffer,
-        prepare_payload=prepare_payload,
+        prepare_micro_batch=prepare_micro_batch,
         data_stream=data_stream,
     )
     return loader, materializer
@@ -432,9 +432,9 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
         return {"values": values, "nested": (values[0], ["text"])}
 
     if online:
-        def metadata_fn(payload: Any, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: Any, data_ref: int) -> SampleMeta:
             """Build online metadata for one synthetic raw sample."""
-            del payload
+            del sample
             return SampleMeta(sample_id=str(data_ref), source_id="source", data_ref=data_ref)
 
         online_source = StridedOnlineSampleSource(samples, metadata_fn, shard_rank=0, num_shards=1)
@@ -444,11 +444,11 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
             planner=planner,
             rank_materializer=RankMaterializer(_FailMaterializer(), collate_fn),
             metadata_synchronizer=LocalMetadataSynchronizer(),
-            payload_distributor=LocalPayloadDistributor(),
+            micro_batch_distributor=LocalMicroBatchDistributor(),
             prefetch_steps=1,
             pin_memory=pin_memory,
             online_sample_source=online_source,
-            owner_payload_redistributor=LocalOwnerPayloadRedistributor(),
+            sample_redistributor=LocalSampleRedistributor(),
         )
 
     metadata = [
@@ -461,13 +461,13 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
         planner=planner,
         rank_materializer=RankMaterializer(_RecordingMaterializer(samples), collate_fn),
         metadata_synchronizer=LocalMetadataSynchronizer(),
-        payload_distributor=LocalPayloadDistributor(),
+        micro_batch_distributor=LocalMicroBatchDistributor(),
         prefetch_steps=1,
         pin_memory=pin_memory,
     )
 
 
-def _build_single_microbatch_double_buffer(payload_distributor: Any) -> DistributedDataset:
+def _build_single_microbatch_double_buffer(micro_batch_distributor: Any) -> DistributedDataset:
     """Build two one-microbatch steps for cross-step look-ahead tests."""
     metadata = [
         SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
@@ -485,7 +485,7 @@ def _build_single_microbatch_double_buffer(payload_distributor: Any) -> Distribu
         planner=DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=1),
         rank_materializer=RankMaterializer(_RecordingMaterializer(["sample-0", "sample-1"]), tuple),
         metadata_synchronizer=LocalMetadataSynchronizer(),
-        payload_distributor=payload_distributor,
+        micro_batch_distributor=micro_batch_distributor,
         prefetch_steps=2,
         double_buffer=True,
     )
@@ -516,7 +516,6 @@ class TestDistributedDataset(unittest.TestCase):
             self.assertEqual([first.micro_batch_index, second.micro_batch_index], [0, 1])
             self.assertEqual(first.replay_id, second.replay_id)
             self.assertTrue(step.is_complete)
-            self.assertFalse(hasattr(step, "payloads"))
             loader.commit(step.replay_id)
             self.assertEqual(loader.consumed_offset, 2)
         finally:
@@ -524,18 +523,18 @@ class TestDistributedDataset(unittest.TestCase):
 
     def test_double_buffer_prefetches_full_sidecar_pipeline_and_next_step(self) -> None:
         """The alternate slot should finish distribution for the next execution unit."""
-        distributor = _BlockingPayloadDistributor(blocked_calls=(1, 2))
+        distributor = _BlockingMicroBatchDistributor(blocked_calls=(1, 2))
         prepare_threads: list[str] = []
 
-        def prepare_payload(payload: Any) -> Any:
+        def prepare_micro_batch(micro_batch: Any) -> Any:
             """Record that device preparation moved onto the data producer."""
             prepare_threads.append(threading.current_thread().name)
-            return payload
+            return micro_batch
 
         loader, _ = _build_loader(
             double_buffer=True,
-            payload_distributor=distributor,
-            prepare_payload=prepare_payload,
+            micro_batch_distributor=distributor,
+            prepare_micro_batch=prepare_micro_batch,
         )
         try:
             step = next(loader)
@@ -564,11 +563,11 @@ class TestDistributedDataset(unittest.TestCase):
 
     def test_double_buffer_with_one_prefetched_step_overlaps_microbatches(self) -> None:
         """One step reservation should still allow overlap within that optimizer step."""
-        distributor = _BlockingPayloadDistributor(blocked_calls=(1,))
+        distributor = _BlockingMicroBatchDistributor(blocked_calls=(1,))
         loader, _ = _build_loader(
             prefetch_steps=1,
             double_buffer=True,
-            payload_distributor=distributor,
+            micro_batch_distributor=distributor,
         )
         try:
             step = next(loader)
@@ -591,10 +590,10 @@ class TestDistributedDataset(unittest.TestCase):
         """Online metadata gather and raw A2A should run before the next consumer request."""
         dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
 
-        def metadata_fn(payload: str, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: str, data_ref: int) -> SampleMeta:
             """Build deterministic online metadata for the synthetic sample."""
             return SampleMeta(
-                sample_id=payload,
+                sample_id=sample,
                 source_id="source",
                 data_ref=data_ref,
                 cost_hint=WorkloadCost(encoder=float(data_ref + 1)),
@@ -607,7 +606,7 @@ class TestDistributedDataset(unittest.TestCase):
             global_rank=0,
         )
         synchronizer = _BlockingMetadataSynchronizer(blocked_call=1)
-        redistributor = _SyntheticOwnerPayloadRedistributor()
+        redistributor = _SyntheticSampleRedistributor()
         prepare_threads: list[str] = []
         loader = DistributedDataset(
             topology=topology,
@@ -615,10 +614,12 @@ class TestDistributedDataset(unittest.TestCase):
             planner=DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=3),
             rank_materializer=RankMaterializer(_FailMaterializer(), tuple),
             metadata_synchronizer=synchronizer,
-            payload_distributor=LocalPayloadDistributor(),
+            micro_batch_distributor=LocalMicroBatchDistributor(),
             prefetch_steps=2,
             double_buffer=True,
-            prepare_payload=lambda payload: prepare_threads.append(threading.current_thread().name) or payload,
+            prepare_micro_batch=lambda micro_batch: (
+                prepare_threads.append(threading.current_thread().name) or micro_batch
+            ),
             online_sample_source=StridedOnlineSampleSource(
                 dataset,
                 metadata_fn,
@@ -626,7 +627,7 @@ class TestDistributedDataset(unittest.TestCase):
                 num_shards=2,
                 max_entries=3,
             ),
-            owner_payload_redistributor=redistributor,
+            sample_redistributor=redistributor,
         )
         try:
             step = next(loader)
@@ -639,7 +640,7 @@ class TestDistributedDataset(unittest.TestCase):
             synchronizer.release.set()
             remaining = list(step)
 
-            self.assertEqual([payload.micro_batch_index for payload in [first, *remaining]], [0, 1, 2])
+            self.assertEqual([micro_batch.micro_batch_index for micro_batch in [first, *remaining]], [0, 1, 2])
             self.assertEqual(dataset.data_refs, [0, 2, 4])
             self.assertTrue(all(name.startswith("hp-data-buffer") for name in redistributor.thread_names))
             self.assertTrue(all(name.startswith("hp-data-buffer") for name in prepare_threads))
@@ -668,7 +669,7 @@ class TestDistributedDataset(unittest.TestCase):
 
     def test_double_buffer_crosses_step_boundary_when_microbatch_count_is_one(self) -> None:
         """Disabling gradient accumulation should still prepare the next optimizer step."""
-        distributor = _BlockingPayloadDistributor(blocked_calls=(1,))
+        distributor = _BlockingMicroBatchDistributor(blocked_calls=(1,))
         loader = _build_single_microbatch_double_buffer(distributor)
         try:
             first_step = next(loader)
@@ -693,7 +694,7 @@ class TestDistributedDataset(unittest.TestCase):
 
     def test_double_buffer_close_drains_running_collective_task(self) -> None:
         """Closing must not cancel a collective that peer ranks may already have entered."""
-        distributor = _BlockingPayloadDistributor(blocked_calls=(1,))
+        distributor = _BlockingMicroBatchDistributor(blocked_calls=(1,))
         loader = _build_single_microbatch_double_buffer(distributor)
         close_complete = threading.Event()
 
@@ -723,7 +724,7 @@ class TestDistributedDataset(unittest.TestCase):
             loader.close()
 
     def test_double_buffer_runs_non_owner_distribution_on_data_producer(self) -> None:
-        """TP peers must enter payload collectives from the same ordered producer role."""
+        """TP peers must enter microbatch collectives from the same ordered producer role."""
         metadata = [
             SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
             for index in range(2)
@@ -735,35 +736,35 @@ class TestDistributedDataset(unittest.TestCase):
             global_rank=1,
         )
         planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=2)
-        distributor = _ReceivingPayloadDistributor(planner.plan(metadata, step=0, cursor_start=0))
+        distributor = _ReceivingMicroBatchDistributor(planner.plan(metadata, step=0, cursor_start=0))
         loader = DistributedDataset(
             topology=topology,
             metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
             planner=planner,
             rank_materializer=RankMaterializer(_FailMaterializer()),
             metadata_synchronizer=LocalMetadataSynchronizer(),
-            payload_distributor=distributor,
+            micro_batch_distributor=distributor,
             prefetch_steps=2,
             double_buffer=True,
         )
         try:
             step = next(loader)
-            payloads = list(step)
+            micro_batches = list(step)
 
-            self.assertEqual([payload.data for payload in payloads], ["received-0", "received-1"])
+            self.assertEqual([micro_batch.data for micro_batch in micro_batches], ["received-0", "received-1"])
             self.assertTrue(all(name.startswith("hp-data-buffer") for name in distributor.thread_names))
             loader.commit(step.replay_id)
         finally:
             loader.close()
 
     def test_online_metadata_balances_and_redistributes_one_microbatch_at_a_time(self) -> None:
-        """Unavailable metadata must restrict planning and payload reads to each microbatch."""
+        """Unavailable metadata must restrict planning and sample reads to each microbatch."""
         dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
 
-        def metadata_fn(payload: str, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: str, data_ref: int) -> SampleMeta:
             """Derive deterministic online cost metadata from one raw sample."""
             return SampleMeta(
-                sample_id=payload,
+                sample_id=sample,
                 source_id="source",
                 data_ref=data_ref,
                 modality="image_text",
@@ -783,17 +784,17 @@ class TestDistributedDataset(unittest.TestCase):
             num_shards=2,
             max_entries=3,
         )
-        redistributor = _SyntheticOwnerPayloadRedistributor()
+        redistributor = _SyntheticSampleRedistributor()
         loader = DistributedDataset(
             topology=topology,
             metadata_source=None,
             planner=DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=3),
             rank_materializer=RankMaterializer(_FailMaterializer(), tuple),
             metadata_synchronizer=_PeerMetadataSynchronizer(),
-            payload_distributor=LocalPayloadDistributor(),
+            micro_batch_distributor=LocalMicroBatchDistributor(),
             prefetch_steps=1,
             online_sample_source=online_source,
-            owner_payload_redistributor=redistributor,
+            sample_redistributor=redistributor,
         )
         try:
             self.assertEqual(len(loader), 1)
@@ -801,15 +802,15 @@ class TestDistributedDataset(unittest.TestCase):
 
             self.assertLessEqual(len(dataset.data_refs), 1)
             first = next(step)
-            self.assertEqual(len(redistributor.local_payload_batches), 1)
+            self.assertEqual(len(redistributor.local_sample_batches), 1)
             self.assertLessEqual(len(dataset.data_refs), 2)
 
             remaining = list(step)
-            payloads = [first, *remaining]
-            self.assertEqual([payload.micro_batch_index for payload in payloads], [0, 1, 2])
+            micro_batches = [first, *remaining]
+            self.assertEqual([micro_batch.micro_batch_index for micro_batch in micro_batches], [0, 1, 2])
             self.assertEqual(dataset.data_refs, [0, 2, 4])
             self.assertEqual(
-                redistributor.local_payload_batches,
+                redistributor.local_sample_batches,
                 [("raw-0",), ("raw-2",), ("raw-4",)],
             )
             self.assertEqual([plan.micro_batch_start for plan in redistributor.plans], [0, 1, 2])
@@ -892,7 +893,7 @@ class TestDistributedDataset(unittest.TestCase):
         finally:
             restored.close()
 
-    def test_tp_peer_receives_payload_without_materializing_dataset(self) -> None:
+    def test_tp_peer_receives_micro_batches_without_materializing_dataset(self) -> None:
         """Only the data owner may perform map-style I/O for a DP coordinate."""
         metadata = [
             SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
@@ -912,12 +913,12 @@ class TestDistributedDataset(unittest.TestCase):
             planner=planner,
             rank_materializer=RankMaterializer(_FailMaterializer()),
             metadata_synchronizer=_PeerMetadataSynchronizer(),
-            payload_distributor=_ReceivingPayloadDistributor(plan),
+            micro_batch_distributor=_ReceivingMicroBatchDistributor(plan),
             prefetch_steps=1,
         )
         try:
             step = next(loader)
-            self.assertEqual([payload.data for payload in step], ["received-0", "received-1"])
+            self.assertEqual([micro_batch.data for micro_batch in step], ["received-0", "received-1"])
         finally:
             loader.close()
 
@@ -925,9 +926,9 @@ class TestDistributedDataset(unittest.TestCase):
         """Non-owner model peers should receive online plans without candidate I/O."""
         dataset = _RecordingMapDataset(["raw-0", "raw-1"])
 
-        def metadata_fn(payload: str, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: str, data_ref: int) -> SampleMeta:
             """Build metadata that must remain unused on the non-owner peer."""
-            return SampleMeta(sample_id=payload, source_id="source", data_ref=data_ref)
+            return SampleMeta(sample_id=sample, source_id="source", data_ref=data_ref)
 
         topology = DataTopology.from_layout(
             mesh_shape=(2,),
@@ -951,16 +952,19 @@ class TestDistributedDataset(unittest.TestCase):
             planner=planner,
             rank_materializer=RankMaterializer(_FailMaterializer()),
             metadata_synchronizer=LocalMetadataSynchronizer(),
-            payload_distributor=_ReceivingPlanSequenceDistributor(plans),
+            micro_batch_distributor=_ReceivingPlanSequenceDistributor(plans),
             prefetch_steps=1,
             online_sample_source=StridedOnlineSampleSource(dataset, metadata_fn, shard_rank=0, num_shards=1),
-            owner_payload_redistributor=LocalOwnerPayloadRedistributor(),
+            sample_redistributor=LocalSampleRedistributor(),
         )
         try:
             step = next(loader)
-            payloads = list(step)
+            micro_batches = list(step)
 
-            self.assertEqual([payload.data for payload in payloads], ["received-online-0", "received-online-1"])
+            self.assertEqual(
+                [micro_batch.data for micro_batch in micro_batches],
+                ["received-online-0", "received-online-1"],
+            )
             self.assertEqual(dataset.data_refs, [])
             loader.commit(step.replay_id)
         finally:

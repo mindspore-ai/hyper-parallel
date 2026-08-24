@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Map-style metadata and payload materialization."""
+"""Map-style metadata and sample materialization."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ class LoadedSample:
     """One owner-loaded raw sample and its online metadata."""
 
     metadata: SampleMeta
-    payload: Any
+    data: Any
 
 
 class OnlineSampleSource(Protocol):
@@ -141,11 +141,11 @@ class StridedOnlineSampleSource:
         if index < 0 or index >= len(self):
             raise ValueError(f"Online sample index must be in [0, {len(self)}), but got {index}.")
         data_ref = self._shard_rank + index * self._num_shards
-        payload = self._dataset[data_ref]
-        metadata = self._metadata_fn(payload, data_ref)
+        sample = self._dataset[data_ref]
+        metadata = self._metadata_fn(sample, data_ref)
         if not isinstance(metadata, SampleMeta):
             raise ValueError(f"metadata_fn must return SampleMeta, but got {type(metadata)}.")
-        return LoadedSample(metadata, payload)
+        return LoadedSample(metadata, sample)
 
 
 class MapDatasetMaterializer:
@@ -202,5 +202,5 @@ class RankMaterializer:
         return self._collate_fn(samples)
 
     def collate(self, samples: list[Any]) -> Any:
-        """Collate already-loaded samples after online payload redistribution."""
+        """Collate already-loaded samples after online redistribution."""
         return self._collate_fn(samples)

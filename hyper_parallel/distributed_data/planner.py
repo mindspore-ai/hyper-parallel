@@ -70,7 +70,7 @@ class DistributedBatchPlanner:
         step: int,
         cursor_start: int,
     ) -> BatchPlan:
-        """Build a deterministic plan without materializing sample payloads.
+        """Build a deterministic plan without materializing sample data.
 
         Args:
             candidates: Metadata for the complete global optimizer-step batch.

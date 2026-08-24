@@ -92,7 +92,7 @@ class SampleMeta:
     """Lightweight sample information visible to the planner.
 
     ``data_ref`` identifies the map-style dataset entry. It must not contain
-    decoded images, token tensors, or other heavyweight payloads.
+    decoded images, token tensors, or other heavyweight sample data.
     """
 
     sample_id: str
@@ -129,7 +129,7 @@ class SampleMeta:
 class TensorShardSpec:
     """Describe one tensor field that context parallelism shards.
 
-    ``path`` addresses a leaf in a nested dict/list/tuple payload. For
+    ``path`` addresses a leaf in a nested dict/list/tuple microbatch. For
     example, ``("input_ids",)`` targets a top-level field and
     ``("images", 0)`` targets the first element of ``images``.
     """
@@ -235,8 +235,8 @@ class BatchPlan:
 
 
 @dataclass(frozen=True)
-class RankPayload:
-    """Materialized payload and its planning-window replay ID for one rank."""
+class RankMicroBatch:
+    """Materialized microbatch and its planning-window replay ID for one rank."""
 
     replay_id: str
     global_rank: int
@@ -247,7 +247,7 @@ class RankPayload:
     data: Any
 
 
-class DistributedDataStep(Iterator[RankPayload]):
+class DistributedDataStep(Iterator[RankMicroBatch]):
     """One optimizer step that materializes local microbatches lazily."""
 
     def __init__(
@@ -257,7 +257,7 @@ class DistributedDataStep(Iterator[RankPayload]):
         cursor_start: int,
         cursor_end: int,
         micro_batch_count: int,
-        load_micro_batch: Callable[[int], tuple[BatchPlan, RankPayload]],
+        load_micro_batch: Callable[[int], tuple[BatchPlan, RankMicroBatch]],
         on_complete: Callable[["DistributedDataStep", str], None],
     ) -> None:
         """Initialize a single-use optimizer-step iterator.
@@ -267,8 +267,8 @@ class DistributedDataStep(Iterator[RankPayload]):
             cursor_start: Per-owner candidate cursor before this step.
             cursor_end: Per-owner candidate cursor after this step.
             micro_batch_count: Number of local microbatches in the step.
-            load_micro_batch: Runtime callback that produces one planned payload.
-            on_complete: Callback invoked after the final payload is produced.
+            load_micro_batch: Runtime callback that produces one planned microbatch.
+            on_complete: Callback invoked after the final microbatch is produced.
         """
         for name, value in (
             ("step", step),
@@ -287,7 +287,7 @@ class DistributedDataStep(Iterator[RankPayload]):
         self.cursor_start = cursor_start
         self.cursor_end = cursor_end
         self.micro_batch_count = micro_batch_count
-        self._load_micro_batch: Callable[[int], tuple[BatchPlan, RankPayload]] | None = load_micro_batch
+        self._load_micro_batch: Callable[[int], tuple[BatchPlan, RankMicroBatch]] | None = load_micro_batch
         self._on_complete: Callable[["DistributedDataStep", str], None] | None = on_complete
         self._micro_batch_index = 0
         self._plan_replay_ids: list[str] = []
@@ -297,16 +297,17 @@ class DistributedDataStep(Iterator[RankPayload]):
         """Return this single-use microbatch iterator."""
         return self
 
-    def __next__(self) -> RankPayload:
-        """Materialize and return the next local microbatch payload."""
+    def __next__(self) -> RankMicroBatch:
+        """Materialize and return the next local microbatch."""
         if self._micro_batch_index >= self.micro_batch_count:
             raise StopIteration
         if self._load_micro_batch is None:
             raise ValueError("DistributedDataStep is no longer attached to its dataset runtime.")
-        plan, payload = self._load_micro_batch(self._micro_batch_index)
-        if payload.micro_batch_index != self._micro_batch_index:
+        plan, micro_batch = self._load_micro_batch(self._micro_batch_index)
+        if micro_batch.micro_batch_index != self._micro_batch_index:
             raise ValueError(
-                f"Expected microbatch {self._micro_batch_index}, but runtime returned {payload.micro_batch_index}."
+                f"Expected microbatch {self._micro_batch_index}, "
+                f"but runtime returned {micro_batch.micro_batch_index}."
             )
         self._plan_replay_ids.append(plan.replay_id)
         self._micro_batch_index += 1
@@ -318,7 +319,7 @@ class DistributedDataStep(Iterator[RankPayload]):
             if on_complete is None:
                 raise ValueError("DistributedDataStep completion callback is unavailable.")
             on_complete(self, self._replay_id)
-        return payload
+        return micro_batch
 
     @property
     def replay_id(self) -> str:
@@ -332,7 +333,7 @@ class DistributedDataStep(Iterator[RankPayload]):
         """Return whether every local microbatch has been produced."""
         return self._micro_batch_index == self.micro_batch_count
 
-    def micro_batches(self) -> Iterator[RankPayload]:
+    def micro_batches(self) -> Iterator[RankMicroBatch]:
         """Return the single-use lazy microbatch iterator."""
         return self
 

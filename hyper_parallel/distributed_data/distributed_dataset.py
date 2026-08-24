@@ -24,8 +24,8 @@ from typing import Any, Callable, Iterator
 
 from hyper_parallel.distributed_data.distributor import (
     MetadataSynchronizer,
-    OwnerPayloadRedistributor,
-    PayloadDistributor,
+    MicroBatchDistributor,
+    SampleRedistributor,
 )
 from hyper_parallel.distributed_data.materializer import (
     LoadedSample,
@@ -35,7 +35,7 @@ from hyper_parallel.distributed_data.materializer import (
     _pin_memory_batch,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
-from hyper_parallel.distributed_data.schema import BatchPlan, DistributedDataStep, RankPayload
+from hyper_parallel.distributed_data.schema import BatchPlan, DistributedDataStep, RankMicroBatch
 from hyper_parallel.distributed_data.state import DatasetStateTracker
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.platform import get_platform
@@ -55,7 +55,7 @@ class _ReservedStep:
 @dataclass(frozen=True)
 class _PreparedMicroBatch:
     plan: BatchPlan
-    payload: RankPayload
+    micro_batch: RankMicroBatch
     ready_event: Any = None
 
 
@@ -69,7 +69,7 @@ class _BufferSlot:
 class DistributedDataset(Iterator[DistributedDataStep]):
     """Plan optimizer steps and materialize one local microbatch at a time.
 
-    Sidecar metadata enables whole-step balancing before any payload read.
+    Sidecar metadata enables whole-step balancing before any sample read.
     Online metadata reads one global microbatch of candidates at a time and
     balances only within that microbatch. Call :meth:`commit` only after every
     microbatch and the corresponding optimizer step succeed.
@@ -83,13 +83,13 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         planner: DistributedBatchPlanner,
         rank_materializer: RankMaterializer,
         metadata_synchronizer: MetadataSynchronizer,
-        payload_distributor: PayloadDistributor,
+        micro_batch_distributor: MicroBatchDistributor,
         prefetch_steps: int = 2,
         pin_memory: bool = False,
         double_buffer: bool = False,
-        prepare_payload: Callable[[Any], Any] | None = None,
+        prepare_micro_batch: Callable[[Any], Any] | None = None,
         online_sample_source: OnlineSampleSource | None = None,
-        owner_payload_redistributor: OwnerPayloadRedistributor | None = None,
+        sample_redistributor: SampleRedistributor | None = None,
         data_stream: Any = None,
     ) -> None:
         """Initialize planning, materialization, communication, and prefetch components."""
@@ -100,8 +100,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             )
         if (metadata_source is None) == (online_sample_source is None):
             raise ValueError("Configure exactly one of metadata_source and online_sample_source.")
-        if online_sample_source is not None and owner_payload_redistributor is None:
-            raise ValueError("Online metadata requires an owner_payload_redistributor.")
+        if online_sample_source is not None and sample_redistributor is None:
+            raise ValueError("Online metadata requires a sample_redistributor.")
         if not isinstance(pin_memory, bool):
             raise ValueError(f"pin_memory must be a boolean, but got {pin_memory!r}.")
         if not isinstance(double_buffer, bool):
@@ -112,9 +112,9 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self._planner = planner
         self._rank_materializer = rank_materializer
         self._metadata_synchronizer = metadata_synchronizer
-        self._owner_payload_redistributor = owner_payload_redistributor
-        self._payload_distributor = payload_distributor
-        self._prepare_payload = prepare_payload
+        self._sample_redistributor = sample_redistributor
+        self._micro_batch_distributor = micro_batch_distributor
+        self._prepare_micro_batch = prepare_micro_batch
         self._double_buffer = double_buffer
         self._data_stream = data_stream
         source_size = len(metadata_source) if metadata_source is not None else len(online_sample_source)
@@ -269,7 +269,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             raise ValueError("Online sample source is not configured.")
         return tuple(self._online_sample_source.get(index) for index in range(cursor_start, cursor_end))
 
-    def _consume_active_microbatch(self, micro_batch_index: int) -> tuple[BatchPlan, RankPayload]:
+    def _consume_active_microbatch(self, micro_batch_index: int) -> tuple[BatchPlan, RankMicroBatch]:
         if self._closed:
             raise ValueError("Cannot consume microbatches from a closed DistributedDataset.")
         reservation = self._require_active_reservation()
@@ -289,26 +289,26 @@ class DistributedDataset(Iterator[DistributedDataStep]):
 
         if self._metadata_source is not None:
             plan = reservation.plan if self._topology.is_data_owner else None
-            owner_payload = owner_input
+            owner_micro_batch = owner_input
         elif self._topology.is_data_owner:
-            plan, owner_payload = self._plan_online_microbatch(
+            plan, owner_micro_batch = self._plan_online_microbatch(
                 reservation,
                 micro_batch_index,
                 owner_input,
             )
         else:
-            plan, owner_payload = None, None
+            plan, owner_micro_batch = None, None
 
-        if owner_payload is not None and self._prepare_payload is not None:
-            owner_payload = self._prepare_payload(owner_payload)
-        received_plan, rank_data = self._payload_distributor.distribute(
-            owner_payload,
+        if owner_micro_batch is not None and self._prepare_micro_batch is not None:
+            owner_micro_batch = self._prepare_micro_batch(owner_micro_batch)
+        received_plan, rank_data = self._micro_batch_distributor.distribute(
+            owner_micro_batch,
             plan,
             self._topology,
         )
         self._validate_received_plan(received_plan, reservation, micro_batch_index)
         planned_samples = received_plan.samples_for(self._topology.data_rank, micro_batch_index)
-        payload = RankPayload(
+        micro_batch = RankMicroBatch(
             replay_id=received_plan.replay_id,
             global_rank=self._topology.global_rank,
             data_rank=self._topology.data_rank,
@@ -321,7 +321,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self._next_micro_batch_index += 1
         if self._next_micro_batch_index < self._planner.micro_batch_count:
             self._schedule_owner_microbatch(self._next_micro_batch_index)
-        return received_plan, payload
+        return received_plan, micro_batch
 
     def _schedule_buffered_microbatch(self, reservation: _ReservedStep, micro_batch_index: int) -> None:
         key = (reservation.step, micro_batch_index)
@@ -341,7 +341,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self,
         reservation: _ReservedStep,
         micro_batch_index: int,
-    ) -> tuple[BatchPlan, RankPayload]:
+    ) -> tuple[BatchPlan, RankMicroBatch]:
         key = (reservation.step, micro_batch_index)
         slot = self._buffer_slots[self._buffer_slot_index(reservation.step, micro_batch_index)]
         if slot.key != key or slot.future is None:
@@ -359,7 +359,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             self._schedule_buffered_microbatch(reservation, self._next_micro_batch_index)
         elif self._prepared_steps:
             self._schedule_buffered_microbatch(self._prepared_steps[0], 0)
-        return prepared.plan, prepared.payload
+        return prepared.plan, prepared.micro_batch
 
     def _prepare_buffered_microbatch(
         self,
@@ -372,17 +372,17 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             else platform.get_stream_context()(self._data_stream)
         )
         with stream_context:
-            plan, owner_payload = self._prepare_buffered_owner_payload(reservation, micro_batch_index)
-            if owner_payload is not None and self._prepare_payload is not None:
-                owner_payload = self._prepare_payload(owner_payload)
-            received_plan, rank_data = self._payload_distributor.distribute(
-                owner_payload,
+            plan, owner_micro_batch = self._prepare_buffered_owner_micro_batch(reservation, micro_batch_index)
+            if owner_micro_batch is not None and self._prepare_micro_batch is not None:
+                owner_micro_batch = self._prepare_micro_batch(owner_micro_batch)
+            received_plan, rank_data = self._micro_batch_distributor.distribute(
+                owner_micro_batch,
                 plan,
                 self._topology,
             )
             self._validate_received_plan(received_plan, reservation, micro_batch_index)
             planned_samples = received_plan.samples_for(self._topology.data_rank, micro_batch_index)
-            payload = RankPayload(
+            micro_batch = RankMicroBatch(
                 replay_id=received_plan.replay_id,
                 global_rank=self._topology.global_rank,
                 data_rank=self._topology.data_rank,
@@ -395,9 +395,9 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             if self._data_stream is not None:
                 ready_event = platform.new_event()
                 ready_event.record(self._data_stream)
-        return _PreparedMicroBatch(received_plan, payload, ready_event)
+        return _PreparedMicroBatch(received_plan, micro_batch, ready_event)
 
-    def _prepare_buffered_owner_payload(
+    def _prepare_buffered_owner_micro_batch(
         self,
         reservation: _ReservedStep,
         micro_batch_index: int,
@@ -416,14 +416,14 @@ class DistributedDataset(Iterator[DistributedDataStep]):
                     step=reservation.step,
                     cursor_start=reservation.cursor_start,
                 )
-            owner_payload = self._rank_materializer.materialize(
+            owner_micro_batch = self._rank_materializer.materialize(
                 reservation.plan,
                 self._topology.data_rank,
                 micro_batch_index,
             )
             if self._pin_executor is not None:
-                owner_payload = self._pin_executor.submit(_pin_memory_batch, owner_payload).result()
-            return reservation.plan, owner_payload
+                owner_micro_batch = self._pin_executor.submit(_pin_memory_batch, owner_micro_batch).result()
+            return reservation.plan, owner_micro_batch
 
         cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
         cursor_end = cursor_start + self._planner.micro_batch_size
@@ -440,8 +440,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         micro_batch_index: int,
         owner_input: Any,
     ) -> tuple[BatchPlan, Any]:
-        if self._owner_payload_redistributor is None:
-            raise ValueError("Online metadata requires an owner payload redistributor.")
+        if self._sample_redistributor is None:
+            raise ValueError("Online metadata requires a sample redistributor.")
         if not isinstance(owner_input, tuple) or any(not isinstance(sample, LoadedSample) for sample in owner_input):
             raise ValueError("Online microbatch preparation returned invalid loaded samples.")
         local_metadata = tuple(sample.metadata for sample in owner_input)
@@ -453,17 +453,17 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             cursor_start=cursor_start,
             micro_batch_index=micro_batch_index,
         )
-        payload_by_position = self._owner_payload_redistributor.redistribute(
-            tuple(sample.payload for sample in owner_input),
+        samples_by_position = self._sample_redistributor.redistribute(
+            tuple(sample.data for sample in owner_input),
             plan,
             self._topology,
         )
         planned_samples = plan.samples_for(self._topology.data_rank, micro_batch_index)
-        samples = [payload_by_position[sample.source_position] for sample in planned_samples]
-        owner_payload = self._rank_materializer.collate(samples)
+        samples = [samples_by_position[sample.source_position] for sample in planned_samples]
+        owner_micro_batch = self._rank_materializer.collate(samples)
         if self._pin_executor is not None:
-            owner_payload = self._pin_executor.submit(_pin_memory_batch, owner_payload).result()
-        return plan, owner_payload
+            owner_micro_batch = self._pin_executor.submit(_pin_memory_batch, owner_micro_batch).result()
+        return plan, owner_micro_batch
 
     def _validate_received_plan(
         self,

@@ -23,11 +23,11 @@ from hyper_parallel.distributed_data.cost_model import CostModel
 from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
 from hyper_parallel.distributed_data.distributor import (
     LocalMetadataSynchronizer,
-    LocalOwnerPayloadRedistributor,
-    LocalPayloadDistributor,
+    LocalMicroBatchDistributor,
+    LocalSampleRedistributor,
+    TorchMicroBatchDistributor,
     TorchMetadataAllGather,
     TorchPackedBytesRedistributor,
-    TorchPayloadDistributor,
     TorchTensorRedistributor,
 )
 from hyper_parallel.distributed_data.materializer import (
@@ -44,7 +44,7 @@ from hyper_parallel.platform.platform import PlatformType
 
 platform = get_platform()
 
-_OWNER_PAYLOAD_TRANSPORTS = ("packed_bytes_a2a", "direct_tensor_a2a")
+_SAMPLE_TRANSPORTS = ("packed_bytes_a2a", "direct_tensor_a2a")
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,7 @@ class DistributedDatasetConfig:
     ``direct_tensor_a2a`` requires every owner sample to be one tensor with a
     globally identical shape and dtype. ``prefetch_steps`` bounds lightweight
     step-plan look-ahead. ``double_buffer`` keeps exactly one fully prepared
-    microbatch ahead, including online metadata collectives and payload
+    microbatch ahead, including online metadata collectives and sample
     distribution. One prefetched step enables overlap within an optimizer
     step; two or more also enable overlap across optimizer-step boundaries.
     ``pin_memory`` copies collated Host tensor leaves into pinned memory on a
@@ -65,7 +65,7 @@ class DistributedDatasetConfig:
     micro_batch_size: int
     micro_batch_count: int
     prefetch_steps: int = 2
-    owner_payload_transport: str = "packed_bytes_a2a"
+    sample_transport: str = "packed_bytes_a2a"
     dp_dim_names: tuple[str, ...] | None = None
     cp_shards: tuple[TensorShardSpec, ...] = ()
     pin_memory: bool = False
@@ -80,10 +80,10 @@ class DistributedDatasetConfig:
             raise ValueError(f"pin_memory must be a boolean, but got {self.pin_memory!r}.")
         if not isinstance(self.double_buffer, bool):
             raise ValueError(f"double_buffer must be a boolean, but got {self.double_buffer!r}.")
-        if self.owner_payload_transport not in _OWNER_PAYLOAD_TRANSPORTS:
+        if self.sample_transport not in _SAMPLE_TRANSPORTS:
             raise ValueError(
-                f"owner_payload_transport must be one of {_OWNER_PAYLOAD_TRANSPORTS}, "
-                f"but got {self.owner_payload_transport!r}."
+                f"sample_transport must be one of {_SAMPLE_TRANSPORTS}, "
+                f"but got {self.sample_transport!r}."
             )
 
 
@@ -96,19 +96,19 @@ def build_distributed_dataset(
     metadata: Sequence[SampleMeta] | None = None,
     collate_fn: Callable[[list[Any]], Any] | None = None,
     metadata_group: Any = None,
-    payload_group: Any = None,
+    consumer_group: Any = None,
     communication_device: Any = None,
-    prepare_payload: Callable[[Any], Any] | None = None,
+    prepare_micro_batch: Callable[[Any], Any] | None = None,
     cost_model: CostModel | None = None,
 ) -> DistributedDataset:
     """Build a PyTorch-only online-planned distributed dataset.
 
     Groups must come from the training mesh; this API never creates an
     independent communication world. ``metadata_group`` contains exactly one
-    data owner per DP coordinate. ``payload_group`` contains all model peers
+    data owner per DP coordinate. ``consumer_group`` contains all model peers
     sharing the current DP coordinate. Online metadata is the default path and
     balances one global microbatch at a time. An explicit sidecar ``metadata``
-    sequence enables whole-step inter-microbatch planning before payload reads.
+    sequence enables whole-step inter-microbatch planning before sample reads.
     When ``config.double_buffer`` is enabled, both groups must be dedicated
     process-group instances that model collectives never use. Every rank then
     submits data collectives from one ordered producer thread.
@@ -118,18 +118,18 @@ def build_distributed_dataset(
             microbatch of raw Host candidates at a time and redistributes them
             before heavyweight target-rank decode.
         mesh: Named root training mesh.
-        config: Batch planning, double buffering, and owner A2A transport configuration.
+        config: Batch planning, double buffering, and sample A2A transport configuration.
         metadata_fn: Derive ``SampleMeta`` from ``(raw_sample, data_ref)`` for
             microbatch-local online planning. Required without ``metadata``.
         metadata: Optional shared lightweight sidecar for whole-step planning.
         collate_fn: Target-owner transform and collation function. In online
             mode it receives the raw samples retained or received after planning.
         metadata_group: Existing process group containing all data owners.
-            Online mode also uses it for owner payload A2A.
-        payload_group: Existing process group for this DP coordinate's peers.
+            Online mode also uses it for sample A2A.
+        consumer_group: Existing process group for this DP coordinate's peers.
         communication_device: Local collective device. Required for packed-byte
             owner A2A and tensor reception over HCCL/NCCL groups.
-        prepare_payload: Optional owner-side move/packing before communication.
+        prepare_micro_batch: Optional owner-side move/packing before communication.
             Double buffering invokes it on the data producer thread.
         cost_model: Optional calibrated workload cost model.
 
@@ -152,7 +152,7 @@ def build_distributed_dataset(
         cp_shards=config.cp_shards,
     )
     online_sample_source = None
-    owner_payload_redistributor = None
+    sample_redistributor = None
     if metadata is None:
         if not hasattr(dataset, "__len__"):
             raise ValueError("Online metadata requires a map-style dataset implementing __len__.")
@@ -166,16 +166,16 @@ def build_distributed_dataset(
             max_entries=complete_steps * planner.local_samples_per_step,
         )
         if topology.data_world_size == 1 or not topology.is_data_owner:
-            owner_payload_redistributor = LocalOwnerPayloadRedistributor()
+            sample_redistributor = LocalSampleRedistributor()
         else:
             topology.validate_metadata_group(metadata_group)
-            if config.owner_payload_transport == "packed_bytes_a2a":
-                owner_payload_redistributor = TorchPackedBytesRedistributor(
+            if config.sample_transport == "packed_bytes_a2a":
+                sample_redistributor = TorchPackedBytesRedistributor(
                     metadata_group,
                     communication_device=communication_device,
                 )
             else:
-                owner_payload_redistributor = TorchTensorRedistributor(
+                sample_redistributor = TorchTensorRedistributor(
                     metadata_group,
                     communication_device=communication_device,
                 )
@@ -199,11 +199,11 @@ def build_distributed_dataset(
             metadata_synchronizer = LocalMetadataSynchronizer()
 
     if len(topology.consumer_ranks) == 1:
-        payload_distributor = LocalPayloadDistributor()
+        micro_batch_distributor = LocalMicroBatchDistributor()
     else:
-        topology.validate_payload_group(payload_group)
-        payload_distributor = TorchPayloadDistributor(
-            payload_group,
+        topology.validate_consumer_group(consumer_group)
+        micro_batch_distributor = TorchMicroBatchDistributor(
+            consumer_group,
             communication_device=communication_device,
         )
 
@@ -214,12 +214,12 @@ def build_distributed_dataset(
         planner=planner,
         rank_materializer=rank_materializer,
         metadata_synchronizer=metadata_synchronizer,
-        payload_distributor=payload_distributor,
+        micro_batch_distributor=micro_batch_distributor,
         prefetch_steps=config.prefetch_steps,
         pin_memory=config.pin_memory,
         double_buffer=config.double_buffer,
-        prepare_payload=prepare_payload,
+        prepare_micro_batch=prepare_micro_batch,
         online_sample_source=online_sample_source,
-        owner_payload_redistributor=owner_payload_redistributor,
+        sample_redistributor=sample_redistributor,
         data_stream=data_stream,
     )

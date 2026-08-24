@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for plan-driven payload distribution helpers."""
+"""Unit tests for plan-driven sample and microbatch distribution helpers."""
 
 from __future__ import annotations
 
@@ -26,10 +26,10 @@ import numpy as np
 from hyper_parallel.distributed_data.distributor import (
     TorchMetadataAllGather,
     TorchPackedBytesRedistributor,
-    TorchPayloadDistributor,
+    TorchMicroBatchDistributor,
     TorchTensorRedistributor,
     _pack_payload_segment,
-    shard_payload,
+    shard_micro_batch,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
 from hyper_parallel.distributed_data.schema import SampleMeta, TensorShardSpec, WorkloadCost
@@ -83,7 +83,7 @@ class _FakeWork:
 
 
 class _FakePlatform:
-    """Minimal platform operations used by ``shard_payload``."""
+    """Minimal platform operations used by ``shard_micro_batch``."""
 
     platform_type = PlatformType.PYTORCH
     tensor_dtype = SimpleNamespace(int64=np.int64, uint8=np.uint8)
@@ -188,28 +188,28 @@ class _FakePlatform:
         del tensor, src, group, async_op
         self.broadcast_count += 1
 
-class TestPayloadSharding(unittest.TestCase):
+class TestMicroBatchSharding(unittest.TestCase):
     """Validate CP field paths recorded in ``BatchPlan``."""
 
     def test_shards_only_selected_nested_tensor(self) -> None:
         """Plan paths should leave unrelated batch fields unchanged."""
-        payload = {"input_ids": _FakeTensor(range(8)), "labels": "replicated"}
+        micro_batch = {"input_ids": _FakeTensor(range(8)), "labels": "replicated"}
         specs = (TensorShardSpec(("input_ids",), 0),)
 
         with patch("hyper_parallel.distributed_data.distributor.platform", _FakePlatform()):
-            result = shard_payload(payload, specs, cp_rank=1, cp_size=2)
+            result = shard_micro_batch(micro_batch, specs, cp_rank=1, cp_size=2)
 
         self.assertEqual(result["input_ids"].values, (4, 5, 6, 7))
         self.assertEqual(result["labels"], "replicated")
 
     def test_rejects_non_divisible_cp_dimension(self) -> None:
         """MVP CP slicing should fail before an uneven collective sequence."""
-        payload = {"input_ids": _FakeTensor(range(7))}
+        micro_batch = {"input_ids": _FakeTensor(range(7))}
         specs = (TensorShardSpec(("input_ids",), 0),)
 
         with patch("hyper_parallel.distributed_data.distributor.platform", _FakePlatform()):
             with self.assertRaisesRegex(ValueError, "not divisible"):
-                shard_payload(payload, specs, cp_rank=0, cp_size=2)
+                shard_micro_batch(micro_batch, specs, cp_rank=0, cp_size=2)
 
     def test_metadata_all_gather_uses_data_owner_order(self) -> None:
         """Process-group order must not change deterministic candidate order."""
@@ -294,8 +294,8 @@ class TestPayloadSharding(unittest.TestCase):
         self.assertEqual(fake_platform.variable_splits, ([1, 0], [1, 0]))
         self.assertTrue(all(work.waited for work in fake_platform.works))
 
-    def test_owner_broadcasts_tensor_payload_without_object_serializing_storage(self) -> None:
-        """Payload structure uses object gather while tensor storage uses broadcast."""
+    def test_owner_broadcasts_tensor_micro_batch_without_object_serializing_storage(self) -> None:
+        """Microbatch structure uses object gather while tensor storage uses broadcast."""
         metadata = [SampleMeta(sample_id="0", source_id="source", data_ref=0)]
         plan = DistributedBatchPlanner(1, 1, 1).plan(metadata, step=0, cursor_start=0)
         topology = DataTopology.from_layout(
@@ -305,12 +305,12 @@ class TestPayloadSharding(unittest.TestCase):
             global_rank=0,
         )
         fake_platform = _FakePlatform()
-        payload = {"input_ids": _FakeTensor((1, 2))}
+        micro_batch = {"input_ids": _FakeTensor((1, 2))}
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
-            distributor = TorchPayloadDistributor(group="payload")
-            received_plan, result = distributor.distribute(payload, plan, topology)
+            distributor = TorchMicroBatchDistributor(group="consumer")
+            received_plan, result = distributor.distribute(micro_batch, plan, topology)
 
         self.assertEqual(received_plan.replay_id, plan.replay_id)
-        self.assertIs(result["input_ids"], payload["input_ids"])
+        self.assertIs(result["input_ids"], micro_batch["input_ids"])
         self.assertEqual(fake_platform.broadcast_count, 1)
