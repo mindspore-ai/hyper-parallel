@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import torch
 
-from hyper_models.components.loss.loss_utils import mean_global_loss
+from hyper_parallel.auto_models.components.loss.loss_utils import mean_global_loss
 
 
 class _FakeSubmesh:
@@ -46,7 +46,7 @@ def test_mean_global_loss_reduces_tokens_over_dp_cp_only() -> None:
     step_tokens = {"foundation_tokens": torch.tensor(256)}
 
     with patch(
-        "hyper_models.components.loss.loss_utils.all_reduce",
+        "hyper_parallel.auto_models.components.loss.loss_utils.all_reduce",
         side_effect=[512, 384],
     ) as mock_all_reduce:
         local_loss = torch.tensor(6.0, requires_grad=True)

@@ -18,11 +18,11 @@ gate/up/down_proj 全部带 bias，OPT/GPT-NeoX 风格），TP=2：
 """
 
 import torch
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.testing.grad_equiv import (
+from hyper_parallel.auto_models.components.distributed.testing.grad_equiv import (
     assert_grad_equivalence,
     run_one_step,
     simulate_tp_replicate_grad_sync,

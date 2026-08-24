@@ -5,7 +5,7 @@ model:
   _target_: torch.nn.Identity
 
 optimizer:
-  _target_: hyper_models.components.optim.optimizer.AdamW
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.AdamW
   no_decay_params: [bias, norm, ln_]
   adamw_config:
     adamw_lr: 0.0001

@@ -45,12 +45,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import perf_kernels  # noqa: E402
 from typing import List  # noqa: E402
-from hyper_models.components.distributed import (  # noqa: E402
+from hyper_parallel.auto_models.components.distributed import (  # noqa: E402
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.config.resolver import resolve_component  # noqa: E402
-from hyper_models.trainer.config import (  # noqa: E402
+from hyper_parallel.auto_models.config.resolver import resolve_component  # noqa: E402
+from hyper_parallel.auto_models.trainer.config import (  # noqa: E402
     PlanOverride,
     entries_to_plan_overrides,
 )
@@ -164,8 +164,8 @@ def show_plan_overrides(overrides, rank):
     """打印 YAML 脱糖后的 plan_overrides 实际内容（可观察性）。
 
     ── 等价的不经 YAML 写法（programmatic 直接构造，效果完全相同）────────
-    from hyper_models.components.distributed import ModuleShardingSpec
-    from hyper_models.trainer.config import Target
+    from hyper_parallel.auto_models.components.distributed import ModuleShardingSpec
+    from hyper_parallel.auto_models.trainer.config import Target
     overrides = {
         "*.self_attn": ModuleShardingSpec(
             region_dispatch=True,   # F.sdpa 融合 kernel：纯标准算子可 dispatch

@@ -16,7 +16,7 @@
 
 import torch
 
-from hyper_models.components.datasets.llm.get_batch import LLMBatchProcessor
+from hyper_parallel.auto_models.components.datasets.llm.get_batch import LLMBatchProcessor
 
 
 def _processor(*, labels_are_shifted: bool) -> LLMBatchProcessor:

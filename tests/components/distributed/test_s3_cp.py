@@ -10,30 +10,30 @@
 import pytest
 import torch
 import torch.nn as nn
-from hyper_models.components.distributed.cp_utils import (
+from hyper_parallel.auto_models.components.distributed.cp_utils import (
     _shard_seq_lens_for_cp,
     shard_batch_for_cp,
 )
-from hyper_models.components.distributed.cp_wrappers import (
+from hyper_parallel.auto_models.components.distributed.cp_wrappers import (
     INNER_WRAPPER_REGISTRY,
     is_flex_attention,
     is_hf_style_attention,
     is_sdpa_attention,
     sdpa_qkv_cp_wrapper,
 )
-from hyper_models.components.distributed.sharding_applier import (
+from hyper_parallel.auto_models.components.distributed.sharding_applier import (
     _resolve_inner_target,
     _resolve_inner_wrapper,
     _wrap_inner_attention,
 )
-from hyper_models.components.distributed.injection import (
+from hyper_parallel.auto_models.components.distributed.injection import (
     inner_wrapper,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     ModuleShardingSpec,
     TP,
 )
-from hyper_models.trainer.config import Target
+from hyper_parallel.auto_models.trainer.config import Target
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import (
     Replicate,
@@ -232,7 +232,7 @@ class TestTargetInnerWrapper:
         spec = ModuleShardingSpec(inner_target="inner_attention",
                                   inner_wrapper=Target(
             sdpa_qkv_cp_wrapper,
-            target_path="hyper_models.components.distributed."
+            target_path="hyper_parallel.auto_models.components.distributed."
                         "cp_wrappers.sdpa_qkv_cp_wrapper"), region_dispatch=False)
         cp_mesh = _FakeCpMesh()
         name, target, apply_fn = _resolve_inner_wrapper(
@@ -319,7 +319,7 @@ class TestTargetInnerWrapper:
         spec = ModuleShardingSpec(inner_target="self",
                                   inner_wrapper=Target(
             sdpa_qkv_cp_wrapper,
-            target_path="hyper_models.components.distributed."
+            target_path="hyper_parallel.auto_models.components.distributed."
                         "cp_wrappers.sdpa_qkv_cp_wrapper",
             cp_mesg="oops"), region_dispatch=False)                      # 拼写错误：应为 cp_mesh
         with pytest.raises(ValueError, match="cp_mesh"):
@@ -386,7 +386,7 @@ class TestNoCpGeneralization:
         spec = ModuleShardingSpec(inner_target="inner_attention",
                                   inner_wrapper=Target(
             sdpa_qkv_cp_wrapper,
-            target_path="hyper_models.components.distributed."
+            target_path="hyper_parallel.auto_models.components.distributed."
                         "cp_wrappers.sdpa_qkv_cp_wrapper"), region_dispatch=False)
         with pytest.raises(ValueError, match="active cp axis"):
             _wrap_inner_attention(NeMoAttention(), None, spec=spec)
@@ -494,7 +494,7 @@ class TestInjectionDiscipline:
 
     def test_wrong_kind_decorator_raises(self):
         """装饰器种类不符（@local_compute 用在 inner_wrapper 上）→ fail-fast。"""
-        from hyper_models.components.distributed.injection import local_compute
+        from hyper_parallel.auto_models.components.distributed.injection import local_compute
 
         @local_compute
         def my_compute(mesh, tp_mesh, cp_mesh, ep_mesh):
@@ -867,7 +867,7 @@ class TestCpSdpaCallCondition:
 
     def test_is_causal_kept_when_cp_inactive(self):
         """cp_size=1：is_causal 原样透传，不替换显式 mask。"""
-        from hyper_models.components.distributed.cp_wrappers import (
+        from hyper_parallel.auto_models.components.distributed.cp_wrappers import (
             _cp_sdpa_call,
         )
         received = {}

@@ -34,12 +34,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     FunctionModule,
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     ModuleShardingSpec,
     TP,
 )

@@ -17,26 +17,26 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
-from hyper_models.components.distributed.local_region import local_region
-from hyper_models.components.distributed.precompiled_boundary import (
+from hyper_parallel.auto_models.components.distributed.local_region import local_region
+from hyper_parallel.auto_models.components.distributed.precompiled_boundary import (
     PrecompiledBoundary,
     _get_arg,
     _set_arg,
 )
-from hyper_models.components.distributed.sharding.apply import (
+from hyper_parallel.auto_models.components.distributed.sharding.apply import (
     _get_attr_by_path,
     _resolve_module,
     _set_param_by_path,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     EP,
     ModuleShardingSpec,
     ShardingPlan,
     TP,
 )
-from hyper_models.components.distributed.source_shard import build_source_shard_info
-from hyper_models.components.distributed.tp_collective_lowering import (
+from hyper_parallel.auto_models.components.distributed.source_shard import build_source_shard_info
+from hyper_parallel.auto_models.components.distributed.tp_collective_lowering import (
     TPExecutionOp,
     create_tp_collective_lowerer,
 )
@@ -86,7 +86,7 @@ class _FakeTPMesh:
 
 def _set_fake_group_ranks(monkeypatch, ranks=(0, 1)):
     monkeypatch.setattr(
-        "hyper_models.components.distributed.tp_collective_lowering."
+        "hyper_parallel.auto_models.components.distributed.tp_collective_lowering."
         "platform.get_process_group_ranks",
         lambda _group: list(ranks),
     )
@@ -418,7 +418,7 @@ class TestRedistributeIO:
         tensor = torch.randn(2, 3)
         gathered = torch.randn(2, 6)
         monkeypatch.setattr(
-            "hyper_models.components.distributed.tp_collective_lowering."
+            "hyper_parallel.auto_models.components.distributed.tp_collective_lowering."
             "platform.differentiable_all_gather_concat",
             lambda *_args, **_kwargs: gathered,
         )

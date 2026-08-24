@@ -17,7 +17,7 @@
 import logging
 from types import SimpleNamespace
 
-from hyper_models.trainer.callbacks import LoggingCallback, TrainerState
+from hyper_parallel.auto_models.trainer.callbacks import LoggingCallback, TrainerState
 
 
 class _FakeTqdmCallback:

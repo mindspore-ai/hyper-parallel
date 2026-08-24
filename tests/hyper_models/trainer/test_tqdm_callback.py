@@ -17,7 +17,7 @@
 from types import SimpleNamespace
 from typing import Any
 
-from hyper_models.trainer.callbacks import TempLogCallback, TqdmCallback, TrainerState
+from hyper_parallel.auto_models.trainer.callbacks import TempLogCallback, TqdmCallback, TrainerState
 
 
 class _FakeProgressBar:

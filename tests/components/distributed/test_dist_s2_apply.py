@@ -12,20 +12,20 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.precompiled_boundary import (
+from hyper_parallel.auto_models.components.distributed.precompiled_boundary import (
     RedistOp,
     _classify_collective,
 )
-from hyper_models.components.distributed.sharding.apply import _local_params_context
-from hyper_models.components.distributed.sharding_applier import (
+from hyper_parallel.auto_models.components.distributed.sharding.apply import _local_params_context
+from hyper_parallel.auto_models.components.distributed.sharding_applier import (
     _shard_module_params,
     detect_tied_weights,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     EP,
     ModuleShardingSpec,
@@ -346,10 +346,10 @@ def _worker_terminal_out_dst(rank, world_size):
     注：端到端路径下 boundary.redistribute_outputs 以声明的 out_dst 为目标，
     产出恒等于声明——out_dst 校验是防御性的，此处直接对校验函数构造不一致。
     """
-    from hyper_models.components.distributed.sharding_applier import (
+    from hyper_parallel.auto_models.components.distributed.sharding_applier import (
         _validate_out_dst,
     )
-    from hyper_models.components.distributed.sharding_config import (
+    from hyper_parallel.auto_models.components.distributed.sharding_config import (
         ModuleShardingSpec,
     )
     from hyper_parallel.core.dtensor.dtensor import DTensor

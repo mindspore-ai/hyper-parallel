@@ -30,7 +30,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,

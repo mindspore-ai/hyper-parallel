@@ -379,7 +379,7 @@ def cp_sdpa_hf_injection(match="*.self_attn"):
 
     返回 plan_overrides 片段（{match: spec}），直接并入 ShardingPlanner 的
     plan_overrides dict。"""
-    from hyper_models.components.distributed.sharding_config import (
+    from hyper_parallel.auto_models.components.distributed.sharding_config import (
         ModuleShardingSpec,
     )
     return {match: ModuleShardingSpec(inner_target="self",
@@ -392,17 +392,17 @@ def ep_archetype_injection(match="*.mlp"):
     default softmax top-k 路由；其他路由语义写自己的工厂）。
 
     返回 plan_overrides 片段（{match: spec}）。"""
-    from hyper_models.components.distributed.ep_compute import (
+    from hyper_parallel.auto_models.components.distributed.ep_compute import (
         routed_only_ep_compute_fn,
     )
-    from hyper_models.components.distributed.sharding_config import (
+    from hyper_parallel.auto_models.components.distributed.sharding_config import (
         ModuleShardingSpec,
     )
-    from hyper_models.trainer.config import Target
+    from hyper_parallel.auto_models.trainer.config import Target
     return {match: ModuleShardingSpec(
         local_compute_fn=Target(
             routed_only_ep_compute_fn,
-            target_path="hyper_models.components.distributed."
+            target_path="hyper_parallel.auto_models.components.distributed."
                         "ep_compute.routed_only_ep_compute_fn"), region_dispatch=False)}
 
 @pytest.fixture

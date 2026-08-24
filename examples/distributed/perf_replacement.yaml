@@ -14,7 +14,7 @@
 #   - match: "*.mlp"
 #     when: ep
 #     local_compute_fn:
-#       _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
+#       _target_: hyper_parallel.auto_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
 plan_overrides:
   # 朴素 eager attention（显式 S×S scores）→ F.sdpa 融合 kernel
   - match: "*.self_attn"

@@ -20,12 +20,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import hyper_models.components.loss.masked_ce as masked_ce_mod
-from hyper_models.components.loss.masked_ce import MaskedCrossEntropy
-from hyper_models.components.loss.utils import calculate_loss
+import hyper_parallel.auto_models.components.loss.masked_ce as masked_ce_mod
+from hyper_parallel.auto_models.components.loss.masked_ce import MaskedCrossEntropy
+from hyper_parallel.auto_models.components.loss.utils import calculate_loss
 
 try:
-    from hyper_models.components.loss.linear_ce import FusedLinearCrossEntropy
+    from hyper_parallel.auto_models.components.loss.linear_ce import FusedLinearCrossEntropy
     HAS_FUSED = True
 except ImportError:  # pragma: no cover
     FusedLinearCrossEntropy = None

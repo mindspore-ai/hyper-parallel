@@ -26,4 +26,4 @@ plan_overrides:
     inner_target: "self"     # 包装边界模块自身（与 inner_wrapper 成对显式声明）
     inner_wrapper: sdpa_hf   # 注册名简写；等价于
     # inner_wrapper:
-    #   _target_: hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper
+    #   _target_: hyper_parallel.auto_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper

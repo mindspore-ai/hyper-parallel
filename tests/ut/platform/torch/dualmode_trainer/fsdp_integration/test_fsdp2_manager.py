@@ -26,11 +26,11 @@ import pytest
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel import Replicate, Shard
-import hyper_models.components.distributed.fsdp2 as fsdp2_module
-from hyper_models.components.distributed.config import FSDP2Config
-from hyper_models.components.distributed.fsdp2 import FSDP2Manager
-from hyper_models.components.distributed.infrastructure import MeshContext
-from hyper_models.components.distributed.local_compute_context import (
+import hyper_parallel.auto_models.components.distributed.fsdp2 as fsdp2_module
+from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
+from hyper_parallel.auto_models.components.distributed.fsdp2 import FSDP2Manager
+from hyper_parallel.auto_models.components.distributed.infrastructure import MeshContext
+from hyper_parallel.auto_models.components.distributed.local_compute_context import (
     install_local_compute_forward_adapters,
     local_compute_context,
 )
@@ -358,7 +358,7 @@ def test_local_compute_adapter_converts_during_forward_and_restores_afterward(
     child = FakeModule(unsharded_dtensor)
     module = FakeModule(child=child)
     monkeypatch.setattr(
-        "hyper_models.components.distributed.local_compute_context.DTensor",
+        "hyper_parallel.auto_models.components.distributed.local_compute_context.DTensor",
         FakeDTensor,
     )
 

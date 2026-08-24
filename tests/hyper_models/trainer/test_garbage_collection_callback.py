@@ -16,8 +16,8 @@
 
 from types import SimpleNamespace
 
-import hyper_models.trainer.callbacks.garbage_collection_callback as callback_module
-from hyper_models.trainer.callbacks import GarbageCollectionCallback, TrainerState
+import hyper_parallel.auto_models.trainer.callbacks.garbage_collection_callback as callback_module
+from hyper_parallel.auto_models.trainer.callbacks import GarbageCollectionCallback, TrainerState
 
 
 def _build_trainer(gc_steps: int, empty_cache_steps: int) -> SimpleNamespace:

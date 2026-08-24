@@ -9,22 +9,22 @@
 
 import torch
 import torch.nn as nn
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
-from hyper_models.components.distributed.sharding_applier import (
+from hyper_parallel.auto_models.components.distributed.cp_utils import shard_batch_for_cp
+from hyper_parallel.auto_models.components.distributed.sharding_applier import (
     _shard_module_params,
     _wrap_inner_attention,
     _wrap_vocab_parallel_embedding,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     ModuleShardingSpec,
     TP,
 )
-from hyper_models.components.distributed.testing.grad_equiv import (
+from hyper_parallel.auto_models.components.distributed.testing.grad_equiv import (
     assert_grad_equivalence,
     run_one_step,
     simulate_tp_replicate_grad_sync,
@@ -240,7 +240,7 @@ def _worker__s5_vocab_embed(rank, world_size):
 
     _shard_module_params(emb, {"weight": {TP: Shard(0)}}, mesh, ("tp",))
     # production：参数解包为 local 后注入 masked wrapper
-    from hyper_models.components.distributed.sharding.apply import (
+    from hyper_parallel.auto_models.components.distributed.sharding.apply import (
         _local_params_context,
     )
     _local_params_context(emb)

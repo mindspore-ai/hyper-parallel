@@ -1,7 +1,7 @@
 # TP×CP×EP×FSDP training with the Indexed form of the same WikiText data.
 
 model:
-  _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: PrimeIntellect/qwen3-moe-tiny
   torch_dtype: bfloat16
   attn_implementation: sdpa
@@ -48,18 +48,18 @@ plan_overrides:
       - "model.norm"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
     replace_module:
-      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
   - match: "*.self_attn"
     when: cp
     region_dispatch: false
     inner_target: self
     inner_wrapper:
-      _target_: hyper_models.components.distributed.cp_wrappers.sdpa_hf_ulysses_cp_wrapper
+      _target_: hyper_parallel.auto_models.components.distributed.cp_wrappers.sdpa_hf_ulysses_cp_wrapper
   - match: "model.layers.[!0]*.mlp"
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
+      _target_: hyper_parallel.auto_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
       use_grouped_gemm: true
 
 mixed_precision:
@@ -72,11 +72,11 @@ dataset:
   model_assets:
     chat_template: null
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: PrimeIntellect/qwen3-moe-tiny
       use_fast: true
 
-  _target_: hyper_models.components.datasets.llm.build_indexed_text_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_indexed_text_dataset
   data_path: ./outputs/training_demo/tiny_qwen3_moe_wikitext2/data/wikitext2_parallel_text_document
   data_config:
     seq_length: 4096
@@ -90,14 +90,14 @@ dataset:
     create_ltor_fields_in_dataloader: false
 
 dataloader:
-  _target_: hyper_models.components.datasets.FixedBatchDataLoader
+  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
 
   # Indexed samples are already fixed-length and only need stacking.
   collate_fn:
-    _target_: hyper_models.components.datasets.build_indexed_collate_fn
+    _target_: hyper_parallel.auto_models.components.datasets.build_indexed_collate_fn
 
   get_batch:
-    _target_: hyper_models.components.datasets.ParallelBatch
+    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
     source_type: indexed
     attention_mode: dense
 
@@ -112,7 +112,7 @@ dataloader:
   prefetch_factor: null
 
 optimizer:
-  _target_: hyper_models.components.optim.optimizer.Muon
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.Muon
   no_decay_params: [bias, norm, ln_]
   muon_config:
     muon_lr: 2.0e-2
@@ -128,7 +128,7 @@ optimizer:
     adamw_eps: 1.0e-8
 
 lr_scheduler:
-  _target_: hyper_models.components.optim.lr_scheduler.MultiLRScheduler
+  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
   lr_decay_style: cosine
   lr_config:
     lr_warmup_steps: 1

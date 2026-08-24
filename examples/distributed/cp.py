@@ -14,7 +14,7 @@ region_dispatch 判断口诀：注入物含通信原语/自定义 kernel/数据�
   plan_overrides glob merge 声明——本例模块是
   HF 风格（forward(hidden_states) 内调 F.scaled_dot_product_attention），
   选择注册表方案 "sdpa_hf"（拦截 F.sdpa 调用点）；也可写成 Target 形式
-  指向 hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper；
+  指向 hyper_parallel.auto_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper；
 - is_causal=True 触发 D-04：cp_size>1 时 is_causal 被替换为 offset-aware
   显式 mask（torch is_causal 在 q_len≠kv_len 时左上角对齐，对 rank>0 的
   CP chunk 是错的）；
@@ -26,12 +26,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
+from hyper_parallel.auto_models.components.distributed.cp_utils import shard_batch_for_cp
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
 

@@ -16,9 +16,9 @@
 
 import torch
 
-from hyper_models.components.optim import cosine_with_warmup
-from hyper_models.trainer.base import BaseTrainer
-from hyper_models.trainer.config import Target, TrainerConfig, TrainingConfig
+from hyper_parallel.auto_models.components.optim import cosine_with_warmup
+from hyper_parallel.auto_models.trainer.base import BaseTrainer
+from hyper_parallel.auto_models.trainer.config import Target, TrainerConfig, TrainingConfig
 
 
 def _unused_target() -> Target:
@@ -38,7 +38,7 @@ def test_trainer_builds_lr_scheduler_from_training_max_steps() -> None:
         lr_scheduler=Target(
             cosine_with_warmup,
             target_path=(
-                "hyper_models.components.optim.lr_scheduler.lr_scheduler."
+                "hyper_parallel.auto_models.components.optim.lr_scheduler.lr_scheduler."
                 "cosine_with_warmup"
             ),
             lr_warmup_steps=1,

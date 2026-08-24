@@ -18,10 +18,10 @@ from types import SimpleNamespace
 
 from torch import nn
 
-from hyper_models._transformers import auto_model as auto_model_module
-from hyper_models._transformers.infrastructure import _apply_module_replacement_actions
-from hyper_models.components.model_transform import module_replacement
-from hyper_models.trainer.config import PlanOverride, Target
+from hyper_parallel.auto_models._transformers import auto_model as auto_model_module
+from hyper_parallel.auto_models._transformers.infrastructure import _apply_module_replacement_actions
+from hyper_parallel.auto_models.components.model_transform import module_replacement
+from hyper_parallel.auto_models.trainer.config import PlanOverride, Target
 
 
 @module_replacement
@@ -82,7 +82,7 @@ def test_build_model_forwards_distributed_setup_to_infrastructure(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(
-        "hyper_models.components.distributed.init_utils.get_world_size_safe",
+        "hyper_parallel.auto_models.components.distributed.init_utils.get_world_size_safe",
         lambda: 1,
     )
     monkeypatch.setattr(

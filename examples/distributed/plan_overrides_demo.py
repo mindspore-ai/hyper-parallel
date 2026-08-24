@@ -36,11 +36,11 @@ from perf_replacement import (  # noqa: E402
     TinyModel,
     load_plan_overrides_from_yaml,
 )
-from hyper_models.components.distributed import (  # noqa: E402
+from hyper_parallel.auto_models.components.distributed import (  # noqa: E402
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.sharding_config import TP  # noqa: E402
+from hyper_parallel.auto_models.components.distributed.sharding_config import TP  # noqa: E402
 from hyper_parallel.core.dtensor.device_mesh import (  # noqa: E402
     init_device_mesh,
 )

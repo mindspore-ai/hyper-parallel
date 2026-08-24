@@ -12,19 +12,19 @@ import logging
 import pytest
 import torch
 import torch.nn as nn
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.sharding_applier import _preflight_compute_injection
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_applier import _preflight_compute_injection
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     ModuleShardingSpec,
     TP,
     resolve_placements,
 )
-from hyper_models.components.distributed.sharding_planner import ShardingPlanner
-from hyper_models.trainer.config import (
+from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_parallel.auto_models.trainer.config import (
     PlanOverride,
     entries_to_plan_overrides,
 )
@@ -603,7 +603,7 @@ def test_override_input_spec_not_mutated(tiny_llama, make_mesh):
 def test_override_dp_declaration_raises(tiny_llama, make_mesh):
     """坐标系约定（05 §3）：plan = 单 dp 切片，override 声明 DP placement
     → fail-first ValueError（教学式报错），而非静默丢弃或选择性保留。"""
-    from hyper_models.components.distributed.sharding_config import DP
+    from hyper_parallel.auto_models.components.distributed.sharding_config import DP
 
     mesh = make_mesh((1,), ("tp",))
     base = dict(
@@ -631,7 +631,7 @@ def test_function_module_uncovered_warns(tiny_llama, make_mesh, caplog):
     """DX guard：FunctionModule 无 spec 覆盖 → plan() warning；有 override
     覆盖 → 不告警且 spec 插入（教程 §10.8）。"""
     import torch
-    from hyper_models.components.distributed import FunctionModule
+    from hyper_parallel.auto_models.components.distributed import FunctionModule
 
     class _Fn(torch.autograd.Function):
         @staticmethod
@@ -675,7 +675,7 @@ class TestOverrideAxisValidation:
 
     def test_ep_virtual_axis_allowed(self, tiny_llama, make_mesh):
         """'ep' 是虚拟轴（TP-extend-EP 专家分片坐标系）→ 不报错。"""
-        from hyper_models.components.distributed.sharding_config import EP
+        from hyper_parallel.auto_models.components.distributed.sharding_config import EP
         mesh = make_mesh((1,), ("tp",))
         spec = ModuleShardingSpec(params={"q_proj.weight": {EP: Shard(0)}})
         # allow_uncovered_params：部分 params 替换使其余参数未覆盖（F4b
@@ -708,7 +708,7 @@ class TestYamlDslEndToEnd:
 
     def test_yaml_contract_fields_merge(self, tiny_llama, make_mesh):
         """契约字段从 YAML 字符串 DSL 脱糖为 Placement 对象后参与 merge。"""
-        from hyper_models.trainer.config import (
+        from hyper_parallel.auto_models.trainer.config import (
             PlanOverride,
             entries_to_plan_overrides,
         )
@@ -736,7 +736,7 @@ class TestYamlDslEndToEnd:
     def test_yaml_sentinels_merge(self, tiny_llama, make_mesh):
         """哨兵经 YAML 透传：'none' 清空推导的 in_src/in_dst（D-14 镜像约束
         要求两者一致清空）。"""
-        from hyper_models.trainer.config import (
+        from hyper_parallel.auto_models.trainer.config import (
             PlanOverride,
             entries_to_plan_overrides,
         )
@@ -751,7 +751,7 @@ class TestYamlDslEndToEnd:
 
     def test_yaml_insert_mode_full_declaration(self, tiny_llama, make_mesh):
         """insert 模式经 YAML：模板未命中的模块完整自声明契约。"""
-        from hyper_models.trainer.config import (
+        from hyper_parallel.auto_models.trainer.config import (
             PlanOverride,
             entries_to_plan_overrides,
         )
@@ -773,7 +773,7 @@ class TestYamlDslEndToEnd:
 
     def test_yaml_insert_with_sentinel_rejected(self, tiny_llama, make_mesh):
         """insert 模式 + 哨兵 → fail-fast（无可继承的推导值）。"""
-        from hyper_models.trainer.config import (
+        from hyper_parallel.auto_models.trainer.config import (
             PlanOverride,
             entries_to_plan_overrides,
         )
@@ -867,7 +867,7 @@ class TestUnsetVsExplicitEmpty:
 
     def test_yaml_empty_dict_is_explicit_clear(self, tiny_llama, make_mesh):
         """YAML 形态 params: {} → 显式清空（不再被拒绝）。"""
-        from hyper_models.trainer.config import (
+        from hyper_parallel.auto_models.trainer.config import (
             PlanOverride,
             entries_to_plan_overrides,
         )
@@ -987,7 +987,7 @@ class TestInjectionDesugar:
 
     def test_desugared_composes_with_handwritten_overrides(self, tiny_llama, make_mesh):
         """脱糖 dict 与手写 override 合并传入：exact merge 契约 + glob merge 注入。"""
-        from hyper_models.components.distributed.sharding_config import (
+        from hyper_parallel.auto_models.components.distributed.sharding_config import (
             TP,
             ModuleShardingSpec,
         )
@@ -1118,23 +1118,23 @@ class TestExplicitExpertMesh:
     def test_expert_mesh_config_key_rejected(self, tiny_hf_native_moe):
         """工厂签名已无 expert_mesh 参数——旧式配置（expert_mesh=...）按
         "未声明的配置键"fail-fast 并列出合法形参（迁移信号明确）。"""
-        from hyper_models.components.distributed import build_expert_mesh
-        from hyper_models.components.distributed.ep_compute import (
+        from hyper_parallel.auto_models.components.distributed import build_expert_mesh
+        from hyper_parallel.auto_models.components.distributed.ep_compute import (
             routed_only_ep_compute_fn,
         )
-        from hyper_models.components.distributed.sharding_config import (
+        from hyper_parallel.auto_models.components.distributed.sharding_config import (
             ModuleShardingSpec,
         )
-        from hyper_models.components.distributed.sharding_applier import (
+        from hyper_parallel.auto_models.components.distributed.sharding_applier import (
             _resolve_local_compute_fn,
         )
-        from hyper_models.trainer.config import Target
+        from hyper_parallel.auto_models.trainer.config import Target
         mesh = _meta_mesh((4, 2), ("dp", "tp"))
         user_mesh = build_expert_mesh(mesh, ep_size=4)
         overrides = {"*.mlp": ModuleShardingSpec(
             local_compute_fn=Target(
                 routed_only_ep_compute_fn,
-                target_path="hyper_models.components.distributed."
+                target_path="hyper_parallel.auto_models.components.distributed."
                             "ep_compute.routed_only_ep_compute_fn",
                 expert_mesh=user_mesh), region_dispatch=False)}
         plan = ShardingPlanner(plan_overrides=overrides).plan(
@@ -1148,21 +1148,21 @@ class TestExplicitExpertMesh:
     def test_ep_mesh_context_key_reserved(self, tiny_hf_native_moe):
         """ep_mesh 是框架保留上下文键——用户配置即 fail-fast（框架统一派生，
         保证 a2a 通信域与专家参数分片域是同一对象）。"""
-        from hyper_models.components.distributed.ep_compute import (
+        from hyper_parallel.auto_models.components.distributed.ep_compute import (
             routed_only_ep_compute_fn,
         )
-        from hyper_models.components.distributed.sharding_config import (
+        from hyper_parallel.auto_models.components.distributed.sharding_config import (
             ModuleShardingSpec,
         )
-        from hyper_models.components.distributed.sharding_applier import (
+        from hyper_parallel.auto_models.components.distributed.sharding_applier import (
             _resolve_local_compute_fn,
         )
-        from hyper_models.trainer.config import Target
+        from hyper_parallel.auto_models.trainer.config import Target
         mesh = _meta_mesh((4, 2), ("dp", "tp"))
         overrides = {"*.mlp": ModuleShardingSpec(
             local_compute_fn=Target(
                 routed_only_ep_compute_fn,
-                target_path="hyper_models.components.distributed."
+                target_path="hyper_parallel.auto_models.components.distributed."
                             "ep_compute.routed_only_ep_compute_fn",
                 ep_mesh="user-mesh"), region_dispatch=False)}
         plan = ShardingPlanner(plan_overrides=overrides).plan(

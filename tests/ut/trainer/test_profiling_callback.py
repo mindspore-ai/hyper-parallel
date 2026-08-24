@@ -19,8 +19,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hyper_models.trainer.callbacks.base import TrainerState
-from hyper_models.trainer.callbacks.profiling_callback import ProfilingCallback
+from hyper_parallel.auto_models.trainer.callbacks.base import TrainerState
+from hyper_parallel.auto_models.trainer.callbacks.profiling_callback import ProfilingCallback
 
 
 def _trainer(*, enabled: bool = True, rank: int = 0, global_rank: int = 0) -> SimpleNamespace:
@@ -50,7 +50,7 @@ def test_profiling_callback_drives_profiler_lifecycle() -> None:
     state = TrainerState()
 
     with patch(
-        "hyper_models.trainer.callbacks.profiling_callback.helper.create_profiler",
+        "hyper_parallel.auto_models.trainer.callbacks.profiling_callback.helper.create_profiler",
         return_value=profiler,
     ) as create_profiler:
         callback.on_train_begin(state)
@@ -68,7 +68,7 @@ def test_profiling_callback_ignores_non_target_rank() -> None:
     callback = ProfilingCallback(_trainer(rank=0, global_rank=1))
 
     with patch(
-        "hyper_models.trainer.callbacks.profiling_callback.helper.create_profiler"
+        "hyper_parallel.auto_models.trainer.callbacks.profiling_callback.helper.create_profiler"
     ) as create_profiler:
         callback.on_train_begin(TrainerState())
 

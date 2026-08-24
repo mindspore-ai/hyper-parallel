@@ -8,7 +8,7 @@ CLI override 用于在不修改 YAML 的情况下调整一次实验的少量参�
 
 ```bash
 python -c \
-  'from hyper_models.config.manager import parse_training_args; print(parse_training_args())' \
+  'from hyper_parallel.auto_models.config.manager import parse_training_args; print(parse_training_args())' \
   configs/qwen3_5.yaml \
   --training.max_steps=200 \
   --accelerator.tp_size=4 \
@@ -53,7 +53,7 @@ override 只能修改 YAML 已经选择的组件。例如 YAML 中存在：
 
 ```yaml
 optimizer:
-  _target_: hyper_models.components.optim.AdamW.Config
+  _target_: hyper_parallel.auto_models.components.optim.AdamW.Config
   lr: 0.0002
 ```
 

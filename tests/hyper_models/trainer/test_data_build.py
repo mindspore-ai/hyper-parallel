@@ -18,15 +18,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from hyper_models.components.data import (
+from hyper_parallel.auto_models.components.data import (
     DataLoader,
     DummyDataset,
     IdentityDataTransform,
     MakeMicroBatchCollator,
 )
-from hyper_models.components.distributed.infrastructure import MeshContext
-from hyper_models.trainer.base import BaseTrainer
-from hyper_models.trainer.config import (
+from hyper_parallel.auto_models.components.distributed.infrastructure import MeshContext
+from hyper_parallel.auto_models.trainer.base import BaseTrainer
+from hyper_parallel.auto_models.trainer.config import (
     ActivationCheckpointConfig,
     Target,
     TrainerConfig,
@@ -161,13 +161,13 @@ def test_trainer_data_stages_return_micro_batches() -> None:
         data_transform=Target(
             IdentityDataTransform,
             target_path=(
-                "hyper_models.components.data.identity_transform."
+                "hyper_parallel.auto_models.components.data.identity_transform."
                 "IdentityDataTransform"
             ),
         ),
         dataset=Target(
             DummyDataset,
-            target_path="hyper_models.components.data.datasets.DummyDataset",
+            target_path="hyper_parallel.auto_models.components.data.datasets.DummyDataset",
             num_samples=16,
             seq_len=6,
             vocab_size=19,
@@ -175,11 +175,11 @@ def test_trainer_data_stages_return_micro_batches() -> None:
         ),
         collate_fn=Target(
             MakeMicroBatchCollator,
-            target_path="hyper_models.components.data.data_collator.MakeMicroBatchCollator",
+            target_path="hyper_parallel.auto_models.components.data.data_collator.MakeMicroBatchCollator",
         ),
         dataloader=Target(
             DataLoader,
-            target_path="hyper_models.components.data.dataloader.DataLoader",
+            target_path="hyper_parallel.auto_models.components.data.dataloader.DataLoader",
             shuffle=True,
             drop_last=True,
             use_background_prefetcher=False,

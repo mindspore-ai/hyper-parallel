@@ -17,9 +17,9 @@
 import unittest
 from unittest.mock import patch
 
-from hyper_models.components.model_transform import module_replacement
-from hyper_models.config.resolver import resolve_root
-from hyper_models.trainer.config import (
+from hyper_parallel.auto_models.components.model_transform import module_replacement
+from hyper_parallel.auto_models.config.resolver import resolve_root
+from hyper_parallel.auto_models.trainer.config import (
     PlanOverride,
     Target,
     _import_module_type,
@@ -125,7 +125,7 @@ class TestModuleReplacementYaml(unittest.TestCase):
 
     def test_module_type_import_error_has_plan_override_context(self):
         with patch(
-            "hyper_models.trainer.config.importlib.import_module",
+            "hyper_parallel.auto_models.trainer.config.importlib.import_module",
             side_effect=ImportError("optional dependency is unavailable"),
         ):
             with self.assertRaisesRegex(ValueError, "plan_overrides.module_type"):

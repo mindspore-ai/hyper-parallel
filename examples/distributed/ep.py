@@ -17,7 +17,7 @@ region_dispatch 判断口诀：注入物含通信原语/自定义 kernel/数据�
   的声明式推导，无需配置；
 - **compute 必须显式注入**（改造后无自动注入）：local_compute_fn 指向
   仓内默认实现的工厂 Target ——
-  hyper_models.components.distributed.ep_compute.routed_only_ep_compute_fn
+  hyper_parallel.auto_models.components.distributed.ep_compute.routed_only_ep_compute_fn
   （router → dispatch all-to-all → 本地 expert → combine all-to-all，
   与 Megatron MoEAlltoAllTokenDispatcher 同构）；不注入会在 apply 时
   fail-fast（_preflight_compute_injection）；
@@ -29,13 +29,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
     routed_only_ep_compute_fn,
 )
-from hyper_models.trainer.config import Target
+from hyper_parallel.auto_models.trainer.config import Target
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
 
@@ -179,7 +179,7 @@ def main():
                 region_dispatch=False,
                 local_compute_fn=Target(
                     routed_only_ep_compute_fn,
-                    target_path="hyper_models.components.distributed."
+                    target_path="hyper_parallel.auto_models.components.distributed."
                                 "ep_compute.routed_only_ep_compute_fn"),
             ),
         })

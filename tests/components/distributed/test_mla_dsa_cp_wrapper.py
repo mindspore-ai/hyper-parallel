@@ -26,7 +26,7 @@ import pytest
 import torch
 from torch import nn
 
-from hyper_models.components.distributed.cp_wrappers import (
+from hyper_parallel.auto_models.components.distributed.cp_wrappers import (
     INNER_WRAPPER_REGISTRY,
     _slice_sequence,
     mla_dsa_ulysses_cp_wrapper,

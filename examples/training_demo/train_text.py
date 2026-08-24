@@ -14,9 +14,9 @@
 # ============================================================================
 """Run the Trainer path with the prepared Qwen3 model and WikiText data."""
 
-from hyper_models.config.manager import parse_training_args
-from hyper_models.trainer.config import TrainerConfig
-from hyper_models.trainer.text_trainer import TextTrainer
+from hyper_parallel.auto_models.config.manager import parse_training_args
+from hyper_parallel.auto_models.trainer.config import TrainerConfig
+from hyper_parallel.auto_models.trainer.text_trainer import TextTrainer
 
 
 def main() -> None:

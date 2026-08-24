@@ -16,9 +16,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
-from hyper_models.components.distributed import ep_compute
-from hyper_models.components.distributed.ep_compute import routed_only_ep_compute_fn
-from hyper_models.components.distributed.ep_utils import (
+from hyper_parallel.auto_models.components.distributed import ep_compute
+from hyper_parallel.auto_models.components.distributed.ep_compute import routed_only_ep_compute_fn
+from hyper_parallel.auto_models.components.distributed.ep_utils import (
     MOE_ROUTER_ADAPTERS,
     bind_local_expert_forward,
     ep_routed_forward,
@@ -28,22 +28,22 @@ from hyper_models.components.distributed.ep_utils import (
     resolve_swiglu_weights,
     _topk_router_module,
 )
-from hyper_models.components.distributed.injection import (
+from hyper_parallel.auto_models.components.distributed.injection import (
     local_compute,
 )
-from hyper_models.components.distributed.precompiled_boundary import PrecompiledBoundary
-from hyper_models.components.distributed.sharding.apply import (
+from hyper_parallel.auto_models.components.distributed.precompiled_boundary import PrecompiledBoundary
+from hyper_parallel.auto_models.components.distributed.sharding.apply import (
     _StackedExperts,
     _stack_moe_experts,
 )
-from hyper_models.components.distributed.sharding_applier import (
+from hyper_parallel.auto_models.components.distributed.sharding_applier import (
     _apply_phase_c,
     _expert_mesh_layout,
     _rewrap_local_outputs,
     _resolve_local_compute_fn,
     _wrap_local_region_forward,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     EP,
     ModuleShardingSpec,
@@ -52,8 +52,8 @@ from hyper_models.components.distributed.sharding_config import (
     TP,
     _normalize_out_fields,
 )
-from hyper_models.components.distributed.sharding_planner import ShardingPlanner
-from hyper_models.trainer.config import Target
+from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_parallel.auto_models.trainer.config import Target
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import (
@@ -113,7 +113,7 @@ class TestRewrapLocalOutputs:
             return f"wrapped-{len(calls)}"
 
         monkeypatch.setattr(
-            "hyper_models.components.distributed.sharding_applier.DTensor.from_local",
+            "hyper_parallel.auto_models.components.distributed.sharding_applier.DTensor.from_local",
             fake_from_local,
         )
         outputs = [torch.ones(2), torch.zeros(2), None]
@@ -341,7 +341,7 @@ class TestTargetLocalComputeFn:
         spec = _identity_spec()
         spec.local_compute_fn = Target(
             routed_only_ep_compute_fn,
-            target_path="hyper_models.components.distributed."
+            target_path="hyper_parallel.auto_models.components.distributed."
                         "ep_compute.routed_only_ep_compute_fn",
             blok_size="oops")                     # 拼写错误：应为 block_size
         spec.region_dispatch = False
@@ -356,7 +356,7 @@ class TestTargetLocalComputeFn:
         spec = _identity_spec()
         spec.local_compute_fn = Target(
             routed_only_ep_compute_fn,
-            target_path="hyper_models.components.distributed."
+            target_path="hyper_parallel.auto_models.components.distributed."
                         "ep_compute.routed_only_ep_compute_fn",
             mesh="oops")
         spec.region_dispatch = False

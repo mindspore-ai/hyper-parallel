@@ -8,12 +8,12 @@
 """
 
 import torch
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.ep_utils import ep_all_to_all
-from hyper_models.components.distributed.precompiled_boundary import PrecompiledBoundary
+from hyper_parallel.auto_models.components.distributed.ep_utils import ep_all_to_all
+from hyper_parallel.auto_models.components.distributed.precompiled_boundary import PrecompiledBoundary
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from tests.components.distributed.conftest import (
@@ -238,14 +238,14 @@ def test_ep_extend_unified_e2e_8proc():
     run_dist(8, _worker_ep_extend_e2e)
 
 
-from hyper_models.components.distributed import local_compute as _cf
+from hyper_parallel.auto_models.components.distributed import local_compute as _cf
 
 
 @_cf
 def _qwen3moe_ep_factory(module, mesh, tp_mesh, cp_mesh, ep_mesh):
     """自定义 EP 工厂：路由是注入函数的一部分——qwen3moe 的 TopKRouter
     语义由本函数显式选择（MOE_ROUTER_ADAPTERS 按名引用），框架不参与。"""
-    from hyper_models.components.distributed.ep_utils import (
+    from hyper_parallel.auto_models.components.distributed.ep_utils import (
         MOE_ROUTER_ADAPTERS,
         bind_local_expert_forward,
         ep_routed_forward,
@@ -262,10 +262,10 @@ def _qwen3moe_ep_factory(module, mesh, tp_mesh, cp_mesh, ep_mesh):
 
 
 def _qwen3moe_ep_injection(match="*.mlp"):
-    from hyper_models.components.distributed.sharding_config import (
+    from hyper_parallel.auto_models.components.distributed.sharding_config import (
         ModuleShardingSpec,
     )
-    from hyper_models.trainer.config import Target
+    from hyper_parallel.auto_models.trainer.config import Target
     return {match: ModuleShardingSpec(
         local_compute_fn=Target(
             _qwen3moe_ep_factory,

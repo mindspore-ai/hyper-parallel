@@ -6,7 +6,7 @@
 - Packed/pre-cut 记录：离线阶段已经组成固定 `seq_length + 1` 记录，训练时直接读取。
 
 离线转换工具的内部设计见
-[`offline_preparation.md`](../../hyper_models/components/datasets/tools/offline_preparation.md)。
+[`offline_preparation.md`](../../hyper_parallel/auto_models/components/datasets/tools/offline_preparation.md)。
 
 ## 1. 选择数据模式
 
@@ -37,11 +37,11 @@ dataset:
 
 dataloader:
   # Fixed Indexed：每个 FB step 固定选择 micro_batch_size=N 条样本。
-  _target_: hyper_models.components.datasets.FixedBatchDataLoader
+  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
 
   # Indexed Dataset 已经完成 fixed-length/pre-packed 处理，这里只做字段堆叠。
   collate_fn:
-    _target_: hyper_models.components.datasets.build_indexed_collate_fn
+    _target_: hyper_parallel.auto_models.components.datasets.build_indexed_collate_fn
 
   # single/cyclic 只控制 Mapping Dataset 的采样顺序，不表示动态组批。
   dataloader_type: single
@@ -101,7 +101,7 @@ tokenizer，因此训练必须加载同一个 tokenizer，或准确提供相同�
 
 ```yaml
 tokenizer:
-  _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
   pretrained_model_name_or_path: /path/to/tokenizer
   tokenizer_type: hf
   use_fast: true
@@ -117,7 +117,7 @@ tokenizer:
 
 ```yaml
 tokenizer:
-  _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
   pretrained_model_name_or_path: /path/to/stable/tokenizer-identity
   tokenizer_type: pretokenized
   vocab_size: 32000
@@ -153,7 +153,7 @@ tokenizer:
 以 Hugging Face 文本数据集为例，转换命令为：
 
 ```bash
-python -m hyper_models.components.datasets.tools.huggingface_offline \
+python -m hyper_parallel.auto_models.components.datasets.tools.huggingface_offline \
   --dataset organization/dataset \
   --dataset-subset subset_name \
   --dataset-split train \
@@ -190,13 +190,13 @@ python -m hyper_models.components.datasets.tools.huggingface_offline \
 dataset:
   model_assets:
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /path/to/tokenizer
       tokenizer_type: hf
       use_fast: true
       local_files_only: true
 
-  _target_: hyper_models.components.datasets.llm.build_indexed_text_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_indexed_text_dataset
   data_path: /path/to/indexed/train_text_document
   data_config:
     seq_length: 2048
@@ -205,7 +205,7 @@ dataset:
 
 dataloader:
   get_batch:
-    _target_: hyper_models.components.datasets.ParallelBatch
+    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
     source_type: indexed
 ```
 
@@ -301,13 +301,13 @@ i
 dataset:
   model_assets:
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /path/to/tokenizer-identity
       tokenizer_type: pretokenized
       vocab_size: 32000
       eod_token_id: 2
 
-  _target_: hyper_models.components.datasets.llm.build_indexed_text_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_indexed_text_dataset
   data_path: /path/to/shards
   data_config:
     seq_length: 2048
@@ -317,7 +317,7 @@ dataset:
 
 dataloader:
   get_batch:
-    _target_: hyper_models.components.datasets.ParallelBatch
+    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
     source_type: indexed
 ```
 

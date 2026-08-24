@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 from torch import nn
 
-from hyper_models.components.optim import AdamW, Muon
+from hyper_parallel.auto_models.components.optim import AdamW, Muon
 
 
 class _MixedModel(nn.Module):
@@ -88,7 +88,7 @@ def test_adamw_builds_decay_and_no_decay_groups() -> None:
     runtime = object()
 
     with patch(
-        "hyper_models.components.optim.optimizer.optimizer.get_hyper_optimizer",
+        "hyper_parallel.auto_models.components.optim.optimizer.optimizer.get_hyper_optimizer",
         return_value=runtime,
     ) as build_core_optimizer:
         component = AdamW(
@@ -138,7 +138,7 @@ def test_muon_passes_prefixed_configs_directly_to_core() -> None:
     runtime = object()
 
     with patch(
-        "hyper_models.components.optim.optimizer.optimizer.get_hyper_optimizer",
+        "hyper_parallel.auto_models.components.optim.optimizer.optimizer.get_hyper_optimizer",
         return_value=runtime,
     ) as build_core_optimizer:
         component = Muon(

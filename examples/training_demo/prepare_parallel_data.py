@@ -21,7 +21,7 @@ from typing import Sequence
 
 import numpy as np
 
-from hyper_models.components.datasets.tools.indexed_dataset import IndexedDatasetBuilder
+from hyper_parallel.auto_models.components.datasets.tools.indexed_dataset import IndexedDatasetBuilder
 
 
 def prepare_parallel_data(output_dir: Path, *, num_samples: int = 64, seq_length: int = 32) -> None:

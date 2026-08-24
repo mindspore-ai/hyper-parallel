@@ -1,6 +1,6 @@
 # VLM Trainer config — Qwen3.5-9B multimodal SFT.
 #
-# Uses the VLM data pipeline (hyper_models.components.datasets.vlm):
+# Uses the VLM data pipeline (hyper_parallel.auto_models.components.datasets.vlm):
 # HyperAutoModelForImageTextToText + VLMChatTransform + VLMDataset +
 # build_vlm_collator + build_vlm_get_batch.
 # The processor is loaded from the model checkpoint (with a tokenizer chat
@@ -10,7 +10,7 @@
 #   torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29595 --module examples.training_demo.train_vlm examples/qwen3_5_9b_base/train.yaml
 
 model:
-  _target_: hyper_models._transformers.HyperAutoModelForImageTextToText.from_pretrained
+  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: /path/to/Qwen3.5-9B
   torch_dtype: bfloat16
   attn_implementation: eager
@@ -51,18 +51,18 @@ dataset:
     chat_template: null
     tokenizer: null
   data_transform:
-    _target_: hyper_models.components.datasets.vlm.build_data_transform.build_vlm_data_transform
+    _target_: hyper_parallel.auto_models.components.datasets.vlm.build_data_transform.build_vlm_data_transform
     max_seq_len: 1024
-  _target_: hyper_models.components.datasets.vlm.dataset.build_vlm_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.vlm.dataset.build_vlm_dataset
   data_path: /path/to/vlm_data.json
   data_config:
     source_type: online
 
 dataloader:
-  _target_: hyper_models.components.datasets.DataLoader
+  _target_: hyper_parallel.auto_models.components.datasets.DataLoader
 
   collate_fn:
-    _target_: hyper_models.components.datasets.vlm.collator.build_vlm_collator
+    _target_: hyper_parallel.auto_models.components.datasets.vlm.collator.build_vlm_collator
     packing: false
 
   # get_batch omitted → VLMTrainer defaults to build_vlm_get_batch.
@@ -76,7 +76,7 @@ dataloader:
   prefetch_factor: null
 
 optimizer:
-  _target_: hyper_models.components.optim.optimizer.AdamW
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.AdamW
   no_decay_params: [bias, norm, ln_]
   adamw_config:
     adamw_lr: 1.0e-5
@@ -85,7 +85,7 @@ optimizer:
     adamw_eps: 1.0e-8
 
 lr_scheduler:
-  _target_: hyper_models.components.optim.lr_scheduler.MultiLRScheduler
+  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
   lr_decay_style: cosine
   lr_config:
     lr_warmup_steps: 1

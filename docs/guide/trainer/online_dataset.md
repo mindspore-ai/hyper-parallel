@@ -48,16 +48,16 @@ dataset:
   model_assets:
     chat_template: null
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: ./model
       use_fast: true
       trust_remote_code: true
   data_transform:
-    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
     data_type: plaintext
     text_keys: text
     max_seq_len: 2048
-  _target_: hyper_models.components.datasets.llm.build_online_text_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
   data_path: Salesforce/wikitext
   data_config:
     dataset_type: mapping
@@ -92,16 +92,16 @@ dataset:
   model_assets:
     chat_template: null
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: ./model
       use_fast: true
       trust_remote_code: true
   data_transform:
-    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
     data_type: plaintext
     text_keys: text
     max_seq_len: 2048
-  _target_: hyper_models.components.datasets.llm.build_online_text_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
   data_path: null
   data_config:
     dataset_type: iterable
@@ -129,16 +129,16 @@ dataset:
   model_assets:
     chat_template: null
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: ./model
       use_fast: true
       trust_remote_code: true
   data_transform:
-    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
     data_type: plaintext
     text_keys: text
     max_seq_len: 2048
-  _target_: hyper_models.components.datasets.llm.build_online_text_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
   data_path: ./data/train
   data_config:
     dataset_type: mapping
@@ -180,10 +180,10 @@ dataset:
 model_assets:
   chat_template: null
   tokenizer:
-    _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: ./model
 data_transform:
-  _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
   data_type: plaintext
   text_keys: [text, content]
   max_seq_len: 2048
@@ -207,12 +207,12 @@ EOS 后不应超过 `max_seq_len`，否则会被 transform 分成多个片段并
 ```yaml
 model_assets:
   chat_template:
-    _target_: hyper_models.components.datasets.llm.chat_template.ChatmlTemplate
+    _target_: hyper_parallel.auto_models.components.datasets.llm.chat_template.ChatmlTemplate
   tokenizer:
-    _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: ./model
 data_transform:
-  _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
   data_type: conversation
   text_keys: messages
   max_seq_len: 2048
@@ -251,16 +251,16 @@ dataset:
   model_assets:
     chat_template: chatml
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /path/to/model
 
   data_transform:
-    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
     data_type: conversation
     text_keys: messages
     max_seq_len: 4096
 
-  _target_: hyper_models.components.datasets.llm.build_online_text_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
   data_path: null
   data_config:
     dataset_type: mapping
@@ -269,14 +269,14 @@ dataset:
 
 dataloader:
   # Fixed Online：固定选择 micro_batch_size=N 条样本。
-  _target_: hyper_models.components.datasets.FixedBatchDataLoader
+  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
 
   # 在固定 N 条样本被选中后执行 text packing。
   collate_fn:
-    _target_: hyper_models.components.datasets.build_online_text_collate_fn
+    _target_: hyper_parallel.auto_models.components.datasets.build_online_text_collate_fn
 
   get_batch:
-    _target_: hyper_models.components.datasets.ParallelBatch
+    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
     source_type: online
 
   dataloader_type: cyclic
@@ -312,16 +312,16 @@ dataset:
   model_assets:
     chat_template: chatml
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: /path/to/model
 
   data_transform:
-    _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
     data_type: conversation
     text_keys: messages
     max_seq_len: 4096
 
-  _target_: hyper_models.components.datasets.llm.build_online_text_dataset
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
   data_path: null
   data_config:
     dataset_type: iterable
@@ -333,17 +333,17 @@ dataset:
 
 dataloader:
   # Dynamic Online：TextTokenBatcher 在每个 FB step 动态选择 K 条样本。
-  _target_: hyper_models.components.datasets.DynamicBatchDataLoader
+  _target_: hyper_parallel.auto_models.components.datasets.DynamicBatchDataLoader
 
   # 组 batch 前至少缓存的候选样本数；不是最终 batch size。
   min_buffered_samples: 200
 
   # K 条样本选定后复用 Fixed Online 的 text packing。
   collate_fn:
-    _target_: hyper_models.components.datasets.build_online_text_collate_fn
+    _target_: hyper_parallel.auto_models.components.datasets.build_online_text_collate_fn
 
   get_batch:
-    _target_: hyper_models.components.datasets.ParallelBatch
+    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
     source_type: online
 
   # Iterable Dataset 不创建 Mapping sampler，此字段保留统一配置结构。

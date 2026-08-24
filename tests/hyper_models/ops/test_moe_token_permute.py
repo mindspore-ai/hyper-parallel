@@ -22,7 +22,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from hyper_models.ops import moe_token_permute, moe_token_unpermute
+from hyper_parallel.auto_models.ops import moe_token_permute, moe_token_unpermute
 from tests.common.mark_utils import arg_mark
 
 

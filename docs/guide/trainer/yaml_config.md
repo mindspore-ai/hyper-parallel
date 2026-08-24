@@ -25,29 +25,29 @@ model:
   weights_path: /models/Qwen3.5-0.8B-Base
 
 optimizer:
-  _target_: hyper_models.components.optim.AdamW.Config
+  _target_: hyper_parallel.auto_models.components.optim.AdamW.Config
   lr: 0.0002
   weight_decay: 0.1
   betas: [0.9, 0.95]
 
 lr_scheduler:
-  _target_: hyper_models.components.optim.CosineWithWarmup.Config
+  _target_: hyper_parallel.auto_models.components.optim.CosineWithWarmup.Config
   warmup_ratio: 0.05
   min_lr: 0.00001
 
 loss:
-  _target_: hyper_models.components.loss.CausalLMLoss.Config
+  _target_: hyper_parallel.auto_models.components.loss.CausalLMLoss.Config
   ignore_index: -100
 
 training:
-  _target_: hyper_models.trainer.config.TrainingConfig
+  _target_: hyper_parallel.auto_models.trainer.config.TrainingConfig
   max_steps: 100
   global_batch_size: 8
   init_device: meta
   loss_aggregation: token_weighted
 
 accelerator:
-  _target_: hyper_models.trainer.config.AcceleratorConfig
+  _target_: hyper_parallel.auto_models.trainer.config.AcceleratorConfig
   tp_size: 2
   dp_shard_size: 4
 
@@ -56,11 +56,11 @@ plan_overrides:            # ShardingPlanner 唯一 override 接口的 YAML 形�
     when: cp               # 激活条件：cp_size>1 才应用（缺省=总是应用；
                            # 条件不满足时跳过并打日志，配置可跨拓扑复用）
     inner_wrapper:
-      _target_: hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper
+      _target_: hyper_parallel.auto_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper
   - match: "*.mlp"
     when: ep               # ep_size>1 时必需（缺注入 = 静默数值错误）
     local_compute_fn:      # 工厂 Target：apply 时注入通用上下文（module/mesh/expert_mesh）
-      _target_: hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
+      _target_: hyper_parallel.auto_models.components.distributed.ep_compute.hf_native_ep_compute_fn
       router: qwen3_moe    # 可选；缺省回落 planner arch 提示 → "default"
   # local_compute_fn 同时也是“性能替换”通道：_target_ 指向任何返回
   # compute_fn(module, *local_args) 的工厂即可把该边界的实现整体换掉
@@ -78,15 +78,15 @@ plan_overrides:            # ShardingPlanner 唯一 override 接口的 YAML 形�
   # + plan_overrides_demo.yaml（plan 内省逐场景断言 + 双模式对拍）。
 
 mixed_precision:
-  _target_: hyper_models.trainer.config.MixedPrecisionConfig
+  _target_: hyper_parallel.auto_models.trainer.config.MixedPrecisionConfig
   enabled: true
 
 gradient_checkpointing:
-  _target_: hyper_models.trainer.config.GradientCheckpointingConfig
+  _target_: hyper_parallel.auto_models.trainer.config.GradientCheckpointingConfig
   activation_checkpoint: full
 
 debug:
-  _target_: hyper_models.trainer.config.DebugConfig
+  _target_: hyper_parallel.auto_models.trainer.config.DebugConfig
   check_nan_inf: true
 ```
 
@@ -97,7 +97,7 @@ debug:
 配置解析调用 `parse_training_args()`：
 
 ```python
-from hyper_models.config.manager import parse_training_args
+from hyper_parallel.auto_models.config.manager import parse_training_args
 
 config = parse_training_args()
 ```
@@ -106,7 +106,7 @@ config = parse_training_args()
 
 ```bash
 python -c \
-  'from hyper_models.config.manager import parse_training_args; print(parse_training_args())' \
+  'from hyper_parallel.auto_models.config.manager import parse_training_args; print(parse_training_args())' \
   configs/qwen3_5.yaml
 ```
 

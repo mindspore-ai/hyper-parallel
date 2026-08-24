@@ -21,10 +21,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hyper_models.components.distributed.config import FSDP2Config
-from hyper_models.components.distributed.fsdp2 import FSDP2Manager
-from hyper_models.components.distributed.infrastructure import MeshContext
-from hyper_models.config.resolver import resolve_component
+from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
+from hyper_parallel.auto_models.components.distributed.fsdp2 import FSDP2Manager
+from hyper_parallel.auto_models.components.distributed.infrastructure import MeshContext
+from hyper_parallel.auto_models.config.resolver import resolve_component
 from tests.common.mark_utils import arg_mark
 
 _YAML_PATH = Path(__file__).resolve().parent / "test_yamls" / "fsdp_config_watch.yaml"

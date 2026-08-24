@@ -1,6 +1,6 @@
 # HyperAutoModel `from_pretrained` 使用指南
 
-本文介绍 `hyper_models._transformers.auto_model` 中 `from_pretrained` 接口的功能、参数、模型加载流程，
+本文介绍 `hyper_parallel.auto_models._transformers.auto_model` 中 `from_pretrained` 接口的功能、参数、模型加载流程，
 以及如何在不使用 Trainer 的情况下直接构造一个可训练的分布式模型。
 
 ## 1. 功能概述
@@ -35,7 +35,7 @@ Transformers 加载权重，还会把以下步骤组合成一次原子操作：
 可以从 `_transformers` 包直接导入：
 
 ```python
-from hyper_models._transformers import (
+from hyper_parallel.auto_models._transformers import (
     HyperAutoModelForCausalLM,
     HyperAutoModelForImageTextToText,
     HyperAutoModelForSequenceClassification,
@@ -78,7 +78,7 @@ model.eval()
 ```python
 import torch
 
-from hyper_models._transformers import HyperAutoModelForCausalLM
+from hyper_parallel.auto_models._transformers import HyperAutoModelForCausalLM
 
 
 model = HyperAutoModelForCausalLM.from_pretrained(
@@ -145,15 +145,15 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
-from hyper_models._transformers import HyperAutoModelForCausalLM
-from hyper_models.components.distributed.config import FSDP2Config
-from hyper_models.components.distributed.infrastructure import (
+from hyper_parallel.auto_models._transformers import HyperAutoModelForCausalLM
+from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
+from hyper_parallel.auto_models.components.distributed.infrastructure import (
     DistributedSetup,
     create_distributed_setup_from_config,
     destroy_process_group,
     initialize_distributed,
 )
-from hyper_models.trainer.config import AcceleratorConfig
+from hyper_parallel.auto_models.trainer.config import AcceleratorConfig
 
 
 def build_parallelize_config() -> DistributedSetup:
@@ -260,7 +260,7 @@ dp_replicate_size * dp_shard_size = dp_size * cp_size
 
 ```yaml
 model:
-  _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B"
   torch_dtype: bfloat16
   attn_implementation: sdpa
@@ -343,7 +343,7 @@ force_hf=False
 - `Qwen3_5ForConditionalGeneration`；
 - `Qwen3VLMoeForConditionalGeneration`。
 
-当前分支中，注册表所指向的 `hyper_models.components.models.*` 实现模块尚不存在。这些架构会记录 warning，
+当前分支中，注册表所指向的 `hyper_parallel.auto_models.components.models.*` 实现模块尚不存在。这些架构会记录 warning，
 然后回退到 Hugging Face 原生实现。当前建议显式传入 `force_hf=True`，以清楚表达使用 HF 原生模型的意图。
 
 ## 8. 分布式权重加载

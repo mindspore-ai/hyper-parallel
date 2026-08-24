@@ -19,7 +19,7 @@ import unittest
 from torch import nn
 from transformers.core_model_loading import WeightRenaming
 
-from hyper_models.components.model_transform import (
+from hyper_parallel.auto_models.components.model_transform import (
     ModuleReplacementSpec,
     apply_module_replacements,
     compile_module_replacements,

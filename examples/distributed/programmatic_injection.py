@@ -45,15 +45,15 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
     inner_wrapper,
     local_compute,
 )
-from hyper_models.components.distributed.cp_wrappers import INNER_WRAPPER_REGISTRY
-from hyper_models.trainer.config import Target
+from hyper_parallel.auto_models.components.distributed.cp_wrappers import INNER_WRAPPER_REGISTRY
+from hyper_parallel.auto_models.trainer.config import Target
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
 # ── 注入生效证明用的计数器 ──────────────────────────────────────────────────
