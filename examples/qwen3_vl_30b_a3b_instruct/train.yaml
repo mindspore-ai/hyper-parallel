@@ -1,17 +1,10 @@
-# Qwen3-VL-MoE training template:
-# visual Encoder DP/CP, save/resume, and 100-step alignment baseline.
+# Qwen3-VL-MoE training template with a frozen visual tower and vl_dummy
 model:
   name: qwen3_vl_moe
   weights_path: /path/to/Qwen3-VL-30B-A3B-Instruct
   tokenizer_path: /path/to/Qwen3-VL-30B-A3B-Instruct
   freeze_modules:
     - model.visual
-  vision_parallel:
-    dp_shard: 1
-    cp: 2
-    ulysses_degree: 1
-    reuse_dp_shard_mesh: true
-    share_samples_across_dp: true
   config_overrides:
     vl: true
     text_config:
@@ -61,9 +54,7 @@ train:
   checkpoint:
     output_dir: outputs/qwen3_vl_moe
     save_steps: 50
-    load_path: null
     save_hf_weights: false
-    save_async: false
 
   logging:
     log_steps: 1

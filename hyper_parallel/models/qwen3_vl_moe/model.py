@@ -27,6 +27,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.models.modules.attention import GroupQueryAttention, _expand_kv_heads
 from hyper_parallel.models.modules.feed_forward import SwiGLUMLP
 from hyper_parallel.models.modules.rope import MultiModalRotaryEmbedding, apply_rotary_pos_emb
@@ -63,6 +65,49 @@ def _use_v1_kernels() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _cp_gather(x: Optional[torch.Tensor], cp_mesh, dim: int) -> Optional[torch.Tensor]:
+    """Gather a CP-sharded tensor to the full sequence on every rank."""
+    if x is None or int(cp_mesh.size()) <= 1:
+        return x
+    if isinstance(x, DTensor):
+        return x.redistribute(cp_mesh, [Replicate()]).to_local()
+    return DTensor.from_local(x, cp_mesh, [Shard(dim)]).redistribute(
+        cp_mesh, [Replicate()],
+    ).to_local()
+
+
+def _cp_slice(x: Optional[torch.Tensor], cp_mesh, dim: int) -> Optional[torch.Tensor]:
+    """Select this rank's contiguous CP sequence shard."""
+    if x is None or int(cp_mesh.size()) <= 1:
+        return x
+    size = int(cp_mesh.size())
+    if x.shape[dim] % size != 0:
+        raise ValueError(
+            f"CP sequence dimension {x.shape[dim]} must be divisible by {size}.",
+        )
+    rank = cp_mesh.get_local_rank()
+    chunk = x.shape[dim] // size
+    start = rank * chunk
+    slices = [slice(None)] * x.ndim
+    slices[dim] = slice(start, start + chunk)
+    return x[tuple(slices)].contiguous()
+
+
+def _cp_slice_deepstack_features(
+    features: Optional[list[torch.Tensor]],
+    visual_pos_masks: Optional[torch.Tensor],
+    sequence_slice: slice,
+) -> Optional[list[torch.Tensor]]:
+    """Keep only visual features belonging to this rank's text sequence shard."""
+    if features is None or visual_pos_masks is None:
+        return features
+    full_mask = visual_pos_masks.reshape(-1)
+    local_mask = full_mask.reshape(visual_pos_masks.shape)[:, sequence_slice].reshape(-1)
+    feature_indices = full_mask.to(torch.int64).cumsum(0) - 1
+    selected = feature_indices[local_mask]
+    return [feature.index_select(0, selected) for feature in features]
 
 
 class _GmmFunction(torch.autograd.Function):
@@ -495,12 +540,11 @@ class Qwen3VLMoeTextAttention(GroupQueryAttention):
         self.num_key_value_groups = self.num_kv_groups
         self.sdpa_core = Qwen3VLMoeTextSdpaCore()
 
-    def forward(self, hidden_states: torch.Tensor,
-                position_ids: Optional[torch.Tensor] = None, **kwargs):  # pylint: disable=W0613
-        """Dispatch attention computation based on the configured implementation."""
-        # eager / sdpa / fa2: replicate projection + rotary explicitly so the
-        # selected kernel (eager fp32-softmax matmul, or NPU fusion attention)
-        # is exercised directly rather than the parent's SDPA path.
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project hidden states to normalized Q/K/V tensors in ``[B, H, S, D]``."""
         bsz, seq_len, _ = hidden_states.shape
         q_out = self.q_proj(hidden_states)
         if q_out.shape[-1] % self.head_dim != 0:
@@ -509,6 +553,7 @@ class Qwen3VLMoeTextAttention(GroupQueryAttention):
             )
         q_raw = q_out.reshape(bsz, seq_len, -1, self.head_dim)
         q = self.q_norm(q_raw).transpose(1, 2)
+
         k_out = self.k_proj(hidden_states)
         if k_out.shape[-1] % self.head_dim != 0:
             raise ValueError(
@@ -517,16 +562,147 @@ class Qwen3VLMoeTextAttention(GroupQueryAttention):
         k = self.k_norm(
             k_out.reshape(bsz, seq_len, -1, self.head_dim)
         ).transpose(1, 2)
+
         v_out = self.v_proj(hidden_states)
         if v_out.shape[-1] != k_out.shape[-1]:
             raise ValueError(
                 f"v_proj output dim {v_out.shape[-1]} must match k_proj output dim {k_out.shape[-1]}."
             )
         v = v_out.reshape(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
+        return q, k, v
 
+    def _run_sdpa_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        scaling: float,
+        bsz: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Run the configured native SDPA attention path."""
+        kv_groups = q.shape[1] // k.shape[1]
+        expand_kv_for_cp = bool(getattr(self, "_hp_cp_expand_kv_before_core", False))
+        enable_gqa = kv_groups > 1 and attn_mask is None and not expand_kv_for_cp
+        if kv_groups > 1 and (expand_kv_for_cp or not enable_gqa):
+            k = _expand_kv_heads(k, kv_groups)
+            v = _expand_kv_heads(v, kv_groups)
+        attn_output = self.sdpa_core(
+            q, k, v, attention_mask=attn_mask, scale=scaling, enable_gqa=enable_gqa,
+        )
+        return attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+
+    def _run_fallback_sdpa_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        scaling: float,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run local SDPA when optional Transformers attention helpers are absent."""
+        bsz, seq_len, _ = hidden_states.shape
+        kv_groups = q.shape[1] // k.shape[1]
+        if kv_groups > 1:
+            k = _expand_kv_heads(k, kv_groups)
+            v = _expand_kv_heads(v, kv_groups)
+        dtype = hidden_states.dtype
+        device = hidden_states.device
+        min_val = torch.finfo(dtype).min
+        causal = torch.triu(
+            torch.full((seq_len, seq_len), min_val, dtype=dtype, device=device),
+            diagonal=1,
+        )
+        fallback_mask = causal.view(1, 1, seq_len, seq_len).expand(
+            bsz, 1, seq_len, seq_len,
+        ).clone()
+        if attn_mask is not None and attn_mask.ndim <= 2:
+            pad_cols = attn_mask == 0
+            fallback_mask = fallback_mask.masked_fill(
+                pad_cols.view(bsz, 1, 1, seq_len), min_val,
+            )
+        attn_output = self.sdpa_core(
+            q,
+            k,
+            v,
+            attention_mask=fallback_mask,
+            scale=scaling,
+        )
+        return attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+
+    def _run_flash_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        scaling: float,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run Transformers flash attention, or local SDPA when it is unavailable."""
+        # pylint: disable=C0415
+        try:
+            from transformers.modeling_flash_attention_utils import _flash_attention_forward
+        except ImportError:
+            return self._run_fallback_sdpa_attention(
+                q, k, v, attn_mask, scaling, hidden_states,
+            )
+
+        _, seq_len, _ = hidden_states.shape
+        if attn_mask is not None and attn_mask.ndim == 4:
+            attn_mask = None
+        attn_output = _flash_attention_forward(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            attention_mask=attn_mask,
+            query_length=seq_len,
+            is_causal=True,
+            dropout=0.0,
+            softmax_scale=scaling,
+            attn_implementation="flash_attention_2",
+        )
+        return attn_output.contiguous().view(hidden_states.shape[0], seq_len, -1)
+
+    def _run_eager_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        scaling: float,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run Transformers eager attention, or local SDPA when it is unavailable."""
+        # pylint: disable=C0415
+        try:
+            from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+                eager_attention_forward as _eager,
+            )
+        except ImportError:
+            return self._run_fallback_sdpa_attention(
+                q, k, v, attn_mask, scaling, hidden_states,
+            )
+
+        attn_output, _ = _eager(
+            self, q, k, v,
+            attention_mask=attn_mask,
+            scaling=scaling,
+            dropout=0.0,
+        )
+        bsz, seq_len, _ = hidden_states.shape
+        return attn_output.contiguous().view(bsz, seq_len, -1)
+
+    def forward(self, hidden_states: torch.Tensor,
+                position_ids: Optional[torch.Tensor] = None, **kwargs):  # pylint: disable=W0613
+        """Dispatch attention computation based on the configured implementation."""
+        # eager / sdpa / fa2: replicate projection + rotary explicitly so the
+        # selected kernel (eager fp32-softmax matmul, or NPU fusion attention)
+        # is exercised directly rather than the parent's SDPA path.
+        bsz, seq_len, _ = hidden_states.shape
+        q, k, v = self._project_qkv(hidden_states)
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=hidden_states.device)
-
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -534,49 +710,20 @@ class Qwen3VLMoeTextAttention(GroupQueryAttention):
         scaling = self.head_dim ** -0.5
 
         if self._attn_implementation == "sdpa":
-            kv_groups = q.shape[1] // k.shape[1]
-            expand_kv_for_cp = bool(getattr(self, "_hp_cp_expand_kv_before_core", False))
-            enable_gqa = kv_groups > 1 and attn_mask is None and not expand_kv_for_cp
-            if kv_groups > 1 and (expand_kv_for_cp or not enable_gqa):
-                k = _expand_kv_heads(k, kv_groups)
-                v = _expand_kv_heads(v, kv_groups)
-            attn_output = self.sdpa_core(
-                q, k, v, attention_mask=attn_mask, scale=scaling, enable_gqa=enable_gqa,
+            attn_output = self._run_sdpa_attention(
+                q, k, v, attn_mask, scaling, bsz, seq_len,
             )
-            attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
             return self.o_proj(attn_output)
 
         if self._attn_implementation == "flash_attention_2":
-            # pylint: disable=C0415
-            from transformers.modeling_flash_attention_utils import _flash_attention_forward
-            # fa2 only consumes the 2D padding form + ``is_causal``.
-            if attn_mask is not None and attn_mask.ndim == 4:
-                attn_mask = None
-            attn_output = _flash_attention_forward(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                attention_mask=attn_mask,
-                query_length=seq_len,
-                is_causal=True,
-                dropout=0.0,
-                softmax_scale=scaling,
-                attn_implementation="flash_attention_2",
+            attn_output = self._run_flash_attention(
+                q, k, v, attn_mask, scaling, hidden_states,
             )
-            attn_output = attn_output.contiguous().view(bsz, seq_len, -1)
             return self.o_proj(attn_output)
 
-        # eager: delegate so the NPU kernel-cache key stays stable.
-        # pylint: disable=C0415
-        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-            eager_attention_forward as _eager,
+        attn_output = self._run_eager_attention(
+            q, k, v, attn_mask, scaling, hidden_states,
         )
-        attn_output, _ = _eager(
-            self, q, k, v,
-            attention_mask=attn_mask,
-            scaling=scaling,
-
-            dropout=0.0,
-        )
-        attn_output = attn_output.contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_output)
 
 
@@ -806,6 +953,7 @@ class Qwen3VLMoeModel(nn.Module):
         self.rope_deltas = None
         self.visual_injection_input = nn.Identity()
         self.visual_injection_output = nn.Identity()
+        self._hp_context_parallel_mesh = None
 
     @property
     def layers(self):
@@ -819,6 +967,10 @@ class Qwen3VLMoeModel(nn.Module):
     def set_input_embeddings(self, value):
         """Set the text token embedding."""
         self.language_model.embed_tokens = value
+
+    def set_context_parallel_mesh(self, cp_mesh) -> None:
+        """Configure the main model to consume CP-local text sequences."""
+        self._hp_context_parallel_mesh = cp_mesh
 
 
     def get_vision_position_ids(
@@ -967,6 +1119,24 @@ class Qwen3VLMoeModel(nn.Module):
     ) -> torch.Tensor:
         """Forward pass."""
         # pylint: disable=W0613  # interface conformance
+        cp_mesh = self._hp_context_parallel_mesh
+        cp_size = int(cp_mesh.size()) if cp_mesh is not None else 1
+        if cp_size > 1:
+            input_ids = _cp_gather(input_ids, cp_mesh, dim=1)
+            inputs_embeds = _cp_gather(inputs_embeds, cp_mesh, dim=1)
+            if attention_mask is not None:
+                attention_mask = _cp_gather(
+                    attention_mask, cp_mesh, dim=attention_mask.ndim - 1,
+                )
+            if position_ids is not None:
+                position_ids = _cp_gather(
+                    position_ids, cp_mesh, dim=position_ids.ndim - 1,
+                )
+            if mm_token_type_ids is not None:
+                mm_token_type_ids = _cp_gather(
+                    mm_token_type_ids, cp_mesh, dim=mm_token_type_ids.ndim - 1,
+                )
+
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -996,6 +1166,31 @@ class Qwen3VLMoeModel(nn.Module):
                 mm_token_type_ids=mm_token_type_ids,
                 image_grid_thw=image_grid_thw,
                 attention_mask=attention_mask,
+            )
+
+        if cp_size > 1:
+            sequence_length = inputs_embeds.shape[1]
+            cp_size = int(cp_mesh.size())
+            local_chunk = sequence_length // cp_size
+            cp_rank = cp_mesh.get_local_rank()
+            sequence_slice = slice(
+                cp_rank * local_chunk,
+                (cp_rank + 1) * local_chunk,
+            )
+            inputs_embeds = _cp_slice(inputs_embeds, cp_mesh, dim=1)
+            if position_ids is not None:
+                position_ids = _cp_slice(
+                    position_ids, cp_mesh, dim=position_ids.ndim - 1,
+                )
+            if attention_mask is not None:
+                attention_mask = _cp_slice(
+                    attention_mask, cp_mesh, dim=attention_mask.ndim - 1,
+                )
+            visual_pos_masks = _cp_slice(visual_pos_masks, cp_mesh, dim=1)
+            deepstack_visual_embeds = _cp_slice_deepstack_features(
+                deepstack_visual_embeds,
+                image_mask[..., 0] if image_mask is not None else None,
+                sequence_slice,
             )
 
         return self.language_model(
