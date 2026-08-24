@@ -105,9 +105,9 @@ from hyper_parallel.auto_models.components.distributed.cp_utils import (
 from hyper_parallel.auto_models.components.distributed.injection import (
     inner_wrapper,
 )
-from hyper_parallel.auto_models.components.models.qwen3_moe_fusions import (
-    _fused_rms_norm,
-    _run_qwen3_moe_flash_attention,
+from hyper_parallel.auto_models.components.models.qwen3_moe_attention_common import (
+    fused_rms_norm as _fused_rms_norm,
+    run_qwen3_moe_flash_attention as _run_qwen3_moe_flash_attention,
 )
 
 logger = logging.getLogger(__name__)
@@ -1356,7 +1356,12 @@ def _qwen3_moe_async_colossal_forward(
         attention_mask, query, key, query_offset
     )
     attention_output, attention_weights = _run_qwen3_moe_fused_attention(
-        module, query, key, value, attention_mask, kwargs
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        kwargs,
     )
     return _finish_qwen3_moe_attention(module, attention_output, input_shape), attention_weights
 
@@ -1397,7 +1402,12 @@ def _qwen3_moe_async_ulysses_forward(
         attention_mask, query, key, query_offset=0
     )
     attention_output, attention_weights = _run_qwen3_moe_fused_attention(
-        module, query, key, value, attention_mask, kwargs
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        kwargs,
     )
     output_bnsd = attention_output.transpose(1, 2).contiguous()
     output_bnsd = ulysses_head_to_seq(
@@ -1457,7 +1467,12 @@ def _qwen3_moe_async_hybrid_forward(
         attention_mask, query, key, query_offset
     )
     attention_output, attention_weights = _run_qwen3_moe_fused_attention(
-        module, query, key, value, attention_mask, kwargs
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        kwargs,
     )
     output_bnsd = attention_output.transpose(1, 2).contiguous()
     output_bnsd = ulysses_head_to_seq(

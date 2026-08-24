@@ -35,13 +35,16 @@ def count_loss_token(
     def _count(obj):
         if isinstance(obj, dict) and not obj.get("padding_flag", False):
             # Hugging Face causal LM loss predicts labels from position one.
-            foundation_tokens = torch.sum(obj["labels"][..., 1:] != IGNORE_INDEX)
+            labels = obj.get("shift_labels")
+            if labels is None:
+                labels = obj["labels"][..., 1:]
+            foundation_tokens = torch.sum(labels != IGNORE_INDEX)
             if "foundation_tokens" in token_len:
                 foundation_tokens = token_len["foundation_tokens"] + foundation_tokens
             token_len["foundation_tokens"] = foundation_tokens  # text tokens
 
             for key in obj.keys():
-                if key.endswith("_labels"):
+                if key.endswith("_labels") and key != "shift_labels":
                     token_name = key.split("_labels")[0]
                     token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
 
