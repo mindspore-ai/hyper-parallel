@@ -379,8 +379,7 @@ class BaseTrainer(Stateful, ABC):
             peft_config=self.peft_config,
             activation_checkpoint=self.config.activation_checkpoint.mode,
             activation_swap=self.config.activation_swap,
-            compile_config=self.config.compile,
-            low_precision_config=self.config.training.low_precision,
+            compile_config=self.config.compile
         )
         self.model_config = self.model.config
         if self.config.accelerator.loss_parallel:
