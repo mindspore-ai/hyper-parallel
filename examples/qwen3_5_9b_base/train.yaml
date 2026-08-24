@@ -1,0 +1,100 @@
+# VLM Trainer config — Qwen3.5-9B multimodal SFT.
+#
+# Uses the VLM data pipeline (hyper_models.components.datasets.vlm):
+# HyperAutoModelForImageTextToText + VLMChatTransform + VLMDataset +
+# build_vlm_collator + build_vlm_get_batch.
+# The processor is loaded from the model checkpoint (with a tokenizer chat
+# template fallback for Base checkpoints).
+#
+# Run:
+#   torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29595 --module examples.training_demo.train_vlm examples/qwen3_5_9b_base/train.yaml
+
+model:
+  _target_: hyper_models._transformers.HyperAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /path/to/Qwen3.5-9B
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  force_hf: true
+
+training:
+  train_iters: 20
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 4
+  reshard_after_forward: true
+  requires_grad_sync: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: off
+
+dataset:
+  model_assets:
+    datasets_type: conversation
+    chat_template: null
+    tokenizer: null
+  data_transform:
+    _target_: hyper_models.components.datasets.vlm.build_data_transform.build_vlm_data_transform
+    max_seq_len: 1024
+  _target_: hyper_models.components.datasets.vlm.dataset.build_vlm_dataset
+  data_path: /path/to/vlm_data.json
+  data_config:
+    source_type: online
+
+dataloader:
+  _target_: hyper_models.components.datasets.DataLoader
+
+  collate_fn:
+    _target_: hyper_models.components.datasets.vlm.collator.build_vlm_collator
+    packing: false
+
+  # get_batch omitted → VLMTrainer defaults to build_vlm_get_batch.
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_models.components.optim.optimizer.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_models.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: ./outputs/qwen3_5_9b_base/checkpoints
+
+debug:
+  check_nan_inf: false
+  check_dataset: false
