@@ -37,7 +37,7 @@ def build_dense_attention_masks(
 ) -> tuple[Any, Any | None]:
     """Build global dense attention and optional sliding-window masks.
 
-    A boolean ``True`` marks a blocked query-key pair. Packed boundaries use
+    A boolean ``True`` marks an allowed query-key pair. Packed boundaries use
     flattened ``[B, S]`` offsets and remain global across CP ranks. The final
     boundary must cover the physical sequence length, including alignment
     padding represented as a synthetic final sequence.
@@ -65,9 +65,6 @@ def build_dense_attention_masks(
             # [B, 1, S, S]， batch，head，query, key
             attention_mask[batch_idx, 0, row_seq_start:, :row_seq_start] = False
 
-    # Convert the allowed-position mask to True=blocked attention semantics.
-    attention_mask = ~attention_mask
-
     swa_mask = None
     if sliding_window is not None:
         positions = platform.arange(seq_length, dtype=platform.tensor_dtype.int64, device=device)
@@ -75,7 +72,7 @@ def build_dense_attention_masks(
         key_positions = positions.unsqueeze(0)
         token_distance = query_positions - key_positions
         outside_window = token_distance > sliding_window
-        swa_mask = attention_mask | outside_window.unsqueeze(0).unsqueeze(0)
+        swa_mask = attention_mask & ~outside_window.unsqueeze(0).unsqueeze(0)
 
     return attention_mask, swa_mask
 

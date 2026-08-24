@@ -31,25 +31,10 @@ from hyper_parallel.auto_models.components.distributed.cp_utils import (
 )
 from hyper_parallel.auto_models.components.distributed.injection import inner_wrapper
 from hyper_parallel.auto_models.components.model_transform import module_replacement
-
-_COMPRESSED_CAUSAL_MASK_SIZE = 2048
-_COMPRESSED_CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
-
-
-def _get_compressed_causal_mask(device: torch.device) -> torch.Tensor:
-    """Return the cached mask required by NPU left-up causal sparse mode."""
-    mask = _COMPRESSED_CAUSAL_MASKS.get(device)
-    if mask is None:
-        mask = torch.triu(
-            torch.ones(
-                (_COMPRESSED_CAUSAL_MASK_SIZE, _COMPRESSED_CAUSAL_MASK_SIZE),
-                dtype=torch.bool,
-                device=device,
-            ),
-            diagonal=1,
-        )
-        _COMPRESSED_CAUSAL_MASKS[device] = mask
-    return mask
+from hyper_parallel.auto_models.components.models.qwen3_moe_attention_common import (
+    fused_rms_norm as _fused_rms_norm,
+    run_qwen3_moe_flash_attention as _run_qwen3_moe_flash_attention,
+)
 
 
 class _GroupedMatmul(torch.autograd.Function):
@@ -109,75 +94,12 @@ class _GroupedMatmul(torch.autograd.Function):
         return grad_inputs, grad_weight, None
 
 
-def _fused_rms_norm(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
-) -> torch.Tensor:
-    """Apply the Ascend fused RMSNorm kernel."""
-    # torch_npu is optional outside Ascend environments.
-    import torch_npu  # pylint: disable=C0415
-
-    return torch_npu.npu_rms_norm(hidden_states, weight, epsilon=epsilon)[0]
-
-
 def qwen3_moe_fused_rms_norm_forward(
     module: nn.Module,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     """Replace ``Qwen3MoeRMSNorm.forward`` with fused NPU RMSNorm."""
     return _fused_rms_norm(hidden_states, module.weight, module.variance_epsilon)
-
-
-def _run_qwen3_moe_flash_attention(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    dropout: float = 0.0,
-    scaling: float | None = None,
-    **kwargs: Any,
-) -> tuple[torch.Tensor, None]:
-    """Run Qwen3-MoE grouped-query attention with the Ascend Flash Attention kernel."""
-    # torch_npu is optional outside Ascend environments.
-    import torch_npu  # pylint: disable=C0415
-
-    del kwargs
-
-    if attention_mask is None:
-        attention_mask = _get_compressed_causal_mask(query.device)
-        sparse_mode = 2
-    else:
-        if attention_mask.ndim == 4:
-            attention_mask = attention_mask[:, :, :, : key.shape[-2]]
-        if attention_mask.dtype == torch.bool:
-            attention_mask = torch.logical_not(attention_mask).to(query.device)
-        else:
-            attention_mask = attention_mask.bool().to(query.device)
-        sparse_mode = 0
-
-    sparse_kwargs = {}
-    if (
-        sparse_mode == 0
-        and getattr(module, "is_causal", True)
-        and query.shape[-2] == key.shape[-2]
-    ):
-        sparse_kwargs["next_tockens"] = 0
-
-    attention_output = torch_npu.npu_fusion_attention(
-        query,
-        key,
-        value,
-        head_num=query.shape[1],
-        input_layout="BNSD",
-        atten_mask=attention_mask,
-        keep_prob=1 - dropout,
-        scale=scaling,
-        sparse_mode=sparse_mode,
-        **sparse_kwargs,
-    )[0]
-    return attention_output.transpose(1, 2).contiguous(), None
 
 
 def _prepare_qwen3_moe_attention_states(
@@ -321,29 +243,153 @@ def _replace_forward(module: nn.Module, forward: Callable) -> nn.Module:
     return replacement
 
 
-@inner_wrapper
-def qwen3_moe_flash_attention_cp_wrapper(
+def _validate_qwen3_moe_flash_attention_cp_target(
     target_module: nn.Module,
-    mesh: Any,
-    tp_mesh: Any,
     cp_mesh: Any,
-    ep_mesh: Any,
-) -> None:
-    """Replace the exact Qwen3-MoE fused attention forward with its CP version."""
-    del mesh, tp_mesh, ep_mesh
+    wrapper_name: str,
+) -> Callable:
+    """Validate a Qwen3-MoE fused CP wrapper target and return its forward."""
     if cp_mesh is None or cp_mesh.size() <= 1:
-        raise ValueError(
-            "qwen3_moe_flash_attention_cp_wrapper requires an active CP mesh"
-        )
+        raise ValueError(f"{wrapper_name} requires an active CP mesh")
 
     original_forward = target_module.forward
     installed_forward = getattr(original_forward, "__func__", original_forward)
     if installed_forward is not qwen3_moe_flash_attention_forward:
         raise ValueError(
-            "qwen3_moe_flash_attention_cp_wrapper can only replace "
+            f"{wrapper_name} can only replace "
             "qwen3_moe_flash_attention_forward; apply "
             "replace_qwen3_moe_flash_attention first"
         )
+    return original_forward
+
+
+def _prepare_qwen3_moe_flash_attention_cp_mask(
+    attention_mask: torch.Tensor | None,
+    query_length: int,
+    key_length: int,
+    query_offset: int,
+    device: torch.device,
+    allow_external_mask: bool,
+) -> torch.Tensor:
+    """Build an implicit CP mask or slice an external global allowed mask."""
+    if attention_mask is None:
+        causal_mask = _cp_offset_causal_mask(
+            query_length,
+            key_length,
+            query_offset,
+            device,
+        )
+        return causal_mask
+
+    if not allow_external_mask:
+        raise ValueError(
+            "Qwen3-MoE fused CP attention requires an implicit causal mask; "
+            "configure create_attention_mask_in_dataloader=false or use "
+            "qwen3_moe_flash_attention_cp_mask_wrapper"
+        )
+    if attention_mask.ndim < 2:
+        raise ValueError(
+            "Qwen3-MoE fused CP attention_mask must include query and key dimensions"
+        )
+    if attention_mask.shape[-1] != key_length:
+        raise ValueError(
+            "Qwen3-MoE fused CP attention_mask must cover the global key sequence: "
+            f"mask key length={attention_mask.shape[-1]}, expected {key_length}"
+        )
+
+    mask_query_length = attention_mask.shape[-2]
+    if mask_query_length != query_length:
+        query_end = query_offset + query_length
+        if mask_query_length < query_end:
+            raise ValueError(
+                "Qwen3-MoE fused CP attention_mask does not cover this rank's query "
+                f"range [{query_offset}, {query_end})"
+            )
+        attention_mask = attention_mask.narrow(
+            -2,
+            query_offset,
+            query_length,
+        )
+
+    return attention_mask
+
+
+def _run_qwen3_moe_flash_attention_cp(
+    target_module: nn.Module,
+    cp_mesh: Any,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Any | None,
+    allow_external_mask: bool,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the common Qwen3-MoE fused CP attention implementation."""
+    if attention_mask is not None and not allow_external_mask:
+        raise ValueError(
+            "Qwen3-MoE fused CP attention requires an implicit causal mask; "
+            "configure create_attention_mask_in_dataloader=false or use "
+            "qwen3_moe_flash_attention_cp_mask_wrapper"
+        )
+    input_shape, query_states, key_states, value_states = (
+        _prepare_qwen3_moe_attention_states(
+            target_module,
+            hidden_states,
+            position_embeddings,
+            past_key_values,
+        )
+    )
+    query_length = query_states.shape[-2]
+    query_offset = cp_mesh.get_local_rank() * query_length
+    key_states, value_states = flex_cp_allgather(
+        key_states.contiguous(),
+        value_states.contiguous(),
+        2,
+        cp_mesh,
+    )
+    cp_attention_mask = _prepare_qwen3_moe_flash_attention_cp_mask(
+        attention_mask,
+        query_length,
+        key_states.shape[-2],
+        query_offset,
+        query_states.device,
+        allow_external_mask,
+    )
+    attention_output, attention_weights = _run_qwen3_moe_flash_attention(
+        target_module,
+        query_states,
+        key_states,
+        value_states,
+        cp_attention_mask,
+        dropout=(
+            0.0
+            if not target_module.training
+            else target_module.attention_dropout
+        ),
+        scaling=target_module.scaling,
+        sliding_window=target_module.sliding_window,
+        **kwargs,
+    )
+    output = _project_qwen3_moe_attention_output(
+        target_module,
+        attention_output,
+        input_shape,
+    )
+    return output, attention_weights
+
+
+def _install_qwen3_moe_flash_attention_cp_forward(
+    target_module: nn.Module,
+    cp_mesh: Any,
+    wrapper_name: str,
+    allow_external_mask: bool,
+) -> None:
+    """Install the shared fused CP forward with the requested mask contract."""
+    original_forward = _validate_qwen3_moe_flash_attention_cp_target(
+        target_module,
+        cp_mesh,
+        wrapper_name,
+    )
 
     @wraps(original_forward)
     def cp_forward(
@@ -353,77 +399,55 @@ def qwen3_moe_flash_attention_cp_wrapper(
         past_key_values: Any | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """CP-aware replacement forward for Qwen3-MoE fused attention.
-
-        All-gathers key/value states across the CP mesh and evaluates the
-        fused attention with a CP-offset causal mask.
-
-        Args:
-            hidden_states: Local sequence shard of hidden states.
-            position_embeddings: Rotary position embedding tuple.
-            attention_mask: Must be None; only the implicit causal mask is
-                supported.
-            past_key_values: Optional cached key/value states.
-            **kwargs: Additional attention arguments.
-
-        Returns:
-            The attention output and attention weights (always None).
-
-        Raises:
-            ValueError: If an explicit attention mask is provided.
-        """
-        if attention_mask is not None:
-            raise ValueError(
-                "Qwen3-MoE fused CP attention currently requires an implicit "
-                "causal mask; configure create_attention_mask_in_dataloader=false"
-            )
-        input_shape, query_states, key_states, value_states = (
-            _prepare_qwen3_moe_attention_states(
-                target_module,
-                hidden_states,
-                position_embeddings,
-                past_key_values,
-            )
-        )
-        query_length = query_states.shape[-2]
-        query_offset = cp_mesh.get_local_rank() * query_length
-        key_states, value_states = flex_cp_allgather(
-            key_states.contiguous(),
-            value_states.contiguous(),
-            2,
-            cp_mesh,
-        )
-        cp_causal_mask = _cp_offset_causal_mask(
-            query_length,
-            key_states.shape[-2],
-            query_offset,
-            query_states.device,
-        )
-        attention_output, attention_weights = _run_qwen3_moe_flash_attention(
+        """Dispatch the model forward contract to the shared fused CP path."""
+        return _run_qwen3_moe_flash_attention_cp(
             target_module,
-            query_states,
-            key_states,
-            value_states,
-            cp_causal_mask,
-            dropout=(
-                0.0
-                if not target_module.training
-                else target_module.attention_dropout
-            ),
-            scaling=target_module.scaling,
-            sliding_window=target_module.sliding_window,
+            cp_mesh,
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_values,
+            allow_external_mask,
             **kwargs,
-        )
-        return (
-            _project_qwen3_moe_attention_output(
-                target_module,
-                attention_output,
-                input_shape,
-            ),
-            attention_weights,
         )
 
     target_module.forward = cp_forward
+
+
+@inner_wrapper
+def qwen3_moe_flash_attention_cp_wrapper(
+    target_module: nn.Module,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+) -> None:
+    """Install Qwen3-MoE fused CP attention with an implicit causal mask."""
+    del mesh, tp_mesh, ep_mesh
+    _install_qwen3_moe_flash_attention_cp_forward(
+        target_module,
+        cp_mesh,
+        "qwen3_moe_flash_attention_cp_wrapper",
+        allow_external_mask=False,
+    )
+
+
+@inner_wrapper
+def qwen3_moe_flash_attention_cp_mask_wrapper(
+    target_module: nn.Module,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+) -> None:
+    """Install Qwen3-MoE fused CP attention that accepts a global block mask."""
+    del mesh, tp_mesh, ep_mesh
+    _install_qwen3_moe_flash_attention_cp_forward(
+        target_module,
+        cp_mesh,
+        "qwen3_moe_flash_attention_cp_mask_wrapper",
+        allow_external_mask=True,
+    )
 
 
 @module_replacement

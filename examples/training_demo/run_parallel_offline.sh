@@ -17,12 +17,11 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+MODEL_SOURCE=${MODEL_SOURCE:-Qwen/Qwen3-30B-A3B}
+DEMO_ROOT=${DEMO_ROOT:-"${DATASET_ROOT:-./dataset}/qwen3-30b-a3b"}
 source "${SCRIPT_DIR}/run_training.bash"
 
-if [[ ! -d "${DATASET_ROOT}" ]]; then
-    echo "Dataset root does not exist: ${DATASET_ROOT}" >&2
-    exit 1
-fi
+mkdir -p "${DATASET_ROOT}"
 for case_data_path in "${DEMO_ROOT}" "${RAW_DATA_PATH}" "${INDEXED_OUTPUT_PREFIX}"; do
     case "${case_data_path}" in
         "${DATASET_ROOT}"/*) ;;
