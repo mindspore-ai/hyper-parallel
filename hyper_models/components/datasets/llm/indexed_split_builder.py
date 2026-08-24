@@ -45,9 +45,9 @@ SplitMatrix: TypeAlias = Sequence[SplitRange | None]
 class _Split(Enum):
     """Stable train, validation, and test identifiers used by Dataset caches."""
 
-    train = 0
-    valid = 1
-    test = 2
+    TRAIN = 0
+    VALID = 1
+    TEST = 2
 
 
 def _get_prefixes_weights_and_sizes_for_blend(

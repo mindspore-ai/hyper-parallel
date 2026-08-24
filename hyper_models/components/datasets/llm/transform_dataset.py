@@ -219,6 +219,7 @@ def _wrap_llm_dataset(
         *,
         skip_invalid_samples: bool = False,
 ) -> Any:
+    """Wrap a mapping or iterable Dataset with the configured sample transform."""
     if hasattr(dataset, "__getitem__") and hasattr(dataset, "__len__"):
         transformed_dataset = _LLMTransformDataset(
             dataset,

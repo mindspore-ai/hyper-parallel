@@ -228,7 +228,7 @@ class TextTrainer:
 
         for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
-            self.base._configure_fsdp_gradient_sync(
+            self.base.configure_fsdp_gradient_sync(
                 micro_step,
                 num_micro_steps,
             )

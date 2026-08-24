@@ -15,6 +15,7 @@
 # modified from https://github.com/NVIDIA/Megatron-LM/blob/main/tools/preprocess_data.py
 
 """Processing large data for pretraining."""
+
 import argparse
 import glob
 import gzip
@@ -77,9 +78,7 @@ def build_huggingface_tokenizer(args: argparse.Namespace) -> Any:
     """Build a Hugging Face tokenizer from command-line arguments."""
     tokenizer_path = args.tokenizer_name_or_path
     if not tokenizer_path:
-        raise ValueError(
-            "tokenizer_name_or_path must be provided for HuggingFaceTokenizer"
-        )
+        raise ValueError("tokenizer_name_or_path must be provided for HuggingFaceTokenizer")
 
     tokenizer_kwargs = {
         "use_fast": args.tokenizer_use_fast,
@@ -95,9 +94,11 @@ def build_huggingface_tokenizer(args: argparse.Namespace) -> Any:
         tokenizer.chat_template = args.chat_template
 
     if args.add_special_tokens:
-        tokenizer.add_special_tokens({
-            "additional_special_tokens": args.add_special_tokens,
-        })
+        tokenizer.add_special_tokens(
+            {
+                "additional_special_tokens": args.add_special_tokens,
+            }
+        )
 
     return tokenizer
 
@@ -112,9 +113,7 @@ def append_eod(args: argparse.Namespace, tokenizer: Any) -> int | None:
         # that do not define an EOS token.
         eod_id = getattr(tokenizer, "sep_token_id", None)
     if eod_id is None:
-        raise ValueError(
-            "append_eod requires the tokenizer to define eos_token_id or sep_token_id"
-        )
+        raise ValueError("append_eod requires the tokenizer to define eos_token_id or sep_token_id")
     return int(eod_id)
 
 
@@ -138,14 +137,17 @@ class Encoder:
                 raise ImportError("NLTK is required when --split-sentences is enabled")
             if os.environ.get("NLTK_DATA"):
                 library = os.path.join(
-                    os.environ["NLTK_DATA"], "tokenizers", "punkt", f"{self.args.lang}.pickle",
+                    os.environ["NLTK_DATA"],
+                    "tokenizers",
+                    "punkt",
+                    f"{self.args.lang}.pickle",
                 )
                 splitter = nltk.load(f"file:{library}")
             else:
                 splitter = nltk.load(f"tokenizers/punkt/{self.args.lang}.pickle")
             if self.args.keep_newlines:
                 Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text=splitter._params,
+                    train_text=splitter._params,  # pylint: disable=protected-access
                     lang_vars=CustomLanguageVars(),
                 )
             else:
@@ -159,7 +161,7 @@ class Encoder:
         for key in self.args.json_keys:
             text = data[key]
             sentences_by_chunk = [
-                Encoder.splitter.tokenize(text[start:start + max_chunk_length])
+                Encoder.splitter.tokenize(text[start : start + max_chunk_length])
                 for start in range(0, len(text), max_chunk_length)
             ]
             output[key] = [sentence for chunk in sentences_by_chunk for sentence in chunk]
@@ -236,8 +238,7 @@ class Partition:
         docs_per_second = count / elapsed
         megabytes_per_second = total_bytes_processed / elapsed / 1024 / 1024
         print(
-            f"Processed {count} documents "
-            f"({docs_per_second} docs/s, {megabytes_per_second} MB/s).",
+            f"Processed {count} documents " f"({docs_per_second} docs/s, {megabytes_per_second} MB/s).",
             file=sys.stderr,
         )
         if self.args.find_optimal_num_workers:
@@ -249,7 +250,9 @@ class Partition:
         print("Opening", input_file_name)
         encoder = Encoder(self.args)
         with open(input_file_name, "r", encoding="utf-8") as input_file, open(
-            output_file_name, "w", encoding="utf-8",
+            output_file_name,
+            "w",
+            encoding="utf-8",
         ) as output_file:
             # multiprocessing.Pool must be shut down with close()+join() so
             # in-flight tasks finish; a 'with' block would terminate() them.
@@ -293,10 +296,8 @@ class Partition:
 
         keys = self.args.json_keys
         for key in keys:
-            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix,
-                                                          key, level)
-            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
-                                                          key, level)
+            output_bin_files[key] = f"{output_prefix}_{key}_{level}.bin"
+            output_idx_files[key] = f"{output_prefix}_{key}_{level}.idx"
             builders[key] = indexed_dataset.IndexedDatasetBuilder(
                 output_bin_files[key],
                 dtype=indexed_dataset.DType.optimal_dtype(len(tokenizer)),
@@ -309,7 +310,7 @@ class Partition:
         pack_to_seq_len = getattr(self.args, "pack_to_seq_len", None)
         chunk_size = pack_to_seq_len + 1 if pack_to_seq_len is not None else None
         token_buffers = {key: [] for key in keys}
-        with open(input_file_name, 'r', encoding='utf-8') as fin:
+        with open(input_file_name, "r", encoding="utf-8") as fin:
             encoded_docs = pool.imap(encoder.encode, fin, 32)
             for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
                 if self.args.find_optimal_num_workers and i > self.args.max_documents:
@@ -322,7 +323,7 @@ class Partition:
                     token_buffers[key].extend(doc[key])
                     complete_length = len(token_buffers[key]) // chunk_size * chunk_size
                     for offset in range(0, complete_length, chunk_size):
-                        chunk = token_buffers[key][offset:offset + chunk_size]
+                        chunk = token_buffers[key][offset : offset + chunk_size]
                         builders[key].add_document(chunk, [chunk_size])
                     del token_buffers[key][:complete_length]
                 self.print_processing_stats(i, proc_start, total_bytes_processed)
@@ -344,140 +345,55 @@ def _parse_bool(value: str) -> bool:
         return True
     if normalized in {"false", "0", "no", "off"}:
         return False
-    raise argparse.ArgumentTypeError(
-        f"Expected a boolean value, but received {value!r}"
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, but received {value!r}")
+
+
+def _add_offline_source_arguments(group: Any) -> None:
+    """Register source, tokenizer, and tokenization arguments."""
+    arguments = (
+        (("--dataset-name-or-path",), {"required": True, "help": "Input JSON/JSONL file, directory, or glob."}),
+        (("--output-prefix",), {"required": True, "help": "Path prefix for generated .bin/.idx files."}),
+        (("--json-keys",), {"nargs": "+", "default": ["text"], "help": "JSON fields to tokenize."}),
+        (("--tokenizer-name-or-path",), {"required": True, "help": "Tokenizer name or local path."}),
+        (("--chat-template",), {"default": None, "help": "Optional tokenizer chat template."}),
+        (("--add-special-tokens",), {"nargs": "+", "default": None, "help": "Additional special tokens."}),
+        (("--tokenizer-use-fast",), {"type": _parse_bool, "default": True, "help": "Use the fast tokenizer."}),
+        (("--trust-remote-code",), {"action": "store_true", "help": "Allow tokenizer remote code."}),
+        (("--split-sentences",), {"action": "store_true", "help": "Split text into sentences."}),
+        (("--keep-newlines",), {"action": "store_true", "help": "Preserve newlines while splitting."}),
+        (("--lang",), {"default": "english", "help": "Punkt language for sentence splitting."}),
+        (("--append-eod",), {"type": _parse_bool, "default": True, "help": "Append an EOD token."}),
+        (("--pack-to-seq-len",), {"type": int, "default": None, "help": "Fixed packed sequence length."}),
     )
+    for flags, options in arguments:
+        group.add_argument(*flags, **options)
+
+
+def _add_offline_worker_arguments(group: Any) -> None:
+    """Register partitioning and worker arguments."""
+    arguments = (
+        (("--keep-sequential-samples",), {"action": "store_true", "help": "Keep sequential samples."}),
+        (("--keep-partition-files",), {"action": "store_true", "help": "Keep temporary partition files."}),
+        (("--workers",), {"type": int, "default": 8, "help": "Number of worker processes."}),
+        (("--partitions",), {"type": int, "default": 1, "help": "Number of data partitions."}),
+        (("--find-optimal-num-workers",), {"action": "store_true", "help": "Benchmark worker counts."}),
+        (
+            ("--workers-to-check",),
+            {"nargs": "+", "type": int, "default": [16, 32, 64], "help": "Candidate worker counts."},
+        ),
+        (("--max-documents",), {"type": int, "default": 100_000, "help": "Benchmark document limit."}),
+        (("--log-interval",), {"type": int, "default": 1000, "help": "Progress-report interval."}),
+    )
+    for flags, options in arguments:
+        group.add_argument(*flags, **options)
 
 
 def get_args() -> argparse.Namespace:
     """Parse offline dataset preparation arguments."""
     parser = argparse.ArgumentParser(description="Prepare an offline dataset.")
     group = parser.add_argument_group(title="input data")
-
-    group.add_argument(
-        "--dataset-name-or-path",
-        type=str,
-        required=True,
-        help="Input JSON/JSONL file, directory, or glob expression.",
-    )
-    group.add_argument(
-        "--output-prefix",
-        type=str,
-        required=True,
-        help="Path prefix for generated .bin/.idx files.",
-    )
-    group.add_argument(
-        "--json-keys",
-        nargs="+",
-        default=["text"],
-        help="One or more JSON fields to tokenize.",
-    )
-    group.add_argument(
-        "--tokenizer-name-or-path",
-        type=str,
-        required=True,
-        help="Tokenizer name or local tokenizer path.",
-    )
-    group.add_argument(
-        "--chat-template",
-        type=str,
-        default=None,
-        help="Optional chat template assigned to the tokenizer.",
-    )
-    group.add_argument(
-        "--add-special-tokens",
-        nargs="+",
-        default=None,
-        help="Additional special tokens added to the tokenizer.",
-    )
-    group.add_argument(
-        "--tokenizer-use-fast",
-        type=_parse_bool,
-        default=True,
-        help="Whether to use the Hugging Face fast tokenizer (default: true).",
-    )
-    group.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Allow tokenizer repositories to execute remote code.",
-    )
-    group.add_argument(
-        '--split-sentences',
-        action='store_true',
-        help='Split text into sentences before tokenization.',
-    )
-    group.add_argument(
-        "--keep-newlines",
-        action="store_true",
-        help="Preserve newline runs when splitting text into sentences.",
-    )
-    group.add_argument(
-        "--lang",
-        type=str,
-        default="english",
-        help="Punkt language used for sentence splitting.",
-    )
-    group.add_argument(
-        "--append-eod",
-        type=_parse_bool,
-        default=True,
-        help="Append the tokenizer EOS, or SEP fallback, to each non-empty document (default: %(default)s).",
-    )
-    group.add_argument(
-        "--pack-to-seq-len",
-        type=int,
-        default=None,
-        help="Pack documents into fixed samples of this sequence length plus one target token.",
-    )
-
-    # Configure dataset partitioning and preprocessing workers.
-    group.add_argument(
-        "--keep-sequential-samples",
-        action="store_true",
-        help="Keep sequential samples when partitioning the dataset.",
-    )
-    group.add_argument(
-        "--keep-partition-files",
-        action="store_true",
-        help="Keep temporary JSON partition files after successful preprocessing.",
-    )
-    group.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Number of worker processes to use.",
-    )
-    group.add_argument(
-        "--partitions",
-        type=int,
-        default=1,
-        help="Number of partitions to use.",
-    )
-    group.add_argument(
-        "--find-optimal-num-workers",
-        action="store_true",
-        help="Benchmark candidate worker counts before reporting the fastest configuration.",
-    )
-    group.add_argument(
-        "--workers-to-check",
-        nargs="+",
-        type=int,
-        default=[16, 32, 64],
-        help="Candidate total worker counts used by --find-optimal-num-workers.",
-    )
-    group.add_argument(
-        "--max-documents",
-        type=int,
-        default=100_000,
-        help="Maximum documents processed per partition during worker benchmarking.",
-    )
-    group.add_argument(
-        "--log-interval",
-        type=int,
-        default=1000,
-        help="Number of documents between progress reports.",
-    )
-
+    _add_offline_source_arguments(group)
+    _add_offline_worker_arguments(group)
     return parser.parse_args()
 
 
@@ -501,10 +417,7 @@ def get_file_name(args: argparse.Namespace, file_id: int) -> dict[str, str]:
     input_file_name = os.path.join(input_directory, "input.jsonl")
     sentence_split_file = os.path.join(input_directory, "input_ss.jsonl")
     output_prefix = os.path.join(partition_directory, output_name)
-    file_names = {
-        'partition': input_file_name,
-        'sentence_split': sentence_split_file,
-        'output_prefix': output_prefix}
+    file_names = {"partition": input_file_name, "sentence_split": sentence_split_file, "output_prefix": output_prefix}
     return file_names
 
 
@@ -552,7 +465,7 @@ def _process_json_file_worker(
     """Encode one partition and return performance or an error to the parent."""
     try:
         partition = Partition(args, workers)
-        measurements = partition.process_json_file((name[input_key], name['output_prefix']))
+        measurements = partition.process_json_file((name[input_key], name["output_prefix"]))
         queue.put((True, measurements))
     except Exception:  # pylint: disable=W0718
         queue.put((False, traceback.format_exc()))
@@ -567,7 +480,7 @@ def _split_sentences_worker(
     """Split one partition and report completion or an error to the parent."""
     try:
         partition = Partition(args, workers)
-        partition.split_sentences((name['partition'], name['sentence_split']))
+        partition.split_sentences((name["partition"], name["sentence_split"]))
         queue.put((True, None))
     except Exception:  # pylint: disable=W0718
         queue.put((False, traceback.format_exc()))
@@ -620,8 +533,7 @@ def _resolve_input_files(dataset_name_or_path: str) -> list[str]:
         input_files = [
             str(Path(file_name).resolve())
             for file_name in glob.glob(dataset_name_or_path)
-            if Path(file_name).is_file()
-            and file_name.lower().endswith(supported_suffixes)
+            if Path(file_name).is_file() and file_name.lower().endswith(supported_suffixes)
         ]
     input_files.sort()
     if not input_files:
@@ -677,19 +589,8 @@ def _cleanup_intermediate_files(
                 pass
 
 
-def prepare_offline_dataset(args: argparse.Namespace) -> None:
-    """Prepare an indexed offline dataset from a parsed configuration.
-
-    This function is the programmatic entry point for callers that already
-    have an ``argparse.Namespace`` containing the preprocessing options.
-
-    Args:
-        args: Offline dataset preprocessing configuration.
-
-    Raises:
-        ImportError: If sentence splitting is requested without NLTK.
-        ValueError: If the preprocessing configuration is invalid.
-    """
+def _validate_preparation_args(args: argparse.Namespace) -> list[int]:
+    """Validate preprocessing options and return worker candidates."""
     if args.partitions <= 0:
         raise ValueError("partitions must be greater than zero")
     if args.log_interval <= 0:
@@ -710,22 +611,134 @@ def prepare_offline_dataset(args: argparse.Namespace) -> None:
         raise ValueError("output_prefix must be provided")
     if not args.tokenizer_name_or_path:
         raise ValueError("tokenizer_name_or_path must be provided")
-
     output_parent = Path(args.output_prefix).expanduser().resolve().parent
     output_parent.mkdir(parents=True, exist_ok=True)
-
     worker_candidates = list(args.workers_to_check) if args.find_optimal_num_workers else [args.workers]
     if not worker_candidates or any(workers <= 0 for workers in worker_candidates):
         raise ValueError("worker counts must be greater than zero")
     invalid_workers = [workers for workers in worker_candidates if workers % args.partitions != 0]
     if invalid_workers:
-        raise ValueError(
-            f"Worker counts {invalid_workers} must be divisible by partitions ({args.partitions})"
-        )
+        raise ValueError(f"Worker counts {invalid_workers} must be divisible by partitions ({args.partitions})")
 
-    if args.split_sentences:
-        if not NLTK_AVAILABLE:
-            raise ImportError("NLTK is required when --split-sentences is enabled")
+    if args.split_sentences and not NLTK_AVAILABLE:
+        raise ImportError("NLTK is required when --split-sentences is enabled")
+    return worker_candidates
+
+
+def _partition_input_data(
+    args: argparse.Namespace,
+    input_files: list[str],
+) -> list[dict[str, str]]:
+    """Create or reuse input partitions and return their path descriptions."""
+    if args.partitions == 1 and len(input_files) == 1:
+        output_path = Path(args.output_prefix).expanduser().resolve()
+        work_directory = output_path.parent / f".{output_path.name}_preprocess"
+        work_directory.mkdir(parents=True, exist_ok=True)
+        return [
+            {
+                "partition": input_files[0],
+                "sentence_split": str(work_directory / "input_ss.jsonl"),
+                "output_prefix": args.output_prefix,
+            }
+        ]
+
+    partition_size = 1
+    if args.keep_sequential_samples:
+        total_sample_count = sum(_count_jsonl_lines(filename) for filename in input_files)
+        if total_sample_count == 0:
+            raise ValueError("Input JSON/JSONL files must contain at least one record")
+        partition_size = math.ceil(total_sample_count / args.partitions)
+    if args.partitions == 1:
+        output_path = Path(args.output_prefix).expanduser().resolve()
+        directory = output_path.parent / f".{output_path.name}_preprocess" / "partition0"
+        directory.mkdir(parents=True, exist_ok=True)
+        names = [
+            {
+                "partition": str(directory / "input.jsonl"),
+                "sentence_split": str(directory / "input_ss.jsonl"),
+                "output_prefix": args.output_prefix,
+            }
+        ]
+    else:
+        names = [get_file_name(args, file_id) for file_id in range(args.partitions)]
+    keep_files = getattr(args, "keep_partition_files", False)
+    partitions_present = keep_files and check_files_exist(names, "partition", args.partitions)
+    split_files_present = keep_files and check_files_exist(names, "sentence_split", args.partitions)
+    if not partitions_present and not split_files_present:
+        _write_input_partitions(args, names, input_files, partition_size)
+    return names
+
+
+def _write_input_partitions(
+    args: argparse.Namespace,
+    names: list[dict[str, str]],
+    input_files: list[str],
+    partition_size: int | None,
+) -> None:
+    """Distribute input records across partition files."""
+    outputs = [open(name["partition"], "w", encoding="utf-8") for name in names]  # pylint: disable=R1732
+    try:
+        partition_index = 0
+        line_count = 0
+        for input_file_name in input_files:
+            open_file = gzip.open if input_file_name.endswith(".gz") else open
+            with open_file(input_file_name, "rt", encoding="utf-8") as input_file:
+                for line in input_file:
+                    outputs[partition_index].write(line)
+                    if args.keep_sequential_samples:
+                        line_count += 1
+                        if line_count % partition_size == 0 and partition_index < args.partitions - 1:
+                            partition_index += 1
+                    else:
+                        partition_index = (partition_index + 1) % args.partitions
+    finally:
+        for output in outputs:
+            output.close()
+
+
+def _split_partitions(args: argparse.Namespace, workers: int, names: list[dict[str, str]]) -> None:
+    """Run sentence splitting for partitions that lack cached outputs."""
+    split_files_present = getattr(args, "keep_partition_files", False) and check_files_exist(
+        names, "sentence_split", args.partitions
+    )
+    if not args.split_sentences or split_files_present:
+        return
+    queue = multiprocessing.Queue()
+    processes = []
+    for name in names:
+        process = multiprocessing.Process(target=_split_sentences_worker, args=(args, workers, name, queue))
+        process.start()
+        processes.append(process)
+    _wait_for_processes(processes, queue)
+
+
+def _encode_partitions(
+    args: argparse.Namespace,
+    workers: int,
+    names: list[dict[str, str]],
+) -> list[float]:
+    """Encode every partition and flatten its performance measurements."""
+    input_key = "sentence_split" if args.split_sentences else "partition"
+    queue = multiprocessing.Queue()
+    processes = []
+    for name in names:
+        process = multiprocessing.Process(
+            target=_process_json_file_worker,
+            args=(args, workers, name, input_key, queue),
+        )
+        process.start()
+        processes.append(process)
+    results = _wait_for_processes(processes, queue)
+    return [measurement for measurements in results for measurement in (measurements or [])]
+
+
+def prepare_offline_dataset(args: argparse.Namespace) -> None:
+    """Prepare an indexed offline dataset from a parsed configuration.
+
+    Args:
+        args: Offline dataset preprocessing configuration.
+    """
+    worker_candidates = _validate_preparation_args(args)
 
     performance = {}
     input_files = _resolve_input_files(args.dataset_name_or_path)
@@ -735,101 +748,9 @@ def prepare_offline_dataset(args: argparse.Namespace) -> None:
 
         if args.split_sentences:
             nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
-
-        in_ss_out_names = []
-        if args.partitions == 1 and len(input_files) == 1:
-            output_path = Path(args.output_prefix).expanduser().resolve()
-            work_directory = output_path.parent / f".{output_path.name}_preprocess"
-            work_directory.mkdir(parents=True, exist_ok=True)
-            in_ss_out_names.append({
-                'partition': input_files[0],
-                'sentence_split': str(work_directory / "input_ss.jsonl"),
-                'output_prefix': args.output_prefix,
-            })
-        else:
-            if args.keep_sequential_samples:
-                total_sample_count = sum(_count_jsonl_lines(filename) for filename in input_files)
-                if total_sample_count == 0:
-                    raise ValueError("Input JSON/JSONL files must contain at least one record")
-                partition_size = math.ceil(total_sample_count / args.partitions)
-
-            if args.partitions == 1:
-                output_path = Path(args.output_prefix).expanduser().resolve()
-                partition_directory = output_path.parent / f".{output_path.name}_preprocess" / "partition0"
-                partition_directory.mkdir(parents=True, exist_ok=True)
-                partition_path = partition_directory / "input.jsonl"
-                in_ss_out_names.append({
-                    'partition': str(partition_path),
-                    'sentence_split': str(partition_directory / "input_ss.jsonl"),
-                    'output_prefix': args.output_prefix,
-                })
-            else:
-                for file_id in range(args.partitions):
-                    in_ss_out_names.append(get_file_name(args, file_id))
-
-            partitions_present = check_files_exist(in_ss_out_names, 'partition', args.partitions)
-            split_sentences_present = check_files_exist(
-                in_ss_out_names, 'sentence_split', args.partitions,
-            )
-            if not getattr(args, "keep_partition_files", False):
-                partitions_present = False
-                split_sentences_present = False
-            if not partitions_present and not split_sentences_present:
-                partitioned_input_files = [
-                    open(name['partition'], 'w', encoding='utf-8')  # pylint: disable=R1732
-                    for name in in_ss_out_names
-                ]
-                try:
-                    index = 0
-                    line_count = 0
-                    for in_file_name in input_files:
-                        open_file = gzip.open if in_file_name.endswith(".gz") else open
-                        with open_file(in_file_name, 'rt', encoding='utf-8') as input_file:
-                            for line in input_file:
-                                partitioned_input_files[index].write(line)
-                                if args.keep_sequential_samples:
-                                    line_count += 1
-                                    if line_count % partition_size == 0 and index < args.partitions - 1:
-                                        index += 1
-                                else:
-                                    index = (index + 1) % args.partitions
-                finally:
-                    for partitioned_input_file in partitioned_input_files:
-                        partitioned_input_file.close()
-
-        split_sentences_present = check_files_exist(
-            in_ss_out_names, 'sentence_split', args.partitions,
-        )
-        if not getattr(args, "keep_partition_files", False):
-            split_sentences_present = False
-        if args.split_sentences and not split_sentences_present:
-            split_queue = multiprocessing.Queue()
-            split_processes = []
-            for name in in_ss_out_names:
-                process = multiprocessing.Process(
-                    target=_split_sentences_worker,
-                    args=(args, workers_per_partition, name, split_queue),
-                )
-                process.start()
-                split_processes.append(process)
-            _wait_for_processes(split_processes, split_queue)
-
-        input_key = 'sentence_split' if args.split_sentences else 'partition'
-        result_queue = multiprocessing.Queue()
-        processes = []
-        for name in in_ss_out_names:
-            process = multiprocessing.Process(
-                target=_process_json_file_worker,
-                args=(args, workers_per_partition, name, input_key, result_queue),
-            )
-            process.start()
-            processes.append(process)
-        partition_results = _wait_for_processes(processes, result_queue)
-        performance[workers] = [
-            measurement
-            for measurements in partition_results
-            for measurement in (measurements or [])
-        ]
+        in_ss_out_names = _partition_input_data(args, input_files)
+        _split_partitions(args, workers_per_partition, in_ss_out_names)
+        performance[workers] = _encode_partitions(args, workers_per_partition, in_ss_out_names)
 
         if args.partitions > 1:
             _merge_partition_outputs(args, in_ss_out_names)
@@ -845,5 +766,5 @@ def main() -> None:
     prepare_offline_dataset(get_args())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

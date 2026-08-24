@@ -202,14 +202,14 @@ _INDEX_HEADER = b"MMIDIDX\x00\x00"
 class DType(Enum):
     """The NumPy data type Enum for reading the IndexedDataset indices"""
 
-    uint8 = 1
-    int8 = 2
-    int16 = 3
-    int32 = 4
-    int64 = 5
-    float64 = 6
-    float32 = 7
-    uint16 = 8
+    UINT8 = 1
+    INT8 = 2
+    INT16 = 3
+    INT32 = 4
+    INT64 = 5
+    FLOAT64 = 6
+    FLOAT32 = 7
+    UINT16 = 8
 
     @classmethod
     def code_from_dtype(cls, value: Type[numpy.number]) -> int:
@@ -221,7 +221,7 @@ class DType(Enum):
         Returns:
             int: The code
         """
-        return cls[value.__name__].value
+        return cls[value.__name__.upper()].value
 
     @classmethod
     def dtype_from_code(cls, value: int) -> Type[numpy.number]:
@@ -233,7 +233,7 @@ class DType(Enum):
         Returns:
             Type[numpy.number]: The dtype
         """
-        return getattr(numpy, cls(value).name)
+        return getattr(numpy, cls(value).name.lower())
 
     @classmethod
     def size(cls, key: Union[int, Type[numpy.number]]) -> int:
@@ -607,6 +607,7 @@ class _S3BinReader(_BinReader):
         self._cache: Optional[bytes] = None
 
     def _extract_from_cache(self, offset: int, size: int) -> bytes:
+        """Return a requested byte range from the active S3 cache window."""
         if self._cache is None:
             raise RuntimeError("Cache is empty; cannot extract before first read")
         start = offset - self._cache_bytes_start
@@ -638,7 +639,7 @@ class _S3BinReader(_BinReader):
     def __del__(self) -> None:
         try:
             self._client.close()
-        except Exception:
+        except (AttributeError, RuntimeError):
             pass
 
 
@@ -788,7 +789,7 @@ class IndexedDataset(torch.utils.data.Dataset):
             return (seq, mode) if mode is not None else seq
 
         if isinstance(idx, slice):
-            start, stop, step = idx.indices(len(self))
+            start, _, step = idx.indices(len(self))
             if step != 1:
                 raise ValueError("Slices into IndexedDataset must be contiguous (step=1)")
             lengths = self.index.sequence_lengths[idx]

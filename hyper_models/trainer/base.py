@@ -679,6 +679,10 @@ class BaseTrainer(Stateful, ABC):
                 if is_hsdp:
                     model_part.set_requires_all_reduce(is_last_micro_batch)
 
+    def configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int) -> None:
+        """Configure FSDP gradient synchronization for an external training loop."""
+        self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
+
     def train_step(
             self,
             data_iterator: Any,
