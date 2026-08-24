@@ -70,7 +70,7 @@ def _parse_cli_scalar(value: object, annotation: object) -> object:
         return value
     target = annotation
     if get_origin(target) in (Union, types.UnionType):
-        members = [member for member in get_args(target) if member is not type(None)]
+        members = [member for member in get_args(target) if member is not types.NoneType]
         if len(members) != 1:
             return value
         target = members[0]

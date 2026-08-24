@@ -496,7 +496,8 @@ def build_llm_get_batch(
     parallel_context = create_batch_parallel_context(mesh_context, pp_shared_data=pp_shared_data)
 
     transport_fields = MODEL_INPUT_FIELDS | LOSS_INPUT_FIELDS | CP_SEQUENCE_FIELDS
-    transport = DistributedBatchTransport(parallel_context=parallel_context, device=device, field_names=transport_fields)
+    transport = DistributedBatchTransport(parallel_context=parallel_context, device=device,
+                                          field_names=transport_fields)
     cp_sharder = ContextParallelBatchSharder(parallel_context)
     cp_distributor = ContextParallelBatchDistributor(parallel_context, device)
     processor = LLMBatchProcessor(

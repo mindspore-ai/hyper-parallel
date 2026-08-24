@@ -27,7 +27,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
@@ -40,7 +40,11 @@ logger = logging.getLogger(__name__)
 
 
 class MeshAxisName(str, Enum):
-    """Canonical enum of mesh dimension names (a str enum, directly comparable to plain strings like "tp" and usable as a dict key)."""
+    """Canonical enum of mesh dimension names.
+
+    A str enum: directly comparable to plain strings like "tp" and usable as
+    a dict key.
+    """
     TP = "tp"
     CP = "cp"
     EP = "ep"
@@ -75,7 +79,15 @@ class TpLocalAttrPlan:
 class PlacementMismatchError(ValueError):
     """DTensor propagation result is inconsistent with the ModuleShardingSpec declaration (05 §5.3)."""
 
-    def __init__(self, module_name: str, expected, actual, stage: str):
+    def __init__(self, module_name: str, expected: Any, actual: Any, stage: str) -> None:
+        """Initialize the mismatch error.
+
+        Args:
+            module_name: FQN of the module whose placement mismatched.
+            expected: Placement declared by the ShardingConfig.
+            actual: Placement produced by DTensor propagation.
+            stage: Which contract stage mismatched (e.g. "in_dst"/"out_src").
+        """
         self.module_name = module_name
         self.expected = expected
         self.actual = actual
@@ -105,7 +117,7 @@ class ModuleShardingSpec:
                communication)
 
     plan_overrides input side only: the contract fields (params/in_src/in_dst/
-    out_src/out_dst/out_names) follow one rule — **"不写继承，写了照办"**
+    out_src/out_dst/out_names) follow one rule — **"unset inherits, set wins"**
     (2026-08-05): ``None`` (unset) or the sentinel ``"auto"`` means
     inherit-from-template (merge only); an explicit value IS the final value,
     including the empty dict ``{}`` (explicit "no sharding / no contract"
@@ -169,10 +181,12 @@ class ModuleShardingSpec:
     # │ The user extension-point interfaces: region_dispatch /           │
     # │ local_compute_fn / inner_target / inner_wrapper                  │
     # │                                                                 │
-    # │ One axiom governs every boundary: 区域计算默认可 dispatch 穿透    │
-    # │ （validate 下 DTensor 直入、策略传播、out_src 真校验）；不能       │
-    # │ dispatch 的，显式声明 region_dispatch=False（骨架黑盒：           │
-    # │ to_local → local 执行 → 声明式重包）。                          │
+    # │ One axiom governs every boundary: region computation is            │
+    # │ dispatch-through by default (under validate: DTensors enter        │
+    # │ directly, strategy propagation, real out_src validation); what     │
+    # │ cannot dispatch explicitly declares region_dispatch=False          │
+    # │ (skeleton black-box: to_local -> local execution ->                │
+    # │ declarative re-wrap).                                              │
     # │                                                                 │
     # │ [local-region family] (module level: skeleton unchanged,         │
     # │   content swapped)                                               │
@@ -232,22 +246,30 @@ class ModuleShardingSpec:
     # │ local_* (module-level skeleton).                                 │
     # └─────────────────────────────────────────────────────────────────┘
     #
-    # region_dispatch: **区域计算（无论来源：模块自身 forward 或注入函数）的
-    #   validate 执行模式声明**——全框架一条公理：区域计算默认可 dispatch
-    #   穿透，不能的显式声明 False。
-    #   - None（无注入）：普通边界——validate 下 DTensor 直入原 forward，
-    #     dispatch 穿透 + out_src 真校验（公理缺省，非本字段的"默认值"）；
-    #   - False（无注入）：模块自身 forward 不可 dispatch（数据依赖逻辑在
-    #     forward 内，如自研 EP-aware MoE 的 a2a）→ 走 local-region 骨架，
-    #     compute = 模块自身 forward（模板识别出此类模块时由 planner 推导
-    #     填入，日志可见）；
-    #   - 有注入（local_compute_fn / inner_wrapper 非 None）：**必须显式
-    #     声明**（无默认）——True = 注入物纯标准算子可 dispatch（validate
-    #     穿透 + out_src/inner_out_src 真校验）；False = 注入物含通信/
-    #     自定义 kernel（validate 黑盒 local 执行 + 声明式重包）。缺失 →
-    #     apply 时 fail-fast；
-    #   - True（无注入）：冗余声明 → fail-fast（普通边界天然穿透）。
-    #   production 不受本字段影响（区域内恒 local 直通）。
+    # region_dispatch: **the validate execution-mode declaration for the
+    #   region computation (whatever its source: the module's own forward or
+    #   an injected function)** — one axiom across the whole framework: region
+    #   computation is dispatch-through by default; what cannot dispatch
+    #   explicitly declares False.
+    #   - None (no injection): an ordinary boundary — under validate, DTensors
+    #     go straight into the original forward, dispatch-through + real
+    #     out_src validation (the axiom's default, not this field's "default
+    #     value");
+    #   - False (no injection): the module's own forward cannot dispatch
+    #     (data-dependent logic inside the forward, e.g. the a2a of an
+    #     in-house EP-aware MoE) → takes the local-region skeleton, compute =
+    #     the module's own forward (derived and filled by the planner when the
+    #     template recognizes such a module, visible in the logs);
+    #   - With injection (local_compute_fn / inner_wrapper non-None): **must be
+    #     declared explicitly** (no default) — True = the injected code is pure
+    #     standard ops, dispatchable (validate dispatch-through + real
+    #     out_src/inner_out_src validation); False = the injected code contains
+    #     communication / custom kernels (validate black-box local execution +
+    #     declarative re-wrap). Missing → fail-fast at apply time;
+    #   - True (no injection): a redundant declaration → fail-fast (an
+    #     ordinary boundary is inherently dispatch-through).
+    #   production is not affected by this field (region is always local
+    #   passthrough).
     region_dispatch: Optional[bool] = None
 
     # ── inner-wrap custom entry points (user-configurable, 05 §4.4.2/§8.6) ──
@@ -272,10 +294,11 @@ class ModuleShardingSpec:
     #     them); ``spec`` is the only optional context. The wrapper replaces
     #     target.forward in place (use cp_utils.flex_cp_allgather for K/V
     #     all-gather). The replaced forward must accept the original
-    #     forward's params (validated at apply time). region_dispatch 必须
-    #     显式声明（见上）：注入物只面向 local 张量（False，适配器托管
-    #     DTensor 转换）或纯标准算子可 dispatch（True，validate 穿透
-    #     真校验）；
+    #     forward's params (validated at apply time). region_dispatch must be
+    #     declared explicitly (see above): the injected code either targets
+    #     local tensors only (False, the adapter manages the DTensor
+    #     conversion) or is pure standard ops, dispatchable (True, validate
+    #     dispatch-through with real validation);
     #   - Target (hyper_models.trainer.config.Target): a delayed wrapper
     #     reference resolved from YAML; the referenced fn must likewise be
     #     @inner_wrapper decorated (the shipped built-ins
@@ -284,15 +307,22 @@ class ModuleShardingSpec:
     #     return (also decorated) = applied as a custom wrapper.
     inner_target: Optional[str] = None
     inner_wrapper: Optional[Union[str, Callable]] = None   # or Target
-    # inner_out_src: inner-wrap 情形 B（inner_target 指向子模块而非 self）的
-    #   输出 placement **显式声明**——框架对 inner 输出布局零推导零猜测：
-    #   - 哨兵 "first_input"：layout-preserving 声明（输出布局 == 首个
-    #     DTensor 入参的运行时布局；attention 类 wrapper 用，多输出非法）；
-    #   - NamedPlacement（{axis: Placement}）：单输出显式声明；
-    #   - {name: NamedPlacement}：多输出逐名声明（tuple 位置按声明键序）。
-    #   情形 B 未声明 → apply 时 fail-fast（情形 A target=self 用边界
-    #   out_src，无需本字段）。validate 对 inner 区域不做传播校验：声明错
-    #   误由重包后的全局形状一致性 / 边界 out_src 校验 / 数值对拍兜底。
+    # inner_out_src: the **explicit declaration** of the output placement for
+    #   inner-wrap case B (inner_target points at a submodule rather than
+    #   self) — the framework does zero derivation and zero guessing about the
+    #   inner output layout:
+    #   - sentinel "first_input": a layout-preserving declaration (the output
+    #     layout == the runtime layout of the first DTensor input argument;
+    #     used by attention-type wrappers; illegal for multiple outputs);
+    #   - NamedPlacement ({axis: Placement}): an explicit single-output
+    #     declaration;
+    #   - {name: NamedPlacement}: a per-name declaration for multiple outputs
+    #     (tuple positions follow the declaration key order).
+    #   Case B without a declaration → fail-fast at apply time (case A
+    #   target=self uses the boundary out_src and does not need this field).
+    #   validate does no propagation check on the inner region: declaration
+    #   errors are backstopped by post-rewrap global-shape consistency / the
+    #   boundary out_src check / numerical comparison.
     inner_out_src: Optional[Union[str, Dict]] = None
 
     # ── local-region custom computation (user-configurable, 05 §4.4.3/§8.6) ──
@@ -407,26 +437,30 @@ class ShardingPlan:
         """
         # Lazy: sharding_config must not import precompiled_boundary at
         # module level (precompiled_boundary already imports this module).
-        from hyper_models.components.distributed.precompiled_boundary import (
+        from hyper_models.components.distributed.precompiled_boundary import (  # pylint: disable=C0415
             PrecompiledBoundary,
         )
 
         def fmt_named(named: Optional[NamedPlacement]) -> str:
+            """Format a NamedPlacement as a compact one-line dict string."""
             if not named:
                 return "{}"
             items = [
                 (getattr(axis, "value", axis), p) for axis, p in named.items()
-                # 只显示本 plan 拓扑轴（spec 可能携带模板的全轴声明，
-                # resolve 时才按 mesh_dim_names 过滤——报告提前过滤避免误导）
+                # Only show the axes of this plan's topology (a spec may carry
+                # the template's full-axis declaration, filtered by
+                # mesh_dim_names only at resolve time — the report filters
+                # early to avoid misleading output)
                 if not self.mesh_dim_names
                 or getattr(axis, "value", axis) in self.mesh_dim_names
             ]
             return "{" + ", ".join(f"{a}: {p!r}" for a, p in items) + "}"
 
-        def fmt_callable(obj) -> str:
+        def fmt_callable(obj: Any) -> str:
+            """Format an injection entry point (callable/Target/name) for display."""
             if obj is None:
                 return "-"
-            path = getattr(obj, "_target_path", None)   # Target 实例
+            path = getattr(obj, "_target_path", None)   # a Target instance
             if path:
                 return path
             if isinstance(obj, str):
@@ -434,32 +468,36 @@ class ShardingPlan:
             return getattr(obj, "__qualname__", repr(obj))
 
         lines = [
-            "=== ShardingPlan 内省报告 ===",
+            "=== ShardingPlan introspection report ===",
             f"mesh_dim_names={self.mesh_dim_names}  "
             f"sequence_parallel={self.sequence_parallel}  "
             f"loss_parallel={self.loss_parallel}",
-            f"边界数: {len(self.modules)}  tied_pairs: "
-            + (", ".join(f"{a}↔{b}" for a, b in self.tied_pairs) or "无"),
+            f"boundaries: {len(self.modules)}  tied_pairs: "
+            + (", ".join(f"{a}<->{b}" for a, b in self.tied_pairs) or "none"),
         ]
         if fqn is not None and fqn not in self.modules:
-            lines.append(f"\n[!] {fqn!r} 不是 plan 中的边界（现有边界见上）")
+            lines.append(
+                f"\n[!] {fqn!r} is not a boundary of this plan "
+                "(existing boundaries listed above)")
             return "\n".join(lines)
         selected = (
             {fqn: self.modules[fqn]} if fqn is not None else self.modules)
 
         for name, spec in selected.items():
             lines.append(f"\n[{name}]")
-            # ── 参数切分表 ──
+            # ── parameter sharding table ──
             if spec.params:
-                lines.append("  参数切分:")
+                lines.append("  parameter sharding:")
                 for pname, named in spec.params.items():
                     lines.append(f"    {pname}: {fmt_named(named)}")
             else:
-                lines.append("  参数切分: 无（{} = 本边界不切参数，仅 I/O 缝合）")
+                lines.append(
+                    "  parameter sharding: none ({} = this boundary shards no "
+                    "parameters, I/O stitching only)")
             attr_plan = spec._tp_local_attr_plan
             if attr_plan is not None and (
                     attr_plan.auto_divide or attr_plan.user_divide):
-                lines.append("  TP-local 属性整除:")
+                lines.append("  TP-local attribute division:")
                 if attr_plan.auto_divide:
                     lines.append(
                         "    auto(D-17): " + ", ".join(attr_plan.auto_divide))
@@ -469,30 +507,33 @@ class ShardingPlan:
                         + ", ".join(attr_plan.user_divide))
             if spec._deferred_bias_params:  # pylint: disable=protected-access
                 lines.append(
-                    "  后置 bias（D-22，区域内不带 bias，TP 归约后恰好加一次）: "
+                    "  deferred bias (D-22, no bias inside the region, added "
+                    "exactly once after the TP reduction): "
                     + ", ".join(spec._deferred_bias_params))  # pylint: disable=protected-access
-            # ── 边界通信计划（编译结果，mesh=None 仅取 RedistOp 描述） ──
+            # ── boundary communication plan (compiled result; with mesh=None
+            #    only the RedistOp descriptions are taken) ──
             boundary = PrecompiledBoundary(spec, None, self.mesh_dim_names)
             if boundary.in_plan:
-                lines.append("  输入通信计划 (in_src → in_dst):")
+                lines.append("  input communication plan (in_src -> in_dst):")
                 for op in boundary.in_plan:
-                    tag = "直通" if op.collective_type == "identity" \
+                    tag = "passthrough" if op.collective_type == "identity" \
                         else op.collective_type
                     lines.append(
                         f"    {op.arg_name}: "
                         f"{tuple(map(repr, op.src_placements))}"
-                        f" → {tuple(map(repr, op.dst_placements))}  [{tag}]")
+                        f" -> {tuple(map(repr, op.dst_placements))}  [{tag}]")
             if boundary.out_plan:
-                lines.append("  输出通信计划 (out_src → out_dst):")
+                lines.append(
+                    "  output communication plan (out_src -> out_dst):")
                 for op in boundary.out_plan:
                     lines.append(
                         f"    {op.arg_name}(tuple[{op.arg_index}]): "
                         f"{tuple(map(repr, op.src_placements))}"
-                        f" → {tuple(map(repr, op.dst_placements))}"
+                        f" -> {tuple(map(repr, op.dst_placements))}"
                         f"  [{op.collective_type}]")
             if not boundary.in_plan and not boundary.out_plan:
-                lines.append("  边界通信: 无")
-            # ── 注入声明与解析 ──
+                lines.append("  boundary communication: none")
+            # ── injection declarations and resolution ──
             injection = []
             if spec.local_compute_fn is not None:
                 injection.append(
@@ -504,20 +545,25 @@ class ShardingPlan:
             if spec.inner_out_src is not None:
                 injection.append(f"inner_out_src={spec.inner_out_src}")
             if spec.region_dispatch is not None:
-                meaning = ("黑盒托管（区域内跳过传播校验，声明式重包）"
+                meaning = ("black-box managed (propagation check skipped "
+                           "inside the region, declarative re-wrap)"
                            if spec.region_dispatch is False
-                           else "dispatch 穿透（validate 真校验已启用）")
+                           else "dispatch-through (real validation under "
+                                "validate is enabled)")
                 injection.append(
-                    f"region_dispatch={spec.region_dispatch} → {meaning}")
+                    f"region_dispatch={spec.region_dispatch} -> {meaning}")
             if injection:
-                lines.append("  注入: " + "; ".join(injection))
+                lines.append("  injection: " + "; ".join(injection))
             else:
-                lines.append("  注入: 无（普通边界，validate 下 dispatch 穿透）")
-            # ── 特殊参数处理 ──
+                lines.append(
+                    "  injection: none (ordinary boundary, dispatch-through "
+                    "under validate)")
+            # ── special-parameter handling ──
             handlers = {k: v for k, v in self.special_handlers.items()
                         if k.startswith(name + ".")}
             for key, handler in handlers.items():
-                lines.append(f"  特殊处理: {key[len(name) + 1:]} → {handler}")
+                lines.append(
+                    f"  special handling: {key[len(name) + 1:]} -> {handler}")
         return "\n".join(lines)
 
 
@@ -582,10 +628,10 @@ def resolve_placements(
 
 
 _PLACEMENT_DSL_DOC = (
-    '"replicate" / "partial" / "shard(N)"（N 为张量维下标，如 "shard(0)"）')
+    '"replicate" / "partial" / "shard(N)" (N is the tensor dim index, e.g. "shard(0)")')
 
 
-def parse_placement(text, *, path: str = "placement") -> Placement:
+def parse_placement(text: Any, *, path: str = "placement") -> Placement:
     """Parse the YAML placement DSL string into a Placement object.
 
     Grammar (closed set): ``replicate`` / ``partial`` / ``shard(N)`` — case
@@ -595,7 +641,7 @@ def parse_placement(text, *, path: str = "placement") -> Placement:
     """
     if not isinstance(text, str):
         raise ValueError(
-            f"{path}: placement 必须是字符串（{_PLACEMENT_DSL_DOC}），"
+            f"{path}: placement must be a string ({_PLACEMENT_DSL_DOC}), "
             f"got {type(text).__name__} {text!r}")
     normalized = re.sub(r"\s+", "", text).lower()
     if normalized == "replicate":
@@ -606,10 +652,10 @@ def parse_placement(text, *, path: str = "placement") -> Placement:
     if match:
         return Shard(int(match.group(1)))
     raise ValueError(
-        f"{path}: 无法解析 placement {text!r} —— 合法文法：{_PLACEMENT_DSL_DOC}")
+        f"{path}: cannot parse placement {text!r} — valid grammar: {_PLACEMENT_DSL_DOC}")
 
 
-def parse_named_placement(raw, *, path: str = "named_placement") -> NamedPlacement:
+def parse_named_placement(raw: Any, *, path: str = "named_placement") -> NamedPlacement:
     """Parse the YAML form ``{axis: placement_str}`` into a NamedPlacement.
 
     Axis names stay plain strings (str-enum interop; custom mesh dims such as
@@ -619,12 +665,12 @@ def parse_named_placement(raw, *, path: str = "named_placement") -> NamedPlaceme
     """
     if not isinstance(raw, dict) or not raw:
         raise ValueError(
-            f"{path}: 期望非空映射 {{轴名: placement 字符串}}，got {raw!r}")
+            f"{path}: expected a non-empty mapping {{axis name: placement string}}, got {raw!r}")
     named: NamedPlacement = {}
     for axis, placement_text in raw.items():
         if not isinstance(axis, str) or not axis:
             raise ValueError(
-                f"{path}: 轴名必须是非空字符串，got {axis!r}")
+                f"{path}: axis name must be a non-empty string, got {axis!r}")
         named[axis] = parse_placement(
             placement_text, path=f"{path}.{axis}")
     return named
@@ -768,6 +814,6 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         nosp_in_dst={"x_BLD": _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())},
         nosp_out_src=_out(Partial(), Replicate()),
         nosp_out_dst=_out(Replicate(), Replicate()),
-        region_dispatch=False,           # MoE forward 自带 a2a，不可 dispatch
+        region_dispatch=False,           # MoE forward has its own a2a; dispatch not allowed
     ),
 }

@@ -13,9 +13,7 @@
 # limitations under the License.
 
 
-import os
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, List, Literal, Optional, Union
 
 import torch
 from torch import distributed as dist
@@ -62,5 +60,4 @@ def all_reduce(
 
     if data.numel() == 1:
         return data.item()
-    else:
-        return data.tolist()
+    return data.tolist()

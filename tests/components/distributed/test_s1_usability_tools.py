@@ -51,10 +51,10 @@ def plan(mesh):
 class TestPlanExplain:
     def test_report_contains_boundary_and_params(self, plan):
         report = plan.explain()
-        assert "ShardingPlan 内省报告" in report
+        assert "ShardingPlan introspection report" in report
         assert "[model.layers.0.self_attn]" in report
         assert "q_proj.weight" in report
-        assert "注入: 无（普通边界" in report
+        assert "injection: none (ordinary boundary" in report
 
     def test_fqn_filter(self, plan):
         report = plan.explain(fqn="model.layers.0.mlp")
@@ -63,7 +63,7 @@ class TestPlanExplain:
 
     def test_unknown_fqn_noted(self, plan):
         report = plan.explain(fqn="no.such.module")
-        assert "不是 plan 中的边界" in report
+        assert "is not a boundary of this plan" in report
 
     def test_injection_section_rendered(self, mesh):
         spec = ModuleShardingSpec(
@@ -74,7 +74,7 @@ class TestPlanExplain:
             plan_overrides={"*.mlp": spec}).plan(model, mesh, tp_size=1)
         report = p.explain(fqn="model.layers.0.mlp")
         assert "local_compute_fn=" in report
-        assert "region_dispatch=False → 黑盒托管" in report
+        assert "region_dispatch=False -> black-box managed" in report
 
     def test_planner_explain_flag_logs(self, mesh, caplog):
         torch.manual_seed(0)
@@ -88,7 +88,7 @@ class TestInsertSkeletonHint:
     def test_all_empty_insert_error_carries_skeleton(self, mesh):
         torch.manual_seed(0)
         model = TinyLlamaForCausalLM(TinyConfig())
-        with pytest.raises(ValueError, match="建议草稿") as exc_info:
+        with pytest.raises(ValueError, match="Suggested draft") as exc_info:
             ShardingPlanner(plan_overrides={
                 "model.layers.0": ModuleShardingSpec()}).plan(
                     model, mesh, tp_size=1)
@@ -108,14 +108,14 @@ class TestInjectionChoiceInfo:
             local_compute_fn=lambda m, x: x, region_dispatch=False)
         with caplog.at_level(logging.INFO):
             _log_injection_choice("model.layers.0.mlp", spec)
-        assert any("黑盒托管" in r.message for r in caplog.records)
+        assert any("black-box hosting" in r.message for r in caplog.records)
 
     def test_true_penetration_logged(self, caplog):
         spec = ModuleShardingSpec(
             inner_target="self", inner_wrapper="sdpa_hf", region_dispatch=True)
         with caplog.at_level(logging.INFO):
             _log_injection_choice("model.layers.0.self_attn", spec)
-        assert any("穿透真校验已启用" in r.message for r in caplog.records)
+        assert any("dispatch-through true validation enabled" in r.message for r in caplog.records)
 
     def test_plain_boundary_silent(self, caplog):
         with caplog.at_level(logging.INFO):
@@ -148,4 +148,4 @@ class TestCheckDispatchable:
         report = check_dispatchable(module, [torch.randn(2, 4)], mesh)
         assert report.dispatchable is True
         text = str(report)
-        assert "dispatchable: True" in text and "建议" in text
+        assert "dispatchable: True" in text and "recommendation" in text

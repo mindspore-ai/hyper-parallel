@@ -14,6 +14,8 @@
 # ============================================================================
 """YAML-callable learning-rate scheduler factories."""
 
+from typing import Any
+
 from hyper_parallel.core.optimizer.lr_scheduler import LRSchedulersContainer, get_constant_schedule_with_warmup, \
     get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
@@ -21,7 +23,23 @@ from hyper_parallel.core.optimizer.lr_scheduler import LRSchedulersContainer, ge
 class MultiLRScheduler:
     """Build one learning-rate scheduler for each child optimizer."""
 
-    def __init__(self, optimizer, lr_decay_style, train_iters, lr_config):
+    def __init__(
+        self,
+        optimizer: Any,
+        lr_decay_style: str,
+        train_iters: int,
+        lr_config: dict,
+    ) -> None:
+        """Initialize schedulers for every child optimizer.
+
+        Args:
+            optimizer: Optimizer or collection of optimizers to schedule.
+            lr_decay_style: One of ``constant``, ``linear`` or ``cosine``.
+            train_iters: Total number of training iterations.
+            lr_config: Mapping with warmup/decay settings such as
+                ``lr_warmup_ratio``, ``lr_warmup_steps``, ``lr_start``,
+                ``lr_decay_ratio`` and ``min_lr``.
+        """
         self.config = lr_config
         self.optimizer = optimizer
         self.lr_decay_style = lr_decay_style
@@ -35,7 +53,19 @@ class MultiLRScheduler:
         lr_decay_ratio = self.config.get('lr_decay_ratio', 1.0)
         min_lr = self.config.get('min_lr', self.config.get('lr_min', 1e-7))
 
-        def build_scheduler(optimizer):
+        def build_scheduler(optimizer: Any) -> Any:
+            """Build the LR scheduler for a single optimizer.
+
+            Args:
+                optimizer: The optimizer whose ``param_groups`` provide the
+                    initial learning rate.
+
+            Returns:
+                The configured learning-rate scheduler.
+
+            Raises:
+                ValueError: If ``lr_decay_style`` is not supported.
+            """
             init_lr = optimizer.param_groups[0]["lr"]
             if self.lr_decay_style == "constant":
                 return get_constant_schedule_with_warmup(
@@ -70,6 +100,6 @@ class MultiLRScheduler:
             scheduler=build_scheduler,
         )
 
-    def get_lr_scheduler(self):
+    def get_lr_scheduler(self) -> Any:
         """Return the scheduler container used by the trainer."""
         return self.lr_scheduler

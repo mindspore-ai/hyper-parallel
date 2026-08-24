@@ -21,7 +21,7 @@ Full implementation requires cut_cross_entropy package.
 from typing import Optional
 
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
 
 
@@ -33,7 +33,14 @@ class FusedLinearCrossEntropy(nn.Module):
     for memory efficiency (avoids materializing the full logits tensor).
     """
 
-    def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100):
+    def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100) -> None:
+        """Initialize the fused linear + cross-entropy loss module.
+
+        Args:
+            fp32_upcast: Whether to upcast inputs to float32 before the
+                matmul / CE computation for numerical stability.
+            ignore_index: Label index ignored by the cross-entropy loss.
+        """
         super().__init__()
         self.fp32_upcast = fp32_upcast
         self.ignore_index = ignore_index
@@ -48,11 +55,13 @@ class FusedLinearCrossEntropy(nn.Module):
         """Compute fused linear + cross-entropy loss.
 
         Args:
-            hidden_states: [B, S, H] final hidden states（lm_weight 提供时），
-                或预计算 logits [N, V]（lm_weight=None 时，对应
-                calculate_loss dispatcher 的 logits 降级路径）。
+            hidden_states: [B, S, H] final hidden states (when ``lm_weight``
+                is provided), or pre-computed logits [N, V] (when
+                ``lm_weight=None``, i.e. the logits fallback path of the
+                ``calculate_loss`` dispatcher).
             labels: [B, S] or [N] target indices.
-            lm_weight: [V, H] LM head weight；None 时 hidden_states 视为 logits。
+            lm_weight: [V, H] LM head weight; when None, ``hidden_states`` is
+                treated as pre-computed logits.
             num_label_tokens: Optional token count for normalization.
 
         Returns:
@@ -61,7 +70,7 @@ class FusedLinearCrossEntropy(nn.Module):
         if lm_weight is not None:
             logits = torch.matmul(hidden_states.float() if self.fp32_upcast else hidden_states, lm_weight.t())
         else:
-            # dispatcher 降级路径：hidden_states 即预计算 logits
+            # dispatcher fallback path: hidden_states are pre-computed logits
             logits = hidden_states.float() if self.fp32_upcast else hidden_states
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)

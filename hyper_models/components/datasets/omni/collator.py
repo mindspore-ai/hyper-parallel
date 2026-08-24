@@ -71,6 +71,13 @@ class VLMCollator:
             modal_field_specs: Optional[Mapping[str, FieldCollateSpec]] = None,
             metadata_collate_func: Optional[MetadataCollateFunc] = None,
     ) -> None:
+        """Store the text collator and reserved modality policies.
+
+        Args:
+            text_collator: LLM collator used for shared text fields.
+            modal_field_specs: Reserved modality field policies.
+            metadata_collate_func: Reserved model-provided metadata hook.
+        """
         self.text_collator = text_collator
         self.modal_field_specs = (
             dict(modal_field_specs)

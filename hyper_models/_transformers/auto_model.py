@@ -19,13 +19,14 @@ Stub — provides from_pretrained/from_config as entry points.
 """
 
 import logging
-from typing import Optional
+from typing import Any, Optional, Union
 
 import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
+    PretrainedConfig,
     PreTrainedModel,
 )
 
@@ -37,6 +38,7 @@ from hyper_models._transformers.model_init import _init_model
 from hyper_models._transformers.registry import get_hf_config, get_is_hf_model
 from hyper_models.components.distributed.infrastructure import DistributedSetup
 from hyper_models.components.utils.device import get_device_id, get_device_type  # pylint: disable=syntax-error
+from hyper_models.trainer.config import CompileConfig
 
 logger = logging.getLogger(__name__)
 
@@ -62,27 +64,29 @@ class _BaseHyperAutoModelClass:
         Used by the HF-native path in _init_model so that the model is loaded
         through the standard transformers checkpoint logic.
         """
-        return super().from_pretrained(*args, **kwargs)
+        # Mixin: `super()` resolves to the HF AutoModel base at runtime (see
+        # HyperAutoModelForCausalLM etc. below), which provides from_pretrained.
+        return super().from_pretrained(*args, **kwargs)  # pylint: disable=E1101
 
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        *model_args,
+        *model_args: Any,
         distributed_setup: Optional[DistributedSetup] = None,
-        backend=None,
-        peft_config=None,
-        torch_dtype="auto",
-        attn_implementation="sdpa",
+        backend: Optional[Any] = None,
+        peft_config: Optional[Any] = None,
+        torch_dtype: Union[str, torch.dtype] = "auto",
+        attn_implementation: str = "sdpa",
         force_hf: bool = False,
         validate_placement: bool = False,
-        qat_config=None,
-        fp8_config=None,
-        compile_config=None,
-        freeze_config=None,
+        qat_config: Optional[Any] = None,
+        fp8_config: Optional[Any] = None,
+        compile_config: Optional[Union[CompileConfig, dict]] = None,
+        freeze_config: Optional[Any] = None,
         activation_checkpoint: Optional[str] = None,
         activation_swap: str = "none",
-        **kwargs,
+        **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
 
@@ -140,16 +144,16 @@ class _BaseHyperAutoModelClass:
     @classmethod
     def from_config(  # pylint: disable=unused-argument
         cls,
-        config,
-        *model_args,
-        distributed_setup=None,
-        device_mesh=None,
-        backend=None,
-        torch_dtype="auto",
-        attn_implementation="sdpa",
+        config: PretrainedConfig,
+        *model_args: Any,
+        distributed_setup: Optional[DistributedSetup] = None,
+        device_mesh: Optional[Any] = None,
+        backend: Optional[Any] = None,
+        torch_dtype: Union[str, torch.dtype] = "auto",
+        attn_implementation: str = "sdpa",
         activation_checkpoint: Optional[str] = None,
         activation_swap: str = "none",
-        **kwargs,
+        **kwargs: Any,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
 
@@ -221,6 +225,10 @@ class _BaseHyperAutoModelClass:
         Step 3-12: apply_model_infrastructure (PP, PEFT, QAT, ShardingPlan,
         activation checkpoint, FSDP2, load, layer compile)
         """
+        # Lazy imports: no_init_weights moved between transformers submodules
+        # across versions (hence the ImportError fallback), and deferring
+        # model_utils keeps this module's import-time dependency graph small.
+        # pylint: disable=import-outside-toplevel
         from contextlib import nullcontext
         from transformers.modeling_utils import ContextManagers
         try:
@@ -228,6 +236,7 @@ class _BaseHyperAutoModelClass:
         except ImportError:
             from transformers.initialization import no_init_weights
         from hyper_models.components.utils.model_utils import init_empty_weights
+        # pylint: enable=import-outside-toplevel
 
         # Step 1: Determine meta device
         from hyper_models.components.distributed.init_utils import (  # pylint: disable=import-outside-toplevel

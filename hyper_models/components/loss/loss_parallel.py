@@ -83,6 +83,15 @@ def causal_lm_loss_parallel(
             local_chunk: torch.Tensor,
             label_chunk: torch.Tensor,
         ) -> torch.Tensor:
+            """Compute the summed distributed cross entropy for one token chunk.
+
+            Args:
+                local_chunk: Local vocab-sharded logits for this chunk.
+                label_chunk: Flattened target labels for this chunk.
+
+            Returns:
+                The summed cross-entropy loss over the chunk.
+            """
             chunk_logits = DTensor.from_local(
                 local_chunk.float(),
                 tp_mesh,

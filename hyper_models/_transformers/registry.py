@@ -21,9 +21,9 @@ import importlib
 import logging
 from collections import OrderedDict
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ def _resolve_custom_model_cls(arch_name: str) -> Optional[type]:
         return None
 
 
-def get_is_hf_model(config, force_hf: bool = False) -> bool:
+def get_is_hf_model(config: PretrainedConfig, force_hf: bool = False) -> bool:
     """Determine whether to use HF native implementation.
 
     Returns:
@@ -94,9 +94,9 @@ def get_is_hf_model(config, force_hf: bool = False) -> bool:
 def get_hf_config(
     path: str,
     attn_implementation: str = "sdpa",
-    torch_dtype="auto",
-    **kwargs,
-):
+    torch_dtype: Any = "auto",
+    **kwargs: Any,
+) -> PretrainedConfig:
     """Wrap AutoConfig.from_pretrained with unified attn_implementation/dtype injection.
 
     Following design doc 01 §5.1.

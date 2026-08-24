@@ -109,7 +109,7 @@ class CheckpointerCallback(Callback):
     # Hook dispatchers
     # ------------------------------------------------------------------
 
-    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+    def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
         """Log the checkpoint configuration and restore any requested state."""
         logger.info(
             "Checkpoint configuration: "
@@ -127,14 +127,14 @@ class CheckpointerCallback(Callback):
         )
         self._load_checkpoint()
 
-    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
         """Save on the configured step cadence."""
         if self._save_steps > 0 and state.global_step % self._save_steps == 0:
             if state.global_step == self._last_saved_step:
                 return
             self._save_checkpoint(state)
 
-    def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
+    def on_epoch_end(self, state: TrainerState, **kwargs: Any) -> None:
         """Save on the configured epoch cadence."""
         if self._save_epochs > 0 and (state.epoch + 1) % self._save_epochs == 0:
             if state.global_step != self._last_saved_step:
@@ -146,7 +146,7 @@ class CheckpointerCallback(Callback):
                     state.global_step,
                 )
 
-    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+    def on_train_end(self, state: TrainerState, **kwargs: Any) -> None:
         """Persist the final step, then drain any in-flight async save.
 
         Always saved when saving is on and the step is not already on disk:

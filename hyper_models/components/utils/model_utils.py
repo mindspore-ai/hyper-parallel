@@ -20,21 +20,40 @@ when available.
 """
 
 from contextlib import contextmanager
+from typing import Iterator, Optional
 
 import torch
 from torch import nn
 
 
 @contextmanager
-def init_empty_weights(include_buffers: bool = False):
+def init_empty_weights(include_buffers: bool = False) -> Iterator[None]:  # pylint: disable=unused-argument
     """Context manager where nn.Parameter/Buffer are allocated on meta device.
 
     Stub implementation based on the standard "meta" dispatch trick.
+
+    Args:
+        include_buffers: Kept for API compatibility with accelerate's
+            ``init_empty_weights``; currently unused by this stub.
+
+    Yields:
+        None.
     """
     device = torch.device("meta")
     old_register_parameter = nn.Module.register_parameter
 
-    def register_empty_parameter(module, name, param):
+    def register_empty_parameter(
+        module: nn.Module,
+        name: str,
+        param: Optional[torch.Tensor],
+    ) -> None:
+        """Register ``param`` on ``module`` after moving it to the meta device.
+
+        Args:
+            module: Target module.
+            name: Parameter name.
+            param: Parameter to register, or None.
+        """
         old_register_parameter(module, name, param)
         if param is not None:
             param_cls = type(module._parameters[name])

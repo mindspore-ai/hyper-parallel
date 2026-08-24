@@ -77,6 +77,7 @@ def _wrap_module_forward(module: Any) -> None:
 
     @functools.wraps(original_forward)
     def local_param_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run forward with directly owned DTensor parameters unwrapped locally."""
         if not _LOCAL_COMPUTE_ACTIVE.get():
             return original_forward(*args, **kwargs)
         saved = []

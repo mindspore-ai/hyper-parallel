@@ -31,6 +31,18 @@ logger = get_dataset_logger(__name__)
 
 
 def _get_record_value(sample: Mapping[str, Any], keys: TextKeys) -> Any:
+    """Read the text field named by one key or the first matching candidate key.
+
+    Args:
+        sample: Raw source record.
+        keys: One field name or an ordered list of candidate field names.
+
+    Returns:
+        The value of the resolved text field.
+
+    Raises:
+        ValueError: If none of the configured fields exist in the sample.
+    """
     if isinstance(keys, str):
         try:
             return sample[keys]
@@ -69,6 +81,7 @@ class PlaintextTransform:
     text_keys: TextKeys = "text"
 
     def __post_init__(self) -> None:
+        """Validate the tokenizer and sequence length configuration."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required for plaintext data")
         if self.max_seq_len <= 0:
@@ -103,6 +116,7 @@ class ConversationTransform:
     text_keys: TextKeys = "conversation"
 
     def __post_init__(self) -> None:
+        """Validate the chat template and sequence length configuration."""
         if self.chat_template is None:
             raise ValueError("chat_template is required for conversation data")
         if self.max_seq_len <= 0:
@@ -123,6 +137,7 @@ class PretokenizedTransform:
     max_seq_len: int | None = None
 
     def __post_init__(self) -> None:
+        """Validate the optional sequence length limit."""
         if self.max_seq_len is not None and self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive or None")
 

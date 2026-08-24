@@ -17,7 +17,6 @@
 get_world_size_safe / get_rank_safe: safe wrappers around torch.distributed.
 """
 
-import torch
 import torch.distributed as dist
 
 

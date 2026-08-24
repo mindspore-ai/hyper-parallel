@@ -49,7 +49,9 @@ class QuantizedLinearBase(nn.Linear, ABC):
         # temporary weight before we replace it. This remains safe for large
         # model conversion and meta-device construction.
         converted = cls.__new__(cls)
-        nn.Module.__init__(converted)
+        # Deliberately invoke nn.Module.__init__ directly to skip
+        # nn.Linear.__init__'s allocation; super() cannot express this.
+        nn.Module.__init__(converted)  # pylint: disable=unnecessary-dunder-call
         converted.in_features = linear.in_features
         converted.out_features = linear.out_features
         converted.register_parameter("weight", linear.weight)

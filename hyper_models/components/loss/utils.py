@@ -17,9 +17,7 @@
 from typing import Any, Optional
 
 import torch
-import torch.nn as nn
-
-from hyper_models.components.loss.masked_ce import MaskedCrossEntropy
+from torch import nn
 
 # FusedLinearCrossEntropy is a stub placeholder — actual implementation
 # depends on cut_cross_entropy or similar fused kernel. The dispatcher
@@ -43,7 +41,7 @@ def _get_lm_head_weight(model: nn.Module) -> Optional[torch.Tensor]:
     return None
 
 
-def calculate_loss(loss_fn: nn.Module, **kwargs) -> torch.Tensor:
+def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
     """Unified loss calculation dispatcher.
 
     Follows design doc §10:
@@ -101,15 +99,14 @@ def calculate_loss(loss_fn: nn.Module, **kwargs) -> torch.Tensor:
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
         )
-    else:
-        # rank_average: mean-scale loss
-        return loss_fn(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-        )
+    # rank_average: mean-scale loss
+    return loss_fn(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+    )
 
 
-def calculate_mtp_loss(
+def calculate_mtp_loss(  # pylint: disable=unused-argument
     mtp_per_depth_logits: list[torch.Tensor],
     mtp_per_depth_h: list[torch.Tensor],
     labels: torch.Tensor,
@@ -118,6 +115,17 @@ def calculate_mtp_loss(
     """Multi-Token-Prediction auxiliary loss.
 
     Computes CE per depth and sums them.
+
+    Args:
+        mtp_per_depth_logits: Per-depth logits from the MTP heads.
+        mtp_per_depth_h: Per-depth hidden states. Reserved for future MTP
+            variants that condition the loss on hidden states; currently
+            unused.
+        labels: Target token indices.
+        loss_fn: Loss module applied per depth.
+
+    Returns:
+        Summed MTP loss over all depths.
     """
     total_mtp_loss = torch.tensor(0.0, device=labels.device, dtype=torch.float32)
     for depth_idx, logits in enumerate(mtp_per_depth_logits):

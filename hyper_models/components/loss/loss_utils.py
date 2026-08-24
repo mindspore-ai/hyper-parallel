@@ -99,7 +99,7 @@ def mean_global_loss(
         losses = {"foundation_loss": losses}
 
     for key, cur_loss in losses.items():
-        loss_name = key.split("_loss")[0]  # foundation/image_decoder/**
+        loss_name = key.split("_loss", maxsplit=1)[0]  # foundation/image_decoder/**
 
         cur_token_len = current_token_counts[f"{loss_name}_tokens"]
         if sequence_parallel:

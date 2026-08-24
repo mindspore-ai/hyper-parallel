@@ -93,4 +93,3 @@ class RuntimeBatchAdapter:
         )
         model_inputs, loss_inputs = self.processor.prepare_batch(distributed_batch)
         return model_inputs, loss_inputs
-

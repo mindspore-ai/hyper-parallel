@@ -64,7 +64,6 @@ class DCPBackend(Protocol):
         **kwargs: Any,
     ) -> Any:
         """Load a DCP checkpoint into the supplied sharded state dict."""
-        ...
 
     def save(
         self,
@@ -74,7 +73,6 @@ class DCPBackend(Protocol):
         **kwargs: Any,
     ) -> Any:
         """Save the supplied sharded state dict as DCP."""
-        ...
 
 
 @dataclass(frozen=True)
@@ -312,6 +310,7 @@ class CheckpointManager:
         *,
         dcp_backend: DCPBackend | None = None,
     ) -> None:
+        """Bind the manager to one finalized model and an optional DCP backend."""
         self.model = model
         self.dcp_backend = dcp_backend
 

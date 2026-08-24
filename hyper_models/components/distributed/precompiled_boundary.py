@@ -116,7 +116,7 @@ class RedistOp:
     collective_type: str
     execution_op: Optional[BoundaryExecutionOp] = None
 
-    def execute(self, tensor: torch.Tensor, *, as_dtensor: bool = False):
+    def execute(self, tensor: torch.Tensor, *, as_dtensor: bool = False) -> Any:
         """Execute the communication.
 
         Args:
@@ -153,12 +153,23 @@ class PrecompiledBoundary:
 
     def __init__(
         self,
-        spec,
-        mesh,
-        mesh_dim_names,
+        spec: Any,
+        mesh: Any,
+        mesh_dim_names: Sequence[str],
         *,
         op_lowerer: Optional[BoundaryOpLowerer] = None,
-    ):
+    ) -> None:
+        """Compile the in/out RedistOp plans for one module boundary.
+
+        Args:
+            spec: ModuleShardingSpec carrying the in_src/in_dst/out_src/out_dst
+                placement contracts.
+            mesh: DeviceMesh the redistributions execute on.
+            mesh_dim_names: Ordered mesh dimension names used to resolve
+                placement shorthands.
+            op_lowerer: Optional lowerer that turns a (src, dst) placement
+                transition into a local-tensor execution op.
+        """
         self.spec = spec
         self.mesh = mesh
         self.mesh_dim_names = tuple(mesh_dim_names)
@@ -176,8 +187,9 @@ class PrecompiledBoundary:
         """Compile the input communication plan from in_src → in_dst (identity
         dimensions naturally compile to pass-through ops)."""
         plan = []
-        in_src = spec.in_src or {}   # None 容错：手写 spec（调试捷径）可能
-        in_dst = spec.in_dst or {}   # 未经 plan 规范化（"不写继承"输入侧语义）
+        in_src = spec.in_src or {}   # tolerate None: a hand-written spec (debug
+        in_dst = spec.in_dst or {}   # shortcut) may not be normalized by the plan
+        # (the input-side semantics of "inherit when not declared")
         all_names = set(in_src.keys()) | set(in_dst.keys())
         for name in sorted(all_names):
             src_p = tuple(resolve_placements(
@@ -231,7 +243,13 @@ class PrecompiledBoundary:
 
     # ── Runtime execution ───────────────────────────────────────────────
 
-    def redistribute_inputs(self, args, kwargs, *, as_dtensor=False):
+    def redistribute_inputs(
+        self,
+        args: Sequence[Any],
+        kwargs: dict,
+        *,
+        as_dtensor: bool = False,
+    ) -> Tuple[Sequence[Any], dict]:
         """Execute input redistribution. as_dtensor=True → return DTensors (validate mode).
 
         When an arg is not found in args/kwargs (None) the op is skipped —
@@ -246,7 +264,7 @@ class PrecompiledBoundary:
             args, kwargs = _set_arg(args, kwargs, op.arg_name, op.arg_index, result)
         return args, kwargs
 
-    def redistribute_outputs(self, outputs, *, as_dtensor_input=False):
+    def redistribute_outputs(self, outputs: Any, *, as_dtensor_input: bool = False) -> Any:
         """Execute output redistribution (single Tensor output / multi-output
         tuple, order preserved, same structure returned).
 

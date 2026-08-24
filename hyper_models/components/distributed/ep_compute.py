@@ -162,7 +162,8 @@ def _build_ep_compute(
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
 
-    def compute_fn(module, hidden_states):
+    def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the routed branch and compose the MoE block output."""
         routed = ep_routed_forward(
             module, hidden_states, router_fn=router_fn, ep_group=ep_group)
         return combine(module, hidden_states, routed)
@@ -215,7 +216,8 @@ def mixtral_ep_compute_fn(
     _require_moe_interface(module, ["gate", "experts"], "mixtral_topk_router")
     bind_local_expert_forward(module, ep_mesh["ep"].size())
 
-    def compute_fn(module, hidden_states):
+    def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply router jitter when training, then run the routed branch."""
         jitter_noise = float(getattr(module, "jitter_noise", 0.0))
         if module.training and jitter_noise > 0.0:
             noise = torch.empty_like(hidden_states).uniform_(
@@ -282,7 +284,12 @@ def qwen2moe_ep_compute_fn(
     """
     del mesh, tp_mesh, cp_mesh
 
-    def combine(module, hidden_states, routed):
+    def combine(
+        module: Any,
+        hidden_states: torch.Tensor,
+        routed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Merge the routed branch with the gated shared-expert branch."""
         shared = module.shared_expert(hidden_states)            # nested boundary
         gate = torch.sigmoid(module.shared_expert_gate(hidden_states))
         return routed + gate * shared
@@ -318,7 +325,12 @@ def deepseekv3_ep_compute_fn(
     """
     del mesh, tp_mesh, cp_mesh
 
-    def combine(module, hidden_states, routed):
+    def combine(
+        module: Any,
+        hidden_states: torch.Tensor,
+        routed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Merge the routed branch with the shared-experts branch."""
         return routed + module.shared_experts(hidden_states)    # nested boundary
 
     return _build_ep_compute(

@@ -34,6 +34,18 @@ class _DatasetTokenizer:
             pad_token_id: int | None = None,
             **tokenizer_options: Any,
     ) -> None:
+        """Record the tokenizer identity and validate the special token configuration.
+
+        Args:
+            *tokenizer_paths: Tokenizer source paths recorded in the cache identity.
+            vocab_size: Pretokenized-corpus vocabulary size.
+            eod_token_id: Pretokenized-corpus end-of-document token ID.
+            pad_token_id: Pretokenized-corpus padding token ID, when one exists.
+            **tokenizer_options: Extra options recorded in the cache identity.
+
+        Raises:
+            ValueError: If the special token configuration is incomplete or out of range.
+        """
         if (vocab_size is None) != (eod_token_id is None):
             raise ValueError("vocab_size and eod_token_id must be provided together")
         if vocab_size is not None and eod_token_id is not None:
@@ -88,6 +100,17 @@ class _HFAutoTokenizer(_DatasetTokenizer):
             trust_remote_code: bool,
             **kwargs: Any,
     ) -> None:
+        """Load a Hugging Face tokenizer and expose the Dataset identity contract.
+
+        Args:
+            pretrained_model_name_or_path: Model identifier or local tokenizer path.
+            *args: Extra positional arguments forwarded to ``HFAutoTokenizer.from_pretrained``.
+            trust_remote_code: Whether to trust remote code when loading the tokenizer.
+            **kwargs: Extra keyword arguments forwarded to ``HFAutoTokenizer.from_pretrained``.
+
+        Raises:
+            ValueError: If the tokenizer defines neither ``eod`` nor ``eos_token_id``.
+        """
         tokenizer_options = dict(kwargs)
         tokenizer_options["trust_remote_code"] = trust_remote_code
         if args:
@@ -152,8 +175,8 @@ class AutoTokenizer:
     @classmethod
     def from_pretrained(
             cls,
-            pretrained_model_name_or_path: str | None = None,
-            *args,
+            pretrained_model_name_or_path: str | None,
+            *args: Any,
             force_default: bool = False,
             force_hf: bool = True,
             trust_remote_code: bool = False,
@@ -161,13 +184,14 @@ class AutoTokenizer:
             vocab_size: int | None = None,
             eod_token_id: int | None = None,
             pad_token_id: int | None = None,
-            **kwargs,
+            **kwargs: Any,
     ) -> Any:
         """
         Load a tokenizer from a pretrained model.
 
         Args:
             pretrained_model_name_or_path: Tokenizer path used for loading or stable Dataset cache identity.
+            *args: Additional positional arguments passed to the tokenizer's from_pretrained.
             force_default: If True, always use NeMoAutoTokenizerWithBosEosEnforced
             force_hf: If True, build a wrapped Hugging Face tokenizer.
             trust_remote_code: Whether to trust remote code when loading config
@@ -180,6 +204,8 @@ class AutoTokenizer:
         Returns:
             A tokenizer instance appropriate for the model type
         """
+        # ``force_default`` is retained for NeMo API compatibility; only the HF backend is supported.
+        del force_default
         if tokenizer_type == "pretokenized":
             if pretrained_model_name_or_path is None:
                 raise ValueError("pretrained_model_name_or_path is required for a pretokenized Dataset")
@@ -238,4 +264,5 @@ __all__ = [
 
 
 def __dir__():
+    """Limit module autocompletion to the public API."""
     return sorted(__all__)

@@ -118,10 +118,11 @@ class MeshContext:
 
     @property
     def pp_enabled(self) -> bool:
+        """Whether pipeline parallelism is enabled (pp_size > 1)."""
         return self.pp_size > 1
 
     @property
-    def dp_cp_mesh(self):
+    def dp_cp_mesh(self) -> Any:
         """DP+CP joint mesh for all-reduce.
 
         Mirrors the derivation in ``FinetuneRecipe.setup()``: take the DP
@@ -149,7 +150,7 @@ class MeshContext:
         return sub
 
     @property
-    def cp_mesh(self):
+    def cp_mesh(self) -> Any:
         """CP submesh for CP utilities (e.g. shard_batch_for_cp).
 
         Returns ``None`` when context parallelism is disabled (cp_size == 1)
@@ -287,10 +288,11 @@ class DistributedSetup:
     pipeline_config: Any = None
     moe_parallel_config: Any = None
     activation_checkpointing: Any = None
-    # TrainerConfig.plan_overrides (List[PlanOverride]) — plan_overrides 的
-    # YAML 传输形态（注入字段 + 契约 DSL + when 条件）；
-    # instantiate_infrastructure 在构造 planner 前经 entries_to_plan_overrides
-    # 脱糖（含 when 过滤）
+    # TrainerConfig.plan_overrides (List[PlanOverride]) — the YAML transport
+    # form of plan_overrides (injected fields + contract DSL + when
+    # conditions); instantiate_infrastructure desugars it via
+    # entries_to_plan_overrides (including when filtering) before building
+    # the planner
     plan_overrides: Any = None
     # TrainingConfig.training.low_precision. Kept on the setup so model
     # construction and sharding consume one resolved policy object.

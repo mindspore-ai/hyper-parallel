@@ -21,7 +21,7 @@ Stub — creates ShardingPlanner, FSDP2Manager, and AutoPipeline.
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 from torch import nn
@@ -38,7 +38,8 @@ from hyper_models.components.activation_swap.attention_swap import (
 )
 from hyper_models.components.compile import apply_compile
 from hyper_models.components.distributed.fsdp2 import FSDP2Manager, _instantiate_fsdp2
-from hyper_models.components.distributed.pipelining import _instantiate_pipeline
+from hyper_models.components.distributed.infrastructure import DistributedSetup, MeshContext
+from hyper_models.components.distributed.pipelining import AutoPipeline, _instantiate_pipeline
 from hyper_models.components.distributed.sharding_applier import apply_sharding_plan
 from hyper_models.components.distributed.sharding_planner import ShardingPlanner
 from hyper_models.trainer.config import (
@@ -88,9 +89,9 @@ def _apply_activation_checkpointing(
 
 
 def instantiate_infrastructure(
-    distributed_setup=None,
-    device=None,
-    **kwargs,
+    distributed_setup: Optional[DistributedSetup] = None,
+    device: Optional[torch.device] = None,
+    **kwargs: Any,
 ) -> tuple[Any, Any, Any]:
     """Instantiate distributed infrastructure components.
 
@@ -602,25 +603,25 @@ def _apply_module_replacement_actions(
 
 def apply_model_infrastructure(
     model: nn.Module,
-    mesh=None,
-    sharding_planner=None,
-    fsdp2_manager=None,
-    autopipeline=None,
-    peft_config=None,
-    qat_config=None,
-    fp8_config=None,
-    freeze_config=None,
-    compile_config=None,
+    mesh: Optional[MeshContext] = None,
+    sharding_planner: Optional[ShardingPlanner] = None,
+    fsdp2_manager: Optional[FSDP2Manager] = None,
+    autopipeline: Optional[AutoPipeline] = None,
+    peft_config: Optional[Any] = None,
+    qat_config: Optional[Any] = None,
+    fp8_config: Optional[Any] = None,
+    freeze_config: Optional[Any] = None,
+    compile_config: Optional[Union[CompileConfig, dict]] = None,
     activation_checkpoint: Optional[str] = None,
     activation_swap: str = "none",
     is_meta_device: bool = False,
     is_hf_model: bool = False,
-    device=None,
+    device: Optional[torch.device] = None,
     load_base_model: bool = False,
     pretrained_path: Optional[str] = None,
     validate_placement: bool = False,
-    low_precision_config=None,
-    **kwargs,
+    low_precision_config: Optional[Any] = None,
+    **kwargs: Any,
 ) -> nn.Module:
     """Apply model infrastructure (sharding, recompute, FSDP2, and compile).
 
