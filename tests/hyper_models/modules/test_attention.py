@@ -55,6 +55,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(
+    "module_type",
+    (MLAAttention, DeepseekV32DSAAttention, DSAAttention),
+)
+def test_attention_module_supports_declarative_replacement(module_type: type[nn.Module]) -> None:
+    """Expose every Attention replacement through Trainer plan_overrides."""
+    assert getattr(module_type, "_hp_module_replacement", False)
+
+
 def _position_ids(batch_size: int, sequence_length: int) -> torch.Tensor:
     """Build position ids on the active NPU."""
     return torch.arange(sequence_length, device="npu").expand(batch_size, -1)
@@ -610,7 +619,7 @@ def test_dsa_attention_runs_real_custom_ops_forward_and_backward() -> None:
     torch.manual_seed(4)
     source = _PanguDSASource().to(device="npu", dtype=torch.bfloat16).train()
     replacement = DSAAttention(module=source).train()
-    assert not replacement.make_transforms()
+    assert not hasattr(replacement, "make_transforms")
     probe = torch.empty((1, 1, 256), device="npu", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="does not consume attention_mask"):
         replacement(probe, attention_mask=torch.ones(1, 1, device="npu"))

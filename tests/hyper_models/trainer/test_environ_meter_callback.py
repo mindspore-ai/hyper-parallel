@@ -44,7 +44,7 @@ def test_environ_meter_callback_publishes_structured_metrics(monkeypatch) -> Non
     micro_batches = [
         {
             "input_ids": torch.ones(2, 4, dtype=torch.int64),
-            "labels": torch.ones(2, 4, dtype=torch.int64),
+            "labels": torch.tensor([[1, 1, 1, -100], [1, 1, -100, -100]]),
             "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]]),
         }
     ]

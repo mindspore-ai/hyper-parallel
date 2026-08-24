@@ -26,10 +26,12 @@ from torch import nn
 from transformers.core_model_loading import WeightConverter
 
 from hyper_models.components.checkpoint import ConcatenateWithSections
+from hyper_models.components.model_transform import module_replacement
 from hyper_models.ops import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
 from hyper_models.ops import npu_fusion_attention_forward
 
 
+@module_replacement
 class MLAAttention(nn.Module):
     """Transformers-compatible MLA using a fused latent projection.
 

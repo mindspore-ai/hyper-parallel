@@ -27,6 +27,7 @@ from torch.nn import functional as F
 from transformers.core_model_loading import WeightConverter
 
 from hyper_models.components.checkpoint import ConcatenateWithSections
+from hyper_models.components.model_transform import module_replacement
 from hyper_models.ops import aggregate_hidden, aux_loss_auto_scale
 from hyper_models.ops import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
 from hyper_models.ops import (
@@ -71,6 +72,7 @@ def apply_mome(
     return hidden_states + mixed_states
 
 
+@module_replacement
 class DeepseekV32DSAAttention(nn.Module):
     """NPU DSA replacement for Transformers ``DeepseekV32Attention``.
 
@@ -468,6 +470,7 @@ class DeepseekV32DSAAttention(nn.Module):
         return attn_output, None
 
 
+@module_replacement
 class DSAAttention(nn.Module):
     """NPU replacement for a Pangu-compatible DSA attention module.
 
@@ -563,10 +566,6 @@ class DSAAttention(nn.Module):
             self.param_sink_k_pe = module.param_sink_k_pe
             self.param_sink_compressed_kv = module.param_sink_compressed_kv
         self.train(module.training)
-
-    def make_transforms(self) -> list[WeightConverter]:
-        """Return no transforms because all source parameter names are preserved."""
-        return []
 
     @staticmethod
     def _get_actual_seq_len(
