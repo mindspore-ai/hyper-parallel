@@ -172,7 +172,7 @@ checkpoint:
 
 debug:
   check_nan_inf: false
-  check_dataset: false
+  check_dataset: null
 
 profiling:
   enabled: false
