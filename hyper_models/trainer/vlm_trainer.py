@@ -183,7 +183,9 @@ class VLMTrainer:
         for _ in range(1, num_micro_steps):
             training_batches.append(self.base.get_batch(data_iterator))
 
-        self.on_step_begin(micro_batches=training_batches)
+        self.on_step_begin(
+            micro_batches=[model_inputs for model_inputs, _ in training_batches]
+        )
         synchronize()
 
         total_loss = 0.0

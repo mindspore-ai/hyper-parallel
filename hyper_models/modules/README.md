@@ -14,11 +14,19 @@ Python or declaratively replace existing model modules through Trainer YAML.
 
 Reusable high-performance functions are provided separately in [`hyper_models.ops`](../ops/README.md).
 
+Modules can also be constructed directly:
+
+```python
+from hyper_models.modules import RMSNorm
+
+norm = RMSNorm(hidden_size=4096, eps=1e-6).npu()
+output = norm(hidden_states)
+```
+
 ## Install custom operators
 
-Some modules depend on the training operators from
-[Omni Ops](https://gitee.com/omniai/omni-ops). Ensure that CANN, PyTorch and `torch_npu` are compatible before
-building the operators.
+Some modules depend on the training operators from [Omni Ops](https://gitee.com/omniai/omni-ops). Ensure that CANN,
+PyTorch and `torch_npu` are compatible before building the operators.
 
 ```bash
 git clone https://gitee.com/omniai/omni-ops.git
@@ -26,29 +34,47 @@ cd omni-ops
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
 
-Build and install the AscendC operator package. Replace `ascend910_93` with the target SoC when needed.
+The `-c` option selects the target SoC. Omni Ops currently supports `ascend910b`, `ascend910_93`, and `ascend950`.
+For example:
 
 ```bash
 cd training/ascendc
+
+# Select the command for the target device:
+# Ascend 910B:   bash build.sh -c ascend910b
+# Ascend 910_93: bash build.sh -c ascend910_93
+# Ascend 950:    bash build.sh -c ascend950
+
+# Example: build for Ascend 910_93
 bash build.sh -c ascend910_93
-
-cd output
-chmod +x CANN-omni_training_custom_ops--linux.<arch>.run
-./CANN-omni_training_custom_ops--linux.<arch>.run \
-  --quiet \
-  --install-path=${ASCEND_HOME_PATH}/opp
-
-source ${ASCEND_HOME_PATH}/opp/vendors/omni_training_custom_transformer/bin/set_env.bash
 ```
 
-Build and install the PyTorch Adapter wheel:
+Install the generated AscendC operator package:
+
+```bash
+cd output
+
+omni_operator_package="CANN-omni_training_custom_ops--linux.$(uname -m).run"
+chmod +x "${omni_operator_package}"
+"./${omni_operator_package}" \
+  --quiet \
+  --install-path="${ASCEND_HOME_PATH}/opp"
+
+source "${ASCEND_HOME_PATH}/opp/vendors/omni_training_custom_transformer/bin/set_env.bash"
+```
+
+The PTA build script installs the wheel into the active Python environment. Activate the target environment first,
+then build and install the wheel:
 
 ```bash
 cd ../torch_ops_extension
+
+which python3
+which pip3
 bash build_and_install.sh
 ```
 
-The vendor environment must be sourced again in each new shell before running modules that use Omni Ops.
+Source the vendor environment in each new shell before using modules that depend on Omni Ops.
 
 ## Replace modules through YAML
 
@@ -79,23 +105,22 @@ plan_overrides:
       _target_: hyper_models.modules.RMSNorm
 ```
 
-- `match` is a module FQN or glob pattern. A list can be used when the same replacement applies to several paths.
-- `module_type` is the import path of the source module and prevents unintended replacements.
-- `exact_type: true` matches only the declared type rather than its subclasses.
-- `replace_module._target_` selects the high-performance replacement.
+- `match` specifies module FQN patterns from `model.named_modules()`. A list is supported when the same replacement
+  applies to multiple paths.
+- `module_type` specifies the source module type. Set `exact_type: true` to exclude subclasses.
+- `replace_module._target_` specifies the high-performance replacement.
 
-Use names from `model.named_modules()` when adapting a new model. Trainer reports an error when a pattern matches no
-module, the source type is incompatible, or required weight conversion cannot be applied.
+Invalid patterns, incompatible module types and unavailable weight conversions raise an error.
 
-Modules that change checkpoint layout declare reversible conversions through `make_transforms()`. Modules whose
-layout is unchanged reuse the source parameters directly.
+Replacements use `make_transforms()` only when parameter names or layouts change. Otherwise, they reuse the source
+parameters directly.
 
 ## Run training
 
-Use the regular Trainer entry point and pass the YAML containing `plan_overrides`:
+Add `plan_overrides` to the training YAML and run the corresponding Trainer entry point. For VLM training:
 
 ```bash
-source ${ASCEND_HOME_PATH}/opp/vendors/omni_training_custom_transformer/bin/set_env.bash
+source "${ASCEND_HOME_PATH}/opp/vendors/omni_training_custom_transformer/bin/set_env.bash"
 
 torchrun \
   --nproc_per_node=8 \
@@ -103,5 +128,5 @@ torchrun \
   path/to/train.yaml
 ```
 
-Before a performance run, use a short sequence to verify checkpoint loading, forward, backward and one optimizer
-step. Keep all other training settings unchanged when comparing the baseline and replacement configurations.
+Run one complete training step first to verify checkpoint loading, forward and backward. For performance comparisons,
+keep the training configuration unchanged and only add or remove `plan_overrides`.
