@@ -108,6 +108,10 @@ class ParallelBatch:
         self.pp_shared_data = pp_shared_data
         self.attention_mode = attention_mode
         self.cp_algorithm = cp_algorithm
+        self.labels_are_shifted = bool(self.data_config.get("labels_are_shifted", False))
+        self.create_attention_mask = bool(
+            self.data_config.get("create_attention_mask_in_dataloader", attention_mode == "dense")
+        )
         self.cp_sharder = CPBatchSharder(self.parallel_context)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
 
@@ -279,6 +283,9 @@ class ParallelBatch:
         attention_mask = None
         swa_mask = None
         packed_seq_params = None
+        if not self.create_attention_mask:
+            return attention_mask, swa_mask, packed_seq_params
+
         mask_compress = self.attention_mode == "compressed"
 
         if mask_compress:
@@ -318,6 +325,8 @@ class ParallelBatch:
             "position_ids": parallel_batch["position_ids"],
             "attention_mask": parallel_batch["attention_mask"],
         }
+        if self.labels_are_shifted:
+            model_inputs["shift_labels"] = parallel_batch["labels"]
         if parallel_batch["swa_mask"] is not None:
             model_inputs["swa_mask"] = parallel_batch["swa_mask"]
         if parallel_batch["packed_seq_params"] is not None:
@@ -327,5 +336,7 @@ class ParallelBatch:
             "labels": parallel_batch["labels"],
             "loss_mask": parallel_batch["loss_mask"],
         }
+        if self.labels_are_shifted:
+            loss_inputs["shift_labels"] = parallel_batch["labels"]
 
         return model_inputs, loss_inputs

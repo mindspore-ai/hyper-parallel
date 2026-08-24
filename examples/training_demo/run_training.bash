@@ -40,4 +40,11 @@ export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
 export SSL_CERT_FILE=${SSL_CERT_FILE:-/home/ma-user/.codex/ca-bundle-with-huawei.pem}
 export HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}
-export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+export HF_HOME=${HF_HOME:-/cache/huggingface}
+
+TRANSFORMERS_513_PATH=${TRANSFORMERS_513_PATH:-"${PROJECT_ROOT}/outputs/pythonpath/transformers-5.13.0"}
+if [[ ! -f "${TRANSFORMERS_513_PATH}/transformers/__init__.py" ]]; then
+    echo "Transformers 5.13.0 Python path does not exist: ${TRANSFORMERS_513_PATH}" >&2
+    return 1
+fi
+export PYTHONPATH="${TRANSFORMERS_513_PATH}:${PROJECT_ROOT}:${PYTHONPATH:-}"
