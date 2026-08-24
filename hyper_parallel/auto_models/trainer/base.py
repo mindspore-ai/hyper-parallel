@@ -26,6 +26,8 @@ Features:
     - Checkpointing
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import queue
@@ -34,7 +36,7 @@ from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -50,7 +52,6 @@ from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
 from ..components.datasets import enable_dataset_logging
 from ..components.datasets.batching import build_dataloader
-from ..components.datasets.llm.chat_template import ChatTemplate
 from ..components.distributed.init_utils import get_local_rank_safe, get_global_rank_safe, get_world_size_safe
 from ..components.distributed.infrastructure import (
     create_distributed_setup_from_config,
@@ -76,6 +77,9 @@ from .callbacks import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..components.datasets.llm.chat_template import ChatTemplate
 
 
 class BackgroundPrefetcher:

@@ -14,11 +14,11 @@
 # ============================================================================
 """Private VLM implementations for the shared dataset build stages."""
 
-from hyper_parallel.auto_models.components.datasets.vlm.build_data_transform import build_vlm_data_transform
-from hyper_parallel.auto_models.components.datasets.vlm.build_processor import build_processor
-from hyper_parallel.auto_models.components.datasets.vlm.collator import build_vlm_collator
-from hyper_parallel.auto_models.components.datasets.vlm.dataset import build_vlm_dataset
-from hyper_parallel.auto_models.components.datasets.vlm.get_batch import (
+from hyper_parallel.auto_models.components.data.vlm.build_data_transform import build_vlm_data_transform
+from hyper_parallel.auto_models.components.data.vlm.build_processor import build_processor
+from hyper_parallel.auto_models.components.data.vlm.collator import build_vlm_collator
+from hyper_parallel.auto_models.components.data.vlm.dataset import build_vlm_dataset
+from hyper_parallel.auto_models.components.data.vlm.get_batch import (
     VLMBatchProcessor,
     VLMGetBatch,
     build_vlm_get_batch,

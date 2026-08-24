@@ -108,7 +108,7 @@ class ParallelBatch:
         self.pp_shared_data = pp_shared_data
         self.attention_mode = attention_mode
         self.cp_algorithm = cp_algorithm
-        self.labels_are_shifted = bool(self.data_config.get("labels_are_shifted", False))
+        self.labels_are_shifted = bool(self.data_config.get("labels_are_shifted", True))
         self.create_attention_mask = bool(
             self.data_config.get("create_attention_mask_in_dataloader", attention_mode == "dense")
         )

@@ -21,7 +21,9 @@ from typing import Any, TypeAlias
 
 from torch.utils.data import IterableDataset
 
-from hyper_parallel.auto_models.components.datasets.dataset_logging import get_dataset_logger
+from hyper_parallel.auto_models.components.datasets.dataset_logging import (
+    get_dataset_logger,
+)
 from hyper_parallel.auto_models.components.utils.constants import IGNORE_INDEX
 
 logger = get_dataset_logger(__name__)
@@ -36,14 +38,13 @@ def _supports_output_index_for_resume(dataset: Any) -> bool:
 
 
 def _has_trainable_labels(model_sample: Mapping[str, Any]) -> bool:
-    """Return whether causal shifting leaves at least one trainable target."""
+    """Return whether pre-shifted labels contain at least one trainable target."""
     labels = model_sample.get("labels")
     if labels is None:
         return True
-    shifted_labels = labels[1:]
     if hasattr(labels, "ne"):
-        return bool(shifted_labels.ne(IGNORE_INDEX).any())
-    return any(label != IGNORE_INDEX for label in shifted_labels)
+        return bool(labels.ne(IGNORE_INDEX).any())
+    return any(label != IGNORE_INDEX for label in labels)
 
 
 def _normalize_transformed_samples(transformed_sample: Any) -> list[ModelSample]:

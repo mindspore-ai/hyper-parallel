@@ -19,8 +19,6 @@ from typing import Any, Optional
 import torch
 from torch.utils.data import default_collate
 
-from hyper_parallel.auto_models.components.datasets.build_collate_fn import build_collate_fn
-from hyper_parallel.auto_models.components.datasets.llm.collator import LLMCollator
 from hyper_parallel.auto_models.components.utils.constants import IGNORE_INDEX
 
 _TEXT_FIELDS = {
@@ -38,17 +36,11 @@ _TEXT_FIELDS = {
 class VLMCollator:
     """Collate text and modality fields into one VLM micro-batch.
 
-    Text fields are delegated to :class:`LLMCollator` (stacked). Modality fields
-    (``pixel_values``, ``image_grid_thw``, ...) are concatenated along dim 0 so
-    variable-length images batch correctly.
-
-    Args:
-        text_collator: LLM collator used for shared text fields.
+    Text fields use default collation. Modality fields such as
+    ``pixel_values`` and ``image_grid_thw`` are concatenated along dim 0 so
+    variable-length images batch correctly. This temporary implementation does
+    not depend on the LLM batching pipeline.
     """
-
-    def __init__(self, text_collator: LLMCollator) -> None:
-        """Bind the LLM collator used for shared text fields."""
-        self.text_collator = text_collator
 
     def __call__(self, samples: Any) -> dict[str, Any]:
         """Collate one micro-batch of VLM samples."""
@@ -61,7 +53,7 @@ class VLMCollator:
             for sample in samples
         ]
 
-        batch = self.text_collator(text_samples)
+        batch = default_collate(text_samples)
         if any(modal_samples):
             for field in {field for sample in modal_samples for field in sample}:
                 values = [sample[field] for sample in modal_samples if field in sample]
@@ -91,13 +83,11 @@ def build_vlm_collator(
     Returns:
         A collator producing one VLM micro-batch dictionary.
     """
-    text_collator = LLMCollator(
-        packing=packing,
-        pad_token_id=pad_token_id,
-        ignore_index=ignore_index,
-        pad_to_length=pad_to_length,
-    )
-    return build_collate_fn(internal_data_collator=VLMCollator(text_collator=text_collator))
+    if packing:
+        raise NotImplementedError("The temporary VLM collator does not support packing")
+    if pad_token_id != 0 or ignore_index != IGNORE_INDEX or pad_to_length is not None:
+        raise NotImplementedError("The temporary VLM collator does not support custom text padding")
+    return VLMCollator()
 
 
 __all__ = ["VLMCollator", "build_vlm_collator"]
