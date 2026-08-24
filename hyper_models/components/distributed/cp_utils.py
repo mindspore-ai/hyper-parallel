@@ -880,12 +880,13 @@ def hybrid_cp_attention(
 def head_tail_load_balance_attention(
         attention_fn: Callable[[Tensor, Tensor, Tensor, dict[str, Any]], Any],
         query: Tensor, key: Tensor, value: Tensor,
-        attention_kwargs: dict[str, Any], cp_mesh: Any) -> Any:
+        attention_kwargs: dict[str, Any], cp_mesh: Any, *,
+        peer_attention_kwargs: Optional[dict[str, Any]] = None) -> Any:
     """Run local-tensor Colossal Head-Tail communication.
 
-    ``attention_kwargs`` are forwarded unchanged to both attention calls.
-    Any split-specific mask or position metadata must be prepared by the
-    caller before entering this communication helper.
+    The caller prepares split-specific mask or position metadata. When
+    ``peer_attention_kwargs`` is omitted, both attention calls reuse
+    ``attention_kwargs`` for backward compatibility.
     """
     if cp_mesh is None or cp_mesh.size() <= 1:
         raise ValueError("Head-Tail load balance requires an active CP mesh")
@@ -907,10 +908,13 @@ def head_tail_load_balance_attention(
     query_peer = platform.p2p_exchange(query_tail, peer_rank)
     global_key, global_value = flex_cp_allgather(key, value, 2, cp_mesh)
 
-    def run_half(query_half: Tensor) -> Tensor:
+    def run_half(
+            query_half: Tensor,
+            call_kwargs: dict[str, Any],
+    ) -> Tensor:
         """Run attention for one Head-Tail query half."""
         output = attention_fn(
-            query_half, global_key, global_value, attention_kwargs
+            query_half, global_key, global_value, call_kwargs
         )
         if not isinstance(output, Tensor):
             raise TypeError(
@@ -919,8 +923,11 @@ def head_tail_load_balance_attention(
             )
         return output
 
-    keep_output = run_half(query_keep)
-    peer_output = run_half(query_peer)
+    keep_output = run_half(query_keep, attention_kwargs)
+    peer_output = run_half(
+        query_peer,
+        attention_kwargs if peer_attention_kwargs is None else peer_attention_kwargs,
+    )
     tail_output = platform.p2p_exchange(peer_output, peer_rank)
     return platform.cat([keep_output, tail_output], dim=2)
 

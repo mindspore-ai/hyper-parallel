@@ -157,31 +157,111 @@ def is_hf_style_attention(module: Any) -> bool:
 # CP-aware SDPA core (K/V all-gather + D-04 offset causal mask)
 # ────────────────────────────────────────────────────────────────────────────
 
+def _prepare_cp_sdpa_kwargs(
+        kwargs: dict[str, Any], *, q_len: int, kv_len: int,
+        query_offset: int, device: Any) -> dict[str, Any]:
+    """Adapt a complete SDPA mask to one CP-local query interval."""
+    call_kwargs = dict(kwargs)
+    attention_mask = call_kwargs.get("attn_mask")
+    if attention_mask is not None:
+        if not isinstance(attention_mask, torch.Tensor):
+            raise TypeError(
+                "CP SDPA attn_mask must be a Tensor or None, got "
+                f"{type(attention_mask).__name__}"
+            )
+        if attention_mask.ndim < 2:
+            raise ValueError(
+                "CP SDPA attn_mask must expose query and KV dimensions, got "
+                f"shape {tuple(attention_mask.shape)}"
+            )
+        if attention_mask.shape[-1] != kv_len:
+            raise ValueError(
+                "CP SDPA attn_mask must cover the complete KV sequence: "
+                f"mask KV length={attention_mask.shape[-1]}, expected {kv_len}"
+            )
+        mask_q_len = attention_mask.shape[-2]
+        if mask_q_len != q_len:
+            if mask_q_len < query_offset + q_len:
+                raise ValueError(
+                    "CP SDPA attn_mask does not cover the required query range "
+                    f"[{query_offset}, {query_offset + q_len}); mask query "
+                    f"length={mask_q_len}"
+                )
+            attention_mask = attention_mask.narrow(
+                -2, query_offset, q_len
+            )
+        call_kwargs["attn_mask"] = attention_mask
+        if call_kwargs.get("is_causal"):
+            call_kwargs["is_causal"] = False
+        return call_kwargs
+
+    if call_kwargs.get("is_causal"):
+        call_kwargs["is_causal"] = False
+        call_kwargs["attn_mask"] = _cp_offset_causal_mask(
+            q_len, kv_len, query_offset, device
+        )
+    return call_kwargs
+
+
+def _prepare_head_tail_sdpa_kwargs(
+        kwargs: dict[str, Any], query: Any, key: Any,
+        cp_mesh: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prepare complete-mask query rows for both Head-Tail attention calls."""
+    local_q_len = query.shape[2]
+    if local_q_len % 2:
+        raise ValueError(
+            "Head-Tail load balance requires an even local Q sequence "
+            f"length, got {local_q_len}"
+        )
+    half_q_len = local_q_len // 2
+    local_rank = cp_mesh.get_local_rank()
+    peer_rank = cp_mesh.size() - 1 - local_rank
+    global_kv_len = key.shape[2] * cp_mesh.size()
+    keep_kwargs = _prepare_cp_sdpa_kwargs(
+        kwargs,
+        q_len=half_q_len,
+        kv_len=global_kv_len,
+        query_offset=local_rank * local_q_len,
+        device=query.device,
+    )
+    peer_kwargs = _prepare_cp_sdpa_kwargs(
+        kwargs,
+        q_len=half_q_len,
+        kv_len=global_kv_len,
+        query_offset=peer_rank * local_q_len + half_q_len,
+        device=query.device,
+    )
+    return keep_kwargs, peer_kwargs
+
+
+def _prepare_hybrid_sdpa_kwargs(
+        kwargs: dict[str, Any], query: Any, key: Any,
+        cp_mesh: Any, ulysses_degree: int) -> dict[str, Any]:
+    """Prepare complete-mask query rows for Hybrid attention."""
+    _, colossal_mesh = _build_hybrid_cp_submeshes(cp_mesh, ulysses_degree)
+    hybrid_q_len = query.shape[2] * ulysses_degree
+    return _prepare_cp_sdpa_kwargs(
+        kwargs,
+        q_len=hybrid_q_len,
+        kv_len=key.shape[2] * cp_mesh.size(),
+        query_offset=colossal_mesh.get_local_rank() * hybrid_q_len,
+        device=query.device,
+    )
+
+
 def _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kwargs):
     """CP-aware SDPA: K/V all-gather + D-04 offset-aware causal mask."""
     cp_dim = 2  # sequence dim of the [B, N, S, H] layout
     global_k, global_v = flex_cp_allgather(
         k.contiguous(), v.contiguous(), cp_dim, cp_mesh)
-    if kwargs.get("is_causal") and cp_mesh.size() > 1:
-        # D-04: triggered by CP semantics (do NOT use the q_len != kv_len
-        # shape comparison as a proxy -- GQA's head-count difference does not
-        # affect the sequence dim, but cross-attention/KV-cache q_len != kv_len
-        # is unrelated to CP, and shape inference would misapply the lo-offset
-        # semantics). With CP active, q is this rank's contiguous chunk and kv
-        # is the full sequence; when q_len != kv_len, torch's is_causal aligns
-        # top-left (equivalent to assuming Q starts at global 0), so the mask
-        # is wrong for rank>0 chunks (G4) -> replace it with an explicit lower-
-        # triangular mask offset by this rank's global Q offset lo (on rank0
-        # lo=0 degenerates to the standard causal mask, same behavior).
-        # Performance note: an explicit attn_mask rules out the SDPA flash
-        # backend (falling back to mem_efficient/math); correctness of the
-        # CP+causal path takes priority over this (05 §4.4.2).
-        cp_rank = cp_mesh.get_local_rank()
-        lo = cp_rank * q.shape[cp_dim]
-        kwargs = dict(kwargs)
-        kwargs.pop("is_causal")
-        kwargs["attn_mask"] = _cp_offset_causal_mask(
-            q.shape[cp_dim], global_k.shape[cp_dim], lo, q.device)
+    if cp_mesh.size() > 1:
+        kwargs = _prepare_cp_sdpa_kwargs(
+            kwargs,
+            q_len=q.shape[cp_dim],
+            kv_len=global_k.shape[cp_dim],
+            query_offset=cp_mesh.get_local_rank() * q.shape[cp_dim],
+            device=q.device,
+        )
     return orig_sdpa(q, global_k, global_v, **kwargs)
 
 
@@ -575,13 +655,17 @@ def sdpa_qkv_load_balance_cp_wrapper(
                 "sdpa_qkv_load_balance",
             )
         )
+        keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
+            call_kwargs, query, key, cp_mesh
+        )
         return head_tail_load_balance_attention(
             attention_call,
             query,
             key,
             value,
-            call_kwargs,
+            keep_kwargs,
             cp_mesh,
+            peer_attention_kwargs=peer_kwargs,
         )
 
     target_module.forward = cp_forward
@@ -622,6 +706,9 @@ def sdpa_hf_load_balance_cp_wrapper(
             q, k, v, call_kwargs = _normalize_hf_sdpa_gqa(
                 q, k, v, call_kwargs
             )
+            keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
+                call_kwargs, q, k, cp_mesh
+            )
             return head_tail_load_balance_attention(
                 lambda query, key, value, attention_kwargs: original_sdpa(
                     query, key, value, **attention_kwargs
@@ -629,8 +716,9 @@ def sdpa_hf_load_balance_cp_wrapper(
                 q,
                 k,
                 v,
-                call_kwargs,
+                keep_kwargs,
                 cp_mesh,
+                peer_attention_kwargs=peer_kwargs,
             )
 
         F.scaled_dot_product_attention = load_balanced_sdpa
@@ -811,7 +899,8 @@ def _validate_hybrid_config(
 
 
 def _apply_qkv_hybrid_wrapper(
-        target_module, cp_mesh, ulysses_degree, wrapper_name):
+        target_module, cp_mesh, ulysses_degree, wrapper_name, *,
+        prepare_sdpa_mask: bool):
     """Replace a separated QKV forward with local-tensor Hybrid CP."""
     _validate_hybrid_config(cp_mesh, ulysses_degree, wrapper_name)
     original_forward = target_module.forward
@@ -827,6 +916,10 @@ def _apply_qkv_hybrid_wrapper(
                 wrapper_name,
             )
         )
+        if prepare_sdpa_mask:
+            call_kwargs = _prepare_hybrid_sdpa_kwargs(
+                call_kwargs, query, key, cp_mesh, ulysses_degree
+            )
         return hybrid_cp_attention(
             attention_call,
             query,
@@ -851,6 +944,7 @@ def sdpa_qkv_hybrid_cp_wrapper(
         cp_mesh,
         ulysses_degree,
         "sdpa_qkv_hybrid",
+        prepare_sdpa_mask=True,
     )
 
 
@@ -865,6 +959,7 @@ def flex_qkv_hybrid_cp_wrapper(
         cp_mesh,
         ulysses_degree,
         "flex_qkv_hybrid",
+        prepare_sdpa_mask=False,
     )
 
 
@@ -890,6 +985,13 @@ def sdpa_hf_hybrid_cp_wrapper(
             fired["hit"] = True
             query, key, value, attention_kwargs = _normalize_hf_sdpa_gqa(
                 query, key, value, attention_kwargs
+            )
+            attention_kwargs = _prepare_hybrid_sdpa_kwargs(
+                attention_kwargs,
+                query,
+                key,
+                cp_mesh,
+                ulysses_degree,
             )
             return hybrid_cp_attention(
                 lambda call_query, call_key, call_value, call_kwargs: (
