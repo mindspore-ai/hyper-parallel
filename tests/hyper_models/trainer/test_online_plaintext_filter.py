@@ -18,10 +18,10 @@ import pytest
 import torch
 from torch.utils.data import IterableDataset
 
-from hyper_models.components.datasets.llm.build_data_transform import PlaintextTransform
-from hyper_models.components.datasets.llm import build_dataset as dataset_module
-from hyper_models.components.datasets.llm.transform_dataset import apply_llm_data_transform
-from hyper_models.components.datasets.contracts import is_iterable_dataset
+from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import PlaintextTransform
+from hyper_parallel.auto_models.components.datasets.llm import build_dataset as dataset_module
+from hyper_parallel.auto_models.components.datasets.llm.transform_dataset import apply_llm_data_transform
+from hyper_parallel.auto_models.components.datasets.contracts import is_iterable_dataset
 
 
 class _Tokenizer:

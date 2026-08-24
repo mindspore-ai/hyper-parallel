@@ -22,10 +22,10 @@ import pytest
 import torch
 from torch import nn
 
-import hyper_models.trainer.base as base_module
-from hyper_models.components.loss import ModelOutputLoss
-from hyper_models.trainer.base import BaseTrainer
-from hyper_models.trainer.config import Target, TrainerConfig
+import hyper_parallel.auto_models.trainer.base as base_module
+from hyper_parallel.auto_models.components.loss import ModelOutputLoss
+from hyper_parallel.auto_models.trainer.base import BaseTrainer
+from hyper_parallel.auto_models.trainer.config import Target, TrainerConfig
 
 
 def _unused_target() -> Target:

@@ -20,7 +20,7 @@ import pytest
 import torch
 from torch import nn
 
-from hyper_models.components.models import qwen3_moe_fusions
+from hyper_parallel.auto_models.components.models import qwen3_moe_fusions
 
 
 class _Attention(nn.Module):

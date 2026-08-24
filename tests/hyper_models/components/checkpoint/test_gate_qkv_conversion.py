@@ -16,7 +16,7 @@
 
 import torch
 
-from hyper_models.components.checkpoint import (
+from hyper_parallel.auto_models.components.checkpoint import (
     DeinterleaveGateQKV,
     InterleaveGateQKV,
 )

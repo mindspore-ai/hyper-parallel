@@ -9,14 +9,14 @@
 
 import pytest
 import torch.nn as nn
-from hyper_models.components.distributed.param_role import (
+from hyper_parallel.auto_models.components.distributed.param_role import (
     ParamRole,
     ParameterClassifier,
     SEGMENT_EXACT,
     SEGMENT_SUBSTRING,
     _build_default_rules,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     EP,
     ModuleShardingSpec,
@@ -27,7 +27,7 @@ from hyper_models.components.distributed.sharding_config import (
     _normalize_out_fields,
     resolve_placements,
 )
-from hyper_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
     Replicate,
@@ -91,7 +91,7 @@ def test_tiny_llama_golden_plan_self_consistent(tiny_llama, make_mesh):
     mesh = make_mesh((1,), ("tp",))
     plan = ShardingPlanner().plan(tiny_llama, mesh, tp_size=2)
     ordered = [fqn for fqn, _ in tiny_llama.named_modules() if fqn in plan.modules]
-    from hyper_models.components.distributed.sharding_config import (
+    from hyper_parallel.auto_models.components.distributed.sharding_config import (
         resolve_placements,
     )
     for a, b in zip(ordered[:-1], ordered[1:]):

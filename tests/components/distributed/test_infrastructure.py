@@ -18,11 +18,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from hyper_models.components.distributed import infrastructure
-from hyper_models._transformers.infrastructure import instantiate_infrastructure
-from hyper_models.components.distributed.config import FSDP2Config
-from hyper_models.components.distributed.fsdp2 import FSDP2Manager
-from hyper_models.trainer.config import AcceleratorConfig
+from hyper_parallel.auto_models.components.distributed import infrastructure
+from hyper_parallel.auto_models._transformers.infrastructure import instantiate_infrastructure
+from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
+from hyper_parallel.auto_models.components.distributed.fsdp2 import FSDP2Manager
+from hyper_parallel.auto_models.trainer.config import AcceleratorConfig
 
 
 class _FakeDeviceMesh:

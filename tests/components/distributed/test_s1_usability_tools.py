@@ -14,15 +14,15 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from hyper_models.components.distributed.dispatch_probe import check_dispatchable
-from hyper_models.components.distributed.sharding_applier import (
+from hyper_parallel.auto_models.components.distributed.dispatch_probe import check_dispatchable
+from hyper_parallel.auto_models.components.distributed.sharding_applier import (
     _log_injection_choice,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     MeshAxisName,
     ModuleShardingSpec,
 )
-from hyper_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
 from tests.components.distributed.conftest import (

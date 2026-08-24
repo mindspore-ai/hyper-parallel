@@ -11,16 +11,16 @@ import logging
 import pytest
 import torch
 import torch.nn as nn
-from hyper_models.components.distributed.head_count import (
+from hyper_parallel.auto_models.components.distributed.head_count import (
     _is_head_sharded,
     _update_user_tp_attrs,
     update_module_head_counts,
 )
-from hyper_models.components.distributed.param_role import (
+from hyper_parallel.auto_models.components.distributed.param_role import (
     ParamRole,
     ParameterClassifier,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     EP,
     ModuleShardingSpec,
@@ -28,10 +28,10 @@ from hyper_models.components.distributed.sharding_config import (
     TP,
     resolve_placements,
 )
-from hyper_models.components.distributed.sharding_applier import (
+from hyper_parallel.auto_models.components.distributed.sharding_applier import (
     _add_bias_to_primary_output,
 )
-from hyper_models.components.distributed.sharding_planner import (
+from hyper_parallel.auto_models.components.distributed.sharding_planner import (
     ARCH_OVERRIDES,
     SPECIAL_HANDLERS,
     ShardingPlanner,

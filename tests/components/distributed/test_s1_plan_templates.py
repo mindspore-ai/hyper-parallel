@@ -7,17 +7,17 @@
 来源: test_s1_templates.py, test_s1_plan_golden.py, test_s1_mesh_dims.py, test_s1_boundary_group.py
 """
 
-from hyper_models.components.distributed.param_role import ParamRole
+from hyper_parallel.auto_models.components.distributed.param_role import ParamRole
 import pytest
 import torch.nn as nn
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     EP,
     TEMPLATES,
     TP,
     resolve_placements,
 )
-from hyper_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
     Replicate,
@@ -71,14 +71,14 @@ def test_moe_mlp_region_dispatch():
 
 def test_moe_gate_out_dst_ep_shard():
     t = TEMPLATES["moe_gate"]
-    from hyper_models.components.distributed.sharding_config import EP
+    from hyper_parallel.auto_models.components.distributed.sharding_config import EP
     assert t.sp_out_dst[EP] == Shard(0)
     assert t.nosp_out_dst[EP] == Shard(0)
 
 
 def test_lm_head_out_src_shard_last_dim():
     # 标量简写：{TP: Shard(-1), ...}
-    from hyper_models.components.distributed.sharding_config import TP
+    from hyper_parallel.auto_models.components.distributed.sharding_config import TP
     assert TEMPLATES["lm_head"].sp_out_src[TP] == Shard(-1)
 
 

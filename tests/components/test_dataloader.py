@@ -18,7 +18,7 @@ import pytest
 import torch
 from torch.utils.data.distributed import DistributedSampler
 
-from hyper_models.components.data import DataLoader
+from hyper_parallel.auto_models.components.data import DataLoader
 
 
 def test_dataloader_partitions_samples_across_dp_ranks() -> None:

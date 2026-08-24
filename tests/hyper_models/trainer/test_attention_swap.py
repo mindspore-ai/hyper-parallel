@@ -29,7 +29,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM,
 )
 
-from hyper_models.components.activation_swap.attention_swap import (
+from hyper_parallel.auto_models.components.activation_swap.attention_swap import (
     apply_attention_swap,
     attention_swap_policy,
     validate_attention_swap,
@@ -117,7 +117,7 @@ def test_attention_swap_only_wraps_attention_and_schedules_local_layers() -> Non
     manager = MagicMock()
 
     with patch(
-        "hyper_models.components.activation_swap.attention_swap.SwapManager",
+        "hyper_parallel.auto_models.components.activation_swap.attention_swap.SwapManager",
         return_value=manager,
     ):
         result = apply_attention_swap(model, "attention")
@@ -163,7 +163,7 @@ def test_attention_swap_finds_self_attn_without_fixed_model_structure() -> None:
     manager = MagicMock()
 
     with patch(
-        "hyper_models.components.activation_swap.attention_swap.SwapManager",
+        "hyper_parallel.auto_models.components.activation_swap.attention_swap.SwapManager",
         return_value=manager,
     ):
         result = apply_attention_swap(model, "attention")

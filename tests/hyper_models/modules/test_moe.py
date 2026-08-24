@@ -30,12 +30,12 @@ pytest.importorskip("torch_npu")
 
 from transformers.core_model_loading import WeightConverter, WeightRenaming
 
-from hyper_models.components.model_transform import (
+from hyper_parallel.auto_models.components.model_transform import (
     ModuleReplacementSpec,
     apply_module_replacements,
     compile_module_replacements,
 )
-from hyper_models.modules import GroupedExperts, SharedExpert
+from hyper_parallel.auto_models.modules import GroupedExperts, SharedExpert
 from tests.common.mark_utils import arg_mark
 
 

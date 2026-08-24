@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("torch_npu")
 
-from hyper_models.ops import swiglu
+from hyper_parallel.auto_models.ops import swiglu
 from tests.common.mark_utils import arg_mark
 
 

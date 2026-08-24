@@ -18,10 +18,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from hyper_models.config.resolver import resolve_root
-from hyper_models.trainer.base import BaseTrainer
-from hyper_models.trainer.config import ModelAssetsConfig, Target, TrainerConfig
-from hyper_models.trainer.text_trainer import TextTrainer
+from hyper_parallel.auto_models.config.resolver import resolve_root
+from hyper_parallel.auto_models.trainer.base import BaseTrainer
+from hyper_parallel.auto_models.trainer.config import ModelAssetsConfig, Target, TrainerConfig
+from hyper_parallel.auto_models.trainer.text_trainer import TextTrainer
 
 
 def _value_target(value):
@@ -108,7 +108,7 @@ def test_conversation_assets_build_template_from_model_assets(monkeypatch) -> No
         calls.append((name, value))
         return chat_template
 
-    monkeypatch.setattr("hyper_models.trainer.text_trainer.build_chat_template", _build_chat_template)
+    monkeypatch.setattr("hyper_parallel.auto_models.trainer.text_trainer.build_chat_template", _build_chat_template)
 
     trainer._build_model_assets()
 
@@ -190,7 +190,7 @@ def test_conversation_assets_require_tokenizer_and_template(missing_field, monke
         chat_template=chat_template,
     ))
     monkeypatch.setattr(
-        "hyper_models.trainer.text_trainer.build_chat_template",
+        "hyper_parallel.auto_models.trainer.text_trainer.build_chat_template",
         lambda name, value: (name, value),
     )
 

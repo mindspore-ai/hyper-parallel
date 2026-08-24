@@ -20,8 +20,8 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
-from hyper_models.components.distributed.config import FSDP2Config
-from hyper_models.trainer.base import BaseTrainer
+from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
+from hyper_parallel.auto_models.trainer.base import BaseTrainer
 
 
 def _trainer(

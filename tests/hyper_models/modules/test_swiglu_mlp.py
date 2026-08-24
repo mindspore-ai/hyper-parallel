@@ -20,13 +20,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from hyper_models.components.checkpoint import ConcatenateWithSections
-from hyper_models.components.model_transform import (
+from hyper_parallel.auto_models.components.checkpoint import ConcatenateWithSections
+from hyper_parallel.auto_models.components.model_transform import (
     ModuleReplacementSpec,
     apply_module_replacements,
     compile_module_replacements,
 )
-from hyper_models.modules import SwiGLUMLP
+from hyper_parallel.auto_models.modules import SwiGLUMLP
 
 
 class SwiGLUSource(nn.Module):

@@ -29,11 +29,11 @@ from typing import Any
 import pytest
 import torch
 
-import hyper_models.components.checkpoint.dcp_checkpointer as dcp_module
-import hyper_models.trainer.callbacks.checkpoint_callback as ckpt_module
-from hyper_models.components.checkpoint.config import CheckpointingConfig
-from hyper_models.trainer.callbacks import TrainerState
-from hyper_models.trainer.config import TrainingConfig
+import hyper_parallel.auto_models.components.checkpoint.dcp_checkpointer as dcp_module
+import hyper_parallel.auto_models.trainer.callbacks.checkpoint_callback as ckpt_module
+from hyper_parallel.auto_models.components.checkpoint.config import CheckpointingConfig
+from hyper_parallel.auto_models.trainer.callbacks import TrainerState
+from hyper_parallel.auto_models.trainer.config import TrainingConfig
 
 
 # ----------------------------------------------------------------------
@@ -286,7 +286,7 @@ def test_registration_is_decided_once_from_config(
     *either* is on. Deciding here beats registering unconditionally and
     re-checking an enable flag inside every hook.
     """
-    from hyper_models.trainer.base import BaseTrainer
+    from hyper_parallel.auto_models.trainer.base import BaseTrainer
 
     trainer = _build_trainer(
         str(tmp_path), save_ckpt=save_ckpt, restore_from=restore_from, save_steps=1

@@ -18,7 +18,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from hyper_models.components.data import (
+from hyper_parallel.auto_models.components.data import (
     MakeMicroBatchCollator,
     calculate_num_micro_batches,
 )

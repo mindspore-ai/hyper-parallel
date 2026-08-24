@@ -19,8 +19,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import hyper_models.trainer.callbacks.environ_meter_callback as callback_module
-from hyper_models.trainer.callbacks import EnvironMeterCallback, TrainerState
+import hyper_parallel.auto_models.trainer.callbacks.environ_meter_callback as callback_module
+from hyper_parallel.auto_models.trainer.callbacks import EnvironMeterCallback, TrainerState
 
 
 def _build_trainer() -> SimpleNamespace:

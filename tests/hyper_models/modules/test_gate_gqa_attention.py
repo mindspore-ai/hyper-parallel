@@ -28,7 +28,7 @@ modeling = pytest.importorskip(
 )
 pytest.importorskip("torch_npu")
 
-from hyper_models.modules import GatedGQAAttention
+from hyper_parallel.auto_models.modules import GatedGQAAttention
 from tests.common.mark_utils import arg_mark
 
 

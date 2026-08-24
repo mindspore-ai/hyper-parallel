@@ -17,7 +17,7 @@
 import logging
 from types import SimpleNamespace
 
-from hyper_models.trainer.callbacks import EvaluateCallback, TrainerState
+from hyper_parallel.auto_models.trainer.callbacks import EvaluateCallback, TrainerState
 
 
 def _build_trainer(eval_steps: int, eval_epochs: int) -> SimpleNamespace:

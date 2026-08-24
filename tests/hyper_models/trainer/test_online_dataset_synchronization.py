@@ -19,9 +19,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from hyper_models.components.distributed import infrastructure
-from hyper_models.components.datasets.llm import online_mapping_dataset
-from hyper_models.components.datasets.parallel import DatasetParallelContext
+from hyper_parallel.auto_models.components.distributed import infrastructure
+from hyper_parallel.auto_models.components.datasets.llm import online_mapping_dataset
+from hyper_parallel.auto_models.components.datasets.parallel import DatasetParallelContext
 
 
 def test_online_mapping_download_synchronizes_shared_cache(monkeypatch) -> None:

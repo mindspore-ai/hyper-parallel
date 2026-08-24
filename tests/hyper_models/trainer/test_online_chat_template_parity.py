@@ -23,10 +23,10 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from hyper_models.components.datasets.llm.build_data_transform import ConversationTransform
-from hyper_models.components.datasets.llm.build_dataset import build_llm_dataset
-from hyper_models.components.datasets.llm.chat_template import build_chat_template
-from hyper_models.components.utils.constants import IGNORE_INDEX
+from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import ConversationTransform
+from hyper_parallel.auto_models.components.datasets.llm.build_dataset import build_llm_dataset
+from hyper_parallel.auto_models.components.datasets.llm.chat_template import build_chat_template
+from hyper_parallel.auto_models.components.utils.constants import IGNORE_INDEX
 
 
 def _build_tokenizer() -> PreTrainedTokenizerFast:
