@@ -42,6 +42,8 @@
 /hyper_parallel/platform/torch/hsdp/ @kisnwang
 /hyper_parallel/platform/torch/pipeline_parallel/ @lichen666
 
+# The maintainers of hyper_parallel/compile.
+/hyper_parallel/compile/ @kisnwang
 
 # The maintainers of tests.
 /tests/ @liuchongming74
