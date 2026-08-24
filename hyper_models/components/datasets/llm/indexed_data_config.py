@@ -75,9 +75,7 @@ class BlendedMegatronDatasetConfig:
         if not all(value >= 0.0 for value in split_values):
             raise ValueError("all split values must be non-negative")
 
-        normalized_values = (
-                np.asarray(split_values, dtype=np.float64) / np.sum(split_values)
-        ).tolist()
+        normalized_values = (np.asarray(split_values, dtype=np.float64) / np.sum(split_values)).tolist()
         canonical_values = []
         for value in normalized_values:
             rounded_value = round(value, 12)
@@ -124,10 +122,47 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
             raise ValueError("Attribute 'tokenizer' must not be None")
 
 
+def _discover_indexed_paths(
+    current_path: str,
+    rank: int,
+    world_size: int,
+    distributed_walk: bool,
+) -> list[str]:
+    """Discover indexed prefixes under one directory."""
+    if not distributed_walk:
+        return _walk_bin_directories([current_path])
+
+    root_layout = None
+    if rank == 0:
+        subdirectories = []
+        top_files = []
+        for name in os.listdir(current_path):
+            path = os.path.join(current_path, name)
+            if os.path.isdir(path):
+                subdirectories.append(path)
+            elif name.endswith(".bin"):
+                top_files.append(os.path.splitext(path)[0])
+        root_layout = (subdirectories, top_files)
+
+    gathered_layouts: list[tuple[list[str], list[str]] | None] = [None] * world_size
+    platform.all_gather_object(gathered_layouts, root_layout)
+    rank_zero_layout = gathered_layouts[0]
+    if rank_zero_layout is None:
+        raise ValueError("Rank 0 did not provide the indexed directory layout")
+    subdirectories, file_paths = rank_zero_layout
+    local_files = _walk_bin_directories(subdirectories[rank::world_size])
+    gathered_files: list[list[str] | None] = [None] * world_size
+    platform.all_gather_object(gathered_files, local_files)
+    for rank_files in gathered_files:
+        if rank_files:
+            file_paths.extend(rank_files)
+    return file_paths
+
+
 def resolve_data_paths(
-        data_path: str | Sequence[str],
-        *,
-        distributed_walk: bool = True,
+    data_path: str | Sequence[str],
+    *,
+    distributed_walk: bool = True,
 ) -> list[str]:
     """Find ``.bin`` files and return indexed prefixes with optional weights.
 
@@ -164,39 +199,7 @@ def resolve_data_paths(
             original_paths = list(data_paths)
             return original_paths
 
-        if use_distributed_walk:
-            # Rank 0 discovers the first level, then all ranks use that same
-            # directory order when taking their rank-strided share.
-            root_layout = None
-            if rank == 0:
-                subdirectories = []
-                top_files = []
-                for name in os.listdir(current_path):
-                    path = os.path.join(current_path, name)
-                    if os.path.isdir(path):
-                        subdirectories.append(path)
-                    elif name.endswith(".bin"):
-                        top_files.append(os.path.splitext(path)[0])
-                root_layout = (subdirectories, top_files)
-
-            gathered_layouts: list[tuple[list[str], list[str]] | None] = [None] * world_size
-            platform.all_gather_object(gathered_layouts, root_layout)
-            rank_zero_layout = gathered_layouts[0]
-            if rank_zero_layout is None:
-                raise ValueError("Rank 0 did not provide the indexed directory layout")
-            subdirectories, top_files = rank_zero_layout
-
-            local_files = _walk_bin_directories(subdirectories[rank::world_size])
-            gathered_files: list[list[str] | None] = [None] * world_size
-            platform.all_gather_object(gathered_files, local_files)
-
-            # Reconstruct the complete and identical prefix list on every rank.
-            file_paths.extend(top_files)
-            for rank_files in gathered_files:
-                if rank_files:
-                    file_paths.extend(rank_files)
-        else:
-            file_paths.extend(_walk_bin_directories([current_path]))
+        file_paths.extend(_discover_indexed_paths(current_path, rank, world_size, use_distributed_walk))
 
     if not file_paths:
         raise ValueError(f"data_path {data_paths!r} has no data file ending with .bin")
@@ -222,8 +225,8 @@ def resolve_data_paths(
 
 
 def build_gpt_dataset_config(
-        data_paths: Sequence[str],
-        data_config: Mapping[str, Any],
+    data_paths: Sequence[str],
+    data_config: Mapping[str, Any],
 ) -> GPTDatasetConfig:
     """Build a GPT Dataset config from provider fields.
 

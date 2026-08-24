@@ -236,7 +236,7 @@ class _IndexedPretrainDataset(ABC):
         identifiers["class"] = cls.__name__
         identifiers["dataset_path"] = dataset_path
         identifiers["num_samples"] = num_samples
-        identifiers["index_split"] = index_split.name
+        identifiers["index_split"] = index_split.name.lower()
         for attribute in cls._key_config_attributes():
             identifiers[attribute] = getattr(config, attribute)
         return identifiers
@@ -338,7 +338,7 @@ class GPTDataset(_IndexedPretrainDataset):
         cache_key = f"{self.unique_description_hash}-{type(self).__name__}"
 
         # drop last for train/test, valid drop depended on config
-        if self.index_split.name == "valid":
+        if self.index_split.name.lower() == "valid":
             drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
         else:
             drop_last_partial_sequence = True
@@ -662,7 +662,7 @@ def _get_ltor_masks_and_position_ids(
 
     # Position ids.
     position_ids = np.arange(seq_length, dtype=np.int64)
-    # We need to clone as the ids will be modifed based on batch index.
+    # We need to clone as the ids will be modified based on batch index.
     if config.reset_position_ids:
         position_ids = position_ids.copy()
 

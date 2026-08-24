@@ -191,7 +191,7 @@ class VLMTrainer:
 
         for micro_step, (model_inputs, loss_inputs) in enumerate(training_batches):
             self.base.model_reshard(micro_step, num_micro_steps)
-            self.base._configure_fsdp_gradient_sync(  # pylint: disable=protected-access
+            self.base.configure_fsdp_gradient_sync(
                 micro_step,
                 num_micro_steps,
             )

@@ -14,6 +14,8 @@
 
 # Following codes are inspired from https://github.com/volcengine/verl/blob/main/verl/utils/device.py
 
+"""PyTorch accelerator discovery and device utility functions."""
+
 import logging
 from typing import Any
 
@@ -61,7 +63,7 @@ def get_torch_device() -> Any:
     try:
         return getattr(torch, device_name)
     except AttributeError:
-        logger.warning(f"Device namespace '{device_name}' not found in torch, try to load 'torch.cuda'.")
+        logger.warning("Device namespace '%s' not found in torch, try to load 'torch.cuda'.", device_name)
         return torch.cuda
 
 
@@ -157,22 +159,18 @@ def is_sm90_or_above() -> bool:
 def get_compute_units() -> int:
     """
     Returns the number of streaming multiprocessors (SMs) or equivalent compute units
-    for the available accelerator. Assigns the value to NUM_SMS.
+    for the available accelerator.
     """
-    NUM_SMS = None
     device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
 
-    # Use match/case for device-specific logic (Python 3.10+)
-    match device_type:
-        case "cuda":
-            device_properties = torch.cuda.get_device_properties(0)
-            NUM_SMS = device_properties.multi_processor_count
-        case "xpu":
-            device_properties = torch.xpu.get_device_properties(0)
-            NUM_SMS = device_properties.max_compute_units
-        case _:
-            print("No CUDA or XPU device available. Using CPU.")
-            # For CPU, you might want to use the number of CPU cores
-            NUM_SMS = torch.get_num_threads()
+    if device_type == "cuda":
+        device_properties = torch.cuda.get_device_properties(0)
+        num_compute_units = device_properties.multi_processor_count
+    elif device_type == "xpu":
+        device_properties = torch.xpu.get_device_properties(0)
+        num_compute_units = device_properties.max_compute_units
+    else:
+        logger.warning("No CUDA or XPU device available. Using CPU.")
+        num_compute_units = torch.get_num_threads()
 
-    return NUM_SMS
+    return num_compute_units

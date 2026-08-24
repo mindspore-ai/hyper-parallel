@@ -1208,6 +1208,7 @@ _QWEN3_MOE_HEAD_DIM = 1
 
 
 def _require_qwen3_moe_attention(module: Any) -> None:
+    """Validate the attributes required by the Qwen3-MoE attention wrapper."""
     required = (
         "q_proj",
         "k_proj",
@@ -1273,6 +1274,7 @@ def _prepare_qwen3_moe_attention_mask(
     key: torch.Tensor,
     query_offset: int,
 ) -> torch.Tensor | None:
+    """Build the causal attention mask for a local Qwen3-MoE CP shard."""
     q_len = query.shape[_QWEN3_MOE_SEQ_DIM]
     kv_len = key.shape[_QWEN3_MOE_SEQ_DIM]
     if attention_mask is None:
@@ -1486,6 +1488,7 @@ def _install_qwen3_moe_async_forward(
     forward_fn: Callable[..., tuple[torch.Tensor, torch.Tensor | None]],
     **forward_config: Any,
 ) -> None:
+    """Install an asynchronous context-parallel Qwen3-MoE forward method."""
     _require_qwen3_moe_attention(target_module)
     original_forward = target_module.forward
 

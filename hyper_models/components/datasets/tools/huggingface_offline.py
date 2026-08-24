@@ -76,16 +76,10 @@ def _download_jsonl(config: OfflinePreparationConfig) -> Path:
         "data_files": config.data_files,
         "num_proc": config.num_proc,
     }
-    load_dataset_kwargs.update({
-        key: value
-        for key, value in optional_load_dataset_kwargs.items()
-        if value is not None
-    })
+    load_dataset_kwargs.update({key: value for key, value in optional_load_dataset_kwargs.items() if value is not None})
     dataset = load_dataset(**load_dataset_kwargs)
     keys = config.json_keys_list()
-    missing_keys = [
-        key for key in keys if key not in dataset.column_names
-    ]
+    missing_keys = [key for key in keys if key not in dataset.column_names]
     if missing_keys:
         raise ValueError(
             f"Dataset {config.dataset_name_or_path} does not contain configured "
@@ -112,198 +106,74 @@ def _parse_bool(value: str) -> bool:
         return True
     if normalized in {"false", "0", "no", "off"}:
         return False
-    raise argparse.ArgumentTypeError(
-        f"Expected a boolean value, but received {value!r}"
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, but received {value!r}")
+
+
+def _add_huggingface_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register Hugging Face source and output arguments."""
+    dataset_group = parser.add_argument_group("dataset")
+    dataset_arguments = (
+        (("--dataset",), {"required": True, "help": "Dataset ID or local JSON/JSONL path."}),
+        (("--dataset-subset",), {"default": None, "help": "Optional dataset subset."}),
+        (("--dataset-split",), {"default": "train", "help": "Dataset split."}),
+        (("--revision",), {"default": None, "help": "Optional dataset revision."}),
+        (("--cache-dir",), {"default": None, "help": "Optional dataset cache directory."}),
+        (("--data-dir",), {"default": None, "help": "Optional repository data directory."}),
+        (("--data-files",), {"nargs": "+", "default": None, "help": "Optional source data files."}),
+        (("--num-proc",), {"type": int, "default": None, "help": "Dataset preparation process count."}),
+        (("--json-keys",), {"nargs": "+", "default": ["text"], "help": "JSON fields to tokenize."}),
     )
+    for flags, options in dataset_arguments:
+        dataset_group.add_argument(*flags, **options)
+    output_group = parser.add_argument_group("output")
+    output_group.add_argument("--output-prefix", required=True, help="Generated .bin/.idx path prefix.")
+    output_group.add_argument("--download-dir", default=None, help="Raw JSONL download directory.")
+
+
+def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register tokenizer, preprocessing, parallelism, and benchmark arguments."""
+    groups = {
+        "tokenizer": (
+            (("--tokenizer",), {"required": True, "help": "Tokenizer name or local path."}),
+            (("--tokenizer-use-fast",), {"type": _parse_bool, "default": True, "help": "Use fast tokenizer."}),
+            (("--trust-remote-code",), {"action": "store_true", "help": "Allow tokenizer remote code."}),
+            (("--chat-template",), {"default": None, "help": "Optional tokenizer chat template."}),
+            (("--add-special-tokens",), {"nargs": "+", "default": None, "help": "Additional special tokens."}),
+        ),
+        "preprocessing": (
+            (("--split-sentences",), {"action": "store_true", "help": "Split text into sentences."}),
+            (("--keep-newlines",), {"action": "store_true", "help": "Preserve newline runs."}),
+            (("--lang",), {"default": "english", "help": "Punkt language."}),
+            (("--append-eod",), {"type": _parse_bool, "default": True, "help": "Append an EOD token."}),
+            (("--pack-to-seq-len",), {"type": int, "default": None, "help": "Fixed packed sequence length."}),
+        ),
+        "parallelism": (
+            (("--workers",), {"type": int, "default": 8, "help": "Worker process count."}),
+            (("--partitions",), {"type": int, "default": 1, "help": "Data partition count."}),
+            (("--keep-sequential-samples",), {"action": "store_true", "help": "Keep sample order."}),
+            (("--keep-partition-files",), {"action": "store_true", "help": "Keep partition files."}),
+        ),
+        "benchmark": (
+            (("--find-optimal-num-workers",), {"action": "store_true", "help": "Benchmark worker counts."}),
+            (
+                ("--workers-to-check",),
+                {"nargs": "+", "type": int, "default": [16, 32, 64], "help": "Candidate worker counts."},
+            ),
+            (("--max-documents",), {"type": int, "default": 100_000, "help": "Benchmark document limit."}),
+            (("--log-interval",), {"type": int, "default": 1000, "help": "Progress-report interval."}),
+        ),
+    }
+    for title, arguments in groups.items():
+        group = parser.add_argument_group(title)
+        for flags, options in arguments:
+            group.add_argument(*flags, **options)
 
 
 def _get_args(argv: List[str] | None = None) -> argparse.Namespace:
     """Parse the Hugging Face offline preparation CLI arguments."""
-    parser = argparse.ArgumentParser(
-        description="Download a Hugging Face dataset and convert to .bin/.idx",
-    )
-    # -------- dataset --------
-    group = parser.add_argument_group("dataset")
-    group.add_argument(
-        "--dataset",
-        required=True,
-        help="Hugging Face dataset ID (e.g. Salesforce/wikitext) or local .json/.jsonl path.",
-    )
-    group.add_argument(
-        "--dataset-subset",
-        default=None,
-        help="Optional Hugging Face dataset configuration / subset name.",
-    )
-    group.add_argument(
-        "--dataset-split",
-        default="train",
-        help="Hugging Face dataset split (default: %(default)s).",
-    )
-    group.add_argument(
-        "--revision",
-        default=None,
-        help="Optional dataset revision, tag, or commit SHA.",
-    )
-    group.add_argument(
-        "--cache-dir",
-        default=None,
-        help="Optional Hugging Face dataset cache directory.",
-    )
-    group.add_argument(
-        "--data-dir",
-        default=None,
-        help="Optional data directory within the dataset repository.",
-    )
-    group.add_argument(
-        "--data-files",
-        nargs="+",
-        default=None,
-        help="Optional source data file or files to load.",
-    )
-    group.add_argument(
-        "--num-proc",
-        type=int,
-        default=None,
-        help="Optional number of processes used while preparing the dataset.",
-    )
-    group.add_argument(
-        "--json-keys",
-        nargs="+",
-        default=["text"],
-        help="One or more JSON fields to tokenize (default: %(default)s).",
-    )
-
-    # -------- output --------
-    group = parser.add_argument_group("output")
-    group.add_argument(
-        "--output-prefix",
-        required=True,
-        help=(
-            "Path prefix for generated .bin/.idx files, e.g. "
-            ".../my_dataset produces .../my_dataset_text_document.bin."
-        ),
-    )
-    group.add_argument(
-        "--download-dir",
-        default=None,
-        help=(
-            "Directory for downloaded raw JSONL files.  "
-            "Defaults to ./download_datasets/{dataset_label}/."
-        ),
-    )
-
-    # -------- tokenizer --------
-    group = parser.add_argument_group("tokenizer")
-    group.add_argument(
-        "--tokenizer",
-        required=True,
-        help="Tokenizer name or local path (e.g. gpt2).",
-    )
-    group.add_argument(
-        "--tokenizer-use-fast",
-        type=_parse_bool,
-        default=True,
-        help="Whether to use the HF fast tokenizer (default: %(default)s).",
-    )
-    group.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Allow tokenizer repositories to execute remote code.",
-    )
-    group.add_argument(
-        "--chat-template",
-        default=None,
-        help="Optional chat template assigned to the tokenizer.",
-    )
-    group.add_argument(
-        "--add-special-tokens",
-        nargs="+",
-        default=None,
-        help="Additional special tokens added to the tokenizer.",
-    )
-
-    # -------- preprocessing --------
-    group = parser.add_argument_group("preprocessing")
-    group.add_argument(
-        "--split-sentences",
-        action="store_true",
-        help="Split text into sentences before tokenization.",
-    )
-    group.add_argument(
-        "--keep-newlines",
-        action="store_true",
-        help="Preserve newline runs when splitting text into sentences.",
-    )
-    group.add_argument(
-        "--lang",
-        default="english",
-        help="Punkt language for sentence splitting (default: %(default)s).",
-    )
-    group.add_argument(
-        "--append-eod",
-        type=_parse_bool,
-        default=True,
-        help="Append the tokenizer EOS (or SEP fallback) to each non-empty document (default: %(default)s).",
-    )
-    group.add_argument(
-        "--pack-to-seq-len",
-        type=int,
-        default=None,
-        help="Pack documents into fixed samples of this sequence length plus one target token.",
-    )
-
-    # -------- parallelism --------
-    group = parser.add_argument_group("parallelism")
-    group.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Number of worker processes (default: %(default)s).",
-    )
-    group.add_argument(
-        "--partitions",
-        type=int,
-        default=1,
-        help="Number of data partitions (default: %(default)s).",
-    )
-    group.add_argument(
-        "--keep-sequential-samples",
-        action="store_true",
-        help="Keep sequential samples when partitioning the dataset.",
-    )
-    group.add_argument(
-        "--keep-partition-files",
-        action="store_true",
-        help="Keep temporary JSON partition files after successful preprocessing.",
-    )
-
-    # -------- benchmark --------
-    group = parser.add_argument_group("benchmark")
-    group.add_argument(
-        "--find-optimal-num-workers",
-        action="store_true",
-        help="Benchmark candidate worker counts and report the fastest.",
-    )
-    group.add_argument(
-        "--workers-to-check",
-        nargs="+",
-        type=int,
-        default=[16, 32, 64],
-        help="Candidate worker counts for --find-optimal-num-workers (default: %(default)s).",
-    )
-    group.add_argument(
-        "--max-documents",
-        type=int,
-        default=100_000,
-        help="Max documents per partition during benchmarking (default: %(default)s).",
-    )
-    group.add_argument(
-        "--log-interval",
-        type=int,
-        default=1000,
-        help="Documents between progress reports (default: %(default)s).",
-    )
-
+    parser = argparse.ArgumentParser(description="Download a Hugging Face dataset and convert to .bin/.idx")
+    _add_huggingface_arguments(parser)
+    _add_conversion_arguments(parser)
     return parser.parse_args(argv)
 
 
