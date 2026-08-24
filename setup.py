@@ -69,8 +69,8 @@ STRICT_NATIVE_BUILD_TRUE_VALUES = {"1", "true", "on", "yes"}
 STRICT_NATIVE_BUILD_FALSE_VALUES = {"", "0", "false", "off", "no"}
 
 INDEXED_DATASET_HELPER_EXTENSION = Pybind11Extension(
-    "hyper_models.components.datasets.llm._indexed_helpers_cpp",
-    ["hyper_models/components/datasets/llm/csrc/indexed_helpers.cpp"],
+    "hyper_parallel.auto_models.components.datasets.llm._indexed_helpers_cpp",
+    ["hyper_parallel/auto_models/components/datasets/llm/csrc/indexed_helpers.cpp"],
     cxx_std=11,
     extra_compile_args=["-O3", "-Wall", "-Wextra"],
 )

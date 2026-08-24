@@ -37,7 +37,7 @@ cd "${PROJECT_ROOT}"
 mkdir -p "${OUTPUT_DIR}" "${DATA_ROOT}/raw" "${DATA_ROOT}/indexed"
 
 if [[ ! -s "${RAW_DATA_PATH}" ]]; then
-    python -m hyper_models.components.datasets.tools.huggingface_offline \
+    python -m hyper_parallel.auto_models.components.datasets.tools.huggingface_offline \
         --dataset Salesforce/wikitext \
         --dataset-subset wikitext-2-raw-v1 \
         --dataset-split train \

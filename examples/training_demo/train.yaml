@@ -7,7 +7,7 @@
 #   bash examples/training_demo/run.sh
 
 model:
-  _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: "Qwen/Qwen3-30B-A3B" # tiny-random-LlamaForCausalLMB #
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
@@ -52,11 +52,11 @@ plan_overrides:
       - "model.norm"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
     replace_module:
-      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
   - match: "*.self_attn"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
     replace_module:
-      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_flash_attention
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_flash_attention
   - match: "*.mlp"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
     replace_module:
@@ -87,7 +87,7 @@ dataset:
     datasets_type: plaintext
     chat_template: null
     tokenizer:
-      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
       use_fast: true
       trust_remote_code: true
 
@@ -108,14 +108,14 @@ dataset:
 dataloader:
   # StatefulDataLoader adapter; sampling order is controlled by dataloader_type,
   # so do not configure torch DataLoader's shuffle option here.
-  _target_: hyper_models.components.datasets.DataLoader
+  _target_: hyper_parallel.auto_models.components.datasets.DataLoader
 
   collate_fn:
-    _target_: hyper_models.components.datasets.llm.build_llm_collator
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_llm_collator
     packing: false
 
   get_batch:
-    _target_: hyper_models.components.datasets.llm.build_llm_get_batch
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_llm_get_batch
 
   # single: sequential/rearranged; cyclic: deterministic shuffled epochs.
   dataloader_type: single # cyclic
@@ -130,7 +130,7 @@ dataloader:
   prefetch_factor: null
 
 optimizer:
-  _target_: hyper_models.components.optim.optimizer.AdamW
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.AdamW
   no_decay_params: [bias, norm, ln_]
   adamw_config:
     adamw_lr: 1.0e-5
@@ -139,7 +139,7 @@ optimizer:
     adamw_eps: 1.0e-8
 
 lr_scheduler:
-  _target_: hyper_models.components.optim.lr_scheduler.MultiLRScheduler
+  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
   lr_decay_style: cosine
   lr_config:
     lr_warmup_steps: 0

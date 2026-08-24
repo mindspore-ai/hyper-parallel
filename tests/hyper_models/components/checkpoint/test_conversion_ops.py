@@ -17,7 +17,7 @@
 import torch
 from transformers.core_model_loading import WeightConverter
 
-from hyper_models.components.checkpoint import (
+from hyper_parallel.auto_models.components.checkpoint import (
     AddScalar,
     ConcatenateWithSections,
     DeinterleaveQKV,

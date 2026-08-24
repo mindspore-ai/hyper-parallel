@@ -7,7 +7,7 @@ optimizer:
   lr: 0.0001
 
 lr_scheduler:
-  _target_: hyper_models.components.optim.lr_scheduler.MultiLRScheduler
+  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
   lr_decay_style: constant
   lr_config: {}
 
@@ -35,7 +35,7 @@ plan_overrides:
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_models.components.distributed.ep_compute.qwen2moe_ep_compute_fn
+      _target_: hyper_parallel.auto_models.components.distributed.ep_compute.qwen2moe_ep_compute_fn
 
 fsdp_config:
   dp_shard_size: 2

@@ -36,11 +36,11 @@ from transformers.core_model_loading import (
     WeightRenaming,
 )
 
-from hyper_models.components.distributed.injection import (
+from hyper_parallel.auto_models.components.distributed.injection import (
     inner_wrapper,
     local_compute,
 )
-from hyper_models.components.model_transform import module_replacement
+from hyper_parallel.auto_models.components.model_transform import module_replacement
 
 FLASH_CALLS = {"n": 0}
 FUSED_CALLS = {"n": 0}

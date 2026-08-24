@@ -22,31 +22,31 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from hyper_models._transformers import HyperAutoModelForCausalLM
-from hyper_models.components.data import (
+from hyper_parallel.auto_models._transformers import HyperAutoModelForCausalLM
+from hyper_parallel.auto_models.components.data import (
     DataLoader,
     DummyDataset,
     IdentityDataTransform,
     MakeMicroBatchCollator,
 )
-from hyper_models.components.loss import ModelOutputLoss
-from hyper_models.components.optim import AdamW, MultiLRScheduler
-from hyper_models.config.manager import parse_training_args
-from hyper_models.config.resolver import (
+from hyper_parallel.auto_models.components.loss import ModelOutputLoss
+from hyper_parallel.auto_models.components.optim import AdamW, MultiLRScheduler
+from hyper_parallel.auto_models.config.manager import parse_training_args
+from hyper_parallel.auto_models.config.resolver import (
     ConfigResolutionError,
     coerce_value,
     resolve_component,
     resolve_root,
 )
-from hyper_models.trainer.config import Target, TrainerConfig, TrainingConfig
+from hyper_parallel.auto_models.trainer.config import Target, TrainerConfig, TrainingConfig
 
 
-OPTIMIZER_TARGET = "hyper_models.components.optim.optimizer.optimizer.AdamW"
+OPTIMIZER_TARGET = "hyper_parallel.auto_models.components.optim.optimizer.optimizer.AdamW"
 MODEL_TARGET = (
-    "hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained"
+    "hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained"
 )
 SCHEDULER_TARGET = (
-    "hyper_models.components.optim.lr_scheduler.lr_scheduler.MultiLRScheduler"
+    "hyper_parallel.auto_models.components.optim.lr_scheduler.lr_scheduler.MultiLRScheduler"
 )
 
 
@@ -110,7 +110,7 @@ class TestTargetResolution(unittest.TestCase):
         config = resolve_root(
             _root(
                 loss_fn={
-                    "_target_": "hyper_models.components.loss.ModelOutputLoss",
+                    "_target_": "hyper_parallel.auto_models.components.loss.ModelOutputLoss",
                 }
             )
         )
@@ -172,25 +172,25 @@ class TestTargetResolution(unittest.TestCase):
         config = resolve_root(
             _root(
                 dataset={
-                    "_target_": "hyper_models.components.data.datasets.DummyDataset",
+                    "_target_": "hyper_parallel.auto_models.components.data.datasets.DummyDataset",
                     "num_samples": 16,
                     "seq_len": 8,
                     "vocab_size": 32,
                 },
                 data_transform={
                     "_target_": (
-                        "hyper_models.components.data.identity_transform."
+                        "hyper_parallel.auto_models.components.data.identity_transform."
                         "IdentityDataTransform"
                     ),
                 },
                 collate_fn={
                     "_target_": (
-                        "hyper_models.components.data.data_collator."
+                        "hyper_parallel.auto_models.components.data.data_collator."
                         "MakeMicroBatchCollator"
                     ),
                 },
                 dataloader={
-                    "_target_": "hyper_models.components.data.dataloader.DataLoader",
+                    "_target_": "hyper_parallel.auto_models.components.data.dataloader.DataLoader",
                 },
             )
         )
@@ -350,7 +350,7 @@ class TestPureDataclassResolution(unittest.TestCase):
         with self.assertRaisesRegex(ConfigResolutionError, r"unknown.*_target_"):
             resolve_component(
                 {
-                    "_target_": "hyper_models.trainer.config.TrainingConfig",
+                    "_target_": "hyper_parallel.auto_models.trainer.config.TrainingConfig",
                     "max_steps": 20,
                 },
                 expected_type=TrainingConfig,
@@ -404,7 +404,7 @@ class TestPlanOverridesResolution(unittest.TestCase):
                 "match": "*.mlp",
                 "when": "ep",
                 "local_compute_fn": {
-                    "_target_": "hyper_models.components.distributed."
+                    "_target_": "hyper_parallel.auto_models.components.distributed."
                                 "ep_compute.routed_only_ep_compute_fn",
                 },
             },
@@ -425,7 +425,7 @@ class TestPlanOverridesResolution(unittest.TestCase):
             {
                 "match": "*.self_attn",
                 "inner_wrapper": {
-                    "_target_": "hyper_models.components.distributed."
+                    "_target_": "hyper_parallel.auto_models.components.distributed."
                                 "cp_wrappers.sdpa_hf_cp_wrapper",
                 },
             },
@@ -477,7 +477,7 @@ class TestPlanOverrideDesugar(unittest.TestCase):
     """PlanOverride.to_override / entries_to_plan_overrides 脱糖语义。"""
 
     def _entry(self, **kwargs):
-        from hyper_models.trainer.config import PlanOverride
+        from hyper_parallel.auto_models.trainer.config import PlanOverride
         return PlanOverride(match=kwargs.pop("match", "*.mlp"), **kwargs)
 
     def test_placement_dsl_parsed(self):
@@ -508,7 +508,7 @@ class TestPlanOverrideDesugar(unittest.TestCase):
             self._entry(params={"weight": {"tp": "shared(0)"}}).to_override()
 
     def test_when_filter_skips_inactive(self):
-        from hyper_models.trainer.config import entries_to_plan_overrides
+        from hyper_parallel.auto_models.trainer.config import entries_to_plan_overrides
         entries = [self._entry(when="cp", inner_wrapper="sdpa_hf")]
         # cp_size=1 → 跳过（声明式门控，entry 不生效）
         self.assertEqual(
@@ -518,7 +518,7 @@ class TestPlanOverrideDesugar(unittest.TestCase):
         self.assertEqual(active["*.mlp"].inner_wrapper, "sdpa_hf")
 
     def test_when_filter_ep(self):
-        from hyper_models.trainer.config import entries_to_plan_overrides
+        from hyper_parallel.auto_models.trainer.config import entries_to_plan_overrides
         entries = [self._entry(when="ep", region_dispatch=False)]
         self.assertEqual(entries_to_plan_overrides(entries, ep_size=1), {})
         self.assertTrue(entries_to_plan_overrides(
@@ -526,13 +526,13 @@ class TestPlanOverrideDesugar(unittest.TestCase):
 
     def test_when_invalid_programmatic_rejected(self):
         """绕过 resolver 直接构造（无 Literal 校验）→ 脱糖时 fail-fast。"""
-        from hyper_models.trainer.config import entries_to_plan_overrides
+        from hyper_parallel.auto_models.trainer.config import entries_to_plan_overrides
         entries = [self._entry(when="context_parallel")]
         with self.assertRaisesRegex(ValueError, "when"):
             entries_to_plan_overrides(entries, cp_size=2)
 
     def test_same_match_entries_merge(self):
-        from hyper_models.trainer.config import entries_to_plan_overrides
+        from hyper_parallel.auto_models.trainer.config import entries_to_plan_overrides
         merged = entries_to_plan_overrides([
             self._entry(inner_target="self"),
             self._entry(inner_wrapper="sdpa_hf"),

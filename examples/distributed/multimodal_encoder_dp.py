@@ -59,16 +59,16 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
     routed_only_ep_compute_fn,
 )
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     ModuleShardingSpec,
     TP,
 )
-from hyper_models.trainer.config import Target
+from hyper_parallel.auto_models.trainer.config import Target
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 
@@ -293,7 +293,7 @@ def main():
                 region_dispatch=False,      # EP compute 内含 a2a → 不可 dispatch
                 local_compute_fn=Target(
                     routed_only_ep_compute_fn,
-                    target_path="hyper_models.components.distributed."
+                    target_path="hyper_parallel.auto_models.components.distributed."
                                 "ep_compute.routed_only_ep_compute_fn"),
             ),
         }).plan(

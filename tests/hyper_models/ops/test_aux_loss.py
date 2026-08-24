@@ -22,7 +22,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from hyper_models.ops import aux_loss_auto_scale, set_aux_loss_scale
+from hyper_parallel.auto_models.ops import aux_loss_auto_scale, set_aux_loss_scale
 from tests.common.mark_utils import arg_mark
 
 

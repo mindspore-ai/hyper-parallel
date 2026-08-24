@@ -15,7 +15,7 @@
 """ep_factories: reference implementations for writing your OWN EP compute
 factory (accuracy_fix_plan.md §3 E2).
 
-The built-in archetypes in ``hyper_models.components.distributed.ep_compute``
+The built-in archetypes in ``hyper_parallel.auto_models.components.distributed.ep_compute``
 cover the four typical transformers MoE behaviors. If your model matches none
 of them (custom router, auxiliary-loss side channels, non-SwiGLU experts,
 unusual shared-expert wiring...), copy one of the factories below and adjust
@@ -54,13 +54,13 @@ from typing import Any, Callable
 
 import torch
 
-from hyper_models.components.distributed.ep_utils import (
+from hyper_parallel.auto_models.components.distributed.ep_utils import (
     MOE_ROUTER_ADAPTERS,
     bind_local_expert_forward,
     ep_routed_forward,
     require_attrs,
 )
-from hyper_models.components.distributed.injection import local_compute
+from hyper_parallel.auto_models.components.distributed.injection import local_compute
 
 
 @local_compute

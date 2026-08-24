@@ -33,14 +33,14 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
     routed_only_ep_compute_fn,
 )
-from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
-from hyper_models.trainer.config import Target
+from hyper_parallel.auto_models.components.distributed.cp_utils import shard_batch_for_cp
+from hyper_parallel.auto_models.trainer.config import Target
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
 S = 16          # 全局序列长：需整除 2*cp（数据管道 pad 约束）与 cp*tp（布局约束）
@@ -195,7 +195,7 @@ def main():
                 region_dispatch=False,
                 local_compute_fn=Target(
                     routed_only_ep_compute_fn,
-                    target_path="hyper_models.components.distributed."
+                    target_path="hyper_parallel.auto_models.components.distributed."
                                 "ep_compute.routed_only_ep_compute_fn"),
             ),
         })

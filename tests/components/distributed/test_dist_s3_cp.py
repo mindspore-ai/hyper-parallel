@@ -11,17 +11,17 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.cp_utils import (
+from hyper_parallel.auto_models.components.distributed.cp_utils import (
     flex_cp_allgather,
     shard_batch_for_cp,
 )
-from hyper_models.components.distributed.precompiled_boundary import PrecompiledBoundary
-from hyper_models.components.distributed.sharding_applier import _wrap_inner_attention
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.precompiled_boundary import PrecompiledBoundary
+from hyper_parallel.auto_models.components.distributed.sharding_applier import _wrap_inner_attention
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     ModuleShardingSpec,
     TP,

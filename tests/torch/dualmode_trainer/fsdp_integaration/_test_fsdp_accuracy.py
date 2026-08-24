@@ -51,18 +51,18 @@ from transformers import (
     Qwen3MoeForCausalLM,
 )
 
-from hyper_models._transformers.infrastructure import instantiate_infrastructure
-from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
-from hyper_models.components.distributed.infrastructure import (
+from hyper_parallel.auto_models._transformers.infrastructure import instantiate_infrastructure
+from hyper_parallel.auto_models.components.distributed.cp_utils import shard_batch_for_cp
+from hyper_parallel.auto_models.components.distributed.infrastructure import (
     DistributedSetup,
     create_distributed_setup_from_config,
     destroy_process_group,
     initialize_distributed,
 )
-from hyper_models.components.distributed.sharding_applier import apply_sharding_plan
-from hyper_models.components.utils.device import get_device_type
-from hyper_models.config.manager import parse_training_args
-from hyper_models.trainer.config import TrainerConfig
+from hyper_parallel.auto_models.components.distributed.sharding_applier import apply_sharding_plan
+from hyper_parallel.auto_models.components.utils.device import get_device_type
+from hyper_parallel.auto_models.config.manager import parse_training_args
+from hyper_parallel.auto_models.trainer.config import TrainerConfig
 from hyper_parallel import (
     DTensor,
     DeviceMesh,

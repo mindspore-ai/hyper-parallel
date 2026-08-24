@@ -16,14 +16,14 @@
 
 import pytest
 
-from hyper_models.components.distributed.config import FSDP2Config
-import hyper_models.components.distributed.infrastructure as infrastructure_module
-from hyper_models.components.distributed.infrastructure import (
+from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
+import hyper_parallel.auto_models.components.distributed.infrastructure as infrastructure_module
+from hyper_parallel.auto_models.components.distributed.infrastructure import (
     _build_device_mesh_from_accelerator,
     create_distributed_setup_from_config,
 )
-from hyper_models.config.resolver import resolve_component
-from hyper_models.trainer.config import AcceleratorConfig
+from hyper_parallel.auto_models.config.resolver import resolve_component
+from hyper_parallel.auto_models.trainer.config import AcceleratorConfig
 from tests.common.mark_utils import arg_mark
 
 

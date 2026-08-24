@@ -24,19 +24,19 @@ import yaml
 from torch.utils.checkpoint import checkpoint
 from transformers.modeling_layers import GradientCheckpointingLayer
 
-from hyper_models._transformers.infrastructure import (
+from hyper_parallel.auto_models._transformers.infrastructure import (
     _apply_activation_checkpointing,
     apply_model_infrastructure,
 )
-from hyper_models.components.activation_checkpoint import (
+from hyper_parallel.auto_models.components.activation_checkpoint import (
     make_selective_checkpoint_context_fn,
 )
-from hyper_models.components.activation_checkpoint.activation_checkpoint import (
+from hyper_parallel.auto_models.components.activation_checkpoint.activation_checkpoint import (
     _find_transformer_layer_container_infos,
 )
-from hyper_models.components.distributed.fsdp2 import FSDP2Manager
-from hyper_models.config.resolver import resolve_component
-from hyper_models.trainer.config import ActivationCheckpointConfig
+from hyper_parallel.auto_models.components.distributed.fsdp2 import FSDP2Manager
+from hyper_parallel.auto_models.config.resolver import resolve_component
+from hyper_parallel.auto_models.trainer.config import ActivationCheckpointConfig
 
 
 class _CountingLinear(nn.Linear):
@@ -107,7 +107,7 @@ def test_disabled_activation_checkpoint_does_not_apply(mode: str | None) -> None
     original_layers = list(model.model.layers)
 
     with patch(
-        "hyper_models._transformers.infrastructure._apply_activation_checkpointing"
+        "hyper_parallel.auto_models._transformers.infrastructure._apply_activation_checkpointing"
     ) as apply_checkpoint:
         result = apply_model_infrastructure(model, activation_checkpoint=mode)
 
@@ -171,7 +171,7 @@ def test_compile_selective_checkpointing_uses_policy_fn() -> None:
     wrapper_calls = []
 
     with patch(
-        "hyper_models.components.activation_checkpoint."
+        "hyper_parallel.auto_models.components.activation_checkpoint."
         "activation_checkpoint.checkpoint_wrapper",
         side_effect=lambda layer, **kwargs: wrapper_calls.append((layer, kwargs)) or layer,
     ):
@@ -211,11 +211,11 @@ def test_selective_checkpoint_recomputes_mutated_topk_output() -> None:
 def test_selective_context_registers_profiler_and_fsdp_runtime_ops() -> None:
     with (
         patch(
-            "hyper_models.components.activation_checkpoint.activation_checkpoint."
+            "hyper_parallel.auto_models.components.activation_checkpoint.activation_checkpoint."
             "ensure_profiler_ops_sac_ignored"
         ) as ensure_profiler_ops,
         patch(
-            "hyper_models.components.activation_checkpoint.activation_checkpoint."
+            "hyper_parallel.auto_models.components.activation_checkpoint.activation_checkpoint."
             "ensure_fsdp_ops_sac_ignored"
         ) as ensure_fsdp_ops,
     ):
@@ -248,7 +248,7 @@ def test_selective_checkpointing_falls_back_for_kv_sharing(caplog) -> None:
     with (
         caplog.at_level("WARNING"),
         patch(
-            "hyper_models.components.activation_checkpoint."
+            "hyper_parallel.auto_models.components.activation_checkpoint."
             "activation_checkpoint.checkpoint_wrapper",
             side_effect=lambda submodule: wrapped_submodules.append(submodule)
             or submodule,
@@ -358,7 +358,7 @@ def test_full_checkpointing_uses_hf_native_api_for_eligible_language_model() -> 
     model = _HFGradientCheckpointingModel()
 
     with patch(
-        "hyper_models.components.activation_checkpoint."
+        "hyper_parallel.auto_models.components.activation_checkpoint."
         "activation_checkpoint.checkpoint_wrapper"
     ) as wrapper:
         _apply_activation_checkpointing(model, "full")
@@ -375,7 +375,7 @@ def test_compile_disables_hf_native_checkpointing() -> None:
     original_mlp = model.model.layers[0].mlp
 
     with patch(
-        "hyper_models.components.activation_checkpoint."
+        "hyper_parallel.auto_models.components.activation_checkpoint."
         "activation_checkpoint.checkpoint_wrapper",
         side_effect=lambda layer, **kwargs: wrapper_calls.append((layer, kwargs)) or layer,
     ):
@@ -405,7 +405,7 @@ def test_full_submodule_checkpointing_skips_attention_for_kv_sharing() -> None:
     wrapped_submodules = []
 
     with patch(
-        "hyper_models.components.activation_checkpoint."
+        "hyper_parallel.auto_models.components.activation_checkpoint."
         "activation_checkpoint.checkpoint_wrapper",
         side_effect=lambda submodule: wrapped_submodules.append(submodule) or submodule,
     ):
@@ -456,11 +456,11 @@ def test_activation_checkpoint_is_after_sharding_and_before_fsdp() -> None:
 
     with (
         patch(
-            "hyper_models._transformers.infrastructure.apply_sharding_plan",
+            "hyper_parallel.auto_models._transformers.infrastructure.apply_sharding_plan",
             side_effect=_apply_sharding,
         ),
         patch(
-            "hyper_models.components.activation_checkpoint."
+            "hyper_parallel.auto_models.components.activation_checkpoint."
             "activation_checkpoint.checkpoint_wrapper",
             side_effect=_checkpoint_wrapper,
         ),

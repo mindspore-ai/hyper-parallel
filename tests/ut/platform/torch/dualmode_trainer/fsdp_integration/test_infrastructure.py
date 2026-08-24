@@ -23,10 +23,10 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers.core_model_loading import WeightRenaming
 
-import hyper_models._transformers.infrastructure as infrastructure_module
-from hyper_models.components.distributed.config import FSDP2Config
-from hyper_models.components.distributed.fsdp2 import FSDP2Manager
-from hyper_models.components.distributed.infrastructure import MeshContext
+import hyper_parallel.auto_models._transformers.infrastructure as infrastructure_module
+from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
+from hyper_parallel.auto_models.components.distributed.fsdp2 import FSDP2Manager
+from hyper_parallel.auto_models.components.distributed.infrastructure import MeshContext
 from tests.common.mark_utils import arg_mark
 
 

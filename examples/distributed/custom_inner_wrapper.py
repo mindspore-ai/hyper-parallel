@@ -34,17 +34,17 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ModuleShardingSpec,
     ShardingPlanner,
     apply_sharding_plan,
     inner_wrapper,
 )
-from hyper_models.components.distributed.cp_utils import (
+from hyper_parallel.auto_models.components.distributed.cp_utils import (
     flex_cp_allgather,
     shard_batch_for_cp,
 )
-from hyper_models.components.distributed.cp_wrappers import (
+from hyper_parallel.auto_models.components.distributed.cp_wrappers import (
     INNER_WRAPPER_REGISTRY,
 )
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh

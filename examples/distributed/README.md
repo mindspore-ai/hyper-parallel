@@ -27,9 +27,9 @@
 > merge 语义；未命中且全部未声明则报错）；YAML
 > `plan_overrides` 是其传输形态（trainer 侧 `entries_to_plan_overrides()`
 > 脱糖后传入同一接口），也可 plan 后直接给 spec 赋值。仓内默认实现：
-> `hyper_models.components.distributed.cp_wrappers`（四个 CP wrapper +
+> `hyper_parallel.auto_models.components.distributed.cp_wrappers`（四个 CP wrapper +
 > `INNER_WRAPPER_REGISTRY`）与
-> `hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn`。
+> `hyper_parallel.auto_models.components.distributed.ep_compute.hf_native_ep_compute_fn`。
 
 使用教程：`docs/components_distributed_tutorial.md`
 设计文档：`docs/detailed_design/05_dual_mode_dtensor_parallel_strategy.md`

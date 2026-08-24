@@ -33,7 +33,7 @@ from hyper_parallel import init_device_mesh  # pylint: disable=C0413
 from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413
 from hyper_parallel.core.dtensor.placement_types import Shard  # pylint: disable=C0413
 from hyper_parallel.core.tensor_parallel import loss_parallel, is_loss_parallel_active  # pylint: disable=C0413
-from hyper_models.components.loss.loss_parallel import causal_lm_loss_parallel  # pylint: disable=C0413
+from hyper_parallel.auto_models.components.loss.loss_parallel import causal_lm_loss_parallel  # pylint: disable=C0413
 
 
 np.random.seed(42)

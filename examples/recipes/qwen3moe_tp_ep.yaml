@@ -25,7 +25,7 @@ plan_overrides:
     when: ep
     region_dispatch: false   # EP compute 内含 all-to-all，不可 dispatch
     local_compute_fn:
-      _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
+      _target_: hyper_parallel.auto_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
       # Qwen3-MoE 对应 qwen3moe archetype（TopKRouter 路由内嵌）；其他模型按
       # ep_compute.py 的 archetype 表选择（Mixtral → routed_only，Qwen2-MoE →
       # qwen2moe，DeepSeek-V3/GLM-4-MoE → deepseekv3）；自定义路由的 MoE 写自己的

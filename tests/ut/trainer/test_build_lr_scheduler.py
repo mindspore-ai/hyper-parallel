@@ -19,7 +19,7 @@ import unittest
 import torch
 from torch import nn
 
-from hyper_models.components.optim import MultiLRScheduler
+from hyper_parallel.auto_models.components.optim import MultiLRScheduler
 from hyper_parallel.core.optimizer import ChainedOptimizer
 
 

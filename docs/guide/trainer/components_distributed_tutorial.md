@@ -1,10 +1,10 @@
-# hyper_models/components/distributed 双模式 DTensor 使用教程
+# hyper_parallel/auto_models/components/distributed 双模式 DTensor 使用教程
 
 > **文档层级（2026-08-10）**：本教程与 [patch_injection_mechanism.md](../../patch_injection_mechanism.md)
 > 是使用/机制语义的**现行口径唯一权威**；其余设计文档与代码串讲为辅助
 > 材料，说法冲突时以这两份为准。
-> 适用组件：`hyper_models/components/distributed/`
-> 设计文档：[hyper_models_dual_mode_dtensor_design.md](../../hyper_models_dual_mode_dtensor_design.md)
+> 适用组件：`hyper_parallel/auto_models/components/distributed/`
+> 设计文档：[auto_models_dual_mode_dtensor_design.md](../../auto_models_dual_mode_dtensor_design.md)
 > 代码走读：[components_distributed_code_walkthrough.md](../../trainer/code_guides/components_distributed_code_walkthrough.md)；
 > FunctionModule 机制走读：[function_module_autograd_walkthrough.md](../../trainer/code_guides/function_module_autograd_walkthrough.md)
 > 场景配方：[examples/recipes/](../../../examples/recipes/README.md)（按 arch/拓扑可引用的 YAML 起点）
@@ -41,7 +41,7 @@ TP/CP/EP/FSDP/多维组合 → §10 自定义注入完整指南 → §11-§13 �
 
 ## 1. 组件概述
 
-`hyper_models/components/distributed` 是独立可用的 DTensor 分片组件，零依赖训练流程
+`hyper_parallel/auto_models/components/distributed` 是独立可用的 DTensor 分片组件，零依赖训练流程
 （不 import `recipes/` / `models/` / `datasets/`），两步用法：
 
 ```
@@ -69,7 +69,7 @@ apply_sharding_plan(model, plan, mesh)   → (model, source_shard_info)  # 双�
 ```python
 import torch.distributed as dist
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
-from hyper_models.components.distributed import ShardingPlanner, apply_sharding_plan
+from hyper_parallel.auto_models.components.distributed import ShardingPlanner, apply_sharding_plan
 
 dist.init_process_group("gloo")   # 或 nccl/hccl
 
@@ -204,7 +204,7 @@ forward 签名推导的**建议 spec 草稿**（改成你的布局即可用）�
 ### 4.2 `check_dispatchable(fn, example_inputs, mesh)`：region_dispatch 判定工具
 
 ```python
-from hyper_models.components.distributed import check_dispatchable
+from hyper_parallel.auto_models.components.distributed import check_dispatchable
 report = check_dispatchable(my_compute_fn, [x_local, w_local], mesh)
 print(report)   # dispatchable=True/False + 首个失败算子 + 填写建议
 ```
@@ -286,8 +286,8 @@ vocab 并行 CE loss（上游 loss 侧消费）。默认 `False` 时 lm_head 出
 命名不命中默认规则时（如自研 `wq/wk/wv`），注册架构覆盖：
 
 ```python
-from hyper_models.components.distributed.sharding_planner import ARCH_OVERRIDES
-from hyper_models.components.distributed.param_role import ParamRole
+from hyper_parallel.auto_models.components.distributed.sharding_planner import ARCH_OVERRIDES
+from hyper_parallel.auto_models.components.distributed.param_role import ParamRole
 
 ARCH_OVERRIDES["myarch"] = [
     (["wq", "wk", "wv"], ParamRole.COLWISE),
@@ -377,7 +377,7 @@ all-gather，由 **inner attention wrapper** 在区域内部完成。
 ### 6.1 数据管道：batch 必须先按 CP 切分
 
 ```python
-from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
+from hyper_parallel.auto_models.components.distributed.cp_utils import shard_batch_for_cp
 
 cp_mesh = mesh["cp"]
 batch = shard_batch_for_cp(batch, cp_mesh)   # 每个 rank 取自己的序列 chunk
@@ -470,7 +470,7 @@ ShardingPlanner(plan_overrides={
 #        when: cp            # 激活条件自述必要性：cp_size>1 才应用（缺省=总是）
 #        region_dispatch: false   # 必填：wrapper 内含通信，不可 dispatch
 #        inner_wrapper:
-#          _target_: hyper_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper
+#          _target_: hyper_parallel.auto_models.components.distributed.cp_wrappers.sdpa_hf_cp_wrapper
 # ③ plan 后直接赋值（两字段都要补）：
 #    spec = plan.modules["...self_attn"]
 #    spec.inner_wrapper = "sdpa_hf"; spec.region_dispatch = False
@@ -686,7 +686,7 @@ plan = ShardingPlanner(plan_overrides={
     "*.mlp": ModuleShardingSpec(
         local_compute_fn=Target(
             hf_native_ep_compute_fn,
-            target_path="hyper_models.components.distributed."
+            target_path="hyper_parallel.auto_models.components.distributed."
                         "ep_compute.hf_native_ep_compute_fn"),
         # 必填伴生声明：EP compute 内含 all-to-all 通信 → 区域内不可 dispatch
         region_dispatch=False),
@@ -697,7 +697,7 @@ model, source_shard_info = apply_sharding_plan(model, plan, mesh)
 #     - match: "*.mlp"
 #       when: ep
 #       local_compute_fn:
-#         _target_: hyper_models.components.distributed.ep_compute.hf_native_ep_compute_fn
+#         _target_: hyper_parallel.auto_models.components.distributed.ep_compute.hf_native_ep_compute_fn
 #       region_dispatch: false   # 必填：compute 内含 a2a 通信，不可 dispatch
 ```
 
@@ -906,8 +906,8 @@ DTensor 上跑传播校验，无需任何声明；**一旦声明注入（`local_
 等恒继承）：
 
 ```python
-from hyper_models.components.distributed import ModuleShardingSpec
-from hyper_models.components.distributed.sharding_config import TP, CP
+from hyper_parallel.auto_models.components.distributed import ModuleShardingSpec
+from hyper_parallel.auto_models.components.distributed.sharding_config import TP, CP
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, Partial
 
 spec = ModuleShardingSpec(
@@ -1187,7 +1187,7 @@ fail-fast）。`inner_target="self"` 时按 self 情形用边界 out_src 重包�
 **示例 F：注册命名方案（团队共享）**
 
 ```python
-from hyper_models.components.distributed.cp_wrappers import INNER_WRAPPER_REGISTRY
+from hyper_parallel.auto_models.components.distributed.cp_wrappers import INNER_WRAPPER_REGISTRY
 
 INNER_WRAPPER_REGISTRY["my_flash"] = my_flash_cp_wrapper   # 须已带 @inner_wrapper
 # 之后任意 spec 可写 inner_wrapper="my_flash"——仍需成对声明 inner_target
@@ -1303,7 +1303,7 @@ dict 全覆盖，production/validate 双模式对拍单卡，计数器逐一断�
 流程：
 
 ```python
-from hyper_models.components.distributed import FunctionModule
+from hyper_parallel.auto_models.components.distributed import FunctionModule
 
 self.a_fn = FunctionModule(A)       # 挂在宿主 __init__：获得 FQN
 # forward 里：A.apply(x) → self.a_fn(x)

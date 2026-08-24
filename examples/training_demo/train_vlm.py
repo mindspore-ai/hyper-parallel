@@ -14,9 +14,9 @@
 # ============================================================================
 """Run the VLM Trainer path with a Qwen-VL model and multimodal data."""
 
-from hyper_models.config.manager import parse_training_args
-from hyper_models.trainer.config import TrainerConfig
-from hyper_models.trainer.vlm_trainer import VLMTrainer
+from hyper_parallel.auto_models.config.manager import parse_training_args
+from hyper_parallel.auto_models.trainer.config import TrainerConfig
+from hyper_parallel.auto_models.trainer.vlm_trainer import VLMTrainer
 
 
 def main() -> None:

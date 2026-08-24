@@ -24,7 +24,7 @@ import torch
 
 torch_npu = pytest.importorskip("torch_npu")
 
-from hyper_models.ops import npu_fusion_attention_forward
+from hyper_parallel.auto_models.ops import npu_fusion_attention_forward
 from tests.common.mark_utils import arg_mark
 
 

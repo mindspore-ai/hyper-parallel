@@ -31,10 +31,10 @@ from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 from transformers.conversion_mapping import get_model_conversion_mapping
 from transformers.core_model_loading import Chunk, WeightConverter, WeightRenaming
 
-import hyper_models._transformers.checkpoint_loader as checkpoint_loader
-import hyper_models._transformers.infrastructure as infrastructure_module
-from hyper_models.config.resolver import resolve_component
-from hyper_models.trainer.config import PlanOverride, entries_to_module_replacements
+import hyper_parallel.auto_models._transformers.checkpoint_loader as checkpoint_loader
+import hyper_parallel.auto_models._transformers.infrastructure as infrastructure_module
+from hyper_parallel.auto_models.config.resolver import resolve_component
+from hyper_parallel.auto_models.trainer.config import PlanOverride, entries_to_module_replacements
 from tests.common.mark_utils import arg_mark
 
 

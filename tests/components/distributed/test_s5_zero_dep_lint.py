@@ -7,7 +7,7 @@ models/datasets）。"""
 import ast
 from pathlib import Path
 
-import hyper_models.components.distributed as dist_pkg
+import hyper_parallel.auto_models.components.distributed as dist_pkg
 
 FORBIDDEN = ("recipes", "_transformers", "hyper_parallel.models",
              "datasets", "trainer")

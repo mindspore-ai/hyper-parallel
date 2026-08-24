@@ -20,8 +20,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from hyper_models.components.datasets.llm.build_data_transform import PlaintextTransform
-from hyper_models.components.datasets.llm.build_dataset import build_llm_dataset
+from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import PlaintextTransform
+from hyper_parallel.auto_models.components.datasets.llm.build_dataset import build_llm_dataset
 
 
 class _Tokenizer:
@@ -109,7 +109,7 @@ def test_online_iterable_hub_source_does_not_require_data_path(monkeypatch) -> N
         return iter([{"input_ids": [1, 2], "labels": [1, 2]}])
 
     monkeypatch.setattr(
-        "hyper_models.components.datasets.llm.build_dataset.build_online_dataset",
+        "hyper_parallel.auto_models.components.datasets.llm.build_dataset.build_online_dataset",
         _build_online_dataset,
     )
     dataset = build_llm_dataset(

@@ -23,7 +23,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 
-import hyper_models._transformers.checkpoint_loader as checkpoint_loader
+import hyper_parallel.auto_models._transformers.checkpoint_loader as checkpoint_loader
 from hyper_parallel import DTensor, Shard, distribute_tensor, init_device_mesh
 from tests.torch.utils import init_dist
 

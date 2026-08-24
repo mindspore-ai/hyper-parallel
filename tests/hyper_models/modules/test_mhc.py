@@ -23,16 +23,16 @@ from typing import Any
 import torch
 from torch import nn
 
-from hyper_models.components.model_transform import (
+from hyper_parallel.auto_models.components.model_transform import (
     ModuleReplacementSpec,
     apply_module_replacements,
     compile_module_replacements,
 )
-from hyper_models.modules import MhcPostModule, MhcPostProcessModule, MhcPreModule
-from hyper_models.ops import mhc_post, mhc_pre
-from hyper_models.ops.mhc_post import mhc_post_process
+from hyper_parallel.auto_models.modules import MhcPostModule, MhcPostProcessModule, MhcPreModule
+from hyper_parallel.auto_models.ops import mhc_post, mhc_pre
+from hyper_parallel.auto_models.ops.mhc_post import mhc_post_process
 
-mhc_pre_module = importlib.import_module("hyper_models.ops.mhc_pre")
+mhc_pre_module = importlib.import_module("hyper_parallel.auto_models.ops.mhc_pre")
 
 
 def _config() -> SimpleNamespace:

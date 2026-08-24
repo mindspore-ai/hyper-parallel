@@ -22,7 +22,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import hyper_models.trainer.text_trainer as text_trainer_module
+import hyper_parallel.auto_models.trainer.text_trainer as text_trainer_module
 
 
 class _FakeBaseTrainer:

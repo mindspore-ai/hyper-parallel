@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 from torch import nn
 
-from hyper_models.components.optim import AdamW
+from hyper_parallel.auto_models.components.optim import AdamW
 
 
 class _Model(nn.Module):
@@ -42,7 +42,7 @@ def test_adamw_builds_core_optimizer_from_prefixed_config() -> None:
     }
 
     with patch(
-        "hyper_models.components.optim.optimizer.optimizer.get_hyper_optimizer",
+        "hyper_parallel.auto_models.components.optim.optimizer.optimizer.get_hyper_optimizer",
         return_value=runtime,
     ) as build_core:
         component = AdamW(

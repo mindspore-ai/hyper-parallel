@@ -11,7 +11,7 @@
 ```python
 from dataclasses import dataclass
 
-from hyper_models.components.optim import LRScheduler
+from hyper_parallel.auto_models.components.optim import LRScheduler
 
 
 class MyWarmup(LRScheduler):
@@ -51,7 +51,7 @@ lr_scheduler:
 解析阶段得到的是 Config：
 
 ```python
-from hyper_models.config.manager import parse_training_args
+from hyper_parallel.auto_models.config.manager import parse_training_args
 
 config = parse_training_args()
 scheduler_config = config.lr_scheduler
@@ -65,8 +65,8 @@ Trainer 取得 optimizer 等运行时依赖后，再调用该 Config 的 `build(
 新增 optimizer 时继承 `Optimizer`，新增 loss 时继承 `Loss`：
 
 ```python
-from hyper_models.components.loss import Loss
-from hyper_models.components.optim import Optimizer
+from hyper_parallel.auto_models.components.loss import Loss
+from hyper_parallel.auto_models.components.optim import Optimizer
 ```
 
 对应 Config 分别继承 `Optimizer.Config` 和 `Loss.Config`。`TrainerConfig` 使用组件基类 Config 作为字段类型，因此新增实现不需要给 Trainer 增加新的类型分支。

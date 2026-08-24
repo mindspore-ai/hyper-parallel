@@ -10,17 +10,17 @@
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from hyper_models.components.distributed import (
+from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_models.components.distributed.cp_utils import shard_batch_for_cp
-from hyper_models.components.distributed.sharding_config import (
+from hyper_parallel.auto_models.components.distributed.cp_utils import shard_batch_for_cp
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     ModuleShardingSpec,
     TP,
 )
-from hyper_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import (

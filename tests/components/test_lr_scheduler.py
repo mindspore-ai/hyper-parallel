@@ -18,7 +18,7 @@ import pytest
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR
 
-from hyper_models.components.optim import cosine_with_warmup
+from hyper_parallel.auto_models.components.optim import cosine_with_warmup
 
 
 def _build_optimizer() -> torch.optim.Optimizer:

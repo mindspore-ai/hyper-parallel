@@ -40,8 +40,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 pytest.importorskip("torch_npu")
 
-import hyper_models.modules.dsa_attention as dsa_attention_module
-from hyper_models.modules import (
+import hyper_parallel.auto_models.modules.dsa_attention as dsa_attention_module
+from hyper_parallel.auto_models.modules import (
     DeepseekV32DSAAttention,
     GQAAttention,
     MLAAttention,

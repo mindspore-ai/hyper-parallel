@@ -14,7 +14,7 @@
 # ============================================================================
 """Tests for basic data-transform components."""
 
-from hyper_models.components.data import IdentityDataTransform
+from hyper_parallel.auto_models.components.data import IdentityDataTransform
 
 
 def test_identity_data_transform_retains_tokenizer_and_example() -> None:

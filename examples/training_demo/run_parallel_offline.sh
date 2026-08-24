@@ -37,7 +37,7 @@ cd "${PROJECT_ROOT}"
 mkdir -p "${OUTPUT_DIR}" "${DATA_ROOT}/raw" "${DATA_ROOT}/indexed"
 
 if [[ ! -s "${RAW_DATA_PATH}" ]]; then
-    python -m hyper_models.components.datasets.tools.huggingface_offline \
+    python -m hyper_parallel.auto_models.components.datasets.tools.huggingface_offline \
         --dataset Salesforce/wikitext \
         --dataset-subset wikitext-2-raw-v1 \
         --dataset-split train \
@@ -55,7 +55,7 @@ if [[ ! -s "${RAW_DATA_PATH}" ]]; then
 fi
 
 if [[ ! -s "${INDEXED_DATA_PATH}.bin" || ! -s "${INDEXED_DATA_PATH}.idx" ]]; then
-    python -m hyper_models.components.datasets.tools.offline_preparation \
+    python -m hyper_parallel.auto_models.components.datasets.tools.offline_preparation \
         --dataset-name-or-path "${RAW_DATA_PATH}" \
         --json-keys text \
         --output-prefix "${INDEXED_OUTPUT_PREFIX}" \
