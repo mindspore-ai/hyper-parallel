@@ -1,3 +1,17 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # HyperParallel MindSpore Ascend NPU Environment
 # ==============================================
 # Base image:
@@ -8,12 +22,19 @@
 
 ARG CANN_QUAY_URL="quay.io/ascend/cann"
 ARG CANN_VERSION="9.1.0"
+ARG CANN_ARCH="a3"
 ARG BASE_OS="ubuntu22.04"
-FROM ${CANN_QUAY_URL}:${CANN_VERSION}-a3-${BASE_OS}-py3.12
+ARG PYTHON_VERSION="3.12"
+FROM ${CANN_QUAY_URL}:${CANN_VERSION}-${CANN_ARCH}-${BASE_OS}-py${PYTHON_VERSION}
+
+ARG CANN_VERSION
+ARG CANN_ARCH
+ARG BASE_OS
+ARG PYTHON_VERSION
 
 LABEL maintainer="jianzhnie"
 LABEL description="HyperParallel MindSpore Ascend NPU environment"
-LABEL version="cann9.1.0-hyper-parallel-mindspore"
+LABEL version="cann${CANN_VERSION}-${CANN_ARCH}-hyper-parallel-mindspore"
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 ARG BUILD_MULTICORE_EXTENSION="off"
@@ -22,27 +43,35 @@ ARG BUILD_CUSTOM_OPS_EXTENSION="off"
 ARG HYPER_PARALLEL_BUILD_STRICT="off"
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    ASCEND_HOME_PATH=/usr/local/Ascend/cann-${CANN_VERSION} \
+    ASCEND_HOME_PATH=/usr/local/Ascend/cann \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
     BUILD_MULTICORE_EXTENSION=${BUILD_MULTICORE_EXTENSION} \
     BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION} \
     BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION} \
-    HYPER_PARALLEL_BUILD_STRICT=${HYPER_PARALLEL_BUILD_STRICT} 
+    HYPER_PARALLEL_BUILD_STRICT=${HYPER_PARALLEL_BUILD_STRICT}
 
-ENV PATH=${ASCEND_HOME_PATH}/bin:${ASCEND_HOME_PATH}/tools/ccec_compiler/bin:${PATH}
-ENV LD_LIBRARY_PATH=${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/aarch64-linux/devlib:${LD_LIBRARY_PATH}
+ENV PATH=/usr/local/Ascend/cann/bin:/usr/local/Ascend/cann/tools/ccec_compiler/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/Ascend/cann/lib64:/usr/local/Ascend/cann/aarch64-linux/devlib:${LD_LIBRARY_PATH}
 
 WORKDIR /workspace/hyper-parallel
 
-RUN if [ ! -e /usr/local/Ascend/cann ]; then \
-        ln -s "${ASCEND_HOME_PATH}" /usr/local/Ascend/cann; \
-    fi \
-    && test -f /usr/local/Ascend/cann/set_env.sh \
-    && printf '%s\n' \
+RUN set -eux; \
+    if [ ! -f /usr/local/Ascend/cann/set_env.sh ]; then \
+        if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then \
+            ln -sfn /usr/local/Ascend/ascend-toolkit /usr/local/Ascend/cann; \
+        else \
+            CANN_HOME="$(find /usr/local/Ascend -mindepth 1 -maxdepth 1 -type d -name 'cann-*' \
+                | sort | head -n 1)"; \
+            test -n "${CANN_HOME}"; \
+            ln -sfn "${CANN_HOME}" /usr/local/Ascend/cann; \
+        fi; \
+    fi; \
+    test -f /usr/local/Ascend/cann/set_env.sh; \
+    printf '%s\n' \
         'if [ -f /usr/local/Ascend/cann/set_env.sh ]; then' \
-        '    source /usr/local/Ascend/cann/set_env.sh' \
+        '    . /usr/local/Ascend/cann/set_env.sh' \
         'fi' \
         > /etc/profile.d/hyper-parallel-ascend.sh
 

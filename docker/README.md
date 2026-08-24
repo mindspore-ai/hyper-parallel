@@ -30,7 +30,7 @@ bash docker/build_hyper-parallel_npu.sh hyper-parallel:npu
 构建完成后启动本地镜像：
 
 ```bash
-IMAGE=hyper-parallel:npu bash docker/run_hyper-parallel.sh
+IMAGE=hyper-parallel:npu bash docker/run_hyper-parallel.sh --name hyper-parallel-npu --cards auto
 ```
 
 ### 3. 进入容器并验证
@@ -89,7 +89,8 @@ torch26 | torch27 | torch29 | torch | mindspore | all
 
 ## 启动容器
 
-启动默认镜像并进入 shell。脚本会自动挂载当前仓库的父目录，并删除同名旧容器：
+启动默认镜像并进入 shell。脚本默认挂载当前仓库目录，并删除同名旧容器；`--cards auto` 会自动
+探测主机上的 NPU 卡，适配 A2/A3 及非 8 卡机器：
 
 ```bash
 bash docker/run_hyper-parallel.sh
@@ -101,18 +102,17 @@ bash docker/run_hyper-parallel.sh
 bash docker/run_hyper-parallel.sh --cards 0,1
 ```
 
+也可以通过环境变量指定卡列表或硬件对应的默认列表：
+
+```bash
+CARDS=auto DEFAULT_CARDS=0,1,2,3 bash docker/run_hyper-parallel.sh
+```
+
 执行验证命令：
 
 ```bash
-bash docker/run_hyper-parallel.sh --cards 0 -- \
+bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
   python3 -c "import hyper_parallel as hp; print(hp.get_platform())"
-```
-
-切换仓库路径或工作目录：
-
-```bash
-bash docker/run_hyper-parallel.sh \
-  --workdir /workspace/hyper-parallel
 ```
 
 ## Native 扩展构建
@@ -159,3 +159,16 @@ for name in ("hyper_parallel", "torch", "torch-npu", "mindspore"):
         pass
 PY
 ```
+
+## 基础版本参数
+
+构建脚本支持通过环境变量覆盖基础镜像版本和硬件架构：
+
+```bash
+CANN_VERSION=9.1.0 CANN_ARCH=a2 PYTHON_VERSION=3.12 \
+bash docker/build_hyper-parallel_npu.sh hyper-parallel:a2
+```
+
+其中 `CANN_ARCH` 用于选择基础镜像标签（例如 `a2` 或 `a3`，具体以镜像仓库实际提供的标签为准）。
+若基础镜像使用 `/usr/local/Ascend/ascend-toolkit` 或带版本号的 CANN 目录，Dockerfile 会自动
+创建统一的 `/usr/local/Ascend/cann` 路径。
