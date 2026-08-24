@@ -17,8 +17,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Any, List, NamedTuple, Optional
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
 import mindspore as ms
 from mindspore.common.api import _no_grad
@@ -26,9 +26,8 @@ import mindspore.mint.distributed as dist
 
 from hyper_parallel.core.fully_shard.hsdp_scheduler import ParamGroupCommCtx
 from hyper_parallel.core.fully_shard.hsdp_utils import apply_gradient_scaling_factor
-from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, MixedPrecisionPolicy
+from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
-from hyper_parallel.platform.mindspore.fully_shard.pack_utils import build_rs_plan, pack_for_reduce_scatter
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
 
 
@@ -51,42 +50,15 @@ class AllGatherMetadata:
     dtype: Any
     inp_split_sizes: list[int]
     total_input_numel: int
-    hash_key: int = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.hash_key = hash(
-            (
-                tuple(tuple(dtypes) for dtypes in self.param_input_dtypes),
-                tuple(tuple(numels) for numels in self.param_input_numels),
-                self.dtype,
-                tuple(self.inp_split_sizes),
-                self.total_input_numel,
-            )
-        )
 
 
-class AllGatherResult(NamedTuple):
+@dataclass
+class AllGatherResult:
     """Keep fused all-gather buffers and handle alive until copy-out."""
 
     all_gather_input: Optional[ms.Tensor]
     all_gather_output: Optional[ms.Tensor]
-    metadata: Optional[AllGatherMetadata]
     handle: Optional[Any]
-
-
-class AllGatherMetadataCache:
-    """Cache all-gather metadata across iterations."""
-
-    _cache: dict[int, AllGatherMetadata] = {}
-
-    @classmethod
-    def get_metadata(cls, hsdp_params, fn):
-        """Retrieve or compute metadata keyed by parameter identity and version."""
-        param_key = tuple((id(param), getattr(param, "version", 0)) for param in hsdp_params)
-        key = hash(param_key)
-        if key not in cls._cache:
-            cls._cache[key] = fn(hsdp_params)
-        return cls._cache[key]
 
 
 @dataclass
@@ -109,8 +81,8 @@ class AllGatherBucket:
             return
         if result.handle is not None:
             result.handle.wait()
-        all_gather_output = result.all_gather_output
-        output_buffers = []
+            result.handle = None
+        gathered_rows = result.all_gather_output.reshape(self.shard_world_size, -1)
         for input_numels, input_dtypes, hsdp_param in zip(
             self.metadata.param_input_numels,
             self.metadata.param_input_dtypes,
@@ -120,16 +92,51 @@ class AllGatherBucket:
                 input_numels,
                 input_dtypes,
                 self.shard_world_size,
-                _normalize_device(all_gather_output.device),
+                _normalize_device(result.all_gather_output.device),
             )
             hsdp_param.alloc_unsharded_param_buffers()
-            output_buffers.extend(hsdp_param.unsharded_param_buffers)
-        split_with_sizes_copy(
-            all_gather_output.view(self.shard_world_size, -1),
-            self.metadata.inp_split_sizes,
-            dim=1,
-            out=[tensor.view(self.shard_world_size, -1) for tensor in output_buffers],
-        )
+
+        column_offset = 0
+        for input_numels, hsdp_param in zip(
+            self.metadata.param_input_numels,
+            self.hsdp_params,
+        ):
+            if hsdp_param.hsdp_placement.dim != 0 and len(input_numels) != 1:
+                raise NotImplementedError(
+                    "Fused non-dim-0 all-gather expects one local shard tensor per parameter."
+                )
+            for input_numel, output_buffer in zip(
+                input_numels,
+                hsdp_param.unsharded_param_buffers,
+            ):
+                gathered_param = gathered_rows.narrow(1, column_offset, input_numel)
+                if hsdp_param.hsdp_placement.dim == 0:
+                    destination = output_buffer.reshape(self.shard_world_size, -1)
+                    source = gathered_param
+                else:
+                    packed_shape = list(hsdp_param.sharded_size)
+                    packed_shape[0] *= self.shard_world_size
+                    packed_param = gathered_param.contiguous().reshape(packed_shape)
+                    param_chunks = packed_param.chunk(self.shard_world_size, dim=0)
+                    source = ms.mint.cat(
+                        param_chunks,
+                        dim=hsdp_param.hsdp_placement.dim,
+                    )
+                    destination = output_buffer.reshape(hsdp_param._orig_size)
+                # MindSpore has no cat(out=); the non-dim-0 branch materializes
+                # one temporary source before updating the stable destination.
+                copy_without_bumping_version(
+                    destination,
+                    source,
+                )
+                column_offset += input_numel
+        if column_offset != gathered_rows.shape[1]:
+            raise AssertionError(
+                "Fused all-gather copy-out consumed an unexpected number of elements: "
+                f"{column_offset} != {gathered_rows.shape[1]}"
+            )
+        result.all_gather_input = None
+        result.all_gather_output = None
         self.all_gather_result = None
 
 
@@ -178,7 +185,7 @@ class ReduceScatterBucket:
         """Whether this bucket needs an actual reduce-scatter collective."""
         return self.shard_group is not None and self.shard_world_size > 1
 
-    def move_reduce_scatter_output(self) -> ms.Tensor:
+    def move_reducescatter_output(self) -> ms.Tensor:
         """Transfer exclusive ownership of the completed output."""
         if self.reduce_scatter_output is None:
             raise RuntimeError("Reduce-scatter output has already been released.")
@@ -196,6 +203,7 @@ class AllReduceBucket:
     replicate_group: Any
     replicate_world_size: int
     dtype: Any
+    reduce_op: str
     needs_avg_div: bool
     all_reduce_output: Optional[ms.Tensor] = None
     handle: Optional[Any] = None
@@ -206,9 +214,19 @@ class AllReduceBucket:
         return self.layout.hsdp_params
 
     @property
+    def param_numels(self) -> list[int]:
+        """Return padded parameter sizes in the all-reduce output."""
+        return self.layout.param_numels
+
+    @property
+    def param_offsets(self) -> list[int]:
+        """Return parameter offsets in the all-reduce output."""
+        return self.layout.param_offsets
+
+    @property
     def uses_collective(self) -> bool:
         """Whether this bucket needs an actual all-reduce collective."""
-        return self.replicate_group is not None and self.replicate_world_size > 1
+        return self.replicate_world_size > 1
 
 
 def get_all_gather_metadata(hsdp_params) -> AllGatherMetadata:
@@ -243,33 +261,35 @@ def get_all_gather_metadata(hsdp_params) -> AllGatherMetadata:
 
 @_no_grad()
 def all_gather_copy_in(
-    all_gather_inputs,
-    all_gather_output,
-    inp_split_sizes,
-    all_gather_input_numel,
-    rank,
-):
-    """Build a contiguous fused all-gather input without writing through views."""
-    del inp_split_sizes, all_gather_input_numel, rank
-    all_gather_input = ms.mint.cat(
-        [tensor.reshape(-1) for tensor in all_gather_inputs],
-        dim=0,
+    all_gather_inputs: list[ms.Tensor],
+    all_gather_output: ms.Tensor,
+    inp_split_sizes: list[int],
+    all_gather_input_numel: int,
+    rank: int,
+) -> tuple[ms.Tensor, ms.Tensor]:
+    """Copy local parameter shards into this rank's fused output slice.
+
+    Args:
+        all_gather_inputs: Per-parameter local communication buffers.
+        all_gather_output: Stable output buffer for the collective.
+        inp_split_sizes: Element count for each local input.
+        all_gather_input_numel: Total element count for one rank.
+        rank: Local collective rank.
+
+    Returns:
+        The rank-local input view and the unchanged stable output buffer.
+    """
+    all_gather_input = all_gather_output.narrow(
+        0,
+        all_gather_input_numel * rank,
+        all_gather_input_numel,
     )
+    input_offset = 0
+    for input_numel, source in zip(inp_split_sizes, all_gather_inputs):
+        destination = all_gather_input.narrow(0, input_offset, input_numel)
+        copy_without_bumping_version(destination, source.reshape(-1))
+        input_offset += input_numel
     return all_gather_input, all_gather_output
-
-
-@_no_grad()
-def split_with_sizes_copy(all_gather_output, split_sizes, dim, out):
-    """Copy dim-1 slices from a fused all-gather into stable buffers."""
-    if dim != 1:
-        raise NotImplementedError("split_with_sizes_copy currently only supports dim=1")
-    offset = 0
-    for destination, size in zip(out, split_sizes):
-        copy_without_bumping_version(
-            destination,
-            all_gather_output.narrow(dim, offset, size),
-        )
-        offset += size
 
 
 @_no_grad()
@@ -279,23 +299,47 @@ def reduce_scatter_copy_in(
     reduce_scatter_input: ms.Tensor,
     world_size: int,
 ) -> None:
-    """Pack gradients with mixed shard dimensions without writing through views."""
+    """Pack gradients with mixed shard dimensions into a fused RS input.
+
+    Args:
+        hsdp_params: Parameters defining each gradient's FSDP layout.
+        unsharded_grads: Full local gradients in parameter order.
+        reduce_scatter_input: Stable base buffer populated for the collective.
+        world_size: Size of the reduce-scatter group.
+    """
     if len(hsdp_params) != len(unsharded_grads):
         raise AssertionError(
             "reduce_scatter_copy_in expects one hsdp_param per unsharded_grad, but got "
             f"{len(hsdp_params)} params and {len(unsharded_grads)} grads"
         )
-    packed_grads = []
+    packed_rows = reduce_scatter_input.reshape(world_size, -1)
+    column_offset = 0
     for hsdp_param, unsharded_grad in zip(hsdp_params, unsharded_grads):
-        plan = build_rs_plan(hsdp_param, unsharded_grad.contiguous(), world_size)
-        packed_grads.append(pack_for_reduce_scatter(unsharded_grad.contiguous(), plan))
-    packed_rows = ms.mint.cat(packed_grads, dim=1)
-    if packed_rows.numel() != reduce_scatter_input.numel():
+        padded_shard_numel = _shape_numel(hsdp_param.padded_sharded_param_size)
+        packed_grad_slot = packed_rows.narrow(1, column_offset, padded_shard_numel)
+        shard_dim = hsdp_param.hsdp_placement.dim
+        if shard_dim == 0:
+            padded_unsharded_dim0 = hsdp_param.padded_sharded_param_size[0] * world_size
+            if unsharded_grad.shape[0] != padded_unsharded_dim0:
+                padding_shape = (
+                    padded_unsharded_dim0 - unsharded_grad.shape[0],
+                    *unsharded_grad.shape[1:],
+                )
+                padding = ms.mint.zeros(padding_shape, dtype=unsharded_grad.dtype)
+                if _normalize_device(padding.device) != _normalize_device(unsharded_grad.device):
+                    padding = padding.to(_normalize_device(unsharded_grad.device))
+                unsharded_grad = ms.mint.cat((unsharded_grad, padding), dim=0)
+            packed_grad = unsharded_grad.reshape(world_size, -1)
+        else:
+            grad_chunks = unsharded_grad.chunk(world_size, dim=shard_dim)
+            packed_grad = ms.mint.cat(grad_chunks, dim=0).reshape(world_size, -1)
+        copy_without_bumping_version(packed_grad_slot, packed_grad)
+        column_offset += padded_shard_numel
+    if column_offset != packed_rows.shape[1]:
         raise AssertionError(
             "reduce_scatter_copy_in packed an unexpected number of elements: "
-            f"{packed_rows.numel()} != {reduce_scatter_input.numel()}"
+            f"{column_offset} != {packed_rows.shape[1]}"
         )
-    copy_without_bumping_version(reduce_scatter_input, packed_rows.reshape(-1))
 
 
 class HSDPParamGroup:
@@ -303,17 +347,15 @@ class HSDPParamGroup:
 
     def __init__(
         self,
-        hsdp_params,
+        hsdp_params: list[MindSporeHSDPParamV2],
         device: Optional[str] = None,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
         enable_zero_copy: bool = False,
         comm_ctx: Optional[ParamGroupCommCtx] = None,
-    ):
+    ) -> None:
         self.device = device
         self.hsdp_params = hsdp_params
-        self.mp_policy = mp_policy
-        self.enable_zero_copy = enable_zero_copy
         self.comm_ctx = comm_ctx or ParamGroupCommCtx()
+        self.enable_zero_copy = enable_zero_copy
         self.gradient_scaling_factor = None
         self.requires_all_reduce = True
         self.all_gather_buckets: list[AllGatherBucket] = []
@@ -340,7 +382,17 @@ class HSDPParamGroup:
 
         self.all_gather_buckets = []
         for bucket_key, hsdp_params in params_by_bucket.items():
-            metadata = get_all_gather_metadata(hsdp_params)
+            param_input_numels = [
+                [hsdp_param._sharded_param_data.numel()] for hsdp_param in hsdp_params
+            ]
+            inp_split_sizes = [input_numels[0] for input_numels in param_input_numels]
+            metadata = AllGatherMetadata(
+                param_input_dtypes=[[bucket_key[1]] for _ in hsdp_params],
+                param_input_numels=param_input_numels,
+                dtype=bucket_key[1],
+                inp_split_sizes=inp_split_sizes,
+                total_input_numel=sum(inp_split_sizes),
+            )
             self.all_gather_buckets.append(
                 AllGatherBucket(
                     hsdp_params=hsdp_params,
@@ -397,7 +449,6 @@ class HSDPParamGroup:
             bucket.all_gather_result = AllGatherResult(
                 all_gather_input=all_gather_input,
                 all_gather_output=all_gather_output,
-                metadata=metadata,
                 handle=handle,
             )
 
@@ -407,24 +458,6 @@ class HSDPParamGroup:
             bucket.copy_out()
         for hsdp_param in self.hsdp_params:
             hsdp_param.wait_for_unshard()
-
-    @staticmethod
-    def _build_gradient_bucket_layout(hsdp_params) -> GradientBucketLayout:
-        """Build one compact output layout for the supplied parameter order."""
-        param_offsets = []
-        param_numels = []
-        total_numel = 0
-        for hsdp_param in hsdp_params:
-            param_offsets.append(total_numel)
-            param_numel = _shape_numel(hsdp_param.sharded_size)
-            param_numels.append(param_numel)
-            total_numel += param_numel
-        return GradientBucketLayout(
-            hsdp_params,
-            param_offsets,
-            param_numels,
-            total_numel,
-        )
 
     def _build_reduce_scatter_buckets(self, reduce_op: str) -> list[ReduceScatterBucket]:
         """Build ordered reduce-scatter buckets without tensor side effects."""
@@ -459,7 +492,7 @@ class HSDPParamGroup:
             needs_avg_div = reduce_op == "avg"
             buckets.append(
                 ReduceScatterBucket(
-                    layout=self._build_gradient_bucket_layout(hsdp_params),
+                    layout=self._build_gradient_bucket_layout_from(hsdp_params),
                     unsharded_grads=grads_by_bucket[bucket_key],
                     shard_group=groups_by_bucket[bucket_key],
                     shard_world_size=shard_world_size,
@@ -469,6 +502,23 @@ class HSDPParamGroup:
                 )
             )
         return buckets
+
+    def _build_gradient_bucket_layout_from(self, hsdp_params) -> GradientBucketLayout:
+        """Build one compact output layout for the supplied parameter order."""
+        param_offsets = []
+        param_numels = []
+        total_numel = 0
+        for hsdp_param in hsdp_params:
+            param_offsets.append(total_numel)
+            param_numel = _shape_numel(hsdp_param.padded_sharded_param_size)
+            param_numels.append(param_numel)
+            total_numel += param_numel
+        return GradientBucketLayout(
+            hsdp_params,
+            param_offsets,
+            param_numels,
+            total_numel,
+        )
 
     @staticmethod
     def _build_all_reduce_buckets(
@@ -507,6 +557,7 @@ class HSDPParamGroup:
                     replicate_group=replicate_group,
                     replicate_world_size=replicate_world_size,
                     dtype=rs_bucket.dtype,
+                    reduce_op=rs_bucket.reduce_op,
                     needs_avg_div=rs_bucket.needs_avg_div,
                 )
             )
@@ -526,7 +577,10 @@ class HSDPParamGroup:
                 reduce_scatter_input,
                 bucket.shard_world_size,
             )
-            apply_gradient_scaling_factor(reduce_scatter_input, self.gradient_scaling_factor)
+            apply_gradient_scaling_factor(
+                reduce_scatter_input,
+                self.gradient_scaling_factor,
+            )
             bucket.reduce_scatter_input = reduce_scatter_input
             if bucket.uses_collective:
                 bucket.reduce_scatter_output = ms.mint.empty(
@@ -579,10 +633,7 @@ class HSDPParamGroup:
             if bucket.reduce_scatter_output is None:
                 raise RuntimeError("Reduce-scatter bucket has not been prepared.")
             if bucket.needs_avg_div and bucket.shard_world_size > 1:
-                bucket.reduce_scatter_output = ms.mint.div(
-                    bucket.reduce_scatter_output,
-                    bucket.shard_world_size,
-                )
+                bucket.reduce_scatter_output.div_(bucket.shard_world_size)
 
     @staticmethod
     def _issue_all_reduce_buckets(
@@ -598,22 +649,25 @@ class HSDPParamGroup:
             bucket.handle = dist.all_reduce(
                 bucket.all_reduce_output,
                 group=bucket.replicate_group,
-                op="sum",
+                op=bucket.reduce_op,
                 async_op=async_op,
             )
 
     def wait_reduce_scatter_and_issue_all_reduce(self, async_op: bool = True) -> None:
-        """Wait all RS buckets and launch the resulting HSDP all-reduces."""
+        """Wait all RS buckets and launch the resulting HSDP all-reduces.
+
+        Args:
+            async_op: Whether subsequent all-reduces are asynchronous.
+        """
         self._wait_reduce_scatter_buckets()
         if not self.requires_all_reduce:
             for bucket in self.reduce_scatter_buckets:
-                current_output = bucket.move_reduce_scatter_output()
+                current_output = bucket.move_reducescatter_output()
                 partial_output = self.reduce_partial_outputs.get(bucket.bucket_key)
-                self.reduce_partial_outputs[bucket.bucket_key] = (
-                    current_output
-                    if partial_output is None
-                    else ms.mint.add(partial_output, current_output)
-                )
+                if partial_output is None:
+                    self.reduce_partial_outputs[bucket.bucket_key] = current_output
+                else:
+                    partial_output.add_(current_output)
             self.reduce_scatter_buckets = []
             self.all_reduce_buckets = []
             return
@@ -621,10 +675,7 @@ class HSDPParamGroup:
         for bucket in self.reduce_scatter_buckets:
             partial_output = self.reduce_partial_outputs.pop(bucket.bucket_key, None)
             if partial_output is not None:
-                bucket.reduce_scatter_output = ms.mint.add(
-                    bucket.reduce_scatter_output,
-                    partial_output,
-                )
+                bucket.reduce_scatter_output.add_(partial_output)
         all_reduce_by_source = {
             id(bucket.source_reduce_scatter_bucket): bucket
             for bucket in self.all_reduce_buckets
@@ -632,9 +683,9 @@ class HSDPParamGroup:
         for rs_bucket in self.reduce_scatter_buckets:
             all_reduce_bucket = all_reduce_by_source.get(id(rs_bucket))
             if all_reduce_bucket is not None:
-                all_reduce_bucket.all_reduce_output = rs_bucket.move_reduce_scatter_output()
+                all_reduce_bucket.all_reduce_output = rs_bucket.move_reducescatter_output()
                 continue
-            reduce_scatter_output = rs_bucket.move_reduce_scatter_output()
+            reduce_scatter_output = rs_bucket.move_reducescatter_output()
             for hsdp_param, param_numel, param_offset in zip(
                 rs_bucket.hsdp_params,
                 rs_bucket.layout.param_numels,
@@ -656,18 +707,15 @@ class HSDPParamGroup:
                 bucket.handle = None
             if bucket.all_reduce_output is None:
                 raise RuntimeError("All-reduce output has already been released.")
-            output = bucket.all_reduce_output
             if bucket.needs_avg_div and bucket.replicate_world_size > 1:
-                output = ms.mint.div(output, bucket.replicate_world_size)
+                bucket.all_reduce_output.div_(bucket.replicate_world_size)
             for hsdp_param, param_numel, param_offset in zip(
                 bucket.hsdp_params,
-                bucket.layout.param_numels,
-                bucket.layout.param_offsets,
+                bucket.param_numels,
+                bucket.param_offsets,
             ):
-                hsdp_param.all_reduce_comm_ctx.all_reduce_output = output.narrow(
-                    0,
-                    param_offset,
-                    param_numel,
+                hsdp_param.all_reduce_comm_ctx.all_reduce_output = bucket.all_reduce_output.narrow(
+                    0, param_offset, param_numel
                 )
             bucket.all_reduce_output = None
         self.all_reduce_buckets = []
@@ -723,7 +771,7 @@ class AllReduceParamGroup:
         element_size = int(ms.Tensor([], dtype=self.reduce_dtype).itemsize)
         current_offset = 0
         for hsdp_param in self.hsdp_params:
-            numel = _shape_numel(hsdp_param.sharded_size)
+            numel = _shape_numel(hsdp_param.padded_sharded_param_size)
             self.param_offsets.append(current_offset)
             self.param_numels.append(numel)
             current_offset += numel
@@ -735,6 +783,8 @@ class AllReduceParamGroup:
 
     def allocate_fused_buffer(self, device: Any) -> None:
         """Allocate and zero the fused all-reduce buffer."""
+        # MindSpore zeros has no device argument; tensor creation follows the
+        # current runtime device and automatically moves to NPU when required.
         del device
         self.fused_buffer = ms.mint.zeros(
             (self.compute_aligned_layout(),),
@@ -742,42 +792,40 @@ class AllReduceParamGroup:
         )
 
     def get_param_buffer_view(self, index: int) -> ms.Tensor:
-        """Return one parameter's communication view."""
+        """Return one parameter's communication view.
+
+        Args:
+            index: Parameter index in the fused padded layout.
+
+        Returns:
+            A mint narrow view covering that parameter's padded buffer region.
+        """
         if self.fused_buffer is None:
             raise RuntimeError("Fused buffer not allocated. Call allocate_fused_buffer first.")
         return self.fused_buffer.narrow(
-            0,
-            self.param_offsets[index],
-            self.param_numels[index],
+            0, self.param_offsets[index], self.param_numels[index]
         )
 
+    def get_param_grad_view(self, index: int, target_shape: tuple[int, ...]) -> ms.Tensor:
+        """Return one parameter's actual-shard gradient view."""
+        return self.get_param_buffer_view(index).narrow(
+            0,
+            0,
+            _shape_numel(target_shape),
+        ).reshape(target_shape)
+
     def accumulate_reduce_partial_outputs(self) -> None:
-        """Pack RS outputs and prior micro-step partials into one aligned AR buffer."""
-        param_outputs = []
-        for hsdp_param in self.hsdp_params:
-            reduced_output = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
-            if reduced_output is None:
-                raise RuntimeError("All-reduce group requires one completed reduce-scatter output per parameter.")
-            if reduced_output.dtype != self.reduce_dtype:
-                reduced_output = reduced_output.to(self.reduce_dtype)
+        """Merge no-all-reduce micro-step outputs into the current buffer."""
+        if self.fused_buffer is None:
+            return
+        for index, hsdp_param in enumerate(self.hsdp_params):
+            if hsdp_param.reduce_partial_output is None:
+                continue
             partial_output = hsdp_param.reduce_partial_output
-            if partial_output is not None:
-                if partial_output.dtype != self.reduce_dtype:
-                    partial_output = partial_output.to(self.reduce_dtype)
-                reduced_output = ms.mint.add(reduced_output, partial_output)
-                hsdp_param.reduce_partial_output = None
-            param_outputs.append(reduced_output.reshape(-1))
-            hsdp_param.clear_reduce_scatter_output()
-            hsdp_param.clear_unsharded_source_grad()
-        packed_output = ms.mint.cat(param_outputs, dim=0)
-        total_numel = self.compute_aligned_layout()
-        if packed_output.numel() < total_numel:
-            padding = ms.mint.zeros(
-                (total_numel - packed_output.numel(),),
-                dtype=self.reduce_dtype,
-            )
-            packed_output = ms.mint.cat((packed_output, padding), dim=0)
-        self.fused_buffer = packed_output
+            if partial_output.dtype != self.reduce_dtype:
+                partial_output = partial_output.to(self.reduce_dtype)
+            self.get_param_buffer_view(index).add_(partial_output.reshape(-1))
+            hsdp_param.reduce_partial_output = None
 
     def issue_async_allreduce(self) -> None:
         """Launch SUM all-reduce; AVG division is applied when splitting."""
@@ -795,24 +843,17 @@ class AllReduceParamGroup:
         if self.all_reduce_handle is not None:
             self.all_reduce_handle.wait()
             self.all_reduce_handle = None
-        if self.fused_buffer is None:
-            raise RuntimeError("Fused buffer has already been released.")
-        output = self.fused_buffer
-        if self.reduce_op == "avg" and self.replicate_world_size > 1:
-            output = ms.mint.div(output, self.replicate_world_size)
         for index, hsdp_param in enumerate(self.hsdp_params):
-            hsdp_param.all_reduce_comm_ctx.all_reduce_output = output.narrow(
-                0,
-                self.param_offsets[index],
-                self.param_numels[index],
-            )
+            reduced_grad = self.get_param_grad_view(index, hsdp_param.sharded_size)
+            if self.reduce_op == "avg" and self.replicate_world_size > 1:
+                reduced_grad.div_(self.replicate_world_size)
+            hsdp_param.all_reduce_comm_ctx.all_reduce_output = reduced_grad
         self.fused_buffer = None
 
 
 __all__ = [
     "AllGatherBucket",
     "AllGatherMetadata",
-    "AllGatherMetadataCache",
     "AllGatherResult",
     "AllReduceBucket",
     "AllReduceParamGroup",
@@ -822,5 +863,4 @@ __all__ = [
     "all_gather_copy_in",
     "get_all_gather_metadata",
     "reduce_scatter_copy_in",
-    "split_with_sizes_copy",
 ]

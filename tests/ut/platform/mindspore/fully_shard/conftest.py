@@ -16,8 +16,6 @@
 import unittest
 
 import pytest
-
-from hyper_parallel.platform.mindspore.fully_shard.param_group import AllGatherMetadataCache
 from tests.ut.platform.mindspore._ensure_mindspore_platform import (
     _force_cpu_device_target,
     ensure_mindspore_platform_for_fully_shard,
@@ -30,10 +28,9 @@ UT_MS_DEVICE_TAG = "CPU:0"
 
 
 def reset_mindspore_fully_shard_shared_state() -> None:
-    """Pin the CPU backend and clear shared metadata between UT cases."""
+    """Pin the MindSpore fully_shard UT runtime to the CPU backend."""
     ensure_mindspore_platform_for_fully_shard()
     _force_cpu_device_target()
-    AllGatherMetadataCache._cache.clear()
 
 
 class MindSporeFullyShardUnitTest(unittest.TestCase):

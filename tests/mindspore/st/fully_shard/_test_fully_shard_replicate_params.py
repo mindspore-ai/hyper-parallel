@@ -78,7 +78,7 @@ def _assert_mixed_prefetch_state(module):
 
 
 def _build_replicate_fully_shard_net(mesh):
-    """SlimLeNet16 with weights kept as replicate_params (all-reduce) and biases sharded, plus prefetch."""
+    """SlimLeNet16 with weights kept as replicate_params and biases sharded, plus prefetch."""
     ms.set_seed(_SEED)
     net = SlimLeNet16()
     replicate_params = {param for param in net.trainable_params() if "weight" in param.name}
@@ -88,6 +88,11 @@ def _build_replicate_fully_shard_net(mesh):
     fully_shard(net, mesh=mesh, mp_policy=_fp32_policy(), replicate_params=replicate_params)
     net.set_reduce_op_type("sum")
     _setup_prefetch(net)
+    root_state = get_hsdp_state(net)
+    assert len(root_state.hsdp_params) == 1
+    output_scale_param = root_state.hsdp_params[0]
+    assert net.output_scale_weight.shape[0] % mesh.shape[-1] != 0
+    assert output_scale_param.is_replicate_param and output_scale_param.shard_world_size == 1
     return net
 
 
