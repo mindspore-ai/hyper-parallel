@@ -54,7 +54,10 @@ class DistributedDatasetConfig:
     ``packed_bytes_a2a`` accepts nested byte records and JSON scalar values.
     ``direct_tensor_a2a`` requires every owner sample to be one tensor with a
     globally identical shape and dtype. ``prefetch_steps`` bounds lightweight
-    step-plan look-ahead; payload look-ahead is always one microbatch.
+    step-plan look-ahead. ``double_buffer`` keeps exactly one fully prepared
+    microbatch ahead, including online metadata collectives and payload
+    distribution. One prefetched step enables overlap within an optimizer
+    step; two or more also enable overlap across optimizer-step boundaries.
     ``pin_memory`` copies collated Host tensor leaves into pinned memory on a
     dedicated data-owner thread.
     """
@@ -66,6 +69,7 @@ class DistributedDatasetConfig:
     dp_dim_names: tuple[str, ...] | None = None
     cp_shards: tuple[TensorShardSpec, ...] = ()
     pin_memory: bool = False
+    double_buffer: bool = False
 
     def __post_init__(self) -> None:
         for name in ("micro_batch_size", "micro_batch_count", "prefetch_steps"):
@@ -74,6 +78,8 @@ class DistributedDatasetConfig:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
         if not isinstance(self.pin_memory, bool):
             raise ValueError(f"pin_memory must be a boolean, but got {self.pin_memory!r}.")
+        if not isinstance(self.double_buffer, bool):
+            raise ValueError(f"double_buffer must be a boolean, but got {self.double_buffer!r}.")
         if self.owner_payload_transport not in _OWNER_PAYLOAD_TRANSPORTS:
             raise ValueError(
                 f"owner_payload_transport must be one of {_OWNER_PAYLOAD_TRANSPORTS}, "
@@ -103,13 +109,16 @@ def build_distributed_dataset(
     sharing the current DP coordinate. Online metadata is the default path and
     balances one global microbatch at a time. An explicit sidecar ``metadata``
     sequence enables whole-step inter-microbatch planning before payload reads.
+    When ``config.double_buffer`` is enabled, both groups must be dedicated
+    process-group instances that model collectives never use. Every rank then
+    submits data collectives from one ordered producer thread.
 
     Args:
         dataset: Shared map-style dataset. Online mode reads only one local
             microbatch of raw Host candidates at a time and redistributes them
             before heavyweight target-rank decode.
         mesh: Named root training mesh.
-        config: Batch planning, prefetch, and owner A2A transport configuration.
+        config: Batch planning, double buffering, and owner A2A transport configuration.
         metadata_fn: Derive ``SampleMeta`` from ``(raw_sample, data_ref)`` for
             microbatch-local online planning. Required without ``metadata``.
         metadata: Optional shared lightweight sidecar for whole-step planning.
@@ -121,6 +130,7 @@ def build_distributed_dataset(
         communication_device: Local collective device. Required for packed-byte
             owner A2A and tensor reception over HCCL/NCCL groups.
         prepare_payload: Optional owner-side move/packing before communication.
+            Double buffering invokes it on the data producer thread.
         cost_model: Optional calibrated workload cost model.
 
     Returns:
@@ -197,6 +207,7 @@ def build_distributed_dataset(
             communication_device=communication_device,
         )
 
+    data_stream = platform.new_stream() if config.double_buffer and communication_device is not None else None
     return DistributedDataset(
         topology=topology,
         metadata_source=metadata_source,
@@ -206,7 +217,9 @@ def build_distributed_dataset(
         payload_distributor=payload_distributor,
         prefetch_steps=config.prefetch_steps,
         pin_memory=config.pin_memory,
+        double_buffer=config.double_buffer,
         prepare_payload=prepare_payload,
         online_sample_source=online_sample_source,
         owner_payload_redistributor=owner_payload_redistributor,
+        data_stream=data_stream,
     )

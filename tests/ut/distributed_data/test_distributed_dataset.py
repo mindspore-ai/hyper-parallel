@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import threading
 import unittest
-from typing import Any, Sequence
+from contextlib import nullcontext
+from typing import Any, Callable, Sequence
+from unittest.mock import patch
 
 from hyper_parallel import distributed_data
 from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
@@ -95,6 +97,19 @@ class TestDistributedDataPublicApi(unittest.TestCase):
                 micro_batch_count=1,
                 pin_memory=1,
             )
+        with self.assertRaisesRegex(ValueError, "double_buffer must be a boolean"):
+            distributed_data.DistributedDatasetConfig(
+                micro_batch_size=1,
+                micro_batch_count=1,
+                double_buffer=1,
+            )
+        config = distributed_data.DistributedDatasetConfig(
+            micro_batch_size=1,
+            micro_batch_count=1,
+            prefetch_steps=1,
+            double_buffer=True,
+        )
+        self.assertTrue(config.double_buffer)
 
 
 class _PeerMetadataSynchronizer:
@@ -185,6 +200,7 @@ class _SyntheticOwnerPayloadRedistributor:
         """Initialize an empty redistribution record."""
         self.local_payload_batches: list[tuple[Any, ...]] = []
         self.plans: list[BatchPlan] = []
+        self.thread_names: list[str] = []
 
     def redistribute(
         self,
@@ -193,6 +209,7 @@ class _SyntheticOwnerPayloadRedistributor:
         topology: DataTopology,
     ) -> dict[int, Any]:
         """Return payloads planned for data rank zero."""
+        self.thread_names.append(threading.current_thread().name)
         local_payloads = tuple(local_payloads)
         self.local_payload_batches.append(local_payloads)
         self.plans.append(plan)
@@ -218,6 +235,7 @@ class _ReceivingPayloadDistributor:
         """Initialize the plan that a remote owner publishes."""
         self._plan = plan
         self._micro_batch_index = 0
+        self.thread_names: list[str] = []
 
     def distribute(
         self,
@@ -228,6 +246,7 @@ class _ReceivingPayloadDistributor:
         """Return a synthetic payload while asserting owner-only reads."""
         if payload is not None or plan is not None or topology.is_data_owner:
             raise AssertionError("Non-owner payload distribution received owner-only inputs.")
+        self.thread_names.append(threading.current_thread().name)
         result = f"received-{self._micro_batch_index}"
         self._micro_batch_index += 1
         return self._plan, result
@@ -255,7 +274,117 @@ class _ReceivingPlanSequenceDistributor:
         return self._plans[index], f"received-online-{index}"
 
 
-def _build_loader(prefetch_steps: int = 2):
+class _BlockingPayloadDistributor:
+    """Block selected full-pipeline distribution calls for overlap assertions."""
+
+    def __init__(self, blocked_calls: tuple[int, ...]) -> None:
+        """Initialize one event pair for each zero-based blocked call."""
+        self._blocked_calls = set(blocked_calls)
+        self._lock = threading.Lock()
+        self._calls = 0
+        self.started = {index: threading.Event() for index in blocked_calls}
+        self.release = {index: threading.Event() for index in blocked_calls}
+        self.thread_names: list[str] = []
+
+    def distribute(
+        self,
+        payload: Any | None,
+        plan: BatchPlan | None,
+        topology: DataTopology,
+    ) -> tuple[BatchPlan, Any]:
+        """Record the producer thread and wait when this call is selected."""
+        with self._lock:
+            call_index = self._calls
+            self._calls += 1
+        self.thread_names.append(threading.current_thread().name)
+        if call_index in self._blocked_calls:
+            self.started[call_index].set()
+            if not self.release[call_index].wait(timeout=5):
+                raise RuntimeError(f"Timed out releasing synthetic distribution call {call_index}.")
+        return LocalPayloadDistributor().distribute(payload, plan, topology)
+
+    def release_all(self) -> None:
+        """Release every synthetic blocked distribution call."""
+        for event in self.release.values():
+            event.set()
+
+
+class _BlockingMetadataSynchronizer(_PeerMetadataSynchronizer):
+    """Block one online metadata collective to prove it runs ahead of consumption."""
+
+    def __init__(self, blocked_call: int) -> None:
+        """Initialize a zero-based blocking call and its coordination events."""
+        self._blocked_call = blocked_call
+        self._calls = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.thread_names: list[str] = []
+
+    def gather(
+        self,
+        local_metadata: Sequence[SampleMeta],
+        owner_ranks: tuple[int, ...],
+    ) -> tuple[SampleMeta, ...]:
+        """Block the selected gather before returning deterministic peer metadata."""
+        call_index = self._calls
+        self._calls += 1
+        self.thread_names.append(threading.current_thread().name)
+        if call_index == self._blocked_call:
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise RuntimeError("Timed out releasing synthetic metadata gather.")
+        return super().gather(local_metadata, owner_ranks)
+
+
+class _FakeReadyEvent:
+    """Record data-stream readiness synchronization across producer and consumer threads."""
+
+    def __init__(self) -> None:
+        """Initialize empty record and wait logs."""
+        self.recorded: list[tuple[Any, str]] = []
+        self.waited: list[tuple[Any, str]] = []
+
+    def record(self, stream: Any) -> None:
+        """Record the stream and thread that completed one data slot."""
+        self.recorded.append((stream, threading.current_thread().name))
+
+    def wait(self, stream: Any) -> None:
+        """Record the compute stream and thread consuming one data slot."""
+        self.waited.append((stream, threading.current_thread().name))
+
+
+class _FakeStreamPlatform:
+    """Provide stream/event primitives without requiring accelerator hardware."""
+
+    def __init__(self) -> None:
+        """Initialize the generated readiness-event list."""
+        self.events: list[_FakeReadyEvent] = []
+
+    @staticmethod
+    def get_stream_context() -> Callable[[Any], Any]:
+        """Return a context factory accepting the synthetic data stream."""
+        return nullcontext
+
+    def new_event(self) -> _FakeReadyEvent:
+        """Create and retain one synthetic readiness event."""
+        event = _FakeReadyEvent()
+        self.events.append(event)
+        return event
+
+    @staticmethod
+    def get_current_stream() -> str:
+        """Return the synthetic training compute stream."""
+        return "compute-stream"
+
+
+def _build_loader(
+    prefetch_steps: int = 2,
+    *,
+    double_buffer: bool = False,
+    payload_distributor: Any | None = None,
+    prepare_payload: Any | None = None,
+    data_stream: Any = None,
+):
     metadata = [
         SampleMeta(
             sample_id=f"local-{index}",
@@ -280,8 +409,11 @@ def _build_loader(prefetch_steps: int = 2):
         planner=planner,
         rank_materializer=RankMaterializer(materializer, tuple),
         metadata_synchronizer=_PeerMetadataSynchronizer(),
-        payload_distributor=LocalPayloadDistributor(),
+        payload_distributor=payload_distributor or LocalPayloadDistributor(),
         prefetch_steps=prefetch_steps,
+        double_buffer=double_buffer,
+        prepare_payload=prepare_payload,
+        data_stream=data_stream,
     )
     return loader, materializer
 
@@ -335,6 +467,30 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
     )
 
 
+def _build_single_microbatch_double_buffer(payload_distributor: Any) -> DistributedDataset:
+    """Build two one-microbatch steps for cross-step look-ahead tests."""
+    metadata = [
+        SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+        for index in range(2)
+    ]
+    topology = DataTopology.from_layout(
+        mesh_shape=(1,),
+        mesh_dim_names=("dp_shard",),
+        rank_list=(0,),
+        global_rank=0,
+    )
+    return DistributedDataset(
+        topology=topology,
+        metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
+        planner=DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=1),
+        rank_materializer=RankMaterializer(_RecordingMaterializer(["sample-0", "sample-1"]), tuple),
+        metadata_synchronizer=LocalMetadataSynchronizer(),
+        payload_distributor=payload_distributor,
+        prefetch_steps=2,
+        double_buffer=True,
+    )
+
+
 class TestDistributedDataset(unittest.TestCase):
     """Validate owner-only reads, bounded look-ahead, and exact resume."""
 
@@ -363,6 +519,240 @@ class TestDistributedDataset(unittest.TestCase):
             self.assertFalse(hasattr(step, "payloads"))
             loader.commit(step.replay_id)
             self.assertEqual(loader.consumed_offset, 2)
+        finally:
+            loader.close()
+
+    def test_double_buffer_prefetches_full_sidecar_pipeline_and_next_step(self) -> None:
+        """The alternate slot should finish distribution for the next execution unit."""
+        distributor = _BlockingPayloadDistributor(blocked_calls=(1, 2))
+        prepare_threads: list[str] = []
+
+        def prepare_payload(payload: Any) -> Any:
+            """Record that device preparation moved onto the data producer."""
+            prepare_threads.append(threading.current_thread().name)
+            return payload
+
+        loader, _ = _build_loader(
+            double_buffer=True,
+            payload_distributor=distributor,
+            prepare_payload=prepare_payload,
+        )
+        try:
+            step = next(loader)
+            first = next(step)
+
+            self.assertEqual(first.micro_batch_index, 0)
+            self.assertTrue(distributor.started[1].wait(timeout=2))
+            self.assertEqual(loader.consumed_offset, 0)
+            self.assertTrue(all(name.startswith("hp-data-buffer") for name in distributor.thread_names))
+            self.assertTrue(all(name.startswith("hp-data-buffer") for name in prepare_threads))
+
+            distributor.release[1].set()
+            second = next(step)
+
+            self.assertEqual(second.micro_batch_index, 1)
+            self.assertTrue(distributor.started[2].wait(timeout=2))
+            self.assertEqual(loader.consumed_offset, 0)
+
+            distributor.release[2].set()
+            loader.commit(step.replay_id)
+            next_step = next(loader)
+            self.assertEqual(next(next_step).micro_batch_index, 0)
+        finally:
+            distributor.release_all()
+            loader.close()
+
+    def test_double_buffer_with_one_prefetched_step_overlaps_microbatches(self) -> None:
+        """One step reservation should still allow overlap within that optimizer step."""
+        distributor = _BlockingPayloadDistributor(blocked_calls=(1,))
+        loader, _ = _build_loader(
+            prefetch_steps=1,
+            double_buffer=True,
+            payload_distributor=distributor,
+        )
+        try:
+            step = next(loader)
+            first = next(step)
+
+            self.assertEqual(first.micro_batch_index, 0)
+            self.assertTrue(distributor.started[1].wait(timeout=2))
+
+            distributor.release[1].set()
+            second = next(step)
+
+            self.assertEqual(second.micro_batch_index, 1)
+            loader.commit(step.replay_id)
+            self.assertEqual(loader.consumed_offset, 2)
+        finally:
+            distributor.release_all()
+            loader.close()
+
+    def test_double_buffer_prefetches_online_collectives_and_redistribution(self) -> None:
+        """Online metadata gather and raw A2A should run before the next consumer request."""
+        dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
+
+        def metadata_fn(payload: str, data_ref: int) -> SampleMeta:
+            """Build deterministic online metadata for the synthetic sample."""
+            return SampleMeta(
+                sample_id=payload,
+                source_id="source",
+                data_ref=data_ref,
+                cost_hint=WorkloadCost(encoder=float(data_ref + 1)),
+            )
+
+        topology = DataTopology.from_layout(
+            mesh_shape=(2,),
+            mesh_dim_names=("dp_shard",),
+            rank_list=(0, 1),
+            global_rank=0,
+        )
+        synchronizer = _BlockingMetadataSynchronizer(blocked_call=1)
+        redistributor = _SyntheticOwnerPayloadRedistributor()
+        prepare_threads: list[str] = []
+        loader = DistributedDataset(
+            topology=topology,
+            metadata_source=None,
+            planner=DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=3),
+            rank_materializer=RankMaterializer(_FailMaterializer(), tuple),
+            metadata_synchronizer=synchronizer,
+            payload_distributor=LocalPayloadDistributor(),
+            prefetch_steps=2,
+            double_buffer=True,
+            prepare_payload=lambda payload: prepare_threads.append(threading.current_thread().name) or payload,
+            online_sample_source=StridedOnlineSampleSource(
+                dataset,
+                metadata_fn,
+                shard_rank=0,
+                num_shards=2,
+                max_entries=3,
+            ),
+            owner_payload_redistributor=redistributor,
+        )
+        try:
+            step = next(loader)
+            first = next(step)
+
+            self.assertEqual(first.micro_batch_index, 0)
+            self.assertTrue(synchronizer.started.wait(timeout=2))
+            self.assertTrue(all(name.startswith("hp-data-buffer") for name in synchronizer.thread_names))
+
+            synchronizer.release.set()
+            remaining = list(step)
+
+            self.assertEqual([payload.micro_batch_index for payload in [first, *remaining]], [0, 1, 2])
+            self.assertEqual(dataset.data_refs, [0, 2, 4])
+            self.assertTrue(all(name.startswith("hp-data-buffer") for name in redistributor.thread_names))
+            self.assertTrue(all(name.startswith("hp-data-buffer") for name in prepare_threads))
+            loader.commit(step.replay_id)
+        finally:
+            synchronizer.release.set()
+            loader.close()
+
+    def test_double_buffer_waits_for_data_stream_readiness_on_compute_stream(self) -> None:
+        """A device-ready slot should establish a stream dependency before consumption."""
+        fake_platform = _FakeStreamPlatform()
+        loader, _ = _build_loader(double_buffer=True, data_stream="data-stream")
+        with patch("hyper_parallel.distributed_data.distributed_dataset.platform", fake_platform):
+            try:
+                step = next(loader)
+                first = next(step)
+
+                self.assertEqual(first.micro_batch_index, 0)
+                self.assertTrue(fake_platform.events)
+                ready_event = fake_platform.events[0]
+                self.assertEqual(ready_event.recorded[0][0], "data-stream")
+                self.assertTrue(ready_event.recorded[0][1].startswith("hp-data-buffer"))
+                self.assertEqual(ready_event.waited, [("compute-stream", threading.current_thread().name)])
+            finally:
+                loader.close()
+
+    def test_double_buffer_crosses_step_boundary_when_microbatch_count_is_one(self) -> None:
+        """Disabling gradient accumulation should still prepare the next optimizer step."""
+        distributor = _BlockingPayloadDistributor(blocked_calls=(1,))
+        loader = _build_single_microbatch_double_buffer(distributor)
+        try:
+            first_step = next(loader)
+            first = next(first_step)
+
+            self.assertEqual(first.micro_batch_index, 0)
+            self.assertTrue(distributor.started[1].wait(timeout=2))
+            self.assertEqual(loader.consumed_offset, 0)
+
+            distributor.release[1].set()
+            loader.commit(first_step.replay_id)
+            second_step = next(loader)
+            second = next(second_step)
+
+            self.assertEqual(second.micro_batch_index, 0)
+            self.assertEqual(second_step.step, 1)
+            loader.commit(second_step.replay_id)
+            self.assertEqual(loader.consumed_offset, 2)
+        finally:
+            distributor.release_all()
+            loader.close()
+
+    def test_double_buffer_close_drains_running_collective_task(self) -> None:
+        """Closing must not cancel a collective that peer ranks may already have entered."""
+        distributor = _BlockingPayloadDistributor(blocked_calls=(1,))
+        loader = _build_single_microbatch_double_buffer(distributor)
+        close_complete = threading.Event()
+
+        def close_loader() -> None:
+            """Close the loader and publish completion to the consumer thread."""
+            loader.close()
+            close_complete.set()
+
+        close_thread = threading.Thread(
+            target=close_loader,
+            name="synthetic-close",
+        )
+        try:
+            step = next(loader)
+            next(step)
+            self.assertTrue(distributor.started[1].wait(timeout=2))
+
+            close_thread.start()
+            self.assertFalse(close_complete.wait(timeout=0.1))
+
+            distributor.release[1].set()
+            self.assertTrue(close_complete.wait(timeout=2))
+        finally:
+            distributor.release_all()
+            if close_thread.is_alive():
+                close_thread.join(timeout=2)
+            loader.close()
+
+    def test_double_buffer_runs_non_owner_distribution_on_data_producer(self) -> None:
+        """TP peers must enter payload collectives from the same ordered producer role."""
+        metadata = [
+            SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+            for index in range(2)
+        ]
+        topology = DataTopology.from_layout(
+            mesh_shape=(2,),
+            mesh_dim_names=("tp",),
+            rank_list=(0, 1),
+            global_rank=1,
+        )
+        planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=2)
+        distributor = _ReceivingPayloadDistributor(planner.plan(metadata, step=0, cursor_start=0))
+        loader = DistributedDataset(
+            topology=topology,
+            metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
+            planner=planner,
+            rank_materializer=RankMaterializer(_FailMaterializer()),
+            metadata_synchronizer=LocalMetadataSynchronizer(),
+            payload_distributor=distributor,
+            prefetch_steps=2,
+            double_buffer=True,
+        )
+        try:
+            step = next(loader)
+            payloads = list(step)
+
+            self.assertEqual([payload.data for payload in payloads], ["received-0", "received-1"])
+            self.assertTrue(all(name.startswith("hp-data-buffer") for name in distributor.thread_names))
+            loader.commit(step.replay_id)
         finally:
             loader.close()
 
