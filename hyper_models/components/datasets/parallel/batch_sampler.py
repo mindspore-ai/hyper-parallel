@@ -81,6 +81,7 @@ class _DatasetBatchSampler:
 
         self.global_batch_size = global_batch_size
         self.epoch = 0
+        self._resume_at_source_batch = False
 
     def _validate_consumed_samples(self, consumed_samples: int, total_samples: int) -> None:
         """Allow sequential sampling to stop exactly at the epoch boundary."""
@@ -130,7 +131,7 @@ class _DatasetBatchSampler:
         return physical_index
 
     def state_dict(self) -> dict[str, int]:
-        """Return the absolute Dataset position needed to resume iteration."""
+        """Return the Dataset epoch and position needed to resume iteration."""
         sampler_state = {
             "consumed_samples": self.consumed_samples,
             "epoch": self.epoch,
@@ -138,6 +139,10 @@ class _DatasetBatchSampler:
             "dp_world_size": self.dp_world_size,
         }
         return sampler_state
+
+    def enable_source_batch_resume(self) -> None:
+        """Restore this sampler at a source-batch boundary for Online batching."""
+        self._resume_at_source_batch = True
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         """Restore the global sample position from a checkpoint.
@@ -151,9 +156,22 @@ class _DatasetBatchSampler:
         consumed_samples = state_dict["consumed_samples"]
         self._validate_consumed_samples(consumed_samples, self.total_samples)
         if state_dict["global_batch_size"] != self.global_batch_size:
+            if self._resume_at_source_batch:
+                raise ValueError("Online dataloader resume requires an unchanged global_batch_size")
+
             raise ValueError("elastic DP resume requires an unchanged global_batch_size")
 
-        if consumed_samples % self.global_batch_size != 0:
+        if self._resume_at_source_batch:
+            if state_dict["dp_world_size"] != self.dp_world_size:
+                raise ValueError("Online dataloader resume does not support DP world-size changes")
+
+            if (
+                    consumed_samples != self.total_samples
+                    and consumed_samples % self.global_micro_batch_size != 0
+            ):
+                raise ValueError("Online source sampler state must align to a distributed micro-batch")
+
+        elif consumed_samples % self.global_batch_size != 0:
             raise ValueError("sampler state must align to a global optimizer batch")
 
         self.consumed_samples = consumed_samples
@@ -177,7 +195,7 @@ class _DatasetBatchSampler:
 
 
 class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
-    """Yield a deterministic shuffled epoch for ``cyclic`` mode."""
+    """Yield one deterministic shuffled epoch for ``cyclic`` mode."""
 
     def __init__(self, *, data_sharding: bool, seed: int, **sampler_options: Any) -> None:
         """Store the cyclic data-sharding policy."""
@@ -187,12 +205,6 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
 
         self.data_sharding = data_sharding
         self.seed = seed
-
-    def _validate_consumed_samples(self, consumed_samples: int, total_samples: int) -> None:
-        """Allow the global consumed position to span multiple epochs."""
-        del total_samples
-        if consumed_samples < 0:
-            raise ValueError("cyclic consumed_samples must be non-negative")
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         """Restore a fixed-GBS cursor, repartitioning only global shuffle order."""
@@ -204,33 +216,34 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
     def __len__(self) -> int:
         """Return the number of local micro-batches remaining in this epoch."""
         active_samples = self._active_samples()
-        current_epoch_samples = self.consumed_samples % active_samples
-        remaining_samples = active_samples - current_epoch_samples
+        remaining_samples = active_samples - self.consumed_samples
         return remaining_samples // self.global_micro_batch_size
 
     def __iter__(self) -> Iterator[list[int]]:
-        """Build the epoch permutation and DP slices."""
+        """Build the current epoch permutation and DP slices."""
         active_samples = self._active_samples()
-        self.epoch = self.consumed_samples // active_samples
-        current_epoch_samples = self.consumed_samples % active_samples
+        if self.consumed_samples % self.global_micro_batch_size != 0:
+            raise ValueError("cyclic consumed_samples must align to a distributed micro-batch")
+
+        logger.debug(
+            "Starting cyclic Dataset epoch=%d at consumed_samples=%d",
+            self.epoch,
+            self.consumed_samples,
+        )
 
         if self.data_sharding:
             # Shuffle one contiguous bucket per DP rank.
-            bucket_size = (self.total_samples // self.global_micro_batch_size) * self.micro_batch_size
-            bucket_offset = current_epoch_samples // self.dp_world_size
+            bucket_size = active_samples // self.dp_world_size
+            bucket_offset = self.consumed_samples // self.dp_world_size
             bucket_start = self.dp_rank * bucket_size
             random_offsets = list(range(bucket_size))
             random.Random(self.seed + self.epoch).shuffle(random_offsets)
-            rank_indices = [
-                bucket_start + offset
-                for offset in random_offsets[bucket_offset:]
-            ]
+            rank_indices = [bucket_start + offset for offset in random_offsets[bucket_offset:]]
         else:
-            # Shuffle globally, then stride across DP ranks.
-            full_bucket_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
-            shuffled_indices = list(range(full_bucket_size))
+            # Shuffle the complete global-batch region, then stride by DP rank.
+            shuffled_indices = list(range(active_samples))
             random.Random(self.seed + self.epoch).shuffle(shuffled_indices)
-            active_indices = shuffled_indices[current_epoch_samples:]
+            active_indices = shuffled_indices[self.consumed_samples:]
             rank_indices = active_indices[self.dp_rank::self.dp_world_size]
 
         local_batch = []
@@ -238,20 +251,8 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
             local_batch.append(index)
             if len(local_batch) == self.micro_batch_size:
                 self.consumed_samples += self.global_micro_batch_size
-                self.epoch = self.consumed_samples // active_samples
                 yield local_batch
                 local_batch = []
-
-    def set_epoch(self, epoch: int) -> None:
-        """Move to an explicit cyclic epoch without losing in-epoch progress."""
-        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
-            raise ValueError("epoch must be a non-negative integer")
-
-        active_samples = self._active_samples()
-        current_epoch = self.consumed_samples // active_samples
-        if epoch != current_epoch:
-            self.consumed_samples = epoch * active_samples
-        self.epoch = epoch
 
     def _active_samples(self) -> int:
         """Return the complete global micro-batch region reused every epoch."""
@@ -365,6 +366,3 @@ def build_dataset_batch_sampler(
         return batch_sampler
 
     raise ValueError("sampler_type must be one of: single, cyclic")
-
-
-__all__ = ["build_dataset_batch_sampler"]

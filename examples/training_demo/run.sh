@@ -14,48 +14,16 @@
 # limitations under the License.
 # ============================================================================
 
-set -eo pipefail
+set -euo pipefail
 
-cd "$(dirname "$0")/../.."
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+RUN_SCRIPTS=(
+    run_base.sh
+    run_parallel_online.sh
+    run_parallel_offline.sh
+)
 
-NPROC=${1:-8}
-if [[ "${NPROC}" != "8" && "${NPROC}" != "16" ]]; then
-    echo "Usage: $0 [8|16] [training overrides...]" >&2
-    exit 1
-fi
-if [[ $# -gt 0 ]]; then
-    shift
-fi
-
-MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
-MASTER_PORT=${MASTER_PORT:-29501}
-CONFIG=${CONFIG:-examples/training_demo/train.yaml}
-
-LABEL=${LABEL:-data}
-OUTPUT_DIR="./output"
-export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
-if [[ "${NPROC}" == "8" ]]; then
-    export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-else
-    export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-fi
-
-export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
-export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
-export PYTHONPATH=../../hyper-parallel:$PYTHONPATH
-
-mkdir -p "${OUTPUT_DIR}"
-
-torchrun \
-    --nproc_per_node="${NPROC}" \
-    --rdzv_id=training_demo \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-    --module examples.training_demo.train_text \
-    --training.global_batch_size="${NPROC}" \
-    --fsdp_config.dp_shard_size="${NPROC}" \
-    "${CONFIG}" \
-    "$@" \
-    2>&1 | tee "${OUTPUT_DIR}/run_${LABEL}.log"
-
-# $(date +%Y%m%d_%H%M%S)
+for run_script in "${RUN_SCRIPTS[@]}"; do
+    echo "Running ${run_script}"
+    bash "${SCRIPT_DIR}/${run_script}" "$@"
+done

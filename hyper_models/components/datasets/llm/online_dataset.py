@@ -22,7 +22,7 @@ from typing import Any
 from hyper_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_models.components.datasets.llm.online_iterable_dataset import build_online_iterable_dataset
 from hyper_models.components.datasets.llm.online_mapping_dataset import build_online_mapping_dataset
-from hyper_models.components.datasets.parallel import DatasetParallelContext
+from hyper_models.components.datasets.parallel import DataLoaderParallelContext
 
 logger = get_dataset_logger(__name__)
 
@@ -36,21 +36,20 @@ def build_online_dataset(
         *,
         data_config: Mapping[str, Any],
         data_path: str | Sequence[str] | None = None,
-        parallel_context: DatasetParallelContext | None = None,
+        dataloader_context: DataLoaderParallelContext | None = None,
 ) -> Any:
-    """Select an online Dataset interface that produces RawSamples.
+    """Select an Online mapping or iterable source Dataset.
 
     Args:
         data_path: Optional local source path or ordered paths.
         data_config: Online options containing ``dataset_type``.
-        parallel_context: Optional Dataset rank ownership policy.
+        dataloader_context: Optional DataLoader ownership policy.
 
     Returns:
-        The mapping or iterable online Dataset when its implementation exists.
+        The selected Online source Dataset.
 
     Raises:
         ValueError: If ``dataset_type`` is unsupported.
-        NotImplementedError: From the selected reserved builder.
     """
     dataset_type = str(data_config.get("dataset_type", "mapping"))
     try:
@@ -64,7 +63,7 @@ def build_online_dataset(
     online_dataset = online_dataset_builder(
         data_path=data_path,
         data_config=data_config,
-        parallel_context=parallel_context,
+        dataloader_context=dataloader_context,
     )
-    logger.debug("Built online Dataset type=%s", type(online_dataset).__name__)
+    logger.debug("Built Online source Dataset type=%s", type(online_dataset).__name__)
     return online_dataset

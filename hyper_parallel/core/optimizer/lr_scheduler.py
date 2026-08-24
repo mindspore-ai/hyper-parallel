@@ -45,7 +45,10 @@ def get_constant_schedule_with_warmup(
 
     def _lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
+            warmup_progress = current_step / max(1, num_warmup_steps)
+            if init_lr == 0.0:
+                return warmup_progress
+            return (lr_start + (init_lr - lr_start) * warmup_progress) / init_lr
 
         return 1.0
 
@@ -68,9 +71,12 @@ def get_linear_schedule_with_warmup(
 
     def _lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
+            warmup_progress = current_step / max(1, num_warmup_steps)
+            if init_lr == 0.0:
+                return warmup_progress
+            return (lr_start + (init_lr - lr_start) * warmup_progress) / init_lr
 
-        min_lr_ratio = min_lr / init_lr
+        min_lr_ratio = min_lr / init_lr if init_lr != 0.0 else 0.0
         return max(
             min_lr_ratio,
             float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps)),
@@ -99,9 +105,12 @@ def get_cosine_schedule_with_warmup(
     def lr_lambda(current_step: int):
         lr_decay_steps = int(num_training_steps * lr_decay_ratio)
         if current_step < num_warmup_steps:
-            return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
+            warmup_progress = current_step / max(1, num_warmup_steps)
+            if init_lr == 0.0:
+                return warmup_progress
+            return (lr_start + (init_lr - lr_start) * warmup_progress) / init_lr
 
-        min_lr_ratio = min_lr / init_lr
+        min_lr_ratio = min_lr / init_lr if init_lr != 0.0 else 0.0
         if current_step > lr_decay_steps:
             return min_lr_ratio
 

@@ -20,6 +20,8 @@ from typing import Any, Dict, Optional, Union
 # pylint: disable-next=forbidden-backend-import
 import torch
 
+from hyper_models.components.utils.constants import IGNORE_INDEX
+
 
 class ModelOutputLoss(torch.nn.Module):
     """Return the loss field from a Transformers-style model output."""
@@ -41,7 +43,16 @@ class ModelOutputLoss(torch.nn.Module):
         Returns:
             The loss tensor or named loss mapping from ``model_output.loss``.
         """
-        return model_output.loss
+        local_loss = model_output.loss
+        if labels is None or not isinstance(local_loss, torch.Tensor):
+            return local_loss
+
+        # Causal LM loss shifts labels by one position. A CP-local slice may
+        # therefore contain no trainable target even when other CP ranks do.
+        has_valid_labels = labels[..., 1:].ne(IGNORE_INDEX).any()
+        local_loss = torch.where(has_valid_labels, local_loss, torch.zeros_like(local_loss))
+
+        return local_loss
 
 
 __all__ = ["ModelOutputLoss"]

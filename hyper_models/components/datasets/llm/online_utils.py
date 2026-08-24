@@ -22,7 +22,7 @@ from dataclasses import replace
 from typing import Any
 
 from hyper_models.components.datasets.dataset_logging import get_dataset_logger
-from hyper_models.components.datasets.parallel import DatasetParallelContext
+from hyper_models.components.datasets.parallel import DataLoaderParallelContext
 
 logger = get_dataset_logger(__name__)
 
@@ -92,7 +92,7 @@ def load_online_hf_dataset(
     Args:
         data_path: Optional local source paths. Required unless
             ``hf_dataset_name`` is set.
-        data_config: Namespace, cache, and optional HF Dataset identifiers.
+        data_config: Cache options and optional HF Dataset identifiers.
         streaming: Whether to request the Hugging Face streaming implementation.
 
     Returns:
@@ -103,22 +103,13 @@ def load_online_hf_dataset(
         ValueError: If neither ``data_path`` nor ``hf_dataset_name`` is set.
     """
     try:
-        from datasets import (  # pylint: disable=C0415
-            disable_progress_bars,
-            enable_progress_bars,
-            load_dataset,
-        )
+        from datasets import load_dataset  # pylint: disable=C0415
     except ImportError as error:
         raise ImportError(
             "Online LLM Dataset requires the optional 'datasets' package"
         ) from error
 
-    namespace = str(data_config.get("namespace", "train"))
     cache_directory = data_config.get("cache_dir")
-    if bool(data_config.get("show_progress", True)):
-        enable_progress_bars()
-    else:
-        disable_progress_bars()
     hf_dataset_name = data_config.get("hf_dataset_name")
     if hf_dataset_name is not None:
         hf_config_name = data_config.get("hf_config_name")
@@ -126,13 +117,13 @@ def load_online_hf_dataset(
             "Loading Hugging Face Dataset %s (config=%s, split=%s, streaming=%s)",
             hf_dataset_name,
             hf_config_name,
-            namespace,
+            "train",
             streaming,
         )
         dataset = load_dataset(
             str(hf_dataset_name),
             name=hf_config_name,
-            split=namespace,
+            split="train",
             streaming=streaming,
             cache_dir=cache_directory,
         )
@@ -147,42 +138,24 @@ def load_online_hf_dataset(
         "Loading %d Online Dataset files (format=%s, split=%s, streaming=%s)",
         len(data_files),
         loader_format,
-        namespace,
+        "train",
         streaming,
     )
     dataset = load_dataset(
         loader_format,
         data_files=data_files,
-        split=namespace,
+        split="train",
         streaming=streaming,
         cache_dir=cache_directory,
     )
     return dataset
 
 
-def split_online_dataset_by_dp(dataset: Any, parallel_context: DatasetParallelContext) -> Any:
-    """Split one Hugging Face iterable source across data-parallel ranks."""
-    if parallel_context.dp_world_size <= 1:
-        return dataset
-    try:
-        from datasets.distributed import split_dataset_by_node  # pylint: disable=C0415
-    except ImportError as error:
-        raise ImportError(
-            "Distributed Online iterable Dataset requires the optional 'datasets' package"
-        ) from error
-    split_dataset = split_dataset_by_node(
-        dataset,
-        rank=parallel_context.dp_rank,
-        world_size=parallel_context.dp_world_size,
-    )
-    return split_dataset
-
-
-def normalize_online_parallel_context(
-        parallel_context: DatasetParallelContext | None,
-) -> DatasetParallelContext:
+def normalize_online_dataloader_context(
+        dataloader_context: DataLoaderParallelContext | None,
+) -> DataLoaderParallelContext:
     """Keep Online IO on TP rank zero even when indexed caches are enabled."""
-    dataset_context = parallel_context or DatasetParallelContext()
-    if dataset_context.data_index_cache:
-        dataset_context = replace(dataset_context, data_index_cache=False)
-    return dataset_context
+    normalized_context = dataloader_context or DataLoaderParallelContext()
+    if normalized_context.data_index_cache:
+        normalized_context = replace(normalized_context, data_index_cache=False)
+    return normalized_context

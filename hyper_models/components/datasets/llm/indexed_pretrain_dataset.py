@@ -93,6 +93,14 @@ class _IndexedPretrainDataset(ABC):
         self.num_samples = num_samples
         self.index_split = index_split
         self.config = config
+        self._ltor_fields_cacheable = not any(
+            (
+                self.config.reset_position_ids,
+                self.config.reset_attention_mask,
+                self.config.eod_mask_loss,
+            )
+        )
+        self._cached_ltor_fields = None
 
         # Handle pad token id provided by the tokenizer.
         try:
@@ -146,6 +154,33 @@ class _IndexedPretrainDataset(ABC):
             ).hexdigest()
 
         self._finalize()
+
+    def _build_ltor_fields(
+            self,
+            tokens: np.ndarray,
+            labels: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Build LTR masks and position IDs when explicitly enabled."""
+        if not self.config.create_ltor_fields:
+            ltor_fields = {}
+            return ltor_fields
+
+        if not self._ltor_fields_cacheable or self._cached_ltor_fields is None:
+            attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(tokens, self.config)
+            if self._ltor_fields_cacheable:
+                self._cached_ltor_fields = (attention_mask, loss_mask, position_ids)
+        else:
+            attention_mask, loss_mask, position_ids = self._cached_ltor_fields
+
+        loss_mask = loss_mask.copy()
+        loss_mask[labels == self._pad_token_id] = 0.0
+        ltor_fields = {
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+        }
+
+        return ltor_fields
 
     def _finalize(self) -> None:
         """Build indices or validate the low-level Dataset."""
@@ -201,7 +236,7 @@ class _IndexedPretrainDataset(ABC):
         identifiers["class"] = cls.__name__
         identifiers["dataset_path"] = dataset_path
         identifiers["num_samples"] = num_samples
-        identifiers["index_split"] = index_split.name
+        identifiers["index_split"] = index_split.name.lower()
         for attribute in cls._key_config_attributes():
             identifiers[attribute] = getattr(config, attribute)
         return identifiers
@@ -241,29 +276,6 @@ class _MockDataset(_IndexedPretrainDataset):
 class MockGPTDataset(_MockDataset):
     """Generate deterministic, fixed-length mock GPT samples."""
 
-    def __init__(
-        self,
-        dataset: IndexedDataReader | None,
-        dataset_path: str | None,
-        indices: np.ndarray | None,
-        num_samples: int,
-        index_split: Any,
-        config: GPTDatasetConfig,
-    ) -> None:
-        """Initialize the mock Dataset with the standard constructor contract."""
-        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
-        self.masks_and_position_ids_are_cacheable = not any(
-            (
-                self.config.reset_position_ids,
-                self.config.reset_attention_mask,
-                self.config.eod_mask_loss,
-            )
-        )
-        self.masks_and_position_ids_are_cached = False
-        self.cached_attention_mask = None
-        self.cached_loss_mask = None
-        self.cached_position_ids = None
-
     def __getitem__(self, index: int) -> Mapping[str, Any]:
         """Generate a deterministic mock sample for one split and index."""
         token = 1
@@ -283,60 +295,17 @@ class MockGPTDataset(_MockDataset):
         tokens = sample[:-1]
         labels = sample[1:]
 
-        if (
-            not self.masks_and_position_ids_are_cacheable
-            or not self.masks_and_position_ids_are_cached
-        ):
-            attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
-                tokens,
-                self.config,
-            )
-            if self.masks_and_position_ids_are_cacheable:
-                self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
-                self.cached_position_ids = position_ids
-                self.masks_and_position_ids_are_cached = True
-        else:
-            attention_mask = self.cached_attention_mask
-            loss_mask = self.cached_loss_mask
-            position_ids = self.cached_position_ids
-
         raw_sample = {
             "tokens": tokens,
             "labels": labels,
-            "loss_mask": loss_mask,
-            "position_ids": position_ids,
         }
-        if self.config.create_attention_mask:
-            raw_sample["attention_mask"] = attention_mask
+        raw_sample.update(self._build_ltor_fields(tokens, labels))
+
         return raw_sample
 
 
 class GPTDataset(_IndexedPretrainDataset):
     """Build fixed-length GPT samples from an indexed token stream."""
-
-    def __init__(
-        self,
-        dataset: IndexedDataReader,
-        dataset_path: str,
-        indices: np.ndarray,
-        num_samples: int,
-        index_split: Any,
-        config: GPTDatasetConfig,
-    ) -> None:
-        """Initialize the Dataset and build or load its three sample indices."""
-        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
-        self.masks_and_position_ids_are_cacheable = not any(
-            (
-                self.config.reset_position_ids,
-                self.config.reset_attention_mask,
-                self.config.eod_mask_loss,
-            )
-        )
-        self.masks_and_position_ids_are_cached = False
-        self.cached_attention_mask = None
-        self.cached_loss_mask = None
-        self.cached_position_ids = None
 
     def _finalize(self) -> None:
         """Build the document, sample, and shuffle indices for the token stream."""
@@ -369,7 +338,7 @@ class GPTDataset(_IndexedPretrainDataset):
         cache_key = f"{self.unique_description_hash}-{type(self).__name__}"
 
         # drop last for train/test, valid drop depended on config
-        if self.index_split.name == "valid":
+        if self.index_split.name.lower() == "valid":
             drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
         else:
             drop_last_partial_sequence = True
@@ -488,27 +457,7 @@ class GPTDataset(_IndexedPretrainDataset):
             labels = np.roll(text, shift=-1)
             labels[-1] = self._pad_token_id
 
-        if (
-            not self.masks_and_position_ids_are_cacheable
-            or not self.masks_and_position_ids_are_cached
-        ):
-            attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
-                tokens,
-                self.config,
-            )
-            if self.masks_and_position_ids_are_cacheable:
-                self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
-                self.cached_position_ids = position_ids
-                self.masks_and_position_ids_are_cached = True
-        else:
-            attention_mask = self.cached_attention_mask
-            loss_mask = self.cached_loss_mask
-            position_ids = self.cached_position_ids
-
-        # For padded sequences, mask the loss
-        loss_mask = loss_mask.copy()
-        loss_mask[labels == self._pad_token_id] = 0.0
+        ltor_fields = self._build_ltor_fields(tokens, labels)
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
@@ -520,12 +469,8 @@ class GPTDataset(_IndexedPretrainDataset):
         raw_sample = {
             "tokens": tokens,
             "labels": labels,
-            "loss_mask": loss_mask,
-            "position_ids": position_ids,
         }
-
-        if self.config.create_attention_mask:
-            raw_sample["attention_mask"] = attention_mask
+        raw_sample.update(ltor_fields)
 
         return raw_sample
 
@@ -609,29 +554,6 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
         config: The GPT-specific Dataset configuration.
     """
 
-    def __init__(
-        self,
-        dataset: IndexedDataReader,
-        dataset_path: str | None,
-        indices: np.ndarray,
-        num_samples: int,
-        index_split: Any,
-        config: GPTDatasetConfig,
-    ) -> None:
-        """Initialize the Dataset and validate pre-cut record lengths."""
-        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
-        self.masks_and_position_ids_are_cacheable = not any(
-            (
-                self.config.reset_position_ids,
-                self.config.reset_attention_mask,
-                self.config.eod_mask_loss,
-            )
-        )
-        self.masks_and_position_ids_are_cached = False
-        self.cached_attention_mask = None
-        self.cached_loss_mask = None
-        self.cached_position_ids = None
-
     def _finalize(self) -> None:
         """Validate the low-level Dataset and the pre-cut record lengths."""
         if self.dataset is None or self.indices is None:
@@ -702,63 +624,36 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
         if np.any(tokens < 0) or np.any(tokens >= self.config.tokenizer.vocab_size):
             raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
 
-        if (
-            not self.masks_and_position_ids_are_cacheable
-            or not self.masks_and_position_ids_are_cached
-        ):
-            attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
-                tokens,
-                self.config,
-            )
-            if self.masks_and_position_ids_are_cacheable:
-                self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
-                self.cached_position_ids = position_ids
-                self.masks_and_position_ids_are_cached = True
-        else:
-            attention_mask = self.cached_attention_mask
-            loss_mask = self.cached_loss_mask
-            position_ids = self.cached_position_ids
+        ltor_fields = self._build_ltor_fields(tokens, labels)
 
-        loss_mask = loss_mask.copy()
-        loss_mask[labels == self._pad_token_id] = 0.0
         tokens[tokens == self._pad_token_id] = 0
         labels[labels == self._pad_token_id] = 0
 
         raw_sample = {
             "tokens": tokens,
             "labels": labels,
-            "loss_mask": loss_mask,
-            "position_ids": position_ids,
         }
-        if self.config.create_attention_mask:
-            raw_sample["attention_mask"] = attention_mask
+        raw_sample.update(ltor_fields)
+
         return raw_sample
 
 
 def _get_ltor_masks_and_position_ids(
     tokens: np.ndarray,
     config: GPTDatasetConfig,
-) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
-    """
-    Build causal attention, loss, and position arrays for one token sequence.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build causal attention, loss, and position arrays for one token sequence.
 
     Args:
-        tokens (np.ndarray): The data array that holds the tokens from the dataset
-        config (GPTDatasetConfig): The dataset config.
+        tokens: Token IDs for one fixed-length Indexed sample.
+        config: Indexed Dataset runtime-field configuration.
 
     Returns:
-        np.ndarray | None: Attention mask needed to be used for Attention
-
-        np.ndarray: The mask used for loss value during training
-
-        np.ndarray: The position ID's of the token
+        Attention mask, loss mask, and position IDs.
     """
     seq_length = tokens.size
     eod_token = config.tokenizer.eod
-    attention_mask = None
-    if config.create_attention_mask:
-        attention_mask = np.tril(np.ones((seq_length, seq_length)))[None, :, :]
+    attention_mask = np.tril(np.ones((seq_length, seq_length)))[None, :, :]
 
     # Loss mask.
     loss_mask = np.ones(seq_length, dtype=np.float32)
@@ -767,7 +662,7 @@ def _get_ltor_masks_and_position_ids(
 
     # Position ids.
     position_ids = np.arange(seq_length, dtype=np.int64)
-    # We need to clone as the ids will be modifed based on batch index.
+    # We need to clone as the ids will be modified based on batch index.
     if config.reset_position_ids:
         position_ids = position_ids.copy()
 
@@ -783,15 +678,14 @@ def _get_ltor_masks_and_position_ids(
         for eod_index in eod_indices:
             next_index = int(eod_index) + 1
             # Mask attention loss.
-            if config.reset_attention_mask and attention_mask is not None:
+            if config.reset_attention_mask:
                 attention_mask[0, next_index:, :next_index] = 0
             # Reset positions.
             if config.reset_position_ids:
                 position_ids[next_index:] -= next_index - prev_index
                 prev_index = next_index
 
-    if attention_mask is not None:
-        # Convert attention mask to binary:
-        attention_mask = attention_mask < 0.5
+    # Convert attention mask to binary:
+    attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids

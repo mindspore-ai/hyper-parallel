@@ -14,9 +14,8 @@
 # ============================================================================
 """Build the private Omni multimodal data transform."""
 
+from collections.abc import Callable
 from typing import Any
-
-from hyper_models.components.datasets.contracts import SampleTransform
 
 
 def build_data_transform(
@@ -27,7 +26,7 @@ def build_data_transform(
         video_processor: Any = None,
         audio_processor: Any = None,
         **transform_options: Any,
-) -> SampleTransform:
+) -> Callable[[Any], Any]:
     """Build the Omni Trainer's modality-specific data transform.
 
     Args:
@@ -48,14 +47,11 @@ def build_data_transform(
     raise NotImplementedError("Omni data transforms are not implemented")
 
 
-def build_omni_transform(**kwargs: Any) -> SampleTransform:
+def build_omni_transform(**kwargs: Any) -> Callable[[Any], Any]:
     """Build the Omni transform using its previous public name."""
     return build_data_transform(**kwargs)
 
 
-def build_omni_adapter(**kwargs: Any) -> SampleTransform:
+def build_omni_adapter(**kwargs: Any) -> Callable[[Any], Any]:
     """Compatibility entry point for the former Omni adapter module."""
     return build_data_transform(**kwargs)
-
-
-__all__ = ["build_data_transform", "build_omni_adapter", "build_omni_transform"]

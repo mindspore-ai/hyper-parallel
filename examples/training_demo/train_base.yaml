@@ -1,4 +1,5 @@
-# TP×CP×EP×FSDP training with Online WikiText tokenization and packing.
+# TP×CP×EP×FSDP base Trainer demo using the shared tiny Qwen3-MoE model and WikiText data.
+# Run with: bash examples/training_demo/run_base.sh
 
 model:
   _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
@@ -65,8 +66,10 @@ plan_overrides:
 mixed_precision:
   enabled: false
 
+# The base case keeps full activation checkpointing enabled so this path also
+# validates recomputation with the common Dataset and batch runtime.
 activation_checkpoint:
-  mode: off
+  mode: full
 
 dataset:
   model_assets:
@@ -80,7 +83,7 @@ dataset:
     _target_: hyper_models.components.datasets.llm.build_data_transform.build_llm_data_transform
     data_type: plaintext
     text_keys: text
-    max_seq_len: 4096
+    max_seq_len: 2048
 
   _target_: hyper_models.components.datasets.llm.build_online_text_dataset
   data_path: ./outputs/training_demo/tiny_qwen3_moe_wikitext2/raw/wikitext-2-raw-v1-train.jsonl
@@ -89,13 +92,8 @@ dataset:
     hf_dataset_name: null
 
 dataloader:
-  _target_: hyper_models.components.datasets.DynamicBatchDataLoader
+  _target_: hyper_models.components.datasets.FixedBatchDataLoader
 
-  # Buffer short Online samples before selecting a token-budgeted FB batch.
-  # The 4096-token budget is derived from micro_batch_size * max_seq_len.
-  min_buffered_samples: 200
-
-  # Pack the dynamically selected K samples and emit their sequence boundaries.
   collate_fn:
     _target_: hyper_models.components.datasets.build_online_text_collate_fn
 
@@ -115,15 +113,8 @@ dataloader:
   prefetch_factor: null
 
 optimizer:
-  _target_: hyper_models.components.optim.optimizer.Muon
+  _target_: hyper_models.components.optim.optimizer.AdamW
   no_decay_params: [bias, norm, ln_]
-  muon_config:
-    muon_lr: 2.0e-2
-    muon_weight_decay: 0.1
-    muon_momentum: 0.95
-    muon_nesterov: true
-    muon_ns_steps: 5
-    muon_ns_variant: asym5
   adamw_config:
     adamw_lr: 1.0e-4
     adamw_weight_decay: 0.01
@@ -139,8 +130,14 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: ""
+  checkpoint_dir: ./outputs/training_demo/checkpoints
   restore_from: null
+  save_steps: 1
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: true
+  restore_optimizer: true
+  restore_train_state: true
 
 debug:
   check_nan_inf: false

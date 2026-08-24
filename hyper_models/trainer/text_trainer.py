@@ -22,7 +22,7 @@ import torch
 from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_models.components.datasets import calculate_num_micro_batches
-from hyper_models.components.datasets.llm import build_chat_template, build_llm_get_batch
+from hyper_models.components.datasets.llm import build_chat_template
 from hyper_models.components.loss.loss_utils import count_loss_token
 from hyper_models.components.utils import helper
 from hyper_models.components.utils.device import synchronize
@@ -81,11 +81,9 @@ class TextTrainer:
             )
 
         self.base.chat_template = None
-        if assets_config.datasets_type == "conversation":
+        if assets_config.chat_template is not None:
             if self.base.tokenizer is None:
                 raise ValueError("dataset.model_assets.tokenizer is required for conversation data")
-            if assets_config.chat_template is None:
-                raise ValueError("dataset.model_assets.chat_template is required for conversation data")
             if isinstance(assets_config.chat_template, str):
                 self.base.chat_template = build_chat_template(
                     assets_config.chat_template,
@@ -126,19 +124,23 @@ class TextTrainer:
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
         )
-        self.base.collate_fn = dataloader_config.collate_fn.build()
+        self.base.collate_fn = dataloader_config.collate_fn.build(
+            mesh_context=self.base.mesh,
+        )
 
     def _build_get_batch(self) -> None:
         """Build the DataLoader-to-LLM batch adapter."""
         config = self.base.config
-        get_batch_builder = config.dataloader.get_batch.build if config.dataloader.get_batch else build_llm_get_batch
-        self.base.get_batch = get_batch_builder(
+        if config.dataloader.get_batch is None:
+            raise ValueError("dataloader.get_batch must define a batching runtime target")
+        get_batch = config.dataloader.get_batch.build(
             mesh_context=self.base.mesh,
             device=self.base.device,
             tokenizer=self.base.tokenizer,
             data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
+        self.base.get_batch = get_batch
 
     @property
     def distributed_setup(self) -> Any:
@@ -188,18 +190,35 @@ class TextTrainer:
             grad_norm=grad_norm,
         )
 
+    def forward_backward_step(
+            self,
+            data_iterator: Any,
+            num_micro_steps: int,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Fetch and execute one forward-backward micro-step.
+
+        Args:
+            data_iterator: Iterator providing one raw FB batch per call.
+            num_micro_steps: Number of FB steps in the current optimizer step.
+
+        Returns:
+            Loss tensor and named loss tensors for this FB step.
+        """
+        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
+        self.base.current_token_counts = count_loss_token(loss_inputs)
+        self.base.step_token_counts = {
+            name: token_count * num_micro_steps
+            for name, token_count in self.base.current_token_counts.items()
+        }
+        loss, loss_dict = self.base.forward_backward_step(model_inputs)
+
+        return loss, loss_dict
+
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one text training step."""
         config = self.base.config
-        first_training_batch = self.base.get_batch(data_iterator)
         num_micro_steps = self.base.num_micro_batches
-        training_batches = [first_training_batch]
-        for _ in range(1, num_micro_steps):
-            training_batches.append(self.base.get_batch(data_iterator))
-
-        # Advance first: callbacks and checkpoints read state.global_step as the
-        # number of completed optimizer updates, which is what resume replays from.
-        self.base.state.global_step += 1
+        optimizers = self.base.optimizer if isinstance(self.base.optimizer, list) else [self.base.optimizer]
 
         self.on_step_begin()
         synchronize()
@@ -207,34 +226,29 @@ class TextTrainer:
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step, (model_inputs, loss_inputs) in enumerate(training_batches):
+        for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
-            self.base._configure_fsdp_gradient_sync(
+            self.base.configure_fsdp_gradient_sync(
                 micro_step,
                 num_micro_steps,
             )
-            self.base.current_token_counts = count_loss_token(loss_inputs)
-            self.base.step_token_counts = {
-                name: token_count * num_micro_steps
-                for name, token_count in self.base.current_token_counts.items()
-            }
-            loss, loss_dict = self.base.forward_backward_step(model_inputs)
+            loss, loss_dict = self.forward_backward_step(
+                data_iterator,
+                num_micro_steps,
+            )
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
         hsdp_sync_stream()
-        grad_norm = clip_grad_norm_(
-            self.base.model,
-            config.training.max_grad_norm,
-        )
+        grad_norm = 0.0
+        if config.training.max_grad_norm > 0:
+            grad_norm = clip_grad_norm_(
+                self.base.model,
+                config.training.max_grad_norm,
+            )
 
-        optimizers = (
-            self.base.optimizer
-            if isinstance(self.base.optimizer, list)
-            else [self.base.optimizer]
-        )
         for optimizer in optimizers:
             with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
@@ -252,6 +266,9 @@ class TextTrainer:
         for scheduler in schedulers:
             scheduler.step()
 
+        # Checkpoint and logging callbacks observe the number of completed
+        # optimizer updates.
+        self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
         self.on_step_end(
             loss=total_loss,
@@ -265,7 +282,7 @@ class TextTrainer:
         }
 
     def train(self) -> None:
-        """Run the text training loop."""
+        """Run the configured global optimizer steps by Dataset epoch."""
         config = self.base.config
         self.on_train_begin()
         logger.info(
@@ -279,16 +296,13 @@ class TextTrainer:
 
         # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
         for epoch in range(self.base.state.epoch, self.base.train_epochs):
-            if epoch > 1:
-                break
             train_dataloader = self.base.train_dataloader
-
             if hasattr(train_dataloader, "set_epoch"):
                 train_dataloader.set_epoch(epoch)
 
+            self.base.state.epoch = epoch
             self.on_epoch_begin()
             data_iterator = iter(train_dataloader) if train_dataloader is not None else None
-
             start_step = self.base.state.global_step - epoch * self.base.train_steps
             train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
             for _ in range(start_step, train_steps):
@@ -301,7 +315,6 @@ class TextTrainer:
             self.on_epoch_end()
             self.base.state.epoch = epoch + 1
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-
             if self.base.state.global_step >= self.base.train_iters:
                 break
 
