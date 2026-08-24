@@ -31,9 +31,9 @@ from hyper_parallel.distributed_data.distributor import (
     TorchPackedBytesRedistributor,
     TorchTensorRedistributor,
 )
-from hyper_parallel.distributed_data.materializer import (
-    MapDatasetMaterializer,
-    RankMaterializer,
+from hyper_parallel.distributed_data.fetcher import (
+    MapDatasetFetcher,
+    MicroBatchFetcher,
     StridedMetadataSource,
     StridedOnlineSampleSource,
 )
@@ -156,7 +156,7 @@ def build_distributed_dataset(
             before heavyweight target-rank decode.
         mesh: Named root training mesh.
         config: Batch planning, double buffering, and sample A2A transport configuration.
-        metadata_fn: Derive ``SampleMeta`` from ``(raw_sample, data_ref)`` for
+        metadata_fn: Derive ``SampleMeta`` from ``(raw_sample, sample_id)`` for
             microbatch-local online planning. Required without ``metadata``.
         metadata: Optional shared lightweight sidecar for whole-step planning.
         collate_fn: Target-owner transform and collation function. In online
@@ -222,7 +222,7 @@ def build_distributed_dataset(
             topology.data_parallel_size,
             max_entries=complete_steps * planner.local_samples_per_step,
         )
-    rank_materializer = RankMaterializer(MapDatasetMaterializer(dataset), collate_fn)
+    micro_batch_fetcher = MicroBatchFetcher(MapDatasetFetcher(dataset), collate_fn)
 
     if topology.data_parallel_size == 1:
         metadata_synchronizer = LocalMetadataSynchronizer()
@@ -247,7 +247,7 @@ def build_distributed_dataset(
         topology=topology,
         metadata_source=metadata_source,
         planner=planner,
-        rank_materializer=rank_materializer,
+        micro_batch_fetcher=micro_batch_fetcher,
         metadata_synchronizer=metadata_synchronizer,
         micro_batch_distributor=micro_batch_distributor,
         prefetch_steps=config.prefetch_steps,

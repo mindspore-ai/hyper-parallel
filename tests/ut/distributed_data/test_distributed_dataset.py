@@ -30,8 +30,8 @@ from hyper_parallel.distributed_data.distributor import (
     LocalMetadataSynchronizer,
     LocalSampleRedistributor,
 )
-from hyper_parallel.distributed_data.materializer import (
-    RankMaterializer,
+from hyper_parallel.distributed_data.fetcher import (
+    MicroBatchFetcher,
     StridedMetadataSource,
     StridedOnlineSampleSource,
 )
@@ -71,10 +71,10 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         """The public builder should require exactly one metadata path."""
         config = distributed_data.DistributedDatasetConfig(micro_batch_size=1, micro_batch_num=1)
 
-        def metadata_fn(sample: Any, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: Any, sample_id: int) -> SampleMeta:
             """Build unused metadata for boundary validation."""
             del sample
-            return SampleMeta(sample_id=str(data_ref), source_id="source", data_ref=data_ref)
+            return SampleMeta(sample_id=sample_id, source_id="source")
 
         with self.assertRaisesRegex(ValueError, "requires metadata_fn"):
             distributed_data.build_distributed_dataset([], None, config)
@@ -121,7 +121,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             global_rank=0,
         )
         metadata = [
-            SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+            SampleMeta(sample_id=index, source_id="source")
             for index in range(4)
         ]
         created: list[tuple[tuple[int, ...], str]] = []
@@ -164,6 +164,18 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         finally:
             loader.close()
 
+    def test_online_metadata_preserves_dataset_sample_id(self) -> None:
+        """Online metadata must retain the key used to read the map-style dataset."""
+        source = StridedOnlineSampleSource(
+            ["sample"],
+            lambda sample, sample_id: SampleMeta(sample_id=sample_id + 1, source_id=sample),
+            shard_rank=0,
+            num_shards=1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must preserve sample_id"):
+            source.get(0)
+
 
 class _PeerMetadataSynchronizer:
     """Add a deterministic second owner's contribution without collectives."""
@@ -178,10 +190,8 @@ class _PeerMetadataSynchronizer:
             raise ValueError(f"Unexpected owners {data_owner_ranks}.")
         peer_metadata = tuple(
             SampleMeta(
-                sample_id=f"peer-{metadata.sample_id}",
+                sample_id=metadata.sample_id + 4,
                 source_id=metadata.source_id,
-                data_ref=metadata.data_ref + 4,
-                modality=metadata.modality,
                 cost_hint=WorkloadCost(encoder=metadata.cost_hint.encoder + 0.5),
             )
             for metadata in local_metadata
@@ -189,18 +199,18 @@ class _PeerMetadataSynchronizer:
         return tuple(local_metadata) + peer_metadata
 
 
-class _RecordingMaterializer:
+class _RecordingFetcher:
     """Record which heavyweight entries the current owner actually reads."""
 
     def __init__(self, dataset: list[Any]) -> None:
         """Initialize recording over a small map-style dataset."""
         self._dataset = dataset
-        self.data_refs = []
+        self.sample_ids = []
 
-    def materialize(self, metadata: SampleMeta) -> Any:
+    def fetch(self, metadata: SampleMeta) -> Any:
         """Record and return one sample."""
-        self.data_refs.append(metadata.data_ref)
-        return self._dataset[metadata.data_ref]
+        self.sample_ids.append(metadata.sample_id)
+        return self._dataset[metadata.sample_id]
 
 
 class _PinnableValue:
@@ -220,12 +230,12 @@ class _PinnableValue:
         return f"pinned-{self.value}"
 
 
-class _FailMaterializer:
+class _FailFetcher:
     """Fail if a non-owner rank attempts heavyweight data access."""
 
-    def materialize(self, metadata: SampleMeta) -> Any:
-        """Reject every materialization attempt."""
-        raise AssertionError(f"Non-owner unexpectedly materialized {metadata.sample_id}.")
+    def fetch(self, metadata: SampleMeta) -> Any:
+        """Reject every fetch attempt."""
+        raise AssertionError(f"Non-owner unexpectedly fetched {metadata.sample_id}.")
 
 
 class _RecordingMapDataset:
@@ -234,16 +244,16 @@ class _RecordingMapDataset:
     def __init__(self, samples: list[str]) -> None:
         """Initialize deterministic raw samples."""
         self._samples = samples
-        self.data_refs: list[int] = []
+        self.sample_ids: list[int] = []
 
     def __len__(self) -> int:
         """Return global raw sample count."""
         return len(self._samples)
 
-    def __getitem__(self, data_ref: int) -> str:
+    def __getitem__(self, sample_id: int) -> str:
         """Record and return one raw sample."""
-        self.data_refs.append(data_ref)
-        return self._samples[data_ref]
+        self.sample_ids.append(sample_id)
+        return self._samples[sample_id]
 
 
 class _SyntheticSampleRedistributor:
@@ -273,7 +283,7 @@ class _SyntheticSampleRedistributor:
             for local_index, sample in enumerate(local_samples)
         }
         for sample in plan.samples:
-            available.setdefault(sample.source_position, f"peer-{sample.meta.data_ref}")
+            available.setdefault(sample.source_position, f"peer-{sample.meta.sample_id}")
         return {
             sample.source_position: available[sample.source_position]
             for sample in plan.samples
@@ -440,10 +450,8 @@ def _build_loader(
 ):
     metadata = [
         SampleMeta(
-            sample_id=f"local-{index}",
+            sample_id=index,
             source_id="source",
-            data_ref=index,
-            modality="image_text",
             cost_hint=WorkloadCost(encoder=float(index + 1)),
         )
         for index in range(4)
@@ -455,12 +463,12 @@ def _build_loader(
         global_rank=0,
     )
     planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=2)
-    materializer = _RecordingMaterializer([f"sample-{index}" for index in range(8)])
+    fetcher = _RecordingFetcher([f"sample-{index}" for index in range(8)])
     loader = DistributedDataset(
         topology=topology,
         metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
         planner=planner,
-        rank_materializer=RankMaterializer(materializer, tuple),
+        micro_batch_fetcher=MicroBatchFetcher(fetcher, tuple),
         metadata_synchronizer=_PeerMetadataSynchronizer(),
         micro_batch_distributor=micro_batch_distributor or LocalMicroBatchDistributor(),
         prefetch_steps=prefetch_steps,
@@ -468,7 +476,7 @@ def _build_loader(
         prepare_micro_batch=prepare_micro_batch,
         data_stream=data_stream,
     )
-    return loader, materializer
+    return loader, fetcher
 
 
 def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool) -> DistributedDataset:
@@ -485,17 +493,17 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
         return {"values": values, "nested": (values[0], ["text"])}
 
     if online:
-        def metadata_fn(sample: Any, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: Any, sample_id: int) -> SampleMeta:
             """Build online metadata for one synthetic raw sample."""
             del sample
-            return SampleMeta(sample_id=str(data_ref), source_id="source", data_ref=data_ref)
+            return SampleMeta(sample_id=sample_id, source_id="source")
 
         online_source = StridedOnlineSampleSource(samples, metadata_fn, shard_rank=0, num_shards=1)
         return DistributedDataset(
             topology=topology,
             metadata_source=None,
             planner=planner,
-            rank_materializer=RankMaterializer(_FailMaterializer(), collate_fn),
+            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), collate_fn),
             metadata_synchronizer=LocalMetadataSynchronizer(),
             micro_batch_distributor=LocalMicroBatchDistributor(),
             prefetch_steps=1,
@@ -505,14 +513,14 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
         )
 
     metadata = [
-        SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+        SampleMeta(sample_id=index, source_id="source")
         for index in range(len(samples))
     ]
     return DistributedDataset(
         topology=topology,
         metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
         planner=planner,
-        rank_materializer=RankMaterializer(_RecordingMaterializer(samples), collate_fn),
+        micro_batch_fetcher=MicroBatchFetcher(_RecordingFetcher(samples), collate_fn),
         metadata_synchronizer=LocalMetadataSynchronizer(),
         micro_batch_distributor=LocalMicroBatchDistributor(),
         prefetch_steps=1,
@@ -523,7 +531,7 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
 def _build_single_microbatch_double_buffer(micro_batch_distributor: Any) -> DistributedDataset:
     """Build two one-microbatch steps for cross-step look-ahead tests."""
     metadata = [
-        SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+        SampleMeta(sample_id=index, source_id="source")
         for index in range(2)
     ]
     topology = DataTopology.from_layout(
@@ -536,7 +544,7 @@ def _build_single_microbatch_double_buffer(micro_batch_distributor: Any) -> Dist
         topology=topology,
         metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
         planner=DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=1),
-        rank_materializer=RankMaterializer(_RecordingMaterializer(["sample-0", "sample-1"]), tuple),
+        micro_batch_fetcher=MicroBatchFetcher(_RecordingFetcher(["sample-0", "sample-1"]), tuple),
         metadata_synchronizer=LocalMetadataSynchronizer(),
         micro_batch_distributor=micro_batch_distributor,
         prefetch_steps=2,
@@ -547,13 +555,13 @@ def _build_single_microbatch_double_buffer(micro_batch_distributor: Any) -> Dist
 class TestDistributedDataset(unittest.TestCase):
     """Validate owner-only reads, bounded look-ahead, and exact resume."""
 
-    def test_materializes_one_microbatch_at_a_time_and_requires_commit(self) -> None:
+    def test_fetches_one_microbatch_at_a_time_and_requires_commit(self) -> None:
         """A step should plan globally but retain at most one look-ahead microbatch."""
-        loader, materializer = _build_loader()
+        loader, fetcher = _build_loader()
         try:
             step = next(loader)
 
-            self.assertLessEqual(len(materializer.data_refs), 1)
+            self.assertLessEqual(len(fetcher.sample_ids), 1)
             self.assertEqual(loader.consumed_offset, 0)
             self.assertEqual(loader.prepared_offset, 4)
             with self.assertRaisesRegex(ValueError, "Fully consume and commit"):
@@ -643,13 +651,13 @@ class TestDistributedDataset(unittest.TestCase):
         """Online metadata gather and raw A2A should run before the next consumer request."""
         dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
 
-        def metadata_fn(sample: str, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
             """Build deterministic online metadata for the synthetic sample."""
+            del sample
             return SampleMeta(
-                sample_id=sample,
+                sample_id=sample_id,
                 source_id="source",
-                data_ref=data_ref,
-                cost_hint=WorkloadCost(encoder=float(data_ref + 1)),
+                cost_hint=WorkloadCost(encoder=float(sample_id + 1)),
             )
 
         topology = DataTopology.from_layout(
@@ -665,7 +673,7 @@ class TestDistributedDataset(unittest.TestCase):
             topology=topology,
             metadata_source=None,
             planner=DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=3),
-            rank_materializer=RankMaterializer(_FailMaterializer(), tuple),
+            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), tuple),
             metadata_synchronizer=synchronizer,
             micro_batch_distributor=LocalMicroBatchDistributor(),
             prefetch_steps=2,
@@ -694,7 +702,7 @@ class TestDistributedDataset(unittest.TestCase):
             remaining = list(step)
 
             self.assertEqual([micro_batch.micro_batch_index for micro_batch in [first, *remaining]], [0, 1, 2])
-            self.assertEqual(dataset.data_refs, [0, 2, 4])
+            self.assertEqual(dataset.sample_ids, [0, 2, 4])
             self.assertTrue(all(name.startswith("hp-data-buffer") for name in redistributor.thread_names))
             self.assertTrue(all(name.startswith("hp-data-buffer") for name in prepare_threads))
             loader.commit(step.replay_id)
@@ -779,7 +787,7 @@ class TestDistributedDataset(unittest.TestCase):
     def test_double_buffer_runs_non_owner_distribution_on_data_producer(self) -> None:
         """TP peers must enter microbatch collectives from the same ordered producer role."""
         metadata = [
-            SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+            SampleMeta(sample_id=index, source_id="source")
             for index in range(2)
         ]
         topology = DataTopology.from_layout(
@@ -794,7 +802,7 @@ class TestDistributedDataset(unittest.TestCase):
             topology=topology,
             metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
             planner=planner,
-            rank_materializer=RankMaterializer(_FailMaterializer()),
+            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher()),
             metadata_synchronizer=LocalMetadataSynchronizer(),
             micro_batch_distributor=distributor,
             prefetch_steps=2,
@@ -814,14 +822,13 @@ class TestDistributedDataset(unittest.TestCase):
         """Unavailable metadata must restrict planning and sample reads to each microbatch."""
         dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
 
-        def metadata_fn(sample: str, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
             """Derive deterministic online cost metadata from one raw sample."""
+            del sample
             return SampleMeta(
-                sample_id=sample,
+                sample_id=sample_id,
                 source_id="source",
-                data_ref=data_ref,
-                modality="image_text",
-                cost_hint=WorkloadCost(encoder=float(data_ref + 1)),
+                cost_hint=WorkloadCost(encoder=float(sample_id + 1)),
             )
 
         topology = DataTopology.from_layout(
@@ -842,7 +849,7 @@ class TestDistributedDataset(unittest.TestCase):
             topology=topology,
             metadata_source=None,
             planner=DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=3),
-            rank_materializer=RankMaterializer(_FailMaterializer(), tuple),
+            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), tuple),
             metadata_synchronizer=_PeerMetadataSynchronizer(),
             micro_batch_distributor=LocalMicroBatchDistributor(),
             prefetch_steps=1,
@@ -853,15 +860,15 @@ class TestDistributedDataset(unittest.TestCase):
             self.assertEqual(len(loader), 1)
             step = next(loader)
 
-            self.assertLessEqual(len(dataset.data_refs), 1)
+            self.assertLessEqual(len(dataset.sample_ids), 1)
             first = next(step)
             self.assertEqual(len(redistributor.local_sample_batches), 1)
-            self.assertLessEqual(len(dataset.data_refs), 2)
+            self.assertLessEqual(len(dataset.sample_ids), 2)
 
             remaining = list(step)
             micro_batches = [first, *remaining]
             self.assertEqual([micro_batch.micro_batch_index for micro_batch in micro_batches], [0, 1, 2])
-            self.assertEqual(dataset.data_refs, [0, 2, 4])
+            self.assertEqual(dataset.sample_ids, [0, 2, 4])
             self.assertEqual(
                 redistributor.local_sample_batches,
                 [("raw-0",), ("raw-2",), ("raw-4",)],
@@ -946,10 +953,10 @@ class TestDistributedDataset(unittest.TestCase):
         finally:
             restored.close()
 
-    def test_tp_peer_receives_micro_batches_without_materializing_dataset(self) -> None:
+    def test_tp_peer_receives_micro_batches_without_fetching_dataset(self) -> None:
         """Only the data owner may perform map-style I/O for a DP coordinate."""
         metadata = [
-            SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+            SampleMeta(sample_id=index, source_id="source")
             for index in range(2)
         ]
         topology = DataTopology.from_layout(
@@ -964,7 +971,7 @@ class TestDistributedDataset(unittest.TestCase):
             topology=topology,
             metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
             planner=planner,
-            rank_materializer=RankMaterializer(_FailMaterializer()),
+            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher()),
             metadata_synchronizer=_PeerMetadataSynchronizer(),
             micro_batch_distributor=_ReceivingMicroBatchDistributor(plan),
             prefetch_steps=1,
@@ -979,9 +986,10 @@ class TestDistributedDataset(unittest.TestCase):
         """Non-owner model peers should receive online plans without candidate I/O."""
         dataset = _RecordingMapDataset(["raw-0", "raw-1"])
 
-        def metadata_fn(sample: str, data_ref: int) -> SampleMeta:
+        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
             """Build metadata that must remain unused on the non-owner peer."""
-            return SampleMeta(sample_id=sample, source_id="source", data_ref=data_ref)
+            del sample
+            return SampleMeta(sample_id=sample_id, source_id="source")
 
         topology = DataTopology.from_layout(
             mesh_shape=(2,),
@@ -992,7 +1000,7 @@ class TestDistributedDataset(unittest.TestCase):
         planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=2)
         plans = [
             planner.plan_microbatch(
-                [SampleMeta(sample_id=str(index), source_id="source", data_ref=index)],
+                [SampleMeta(sample_id=index, source_id="source")],
                 step=0,
                 cursor_start=index,
                 micro_batch_index=index,
@@ -1003,7 +1011,7 @@ class TestDistributedDataset(unittest.TestCase):
             topology=topology,
             metadata_source=None,
             planner=planner,
-            rank_materializer=RankMaterializer(_FailMaterializer()),
+            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher()),
             metadata_synchronizer=LocalMetadataSynchronizer(),
             micro_batch_distributor=_ReceivingPlanSequenceDistributor(plans),
             prefetch_steps=1,
@@ -1018,7 +1026,7 @@ class TestDistributedDataset(unittest.TestCase):
                 [micro_batch.data for micro_batch in micro_batches],
                 ["received-online-0", "received-online-1"],
             )
-            self.assertEqual(dataset.data_refs, [])
+            self.assertEqual(dataset.sample_ids, [])
             loader.commit(step.replay_id)
         finally:
             loader.close()
@@ -1026,7 +1034,7 @@ class TestDistributedDataset(unittest.TestCase):
     def test_metadata_shards_can_be_truncated_to_equal_complete_steps(self) -> None:
         """Uneven strided tails must not make owners call different collective counts."""
         metadata = [
-            SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+            SampleMeta(sample_id=index, source_id="source")
             for index in range(10)
         ]
         sources = [

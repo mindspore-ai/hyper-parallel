@@ -91,14 +91,12 @@ class WorkloadCost:
 class SampleMeta:
     """Lightweight sample information visible to the planner.
 
-    ``data_ref`` identifies the map-style dataset entry. It must not contain
+    ``sample_id`` identifies the map-style dataset entry. It must not contain
     decoded images, token tensors, or other heavyweight sample data.
     """
 
-    sample_id: str
+    sample_id: int | str
     source_id: str
-    data_ref: int | str
-    modality: str = "text"
     text_tokens: int = 0
     vision_tokens: int = 0
     audio_tokens: int = 0
@@ -106,19 +104,17 @@ class SampleMeta:
     cost_hint: WorkloadCost | None = None
 
     def __post_init__(self) -> None:
-        for name in ("sample_id", "source_id", "modality"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"SampleMeta.{name} must be a non-empty string, but got {value!r}.")
-        if not isinstance(self.data_ref, (int, str)) or isinstance(self.data_ref, bool):
+        if not isinstance(self.source_id, str) or not self.source_id:
+            raise ValueError(f"SampleMeta.source_id must be a non-empty string, but got {self.source_id!r}.")
+        if not isinstance(self.sample_id, (int, str)) or isinstance(self.sample_id, bool):
             raise ValueError(
-                "SampleMeta.data_ref must be an integer index or string key, "
-                f"but got {type(self.data_ref)}."
+                "SampleMeta.sample_id must be an integer index or string key, "
+                f"but got {type(self.sample_id)}."
             )
-        if isinstance(self.data_ref, int) and self.data_ref < 0:
-            raise ValueError(f"SampleMeta.data_ref integer index must be non-negative, but got {self.data_ref}.")
-        if isinstance(self.data_ref, str) and not self.data_ref:
-            raise ValueError("SampleMeta.data_ref string key must not be empty.")
+        if isinstance(self.sample_id, int) and self.sample_id < 0:
+            raise ValueError(f"SampleMeta.sample_id integer index must be non-negative, but got {self.sample_id}.")
+        if isinstance(self.sample_id, str) and not self.sample_id:
+            raise ValueError("SampleMeta.sample_id string key must not be empty.")
         for name in ("text_tokens", "vision_tokens", "audio_tokens", "io_bytes"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -236,19 +232,19 @@ class BatchPlan:
 
 @dataclass(frozen=True)
 class RankMicroBatch:
-    """Materialized microbatch and its planning-window replay ID for one rank."""
+    """Fetched microbatch and its planning-window replay ID for one rank."""
 
     replay_id: str
     global_rank: int
     data_rank: int
     cp_rank: int
     micro_batch_index: int
-    sample_ids: tuple[str, ...]
+    sample_ids: tuple[int | str, ...]
     data: Any
 
 
 class DistributedDataStep(Iterator[RankMicroBatch]):
-    """One optimizer step that materializes local microbatches lazily."""
+    """One optimizer step that fetches local microbatches lazily."""
 
     def __init__(
         self,
@@ -298,7 +294,7 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
         return self
 
     def __next__(self) -> RankMicroBatch:
-        """Materialize and return the next local microbatch."""
+        """Fetch and return the next local microbatch."""
         if self._micro_batch_index >= self.micro_batch_num:
             raise StopIteration
         if self._load_micro_batch is None:

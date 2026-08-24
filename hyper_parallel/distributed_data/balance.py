@@ -82,7 +82,8 @@ class GreedyBatchBalancer:
                 -item.cost.dominant,
                 -item.cost.total,
                 item.metadata.source_id,
-                item.metadata.sample_id,
+                0 if isinstance(item.metadata.sample_id, int) else 1,
+                str(item.metadata.sample_id),
                 item.source_position,
             ),
         )

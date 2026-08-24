@@ -24,8 +24,6 @@ def _metadata(sample_id: str, encoder_cost: float) -> SampleMeta:
     return SampleMeta(
         sample_id=sample_id,
         source_id="source",
-        data_ref=int(sample_id),
-        modality="image_text",
         cost_hint=WorkloadCost(encoder=encoder_cost),
     )
 
@@ -87,3 +85,15 @@ class TestDistributedBatchPlanner(unittest.TestCase):
             self.assertEqual(len(plan.samples_for(data_rank, 1)), 2)
         with self.assertRaisesRegex(ValueError, "micro_batch_index must be in"):
             plan.samples_for(0, 0)
+
+    def test_mixed_integer_and_string_sample_ids_are_deterministic(self) -> None:
+        """Planner tie-breaking should support both map-style key types."""
+        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=2, micro_batch_num=1)
+        candidates = [
+            SampleMeta(sample_id="1", source_id="source"),
+            SampleMeta(sample_id=1, source_id="source"),
+        ]
+
+        plan = planner.plan(candidates, step=0, cursor_start=0)
+
+        self.assertEqual(plan, planner.plan(candidates, step=0, cursor_start=0))

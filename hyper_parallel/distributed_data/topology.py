@@ -198,7 +198,7 @@ class DataTopology:
 
     @property
     def is_data_owner(self) -> bool:
-        """Return whether the current rank materializes data for its DP coordinate."""
+        """Return whether the current rank fetches data for its DP coordinate."""
         return self.global_rank == self.data_owner_rank
 
     def validate_metadata_group(self, group: Any) -> None:

@@ -42,7 +42,7 @@ class MetadataSynchronizer(Protocol):
 
 
 class MicroBatchDistributor(Protocol):
-    """Distribute one owner-materialized microbatch to model-parallel peers."""
+    """Distribute one owner-fetched microbatch to model-parallel peers."""
 
     def distribute(
         self,

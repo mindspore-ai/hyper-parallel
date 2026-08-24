@@ -27,11 +27,11 @@ from hyper_parallel.distributed_data.distributor import (
     MicroBatchDistributor,
     SampleRedistributor,
 )
-from hyper_parallel.distributed_data.materializer import (
+from hyper_parallel.distributed_data.fetcher import (
     LoadedSample,
     MetadataSource,
+    MicroBatchFetcher,
     OnlineSampleSource,
-    RankMaterializer,
     _pin_memory_batch,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
@@ -67,7 +67,7 @@ class _BufferSlot:
 
 
 class DistributedDataset(Iterator[DistributedDataStep]):
-    """Plan optimizer steps and materialize one local microbatch at a time.
+    """Plan optimizer steps and fetch one local microbatch at a time.
 
     Sidecar metadata enables whole-step balancing before any sample read.
     Online metadata reads one global microbatch of candidates at a time and
@@ -81,7 +81,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         topology: DataTopology,
         metadata_source: MetadataSource | None,
         planner: DistributedBatchPlanner,
-        rank_materializer: RankMaterializer,
+        micro_batch_fetcher: MicroBatchFetcher,
         metadata_synchronizer: MetadataSynchronizer,
         micro_batch_distributor: MicroBatchDistributor,
         prefetch_steps: int = 2,
@@ -92,7 +92,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         sample_redistributor: SampleRedistributor | None = None,
         data_stream: Any = None,
     ) -> None:
-        """Initialize planning, materialization, communication, and prefetch components."""
+        """Initialize planning, fetching, communication, and prefetch components."""
         if planner.data_parallel_size != topology.data_parallel_size:
             raise ValueError(
                 f"Planner data_parallel_size={planner.data_parallel_size} does not match "
@@ -110,7 +110,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self._metadata_source = metadata_source
         self._online_sample_source = online_sample_source
         self._planner = planner
-        self._rank_materializer = rank_materializer
+        self._micro_batch_fetcher = micro_batch_fetcher
         self._metadata_synchronizer = metadata_synchronizer
         self._sample_redistributor = sample_redistributor
         self._micro_batch_distributor = micro_batch_distributor
@@ -253,13 +253,13 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             if reservation.plan is None:
                 raise ValueError("Sidecar metadata did not produce a data-owner BatchPlan.")
             owner_future = self._executor.submit(
-                self._rank_materializer.materialize,
+                self._micro_batch_fetcher.fetch,
                 reservation.plan,
                 self._topology.data_rank,
                 micro_batch_index,
             )
             if self._pin_executor is not None:
-                owner_future = self._pin_executor.submit(self._pin_materialized_microbatch, owner_future)
+                owner_future = self._pin_executor.submit(self._pin_fetched_microbatch, owner_future)
             self._owner_future = owner_future
             return
 
@@ -422,7 +422,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
                     step=reservation.step,
                     cursor_start=reservation.cursor_start,
                 )
-            owner_micro_batch = self._rank_materializer.materialize(
+            owner_micro_batch = self._micro_batch_fetcher.fetch(
                 reservation.plan,
                 self._topology.data_rank,
                 micro_batch_index,
@@ -466,7 +466,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         )
         planned_samples = plan.samples_for(self._topology.data_rank, micro_batch_index)
         samples = [samples_by_position[sample.source_position] for sample in planned_samples]
-        owner_micro_batch = self._rank_materializer.collate(samples)
+        owner_micro_batch = self._micro_batch_fetcher.collate(samples)
         if self._pin_executor is not None:
             owner_micro_batch = self._pin_executor.submit(_pin_memory_batch, owner_micro_batch).result()
         return plan, owner_micro_batch
@@ -512,5 +512,5 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         return self._active_reservation
 
     @staticmethod
-    def _pin_materialized_microbatch(owner_future: Future[Any]) -> Any:
+    def _pin_fetched_microbatch(owner_future: Future[Any]) -> Any:
         return _pin_memory_batch(owner_future.result())

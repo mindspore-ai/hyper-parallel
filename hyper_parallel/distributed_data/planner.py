@@ -70,7 +70,7 @@ class DistributedBatchPlanner:
         step: int,
         cursor_start: int,
     ) -> BatchPlan:
-        """Build a deterministic plan without materializing sample data.
+        """Build a deterministic plan without fetching sample data.
 
         Args:
             candidates: Metadata for the complete global optimizer-step batch.
@@ -208,7 +208,6 @@ class DistributedBatchPlanner:
                 {
                     "source_id": sample.meta.source_id,
                     "sample_id": sample.meta.sample_id,
-                    "data_ref": sample.meta.data_ref,
                     "target_data_rank": sample.target_data_rank,
                     "micro_batch_index": sample.micro_batch_index,
                     "position_in_micro_batch": sample.position_in_micro_batch,

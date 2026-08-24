@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Map-style metadata and sample materialization."""
+"""Map-style metadata access and sample fetching."""
 
 from __future__ import annotations
 
@@ -32,10 +32,10 @@ class MetadataSource(Protocol):
         """Return metadata at one local cursor position."""
 
 
-class SampleMaterializer(Protocol):
-    """Materialize one heavyweight sample from a lightweight reference."""
+class SampleFetcher(Protocol):
+    """Fetch one heavyweight sample from lightweight metadata."""
 
-    def materialize(self, metadata: SampleMeta) -> Any:
+    def fetch(self, metadata: SampleMeta) -> Any:
         """Read and transform one sample."""
 
 
@@ -140,26 +140,30 @@ class StridedOnlineSampleSource:
         """Load one raw sample and derive metadata without rereading it."""
         if index < 0 or index >= len(self):
             raise ValueError(f"Online sample index must be in [0, {len(self)}), but got {index}.")
-        data_ref = self._shard_rank + index * self._num_shards
-        sample = self._dataset[data_ref]
-        metadata = self._metadata_fn(sample, data_ref)
+        sample_id = self._shard_rank + index * self._num_shards
+        sample = self._dataset[sample_id]
+        metadata = self._metadata_fn(sample, sample_id)
         if not isinstance(metadata, SampleMeta):
             raise ValueError(f"metadata_fn must return SampleMeta, but got {type(metadata)}.")
+        if metadata.sample_id != sample_id:
+            raise ValueError(
+                f"metadata_fn must preserve sample_id {sample_id!r}, but returned {metadata.sample_id!r}."
+            )
         return LoadedSample(metadata, sample)
 
 
-class MapDatasetMaterializer:
-    """Materialize samples by indexing a map-style dataset with ``data_ref``."""
+class MapDatasetFetcher:
+    """Fetch samples by indexing a map-style dataset with ``sample_id``."""
 
     def __init__(self, dataset: Any) -> None:
-        """Initialize the materializer with a map-style dataset."""
+        """Initialize the fetcher with a map-style dataset."""
         if not hasattr(dataset, "__getitem__"):
-            raise ValueError("MapDatasetMaterializer requires a dataset implementing __getitem__.")
+            raise ValueError("MapDatasetFetcher requires a dataset implementing __getitem__.")
         self._dataset = dataset
 
-    def materialize(self, metadata: SampleMeta) -> Any:
+    def fetch(self, metadata: SampleMeta) -> Any:
         """Read one map-style dataset entry."""
-        return self._dataset[metadata.data_ref]
+        return self._dataset[metadata.sample_id]
 
 
 def _identity_collate(samples: list[Any]) -> list[Any]:
@@ -178,27 +182,27 @@ def _pin_memory_batch(batch: Any) -> Any:
     return pin_memory() if callable(pin_memory) else batch
 
 
-class RankMaterializer:
-    """Materialize and collate one planned data-rank microbatch."""
+class MicroBatchFetcher:
+    """Fetch and collate one planned data-rank microbatch."""
 
     def __init__(
         self,
-        materializer: SampleMaterializer,
+        sample_fetcher: SampleFetcher,
         collate_fn: Callable[[list[Any]], Any] | None = None,
     ) -> None:
-        """Initialize sample materialization and owner-side collation."""
-        self._materializer = materializer
+        """Initialize sample fetching and owner-side collation."""
+        self._sample_fetcher = sample_fetcher
         self._collate_fn = collate_fn or _identity_collate
 
-    def materialize(self, plan: BatchPlan, data_rank: int, micro_batch_index: int) -> Any:
-        """Materialize only samples assigned to the requested execution slot."""
+    def fetch(self, plan: BatchPlan, data_rank: int, micro_batch_index: int) -> Any:
+        """Fetch only samples assigned to the requested execution slot."""
         planned_samples = plan.samples_for(data_rank, micro_batch_index)
         if len(planned_samples) != plan.micro_batch_size:
             raise ValueError(
                 f"Plan slot ({data_rank}, {micro_batch_index}) expected {plan.micro_batch_size} samples, "
                 f"but got {len(planned_samples)}."
             )
-        samples = [self._materializer.materialize(planned.meta) for planned in planned_samples]
+        samples = [self._sample_fetcher.fetch(planned.meta) for planned in planned_samples]
         return self._collate_fn(samples)
 
     def collate(self, samples: list[Any]) -> Any:
