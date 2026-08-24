@@ -1464,6 +1464,11 @@ class MindSporePlatform(Platform):
         EXISTING_COMM_GROUPS[group_name] = group_name
         return group_name
 
+    def _create_named_group(self, rank_list: Sequence[int], group_name: str) -> str:
+        """Create a fresh named communication group for one subsystem."""
+        self._create_group_with_options(group_name, list(rank_list))
+        return group_name
+
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
         group_name = group_info if isinstance(group_info, str) else group_info.group_name

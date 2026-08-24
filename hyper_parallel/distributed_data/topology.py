@@ -54,10 +54,11 @@ class DataTopology:
     dp_dim_names: tuple[str, ...]
     coordinate: tuple[int, ...]
     data_rank: int
-    data_world_size: int
+    data_parallel_size: int
     data_owner_rank: int
-    owner_ranks: tuple[int, ...]
-    consumer_ranks: tuple[int, ...]
+    data_owner_ranks: tuple[int, ...]
+    model_parallel_rank_groups: tuple[tuple[int, ...], ...]
+    model_parallel_ranks: tuple[int, ...]
     cp_rank: int
     cp_size: int
     tp_rank: int
@@ -136,22 +137,25 @@ class DataTopology:
         dp_indices = tuple(mesh_dim_names.index(name) for name in selected_dp_names)
         dp_shape = tuple(mesh_shape[index] for index in dp_indices)
         dp_coordinate = tuple(coordinate[index] for index in dp_indices)
-        data_world_size = math.prod(dp_shape) if dp_shape else 1
+        data_parallel_size = math.prod(dp_shape) if dp_shape else 1
         data_rank = _flatten_coordinate(dp_coordinate, dp_shape) if dp_shape else 0
 
-        owner_ranks = []
-        for candidate_data_rank in range(data_world_size):
+        data_owner_ranks = []
+        for candidate_data_rank in range(data_parallel_size):
             candidate_dp_coordinate = _unflatten_coordinate(candidate_data_rank, dp_shape) if dp_shape else ()
             owner_coordinate = [0] * len(mesh_shape)
             for index, value in zip(dp_indices, candidate_dp_coordinate, strict=True):
                 owner_coordinate[index] = value
-            owner_ranks.append(rank_list[_flatten_coordinate(tuple(owner_coordinate), mesh_shape)])
+            data_owner_ranks.append(rank_list[_flatten_coordinate(tuple(owner_coordinate), mesh_shape)])
 
-        consumer_ranks = []
+        model_parallel_rank_groups = [[] for _ in range(data_parallel_size)]
         for flat_index, candidate_rank in enumerate(rank_list):
             candidate_coordinate = _unflatten_coordinate(flat_index, mesh_shape)
-            if tuple(candidate_coordinate[index] for index in dp_indices) == dp_coordinate:
-                consumer_ranks.append(candidate_rank)
+            candidate_dp_coordinate = tuple(candidate_coordinate[index] for index in dp_indices)
+            candidate_data_rank = _flatten_coordinate(candidate_dp_coordinate, dp_shape) if dp_shape else 0
+            model_parallel_rank_groups[candidate_data_rank].append(candidate_rank)
+        model_parallel_rank_groups = tuple(tuple(ranks) for ranks in model_parallel_rank_groups)
+        model_parallel_ranks = model_parallel_rank_groups[data_rank]
 
         owner_coordinate = list(coordinate)
         for index, _ in enumerate(owner_coordinate):
@@ -169,10 +173,11 @@ class DataTopology:
             dp_dim_names=selected_dp_names,
             coordinate=coordinate,
             data_rank=data_rank,
-            data_world_size=data_world_size,
+            data_parallel_size=data_parallel_size,
             data_owner_rank=data_owner_rank,
-            owner_ranks=tuple(owner_ranks),
-            consumer_ranks=tuple(consumer_ranks),
+            data_owner_ranks=tuple(data_owner_ranks),
+            model_parallel_rank_groups=model_parallel_rank_groups,
+            model_parallel_ranks=model_parallel_ranks,
             cp_rank=cp_rank,
             cp_size=cp_size,
             tp_rank=tp_rank,
@@ -198,11 +203,11 @@ class DataTopology:
 
     def validate_metadata_group(self, group: Any) -> None:
         """Validate that a metadata group contains exactly the data owners."""
-        self._validate_group(group, self.owner_ranks, "metadata_group")
+        self._validate_group(group, self.data_owner_ranks, "metadata_group")
 
-    def validate_consumer_group(self, group: Any) -> None:
-        """Validate that a process group contains consumers of this DP coordinate."""
-        self._validate_group(group, self.consumer_ranks, "consumer_group")
+    def validate_model_parallel_group(self, group: Any) -> None:
+        """Validate the model-parallel group for this DP coordinate."""
+        self._validate_group(group, self.model_parallel_ranks, "model_parallel_group")
 
     @staticmethod
     def _validate_group(group, expected_ranks: tuple[int, ...], name: str) -> None:

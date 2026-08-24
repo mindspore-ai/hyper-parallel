@@ -166,9 +166,9 @@ class BatchPlan:
     step: int
     cursor_start: int
     cursor_end: int
-    data_world_size: int
+    data_parallel_size: int
     micro_batch_size: int
-    micro_batch_count: int
+    micro_batch_num: int
     samples: tuple[PlannedSample, ...]
     cp_shards: tuple[TensorShardSpec, ...] = ()
     micro_batch_start: int = 0
@@ -184,7 +184,7 @@ class BatchPlan:
             raise ValueError(
                 f"BatchPlan.cursor_end={self.cursor_end} must not precede cursor_start={self.cursor_start}."
             )
-        for name in ("data_world_size", "micro_batch_size", "micro_batch_count"):
+        for name in ("data_parallel_size", "micro_batch_size", "micro_batch_num"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"BatchPlan.{name} must be a positive integer, but got {value!r}.")
@@ -196,13 +196,13 @@ class BatchPlan:
             raise ValueError(
                 f"BatchPlan.micro_batch_start must be a non-negative integer, but got {self.micro_batch_start!r}."
             )
-        expected = self.data_world_size * self.micro_batch_size * self.micro_batch_count
+        expected = self.data_parallel_size * self.micro_batch_size * self.micro_batch_num
         if len(self.samples) != expected:
             raise ValueError(f"BatchPlan expected {expected} planned samples, but got {len(self.samples)}.")
         slot_positions: dict[tuple[int, int], set[int]] = {}
-        micro_batch_end = self.micro_batch_start + self.micro_batch_count
+        micro_batch_end = self.micro_batch_start + self.micro_batch_num
         for sample in self.samples:
-            if sample.target_data_rank < 0 or sample.target_data_rank >= self.data_world_size:
+            if sample.target_data_rank < 0 or sample.target_data_rank >= self.data_parallel_size:
                 raise ValueError(f"Planned sample has invalid target_data_rank={sample.target_data_rank}.")
             if sample.micro_batch_index < self.micro_batch_start or sample.micro_batch_index >= micro_batch_end:
                 raise ValueError(f"Planned sample has invalid micro_batch_index={sample.micro_batch_index}.")
@@ -210,7 +210,7 @@ class BatchPlan:
             slot_positions.setdefault(slot, set()).add(sample.position_in_micro_batch)
         expected_positions = set(range(self.micro_batch_size))
         if any(positions != expected_positions for positions in slot_positions.values()) or len(slot_positions) != (
-            self.data_world_size * self.micro_batch_count
+            self.data_parallel_size * self.micro_batch_num
         ):
             raise ValueError(
                 "Every BatchPlan (data_rank, microbatch) slot must contain each microbatch position exactly once."
@@ -218,9 +218,9 @@ class BatchPlan:
 
     def samples_for(self, data_rank: int, micro_batch_index: int) -> tuple[PlannedSample, ...]:
         """Return samples assigned to one data rank and microbatch."""
-        if data_rank < 0 or data_rank >= self.data_world_size:
-            raise ValueError(f"data_rank must be in [0, {self.data_world_size}), but got {data_rank}.")
-        micro_batch_end = self.micro_batch_start + self.micro_batch_count
+        if data_rank < 0 or data_rank >= self.data_parallel_size:
+            raise ValueError(f"data_rank must be in [0, {self.data_parallel_size}), but got {data_rank}.")
+        micro_batch_end = self.micro_batch_start + self.micro_batch_num
         if micro_batch_index < self.micro_batch_start or micro_batch_index >= micro_batch_end:
             raise ValueError(
                 f"micro_batch_index must be in [{self.micro_batch_start}, {micro_batch_end}), "
@@ -256,7 +256,7 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
         step: int,
         cursor_start: int,
         cursor_end: int,
-        micro_batch_count: int,
+        micro_batch_num: int,
         load_micro_batch: Callable[[int], tuple[BatchPlan, RankMicroBatch]],
         on_complete: Callable[["DistributedDataStep", str], None],
     ) -> None:
@@ -266,7 +266,7 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
             step: Logical optimizer-step index.
             cursor_start: Per-owner candidate cursor before this step.
             cursor_end: Per-owner candidate cursor after this step.
-            micro_batch_count: Number of local microbatches in the step.
+            micro_batch_num: Number of local microbatches in the step.
             load_micro_batch: Runtime callback that produces one planned microbatch.
             on_complete: Callback invoked after the final microbatch is produced.
         """
@@ -279,14 +279,14 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
                 raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
         if cursor_end < cursor_start:
             raise ValueError(f"cursor_end={cursor_end} must not precede cursor_start={cursor_start}.")
-        if not isinstance(micro_batch_count, int) or isinstance(micro_batch_count, bool) or micro_batch_count < 1:
-            raise ValueError(f"micro_batch_count must be a positive integer, but got {micro_batch_count!r}.")
+        if not isinstance(micro_batch_num, int) or isinstance(micro_batch_num, bool) or micro_batch_num < 1:
+            raise ValueError(f"micro_batch_num must be a positive integer, but got {micro_batch_num!r}.")
         if not callable(load_micro_batch) or not callable(on_complete):
             raise ValueError("load_micro_batch and on_complete must be callable.")
         self.step = step
         self.cursor_start = cursor_start
         self.cursor_end = cursor_end
-        self.micro_batch_count = micro_batch_count
+        self.micro_batch_num = micro_batch_num
         self._load_micro_batch: Callable[[int], tuple[BatchPlan, RankMicroBatch]] | None = load_micro_batch
         self._on_complete: Callable[["DistributedDataStep", str], None] | None = on_complete
         self._micro_batch_index = 0
@@ -299,7 +299,7 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
 
     def __next__(self) -> RankMicroBatch:
         """Materialize and return the next local microbatch."""
-        if self._micro_batch_index >= self.micro_batch_count:
+        if self._micro_batch_index >= self.micro_batch_num:
             raise StopIteration
         if self._load_micro_batch is None:
             raise ValueError("DistributedDataStep is no longer attached to its dataset runtime.")
@@ -311,7 +311,7 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
             )
         self._plan_replay_ids.append(plan.replay_id)
         self._micro_batch_index += 1
-        if self._micro_batch_index == self.micro_batch_count:
+        if self._micro_batch_index == self.micro_batch_num:
             self._replay_id = self._build_replay_id()
             on_complete = self._on_complete
             self._load_micro_batch = None
@@ -331,7 +331,7 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
     @property
     def is_complete(self) -> bool:
         """Return whether every local microbatch has been produced."""
-        return self._micro_batch_index == self.micro_batch_count
+        return self._micro_batch_index == self.micro_batch_num
 
     def micro_batches(self) -> Iterator[RankMicroBatch]:
         """Return the single-use lazy microbatch iterator."""

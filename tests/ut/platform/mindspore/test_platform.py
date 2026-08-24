@@ -23,6 +23,7 @@ ms = pytest.importorskip("mindspore")
 nn = pytest.importorskip("mindspore.nn")
 ms.set_context(mode=ms.PYNATIVE_MODE, device_target="CPU")
 
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS  # pylint: disable=wrong-import-position
 from hyper_parallel.platform.mindspore.platform import (  # pylint: disable=wrong-import-position
     MindSporePlatform,
     _MSDifferentiableAllToAllSingle,
@@ -44,6 +45,25 @@ def test_prepare_batch_p2p_group_does_not_synchronize():
 
     barrier.assert_not_called()
     assert result is None
+
+
+def test_create_named_group_uses_subsystem_namespace() -> None:
+    """A named group should not reuse a model group with the same ranks."""
+    ms_platform = MindSporePlatform()
+    rank_key = str((0, 2))
+    group_name = "hp_data_test_group"
+    EXISTING_COMM_GROUPS[rank_key] = mock.sentinel.model_group
+    try:
+        with mock.patch.object(ms_platform, "_create_named_group", return_value=group_name) as create_named_group:
+            first = ms_platform.create_named_group((2, 0), group_name)
+            second = ms_platform.create_named_group((0, 2), group_name)
+
+        assert first == group_name
+        assert second == group_name
+        create_named_group.assert_called_once_with((0, 2), group_name)
+    finally:
+        EXISTING_COMM_GROUPS.pop(rank_key, None)
+        EXISTING_COMM_GROUPS.pop(group_name, None)
 
 
 def test_buffers_dict_includes_all_registered_buffers():

@@ -1076,6 +1076,11 @@ class TorchPlatform(Platform):
         group_dict = create_sub_groups(rank_list)
         return group_dict[normalized_rank_list]
 
+    def _create_named_group(self, rank_list: Sequence[int], group_name: str) -> ProcessGroup:
+        """Create a fresh ProcessGroup without consulting the rank-list cache."""
+        del self
+        return dist.new_group(ranks=list(rank_list), group_desc=group_name)
+
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
         output_shape = list(data.shape)

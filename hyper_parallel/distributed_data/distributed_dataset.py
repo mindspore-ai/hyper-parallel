@@ -93,10 +93,10 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         data_stream: Any = None,
     ) -> None:
         """Initialize planning, materialization, communication, and prefetch components."""
-        if planner.data_world_size != topology.data_world_size:
+        if planner.data_parallel_size != topology.data_parallel_size:
             raise ValueError(
-                f"Planner data_world_size={planner.data_world_size} does not match "
-                f"topology data_world_size={topology.data_world_size}."
+                f"Planner data_parallel_size={planner.data_parallel_size} does not match "
+                f"topology data_parallel_size={topology.data_parallel_size}."
             )
         if (metadata_source is None) == (online_sample_source is None):
             raise ValueError("Configure exactly one of metadata_source and online_sample_source.")
@@ -167,7 +167,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             step=reservation.step,
             cursor_start=reservation.cursor_start,
             cursor_end=reservation.cursor_end,
-            micro_batch_count=self._planner.micro_batch_count,
+            micro_batch_num=self._planner.micro_batch_num,
             load_micro_batch=self._consume_active_microbatch,
             on_complete=self._complete_active_step,
         )
@@ -237,7 +237,10 @@ class DistributedDataset(Iterator[DistributedDataStep]):
                     self._metadata_source.get(index)
                     for index in range(cursor_start, cursor_end)
                 )
-                candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.owner_ranks)
+                candidates = self._metadata_synchronizer.gather(
+                    local_metadata,
+                    self._topology.data_owner_ranks,
+                )
                 plan = self._planner.plan(candidates, step=step, cursor_start=cursor_start)
             self._prepared_steps.append(_ReservedStep(step, cursor_start, cursor_end, plan))
 
@@ -319,7 +322,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         )
 
         self._next_micro_batch_index += 1
-        if self._next_micro_batch_index < self._planner.micro_batch_count:
+        if self._next_micro_batch_index < self._planner.micro_batch_num:
             self._schedule_owner_microbatch(self._next_micro_batch_index)
         return received_plan, micro_batch
 
@@ -355,7 +358,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             prepared.ready_event.wait(platform.get_current_stream())
 
         self._next_micro_batch_index += 1
-        if self._next_micro_batch_index < self._planner.micro_batch_count:
+        if self._next_micro_batch_index < self._planner.micro_batch_num:
             self._schedule_buffered_microbatch(reservation, self._next_micro_batch_index)
         elif self._prepared_steps:
             self._schedule_buffered_microbatch(self._prepared_steps[0], 0)
@@ -410,7 +413,10 @@ class DistributedDataset(Iterator[DistributedDataStep]):
                     self._metadata_source.get(index)
                     for index in range(reservation.cursor_start, reservation.cursor_end)
                 )
-                candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.owner_ranks)
+                candidates = self._metadata_synchronizer.gather(
+                    local_metadata,
+                    self._topology.data_owner_ranks,
+                )
                 reservation.plan = self._planner.plan(
                     candidates,
                     step=reservation.step,
@@ -431,7 +437,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         return self._plan_online_microbatch(reservation, micro_batch_index, owner_input)
 
     def _buffer_slot_index(self, step: int, micro_batch_index: int) -> int:
-        sequence = step * self._planner.micro_batch_count + micro_batch_index
+        sequence = step * self._planner.micro_batch_num + micro_batch_index
         return sequence % len(self._buffer_slots)
 
     def _plan_online_microbatch(
@@ -445,7 +451,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         if not isinstance(owner_input, tuple) or any(not isinstance(sample, LoadedSample) for sample in owner_input):
             raise ValueError("Online microbatch preparation returned invalid loaded samples.")
         local_metadata = tuple(sample.metadata for sample in owner_input)
-        candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.owner_ranks)
+        candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.data_owner_ranks)
         cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
         plan = self._planner.plan_microbatch(
             candidates,
@@ -474,13 +480,13 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         if plan.step != reservation.step:
             raise ValueError(f"Expected optimizer step {reservation.step}, but received plan step {plan.step}.")
         dimensions_match = (
-            plan.data_world_size == self._planner.data_world_size
+            plan.data_parallel_size == self._planner.data_parallel_size
             and plan.micro_batch_size == self._planner.micro_batch_size
         )
         if not dimensions_match:
             raise ValueError("Received BatchPlan dimensions do not match the distributed dataset planner.")
         if self._metadata_source is not None:
-            expected_window = (reservation.cursor_start, reservation.cursor_end, 0, self._planner.micro_batch_count)
+            expected_window = (reservation.cursor_start, reservation.cursor_end, 0, self._planner.micro_batch_num)
             if reservation.replay_id is None:
                 reservation.replay_id = plan.replay_id
             elif plan.replay_id != reservation.replay_id:
@@ -488,7 +494,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         else:
             cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
             expected_window = (cursor_start, cursor_start + self._planner.micro_batch_size, micro_batch_index, 1)
-        actual_window = (plan.cursor_start, plan.cursor_end, plan.micro_batch_start, plan.micro_batch_count)
+        actual_window = (plan.cursor_start, plan.cursor_end, plan.micro_batch_start, plan.micro_batch_num)
         if actual_window != expected_window:
             raise ValueError(f"Received BatchPlan window {actual_window} does not match expected {expected_window}.")
 
@@ -496,7 +502,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         if step is not self._active_step:
             raise ValueError("Completed DistributedDataStep is not the dataset's active step.")
         reservation = self._require_active_reservation()
-        if self._next_micro_batch_index != self._planner.micro_batch_count:
+        if self._next_micro_batch_index != self._planner.micro_batch_num:
             raise ValueError("Cannot complete a DistributedDataStep before every microbatch is produced.")
         self._state.mark_delivered(replay_id, reservation.cursor_start, reservation.cursor_end)
 

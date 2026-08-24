@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
@@ -47,6 +48,46 @@ platform = get_platform()
 _SAMPLE_TRANSPORTS = ("packed_bytes_a2a", "direct_tensor_a2a")
 
 
+def _create_data_groups(topology: DataTopology) -> tuple[Any, Any]:
+    """Create dedicated data communicators in one globally deterministic order."""
+    layout_signature = (
+        topology.mesh_shape,
+        topology.mesh_dim_names,
+        topology.rank_list,
+        topology.dp_dim_names,
+    )
+    namespace = hashlib.sha256(repr(layout_signature).encode("utf-8")).hexdigest()[:12]
+
+    created_groups = []
+    metadata_group = None
+    if len(topology.data_owner_ranks) > 1:
+        metadata_group = platform.create_named_group(
+            topology.data_owner_ranks,
+            f"hp_data_metadata_{namespace}",
+        )
+        created_groups.append((topology.data_owner_ranks, metadata_group))
+
+    model_parallel_group = None
+    for data_rank, rank_group in enumerate(topology.model_parallel_rank_groups):
+        if len(rank_group) == 1:
+            continue
+        group = platform.create_named_group(
+            rank_group,
+            f"hp_data_model_{namespace}_{data_rank}",
+        )
+        created_groups.append((rank_group, group))
+        if data_rank == topology.data_rank:
+            model_parallel_group = group
+
+    # HCCL initializes communicators lazily. Prewarm them serially before the
+    # data producer thread can issue collectives on multiple fresh groups.
+    for rank_group, group in created_groups:
+        if topology.global_rank in rank_group:
+            platform.barrier(group)
+        platform.barrier()
+    return metadata_group, model_parallel_group
+
+
 @dataclass(frozen=True)
 class DistributedDatasetConfig:
     """Configuration for global-step planning and bounded prefetch.
@@ -63,7 +104,7 @@ class DistributedDatasetConfig:
     """
 
     micro_batch_size: int
-    micro_batch_count: int
+    micro_batch_num: int
     prefetch_steps: int = 2
     sample_transport: str = "packed_bytes_a2a"
     dp_dim_names: tuple[str, ...] | None = None
@@ -72,7 +113,7 @@ class DistributedDatasetConfig:
     double_buffer: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("micro_batch_size", "micro_batch_count", "prefetch_steps"):
+        for name in ("micro_batch_size", "micro_batch_num", "prefetch_steps"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
@@ -95,23 +136,19 @@ def build_distributed_dataset(
     metadata_fn: Callable[[Any, int], SampleMeta] | None = None,
     metadata: Sequence[SampleMeta] | None = None,
     collate_fn: Callable[[list[Any]], Any] | None = None,
-    metadata_group: Any = None,
-    consumer_group: Any = None,
     communication_device: Any = None,
     prepare_micro_batch: Callable[[Any], Any] | None = None,
     cost_model: CostModel | None = None,
 ) -> DistributedDataset:
     """Build a PyTorch-only online-planned distributed dataset.
 
-    Groups must come from the training mesh; this API never creates an
-    independent communication world. ``metadata_group`` contains exactly one
-    data owner per DP coordinate. ``consumer_group`` contains all model peers
-    sharing the current DP coordinate. Online metadata is the default path and
-    balances one global microbatch at a time. An explicit sidecar ``metadata``
-    sequence enables whole-step inter-microbatch planning before sample reads.
-    When ``config.double_buffer`` is enabled, both groups must be dedicated
-    process-group instances that model collectives never use. Every rank then
-    submits data collectives from one ordered producer thread.
+    The builder creates dedicated ``metadata_group`` and model-parallel data
+    groups from ``mesh``. All ranks must therefore call this function in the
+    same control flow. Online metadata is the default path and balances one
+    global microbatch at a time. An explicit sidecar ``metadata`` sequence
+    enables whole-step inter-microbatch planning before sample reads. When
+    ``config.double_buffer`` is enabled, every rank submits data collectives
+    from one ordered producer thread.
 
     Args:
         dataset: Shared map-style dataset. Online mode reads only one local
@@ -124,9 +161,6 @@ def build_distributed_dataset(
         metadata: Optional shared lightweight sidecar for whole-step planning.
         collate_fn: Target-owner transform and collation function. In online
             mode it receives the raw samples retained or received after planning.
-        metadata_group: Existing process group containing all data owners.
-            Online mode also uses it for sample A2A.
-        consumer_group: Existing process group for this DP coordinate's peers.
         communication_device: Local collective device. Required for packed-byte
             owner A2A and tensor reception over HCCL/NCCL groups.
         prepare_micro_batch: Optional owner-side move/packing before communication.
@@ -144,10 +178,11 @@ def build_distributed_dataset(
         raise ValueError("Provide either online metadata_fn or sidecar metadata, but not both.")
 
     topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
+    metadata_group, model_parallel_group = _create_data_groups(topology)
     planner = DistributedBatchPlanner(
-        topology.data_world_size,
+        topology.data_parallel_size,
         config.micro_batch_size,
-        config.micro_batch_count,
+        config.micro_batch_num,
         cost_model=cost_model,
         cp_shards=config.cp_shards,
     )
@@ -162,10 +197,10 @@ def build_distributed_dataset(
             dataset,
             metadata_fn,
             topology.data_rank,
-            topology.data_world_size,
+            topology.data_parallel_size,
             max_entries=complete_steps * planner.local_samples_per_step,
         )
-        if topology.data_world_size == 1 or not topology.is_data_owner:
+        if topology.data_parallel_size == 1 or not topology.is_data_owner:
             sample_redistributor = LocalSampleRedistributor()
         else:
             topology.validate_metadata_group(metadata_group)
@@ -184,12 +219,12 @@ def build_distributed_dataset(
         metadata_source = StridedMetadataSource(
             metadata,
             topology.data_rank,
-            topology.data_world_size,
+            topology.data_parallel_size,
             max_entries=complete_steps * planner.local_samples_per_step,
         )
     rank_materializer = RankMaterializer(MapDatasetMaterializer(dataset), collate_fn)
 
-    if topology.data_world_size == 1:
+    if topology.data_parallel_size == 1:
         metadata_synchronizer = LocalMetadataSynchronizer()
     else:
         if topology.is_data_owner:
@@ -198,12 +233,12 @@ def build_distributed_dataset(
         else:
             metadata_synchronizer = LocalMetadataSynchronizer()
 
-    if len(topology.consumer_ranks) == 1:
+    if len(topology.model_parallel_ranks) == 1:
         micro_batch_distributor = LocalMicroBatchDistributor()
     else:
-        topology.validate_consumer_group(consumer_group)
+        topology.validate_model_parallel_group(model_parallel_group)
         micro_batch_distributor = TorchMicroBatchDistributor(
-            consumer_group,
+            model_parallel_group,
             communication_device=communication_device,
         )
 

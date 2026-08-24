@@ -36,7 +36,7 @@ class MetadataSynchronizer(Protocol):
     def gather(
         self,
         local_metadata: Sequence[SampleMeta],
-        owner_ranks: tuple[int, ...],
+        data_owner_ranks: tuple[int, ...],
     ) -> tuple[SampleMeta, ...]:
         """Gather candidates in deterministic data-owner order."""
 
@@ -71,11 +71,11 @@ class LocalMetadataSynchronizer:
     def gather(
         self,
         local_metadata: Sequence[SampleMeta],
-        owner_ranks: tuple[int, ...],
+        data_owner_ranks: tuple[int, ...],
     ) -> tuple[SampleMeta, ...]:
         """Return local candidates unchanged."""
-        if len(owner_ranks) != 1:
-            raise ValueError(f"Local metadata synchronization requires one owner, but got {owner_ranks}.")
+        if len(data_owner_ranks) != 1:
+            raise ValueError(f"Local metadata synchronization requires one owner, but got {data_owner_ranks}.")
         return tuple(local_metadata)
 
 
@@ -111,22 +111,22 @@ class TorchMetadataAllGather:
     def gather(
         self,
         local_metadata: Sequence[SampleMeta],
-        owner_ranks: tuple[int, ...],
+        data_owner_ranks: tuple[int, ...],
     ) -> tuple[SampleMeta, ...]:
-        """All-gather metadata and concatenate it in ``owner_ranks`` order."""
+        """All-gather metadata and concatenate it in ``data_owner_ranks`` order."""
         group_ranks = tuple(platform.get_process_group_ranks(self._group))
-        if set(group_ranks) != set(owner_ranks):
-            raise ValueError(f"metadata_group ranks must be {owner_ranks}, but got {group_ranks}.")
+        if set(group_ranks) != set(data_owner_ranks):
+            raise ValueError(f"metadata_group ranks must be {data_owner_ranks}, but got {group_ranks}.")
         gathered: list[Any] = [None] * len(group_ranks)
         platform.all_gather_object(gathered, tuple(local_metadata), self._group)
         by_global_rank = dict(zip(group_ranks, gathered, strict=True))
         ordered = []
-        for owner_rank in owner_ranks:
-            contribution = by_global_rank[owner_rank]
+        for data_owner_rank in data_owner_ranks:
+            contribution = by_global_rank[data_owner_rank]
             if not isinstance(contribution, tuple) or any(
                 not isinstance(metadata, SampleMeta) for metadata in contribution
             ):
-                raise ValueError(f"Rank {owner_rank} contributed invalid SampleMeta data.")
+                raise ValueError(f"Rank {data_owner_rank} contributed invalid SampleMeta data.")
             ordered.extend(contribution)
         return tuple(ordered)
 
@@ -148,7 +148,7 @@ class TorchPackedBytesRedistributor:
         topology: DataTopology,
     ) -> dict[int, Any]:
         """Encode raw samples, exchange packed uint8 tensors, and decode local samples."""
-        group_data_ranks = _owner_group_data_ranks(self._group, topology)
+        group_data_ranks = _data_owner_group_data_ranks(self._group, topology)
         outgoing, received_positions = _build_sample_routes(local_samples, plan, topology)
         outgoing = tuple(outgoing[data_rank] for data_rank in group_data_ranks)
         received_positions = tuple(received_positions[data_rank] for data_rank in group_data_ranks)
@@ -163,13 +163,13 @@ class TorchPackedBytesRedistributor:
         )
         received_sizes_tensor, size_work = platform.all_to_all_single(
             size_tensor,
-            [topology.data_world_size],
+            [topology.data_parallel_size],
             self._group,
             async_op=True,
         )
         _wait_collective(size_work)
         output_splits = [int(size) for size in platform.tensor_to_numpy(received_sizes_tensor).reshape(-1)]
-        if len(output_splits) != topology.data_world_size or any(size < 0 for size in output_splits):
+        if len(output_splits) != topology.data_parallel_size or any(size < 0 for size in output_splits):
             raise ValueError(f"Packed-byte A2A received invalid byte splits {output_splits}.")
 
         send_tensor = _bytes_to_tensor(b"".join(segments), communication_device)
@@ -211,7 +211,7 @@ class TorchTensorRedistributor:
         topology: DataTopology,
     ) -> dict[int, Any]:
         """Exchange tensor samples without Host serialization."""
-        group_data_ranks = _owner_group_data_ranks(self._group, topology)
+        group_data_ranks = _data_owner_group_data_ranks(self._group, topology)
         outgoing, received_positions = _build_sample_routes(local_samples, plan, topology)
         outgoing = tuple(outgoing[data_rank] for data_rank in group_data_ranks)
         received_positions = tuple(received_positions[data_rank] for data_rank in group_data_ranks)
@@ -219,7 +219,7 @@ class TorchTensorRedistributor:
             local_samples,
             self._group,
             self._communication_device,
-            topology.data_world_size,
+            topology.data_parallel_size,
         )
         samples_by_position = {
             source_position: prepared[local_index]
@@ -301,9 +301,9 @@ class TorchMicroBatchDistributor:
     ) -> tuple[BatchPlan, Any]:
         """Broadcast one nested microbatch, then apply this rank's CP slicing."""
         group_ranks = tuple(platform.get_process_group_ranks(self._group))
-        if set(group_ranks) != set(topology.consumer_ranks):
+        if set(group_ranks) != set(topology.model_parallel_ranks):
             raise ValueError(
-                f"consumer_group ranks must be {topology.consumer_ranks}, but got {group_ranks}."
+                f"model_parallel_group ranks must be {topology.model_parallel_ranks}, but got {group_ranks}."
             )
         is_source = topology.global_rank == topology.data_owner_rank
         backend = str(platform.get_backend(self._group)).lower()
@@ -349,11 +349,11 @@ class TorchMicroBatchDistributor:
         return received_plan, sharded
 
 
-def _owner_group_data_ranks(group: Any, topology: DataTopology) -> tuple[int, ...]:
+def _data_owner_group_data_ranks(group: Any, topology: DataTopology) -> tuple[int, ...]:
     group_ranks = tuple(platform.get_process_group_ranks(group))
-    if set(group_ranks) != set(topology.owner_ranks):
-        raise ValueError(f"metadata_group ranks must be {topology.owner_ranks}, but got {group_ranks}.")
-    return tuple(topology.owner_ranks.index(global_rank) for global_rank in group_ranks)
+    if set(group_ranks) != set(topology.data_owner_ranks):
+        raise ValueError(f"metadata_group ranks must be {topology.data_owner_ranks}, but got {group_ranks}.")
+    return tuple(topology.data_owner_ranks.index(global_rank) for global_rank in group_ranks)
 
 
 def _collective_device(group: Any, communication_device: Any) -> Any:
@@ -377,12 +377,12 @@ def _build_sample_routes(
 ) -> tuple[tuple[tuple[tuple[int, Any], ...], ...], tuple[tuple[int, ...], ...]]:
     if not topology.is_data_owner:
         raise ValueError("Only data owners may redistribute online raw samples.")
-    if plan.data_world_size != topology.data_world_size:
+    if plan.data_parallel_size != topology.data_parallel_size:
         raise ValueError(
-            f"Plan data_world_size={plan.data_world_size} does not match topology "
-            f"data_world_size={topology.data_world_size}."
+            f"Plan data_parallel_size={plan.data_parallel_size} does not match topology "
+            f"data_parallel_size={topology.data_parallel_size}."
         )
-    local_count = plan.micro_batch_size * plan.micro_batch_count
+    local_count = plan.micro_batch_size * plan.micro_batch_num
     if len(local_samples) != local_count:
         raise ValueError(f"Expected {local_count} local raw samples, but got {len(local_samples)}.")
     planned_by_position = {sample.source_position: sample for sample in plan.samples}
@@ -390,7 +390,7 @@ def _build_sample_routes(
         raise ValueError("BatchPlan source positions must be unique for raw sample redistribution.")
 
     source_start = topology.data_rank * local_count
-    outgoing: list[list[tuple[int, Any]]] = [[] for _ in range(topology.data_world_size)]
+    outgoing: list[list[tuple[int, Any]]] = [[] for _ in range(topology.data_parallel_size)]
     for local_index, sample in enumerate(local_samples):
         source_position = source_start + local_index
         planned_sample = planned_by_position.get(source_position)
@@ -398,7 +398,7 @@ def _build_sample_routes(
             raise ValueError(f"BatchPlan is missing source position {source_position}.")
         outgoing[planned_sample.target_data_rank].append((source_position, sample))
 
-    received_positions: list[list[int]] = [[] for _ in range(topology.data_world_size)]
+    received_positions: list[list[int]] = [[] for _ in range(topology.data_parallel_size)]
     for planned_sample in plan.samples:
         if planned_sample.target_data_rank != topology.data_rank:
             continue
@@ -416,7 +416,7 @@ def _prepare_uniform_tensors(
     local_samples: Sequence[Any],
     group: Any,
     communication_device: Any,
-    data_world_size: int,
+    data_parallel_size: int,
 ) -> tuple[Any, ...]:
     if not local_samples or any(not platform.is_tensor(sample) for sample in local_samples):
         raise ValueError("direct_tensor_a2a requires every online sample to be a tensor.")
@@ -426,7 +426,7 @@ def _prepare_uniform_tensors(
         raise ValueError("direct_tensor_a2a requires identical sample shapes and dtypes on each data owner.")
 
     local_schema = (sample_shape, str(sample_dtype))
-    gathered_schemas: list[Any] = [None] * data_world_size
+    gathered_schemas: list[Any] = [None] * data_parallel_size
     platform.all_gather_object(gathered_schemas, local_schema, group)
     if any(schema != local_schema for schema in gathered_schemas):
         raise ValueError(f"direct_tensor_a2a requires one global tensor schema, but got {gathered_schemas}.")

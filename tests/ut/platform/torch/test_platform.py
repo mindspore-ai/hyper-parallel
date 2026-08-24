@@ -28,13 +28,14 @@ import numpy as np
 import pytest
 import torch
 
-from hyper_parallel.platform.torch.platform import TorchPlatform
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 from hyper_parallel.platform.torch.dtensor import DTensorBase
+from hyper_parallel.platform.torch.platform import TorchPlatform
 
 
 class TestTorchPlatformCore(unittest.TestCase):
     """Unit tests for TorchPlatform core functionality.
-    
+
     Tests cover device and distributed environment management,
     distributed communication primitives, parameter management,
     and tensor operations.
@@ -42,7 +43,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method.
-        
+
         Configures the environment and initializes the TorchPlatform instance.
         """
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -54,6 +55,36 @@ class TestTorchPlatformCore(unittest.TestCase):
         TorchPlatform.prepare_batch_p2p_group(mock.sentinel.pp_group)
 
         mock_barrier.assert_called_once_with(group=mock.sentinel.pp_group)
+
+    def test_create_named_group_does_not_reuse_rank_list_group(self) -> None:
+        """A subsystem namespace should own a communicator separate from model groups."""
+        rank_key = str((0, 2))
+        group_name = "hp_data_test_group"
+        EXISTING_COMM_GROUPS[rank_key] = mock.sentinel.model_group
+        self.addCleanup(EXISTING_COMM_GROUPS.pop, rank_key, None)
+        self.addCleanup(EXISTING_COMM_GROUPS.pop, group_name, None)
+
+        with mock.patch.object(
+            self.platform,
+            "_create_named_group",
+            return_value=mock.sentinel.data_group,
+        ) as create_named_group:
+            first = self.platform.create_named_group((2, 0), group_name)
+            second = self.platform.create_named_group((0, 2), group_name)
+
+        self.assertIs(first, mock.sentinel.data_group)
+        self.assertIs(second, mock.sentinel.data_group)
+        create_named_group.assert_called_once_with((0, 2), group_name)
+
+    @mock.patch("hyper_parallel.platform.torch.platform.dist.new_group")
+    def test_create_named_group_passes_group_description(self, new_group) -> None:
+        """Torch should forward the subsystem namespace to the process group."""
+        new_group.return_value = mock.sentinel.data_group
+
+        result = self.platform._create_named_group((0, 2), "hp_data_test_group")
+
+        self.assertIs(result, mock.sentinel.data_group)
+        new_group.assert_called_once_with(ranks=[0, 2], group_desc="hp_data_test_group")
 
     def test_buffers_dict_includes_all_registered_buffers(self):
         """Torch buffer enumeration includes persistent and non-persistent buffers."""
@@ -127,10 +158,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('hyper_parallel.platform.torch.platform.TorchPlatform.get_device_handle')
     def test_device_type(self, mock_get_device_handle):
         """Test device type detection logic.
-        
+
         Verifies that the platform correctly identifies different device types
         (NPU and CUDA) based on the device handle.
-        
+
         Args:
             mock_get_device_handle: Mock for the get_device_handle method.
         """
@@ -146,11 +177,11 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.init_process_group')
     def test_init_process_group(self, mock_init, mock_get_default):
         """Test distributed process group initialization logic.
-        
+
         Verifies that the platform properly initializes the distributed
         environment when not already initialized, and avoids reinitialization
         when already initialized.
-        
+
         Args:
             mock_init: Mock for torch.distributed.init_process_group.
             mock_get_default: Mock for _get_default_group function.
@@ -172,10 +203,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.new_group')
     def test_split_group(self, mock_new_group, mock_get_rank):
         """Test process group splitting logic.
-        
+
         Verifies that the platform correctly splits the default process group
         into subgroups based on provided rank lists.
-        
+
         Args:
             mock_new_group: Mock for torch.distributed.new_group.
             mock_get_rank: Mock for TorchPlatform.get_rank.
@@ -200,10 +231,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.nn.functional.all_gather')
     def test_differentiable_all_gather_concat(self, mock_all_gather):
         """Test differentiable all_gather and concatenation logic.
-        
+
         Verifies that the platform correctly performs all_gather operation
         and concatenates results along the specified dimension.
-        
+
         Args:
             mock_all_gather: Mock for torch.distributed.nn.functional.all_gather.
         """
@@ -225,10 +256,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.nn.functional.all_reduce')
     def test_differentiable_all_reduce(self, mock_all_reduce):
         """Test differentiable all_reduce logic.
-        
+
         Verifies that the platform correctly performs all_reduce operation
         with the specified reduction operation.
-        
+
         Args:
             mock_all_reduce: Mock for torch.distributed.nn.functional.all_reduce.
         """
@@ -245,10 +276,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.empty')
     def test_differentiable_reduce_scatter(self, mock_empty, mock_chunk, mock_reduce_scatter):
         """Test differentiable reduce_scatter logic.
-        
+
         Verifies that the platform correctly performs reduce_scatter operation
         with both sum and average reduction operations.
-        
+
         Args:
             mock_empty: Mock for torch.empty.
             mock_chunk: Mock for torch.chunk.
@@ -280,10 +311,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.all_reduce')
     def test_all_reduce_non_contiguous(self, mock_all_reduce):
         """Test all_reduce handling of non-contiguous tensors.
-        
+
         Verifies that the platform correctly handles non-contiguous tensors
         by converting them to contiguous before performing all_reduce.
-        
+
         Args:
             mock_all_reduce: Mock for torch.distributed.all_reduce.
         """
@@ -457,7 +488,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def test_search_parameter_by_name(self):
         """Test parameter search by name logic.
-        
+
         Verifies that the platform correctly searches for parameters
         in nested model structures using dot notation.
         """
@@ -494,7 +525,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def test_update_parameter_by_name(self):
         """Test parameter update by name logic.
-        
+
         Verifies that the platform correctly updates model parameters
         using the result from search_parameter_by_name.
         """
@@ -519,10 +550,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('hyper_parallel.core.dtensor.layout._get_slice_tensor_by_layout')
     def test_set_layout_into_parameter(self, mock_get_slice, mock_dtensor_from_local, mock_parameter):
         """Test parameter layout setting logic.
-        
+
         Verifies that the platform correctly sets tensor layouts into parameters
         and handles error cases appropriately.
-        
+
         Args:
             mock_get_slice: Mock for _get_slice_tensor_by_layout function.
             mock_dtensor_from_local: Mock for DTensor.from_local method.
@@ -555,7 +586,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def test_cast_fp_tensor(self):
         """Test floating-point tensor type casting logic.
-        
+
         Verifies that the platform correctly casts tensors to different
         floating-point types and handles edge cases.
         """
@@ -580,7 +611,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def test_apply_to_tensors(self):
         """Test recursive tensor processing logic.
-        
+
         Verifies that the platform correctly applies functions recursively
         to tensors within nested data structures.
         """

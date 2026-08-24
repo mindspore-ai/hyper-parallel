@@ -222,7 +222,7 @@ class TestMicroBatchSharding(unittest.TestCase):
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
             synchronizer = TorchMetadataAllGather(group="metadata")
-            result = synchronizer.gather((owner_nine,), owner_ranks=(3, 9))
+            result = synchronizer.gather((owner_nine,), data_owner_ranks=(3, 9))
 
         self.assertEqual([metadata.sample_id for metadata in result], ["three", "nine"])
 

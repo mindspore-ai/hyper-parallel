@@ -33,9 +33,10 @@ class TestDataTopology(unittest.TestCase):
 
         self.assertEqual(topology.coordinate, (1, 1, 1))
         self.assertEqual(topology.data_rank, 1)
-        self.assertEqual(topology.owner_ranks, (0, 4))
+        self.assertEqual(topology.data_owner_ranks, (0, 4))
         self.assertEqual(topology.data_owner_rank, 4)
-        self.assertEqual(topology.consumer_ranks, (4, 5, 6, 7))
+        self.assertEqual(topology.model_parallel_rank_groups, ((0, 1, 2, 3), (4, 5, 6, 7)))
+        self.assertEqual(topology.model_parallel_ranks, (4, 5, 6, 7))
         self.assertEqual((topology.cp_rank, topology.cp_size), (1, 2))
         self.assertEqual((topology.tp_rank, topology.tp_size), (1, 2))
         self.assertFalse(topology.is_data_owner)
@@ -49,9 +50,10 @@ class TestDataTopology(unittest.TestCase):
             global_rank=25,
         )
 
-        self.assertEqual(topology.owner_ranks, (10, 21))
+        self.assertEqual(topology.data_owner_ranks, (10, 21))
         self.assertEqual(topology.data_owner_rank, 21)
-        self.assertEqual(topology.consumer_ranks, (21, 25))
+        self.assertEqual(topology.model_parallel_rank_groups, ((10, 12), (21, 25)))
+        self.assertEqual(topology.model_parallel_ranks, (21, 25))
 
     def test_without_dp_axis_uses_one_data_coordinate(self) -> None:
         """A pure TP mesh should have one owner and one data coordinate."""
@@ -62,7 +64,7 @@ class TestDataTopology(unittest.TestCase):
             global_rank=2,
         )
 
-        self.assertEqual(topology.data_world_size, 1)
+        self.assertEqual(topology.data_parallel_size, 1)
         self.assertEqual(topology.data_rank, 0)
         self.assertEqual(topology.data_owner_rank, 0)
-        self.assertEqual(topology.consumer_ranks, (0, 1, 2, 3))
+        self.assertEqual(topology.model_parallel_ranks, (0, 1, 2, 3))

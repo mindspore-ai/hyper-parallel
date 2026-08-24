@@ -1062,6 +1062,10 @@ class Platform:
         """
         raise NotImplementedError("Platform subclasses must implement _create_group")
 
+    def _create_named_group(self, rank_list: Sequence[int], group_name: str) -> Any:
+        """Create a process group in a caller-owned cache namespace."""
+        raise NotImplementedError("Platform subclasses must implement _create_named_group")
+
     def new_stream(self):
         """Create a new compute stream for asynchronous operations.
 
@@ -1144,6 +1148,33 @@ class Platform:
 
         group = self._create_group(rank_list)
         EXISTING_COMM_GROUPS[group_key] = group
+        return group
+
+    def create_named_group(self, rank_list: Sequence[int], group_name: str) -> Any:
+        """Create or retrieve a process group by a caller-provided name.
+
+        Unlike :meth:`create_group`, the cache key is independent of the rank
+        list. This allows a subsystem to own a dedicated communicator even
+        when a model communication group contains the same ranks. Every rank
+        must call this method with the same groups in the same order.
+
+        Args:
+            rank_list: Global ranks participating in the group.
+            group_name: Globally deterministic cache namespace for the group.
+
+        Returns:
+            The process group associated with ``group_name``.
+        """
+        if not isinstance(group_name, str) or not group_name:
+            raise ValueError(f"group_name must be a non-empty string, but got {group_name!r}.")
+        normalized_ranks = tuple(sorted(rank_list))
+        if not normalized_ranks or len(normalized_ranks) != len(set(normalized_ranks)):
+            raise ValueError(f"rank_list must contain unique ranks, but got {rank_list}.")
+        if group_name in EXISTING_COMM_GROUPS:
+            return EXISTING_COMM_GROUPS[group_name]
+
+        group = self._create_named_group(normalized_ranks, group_name)
+        EXISTING_COMM_GROUPS[group_name] = group
         return group
 
     @staticmethod

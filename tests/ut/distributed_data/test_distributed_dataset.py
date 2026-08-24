@@ -23,6 +23,7 @@ from typing import Any, Callable, Sequence
 from unittest.mock import patch
 
 from hyper_parallel import distributed_data
+from hyper_parallel.distributed_data import api as distributed_data_api
 from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
 from hyper_parallel.distributed_data.distributor import (
     LocalMicroBatchDistributor,
@@ -68,7 +69,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
     def test_builder_selects_online_or_sidecar_metadata(self) -> None:
         """The public builder should require exactly one metadata path."""
-        config = distributed_data.DistributedDatasetConfig(micro_batch_size=1, micro_batch_count=1)
+        config = distributed_data.DistributedDatasetConfig(micro_batch_size=1, micro_batch_num=1)
 
         def metadata_fn(sample: Any, data_ref: int) -> SampleMeta:
             """Build unused metadata for boundary validation."""
@@ -88,28 +89,80 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sample_transport"):
             distributed_data.DistributedDatasetConfig(
                 micro_batch_size=1,
-                micro_batch_count=1,
+                micro_batch_num=1,
                 sample_transport="object_p2p",
             )
         with self.assertRaisesRegex(ValueError, "pin_memory must be a boolean"):
             distributed_data.DistributedDatasetConfig(
                 micro_batch_size=1,
-                micro_batch_count=1,
+                micro_batch_num=1,
                 pin_memory=1,
             )
         with self.assertRaisesRegex(ValueError, "double_buffer must be a boolean"):
             distributed_data.DistributedDatasetConfig(
                 micro_batch_size=1,
-                micro_batch_count=1,
+                micro_batch_num=1,
                 double_buffer=1,
             )
         config = distributed_data.DistributedDatasetConfig(
             micro_batch_size=1,
-            micro_batch_count=1,
+            micro_batch_num=1,
             prefetch_steps=1,
             double_buffer=True,
         )
         self.assertTrue(config.double_buffer)
+
+    def test_builder_creates_dedicated_data_groups_in_global_order(self) -> None:
+        """Every rank should derive the same metadata and model-group creation sequence."""
+        topology = DataTopology.from_layout(
+            mesh_shape=(2, 2),
+            mesh_dim_names=("dp_shard", "tp"),
+            rank_list=(0, 1, 2, 3),
+            global_rank=0,
+        )
+        metadata = [
+            SampleMeta(sample_id=str(index), source_id="source", data_ref=index)
+            for index in range(4)
+        ]
+        created: list[tuple[tuple[int, ...], str]] = []
+        group_ranks: dict[str, tuple[int, ...]] = {}
+        barriers: list[str | None] = []
+
+        def create_named_group(ranks: Sequence[int], group_name: str) -> str:
+            """Record one synthetic dedicated group creation."""
+            normalized_ranks = tuple(ranks)
+            created.append((normalized_ranks, group_name))
+            group_ranks[group_name] = normalized_ranks
+            return group_name
+
+        with (
+            patch("hyper_parallel.distributed_data.api.DataTopology.from_mesh", return_value=topology),
+            patch.object(distributed_data_api.platform, "create_named_group", side_effect=create_named_group),
+            patch.object(
+                distributed_data_api.platform,
+                "barrier",
+                side_effect=lambda group=None: barriers.append(group),
+            ),
+            patch.object(
+                distributed_data_api.platform,
+                "get_process_group_ranks",
+                side_effect=lambda group: group_ranks[group],
+            ),
+        ):
+            loader = distributed_data.build_distributed_dataset(
+                [f"sample-{index}" for index in range(4)],
+                mesh=object(),
+                config=distributed_data.DistributedDatasetConfig(micro_batch_size=1, micro_batch_num=1),
+                metadata=metadata,
+            )
+
+        try:
+            self.assertEqual([ranks for ranks, _ in created], [(0, 2), (0, 1), (2, 3)])
+            self.assertTrue(created[0][1].startswith("hp_data_metadata_"))
+            self.assertTrue(all(name.startswith("hp_data_model_") for _, name in created[1:]))
+            self.assertEqual(barriers, [created[0][1], None, created[1][1], None, None])
+        finally:
+            loader.close()
 
 
 class _PeerMetadataSynchronizer:
@@ -118,11 +171,11 @@ class _PeerMetadataSynchronizer:
     def gather(
         self,
         local_metadata: Sequence[SampleMeta],
-        owner_ranks: tuple[int, ...],
+        data_owner_ranks: tuple[int, ...],
     ) -> tuple[SampleMeta, ...]:
         """Return local metadata followed by a synthetic peer contribution."""
-        if owner_ranks != (0, 1):
-            raise ValueError(f"Unexpected owners {owner_ranks}.")
+        if data_owner_ranks != (0, 1):
+            raise ValueError(f"Unexpected owners {data_owner_ranks}.")
         peer_metadata = tuple(
             SampleMeta(
                 sample_id=f"peer-{metadata.sample_id}",
@@ -323,7 +376,7 @@ class _BlockingMetadataSynchronizer(_PeerMetadataSynchronizer):
     def gather(
         self,
         local_metadata: Sequence[SampleMeta],
-        owner_ranks: tuple[int, ...],
+        data_owner_ranks: tuple[int, ...],
     ) -> tuple[SampleMeta, ...]:
         """Block the selected gather before returning deterministic peer metadata."""
         call_index = self._calls
@@ -333,7 +386,7 @@ class _BlockingMetadataSynchronizer(_PeerMetadataSynchronizer):
             self.started.set()
             if not self.release.wait(timeout=5):
                 raise RuntimeError("Timed out releasing synthetic metadata gather.")
-        return super().gather(local_metadata, owner_ranks)
+        return super().gather(local_metadata, data_owner_ranks)
 
 
 class _FakeReadyEvent:
@@ -401,7 +454,7 @@ def _build_loader(
         rank_list=(0, 1),
         global_rank=0,
     )
-    planner = DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=2)
+    planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=2)
     materializer = _RecordingMaterializer([f"sample-{index}" for index in range(8)])
     loader = DistributedDataset(
         topology=topology,
@@ -425,7 +478,7 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
         rank_list=(0,),
         global_rank=0,
     )
-    planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=len(samples), micro_batch_count=1)
+    planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=len(samples), micro_batch_num=1)
 
     def collate_fn(values: list[Any]) -> dict[str, Any]:
         """Create a nested batch that exercises recursive pinning."""
@@ -482,7 +535,7 @@ def _build_single_microbatch_double_buffer(micro_batch_distributor: Any) -> Dist
     return DistributedDataset(
         topology=topology,
         metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
-        planner=DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=1),
+        planner=DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=1),
         rank_materializer=RankMaterializer(_RecordingMaterializer(["sample-0", "sample-1"]), tuple),
         metadata_synchronizer=LocalMetadataSynchronizer(),
         micro_batch_distributor=micro_batch_distributor,
@@ -611,7 +664,7 @@ class TestDistributedDataset(unittest.TestCase):
         loader = DistributedDataset(
             topology=topology,
             metadata_source=None,
-            planner=DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=3),
+            planner=DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=3),
             rank_materializer=RankMaterializer(_FailMaterializer(), tuple),
             metadata_synchronizer=synchronizer,
             micro_batch_distributor=LocalMicroBatchDistributor(),
@@ -735,7 +788,7 @@ class TestDistributedDataset(unittest.TestCase):
             rank_list=(0, 1),
             global_rank=1,
         )
-        planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=2)
+        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=2)
         distributor = _ReceivingMicroBatchDistributor(planner.plan(metadata, step=0, cursor_start=0))
         loader = DistributedDataset(
             topology=topology,
@@ -788,7 +841,7 @@ class TestDistributedDataset(unittest.TestCase):
         loader = DistributedDataset(
             topology=topology,
             metadata_source=None,
-            planner=DistributedBatchPlanner(data_world_size=2, micro_batch_size=1, micro_batch_count=3),
+            planner=DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=3),
             rank_materializer=RankMaterializer(_FailMaterializer(), tuple),
             metadata_synchronizer=_PeerMetadataSynchronizer(),
             micro_batch_distributor=LocalMicroBatchDistributor(),
@@ -814,7 +867,7 @@ class TestDistributedDataset(unittest.TestCase):
                 [("raw-0",), ("raw-2",), ("raw-4",)],
             )
             self.assertEqual([plan.micro_batch_start for plan in redistributor.plans], [0, 1, 2])
-            self.assertTrue(all(plan.micro_batch_count == 1 for plan in redistributor.plans))
+            self.assertTrue(all(plan.micro_batch_num == 1 for plan in redistributor.plans))
             loader.commit(step.replay_id)
         finally:
             loader.close()
@@ -905,7 +958,7 @@ class TestDistributedDataset(unittest.TestCase):
             rank_list=(0, 1),
             global_rank=1,
         )
-        planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=2)
+        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=2)
         plan = planner.plan(metadata, step=0, cursor_start=0)
         loader = DistributedDataset(
             topology=topology,
@@ -936,7 +989,7 @@ class TestDistributedDataset(unittest.TestCase):
             rank_list=(0, 1),
             global_rank=1,
         )
-        planner = DistributedBatchPlanner(data_world_size=1, micro_batch_size=1, micro_batch_count=2)
+        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=2)
         plans = [
             planner.plan_microbatch(
                 [SampleMeta(sample_id=str(index), source_id="source", data_ref=index)],

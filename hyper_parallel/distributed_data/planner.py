@@ -30,9 +30,9 @@ class DistributedBatchPlanner:
 
     def __init__(
         self,
-        data_world_size: int,
+        data_parallel_size: int,
         micro_batch_size: int,
-        micro_batch_count: int,
+        micro_batch_num: int,
         *,
         cost_model: CostModel | None = None,
         balancer: BatchBalancer | None = None,
@@ -40,15 +40,15 @@ class DistributedBatchPlanner:
     ) -> None:
         """Initialize fixed optimizer-step dimensions and planning policies."""
         for name, value in (
-            ("data_world_size", data_world_size),
+            ("data_parallel_size", data_parallel_size),
             ("micro_batch_size", micro_batch_size),
-            ("micro_batch_count", micro_batch_count),
+            ("micro_batch_num", micro_batch_num),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
-        self.data_world_size = data_world_size
+        self.data_parallel_size = data_parallel_size
         self.micro_batch_size = micro_batch_size
-        self.micro_batch_count = micro_batch_count
+        self.micro_batch_num = micro_batch_num
         self.cost_model = cost_model or LinearMultimodalCostModel()
         self.balancer = balancer or GreedyBatchBalancer()
         self.cp_shards = cp_shards
@@ -56,12 +56,12 @@ class DistributedBatchPlanner:
     @property
     def local_samples_per_step(self) -> int:
         """Return candidate samples contributed by each data owner per step."""
-        return self.micro_batch_size * self.micro_batch_count
+        return self.micro_batch_size * self.micro_batch_num
 
     @property
     def global_samples_per_step(self) -> int:
         """Return total candidates required to plan one optimizer step."""
-        return self.local_samples_per_step * self.data_world_size
+        return self.local_samples_per_step * self.data_parallel_size
 
     def plan(
         self,
@@ -85,7 +85,7 @@ class DistributedBatchPlanner:
             step=step,
             cursor_start=cursor_start,
             micro_batch_start=0,
-            micro_batch_count=self.micro_batch_count,
+            micro_batch_num=self.micro_batch_num,
         )
 
     def plan_microbatch(
@@ -111,17 +111,17 @@ class DistributedBatchPlanner:
             not isinstance(micro_batch_index, int)
             or isinstance(micro_batch_index, bool)
             or micro_batch_index < 0
-            or micro_batch_index >= self.micro_batch_count
+            or micro_batch_index >= self.micro_batch_num
         ):
             raise ValueError(
-                f"micro_batch_index must be in [0, {self.micro_batch_count}), but got {micro_batch_index!r}."
+                f"micro_batch_index must be in [0, {self.micro_batch_num}), but got {micro_batch_index!r}."
             )
         return self._plan(
             candidates,
             step=step,
             cursor_start=cursor_start,
             micro_batch_start=micro_batch_index,
-            micro_batch_count=1,
+            micro_batch_num=1,
         )
 
     def _plan(
@@ -131,11 +131,11 @@ class DistributedBatchPlanner:
         step: int,
         cursor_start: int,
         micro_batch_start: int,
-        micro_batch_count: int,
+        micro_batch_num: int,
     ) -> BatchPlan:
         if step < 0 or cursor_start < 0:
             raise ValueError(f"step and cursor_start must be non-negative, but got {step} and {cursor_start}.")
-        expected_candidates = self.data_world_size * self.micro_batch_size * micro_batch_count
+        expected_candidates = self.data_parallel_size * self.micro_batch_size * micro_batch_num
         if len(candidates) != expected_candidates:
             raise ValueError(
                 f"Planner requires {expected_candidates} candidates for this planning window, "
@@ -149,13 +149,13 @@ class DistributedBatchPlanner:
             BalanceItem(metadata=metadata, source_position=position, cost=self.cost_model.estimate(metadata))
             for position, metadata in enumerate(candidates)
         )
-        slot_count = self.data_world_size * micro_batch_count
+        slot_count = self.data_parallel_size * micro_batch_num
         slots = self.balancer.balance(items, slot_count, self.micro_batch_size)
 
         planned_samples = []
         for slot_index, slot in enumerate(slots):
-            micro_batch_index = micro_batch_start + slot_index // self.data_world_size
-            target_data_rank = slot_index % self.data_world_size
+            micro_batch_index = micro_batch_start + slot_index // self.data_parallel_size
+            target_data_rank = slot_index % self.data_parallel_size
             for position_in_micro_batch, item in enumerate(slot):
                 planned_samples.append(
                     PlannedSample(
@@ -168,12 +168,12 @@ class DistributedBatchPlanner:
                     )
                 )
 
-        cursor_end = cursor_start + self.micro_batch_size * micro_batch_count
+        cursor_end = cursor_start + self.micro_batch_size * micro_batch_num
         replay_id = self._replay_id(
             step,
             cursor_start,
             micro_batch_start,
-            micro_batch_count,
+            micro_batch_num,
             tuple(planned_samples),
         )
         return BatchPlan(
@@ -181,9 +181,9 @@ class DistributedBatchPlanner:
             step=step,
             cursor_start=cursor_start,
             cursor_end=cursor_end,
-            data_world_size=self.data_world_size,
+            data_parallel_size=self.data_parallel_size,
             micro_batch_size=self.micro_batch_size,
-            micro_batch_count=micro_batch_count,
+            micro_batch_num=micro_batch_num,
             samples=tuple(planned_samples),
             cp_shards=self.cp_shards,
             micro_batch_start=micro_batch_start,
@@ -194,16 +194,16 @@ class DistributedBatchPlanner:
         step: int,
         cursor_start: int,
         micro_batch_start: int,
-        micro_batch_count: int,
+        micro_batch_num: int,
         samples: tuple[PlannedSample, ...],
     ) -> str:
         stable_plan = {
             "step": step,
             "cursor_start": cursor_start,
-            "data_world_size": self.data_world_size,
+            "data_parallel_size": self.data_parallel_size,
             "micro_batch_size": self.micro_batch_size,
             "micro_batch_start": micro_batch_start,
-            "micro_batch_count": micro_batch_count,
+            "micro_batch_num": micro_batch_num,
             "samples": [
                 {
                     "source_id": sample.meta.source_id,
