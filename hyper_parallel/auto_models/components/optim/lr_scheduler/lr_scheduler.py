@@ -16,8 +16,7 @@
 
 from typing import Any
 
-from hyper_parallel.core.optimizer.lr_scheduler import LRSchedulersContainer, get_constant_schedule_with_warmup, \
-    get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+from hyper_parallel.core.optimizer import get_hyper_lr_scheduler
 
 
 class MultiLRScheduler:
@@ -52,52 +51,30 @@ class MultiLRScheduler:
         lr_start = self.config.get('lr_start', 0.0)
         lr_decay_ratio = self.config.get('lr_decay_ratio', 1.0)
         min_lr = self.config.get('min_lr', self.config.get('lr_min', 1e-7))
+        initial_lrs = {
+            float(param_group.get("initial_lr", param_group["lr"]))
+            for child_optimizer in self.optimizer.optimizers_dict.values()
+            for param_group in child_optimizer.param_groups
+        }
+        if not initial_lrs:
+            raise ValueError("MultiLRScheduler requires at least one optimizer parameter group")
+        if len(initial_lrs) != 1:
+            raise ValueError(
+                "MultiLRScheduler on master requires one shared initial learning rate; "
+                f"got {sorted(initial_lrs)}. Per-optimizer absolute minimum learning rates "
+                "must be migrated separately."
+            )
 
-        def build_scheduler(optimizer: Any) -> Any:
-            """Build the LR scheduler for a single optimizer.
-
-            Args:
-                optimizer: The optimizer whose ``param_groups`` provide the
-                    initial learning rate.
-
-            Returns:
-                The configured learning-rate scheduler.
-
-            Raises:
-                ValueError: If ``lr_decay_style`` is not supported.
-            """
-            init_lr = optimizer.param_groups[0]["lr"]
-            if self.lr_decay_style == "constant":
-                return get_constant_schedule_with_warmup(
-                    optimizer=optimizer,
-                    num_warmup_steps=lr_warmup_steps,
-                    init_lr=init_lr,
-                    lr_start=lr_start,
-                )
-            if self.lr_decay_style == "linear":
-                return get_linear_schedule_with_warmup(
-                    optimizer=optimizer,
-                    num_warmup_steps=lr_warmup_steps,
-                    num_training_steps=train_iters,
-                    init_lr=init_lr,
-                    min_lr=min_lr,
-                    lr_start=lr_start,
-                )
-            if self.lr_decay_style == "cosine":
-                return get_cosine_schedule_with_warmup(
-                    optimizer=optimizer,
-                    num_warmup_steps=lr_warmup_steps,
-                    num_training_steps=train_iters,
-                    init_lr=init_lr,
-                    lr_decay_ratio=lr_decay_ratio,
-                    min_lr=min_lr,
-                    lr_start=lr_start,
-                )
-            raise ValueError(f"Unsupported lr_decay_style: {self.lr_decay_style!r}")
-
-        self.lr_scheduler = LRSchedulersContainer(
-            optimizers=self.optimizer,
-            scheduler=build_scheduler,
+        self.lr_scheduler = get_hyper_lr_scheduler(
+            optimizer=self.optimizer,
+            total_steps=train_iters,
+            warmup_steps=lr_warmup_steps,
+            warmup_ratio=lr_warmup_ratio,
+            decay_style=self.lr_decay_style,
+            lr=initial_lrs.pop(),
+            lr_min=min_lr,
+            lr_start=lr_start,
+            lr_decay_ratio=lr_decay_ratio,
         )
 
     def get_lr_scheduler(self) -> Any:

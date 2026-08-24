@@ -22,13 +22,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
-from hyper_parallel import DTensor, DeviceMesh, HSDPModule, Replicate, fully_shard
-from hyper_parallel.core.dtensor.placement_types import Partial, Placement
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
-from hyper_parallel.platform import get_platform
+from hyper_parallel import DeviceMesh, DTensor, HSDPModule, Replicate, fully_shard
 from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
 from hyper_parallel.auto_models.components.distributed.infrastructure import MeshContext
-from hyper_parallel.auto_models.components.distributed.source_shard import FSDP_OWNED_DIMS
+from hyper_parallel.auto_models.components.distributed.source_shard import (
+    FSDP_OWNED_DIMS,
+)
+from hyper_parallel.core.dtensor.placement_types import Partial, Placement
+from hyper_parallel.platform import get_platform
 
 logger = logging.getLogger(__name__)
 platform = get_platform()
@@ -354,7 +356,7 @@ class FSDP2Manager:
                 owner_by_parameter[parameter] = model
         return owner_by_parameter
 
-    def _get_default_source_shard_info(self) -> "fully_shard_utils.SourceShardMetaInfo":
+    def _get_default_source_shard_info(self) -> fully_shard_utils.SourceShardMetaInfo:
         """Build all-Replicate source metadata covering every non-FSDP mesh axis.
 
         Used to complete source_shard_info for parameters the plan does not mention;
@@ -464,19 +466,24 @@ class FSDP2Manager:
     ) -> bool:
         """Restore global-mean gradients for one source-layout FSDP unit.
 
-        ``fully_shard`` defaults units whose parameters all have source-layout
-        metadata to SUM reduction. The token-weighted backward loss is scaled
-        by the FSDP data domain (DP x CP), so a source-layout SUM-reduced unit
-        must apply its inverse exactly once. With loss parallelism, TP ranks
-        hold shards or partial contributions to one logical loss and TP is not
-        another averaging axis. Without loss parallelism, logits and the loss
-        are replicated over TP, so the SUM path also accumulates ``tp_size``
-        identical loss replicas and must divide by TP. EP is excluded because
-        expert ranks own different parameters.
+        Master defaults every ``fully_shard`` unit to AVG reduction, so units
+        with source-layout metadata explicitly select SUM. The token-weighted
+        backward loss is scaled by the FSDP data domain (DP x CP), so a
+        source-layout SUM-reduced unit must apply its inverse exactly once.
+        With loss parallelism, TP ranks hold shards or partial contributions
+        to one logical loss and TP is not another averaging axis. Without loss
+        parallelism, logits and the loss are replicated over TP, so the SUM
+        path also accumulates ``tp_size`` identical loss replicas and must
+        divide by TP. EP is excluded because expert ranks own different
+        parameters.
 
         Returns:
             Whether a gradient scaling factor was configured for the unit.
         """
+        if not managed_source_shard_info:
+            return False
+        hsdp_module.set_reduce_op_type("sum", recurse=False)
+
         tp_loss_replica_size = (
             1 if self.mesh_context.loss_parallel else self.mesh_context.tp_size
         )
@@ -485,7 +492,7 @@ class FSDP2Manager:
             * self.mesh_context.cp_size
             * tp_loss_replica_size
         )
-        if source_gradient_domain_size <= 1 or not managed_source_shard_info:
+        if source_gradient_domain_size <= 1:
             return False
         hsdp_module.set_gradient_scaling_factor(1.0 / source_gradient_domain_size)
         return True
