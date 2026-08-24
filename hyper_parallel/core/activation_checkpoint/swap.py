@@ -702,6 +702,12 @@ class SwapManager:
     """Singleton manager for swap groups and their operations."""
     _instance: Optional["SwapManager"] = None
     _lock = threading.Lock()
+    _FORWARD_PREFETCH_HOOK_HANDLE_ATTRS = (
+        "_swap_forward_pre_hook_handle",
+        "_swap_forward_hook_handle",
+        "_swap_backward_pre_hook_handle",
+        "_swap_backward_hook_handle",
+    )
 
     def __init__(self) -> None:
         """Initialize process-local swap groups once for the singleton."""
@@ -814,6 +820,26 @@ class SwapManager:
         if group is None:
             return False
         return group.is_last_group
+
+    def unregister_forward_prefetch_hooks(self, module: Any) -> int:
+        """Remove hooks installed by :meth:`set_forward_prefetch_layer`.
+
+        Args:
+            module: Module whose layer-level swap hooks should be removed.
+
+        Returns:
+            Number of removed hook handles.
+        """
+        removed_count = 0
+        for attr_name in self._FORWARD_PREFETCH_HOOK_HANDLE_ATTRS:
+            if not hasattr(module, attr_name):
+                continue
+            handle = getattr(module, attr_name)
+            if handle is not None:
+                handle.remove()
+            delattr(module, attr_name)
+            removed_count += 1
+        return removed_count
 
     def set_forward_prefetch_layer(self, first_layer, second_layer):
         """
