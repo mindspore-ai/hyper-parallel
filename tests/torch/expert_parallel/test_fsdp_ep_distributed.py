@@ -69,9 +69,9 @@ def test_fsdp_ep_three_step_training():
     Description:
         4-card setup: 2 FSDP × 2 EP.  Train standalone and FSDP+EP for 3 steps
         on the same small batch and verify their loss values match.  The FSDP+EP
-        backward loss is divided by ``world_size`` to compensate for the
-        ep_size × token-duplication of expert gradients and the SUM reduce that
-        fully_shard applies when expert parameters are DTensors.
+        backward loss is divided by ``ep_size`` to compensate for EP token
+        duplication; fully_shard's default AVG reduction already normalizes
+        gradients across the FSDP dimension.
     Expectation: FSDP+EP loss matches standalone loss within rtol=1e-3, atol=1e-3.
     """
     _run_group(
