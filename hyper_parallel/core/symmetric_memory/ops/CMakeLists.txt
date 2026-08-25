@@ -1,25 +1,30 @@
 cmake_minimum_required(VERSION 3.18)
 project(aclshmem_kernel)
 
-# 设置C++标准
+# Set the C++ standard.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 生成位置无关代码
+# Generate position-independent code.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# 获取CANN相关环境变量
+# Read the CANN environment.
 if(NOT DEFINED ENV{ASCEND_HOME_PATH})
     message(FATAL_ERROR "Cannot find ASCEND_HOME_PATH, please run set_env.sh.")
 else()
     set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 endif()
 
-# 获取aclshmem相关环境变量
+# Read the aclshmem environment.
 if(NOT DEFINED ENV{SHMEM_HOME_PATH})
     message(FATAL_ERROR "Cannot find SHMEM_HOME_PATH, please run set_env.sh.")
 else()
     set(SHMEM_HOME_PATH $ENV{SHMEM_HOME_PATH})
+endif()
+if(NOT DEFINED ENV{SHMEM_SOURCE_DIR})
+    message(FATAL_ERROR "Cannot find SHMEM_SOURCE_DIR, please run the explicit native dependency workflow.")
+else()
+    set(SHMEM_SOURCE_DIR $ENV{SHMEM_SOURCE_DIR})
 endif()
 
 option(USE_UNIT_TEST "USE_UNIT_TEST" OFF)
@@ -75,26 +80,26 @@ link_directories(
 
 link_libraries(runtime stdc++ ascendcl m tiling_api platform c_sec dl nnopbase)
 
-file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/obj)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/obj)
 
 function(aclshmem_add_share_lib NAME)
     add_library(${NAME}_kernel OBJECT ${NAME}/kernel/${NAME}_kernel.cpp)
     set_target_properties(${NAME}_kernel PROPERTIES
-        OBJECT_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/obj"
-        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/obj"  # 兼容性保留
+        OBJECT_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obj"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obj"
     )
 
     target_compile_options(${NAME}_kernel PRIVATE ${CMAKE_CCE_COMPILE_OPTIONS} --cce-aicore-arch=dav-c220-vec)
     target_include_directories(${NAME}_kernel PRIVATE
         ${SHMEM_HOME_PATH}/shmem/include
-        ${SHMEM_HOME_PATH}/../src/device
+        ${SHMEM_SOURCE_DIR}/src/device
     )
 
     add_library(${NAME}_shared SHARED ${NAME}/host/${NAME}.cpp)
 
     set_target_properties(${NAME}_shared PROPERTIES
-        OBJECT_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/obj"
-        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/obj"
+        OBJECT_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obj"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obj"
     )
 
     # Public-layer host code: ABI=0 to match CANN's host-side policy
@@ -106,7 +111,7 @@ function(aclshmem_add_share_lib NAME)
         ${SHMEM_HOME_PATH}/shmem/include
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    target_link_libraries(${NAME}_shared hpshmem ${NAME}_kernel)
+    target_link_libraries(${NAME}_shared hyper_parallel_shmem ${NAME}_kernel)
 
     set(GLOBAL_LIBS ${GLOBAL_LIBS} ${NAME}_kernel ${NAME}_shared PARENT_SCOPE)
 endfunction()
@@ -132,7 +137,9 @@ endforeach()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set_target_properties(aclshmem_symmetric_memory_kernel PROPERTIES
-            INSTALL_RPATH $ORIGIN:$ORIGIN/shmem
+            BUILD_WITH_INSTALL_RPATH TRUE
+            BUILD_RPATH "$ORIGIN:$ORIGIN/shmem"
+            INSTALL_RPATH "$ORIGIN:$ORIGIN/shmem"
             )
     install(FILES ${CMAKE_BINARY_DIR}/libaclshmem_symmetric_memory_kernel.so DESTINATION lib)
     file(GLOB SHMEM_SO_FILES "${SHMEM_HOME_PATH}/shmem/lib/*")

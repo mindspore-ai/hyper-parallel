@@ -16,6 +16,7 @@
 
 import os
 from logging import getLogger
+from pathlib import Path
 import torch
 import torch.distributed as dist
 from hyper_parallel.platform import get_platform
@@ -26,13 +27,39 @@ _is_shmem_available = False
 
 _manager = None
 _ops = None
-current_dir = os.path.dirname(os.path.abspath(__file__))
-file_path = os.path.join(current_dir, 'libaclshmem_torch.so')
-if os.path.exists(file_path):
+
+
+def _require_library() -> Path:
+    """Locate the installed or source-build Torch symmetric-memory adapter."""
+    module_path = Path(__file__).resolve()
+    package_root = module_path.parents[3]
+    relative_path = Path("core/symmetric_memory/lib/framework/torch/libaclshmem_torch.so")
+    candidates = [package_root / relative_path]
+    repository_root = module_path.parents[4]
+    if (repository_root / "setup.py").is_file():
+        candidates.insert(0, repository_root / "build/native/payload/hyper_parallel" / relative_path)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    searched = ", ".join(str(path) for path in candidates)
+    raise ImportError(
+        "[HP-NATIVE-PAYLOAD-MISSING] component=symmetric_memory framework=torch "
+        f"searched={searched}. The current wheel does not include this optional component, or the local build failed; "
+        "inspect the build log and run ./build.sh --shmem torch for source/PYTHONPATH development."
+    )
+
+
+file_path = str(_require_library())
+try:
     torch.ops.load_library(file_path)
     _manager = torch.classes.SymmetricMemory.Manager()
     _ops = torch.classes.SymmetricMemory.Ops()
     _is_shmem_available = True
+except (OSError, RuntimeError) as error:
+    raise ImportError(
+        "[HP-NATIVE-LOAD-FAILED] component=symmetric_memory framework=torch "
+        f"library={file_path} error={error}. Check the Python/Torch/torch_npu/CANN version combination and build log."
+    ) from error
 
 
 class TorchSymmetricMemoryHandler:
@@ -87,23 +114,23 @@ class TorchSymmetricMemoryHandler:
 
     @staticmethod
     def rendezvous(tensor, group):
-        """Allocate symmetric memory across ranks; not needed in CANN SHMEM v1.0.0."""
-        raise NotImplementedError("In CANN SHMEM v1.0.0, rendezvous is not needed, "
+        """Allocate symmetric memory across ranks; not needed in CANN SHMEM v1.6.0."""
+        raise NotImplementedError("In CANN SHMEM v1.6.0, rendezvous is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "so this function is not implemented. ")
 
     @staticmethod
     def set_signal_pad_size(size: int) -> None:
-        """Set the signal pad size; not implemented for CANN SHMEM v1.0.0."""
-        raise NotImplementedError("In CANN SHMEM v1.0.0, set_signal_pad_size is not needed, "
+        """Set the signal pad size; not implemented for CANN SHMEM v1.6.0."""
+        raise NotImplementedError("In CANN SHMEM v1.6.0, set_signal_pad_size is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "you can create symmetric signal memory by empty() "
                                   "so this function is not implemented. ")
 
     @staticmethod
     def get_signal_pad_size() -> int:
-        """Return the signal pad size; not implemented for CANN SHMEM v1.0.0."""
-        raise NotImplementedError("In CANN SHMEM v1.0.0, get_signal_pad_size is not needed, "
+        """Return the signal pad size; not implemented for CANN SHMEM v1.6.0."""
+        raise NotImplementedError("In CANN SHMEM v1.6.0, get_signal_pad_size is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "you can create symmetric signal memory by empty() "
                                   "so this function is not implemented. ")

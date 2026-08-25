@@ -18,16 +18,6 @@
 class MSMulticoreHandler:
     """MindSpore platform handler for MoE-FFN multicore operators."""
 
-    def __init__(self):
-        # Eagerly import platform/mindspore/__init__.py so that its module-level
-        # code runs now (sets ASCEND_CUSTOM_OPP_PATH, preloads ctypes libs, adds
-        # build/lib to sys.path).  This MUST happen before any `import mindspore`
-        # elsewhere in the process; deferring to the first moe_fwd/bwd call
-        # is too late when symmetric_memory or other modules import mindspore first.
-        # Note: platform/mindspore/__init__.py itself does NOT import mindspore at
-        # module level, so this import is safe to call early.
-        import hyper_parallel.core.multicore.platform.mindspore  # noqa: F401  # pylint: disable=C0415,W0611
-
     @staticmethod
     def mega_moe(
         dispatch_target, dispatch_target_off,

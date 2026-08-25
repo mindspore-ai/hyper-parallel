@@ -61,16 +61,28 @@ git push upstream vX.Y.Z
 ### 5. 构建 Wheel
 
 ```bash
-# MindSpore 后端
-python setup.py bdist_wheel
+# 外部构建工程先选择 CANN 环境；统一入口完成依赖准备、native 编译和 wheel 打包
+source /usr/local/Ascend/cann/set_env.sh
+./build.sh --multicore all --shmem all --custom-ops on \
+  --soc-list ascend910b,ascend910_93 --strict off
 
-# PyTorch + MindSpore 后端
-BUILD_TORCH_EXTENSION=true python setup.py bdist_wheel
-
-# Wheel 文件名格式：hyper_parallel-X.Y.Z+{python_tag}-{arch_tag}.whl
+# 每个 Python ABI/host 架构一个 wheel，例如：
+# hyper_parallel-0.1.0-cp310-cp310-linux_aarch64.whl
 ```
 
+optional native 组件失败时仍保留 wheel，并在 build log 中记录稳定 reason code。native 能力缺失由
+Level 0 MegaMoe ST 和全量用例拦截。正式发布由版本指定的 glibc 基线构建、全量用例和人工评审共同决定，
+wheel 文件已生成不代表制品满足发布条件。native 制品的构建与运行基线为 CANN 9.1.0。
+
 ### 6. 发布后验证
+
+HyperMegaMoe/multicore ST 必须在启动 pytest、MindSpore、Torch 或分布式 worker 前完成环境激活：
+
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+source "$(command -v hyper_parallel_multicore_set_env.bash)"
+pytest tests/mindspore/st/multicore/test_moe.py
+```
 
 - [ ] README 中英文版本章节一致、代码示例可运行
 - [ ] 用户手册安装步骤在空环境可复现、特性文档代码示例与 examples/ 一致
@@ -78,6 +90,9 @@ BUILD_TORCH_EXTENSION=true python setup.py bdist_wheel
 - [ ] Release Notes 变更分类准确、贡献者名单完整
 - [ ] 所有文档 markdown lint 通过
 - [ ] 交叉引用链接正确、术语一致
+- [ ] wheel/PYTHONPATH 均先 source 制品内 `set_env.bash`，四种框架 import 顺序和 clean-venv smoke 通过
+- [ ] 未 source 时稳定报 `HP-NATIVE-OPP-NOT-ACTIVATED`，框架已先导入时稳定报 `HP-NATIVE-OPP-ACTIVATION-TOO-LATE`
+- [ ] 目标 glibc 基线门禁验证通过；910B/910C 支持矩阵验证通过，不支持的 SoC 返回明确 reason code
 
 ## 版本历史
 

@@ -19,7 +19,7 @@
 //
 // Uses AclnnOpRunner + LAUNCH_ACLNN_FUNC so that GetWorkspaceSize, executor
 // caching, and workspace allocation are handled transparently by the MindSpore
-// framework.  The function name "aclnnMegaMoe" is resolved at runtime
+// framework.  The function name "aclnnHyperMegaMoe" is resolved at runtime
 // from the loaded libcust_opapi.so — no compile-time declaration is needed.
 //
 // This op is INPLACE with 5 declared returns:
@@ -93,10 +93,10 @@ std::vector<ms::Tensor> npu_mega_moe(
   MS_EXCEPTION_IF_NULL(runner);
   // LAUNCH_ACLNN_FUNC captures all args via Arg() helpers (ms::Tensor →
   // TensorPtr, scalars pass through), then LAUNCH_ACLNN internally:
-  //   1. calls aclnnMegaMoeGetWorkspaceSize (via dynamic lookup + cache)
+  //   1. calls aclnnHyperMegaMoeGetWorkspaceSize (via dynamic lookup + cache)
   //   2. allocates workspace through MindSpore's device memory manager
-  //   3. dispatches aclnnMegaMoe asynchronously on the current stream
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMegaMoe,
+  //   3. dispatches aclnnHyperMegaMoe asynchronously on the current stream
+  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnHyperMegaMoe,
       dispatch_target, dispatch_target_off,
       dispatch_src, dispatch_src_off, dispatch_size,
       up_proj_weight, up_proj_glist,

@@ -1,7 +1,7 @@
 hyper-parallel/hyper_parallel/core/fully_shard/api.py:_check_hsdp_input_valid
 hyper-parallel/hyper_parallel/core/hsdp/api.py:hsdp
-hyper-parallel/hyper_parallel/core/multicore/ops/mega_moe/op_host/mega_moe_def.cpp:ops::MegaMoe::MegaMoe
-hyper-parallel/hyper_parallel/core/multicore/ops/mega_moe_grad/op_host/mega_moe_grad_def.cpp:ops::MegaMoeGrad::MegaMoeGrad
+hyper-parallel/hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp:ops::HyperMegaMoe::HyperMegaMoe
+hyper-parallel/hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_def.cpp:ops::HyperMegaMoeGrad::HyperMegaMoeGrad
 hyper-parallel/hyper_parallel/integration/llamafactory/context_parallel/models/qwen3_vl/qwen3vl_forward.py:forward
 hyper-parallel/hyper_parallel/core/context_parallel/linear_attention_context_parallel.py:forward
 hyper-parallel/hyper_parallel/core/context_parallel/linear_attention_context_parallel.py:backward

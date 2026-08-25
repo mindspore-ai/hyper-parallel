@@ -18,12 +18,6 @@
 class TorchMulticoreHandler:
     """PyTorch platform handler for MoE-FFN multicore operators."""
 
-    def __init__(self):
-        # Eagerly import platform/torch/__init__.py so that its module-level code
-        # runs now (sets ASCEND_CUSTOM_OPP_PATH, preloads ctypes libs).
-        # Must happen before torch_npu is imported anywhere else in the process.
-        import hyper_parallel.core.multicore.platform.torch  # noqa: F401  # pylint: disable=C0415,W0611
-
     @staticmethod
     def mega_moe(
         dispatch_target, dispatch_target_off,
