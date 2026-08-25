@@ -994,18 +994,22 @@ class MindSporePlatform(Platform):
         return ms.manual_seed(seed)
 
     @staticmethod
-    def ones(size, dtype=None):
+    def ones(size, dtype=None, device=None):
         """
         Create a tensor filled with ones.
 
         Args:
             size (tuple): The shape of the output tensor.
             dtype (Optional[ms.Type]): The desired data type.
+            device (Optional[ms.device]): The device to create the tensor on.
 
         Returns:
             Tensor: A tensor filled with ones.
         """
-        return mint.ones(size, dtype=dtype)
+        tensor = mint.ones(size, dtype=dtype)
+        if device in ("GPU", "Ascend"):
+            return tensor.to(device)
+        return tensor
 
     @staticmethod
     def zeros(size, dtype=None, device=None):

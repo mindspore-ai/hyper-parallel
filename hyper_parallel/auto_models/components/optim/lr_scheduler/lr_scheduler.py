@@ -14,9 +14,15 @@
 # ============================================================================
 """YAML-callable learning-rate scheduler factories."""
 
+from functools import partial
 from typing import Any
 
-from hyper_parallel.core.optimizer import get_hyper_lr_scheduler
+from hyper_parallel.core.optimizer.lr_scheduler import (
+    LRSchedulersContainer,
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+)
 
 
 class MultiLRScheduler:
@@ -44,37 +50,50 @@ class MultiLRScheduler:
         self.lr_decay_style = lr_decay_style
         self.train_iters = train_iters
 
-        lr_warmup_ratio = self.config.get('lr_warmup_ratio', 0.0)
-        lr_warmup_steps = self.config.get('lr_warmup_steps')
+        lr_start = self.config.get("lr_start", 0.0)
+        init_lr = self.config.get("lr", 1e-3)
+        min_lr = self.config.get("min_lr", self.config.get("lr_min", 1e-7))
+
+        lr_warmup_ratio = self.config.get("lr_warmup_ratio", 0.0)
+        lr_warmup_steps = self.config.get("lr_warmup_steps")
         if lr_warmup_steps is None:
             lr_warmup_steps = int(train_iters * lr_warmup_ratio)
-        lr_start = self.config.get('lr_start', 0.0)
-        lr_decay_ratio = self.config.get('lr_decay_ratio', 1.0)
-        min_lr = self.config.get('min_lr', self.config.get('lr_min', 1e-7))
-        initial_lrs = {
-            float(param_group.get("initial_lr", param_group["lr"]))
-            for child_optimizer in self.optimizer.optimizers_dict.values()
-            for param_group in child_optimizer.param_groups
-        }
-        if not initial_lrs:
-            raise ValueError("MultiLRScheduler requires at least one optimizer parameter group")
-        if len(initial_lrs) != 1:
+        lr_decay_ratio = self.config.get("lr_decay_ratio", 1.0)
+
+        if self.lr_decay_style == "constant":
+            lr_scheduler = partial(
+                get_constant_schedule_with_warmup,
+                num_warmup_steps=lr_warmup_steps,
+                init_lr=init_lr,
+                lr_start=lr_start,
+            )
+        elif self.lr_decay_style == "linear":
+            lr_scheduler = partial(
+                get_linear_schedule_with_warmup,
+                num_warmup_steps=lr_warmup_steps,
+                num_training_steps=train_iters,
+                init_lr=init_lr,
+                min_lr=min_lr,
+                lr_start=lr_start,
+            )
+        elif self.lr_decay_style == "cosine":
+            lr_scheduler = partial(
+                get_cosine_schedule_with_warmup,
+                num_warmup_steps=lr_warmup_steps,
+                num_training_steps=train_iters,
+                init_lr=init_lr,
+                lr_decay_ratio=lr_decay_ratio,
+                min_lr=min_lr,
+                lr_start=lr_start,
+            )
+        else:
             raise ValueError(
-                "MultiLRScheduler on master requires one shared initial learning rate; "
-                f"got {sorted(initial_lrs)}. Per-optimizer absolute minimum learning rates "
-                "must be migrated separately."
+                f"Unsupported lr_decay_style {self.lr_decay_style!r}; expected 'constant', 'linear' or 'cosine'"
             )
 
-        self.lr_scheduler = get_hyper_lr_scheduler(
-            optimizer=self.optimizer,
-            total_steps=train_iters,
-            warmup_steps=lr_warmup_steps,
-            warmup_ratio=lr_warmup_ratio,
-            decay_style=self.lr_decay_style,
-            lr=initial_lrs.pop(),
-            lr_min=min_lr,
-            lr_start=lr_start,
-            lr_decay_ratio=lr_decay_ratio,
+        self.lr_scheduler = LRSchedulersContainer(
+            optimizers=self.optimizer,
+            scheduler=lr_scheduler,
         )
 
     def get_lr_scheduler(self) -> Any:

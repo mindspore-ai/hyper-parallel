@@ -362,6 +362,9 @@ if __name__ == '__main__':
             'hyper_parallel.core.multicore.platform.torch': [
                 '*.so',
             ],
+            'hyper_parallel.auto_models.components.datasets.llm': [
+                '*.so',
+            ],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
                 'configs_eval/default.yaml',
             ],
