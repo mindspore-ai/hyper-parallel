@@ -386,7 +386,9 @@ def _resolve_parameter_source_meshes(plan, mesh_context, full_mesh, tp_mesh):
     return expert_mesh, dense_source_mesh, expert_source_mesh
 
 
-def _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode):
+def _shard_planned_parameters(
+    models, plan, mesh, expert_mesh, tp_mesh, validate_mode,
+):
     """Shard dense and expert parameters, then update local attention metadata."""
     for model in models:
         for module_fqn, spec in plan.modules.items():
@@ -438,7 +440,7 @@ def _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode):
                 # TODO(liuluobin): 集成到maybe_update_head_counts里
                 head_count_owner = getattr(spec, "_head_count_owner", None)
                 if head_count_owner is not None:
-                    owner = _resolve_module(part, head_count_owner)
+                    owner = _resolve_module(model, head_count_owner)
                     update_module_head_counts(
                         owner, tp_mesh.size() if tp_mesh is not None else 1,
                         head_count_owner)
@@ -545,7 +547,9 @@ def apply_sharding_plan(
         _normalize_out_fields(spec)
 
     # ====== Phase A: parameter sharding ======
-    _shard_planned_parameters(models, plan, mesh, expert_mesh, validate_mode)
+    _shard_planned_parameters(
+        models, plan, mesh, expert_mesh, tp_mesh, validate_mode,
+    )
 
     # ====== Phase B: special handlers ======
     _apply_plan_special_handlers(models, plan, mesh)

@@ -77,6 +77,10 @@ from hyper_parallel.auto_models.components.distributed.openpangu_dsa_template im
     OPENPANGU_DSA_ARCHITECTURES,
     build_openpangu_dsa_specs,
 )
+from hyper_parallel.auto_models.components.distributed.openpangu_mhc_template import (
+    OPENPANGU_MHC_ARCHITECTURES,
+    build_openpangu_mhc_specs,
+)
 from hyper_parallel.auto_models.components.distributed.pipelining import (
     AutoPipeline,
     _instantiate_pipeline,
@@ -123,6 +127,7 @@ __all__ = [
     "ModuleShardingSpec",
     "NamedPlacement",
     "OPENPANGU_DSA_ARCHITECTURES",
+    "OPENPANGU_MHC_ARCHITECTURES",
     "ParameterClassifier",
     "ParamRole",
     "PlacementMismatchError",
@@ -138,6 +143,7 @@ __all__ = [
     "build_expert_mesh",
     "build_source_shard_info",
     "build_openpangu_dsa_specs",
+    "build_openpangu_mhc_specs",
     "check_dispatchable",
     "deepseekv3_ep_compute_fn",
     "mixtral_ep_compute_fn",
