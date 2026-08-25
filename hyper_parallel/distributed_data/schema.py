@@ -120,6 +120,50 @@ class SampleMeta:
 
 
 @dataclass(frozen=True)
+class TensorSampleSpec:
+    """Internal tensor layout metadata synchronized with online planning metadata."""
+
+    shape: tuple[int, ...]
+    dtype: str
+    numel: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.shape, tuple) or any(
+            not isinstance(size, int) or isinstance(size, bool) or size < 0
+            for size in self.shape
+        ):
+            raise ValueError(f"TensorSampleSpec.shape must contain non-negative integers, but got {self.shape!r}.")
+        if not isinstance(self.dtype, str) or not self.dtype:
+            raise ValueError(f"TensorSampleSpec.dtype must be a non-empty string, but got {self.dtype!r}.")
+        expected_numel = math.prod(self.shape)
+        if (
+            not isinstance(self.numel, int)
+            or isinstance(self.numel, bool)
+            or self.numel != expected_numel
+        ):
+            raise ValueError(
+                f"TensorSampleSpec.numel must equal shape product {expected_numel}, but got {self.numel!r}."
+            )
+
+
+@dataclass(frozen=True)
+class OnlineSampleMetadata:
+    """Internal online planning metadata with an optional tensor transport descriptor."""
+
+    sample_meta: SampleMeta
+    tensor_spec: TensorSampleSpec | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sample_meta, SampleMeta):
+            raise ValueError(f"OnlineSampleMetadata.sample_meta must be SampleMeta, but got {type(self.sample_meta)}.")
+        if self.tensor_spec is not None and not isinstance(self.tensor_spec, TensorSampleSpec):
+            raise ValueError(
+                "OnlineSampleMetadata.tensor_spec must be TensorSampleSpec or None, "
+                f"but got {type(self.tensor_spec)}."
+            )
+
+
+@dataclass(frozen=True)
 class TensorShardSpec:
     """Describe one tensor field that context parallelism shards.
 

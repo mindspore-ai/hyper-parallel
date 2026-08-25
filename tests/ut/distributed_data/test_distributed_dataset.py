@@ -36,7 +36,7 @@ from hyper_parallel.distributed_data.fetcher import (
     StridedOnlineSampleSource,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
-from hyper_parallel.distributed_data.schema import BatchPlan, SampleMeta, WorkloadCost
+from hyper_parallel.distributed_data.schema import BatchPlan, OnlineSampleMetadata, SampleMeta, WorkloadCost
 from hyper_parallel.distributed_data.topology import DataTopology
 
 
@@ -287,20 +287,25 @@ class _PeerMetadataSynchronizer:
 
     def gather(
         self,
-        local_metadata: Sequence[SampleMeta],
+        local_metadata: Sequence[SampleMeta | OnlineSampleMetadata],
         data_owner_ranks: tuple[int, ...],
-    ) -> tuple[SampleMeta, ...]:
+    ) -> tuple[SampleMeta | OnlineSampleMetadata, ...]:
         """Return local metadata followed by a synthetic peer contribution."""
         if data_owner_ranks != (0, 1):
             raise ValueError(f"Unexpected owners {data_owner_ranks}.")
-        peer_metadata = tuple(
-            SampleMeta(
-                sample_id=metadata.sample_id + 4,
-                cost_hint=WorkloadCost(encoder=metadata.cost_hint.encoder + 0.5),
+        peer_metadata = []
+        for metadata in local_metadata:
+            sample_meta = metadata.sample_meta if isinstance(metadata, OnlineSampleMetadata) else metadata
+            peer_sample_meta = SampleMeta(
+                sample_id=sample_meta.sample_id + 4,
+                cost_hint=WorkloadCost(encoder=sample_meta.cost_hint.encoder + 0.5),
             )
-            for metadata in local_metadata
-        )
-        return tuple(local_metadata) + peer_metadata
+            peer_metadata.append(
+                OnlineSampleMetadata(peer_sample_meta, metadata.tensor_spec)
+                if isinstance(metadata, OnlineSampleMetadata)
+                else peer_sample_meta
+            )
+        return tuple(local_metadata) + tuple(peer_metadata)
 
 
 class _RecordingFetcher:
@@ -369,13 +374,21 @@ class _SyntheticSampleRedistributor:
         self.plans: list[BatchPlan] = []
         self.thread_names: list[str] = []
 
+    @staticmethod
+    def describe_sample(sample: Any) -> None:
+        """Return no tensor descriptor for synthetic string samples."""
+        del sample
+
     def redistribute(
         self,
         local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
+        global_metadata: Sequence[OnlineSampleMetadata],
     ) -> dict[int, Any]:
         """Return samples planned for data rank zero."""
+        if len(global_metadata) != len(plan.samples):
+            raise ValueError("Synthetic redistribution received incomplete global metadata.")
         self.thread_names.append(threading.current_thread().name)
         local_samples = tuple(local_samples)
         self.local_sample_batches.append(local_samples)
@@ -489,9 +502,9 @@ class _BlockingMetadataSynchronizer(_PeerMetadataSynchronizer):
 
     def gather(
         self,
-        local_metadata: Sequence[SampleMeta],
+        local_metadata: Sequence[SampleMeta | OnlineSampleMetadata],
         data_owner_ranks: tuple[int, ...],
-    ) -> tuple[SampleMeta, ...]:
+    ) -> tuple[SampleMeta | OnlineSampleMetadata, ...]:
         """Block the selected gather before returning deterministic peer metadata."""
         call_index = self._calls
         self._calls += 1

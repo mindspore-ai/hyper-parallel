@@ -32,7 +32,13 @@ from hyper_parallel.distributed_data.distributor import (
     shard_micro_batch,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
-from hyper_parallel.distributed_data.schema import SampleMeta, TensorShardSpec, WorkloadCost
+from hyper_parallel.distributed_data.schema import (
+    OnlineSampleMetadata,
+    SampleMeta,
+    TensorSampleSpec,
+    TensorShardSpec,
+    WorkloadCost,
+)
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.platform.platform import PlatformType
 
@@ -65,7 +71,7 @@ class _FakeTensor:
         del device, non_blocking
         return self
 
-    def __getitem__(self, index: int) -> "_FakeTensor":
+    def __getitem__(self, index: int | slice) -> "_FakeTensor":
         """Return one leading-dimension slice."""
         return _FakeTensor(self.array[index], self.dtype)
 
@@ -103,6 +109,7 @@ class _FakePlatform:
         self.variable_splits: tuple[list[int], list[int]] | None = None
         self.works: list[_FakeWork] = []
         self.broadcast_count = 0
+        self.all_gather_count = 0
 
     @staticmethod
     def is_tensor(value: Any) -> bool:
@@ -152,6 +159,7 @@ class _FakePlatform:
     def all_gather_object(self, output: list[Any], value: Any, group: Any) -> None:
         """Populate an object-gather output list."""
         del group
+        self.all_gather_count += 1
         contributions = self.gathered_objects or tuple(value for _ in output)
         output[:] = contributions
 
@@ -226,6 +234,29 @@ class TestMicroBatchSharding(unittest.TestCase):
 
         self.assertEqual([metadata.sample_id for metadata in result], ["three", "nine"])
 
+    def test_metadata_all_gather_carries_online_tensor_specs(self) -> None:
+        """Tensor transport descriptors should reuse the existing metadata collective."""
+        owner_three = OnlineSampleMetadata(
+            SampleMeta(sample_id="three"),
+            TensorSampleSpec((3,), "float32", 3),
+        )
+        owner_nine = OnlineSampleMetadata(
+            SampleMeta(sample_id="nine"),
+            TensorSampleSpec((2,), "float32", 2),
+        )
+        fake_platform = _FakePlatform(
+            group_ranks=(9, 3),
+            gathered_objects=((owner_nine,), (owner_three,)),
+        )
+
+        with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
+            synchronizer = TorchMetadataAllGather(group="metadata")
+            result = synchronizer.gather((owner_nine,), data_owner_ranks=(3, 9))
+
+        self.assertEqual([metadata.sample_meta.sample_id for metadata in result], ["three", "nine"])
+        self.assertEqual([metadata.tensor_spec.shape for metadata in result], [(3,), (2,)])
+        self.assertEqual(fake_platform.all_gather_count, 1)
+
     @staticmethod
     def _cross_owner_plan() -> tuple[Any, DataTopology]:
         """Build a two-owner plan in which both samples change owner."""
@@ -253,6 +284,18 @@ class TestMicroBatchSharding(unittest.TestCase):
         )
         return plan, topology
 
+    @staticmethod
+    def _online_tensor_metadata(
+        plan: Any,
+        tensor_specs: tuple[TensorSampleSpec, ...],
+    ) -> tuple[OnlineSampleMetadata, ...]:
+        """Build transport metadata in global source-position order."""
+        planned_by_position = {sample.source_position: sample for sample in plan.samples}
+        return tuple(
+            OnlineSampleMetadata(planned_by_position[position].meta, tensor_spec)
+            for position, tensor_spec in enumerate(tensor_specs)
+        )
+
     def test_packed_bytes_a2a_exchanges_nested_raw_payloads(self) -> None:
         """Packed-byte A2A should preserve nested JPEG/text records without object P2P."""
         plan, topology = self._cross_owner_plan()
@@ -270,6 +313,7 @@ class TestMicroBatchSharding(unittest.TestCase):
                 ({"image": b"local-jpeg", "text": "local"},),
                 plan,
                 topology,
+                (),
             )
 
         self.assertEqual(result, {1: peer_payload})
@@ -281,14 +325,106 @@ class TestMicroBatchSharding(unittest.TestCase):
         plan, topology = self._cross_owner_plan()
         peer_tensor = _FakeTensor([[9.0, 10.0]])
         fake_platform = _FakePlatform(group_ranks=(1, 0), variable_output=peer_tensor)
+        global_metadata = self._online_tensor_metadata(
+            plan,
+            (
+                TensorSampleSpec((2,), "float32", 2),
+                TensorSampleSpec((2,), "float32", 2),
+            ),
+        )
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
             redistributor = TorchTensorRedistributor(group="metadata")
-            result = redistributor.redistribute((_FakeTensor([1.0, 2.0]),), plan, topology)
+            result = redistributor.redistribute(
+                (_FakeTensor([1.0, 2.0]),),
+                plan,
+                topology,
+                global_metadata,
+            )
 
         self.assertEqual(result[1].values, (9.0, 10.0))
         self.assertEqual(fake_platform.variable_splits, ([1, 0], [1, 0]))
+        self.assertEqual(fake_platform.all_gather_count, 0)
         self.assertTrue(all(work.waited for work in fake_platform.works))
+
+    def test_direct_tensor_a2a_flattens_variable_shapes_from_global_metadata(self) -> None:
+        """Variable tensor shapes should use element splits and reconstruct the target shape."""
+        plan, topology = self._cross_owner_plan()
+        fake_platform = _FakePlatform(
+            group_ranks=(1, 0),
+            variable_output=_FakeTensor([9.0, 10.0, 11.0]),
+        )
+        global_metadata = self._online_tensor_metadata(
+            plan,
+            (
+                TensorSampleSpec((2,), "float32", 2),
+                TensorSampleSpec((3,), "float32", 3),
+            ),
+        )
+
+        with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
+            redistributor = TorchTensorRedistributor(group="metadata")
+            result = redistributor.redistribute(
+                (_FakeTensor([1.0, 2.0]),),
+                plan,
+                topology,
+                global_metadata,
+            )
+
+        self.assertEqual(result[1].shape, (3,))
+        self.assertEqual(result[1].values, (9.0, 10.0, 11.0))
+        self.assertEqual(fake_platform.variable_splits, ([2, 0], [3, 0]))
+        self.assertEqual(fake_platform.all_gather_count, 0)
+        self.assertTrue(all(work.waited for work in fake_platform.works))
+
+    def test_direct_tensor_a2a_rejects_mixed_global_dtypes_before_collective(self) -> None:
+        """One A2AV buffer cannot represent multiple element dtypes."""
+        plan, topology = self._cross_owner_plan()
+        fake_platform = _FakePlatform(group_ranks=(1, 0))
+        global_metadata = self._online_tensor_metadata(
+            plan,
+            (
+                TensorSampleSpec((2,), "float32", 2),
+                TensorSampleSpec((3,), "float16", 3),
+            ),
+        )
+
+        with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
+            redistributor = TorchTensorRedistributor(group="metadata")
+            with self.assertRaisesRegex(ValueError, "one dtype"):
+                redistributor.redistribute(
+                    (_FakeTensor([1.0, 2.0]),),
+                    plan,
+                    topology,
+                    global_metadata,
+                )
+
+        self.assertIsNone(fake_platform.variable_splits)
+
+    def test_direct_tensor_a2a_rejects_missing_tensor_descriptor_before_collective(self) -> None:
+        """A non-tensor sample marker should fail consistently after metadata synchronization."""
+        plan, topology = self._cross_owner_plan()
+        fake_platform = _FakePlatform(group_ranks=(1, 0))
+        planned_by_position = {sample.source_position: sample for sample in plan.samples}
+        global_metadata = (
+            OnlineSampleMetadata(planned_by_position[0].meta),
+            OnlineSampleMetadata(
+                planned_by_position[1].meta,
+                TensorSampleSpec((3,), "float32", 3),
+            ),
+        )
+
+        with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
+            redistributor = TorchTensorRedistributor(group="metadata")
+            with self.assertRaisesRegex(ValueError, "missing tensor metadata"):
+                redistributor.redistribute(
+                    (_FakeTensor([1.0, 2.0]),),
+                    plan,
+                    topology,
+                    global_metadata,
+                )
+
+        self.assertIsNone(fake_platform.variable_splits)
 
     def test_owner_broadcasts_tensor_micro_batch_without_object_serializing_storage(self) -> None:
         """Microbatch structure uses object gather while tensor storage uses broadcast."""

@@ -36,7 +36,12 @@ from hyper_parallel.distributed_data.fetcher import (
     _pin_memory_batch,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
-from hyper_parallel.distributed_data.schema import BatchPlan, DistributedDataStep, RankMicroBatch
+from hyper_parallel.distributed_data.schema import (
+    BatchPlan,
+    DistributedDataStep,
+    OnlineSampleMetadata,
+    RankMicroBatch,
+)
 from hyper_parallel.distributed_data.state import DatasetStateTracker
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.platform import get_platform
@@ -455,8 +460,17 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             raise ValueError("Online metadata requires a sample redistributor.")
         if not isinstance(owner_input, tuple) or any(not isinstance(sample, LoadedSample) for sample in owner_input):
             raise ValueError("Online microbatch preparation returned invalid loaded samples.")
-        local_metadata = tuple(sample.metadata for sample in owner_input)
-        candidates = self._metadata_synchronizer.gather(local_metadata, self._topology.data_owner_ranks)
+        local_metadata = tuple(
+            OnlineSampleMetadata(
+                sample_meta=sample.metadata,
+                tensor_spec=self._sample_redistributor.describe_sample(sample.data),
+            )
+            for sample in owner_input
+        )
+        global_metadata = self._metadata_synchronizer.gather(local_metadata, self._topology.data_owner_ranks)
+        if any(not isinstance(metadata, OnlineSampleMetadata) for metadata in global_metadata):
+            raise ValueError("Online metadata synchronization returned invalid sample transport metadata.")
+        candidates = tuple(metadata.sample_meta for metadata in global_metadata)
         cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
         plan = self._planner.plan_microbatch(
             candidates,
@@ -468,6 +482,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             tuple(sample.data for sample in owner_input),
             plan,
             self._topology,
+            global_metadata,
         )
         planned_samples = plan.samples_for(self._topology.data_rank, micro_batch_index)
         samples = [samples_by_position[sample.source_position] for sample in planned_samples]

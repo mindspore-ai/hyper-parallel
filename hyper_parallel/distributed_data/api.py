@@ -94,12 +94,12 @@ class DistributedDatasetConfig:
     """Configuration for global-step planning and bounded prefetch.
 
     ``packed_bytes_a2a`` accepts nested byte records and JSON scalar values.
-    ``direct_tensor_a2a`` requires every owner sample to be one tensor with a
-    globally identical shape and dtype. ``prefetch_steps`` bounds lightweight
-    step-plan look-ahead. ``double_buffer`` keeps exactly one fully prepared
-    microbatch ahead, including online metadata collectives and sample
-    distribution. One prefetched step enables overlap within an optimizer
-    step; two or more also enable overlap across optimizer-step boundaries.
+    ``direct_tensor_a2a`` requires every owner sample to be one tensor and one
+    dtype per global microbatch; tensor shapes may vary. ``prefetch_steps``
+    bounds lightweight step-plan look-ahead. ``double_buffer`` keeps exactly
+    one fully prepared microbatch ahead, including online metadata collectives
+    and sample distribution. One prefetched step enables overlap within an
+    optimizer step; two or more also enable overlap across optimizer-step boundaries.
     ``pin_memory``, ``num_workers``, and ``prefetch_factor`` configure the
     native PyTorch DataLoader used for owner-local reads. Online candidates are
     pinned only after planning and redistribution. Distributed collectives

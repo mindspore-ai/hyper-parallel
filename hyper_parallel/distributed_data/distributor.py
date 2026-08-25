@@ -17,17 +17,26 @@
 from __future__ import annotations
 
 import json
+import math
 import struct
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol, Sequence, TypeVar
 
 import numpy as np
 
-from hyper_parallel.distributed_data.schema import BatchPlan, SampleMeta, TensorShardSpec
+from hyper_parallel.distributed_data.schema import (
+    BatchPlan,
+    OnlineSampleMetadata,
+    SampleMeta,
+    TensorSampleSpec,
+    TensorShardSpec,
+)
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 
 platform = get_platform()
+
+MetadataValue = TypeVar("MetadataValue", SampleMeta, OnlineSampleMetadata)
 
 
 class MetadataSynchronizer(Protocol):
@@ -35,9 +44,9 @@ class MetadataSynchronizer(Protocol):
 
     def gather(
         self,
-        local_metadata: Sequence[SampleMeta],
+        local_metadata: Sequence[MetadataValue],
         data_owner_ranks: tuple[int, ...],
-    ) -> tuple[SampleMeta, ...]:
+    ) -> tuple[MetadataValue, ...]:
         """Gather candidates in deterministic data-owner order."""
 
 
@@ -56,11 +65,15 @@ class MicroBatchDistributor(Protocol):
 class SampleRedistributor(Protocol):
     """Move owner-loaded raw samples to their planned DP data ranks."""
 
+    def describe_sample(self, sample: Any) -> TensorSampleSpec | None:
+        """Return metadata needed to transport one online sample."""
+
     def redistribute(
         self,
         local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
+        global_metadata: Sequence[OnlineSampleMetadata],
     ) -> dict[int, Any]:
         """Return local target samples keyed by global source position."""
 
@@ -70,9 +83,9 @@ class LocalMetadataSynchronizer:
 
     def gather(
         self,
-        local_metadata: Sequence[SampleMeta],
+        local_metadata: Sequence[MetadataValue],
         data_owner_ranks: tuple[int, ...],
-    ) -> tuple[SampleMeta, ...]:
+    ) -> tuple[MetadataValue, ...]:
         """Return local candidates unchanged."""
         if len(data_owner_ranks) != 1:
             raise ValueError(f"Local metadata synchronization requires one owner, but got {data_owner_ranks}.")
@@ -82,13 +95,20 @@ class LocalMetadataSynchronizer:
 class LocalSampleRedistributor:
     """Keep online raw samples local when there is one DP data owner."""
 
+    @staticmethod
+    def describe_sample(sample: Any) -> TensorSampleSpec | None:
+        """Return no transport descriptor because local samples do not communicate."""
+        del sample
+
     def redistribute(
         self,
         local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
+        global_metadata: Sequence[OnlineSampleMetadata],
     ) -> dict[int, Any]:
         """Return the single owner's raw samples without communication."""
+        del global_metadata
         outgoing, _ = _build_sample_routes(local_samples, plan, topology)
         if len(outgoing) != 1:
             raise ValueError("Local sample redistribution requires one data rank.")
@@ -96,10 +116,10 @@ class LocalSampleRedistributor:
 
 
 class TorchMetadataAllGather:
-    """PyTorch object all-gather for lightweight ``SampleMeta`` candidates.
+    """PyTorch object all-gather for lightweight sample metadata candidates.
 
-    This exchanges metadata only. Pixel data and model-input tensors never
-    pass through the object collective.
+    Online tensor shape descriptors share this collective with planner
+    metadata. Pixel data and model-input tensor storage never pass through it.
     """
 
     def __init__(self, group: Any) -> None:
@@ -110,9 +130,9 @@ class TorchMetadataAllGather:
 
     def gather(
         self,
-        local_metadata: Sequence[SampleMeta],
+        local_metadata: Sequence[MetadataValue],
         data_owner_ranks: tuple[int, ...],
-    ) -> tuple[SampleMeta, ...]:
+    ) -> tuple[MetadataValue, ...]:
         """All-gather metadata and concatenate it in ``data_owner_ranks`` order."""
         group_ranks = tuple(platform.get_process_group_ranks(self._group))
         if set(group_ranks) != set(data_owner_ranks):
@@ -124,9 +144,10 @@ class TorchMetadataAllGather:
         for data_owner_rank in data_owner_ranks:
             contribution = by_global_rank[data_owner_rank]
             if not isinstance(contribution, tuple) or any(
-                not isinstance(metadata, SampleMeta) for metadata in contribution
+                not isinstance(metadata, (SampleMeta, OnlineSampleMetadata))
+                for metadata in contribution
             ):
-                raise ValueError(f"Rank {data_owner_rank} contributed invalid SampleMeta data.")
+                raise ValueError(f"Rank {data_owner_rank} contributed invalid sample metadata.")
             ordered.extend(contribution)
         return tuple(ordered)
 
@@ -141,13 +162,20 @@ class TorchPackedBytesRedistributor:
         self._group = group
         self._communication_device = communication_device
 
+    @staticmethod
+    def describe_sample(sample: Any) -> TensorSampleSpec | None:
+        """Return no tensor descriptor for packed byte transport."""
+        del sample
+
     def redistribute(
         self,
         local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
+        global_metadata: Sequence[OnlineSampleMetadata],
     ) -> dict[int, Any]:
         """Encode raw samples, exchange packed uint8 tensors, and decode local samples."""
+        del global_metadata
         group_data_ranks = _data_owner_group_data_ranks(self._group, topology)
         outgoing, received_positions = _build_sample_routes(local_samples, plan, topology)
         outgoing = tuple(outgoing[data_rank] for data_rank in group_data_ranks)
@@ -195,7 +223,7 @@ class TorchPackedBytesRedistributor:
 
 
 class TorchTensorRedistributor:
-    """Exchange uniform tensor samples directly with variable-split all-to-all."""
+    """Exchange fixed- or variable-shape tensor samples with tensor all-to-all."""
 
     def __init__(self, group: Any, *, communication_device: Any = None) -> None:
         """Initialize direct tensor A2A over the data-owner group."""
@@ -204,22 +232,33 @@ class TorchTensorRedistributor:
         self._group = group
         self._communication_device = communication_device
 
+    @staticmethod
+    def describe_sample(sample: Any) -> TensorSampleSpec | None:
+        """Build the tensor descriptor synchronized by the existing metadata All-Gather."""
+        if not platform.is_tensor(sample):
+            return None
+        shape = tuple(int(size) for size in sample.shape)
+        return TensorSampleSpec(shape=shape, dtype=str(sample.dtype), numel=math.prod(shape))
+
     def redistribute(
         self,
         local_samples: Sequence[Any],
         plan: BatchPlan,
         topology: DataTopology,
+        global_metadata: Sequence[OnlineSampleMetadata],
     ) -> dict[int, Any]:
-        """Exchange tensor samples without Host serialization."""
+        """Select a uniform fast path or flattened variable-shape A2A from global metadata."""
         group_data_ranks = _data_owner_group_data_ranks(self._group, topology)
         outgoing, received_positions = _build_sample_routes(local_samples, plan, topology)
         outgoing = tuple(outgoing[data_rank] for data_rank in group_data_ranks)
         received_positions = tuple(received_positions[data_rank] for data_rank in group_data_ranks)
-        prepared = _prepare_uniform_tensors(
+        tensor_specs = _validate_tensor_metadata(global_metadata, plan)
+        prepared = _prepare_tensors(
             local_samples,
+            tensor_specs,
+            topology.data_rank,
             self._group,
             self._communication_device,
-            topology.data_parallel_size,
         )
         samples_by_position = {
             source_position: prepared[local_index]
@@ -235,7 +274,28 @@ class TorchTensorRedistributor:
             for target_items in outgoing
             for source_position, _ in target_items
         ]
-        sample_shape = tuple(prepared[0].shape)
+        if len({spec.shape for spec in tensor_specs}) == 1:
+            return self._redistribute_uniform(
+                ordered_tensors,
+                outgoing,
+                received_positions,
+                tensor_specs,
+            )
+        return self._redistribute_variable(
+            ordered_tensors,
+            outgoing,
+            received_positions,
+            tensor_specs,
+        )
+
+    def _redistribute_uniform(
+        self,
+        ordered_tensors: Sequence[Any],
+        outgoing: Sequence[Sequence[tuple[int, Any]]],
+        received_positions: Sequence[Sequence[int]],
+        tensor_specs: Sequence[TensorSampleSpec],
+    ) -> dict[int, Any]:
+        sample_shape = tensor_specs[0].shape
         send_tensor = platform.cat(
             [tensor.reshape((1, *sample_shape)) for tensor in ordered_tensors],
             dim=0,
@@ -260,6 +320,44 @@ class TorchTensorRedistributor:
             source_position: received_tensor[index]
             for index, source_position in enumerate(ordered_positions)
         }
+
+    def _redistribute_variable(
+        self,
+        ordered_tensors: Sequence[Any],
+        outgoing: Sequence[Sequence[tuple[int, Any]]],
+        received_positions: Sequence[Sequence[int]],
+        tensor_specs: Sequence[TensorSampleSpec],
+    ) -> dict[int, Any]:
+        send_tensor = platform.cat([tensor.reshape((-1,)) for tensor in ordered_tensors], dim=0)
+        input_splits = [
+            sum(tensor_specs[source_position].numel for source_position, _ in items)
+            for items in outgoing
+        ]
+        output_splits = [
+            sum(tensor_specs[source_position].numel for source_position in positions)
+            for positions in received_positions
+        ]
+        received_tensor, work = platform.variable_all_to_all_single(
+            send_tensor,
+            input_splits,
+            output_splits,
+            self._group,
+            async_op=True,
+        )
+        _wait_collective(work)
+        samples_by_position = {}
+        cursor = 0
+        for source_positions in received_positions:
+            for source_position in source_positions:
+                tensor_spec = tensor_specs[source_position]
+                end = cursor + tensor_spec.numel
+                samples_by_position[source_position] = received_tensor[cursor:end].reshape(tensor_spec.shape)
+                cursor = end
+        if cursor != received_tensor.shape[0]:
+            raise ValueError(
+                f"Variable tensor A2A consumed {cursor} elements, but received {received_tensor.shape[0]}."
+            )
+        return samples_by_position
 
 
 class LocalMicroBatchDistributor:
@@ -412,24 +510,54 @@ def _build_sample_routes(
     )
 
 
-def _prepare_uniform_tensors(
+def _validate_tensor_metadata(
+    global_metadata: Sequence[OnlineSampleMetadata],
+    plan: BatchPlan,
+) -> tuple[TensorSampleSpec, ...]:
+    if len(global_metadata) != len(plan.samples):
+        raise ValueError(
+            f"Direct tensor A2A expected {len(plan.samples)} global metadata entries, "
+            f"but got {len(global_metadata)}."
+        )
+    planned_by_position = {sample.source_position: sample for sample in plan.samples}
+    tensor_specs = []
+    for source_position, metadata in enumerate(global_metadata):
+        planned_sample = planned_by_position.get(source_position)
+        if planned_sample is None or planned_sample.meta.sample_id != metadata.sample_meta.sample_id:
+            raise ValueError(f"Tensor metadata at source position {source_position} does not match BatchPlan.")
+        if metadata.tensor_spec is None:
+            raise ValueError(f"Direct tensor A2A is missing tensor metadata at source position {source_position}.")
+        tensor_specs.append(metadata.tensor_spec)
+    dtypes = {spec.dtype for spec in tensor_specs}
+    if len(dtypes) != 1:
+        raise ValueError(f"direct_tensor_a2a requires one dtype per global microbatch, but got {sorted(dtypes)}.")
+    return tuple(tensor_specs)
+
+
+def _prepare_tensors(
     local_samples: Sequence[Any],
+    tensor_specs: Sequence[TensorSampleSpec],
+    data_rank: int,
     group: Any,
     communication_device: Any,
-    data_parallel_size: int,
 ) -> tuple[Any, ...]:
     if not local_samples or any(not platform.is_tensor(sample) for sample in local_samples):
         raise ValueError("direct_tensor_a2a requires every online sample to be a tensor.")
-    sample_shape = tuple(local_samples[0].shape)
-    sample_dtype = local_samples[0].dtype
-    if any(tuple(sample.shape) != sample_shape or sample.dtype != sample_dtype for sample in local_samples):
-        raise ValueError("direct_tensor_a2a requires identical sample shapes and dtypes on each data owner.")
-
-    local_schema = (sample_shape, str(sample_dtype))
-    gathered_schemas: list[Any] = [None] * data_parallel_size
-    platform.all_gather_object(gathered_schemas, local_schema, group)
-    if any(schema != local_schema for schema in gathered_schemas):
-        raise ValueError(f"direct_tensor_a2a requires one global tensor schema, but got {gathered_schemas}.")
+    local_count = len(local_samples)
+    source_start = data_rank * local_count
+    for local_index, sample in enumerate(local_samples):
+        expected_spec = tensor_specs[source_start + local_index]
+        sample_shape = tuple(int(size) for size in sample.shape)
+        actual_spec = TensorSampleSpec(
+            shape=sample_shape,
+            dtype=str(sample.dtype),
+            numel=math.prod(sample_shape),
+        )
+        if actual_spec != expected_spec:
+            raise ValueError(
+                f"Tensor sample at source position {source_start + local_index} changed after metadata sync: "
+                f"expected {expected_spec}, got {actual_spec}."
+            )
 
     backend = str(platform.get_backend(group)).lower()
     accelerator_backend = "hccl" in backend or "nccl" in backend
