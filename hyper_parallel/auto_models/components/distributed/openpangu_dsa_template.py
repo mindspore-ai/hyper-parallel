@@ -1,3 +1,17 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Built-in tensor-parallel boundary template for OpenPangu DSA attention."""
 
 import re
@@ -8,7 +22,8 @@ from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shar
 from .sharding_config import ModuleShardingSpec
 
 
-_ATTN = r"(?:^|\.)layers\.\d+\.(?:mtp_block\.)?self_attention\."
+_ATTN_ROOT = r"(?:^|\.)layers\.\d+\.(?:mtp_block\.)?self_attention$"
+_ATTN = _ATTN_ROOT[:-1] + r"\."
 
 
 def _direct_params(module, placement):
@@ -37,7 +52,24 @@ def build_openpangu_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
     named architecture template avoids rebuilding them in each trainer.
     """
     specs = {}
-    for fqn, module in model.named_modules():
+    named_modules = dict(model.named_modules())
+    for fqn, module in named_modules.items():
+        # Sink parameters participate in the head-sharded DSA projections but
+        # are shared by all TP ranks.  They live directly on the attention
+        # module, which is intentionally not a communication boundary in this
+        # template, so declare a parameter-only replicated spec.
+        if re.search(_ATTN_ROOT, fqn):
+            sink_params = {
+                name: {"tp": Replicate()}
+                for name, _ in module.named_parameters(recurse=False)
+                if name.startswith("param_sink_")
+            }
+            if sink_params:
+                specs[fqn] = ModuleShardingSpec(
+                    params=sink_params,
+                    is_boundary=False,
+                )
+
         # The OpenPangu integration gathers the language-model SP output before
         # its multi-token prediction vocabulary heads.  The vocab-parallel
         # projection therefore consumes a replicated sequence (not Shard(1)).
@@ -86,7 +118,22 @@ def build_openpangu_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
                 module, param=Shard(0), in_src=Replicate(), in_dst=Replicate(),
                 out_src=Shard(-1), out_dst=Shard(-1))
         elif leaf == "linear_proj":
-            sequence_dim = 0 if ".mtp_block." in fqn else 1
+            # GQA/DSA feed this projection in BSH layout, while MLA transposes
+            # its BSH attention result to SBH before the projection and
+            # transposes the output back afterwards.  Select the reduce-scatter
+            # axis from the owning attention implementation instead of the FQN:
+            # regular decoder layers may mix DSA and MLA attention, so an
+            # ``mtp_block`` name alone cannot determine the runtime layout.
+            parent_fqn = fqn.rsplit(".", 1)[0]
+            attention_type = getattr(named_modules.get(parent_fqn), "attention_type", None)
+            if attention_type == "mla":
+                sequence_dim = 0
+            elif attention_type in {"gqa", "dsa"}:
+                sequence_dim = 1
+            else:
+                # Retain the legacy fallback for architecture-compatible test
+                # doubles or external modules that do not expose attention_type.
+                sequence_dim = 0 if ".mtp_block." in fqn else 1
             specs[fqn] = _linear(
                 module, param=Shard(1), in_src=Shard(-1), in_dst=Shard(-1),
                 out_src=Partial(), out_dst=Shard(sequence_dim))

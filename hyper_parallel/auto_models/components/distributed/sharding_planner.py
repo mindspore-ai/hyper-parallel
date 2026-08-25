@@ -69,9 +69,13 @@ from hyper_parallel.auto_models.components.distributed.sharding_config import (
     _multi_dim,
     _normalize_out_fields,
 )
-from hyper_models.components.distributed.openpangu_dsa_template import (
+from hyper_parallel.auto_models.components.distributed.openpangu_dsa_template import (
     OPENPANGU_DSA_ARCHITECTURES,
     build_openpangu_dsa_specs,
+)
+from hyper_parallel.auto_models.components.distributed.openpangu_mhc_template import (
+    OPENPANGU_MHC_ARCHITECTURES,
+    build_openpangu_mhc_specs,
 )
 
 logger = logging.getLogger(__name__)
@@ -392,17 +396,11 @@ class ShardingPlanner:
 
         # Phase 4.5: unified override pass — merge mode (unset fields inherit
         # the derived spec) / insert mode (fully self-declared only) / glob.
-<<<<<<< HEAD:hyper_parallel/auto_models/components/distributed/sharding_planner.py
-        self._merge_plan_overrides(plan, model)
+        self._merge_plan_overrides(plan, model, arch=arch)
         # Plan output normalization: contract-field None (undeclared) → {} —
         # "unset inherits, written is honored" only exists on the input side;
         # specs inside the plan always hold concrete values, so downstream
         # consumers need no branching.
-=======
-        self._merge_plan_overrides(plan, model, arch=arch)
-        # plan 输出规范化：契约字段 None（未声明）→ {}——"不写继承，写了照办"
-        # 只存在于输入侧；plan 内的 spec 恒为具体值，下游消费者零分支
->>>>>>> 75413efd (feat: add OpenPangu DSA sharding template and rework loss parallel ops):hyper_models/components/distributed/sharding_planner.py
         self._normalize_contract_fields(plan)
         self._finalize_tp_local_attr_plans(
             plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names,
@@ -1125,12 +1123,18 @@ class ShardingPlanner:
         entries: List[Tuple[str, ModuleShardingSpec, str]] = []
         # ``derive=False`` is the pure declaration mode: only explicit
         # plan_overrides may enter the plan.  Architecture templates are a
-        # form of derivation as well, and leaking the OpenPangu DSA template
-        # here makes activation-only CP plans unexpectedly own parameters.
+        # form of derivation as well, and leaking OpenPangu architecture
+        # templates here makes activation-only CP plans unexpectedly own
+        # parameters.
         if self._derive and arch in OPENPANGU_DSA_ARCHITECTURES:
             entries.extend(
                 (fqn, spec, "openpangu_dsa_template")
                 for fqn, spec in build_openpangu_dsa_specs(model).items()
+            )
+        if self._derive and arch in OPENPANGU_MHC_ARCHITECTURES:
+            entries.extend(
+                (fqn, spec, "openpangu_mhc_template")
+                for fqn, spec in build_openpangu_mhc_specs(model).items()
             )
         entries.extend([
             (fqn, spec, "plan_overrides")
