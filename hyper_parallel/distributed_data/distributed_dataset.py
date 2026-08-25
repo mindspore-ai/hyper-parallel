@@ -273,8 +273,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             self._owner_future = owner_future
             return
 
-        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
-        cursor_end = cursor_start + self._planner.micro_batch_size
+        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.raw_sample_size
+        cursor_end = cursor_start + self._planner.raw_sample_size
         self._owner_future = self._executor.submit(self._load_online_microbatch, cursor_start, cursor_end)
 
     def _load_online_microbatch(self, cursor_start: int, cursor_end: int) -> tuple[LoadedSample, ...]:
@@ -441,8 +441,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
                 owner_micro_batch = self._pin_executor.submit(_pin_memory_batch, owner_micro_batch).result()
             return reservation.plan, owner_micro_batch
 
-        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
-        cursor_end = cursor_start + self._planner.micro_batch_size
+        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.raw_sample_size
+        cursor_end = cursor_start + self._planner.raw_sample_size
         owner_input = self._load_online_microbatch(cursor_start, cursor_end)
         return self._plan_online_microbatch(reservation, micro_batch_index, owner_input)
 
@@ -471,7 +471,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         if any(not isinstance(metadata, OnlineSampleMetadata) for metadata in global_metadata):
             raise ValueError("Online metadata synchronization returned invalid sample transport metadata.")
         candidates = tuple(metadata.sample_meta for metadata in global_metadata)
-        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
+        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.raw_sample_size
         plan = self._planner.plan_microbatch(
             candidates,
             step=reservation.step,
@@ -501,7 +501,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             raise ValueError(f"Expected optimizer step {reservation.step}, but received plan step {plan.step}.")
         dimensions_match = (
             plan.data_parallel_size == self._planner.data_parallel_size
-            and plan.micro_batch_size == self._planner.micro_batch_size
+            and plan.raw_sample_size == self._planner.raw_sample_size
         )
         if not dimensions_match:
             raise ValueError("Received BatchPlan dimensions do not match the distributed dataset planner.")
@@ -512,8 +512,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             elif plan.replay_id != reservation.replay_id:
                 raise ValueError("Sidecar microbatches received inconsistent whole-step BatchPlan replay IDs.")
         else:
-            cursor_start = reservation.cursor_start + micro_batch_index * self._planner.micro_batch_size
-            expected_window = (cursor_start, cursor_start + self._planner.micro_batch_size, micro_batch_index, 1)
+            cursor_start = reservation.cursor_start + micro_batch_index * self._planner.raw_sample_size
+            expected_window = (cursor_start, cursor_start + self._planner.raw_sample_size, micro_batch_index, 1)
         actual_window = (plan.cursor_start, plan.cursor_end, plan.micro_batch_start, plan.micro_batch_num)
         if actual_window != expected_window:
             raise ValueError(f"Received BatchPlan window {actual_window} does not match expected {expected_window}.")

@@ -103,10 +103,11 @@ class DistributedDatasetConfig:
     ``pin_memory``, ``num_workers``, and ``prefetch_factor`` configure the
     native PyTorch DataLoader used for owner-local reads. Online candidates are
     pinned only after planning and redistribution. Distributed collectives
-    always remain in the training rank process.
+    always remain in the training rank process. ``raw_sample_size`` is the
+    number of dataset records assigned to each data owner per microbatch.
     """
 
-    micro_batch_size: int
+    raw_sample_size: int
     micro_batch_num: int
     prefetch_steps: int = 2
     sample_transport: str = "packed_bytes_a2a"
@@ -118,7 +119,7 @@ class DistributedDatasetConfig:
     prefetch_factor: int = 2
 
     def __post_init__(self) -> None:
-        for name in ("micro_batch_size", "micro_batch_num", "prefetch_steps"):
+        for name in ("raw_sample_size", "micro_batch_num", "prefetch_steps"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
@@ -197,7 +198,7 @@ def build_distributed_dataset(
     metadata_group, model_parallel_group = _create_data_groups(topology)
     planner = DistributedBatchPlanner(
         topology.data_parallel_size,
-        config.micro_batch_size,
+        config.raw_sample_size,
         config.micro_batch_num,
         cost_model=cost_model,
         cp_shards=config.cp_shards,

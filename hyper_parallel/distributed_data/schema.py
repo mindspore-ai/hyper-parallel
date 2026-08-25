@@ -198,14 +198,14 @@ class PlannedSample:
 
 @dataclass(frozen=True)
 class BatchPlan:
-    """Deterministic plan for a contiguous optimizer-step microbatch window."""
+    """Deterministic raw-sample plan for an optimizer-step microbatch window."""
 
     replay_id: str
     step: int
     cursor_start: int
     cursor_end: int
     data_parallel_size: int
-    micro_batch_size: int
+    raw_sample_size: int
     micro_batch_num: int
     samples: tuple[PlannedSample, ...]
     cp_shards: tuple[TensorShardSpec, ...] = ()
@@ -222,7 +222,7 @@ class BatchPlan:
             raise ValueError(
                 f"BatchPlan.cursor_end={self.cursor_end} must not precede cursor_start={self.cursor_start}."
             )
-        for name in ("data_parallel_size", "micro_batch_size", "micro_batch_num"):
+        for name in ("data_parallel_size", "raw_sample_size", "micro_batch_num"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"BatchPlan.{name} must be a positive integer, but got {value!r}.")
@@ -234,7 +234,7 @@ class BatchPlan:
             raise ValueError(
                 f"BatchPlan.micro_batch_start must be a non-negative integer, but got {self.micro_batch_start!r}."
             )
-        expected = self.data_parallel_size * self.micro_batch_size * self.micro_batch_num
+        expected = self.data_parallel_size * self.raw_sample_size * self.micro_batch_num
         if len(self.samples) != expected:
             raise ValueError(f"BatchPlan expected {expected} planned samples, but got {len(self.samples)}.")
         slot_positions: dict[tuple[int, int], set[int]] = {}
@@ -246,7 +246,7 @@ class BatchPlan:
                 raise ValueError(f"Planned sample has invalid micro_batch_index={sample.micro_batch_index}.")
             slot = (sample.target_data_rank, sample.micro_batch_index)
             slot_positions.setdefault(slot, set()).add(sample.position_in_micro_batch)
-        expected_positions = set(range(self.micro_batch_size))
+        expected_positions = set(range(self.raw_sample_size))
         if any(positions != expected_positions for positions in slot_positions.values()) or len(slot_positions) != (
             self.data_parallel_size * self.micro_batch_num
         ):

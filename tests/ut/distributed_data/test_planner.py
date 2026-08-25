@@ -32,7 +32,7 @@ class TestDistributedBatchPlanner(unittest.TestCase):
 
     def test_balances_all_microbatches_in_one_optimizer_step(self) -> None:
         """Heavy samples should be spread across both microbatches."""
-        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=2, micro_batch_num=2)
+        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=2)
         candidates = [_metadata("0", 8.0), _metadata("1", 7.0), _metadata("2", 1.0), _metadata("3", 1.0)]
 
         plan = planner.plan(candidates, step=0, cursor_start=0)
@@ -46,7 +46,7 @@ class TestDistributedBatchPlanner(unittest.TestCase):
 
     def test_same_metadata_produces_same_replay_id_and_placements(self) -> None:
         """Planning must be byte-stable for checkpoint replay."""
-        planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=2)
+        planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=2)
         candidates = [_metadata(str(index), float(index + 1)) for index in range(4)]
 
         first = planner.plan(candidates, step=3, cursor_start=6)
@@ -61,13 +61,13 @@ class TestDistributedBatchPlanner(unittest.TestCase):
 
     def test_rejects_incomplete_global_candidate_set(self) -> None:
         """A planner must never silently construct a partial optimizer step."""
-        planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=2)
+        planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=2)
         with self.assertRaisesRegex(ValueError, "requires 4 candidates"):
             planner.plan([_metadata("0", 1.0)], step=0, cursor_start=0)
 
     def test_rejects_duplicate_sample_ids(self) -> None:
         """The dataset-wide sample identifier must be unique in a planning window."""
-        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=2, micro_batch_num=1)
+        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=1)
         candidates = [_metadata("0", 1.0), _metadata("0", 2.0)]
 
         with self.assertRaisesRegex(ValueError, "unique sample_id"):
@@ -75,7 +75,7 @@ class TestDistributedBatchPlanner(unittest.TestCase):
 
     def test_online_plan_balances_only_one_global_microbatch(self) -> None:
         """Online planning should preserve the optimizer microbatch position without later metadata."""
-        planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=2, micro_batch_num=3)
+        planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=2, micro_batch_num=3)
         candidates = [_metadata(str(index), float(index + 1)) for index in range(4)]
 
         plan = planner.plan_microbatch(
@@ -95,7 +95,7 @@ class TestDistributedBatchPlanner(unittest.TestCase):
 
     def test_mixed_integer_and_string_sample_ids_are_deterministic(self) -> None:
         """Planner tie-breaking should support both map-style key types."""
-        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=2, micro_batch_num=1)
+        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=1)
         candidates = [
             SampleMeta(sample_id="1"),
             SampleMeta(sample_id=1),

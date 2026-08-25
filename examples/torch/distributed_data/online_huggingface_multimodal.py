@@ -143,7 +143,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--backend", choices=("hccl", "gloo"), default="hccl")
-    parser.add_argument("--micro-batch-size", type=int, default=2)
+    parser.add_argument("--raw-sample-size", type=int, default=2)
     parser.add_argument("--micro-batch-num", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -213,7 +213,7 @@ def main() -> None:
     """Run and validate one online-planned optimizer step."""
     args = _parse_args()
     rank, world_size, communication_device, device_type = _initialize_distributed(args.backend)
-    sample_count = world_size * args.micro_batch_size * args.micro_batch_num
+    sample_count = world_size * args.raw_sample_size * args.micro_batch_num
     dataset = HuggingFaceManifestDataset(args.manifest, sample_count)
     mesh = DeviceMesh(
         device_type,
@@ -225,7 +225,7 @@ def main() -> None:
         dataset,
         mesh,
         DistributedDatasetConfig(
-            micro_batch_size=args.micro_batch_size,
+            raw_sample_size=args.raw_sample_size,
             micro_batch_num=args.micro_batch_num,
             prefetch_steps=1,
             sample_transport="packed_bytes_a2a",
@@ -258,7 +258,7 @@ def main() -> None:
             world_size,
         )
         loader.commit(step.replay_id)
-        expected_offset = args.micro_batch_size * args.micro_batch_num
+        expected_offset = args.raw_sample_size * args.micro_batch_num
         if loader.consumed_offset != expected_offset:
             raise ValueError(f"Expected consumed_offset={expected_offset}, got {loader.consumed_offset}.")
     finally:
@@ -273,7 +273,7 @@ def main() -> None:
                     "backend": args.backend,
                     "world_size": world_size,
                     "samples": sample_count,
-                    "micro_batch_size": args.micro_batch_size,
+                    "raw_sample_size": args.raw_sample_size,
                     "micro_batch_num": args.micro_batch_num,
                     "num_workers": args.num_workers,
                     "double_buffer": args.double_buffer,

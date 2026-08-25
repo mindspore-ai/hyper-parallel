@@ -237,9 +237,9 @@ class MicroBatchFetcher:
     def fetch(self, plan: BatchPlan, data_rank: int, micro_batch_index: int) -> Any:
         """Fetch only samples assigned to the requested execution slot."""
         planned_samples = plan.samples_for(data_rank, micro_batch_index)
-        if len(planned_samples) != plan.micro_batch_size:
+        if len(planned_samples) != plan.raw_sample_size:
             raise ValueError(
-                f"Plan slot ({data_rank}, {micro_batch_index}) expected {plan.micro_batch_size} samples, "
+                f"Plan slot ({data_rank}, {micro_batch_index}) expected {plan.raw_sample_size} samples, "
                 f"but got {len(planned_samples)}."
             )
         if self._local_data_loader is None:

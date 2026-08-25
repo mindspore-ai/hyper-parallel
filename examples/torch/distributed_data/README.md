@@ -17,7 +17,7 @@ dimensions, and checksum. JPEG bytes are not stored in metadata and are not read
 a second time after planning.
 
 On the local 8-card machine, the downloaded 64-record dataset runs as one step
-with four microbatches of two samples per rank:
+with four microbatches of two raw samples per rank:
 
 ```bash
 torchrun --nproc_per_node=8 \

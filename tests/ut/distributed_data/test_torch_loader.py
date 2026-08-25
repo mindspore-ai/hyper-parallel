@@ -66,7 +66,7 @@ class TestTorchLocalDataLoader(unittest.TestCase):
 
     def test_sidecar_plan_uses_persistent_workers_and_preserves_batch_order(self) -> None:
         """Planned microbatches should be collated by native worker processes."""
-        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=2, micro_batch_num=2)
+        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=2)
         plan = planner.plan(
             tuple(SampleMeta(sample_id=index) for index in range(4)),
             step=0,

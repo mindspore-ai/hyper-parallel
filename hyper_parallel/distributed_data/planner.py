@@ -31,23 +31,23 @@ class DistributedBatchPlanner:
     def __init__(
         self,
         data_parallel_size: int,
-        micro_batch_size: int,
+        raw_sample_size: int,
         micro_batch_num: int,
         *,
         cost_model: CostModel | None = None,
         balancer: BatchBalancer | None = None,
         cp_shards: tuple[TensorShardSpec, ...] = (),
     ) -> None:
-        """Initialize fixed optimizer-step dimensions and planning policies."""
+        """Initialize fixed raw-sample dimensions and planning policies."""
         for name, value in (
             ("data_parallel_size", data_parallel_size),
-            ("micro_batch_size", micro_batch_size),
+            ("raw_sample_size", raw_sample_size),
             ("micro_batch_num", micro_batch_num),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
         self.data_parallel_size = data_parallel_size
-        self.micro_batch_size = micro_batch_size
+        self.raw_sample_size = raw_sample_size
         self.micro_batch_num = micro_batch_num
         self.cost_model = cost_model or LinearMultimodalCostModel()
         self.balancer = balancer or GreedyBatchBalancer()
@@ -56,7 +56,7 @@ class DistributedBatchPlanner:
     @property
     def local_samples_per_step(self) -> int:
         """Return candidate samples contributed by each data owner per step."""
-        return self.micro_batch_size * self.micro_batch_num
+        return self.raw_sample_size * self.micro_batch_num
 
     @property
     def global_samples_per_step(self) -> int:
@@ -135,7 +135,7 @@ class DistributedBatchPlanner:
     ) -> BatchPlan:
         if step < 0 or cursor_start < 0:
             raise ValueError(f"step and cursor_start must be non-negative, but got {step} and {cursor_start}.")
-        expected_candidates = self.data_parallel_size * self.micro_batch_size * micro_batch_num
+        expected_candidates = self.data_parallel_size * self.raw_sample_size * micro_batch_num
         if len(candidates) != expected_candidates:
             raise ValueError(
                 f"Planner requires {expected_candidates} candidates for this planning window, "
@@ -150,7 +150,7 @@ class DistributedBatchPlanner:
             for position, metadata in enumerate(candidates)
         )
         slot_count = self.data_parallel_size * micro_batch_num
-        slots = self.balancer.balance(items, slot_count, self.micro_batch_size)
+        slots = self.balancer.balance(items, slot_count, self.raw_sample_size)
 
         planned_samples = []
         for slot_index, slot in enumerate(slots):
@@ -168,7 +168,7 @@ class DistributedBatchPlanner:
                     )
                 )
 
-        cursor_end = cursor_start + self.micro_batch_size * micro_batch_num
+        cursor_end = cursor_start + self.raw_sample_size * micro_batch_num
         replay_id = self._replay_id(
             step,
             cursor_start,
@@ -182,7 +182,7 @@ class DistributedBatchPlanner:
             cursor_start=cursor_start,
             cursor_end=cursor_end,
             data_parallel_size=self.data_parallel_size,
-            micro_batch_size=self.micro_batch_size,
+            raw_sample_size=self.raw_sample_size,
             micro_batch_num=micro_batch_num,
             samples=tuple(planned_samples),
             cp_shards=self.cp_shards,
@@ -201,7 +201,7 @@ class DistributedBatchPlanner:
             "step": step,
             "cursor_start": cursor_start,
             "data_parallel_size": self.data_parallel_size,
-            "micro_batch_size": self.micro_batch_size,
+            "raw_sample_size": self.raw_sample_size,
             "micro_batch_start": micro_batch_start,
             "micro_batch_num": micro_batch_num,
             "samples": [

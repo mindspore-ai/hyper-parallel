@@ -480,7 +480,7 @@ def _build_sample_routes(
             f"Plan data_parallel_size={plan.data_parallel_size} does not match topology "
             f"data_parallel_size={topology.data_parallel_size}."
         )
-    local_count = plan.micro_batch_size * plan.micro_batch_num
+    local_count = plan.raw_sample_size * plan.micro_batch_num
     if len(local_samples) != local_count:
         raise ValueError(f"Expected {local_count} local raw samples, but got {len(local_samples)}.")
     planned_by_position = {sample.source_position: sample for sample in plan.samples}

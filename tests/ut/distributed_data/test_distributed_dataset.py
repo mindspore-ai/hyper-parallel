@@ -69,7 +69,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
     def test_builder_selects_online_or_sidecar_metadata(self) -> None:
         """The public builder should require exactly one metadata path."""
-        config = distributed_data.DistributedDatasetConfig(micro_batch_size=1, micro_batch_num=1)
+        config = distributed_data.DistributedDatasetConfig(raw_sample_size=1, micro_batch_num=1)
 
         def metadata_fn(sample: Any, sample_id: int) -> SampleMeta:
             """Build unused metadata for boundary validation."""
@@ -88,36 +88,36 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "sample_transport"):
             distributed_data.DistributedDatasetConfig(
-                micro_batch_size=1,
+                raw_sample_size=1,
                 micro_batch_num=1,
                 sample_transport="object_p2p",
             )
         with self.assertRaisesRegex(ValueError, "pin_memory must be a boolean"):
             distributed_data.DistributedDatasetConfig(
-                micro_batch_size=1,
+                raw_sample_size=1,
                 micro_batch_num=1,
                 pin_memory=1,
             )
         with self.assertRaisesRegex(ValueError, "double_buffer must be a boolean"):
             distributed_data.DistributedDatasetConfig(
-                micro_batch_size=1,
+                raw_sample_size=1,
                 micro_batch_num=1,
                 double_buffer=1,
             )
         with self.assertRaisesRegex(ValueError, "num_workers must be a non-negative integer"):
             distributed_data.DistributedDatasetConfig(
-                micro_batch_size=1,
+                raw_sample_size=1,
                 micro_batch_num=1,
                 num_workers=-1,
             )
         with self.assertRaisesRegex(ValueError, "prefetch_factor must be a positive integer"):
             distributed_data.DistributedDatasetConfig(
-                micro_batch_size=1,
+                raw_sample_size=1,
                 micro_batch_num=1,
                 prefetch_factor=0,
             )
         config = distributed_data.DistributedDatasetConfig(
-            micro_batch_size=1,
+            raw_sample_size=1,
             micro_batch_num=1,
             prefetch_steps=1,
             double_buffer=True,
@@ -168,7 +168,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             loader = distributed_data.build_distributed_dataset(
                 [f"sample-{index}" for index in range(4)],
                 mesh=object(),
-                config=distributed_data.DistributedDatasetConfig(micro_batch_size=1, micro_batch_num=1),
+                config=distributed_data.DistributedDatasetConfig(raw_sample_size=1, micro_batch_num=1),
                 metadata=metadata,
             )
 
@@ -215,7 +215,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
                 dataset,
                 mesh=object(),
                 config=distributed_data.DistributedDatasetConfig(
-                    micro_batch_size=1,
+                    raw_sample_size=1,
                     micro_batch_num=1,
                     num_workers=2,
                     prefetch_factor=3,
@@ -250,7 +250,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             global_rank=0,
         )
         dataset = ["sample-0", "sample-1"]
-        config = distributed_data.DistributedDatasetConfig(micro_batch_size=2, micro_batch_num=1)
+        config = distributed_data.DistributedDatasetConfig(raw_sample_size=2, micro_batch_num=1)
 
         def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
             """Derive minimal online metadata for the public builder path."""
@@ -578,7 +578,7 @@ def _build_loader(
         rank_list=(0, 1),
         global_rank=0,
     )
-    planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=2)
+    planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=2)
     fetcher = _RecordingFetcher([f"sample-{index}" for index in range(8)])
     loader = DistributedDataset(
         topology=topology,
@@ -602,7 +602,7 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
         rank_list=(0,),
         global_rank=0,
     )
-    planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=len(samples), micro_batch_num=1)
+    planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=len(samples), micro_batch_num=1)
 
     def collate_fn(values: list[Any]) -> dict[str, Any]:
         """Create a nested batch that exercises recursive pinning."""
@@ -659,7 +659,7 @@ def _build_single_microbatch_double_buffer(micro_batch_distributor: Any) -> Dist
     return DistributedDataset(
         topology=topology,
         metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
-        planner=DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=1),
+        planner=DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=1),
         micro_batch_fetcher=MicroBatchFetcher(_RecordingFetcher(["sample-0", "sample-1"]), tuple),
         metadata_synchronizer=LocalMetadataSynchronizer(),
         micro_batch_distributor=micro_batch_distributor,
@@ -787,7 +787,7 @@ class TestDistributedDataset(unittest.TestCase):
         loader = DistributedDataset(
             topology=topology,
             metadata_source=None,
-            planner=DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=3),
+            planner=DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=3),
             micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), tuple),
             metadata_synchronizer=synchronizer,
             micro_batch_distributor=LocalMicroBatchDistributor(),
@@ -911,7 +911,7 @@ class TestDistributedDataset(unittest.TestCase):
             rank_list=(0, 1),
             global_rank=1,
         )
-        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=2)
+        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=2)
         distributor = _ReceivingMicroBatchDistributor(planner.plan(metadata, step=0, cursor_start=0))
         loader = DistributedDataset(
             topology=topology,
@@ -962,7 +962,7 @@ class TestDistributedDataset(unittest.TestCase):
         loader = DistributedDataset(
             topology=topology,
             metadata_source=None,
-            planner=DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=1, micro_batch_num=3),
+            planner=DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=3),
             micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), tuple),
             metadata_synchronizer=_PeerMetadataSynchronizer(),
             micro_batch_distributor=LocalMicroBatchDistributor(),
@@ -1079,7 +1079,7 @@ class TestDistributedDataset(unittest.TestCase):
             rank_list=(0, 1),
             global_rank=1,
         )
-        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=2)
+        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=2)
         plan = planner.plan(metadata, step=0, cursor_start=0)
         loader = DistributedDataset(
             topology=topology,
@@ -1111,7 +1111,7 @@ class TestDistributedDataset(unittest.TestCase):
             rank_list=(0, 1),
             global_rank=1,
         )
-        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=2)
+        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=2)
         plans = [
             planner.plan_microbatch(
                 [SampleMeta(sample_id=index)],
