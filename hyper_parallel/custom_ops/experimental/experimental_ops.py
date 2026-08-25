@@ -251,6 +251,32 @@ def npu_mhc_pre_cmhc(
         x, phi, alpha, bias, perm_mats, gamma, hc_eps, norm_eps)
 
 
+def npu_mhc_head(
+        x,
+        weight,
+        hc_base,
+        hc_scale,
+        *,
+        hc_eps: float = 1e-6,
+        norm_eps: float = 1e-6,
+) -> Tuple:
+    """MHC head: collapse n residual streams into 1 via gated weighted sum (fused).
+
+    Uses the fused aclnnMhcHead kernel: linear projection -> RMSNorm ->
+    sigmoid gated weighted sum collapses [s,b,nH] packed streams into [s,b,H].
+    rms_inv/mixes are forward caches returned for backward (both present when
+    autograd is active).
+
+    .. warning::
+        This is an experimental API that subject to change or deletion.
+
+    Returns:
+        tuple: 3 output tensors (out, rms_inv, mixes).
+    """
+    return _platform.custom_ops.npu_mhc_head(
+        x, weight, hc_base, hc_scale, hc_eps, norm_eps)
+
+
 def npu_situ_glu(
         x,
         *,
