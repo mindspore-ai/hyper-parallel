@@ -236,6 +236,41 @@ def test_step_batch_skips_units_without_gradients():
     functional.assert_not_called()
 
 
+@pytest.mark.parametrize("supports_decoupled_weight_decay", (False, True))
+def test_step_batch_only_passes_supported_decoupled_weight_decay(
+        supports_decoupled_weight_decay,
+):
+    """Pass decoupled weight decay only to functional Adam versions that support it."""
+    parameter = torch.nn.Parameter(torch.ones(2))
+    parameter.grad = torch.ones_like(parameter)
+    optimizer = torch.optim.Adam([parameter])
+    adapter = _adapter(optimizer)
+    adapter._init_param_state(parameter, parameter.grad, optimizer.param_groups[0])
+    slots = adapter._build_slots(parameter, optimizer.state[parameter])
+    unit = UpdateUnit(0, parameter, parameter.grad, slots)
+    call_kwargs = {}
+    missing = object()
+
+    if supports_decoupled_weight_decay:
+        def functional_adam(*args, decoupled_weight_decay=missing, **kwargs):
+            del args, kwargs
+            if decoupled_weight_decay is not missing:
+                call_kwargs["decoupled_weight_decay"] = decoupled_weight_decay
+
+    else:
+        def functional_adam(*args, **kwargs):
+            del args
+            call_kwargs.update(kwargs)
+
+    with mock.patch.object(torch.optim._functional, "adam", functional_adam):
+        adapter.step_batch([unit], {})
+
+    if supports_decoupled_weight_decay:
+        assert call_kwargs["decoupled_weight_decay"] is False
+    else:
+        assert "decoupled_weight_decay" not in call_kwargs
+
+
 def test_export_swappable_state_prefers_host_mirror_and_deep_copies_metadata():
     """Export host mirrors for swapped tensors and copy all checkpoint data."""
     parameter = torch.nn.Parameter(torch.ones(2))
