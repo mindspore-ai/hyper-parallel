@@ -42,6 +42,8 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn_backward.cc"),
     os.path.join(_CC_DIR, "mhc_pre_cmhc.cc"),
     os.path.join(_CC_DIR, "mhc_pre_cmhc_backward.cc"),
+    os.path.join(_CC_DIR, "mhc_head.cc"),
+    os.path.join(_CC_DIR, "mhc_head_backward.cc"),
     os.path.join(_CC_DIR, "situ_glu.cc"),
     os.path.join(_CC_DIR, "situ_glu_grad.cc"),
     os.path.join(_CC_DIR, "lightning_indexer_v2.cc"),
@@ -66,7 +68,7 @@ except ImportError:
     _custom_ops = _build_custom_ops()
 else:
     # Rebuild stale source-tree extensions that predate newly added symbols.
-    if not hasattr(_custom_ops, "npu_situ_glu"):
+    if not hasattr(_custom_ops, "npu_mhc_head"):
         _custom_ops = _build_custom_ops()
 
 
@@ -493,6 +495,70 @@ class NpuMhcPreCmhcDFunction(DFunction):  # pylint: disable=W0221
             grad_h_in, grad_h_post, grad_h_res, x, phi, alpha,
             h_pre, h_mix, inv_rms, h_post, None, perm_mats, coeff, ctx.hc_eps)
         return tuple(grads[:4]) + (None, None, None, None)
+
+
+class NpuMhcHeadDFunction(DFunction):  # pylint: disable=W0221
+    """DFunction wrapper for npu_mhc_head on MindSpore.
+
+    Forward returns 3 tensors (out, rms_inv, mixes). Backward consumes the
+    saved forward inputs (x, weight, hc_base, hc_scale) plus caches (rms_inv,
+    mixes) and grad_out. Note: rms_inv/mixes are forward caches fed back as
+    backward inputs; backward aclnn takes only hcEps (no normEps) since rms_inv
+    is already cached. All four grad outputs are required (no nullopt skip).
+    """
+
+    _op_name = "npu_mhc_head"
+
+    @staticmethod
+    def forward(ctx, x, weight, hc_base, hc_scale, hc_eps, norm_eps):
+        """Forward pass: delegates to the MindSpore Ascend MhcHead custom kernel.
+
+        Args:
+            ctx: Autograd context.
+            x: Input tensor [s, b, nH]. dtype bfloat16/float16.
+            weight: Projection matrix [n, nH]. dtype float32.
+            hc_base: mHC bias [n]. dtype float32.
+            hc_scale: mHC scale [1]. dtype float32.
+            hc_eps: Sigmoid output eps parameter.
+            norm_eps: RMSNorm eps parameter.
+
+        Returns:
+            tuple[Tensor, ...]: 3 output tensors (out, rms_inv, mixes).
+        """
+        result = _custom_ops.npu_mhc_head(x, weight, hc_base, hc_scale, hc_eps, norm_eps)
+        _, rms_inv, mixes = result
+        ctx.save_for_backward(x, weight, hc_base, hc_scale, rms_inv, mixes)
+        ctx.hc_eps = hc_eps
+        return result
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Backward pass: calls npu_mhc_head_backward kernel.
+
+        Args:
+            ctx: Autograd context.
+            grad_outputs: Upstream gradients for the 3 forward outputs.
+                grad_outputs[0]=grad_out; [1..2] correspond to rms_inv/mixes
+                caches and are None.
+
+        Returns:
+            tuple: (grad_x, grad_weight, grad_scale, grad_base, None, None) --
+                gradients for the 6 forward inputs (hc_eps/norm_eps have no
+                gradient).
+        """
+        x, weight, hc_base, hc_scale, rms_inv, mixes = ctx.saved_tensors
+        (grad_out, x, weight, hc_base, hc_scale, rms_inv, mixes) = _ensure_contiguous(
+            grad_outputs[0], x, weight, hc_base, hc_scale, rms_inv, mixes)
+        # No reshape needed: rms_inv [s,b,1] and mixes [s,b,n] have matching
+        # rank between forward output and backward aclnn input.
+        grads = _custom_ops.npu_mhc_head_backward(
+            x, weight, hc_base, hc_scale, grad_out, rms_inv, mixes, ctx.hc_eps)
+        # .cc returns (grad_x, grad_weight, grad_scale, grad_base) per the
+        # aclnn output order, but forward inputs are (x, weight, hc_base,
+        # hc_scale, hc_eps, norm_eps) — grad_base must map to hc_base (pos 3)
+        # and grad_scale to hc_scale (pos 4), so reorder before returning.
+        grad_x, grad_weight, grad_scale, grad_base = grads
+        return (grad_x, grad_weight, grad_base, grad_scale, None, None)
 
 
 class NpuSituGluDFunction(DFunction):  # pylint: disable=W0221
