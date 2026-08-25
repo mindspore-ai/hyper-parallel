@@ -30,21 +30,8 @@ def test_dcp_with_optimizer_tp_dp():
     """
     parallel_run([
         TorchCase(_TEST_DCP_TP_DP, "test_dcp_with_optimizer_tp_dp", 12502, 4),
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_dcp_tp_fsdp_model_state_roundtrip():
-    """
-    Feature: TP + FSDP + DCP sync save/load round-trip for model state only.
-
-    Description: test_dcp_tp_fsdp_model_state_roundtrip
-    Expectation: Run success.
-    """
-    parallel_run([
         TorchCase(_TEST_DCP_TP_DP, "test_dcp_tp_fsdp_model_state_roundtrip", 12504, 4),
     ])
-
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dcp_async_save_with_optimizer_tp_dp():
