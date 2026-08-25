@@ -48,7 +48,7 @@ from hyper_parallel.core.fully_shard.api import (
     _validate_module_for_fully_shard,
     fully_shard,
 )
-from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy
 from hyper_parallel.platform.platform import PlatformType
 
 
@@ -368,6 +368,41 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
         mesh = MagicMock()
         mesh.ndim = 1
         return mesh
+
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    @patch("hyper_parallel.platform.mindspore.autograd_compat.enable_mindspore_backward_compat")
+    def test_fully_shard_rejects_zero_copy_before_initialization(
+        self, mock_enable_backward_compat, mock_platform
+    ):
+        """An explicit MindSpore zero-copy request should fail before initialization."""
+        mock_platform.platform_type = PlatformType.MINDSPORE
+
+        with self.assertRaisesRegex(NotImplementedError, "comm_fusion_zero_copy=True"):
+            fully_shard(
+                ms_nn.Dense(4, 4),
+                mesh=self._create_mock_mesh(),
+                comm_fusion=True,
+                comm_fusion_zero_copy=True,
+            )
+
+        mock_enable_backward_compat.assert_not_called()
+
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    @patch("hyper_parallel.platform.mindspore.autograd_compat.enable_mindspore_backward_compat")
+    def test_fully_shard_rejects_cpu_offload_before_initialization(
+        self, mock_enable_backward_compat, mock_platform
+    ):
+        """MindSpore CPU offload should fail when fully_shard accepts the policy."""
+        mock_platform.platform_type = PlatformType.MINDSPORE
+
+        with self.assertRaisesRegex(NotImplementedError, "CPUOffloadPolicy"):
+            fully_shard(
+                ms_nn.Dense(4, 4),
+                mesh=self._create_mock_mesh(),
+                offload_policy=CPUOffloadPolicy(),
+            )
+
+        mock_enable_backward_compat.assert_not_called()
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")

@@ -134,13 +134,6 @@ def _seq_full(x):
     return x, None
 
 
-def _cp_gather(x, cp_mesh: DeviceMesh):
-    """Gather a CP sequence shard (dim 1) to a local full-sequence tensor."""
-    return DTensor.from_local(x, cp_mesh, [Shard(1)]).redistribute(
-        cp_mesh, [Replicate()],
-    ).to_local()
-
-
 def _cp_slice(x, cp_mesh: DeviceMesh, dim: int = 1):
     """Return this CP rank's contiguous slice along ``dim``."""
     rank = cp_mesh.get_local_rank()
@@ -312,8 +305,13 @@ def _mesh_size(mesh) -> int:
 def _resolve_vision_dp_shard_size(mesh, cfg) -> int:
     """Resolve visual Encoder DP shard size from config or global DP."""
     vision_parallel = _get_vision_parallel_cfg(cfg)
-    dp_mesh = _resolve_dp_mesh(mesh)
-    global_dp_size = _mesh_size(dp_mesh)
+    accelerator = cfg.train.accelerator
+    global_dp = getattr(accelerator, "dp_shard", None)
+    if global_dp in (None, "", 0, "0"):
+        global_dp = getattr(accelerator, "dp", None)
+    global_dp_size = int(global_dp or 1)
+    if global_dp_size == -1:
+        global_dp_size = _mesh_size(_resolve_dp_mesh(mesh))
     requested = vision_parallel.get("dp_shard", None)
     if requested in (None, "", 0, "0"):
         return global_dp_size
@@ -330,46 +328,29 @@ def _resolve_vision_dp_shard_size(mesh, cfg) -> int:
 
 
 def _resolve_vision_cp_mesh(mesh, cfg):
-    """Resolve visual Encoder CP mesh, including explicit dp_shard reuse mode."""
+    """Resolve visual Encoder CP mesh."""
     vision_parallel = _get_vision_parallel_cfg(cfg)
     cp_size = int(vision_parallel.get("cp", 1) or 1)
     if cp_size <= 1:
         return None
 
     global_cp = int(getattr(cfg.train.accelerator, "cp", 1) or 1)
-    if global_cp > 1:
-        try:
-            cp_mesh = mesh["cp"]
-        except (KeyError, TypeError):
-            cp_mesh = mesh
-        actual_size = _mesh_size(cp_mesh)
-        if actual_size != cp_size:
-            raise ValueError(
-                f"vision_parallel.cp={cp_size} but train.accelerator.cp mesh size is {actual_size}."
-            )
-        return cp_mesh
-
-    dp_mesh = _resolve_dp_mesh(mesh)
-    actual_size = _mesh_size(dp_mesh)
+    if global_cp <= 1:
+        raise ValueError(
+            "vision_parallel.cp requires train.accelerator.cp > 1 with a matching "
+            "cp mesh. Set train.accelerator.cp to the visual CP size or disable "
+            "vision_parallel.cp."
+        )
+    try:
+        cp_mesh = mesh["cp"]
+    except (KeyError, TypeError):
+        cp_mesh = mesh
+    actual_size = _mesh_size(cp_mesh)
     if actual_size != cp_size:
         raise ValueError(
-            "vision_parallel.cp requires either train.accelerator.cp > 1 with a matching "
-            f"cp mesh, or a dp_shard mesh of the same size. Requested cp={cp_size}, got "
-            f"dp_shard mesh size={actual_size}."
+            f"vision_parallel.cp={cp_size} but train.accelerator.cp mesh size is {actual_size}."
         )
-    if not vision_parallel.get("reuse_dp_shard_mesh", False):
-        raise ValueError(
-            "vision_parallel.cp requested encoder-only CP on the dp_shard mesh while "
-            "train.accelerator.cp=1. This path may aggregate attention states across "
-            "different DP samples, so it requires explicit opt-in via "
-            "model.vision_parallel.reuse_dp_shard_mesh=true."
-        )
-    logger.warning_rank0(
-        "VL vision CP is reusing the dp_shard mesh because train.accelerator.cp=1. "
-        "This mode is intended for targeted 2-card validation; ranks may hold "
-        "different samples unless vision_parallel.share_samples_across_dp=true."
-    )
-    return dp_mesh
+    return cp_mesh
 
 
 def _resolve_qwen3_vl_moe_dp_sizes(mesh, cfg) -> tuple[int, int]:
@@ -443,6 +424,13 @@ def _apply_vl_visual_cp(model, mesh, cfg) -> None:
     if cp_mesh is None:
         return
 
+    if not hasattr(visual, "set_context_parallel_mesh"):
+        raise ValueError(
+            "vision_parallel.cp requires the visual Encoder to expose "
+            "set_context_parallel_mesh()."
+        )
+    visual.set_context_parallel_mesh(cp_mesh)
+
     vision_parallel = _get_vision_parallel_cfg(cfg)
     ulysses_degree = vision_parallel.get("ulysses_degree", 1)
     async_cp = bool(
@@ -495,26 +483,6 @@ def _apply_vl_visual_cp(model, mesh, cfg) -> None:
     )
 
 
-def _apply_full_sequence_input_cp_gather(module, cp_mesh: DeviceMesh) -> None:
-    """Gather CP-sharded VL token inputs to full sequence before visual fusion."""
-
-    def _pre_hook(hook_module, args, kwargs):
-        del hook_module
-        args = list(args)
-        kwargs = dict(kwargs)
-        if args:
-            args[0] = _cp_gather(args[0], cp_mesh)
-            if len(args) > 1 and args[1] is not None:
-                args[1] = _cp_gather(args[1], cp_mesh)
-        elif kwargs.get("input_ids") is not None:
-            kwargs["input_ids"] = _cp_gather(kwargs["input_ids"], cp_mesh)
-            if kwargs.get("attention_mask") is not None:
-                kwargs["attention_mask"] = _cp_gather(kwargs["attention_mask"], cp_mesh)
-        return tuple(args), kwargs
-
-    module.register_forward_pre_hook(_pre_hook, with_kwargs=True)
-
-
 def _apply_visual_sequence_roundtrip(module) -> None:
     """Gather/restore sequence-sharded VL embeddings around visual token injection."""
     placements = []
@@ -535,22 +503,7 @@ def _apply_visual_sequence_roundtrip(module) -> None:
     module.visual_injection_output.register_forward_hook(_post_hook)
 
 
-def _apply_text_decoder_input_cp_slice(module, cp_mesh: DeviceMesh) -> None:
-    """Slice text decoder inputs after the full-sequence attention mask is built."""
-
-    def _post_hook(hook_module, hook_args, output):
-        del hook_module, hook_args
-        inputs_embeds, position_ids = output
-        inputs_embeds, tp_placement = _seq_full(inputs_embeds)
-        inputs_embeds = _cp_slice(inputs_embeds, cp_mesh, dim=1)
-        inputs_embeds = _seq_restore(inputs_embeds, tp_placement)
-        position_ids = _cp_slice(position_ids, cp_mesh, dim=position_ids.ndim - 1)
-        return inputs_embeds, position_ids
-
-    module.decoder_input.register_forward_hook(_post_hook)
-
-
-def _apply_deepstack_sequence_roundtrip(module, cp_mesh: Optional[DeviceMesh] = None) -> None:
+def _apply_deepstack_sequence_roundtrip(module) -> None:
     """Gather/restore DeepStack activations around global visual-position updates."""
     placements = []
 
@@ -559,14 +512,10 @@ def _apply_deepstack_sequence_roundtrip(module, cp_mesh: Optional[DeviceMesh] = 
         hidden_states = args[0]
         hidden_states, tp_placement = _seq_full(hidden_states)
         placements.append(tp_placement)
-        if cp_mesh is not None:
-            hidden_states = _cp_gather(hidden_states, cp_mesh)
         return (hidden_states,)
 
     def _post_hook(hook_module, hook_args, output):
         del hook_module, hook_args
-        if cp_mesh is not None:
-            output = _cp_slice(output, cp_mesh, dim=1)
         tp_placement = placements.pop() if placements else None
         return _seq_restore(output, tp_placement)
 
@@ -1077,15 +1026,12 @@ def _apply_tp_cp_ep(model, mesh, cfg) -> None:
         _apply_visual_sequence_roundtrip(model.model)
     if cp_size > 1:
         parallelize_qwen3_5_moe_cp(model, mesh["cp"])
-        # The trainer pre-shards the data sequence across CP; the VL visual /
-        # DeepStack injection is whole-sequence. Gather at the composite boundary,
-        # then slice decoder inputs after mask construction.
-        composite = model.model
-        _apply_full_sequence_input_cp_gather(composite, mesh["cp"])
-        _apply_text_decoder_input_cp_slice(composite.language_model, mesh["cp"])
-    if tp_size > 1 or cp_size > 1:
-        cp_mesh = mesh["cp"] if cp_size > 1 else None
-        _apply_deepstack_sequence_roundtrip(model.model.language_model, cp_mesh)
+        # The trainer pre-shards the data sequence across CP. The composite
+        # model gathers it for multimodal fusion and slices it again before
+        # entering the text decoder.
+        model.model.set_context_parallel_mesh(mesh["cp"])
+    if tp_size > 1:
+        _apply_deepstack_sequence_roundtrip(model.model.language_model)
     if ep_size > 1:
         parallelize_qwen3_5_moe_ep(
             model,

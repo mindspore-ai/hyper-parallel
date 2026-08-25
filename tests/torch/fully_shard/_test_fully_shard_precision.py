@@ -18,6 +18,7 @@ import os
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import numpy as np
+import pytest
 import torch
 import torch_npu
 from torch import optim
@@ -47,6 +48,23 @@ class SimpleRecomputeModel(torch.nn.Module):
             x = torch.relu(layer(x))
         return torch.sum(x)
 
+
+class UnevenShardModel(torch.nn.Module):
+    """Model with uneven and shorter-than-shard dim-0 parameters."""
+
+    def __init__(self):
+        super().__init__()
+        self.input_projection_weight = torch.nn.Parameter(torch.full((5, 8), 0.01).npu())
+        self.output_projection_weight = torch.nn.Parameter(torch.full((7, 5), 0.01).npu())
+        self.output_scale_weight = torch.nn.Parameter(torch.ones(1).npu())
+
+    def forward(self, x):
+        x = torch.matmul(x, self.input_projection_weight.t())
+        x = torch.relu(x)
+        x = torch.matmul(x, self.output_projection_weight.t())
+        return torch.sum(x * self.output_scale_weight)
+
+
 def _get_standard_fully_shard_kwargs(mp_policy, offload_policy=None):
     """get standard fully shard kwargs"""
     default_mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
@@ -61,18 +79,19 @@ def _get_standard_fully_shard_kwargs(mp_policy, offload_policy=None):
     return fsdp_kwargs
 
 
-def get_standalone_result(step, acc_grad=False):  # pylint: disable=unused-argument
+def get_standalone_result(step, acc_grad=False, model_factory=SimpleModel):  # pylint: disable=unused-argument
     """
     Get results from standalone (non-distributed) model training for comparison.
 
     Args:
         step (int): Number of training steps to execute
         acc_grad (bool): Whether to accumulate gradients without zeroing, defaults to False
+        model_factory (Callable): Builds the model used by this precision case.
 
     Returns:
-        tuple: (loss tensor, gradient tensor) from standalone training
+        tuple: Loss tensor and a mapping of parameter names to full gradients.
     """
-    standalone_model = SimpleModel().npu()
+    standalone_model = model_factory().npu()
     standalone_optimizer = optim.SGD(standalone_model.parameters(), lr=0.01)
     acc_epoch = 2
     acc_step = 4
@@ -80,47 +99,53 @@ def get_standalone_result(step, acc_grad=False):  # pylint: disable=unused-argum
         for _ in range(acc_step):
             standalone_loss = standalone_model(standalone_x.npu())
             standalone_loss.backward()
-            standalone_grad = standalone_model.weight.grad.data.clone()  # using for validation
+            standalone_grads = {
+                param_name: param.grad.data.clone()
+                for param_name, param in standalone_model.named_parameters()
+            }
             if not acc_grad:
                 standalone_optimizer.step()
                 standalone_optimizer.zero_grad()
         if acc_grad:
             standalone_optimizer.step()
             standalone_optimizer.zero_grad()
-    return standalone_loss, standalone_grad
+    return standalone_loss, standalone_grads
 
 
 def _tensor_storage_info(tensor):
     """Return the raw TensorImpl storage pointer and byte size."""
-    with getattr(torch, "_C").DisableTorchFunctionSubclass():
+    with torch._C.DisableTorchFunctionSubclass():  # pylint: disable=protected-access
         storage = tensor.untyped_storage()
-        storage_nbytes = storage.nbytes() if hasattr(storage, "nbytes") else storage.size()
-        return storage.data_ptr(), storage_nbytes
+        return storage.data_ptr(), storage.nbytes()
 
 
 def _assert_comm_fusion_flat_buffer_memory(model, optimizer):
-    """Verify comm_fusion keeps managed sharded parameter storage in the flat buffer."""
+    """Verify comm_fusion keeps managed parameter storage in its AllGather buckets."""
     state = model.hsdp_scheduler.hsdp_state
     param_group = state.param_group
     if param_group is None:
         raise AssertionError("comm_fusion should create an HSDPParamGroup.")
-    flat_buffer = param_group._flat_param_buffer  # pylint: disable=protected-access
-    if flat_buffer is None:
-        raise AssertionError("comm_fusion zero-copy should create a flat parameter buffer.")
+    flat_buffers = [
+        bucket.flat_param_buffer
+        for bucket in param_group.all_gather_buckets
+        if bucket.flat_param_buffer is not None
+    ]
+    if not flat_buffers:
+        raise AssertionError("comm_fusion zero-copy should create AllGather flat parameter buffers.")
 
     torch.npu.synchronize()
     allocated = torch.npu.memory_allocated()
-    flat_ptr, flat_nbytes = _tensor_storage_info(flat_buffer)
+    flat_storage_nbytes = dict(_tensor_storage_info(flat_buffer) for flat_buffer in flat_buffers)
     optimizer_param_ids = {
         id(param)
         for group in optimizer.param_groups
         for param in group["params"]
     }
-    unique_storage_nbytes = {flat_ptr: flat_nbytes}
+    unique_storage_nbytes = dict(flat_storage_nbytes)
     non_flat_storages = []
 
     for hsdp_param in state.hsdp_params:
-        param_fqn = getattr(hsdp_param, "_param_fqn", "<unknown>")
+        param_fqn = hsdp_param._param_fqn or "<unknown>"  # pylint: disable=protected-access
         if id(hsdp_param.sharded_param) not in optimizer_param_ids:
             raise AssertionError(f"Optimizer does not hold managed parameter {param_fqn}.")
 
@@ -132,15 +157,17 @@ def _assert_comm_fusion_flat_buffer_memory(model, optimizer):
         for label, tensor in checked_tensors:
             storage_ptr, storage_nbytes = _tensor_storage_info(tensor)
             unique_storage_nbytes[storage_ptr] = storage_nbytes
-            if storage_ptr != flat_ptr:
+            if storage_ptr not in flat_storage_nbytes:
                 non_flat_storages.append((param_fqn, label, storage_ptr, storage_nbytes))
 
     param_storage_nbytes = sum(unique_storage_nbytes.values())
-    if non_flat_storages or param_storage_nbytes != flat_nbytes:
+    flat_storage_total_nbytes = sum(flat_storage_nbytes.values())
+    if non_flat_storages or param_storage_nbytes != flat_storage_total_nbytes:
         raise AssertionError(
             "comm_fusion zero-copy should leave managed sharded parameter storage backed only by "
             f"flat_param_buffer after fully_shard. memory_allocated={allocated}, "
-            f"flat_param_buffer_nbytes={flat_nbytes}, managed_param_storage_nbytes={param_storage_nbytes}, "
+            f"flat_param_buffer_nbytes={flat_storage_total_nbytes}, "
+            f"managed_param_storage_nbytes={param_storage_nbytes}, "
             f"unique_storage_nbytes={unique_storage_nbytes}, non_flat_storages={non_flat_storages}."
         )
 
@@ -149,6 +176,7 @@ def get_fully_shard_result(
         step,
         acc_grad=False,
         check_comm_fusion_memory=False,
+        model_factory=SimpleModel,
         **fsdp_kwargs):  # pylint: disable=unused-argument
     """
     Get results from HSDP (Hybrid Sharded Data Parallel) distributed training.
@@ -158,23 +186,24 @@ def get_fully_shard_result(
         shard_size (int): Size of parameter sharding, defaults to 1
         optimizer_level (str): Optimization level ("level1", "level2", "level3"), defaults to "level1"
         acc_grad (bool): Whether to accumulate gradients without zeroing, defaults to False
+        model_factory (Callable): Builds the model used by this precision case.
 
     Returns:
-        tuple: (loss tensor, gradient tensor) from distributed HSDP training
+        tuple: Loss tensor, local gradients, and parameter names using RaggedShard gradients.
     """
-    dist_model = SimpleModel().npu()
+    dist_model = model_factory().npu()
     dist_x = standalone_x.npu()
     dist_model = fully_shard(dist_model, **fsdp_kwargs)
     # when loss is sum and DTensor not used, set grad comm type to sum for single-card precision compare
     dist_model.set_reduce_op_type("sum")
     dist_optimizer = optim.SGD(dist_model.parameters(), lr=0.01)
-    if check_comm_fusion_memory:
-        _assert_comm_fusion_flat_buffer_memory(dist_model, dist_optimizer)
     mesh: DeviceMesh = fsdp_kwargs['mesh']
     acc_epoch = 2
     acc_step = 4
+    comm_fusion_memory_checked = False
     with SkipDTensorDispatch():
-        dist_grad = None
+        dist_grads = {}
+        ragged_grad_param_names = set()
         for _ in range(acc_epoch):
             for _ in range(acc_step):
                 # if i == acc_step - 1:
@@ -182,21 +211,29 @@ def get_fully_shard_result(
                 # else:
                 #     dist_model.set_requires_grad_sync(False)
                 dist_loss = dist_model(dist_x)
+                if check_comm_fusion_memory and not comm_fusion_memory_checked:
+                    _assert_comm_fusion_flat_buffer_memory(dist_model, dist_optimizer)
+                    comm_fusion_memory_checked = True
                 # handle backward input
                 repeat_num = len(mesh.rank_list)
                 backward_input = torch.tensor(1.0 / repeat_num)
                 dist_loss.backward(backward_input)
-                if dist_model.weight.grad is not None:
-                    assert isinstance(dist_model.weight.grad, DTensor),\
-                        f"Expected dist_model.weight.grad to be a DTensor, but got {type(dist_model.weight.grad)}"
-                    dist_grad = dist_model.weight.grad.data.clone()
+                for param_name, param in dist_model.named_parameters():
+                    if param.grad is None:
+                        continue
+                    assert isinstance(param.grad, DTensor), \
+                        f"Expected {param_name}.grad to be a DTensor, but got {type(param.grad)}"
+                    if any(placement.is_ragged_shard() for placement in param.grad.placements):
+                        ragged_grad_param_names.add(param_name)
+                    dist_grads[param_name] = param.grad.data.clone()
                 if not acc_grad:
                     dist_optimizer.step()
                     dist_optimizer.zero_grad()
             if acc_grad:
                 dist_optimizer.step()
                 dist_optimizer.zero_grad()
-    return dist_loss, dist_grad
+    dist_model.reset_iter_state()
+    return dist_loss, dist_grads, ragged_grad_param_names
 
 
 def _build_prefetch_recompute_model(enable_recompute=False):
@@ -298,36 +335,77 @@ def shard_param_data_parallel_prefetch_recompute(acc_grad=False, **fsdp_kwargs):
                        0.001, 0.001)
 
 
-def shard_param_data_parallel(acc_grad=False, check_comm_fusion_memory=False, **fsdp_kwargs):
+def shard_param_data_parallel(
+        acc_grad=False,
+        check_comm_fusion_memory=False,
+        model_factory=SimpleModel,
+        **fsdp_kwargs):
     """shard param data parallel"""
     rank, _ = init_dist()
     step = 4
     mesh: DeviceMesh = fsdp_kwargs['mesh']
     shard_size = mesh.mesh_shape[-1]
-    standalone_loss, standalone_grad = get_standalone_result(step, acc_grad=acc_grad)
-    dist_loss, dist_grad = get_fully_shard_result(
+    standalone_loss, standalone_grads = get_standalone_result(
+        step,
+        acc_grad=acc_grad,
+        model_factory=model_factory,
+    )
+    dist_loss, dist_grads, ragged_grad_param_names = get_fully_shard_result(
         step,
         acc_grad=acc_grad,
         check_comm_fusion_memory=check_comm_fusion_memory,
+        model_factory=model_factory,
         **fsdp_kwargs,
     )
 
     assert np.allclose(standalone_loss.cpu().detach().numpy(),
                        dist_loss.cpu().detach().numpy(),
                        0.001, 0.001)
-    dp_stride = 8 // shard_size
-    dp_offset = rank % shard_size * dp_stride
-    assert np.allclose(standalone_grad.cpu().detach().numpy()[dp_offset: dp_offset + dp_stride, :],
-                       dist_grad.cpu().detach().numpy(),
-                       0.001, 0.001)
+    shard_rank = rank % shard_size
+    assert standalone_grads.keys() == dist_grads.keys()
+    for param_name, standalone_grad in standalone_grads.items():
+        dim0_shard_size = (standalone_grad.size(0) + shard_size - 1) // shard_size
+        shard_offset = min(shard_rank * dim0_shard_size, standalone_grad.size(0))
+        actual_shard_length = min(dim0_shard_size, standalone_grad.size(0) - shard_offset)
+        expected_grad = standalone_grad.narrow(0, shard_offset, actual_shard_length)
+        dist_grad = dist_grads[param_name]
+        if param_name in ragged_grad_param_names:
+            expected_grad = expected_grad.flatten()
+            dist_grad = dist_grad.flatten()
+            assert expected_grad.numel() == dist_grad.numel(), (
+                f"Ragged gradient local numel mismatch for {param_name}: "
+                f"expected={expected_grad.numel()}, actual={dist_grad.numel()}"
+            )
+        else:
+            assert expected_grad.shape == dist_grad.shape, (
+                f"Gradient shape mismatch for {param_name}: "
+                f"expected={expected_grad.shape}, actual={dist_grad.shape}"
+            )
+        assert np.allclose(expected_grad.cpu().detach().numpy(),
+                           dist_grad.cpu().detach().numpy(),
+                           0.001, 0.001), (
+            f"Gradient values mismatch for {param_name}: "
+            f"expected={expected_grad}, actual={dist_grad}"
+        )
 
 
-def test_zero3_fully_shard():
-    """test zero3 fully shard parallel"""
+@pytest.mark.parametrize(
+    "comm_fusion",
+    [False, True],
+    ids=["per_param", "param_group"],
+)
+def test_zero3_fully_shard(comm_fusion):
+    """Test zero3 fully shard through the per-parameter and ParamGroup paths."""
     init_dist()
     mp_policy = MixedPrecisionPolicy()
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
-    shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
+    fsdp_kwargs["comm_fusion"] = comm_fusion
+    shard_param_data_parallel(
+        acc_grad=False,
+        check_comm_fusion_memory=comm_fusion,
+        model_factory=UnevenShardModel,
+        **fsdp_kwargs,
+    )
 
 
 def test_zero3_fully_shard_with_mp():
@@ -348,68 +426,67 @@ def test_zero3_fully_shard_with_offload():
     shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
 
 
-def test_zero3_partial_shard():
-    """test zero3 partial shard parallel"""
+@pytest.mark.parametrize(
+    "comm_fusion",
+    [False, True],
+    ids=["per_param", "param_group"],
+)
+def test_zero3_partial_shard(comm_fusion):
+    """Test zero3 partial shard through the per-parameter and ParamGroup paths."""
     init_dist()
     op_size = 2
     mp_policy = MixedPrecisionPolicy()
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
     hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(2, op_size), mesh_dim_names=("dp", "op"))
     fsdp_kwargs['mesh'] = hsdp_mesh
-    shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
+    fsdp_kwargs["comm_fusion"] = comm_fusion
+    shard_param_data_parallel(
+        acc_grad=False,
+        check_comm_fusion_memory=comm_fusion,
+        **fsdp_kwargs,
+    )
 
 
-def test_zero3_fully_shard_prefetch_recompute():
-    """test zero3 fully shard parallel with child-module prefetch and activation recompute"""
+@pytest.mark.parametrize(
+    "comm_fusion",
+    [False, True],
+    ids=["per_param", "param_group"],
+)
+def test_zero3_fully_shard_prefetch_recompute(comm_fusion):
+    """Test zero3 fully shard with child-module prefetch and activation recompute on both comm paths."""
     init_dist()
     mp_policy = MixedPrecisionPolicy()
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
+    fsdp_kwargs["comm_fusion"] = comm_fusion
     shard_param_data_parallel_prefetch_recompute(**fsdp_kwargs)
 
 
-def test_zero3_partial_shard_prefetch_recompute():
-    """test zero3 partial shard parallel with child-module prefetch and activation recompute"""
+@pytest.mark.parametrize(
+    "comm_fusion",
+    [False, True],
+    ids=["per_param", "param_group"],
+)
+def test_zero3_partial_shard_prefetch_recompute(comm_fusion):
+    """Test zero3 partial shard with child-module prefetch and activation recompute on both comm paths."""
     init_dist()
     op_size = 2
     mp_policy = MixedPrecisionPolicy()
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
     hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(2, op_size), mesh_dim_names=("dp", "op"))
     fsdp_kwargs['mesh'] = hsdp_mesh
+    fsdp_kwargs["comm_fusion"] = comm_fusion
     shard_param_data_parallel_prefetch_recompute(**fsdp_kwargs)
 
 
-def test_zero3_fully_shard_prefetch_recompute_grad_accum():
-    """test zero3 fully shard parallel with child-module prefetch, activation recompute and grad accumulation"""
+@pytest.mark.parametrize(
+    "comm_fusion",
+    [False, True],
+    ids=["per_param", "param_group"],
+)
+def test_zero3_fully_shard_prefetch_recompute_grad_accum(comm_fusion):
+    """Test zero3 fully shard with prefetch, activation recompute and grad accumulation on both comm paths."""
     init_dist()
     mp_policy = MixedPrecisionPolicy()
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
+    fsdp_kwargs["comm_fusion"] = comm_fusion
     shard_param_data_parallel_prefetch_recompute(acc_grad=True, **fsdp_kwargs)
-
-
-def test_zero3_fully_shard_comm_fusion():
-    """
-    Feature: Test_zero3_fully_shard_comm_fusion.
-    Description: Test_zero3_fully_shard with comm fusion.
-    Expectation: case run successfully.
-    """
-    init_dist()
-    mp_policy = MixedPrecisionPolicy()
-    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
-    fsdp_kwargs["comm_fusion"] = True
-    shard_param_data_parallel(acc_grad=False, check_comm_fusion_memory=True, **fsdp_kwargs)
-
-
-def test_zero3_partial_shard_comm_fusion():
-    """
-    Feature: Test_zero3_partial_shard_comm_fusion.
-    Description: Test_zero3_partial_shard with comm fusion.
-    Expectation: case run successfully.
-    """
-    init_dist()
-    op_size = 2
-    mp_policy = MixedPrecisionPolicy()
-    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
-    hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(2, op_size), mesh_dim_names=("dp", "op"))
-    fsdp_kwargs['mesh'] = hsdp_mesh
-    fsdp_kwargs["comm_fusion"] = True
-    shard_param_data_parallel(acc_grad=False, check_comm_fusion_memory=True, **fsdp_kwargs)

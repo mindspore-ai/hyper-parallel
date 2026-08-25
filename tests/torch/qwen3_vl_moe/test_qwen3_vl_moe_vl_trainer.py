@@ -84,7 +84,6 @@ def test_qwen3_vl_moe_vl_dummy_smoke_group1():
         TorchCase(_WORKER, "test_qwen3_vl_moe_vl_dummy_smoke_2card_dp", 13901, 2),
         TorchCase(_WORKER, "test_qwen3_vl_moe_vl_dummy_smoke_1card", 13900, 1),
         TorchCase(_WORKER, "test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_dp1", 13908, 2),
-        TorchCase(_WORKER, "test_qwen3_vl_moe_vl_dummy_vision_cp_requires_reuse_opt_in_2card", 13907, 2),
     ])
 
 
@@ -103,7 +102,6 @@ def test_qwen3_vl_moe_vl_dummy_smoke_group2():
     _run_case_waves([
         TorchCase(_WORKER, "test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_cp_colossal", 13902, 2),
         TorchCase(_WORKER, "test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_cp_ulysses", 13903, 2),
-        TorchCase(_WORKER, "test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_cp_colossal_same_sample", 13910, 2),
         TorchCase(_WORKER, "test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_async_cp_colossal", 13914, 2),
     ])
 
@@ -114,38 +112,26 @@ def test_qwen3_vl_moe_vl_dummy_smoke_group2():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_qwen3_vl_moe_vl_dummy_loss_alignment_self_consistency():
+def test_qwen3_vl_moe_vl_dummy_loss_alignment():
     """
-    Feature: Qwen3-VL-MoE first-step loss self-consistency regression.
+    Feature: Qwen3-VL-MoE first-step loss alignment regression.
     Description: Compare independent distributed modes using batched captures.
     Expectation: Compared losses stay within tolerance.
     """
     losses = _collect_captured_losses([
-        ("test_qwen3_vl_moe_vl_dummy_capture_loss_1card_baseline", 13913, 1),
         ("test_qwen3_vl_moe_vl_dummy_capture_loss_2card_dp", 13904, 2),
         ("test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_dp1", 13909, 2),
-        ("test_qwen3_vl_moe_vl_dummy_capture_loss_2card_baseline_same_sample", 13912, 2),
         ("test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_cp_colossal", 13905, 2),
-        ("test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_cp_colossal_same_sample", 13911, 2),
         ("test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_cp_ulysses", 13906, 2),
         ("test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_async_cp_colossal", 13915, 2),
     ])
-    single_card_loss = losses[0]
-    baseline_loss = losses[1]
-    vision_dp1_loss = losses[2]
-    baseline_same_sample_loss = losses[3]
-    colossal_loss = losses[4]
-    colossal_same_sample_loss = losses[5]
-    ulysses_loss = losses[6]
-    async_colossal_loss = losses[7]
+    baseline_loss = losses[0]
+    vision_dp1_loss = losses[1]
+    colossal_loss = losses[2]
+    ulysses_loss = losses[3]
+    async_colossal_loss = losses[4]
 
     tolerance = 1.0e-5
-    assert math.isclose(
-        single_card_loss, baseline_same_sample_loss, rel_tol=1.0e-6, abs_tol=tolerance
-    ), (
-        "1-card baseline and 2-card same-sample baseline first-step losses diverged: "
-        f"{single_card_loss} vs {baseline_same_sample_loss}"
-    )
     assert math.isclose(
         baseline_loss, vision_dp1_loss, rel_tol=1.0e-6, abs_tol=tolerance
     ), (
@@ -157,12 +143,6 @@ def test_qwen3_vl_moe_vl_dummy_loss_alignment_self_consistency():
     ), (
         "Baseline DP/FSDP and visual CP (Pure Colossal) first-step losses diverged: "
         f"{baseline_loss} vs {colossal_loss}"
-    )
-    assert math.isclose(
-        baseline_same_sample_loss, colossal_same_sample_loss, rel_tol=1.0e-6, abs_tol=tolerance
-    ), (
-        "Same-sample baseline and visual CP (Pure Colossal, same-sample DP fanout) "
-        f"first-step losses diverged: {baseline_same_sample_loss} vs {colossal_same_sample_loss}"
     )
     assert math.isclose(
         baseline_loss, ulysses_loss, rel_tol=1.0e-6, abs_tol=tolerance

@@ -27,6 +27,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+
 
 def _gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
@@ -426,6 +429,66 @@ torch.utils._pytree.register_pytree_node(  # pylint: disable=protected-access
 )
 
 
+def _cp_shard_packed_sequence(
+    hidden_states: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    cp_mesh,
+    alignment: int = 1,
+) -> torch.Tensor:
+    """Slice every packed visual sequence onto this CP rank."""
+    cp_size = int(cp_mesh.size())
+    if cp_size <= 1:
+        return hidden_states
+
+    lengths = [int(length) for length in sequence_lengths.tolist()]
+    divisor = cp_size * alignment
+    invalid = [length for length in lengths if length % divisor != 0]
+    if invalid:
+        raise ValueError(
+            "Visual Encoder CP requires every packed image/frame sequence length "
+            f"to be divisible by cp*alignment={divisor}; got {invalid}."
+        )
+
+    cp_rank = cp_mesh.get_local_rank()
+    local_chunks = []
+    for chunk, length in zip(hidden_states.split(lengths, dim=0), lengths):
+        local_length = length // cp_size
+        start = cp_rank * local_length
+        local_chunks.append(chunk.narrow(0, start, local_length))
+    return torch.cat(local_chunks, dim=0).contiguous()
+
+
+def _cp_gather_packed_sequence(
+    hidden_states: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    cp_mesh,
+) -> torch.Tensor:
+    """Gather packed visual sequences and restore their original token order."""
+    cp_size = int(cp_mesh.size())
+    if cp_size <= 1:
+        return hidden_states
+    if isinstance(hidden_states, DTensor):
+        hidden_states = hidden_states.to_local()
+
+    lengths = [int(length) for length in sequence_lengths.tolist()]
+    local_lengths = [length // cp_size for length in lengths]
+    local_total = sum(local_lengths)
+    gathered = (
+        DTensor.from_local(hidden_states, cp_mesh, [Shard(0)])
+        .redistribute(cp_mesh, [Replicate()])
+        .to_local()
+    )
+    rank_chunks = gathered.split([local_total] * cp_size, dim=0)
+    rank_sequences = [
+        rank_chunk.split(local_lengths, dim=0) for rank_chunk in rank_chunks
+    ]
+    chunks = [
+        torch.cat([rank_sequences[rank][chunk_idx] for rank in range(cp_size)], dim=0)
+        for chunk_idx in range(len(lengths))
+    ]
+    return torch.cat(chunks, dim=0).contiguous()
+
+
 class Qwen3VLMoeVisionModel(nn.Module):
     """Native Qwen3-VL-MoE vision tower."""
 
@@ -451,10 +514,15 @@ class Qwen3VLMoeVisionModel(nn.Module):
             Qwen3VLMoeVisionPatchMerger(config, use_postshuffle_norm=True)
             for _ in self.deepstack_visual_indexes
         ])
+        self._hp_context_parallel_mesh = None
 
     @property
     def dtype(self):
         return self.patch_embed.proj.weight.dtype
+
+    def set_context_parallel_mesh(self, cp_mesh) -> None:
+        """Configure packed-sequence sharding for visual Encoder CP."""
+        self._hp_context_parallel_mesh = cp_mesh
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         # Compute ``max_hw`` / ``total_tokens`` via tensor reductions —
@@ -576,13 +644,33 @@ class Qwen3VLMoeVisionModel(nn.Module):
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
 
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0],
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+
+        cp_mesh = self._hp_context_parallel_mesh
+        if cp_mesh is not None and int(cp_mesh.size()) > 1:
+            hidden_states = _cp_shard_packed_sequence(
+                hidden_states,
+                sequence_lengths,
+                cp_mesh,
+                alignment=self.spatial_merge_unit,
+            )
+            rotary_pos_emb = _cp_shard_packed_sequence(
+                rotary_pos_emb, sequence_lengths, cp_mesh,
+            )
+            local_lengths = sequence_lengths // int(cp_mesh.size())
+            cu_seqlens = F.pad(
+                local_lengths.cumsum(dim=0, dtype=torch.int32),
+                (1, 0),
+                value=0,
+            )
+
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
 
         deepstack_features = []
         for layer_idx, block in enumerate(self.blocks):
@@ -596,6 +684,16 @@ class Qwen3VLMoeVisionModel(nn.Module):
                 deepstack_features.append(
                     self.deepstack_merger_list[merge_idx](hidden_states)
                 )
+
+        if cp_mesh is not None and int(cp_mesh.size()) > 1:
+            hidden_states = _cp_gather_packed_sequence(
+                hidden_states, sequence_lengths, cp_mesh,
+            )
+            feature_lengths = sequence_lengths // self.spatial_merge_unit
+            deepstack_features = [
+                _cp_gather_packed_sequence(feature, feature_lengths, cp_mesh)
+                for feature in deepstack_features
+            ]
 
         return Qwen3VLMoeVisionOutput(
             last_hidden_state=hidden_states,

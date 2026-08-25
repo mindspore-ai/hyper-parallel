@@ -172,8 +172,8 @@ class Muon(BaseDistributedOptimizer):
     def step(self, closure=None) -> Optional[float]:
         """
         Perform a single optimization step.
-        De-duplication is controlled by the caller: ``param_to_ns_input`` should already contain only the owned 
-        params (via ``hsdp_assign.owned_params``). The caller is responsible for broadcasting the updated params to 
+        De-duplication is controlled by the caller: ``param_to_ns_input`` should already contain only the owned
+        params (via ``hsdp_assign.owned_params``). The caller is responsible for broadcasting the updated params to
         replica peers via ``AsyncReplicateBroadcaster.flush_group``.
         """
         loss = None
@@ -691,7 +691,7 @@ class Muon(BaseDistributedOptimizer):
         working_inputs: Dict[torch.nn.Parameter, torch.Tensor] = {}
 
         for p in p_list:
-            origin_shape = tuple(getattr(p, 'local_shape', None) or p.to_local().shape) if no_shard else tuple(p.shape)
+            origin_shape = tuple(to_local_if_dtensor(p.data).shape) if no_shard else tuple(p.shape)
             ns_input = ns_inputs[p].view(origin_shape)
             origin_shapes[p] = origin_shape
 

@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -120,18 +120,22 @@ class NetWithScaler(nn.Cell):
         return x
 
 class SlimLeNet16(nn.Cell):
-    """Slim LeNet variant for 16-class classification"""
+    """Slim LeNet variant with uneven and shorter-than-shard parameters."""
     def __init__(self):
         super().__init__()
         self.flatten = nn.Flatten()
         self.dense_relu_sequential = nn.SequentialCell(
-            nn.Dense(28*28, 512, weight_init="normal", bias_init="zeros"),
+            nn.Dense(28*28, 513, weight_init="normal", bias_init="zeros"),
             nn.ReLU(),
-            nn.Dense(512, 512, weight_init="normal", bias_init="zeros"),
+            nn.Dense(513, 512, weight_init="normal", bias_init="zeros"),
             nn.ReLU(),
             nn.Dense(512, 16, weight_init="normal", bias_init="zeros")
+        )
+        self.output_scale_weight = Parameter(
+            initializer("ones", [1], self.dense_relu_sequential[4].weight.dtype),
+            name="output_scale_weight",
         )
 
     def construct(self, x):
         x = self.flatten(x)
-        return self.dense_relu_sequential(x)
+        return mint.mul(self.dense_relu_sequential(x), self.output_scale_weight)

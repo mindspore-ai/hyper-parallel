@@ -18,10 +18,11 @@ from typing import Optional
 
 from hyper_parallel.collectives.cc import get_group_local_rank
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.placement_types import Placement
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
-
+DType = platform.dtype
 
 @dataclass
 class MixedPrecisionPolicy:
@@ -36,9 +37,9 @@ class MixedPrecisionPolicy:
         reduce_dtype: Data type for gradient reduction. If None, uses param_dtype.
         output_dtype: Data type for module outputs. If None, no casting applied.
     """
-    param_dtype: Optional[platform.dtype] = None
-    reduce_dtype: Optional[platform.dtype] = None
-    output_dtype: Optional[platform.dtype] = None
+    param_dtype: Optional[DType] = None
+    reduce_dtype: Optional[DType] = None
+    output_dtype: Optional[DType] = None
     cast_forward_inputs: bool = True
     apply_grad_on_fp32_main_grad: bool = False
 
@@ -68,6 +69,11 @@ class CPUOffloadPolicy(OffloadPolicy):
             is constrained. (Default: True)
     """
     pin_memory: bool = True
+
+@dataclass
+class CommFusionPolicy():
+    enable_comm_fusion: bool = False
+    comm_fusion_zero_copy: bool = False
 
 
 @dataclass
@@ -111,3 +117,12 @@ class HSDPMeshInfo(FSDPMeshInfo, DDPMeshInfo):
     def __post_init__(self):
         # Calls `FSDPMeshInfo` -> `DDPMeshInfo` -> `DataParallelMeshInfo`
         super().__post_init__()
+
+
+@dataclass(frozen=True)
+class SourceShardMetaInfo:
+    """Describe a parameter's source TP/EP layout before fully_shard."""
+
+    mesh: DeviceMesh
+    placements: tuple[Placement, ...]
+    origin_is_dtensor: bool = False

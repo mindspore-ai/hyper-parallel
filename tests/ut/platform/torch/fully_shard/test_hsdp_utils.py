@@ -31,7 +31,6 @@ from torch import nn
 
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FullyShardParamMode,
-    HSDPConfigV2,
     ParamModuleInfo,
     _get_param_module_infos,
     _named_parameters_with_duplicates,
@@ -245,33 +244,8 @@ class TestGetParamModuleInfos(unittest.TestCase):
         self.assertEqual(info.shared_param_names, ["weight"])
 
 
-class TestHSDPConfigAndParamDiscovery(unittest.TestCase):
-    """Unit tests for config defaults and managed-parameter discovery."""
-
-    def test_config_derives_reduce_dtype_and_comm_fusion_flags(self):
-        """HSDPConfigV2 should preserve scheduler-facing configuration fields."""
-        mp_policy = SimpleNamespace(reduce_dtype=torch.float16)
-
-        config = HSDPConfigV2(
-            mesh="mesh",
-            reshard_after_forward=False,
-            shard_placement_fn="placement-fn",
-            mp_policy=mp_policy,
-            offload_policy="offload",
-            ignored_params={"ignored"},
-            replicate_params={"replicate"},
-            comm_fusion=True,
-            comm_fusion_zero_copy=True,
-        )
-
-        self.assertEqual(config.mesh, "mesh")
-        self.assertFalse(config.reshard_after_forward)
-        self.assertEqual(config.shard_placement_fn, "placement-fn")
-        self.assertEqual(config.reduce_dtype, torch.float16)
-        self.assertEqual(config.ignored_params, {"ignored"})
-        self.assertEqual(config.replicate_params, {"replicate"})
-        self.assertTrue(config.comm_fusion)
-        self.assertTrue(config.comm_fusion_zero_copy)
+class TestManagedParamDiscovery(unittest.TestCase):
+    """Unit tests for managed-parameter discovery."""
 
     def test_get_managed_modules_parameters_skips_ignored_duplicates_and_initialized(self):
         """Only unique, non-ignored, non-HSDP-initialized params should be managed."""
@@ -376,7 +350,8 @@ class TestGetHSDPState(unittest.TestCase):
 
         self.assertEqual(get_hsdp_state(module), "state")
         module.hsdp_scheduler = None
-        self.assertIsNone(get_hsdp_state(module))
+        with self.assertRaisesRegex(AssertionError, "contains 'hsdp_scheduler'"):
+            get_hsdp_state(module)
         self.assertIsNone(get_hsdp_state(object()))
 
 

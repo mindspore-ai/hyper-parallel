@@ -27,32 +27,6 @@ from hyper_parallel.platform.platform import PlatformType
 platform = get_platform()
 
 
-class HSDPConfigV2:
-    """HSDPConfigV2 inspect by torch fully_shard"""
-
-    def __init__(self,
-        mesh,
-        reshard_after_forward,
-        shard_placement_fn,
-        mp_policy,
-        offload_policy,
-        ignored_params=None,
-        replicate_params=None,
-        comm_fusion=False,
-        comm_fusion_zero_copy=False,
-    ):
-        self.mesh = mesh
-        self.reshard_after_forward = reshard_after_forward
-        self.shard_placement_fn = shard_placement_fn
-        self.mp_policy = mp_policy
-        self.offload_policy = offload_policy
-        self.ignored_params = ignored_params
-        self.replicate_params = replicate_params
-        self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
-        self.comm_fusion = comm_fusion
-        self.comm_fusion_zero_copy = comm_fusion_zero_copy
-
-
 class ShardedState(Enum):
     """
     Parameter shard state
@@ -62,20 +36,7 @@ class ShardedState(Enum):
 
 
 class FullyShardParamMode(Enum):
-    """
-    Internal fully_shard execution modes derived from the original parameter layout.
-
-    LOCAL_PARAM:
-        The parameter is a regular local tensor parameter and fully_shard owns the
-        full data-parallel sharding behaviour.
-    DTENSOR_COMPAT:
-        The parameter already carries a DTensor layout and fully_shard is only used
-        as the compatibility wrapper without adding an extra FSDP shard dimension.
-    DTENSOR_UNIFIED:
-        The parameter already carries a DTensor layout and fully_shard additionally
-        contributes a data-parallel/FSDP mesh that must be unified with the
-        existing distributed layout.
-    """
+    """Internal fully_shard execution modes derived from parameter layout."""
 
     LOCAL_PARAM = auto()
     DTENSOR_COMPAT = auto()
@@ -223,13 +184,7 @@ def infer_fully_shard_param_mode(
     mesh: Optional[DeviceMesh],
     params: Optional[Sequence[Any]] = None,
 ) -> FullyShardParamMode:
-    """
-    Infer the internal fully_shard execution mode from parameter layout and mesh.
-
-    The mode is intentionally phrased around whether parameters already carry a
-    distributed layout instead of assuming the layout came from TP only. DTensor
-    parameters may originate from TP, EP, or other distributed sharding paths.
-    """
+    """Infer the compatibility parameter mode from parameter layout and mesh."""
     has_dtensor_param = any(is_dtensor_managed_param(param) for param in params or ())
     if not has_dtensor_param:
         return FullyShardParamMode.LOCAL_PARAM
@@ -328,9 +283,9 @@ def get_hsdp_state(module):
     """Return the HSDPState for a fully_shard-managed module, or None."""
     from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
     if isinstance(module, HSDPModule):
-        scheduler = getattr(module, "hsdp_scheduler", None)
-        if scheduler is not None:
-            return scheduler.hsdp_state
+        if module.hsdp_scheduler is None:
+            raise AssertionError("Expect HSDPModule contains 'hsdp_scheduler'.")
+        return module.hsdp_scheduler.hsdp_state
 
 
 def apply_gradient_scaling_factor(reduced_grad: Any, factor: Any) -> None:

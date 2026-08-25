@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -114,11 +114,11 @@ class HSDPParamV2:
         """Initialize dtype attributes from mixed precision policy."""
         raise NotImplementedError("HSDP param subclasses must implement init_dtype_attrs")
 
-    def init_all_gather_outputs(
+    def init_unsharded_param_buffers(
         self, all_gather_input_numels, all_gather_input_dtypes, world_size, device, force_recreate=False
     ):
-        """Allocate or reuse output buffers for all-gather communication."""
-        raise NotImplementedError("HSDP param subclasses must implement init_all_gather_outputs")
+        """Allocate or reuse buffers that hold unsharded parameter data."""
+        raise NotImplementedError("HSDP param subclasses must implement init_unsharded_param_buffers")
 
     def init_unsharded_param(self):
         """Reconstruct the full unsharded parameter from all-gather outputs."""
@@ -144,12 +144,12 @@ class HSDPParamV2:
         """Accumulate unsharded param grad into accumulated grad buffer if both exist."""
         raise NotImplementedError("HSDP param subclasses must implement accumulate_unsharded_grad_if_needed")
 
-    def alloc_all_gather_outputs(self):
-        """Resize all-gather output buffers to their full capacity for communication."""
-        raise NotImplementedError("HSDP param subclasses must implement alloc_all_gather_outputs")
+    def alloc_unsharded_param_buffers(self):
+        """Restore unsharded parameter buffers to their full capacity."""
+        raise NotImplementedError("HSDP param subclasses must implement alloc_unsharded_param_buffers")
 
     def free_unsharded_param(self):
-        """Release storage of all-gather outputs and inner tensors to free device memory."""
+        """Release unsharded parameter buffers and inner tensors."""
         raise NotImplementedError("HSDP param subclasses must implement free_unsharded_param")
 
     @property

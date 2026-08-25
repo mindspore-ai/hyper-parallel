@@ -36,12 +36,15 @@ from hyper_parallel.core.fully_shard.api import (
     _get_device_from_mesh,
     _normalize_replicate_params,
     _resolve_local_tensor,
+    _validate_managed_params_source_shard_infos,
     _validate_module_for_fully_shard,
     fully_shard,
+    HSDPModule,
     get_model_state_dict,
     hsdp_sync_stream,
 )
-from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, SourceShardMetaInfo
+from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.platform.platform import PlatformType
 
 
@@ -339,6 +342,68 @@ class TestFullyShardListAPI(unittest.TestCase):
         mesh = MagicMock()
         mesh.ndim = 1
         return mesh
+
+    def test_source_shard_infos_validation_requires_complete_managed_parameter_map(self):
+        """TP metadata must cover exactly the parameters managed by one fully_shard call."""
+        first = nn.Parameter(torch.ones(2))
+        second = nn.Parameter(torch.ones(2))
+        external = nn.Parameter(torch.ones(2))
+        managed = {first, second}
+        metadata = SourceShardMetaInfo(self._create_mock_mesh(), (Replicate(),))
+
+        with self.assertRaisesRegex(ValueError, "cover every parameter"):
+            _validate_managed_params_source_shard_infos(managed, {first: metadata})
+        with self.assertRaisesRegex(ValueError, "not managed"):
+            _validate_managed_params_source_shard_infos(managed, {first: metadata, second: metadata, external: metadata})
+        with self.assertRaisesRegex(ValueError, "SourceShardMetaInfo"):
+            _validate_managed_params_source_shard_infos(managed, {first: metadata, second: object()})
+        origin_metadata = SourceShardMetaInfo(self._create_mock_mesh(), (Replicate(),), origin_is_dtensor=True)
+        with self.assertRaisesRegex(ValueError, "origin_is_dtensor"):
+            _validate_managed_params_source_shard_infos(managed, {first: metadata, second: origin_metadata})
+
+    def test_source_shard_infos_rejects_native_dtensor_mixing(self):
+        """The explicit plain-parameter map cannot be mixed with native DTensor parameters."""
+        parameter = nn.Parameter(torch.ones(2))
+        metadata = {parameter: SourceShardMetaInfo(self._create_mock_mesh(), (Replicate(),))}
+
+        with patch(
+            "hyper_parallel.core.fully_shard.api.DTensor",
+            nn.Parameter,
+        ), self.assertRaisesRegex(ValueError, "native DTensor"):
+            _validate_managed_params_source_shard_infos({parameter}, metadata)
+
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_source_shard_infos_is_forwarded_by_fully_shard(self, mock_platform, mock_get_device):
+        """The validated parameter-identity map reaches the scheduler initialization."""
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_get_device.return_value = self.device
+        mesh = self._create_mock_mesh()
+        module = SimpleLinear(2, 2)
+        metadata = SourceShardMetaInfo(mesh, (Replicate(),))
+        source_shard_infos = {
+            module.weight: metadata,
+            module.bias: metadata,
+        }
+
+        with patch.object(HSDPModule, "hsdp_init") as mock_hsdp_init:
+            fully_shard(module, mesh=mesh, source_shard_infos=source_shard_infos)
+
+        self.assertIs(mock_hsdp_init.call_args.kwargs["source_shard_infos"], source_shard_infos)
+
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_source_shard_infos_none_is_forwarded_as_none(self, mock_platform, mock_get_device):
+        """A missing TP metadata map should remain None through fully_shard initialization."""
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_get_device.return_value = self.device
+        module = SimpleLinear(2, 2)
+        mesh = self._create_mock_mesh()
+
+        with patch.object(HSDPModule, "hsdp_init") as mock_hsdp_init:
+            fully_shard(module, mesh=mesh, source_shard_infos=None)
+
+        self.assertIsNone(mock_hsdp_init.call_args.kwargs["source_shard_infos"])
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")

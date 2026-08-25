@@ -13,16 +13,19 @@ model:
     dp_shard: 1
     cp: 2
     ulysses_degree: 1
-    reuse_dp_shard_mesh: true
-    share_samples_across_dp: true
+    async_cp: false
+train:
+  accelerator:
+    dp_shard: 1
+    cp: 2
 ```
 
 含义很直接：
 
 - `dp_shard: 1` 让视觉塔参数保持复制，文本侧仍可按全局 `train.accelerator.dp_shard` 工作。
-- `cp: 2` 只作用于视觉 encoder。
-- `reuse_dp_shard_mesh: true` 表示视觉 CP 可以复用 `dp_shard` mesh。
-- `share_samples_across_dp: true` 只用于验证和自洽对齐，不建议作为常规训练模式。
+- `cp: 2` 只作用于视觉 encoder；使用时需要和 `train.accelerator.cp` 匹配。
+- `ulysses_degree: 1` 表示 Pure Colossal，`ulysses_degree: 2` 表示 Pure Ulysses。
+- `async_cp: true` 时启用视觉 encoder 的异步 CP 路径。
 
 ## 保存恢复
 
@@ -45,7 +48,7 @@ train:
 
 - 100 step 训练模板
 - 保存恢复模板
-- 视觉 encoder DP/CP 验证模板
+- 视觉 encoder DP/CP/async CP 模板
 
 ## 测试入口
 

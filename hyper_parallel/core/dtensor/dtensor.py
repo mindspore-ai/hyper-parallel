@@ -332,12 +332,15 @@ class DTensor(DTensorBase):
         *,
         run_check: bool = False,
         shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
     ) -> 'DTensor':
         """
         Create a DTensor from a local tensor with device mesh and placements.
 
         Args:
-            local_tensor (Tensor): The local tensor shard on this device.
+            local_tensor (Tensor): The local tensor shard on this device. For
+                ``RaggedShard``, the input may use its natural rank-local shape;
+                construction stores it as a one-dimensional view internally.
             device_mesh (DeviceMesh): The device mesh describing the device topology.
             placements: The placement strategy. Supports two styles:
                 - Placement objects (e.g., ``[Shard(0), Replicate()]``).
@@ -349,6 +352,9 @@ class DTensor(DTensorBase):
                 Default: ``False``.
             shape (tuple[int, ...], optional): Explicit logical global shape.
                 Required for RaggedShard.
+            stride (tuple[int, ...], optional): Explicit logical global stride.
+                Requires ``shape``. Normal layouts also retain compatibility
+                with shape-only construction.
 
         Returns:
             DTensor: A new DTensor instance.
@@ -359,18 +365,36 @@ class DTensor(DTensorBase):
             >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
             >>> dtensor = DTensor.from_local(local_tensor, mesh, ("dp", "None"))
         """
+        tensor_dim = len(shape) if shape is not None else len(local_tensor.shape)
+        layout = _build_layout(device_mesh, placements, tensor_dim)
+        is_ragged = _layout_has_ragged_shard(layout)
+        if is_ragged:
+            if stride is not None and shape is None:
+                raise ValueError("stride requires an explicit shape")
+            if hasattr(local_tensor, "is_contiguous") and not local_tensor.is_contiguous():
+                raise ValueError("RaggedShard local tensor must be contiguous")
+            local_tensor = local_tensor.view(-1)
+        elif stride is not None and shape is None:
+            raise ValueError("stride requires an explicit shape")
         if run_check:
             # pylint: disable=C0415
             from hyper_parallel.core.dtensor._from_local_utils import run_from_local_checks
-            tensor_dim = len(shape) if shape is not None else len(local_tensor.shape)
-            layout = _build_layout(device_mesh, placements, tensor_dim)
             run_from_local_checks(
                 local_tensor,
                 device_mesh,
                 layout.placements,
                 shape=shape,
             )
-        return DTensor(local_tensor, device_mesh, placements, shape=shape)
+        if shape is not None and stride is not None:
+            layout = cp.deepcopy(layout)
+            layout.set_tensor_meta(shape, stride, local_tensor.dtype)
+        return DTensor(
+            local_tensor,
+            device_mesh,
+            layout.placements,
+            layout,
+            shape=shape,
+        )
 
     @staticmethod
     def from_local_with_layout(
@@ -409,13 +433,28 @@ class DTensor(DTensorBase):
     def _from_converted_local(self, local_tensor: Tensor) -> 'DTensor':
         """Rebuild converted DTensor data without preserving Parameter identity."""
         cls = DTensor if isinstance(self, platform.Parameter) else self.__class__
-        kwargs = {
-            "device_mesh": self._device_mesh,
-            "placements": self._alias_placements(),
-        }
-        if hasattr(self, "_global_shape"):
-            kwargs["shape"] = self._global_shape
-        return cls(local_tensor, **kwargs)
+        if not isinstance(self._layout, Layout):
+            constructor_kwargs = {
+                "device_mesh": self._device_mesh,
+                "placements": self._alias_placements(),
+            }
+            if hasattr(self, "_global_shape"):
+                constructor_kwargs["shape"] = self._global_shape
+            return cls(local_tensor, **constructor_kwargs)
+        layout = cp.deepcopy(self._layout)
+        if layout.tensor_shape is not None:
+            layout.set_tensor_meta(
+                layout.tensor_shape,
+                layout.tensor_stride,
+                local_tensor.dtype,
+            )
+        return cls(
+            local_tensor,
+            device_mesh=self._device_mesh,
+            placements=layout.placements,
+            layout=layout,
+            shape=getattr(self, "_global_shape", None),
+        )
 
     def to(self, *args, **kwargs):
         """Move the DTensor to a different device or dtype.
@@ -1316,9 +1355,9 @@ def _dtensor_init_helper(
         local_tensor = init_op(local_shape, **kwargs)
 
     return DTensor.from_local(
-            local_tensor,
-            device_mesh,
-            placements,
+        local_tensor,
+        device_mesh,
+        placements,
     )
 
 

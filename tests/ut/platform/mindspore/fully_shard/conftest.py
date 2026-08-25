@@ -16,11 +16,6 @@
 import unittest
 
 import pytest
-
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
-from hyper_parallel.platform.mindspore.fully_shard import param_group as param_group_mod
-from hyper_parallel.platform.mindspore.fully_shard.param_group import AllGatherMetadataCache
-from hyper_parallel.platform.mindspore.fully_shard.state import MindSporeHSDPStateV2
 from tests.ut.platform.mindspore._ensure_mindspore_platform import (
     _force_cpu_device_target,
     ensure_mindspore_platform_for_fully_shard,
@@ -33,18 +28,9 @@ UT_MS_DEVICE_TAG = "CPU:0"
 
 
 def reset_mindspore_fully_shard_shared_state() -> None:
-    """Isolate fused-comm globals and pin CPU backend between UT cases."""
+    """Pin the MindSpore fully_shard UT runtime to the CPU backend."""
     ensure_mindspore_platform_for_fully_shard()
     _force_cpu_device_target()
-    HSDPSchedulerV2.root_bp_state = False
-    param_group_mod.comm_ctx.comm_handle = None
-    param_group_mod.comm_ctx.all_reduce_handle = None
-    param_group_mod.comm_ctx.pre_param_group = None
-    param_group_mod.comm_ctx.all_reduce_param_group = None
-    MindSporeHSDPStateV2.pre_direct_all_reduce_grads.clear()
-    MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
-    MindSporeHSDPStateV2.pending_all_reduce_groups.clear()
-    AllGatherMetadataCache._cache.clear()
 
 
 class MindSporeFullyShardUnitTest(unittest.TestCase):

@@ -62,6 +62,18 @@ def _build_args(
     global_batch_size: Optional[int] = None,
 ) -> HyperTrainerConfig:
     """Build a minimal trainer config for the requested distributed smoke case."""
+    vision_cp = int((vision_parallel or {}).get("cp", 1) or 1)
+    if vision_cp > 1:
+        if world_size % vision_cp != 0:
+            raise ValueError(
+                f"world_size={world_size} must be divisible by vision_parallel.cp={vision_cp}."
+            )
+        dp_shard = world_size // vision_cp
+        cp = vision_cp
+    else:
+        dp_shard = world_size
+        cp = 1
+
     config_overrides = {
         "vl": True,
         "text_config": {
@@ -112,7 +124,8 @@ def _build_args(
             init_device="meta",
             local_rank=int(os.environ.get("LOCAL_RANK", "0")),
             accelerator=AcceleratorConfig(
-                dp_shard=world_size,
+                dp_shard=dp_shard,
+                cp=cp,
                 comm_fusion=False,
             ),
             optimizer=OptimizerConfig(
@@ -143,7 +156,7 @@ def _build_args(
 
 
 def _maybe_write_captured_loss(case_name: str, loss: Optional[float]) -> None:
-    """Write a rank-zero loss result for launcher-side consistency checks."""
+    """Write a rank-zero loss result for launcher-side collection."""
     path = os.environ.get("HP_QWEN3_VL_MOE_CAPTURE_FILE")
     if not path:
         master_port = os.environ.get("MASTER_PORT")
@@ -210,7 +223,7 @@ def test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_cp_colossal():
     _run_vl_smoke(
         "smoke_2card_vision_cp_colossal",
         world_size=2,
-        vision_parallel={"cp": 2, "ulysses_degree": 1, "reuse_dp_shard_mesh": True},
+        vision_parallel={"cp": 2, "ulysses_degree": 1},
     )
 
 
@@ -228,22 +241,7 @@ def test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_cp_ulysses():
     _run_vl_smoke(
         "smoke_2card_vision_cp_ulysses",
         world_size=2,
-        vision_parallel={"cp": 2, "ulysses_degree": 2, "reuse_dp_shard_mesh": True},
-    )
-
-
-def test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_cp_colossal_same_sample():
-    """Feature: 2-card visual Encoder CP smoke with same-sample DP fanout."""
-    _run_vl_smoke(
-        "smoke_2card_vision_cp_colossal_same_sample",
-        world_size=2,
-        vision_parallel={
-            "cp": 2,
-            "ulysses_degree": 1,
-            "reuse_dp_shard_mesh": True,
-            "share_samples_across_dp": True,
-        },
-        global_batch_size=1,
+        vision_parallel={"cp": 2, "ulysses_degree": 2},
     )
 
 
@@ -252,41 +250,8 @@ def test_qwen3_vl_moe_vl_dummy_smoke_2card_vision_async_cp_colossal():
     _run_vl_smoke(
         "smoke_2card_vision_async_cp_colossal",
         world_size=2,
-        vision_parallel={
-            "cp": 2,
-            "ulysses_degree": 1,
-            "reuse_dp_shard_mesh": True,
-            "async_cp": True,
-        },
+        vision_parallel={"cp": 2, "ulysses_degree": 1, "async_cp": True},
     )
-
-
-def test_qwen3_vl_moe_vl_dummy_vision_cp_requires_reuse_opt_in_2card():
-    """Feature: 2-card visual Encoder CP requires explicit dp_shard reuse opt-in."""
-    try:
-        _run_vl_case(
-            "smoke_2card_vision_cp_requires_reuse_opt_in",
-            world_size=2,
-            vision_parallel={"cp": 2, "ulysses_degree": 1},
-        )
-    except ValueError as exc:
-        if "reuse_dp_shard_mesh" not in str(exc):
-            raise AssertionError(f"unexpected error message: {exc}") from exc
-    else:
-        raise AssertionError("vision CP without reuse_dp_shard_mesh opt-in unexpectedly succeeded")
-    finally:
-        if dist.is_initialized():
-            destroy_process_group()
-
-
-def test_qwen3_vl_moe_vl_dummy_capture_loss_1card_baseline():
-    """Feature: capture 1-card baseline first-step loss for self-consistency comparison."""
-    loss = _run_vl_case(
-        "align_1card_baseline",
-        world_size=1,
-        global_batch_size=1,
-    )
-    _maybe_write_captured_loss("align_1card_baseline", loss)
 
 
 def test_qwen3_vl_moe_vl_dummy_capture_loss_2card_dp():
@@ -305,41 +270,14 @@ def test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_dp1():
     _maybe_write_captured_loss("align_2card_vision_dp1", loss)
 
 
-def test_qwen3_vl_moe_vl_dummy_capture_loss_2card_baseline_same_sample():
-    """Feature: capture 2-card baseline first-step loss with same-sample DP fanout."""
-    loss = _run_vl_case(
-        "align_2card_baseline_same_sample",
-        world_size=2,
-        vision_parallel={"share_samples_across_dp": True},
-        global_batch_size=1,
-    )
-    _maybe_write_captured_loss("align_2card_baseline_same_sample", loss)
-
-
 def test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_cp_colossal():
     """Feature: capture 2-card visual CP Pure Colossal first-step loss."""
     loss = _run_vl_case(
         "align_2card_vision_cp_colossal",
         world_size=2,
-        vision_parallel={"cp": 2, "ulysses_degree": 1, "reuse_dp_shard_mesh": True},
+        vision_parallel={"cp": 2, "ulysses_degree": 1},
     )
     _maybe_write_captured_loss("align_2card_vision_cp_colossal", loss)
-
-
-def test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_cp_colossal_same_sample():
-    """Feature: capture same-sample visual CP Pure Colossal first-step loss."""
-    loss = _run_vl_case(
-        "align_2card_vision_cp_colossal_same_sample",
-        world_size=2,
-        vision_parallel={
-            "cp": 2,
-            "ulysses_degree": 1,
-            "reuse_dp_shard_mesh": True,
-            "share_samples_across_dp": True,
-        },
-        global_batch_size=1,
-    )
-    _maybe_write_captured_loss("align_2card_vision_cp_colossal_same_sample", loss)
 
 
 def test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_cp_ulysses():
@@ -347,7 +285,7 @@ def test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_cp_ulysses():
     loss = _run_vl_case(
         "align_2card_vision_cp_ulysses",
         world_size=2,
-        vision_parallel={"cp": 2, "ulysses_degree": 2, "reuse_dp_shard_mesh": True},
+        vision_parallel={"cp": 2, "ulysses_degree": 2},
     )
     _maybe_write_captured_loss("align_2card_vision_cp_ulysses", loss)
 
@@ -357,11 +295,6 @@ def test_qwen3_vl_moe_vl_dummy_capture_loss_2card_vision_async_cp_colossal():
     loss = _run_vl_case(
         "align_2card_vision_async_cp_colossal",
         world_size=2,
-        vision_parallel={
-            "cp": 2,
-            "ulysses_degree": 1,
-            "reuse_dp_shard_mesh": True,
-            "async_cp": True,
-        },
+        vision_parallel={"cp": 2, "ulysses_degree": 1, "async_cp": True},
     )
     _maybe_write_captured_loss("align_2card_vision_async_cp_colossal", loss)

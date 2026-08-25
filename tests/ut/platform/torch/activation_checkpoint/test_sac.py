@@ -34,6 +34,7 @@ from hyper_parallel.platform.torch.activation_checkpoint.sac import (
     _maybe_detach,
     _policy_from_bool,
     create_selective_checkpoint_contexts,
+    ignore_sac_ops,
 )
 
 
@@ -80,6 +81,25 @@ class TestSacHelpers(unittest.TestCase):
         self.assertIs(entry.save.val, cached)
         self.assertIs(entry.swap.val, cached)
         self.assertTrue(entry.swap.group_swap)
+
+    def test_ignore_sac_ops_adds_available_operators(self):
+        """Added runtime operators should execute without policy evaluation."""
+        op = torch.ops.aten.add.Tensor
+        original_ignored_ops = set(sac.SAC_IGNORED_OPS)
+        self.addCleanup(sac.SAC_IGNORED_OPS.update, original_ignored_ops)
+        self.addCleanup(sac.SAC_IGNORED_OPS.intersection_update, original_ignored_ops)
+
+        ignore_sac_ops([op, None])
+        policy_fn = MagicMock(return_value=CheckpointPolicy.MUST_SAVE)
+        caching, _ = create_selective_checkpoint_contexts(policy_fn)
+        x = torch.tensor([1.0])
+        with caching:
+            result = torch.add(x, x)
+
+        self.assertIn(op, sac.SAC_IGNORED_OPS)
+        self.assertNotIn(None, sac.SAC_IGNORED_OPS)
+        self.assertTrue(torch.equal(result, torch.tensor([2.0])))
+        policy_fn.assert_not_called()
 
 
 class TestCreateSelectiveCheckpointContexts(unittest.TestCase):

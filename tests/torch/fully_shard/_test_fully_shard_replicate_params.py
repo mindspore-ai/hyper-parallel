@@ -40,9 +40,10 @@ class C(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.lin_c = nn.Linear(dim, dim)
+        self.output_scale_weight = nn.Parameter(torch.ones(3))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lin_c(x)
+        return self.lin_c(x) + self.output_scale_weight.mean()
 
 
 class B(nn.Module):
@@ -127,6 +128,7 @@ def get_standalone_result(step, acc_grad=False):
             "subtrahend": model.module_b.subtrahend.grad.clone(),
             "lin_c.weight": model.module_b.module_c.lin_c.weight.grad.clone(),
             "lin_c.bias": model.module_b.module_c.lin_c.bias.grad.clone(),
+            "output_scale_weight": model.module_b.module_c.output_scale_weight.grad.clone(),
         }
         if not acc_grad:
             opt.step()
@@ -159,6 +161,13 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
     fsdp_kwargs['replicate_params'] = replicate_set
     dist_model = fully_shard(model, **fsdp_kwargs)
     dist_model.set_reduce_op_type("sum")
+    output_scale_weight = dist_model.module_b.module_c.output_scale_weight
+    output_scale_hsdp_param = next(
+        hsdp_param for hsdp_param in dist_model.hsdp_scheduler.hsdp_state.hsdp_params
+        if hsdp_param.sharded_param is output_scale_weight
+    )
+    assert output_scale_weight.shape[0] % mesh.mesh_shape[-1] != 0
+    assert output_scale_hsdp_param.is_replicate_param and output_scale_hsdp_param.shard_world_size == 1
 
     opt = optim.SGD(dist_model.parameters(), lr=0.01)
     with SkipDTensorDispatch():
@@ -172,6 +181,7 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
                 "subtrahend": dist_model.module_b.subtrahend.grad,
                 "lin_c.weight": dist_model.module_b.module_c.lin_c.weight.grad,
                 "lin_c.bias": dist_model.module_b.module_c.lin_c.bias.grad,
+                "output_scale_weight": dist_model.module_b.module_c.output_scale_weight.grad,
             }
             grads = {k: v.clone() if v is not None else None for k, v in grads.items()}
             if not acc_grad:
@@ -187,7 +197,7 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
 def shard_param_data_parallel(acc_grad=False, **fsdp_kwargs):
     """shard param data parallel"""
     rank, _ = init_dist()
-    step = 4
+    step = 20
     mesh: DeviceMesh = fsdp_kwargs['mesh']
     shard_size = mesh.mesh_shape[-1]
     standalone_loss, standalone_grad = get_standalone_result(step, acc_grad=acc_grad)

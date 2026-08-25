@@ -591,6 +591,10 @@ class TestParallelElementwiseOps(unittest.TestCase):
             extra_args={"input_shapes": [(16,), (4, 8, 16)]},
             flag=False
         )
+        output_layout = self.op.infer_layout(
+            [x_layout, y_layout, [(16,), (4, 8, 16)]]
+        )[0][0]
+        assert output_layout.placements == [Shard(0), Shard(1), Shard(2)]
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_no_input_shapes_provided_22(self, mock_platform):

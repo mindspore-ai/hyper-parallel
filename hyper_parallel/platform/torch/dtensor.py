@@ -244,8 +244,16 @@ class DTensorBase(Tensor):
     @property
     # pylint: disable=C2801
     def data(self):
-        """Return the underlying Tensor's data view, bypassing DTensor wrappers."""
-        return Tensor.data.__get__(self, type(self))
+        """
+        Directory get Tensor.data relative storage.
+        After DTensor object created, there are two reference on underlying storage. (.data and ._local_tensor)
+        If not using DisableTorchFunctionSubclass, Tensor.__get__ will goto '__torch_function__',
+        and finally return '._local_tensor' storage.
+        """
+        with getattr(torch, "_C").DisableTorchFunctionSubclass():
+            # Directory get Tensor.data relative storage.
+            # If not using DisableTorchFunctionSubclass, Tensor.__get__ will goto __torch_funtin
+            return Tensor.data.__get__(self, type(self))
 
     @data.setter
     # pylint: disable=C2801

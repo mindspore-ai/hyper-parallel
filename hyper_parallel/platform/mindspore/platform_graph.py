@@ -53,6 +53,10 @@ class MindSporeGraphPlatform(MindSporePlatform):
         raise NotImplementedError("create_selective_checkpoint_contexts is not supported on MindSpore Graph platform")
 
     @staticmethod
+    def ignore_sac_ops(ignore_ops: list[object | None]) -> None:
+        raise NotImplementedError("ignore_sac_ops is not supported on MindSpore Graph platform")
+
+    @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
         raise NotImplementedError("async_save_on_cpu is not supported on MindSpore Graph platform")
 
