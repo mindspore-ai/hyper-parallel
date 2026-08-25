@@ -24,7 +24,6 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.auto_models.components.model_transform import module_replacement
 from hyper_parallel.auto_models.ops import mhc_post, mhc_pre
-from hyper_parallel.auto_models.ops.mhc_post import mhc_post_process
 
 
 def _required_attribute(module: nn.Module, name: str) -> Any:
@@ -127,8 +126,6 @@ class MhcPreModule(nn.Module):
         self.hc_eps = float(_required_attribute(module, "hc_eps"))
         self.norm_eps = float(_required_attribute(module, "norm_eps"))
         self.mhc_recur_norm = int(_required_config_value(module, "mhc_recur_norm"))
-        self.mhc_hpre_renorm = bool(_required_config_value(module, "mhc_hpre_renorm"))
-        self.use_mhc_ascendc_pre = bool(_required_config_value(module, "use_mhc_ascendc_pre"))
         if self.hc_eps <= 0 or self.norm_eps <= 0:
             raise ValueError("MHC eps values must be positive")
         if self.mhc_recur_norm <= 0:
@@ -150,8 +147,6 @@ class MhcPreModule(nn.Module):
             self.norm_eps,
             self.hc_eps,
             gamma,
-            self.mhc_hpre_renorm,
-            self.use_mhc_ascendc_pre,
         )
 
 
@@ -177,7 +172,6 @@ class MhcPostModule(nn.Module):
         del module_fqn, context
         self.config = getattr(module, "config", None)
         self.num_stream = _num_stream(module)
-        self.use_mhc_ascendc_post = bool(_required_config_value(module, "use_mhc_ascendc_post"))
         self.train(module.training)
 
     def forward(
@@ -194,82 +188,4 @@ class MhcPostModule(nn.Module):
             h_post,
             h_res,
             self.num_stream,
-            self.use_mhc_ascendc_post,
-        )
-
-
-@module_replacement
-class MhcPostProcessModule(nn.Module):
-    """Merge all residual streams at the end of an MHC stack."""
-
-    def __init__(
-        self,
-        *,
-        module: nn.Module,
-        module_fqn: str = "",
-        context: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Build the high-performance final MHC module from an existing module.
-
-        Args:
-            module: Source MHC post-process module with the existing parameter layout.
-            module_fqn: Fully qualified source-module name supplied by replacement.
-            context: Replacement context supplied by Trainer.
-
-        Raises:
-            TypeError: If required source attributes or settings are missing.
-            ValueError: If parameter shapes or runtime settings are incompatible.
-        """
-        super().__init__()
-        del module_fqn, context
-        self.config = getattr(module, "config", None)
-        self.num_stream = _num_stream(module)
-        self.layer_number = getattr(module, "layer_number", 1)
-
-        phi = _required_attribute(module, "phi")
-        if not isinstance(phi, nn.Linear) or phi.bias is not None:
-            raise TypeError("MhcPostProcessModule requires a bias-free nn.Linear phi projection")
-        if phi.in_features % self.num_stream != 0:
-            raise ValueError("MHC post-process phi input size must be divisible by num_stream")
-        if phi.out_features != self.num_stream:
-            raise ValueError("MHC post-process phi output size must equal num_stream")
-        self.phi = phi
-        self.branch_alpha = _parameter(module, "branch_alpha")
-        self.branch_beta = _parameter(module, "branch_beta")
-        if self.branch_alpha.numel() != 1:
-            raise ValueError("MHC post-process branch_alpha must contain one value")
-        if self.branch_beta.numel() != self.num_stream:
-            raise ValueError("MHC post-process branch_beta size must equal num_stream")
-
-        self.mhc_use_gamma = bool(_required_config_value(module, "mhc_use_gamma"))
-        parameters = [self.branch_alpha, self.branch_beta]
-        if self.mhc_use_gamma:
-            self.norm_gamma = _parameter(module, "norm_gamma")
-            if self.norm_gamma.numel() != phi.in_features:
-                raise ValueError("MHC post-process norm_gamma size must equal the phi input size")
-            parameters.append(self.norm_gamma)
-        elif hasattr(module, "norm_gamma"):
-            raise ValueError("MHC post-process source has norm_gamma while mhc_use_gamma is disabled")
-        _validate_parameter_layout(phi, tuple(parameters))
-
-        self.hc_eps = float(_required_attribute(module, "hc_eps"))
-        self.norm_eps = float(_required_attribute(module, "norm_eps"))
-        self.mhc_hpre_renorm = bool(_required_config_value(module, "mhc_hpre_renorm"))
-        if self.hc_eps <= 0 or self.norm_eps <= 0:
-            raise ValueError("MHC eps values must be positive")
-        self.train(module.training)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Merge all residual streams into one hidden state."""
-        gamma = self.norm_gamma if self.mhc_use_gamma else None
-        return mhc_post_process(
-            x,
-            self.phi.weight,
-            self.branch_alpha,
-            self.branch_beta,
-            self.num_stream,
-            self.norm_eps,
-            self.hc_eps,
-            gamma,
-            self.mhc_hpre_renorm,
         )

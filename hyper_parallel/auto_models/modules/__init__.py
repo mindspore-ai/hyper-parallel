@@ -17,7 +17,7 @@
 from hyper_parallel.auto_models.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
 from hyper_parallel.auto_models.modules.gqa_attention import GatedGQAAttention, GQAAttention
 from hyper_parallel.auto_models.modules.grouped_experts import GroupedExperts
-from hyper_parallel.auto_models.modules.mhc import MhcPostModule, MhcPostProcessModule, MhcPreModule
+from hyper_parallel.auto_models.modules.mhc import MhcPostModule, MhcPreModule
 from hyper_parallel.auto_models.modules.mla_attention import MLAAttention
 from hyper_parallel.auto_models.modules.rms_norm import OffsetRMSNorm, RMSNorm
 from hyper_parallel.auto_models.modules.shared_expert import SharedExpert
@@ -30,7 +30,6 @@ __all__ = [
     "GatedGQAAttention",
     "GroupedExperts",
     "MhcPostModule",
-    "MhcPostProcessModule",
     "MhcPreModule",
     "MLAAttention",
     "OffsetRMSNorm",

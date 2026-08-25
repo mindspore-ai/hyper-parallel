@@ -17,14 +17,13 @@
 from typing import Any, Optional, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 
 try:
     import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 except ImportError:
     omni_training_custom_ops = None
 
-from hyper_parallel.auto_models.ops.sinkhorn import sinkhorn, sinkhorn_knopps
+from hyper_parallel.auto_models.ops.sinkhorn import sinkhorn
 
 
 class _MhcPre(torch.autograd.Function):
@@ -98,46 +97,6 @@ class _MhcPre(torch.autograd.Function):
         return tuple(grads)
 
 
-def hc_split_sinkhorn_torch(
-    weight: torch.Tensor,
-    branch_alpha: torch.Tensor,
-    branch_beta: torch.Tensor,
-    num_stream: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Derive MHC pre, post, and residual coefficients from projection weights.
-
-    Args:
-        weight: Projected MHC coefficient logits.
-        branch_alpha: Learned scale for each coefficient group.
-        branch_beta: Learned bias for each coefficient group.
-        num_stream: Number of residual streams.
-        sinkhorn_iters: Number of Sinkhorn iterations.
-        eps: Numerical stability epsilon.
-
-    Returns:
-        Pre-connection, post-connection, and residual mixing coefficients.
-    """
-    h_pre, h_post, h_res = weight.split([num_stream, num_stream, num_stream * num_stream], dim=-1)
-    h_res = h_res.unflatten(-1, (num_stream, num_stream))
-
-    hpre_input_alpha = h_pre * branch_alpha[0]
-    hpre_input_beta = branch_beta[:num_stream].unsqueeze(0).unsqueeze(0)
-    h_pre = torch.sigmoid(hpre_input_alpha + hpre_input_beta) + eps
-
-    hpost_input_alpha = h_post * branch_alpha[1]
-    hpost_input_beta = branch_beta[num_stream:2 * num_stream].unsqueeze(0).unsqueeze(0)
-    h_post = 2 * torch.sigmoid(hpost_input_alpha + hpost_input_beta)
-
-    hres_input_alpha = h_res * branch_alpha[2]
-    hres_input_beta = branch_beta[2 * num_stream:].view(num_stream, num_stream).unsqueeze(0).unsqueeze(0)
-    h_res = hres_input_alpha + hres_input_beta
-    h_res = sinkhorn_knopps(h_res, sinkhorn_iters, eps)
-
-    return h_pre, h_post, h_res
-
-
 def mhc_pre(
     x: torch.Tensor,
     phi: torch.Tensor,
@@ -148,9 +107,7 @@ def mhc_pre(
     norm_eps: float = 1e-6,
     hc_eps: float = 1e-6,
     gamma: Optional[torch.Tensor] = None,
-    hpre_renorm: bool = False,
-    use_ascendc: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare an input and its mixing coefficients for an MHC-wrapped block.
 
     Args:
@@ -163,42 +120,24 @@ def mhc_pre(
         norm_eps: RMS normalization epsilon.
         hc_eps: Hyper-connection numerical stability epsilon.
         gamma: Optional RMS normalization scale.
-        hpre_renorm: Whether to normalize pre-connection coefficients.
-        use_ascendc: Whether to use the fused NPU custom operators.
 
     Returns:
-        Block input, post coefficients, residual coefficients, and optional residual buffer.
+        Block input, post coefficients, residual coefficients, and residual buffer.
     """
-    shape, dtype = x.size(), x.dtype
-    if use_ascendc:
-        x = x.reshape(shape[0], shape[1], num_stream, -1)
-        if gamma is not None:
-            gamma = gamma.reshape(num_stream, -1).float()
-        y, h_pre, h_post, h_comb_before, residual = _MhcPre.apply(
-            x,
-            phi.float(),
-            branch_alpha.float(),
-            branch_beta.float(),
-            gamma,
-            True,
-            norm_eps,
-            hc_eps,
-        )
-        h_res = sinkhorn(h_comb_before, sinkhorn_iters, hc_eps)
-        residual = residual.reshape(shape[0], shape[1], -1)
-        return y, h_post, h_res, residual
-
-    x = x.float()
-    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
+    shape = x.size()
+    x = x.reshape(shape[0], shape[1], num_stream, -1)
     if gamma is not None:
-        weight = F.linear(x * rsqrt * gamma, phi)  # pylint: disable=not-callable
-    else:
-        weight = F.linear(x, phi) * rsqrt  # pylint: disable=not-callable
-    h_pre, h_post, h_res = hc_split_sinkhorn_torch(
-        weight, branch_alpha, branch_beta, num_stream, sinkhorn_iters, hc_eps
+        gamma = gamma.reshape(num_stream, -1).float()
+    y, _, h_post, h_comb_before, residual = _MhcPre.apply(
+        x,
+        phi.float(),
+        branch_alpha.float(),
+        branch_beta.float(),
+        gamma,
+        True,
+        norm_eps,
+        hc_eps,
     )
-    if hpre_renorm:
-        eps_cache = torch.full((), 1e-30, dtype=h_pre.dtype, device=h_pre.device)
-        h_pre = h_pre / h_pre.sum(dim=-1, keepdim=True).maximum(eps_cache)
-    y = torch.sum(h_pre.unsqueeze(-1) * x.unflatten(dim=-1, sizes=(num_stream, -1)), dim=2).to(dtype)
-    return y, h_post, h_res, None
+    h_res = sinkhorn(h_comb_before, sinkhorn_iters, hc_eps)
+    residual = residual.reshape(shape[0], shape[1], -1)
+    return y, h_post, h_res, residual
