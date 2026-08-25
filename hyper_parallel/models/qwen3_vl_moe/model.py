@@ -103,10 +103,19 @@ def _cp_slice_deepstack_features(
     """Keep only visual features belonging to this rank's text sequence shard."""
     if features is None or visual_pos_masks is None:
         return features
-    full_mask = visual_pos_masks.reshape(-1)
-    local_mask = full_mask.reshape(visual_pos_masks.shape)[:, sequence_slice].reshape(-1)
+
+    full_mask_2d = visual_pos_masks.to(torch.bool)
+    full_mask = full_mask_2d.reshape(-1)
+    full_positions = torch.arange(
+        full_mask.numel(),
+        device=full_mask.device,
+        dtype=torch.long,
+    ).reshape(visual_pos_masks.shape)
+    local_positions = full_positions[:, sequence_slice].reshape(-1)
+    local_visual_mask = full_mask_2d[:, sequence_slice].reshape(-1)
+
     feature_indices = full_mask.to(torch.int64).cumsum(0) - 1
-    selected = feature_indices[local_mask]
+    selected = feature_indices.index_select(0, local_positions[local_visual_mask])
     return [feature.index_select(0, selected) for feature in features]
 
 
