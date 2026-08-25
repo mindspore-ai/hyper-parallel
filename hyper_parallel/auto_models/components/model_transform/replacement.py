@@ -184,6 +184,21 @@ def _named_identities(module: nn.Module, *, kind: str) -> dict[str, object]:
     raise ValueError(f"unsupported module identity kind {kind!r}")
 
 
+def _named_tensor_shapes(model: nn.Module) -> dict[str, tuple[int, ...]]:
+    """Capture the source-model parameter and persistent-buffer shapes."""
+    shapes = {
+        name: tuple(value.shape)
+        for name, value in model.named_parameters(remove_duplicate=False)
+    }
+    for module_name, module in model.named_modules(remove_duplicate=False):
+        for name, value in module._buffers.items():  # pylint: disable=protected-access
+            if value is None or name in module._non_persistent_buffers_set:  # pylint: disable=protected-access
+                continue
+            fqn = f"{module_name}.{name}" if module_name else name
+            shapes[fqn] = tuple(value.shape)
+    return shapes
+
+
 def _validate_forward_compatibility(
     source: nn.Module,
     replacement: nn.Module,
@@ -315,6 +330,8 @@ def apply_module_replacements(
             target.module_fqns[0],
             has_weight_transforms=bool(transforms),
         )
+        if transforms and callable(getattr(replacement, "reset_parameters", None)):
+            replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
         prepared.append((target, replacement))
 
     for target, _ in prepared:
@@ -327,6 +344,8 @@ def apply_module_replacements(
             raise ValueError(
                 "weights_mapping is required when a replacement defines make_transforms()"
             )
+        model._hp_checkpoint_source_shapes = _named_tensor_shapes(model)  # pylint: disable=protected-access
+        model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
         weights_mapping[:0] = extra_transforms
     for target, replacement in prepared:
         for fqn in target.module_fqns:

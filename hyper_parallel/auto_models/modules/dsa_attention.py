@@ -36,6 +36,7 @@ from hyper_parallel.auto_models.ops import (
     dsa_sparse_attention,
     dsa_sparse_attention_rescale,
 )
+from hyper_parallel.auto_models.ops.npu_fusion_attention import resolve_packed_sequence_lengths
 
 
 def apply_mome(
@@ -409,8 +410,21 @@ class DeepseekV32DSAAttention(nn.Module):
             index_query = torch.cat((index_query_rot, index_query_pass), dim=-1)
             index_key = torch.cat((index_key_rot, index_key_pass), dim=-1)
 
-        actual_seq_len = self._get_actual_seq_len(
-            actual_seq_len,
+        packed_kwargs = dict(kwargs)
+        packed_kwargs["actual_seq_len"] = actual_seq_len
+        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
+            packed_kwargs,
+            batch_size * seq_length,
+            batch_size * seq_length,
+        )
+        actual_q_len = self._get_actual_seq_len(
+            actual_q_len,
+            batch_size,
+            seq_length,
+            hidden_states.device,
+        )
+        actual_kv_len = self._get_actual_seq_len(
+            actual_kv_len,
             batch_size,
             seq_length,
             hidden_states.device,
@@ -419,8 +433,8 @@ class DeepseekV32DSAAttention(nn.Module):
             index_query,
             index_key,
             merge_weight,
-            actual_seq_len,
-            actual_seq_len,
+            actual_q_len,
+            actual_kv_len,
             self.index_topk,
         )
         sparse_scale = self.scaling
@@ -431,8 +445,8 @@ class DeepseekV32DSAAttention(nn.Module):
             k_rot,
             topk_indices,
             sparse_scale,
-            actual_seq_len,
-            actual_seq_len,
+            actual_q_len,
+            actual_kv_len,
         )
         if self.training and not self.freeze_dsa and self.dsa_loss_coeff:
             query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
@@ -450,8 +464,8 @@ class DeepseekV32DSAAttention(nn.Module):
                 softmax_sum,
                 q_rot_tnd,
                 k_rot_tnd,
-                actual_seq_len,
-                actual_seq_len,
+                actual_q_len,
+                actual_kv_len,
                 sparse_scale,
                 self.dsa_loss_coeff,
             )
@@ -616,6 +630,7 @@ class DSAAttention(nn.Module):
         output_attentions: bool = False,
         return_bias: bool = False,
         mome_mask: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run DSA with its configured MOME and parameter-sink paths."""
         if attention_mask is not None:
@@ -726,15 +741,25 @@ class DSAAttention(nn.Module):
             index_query = torch.cat((index_query_rot, index_query_pass), dim=-1)
             index_key = torch.cat((index_key_rot, index_key_pass), dim=-1)
 
-        actual_seq_len = self._get_actual_seq_len(
-            actual_seq_len, batch_size, seq_length, hidden_states.device
+        packed_kwargs = dict(kwargs)
+        packed_kwargs["actual_seq_len"] = actual_seq_len
+        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
+            packed_kwargs,
+            batch_size * seq_length,
+            batch_size * seq_length,
+        )
+        actual_q_len = self._get_actual_seq_len(
+            actual_q_len, batch_size, seq_length, hidden_states.device
+        )
+        actual_kv_len = self._get_actual_seq_len(
+            actual_kv_len, batch_size, seq_length, hidden_states.device
         )
         topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
             index_query,
             index_key,
             merge_weight,
-            actual_seq_len,
-            actual_seq_len,
+            actual_q_len,
+            actual_kv_len,
             self.index_topk,
         )
         sparse_scale = self.qk_head_dim**-0.5
@@ -753,8 +778,8 @@ class DSAAttention(nn.Module):
                 self.num_heads,
                 sparse_scale,
                 1 - self.attention_dropout.p,
-                actual_seq_len,
-                actual_seq_len,
+                actual_q_len,
+                actual_kv_len,
             )
         else:
             attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
@@ -764,8 +789,8 @@ class DSAAttention(nn.Module):
                 k_rot,
                 topk_indices,
                 sparse_scale,
-                actual_seq_len,
-                actual_seq_len,
+                actual_q_len,
+                actual_kv_len,
             )
         if self.training and not self.freeze_dsa and self.dsa_loss_coeff:
             query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
@@ -783,8 +808,8 @@ class DSAAttention(nn.Module):
                 softmax_sum,
                 q_rot_tnd,
                 k_rot_tnd,
-                actual_seq_len,
-                actual_seq_len,
+                actual_q_len,
+                actual_kv_len,
                 sparse_scale,
                 self.dsa_loss_coeff,
             )

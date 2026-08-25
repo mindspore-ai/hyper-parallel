@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -92,12 +92,63 @@ def _coalesce_lengths(
     return first
 
 
-def _packed_sequence_lengths(
+def _packed_parameter_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose packed-sequence fields carried by a model-level parameter object."""
+    packed_seq_params = kwargs.get("packed_seq_params")
+    if packed_seq_params is None:
+        return dict(kwargs)
+
+    resolved_kwargs = dict(kwargs)
+    field_aliases = {
+        "actual_seq_len": "actual_seq_len",
+        "actual_q_len": "actual_q_len",
+        "actual_kv_len": "actual_kv_len",
+        "actual_seq_qlen": "actual_seq_qlen",
+        "actual_seq_kvlen": "actual_seq_kvlen",
+        "cu_seq_lens": "cu_seq_lens_q",
+        "cu_seq_lens_q": "cu_seq_lens_q",
+        "cu_seq_lens_k": "cu_seq_lens_k",
+        "cu_seq_lens_kv": "cu_seq_lens_k",
+        "cu_seqlens_q": "cu_seq_lens_q",
+        "cu_seqlens_k": "cu_seq_lens_k",
+        "cu_seqlens_kv": "cu_seq_lens_k",
+    }
+    found = False
+    for source_name, target_name in field_aliases.items():
+        if isinstance(packed_seq_params, Mapping):
+            value = packed_seq_params.get(source_name)
+        else:
+            value = getattr(packed_seq_params, source_name, None)
+        if value is not None:
+            found = True
+            if resolved_kwargs.get(target_name) is None:
+                resolved_kwargs[target_name] = value
+            if source_name == "cu_seq_lens":
+                if resolved_kwargs.get("cu_seq_lens_k") is None:
+                    resolved_kwargs["cu_seq_lens_k"] = value
+    if not found:
+        raise ValueError(
+            "packed_seq_params must provide cumulative query and key/value sequence lengths"
+        )
+    return resolved_kwargs
+
+
+def resolve_packed_sequence_lengths(
     kwargs: dict[str, Any],
     query_tokens: int,
     key_tokens: int,
 ) -> tuple[list[int] | None, list[int] | None]:
-    """Resolve PR/VeOmni and Transformers packed-sequence argument names."""
+    """Resolve PanGu, VeOmni, and Transformers packed-sequence arguments.
+
+    Args:
+        kwargs: Attention keyword arguments or a ``packed_seq_params`` carrier.
+        query_tokens: Number of flattened query tokens.
+        key_tokens: Number of flattened key/value tokens.
+
+    Returns:
+        Cumulative query and key/value sequence ends without leading zeros.
+    """
+    kwargs = _packed_parameter_kwargs(kwargs)
     query_lengths = _coalesce_lengths(
         kwargs,
         (
@@ -176,7 +227,7 @@ def npu_fusion_attention_forward(
     batch_size = query.shape[0]
     query_length = query.shape[2]
     key_length = key.shape[2]
-    query_lengths, key_lengths = _packed_sequence_lengths(
+    query_lengths, key_lengths = resolve_packed_sequence_lengths(
         kwargs,
         batch_size * query_length,
         key.shape[0] * key_length,

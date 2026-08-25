@@ -202,6 +202,10 @@ class TestModuleReplacementPlan(unittest.TestCase):
                 calls.append("make_transforms")
                 return [WeightRenaming("weight", "packed_weight")]
 
+            def reset_parameters(self) -> None:
+                """Declare replacement-owned random initialization."""
+                return None
+
         model = nn.Sequential(nn.Linear(4, 8, bias=False))
         spec = ModuleReplacementSpec(
             match=("0",),
@@ -222,6 +226,7 @@ class TestModuleReplacementPlan(unittest.TestCase):
         self.assertEqual(len(weights_mapping), 1)
         self.assertEqual(weights_mapping[0].source_patterns, ["weight"])
         self.assertEqual(weights_mapping[0].target_patterns, ["packed_weight"])
+        self.assertTrue(model[0]._hp_reset_after_materialization)
 
     def test_rejects_hooks_that_cannot_be_migrated(self):
         model = nn.Sequential(nn.Linear(4, 8))

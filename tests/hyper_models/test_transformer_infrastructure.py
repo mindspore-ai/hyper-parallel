@@ -121,3 +121,66 @@ def test_build_model_forwards_distributed_setup_to_infrastructure(monkeypatch):
 
     assert result is model
     assert captured["distributed_setup"] is setup
+
+
+def test_single_rank_replacement_builds_structure_before_checkpoint_loading(
+    monkeypatch,
+):
+    """Keep checkpoint loading after replacement for a single-rank HF model."""
+    setup = _setup()
+    setup.plan_overrides = [
+        PlanOverride(
+            match="0",
+            module_type="torch.nn.Linear",
+            replace_module=Target(
+                _identity_replacement,
+                target_path=f"{__name__}._identity_replacement",
+            ),
+        )
+    ]
+    model = nn.Linear(4, 8)
+    captured = {}
+
+    monkeypatch.setattr(
+        "hyper_parallel.auto_models.components.distributed.init_utils.get_world_size_safe",
+        lambda: 1,
+    )
+
+    def _init_model(*args, **kwargs):
+        del kwargs
+        captured["model_init_path"] = args[1]
+        return False, model
+
+    def _apply_model_infrastructure(input_model, **kwargs):
+        captured.update(kwargs)
+        return input_model
+
+    monkeypatch.setattr(auto_model_module, "_init_model", _init_model)
+    monkeypatch.setattr(auto_model_module, "_current_device", lambda: "cpu")
+    monkeypatch.setattr(
+        auto_model_module,
+        "apply_model_infrastructure",
+        _apply_model_infrastructure,
+    )
+
+    result = auto_model_module.HyperAutoModelForCausalLM._build_model(
+        "checkpoint",
+        is_hf_model=True,
+        hf_config=object(),
+        mesh=None,
+        sharding_planner=None,
+        fsdp2_manager=None,
+        autopipeline=None,
+        backend=None,
+        peft_config=None,
+        torch_dtype="auto",
+        attn_implementation="sdpa",
+        validate_placement=False,
+        load_base_model=True,
+        distributed_setup=setup,
+    )
+
+    assert result is model
+    assert captured["model_init_path"] is None
+    assert captured["is_meta_device"]
+    assert captured["pretrained_path"] == "checkpoint"

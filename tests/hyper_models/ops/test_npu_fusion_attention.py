@@ -81,6 +81,17 @@ def test_packed_attention_matches_individual_sequences() -> None:
     )
     torch.testing.assert_close(from_cu_lengths, packed, rtol=0.0, atol=0.0)
 
+    from_packed_params, _ = npu_fusion_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        None,
+        actual_seq_len=None,
+        packed_seq_params=SimpleNamespace(actual_seq_len=[3, 7]),
+    )
+    torch.testing.assert_close(from_packed_params, packed, rtol=0.0, atol=0.0)
+
     packed.float().sum().backward()
     assert all(
         tensor.grad is not None and torch.isfinite(tensor.grad).all()
