@@ -87,7 +87,7 @@ model, source_shard_info = apply_sharding_plan(model, plan, mesh)   # production
 
 ## 目录
 
-```
+```text
 sharding_config.py    # MeshAxisName/NamedPlacement/ShardingPlan/ModuleShardingSpec
                       #   /ShardingTemplate/TEMPLATES/PlacementMismatchError
 param_role.py         # ParamRole(14) + ParameterClassifier + 默认命名规则
