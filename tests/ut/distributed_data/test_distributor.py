@@ -213,8 +213,8 @@ class TestMicroBatchSharding(unittest.TestCase):
 
     def test_metadata_all_gather_uses_data_owner_order(self) -> None:
         """Process-group order must not change deterministic candidate order."""
-        owner_three = SampleMeta(sample_id="three", source_id="source")
-        owner_nine = SampleMeta(sample_id="nine", source_id="source")
+        owner_three = SampleMeta(sample_id="three")
+        owner_nine = SampleMeta(sample_id="nine")
         fake_platform = _FakePlatform(
             group_ranks=(9, 3),
             gathered_objects=((owner_nine,), (owner_three,)),
@@ -232,12 +232,10 @@ class TestMicroBatchSharding(unittest.TestCase):
         metadata = [
             SampleMeta(
                 sample_id="local",
-                source_id="source",
                 cost_hint=WorkloadCost(encoder=1.0),
             ),
             SampleMeta(
                 sample_id="peer",
-                source_id="source",
                 cost_hint=WorkloadCost(encoder=2.0),
             ),
         ]
@@ -294,7 +292,7 @@ class TestMicroBatchSharding(unittest.TestCase):
 
     def test_owner_broadcasts_tensor_micro_batch_without_object_serializing_storage(self) -> None:
         """Microbatch structure uses object gather while tensor storage uses broadcast."""
-        metadata = [SampleMeta(sample_id="0", source_id="source")]
+        metadata = [SampleMeta(sample_id="0")]
         plan = DistributedBatchPlanner(1, 1, 1).plan(metadata, step=0, cursor_start=0)
         topology = DataTopology.from_layout(
             mesh_shape=(2,),

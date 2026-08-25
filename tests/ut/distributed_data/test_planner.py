@@ -23,7 +23,6 @@ from hyper_parallel.distributed_data.schema import SampleMeta, WorkloadCost
 def _metadata(sample_id: str, encoder_cost: float) -> SampleMeta:
     return SampleMeta(
         sample_id=sample_id,
-        source_id="source",
         cost_hint=WorkloadCost(encoder=encoder_cost),
     )
 
@@ -66,6 +65,14 @@ class TestDistributedBatchPlanner(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires 4 candidates"):
             planner.plan([_metadata("0", 1.0)], step=0, cursor_start=0)
 
+    def test_rejects_duplicate_sample_ids(self) -> None:
+        """The dataset-wide sample identifier must be unique in a planning window."""
+        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=2, micro_batch_num=1)
+        candidates = [_metadata("0", 1.0), _metadata("0", 2.0)]
+
+        with self.assertRaisesRegex(ValueError, "unique sample_id"):
+            planner.plan(candidates, step=0, cursor_start=0)
+
     def test_online_plan_balances_only_one_global_microbatch(self) -> None:
         """Online planning should preserve the optimizer microbatch position without later metadata."""
         planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_size=2, micro_batch_num=3)
@@ -90,8 +97,8 @@ class TestDistributedBatchPlanner(unittest.TestCase):
         """Planner tie-breaking should support both map-style key types."""
         planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=2, micro_batch_num=1)
         candidates = [
-            SampleMeta(sample_id="1", source_id="source"),
-            SampleMeta(sample_id=1, source_id="source"),
+            SampleMeta(sample_id="1"),
+            SampleMeta(sample_id=1),
         ]
 
         plan = planner.plan(candidates, step=0, cursor_start=0)

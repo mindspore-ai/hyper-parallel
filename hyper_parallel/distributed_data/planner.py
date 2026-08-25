@@ -141,9 +141,9 @@ class DistributedBatchPlanner:
                 f"Planner requires {expected_candidates} candidates for this planning window, "
                 f"but got {len(candidates)}."
             )
-        sample_keys = [(metadata.source_id, metadata.sample_id) for metadata in candidates]
-        if len(set(sample_keys)) != len(sample_keys):
-            raise ValueError("Planner candidates must have unique (source_id, sample_id) identities.")
+        sample_ids = [metadata.sample_id for metadata in candidates]
+        if len(set(sample_ids)) != len(sample_ids):
+            raise ValueError("Planner candidates must have unique sample_id values.")
 
         items = tuple(
             BalanceItem(metadata=metadata, source_position=position, cost=self.cost_model.estimate(metadata))
@@ -206,7 +206,6 @@ class DistributedBatchPlanner:
             "micro_batch_num": micro_batch_num,
             "samples": [
                 {
-                    "source_id": sample.meta.source_id,
                     "sample_id": sample.meta.sample_id,
                     "target_data_rank": sample.target_data_rank,
                     "micro_batch_index": sample.micro_batch_index,

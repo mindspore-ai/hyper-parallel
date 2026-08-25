@@ -74,7 +74,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         def metadata_fn(sample: Any, sample_id: int) -> SampleMeta:
             """Build unused metadata for boundary validation."""
             del sample
-            return SampleMeta(sample_id=sample_id, source_id="source")
+            return SampleMeta(sample_id=sample_id)
 
         with self.assertRaisesRegex(ValueError, "requires metadata_fn"):
             distributed_data.build_distributed_dataset([], None, config)
@@ -121,7 +121,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
             global_rank=0,
         )
         metadata = [
-            SampleMeta(sample_id=index, source_id="source")
+            SampleMeta(sample_id=index)
             for index in range(4)
         ]
         created: list[tuple[tuple[int, ...], str]] = []
@@ -168,7 +168,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         """Online metadata must retain the key used to read the map-style dataset."""
         source = StridedOnlineSampleSource(
             ["sample"],
-            lambda sample, sample_id: SampleMeta(sample_id=sample_id + 1, source_id=sample),
+            lambda _sample, sample_id: SampleMeta(sample_id=sample_id + 1),
             shard_rank=0,
             num_shards=1,
         )
@@ -191,7 +191,6 @@ class _PeerMetadataSynchronizer:
         peer_metadata = tuple(
             SampleMeta(
                 sample_id=metadata.sample_id + 4,
-                source_id=metadata.source_id,
                 cost_hint=WorkloadCost(encoder=metadata.cost_hint.encoder + 0.5),
             )
             for metadata in local_metadata
@@ -451,7 +450,6 @@ def _build_loader(
     metadata = [
         SampleMeta(
             sample_id=index,
-            source_id="source",
             cost_hint=WorkloadCost(encoder=float(index + 1)),
         )
         for index in range(4)
@@ -496,7 +494,7 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
         def metadata_fn(sample: Any, sample_id: int) -> SampleMeta:
             """Build online metadata for one synthetic raw sample."""
             del sample
-            return SampleMeta(sample_id=sample_id, source_id="source")
+            return SampleMeta(sample_id=sample_id)
 
         online_source = StridedOnlineSampleSource(samples, metadata_fn, shard_rank=0, num_shards=1)
         return DistributedDataset(
@@ -513,7 +511,7 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
         )
 
     metadata = [
-        SampleMeta(sample_id=index, source_id="source")
+        SampleMeta(sample_id=index)
         for index in range(len(samples))
     ]
     return DistributedDataset(
@@ -531,7 +529,7 @@ def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool)
 def _build_single_microbatch_double_buffer(micro_batch_distributor: Any) -> DistributedDataset:
     """Build two one-microbatch steps for cross-step look-ahead tests."""
     metadata = [
-        SampleMeta(sample_id=index, source_id="source")
+        SampleMeta(sample_id=index)
         for index in range(2)
     ]
     topology = DataTopology.from_layout(
@@ -656,7 +654,6 @@ class TestDistributedDataset(unittest.TestCase):
             del sample
             return SampleMeta(
                 sample_id=sample_id,
-                source_id="source",
                 cost_hint=WorkloadCost(encoder=float(sample_id + 1)),
             )
 
@@ -787,7 +784,7 @@ class TestDistributedDataset(unittest.TestCase):
     def test_double_buffer_runs_non_owner_distribution_on_data_producer(self) -> None:
         """TP peers must enter microbatch collectives from the same ordered producer role."""
         metadata = [
-            SampleMeta(sample_id=index, source_id="source")
+            SampleMeta(sample_id=index)
             for index in range(2)
         ]
         topology = DataTopology.from_layout(
@@ -827,7 +824,6 @@ class TestDistributedDataset(unittest.TestCase):
             del sample
             return SampleMeta(
                 sample_id=sample_id,
-                source_id="source",
                 cost_hint=WorkloadCost(encoder=float(sample_id + 1)),
             )
 
@@ -956,7 +952,7 @@ class TestDistributedDataset(unittest.TestCase):
     def test_tp_peer_receives_micro_batches_without_fetching_dataset(self) -> None:
         """Only the data owner may perform map-style I/O for a DP coordinate."""
         metadata = [
-            SampleMeta(sample_id=index, source_id="source")
+            SampleMeta(sample_id=index)
             for index in range(2)
         ]
         topology = DataTopology.from_layout(
@@ -989,7 +985,7 @@ class TestDistributedDataset(unittest.TestCase):
         def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
             """Build metadata that must remain unused on the non-owner peer."""
             del sample
-            return SampleMeta(sample_id=sample_id, source_id="source")
+            return SampleMeta(sample_id=sample_id)
 
         topology = DataTopology.from_layout(
             mesh_shape=(2,),
@@ -1000,7 +996,7 @@ class TestDistributedDataset(unittest.TestCase):
         planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_size=1, micro_batch_num=2)
         plans = [
             planner.plan_microbatch(
-                [SampleMeta(sample_id=index, source_id="source")],
+                [SampleMeta(sample_id=index)],
                 step=0,
                 cursor_start=index,
                 micro_batch_index=index,
@@ -1034,7 +1030,7 @@ class TestDistributedDataset(unittest.TestCase):
     def test_metadata_shards_can_be_truncated_to_equal_complete_steps(self) -> None:
         """Uneven strided tails must not make owners call different collective counts."""
         metadata = [
-            SampleMeta(sample_id=index, source_id="source")
+            SampleMeta(sample_id=index)
             for index in range(10)
         ]
         sources = [

@@ -91,12 +91,12 @@ class WorkloadCost:
 class SampleMeta:
     """Lightweight sample information visible to the planner.
 
-    ``sample_id`` identifies the map-style dataset entry. It must not contain
-    decoded images, token tensors, or other heavyweight sample data.
+    ``sample_id`` uniquely identifies the map-style dataset entry within a
+    planning window. Metadata must not contain decoded images, token tensors,
+    or other heavyweight sample data.
     """
 
     sample_id: int | str
-    source_id: str
     text_tokens: int = 0
     vision_tokens: int = 0
     audio_tokens: int = 0
@@ -104,8 +104,6 @@ class SampleMeta:
     cost_hint: WorkloadCost | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source_id, str) or not self.source_id:
-            raise ValueError(f"SampleMeta.source_id must be a non-empty string, but got {self.source_id!r}.")
         if not isinstance(self.sample_id, (int, str)) or isinstance(self.sample_id, bool):
             raise ValueError(
                 "SampleMeta.sample_id must be an integer index or string key, "
