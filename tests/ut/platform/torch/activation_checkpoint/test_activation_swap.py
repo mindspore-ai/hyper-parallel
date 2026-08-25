@@ -15,6 +15,7 @@
 """Unit tests for PyTorch activation swap platform implementation."""
 import contextlib
 import gc
+import importlib.util
 import os
 import unittest
 import weakref
@@ -34,6 +35,11 @@ from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import 
     swap_tensor_wrapper,
     swap_wrapper,
 )
+
+# Some CI pythons are built without liblzma: the lazy transformers ->
+# torchvision import chain dies on "from _lzma import *". Tests hitting that
+# chain run only where lzma is available.
+_HAS_LZMA = importlib.util.find_spec("_lzma") is not None
 
 
 class _TinyModule(torch.nn.Module):
@@ -103,6 +109,7 @@ class TestSwapWrapper(unittest.TestCase):
         self.assertIsInstance(wrapper._wrapped_module, FuncModule)
         self.assertEqual(wrapper(torch.tensor(2)).item(), 3)
 
+    @unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
     def test_rejects_overlapping_wrap(self):
         """Wrapping the same module twice should warn."""
         mod = _TinyModule()
@@ -183,6 +190,7 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
 class TestSwapTensorWrapper(unittest.TestCase):
     """Unit tests for swap_tensor_wrapper()."""
 
+    @unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
     def test_warns_and_returns_target_when_group_unregistered(self):
         """Missing swap groups should warn and leave tensors unchanged."""
         target = torch.ones(2)
