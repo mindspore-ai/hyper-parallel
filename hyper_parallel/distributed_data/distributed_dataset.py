@@ -29,6 +29,7 @@ from hyper_parallel.distributed_data.distributor import (
 )
 from hyper_parallel.distributed_data.fetcher import (
     LoadedSample,
+    LocalDataLoader,
     MetadataSource,
     MicroBatchFetcher,
     OnlineSampleSource,
@@ -91,6 +92,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         online_sample_source: OnlineSampleSource | None = None,
         sample_redistributor: SampleRedistributor | None = None,
         data_stream: Any = None,
+        local_data_loader: LocalDataLoader | None = None,
     ) -> None:
         """Initialize planning, fetching, communication, and prefetch components."""
         if planner.data_parallel_size != topology.data_parallel_size:
@@ -117,6 +119,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self._prepare_micro_batch = prepare_micro_batch
         self._double_buffer = double_buffer
         self._data_stream = data_stream
+        self._local_data_loader = local_data_loader
         source_size = len(metadata_source) if metadata_source is not None else len(online_sample_source)
         self._source_size = source_size
         self._state = DatasetStateTracker(
@@ -128,7 +131,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=thread_name)
         self._pin_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="hp-data-pin")
-            if pin_memory and topology.is_data_owner
+            if pin_memory and topology.is_data_owner and not micro_batch_fetcher.fetched_batches_are_pinned
             else None
         )
         self._prepared_steps: deque[_ReservedStep] = deque()
@@ -211,6 +214,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self._executor.shutdown(wait=True, cancel_futures=not self._double_buffer)
         if self._pin_executor is not None:
             self._pin_executor.shutdown(wait=True, cancel_futures=True)
+        if self._local_data_loader is not None:
+            self._local_data_loader.close()
         self._prepared_steps.clear()
         self._active_step = None
         self._active_reservation = None
@@ -270,7 +275,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
     def _load_online_microbatch(self, cursor_start: int, cursor_end: int) -> tuple[LoadedSample, ...]:
         if self._online_sample_source is None:
             raise ValueError("Online sample source is not configured.")
-        return tuple(self._online_sample_source.get(index) for index in range(cursor_start, cursor_end))
+        return self._online_sample_source.get_range(cursor_start, cursor_end)
 
     def _consume_active_microbatch(self, micro_batch_index: int) -> tuple[BatchPlan, RankMicroBatch]:
         if self._closed:

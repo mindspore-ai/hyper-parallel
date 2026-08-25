@@ -1066,6 +1066,19 @@ class Platform:
         """Create a process group in a caller-owned cache namespace."""
         raise NotImplementedError("Platform subclasses must implement _create_named_group")
 
+    @staticmethod
+    def create_data_loader(dataset: Any, **kwargs: Any) -> Any:
+        """Create the framework-native data loader.
+
+        Args:
+            dataset: Framework-compatible map-style dataset.
+            **kwargs: Native data-loader keyword arguments.
+
+        Returns:
+            A framework-native data loader.
+        """
+        raise NotImplementedError("Platform subclasses must implement create_data_loader")
+
     def new_stream(self):
         """Create a new compute stream for asynchronous operations.
 

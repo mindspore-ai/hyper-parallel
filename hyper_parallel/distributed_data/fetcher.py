@@ -47,6 +47,23 @@ class LoadedSample:
     data: Any
 
 
+class LocalDataLoader(Protocol):
+    """Execute data-owner-local reads through a framework DataLoader."""
+
+    @property
+    def pin_memory(self) -> bool:
+        """Return whether fetched sidecar batches are pinned by the loader."""
+
+    def fetch(self, plan: BatchPlan, data_rank: int, micro_batch_index: int) -> Any:
+        """Fetch one sidecar-planned microbatch."""
+
+    def load_online(self, sample_ids: Sequence[int | str]) -> tuple[LoadedSample, ...]:
+        """Load one online-planning candidate microbatch."""
+
+    def close(self) -> None:
+        """Release DataLoader workers and queues."""
+
+
 class OnlineSampleSource(Protocol):
     """Load raw samples and derive metadata on one data owner."""
 
@@ -55,6 +72,9 @@ class OnlineSampleSource(Protocol):
 
     def get(self, index: int) -> LoadedSample:
         """Load one local raw sample and derive its metadata."""
+
+    def get_range(self, start: int, end: int) -> tuple[LoadedSample, ...]:
+        """Load an ordered local cursor range."""
 
 
 class StridedMetadataSource:
@@ -108,6 +128,7 @@ class StridedOnlineSampleSource:
         num_shards: int,
         *,
         max_entries: int | None = None,
+        local_data_loader: LocalDataLoader | None = None,
     ) -> None:
         """Initialize online loading over a shared map-style dataset."""
         if not hasattr(dataset, "__len__") or not hasattr(dataset, "__getitem__"):
@@ -127,6 +148,7 @@ class StridedOnlineSampleSource:
         self._shard_rank = shard_rank
         self._num_shards = num_shards
         self._max_entries = max_entries
+        self._local_data_loader = local_data_loader
 
     def __len__(self) -> int:
         """Return raw samples owned by this deterministic DP shard."""
@@ -141,6 +163,8 @@ class StridedOnlineSampleSource:
         if index < 0 or index >= len(self):
             raise ValueError(f"Online sample index must be in [0, {len(self)}), but got {index}.")
         sample_id = self._shard_rank + index * self._num_shards
+        if self._local_data_loader is not None:
+            return self._local_data_loader.load_online((sample_id,))[0]
         sample = self._dataset[sample_id]
         metadata = self._metadata_fn(sample, sample_id)
         if not isinstance(metadata, SampleMeta):
@@ -150,6 +174,15 @@ class StridedOnlineSampleSource:
                 f"metadata_fn must preserve sample_id {sample_id!r}, but returned {metadata.sample_id!r}."
             )
         return LoadedSample(metadata, sample)
+
+    def get_range(self, start: int, end: int) -> tuple[LoadedSample, ...]:
+        """Load an ordered local cursor range, using workers when configured."""
+        if start < 0 or end < start or end > len(self):
+            raise ValueError(f"Online sample range must satisfy 0 <= start <= end <= {len(self)}, got {start}:{end}.")
+        if self._local_data_loader is None:
+            return tuple(self.get(index) for index in range(start, end))
+        sample_ids = tuple(self._shard_rank + index * self._num_shards for index in range(start, end))
+        return self._local_data_loader.load_online(sample_ids)
 
 
 class MapDatasetFetcher:
@@ -189,10 +222,17 @@ class MicroBatchFetcher:
         self,
         sample_fetcher: SampleFetcher,
         collate_fn: Callable[[list[Any]], Any] | None = None,
+        local_data_loader: LocalDataLoader | None = None,
     ) -> None:
         """Initialize sample fetching and owner-side collation."""
         self._sample_fetcher = sample_fetcher
         self._collate_fn = collate_fn or _identity_collate
+        self._local_data_loader = local_data_loader
+
+    @property
+    def fetched_batches_are_pinned(self) -> bool:
+        """Return whether the local DataLoader pins fetched sidecar batches."""
+        return self._local_data_loader is not None and self._local_data_loader.pin_memory
 
     def fetch(self, plan: BatchPlan, data_rank: int, micro_batch_index: int) -> Any:
         """Fetch only samples assigned to the requested execution slot."""
@@ -202,8 +242,10 @@ class MicroBatchFetcher:
                 f"Plan slot ({data_rank}, {micro_batch_index}) expected {plan.micro_batch_size} samples, "
                 f"but got {len(planned_samples)}."
             )
-        samples = [self._sample_fetcher.fetch(planned.meta) for planned in planned_samples]
-        return self._collate_fn(samples)
+        if self._local_data_loader is None:
+            samples = [self._sample_fetcher.fetch(planned.meta) for planned in planned_samples]
+            return self.collate(samples)
+        return self._local_data_loader.fetch(plan, data_rank, micro_batch_index)
 
     def collate(self, samples: list[Any]) -> Any:
         """Collate already-loaded samples after online redistribution."""

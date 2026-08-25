@@ -40,6 +40,7 @@ from hyper_parallel.distributed_data.fetcher import (
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
 from hyper_parallel.distributed_data.schema import SampleMeta, TensorShardSpec
 from hyper_parallel.distributed_data.topology import DataTopology
+from hyper_parallel.distributed_data.torch_loader import TorchLocalDataLoader
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 
@@ -99,8 +100,10 @@ class DistributedDatasetConfig:
     microbatch ahead, including online metadata collectives and sample
     distribution. One prefetched step enables overlap within an optimizer
     step; two or more also enable overlap across optimizer-step boundaries.
-    ``pin_memory`` copies collated Host tensor leaves into pinned memory on a
-    dedicated data-owner thread.
+    ``pin_memory``, ``num_workers``, and ``prefetch_factor`` configure the
+    native PyTorch DataLoader used for owner-local reads. Online candidates are
+    pinned only after planning and redistribution. Distributed collectives
+    always remain in the training rank process.
     """
 
     micro_batch_size: int
@@ -111,6 +114,8 @@ class DistributedDatasetConfig:
     cp_shards: tuple[TensorShardSpec, ...] = ()
     pin_memory: bool = False
     double_buffer: bool = False
+    num_workers: int = 0
+    prefetch_factor: int = 2
 
     def __post_init__(self) -> None:
         for name in ("micro_batch_size", "micro_batch_num", "prefetch_steps"):
@@ -121,6 +126,14 @@ class DistributedDatasetConfig:
             raise ValueError(f"pin_memory must be a boolean, but got {self.pin_memory!r}.")
         if not isinstance(self.double_buffer, bool):
             raise ValueError(f"double_buffer must be a boolean, but got {self.double_buffer!r}.")
+        if not isinstance(self.num_workers, int) or isinstance(self.num_workers, bool) or self.num_workers < 0:
+            raise ValueError(f"num_workers must be a non-negative integer, but got {self.num_workers!r}.")
+        if (
+            not isinstance(self.prefetch_factor, int)
+            or isinstance(self.prefetch_factor, bool)
+            or self.prefetch_factor < 1
+        ):
+            raise ValueError(f"prefetch_factor must be a positive integer, but got {self.prefetch_factor!r}.")
         if self.sample_transport not in _SAMPLE_TRANSPORTS:
             raise ValueError(
                 f"sample_transport must be one of {_SAMPLE_TRANSPORTS}, "
@@ -139,6 +152,7 @@ def build_distributed_dataset(
     communication_device: Any = None,
     prepare_micro_batch: Callable[[Any], Any] | None = None,
     cost_model: CostModel | None = None,
+    worker_init_fn: Callable[[int], None] | None = None,
 ) -> DistributedDataset:
     """Build a PyTorch-only online-planned distributed dataset.
 
@@ -166,6 +180,8 @@ def build_distributed_dataset(
         prepare_micro_batch: Optional owner-side move/packing before communication.
             Double buffering invokes it on the data producer thread.
         cost_model: Optional calibrated workload cost model.
+        worker_init_fn: Optional callback forwarded to the native PyTorch
+            DataLoader and invoked once in each local worker process.
 
     Returns:
         Configured :class:`DistributedDataset` iterator.
@@ -186,6 +202,20 @@ def build_distributed_dataset(
         cost_model=cost_model,
         cp_shards=config.cp_shards,
     )
+    local_data_loader = (
+        TorchLocalDataLoader(
+            dataset,
+            metadata_fn=metadata_fn,
+            collate_fn=collate_fn,
+            num_workers=config.num_workers,
+            prefetch_factor=config.prefetch_factor,
+            pin_memory=config.pin_memory if metadata is not None else False,
+            worker_init_fn=worker_init_fn,
+            online_metadata=metadata is None,
+        )
+        if topology.is_data_owner
+        else None
+    )
     online_sample_source = None
     sample_redistributor = None
     if metadata is None:
@@ -199,6 +229,7 @@ def build_distributed_dataset(
             topology.data_rank,
             topology.data_parallel_size,
             max_entries=complete_steps * planner.local_samples_per_step,
+            local_data_loader=local_data_loader,
         )
         if topology.data_parallel_size == 1 or not topology.is_data_owner:
             sample_redistributor = LocalSampleRedistributor()
@@ -222,7 +253,8 @@ def build_distributed_dataset(
             topology.data_parallel_size,
             max_entries=complete_steps * planner.local_samples_per_step,
         )
-    micro_batch_fetcher = MicroBatchFetcher(MapDatasetFetcher(dataset), collate_fn)
+    sidecar_data_loader = local_data_loader if metadata is not None else None
+    micro_batch_fetcher = MicroBatchFetcher(MapDatasetFetcher(dataset), collate_fn, sidecar_data_loader)
 
     if topology.data_parallel_size == 1:
         metadata_synchronizer = LocalMetadataSynchronizer()
@@ -257,4 +289,5 @@ def build_distributed_dataset(
         online_sample_source=online_sample_source,
         sample_redistributor=sample_redistributor,
         data_stream=data_stream,
+        local_data_loader=local_data_loader,
     )

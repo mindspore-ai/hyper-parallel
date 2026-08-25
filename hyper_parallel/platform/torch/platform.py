@@ -1394,6 +1394,13 @@ class TorchPlatform(Platform):
         from hyper_parallel.platform.torch.multicore import TorchMulticoreHandler
         return TorchMulticoreHandler()
 
+    @staticmethod
+    def create_data_loader(dataset: Any, **kwargs: Any) -> Any:
+        """Create a native PyTorch DataLoader."""
+        from torch.utils.data import DataLoader  # pylint: disable=C0415
+
+        return DataLoader(dataset, **kwargs)
+
     def new_stream(self):
         device = self.get_device_handle()
         return device.Stream()

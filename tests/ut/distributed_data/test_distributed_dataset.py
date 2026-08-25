@@ -104,13 +104,29 @@ class TestDistributedDataPublicApi(unittest.TestCase):
                 micro_batch_num=1,
                 double_buffer=1,
             )
+        with self.assertRaisesRegex(ValueError, "num_workers must be a non-negative integer"):
+            distributed_data.DistributedDatasetConfig(
+                micro_batch_size=1,
+                micro_batch_num=1,
+                num_workers=-1,
+            )
+        with self.assertRaisesRegex(ValueError, "prefetch_factor must be a positive integer"):
+            distributed_data.DistributedDatasetConfig(
+                micro_batch_size=1,
+                micro_batch_num=1,
+                prefetch_factor=0,
+            )
         config = distributed_data.DistributedDatasetConfig(
             micro_batch_size=1,
             micro_batch_num=1,
             prefetch_steps=1,
             double_buffer=True,
+            num_workers=2,
+            prefetch_factor=3,
         )
         self.assertTrue(config.double_buffer)
+        self.assertEqual(config.num_workers, 2)
+        self.assertEqual(config.prefetch_factor, 3)
 
     def test_builder_creates_dedicated_data_groups_in_global_order(self) -> None:
         """Every rank should derive the same metadata and model-group creation sequence."""
@@ -175,6 +191,95 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must preserve sample_id"):
             source.get(0)
+
+    def test_builder_configures_owner_torch_dataloader(self) -> None:
+        """The public options should configure one owner-local native DataLoader."""
+        dataset = ["sample"]
+        metadata = [SampleMeta(sample_id=0)]
+        topology = DataTopology.from_layout(
+            mesh_shape=(1,),
+            mesh_dim_names=("dp_shard",),
+            rank_list=(0,),
+            global_rank=0,
+        )
+
+        def worker_init_fn(worker_id: int) -> None:
+            """Provide a synthetic callback for constructor forwarding."""
+            del worker_id
+
+        with (
+            patch("hyper_parallel.distributed_data.api.DataTopology.from_mesh", return_value=topology),
+            patch("hyper_parallel.distributed_data.api.TorchLocalDataLoader") as local_loader_type,
+        ):
+            loader = distributed_data.build_distributed_dataset(
+                dataset,
+                mesh=object(),
+                config=distributed_data.DistributedDatasetConfig(
+                    micro_batch_size=1,
+                    micro_batch_num=1,
+                    num_workers=2,
+                    prefetch_factor=3,
+                    pin_memory=True,
+                ),
+                metadata=metadata,
+                collate_fn=tuple,
+                worker_init_fn=worker_init_fn,
+            )
+
+        try:
+            local_loader_type.assert_called_once_with(
+                dataset,
+                metadata_fn=None,
+                collate_fn=tuple,
+                num_workers=2,
+                prefetch_factor=3,
+                pin_memory=True,
+                worker_init_fn=worker_init_fn,
+                online_metadata=False,
+            )
+        finally:
+            loader.close()
+        local_loader_type.return_value.close.assert_called_once_with()
+
+    def test_builder_runs_both_metadata_paths_through_torch_dataloader(self) -> None:
+        """The native local loader should preserve both public planning modes."""
+        topology = DataTopology.from_layout(
+            mesh_shape=(1,),
+            mesh_dim_names=("dp_shard",),
+            rank_list=(0,),
+            global_rank=0,
+        )
+        dataset = ["sample-0", "sample-1"]
+        config = distributed_data.DistributedDatasetConfig(micro_batch_size=2, micro_batch_num=1)
+
+        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
+            """Derive minimal online metadata for the public builder path."""
+            del sample
+            return SampleMeta(sample_id=sample_id)
+
+        for online in (False, True):
+            with (
+                self.subTest(online=online),
+                patch("hyper_parallel.distributed_data.api.DataTopology.from_mesh", return_value=topology),
+            ):
+                kwargs = {"metadata_fn": metadata_fn} if online else {
+                    "metadata": [SampleMeta(sample_id=0), SampleMeta(sample_id=1)]
+                }
+                loader = distributed_data.build_distributed_dataset(
+                    dataset,
+                    mesh=object(),
+                    config=config,
+                    collate_fn=tuple,
+                    **kwargs,
+                )
+                try:
+                    step = next(loader)
+                    micro_batch = next(step)
+
+                    self.assertEqual(micro_batch.data, ("sample-0", "sample-1"))
+                    loader.commit(step.replay_id)
+                finally:
+                    loader.close()
 
 
 class _PeerMetadataSynchronizer:
