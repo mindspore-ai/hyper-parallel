@@ -1,0 +1,14 @@
+.git
+.gitignore
+.agent
+.jenkins
+build
+dist
+*.egg-info
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.tox
+tests
