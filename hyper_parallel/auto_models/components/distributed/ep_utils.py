@@ -475,6 +475,79 @@ def bind_local_expert_forward(
 # MoEAlltoAllTokenDispatcher + expert_tensor_parallel_size=1)
 # ────────────────────────────────────────────────────────────────────────────
 
+
+def _prepare_ep_dispatch(
+    hidden_states: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    local_expert_count: int,
+    global_expert_count: int,
+    ep_size: int,
+    ep_group: Any,
+):
+    """Sort routed tokens and exchange per-rank dispatch counts."""
+    flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    token_count = flattened_states.shape[0]
+    experts_per_token = topk_indices.shape[1]
+    expert_indices = topk_indices.reshape(-1)
+    expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+    source_indices = torch.arange(token_count, device=flattened_states.device).repeat_interleave(experts_per_token)
+    destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
+    dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
+    dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
+    dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
+    send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
+    receive_counts_tensor = torch.empty_like(send_counts_tensor)
+    dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
+    return (
+        source_indices,
+        expert_weights,
+        dispatch_order,
+        dispatched_states,
+        dispatched_indices,
+        send_counts_tensor.tolist(),
+        receive_counts_tensor.tolist(),
+    )
+
+
+def _run_ep_local_experts(
+    module: Any,
+    dispatched_states: torch.Tensor,
+    dispatched_indices: torch.Tensor,
+    send_counts: list[int],
+    receive_counts: list[int],
+    ep_group: Any,
+    expert_offset: int,
+) -> torch.Tensor:
+    """Dispatch tokens, run local experts, and return combined expert outputs."""
+    received_states = ep_all_to_all(dispatched_states, send_counts, receive_counts, ep_group)
+    received_indices = ep_all_to_all(
+        dispatched_indices, send_counts, receive_counts, ep_group
+    ).squeeze(-1)
+    local_outputs = module.experts(received_states, received_indices - expert_offset)
+    return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
+
+
+def _aggregate_ep_outputs(
+    combined_outputs: torch.Tensor,
+    expert_weights: torch.Tensor,
+    source_indices: torch.Tensor,
+    dispatch_order: torch.Tensor,
+    output_shape: tuple[int, int, int],
+) -> torch.Tensor:
+    """Undo expert-major routing and aggregate weighted top-k outputs."""
+    weighted_outputs = combined_outputs * expert_weights[dispatch_order].unsqueeze(-1)
+    output = torch.zeros(
+        output_shape[0] * output_shape[1],
+        output_shape[-1],
+        dtype=weighted_outputs.dtype,
+        device=weighted_outputs.device,
+    )
+    output.index_add_(0, source_indices[dispatch_order], weighted_outputs)
+    return output.view(*output_shape)
+
+
 def ep_routed_forward(
     module: Any,
     hidden_states: torch.Tensor,
@@ -530,95 +603,41 @@ def ep_routed_forward(
     expert_offset = ep_rank * local_expert_count
 
     batch_size, sequence_length, hidden_size = hidden_states.shape
-    flattened_states = hidden_states.reshape(-1, hidden_size)
-    token_count = flattened_states.shape[0]
-
-    # 1. router (local chunk): each rank's chunk differs -> no token duplication
     topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
-    experts_per_token = topk_indices.shape[1]
-    flattened_expert_indices = topk_indices.reshape(-1)
-    flattened_expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
-    source_token_indices = torch.arange(
-        token_count,
-        device=flattened_states.device,
-    ).repeat_interleave(experts_per_token)
-    destination_ranks = torch.div(
-        flattened_expert_indices,
-        local_expert_count,
-        rounding_mode="floor",
+    dispatch = _prepare_ep_dispatch(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        local_expert_count=local_expert_count,
+        global_expert_count=global_expert_count,
+        ep_size=ep_size,
+        ep_group=ep_group,
     )
-
-    # 2. sort by (dest, expert) + counts exchange (extended EP group)
-    dispatch_order = (
-        destination_ranks * global_expert_count + flattened_expert_indices
-    ).argsort()
-    dispatched_states = flattened_states[source_token_indices[dispatch_order]].contiguous()
-    dispatched_expert_indices = flattened_expert_indices[
-        dispatch_order
-    ].unsqueeze(-1).contiguous()
-    send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
-    receive_counts_tensor = torch.empty_like(send_counts_tensor)
-    dist.all_to_all_single(
-        receive_counts_tensor,
-        send_counts_tensor,
-        group=ep_group,
-    )
-    send_counts = send_counts_tensor.tolist()
-    receive_counts = receive_counts_tensor.tolist()
-
-    # 3. a2a dispatch over the extended EP group (tokens carry the full H,
-    #    sent to the rank holding the expert)
-    received_states = ep_all_to_all(
+    (
+        source_token_indices,
+        flattened_expert_weights,
+        dispatch_order,
         dispatched_states,
+        dispatched_expert_indices,
         send_counts,
         receive_counts,
-        ep_group,
-    )
-    received_global_expert_indices = ep_all_to_all(
+    ) = dispatch
+    combined_expert_outputs = _run_ep_local_experts(
+        module,
+        dispatched_states,
         dispatched_expert_indices,
         send_counts,
         receive_counts,
         ep_group,
-    ).squeeze(-1)
-
-    # 4. Call the local expert module so nested FSDP hooks unshard before
-    #    accessing expert weights and reshard after the SwiGLU computation.
-    local_expert_outputs = module.experts(
-        received_states,
-        received_global_expert_indices - expert_offset,
+        expert_offset,
     )
-
-    # 5. a2a combine over the extended EP group -> inverse perm -> weighted
-    #    aggregation by topk_w
-    combined_expert_outputs = ep_all_to_all(
-        local_expert_outputs.contiguous(),
-        receive_counts,
-        send_counts,
-        ep_group,
+    return _aggregate_ep_outputs(
+        combined_expert_outputs,
+        flattened_expert_weights,
+        source_token_indices,
+        dispatch_order,
+        (batch_size, sequence_length, hidden_size),
     )
-    weighted_expert_outputs = combined_expert_outputs * flattened_expert_weights[
-        dispatch_order
-    ].unsqueeze(-1)
-    # ``dispatch_order`` is globally expert-major, so index-add accumulates a
-    # token's selected experts in ascending expert order. This matches the HF
-    # Qwen3 expert loop and avoids BF16 drift from summing in router top-k order.
-    output = torch.zeros(
-        token_count,
-        hidden_size,
-        dtype=weighted_expert_outputs.dtype,
-        device=weighted_expert_outputs.device,
-    )
-    output.index_add_(
-        0,
-        source_token_indices[dispatch_order],
-        weighted_expert_outputs,
-    )
-    output = output.view(
-        batch_size,
-        sequence_length,
-        hidden_size,
-    )
-    return output
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -601,6 +601,91 @@ def _apply_module_replacement_actions(
     )
 
 
+def _resolve_compile_config(
+    compile_config: Optional[Union[CompileConfig, dict]],
+    validate_placement: bool,
+    fsdp2_manager: Optional[FSDP2Manager],
+) -> tuple[Optional[CompileConfig], bool]:
+    """Normalize compile configuration and validate its FSDP interaction."""
+    if isinstance(compile_config, dict):
+        compile_config = CompileConfig(enabled=True, **compile_config)
+    if compile_config is not None and not isinstance(compile_config, CompileConfig):
+        raise TypeError("compile_config must be a CompileConfig, mapping, or None")
+    compile_for_execution = bool(
+        not validate_placement and compile_config is not None and compile_config.enabled
+    )
+    if validate_placement and compile_config is not None and compile_config.enabled:
+        logger.info("Skipping decoder-layer compile during placement validation")
+    if compile_for_execution and compile_config.fullgraph and isinstance(fsdp2_manager, FSDP2Manager):
+        raise ValueError(
+            "compile.fullgraph=True is incompatible with FSDP hooks kept eager "
+            "by _dynamo_disable; set compile.fullgraph=False"
+        )
+    return compile_config, compile_for_execution
+
+
+def _apply_pre_sharding_features(
+    model: nn.Module,
+    autopipeline: Optional[AutoPipeline],
+    peft_config: Optional[Any],
+    qat_config: Optional[Any],
+    fp8_config: Optional[Any],
+) -> None:
+    """Apply or report optional features that precede sharding."""
+    if autopipeline is not None:
+        autopipeline.build(model)
+    if peft_config is not None:
+        logger.warning("PEFT injection not implemented in stub")
+    if qat_config is not None:
+        logger.warning("QAT not implemented in stub")
+    if fp8_config is not None:
+        logger.warning("FP8 not implemented in stub")
+
+
+def _apply_activation_features(
+    model: nn.Module,
+    activation_checkpoint: Optional[str],
+    activation_swap: str,
+    compile_for_execution: bool,
+    mesh: Optional[MeshContext],
+) -> nn.Module:
+    """Apply activation checkpointing and attention swap in execution order."""
+    if activation_checkpoint not in (None, "off"):
+        model = _apply_activation_checkpointing(
+            model, activation_checkpoint, enable_compile=compile_for_execution
+        )
+    validate_attention_swap(
+        activation_swap,
+        activation_checkpoint=activation_checkpoint,
+        enable_compile=compile_for_execution,
+        pp_size=getattr(mesh, "pp_size", 1),
+    )
+    return apply_attention_swap(model, activation_swap) if activation_swap != "none" else model
+
+
+def _materialize_and_load_model(
+    model: nn.Module,
+    *,
+    is_meta_device: bool,
+    device: Optional[torch.device],
+    load_base_model: bool,
+    pretrained_path: Optional[str],
+    weights_mapping: Any,
+) -> nn.Module:
+    """Materialize model storage and load or initialize meta-device weights."""
+    model = _move_model_to_device(model, is_meta_device, device)
+    if not is_meta_device:
+        return model
+    if load_base_model:
+        load_report = CheckpointManager(model).load_checkpoint(
+            pretrained_path, strict=False, weights_mapping=weights_mapping
+        )
+        _finalize_model_loading(model, load_report, strict=True)
+    else:
+        _initialize_model_weights(model)
+    return model
+
+
 def apply_model_infrastructure(
     model: nn.Module,
     mesh: Optional[MeshContext] = None,
@@ -633,40 +718,12 @@ def apply_model_infrastructure(
 
     distributed_setup = kwargs.get("distributed_setup")
 
-    if isinstance(compile_config, dict):
-        compile_config = CompileConfig(enabled=True, **compile_config)
-    if compile_config is not None and not isinstance(compile_config, CompileConfig):
-        raise TypeError("compile_config must be a CompileConfig, mapping, or None")
-    compile_for_execution = bool(
-        not validate_placement
-        and compile_config is not None
-        and compile_config.enabled
+    compile_config, compile_for_execution = _resolve_compile_config(
+        compile_config, validate_placement, fsdp2_manager
     )
-    if validate_placement and compile_config is not None and compile_config.enabled:
-        logger.info("Skipping decoder-layer compile during placement validation")
-    if (
-        compile_for_execution
-        and compile_config.fullgraph
-        and isinstance(fsdp2_manager, FSDP2Manager)
-    ):
-        raise ValueError(
-            "compile.fullgraph=True is incompatible with FSDP hooks kept eager "
-            "by _dynamo_disable; set compile.fullgraph=False"
-        )
-
-    # Step 3: PP split (if autopipeline)
-    if autopipeline is not None:
-        autopipeline.build(model)
-
-    # Step 4: PEFT injection (before sharding)
-    if peft_config is not None:
-        logger.warning("PEFT injection not implemented in stub")
-
-    # Step 5: QAT / FP8 (before sharding)
-    if qat_config is not None:
-        logger.warning("QAT not implemented in stub")
-    if fp8_config is not None:
-        logger.warning("FP8 not implemented in stub")
+    _apply_pre_sharding_features(
+        model, autopipeline, peft_config, qat_config, fp8_config
+    )
 
     # Step 5.5: structure-preserving replacement before plan derivation.
     weights_mapping = get_model_conversion_mapping(model)
@@ -677,7 +734,6 @@ def apply_model_infrastructure(
         low_precision_config=low_precision_config,
     )
 
-    # Step 6: Parameter freezing (before sharding)
     if freeze_config is not None:
         logger.warning("Parameter freezing not implemented in stub")
 
@@ -690,25 +746,9 @@ def apply_model_infrastructure(
         validate_placement,
     )
 
-    # Step 9-1: activation checkpointing remains inside the FSDP boundary.
-    if activation_checkpoint not in (None, "off"):
-        model = _apply_activation_checkpointing(
-            model,
-            activation_checkpoint,
-            enable_compile=compile_for_execution,
-        )
-
-    # Step 9-2:activation swap.
-    validate_attention_swap(
-        activation_swap,
-        activation_checkpoint=activation_checkpoint,
-        enable_compile=compile_for_execution,
-        pp_size=getattr(mesh, "pp_size", 1),
+    model = _apply_activation_features(
+        model, activation_checkpoint, activation_swap, compile_for_execution, mesh
     )
-    if activation_swap != "none":
-        model = apply_attention_swap(model, activation_swap)
-
-
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.
     model = _apply_fsdp2(
@@ -718,17 +758,14 @@ def apply_model_infrastructure(
     )
 
     # Steps 11-12: materialize model storage, then load or initialize weights.
-    model = _move_model_to_device(model, is_meta_device, device)
-    if is_meta_device:
-        if load_base_model:
-            load_report = CheckpointManager(model).load_checkpoint(
-                pretrained_path,
-                strict=False,
-                weights_mapping=weights_mapping,
-            )
-            _finalize_model_loading(model, load_report, strict=True)
-        else:
-            _initialize_model_weights(model)
+    model = _materialize_and_load_model(
+        model,
+        is_meta_device=is_meta_device,
+        device=device,
+        load_base_model=load_base_model,
+        pretrained_path=pretrained_path,
+        weights_mapping=weights_mapping,
+    )
 
     # Step 13: compile only the execution model, after FSDP and loading.
     if compile_for_execution:

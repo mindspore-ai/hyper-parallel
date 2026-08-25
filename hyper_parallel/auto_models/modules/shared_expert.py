@@ -81,6 +81,96 @@ class SharedExpert(nn.Module):
         context: Additional replacement context.
     """
 
+    @staticmethod
+    def _separate_projections(module: nn.Module) -> tuple[nn.Linear, nn.Linear, nn.Linear]:
+        """Validate and return separate source projections."""
+        source_linears = (module.gate_proj, module.up_proj, module.down_proj)
+        if any(not isinstance(layer, nn.Linear) for layer in source_linears):
+            raise TypeError("SharedExpert source projections must be nn.Linear instances")
+        gate_proj, up_proj, down_proj = source_linears
+        if gate_proj.in_features != up_proj.in_features:
+            raise ValueError("SharedExpert gate and up projections must have the same input size")
+        if gate_proj.out_features != up_proj.out_features:
+            raise ValueError("SharedExpert gate and up projections must have the same output size")
+        if down_proj.in_features != gate_proj.out_features:
+            raise ValueError("SharedExpert down projection input size is incompatible with gate/up")
+        if down_proj.out_features != gate_proj.in_features:
+            raise ValueError("SharedExpert down projection output size is incompatible with gate/up")
+        if gate_proj.weight.requires_grad != up_proj.weight.requires_grad:
+            raise ValueError("SharedExpert gate and up weights must use the same training policy")
+        if (gate_proj.bias is None) != (up_proj.bias is None):
+            raise ValueError("SharedExpert gate and up projections must use the same bias policy")
+        if gate_proj.bias is not None and gate_proj.bias.requires_grad != up_proj.bias.requires_grad:
+            raise ValueError("SharedExpert gate and up biases must use the same training policy")
+        return gate_proj, up_proj, down_proj
+
+    def _initialize_fused_source(self, module: nn.Module) -> None:
+        """Reuse an already fused source module without converting parameters."""
+        self.linear_fc1 = module.linear_fc1
+        self.linear_fc2 = module.linear_fc2
+        if not all(hasattr(layer, "skip_bias_add") for layer in (self.linear_fc1, self.linear_fc2)):
+            raise TypeError("fused SharedExpert projections must return output and bias separately")
+        if not hasattr(module, "activation_func"):
+            raise TypeError("fused SharedExpert source module is missing activation_func")
+        self.activation_func = module.activation_func
+        self._return_bias_tuple = True
+        self._gate_size = 0
+        self._up_size = 0
+        self.train(module.training)
+
+    def _initialize_separate_linears(
+        self,
+        gate_proj: nn.Linear,
+        up_proj: nn.Linear,
+        down_proj: nn.Linear,
+    ) -> None:
+        """Construct fused linear layers from separate source projections."""
+        self._gate_size = gate_proj.out_features
+        self._up_size = up_proj.out_features
+        self.linear_fc1 = LinearWithMatmul(
+            gate_proj.in_features,
+            self._gate_size + self._up_size,
+            bias=gate_proj.bias is not None,
+            device=gate_proj.weight.device,
+            dtype=gate_proj.weight.dtype,
+        )
+        self.linear_fc1.weight.requires_grad_(gate_proj.weight.requires_grad)
+        if gate_proj.bias is not None:
+            self.linear_fc1.bias.requires_grad_(gate_proj.bias.requires_grad)
+        self.linear_fc2 = LinearWithMatmul(
+            down_proj.in_features,
+            down_proj.out_features,
+            bias=down_proj.bias is not None,
+            device=down_proj.weight.device,
+            dtype=down_proj.weight.dtype,
+        )
+        self.linear_fc2.weight.requires_grad_(down_proj.weight.requires_grad)
+        if down_proj.bias is not None:
+            self.linear_fc2.bias.requires_grad_(down_proj.bias.requires_grad)
+
+    def _initialize_activation(self, module: nn.Module, config: Any) -> None:
+        """Select the source-compatible gated activation implementation."""
+        hidden_act = getattr(config, "hidden_act", None)
+        if hidden_act is None:
+            hidden_act = getattr(config, "hidden_activation", None)
+        if hidden_act is None:
+            hidden_act = getattr(config, "mlp_hidden_act", None)
+        activation_func = getattr(module, "act_fn", None)
+        if activation_func is None:
+            if hidden_act is None:
+                hidden_act = "silu"
+            activation_func = ACT2FN[hidden_act]
+        if hidden_act == "silu" and bool(getattr(config, "use_fused_swiglu", True)):
+            self.activation_func = partial(swiglu, dim=-1)
+            return
+
+        def glu(x: torch.Tensor) -> torch.Tensor:
+            """Apply the configured gated linear unit."""
+            gate, value = torch.chunk(x, 2, dim=-1)
+            return activation_func(gate) * value
+
+        self.activation_func = glu
+
     def __init__(
         self,
         *,
@@ -105,93 +195,12 @@ class SharedExpert(nn.Module):
             )
 
         if self._source_is_fused:
-            self.linear_fc1 = module.linear_fc1
-            self.linear_fc2 = module.linear_fc2
-            if not all(
-                hasattr(layer, "skip_bias_add")
-                for layer in (self.linear_fc1, self.linear_fc2)
-            ):
-                raise TypeError(
-                    "fused SharedExpert projections must return output and bias separately"
-                )
-            if not hasattr(module, "activation_func"):
-                raise TypeError("fused SharedExpert source module is missing activation_func")
-            self.activation_func = module.activation_func
-            self._return_bias_tuple = True
-            self._gate_size = 0
-            self._up_size = 0
-            self.train(module.training)
+            self._initialize_fused_source(module)
             return
 
-        source_linears = (module.gate_proj, module.up_proj, module.down_proj)
-        if any(not isinstance(layer, nn.Linear) for layer in source_linears):
-            raise TypeError("SharedExpert source projections must be nn.Linear instances")
-        gate_proj, up_proj, down_proj = source_linears
-        if gate_proj.in_features != up_proj.in_features:
-            raise ValueError("SharedExpert gate and up projections must have the same input size")
-        if gate_proj.out_features != up_proj.out_features:
-            raise ValueError("SharedExpert gate and up projections must have the same output size")
-        if down_proj.in_features != gate_proj.out_features:
-            raise ValueError("SharedExpert down projection input size is incompatible with gate/up")
-        if down_proj.out_features != gate_proj.in_features:
-            raise ValueError("SharedExpert down projection output size is incompatible with gate/up")
-        if gate_proj.weight.requires_grad != up_proj.weight.requires_grad:
-            raise ValueError("SharedExpert gate and up weights must use the same training policy")
-        if (gate_proj.bias is None) != (up_proj.bias is None):
-            raise ValueError("SharedExpert gate and up projections must use the same bias policy")
-        if (
-            gate_proj.bias is not None
-            and gate_proj.bias.requires_grad != up_proj.bias.requires_grad
-        ):
-            raise ValueError("SharedExpert gate and up biases must use the same training policy")
-
-        self._gate_size = gate_proj.out_features
-        self._up_size = up_proj.out_features
-        self.linear_fc1 = LinearWithMatmul(
-            gate_proj.in_features,
-            self._gate_size + self._up_size,
-            bias=gate_proj.bias is not None,
-            device=gate_proj.weight.device,
-            dtype=gate_proj.weight.dtype,
-        )
-        self.linear_fc1.weight.requires_grad_(gate_proj.weight.requires_grad)
-        if gate_proj.bias is not None:
-            self.linear_fc1.bias.requires_grad_(gate_proj.bias.requires_grad)
-        self.linear_fc2 = LinearWithMatmul(
-            down_proj.in_features,
-            down_proj.out_features,
-            bias=down_proj.bias is not None,
-            device=down_proj.weight.device,
-            dtype=down_proj.weight.dtype,
-        )
-        self.linear_fc2.weight.requires_grad_(down_proj.weight.requires_grad)
-        if down_proj.bias is not None:
-            self.linear_fc2.bias.requires_grad_(down_proj.bias.requires_grad)
-
-        hidden_act = getattr(config, "hidden_act", None)
-        if hidden_act is None:
-            hidden_act = getattr(config, "hidden_activation", None)
-        if hidden_act is None:
-            hidden_act = getattr(config, "mlp_hidden_act", None)
-        use_fused_swiglu = bool(getattr(config, "use_fused_swiglu", True))
-        gated_linear_unit = True
-        _activation_func = getattr(module, "act_fn", None)
-        if _activation_func is None:
-            if hidden_act is None:
-                hidden_act = "silu"
-            _activation_func = ACT2FN[hidden_act]
-
-        if gated_linear_unit:
-            if hidden_act == "silu" and use_fused_swiglu:
-                self.activation_func = partial(swiglu, dim=-1)
-            else:
-                def glu(x: torch.Tensor) -> torch.Tensor:
-                    """Apply the configured gated linear unit."""
-                    x = torch.chunk(x, 2, dim=-1)
-                    return _activation_func(x[0]) * x[1]
-                self.activation_func = glu
-        else:
-            self.activation_func = _activation_func
+        gate_proj, up_proj, down_proj = self._separate_projections(module)
+        self._initialize_separate_linears(gate_proj, up_proj, down_proj)
+        self._initialize_activation(module, config)
         self._return_bias_tuple = False
         self.train(module.training)
 

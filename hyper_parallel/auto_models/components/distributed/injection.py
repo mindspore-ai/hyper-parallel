@@ -299,6 +299,83 @@ def _is_subsequence(sub: List[str], full: List[str]) -> bool:
     return all(name in it for name in sub)
 
 
+def _compute_parameters(compute_fn: Callable[..., Any], owner: str) -> List[inspect.Parameter]:
+    """Return the declared compute parameters after its module argument."""
+    try:
+        params = list(inspect.signature(compute_fn).parameters.values())
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{owner}: cannot introspect the signature of the injected compute fn") from exc
+    if not params:
+        raise TypeError(
+            f"{owner}: a compute fn needs at least the module first "
+            "parameter -- the contract is fn(module, *forward_args)"
+        )
+    return params[1:]
+
+
+def _validate_explicit_compute_parameters(params: List[inspect.Parameter], owner: str) -> None:
+    """Reject variadic compute parameters that hide signature mismatches."""
+    for param in params:
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            raise TypeError(
+                f"{owner}: a compute fn must not use *args/**kwargs "
+                f"(parameter {param.name!r}) -- its arguments must explicitly "
+                "match the original forward"
+            )
+
+
+def _validate_compute_parameter_names(
+    fn_params: List[inspect.Parameter],
+    fwd_params: List[inspect.Parameter],
+    owner: str,
+) -> None:
+    """Validate compute parameter names and positional ordering."""
+    fwd_names = {
+        param.name
+        for param in fwd_params
+        if param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    }
+    for param in fn_params:
+        if param.name not in fwd_names:
+            raise TypeError(
+                f"{owner}: compute-fn parameter {param.name!r} has no "
+                f"same-named entry among the original forward parameters {sorted(fwd_names)} -- "
+                "the injected function's arguments must match the original function's "
+                "(the skeleton forwards the actual forward arguments, so a name mismatch "
+                "becomes a runtime TypeError)"
+            )
+    positional_kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    fwd_pos = [param.name for param in fwd_params if param.kind in positional_kinds]
+    fn_pos = [param.name for param in fn_params if param.kind in positional_kinds]
+    if not _is_subsequence(fn_pos, fwd_pos):
+        raise TypeError(
+            f"{owner}: the compute fn's positional parameters {fn_pos} are not an in-order subsequence "
+            f"of the original forward's positional parameters {fwd_pos} -- the skeleton forwards "
+            "arguments positionally, so a reordering would bind them wrong"
+        )
+
+
+def _validate_required_compute_parameters(
+    fn_params: List[inspect.Parameter],
+    fwd_params: List[inspect.Parameter],
+    owner: str,
+) -> None:
+    """Require the compute function to accept every required forward parameter."""
+    fn_names = {param.name for param in fn_params}
+    required = [
+        param.name
+        for param in fwd_params
+        if param.default is inspect.Parameter.empty
+        and param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    ]
+    missing = [name for name in required if name not in fn_names]
+    if missing:
+        raise TypeError(
+            f"{owner}: the original forward's required parameters {missing} are not accepted by the "
+            "compute fn (the compute fn's declared arguments must cover the original function's required ones)"
+        )
+
+
 def validate_local_compute_signature(compute_fn: Callable[..., Any],
                                      forward: Callable[..., Any],
                                      *,
@@ -328,61 +405,11 @@ def validate_local_compute_signature(compute_fn: Callable[..., Any],
     Raises:
         TypeError: If any of the rules above is violated.
     """
-    try:
-        fn_params = list(inspect.signature(compute_fn).parameters.values())
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            f"{owner}: cannot introspect the signature of the injected "
-            "compute fn") from exc
-    if not fn_params:
-        raise TypeError(
-            f"{owner}: a compute fn needs at least the module first "
-            "parameter -- the contract is fn(module, *forward_args)")
-    fn_params = fn_params[1:]                     # skip module
-    for p in fn_params:
-        if p.kind in (inspect.Parameter.VAR_POSITIONAL,
-                      inspect.Parameter.VAR_KEYWORD):
-            raise TypeError(
-                f"{owner}: a compute fn must not use *args/**kwargs "
-                f"(parameter {p.name!r}) -- its arguments must explicitly "
-                "match the original forward")
-
+    fn_params = _compute_parameters(compute_fn, owner)
+    _validate_explicit_compute_parameters(fn_params, owner)
     fwd_params = list(inspect.signature(forward).parameters.values())
-    fwd_names = {p.name for p in fwd_params
-                 if p.kind not in (inspect.Parameter.VAR_POSITIONAL,
-                                   inspect.Parameter.VAR_KEYWORD)}
-    fn_names = {p.name for p in fn_params}
-    for p in fn_params:
-        if p.name not in fwd_names:
-            raise TypeError(
-                f"{owner}: compute-fn parameter {p.name!r} has no "
-                f"same-named entry among the original forward parameters "
-                f"{sorted(fwd_names)} -- the injected function's arguments "
-                "must match the original function's (the skeleton forwards "
-                "the actual forward arguments, so a name mismatch becomes a "
-                "runtime TypeError)")
-    fwd_pos = [p.name for p in fwd_params
-               if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
-                             inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-    fn_pos = [p.name for p in fn_params
-              if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
-                            inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-    if not _is_subsequence(fn_pos, fwd_pos):
-        raise TypeError(
-            f"{owner}: the compute fn's positional parameters {fn_pos} are "
-            f"not an in-order subsequence of the original forward's "
-            f"positional parameters {fwd_pos} -- the skeleton forwards "
-            "arguments positionally, so a reordering would bind them wrong")
-    required = [p.name for p in fwd_params
-                if p.default is inspect.Parameter.empty
-                and p.kind not in (inspect.Parameter.VAR_POSITIONAL,
-                                   inspect.Parameter.VAR_KEYWORD)]
-    missing = [n for n in required if n not in fn_names]
-    if missing:
-        raise TypeError(
-            f"{owner}: the original forward's required parameters {missing} "
-            "are not accepted by the compute fn (the compute fn's declared "
-            "arguments must cover the original function's required ones)")
+    _validate_compute_parameter_names(fn_params, fwd_params, owner)
+    _validate_required_compute_parameters(fn_params, fwd_params, owner)
 
 
 def validate_wrapped_forward(orig_forward: Callable[..., Any],

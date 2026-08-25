@@ -418,6 +418,108 @@ class ShardingPlan:
     # (embed_tokens <-> lm_head).
     tied_pairs: List[Tuple[str, str]] = field(default_factory=list)
 
+    def _format_named_placement(self, named: Optional[NamedPlacement]) -> str:
+        """Format a named placement as a compact one-line dictionary."""
+        if not named:
+            return "{}"
+        items = [
+            (getattr(axis, "value", axis), placement)
+            for axis, placement in named.items()
+            if not self.mesh_dim_names or getattr(axis, "value", axis) in self.mesh_dim_names
+        ]
+        return "{" + ", ".join(f"{axis}: {placement!r}" for axis, placement in items) + "}"
+
+    @staticmethod
+    def _format_injection_callable(obj: Any) -> str:
+        """Format a callable, Target, or registry name for display."""
+        if obj is None:
+            return "-"
+        path = getattr(obj, "_target_path", None)
+        if path:
+            return path
+        if isinstance(obj, str):
+            return obj
+        return getattr(obj, "__qualname__", repr(obj))
+
+    def _append_parameter_explanation(self, lines: List[str], spec: ModuleShardingSpec) -> None:
+        """Append parameter, TP-local attribute, and deferred-bias details."""
+        if spec.params:
+            lines.append("  parameter sharding:")
+            for param_name, named in spec.params.items():
+                lines.append(f"    {param_name}: {self._format_named_placement(named)}")
+        else:
+            lines.append("  parameter sharding: none ({} = this boundary shards no parameters, I/O stitching only)")
+        attr_plan = spec._tp_local_attr_plan
+        if attr_plan is not None and (attr_plan.auto_divide or attr_plan.user_divide):
+            lines.append("  TP-local attribute division:")
+            if attr_plan.auto_divide:
+                lines.append("    auto(D-17): " + ", ".join(attr_plan.auto_divide))
+            if attr_plan.user_divide:
+                lines.append("    user(plan_overrides): " + ", ".join(attr_plan.user_divide))
+        if spec._deferred_bias_params:  # pylint: disable=protected-access
+            lines.append(
+                "  deferred bias (D-22, no bias inside the region, added exactly once after the TP reduction): "
+                + ", ".join(spec._deferred_bias_params)  # pylint: disable=protected-access
+            )
+
+    def _append_communication_explanation(self, lines: List[str], spec: ModuleShardingSpec) -> None:
+        """Append compiled input and output redistribution operations."""
+        # Lazy import avoids a cycle because precompiled_boundary imports this module.
+        from hyper_parallel.auto_models.components.distributed.precompiled_boundary import (  # pylint: disable=C0415
+            PrecompiledBoundary,
+        )
+
+        boundary = PrecompiledBoundary(spec, None, self.mesh_dim_names)
+        if boundary.in_plan:
+            lines.append("  input communication plan (in_src -> in_dst):")
+            for op in boundary.in_plan:
+                tag = "passthrough" if op.collective_type == "identity" else op.collective_type
+                lines.append(
+                    f"    {op.arg_name}: {tuple(map(repr, op.src_placements))} -> "
+                    f"{tuple(map(repr, op.dst_placements))}  [{tag}]"
+                )
+        if boundary.out_plan:
+            lines.append("  output communication plan (out_src -> out_dst):")
+            for op in boundary.out_plan:
+                lines.append(
+                    f"    {op.arg_name}(tuple[{op.arg_index}]): {tuple(map(repr, op.src_placements))} -> "
+                    f"{tuple(map(repr, op.dst_placements))}  [{op.collective_type}]"
+                )
+        if not boundary.in_plan and not boundary.out_plan:
+            lines.append("  boundary communication: none")
+
+    def _append_injection_explanation(self, lines: List[str], spec: ModuleShardingSpec) -> None:
+        """Append compute-injection declarations and dispatch semantics."""
+        injection = []
+        if spec.local_compute_fn is not None:
+            injection.append(f"local_compute_fn={self._format_injection_callable(spec.local_compute_fn)}")
+        if spec.inner_wrapper is not None:
+            injection.append(
+                f"inner_wrapper={self._format_injection_callable(spec.inner_wrapper)}"
+                f"(target={spec.inner_target or 'auto'})"
+            )
+        if spec.inner_out_src is not None:
+            injection.append(f"inner_out_src={spec.inner_out_src}")
+        if spec.region_dispatch is not None:
+            meaning = (
+                "black-box managed (propagation check skipped inside the region, declarative re-wrap)"
+                if spec.region_dispatch is False
+                else "dispatch-through (real validation under validate is enabled)"
+            )
+            injection.append(f"region_dispatch={spec.region_dispatch} -> {meaning}")
+        if injection:
+            lines.append("  injection: " + "; ".join(injection))
+        else:
+            lines.append("  injection: none (ordinary boundary, dispatch-through under validate)")
+
+    def _append_handler_explanation(self, lines: List[str], boundary_fqn: str) -> None:
+        """Append special parameter handlers belonging to one boundary."""
+        handlers = {
+            key: value for key, value in self.special_handlers.items() if key.startswith(boundary_fqn + ".")
+        }
+        for key, handler in handlers.items():
+            lines.append(f"  special handling: {key[len(boundary_fqn) + 1:]} -> {handler}")
+
     def explain(self, fqn: Optional[str] = None) -> str:
         """Human-readable introspection report of this plan (usability tool).
 
@@ -435,38 +537,6 @@ class ShardingPlan:
             fqn: optional exact boundary FQN — report just that boundary;
                 None reports all boundaries.
         """
-        # Lazy: sharding_config must not import precompiled_boundary at
-        # module level (precompiled_boundary already imports this module).
-        from hyper_parallel.auto_models.components.distributed.precompiled_boundary import (  # pylint: disable=C0415
-            PrecompiledBoundary,
-        )
-
-        def fmt_named(named: Optional[NamedPlacement]) -> str:
-            """Format a NamedPlacement as a compact one-line dict string."""
-            if not named:
-                return "{}"
-            items = [
-                (getattr(axis, "value", axis), p) for axis, p in named.items()
-                # Only show the axes of this plan's topology (a spec may carry
-                # the template's full-axis declaration, filtered by
-                # mesh_dim_names only at resolve time — the report filters
-                # early to avoid misleading output)
-                if not self.mesh_dim_names
-                or getattr(axis, "value", axis) in self.mesh_dim_names
-            ]
-            return "{" + ", ".join(f"{a}: {p!r}" for a, p in items) + "}"
-
-        def fmt_callable(obj: Any) -> str:
-            """Format an injection entry point (callable/Target/name) for display."""
-            if obj is None:
-                return "-"
-            path = getattr(obj, "_target_path", None)   # a Target instance
-            if path:
-                return path
-            if isinstance(obj, str):
-                return obj
-            return getattr(obj, "__qualname__", repr(obj))
-
         lines = [
             "=== ShardingPlan introspection report ===",
             f"mesh_dim_names={self.mesh_dim_names}  "
@@ -485,85 +555,10 @@ class ShardingPlan:
 
         for name, spec in selected.items():
             lines.append(f"\n[{name}]")
-            # ── parameter sharding table ──
-            if spec.params:
-                lines.append("  parameter sharding:")
-                for pname, named in spec.params.items():
-                    lines.append(f"    {pname}: {fmt_named(named)}")
-            else:
-                lines.append(
-                    "  parameter sharding: none ({} = this boundary shards no "
-                    "parameters, I/O stitching only)")
-            attr_plan = spec._tp_local_attr_plan
-            if attr_plan is not None and (
-                    attr_plan.auto_divide or attr_plan.user_divide):
-                lines.append("  TP-local attribute division:")
-                if attr_plan.auto_divide:
-                    lines.append(
-                        "    auto(D-17): " + ", ".join(attr_plan.auto_divide))
-                if attr_plan.user_divide:
-                    lines.append(
-                        "    user(plan_overrides): "
-                        + ", ".join(attr_plan.user_divide))
-            if spec._deferred_bias_params:  # pylint: disable=protected-access
-                lines.append(
-                    "  deferred bias (D-22, no bias inside the region, added "
-                    "exactly once after the TP reduction): "
-                    + ", ".join(spec._deferred_bias_params))  # pylint: disable=protected-access
-            # ── boundary communication plan (compiled result; with mesh=None
-            #    only the RedistOp descriptions are taken) ──
-            boundary = PrecompiledBoundary(spec, None, self.mesh_dim_names)
-            if boundary.in_plan:
-                lines.append("  input communication plan (in_src -> in_dst):")
-                for op in boundary.in_plan:
-                    tag = "passthrough" if op.collective_type == "identity" \
-                        else op.collective_type
-                    lines.append(
-                        f"    {op.arg_name}: "
-                        f"{tuple(map(repr, op.src_placements))}"
-                        f" -> {tuple(map(repr, op.dst_placements))}  [{tag}]")
-            if boundary.out_plan:
-                lines.append(
-                    "  output communication plan (out_src -> out_dst):")
-                for op in boundary.out_plan:
-                    lines.append(
-                        f"    {op.arg_name}(tuple[{op.arg_index}]): "
-                        f"{tuple(map(repr, op.src_placements))}"
-                        f" -> {tuple(map(repr, op.dst_placements))}"
-                        f"  [{op.collective_type}]")
-            if not boundary.in_plan and not boundary.out_plan:
-                lines.append("  boundary communication: none")
-            # ── injection declarations and resolution ──
-            injection = []
-            if spec.local_compute_fn is not None:
-                injection.append(
-                    f"local_compute_fn={fmt_callable(spec.local_compute_fn)}")
-            if spec.inner_wrapper is not None:
-                injection.append(
-                    f"inner_wrapper={fmt_callable(spec.inner_wrapper)}"
-                    f"(target={spec.inner_target or 'auto'})")
-            if spec.inner_out_src is not None:
-                injection.append(f"inner_out_src={spec.inner_out_src}")
-            if spec.region_dispatch is not None:
-                meaning = ("black-box managed (propagation check skipped "
-                           "inside the region, declarative re-wrap)"
-                           if spec.region_dispatch is False
-                           else "dispatch-through (real validation under "
-                                "validate is enabled)")
-                injection.append(
-                    f"region_dispatch={spec.region_dispatch} -> {meaning}")
-            if injection:
-                lines.append("  injection: " + "; ".join(injection))
-            else:
-                lines.append(
-                    "  injection: none (ordinary boundary, dispatch-through "
-                    "under validate)")
-            # ── special-parameter handling ──
-            handlers = {k: v for k, v in self.special_handlers.items()
-                        if k.startswith(name + ".")}
-            for key, handler in handlers.items():
-                lines.append(
-                    f"  special handling: {key[len(name) + 1:]} -> {handler}")
+            self._append_parameter_explanation(lines, spec)
+            self._append_communication_explanation(lines, spec)
+            self._append_injection_explanation(lines, spec)
+            self._append_handler_explanation(lines, name)
         return "\n".join(lines)
 
 

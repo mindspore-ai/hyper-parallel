@@ -107,6 +107,67 @@ def _normalize_out_placements(out_placements, num_outputs: int):
     return (tuple(out_placements),)
 
 
+def _unwrap_region_inputs(
+    args: Sequence[Any],
+    kwargs: Dict[str, Any],
+    name_to_idx: Dict[str, int],
+    in_placements: Dict[str, Optional[Placements]],
+    device_mesh: DeviceMesh,
+    redistribute_inputs: bool,
+) -> tuple[list[Any], bool]:
+    """Convert declared DTensor inputs to local tensors."""
+    local_args = list(args)
+    saw_dtensor = False
+    for name, placements in in_placements.items():
+        if name in kwargs:
+            from_kwargs, index = True, None
+            value = kwargs[name]
+        else:
+            from_kwargs = False
+            index = name_to_idx.get(name)
+            if index is None or index >= len(local_args):
+                continue
+            value = local_args[index]
+        if not isinstance(value, DTensor):
+            continue
+        saw_dtensor = True
+        dtensor = value
+        if (
+            redistribute_inputs
+            and placements is not None
+            and tuple(dtensor.placements) != tuple(placements)
+        ):
+            dtensor = dtensor.redistribute(device_mesh, placements)
+        local_value = dtensor.to_local()
+        if from_kwargs:
+            kwargs[name] = local_value
+        else:
+            local_args[index] = local_value
+    return local_args, saw_dtensor
+
+
+def _wrap_region_outputs(
+    output: Any,
+    out_placements: Sequence[Optional[Placements]],
+    device_mesh: DeviceMesh,
+) -> Any:
+    """Wrap tensor outputs into DTensors using declared placements."""
+    single = not isinstance(output, tuple)
+    output_items = (output,) if single else output
+    placements_items = _normalize_out_placements(out_placements, len(output_items))
+    wrapped_output = []
+    for item, placements in zip(output_items, placements_items):
+        if isinstance(item, DTensor):
+            wrapped_output.append(item)
+        elif isinstance(item, torch.Tensor):
+            if placements is None:
+                raise TypeError("Tensor output requires non-None out_placements entry!")
+            wrapped_output.append(DTensor.from_local(item, device_mesh, tuple(placements)))
+        else:
+            wrapped_output.append(item)
+    return wrapped_output[0] if single else tuple(wrapped_output)
+
+
 def local_region(
     func: Optional[Callable] = None,
     *,
@@ -166,64 +227,16 @@ def local_region(
             if name_to_idx is None:
                 name_to_idx = _bind_arg_names(fn)
 
-            args = list(args)
-            saw_dtensor = False
-
-            if in_placements:
-                for name, placements in in_placements.items():
-                    if name in kwargs:
-                        from_kwargs, idx = True, None
-                        value = kwargs[name]
-                    else:
-                        from_kwargs = False
-                        idx = name_to_idx.get(name)
-                        if idx is None or idx >= len(args):
-                            continue
-                        value = args[idx]
-
-                    if not isinstance(value, DTensor):
-                        # non-DTensor input (already unwrapped by production /
-                        # non-tensor argument) -> passthrough
-                        continue
-                    saw_dtensor = True
-
-                    dt = value
-                    if (redistribute_inputs and placements is not None
-                            and tuple(dt.placements) != tuple(placements)):
-                        dt = dt.redistribute(device_mesh, placements)
-
-                    local_value = dt.to_local()
-                    if from_kwargs:
-                        kwargs[name] = local_value
-                    else:
-                        args[idx] = local_value
+            args, saw_dtensor = _unwrap_region_inputs(
+                args, kwargs, name_to_idx, in_placements or {}, device_mesh, redistribute_inputs
+            )
 
             out = fn(*args, **kwargs)
 
             if not saw_dtensor or out_placements is None:
                 return out
 
-            single = not isinstance(out, tuple)
-            out_items = (out,) if single else out
-            placements_items = _normalize_out_placements(out_placements, len(out_items))
-
-            wrapped_out = []
-            for item, placements in zip(out_items, placements_items):
-                if isinstance(item, DTensor):
-                    # already wrapped inside the region -> do not re-wrap
-                    wrapped_out.append(item)
-                elif isinstance(item, torch.Tensor):
-                    if placements is None:
-                        raise TypeError(
-                            "Tensor output requires non-None out_placements entry!"
-                        )
-                    wrapped_out.append(
-                        DTensor.from_local(item, device_mesh, tuple(placements))
-                    )
-                else:
-                    wrapped_out.append(item)
-
-            return wrapped_out[0] if single else tuple(wrapped_out)
+            return _wrap_region_outputs(out, out_placements, device_mesh)
 
         return wrapped
 

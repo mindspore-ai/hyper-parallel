@@ -41,6 +41,17 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-second, first), dim=-1)
 
 
+def _projections_can_fuse(projections: tuple[nn.Linear, ...]) -> bool:
+    """Return whether projections share the layout needed for fusion."""
+    biases = tuple(projection.bias for projection in projections)
+    return (
+        len({projection.in_features for projection in projections}) == 1
+        and len({projection.weight.requires_grad for projection in projections}) == 1
+        and (all(bias is None for bias in biases) or all(bias is not None for bias in biases))
+        and (biases[0] is None or len({bias.requires_grad for bias in biases}) == 1)
+    )
+
+
 @module_replacement
 class GQAAttention(nn.Module):
     """Transformers-compatible GQA using a grouped ``linear_qkv`` layout.
@@ -52,60 +63,36 @@ class GQAAttention(nn.Module):
     declares the checkpoint conversion.
     """
 
-    def __init__(
-        self,
-        *,
-        module: nn.Module,
-        module_fqn: str = "",
-        context: Mapping[str, Any] | None = None,
-        attention_interface: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] = (
-            npu_fusion_attention_forward
-        ),
-    ) -> None:
-        """Build the high-performance module from a Transformers attention module."""
-        super().__init__()
-        del module_fqn, context
-        self.attention_interface = attention_interface
-        config = module.config
-        self.config = config
-        self.layer_idx = getattr(module, "layer_idx", getattr(module, "layer_number", None))
-
+    def _initialize_dimensions(self, module: nn.Module) -> None:
+        """Initialize head dimensions and grouped-QKV layout metadata."""
+        config = self.config
         self.num_heads = getattr(module, "num_attention_heads", config.num_attention_heads)
-        self.num_key_value_heads = getattr(
-            module,
-            "num_key_value_heads",
-            config.num_key_value_heads,
-        )
+        self.num_key_value_heads = getattr(module, "num_key_value_heads", config.num_key_value_heads)
         if self.num_heads % self.num_key_value_heads:
-            raise ValueError(
-                "num_attention_heads must be divisible by num_key_value_heads"
-            )
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.qk_head_dim = getattr(
-            module,
-            "head_dim",
-            getattr(config, "head_dim", config.hidden_size // self.num_heads),
+            module, "head_dim", getattr(config, "head_dim", config.hidden_size // self.num_heads)
         )
-        self.v_head_dim = getattr(module, "v_head_dim", None) or getattr(
-            config,
-            "v_head_dim",
-            None,
-        ) or self.qk_head_dim
+        self.v_head_dim = (
+            getattr(module, "v_head_dim", None) or getattr(config, "v_head_dim", None) or self.qk_head_dim
+        )
         self.qkv_split_sizes = (
             self.num_key_value_groups * self.qk_head_dim,
             self.qk_head_dim,
             self.v_head_dim,
         )
         self.qkv_group_width = sum(self.qkv_split_sizes)
+
+    def _initialize_attention_options(self, module: nn.Module) -> None:
+        """Copy supported attention options and reject unsupported variants."""
+        config = self.config
         self.scaling = getattr(module, "scaling", self.qk_head_dim**-0.5)
         self.attention_dropout = getattr(module, "attention_dropout", 0.0)
         if isinstance(self.attention_dropout, nn.Dropout):
             self.attention_dropout = self.attention_dropout.p
         self.is_causal = getattr(module, "is_causal", True)
-        self.sliding_window = getattr(
-            module, "sliding_window", getattr(config, "sliding_window", None)
-        )
-
+        self.sliding_window = getattr(module, "sliding_window", getattr(config, "sliding_window", None))
         self.rotary_interleaved = getattr(
             module,
             "rotary_interleaved",
@@ -124,69 +111,40 @@ class GQAAttention(nn.Module):
                 "elementwise attention gates require a dedicated replacement."
             )
 
+    def _source_qkv(self, module: nn.Module) -> tuple[nn.Linear, tuple[str, ...]]:
+        """Validate and return the source QKV projection layout."""
         self._source_is_fused = hasattr(module, "qkv_proj")
         if self._source_is_fused:
             source_qkv = module.qkv_proj
             if not isinstance(source_qkv, nn.Linear):
                 raise TypeError("qkv_proj must be torch.nn.Linear")
-            source_projection_names = ("qkv_proj",)
-            expected_projection_size = (
+            expected_size = (
                 self.num_heads * self.qk_head_dim
                 + self.num_key_value_heads * self.qk_head_dim
                 + self.num_key_value_heads * self.v_head_dim
             )
-            if source_qkv.out_features != expected_projection_size:
-                raise ValueError(
-                    "qkv_proj output size is incompatible with the configured GQA dimensions"
-                )
-        else:
-            required = ("q_proj", "k_proj", "v_proj")
-            if any(not hasattr(module, name) for name in required):
-                raise TypeError(
-                    "GQAAttention requires qkv_proj or q_proj/k_proj/v_proj on the source module"
-                )
-            source_qkv = module.q_proj
-            source_projection_names = required
-            source_projections = tuple(getattr(module, name) for name in required)
-            if any(
-                not isinstance(projection, nn.Linear)
-                for projection in source_projections
-            ):
-                raise TypeError("q_proj, k_proj, and v_proj must be torch.nn.Linear")
-            expected_projection_sizes = (
-                self.num_heads * self.qk_head_dim,
-                self.num_key_value_heads * self.qk_head_dim,
-                self.num_key_value_heads * self.v_head_dim,
-            )
-            actual_projection_sizes = tuple(
-                projection.out_features for projection in source_projections
-            )
-            if actual_projection_sizes != expected_projection_sizes:
-                raise ValueError(
-                    "Q/K/V projection sizes are incompatible with the configured GQA dimensions"
-                )
-            biases = tuple(projection.bias for projection in source_projections)
-            can_fuse = (
-                len({projection.in_features for projection in source_projections}) == 1
-                and len(
-                    {projection.weight.requires_grad for projection in source_projections}
-                )
-                == 1
-                and (
-                    all(bias is None for bias in biases)
-                    or all(bias is not None for bias in biases)
-                )
-                and (
-                    biases[0] is None
-                    or len({bias.requires_grad for bias in biases}) == 1
-                )
-            )
-            if not can_fuse:
-                raise ValueError(
-                    "Q, K, and V projections cannot be represented by one fused projection"
-                )
-        self._source_projection_names = source_projection_names
+            if source_qkv.out_features != expected_size:
+                raise ValueError("qkv_proj output size is incompatible with the configured GQA dimensions")
+            return source_qkv, ("qkv_proj",)
+        required = ("q_proj", "k_proj", "v_proj")
+        if any(not hasattr(module, name) for name in required):
+            raise TypeError("GQAAttention requires qkv_proj or q_proj/k_proj/v_proj on the source module")
+        projections = tuple(getattr(module, name) for name in required)
+        if any(not isinstance(projection, nn.Linear) for projection in projections):
+            raise TypeError("q_proj, k_proj, and v_proj must be torch.nn.Linear")
+        expected_sizes = (
+            self.num_heads * self.qk_head_dim,
+            self.num_key_value_heads * self.qk_head_dim,
+            self.num_key_value_heads * self.v_head_dim,
+        )
+        if tuple(projection.out_features for projection in projections) != expected_sizes:
+            raise ValueError("Q/K/V projection sizes are incompatible with the configured GQA dimensions")
+        if not _projections_can_fuse(projections):
+            raise ValueError("Q, K, and V projections cannot be represented by one fused projection")
+        return module.q_proj, required
 
+    def _initialize_projections(self, module: nn.Module, source_qkv: nn.Linear) -> None:
+        """Create the fused QKV projection and attach the source output projection."""
         projection_size = self.num_key_value_heads * self.qkv_group_width
         self.linear_qkv = nn.Linear(
             source_qkv.in_features,
@@ -198,17 +156,36 @@ class GQAAttention(nn.Module):
         self.linear_qkv.weight.requires_grad_(source_qkv.weight.requires_grad)
         if self.linear_qkv.bias is not None:
             self.linear_qkv.bias.requires_grad_(source_qkv.bias.requires_grad)
-
         if not hasattr(module, "o_proj") or not isinstance(module.o_proj, nn.Linear):
             raise TypeError("GQAAttention requires o_proj on the source module")
         if module.o_proj.in_features != self.num_heads * self.v_head_dim:
-            raise ValueError(
-                "o_proj input size is incompatible with the configured GQA dimensions"
-            )
+            raise ValueError("o_proj input size is incompatible with the configured GQA dimensions")
         self.o_proj = module.o_proj
         self.q_norm = getattr(module, "q_norm", None)
         self.k_norm = getattr(module, "k_norm", None)
 
+    def __init__(
+        self,
+        *,
+        module: nn.Module,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+        attention_interface: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] = (
+            npu_fusion_attention_forward
+        ),
+    ) -> None:
+        """Build the high-performance module from a Transformers attention module."""
+        super().__init__()
+        del module_fqn, context
+        self.attention_interface = attention_interface
+        config = module.config
+        self.config = config
+        self.layer_idx = getattr(module, "layer_idx", getattr(module, "layer_number", None))
+        self._initialize_dimensions(module)
+        self._initialize_attention_options(module)
+        source_qkv, source_projection_names = self._source_qkv(module)
+        self._source_projection_names = source_projection_names
+        self._initialize_projections(module, source_qkv)
         self.train(module.training)
 
     def make_transforms(self) -> list[WeightConverter]:
@@ -343,6 +320,79 @@ class GatedGQAAttention(nn.Module):
     query head. This is the gated-query layout used by Qwen3.5 full attention.
     """
 
+    def _initialize_dimensions(self, module: nn.Module) -> None:
+        """Initialize gated grouped-QKV dimensions and attention options."""
+        config = self.config
+        self.num_heads = getattr(module, "num_attention_heads", config.num_attention_heads)
+        self.num_key_value_heads = getattr(module, "num_key_value_heads", config.num_key_value_heads)
+        if self.num_heads % self.num_key_value_heads:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.qk_head_dim = getattr(
+            module, "head_dim", getattr(config, "head_dim", config.hidden_size // self.num_heads)
+        )
+        self.v_head_dim = (
+            getattr(module, "v_head_dim", None) or getattr(config, "v_head_dim", None) or self.qk_head_dim
+        )
+        self.qkv_split_sizes = (
+            self.num_key_value_groups * self.qk_head_dim,
+            self.qk_head_dim,
+            self.v_head_dim,
+        )
+        self.qkv_group_width = sum(self.qkv_split_sizes)
+        self.gated_qkv_group_width = self.qkv_group_width + self.num_key_value_groups * self.qk_head_dim
+        self.scaling = getattr(module, "scaling", self.qk_head_dim**-0.5)
+        self.attention_dropout = getattr(module, "attention_dropout", 0.0)
+        if isinstance(self.attention_dropout, nn.Dropout):
+            self.attention_dropout = self.attention_dropout.p
+        self.is_causal = getattr(module, "is_causal", True)
+        self.sliding_window = getattr(module, "sliding_window", getattr(config, "sliding_window", None))
+        self.rotary_interleaved = getattr(
+            module,
+            "rotary_interleaved",
+            getattr(config, "rope_interleave", getattr(config, "rope_interleaved", False)),
+        )
+
+    def _validate_source_projections(self, module: nn.Module) -> None:
+        """Validate separate gated-query, key, value, and output projections."""
+        projections = (module.q_proj, module.k_proj, module.v_proj)
+        if any(not isinstance(projection, nn.Linear) for projection in projections):
+            raise TypeError("q_proj, k_proj, and v_proj must be torch.nn.Linear")
+        expected_sizes = (
+            2 * self.num_heads * self.qk_head_dim,
+            self.num_key_value_heads * self.qk_head_dim,
+            self.num_key_value_heads * self.v_head_dim,
+        )
+        if tuple(projection.out_features for projection in projections) != expected_sizes:
+            raise ValueError(
+                "Q/gate, K, and V projection sizes are incompatible with the configured gated GQA dimensions"
+            )
+        if not _projections_can_fuse(projections):
+            raise ValueError("Q/gate, K, and V projections cannot be represented by one fused projection")
+        attention_output_size = self.num_heads * self.v_head_dim
+        if self.num_heads * self.qk_head_dim != attention_output_size:
+            raise ValueError("GatedGQAAttention requires the gate width to match the attention output width")
+        if not isinstance(module.o_proj, nn.Linear):
+            raise TypeError("o_proj must be torch.nn.Linear")
+        if module.o_proj.in_features != attention_output_size:
+            raise ValueError("o_proj input size is incompatible with the configured gated GQA dimensions")
+
+    def _initialize_projection(self, module: nn.Module) -> None:
+        """Create the fused gated-QKV projection and attach source output layers."""
+        self.linear_qkv = nn.Linear(
+            module.q_proj.in_features,
+            self.num_key_value_heads * self.gated_qkv_group_width,
+            bias=module.q_proj.bias is not None,
+            device=module.q_proj.weight.device,
+            dtype=module.q_proj.weight.dtype,
+        )
+        self.linear_qkv.weight.requires_grad_(module.q_proj.weight.requires_grad)
+        if self.linear_qkv.bias is not None:
+            self.linear_qkv.bias.requires_grad_(module.q_proj.bias.requires_grad)
+        self.q_norm = module.q_norm
+        self.k_norm = module.k_norm
+        self.o_proj = module.o_proj
+
     def __init__(
         self,
         *,
@@ -370,124 +420,9 @@ class GatedGQAAttention(nn.Module):
         self.attention_interface = attention_interface
         self.config = module.config
         self.layer_idx = getattr(module, "layer_idx", None)
-        self.num_heads = getattr(
-            module, "num_attention_heads", self.config.num_attention_heads
-        )
-        self.num_key_value_heads = getattr(
-            module, "num_key_value_heads", self.config.num_key_value_heads
-        )
-        if self.num_heads % self.num_key_value_heads:
-            raise ValueError(
-                "num_attention_heads must be divisible by num_key_value_heads"
-            )
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.qk_head_dim = getattr(
-            module,
-            "head_dim",
-            getattr(
-                self.config,
-                "head_dim",
-                self.config.hidden_size // self.num_heads,
-            ),
-        )
-        self.v_head_dim = getattr(module, "v_head_dim", None) or getattr(
-            self.config, "v_head_dim", None
-        ) or self.qk_head_dim
-        self.qkv_split_sizes = (
-            self.num_key_value_groups * self.qk_head_dim,
-            self.qk_head_dim,
-            self.v_head_dim,
-        )
-        self.qkv_group_width = sum(self.qkv_split_sizes)
-        self.gated_qkv_group_width = (
-            self.qkv_group_width + self.num_key_value_groups * self.qk_head_dim
-        )
-        self.scaling = getattr(module, "scaling", self.qk_head_dim**-0.5)
-        self.attention_dropout = getattr(module, "attention_dropout", 0.0)
-        if isinstance(self.attention_dropout, nn.Dropout):
-            self.attention_dropout = self.attention_dropout.p
-        self.is_causal = getattr(module, "is_causal", True)
-        self.sliding_window = getattr(
-            module,
-            "sliding_window",
-            getattr(self.config, "sliding_window", None),
-        )
-        self.rotary_interleaved = getattr(
-            module,
-            "rotary_interleaved",
-            getattr(
-                self.config,
-                "rope_interleave",
-                getattr(self.config, "rope_interleaved", False),
-            ),
-        )
-
-        source_projections = (module.q_proj, module.k_proj, module.v_proj)
-        if any(
-            not isinstance(projection, nn.Linear)
-            for projection in source_projections
-        ):
-            raise TypeError("q_proj, k_proj, and v_proj must be torch.nn.Linear")
-        expected_query_gate_size = 2 * self.num_heads * self.qk_head_dim
-        expected_projection_sizes = (
-            expected_query_gate_size,
-            self.num_key_value_heads * self.qk_head_dim,
-            self.num_key_value_heads * self.v_head_dim,
-        )
-        actual_projection_sizes = tuple(
-            projection.out_features for projection in source_projections
-        )
-        if actual_projection_sizes != expected_projection_sizes:
-            raise ValueError(
-                "Q/gate, K, and V projection sizes are incompatible with the "
-                "configured gated GQA dimensions"
-            )
-        biases = tuple(projection.bias for projection in source_projections)
-        can_fuse = (
-            len({projection.in_features for projection in source_projections}) == 1
-            and len(
-                {projection.weight.requires_grad for projection in source_projections}
-            )
-            == 1
-            and (
-                all(bias is None for bias in biases)
-                or all(bias is not None for bias in biases)
-            )
-            and (
-                biases[0] is None
-                or len({bias.requires_grad for bias in biases}) == 1
-            )
-        )
-        if not can_fuse:
-            raise ValueError(
-                "Q/gate, K, and V projections cannot be represented by one fused projection"
-            )
-        gate_size = self.num_heads * self.qk_head_dim
-        attention_output_size = self.num_heads * self.v_head_dim
-        if gate_size != attention_output_size:
-            raise ValueError(
-                "GatedGQAAttention requires the gate width to match the attention output width"
-            )
-        if not isinstance(module.o_proj, nn.Linear):
-            raise TypeError("o_proj must be torch.nn.Linear")
-        if module.o_proj.in_features != attention_output_size:
-            raise ValueError(
-                "o_proj input size is incompatible with the configured gated GQA dimensions"
-            )
-
-        self.linear_qkv = nn.Linear(
-            module.q_proj.in_features,
-            self.num_key_value_heads * self.gated_qkv_group_width,
-            bias=module.q_proj.bias is not None,
-            device=module.q_proj.weight.device,
-            dtype=module.q_proj.weight.dtype,
-        )
-        self.linear_qkv.weight.requires_grad_(module.q_proj.weight.requires_grad)
-        if self.linear_qkv.bias is not None:
-            self.linear_qkv.bias.requires_grad_(module.q_proj.bias.requires_grad)
-        self.q_norm = module.q_norm
-        self.k_norm = module.k_norm
-        self.o_proj = module.o_proj
+        self._initialize_dimensions(module)
+        self._validate_source_projections(module)
+        self._initialize_projection(module)
         self.train(module.training)
 
     def make_transforms(self) -> list[WeightConverter]:

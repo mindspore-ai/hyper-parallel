@@ -130,6 +130,46 @@ def _packed_sequence_lengths(
     return query_lengths, key_lengths
 
 
+def _attention_options(module: torch.nn.Module, kwargs: dict[str, Any]):
+    """Resolve sparse-window and causal options from kwargs and the module."""
+    pre_tokens = kwargs.get("pre_tokens", getattr(module, "pre_tockens", 1048576))
+    next_tokens = kwargs.get("next_tokens", getattr(module, "next_tockens", 0))
+    sparse_mode = kwargs.get("sparse_mode", getattr(module, "sparse_mode", 0))
+    sliding_window = kwargs.get("sliding_window")
+    is_causal = kwargs.get("is_causal", getattr(module, "is_causal", True))
+    if sliding_window is not None:
+        pre_tokens = sliding_window
+    return pre_tokens, next_tokens, sparse_mode, sliding_window, is_causal
+
+
+def _prepare_attention_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    *,
+    is_packed: bool,
+    is_causal: bool,
+    sliding_window: Optional[int],
+    sparse_mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, Optional[torch.Tensor], int]:
+    """Prepare QKV layout, mask, and sparse mode for the NPU operator."""
+    if is_packed:
+        query = query.transpose(1, 2).reshape(-1, query.shape[1], query.shape[-1])
+        key = key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1])
+        value = value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1])
+        if attention_mask is None and is_causal:
+            npu_mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
+            sparse_mode = 3
+        else:
+            npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
+        return query, key, value, "TND", npu_mask, sparse_mode
+    if attention_mask is None and is_causal:
+        return query, key, value, "BNSD", _causal_attention_mask(query, key, sliding_window), 0
+    npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
+    return query, key, value, "BNSD", npu_mask, sparse_mode
+
+
 def npu_fusion_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -182,37 +222,17 @@ def npu_fusion_attention_forward(
         key.shape[0] * key_length,
     )
     is_packed = query_lengths is not None
-    pre_tokens = kwargs.get("pre_tokens", getattr(module, "pre_tockens", 1048576))
-    next_tokens = kwargs.get("next_tokens", getattr(module, "next_tockens", 0))
-    sparse_mode = kwargs.get("sparse_mode", getattr(module, "sparse_mode", 0))
-    sliding_window = kwargs.get("sliding_window")
-    is_causal = kwargs.get("is_causal", getattr(module, "is_causal", True))
-    if sliding_window is not None:
-        pre_tokens = sliding_window
-    if is_packed:
-        input_layout = "TND"
-        query = query.transpose(1, 2).reshape(-1, query.shape[1], query.shape[-1])
-        key = key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1])
-        value = value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1])
-        if attention_mask is None and is_causal:
-            # Ascend compressed causal masks use a fixed 2048 x 2048 shape.
-            npu_attention_mask = torch.ones(
-                (2048, 2048), dtype=torch.bool, device=query.device
-            ).triu(diagonal=1)
-            sparse_mode = 3
-        else:
-            npu_attention_mask = (
-                None if attention_mask is None else _npu_attention_mask(attention_mask)
-            )
-    elif attention_mask is None and is_causal:
-        input_layout = "BNSD"
-        npu_attention_mask = _causal_attention_mask(query, key, sliding_window)
-        sparse_mode = 0
-    else:
-        input_layout = "BNSD"
-        npu_attention_mask = (
-            None if attention_mask is None else _npu_attention_mask(attention_mask)
-        )
+    pre_tokens, next_tokens, sparse_mode, sliding_window, is_causal = _attention_options(module, kwargs)
+    query, key, value, input_layout, npu_attention_mask, sparse_mode = _prepare_attention_inputs(
+        query,
+        key,
+        value,
+        attention_mask,
+        is_packed=is_packed,
+        is_causal=is_causal,
+        sliding_window=sliding_window,
+        sparse_mode=sparse_mode,
+    )
     output = torch_npu.npu_fusion_attention(
         query,
         key,

@@ -30,6 +30,72 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
     """Run one expert projection through three A5 HiFloat8 GMM layouts."""
 
     @staticmethod
+    def _validate_forward_inputs(
+        inputs: torch.Tensor,
+        weight: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ) -> None:
+        """Validate grouped-linear shapes, dtypes, devices, and group metadata."""
+        if inputs.ndim != 2:
+            raise ValueError(
+                "HiFloat8 grouped linear inputs must be two-dimensional, "
+                f"got shape {tuple(inputs.shape)}."
+            )
+        if weight.ndim != 3:
+            raise ValueError(
+                "HiFloat8 grouped linear weight must be three-dimensional, "
+                f"got shape {tuple(weight.shape)}."
+            )
+        if inputs.shape[-1] != weight.shape[-1]:
+            raise ValueError(
+                "HiFloat8 grouped linear contracting dimensions differ: "
+                f"inputs={inputs.shape[-1]}, weight={weight.shape[-1]}."
+            )
+        if inputs.dtype not in (torch.float16, torch.bfloat16) or weight.dtype not in (
+            torch.float16, torch.bfloat16
+        ):
+            raise TypeError("HiFloat8 grouped linear inputs and weight must use float16 or bfloat16.")
+        if not isinstance(group_list, torch.Tensor) or group_list.ndim != 1:
+            raise ValueError("HiFloat8 grouped linear group_list must be one-dimensional.")
+        if group_list.dtype != torch.int64:
+            raise TypeError("HiFloat8 grouped linear group_list must use torch.int64.")
+        if group_list.shape[0] != weight.shape[0]:
+            raise ValueError(
+                "HiFloat8 grouped linear requires one group per expert: "
+                f"groups={group_list.shape[0]}, experts={weight.shape[0]}."
+            )
+        if group_list_type not in (0, 1):
+            raise ValueError(
+                f"HiFloat8 grouped linear group_list_type must be 0 or 1, got {group_list_type}."
+            )
+        if inputs.device != weight.device or group_list.device != inputs.device:
+            raise ValueError("HiFloat8 grouped linear inputs, weight, and group_list must be on the same device.")
+        if inputs.shape[0] == 0 and torch.any(group_list != 0).item():
+            raise ValueError("An empty HiFloat8 grouped input requires an all-zero group_list.")
+
+    @staticmethod
+    def _save_forward_context(
+        ctx: torch.autograd.function.FunctionCtx,
+        inputs: torch.Tensor,
+        weight: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+        grad_output_quantizer: HiFloat8Quantizer,
+    ) -> None:
+        """Save tensor metadata and quantizer state required by backward."""
+        ctx.input_shape = inputs.shape
+        ctx.input_dtype = inputs.dtype
+        ctx.input_device = inputs.device
+        ctx.weight_shape = weight.shape
+        ctx.weight_dtype = weight.dtype
+        ctx.weight_device = weight.device
+        ctx.save_for_backward(group_list)
+        ctx.group_list_type = group_list_type
+        ctx.grad_output_quantizer = grad_output_quantizer
+        ctx.empty_input = inputs.shape[0] == 0
+
+    @staticmethod
     def forward(
         ctx: torch.autograd.function.FunctionCtx,
         inputs: torch.Tensor,
@@ -46,67 +112,12 @@ class _HiFloat8GroupedLinearFunction(torch.autograd.Function):
         receives its transposed ``[experts, in_features, out_features]`` view.
         """
 
-        if inputs.ndim != 2:
-            raise ValueError(
-                "HiFloat8 grouped linear inputs must be two-dimensional, "
-                f"got shape {tuple(inputs.shape)}."
-            )
-        if weight.ndim != 3:
-            raise ValueError(
-                "HiFloat8 grouped linear weight must be three-dimensional, "
-                f"got shape {tuple(weight.shape)}."
-            )
-        if inputs.shape[-1] != weight.shape[-1]:
-            raise ValueError(
-                "HiFloat8 grouped linear contracting dimensions differ: "
-                f"inputs={inputs.shape[-1]}, weight={weight.shape[-1]}."
-            )
-        if inputs.dtype not in (torch.float16, torch.bfloat16) or (
-            weight.dtype not in (torch.float16, torch.bfloat16)
-        ):
-            raise TypeError(
-                "HiFloat8 grouped linear inputs and weight must use "
-                "float16 or bfloat16."
-            )
-        if not isinstance(group_list, torch.Tensor) or group_list.ndim != 1:
-            raise ValueError(
-                "HiFloat8 grouped linear group_list must be one-dimensional."
-            )
-        if group_list.dtype != torch.int64:
-            raise TypeError(
-                "HiFloat8 grouped linear group_list must use torch.int64."
-            )
-        if group_list.shape[0] != weight.shape[0]:
-            raise ValueError(
-                "HiFloat8 grouped linear requires one group per expert: "
-                f"groups={group_list.shape[0]}, experts={weight.shape[0]}."
-            )
-        if group_list_type not in (0, 1):
-            raise ValueError(
-                "HiFloat8 grouped linear group_list_type must be 0 or 1, "
-                f"got {group_list_type}."
-            )
-        if inputs.device != weight.device or group_list.device != inputs.device:
-            raise ValueError(
-                "HiFloat8 grouped linear inputs, weight, and group_list must "
-                "be on the same device."
-            )
-        if inputs.shape[0] == 0 and torch.any(group_list != 0).item():
-            raise ValueError(
-                "An empty HiFloat8 grouped input requires an all-zero "
-                "group_list."
-            )
-
-        ctx.input_shape = inputs.shape
-        ctx.input_dtype = inputs.dtype
-        ctx.input_device = inputs.device
-        ctx.weight_shape = weight.shape
-        ctx.weight_dtype = weight.dtype
-        ctx.weight_device = weight.device
-        ctx.save_for_backward(group_list)
-        ctx.group_list_type = group_list_type
-        ctx.grad_output_quantizer = grad_output_quantizer
-        ctx.empty_input = inputs.shape[0] == 0
+        _HiFloat8GroupedLinearFunction._validate_forward_inputs(
+            inputs, weight, group_list, group_list_type
+        )
+        _HiFloat8GroupedLinearFunction._save_forward_context(
+            ctx, inputs, weight, group_list, group_list_type, grad_output_quantizer
+        )
         if ctx.empty_input:
             return inputs.new_empty((0, weight.shape[-2]))
 

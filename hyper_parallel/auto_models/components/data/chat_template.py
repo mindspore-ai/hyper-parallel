@@ -33,6 +33,46 @@ ROLE_SUPPORTED = ["system", "user", "assistant", "tool"]
 CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
 
 
+def _format_janus_message(
+    message: Dict[str, str], index: int, message_count: int, task_type: str, assistant_count: int
+) -> tuple[str, int]:
+    """Format one Janus message and update the generation assistant count."""
+    role = message["role"]
+    content = message["content"]
+    separators = ["\n\n", "<｜end▁of▁sentence｜>"]
+    if content == "":
+        return role + ":", assistant_count
+    if "assistant" in role and (
+        "wikihow_generation" in task_type or "interleave_generation" in task_type
+    ):
+        prefix = "Assistant: " if assistant_count == 0 else ""
+        suffix = separators[1] if index + 1 == message_count else separators[0]
+        return prefix + content.strip() + suffix, assistant_count + 1
+    if "assistant" in role:
+        return "Assistant: " + content.strip() + separators[1], assistant_count
+    if "user" in role:
+        return "User: " + content.strip() + separators[0], assistant_count
+    if "system" in role and "wikihow_generation" in task_type:
+        instruction = "Please generate a step-by-step tutorial with images for the following question."
+        return content.strip() + separators[0] + instruction + separators[0], assistant_count
+    if "system" in role:
+        return content.strip() + separators[0], assistant_count
+    raise ValueError(f"Unknown role {role}, should be one of {{system, user, assistant}}.")
+
+
+def _janus_labels(content_ids: List[int], image_token_id: int, loss_mask: int, task_type: str) -> List[int]:
+    """Build labels for one encoded Janus message."""
+    if loss_mask != 1:
+        return [IGNORE_INDEX] * len(content_ids)
+    if (
+        image_token_id in content_ids
+        and "wikihow_generation" not in task_type
+        and "interleave_generation" not in task_type
+    ):
+        return [image_token_id if token == image_token_id else IGNORE_INDEX for token in content_ids]
+    return content_ids
+
+
 def build_chat_template(template_name: str, tokenizer: "PreTrainedTokenizer") -> "ChatTemplate":
     """Build the registered chat template for the given tokenizer.
 
@@ -324,38 +364,11 @@ class JanusTemplate(ChatTemplate):
         """
         input_ids, attention_mask, labels = [], [], []
         images_seq_mask, images_emb_mask = [], []
-        seps = ["\n\n", "<｜end▁of▁sentence｜>"]
-        assitant_cnt = 0
+        assistant_count = 0
         for idx, message in enumerate(messages):
-            if message["content"] == "":
-                content_str = message["role"] + ":"
-            elif (
-                "assistant" in message["role"]
-                and "wikihow_generation" in task_type
-                or "assistant" in message["role"]
-                and "interleave_generation" in task_type
-            ):
-                prefix = "Assistant: " if assitant_cnt == 0 else ""
-                suffix = seps[1] if idx + 1 == len(messages) else seps[0]
-                content_str = prefix + message["content"].strip() + suffix
-                assitant_cnt += 1
-            elif "assistant" in message["role"]:
-                content_str = "Assistant" + ": " + message["content"].strip() + seps[1]
-            elif "user" in message["role"]:
-                content_str = "User" + ": " + message["content"].strip() + seps[0]
-            elif "system" in message["role"] and "wikihow_generation" in task_type:
-                content_str = (
-                    message["content"].strip()
-                    + seps[0]
-                    + "Please generate a step-by-step tutorial with images for the following question."
-                    + seps[0]
-                )
-            elif "system" in message["role"]:
-                content_str = message["content"].strip() + seps[0]
-            else:
-                raise ValueError(
-                    f"Unknown role {message['role']}, should be one of {{system, user, assistant}}."
-                )
+            content_str, assistant_count = _format_janus_message(
+                message, idx, len(messages), task_type, assistant_count
+            )
             if "system" in message["role"]:
                 content_ids = self.tokenizer.encode(content_str)
             else:
@@ -369,20 +382,9 @@ class JanusTemplate(ChatTemplate):
             num_image_tokens = torch.sum(content_ids_tensor == image_token_id).item()
             n_image = num_image_tokens // 576
             if n_image > 0:
-                for _j, n_image_tokens in enumerate([num_image_tokens]):
-                    images_emb_mask.append([True] * n_image_tokens)
+                images_emb_mask.append([True] * num_image_tokens)
 
-            if message["loss_mask"] == 1:
-                if (
-                    image_token_id in content_ids
-                    and "wikihow_generation" not in task_type
-                    and "interleave_generation" not in task_type
-                ):
-                    labels += [image_token_id if x == image_token_id else IGNORE_INDEX for x in content_ids]
-                else:
-                    labels += content_ids
-            else:
-                labels += [IGNORE_INDEX] * len(content_ids)
+            labels += _janus_labels(content_ids, image_token_id, message["loss_mask"], task_type)
 
         model_inputs = {
             "input_ids": input_ids,

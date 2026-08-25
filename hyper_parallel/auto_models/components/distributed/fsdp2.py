@@ -527,6 +527,86 @@ class FSDP2Manager:
             key=lambda wrap_module: module_order.get(id(wrap_module.module), len(module_order)),
         )
 
+    def _parallelize_child_units(
+        self,
+        wrap_modules: list[_WrapModuleInfo],
+        owner_by_parameter,
+        metadata_by_parameter,
+        replicate_params,
+        dense_fsdp_kwargs: dict[str, Any],
+    ) -> int:
+        """Apply FSDP to child units and return the gradient-scaled count."""
+        gradient_scaled_units = 0
+        wrapping_order = sorted(
+            wrap_modules, key=lambda wrap_module: wrap_module.fqn.count("."), reverse=True
+        )
+        for wrap_module in wrapping_order:
+            managed_source_info = self._build_managed_source_shard_info(
+                wrap_module.module, owner_by_parameter, metadata_by_parameter
+            )
+            fsdp_sublayer_kwargs = dense_fsdp_kwargs
+            if self._uses_expert_mesh(managed_source_info):
+                if self.mesh_context.fsdp_moe_mesh is None:
+                    raise ValueError("Expert TP metadata requires MeshContext.fsdp_moe_mesh")
+                fsdp_sublayer_kwargs, _ = self._build_fully_shard_kwargs(
+                    self._build_fsdp_actual_mesh(expert=True)
+                )
+            fully_shard(  # pylint: disable=unexpected-keyword-arg
+                wrap_module.module,
+                source_shard_infos=self._source_infos_for_fully_shard(managed_source_info),
+                replicate_params=self._build_managed_replicate_params(
+                    wrap_module.module, owner_by_parameter, replicate_params
+                ),
+                **fsdp_sublayer_kwargs,
+            )
+            if self._configure_source_layout_gradient_scaling(wrap_module.module, managed_source_info):
+                gradient_scaled_units += 1
+        return gradient_scaled_units
+
+    def _parallelize_root(
+        self,
+        model: ModuleClass,
+        owner_by_parameter,
+        metadata_by_parameter,
+        replicate_params,
+        dense_root_kwargs: dict[str, Any],
+    ) -> int:
+        """Apply root FSDP and report whether gradient scaling was configured."""
+        root_source_info = self._build_managed_source_shard_info(
+            model, owner_by_parameter, metadata_by_parameter
+        )
+        if self._uses_expert_mesh(root_source_info):
+            raise ValueError("Routed expert parameters must belong to a nested experts FSDP unit")
+        fully_shard(  # pylint: disable=unexpected-keyword-arg
+            model,
+            source_shard_infos=self._source_infos_for_fully_shard(root_source_info),
+            replicate_params=self._build_managed_replicate_params(
+                model, owner_by_parameter, replicate_params
+            ),
+            **dense_root_kwargs,
+        )
+        return int(self._configure_source_layout_gradient_scaling(model, root_source_info))
+
+    def _log_gradient_scaling(self, gradient_scaled_units: int) -> None:
+        """Log the source-layout gradient scaling applied to FSDP units."""
+        if not gradient_scaled_units:
+            return
+        domain_size = (
+            self.mesh_context.dp_size
+            * self.mesh_context.cp_size
+            * (1 if self.mesh_context.loss_parallel else self.mesh_context.tp_size)
+        )
+        logger.info(
+            "Applied source-layout SUM gradient scaling: dp_size=%d, cp_size=%d, tp_size=%d, "
+            "source_gradient_domain_size=%d, factor=%s, units=%d",
+            self.mesh_context.dp_size,
+            self.mesh_context.cp_size,
+            self.mesh_context.tp_size,
+            domain_size,
+            1.0 / domain_size,
+            gradient_scaled_units,
+        )
+
     def parallelize(
         self,
         model: ModuleClass,
@@ -559,83 +639,21 @@ class FSDP2Manager:
             self._build_fsdp_actual_mesh()
         )
 
-        wrapping_order = sorted(
+        gradient_scaled_units = self._parallelize_child_units(
             wrap_modules,
-            key=lambda wrap_module: wrap_module.fqn.count("."),
-            reverse=True,
+            owner_by_parameter,
+            metadata_by_parameter,
+            replicate_params,
+            dense_fsdp_kwargs,
         )
-        gradient_scaled_units = 0
-        for wrap_module in wrapping_order:
-            managed_source_shard_info = self._build_managed_source_shard_info(
-                wrap_module.module,
-                owner_by_parameter,
-                metadata_by_parameter,
-            )
-            fsdp_sublayer_kwargs = dense_fsdp_kwargs
-            if self._uses_expert_mesh(managed_source_shard_info):
-                if self.mesh_context.fsdp_moe_mesh is None:
-                    raise ValueError("Expert TP metadata requires MeshContext.fsdp_moe_mesh")
-                fsdp_sublayer_kwargs, _ = self._build_fully_shard_kwargs(
-                    self._build_fsdp_actual_mesh(expert=True)
-                )
-            fully_shard(  # pylint: disable=unexpected-keyword-arg
-                wrap_module.module,
-                source_shard_infos=self._source_infos_for_fully_shard(
-                    managed_source_shard_info
-                ),
-                replicate_params=self._build_managed_replicate_params(
-                    wrap_module.module,
-                    owner_by_parameter,
-                    replicate_params,
-                ),
-                **fsdp_sublayer_kwargs,
-            )
-            if self._configure_source_layout_gradient_scaling(
-                wrap_module.module,
-                managed_source_shard_info,
-            ):
-                gradient_scaled_units += 1
-
-        root_source_shard_info = self._build_managed_source_shard_info(
+        gradient_scaled_units += self._parallelize_root(
             model,
             owner_by_parameter,
             metadata_by_parameter,
+            replicate_params,
+            dense_root_kwargs,
         )
-        if self._uses_expert_mesh(root_source_shard_info):
-            raise ValueError(
-                "Routed expert parameters must belong to a nested experts FSDP unit"
-            )
-        fully_shard(  # pylint: disable=unexpected-keyword-arg
-            model,
-            source_shard_infos=self._source_infos_for_fully_shard(
-                root_source_shard_info
-            ),
-            replicate_params=self._build_managed_replicate_params(
-                model,
-                owner_by_parameter,
-                replicate_params,
-            ),
-            **dense_root_kwargs,
-        )
-        if self._configure_source_layout_gradient_scaling(model, root_source_shard_info):
-            gradient_scaled_units += 1
-        if gradient_scaled_units:
-            source_gradient_domain_size = (
-                self.mesh_context.dp_size
-                * self.mesh_context.cp_size
-                * (1 if self.mesh_context.loss_parallel else self.mesh_context.tp_size)
-            )
-            logger.info(
-                "Applied source-layout SUM gradient scaling: dp_size=%d, "
-                "cp_size=%d, tp_size=%d, source_gradient_domain_size=%d, "
-                "factor=%s, units=%d",
-                self.mesh_context.dp_size,
-                self.mesh_context.cp_size,
-                self.mesh_context.tp_size,
-                source_gradient_domain_size,
-                1.0 / source_gradient_domain_size,
-                gradient_scaled_units,
-            )
+        self._log_gradient_scaling(gradient_scaled_units)
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
         self._configure_prefetch(
             [wrap_module.module for wrap_module in ordered_wrap_modules]

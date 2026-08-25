@@ -72,6 +72,77 @@ def apply_mome(
     return hidden_states + mixed_states
 
 
+def _apply_attention_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+    *,
+    interleaved: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the configured RoPE convention to an attention query/key pair."""
+    if position_embeddings is None:
+        return query, key
+    cos, sin = position_embeddings
+    rotary_op = apply_rotary_pos_emb_interleave if interleaved else apply_rotary_pos_emb
+    return rotary_op(query, key, cos, sin, unsqueeze_dim=2)
+
+
+def _apply_index_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+    *,
+    rope_head_dim: int,
+    index_head_dim: int,
+    interleaved: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to the rotary portion of an indexer query/key pair."""
+    if position_embeddings is None:
+        return query, key
+    cos, sin = position_embeddings
+    split_sizes = (rope_head_dim, index_head_dim - rope_head_dim)
+    query_rot, query_pass = torch.split(query, split_sizes, dim=-1)
+    key_rot, key_pass = torch.split(key, split_sizes, dim=-1)
+    rotary_op = apply_rotary_pos_emb_interleave if interleaved else apply_rotary_pos_emb
+    query_rot, key_rot = rotary_op(query_rot, key_rot, cos, sin, unsqueeze_dim=2)
+    return torch.cat((query_rot, query_pass), dim=-1), torch.cat((key_rot, key_pass), dim=-1)
+
+
+def _absorb_query_projection(
+    query: torch.Tensor,
+    key_up_weight: torch.Tensor,
+    *,
+    num_heads: int,
+    batch_size: int,
+    seq_length: int,
+    input_dim: int,
+    output_dim: int,
+) -> torch.Tensor:
+    """Absorb the key up-projection weight into query states."""
+    query = query.permute(2, 0, 1, 3).reshape(num_heads, batch_size * seq_length, input_dim)
+    query = torch.bmm(query, key_up_weight).view(num_heads, batch_size, seq_length, output_dim)
+    return query.permute(1, 2, 0, 3)
+
+
+def _restore_attention_projection(
+    output: torch.Tensor,
+    value_up_weight: torch.Tensor,
+    *,
+    num_heads: int,
+    batch_size: int,
+    seq_length: int,
+    kv_lora_rank: int,
+    value_head_dim: int,
+) -> torch.Tensor:
+    """Apply the absorbed value up-projection and restore the hidden layout."""
+    output = output[..., :kv_lora_rank]
+    output = output.permute(2, 0, 1, 3).reshape(num_heads, batch_size * seq_length, kv_lora_rank)
+    output = torch.bmm(output, value_up_weight)
+    return output.view(num_heads, batch_size, seq_length, value_head_dim).permute(1, 2, 0, 3).reshape(
+        batch_size, seq_length, -1
+    )
+
+
 @module_replacement
 class DeepseekV32DSAAttention(nn.Module):
     """NPU DSA replacement for Transformers ``DeepseekV32Attention``.
@@ -82,64 +153,49 @@ class DeepseekV32DSAAttention(nn.Module):
     custom attention masks, dropout, and KV cache are not supported.
     """
 
-    def __init__(
-        self,
-        *,
-        module: nn.Module,
-        module_fqn: str = "",
-        context: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Build the high-performance module from a Transformers DSA module."""
-        super().__init__()
-        del module_fqn, context
+    @staticmethod
+    def _validate_source(module: nn.Module) -> None:
+        """Validate the required DSA module and indexer surface."""
         required = (
-            "q_a_proj",
-            "q_a_layernorm",
-            "q_b_proj",
-            "kv_a_proj_with_mqa",
-            "kv_a_layernorm",
-            "kv_b_proj",
-            "o_proj",
-            "indexer",
+            "q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_proj_with_mqa",
+            "kv_a_layernorm", "kv_b_proj", "o_proj", "indexer",
         )
         missing = [name for name in required if not hasattr(module, name)]
         if missing:
             raise TypeError(f"DeepseekV32DSAAttention source module is missing: {missing}")
         indexer_required = ("wq_b", "wk", "k_norm", "weights_proj")
-        indexer_missing = [
-            name for name in indexer_required if not hasattr(module.indexer, name)
-        ]
+        indexer_missing = [name for name in indexer_required if not hasattr(module.indexer, name)]
         if indexer_missing:
-            raise TypeError(
-                f"DeepseekV32DSAAttention source indexer is missing: {indexer_missing}"
-            )
+            raise TypeError(f"DeepseekV32DSAAttention source indexer is missing: {indexer_missing}")
 
-        config = module.config
-        self.config = config
-        if hasattr(config, "indexer_types"):
-            raise TypeError(
-                "DeepseekV32DSAAttention supports the DeepSeek-V3.2 DSA contract; "
-                "GLM-MOE-DSA shared indexers and three-value forward result require "
-                "a dedicated replacement"
-            )
+    def _initialize_dimensions(self, module: nn.Module) -> None:
+        """Copy main-attention and indexer dimensions from the source module."""
+        config = self.config
         self.layer_idx = getattr(module, "layer_idx", getattr(module, "layer_number", None))
         self.num_heads = getattr(module, "num_heads", config.num_attention_heads)
         self.q_lora_rank = getattr(module, "q_lora_rank", config.q_lora_rank)
         self.kv_lora_rank = getattr(module, "kv_lora_rank", config.kv_lora_rank)
-        self.qk_rope_head_dim = getattr(
-            module, "qk_rope_head_dim", config.qk_rope_head_dim
-        )
-        self.qk_nope_head_dim = getattr(
-            module, "qk_nope_head_dim", config.qk_nope_head_dim
-        )
+        self.qk_rope_head_dim = getattr(module, "qk_rope_head_dim", config.qk_rope_head_dim)
+        self.qk_nope_head_dim = getattr(module, "qk_nope_head_dim", config.qk_nope_head_dim)
         self.v_head_dim = getattr(module, "v_head_dim", config.v_head_dim)
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         if self.q_lora_rank is None:
             raise ValueError("DeepseekV32DSAAttention requires the Q-LoRA projection path")
-        self.scaling = getattr(module, "scaling", self.qk_head_dim**-0.5)
-        attention_dropout = getattr(
-            module, "attention_dropout", getattr(config, "attention_dropout", 0.0)
+        self.index_head_dim = getattr(module.indexer, "head_dim", config.index_head_dim)
+        self.num_index_heads = getattr(
+            module.indexer,
+            "n_heads",
+            getattr(config, "index_n_heads", getattr(config, "index_num_attention_heads", None)),
         )
+        if self.num_index_heads is None:
+            raise ValueError("DeepseekV32DSAAttention requires the number of indexer heads")
+        self.index_topk = getattr(module.indexer, "index_topk", config.index_topk)
+
+    def _initialize_options(self, module: nn.Module) -> None:
+        """Copy supported DSA options and reject unsupported source modes."""
+        config = self.config
+        self.scaling = getattr(module, "scaling", self.qk_head_dim**-0.5)
+        attention_dropout = getattr(module, "attention_dropout", getattr(config, "attention_dropout", 0.0))
         if isinstance(attention_dropout, nn.Dropout):
             attention_dropout = attention_dropout.p
         if attention_dropout != 0.0:
@@ -152,42 +208,19 @@ class DeepseekV32DSAAttention(nn.Module):
             source_rotary_interleaved = getattr(config, "rope_interleave", None)
         if source_rotary_interleaved is None:
             source_rotary_interleaved = getattr(config, "rope_interleaved", None)
-        # Transformers DSA uses interleaved RoPE for the main MLA path when
-        # the source does not expose a mode, while its indexer remains half-split.
-        self.rotary_interleaved = bool(
-            True if source_rotary_interleaved is None else source_rotary_interleaved
-        )
+        self.rotary_interleaved = bool(True if source_rotary_interleaved is None else source_rotary_interleaved)
         self.index_rotary_interleaved = bool(
-            getattr(
-                module.indexer,
-                "rotary_interleaved",
-                getattr(config, "index_rope_interleaved", False),
-            )
+            getattr(module.indexer, "rotary_interleaved", getattr(config, "index_rope_interleaved", False))
         )
-        self.index_head_dim = getattr(module.indexer, "head_dim", config.index_head_dim)
-        self.num_index_heads = getattr(
-            module.indexer,
-            "n_heads",
-            getattr(
-                config,
-                "index_n_heads",
-                getattr(config, "index_num_attention_heads", None),
-            ),
-        )
-        if self.num_index_heads is None:
-            raise ValueError("DeepseekV32DSAAttention requires the number of indexer heads")
-        self.index_topk = getattr(module.indexer, "index_topk", config.index_topk)
         self.dsa_loss_coeff = getattr(config, "dsa_loss_coeff", 0.0)
-        self.freeze_dsa = bool(
-            getattr(config, "freeze_DSA", getattr(config, "freeze_dsa", False))
-        )
+        self.freeze_dsa = bool(getattr(config, "freeze_DSA", getattr(config, "freeze_dsa", False)))
         if getattr(module, "param_sink_number", 0) > 0:
-            raise ValueError(
-                "DeepseekV32DSAAttention does not support the parameter-sink path"
-            )
+            raise ValueError("DeepseekV32DSAAttention does not support the parameter-sink path")
         if getattr(module, "use_mome", False):
             raise ValueError("DeepseekV32DSAAttention does not support the MOME path")
 
+    def _initialize_source_layers(self, module: nn.Module) -> None:
+        """Fuse latent projections and attach the remaining source layers."""
         q_a = module.q_a_proj
         kv_a = module.kv_a_proj_with_mqa
         self._q_latent_output_size = q_a.out_features
@@ -199,10 +232,7 @@ class DeepseekV32DSAAttention(nn.Module):
             and (q_a.bias is None or q_a.bias.requires_grad == kv_a.bias.requires_grad)
         )
         if not can_fuse:
-            raise ValueError(
-                "Q and KV latent projections cannot be represented by one fused projection"
-            )
-
+            raise ValueError("Q and KV latent projections cannot be represented by one fused projection")
         self.linear_qkv = nn.Linear(
             q_a.in_features,
             q_a.out_features + kv_a.out_features,
@@ -213,13 +243,31 @@ class DeepseekV32DSAAttention(nn.Module):
         self.linear_qkv.weight.requires_grad_(q_a.weight.requires_grad)
         if q_a.bias is not None:
             self.linear_qkv.bias.requires_grad_(q_a.bias.requires_grad)
+        for name in ("q_a_layernorm", "kv_a_layernorm", "q_b_proj", "kv_b_proj", "o_proj", "indexer"):
+            setattr(self, name, getattr(module, name))
 
-        self.q_a_layernorm = module.q_a_layernorm
-        self.kv_a_layernorm = module.kv_a_layernorm
-        self.q_b_proj = module.q_b_proj
-        self.kv_b_proj = module.kv_b_proj
-        self.o_proj = module.o_proj
-        self.indexer = module.indexer
+    def __init__(
+        self,
+        *,
+        module: nn.Module,
+        module_fqn: str = "",
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Build the high-performance module from a Transformers DSA module."""
+        super().__init__()
+        del module_fqn, context
+        self._validate_source(module)
+        config = module.config
+        self.config = config
+        if hasattr(config, "indexer_types"):
+            raise TypeError(
+                "DeepseekV32DSAAttention supports the DeepSeek-V3.2 DSA contract; "
+                "GLM-MOE-DSA shared indexers and three-value forward result require "
+                "a dedicated replacement"
+            )
+        self._initialize_dimensions(module)
+        self._initialize_options(module)
+        self._initialize_source_layers(module)
         self.train(module.training)
 
     def make_transforms(self) -> list[WeightConverter]:
@@ -281,6 +329,112 @@ class DeepseekV32DSAAttention(nn.Module):
             device=device,
         )
 
+    @staticmethod
+    def _validate_forward_inputs(
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Any | None,
+        position_ids: torch.Tensor | None,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Validate inputs supported by the DeepSeek sparse-attention path."""
+        batch_size, seq_length = hidden_states.shape[:-1]
+        if past_key_values is not None:
+            raise NotImplementedError("DeepseekV32DSAAttention does not support KV cache")
+        if position_ids is not None and (
+            position_ids.ndim != 2
+            or position_ids.shape[0] not in (1, batch_size)
+            or position_ids.shape[1] != seq_length
+        ):
+            raise ValueError("position_ids must have shape [1 or batch_size, sequence_length]")
+        if attention_mask is not None:
+            expected_shape = (batch_size, 1, seq_length, seq_length)
+            if tuple(attention_mask.shape) != expected_shape:
+                raise ValueError(
+                    "DeepseekV32DSAAttention supports only a Transformers 4D causal mask; "
+                    "padding and custom masks are not supported"
+                )
+        if kwargs.pop("output_attentions", False):
+            raise NotImplementedError("DeepseekV32DSAAttention does not expose attention weights")
+
+    def _project_attention_states(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project hidden states into absorbed-query and latent KV states."""
+        batch_size, seq_length = hidden_states.shape[:-1]
+        latent_states = self.linear_qkv(hidden_states)
+        q_latent, kv_nope, k_rot = torch.split(
+            latent_states, (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim), dim=-1
+        )
+        q_resid = self.q_a_layernorm(q_latent)
+        q_states = self.q_b_proj(q_resid).view(batch_size, seq_length, self.num_heads, self.qk_head_dim)
+        q_pass, q_rot = torch.split(q_states, (self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
+        kv_weight = self.kv_b_proj.weight.view(
+            self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+        )
+        absorbed_query = _absorb_query_projection(
+            q_pass,
+            kv_weight[:, : self.qk_nope_head_dim],
+            num_heads=self.num_heads,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            input_dim=self.qk_nope_head_dim,
+            output_dim=self.kv_lora_rank,
+        )
+        kv_nope = self.kv_a_layernorm(kv_nope).view(batch_size, seq_length, 1, self.kv_lora_rank)
+        k_rot = k_rot.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
+        return q_resid, absorbed_query, kv_nope, q_rot, k_rot, kv_weight
+
+    def _project_index_states(
+        self,
+        hidden_states: torch.Tensor,
+        q_resid: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build indexer query, key, and merge-weight states."""
+        batch_size, seq_length = hidden_states.shape[:-1]
+        index_query = self.indexer.wq_b(q_resid.detach()).view(
+            batch_size, seq_length, self.num_index_heads, self.index_head_dim
+        )
+        index_key = self.indexer.k_norm(self.indexer.wk(hidden_states.detach())).unsqueeze(2)
+        merge_weight = self.indexer.weights_proj(hidden_states.detach())
+        merge_weight = merge_weight * self.num_index_heads**-0.5 * self.index_head_dim**-0.5
+        index_query, index_key = _apply_index_rope(
+            index_query,
+            index_key,
+            position_embeddings,
+            rope_head_dim=self.qk_rope_head_dim,
+            index_head_dim=self.index_head_dim,
+            interleaved=self.index_rotary_interleaved,
+        )
+        return index_query, index_key, merge_weight
+
+    def _apply_auxiliary_loss(
+        self,
+        attn_output: torch.Tensor,
+        index_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        attention_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        topk_indices: torch.Tensor,
+        softmax_stats: tuple[torch.Tensor, torch.Tensor],
+        actual_seq_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attach the DSA KL auxiliary loss when training enables it."""
+        if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
+            return attn_output
+        index_query_tnd, index_key_tnd, merge_weight_tnd = index_states
+        query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
+            tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
+            for tensor in attention_states
+        )
+        softmax_max, softmax_sum = softmax_stats
+        aux_loss = dsa_kl_loss(
+            index_query_tnd, index_key_tnd, merge_weight_tnd, query_tnd, key_tnd,
+            topk_indices, softmax_max, softmax_sum, q_rot_tnd, k_rot_tnd,
+            actual_seq_len, actual_seq_len, self.scaling, self.dsa_loss_coeff,
+        )
+        return aux_loss_auto_scale(attn_output, aux_loss)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -293,127 +447,18 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> tuple[torch.Tensor, None]:
         """Run causal or packed DSA with the NPU sparse-attention kernels."""
         batch_size, seq_length = hidden_states.shape[:-1]
-        if past_key_values is not None:
-            raise NotImplementedError("DeepseekV32DSAAttention does not support KV cache")
-        if position_ids is not None and (
-            position_ids.ndim != 2
-            or position_ids.shape[0] not in (1, batch_size)
-            or position_ids.shape[1] != seq_length
-        ):
-            raise ValueError(
-                "position_ids must have shape [1 or batch_size, sequence_length]"
-            )
-        if attention_mask is not None:
-            expected_shape = (
-                hidden_states.shape[0],
-                1,
-                hidden_states.shape[1],
-                hidden_states.shape[1],
-            )
-            if tuple(attention_mask.shape) != expected_shape:
-                raise ValueError(
-                    "DeepseekV32DSAAttention supports only a Transformers 4D causal mask; "
-                    "padding and custom masks are not supported"
-                )
-        output_attentions = kwargs.pop("output_attentions", False)
-        if output_attentions:
-            raise NotImplementedError(
-                "DeepseekV32DSAAttention does not expose attention weights"
-            )
-        latent_states = self.linear_qkv(hidden_states)
-        q_latent, kv_nope, k_rot = torch.split(
-            latent_states,
-            (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim),
-            dim=-1,
+        self._validate_forward_inputs(hidden_states, attention_mask, past_key_values, position_ids, kwargs)
+        q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
+            hidden_states
         )
-        q_resid = self.q_a_layernorm(q_latent)
-        q_states = self.q_b_proj(q_resid).view(
-            batch_size, seq_length, self.num_heads, self.qk_head_dim
+        q_rot, k_rot = _apply_attention_rope(
+            q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
         )
-        q_pass, q_rot = torch.split(
-            q_states, (self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1
+        index_query, index_key, merge_weight = self._project_index_states(
+            hidden_states, q_resid, position_embeddings
         )
-
-        kv_weight = self.kv_b_proj.weight.view(
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        key_up_weight = kv_weight[:, : self.qk_nope_head_dim]
-        absorbed_query_states = q_pass.permute(2, 0, 1, 3).reshape(
-            self.num_heads, batch_size * seq_length, self.qk_nope_head_dim
-        )
-        absorbed_query_states = torch.bmm(
-            absorbed_query_states, key_up_weight
-        ).view(
-            self.num_heads, batch_size, seq_length, self.kv_lora_rank
-        ).permute(1, 2, 0, 3)
-
-        kv_nope = self.kv_a_layernorm(kv_nope).view(
-            batch_size, seq_length, 1, self.kv_lora_rank
-        )
-        k_rot = k_rot.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            if self.rotary_interleaved:
-                q_rot, k_rot = apply_rotary_pos_emb_interleave(
-                    q_rot, k_rot, cos, sin, unsqueeze_dim=2
-                )
-            else:
-                q_rot, k_rot = apply_rotary_pos_emb(
-                    q_rot, k_rot, cos, sin, unsqueeze_dim=2
-                )
-
-        index_query = self.indexer.wq_b(q_resid.detach()).view(
-            batch_size,
-            seq_length,
-            self.num_index_heads,
-            self.index_head_dim,
-        )
-        index_key = self.indexer.k_norm(
-            self.indexer.wk(hidden_states.detach())
-        ).unsqueeze(2)
-        merge_weight = self.indexer.weights_proj(hidden_states.detach())
-        merge_weight = (
-            merge_weight
-            * self.num_index_heads**-0.5
-            * self.index_head_dim**-0.5
-        )
-        if position_embeddings is not None:
-            index_query_rot, index_query_pass = torch.split(
-                index_query,
-                (self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim),
-                dim=-1,
-            )
-            index_key_rot, index_key_pass = torch.split(
-                index_key,
-                (self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim),
-                dim=-1,
-            )
-            if self.index_rotary_interleaved:
-                index_query_rot, index_key_rot = apply_rotary_pos_emb_interleave(
-                    index_query_rot,
-                    index_key_rot,
-                    cos,
-                    sin,
-                    unsqueeze_dim=2,
-                )
-            else:
-                index_query_rot, index_key_rot = apply_rotary_pos_emb(
-                    index_query_rot,
-                    index_key_rot,
-                    cos,
-                    sin,
-                    unsqueeze_dim=2,
-                )
-            index_query = torch.cat((index_query_rot, index_query_pass), dim=-1)
-            index_key = torch.cat((index_key_rot, index_key_pass), dim=-1)
-
         actual_seq_len = self._get_actual_seq_len(
-            actual_seq_len,
-            batch_size,
-            seq_length,
-            hidden_states.device,
+            actual_seq_len, batch_size, seq_length, hidden_states.device
         )
         topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
             index_query,
@@ -423,49 +468,34 @@ class DeepseekV32DSAAttention(nn.Module):
             actual_seq_len,
             self.index_topk,
         )
-        sparse_scale = self.scaling
         attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
             absorbed_query_states,
             kv_nope,
             q_rot,
             k_rot,
             topk_indices,
-            sparse_scale,
+            self.scaling,
             actual_seq_len,
             actual_seq_len,
         )
-        if self.training and not self.freeze_dsa and self.dsa_loss_coeff:
-            query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
-                tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
-                for tensor in (absorbed_query_states, kv_nope, q_rot, k_rot)
-            )
-            aux_loss = dsa_kl_loss(
-                index_query_tnd,
-                index_key_tnd,
-                merge_weight_tnd,
-                query_tnd,
-                key_tnd,
-                topk_indices,
-                softmax_max,
-                softmax_sum,
-                q_rot_tnd,
-                k_rot_tnd,
-                actual_seq_len,
-                actual_seq_len,
-                sparse_scale,
-                self.dsa_loss_coeff,
-            )
-            attn_output = aux_loss_auto_scale(attn_output, aux_loss)
-
-        attn_output = attn_output[..., : self.kv_lora_rank]
+        attn_output = self._apply_auxiliary_loss(
+            attn_output,
+            (index_query_tnd, index_key_tnd, merge_weight_tnd),
+            (absorbed_query_states, kv_nope, q_rot, k_rot),
+            topk_indices,
+            (softmax_max, softmax_sum),
+            actual_seq_len,
+        )
         value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
-        attn_output = attn_output.permute(2, 0, 1, 3).reshape(
-            self.num_heads, batch_size * seq_length, self.kv_lora_rank
+        attn_output = _restore_attention_projection(
+            attn_output,
+            value_up_weight,
+            num_heads=self.num_heads,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            kv_lora_rank=self.kv_lora_rank,
+            value_head_dim=self.v_head_dim,
         )
-        attn_output = torch.bmm(attn_output, value_up_weight)
-        attn_output = attn_output.view(
-            self.num_heads, batch_size, seq_length, self.v_head_dim
-        ).permute(1, 2, 0, 3).reshape(batch_size, seq_length, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
@@ -604,6 +634,133 @@ class DSAAttention(nn.Module):
         sink_key = torch.cat((sink_latent, sink_rotary_key), dim=-1)
         return sink_key, sink_value
 
+    @staticmethod
+    def _validate_forward_inputs(
+        attention_mask: torch.Tensor | None,
+        kv_reuse_states: Any | None,
+        past_key_values: Any | None,
+        cache_position: torch.Tensor | None,
+        output_attentions: bool,
+    ) -> None:
+        """Validate inputs supported by the Pangu-compatible DSA path."""
+        if attention_mask is not None:
+            raise ValueError(
+                "DSAAttention does not consume attention_mask; pass packed sequence "
+                "boundaries through actual_seq_len"
+            )
+        if kv_reuse_states is not None:
+            raise NotImplementedError("DSAAttention does not support KV reuse")
+        if past_key_values is not None or cache_position is not None:
+            raise NotImplementedError("DSAAttention does not support KV cache")
+        if output_attentions:
+            raise NotImplementedError("DSAAttention does not expose attention weights")
+
+    def _project_attention_states(
+        self,
+        hidden_states: torch.Tensor,
+        mome_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project hidden states into absorbed-query and latent KV states."""
+        batch_size, seq_length = hidden_states.shape[:-1]
+        latent_states, _ = self.linear_qkv(hidden_states)
+        q_latent, kv_nope, k_rot = torch.split(
+            latent_states, (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim), dim=-1
+        )
+        if self.use_mome:
+            q_latent = apply_mome(q_latent, mome_mask, self.qa_conv, fused=False)
+            kv_nope = apply_mome(kv_nope, mome_mask, self.compresskv_conv, fused=False)
+        q_resid = self.q_layernorm(q_latent)
+        q_states, _ = self.linear_qb(q_resid.contiguous())
+        q_states = q_states.view(batch_size, seq_length, self.num_heads, self.qk_head_dim)
+        q_pass, q_rot = torch.split(q_states, (self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
+        kv_weight = self.linear_kvb.weight.view(
+            self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+        )
+        absorbed_query = _absorb_query_projection(
+            q_pass,
+            kv_weight[:, : self.qk_nope_head_dim],
+            num_heads=self.num_heads,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            input_dim=self.qk_nope_head_dim,
+            output_dim=self.kv_lora_rank,
+        )
+        kv_nope = self.k_layernorm(kv_nope).view(batch_size, seq_length, 1, self.kv_lora_rank)
+        k_rot = k_rot.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
+        return q_resid, absorbed_query, kv_nope, q_rot, k_rot, kv_weight
+
+    def _project_index_states(
+        self,
+        hidden_states: torch.Tensor,
+        q_resid: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build indexer states and apply their rotary embedding."""
+        batch_size, seq_length = hidden_states.shape[:-1]
+        index_query, _ = self.index_linear_qb(q_resid.detach())
+        index_query = index_query.view(batch_size, seq_length, self.num_index_heads, self.index_head_dim)
+        index_key, _ = self.index_linear_k(hidden_states.detach())
+        index_key = self.index_k_layernorm(index_key.unsqueeze(2))
+        merge_weight, _ = self.linear_merge_weight(hidden_states.detach())
+        merge_weight = merge_weight * self.num_index_heads**-0.5 * self.index_head_dim**-0.5
+        index_query, index_key = _apply_index_rope(
+            index_query,
+            index_key,
+            position_embeddings,
+            rope_head_dim=self.qk_rope_head_dim,
+            index_head_dim=self.index_head_dim,
+            interleaved=self.rotary_interleaved,
+        )
+        return index_query, index_key, merge_weight
+
+    def _run_sparse_attention(
+        self,
+        attention_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        topk_indices: torch.Tensor,
+        actual_seq_len: torch.Tensor,
+        batch_size: int,
+        seq_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run sparse attention with or without parameter-sink rescaling."""
+        absorbed_query, kv_nope, q_rot, k_rot = attention_states
+        sparse_scale = self.qk_head_dim**-0.5
+        if self.param_sink_number <= 0:
+            return dsa_sparse_attention(
+                absorbed_query, kv_nope, q_rot, k_rot, topk_indices,
+                sparse_scale, actual_seq_len, actual_seq_len,
+            )
+        sink_key, sink_value = self._prepare_param_sink(batch_size)
+        return dsa_sparse_attention_rescale(
+            absorbed_query, kv_nope, q_rot, k_rot, sink_key, sink_value,
+            topk_indices, batch_size, seq_length, self.num_heads, sparse_scale,
+            1 - self.attention_dropout.p, actual_seq_len, actual_seq_len,
+        )
+
+    def _apply_auxiliary_loss(
+        self,
+        attn_output: torch.Tensor,
+        index_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        attention_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        topk_indices: torch.Tensor,
+        softmax_stats: tuple[torch.Tensor, torch.Tensor],
+        actual_seq_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attach the DSA KL auxiliary loss when training enables it."""
+        if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
+            return attn_output
+        index_query_tnd, index_key_tnd, merge_weight_tnd = index_states
+        query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
+            tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
+            for tensor in attention_states
+        )
+        softmax_max, softmax_sum = softmax_stats
+        aux_loss = dsa_kl_loss(
+            index_query_tnd, index_key_tnd, merge_weight_tnd, query_tnd, key_tnd,
+            topk_indices, softmax_max, softmax_sum, q_rot_tnd, k_rot_tnd,
+            actual_seq_len, actual_seq_len, self.qk_head_dim**-0.5, self.dsa_loss_coeff,
+        )
+        return aux_loss_auto_scale(attn_output, aux_loss)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -618,114 +775,19 @@ class DSAAttention(nn.Module):
         mome_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run DSA with its configured MOME and parameter-sink paths."""
-        if attention_mask is not None:
-            raise ValueError(
-                "DSAAttention does not consume attention_mask; pass packed sequence "
-                "boundaries through actual_seq_len"
-            )
-        if kv_reuse_states is not None:
-            raise NotImplementedError("DSAAttention does not support KV reuse")
-        if past_key_values is not None or cache_position is not None:
-            raise NotImplementedError("DSAAttention does not support KV cache")
-        if output_attentions:
-            raise NotImplementedError("DSAAttention does not expose attention weights")
-
+        self._validate_forward_inputs(
+            attention_mask, kv_reuse_states, past_key_values, cache_position, output_attentions
+        )
         batch_size, seq_length = hidden_states.shape[:-1]
-        latent_states, _ = self.linear_qkv(hidden_states)
-        q_latent, kv_nope, k_rot = torch.split(
-            latent_states,
-            (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim),
-            dim=-1,
+        q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
+            hidden_states, mome_mask
         )
-        if self.use_mome:
-            q_latent = apply_mome(
-                q_latent, mome_mask, self.qa_conv, fused=False
-            )
-            kv_nope = apply_mome(
-                kv_nope, mome_mask, self.compresskv_conv, fused=False
-            )
-        q_resid = self.q_layernorm(q_latent)
-        q_states, _ = self.linear_qb(q_resid.contiguous())
-        q_states = q_states.view(
-            batch_size, seq_length, self.num_heads, self.qk_head_dim
+        q_rot, k_rot = _apply_attention_rope(
+            q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
         )
-        q_pass, q_rot = torch.split(
-            q_states, (self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1
+        index_query, index_key, merge_weight = self._project_index_states(
+            hidden_states, q_resid, position_embeddings
         )
-
-        kv_weight = self.linear_kvb.weight.view(
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        key_up_weight = kv_weight[:, : self.qk_nope_head_dim]
-        absorbed_query_states = q_pass.permute(2, 0, 1, 3).reshape(
-            self.num_heads, batch_size * seq_length, self.qk_nope_head_dim
-        )
-        absorbed_query_states = torch.bmm(
-            absorbed_query_states, key_up_weight
-        ).view(
-            self.num_heads, batch_size, seq_length, self.kv_lora_rank
-        ).permute(1, 2, 0, 3)
-
-        kv_nope = self.k_layernorm(kv_nope).view(
-            batch_size, seq_length, 1, self.kv_lora_rank
-        )
-        k_rot = k_rot.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
-
-        index_query, _ = self.index_linear_qb(q_resid.detach())
-        index_query = index_query.view(
-            batch_size, seq_length, self.num_index_heads, self.index_head_dim
-        )
-        index_key, _ = self.index_linear_k(hidden_states.detach())
-        index_key = self.index_k_layernorm(index_key.unsqueeze(2))
-        merge_weight, _ = self.linear_merge_weight(hidden_states.detach())
-        merge_weight = (
-            merge_weight
-            * self.num_index_heads**-0.5
-            * self.index_head_dim**-0.5
-        )
-
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            if self.rotary_interleaved:
-                q_rot, k_rot = apply_rotary_pos_emb_interleave(
-                    q_rot, k_rot, cos, sin, unsqueeze_dim=2
-                )
-            else:
-                q_rot, k_rot = apply_rotary_pos_emb(
-                    q_rot, k_rot, cos, sin, unsqueeze_dim=2
-                )
-
-            index_query_rot, index_query_pass = torch.split(
-                index_query,
-                (self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim),
-                dim=-1,
-            )
-            index_key_rot, index_key_pass = torch.split(
-                index_key,
-                (self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim),
-                dim=-1,
-            )
-            if self.rotary_interleaved:
-                index_query_rot, index_key_rot = apply_rotary_pos_emb_interleave(
-                    index_query_rot,
-                    index_key_rot,
-                    cos,
-                    sin,
-                    unsqueeze_dim=2,
-                )
-            else:
-                index_query_rot, index_key_rot = apply_rotary_pos_emb(
-                    index_query_rot,
-                    index_key_rot,
-                    cos,
-                    sin,
-                    unsqueeze_dim=2,
-                )
-            index_query = torch.cat((index_query_rot, index_query_pass), dim=-1)
-            index_key = torch.cat((index_key_rot, index_key_pass), dim=-1)
-
         actual_seq_len = self._get_actual_seq_len(
             actual_seq_len, batch_size, seq_length, hidden_states.device
         )
@@ -737,68 +799,28 @@ class DSAAttention(nn.Module):
             actual_seq_len,
             self.index_topk,
         )
-        sparse_scale = self.qk_head_dim**-0.5
-        if self.param_sink_number > 0:
-            sink_key, sink_value = self._prepare_param_sink(batch_size)
-            attn_output, softmax_max, softmax_sum = dsa_sparse_attention_rescale(
-                absorbed_query_states,
-                kv_nope,
-                q_rot,
-                k_rot,
-                sink_key,
-                sink_value,
-                topk_indices,
-                batch_size,
-                seq_length,
-                self.num_heads,
-                sparse_scale,
-                1 - self.attention_dropout.p,
-                actual_seq_len,
-                actual_seq_len,
-            )
-        else:
-            attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
-                absorbed_query_states,
-                kv_nope,
-                q_rot,
-                k_rot,
-                topk_indices,
-                sparse_scale,
-                actual_seq_len,
-                actual_seq_len,
-            )
-        if self.training and not self.freeze_dsa and self.dsa_loss_coeff:
-            query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
-                tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
-                for tensor in (absorbed_query_states, kv_nope, q_rot, k_rot)
-            )
-            aux_loss = dsa_kl_loss(
-                index_query_tnd,
-                index_key_tnd,
-                merge_weight_tnd,
-                query_tnd,
-                key_tnd,
-                topk_indices,
-                softmax_max,
-                softmax_sum,
-                q_rot_tnd,
-                k_rot_tnd,
-                actual_seq_len,
-                actual_seq_len,
-                sparse_scale,
-                self.dsa_loss_coeff,
-            )
-            attn_output = aux_loss_auto_scale(attn_output, aux_loss)
-
-        attn_output = attn_output[..., : self.kv_lora_rank]
-        value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
-        attn_output = attn_output.permute(2, 0, 1, 3).reshape(
-            self.num_heads, batch_size * seq_length, self.kv_lora_rank
+        attention_states = (absorbed_query_states, kv_nope, q_rot, k_rot)
+        attn_output, softmax_max, softmax_sum = self._run_sparse_attention(
+            attention_states, topk_indices, actual_seq_len, batch_size, seq_length
         )
-        attn_output = torch.bmm(attn_output, value_up_weight)
-        attn_output = attn_output.view(
-            self.num_heads, batch_size, seq_length, self.v_head_dim
-        ).permute(1, 2, 0, 3).reshape(batch_size, seq_length, -1)
+        attn_output = self._apply_auxiliary_loss(
+            attn_output,
+            (index_query_tnd, index_key_tnd, merge_weight_tnd),
+            attention_states,
+            topk_indices,
+            (softmax_max, softmax_sum),
+            actual_seq_len,
+        )
+        value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
+        attn_output = _restore_attention_projection(
+            attn_output,
+            value_up_weight,
+            num_heads=self.num_heads,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            kv_lora_rank=self.kv_lora_rank,
+            value_head_dim=self.v_head_dim,
+        )
         if self.use_mome:
             attn_output = apply_mome(
                 attn_output,

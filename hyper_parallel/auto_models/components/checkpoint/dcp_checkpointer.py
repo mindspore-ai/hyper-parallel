@@ -129,6 +129,45 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
         return super().build_local_plan()
 
 
+def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> List[torch.Tensor]:
+    """Return trainable parameters managed by an optimizer."""
+    return [
+        param
+        for group in optimizer.param_groups
+        for param in group["params"]
+        if param.requires_grad
+    ]
+
+
+def _prime_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    params: List[torch.Tensor],
+) -> None:
+    """Run a parameter-neutral optimizer step to materialize its state."""
+    for param in params:
+        param.grad = torch.zeros_like(param)
+    for group in optimizer.param_groups:
+        if "lr" in group:
+            group["lr"] = 0.0
+        if "weight_decay" in group:
+            group["weight_decay"] = 0.0
+    with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+        optimizer.step()
+
+
+def _restore_optimizer_hyperparams(
+    optimizer: torch.optim.Optimizer,
+    saved_hyperparams: List[tuple[Optional[float], Optional[float]]],
+) -> None:
+    """Restore optimizer hyperparameters after state priming."""
+    for group, (lr, weight_decay) in zip(optimizer.param_groups, saved_hyperparams):
+        if lr is not None:
+            group["lr"] = lr
+        if weight_decay is not None:
+            group["weight_decay"] = weight_decay
+    optimizer.zero_grad(set_to_none=True)
+
+
 def initialize_optimizer_state(optimizer: torch.optim.Optimizer) -> bool:
     """Materialize optimizer state so a DCP load has entries to fill.
 
@@ -154,12 +193,7 @@ def initialize_optimizer_state(optimizer: torch.optim.Optimizer) -> bool:
     if all(opt.state for opt in sub_optimizers):
         return True
 
-    params = [
-        param
-        for group in optimizer.param_groups
-        for param in group["params"]
-        if param.requires_grad
-    ]
+    params = _optimizer_parameters(optimizer)
     if not params:
         return False
     if any(param.grad is not None for param in params):
@@ -173,22 +207,9 @@ def initialize_optimizer_state(optimizer: torch.optim.Optimizer) -> bool:
         (group.get("lr"), group.get("weight_decay")) for group in optimizer.param_groups
     ]
     try:
-        for param in params:
-            param.grad = torch.zeros_like(param)
-        for group in optimizer.param_groups:
-            if "lr" in group:
-                group["lr"] = 0.0
-            if "weight_decay" in group:
-                group["weight_decay"] = 0.0
-        with SkipDTensorDispatch(no_skip={torch.zeros_like}):
-            optimizer.step()
+        _prime_optimizer_state(optimizer, params)
     finally:
-        for group, (lr, weight_decay) in zip(optimizer.param_groups, saved_hyperparams):
-            if lr is not None:
-                group["lr"] = lr
-            if weight_decay is not None:
-                group["weight_decay"] = weight_decay
-        optimizer.zero_grad(set_to_none=True)
+        _restore_optimizer_hyperparams(optimizer, saved_hyperparams)
 
     return all(opt.state for opt in sub_optimizers)
 

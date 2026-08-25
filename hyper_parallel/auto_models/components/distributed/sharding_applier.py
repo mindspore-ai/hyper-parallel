@@ -140,23 +140,8 @@ def _check_target_config_keys(target, kind):
             f"typo). Valid parameters: {sorted(bindable) or '(none)'}")
 
 
-def _preflight_compute_injection(plan, mesh, model=None):
-    """Fail-fast BEFORE any mutation: CP/EP sharding without an explicit
-    compute injection is a silent numerical error (no auto-injection since
-    the explicit-injection rework).
-
-    - CP: an attention boundary (``_needs_cp_attn`` metadata from the
-      template) under an active cp mesh needs ``inner_wrapper``;
-    - EP: a TP-extend-EP boundary (``_ep_size > 0``, expert params already
-      destined for ``{EP: Shard(0)}``) needs ``local_compute_fn`` — or an
-      explicit ``region_dispatch=False`` when the module's own forward is
-      EP-aware (a2a inside forward).
-
-    ``model`` (optional) enables the arch-aware EP archetype suggestion in
-    the error message (accuracy_fix_plan.md §3 E2).
-    """
-    transformers_version = importlib.metadata.version("transformers")
-    cp_mesh = _get_cp_submesh(mesh, plan.mesh_dim_names)
+def _validate_inner_wrapper_injections(plan, cp_mesh, transformers_version):
+    """Validate the structural contract of every inner wrapper."""
     for fqn, spec in plan.modules.items():
         wrapper = getattr(spec, "inner_wrapper", None)
         target = getattr(spec, "inner_target", None)
@@ -213,6 +198,10 @@ def _preflight_compute_injection(plan, mesh, model=None):
                 "placements, or use inner_target='self' to reuse boundary "
                 "out_src."
             )
+
+
+def _validate_cp_compute_injections(plan, cp_mesh):
+    """Require an explicit CP wrapper for each active attention boundary."""
     if cp_mesh is not None and cp_mesh.size() > 1:
         for fqn, spec in plan.modules.items():
             if (spec.is_boundary and getattr(spec, "_needs_cp_attn", False)
@@ -236,6 +225,10 @@ def _preflight_compute_injection(plan, mesh, model=None):
                     "NeMo-style (q,k,v) signature, sdpa_hf for the "
                     "HF-style forward(hidden_states); or provide a custom "
                     "callable/Target implementation)")
+
+
+def _validate_ep_compute_injections(plan, model):
+    """Require an explicit compute source for each active EP boundary."""
     for fqn, spec in plan.modules.items():
         if (spec.is_boundary and getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
                 and getattr(spec, "local_compute_fn", None) is None
@@ -280,6 +273,15 @@ def _preflight_compute_injection(plan, mesh, model=None):
                 "for the same build-time interface validation)\n"
                 "  ③ In-house EP-aware MoE (all-to-all already inside "
                 "forward) → declare region_dispatch: false")
+
+
+def _preflight_compute_injection(plan, mesh, model=None):
+    """Fail fast before mutating a plan with incomplete CP/EP injection."""
+    transformers_version = importlib.metadata.version("transformers")
+    cp_mesh = _get_cp_submesh(mesh, plan.mesh_dim_names)
+    _validate_inner_wrapper_injections(plan, cp_mesh, transformers_version)
+    _validate_cp_compute_injections(plan, cp_mesh)
+    _validate_ep_compute_injections(plan, model)
 
 
 def _require_region_dispatch(spec, *, source):

@@ -98,6 +98,69 @@ def _all_module_aliases(model: nn.Module) -> dict[int, tuple[nn.Module, tuple[st
     }
 
 
+def _validate_module_type(
+    module: nn.Module,
+    fqns: tuple[str, ...],
+    spec: ModuleReplacementSpec,
+) -> None:
+    """Validate one matched module against a replacement specification."""
+    # exact_type deliberately requires an exact type match, so the type()
+    # comparison is intentional and must not become isinstance().
+    type_matches = (
+        type(module) is spec.module_type  # pylint: disable=unidiomatic-typecheck
+        if spec.exact_type
+        else isinstance(module, spec.module_type)
+    )
+    if not type_matches:
+        raise TypeError(
+            f"module replacement {spec.match} selected {fqns[0]!r} "
+            f"of type {type(module).__name__}, expected "
+            f"{'exact ' if spec.exact_type else ''}{spec.module_type.__name__}"
+        )
+
+
+def _select_replacement_spec(
+    spec: ModuleReplacementSpec,
+    aliases: dict[int, tuple[nn.Module, tuple[str, ...]]],
+    selected: dict[int, ModuleReplacementTarget],
+) -> None:
+    """Match one replacement specification and merge its targets."""
+    matched_ids_by_pattern = {pattern: set() for pattern in spec.match}
+    for module_id, (module, fqns) in aliases.items():
+        matched_patterns = tuple(
+            pattern for pattern in spec.match if any(fnmatch.fnmatchcase(fqn, pattern) for fqn in fqns)
+        )
+        if not matched_patterns:
+            continue
+        _validate_module_type(module, fqns, spec)
+        for pattern in matched_patterns:
+            matched_ids_by_pattern[pattern].add(module_id)
+        previous = selected.get(module_id)
+        if previous is not None and previous.spec is not spec:
+            raise ValueError(
+                f"module replacement conflict for aliases {fqns}: "
+                "one source module may match only one factory"
+            )
+        selected[module_id] = ModuleReplacementTarget(fqns, module, spec)
+    unmatched_patterns = [
+        pattern for pattern, matched_ids in matched_ids_by_pattern.items() if not matched_ids
+    ]
+    if unmatched_patterns:
+        raise ValueError(f"module replacement pattern(s) matched no module: {unmatched_patterns}")
+
+
+def _validate_non_nested_targets(targets: tuple[ModuleReplacementTarget, ...]) -> None:
+    """Reject plans that select both a module and one of its descendants."""
+    selected_sources = {id(target.source) for target in targets}
+    for target in targets:
+        for child in target.source.modules():
+            if child is not target.source and id(child) in selected_sources:
+                raise ValueError(
+                    "module replacement does not support selecting a module and its descendant: "
+                    f"{target.module_fqns}"
+                )
+
+
 def compile_module_replacements(
     model: nn.Module,
     specs: Iterable[ModuleReplacementSpec],
@@ -111,54 +174,10 @@ def compile_module_replacements(
     aliases = _all_module_aliases(model)
     selected: dict[int, ModuleReplacementTarget] = {}
     for spec in specs:
-        matched_ids_by_pattern = {pattern: set() for pattern in spec.match}
-        for module_id, (module, fqns) in aliases.items():
-            matched_patterns = tuple(
-                pattern for pattern in spec.match
-                if any(fnmatch.fnmatchcase(fqn, pattern) for fqn in fqns)
-            )
-            if not matched_patterns:
-                continue
-            # exact_type deliberately requires an exact type match, so the
-            # type() comparison is intentional and must not become isinstance().
-            type_matches = (
-                type(module) is spec.module_type  # pylint: disable=unidiomatic-typecheck
-                if spec.exact_type else isinstance(module, spec.module_type)
-            )
-            if not type_matches:
-                raise TypeError(
-                    f"module replacement {spec.match} selected {fqns[0]!r} "
-                    f"of type {type(module).__name__}, expected "
-                    f"{'exact ' if spec.exact_type else ''}{spec.module_type.__name__}"
-                )
-            for pattern in matched_patterns:
-                matched_ids_by_pattern[pattern].add(module_id)
-            previous = selected.get(module_id)
-            if previous is not None and previous.spec is not spec:
-                raise ValueError(
-                    f"module replacement conflict for aliases {fqns}: "
-                    "one source module may match only one factory"
-                )
-            selected[module_id] = ModuleReplacementTarget(fqns, module, spec)
-        unmatched_patterns = [
-            pattern for pattern, matched_ids in matched_ids_by_pattern.items()
-            if not matched_ids
-        ]
-        if unmatched_patterns:
-            raise ValueError(
-                "module replacement pattern(s) matched no module: "
-                f"{unmatched_patterns}"
-            )
+        _select_replacement_spec(spec, aliases, selected)
 
     targets = tuple(selected.values())
-    selected_sources = {id(target.source) for target in targets}
-    for target in targets:
-        for child in target.source.modules():
-            if child is not target.source and id(child) in selected_sources:
-                raise ValueError(
-                    "module replacement does not support selecting a module and its descendant: "
-                    f"{target.module_fqns}"
-                )
+    _validate_non_nested_targets(targets)
     return ModuleReplacementPlan(targets)
 
 

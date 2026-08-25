@@ -271,6 +271,77 @@ class ShardingPlanner:
 
     # ── Main entry point ────────────────────────────────────────────────
 
+    def _derive_boundary_specs(
+        self,
+        plan: ShardingPlan,
+        boundary_groups,
+        *,
+        sequence_parallel: bool,
+        loss_parallel: bool,
+        mesh_dim_names: Tuple[str, ...],
+        arch: str,
+        ep_extend: int,
+        mesh: DeviceMesh,
+        model: Any,
+        param_ndims: Dict[str, int],
+    ) -> None:
+        """Materialize template-derived boundary specs into a plan."""
+        if not self._derive:
+            logger.info(
+                "derive=False: template derivation skipped — the plan will contain only plan_overrides "
+                "specs (all insert mode, fully self-declared)"
+            )
+            return
+        for boundary_fqn, group in boundary_groups.items():
+            boundary_type = self._infer_boundary_type(boundary_fqn, group)
+            template = self._templates.get(boundary_type)
+            if template is None:
+                logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
+                continue
+            spec = self._build_spec_from_template(
+                boundary_fqn,
+                group,
+                template,
+                sequence_parallel,
+                loss_parallel,
+                mesh_dim_names,
+                param_ndims=param_ndims,
+            )
+            if spec is None:
+                continue
+            if boundary_type == "moe_mlp":
+                self._mark_hf_native_moe(
+                    spec, group, boundary_fqn, template, mesh_dim_names, arch,
+                    ep_extend=ep_extend, mesh=mesh, model=model, param_ndims=param_ndims,
+                )
+            plan.modules[boundary_fqn] = spec
+
+    def _finalize_boundary_specs(
+        self,
+        plan: ShardingPlan,
+        model: Any,
+        *,
+        tp_size: int,
+        mesh_dim_names: Tuple[str, ...],
+    ) -> None:
+        """Normalize overrides and finish placement-dependent boundary metadata."""
+        self._merge_plan_overrides(plan, model)
+        self._normalize_contract_fields(plan)
+        self._finalize_tp_local_attr_plans(plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names)
+        self._finalize_deferred_biases(plan, model, mesh_dim_names)
+        self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
+
+    @staticmethod
+    def _log_explanation(plan: ShardingPlan, enabled: bool) -> None:
+        """Log the plan explanation when requested."""
+        if enabled:
+            logger.info("ShardingPlan explain:\n%s", plan.explain())
+
+    def _classify_boundary_groups(self, model: Any, arch: str):
+        """Classify model parameters and group them into candidate boundaries."""
+        param_roles = self._classify_all_params(model, arch)
+        return param_roles, self._group_by_boundary(param_roles)
+
     def plan(
         self,
         model: Any,
@@ -344,10 +415,7 @@ class ShardingPlanner:
         ep_extend = ep_size if ep_size > 1 else 0
 
         # Phase 1: parameter role classification
-        param_roles = self._classify_all_params(model, arch)
-
-        # Phase 2: communication boundary grouping
-        boundary_groups = self._group_by_boundary(param_roles)
+        param_roles, boundary_groups = self._classify_boundary_groups(model, arch)
 
         # Phase 3+4: semantic inference + template-fills I/O
         param_ndims = {name: p.ndim for name, p in model.named_parameters()}
@@ -359,46 +427,24 @@ class ShardingPlanner:
             sequence_parallel=sequence_parallel,
             loss_parallel=loss_parallel,
         )
-        if not self._derive:
-            logger.info(
-                "derive=False: template derivation skipped — the plan will "
-                "contain only plan_overrides specs (all insert mode, fully "
-                "self-declared)")
-        for boundary_fqn, group in (boundary_groups.items() if self._derive
-                                    else ()):
-            boundary_type = self._infer_boundary_type(boundary_fqn, group)
-            template = self._templates.get(boundary_type)
-            if template is None:
-                logger.warning(
-                    "No template for boundary_type=%s at %s", boundary_type, boundary_fqn
-                )
-                continue
-            spec = self._build_spec_from_template(
-                boundary_fqn, group, template,
-                sequence_parallel, loss_parallel, mesh_dim_names,
-                param_ndims=param_ndims,
-            )
-            if spec is not None:
-                if boundary_type == "moe_mlp":
-                    self._mark_hf_native_moe(
-                        spec, group, boundary_fqn, template, mesh_dim_names, arch,
-                        ep_extend=ep_extend, mesh=mesh, model=model,
-                        param_ndims=param_ndims)
-                plan.modules[boundary_fqn] = spec
+        self._derive_boundary_specs(
+            plan,
+            boundary_groups,
+            sequence_parallel=sequence_parallel,
+            loss_parallel=loss_parallel,
+            mesh_dim_names=mesh_dim_names,
+            arch=arch,
+            ep_extend=ep_extend,
+            mesh=mesh,
+            model=model,
+            param_ndims=param_ndims,
+        )
 
         # Phase 4.5: unified override pass — merge mode (unset fields inherit
         # the derived spec) / insert mode (fully self-declared only) / glob.
-        self._merge_plan_overrides(plan, model)
-        # Plan output normalization: contract-field None (undeclared) → {} —
-        # "unset inherits, written is honored" only exists on the input side;
-        # specs inside the plan always hold concrete values, so downstream
-        # consumers need no branching.
-        self._normalize_contract_fields(plan)
-        self._finalize_tp_local_attr_plans(
-            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names,
+        self._finalize_boundary_specs(
+            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names
         )
-        self._finalize_deferred_biases(plan, model, mesh_dim_names)
-        self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
         # uniqueness (the only nesting check that remains)
@@ -429,8 +475,7 @@ class ShardingPlanner:
         # tied-weight detection (embed <-> lm_head sharing storage)
         plan.tied_pairs = self._detect_tied_pairs(model)
 
-        if explain:
-            logger.info("ShardingPlan explain:\n%s", plan.explain())
+        self._log_explanation(plan, explain)
 
         return plan
 
@@ -655,6 +700,51 @@ class ShardingPlanner:
 
     # ── Phase 3 ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _explicit_boundary_type(fqn_lower: str, segment: str) -> Optional[str]:
+        """Return an explicit FQN-based boundary type when one matches."""
+        if _match_any(
+                fqn_lower,
+                ["embed_tokens", "wte", ".embed.", "tok_embeddings", "embed_in", "word_embeddings"],
+        ):
+            return "embed"
+        if _match_any(fqn_lower, ["lm_head", "embed_out", "output_layer"]):
+            return "lm_head"
+        if _match_any(fqn_lower, ["norm", "layernorm", "rmsnorm", "ln_"]):
+            return "norm"
+        if _match_any(segment, ["router"]):
+            return "moe_gate"
+        return None
+
+    @staticmethod
+    def _moe_boundary_type(fqn: str, roles: set[ParamRole]) -> Optional[str]:
+        """Return the boundary type implied by MoE-specific parameter roles."""
+        if ParamRole.MOE_EXPERT in roles:
+            return "moe_mlp" if _match_any(_last_segment(fqn), list(_MOE_CONTAINER_PATTERNS)) else "unknown"
+        if ParamRole.SHARED_EXPERT in roles:
+            return "mlp"
+        if ParamRole.MOE_GATE in roles:
+            return "unknown"
+        return None
+
+    @staticmethod
+    def _dense_boundary_type(fqn_lower: str, group: List[Tuple[str, ParamRole]]) -> str:
+        """Infer an attention or MLP boundary from dense parameter roles."""
+        has_colwise = any(
+            role in (ParamRole.COLWISE, ParamRole.FUSED_QKV, ParamRole.FUSED_GATE_UP)
+            for _, role in group
+        )
+        has_rowwise = any(role == ParamRole.ROWWISE for _, role in group)
+        if has_colwise and has_rowwise:
+            if _match_any(fqn_lower, list(_ATTN_PATTERNS)):
+                return "attention"
+            if _match_any(fqn_lower, list(_MLP_PATTERNS)):
+                return "mlp"
+            return "attention"
+        if has_colwise and _match_any(fqn_lower, list(_MLP_PATTERNS)):
+            return "mlp"
+        return "unknown"
+
     def _infer_boundary_type(self, fqn: str, group: List[Tuple[str, ParamRole]]) -> str:
         """Identify the semantic role from the module FQN + the group's
         parameter roles.
@@ -665,16 +755,9 @@ class ShardingPlanner:
         fqn_lower = fqn.lower()
         seg = _last_segment(fqn)
 
-        # 1. Explicit rules (highest priority; the leaf module itself is the boundary)
-        if _match_any(fqn_lower, ["embed_tokens", "wte", ".embed.", "tok_embeddings",
-                                  "embed_in", "word_embeddings"]):
-            return "embed"
-        if _match_any(fqn_lower, ["lm_head", "embed_out", "output_layer"]):
-            return "lm_head"
-        if _match_any(fqn_lower, ["norm", "layernorm", "rmsnorm", "ln_"]):
-            return "norm"
-        if _match_any(seg, ["router"]):
-            return "moe_gate"
+        explicit_type = self._explicit_boundary_type(fqn_lower, seg)
+        if explicit_type is not None:
+            return explicit_type
 
         # 2. Leaf-segment guard: projection/expert leaf modules are not
         # boundary containers themselves
@@ -694,39 +777,8 @@ class ShardingPlanner:
         # substring of the whole FQN (a parent path segment like "mlp" must
         # not qualify a leaf Linear such as shared_expert_gate).
         roles = {r for _, r in group}
-        if ParamRole.MOE_EXPERT in roles:
-            if _match_any(_last_segment(fqn), list(_MOE_CONTAINER_PATTERNS)):
-                return "moe_mlp"
-            return "unknown"
-        if ParamRole.SHARED_EXPERT in roles:
-            # The shared expert submodule has dense-MLP semantics (colwise/
-            # rowwise TP, no EP, no use_local_map): an independent nested TP
-            # boundary whose exit performs the RowWise Partial reduction
-            # (accuracy_problem.md 10.3 Option A). Being a normal (dispatchable)
-            # boundary also means validate mode checks its out_src via real
-            # propagation instead of a declarative rewrap.
-            return "mlp"
-        if ParamRole.MOE_GATE in roles:
-            # Router-like params without routed experts: do not anchor a
-            # boundary; merge upward.
-            return "unknown"
-
-        # 4. Parameter role combinations
-        has_colwise = any(r in (ParamRole.COLWISE, ParamRole.FUSED_QKV,
-                                ParamRole.FUSED_GATE_UP) for _, r in group)
-        has_rowwise = any(r == ParamRole.ROWWISE for _, r in group)
-        if has_colwise and has_rowwise:
-            if _match_any(fqn_lower, list(_ATTN_PATTERNS)):
-                return "attention"
-            if _match_any(fqn_lower, list(_MLP_PATTERNS)):
-                return "mlp"
-            return "attention"  # default to attention (more conservative SP communication)
-        if has_colwise and not has_rowwise:
-            if _match_any(fqn_lower, list(_MLP_PATTERNS)):
-                return "mlp"
-            return "unknown"
-
-        return "unknown"
+        moe_type = self._moe_boundary_type(fqn, roles)
+        return moe_type if moe_type is not None else self._dense_boundary_type(fqn_lower, group)
 
     # ── Phase 4 ─────────────────────────────────────────────────────────
 
@@ -899,6 +951,99 @@ class ShardingPlanner:
         r"^experts\.(?:\d+\.)?(?:gate_up_proj|gate_and_up_projs"
         r"|fused_gate_up|w13)(?:\.weight)?$")
 
+    def _detect_expert_layout(self, group, boundary_fqn: str, param_ndims):
+        """Return expert parameters grouped by per-expert and batched layouts."""
+        expert_params = [fqn for fqn, role in group if role == ParamRole.MOE_EXPERT]
+        if not expert_params:
+            return None
+        stacks: Dict[str, List[Tuple[int, str]]] = {}
+        batched: List[str] = []
+        for param_fqn in expert_params:
+            rel = param_fqn[len(boundary_fqn) + 1:]
+            if "bias" in rel.lower():
+                logger.warning(
+                    "%s: MoE expert has bias (%s); not supported in v1, skipping EP marking",
+                    boundary_fqn, rel,
+                )
+                return None
+            match = self._PER_EXPERT_RE.match(rel)
+            if match is not None:
+                stacks.setdefault(match.group(2), []).append((int(match.group(1)), rel))
+            elif self._BATCHED_EXPERT_RE.match(rel) is not None and (param_ndims or {}).get(param_fqn, 2) >= 3:
+                batched.append(rel)
+        if stacks and batched:
+            logger.warning(
+                "%s: mixed per-expert and batched layouts (%s ...); skipping EP marking",
+                boundary_fqn, batched[0],
+            )
+            return None
+        return expert_params, stacks, batched
+
+    @staticmethod
+    def _mark_old_style_experts(
+        spec: ModuleShardingSpec,
+        stacks: Dict[str, List[Tuple[int, str]]],
+        template: ShardingTemplate,
+    ) -> None:
+        """Stack per-expert parameters while retaining explicit TP and EP axes."""
+        for projection, items in stacks.items():
+            items.sort()
+            sources = [rel for _, rel in items]
+            stacked = f"experts.{projection}"
+            tp_placement = _moe_expert_tp_placement(stacked, ndim=3, template=template)
+            for rel in sources:
+                spec.params.pop(rel, None)
+            spec.params[stacked] = _multi_dim(
+                tp=tp_placement, cp=Replicate(), ep=template.moe_expert_placement
+            )
+            spec._ep_stack[stacked] = sources
+
+    @staticmethod
+    def _mark_extended_expert_params(
+        spec: ModuleShardingSpec,
+        expert_params: List[str],
+        stacks: Dict[str, List[Tuple[int, str]]],
+        batched: List[str],
+        boundary_fqn: str,
+        template: ShardingTemplate,
+    ) -> None:
+        """Mark expert parameters for TP-extended EP sharding."""
+        if stacks:
+            for projection, items in stacks.items():
+                items.sort()
+                sources = [rel for _, rel in items]
+                stacked = f"experts.{projection}"
+                for rel in sources:
+                    spec.params.pop(rel, None)
+                spec.params[stacked] = _multi_dim(
+                    tp=None, cp=Replicate(), ep=template.moe_expert_placement
+                )
+                spec._ep_stack[stacked] = sources
+            spec.region_dispatch = None
+            return
+        if batched:
+            for rel in batched:
+                spec.params[rel] = _multi_dim(
+                    tp=None, cp=Replicate(), ep=template.moe_expert_placement
+                )
+            spec.region_dispatch = None
+            return
+        for param_fqn in expert_params:
+            rel = param_fqn[len(boundary_fqn) + 1:]
+            spec.params[rel] = _multi_dim(
+                tp=None, cp=Replicate(), ep=template.moe_expert_placement
+            )
+
+    @staticmethod
+    def _set_extended_ep_contract(spec: ModuleShardingSpec, ep_extend: int) -> None:
+        """Set the identity boundary contract used by TP-extended EP."""
+        identity = copy.deepcopy(spec.in_src)
+        spec.in_dst = copy.deepcopy(identity)
+        out_layout = copy.deepcopy(next(iter(identity.values())))
+        spec.out_src = {"output": copy.deepcopy(out_layout)}
+        spec.out_dst = {"output": copy.deepcopy(out_layout)}
+        spec._ep_size = ep_extend
+
     def _mark_hf_native_moe(
         self, spec: ModuleShardingSpec, group, boundary_fqn: str,
         template: ShardingTemplate, mesh_dim_names: Tuple[str, ...], arch: str,
@@ -943,125 +1088,19 @@ class ShardingPlanner:
         _ = arch
         if not ep_extend:
             return
-        expert_params = [fqn for fqn, r in group if r == ParamRole.MOE_EXPERT]
-        if not expert_params:
+        layout = self._detect_expert_layout(group, boundary_fqn, param_ndims)
+        if layout is None:
             return
-
-        has_ep_in_mesh = "ep" in mesh_dim_names
-
-        # ── Detect expert layout (only affects stacking strategy) ──
-        stacks: Dict[str, List[Tuple[int, str]]] = {}
-        batched: List[str] = []
-        for param_fqn in expert_params:
-            rel = param_fqn[len(boundary_fqn) + 1:]
-            if "bias" in rel.lower():
-                logger.warning(
-                    "%s: MoE expert has bias (%s); not supported in v1, "
-                    "skipping EP marking",
-                    boundary_fqn, rel,
-                )
-                return
-            m = self._PER_EXPERT_RE.match(rel)
-            if m is not None:
-                stacks.setdefault(m.group(2), []).append((int(m.group(1)), rel))
-                continue
-            if (self._BATCHED_EXPERT_RE.match(rel) is not None
-                    and (param_ndims or {}).get(param_fqn, 2) >= 3):
-                batched.append(rel)
-                continue
-            # Custom naming (w1/w2/w3 etc.) — pre-stacked 3D, no-op for
-            # both modes; D-10 will mark EP on them below.
-
-        if stacks and batched:
-            logger.warning(
-                "%s: mixed per-expert and batched layouts (%s ...); "
-                "skipping EP marking",
-                boundary_fqn, batched[0],
-            )
+        expert_params, stacks, batched = layout
+        if "ep" in mesh_dim_names:
+            if stacks:
+                self._mark_old_style_experts(spec, stacks, template)
             return
-
-        # ────────────────────────────────────────────────────────────────
-        # Old-style EP: mesh has explicit "ep" axis
-        # ────────────────────────────────────────────────────────────────
-        if has_ep_in_mesh:
-            if not stacks:
-                # Batched / custom layouts: already 3D, placements from
-                # _build_spec_from_template ({TP: Shard(…), EP: Shard(0)})
-                # are correct. Nothing to do.
-                return
-            # Per-expert layout: stack first so the expert dim exists for
-            # EP Shard(0).  Keep both TP and EP keys — old-style EP shards
-            # on both axes simultaneously on the main mesh.
-            for proj, items in stacks.items():
-                items.sort()
-                sources = [rel for _, rel in items]
-                stacked = f"experts.{proj}"
-                # Compute the correct TP placement for the 3D stacked
-                # tensor (ndim=3 shifts TP axes: colwise Shard(1),
-                # rowwise Shard(2))
-                tp_p = _moe_expert_tp_placement(stacked, ndim=3, template=template)
-                for rel in sources:
-                    spec.params.pop(rel, None)
-                spec.params[stacked] = _multi_dim(
-                    tp=tp_p, cp=Replicate(),
-                    ep=template.moe_expert_placement)
-                spec._ep_stack[stacked] = sources
-            # No _ep_size — old-style EP uses the main mesh's "ep" axis
-            return
-
-        # ────────────────────────────────────────────────────────────────
-        # D-10 TP-extend-EP: mesh has NO "ep" axis
-        # ────────────────────────────────────────────────────────────────
         self._validate_ep_extend(ep_extend, mesh, model)
-
-        if stacks:
-            # Per-expert layout: stack + {EP: Shard(0)} (no TP key)
-            for proj, items in stacks.items():
-                items.sort()
-                sources = [rel for _, rel in items]
-                stacked = f"experts.{proj}"
-                for rel in sources:
-                    spec.params.pop(rel, None)
-                spec.params[stacked] = _multi_dim(
-                    tp=None, cp=Replicate(), ep=template.moe_expert_placement)
-                spec._ep_stack[stacked] = sources
-            # HF-native forward is NOT EP-aware: clear the template's
-            # region_dispatch (back to None) so the module never silently
-            # runs its own forward on sharded experts — an explicit
-            # local_compute_fn injection is required (apply-time preflight
-            # fails fast).
-            spec.region_dispatch = None
-        elif batched:
-            # Batched layout: already 3D, just mark {EP: Shard(0)}
-            for rel in batched:
-                spec.params[rel] = _multi_dim(
-                    tp=None, cp=Replicate(), ep=template.moe_expert_placement)
-            # Same as above: HF-native forward is NOT EP-aware.
-            spec.region_dispatch = None
-        # else: custom naming (w1/w2/w3) — pre-stacked 3D by the module
-        # author; the template's region_dispatch=False is KEPT: such modules
-        # are EP-aware by construction (their own forward carries the a2a).
-        # An explicit local_compute_fn still overrides when declared.
-
-        if not stacks and not batched:
-            # Custom naming (w1/w2/w3): pre-stacked 3D, mark {EP: Shard(0)}
-            for param_fqn in expert_params:
-                rel = param_fqn[len(boundary_fqn) + 1:]
-                spec.params[rel] = _multi_dim(
-                    tp=None, cp=Replicate(), ep=template.moe_expert_placement)
-
-        # D-10: change the MoE boundary contract to SP-in identity
-        # (Megatron MoE never gathers anyway; all communication is
-        # cohesive inside the region, 05 §6.4.8). The layout follows the
-        # template in_src (SP → TP Shard(1); non-SP → Replicate); MoE is
-        # per-token computation, so the output layout always equals the
-        # input layout.
-        identity = copy.deepcopy(spec.in_src)
-        spec.in_dst = copy.deepcopy(identity)
-        out_layout = copy.deepcopy(next(iter(identity.values())))
-        spec.out_src = {"output": copy.deepcopy(out_layout)}
-        spec.out_dst = {"output": copy.deepcopy(out_layout)}
-        spec._ep_size = ep_extend
+        self._mark_extended_expert_params(
+            spec, expert_params, stacks, batched, boundary_fqn, template
+        )
+        self._set_extended_ep_contract(spec, ep_extend)
 
     # ── Phase 4.5: unified override pass (05 §3.6.7 + unification rework) ──
 
@@ -1411,6 +1450,108 @@ class ShardingPlanner:
             "override needed.")
 
     @staticmethod
+    def _should_defer_rowwise_bias(
+        module_fqn: str,
+        module: nn.Module,
+        owner_path: str,
+        param_name: str,
+        bias_tp,
+        out_src,
+        partial_outputs: List[str],
+    ) -> bool:
+        """Validate a rowwise bias and return whether it must be deferred."""
+        if not partial_outputs:
+            return False
+        if len(out_src) != 1:
+            raise ValueError(
+                f"boundary {module_fqn!r}: rowwise bias deferral (D-22) v1 only supports single-output "
+                f"boundaries — this boundary's out_src declares {len(out_src)} outputs with a TP Partial "
+                f"reduction, so the framework cannot attribute {param_name!r} to a unique output. Take over "
+                "the region with local_compute_fn (add the bias yourself after the reduction)"
+            )
+        if bias_tp is not None and not isinstance(bias_tp, Replicate):
+            raise ValueError(
+                f"boundary {module_fqn!r}: the bias of rowwise Linear {owner_path!r} declares a non-Replicate "
+                f"TP placement ({bias_tp!r}) — D-22 deferred addition requires the bias to stay Replicate "
+                f"(added exactly once as a whole after the TP reduction). Remove {param_name!r} from "
+                "spec.params, or change it to {TP: replicate()}"
+            )
+        owner = module.get_submodule(owner_path) if owner_path else module
+        if isinstance(owner, nn.Linear):
+            return True
+        logger.warning(
+            "boundary %s: rowwise Linear %r carries a bias and the boundary out_src is TP Partial — but "
+            "the owner type is %s (not nn.Linear), so the framework does not touch its forward semantics: "
+            "the bias will be counted multiple times by the Partial reduction (production output = correct "
+            "value + tp_size × bias). Move the bias after the boundary communication, switch to nn.Linear, "
+            "or take over the region with local_compute_fn",
+            module_fqn, owner_path, type(owner).__name__,
+        )
+        return False
+
+    @staticmethod
+    def _validate_colwise_bias(
+        module_fqn: str,
+        weight_path: str,
+        param_name: str,
+        param,
+        bias_named,
+        bias_tp,
+        shard_dim: int,
+    ) -> None:
+        """Require a colwise bias to follow its weight's output shard."""
+        bias_dim = None
+        if isinstance(bias_tp, Shard):
+            bias_dim = bias_tp.dim if bias_tp.dim >= 0 else bias_tp.dim + param.ndim
+        if bias_dim == shard_dim:
+            return
+        declared = repr(bias_tp) if bias_named else "undeclared"
+        raise ValueError(
+            f"boundary {module_fqn!r}: {weight_path!r} is sharded along the output dim as Shard({shard_dim}), "
+            f"but {param_name!r} is not sharded along the output channels the same way ({declared}) — "
+            f"template mismatch (typical: lm_head.bias). Declare it explicitly via plan_overrides as "
+            f"{{'{param_name}': {{TP: shard({shard_dim})}}}}, or remove the bias"
+        )
+
+    @staticmethod
+    def _collect_deferred_biases(module_fqn: str, spec: ModuleShardingSpec, module: nn.Module) -> List[str]:
+        """Validate one boundary's biases and collect rowwise deferred names."""
+        named_params = dict(module.named_parameters())
+        out_src = spec.out_src or {}
+        partial_outputs = [
+            out_name for out_name, named in out_src.items() if isinstance(named.get(TP), Partial)
+        ]
+        deferred: List[str] = []
+        for param_name, param in named_params.items():
+            if param_name == "bias":
+                owner_path = ""
+            elif param_name.endswith(".bias"):
+                owner_path = param_name[: -len(".bias")]
+            else:
+                continue
+            weight_path = f"{owner_path}.weight" if owner_path else "weight"
+            weight = named_params.get(weight_path)
+            weight_named = (spec.params or {}).get(weight_path)
+            if weight is None or weight_named is None:
+                continue
+            tp_placement = weight_named.get(TP)
+            if not isinstance(tp_placement, Shard):
+                continue
+            shard_dim = tp_placement.dim if tp_placement.dim >= 0 else tp_placement.dim + weight.ndim
+            bias_named = spec.params.get(param_name)
+            bias_tp = bias_named.get(TP) if bias_named else None
+            if shard_dim == weight.ndim - 1:
+                if ShardingPlanner._should_defer_rowwise_bias(
+                    module_fqn, module, owner_path, param_name, bias_tp, out_src, partial_outputs
+                ):
+                    deferred.append(param_name)
+            else:
+                ShardingPlanner._validate_colwise_bias(
+                    module_fqn, weight_path, param_name, param, bias_named, bias_tp, shard_dim
+                )
+        return deferred
+
+    @staticmethod
     def _finalize_deferred_biases(
         plan: ShardingPlan, model, mesh_dim_names: Tuple[str, ...],
     ) -> None:
@@ -1456,96 +1597,7 @@ class ShardingPlanner:
             module = modules.get(module_fqn)
             if module is None:
                 continue
-            named_params = dict(module.named_parameters())
-            out_src = spec.out_src or {}
-            partial_outputs = [
-                out_name for out_name, named in out_src.items()
-                if isinstance(named.get(TP), Partial)
-            ]
-            deferred: List[str] = []
-            for param_name, param in named_params.items():
-                if param_name == "bias":
-                    owner_path = ""      # the boundary module itself is the bias-carrying Linear
-                elif param_name.endswith(".bias"):
-                    owner_path = param_name[: -len(".bias")]
-                else:
-                    continue
-                weight_path = f"{owner_path}.weight" if owner_path else "weight"
-                weight = named_params.get(weight_path)
-                weight_named = (spec.params or {}).get(weight_path)
-                if weight is None or weight_named is None:
-                    continue
-                tp_p = weight_named.get(TP)
-                if not isinstance(tp_p, Shard):
-                    continue
-                shard_dim = tp_p.dim if tp_p.dim >= 0 else tp_p.dim + weight.ndim
-                bias_named = spec.params.get(param_name)
-                bias_tp = bias_named.get(TP) if bias_named else None
-                if shard_dim == weight.ndim - 1:
-                    # contraction-dim shard (rowwise): a fused bias would be
-                    # counted once per TP rank by the boundary Partial
-                    # reduction — defer it past the reduction (D-22).
-                    if not partial_outputs:
-                        continue   # no boundary reduction → the bias is added exactly once anyway
-                    if len(out_src) != 1:
-                        raise ValueError(
-                            f"boundary {module_fqn!r}: rowwise bias "
-                            f"deferral (D-22) v1 only supports single-output "
-                            f"boundaries — this boundary's out_src declares "
-                            f"{len(out_src)} outputs with a TP Partial "
-                            f"reduction, so the framework cannot attribute "
-                            f"{param_name!r} to a unique output. Take over "
-                            f"the region with local_compute_fn (add the bias "
-                            f"yourself after the reduction)")
-                    if bias_tp is not None and not isinstance(bias_tp, Replicate):
-                        raise ValueError(
-                            f"boundary {module_fqn!r}: the bias of rowwise "
-                            f"Linear {owner_path!r} declares a non-Replicate "
-                            f"TP placement ({bias_tp!r}) — D-22 deferred "
-                            f"addition requires the bias to stay Replicate "
-                            f"(added exactly once as a whole after the TP "
-                            f"reduction). Remove {param_name!r} from "
-                            f"spec.params, or change it to "
-                            f"{{TP: replicate()}}")
-                    owner = (module.get_submodule(owner_path)
-                             if owner_path else module)
-                    if not isinstance(owner, nn.Linear):
-                        logger.warning(
-                            "boundary %s: rowwise Linear %r carries a bias "
-                            "and the boundary out_src is TP Partial — but "
-                            "the owner type is %s (not nn.Linear), so the "
-                            "framework does not touch its forward semantics: "
-                            "the bias will be counted multiple times by the "
-                            "Partial reduction (production output = correct "
-                            "value + tp_size × bias). Move the bias after "
-                            "the boundary communication, switch to "
-                            "nn.Linear, or take over the region with "
-                            "local_compute_fn",
-                            module_fqn, owner_path, type(owner).__name__)
-                        continue
-                    deferred.append(param_name)
-                else:
-                    # output-dim shard (colwise / lm_head / embed): the bias
-                    # must follow the same output-channel shard — a
-                    # replicated/undeclared bias here is the lm_head.bias
-                    # template mismatch (would crash as a remote broadcast
-                    # shape error at runtime).
-                    bias_dim = None
-                    if isinstance(bias_tp, Shard):
-                        bias_dim = (bias_tp.dim if bias_tp.dim >= 0
-                                    else bias_tp.dim + param.ndim)
-                    if bias_dim != shard_dim:
-                        declared = repr(bias_tp) if bias_named else "undeclared"
-                        raise ValueError(
-                            f"boundary {module_fqn!r}: {weight_path!r} is "
-                            f"sharded along the output dim as "
-                            f"Shard({shard_dim}), but {param_name!r} is not "
-                            f"sharded along the output channels the same way "
-                            f"({declared}) — template mismatch (typical: "
-                            f"lm_head.bias). Declare it explicitly via "
-                            f"plan_overrides as "
-                            f"{{'{param_name}': {{TP: shard({shard_dim})}}}}, "
-                            f"or remove the bias")
+            deferred = ShardingPlanner._collect_deferred_biases(module_fqn, spec, module)
             spec._deferred_bias_params = tuple(deferred)  # pylint: disable=protected-access
             if deferred:
                 logger.info(
