@@ -50,18 +50,19 @@ class SimpleRecomputeModel(torch.nn.Module):
 
 
 class UnevenShardModel(torch.nn.Module):
-    """Two-layer model whose parameters are uneven on dim 0 for four-way FSDP."""
+    """Model with uneven and shorter-than-shard dim-0 parameters."""
 
     def __init__(self):
         super().__init__()
         self.input_projection_weight = torch.nn.Parameter(torch.full((5, 8), 0.01).npu())
         self.output_projection_weight = torch.nn.Parameter(torch.full((7, 5), 0.01).npu())
+        self.output_scale_weight = torch.nn.Parameter(torch.ones(1).npu())
 
     def forward(self, x):
         x = torch.matmul(x, self.input_projection_weight.t())
         x = torch.relu(x)
         x = torch.matmul(x, self.output_projection_weight.t())
-        return torch.sum(x)
+        return torch.sum(x * self.output_scale_weight)
 
 
 def _get_standard_fully_shard_kwargs(mp_policy, offload_policy=None):

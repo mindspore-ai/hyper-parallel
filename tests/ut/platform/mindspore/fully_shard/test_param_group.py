@@ -37,12 +37,14 @@ import mindspore as ms
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.platform.mindspore.fully_shard.param_group import (
+    AllGatherResult,
     AllReduceParamGroup,
     HSDPParamGroup,
     all_gather_copy_in,
     get_all_gather_metadata,
     reduce_scatter_copy_in,
 )
+from hyper_parallel.platform.mindspore.fully_shard import param_group as param_group_module
 from tests.ut.platform.mindspore.fully_shard.conftest import MindSporeFullyShardUnitTest
 
 
@@ -58,6 +60,16 @@ def _mesh_info(mesh_cls=FSDPMeshInfo, *, shard_group=None, replicate_group=None)
     return mesh_info
 
 
+@pytest.fixture(autouse=True)
+def _patch_view_copy_for_cpu(monkeypatch):
+    """Keep CPU UT focused on copy geometry; NPU ST validates ACLNN view-copy values."""
+    monkeypatch.setattr(
+        param_group_module,
+        "copy_without_bumping_version",
+        MagicMock(),
+    )
+
+
 def _fake_param(
     values,
     *,
@@ -65,6 +77,7 @@ def _fake_param(
     grad=None,
     param_dtype=None,
     reduce_dtype=None,
+    shard_dim=0,
 ):
     """Create the parameter facts consumed by ``HSDPParamGroup``."""
     local_tensor = ms.Tensor(values, ms.float32)
@@ -85,9 +98,11 @@ def _fake_param(
     hsdp_param.param_dtype = param_dtype
     hsdp_param.reduce_dtype = reduce_dtype
     hsdp_param.sharded_size = local_tensor.shape
-    hsdp_param.hsdp_placement = Shard(0)
+    hsdp_param.padded_sharded_param_size = local_tensor.shape
+    hsdp_param.hsdp_placement = Shard(shard_dim)
     hsdp_param._orig_size = (local_tensor.shape[0] * hsdp_param.shard_world_size,)
     hsdp_param.sharded_param = SimpleNamespace(requires_grad=True)
+    hsdp_param._sharded_param_data = local_tensor
     hsdp_param.all_gather_inputs = [
         local_tensor.to(param_dtype) if param_dtype is not None else local_tensor
     ]
@@ -130,7 +145,11 @@ class TestParamGroupHelpers(MindSporeFullyShardUnitTest):
             rank=1,
         )
         self.assertIs(returned_output, output)
-        np.testing.assert_allclose(local_input.asnumpy(), np.array([1.0, 2.0, 3.0]))
+        self.assertEqual(local_input.storage_offset(), 3)
+        copy_calls = param_group_module.copy_without_bumping_version.call_args_list
+        self.assertEqual([call.args[0].shape for call in copy_calls], [(2,), (1,)])
+        np.testing.assert_allclose(copy_calls[0].args[1].asnumpy(), np.array([1.0, 2.0]))
+        np.testing.assert_allclose(copy_calls[1].args[1].asnumpy(), np.array([3.0]))
 
     def test_get_all_gather_metadata_rejects_mixed_dtype(self):
         """One all-gather bucket must have a uniform communication dtype."""
@@ -140,7 +159,11 @@ class TestParamGroupHelpers(MindSporeFullyShardUnitTest):
             get_all_gather_metadata([param_a, param_b])
 
     def test_reduce_scatter_copy_in_packs_dim_zero_gradients(self):
-        """Fused RS packing should concatenate each parameter in column order."""
+        """
+        Feature: Fused even reduce-scatter packing.
+        Description: Pack two dim-0 parameter gradients into one collective input.
+        Expectation: Each reduce-scatter row retains parameter column order.
+        """
         param_a = _fake_param([1.0], mesh_info=_mesh_info(FSDPMeshInfo, shard_group="pg"))
         param_b = _fake_param([2.0, 3.0], mesh_info=_mesh_info(FSDPMeshInfo, shard_group="pg"))
         grad_a = ms.Tensor([1.0, 2.0], ms.float32)
@@ -149,10 +172,62 @@ class TestParamGroupHelpers(MindSporeFullyShardUnitTest):
 
         reduce_scatter_copy_in([param_a, param_b], [grad_a, grad_b], output, world_size=2)
 
+        copy_calls = param_group_module.copy_without_bumping_version.call_args_list
+        self.assertEqual([call.args[0].shape for call in copy_calls], [(2, 1), (2, 2)])
         np.testing.assert_allclose(
-            output.view(2, -1).asnumpy(),
-            np.array([[1.0, 3.0, 4.0], [2.0, 5.0, 6.0]], dtype=np.float32),
+            copy_calls[0].args[1].asnumpy(),
+            np.array([[1.0], [2.0]], dtype=np.float32),
         )
+        np.testing.assert_allclose(
+            copy_calls[1].args[1].asnumpy(),
+            np.array([[3.0, 4.0], [5.0, 6.0]], dtype=np.float32),
+        )
+
+    def test_reduce_scatter_copy_in_packs_non_dim_zero_gradient(self):
+        """A dimension-one gradient should use the inline chunk-cat RS layout."""
+        hsdp_param = _fake_param(
+            [[0.0, 1.0], [4.0, 5.0]],
+            mesh_info=_mesh_info(FSDPMeshInfo, shard_group="pg"),
+            shard_dim=1,
+        )
+        hsdp_param._orig_size = (2, 4)
+        full_grad = ms.Tensor(np.arange(8, dtype=np.float32).reshape(2, 4))
+        output = ms.mint.empty((8,), dtype=ms.float32)
+
+        reduce_scatter_copy_in([hsdp_param], [full_grad], output, world_size=2)
+
+        packed_grad = param_group_module.copy_without_bumping_version.call_args.args[1]
+        np.testing.assert_allclose(
+            packed_grad.asnumpy(),
+            np.array([[0.0, 1.0, 4.0, 5.0], [2.0, 3.0, 6.0, 7.0]], dtype=np.float32),
+        )
+
+    def test_reduce_scatter_copy_in_zero_pads_uneven_dim_zero_gradients(self):
+        """
+        Feature: Fused uneven reduce-scatter packing.
+        Description: Pack a five-element parameter gradient for two FSDP ranks.
+        Expectation: Each row has the ceil-chunk size and the final element is zero padding.
+        """
+        hsdp_param = _fake_param(
+            [1.0, 2.0],
+            mesh_info=_mesh_info(FSDPMeshInfo, shard_group="pg"),
+        )
+        hsdp_param._orig_size = (5,)
+        hsdp_param.sharded_size = (2,)
+        hsdp_param.padded_sharded_param_size = (3,)
+        full_grad = ms.Tensor([1.0, 2.0, 3.0, 4.0, 5.0], ms.float32)
+        output = ms.mint.empty((6,), dtype=ms.float32)
+
+        reduce_scatter_copy_in([hsdp_param], [full_grad], output, world_size=2)
+
+        packed_grad = param_group_module.copy_without_bumping_version.call_args.args[1]
+        np.testing.assert_allclose(
+            packed_grad.asnumpy(),
+            np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 0.0]], dtype=np.float32),
+        )
+        layout = HSDPParamGroup([hsdp_param])._build_gradient_bucket_layout_from([hsdp_param])
+        self.assertEqual(layout.param_numels, [3])
+        self.assertEqual(layout.total_numel, 3)
 
 
 class TestAllGatherBuckets(MindSporeFullyShardUnitTest):
@@ -176,6 +251,58 @@ class TestAllGatherBuckets(MindSporeFullyShardUnitTest):
             for bucket in group.all_gather_buckets
             for param in bucket.hsdp_params
         ])
+
+    def test_copy_out_restores_mixed_shard_dimensions(self):
+        """Fused all-gather should inline dim-0 and non-dim-0 reconstruction."""
+        mesh_info = _mesh_info(FSDPMeshInfo, shard_group="pg")
+        dim0_param = _fake_param(
+            [[0.0, 1.0], [2.0, 3.0]],
+            mesh_info=mesh_info,
+        )
+        dim0_param._orig_size = (4, 2)
+        dim0_param.unsharded_param_buffers = [ms.mint.empty((8,), dtype=ms.float32)]
+        dim1_param = _fake_param(
+            [[0.0, 1.0], [4.0, 5.0], [8.0, 9.0], [12.0, 13.0]],
+            mesh_info=mesh_info,
+            shard_dim=1,
+        )
+        dim1_param._orig_size = (4, 4)
+        dim1_param.unsharded_param_buffers = [ms.mint.empty((16,), dtype=ms.float32)]
+        group = HSDPParamGroup([dim0_param, dim1_param], device="cpu")
+        group._init_all_gather_buckets()
+        all_gather_bucket = group.all_gather_buckets[0]
+        rank0_input = ms.Tensor(
+            [
+                0.0, 1.0, 2.0, 3.0,
+                0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 12.0, 13.0,
+            ],
+            ms.float32,
+        )
+        rank1_input = ms.Tensor(
+            [
+                4.0, 5.0, 6.0, 7.0,
+                2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0, 15.0,
+            ],
+            ms.float32,
+        )
+        all_gather_bucket.all_gather_result = AllGatherResult(
+            all_gather_input=rank0_input,
+            all_gather_output=ms.mint.cat((rank0_input, rank1_input), dim=0),
+            handle=None,
+        )
+
+        all_gather_bucket.copy_out()
+
+        copy_calls = param_group_module.copy_without_bumping_version.call_args_list
+        np.testing.assert_allclose(
+            copy_calls[0].args[1].reshape(4, 2).asnumpy(),
+            np.arange(8, dtype=np.float32).reshape(4, 2),
+        )
+        np.testing.assert_allclose(
+            copy_calls[1].args[1].reshape(4, 4).asnumpy(),
+            np.arange(16, dtype=np.float32).reshape(4, 4),
+        )
+        self.assertIsNone(all_gather_bucket.all_gather_result)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.all_gather_copy_in", wraps=all_gather_copy_in)
     @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.dist.all_gather_into_tensor")
@@ -224,9 +351,14 @@ class TestReduceBuckets(MindSporeFullyShardUnitTest):
         self.assertTrue(all(bucket.reduce_op == "sum" for bucket in buckets))
         self.assertTrue(all(bucket.needs_avg_div for bucket in buckets))
 
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.apply_gradient_scaling_factor")
     @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.dist.reduce_scatter_tensor")
-    def test_foreach_reducescatter_launches_mint_sum(self, mock_reduce_scatter):
-        """AVG should launch mint SUM then defer explicit division until wait."""
+    def test_foreach_reducescatter_launches_mint_sum(self, mock_reduce_scatter, mock_apply_scaling):
+        """
+        Feature: Fused reduce-scatter scaling and reduction.
+        Description: Scale one bucket and launch AVG as a mint SUM collective.
+        Expectation: The same base tensor reaches the inplace helper and SUM collective.
+        """
         mesh_info = _mesh_info(FSDPMeshInfo, shard_group="pg")
         param = _fake_param(
             [1.0, 2.0],
@@ -234,13 +366,19 @@ class TestReduceBuckets(MindSporeFullyShardUnitTest):
             grad=ms.Tensor([1.0, 2.0, 3.0, 4.0], ms.float32),
         )
         group = HSDPParamGroup([param], device="cpu")
+        group.gradient_scaling_factor = 0.5
         handle = MagicMock()
         mock_reduce_scatter.return_value = handle
+        mock_apply_scaling.return_value = ms.Tensor([-1.0], ms.float32)
 
         group.foreach_reducescatter("avg", async_op=True)
 
         self.assertIs(group.comm_ctx.pre_param_group, group)
         self.assertEqual(mock_reduce_scatter.call_args.kwargs["op"], "sum")
+        reduce_scatter_input = mock_reduce_scatter.call_args.args[1]
+        mock_apply_scaling.assert_called_once_with(reduce_scatter_input, 0.5)
+        self.assertEqual(reduce_scatter_input.shape, (4,))
+        self.assertIsNot(reduce_scatter_input, mock_apply_scaling.return_value)
         param.clear_unsharded_source_grad.assert_called_once_with()
 
     def test_replicate_param_uses_local_rs_then_all_reduce_bucket(self):
@@ -303,8 +441,10 @@ class TestAllReduceParamGroup(MindSporeFullyShardUnitTest):
             mesh_info=_mesh_info(HSDPMeshInfo, shard_group="fsdp", replicate_group="dp"),
         )
         group = AllReduceParamGroup("dp", [param], reduce_op="avg")
-        param.reduce_scatter_comm_ctx.reduce_scatter_output = ms.Tensor([2.0, 4.0])
+        group.allocate_fused_buffer("cpu")
         group.accumulate_reduce_partial_outputs()
+        reduced_grad = MagicMock()
+        group.get_param_grad_view = MagicMock(return_value=reduced_grad)
         handle = MagicMock()
         mock_all_reduce.return_value = handle
 
@@ -313,10 +453,8 @@ class TestAllReduceParamGroup(MindSporeFullyShardUnitTest):
 
         self.assertEqual(mock_all_reduce.call_args.kwargs["op"], "sum")
         handle.wait.assert_called_once_with()
-        np.testing.assert_allclose(
-            param.all_reduce_comm_ctx.all_reduce_output.asnumpy(),
-            np.array([1.0, 2.0], dtype=np.float32),
-        )
+        reduced_grad.div_.assert_called_once_with(2)
+        self.assertIs(param.all_reduce_comm_ctx.all_reduce_output, reduced_grad)
         self.assertIsNone(group.fused_buffer)
 
 

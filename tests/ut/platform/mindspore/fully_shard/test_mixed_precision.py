@@ -115,17 +115,23 @@ class TestGradientApplication(MindSporeFullyShardUnitTest):
         self.assertEqual(assigned.dtype, ms.float32)
         np.testing.assert_allclose(assigned.asnumpy(), np.array([1.0, 2.0], dtype=np.float32))
 
-    def test_apply_reduced_grad_accumulates_without_view_inplace(self):
-        """MindSpore accumulation should replace the gradient with a mint.add result."""
+    def test_apply_reduced_grad_accumulates_inplace(self):
+        """MindSpore accumulation should update the existing local gradient in place."""
         hsdp_param = _bare_param()
+        local_grad = MagicMock()
         hsdp_param.sharded_param.grad = SimpleNamespace(
-            _local_tensor=ms.Tensor([1.0, 2.0], ms.float32)
+            _local_tensor=local_grad
         )
+        reduced_grad = ms.Tensor([3.0, 4.0], ms.float32)
 
-        hsdp_param.apply_reduced_grad(ms.Tensor([3.0, 4.0], ms.float32))
+        hsdp_param.apply_reduced_grad(reduced_grad)
 
-        accumulated = hsdp_param.to_sharded_dtensor.call_args.args[0]
-        np.testing.assert_allclose(accumulated.asnumpy(), np.array([4.0, 6.0], dtype=np.float32))
+        local_grad.add_.assert_called_once()
+        np.testing.assert_allclose(
+            local_grad.add_.call_args.args[0].asnumpy(),
+            reduced_grad.asnumpy(),
+        )
+        hsdp_param.to_sharded_dtensor.assert_not_called()
 
     def test_apply_reduced_grad_assigns_fp32_main_grad(self):
         """FP32-main-grad policy should leave ``param.grad`` empty."""
@@ -138,19 +144,21 @@ class TestGradientApplication(MindSporeFullyShardUnitTest):
         self.assertIsNotNone(hsdp_param.sharded_param.main_grad)
 
     def test_apply_reduced_grad_reports_cpu_offload_sync(self):
-        """Non-blocking CPU offload should tell the caller to synchronize."""
+        """
+        Feature: Reduced-gradient CPU offload.
+        Description: Apply a real reduced tensor through the pinned-memory offload path.
+        Expectation: The transfer is non-blocking and the caller is asked to synchronize.
+        """
         hsdp_param = _bare_param()
         hsdp_param.offload_to_cpu = True
         hsdp_param.pin_memory = True
-        reduced_grad = MagicMock()
-        reduced_grad.reshape.return_value.narrow.return_value.view.return_value = reduced_grad
-        reduced_grad.dtype = ms.float32
-        reduced_grad.to.return_value = MagicMock(name="cpu-grad")
+        reduced_grad = ms.Tensor([1.0, 2.0], ms.float32)
 
-        need_synchronize = hsdp_param.apply_reduced_grad(reduced_grad)
+        with patch.object(ms.Tensor, "to", return_value=reduced_grad) as mock_to:
+            need_synchronize = hsdp_param.apply_reduced_grad(reduced_grad)
 
         self.assertTrue(need_synchronize)
-        reduced_grad.to.assert_called_once_with("cpu", non_blocking=True)
+        mock_to.assert_called_once_with("cpu", non_blocking=True)
 
 
 class TestGradientAccumulation(MindSporeFullyShardUnitTest):
@@ -167,21 +175,20 @@ class TestGradientAccumulation(MindSporeFullyShardUnitTest):
         self.assertEqual(hsdp_param.unsharded_accumulated_grad.dtype, ms.float32)
         self.assertIsNone(hsdp_param._unsharded_param.grad)
 
-    def test_accumulate_unsharded_grad_uses_mint_add(self):
-        """A later micro-step should merge into the retained full gradient."""
+    def test_accumulate_unsharded_grad_is_inplace(self):
+        """A later micro-step should update the retained full gradient in place."""
         hsdp_param = _bare_param()
-        hsdp_param.unsharded_accumulated_grad = ms.Tensor([1.0, 2.0], ms.float32)
-        hsdp_param._unsharded_param.grad = ms.Tensor([3.0, 4.0], ms.float32)
+        accumulated_grad = MagicMock(dtype=ms.float32)
+        current_grad = ms.Tensor([3.0, 4.0], ms.float32)
+        hsdp_param.unsharded_accumulated_grad = accumulated_grad
+        hsdp_param._unsharded_param.grad = current_grad
         hsdp_param._to_local_unsharded_grad = MagicMock(
             return_value=hsdp_param._unsharded_param.grad
         )
 
         hsdp_param.accumulate_unsharded_grad_if_needed()
 
-        np.testing.assert_allclose(
-            hsdp_param.unsharded_accumulated_grad.asnumpy(),
-            np.array([4.0, 6.0], dtype=np.float32),
-        )
+        accumulated_grad.add_.assert_called_once_with(current_grad)
         self.assertIsNone(hsdp_param._unsharded_param.grad)
 
 
@@ -203,6 +210,7 @@ class TestCommunicationDtypes(MindSporeFullyShardUnitTest):
         hsdp_param.mesh_info = SimpleNamespace(shard_process_group="fsdp")
         hsdp_param.hsdp_placement = SimpleNamespace(dim=0)
         hsdp_param._orig_size = (4,)
+        hsdp_param.padded_sharded_param_size = (2,)
         hsdp_param.reduce_scatter_comm_ctx = SimpleNamespace(
             reduce_scatter_output=None,
             reduce_scatter_handle=None,

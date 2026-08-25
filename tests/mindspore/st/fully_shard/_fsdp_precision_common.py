@@ -23,11 +23,34 @@ capture that mapping and the Tensor/DTensor-to-numpy conversion so every precisi
 import numpy as np
 
 
-def assert_shard_matches_reference(case_name, rank, what, reference_full, local_shard,
-                                   shard_size, shard_coord, rtol=1e-4, atol=1e-5):
-    """Assert a rank's local shard equals the dim-0 slice of the single-card reference tensor."""
-    chunk = reference_full.shape[0] // shard_size
-    expected = reference_full[shard_coord * chunk: (shard_coord + 1) * chunk]
+def assert_shard_matches_reference(
+    case_name: str,
+    rank: int,
+    what: str,
+    reference_full: np.ndarray,
+    local_shard: np.ndarray,
+    shard_size: int,
+    shard_coord: int,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> None:
+    """Assert a local shard equals the rank's ceil-chunk reference slice.
+
+    Args:
+        case_name: Precision case name used in failures.
+        rank: Distributed rank used in failures.
+        what: Tensor label used in failures.
+        reference_full: Full single-card reference array.
+        local_shard: Logical local shard array.
+        shard_size: Number of ranks sharding tensor dimension zero.
+        shard_coord: This rank's coordinate in the shard mesh.
+        rtol: Relative comparison tolerance.
+        atol: Absolute comparison tolerance.
+    """
+    chunk = (reference_full.shape[0] + shard_size - 1) // shard_size
+    shard_start = min(shard_coord * chunk, reference_full.shape[0])
+    shard_end = min(shard_start + chunk, reference_full.shape[0])
+    expected = reference_full[shard_start:shard_end]
     assert np.allclose(expected, local_shard, rtol=rtol, atol=atol), (
         f"{case_name}, rank {rank}, {what}: expected slice {expected}, got {local_shard}"
     )

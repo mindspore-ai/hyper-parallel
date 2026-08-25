@@ -34,7 +34,7 @@ ensure_mindspore_platform_for_fully_shard()
 import mindspore as ms
 
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext
-from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.platform.mindspore.fully_shard.param_group import AllReduceParamGroup
 from hyper_parallel.platform.mindspore.fully_shard.state import (
     MindSporeHSDPStateV2,
@@ -136,7 +136,6 @@ class TestParameterInitialization(MindSporeFullyShardUnitTest):
         mock_group.assert_called_once_with(
             [param],
             "cpu",
-            state.mp_policy,
             False,
             comm_ctx=state.scheduler_ctx.param_group_comm_ctx,
         )
@@ -241,6 +240,11 @@ class TestBackwardCommunication(MindSporeFullyShardUnitTest):
             hsdp_params=[hsdp_param],
             reduce_op="avg",
         )
+        all_reduce_group.allocate_fused_buffer.assert_called_once_with("cpu")
+        hsdp_param.reduce_scatter_grad.assert_called_once_with(
+            reduce_op="avg",
+            output_buffer=all_reduce_group.get_param_buffer_view.return_value,
+        )
         self.assertEqual(state.scheduler_ctx.pre_all_reduce_groups, [all_reduce_group])
 
     def test_wait_fsdp_reduce_scatter_retains_final_output_for_root(self):
@@ -248,13 +252,14 @@ class TestBackwardCommunication(MindSporeFullyShardUnitTest):
         param = _fake_param()
         reduced_grad = ms.Tensor([1.0, 2.0])
         param.reduce_scatter_output.return_value = reduced_grad
+        param.reduce_scatter_comm_ctx.reduce_scatter_output = reduced_grad
         state = _new_state([param])
         state.scheduler_ctx.pre_reduce_scatter_params.append(param)
 
         state._wait_prev_reduce_scatter_without_all_reduce()
 
         self.assertIs(param.reduce_scatter_comm_ctx.reduce_scatter_output, reduced_grad)
-        param.clear_unsharded_source_grad.assert_called_once_with()
+        self.assertIsNone(param.unsharded_param.grad)
 
     def test_no_all_reduce_micro_step_parks_partial_output(self):
         """A no-sync HSDP micro-step should keep RS output in reduce dtype."""
@@ -303,6 +308,35 @@ class TestBackwardCommunication(MindSporeFullyShardUnitTest):
 class TestStateConfiguration(MindSporeFullyShardUnitTest):
     """Test iteration cleanup and reduction configuration."""
 
+    def test_validation_helpers_cover_cpu_offload(self):
+        """CPU offload validation should reject managed parameters outside CPU."""
+        non_cpu_param = _fake_param()
+        non_cpu_param.sharded_param.device = "Ascend:0"
+        state = _new_state([non_cpu_param])
+        state._validate_cpu_offload_params()
+
+        cpu_offload_state = _new_state([_fake_param()])
+        cpu_offload_state.offload_policy = CPUOffloadPolicy()
+        cpu_offload_state._validate_cpu_offload_params()
+
+        non_cpu_param._param_fqn = "module.weight"
+        state.offload_policy = CPUOffloadPolicy()
+        with self.assertRaisesRegex(RuntimeError, "module.weight"):
+            state._validate_cpu_offload_params()
+
+    def test_lazy_init_rejects_cpu_offload_params_outside_cpu(self):
+        """Lazy initialization should retain the runtime CPU-offload defense."""
+        param = _fake_param()
+        param._param_fqn = "module.weight"
+        param.sharded_param.device = "Ascend:0"
+        state = _new_state([param])
+        state.offload_policy = CPUOffloadPolicy()
+
+        with self.assertRaisesRegex(RuntimeError, "module.weight"):
+            state.lazy_init()
+
+        param.init_dtype_attrs.assert_not_called()
+
     def test_reset_clears_only_tree_local_communication(self):
         """Reset should release this tree's contexts without clearing optimizer grads."""
         param = _fake_param()
@@ -316,8 +350,8 @@ class TestStateConfiguration(MindSporeFullyShardUnitTest):
         self.assertEqual(state.scheduler_ctx.pre_reduce_scatter_params, [])
         self.assertEqual(state.scheduler_ctx.pending_all_reduce_groups, [])
         self.assertEqual(param.sharded_param.grad, "optimizer-grad")
-        param.clear_reduce_scatter_output.assert_called_once_with()
-        param.clear_all_reduce_output.assert_called_once_with()
+        self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
+        self.assertIsNone(param.all_reduce_comm_ctx.all_reduce_output)
 
     def test_reduce_op_setter_accepts_mint_strings(self):
         """Only mint-supported SUM and AVG strings should be accepted."""

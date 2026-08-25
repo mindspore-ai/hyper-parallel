@@ -14,7 +14,7 @@
 # ============================================================================
 """Pure fully_shard precision cases (MindSpore ST).
 
-A fully_shard SlimLeNet16 and an identical single-card reference (built via
+A fully_shard SlimLeNet16, including its uneven 513-row parameters, and an identical single-card reference (built via
 init_empty_weights + in-process load) are trained for several optimizer steps on the same
 data; each step accumulates gradients in sharded form (grad sync on every micro-batch) and
 the reference's full gradient is compared against each rank's gradient shard (see
@@ -25,7 +25,6 @@ failing case points at one feature. The full-form (deferred-sync) accumulation i
 """
 # pylint: disable=wrong-import-position
 import os
-from unittest.mock import patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
@@ -43,7 +42,6 @@ from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
-from hyper_parallel.platform.mindspore.fully_shard import param_group as param_group_module
 from tests.mindspore.st.common_net import SlimLeNet16
 from tests.mindspore.st.fully_shard._fsdp_precision_common import assert_shard_matches_reference, _to_numpy
 
@@ -98,31 +96,15 @@ def _assert_comm_fusion_state(net, enabled):
         assert actual == enabled, (
             f"{type(mod).__name__} comm_fusion mismatch: expected {enabled}, got {actual}"
         )
-        param_group = getattr(state, "param_group", None)  # absent when comm_fusion is off
+        param_group = state.param_group
         if not enabled:
             assert param_group is None
         elif state.hsdp_params:
             assert param_group is not None, f"{type(mod).__name__} has sharded params but no fused group"
+            assert param_group.enable_zero_copy is False, "MindSpore communication fusion must use copy-in"
             found_fused_group = True
     if enabled:
         assert found_fused_group, "expected at least one fused param_group when comm_fusion=True"
-
-
-def _assert_comm_fusion_copy_fallback(net):
-    """Verify MindSpore disables zero-copy and does not allocate a flat parameter buffer."""
-    modules = [net, net.dense_relu_sequential[0], net.dense_relu_sequential[2], net.dense_relu_sequential[4]]
-    found_param_group = False
-    for mod in modules:
-        state = mod.hsdp_scheduler.hsdp_state
-        param_group = getattr(state, "param_group", None)
-        if param_group is None or not state.hsdp_params:
-            continue
-        found_param_group = True
-        assert param_group.enable_zero_copy is False, "MindSpore must fall back to the all-gather copy-in path"
-        assert not hasattr(param_group, "_flat_param_buffer"), "MindSpore must not create a flat parameter buffer"
-
-    assert found_param_group, "expected at least one fused param_group when comm_fusion=True"
-
 
 def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion, comm_fusion_zero_copy=None):
     """Build a fully_shard SlimLeNet16 matching the reference via init_empty_weights + in-process load."""
@@ -153,28 +135,6 @@ def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion, comm_fus
     if recompute:
         _apply_recompute(net)
     return net
-
-
-def _assert_comm_fusion_zero_copy_falls_back_to_copy_in(state_dict, mesh, rank_slice):
-    """Exercise a zero-copy request and verify MindSpore uses all-gather copy-in."""
-    zero_copy_net = _build_fully_shard_net(
-        state_dict,
-        mesh,
-        recompute=False,
-        comm_fusion=True,
-        comm_fusion_zero_copy=True,
-    )
-    _assert_comm_fusion_copy_fallback(zero_copy_net)
-    images, labels = _step_batch(0, get_group_size())
-    with patch.object(
-        param_group_module,
-        "all_gather_copy_in",
-        wraps=param_group_module.all_gather_copy_in,
-    ) as mock_copy_in:
-        _fully_shard_backward(zero_copy_net, images[rank_slice], labels[rank_slice])
-    assert mock_copy_in.call_count > 0, "MindSpore fused all-gather did not use the copy-in path"
-    zero_copy_net.zero_grad()
-
 
 def _step_batch(step, world_size):
     """Deterministic global (images, labels) batch for one step, identical on every rank."""
@@ -209,6 +169,12 @@ def _reference_backward(net, images, labels, rank_slice):
     return rank_loss, grads
 
 
+def _apply_sgd_step(parameters, gradients):
+    """Apply stateless in-place SGD without allocating state for empty local shards."""
+    for parameter, gradient in zip(parameters, gradients):
+        parameter.add_(gradient, alpha=-_LR)
+
+
 def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=False):
     """Train a fully_shard SlimLeNet16 and a single-card reference in step, comparing loss + grad shards."""
     ms.set_context(mode=ms.PYNATIVE_MODE)
@@ -233,14 +199,9 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
     state_dict = {name: Tensor(param.asnumpy().copy(), ms.float32)
                   for name, param in reference_net.parameters_dict().items()}
     fsdp_net = _build_fully_shard_net(state_dict, mesh, recompute=recompute, comm_fusion=comm_fusion)
-    fsdp_optimizer = nn.SGD(fsdp_net.trainable_params(), learning_rate=_LR)
-    reference_optimizer = nn.SGD(reference_net.trainable_params(), learning_rate=_LR)
 
     local_bs = _GLOBAL_BS // world_size
     rank_slice = slice(rank * local_bs, (rank + 1) * local_bs)
-    if comm_fusion and not hsdp and not recompute:
-        _assert_comm_fusion_zero_copy_falls_back_to_copy_in(state_dict, mesh, rank_slice)
-
     for step in range(_NUM_STEPS):
         images, labels = _step_batch(step, world_size)
         fsdp_loss, fsdp_grads = _fully_shard_backward(fsdp_net, images[rank_slice], labels[rank_slice])
@@ -254,9 +215,9 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
                                            _to_numpy(full_grad), _to_numpy(local_grad), shard_size, shard_coord)
 
         with SkipDTensorDispatch(), _no_grad():
-            fsdp_optimizer(fsdp_grads)
+            _apply_sgd_step(fsdp_net.trainable_params(), fsdp_grads)
         with _no_grad():
-            reference_optimizer(reference_grads)
+            _apply_sgd_step(reference_net.trainable_params(), reference_grads)
 
     print(f"[Rank {rank}] {case_name} passed: world_size={world_size}, mesh={mesh.shape}, "
           f"steps={_NUM_STEPS}, recompute={recompute}, comm_fusion={comm_fusion}")
@@ -264,10 +225,10 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
 
 def test_ms_fully_shard_with_gradient_accumulation():
     """
-    Feature: 1D dp fully_shard with prefetch and sharded-form gradient accumulation.
+    Feature: 1D dp fully_shard with uneven parameters, prefetch, and sharded-form gradient accumulation.
     Description: Train a fully_shard SlimLeNet16 and an identical single-card reference for several
                  optimizer steps, accumulating gradients in sharded form over micro-batches each step.
-    Expectation: Per-rank loss and every parameter's gradient shard match the reference at every step.
+    Expectation: Per-rank loss and every even or uneven parameter gradient shard match the reference at every step.
     """
     run_precision_case(case_name="fully_shard with gradient accumulation")
 

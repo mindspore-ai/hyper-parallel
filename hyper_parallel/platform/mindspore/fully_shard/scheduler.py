@@ -94,10 +94,12 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         return self._register_post_backward_hook(args, kwargs)
 
     def _register_backward_pre_hook(self, outputs):
-        """Register output hook to trigger backward pre hook."""
+        """Register gradient hooks on outputs to trigger backward pre hook."""
         flat_outputs, _ = tree_flatten(outputs)
         for output in flat_outputs:
             if isinstance(output, ms.Tensor) and output._requires_grad:
+                # Removing a MindSpore tensor hook from its own callback corrupts autograd callback traversal.
+                # The output tensor owns this hook for the lifetime of its graph, so no separate cleanup is needed.
                 output.register_hook(self._backward_pre_hook)
         return outputs
 
@@ -159,9 +161,9 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _finalize_per_param_reductions(self) -> None:
         """Drain the module-tree-local comm_fusion=False communication queues."""
-        previous_groups = self.hsdp_state._wait_prev_reduce_scatter()
+        last_all_reduce_groups = self.hsdp_state._wait_prev_reduce_scatter()
         self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce()
-        self.hsdp_state._issue_prev_fused_all_reduce(previous_groups)
+        self.hsdp_state._issue_prev_fused_all_reduce(last_all_reduce_groups)
         self.hsdp_state.wait_and_split_all_reduce_work_groups()
 
     def launch_tp_replicate_reduce_and_apply(self) -> None:
@@ -177,7 +179,7 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
                     reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
                 if reduced_grad is None:
                     continue
-                hsdp_param.all_reduce_tp_replicate_grad_inplace(
+                hsdp_param.all_reduce_source_replicate_grad_inplace(
                     reduced_grad,
                     hsdp_state.reduce_op_type,
                 )

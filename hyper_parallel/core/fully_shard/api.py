@@ -17,7 +17,12 @@ from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
 from hyper_parallel.platform.platform import PlatformType
-from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy, SourceShardMetaInfo
+from hyper_parallel.core.fully_shard.utils import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+    SourceShardMetaInfo,
+)
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
@@ -733,6 +738,7 @@ def fully_shard(
 
         offload_policy (OffloadPolicy, default=OffloadPolicy()):
             Memory offload policy for reducing device memory usage.
+            ``CPUOffloadPolicy`` is currently unsupported on MindSpore.
 
         ignored_params (Optional[set[nn.Parameter]], default=None):
             Set of parameters to exclude from fully_shard management entirely.
@@ -761,7 +767,8 @@ def fully_shard(
             When enabled, fully_shard may rebase sharded local parameter storage
             into one shared flat buffer so fused all-gather can read directly from
             contiguous memory. This path depends on optimizer compatibility with
-            view-backed parameters.
+            view-backed parameters. MindSpore rejects an explicit ``True`` value
+            because its optimizers do not update view-backed Parameter storage.
         source_shard_infos (Optional[Mapping[nn.Parameter, SourceShardMetaInfo]]):
             Source TP/EP mesh and placements for the plain-parameter dual mode.
             This interface is currently supported by the Torch backend only.
@@ -775,6 +782,17 @@ def fully_shard(
     if source_shard_infos is not None and platform_type != PlatformType.PYTORCH:
         raise NotImplementedError("source_shard_infos is currently supported only on the Torch backend")
     if platform_type == PlatformType.MINDSPORE:
+        if comm_fusion_zero_copy:
+            raise NotImplementedError(
+                "comm_fusion_zero_copy=True is not supported on MindSpore because its optimizers "
+                "do not update view-backed Parameter storage. Omit comm_fusion_zero_copy or set it "
+                "to False to use copy-in communication fusion."
+            )
+        if isinstance(offload_policy, CPUOffloadPolicy):
+            raise NotImplementedError(
+                "CPUOffloadPolicy is not supported by fully_shard on MindSpore because operator "
+                "outputs do not preserve CPU tensor storage."
+            )
         from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
         enable_mindspore_backward_compat()

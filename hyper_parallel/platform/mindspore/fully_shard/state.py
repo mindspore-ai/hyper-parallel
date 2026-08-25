@@ -15,12 +15,13 @@
 """MindSpore HSDP state aligned with the Torch fully_shard lifecycle."""
 
 from collections import defaultdict
-from typing import List
+from typing import List, Optional
 
 import mindspore as ms
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
-from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos, unwrap_dtensor_param
+from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
 from hyper_parallel.core.fully_shard.utils import (
     CPUOffloadPolicy,
     DDPMeshInfo,
@@ -39,7 +40,7 @@ from hyper_parallel.tools.logging import get_logger
 logger = get_logger("FSDP")
 
 
-def _to_dtype_if_needed(tensor: ms.Tensor, dtype: ms.Type | None) -> ms.Tensor:
+def _to_dtype_if_needed(tensor: ms.Tensor, dtype: Optional[ms.Type]) -> ms.Tensor:
     """Cast ``tensor`` only when a different MindSpore dtype is requested."""
     if isinstance(dtype, ms.Type) and tensor.dtype != dtype:
         return tensor.to(dtype)
@@ -86,9 +87,8 @@ class MindSporeHSDPStateV2(HSDPState):
         self.param_group = HSDPParamGroup(
             self.hsdp_params,
             self.device,
-            self.mp_policy,
-            # MindSpore does not provide the view + in-place semantics needed by
-            # the Torch parameter-group zero-copy path. Keep the safe copy path.
+            # MindSpore optimizers do not update view-backed Parameter storage,
+            # so the supported communication-fusion path always uses copy-in.
             False,
             comm_ctx=self.scheduler_ctx.param_group_comm_ctx,
         )
@@ -111,12 +111,11 @@ class MindSporeHSDPStateV2(HSDPState):
     @staticmethod
     def _build_param_source_shard_info(param):
         """Build normalized source-layout metadata for a native DTensor parameter."""
-        dtensor_payload = unwrap_dtensor_param(param)
-        if dtensor_payload is None:
+        if not isinstance(param, DTensor):
             return None
         return SourceShardMetaInfo(
-            mesh=dtensor_payload.device_mesh,
-            placements=tuple(dtensor_payload.placements),
+            mesh=param.device_mesh,
+            placements=tuple(param.placements),
             origin_is_dtensor=True,
         )
 
@@ -239,10 +238,6 @@ class MindSporeHSDPStateV2(HSDPState):
                 reduce_scatter_reduce_op=self.reduce_op_type,
             )
 
-    def _resolve_reduce_op(self) -> str:
-        """Return the active mint reduction operation."""
-        return self.reduce_op_type
-
     def post_backward(self, *unused) -> None:  # pylint: disable=unused-argument
         """Accumulate gradients, reshard parameters, and launch reductions."""
         logger.debug(
@@ -314,14 +309,16 @@ class MindSporeHSDPStateV2(HSDPState):
                 hsdp_params=hsdp_params,
                 reduce_op=self.reduce_op_type,
             )
+            group.allocate_fused_buffer(self.device)
             logger.debug(
                 "post_backward module=%s launch=fused_reduce_scatter group_params=%s",
                 self,
                 hsdp_params,
             )
-            for hsdp_param in hsdp_params:
+            for index, hsdp_param in enumerate(hsdp_params):
                 hsdp_param.reduce_scatter_grad(
                     reduce_op=self.reduce_op_type,
+                    output_buffer=group.get_param_buffer_view(index),
                 )
             self.scheduler_ctx.pre_all_reduce_groups.append(group)
 
@@ -339,6 +336,11 @@ class MindSporeHSDPStateV2(HSDPState):
             )
             for hsdp_param in previous_group.hsdp_params:
                 hsdp_param.reduce_scatter_output()
+                hsdp_param.clear_reduce_scatter_output()
+                if hsdp_param.unsharded_accumulated_grad_data is not None:
+                    hsdp_param.unsharded_accumulated_grad = None
+                elif hsdp_param.unsharded_param.grad is not None:
+                    hsdp_param.unsharded_param.grad = None
         return previous_groups
 
     def _issue_prev_fused_all_reduce(self, previous_groups: List[AllReduceParamGroup]) -> None:
@@ -367,21 +369,16 @@ class MindSporeHSDPStateV2(HSDPState):
                 if hsdp_param.reduce_partial_output is None:
                     hsdp_param.reduce_partial_output = reduced_grad
                 else:
-                    hsdp_param.reduce_partial_output = ms.mint.add(
-                        hsdp_param.reduce_partial_output,
-                        reduced_grad,
-                    )
+                    hsdp_param.reduce_partial_output.add_(reduced_grad)
                 hsdp_param.clear_reduce_scatter_output()
             elif hsdp_param.reduce_partial_output is not None:
-                reduced_grad = ms.mint.add(
-                    reduced_grad,
-                    hsdp_param.reduce_partial_output,
-                )
-                hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = reduced_grad
+                reduced_grad.add_(hsdp_param.reduce_partial_output)
                 hsdp_param.reduce_partial_output = None
-            else:
-                hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = reduced_grad
-            hsdp_param.clear_unsharded_source_grad()
+
+            if hsdp_param.unsharded_accumulated_grad_data is not None:
+                hsdp_param.unsharded_accumulated_grad = None
+            elif hsdp_param.unsharded_param.grad is not None:
+                hsdp_param.unsharded_param.grad = None
 
     def wait_and_split_all_reduce_work_groups(self) -> None:
         """Wait fused all-reduce work and expose each parameter result."""
@@ -398,21 +395,22 @@ class MindSporeHSDPStateV2(HSDPState):
         """Clear communication bookkeeping without clearing optimizer gradients."""
         self.scheduler_ctx.pre_reduce_scatter_params.clear()
         self.scheduler_ctx.pre_all_reduce_params.clear()
-        self.scheduler_ctx.pre_direct_all_reduce_grads.clear()
         self.scheduler_ctx.pre_all_reduce_groups.clear()
         self.scheduler_ctx.pending_all_reduce_groups.clear()
         if self.param_group is not None:
             self.param_group.reset_iter_state()
         for hsdp_param in self.hsdp_params:
-            hsdp_param.allgather_comm_ctx.allgather_input = None
-            hsdp_param.allgather_comm_ctx.allgather_output = None
             hsdp_param.allgather_comm_ctx.allgather_handle = None
+            hsdp_param.allgather_comm_ctx.allgather_output = None
             hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_handle = None
-            hsdp_param.clear_reduce_scatter_output()
+            hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = None
             hsdp_param.all_reduce_comm_ctx.all_reduce_handle = None
-            hsdp_param.clear_all_reduce_output()
+            hsdp_param.all_reduce_comm_ctx.all_reduce_output = None
             hsdp_param.reduce_partial_output = None
-            hsdp_param.clear_unsharded_source_grad()
+            hsdp_param.unsharded_accumulated_grad = None
+            hsdp_param._grad = None
+            if hsdp_param.unsharded_param_buffers:
+                hsdp_param.unsharded_param.grad = None
 
     def set_requires_grad_sync(self, requires_grad_sync: bool) -> None:
         """Set whether this state synchronizes gradients in backward."""
