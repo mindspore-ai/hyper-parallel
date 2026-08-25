@@ -516,9 +516,10 @@ def test_act_swap_function_mode():
 class _SwapTensorTransformerBlock(nn.Cell):
     """Transformer block variant that optionally swaps selected activations."""
 
-    def __init__(self, dim=256, num_heads=4, swap_tensor_on=False):
+    def __init__(self, dim=256, num_heads=4, swap_tensor_on=False, group_swap=False):
         super().__init__()
         self.swap_tensor_on = swap_tensor_on
+        self.group_swap = group_swap
         self.attn = SelfAttention(dim, num_heads)
         self.norm1 = nn.LayerNorm((dim,))
         self.norm2 = nn.LayerNorm((dim,))
@@ -531,27 +532,50 @@ class _SwapTensorTransformerBlock(nn.Cell):
     def construct(self, x):
         """TransformerBlock construct"""
         attn_out = self.attn(x)
+        attn_residual = x + attn_out
         if self.swap_tensor_on:
-            attn_out = swap_tensor_wrapper(attn_out, tag="attn_out")
-        x = x + attn_out
-        x = self.norm1(x)
+            # This residual is consumed by LayerNorm, whose backward needs its input.
+            # It is not the block output, so the layer swap hook can offload it.
+            attn_residual = swap_tensor_wrapper(
+                attn_residual, tag="attn_residual", group_swap=self.group_swap
+            )
+        norm1_out = self.norm1(attn_residual)
         if self.swap_tensor_on:
-            x = swap_tensor_wrapper(x, tag="norm1_out")
-        x = x + self.ffn(x)
-        x = self.norm2(x)
+            # FFN backward consumes this normalized activation as its input.
+            norm1_out = swap_tensor_wrapper(
+                norm1_out, tag="norm1_out", group_swap=self.group_swap
+            )
+        ffn_residual = norm1_out + self.ffn(norm1_out)
         if self.swap_tensor_on:
-            x = swap_tensor_wrapper(x, tag="norm2_out")
-        return x
+            # The following LayerNorm consumes this residual during backward.
+            ffn_residual = swap_tensor_wrapper(
+                ffn_residual, tag="ffn_residual", group_swap=self.group_swap
+            )
+        return self.norm2(ffn_residual)
 
 
 class _SwapTensorTransformer(nn.Cell):
     """SimpleTransformer variant that uses swap_tensor_wrapper() in each block."""
 
-    def __init__(self, vocab_size=32000, dim=2048, depth=16, swap_tensor_on=False):
+    def __init__(
+        self,
+        vocab_size=32000,
+        dim=2048,
+        depth=16,
+        swap_tensor_on=False,
+        group_swap=False,
+    ):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.layers = nn.CellList(
-            [_SwapTensorTransformerBlock(dim, swap_tensor_on=swap_tensor_on) for _ in range(depth)]
+            [
+                _SwapTensorTransformerBlock(
+                    dim,
+                    swap_tensor_on=swap_tensor_on,
+                    group_swap=group_swap,
+                )
+                for _ in range(depth)
+            ]
         )
         self.norm = nn.LayerNorm((dim,))
         self.head = nn.Dense(dim, vocab_size, has_bias=False)
@@ -571,13 +595,20 @@ def run_one_swap_tensor_mode(mode: str, train_steps: int = 3, seed: int = 42) ->
     data_list = prepare_data()
     try:
         with seed_memory_time_context(seed=seed) as stats:
-            vocab_size, dim, depth = 32000, 2048, 6
+            # Keep this focused interface test runnable when other ST workers share
+            # the NPU.  The selected activations remain large enough to exercise
+            # both per-tensor and group swap paths.
+            vocab_size, dim, depth = 10000, 1024, 6
 
             if mode == "none":
                 model = _SwapTensorTransformer(vocab_size=vocab_size, dim=dim, depth=depth)
-            elif mode == "swap_tensor":
+            elif mode in ("swap_tensor", "group_swap"):
                 model = _SwapTensorTransformer(
-                    vocab_size=vocab_size, dim=dim, depth=depth, swap_tensor_on=True
+                    vocab_size=vocab_size,
+                    dim=dim,
+                    depth=depth,
+                    swap_tensor_on=True,
+                    group_swap=mode == "group_swap",
                 )
                 for i in range(len(model.layers) - 1):
                     SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
@@ -629,8 +660,9 @@ def run_one_swap_tensor_mode_in_subprocess(mode: str, train_steps: int = 3, seed
         if marker in line:
             return json.loads(line[line.find(marker) + len(marker):])
 
+    failure = f" exited with code {completed.returncode}" if completed.returncode else ""
     raise RuntimeError(
-        f"Mode {mode!r} did not produce a result marker.\n"
+        f"Mode {mode!r}{failure} before producing a result marker.\n"
         f"STDOUT:\n{completed.stdout}\n"
         f"STDERR:\n{completed.stderr}"
     )
@@ -639,18 +671,19 @@ def run_one_swap_tensor_mode_in_subprocess(mode: str, train_steps: int = 3, seed
 def test_act_swap_tensor_function_mode():
     """
     Feature: swap_tensor_wrapper() Function Interface
-    Description: Compare peak memory usage across two modes:
-                 'none' (baseline) and 'swap_tensor' (manually offload selected
-                 block outputs via swap_tensor_wrapper()).
+    Description: Compare peak memory usage across three modes:
+                 'none' (baseline), 'swap_tensor' (manually offload selected
+                 block outputs via swap_tensor_wrapper()), and 'group_swap'
+                 (enable group copy fusion for the same wrapper calls).
                  Validate that losses are numerically identical at every training
-                 step and that swap_tensor reduces peak memory usage.
-    Expectation: NONE > SWAP_TENSOR in peak memory usage, and both modes
-                 produce consistent losses without OOM.
+                 step and that both swap modes reduce peak memory usage.
+    Expectation: NONE > SWAP_TENSOR and NONE > GROUP_SWAP in peak memory usage,
+                 and all modes produce consistent losses without OOM.
     """
-    print("Starting swap_tensor_wrapper() comparison: none vs swap_tensor")
+    print("Starting swap_tensor_wrapper() comparison: none vs swap_tensor vs group_swap")
     train_steps = 3
 
-    modes = ["none", "swap_tensor"]
+    modes = ["none", "swap_tensor", "group_swap"]
     results = {}
 
     for mode in modes:
@@ -677,17 +710,19 @@ def test_act_swap_tensor_function_mode():
     tol = 1e-4
     for step in range(train_steps):
         base_val = base_losses[step]
-        val = results["swap_tensor"]["losses"][step]
-        diff = abs(val - base_val)
-        assert diff < tol, (
-            f"Loss mismatch at step {step} in mode 'swap_tensor': "
-            f"none={base_val:.8f}, swap_tensor={val:.8f}, diff={diff:.2e}"
-        )
+        for mode in ["swap_tensor", "group_swap"]:
+            val = results[mode]["losses"][step]
+            diff = abs(val - base_val)
+            assert diff < tol, (
+                f"Loss mismatch at step {step} in mode '{mode}': "
+                f"none={base_val:.8f}, {mode}={val:.8f}, diff={diff:.2e}"
+            )
     print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
 
     mem_none = results["none"]["peak_mem_gb"]
-    mem_swap_tensor = results["swap_tensor"]["peak_mem_gb"]
-    assert mem_none > mem_swap_tensor, (
-        f"Expected NONE ({mem_none:.5f}) > SWAP_TENSOR ({mem_swap_tensor:.5f})"
-    )
-    print(f"Verified: NONE ({mem_none:.5f}) > SWAP_TENSOR ({mem_swap_tensor:.5f})")
+    for mode in ["swap_tensor", "group_swap"]:
+        mem_swap = results[mode]["peak_mem_gb"]
+        assert mem_none > mem_swap, (
+            f"Expected NONE ({mem_none:.5f}) > {mode.upper()} ({mem_swap:.5f})"
+        )
+        print(f"Verified: NONE ({mem_none:.5f}) > {mode.upper()} ({mem_swap:.5f})")

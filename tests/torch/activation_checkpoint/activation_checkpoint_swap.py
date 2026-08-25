@@ -165,9 +165,10 @@ class _SwapFnTransformer(SimpleTransformer):
 class _TransformerBlock(nn.Module):
     """A simple Transformer block for testing purposes."""
 
-    def __init__(self, dim=256, num_heads=4, swap_tensor_on=False):
+    def __init__(self, dim=256, num_heads=4, swap_tensor_on=False, group_swap=False):
         super().__init__()
         self.swap_tensor_on = swap_tensor_on
+        self.group_swap = group_swap
         self.dim = dim
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
@@ -181,16 +182,16 @@ class _TransformerBlock(nn.Module):
     def forward(self, x):
         """TransformerBlock forwardS"""
         attn_out, _ = self.attn(x, x, x)
-        if self.swap_tensor_on:
-            attn_out = swap_tensor_wrapper(attn_out, tag="attn_out")
         x = x + attn_out
+        if self.swap_tensor_on:
+            x = swap_tensor_wrapper(x, tag="attn_residual", group_swap=self.group_swap)
         x = self.norm1(x)
         if self.swap_tensor_on:
-            x = swap_tensor_wrapper(x, tag="norm1_out")
+            x = swap_tensor_wrapper(x, tag="norm1_out", group_swap=self.group_swap)
         x = x + self.ffn(x)
-        x = self.norm2(x)
         if self.swap_tensor_on:
-            x = swap_tensor_wrapper(x, tag="norm2_out")
+            x = swap_tensor_wrapper(x, tag="ffn_residual", group_swap=self.group_swap)
+        x = self.norm2(x)
         return x
 
 
@@ -198,10 +199,24 @@ class _TransformerBlock(nn.Module):
 class _SwapTensorTransformer(nn.Module):
     """A simple Transformer model for testing purposes."""
 
-    def __init__(self, vocab_size=1000, dim=2048, depth=6, swap_tensor_on=False):
+    def __init__(
+        self,
+        vocab_size=1000,
+        dim=2048,
+        depth=6,
+        swap_tensor_on=False,
+        group_swap=False,
+    ):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
-        self.layers = nn.ModuleList([_TransformerBlock(dim, swap_tensor_on=swap_tensor_on) for _ in range(depth)])
+        self.layers = nn.ModuleList([
+            _TransformerBlock(
+                dim,
+                swap_tensor_on=swap_tensor_on,
+                group_swap=group_swap,
+            )
+            for _ in range(depth)
+        ])
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, vocab_size)
 
@@ -255,7 +270,7 @@ def _build_swap_tensor_model(mode: str) -> torch.nn.Module:
     """Build and configure a model using the swap_tensor_wrapper() interface.
 
     Args:
-        mode: One of 'none' or 'swap_tensor'.
+        mode: One of 'none', 'swap_tensor', or 'group_swap'.
 
     Returns:
         Configured model placed on NPU.
@@ -268,8 +283,14 @@ def _build_swap_tensor_model(mode: str) -> torch.nn.Module:
     if mode == "none":
         # return SimpleTransformer(vocab_size=vocab_size, dim=dim, depth=depth).npu()
         return _SwapTensorTransformer(vocab_size=vocab_size, dim=dim, depth=depth).npu()
-    if mode == "swap_tensor":
-        model = _SwapTensorTransformer(vocab_size=vocab_size, dim=dim, depth=depth, swap_tensor_on=True).npu()
+    if mode in ("swap_tensor", "group_swap"):
+        model = _SwapTensorTransformer(
+            vocab_size=vocab_size,
+            dim=dim,
+            depth=depth,
+            swap_tensor_on=True,
+            group_swap=mode == "group_swap",
+        ).npu()
         for i in range(len(model.layers) - 1):
             SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
         return model
@@ -351,19 +372,21 @@ def test_act_swap_tensor_function_mode():
     """
     Feature: swap_tensor_wrapper() Function Interface
     Description: Validate the declarative tensor swap interface by comparing
-                 training across two modes: 'none' (baseline) and
-                 'swap_tensor' (manually offload each transformer block output
-                 via swap_tensor_wrapper()).
+                 training across three modes: 'none' (baseline),
+                 'swap_tensor' (manually offload selected transformer activations
+                 via swap_tensor_wrapper()), and 'group_swap' (offload the same
+                 activations with group copy fusion enabled).
                  Asserts that losses are numerically identical at every
                  training step and that device memory is reduced when swap is applied.
     Expectation: All modes produce consistent losses (within 1e-5 tolerance),
-                 and NONE > SWAP_TENSOR in peak device memory.
+                 and NONE > SWAP_TENSOR and NONE > GROUP_SWAP in peak device memory.
     """
-    print("Starting swap_tensor_wrapper() comparison: none vs swap_tensor")
-    dataloader = prepare_data()
+    print("Starting swap_tensor_wrapper() comparison: none vs swap_tensor vs group_swap")
+    # Each selected activation is 8 MiB, allowing all three to share one 32 MiB group-copy bucket.
+    dataloader = prepare_data(batch_size=2)
     train_steps = 3
 
-    modes = ["none", "swap_tensor"]
+    modes = ["none", "swap_tensor", "group_swap"]
 
     results = {}
 
@@ -393,13 +416,22 @@ def test_act_swap_tensor_function_mode():
     tol = 1e-5
     for step in range(train_steps):
         base_val = base_losses[step]
-        val = results["swap_tensor"]["losses"][step]
-        diff = abs(val - base_val)
-        assert diff < tol, (
-            f"Loss mismatch at step {step} in mode 'swap_tensor': "
-            f"none={base_val:.8f}, swap_tensor={val:.8f}, diff={diff:.2e}"
-        )
+        for mode in ["swap_tensor", "group_swap"]:
+            val = results[mode]["losses"][step]
+            diff = abs(val - base_val)
+            assert diff < tol, (
+                f"Loss mismatch at step {step} in mode '{mode}': "
+                f"none={base_val:.8f}, {mode}={val:.8f}, diff={diff:.2e}"
+            )
     print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
+
+    mem_none = results["none"]["peak_mem_gb"]
+    for mode in ["swap_tensor", "group_swap"]:
+        mem_swap = results[mode]["peak_mem_gb"]
+        assert mem_none > mem_swap, (
+            f"Expected NONE ({mem_none:.5f}) > {mode.upper()} ({mem_swap:.5f})"
+        )
+        print(f"Verified: NONE ({mem_none:.5f}) > {mode.upper()} ({mem_swap:.5f})")
 
 
 class _SmallNet(torch.nn.Module):
