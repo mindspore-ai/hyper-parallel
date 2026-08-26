@@ -325,6 +325,35 @@ class ShardingPlanner:
                 )
             plan.modules[boundary_fqn] = spec
 
+        # Architecture-specific templates (Phase 1-4): DSA/MHC boundaries that
+        # do not fit the generic attention/mlp/norm structural patterns are
+        # matched by the canonical architecture name and derived here, subject
+        # to the same derivation semantics as the generic templates
+        # (derive=False skips them via the early return above).
+        self._derive_architecture_specs(plan, model, arch)
+
+    def _derive_architecture_specs(
+        self, plan: ShardingPlan, model: Any, arch: str,
+    ) -> None:
+        """Derive DSA/MHC architecture-template specs, matched by arch name.
+
+        The generic structural templates cover standard attention/mlp/norm/
+        embed/lm_head boundaries; the DSA/MHC builders cover the model-specific
+        leaves (head-sharded index/query projections, MHC pre-modules, sink
+        parameters).  The builders emit fully self-declared specs, so they are
+        assigned directly into the plan — exactly like the generic templates'
+        output — and need no override-style merge/insert matching (that
+        machinery now serves only user plan_overrides in Phase 4.5).
+        """
+        for architectures, builder in (
+            (DSA_ARCHITECTURES, build_dsa_specs),
+            (MHC_ARCHITECTURES, build_mhc_specs),
+        ):
+            if arch not in architectures:
+                continue
+            for fqn, spec in builder(model).items():
+                plan.modules[fqn] = spec
+
     def _finalize_boundary_specs(
         self,
         plan: ShardingPlan,
@@ -332,10 +361,9 @@ class ShardingPlanner:
         *,
         tp_size: int,
         mesh_dim_names: Tuple[str, ...],
-        arch: Optional[str] = None,
     ) -> None:
         """Normalize overrides and finish placement-dependent boundary metadata."""
-        self._merge_plan_overrides(plan, model, arch=arch)
+        self._merge_plan_overrides(plan, model)
         self._normalize_contract_fields(plan)
         self._finalize_tp_local_attr_plans(plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names)
         self._finalize_deferred_biases(plan, model, mesh_dim_names)
@@ -454,7 +482,6 @@ class ShardingPlanner:
         # the derived spec) / insert mode (fully self-declared only) / glob.
         self._finalize_boundary_specs(
             plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names,
-            arch=arch,
         )
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
@@ -1131,7 +1158,7 @@ class ShardingPlanner:
     def _is_glob_key(cls, key: str) -> bool:
         return any(c in key for c in cls._GLOB_CHARS)
 
-    def _merge_plan_overrides(self, plan: ShardingPlan, model, arch=None) -> None:
+    def _merge_plan_overrides(self, plan: ShardingPlan, model) -> None:
         """Unified override pass, executed before Phase 5 and the D-14 checks.
 
         Three modes:
@@ -1172,26 +1199,10 @@ class ShardingPlanner:
         - user spec objects are never mutated (merge reads them, insert
           deep-copies them) — plan() can be called repeatedly.
         """
-        entries: List[Tuple[str, ModuleShardingSpec, str]] = []
-        # ``derive=False`` is the pure declaration mode: only explicit
-        # plan_overrides may enter the plan.  Architecture templates are a
-        # form of derivation as well, and leaking these architecture
-        # templates here makes activation-only CP plans unexpectedly own
-        # parameters.
-        if self._derive and arch in DSA_ARCHITECTURES:
-            entries.extend(
-                (fqn, spec, "dsa_template")
-                for fqn, spec in build_dsa_specs(model).items()
-            )
-        if self._derive and arch in MHC_ARCHITECTURES:
-            entries.extend(
-                (fqn, spec, "mhc_template")
-                for fqn, spec in build_mhc_specs(model).items()
-            )
-        entries.extend([
+        entries: List[Tuple[str, ModuleShardingSpec, str]] = [
             (fqn, spec, "plan_overrides")
             for fqn, spec in self._plan_overrides.items()
-        ])
+        ]
         if not entries:
             return
 
