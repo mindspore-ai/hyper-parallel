@@ -20,11 +20,19 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from hyper_parallel.auto_models.components.datasets.llm._indexed_helpers_cpp import (
-    build_blending_indices as _build_blending_indices_cpp,
-    build_sample_index_int32,
-    build_sample_index_int64,
-)
+try:
+    from hyper_parallel.auto_models.components.datasets.llm._indexed_helpers_cpp import (
+        build_blending_indices as _build_blending_indices_cpp,
+        build_sample_index_int32,
+        build_sample_index_int64,
+    )
+except ImportError as error:
+    raise ImportError(
+        "The native indexed Dataset helpers are not built. From the HyperParallel repository root, run "
+        "`bash build.sh --multicore off --shmem off --custom-ops off`. If HyperParallel is not installed in "
+        "editable mode, then install the generated wheel with "
+        "`pip install --force-reinstall dist/hyper_parallel-*.whl`."
+    ) from error
 
 
 def build_sample_index(

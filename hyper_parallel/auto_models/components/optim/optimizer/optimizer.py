@@ -14,23 +14,13 @@
 # ============================================================================
 """YAML-targeted optimizer implementations."""
 
-import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import logging
 
 from torch import nn
-
-from hyper_parallel.auto_models.components.distributed.init_utils import (
-    get_global_rank_safe,
-)
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 
 logger = logging.getLogger(__name__)
-
-
-def _info_rank0(message: str, *args: Any) -> None:
-    """Log an informational message only on global rank zero."""
-    if get_global_rank_safe() == 0:
-        logger.info(message, *args)
 
 
 # adapted from https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer_pt_utils.py#L1123
@@ -139,10 +129,7 @@ class AdamW:
             if decay_parameters:
                 param_groups.append({"params": decay_parameters, "weight_decay": weight_decay})
             if no_decay_parameters:
-                _info_rank0(
-                    "Parameters without weight decay: %s",
-                    no_decay_parameter_names,
-                )
+                logger.info_rank0(f"Parameters without weight decay: {no_decay_parameter_names}")
                 param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
 
         return param_groups, adamw_names
@@ -189,13 +176,13 @@ class Muon:
             allowed_param_ids=[id(parameter) for parameter in adamw_params],
         )
 
-        _info_rank0(
+        logger.info_rank0(
             "Muon optimizer split: %s Muon parameters, %s AdamW parameters",
             len(muon_names),
             len(adamw_names),
         )
-        _info_rank0("Muon parameters (first 5): %s", muon_names[:5])
-        _info_rank0("AdamW parameters (first 5): %s", adamw_names[:5])
+        logger.info_rank0("Muon parameters (first 5): %s", muon_names[:5])
+        logger.info_rank0("AdamW parameters (first 5): %s", adamw_names[:5])
 
         self.optimizer = get_hyper_optimizer(
             model=self.model,

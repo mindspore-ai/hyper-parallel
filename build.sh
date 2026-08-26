@@ -24,6 +24,8 @@ function show_help() {
 Usage:
   ./build.sh [OPTIONS]
 
+The indexed Dataset C++ helpers are built on every invocation.
+
 Options:
   --multicore VALUE          Build multicore: off, mindspore/ms, torch/pytorch, all/both.
                              Default: mindspore.
@@ -179,4 +181,20 @@ printf '  %-32s %s\n' "BUILD_SHMEM_EXTENSION" "${BUILD_SHMEM_EXTENSION}"
 printf '  %-32s %s\n' "BUILD_CUSTOM_OPS_EXTENSION" "${BUILD_CUSTOM_OPS_EXTENSION}"
 printf '  %-32s %s\n' "HYPER_PARALLEL_BUILD_STRICT" "${HYPER_PARALLEL_BUILD_STRICT}"
 
-python setup.py bdist_wheel
+INDEXED_HELPERS_DIR="${PROJECT_ROOT}/hyper_parallel/auto_models/components/datasets/llm"
+INDEXED_HELPERS_SOURCE="${INDEXED_HELPERS_DIR}/csrc/indexed_helpers.cpp"
+PYTHON_BIN=${PYTHON:-python}
+CXX_BIN=${CXX:-c++}
+INDEXED_HELPERS_SUFFIX=$("${PYTHON_BIN}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
+INDEXED_HELPERS_OUTPUT="${INDEXED_HELPERS_DIR}/_indexed_helpers_cpp${INDEXED_HELPERS_SUFFIX}"
+
+if ! PYBIND11_INCLUDES=$("${PYTHON_BIN}" -m pybind11 --includes 2>/dev/null); then
+    die "pybind11 is required to build indexed Dataset helpers. Install it with 'pip install pybind11'."
+fi
+read -r -a PYBIND11_INCLUDE_ARGS <<< "${PYBIND11_INCLUDES}"
+
+echo "Building indexed Dataset helpers: ${INDEXED_HELPERS_OUTPUT}"
+"${CXX_BIN}" -O3 -Wall -shared -std=c++17 -fPIC "${PYBIND11_INCLUDE_ARGS[@]}" \
+    "${INDEXED_HELPERS_SOURCE}" -o "${INDEXED_HELPERS_OUTPUT}"
+
+"${PYTHON_BIN}" setup.py bdist_wheel
