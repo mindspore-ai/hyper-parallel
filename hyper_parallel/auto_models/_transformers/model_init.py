@@ -63,15 +63,24 @@ def _init_model(
 
     # ── Path A: HF native ──
     if is_hf_model:
-        # Use HF parent class from_pretrained (meta device if context is set)
-        model = cls._from_pretrained_parent_class(
-            pretrained_model_name_or_path,
-            *model_args,
-            config=hf_config,
-            torch_dtype=torch_dtype,
-            attn_implementation=attn_implementation,
-            **kwargs,
-        )
+        if pretrained_model_name_or_path is None:
+            config_kwargs = dict(kwargs)
+            if torch_dtype != "auto":
+                config_kwargs["dtype"] = torch_dtype
+            config_kwargs["attn_implementation"] = attn_implementation
+            model = getattr(cls, "_from_config_parent_class")(
+                hf_config,
+                **config_kwargs,
+            )
+        else:
+            model = getattr(cls, "_from_pretrained_parent_class")(
+                pretrained_model_name_or_path,
+                *model_args,
+                config=hf_config,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
         return False, model
 
     # ── Path B: Custom model implementation ──
@@ -82,14 +91,23 @@ def _init_model(
             "Custom model class for %s not found; falling back to HF native.",
             arch_name,
         )
-        model = cls._from_pretrained_parent_class(
-            pretrained_model_name_or_path,
-            *model_args,
-            config=hf_config,
-            torch_dtype=torch_dtype,
-            attn_implementation=attn_implementation,
-            **kwargs,
-        )
+        if pretrained_model_name_or_path is None:
+            config_kwargs = dict(kwargs)
+            if torch_dtype != "auto":
+                config_kwargs["dtype"] = torch_dtype
+            config_kwargs["attn_implementation"] = attn_implementation
+            model = getattr(cls, "_from_config_parent_class")(
+                hf_config, **config_kwargs
+            )
+        else:
+            model = getattr(cls, "_from_pretrained_parent_class")(
+                pretrained_model_name_or_path,
+                *model_args,
+                config=hf_config,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
         return False, model
 
     # Instantiate custom model

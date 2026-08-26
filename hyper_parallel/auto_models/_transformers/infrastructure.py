@@ -249,10 +249,12 @@ def _initialize_model_weights(model: nn.Module) -> None:
         tensor._is_hf_initialized = False  # pylint: disable=W0212
 
     initialize_weights = getattr(model, "initialize_weights", None)
+    native_initialization = callable(initialize_weights)
     if callable(initialize_weights):
         initialize_weights()
     else:
         init_weights = getattr(model, "init_weights", None)
+        native_initialization = callable(init_weights)
         if callable(init_weights):
             init_weights()
         else:
@@ -260,6 +262,13 @@ def _initialize_model_weights(model: nn.Module) -> None:
                 reset_parameters = getattr(module, "reset_parameters", None)
                 if callable(reset_parameters):
                     reset_parameters()
+    if native_initialization:
+        for module in model.modules():
+            if not getattr(module, "_hp_reset_after_materialization", False):
+                continue
+            reset_parameters = getattr(module, "reset_parameters", None)
+            if callable(reset_parameters):
+                reset_parameters()
     logger.info("Initialized model state with model-native random initialization")
 
 
@@ -542,6 +551,7 @@ def _apply_module_replacement_actions(
     distributed_setup,
     weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
     low_precision_config=None,
+    capture_checkpoint_metadata: bool = True,
 ) -> tuple[nn.Module, list[WeightRenaming | WeightConverter]]:
     """Apply explicit replacement rules before sharding sees the model."""
 
@@ -598,6 +608,7 @@ def _apply_module_replacement_actions(
         plan,
         weights_mapping=weights_mapping,
         context=context,
+        capture_checkpoint_metadata=capture_checkpoint_metadata,
     )
 
 
@@ -732,6 +743,7 @@ def apply_model_infrastructure(
         distributed_setup,
         weights_mapping,
         low_precision_config=low_precision_config,
+        capture_checkpoint_metadata=load_base_model,
     )
 
     if freeze_config is not None:

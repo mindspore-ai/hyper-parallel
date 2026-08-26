@@ -16,7 +16,7 @@
 
 import json
 import logging
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +77,8 @@ class DCPBackend(Protocol):
 
 @dataclass(frozen=True)
 class _CheckpointIndex:
+    """Map checkpoint tensor names to their safetensors shard files."""
+
     files_by_key: dict[str, Path]
 
     def keys(self) -> tuple[str, ...]:
@@ -98,6 +100,38 @@ class _LoadGroup:
     transform: WeightRenaming | WeightConverter
 
 
+@dataclass(frozen=True)
+class _TensorShape:
+    shape: torch.Size
+
+
+class _SourceModelView:
+    """Expose pre-replacement parameter shapes to Transformers conversion ops."""
+
+    def __init__(self, model: nn.Module, shapes: dict[str, tuple[int, ...]]) -> None:
+        """Build a lightweight model view from captured tensor shapes."""
+        self.config = getattr(model, "config", None)
+        self.base_model_prefix = getattr(model, "base_model_prefix", None)
+        self._targets = {
+            name: _TensorShape(torch.Size(shape)) for name, shape in shapes.items()
+        }
+
+    def get_parameter(self, name: str) -> _TensorShape:
+        """Return source parameter metadata used by shape-aware converters."""
+        try:
+            return self._targets[name]
+        except KeyError as exc:
+            raise AttributeError(f"source model has no parameter {name!r}") from exc
+
+
+@dataclass
+class _ReplacementLoadGroup:
+    group: _LoadGroup
+    expected: Counter[str]
+    received: Counter[str]
+    completed: bool = False
+
+
 def _index_single_file(file_path: Path) -> _CheckpointIndex:
     with safe_open(str(file_path), framework="pt", device="cpu") as checkpoint:
         files_by_key = {key: file_path for key in checkpoint.keys()}
@@ -105,6 +139,8 @@ def _index_single_file(file_path: Path) -> _CheckpointIndex:
 
 
 def _index_sharded_checkpoint(directory: Path, index_path: Path) -> _CheckpointIndex:
+    """Index tensors described by a sharded safetensors index file."""
+
     try:
         index_data = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -123,6 +159,8 @@ def _index_sharded_checkpoint(directory: Path, index_path: Path) -> _CheckpointI
 
 
 def _resolve_checkpoint_index(pretrained_path: str) -> _CheckpointIndex:
+    """Resolve a local or Hub checkpoint into a tensor-to-file index."""
+
     path = Path(pretrained_path).expanduser()
     if path.is_file():
         if path.suffix != ".safetensors":
@@ -157,6 +195,8 @@ def _join_fqn(module_name: str, tensor_name: str) -> str:
 
 
 def _build_load_targets(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Collect persistent parameters and buffers owned by the model."""
+
     targets = {}
     # Direct module registries preserve tied aliases and let us exclude
     # non-persistent buffers without materializing an FSDP state_dict.
@@ -186,6 +226,8 @@ def _build_load_groups(
     tuple[str, ...],
     list[WeightRenaming | WeightConverter],
 ]:
+    """Build checkpoint conversion groups and report unmatched transforms."""
+
     weight_mapping = weights_mapping
     unsupported = [
         transform
@@ -198,11 +240,10 @@ def _build_load_groups(
 
     renamings = [transform for transform in weight_mapping if isinstance(transform, WeightRenaming)]
     converters = [transform for transform in weight_mapping if isinstance(transform, WeightConverter)]
-    converters_by_pattern = {
-        pattern: converter
-        for converter in converters
-        for pattern in converter.source_patterns
-    }
+    converters_by_pattern = defaultdict(list)
+    for converter in converters:
+        for pattern in converter.source_patterns:
+            converters_by_pattern[pattern].append(converter)
     groups: OrderedDict[str, _LoadGroup] = OrderedDict()
     unexpected_keys = []
     base_model_prefix = getattr(model, "base_model_prefix", None)
@@ -231,10 +272,27 @@ def _build_load_groups(
             source_pattern = source_key
             transform = WeightRenaming(source_patterns=source_key, target_patterns=target_name)
         else:
-            converter = converters_by_pattern.get(source_pattern)
+            candidates = converters_by_pattern.get(source_pattern, [])
+            scoped_candidates = [
+                converter
+                for converter in candidates
+                if converter.scope_prefix is not None
+                and (
+                    target_name == converter.scope_prefix
+                    or target_name.startswith(f"{converter.scope_prefix}.")
+                )
+            ]
+            if len(scoped_candidates) == 1:
+                converter = scoped_candidates[0]
+            else:
+                unscoped_candidates = [
+                    converter for converter in candidates if converter.scope_prefix is None
+                ]
+                converter = unscoped_candidates[0] if len(unscoped_candidates) == 1 else None
             if converter is None:
                 raise ValueError(
-                    f"No WeightConverter found for matched source pattern {source_pattern!r}"
+                    "No unique WeightConverter found for matched source pattern "
+                    f"{source_pattern!r} and target {target_name!r}"
                 )
             transform = deepcopy(converter)
 
@@ -252,6 +310,83 @@ def _build_load_groups(
     return tuple(groups.values()), tuple(unexpected_keys), weight_mapping
 
 
+def _build_replacement_routes(
+    model: nn.Module,
+    source_names: tuple[str, ...],
+    targets: dict[str, torch.Tensor],
+    transforms: list[WeightRenaming | WeightConverter],
+) -> dict[str, tuple[_ReplacementLoadGroup, str, str]]:
+    """Route normalized Transformers parameters into replacement converters."""
+    routing_transforms = deepcopy(transforms)
+    renamings = [
+        transform
+        for transform in routing_transforms
+        if isinstance(transform, WeightRenaming)
+    ]
+    converters = [
+        transform
+        for transform in routing_transforms
+        if isinstance(transform, WeightConverter)
+    ]
+    converters_by_pattern = defaultdict(list)
+    for converter in converters:
+        for pattern in converter.source_patterns:
+            converters_by_pattern[pattern].append(converter)
+
+    groups: OrderedDict[str, _ReplacementLoadGroup] = OrderedDict()
+    routes = {}
+    base_model_prefix = getattr(model, "base_model_prefix", None)
+    for source_name in source_names:
+        target_name, source_pattern = rename_source_key(
+            source_name,
+            renamings,
+            converters,
+            base_model_prefix=base_model_prefix,
+            meta_state_dict=targets,
+        )
+        if source_pattern is None and target_name == source_name:
+            continue
+        if target_name not in targets:
+            continue
+
+        if source_pattern is None:
+            collected_pattern = source_name
+            transform: WeightRenaming | WeightConverter = WeightRenaming(
+                source_patterns=source_name,
+                target_patterns=target_name,
+            )
+        else:
+            collected_pattern = source_pattern
+            candidates = converters_by_pattern.get(source_pattern, [])
+            scoped_candidates = [
+                converter
+                for converter in candidates
+                if converter.scope_prefix is not None
+                and (
+                    target_name == converter.scope_prefix
+                    or target_name.startswith(f"{converter.scope_prefix}.")
+                )
+            ]
+            if len(scoped_candidates) != 1:
+                raise ValueError(
+                    "No unique replacement WeightConverter found for source "
+                    f"{source_name!r} and target {target_name!r}"
+                )
+            transform = deepcopy(scoped_candidates[0])
+
+        state = groups.get(target_name)
+        if state is None:
+            state = _ReplacementLoadGroup(
+                group=_LoadGroup(target_name, transform),
+                expected=Counter(),
+                received=Counter(),
+            )
+            groups[target_name] = state
+        state.expected[collected_pattern] += 1
+        routes[source_name] = (state, target_name, collected_pattern)
+    return routes
+
+
 def _local_target_tensor(target: torch.Tensor) -> torch.Tensor:
     return target.to_local() if isinstance(target, DTensor) else target
 
@@ -263,6 +398,8 @@ def _target_layout(target: torch.Tensor) -> Any:
 
 
 def _shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Shard a full checkpoint tensor according to its target layout."""
+
     layout = _target_layout(target)
     if layout is None:
         return full_tensor
@@ -279,6 +416,8 @@ def _shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch
 
 
 def _copy_into_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor) -> None:
+    """Copy a checkpoint tensor into its materialized local target."""
+
     local_tensor = _shard_for_target(target_name, full_tensor, target)
     destination = _local_target_tensor(target)
     if destination.is_meta:
@@ -333,6 +472,26 @@ class CheckpointManager:
 
         checkpoint_index = _resolve_checkpoint_index(pretrained_path)
         targets = _build_load_targets(self.model)
+        replacement_mapping = getattr(
+            self.model,
+            "_hp_replacement_weight_conversions",
+            None,
+        )
+        source_shapes = getattr(
+            self.model,
+            "_hp_checkpoint_source_shapes",
+            None,
+        )
+        if replacement_mapping and source_shapes:
+            return self._load_with_replacement_conversions(
+                checkpoint_index,
+                targets,
+                weights_mapping,
+                replacement_mapping,
+                source_shapes,
+                pretrained_path,
+                strict,
+            )
         groups, unexpected_keys, weight_mapping = _build_load_groups(
             self.model,
             checkpoint_index,
@@ -372,6 +531,90 @@ class CheckpointManager:
             len(report.loaded_keys),
             pretrained_path,
         )
+        return report
+
+    def _load_with_replacement_conversions(
+        self,
+        checkpoint_index: _CheckpointIndex,
+        targets: dict[str, torch.Tensor],
+        weights_mapping: list[WeightRenaming | WeightConverter],
+        replacement_mapping: list[WeightRenaming | WeightConverter],
+        source_shapes: dict[str, tuple[int, ...]],
+        pretrained_path: str,
+        strict: bool,
+    ) -> LoadReport:
+        """Normalize original weights before applying replacement conversions."""
+        replacement_ids = {id(transform) for transform in replacement_mapping}
+        base_mapping = [
+            transform
+            for transform in weights_mapping
+            if id(transform) not in replacement_ids
+        ]
+        source_model = _SourceModelView(self.model, source_shapes)
+        base_groups, unexpected_keys, _ = _build_load_groups(
+            source_model,
+            checkpoint_index,
+            source_model._targets,  # pylint: disable=protected-access
+            weights_mapping=base_mapping,
+        )
+        routes = _build_replacement_routes(
+            self.model,
+            tuple(source_shapes),
+            targets,
+            replacement_mapping,
+        )
+        aliases_by_target = _alias_names_by_target(targets)
+        loaded_keys = set()
+        loaded_target_ids = set()
+        used_replacements = []
+
+        def copy_converted(converted: dict[str, torch.Tensor]) -> None:
+            """Copy converted tensors into their finalized model targets."""
+            nonlocal unexpected_keys
+            for target_name, tensor in converted.items():
+                target = targets.get(target_name)
+                if target is None:
+                    unexpected_keys += (target_name,)
+                    continue
+                tensor = tensor[0] if isinstance(tensor, list) else tensor
+                target_id = id(target)
+                if target_id not in loaded_target_ids:
+                    _copy_into_target(target_name, tensor, target)
+                    loaded_target_ids.add(target_id)
+                loaded_keys.update(aliases_by_target[target_id])
+
+        for base_group in base_groups:
+            normalized = self._convert_group(base_group, model=source_model)
+            for source_name, tensor in normalized.items():
+                tensor = tensor[0] if isinstance(tensor, list) else tensor
+                route = routes.get(source_name)
+                if route is None:
+                    copy_converted({source_name: tensor})
+                    continue
+                state, target_name, source_pattern = route
+                state.group.transform.add_tensor(
+                    target_name,
+                    source_name,
+                    source_pattern,
+                    lambda value=tensor: value,
+                )
+                state.received[source_pattern] += 1
+                if not state.completed and state.received == state.expected:
+                    copy_converted(self._convert_group(state.group))
+                    state.completed = True
+                    used_replacements.append(state.group.transform)
+
+        missing_keys = tuple(sorted(set(targets) - loaded_keys, key=dot_natural_key))
+        unexpected_keys = tuple(sorted(set(unexpected_keys), key=dot_natural_key))
+        self._validate_load_result(missing_keys, unexpected_keys, strict)
+        used_base = [transform for transform in base_mapping if transform.was_used()]
+        self.model._weight_conversions = used_base + used_replacements  # pylint: disable=protected-access
+        report = LoadReport(
+            loaded_keys=tuple(sorted(loaded_keys, key=dot_natural_key)),
+            missing_keys=missing_keys,
+            unexpected_keys=unexpected_keys,
+        )
+        logger.info("Loaded %d model tensors from %s", len(report.loaded_keys), pretrained_path)
         return report
 
     def save_pretrained(
@@ -436,12 +679,19 @@ class CheckpointManager:
             **kwargs,
         )
 
-    def _convert_group(self, group: _LoadGroup) -> dict[str, torch.Tensor]:
+    def _convert_group(
+        self,
+        group: _LoadGroup,
+        *,
+        model: nn.Module | _SourceModelView | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Convert all checkpoint tensors belonging to one load group."""
+
         try:
             return group.transform.convert(
                 group.first_target_name,
-                model=self.model,
-                config=getattr(self.model, "config", None),
+                model=self.model if model is None else model,
+                config=getattr(self.model if model is None else model, "config", None),
                 hf_quantizer=None,
                 loading_info=None,
             )
@@ -456,6 +706,8 @@ class CheckpointManager:
         unexpected_keys: tuple[str, ...],
         strict: bool,
     ) -> None:
+        """Validate missing keys and report ignored checkpoint tensors."""
+
         if strict and missing_keys:
             preview = ", ".join(missing_keys[:10])
             raise RuntimeError(
@@ -470,6 +722,8 @@ class CheckpointManager:
             )
 
     def _gather_full_state_dict(self, *, keep_state_dict: bool) -> dict[str, Any]:
+        """Gather sharded model tensors into a full CPU state dictionary."""
+
         state_dict = self.model.state_dict(keep_vars=True)
         gathered = {}
         for name, value in state_dict.items():

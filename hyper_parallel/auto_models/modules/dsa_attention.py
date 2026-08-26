@@ -36,6 +36,7 @@ from hyper_parallel.auto_models.ops import (
     dsa_sparse_attention,
     dsa_sparse_attention_rescale,
 )
+from hyper_parallel.auto_models.ops.npu_fusion_attention import resolve_packed_sequence_lengths
 
 
 def apply_mome(
@@ -45,7 +46,7 @@ def apply_mome(
     *,
     fused: bool,
 ) -> torch.Tensor:
-    """Apply Pangu's masked causal depthwise convolution and residual."""
+    """Apply masked causal depthwise convolution and residual."""
     if mome_mask is None:
         raise ValueError("mome_mask is required when MOME is enabled")
     if mome_mask.shape != hidden_states.shape[:2]:
@@ -417,7 +418,8 @@ class DeepseekV32DSAAttention(nn.Module):
         attention_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         topk_indices: torch.Tensor,
         softmax_stats: tuple[torch.Tensor, torch.Tensor],
-        actual_seq_len: torch.Tensor,
+        actual_q_len: torch.Tensor,
+        actual_kv_len: torch.Tensor,
     ) -> torch.Tensor:
         """Attach the DSA KL auxiliary loss when training enables it."""
         if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
@@ -431,7 +433,7 @@ class DeepseekV32DSAAttention(nn.Module):
         aux_loss = dsa_kl_loss(
             index_query_tnd, index_key_tnd, merge_weight_tnd, query_tnd, key_tnd,
             topk_indices, softmax_max, softmax_sum, q_rot_tnd, k_rot_tnd,
-            actual_seq_len, actual_seq_len, self.scaling, self.dsa_loss_coeff,
+            actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
 
@@ -457,15 +459,31 @@ class DeepseekV32DSAAttention(nn.Module):
         index_query, index_key, merge_weight = self._project_index_states(
             hidden_states, q_resid, position_embeddings
         )
-        actual_seq_len = self._get_actual_seq_len(
-            actual_seq_len, batch_size, seq_length, hidden_states.device
+        packed_kwargs = dict(kwargs)
+        packed_kwargs["actual_seq_len"] = actual_seq_len
+        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
+            packed_kwargs,
+            batch_size * seq_length,
+            batch_size * seq_length,
+        )
+        actual_q_len = self._get_actual_seq_len(
+            actual_q_len,
+            batch_size,
+            seq_length,
+            hidden_states.device,
+        )
+        actual_kv_len = self._get_actual_seq_len(
+            actual_kv_len,
+            batch_size,
+            seq_length,
+            hidden_states.device,
         )
         topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
             index_query,
             index_key,
             merge_weight,
-            actual_seq_len,
-            actual_seq_len,
+            actual_q_len,
+            actual_kv_len,
             self.index_topk,
         )
         attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
@@ -475,8 +493,8 @@ class DeepseekV32DSAAttention(nn.Module):
             k_rot,
             topk_indices,
             self.scaling,
-            actual_seq_len,
-            actual_seq_len,
+            actual_q_len,
+            actual_kv_len,
         )
         attn_output = self._apply_auxiliary_loss(
             attn_output,
@@ -484,7 +502,8 @@ class DeepseekV32DSAAttention(nn.Module):
             (absorbed_query_states, kv_nope, q_rot, k_rot),
             topk_indices,
             (softmax_max, softmax_sum),
-            actual_seq_len,
+            actual_q_len,
+            actual_kv_len,
         )
         value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
         attn_output = _restore_attention_projection(
@@ -502,7 +521,7 @@ class DeepseekV32DSAAttention(nn.Module):
 
 @module_replacement
 class DSAAttention(nn.Module):
-    """NPU replacement for a Pangu-compatible DSA attention module.
+    """NPU-optimized replacement for a DSA attention module.
 
     Packed boundaries are supplied through ``actual_seq_len``. Attention masks,
     KV reuse, and KV cache are not supported. The source parameter layout is
@@ -565,7 +584,10 @@ class DSAAttention(nn.Module):
         self.use_fused_mome = bool(getattr(module, "use_fused_mome", False))
         self.param_sink_number = int(getattr(module, "param_sink_number", 0))
         self.param_sink_scalar = getattr(module, "param_sink_scalar", None)
-        self.apply_FA_rescale = bool(getattr(module, "apply_FA_rescale", False))
+        # Preserve the source model's attribute spelling for compatibility.
+        self.apply_FA_rescale = bool(  # pylint: disable=invalid-name
+            getattr(module, "apply_FA_rescale", False)
+        )
         self.attention_dropout = getattr(module, "attention_dropout", nn.Dropout(0.0))
         if self.param_sink_number > 0:
             if self.param_sink_scalar:
@@ -642,7 +664,7 @@ class DSAAttention(nn.Module):
         cache_position: torch.Tensor | None,
         output_attentions: bool,
     ) -> None:
-        """Validate inputs supported by the Pangu-compatible DSA path."""
+        """Validate inputs supported by the optimized DSA path."""
         if attention_mask is not None:
             raise ValueError(
                 "DSAAttention does not consume attention_mask; pass packed sequence "
@@ -717,7 +739,8 @@ class DSAAttention(nn.Module):
         self,
         attention_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         topk_indices: torch.Tensor,
-        actual_seq_len: torch.Tensor,
+        actual_q_len: torch.Tensor,
+        actual_kv_len: torch.Tensor,
         batch_size: int,
         seq_length: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -727,13 +750,13 @@ class DSAAttention(nn.Module):
         if self.param_sink_number <= 0:
             return dsa_sparse_attention(
                 absorbed_query, kv_nope, q_rot, k_rot, topk_indices,
-                sparse_scale, actual_seq_len, actual_seq_len,
+                sparse_scale, actual_q_len, actual_kv_len,
             )
         sink_key, sink_value = self._prepare_param_sink(batch_size)
         return dsa_sparse_attention_rescale(
             absorbed_query, kv_nope, q_rot, k_rot, sink_key, sink_value,
             topk_indices, batch_size, seq_length, self.num_heads, sparse_scale,
-            1 - self.attention_dropout.p, actual_seq_len, actual_seq_len,
+            1 - self.attention_dropout.p, actual_q_len, actual_kv_len,
         )
 
     def _apply_auxiliary_loss(
@@ -743,7 +766,8 @@ class DSAAttention(nn.Module):
         attention_states: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         topk_indices: torch.Tensor,
         softmax_stats: tuple[torch.Tensor, torch.Tensor],
-        actual_seq_len: torch.Tensor,
+        actual_q_len: torch.Tensor,
+        actual_kv_len: torch.Tensor,
     ) -> torch.Tensor:
         """Attach the DSA KL auxiliary loss when training enables it."""
         if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
@@ -757,7 +781,7 @@ class DSAAttention(nn.Module):
         aux_loss = dsa_kl_loss(
             index_query_tnd, index_key_tnd, merge_weight_tnd, query_tnd, key_tnd,
             topk_indices, softmax_max, softmax_sum, q_rot_tnd, k_rot_tnd,
-            actual_seq_len, actual_seq_len, self.qk_head_dim**-0.5, self.dsa_loss_coeff,
+            actual_q_len, actual_kv_len, self.qk_head_dim**-0.5, self.dsa_loss_coeff,
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
 
@@ -773,6 +797,7 @@ class DSAAttention(nn.Module):
         output_attentions: bool = False,
         return_bias: bool = False,
         mome_mask: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run DSA with its configured MOME and parameter-sink paths."""
         self._validate_forward_inputs(
@@ -788,20 +813,30 @@ class DSAAttention(nn.Module):
         index_query, index_key, merge_weight = self._project_index_states(
             hidden_states, q_resid, position_embeddings
         )
-        actual_seq_len = self._get_actual_seq_len(
-            actual_seq_len, batch_size, seq_length, hidden_states.device
+        packed_kwargs = dict(kwargs)
+        packed_kwargs["actual_seq_len"] = actual_seq_len
+        actual_q_len, actual_kv_len = resolve_packed_sequence_lengths(
+            packed_kwargs,
+            batch_size * seq_length,
+            batch_size * seq_length,
+        )
+        actual_q_len = self._get_actual_seq_len(
+            actual_q_len, batch_size, seq_length, hidden_states.device
+        )
+        actual_kv_len = self._get_actual_seq_len(
+            actual_kv_len, batch_size, seq_length, hidden_states.device
         )
         topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
             index_query,
             index_key,
             merge_weight,
-            actual_seq_len,
-            actual_seq_len,
+            actual_q_len,
+            actual_kv_len,
             self.index_topk,
         )
         attention_states = (absorbed_query_states, kv_nope, q_rot, k_rot)
         attn_output, softmax_max, softmax_sum = self._run_sparse_attention(
-            attention_states, topk_indices, actual_seq_len, batch_size, seq_length
+            attention_states, topk_indices, actual_q_len, actual_kv_len, batch_size, seq_length
         )
         attn_output = self._apply_auxiliary_loss(
             attn_output,
@@ -809,7 +844,8 @@ class DSAAttention(nn.Module):
             attention_states,
             topk_indices,
             (softmax_max, softmax_sum),
-            actual_seq_len,
+            actual_q_len,
+            actual_kv_len,
         )
         value_up_weight = kv_weight[:, self.qk_nope_head_dim :].transpose(1, 2)
         attn_output = _restore_attention_projection(
