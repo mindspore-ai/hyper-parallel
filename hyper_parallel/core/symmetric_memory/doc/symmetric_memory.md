@@ -1,6 +1,6 @@
 # Symmetric Memory 模块使用文档
 
-Symmetric Memory（对称内存）模块为 hyper-parallel 提供跨进程的对称内存管理、单边通信、通信函数及融合算子能力，支持高效的进程间同步与数据交互。该模块背景见[【RFC】HyperParallel Symmetric Memory 单边通信特性设计](https://gitcode.com/mindspore/hyper-parallel/issues/59)。当前模块仅对 PyTorch 提供完整支持，MindSpore 支持正在开发中。
+Symmetric Memory（对称内存）模块为 hyper-parallel 提供跨进程的对称内存管理、单边通信、通信函数及融合算子能力，支持高效的进程间同步与数据交互。该模块背景见[【RFC】HyperParallel Symmetric Memory 单边通信特性设计](https://gitcode.com/mindspore/hyper-parallel/issues/59)。PyTorch 支持全部下述接口；MindSpore 已支持内存分配、基础单边通信、信号同步和 `shmem_allgather`，`shmem_alltoall` 与融合算子仍在开发中。
 
 ## 目录
 
@@ -140,7 +140,7 @@ hyper_parallel.core.symmetric_memory.shmem_put_with_signal(
 hyper_parallel.core.symmetric_memory.shmem_allgather(output_tensor, input_tensor) -> None
 ```
 
-**功能**：将所有 rank 的输入张量聚集并拼接至输出张量（仅支持 PyTorch）。
+**功能**：将所有 rank 的输入张量聚集并拼接至输出张量（支持 PyTorch 和 MindSpore）。
 **参数**：
 
 - `output_tensor`: 输出张量（对称内存张量），形状需为 `(world_size * local_shape)`。
@@ -228,7 +228,7 @@ hyper_parallel.core.symmetric_memory.fused_matmul_reduce_scatter(x1, x2, symm_te
 
 ## 注意事项
 
-1. 框架支持：融合算子仅支持 PyTorch，MindSpore 支持待开发；
+1. 框架支持：基础单边通信和 `shmem_allgather` 支持 PyTorch、MindSpore；`shmem_alltoall` 和融合算子目前仅支持 PyTorch；
 2. 张量要求：对称内存相关张量需通过 `symm_mem.empty()` 创建，创建时需要所有进程同步创建，且不同进程的张量大小需严格一致；
 3. 信号操作：信号张量需为 int32 类型，用于进程间同步的原子操作/等待操作；
 4. 通信域：所有通信函数操作需保证通信域内所有进程调用参数一致，避免死锁或数据不一致。

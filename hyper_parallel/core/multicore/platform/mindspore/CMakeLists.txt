@@ -7,71 +7,22 @@ add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)
 set(MS_EXTENSION_NAME "hyper_parallel_mega_moe_ms")
 set(BUILD_EXTENSION_DIR "${CMAKE_BINARY_DIR}/lib")
 
-# =============================================================================
-# Prebuild Auto-Extract
-# If no vendor env var is set, extract prebuild/mega_moe.tar.gz
-# (vendors/ inside contains pre-built vendor libs).
-# =============================================================================
-
-set(_PREBUILD_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../prebuild")
-set(_PREBUILD_DIR  "${_PREBUILD_ROOT}/mega_moe")
-set(_TARBALL       "${_PREBUILD_DIR}.tar.gz")
-
-if(NOT DEFINED ENV{HP_MULTICORE_DIR}
-  AND NOT DEFINED ENV{CANN_VENDOR_FWD_LIBDIR}
-  AND NOT DEFINED ENV{CANN_VENDOR_BWD_LIBDIR}
-  AND NOT DEFINED ENV{CANN_VENDOR_LIBDIR})
-
-    if(NOT IS_DIRECTORY "${_PREBUILD_DIR}" AND EXISTS "${_TARBALL}")
-        message(STATUS "Extracting prebuild: ${_TARBALL}")
-        execute_process(
-            COMMAND ${CMAKE_COMMAND} -E tar xzf "${_TARBALL}"
-            WORKING_DIRECTORY "${_PREBUILD_ROOT}"
-            RESULT_VARIABLE _extract_ret)
-        if(NOT _extract_ret EQUAL 0)
-            message(WARNING "Failed to extract ${_TARBALL} (exit ${_extract_ret})")
-        endif()
-    endif()
-
-    if(IS_DIRECTORY "${_PREBUILD_DIR}/vendors")
-        set(ENV{HP_MULTICORE_DIR} "${_PREBUILD_DIR}/vendors")
-        message(STATUS "Auto-detected HP_MULTICORE_DIR: ${_PREBUILD_DIR}/vendors")
-    endif()
+# The operator build produces one package containing both forward and backward.
+# Only the verified, explicit vendor root is accepted; this CMake project never
+# extracts a repository tarball or mutates user shell configuration.
+if(NOT HP_MULTICORE_VENDOR_ROOT AND DEFINED ENV{HP_MULTICORE_VENDOR_ROOT})
+    set(HP_MULTICORE_VENDOR_ROOT "$ENV{HP_MULTICORE_VENDOR_ROOT}")
+endif()
+if(NOT HP_MULTICORE_VENDOR_ROOT)
+    message(FATAL_ERROR "HP_MULTICORE_VENDOR_ROOT must identify hyper_parallel_multicore_nn")
+endif()
+set(CANN_VENDOR_LIBDIR "${HP_MULTICORE_VENDOR_ROOT}/op_api/lib")
+if(NOT EXISTS "${CANN_VENDOR_LIBDIR}/libcust_opapi.so")
+    message(FATAL_ERROR "Unified libcust_opapi.so is missing from ${CANN_VENDOR_LIBDIR}")
 endif()
 
-# =============================================================================
-# CANN Vendor Library Paths
-# Priority: CANN_VENDOR_FWD/BWD_LIBDIR > HP_MULTICORE_DIR > CANN_VENDOR_LIBDIR
-# =============================================================================
-
-if(DEFINED ENV{HP_MULTICORE_DIR})
-    if(DEFINED ENV{CANN_VENDOR_FWD_LIBDIR})
-        set(CANN_VENDOR_FWD_LIBDIR "$ENV{CANN_VENDOR_FWD_LIBDIR}")
-    else()
-        set(CANN_VENDOR_FWD_LIBDIR "$ENV{HP_MULTICORE_DIR}/mega_moe_nn/op_api/lib")
-    endif()
-    if(DEFINED ENV{CANN_VENDOR_BWD_LIBDIR})
-        set(CANN_VENDOR_BWD_LIBDIR "$ENV{CANN_VENDOR_BWD_LIBDIR}")
-    else()
-        set(CANN_VENDOR_BWD_LIBDIR "$ENV{HP_MULTICORE_DIR}/mega_moe_grad_nn/op_api/lib")
-    endif()
-elseif(DEFINED ENV{CANN_VENDOR_LIBDIR})
-    set(CANN_VENDOR_FWD_LIBDIR "$ENV{CANN_VENDOR_LIBDIR}")
-    set(CANN_VENDOR_BWD_LIBDIR "$ENV{CANN_VENDOR_LIBDIR}")
-else()
-    message(FATAL_ERROR
-        "Cannot locate cust_opapi libraries. Set one of:\n"
-        "  HP_MULTICORE_DIR  (vendors root; fwd/bwd paths derived automatically)\n"
-        "  CANN_VENDOR_FWD_LIBDIR + CANN_VENDOR_BWD_LIBDIR  (explicit overrides)\n"
-        "  CANN_VENDOR_LIBDIR  (legacy single-lib fallback)\n"
-        "  Or place prebuild/mega_moe.tar.gz and re-run cmake.")
-endif()
-
-string(REGEX REPLACE "/op_api/lib/?$" "" CANN_VENDOR_HOME "${CANN_VENDOR_FWD_LIBDIR}")
-
-message(STATUS "CANN_VENDOR_FWD_LIBDIR : ${CANN_VENDOR_FWD_LIBDIR}")
-message(STATUS "CANN_VENDOR_BWD_LIBDIR : ${CANN_VENDOR_BWD_LIBDIR}")
-message(STATUS "CANN_VENDOR_HOME       : ${CANN_VENDOR_HOME}")
+message(STATUS "HP_MULTICORE_VENDOR_ROOT : ${HP_MULTICORE_VENDOR_ROOT}")
+message(STATUS "CANN_VENDOR_LIBDIR       : ${CANN_VENDOR_LIBDIR}")
 
 # =============================================================================
 # Source Files
@@ -93,13 +44,13 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/find_ms_path.cmake)
 # =============================================================================
 
 set(SRC_FILES  ${OPS_SRC_FILES})
-set(LIB_DIRS
-    ${CANN_VENDOR_FWD_LIBDIR}
-    ${CANN_VENDOR_BWD_LIBDIR}
-    ${CMAKE_CURRENT_BINARY_DIR}/../../lib/hyper_parallel/lib)
-set(LIBS       cust_opapi)
+set(LIB_DIRS ${CANN_VENDOR_LIBDIR})
+# LAUNCH_ACLNN_FUNC resolves aclnnHyperMegaMoe* through MindSpore's
+# GetOpApiFunc at runtime. Directly linking the generic libcust_opapi.so SONAME
+# would allow another installed custom vendor to capture this dependency.
+set(LIBS)
 set(INCLUDE_DIRS
-    ${CANN_VENDOR_HOME}/include
+    ${HP_MULTICORE_VENDOR_ROOT}/op_api/include
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${MS_PATH}/include
     ${MS_PATH}/core/include)
@@ -180,13 +131,18 @@ endif()
 set(PYTHON_SCRIPT_PATH "${CMAKE_BINARY_DIR}/build_custom_with_ms.py")
 file(WRITE ${PYTHON_SCRIPT_PATH} "
 import mindspore as ms
+
+
+class HyperParallelCustomOpBuilder(ms.ops.CustomOpBuilder):
+    def get_ldflags(self):
+        flags = super().get_ldflags()
+        broken_rpath_flag = '-Wl,--disable-new-dtags,--rpath'
+        return [flag for flag in flags if flag != broken_rpath_flag]
+
+
 src_files = '${SRC_FILES}'.split(';')
-rpath_flag = (
-    \"-Wl,-rpath,'$$ORIGIN'/../../../../lib\"
-    \" -Wl,-rpath,${CANN_VENDOR_FWD_LIBDIR}\"
-    \" -Wl,-rpath,${CANN_VENDOR_BWD_LIBDIR} \"
-)
-ms.ops.CustomOpBuilder(
+rpath_flag = \"-Wl,--enable-new-dtags,-rpath,'$$ORIGIN'/../../vendors/hyper_parallel_multicore_nn/op_api/lib \"
+HyperParallelCustomOpBuilder(
     name='${MS_EXTENSION_NAME}',
     sources=src_files,
     op_def=${DEF_YAML_STRING},
@@ -202,33 +158,10 @@ ms.ops.CustomOpBuilder(
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_custom_target(
     BuildCustomOp ALL
-    COMMAND cd ${CMAKE_BINARY_DIR} && ${Python3_EXECUTABLE} ${PYTHON_SCRIPT_PATH}
+    COMMAND cd ${CMAKE_BINARY_DIR} && ${CMAKE_COMMAND} -E env --unset=MAKEFLAGS
+            ${Python3_EXECUTABLE} ${PYTHON_SCRIPT_PATH}
     COMMENT "Building hyper_parallel_mega_moe_ms custom operator with MindSpore"
 )
-
-# =============================================================================
-# Environment Setup Banner
-# =============================================================================
-
-string(REGEX REPLACE "/op_api/lib/?$" "" _FWD_ROOT "${CANN_VENDOR_FWD_LIBDIR}")
-string(REGEX REPLACE "/op_api/lib/?$" "" _BWD_ROOT "${CANN_VENDOR_BWD_LIBDIR}")
-
-message(STATUS "")
-message(STATUS "================================================================")
-message(STATUS "  hyper_parallel multicore: environment setup")
-message(STATUS "================================================================")
-message(STATUS "  Run the following in your terminal before importing:")
-message(STATUS "")
-message(STATUS "  export ASCEND_CUSTOM_OPP_PATH=${_FWD_ROOT}:\${ASCEND_CUSTOM_OPP_PATH}")
-message(STATUS "  export LD_LIBRARY_PATH=${CANN_VENDOR_FWD_LIBDIR}:\${LD_LIBRARY_PATH}")
-if(NOT "${_BWD_ROOT}" STREQUAL "${_FWD_ROOT}")
-    message(STATUS "  export ASCEND_CUSTOM_OPP_PATH=${_BWD_ROOT}:\${ASCEND_CUSTOM_OPP_PATH}")
-    message(STATUS "  export LD_LIBRARY_PATH=${CANN_VENDOR_BWD_LIBDIR}:\${LD_LIBRARY_PATH}")
-endif()
-message(STATUS "")
-message(STATUS "  (Run 'source ~/.bashrc' or open a new terminal to apply)")
-message(STATUS "================================================================")
-message(STATUS "")
 
 # =============================================================================
 # Install

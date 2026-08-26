@@ -3,7 +3,7 @@
  *
  * PyTorch TORCH_LIBRARY_IMPL for hyper_parallel::mega_moe_grad.
  *
- * NPU implementation calls aclnnMegaMoeGrad via EXEC_NPU_CMD.
+ * NPU implementation calls aclnnHyperMegaMoeGrad via EXEC_NPU_CMD.
  * Meta implementation is a no-op (output tensors pre-allocated by caller).
  */
 #include <torch/library.h>
@@ -54,7 +54,7 @@ BwdReturn mega_moe_grad_npu(
     int64_t expert_num,
     int64_t hidden_size,
     int64_t seq_size) {
-    EXEC_NPU_CMD_EXT(aclnnMegaMoeGrad,
+    EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeGrad,
         dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw, w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
         combine_target_off, combine_src_off, combine_size,

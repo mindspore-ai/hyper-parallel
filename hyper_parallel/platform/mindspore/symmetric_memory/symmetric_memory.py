@@ -13,17 +13,57 @@
 # limitations under the License.
 # ============================================================================
 """Symmetric Memory"""
-import os
+import importlib.util
+from pathlib import Path
+import sys
 import mindspore as ms
 from mindspore.runtime import Stream, StreamCtx, Event
 from hyper_parallel.platform import get_platform
-from . import aclshmem_ms
+
+
+def _require_library() -> Path:
+    """Locate the installed or source-build MindSpore symmetric-memory adapter."""
+    module_path = Path(__file__).resolve()
+    package_root = module_path.parents[3]
+    relative_path = Path("core/symmetric_memory/lib/framework/mindspore/aclshmem_ms/aclshmem_ms.so")
+    candidates = [package_root / relative_path]
+    repository_root = module_path.parents[4]
+    if (repository_root / "setup.py").is_file():
+        candidates.insert(0, repository_root / "build/native/payload/hyper_parallel" / relative_path)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    searched = ", ".join(str(path) for path in candidates)
+    raise ImportError(
+        "[HP-NATIVE-PAYLOAD-MISSING] component=symmetric_memory framework=mindspore "
+        f"searched={searched}. The current wheel does not include this optional component, or the local build failed; "
+        "inspect the build log and run ./build.sh --shmem mindspore for source/PYTHONPATH development."
+    )
+
 
 _is_shmem_available = False
-current_dir = os.path.dirname(os.path.abspath(__file__))
-_lib_path = os.path.join(current_dir, 'aclshmem_ms/aclshmem_ms.so')
-if os.path.exists(_lib_path):
-    _is_shmem_available = True
+_lib_path = str(_require_library())
+aclshmem_ms = None
+_module_spec = importlib.util.spec_from_file_location("aclshmem_ms", _lib_path)
+if _module_spec is None or _module_spec.loader is None:
+    raise ImportError(f"Unable to create a module spec for symmetric_memory extension: {_lib_path}.")
+try:
+    aclshmem_ms = importlib.util.module_from_spec(_module_spec)
+    sys.modules["aclshmem_ms"] = aclshmem_ms
+    _module_spec.loader.exec_module(aclshmem_ms)
+except (ImportError, OSError, RuntimeError) as error:
+    if aclshmem_ms is not None and sys.modules.get("aclshmem_ms") is aclshmem_ms:
+        sys.modules.pop("aclshmem_ms", None)
+    raise ImportError(
+        "[HP-NATIVE-LOAD-FAILED] component=symmetric_memory framework=mindspore "
+        f"library={_lib_path} error={error}. "
+        "Check the Python/MindSpore/CANN version combination and build log."
+    ) from error
+except Exception:
+    if aclshmem_ms is not None and sys.modules.get("aclshmem_ms") is aclshmem_ms:
+        sys.modules.pop("aclshmem_ms", None)
+    raise
+_is_shmem_available = True
 
 
 class MSSymmetricMemoryHandler:
@@ -58,23 +98,23 @@ class MSSymmetricMemoryHandler:
 
     @staticmethod
     def rendezvous(tensor, group):
-        """Not implemented: symmetric memory is allocated at init time in CANN SHMEM v1.0.0."""
-        raise NotImplementedError("In CANN SHMEM v1.0.0, rendezvous is not needed, "
+        """Not implemented: symmetric memory is allocated at init time in CANN SHMEM v1.6.0."""
+        raise NotImplementedError("In CANN SHMEM v1.6.0, rendezvous is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "so this function is not implemented. ")
 
     @staticmethod
     def set_signal_pad_size(size: int) -> None:
-        """Not implemented: signal padding is not needed in CANN SHMEM v1.0.0."""
-        raise NotImplementedError("In CANN SHMEM v1.0.0, set_signal_pad_size is not needed, "
+        """Not implemented: signal padding is not needed in CANN SHMEM v1.6.0."""
+        raise NotImplementedError("In CANN SHMEM v1.6.0, set_signal_pad_size is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "you can create symmetric signal memory by empty() "
                                   "so this function is not implemented. ")
 
     @staticmethod
     def get_signal_pad_size() -> int:
-        """Not implemented: signal padding is not needed in CANN SHMEM v1.0.0."""
-        raise NotImplementedError("In CANN SHMEM v1.0.0, get_signal_pad_size is not needed, "
+        """Not implemented: signal padding is not needed in CANN SHMEM v1.6.0."""
+        raise NotImplementedError("In CANN SHMEM v1.6.0, get_signal_pad_size is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "you can create symmetric signal memory by empty() "
                                   "so this function is not implemented. ")

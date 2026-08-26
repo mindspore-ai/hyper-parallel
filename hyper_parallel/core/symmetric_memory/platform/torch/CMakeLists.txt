@@ -7,25 +7,27 @@ add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 生成位置无关代码
+# Generate position-independent code.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# 获取CANN相关环境变量
+# Read the CANN environment.
 if(NOT DEFINED ENV{ASCEND_HOME_PATH})
     message(FATAL_ERROR "Cannot find ASCEND_HOME_PATH, please run set_env.sh.")
 else()
     set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 endif()
 
-# 获取aclshmem相关环境变量
+# Read the aclshmem environment.
 if(NOT DEFINED ENV{SHMEM_HOME_PATH})
-    if(NOT DEFINED ENV{HP_THIRD_PARTY_DIR})
-        message(FATAL_ERROR "Cannot find SHMEM from source or prebuild, please check log.")
-    else()
-        set(SHMEM_HOME_PATH $ENV{HP_THIRD_PARTY_DIR})
-    endif()
-else()
-    set(SHMEM_HOME_PATH $ENV{SHMEM_HOME_PATH})
+    message(FATAL_ERROR "Cannot find SHMEM_HOME_PATH. Run the explicit native dependency/build workflow first.")
+endif()
+set(SHMEM_HOME_PATH $ENV{SHMEM_HOME_PATH})
+
+if(NOT ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB OR
+  NOT EXISTS "${ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB}")
+    message(FATAL_ERROR
+        "ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB must name the kernel library installed by "
+        "build_symmetric_memory.sh. Got: '${ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB}'")
 endif()
 
 set(CMAKE_COMPILER bisheng)
@@ -75,23 +77,23 @@ include_directories(
 )
 
 link_directories(
-    ${CMAKE_BINARY_DIR}
     ${Python3_SITELIB}/torch/lib
     ${Python3_SITELIB}/torch_npu/lib
     ${SHMEM_HOME_PATH}/shmem/lib
-    ${CMAKE_CURRENT_BINARY_DIR}/../ops
-    ${CMAKE_CURRENT_BINARY_DIR}/../../lib/hyper_parallel/lib
-    ${CMAKE_CURRENT_BINARY_DIR}/../../lib/hyper_parallel/lib/shmem
 )
 
-link_libraries(aclshmem_symmetric_memory_kernel "${TORCH_LIBRARIES}" torch_npu hpshmem)
+link_libraries("${TORCH_LIBRARIES}" torch_npu hyper_parallel_shmem)
 
 if(BUILD_TORCH_LIB)
     set(TORCH_BINDINGS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/torch_bindings.cpp)
     add_library(aclshmem_torch
         SHARED ${TORCH_BINDINGS_SRC})
-    target_link_libraries(aclshmem_torch PRIVATE shmem_utils hpshmem aclshmem_symmetric_memory_kernel)
+    target_link_libraries(
+        aclshmem_torch PRIVATE
+        hyper_parallel_shmem_utils
+        hyper_parallel_shmem
+        "${ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB}")
     set_target_properties(aclshmem_torch PROPERTIES
-        INSTALL_RPATH $ORIGIN:$ORIGIN/../../../lib:$ORIGIN/../../../lib/shmem)
+        INSTALL_RPATH $ORIGIN:$ORIGIN/../..:$ORIGIN/../../shmem)
     install(TARGETS aclshmem_torch DESTINATION . COMPONENT aclshmem_torch)
 endif()

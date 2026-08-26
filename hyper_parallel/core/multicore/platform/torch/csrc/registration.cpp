@@ -15,7 +15,7 @@
 
 TORCH_LIBRARY(hyper_parallel, m) {
     // -------------------------------------------------------------------------
-    // mega_moe: MoE-FFN forward operator (wraps aclnnMegaMoe)
+    // mega_moe: MoE-FFN forward operator (wraps aclnnHyperMegaMoe)
     //
     // Output buffers written in-place:
     //   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target.
@@ -54,7 +54,7 @@ TORCH_LIBRARY(hyper_parallel, m) {
 
 
     // -------------------------------------------------------------------------
-    // mega_moe_grad: MoE-FFN backward operator (wraps aclnnMegaMoeGrad)
+    // mega_moe_grad: MoE-FFN backward operator (wraps aclnnHyperMegaMoeGrad)
     //
     // Output buffers written in-place:
     //   dispatch_target, hidden_dw, act_grad_y, grad_gate,

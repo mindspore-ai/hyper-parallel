@@ -1,99 +1,46 @@
 # =============================================================================
-# Find MindSpore Internal Kernels Library
+# Find MindSpore without importing the framework or modifying the environment.
 # =============================================================================
-
-# Find Python to get MindSpore installation path
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-# Allow user to override MindSpore path
 if(DEFINED ENV{MINDSPORE_PATH})
     set(MS_PATH $ENV{MINDSPORE_PATH})
-    message(STATUS "Using MINDSPORE_PATH environment variable: ${MS_PATH}")
+    set(MS_VERSION "user-specified")
 else()
-    execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import mindspore"
-    RESULT_VARIABLE TEST_MINDSPORE
-    OUTPUT_QUIET
-    ERROR_QUIET
-    )
-    if(TEST_MINDSPORE GREATER 0)
-        message(WARNING "MindSpore not found. Installing automatically...")
-        execute_process(
-            COMMAND ${Python3_EXECUTABLE} -m pip install mindspore==2.8.0
-            RESULT_VARIABLE PIP_INSTALL_RESULT
-        )
-        if(NOT PIP_INSTALL_RESULT EQUAL 0)
-            message(FATAL_ERROR "Failed to install MindSpore.")
-        endif()
-    else()
-        execute_process(
-            COMMAND ${Python3_EXECUTABLE} -c "import mindspore; print(mindspore.__version__)"
-            OUTPUT_VARIABLE MS_VERSION_RAW
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        message(STATUS "Detected MindSpore version: ${MS_VERSION_RAW}")
+    set(MS_DISCOVERY_SCRIPT [=[
+import importlib.metadata as metadata
+import importlib.util
+import sys
 
-        if(MS_VERSION_RAW VERSION_LESS "2.8.0")
-            message(WARNING "MindSpore version ${MS_VERSION_RAW} is too old. Installing required version 2.8.0...")
-            execute_process(
-                COMMAND ${Python3_EXECUTABLE} -m pip install mindspore==2.8.0
-                RESULT_VARIABLE PIP_INSTALL_RESULT
-            )
-            if(NOT PIP_INSTALL_RESULT EQUAL 0)
-                message(FATAL_ERROR "Failed to upgrade to MindSpore 2.8.0.")
-            endif()
-        else()
-            message(STATUS "MindSpore version meets the requirement (≥2.8.0)")
-        endif()
-    endif()
-    # Get MindSpore installation path using Python - get the last line of output
+spec = importlib.util.find_spec("mindspore")
+if spec is None or not spec.submodule_search_locations:
+    sys.exit(1)
+print(next(iter(spec.submodule_search_locations)) + "|" + metadata.version("mindspore"))
+]=])
     execute_process(
-        COMMAND ${Python3_EXECUTABLE} -c "import mindspore as ms; print(ms.__file__)"
-        OUTPUT_VARIABLE MS_MODULE_PATH_RAW
+        COMMAND ${Python3_EXECUTABLE} -c ${MS_DISCOVERY_SCRIPT}
+        OUTPUT_VARIABLE MS_DISCOVERY
         OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE PYTHON_RESULT
-        ERROR_VARIABLE PYTHON_ERROR
+        ERROR_VARIABLE MS_DISCOVERY_ERROR
+        RESULT_VARIABLE MS_DISCOVERY_RESULT
     )
-
-    # Extract the last non-empty line which should be the MindSpore path
-    string(REPLACE "\n" ";" OUTPUT_LINES "${MS_MODULE_PATH_RAW}")
-
-    # Find the last non-empty line
-    set(MS_MODULE_PATH "")
-    foreach(LINE ${OUTPUT_LINES})
-        string(STRIP "${LINE}" STRIPPED_LINE)
-        if(NOT STRIPPED_LINE STREQUAL "")
-            set(MS_MODULE_PATH "${STRIPPED_LINE}")
-        endif()
-    endforeach()
-
-    # Debug: Show the raw output and extracted path
-    string(LENGTH "${MS_MODULE_PATH_RAW}" RAW_LENGTH)
-    message(STATUS "Raw Python output length: ${RAW_LENGTH}")
-    list(LENGTH OUTPUT_LINES NUM_LINES)
-    message(STATUS "Number of output lines: ${NUM_LINES}")
-    message(STATUS "Extracted MindSpore path: ${MS_MODULE_PATH}")
-
-
-    if(NOT MS_MODULE_PATH MATCHES ".*mindspore.*")
-        execute_process(COMMAND ${CMAKE_COMMAND} -E echo "")
-        message(FATAL_ERROR "Invalid MindSpore path detected: ${MS_MODULE_PATH}")
+    if(NOT MS_DISCOVERY_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "MindSpore is not installed for ${Python3_EXECUTABLE}. "
+            "Install the declared build dependency or set MINDSPORE_PATH. "
+            "Discovery error: ${MS_DISCOVERY_ERROR}")
     endif()
-
-    if(NOT PYTHON_RESULT EQUAL 0)
-        execute_process(COMMAND ${CMAKE_COMMAND} -E echo "")
-        message(FATAL_ERROR "Failed to find MindSpore installation: ${PYTHON_ERROR}."
-        "Please ensure MindSpore is installed or set MINDSPORE_PATH environment variable.")
+    string(REPLACE "|" ";" MS_DISCOVERY_FIELDS "${MS_DISCOVERY}")
+    list(LENGTH MS_DISCOVERY_FIELDS MS_DISCOVERY_FIELD_COUNT)
+    if(NOT MS_DISCOVERY_FIELD_COUNT EQUAL 2)
+        message(FATAL_ERROR "Unexpected MindSpore discovery result: ${MS_DISCOVERY}")
     endif()
-
-    # Extract directory from MindSpore module path
-    get_filename_component(MS_PATH ${MS_MODULE_PATH} DIRECTORY)
+    list(GET MS_DISCOVERY_FIELDS 0 MS_PATH)
+    list(GET MS_DISCOVERY_FIELDS 1 MS_VERSION)
 endif()
 
-# =============================================================================
-# MindSpore Path Detection
-# =============================================================================
-
-if(NOT DEFINED MS_PATH)
-    message(FATAL_ERROR "MS_PATH is not defined. Make sure find_lib.cmake is included in the parent CMakeLists.txt")
+if(NOT IS_DIRECTORY "${MS_PATH}" OR NOT EXISTS "${MS_PATH}/include")
+    message(FATAL_ERROR "Invalid MindSpore development path: ${MS_PATH}")
 endif()
+message(STATUS "MindSpore path: ${MS_PATH}")
+message(STATUS "MindSpore version: ${MS_VERSION}")

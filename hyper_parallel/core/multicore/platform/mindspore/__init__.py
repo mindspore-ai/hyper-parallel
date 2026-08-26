@@ -30,87 +30,17 @@ Exposes ``mega_moe`` and ``mega_moe_grad`` backed by the
     ``ms.set_context(mode=ms.GRAPH_MODE)`` is active will raise a
     ``RuntimeError`` at call time.
 
-Vendor library resolution order (highest priority first):
-
-  1. ``CANN_VENDOR_FWD_LIBDIR`` / ``CANN_VENDOR_BWD_LIBDIR``
-  2. ``HP_MULTICORE_DIR``  (vendors root; fwd/bwd derived automatically)
-  3. ``CANN_VENDOR_LIBDIR``  (legacy single-lib fallback)
-  4. Auto-detect from ``prebuild/mega_moe/vendors/``
+Forward and backward ACLNN symbols are packaged in one component-owned
+``hyper_parallel_multicore_nn`` vendor. Source the packaged ``set_env.bash``
+before starting the application or framework Python process so CANN can discover that vendor.
 """
 __all__ = ["mega_moe", "mega_moe_grad"]
 
-import ctypes
-import os
-import re
-import sys
-
-_ASCEND_HOME = os.environ.get("ASCEND_HOME_PATH",
-                               "/usr/local/Ascend/ascend-toolkit/latest")
-
-_CANN_VENDOR_FWD_LIBDIR = os.environ.get("CANN_VENDOR_FWD_LIBDIR", "")
-_CANN_VENDOR_BWD_LIBDIR = os.environ.get("CANN_VENDOR_BWD_LIBDIR", "")
-
-if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
-    _HP_MULTICORE_DIR = os.environ.get("HP_MULTICORE_DIR", "")
-    if _HP_MULTICORE_DIR:
-        _CANN_VENDOR_FWD_LIBDIR = os.path.join(
-            _HP_MULTICORE_DIR, "mega_moe_nn", "op_api", "lib")
-        _CANN_VENDOR_BWD_LIBDIR = os.path.join(
-            _HP_MULTICORE_DIR, "mega_moe_grad_nn", "op_api", "lib")
-    elif os.environ.get("CANN_VENDOR_LIBDIR", ""):
-        _CANN_VENDOR_FWD_LIBDIR = os.environ["CANN_VENDOR_LIBDIR"]
-        _CANN_VENDOR_BWD_LIBDIR = os.environ["CANN_VENDOR_LIBDIR"]
-    else:
-        _PREBUILD_DIR = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "../../prebuild/mega_moe"))
-        if os.path.isdir(_PREBUILD_DIR):
-            _vendors = os.path.join(_PREBUILD_DIR, "vendors")
-            _fwd = os.path.join(_vendors, "mega_moe_nn", "op_api", "lib")
-            _bwd = os.path.join(_vendors, "mega_moe_grad_nn", "op_api", "lib")
-            if os.path.isdir(_fwd):
-                _CANN_VENDOR_FWD_LIBDIR = _fwd
-            if os.path.isdir(_bwd):
-                _CANN_VENDOR_BWD_LIBDIR = _bwd
-
-# ---------------------------------------------------------------------------
-# Set ASCEND_CUSTOM_OPP_PATH at module load time — BEFORE any MindSpore import.
-#
-# GetOpApiFuncAddr (called by LAUNCH_ACLNN_FUNC at op invocation) scans
-# ASCEND_CUSTOM_OPP_PATH to populate g_custom_lib_path, which may be cached
-# as a static variable on first call.  MindSpore's own initialization can
-# trigger GetOpApiFuncAddr for standard CANN ops during `import mindspore`,
-# which would cache an empty g_custom_lib_path if we set the env var too late
-# (e.g., inside _get_ms_ops()).  Setting it here ensures the correct paths are
-# present before any such call.
-# ---------------------------------------------------------------------------
-for _libdir in (_CANN_VENDOR_FWD_LIBDIR, _CANN_VENDOR_BWD_LIBDIR):
-    if _libdir:
-        _vendor_root = re.sub(r'/op_api/lib/?$', '', _libdir)
-        _cur_opp = os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')
-        if _vendor_root and _vendor_root not in _cur_opp:
-            os.environ['ASCEND_CUSTOM_OPP_PATH'] = (
-                f"{_vendor_root}:{_cur_opp}" if _cur_opp else _vendor_root)
-
-# Pre-load CANN base libs with RTLD_GLOBAL.
-for _ascendcl_path in [
-    os.path.join(_ASCEND_HOME, "lib64", "libascendcl.so"),
-    os.path.join(_ASCEND_HOME, "fwkacllib", "lib64", "libascendcl.so"),
-]:
-    if os.path.exists(_ascendcl_path):
-        ctypes.CDLL(_ascendcl_path, mode=ctypes.RTLD_GLOBAL)
-        break
-
-_opapi_path = os.path.join(_ASCEND_HOME, "lib64", "libopapi.so")
-if os.path.exists(_opapi_path):
-    ctypes.CDLL(_opapi_path, mode=ctypes.RTLD_GLOBAL)
-
-# Pre-load both libcust_opapi.so with RTLD_GLOBAL so LAUNCH_ACLNN_FUNC can
-# resolve aclnnMegaMoe* / aclnnMegaMoeGrad* from either package.
-for _vendor_libdir in (_CANN_VENDOR_FWD_LIBDIR, _CANN_VENDOR_BWD_LIBDIR):
-    if _vendor_libdir:
-        _cust_opapi = os.path.join(_vendor_libdir, "libcust_opapi.so")
-        if os.path.exists(_cust_opapi):
-            ctypes.CDLL(_cust_opapi, mode=ctypes.RTLD_GLOBAL)
+from hyper_parallel.core.multicore._loader import (
+    get_multicore_paths,
+    load_cpython_extension,
+    preload_vendor_library,
+)
 
 # Lazily import the compiled MindSpore extension on first use to avoid a
 # circular import triggered by MindSpore's custom-op scan at load time.
@@ -140,11 +70,10 @@ def _get_ms_ops():
     """Lazily load and return the compiled MindSpore extension module."""
     global _ms_ops
     if _ms_ops is None:
-        build_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "lib")
-        if build_lib not in sys.path:
-            sys.path.insert(0, build_lib)
-        import hyper_parallel_mega_moe_ms as _m  # noqa: E402  # pylint: disable=import-outside-toplevel
-        _ms_ops = _m
+        vendor_root, adapter_path = get_multicore_paths("mindspore")
+        __import__("mindspore")
+        preload_vendor_library(vendor_root)
+        _ms_ops = load_cpython_extension("hyper_parallel_mega_moe_ms", adapter_path)
     return _ms_ops
 
 

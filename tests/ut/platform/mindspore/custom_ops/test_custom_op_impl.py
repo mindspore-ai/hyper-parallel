@@ -14,7 +14,9 @@
 # ============================================================================
 """Unit tests for custom_ops module loading logic."""
 import os
+from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -55,13 +57,93 @@ class TestCustomOpsLoading(unittest.TestCase):
 
         self.assertIs(custom_op_impl._custom_ops, mock_mod)
 
-    def test_build_lib_added_to_sys_path(self):
-        """build/lib is added to sys.path before attempting import."""
-        from hyper_parallel.platform.mindspore.custom_ops import custom_op_impl
+    def test_build_lib_is_searched_without_sys_path_mutation(self):
+        """The prebuilt directory is explicit and does not leak into global import state."""
+        mock_mod = MagicMock()
+        original_sys_path = list(sys.path)
+        with patch.dict(sys.modules, {_MODULE_NAME: mock_mod}):
+            from hyper_parallel.platform.mindspore.custom_ops import custom_op_impl
 
-        expected_suffix = os.path.join("custom_ops", "build", "lib")
-        build_lib_paths = [p for p in sys.path if expected_suffix in p]
-        self.assertTrue(build_lib_paths, f"build/lib not found in sys.path: {sys.path[:5]}")
+        expected_suffix = os.path.join("custom_ops", "lib")
+        self.assertTrue(any(expected_suffix in path for path in custom_op_impl._extension_search_paths()))
+        self.assertEqual(sys.path, original_sys_path)
+
+    def test_missing_extension_does_not_jit_compile(self):
+        """A missing prebuilt extension reports guidance without invoking CustomOpBuilder."""
+        with self.assertRaisesRegex(
+            ImportError,
+            "HP-NATIVE-LOAD-FAILED.*--custom-ops on",
+        ):
+            from hyper_parallel.platform.mindspore.custom_ops import custom_op_impl  # noqa: F401
+
+        self._mock_ms.ops.CustomOpBuilder.assert_not_called()
+
+    def test_binary_loader_error_is_wrapped_with_native_guidance(self):
+        """An incompatible prebuilt extension reports a stable native load error."""
+        mock_mod = MagicMock()
+        with patch.dict(sys.modules, {_MODULE_NAME: mock_mod}):
+            from hyper_parallel.platform.mindspore.custom_ops import custom_op_impl
+
+        sys.modules.pop(_MODULE_NAME, None)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library = Path(temporary_directory) / f"{_MODULE_NAME}.so"
+            library.touch()
+            spec = MagicMock()
+            spec.loader.exec_module.side_effect = OSError("incompatible binary")
+            with patch.object(
+                custom_op_impl,
+                "_extension_search_paths",
+                return_value=[temporary_directory],
+            ), patch.object(
+                custom_op_impl.machinery,
+                "EXTENSION_SUFFIXES",
+                (".so",),
+            ), patch.object(
+                custom_op_impl.util,
+                "spec_from_file_location",
+                return_value=spec,
+            ), patch.object(
+                custom_op_impl.util,
+                "module_from_spec",
+                return_value=MagicMock(),
+            ):
+                with self.assertRaisesRegex(ImportError, "incompatible binary"):
+                    custom_op_impl._load_prebuilt_extension()
+
+        self.assertNotIn(_MODULE_NAME, sys.modules)
+
+    def test_binary_loader_does_not_remove_concurrently_registered_module(self):
+        """A failed candidate only removes the module object that it registered."""
+        mock_mod = MagicMock()
+        with patch.dict(sys.modules, {_MODULE_NAME: mock_mod}):
+            from hyper_parallel.platform.mindspore.custom_ops import custom_op_impl
+
+        sys.modules.pop(_MODULE_NAME, None)
+        replacement = MagicMock()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library = Path(temporary_directory) / f"{_MODULE_NAME}.so"
+            library.touch()
+            spec = MagicMock()
+
+            def fail_after_replacement(module):
+                del module
+                sys.modules[_MODULE_NAME] = replacement
+                raise OSError("incompatible binary")
+
+            spec.loader.exec_module.side_effect = fail_after_replacement
+            with patch.object(
+                custom_op_impl, "_extension_search_paths", return_value=[temporary_directory]
+            ), patch.object(
+                custom_op_impl.machinery, "EXTENSION_SUFFIXES", (".so",)
+            ), patch.object(
+                custom_op_impl.util, "spec_from_file_location", return_value=spec
+            ), patch.object(
+                custom_op_impl.util, "module_from_spec", return_value=MagicMock()
+            ):
+                with self.assertRaisesRegex(ImportError, "incompatible binary"):
+                    custom_op_impl._load_prebuilt_extension()
+
+        self.assertIs(sys.modules.pop(_MODULE_NAME), replacement)
 
 
 if __name__ == "__main__":

@@ -32,20 +32,7 @@ __all__ = [
     # "overlap_launch_all_to_all_v",
 ]
 
-import os
-import pathlib
 from hyper_parallel.platform import get_platform
-
-#优先加载hyper-parallel/lib/shmem目录下的shmem库，确保使用的是编译好的shmem库
-project_root = pathlib.Path(__file__).parent.parent.parent
-shmem_lib_dir = project_root / "lib" / "shmem"
-
-if not shmem_lib_dir.exists():
-    raise FileNotFoundError(f"shmem库目录不存在: {shmem_lib_dir}")
-
-ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-new_ld_path = f"{shmem_lib_dir}:{ld_path}" if ld_path else str(shmem_lib_dir)
-os.environ["LD_LIBRARY_PATH"] = new_ld_path
 
 platform = get_platform()
 _symm_handler = platform.get_symmetric_memory_handler()
@@ -223,7 +210,7 @@ def shmem_put_with_signal(target, target_offset, src, src_offset,
 
 def shmem_allgather(output_tensor, input_tensor):
     """
-    This interface only supports torch for now, the mindspore version is still in development.
+    This interface supports both torch and MindSpore.
     This function gathers the input tensor from all ranks and concatenates them into the output tensor.
     The resulting output tensor will contain the gathered data from all ranks,
     and the order of the gathered data will correspond to the order of the ranks.

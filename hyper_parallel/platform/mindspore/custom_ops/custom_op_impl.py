@@ -14,39 +14,65 @@
 # ============================================================================
 """MindSpore custom kernel implementations and DFunction wrappers."""
 from dataclasses import dataclass
-import importlib
+from importlib import machinery
+from importlib import util
 import os
+from pathlib import Path
 import sys
 
-import mindspore as ms # pylint: disable=C0415
+import mindspore as ms  # pylint: disable=C0415
 
 from hyper_parallel.core.shard.dfunction import DFunction
 
 
 _CC_DIR = os.path.dirname(os.path.abspath(__file__))
 _MS_EXTENSION_NAME = "hyper_parallel_custom_ops_ms"
-_BUILD_LIB = os.path.join(_CC_DIR, "build", "lib")
+_BUILD_LIB = os.path.join(_CC_DIR, "lib")
 
-if _BUILD_LIB not in sys.path:
-    sys.path.insert(0, _BUILD_LIB)
-
-_CUSTOM_OP_SOURCES = [
-    os.path.join(_CC_DIR, "module.cc"),
-    os.path.join(_CC_DIR, "dense_lightning_indexer_grad_kl_loss.cc"),
-    os.path.join(_CC_DIR, "dense_lightning_indexer_softmax_lse.cc"),
-    os.path.join(_CC_DIR, "sparse_lightning_indexer_grad_kl_loss.cc"),
-    os.path.join(_CC_DIR, "mhc_post.cc"),
-    os.path.join(_CC_DIR, "mhc_post_backward.cc"),
-    os.path.join(_CC_DIR, "mhc_pre_sinkhorn.cc"),
-    os.path.join(_CC_DIR, "mhc_pre_sinkhorn_backward.cc"),
-    os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn.cc"),
-    os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn_backward.cc"),
-    os.path.join(_CC_DIR, "lightning_indexer_v2.cc"),
-    os.path.join(_CC_DIR, "sparse_flash_mla.cc"),
-    os.path.join(_CC_DIR, "sparse_flash_mla_grad.cc"),
-    os.path.join(_CC_DIR, "sparse_lightning_indexer_kl_loss_grad.cc"),
-]
 _MHC_PRE_CLAMP_NONE_GRADS = (None,) * 7
+
+
+def _extension_search_paths():
+    """Return source-build and installed extension directories in priority order."""
+    module_path = Path(__file__).resolve()
+    repository_root = module_path.parents[4]
+    search_paths = []
+    if (repository_root / "setup.py").is_file():
+        search_paths.append(str(
+            repository_root / "build" / "native" / "payload" / "hyper_parallel"
+            / "platform" / "mindspore" / "custom_ops" / "lib"
+        ))
+    search_paths.append(_BUILD_LIB)
+    return list(dict.fromkeys(search_paths))
+
+
+def _load_prebuilt_extension():
+    """Load the exact prebuilt extension without mutating process-global ``sys.path``."""
+    loaded_module = sys.modules.get(_MS_EXTENSION_NAME)
+    if loaded_module is not None:
+        return loaded_module
+    load_errors = []
+    for extension_path in _extension_search_paths():
+        root = Path(extension_path)
+        for suffix in machinery.EXTENSION_SUFFIXES:
+            library_path = root / f"{_MS_EXTENSION_NAME}{suffix}"
+            if not library_path.is_file():
+                continue
+            module = None
+            try:
+                spec = util.spec_from_file_location(_MS_EXTENSION_NAME, library_path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Cannot create an extension loader for {library_path}")
+                module = util.module_from_spec(spec)
+                sys.modules[_MS_EXTENSION_NAME] = module
+                spec.loader.exec_module(module)
+                return module
+            except (ImportError, OSError, RuntimeError) as error:
+                if module is not None and sys.modules.get(_MS_EXTENSION_NAME) is module:
+                    sys.modules.pop(_MS_EXTENSION_NAME, None)
+                load_errors.append(f"{library_path}: {error}")
+    details = "; ".join(load_errors) if load_errors else "no prebuilt extension file was found"
+    raise ImportError(details)
 
 
 @dataclass(frozen=True)
@@ -97,23 +123,19 @@ def _bind_mhc_pre_clamp_args(args, kwargs):
     return _MhcPreClampArgs(*(values[name] for name in names))
 
 
-def _build_custom_ops():
-    return ms.ops.CustomOpBuilder(
-        _MS_EXTENSION_NAME,
-        _CUSTOM_OP_SOURCES,
-        backend="Ascend",
-    ).load()
-
-
 try:
-    _custom_ops = importlib.import_module(_MS_EXTENSION_NAME)
-except ImportError:
-    # Source-tree development: .so not pre-built; JIT-compile from local .cc files.
-    _custom_ops = _build_custom_ops()
-else:
-    # Rebuild stale source-tree extensions that predate newly added symbols.
-    if not hasattr(_custom_ops, "npu_mhc_pre_clamp_sinkhorn"):
-        _custom_ops = _build_custom_ops()
+    _custom_ops = _load_prebuilt_extension()
+except ImportError as error:
+    raise ImportError(
+        "[HP-NATIVE-LOAD-FAILED] component=custom_ops framework=mindspore. "
+        "No compatible prebuilt extension could be loaded. For a source/PYTHONPATH checkout, run "
+        "`./build.sh --multicore off --shmem off --custom-ops on`."
+    ) from error
+if not hasattr(_custom_ops, "npu_mhc_pre_clamp_sinkhorn"):
+    raise ImportError(
+        "[HP-NATIVE-INCOMPATIBLE] component=custom_ops framework=mindspore. "
+        "The prebuilt extension is stale or was built for a different HyperParallel source revision."
+    )
 
 
 def _ensure_contiguous(*tensors):

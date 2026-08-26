@@ -62,7 +62,15 @@ import mindspore as ms
 
 src_files = [${SRC_FILES_PYTHON}]
 
-ms.ops.CustomOpBuilder(
+class _HyperParallelCustomOpBuilder(ms.ops.CustomOpBuilder):
+    \"\"\"Remove MindSpore 2.10's bare --rpath flag from the host link command.\"\"\"
+
+    def get_ldflags(self):
+        flags = super().get_ldflags()
+        return [flag for flag in flags if flag != '-Wl,--disable-new-dtags,--rpath']
+
+
+_HyperParallelCustomOpBuilder(
     name='${MS_EXTENSION_NAME}',
     sources=src_files,
     op_def=[],
@@ -80,6 +88,7 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 add_custom_target(
     BuildCustomOp ALL
-    COMMAND cd ${CMAKE_BINARY_DIR} && ${Python3_EXECUTABLE} ${PYTHON_SCRIPT_PATH}
+    COMMAND cd ${CMAKE_BINARY_DIR} && ${CMAKE_COMMAND} -E env --unset=MAKEFLAGS
+            ${Python3_EXECUTABLE} ${PYTHON_SCRIPT_PATH}
     COMMENT "Building ${MS_EXTENSION_NAME} custom operator with MindSpore"
 )

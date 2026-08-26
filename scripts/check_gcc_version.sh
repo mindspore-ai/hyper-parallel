@@ -5,7 +5,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # Shared host GCC version policy, aligned with mindspore/CMakeLists.txt:
 #   - require GCC >= 7.3.0 (fatal on lower)
-#   - warn if GCC >  11.3.0 (continue)
+#   - warn if GCC >  11.3.0 (non-fatal)
 # Source this file from build scripts (do NOT execute), e.g.:
 #   source "$(dirname "$0")/check_gcc_version.sh"
 #   check_gcc_version
@@ -14,7 +14,7 @@
 check_gcc_version() {
     local gcc_bin="${1:-gcc}"
     if ! command -v "${gcc_bin}" >/dev/null 2>&1; then
-        echo "ERROR: ${gcc_bin} not found. hyper_parallel requires GCC in [7.3.0, 11.3.0]." >&2
+        echo "ERROR: ${gcc_bin} not found. hyper_parallel requires GCC >= 7.3.0." >&2
         return 1
     fi
 
