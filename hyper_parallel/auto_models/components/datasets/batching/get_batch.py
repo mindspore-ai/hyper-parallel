@@ -319,6 +319,7 @@ class ParallelBatch:
             parallel_batch: Mapping[str, Any],
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         """Split forward fields from loss and token-accounting fields."""
+        
         model_inputs = {
             "input_ids": parallel_batch["input_ids"],
             "labels": parallel_batch["labels"],
