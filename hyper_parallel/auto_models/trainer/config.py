@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Typed configuration tree produced by the HyperModels YAML resolver."""
+"""Typed configuration tree produced by the AutoModels YAML resolver."""
 
 import inspect
 import importlib
