@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Built-in tensor-parallel boundary template for OpenPangu DSA attention."""
+"""Built-in tensor-parallel boundary template for DSA attention."""
 
 import re
 from typing import Dict
@@ -43,8 +43,8 @@ def _linear(module, *, param, in_src, in_dst, out_src, out_dst):
     )
 
 
-def build_openpangu_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
-    """Materialize DSA leaf-boundary specs for an OpenPangu model.
+def build_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
+    """Materialize DSA leaf-boundary specs for the target model.
 
     DSA does not follow a single q/k/v/o projection chain: some projections
     preserve sequence parallelism, some shard index/query heads, and
@@ -70,7 +70,7 @@ def build_openpangu_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
                     is_boundary=False,
                 )
 
-        # The OpenPangu integration gathers the language-model SP output before
+        # The integration gathers the language-model SP output before
         # its multi-token prediction vocabulary heads.  The vocab-parallel
         # projection therefore consumes a replicated sequence (not Shard(1)).
         if fqn == "lm_head" or fqn.endswith(".lm_head"):
@@ -82,7 +82,7 @@ def build_openpangu_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
                 out_dst={"output": {"tp": Shard(-1)}},
             )
             continue
-        # OpenPangu VL merges image/audio features into token embeddings before
+        # The VL model merges image/audio features into token embeddings before
         # entering the language-model SP boundary.  Keep the vocab-parallel
         # embedding output replicated here; the parent language-model boundary
         # performs the sequence scatter after multimodal fusion.
@@ -171,6 +171,6 @@ def build_openpangu_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
     return specs
 
 
-OPENPANGU_DSA_ARCHITECTURES = frozenset({
-    "openpanguv2vl", "openpangu_v2_vl", "openpangu_v2_vl_moe",
+DSA_ARCHITECTURES = frozenset({
+    "v2vl", "v2_vl", "v2_vl_moe",
 })

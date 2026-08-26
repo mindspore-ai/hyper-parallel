@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for the OpenPangu MHC tensor-parallel parameter template."""
+"""Tests for the MHC tensor-parallel parameter template."""
 
 from types import SimpleNamespace
 
 import torch
 from torch import nn
 
-from hyper_parallel.auto_models.components.distributed.openpangu_mhc_template import (
-    build_openpangu_mhc_specs,
+from hyper_parallel.auto_models.components.distributed.mhc_template import (
+    build_mhc_specs,
 )
 from hyper_parallel.auto_models.components.distributed.sharding_planner import (
     ShardingPlanner,
@@ -54,10 +54,10 @@ class _TinyLayer(nn.Module):
             self.merge_mhc_module = _TinyMhc()
 
 
-class _TinyOpenPangu(nn.Module):
+class _TinyVlModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(architectures=["OpenPanguV2VL"])
+        self.config = SimpleNamespace(architectures=["V2VL"])
         self.model = nn.Module()
         self.model.language_model = nn.Module()
         self.model.language_model.layers = nn.ModuleList([
@@ -71,10 +71,10 @@ class _FakeTpMesh:
     mesh_shape = (2,)
 
 
-def test_openpangu_mhc_template_owns_only_mhc_parameters():
-    model = _TinyOpenPangu()
+def test_mhc_template_owns_only_mhc_parameters():
+    model = _TinyVlModel()
 
-    specs = build_openpangu_mhc_specs(model)
+    specs = build_mhc_specs(model)
 
     assert specs
     assert all("mhc" in fqn for fqn in specs)
@@ -88,7 +88,7 @@ def test_openpangu_mhc_template_owns_only_mhc_parameters():
 
 def test_planner_composes_dsa_and_mhc_templates():
     """Independent architecture templates jointly cover their parameters."""
-    model = _TinyOpenPangu()
+    model = _TinyVlModel()
 
     plan = ShardingPlanner().plan(model, _FakeTpMesh(), tp_size=2)
 

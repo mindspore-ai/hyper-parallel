@@ -73,13 +73,13 @@ from hyper_parallel.auto_models.components.distributed.param_role import (
     ParameterClassifier,
     ParamRole,
 )
-from hyper_parallel.auto_models.components.distributed.openpangu_dsa_template import (
-    OPENPANGU_DSA_ARCHITECTURES,
-    build_openpangu_dsa_specs,
+from hyper_parallel.auto_models.components.distributed.dsa_template import (
+    DSA_ARCHITECTURES,
+    build_dsa_specs,
 )
-from hyper_parallel.auto_models.components.distributed.openpangu_mhc_template import (
-    OPENPANGU_MHC_ARCHITECTURES,
-    build_openpangu_mhc_specs,
+from hyper_parallel.auto_models.components.distributed.mhc_template import (
+    MHC_ARCHITECTURES,
+    build_mhc_specs,
 )
 from hyper_parallel.auto_models.components.distributed.pipelining import (
     AutoPipeline,
@@ -126,8 +126,8 @@ __all__ = [
     "MeshAxisName",
     "ModuleShardingSpec",
     "NamedPlacement",
-    "OPENPANGU_DSA_ARCHITECTURES",
-    "OPENPANGU_MHC_ARCHITECTURES",
+    "DSA_ARCHITECTURES",
+    "MHC_ARCHITECTURES",
     "ParameterClassifier",
     "ParamRole",
     "PlacementMismatchError",
@@ -142,8 +142,8 @@ __all__ = [
     "bind_local_expert_forward",
     "build_expert_mesh",
     "build_source_shard_info",
-    "build_openpangu_dsa_specs",
-    "build_openpangu_mhc_specs",
+    "build_dsa_specs",
+    "build_mhc_specs",
     "check_dispatchable",
     "deepseekv3_ep_compute_fn",
     "mixtral_ep_compute_fn",

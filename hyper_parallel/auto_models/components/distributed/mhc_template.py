@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Built-in tensor-parallel parameter template for OpenPangu MHC modules."""
+"""Built-in tensor-parallel parameter template for MHC modules."""
 
 from typing import Dict
 
@@ -35,8 +35,8 @@ def _direct_params(module):
     }
 
 
-def build_openpangu_mhc_specs(model) -> Dict[str, ModuleShardingSpec]:
-    """Materialize replicated parameter specs for OpenPangu MHC modules.
+def build_mhc_specs(model) -> Dict[str, ModuleShardingSpec]:
+    """Materialize replicated parameter specs for MHC modules.
 
     MHC mixes recurrent streams locally inside each sequence-parallel shard.
     Its coefficients and small projections are therefore replicated across TP
@@ -56,6 +56,6 @@ def build_openpangu_mhc_specs(model) -> Dict[str, ModuleShardingSpec]:
     return specs
 
 
-OPENPANGU_MHC_ARCHITECTURES = frozenset({
-    "openpanguv2vl", "openpangu_v2_vl", "openpangu_v2_vl_moe",
+MHC_ARCHITECTURES = frozenset({
+    "v2vl", "v2_vl", "v2_vl_moe",
 })

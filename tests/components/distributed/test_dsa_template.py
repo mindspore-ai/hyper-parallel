@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for the OpenPangu architecture-specific TP template."""
+"""Tests for the DSA architecture-specific TP template."""
 
 from types import SimpleNamespace
 
@@ -75,10 +75,10 @@ class _TinyLayer(nn.Module):
         self.self_attention = _TinyAttention()
 
 
-class _TinyOpenPangu(nn.Module):
+class _TinyVlModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(architectures=["OpenPanguV2VL"])
+        self.config = SimpleNamespace(architectures=["V2VL"])
         self.model = nn.Module()
         self.model.language_model = nn.Module()
         self.model.language_model.layers = nn.ModuleList([_TinyLayer()])
@@ -86,11 +86,11 @@ class _TinyOpenPangu(nn.Module):
 
 def test_linear_proj_sequence_axis_follows_attention_runtime_layout():
     """Mixed attention layers reduce-scatter on their actual sequence axis."""
-    from hyper_parallel.auto_models.components.distributed.openpangu_dsa_template import (
-        build_openpangu_dsa_specs,
+    from hyper_parallel.auto_models.components.distributed.dsa_template import (
+        build_dsa_specs,
     )
 
-    specs = build_openpangu_dsa_specs(_MixedAttentionModel())
+    specs = build_dsa_specs(_MixedAttentionModel())
 
     assert specs["layers.0.self_attention.linear_proj"].out_dst["output"]["tp"] == Shard(1)
     assert specs["layers.1.self_attention.linear_proj"].out_dst["output"]["tp"] == Shard(0)
@@ -98,13 +98,13 @@ def test_linear_proj_sequence_axis_follows_attention_runtime_layout():
     assert specs["layers.3.mtp_block.self_attention.linear_proj"].out_dst["output"]["tp"] == Shard(0)
 
 
-def test_openpangu_dsa_template_owns_only_sink_parameters():
+def test_dsa_template_owns_only_sink_parameters():
     """The DSA template replicates sinks without absorbing MHC concerns."""
-    from hyper_parallel.auto_models.components.distributed.openpangu_dsa_template import (
-        build_openpangu_dsa_specs,
+    from hyper_parallel.auto_models.components.distributed.dsa_template import (
+        build_dsa_specs,
     )
 
-    specs = build_openpangu_dsa_specs(_TinyOpenPangu())
+    specs = build_dsa_specs(_TinyVlModel())
     fqn = "model.language_model.layers.0.self_attention"
 
     assert set(specs) == {fqn}
