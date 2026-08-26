@@ -95,13 +95,14 @@ class DistributedDatasetConfig:
 
     ``packed_bytes_a2a`` accepts nested byte records and JSON scalar values.
     ``direct_tensor_a2a`` requires every owner sample to be one tensor and one
-    dtype per global microbatch; tensor shapes may vary. ``prefetch_steps``
-    bounds lightweight step-plan look-ahead. ``double_buffer`` keeps exactly
-    one fully prepared microbatch ahead, including online metadata collectives
-    and sample distribution. One prefetched step enables overlap within an
-    optimizer step; two or more also enable overlap across optimizer-step boundaries.
-    ``pin_memory``, ``num_workers``, and ``prefetch_factor`` configure the
-    native PyTorch DataLoader used for owner-local reads. Online candidates are
+    dtype per global microbatch; tensor shapes may vary. With sidecar metadata,
+    ``prefetch_steps`` bounds complete optimizer steps that are read, collated,
+    and made ready in Host memory. Online metadata preserves microbatch-local
+    planning, so the same option bounds Host-ready microbatches instead.
+    ``double_buffer`` independently keeps at most one device/communication-ready
+    microbatch ahead. ``prefetch_factor`` controls native PyTorch worker-task
+    look-ahead, while ``num_workers`` controls the worker count. ``pin_memory``
+    pins each final collated batch on a dedicated thread. Online candidates are
     pinned only after planning and redistribution. Distributed collectives
     always remain in the training rank process. ``raw_sample_size`` is the
     number of dataset records assigned to each data owner per microbatch.
@@ -142,6 +143,107 @@ class DistributedDatasetConfig:
             )
 
 
+def _validate_builder_metadata(
+    metadata_fn: Callable[[Any, int], SampleMeta] | None,
+    metadata: Sequence[SampleMeta] | None,
+) -> None:
+    if platform.platform_type != PlatformType.PYTORCH:
+        raise ValueError("The distributed dataset MVP currently supports only PyTorch.")
+    if metadata is None and metadata_fn is None:
+        raise ValueError("Online metadata requires metadata_fn when no sidecar metadata is provided.")
+    if metadata is not None and metadata_fn is not None:
+        raise ValueError("Provide either online metadata_fn or sidecar metadata, but not both.")
+
+
+def _create_local_data_loader(
+    dataset: Any,
+    metadata_fn: Callable[[Any, int], SampleMeta] | None,
+    metadata: Sequence[SampleMeta] | None,
+    collate_fn: Callable[[list[Any]], Any] | None,
+    worker_init_fn: Callable[[int], None] | None,
+    topology: DataTopology,
+    config: DistributedDatasetConfig,
+) -> TorchLocalDataLoader | None:
+    if not topology.is_data_owner:
+        return None
+    return TorchLocalDataLoader(
+        dataset,
+        metadata_fn=metadata_fn,
+        collate_fn=collate_fn,
+        num_workers=config.num_workers,
+        prefetch_factor=config.prefetch_factor,
+        pin_memory=config.pin_memory if metadata is not None else False,
+        worker_init_fn=worker_init_fn,
+        online_metadata=metadata is None,
+    )
+
+
+def _create_online_sample_source(
+    dataset: Any,
+    metadata_fn: Callable[[Any, int], SampleMeta],
+    planner: DistributedBatchPlanner,
+    topology: DataTopology,
+    local_data_loader: TorchLocalDataLoader | None,
+) -> StridedOnlineSampleSource:
+    if not hasattr(dataset, "__len__"):
+        raise ValueError("Online metadata requires a map-style dataset implementing __len__.")
+    complete_steps = len(dataset) // planner.global_samples_per_step
+    return StridedOnlineSampleSource(
+        dataset,
+        metadata_fn,
+        topology.data_rank,
+        topology.data_parallel_size,
+        max_entries=complete_steps * planner.local_samples_per_step,
+        local_data_loader=local_data_loader,
+    )
+
+
+def _create_sidecar_metadata_source(
+    metadata: Sequence[SampleMeta],
+    planner: DistributedBatchPlanner,
+    topology: DataTopology,
+) -> StridedMetadataSource:
+    complete_steps = len(metadata) // planner.global_samples_per_step
+    return StridedMetadataSource(
+        metadata,
+        topology.data_rank,
+        topology.data_parallel_size,
+        max_entries=complete_steps * planner.local_samples_per_step,
+    )
+
+
+def _create_sample_redistributor(
+    topology: DataTopology,
+    config: DistributedDatasetConfig,
+    metadata_group: Any,
+    communication_device: Any,
+) -> Any:
+    if topology.data_parallel_size == 1 or not topology.is_data_owner:
+        return LocalSampleRedistributor()
+    topology.validate_metadata_group(metadata_group)
+    if config.sample_transport == "packed_bytes_a2a":
+        return TorchPackedBytesRedistributor(metadata_group, communication_device=communication_device)
+    return TorchTensorRedistributor(metadata_group, communication_device=communication_device)
+
+
+def _create_metadata_synchronizer(topology: DataTopology, metadata_group: Any) -> Any:
+    if topology.data_parallel_size == 1 or not topology.is_data_owner:
+        return LocalMetadataSynchronizer()
+    topology.validate_metadata_group(metadata_group)
+    return TorchMetadataAllGather(metadata_group)
+
+
+def _create_micro_batch_distributor(
+    topology: DataTopology,
+    model_parallel_group: Any,
+    communication_device: Any,
+) -> Any:
+    if len(topology.model_parallel_ranks) == 1:
+        return LocalMicroBatchDistributor()
+    topology.validate_model_parallel_group(model_parallel_group)
+    return TorchMicroBatchDistributor(model_parallel_group, communication_device=communication_device)
+
+
 def build_distributed_dataset(
     dataset: Any,
     mesh: Any,
@@ -155,19 +257,20 @@ def build_distributed_dataset(
     cost_model: CostModel | None = None,
     worker_init_fn: Callable[[int], None] | None = None,
 ) -> DistributedDataset:
-    """Build a PyTorch-only online-planned distributed dataset.
+    """Build an online-planned distributed dataset.
 
     The builder creates dedicated ``metadata_group`` and model-parallel data
     groups from ``mesh``. All ranks must therefore call this function in the
     same control flow. Online metadata is the default path and balances one
     global microbatch at a time. An explicit sidecar ``metadata`` sequence
-    enables whole-step inter-microbatch planning before sample reads. When
-    ``config.double_buffer`` is enabled, every rank submits data collectives
-    from one ordered producer thread.
+    enables whole-step inter-microbatch planning before sample reads. Host
+    prefetch performs real dataset reads and CPU preprocessing; device double
+    buffering remains a separate one-microbatch stage. Every rank submits data
+    collectives from one ordered producer thread.
 
     Args:
-        dataset: Shared map-style dataset. Online mode reads only one local
-            microbatch of raw Host candidates at a time and redistributes them
+        dataset: Shared map-style dataset. Online mode reads a bounded number
+            of local raw Host-candidate microbatches and redistributes each one
             before heavyweight target-rank decode.
         mesh: Named root training mesh.
         config: Batch planning, double buffering, and sample A2A transport configuration.
@@ -178,22 +281,16 @@ def build_distributed_dataset(
             mode it receives the raw samples retained or received after planning.
         communication_device: Local collective device. Required for packed-byte
             owner A2A and tensor reception over HCCL/NCCL groups.
-        prepare_micro_batch: Optional owner-side move/packing before communication.
-            Double buffering invokes it on the data producer thread.
+        prepare_micro_batch: Optional owner-side move or packing in the
+            device/communication stage. Double buffering runs this stage ahead.
         cost_model: Optional calibrated workload cost model.
-        worker_init_fn: Optional callback forwarded to the native PyTorch
-            DataLoader and invoked once in each local worker process.
+        worker_init_fn: Optional callback forwarded to the native data loader
+            and invoked once in each local worker process.
 
     Returns:
         Configured :class:`DistributedDataset` iterator.
     """
-    if platform.platform_type != PlatformType.PYTORCH:
-        raise ValueError("The distributed dataset MVP currently supports only PyTorch.")
-    if metadata is None and metadata_fn is None:
-        raise ValueError("Online metadata requires metadata_fn when no sidecar metadata is provided.")
-    if metadata is not None and metadata_fn is not None:
-        raise ValueError("Provide either online metadata_fn or sidecar metadata, but not both.")
-
+    _validate_builder_metadata(metadata_fn, metadata)
     topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
     metadata_group, model_parallel_group = _create_data_groups(topology)
     planner = DistributedBatchPlanner(
@@ -203,78 +300,33 @@ def build_distributed_dataset(
         cost_model=cost_model,
         cp_shards=config.cp_shards,
     )
-    local_data_loader = (
-        TorchLocalDataLoader(
-            dataset,
-            metadata_fn=metadata_fn,
-            collate_fn=collate_fn,
-            num_workers=config.num_workers,
-            prefetch_factor=config.prefetch_factor,
-            pin_memory=config.pin_memory if metadata is not None else False,
-            worker_init_fn=worker_init_fn,
-            online_metadata=metadata is None,
-        )
-        if topology.is_data_owner
-        else None
+    local_data_loader = _create_local_data_loader(
+        dataset,
+        metadata_fn,
+        metadata,
+        collate_fn,
+        worker_init_fn,
+        topology,
+        config,
     )
     online_sample_source = None
     sample_redistributor = None
     if metadata is None:
-        if not hasattr(dataset, "__len__"):
-            raise ValueError("Online metadata requires a map-style dataset implementing __len__.")
-        complete_steps = len(dataset) // planner.global_samples_per_step
         metadata_source = None
-        online_sample_source = StridedOnlineSampleSource(
-            dataset,
-            metadata_fn,
-            topology.data_rank,
-            topology.data_parallel_size,
-            max_entries=complete_steps * planner.local_samples_per_step,
-            local_data_loader=local_data_loader,
+        online_sample_source = _create_online_sample_source(
+            dataset, metadata_fn, planner, topology, local_data_loader
         )
-        if topology.data_parallel_size == 1 or not topology.is_data_owner:
-            sample_redistributor = LocalSampleRedistributor()
-        else:
-            topology.validate_metadata_group(metadata_group)
-            if config.sample_transport == "packed_bytes_a2a":
-                sample_redistributor = TorchPackedBytesRedistributor(
-                    metadata_group,
-                    communication_device=communication_device,
-                )
-            else:
-                sample_redistributor = TorchTensorRedistributor(
-                    metadata_group,
-                    communication_device=communication_device,
-                )
+        sample_redistributor = _create_sample_redistributor(
+            topology, config, metadata_group, communication_device
+        )
     else:
-        complete_steps = len(metadata) // planner.global_samples_per_step
-        metadata_source = StridedMetadataSource(
-            metadata,
-            topology.data_rank,
-            topology.data_parallel_size,
-            max_entries=complete_steps * planner.local_samples_per_step,
-        )
+        metadata_source = _create_sidecar_metadata_source(metadata, planner, topology)
     sidecar_data_loader = local_data_loader if metadata is not None else None
     micro_batch_fetcher = MicroBatchFetcher(MapDatasetFetcher(dataset), collate_fn, sidecar_data_loader)
-
-    if topology.data_parallel_size == 1:
-        metadata_synchronizer = LocalMetadataSynchronizer()
-    else:
-        if topology.is_data_owner:
-            topology.validate_metadata_group(metadata_group)
-            metadata_synchronizer = TorchMetadataAllGather(metadata_group)
-        else:
-            metadata_synchronizer = LocalMetadataSynchronizer()
-
-    if len(topology.model_parallel_ranks) == 1:
-        micro_batch_distributor = LocalMicroBatchDistributor()
-    else:
-        topology.validate_model_parallel_group(model_parallel_group)
-        micro_batch_distributor = TorchMicroBatchDistributor(
-            model_parallel_group,
-            communication_device=communication_device,
-        )
-
+    metadata_synchronizer = _create_metadata_synchronizer(topology, metadata_group)
+    micro_batch_distributor = _create_micro_batch_distributor(
+        topology, model_parallel_group, communication_device
+    )
     data_stream = platform.new_stream() if config.double_buffer and communication_device is not None else None
     return DistributedDataset(
         topology=topology,

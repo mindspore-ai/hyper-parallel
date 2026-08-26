@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Prepared and consumed offsets for exact data replay."""
+"""Reserved, Host-ready, and consumed offsets for exact data replay."""
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 
@@ -43,7 +44,14 @@ class DistributedDatasetState:
 
     @classmethod
     def from_dict(cls, state_dict: dict[str, Any]) -> "DistributedDatasetState":
-        """Validate and construct state from a checkpoint dictionary."""
+        """Validate and construct state from a checkpoint dictionary.
+
+        Args:
+            state_dict: Serialized distributed-dataset state.
+
+        Returns:
+            Validated checkpoint state.
+        """
         required = {"version", "consumed_offset", "next_step", "metadata_size", "samples_per_step"}
         missing = required - set(state_dict)
         if missing:
@@ -59,11 +67,12 @@ class _PendingWindow:
     cursor_start: int
     cursor_end: int
     replay_id: str | None = None
+    ready: bool = False
     delivered: bool = False
 
 
 class DatasetStateTracker:
-    """Track bounded preparation separately from successfully consumed data."""
+    """Track reservation, Host readiness, and successful consumption."""
 
     VERSION = 1
 
@@ -81,40 +90,60 @@ class DatasetStateTracker:
         self._consumed_offset = 0
         self._next_step = 0
         self._pending: deque[_PendingWindow] = deque()
+        self._lock = Lock()
 
     @property
     def consumed_offset(self) -> int:
         """Return the offset after the last successful optimizer step."""
-        return self._consumed_offset
+        with self._lock:
+            return self._consumed_offset
 
     @property
-    def prepared_offset(self) -> int:
-        """Return the offset after all reserved preparation windows."""
-        return self._pending[-1].cursor_end if self._pending else self._consumed_offset
+    def reserved_offset(self) -> int:
+        """Return the offset after all scheduled Host-prefetch windows."""
+        with self._lock:
+            return self._reserved_offset_unlocked()
+
+    @property
+    def ready_offset(self) -> int:
+        """Return the offset after contiguous windows ready in Host memory."""
+        with self._lock:
+            offset = self._consumed_offset
+            for window in self._pending:
+                if not window.ready:
+                    break
+                offset = window.cursor_end
+            return offset
 
     @property
     def next_step(self) -> int:
         """Return the logical step index for the next scheduled window."""
-        return self._next_step + len(self._pending)
+        with self._lock:
+            return self._next_step + len(self._pending)
 
     @property
     def has_delivered_unconsumed(self) -> bool:
         """Return whether a delivered step still awaits successful consumption."""
-        return bool(self._pending and self._pending[0].delivered)
+        with self._lock:
+            return bool(self._pending and self._pending[0].delivered)
 
     @property
     def can_prefetch(self) -> bool:
-        """Return whether another bounded look-ahead window may be scheduled."""
-        return len(self._pending) < self._prefetch_steps
+        """Return whether the bounded Host-ready queue has a free step slot."""
+        with self._lock:
+            queued_windows = sum(not window.delivered for window in self._pending)
+            return queued_windows < self._prefetch_steps
 
     @property
     def has_pending(self) -> bool:
         """Return whether any planned or scheduled step remains unconsumed."""
-        return bool(self._pending)
+        with self._lock:
+            return bool(self._pending)
 
     def can_reserve_full_step(self) -> bool:
         """Return whether the metadata source contains another complete local step."""
-        return self.prepared_offset + self._samples_per_step <= self._metadata_size
+        with self._lock:
+            return self._reserved_offset_unlocked() + self._samples_per_step <= self._metadata_size
 
     def reserve(self) -> tuple[int, int, int]:
         """Reserve the next bounded prefetch window.
@@ -122,58 +151,94 @@ class DatasetStateTracker:
         Returns:
             ``(step, cursor_start, cursor_end)`` for the producer task.
         """
-        if not self.can_prefetch:
-            raise ValueError(f"At most {self._prefetch_steps} unconsumed steps may be prepared.")
-        if not self.can_reserve_full_step():
-            raise ValueError("Metadata source does not contain another complete optimizer step.")
-        start = self.prepared_offset
-        end = start + self._samples_per_step
-        step = self._next_step + len(self._pending)
-        self._pending.append(_PendingWindow(start, end))
-        return step, start, end
+        with self._lock:
+            queued_windows = sum(not window.delivered for window in self._pending)
+            if queued_windows >= self._prefetch_steps:
+                raise ValueError(f"At most {self._prefetch_steps} Host-prefetch steps may be queued.")
+            start = self._reserved_offset_unlocked()
+            if start + self._samples_per_step > self._metadata_size:
+                raise ValueError("Metadata source does not contain another complete optimizer step.")
+            end = start + self._samples_per_step
+            step = self._next_step + len(self._pending)
+            self._pending.append(_PendingWindow(start, end))
+            return step, start, end
+
+    def mark_ready(self, cursor_start: int, cursor_end: int) -> None:
+        """Mark one fully read and Host-preprocessed window as ready.
+
+        Args:
+            cursor_start: Inclusive sample offset of the reserved window.
+            cursor_end: Exclusive sample offset of the reserved window.
+        """
+        with self._lock:
+            for window in self._pending:
+                if (window.cursor_start, window.cursor_end) != (cursor_start, cursor_end):
+                    continue
+                if window.ready:
+                    raise ValueError(f"Host-prefetch window [{cursor_start}, {cursor_end}) is already ready.")
+                window.ready = True
+                return
+        raise ValueError(f"Host-prefetch window [{cursor_start}, {cursor_end}) was not reserved.")
 
     def mark_delivered(self, replay_id: str, cursor_start: int, cursor_end: int) -> None:
-        """Attach a completed replay ID to the oldest scheduled window."""
-        if not self._pending:
-            raise ValueError("Cannot deliver a step when no prefetch window is pending.")
-        window = self._pending[0]
-        if window.delivered:
-            raise ValueError("The current prefetched step was already delivered and must be committed first.")
-        if not isinstance(replay_id, str) or not replay_id:
-            raise ValueError(f"replay_id must be a non-empty string, but got {replay_id!r}.")
-        if cursor_start != window.cursor_start or cursor_end != window.cursor_end:
-            raise ValueError(
-                f"Delivered cursor [{cursor_start}, {cursor_end}) does not match reserved window "
-                f"[{window.cursor_start}, {window.cursor_end})."
-            )
-        window.replay_id = replay_id
-        window.delivered = True
+        """Attach a completed replay ID to the oldest scheduled window.
+
+        Args:
+            replay_id: Deterministic identifier of the delivered step plan.
+            cursor_start: Inclusive sample offset of the delivered window.
+            cursor_end: Exclusive sample offset of the delivered window.
+        """
+        with self._lock:
+            if not self._pending:
+                raise ValueError("Cannot deliver a step when no prefetch window is pending.")
+            window = self._pending[0]
+            if not window.ready:
+                raise ValueError("Cannot deliver a distributed-data step before its Host data is ready.")
+            if window.delivered:
+                raise ValueError("The current prefetched step was already delivered and must be committed first.")
+            if not isinstance(replay_id, str) or not replay_id:
+                raise ValueError(f"replay_id must be a non-empty string, but got {replay_id!r}.")
+            if cursor_start != window.cursor_start or cursor_end != window.cursor_end:
+                raise ValueError(
+                    f"Delivered cursor [{cursor_start}, {cursor_end}) does not match reserved window "
+                    f"[{window.cursor_start}, {window.cursor_end})."
+                )
+            window.replay_id = replay_id
+            window.delivered = True
 
     def commit(self, replay_id: str) -> None:
-        """Commit the oldest delivered plan after optimizer-step success."""
-        if not self._pending or not self._pending[0].delivered:
-            raise ValueError("No delivered distributed-data step is available to commit.")
-        window = self._pending[0]
-        if replay_id != window.replay_id:
-            raise ValueError(f"Plans must commit in order: expected {window.replay_id}, but got {replay_id}.")
-        self._consumed_offset = window.cursor_end
-        self._next_step += 1
-        self._pending.popleft()
+        """Commit the oldest delivered plan after optimizer-step success.
+
+        Args:
+            replay_id: Deterministic identifier of the successfully consumed plan.
+        """
+        with self._lock:
+            if not self._pending or not self._pending[0].delivered:
+                raise ValueError("No delivered distributed-data step is available to commit.")
+            window = self._pending[0]
+            if replay_id != window.replay_id:
+                raise ValueError(f"Plans must commit in order: expected {window.replay_id}, but got {replay_id}.")
+            self._consumed_offset = window.cursor_end
+            self._next_step += 1
+            self._pending.popleft()
 
     def state_dict(self) -> dict[str, int]:
         """Return checkpoint state at the successfully consumed offset only."""
-        return DistributedDatasetState(
-            consumed_offset=self._consumed_offset,
-            next_step=self._next_step,
-            metadata_size=self._metadata_size,
-            samples_per_step=self._samples_per_step,
-            version=self.VERSION,
-        ).to_dict()
+        with self._lock:
+            return DistributedDatasetState(
+                consumed_offset=self._consumed_offset,
+                next_step=self._next_step,
+                metadata_size=self._metadata_size,
+                samples_per_step=self._samples_per_step,
+                version=self.VERSION,
+            ).to_dict()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Restore consumed state and discard any runtime look-ahead."""
-        if self._pending:
-            raise ValueError("Cannot restore distributed dataset state while prefetch work is pending.")
+        """Restore consumed state and discard any runtime look-ahead.
+
+        Args:
+            state_dict: Checkpoint state recorded after a successful optimizer step.
+        """
         state = DistributedDatasetState.from_dict(state_dict)
         if state.version != self.VERSION:
             raise ValueError(f"Unsupported distributed dataset state version {state.version}.")
@@ -195,5 +260,11 @@ class DatasetStateTracker:
             raise ValueError(
                 f"State consumed_offset {state.consumed_offset} and next_step {state.next_step} are not step-aligned."
             )
-        self._consumed_offset = state.consumed_offset
-        self._next_step = state.next_step
+        with self._lock:
+            if self._pending:
+                raise ValueError("Cannot restore distributed dataset state while prefetch work is pending.")
+            self._consumed_offset = state.consumed_offset
+            self._next_step = state.next_step
+
+    def _reserved_offset_unlocked(self) -> int:
+        return self._pending[-1].cursor_end if self._pending else self._consumed_offset

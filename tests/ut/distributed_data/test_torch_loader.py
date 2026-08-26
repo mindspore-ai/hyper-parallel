@@ -23,6 +23,7 @@ from unittest.mock import patch
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
 from hyper_parallel.distributed_data.schema import SampleMeta
 from hyper_parallel.distributed_data.torch_loader import TorchLocalDataLoader
+from tests.common.mark_utils import arg_mark
 
 _WORKER_ID_ENV = "HYPER_DATA_TEST_WORKER_ID"
 
@@ -64,8 +65,16 @@ def _worker_init_fn(worker_id: int) -> None:
 class TestTorchLocalDataLoader(unittest.TestCase):
     """Validate planned and online reads through native DataLoader workers."""
 
-    def test_sidecar_plan_uses_persistent_workers_and_preserves_batch_order(self) -> None:
-        """Planned microbatches should be collated by native worker processes."""
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_sidecar_plan_uses_sample_tasks_and_preserves_batch_order(self) -> None:
+        """
+        Feature: Owner-local data loading
+        Description: Multiple workers should load samples before caller-side final collation.
+        Expectation: The operation produces the expected data, ordering, state, or error.
+        """
         planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=2)
         plan = planner.plan(
             tuple(SampleMeta(sample_id=index) for index in range(4)),
@@ -100,16 +109,24 @@ class TestTorchLocalDataLoader(unittest.TestCase):
                 next_batch["sample_ids"],
                 tuple(sample.meta.sample_id for sample in next_plan.samples_for(0, 0)),
             )
-            self.assertTrue(all(batch["collate_pid"] != os.getpid() for batch in batches))
-            self.assertEqual({batch["worker_ids"][0] for batch in batches}, {"0", "1"})
-            self.assertTrue(all(len(set(batch["sample_pids"])) == 1 for batch in batches))
+            self.assertTrue(all(batch["collate_pid"] == os.getpid() for batch in batches))
+            self.assertTrue(all(set(batch["worker_ids"]) == {"0", "1"} for batch in batches))
+            self.assertTrue(all(len(set(batch["sample_pids"])) == 2 for batch in batches))
         finally:
             loader.close()
 
         loader.close()
 
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
     def test_online_metadata_runs_per_sample_in_workers_without_pinning_candidates(self) -> None:
-        """Online reads should use workers but return raw candidate samples for planning."""
+        """
+        Feature: Owner-local data loading
+        Description: Online reads should use workers but return raw candidate samples for planning.
+        Expectation: The operation produces the expected data, ordering, state, or error.
+        """
         loader = TorchLocalDataLoader(
             _WorkerDataset(),
             metadata_fn=_metadata_fn,
@@ -132,8 +149,16 @@ class TestTorchLocalDataLoader(unittest.TestCase):
         finally:
             loader.close()
 
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
     def test_native_worker_failure_reaches_the_caller(self) -> None:
-        """DataLoader should retain its native worker traceback and exception type."""
+        """
+        Feature: Owner-local data loading
+        Description: DataLoader should retain its native worker traceback and exception type.
+        Expectation: The operation produces the expected data, ordering, state, or error.
+        """
         loader = TorchLocalDataLoader(
             _WorkerDataset(),
             metadata_fn=_metadata_fn,
@@ -150,8 +175,16 @@ class TestTorchLocalDataLoader(unittest.TestCase):
         finally:
             loader.close()
 
-    def test_forwards_native_prefetch_and_pin_memory_options(self) -> None:
-        """Worker queues and the pin thread should be owned by PyTorch DataLoader."""
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_forwards_native_worker_prefetch_options(self) -> None:
+        """
+        Feature: Owner-local data loading
+        Description: Worker queues should be native while final-batch pinning stays external.
+        Expectation: The operation produces the expected data, ordering, state, or error.
+        """
         with patch("torch.utils.data.DataLoader") as dataloader_type:
             loader = TorchLocalDataLoader(
                 _WorkerDataset(),
@@ -170,12 +203,20 @@ class TestTorchLocalDataLoader(unittest.TestCase):
             self.assertEqual(kwargs["prefetch_factor"], 4)
             self.assertTrue(kwargs["persistent_workers"])
             self.assertEqual(kwargs["multiprocessing_context"], "spawn")
-            self.assertTrue(kwargs["pin_memory"])
+            self.assertFalse(kwargs["pin_memory"])
         finally:
             loader.close()
 
+    @arg_mark(
+        plat_marks=["cpu_linux"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
     def test_rejects_pinning_before_online_redistribution(self) -> None:
-        """Raw online candidates should not consume the final-batch pin-memory budget."""
+        """
+        Feature: Owner-local data loading
+        Description: Raw online candidates should not consume the final-batch pin-memory budget.
+        Expectation: The operation produces the expected data, ordering, state, or error.
+        """
         with self.assertRaisesRegex(ValueError, "only after planning and redistribution"):
             TorchLocalDataLoader(
                 _WorkerDataset(),
