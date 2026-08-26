@@ -59,26 +59,6 @@ def test_prepare_module_io_two_card_wave_one():
     )
 
 
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_prepare_module_io_two_card_wave_one_gloo():
-    """
-    Feature: first parallel_run — four 2-card worker cases (sum ranks = 8)
-    Description:
-        1. test_prepare_module_input_identity_roundtrip_npu
-        2. test_prepare_module_output_replicate_to_shard_npu
-        3. test_prepare_module_input_output_chain_npu
-        4. test_prepare_module_input_then_colwise_linear_vs_cpu_npu
-    Expectation: Run success.
-    """
-    _run_group(
-        ("test_prepare_module_input_identity_roundtrip_npu", 10700, 2),
-        ("test_prepare_module_output_replicate_to_shard_npu", 10701, 2),
-        ("test_prepare_module_input_output_chain_npu", 10702, 2),
-        ("test_prepare_module_input_then_colwise_linear_vs_cpu_npu", 10703, 2),
-    )
-
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_prepare_module_io_two_card_wave_two():
