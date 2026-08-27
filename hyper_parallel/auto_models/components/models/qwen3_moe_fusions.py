@@ -28,6 +28,8 @@ from torch import nn
 from hyper_parallel.auto_models.components.distributed.cp_utils import (
     _cp_offset_causal_mask,
     flex_cp_allgather,
+    ulysses_head_to_seq,
+    ulysses_seq_to_head,
 )
 from hyper_parallel.auto_models.components.distributed.injection import inner_wrapper
 from hyper_parallel.auto_models.components.model_transform import module_replacement
@@ -263,6 +265,64 @@ def _validate_qwen3_moe_flash_attention_cp_target(
     return original_forward
 
 
+def _validate_qwen3_moe_flash_attention_ulysses_heads(
+    target_module: nn.Module,
+    cp_size: int,
+    wrapper_name: str,
+) -> None:
+    """Validate the Qwen3-MoE head counts required by Pure Ulysses."""
+    config = getattr(target_module, "config", None)
+    if config is None:
+        raise ValueError(f"{wrapper_name} requires target_module.config")
+
+    for name in ("num_attention_heads", "num_key_value_heads"):
+        count = getattr(config, name, None)
+        if count is None:
+            count = getattr(target_module, name, None)
+        if count is None:
+            raise ValueError(
+                f"{wrapper_name} requires {name} in target_module.config"
+            )
+        count = int(count)
+        if count % cp_size:
+            raise ValueError(
+                f"{wrapper_name} requires {name} ({count}) to be divisible "
+                f"by Ulysses degree ({cp_size})"
+            )
+
+
+def _prepare_qwen3_moe_flash_attention_ulysses_mask(
+    attention_mask: torch.Tensor | None,
+    query_length: int,
+    key_length: int,
+) -> torch.Tensor | None:
+    """Validate an external mask after Ulysses has restored global sequence."""
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim < 2:
+        raise ValueError(
+            "Qwen3-MoE fused Ulysses attention_mask must include query and key "
+            "dimensions"
+        )
+    if attention_mask.shape[-1] != key_length:
+        raise ValueError(
+            "Qwen3-MoE fused Ulysses attention_mask must cover the global key "
+            f"sequence: mask key length={attention_mask.shape[-1]}, "
+            f"expected {key_length}"
+        )
+
+    mask_query_length = attention_mask.shape[-2]
+    if mask_query_length < query_length:
+        raise ValueError(
+            "Qwen3-MoE fused Ulysses attention_mask must cover the global query "
+            f"sequence: mask query length={mask_query_length}, expected at least "
+            f"{query_length}"
+        )
+    if mask_query_length != query_length:
+        attention_mask = attention_mask.narrow(-2, 0, query_length)
+    return attention_mask
+
+
 def _prepare_qwen3_moe_flash_attention_cp_mask(
     attention_mask: torch.Tensor | None,
     query_length: int,
@@ -378,6 +438,77 @@ def _run_qwen3_moe_flash_attention_cp(
     return output, attention_weights
 
 
+def _run_qwen3_moe_flash_attention_ulysses(
+    target_module: nn.Module,
+    cp_mesh: Any,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Any | None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run fused Qwen3-MoE attention with synchronous Pure Ulysses A2A."""
+    input_shape, query_states, key_states, value_states = (
+        _prepare_qwen3_moe_attention_states(
+            target_module,
+            hidden_states,
+            position_embeddings,
+            past_key_values,
+        )
+    )
+    cp_size = cp_mesh.size()
+    for name, states in (
+        ("query", query_states),
+        ("key", key_states),
+        ("value", value_states),
+    ):
+        if states.shape[1] % cp_size:
+            raise ValueError(
+                f"{name} head count ({states.shape[1]}) must be divisible by "
+                f"Ulysses degree ({cp_size})"
+            )
+
+    query_states, key_states, value_states = (
+        ulysses_seq_to_head(states, 2, 1, cp_mesh)
+        for states in (query_states, key_states, value_states)
+    )
+    global_query_length = query_states.shape[2]
+    global_key_length = key_states.shape[2]
+    ulysses_attention_mask = _prepare_qwen3_moe_flash_attention_ulysses_mask(
+        attention_mask,
+        global_query_length,
+        global_key_length,
+    )
+    attention_output, attention_weights = _run_qwen3_moe_flash_attention(
+        target_module,
+        query_states,
+        key_states,
+        value_states,
+        ulysses_attention_mask,
+        dropout=(
+            0.0
+            if not target_module.training
+            else target_module.attention_dropout
+        ),
+        scaling=target_module.scaling,
+        sliding_window=target_module.sliding_window,
+        **kwargs,
+    )
+    # The fused kernel returns BSHD, whereas the projections use BHSD.
+    attention_output = ulysses_head_to_seq(
+        attention_output,
+        1,
+        2,
+        cp_mesh,
+    )
+    output = _project_qwen3_moe_attention_output(
+        target_module,
+        attention_output,
+        input_shape,
+    )
+    return output, attention_weights
+
+
 def _install_qwen3_moe_flash_attention_cp_forward(
     target_module: nn.Module,
     cp_mesh: Any,
@@ -448,6 +579,68 @@ def qwen3_moe_flash_attention_cp_mask_wrapper(
         "qwen3_moe_flash_attention_cp_mask_wrapper",
         allow_external_mask=True,
     )
+
+
+@inner_wrapper
+def qwen3_moe_flash_attention_ulysses_cp_wrapper(
+    target_module: nn.Module,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+) -> None:
+    """Install Qwen3-MoE fused attention with synchronous Pure Ulysses A2A.
+
+    Args:
+        target_module: Qwen3-MoE attention module whose forward is replaced.
+        mesh: Active model mesh supplied by the injection framework.
+        tp_mesh: Active tensor-parallel mesh, if configured.
+        cp_mesh: Active context-parallel mesh used for Ulysses all-to-all.
+        ep_mesh: Active expert-parallel mesh, if configured.
+    """
+    del mesh, tp_mesh, ep_mesh
+    wrapper_name = "qwen3_moe_flash_attention_ulysses_cp_wrapper"
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(f"{wrapper_name} requires an active CP mesh")
+    _validate_qwen3_moe_flash_attention_ulysses_heads(
+        target_module,
+        cp_mesh.size(),
+        wrapper_name,
+    )
+    original_forward = _validate_qwen3_moe_flash_attention_cp_target(
+        target_module,
+        cp_mesh,
+        wrapper_name,
+    )
+
+    @wraps(original_forward)
+    def cp_forward(
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Any | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the original attention signature through Pure Ulysses.
+
+        Args:
+            hidden_states: Local sequence shard hidden states.
+            position_embeddings: Cosine and sine rotary embedding tensors.
+            attention_mask: Optional mask covering the global sequence.
+            past_key_values: Optional model cache passed through to projection.
+            **kwargs: Additional fused attention arguments.
+        """
+        return _run_qwen3_moe_flash_attention_ulysses(
+            target_module,
+            cp_mesh,
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_values,
+            **kwargs,
+        )
+
+    target_module.forward = cp_forward
 
 
 @module_replacement
