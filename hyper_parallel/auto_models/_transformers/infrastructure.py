@@ -79,12 +79,14 @@ def _apply_activation_checkpointing(
     model: nn.Module,
     activation_checkpoint: Optional[str],
     enable_compile: bool = False,
+    swap_inputs: bool = False,
 ) -> nn.Module:
     """Forward activation checkpointing to the distributed implementation."""
     return _apply_activation_checkpointing_impl(
         model,
         activation_checkpoint,
         enable_compile=enable_compile,
+        swap_inputs=swap_inputs,
     )
 
 
@@ -648,11 +650,15 @@ def _apply_activation_features(
     activation_swap: str,
     compile_for_execution: bool,
     mesh: Optional[MeshContext],
+    swap_inputs: bool = False,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order."""
     if activation_checkpoint not in (None, "off"):
         model = _apply_activation_checkpointing(
-            model, activation_checkpoint, enable_compile=compile_for_execution
+            model,
+            activation_checkpoint,
+            enable_compile=compile_for_execution,
+            swap_inputs=swap_inputs,
         )
     validate_attention_swap(
         activation_swap,
@@ -699,6 +705,7 @@ def apply_model_infrastructure(
     compile_config: Optional[Union[CompileConfig, dict]] = None,
     activation_checkpoint: Optional[str] = None,
     activation_swap: str = "none",
+    swap_inputs: bool = False,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device: Optional[torch.device] = None,
@@ -747,7 +754,12 @@ def apply_model_infrastructure(
     )
 
     model = _apply_activation_features(
-        model, activation_checkpoint, activation_swap, compile_for_execution, mesh
+        model,
+        activation_checkpoint,
+        activation_swap,
+        compile_for_execution,
+        mesh,
+        swap_inputs=swap_inputs,
     )
     # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
     # as DTensors, and FSDP derives their source layouts directly.

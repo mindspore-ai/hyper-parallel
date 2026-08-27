@@ -85,6 +85,7 @@ class _BaseHyperAutoModelClass:
         compile_config: Optional[Union[CompileConfig, dict]] = None,
         freeze_config: Optional[Any] = None,
         activation_checkpoint: Optional[str] = None,
+        swap_inputs: bool = False,
         activation_swap: str = "none",
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -137,6 +138,7 @@ class _BaseHyperAutoModelClass:
             compile_config=compile_config,
             freeze_config=freeze_config,
             activation_checkpoint=activation_checkpoint,
+            swap_inputs=swap_inputs,
             activation_swap=activation_swap,
             **kwargs,
         )
@@ -152,6 +154,7 @@ class _BaseHyperAutoModelClass:
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "sdpa",
         activation_checkpoint: Optional[str] = None,
+        swap_inputs: bool = False,
         activation_swap: str = "none",
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -187,6 +190,7 @@ class _BaseHyperAutoModelClass:
             load_base_model=False,
             distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
+            swap_inputs=swap_inputs,
             activation_swap=activation_swap,
             **kwargs,
         )
@@ -214,6 +218,7 @@ class _BaseHyperAutoModelClass:
         compile_config=None,
         freeze_config=None,
         activation_checkpoint: Optional[str] = None,
+        swap_inputs: bool = False,
         activation_swap: str = "none",
         **kwargs,
     ) -> PreTrainedModel:
@@ -286,6 +291,7 @@ class _BaseHyperAutoModelClass:
             validate_placement=validate_placement,
             distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
+            swap_inputs=swap_inputs,
             activation_swap=activation_swap,
         )
 

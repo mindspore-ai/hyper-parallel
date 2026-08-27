@@ -378,6 +378,7 @@ class BaseTrainer(Stateful, ABC):
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
             activation_checkpoint=self.config.activation_checkpoint.mode,
+            swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
             activation_swap=self.config.activation_swap,
             compile_config=self.config.compile
         )
