@@ -21,6 +21,7 @@ from hyper_parallel.core.context_parallel.async_dsa_context_parallel import (
     AsyncDSASparseAttentionContextParallel,
 )
 from hyper_parallel.core.context_parallel.dsa_context_parallel import (
+    DSADenseAttentionContextParallel,
     DSAIndexerContextParallel,
     DSAIndexerLossContextParallel,
     DSASparseAttentionContextParallel,
@@ -32,6 +33,7 @@ __all__ = [
     "AsyncDSAIndexerContextParallel",
     "AsyncDSAIndexerLossContextParallel",
     "AsyncDSASparseAttentionContextParallel",
+    "DSADenseAttentionContextParallel",
     "DSAIndexerContextParallel",
     "DSAIndexerLossContextParallel",
     "DSASparseAttentionContextParallel",
