@@ -503,6 +503,26 @@ def apply_cache_compatibility_patches() -> None:
 
 
 def destroy_process_group() -> None:
-    """Destroy the process group."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    """Destroy the process group and clear caches tied to the distributed runtime."""
+    try:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    finally:
+        # Import here to avoid adding the cache modules to the auto-model import graph during package initialization.
+        from hyper_parallel.auto_models.components.distributed.cp_utils import (  # pylint: disable=C0415
+            _HYBRID_MESH_CACHE,
+        )
+        from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP  # pylint: disable=C0415
+        from hyper_parallel.core.dtensor.dtensor import _LAYOUT_CACHE  # pylint: disable=C0415
+        from hyper_parallel.core.dtensor.tensor_redistribution import _tensor_redistribution  # pylint: disable=C0415
+        from hyper_parallel.core.fully_shard.hsdp_param import _GROUP_INFO_CACHE  # pylint: disable=C0415
+        from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS  # pylint: disable=C0415
+
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+        _GROUP_INFO_CACHE.clear()
+        _HYBRID_MESH_CACHE.clear()
+        _tensor_redistribution._transform_cache.clear()  # pylint: disable=protected-access
+        _tensor_redistribution.is_init = False
+        _tensor_redistribution.rank_id = None
