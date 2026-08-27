@@ -856,7 +856,7 @@ def _is_hsdp_param_sharded(hsdp_param) -> bool:
     if legacy_state is not None:
         return bool(legacy_state)
 
-    from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
+    from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState  # pylint: disable=C0415
 
     if not hasattr(hsdp_param, "sharded_state"):
         raise AttributeError(

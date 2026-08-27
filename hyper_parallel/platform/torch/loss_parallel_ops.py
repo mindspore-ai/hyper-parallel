@@ -32,9 +32,7 @@ from hyper_parallel.core.tensor_parallel.loss_parallel_ops_common import (
     _get_local_tensor,
     _validate_cross_entropy_params,
     _check_context_and_layout,
-    _validate_mesh_and_shard,
 )
-from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_strict
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()

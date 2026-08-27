@@ -236,7 +236,7 @@ def _validate_ep_compute_injections(plan, model):
                 and getattr(spec, "region_dispatch", None) is not False):
             suggestion = ""
             if model is not None:
-                arch = ShardingPlanner._get_architecture(model)
+                arch = ShardingPlanner._get_architecture(model)  # pylint: disable=protected-access
                 archetype = EP_ARCHETYPE_SUGGESTIONS.get(arch)
                 if archetype is not None:
                     suggestion = (
@@ -718,7 +718,7 @@ def _install_bias_suppression(module, spec):
         owner = module.get_submodule(owner_path) if owner_path else module
         original = owner.forward
 
-        @functools.wraps(original)
+        @functools.wraps(original)  # pylint: disable=cell-var-from-loop
         def bias_free_forward(
             *args: Any,
             __original: Callable[..., Any] = original,

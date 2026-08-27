@@ -55,6 +55,8 @@ class _TinyLayer(nn.Module):
 
 
 class _TinyVlModel(nn.Module):
+    """A minimal VL-shaped model used to test structural template matching."""
+
     def __init__(self) -> None:
         super().__init__()
         # Deliberately unrelated: DSA/MHC templates must match structure, not

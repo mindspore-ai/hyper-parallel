@@ -147,7 +147,7 @@ def _validate_mesh_and_shard(dtensor: DTensor, strict: bool = True) -> None:
 
 
 def _validate_cross_entropy_params(
-    input_tensor,
+    input_tensor,  # pylint: disable=W0613
     target,
     weight: Optional[Any],
     size_average: Optional[bool],

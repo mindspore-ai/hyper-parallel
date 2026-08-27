@@ -20,6 +20,10 @@ import torch
 from torch import nn
 
 from hyper_parallel.auto_models.components.distributed import sharding_applier
+from hyper_parallel.auto_models.components.distributed.dsa_template import (
+    build_dsa_specs,
+    matches_dsa_template,
+)
 from hyper_parallel.auto_models.components.distributed.sharding_config import (
     ModuleShardingSpec,
 )
@@ -92,10 +96,6 @@ class _PlainLmHeadModel(nn.Module):
 
 def test_linear_proj_sequence_axis_follows_attention_runtime_layout():
     """Mixed attention layers reduce-scatter on their actual sequence axis."""
-    from hyper_parallel.auto_models.components.distributed.dsa_template import (
-        build_dsa_specs,
-    )
-
     specs = build_dsa_specs(_MixedAttentionModel())
 
     assert specs["layers.0.self_attention.linear_proj"].out_dst["output"]["tp"] == Shard(1)
@@ -106,10 +106,6 @@ def test_linear_proj_sequence_axis_follows_attention_runtime_layout():
 
 def test_dsa_template_owns_only_sink_parameters():
     """The DSA template replicates sinks without absorbing MHC concerns."""
-    from hyper_parallel.auto_models.components.distributed.dsa_template import (
-        build_dsa_specs,
-    )
-
     specs = build_dsa_specs(_TinyVlModel())
     fqn = "model.language_model.layers.0.self_attention"
 
@@ -127,15 +123,10 @@ def test_dsa_template_owns_only_sink_parameters():
 
 def test_dsa_template_does_not_claim_plain_lm_head_without_dsa_structure():
     """A global template scan must not override ordinary model boundaries."""
-    from hyper_parallel.auto_models.components.distributed.dsa_template import (
-        build_dsa_specs,
-        matches_dsa_template,
-    )
-
     model = _PlainLmHeadModel()
 
     assert not matches_dsa_template(model)
-    assert build_dsa_specs(model) == {}
+    assert not build_dsa_specs(model)
 
 
 def test_parameter_sharding_updates_explicit_head_count_owner(monkeypatch):
@@ -144,7 +135,7 @@ def test_parameter_sharding_updates_explicit_head_count_owner(monkeypatch):
     model.attention = nn.Module()
     model.attention.projection = nn.Linear(4, 4, bias=False)
     spec = ModuleShardingSpec(params={})
-    spec._head_count_owner = "attention"
+    spec._head_count_owner = "attention"  # pylint: disable=protected-access
     plan = SimpleNamespace(
         modules={"attention.projection": spec},
         mesh_dim_names=("tp",),
@@ -168,7 +159,7 @@ def test_parameter_sharding_updates_explicit_head_count_owner(monkeypatch):
         lambda owner, size, fqn: calls.append((owner, size, fqn)),
     )
 
-    sharding_applier._shard_planned_parameters(
+    sharding_applier._shard_planned_parameters(  # pylint: disable=protected-access
         [model], plan, object(), None, tp_mesh, validate_mode=False,
     )
 

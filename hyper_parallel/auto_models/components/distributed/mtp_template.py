@@ -27,6 +27,7 @@ _MTP_CHILDREN = frozenset({"mtp_block", "prev_norm", "emb_norm", "prev_proj"})
 
 
 def _matching_mtp_layers(model: Any) -> Dict[str, Any]:
+    """Find decoder layers that expose the full MTP structural contract."""
     matches = {}
     for fqn, module in model.named_modules():
         if not _MTP_LAYER.search(fqn):
@@ -73,4 +74,3 @@ def build_mtp_specs(model: Any) -> Dict[str, ModuleShardingSpec]:
             out_dst={"output": {"tp": Shard(1)}},
         )
     return specs
-    

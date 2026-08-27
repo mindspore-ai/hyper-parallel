@@ -59,6 +59,7 @@ class _FakeTpMesh:
 
 
 def test_mtp_template_declares_replicated_prev_proj_with_sequence_shards():
+    """MTP prev_proj keeps its weight replicated across TP ranks."""
     model = _TinyModel(_TinyMtpLayer())
 
     specs = build_mtp_specs(model)
@@ -81,6 +82,7 @@ def test_mtp_template_rejects_a_prev_proj_name_without_mtp_structure():
 
 
 def test_planner_covers_all_mtp_specific_trainable_parameters():
+    """The plan declares sharding for every MTP-specific trainable parameter."""
     model = _TinyModel(_TinyMtpLayer())
 
     plan = ShardingPlanner().plan(model, _FakeTpMesh(), tp_size=2)
@@ -92,4 +94,3 @@ def test_planner_covers_all_mtp_specific_trainable_parameters():
     }
     assert set(dict(model.named_parameters())) == declared
     assert isinstance(plan.modules["layers.0.prev_proj"].params["weight"]["tp"], Replicate)
- 

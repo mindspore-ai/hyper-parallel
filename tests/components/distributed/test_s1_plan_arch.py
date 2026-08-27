@@ -2,15 +2,20 @@
 # Licensed under the Apache License, Version 2.0
 # ============================================================================
 
+# White-box tests deliberately exercise private planner/spec APIs.
+# pylint: disable=protected-access
+
 """test_s1_plan_arch.py: 核心套件合并文件。
 
-来源: test_s1_arch_override.py, test_s1_head_count.py, test_s1_role_mapping.py, test_s1_semantic_infer.py, test_s1_mla_deepseek.py, test_s1_special_handlers.py, test_s1_compat.py, test_s1_sp_loss_matrix.py
+来源: test_s1_arch_override.py, test_s1_head_count.py, test_s1_role_mapping.py,
+test_s1_semantic_infer.py, test_s1_mla_deepseek.py, test_s1_special_handlers.py,
+test_s1_compat.py, test_s1_sp_loss_matrix.py
 """
 
 import logging
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 from hyper_parallel.auto_models.components.distributed.head_count import (
     _is_head_sharded,
     _update_user_tp_attrs,
@@ -89,6 +94,8 @@ class _Cfg:
 
 
 class TestArchOverridePriority:
+    """ARCH_OVERRIDES take precedence over the default role mapping."""
+
     def test_override_beats_default(self):
         """override 命中 → 覆盖默认规则（embed_tokens 默认 EMBED，强制为 SKIP）。"""
         overrides = {"myarch": [("embed_tokens.weight", ParamRole.SKIP)]}
@@ -119,6 +126,8 @@ class TestArchOverridePriority:
 
 
 class TestGetArchitecture:
+    """ShardingPlanner._get_architecture resolution priority and fallbacks."""
+
     def setup_method(self):
         self.planner = ShardingPlanner()
 
@@ -161,6 +170,8 @@ def _spec(**params):
 
 
 class TestIsHeadSharded:
+    """Head-sharding detection from q/k/v weight placements."""
+
     def test_qkv_colwise_detected(self):
         spec = _spec(**{
             "q_proj.weight": {TP: Shard(0)},
@@ -213,7 +224,10 @@ class _NamedAttrAttention(nn.Module):
 
 
 class TestUpdateModuleHeadCounts:
+    """TP-local cached head-count rewriting (D-17)."""
+
     def test_divide_and_preserve_invariants(self):
+        """Dividing head counts preserves head_dim and the config object."""
         attn = TinyLlamaAttention(TinyConfig())   # num_heads=4, head_dim=4
         attn.num_key_value_heads = 4
         attn.num_index_heads = 8
@@ -249,6 +263,7 @@ class TestUpdateModuleHeadCounts:
         assert attn.num_heads == 2
 
     def test_non_divisible_warns_and_keeps(self, caplog):
+        """A non-divisible head count warns once and stays unchanged."""
         attn = TinyLlamaAttention(TinyConfig())   # num_heads=4
         with caplog.at_level(logging.WARNING):
             n = update_module_head_counts(attn, 3, "self_attn")
@@ -268,6 +283,7 @@ class TestUpdateModuleHeadCounts:
         assert not hasattr(attn, "_hp_full_head_counts")
 
     def test_user_tp_attr_divide_is_idempotent(self):
+        """User-declared TP-local attributes divide once and are then stable."""
         attn = TinyLlamaAttention(TinyConfig())
         attn.hidden_size = 16
         assert _update_user_tp_attrs(
@@ -306,6 +322,7 @@ T = TEMPLATES["attention"]
     (ParamRole.BIAS, "unmatched.bias", Replicate()),
 ])
 def test_role_to_tp_placement(role, path, tp_want):
+    """Each role maps to the expected TP placement for a dense boundary."""
     out = P._placement_for_role(path, role, T, has_tp=True, has_ep=False)
     assert out[TP] == tp_want
     # CP 维参数恒 Replicate；EP 维非 MoE 参数 Replicate
@@ -406,6 +423,7 @@ C, R, N = ParamRole.COLWISE, ParamRole.ROWWISE, ParamRole.NORM
     ("model.layers.0", [("a", ParamRole.SKIP)], "unknown"),
 ])
 def test_infer_boundary_type(fqn, group, want):
+    """Phase 3 boundary-type inference is driven by the role table."""
     assert P._infer_boundary_type(fqn, group) == want
 
 
@@ -458,6 +476,8 @@ class _TinyDeepseek(nn.Module):
 
 
 class TestMlaArchOverride:
+    """DeepSeek MLA ARCH_OVERRIDES apply to both architecture spellings."""
+
     def test_arch_overrides_registered_both_spellings(self):
         """architectures 拼写（deepseekv3）与 model_type 拼写（deepseek_v3）
         均注册同一份 MLA 覆盖；v2/v3 同构。"""
@@ -499,6 +519,8 @@ class TestMlaArchOverride:
 
 
 class TestMlaPlan:
+    """End-to-end MLA planning produces the expected attention boundaries."""
+
     def test_attention_boundary_and_placements(self, make_mesh):
         """端到端：architectures 检测 → 覆盖生效 → attention 边界生成，
         REPLICATED 全复制 / q_b,kv_b colwise / o_proj rowwise / cp_attn 置位。"""
@@ -575,7 +597,7 @@ def test_non_special_roles_ignored():
         "a.b.weight": ParamRole.COLWISE,
         "a.c.weight": ParamRole.SKIP,
     })
-    assert out == {}
+    assert not out
 
 
 def test_special_handlers_registry():
@@ -593,6 +615,8 @@ def _model(**kw):
 
 
 class TestCompat:
+    """validate_model_compatibility fails fast on non-divisible topologies."""
+
     def test_heads_not_divisible(self):
         with pytest.raises(ValueError, match="num_attention_heads"):
             validate_model_compatibility(
@@ -871,6 +895,8 @@ class _TinyQwen2MoeMlp(nn.Module):
 
 
 class _TinyQwen2Moe(nn.Module):
+    """A minimal Qwen2-MoE-shaped model for architecture-override tests."""
+
     def __init__(self, architectures=("Qwen2MoeForCausalLM",),
                  model_type="qwen2_moe"):
         super().__init__()
@@ -884,11 +910,13 @@ class _TinyQwen2Moe(nn.Module):
 
 
 class TestQwen2MoeArchOverride:
+    """Qwen2-MoE shared-expert-gate override registration and classification."""
+
     def test_arch_overrides_registered_both_spellings(self):
         for key in ("qwen2moe", "qwen2_moe"):
             assert key in ARCH_OVERRIDES
-            assert (["shared_expert_gate"], ParamRole.REPLICATED) in [
-                (pats, r) for pats, r in ARCH_OVERRIDES[key]]
+            assert (["shared_expert_gate"], ParamRole.REPLICATED) in list(
+                ARCH_OVERRIDES[key])
 
     def test_shared_expert_gate_replicated(self):
         """shared_expert_gate.weight → REPLICATED（不是 MOE_GATE —— 不会
