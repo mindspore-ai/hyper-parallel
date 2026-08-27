@@ -33,7 +33,27 @@ from hyper_parallel.core.dtensor.dtensor import (
 )
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import RaggedShard, Replicate, Shard
+from hyper_parallel.core.shard._op_dispatch import _debug_mode_observer  # pylint: disable=C0413
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+
+
+class _DispatchObserver:
+    """Record names resolved from real public API callables."""
+
+    def __init__(self) -> None:
+        """Initialize an empty dispatch-name list."""
+        self.names = []
+
+    def on_op_dispatch_enter(
+        self, op_name: str, op_call: object, args: tuple, kwargs: dict
+    ) -> None:
+        """Record the dispatcher name without replacing the callable."""
+        del op_call, args, kwargs
+        self.names.append(op_name)
+
+    def on_op_dispatch_exit(self, op_name: str, result: object) -> None:
+        """Satisfy the observer protocol without changing the result."""
+        del op_name, result
 
 
 class TestRaggedDTensor(unittest.TestCase):
@@ -243,6 +263,67 @@ class TestRaggedDTensor(unittest.TestCase):
         self.assertTrue(torch.equal(result.to_local(), expected))
         result.to_local().sum().backward()
         self.assertIsNotNone(local.grad)
+
+    def test_torch_public_interfaces_dispatch_whitelisted_names(self):
+        """Resolve RaggedShard whitelist names from real Torch public APIs."""
+        mesh = self._mesh()
+        first = DTensor.from_local(
+            torch.arange(1, 65, dtype=torch.float32),
+            mesh,
+            (RaggedShard(dims=(0, 1), local_units=(1, 2)),),
+            shape=(6, 4, 8),
+        )
+        second = DTensor.from_local(
+            torch.arange(2, 66, dtype=torch.float32),
+            mesh,
+            (RaggedShard(dims=(0, 1), local_units=(1, 2)),),
+            shape=(6, 4, 8),
+        )
+        # Lambdas normalize unary, binary, and reverse APIs to one test signature.
+        # pylint: disable=unnecessary-lambda,not-callable
+        cases = (
+            ("torch.abs(x)", "abs", lambda x, _: torch.abs(x)),
+            ("torch.absolute(x)", "absolute", lambda x, _: torch.absolute(x)),
+            ("torch.clone(x)", "clone", lambda x, _: torch.clone(x)),
+            ("torch.cos(x)", "cos", lambda x, _: torch.cos(x)),
+            ("torch.exp(x)", "exp", lambda x, _: torch.exp(x)),
+            ("torch.nn.functional.gelu(x)", "gelu", lambda x, _: torch.nn.functional.gelu(x)),
+            ("torch.isinf(x)", "isinf", lambda x, _: torch.isinf(x)),
+            ("torch.isnan(x)", "isnan", lambda x, _: torch.isnan(x)),
+            ("torch.log(x)", "log", lambda x, _: torch.log(x)),
+            ("torch.neg(x)", "neg", lambda x, _: torch.neg(x)),
+            ("torch.negative(x)", "negative", lambda x, _: torch.negative(x)),
+            ("torch.relu(x)", "relu", lambda x, _: torch.relu(x)),
+            ("torch.rsqrt(x)", "rsqrt", lambda x, _: torch.rsqrt(x)),
+            ("torch.sigmoid(x)", "sigmoid", lambda x, _: torch.sigmoid(x)),
+            ("torch.nn.functional.silu(x)", "silu", lambda x, _: torch.nn.functional.silu(x)),
+            ("torch.sin(x)", "sin", lambda x, _: torch.sin(x)),
+            ("torch.sqrt(x)", "sqrt", lambda x, _: torch.sqrt(x)),
+            ("torch.square(x)", "square", lambda x, _: torch.square(x)),
+            ("torch.add(x, y)", "add", lambda x, y: torch.add(x, y)),
+            ("torch.div(x, y)", "div", lambda x, y: torch.div(x, y)),
+            ("torch.mul(x, y)", "mul", lambda x, y: torch.mul(x, y)),
+            ("torch.pow(x, y)", "pow", lambda x, y: torch.pow(x, y)),
+            ("torch.sub(x, y)", "sub", lambda x, y: torch.sub(x, y)),
+            ("2.0 - x", "__rsub__", lambda x, _: 2.0 - x),
+            ("2.0 ** x", "__rpow__", lambda x, _: 2.0 ** x),
+            ("torch.true_divide(x, y)", "true_divide", lambda x, y: torch.true_divide(x, y)),
+        )
+
+        for api_name, expected_op_name, function in cases:
+            with self.subTest(api=api_name):
+                observer = _DispatchObserver()
+                token = _debug_mode_observer.set(observer)
+                try:
+                    result = function(first, second)
+                finally:
+                    _debug_mode_observer.reset(token)
+                self.assertEqual(observer.names, [expected_op_name])
+                self.assertEqual(tuple(result.placements), tuple(first.placements))
+
+        self.assertFalse(hasattr(torch, "real_div"))
+        self.assertFalse(hasattr(torch.Tensor, "real_div"))
+        self.assertFalse(hasattr(torch.ops.aten, "real_div"))
 
     def test_ragged_dtensor_supports_parameter_autograd_metadata(self):
         """Ragged DTensors should support Parameter wrapping and local hooks."""

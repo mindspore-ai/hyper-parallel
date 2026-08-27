@@ -86,6 +86,7 @@ _no_skip_ops: ContextVar[FrozenSet[str]] = ContextVar('_no_skip_ops', default=fr
 _debug_mode_observer: ContextVar = ContextVar('_debug_mode_observer', default=None)
 
 _RAGGED_ELEMENTWISE_OPS = {
+    # Torch public APIs dispatch with these lowercase names.
     "abs": "unary", "absolute": "unary", "clone": "unary", "cos": "unary",
     "conj": "unary", "empty_like": "unary", "exp": "unary", "gelu": "unary",
     "isinf": "unary", "isnan": "unary",
@@ -94,9 +95,18 @@ _RAGGED_ELEMENTWISE_OPS = {
     "sqrt": "unary", "square": "unary", "zeros_like": "unary",
     "add": "binary", "add_": "binary", "addcdiv_": "binary",
     "addcmul_": "binary", "div": "binary", "lerp_": "binary",
-    "mul": "binary", "mul_": "binary", "pow": "binary", "real_div": "binary",
+    "mul": "binary", "mul_": "binary", "pow": "binary",
     "sub": "binary", "__rsub__": "binary", "__rpow__": "binary",
     "true_divide": "binary",
+    # MindSpore public APIs dispatch with primitive names. Aliased APIs share
+    # one name, e.g. abs/absolute -> Abs and neg/negative -> Neg.
+    "Abs": "unary", "Clone": "unary", "Cos": "unary", "Exp": "unary",
+    "GeLU": "unary", "GeluExt": "unary", "IsInf": "unary", "IsNan": "unary",
+    "Log": "unary", "Neg": "unary", "ReLU": "unary", "Rsqrt": "unary",
+    "Sigmoid": "unary", "SiLU": "unary", "Sin": "unary", "Sqrt": "unary",
+    "Square": "unary",
+    "Add": "binary", "AddExt": "binary", "Div": "binary", "Mul": "binary",
+    "Pow": "binary", "RealDiv": "binary", "Sub": "binary", "SubExt": "binary",
 }
 
 _RAGGED_INPLACE_ELEMENTWISE_OPS = frozenset({

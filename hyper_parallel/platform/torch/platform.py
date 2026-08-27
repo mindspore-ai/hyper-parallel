@@ -1092,6 +1092,11 @@ class TorchPlatform(Platform):
         """
         return dist.new_group(ranks=list(rank_list))
 
+    @staticmethod
+    def detach(input_tensor):
+        """Return a tensor detached from the autograd graph."""
+        return input_tensor.detach()
+
     def _create_group(self, rank_list):
         normalized_rank_list = tuple(sorted(rank_list))
         world_rank_list = tuple(range(self.get_world_size()))

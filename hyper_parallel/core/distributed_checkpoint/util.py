@@ -503,8 +503,9 @@ def _broadcast_within_existing_groups(
             raise ValueError(f"The broadcast info attached to tensor must be of type {BroadcastInfo}.")
         group_ranks, src_rank = tuple(broadcast_info.group_ranks), broadcast_info.src_rank
         if group_ranks in groups:
+            local_tensor = obj.to_local() if isinstance(obj, DTensor) else obj
             platform.broadcast(
-                obj.to_local().detach() if isinstance(obj, DTensor) else obj.detach(),
+                platform.detach(local_tensor),
                 src_rank,
                 groups[group_ranks]
             )
@@ -574,8 +575,9 @@ def _create_groups_and_broadcast(missing_groups_ranks: dict[tuple, list[Any]]) -
             broadcast_info = getattr(tensor, BROADCAST_INFO, None)
             if broadcast_info is None:
                 continue
+            local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
             platform.broadcast(
-                tensor.to_local().detach() if isinstance(tensor, DTensor) else tensor.detach(),
+                platform.detach(local_tensor),
                 broadcast_info.src_rank,
                 new_groups[group_ranks]
             )

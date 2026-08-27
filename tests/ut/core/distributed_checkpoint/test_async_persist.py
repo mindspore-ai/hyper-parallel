@@ -70,6 +70,30 @@ class TestAsyncStaging(unittest.TestCase):
         self.assertFalse(staged_weight.is_cuda)
         torch.testing.assert_close(staged_weight, weight.cpu())
 
+    def test_copy_tensor_to_cpu_uses_platform_detach(self):
+        """
+        Feature: Cross-backend tensor staging.
+        Description: Stage a tensor whose detached value only exposes the shared ``to`` API.
+        Expectation: The platform detach hook is used and the CPU transfer requests an independent copy.
+        """
+        source = object()
+        staged = object()
+        to_calls = []
+
+        class _DetachedTensor:
+            def to(self, *args, **kwargs):
+                """Record the backend-neutral CPU copy request."""
+                to_calls.append((args, kwargs))
+                return staged
+
+        detached = _DetachedTensor()
+        with patch.object(staging_mod.platform, "detach", return_value=detached) as detach:
+            result = staging_mod._copy_tensor_to_cpu(source)
+
+        detach.assert_called_once_with(source)
+        self.assertEqual(to_calls, [(('cpu',), {'copy': True})])
+        self.assertIs(result, staged)
+
     def test_build_staged_state_dict_deep_copies_bytes(self):
         """
         Feature: build_staged_state_dict bytes isolation.

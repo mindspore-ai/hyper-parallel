@@ -17,6 +17,19 @@ from mindspore._c_expression import NoFallbackGuard, _DisableMsDispatchMode
 from mindspore.common.tensor import Tensor
 
 
+class _MindSporeGetItem:
+    """Expose native MindSpore getitem under its distributed operator name."""
+    name = "__getitem__"
+
+    @staticmethod
+    def __call__(tensor: Tensor, key: object) -> Tensor:
+        """Run MindSpore's native C++ tensor indexing implementation."""
+        return Tensor.__getitem__(tensor, key)
+
+
+_MS_GETITEM = _MindSporeGetItem()
+
+
 class DTensorBase(Tensor):
     """
     DTensorBase - Base class for distributed tensors in MindSpore.
@@ -90,6 +103,24 @@ class DTensorBase(Tensor):
 
     def __str__(self):
         return str(self._local_tensor)
+
+    def __getitem__(self, key: object) -> Tensor:
+        """Dispatch the supported Shard(0) integer case, otherwise use native getitem."""
+        if isinstance(key, int) and not isinstance(key, bool):
+            layout = getattr(self, "_layout", None)
+            placements = tuple(getattr(layout, "placements", ()) or ())
+            mesh_shape = tuple(getattr(layout, "mesh_shape", ()) or ())
+            if (
+                len(placements) == 1
+                and len(mesh_shape) == 1
+                and placements[0].is_shard(0)
+            ):
+                # Lazy import avoids a platform initialization cycle through core.dtensor.
+                from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard  # pylint: disable=C0415
+                if isinstance(placements[0], Shard) and not isinstance(placements[0], StridedShard):
+                    from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER  # pylint: disable=C0415
+                    return _OP_DISPATCHER.dispatch(_MS_GETITEM, (self, key), {})
+        return Tensor.__getitem__(self, key)
 
     def __copy__(self) -> Tensor:
         """

@@ -113,6 +113,14 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertIs(buffers["persistent"], module.persistent)
         self.assertIs(buffers["scratch"], module.scratch)
 
+    def test_detach_returns_tensor_without_grad_tracking(self):
+        """Torch platform detach removes autograd tracking from the result."""
+        tensor = torch.ones(2, requires_grad=True)
+        detached = TorchPlatform.detach(tensor)
+
+        self.assertFalse(detached.requires_grad)
+        self.assertTrue(torch.equal(detached, tensor))
+
     def test_dtensor_data_setter_updates_wrapper_and_local_tensor(self):
         """Assigning ``dtensor.data = x`` should synchronize wrapper and local tensor payloads."""
         class FakeDataDescriptor:

@@ -146,7 +146,7 @@ class DataCopier:
 def _copy_tensor_to_cpu(tensor: platform.Tensor) -> platform.Tensor:
     """Return a host-memory copy of a framework tensor, detached from autograd where applicable."""
     # ``to("cpu")`` is supported on both Torch and MindSpore tensor APIs used by HyperParallel.
-    t = tensor.detach().clone() if tensor.is_cpu else tensor.detach().cpu()
+    t = platform.detach(tensor).to("cpu", copy=True)
     if hasattr(tensor, CHUNK_INFO):
         setattr(t, CHUNK_INFO, getattr(tensor, CHUNK_INFO))
     return t
