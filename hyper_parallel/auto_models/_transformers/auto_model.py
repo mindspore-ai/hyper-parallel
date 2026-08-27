@@ -69,6 +69,11 @@ class _BaseHyperAutoModelClass:
         return super().from_pretrained(*args, **kwargs)  # pylint: disable=E1101
 
     @classmethod
+    def _from_config_parent_class(cls, *args, **kwargs):
+        """Delegate to the parent Hugging Face AutoModel ``from_config`` path."""
+        return super().from_config(*args, **kwargs)  # pylint: disable=no-member
+
+    @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
@@ -254,7 +259,7 @@ class _BaseHyperAutoModelClass:
 
         # Step 2: Build model
         with init_ctx:
-            is_custom_model, model = _init_model(
+            _, model = _init_model(
                 cls,
                 pretrained_model_name_or_path,
                 hf_config,

@@ -45,7 +45,7 @@ def module_replacement(factory: ModuleReplacementFactory) -> ModuleReplacementFa
         for parameter in signature.parameters.values()
     ):
         raise TypeError("module replacement factories must not declare **kwargs")
-    factory._hp_module_replacement = True  # type: ignore[attr-defined]
+    factory._hp_module_replacement = True  # type: ignore[attr-defined]  # pylint: disable=protected-access
     return factory
 
 
@@ -182,15 +182,23 @@ def compile_module_replacements(
 
 
 def _parent_and_name(model: nn.Module, fqn: str) -> tuple[nn.Module, str]:
+    """Resolve a replacement target's parent module and local name."""
+
     parent_fqn, _, name = fqn.rpartition(".")
     parent = model.get_submodule(parent_fqn) if parent_fqn else model
-    if not name or parent._modules.get(name) is None:
+    if not name or parent._modules.get(name) is None:  # pylint: disable=protected-access
         raise ValueError(f"replacement target {fqn!r} is no longer registered on its parent")
     return parent, name
 
 
 def _registered_names(module: nn.Module) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    return tuple(module._modules), tuple(module._parameters), tuple(module._buffers)
+    """Return direct module, parameter, and buffer registry names."""
+
+    return (  # pylint: disable=protected-access
+        tuple(module._modules),
+        tuple(module._parameters),
+        tuple(module._buffers),
+    )
 
 
 def _named_identities(module: nn.Module, *, kind: str) -> dict[str, object]:
@@ -201,6 +209,21 @@ def _named_identities(module: nn.Module, *, kind: str) -> dict[str, object]:
     if kind == "buffer":
         return dict(module.named_buffers(remove_duplicate=False))
     raise ValueError(f"unsupported module identity kind {kind!r}")
+
+
+def _named_tensor_shapes(model: nn.Module) -> dict[str, tuple[int, ...]]:
+    """Capture parameter and persistent-buffer shapes before replacement."""
+    shapes = {
+        name: tuple(value.shape)
+        for name, value in model.named_parameters(remove_duplicate=False)
+    }
+    for module_name, module in model.named_modules(remove_duplicate=False):
+        for name, value in module._buffers.items():  # pylint: disable=protected-access
+            if value is None or name in module._non_persistent_buffers_set:  # pylint: disable=protected-access
+                continue
+            fqn = f"{module_name}.{name}" if module_name else name
+            shapes[fqn] = tuple(value.shape)
+    return shapes
 
 
 def _validate_forward_compatibility(
@@ -269,6 +292,8 @@ def _validate_replacement(
     *,
     has_weight_transforms: bool = False,
 ) -> None:
+    """Validate that a replacement preserves the source module contract."""
+
     if not isinstance(replacement, nn.Module):
         raise TypeError(f"replacement factory for {fqn!r} must return nn.Module")
     if source.training != replacement.training:
@@ -303,6 +328,7 @@ def apply_module_replacements(
     *,
     weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
     context: Mapping[str, Any] | None = None,
+    capture_checkpoint_metadata: bool = True,
 ) -> tuple[nn.Module, list[WeightRenaming | WeightConverter] | None]:
     """Build all replacements, validate them, then install them atomically."""
 
@@ -334,21 +360,26 @@ def apply_module_replacements(
             target.module_fqns[0],
             has_weight_transforms=bool(transforms),
         )
+        if transforms and callable(getattr(replacement, "reset_parameters", None)):
+            replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
         prepared.append((target, replacement))
 
     for target, _ in prepared:
         for fqn in target.module_fqns:
             parent, name = _parent_and_name(model, fqn)
-            if parent._modules[name] is not target.source:
+            if parent._modules[name] is not target.source:  # pylint: disable=protected-access
                 raise ValueError(f"replacement target {fqn!r} changed while plan was being applied")
     if extra_transforms:
         if weights_mapping is None:
             raise ValueError(
                 "weights_mapping is required when a replacement defines make_transforms()"
             )
+        if capture_checkpoint_metadata:
+            model._hp_checkpoint_source_shapes = _named_tensor_shapes(model)  # pylint: disable=protected-access
+            model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
         weights_mapping[:0] = extra_transforms
     for target, replacement in prepared:
         for fqn in target.module_fqns:
             parent, name = _parent_and_name(model, fqn)
-            parent._modules[name] = replacement
+            parent._modules[name] = replacement  # pylint: disable=protected-access
     return model, weights_mapping

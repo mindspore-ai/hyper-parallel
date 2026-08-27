@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 # This package provides PyTorch-specific high-performance modules.
@@ -192,6 +192,7 @@ class MLAAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_values: Any | None = None,
+        actual_seq_len: torch.Tensor | Sequence[int] | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run MLA with the same external contract as Transformers attention."""
@@ -262,6 +263,7 @@ class MLAAttention(nn.Module):
             dropout=self.attention_dropout if self.training else 0.0,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
+            actual_seq_len=actual_seq_len,
             **kwargs,
         )
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
