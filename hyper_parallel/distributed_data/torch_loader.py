@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from typing import Any, Callable
 
-from hyper_parallel.distributed_data.fetcher import LoadedSample
+from hyper_parallel.distributed_data.data_construct import LoadedSample
 from hyper_parallel.distributed_data.schema import BatchPlan, SampleMeta
 from hyper_parallel.platform import get_platform
 
@@ -166,7 +166,7 @@ class TorchLocalDataLoader:
             )
         self._loader: Any = platform.create_data_loader(loader_dataset, **loader_kwargs)
         self._iterator: Iterator[Any] | None = None
-        self._active_replay_id: str | None = None
+        self._active_plan_id: str | None = None
         self._next_micro_batch_index = 0
         self._closed = False
 
@@ -189,7 +189,7 @@ class TorchLocalDataLoader:
         if self._online_metadata:
             raise ValueError("Online TorchLocalDataLoader cannot fetch sidecar-planned batches.")
         self._raise_if_closed()
-        if self._active_replay_id is None:
+        if self._active_plan_id is None:
             if micro_batch_index != plan.micro_batch_start:
                 raise ValueError(
                     f"Expected first microbatch {plan.micro_batch_start}, but got {micro_batch_index}."
@@ -201,9 +201,9 @@ class TorchLocalDataLoader:
             )
             self._batch_sampler.replace(sample_tasks)
             self._iterator = iter(self._loader)
-            self._active_replay_id = plan.replay_id
+            self._active_plan_id = plan.plan_id
             self._next_micro_batch_index = plan.micro_batch_start
-        if plan.replay_id != self._active_replay_id:
+        if plan.plan_id != self._active_plan_id:
             raise ValueError("Cannot replace an active DataLoader plan before all of its microbatches are consumed.")
         if micro_batch_index != self._next_micro_batch_index:
             raise ValueError(f"Expected microbatch {self._next_micro_batch_index}, but got {micro_batch_index}.")
@@ -213,7 +213,7 @@ class TorchLocalDataLoader:
         batch = self._collate_fn(samples)
         self._next_micro_batch_index += 1
         if self._next_micro_batch_index == plan.micro_batch_start + plan.micro_batch_num:
-            self._active_replay_id = None
+            self._active_plan_id = None
             self._iterator = None
         return batch
 
@@ -256,7 +256,7 @@ class TorchLocalDataLoader:
             return
         self._iterator = None
         self._loader = None
-        self._active_replay_id = None
+        self._active_plan_id = None
         self._closed = True
 
     def _next_batch(self) -> Any:

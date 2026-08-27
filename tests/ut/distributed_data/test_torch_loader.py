@@ -79,7 +79,7 @@ class TestTorchLocalDataLoader(unittest.TestCase):
         plan = planner.plan(
             tuple(SampleMeta(sample_id=index) for index in range(4)),
             step=0,
-            cursor_start=0,
+            sample_offset_start=0,
         )
         loader = TorchLocalDataLoader(
             _WorkerDataset(),
@@ -96,7 +96,7 @@ class TestTorchLocalDataLoader(unittest.TestCase):
             next_plan = planner.plan(
                 tuple(SampleMeta(sample_id=index) for index in range(4, 8)),
                 step=1,
-                cursor_start=4,
+                sample_offset_start=4,
             )
             next_batch = loader.fetch(next_plan, 0, 0)
 

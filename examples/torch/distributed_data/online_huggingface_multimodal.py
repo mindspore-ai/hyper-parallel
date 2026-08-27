@@ -170,7 +170,7 @@ def _initialize_distributed(backend: str) -> tuple[int, int, Any, str]:
 def _validate_global_result(
     local_records: list[dict[str, Any]],
     local_plan_ids: list[str],
-    step_replay_id: str,
+    step_plan_id: str,
     sample_count: int,
     num_workers: int,
     rank: int,
@@ -180,9 +180,9 @@ def _validate_global_result(
     gathered_plan_ids = _all_gather_object(local_plan_ids, world_size)
     if any(plan_ids != local_plan_ids for plan_ids in gathered_plan_ids):
         raise ValueError(f"Ranks produced inconsistent online plans: {gathered_plan_ids}.")
-    gathered_step_ids = _all_gather_object(step_replay_id, world_size)
+    gathered_step_ids = _all_gather_object(step_plan_id, world_size)
     if len(set(gathered_step_ids)) != 1:
-        raise ValueError(f"Ranks produced inconsistent step replay IDs: {gathered_step_ids}.")
+        raise ValueError(f"Ranks produced inconsistent step plan IDs: {gathered_step_ids}.")
 
     gathered_records = _all_gather_object(local_records, world_size)
     flat_records = [record for rank_records in gathered_records for record in rank_records]
@@ -247,17 +247,17 @@ def main() -> None:
             if data_indices != micro_batch.sample_ids:
                 raise ValueError(f"Rank {rank} received data in an order different from its plan.")
             local_records.extend(micro_batch.data)
-            local_plan_ids.append(micro_batch.replay_id)
+            local_plan_ids.append(micro_batch.plan_id)
         cross_owner_samples = _validate_global_result(
             local_records,
             local_plan_ids,
-            step.replay_id,
+            step.plan_id,
             sample_count,
             args.num_workers,
             rank,
             world_size,
         )
-        loader.commit(step.replay_id)
+        loader.commit(step.plan_id)
         expected_offset = args.raw_sample_size * args.micro_batch_num
         if loader.consumed_offset != expected_offset:
             raise ValueError(f"Expected consumed_offset={expected_offset}, got {loader.consumed_offset}.")

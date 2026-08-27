@@ -31,7 +31,7 @@ from hyper_parallel.distributed_data.distributor import (
     TorchPackedBytesRedistributor,
     TorchTensorRedistributor,
 )
-from hyper_parallel.distributed_data.fetcher import (
+from hyper_parallel.distributed_data.data_construct import (
     MapDatasetFetcher,
     MicroBatchFetcher,
     StridedMetadataSource,

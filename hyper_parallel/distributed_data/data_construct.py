@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Map-style metadata access and sample fetching."""
+"""Map-style metadata access and data construction."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class MetadataSource(Protocol):
         """Return local metadata entry count."""
 
     def get(self, index: int) -> SampleMeta:
-        """Return metadata at one local cursor position."""
+        """Return metadata at one local sample offset."""
 
 
 class SampleFetcher(Protocol):
@@ -74,7 +74,7 @@ class OnlineSampleSource(Protocol):
         """Load one local raw sample and derive its metadata."""
 
     def get_range(self, start: int, end: int) -> tuple[LoadedSample, ...]:
-        """Load an ordered local cursor range."""
+        """Load an ordered local sample-offset range."""
 
 
 class StridedMetadataSource:
@@ -111,7 +111,7 @@ class StridedMetadataSource:
         return min(local_entries, self._max_entries) if self._max_entries is not None else local_entries
 
     def get(self, index: int) -> SampleMeta:
-        """Return metadata at one local cursor position."""
+        """Return metadata at one local sample offset."""
         if index < 0 or index >= len(self):
             raise ValueError(f"Metadata index must be in [0, {len(self)}), but got {index}.")
         return self._metadata[self._shard_rank + index * self._num_shards]
@@ -176,7 +176,7 @@ class StridedOnlineSampleSource:
         return LoadedSample(metadata, sample)
 
     def get_range(self, start: int, end: int) -> tuple[LoadedSample, ...]:
-        """Load an ordered local cursor range, using workers when configured."""
+        """Load an ordered local sample-offset range, using workers when configured."""
         if start < 0 or end < start or end > len(self):
             raise ValueError(f"Online sample range must satisfy 0 <= start <= end <= {len(self)}, got {start}:{end}.")
         if self._local_data_loader is None:

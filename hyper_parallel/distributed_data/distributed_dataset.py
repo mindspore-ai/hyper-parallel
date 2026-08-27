@@ -27,7 +27,7 @@ from hyper_parallel.distributed_data.distributor import (
     MicroBatchDistributor,
     SampleRedistributor,
 )
-from hyper_parallel.distributed_data.fetcher import (
+from hyper_parallel.distributed_data.data_construct import (
     LoadedSample,
     LocalDataLoader,
     MetadataSource,
@@ -52,12 +52,12 @@ platform = get_platform()
 @dataclass
 class _ReservedStep:
     step: int
-    cursor_start: int
-    cursor_end: int
+    sample_offset_start: int
+    sample_offset_end: int
     host_future: Future["_HostReadyStep"] | None = None
     online_host_futures: dict[int, Future["_HostReadyMicroBatch"]] | None = None
     next_online_micro_batch_index: int = 0
-    replay_id: str | None = None
+    plan_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -193,8 +193,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self._fill_online_host_prefetch()
         self._active_step = DistributedDataStep(
             step=reservation.step,
-            cursor_start=reservation.cursor_start,
-            cursor_end=reservation.cursor_end,
+            sample_offset_start=reservation.sample_offset_start,
+            sample_offset_end=reservation.sample_offset_end,
             micro_batch_num=self._planner.micro_batch_num,
             load_micro_batch=self._consume_active_microbatch,
             on_complete=self._complete_active_step,
@@ -216,15 +216,15 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         """Return the offset after contiguous steps ready in Host memory."""
         return self._state.ready_offset
 
-    def commit(self, replay_id: str) -> None:
+    def commit(self, plan_id: str) -> None:
         """Commit one fully consumed step after optimizer-step success.
 
         Args:
-            replay_id: Deterministic identifier returned by the consumed step.
+            plan_id: Deterministic identifier returned by the consumed step.
         """
         if self._active_step is None or not self._active_step.is_complete:
             raise ValueError("Consume every microbatch before committing the distributed-data step.")
-        self._state.commit(replay_id)
+        self._state.commit(plan_id)
         self._active_step = None
         self._active_reservation = None
         self._active_future = None
@@ -277,8 +277,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
 
     def _fill_prefetch(self) -> None:
         while self._state.can_prefetch and self._state.can_reserve_full_step():
-            step, cursor_start, cursor_end = self._state.reserve()
-            reservation = _ReservedStep(step, cursor_start, cursor_end)
+            step, sample_offset_start, sample_offset_end = self._state.reserve()
+            reservation = _ReservedStep(step, sample_offset_start, sample_offset_end)
             if self._metadata_source is not None:
                 plan_future = self._producer_executor.submit(self._plan_sidecar_step, reservation)
                 reservation.host_future = self._host_executor.submit(
@@ -297,7 +297,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             raise ValueError("Sidecar metadata source is not configured.")
         local_metadata = tuple(
             self._metadata_source.get(index)
-            for index in range(reservation.cursor_start, reservation.cursor_end)
+            for index in range(reservation.sample_offset_start, reservation.sample_offset_end)
         )
         candidates = self._metadata_synchronizer.gather(
             local_metadata,
@@ -306,7 +306,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         return self._planner.plan(
             candidates,
             step=reservation.step,
-            cursor_start=reservation.cursor_start,
+            sample_offset_start=reservation.sample_offset_start,
         )
 
     def _prepare_sidecar_host_step(
@@ -328,7 +328,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
                 )
                 micro_batch = self._pin_host_batch(micro_batch)
             micro_batches.append(micro_batch)
-        self._state.mark_ready(reservation.cursor_start, reservation.cursor_end)
+        self._state.mark_ready(reservation.sample_offset_start, reservation.sample_offset_end)
         return _HostReadyStep(
             plans=tuple(plan for _ in range(self._planner.micro_batch_num)),
             micro_batches=tuple(micro_batches),
@@ -350,7 +350,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         else:
             plan, micro_batch = None, None
         if micro_batch_index + 1 == self._planner.micro_batch_num:
-            self._state.mark_ready(reservation.cursor_start, reservation.cursor_end)
+            self._state.mark_ready(reservation.sample_offset_start, reservation.sample_offset_end)
         return _HostReadyMicroBatch(plan, micro_batch)
 
     def _ensure_online_host_microbatch(
@@ -369,13 +369,15 @@ class DistributedDataset(Iterator[DistributedDataStep]):
                 f"Expected online Host-prefetch microbatch {reservation.next_online_micro_batch_index}, "
                 f"but got {micro_batch_index}."
             )
-        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.raw_sample_size
-        cursor_end = cursor_start + self._planner.raw_sample_size
+        sample_offset_start = (
+            reservation.sample_offset_start + micro_batch_index * self._planner.raw_sample_size
+        )
+        sample_offset_end = sample_offset_start + self._planner.raw_sample_size
         if self._topology.is_data_owner:
             loaded_future = self._host_executor.submit(
                 self._load_online_microbatch,
-                cursor_start,
-                cursor_end,
+                sample_offset_start,
+                sample_offset_end,
             )
         else:
             loaded_future = Future()
@@ -408,10 +410,14 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             if len(self._online_pending_units) >= self._prefetch_steps:
                 return
 
-    def _load_online_microbatch(self, cursor_start: int, cursor_end: int) -> tuple[LoadedSample, ...]:
+    def _load_online_microbatch(
+        self,
+        sample_offset_start: int,
+        sample_offset_end: int,
+    ) -> tuple[LoadedSample, ...]:
         if self._online_sample_source is None:
             raise ValueError("Online sample source is not configured.")
-        return self._online_sample_source.get_range(cursor_start, cursor_end)
+        return self._online_sample_source.get_range(sample_offset_start, sample_offset_end)
 
     def _consume_active_microbatch(self, micro_batch_index: int) -> tuple[BatchPlan, RankMicroBatch]:
         if self._closed:
@@ -517,7 +523,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             self._validate_received_plan(received_plan, reservation, micro_batch_index)
             planned_samples = received_plan.samples_for(self._topology.data_rank, micro_batch_index)
             micro_batch = RankMicroBatch(
-                replay_id=received_plan.replay_id,
+                plan_id=received_plan.plan_id,
                 global_rank=self._topology.global_rank,
                 data_rank=self._topology.data_rank,
                 cp_rank=self._topology.cp_rank,
@@ -556,11 +562,13 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         if any(not isinstance(metadata, OnlineSampleMetadata) for metadata in global_metadata):
             raise ValueError("Online metadata synchronization returned invalid sample transport metadata.")
         candidates = tuple(metadata.sample_meta for metadata in global_metadata)
-        cursor_start = reservation.cursor_start + micro_batch_index * self._planner.raw_sample_size
+        sample_offset_start = (
+            reservation.sample_offset_start + micro_batch_index * self._planner.raw_sample_size
+        )
         plan = self._planner.plan_microbatch(
             candidates,
             step=reservation.step,
-            cursor_start=cursor_start,
+            sample_offset_start=sample_offset_start,
             micro_batch_index=micro_batch_index,
         )
         samples_by_position = self._sample_redistributor.redistribute(
@@ -590,25 +598,46 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         if not dimensions_match:
             raise ValueError("Received BatchPlan dimensions do not match the distributed dataset planner.")
         if self._metadata_source is not None:
-            expected_window = (reservation.cursor_start, reservation.cursor_end, 0, self._planner.micro_batch_num)
-            if reservation.replay_id is None:
-                reservation.replay_id = plan.replay_id
-            elif plan.replay_id != reservation.replay_id:
-                raise ValueError("Sidecar microbatches received inconsistent whole-step BatchPlan replay IDs.")
+            expected_window = (
+                reservation.sample_offset_start,
+                reservation.sample_offset_end,
+                0,
+                self._planner.micro_batch_num,
+            )
+            if reservation.plan_id is None:
+                reservation.plan_id = plan.plan_id
+            elif plan.plan_id != reservation.plan_id:
+                raise ValueError("Sidecar microbatches received inconsistent whole-step plan IDs.")
         else:
-            cursor_start = reservation.cursor_start + micro_batch_index * self._planner.raw_sample_size
-            expected_window = (cursor_start, cursor_start + self._planner.raw_sample_size, micro_batch_index, 1)
-        actual_window = (plan.cursor_start, plan.cursor_end, plan.micro_batch_start, plan.micro_batch_num)
+            sample_offset_start = (
+                reservation.sample_offset_start + micro_batch_index * self._planner.raw_sample_size
+            )
+            expected_window = (
+                sample_offset_start,
+                sample_offset_start + self._planner.raw_sample_size,
+                micro_batch_index,
+                1,
+            )
+        actual_window = (
+            plan.sample_offset_start,
+            plan.sample_offset_end,
+            plan.micro_batch_start,
+            plan.micro_batch_num,
+        )
         if actual_window != expected_window:
             raise ValueError(f"Received BatchPlan window {actual_window} does not match expected {expected_window}.")
 
-    def _complete_active_step(self, step: DistributedDataStep, replay_id: str) -> None:
+    def _complete_active_step(self, step: DistributedDataStep, plan_id: str) -> None:
         if step is not self._active_step:
             raise ValueError("Completed DistributedDataStep is not the dataset's active step.")
         reservation = self._require_active_reservation()
         if self._next_micro_batch_index != self._planner.micro_batch_num:
             raise ValueError("Cannot complete a DistributedDataStep before every microbatch is produced.")
-        self._state.mark_delivered(replay_id, reservation.cursor_start, reservation.cursor_end)
+        self._state.mark_delivered(
+            plan_id,
+            reservation.sample_offset_start,
+            reservation.sample_offset_end,
+        )
         self._fill_prefetch()
         self._fill_online_host_prefetch()
 

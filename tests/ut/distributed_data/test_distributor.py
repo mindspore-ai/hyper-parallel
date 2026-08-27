@@ -273,7 +273,7 @@ class TestMicroBatchSharding(unittest.TestCase):
         plan = DistributedBatchPlanner(2, 1, 2).plan_microbatch(
             metadata,
             step=0,
-            cursor_start=1,
+            sample_offset_start=1,
             micro_batch_index=1,
         )
         topology = DataTopology.from_layout(
@@ -429,7 +429,7 @@ class TestMicroBatchSharding(unittest.TestCase):
     def test_owner_broadcasts_tensor_micro_batch_without_object_serializing_storage(self) -> None:
         """Microbatch structure uses object gather while tensor storage uses broadcast."""
         metadata = [SampleMeta(sample_id="0")]
-        plan = DistributedBatchPlanner(1, 1, 1).plan(metadata, step=0, cursor_start=0)
+        plan = DistributedBatchPlanner(1, 1, 1).plan(metadata, step=0, sample_offset_start=0)
         topology = DataTopology.from_layout(
             mesh_shape=(2,),
             mesh_dim_names=("tp",),
@@ -443,6 +443,6 @@ class TestMicroBatchSharding(unittest.TestCase):
             distributor = TorchMicroBatchDistributor(group="consumer")
             received_plan, result = distributor.distribute(micro_batch, plan, topology)
 
-        self.assertEqual(received_plan.replay_id, plan.replay_id)
+        self.assertEqual(received_plan.plan_id, plan.plan_id)
         self.assertIs(result["input_ids"], micro_batch["input_ids"])
         self.assertEqual(fake_platform.broadcast_count, 1)

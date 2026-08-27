@@ -31,7 +31,7 @@ from hyper_parallel.distributed_data.distributor import (
     LocalMetadataSynchronizer,
     LocalSampleRedistributor,
 )
-from hyper_parallel.distributed_data.fetcher import (
+from hyper_parallel.distributed_data.data_construct import (
     MicroBatchFetcher,
     StridedMetadataSource,
     StridedOnlineSampleSource,
@@ -328,7 +328,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
                     micro_batch = next(step)
 
                     self.assertEqual(micro_batch.data, ("sample-0", "sample-1"))
-                    loader.commit(step.replay_id)
+                    loader.commit(step.plan_id)
                 finally:
                     loader.close()
 
@@ -750,13 +750,13 @@ class TestDistributedDataset(unittest.TestCase):
 
             first = next(step)
             with self.assertRaisesRegex(ValueError, "Consume every microbatch"):
-                _ = step.replay_id
+                _ = step.plan_id
             second = next(step)
 
             self.assertEqual([first.micro_batch_index, second.micro_batch_index], [0, 1])
-            self.assertEqual(first.replay_id, second.replay_id)
+            self.assertEqual(first.plan_id, second.plan_id)
             self.assertTrue(step.is_complete)
-            loader.commit(step.replay_id)
+            loader.commit(step.plan_id)
             self.assertEqual(loader.consumed_offset, 2)
         finally:
             loader.close()
@@ -830,7 +830,7 @@ class TestDistributedDataset(unittest.TestCase):
             self.assertEqual(loader.consumed_offset, 0)
 
             distributor.release[2].set()
-            loader.commit(step.replay_id)
+            loader.commit(step.plan_id)
             next_step = next(loader)
             self.assertEqual(next(next_step).micro_batch_index, 0)
         finally:
@@ -891,7 +891,7 @@ class TestDistributedDataset(unittest.TestCase):
             second = next(step)
 
             self.assertEqual(second.micro_batch_index, 1)
-            loader.commit(step.replay_id)
+            loader.commit(step.plan_id)
             self.assertEqual(loader.consumed_offset, 2)
         finally:
             distributor.release_all()
@@ -962,7 +962,7 @@ class TestDistributedDataset(unittest.TestCase):
             self.assertEqual(dataset.sample_ids, [0, 2, 4])
             self.assertTrue(all(name.startswith("hp-data-buffer") for name in redistributor.thread_names))
             self.assertTrue(all(name.startswith("hp-data-buffer") for name in prepare_threads))
-            loader.commit(step.replay_id)
+            loader.commit(step.plan_id)
         finally:
             synchronizer.release.set()
             loader.close()
@@ -1014,13 +1014,13 @@ class TestDistributedDataset(unittest.TestCase):
             self.assertEqual(loader.consumed_offset, 0)
 
             distributor.release[1].set()
-            loader.commit(first_step.replay_id)
+            loader.commit(first_step.plan_id)
             second_step = next(loader)
             second = next(second_step)
 
             self.assertEqual(second.micro_batch_index, 0)
             self.assertEqual(second_step.step, 1)
-            loader.commit(second_step.replay_id)
+            loader.commit(second_step.plan_id)
             self.assertEqual(loader.consumed_offset, 2)
         finally:
             distributor.release_all()
@@ -1086,7 +1086,7 @@ class TestDistributedDataset(unittest.TestCase):
             global_rank=1,
         )
         planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=2)
-        distributor = _ReceivingMicroBatchDistributor(planner.plan(metadata, step=0, cursor_start=0))
+        distributor = _ReceivingMicroBatchDistributor(planner.plan(metadata, step=0, sample_offset_start=0))
         loader = DistributedDataset(
             topology=topology,
             metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
@@ -1103,7 +1103,7 @@ class TestDistributedDataset(unittest.TestCase):
 
             self.assertEqual([micro_batch.data for micro_batch in micro_batches], ["received-0", "received-1"])
             self.assertTrue(all(name.startswith("hp-data-buffer") for name in distributor.thread_names))
-            loader.commit(step.replay_id)
+            loader.commit(step.plan_id)
         finally:
             loader.close()
 
@@ -1171,7 +1171,7 @@ class TestDistributedDataset(unittest.TestCase):
             )
             self.assertEqual([plan.micro_batch_start for plan in redistributor.plans], [0, 1, 2])
             self.assertTrue(all(plan.micro_batch_num == 1 for plan in redistributor.plans))
-            loader.commit(step.replay_id)
+            loader.commit(step.plan_id)
         finally:
             loader.close()
 
@@ -1317,7 +1317,7 @@ class TestDistributedDataset(unittest.TestCase):
             before_commit = loader.state_dict()
             self.assertEqual(before_commit["consumed_offset"], 0)
             list(step)
-            loader.commit(step.replay_id)
+            loader.commit(step.plan_id)
             consumed_state = loader.state_dict()
             self.assertEqual(consumed_state["consumed_offset"], 2)
         finally:
@@ -1327,7 +1327,7 @@ class TestDistributedDataset(unittest.TestCase):
         try:
             restored.load_state_dict(consumed_state)
             resumed_step = next(restored)
-            self.assertEqual(resumed_step.cursor_start, 2)
+            self.assertEqual(resumed_step.sample_offset_start, 2)
             self.assertEqual(resumed_step.step, 1)
         finally:
             restored.close()
@@ -1353,7 +1353,7 @@ class TestDistributedDataset(unittest.TestCase):
             global_rank=1,
         )
         planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=2)
-        plan = planner.plan(metadata, step=0, cursor_start=0)
+        plan = planner.plan(metadata, step=0, sample_offset_start=0)
         loader = DistributedDataset(
             topology=topology,
             metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
@@ -1397,7 +1397,7 @@ class TestDistributedDataset(unittest.TestCase):
             planner.plan_microbatch(
                 [SampleMeta(sample_id=index)],
                 step=0,
-                cursor_start=index,
+                sample_offset_start=index,
                 micro_batch_index=index,
             )
             for index in range(2)
@@ -1422,7 +1422,7 @@ class TestDistributedDataset(unittest.TestCase):
                 ["received-online-0", "received-online-1"],
             )
             self.assertEqual(dataset.sample_ids, [])
-            loader.commit(step.replay_id)
+            loader.commit(step.plan_id)
         finally:
             loader.close()
 

@@ -35,7 +35,7 @@ class TestDistributedBatchPlanner(unittest.TestCase):
         planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=2)
         candidates = [_metadata("0", 8.0), _metadata("1", 7.0), _metadata("2", 1.0), _metadata("3", 1.0)]
 
-        plan = planner.plan(candidates, step=0, cursor_start=0)
+        plan = planner.plan(candidates, step=0, sample_offset_start=0)
 
         costs = []
         for micro_batch_index in range(2):
@@ -44,17 +44,17 @@ class TestDistributedBatchPlanner(unittest.TestCase):
         self.assertEqual(sorted(costs), [8.0, 9.0])
         self.assertEqual({sample.meta.sample_id for sample in plan.samples}, {"0", "1", "2", "3"})
 
-    def test_same_metadata_produces_same_replay_id_and_placements(self) -> None:
+    def test_same_metadata_produces_same_plan_id_and_placements(self) -> None:
         """Planning must be byte-stable for checkpoint replay."""
         planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=2)
         candidates = [_metadata(str(index), float(index + 1)) for index in range(4)]
 
-        first = planner.plan(candidates, step=3, cursor_start=6)
-        second = planner.plan(candidates, step=3, cursor_start=6)
+        first = planner.plan(candidates, step=3, sample_offset_start=6)
+        second = planner.plan(candidates, step=3, sample_offset_start=6)
 
         self.assertEqual(first, second)
         self.assertFalse(hasattr(first, "version"))
-        self.assertEqual(first.replay_id, second.replay_id)
+        self.assertEqual(first.plan_id, second.plan_id)
         for micro_batch_index in range(2):
             for data_rank in range(2):
                 self.assertEqual(len(first.samples_for(data_rank, micro_batch_index)), 1)
@@ -63,7 +63,7 @@ class TestDistributedBatchPlanner(unittest.TestCase):
         """A planner must never silently construct a partial optimizer step."""
         planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=2)
         with self.assertRaisesRegex(ValueError, "requires 4 candidates"):
-            planner.plan([_metadata("0", 1.0)], step=0, cursor_start=0)
+            planner.plan([_metadata("0", 1.0)], step=0, sample_offset_start=0)
 
     def test_rejects_duplicate_sample_ids(self) -> None:
         """The dataset-wide sample identifier must be unique in a planning window."""
@@ -71,7 +71,7 @@ class TestDistributedBatchPlanner(unittest.TestCase):
         candidates = [_metadata("0", 1.0), _metadata("0", 2.0)]
 
         with self.assertRaisesRegex(ValueError, "unique sample_id"):
-            planner.plan(candidates, step=0, cursor_start=0)
+            planner.plan(candidates, step=0, sample_offset_start=0)
 
     def test_online_plan_balances_only_one_global_microbatch(self) -> None:
         """Online planning should preserve the optimizer microbatch position without later metadata."""
@@ -81,13 +81,13 @@ class TestDistributedBatchPlanner(unittest.TestCase):
         plan = planner.plan_microbatch(
             candidates,
             step=5,
-            cursor_start=2,
+            sample_offset_start=2,
             micro_batch_index=1,
         )
 
         self.assertEqual(plan.micro_batch_start, 1)
         self.assertEqual(plan.micro_batch_num, 1)
-        self.assertEqual((plan.cursor_start, plan.cursor_end), (2, 4))
+        self.assertEqual((plan.sample_offset_start, plan.sample_offset_end), (2, 4))
         for data_rank in range(2):
             self.assertEqual(len(plan.samples_for(data_rank, 1)), 2)
         with self.assertRaisesRegex(ValueError, "micro_batch_index must be in"):
@@ -101,6 +101,6 @@ class TestDistributedBatchPlanner(unittest.TestCase):
             SampleMeta(sample_id=1),
         ]
 
-        plan = planner.plan(candidates, step=0, cursor_start=0)
+        plan = planner.plan(candidates, step=0, sample_offset_start=0)
 
-        self.assertEqual(plan, planner.plan(candidates, step=0, cursor_start=0))
+        self.assertEqual(plan, planner.plan(candidates, step=0, sample_offset_start=0))

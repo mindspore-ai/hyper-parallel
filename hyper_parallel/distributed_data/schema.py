@@ -200,10 +200,10 @@ class PlannedSample:
 class BatchPlan:
     """Deterministic raw-sample plan for an optimizer-step microbatch window."""
 
-    replay_id: str
+    plan_id: str
     step: int
-    cursor_start: int
-    cursor_end: int
+    sample_offset_start: int
+    sample_offset_end: int
     data_parallel_size: int
     raw_sample_size: int
     micro_batch_num: int
@@ -212,15 +212,16 @@ class BatchPlan:
     micro_batch_start: int = 0
 
     def __post_init__(self) -> None:
-        if not self.replay_id:
-            raise ValueError("BatchPlan.replay_id must not be empty.")
-        for name in ("step", "cursor_start", "cursor_end"):
+        if not self.plan_id:
+            raise ValueError("BatchPlan.plan_id must not be empty.")
+        for name in ("step", "sample_offset_start", "sample_offset_end"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"BatchPlan.{name} must be a non-negative integer, but got {value!r}.")
-        if self.cursor_end < self.cursor_start:
+        if self.sample_offset_end < self.sample_offset_start:
             raise ValueError(
-                f"BatchPlan.cursor_end={self.cursor_end} must not precede cursor_start={self.cursor_start}."
+                f"BatchPlan.sample_offset_end={self.sample_offset_end} must not precede "
+                f"sample_offset_start={self.sample_offset_start}."
             )
         for name in ("data_parallel_size", "raw_sample_size", "micro_batch_num"):
             value = getattr(self, name)
@@ -274,9 +275,9 @@ class BatchPlan:
 
 @dataclass(frozen=True)
 class RankMicroBatch:
-    """Fetched microbatch and its planning-window replay ID for one rank."""
+    """Fetched microbatch and its associated plan ID for one rank."""
 
-    replay_id: str
+    plan_id: str
     global_rank: int
     data_rank: int
     cp_rank: int
@@ -292,8 +293,8 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
         self,
         *,
         step: int,
-        cursor_start: int,
-        cursor_end: int,
+        sample_offset_start: int,
+        sample_offset_end: int,
         micro_batch_num: int,
         load_micro_batch: Callable[[int], tuple[BatchPlan, RankMicroBatch]],
         on_complete: Callable[["DistributedDataStep", str], None],
@@ -302,34 +303,37 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
 
         Args:
             step: Logical optimizer-step index.
-            cursor_start: Per-owner candidate cursor before this step.
-            cursor_end: Per-owner candidate cursor after this step.
+            sample_offset_start: Inclusive per-owner sample offset for this step.
+            sample_offset_end: Exclusive per-owner sample offset for this step.
             micro_batch_num: Number of local microbatches in the step.
             load_micro_batch: Runtime callback that produces one planned microbatch.
             on_complete: Callback invoked after the final microbatch is produced.
         """
         for name, value in (
             ("step", step),
-            ("cursor_start", cursor_start),
-            ("cursor_end", cursor_end),
+            ("sample_offset_start", sample_offset_start),
+            ("sample_offset_end", sample_offset_end),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
-        if cursor_end < cursor_start:
-            raise ValueError(f"cursor_end={cursor_end} must not precede cursor_start={cursor_start}.")
+        if sample_offset_end < sample_offset_start:
+            raise ValueError(
+                f"sample_offset_end={sample_offset_end} must not precede "
+                f"sample_offset_start={sample_offset_start}."
+            )
         if not isinstance(micro_batch_num, int) or isinstance(micro_batch_num, bool) or micro_batch_num < 1:
             raise ValueError(f"micro_batch_num must be a positive integer, but got {micro_batch_num!r}.")
         if not callable(load_micro_batch) or not callable(on_complete):
             raise ValueError("load_micro_batch and on_complete must be callable.")
         self.step = step
-        self.cursor_start = cursor_start
-        self.cursor_end = cursor_end
+        self.sample_offset_start = sample_offset_start
+        self.sample_offset_end = sample_offset_end
         self.micro_batch_num = micro_batch_num
         self._load_micro_batch: Callable[[int], tuple[BatchPlan, RankMicroBatch]] | None = load_micro_batch
         self._on_complete: Callable[["DistributedDataStep", str], None] | None = on_complete
         self._micro_batch_index = 0
-        self._plan_replay_ids: list[str] = []
-        self._replay_id: str | None = None
+        self._micro_batch_plan_ids: list[str] = []
+        self._plan_id: str | None = None
 
     def __iter__(self) -> "DistributedDataStep":
         """Return this single-use microbatch iterator."""
@@ -347,24 +351,24 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
                 f"Expected microbatch {self._micro_batch_index}, "
                 f"but runtime returned {micro_batch.micro_batch_index}."
             )
-        self._plan_replay_ids.append(plan.replay_id)
+        self._micro_batch_plan_ids.append(plan.plan_id)
         self._micro_batch_index += 1
         if self._micro_batch_index == self.micro_batch_num:
-            self._replay_id = self._build_replay_id()
+            self._plan_id = self._build_plan_id()
             on_complete = self._on_complete
             self._load_micro_batch = None
             self._on_complete = None
             if on_complete is None:
                 raise ValueError("DistributedDataStep completion callback is unavailable.")
-            on_complete(self, self._replay_id)
+            on_complete(self, self._plan_id)
         return micro_batch
 
     @property
-    def replay_id(self) -> str:
-        """Return the optimizer-step replay ID after all microbatches are produced."""
-        if self._replay_id is None:
-            raise ValueError("Consume every microbatch before requesting the optimizer-step replay ID.")
-        return self._replay_id
+    def plan_id(self) -> str:
+        """Return the optimizer-step plan ID after all microbatches are produced."""
+        if self._plan_id is None:
+            raise ValueError("Consume every microbatch before requesting the optimizer-step plan ID.")
+        return self._plan_id
 
     @property
     def is_complete(self) -> bool:
@@ -375,12 +379,12 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
         """Return the single-use lazy microbatch iterator."""
         return self
 
-    def _build_replay_id(self) -> str:
+    def _build_plan_id(self) -> str:
         stable_step = {
             "step": self.step,
-            "cursor_start": self.cursor_start,
-            "cursor_end": self.cursor_end,
-            "plan_replay_ids": self._plan_replay_ids,
+            "sample_offset_start": self.sample_offset_start,
+            "sample_offset_end": self.sample_offset_end,
+            "micro_batch_plan_ids": self._micro_batch_plan_ids,
         }
         encoded = json.dumps(stable_step, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()[:24]

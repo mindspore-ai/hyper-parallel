@@ -68,14 +68,14 @@ class DistributedBatchPlanner:
         candidates: Sequence[SampleMeta],
         *,
         step: int,
-        cursor_start: int,
+        sample_offset_start: int,
     ) -> BatchPlan:
         """Build a deterministic plan without fetching sample data.
 
         Args:
             candidates: Metadata for the complete global optimizer-step batch.
             step: Logical optimizer-step index.
-            cursor_start: Per-owner candidate cursor before this plan.
+            sample_offset_start: Inclusive per-owner sample offset for this plan.
 
         Returns:
             A deterministic :class:`BatchPlan`.
@@ -83,7 +83,7 @@ class DistributedBatchPlanner:
         return self._plan(
             candidates,
             step=step,
-            cursor_start=cursor_start,
+            sample_offset_start=sample_offset_start,
             micro_batch_start=0,
             micro_batch_num=self.micro_batch_num,
         )
@@ -93,7 +93,7 @@ class DistributedBatchPlanner:
         candidates: Sequence[SampleMeta],
         *,
         step: int,
-        cursor_start: int,
+        sample_offset_start: int,
         micro_batch_index: int,
     ) -> BatchPlan:
         """Build one online microbatch plan when later metadata is unavailable.
@@ -101,7 +101,7 @@ class DistributedBatchPlanner:
         Args:
             candidates: Metadata for one complete global microbatch.
             step: Logical optimizer-step index.
-            cursor_start: Per-owner candidate cursor before this microbatch.
+            sample_offset_start: Inclusive per-owner sample offset for this microbatch.
             micro_batch_index: Microbatch position within the optimizer step.
 
         Returns:
@@ -119,7 +119,7 @@ class DistributedBatchPlanner:
         return self._plan(
             candidates,
             step=step,
-            cursor_start=cursor_start,
+            sample_offset_start=sample_offset_start,
             micro_batch_start=micro_batch_index,
             micro_batch_num=1,
         )
@@ -129,12 +129,14 @@ class DistributedBatchPlanner:
         candidates: Sequence[SampleMeta],
         *,
         step: int,
-        cursor_start: int,
+        sample_offset_start: int,
         micro_batch_start: int,
         micro_batch_num: int,
     ) -> BatchPlan:
-        if step < 0 or cursor_start < 0:
-            raise ValueError(f"step and cursor_start must be non-negative, but got {step} and {cursor_start}.")
+        if step < 0 or sample_offset_start < 0:
+            raise ValueError(
+                f"step and sample_offset_start must be non-negative, but got {step} and {sample_offset_start}."
+            )
         expected_candidates = self.data_parallel_size * self.raw_sample_size * micro_batch_num
         if len(candidates) != expected_candidates:
             raise ValueError(
@@ -168,19 +170,19 @@ class DistributedBatchPlanner:
                     )
                 )
 
-        cursor_end = cursor_start + self.raw_sample_size * micro_batch_num
-        replay_id = self._replay_id(
+        sample_offset_end = sample_offset_start + self.raw_sample_size * micro_batch_num
+        plan_id = self._plan_id(
             step,
-            cursor_start,
+            sample_offset_start,
             micro_batch_start,
             micro_batch_num,
             tuple(planned_samples),
         )
         return BatchPlan(
-            replay_id=replay_id,
+            plan_id=plan_id,
             step=step,
-            cursor_start=cursor_start,
-            cursor_end=cursor_end,
+            sample_offset_start=sample_offset_start,
+            sample_offset_end=sample_offset_end,
             data_parallel_size=self.data_parallel_size,
             raw_sample_size=self.raw_sample_size,
             micro_batch_num=micro_batch_num,
@@ -189,17 +191,17 @@ class DistributedBatchPlanner:
             micro_batch_start=micro_batch_start,
         )
 
-    def _replay_id(
+    def _plan_id(
         self,
         step: int,
-        cursor_start: int,
+        sample_offset_start: int,
         micro_batch_start: int,
         micro_batch_num: int,
         samples: tuple[PlannedSample, ...],
     ) -> str:
         stable_plan = {
             "step": step,
-            "cursor_start": cursor_start,
+            "sample_offset_start": sample_offset_start,
             "data_parallel_size": self.data_parallel_size,
             "raw_sample_size": self.raw_sample_size,
             "micro_batch_start": micro_batch_start,
