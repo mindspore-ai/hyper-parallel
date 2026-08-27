@@ -315,6 +315,12 @@ class ShardingPlanner:
                     spec, group, boundary_fqn, template, mesh_dim_names, arch,
                     ep_extend=ep_extend, mesh=mesh, model=model, param_ndims=param_ndims,
                 )
+            if boundary_type == "linear_attention" and "cp" in mesh_dim_names:
+                boundary_module = model.get_submodule(boundary_fqn)
+                if "GatedDeltaNet" in type(boundary_module).__name__:
+                    spec.inner_target = "self"
+                    spec.inner_wrapper = "qwen3_8_gdn_ulysses"
+                    spec.region_dispatch = False
             plan.modules[boundary_fqn] = spec
 
     def _finalize_boundary_specs(
@@ -455,19 +461,26 @@ class ShardingPlanner:
         # Phase 5: _is_terminal marking (D-14: chain propagation removed)
         plan = self._mark_terminal(plan, model)
 
-        # Phase 6: special parameter handling
-        plan.special_handlers = self._collect_special_handlers(param_roles)
+        # Phase 6: special handlers in this planner are TP parameter-sharding
+        # handlers. Pure CP keeps parameters replicated and only transforms
+        # activations inside its inner wrappers.
+        plan.special_handlers = (
+            self._collect_special_handlers(param_roles) if tp_size > 1 else {}
+        )
 
         # F4 plan-time lints (accuracy_fix_plan.md §2 — after Phase 4.5
         # overrides merge and Phase 6, so hand-written specs and special
         # handlers are all accounted for):
         # F4a: every Shard(dim) must divide the parameter shape — an empty
         #      shard at apply time becomes a plan-time teaching error;
-        # F4b: every trainable parameter must be covered by the plan.
+        # F4b: parameter-sharding axes require complete trainable-parameter
+        # coverage. Pure CP only declares activation boundaries; FSDP owns its
+        # parameter and gradient layouts independently.
         self._check_shard_divisibility(
             plan, param_shapes, tp_size=tp_size, cp_size=cp_size,
             ep_size=ep_size)
-        self._check_all_trainable_params_covered(plan, model)
+        if tp_size > 1 or ep_size > 1:
+            self._check_all_trainable_params_covered(plan, model)
 
         # DX guard: FunctionModule instances not covered by any spec run
         # without any boundary communication — warn instead of silently passing
@@ -704,6 +717,8 @@ class ShardingPlanner:
     @staticmethod
     def _explicit_boundary_type(fqn_lower: str, segment: str) -> Optional[str]:
         """Return an explicit FQN-based boundary type when one matches."""
+        if segment in ("linear_attn", "linear_attention"):
+            return "linear_attention"
         if _match_any(
                 fqn_lower,
                 ["embed_tokens", "wte", ".embed.", "tok_embeddings", "embed_in", "word_embeddings"],

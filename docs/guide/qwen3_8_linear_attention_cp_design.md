@@ -395,7 +395,7 @@ ModuleShardingSpec(
     out_src={"output": {"cp": Shard(1)}},
     out_dst={"output": {"cp": Shard(1)}},
     inner_target="self",
-    inner_wrapper="qwen3_8_gdn_ulysses_interface",
+    inner_wrapper="qwen3_8_gdn_ulysses",
     region_dispatch=False,
 )
 ```

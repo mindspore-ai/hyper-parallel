@@ -63,6 +63,9 @@ forward's params (validated at apply time).
 - ``sdpa_*_load_balance_cp_wrapper``: local-tensor Colossal Head-Tail variants
   for Q exchange, K/V all-gather, dual SDPA execution, output restoration,
   and backward communication.
+- ``qwen3_8_gdn_ulysses_cp_wrapper``: primitive interception for Qwen3.8
+  Gated DeltaNet, with a causal-Conv1d halo and Ulysses exchange around the
+  Gated Delta Rule interface.
 
 Users may register their own named schemes::
 
@@ -82,6 +85,7 @@ import logging
 from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F
 
 from hyper_parallel.platform import get_platform
@@ -137,6 +141,139 @@ def is_flex_attention(module: Any) -> bool:
     """True when the module is configured for or named as FlexAttention."""
     impl = _attn_implementation(module)
     return (impl == "flex_attention") or ("FlexAttention" in type(module).__name__)
+
+
+def _exchange_previous_cp_halo(
+        tail: torch.Tensor, cp_mesh: Any) -> torch.Tensor:
+    """Exchange one causal-convolution tail with the next CP rank."""
+    cp_size = cp_mesh.size()
+    if cp_size <= 1:
+        return torch.zeros_like(tail)
+
+    cp_rank = cp_mesh.get_local_rank()
+    group = cp_mesh.get_group()
+    group_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+    mesh_ranks = tuple(int(rank) for rank in cp_mesh.rank_list)
+    rank_to_group_index = {
+        rank: index for index, rank in enumerate(group_ranks)
+    }
+
+    batch_size = tail.shape[0]
+    input_splits = [0] * cp_size
+    send = tail
+    if cp_rank < cp_size - 1:
+        next_rank = rank_to_group_index[mesh_ranks[cp_rank + 1]]
+        input_splits[next_rank] = batch_size
+    else:
+        send = tail[:0]
+
+    output_splits = [0] * cp_size
+    if cp_rank > 0:
+        previous_rank = rank_to_group_index[mesh_ranks[cp_rank - 1]]
+        output_splits[previous_rank] = batch_size
+
+    received = platform.differentiable_all_to_all_single(
+        send,
+        input_splits,
+        output_splits,
+        group,
+    )
+    if cp_rank == 0:
+        return torch.zeros_like(tail) + received.sum().to(tail.dtype) * 0
+    return received
+
+
+def _gdn_cp_causal_conv1d(
+        original_conv: Callable[..., Any], cp_mesh: Any,
+        hidden_states: torch.Tensor, weight: torch.Tensor,
+        bias: Any = None, activation: Any = None, **kwargs: Any) -> Any:
+    """Run the original causal Conv1d with the previous CP rank's halo."""
+    halo_width = weight.shape[-1] - 1
+    if halo_width <= 0 or cp_mesh.size() <= 1:
+        return original_conv(
+            hidden_states, weight, bias, activation, **kwargs)
+    if hidden_states.shape[-1] < halo_width:
+        raise ValueError(
+            "Qwen3.8 GDN CP requires local sequence length "
+            f"({hidden_states.shape[-1]}) to be at least Conv1d halo width "
+            f"({halo_width})"
+        )
+    tail = hidden_states[..., -halo_width:].contiguous()
+    halo = _exchange_previous_cp_halo(tail, cp_mesh)
+    conv_input = torch.cat((halo, hidden_states), dim=-1)
+    output = original_conv(
+        conv_input, weight, bias, activation, **kwargs)
+    return output[..., halo_width:].contiguous()
+
+
+def _gdn_rule_cp_to_hp(
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+        decay: torch.Tensor, beta: torch.Tensor,
+        cp_mesh: Any) -> tuple[torch.Tensor, ...]:
+    """Convert local-sequence GDN rule inputs into local-head layouts."""
+    tensors = (query, key, value, decay, beta)
+    expected_dims = (4, 4, 4, 3, 3)
+    if any(
+            tensor.dim() != expected
+            for tensor, expected in zip(tensors, expected_dims)):
+        shapes = [tuple(tensor.shape) for tensor in tensors]
+        raise ValueError(
+            "Qwen3.8 GDN CP expects 4-D Q/K/V and 3-D g/beta, got "
+            f"{shapes}"
+        )
+    if any(tensor.shape[1] != query.shape[1] for tensor in tensors[1:]):
+        raise ValueError("Qwen3.8 GDN CP inputs must share the sequence length")
+    return tuple(
+        ulysses_seq_to_head(
+            tensor, seq_dim=1, head_dim=2, cp_mesh=cp_mesh)
+        for tensor in tensors
+    )
+
+
+def _gdn_rule_hp_to_cp(
+        output: torch.Tensor, cp_mesh: Any) -> torch.Tensor:
+    """Restore one GDN rule output to the local-sequence layout."""
+    if output.dim() != 4:
+        raise ValueError(
+            "Qwen3.8 GDN CP expects a 4-D GDN rule output, got "
+            f"shape {tuple(output.shape)}"
+        )
+    return ulysses_head_to_seq(
+        output, seq_dim=1, head_dim=2, cp_mesh=cp_mesh)
+
+
+def _validate_qwen3_8_gdn_cp(target_module: Any, cp_mesh: Any) -> None:
+    """Validate the Qwen3.8 GDN interface required by CP interception."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError("Qwen3.8 GDN CP requires an active CP mesh")
+    module_name = type(target_module).__name__
+    if "GatedDeltaNet" not in module_name:
+        raise TypeError(
+            "Qwen3.8 GDN CP wrapper requires a GatedDeltaNet module, got "
+            f"{module_name}"
+        )
+    num_value_heads = getattr(target_module, "num_v_heads", None)
+    if not isinstance(num_value_heads, int) or num_value_heads <= 0:
+        raise ValueError(
+            "Qwen3.8 GDN CP requires target_module.num_v_heads to be a "
+            "positive integer"
+        )
+    if num_value_heads % cp_mesh.size():
+        raise ValueError(
+            f"Qwen3.8 GDN value heads ({num_value_heads}) must be divisible "
+            f"by CP size ({cp_mesh.size()})"
+        )
+
+
+def _resolve_gdn_forward_globals(original_forward: Callable[..., Any]) -> dict:
+    """Return the globals used by the unwrapped Transformers GDN forward."""
+    implementation = inspect.unwrap(original_forward)
+    forward_globals = getattr(implementation, "__globals__", None)
+    if not isinstance(forward_globals, dict):
+        raise TypeError(
+            "Qwen3.8 GDN CP could not resolve the Transformers forward globals"
+        )
+    return forward_globals
 
 
 def is_hf_style_attention(module: Any) -> bool:
@@ -1592,6 +1729,142 @@ def qwen3_moe_async_hybrid_cp_wrapper(
     )
 
 
+@inner_wrapper
+def qwen3_8_gdn_ulysses_cp_wrapper(
+    target_module: Any,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+) -> None:
+    """Install primitive-level Ulysses CP around a Qwen3.8 GDN forward."""
+    del mesh, tp_mesh, ep_mesh
+    _validate_qwen3_8_gdn_cp(target_module, cp_mesh)
+    original_forward = target_module.forward
+    forward_globals = _resolve_gdn_forward_globals(original_forward)
+    forward_impl = inspect.unwrap(original_forward)
+    referenced_names = set(forward_impl.__code__.co_names)
+
+    conv_name = "causal_conv1d_fn"
+    original_conv = forward_globals.get(conv_name)
+    if conv_name not in referenced_names or not callable(original_conv):
+        raise RuntimeError(
+            "Qwen3.8 GDN CP requires forward to call causal_conv1d_fn"
+        )
+
+    rule_names = tuple(
+        name for name in (
+            "torch_chunk_gated_delta_rule",
+            "chunk_gated_delta_rule",
+        )
+        if name in referenced_names and callable(forward_globals.get(name))
+    )
+    if not rule_names:
+        raise RuntimeError(
+            "Qwen3.8 GDN CP could not find a supported chunk Gated Delta "
+            "Rule call in the Transformers forward"
+        )
+    original_rules = {name: forward_globals[name] for name in rule_names}
+
+    def make_cp_rule(original_rule: Callable[..., Any]) -> Callable[..., Any]:
+        """Build one CP-aware wrapper for a referenced GDN rule primitive."""
+        @functools.wraps(original_rule)
+        def cp_rule(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if args:
+                raise TypeError(
+                    "Qwen3.8 GDN CP expects g and beta to be passed by keyword"
+                )
+            decay = kwargs.get("g")
+            beta = kwargs.get("beta")
+            if not isinstance(decay, torch.Tensor) or not isinstance(beta, torch.Tensor):
+                raise TypeError(
+                    "Qwen3.8 GDN CP requires Tensor keyword arguments g and beta"
+                )
+            if kwargs.get("initial_state") is not None or kwargs.get(
+                    "output_final_state", False):
+                raise NotImplementedError(
+                    "Qwen3.8 GDN CP does not support recurrent cache state"
+                )
+            query, key, value, decay, beta = _gdn_rule_cp_to_hp(
+                query, key, value, decay, beta, cp_mesh)
+            call_kwargs = dict(kwargs)
+            call_kwargs.update(g=decay, beta=beta)
+            output = original_rule(query, key, value, **call_kwargs)
+            if not isinstance(output, tuple) or len(output) != 2:
+                raise TypeError(
+                    "Qwen3.8 GDN rule must return (output, recurrent_state)"
+                )
+            core_output, recurrent_state = output
+            if recurrent_state is not None:
+                raise NotImplementedError(
+                    "Qwen3.8 GDN CP does not support a returned recurrent state"
+                )
+            return _gdn_rule_hp_to_cp(core_output, cp_mesh), recurrent_state
+
+        return cp_rule
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the original GDN forward with CP-aware primitive interfaces."""
+        cache_params = kwargs.get("cache_params")
+        if cache_params is None and len(args) > 1:
+            cache_params = args[1]
+        if cache_params is not None:
+            raise NotImplementedError(
+                "Qwen3.8 GDN CP currently supports training with cache_params=None"
+            )
+        if kwargs.get("cu_seq_lens_q") is not None:
+            raise NotImplementedError(
+                "Qwen3.8 GDN CP does not support packed sequences"
+            )
+
+        fired = {"conv": 0, "rule": 0}
+
+        @functools.wraps(original_conv)
+        def cp_conv(*conv_args: Any, **conv_kwargs: Any) -> Any:
+            fired["conv"] += 1
+            return _gdn_cp_causal_conv1d(
+                original_conv, cp_mesh, *conv_args, **conv_kwargs)
+
+        wrapped_rules = {}
+        for name, original_rule in original_rules.items():
+            wrapped_rule = make_cp_rule(original_rule)
+
+            @functools.wraps(wrapped_rule)
+            def counted_rule(
+                *rule_args: Any,
+                __wrapped_rule: Callable[..., Any] = wrapped_rule,
+                **rule_kwargs: Any,
+            ) -> Any:
+                fired["rule"] += 1
+                return __wrapped_rule(*rule_args, **rule_kwargs)
+
+            wrapped_rules[name] = counted_rule
+
+        forward_globals[conv_name] = cp_conv
+        forward_globals.update(wrapped_rules)
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            forward_globals[conv_name] = original_conv
+            forward_globals.update(original_rules)
+        if fired["conv"] != 1 or fired["rule"] != 1:
+            raise RuntimeError(
+                "Qwen3.8 GDN CP wrapper expected one causal Conv1d and one "
+                "Gated Delta Rule call, got "
+                f"conv={fired['conv']}, rule={fired['rule']}"
+            )
+        return output
+
+    target_module.forward = cp_forward
+
+
 # {registry_name: wrapper_fn} -- inner-wrapper named registry (05 §4.4.2).
 # The mechanism is not CP-gated (declaration means application); the in-repo
 # reference implementations carry CP semantics (their self-checks require an
@@ -1611,6 +1884,7 @@ INNER_WRAPPER_REGISTRY = {
     "sdpa_hf_ulysses": sdpa_hf_ulysses_cp_wrapper,
     "flex_hf_ulysses": flex_hf_ulysses_cp_wrapper,
     "mla_dsa_ulysses": mla_dsa_ulysses_cp_wrapper,
+    "qwen3_8_gdn_ulysses": qwen3_8_gdn_ulysses_cp_wrapper,
 }
 
 # Static requirements for shipped wrappers. Custom registry entries own their

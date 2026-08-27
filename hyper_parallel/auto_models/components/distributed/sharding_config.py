@@ -718,6 +718,24 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         needs_cp_attn=True,
     ),
 
+    # ── Linear attention / Gated DeltaNet ──
+    # The boundary keeps the local sequence layout. A model-specific inner
+    # wrapper repairs causal Conv1d boundaries and exchanges the GDN rule from
+    # sequence shards to head shards while preserving the upstream forward.
+    "linear_attention": ShardingTemplate(
+        colwise_placement=Shard(0),
+        rowwise_placement=Shard(1),
+        sp_in_src=_hid(Shard(1), Shard(1)),
+        sp_in_dst=_hid(Replicate(), Shard(1)),
+        sp_out_src=_out(Partial(), Shard(1)),
+        sp_out_dst=_out(Shard(1), Shard(1)),
+        nosp_in_src=_hid(Replicate(), Replicate()),
+        nosp_in_dst=_hid(Replicate(), Replicate()),
+        nosp_out_src=_out(Partial(), Replicate()),
+        nosp_out_dst=_out(Replicate(), Replicate()),
+        needs_cp_attn=True,
+    ),
+
     # ── MLP (gate/up Colwise + down Rowwise) ──
     # The CP dim stays Shard(1) throughout (revision D-06): MLP is pointwise and
     # CP needs no communication; if in_dst had CP=Replicate, the full-sequence

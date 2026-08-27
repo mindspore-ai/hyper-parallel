@@ -41,7 +41,12 @@ fsdp_config:
   backward_prefetch_depth: 1
   comm_fusion: false
 
-plan_overrides: []
+plan_overrides:
+  - match: "*.self_attn"
+    when: cp
+    inner_target: self
+    inner_wrapper: sdpa_hf_ulysses
+    region_dispatch: false
 
 mixed_precision:
   enabled: false

@@ -36,6 +36,7 @@ from hyper_parallel.auto_models.components.distributed.cp_wrappers import (
     qwen3_moe_async_colossal_cp_wrapper,
     qwen3_moe_async_hybrid_cp_wrapper,
     qwen3_moe_async_ulysses_cp_wrapper,
+    qwen3_8_gdn_ulysses_cp_wrapper,
 )
 from hyper_parallel.auto_models.components.distributed.ep_compute import (
     EP_ARCHETYPE_SUGGESTIONS,
@@ -151,6 +152,7 @@ __all__ = [
     "qwen3_moe_async_colossal_cp_wrapper",
     "qwen3_moe_async_hybrid_cp_wrapper",
     "qwen3_moe_async_ulysses_cp_wrapper",
+    "qwen3_8_gdn_ulysses_cp_wrapper",
     "require_attrs",
     "resolve_placements",
     "resolve_swiglu_weights",
