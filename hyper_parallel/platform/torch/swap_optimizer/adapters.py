@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -240,9 +241,10 @@ class TorchAdamBaseAdapter(OptimizerSwapAdapter):
                 "has_complex": False,
             }
             if self.functional_name == "adam":
-                kwargs["decoupled_weight_decay"] = self.decoupled_weight_decay or group.get(
-                    "decoupled_weight_decay", False
-                )
+                if "decoupled_weight_decay" in inspect.signature(func).parameters:
+                    kwargs["decoupled_weight_decay"] = self.decoupled_weight_decay or group.get(
+                        "decoupled_weight_decay", False
+                    )
             func(params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps, **kwargs)
 
     def all_slots(self):
