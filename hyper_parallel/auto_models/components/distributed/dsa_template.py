@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Built-in tensor-parallel boundary template for DSA attention."""
+"""Structurally matched tensor-parallel boundary template for DSA attention."""
 
 import re
 from typing import Dict
@@ -24,6 +24,15 @@ from .sharding_config import ModuleShardingSpec
 
 _ATTN_ROOT = r"(?:^|\.)layers\.\d+\.(?:mtp_block\.)?self_attention$"
 _ATTN = _ATTN_ROOT[:-1] + r"\."
+_ATTENTION_TYPES = frozenset({"dsa", "mla", "gqa"})
+_DISTINCTIVE_LEAVES = frozenset({
+    "linear_qb",
+    "linear_kvb",
+    "index_linear_qb",
+    "index_linear_k",
+    "linear_merge_weight",
+    "sparse_lightning_indexer_kllloss",
+})
 
 
 def _direct_params(module, placement):
@@ -43,22 +52,52 @@ def _linear(module, *, param, in_src, in_dst, out_src, out_dst):
     )
 
 
+def _is_dsa_attention(module) -> bool:
+    """Match the DSA/MLA attention contract without using a model name."""
+    if getattr(module, "attention_type", None) in _ATTENTION_TYPES:
+        return True
+    if any(
+        name.startswith("param_sink_")
+        for name, _ in module.named_parameters(recurse=False)
+    ):
+        return True
+    child_names = {name for name, _ in module.named_children()}
+    return bool(_DISTINCTIVE_LEAVES.intersection(child_names))
+
+
+def _matching_attention_roots(named_modules) -> frozenset[str]:
+    return frozenset(
+        fqn
+        for fqn, module in named_modules.items()
+        if re.search(_ATTN_ROOT, fqn) and _is_dsa_attention(module)
+    )
+
+
+def matches_dsa_template(model) -> bool:
+    """Return whether *model* exposes the DSA/MLA structural contract."""
+    return bool(_matching_attention_roots(dict(model.named_modules())))
+
+
 def build_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
-    """Materialize DSA leaf-boundary specs for the target model.
+    """Materialize DSA leaf-boundary specs for a structurally matched model.
 
     DSA does not follow a single q/k/v/o projection chain: some projections
     preserve sequence parallelism, some shard index/query heads, and
-    ``linear_kvb.weight`` is consumed directly.  Keeping these contracts as a
-    named architecture template avoids rebuilding them in each trainer.
+    ``linear_kvb.weight`` is consumed directly.  The template is selected by
+    this module contract instead of ``config.architectures``/``model_type``.
     """
     specs = {}
     named_modules = dict(model.named_modules())
+    attention_roots = _matching_attention_roots(named_modules)
+    if not attention_roots:
+        return specs
+
     for fqn, module in named_modules.items():
         # Sink parameters participate in the head-sharded DSA projections but
         # are shared by all TP ranks.  They live directly on the attention
         # module, which is intentionally not a communication boundary in this
         # template, so declare a parameter-only replicated spec.
-        if re.search(_ATTN_ROOT, fqn):
+        if fqn in attention_roots:
             sink_params = {
                 name: {"tp": Replicate()}
                 for name, _ in module.named_parameters(recurse=False)
@@ -95,7 +134,9 @@ def build_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
                 out_dst={"output": {"tp": Replicate()}},
             )
             continue
-        if not re.search(_ATTN, fqn):
+        if not re.search(_ATTN, fqn) or not any(
+            fqn.startswith(f"{root}.") for root in attention_roots
+        ):
             continue
         leaf = fqn.rsplit(".", 1)[-1]
 
@@ -169,8 +210,3 @@ def build_dsa_specs(model) -> Dict[str, ModuleShardingSpec]:
                 in_dst={name: {"tp": Replicate()} for name in src},
                 out_src={}, out_dst={})
     return specs
-
-
-DSA_ARCHITECTURES = frozenset({
-    "v2vl", "v2_vl", "v2_vl_moe",
-})

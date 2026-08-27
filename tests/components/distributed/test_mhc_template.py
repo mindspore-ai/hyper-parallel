@@ -57,7 +57,11 @@ class _TinyLayer(nn.Module):
 class _TinyVlModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(architectures=["V2VL"])
+        # Deliberately unrelated: DSA/MHC templates must match structure, not
+        # config.architectures or model_type.
+        self.config = SimpleNamespace(
+            architectures=["UnrelatedArchitecture"],
+        )
         self.model = nn.Module()
         self.model.language_model = nn.Module()
         self.model.language_model.layers = nn.ModuleList([
@@ -86,8 +90,8 @@ def test_mhc_template_owns_only_mhc_parameters():
         )
 
 
-def test_planner_composes_dsa_and_mhc_templates():
-    """Independent architecture templates jointly cover their parameters."""
+def test_planner_composes_dsa_and_mhc_templates_by_structure():
+    """Independent structural templates jointly cover their parameters."""
     model = _TinyVlModel()
 
     plan = ShardingPlanner().plan(model, _FakeTpMesh(), tp_size=2)

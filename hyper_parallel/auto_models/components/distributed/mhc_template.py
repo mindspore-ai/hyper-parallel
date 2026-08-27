@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Built-in tensor-parallel parameter template for MHC modules."""
+"""Structurally matched tensor-parallel parameter template for MHC modules."""
 
 from typing import Dict
 
@@ -35,6 +35,20 @@ def _direct_params(module):
     }
 
 
+def _is_mhc_module_fqn(fqn: str) -> bool:
+    return any(part in _MHC_MODULES for part in fqn.split("."))
+
+
+def matches_mhc_template(model) -> bool:
+    """Return whether *model* contains an independently owned MHC subtree."""
+    for fqn, module in model.named_modules():
+        if not _is_mhc_module_fqn(fqn):
+            continue
+        if any(module.named_parameters(recurse=False)):
+            return True
+    return False
+
+
 def build_mhc_specs(model) -> Dict[str, ModuleShardingSpec]:
     """Materialize replicated parameter specs for MHC modules.
 
@@ -45,7 +59,7 @@ def build_mhc_specs(model) -> Dict[str, ModuleShardingSpec]:
     """
     specs = {}
     for fqn, module in model.named_modules():
-        if not any(part in _MHC_MODULES for part in fqn.split(".")):
+        if not _is_mhc_module_fqn(fqn):
             continue
         params = _direct_params(module)
         if params:
@@ -54,8 +68,3 @@ def build_mhc_specs(model) -> Dict[str, ModuleShardingSpec]:
                 is_boundary=False,
             )
     return specs
-
-
-MHC_ARCHITECTURES = frozenset({
-    "v2vl", "v2_vl", "v2_vl_moe",
-})

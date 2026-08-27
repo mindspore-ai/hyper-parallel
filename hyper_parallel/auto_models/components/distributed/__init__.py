@@ -74,12 +74,16 @@ from hyper_parallel.auto_models.components.distributed.param_role import (
     ParamRole,
 )
 from hyper_parallel.auto_models.components.distributed.dsa_template import (
-    DSA_ARCHITECTURES,
     build_dsa_specs,
+    matches_dsa_template,
 )
 from hyper_parallel.auto_models.components.distributed.mhc_template import (
-    MHC_ARCHITECTURES,
     build_mhc_specs,
+    matches_mhc_template,
+)
+from hyper_parallel.auto_models.components.distributed.mtp_template import (
+    build_mtp_specs,
+    matches_mtp_template,
 )
 from hyper_parallel.auto_models.components.distributed.pipelining import (
     AutoPipeline,
@@ -126,8 +130,6 @@ __all__ = [
     "MeshAxisName",
     "ModuleShardingSpec",
     "NamedPlacement",
-    "DSA_ARCHITECTURES",
-    "MHC_ARCHITECTURES",
     "ParameterClassifier",
     "ParamRole",
     "PlacementMismatchError",
@@ -144,6 +146,7 @@ __all__ = [
     "build_source_shard_info",
     "build_dsa_specs",
     "build_mhc_specs",
+    "build_mtp_specs",
     "check_dispatchable",
     "deepseekv3_ep_compute_fn",
     "mixtral_ep_compute_fn",
@@ -158,6 +161,9 @@ __all__ = [
     "inner_wrapper",
     "local_compute",
     "local_region",
+    "matches_dsa_template",
+    "matches_mhc_template",
+    "matches_mtp_template",
     "qwen2moe_ep_compute_fn",
     "qwen3moe_ep_compute_fn",
     "qwen3_moe_async_colossal_cp_wrapper",

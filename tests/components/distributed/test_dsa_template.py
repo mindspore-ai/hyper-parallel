@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for the DSA architecture-specific TP template."""
+"""Tests for the structurally matched DSA TP template."""
 
 from types import SimpleNamespace
 
@@ -78,10 +78,16 @@ class _TinyLayer(nn.Module):
 class _TinyVlModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(architectures=["V2VL"])
+        self.config = SimpleNamespace(architectures=["UnrelatedArchitecture"])
         self.model = nn.Module()
         self.model.language_model = nn.Module()
         self.model.language_model.layers = nn.ModuleList([_TinyLayer()])
+
+
+class _PlainLmHeadModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lm_head = nn.Linear(8, 8, bias=False)
 
 
 def test_linear_proj_sequence_axis_follows_attention_runtime_layout():
@@ -117,6 +123,19 @@ def test_dsa_template_owns_only_sink_parameters():
         isinstance(placements["tp"], Replicate)
         for placements in specs[fqn].params.values()
     )
+
+
+def test_dsa_template_does_not_claim_plain_lm_head_without_dsa_structure():
+    """A global template scan must not override ordinary model boundaries."""
+    from hyper_parallel.auto_models.components.distributed.dsa_template import (
+        build_dsa_specs,
+        matches_dsa_template,
+    )
+
+    model = _PlainLmHeadModel()
+
+    assert not matches_dsa_template(model)
+    assert build_dsa_specs(model) == {}
 
 
 def test_parameter_sharding_updates_explicit_head_count_owner(monkeypatch):
