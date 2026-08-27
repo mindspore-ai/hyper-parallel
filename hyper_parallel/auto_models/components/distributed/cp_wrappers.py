@@ -206,6 +206,29 @@ def _gdn_cp_causal_conv1d(
     return output[..., halo_width:].contiguous()
 
 
+def _gdn_cp_conv1d_module(
+        original_forward: Callable[..., Any], conv_module: Any,
+        cp_mesh: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run the Transformers Conv1d fallback with the previous CP halo."""
+    kernel_size = conv_module.kernel_size[0]
+    dilation = conv_module.dilation[0]
+    halo_width = (kernel_size - 1) * dilation
+    if halo_width <= 0 or cp_mesh.size() <= 1:
+        return original_forward(hidden_states)
+    if hidden_states.shape[-1] < halo_width:
+        raise ValueError(
+            "Qwen3.8 GDN CP requires local sequence length "
+            f"({hidden_states.shape[-1]}) to be at least Conv1d halo width "
+            f"({halo_width})"
+        )
+    tail = hidden_states[..., -halo_width:].contiguous()
+    halo = _exchange_previous_cp_halo(tail, cp_mesh)
+    conv_input = torch.cat((halo, hidden_states), dim=-1)
+    output = original_forward(conv_input)
+    local_length = hidden_states.shape[-1]
+    return output[..., halo_width:halo_width + local_length].contiguous()
+
+
 def _gdn_rule_cp_to_hp(
         query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
         decay: torch.Tensor, beta: torch.Tensor,
@@ -1761,9 +1784,17 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
         getattr(conv_owner, conv_name)
         if conv_owner is target_module else conv_owner.get(conv_name)
     )
-    if conv_name not in referenced_names or not callable(original_conv):
+    conv_module = getattr(target_module, "conv1d", None)
+    original_conv_forward = getattr(conv_module, "forward", None)
+    use_fused_conv = conv_name in referenced_names and callable(original_conv)
+    use_module_conv = (
+        not use_fused_conv
+        and "conv1d" in referenced_names
+        and callable(original_conv_forward)
+    )
+    if not use_fused_conv and not use_module_conv:
         raise RuntimeError(
-            "Qwen3.8 GDN CP requires forward to call causal_conv1d_fn"
+            "Qwen3.8 GDN CP requires a fused or module causal Conv1d path"
         )
 
     rule_names = tuple(
@@ -1858,14 +1889,21 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
 
         fired = {"conv": 0, "rule": 0}
 
-        @functools.wraps(original_conv)
-        def cp_conv(*conv_args: Any, **conv_kwargs: Any) -> Any:
-            fired["conv"] += 1
-            if not conv_args and "x" in conv_kwargs:
-                conv_kwargs = dict(conv_kwargs)
-                conv_args = (conv_kwargs.pop("x"),)
-            return _gdn_cp_causal_conv1d(
-                original_conv, cp_mesh, *conv_args, **conv_kwargs)
+        if use_fused_conv:
+            @functools.wraps(original_conv)
+            def cp_conv(*conv_args: Any, **conv_kwargs: Any) -> Any:
+                fired["conv"] += 1
+                if not conv_args and "x" in conv_kwargs:
+                    conv_kwargs = dict(conv_kwargs)
+                    conv_args = (conv_kwargs.pop("x"),)
+                return _gdn_cp_causal_conv1d(
+                    original_conv, cp_mesh, *conv_args, **conv_kwargs)
+        else:
+            @functools.wraps(original_conv_forward)
+            def cp_conv(hidden_states: torch.Tensor) -> torch.Tensor:
+                fired["conv"] += 1
+                return _gdn_cp_conv1d_module(
+                    original_conv_forward, conv_module, cp_mesh, hidden_states)
 
         wrapped_rules = {}
         for name, original_rule in original_rules.items():
@@ -1882,13 +1920,19 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
 
             wrapped_rules[name] = counted_rule
 
-        replace_primitive(conv_owner, conv_name, cp_conv)
+        if use_fused_conv:
+            replace_primitive(conv_owner, conv_name, cp_conv)
+        else:
+            conv_module.forward = cp_conv
         for name, wrapped_rule in wrapped_rules.items():
             replace_primitive(rule_owners[name], name, wrapped_rule)
         try:
             output = original_forward(*args, **kwargs)
         finally:
-            replace_primitive(conv_owner, conv_name, original_conv)
+            if use_fused_conv:
+                replace_primitive(conv_owner, conv_name, original_conv)
+            else:
+                conv_module.forward = original_conv_forward
             for name, original_rule in original_rules.items():
                 replace_primitive(rule_owners[name], name, original_rule)
         if fired["conv"] != 1 or fired["rule"] != 1:
