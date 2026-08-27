@@ -1,6 +1,6 @@
 # Tiny Qwen3-MoE 训练演示
 
-这份示例使用仓库内的紧凑 Qwen3-MoE checkpoint 和示例目录内的确定性 `TinyCausalDataset`，不依赖 Hugging Face Hub，适合验证现有 Trainer/FSDP 能力和 7 种 CP wrapper。
+这份示例使用仓库内的紧凑 Qwen3-MoE checkpoint 和 Trainer 已有的 indexed mock 数据流程，不依赖 Hugging Face Hub，适合验证现有 Trainer/FSDP 能力和 7 种 CP wrapper。
 
 ## 1. 环境准备
 
@@ -20,7 +20,7 @@ cd /path/to/hyper-parallel
 export HYPER_PARALLEL_PLATFORM=torch
 ```
 
-训练数据由示例目录内的 `TinyCausalDataset` 生成，模型文件位于：
+训练数据由 `build_indexed_text_dataset(mock_data=true)` 生成，模型文件位于：
 
 ```text
 examples/training_demo/tiny_qwen3_moe/
@@ -98,7 +98,7 @@ CP2 的关键配置已经在 [train.yaml](../../../examples/training_demo/train.
 - `sequence_parallel: true` 保持 activation 的 CP 布局契约一致。
 - `when: cp` 的 `qwen3_moe_flash_attention_cp_wrapper` 在 `cp_size > 1` 时安装。
 - `create_attention_mask_in_dataloader: false`，由 wrapper 根据 CP rank 自动构造带 query offset 的 causal mask。
-- `labels_are_shifted: true`，保证 CP 分片前已经保留跨分片的 next-token target。
+- indexed `MockGPTDataset` 原生生成预移位的 `tokens`/`labels`；`labels_are_shifted: true` 告诉 `ParallelBatch` 直接使用这些 target，保证 CP 分片边界的 next-token 标签正确。
 
 ## 5. 七种 CP wrapper 配置
 

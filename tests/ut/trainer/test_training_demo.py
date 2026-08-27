@@ -16,11 +16,13 @@
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-import torch
+import numpy as np
 import yaml
 
-from examples.training_demo.data import TinyCausalDataset
+from hyper_parallel.auto_models.components.datasets.llm import build_indexed_text_dataset
+from hyper_parallel.auto_models.components.datasets.llm.build_tokenizer import AutoTokenizer
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -76,31 +78,43 @@ CP_VARIANTS = {
 
 
 class TestTinyQwen3TrainingDemo(unittest.TestCase):
-    """Validate deterministic labels and the seven CP wrapper configurations."""
+    """Validate the existing mock data path and seven CP wrapper configurations."""
 
-    def test_example_dataset_emits_pre_shifted_causal_labels(self) -> None:
-        """Preserve cross-shard next-token targets before CP slicing."""
-        dataset = TinyCausalDataset(
-            num_samples=2,
-            seq_len=6,
+    def test_indexed_mock_dataset_emits_pre_shifted_causal_labels(self) -> None:
+        """Reuse master MockGPTDataset to preserve targets before CP slicing."""
+        tokenizer = AutoTokenizer.from_pretrained(
+            "tiny-qwen3-moe",
+            tokenizer_type="pretokenized",
             vocab_size=19,
-            seed=23,
+            eod_token_id=2,
+            pad_token_id=0,
         )
+        train_dataset, valid_dataset, test_dataset = build_indexed_text_dataset(
+            data_config={
+                "seq_length": 8,
+                "split": "100, 0, 0",
+                "mock_data": True,
+                "data_lazy_load": False,
+                "is_dataset_from_mr": False,
+                "simple_blend": "no",
+            },
+            tokenizer=tokenizer,
+            training_config=SimpleNamespace(
+                seed=23,
+                train_iters=1,
+                train_samples=None,
+                global_batch_size=2,
+                eval_iters=0,
+            ),
+        )
+        sample = train_dataset[0]
 
-        self.assertEqual(
-            tuple(dataset.input_ids.shape),
-            (2, 6),
-            f"Unexpected input shape: expected={(2, 6)}, got={tuple(dataset.input_ids.shape)}",
-        )
-        self.assertEqual(
-            tuple(dataset.labels.shape),
-            (2, 6),
-            f"Unexpected label shape: expected={(2, 6)}, got={tuple(dataset.labels.shape)}",
-        )
         self.assertTrue(
-            torch.equal(dataset.input_ids[:, 1:], dataset.labels[:, :-1]),
-            f"Labels are not next-token shifted: input_ids={dataset.input_ids}, labels={dataset.labels}",
+            np.array_equal(sample["tokens"][1:], sample["labels"][:-1]),
+            f"Labels are not next-token shifted: tokens={sample['tokens']}, labels={sample['labels']}",
         )
+        self.assertIsNone(valid_dataset, f"Unexpected validation Dataset: {valid_dataset}")
+        self.assertIsNone(test_dataset, f"Unexpected test Dataset: {test_dataset}")
 
     def test_cp_wrapper_yaml_matrix(self) -> None:
         """Declare exactly one expected wrapper and topology per CP variant."""
@@ -157,9 +171,15 @@ class TestTinyQwen3TrainingDemo(unittest.TestCase):
                 )
                 self.assertEqual(
                     config["dataset"]["_target_"],
-                    "examples.training_demo.data.TinyCausalDataset",
-                    f"Dataset target mismatch: expected=examples.training_demo.data.TinyCausalDataset, "
+                    "hyper_parallel.auto_models.components.datasets.llm.build_indexed_text_dataset",
+                    "Dataset target mismatch: expected existing indexed Dataset builder, "
                     f"got={config['dataset']['_target_']}",
+                )
+                data_config = config["dataset"]["data_config"]
+                self.assertTrue(data_config["mock_data"], f"Mock data is disabled for {variant}")
+                self.assertTrue(
+                    data_config["labels_are_shifted"],
+                    f"Pre-shifted label contract is disabled for {variant}",
                 )
                 self.assertEqual(
                     config["dataloader"]["_target_"],

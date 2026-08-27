@@ -69,17 +69,23 @@ activation_checkpoint:
 dataset:
   model_assets:
     chat_template: null
-    tokenizer: null
-  data_transform:
-    _target_: hyper_parallel.auto_models.components.data.identity_transform.IdentityDataTransform
+    tokenizer:
+      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: ./examples/training_demo/tiny_qwen3_moe
+      tokenizer_type: pretokenized
+      vocab_size: 256
+      eod_token_id: 2
+      pad_token_id: 0
   data_config:
+    seq_length: 16
+    split: "100, 0, 0"
+    mock_data: true
+    data_lazy_load: false
+    is_dataset_from_mr: false
+    simple_blend: "no"
     labels_are_shifted: true
     create_attention_mask_in_dataloader: false
-  _target_: examples.training_demo.data.TinyCausalDataset
-  num_samples: 64
-  seq_len: 16
-  vocab_size: 256
-  seed: 42
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_indexed_text_dataset
 
 dataloader:
   _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
