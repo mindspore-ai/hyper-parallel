@@ -265,15 +265,25 @@ def _validate_qwen3_8_gdn_cp(target_module: Any, cp_mesh: Any) -> None:
         )
 
 
-def _resolve_gdn_forward_globals(original_forward: Callable[..., Any]) -> dict:
-    """Return the globals used by the unwrapped Transformers GDN forward."""
+def _resolve_gdn_forward_implementation(
+        original_forward: Callable[..., Any]) -> Callable[..., Any]:
+    """Resolve the GDN implementation beneath Transformers hook wrappers."""
     implementation = inspect.unwrap(original_forward)
-    forward_globals = getattr(implementation, "__globals__", None)
-    if not isinstance(forward_globals, dict):
-        raise TypeError(
-            "Qwen3.8 GDN CP could not resolve the Transformers forward globals"
-        )
-    return forward_globals
+    visited = set()
+    while id(implementation) not in visited:
+        visited.add(id(implementation))
+        referenced_names = set(implementation.__code__.co_names)
+        if "chunk_gated_delta_rule" in referenced_names:
+            return implementation
+        closure = inspect.getclosurevars(implementation).nonlocals
+        wrapped = closure.get("forward_func")
+        if not callable(wrapped):
+            break
+        implementation = inspect.unwrap(wrapped)
+    raise RuntimeError(
+        "Qwen3.8 GDN CP could not resolve the Transformers forward "
+        "implementation"
+    )
 
 
 def is_hf_style_attention(module: Any) -> bool:
@@ -1741,12 +1751,16 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
     del mesh, tp_mesh, ep_mesh
     _validate_qwen3_8_gdn_cp(target_module, cp_mesh)
     original_forward = target_module.forward
-    forward_globals = _resolve_gdn_forward_globals(original_forward)
-    forward_impl = inspect.unwrap(original_forward)
+    forward_impl = _resolve_gdn_forward_implementation(original_forward)
+    forward_globals = forward_impl.__globals__
     referenced_names = set(forward_impl.__code__.co_names)
 
     conv_name = "causal_conv1d_fn"
-    original_conv = forward_globals.get(conv_name)
+    conv_owner = target_module if hasattr(target_module, conv_name) else forward_globals
+    original_conv = (
+        getattr(conv_owner, conv_name)
+        if conv_owner is target_module else conv_owner.get(conv_name)
+    )
     if conv_name not in referenced_names or not callable(original_conv):
         raise RuntimeError(
             "Qwen3.8 GDN CP requires forward to call causal_conv1d_fn"
@@ -1757,14 +1771,32 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
             "torch_chunk_gated_delta_rule",
             "chunk_gated_delta_rule",
         )
-        if name in referenced_names and callable(forward_globals.get(name))
+        if name in referenced_names and (
+            callable(getattr(target_module, name, None))
+            or callable(forward_globals.get(name))
+        )
     )
     if not rule_names:
         raise RuntimeError(
             "Qwen3.8 GDN CP could not find a supported chunk Gated Delta "
             "Rule call in the Transformers forward"
         )
-    original_rules = {name: forward_globals[name] for name in rule_names}
+    rule_owners = {
+        name: target_module if callable(getattr(target_module, name, None))
+        else forward_globals
+        for name in rule_names
+    }
+    original_rules = {
+        name: getattr(owner, name) if owner is target_module else owner[name]
+        for name, owner in rule_owners.items()
+    }
+
+    def replace_primitive(owner: Any, name: str, value: Callable[..., Any]) -> None:
+        """Replace one module attribute or forward global primitive."""
+        if owner is target_module:
+            setattr(owner, name, value)
+        else:
+            owner[name] = value
 
     def make_cp_rule(original_rule: Callable[..., Any]) -> Callable[..., Any]:
         """Build one CP-aware wrapper for a referenced GDN rule primitive."""
@@ -1829,6 +1861,9 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
         @functools.wraps(original_conv)
         def cp_conv(*conv_args: Any, **conv_kwargs: Any) -> Any:
             fired["conv"] += 1
+            if not conv_args and "x" in conv_kwargs:
+                conv_kwargs = dict(conv_kwargs)
+                conv_args = (conv_kwargs.pop("x"),)
             return _gdn_cp_causal_conv1d(
                 original_conv, cp_mesh, *conv_args, **conv_kwargs)
 
@@ -1847,13 +1882,15 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
 
             wrapped_rules[name] = counted_rule
 
-        forward_globals[conv_name] = cp_conv
-        forward_globals.update(wrapped_rules)
+        replace_primitive(conv_owner, conv_name, cp_conv)
+        for name, wrapped_rule in wrapped_rules.items():
+            replace_primitive(rule_owners[name], name, wrapped_rule)
         try:
             output = original_forward(*args, **kwargs)
         finally:
-            forward_globals[conv_name] = original_conv
-            forward_globals.update(original_rules)
+            replace_primitive(conv_owner, conv_name, original_conv)
+            for name, original_rule in original_rules.items():
+                replace_primitive(rule_owners[name], name, original_rule)
         if fired["conv"] != 1 or fired["rule"] != 1:
             raise RuntimeError(
                 "Qwen3.8 GDN CP wrapper expected one causal Conv1d and one "

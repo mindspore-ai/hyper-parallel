@@ -22,9 +22,12 @@ from hyper_parallel.auto_models.components.distributed.sharding_planner import (
 )
 
 
-def causal_conv1d_fn(hidden_states, weight, bias=None, activation=None):
+def causal_conv1d_fn(
+        hidden_states=None, weight=None, bias=None, activation=None, *, x=None):
     """Fake Transformers Conv1d primitive used by the fake GDN forward."""
     del weight, bias, activation
+    if hidden_states is None:
+        hidden_states = x
     return hidden_states + 1
 
 
@@ -34,6 +37,14 @@ def torch_chunk_gated_delta_rule(
     """Fake Transformers GDN primitive used by the fake GDN forward."""
     del key, value, g, beta, initial_state, output_final_state
     return query + 2, None
+
+
+def _hook_wrapper(forward_func):
+    """Mimic the Transformers hook decorator without ``functools.wraps``."""
+    def wrapped(self, *args, **kwargs):
+        return forward_func(self, *args, **kwargs)
+
+    return wrapped
 
 
 class _FakeCPMesh:
@@ -59,6 +70,37 @@ class FakeGatedDeltaNet:
         decay = torch.zeros(mixed.shape[:-1])
         beta = torch.zeros_like(decay)
         output, _ = torch_chunk_gated_delta_rule(
+            mixed,
+            mixed,
+            mixed,
+            g=decay,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+        )
+        return output
+
+
+class HookedGatedDeltaNet:
+    """GDN variant using instance primitives below an opaque hook wrapper."""
+
+    def __init__(self):
+        """Initialize instance primitive attributes and head metadata."""
+        self.num_v_heads = 2
+        self.causal_conv1d_fn = causal_conv1d_fn
+        self.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+
+    @_hook_wrapper
+    def forward(self, hidden_states, cache_params=None, **kwargs):
+        """Run the same attribute primitive calls as Transformers 5.13."""
+        del cache_params, kwargs
+        mixed = self.causal_conv1d_fn(
+            x=hidden_states,
+            weight=torch.ones(1, 2),
+        )
+        decay = torch.zeros(mixed.shape[:-1])
+        beta = torch.zeros_like(decay)
+        output, _ = self.chunk_gated_delta_rule(
             mixed,
             mixed,
             mixed,
@@ -119,3 +161,39 @@ def test_planner_recognizes_linear_attention_boundary():
         "model.layers.0.linear_attn",
         "linear_attn",
     ) == "linear_attention"
+
+
+def test_qwen3_8_gdn_wrapper_resolves_hooked_instance_primitives(monkeypatch):
+    """The wrapper supports the decorated Transformers 5.13 call structure."""
+    monkeypatch.setattr(
+        cp_wrappers,
+        "_gdn_cp_causal_conv1d",
+        lambda original, cp_mesh, *args, **kwargs: original(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        cp_wrappers,
+        "_gdn_rule_cp_to_hp",
+        lambda query, key, value, decay, beta, cp_mesh: (
+            query, key, value, decay, beta),
+    )
+    monkeypatch.setattr(
+        cp_wrappers,
+        "_gdn_rule_hp_to_cp",
+        lambda output, cp_mesh: output,
+    )
+
+    module = HookedGatedDeltaNet()
+    original_conv = module.causal_conv1d_fn
+    original_rule = module.chunk_gated_delta_rule
+    cp_wrappers.qwen3_8_gdn_ulysses_cp_wrapper(
+        module,
+        mesh=None,
+        tp_mesh=None,
+        cp_mesh=_FakeCPMesh(),
+        ep_mesh=None,
+    )
+
+    inputs = torch.zeros(1, 2, 2, 1)
+    torch.testing.assert_close(module.forward(inputs), inputs + 3)
+    assert module.causal_conv1d_fn is original_conv
+    assert module.chunk_gated_delta_rule is original_rule
