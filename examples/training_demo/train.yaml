@@ -1,0 +1,186 @@
+# Trainer end-to-end demo.
+#
+# This offline smoke configuration uses a compact Qwen3-30B-A3B-compatible
+# checkpoint and deterministic token data to validate the full Trainer path.
+#
+# Run on eight Ascend NPUs with:
+#   bash examples/training_demo/run.sh
+
+model:
+  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ./examples/training_demo/tiny_qwen3_moe
+  ignore_mismatched_sizes: false
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_iters: 25
+  train_samples: null
+
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true # false
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: false
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - "model.norm"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
+    replace_module:
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
+  - match: "*.self_attn"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+    replace_module:
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_flash_attention
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.qwen3_moe_flash_attention_cp_wrapper
+  - match: "*.mlp"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
+    replace_module:
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_sparse_moe
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none # attention, none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+# The smoke Dataset is already tokenized, so no Hub access or tokenizer is
+# required. Its size covers all 25 iterations at a global batch size of eight.
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer: null
+
+  data_transform:
+    _target_: hyper_parallel.auto_models.components.data.identity_transform.IdentityDataTransform
+
+  data_config:
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+
+  _target_: examples.training_demo.data.TinyCausalDataset
+  num_samples: 256
+  seq_len: 16
+  vocab_size: 256
+  seed: 42
+
+dataloader:
+  # StatefulDataLoader adapter; sampling order is controlled by dataloader_type,
+  # so do not configure torch DataLoader's shuffle option here.
+  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
+
+  collate_fn:
+    _target_: hyper_parallel.auto_models.components.datasets.build_indexed_collate_fn
+
+  get_batch:
+    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
+    source_type: indexed
+
+  # single: sequential/rearranged; cyclic: deterministic shuffled epochs.
+  dataloader_type: single # cyclic
+
+  # Defaults.
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 0
+    min_lr: 1.0e-6
+
+checkpoint:
+  # Gates saving only; loading is controlled by restore_from below, so
+  # save_ckpt=false with a restore_from set means "start here, write nothing".
+  save_ckpt: true
+  checkpoint_dir: ./outputs/training_demo/tiny_qwen3_moe_checkpoints
+  save_steps: 25
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  # Where the per-step training state (step/epoch, lr_scheduler, dataloader
+  # position, RNG) is written.
+  #   true  - one torch.save file per rank under extra_state/. Always correct.
+  #   false - embedded in the DCP state dict; fewer files, but DCP deduplicates
+  #           entries sharing an FQN across ranks, so it is only valid when that
+  #           state is identical on every rank. Restore auto-detects either
+  #           layout, so this can be flipped between runs.
+  save_extra_state_per_rank: false
+
+  # Resume with:  bash examples/training_demo/run.sh --checkpoint.restore_from=LATEST
+  # or point at one directory: --checkpoint.restore_from=./outputs/training_demo/tiny_qwen3_moe_checkpoints/global_step_25
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiling:
+  enabled: false
+  start_step: 3
+  end_step: 4
+  trace_dir: ./outputs/training_demo/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  rank: 0

@@ -1,0 +1,124 @@
+# Tiny Qwen3-MoE: asynchronous Hybrid CP (Ulysses degree 2, Colossal degree 2).
+
+model:
+  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ./examples/training_demo/tiny_qwen3_moe
+  ignore_mismatched_sizes: false
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_iters: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 4
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: false
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - "model.norm"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
+    replace_module:
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
+  - match: "*.self_attn"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+    replace_module:
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_flash_attention
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.auto_models.components.distributed.cp_wrappers.qwen3_moe_async_hybrid_cp_wrapper
+      ulysses_degree: 2
+  - match: "*.mlp"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
+    replace_module:
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_sparse_moe
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: off
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer: null
+  data_transform:
+    _target_: hyper_parallel.auto_models.components.data.identity_transform.IdentityDataTransform
+  data_config:
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+  _target_: examples.training_demo.data.TinyCausalDataset
+  num_samples: 64
+  seq_len: 16
+  vocab_size: 256
+  seed: 42
+
+dataloader:
+  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.auto_models.components.datasets.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
+    source_type: indexed
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 0
+    min_lr: 1.0e-6
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
