@@ -49,6 +49,7 @@ MINDSPORE_REQUIRES = [
     "mindspore>=2.10",
 ]
 
+
 def _read_requirements(requirements_path: str) -> list[str]:
     """Read Python requirement lines from a repository-local file."""
     with open(os.path.join(ROOT_DIR, requirements_path), encoding='utf-8') as file:

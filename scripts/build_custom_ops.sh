@@ -8,6 +8,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+<<<<<<< HEAD
 # Build the MindSpore custom-op adapter.
 
 set -euo pipefail
@@ -57,6 +58,49 @@ function require_cache_key() {
     if [[ ! "${key_value}" =~ ^[0-9a-f]{16}$ ]]; then
         fail "FRAMEWORK_CACHE_KEY_INVALID" \
             "${key_name} cache identity must be one 16-character hexadecimal digest." 6
+=======
+# Build custom ops MindSpore extension: hyper_parallel_custom_ops_ms.so
+#
+# This script compiles the .cc files under
+#   hyper_parallel/platform/mindspore/custom_ops/
+# into a pre-built .so using MindSpore's CustomOpBuilder.build().
+# The output is placed under build/lib/ relative to the custom_ops source dir
+# and is picked up by setup.py's package_data at install time.
+#
+# BUILD_CUSTOM_OPS_EXTENSION controls whether this component is built:
+#   off: skip custom ops
+#   on (default): build custom ops
+
+set -e
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
+CUSTOM_OPS_SRC="$PROJECT_ROOT/hyper_parallel/platform/mindspore/custom_ops"
+CUSTOM_OPS_BUILD_DIR="$CUSTOM_OPS_SRC/build"
+BUILD_CUSTOM_OPS_EXTENSION="${BUILD_CUSTOM_OPS_EXTENSION:-on}"
+BUILD_CUSTOM_OPS_EXTENSION_DISPLAY="${BUILD_CUSTOM_OPS_EXTENSION}"
+
+case "${BUILD_CUSTOM_OPS_EXTENSION}" in
+    on|ON)
+        ;;
+    off|OFF)
+        rm -rf "$CUSTOM_OPS_BUILD_DIR"
+        echo "INFO: custom ops build skipped (BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION_DISPLAY})."
+        exit 0
+        ;;
+    *)
+        echo "ERROR: Unsupported BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION}."
+        echo "       Use off to skip custom ops, or on to build."
+        exit 1
+        ;;
+esac
+
+SET_ENV_FILE="/usr/local/Ascend/cann/set_env.sh"
+if [ -z "${ASCEND_HOME_PATH}" ]; then
+    echo "Warning: ASCEND_HOME_PATH is not set. Attempting to source ${SET_ENV_FILE}."
+    if [ -f "${SET_ENV_FILE}" ]; then
+        source "${SET_ENV_FILE}"
+>>>>>>> 84082eb1 (Fix compile script to contain custom ops)
     fi
 }
 
