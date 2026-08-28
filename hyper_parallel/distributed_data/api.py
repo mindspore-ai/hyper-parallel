@@ -104,12 +104,14 @@ class DistributedDatasetConfig:
     look-ahead, while ``num_workers`` controls the worker count. ``pin_memory``
     pins each final collated batch on a dedicated thread. Online candidates are
     pinned only after planning and redistribution. Distributed collectives
-    always remain in the training rank process. ``raw_sample_size`` is the
-    number of dataset records assigned to each data owner per microbatch.
+    always remain in the training rank process. One dataset record is treated
+    as one planning unit per data-owner microbatch by default, which directly
+    supports prepacked records. ``raw_sample_size`` is an explicit override for
+    modes that assign multiple raw records to each data owner per microbatch.
     """
 
-    raw_sample_size: int
     micro_batch_num: int
+    raw_sample_size: int = 1
     prefetch_steps: int = 2
     sample_transport: str = "packed_bytes_a2a"
     dp_dim_names: tuple[str, ...] | None = None

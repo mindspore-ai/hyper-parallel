@@ -88,7 +88,8 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         Description: The public builder should require exactly one metadata path.
         Expectation: The operation produces the expected data, ordering, state, or error.
         """
-        config = distributed_data.DistributedDatasetConfig(raw_sample_size=1, micro_batch_num=1)
+        config = distributed_data.DistributedDatasetConfig(micro_batch_num=1)
+        self.assertEqual(config.raw_sample_size, 1)
 
         def metadata_fn(sample: Any, sample_id: int) -> SampleMeta:
             """Build unused metadata for boundary validation."""

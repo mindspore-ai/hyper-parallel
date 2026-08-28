@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Run online multimodal planning over downloaded Hugging Face JPEG samples."""
+"""Run sidecar-planned DP/MP data loading over downloaded Hugging Face JPEG samples."""
 # This file is intentionally a PyTorch-only runnable example.
 # pylint: disable=C0413,forbidden-backend-import
 
@@ -44,9 +44,9 @@ from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMeta
 
 
 class HuggingFaceManifestDataset:
-    """Read locally downloaded image-caption records through map-style indexing."""
+    """Expose local image-caption records and their lightweight metadata sidecar."""
 
-    _REQUIRED_FIELDS = ("sample_id", "image", "text", "width", "height", "sha256")
+    _REQUIRED_FIELDS = ("sample_id", "image", "text", "width", "height", "jpeg_bytes", "sha256")
 
     def __init__(self, manifest_path: Path, sample_count: int) -> None:
         """Load and validate a finite manifest window.
@@ -68,16 +68,31 @@ class HuggingFaceManifestDataset:
 
         self._manifest_dir = manifest_path.parent
         self._rows = rows[:sample_count]
+        sidecar_metadata = []
         for index, row in enumerate(self._rows):
             if not isinstance(row, dict):
                 raise ValueError(f"Manifest row {index} must be a JSON object.")
             missing = [field for field in self._REQUIRED_FIELDS if field not in row]
             if missing:
                 raise ValueError(f"Manifest row {index} is missing fields {missing}.")
+            sidecar_metadata.append(
+                SampleMeta(
+                    sample_id=index,
+                    text_tokens=max(1, len(row["text"].split())),
+                    vision_tokens=math.ceil(row["width"] / 14) * math.ceil(row["height"] / 14),
+                    io_bytes=row["jpeg_bytes"],
+                )
+            )
+        self._sidecar_metadata = tuple(sidecar_metadata)
 
     def __len__(self) -> int:
         """Return the records in the selected global-step window."""
         return len(self._rows)
+
+    @property
+    def sidecar_metadata(self) -> tuple[SampleMeta, ...]:
+        """Return precomputed sample costs without reading JPEG contents."""
+        return self._sidecar_metadata
 
     def __getitem__(self, data_index: int) -> dict[str, Any]:
         """Read one caption and its original JPEG bytes in a DataLoader worker."""
@@ -97,19 +112,8 @@ class HuggingFaceManifestDataset:
         }
 
 
-def derive_online_metadata(sample: dict[str, Any], sample_id: int) -> SampleMeta:
-    """Estimate text, vision, and I/O cost after the owner reads a raw sample."""
-    vision_tokens = math.ceil(sample["width"] / 14) * math.ceil(sample["height"] / 14)
-    return SampleMeta(
-        sample_id=sample_id,
-        text_tokens=max(1, len(sample["caption"].split())),
-        vision_tokens=vision_tokens,
-        io_bytes=len(sample["image_bytes"]),
-    )
-
-
 def decode_and_collate(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
-    """Decode target-rank JPEGs after A2A and return a validated training batch."""
+    """Decode sidecar-planned JPEGs and return a validated training batch."""
     records = []
     for sample in samples:
         digest = hashlib.sha256(sample["image_bytes"]).hexdigest()
@@ -143,8 +147,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--backend", choices=("hccl", "gloo"), default="hccl")
-    parser.add_argument("--raw-sample-size", type=int, default=2)
     parser.add_argument("--micro-batch-num", type=int, default=4)
+    parser.add_argument("--model-parallel-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--double-buffer", action="store_true")
@@ -173,19 +177,28 @@ def _validate_global_result(
     step_plan_id: str,
     sample_count: int,
     num_workers: int,
-    rank: int,
-    world_size: int,
+    mesh_shape: tuple[int, int],
 ) -> int:
-    """Validate plan agreement, worker execution, A2A movement, and sample coverage."""
+    """Validate sidecar planning, sample reassignment, and MP replication."""
+    data_parallel_size, model_parallel_size = mesh_shape
+    world_size = data_parallel_size * model_parallel_size
     gathered_plan_ids = _all_gather_object(local_plan_ids, world_size)
     if any(plan_ids != local_plan_ids for plan_ids in gathered_plan_ids):
-        raise ValueError(f"Ranks produced inconsistent online plans: {gathered_plan_ids}.")
+        raise ValueError(f"Ranks produced inconsistent sidecar plans: {gathered_plan_ids}.")
     gathered_step_ids = _all_gather_object(step_plan_id, world_size)
     if len(set(gathered_step_ids)) != 1:
         raise ValueError(f"Ranks produced inconsistent step plan IDs: {gathered_step_ids}.")
 
     gathered_records = _all_gather_object(local_records, world_size)
-    flat_records = [record for rank_records in gathered_records for record in rank_records]
+    representative_records = []
+    for data_rank in range(data_parallel_size):
+        group_start = data_rank * model_parallel_size
+        group_records = gathered_records[group_start: group_start + model_parallel_size]
+        if any(records != group_records[0] for records in group_records[1:]):
+            raise ValueError(f"Model-parallel ranks for data rank {data_rank} received different microbatches.")
+        representative_records.append(group_records[0])
+
+    flat_records = [record for rank_records in representative_records for record in rank_records]
     received_indices = [record["data_index"] for record in flat_records]
     if len(received_indices) != len(set(received_indices)) or set(received_indices) != set(range(sample_count)):
         raise ValueError("Distributed step did not preserve every manifest sample exactly once.")
@@ -193,47 +206,59 @@ def _validate_global_result(
     main_pids = set(_all_gather_object(os.getpid(), world_size))
     worker_pids = {record["worker_pid"] for record in flat_records}
     if num_workers > 0 and worker_pids & main_pids:
-        raise ValueError("Expected online reads to run in DataLoader worker processes.")
+        raise ValueError("Expected sidecar-planned reads to run in DataLoader worker processes.")
     if num_workers == 0 and not worker_pids <= main_pids:
         raise ValueError("num_workers=0 unexpectedly returned samples from worker processes.")
 
-    cross_owner_samples = sum(
-        record["data_index"] % world_size != target_rank
-        for target_rank, rank_records in enumerate(gathered_records)
+    reassigned_samples = sum(
+        record["data_index"] % data_parallel_size != target_data_rank
+        for target_data_rank, rank_records in enumerate(representative_records)
         for record in rank_records
     )
-    if world_size > 1 and cross_owner_samples == 0:
-        raise ValueError("The balanced plan did not exercise cross-owner A2A movement.")
-    if len(local_records) * world_size != sample_count:
-        raise ValueError(f"Rank {rank} received an unexpected local sample count {len(local_records)}.")
-    return cross_owner_samples
+    if data_parallel_size > 1 and reassigned_samples == 0:
+        raise ValueError("The sidecar plan did not reassign any samples across data ranks.")
+    expected_local_samples = sample_count // data_parallel_size
+    if any(len(records) != expected_local_samples for records in gathered_records):
+        raise ValueError(f"Each rank must receive {expected_local_samples} samples, got {gathered_records}.")
+    return reassigned_samples
 
 
 def main() -> None:
-    """Run and validate one online-planned optimizer step."""
+    """Run and validate one sidecar-planned optimizer step."""
     args = _parse_args()
     rank, world_size, communication_device, device_type = _initialize_distributed(args.backend)
-    sample_count = world_size * args.raw_sample_size * args.micro_batch_num
+    if args.model_parallel_size < 1 or world_size % args.model_parallel_size != 0:
+        raise ValueError(
+            f"model_parallel_size must be positive and divide world_size={world_size}, "
+            f"but got {args.model_parallel_size}."
+        )
+    data_parallel_size = world_size // args.model_parallel_size
+    mesh_shape = (data_parallel_size, args.model_parallel_size)
+    config = DistributedDatasetConfig(
+        micro_batch_num=args.micro_batch_num,
+        prefetch_steps=1,
+        dp_dim_names=("dp",),
+        double_buffer=args.double_buffer,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+    )
+    sample_count = data_parallel_size * config.raw_sample_size * config.micro_batch_num
     dataset = HuggingFaceManifestDataset(args.manifest, sample_count)
+    mesh_ranks = [
+        list(range(data_rank * args.model_parallel_size, (data_rank + 1) * args.model_parallel_size))
+        for data_rank in range(data_parallel_size)
+    ]
     mesh = DeviceMesh(
         device_type,
-        list(range(world_size)),
-        mesh_dim_names=("dp",),
+        mesh_ranks,
+        mesh_dim_names=("dp", "mp"),
         _init_backend=False,
     )
     loader = build_distributed_dataset(
         dataset,
         mesh,
-        DistributedDatasetConfig(
-            raw_sample_size=args.raw_sample_size,
-            micro_batch_num=args.micro_batch_num,
-            prefetch_steps=1,
-            sample_transport="packed_bytes_a2a",
-            double_buffer=args.double_buffer,
-            num_workers=args.num_workers,
-            prefetch_factor=args.prefetch_factor,
-        ),
-        metadata_fn=derive_online_metadata,
+        config,
+        metadata=dataset.sidecar_metadata,
         collate_fn=decode_and_collate,
         communication_device=communication_device,
     )
@@ -248,17 +273,16 @@ def main() -> None:
                 raise ValueError(f"Rank {rank} received data in an order different from its plan.")
             local_records.extend(micro_batch.data)
             local_plan_ids.append(micro_batch.plan_id)
-        cross_owner_samples = _validate_global_result(
+        reassigned_samples = _validate_global_result(
             local_records,
             local_plan_ids,
             step.plan_id,
             sample_count,
             args.num_workers,
-            rank,
-            world_size,
+            mesh_shape,
         )
         loader.commit(step.plan_id)
-        expected_offset = args.raw_sample_size * args.micro_batch_num
+        expected_offset = config.raw_sample_size * config.micro_batch_num
         if loader.consumed_offset != expected_offset:
             raise ValueError(f"Expected consumed_offset={expected_offset}, got {loader.consumed_offset}.")
     finally:
@@ -272,13 +296,18 @@ def main() -> None:
                     "dataset": "diffusers/pokemon-gpt4-captions",
                     "backend": args.backend,
                     "world_size": world_size,
+                    "data_parallel_size": data_parallel_size,
+                    "model_parallel_size": args.model_parallel_size,
+                    "data_owner_ranks": list(range(0, world_size, args.model_parallel_size)),
+                    "model_parallel_groups": mesh_ranks,
                     "samples": sample_count,
-                    "raw_sample_size": args.raw_sample_size,
+                    "dataset_units_per_micro_batch": config.raw_sample_size,
                     "micro_batch_num": args.micro_batch_num,
                     "num_workers": args.num_workers,
                     "double_buffer": args.double_buffer,
-                    "transport": "packed_bytes_a2a",
-                    "cross_owner_samples": cross_owner_samples,
+                    "metadata_mode": "sidecar",
+                    "sample_loading": "shared_storage_index_fetch",
+                    "reassigned_samples": reassigned_samples,
                     "consumed_offset": loader.consumed_offset,
                 },
                 sort_keys=True,
