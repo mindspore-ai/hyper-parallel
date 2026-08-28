@@ -27,12 +27,13 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from torch import nn
 from torch.distributed import is_available, is_initialized
-from transformers.conversion_mapping import get_model_conversion_mapping
-from transformers.core_model_loading import (
+from hyper_parallel.auto_models.weight_conversion import (
     WeightConverter,
     WeightRenaming,
     dot_natural_key,
+    get_model_conversion_mapping,
     rename_source_key,
+    revert_weight_conversion,
 )
 
 from hyper_parallel import DTensor, Partial, distribute_tensor
@@ -608,6 +609,10 @@ class CheckpointManager:
         unexpected_keys = tuple(sorted(set(unexpected_keys), key=dot_natural_key))
         self._validate_load_result(missing_keys, unexpected_keys, strict)
         used_base = [transform for transform in base_mapping if transform.was_used()]
+        self.model._hp_used_base_weight_conversions = used_base  # pylint: disable=protected-access
+        self.model._hp_used_replacement_weight_conversions = (  # pylint: disable=protected-access
+            used_replacements
+        )
         self.model._weight_conversions = used_base + used_replacements  # pylint: disable=protected-access
         report = LoadReport(
             loaded_keys=tuple(sorted(loaded_keys, key=dot_natural_key)),
@@ -641,6 +646,23 @@ class CheckpointManager:
         state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
         if not is_main_process:
             return False
+        used_base = getattr(
+            self.model, "_hp_used_base_weight_conversions", None
+        )
+        used_replacements = getattr(
+            self.model, "_hp_used_replacement_weight_conversions", None
+        )
+        if save_original_format and used_replacements:
+            original_mapping = getattr(self.model, "_weight_conversions", None)
+            try:
+                self.model._weight_conversions = used_replacements  # pylint: disable=protected-access
+                state_dict = revert_weight_conversion(self.model, state_dict)
+                if used_base:
+                    self.model._weight_conversions = used_base  # pylint: disable=protected-access
+                    state_dict = revert_weight_conversion(self.model, state_dict)
+            finally:
+                self.model._weight_conversions = original_mapping  # pylint: disable=protected-access
+            save_original_format = False
         save_method(
             save_directory,
             state_dict=state_dict,
