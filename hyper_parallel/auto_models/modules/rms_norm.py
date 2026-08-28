@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
-from transformers.core_model_loading import WeightConverter
+from hyper_parallel.auto_models.weight_conversion import WeightConverter
 
 from hyper_parallel.auto_models.components.checkpoint.conversion_ops import AddScalar
 from hyper_parallel.auto_models.components.model_transform import module_replacement

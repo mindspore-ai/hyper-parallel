@@ -23,7 +23,10 @@ from typing import Any, Optional
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers.activations import ACT2FN
-from transformers.core_model_loading import WeightConverter, WeightRenaming
+from hyper_parallel.auto_models.weight_conversion import (
+    WeightConverter,
+    WeightRenaming,
+)
 
 from hyper_parallel.auto_models.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.auto_models.components.model_transform import module_replacement
@@ -61,7 +64,9 @@ class LinearWithMatmul(nn.Linear):
         super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
         self.skip_bias_add = skip_bias_add
 
-    def forward(self, input: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(  # pylint: disable=redefined-builtin
+        self, input: torch.Tensor
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply matmul and optionally return bias for external addition."""
         output = torch.matmul(input, self.weight.t().contiguous())
         if self.skip_bias_add:

@@ -25,8 +25,11 @@ from typing import Any, Optional, Union
 
 import torch
 from torch import nn
-from transformers.conversion_mapping import get_model_conversion_mapping
-from transformers.core_model_loading import WeightConverter, WeightRenaming
+from hyper_parallel.auto_models.weight_conversion import (
+    WeightConverter,
+    WeightRenaming,
+    get_model_conversion_mapping,
+)
 
 from hyper_parallel.auto_models._transformers.checkpoint_loader import CheckpointManager, LoadReport
 from hyper_parallel.auto_models.components.activation_checkpoint import (

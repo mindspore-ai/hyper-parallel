@@ -17,7 +17,7 @@
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
-from transformers.core_model_loading import ConversionOps
+from hyper_parallel.auto_models.weight_conversion import ConversionOps
 
 
 def _single_tensor(value: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:

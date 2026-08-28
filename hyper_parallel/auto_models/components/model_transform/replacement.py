@@ -24,7 +24,10 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
 from torch import nn
-from transformers.core_model_loading import WeightConverter, WeightRenaming
+from hyper_parallel.auto_models.weight_conversion import (
+    WeightConverter,
+    WeightRenaming,
+)
 
 
 ModuleReplacementFactory = Callable[..., nn.Module]
