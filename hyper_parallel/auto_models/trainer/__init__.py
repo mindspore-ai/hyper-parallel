@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Trainer configuration interfaces for the HyperModels suite."""
+"""Trainer configuration interfaces for the AutoModels suite."""

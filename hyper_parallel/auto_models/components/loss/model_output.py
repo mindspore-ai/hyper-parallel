@@ -16,7 +16,7 @@
 
 from typing import Any, Dict, Optional, Union
 
-# HyperModels loss components implement the Transformers/PyTorch Trainer API.
+# AutoModels loss components implement the Transformers/PyTorch Trainer API.
 # pylint: disable-next=forbidden-backend-import
 import torch
 

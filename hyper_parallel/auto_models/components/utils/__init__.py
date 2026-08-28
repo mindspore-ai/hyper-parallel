@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Shared utility helpers for HyperModels components."""
+"""Shared utility helpers for AutoModels components."""
