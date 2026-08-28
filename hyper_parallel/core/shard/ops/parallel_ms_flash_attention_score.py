@@ -543,7 +543,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
             softmax_layout = self._infer_softmax_layout_conservatively(query_layout)
         softmax_max_layout = softmax_layout
         softmax_sum_layout = copy.deepcopy(softmax_layout)
-        softmax_out_layout = self._create_replicated_scalar_layout(query_layout)
+        softmax_out_layout = self._create_replicated_placeholder_layout(query_layout)
         if softmax_out_layout.placements is None and softmax_out_layout.tensor_map is not None:
             softmax_out_layout.tensor_map_to_placement()
 
@@ -1276,11 +1276,11 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
                 f"This ensures proper alignment for context parallel."
             )
 
-    def _create_replicated_scalar_layout(self, query_layout: Layout) -> Layout:
-        """Create a fully replicated layout for scalar tensor."""
+    def _create_replicated_placeholder_layout(self, query_layout: Layout) -> Layout:
+        """Create a fully replicated one-dimensional layout for the placeholder output."""
         layout = Layout.from_device_mesh(query_layout.mesh)
         mesh_ndim = len(query_layout.mesh_shape)
         replicated_placements = tuple(Replicate() for _ in range(mesh_ndim))
         layout.set_placements(replicated_placements)
-        layout.set_tensor_map(())
+        layout.set_tensor_map((-1,))
         return layout

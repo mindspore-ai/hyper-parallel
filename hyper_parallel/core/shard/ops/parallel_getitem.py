@@ -19,11 +19,12 @@ Supports basic indexing (int, slice, None, Ellipsis) which produces views,
 and advanced indexing (list, LongTensor) which produces copies.
 BoolTensor masks are not supported because the output shape is data-dependent.
 """
-from typing import Tuple
+from typing import Callable, Optional
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import RaggedShard, Shard, StridedShard
 from .parallel_ops import DistributedOp
 
 platform = get_platform()
@@ -266,6 +267,19 @@ def _copy_partial_state(src_layout, dst_layout):
             dst_layout.set_partial_by_dev_axis(dst_layout.alias_name[dev_idx], op)
 
 
+def _is_full_slice_action(action, global_shape) -> bool:
+    """Return whether an expanded action keeps one complete input dimension."""
+    if action[0] != "slice":
+        return False
+    input_dim = action[-1]
+    start, stop, step = action[1], action[2], action[3]
+    normalized_step = 1 if step is None else step
+    return (
+        normalized_step == 1
+        and (start is None or start == 0)
+        and (stop is None or stop >= global_shape[input_dim])
+    )
+
 
 class GetItemDistributedOp(DistributedOp):
     """Distributed implementation for tensor.__getitem__.
@@ -275,8 +289,9 @@ class GetItemDistributedOp(DistributedOp):
     BoolTensor masks are rejected because they produce data-dependent shapes.
 
     Sharding constraints:
-      - Any dimension indexed by int, non-full slice, or advanced index must
-        be replicated.
+      - Integer indexing on Shard(0) is supported for the owner-only RaggedShard
+        view case on a 1-D mesh; other indexed dimensions must be replicated.
+      - Any dimension indexed by non-full slice or advanced index must be replicated.
       - Advanced index tensors must themselves be replicated.
       - Input must not have Partial status.
       - slice step != 1 is not supported.
@@ -347,7 +362,7 @@ class GetItemDistributedOp(DistributedOp):
     def _validate_slice_action(action, alias_map, global_shape, op_name="__getitem__"):
         """Validate a slice indexing action."""
         input_dim = action[-1]
-        start, stop, step = action[1], action[2], action[3]
+        step = action[3]
         step = step if step is not None else 1
 
         if step != 1:
@@ -356,11 +371,7 @@ class GetItemDistributedOp(DistributedOp):
                 f"but got {step}."
             )
 
-        is_full = (start is None or start == 0) and (
-            stop is None or stop >= global_shape[input_dim]
-        )
-
-        if not is_full and alias_map[input_dim] != "None":
+        if not _is_full_slice_action(action, global_shape) and alias_map[input_dim] != "None":
             raise ValueError(
                 f"For {op_name}, non-full slice on non-replicate "
                 f"dim {input_dim} is not supported, "
@@ -432,29 +443,74 @@ class GetItemDistributedOp(DistributedOp):
                     action, alias_map, op_name
                 )
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
+    @staticmethod
+    def _infer_shard_dim0_int(self_layout, expanded_actions, global_shape, kind):
+        """Return the owner-only RaggedShard layout and local index, if supported."""
+        placements = tuple(self_layout.placements)
+        placement = placements[0] if len(placements) == 1 else None
+        if (
+            kind != _BASIC
+            or len(global_shape) < 2
+            or len(self_layout.mesh_shape) != 1
+            or not expanded_actions
+            or expanded_actions[0][0] != "int"
+            or expanded_actions[0][-1] != 0
+            or not all(
+                _is_full_slice_action(action, global_shape)
+                for action in expanded_actions[1:]
+            )
+            or not isinstance(placement, Shard)
+            or isinstance(placement, StridedShard)
+            or not placement.is_shard(0)
+        ):
+            return None
+
+        index = expanded_actions[0][1]
+        global_dim0 = global_shape[0]
+        if index < -global_dim0 or index >= global_dim0:
+            return None
+
+        mesh_size = self_layout.mesh.size(0)
+        if global_dim0 % mesh_size != 0:
+            return None
+
+        normalized_index = index if index >= 0 else index + global_dim0
+        rows_per_rank = global_dim0 // mesh_size
+        owner_rank = normalized_index // rows_per_rank
+        local_index = normalized_index % rows_per_rank
+        output_global_shape = tuple(global_shape[1:])
+        local_units = tuple(1 if rank == owner_rank else 0 for rank in range(mesh_size))
+
+        output_layout = Layout.from_device_mesh(self_layout.mesh)
+        output_layout.set_placements((RaggedShard(tuple(range(len(output_global_shape))), local_units),))
+        output_layout.placement_to_tensor_map(len(output_global_shape))
+        return output_layout, (owner_rank, local_index, output_global_shape)
+
+    def infer_layout(self, cache_values: list) -> tuple:  # pylint: disable=W0221
         """Infer output layout for __getitem__.
 
         Rules:
             1. Input must not have Partial status.
             2. BoolTensor mask indexing is not supported.
-            3. Any dimension indexed by int, non-full slice, or advanced index
+            3. Integer indexing on Shard(0) may produce an owner-only RaggedShard
+               view on a 1-D mesh.
+            4. Other dimensions indexed by int, non-full slice, or advanced index
                must be replicated.
-            4. slice step must be None or 1.
-            5. Advanced index tensors must be replicated.
-            6. BASIC: Output alias_tensor_map is derived by removing int-indexed
+            5. slice step must be None or 1.
+            6. Advanced index tensors must be replicated.
+            7. BASIC: Output alias_tensor_map is derived by removing int-indexed
                dims, inserting Replicate for newaxis, and preserving sharding
                for full-slice dims.
-            7. ADVANCED: Advanced indices broadcast shape B is inserted at
+            8. ADVANCED: Advanced indices broadcast shape B is inserted at
                position p (consecutive: p = first advanced dim; non-consecutive:
                p = 0). B dims are all Replicate. Other dims preserve sharding.
-            8. Partial state is copied to the output layout for preserved dims.
+            9. Partial state is copied to the output layout for preserved dims.
 
         Args:
             cache_values: [self_layout, key_desc, global_shape, kind]
 
         Returns:
-            tuple: ((output_layout,), None)
+            tuple: Output layouts and optional owner-only RaggedShard metadata.
 
         Raises:
             ValueError: If any constraint is violated.
@@ -471,6 +527,14 @@ class GetItemDistributedOp(DistributedOp):
 
         if not self._allow_partial_inputs:
             self._check_partial_inputs([self_layout])
+
+        ragged_result = self._infer_shard_dim0_int(
+            self_layout, expanded_actions, global_shape, kind
+        )
+        if ragged_result is not None:
+            output_layout, info = ragged_result
+            return ((output_layout,), info)
+
         self._validate_input_layouts(self_layout, expanded_actions, global_shape, kind)
 
         if kind == _BASIC:
@@ -488,6 +552,50 @@ class GetItemDistributedOp(DistributedOp):
             )
 
         return ((out_layout,), None)
+
+    def get_expand_impl(
+        self,
+        func: Callable,
+        infer_result: tuple,
+        cache_values: list,
+    ) -> Optional[Callable]:
+        """Return a local view implementation for owner-only RaggedShard indexing."""
+        info = infer_result[1]
+        if info is None:
+            return None
+
+        input_layout = cache_values[0]
+        output_layout = infer_result[0][0]
+        owner_rank, local_index, output_global_shape = info
+
+        def ragged_getitem_impl(local_input: Tensor, local_key: object) -> DTensor:
+            """Return the selected owner view or an empty non-owner view."""
+            del local_key
+            if not local_input.is_contiguous():
+                raise ValueError(
+                    f"For {self.op_name}, Shard(0) integer indexing to RaggedShard "
+                    "requires a contiguous local tensor."
+                )
+
+            local_rank = input_layout.mesh.get_local_rank(0)
+            if local_rank == owner_rank:
+                local_view = func(local_input, local_index).view(-1)
+            else:
+                local_view = local_input.view(-1)[:0]
+            return DTensor.from_local_with_layout(
+                local_view,
+                output_layout,
+                shape=output_global_shape,
+            )
+
+        return ragged_getitem_impl
+
+    @staticmethod
+    def wrap_output(py_output: object, output_layouts: object) -> object:
+        """Pass through the RaggedShard DTensor built by the local implementation."""
+        if isinstance(py_output, DTensor):
+            return py_output
+        return DistributedOp.wrap_output(py_output, output_layouts)
 
     @staticmethod
     def _infer_basic_output_layout(self_layout, expanded_actions):

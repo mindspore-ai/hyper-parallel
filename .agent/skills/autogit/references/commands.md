@@ -21,14 +21,16 @@ autogit commit -m "feat: new thing" # specify commit message (skips preview)
 
 ```text
 Check for changes → stage (filter cosmetic-only edits) → warn if pre-commit
-  hook missing → preview commit message (tty) / require -m (non-tty)
-  → git commit (pre-commit hook auto-runs lint) → git push origin <branch>
+  hook missing → AGENTS catalog check → preview commit message (tty) /
+  require -m (non-tty) → git commit (pre-commit hook auto-runs lint) →
+  git push origin <branch>
 ```
 
 ### Lint Ownership
 
 - Lint (pylint + markdownlint) is owned by the project's **pre-commit git hook**, installed via `bash scripts/pre-commit/install.sh`. The hook fires on every `git commit` automatically — autogit does not duplicate it.
 - If the hook is not installed, `autogit commit` prints a one-line install reminder and continues (non-blocking).
+- **AGENTS catalog** (`check_agents_catalog.py`) runs in `autogit commit` and `autogit check` (blocking). Ensures `AGENTS.md` Skills/Agents tables match `.agent/skills` and `.agent/agents` on disk.
 - For an explicit no-commit precheck, use `autogit check` (see §2).
 
 ### Commit Message Convention
@@ -72,6 +74,7 @@ If `pylint` or `markdownlint-cli2` is missing, AutoGit installs the dependency d
 | shellcheck | Shell script analysis | `*.sh`, `*.bash` |
 | codespell | Spelling check | All text files |
 | markdownlint-cli2 | Standard rules | `*.md` |
+| agents-catalog | `AGENTS.md` Skills/Agents vs `.agent/` disk | Always (full tree) |
 
 AutoGit auto-installs missing `pylint` and `markdownlint-cli2` according to `.pre-commit-config.yaml`. Other tools still degrade gracefully if unavailable.
 

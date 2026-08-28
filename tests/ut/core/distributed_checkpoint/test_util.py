@@ -19,6 +19,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -49,6 +50,10 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     set_element,
     traverse_state_dict,
 )
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Shard
 
 
 class TestUtil(unittest.TestCase):
@@ -199,6 +204,28 @@ class TestUtil(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0].offsets, (0, 4))
         self.assertEqual(chunks[0].sizes, (4, 4))
+
+    def test_create_chunk_list_for_empty_uneven_shard(self):
+        """DCP geometry should retain the logical offset of an empty trailing shard."""
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=3):
+            mesh = DeviceMesh(
+                "cpu",
+                [0, 1, 2, 3],
+                mesh_dim_names=("fsdp",),
+                _init_backend=False,
+            )
+        layout = Layout.from_device_mesh(mesh)
+        layout.set_placements((Shard(0, uneven_shard=True),))
+        layout.placement_to_tensor_map(dim=2)
+        layout.set_tensor_meta((6, 3), (3, 1), torch.float32)
+        tensor = DTensor.from_local_with_layout(torch.empty(0, 3), layout)
+
+        with patch.object(util_mod.platform, "get_rank", return_value=3):
+            chunks = util_mod.create_chunk_list_for_tensor(tensor)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].offsets, (6, 0))
+        self.assertEqual(chunks[0].sizes, (0, 3))
 
     def test_create_chunk_list_for_tensor_invalid_chunk_info_raises(self):
         """

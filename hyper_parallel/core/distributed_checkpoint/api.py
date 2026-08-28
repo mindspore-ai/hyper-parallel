@@ -14,7 +14,6 @@
 # ============================================================================
 """Hyper Parallel Checkpoint API"""
 import multiprocessing as mp
-import pickle
 import queue
 import threading
 import traceback
@@ -72,55 +71,10 @@ def _gather_from_all_ranks(
         list[Any]: List of all objects from all ranks.
     """
     if use_collectives and world_size > 1:
-        serialization_error = None
-        serialized_object = b""
-        try:
-            serialized_object = pickle.dumps(local_object)
-        except Exception as error:  # pylint: disable=W0718
-            serialization_error = error
-        _raise_if_stage_failed(
-            serialization_error,
-            "collective payload serialization",
-            world_size,
-            use_collectives,
-        )
-        serialized_objects = [b""] * world_size
-        platform.all_gather_object(serialized_objects, serialized_object)
-        deserialization_error = None
-        all_objects = []
-        try:
-            all_objects = [pickle.loads(value) for value in serialized_objects]
-        except Exception as error:  # pylint: disable=W0718
-            deserialization_error = error
-        _raise_if_stage_failed(
-            deserialization_error,
-            "collective payload deserialization",
-            world_size,
-            use_collectives,
-        )
+        all_objects = [None] * world_size
+        platform.all_gather_object(all_objects, local_object)
         return all_objects
     return [local_object]
-
-
-def _raise_if_stage_failed(
-    local_error: Optional[Exception],
-    operation: str,
-    world_size: int,
-    use_collectives: bool,
-) -> None:
-    """Exchange rank-local errors before entering the next checkpoint phase."""
-    if use_collectives and world_size > 1:
-        errors = [None] * world_size
-        platform.all_gather_object(
-            errors,
-            None if local_error is None else str(local_error),
-        )
-        if any(error is not None for error in errors):
-            raise RuntimeError(
-                f"Distributed checkpoint {operation} failed on one or more ranks: {errors}"
-            ) from local_error
-    elif local_error is not None:
-        raise local_error
 
 
 def _save_impl(
@@ -131,8 +85,6 @@ def _save_impl(
     planner: Optional[SavePlanner] = None,
     no_dist: bool = False,
     use_collectives: bool = True,
-    rank_override: Optional[int] = None,
-    world_size_override: Optional[int] = None,
 ) -> Metadata:
     """Synchronous distributed checkpoint save (shared by :func:`save` and :func:`async_save`)."""
     # Convert checkpoint_id to Path if it's a string
@@ -141,107 +93,77 @@ def _save_impl(
     # Determine if we're in distributed mode
     use_collectives = False if no_dist else use_collectives
 
-    # Get rank and coordinator info
-    rank = (
-        rank_override
-        if rank_override is not None
-        else (0 if no_dist else platform.get_rank())
-    )
-    world_size = (
-        world_size_override
-        if world_size_override is not None
-        else (1 if no_dist else platform.get_world_size())
-    )
+    # Set up storage writer
+    if storage_writer is None:
+        if checkpoint_id is None:
+            raise ValueError("Either storage_writer or checkpoint_id must be provided")
+        storage_writer = FileSystemWriter(checkpoint_id)
+    else:
+        if checkpoint_id:
+            storage_writer.initialize_writer(checkpoint_id)
+
+    # Set up planner
+    planner = StandardSavePlanner() if planner is None else planner
+
+    # ``no_dist`` is a complete single-process contract: it must work before
+    # any process group exists and must not query distributed state.
+    if no_dist:
+        rank, world_size = 0, 1
+    else:
+        rank = platform.get_rank()
+        world_size = platform.get_world_size()
     is_coordinator = rank == 0
 
-    setup_error = None
-    cached_res = None
-    local_plan = None
-    try:
-        if storage_writer is None:
-            if checkpoint_id is None:
-                raise ValueError("Either storage_writer or checkpoint_id must be provided")
-            storage_writer = FileSystemWriter(checkpoint_id)
-        elif checkpoint_id:
-            storage_writer.initialize_writer(checkpoint_id)
-        planner = StandardSavePlanner() if planner is None else planner
-        planner.configure_planner(
-            state_dict=state_dict,
-            is_coordinator=is_coordinator,
-            rank=rank,
-            use_collectives=use_collectives,
-        )
-        storage_writer.configure_writer(
-            is_coordinator=is_coordinator,
-            rank=rank,
-            use_collectives=use_collectives,
-        )
-        cached_res = planner.get_cached() if hasattr(planner, "get_cached") else None
-        if cached_res is None:
-            local_plan = storage_writer.optimize_local_plan(planner.build_local_plan())
-    except Exception as error:  # pylint: disable=W0718
-        setup_error = error
-    _raise_if_stage_failed(setup_error, "save planning setup", world_size, use_collectives)
+    # Configure planner
+    planner.configure_planner(
+        state_dict=state_dict,
+        is_coordinator=is_coordinator,
+        rank=rank,
+        use_collectives=use_collectives
+    )
 
-    plan_error = None
-    try:
-        cache_states = _gather_from_all_ranks(
-            (
-                None
-                if cached_res is None
-                else (
-                    cached_res.metadata.state_dict_metadata,
-                    cached_res.metadata.planner_data,
-                    cached_res.metadata.version,
-                )
-            ),
-            world_size,
-            use_collectives,
-        )
-        cache_hits = [cache_state is not None for cache_state in cache_states]
-        if any(cache_hits) and not all(cache_hits):
-            raise RuntimeError("Distributed checkpoint save-plan caches differ across ranks")
-        if all(cache_hits) and any(cache_state != cache_states[0] for cache_state in cache_states[1:]):
-            raise RuntimeError("Distributed checkpoint cached metadata differs across ranks")
-        if cached_res:
-            final_plan, metadata = cached_res.final_plan, cached_res.metadata
+    # Configure storage writer (use_collectives for rank-local metadata when False)
+    storage_writer.configure_writer(
+        is_coordinator=is_coordinator,
+        rank=rank,
+        use_collectives=use_collectives
+    )
+
+    cached_res = planner.get_cached() if hasattr(planner, 'get_cached') else None
+    if cached_res:
+        # Get final plan and metadata from cache
+        final_plan, metadata = cached_res.final_plan, cached_res.metadata
+
+    else:
+        # Build local plan
+        local_plan = planner.build_local_plan()
+        local_plan = storage_writer.optimize_local_plan(local_plan)
+
+        # Gather all local plans and build global plan
+        all_local_plans = _gather_from_all_ranks(local_plan, world_size, use_collectives)
+        global_plans, metadata = planner.build_global_plan(all_local_plans)
+        global_plans = storage_writer.optimize_global_plan(global_plans)
+
+        # Select central plan for current rank
+        if use_collectives and world_size > 1 and global_plans:
+            central_plan = global_plans[rank]
+        elif global_plans:
+            central_plan = global_plans[0]
         else:
-            # Gather all local plans and build global plan.
-            all_local_plans = _gather_from_all_ranks(local_plan, world_size, use_collectives)
-            global_plans, metadata = planner.build_global_plan(all_local_plans)
-            global_plans = storage_writer.optimize_global_plan(global_plans)
+            central_plan = local_plan
 
-            # Select central plan for current rank.
-            if use_collectives and world_size > 1 and global_plans:
-                central_plan = global_plans[rank]
-            elif global_plans:
-                central_plan = global_plans[0]
-            else:
-                central_plan = local_plan
-            final_plan = planner.finalize_plan(central_plan)
-            if hasattr(planner, "cache_result"):
-                planner.cache_result(final_plan, metadata)
-    except Exception as error:  # pylint: disable=W0718
-        plan_error = error
-    _raise_if_stage_failed(plan_error, "save global planning", world_size, use_collectives)
+        # Finalize and cache plan
+        final_plan = planner.finalize_plan(central_plan)
+        # Add final plan and metadata to the cache
+        if hasattr(planner, 'cache_result'):
+            planner.cache_result(final_plan, metadata)
 
-    # Propagate rank-local write failures before entering result collection.
-    write_error = None
-    try:
-        write_results = storage_writer.execute_write(final_plan, planner)
-    except Exception as error:  # pylint: disable=W0718
-        write_error = error
-        write_results = []
-    _raise_if_stage_failed(write_error, "write", world_size, use_collectives)
+    # Write data
+    write_results = storage_writer.execute_write(final_plan, planner)
 
     # Finalize checkpoint
     all_write_results = _gather_from_all_ranks(write_results, world_size, use_collectives)
-    finalize_error = None
-    try:
-        storage_writer.finalize_checkpoint(metadata, all_write_results)
-    except Exception as error:  # pylint: disable=W0718
-        finalize_error = error
-    _raise_if_stage_failed(finalize_error, "finalization", world_size, use_collectives)
+    storage_writer.finalize_checkpoint(metadata, all_write_results)
 
     return metadata
 
@@ -254,8 +176,6 @@ def _async_persist_worker(
         planner: Optional[SavePlanner],
         no_dist: bool,
         use_collectives: bool,
-        rank: int,
-        world_size: int,
 ) -> None:
     """Child-process entry: run :func:`_save_impl` and report ``Metadata`` or an error string on ``result_queue``."""
     try:
@@ -266,8 +186,6 @@ def _async_persist_worker(
             planner=planner,
             no_dist=no_dist,
             use_collectives=use_collectives,
-            rank_override=rank,
-            world_size_override=world_size,
         )
         result_queue.put((_AsyncPersistStatus.SUCCESS, meta))
     except Exception:  # pylint: disable=broad-except
@@ -280,26 +198,17 @@ def _async_persist_wait_process(
         persist_future: Future[Metadata],
 ) -> None:
     """Join persist ``proc`` and complete ``persist_future`` (runs on a daemon thread)."""
-    while True:
-        try:
-            status, payload = result_queue.get(timeout=0.1)
-            break
-        except queue.Empty:
-            if proc.is_alive():
-                continue
-            proc.join()
-            try:
-                status, payload = result_queue.get(timeout=0.1)
-                break
-            except queue.Empty:
-                persist_future.set_exception(
-                    RuntimeError(
-                        f"async_persist process exited with code {proc.exitcode} and no result on queue"
-                    )
-                )
-                return
     proc.join()
     if persist_future.done():
+        return
+    try:
+        status, payload = result_queue.get_nowait()
+    except queue.Empty:
+        persist_future.set_exception(
+            RuntimeError(
+                f"async_persist process exited with code {proc.exitcode} and no result on queue"
+            )
+        )
         return
     if status == _AsyncPersistStatus.SUCCESS:
         persist_future.set_result(payload)
@@ -342,7 +251,7 @@ def save(
     Returns:
         Metadata: Metadata object for the saved checkpoint.
     """
-    return _save_impl(
+    metadata = _save_impl(
         state_dict,
         checkpoint_id=checkpoint_id,
         storage_writer=storage_writer,
@@ -350,6 +259,9 @@ def save(
         no_dist=no_dist,
         use_collectives=use_collectives,
     )
+    if not no_dist:
+        platform.barrier()
+    return metadata
 
 
 def async_save(
@@ -359,7 +271,7 @@ def async_save(
         storage_writer: Optional[StorageWriter] = None,
         planner: Optional[SavePlanner] = None,
         no_dist: bool = False,
-        use_collectives: bool = False,
+        use_collectives: bool = True,
 ) -> AsyncSaveResponse:
     """
     Asynchronous version of :func:`save` using a **background child process** for persistence.
@@ -393,15 +305,8 @@ def async_save(
         AsyncSaveResponse: Contains ``persist_completion`` only; staging is synchronous.
     """
     persist_completion: Future[Metadata] = Future()
-    if use_collectives and not no_dist:
-        raise ValueError(
-            "async_save does not support collectives from its persistence child; "
-            "use use_collectives=False"
-        )
 
     staged = build_staged_state_dict(state_dict)
-    rank = 0 if no_dist else platform.get_rank()
-    world_size = 1 if no_dist else platform.get_world_size()
 
     result_queue: mp.Queue = mp.Queue(maxsize=1)
     proc = mp.Process(
@@ -414,8 +319,6 @@ def async_save(
             planner,
             no_dist,
             use_collectives,
-            rank,
-            world_size,
         ),
         name="HPAsyncCheckpointPersist",
     )
@@ -467,67 +370,69 @@ def load(
     # Determine if we're in distributed mode
     use_collectives = False if no_dist else use_collectives
 
-    # Get rank and coordinator info
-    rank = 0 if no_dist else platform.get_rank()
-    world_size = 1 if no_dist else platform.get_world_size()
+    # Set up storage reader
+    if storage_reader is None:
+        if checkpoint_id is None:
+            raise ValueError("Either storage_reader or checkpoint_id must be provided")
+        storage_reader = FileSystemReader(checkpoint_id)
+    else:
+        if checkpoint_id:
+            storage_reader.initialize_reader(checkpoint_id)
+
+    # Set up planner
+    planner = StandardLoadPlanner() if planner is None else planner
+
+    # Match save(): ``no_dist`` must not require an initialized process group.
+    if no_dist:
+        rank, world_size = 0, 1
+    else:
+        rank = platform.get_rank()
+        world_size = platform.get_world_size()
     is_coordinator = rank == 0
 
-    metadata_error = None
+    # Load metadata
     try:
-        if storage_reader is None:
-            if checkpoint_id is None:
-                raise ValueError("Either storage_reader or checkpoint_id must be provided")
-            storage_reader = FileSystemReader(checkpoint_id)
-        elif checkpoint_id:
-            storage_reader.initialize_reader(checkpoint_id)
-        planner = StandardLoadPlanner() if planner is None else planner
-        if use_collectives:
-            metadata = storage_reader.load_metadata()
-        else:
-            metadata = storage_reader.load_metadata(rank=rank)
-    except Exception as error:  # pylint: disable=W0718
-        metadata_error = error
-    _raise_if_stage_failed(metadata_error, "load metadata", world_size, use_collectives)
+        metadata = storage_reader.load_metadata()
+    except FileNotFoundError:
+        # Fallback to rank-local metadata (e.g. checkpoint saved with use_collectives=False)
+        metadata = storage_reader.load_metadata(rank=rank)
+        use_collectives = False
 
-    setup_error = None
-    try:
-        planner.configure_planner(
-            state_dict=state_dict,
-            metadata=metadata,
-            is_coordinator=is_coordinator,
-            rank=rank,
-        )
-        storage_reader.configure_reader(
-            metadata=metadata,
-            is_coordinator=is_coordinator,
-            rank=rank,
-            use_collectives=use_collectives,
-        )
-        local_plan = storage_reader.optimize_local_plan(planner.build_local_plan())
-    except Exception as error:  # pylint: disable=W0718
-        setup_error = error
-    _raise_if_stage_failed(setup_error, "load planning setup", world_size, use_collectives)
+    # Configure planner
+    planner.configure_planner(
+        state_dict=state_dict,
+        metadata=metadata,
+        is_coordinator=is_coordinator,
+        rank=rank
+    )
+
+    # Configure storage reader
+    storage_reader.configure_reader(
+        metadata=metadata,
+        is_coordinator=is_coordinator,
+        rank=rank,
+        use_collectives=use_collectives
+    )
+
+    # Build local plan
+    local_plan = planner.build_local_plan()
+    local_plan = storage_reader.optimize_local_plan(local_plan)
 
     # Gather all local plans and build global plan
     all_local_plans = _gather_from_all_ranks(local_plan, world_size, use_collectives)
-    plan_error = None
-    try:
-        global_plans = planner.build_global_plan(all_local_plans)
-        global_plans = storage_reader.optimize_global_plan(global_plans)
-        if use_collectives and world_size > 1 and global_plans:
-            central_plan = global_plans[rank]
-        elif global_plans:
-            central_plan = global_plans[0]
-        else:
-            central_plan = local_plan
-        final_plan = planner.finalize_plan(central_plan)
-    except Exception as error:  # pylint: disable=W0718
-        plan_error = error
-    _raise_if_stage_failed(plan_error, "load global planning", world_size, use_collectives)
+    global_plans = planner.build_global_plan(all_local_plans)
+    global_plans = storage_reader.optimize_global_plan(global_plans)
 
-    read_error = None
-    try:
-        storage_reader.execute_read(final_plan, planner)
-    except Exception as error:  # pylint: disable=W0718
-        read_error = error
-    _raise_if_stage_failed(read_error, "read", world_size, use_collectives)
+    # Select central plan for current rank
+    if use_collectives and world_size > 1 and global_plans:
+        central_plan = global_plans[rank]
+    elif global_plans:
+        central_plan = global_plans[0]
+    else:
+        central_plan = local_plan
+
+    # Finalize plan
+    final_plan = planner.finalize_plan(central_plan)
+
+    # Execute read
+    storage_reader.execute_read(final_plan, planner)

@@ -43,6 +43,7 @@ class Transition:
 
 
 class Environment(Protocol):
+
     async def reset(self, prompt: Any) -> Observation:
         """Reset one episode and return its initial observation."""
 

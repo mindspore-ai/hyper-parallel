@@ -13,10 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """framework platform api"""
+# Backend platform modules intentionally import this abstraction to register
+# their implementations; the resulting import cycle is architectural.
+# pylint: disable=cyclic-import
 import os
 from datetime import timedelta
 from enum import auto, Enum
-from typing import Optional, Any, Union
+from typing import Any, Callable, Optional, Sequence, Union
 
 import numpy as np
 
@@ -148,6 +151,11 @@ class Platform:
         raise NotImplementedError(
             "Platform subclasses must implement custom_ops"
         )
+
+    @staticmethod
+    def get_swap_optimizer():
+        """Return the active backend's optimizer-state swap wrapper class."""
+        raise NotImplementedError("Platform subclasses must implement get_swap_optimizer")
 
     @staticmethod
     def get_rank():
@@ -707,6 +715,26 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement all_to_all_single")
 
     @staticmethod
+    def differentiable_variable_all_gather(
+            input_tensor: Any, output_splits: Sequence[int], group: Any) -> Any:
+        """Gather variable dim-zero shards on every rank with gradient support.
+
+        Args:
+            input_tensor: Local input shaped ``[local_rows, *feature_dims]``.
+            output_splits: Dim-zero rows contributed by each group rank.
+            group: Raw platform process group.
+
+        Returns:
+            Tensor concatenated in group-rank order along dim zero.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement differentiable_variable_all_gather"
+        )
+
+    @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
                                             handle_box=None):
         """Differentiable wrapper that waits for a pre-launched async all-gather.
@@ -938,20 +966,12 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement buffers_dict")
 
     @staticmethod
-    def get_model_state_dict(
-        model: Any,
-        *,
-        options: Any = None,
-        full_state_dict: Optional[bool] = None,
-        cpu_offload: Optional[bool] = None,
-    ) -> dict[str, Any]:
+    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
         """Get the state dictionary of a model.
 
         Args:
             model: The model to extract state from.
-            options: Optional backend-native configuration for state dict extraction.
-            full_state_dict: Optional backend-neutral full-state selection.
-            cpu_offload: Optional backend-neutral output placement selection.
+            options: Optional configuration for state dict extraction.
 
         Returns:
             dict: The state dictionary containing model parameters and buffers.
@@ -961,56 +981,6 @@ class Platform:
         """
         raise NotImplementedError(
             "Platform subclasses must implement get_model_state_dict"
-        )
-
-    @staticmethod
-    def get_tensor_ipc_rebuild_args(tensor: Any) -> tuple[Any, ...]:
-        """Return backend-native arguments for rebuilding a shared tensor.
-
-        Args:
-            tensor: Device tensor whose storage will be shared with another process.
-
-        Returns:
-            Backend-native tensor rebuild arguments.
-
-        Raises:
-            NotImplementedError: Platform subclasses must implement this method.
-        """
-        raise NotImplementedError(
-            "Platform subclasses must implement get_tensor_ipc_rebuild_args"
-        )
-
-    @staticmethod
-    def gather_state_dict(state_dict: dict[str, Any], *, cpu_offload: bool = False) -> dict[str, Any]:
-        """Gather every distributed value in an already validated state dictionary.
-
-        Args:
-            state_dict: Rank-local state dictionary with matching key order on every rank.
-            cpu_offload: Whether gathered values should be offloaded to CPU.
-
-        Returns:
-            A state dictionary containing gathered values.
-
-        Raises:
-            NotImplementedError: Platform subclasses must implement this method.
-        """
-        raise NotImplementedError("Platform subclasses must implement gather_state_dict")
-
-    @staticmethod
-    def get_tensor_distribution_spec(tensor: Any) -> tuple[Any, ...]:
-        """Return stable metadata describing a tensor's collective layout.
-
-        Args:
-            tensor: Plain or distributed tensor to describe.
-
-        Returns:
-            A hashable tuple identifying whether and how the tensor is distributed.
-
-        Raises:
-            NotImplementedError: Platform subclasses must implement this method.
-        """
-        raise NotImplementedError(
-            "Platform subclasses must implement get_tensor_distribution_spec"
         )
 
     @staticmethod
@@ -1507,16 +1477,17 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement checkpoint_wrapper")
 
     @staticmethod
-    def checkpoint_exclude_wrapper(module: Any) -> Any:
+    def checkpoint_exclude_wrapper(module: Any, *, save_output: bool = True) -> Any:
         """Wrap a callable whose activations should be saved instead of recomputed.
 
         Args:
             module: The module or callable to exclude from activation recomputation.
+            save_output: Whether to retain the excluded region output for replay.
 
         Returns:
             The wrapped module or callable.
         """
-        raise NotImplementedError("checkpoint_exclude_wrapper is currently only supported on MindSpore")
+        raise NotImplementedError("Platform subclasses must implement checkpoint_exclude_wrapper")
 
     @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):
@@ -1561,6 +1532,16 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement noop_context_fn")
 
     @staticmethod
+    def ignore_sac_ops(ignore_ops: list[object | None]) -> None:
+        """Exclude backend operators from selective-checkpoint replay accounting.
+
+        Args:
+            ops (list[object | None]): Iterable of backend-native operator identifiers. Unavailable
+                optional operators may be represented by ``None``.
+        """
+        raise NotImplementedError("Platform subclasses must implement ignore_sac_ops")
+
+    @staticmethod
     def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
         """Create contexts for selective activation checkpointing.
 
@@ -1575,14 +1556,11 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement create_selective_checkpoint_contexts")
 
     @staticmethod
-    def ignore_sac_ops(ops: list[object | None]) -> None:
-        """Exclude backend operators from selective-checkpoint replay accounting.
-
-        Args:
-            ops: Iterable of backend-native operator identifiers. Unavailable
-                optional operators may be represented by ``None``.
-        """
-        raise NotImplementedError("Platform subclasses must implement ignore_sac_ops")
+    def create_native_selective_checkpoint_contexts(policy_fn: Callable) -> Any:
+        """Create framework-native selective checkpoint contexts for compile."""
+        raise NotImplementedError(
+            "Native selective checkpoint compile is not supported by this platform"
+        )
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
@@ -1629,15 +1607,19 @@ class Platform:
         """Context manager binding recompute unpack to a caller-provided session.
 
         Args:
-            session_id: Stable session key.  Recompute caches are keyed by this
-                instead of the transient autodiff engine id, so a re-run fired
-                under one engine can be reused by another.
+            session_id: Required stable session key. Recompute caches are keyed
+                by this instead of the transient autodiff engine id, so a re-run
+                fired under one engine can be reused by another. Must not be
+                ``None``.
             retain_on_unpack (bool): When ``True``, unpack returns recomputed
                 tensors without popping them, so a later backward can consume
                 them.  Default: ``False``.
 
         Returns:
             A context manager activating the session for its scope.
+
+        Yields:
+            The supplied session id.
         """
         raise NotImplementedError("Platform subclasses must implement recompute_session_ctx")
 

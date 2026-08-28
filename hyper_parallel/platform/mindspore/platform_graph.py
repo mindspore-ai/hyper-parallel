@@ -53,7 +53,7 @@ class MindSporeGraphPlatform(MindSporePlatform):
         raise NotImplementedError("create_selective_checkpoint_contexts is not supported on MindSpore Graph platform")
 
     @staticmethod
-    def ignore_sac_ops(ops: list[object | None]) -> None:
+    def ignore_sac_ops(ignore_ops: list[object | None]) -> None:
         raise NotImplementedError("ignore_sac_ops is not supported on MindSpore Graph platform")
 
     @staticmethod

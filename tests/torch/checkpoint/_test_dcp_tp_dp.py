@@ -526,7 +526,7 @@ def test_dcp_async_save_with_optimizer_tp_dp():
         "model": model2.state_dict(),
         "optimizer": optimizer2.state_dict(),
     }
-    load(load_state_async, checkpoint_id=checkpoint_path_async, use_collectives=False)
+    load(load_state_async, checkpoint_id=checkpoint_path_async, use_collectives=True)
     dist.barrier()
     _assert_sd_tensors_close(save_state["model"], load_state_async["model"])
     _assert_sd_tensors_close(save_state["optimizer"], load_state_async["optimizer"])
@@ -537,3 +537,39 @@ def test_dcp_async_save_with_optimizer_tp_dp():
         shutil.rmtree(Path(path_name))
         shutil.rmtree(sharded_pretrain_ckpt_path)
         unsharded_ckpt_path.unlink(missing_ok=True)
+
+
+def test_dcp_tp_fsdp_model_state_roundtrip():
+    """TP + FSDP + DCP sync save/load round-trip for model state only."""
+    init_dist()
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    assert world == 4, f"test_dcp_tp_fsdp_model_state_roundtrip requires world_size=4, but got {world}"
+
+    checkpoint_path = Path("dcp_tp_fsdp_roundtrip")
+
+    if rank == 0:
+        os.makedirs(str(checkpoint_path), exist_ok=True)
+    dist.barrier()
+
+    torch.manual_seed(42)
+    source_model = _fully_shard_model(world)
+
+    save_state = {"model": source_model.state_dict()}
+    save(save_state, checkpoint_id=checkpoint_path, use_collectives=True)
+    dist.barrier()
+
+    torch.manual_seed(99)
+    target_model = _fully_shard_model(world)
+
+    load_state = {"model": target_model.state_dict()}
+    load(load_state, checkpoint_id=checkpoint_path, use_collectives=True)
+
+    _assert_sd_tensors_close(save_state["model"], load_state["model"])
+
+    target_model.load_state_dict(load_state["model"])
+    _assert_sd_tensors_close(source_model.state_dict(), target_model.state_dict())
+
+    dist.barrier()
+    if rank == 0:
+        shutil.rmtree(checkpoint_path)

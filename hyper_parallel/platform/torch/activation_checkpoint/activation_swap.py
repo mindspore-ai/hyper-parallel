@@ -35,6 +35,15 @@ _SWAP_WRAPPED_MODULE = "_swap_wrapped_module"
 _SWAP_PREFIX = _SWAP_WRAPPED_MODULE + "."
 
 
+def _raise_if_compiling(feature_name: str) -> None:
+    """Reject HyperParallel activation-swap extensions during Torch capture."""
+    if torch.compiler.is_compiling():
+        raise ValueError(
+            f"HyperParallel {feature_name} is not supported in compile mode. "
+            "Use Torch-native non-reentrant checkpointing with SAVE/RECOMPUTE policies."
+        )
+
+
 class FuncModule(nn.Module):
     """
     Thin :class:`~torch.nn.Module` adapter that wraps a plain callable.
@@ -175,6 +184,7 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
     Context manager to offload tensors to CPU during forward pass.
     """
     def __init__(self, policy_fn=None, group_swap: bool = False) -> None:
+        _raise_if_compiling("AsyncSaveOnCpu")
         self.add_to_storage = False
         self.storage = Storage()
         self.count_idx = 0
@@ -185,24 +195,25 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
 
         def pack_to_cpu(tensor: torch.Tensor):
             if not base_check_fn(tensor):
-                return tensor
+                return tensor.detach()
             if policy_fn is not None:
                 if policy_fn(tensor) == CheckpointPolicy.MUST_SAVE:
-                    return tensor
+                    return tensor.detach()
                 if policy_fn(tensor) != CheckpointPolicy.MUST_SWAP:
                     raise RuntimeError(f"Swap :set an invalid policy {policy_fn(tensor)}")
             group_name = swap_manager.get_current_group_name()
             if not group_name:
-                return tensor
+                return tensor.detach()
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)
                 self.add_to_storage = True
             funcname = f"{group_name}::{tensor.shape}"
+            detached = tensor.detach()
             self.storage[self.count_idx].append(
-                SwapTensor(tensor, funcname, group_swap=group_swap)
+                SwapTensor(detached, funcname, group_swap=group_swap)
             )
             self.count_idx += 1
-            return tensor
+            return detached
 
         def unpack_from_cpu(tensor) -> torch.Tensor:
             if self.storage is not None:
@@ -220,16 +231,19 @@ class ActivationWrapper(torch.nn.Module, ABC):
     Not meant to be instantiated directly.
     """
 
-    def __init__(self, module: Union[nn.Module, Callable]):
+    def __init__(self, module: Union[nn.Module, Callable], *, track_overlaps: bool = True):
+        """Initialize a wrapper and optionally participate in overlap tracking."""
         if callable(module) and not isinstance(module, nn.Module):
-            _check_and_mark_callable(module)
+            if track_overlaps:
+                _check_and_mark_callable(module)
             module = FuncModule(module)
-            _mark_wrapped(module)
-        else:
+            if track_overlaps:
+                _mark_wrapped(module)
+        elif track_overlaps:
             _check_and_mark_wrapped(module)
         super().__init__()
         self._swap_wrapped_module = module
-        self._is_wrapped = True
+        self._is_wrapped = track_overlaps
         # state_dict post hook to remove prefix to allow loading into a
         # non-swap wrapped module.
         self._register_state_dict_hook(self._post_state_dict_hook)
@@ -355,6 +369,7 @@ class SwapWrapper(ActivationWrapper):
 
     def forward(self, *args, **kwargs):
         """Run the wrapped module inside an AsyncSaveOnCpu context for activation swapping."""
+        _raise_if_compiling("swap_wrapper")
         with AsyncSaveOnCpu(policy_fn=self.policy_fn, group_swap=self.group_swap):
             return self._swap_wrapped_module(*args, **kwargs)
 
@@ -375,6 +390,7 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = Fa
     participates in the existing swap scheduling managed by ``SwapManager``.
     It preserves the input structure and returns the original tensors.
     """
+    _raise_if_compiling("swap_tensor_wrapper")
     swap_manager = SwapManager()
     group_name = swap_manager.get_current_group_name()
     if not group_name:

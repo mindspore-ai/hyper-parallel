@@ -194,7 +194,6 @@ class Llama3Attention(nn.Module):
         self.wk = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(cfg.n_heads * self.head_dim, cfg.dim, bias=False)
-        self.wo.output_scale_weight = nn.Parameter(torch.ones(cfg.dim + 1, cfg.dim))
         self.sdpa_core = Llama3BshdSdpaCore()
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -231,8 +230,7 @@ class Llama3Attention(nn.Module):
         out_l = out_bshd.reshape(b, s, n_h * self.head_dim)
         if mesh is not None:
             out_l = DTensor.from_local(out_l, mesh, [PlShard(-1)])
-        attention_output = self.wo(out_l)
-        return attention_output * self.wo.output_scale_weight.mean(dim=0)
+        return self.wo(out_l)
 
 
 class Llama3FeedForward(nn.Module):

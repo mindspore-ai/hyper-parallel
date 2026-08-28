@@ -1,3 +1,8 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -30,5 +35,8 @@ def test_sac_group():
         MindSporeCase(BASE_SHARD, "test_swap_manager_manual_group_api", 11640, 1),
         MindSporeCase(BASE_SHARD, "test_inplace_modification", 11641, 1),
         MindSporeCase(BASE_SHARD, "test_wrapper_overlap_detection_cases", 11642, 1),
-        MindSporeCase(BASE_SHARD, "test_wrapper_non_overlapping_allowed_cases", 11643, 1)
+        MindSporeCase(BASE_SHARD, "test_wrapper_non_overlapping_allowed_cases", 11643, 1),
+        MindSporeCase(
+            "checkpoint_exclude_matmul.py", "test_rmsnorm_matmul_checkpoint_exclude_memory", 11644, 1
+        ),
     ])

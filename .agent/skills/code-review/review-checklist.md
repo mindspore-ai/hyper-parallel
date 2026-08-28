@@ -178,6 +178,11 @@ When a change introduces new API patterns, evaluate broader implications:
 - [ ] **Tests exist** — New functionality has corresponding tests
 - [ ] **Right test location** — `tests/ut/core/`, `tests/ut/platform/torch/` for PyTorch-focused UTs; MindSpore under `tests/ut/platform/mindspore/` or `*_mindspore.py`
 
+### Style / Comments (from `code-style.md`)
+
+- [ ] **Inline `#` is why-only** — no what-restating walls; no job/commit/one-off metrics/local paths; ~2–4 lines when needed
+- [ ] **High-risk paths** (stream/memory/launcher import bans) have a short why if non-obvious
+
 ### Test Patterns
 
 - [ ] **Proper markers** — `@arg_mark(plat_marks=..., level_mark=..., card_mark=..., essential_mark=...)`

@@ -2,7 +2,7 @@ include requirements.txt
 include README.md
 include README.en.md
 include LICENSE
-
+include scripts/hyper_parallel_multicore_set_env.bash
 prune build
 prune dist
 prune *.egg-info
@@ -19,3 +19,4 @@ global-exclude *.dylib
 global-exclude *.dll
 global-exclude .git*
 global-exclude .gitignore
+global-exclude .commit_id

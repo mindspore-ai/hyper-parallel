@@ -14,15 +14,14 @@
 # ============================================================================
 """Unit tests for ``hyper_parallel.core.utils.shape_utils``.
 
-``compute_local_shape_and_global_offset`` is plain chunk math: given a
+``compute_local_shape_and_global_offset`` is balanced shard math: given a
 tensor shape, a mesh, and a placement, return the per-rank local shape.
-The math has to match ``torch.chunk`` semantics (first ``remainder``
-ranks get one extra element). Coverage pins:
+Coverage pins:
 
 1. Even split — ``global_size % num_devices == 0`` → every rank gets the
    even quotient on the sharded axis.
 2. Uneven split — first ``remainder`` ranks get ``quotient + 1``, the rest
-   get ``quotient`` (matches ``torch.chunk`` exactly).
+   get ``quotient`` (balanced ``Shard`` semantics).
 3. ``"None"`` axis entries are no-ops (replicated dim left untouched).
 4. Multi-dim placement — sharding two tensor dims via two different mesh
    axes does not interfere; chunk math is applied per dim independently.
@@ -111,7 +110,7 @@ class TestComputeLocalShape(unittest.TestCase):
                     f"Even split should give 2 on every rank, got {slice_shape} on rank={rank}"
                 ))
 
-    def test_uneven_split_matches_torch_chunk(self):
+    def test_uneven_split_uses_balanced_shard_geometry(self):
         """``global=10 / num_devices=4`` → ranks 0,1 get 3 each; ranks 2,3 get 2 each."""
         expected_per_rank = {0: 3, 1: 3, 2: 2, 3: 2}
         for rank, expected in expected_per_rank.items():
@@ -127,6 +126,30 @@ class TestComputeLocalShape(unittest.TestCase):
                     f"Uneven split mismatch on rank={rank}: "
                     f"expected={expected}, got={slice_shape[0]}"
                 ))
+
+    def test_ceil_chunk_keeps_fixed_size_until_trailing_shard(self):
+        """FSDP ceil-chunk geometry differs from balanced Shard geometry."""
+        expected_geometries = {
+            (10, 4): ((3, 0), (3, 3), (3, 6), (1, 9)),
+            (6, 4): ((2, 0), (2, 2), (2, 4), (0, 6)),
+        }
+        for (global_size, shard_count), rank_geometries in expected_geometries.items():
+            for shard_rank, (expected_size, expected_offset) in enumerate(rank_geometries):
+                with self.subTest(
+                    global_size=global_size,
+                    shard_count=shard_count,
+                    shard_rank=shard_rank,
+                ):
+                    local_shape, global_offset = (
+                        shape_utils.compute_local_shape_and_global_offset_by_ceil_chunk(
+                            (global_size, 3),
+                            shard_dim=0,
+                            shard_count=shard_count,
+                            shard_rank=shard_rank,
+                        )
+                    )
+                    self.assertEqual(local_shape, [expected_size, 3])
+                    self.assertEqual(global_offset, [expected_offset, 0])
 
     def test_replicate_axis_keeps_full_shape(self):
         """``alias_tensor_map`` entries equal to ``\"None\"`` leave the dim untouched."""

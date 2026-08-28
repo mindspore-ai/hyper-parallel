@@ -23,9 +23,6 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Placement, Shard
 from hyper_parallel.core.tensor_parallel.mc2 import MC2Linear
 from hyper_parallel.core.tensor_parallel.style import ColwiseParallel, RowwiseParallel
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
 
 __all__ = ["MC2ColwiseParallel", "MC2RowwiseParallel"]
 
@@ -37,7 +34,9 @@ def _replace_with_mc2_linear(
     sequence_dim: int,
 ) -> MC2Linear:
     """Replace ``nn.Linear`` with configured ``MC2Linear`` in place."""
-    if not platform.is_linear_module(module):
+    # Torch-only check: get_platform() is a process singleton and mixed UT may
+    # already have cached MindSpore, whose is_linear_module rejects nn.Linear.
+    if not isinstance(module, nn.Linear):
         raise NotImplementedError(
             f"MC2 parallel style only supports Linear modules, but got {type(module).__name__}."
         )

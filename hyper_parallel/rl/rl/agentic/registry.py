@@ -18,8 +18,12 @@ from rl.agentic.base import Environment
 from rl.dataset.contracts import PromptRecord
 from rl.registry import Registry
 EnvironmentBuilder = Callable[[PromptRecord], Environment]
+
+
 class EnvironmentRegistry(Registry[EnvironmentBuilder]):
     """Registry specialized only by its public error label."""
+
     def __init__(self) -> None:
+        """Create the environment registry with its public error label."""
         super().__init__("environment")
 ENVIRONMENTS = EnvironmentRegistry()

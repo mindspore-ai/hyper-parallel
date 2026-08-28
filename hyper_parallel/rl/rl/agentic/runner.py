@@ -14,6 +14,7 @@
 # ============================================================================
 """Synchronous batched engine driver for token-first AgentSessions."""
 import asyncio
+import hashlib
 from typing import Any, Optional, Sequence
 from rl.agentic.base import Action
 from rl.agentic.registry import ENVIRONMENTS
@@ -21,6 +22,25 @@ from rl.agentic.session import AgentSession
 from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory
 from rl.dataset.batch_builder import build_experience_batch
 from rl.roles.rollout.base import GenerationEngine, GenerationRequest, GenerationSettings
+
+
+def _canonical_row_seed(
+    base_seed: int,
+    prompt_id: str,
+    sample_index: int,
+    samples_per_prompt: int,
+) -> int:
+    """Derive a stable sampling seed independent of physical DP rank."""
+    try:
+        prompt_index = int(prompt_id)
+    except ValueError:
+        digest = hashlib.sha256(prompt_id.encode("utf-8")).digest()
+        prompt_index = int.from_bytes(digest[:4], byteorder="big", signed=False)
+    if prompt_index < 0:
+        raise ValueError(f"Prompt IDs used for seeded rollout must be non-negative, got {prompt_id!r}")
+    return base_seed + prompt_index * samples_per_prompt + sample_index
+
+
 class AgentRunner:
     """Drive N sampled environments through one batched generation engine.
 
@@ -28,6 +48,7 @@ class AgentRunner:
     Finished sessions receive discarded dummy generations, preserving FSDP
     collective ordering without introducing a distributed scheduler.
     """
+
     def __init__(
         self,
         engine: GenerationEngine,
@@ -52,6 +73,7 @@ class AgentRunner:
         self.max_turns = max_turns
         self.max_observation_tokens = max_observation_tokens
         self.settings = settings
+
     def _left_pad_sessions(
         self,
         sessions: Sequence[AgentSession],
@@ -69,16 +91,21 @@ class AgentRunner:
             input_ids[row, -tokens.numel() :] = tokens
             attention_mask[row, -tokens.numel() :] = 1
         return input_ids, attention_mask
+
     def _response_mask(self, response_ids: Any, explicit_mask: Any) -> Any:
+        if explicit_mask is not None and tuple(explicit_mask.shape) != tuple(response_ids.shape):
+            raise ValueError("Generation response_mask must align with response IDs")
+        if self.settings.ignore_eos:
+            return response_ids.eq(response_ids) if explicit_mask is None else explicit_mask.bool()
         terminal_mask = response_ids.eq(self.settings.eos_token_ids[0])
         for token_id in self.settings.eos_token_ids[1:]:
             terminal_mask = terminal_mask | response_ids.eq(token_id)
-        eos_prefix_mask = terminal_mask.cumsum(dim=-1).eq(0)
+        terminal_count = terminal_mask.to(dtype=response_ids.dtype)
+        eos_prefix_mask = (terminal_count.cumsum(dim=-1) - terminal_count).eq(0)
         if explicit_mask is None:
             return eos_prefix_mask
-        if tuple(explicit_mask.shape) != tuple(response_ids.shape):
-            raise ValueError("Generation response_mask must align with response IDs")
         return explicit_mask.bool() & eos_prefix_mask
+
     def _build_batch(
         self,
         trajectories: tuple[Trajectory, ...],
@@ -93,6 +120,7 @@ class AgentRunner:
                 "max_turns": self.max_turns,
             },
         )
+
     def _synchronize_error(self, local_error: Optional[Exception], operation: str) -> None:
         """Use the generation engine to make local orchestration failures global."""
         synchronize = getattr(self.engine, "synchronize_error", None)
@@ -100,6 +128,7 @@ class AgentRunner:
             synchronize(local_error, operation)
         elif local_error is not None:
             raise local_error
+
     @staticmethod
     async def _gather_session_operations(operation: str, *coroutines: Any) -> None:
         """Wait for every session coroutine and report all local failures together."""
@@ -107,6 +136,7 @@ class AgentRunner:
         errors = [str(result) for result in results if isinstance(result, BaseException)]
         if errors:
             raise RuntimeError(f"{operation} failed: {errors}")
+
     async def _run_sessions(
         self,
         sessions: Sequence[AgentSession],
@@ -129,7 +159,23 @@ class AgentRunner:
                 local_error = None
                 try:
                     input_ids, attention_mask = self._left_pad_sessions(sessions)
-                    request = GenerationRequest(input_ids, attention_mask, self.settings)
+                    row_seeds = None
+                    if self.settings.seed is not None:
+                        row_seeds = tuple(
+                            _canonical_row_seed(
+                                self.settings.seed,
+                                session.prompt.prompt_id,
+                                session.sample_index,
+                                self.num_samples,
+                            )
+                            for session in sessions
+                        )
+                    request = GenerationRequest(
+                        input_ids,
+                        attention_mask,
+                        self.settings,
+                        row_seeds,
+                    )
                 except Exception as error:  # pylint: disable=W0718
                     local_error = error
                 self._synchronize_error(local_error, "generation request preparation")
@@ -244,6 +290,7 @@ class AgentRunner:
         if trajectories is None:
             raise RuntimeError("Trajectory construction failed without a synchronized error")
         return trajectories, generation_seconds
+
     def rollout(
         self,
         prompt_records: Sequence[PromptRecord],

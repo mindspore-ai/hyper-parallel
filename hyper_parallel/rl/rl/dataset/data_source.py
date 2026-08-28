@@ -16,15 +16,21 @@
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 import pandas as pd
-from hyper_parallel import get_platform
+
 from rl.dataset.contracts import Message, PromptRecord
+
+from hyper_parallel import get_platform
 platform = get_platform()
 PROMPT_INSTRUCTION = 'Let\'s think step by step and output the final answer after "####".'
 _PROMPT_COLUMN_CANDIDATES = ("prompt", "question", "problem", "input_text")
 _ANSWER_COLUMN_CANDIDATES = ("extra_info", "answer", "solution")
 _MAPPING_ANSWER_KEYS = ("ground_truth", "answer", "solution")
+
+
 def _to_builtin(value: Any) -> Any:
     return value.tolist() if hasattr(value, "tolist") else value
+
+
 def _pick_column(
     columns: set[str], configured: Optional[str], candidates: Sequence[str],
     label: str, required: bool,
@@ -47,6 +53,8 @@ def _pick_column(
         f"Prompt parquet is missing required columns: no {label} column found; "
         f"expected one of {list(candidates)}, available={sorted(columns)}"
     )
+
+
 def _normalize_prompt(prompt_source: Any, index: int) -> tuple[str, str]:
     """Normalize one raw or structured prompt source."""
     prompt_source = _to_builtin(prompt_source)
@@ -73,6 +81,8 @@ def _normalize_prompt(prompt_source: Any, index: int) -> tuple[str, str]:
     raise ValueError(
         f"Unsupported prompt source type at sample {index}: {type(prompt_source)!r}"
     )
+
+
 def _normalize_ground_truth(answer_source: Any, index: int) -> str:
     """Normalize one mapping or string answer into an exact-match target."""
     answer_source = _to_builtin(answer_source)
@@ -93,6 +103,8 @@ def _normalize_ground_truth(answer_source: Any, index: int) -> str:
     if not ground_truth:
         raise ValueError(f"Ground truth at sample {index} must not be empty")
     return ground_truth
+
+
 def _select_answer_source(
     record: Mapping[str, Any],
     answer_column: Optional[str],
@@ -111,8 +123,11 @@ def _select_answer_source(
     raise ValueError(
         f"Sample {index} is missing reward_model.ground_truth and fallback answer"
     )
+
+
 class PromptDataset:
     """Read tokenized prompt records from supported text parquet layouts."""
+
     def __init__(
         self,
         parquet_path: str,
@@ -122,6 +137,7 @@ class PromptDataset:
         answer_column: Optional[str] = None,
         max_samples: Optional[int] = None,
     ) -> None:
+        """Load and validate a tokenized prompt dataset from parquet."""
         path = Path(parquet_path)
         if not path.is_file():
             raise ValueError(f"Prompt parquet file does not exist: {path}")
@@ -155,9 +171,11 @@ class PromptDataset:
         self._records = frame.to_dict("records")
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
+
     def __len__(self) -> int:
         """Return the number of prompt samples."""
         return len(self._records)
+
     def _tokenize(self, prompt: str, index: int) -> tuple[Any, Any]:
         """Tokenize one prompt and enforce its configured length bound."""
         encoded = self._tokenizer.apply_chat_template(
@@ -186,6 +204,7 @@ class PromptDataset:
                 f"attention_mask={attention_mask.shape}"
             )
         return input_ids, attention_mask
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Return one formatted and tokenized prompt sample."""
         record = self._records[index]
@@ -205,6 +224,8 @@ class PromptDataset:
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }
+
+
 def build_padded_evaluation_batches(
     dataset_size: int, num_replicas: int, rank: int, batch_size: int,
     max_samples: Optional[int] = None,
@@ -234,6 +255,8 @@ def build_padded_evaluation_batches(
             ]
         )
     return batches
+
+
 def build_prompt_records(
     batch: Mapping[str, Any],
     input_ids: Any,
@@ -251,10 +274,15 @@ def build_prompt_records(
         )
         for index in range(input_ids.shape[0])
     )
+
+
 def _left_pad(tensor: Any, length: int, value: int) -> Any:
     padding = platform.full((length - int(tensor.numel()),), value, dtype=tensor.dtype)
     return platform.cat((padding, tensor), dim=0)
+
+
 def collate_prompt_samples(samples: Sequence[dict[str, Any]], pad_token_id: int) -> dict[str, Any]:
+    """Left-pad prompt samples into one training batch."""
     if not samples:
         raise ValueError("collate_prompt_samples requires at least one sample")
     max_length = max(int(sample["input_ids"].numel()) for sample in samples)

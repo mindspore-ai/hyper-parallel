@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +14,11 @@
 # ============================================================================
 """func tracer module"""
 import ast
-import sys
 import inspect
-import textwrap
 import linecache
+import sys
+import textwrap
+import weakref
 
 
 class _FuncTracer:
@@ -26,7 +27,7 @@ class _FuncTracer:
     def __init__(self):
         self.ind = 0
         self.trace_str = ""
-        self.code_trees = {}
+        self.code_trees = weakref.WeakKeyDictionary()
         self.max_sub_length = 30
 
     def add2trace(self, s):

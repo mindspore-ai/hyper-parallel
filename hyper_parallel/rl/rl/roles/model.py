@@ -28,13 +28,7 @@ SUPPORTED_MODEL_IMPLEMENTATIONS = (
     NATIVE_MODEL_IMPLEMENTATION,
 )
 HYPER_QWEN3_ARCHITECTURE = "HyperQwen3ForCausalLM"
-HYPER_QWEN3_5_ARCHITECTURE = "HyperQwen3_5ForCausalLM"
 NATIVE_QWEN3_ARCHITECTURE = "Qwen3ForCausalLM"
-NATIVE_QWEN3_5_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
-_HYPER_ARCHITECTURES = {
-    "qwen3": HYPER_QWEN3_ARCHITECTURE,
-    "qwen3_5": HYPER_QWEN3_5_ARCHITECTURE,
-}
 
 
 @dataclass(frozen=True)
@@ -52,34 +46,17 @@ class ModelRegistration:
 
     @property
     def family(self) -> str:
-        """Return the supported Qwen model family."""
+        """Return the supported Qwen3 model family."""
         if (
             self.hf_architecture == "Qwen3ForCausalLM"
             and self.model_type == "qwen3"
         ):
             return "qwen3"
-        composite_qwen3_5 = (
-            self.hf_architecture == "Qwen3_5ForConditionalGeneration"
-            and self.model_type == "qwen3_5"
-            and self.text_model_type == "qwen3_5_text"
-        )
-        text_qwen3_5 = (
-            self.hf_architecture == "Qwen3_5ForCausalLM"
-            and self.model_type == "qwen3_5_text"
-            and self.text_model_type == "qwen3_5_text"
-        )
-        if composite_qwen3_5 or text_qwen3_5:
-            return "qwen3_5"
         raise ValueError(
             "Unsupported RL model identity: "
             f"architecture={self.hf_architecture!r}, model_type={self.model_type!r}, "
             f"text_model_type={self.text_model_type!r}"
         )
-
-    @property
-    def native_uses_language_model_prefix(self) -> bool:
-        """Return whether native vLLM wraps text weights under ``language_model``."""
-        return self.hf_architecture == "Qwen3_5ForConditionalGeneration"
 
 
 @dataclass(frozen=True)
@@ -104,14 +81,6 @@ class VLLMModelRegistration:
         """Map one canonical Actor parameter name into the rollout namespace."""
         if name == "lm_head.weight" and self.model.tie_word_embeddings:
             return None
-        if (
-            not self.is_hyper
-            and self.family == "qwen3_5"
-            and self.model.native_uses_language_model_prefix
-            and name.startswith("model.")
-            and not name.startswith("model.language_model.")
-        ):
-            return f"model.language_model.{name.removeprefix('model.')}"
         return name
 
 
@@ -128,22 +97,15 @@ def normalize_model_implementation(value: Any) -> str:
 
 def architecture_for_implementation(
     implementation: str,
-    model_family: str = "qwen3_5",
+    model_family: str = "qwen3",
 ) -> str:
-    """Return the default architecture for one implementation and family."""
+    """Return the Qwen3 architecture for one rollout implementation."""
+    if model_family != "qwen3":
+        raise ValueError(f"Unsupported vLLM model family: {model_family!r}")
     normalized = normalize_model_implementation(implementation)
     if normalized == HYPER_MODEL_IMPLEMENTATION:
-        try:
-            return _HYPER_ARCHITECTURES[model_family]
-        except KeyError as error:
-            raise ValueError(
-                f"Unsupported Hyper-vLLM model family: {model_family!r}"
-            ) from error
-    if model_family == "qwen3":
-        return NATIVE_QWEN3_ARCHITECTURE
-    if model_family == "qwen3_5":
-        return NATIVE_QWEN3_5_ARCHITECTURE
-    raise ValueError(f"Unsupported native vLLM model family: {model_family!r}")
+        return HYPER_QWEN3_ARCHITECTURE
+    return NATIVE_QWEN3_ARCHITECTURE
 
 
 def resolve_vllm_model(
@@ -161,7 +123,7 @@ def resolve_vllm_model(
 
 
 def build_role_model(runtime_config: object, distributed_setup: object, *, frozen: bool) -> platform.Module:
-    """Build one finalized role model through the HyperModels atomic loader."""
+    """Build one finalized role model through the HyperAutoModel atomic loader."""
     activation_checkpoint = getattr(runtime_config.activation_checkpoint, "mode", "off")
     model = runtime_config.model.build(
         distributed_setup=distributed_setup,
@@ -182,7 +144,7 @@ def build_role_optimizer(runtime_config: object, model: platform.Module) -> tupl
     if runtime_config.lr_scheduler is not None:
         lr_scheduler = runtime_config.lr_scheduler.build(
             optimizer=optimizer,
-            train_steps=runtime_config.training.train_iters,
+            train_iters=runtime_config.training.train_iters,
         ).get_lr_scheduler()
     return optimizer, lr_scheduler
 
@@ -199,11 +161,9 @@ def iter_hsdp_roots(model: platform.Module) -> Iterator[HSDPModule]:
 __all__ = [
     "HYPER_MODEL_IMPLEMENTATION",
     "HYPER_QWEN3_ARCHITECTURE",
-    "HYPER_QWEN3_5_ARCHITECTURE",
     "ModelRegistration",
     "NATIVE_MODEL_IMPLEMENTATION",
     "NATIVE_QWEN3_ARCHITECTURE",
-    "NATIVE_QWEN3_5_ARCHITECTURE",
     "SUPPORTED_MODEL_IMPLEMENTATIONS",
     "VLLMModelRegistration",
     "architecture_for_implementation",

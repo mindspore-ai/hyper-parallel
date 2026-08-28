@@ -31,6 +31,25 @@ def test_linear_attention_cp_accepts_supported_modes(mode):
     assert LinearAttentionContextParallel(mode=mode).mode == mode
 
 
+@pytest.mark.parametrize("backend", ("eager", "triton"))
+def test_linear_attention_cp_accepts_explicit_backends(backend):
+    """The public backend selection is explicit and preserved by the style."""
+    style = LinearAttentionContextParallel(mode="ulysses", backend=backend)
+    assert style.backend == backend
+
+
+def test_linear_attention_cp_rejects_unknown_backend():
+    """An unknown GDN backend fails before patching a module."""
+    with pytest.raises(ValueError, match="backend must be"):
+        LinearAttentionContextParallel(backend="auto")
+
+
+def test_linear_attention_cp_rejects_triton_all_gather():
+    """The unsupported fused all-gather combination cannot silently fall back."""
+    with pytest.raises(NotImplementedError, match="all-gather CP"):
+        LinearAttentionContextParallel(mode="all_gather", backend="triton")
+
+
 def test_linear_attention_cp_rejects_unknown_mode():
     """An unsupported execution mode fails before patching a module."""
     with pytest.raises(NotImplementedError, match="currently supports"):

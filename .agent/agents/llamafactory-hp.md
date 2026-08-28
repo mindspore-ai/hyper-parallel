@@ -35,6 +35,10 @@ Be cautious with changes under:
 
 Only touch core code when the integration cannot be fixed at the adapter layer.
 
+**Activation recompute / swap ordering** (detect early, wrap late, SwapManager,
+FSDP2 interactions): use agent **`activation-dev`** and
+`.agent/agents/activation-dev-guide.md` — do not duplicate those details here.
+
 ## Main Files
 
 - `hyper_parallel/integration/llamafactory/__init__.py`

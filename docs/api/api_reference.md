@@ -845,6 +845,8 @@ checkpoint(
     swap_inputs: bool = False,
     policy_fn: Optional[Callable] = None,
     context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
+    group_swap: bool = False,
+    early_stop: bool = True,
     **kwargs,
 )
 ```
@@ -857,6 +859,12 @@ checkpoint(
 | `swap_inputs` | `bool` | `False` | 是否将 checkpoint 保存的输入 offload 到 CPU |
 | `policy_fn` | `callable` | `None` | SAC 逐算子策略：`(ctx, op, *args, **kwargs) -> CheckpointPolicy` |
 | `context_fn` | `callable` | `None` | 返回 `(forward_ctx, recompute_ctx)` 的无参工厂；可与 `policy_fn` 组合 |
+| `group_swap` | `bool` | `False` | 是否对 `MUST_SWAP` tensor 启用分组 copy 融合 |
+| `early_stop` | `bool` | `True` | 是否在产生全部 backward 所需 tensor 后提前停止重计算 |
+
+Torch 2.6、2.7、2.9 eager 模式统一使用 HyperParallel non-reentrant 实现。`early_stop` 只接受单次调用
+关键字或 `checkpoint_kwargs` 配置，不继承外层 `torch.utils.checkpoint.set_checkpoint_early_stop()`。
+Torch backend 还会消费 `preserve_rng_state`、`determinism_check` 和 `debug` 等 checkpoint 保留关键字。
 
 ---
 
@@ -890,7 +898,7 @@ swap(
 checkpoint_wrapper(module, **checkpoint_kwargs) -> CheckpointWrapper
 ```
 
-`checkpoint_kwargs` 与 `checkpoint` 一致，例如 `policy_fn`、`swap_inputs`。
+`checkpoint_kwargs` 与 `checkpoint` 一致，例如 `policy_fn`、`swap_inputs`、`early_stop`。
 
 ---
 
@@ -900,11 +908,20 @@ checkpoint_wrapper(module, **checkpoint_kwargs) -> CheckpointWrapper
 重算阶段直接复用前向输出，以额外显存占用换取计算开销降低。
 
 ```python
-checkpoint_exclude_wrapper(module) -> CheckpointExcludeWrapper
+checkpoint_exclude_wrapper(
+    module,
+    *,
+    save_output: bool = True,
+) -> CheckpointExcludeWrapper
 ```
 
-当前仅支持 MindSpore PyNative 模式，并且需要在 HyperParallel 的 `checkpoint` 或
-`checkpoint_wrapper`（`use_reentrant=False`）内部使用。支持包装 MindSpore Cell 和普通 callable。
+支持 PyTorch eager 和 MindSpore PyNative 模式，并且需要在 HyperParallel 的 `checkpoint` 或
+`checkpoint_wrapper`（`use_reentrant=False`）内部使用。支持包装 Module/Cell 和普通 callable。
+
+`save_output=False` 用于连续 SAVE 区域的中间节点：该区域内部通过 saved-tensor hooks 保存的反向激活
+保持不变，但其边界输出不会为 replay 常驻显存。此时区域返回值必须作为一个参数整体直接传给另一个
+`checkpoint_exclude_wrapper`，不能在中间被解包、被 replay 中执行的普通算子读取，也不能作为 checkpoint
+的最终输出。
 
 ---
 

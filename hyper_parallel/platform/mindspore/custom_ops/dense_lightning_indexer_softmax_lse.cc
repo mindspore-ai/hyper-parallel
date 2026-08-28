@@ -27,9 +27,22 @@ std::tuple<ms::Tensor, ms::Tensor> GenResultTensors(const ms::Tensor &query_inde
                                                     const std::string &layout) {
   std::vector<int64_t> out_shape;
   if (layout == "TND") {
+    if (query_index.shape().size() != 3 || key_index.shape().size() != 3) {
+      MS_LOG(EXCEPTION) << "For npu_dense_lightning_indexer_softmax_lse with TND layout, query_index and "
+                        << "key_index must be rank 3, but got " << query_index.shape().size() << " and "
+                        << key_index.shape().size() << ".";
+    }
     out_shape = {key_index.shape()[1], query_index.shape()[0]};
-  } else {
+  } else if (layout == "BSND") {
+    if (query_index.shape().size() != 4 || key_index.shape().size() != 4) {
+      MS_LOG(EXCEPTION) << "For npu_dense_lightning_indexer_softmax_lse with BSND layout, query_index and "
+                        << "key_index must be rank 4, but got " << query_index.shape().size() << " and "
+                        << key_index.shape().size() << ".";
+    }
     out_shape = {query_index.shape()[0], key_index.shape()[2], query_index.shape()[1]};
+  } else {
+    MS_LOG(EXCEPTION) << "For npu_dense_lightning_indexer_softmax_lse, layout must be BSND or TND, but got "
+                      << layout << ".";
   }
   ms::Tensor softmax_max_out(ms::TypeId::kNumberTypeFloat32, out_shape);
   ms::Tensor softmax_sum_out(ms::TypeId::kNumberTypeFloat32, out_shape);

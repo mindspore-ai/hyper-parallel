@@ -12,35 +12,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-
 """HyperParallel optimizer module."""
+from importlib import import_module as _import_module  # pylint: disable=invalid-name
 
 import inspect
 import logging
 from typing import Any, Dict, List, Optional
 
-from torch import nn
-
-import hyper_parallel.core.optimizer.utils  # noqa: F401 - install rank0 logging helpers on logging.Logger
-
-from hyper_parallel.core.optimizer.adamw import AdamW
-from hyper_parallel.core.optimizer.muon import Muon
-from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
-from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
+from hyper_parallel.core.optimizer.swap_optimizer import (
+    SwapOptimizer,
+    SwapOptimizerConfig,
+    swap_optimizer,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-__all__ = ['get_hyper_optimizer']
+# Torch-only optimizer implementations import torch at module load. Keep them
+# off the eager path so MindSpore-only environments can import SwapOptimizer.
+_LAZY_EXPORTS = {
+    "AdamW": ".adamw",
+    "Muon": ".muon",
+    "ChainedOptimizer": ".optimizer",
+    "detect_dtensor_backend": ".dtensor_compat",
+}
+
+
+def __getattr__(name):  # pylint: disable=invalid-name
+    """Lazily import torch-only optimizer symbols."""
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = _import_module(_LAZY_EXPORTS[name], __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():  # pylint: disable=invalid-name
+    """Include lazy torch-only optimizer exports in ``dir()``."""
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
+
+
+def _load_torch_optimizer_runtime():
+    """Import torch-only optimizer helpers used by the factory APIs."""
+    # pylint: disable=import-outside-toplevel,unused-import
+    import hyper_parallel.core.optimizer.utils  # noqa: F401 - install rank0 logging helpers
+
+    from hyper_parallel.core.optimizer.adamw import AdamW
+    from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
+    from hyper_parallel.core.optimizer.muon import Muon
+    from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+
+    return AdamW, Muon, ChainedOptimizer, detect_dtensor_backend
+
+
+def get_hyper_lr_scheduler(*args: Any, **kwargs: Any) -> Any:
+    """Create the HyperParallel LR scheduler."""
+    # pylint: disable=import-outside-toplevel
+    from hyper_parallel.core.optimizer.lr_scheduler import (
+        get_hyper_lr_scheduler as _get_hyper_lr_scheduler,
+    )
+    return _get_hyper_lr_scheduler(*args, **kwargs)
 
 
 def get_hyper_optimizer(
-        model: nn.Module,
+        model: Any,
         muon_params: List[Dict[str, Any]],
         adamw_params: List[Dict[str, Any]],
         muon_kwargs: Optional[Dict[str, Any]] = None,
         adamw_kwargs: Optional[Dict[str, Any]] = None,
-) -> ChainedOptimizer:
+) -> Any:
     """Create a chained Muon + AdamW optimizer.
 
     Args:
@@ -80,6 +121,8 @@ def get_hyper_optimizer(
 
         optimizer.step()
     """
+    AdamW, Muon, ChainedOptimizer, detect_dtensor_backend = _load_torch_optimizer_runtime()
+
     # 1. Arguments Preparation
     # 1.1 adamw
     adamw_raw = adamw_kwargs or {}
@@ -119,3 +162,12 @@ def get_hyper_optimizer(
     flatten = bool(adamw_params and muon_params)
 
     return ChainedOptimizer(model, optimizers=optimizers, flatten=flatten)
+
+
+__all__ = [
+    'SwapOptimizer',
+    'SwapOptimizerConfig',
+    'get_hyper_optimizer',
+    'get_hyper_lr_scheduler',
+    'swap_optimizer',
+]

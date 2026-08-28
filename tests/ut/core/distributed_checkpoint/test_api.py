@@ -16,7 +16,6 @@
 # pylint: disable=wrong-import-position
 import importlib
 import os
-import pickle
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,7 +36,6 @@ importlib.reload(api_mod)
 
 from hyper_parallel.core.distributed_checkpoint.api import (
     _gather_from_all_ranks,
-    _raise_if_stage_failed,
     load,
     save,
 )
@@ -48,7 +46,6 @@ class TestApi(unittest.TestCase):
     """Tests for distributed checkpoint save/load API."""
 
     def setUp(self) -> None:
-        """Reset the selected platform and checkpoint planner cache."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
         importlib.reload(planner_mod)
@@ -125,48 +122,15 @@ class TestApi(unittest.TestCase):
         """
         expected = [{"a": 1}, {"a": 2}]
 
-        def _gather_side_effect(out, local_obj):
-            if local_obj is None:
-                out[:] = [None, None]
-            else:
-                out[:] = [pickle.dumps(value) for value in expected]
+        def gather_side_effect(out, local_obj):
+            del local_obj
+            out[0] = expected[0]
+            out[1] = expected[1]
 
-        mock_all_gather.side_effect = _gather_side_effect
+        mock_all_gather.side_effect = gather_side_effect
         result = _gather_from_all_ranks({"a": 1}, world_size=2, use_collectives=True)
-        self.assertEqual(mock_all_gather.call_count, 3)
-        self.assertEqual(result, expected)
-
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.all_gather_object")
-    def test_gather_propagates_payload_serialization_failure(self, mock_all_gather):
-        """
-        Feature: Collective payload serialization failure propagation.
-        Description: The local rank cannot pickle its plan before collective exchange.
-        Expectation: Every rank can fail in the status collective before payload exchange.
-        """
-
-        def _gather_side_effect(out, local_error):
-            out[:] = [local_error, None]
-
-        mock_all_gather.side_effect = _gather_side_effect
-        with self.assertRaisesRegex(RuntimeError, "payload serialization"):
-            _gather_from_all_ranks(lambda: None, world_size=2, use_collectives=True)
         mock_all_gather.assert_called_once()
-
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.all_gather_object")
-    def test_stage_failure_from_peer_is_raised_on_healthy_rank(self, mock_all_gather):
-        """
-        Feature: Distributed checkpoint phase failure propagation.
-        Description: A peer reports setup failure while the local rank succeeds.
-        Expectation: The healthy rank raises before entering the next checkpoint phase.
-        """
-
-        def _gather_side_effect(out, local_error):
-            self.assertIsNone(local_error)
-            out[:] = ["rank 0 failed", None]
-
-        mock_all_gather.side_effect = _gather_side_effect
-        with self.assertRaisesRegex(RuntimeError, "planning setup"):
-            _raise_if_stage_failed(None, "planning setup", 2, True)
+        self.assertEqual(result, expected)
 
 
 if __name__ == "__main__":

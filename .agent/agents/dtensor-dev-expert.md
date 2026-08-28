@@ -28,8 +28,7 @@ You are the domain expert on DTensor internals for HyperParallel.
 ### Layout (`core/dtensor/layout.py`)
 - `_build_layout(device_mesh, placements, tensor_dim)` — called on every DTensor construction and redistribute
 - `placement_to_tensor_map` — maps placements to tensor dimensions
-- `is_partial()` — **method**, not property; always call with parentheses
-- Layout comparison and compatibility checking
+- Layout comparison and compatibility checking (hard rules like `is_partial()` → `.agent/rules/distributed.md`)
 
 ### Placement Types (`core/dtensor/placement_types.py`)
 - `Shard(dim)` / `Replicate()` / `Partial(reduce_op)`

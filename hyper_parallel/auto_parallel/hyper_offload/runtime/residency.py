@@ -357,5 +357,10 @@ class ResidencyManager:
         """Release all physical resources and reset tracking."""
         for buffer in self._residency.values():
             if buffer.host_buffer is not None:
-                self._host_pool.release(buffer.host_buffer, event=buffer.host_event)
+                event_to_wait = (
+                    buffer.device_event
+                    if buffer.device_event is not None
+                    else buffer.host_event
+                )
+                self._host_pool.release(buffer.host_buffer, event=event_to_wait)
         self._residency.clear()

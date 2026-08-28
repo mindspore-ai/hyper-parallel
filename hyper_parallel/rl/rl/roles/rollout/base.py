@@ -51,6 +51,7 @@ class GenerationRequest:
     input_ids: Any
     attention_mask: Any
     settings: GenerationSettings
+    row_seeds: Optional[tuple[int, ...]] = None
 
 
 @dataclass(frozen=True)

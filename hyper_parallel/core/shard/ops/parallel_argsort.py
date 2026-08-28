@@ -16,6 +16,7 @@
 Distributed implementation for Argsort operator.
 """
 
+import copy
 from typing import Tuple
 
 from .parallel_ops import DistributedOp
@@ -112,4 +113,4 @@ class ArgsortDistributedOp(DistributedOp):
                 f"Please redistribute the tensor to Replicate on this dimension before sorting."
             )
 
-        return ((layout,), None)
+        return ((copy.deepcopy(layout),), None)

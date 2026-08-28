@@ -15,10 +15,10 @@
 """Transformers Qwen3 adapter for the Hyper-vLLM runtime."""
 
 from collections.abc import Iterable
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-import torch
-from torch import nn
+import torch  # pylint: disable=forbidden-backend-import
+from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3ForCausalLM,
@@ -26,8 +26,18 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from hyper_parallel.auto_models.components.distributed import (
+    ShardingPlanner,
+    apply_sharding_plan,
+)
+from hyper_parallel.auto_models.components.distributed.sharding_planner import (
+    validate_model_compatibility,
+)
+from hyper_parallel import DeviceMesh, distribute_tensor, mark_created_groups
 
 
 def _join_prefix(prefix: str, suffix: str) -> str:
@@ -48,8 +58,6 @@ def _validate_adapter_config(vllm_config: VllmConfig) -> None:
         raise ValueError("HyperQwen3ForCausalLM requires model_type='qwen3'")
     if model_config.dtype != torch.bfloat16:
         raise ValueError("HyperQwen3ForCausalLM currently supports only bfloat16")
-    if parallel_config.tensor_parallel_size != 1:
-        raise ValueError("HyperQwen3ForCausalLM currently supports tensor_parallel_size=1")
     if parallel_config.pipeline_parallel_size != 1:
         raise ValueError("HyperQwen3ForCausalLM currently supports pipeline_parallel_size=1")
     if _config_value(parallel_config, "prefill_context_parallel_size", 1) != 1:
@@ -74,6 +82,7 @@ class _VLLMQwen3Attention(nn.Module):
         vllm_config: VllmConfig,
         prefix: str,
     ) -> None:
+        """Replace Qwen3 attention compute with a vLLM paged-attention leaf."""
         super().__init__()
         self.q_proj = attention.q_proj
         self.k_proj = attention.k_proj
@@ -84,13 +93,14 @@ class _VLLMQwen3Attention(nn.Module):
         self.head_dim = attention.head_dim
         self.num_heads = attention.config.num_attention_heads
         self.num_key_value_heads = attention.config.num_key_value_heads
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.scaling = attention.scaling
         self.layer_idx = attention.layer_idx
         self.attention = Attention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads // tp_size,
             head_size=self.head_dim,
             scale=self.scaling,
-            num_kv_heads=self.num_key_value_heads,
+            num_kv_heads=self.num_key_value_heads // tp_size,
             cache_config=vllm_config.cache_config,
             quant_config=vllm_config.quant_config,
             per_layer_sliding_window=attention.sliding_window,
@@ -160,8 +170,52 @@ def _map_weight_name(name: str) -> Optional[str]:
     return name
 
 
-def _load_parameter(parameter: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-    default_weight_loader(parameter, loaded_weight)
+def _device_mesh_from_vllm_tp() -> DeviceMesh:
+    """Build a Hyper mesh view over vLLM's existing TP process group."""
+    tp_group = get_tp_group()
+    process_group = tp_group.device_group
+    mark_created_groups(process_group)
+    mesh = DeviceMesh.from_group(
+        process_group,
+        device_type="npu",
+        mesh_dim_names=("tp",),
+    )
+    if mesh.get_group() is not process_group:
+        raise RuntimeError("Hyper Qwen3 TP mesh did not retain vLLM's process group")
+    if tuple(mesh.rank_list) != tuple(tp_group.ranks):
+        raise RuntimeError(
+            f"Hyper TP mesh ranks {mesh.rank_list} differ from vLLM TP ranks "
+            f"{tuple(tp_group.ranks)}"
+        )
+    return mesh
+
+
+def _load_parameter(
+    parameter: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *,
+    tp_mesh: Optional[DeviceMesh] = None,
+    placements: Optional[tuple[object, ...]] = None,
+) -> None:
+    """Load a full Actor/checkpoint tensor into a replicated or TP-local parameter."""
+    if tp_mesh is None or placements is None:
+        default_weight_loader(parameter, loaded_weight)
+        return
+    local_weight = distribute_tensor(
+        loaded_weight,
+        tp_mesh,
+        placements,
+        src_data_rank=None,
+    ).to_local()
+    if tuple(parameter.shape) != tuple(local_weight.shape):
+        raise ValueError(
+            "Qwen3 TP checkpoint shard shape mismatch: "
+            f"parameter={tuple(parameter.shape)}, weight={tuple(local_weight.shape)}"
+        )
+    with torch.no_grad():
+        parameter.copy_(
+            local_weight.to(device=parameter.device, dtype=parameter.dtype)
+        )
 
 
 @support_torch_compile(
@@ -171,6 +225,8 @@ def _load_parameter(parameter: torch.Tensor, loaded_weight: torch.Tensor) -> Non
         "inputs_embeds": 0,
     }
 )
+
+
 class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
     """Run the Transformers Qwen3 model with Hyper-vLLM runtime leaves."""
 
@@ -179,6 +235,7 @@ class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
     supports_multimodal = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        """Build and TP-shard the Transformers Qwen3 model for Hyper-vLLM."""
         _validate_adapter_config(vllm_config)
         super().__init__(vllm_config.model_config.hf_config)
         with torch.device("cpu"):
@@ -195,6 +252,46 @@ class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
                 vllm_config=vllm_config,
                 prefix=layer_prefix,
             )
+        self._tp_mesh: Optional[DeviceMesh] = None
+        self._tp_placements: dict[str, tuple[object, ...]] = {}
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        if tp_size > 1:
+            validate_model_compatibility(self, tp_size=tp_size)
+            self._tp_mesh = _device_mesh_from_vllm_tp()
+            plan = ShardingPlanner().plan(
+                self,
+                self._tp_mesh,
+                tp_size=tp_size,
+                cp_size=1,
+                ep_size=1,
+                sequence_parallel=False,
+                loss_parallel=False,
+            )
+            _, tp_layout_info = apply_sharding_plan(
+                self,
+                plan,
+                self._tp_mesh,
+                validate_mode=False,
+            )
+            if tp_layout_info is None:
+                raise RuntimeError("Qwen3 TP sharding returned no source-layout metadata")
+            self._tp_placements = {
+                name: tuple(placements)
+                for name, (placements, _source_mesh) in tp_layout_info.items()
+            }
+            if self.config.tie_word_embeddings:
+                embedding_placements = self._tp_placements.get(
+                    "model.embed_tokens.weight"
+                )
+                lm_head_placements = self._tp_placements.get("lm_head.weight")
+                if embedding_placements is not None:
+                    self._tp_placements.setdefault(
+                        "lm_head.weight", embedding_placements
+                    )
+                elif lm_head_placements is not None:
+                    self._tp_placements.setdefault(
+                        "model.embed_tokens.weight", lm_head_placements
+                    )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Apply the Transformers Qwen3 token embedding."""
@@ -203,7 +300,7 @@ class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
     def get_input_embeddings(
         self,
         input_ids: Optional[torch.Tensor] = None,
-    ) -> nn.Module | torch.Tensor:
+    ) -> Union[nn.Module, torch.Tensor]:
         """Preserve the HF accessor and support vLLM's legacy embedding call."""
         if input_ids is None:
             return self.model.embed_tokens
@@ -268,7 +365,12 @@ class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
                 )
             if target_name in loaded_parameters:
                 raise ValueError(f"Duplicate Qwen3 checkpoint parameter '{source_name}'")
-            _load_parameter(parameters[target_name], loaded_weight)
+            _load_parameter(
+                parameters[target_name],
+                loaded_weight,
+                tp_mesh=self._tp_mesh,
+                placements=self._tp_placements.get(target_name),
+            )
             loaded_parameters.add(target_name)
             if target_name == "model.embed_tokens.weight":
                 tied_embedding_weight = loaded_weight
@@ -279,7 +381,12 @@ class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
             and "lm_head.weight" not in loaded_parameters
             and tied_embedding_weight is not None
         ):
-            _load_parameter(parameters["lm_head.weight"], tied_embedding_weight)
+            _load_parameter(
+                parameters["lm_head.weight"],
+                tied_embedding_weight,
+                tp_mesh=self._tp_mesh,
+                placements=self._tp_placements.get("lm_head.weight"),
+            )
             loaded_parameters.add("lm_head.weight")
 
         missing_parameters = set(parameters).difference(loaded_parameters)

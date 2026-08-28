@@ -16,9 +16,10 @@
 import unittest
 from unittest.mock import patch, MagicMock
 import numpy as np
+import torch
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import RaggedShard, Replicate, Shard
 from hyper_parallel.core.shard.ops.parallel_getitem import (
     GetItemDistributedOp,
     _key_cache_descriptor,
@@ -66,6 +67,15 @@ class TestGetItemDistributedOp(unittest.TestCase):
         """Set up mock and return a standard 2x2 (dp, mp) mesh."""
         self._setup_mock_platform(mock_platform, world_size=4)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
+
+    def _make_1d_mesh(self, mock_platform, world_size=2):
+        """Set up mock and return a one-dimensional mesh."""
+        self._setup_mock_platform(mock_platform, world_size=world_size)
+        return init_device_mesh(
+            device_type="npu",
+            mesh_shape=(world_size,),
+            mesh_dim_names=("dp",),
+        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, mp, cp) mesh for 3D tensor tests."""
@@ -483,20 +493,131 @@ class TestGetItemDistributedOp(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_int_on_sharded_dim(self, mock_platform):
         """
-        Feature: Error when int index on sharded dimension.
-        Description: x[2] with shard on dim0.
-        Expectation: ValueError with "non-replicate dim".
+        Feature: Integer index on Shard(0) produces an owner-only RaggedShard.
+        Description: x[6] with global shape (8, 10) on a two-rank mesh.
+        Expectation: Rank one owns the output with local index two.
         """
-        mesh = self._make_2x2_mesh(mock_platform)
-        self_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        mesh = self._make_1d_mesh(mock_platform)
+        self_layout = _build_layout(mesh, (Shard(0),), 2)
         global_shape = (8, 10)
 
-        key_desc, kind = _key_cache_descriptor(2)
+        key_desc, kind = _key_cache_descriptor(6)
         cache_values = [self_layout, key_desc, global_shape, kind]
 
-        with self.assertRaises(ValueError) as ctx:
-            getitem_op.infer_layout(cache_values)
-        self.assertIn("non-replicate dim 0", str(ctx.exception))
+        result = getitem_op.infer_layout(cache_values)
+        out_layout = result[0][0]
+        owner_rank, local_index, output_global_shape = result[1]
+
+        self.assertEqual(
+            tuple(out_layout.placements),
+            (RaggedShard(dims=(0,), local_units=(0, 1)),),
+        )
+        self.assertEqual(owner_rank, 1)
+        self.assertEqual(local_index, 2)
+        self.assertEqual(output_global_shape, (10,))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_negative_int_on_sharded_dim(self, mock_platform):
+        """Normalize a negative global index before owner and local-index inference."""
+        mesh = self._make_1d_mesh(mock_platform)
+        self_layout = _build_layout(mesh, (Shard(0),), 2)
+        key_desc, kind = _key_cache_descriptor(-1)
+
+        result = getitem_op.infer_layout([self_layout, key_desc, (8, 10), kind])
+        owner_rank, local_index, _ = result[1]
+
+        self.assertEqual(owner_rank, 1)
+        self.assertEqual(local_index, 3)
+        self.assertEqual(
+            tuple(result[0][0].placements),
+            (RaggedShard(dims=(0,), local_units=(0, 1)),),
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sharded_int_rejects_multidimensional_mesh(self, mock_platform):
+        """Reject owner-only RaggedShard indexing when the input mesh is not one-dimensional."""
+        mesh = self._make_2x2_mesh(mock_platform)
+        self_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        key_desc, kind = _key_cache_descriptor(2)
+
+        with self.assertRaisesRegex(ValueError, "non-replicate dim 0"):
+            getitem_op.infer_layout([self_layout, key_desc, (8, 10), kind])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sharded_int_rejects_non_divisible_dim0(self, mock_platform):
+        """Reject owner inference that does not match the current uniform Shard slicing contract."""
+        mesh = self._make_1d_mesh(mock_platform)
+        self_layout = _build_layout(mesh, (Shard(0),), 2)
+        key_desc, kind = _key_cache_descriptor(2)
+
+        with self.assertRaisesRegex(ValueError, "non-replicate dim 0"):
+            getitem_op.infer_layout([self_layout, key_desc, (7, 10), kind])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sharded_int_rejects_scalar_output(self, mock_platform):
+        """Reject one-dimensional input indexing until owner-only scalar placement is defined."""
+        mesh = self._make_1d_mesh(mock_platform)
+        self_layout = _build_layout(mesh, (Shard(0),), 1)
+        key_desc, kind = _key_cache_descriptor(2)
+
+        with self.assertRaisesRegex(ValueError, "non-replicate dim 0"):
+            getitem_op.infer_layout([self_layout, key_desc, (8,), kind])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sharded_int_owner_view_mutates_parent(self, mock_platform):
+        """Wrap the owner row as RaggedShard and preserve storage aliasing through zero_."""
+        mesh = self._make_1d_mesh(mock_platform)
+        self_layout = _build_layout(mesh, (Shard(0),), 2)
+        key_desc, kind = _key_cache_descriptor(6)
+        cache_values = [self_layout, key_desc, (8, 4), kind]
+        infer_result = getitem_op.infer_layout(cache_values)
+        local_parent = torch.arange(16).reshape(4, 4)
+        impl = getitem_op.get_expand_impl(lambda tensor, key: tensor[key], infer_result, cache_values)
+
+        with patch.object(self_layout.mesh, "get_local_rank", return_value=1):
+            local_output = impl(local_parent, 6)
+            result = getitem_op.wrap_output(local_output, infer_result[0])
+            result.zero_()
+
+        self.assertEqual(tuple(result.shape), (4,))
+        self.assertEqual(tuple(result.local_shape), (4,))
+        self.assertTrue(torch.equal(local_parent[2], torch.zeros(4, dtype=local_parent.dtype)))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sharded_int_non_owner_returns_empty_view(self, mock_platform):
+        """Return a valid zero-unit RaggedShard view without changing the non-owner parent."""
+        mesh = self._make_1d_mesh(mock_platform)
+        self_layout = _build_layout(mesh, (Shard(0),), 2)
+        key_desc, kind = _key_cache_descriptor(6)
+        cache_values = [self_layout, key_desc, (8, 4), kind]
+        infer_result = getitem_op.infer_layout(cache_values)
+        local_parent = torch.arange(16).reshape(4, 4)
+        expected_parent = local_parent.clone()
+        impl = getitem_op.get_expand_impl(lambda tensor, key: tensor[key], infer_result, cache_values)
+
+        with patch.object(self_layout.mesh, "get_local_rank", return_value=0):
+            local_output = impl(local_parent, 6)
+            result = getitem_op.wrap_output(local_output, infer_result[0])
+            result.zero_()
+
+        self.assertEqual(tuple(result.shape), (4,))
+        self.assertEqual(tuple(result.local_shape), (0,))
+        self.assertTrue(torch.equal(local_parent, expected_parent))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sharded_int_rejects_non_contiguous_local_tensor(self, mock_platform):
+        """Reject local storage that cannot preserve aliasing through a flat view."""
+        mesh = self._make_1d_mesh(mock_platform)
+        self_layout = _build_layout(mesh, (Shard(0),), 2)
+        key_desc, kind = _key_cache_descriptor(6)
+        cache_values = [self_layout, key_desc, (8, 4), kind]
+        infer_result = getitem_op.infer_layout(cache_values)
+        local_parent = torch.arange(16).reshape(4, 4).t()
+        impl = getitem_op.get_expand_impl(lambda tensor, key: tensor[key], infer_result, cache_values)
+
+        with patch.object(self_layout.mesh, "get_local_rank", return_value=1):
+            with self.assertRaisesRegex(ValueError, "requires a contiguous local tensor"):
+                impl(local_parent, 6)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_partial_slice_on_sharded_dim(self, mock_platform):

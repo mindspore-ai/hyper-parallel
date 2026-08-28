@@ -25,8 +25,11 @@ from rl.utils.monitoring.metrics import (
 from hyper_parallel import HSDPModule, SkipDTensorDispatch, get_platform, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 platform = get_platform()
+
+
 class Actor(platform.Module):
     """Own one policy model and, when trainable, its optimization runtime."""
+
     def __init__(
         self,
         actor_model: platform.Module,
@@ -76,6 +79,7 @@ class Actor(platform.Module):
             self.eval()
         elif device is None:
             raise ValueError("A trainable Actor requires a device")
+
     def sequence_log_probs(
         self,
         sequences: platform.Tensor,
@@ -103,6 +107,7 @@ class Actor(platform.Module):
             dim=-1,
             index=next_token_ids.unsqueeze(-1),
         ).squeeze(-1)
+
     def compute_log_probs(self, experience: ExperienceBatch) -> platform.Tensor:
         """Compute detached policy log-probabilities in response micro-batches."""
         was_training = self.training
@@ -128,6 +133,7 @@ class Actor(platform.Module):
         finally:
             self.train(was_training)
         return platform.cat(chunks, dim=0).detach()
+
     def forward_backward(
         self,
         experience: ExperienceBatch,
@@ -180,6 +186,7 @@ class Actor(platform.Module):
             ).flatten().sum(dim=0),
             clipped_token_count=output.clipped_token_count.detach(),
         )
+
     def update(self, experience: ExperienceBatch) -> ActorUpdateMetrics:
         """Run policy epochs, optimizer steps, and metric finalization."""
         self._require_trainable()
@@ -220,10 +227,12 @@ class Actor(platform.Module):
         return accumulator.finalize(
             learning_rate=float(self.optimizer.param_groups[0]["lr"])
         )
+
     def _require_trainable(self) -> None:
         """Reject optimization calls on an inference-only reference Actor."""
         if self.optimizer is None:
             raise RuntimeError("An inference-only reference Actor cannot be updated")
+
     def _validate_experience(self, experience: ExperienceBatch) -> int:
         """Validate token-aligned fields required by policy optimization."""
         sequences = experience.sequences
@@ -272,6 +281,7 @@ class Actor(platform.Module):
                     f"expected={expected_shape}, got={tuple(reference_log_probs.shape)}"
                 )
         return response_count
+
     def _global_token_count(self, action_mask: platform.Tensor) -> int:
         """All-reduce the valid action-token count used for loss scaling."""
         count = platform.tensor(
@@ -285,11 +295,13 @@ class Actor(platform.Module):
         if result <= 0:
             raise RuntimeError("Actor update has no valid action tokens on any rank")
         return result
+
     def _set_gradient_sync(self, is_last_micro_batch: bool) -> None:
         """Enable HSDP gradient synchronization for the final micro-batch."""
         if isinstance(self.actor_model, HSDPModule):
             self.actor_model.set_requires_gradient_sync(is_last_micro_batch)
             self.actor_model.set_is_last_backward(is_last_micro_batch)
+
     def _optimizer_step(self) -> float:
         """Synchronize streams, clip gradients, and update Actor parameters."""
         hsdp_sync_stream()

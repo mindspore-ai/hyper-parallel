@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=undefined-all-variable
 """SAPP-PPB: Symbolic Automatic Parallel Planner - Pipeline Parallelism Balancing.
 
 Offline ILP planner for automatically generating layer distribution and
 recomputation policies across pipeline parallel stages.
 """
-# pylint: disable=invalid-name,undefined-all-variable
 
-from importlib import import_module as _import_module
-import sys as _sys
-
-_sys.modules.setdefault("sapp_ppb", _sys.modules[__name__])
+from importlib import import_module as _import_module  # pylint: disable=invalid-name
 
 __all__ = [
     "SappPipeline",
@@ -37,6 +34,10 @@ __all__ = [
     "build_arg_parser",
     "run",
     "main",
+    "LayerBuilder",
+    "SAPP_PPB_AVAILABLE",
+    "PPSimulator",
+    "PPBalancer",
 ]
 
 _EXPORTS = {
@@ -52,10 +53,14 @@ _EXPORTS = {
     "build_arg_parser": ".run_pipeline_balance",
     "run": ".run_pipeline_balance",
     "main": ".run_pipeline_balance",
+    "LayerBuilder": ".pp_config_builder.layer_loader",
+    "SAPP_PPB_AVAILABLE": ".pp_config_builder.layer_loader",
+    "PPSimulator": ".pp_sim_adapter",
+    "PPBalancer": ".pp_modeling.pp_balancer",
 }
 
 
-def __getattr__(name):
+def __getattr__(name):  # pylint: disable=invalid-name
     """Lazily import public SAPP-PPB interfaces."""
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

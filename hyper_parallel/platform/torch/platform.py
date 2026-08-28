@@ -14,7 +14,7 @@
 # ============================================================================
 """Torch platform api"""
 from datetime import timedelta
-from typing import Optional, Any, Union
+from typing import Any, Callable, Optional, Sequence, Union
 import dataclasses
 from collections import OrderedDict
 
@@ -378,6 +378,81 @@ class _TorchP2PExchangeFunction(torch.autograd.Function):
         return recv_buf, None, None
 
 
+class _TorchDifferentiableVariableAllGather(torch.autograd.Function):
+    """Variable dim-zero all-gather with an uneven reduce-scatter backward."""
+
+    @staticmethod
+    def forward(ctx, input_tensor, output_splits, group):  # pylint: disable=arguments-differ
+        """Gather each rank's true row count without replicating inputs for A2A."""
+        if input_tensor.ndim == 0:
+            raise ValueError("variable all-gather input must have at least one dimension")
+        splits = tuple(output_splits)
+        if not splits:
+            raise ValueError("output_splits must contain at least one group rank")
+        if any(not isinstance(rows, int) or isinstance(rows, bool) or rows < 0 for rows in splits):
+            raise ValueError(f"output_splits must contain non-negative integers, got {splits!r}")
+
+        group_rank = dist.get_rank(group=group)
+        if group_rank < 0 or group_rank >= len(splits):
+            raise ValueError(f"group rank must be in [0, {len(splits)}), got {group_rank}")
+        if input_tensor.shape[0] != splits[group_rank]:
+            raise ValueError(
+                "variable all-gather local rows must match output_splits at the group rank, "
+                f"got local_rows={input_tensor.shape[0]}, group_rank={group_rank}, "
+                f"output_splits={splits!r}"
+            )
+
+        input_tensor = input_tensor.contiguous()
+        feature_shape = tuple(input_tensor.shape[1:])
+        if input_tensor.device.type == "npu":
+            gathered = [input_tensor.new_empty((rows, *feature_shape)) for rows in splits]
+            dist.all_gather(gathered, input_tensor, group=group)
+        else:
+            max_rows = max(splits)
+            if max_rows == 0:
+                gathered = [input_tensor.new_empty((0, *feature_shape)) for _ in splits]
+            else:
+                padded = input_tensor.new_zeros((max_rows, *feature_shape))
+                if input_tensor.shape[0] > 0:
+                    padded[:input_tensor.shape[0]].copy_(input_tensor)
+                padded_outputs = [torch.empty_like(padded) for _ in splits]
+                dist.all_gather(padded_outputs, padded, group=group)
+                gathered = [
+                    output[:rows].contiguous()
+                    for output, rows in zip(padded_outputs, splits)
+                ]
+
+        ctx.output_splits = splits
+        ctx.group = group
+        ctx.group_rank = group_rank
+        return torch.cat(gathered, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Sum replicated output gradients and return this rank's uneven shard."""
+        output_rows = ctx.output_splits[ctx.group_rank]
+        output = grad_output.new_empty((output_rows, *grad_output.shape[1:]))
+        if sum(ctx.output_splits) == 0:
+            return output, None, None
+
+        grad_output = grad_output.contiguous()
+        if grad_output.device.type == "npu":
+            from torch_npu.distributed import reduce_scatter_tensor_uneven  # pylint: disable=C0415
+            reduce_scatter_tensor_uneven(
+                output,
+                grad_output,
+                input_split_sizes=list(ctx.output_splits),
+                op=dist.ReduceOp.SUM,
+                group=ctx.group,
+            )
+        else:
+            reduced = grad_output.clone()
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=ctx.group)
+            start = sum(ctx.output_splits[:ctx.group_rank])
+            output.copy_(reduced.narrow(0, start, output_rows))
+        return output, None, None
+
+
 # Mapping from string op names to torch.distributed.ReduceOp
 _OP_MAP = {
     'sum': dist.ReduceOp.SUM,
@@ -401,8 +476,10 @@ else:
 
 def _ensure_contiguous(x):
     """Return a contiguous copy of *x* if not already contiguous."""
+    if torch.compiler.is_compiling():
+        return x.contiguous()
     if not x.is_contiguous() or x.storage_offset() != 0:
-        x = x.contiguous()
+        return x.contiguous()
     return x
 
 
@@ -460,6 +537,14 @@ class TorchPlatform(Platform):
             from hyper_parallel.platform.torch.custom_ops import TorchCustomOps  # pylint: disable=import-outside-toplevel
             self._custom_ops_cls = TorchCustomOps
         return self._custom_ops_cls
+
+    @staticmethod
+    def get_swap_optimizer():
+        """Return the Torch optimizer-state swap wrapper class."""
+        from hyper_parallel.platform.torch.swap_optimizer.swap_optimizer import (  # pylint: disable=import-outside-toplevel
+            get_swap_optimizer,
+        )
+        return get_swap_optimizer()
 
     @staticmethod
     def is_linear_module(module) -> bool:
@@ -559,18 +644,19 @@ class TorchPlatform(Platform):
         return torch.manual_seed(seed)
 
     @staticmethod
-    def ones(size, dtype=None):
+    def ones(size, dtype=None, device=None):
         """
         Create a tensor filled with ones.
 
         Args:
             size (tuple): The shape of the output tensor.
             dtype (Optional[torch.dtype]): The desired data type.
+            device (Optional[torch.device]): The device to create the tensor on.
 
         Returns:
             Tensor: A tensor filled with ones.
         """
-        return torch.ones(size, dtype=dtype)
+        return torch.ones(size, dtype=dtype, device=device)
 
     @staticmethod
     def zeros(size, dtype=None, device=None):
@@ -925,77 +1011,17 @@ class TorchPlatform(Platform):
         return cell.named_buffers()
 
     @staticmethod
-    def get_model_state_dict(
-        model: Any,
-        *,
-        options: Any = None,
-        full_state_dict: Optional[bool] = None,
-        cpu_offload: Optional[bool] = None,
-    ) -> dict[str, Any]:
+    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
         """Get the state dictionary of a model.
 
         Delegates to torch-specific implementation that handles DTensor
         gathering, CPU offloading and frozen-parameter filtering.
-
-        Args:
-            model: Model whose state is requested.
-            options: Optional Torch-native ``StateDictOptions``.
-            full_state_dict: Optional backend-neutral full-state selection.
-            cpu_offload: Optional backend-neutral output placement selection.
-
-        Returns:
-            The requested model state dictionary.
-
-        Raises:
-            ValueError: If native options and backend-neutral flags are mixed.
         """
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
             get_model_state_dict as _get_model_state_dict,
         )
-        if options is not None and (full_state_dict is not None or cpu_offload is not None):
-            raise ValueError(
-                "get_model_state_dict accepts either options or backend-neutral flags, not both"
-            )
-        if full_state_dict is not None or cpu_offload is not None:
-            from torch.distributed.checkpoint.state_dict import StateDictOptions  # pylint: disable=C0415
-
-            options = StateDictOptions(
-                full_state_dict=bool(full_state_dict),
-                cpu_offload=bool(cpu_offload),
-            )
         return _get_model_state_dict(model, options=options)
-
-    @staticmethod
-    def get_tensor_ipc_rebuild_args(tensor: Any) -> tuple[Any, ...]:
-        """Share tensor storage and return Torch multiprocessing rebuild arguments."""
-        # pylint: disable=C0415
-        from torch.multiprocessing.reductions import reduce_tensor
-
-        _, rebuild_args = reduce_tensor(tensor)
-        return rebuild_args
-
-    @staticmethod
-    def gather_state_dict(state_dict: dict[str, Any], *, cpu_offload: bool = False) -> dict[str, Any]:
-        """Gather a prevalidated Torch state dictionary on every rank."""
-        # pylint: disable=C0415
-        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import _gather_full_state_dict
-
-        return _gather_full_state_dict(state_dict, cpu_offload)
-
-    @staticmethod
-    def get_tensor_distribution_spec(tensor: Any) -> tuple[Any, ...]:
-        """Describe the mesh and placements that determine Torch collectives."""
-        if not isinstance(tensor, DTensorBase):
-            return ("tensor",)
-        mesh = tensor.device_mesh
-        return (
-            "dtensor",
-            str(mesh.device_type),
-            tuple(mesh.mesh_shape),
-            tuple(mesh.rank_list),
-            tuple(repr(placement) for placement in tensor.placements),
-        )
 
     @staticmethod
     def set_model_state_dict(model: Any, model_state_dict: dict[str, Any], *, options: Any = None) -> None:
@@ -1225,6 +1251,14 @@ class TorchPlatform(Platform):
             ``[sum(output_splits), *input_tensor.shape[1:]]``.
         """
         return _AsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
+
+    @staticmethod
+    def differentiable_variable_all_gather(
+            input_tensor: Tensor, output_splits: Sequence[int], group: Any) -> Tensor:
+        """Gather variable dim-zero shards on HCCL or Gloo with autograd support."""
+        return _TorchDifferentiableVariableAllGather.apply(
+            input_tensor, tuple(output_splits), group
+        )
 
     @staticmethod
     def wait_async_tensor(tensor):
@@ -1524,11 +1558,6 @@ class TorchPlatform(Platform):
         device = self.get_device_handle()
         return device.current_stream()
 
-    @staticmethod
-    def move_to_device(tensor, device, non_blocking=False):
-        """Move a tensor to the target device."""
-        return tensor.to(device=device, non_blocking=non_blocking)
-
     def new_event(self):
         device = self.get_device_handle()
         return device.Event()
@@ -1538,13 +1567,61 @@ class TorchPlatform(Platform):
 
     @property
     def checkpoint(self):
-        return torch.utils.checkpoint.checkpoint
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import checkpoint
+        return checkpoint
+
+    @staticmethod
+    def recompute_handle_collector_ctx():
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import recompute_handle_collector_ctx
+        return recompute_handle_collector_ctx()
+
+    @staticmethod
+    def recompute_handle(handle, session_id):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import recompute_handle
+        return recompute_handle(handle, session_id)
+
+    @staticmethod
+    def recompute_session_ctx(session_id, retain_on_unpack=False):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import recompute_session_ctx
+        return recompute_session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack)
+
+    @staticmethod
+    def clear_recompute_session(session_id):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import clear_recompute_session
+        return clear_recompute_session(session_id)
+
+    @staticmethod
+    def is_compiling() -> bool:
+        """Return whether execution is currently captured by ``torch.compile``."""
+        return torch.compiler.is_compiling()
 
     @staticmethod
     def checkpoint_wrapper(module, **checkpoint_kwargs):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.checkpoint_wrapper import ckpt_wrapper
         return ckpt_wrapper(module, **checkpoint_kwargs)
+
+    @staticmethod
+    def checkpoint_exclude_wrapper(module: Any, *, save_output: bool = True) -> Any:
+        """Wrap a module or callable whose activations should not be recomputed.
+
+        Args:
+            module: PyTorch Module or callable to exclude from checkpoint replay.
+            save_output: Whether to retain the excluded region output for replay.
+
+        Returns:
+            The platform-specific checkpoint exclusion wrapper.
+        """
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint_exclude_wrapper import (
+            checkpoint_exclude_wrapper,
+        )
+        return checkpoint_exclude_wrapper(module, save_output=save_output)
 
     @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):
@@ -1569,16 +1646,25 @@ class TorchPlatform(Platform):
         return noop_context_fn
 
     @staticmethod
+    def ignore_sac_ops(ignore_ops: list[object | None]) -> None:
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.sac import ignore_sac_ops
+        ignore_sac_ops(ignore_ops)
+
+    @staticmethod
     def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.sac import create_selective_checkpoint_contexts
         return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation, group_swap)
 
     @staticmethod
-    def ignore_sac_ops(ops: list[object | None]) -> None:
+    def create_native_selective_checkpoint_contexts(policy_fn: Callable) -> Any:
+        """Create Torch-native selective-checkpoint contexts for compile."""
         # pylint: disable=C0415
-        from hyper_parallel.platform.torch.activation_checkpoint.sac import ignore_sac_ops
-        ignore_sac_ops(ops)
+        from hyper_parallel.platform.torch.activation_checkpoint.native_compile import (
+            create_native_selective_checkpoint_contexts,
+        )
+        return create_native_selective_checkpoint_contexts(policy_fn)
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):

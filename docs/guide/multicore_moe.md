@@ -21,8 +21,10 @@ HyperParallel 提供芯片内多核 MPMD 并行能力，结合核级内存语义
 | `ops/` | 多核并行算子 |
 | `scheduler/` | 多核并行调度器 |
 | `tasks/` | 任务编排 |
-| `platform/` | 平台抽象 |
-| `prebuild/` | 预构建 |
+| `platform/` | MindSpore/PyTorch ABI adapter |
+
+源码构建生成一个同时包含正反向 kernel 的
+`hyper_parallel_multicore_nn` vendor，并与构建解释器对应的 Python ABI 框架 adapter 一起进入 wheel 或本地 native payload。
 
 ---
 
@@ -42,6 +44,19 @@ mc.mega_moe_grad(...)
 ```
 
 完整的参数说明、RuntimeConfig 生成方式与编译步骤见下方详细文档。
+
+源码开发态通过统一入口完成依赖准备和 native 构建：
+
+```bash
+./build.sh --multicore mindspore --shmem mindspore --custom-ops off
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+python your_program.py
+```
+
+同一次构建也会生成 wheel；默认复用依赖和编译缓存，必要时使用 `--clean` 重编所选组件。
+必须在启动 Python、导入 MindSpore/Torch/torch_npu 之前 source `set_env.bash`，设置 CANN custom OPP
+所需路径。
 
 ---
 

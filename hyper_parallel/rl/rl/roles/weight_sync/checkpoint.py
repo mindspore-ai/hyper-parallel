@@ -24,8 +24,7 @@ from typing import Any, Callable, Mapping, Optional
 import yaml
 
 from rl.utils.monitoring.config import sanitize_config
-
-from hyper_parallel import get_platform
+from hyper_parallel import SkipDTensorDispatch, get_platform
 from hyper_parallel.core.distributed_checkpoint import (
     load as dcp_load,
     save as dcp_save,
@@ -35,8 +34,34 @@ platform = get_platform()
 logger = logging.getLogger(__name__)
 
 
+def _clone_shared_checkpoint_tensors(
+    state_dict: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[tuple[str, str], ...]]:
+    """Detach duplicate tensor storage while preserving every checkpoint key."""
+    storage_owners: dict[tuple[str, int], str] = {}
+    cloned_aliases = []
+    for name, value in state_dict.items():
+        data_ptr = getattr(value, "data_ptr", None)
+        numel = getattr(value, "numel", None)
+        clone = getattr(value, "clone", None)
+        if not callable(data_ptr) or not callable(numel) or not callable(clone):
+            continue
+        if int(numel()) == 0:
+            continue
+        pointer = int(data_ptr())
+        if pointer == 0:
+            continue
+        storage_key = (str(getattr(value, "device", "unknown")), pointer)
+        owner = storage_owners.setdefault(storage_key, name)
+        if owner == name:
+            continue
+        state_dict[name] = clone()
+        cloned_aliases.append((name, owner))
+    return state_dict, tuple(cloned_aliases)
+
+
 class RLCheckpointManager:
-    """Compose HyperModels checkpoint IO with RL completion metadata."""
+    """Compose HyperAutoModel checkpoint IO with RL completion metadata."""
 
     def __init__(
         self,
@@ -99,14 +124,12 @@ class RLCheckpointManager:
                 )
             rank_state = checkpoint_dir / f"rank_{platform.get_rank()}"
             if not rank_state.is_dir():
-                raise RuntimeError(
-                    f"Checkpoint rank-local state is missing: {rank_state}"
-                )
+                raise RuntimeError(f"Checkpoint rank-local state is missing: {rank_state}")
 
         self.run_synchronized("checkpoint resume preflight", validate_files)
 
     def begin(self, state: Any) -> None:
-        """Restore policy, optimizer, scheduler, and progress state."""
+        """Restore policy, optimizer, scheduler, RNG, dataloader, and progress state."""
         if not self.load_path:
             return
         checkpoint_dir = Path(self.load_path)
@@ -188,14 +211,24 @@ class RLCheckpointManager:
         self.invalidate(step)
         checkpoint_dir = self.directory(step)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_state = {"model": self.trainer.model.state_dict()}
+        model_state, cloned_aliases = _clone_shared_checkpoint_tensors(
+            self.trainer.model.state_dict()
+        )
+        if cloned_aliases and platform.get_rank() == 0:
+            logger.info(
+                "Cloned shared checkpoint storage for tied aliases: %s",
+                cloned_aliases,
+            )
+        checkpoint_state = {"model": model_state}
         dcp_save(
             checkpoint_state,
             checkpoint_id=checkpoint_dir,
             use_collectives=True,
         )
+        del checkpoint_state, model_state
+
         def save_rank_state() -> None:
-            """Persist RNG, scheduler, and dataloader state independently per rank."""
+            """Persist RNG, scheduler, optimizer, and dataloader state per rank."""
             rank_state = {
                 "cpu_rng": platform.get_rng_state(),
                 "device_rng": platform.get_rng_state(
@@ -207,7 +240,7 @@ class RLCheckpointManager:
             if self.trainer.lr_scheduler is not None:
                 rank_state["scheduler"] = self.trainer.lr_scheduler.state_dict()
             if self.trainer.optimizer is not None:
-                rank_state["optimizer"] = self.trainer.optimizer.state_dict()
+                rank_state["optimizer"] = self._optimizer_state_dict()
             dcp_save(
                 {"runtime": pickle.dumps(rank_state)},
                 checkpoint_id=checkpoint_dir / f"rank_{platform.get_rank()}",
@@ -216,6 +249,11 @@ class RLCheckpointManager:
 
         self.run_synchronized("checkpoint rank-state save", save_rank_state)
         self._write_metadata(checkpoint_dir, state)
+
+    def _optimizer_state_dict(self) -> dict[str, Any]:
+        """Export optimizer state without dispatching its fused initialization step."""
+        with SkipDTensorDispatch():
+            return self.trainer.optimizer.state_dict()
 
     def _write_metadata(self, checkpoint_dir: Path, state: Any) -> None:
         """Persist resolved configuration and publish the completion marker."""

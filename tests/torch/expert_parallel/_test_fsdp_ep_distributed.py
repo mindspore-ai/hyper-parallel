@@ -37,10 +37,10 @@ Configuration for all tests:
 import torch
 import torch.distributed as dist
 
-import torch_npu  # noqa: F401 — Ascend NPU
+import torch_npu  # noqa: F401  # pylint: disable=unused-import
 
 from hyper_parallel import init_device_mesh, fully_shard
-from hyper_parallel.platform.torch.common import FeedForward, MoE
+from hyper_parallel.platform.torch.common import MoE
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from tests.torch.utils import init_dist
 
@@ -163,15 +163,11 @@ def test_fsdp_ep_three_step_training_npu():
     Expectation: FSDP+EP loss matches standalone loss within rtol=1e-3, atol=1e-3.
 
     Note:
-        Two sources inflate the FSDP+EP gradient relative to standalone:
-          * EP AlltoAllV duplicates each token ep_size times so every expert
-            processes ep_size × more tokens (and accumulates ep_size × gradient).
-          * fully_shard's default reduce-op is SUM (not AVG) whenever any managed
-            parameter is a DTensor, which is the case here because ExpertParallel
-            converts expert weights to DTensors.  reduce_scatter on the FSDP dim
-            therefore sums (not averages) across fsdp_size replicas.
-        The combined factor is fsdp_size × ep_size = world_size, so dividing the
-        backward loss by world_size matches the standalone loss trajectory.
+        EP AlltoAllV duplicates each token ep_size times, so every expert
+        processes ep_size times more tokens and accumulates ep_size times the
+        gradient. fully_shard's default AVG reduction already normalizes across
+        the FSDP dimension. Therefore, only the EP duplication needs compensation,
+        and dividing the backward loss by ep_size matches the standalone trajectory.
 
     Configuration:
         - num_proc: 4 (2 FSDP × 2 EP)
@@ -190,7 +186,7 @@ def test_fsdp_ep_three_step_training_npu():
 
     fsdp_size = 2
     ep_size = 2
-    grad_scale = fsdp_size * ep_size
+    grad_scale = ep_size
 
     mesh = init_device_mesh(
         device_type="npu",

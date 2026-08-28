@@ -120,7 +120,7 @@ class HSDPMeshInfo(FSDPMeshInfo, DDPMeshInfo):
 
 
 @dataclass(frozen=True)
-class TPShardMetaInfo:
+class SourceShardMetaInfo:
     """Describe a parameter's source TP/EP layout before fully_shard."""
 
     mesh: DeviceMesh

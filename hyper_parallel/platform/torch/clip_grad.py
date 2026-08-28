@@ -178,7 +178,8 @@ def _get_param_mesh_info(
     Checks the *gradient's* spec first; falls back to the *parameter's*
     spec when the gradient is a plain tensor on a DTensor parameter
     (common after FSDP/HSDP backward where ``param.grad`` is stored as
-    the local shard tensor).
+    the local shard tensor). A plain production-TP Parameter may instead
+    retain its original Layout in ``_sharding_spec``.
 
     Returns ``(mesh, shard_dims, partial_info)`` where *partial_info*
     is a tuple of ``(mesh_dim, dist.ReduceOp, needs_manual_avg)``
@@ -187,21 +188,29 @@ def _get_param_mesh_info(
     requested but the backend lacks ``dist.ReduceOp.AVG`` support.
     """
     grad = _get_grad_obj(param)
-    # Prefer grad's spec (most accurate); fall back to param's.
+    # Prefer grad's spec (most accurate); fall back to the parameter or the
+    # layout retained when production TP unwraps a DTensor Parameter.
     spec_source = grad if isinstance(grad, DTensor) else param
-    if not isinstance(spec_source, DTensor):
-        return None, (), ()
+    if isinstance(spec_source, DTensor):
+        placements = spec_source.placements
+        device_mesh = spec_source.device_mesh
+    else:
+        layout = getattr(param, "_sharding_spec", None)
+        if layout is None:
+            return None, (), ()
+        placements = layout.placements
+        device_mesh = layout.mesh
 
     shard_dims = tuple(
-        i for i, p in enumerate(spec_source.placements)
+        i for i, p in enumerate(placements)
         if p.is_shard()
     )
     partial_info = tuple(
         (i, *_str_to_reduce_op(p.reduce_op))
-        for i, p in enumerate(spec_source.placements)
+        for i, p in enumerate(placements)
         if isinstance(p, Partial)
     )
-    return spec_source.device_mesh, shard_dims, partial_info
+    return device_mesh, shard_dims, partial_info
 
 
 def _sum_p_norms(

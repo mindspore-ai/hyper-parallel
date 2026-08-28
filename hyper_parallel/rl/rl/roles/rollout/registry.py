@@ -18,11 +18,17 @@ from rl.registry import Registry
 from rl.roles.model import ModelRegistration
 from rl.roles.rollout.base import GenerationEngine
 RolloutEngineBuilder = Callable[..., GenerationEngine]
+
+
 class RolloutEngineRegistry(Registry[RolloutEngineBuilder]):
     """Registry specialized only by its public error label."""
+
     def __init__(self) -> None:
+        """Create the rollout registry with its public error label."""
         super().__init__("rollout engine")
 ROLLOUT_ENGINES = RolloutEngineRegistry()
+
+
 def build_rollout_engine(
     config: Mapping[str, Any],
     model: ModelRegistration,

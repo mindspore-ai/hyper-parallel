@@ -20,6 +20,8 @@ from rl.dataset.contracts import ExperienceBatch
 from hyper_parallel import get_platform
 platform = get_platform()
 _GIB = 1024 ** 3
+
+
 @dataclass(frozen=True)
 class ActorMicroBatchMetrics:
     """Detached token sums produced by one Actor forward/backward call."""
@@ -29,6 +31,8 @@ class ActorMicroBatchMetrics:
     old_policy_kl_sum: Any
     log_ratio_abs_sum: Any
     clipped_token_count: Any
+
+
 @dataclass(frozen=True)
 class ActorUpdateMetrics:
     """Globally reduced diagnostics from one Actor update."""
@@ -42,6 +46,8 @@ class ActorUpdateMetrics:
     learning_rate: float
     valid_tokens: int
     optimizer_steps: int
+
+
 @dataclass(frozen=True)
 class CriticUpdateMetrics:
     """Globally reduced diagnostics from one Critic update."""
@@ -50,8 +56,11 @@ class CriticUpdateMetrics:
     learning_rate: float
     valid_tokens: int
     optimizer_steps: int
+
+
 class ActorMetricAccumulator:
     """Accumulate detached Actor statistics without controlling optimization."""
+
     def __init__(self, totals: Any, dp_group_info: Any, dp_size: int) -> None:
         """Initialize detached metric totals and data-parallel reduction metadata."""
         self._totals = totals
@@ -60,6 +69,7 @@ class ActorMetricAccumulator:
         self._global_tokens = 0
         self._gradient_norm_sum = 0.0
         self._optimizer_steps = 0
+
     @classmethod
     def create(
         cls,
@@ -73,6 +83,7 @@ class ActorMetricAccumulator:
             raise ValueError(f"dp_size must be positive, got {dp_size}")
         totals = zero.new_zeros((6,), dtype=platform.tensor_dtype.float32)
         return cls(totals, dp_group_info, dp_size)
+
     def add_micro_batch(self, metrics: ActorMicroBatchMetrics) -> None:
         """Add detached loss and diagnostic sums from one micro-batch."""
         values = (
@@ -86,6 +97,7 @@ class ActorMetricAccumulator:
         self._totals.add_(
             platform.cat(tuple(value.detach().reshape(1) for value in values), dim=0)
         )
+
     def add_optimizer_step(self, *, global_tokens: int, gradient_norm: float) -> None:
         """Record one optimizer step and its global token denominator."""
         if global_tokens <= 0:
@@ -93,6 +105,7 @@ class ActorMetricAccumulator:
         self._global_tokens += global_tokens
         self._gradient_norm_sum += gradient_norm
         self._optimizer_steps += 1
+
     def finalize(self, *, learning_rate: float) -> ActorUpdateMetrics:
         """Reduce token sums and return public Actor update metrics."""
         if self._optimizer_steps <= 0 or self._global_tokens <= 0:
@@ -113,6 +126,8 @@ class ActorMetricAccumulator:
             valid_tokens=self._global_tokens,
             optimizer_steps=self._optimizer_steps,
         )
+
+
 def _system_memory_metrics() -> dict[str, float]:
     """Read peak device memory metrics when the backend exposes them."""
     handle = platform.get_device_handle(platform.device_type())
@@ -125,6 +140,8 @@ def _system_memory_metrics() -> dict[str, float]:
         "system/max_memory_allocated_gb": allocated,
         "system/max_memory_reserved_gb": reserved,
     }
+
+
 def build_training_metrics(
     *,
     step: int,
@@ -167,7 +184,37 @@ def build_training_metrics(
         metrics["policy/fingerprint_changed"] = float(
             bool(policy.policy_fingerprint_changed)
         )
+        configured_strategy = getattr(
+            policy,
+            "weight_sync_configured_strategy",
+            None,
+        )
+        last_strategy = getattr(policy, "weight_sync_last_strategy", None)
+        metrics.update(
+            {
+                "weight_sync/configured_direct_reshard": float(
+                    configured_strategy == "direct_reshard"
+                ),
+                "weight_sync/configured_full_gather": float(
+                    configured_strategy == "full_gather"
+                ),
+                "weight_sync/last_direct_reshard": float(
+                    last_strategy == "direct_reshard"
+                ),
+                "weight_sync/last_full_gather": float(
+                    last_strategy == "full_gather"
+                ),
+                "weight_sync/fallback_count": float(
+                    getattr(policy, "weight_sync_fallback_count", 0)
+                ),
+                "weight_sync/direct_success_count": float(
+                    getattr(policy, "weight_sync_direct_success_count", 0)
+                ),
+            }
+        )
     return metrics
+
+
 def _local_statistics(values: Any) -> tuple[int, float, float, float, float]:
     """Return mergeable count, sum, squared sum, minimum, and maximum."""
     values = values.detach().float()
@@ -181,11 +228,15 @@ def _local_statistics(values: Any) -> tuple[int, float, float, float, float]:
         float(values.min().item()),
         float(values.max().item()),
     )
+
+
 def _masked_statistics(values: Optional[Any], mask: Any) -> tuple[int, float, float, float, float]:
     """Build local statistics from valid action positions."""
     if values is None:
         return 0, 0.0, 0.0, math.inf, -math.inf
     return _local_statistics(values.detach().float().masked_select(mask))
+
+
 def _merge_statistics(
     records: list[dict[str, Any]],
     key: str,
@@ -206,6 +257,8 @@ def _merge_statistics(
         "min": min(float(record[key][3]) for record in records if record[key][0]),
         "max": max(float(record[key][4]) for record in records if record[key][0]),
     }
+
+
 def _pearson_correlation(
     left: dict[str, float],
     right: dict[str, float],
@@ -218,6 +271,8 @@ def _pearson_correlation(
     right_scale = count * right["square_sum"] - right["sum"] ** 2
     denominator = math.sqrt(max(left_scale * right_scale, 0.0))
     return covariance / denominator if denominator > 0.0 else float("nan")
+
+
 def _add_distribution_metrics(
     metrics: dict[str, float],
     prefix: str,
@@ -390,6 +445,8 @@ def summarize_training_diagnostics(
         return {"training/rollout_probs_diff_valid": 0.0}
     _add_target_diagnostics(metrics, records)
     return metrics
+
+
 def select_round_robin_samples(
     records: list[dict[str, Any]],
     limit: int,
@@ -524,7 +581,7 @@ def summarize_rollout(
     step: int,
     sample_limit: int,
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
-    """Gather rollout diagnostics and bounded samples on rank zero."""
+    """Gather rollout metrics and bounded samples on rank zero."""
     rank = platform.get_rank()
     local = _local_rollout_record(
         rollout,
@@ -538,6 +595,8 @@ def summarize_rollout(
         return {}, []
     records = [record for record in gathered if record is not None]
     return _rollout_metrics(records), select_round_robin_samples(records, sample_limit)
+
+
 def enforce_learning_gate(
     metrics: Mapping[str, float],
     *,
@@ -548,6 +607,7 @@ def enforce_learning_gate(
     """Fail numerical acceptance runs when configured invariants are absent."""
     if not bool(config.get("enabled", False)):
         return
+
     def validate() -> None:
         """Validate rank-zero learning evidence before synchronized publication."""
         if platform.get_rank() != 0:

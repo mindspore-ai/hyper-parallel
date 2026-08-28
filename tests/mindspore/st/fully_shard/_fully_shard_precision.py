@@ -14,7 +14,7 @@
 # ============================================================================
 """Pure fully_shard precision cases (MindSpore ST).
 
-A fully_shard SlimLeNet16 and an identical single-card reference (built via
+A fully_shard SlimLeNet16, including its uneven 513-row parameters, and an identical single-card reference (built via
 init_empty_weights + in-process load) are trained for several optimizer steps on the same
 data; each step accumulates gradients in sharded form (grad sync on every micro-batch) and
 the reference's full gradient is compared against each rank's gradient shard (see
@@ -92,74 +92,19 @@ def _assert_comm_fusion_state(net, enabled):
     found_fused_group = False
     for mod in modules:
         state = mod.hsdp_scheduler.hsdp_state
-        assert state.config.comm_fusion == enabled, (
-            f"{type(mod).__name__} comm_fusion mismatch: expected {enabled}, got {state.config.comm_fusion}"
+        actual = state.comm_fusion_policy.enable_comm_fusion
+        assert actual == enabled, (
+            f"{type(mod).__name__} comm_fusion mismatch: expected {enabled}, got {actual}"
         )
-        param_group = getattr(state, "param_group", None)  # absent when comm_fusion is off
+        param_group = state.param_group
         if not enabled:
             assert param_group is None
         elif state.hsdp_params:
             assert param_group is not None, f"{type(mod).__name__} has sharded params but no fused group"
+            assert param_group.enable_zero_copy is False, "MindSpore communication fusion must use copy-in"
             found_fused_group = True
     if enabled:
         assert found_fused_group, "expected at least one fused param_group when comm_fusion=True"
-
-
-def _tensor_storage_info(tensor):
-    """Return raw storage pointer and byte size for a MindSpore tensor."""
-    storage = tensor.untyped_storage()
-    return storage.data_ptr(), storage.size()
-
-
-def _assert_comm_fusion_flat_buffer_memory(net, optimizer):
-    """Verify comm_fusion keeps each sharded parameter storage in its flat buffer."""
-    modules = [net, net.dense_relu_sequential[0], net.dense_relu_sequential[2], net.dense_relu_sequential[4]]
-    optimizer_param_ids = {id(param) for param in optimizer.parameters}
-    found_flat_buffer = False
-
-    ms.runtime.synchronize()
-    allocated = ms.runtime.memory_allocated()
-    for mod in modules:
-        state = mod.hsdp_scheduler.hsdp_state
-        param_group = getattr(state, "param_group", None)
-        if param_group is None or not state.hsdp_params:
-            continue
-        flat_buffer = param_group._flat_param_buffer  # pylint: disable=protected-access
-        if flat_buffer is None:
-            continue
-
-        found_flat_buffer = True
-        flat_ptr, flat_nbytes = _tensor_storage_info(flat_buffer)
-        unique_storage_nbytes = {flat_ptr: flat_nbytes}
-        non_flat_storages = []
-        for hsdp_param in state.hsdp_params:
-            param_fqn = getattr(hsdp_param, "_param_fqn", "<unknown>")
-            if id(hsdp_param.sharded_param) not in optimizer_param_ids:
-                raise AssertionError(f"Optimizer does not hold managed parameter {param_fqn}.")
-
-            local_tensor = hsdp_param.sharded_param._local_tensor  # pylint: disable=protected-access
-            checked_tensors = (
-                ("_sharded_param_data", hsdp_param._sharded_param_data),  # pylint: disable=protected-access
-                ("sharded_param._local_tensor", local_tensor),
-                ("sharded_param", hsdp_param.sharded_param),
-            )
-            for label, tensor in checked_tensors:
-                storage_ptr, storage_nbytes = _tensor_storage_info(tensor)
-                unique_storage_nbytes[storage_ptr] = storage_nbytes
-                if storage_ptr != flat_ptr:
-                    non_flat_storages.append((param_fqn, label, storage_ptr, storage_nbytes))
-
-        param_storage_nbytes = sum(unique_storage_nbytes.values())
-        if non_flat_storages or param_storage_nbytes != flat_nbytes:
-            raise AssertionError(
-                "MindSpore comm_fusion zero-copy should leave managed sharded parameter storage backed only by "
-                f"flat_param_buffer after fully_shard. memory_allocated={allocated}, "
-                f"flat_param_buffer_nbytes={flat_nbytes}, managed_param_storage_nbytes={param_storage_nbytes}, "
-                f"unique_storage_nbytes={unique_storage_nbytes}, non_flat_storages={non_flat_storages}."
-            )
-
-    assert found_flat_buffer, "expected at least one flat_param_buffer when comm_fusion=True"
-
 
 def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion, comm_fusion_zero_copy=None):
     """Build a fully_shard SlimLeNet16 matching the reference via init_empty_weights + in-process load."""
@@ -190,23 +135,6 @@ def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion, comm_fus
     if recompute:
         _apply_recompute(net)
     return net
-
-
-def _assert_comm_fusion_zero_copy_lazy_init_memory(state_dict, mesh, rank_slice):
-    """Exercise MindSpore comm_fusion zero-copy lazy init and assert flat-buffer storage ownership."""
-    zero_copy_net = _build_fully_shard_net(
-        state_dict,
-        mesh,
-        recompute=False,
-        comm_fusion=True,
-        comm_fusion_zero_copy=True,
-    )
-    zero_copy_optimizer = nn.SGD(zero_copy_net.trainable_params(), learning_rate=_LR)
-    images, labels = _step_batch(0, get_group_size())
-    _fully_shard_backward(zero_copy_net, images[rank_slice], labels[rank_slice])
-    _assert_comm_fusion_flat_buffer_memory(zero_copy_net, zero_copy_optimizer)
-    zero_copy_net.zero_grad()
-
 
 def _step_batch(step, world_size):
     """Deterministic global (images, labels) batch for one step, identical on every rank."""
@@ -241,6 +169,12 @@ def _reference_backward(net, images, labels, rank_slice):
     return rank_loss, grads
 
 
+def _apply_sgd_step(parameters, gradients):
+    """Apply stateless in-place SGD without allocating state for empty local shards."""
+    for parameter, gradient in zip(parameters, gradients):
+        parameter.add_(gradient, alpha=-_LR)
+
+
 def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=False):
     """Train a fully_shard SlimLeNet16 and a single-card reference in step, comparing loss + grad shards."""
     ms.set_context(mode=ms.PYNATIVE_MODE)
@@ -265,14 +199,9 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
     state_dict = {name: Tensor(param.asnumpy().copy(), ms.float32)
                   for name, param in reference_net.parameters_dict().items()}
     fsdp_net = _build_fully_shard_net(state_dict, mesh, recompute=recompute, comm_fusion=comm_fusion)
-    fsdp_optimizer = nn.SGD(fsdp_net.trainable_params(), learning_rate=_LR)
-    reference_optimizer = nn.SGD(reference_net.trainable_params(), learning_rate=_LR)
 
     local_bs = _GLOBAL_BS // world_size
     rank_slice = slice(rank * local_bs, (rank + 1) * local_bs)
-    if comm_fusion and not hsdp and not recompute:
-        _assert_comm_fusion_zero_copy_lazy_init_memory(state_dict, mesh, rank_slice)
-
     for step in range(_NUM_STEPS):
         images, labels = _step_batch(step, world_size)
         fsdp_loss, fsdp_grads = _fully_shard_backward(fsdp_net, images[rank_slice], labels[rank_slice])
@@ -286,9 +215,9 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
                                            _to_numpy(full_grad), _to_numpy(local_grad), shard_size, shard_coord)
 
         with SkipDTensorDispatch(), _no_grad():
-            fsdp_optimizer(fsdp_grads)
+            _apply_sgd_step(fsdp_net.trainable_params(), fsdp_grads)
         with _no_grad():
-            reference_optimizer(reference_grads)
+            _apply_sgd_step(reference_net.trainable_params(), reference_grads)
 
     print(f"[Rank {rank}] {case_name} passed: world_size={world_size}, mesh={mesh.shape}, "
           f"steps={_NUM_STEPS}, recompute={recompute}, comm_fusion={comm_fusion}")
@@ -296,10 +225,10 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
 
 def test_ms_fully_shard_with_gradient_accumulation():
     """
-    Feature: 1D dp fully_shard with prefetch and sharded-form gradient accumulation.
+    Feature: 1D dp fully_shard with uneven parameters, prefetch, and sharded-form gradient accumulation.
     Description: Train a fully_shard SlimLeNet16 and an identical single-card reference for several
                  optimizer steps, accumulating gradients in sharded form over micro-batches each step.
-    Expectation: Per-rank loss and every parameter's gradient shard match the reference at every step.
+    Expectation: Per-rank loss and every even or uneven parameter gradient shard match the reference at every step.
     """
     run_precision_case(case_name="fully_shard with gradient accumulation")
 

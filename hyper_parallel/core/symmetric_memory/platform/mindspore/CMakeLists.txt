@@ -27,32 +27,25 @@ add_subdirectory(framework)
 set(OPS_SRC_FILES ${C_API_SRC_FILES} ${FRAMEWORK_SRC_FILES})
 
 if(NOT DEFINED ENV{SHMEM_HOME_PATH})
-    if(NOT DEFINED ENV{HP_THIRD_PARTY_DIR})
-        message(FATAL_ERROR "Cannot find SHMEM from source or prebuild, please check log.")
-    else()
-        set(SHMEM_HOME_PATH $ENV{HP_THIRD_PARTY_DIR})
-    endif()
-else()
-    set(SHMEM_HOME_PATH $ENV{SHMEM_HOME_PATH})
+    message(FATAL_ERROR "Cannot find SHMEM_HOME_PATH. Run the explicit native dependency/build workflow first.")
 endif()
+set(SHMEM_HOME_PATH $ENV{SHMEM_HOME_PATH})
 
 # Include find_ms_path.cmake to set up MS_PATH (mindspore path)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/find_ms_path.cmake)
 
-find_library(ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB
-    NAMES aclshmem_symmetric_memory_kernel
-    PATHS
-    ${CMAKE_CURRENT_BINARY_DIR}/../ops
-    ${CMAKE_CURRENT_BINARY_DIR}/../../lib/hyper_parallel/lib
-    NO_DEFAULT_PATH
-)
+if(NOT ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB OR
+  NOT EXISTS "${ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB}")
+    message(FATAL_ERROR
+        "ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB must name the kernel library installed by "
+        "build_symmetric_memory.sh. Got: '${ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB}'")
+endif()
 
 
 # Set library and source variables
-set(SRC_FILES  ${OPS_SRC_FILES})  #如果有framework再加上其路径
-set(LIB_DIRS ${SHMEM_HOME_PATH}/shmem/lib
-    ${CMAKE_CURRENT_BINARY_DIR}/../../lib/hyper_parallel/lib/shmem)
-set(LIBS hpshmem)
+set(SRC_FILES ${OPS_SRC_FILES})  # Append framework sources here when needed.
+set(LIB_DIRS ${SHMEM_HOME_PATH}/shmem/lib)
+set(LIBS hyper_parallel_shmem)
 set(INCLUDE_DIRS ${SHMEM_HOME_PATH}/shmem/include ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../ops/include ${MS_PATH}/include ${MS_PATH}/core/include)
 
@@ -152,9 +145,18 @@ endif()
 set(PYTHON_SCRIPT_PATH "${CMAKE_BINARY_DIR}/build_custom_with_ms.py")
 file(WRITE ${PYTHON_SCRIPT_PATH} "
 import mindspore as ms
+
+
+class HyperParallelCustomOpBuilder(ms.ops.CustomOpBuilder):
+    def get_ldflags(self):
+        flags = super().get_ldflags()
+        broken_rpath_flag = '-Wl,--disable-new-dtags,--rpath'
+        return [flag for flag in flags if flag != broken_rpath_flag]
+
+
 src_files = '${SRC_FILES}'.split(';')
-rpath_flag = \"-Wl,-rpath,'$$ORIGIN'/../../../../lib:'$$ORIGIN'/../../../../lib/shmem \"
-ms.ops.CustomOpBuilder(
+rpath_flag = \"-Wl,--enable-new-dtags,-rpath,'$$ORIGIN'/../../..:'$$ORIGIN'/../../../shmem \"
+HyperParallelCustomOpBuilder(
     name='${MS_EXTENSION_NAME}',
     sources=src_files,
     op_def=${DEF_YAML_STRING},
@@ -171,7 +173,8 @@ ms.ops.CustomOpBuilder(
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_custom_target(
     BuildCustomOp ALL
-    COMMAND cd ${CMAKE_BINARY_DIR} && ${Python3_EXECUTABLE} ${PYTHON_SCRIPT_PATH}
+    COMMAND cd ${CMAKE_BINARY_DIR} && ${CMAKE_COMMAND} -E env --unset=MAKEFLAGS
+            ${Python3_EXECUTABLE} ${PYTHON_SCRIPT_PATH}
     DEPENDS ${ASCENDC_TARGET_NAME}
     COMMENT "Building custom operator with MindSpore"
 )

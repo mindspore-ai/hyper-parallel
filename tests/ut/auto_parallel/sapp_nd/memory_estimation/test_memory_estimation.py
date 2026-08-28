@@ -137,6 +137,112 @@ class _FakeTemplateEvaluator:
         self.calls.append(("pp_micro", schedule, func))
 
 
+class _CountingRaiser:
+    """Callable that raises RuntimeError after *raise_on* successful calls."""
+
+    def __init__(self, raise_on: int) -> None:
+        """Initialize with the call number that triggers the exception."""
+        self.call_count = 0
+        self.raise_on = raise_on
+
+    def __call__(self, **_kwargs: Any) -> tuple:
+        """Return a valid result or raise on the configured call."""
+        self.call_count += 1
+        if self.call_count >= self.raise_on:
+            raise RuntimeError("injected failure")
+        return (2 * MEGABYTE, 3 * MEGABYTE)
+
+
+class TestPPBExceptionRecovery(unittest.TestCase):
+    """Verify that lay_ppb and lay_ppb_new restore shared state on exception."""
+
+    def _make_body_ppb(self, raise_on: int) -> tuple:
+        """Create a _PPB with a _CountingRaiser and minimal ccfg/ctx for BODY path."""
+        raiser = _CountingRaiser(raise_on)
+        ppb = _PPB(SimpleNamespace(ppb_combined=[]), raiser)
+        rec_op = SimpleNamespace(attBMM=10, headCast=20, dropout=30, softmax=40, normOp=50, gather=60, ffAct=70)
+        ccfg = SimpleNamespace(model_name="test-model", rec_op=rec_op)
+        ctx = Context()
+        ctx.head_node = "head"
+        ctx.tail_node = "tail"
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        return ppb, ccfg, ctx, raiser
+
+    def test_lay_ppb_restores_rec_op_on_exception(self) -> None:
+        """
+        Feature: TestPPBExceptionRecovery.
+        Description: _inner_dynamic_mem raises during BODY path in lay_ppb.
+        Expectation: ccfg.rec_op attributes are restored to their original values.
+        """
+        ppb, ccfg, ctx, _ = self._make_body_ppb(raise_on=2)
+        original_vals = {k: getattr(ccfg.rec_op, k) for k in
+                         ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'gather', 'ffAct']}
+        with self.assertRaises(RuntimeError):
+            ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+        for key, val in original_vals.items():
+            self.assertEqual(getattr(ccfg.rec_op, key), val,
+                             f"rec_op.{key} not restored: expected {val}, got {getattr(ccfg.rec_op, key)}")
+
+    def test_lay_ppb_deletes_synthetic_rec_op_on_exception(self) -> None:
+        """
+        Feature: TestPPBExceptionRecovery.
+        Description: ccfg has no rec_op; synthetic one is created, then _inner_dynamic_mem raises.
+        Expectation: The synthetic rec_op is deleted (delattr) after the exception.
+        """
+        raiser = _CountingRaiser(raise_on=1)
+        ppb = _PPB(SimpleNamespace(ppb_combined=[]), raiser)
+        ccfg = SimpleNamespace(model_name="test-model")
+        ctx = Context()
+        ctx.head_node = "head"
+        ctx.tail_node = "tail"
+        ctx.current_node = LayerType.NOT_REC_LAYER
+        with self.assertRaises(RuntimeError):
+            ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+        self.assertFalse(hasattr(ccfg, 'rec_op'),
+                         "synthetic rec_op should have been deleted after exception")
+
+    def test_lay_ppb_restores_enable_node_log_on_exception(self) -> None:
+        """
+        Feature: TestPPBExceptionRecovery.
+        Description: ctx.enable_node_log is False before call; _inner_dynamic_mem raises.
+        Expectation: ctx.enable_node_log is restored to its original value (False), not hard-coded True.
+        """
+        ppb, ccfg, ctx, _ = self._make_body_ppb(raise_on=1)
+        ctx.enable_node_log = False
+        with self.assertRaises(RuntimeError):
+            ppb.lay_ppb(ccfg, ctx, 4 * MEGABYTE)
+        self.assertFalse(ctx.enable_node_log,
+                         "enable_node_log should be restored to False, not hard-coded True")
+
+    def test_lay_ppb_new_restores_rec_op_on_exception(self) -> None:
+        """
+        Feature: TestPPBExceptionRecovery.
+        Description: _inner_dynamic_mem raises during BODY path in lay_ppb_new.
+        Expectation: ccfg.rec_op attributes are restored to their original values.
+        """
+        ppb, ccfg, ctx, _ = self._make_body_ppb(raise_on=2)
+        original_vals = {k: getattr(ccfg.rec_op, k) for k in
+                         ['attBMM', 'headCast', 'dropout', 'softmax', 'normOp', 'gather', 'ffAct']}
+        with self.assertRaises(RuntimeError):
+            ppb.lay_ppb_new(ccfg, ctx, 4 * MEGABYTE)
+        for key, val in original_vals.items():
+            self.assertEqual(getattr(ccfg.rec_op, key), val,
+                             f"rec_op.{key} not restored: expected {val}, got {getattr(ccfg.rec_op, key)}")
+
+    def test_lay_ppb_new_restores_enable_node_log_on_exception(self) -> None:
+        """
+        Feature: TestPPBExceptionRecovery.
+        Description: ctx.enable_node_log is False before call; _inner_dynamic_mem raises in lay_ppb_new.
+        Expectation: ctx.enable_node_log is restored to its original value (False), not hard-coded True.
+        """
+        ppb, ccfg, ctx, _ = self._make_body_ppb(raise_on=1)
+        ctx.enable_node_log = False
+        with self.assertRaises(RuntimeError):
+            ppb.lay_ppb_new(ccfg, ctx, 4 * MEGABYTE)
+        self.assertFalse(ctx.enable_node_log,
+                         "enable_node_log should be restored to False, not hard-coded True")
+
+
 class TestSappNDMemoryEstimation(unittest.TestCase):
     """A test class for SAPP-ND memory estimation."""
 

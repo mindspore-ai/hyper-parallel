@@ -15,11 +15,15 @@
 """Token-first dataset and training contracts for the Hyper-RL runtime."""
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
+
+
 @dataclass(frozen=True)
 class Message:
     """One conversational message before tokenization."""
     role: Literal["system", "user", "assistant", "tool", "environment"]
     content: str
+
+
 @dataclass(frozen=True)
 class PromptRecord:
     """Stable input record understood by rollout and environments."""
@@ -27,6 +31,8 @@ class PromptRecord:
     messages: tuple[Message, ...]
     ground_truth: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class Turn:
     """One token-aligned observation or action in a trajectory."""
@@ -36,6 +42,8 @@ class Turn:
     token_end: int
     trainable: bool
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class Trajectory:
     """Canonical output of both one-shot and multi-turn rollout."""
@@ -56,6 +64,7 @@ class Trajectory:
     metadata: dict[str, Any] = field(default_factory=dict)
     worker_policy_version: Optional[int] = None
     worker_policy_fingerprint: Optional[str] = None
+
     def __post_init__(self) -> None:
         """Fail early when token-aligned fields drift apart."""
         if self.policy_version < 0:
@@ -85,6 +94,8 @@ class Trajectory:
             raise ValueError(
                 "trajectory rollout_log_probs must align with next-token positions"
             )
+
+
 @dataclass(frozen=True)
 class ExperienceBatch:
     """Padded tensor batch consumed by an algorithm and the actor worker.
@@ -107,6 +118,7 @@ class ExperienceBatch:
     metadata: dict[str, Any] = field(default_factory=dict)
     worker_policy_version: Optional[int] = None
     worker_policy_fingerprint: Optional[str] = None
+
     def __post_init__(self) -> None:
         """Validate the shared token dimensions before algorithm code runs."""
         worker_identity = (
@@ -154,6 +166,7 @@ class ExperienceBatch:
                 raise ValueError(
                     "experience worker policy identity must match every trajectory"
                 )
+
     @property
     def loss_action_mask(self) -> Any:
         """Align full-sequence action positions with next-token log-probabilities."""

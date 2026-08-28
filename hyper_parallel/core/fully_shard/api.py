@@ -17,7 +17,12 @@ from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
 from hyper_parallel.platform.platform import PlatformType
-from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy, TPShardMetaInfo
+from hyper_parallel.core.fully_shard.utils import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+    SourceShardMetaInfo,
+)
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
@@ -133,7 +138,7 @@ class HSDPModule:
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
                   comm_fusion, comm_fusion_zero_copy: Optional[bool] = None,
-                  tp_grad_infos: Optional[Mapping[ParameterClass, TPShardMetaInfo]] = None):
+                  source_shard_infos: Optional[Mapping[ParameterClass, SourceShardMetaInfo]] = None):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -160,7 +165,7 @@ class HSDPModule:
                                               device,
                                               comm_fusion,
                                               resolved_comm_fusion_zero_copy,
-                                              tp_grad_infos=tp_grad_infos,
+                                              source_shard_infos=source_shard_infos,
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
@@ -633,50 +638,50 @@ def _get_modules_parameters(modules, ignored_params=None):
     """Collect deduplicated parameters from module roots."""
     return get_managed_modules_parameters(modules, ignored_params)
 
-def _validate_managed_params_tp_grad_infos(
+def _validate_managed_params_source_shard_infos(
     managed_parameters: set[ParameterClass],
-    tp_grad_infos: Optional[Mapping[ParameterClass, TPShardMetaInfo]],
+    source_shard_infos: Optional[Mapping[ParameterClass, SourceShardMetaInfo]],
 ) -> None:
     """Validate the parameter-identity metadata consumed by one fully_shard unit."""
-    if tp_grad_infos is None:
+    if source_shard_infos is None:
         return
-    if not isinstance(tp_grad_infos, Mapping):
-        raise ValueError("tp_grad_infos must be a mapping from Parameter to TPShardMetaInfo")
+    if not isinstance(source_shard_infos, Mapping):
+        raise ValueError("source_shard_infos must be a mapping from Parameter to SourceShardMetaInfo")
 
     managed_parameters = set(managed_parameters)
 
     if any(isinstance(parameter, DTensor) for parameter in managed_parameters):
         raise ValueError(
-            "tp_grad_infos cannot be provided when fully_shard manages a native DTensor parameter"
+            "source_shard_infos cannot be provided when fully_shard manages a native DTensor parameter"
         )
 
     invalid_values = [
         parameter
-        for parameter, metadata in tp_grad_infos.items()
-        if not isinstance(metadata, TPShardMetaInfo)
+        for parameter, metadata in source_shard_infos.items()
+        if not isinstance(metadata, SourceShardMetaInfo)
     ]
     if invalid_values:
-        raise ValueError("tp_grad_infos values must be TPShardMetaInfo instances")
+        raise ValueError("source_shard_infos values must be SourceShardMetaInfo instances")
 
     invalid_origins = [
         parameter
-        for parameter, metadata in tp_grad_infos.items()
+        for parameter, metadata in source_shard_infos.items()
         if metadata.origin_is_dtensor and not isinstance(parameter, DTensor)
     ]
     if invalid_origins:
         raise ValueError(
-            "tp_grad_infos origin_is_dtensor=True requires a native DTensor parameter"
+            "source_shard_infos origin_is_dtensor=True requires a native DTensor parameter"
         )
 
-    missing_parameters = managed_parameters.difference(tp_grad_infos)
+    missing_parameters = managed_parameters.difference(source_shard_infos)
     if missing_parameters:
         raise ValueError(
-            "tp_grad_infos must cover every parameter managed by this fully_shard call"
+            "source_shard_infos must cover every parameter managed by this fully_shard call"
         )
-    unexpected_parameters = set(tp_grad_infos).difference(managed_parameters)
+    unexpected_parameters = set(source_shard_infos).difference(managed_parameters)
     if unexpected_parameters:
         raise ValueError(
-            "tp_grad_infos contains a parameter not managed by this fully_shard call"
+            "source_shard_infos contains a parameter not managed by this fully_shard call"
         )
 
 
@@ -692,7 +697,7 @@ def fully_shard(
         replicate_params: Optional[set[platform.Parameter]] = None,
         comm_fusion: bool = False,
         comm_fusion_zero_copy: Optional[bool] = None,
-        tp_grad_infos: Optional[Mapping[ParameterClass, TPShardMetaInfo]] = None,
+        source_shard_infos: Optional[Mapping[ParameterClass, SourceShardMetaInfo]] = None,
 ) -> Union[ModuleClass, List[ModuleClass]]:
 
     """
@@ -733,6 +738,7 @@ def fully_shard(
 
         offload_policy (OffloadPolicy, default=OffloadPolicy()):
             Memory offload policy for reducing device memory usage.
+            ``CPUOffloadPolicy`` is currently unsupported on MindSpore.
 
         ignored_params (Optional[set[nn.Parameter]], default=None):
             Set of parameters to exclude from fully_shard management entirely.
@@ -761,8 +767,9 @@ def fully_shard(
             When enabled, fully_shard may rebase sharded local parameter storage
             into one shared flat buffer so fused all-gather can read directly from
             contiguous memory. This path depends on optimizer compatibility with
-            view-backed parameters.
-        tp_grad_infos (Optional[Mapping[nn.Parameter, TPShardMetaInfo]]):
+            view-backed parameters. MindSpore rejects an explicit ``True`` value
+            because its optimizers do not update view-backed Parameter storage.
+        source_shard_infos (Optional[Mapping[nn.Parameter, SourceShardMetaInfo]]):
             Source TP/EP mesh and placements for the plain-parameter dual mode.
             This interface is currently supported by the Torch backend only.
 
@@ -772,10 +779,20 @@ def fully_shard(
     platform_type = platform.platform_type
     _validate_module_for_fully_shard(module, platform_type)
 
-    if tp_grad_infos is not None and platform_type != PlatformType.PYTORCH:
-        raise NotImplementedError("tp_grad_infos is currently supported only on the Torch backend")
-
+    if source_shard_infos is not None and platform_type != PlatformType.PYTORCH:
+        raise NotImplementedError("source_shard_infos is currently supported only on the Torch backend")
     if platform_type == PlatformType.MINDSPORE:
+        if comm_fusion_zero_copy:
+            raise NotImplementedError(
+                "comm_fusion_zero_copy=True is not supported on MindSpore because its optimizers "
+                "do not update view-backed Parameter storage. Omit comm_fusion_zero_copy or set it "
+                "to False to use copy-in communication fusion."
+            )
+        if isinstance(offload_policy, CPUOffloadPolicy):
+            raise NotImplementedError(
+                "CPUOffloadPolicy is not supported by fully_shard on MindSpore because operator "
+                "outputs do not preserve CPU tensor storage."
+            )
         from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
         enable_mindspore_backward_compat()
@@ -792,7 +809,7 @@ def fully_shard(
     params = _get_modules_parameters(modules, ignored_params)
     has_dtensor_param = any(isinstance(param, DTensor) for param in params)
     if platform_type == PlatformType.PYTORCH:
-        _validate_managed_params_tp_grad_infos(set(params), tp_grad_infos)
+        _validate_managed_params_source_shard_infos(set(params), source_shard_infos)
 
     replicate_params = _normalize_replicate_params(replicate_params)
 
@@ -819,7 +836,7 @@ def fully_shard(
         device,
         comm_fusion,
         comm_fusion_zero_copy,
-        tp_grad_infos=tp_grad_infos,
+        source_shard_infos=source_shard_infos,
     )
     # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
     if len(modules) > 1:

@@ -30,11 +30,6 @@ ParameterClass = platform.Parameter
 
 class HSDPState:
     """HSDP state for cell"""
-    # Record pending per-parameter reduce-scatter/all-reduce work across
-    # fully_shard states so later backward hooks/root drains can materialize
-    # gradients launched by earlier states.
-    pre_reduce_scatter_params = []
-    pre_all_reduce_params = []
 
     def __init__(
         self,
@@ -47,6 +42,7 @@ class HSDPState:
         raw_ignored_params: Set[ParameterClass],
         raw_replicate_params: set[ParameterClass],
         platform_impl,
+        scheduler_ctx,
         device=None,
     ):
         """
@@ -62,6 +58,7 @@ class HSDPState:
             raw_ignored_params: Parameters excluded from fully_shard management.
             raw_replicate_params: Managed parameters that remain replicated.
             platform_impl: Platform abstraction layer (Torch or MindSpore).
+            scheduler_ctx: Scheduler context shared by this module tree.
             device: Optional target device for parameters.
         """
         self.modules = (cell,) if isinstance(cell, platform.Module) else tuple(cell)
@@ -74,6 +71,7 @@ class HSDPState:
         self.raw_ignored_params = set(raw_ignored_params or ())
         self.raw_replicate_params = set(raw_replicate_params or ())
         self.platform = platform_impl
+        self.scheduler_ctx = scheduler_ctx
         self.device = device
         self.hsdp_params: List[HSDPParamV2] = []
         self.param_group = None
@@ -87,9 +85,7 @@ class HSDPState:
         self.reshard_after_backward = True
         # Requires AllReduce for grad When HSDP
         self.requires_all_reduce = True
-        # Default reduce op is decided at the fully_shard-state level:
-        # if all parameters have source-layout metadata, use SUM; otherwise AVG.
-        self.reduce_op_type = self._resolve_default_reduce_op()
+        self.set_reduce_op_type("avg")
         self._reset_sharded_params = False
 
     def __repr__(self) -> str:
@@ -110,6 +106,10 @@ class HSDPState:
     def _move_states_to_device(self):
         """move states to device"""
         raise NotImplementedError("HSDPState subclasses must implement _move_states_to_device")
+
+    def set_reduce_op_type(self, reduce_op_type: str) -> None:
+        """Set the gradient reduction operation for the current backend."""
+        raise NotImplementedError("HSDPState subclasses must implement set_reduce_op_type")
 
     def shard(self) -> None:
         """change parameters to sharded state"""

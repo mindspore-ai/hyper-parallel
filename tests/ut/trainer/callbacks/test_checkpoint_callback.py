@@ -390,67 +390,6 @@ class TestAsyncSaveDispatch(unittest.TestCase):
                 f"second dispatch must wait for first; observed order: {kinds}"
             ))
 
-    def test_second_dispatch_reports_error_from_joined_save(self):
-        """An async failure discovered during join must block the next save."""
-        with tempfile.TemporaryDirectory() as tmp:
-            callback = CheckpointCallback(_build_trainer(tmp, save_async=True))
-            started = threading.Event()
-            release = threading.Event()
-
-            def failing_save(_state):
-                started.set()
-                release.wait(timeout=2.0)
-                callback._save_error = OSError("disk full")
-
-            callback._save = failing_save
-            state = TrainerState(max_steps=10)
-            state.global_step = 1
-            callback._dispatch_save(state)
-            self.assertTrue(started.wait(timeout=2.0))
-            release.set()
-            state.global_step = 2
-
-            with self.assertRaisesRegex(RuntimeError, "Checkpoint save failed"):
-                callback._dispatch_save(state)
-
-
-class TestFailurePropagation(unittest.TestCase):
-    """Recorded callback failures must remain visible to trainer lifecycles."""
-
-    def test_raise_if_load_failed_preserves_original_error(self):
-        """A deferred resume failure must raise with its original cause."""
-        with tempfile.TemporaryDirectory() as tmp:
-            callback = CheckpointCallback(_build_trainer(tmp, load_path=tmp))
-            callback._load_error = ValueError("invalid checkpoint")
-
-            with self.assertRaisesRegex(RuntimeError, "Failed to load checkpoint") as context:
-                callback.raise_if_load_failed()
-
-            self.assertIsInstance(context.exception.__cause__, ValueError)
-
-    def test_raise_if_save_failed_preserves_original_error(self):
-        """A deferred save failure must raise after pending work is joined."""
-        with tempfile.TemporaryDirectory() as tmp:
-            callback = CheckpointCallback(_build_trainer(tmp))
-            callback._save_error = OSError("disk full")
-
-            with self.assertRaisesRegex(RuntimeError, "Checkpoint save failed") as context:
-                callback.raise_if_save_failed()
-
-            self.assertIsInstance(context.exception.__cause__, OSError)
-
-    def test_dispatch_does_not_erase_prior_save_error(self):
-        """A later periodic save must not overwrite an unreported failure."""
-        with tempfile.TemporaryDirectory() as tmp:
-            callback = CheckpointCallback(_build_trainer(tmp))
-            callback._save_error = OSError("disk full")
-            callback._save = MagicMock()
-
-            with self.assertRaisesRegex(RuntimeError, "Checkpoint save failed"):
-                callback._dispatch_save(TrainerState(max_steps=10))
-
-            callback._save.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

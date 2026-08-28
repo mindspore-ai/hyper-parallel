@@ -14,12 +14,15 @@
 # ============================================================================
 """Synchronous requirements-driven Hyper-Parallel RL trainer."""
 import functools
+from hashlib import sha256
+import json
 import logging
 import os
+from pathlib import Path
 import random
 import subprocess
 import time
-from copy import deepcopy
+import traceback
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Optional
 
@@ -31,13 +34,16 @@ from rl.config import (
     build_model_registration,
     build_runtime_config,
     required_mapping,
+    resolve_vllm_automatic_limits,
     uses_colocated_vllm,
     validate_config,
 )
 from rl.consistency import (
     CONSISTENCY_PROFILE_OFF,
     configure_consistency_profile,
+    consistency_runtime_state,
     install_trainer_consistency_profile,
+    measure_post_update_old_policy_mismatch,
     validate_consistency_forward_inputs,
     validate_pre_update_consistency,
 )
@@ -68,7 +74,7 @@ from rl.utils.monitoring.metrics import (
 )
 from rl.utils.monitoring.tracker import TrainingTracker
 
-from hyper_models.components.distributed.infrastructure import (
+from hyper_parallel.auto_models.components.distributed.infrastructure import (
     create_distributed_setup_from_config,
     destroy_process_group,
     initialize_distributed,
@@ -78,6 +84,125 @@ from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 
 platform = get_platform()
 logger = logging.getLogger(__name__)
+
+
+def _configure_batch_invariant_communication(config: Mapping[str, Any]) -> None:
+    """Align HCCL options before Trainer and rollout process groups initialize."""
+    rollout = config.get("rollout")
+    if not isinstance(rollout, Mapping) or rollout.get("engine") != "vllm":
+        return
+    vllm = rollout.get("vllm")
+    if not isinstance(vllm, Mapping) or not bool(vllm.get("batch_invariant", False)):
+        return
+    # vLLM-Ascend applies these settings before its first TP group. HCCL caches
+    # them at first initialization, so the Trainer must use the same values.
+    os.environ["HCCL_DETERMINISTIC"] = "strict"
+    os.environ["LCCL_DETERMINISTIC"] = "1"
+
+
+def _rollout_tensor_artifact(tensor: Any, *, dtype_name: Optional[str] = None) -> dict[str, Any]:
+    """Serialize one small rollout tensor with an exact byte digest."""
+    value = tensor.detach().to("cpu").contiguous()
+    if dtype_name is not None:
+        value = platform.tensor_type_cast(value, dtype_name)
+    array = platform.tensor_to_numpy(value)
+    payload = array.tobytes()
+    return {
+        "dtype": str(value.dtype).rsplit(".", maxsplit=1)[-1],
+        "shape": [int(size) for size in value.shape],
+        "sha256": sha256(payload).hexdigest(),
+        "values": array.tolist(),
+    }
+
+
+def _write_rollout_artifact(rollout: ExperienceBatch, policy_version: int) -> None:
+    """Persist and optionally compare token, mask, and raw-logprob contracts."""
+    output_dir = os.environ.get("HYPER_RL_ROLLOUT_ARTIFACT_DIR")
+    if not output_dir:
+        return
+    strategy = os.environ.get("HYPER_RL_ROLLOUT_ARTIFACT_STRATEGY")
+    if not strategy:
+        raise ValueError("HYPER_RL_ROLLOUT_ARTIFACT_STRATEGY must be set")
+    oracle_run_id = os.environ.get("HYPER_RL_WEIGHT_ORACLE_RUN_ID")
+    if not oracle_run_id:
+        raise RuntimeError("HYPER_RL_WEIGHT_ORACLE_RUN_ID must identify the verification run")
+    rank = int(platform.get_rank())
+    artifact = {
+        "strategy": strategy,
+        "oracle_run_id": oracle_run_id,
+        "policy_version": int(policy_version),
+        "trainer_rank": rank,
+        "worker_policy_version": rollout.worker_policy_version,
+        "worker_policy_fingerprint": rollout.worker_policy_fingerprint,
+        "sequences": _rollout_tensor_artifact(rollout.sequences),
+        "attention_mask": _rollout_tensor_artifact(
+            rollout.attention_mask,
+            dtype_name="int32",
+        ),
+        "action_mask": _rollout_tensor_artifact(
+            rollout.action_mask,
+            dtype_name="int32",
+        ),
+        "raw_logprobs": _rollout_tensor_artifact(
+            rollout.old_log_probs,
+            dtype_name="float32",
+        ),
+    }
+    filename = f"{strategy}-policy{int(policy_version)}-rank{rank}.json"
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    oracle_dir = os.environ.get("HYPER_RL_ROLLOUT_ARTIFACT_ORACLE_DIR")
+    if oracle_dir:
+        oracle_path = Path(oracle_dir) / f"full_gather-policy{int(policy_version)}-rank{rank}.json"
+        if not oracle_path.is_file():
+            raise RuntimeError(f"Full-gather rollout artifact is missing: {oracle_path}")
+        oracle = json.loads(oracle_path.read_text(encoding="utf-8"))
+        if oracle.get("oracle_run_id") != oracle_run_id:
+            raise RuntimeError(
+                "Full-gather rollout oracle run mismatch: "
+                f"expected={oracle_run_id!r}, actual={oracle.get('oracle_run_id')!r}"
+            )
+        compared_fields = ("sequences", "attention_mask", "action_mask", "raw_logprobs")
+        mismatches = [
+            field
+            for field in compared_fields
+            if {
+                key: artifact[field][key]
+                for key in ("dtype", "shape", "sha256")
+            }
+            != {
+                key: oracle.get(field, {}).get(key)
+                for key in ("dtype", "shape", "sha256")
+            }
+        ]
+        for field in ("policy_version", "worker_policy_version", "worker_policy_fingerprint"):
+            if artifact[field] != oracle.get(field):
+                mismatches.append(field)
+        if mismatches:
+            artifact["oracle_match"] = False
+            artifact["oracle_mismatches"] = mismatches
+            artifact["oracle_path"] = str(oracle_path)
+            mismatch_target = directory / f"mismatch-{filename}"
+            mismatch_temporary = (
+                directory / f".{mismatch_target.name}.{os.getpid()}.tmp"
+            )
+            mismatch_temporary.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            mismatch_temporary.replace(mismatch_target)
+            raise RuntimeError(
+                "Direct rollout artifact differs from full-gather oracle: "
+                f"policy_version={policy_version}, rank={rank}, fields={mismatches}"
+            )
+        artifact["oracle_match"] = True
+    target = directory / filename
+    temporary = directory / f".{filename}.{os.getpid()}.tmp"
+    temporary.write_text(
+        json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
 
 
 def _resolve_eos_token_ids(model: Any, tokenizer: Any) -> tuple[int, ...]:
@@ -157,21 +282,31 @@ def _iter_state_tensors(value: Any):
     elif isinstance(value, (list, tuple)):
         for item in value:
             yield from _iter_state_tensors(item)
+
+
 class SyncTrainer:
-    """Synchronous RL orchestrator composed from HyperModels role runtimes.
+    """Synchronous RL orchestrator composed from HyperAutoModel role runtimes.
 
     Args:
         resolved_config: Fully merged Hyper-RL YAML configuration.
     """
+
     def __init__(self, resolved_config: Mapping[str, Any]) -> None:
         """Validate configuration and build the complete distributed runtime."""
-        self.resolved_config = deepcopy(dict(resolved_config))
+        self.resolved_config = resolve_vllm_automatic_limits(resolved_config)
         self._consistency_profile = configure_consistency_profile(self.resolved_config)
         self.algorithm = build_algorithm(
             required_mapping(self.resolved_config, "algorithm")
         )
         validate_config(self.resolved_config, self.algorithm)
+        _configure_batch_invariant_communication(self.resolved_config)
         install_trainer_consistency_profile(self.resolved_config)
+        logger.info(
+            "training-inference consistency runtime: enabled=%s recipe=%s state=%s",
+            self._consistency_profile != CONSISTENCY_PROFILE_OFF,
+            self._consistency_profile,
+            consistency_runtime_state(),
+        )
         self.model_registration = build_model_registration(self.resolved_config)
         self.runtime_config = build_runtime_config(self.resolved_config)
         self.state = RLTrainerState(max_steps=self.runtime_config.training.train_iters)
@@ -210,6 +345,7 @@ class SyncTrainer:
         seed = int(self.runtime_config.training.seed)
         random.seed(seed)
         platform.manual_seed(seed)
+
     def train(self) -> None:
         """Run synchronous rollout, learning, publication, and checkpointing."""
         completed = False
@@ -217,6 +353,7 @@ class SyncTrainer:
             self.checkpoints.validate_resume()
             self.checkpoints.begin(self.state)
             if self.state.global_step > self.rollout_engine.policy_version:
+                self._release_training_state_for_rollout()
                 self.rollout_engine.prepare_for_training()
                 self.rollout_engine.update_weights(
                     PolicySnapshot(
@@ -270,6 +407,7 @@ class SyncTrainer:
             if completed:
                 platform.barrier()
             self._cleanup_distributed()
+
     def _prepare_experience(
         self,
         rollout: ExperienceBatch,
@@ -341,6 +479,8 @@ class SyncTrainer:
 
     def _publish_policy(self, next_step: int, actor_update: Any) -> None:
         """Transfer the updated Actor and restore rollout residency."""
+        hsdp_sync_stream()
+        self._reshard_model(self.actor.actor_model)
         self.rollout_engine.update_weights(
             PolicySnapshot(
                 version=next_step,
@@ -372,9 +512,14 @@ class SyncTrainer:
         )
         if prompt_records is None:
             raise RuntimeError("Prompt record construction failed without a synchronized error")
+        #start vllm serve load model weight to NPU
         rollout = self.rollout_manager.generate(
             prompt_records=prompt_records,
             policy_version=self.state.global_step,
+        )
+        self._run_rank_synchronized(
+            "rollout artifact publication",
+            lambda: _write_rollout_artifact(rollout, self.state.global_step),
         )
         timings["gen"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()
@@ -393,12 +538,32 @@ class SyncTrainer:
         stage_started = time.perf_counter()
         actor_update = self.actor.update(experience)
         timings["update_actor"] = time.perf_counter() - stage_started
+        if self._consistency_profile != CONSISTENCY_PROFILE_OFF:
+            stage_started = time.perf_counter()
+            post_update_log_probs = self._run_rank_synchronized(
+                "post-update Actor log-probabilities",
+                lambda: self.actor.compute_log_probs(experience),
+            )
+            if post_update_log_probs is None:
+                raise RuntimeError(
+                    "Post-update Actor log-probability computation failed without a synchronized error"
+                )
+            diagnostic_metrics.update(
+                measure_post_update_old_policy_mismatch(
+                    experience,
+                    post_update_log_probs,
+                    group=self._dp_group_info.group,
+                    group_size=self.parallel_dims.dp_size,
+                )
+            )
+            timings["post_update_old_log_prob"] = time.perf_counter() - stage_started
         critic_update = None
         if self.critic is not None:
             stage_started = time.perf_counter()
             critic_update = self.critic.update(experience)
             timings["update_critic"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()
+        #synic weight
         self._publish_policy(next_step, actor_update)
         timings["weight_sync"] = time.perf_counter() - stage_started
         timings["step"] = time.perf_counter() - step_started
@@ -421,6 +586,7 @@ class SyncTrainer:
             critic_update=critic_update,
             diagnostic_metrics=diagnostic_metrics,
         )
+
     def _complete_step(
         self,
         *,
@@ -483,30 +649,76 @@ class SyncTrainer:
         ):
             self._release_training_state_for_rollout()
             self.rollout_engine.prepare_for_rollout()
+
     def _validate_runtime_topology(self) -> None:
-        """Validate torchrun world size against the requested FSDP shard count."""
+        """Validate torchrun world size against the resolved Trainer mesh."""
         world_size = platform.get_world_size()
-        dp_shard = int(self.runtime_config.fsdp_config.dp_shard_size)
-        if world_size != dp_shard:
+        expected_world_size = (
+            int(self.parallel_dims.dp_size)
+            * int(self.parallel_dims.cp_size)
+            * int(self.parallel_dims.tp_size)
+            * int(self.parallel_dims.pp_size)
+        )
+        if world_size != expected_world_size:
             raise ValueError(
-                f"torchrun world size must equal train.accelerator.dp_shard: "
-                f"world_size={world_size}, dp_shard={dp_shard}"
+                "torchrun world size must equal the resolved Trainer mesh size: "
+                f"world_size={world_size}, expected_world_size={expected_world_size}"
             )
-        if uses_colocated_vllm(self.resolved_config):
-            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
-            if local_world_size != world_size:
-                raise ValueError(
-                    "The initial colocated rollout DP path is single-node only: "
-                    f"world_size={world_size}, local_world_size={local_world_size}"
-                )
+        rollout_config = required_mapping(self.resolved_config, "rollout")
+        if rollout_config.get("engine") != "vllm":
+            return
+        vllm_config = required_mapping(rollout_config, "vllm")
+        deployment = str(vllm_config.get("deployment", "disjoint"))
+        local_world_size = os.environ.get("LOCAL_WORLD_SIZE", str(world_size))
+        if deployment == "colocated":
             visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-            if visible_devices is not None:
-                device_ids = [device.strip() for device in visible_devices.split(",")]
-                if len(device_ids) < local_world_size or len(set(device_ids[:local_world_size])) != local_world_size:
-                    raise ValueError(
-                        "Colocated rollout requires one unique visible physical NPU per local trainer rank: "
-                        f"ASCEND_RT_VISIBLE_DEVICES={visible_devices!r}"
-                    )
+            device_mapping = visible_devices or ",".join(
+                str(device) for device in range(int(local_world_size))
+            )
+        else:
+            device_mapping = str(vllm_config.get("visible_devices", ""))
+        local_metadata = (
+            local_world_size,
+            str(vllm_config.get("host", "127.0.0.1")),
+            int(vllm_config["port"]),
+            device_mapping,
+        )
+        metadata: list[Any] = [None] * world_size
+        platform.all_gather_object(metadata, local_metadata)
+        for rank, (rank_local_world_size, _host, _port, rank_devices) in enumerate(metadata):
+            if int(rank_local_world_size) != world_size:
+                raise ValueError(
+                    "The shared vLLM rollout path is single-node only: "
+                    f"rank={rank}, world_size={world_size}, local_world_size={rank_local_world_size}"
+                )
+            device_ids = [device.strip() for device in rank_devices.split(",")]
+            expected_devices = (
+                world_size
+                if deployment == "colocated"
+                else int(vllm_config["data_parallel_size"])
+                * int(vllm_config["tensor_parallel_size"])
+            )
+            if (
+                len(device_ids) != expected_devices
+                or not all(device_ids)
+                or len(set(device_ids)) != expected_devices
+            ):
+                raise ValueError(
+                    f"Shared {deployment} rollout requires its full unique physical NPU set on every rank: "
+                    f"rank={rank}, devices={rank_devices!r}, expected={expected_devices}"
+                )
+        endpoints = [(host, port) for _, host, port, _ in metadata]
+        if any(endpoint != endpoints[0] for endpoint in endpoints):
+            raise ValueError(
+                f"Shared {deployment} rollout requires the same endpoint on every rank: endpoints={endpoints!r}"
+            )
+        device_mappings = [rank_devices for _, _, _, rank_devices in metadata]
+        if any(mapping != device_mappings[0] for mapping in device_mappings):
+            raise ValueError(
+                f"Shared {deployment} rollout requires the same full physical NPU set on every rank: "
+                f"mappings={device_mappings!r}"
+            )
+
     def _build_runtime(self) -> None:
         """Build tokenizer, data, requirement-selected roles, optimizers, and tracking."""
         self._build_tokenizer_and_data()
@@ -524,6 +736,7 @@ class SyncTrainer:
             self._run_rank_synchronized,
         )
         self._build_tracker()
+
     def _build_tokenizer_and_data(self) -> None:
         """Build the shared tokenizer, train split, and optional evaluation split."""
         model_config = required_mapping(self.resolved_config, "model")
@@ -619,7 +832,7 @@ class SyncTrainer:
         critic_model = None
         if self.algorithm.requirements.roles.critic:
             raise NotImplementedError(
-                "Critic construction is not available in the initial HyperModels "
+                "Critic construction is not available in the initial HyperAutoModel "
                 "migration; use a critic-free algorithm such as GRPO"
             )
         actor_optimizer, actor_lr_scheduler = self._build_optimizer_for(actor_model)
@@ -673,8 +886,9 @@ class SyncTrainer:
         self.lr_scheduler = self.actor.lr_scheduler
 
     def _build_optimizer_for(self, model: Any) -> tuple[Any, Any]:
-        """Build independent HyperModels optimizer state for one role model."""
+        """Build independent HyperAutoModel optimizer state for one role model."""
         return build_role_optimizer(self.runtime_config, model)
+
     def _build_rollout_runtime(self) -> None:
         """Build the selected generation engine and train/evaluation rollout managers."""
         rollout_config = required_mapping(self.resolved_config, "rollout")
@@ -684,6 +898,24 @@ class SyncTrainer:
             rollout_config,
             self.model_registration,
         )
+        if self.parallel_dims.tp_size > 1:
+            configure_tp = getattr(
+                self.rollout_engine,
+                "configure_trainer_tensor_parallel",
+                None,
+            )
+            if not callable(configure_tp):
+                raise ValueError(
+                    "Trainer TP rollout requires request ownership support"
+                )
+            tp_mesh = self.parallel_dims.device_mesh["tp"]
+            configure_tp(
+                group=tp_mesh.get_group(),
+                tp_rank=int(self.parallel_dims.tp_rank),
+                tp_size=int(self.parallel_dims.tp_size),
+                request_rank=int(self.parallel_dims.dp_rank),
+                request_size=int(self.parallel_dims.dp_size),
+            )
         eos_token_ids = _resolve_eos_token_ids(self.model, self.tokenizer)
         manager_kwargs = {
             "engine": self.rollout_engine,
@@ -704,6 +936,7 @@ class SyncTrainer:
             do_sample=True,
             collect_old_log_probs=self.algorithm.requirements.data.rollout_log_probs,
             seed=(None if rollout_config.get("seed") is None else int(rollout_config["seed"])),
+            ignore_eos=bool(rollout_config.get("ignore_eos", False)),
             **manager_kwargs,
         )
         self.evaluator: Optional[Evaluator] = None
@@ -715,6 +948,7 @@ class SyncTrainer:
                 top_p=float(evaluation_config.get("top_p", 1.0)),
                 top_k=int(evaluation_config.get("top_k", 0)),
                 do_sample=bool(evaluation_config.get("do_sample", False)),
+                ignore_eos=bool(evaluation_config.get("ignore_eos", False)),
                 **manager_kwargs,
             )
             max_samples = evaluation_config.get("max_samples")
@@ -728,6 +962,7 @@ class SyncTrainer:
                 log_samples=int(evaluation_config.get("log_samples", 0)),
                 progress_steps=int(evaluation_config.get("progress_steps", 0)),
             )
+
     def _build_one_parallel_model(self, frozen: bool) -> platform.Module:
         """Build, freeze when requested, parallelize, materialize, and load one model."""
         return build_role_model(
@@ -735,6 +970,7 @@ class SyncTrainer:
             self.distributed_setup,
             frozen=frozen,
         )
+
     def _build_tracker(self) -> None:
         """Initialize console/W&B tracking on global rank zero only."""
         logging_config = required_mapping(self.resolved_config, "logging")
@@ -756,6 +992,7 @@ class SyncTrainer:
             wandb_entity=wandb_config.get("entity"),
             wandb_directory=str(wandb_config.get("directory", "outputs/wandb")),
         )
+
     def _next_batch(self, data_iterator: Any) -> tuple[Mapping[str, Any], Any]:
         """Fetch one batch, advancing the distributed sampler epoch on exhaustion."""
         try:
@@ -765,6 +1002,7 @@ class SyncTrainer:
             self.sampler.set_epoch(self.state.epoch)
             data_iterator = iter(self.train_dataloader)
             return next(data_iterator), data_iterator
+
     def _cleanup_distributed(self) -> None:
         """Close tracking and destroy the initialized process group."""
         if self._tracker is not None:
@@ -788,6 +1026,7 @@ class SyncTrainer:
         except (RuntimeError, ValueError) as exc:
             logger.warning("Distributed cleanup failed: %s", exc)
         self._runtime_started = False
+
     @staticmethod
     def _reshard_model(model: Optional[Any]) -> None:
         """Explicitly release every nested full FSDP parameter allocation."""
@@ -795,6 +1034,7 @@ class SyncTrainer:
             return
         for hsdp_root in iter_hsdp_roots(model):
             hsdp_root.reshard()
+
     @staticmethod
     def _validate_optimizer_cpu_residency(optimizer: Optional[Any], role: str) -> None:
         """Fail if a colocated optimizer retains tensor state on the NPU."""
@@ -812,6 +1052,7 @@ class SyncTrainer:
             raise RuntimeError(
                 f"Colocated {role} optimizer state must be CPU resident, got devices={sorted(set(device_states))}"
             )
+
     def _release_training_state_for_rollout(self) -> None:
         """Reshard FSDP state and release allocator cache before waking vLLM."""
         if not uses_colocated_vllm(self.resolved_config):
@@ -843,6 +1084,7 @@ class SyncTrainer:
                 empty_cache()
             platform.get_current_stream().synchronize()
         self._run_rank_synchronized("allocator-cache release", release_allocator_cache)
+
     @staticmethod
     def _run_rank_synchronized(operation: str, callback: Any) -> Any:
         """Run local work and make its failure visible on every training rank."""
@@ -858,7 +1100,12 @@ class SyncTrainer:
                 raise local_error
             return result
         errors: list[Optional[str]] = [None] * world_size
-        platform.all_gather_object(errors, None if local_error is None else str(local_error))
+        local_traceback = (
+            None
+            if local_error is None
+            else "".join(traceback.format_exception(local_error))
+        )
+        platform.all_gather_object(errors, local_traceback)
         if any(error is not None for error in errors):
             raise RuntimeError(f"{operation} failed on at least one rank: {errors}")
         return result

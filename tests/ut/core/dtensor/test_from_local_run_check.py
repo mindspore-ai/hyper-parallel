@@ -52,33 +52,6 @@ class TestFromLocalRunCheck(unittest.TestCase):
         self.assertIs(mock_checks.call_args.args[1], mesh)
         self.assertEqual(mock_checks.call_args.args[2], layout.placements)
 
-    def test_explicit_logical_meta_is_attached_to_an_uncached_layout(self):
-        """Uneven local shards should retain explicit logical shape, stride, and dtype."""
-        local = torch.ones(2, 3)
-        mesh = MagicMock()
-        cached_layout = MagicMock()
-        cached_layout.placements = (Shard(0),)
-        logical_layout = MagicMock()
-        logical_layout.placements = (Shard(0),)
-
-        with patch("hyper_parallel.core.dtensor.dtensor._build_layout", return_value=cached_layout), \
-                patch("hyper_parallel.core.dtensor.dtensor.cp.deepcopy", return_value=logical_layout):
-            DTensor.from_local(
-                local,
-                mesh,
-                [Shard(0)],
-                shape=(5, 3),
-                stride=(3, 1),
-            )
-
-        logical_layout.set_tensor_meta.assert_called_once_with((5, 3), (3, 1), torch.float32)
-        cached_layout.set_tensor_meta.assert_not_called()
-
-    def test_explicit_logical_meta_requires_shape_and_stride_together(self):
-        """Partial logical metadata should fail at the public constructor boundary."""
-        with self.assertRaisesRegex(ValueError, "shape and stride"):
-            DTensor.from_local(torch.ones(2), MagicMock(), [Shard(0)], shape=(3,))
-
     def test_check_tensor_meta_raises_on_mismatch(self):
         """Inconsistent metadata across ranks should raise ValueError."""
         local = torch.ones(2, 2)

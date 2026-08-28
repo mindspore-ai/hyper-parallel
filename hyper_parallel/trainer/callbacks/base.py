@@ -288,8 +288,6 @@ class CheckpointCallback(Callback):
         )
         self._last_saved_step = -1
         self._save_thread = None   # async save worker
-        self._save_error: Optional[Exception] = None
-        self._load_error: Optional[Exception] = None
 
     def on_train_begin(self, state: "TrainerState", **kwargs) -> None:
         """Resume from checkpoint: model + optimizer + lr_scheduler + step + RNG.
@@ -298,17 +296,13 @@ class CheckpointCallback(Callback):
         """
         if not self.load_path:
             return
-        self._load_error = None
         try:
             # pylint: disable=C0415
             # Non-model artifacts (optimizer/scheduler/RNG) are plain dicts —
             # use torch.save/load, matching the save side.
 
             if not os.path.isdir(self.load_path):
-                self._load_error = FileNotFoundError(
-                    f"Checkpoint path not found: {self.load_path}"
-                )
-                logger.warning("%s", self._load_error)
+                logger.warning("Checkpoint path not found: %s", self.load_path)
                 return
 
             # 1. Restore model via hyper DCP
@@ -361,18 +355,8 @@ class CheckpointCallback(Callback):
             if dispatch is not None:
                 dispatch(self.load_path)
 
-        except Exception as exc:  # pylint: disable=W0718
-            if not getattr(self.trainer, "_defer_checkpoint_errors", False) and not isinstance(
-                exc, (OSError, RuntimeError, ValueError)
-            ):
-                raise
-            self._load_error = exc
+        except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Failed to load checkpoint from %s: %s", self.load_path, exc)
-
-    def raise_if_load_failed(self) -> None:
-        """Raise a recorded checkpoint resume failure, if any."""
-        if self._load_error is not None:
-            raise RuntimeError(f"Failed to load checkpoint from {self.load_path}") from self._load_error
 
     def on_step_end(self, state: "TrainerState", *, loss: float = None,
                     grad_norm: float = None, **kwargs) -> None:
@@ -389,55 +373,19 @@ class CheckpointCallback(Callback):
         # Wait for any outstanding async save first so the two don't race on
         # the same directory / state-dict iterator.
         self._join_pending()
-        if self._save_error is not None and not getattr(
-            self.trainer, "_defer_checkpoint_errors", False
-        ):
-            self.raise_if_save_failed()
         if self.save_steps > 0 and state.global_step != self._last_saved_step:
             # Final save always sync — the process is about to exit.
             self._save(state)
 
-    def save_now(self, state: "TrainerState") -> None:
-        """Synchronously persist a checkpoint regardless of periodic cadence."""
-        self._join_pending()
-        if state.global_step != self._last_saved_step:
-            self._save(state)
-
-    def ensure_saved(self, step: int) -> None:
-        """Wait for a save and raise unless every local artifact completed."""
-        self._join_pending()
-        if self._save_error is not None:
-            raise RuntimeError(f"Checkpoint save failed at step {step}") from self._save_error
-        if self._last_saved_step != step:
-            raise RuntimeError(
-                f"Checkpoint step {step} was not saved; last successful step={self._last_saved_step}"
-            )
-
-    def raise_if_save_failed(self) -> None:
-        """Wait for pending work and raise a recorded checkpoint save failure."""
-        self._join_pending()
-        if self._save_error is not None:
-            raise RuntimeError("Checkpoint save failed") from self._save_error
-
     # --- async plumbing -------------------------------------------------
     def _dispatch_save(self, state: "TrainerState") -> None:
         """Route to sync or async save based on ``save_async`` flag."""
-        if self._save_error is not None and not getattr(
-            self.trainer, "_defer_checkpoint_errors", False
-        ):
-            self.raise_if_save_failed()
         if not self.save_async:
             self._save(state)
-            if not getattr(self.trainer, "_defer_checkpoint_errors", False):
-                self.raise_if_save_failed()
             return
         # Wait for previous save to finish before starting a new one; saving
         # twice concurrently would double RAM and race the filesystem.
         self._join_pending()
-        if self._save_error is not None and not getattr(
-            self.trainer, "_defer_checkpoint_errors", False
-        ):
-            self.raise_if_save_failed()
         # pylint: disable=C0415
         # Snapshot state fields so the worker doesn't see later mutations.
         snap_step = state.global_step
@@ -476,11 +424,10 @@ class CheckpointCallback(Callback):
         # nn.Module — platform.save_checkpoint expects Module (safetensors).
         # Use torch.save/load for these non-model artifacts.
         save_dir = os.path.join(self.output_dir, f"step_{state.global_step}")
+        os.makedirs(save_dir, exist_ok=True)
         rank = platform.get_rank()
-        self._save_error = None
 
         try:
-            os.makedirs(save_dir, exist_ok=True)
             # 1. Model — via hyper DCP (each rank saves its own shards)
             model_sd = self.trainer.model.state_dict()
             dcp_save(model_sd, checkpoint_id=save_dir, use_collectives=False)
@@ -527,15 +474,8 @@ class CheckpointCallback(Callback):
             if dispatch is not None:
                 dispatch(save_dir)
 
-        except Exception as exc:  # pylint: disable=W0718
-            self._save_error = exc
+        except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Failed to save checkpoint: %s", exc)
-            if (
-                not self.save_async
-                and not getattr(self.trainer, "_defer_checkpoint_errors", False)
-                and not isinstance(exc, (OSError, RuntimeError, ValueError))
-            ):
-                raise
 
         # HF format export is handled by SafetensorsExportCallback (separate concern).
 

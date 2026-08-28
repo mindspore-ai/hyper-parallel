@@ -205,22 +205,8 @@ class Configurable:
         super().__init_subclass__(**kwargs)
         if "Config" in cls.__dict__:
             config_cls = cls.__dict__["Config"]
-            if not (isinstance(config_cls, type) and issubclass(config_cls, Configurable.Config)):
-                raise TypeError(
-                    f"{cls.__name__}.Config must be a Configurable.Config subclass, "
-                    f"got {config_cls!r}"
-                )
-            # Read _owner from the Config class's own __dict__: a subclassed
-            # Config inherits the parent's binding and must be (re)bound,
-            # while an aliased Config (Config = OtherOwner.Config) carries its
-            # own binding and must be rejected.
-            if config_cls.__dict__.get("_owner") is not None:
-                raise TypeError(
-                    f"{cls.__name__}.Config is already bound to "
-                    f"{config_cls._owner.__name__}; subclass the Config instead of "
-                    "aliasing it"
-                )
-            config_cls._owner = cls
+            if issubclass(config_cls, Configurable.Config):
+                config_cls._owner = cls
 
 
 def enforce_module_config_slots(config_cls: type, owner_name: str) -> None:

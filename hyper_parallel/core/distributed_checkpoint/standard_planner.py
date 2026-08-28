@@ -15,7 +15,6 @@
 """Standard planner implementations for checkpoint save and load."""
 from dataclasses import dataclass
 import dataclasses
-import hashlib
 import pickle
 from typing import Any, Optional, Union
 
@@ -39,7 +38,11 @@ from hyper_parallel.core.distributed_checkpoint.planner import (
     ReadItem,
     LoadItemType
 )
-from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank, infer_intersection
+from hyper_parallel.core.distributed_checkpoint.reshard import infer_intersection
+from hyper_parallel.core.distributed_checkpoint.ragged_utils import (
+    create_ragged_write_items,
+    get_ragged_box_tensor,
+)
 from hyper_parallel.core.distributed_checkpoint.util import (
     narrow_tensor_by_index,
     chunk_to_area,
@@ -49,7 +52,7 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     set_element,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.layout import Layout, infer_slice_area_by_layout
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -74,8 +77,7 @@ class StandardSavePlanner(SavePlanner):
             enable_plan_caching: bool = True,
             remove_redundancy: bool = True,
             save_to_minimum_rank: bool = False,
-    ) -> None:
-        """Initialize save planning and optional structural plan caching."""
+    ):
         self.state_dict: Optional[dict[str, Any]] = None
         self.is_coordinator: bool = False
         self.rank: int = 0
@@ -83,9 +85,10 @@ class StandardSavePlanner(SavePlanner):
         self.save_to_minimum_rank: bool = save_to_minimum_rank
         self.flatten_state_dict: bool = True
         self._enable_plan_caching: bool = enable_plan_caching
+        self._default_enable_plan_caching: bool = enable_plan_caching
         self._cached_plans_key: str = self.__class__.__name__
 
-    def configure_planner(self, state_dict: dict[str, Any], **kwargs: Any) -> None:
+    def configure_planner(self, state_dict: dict[str, Any], **kwargs) -> None:
         """
         Configure planner.
 
@@ -101,41 +104,28 @@ class StandardSavePlanner(SavePlanner):
         self.flatten_state_dict = kwargs.get("flatten_state_dict", True)
 
         use_collectives = bool(kwargs.get("use_collectives", True))
+        self._enable_plan_caching = bool(
+            kwargs.get("enable_plan_caching", self._default_enable_plan_caching)
+        )
         if not use_collectives:
             self.remove_redundancy = False
             self._enable_plan_caching = False
-        elif "enable_plan_caching" in kwargs:
-            self._enable_plan_caching = bool(kwargs["enable_plan_caching"])
 
         if self.flatten_state_dict:
             state_dict, self.name_mapping = flatten_state_dict(state_dict)
         self.state_dict = state_dict
+        if any(
+                isinstance(obj, DTensor)
+                and obj.layout is not None
+                and obj.layout.ragged_shard is not None
+                for obj in state_dict.values()
+        ):
+            self._enable_plan_caching = False
         self._cached_plans_key = self._build_cache_key(state_dict)
 
     def _build_cache_key(self, state_dict: dict[str, Any]) -> str:
-        """Build a stable cache namespace from checkpoint structure and tensor layouts."""
-        entries = []
-        for name, value in state_dict.items():
-            if isinstance(value, DTensor):
-                descriptor = (
-                    "dtensor",
-                    str(value.dtype),
-                    tuple(value.shape),
-                    value.layout.compact_str,
-                    repr(getattr(value, CHUNK_INFO, None)),
-                )
-            elif isinstance(value, Tensor):
-                descriptor = (
-                    "tensor",
-                    str(value.dtype),
-                    tuple(value.shape),
-                    repr(getattr(value, CHUNK_INFO, None)),
-                )
-            else:
-                descriptor = (type(value).__module__, type(value).__qualname__)
-            entries.append((name, descriptor))
-        digest = hashlib.sha256(pickle.dumps(entries)).hexdigest()
-        return f"{self.__class__.__name__}:{digest}"
+        """Build a stable cache namespace from sorted state_dict keys."""
+        return f"{self.__class__.__name__}:{'||'.join(state_dict.keys())}"
 
     def build_local_plan(self) -> SavePlan:
         """
@@ -177,11 +167,10 @@ class StandardSavePlanner(SavePlanner):
 
             inner_rank_id = dtensor_layout.rank_list.index(current_rank)
             # Calculate slice area using infer_slice_area_by_rank
-            slice_area = infer_slice_area_by_rank(
-                mesh_shape=dtensor_layout.mesh_shape,
-                tensor_map=dtensor_layout.tensor_map,
-                rank_id=inner_rank_id,
-                full_shape=global_shape
+            slice_area = infer_slice_area_by_layout(
+                dtensor_layout,
+                inner_rank_id,
+                global_shape,
             )
             # Extract offsets (start values) from slice_area
             return tuple(start for start, _ in slice_area)
@@ -190,6 +179,9 @@ class StandardSavePlanner(SavePlanner):
         for fqn, obj in self.state_dict.items():
             # Check if it's a DTensor
             if isinstance(obj, DTensor):
+                if obj.layout is not None and obj.layout.ragged_shard is not None:
+                    items.extend(create_ragged_write_items(fqn, obj))
+                    continue
                 # Create write item for DTensor
                 local_tensor = obj.to_local()
                 layout = obj.layout
@@ -378,6 +370,8 @@ class StandardSavePlanner(SavePlanner):
         obj = self.state_dict[fqn]
         if item.type == WriteItemType.TENSOR:
             if isinstance(obj, DTensor):
+                if obj.layout is not None and obj.layout.ragged_shard is not None:
+                    return get_ragged_box_tensor(obj, item.index).detach().cpu()
                 return obj.to_local().detach().cpu()
             if isinstance(obj, Tensor):
                 return obj.detach().cpu()
@@ -443,7 +437,7 @@ class StandardLoadPlanner(LoadPlanner):
     Iterate state_dict and creates load plans via chunk list for resharding support.
     """
 
-    def __init__(self, allow_partial_load: bool = False) -> None:
+    def __init__(self, allow_partial_load: bool = False):
         """
         Args:
             allow_partial_load (bool): If True, allow loading when checkpoint has fewer keys than state_dict.
@@ -456,12 +450,7 @@ class StandardLoadPlanner(LoadPlanner):
         self.allow_partial_load = allow_partial_load
         self.flatten_state_dict: bool = True
 
-    def configure_planner(
-        self,
-        state_dict: dict[str, Any],
-        metadata: Metadata,
-        **kwargs: Any,
-    ) -> None:
+    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
         """
         Configure planner with state dict and metadata.
 
@@ -581,6 +570,18 @@ class StandardLoadPlanner(LoadPlanner):
             raise KeyError(f"Key {fqn} not found in state_dict")
 
         target = self.state_dict[fqn]
+        if (
+                isinstance(target, DTensor)
+                and target.layout is not None
+                and target.layout.ragged_shard is not None
+        ):
+            box_tensor = get_ragged_box_tensor(target, read_item.dest_index)
+            return narrow_tensor_by_index(
+                box_tensor,
+                read_item.dest_offsets,
+                read_item.lengths,
+            )
+
         local_tensor = target.to_local().detach() if isinstance(target, DTensor) else target.detach()
         return narrow_tensor_by_index(
             local_tensor,
@@ -635,16 +636,9 @@ class _DcpMergeLoadPlanner(StandardLoadPlanner):
     """Load planner that builds distributed checkpoint from dcp into fully ``state_dict`` (in-place)."""
 
     def __init__(self) -> None:
-        """Initialize a load planner that reconstructs every checkpoint entry."""
         super().__init__()
 
-    def configure_planner(
-        self,
-        state_dict: dict[str, Any],
-        metadata: Metadata,
-        **kwargs: Any,
-    ) -> None:
-        """Populate an empty destination from checkpoint metadata before loading."""
+    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
         if len(state_dict) > 0:
             raise ValueError(
                 "state_dict must be empty for _DcpMergeLoadPlanner; "

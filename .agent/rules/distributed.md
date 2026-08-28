@@ -1,4 +1,5 @@
 ---
+name: distributed
 description: Rules for distributed system code (DTensor, collectives, stream sync, memory)
 paths:
   - hyper_parallel/core/**

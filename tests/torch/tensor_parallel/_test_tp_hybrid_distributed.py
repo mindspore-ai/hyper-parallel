@@ -27,7 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-import torch_npu  # noqa: F401  -- Ascend NPU
+import torch_npu  # noqa: F401  # pylint: disable=unused-import  # side effect: register Ascend NPU
 
 from hyper_parallel import (
     ColwiseParallel,
@@ -63,6 +63,14 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(hidden_f, out_f, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the two-layer MLP forward pass.
+
+        Args:
+            x: Input activations.
+
+        Returns:
+            Output activations.
+        """
         return self.w2(F.relu(self.w1(x)))
 
 
@@ -171,5 +179,6 @@ def test_tp_fsdp_mlp_fwd_bwd_precision_npu():
     tp_group = root_mesh.get_group("tp")
     gathered_tp = [torch.empty_like(dp_full_grad) for _ in range(tp_size)]
     dist.all_gather(gathered_tp, dp_full_grad, group=tp_group)
-    full_grad = torch.cat(gathered_tp, dim=0).cpu() / dp_size
+    # fully_shard defaults to AVG, so gathering the DP shards already reconstructs the reference gradient.
+    full_grad = torch.cat(gathered_tp, dim=0).cpu()
     _npu_precision_close(full_grad, ref_w1_grad)

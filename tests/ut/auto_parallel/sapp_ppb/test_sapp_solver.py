@@ -326,7 +326,7 @@ class TestSappSolver:
         assert pipe.fuse_layer_per_recompute(split_strategy) == aggregate_strategy
         assert pipe.get_manual_memory_parameter(split_strategy) == [[13, 17]]
         assert pipe.get_manual_memory_activation(split_strategy) == [[6, 6]]
-        assert pipe.get_manual_time(split_strategy) == [[13, 13]]
+        assert pipe.get_manual_time(split_strategy) == [[15, 15]]
         assert pipe.get_manual_fw_time(split_strategy) == [[5, 5]]
         assert pipe.get_manual_recompute_time(split_strategy) == [[0.0, 0.0]]
         pipe.debug_print_manual_theoretical_memory(split_strategy)
@@ -571,9 +571,10 @@ manual:
         assert list(tmp_path.glob("problem_unit_*.lp"))
 
         unused_rec = Recompute.TYPE.SLCT
+        saved = solver.recompute_considered_[unused_rec]
         solver.recompute_considered_[unused_rec] = False
         solver.add_optional_recompute_constraint(solver.problem_, solver.variables_, solver.layers_sorted_)
-        solver.recompute_considered_[unused_rec] = True
+        solver.recompute_considered_[unused_rec] = saved
 
     def test_sequence_updates_and_comm_simulation_without_solver(self, tmp_path, monkeypatch):
         """Cover sequence-pipeline mutation and communication simulation with tiny inputs."""
@@ -593,6 +594,8 @@ manual:
             time_=12.0,
             forward_time_=4.0,
             backward_time_rec_={rec: 8.0 for rec in Recompute.TYPE},
+            recompute_considered_={rec: True for rec in Recompute.TYPE},
+            name_="layer_group_1",
             update_internal_time_for_seqpp=lambda: time_updates.append("body"),
         )
         head = SimpleNamespace(

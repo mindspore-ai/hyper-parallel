@@ -18,17 +18,18 @@ import os
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 
-from rl.consistency import install_rollout_consistency_profile
-from rl.roles.model import HYPER_QWEN3_5_ARCHITECTURE, HYPER_QWEN3_ARCHITECTURE
+from rl.consistency import (
+    CONSISTENCY_PROFILE_OFF,
+    consistency_runtime_state,
+    install_rollout_consistency_profile,
+)
+from rl.consistency.qwen3_dense import install_qwen3_rollout_rms_norm_diagnostic
+from rl.roles.model import HYPER_QWEN3_ARCHITECTURE
 from rl.roles.weight_sync.vllm_worker import install_vllm_weight_sync_hooks
 
 HYPER_QWEN3_MODEL_CLASS = "rl.roles.rollout.vllm_qwen3:HyperQwen3ForCausalLM"
-HYPER_QWEN3_5_MODEL_CLASS = (
-    "rl.roles.rollout.vllm_qwen3_5:HyperQwen3_5ForCausalLM"
-)
 _HYPER_MODELS = {
     HYPER_QWEN3_ARCHITECTURE: HYPER_QWEN3_MODEL_CLASS,
-    HYPER_QWEN3_5_ARCHITECTURE: HYPER_QWEN3_5_MODEL_CLASS,
 }
 _SUPPORTED_VLLM_VERSION = "0.22.1"
 _SUPPORTED_VLLM_ASCEND_VERSION = "0.22.1rc1"
@@ -37,9 +38,20 @@ _LOGGER = logging.getLogger(__name__)
 
 def register_hyper_models() -> None:
     """Register supported HyperParallel model adapters with vLLM."""
+    diagnostic_rms_norm = os.environ.get("HYPER_RL_TEST_QWEN3_RMS_NORM", "0")
+    if diagnostic_rms_norm not in ("0", "1"):
+        raise ValueError("HYPER_RL_TEST_QWEN3_RMS_NORM must be 0 or 1")
+    if diagnostic_rms_norm == "1":
+        install_qwen3_rollout_rms_norm_diagnostic()
     profile = os.environ.get("HYPER_RL_CONSISTENCY_PROFILE")
     if profile is not None:
         install_rollout_consistency_profile(profile)
+    _LOGGER.info(
+        "training-inference consistency rollout runtime: enabled=%s recipe=%s state=%s",
+        profile is not None,
+        profile or CONSISTENCY_PROFILE_OFF,
+        consistency_runtime_state(),
+    )
     try:
         installed_version = package_version("vllm").split("+", maxsplit=1)[0]
     except PackageNotFoundError:
@@ -81,7 +93,6 @@ def register_hyper_models() -> None:
 
 
 __all__ = [
-    "HYPER_QWEN3_5_ARCHITECTURE",
     "HYPER_QWEN3_ARCHITECTURE",
     "register_hyper_models",
 ]

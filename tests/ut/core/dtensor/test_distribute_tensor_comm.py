@@ -21,7 +21,9 @@ def test_distribute_tensor_none_uses_local_slice():
          patch("hyper_parallel.core.dtensor.dtensor.DTensor") as mock_dt:
         distribute_tensor(tensor, mesh, [Shard(0)], src_data_rank=None)
         mock_slice.assert_called_once_with(tensor, layout)
-        mock_dt.assert_called_once_with(local, mesh, layout.alias_placements)
+        mock_dt.from_local_with_layout.assert_called_once_with(
+            local, layout, shape=(8, 4)
+        )
 
 
 def test_distribute_tensor_default_uses_local_slice():
@@ -38,7 +40,9 @@ def test_distribute_tensor_default_uses_local_slice():
          patch("hyper_parallel.core.dtensor.dtensor.DTensor") as mock_dt:
         distribute_tensor(tensor, mesh, [Shard(0)])
         mock_slice.assert_called_once_with(tensor, layout)
-        mock_dt.assert_called_once_with(local, mesh, layout.alias_placements)
+        mock_dt.from_local_with_layout.assert_called_once_with(
+            local, layout, shape=(8, 4)
+        )
 
 
 def test_distribute_tensor_explicit_src_data_rank_uses_communication_path():
@@ -59,7 +63,9 @@ def test_distribute_tensor_explicit_src_data_rank_uses_communication_path():
          patch("hyper_parallel.core.dtensor.dtensor.DTensor") as mock_dt:
         distribute_tensor(tensor, mesh, [Shard(0)], src_data_rank=0)
         mock_comm.assert_called_once_with(tensor, mesh, layout.placements, 0)
-        mock_dt.assert_called_once_with(local, mesh, layout.alias_placements)
+        mock_dt.from_local_with_layout.assert_called_once_with(
+            local, layout, shape=(8, 4)
+        )
 
 
 def test_distribute_shard_then_replicate():

@@ -14,6 +14,7 @@
 # ============================================================================
 """_op_dispatch"""
 import atexit
+import copy
 import glob
 import importlib
 import logging
@@ -28,6 +29,7 @@ import yaml
 
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import RaggedShardInfo
 from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker, is_rng_supported_mesh
 from hyper_parallel.core.dtensor.debug._dispatch_logger import log_dispatch_enter, log_dispatch_exit
 from hyper_parallel.platform import get_platform
@@ -82,6 +84,42 @@ def _apply_shard_offset_to_rng_args(args, offset_incr):
 _dtensor_dispatch_disabled: ContextVar[bool] = ContextVar('_dtensor_dispatch_disabled', default=False)
 _no_skip_ops: ContextVar[FrozenSet[str]] = ContextVar('_no_skip_ops', default=frozenset())
 _debug_mode_observer: ContextVar = ContextVar('_debug_mode_observer', default=None)
+
+_RAGGED_ELEMENTWISE_OPS = {
+    "abs": "unary", "absolute": "unary", "clone": "unary", "cos": "unary",
+    "conj": "unary", "empty_like": "unary", "exp": "unary", "gelu": "unary",
+    "isinf": "unary", "isnan": "unary",
+    "log": "unary", "neg": "unary", "negative": "unary", "relu": "unary",
+    "rsqrt": "unary", "sigmoid": "unary", "silu": "unary", "sin": "unary",
+    "sqrt": "unary", "square": "unary", "zeros_like": "unary",
+    "add": "binary", "add_": "binary", "addcdiv_": "binary",
+    "addcmul_": "binary", "div": "binary", "lerp_": "binary",
+    "mul": "binary", "mul_": "binary", "pow": "binary", "real_div": "binary",
+    "sub": "binary", "__rsub__": "binary", "__rpow__": "binary",
+    "true_divide": "binary",
+}
+
+_RAGGED_INPLACE_ELEMENTWISE_OPS = frozenset({
+    "add_",
+    "addcdiv_",
+    "addcmul_",
+    "lerp_",
+    "mul_",
+})
+
+# Tensor subclass bookkeeping must stay available when a Ragged DTensor is
+# wrapped as a Parameter. These operations only inspect or update the local
+# autograd wrapper and do not reinterpret the logical distributed shape.
+_RAGGED_METADATA_BYPASS_OPS = frozenset({
+    "requires_grad_",
+    "__get__",
+    "__set__",
+    "register_hook",
+    "_has_compatible_shallow_copy_type",
+    "is_complex",
+    "is_floating_point",
+    "is_contiguous",
+})
 
 
 def get_no_skip_ops() -> FrozenSet[str]:
@@ -530,6 +568,61 @@ class OpDispatcher:
         return {k: OpDispatcher._unwrap_value(v) for k, v in kwargs.items()}
 
     @staticmethod
+    def _collect_dtensors(value: object) -> List[DTensor]:
+        """Return all DTensors nested in one dispatch argument."""
+        if isinstance(value, DTensor):
+            return [value]
+        if isinstance(value, (tuple, list)):
+            return list(chain.from_iterable(
+                OpDispatcher._collect_dtensors(item) for item in value
+            ))
+        if isinstance(value, dict):
+            return list(chain.from_iterable(
+                OpDispatcher._collect_dtensors(item) for item in value.values()
+            ))
+        return []
+
+    def _validate_ragged_dispatch(
+        self, op_name: str, args: tuple, kwargs: dict
+    ) -> Optional[DTensor]:
+        """Return the first Ragged input for a whitelisted elementwise op."""
+        reference = next(
+            (
+                dtensor for dtensor in self._collect_dtensors((args, kwargs))
+                if isinstance(getattr(dtensor.layout, "ragged_shard", None), RaggedShardInfo)
+            ),
+            None,
+        )
+        if reference is None:
+            return None
+        if op_name not in _RAGGED_ELEMENTWISE_OPS:
+            raise RuntimeError(
+                f"Operator {op_name!r} does not support RaggedShard in phase one"
+            )
+        return reference
+
+    def _dispatch_ragged_elementwise(
+        self, op_call: callable, args: tuple, kwargs: dict,
+        reference: DTensor,
+    ) -> DTensor:
+        """Execute a whitelisted op locally and inherit its Ragged Layout."""
+        local_args = tuple(self._unwrap_args(args))
+        local_kwargs = self._unwrap_kwargs(kwargs)
+        py_output = op_call(*local_args, **local_kwargs)
+        op_name = platform.get_op_name(op_call)
+        if op_name in _RAGGED_INPLACE_ELEMENTWISE_OPS:
+            if not args or not isinstance(args[0], DTensor):
+                raise ValueError(
+                    f"Ragged in-place operator {op_name!r} requires a DTensor first argument"
+                )
+            return args[0]
+        return DTensor.from_local_with_layout(
+            py_output,
+            copy.deepcopy(reference.layout),
+            shape=tuple(reference.shape),
+        )
+
+    @staticmethod
     def _gather_dtensors_to_full(args: tuple, kwargs: dict) -> tuple:
         """Gather all DTensor arguments to full tensors for fallback execution.
 
@@ -925,7 +1018,17 @@ class OpDispatcher:
 
         result = None
         try:
-            if self._should_bypass_dispatch(op_name):
+            should_bypass = self._should_bypass_dispatch(op_name)
+            ragged_dtensor = None
+            if not should_bypass or op_name not in _RAGGED_METADATA_BYPASS_OPS:
+                ragged_dtensor = self._validate_ragged_dispatch(op_name, args, kwargs)
+            if ragged_dtensor is not None:
+                result = self._dispatch_ragged_elementwise(
+                    op_call, args, kwargs, ragged_dtensor
+                )
+                return result
+
+            if should_bypass:
                 self._validate_inplace_partial_inputs(op_name, args, kwargs)
                 result = op_call(*self._unwrap_args(args), **self._unwrap_kwargs(kwargs))
                 if op_name in self._INPLACE_BYPASS_OPS and args and isinstance(args[0], DTensor):

@@ -300,11 +300,60 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
         )
 
 
+class TestRootBackwardCallback(unittest.TestCase):
+    """Unit tests for root-only backward finalizer registration."""
+
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.Variable")
+    def test_root_backward_pre_hook_queues_finalizer(self, mock_variable):
+        """Only the root scheduler should queue the end-of-backward callback."""
+        scheduler = _make_scheduler_stub()
+        scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler._is_root = True
+        scheduler.cell = MagicMock()
+        scheduler._hsdp_backward_pre_hook = MagicMock()
+        grad = torch.ones(1)
+
+        result = scheduler._backward_pre_hook(grad)
+
+        self.assertIs(result, grad)
+        mock_variable._execution_engine.queue_callback.assert_called_once_with(
+            scheduler._root_backward_hook
+        )
+        scheduler._hsdp_backward_pre_hook.assert_called_once_with(scheduler.cell, None)
+
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.Variable")
+    def test_non_root_backward_pre_hook_does_not_queue_finalizer(self, mock_variable):
+        """A child scheduler should run its pre-hook without queuing root finalization."""
+        scheduler = _make_scheduler_stub()
+        scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler._is_root = False
+        scheduler.cell = MagicMock()
+        scheduler._hsdp_backward_pre_hook = MagicMock()
+
+        scheduler._backward_pre_hook(torch.ones(1))
+
+        mock_variable._execution_engine.queue_callback.assert_not_called()
+        scheduler._hsdp_backward_pre_hook.assert_called_once_with(scheduler.cell, None)
+
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.Variable")
+    def test_repeated_backward_pre_hook_does_not_queue_again(self, mock_variable):
+        """A repeated output hook in PRE_BACKWARD should have no side effects."""
+        scheduler = _make_scheduler_stub()
+        scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+        scheduler._is_root = True
+        scheduler.cell = MagicMock()
+        scheduler._hsdp_backward_pre_hook = MagicMock()
+        grad = torch.ones(1)
+
+        result = scheduler._backward_pre_hook(grad)
+
+        self.assertIs(result, grad)
+        mock_variable._execution_engine.queue_callback.assert_not_called()
+        scheduler._hsdp_backward_pre_hook.assert_not_called()
+
+
 class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
     """Unit tests for forward-prefetch suppression during activation recompute."""
-
-    def tearDown(self):
-        HSDPSchedulerV2.root_bp_state = False
 
     def test_forward_pre_hook_disables_prefetch_during_recompute(self):
         """_hsdp_forward_pre_hook clears prefetch targets when root_bp_state is True.
@@ -340,7 +389,7 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
         scheduler._lazy_init_all_states = MagicMock()
         scheduler._register_post_backward_hook = MagicMock(return_value=("wrapped_args", "wrapped_kwargs"))
 
-        HSDPSchedulerV2.root_bp_state = True
+        scheduler.scheduler_ctx.root_bp_state = True
 
         result = scheduler._forward_pre_hook(MagicMock(), ("arg",), {"k": "v"})
 
@@ -360,7 +409,7 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
         scheduler._register_backward_pre_hook = MagicMock()
         scheduler._hsdp_forward_hook = MagicMock()
 
-        HSDPSchedulerV2.root_bp_state = True
+        scheduler.scheduler_ctx.root_bp_state = True
 
         result = scheduler._forward_hook(MagicMock(), MagicMock(), outputs)
 
@@ -384,6 +433,7 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
         prefetch_cell.hsdp_scheduler.hsdp_state = prefetch_state
         scheduler.backward_prefetch_cells = [prefetch_cell]
         scheduler.platform = MagicMock()
+        scheduler.scheduler_ctx = HSDPSchedulerContext()
         scheduler.platform.profiler_record.return_value = MagicMock(
             __enter__=MagicMock(return_value=None),
             __exit__=MagicMock(return_value=False),
@@ -470,6 +520,7 @@ class TestTorchSchedulerSetup(unittest.TestCase):
     """Unit tests for Torch scheduler setup helpers and hook registration."""
 
     def _make_scheduler(self, mesh=None):
+        """Create a minimally initialized Torch scheduler for setup tests."""
         scheduler = object.__new__(TorchHSDPSchedulerV2)
         scheduler.modules = (nn.Linear(2, 2),)
         scheduler.mesh = mesh
@@ -480,9 +531,35 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         scheduler.ignored_params = set()
         scheduler.replicate_params = set()
         scheduler.platform = MagicMock()
+        scheduler.scheduler_ctx = HSDPSchedulerContext()
         scheduler.device = torch.device("cpu")
-        scheduler.tp_grad_infos = None
+        scheduler.source_shard_infos = None
         return scheduler
+
+    def test_dynamo_disable_preserves_fsdp_hook_metadata(self):
+        """The native Dynamo decorator should preserve FSDP hook metadata."""
+        hook = TorchHSDPSchedulerV2._forward_pre_hook
+
+        self.assertEqual(hook.__name__, "_forward_pre_hook")
+        self.assertEqual(hook.__wrapped__.__name__, "_forward_pre_hook")
+
+    def test_fsdp_runtime_hooks_are_dynamo_disabled(self):
+        """All FSDP runtime scheduler entries should carry the native decorator."""
+        hook_names = (
+            "_forward_pre_hook",
+            "_forward_hook",
+            "_backward_pre_hook",
+            "_root_backward_hook",
+            "_backward_hook",
+            "_grouped_forward_pre_hook",
+            "reset_iter_state",
+        )
+
+        for hook_name in hook_names:
+            self.assertTrue(
+                hasattr(getattr(TorchHSDPSchedulerV2, hook_name), "__wrapped__"),
+                hook_name,
+            )
 
     @patch("hyper_parallel.platform.torch.fully_shard.scheduler.TorchHSDPStateV2")
     def test_new_cell_state_forwards_scheduler_configuration(self, mock_state_ctor):
@@ -501,8 +578,9 @@ class TestTorchSchedulerSetup(unittest.TestCase):
             scheduler.ignored_params,
             scheduler.replicate_params,
             scheduler.platform,
+            scheduler.scheduler_ctx,
             scheduler.device,
-            tp_grad_infos=None,
+            source_shard_infos=None,
         )
 
     def test_grouped_hook_skip_returns_torch_noop(self):
@@ -551,6 +629,8 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         module_a.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
         module_b.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
         self.assertEqual(scheduler._register_forward_module_hook.call_count, 2)
+        for call in scheduler._register_forward_module_hook.call_args_list:
+            self.assertTrue(hasattr(call.args[1], "__wrapped__"))
 
 
 if __name__ == "__main__":

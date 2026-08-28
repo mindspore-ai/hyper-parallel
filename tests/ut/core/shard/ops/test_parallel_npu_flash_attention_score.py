@@ -337,7 +337,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         assert len(softmax_sum.to_dict()["tensor_map"]) == 4
         assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1, -1)
         assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
-        assert softmax_out.to_dict()["tensor_map"] == ()
+        assert softmax_out.to_dict()["tensor_map"] == (-1,)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_multi_dimensional_mesh_18(self, mock_platform):
@@ -1186,7 +1186,7 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
             np.empty((2, 2, 32), dtype=np.float32),
             np.empty((2, 2, 8), dtype=np.float32),
             np.empty((2, 2, 8), dtype=np.float32),
-            np.empty((), dtype=np.float32),
+            np.empty((1,), dtype=np.float32),
         )
 
         def _wrap_with_layout(local_tensor, device_mesh, placements, layout):

@@ -23,7 +23,7 @@ Applies to all distributed operator tests under `tests/`. Two test layers are re
 
 **File naming:** `test_<source_file_name>.py` — strict 1-to-1 with `hyper_parallel/core/shard/ops/<source_file_name>.py`. One UT file per source file; do not split.
 
-**Framework:** `unittest.TestCase` only. Do not use pytest.
+**Framework:** write UT case bodies as `unittest.TestCase`. Do **not** write pytest-native test functions/fixtures as the primary structure for these UT files. Still **run** them with pytest. (Runner vs authoring — see `.agent/rules/testing.md`.)
 
 **setUp / tearDown must:**
 
@@ -206,16 +206,6 @@ Suite entry functions use `tag_include` to select cases. No `level` field on `Op
 
 ## Assertion Format
 
-- Use f-strings for all assertion messages.
-- Print both compared values in the message.
-- Keep each line ≤ 120 characters; use parentheses to wrap multi-line messages.
+Canonical style: `.agent/rules/test-assertion-style.md` (f-strings, both values, ≤120 cols).
 
-```python
-# Correct
-assert np.allclose(a, b, 1e-3, 1e-3), (
-    f"Data parallel mismatch: standalone={a}, parallel={b}"
-)
-
-# Wrong — no values printed
-assert np.allclose(a, b, 1e-3, 1e-3), "Test failed"
-```
+Op-specific extras above (e.g. `assertRaisesRegex` substring matching) still apply.

@@ -19,6 +19,8 @@ parameter shards on ``head`` or ``feature`` dimensions and norms on the
 sequence axis so per-step gradients stay slice-faithful to the single-card
 run.
 """
+# Qwen3.5 is currently registered as a Torch model implementation.
+# pylint: disable=forbidden-backend-import
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Optional, TYPE_CHECKING
@@ -422,16 +424,25 @@ def _shard_gated_delta_local_params(linear_attn, tp_mesh: DeviceMesh) -> None:
     )
 
 
-def _build_gated_delta_tp_load_transforms(
+def qwen3_5_tp_load_transforms(
     model: Qwen3_5ForCausalLM,
-    tp_mesh: DeviceMesh,
-    *,
-    require_pre_sharded_params: bool,
+    mesh: DeviceMesh,
+    cfg: "HyperTrainerConfig",
 ) -> dict:
-    """Build the canonical load-time transforms for TP-local GDN parameters."""
-    if tp_mesh.size() <= 1 or not _has_linear_attention_layers(model):
-        return {}
+    """``ModelSpec.tp_load_transform_fn`` — slice GatedDeltaNet TP-local weights.
 
+    Under the trainer's meta-init → parallelize → load order the GatedDeltaNet
+    ``in_proj_qkv`` / ``conv1d`` / ``dt_bias`` / ``A_log`` params are sliced to
+    a rank-local head subset on meta (see
+    :func:`_shard_gated_delta_local_params`), so the full checkpoint weight no longer
+    matches their shape. This returns transforms that map the full checkpoint
+    tensors to this rank's slices before load. No-op for ``tp <= 1`` or a
+    full-attention-only model.
+    """
+    tp_size = int(cfg.train.accelerator.tp or 1)
+    if tp_size <= 1 or not _has_linear_attention_layers(model):
+        return {}
+    tp_mesh = mesh["tp"]
     transforms: dict = {}
     for idx, block in enumerate(model.layers):
         if block.layer_type == "full_attention":
@@ -446,7 +457,7 @@ def _build_gated_delta_tp_load_transforms(
             2 * linear_attn.key_dim
             + linear_attn.num_v_heads * linear_attn.head_v_dim
         )
-        if require_pre_sharded_params and linear_attn.conv1d.weight.shape[0] == full_conv_dim:
+        if linear_attn.conv1d.weight.shape[0] == full_conv_dim:
             continue
         q_slice, k_slice, v_slice, head_start, head_end = _gated_delta_tp_slices(
             linear_attn, tp_mesh,
@@ -467,54 +478,14 @@ def _build_gated_delta_tp_load_transforms(
     return transforms
 
 
-def qwen3_5_tp_load_transforms(
-    model: Qwen3_5ForCausalLM,
-    mesh: DeviceMesh,
-    cfg: "HyperTrainerConfig",
-) -> dict:
-    """``ModelSpec.tp_load_transform_fn`` — slice GatedDeltaNet TP-local weights.
-
-    Under the trainer's meta-init → parallelize → load order the GatedDeltaNet
-    ``in_proj_qkv`` / ``conv1d`` / ``dt_bias`` / ``A_log`` params are sliced to
-    a rank-local head subset on meta (see
-    :func:`_shard_gated_delta_local_params`), so the full checkpoint weight no longer
-    matches their shape. This returns transforms that map the full checkpoint
-    tensors to this rank's slices before load. No-op for ``tp <= 1`` or a
-    full-attention-only model.
-    """
-    tp_size = int(cfg.train.accelerator.tp or 1)
-    if tp_size <= 1 or not _has_linear_attention_layers(model):
-        return {}
-    return _build_gated_delta_tp_load_transforms(
-        model,
-        mesh["tp"],
-        require_pre_sharded_params=True,
-    )
-
-
-def qwen3_5_inference_tp_load_transforms(
-    model: Qwen3_5ForCausalLM,
-    tp_mesh: DeviceMesh,
-) -> dict:
-    """Return transforms for native GDN parameters sliced outside DTensor.
-
-    Args:
-        model: Native Qwen3.5 model whose GDN parameters are already TP-local.
-        tp_mesh: One-dimensional inference tensor-parallel mesh.
-
-    Returns:
-        Checkpoint-key transforms that select this rank's GDN blocks.
-    """
-    return _build_gated_delta_tp_load_transforms(
-        model,
-        tp_mesh,
-        require_pre_sharded_params=False,
-    )
-
-
-def _apply_linear_attention_cp(module: nn.Module, cp_mesh: DeviceMesh, mode: str) -> None:
+def _apply_linear_attention_cp(
+    module: nn.Module,
+    cp_mesh: DeviceMesh,
+    mode: str,
+    backend: str,
+) -> None:
     """Apply CP to a Qwen3.5 linear-attention module."""
-    LinearAttentionContextParallel(mode=mode).apply(module, cp_mesh)
+    LinearAttentionContextParallel(mode=mode, backend=backend).apply(module, cp_mesh)
 
 
 def _validate_qwen3_5_tp_config(model: Qwen3_5ForCausalLM, tp_world: int) -> None:
@@ -541,141 +512,69 @@ def _validate_qwen3_5_tp_config(model: Qwen3_5ForCausalLM, tp_world: int) -> Non
             )
 
 
-def _validate_qwen3_5_inference_tp_config(
-    model: Qwen3_5ForCausalLM,
-    tp_world: int,
-) -> None:
-    """Validate inference TP dimensions that Hyper shards without padding."""
-    _validate_qwen3_5_tp_config(model, tp_world)
-    cfg = model.config
-    for field, value in (
-        ("vocab_size", cfg.vocab_size),
-        ("intermediate_size", cfg.intermediate_size),
-    ):
-        if value % tp_world != 0:
-            raise ValueError(
-                f"{field} ({value}) must be divisible by TP size ({tp_world})."
-            )
-
-
-_TP_PROFILE_TRAINING_SP = "training_sp"
-_TP_PROFILE_INFERENCE_REPLICATED = "inference_replicated"
-
-
-def _build_qwen3_5_tp_plans(
-    activation_profile: str,
-    *,
-    enable_loss_parallel: bool = False,
-):
-    """Build canonical parameter-sharding plans with profile-specific activations."""
-    if activation_profile == _TP_PROFILE_TRAINING_SP:
-        output_layout = Shard(1)
-        colwise = ColwiseParallel()
-        rowwise_output = RowwiseParallel(
-            input_layouts=Shard(-1),
-            output_layouts=output_layout,
-            use_local_output=False,
-        )
-        rowwise_reduce_output = RowwiseParallel(
-            input_layouts=Shard(-1),
-            output_layouts=output_layout,
-            reduce_dtype=torch.float32,
-            use_local_output=False,
-        )
-        norm = SequenceParallel(sequence_dim=1, use_local_output=False)
-        input_boundary = PrepareModuleInput(
-            input_layouts=(output_layout,),
-            desired_input_layouts=(Replicate(),),
-            use_local_output=True,
-        )
-        root = {
-            "model.embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=output_layout,
-                use_local_output=False,
-            ),
-            "model.norm": norm,
-            "lm_head": ColwiseParallel(
-                input_layouts=output_layout,
-                output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
-                use_local_output=not enable_loss_parallel,
-            ),
-        }
-        layer_boundaries = {
-            "input_layernorm": norm,
-            "post_attention_layernorm": norm,
-            "mlp": input_boundary,
-        }
-    elif activation_profile == _TP_PROFILE_INFERENCE_REPLICATED:
-        output_layout = Replicate()
-        colwise = ColwiseParallel(
-            input_layouts=Replicate(),
-            output_layouts=Shard(-1),
-            use_local_output=True,
-        )
-        rowwise_output = RowwiseParallel(
-            input_layouts=Shard(-1),
-            output_layouts=output_layout,
-            use_local_output=True,
-        )
-        rowwise_reduce_output = rowwise_output
-        input_boundary = None
-        root = {
-            "model.embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=output_layout,
-                use_local_output=True,
-            ),
-            "lm_head": ColwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=output_layout,
-                use_local_output=True,
-            ),
-        }
-        layer_boundaries = {}
-    else:
-        raise ValueError(
-            f"Unknown Qwen3.5 TP activation profile {activation_profile!r}; expected "
-            f"{_TP_PROFILE_TRAINING_SP!r} or {_TP_PROFILE_INFERENCE_REPLICATED!r}."
-        )
-
-    mlp = {
+def _build_qwen3_5_tp_plans(sp_layout, enable_loss_parallel: bool):
+    """Build reusable TP plans for dense Qwen3.5 blocks."""
+    rowwise_output_plan = RowwiseParallel(
+        input_layouts=Shard(-1),
+        output_layouts=sp_layout,
+        use_local_output=False,
+    )
+    rowwise_reduce_output_plan = RowwiseParallel(
+        input_layouts=Shard(-1),
+        output_layouts=sp_layout,
+        reduce_dtype=torch.float32,
+        use_local_output=False,
+    )
+    norm_plan = SequenceParallel(sequence_dim=1, use_local_output=False)
+    sp_to_replicate = PrepareModuleInput(
+        input_layouts=(sp_layout,),
+        desired_input_layouts=(Replicate(),),
+        use_local_output=True,
+    )
+    colwise = ColwiseParallel()
+    norm_and_mlp_plan = {
+        "input_layernorm": norm_plan,
+        "post_attention_layernorm": norm_plan,
+        "mlp": sp_to_replicate,
         "mlp.gate_proj": colwise,
         "mlp.up_proj": colwise,
-        "mlp.down_proj": rowwise_output,
+        "mlp.down_proj": rowwise_output_plan,
     }
-    full_attention = {}
-    if input_boundary is not None:
-        full_attention["self_attn"] = input_boundary
-    full_attention.update({
+    full_attention_plan = {
+        "self_attn": sp_to_replicate,
         "self_attn.q_proj": colwise,
         "self_attn.k_proj": colwise,
         "self_attn.v_proj": colwise,
-    })
-    if input_boundary is not None:
-        full_attention.update({
-            "self_attn.q_norm": SequenceParallel(sequence_dim=2, use_local_output=True),
-            "self_attn.k_norm": SequenceParallel(sequence_dim=2, use_local_output=True),
-        })
-    full_attention["self_attn.o_proj"] = rowwise_reduce_output
-
-    linear_attention = {}
-    if input_boundary is not None:
-        linear_attention["linear_attn"] = input_boundary
-    linear_attention.update({
+        "self_attn.q_norm": SequenceParallel(sequence_dim=2, use_local_output=True),
+        "self_attn.k_norm": SequenceParallel(sequence_dim=2, use_local_output=True),
+        "self_attn.o_proj": rowwise_reduce_output_plan,
+    }
+    linear_attention_plan = {
+        "linear_attn": sp_to_replicate,
         "linear_attn.in_proj_z": colwise,
         "linear_attn.in_proj_b": colwise,
         "linear_attn.in_proj_a": colwise,
-        "linear_attn.out_proj": rowwise_output,
-    })
-    norm_and_mlp = {**layer_boundaries, **mlp}
+        "linear_attn.out_proj": rowwise_output_plan,
+    }
     return SimpleNamespace(
-        root=root,
-        norm_and_mlp=norm_and_mlp,
-        norm_and_mlp_reduce={**norm_and_mlp, "mlp.down_proj": rowwise_reduce_output},
-        full_attention=full_attention,
-        linear_attention=linear_attention,
-        linear_attention_reduce={**linear_attention, "linear_attn.out_proj": rowwise_reduce_output},
+        root={
+            "model.embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=sp_layout,
+                use_local_output=False,
+            ),
+            "model.norm": norm_plan,
+            "lm_head": ColwiseParallel(
+                input_layouts=sp_layout,
+                output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
+                use_local_output=not enable_loss_parallel,
+            ),
+        },
+        norm_and_mlp=norm_and_mlp_plan,
+        norm_and_mlp_reduce={**norm_and_mlp_plan, "mlp.down_proj": rowwise_reduce_output_plan},
+        full_attention=full_attention_plan,
+        linear_attention=linear_attention_plan,
+        linear_attention_reduce={**linear_attention_plan, "linear_attn.out_proj": rowwise_reduce_output_plan},
     )
 
 
@@ -686,8 +585,6 @@ def _apply_qwen3_5_tp_layer_plan(
     plans,
     mlp_reduce_layer_indices,
     linear_reduce_layer_indices,
-    *,
-    src_data_rank: Optional[int],
 ) -> None:
     """Apply the dense TP plan for one decoder block."""
     norm_and_mlp = (
@@ -696,11 +593,7 @@ def _apply_qwen3_5_tp_layer_plan(
         else plans.norm_and_mlp
     )
     if block.layer_type == "full_attention":
-        plan = {**norm_and_mlp, **plans.full_attention}
-        if src_data_rank is None:
-            parallelize_module(block, tp_mesh, plan, src_data_rank=None)
-        else:
-            parallelize_module(block, tp_mesh, plan)
+        parallelize_module(block, tp_mesh, {**norm_and_mlp, **plans.full_attention})
         return
 
     linear_attention = (
@@ -708,87 +601,8 @@ def _apply_qwen3_5_tp_layer_plan(
         if layer_idx in linear_reduce_layer_indices
         else plans.linear_attention
     )
-    plan = {**norm_and_mlp, **linear_attention}
-    if src_data_rank is None:
-        parallelize_module(block, tp_mesh, plan, src_data_rank=None)
-    else:
-        parallelize_module(block, tp_mesh, plan)
+    parallelize_module(block, tp_mesh, {**norm_and_mlp, **linear_attention})
     _shard_gated_delta_local_params(block.linear_attn, tp_mesh)
-    bind_runtime = getattr(block.linear_attn, "bind_state_runtime_parameters", None)
-    if bind_runtime is not None:
-        bind_runtime()
-
-
-def _apply_qwen3_5_tp(
-    model: Qwen3_5ForCausalLM,
-    tp_mesh: DeviceMesh,
-    *,
-    activation_profile: str,
-    enable_loss_parallel: bool,
-    register_grad_hooks: bool,
-) -> Qwen3_5ForCausalLM:
-    """Apply canonical Qwen3.5 TP parameter shards under one activation profile."""
-    tp_world = tp_mesh.size()
-    inference = activation_profile == _TP_PROFILE_INFERENCE_REPLICATED
-    if inference:
-        _validate_qwen3_5_inference_tp_config(model, tp_world)
-        if tp_world <= 1:
-            return model
-    else:
-        _validate_qwen3_5_tp_config(model, tp_world)
-
-    plans = _build_qwen3_5_tp_plans(
-        activation_profile,
-        enable_loss_parallel=enable_loss_parallel,
-    )
-    src_data_rank = None if inference else 0
-    if src_data_rank is None:
-        parallelize_module(model, tp_mesh, plans.root, src_data_rank=None)
-    else:
-        parallelize_module(model, tp_mesh, plans.root)
-    if model.config.tie_word_embeddings:
-        model.tie_weights()
-
-    full_attention_layer_indices = {
-        idx for idx, block in enumerate(model.layers)
-        if block.layer_type == "full_attention"
-    }
-    if inference:
-        mlp_reduce_layer_indices = set()
-        linear_reduce_layer_indices = set()
-    else:
-        mlp_reduce_layer_indices = full_attention_layer_indices
-        linear_reduce_layer_indices = {
-            idx for idx, block in enumerate(model.layers)
-            if block.layer_type == "linear_attention"
-        }
-
-    for layer_idx, block in enumerate(model.layers):
-        _apply_qwen3_5_tp_layer_plan(
-            block,
-            layer_idx,
-            tp_mesh,
-            plans,
-            mlp_reduce_layer_indices,
-            linear_reduce_layer_indices,
-            src_data_rank=src_data_rank,
-        )
-
-    if inference:
-        logger.info_rank0(
-            "Inference TP applied to Qwen3.5: replicated activations, tp_size=%d, layers=%d",
-            tp_world,
-            len(model.layers),
-        )
-    else:
-        if register_grad_hooks:
-            _register_tp_replicated_param_grad_sum(model, tp_mesh)
-        model.hp_loss_tp_scale_size = tp_world
-        logger.info_rank0(
-            "TP applied to Qwen3.5: SequenceParallel plan, tp_size=%d, layers=%d",
-            tp_world, len(model.layers),
-        )
-    return model
 
 
 def parallelize_qwen3_5_tp(
@@ -826,36 +640,45 @@ def parallelize_qwen3_5_tp(
             "Qwen3.5 TP currently only supports the SequenceParallel path."
         )
 
-    return _apply_qwen3_5_tp(
-        model,
-        tp_mesh,
-        activation_profile=_TP_PROFILE_TRAINING_SP,
-        enable_loss_parallel=enable_loss_parallel,
-        register_grad_hooks=register_grad_hooks,
+    tp_world = tp_mesh.size()
+    cfg = model.config
+    _validate_qwen3_5_tp_config(model, tp_world)
+    tie_embeddings = bool(cfg.tie_word_embeddings)
+    sp_layout = Shard(1)
+    plans = _build_qwen3_5_tp_plans(sp_layout, enable_loss_parallel)
+    parallelize_module(model, tp_mesh, plans.root)
+
+    if tie_embeddings:
+        model.tie_weights()
+
+    full_attention_layer_indices = {
+        idx for idx, block in enumerate(model.layers)
+        if block.layer_type == "full_attention"
+    }
+    mlp_reduce_layer_indices = full_attention_layer_indices
+    linear_attn_reduce_layer_indices = {
+        idx for idx, block in enumerate(model.layers)
+        if block.layer_type == "linear_attention"
+    }
+
+    for layer_idx, block in enumerate(model.layers):
+        _apply_qwen3_5_tp_layer_plan(
+            block,
+            layer_idx,
+            tp_mesh,
+            plans,
+            mlp_reduce_layer_indices,
+            linear_attn_reduce_layer_indices,
+        )
+
+    if register_grad_hooks:
+        _register_tp_replicated_param_grad_sum(model, tp_mesh)
+    model.hp_loss_tp_scale_size = tp_world
+    logger.info_rank0(
+        "TP applied to Qwen3.5: SequenceParallel plan, tp_size=%d, layers=%d",
+        tp_world, len(model.layers),
     )
-
-
-def parallelize_qwen3_5_inference_tp(
-    model: Qwen3_5ForCausalLM,
-    tp_mesh: DeviceMesh,
-) -> Qwen3_5ForCausalLM:
-    """Shard native Qwen3.5 weights while retaining replicated packed tokens.
-
-    Args:
-        model: Native Hyper Qwen3.5 model, optionally containing vLLM runtime
-            leaves that do not own checkpoint parameters.
-        tp_mesh: One-dimensional mesh backed by vLLM's existing TP group.
-
-    Returns:
-        The input model with native Hyper parameters sharded in place.
-    """
-    return _apply_qwen3_5_tp(
-        model,
-        tp_mesh,
-        activation_profile=_TP_PROFILE_INFERENCE_REPLICATED,
-        enable_loss_parallel=False,
-        register_grad_hooks=False,
-    )
+    return model
 
 
 def parallelize_qwen3_5_cp(
@@ -864,6 +687,7 @@ def parallelize_qwen3_5_cp(
     *,
     ulysses_degree: Optional[int] = None,
     linear_attention_cp_mode: str = "ulysses",
+    linear_attention_gdn_backend: str = "eager",
 ) -> Qwen3_5ForCausalLM:
     """Apply context parallelism across the Qwen3.5 hybrid decoder.
 
@@ -881,11 +705,11 @@ def parallelize_qwen3_5_cp(
     rank ends up with the full sequence on a head-shard and a square causal
     mask is correct again.
 
-    Linear-attention (:class:`Qwen3_5GatedDeltaNet`) layers use a matching
-    pure-Ulysses execution wrapper: project local sequence shards, all-to-all
-    the projected Q/K/V/B/A tensors to full-sequence local-head shards, run
-    the per-head conv and gated delta rule on local heads, then all-to-all the
-    result back to sequence shards before the output projection.
+    Linear-attention (:class:`Qwen3_5GatedDeltaNet`) layers select Ulysses,
+    State-P2P, or all-gather execution with ``linear_attention_cp_mode``.
+    ``linear_attention_gdn_backend`` explicitly selects the eager or Triton
+    local GDN implementation; unsupported combinations fail instead of
+    silently falling back.
     """
     # Only pure Ulysses is wired here; a smaller ``ulysses_degree`` makes each
     # rank attend over gathered K/V with ``is_causal=True`` but without a
@@ -908,12 +732,18 @@ def parallelize_qwen3_5_cp(
             cp_plan.apply(block.self_attn.sdpa_core, cp_mesh)
             full_attached += 1
         else:
-            _apply_linear_attention_cp(block.linear_attn, cp_mesh, linear_attention_cp_mode)
+            _apply_linear_attention_cp(
+                block.linear_attn,
+                cp_mesh,
+                linear_attention_cp_mode,
+                linear_attention_gdn_backend,
+            )
             linear_attached += 1
     logger.info_rank0(
         "CP applied to Qwen3.5: cp_size=%d, ulysses_degree=%s, full-attn hooks=%d, "
-        "linear-attn %s hooks=%d",
-        cp_mesh.size(), ulysses_degree, full_attached, linear_attention_cp_mode, linear_attached,
+        "linear-attn %s/%s hooks=%d",
+        cp_mesh.size(), ulysses_degree, full_attached, linear_attention_cp_mode,
+        linear_attention_gdn_backend, linear_attached,
     )
     return model
 
@@ -1476,11 +1306,17 @@ def parallelize_qwen3_5(
             "linear_attention_cp_mode",
             "ulysses",
         )
+        linear_attention_gdn_backend = getattr(
+            cfg.train.accelerator,
+            "linear_attention_gdn_backend",
+            "eager",
+        )
         parallelize_qwen3_5_cp(
             model,
             cp_mesh,
             ulysses_degree=ulysses_degree,
             linear_attention_cp_mode=linear_attention_cp_mode,
+            linear_attention_gdn_backend=linear_attention_gdn_backend,
         )
 
     if cfg.train.accelerator.ep > 1:
@@ -1512,10 +1348,8 @@ __all__ = [
     "broadcast_state_dict_from_rank0",
     "parallelize_qwen3_5",
     "parallelize_qwen3_5_cp",
-    "parallelize_qwen3_5_inference_tp",
     "parallelize_qwen3_5_tp",
     "pipeline_qwen3_5_for_trainer",
     "qwen3_5_tp_load_transforms",
-    "qwen3_5_inference_tp_load_transforms",
     "pipelining_qwen3_5",
 ]

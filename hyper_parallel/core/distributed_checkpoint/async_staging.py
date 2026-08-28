@@ -41,7 +41,12 @@ def _stage_leaf(obj: Any) -> Any:
         # Only the local shard is materialized; wrap again so planner metadata (mesh, placements) matches ``save``.
         local = obj.to_local()
         staged_local = _tensor_to_staging_cpu(local)
-        return DTensor.from_local(staged_local, obj.device_mesh, obj.placements)
+        return DTensor.from_local(
+            staged_local,
+            obj.device_mesh,
+            obj.placements,
+            shape=tuple(obj.shape),
+        )
     if isinstance(obj, Tensor):
         return _tensor_to_staging_cpu(obj)
     if isinstance(obj, (bytes, bytearray)):

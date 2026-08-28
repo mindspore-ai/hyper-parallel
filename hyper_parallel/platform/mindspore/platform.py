@@ -14,7 +14,7 @@
 # ============================================================================
 """MindSpore platform api"""
 from datetime import timedelta
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 import dataclasses
 from collections import OrderedDict
 
@@ -169,6 +169,124 @@ def _mindspore_reduce_scatter_single(
     if not async_op:
         return normalized_output, None
     return normalized_output, handle
+
+
+def _mindspore_variable_all_gather(
+        input_tensor: Tensor,
+        output_splits: Sequence[int],
+        group: str,
+) -> Tensor:
+    """Gather variable dim-zero rows with MindSpore ``AllGatherV``."""
+    if input_tensor.ndim == 0:
+        raise ValueError("variable all-gather input must have at least one dimension")
+    splits = tuple(output_splits)
+    if not splits:
+        raise ValueError("output_splits must contain at least one group rank")
+    if any(not isinstance(rows, int) or isinstance(rows, bool) or rows < 0 for rows in splits):
+        raise ValueError(f"output_splits must contain non-negative integers, got {splits!r}")
+
+    feature_shape = tuple(input_tensor.shape[1:])
+    feature_numel = int(np.prod(feature_shape, dtype=np.int64)) if feature_shape else 1
+    element_splits = [rows * feature_numel for rows in splits]
+    if sum(element_splits) == 0:
+        return input_tensor.reshape((0, *feature_shape))
+    element_splits_tensor = ms.Tensor(element_splits, dtype=ms.int64)
+    gathered = ms.ops.AllGatherV(group=group)(
+        input_tensor.reshape((-1,)),
+        element_splits_tensor,
+    )
+    return gathered.reshape((sum(splits), *feature_shape))
+
+
+def _validate_variable_row_splits(
+        input_tensor: Tensor,
+        input_splits: Sequence[int],
+        output_splits: Sequence[int],
+        group: str,
+) -> tuple[list[int], list[int]]:
+    """Validate dim-zero row splits for a variable all-to-all."""
+    normalized_input = list(input_splits)
+    normalized_output = list(output_splits)
+    if not normalized_input or len(normalized_input) != len(normalized_output):
+        raise ValueError(
+            "input_splits and output_splits must be non-empty and have the same length, "
+            f"got input_splits={normalized_input!r}, output_splits={normalized_output!r}"
+        )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in (*normalized_input, *normalized_output)
+    ):
+        raise ValueError(
+            "input_splits and output_splits must contain non-negative integers, "
+            f"got input_splits={normalized_input!r}, output_splits={normalized_output!r}"
+        )
+    if input_tensor.ndim == 0:
+        raise ValueError("variable all-to-all input_tensor must have at least one dimension")
+    if sum(normalized_input) != input_tensor.shape[0]:
+        raise ValueError(
+            "sum(input_splits) must equal input_tensor.shape[0], "
+            f"got sum={sum(normalized_input)}, shape={tuple(input_tensor.shape)!r}"
+        )
+    group_size = get_group_size(group)
+    if len(normalized_input) != group_size:
+        raise ValueError(
+            "split metadata length must equal the process-group size, "
+            f"got splits={len(normalized_input)}, group_size={group_size}"
+        )
+    return normalized_input, normalized_output
+
+
+def _mindspore_variable_all_to_all(
+        input_tensor: Tensor,
+        input_splits: Sequence[int],
+        output_splits: Sequence[int],
+        group: str,
+) -> Tensor:
+    """Run one synchronous N-D variable all-to-all using dim-zero row splits."""
+    output_shape = (sum(output_splits), *tuple(input_tensor.shape[1:]))
+    output, _ = comm_func.all_to_all_single(
+        output_shape,
+        input_tensor,
+        output_split_sizes=list(output_splits),
+        input_split_sizes=list(input_splits),
+        group=group,
+        async_op=False,
+    )
+    return output
+
+
+class _MSDifferentiableAllToAllSingle(_Function):
+    """Variable all-to-all with a symmetric reverse-A2A backward."""
+
+    @staticmethod
+    def forward(  # pylint: disable=arguments-differ
+            ctx: Any,
+            input_tensor: Tensor,
+            output_splits: Sequence[int],
+            input_splits: Sequence[int],
+            group: str,
+    ) -> Tensor:
+        """Exchange dim-zero rows and record the reverse split metadata."""
+        ctx.input_splits = input_splits
+        ctx.output_splits = output_splits
+        ctx.group = group
+        return _mindspore_variable_all_to_all(
+            input_tensor,
+            input_splits,
+            output_splits,
+            group,
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple:
+        """Route gradients through the reverse variable all-to-all."""
+        grad_input = _mindspore_variable_all_to_all(
+            grad_output,
+            ctx.output_splits,
+            ctx.input_splits,
+            ctx.group,
+        )
+        return grad_input, None, None, None
 
 
 class AsyncCollectiveTensor(Tensor):
@@ -440,7 +558,7 @@ class _MSAsyncA2ALazyBwd(_Function):
         return AsyncCollectiveTensor(actual_output, work)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Symmetric reverse a2a; returns :class:`AsyncCollectiveTensor`."""
         # If grad_output is still lazy, force unwrap before issuing the
         # reverse a2a (which is itself a "real" op on the data).
@@ -612,7 +730,7 @@ class _MSSyncHookFunction(_Function):
         return _MSSyncHookFunction._passthrough(x)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Mirror of :meth:`forward` using ``_BWD_ROLES``."""
         hook_name = ctx.hook_name
         coordinator = ctx.coordinator
@@ -657,7 +775,7 @@ class _MSAsyncA2AFunction(_Function):
         return _a2a_reconstruct_ms(out_perm, concat_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Launch async head->seq A2A for backward overlap, or return zero grad."""
         if ctx.handle_box is not None:
             g = grad_output.contiguous()
@@ -695,7 +813,7 @@ class _MSAsyncAllGatherFunction(_Function):
         return _move_dim_from_front(out_perm, gather_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         """Launch reverse reduce-scatter for the all-gather."""
         grad_perm = _move_dim_to_front(grad_output.contiguous(), ctx.gather_dim)
         output_shape = list(grad_perm.shape)
@@ -757,6 +875,14 @@ class MindSporePlatform(Platform):
             )
             self._custom_ops_cls = MindSporeCustomOps
         return self._custom_ops_cls
+
+    @staticmethod
+    def get_swap_optimizer():
+        """Return the MindSpore optimizer-state swap wrapper class."""
+        from hyper_parallel.platform.mindspore.swap_optimizer.swap_optimizer import (  # pylint: disable=import-outside-toplevel
+            get_swap_optimizer,
+        )
+        return get_swap_optimizer()
 
     def __init__(self):
         # Ensure MindSpore ``nn.Cell.to_empty`` is patched as soon as the
@@ -868,18 +994,22 @@ class MindSporePlatform(Platform):
         return ms.manual_seed(seed)
 
     @staticmethod
-    def ones(size, dtype=None):
+    def ones(size, dtype=None, device=None):
         """
         Create a tensor filled with ones.
 
         Args:
             size (tuple): The shape of the output tensor.
             dtype (Optional[ms.Type]): The desired data type.
+            device (Optional[ms.device]): The device to create the tensor on.
 
         Returns:
             Tensor: A tensor filled with ones.
         """
-        return mint.ones(size, dtype=dtype)
+        tensor = mint.ones(size, dtype=dtype)
+        if device in ("GPU", "Ascend"):
+            return tensor.to(device)
+        return tensor
 
     @staticmethod
     def zeros(size, dtype=None, device=None):
@@ -1385,6 +1515,33 @@ class MindSporePlatform(Platform):
         return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
 
     @staticmethod
+    def differentiable_all_to_all_single(
+            input_tensor: Tensor,
+            input_splits: Sequence[int],
+            output_splits: Sequence[int],
+            group: str,
+    ) -> Tensor:
+        """Run a differentiable N-D variable all-to-all with dim-zero row splits."""
+        input_splits, output_splits = _validate_variable_row_splits(
+            input_tensor,
+            input_splits,
+            output_splits,
+            group,
+        )
+        return _MSDifferentiableAllToAllSingle.apply(
+            input_tensor,
+            output_splits,
+            input_splits,
+            group,
+        )
+
+    @staticmethod
+    def differentiable_variable_all_gather(
+            input_tensor: Tensor, output_splits: Sequence[int], group: str) -> Tensor:
+        """Gather variable dim-zero row shards with native ``AllGatherV``."""
+        return _mindspore_variable_all_gather(input_tensor, output_splits, group)
+
+    @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
                                             handle_box=None):
         return _MSAsyncAllGatherFunction.apply(
@@ -1502,20 +1659,12 @@ class MindSporePlatform(Platform):
         return _MicroBatch(micro_batch_num, args_batch_dim, kwargs_batch_dim)
 
     @staticmethod
-    def get_model_state_dict(
-        model: Any,
-        *,
-        options: Any = None,
-        full_state_dict: Optional[bool] = None,
-        cpu_offload: Optional[bool] = None,
-    ) -> dict[str, Any]:
+    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
         """Get the state dictionary of a model (not yet supported on MindSpore).
 
         Args:
             model: The model to extract state from.
             options: Optional configuration for state dict extraction.
-            full_state_dict: Optional backend-neutral full-state selection.
-            cpu_offload: Optional backend-neutral output placement selection.
 
         Returns:
             dict: The state dictionary containing model parameters and buffers.
@@ -1524,37 +1673,7 @@ class MindSporePlatform(Platform):
             NotImplementedError: MindSpore support is not yet implemented.
         """
         raise NotImplementedError(
-            "get_model_state_dict is not yet supported on MindSpore: "
-            f"options={options}, full_state_dict={full_state_dict}, cpu_offload={cpu_offload}"
-        )
-
-    @staticmethod
-    def get_tensor_ipc_rebuild_args(tensor: Any) -> tuple[Any, ...]:
-        """Reject tensor IPC because MindSpore does not expose this transport."""
-        raise NotImplementedError(
-            f"Tensor IPC rebuild arguments are not supported on MindSpore: tensor={type(tensor)!r}"
-        )
-
-    @staticmethod
-    def gather_state_dict(state_dict: dict[str, Any], *, cpu_offload: bool = False) -> dict[str, Any]:
-        """Reject distributed state gathering because MindSpore does not support it yet."""
-        raise NotImplementedError(
-            "State-dict gathering is not supported on MindSpore: "
-            f"keys={list(state_dict)}, cpu_offload={cpu_offload}"
-        )
-
-    @staticmethod
-    def get_tensor_distribution_spec(tensor: Any) -> tuple[Any, ...]:
-        """Describe the mesh and placements that determine MindSpore collectives."""
-        if not isinstance(tensor, DTensorBase):
-            return ("tensor",)
-        mesh = tensor.device_mesh
-        return (
-            "dtensor",
-            str(mesh.device_type),
-            tuple(mesh.mesh_shape),
-            tuple(mesh.rank_list),
-            tuple(repr(placement) for placement in tensor.placements),
+            "get_model_state_dict is not yet supported on MindSpore"
         )
 
     @staticmethod
@@ -1844,18 +1963,21 @@ class MindSporePlatform(Platform):
         return ckpt_wrapper(module, **checkpoint_kwargs)
 
     @staticmethod
-    def checkpoint_exclude_wrapper(module: Any) -> Any:
+    def checkpoint_exclude_wrapper(module: Any, *, save_output: bool = True) -> Any:
         """Wrap a Cell or callable whose activations should not be recomputed.
 
         Args:
             module: MindSpore Cell or callable to exclude from checkpoint replay.
+            save_output: Whether to retain the excluded region output for replay.
 
         Returns:
             The platform-specific checkpoint exclusion wrapper.
         """
         # pylint: disable=C0415
-        from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper import checkpoint_exclude_wrapper
-        return checkpoint_exclude_wrapper(module)
+        from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper import (
+            checkpoint_exclude_wrapper,
+        )
+        return checkpoint_exclude_wrapper(module, save_output=save_output)
 
     @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):
@@ -1888,10 +2010,10 @@ class MindSporePlatform(Platform):
                                                     group_swap=group_swap)
 
     @staticmethod
-    def ignore_sac_ops(ops: list[object | None]) -> None:
+    def ignore_sac_ops(ignore_ops: list[object | None]) -> None:
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.sac import ignore_sac_ops
-        ignore_sac_ops(ops)
+        ignore_sac_ops(ignore_ops)
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
@@ -1911,6 +2033,8 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def recompute_session_ctx(session_id, retain_on_unpack=False):
+        if session_id is None:
+            raise ValueError("session_id must not be None.")
         # pylint: disable=C0415
         from mindspore.common.recompute import _recompute_session_ctx
         return _recompute_session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack)

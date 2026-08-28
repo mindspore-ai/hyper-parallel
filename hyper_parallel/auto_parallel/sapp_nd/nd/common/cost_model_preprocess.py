@@ -13,11 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """parse config for cost model"""
-import re
 import inspect
+import re
+import weakref
 from copy import deepcopy
-from pprint import pformat
 from enum import Enum
+from pprint import pformat
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.generate_partitions import PartitionGenerator
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
@@ -129,6 +130,14 @@ class CostModelConfig(PartitionGenerator):
         for k, v in self.__dict__.items():
             setattr(res, k, deepcopy(v, memo))
         return res
+
+    def __getstate__(self) -> dict:
+        """Return instance state for multiprocessing serialization."""
+        return self.__dict__.copy()
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore instance state after multiprocessing deserialization."""
+        self.__dict__.update(state)
 
     def fp_bytes(self, precision):
         """Return bytes size for datatype"""
@@ -353,12 +362,18 @@ class CostModelConfig(PartitionGenerator):
         Use input fun as callback for layer_custom_config
         Only for overwriting cost model variables
         """
+        config_ref = weakref.ref(self)
         for idx, f in enumerate(self.layer_custom_config):
 
             def wrap(e, hook=f[1]):
                 hook(e)
                 if isinstance(e, CostModelConfig):
-                    fun(self)
+                    config = config_ref()
+                    if config is None:
+                        raise ReferenceError(
+                            "CostModelConfig has already been released"
+                        )
+                    fun(config)
                 else:
                     e.set_ccfg(fun)
 

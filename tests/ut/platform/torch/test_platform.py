@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from hyper_parallel.platform.torch.platform import TorchPlatform
@@ -65,45 +66,6 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertEqual(set(buffers), {"persistent", "scratch"})
         self.assertIs(buffers["persistent"], module.persistent)
         self.assertIs(buffers["scratch"], module.scratch)
-
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.get_model_state_dict")
-    def test_get_model_state_dict_builds_backend_options(self, mock_get_state_dict):
-        """Backend-neutral flags are converted to Torch state-dict options."""
-        model = object()
-        mock_get_state_dict.return_value = {"weight": mock.sentinel.weight}
-
-        result = TorchPlatform.get_model_state_dict(
-            model,
-            full_state_dict=True,
-            cpu_offload=False,
-        )
-
-        self.assertEqual(result, {"weight": mock.sentinel.weight})
-        options = mock_get_state_dict.call_args.kwargs["options"]
-        self.assertTrue(options.full_state_dict)
-        self.assertFalse(options.cpu_offload)
-
-    @patch("torch.multiprocessing.reductions.reduce_tensor")
-    def test_get_tensor_ipc_rebuild_args_drops_rebuild_callable(self, mock_reduce_tensor):
-        """Tensor IPC exposes only the native rebuild argument tuple."""
-        tensor = torch.ones(1)
-        mock_reduce_tensor.return_value = (mock.sentinel.rebuild, ("storage", 1))
-
-        rebuild_args = TorchPlatform.get_tensor_ipc_rebuild_args(tensor)
-
-        self.assertEqual(rebuild_args, ("storage", 1))
-        mock_reduce_tensor.assert_called_once_with(tensor)
-
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils._gather_full_state_dict")
-    def test_gather_state_dict_delegates_prevalidated_mapping(self, mock_gather):
-        """Torch gathers the exact mapping already validated by the caller."""
-        state_dict = {"weight": mock.sentinel.weight}
-        mock_gather.return_value = {"weight": mock.sentinel.full_weight}
-
-        result = TorchPlatform.gather_state_dict(state_dict, cpu_offload=False)
-
-        self.assertEqual(result, {"weight": mock.sentinel.full_weight})
-        mock_gather.assert_called_once_with(state_dict, False)
 
     def test_dtensor_data_setter_updates_wrapper_and_local_tensor(self):
         """Assigning ``dtensor.data = x`` should synchronize wrapper and local tensor payloads."""
@@ -647,3 +609,82 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertTrue(torch.allclose(result["nested"]["tensor2"], torch.tensor([14.0, 16.0])))
         self.assertEqual(result["nested"]["value"], 10)  # Non-tensor values remain unchanged
         self.assertEqual(result["value"], 5)  # Non-tensor values remain unchanged
+
+
+def test_variable_all_gather_gloo_pads_and_trims_outputs() -> None:
+    """The CPU path gathers equal padded buffers and trims true row counts."""
+    local = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    sources = (
+        local,
+        torch.empty((0, 2)),
+        torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    )
+    output_shapes = []
+
+    def all_gather(outputs, input_tensor, group):
+        """Populate padded all-gather outputs."""
+        del input_tensor, group
+        output_shapes.extend(tuple(output.shape) for output in outputs)
+        for output, source in zip(outputs, sources):
+            output.zero_()
+            output[:source.shape[0]].copy_(source)
+
+    with patch(
+        "hyper_parallel.platform.torch.platform.dist.get_rank", return_value=0
+    ), patch(
+        "hyper_parallel.platform.torch.platform.dist.all_gather", side_effect=all_gather
+    ) as mock_all_gather:
+        actual = TorchPlatform.differentiable_variable_all_gather(
+            local, [2, 0, 4], object()
+        )
+
+    assert torch.equal(actual, torch.cat(sources, dim=0))
+    assert output_shapes == [(4, 2), (4, 2), (4, 2)]
+    mock_all_gather.assert_called_once()
+
+
+def test_variable_all_gather_gloo_backward_uses_all_reduce_and_slice() -> None:
+    """The Gloo compatibility path preserves variable all-gather gradients."""
+    local = torch.tensor([[1.0], [2.0]], requires_grad=True)
+
+    def all_gather(outputs, input_tensor, group):
+        """Populate two equal-size padded receive buffers."""
+        del group
+        outputs[0].zero_()
+        outputs[0][0, 0] = 5.0
+        outputs[1].copy_(input_tensor)
+
+    def all_reduce(tensor, op, group):
+        """Simulate the sum of full-output gradients from two ranks."""
+        del op, group
+        tensor.mul_(2.0)
+
+    with patch(
+        "hyper_parallel.platform.torch.platform.dist.get_rank", return_value=1
+    ), patch(
+        "hyper_parallel.platform.torch.platform.dist.all_gather", side_effect=all_gather
+    ), patch(
+        "hyper_parallel.platform.torch.platform.dist.all_reduce", side_effect=all_reduce
+    ) as mock_all_reduce:
+        gathered = TorchPlatform.differentiable_variable_all_gather(
+            local, [1, 2], object()
+        )
+        gathered.sum().backward()
+
+    assert torch.equal(local.grad, torch.full_like(local, 2.0))
+    mock_all_reduce.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "splits, message",
+    [([], "at least one"), ([1, -1], "non-negative")],
+)
+def test_variable_all_gather_rejects_invalid_metadata(splits, message) -> None:
+    """Invalid split metadata fails before communication."""
+    with patch(
+        "hyper_parallel.platform.torch.platform.dist.all_gather"
+    ) as mock_all_gather, pytest.raises(ValueError, match=message):
+        TorchPlatform.differentiable_variable_all_gather(
+            torch.ones(1, 2), splits, object()
+        )
+    mock_all_gather.assert_not_called()

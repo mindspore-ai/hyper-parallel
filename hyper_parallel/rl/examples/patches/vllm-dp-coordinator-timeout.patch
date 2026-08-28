@@ -1,0 +1,20 @@
+diff --git a/vllm/v1/engine/coordinator.py b/vllm/v1/engine/coordinator.py
+index 87937cc6a..151a07abe 100644
+--- a/vllm/v1/engine/coordinator.py
++++ b/vllm/v1/engine/coordinator.py
+@@ -59,12 +59,13 @@ class DPCoordinator:
+     def _wait_for_zmq_addrs(self, zmq_addr_pipe) -> tuple[str, str, str]:
+         try:
++            timeout = 120
+             ready = multiprocessing.connection.wait(
+-                [zmq_addr_pipe, self.proc.sentinel], timeout=30
++                [zmq_addr_pipe, self.proc.sentinel], timeout=timeout
+             )
+             if not ready:
+                 raise RuntimeError(
+                     "DP Coordinator process failed to report ZMQ addresses "
+-                    "during startup."
++                    f"within timeout={timeout} seconds during startup."
+                 )
+             try:
+                 return zmq_addr_pipe.recv()

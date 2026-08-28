@@ -13,6 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for PyTorch activation checkpoint wrapper."""
+# These tests intentionally select the Torch backend before importing aliases,
+# patch the platform object, and inspect wrapper state for API coverage.
+# pylint: disable=wrong-import-position,protected-access,unused-argument,cyclic-import
 import os
 import unittest
 from unittest.mock import patch
@@ -132,6 +135,17 @@ class TestCheckpointWrapper(unittest.TestCase):
         ctx_fn()
         mock_plat.create_selective_checkpoint_contexts.assert_called_once_with(
             policy, group_swap=False)
+
+    def test_do_checkpoint_passes_early_stop(self, mock_plat):
+        """Test wrapper forwards its early_stop configuration to core checkpoint."""
+        mock_plat.checkpoint.return_value = "result"
+        mod = _BaseWrapperModule()
+        wrapper = CheckpointWrapper(mod, early_stop=False)
+
+        result = wrapper.forward(torch.randn(2, 4))
+
+        self.assertEqual(result, "result")
+        self.assertFalse(mock_plat.checkpoint.call_args.kwargs["early_stop"])
 
 
 class TestCkptWrapper(unittest.TestCase):
