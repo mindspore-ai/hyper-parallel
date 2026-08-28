@@ -28,22 +28,12 @@ logger = logging.getLogger(__name__)
 
 _MAPPING_GET_POLYFILL_INSTALLED = False
 
-_MODEL_LAYER_PATHS = {
-    "gpt2": ("transformer.h",),
-    "llama": ("model.layers",),
-    "qwen2": ("model.layers",),
-    "qwen3": ("model.layers",),
-    "qwen3_5": ("model.layers",),
-    "qwen3_5_moe": ("model.layers",),
-    "glm5": ("model.layers",),
-}
-
 
 def _get_attribute(root: Any, path: str) -> Any:
-    """Read a dotted module path, including numeric ModuleList indexes."""
+    """Read a dotted module path."""
     value = root
     for part in path.split("."):
-        value = value[int(part)] if part.isdigit() else getattr(value, part)
+        value = getattr(value, part)
     return value
 
 
@@ -89,19 +79,40 @@ def _qualify_declared_layers(
     ]
 
 
-def _layers_from_path(model: nn.Module, path: str) -> list[tuple[str, nn.Module]]:
-    """Return indexed layers from one declared container path."""
-    try:
-        container = _get_attribute(model, path)
-    except (AttributeError, IndexError, KeyError, TypeError):
-        return []
-    if not isinstance(container, (nn.ModuleList, nn.Sequential)):
-        return []
-    return [(f"{path}.{index}", layer) for index, layer in enumerate(container)]
+def _layers_from_model_metadata(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Return blocks declared by the model's no-split metadata."""
+    layer_class_names = set(getattr(model, "_no_split_modules", ()) or ())
+    return [
+        (name, module)
+        for name, module in model.named_modules()
+        if module.__class__.__name__ in layer_class_names
+    ]
+
+
+def _layers_from_common_paths(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Return layers from the first common non-empty container path."""
+    common_layer_paths = {
+        "model.layers": (nn.ModuleList, nn.Sequential),
+        "transformer.h": (nn.ModuleList, nn.Sequential),
+        "layers": (nn.ModuleList, nn.Sequential),
+        "model.decoder.layers": (nn.ModuleList, nn.Sequential),
+        "decoder.layers": (nn.ModuleList, nn.Sequential),
+    }
+    for path, container_types in common_layer_paths.items():
+        try:
+            container = _get_attribute(model, path)
+        except AttributeError:
+            continue
+        if isinstance(container, container_types) and container:
+            return [
+                (f"{path}.{index}", layer)
+                for index, layer in enumerate(container)
+            ]
+    return []
 
 
 def get_compile_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
-    """Return stable decoder-layer segments declared by a supported model."""
+    """Return decoder-layer segments using explicit then conventional contracts."""
     declared_getter = getattr(model, "get_compile_layers", None)
     if callable(declared_getter):
         layers = _qualify_declared_layers(
@@ -111,24 +122,18 @@ def get_compile_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
         if layers:
             return layers
 
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    candidate_paths = list(_MODEL_LAYER_PATHS.get(model_type, ()))
-    candidate_paths.extend(("layers", "model.layers"))
+    layers = _layers_from_common_paths(model)
+    if layers:
+        return layers
 
-    seen_containers = set()
-    for path in candidate_paths:
-        layers = _layers_from_path(model, path)
-        if not layers:
-            continue
-        container_id = id(_get_attribute(model, path))
-        if container_id in seen_containers:
-            continue
-        seen_containers.add(container_id)
+    layers = _layers_from_model_metadata(model)
+    if layers:
         return layers
 
     raise ValueError(
         "compile is enabled, but the model exposes no decoder-layer compile contract; "
-        "define get_compile_layers() or use a supported model layer container"
+        "define get_compile_layers(), expose a common layer container, or define "
+        "_no_split_modules"
     )
 
 
