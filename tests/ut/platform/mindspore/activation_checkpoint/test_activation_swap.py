@@ -15,6 +15,7 @@
 """Unit tests for MindSpore activation swap platform implementation."""
 import contextlib
 import gc
+import importlib.util
 import os
 import unittest
 import weakref
@@ -49,6 +50,11 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap imp
 )
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 enable_mindspore_backward_compat()
+
+# Some CI pythons are built without liblzma: the lazy transformers ->
+# torchvision import chain dies on "from _lzma import *". Tests hitting that
+# chain run only where lzma is available.
+_HAS_LZMA = importlib.util.find_spec("_lzma") is not None
 
 class _TinyCell(nn.Cell):
     """Small cell used by wrapper tests."""
@@ -185,6 +191,7 @@ class TestSwapWrapper(unittest.TestCase):
         self.assertIsInstance(wrapper._wrapped_module, FuncCell)
         self.assertTrue(np.allclose(result.asnumpy(), np.array([3], np.float32)))
 
+    @unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
     def test_rejects_overlapping_wrap(self):
         """Wrapping an already wrapped cell should warn."""
         cell = _TinyCell()
@@ -233,6 +240,7 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
 class TestSwapTensorWrapper(unittest.TestCase):
     """Unit tests for swap_tensor_wrapper()."""
 
+    @unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
     def test_warns_and_returns_target_when_group_unregistered(self):
         """Unregistered groups should warn and leave tensors untouched."""
         target = ms.Tensor(np.ones((2,), np.float32))
