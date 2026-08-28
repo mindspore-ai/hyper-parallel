@@ -47,7 +47,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
-    tags=("npu_level0",),
+    tags=("npu_level1",),
 ))
 
 # ----- BSND DP (2-device) -----
@@ -70,7 +70,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
-    tags=("npu_level0",),
+    tags=("npu_level1",),
 ))
 
 # ----- BSND DP+CP+TP (8-device) -----
@@ -93,7 +93,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2, 2, 2),
     mesh_dim_names=("dp", "cp", "tp"),
-    tags=("npu_level0",),
+    tags=("npu_level1",),
 ))
 
 # ----- TND DP+CP/TP (4-device) -----
@@ -116,5 +116,5 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("npu_level0",),
+    tags=("npu_level1",),
 ))

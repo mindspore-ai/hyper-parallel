@@ -22,7 +22,7 @@ from tests.common.parallel_case import MindSporeCase, parallel_run
 _WORKER = str(Path(__file__).resolve().parent / "mega_moe.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_mega_moe_group_tp2ep2():
     """
     Feature: MoE-FFN forward and backward operators with MindSpore (TP=2, EP=2).
