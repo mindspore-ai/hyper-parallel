@@ -15,8 +15,8 @@
 """Declarative distributed modules for training (M1, ``dmodule``).
 
 Public surface for building models from nested configs, applying
-:class:`~hyper_parallel.dmodule.sharding.ShardingConfig`, and registering
-models for :class:`~hyper_parallel.trainer.base.BaseTrainer`.
+:class:`~hyper_parallel.dmodule.sharding.ShardingConfig`, and packaging
+construction and parallelization hooks in a declarative ``ModelSpec``.
 
 Typical flow::
 

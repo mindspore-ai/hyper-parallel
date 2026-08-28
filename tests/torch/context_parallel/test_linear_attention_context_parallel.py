@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Launcher for Qwen3.5 linear-attention context parallel tests."""
+"""Launcher for shared Gated DeltaNet context parallel tests."""
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
@@ -30,7 +30,7 @@ _WORKER = str(Path(__file__).resolve().parent / "_test_linear_attention_context_
 )
 def test_linear_attention_context_parallel_accuracy():
     """
-    Feature: Qwen3.5 Gated DeltaNet context parallel execution
+    Feature: Gated DeltaNet context parallel execution
     Description: Compare Ulysses, P2P, and AllGather forward/backward with a full-sequence reference.
     Expectation: Outputs, input gradients, parameter gradients, and gradient norms match.
     """

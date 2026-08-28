@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed accuracy tests for Qwen3.5 linear-attention CP."""
+"""Distributed accuracy tests for shared Gated DeltaNet linear-attention CP."""
 import torch
 import torch.distributed as dist
 
@@ -21,7 +21,7 @@ from hyper_parallel.core.context_parallel.linear_attention_context_parallel impo
     LinearAttentionContextParallel,
     _differentiable_all_to_all_shard,
 )
-from hyper_parallel.models.qwen3_5.model import Qwen3_5GatedDeltaNet
+from hyper_parallel.models.modules.linear_attention import GatedDeltaNet
 from tests.torch.utils import init_dist
 
 
@@ -49,7 +49,7 @@ def _global_relative_l2(actual, expected):
 
 
 def _build_module(device):
-    return Qwen3_5GatedDeltaNet(
+    return GatedDeltaNet(
         hidden_size=128,
         num_v_heads=8,
         num_k_heads=4,

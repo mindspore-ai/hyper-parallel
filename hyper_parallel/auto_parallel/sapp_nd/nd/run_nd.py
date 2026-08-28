@@ -1,4 +1,4 @@
-# Copyright 2024-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,84 +16,12 @@
 
 import argparse
 import os
-import sys
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger, set_verbose_level
 import hyper_parallel.auto_parallel.sapp_nd.nd.parallelize as Par
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
-
-
-def _run_hyper_v2_search(cli_parser, cli_args):
-    """Run the HyperParallel V2 strategy search via ``config_adapter``.
-
-    This branch is activated when ``-f hyper_v2`` is combined with
-    ``-s/--search-config``.  It reads the Search Config YAML, validates
-    it, runs the ND search engine through :func:`search_strategies`,
-    and writes the resolved strategy back into a copy of the original
-    ``train.yaml``.
-
-    Args:
-        cli_parser: The :class:`argparse.ArgumentParser` (used for ``error()``).
-        cli_args: The parsed CLI namespace.  Requires ``yaml_config``,
-            ``search_config``, and optionally ``output_dir``.
-
-    Raises:
-        SystemExit: If validation fails (via ``parser.error``).
-    """
-    # pylint: disable=import-outside-toplevel
-    from hyper_parallel.auto_parallel.config_adapter import (
-        read_search_config,
-        validate,
-        search_strategies,
-        write_resolved_yaml,
-    )
-
-    if not os.path.isfile(cli_args.search_config):
-        cli_parser.error(f"search-config not found: {cli_args.search_config}")
-    if not os.path.isfile(cli_args.yaml_config):
-        cli_parser.error(f"yaml-config not found: {cli_args.yaml_config}")
-
-    set_verbose_level(cli_args.verbosity)
-
-    search_cfg = read_search_config(cli_args.search_config)
-
-    if cli_args.global_batch_size is not None:
-        search_cfg.constraint["global_batch_size"] = cli_args.global_batch_size
-    if cli_args.devices is not None:
-        cards_per_node = max(1, search_cfg.cluster_spec.get("cards_per_node", 8))
-        search_cfg.cluster_spec["num_nodes"] \
-            = max(1, cli_args.devices // cards_per_node)
-
-    errors = validate(search_cfg)
-    hard_errors = [e for e in errors if e.severity == "error"]
-    warnings = [e for e in errors if e.severity == "warning"]
-    for w in warnings:
-        logger.warning("%s: %s", w.field_path, w.message)
-    if hard_errors:
-        for e in hard_errors:
-            logger.error("%s: %s", e.field_path, e.message)
-        cli_parser.error(
-            f"Search config validation failed with {len(hard_errors)} error(s)."
-        )
-
-    result = search_strategies(search_cfg)
-    search_cfg.resolved_strategy = result
-
-    output_dir = cli_args.output_dir or "."
-    if not os.path.isdir(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-    resolve_path = os.path.join(output_dir, "resolved.yaml")
-    write_resolved_yaml(search_cfg, cli_args.yaml_config, resolve_path)
-    logger.output("Resolved strategy written to %s", resolve_path)
-    logger.output(
-        "Optimal strategy: dp=%(dp)s tp=%(tp)s pp=%(pp)s "
-        "cp=%(cp)s ep=%(ep)s mb_num=%(micro_batch_num)s "
-        "mem=%(memory_estimate_mb).0f MB score=%(score).2e",
-        result,
-    )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -116,7 +44,7 @@ if __name__ == "__main__":
         type=str,
         required=False,
         help="Framework to evaluate in "
-        "[mindformers, mindspeed, hyperparallel, hyper_v2, torchtitan]",
+        "[mindformers, mindspeed, hyperparallel, torchtitan]",
     )
     parser.add_argument(
         "-d",
@@ -255,23 +183,6 @@ if __name__ == "__main__":
         default=None,
         help="Path to accelerate configuration yaml file (for hyperparallel2)",
     )
-    parser.add_argument(
-        "-s",
-        "--search-config",
-        type=str,
-        default=None,
-        help="Path to Search Config YAML for fine-grained search-space control "
-        "(hyper_v2 only). Scalar=fixed, list=candidates, 'auto'=ND decides.",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Directory for output files when using --search-config "
-        "(default: current directory).",
-    )
-
     args = parser.parse_args()
 
     max_mem = (
@@ -288,10 +199,6 @@ if __name__ == "__main__":
                 "\nProceeding without cache file..."
             )
             args.cache_file = None
-
-    if args.framework == "hyper_v2" and args.search_config:
-        _run_hyper_v2_search(parser, args)
-        sys.exit(0)
 
     set_verbose_level(args.verbosity)
     dims = Dim.get_dims(args.dimensions)

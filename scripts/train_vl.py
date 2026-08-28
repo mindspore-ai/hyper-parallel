@@ -12,26 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""VL training entry point."""
-# pylint: disable=wrong-import-position
-import os
+"""Vision-language training entry point for the AutoModel workflow."""
 
-# Pin the backend before importing hyper_parallel because platform objects are
-# resolved at import time. Keep explicit user overrides intact.
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
+from hyper_parallel.auto_models.config.manager import parse_training_args
+from hyper_parallel.auto_models.trainer.config import TrainerConfig
+from hyper_parallel.auto_models.trainer.vlm_trainer import VLMTrainer
 
-from hyper_parallel.trainer.utils import init_logger
-from hyper_parallel.trainer.config import HyperTrainerConfig, parse_args
-from hyper_parallel.trainer.utils.discovery import discover_model_spec
-from hyper_parallel.trainer.vl_trainer import VLTrainer
 
-# Configure the root logger before training. Module-level loggers in the
-# imports above resolve their handler lazily (at first emit, which happens
-# during training), so doing this after the imports keeps the same format.
-init_logger()
+def main() -> None:
+    """Resolve configured components and execute vision-language training."""
+    config: TrainerConfig = parse_training_args()
+    trainer = VLMTrainer(config)
+    trainer.train()
+
 
 if __name__ == "__main__":
-    args = parse_args(HyperTrainerConfig)
-    discover_model_spec(args.model.name)
-    trainer = VLTrainer(args)
-    trainer.train()
+    main()

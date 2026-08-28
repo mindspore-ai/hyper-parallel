@@ -81,13 +81,15 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 运行仓库提供的单机 8 卡训练示例 [`examples/demo_trainer/train.yaml`](examples/demo_trainer/train.yaml)：
 
 ```bash
-bash examples/demo_trainer/launch_1node_8dies.sh
+torchrun --standalone --nproc_per_node=8 \
+  scripts/train_lm.py examples/demo_trainer/train.yaml
 ```
 
 附加命令行参数可按 YAML 字段路径覆盖配置值，无需修改配置文件：
 
 ```bash
-bash examples/demo_trainer/launch_1node_8dies.sh \
+torchrun --standalone --nproc_per_node=8 \
+  scripts/train_lm.py examples/demo_trainer/train.yaml \
   --model.pretrained_model_name_or_path=/path/to/model \
   --training.train_iters=10
 ```
@@ -122,7 +124,6 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 - [版本说明](./hyper_parallel_v1.0.0_release_notes.md) — 版本变更记录
 
 ---
-
 
 ## 🗂️ 项目结构
 

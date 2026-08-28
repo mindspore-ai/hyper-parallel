@@ -12,42 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""LM pretraining / SFT entry point.
+"""Language-model training entry point for the AutoModel workflow."""
 
-Usage:
-    torchrun --nproc_per_node=8 scripts/train_lm.py config.yaml
+from hyper_parallel.auto_models.config.manager import parse_training_args
+from hyper_parallel.auto_models.trainer.config import TrainerConfig
+from hyper_parallel.auto_models.trainer.text_trainer import TextTrainer
 
-Adding a new model
-------------------
-No edit to this file is required. Create
-``hyper_parallel/models/<name>/__init__.py`` that calls
-``register_spec("<name>", ModelSpec(...))`` at import time, then set
-``model.name: <name>`` in the YAML. See ``trainer/utils/discovery.py``
-for the resolution rules (built-in vs. fully-qualified external package).
-"""
-# pylint: disable=wrong-import-position
-import os
 
-# Pin the backend before importing hyper_parallel because platform objects are
-# resolved at import time. Keep explicit user overrides intact.
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
+def main() -> None:
+    """Resolve configured components and execute language-model training."""
+    config: TrainerConfig = parse_training_args()
+    trainer = TextTrainer(config)
+    trainer.train()
 
-# Configure root logger BEFORE any other imports so module-level loggers in
-# downstream files pick up our format. ``init_logger`` is idempotent.
-from hyper_parallel.trainer.utils import init_logger
-
-init_logger()
-
-from hyper_parallel.trainer.config import parse_args, HyperTrainerConfig
-from hyper_parallel.trainer.utils.discovery import discover_model_spec
-from hyper_parallel.trainer.llm_trainer import LLMTrainer
 
 if __name__ == "__main__":
-    args = parse_args(HyperTrainerConfig)
-    # Resolve ``model.name`` to a Python package and import it. The package's
-    # ``__init__.py`` calls ``register_spec`` as a side effect, populating the
-    # global registry that ``BaseTrainer.__init__`` then queries via
-    # ``get_spec(args.model.name)``.
-    discover_model_spec(args.model.name)
-    trainer = LLMTrainer(args)
-    trainer.train()
+    main()

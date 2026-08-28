@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Shared neural-network building blocks for model implementations.
-
-Each model in ``hyper_parallel.models.<name>`` declares its own ``_tp_plan``
-and ``parallelize_<name>`` from these primitives — there is no global
-default parallel plan. Inspired by torchtitan ``models/common/``.
-"""
+"""Shared neural-network layers and linear-attention operator wrappers."""
 
 __all__ = [
     "GroupQueryAttention",
