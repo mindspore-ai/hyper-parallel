@@ -12,1438 +12,374 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for bounded-prefetch distributed dataset orchestration."""
+"""Unit tests for local-batch distributed dataset orchestration."""
 
 from __future__ import annotations
 
-import threading
-import time
+import dataclasses
+import inspect
 import unittest
-from contextlib import nullcontext
-from typing import Any, Callable, Sequence
-from unittest.mock import patch
+from typing import Any, Sequence
 
 from hyper_parallel import distributed_data
-from hyper_parallel.distributed_data import api as distributed_data_api
+from hyper_parallel.distributed_data.data_construct import (
+    LocalBatchMetadataView,
+    OnlineLocalBatchSource,
+    OnlineLocalBatchView,
+    SidecarLocalBatchFetcher,
+    SidecarLocalBatchSource,
+)
 from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
 from hyper_parallel.distributed_data.distributor import (
-    LocalMicroBatchDistributor,
+    IdentityModelParallelLocalBatchDistributor,
     LocalMetadataSynchronizer,
-    LocalSampleRedistributor,
-)
-from hyper_parallel.distributed_data.data_construct import (
-    MicroBatchFetcher,
-    StridedMetadataSource,
-    StridedOnlineSampleSource,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
-from hyper_parallel.distributed_data.schema import BatchPlan, OnlineSampleMetadata, SampleMeta, WorkloadCost
+from hyper_parallel.distributed_data.schema import LocalBatchMeta, OnlineLocalBatchMetadata, WorkloadCost
 from hyper_parallel.distributed_data.state import DatasetStateTracker
 from hyper_parallel.distributed_data.topology import DataTopology
-from tests.common.mark_utils import arg_mark
 
 
-class TestDistributedDataPublicApi(unittest.TestCase):
-    """Validate the stable package-level construction interface."""
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
+def _topology(data_parallel_size: int = 1) -> DataTopology:
+    return DataTopology.from_layout(
+        mesh_shape=(data_parallel_size,),
+        mesh_dim_names=("dp",),
+        rank_list=tuple(range(data_parallel_size)),
+        global_rank=0,
     )
-    def test_exports_only_supported_user_contracts(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Internal planning and communication components should stay module-scoped.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        self.assertEqual(
-            distributed_data.__all__,
-            [
-                "CostModel",
-                "DistributedDataStep",
-                "DistributedDataset",
-                "DistributedDatasetConfig",
-                "LinearMultimodalCostModel",
-                "SampleMeta",
-                "TensorShardSpec",
-                "WorkloadCost",
-                "build_distributed_dataset",
-            ],
-        )
-        for internal_name in (
-            "DataTopology",
-            "DatasetStateTracker",
-            "DistributedBatchPlanner",
-            "TorchMicroBatchDistributor",
-        ):
-            self.assertFalse(hasattr(distributed_data, internal_name))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_builder_selects_online_or_sidecar_metadata(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: The public builder should require exactly one metadata path.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        config = distributed_data.DistributedDatasetConfig(micro_batch_num=1)
-        self.assertEqual(config.raw_sample_size, 1)
 
-        def metadata_fn(sample: Any, sample_id: int) -> SampleMeta:
-            """Build unused metadata for boundary validation."""
-            del sample
-            return SampleMeta(sample_id=sample_id)
+def _sidecar_loader(
+    payloads: Sequence[Any],
+    *,
+    micro_batch_num: int = 2,
+    prepare_local_batch: Any = None,
+) -> tuple[DistributedDataset, list[int | str]]:
+    fetched_ids: list[int | str] = []
+    metadata = tuple(LocalBatchMeta(local_batch_id=index) for index in range(len(payloads)))
 
-        with self.assertRaisesRegex(ValueError, "requires metadata_fn"):
-            distributed_data.build_distributed_dataset([], None, config)
-        with self.assertRaisesRegex(ValueError, "either online metadata_fn or sidecar metadata"):
-            distributed_data.build_distributed_dataset(
-                [],
-                None,
-                config,
-                metadata_fn=metadata_fn,
-                metadata=[],
-            )
-        with self.assertRaisesRegex(ValueError, "sample_transport"):
-            distributed_data.DistributedDatasetConfig(
-                raw_sample_size=1,
-                micro_batch_num=1,
-                sample_transport="object_p2p",
-            )
-        with self.assertRaisesRegex(ValueError, "pin_memory must be a boolean"):
-            distributed_data.DistributedDatasetConfig(
-                raw_sample_size=1,
-                micro_batch_num=1,
-                pin_memory=1,
-            )
-        with self.assertRaisesRegex(ValueError, "double_buffer must be a boolean"):
-            distributed_data.DistributedDatasetConfig(
-                raw_sample_size=1,
-                micro_batch_num=1,
-                double_buffer=1,
-            )
-        with self.assertRaisesRegex(ValueError, "num_workers must be a non-negative integer"):
-            distributed_data.DistributedDatasetConfig(
-                raw_sample_size=1,
-                micro_batch_num=1,
-                num_workers=-1,
-            )
-        with self.assertRaisesRegex(ValueError, "prefetch_factor must be a positive integer"):
-            distributed_data.DistributedDatasetConfig(
-                raw_sample_size=1,
-                micro_batch_num=1,
-                prefetch_factor=0,
-            )
-        config = distributed_data.DistributedDatasetConfig(
-            raw_sample_size=1,
-            micro_batch_num=1,
-            prefetch_steps=1,
-            double_buffer=True,
-            num_workers=2,
-            prefetch_factor=3,
-        )
-        self.assertTrue(config.double_buffer)
-        self.assertEqual(config.num_workers, 2)
-        self.assertEqual(config.prefetch_factor, 3)
+    def fetch(local_batch_id: int | str) -> Any:
+        """Record and return one synthetic local batch."""
+        fetched_ids.append(local_batch_id)
+        return payloads[int(local_batch_id)]
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_builder_creates_dedicated_data_groups_in_global_order(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Every rank should derive the same metadata and model-group creation sequence.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        topology = DataTopology.from_layout(
-            mesh_shape=(2, 2),
-            mesh_dim_names=("dp_shard", "tp"),
-            rank_list=(0, 1, 2, 3),
-            global_rank=0,
-        )
-        metadata = [
-            SampleMeta(sample_id=index)
-            for index in range(4)
-        ]
-        created: list[tuple[tuple[int, ...], str]] = []
-        group_ranks: dict[str, tuple[int, ...]] = {}
-        barriers: list[str | None] = []
-
-        def create_named_group(ranks: Sequence[int], group_name: str) -> str:
-            """Record one synthetic dedicated group creation."""
-            normalized_ranks = tuple(ranks)
-            created.append((normalized_ranks, group_name))
-            group_ranks[group_name] = normalized_ranks
-            return group_name
-
-        with (
-            patch("hyper_parallel.distributed_data.api.DataTopology.from_mesh", return_value=topology),
-            patch.object(distributed_data_api.platform, "create_named_group", side_effect=create_named_group),
-            patch.object(
-                distributed_data_api.platform,
-                "barrier",
-                side_effect=lambda group=None: barriers.append(group),
-            ),
-            patch.object(
-                distributed_data_api.platform,
-                "get_process_group_ranks",
-                side_effect=lambda group: group_ranks[group],
-            ),
-        ):
-            loader = distributed_data.build_distributed_dataset(
-                [f"sample-{index}" for index in range(4)],
-                mesh=object(),
-                config=distributed_data.DistributedDatasetConfig(raw_sample_size=1, micro_batch_num=1),
-                metadata=metadata,
-            )
-
-        try:
-            self.assertEqual([ranks for ranks, _ in created], [(0, 2), (0, 1), (2, 3)])
-            self.assertTrue(created[0][1].startswith("hp_data_metadata_"))
-            self.assertTrue(all(name.startswith("hp_data_model_") for _, name in created[1:]))
-            self.assertEqual(barriers, [created[0][1], None, created[1][1], None, None])
-        finally:
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_online_metadata_preserves_dataset_sample_id(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Online metadata must retain the key used to read the map-style dataset.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        source = StridedOnlineSampleSource(
-            ["sample"],
-            lambda _sample, sample_id: SampleMeta(sample_id=sample_id + 1),
+    source = SidecarLocalBatchSource(metadata, fetch)
+    planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_num=micro_batch_num)
+    loader = DistributedDataset(
+        topology=_topology(),
+        source=source,
+        metadata_source=LocalBatchMetadataView(
+            source,
             shard_rank=0,
             num_shards=1,
-        )
-
-        with self.assertRaisesRegex(ValueError, "must preserve sample_id"):
-            source.get(0)
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
+            max_entries=len(payloads),
+        ),
+        online_source=None,
+        planner=planner,
+        sidecar_fetcher=SidecarLocalBatchFetcher(source),
+        metadata_synchronizer=LocalMetadataSynchronizer(),
+        local_batch_redistributor=None,
+        model_parallel_distributor=IdentityModelParallelLocalBatchDistributor(),
+        prefetch_steps=1,
+        prepare_local_batch=prepare_local_batch,
     )
-    def test_builder_configures_owner_torch_dataloader(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: The public options should configure one owner-local native DataLoader.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        dataset = ["sample"]
-        metadata = [SampleMeta(sample_id=0)]
-        topology = DataTopology.from_layout(
-            mesh_shape=(1,),
-            mesh_dim_names=("dp_shard",),
-            rank_list=(0,),
-            global_rank=0,
-        )
-
-        def worker_init_fn(worker_id: int) -> None:
-            """Provide a synthetic callback for constructor forwarding."""
-            del worker_id
-
-        with (
-            patch("hyper_parallel.distributed_data.api.DataTopology.from_mesh", return_value=topology),
-            patch("hyper_parallel.distributed_data.api.TorchLocalDataLoader") as local_loader_type,
-        ):
-            loader = distributed_data.build_distributed_dataset(
-                dataset,
-                mesh=object(),
-                config=distributed_data.DistributedDatasetConfig(
-                    raw_sample_size=1,
-                    micro_batch_num=1,
-                    num_workers=2,
-                    prefetch_factor=3,
-                    pin_memory=True,
-                ),
-                metadata=metadata,
-                collate_fn=tuple,
-                worker_init_fn=worker_init_fn,
-            )
-
-        try:
-            local_loader_type.assert_called_once_with(
-                dataset,
-                metadata_fn=None,
-                collate_fn=tuple,
-                num_workers=2,
-                prefetch_factor=3,
-                pin_memory=True,
-                worker_init_fn=worker_init_fn,
-                online_metadata=False,
-            )
-        finally:
-            loader.close()
-        local_loader_type.return_value.close.assert_called_once_with()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_builder_runs_both_metadata_paths_through_torch_dataloader(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: The native local loader should preserve both public planning modes.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        topology = DataTopology.from_layout(
-            mesh_shape=(1,),
-            mesh_dim_names=("dp_shard",),
-            rank_list=(0,),
-            global_rank=0,
-        )
-        dataset = ["sample-0", "sample-1"]
-        config = distributed_data.DistributedDatasetConfig(raw_sample_size=2, micro_batch_num=1)
-
-        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
-            """Derive minimal online metadata for the public builder path."""
-            del sample
-            return SampleMeta(sample_id=sample_id)
-
-        for online in (False, True):
-            with (
-                self.subTest(online=online),
-                patch("hyper_parallel.distributed_data.api.DataTopology.from_mesh", return_value=topology),
-            ):
-                kwargs = {"metadata_fn": metadata_fn} if online else {
-                    "metadata": [SampleMeta(sample_id=0), SampleMeta(sample_id=1)]
-                }
-                loader = distributed_data.build_distributed_dataset(
-                    dataset,
-                    mesh=object(),
-                    config=config,
-                    collate_fn=tuple,
-                    **kwargs,
-                )
-                try:
-                    step = next(loader)
-                    micro_batch = next(step)
-
-                    self.assertEqual(micro_batch.data, ("sample-0", "sample-1"))
-                    loader.commit(step.plan_id)
-                finally:
-                    loader.close()
+    return loader, fetched_ids
 
 
 class _PeerMetadataSynchronizer:
-    """Add a deterministic second owner's contribution without collectives."""
+    """Append one synthetic peer contribution after rank-zero metadata."""
 
     def gather(
         self,
-        local_metadata: Sequence[SampleMeta | OnlineSampleMetadata],
+        local_metadata: Sequence[OnlineLocalBatchMetadata],
         data_owner_ranks: tuple[int, ...],
-    ) -> tuple[SampleMeta | OnlineSampleMetadata, ...]:
-        """Return local metadata followed by a synthetic peer contribution."""
+    ) -> tuple[OnlineLocalBatchMetadata, ...]:
+        """Return rank-zero metadata followed by synthetic peer metadata."""
         if data_owner_ranks != (0, 1):
-            raise ValueError(f"Unexpected owners {data_owner_ranks}.")
-        peer_metadata = []
-        for metadata in local_metadata:
-            sample_meta = metadata.sample_meta if isinstance(metadata, OnlineSampleMetadata) else metadata
-            peer_sample_meta = SampleMeta(
-                sample_id=sample_meta.sample_id + 4,
-                cost_hint=WorkloadCost(encoder=sample_meta.cost_hint.encoder + 0.5),
+            raise ValueError(f"Unexpected data owners {data_owner_ranks}.")
+        peer = tuple(
+            OnlineLocalBatchMetadata(
+                LocalBatchMeta(
+                    local_batch_id=item.local_batch_meta.local_batch_id + 1,
+                    cost_hint=WorkloadCost(encoder=float(10 - index)),
+                )
             )
-            peer_metadata.append(
-                OnlineSampleMetadata(peer_sample_meta, metadata.tensor_spec)
-                if isinstance(metadata, OnlineSampleMetadata)
-                else peer_sample_meta
-            )
-        return tuple(local_metadata) + tuple(peer_metadata)
+            for index, item in enumerate(local_metadata)
+        )
+        return tuple(local_metadata) + peer
 
 
-class _RecordingFetcher:
-    """Record which heavyweight entries the current owner actually reads."""
-
-    def __init__(self, dataset: list[Any]) -> None:
-        """Initialize recording over a small map-style dataset."""
-        self._dataset = dataset
-        self.sample_ids = []
-
-    def fetch(self, metadata: SampleMeta) -> Any:
-        """Record and return one sample."""
-        self.sample_ids.append(metadata.sample_id)
-        return self._dataset[metadata.sample_id]
-
-
-class _PinnableValue:
-    """Record the thread used to pin one synthetic tensor leaf."""
-
-    def __init__(self, value: str, thread_names: list[str], *, fail: bool = False) -> None:
-        """Initialize one synthetic tensor-like value."""
-        self.value = value
-        self._thread_names = thread_names
-        self._fail = fail
-
-    def pin_memory(self) -> str:
-        """Return a pinned marker or raise a synthetic allocation error."""
-        self._thread_names.append(threading.current_thread().name)
-        if self._fail:
-            raise RuntimeError("synthetic pin failure")
-        return f"pinned-{self.value}"
-
-
-class _FailFetcher:
-    """Fail if a non-owner rank attempts heavyweight data access."""
-
-    def fetch(self, metadata: SampleMeta) -> Any:
-        """Reject every fetch attempt."""
-        raise AssertionError(f"Non-owner unexpectedly fetched {metadata.sample_id}.")
-
-
-class _RecordingMapDataset:
-    """Record raw map-style reads performed by an online data owner."""
-
-    def __init__(self, samples: list[str]) -> None:
-        """Initialize deterministic raw samples."""
-        self._samples = samples
-        self.sample_ids: list[int] = []
-
-    def __len__(self) -> int:
-        """Return global raw sample count."""
-        return len(self._samples)
-
-    def __getitem__(self, sample_id: int) -> str:
-        """Record and return one raw sample."""
-        self.sample_ids.append(sample_id)
-        return self._samples[sample_id]
-
-
-class _SyntheticSampleRedistributor:
-    """Provide peer samples while recording owner-loaded raw samples."""
+class _PeerLocalBatchRedistributor:
+    """Simulate a whole-step A2A result for data rank zero."""
 
     def __init__(self) -> None:
-        """Initialize an empty redistribution record."""
-        self.local_sample_batches: list[tuple[Any, ...]] = []
-        self.plans: list[BatchPlan] = []
-        self.thread_names: list[str] = []
+        """Initialize redistribution call records."""
+        self.calls = 0
+        self.local_inputs: tuple[Any, ...] = ()
 
     @staticmethod
-    def describe_sample(sample: Any) -> None:
-        """Return no tensor descriptor for synthetic string samples."""
-        del sample
+    def describe_local_batch(local_batch: Any) -> None:
+        """Return no tensor descriptor for synthetic string payloads."""
+        del local_batch
 
     def redistribute(
         self,
-        local_samples: Sequence[Any],
-        plan: BatchPlan,
+        local_batches: Sequence[Any],
+        plan: Any,
         topology: DataTopology,
-        global_metadata: Sequence[OnlineSampleMetadata],
+        global_metadata: Sequence[OnlineLocalBatchMetadata],
     ) -> dict[int, Any]:
-        """Return samples planned for data rank zero."""
-        if len(global_metadata) != len(plan.samples):
-            raise ValueError("Synthetic redistribution received incomplete global metadata.")
-        self.thread_names.append(threading.current_thread().name)
-        local_samples = tuple(local_samples)
-        self.local_sample_batches.append(local_samples)
-        self.plans.append(plan)
-        local_count = len(local_samples)
-        source_start = topology.data_rank * local_count
-        available = {
-            source_start + local_index: sample
-            for local_index, sample in enumerate(local_samples)
-        }
-        for sample in plan.samples:
-            available.setdefault(sample.source_position, f"peer-{sample.meta.sample_id}")
+        """Return synthetic target-rank payloads keyed by source position."""
+        self.calls += 1
+        self.local_inputs = tuple(local_batches)
+        if topology.data_rank != 0 or len(global_metadata) != 4:
+            raise ValueError("Unexpected online whole-step redistribution inputs.")
         return {
-            sample.source_position: available[sample.source_position]
-            for sample in plan.samples
-            if sample.target_data_rank == topology.data_rank
+            planned.source_position: f"batch-{planned.meta.local_batch_id}"
+            for planned in plan.local_batches
+            if planned.target_data_rank == topology.data_rank
         }
 
 
-class _ReceivingMicroBatchDistributor:
-    """Stand in for owner-to-TP-peer microbatch communication."""
+class TestDistributedDataPublicApi(unittest.TestCase):
+    """Validate the source-oriented public API boundary."""
 
-    def __init__(self, plan: BatchPlan) -> None:
-        """Initialize the plan that a remote owner publishes."""
-        self._plan = plan
-        self._micro_batch_index = 0
-        self.thread_names: list[str] = []
+    def test_exports_local_batch_contracts(self) -> None:
+        """Public exports should describe complete local batches, not raw samples."""
+        for name in (
+            "LocalBatch",
+            "LocalBatchMeta",
+            "OnlineLocalBatchSource",
+            "SidecarLocalBatchSource",
+        ):
+            self.assertIn(name, distributed_data.__all__)
+            self.assertTrue(hasattr(distributed_data, name))
+        self.assertNotIn("SampleMeta", distributed_data.__all__)
 
-    def distribute(
-        self,
-        micro_batch: Any | None,
-        plan: BatchPlan | None,
-        topology: DataTopology,
-    ) -> tuple[BatchPlan, Any]:
-        """Return a synthetic microbatch while asserting owner-only reads."""
-        if micro_batch is not None or plan is not None or topology.is_data_owner:
-            raise AssertionError("Non-owner distribution received owner-only inputs.")
-        self.thread_names.append(threading.current_thread().name)
-        result = f"received-{self._micro_batch_index}"
-        self._micro_batch_index += 1
-        return self._plan, result
+    def test_config_contains_only_distributed_controls(self) -> None:
+        """Reading, worker, and raw-sample options belong to the single-card source."""
+        field_names = {field.name for field in dataclasses.fields(distributed_data.DistributedDatasetConfig)}
 
-
-class _ReceivingPlanSequenceDistributor:
-    """Return one remote online microbatch plan per distribution call."""
-
-    def __init__(self, plans: Sequence[BatchPlan]) -> None:
-        """Initialize the ordered remote plan sequence."""
-        self._plans = tuple(plans)
-        self._micro_batch_index = 0
-
-    def distribute(
-        self,
-        micro_batch: Any | None,
-        plan: BatchPlan | None,
-        topology: DataTopology,
-    ) -> tuple[BatchPlan, Any]:
-        """Return the next remote plan while asserting non-owner behavior."""
-        if micro_batch is not None or plan is not None or topology.is_data_owner:
-            raise AssertionError("Non-owner online distribution received owner-only inputs.")
-        index = self._micro_batch_index
-        self._micro_batch_index += 1
-        return self._plans[index], f"received-online-{index}"
-
-
-class _BlockingMicroBatchDistributor:
-    """Block selected full-pipeline distribution calls for overlap assertions."""
-
-    def __init__(self, blocked_calls: tuple[int, ...]) -> None:
-        """Initialize one event pair for each zero-based blocked call."""
-        self._blocked_calls = set(blocked_calls)
-        self._lock = threading.Lock()
-        self._calls = 0
-        self.started = {index: threading.Event() for index in blocked_calls}
-        self.release = {index: threading.Event() for index in blocked_calls}
-        self.thread_names: list[str] = []
-
-    def distribute(
-        self,
-        micro_batch: Any | None,
-        plan: BatchPlan | None,
-        topology: DataTopology,
-    ) -> tuple[BatchPlan, Any]:
-        """Record the producer thread and wait when this call is selected."""
-        with self._lock:
-            call_index = self._calls
-            self._calls += 1
-        self.thread_names.append(threading.current_thread().name)
-        if call_index in self._blocked_calls:
-            self.started[call_index].set()
-            if not self.release[call_index].wait(timeout=5):
-                raise RuntimeError(f"Timed out releasing synthetic distribution call {call_index}.")
-        return LocalMicroBatchDistributor().distribute(micro_batch, plan, topology)
-
-    def release_all(self) -> None:
-        """Release every synthetic blocked distribution call."""
-        for event in self.release.values():
-            event.set()
-
-
-class _BlockingMetadataSynchronizer(_PeerMetadataSynchronizer):
-    """Block one online metadata collective to prove it runs ahead of consumption."""
-
-    def __init__(self, blocked_call: int) -> None:
-        """Initialize a zero-based blocking call and its coordination events."""
-        self._blocked_call = blocked_call
-        self._calls = 0
-        self.started = threading.Event()
-        self.release = threading.Event()
-        self.thread_names: list[str] = []
-
-    def gather(
-        self,
-        local_metadata: Sequence[SampleMeta | OnlineSampleMetadata],
-        data_owner_ranks: tuple[int, ...],
-    ) -> tuple[SampleMeta | OnlineSampleMetadata, ...]:
-        """Block the selected gather before returning deterministic peer metadata."""
-        call_index = self._calls
-        self._calls += 1
-        self.thread_names.append(threading.current_thread().name)
-        if call_index == self._blocked_call:
-            self.started.set()
-            if not self.release.wait(timeout=5):
-                raise RuntimeError("Timed out releasing synthetic metadata gather.")
-        return super().gather(local_metadata, data_owner_ranks)
-
-
-class _FakeReadyEvent:
-    """Record data-stream readiness synchronization across producer and consumer threads."""
-
-    def __init__(self) -> None:
-        """Initialize empty record and wait logs."""
-        self.recorded: list[tuple[Any, str]] = []
-        self.waited: list[tuple[Any, str]] = []
-
-    def record(self, stream: Any) -> None:
-        """Record the stream and thread that completed one data slot."""
-        self.recorded.append((stream, threading.current_thread().name))
-
-    def wait(self, stream: Any) -> None:
-        """Record the compute stream and thread consuming one data slot."""
-        self.waited.append((stream, threading.current_thread().name))
-
-
-class _FakeStreamPlatform:
-    """Provide stream/event primitives without requiring accelerator hardware."""
-
-    def __init__(self) -> None:
-        """Initialize the generated readiness-event list."""
-        self.events: list[_FakeReadyEvent] = []
-
-    @staticmethod
-    def get_stream_context() -> Callable[[Any], Any]:
-        """Return a context factory accepting the synthetic data stream."""
-        return nullcontext
-
-    def new_event(self) -> _FakeReadyEvent:
-        """Create and retain one synthetic readiness event."""
-        event = _FakeReadyEvent()
-        self.events.append(event)
-        return event
-
-    @staticmethod
-    def get_current_stream() -> str:
-        """Return the synthetic training compute stream."""
-        return "compute-stream"
-
-
-def _build_loader(
-    prefetch_steps: int = 2,
-    *,
-    double_buffer: bool = False,
-    micro_batch_distributor: Any | None = None,
-    prepare_micro_batch: Any | None = None,
-    data_stream: Any = None,
-):
-    metadata = [
-        SampleMeta(
-            sample_id=index,
-            cost_hint=WorkloadCost(encoder=float(index + 1)),
+        self.assertEqual(
+            field_names,
+            {
+                "micro_batch_num",
+                "prefetch_steps",
+                "payload_transport",
+                "dp_dim_names",
+                "cp_shards",
+                "double_buffer",
+            },
         )
-        for index in range(4)
-    ]
-    topology = DataTopology.from_layout(
-        mesh_shape=(2,),
-        mesh_dim_names=("dp_shard",),
-        rank_list=(0, 1),
-        global_rank=0,
-    )
-    planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=2)
-    fetcher = _RecordingFetcher([f"sample-{index}" for index in range(8)])
-    loader = DistributedDataset(
-        topology=topology,
-        metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
-        planner=planner,
-        micro_batch_fetcher=MicroBatchFetcher(fetcher, tuple),
-        metadata_synchronizer=_PeerMetadataSynchronizer(),
-        micro_batch_distributor=micro_batch_distributor or LocalMicroBatchDistributor(),
-        prefetch_steps=prefetch_steps,
-        double_buffer=double_buffer,
-        prepare_micro_batch=prepare_micro_batch,
-        data_stream=data_stream,
-    )
-    return loader, fetcher
+        with self.assertRaisesRegex(ValueError, "payload_transport"):
+            distributed_data.DistributedDatasetConfig(
+                micro_batch_num=1,
+                payload_transport="object_p2p",
+            )
+
+    def test_builder_accepts_a_source_instead_of_dataset_callbacks(self) -> None:
+        """The builder should not own metadata derivation, collation, or workers."""
+        parameters = inspect.signature(distributed_data.build_distributed_dataset).parameters
+
+        self.assertIn("source", parameters)
+        for removed in ("dataset", "metadata", "metadata_fn", "collate_fn", "worker_init_fn"):
+            self.assertNotIn(removed, parameters)
 
 
-def _build_pinning_loader(samples: list[Any], *, online: bool, pin_memory: bool) -> DistributedDataset:
-    topology = DataTopology.from_layout(
-        mesh_shape=(1,),
-        mesh_dim_names=("dp_shard",),
-        rank_list=(0,),
-        global_rank=0,
-    )
-    planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=len(samples), micro_batch_num=1)
+class TestLocalBatchSources(unittest.TestCase):
+    """Validate the two supported metadata availability points."""
 
-    def collate_fn(values: list[Any]) -> dict[str, Any]:
-        """Create a nested batch that exercises recursive pinning."""
-        return {"values": values, "nested": (values[0], ["text"])}
-
-    if online:
-        def metadata_fn(sample: Any, sample_id: int) -> SampleMeta:
-            """Build online metadata for one synthetic raw sample."""
-            del sample
-            return SampleMeta(sample_id=sample_id)
-
-        online_source = StridedOnlineSampleSource(samples, metadata_fn, shard_rank=0, num_shards=1)
-        return DistributedDataset(
-            topology=topology,
-            metadata_source=None,
-            planner=planner,
-            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), collate_fn),
-            metadata_synchronizer=LocalMetadataSynchronizer(),
-            micro_batch_distributor=LocalMicroBatchDistributor(),
-            prefetch_steps=1,
-            pin_memory=pin_memory,
-            online_sample_source=online_source,
-            sample_redistributor=LocalSampleRedistributor(),
+    def test_sidecar_source_does_not_fetch_payload_for_metadata(self) -> None:
+        """Reading sidecar entries must not invoke the heavyweight fetch callback."""
+        fetched_ids = []
+        source = SidecarLocalBatchSource(
+            [LocalBatchMeta(local_batch_id="batch-0")],
+            fetched_ids.append,
         )
 
-    metadata = [
-        SampleMeta(sample_id=index)
-        for index in range(len(samples))
-    ]
-    return DistributedDataset(
-        topology=topology,
-        metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
-        planner=planner,
-        micro_batch_fetcher=MicroBatchFetcher(_RecordingFetcher(samples), collate_fn),
-        metadata_synchronizer=LocalMetadataSynchronizer(),
-        micro_batch_distributor=LocalMicroBatchDistributor(),
-        prefetch_steps=1,
-        pin_memory=pin_memory,
-    )
+        metadata = source.get_metadata(0)
 
+        self.assertEqual(metadata.local_batch_id, "batch-0")
+        self.assertEqual(fetched_ids, [])
+        source.fetch(metadata)
+        self.assertEqual(fetched_ids, ["batch-0"])
 
-def _build_single_microbatch_double_buffer(micro_batch_distributor: Any) -> DistributedDataset:
-    """Build two one-microbatch steps for cross-step look-ahead tests."""
-    metadata = [
-        SampleMeta(sample_id=index)
-        for index in range(2)
-    ]
-    topology = DataTopology.from_layout(
-        mesh_shape=(1,),
-        mesh_dim_names=("dp_shard",),
-        rank_list=(0,),
-        global_rank=0,
-    )
-    return DistributedDataset(
-        topology=topology,
-        metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
-        planner=DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=1),
-        micro_batch_fetcher=MicroBatchFetcher(_RecordingFetcher(["sample-0", "sample-1"]), tuple),
-        metadata_synchronizer=LocalMetadataSynchronizer(),
-        micro_batch_distributor=micro_batch_distributor,
-        prefetch_steps=2,
-        double_buffer=True,
-    )
+    def test_online_source_derives_metadata_after_materialization(self) -> None:
+        """Online metadata should observe the complete processed local batch."""
+        events = []
+
+        class _OnlineBatches:
+            def __len__(self) -> int:
+                """Return one online local batch."""
+                return 1
+
+            def __getitem__(self, index: int) -> dict[str, int]:
+                """Materialize one online local batch."""
+                events.append(("load", index))
+                return {"tokens": 32768}
+
+        def metadata_fn(local_batch: dict[str, int], local_batch_id: int) -> LocalBatchMeta:
+            """Derive metadata after observing the processed local batch."""
+            events.append(("metadata", local_batch["tokens"]))
+            return LocalBatchMeta(local_batch_id=local_batch_id, text_tokens=local_batch["tokens"])
+
+        source = OnlineLocalBatchSource(_OnlineBatches(), metadata_fn)
+
+        loaded = source.load(0)
+
+        self.assertEqual(events, [("load", 0), ("metadata", 32768)])
+        self.assertEqual(loaded.metadata.text_tokens, 32768)
+        self.assertEqual(loaded.data, {"tokens": 32768})
 
 
 class TestDistributedDataset(unittest.TestCase):
-    """Validate owner-only reads, bounded look-ahead, and exact resume."""
+    """Validate planning, materialization, delivery, and checkpoint offsets."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_prefetches_real_sidecar_data_and_requires_commit(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Sidecar prefetch should make complete Host steps ready before consumption.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        loader, fetcher = _build_loader()
+    def test_sidecar_plans_before_target_rank_fetch_and_commits_offsets(self) -> None:
+        """Sidecar entries should produce two local batches per optimizer step."""
+        loader, fetched_ids = _sidecar_loader(["batch-0", "batch-1", "batch-2", "batch-3"])
         try:
+            self.assertEqual(fetched_ids, [])
+
             step = next(loader)
+            local_batches = tuple(step)
 
-            deadline = time.monotonic() + 2
-            while loader.ready_offset < 4 and time.monotonic() < deadline:
-                time.sleep(0.001)
-            self.assertEqual(len(fetcher.sample_ids), 4)
-            self.assertEqual(loader.consumed_offset, 0)
-            self.assertEqual(loader.ready_offset, 4)
-            self.assertEqual(loader.reserved_offset, 4)
-            with self.assertRaisesRegex(ValueError, "Fully consume and commit"):
-                next(loader)
-            with self.assertRaisesRegex(ValueError, "Consume every microbatch"):
-                loader.commit("not-ready")
-
-            first = next(step)
-            with self.assertRaisesRegex(ValueError, "Consume every microbatch"):
-                _ = step.plan_id
-            second = next(step)
-
-            self.assertEqual([first.micro_batch_index, second.micro_batch_index], [0, 1])
-            self.assertEqual(first.plan_id, second.plan_id)
-            self.assertTrue(step.is_complete)
+            self.assertEqual([item.local_batch_id for item in local_batches], [0, 1])
+            self.assertEqual([item.data for item in local_batches], ["batch-0", "batch-1"])
+            self.assertEqual(fetched_ids, [0, 1])
+            self.assertEqual({item.plan_id for item in local_batches}, {step.plan_id})
             loader.commit(step.plan_id)
             self.assertEqual(loader.consumed_offset, 2)
+            self.assertEqual(loader.state_dict()["local_batches_per_step"], 2)
         finally:
             loader.close()
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_state_separates_reserved_ready_and_consumed_offsets(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Only completed Host reads and commits should advance their offsets.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        state = DatasetStateTracker(metadata_size=6, samples_per_step=2, prefetch_steps=2)
-        _, first_start, first_end = state.reserve()
-        _, second_start, second_end = state.reserve()
+    def test_online_mode_plans_and_redistributes_the_complete_step(self) -> None:
+        """Online mode should load all accumulation slots before one whole-step A2A."""
+        loaded_ids = []
 
-        self.assertEqual(state.reserved_offset, 4)
-        self.assertEqual(state.ready_offset, 0)
-        self.assertEqual(state.consumed_offset, 0)
+        class _OnlineBatches:
+            def __len__(self) -> int:
+                """Return enough global local batches for two optimizer steps."""
+                return 8
 
-        state.mark_ready(first_start, first_end)
-        self.assertEqual(state.ready_offset, 2)
-        state.mark_ready(second_start, second_end)
-        state.mark_delivered("first-step", first_start, first_end)
-        self.assertEqual(state.ready_offset, 4)
-        self.assertEqual(state.consumed_offset, 0)
+            def __getitem__(self, index: int) -> str:
+                """Record and materialize one global local-batch index."""
+                loaded_ids.append(index)
+                return f"batch-{index}"
 
-        state.commit("first-step")
-        self.assertEqual(state.consumed_offset, 2)
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_double_buffer_prefetches_full_sidecar_pipeline_and_next_step(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: The alternate slot should finish distribution for the next execution unit.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        distributor = _BlockingMicroBatchDistributor(blocked_calls=(1, 2))
-        prepare_threads: list[str] = []
-
-        def prepare_micro_batch(micro_batch: Any) -> Any:
-            """Record that device preparation moved onto the data producer."""
-            prepare_threads.append(threading.current_thread().name)
-            return micro_batch
-
-        loader, _ = _build_loader(
-            double_buffer=True,
-            micro_batch_distributor=distributor,
-            prepare_micro_batch=prepare_micro_batch,
-        )
-        try:
-            step = next(loader)
-            first = next(step)
-
-            self.assertEqual(first.micro_batch_index, 0)
-            self.assertTrue(distributor.started[1].wait(timeout=2))
-            self.assertEqual(loader.consumed_offset, 0)
-            self.assertTrue(all(name.startswith("hp-data-buffer") for name in distributor.thread_names))
-            self.assertTrue(all(name.startswith("hp-data-buffer") for name in prepare_threads))
-
-            distributor.release[1].set()
-            second = next(step)
-
-            self.assertEqual(second.micro_batch_index, 1)
-            self.assertTrue(distributor.started[2].wait(timeout=2))
-            self.assertEqual(loader.consumed_offset, 0)
-
-            distributor.release[2].set()
-            loader.commit(step.plan_id)
-            next_step = next(loader)
-            self.assertEqual(next(next_step).micro_batch_index, 0)
-        finally:
-            distributor.release_all()
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_disabling_double_buffer_leaves_distribution_on_demand(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Host prefetch alone must not prepare a device/communication batch ahead.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        distributor = _BlockingMicroBatchDistributor(blocked_calls=(0,))
-        loader, _ = _build_loader(
-            double_buffer=False,
-            micro_batch_distributor=distributor,
-        )
-        try:
-            step = next(loader)
-
-            self.assertFalse(distributor.started[0].wait(timeout=0.05))
-            distributor.release[0].set()
-            first = next(step)
-            self.assertEqual(first.micro_batch_index, 0)
-            self.assertTrue(distributor.started[0].is_set())
-        finally:
-            distributor.release_all()
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_double_buffer_with_one_prefetched_step_overlaps_microbatches(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: One step reservation should still allow overlap within that optimizer step.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        distributor = _BlockingMicroBatchDistributor(blocked_calls=(1,))
-        loader, _ = _build_loader(
-            prefetch_steps=1,
-            double_buffer=True,
-            micro_batch_distributor=distributor,
-        )
-        try:
-            step = next(loader)
-            first = next(step)
-
-            self.assertEqual(first.micro_batch_index, 0)
-            self.assertTrue(distributor.started[1].wait(timeout=2))
-
-            distributor.release[1].set()
-            second = next(step)
-
-            self.assertEqual(second.micro_batch_index, 1)
-            loader.commit(step.plan_id)
-            self.assertEqual(loader.consumed_offset, 2)
-        finally:
-            distributor.release_all()
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_double_buffer_prefetches_online_collectives_and_redistribution(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Online metadata gather and raw A2A should run before the next consumer request.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
-
-        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
-            """Build deterministic online metadata for the synthetic sample."""
-            del sample
-            return SampleMeta(
-                sample_id=sample_id,
-                cost_hint=WorkloadCost(encoder=float(sample_id + 1)),
+        def metadata_fn(local_batch: str, local_batch_id: int) -> LocalBatchMeta:
+            """Derive synthetic online workload metadata."""
+            del local_batch
+            return LocalBatchMeta(
+                local_batch_id=local_batch_id,
+                cost_hint=WorkloadCost(encoder=float(local_batch_id + 1)),
             )
 
-        topology = DataTopology.from_layout(
-            mesh_shape=(2,),
-            mesh_dim_names=("dp_shard",),
-            rank_list=(0, 1),
-            global_rank=0,
-        )
-        synchronizer = _BlockingMetadataSynchronizer(blocked_call=1)
-        redistributor = _SyntheticSampleRedistributor()
-        prepare_threads: list[str] = []
+        source = OnlineLocalBatchSource(_OnlineBatches(), metadata_fn)
+        planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_num=2)
+        redistributor = _PeerLocalBatchRedistributor()
         loader = DistributedDataset(
-            topology=topology,
+            topology=_topology(data_parallel_size=2),
+            source=source,
             metadata_source=None,
-            planner=DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=3),
-            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), tuple),
-            metadata_synchronizer=synchronizer,
-            micro_batch_distributor=LocalMicroBatchDistributor(),
-            prefetch_steps=2,
-            double_buffer=True,
-            prepare_micro_batch=lambda micro_batch: (
-                prepare_threads.append(threading.current_thread().name) or micro_batch
-            ),
-            online_sample_source=StridedOnlineSampleSource(
-                dataset,
-                metadata_fn,
+            online_source=OnlineLocalBatchView(
+                source,
                 shard_rank=0,
                 num_shards=2,
-                max_entries=3,
+                max_entries=4,
             ),
-            sample_redistributor=redistributor,
+            planner=planner,
+            sidecar_fetcher=None,
+            metadata_synchronizer=_PeerMetadataSynchronizer(),
+            local_batch_redistributor=redistributor,
+            model_parallel_distributor=IdentityModelParallelLocalBatchDistributor(),
+            prefetch_steps=1,
         )
         try:
             step = next(loader)
-            first = next(step)
+            local_batches = tuple(step)
 
-            self.assertEqual(first.micro_batch_index, 0)
-            self.assertTrue(synchronizer.started.wait(timeout=2))
-            self.assertTrue(all(name.startswith("hp-data-buffer") for name in synchronizer.thread_names))
-
-            synchronizer.release.set()
-            remaining = list(step)
-
-            self.assertEqual([micro_batch.micro_batch_index for micro_batch in [first, *remaining]], [0, 1, 2])
-            self.assertEqual(dataset.sample_ids, [0, 2, 4])
-            self.assertTrue(all(name.startswith("hp-data-buffer") for name in redistributor.thread_names))
-            self.assertTrue(all(name.startswith("hp-data-buffer") for name in prepare_threads))
-            loader.commit(step.plan_id)
+            self.assertEqual(loaded_ids, [0, 2])
+            self.assertEqual(redistributor.calls, 1)
+            self.assertEqual(redistributor.local_inputs, ("batch-0", "batch-2"))
+            self.assertEqual(len(local_batches), 2)
+            self.assertEqual(
+                [item.data for item in local_batches],
+                [f"batch-{item.local_batch_id}" for item in local_batches],
+            )
         finally:
-            synchronizer.release.set()
             loader.close()
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_double_buffer_waits_for_data_stream_readiness_on_compute_stream(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: A device-ready slot should establish a stream dependency before consumption.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        fake_platform = _FakeStreamPlatform()
-        loader, _ = _build_loader(double_buffer=True, data_stream="data-stream")
-        with patch("hyper_parallel.distributed_data.distributed_dataset.platform", fake_platform):
-            try:
-                step = next(loader)
-                first = next(step)
+    def test_prepare_local_batch_runs_after_host_fetch(self) -> None:
+        """Device preparation should receive the opaque local-batch payload."""
+        prepared = []
 
-                self.assertEqual(first.micro_batch_index, 0)
-                self.assertTrue(fake_platform.events)
-                ready_event = fake_platform.events[0]
-                self.assertEqual(ready_event.recorded[0][0], "data-stream")
-                self.assertTrue(ready_event.recorded[0][1].startswith("hp-data-buffer"))
-                self.assertEqual(ready_event.waited, [("compute-stream", threading.current_thread().name)])
-            finally:
-                loader.close()
+        def prepare_local_batch(local_batch: str) -> str:
+            """Record and transform one opaque local-batch payload."""
+            prepared.append(local_batch)
+            return f"prepared:{local_batch}"
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_double_buffer_crosses_step_boundary_when_microbatch_count_is_one(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Disabling gradient accumulation should still prepare the next optimizer step.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        distributor = _BlockingMicroBatchDistributor(blocked_calls=(1,))
-        loader = _build_single_microbatch_double_buffer(distributor)
+        loader, _ = _sidecar_loader(
+            ["batch-0", "batch-1"],
+            prepare_local_batch=prepare_local_batch,
+        )
+        try:
+            step = next(loader)
+            local_batches = tuple(step)
+
+            self.assertEqual(prepared, ["batch-0", "batch-1"])
+            self.assertEqual([item.data for item in local_batches], ["prepared:batch-0", "prepared:batch-1"])
+        finally:
+            loader.close()
+
+    def test_checkpoint_resume_uses_local_batch_offsets(self) -> None:
+        """Committed offsets should replay only unconsumed local batches."""
+        loader, _ = _sidecar_loader(["batch-0", "batch-1", "batch-2", "batch-3"])
         try:
             first_step = next(loader)
-            first = next(first_step)
-
-            self.assertEqual(first.micro_batch_index, 0)
-            self.assertTrue(distributor.started[1].wait(timeout=2))
-            self.assertEqual(loader.consumed_offset, 0)
-
-            distributor.release[1].set()
+            tuple(first_step)
             loader.commit(first_step.plan_id)
-            second_step = next(loader)
-            second = next(second_step)
-
-            self.assertEqual(second.micro_batch_index, 0)
-            self.assertEqual(second_step.step, 1)
-            loader.commit(second_step.plan_id)
-            self.assertEqual(loader.consumed_offset, 2)
+            state = loader.state_dict()
         finally:
-            distributor.release_all()
             loader.close()
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_double_buffer_close_drains_running_collective_task(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Closing must not cancel a collective that peer ranks may already have entered.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        distributor = _BlockingMicroBatchDistributor(blocked_calls=(1,))
-        loader = _build_single_microbatch_double_buffer(distributor)
-        close_complete = threading.Event()
+        resumed, _ = _sidecar_loader(["batch-0", "batch-1", "batch-2", "batch-3"])
+        try:
+            resumed.load_state_dict(state)
+            next_step = next(resumed)
+            local_batches = tuple(next_step)
 
-        def close_loader() -> None:
-            """Close the loader and publish completion to the consumer thread."""
-            loader.close()
-            close_complete.set()
+            self.assertEqual(next_step.local_batch_offset_start, 2)
+            self.assertEqual([item.local_batch_id for item in local_batches], [2, 3])
+        finally:
+            resumed.close()
 
-        close_thread = threading.Thread(
-            target=close_loader,
-            name="synthetic-close",
-        )
+    def test_commit_requires_a_fully_consumed_step(self) -> None:
+        """Checkpoint state must not advance before all local batches are delivered."""
+        loader, _ = _sidecar_loader(["batch-0", "batch-1"])
         try:
             step = next(loader)
+
+            with self.assertRaisesRegex(ValueError, "Consume every local batch"):
+                loader.commit("unknown")
             next(step)
-            self.assertTrue(distributor.started[1].wait(timeout=2))
-
-            close_thread.start()
-            self.assertFalse(close_complete.wait(timeout=0.1))
-
-            distributor.release[1].set()
-            self.assertTrue(close_complete.wait(timeout=2))
-        finally:
-            distributor.release_all()
-            if close_thread.is_alive():
-                close_thread.join(timeout=2)
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_double_buffer_runs_non_owner_distribution_on_data_producer(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: TP peers must enter microbatch collectives from the same ordered producer role.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        metadata = [
-            SampleMeta(sample_id=index)
-            for index in range(2)
-        ]
-        topology = DataTopology.from_layout(
-            mesh_shape=(2,),
-            mesh_dim_names=("tp",),
-            rank_list=(0, 1),
-            global_rank=1,
-        )
-        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=2)
-        distributor = _ReceivingMicroBatchDistributor(planner.plan(metadata, step=0, sample_offset_start=0))
-        loader = DistributedDataset(
-            topology=topology,
-            metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
-            planner=planner,
-            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher()),
-            metadata_synchronizer=LocalMetadataSynchronizer(),
-            micro_batch_distributor=distributor,
-            prefetch_steps=2,
-            double_buffer=True,
-        )
-        try:
-            step = next(loader)
-            micro_batches = list(step)
-
-            self.assertEqual([micro_batch.data for micro_batch in micro_batches], ["received-0", "received-1"])
-            self.assertTrue(all(name.startswith("hp-data-buffer") for name in distributor.thread_names))
-            loader.commit(step.plan_id)
+            with self.assertRaisesRegex(ValueError, "Consume every local batch"):
+                loader.commit("unknown")
         finally:
             loader.close()
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_online_metadata_balances_and_redistributes_one_microbatch_at_a_time(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Unavailable metadata must restrict planning and sample reads to each microbatch.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
 
-        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
-            """Derive deterministic online cost metadata from one raw sample."""
-            del sample
-            return SampleMeta(
-                sample_id=sample_id,
-                cost_hint=WorkloadCost(encoder=float(sample_id + 1)),
-            )
+class TestDatasetStateTracker(unittest.TestCase):
+    """Validate local-batch checkpoint schema boundaries."""
 
-        topology = DataTopology.from_layout(
-            mesh_shape=(2,),
-            mesh_dim_names=("dp_shard",),
-            rank_list=(0, 1),
-            global_rank=0,
-        )
-        online_source = StridedOnlineSampleSource(
-            dataset,
-            metadata_fn,
-            shard_rank=0,
-            num_shards=2,
-            max_entries=3,
-        )
-        redistributor = _SyntheticSampleRedistributor()
-        loader = DistributedDataset(
-            topology=topology,
-            metadata_source=None,
-            planner=DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=3),
-            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), tuple),
-            metadata_synchronizer=_PeerMetadataSynchronizer(),
-            micro_batch_distributor=LocalMicroBatchDistributor(),
-            prefetch_steps=1,
-            online_sample_source=online_source,
-            sample_redistributor=redistributor,
-        )
-        try:
-            self.assertEqual(len(loader), 1)
-            step = next(loader)
+    def test_state_dict_uses_source_and_local_batch_terms(self) -> None:
+        """State dictionaries should not expose raw-sample terminology."""
+        tracker = DatasetStateTracker(source_size=8, local_batches_per_step=2, prefetch_steps=1)
 
-            self.assertLessEqual(len(dataset.sample_ids), 1)
-            first = next(step)
-            self.assertEqual(len(redistributor.local_sample_batches), 1)
-            self.assertLessEqual(len(dataset.sample_ids), 2)
+        state = tracker.state_dict()
 
-            remaining = list(step)
-            micro_batches = [first, *remaining]
-            self.assertEqual([micro_batch.micro_batch_index for micro_batch in micro_batches], [0, 1, 2])
-            self.assertEqual(dataset.sample_ids, [0, 2, 4])
-            self.assertEqual(
-                redistributor.local_sample_batches,
-                [("raw-0",), ("raw-2",), ("raw-4",)],
-            )
-            self.assertEqual([plan.micro_batch_start for plan in redistributor.plans], [0, 1, 2])
-            self.assertTrue(all(plan.micro_batch_num == 1 for plan in redistributor.plans))
-            loader.commit(step.plan_id)
-        finally:
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_online_prefetch_reads_only_the_bounded_future_microbatches(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Online prefetch should perform real reads without materializing a whole step.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        dataset = _RecordingMapDataset([f"raw-{index}" for index in range(6)])
-
-        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
-            """Derive deterministic online metadata from one raw sample."""
-            del sample
-            return SampleMeta(sample_id=sample_id)
-
-        topology = DataTopology.from_layout(
-            mesh_shape=(2,),
-            mesh_dim_names=("dp_shard",),
-            rank_list=(0, 1),
-            global_rank=0,
-        )
-        synchronizer = _BlockingMetadataSynchronizer(blocked_call=1)
-        loader = DistributedDataset(
-            topology=topology,
-            metadata_source=None,
-            planner=DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=3),
-            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher(), tuple),
-            metadata_synchronizer=synchronizer,
-            micro_batch_distributor=LocalMicroBatchDistributor(),
-            prefetch_steps=2,
-            online_sample_source=StridedOnlineSampleSource(
-                dataset,
-                metadata_fn,
-                shard_rank=0,
-                num_shards=2,
-                max_entries=3,
-            ),
-            sample_redistributor=_SyntheticSampleRedistributor(),
-        )
-        try:
-            next(loader)
-
-            self.assertTrue(synchronizer.started.wait(timeout=2))
-            self.assertEqual(dataset.sample_ids, [0, 2])
-            self.assertEqual(loader.consumed_offset, 0)
-        finally:
-            synchronizer.release.set()
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_pin_memory_uses_dedicated_thread_after_collation(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Both metadata paths should recursively pin collated batches off the consumer thread.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        for online in (False, True):
-            with self.subTest(online=online):
-                thread_names: list[str] = []
-                samples = [
-                    _PinnableValue("zero", thread_names),
-                    _PinnableValue("one", thread_names),
-                ]
-                loader = _build_pinning_loader(samples, online=online, pin_memory=True)
-                try:
-                    step = next(loader)
-                    batch = next(step).data
-
-                    self.assertEqual(
-                        batch,
-                        {
-                            "values": ["pinned-zero", "pinned-one"],
-                            "nested": ("pinned-zero", ["text"]),
-                        },
-                    )
-                    self.assertTrue(thread_names)
-                    self.assertTrue(all(name.startswith("hp-data-pin") for name in thread_names))
-                finally:
-                    loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_pin_memory_is_disabled_by_default(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Leaving pinning disabled should preserve collated object identity.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        thread_names: list[str] = []
-        samples = [_PinnableValue("zero", thread_names)]
-        loader = _build_pinning_loader(samples, online=False, pin_memory=False)
-        try:
-            step = next(loader)
-            batch = next(step).data
-
-            self.assertIs(batch["values"][0], samples[0])
-            self.assertEqual(thread_names, [])
-        finally:
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_pin_memory_errors_reach_the_consumer(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Pinning failures should not be swallowed by the background thread.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        samples = [_PinnableValue("zero", [], fail=True)]
-        loader = _build_pinning_loader(samples, online=False, pin_memory=True)
-        try:
-            step = next(loader)
-            with self.assertRaisesRegex(RuntimeError, "synthetic pin failure"):
-                next(step)
-        finally:
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_checkpoint_ignores_unconsumed_preparation_and_resumes(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Restoring must restart from the last optimizer-step commit.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        loader, _ = _build_loader()
-        try:
-            step = next(loader)
-            before_commit = loader.state_dict()
-            self.assertEqual(before_commit["consumed_offset"], 0)
-            list(step)
-            loader.commit(step.plan_id)
-            consumed_state = loader.state_dict()
-            self.assertEqual(consumed_state["consumed_offset"], 2)
-        finally:
-            loader.close()
-
-        restored, _ = _build_loader()
-        try:
-            restored.load_state_dict(consumed_state)
-            resumed_step = next(restored)
-            self.assertEqual(resumed_step.sample_offset_start, 2)
-            self.assertEqual(resumed_step.step, 1)
-        finally:
-            restored.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_tp_peer_receives_micro_batches_without_fetching_dataset(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Only the data owner may perform map-style I/O for a DP coordinate.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        metadata = [
-            SampleMeta(sample_id=index)
-            for index in range(2)
-        ]
-        topology = DataTopology.from_layout(
-            mesh_shape=(2,),
-            mesh_dim_names=("tp",),
-            rank_list=(0, 1),
-            global_rank=1,
-        )
-        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=2)
-        plan = planner.plan(metadata, step=0, sample_offset_start=0)
-        loader = DistributedDataset(
-            topology=topology,
-            metadata_source=StridedMetadataSource(metadata, shard_rank=0, num_shards=1),
-            planner=planner,
-            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher()),
-            metadata_synchronizer=_PeerMetadataSynchronizer(),
-            micro_batch_distributor=_ReceivingMicroBatchDistributor(plan),
-            prefetch_steps=1,
-        )
-        try:
-            step = next(loader)
-            self.assertEqual([micro_batch.data for micro_batch in step], ["received-0", "received-1"])
-        finally:
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_online_tp_peer_receives_microbatch_plans_without_reading_dataset(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Non-owner model peers should receive online plans without candidate I/O.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        dataset = _RecordingMapDataset(["raw-0", "raw-1"])
-
-        def metadata_fn(sample: str, sample_id: int) -> SampleMeta:
-            """Build metadata that must remain unused on the non-owner peer."""
-            del sample
-            return SampleMeta(sample_id=sample_id)
-
-        topology = DataTopology.from_layout(
-            mesh_shape=(2,),
-            mesh_dim_names=("tp",),
-            rank_list=(0, 1),
-            global_rank=1,
-        )
-        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=1, micro_batch_num=2)
-        plans = [
-            planner.plan_microbatch(
-                [SampleMeta(sample_id=index)],
-                step=0,
-                sample_offset_start=index,
-                micro_batch_index=index,
-            )
-            for index in range(2)
-        ]
-        loader = DistributedDataset(
-            topology=topology,
-            metadata_source=None,
-            planner=planner,
-            micro_batch_fetcher=MicroBatchFetcher(_FailFetcher()),
-            metadata_synchronizer=LocalMetadataSynchronizer(),
-            micro_batch_distributor=_ReceivingPlanSequenceDistributor(plans),
-            prefetch_steps=1,
-            online_sample_source=StridedOnlineSampleSource(dataset, metadata_fn, shard_rank=0, num_shards=1),
-            sample_redistributor=LocalSampleRedistributor(),
-        )
-        try:
-            step = next(loader)
-            micro_batches = list(step)
-
-            self.assertEqual(
-                [micro_batch.data for micro_batch in micro_batches],
-                ["received-online-0", "received-online-1"],
-            )
-            self.assertEqual(dataset.sample_ids, [])
-            loader.commit(step.plan_id)
-        finally:
-            loader.close()
-
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
-    def test_metadata_shards_can_be_truncated_to_equal_complete_steps(self) -> None:
-        """
-        Feature: Distributed dataset prefetch and replay
-        Description: Uneven strided tails must not make owners call different collective counts.
-        Expectation: The operation produces the expected data, ordering, state, or error.
-        """
-        metadata = [
-            SampleMeta(sample_id=index)
-            for index in range(10)
-        ]
-        sources = [
-            StridedMetadataSource(metadata, shard_rank=rank, num_shards=3, max_entries=2)
-            for rank in range(3)
-        ]
-
-        self.assertEqual([len(source) for source in sources], [2, 2, 2])
+        self.assertEqual(state["source_size"], 8)
+        self.assertEqual(state["local_batches_per_step"], 2)
+        self.assertNotIn("metadata_size", state)
+        self.assertNotIn("samples_per_step", state)

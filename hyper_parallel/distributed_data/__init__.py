@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Metadata-planned distributed data loading."""
+"""Metadata-planned distribution of complete single-card local batches."""
 
 from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataset
 from hyper_parallel.distributed_data.cost_model import CostModel, LinearMultimodalCostModel
+from hyper_parallel.distributed_data.data_construct import OnlineLocalBatchSource, SidecarLocalBatchSource
 from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
 from hyper_parallel.distributed_data.schema import (
     DistributedDataStep,
-    SampleMeta,
+    LocalBatch,
+    LocalBatchMeta,
     TensorShardSpec,
     WorkloadCost,
 )
@@ -30,7 +32,10 @@ __all__ = [
     "DistributedDataset",
     "DistributedDatasetConfig",
     "LinearMultimodalCostModel",
-    "SampleMeta",
+    "LocalBatch",
+    "LocalBatchMeta",
+    "OnlineLocalBatchSource",
+    "SidecarLocalBatchSource",
     "TensorShardSpec",
     "WorkloadCost",
     "build_distributed_dataset",

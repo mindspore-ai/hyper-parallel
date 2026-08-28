@@ -12,21 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Cost-model interfaces for multimodal sample planning."""
+"""Cost-model interfaces for multimodal local-batch planning."""
 
 from __future__ import annotations
 
 import math
 from typing import Protocol
 
-from hyper_parallel.distributed_data.schema import SampleMeta, WorkloadCost
+from hyper_parallel.distributed_data.schema import LocalBatchMeta, WorkloadCost
 
 
 class CostModel(Protocol):
-    """Estimate normalized stage costs from lightweight sample metadata."""
+    """Estimate normalized stage costs from lightweight local-batch metadata."""
 
-    def estimate(self, metadata: SampleMeta) -> WorkloadCost:
-        """Estimate one sample's workload cost."""
+    def estimate(self, metadata: LocalBatchMeta) -> WorkloadCost:
+        """Estimate one local batch's workload cost."""
 
 
 class LinearMultimodalCostModel:
@@ -66,7 +66,7 @@ class LinearMultimodalCostModel:
         ):
             raise ValueError(f"Cost-model weights must be finite and non-negative, but got {self._weights}.")
 
-    def estimate(self, metadata: SampleMeta) -> WorkloadCost:
+    def estimate(self, metadata: LocalBatchMeta) -> WorkloadCost:
         """Estimate normalized I/O, encoder, LLM, memory, and communication cost."""
         if metadata.cost_hint is not None:
             return metadata.cost_hint

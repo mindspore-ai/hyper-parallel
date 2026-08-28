@@ -12,95 +12,90 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for global-step batch planning."""
+"""Unit tests for whole-step local-batch planning."""
+
+from __future__ import annotations
 
 import unittest
 
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
-from hyper_parallel.distributed_data.schema import SampleMeta, WorkloadCost
+from hyper_parallel.distributed_data.schema import LocalBatchMeta, WorkloadCost
 
 
-def _metadata(sample_id: str, encoder_cost: float) -> SampleMeta:
-    return SampleMeta(
-        sample_id=sample_id,
+def _metadata(local_batch_id: int | str, encoder_cost: float) -> LocalBatchMeta:
+    return LocalBatchMeta(
+        local_batch_id=local_batch_id,
         cost_hint=WorkloadCost(encoder=encoder_cost),
     )
 
 
 class TestDistributedBatchPlanner(unittest.TestCase):
-    """Validate deterministic whole-step planning and balancing."""
+    """Validate deterministic local-batch placement."""
 
-    def test_balances_all_microbatches_in_one_optimizer_step(self) -> None:
-        """Heavy samples should be spread across both microbatches."""
-        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=2)
-        candidates = [_metadata("0", 8.0), _metadata("1", 7.0), _metadata("2", 1.0), _metadata("3", 1.0)]
+    def test_plans_one_local_batch_for_every_execution_slot(self) -> None:
+        """Every DP-rank accumulation slot should receive exactly one local batch."""
+        planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_num=2)
+        candidates = [_metadata(index, float(4 - index)) for index in range(4)]
 
-        plan = planner.plan(candidates, step=0, sample_offset_start=0)
+        plan = planner.plan(candidates, step=0, local_batch_offset_start=0)
 
-        costs = []
+        planned_ids = set()
         for micro_batch_index in range(2):
-            samples = plan.samples_for(0, micro_batch_index)
-            costs.append(sum(sample.cost.encoder for sample in samples))
-        self.assertEqual(sorted(costs), [8.0, 9.0])
-        self.assertEqual({sample.meta.sample_id for sample in plan.samples}, {"0", "1", "2", "3"})
+            for data_rank in range(2):
+                planned_ids.add(plan.local_batch_for(data_rank, micro_batch_index).meta.local_batch_id)
+        self.assertEqual(planned_ids, {0, 1, 2, 3})
+        self.assertEqual((plan.local_batch_offset_start, plan.local_batch_offset_end), (0, 2))
+
+    def test_groups_similar_costs_in_the_same_global_microbatch(self) -> None:
+        """Whole-step sorting should reduce synchronized DP straggler gaps."""
+        planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_num=2)
+        candidates = [_metadata("heavy-0", 8.0), _metadata("heavy-1", 7.0),
+                      _metadata("light-0", 1.0), _metadata("light-1", 1.0)]
+
+        plan = planner.plan(candidates, step=0, local_batch_offset_start=0)
+
+        first_costs = [plan.local_batch_for(rank, 0).cost.encoder for rank in range(2)]
+        second_costs = [plan.local_batch_for(rank, 1).cost.encoder for rank in range(2)]
+        self.assertEqual(first_costs, [8.0, 7.0])
+        self.assertEqual(second_costs, [1.0, 1.0])
 
     def test_same_metadata_produces_same_plan_id_and_placements(self) -> None:
         """Planning must be byte-stable for checkpoint replay."""
-        planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=2)
-        candidates = [_metadata(str(index), float(index + 1)) for index in range(4)]
+        planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_num=2)
+        candidates = [_metadata(index, float(index + 1)) for index in range(4)]
 
-        first = planner.plan(candidates, step=3, sample_offset_start=6)
-        second = planner.plan(candidates, step=3, sample_offset_start=6)
+        first = planner.plan(candidates, step=3, local_batch_offset_start=6)
+        second = planner.plan(candidates, step=3, local_batch_offset_start=6)
 
         self.assertEqual(first, second)
-        self.assertFalse(hasattr(first, "version"))
         self.assertEqual(first.plan_id, second.plan_id)
-        for micro_batch_index in range(2):
-            for data_rank in range(2):
-                self.assertEqual(len(first.samples_for(data_rank, micro_batch_index)), 1)
 
     def test_rejects_incomplete_global_candidate_set(self) -> None:
-        """A planner must never silently construct a partial optimizer step."""
-        planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=1, micro_batch_num=2)
+        """The planner must not silently construct a partial optimizer step."""
+        planner = DistributedBatchPlanner(data_parallel_size=2, micro_batch_num=2)
+
         with self.assertRaisesRegex(ValueError, "requires 4 candidates"):
-            planner.plan([_metadata("0", 1.0)], step=0, sample_offset_start=0)
+            planner.plan([_metadata(0, 1.0)], step=0, local_batch_offset_start=0)
 
-    def test_rejects_duplicate_sample_ids(self) -> None:
-        """The dataset-wide sample identifier must be unique in a planning window."""
-        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=1)
-        candidates = [_metadata("0", 1.0), _metadata("0", 2.0)]
+    def test_rejects_duplicate_local_batch_ids(self) -> None:
+        """Local-batch identifiers must be unique within a planning window."""
+        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_num=2)
 
-        with self.assertRaisesRegex(ValueError, "unique sample_id"):
-            planner.plan(candidates, step=0, sample_offset_start=0)
+        with self.assertRaisesRegex(ValueError, "unique local_batch_id"):
+            planner.plan(
+                [_metadata("duplicate", 1.0), _metadata("duplicate", 2.0)],
+                step=0,
+                local_batch_offset_start=0,
+            )
 
-    def test_online_plan_balances_only_one_global_microbatch(self) -> None:
-        """Online planning should preserve the optimizer microbatch position without later metadata."""
-        planner = DistributedBatchPlanner(data_parallel_size=2, raw_sample_size=2, micro_batch_num=3)
-        candidates = [_metadata(str(index), float(index + 1)) for index in range(4)]
+    def test_mixed_integer_and_string_ids_are_deterministic(self) -> None:
+        """Planner tie-breaking should support integer and string IDs."""
+        planner = DistributedBatchPlanner(data_parallel_size=1, micro_batch_num=2)
+        candidates = [LocalBatchMeta(local_batch_id="1"), LocalBatchMeta(local_batch_id=1)]
 
-        plan = planner.plan_microbatch(
-            candidates,
-            step=5,
-            sample_offset_start=2,
-            micro_batch_index=1,
+        plan = planner.plan(candidates, step=0, local_batch_offset_start=0)
+
+        self.assertEqual(
+            plan,
+            planner.plan(candidates, step=0, local_batch_offset_start=0),
         )
-
-        self.assertEqual(plan.micro_batch_start, 1)
-        self.assertEqual(plan.micro_batch_num, 1)
-        self.assertEqual((plan.sample_offset_start, plan.sample_offset_end), (2, 4))
-        for data_rank in range(2):
-            self.assertEqual(len(plan.samples_for(data_rank, 1)), 2)
-        with self.assertRaisesRegex(ValueError, "micro_batch_index must be in"):
-            plan.samples_for(0, 0)
-
-    def test_mixed_integer_and_string_sample_ids_are_deterministic(self) -> None:
-        """Planner tie-breaking should support both map-style key types."""
-        planner = DistributedBatchPlanner(data_parallel_size=1, raw_sample_size=2, micro_batch_num=1)
-        candidates = [
-            SampleMeta(sample_id="1"),
-            SampleMeta(sample_id=1),
-        ]
-
-        plan = planner.plan(candidates, step=0, sample_offset_start=0)
-
-        self.assertEqual(plan, planner.plan(candidates, step=0, sample_offset_start=0))

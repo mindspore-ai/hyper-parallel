@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator
@@ -27,7 +25,7 @@ from typing import Any, Callable, Iterator
 class WorkloadCost:
     """Normalized cost components used by the batch planner.
 
-    The components intentionally remain separate because multimodal samples
+    The components intentionally remain separate because multimodal local batches
     can stress different stages. Values are expected to be normalized by the
     selected cost model before the planner compares them.
     """
@@ -88,15 +86,15 @@ class WorkloadCost:
 
 
 @dataclass(frozen=True)
-class SampleMeta:
-    """Lightweight sample information visible to the planner.
+class LocalBatchMeta:
+    """Lightweight local-batch information visible to the planner.
 
-    ``sample_id`` uniquely identifies the map-style dataset entry within a
-    planning window. Metadata must not contain decoded images, token tensors,
-    or other heavyweight sample data.
+    ``local_batch_id`` identifies one complete input consumed by one data rank
+    for one forward/backward pass. Metadata must not contain the heavyweight
+    local-batch payload.
     """
 
-    sample_id: int | str
+    local_batch_id: int | str
     text_tokens: int = 0
     vision_tokens: int = 0
     audio_tokens: int = 0
@@ -104,24 +102,27 @@ class SampleMeta:
     cost_hint: WorkloadCost | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.sample_id, (int, str)) or isinstance(self.sample_id, bool):
+        if not isinstance(self.local_batch_id, (int, str)) or isinstance(self.local_batch_id, bool):
             raise ValueError(
-                "SampleMeta.sample_id must be an integer index or string key, "
-                f"but got {type(self.sample_id)}."
+                "LocalBatchMeta.local_batch_id must be an integer index or string key, "
+                f"but got {type(self.local_batch_id)}."
             )
-        if isinstance(self.sample_id, int) and self.sample_id < 0:
-            raise ValueError(f"SampleMeta.sample_id integer index must be non-negative, but got {self.sample_id}.")
-        if isinstance(self.sample_id, str) and not self.sample_id:
-            raise ValueError("SampleMeta.sample_id string key must not be empty.")
+        if isinstance(self.local_batch_id, int) and self.local_batch_id < 0:
+            raise ValueError(
+                "LocalBatchMeta.local_batch_id integer index must be non-negative, "
+                f"but got {self.local_batch_id}."
+            )
+        if isinstance(self.local_batch_id, str) and not self.local_batch_id:
+            raise ValueError("LocalBatchMeta.local_batch_id string key must not be empty.")
         for name in ("text_tokens", "vision_tokens", "audio_tokens", "io_bytes"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"SampleMeta.{name} must be a non-negative integer, but got {value!r}.")
+                raise ValueError(f"LocalBatchMeta.{name} must be a non-negative integer, but got {value!r}.")
 
 
 @dataclass(frozen=True)
-class TensorSampleSpec:
-    """Internal tensor layout metadata synchronized with online planning metadata."""
+class TensorLocalBatchSpec:
+    """Tensor layout metadata synchronized with online local-batch metadata."""
 
     shape: tuple[int, ...]
     dtype: str
@@ -132,9 +133,11 @@ class TensorSampleSpec:
             not isinstance(size, int) or isinstance(size, bool) or size < 0
             for size in self.shape
         ):
-            raise ValueError(f"TensorSampleSpec.shape must contain non-negative integers, but got {self.shape!r}.")
+            raise ValueError(
+                f"TensorLocalBatchSpec.shape must contain non-negative integers, but got {self.shape!r}."
+            )
         if not isinstance(self.dtype, str) or not self.dtype:
-            raise ValueError(f"TensorSampleSpec.dtype must be a non-empty string, but got {self.dtype!r}.")
+            raise ValueError(f"TensorLocalBatchSpec.dtype must be a non-empty string, but got {self.dtype!r}.")
         expected_numel = math.prod(self.shape)
         if (
             not isinstance(self.numel, int)
@@ -142,23 +145,26 @@ class TensorSampleSpec:
             or self.numel != expected_numel
         ):
             raise ValueError(
-                f"TensorSampleSpec.numel must equal shape product {expected_numel}, but got {self.numel!r}."
+                f"TensorLocalBatchSpec.numel must equal shape product {expected_numel}, but got {self.numel!r}."
             )
 
 
 @dataclass(frozen=True)
-class OnlineSampleMetadata:
-    """Internal online planning metadata with an optional tensor transport descriptor."""
+class OnlineLocalBatchMetadata:
+    """Online local-batch metadata with an optional tensor transport descriptor."""
 
-    sample_meta: SampleMeta
-    tensor_spec: TensorSampleSpec | None = None
+    local_batch_meta: LocalBatchMeta
+    tensor_spec: TensorLocalBatchSpec | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.sample_meta, SampleMeta):
-            raise ValueError(f"OnlineSampleMetadata.sample_meta must be SampleMeta, but got {type(self.sample_meta)}.")
-        if self.tensor_spec is not None and not isinstance(self.tensor_spec, TensorSampleSpec):
+        if not isinstance(self.local_batch_meta, LocalBatchMeta):
             raise ValueError(
-                "OnlineSampleMetadata.tensor_spec must be TensorSampleSpec or None, "
+                "OnlineLocalBatchMetadata.local_batch_meta must be LocalBatchMeta, "
+                f"but got {type(self.local_batch_meta)}."
+            )
+        if self.tensor_spec is not None and not isinstance(self.tensor_spec, TensorLocalBatchSpec):
+            raise ValueError(
+                "OnlineLocalBatchMetadata.tensor_spec must be TensorLocalBatchSpec or None, "
                 f"but got {type(self.tensor_spec)}."
             )
 
@@ -185,45 +191,43 @@ class TensorShardSpec:
 
 
 @dataclass(frozen=True)
-class PlannedSample:
-    """Placement of one sample within an optimizer-step plan."""
+class PlannedLocalBatch:
+    """Placement of one local batch within an optimizer-step plan."""
 
-    meta: SampleMeta
+    meta: LocalBatchMeta
     source_position: int
     target_data_rank: int
     micro_batch_index: int
-    position_in_micro_batch: int
     cost: WorkloadCost
 
 
 @dataclass(frozen=True)
 class BatchPlan:
-    """Deterministic raw-sample plan for an optimizer-step microbatch window."""
+    """Deterministic local-batch placement for one optimizer step."""
 
     plan_id: str
     step: int
-    sample_offset_start: int
-    sample_offset_end: int
+    local_batch_offset_start: int
+    local_batch_offset_end: int
     data_parallel_size: int
-    raw_sample_size: int
     micro_batch_num: int
-    samples: tuple[PlannedSample, ...]
+    local_batches: tuple[PlannedLocalBatch, ...]
     cp_shards: tuple[TensorShardSpec, ...] = ()
     micro_batch_start: int = 0
 
     def __post_init__(self) -> None:
         if not self.plan_id:
             raise ValueError("BatchPlan.plan_id must not be empty.")
-        for name in ("step", "sample_offset_start", "sample_offset_end"):
+        for name in ("step", "local_batch_offset_start", "local_batch_offset_end"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"BatchPlan.{name} must be a non-negative integer, but got {value!r}.")
-        if self.sample_offset_end < self.sample_offset_start:
+        if self.local_batch_offset_end < self.local_batch_offset_start:
             raise ValueError(
-                f"BatchPlan.sample_offset_end={self.sample_offset_end} must not precede "
-                f"sample_offset_start={self.sample_offset_start}."
+                f"BatchPlan.local_batch_offset_end={self.local_batch_offset_end} must not precede "
+                f"local_batch_offset_start={self.local_batch_offset_start}."
             )
-        for name in ("data_parallel_size", "raw_sample_size", "micro_batch_num"):
+        for name in ("data_parallel_size", "micro_batch_num"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"BatchPlan.{name} must be a positive integer, but got {value!r}.")
@@ -235,28 +239,33 @@ class BatchPlan:
             raise ValueError(
                 f"BatchPlan.micro_batch_start must be a non-negative integer, but got {self.micro_batch_start!r}."
             )
-        expected = self.data_parallel_size * self.raw_sample_size * self.micro_batch_num
-        if len(self.samples) != expected:
-            raise ValueError(f"BatchPlan expected {expected} planned samples, but got {len(self.samples)}.")
-        slot_positions: dict[tuple[int, int], set[int]] = {}
-        micro_batch_end = self.micro_batch_start + self.micro_batch_num
-        for sample in self.samples:
-            if sample.target_data_rank < 0 or sample.target_data_rank >= self.data_parallel_size:
-                raise ValueError(f"Planned sample has invalid target_data_rank={sample.target_data_rank}.")
-            if sample.micro_batch_index < self.micro_batch_start or sample.micro_batch_index >= micro_batch_end:
-                raise ValueError(f"Planned sample has invalid micro_batch_index={sample.micro_batch_index}.")
-            slot = (sample.target_data_rank, sample.micro_batch_index)
-            slot_positions.setdefault(slot, set()).add(sample.position_in_micro_batch)
-        expected_positions = set(range(self.raw_sample_size))
-        if any(positions != expected_positions for positions in slot_positions.values()) or len(slot_positions) != (
-            self.data_parallel_size * self.micro_batch_num
-        ):
+        expected = self.data_parallel_size * self.micro_batch_num
+        if len(self.local_batches) != expected:
             raise ValueError(
-                "Every BatchPlan (data_rank, microbatch) slot must contain each microbatch position exactly once."
+                f"BatchPlan expected {expected} planned local batches, but got {len(self.local_batches)}."
+            )
+        slots = set()
+        micro_batch_end = self.micro_batch_start + self.micro_batch_num
+        for local_batch in self.local_batches:
+            if local_batch.target_data_rank < 0 or local_batch.target_data_rank >= self.data_parallel_size:
+                raise ValueError(
+                    f"Planned local batch has invalid target_data_rank={local_batch.target_data_rank}."
+                )
+            if (
+                local_batch.micro_batch_index < self.micro_batch_start
+                or local_batch.micro_batch_index >= micro_batch_end
+            ):
+                raise ValueError(
+                    f"Planned local batch has invalid micro_batch_index={local_batch.micro_batch_index}."
+                )
+            slots.add((local_batch.target_data_rank, local_batch.micro_batch_index))
+        if len(slots) != expected:
+            raise ValueError(
+                "Every BatchPlan (data_rank, microbatch) slot must contain exactly one local batch."
             )
 
-    def samples_for(self, data_rank: int, micro_batch_index: int) -> tuple[PlannedSample, ...]:
-        """Return samples assigned to one data rank and microbatch."""
+    def local_batch_for(self, data_rank: int, micro_batch_index: int) -> PlannedLocalBatch:
+        """Return the local batch assigned to one data-rank execution slot."""
         if data_rank < 0 or data_rank >= self.data_parallel_size:
             raise ValueError(f"data_rank must be in [0, {self.data_parallel_size}), but got {data_rank}.")
         micro_batch_end = self.micro_batch_start + self.micro_batch_num
@@ -265,71 +274,75 @@ class BatchPlan:
                 f"micro_batch_index must be in [{self.micro_batch_start}, {micro_batch_end}), "
                 f"but got {micro_batch_index}."
             )
-        selected = (
-            sample
-            for sample in self.samples
-            if sample.target_data_rank == data_rank and sample.micro_batch_index == micro_batch_index
-        )
-        return tuple(sorted(selected, key=lambda sample: sample.position_in_micro_batch))
+        selected = [
+            local_batch
+            for local_batch in self.local_batches
+            if local_batch.target_data_rank == data_rank and local_batch.micro_batch_index == micro_batch_index
+        ]
+        if len(selected) != 1:
+            raise ValueError(
+                f"BatchPlan slot ({data_rank}, {micro_batch_index}) expected one local batch, got {len(selected)}."
+            )
+        return selected[0]
 
 
 @dataclass(frozen=True)
-class RankMicroBatch:
-    """Fetched microbatch and its associated plan ID for one rank."""
+class LocalBatch:
+    """One rank-local forward/backward input and its plan identity."""
 
     plan_id: str
     global_rank: int
     data_rank: int
     cp_rank: int
     micro_batch_index: int
-    sample_ids: tuple[int | str, ...]
+    local_batch_id: int | str
     data: Any
 
 
-class DistributedDataStep(Iterator[RankMicroBatch]):
-    """One optimizer step that fetches local microbatches lazily."""
+class DistributedDataStep(Iterator[LocalBatch]):
+    """One optimizer step that fetches local batches lazily."""
 
     def __init__(
         self,
         *,
         step: int,
-        sample_offset_start: int,
-        sample_offset_end: int,
+        local_batch_offset_start: int,
+        local_batch_offset_end: int,
         micro_batch_num: int,
-        load_micro_batch: Callable[[int], tuple[BatchPlan, RankMicroBatch]],
+        load_local_batch: Callable[[int], tuple[BatchPlan, LocalBatch]],
         on_complete: Callable[["DistributedDataStep", str], None],
     ) -> None:
         """Initialize a single-use optimizer-step iterator.
 
         Args:
             step: Logical optimizer-step index.
-            sample_offset_start: Inclusive per-owner sample offset for this step.
-            sample_offset_end: Exclusive per-owner sample offset for this step.
-            micro_batch_num: Number of local microbatches in the step.
-            load_micro_batch: Runtime callback that produces one planned microbatch.
+            local_batch_offset_start: Inclusive per-owner local-batch offset.
+            local_batch_offset_end: Exclusive per-owner local-batch offset.
+            micro_batch_num: Number of local batches consumed by each data rank.
+            load_local_batch: Runtime callback that produces one planned local batch.
             on_complete: Callback invoked after the final microbatch is produced.
         """
         for name, value in (
             ("step", step),
-            ("sample_offset_start", sample_offset_start),
-            ("sample_offset_end", sample_offset_end),
+            ("local_batch_offset_start", local_batch_offset_start),
+            ("local_batch_offset_end", local_batch_offset_end),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
-        if sample_offset_end < sample_offset_start:
+        if local_batch_offset_end < local_batch_offset_start:
             raise ValueError(
-                f"sample_offset_end={sample_offset_end} must not precede "
-                f"sample_offset_start={sample_offset_start}."
+                f"local_batch_offset_end={local_batch_offset_end} must not precede "
+                f"local_batch_offset_start={local_batch_offset_start}."
             )
         if not isinstance(micro_batch_num, int) or isinstance(micro_batch_num, bool) or micro_batch_num < 1:
             raise ValueError(f"micro_batch_num must be a positive integer, but got {micro_batch_num!r}.")
-        if not callable(load_micro_batch) or not callable(on_complete):
-            raise ValueError("load_micro_batch and on_complete must be callable.")
+        if not callable(load_local_batch) or not callable(on_complete):
+            raise ValueError("load_local_batch and on_complete must be callable.")
         self.step = step
-        self.sample_offset_start = sample_offset_start
-        self.sample_offset_end = sample_offset_end
+        self.local_batch_offset_start = local_batch_offset_start
+        self.local_batch_offset_end = local_batch_offset_end
         self.micro_batch_num = micro_batch_num
-        self._load_micro_batch: Callable[[int], tuple[BatchPlan, RankMicroBatch]] | None = load_micro_batch
+        self._load_local_batch: Callable[[int], tuple[BatchPlan, LocalBatch]] | None = load_local_batch
         self._on_complete: Callable[["DistributedDataStep", str], None] | None = on_complete
         self._micro_batch_index = 0
         self._micro_batch_plan_ids: list[str] = []
@@ -339,29 +352,29 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
         """Return this single-use microbatch iterator."""
         return self
 
-    def __next__(self) -> RankMicroBatch:
-        """Fetch and return the next local microbatch."""
+    def __next__(self) -> LocalBatch:
+        """Fetch and return the next local batch."""
         if self._micro_batch_index >= self.micro_batch_num:
             raise StopIteration
-        if self._load_micro_batch is None:
+        if self._load_local_batch is None:
             raise ValueError("DistributedDataStep is no longer attached to its dataset runtime.")
-        plan, micro_batch = self._load_micro_batch(self._micro_batch_index)
-        if micro_batch.micro_batch_index != self._micro_batch_index:
+        plan, local_batch = self._load_local_batch(self._micro_batch_index)
+        if local_batch.micro_batch_index != self._micro_batch_index:
             raise ValueError(
                 f"Expected microbatch {self._micro_batch_index}, "
-                f"but runtime returned {micro_batch.micro_batch_index}."
+                f"but runtime returned {local_batch.micro_batch_index}."
             )
         self._micro_batch_plan_ids.append(plan.plan_id)
         self._micro_batch_index += 1
         if self._micro_batch_index == self.micro_batch_num:
             self._plan_id = self._build_plan_id()
             on_complete = self._on_complete
-            self._load_micro_batch = None
+            self._load_local_batch = None
             self._on_complete = None
             if on_complete is None:
                 raise ValueError("DistributedDataStep completion callback is unavailable.")
             on_complete(self, self._plan_id)
-        return micro_batch
+        return local_batch
 
     @property
     def plan_id(self) -> str:
@@ -375,16 +388,12 @@ class DistributedDataStep(Iterator[RankMicroBatch]):
         """Return whether every local microbatch has been produced."""
         return self._micro_batch_index == self.micro_batch_num
 
-    def micro_batches(self) -> Iterator[RankMicroBatch]:
-        """Return the single-use lazy microbatch iterator."""
+    def local_batches(self) -> Iterator[LocalBatch]:
+        """Return the single-use lazy local-batch iterator."""
         return self
 
     def _build_plan_id(self) -> str:
-        stable_step = {
-            "step": self.step,
-            "sample_offset_start": self.sample_offset_start,
-            "sample_offset_end": self.sample_offset_end,
-            "micro_batch_plan_ids": self._micro_batch_plan_ids,
-        }
-        encoded = json.dumps(stable_step, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()[:24]
+        plan_ids = set(self._micro_batch_plan_ids)
+        if len(plan_ids) != 1:
+            raise ValueError(f"One optimizer step must use one whole-step plan, but got {sorted(plan_ids)}.")
+        return self._micro_batch_plan_ids[0]

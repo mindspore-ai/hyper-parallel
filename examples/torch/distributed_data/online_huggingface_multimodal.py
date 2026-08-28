@@ -40,7 +40,12 @@ except ImportError:
     torch_npu = None
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMeta, build_distributed_dataset
+from hyper_parallel.distributed_data import (
+    DistributedDatasetConfig,
+    LocalBatchMeta,
+    SidecarLocalBatchSource,
+    build_distributed_dataset,
+)
 
 
 class HuggingFaceManifestDataset:
@@ -76,8 +81,8 @@ class HuggingFaceManifestDataset:
             if missing:
                 raise ValueError(f"Manifest row {index} is missing fields {missing}.")
             sidecar_metadata.append(
-                SampleMeta(
-                    sample_id=index,
+                LocalBatchMeta(
+                    local_batch_id=index,
                     text_tokens=max(1, len(row["text"].split())),
                     vision_tokens=math.ceil(row["width"] / 14) * math.ceil(row["height"] / 14),
                     io_bytes=row["jpeg_bytes"],
@@ -90,12 +95,12 @@ class HuggingFaceManifestDataset:
         return len(self._rows)
 
     @property
-    def sidecar_metadata(self) -> tuple[SampleMeta, ...]:
-        """Return precomputed sample costs without reading JPEG contents."""
+    def sidecar_metadata(self) -> tuple[LocalBatchMeta, ...]:
+        """Return precomputed local-batch costs without reading JPEG contents."""
         return self._sidecar_metadata
 
     def __getitem__(self, data_index: int) -> dict[str, Any]:
-        """Read one caption and its original JPEG bytes in a DataLoader worker."""
+        """Read one caption and its original JPEG bytes."""
         row = self._rows[data_index]
         image_path = Path(row["image"])
         if not image_path.is_absolute():
@@ -111,11 +116,9 @@ class HuggingFaceManifestDataset:
             "worker_pid": os.getpid(),
         }
 
-
-def decode_and_collate(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
-    """Decode sidecar-planned JPEGs and return a validated training batch."""
-    records = []
-    for sample in samples:
+    def fetch_local_batch(self, local_batch_id: int | str) -> tuple[dict[str, Any], ...]:
+        """Run the existing single-card read and decode pipeline for one local batch."""
+        sample = self[int(local_batch_id)]
         digest = hashlib.sha256(sample["image_bytes"]).hexdigest()
         if digest != sample["sha256"]:
             raise ValueError(f"JPEG checksum mismatch for {sample['record_id']}.")
@@ -123,16 +126,15 @@ def decode_and_collate(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], .
             image.load()
             if image.size != (sample["width"], sample["height"]):
                 raise ValueError(f"JPEG dimensions mismatch for {sample['record_id']}.")
-        records.append(
+        return (
             {
                 "record_id": sample["record_id"],
                 "data_index": sample["data_index"],
                 "caption": sample["caption"],
                 "worker_pid": sample["worker_pid"],
                 "sha256": digest,
-            }
+            },
         )
-    return tuple(records)
 
 
 def _all_gather_object(value: Any, world_size: int) -> list[Any]:
@@ -149,8 +151,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("hccl", "gloo"), default="hccl")
     parser.add_argument("--micro-batch-num", type=int, default=4)
     parser.add_argument("--model-parallel-size", type=int, default=4)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--double-buffer", action="store_true")
     return parser.parse_args()
 
@@ -176,10 +176,9 @@ def _validate_global_result(
     local_plan_ids: list[str],
     step_plan_id: str,
     sample_count: int,
-    num_workers: int,
     mesh_shape: tuple[int, int],
 ) -> int:
-    """Validate sidecar planning, sample reassignment, and MP replication."""
+    """Validate sidecar planning, local-batch reassignment, and MP replication."""
     data_parallel_size, model_parallel_size = mesh_shape
     world_size = data_parallel_size * model_parallel_size
     gathered_plan_ids = _all_gather_object(local_plan_ids, world_size)
@@ -203,24 +202,17 @@ def _validate_global_result(
     if len(received_indices) != len(set(received_indices)) or set(received_indices) != set(range(sample_count)):
         raise ValueError("Distributed step did not preserve every manifest sample exactly once.")
 
-    main_pids = set(_all_gather_object(os.getpid(), world_size))
-    worker_pids = {record["worker_pid"] for record in flat_records}
-    if num_workers > 0 and worker_pids & main_pids:
-        raise ValueError("Expected sidecar-planned reads to run in DataLoader worker processes.")
-    if num_workers == 0 and not worker_pids <= main_pids:
-        raise ValueError("num_workers=0 unexpectedly returned samples from worker processes.")
-
-    reassigned_samples = sum(
+    reassigned_local_batches = sum(
         record["data_index"] % data_parallel_size != target_data_rank
         for target_data_rank, rank_records in enumerate(representative_records)
         for record in rank_records
     )
-    if data_parallel_size > 1 and reassigned_samples == 0:
-        raise ValueError("The sidecar plan did not reassign any samples across data ranks.")
+    if data_parallel_size > 1 and reassigned_local_batches == 0:
+        raise ValueError("The sidecar plan did not reassign any local batches across data ranks.")
     expected_local_samples = sample_count // data_parallel_size
     if any(len(records) != expected_local_samples for records in gathered_records):
         raise ValueError(f"Each rank must receive {expected_local_samples} samples, got {gathered_records}.")
-    return reassigned_samples
+    return reassigned_local_batches
 
 
 def main() -> None:
@@ -239,11 +231,10 @@ def main() -> None:
         prefetch_steps=1,
         dp_dim_names=("dp",),
         double_buffer=args.double_buffer,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
     )
-    sample_count = data_parallel_size * config.raw_sample_size * config.micro_batch_num
+    sample_count = data_parallel_size * config.micro_batch_num
     dataset = HuggingFaceManifestDataset(args.manifest, sample_count)
+    source = SidecarLocalBatchSource(dataset.sidecar_metadata, dataset.fetch_local_batch)
     mesh_ranks = [
         list(range(data_rank * args.model_parallel_size, (data_rank + 1) * args.model_parallel_size))
         for data_rank in range(data_parallel_size)
@@ -255,11 +246,9 @@ def main() -> None:
         _init_backend=False,
     )
     loader = build_distributed_dataset(
-        dataset,
+        source,
         mesh,
         config,
-        metadata=dataset.sidecar_metadata,
-        collate_fn=decode_and_collate,
         communication_device=communication_device,
     )
 
@@ -267,22 +256,21 @@ def main() -> None:
     local_plan_ids = []
     try:
         step = next(loader)
-        for micro_batch in step:
-            data_indices = tuple(record["data_index"] for record in micro_batch.data)
-            if data_indices != micro_batch.sample_ids:
+        for local_batch in step:
+            data_indices = tuple(record["data_index"] for record in local_batch.data)
+            if data_indices != (local_batch.local_batch_id,):
                 raise ValueError(f"Rank {rank} received data in an order different from its plan.")
-            local_records.extend(micro_batch.data)
-            local_plan_ids.append(micro_batch.plan_id)
-        reassigned_samples = _validate_global_result(
+            local_records.extend(local_batch.data)
+            local_plan_ids.append(local_batch.plan_id)
+        reassigned_local_batches = _validate_global_result(
             local_records,
             local_plan_ids,
             step.plan_id,
             sample_count,
-            args.num_workers,
             mesh_shape,
         )
         loader.commit(step.plan_id)
-        expected_offset = config.raw_sample_size * config.micro_batch_num
+        expected_offset = config.micro_batch_num
         if loader.consumed_offset != expected_offset:
             raise ValueError(f"Expected consumed_offset={expected_offset}, got {loader.consumed_offset}.")
     finally:
@@ -301,13 +289,12 @@ def main() -> None:
                     "data_owner_ranks": list(range(0, world_size, args.model_parallel_size)),
                     "model_parallel_groups": mesh_ranks,
                     "samples": sample_count,
-                    "dataset_units_per_micro_batch": config.raw_sample_size,
+                    "local_batches_per_data_rank": config.micro_batch_num,
                     "micro_batch_num": args.micro_batch_num,
-                    "num_workers": args.num_workers,
                     "double_buffer": args.double_buffer,
                     "metadata_mode": "sidecar",
                     "sample_loading": "shared_storage_index_fetch",
-                    "reassigned_samples": reassigned_samples,
+                    "reassigned_local_batches": reassigned_local_batches,
                     "consumed_offset": loader.consumed_offset,
                 },
                 sort_keys=True,

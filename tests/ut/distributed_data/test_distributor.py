@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for plan-driven sample and microbatch distribution helpers."""
+"""Unit tests for plan-driven local-batch distribution helpers."""
 
 from __future__ import annotations
 
@@ -25,17 +25,17 @@ import numpy as np
 
 from hyper_parallel.distributed_data.distributor import (
     TorchMetadataAllGather,
-    TorchPackedBytesRedistributor,
-    TorchMicroBatchDistributor,
-    TorchTensorRedistributor,
+    TorchModelParallelLocalBatchDistributor,
+    TorchPackedBytesLocalBatchRedistributor,
+    TorchTensorLocalBatchRedistributor,
     _pack_payload_segment,
-    shard_micro_batch,
+    shard_local_batch,
 )
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
 from hyper_parallel.distributed_data.schema import (
-    OnlineSampleMetadata,
-    SampleMeta,
-    TensorSampleSpec,
+    LocalBatchMeta,
+    OnlineLocalBatchMetadata,
+    TensorLocalBatchSpec,
     TensorShardSpec,
     WorkloadCost,
 )
@@ -89,7 +89,7 @@ class _FakeWork:
 
 
 class _FakePlatform:
-    """Minimal platform operations used by ``shard_micro_batch``."""
+    """Minimal platform operations used by ``shard_local_batch``."""
 
     platform_type = PlatformType.PYTORCH
     tensor_dtype = SimpleNamespace(int64=np.int64, uint8=np.uint8)
@@ -205,7 +205,7 @@ class TestMicroBatchSharding(unittest.TestCase):
         specs = (TensorShardSpec(("input_ids",), 0),)
 
         with patch("hyper_parallel.distributed_data.distributor.platform", _FakePlatform()):
-            result = shard_micro_batch(micro_batch, specs, cp_rank=1, cp_size=2)
+            result = shard_local_batch(micro_batch, specs, cp_rank=1, cp_size=2)
 
         self.assertEqual(result["input_ids"].values, (4, 5, 6, 7))
         self.assertEqual(result["labels"], "replicated")
@@ -217,12 +217,12 @@ class TestMicroBatchSharding(unittest.TestCase):
 
         with patch("hyper_parallel.distributed_data.distributor.platform", _FakePlatform()):
             with self.assertRaisesRegex(ValueError, "not divisible"):
-                shard_micro_batch(micro_batch, specs, cp_rank=0, cp_size=2)
+                shard_local_batch(micro_batch, specs, cp_rank=0, cp_size=2)
 
     def test_metadata_all_gather_uses_data_owner_order(self) -> None:
         """Process-group order must not change deterministic candidate order."""
-        owner_three = SampleMeta(sample_id="three")
-        owner_nine = SampleMeta(sample_id="nine")
+        owner_three = LocalBatchMeta(local_batch_id="three")
+        owner_nine = LocalBatchMeta(local_batch_id="nine")
         fake_platform = _FakePlatform(
             group_ranks=(9, 3),
             gathered_objects=((owner_nine,), (owner_three,)),
@@ -232,17 +232,17 @@ class TestMicroBatchSharding(unittest.TestCase):
             synchronizer = TorchMetadataAllGather(group="metadata")
             result = synchronizer.gather((owner_nine,), data_owner_ranks=(3, 9))
 
-        self.assertEqual([metadata.sample_id for metadata in result], ["three", "nine"])
+        self.assertEqual([metadata.local_batch_id for metadata in result], ["three", "nine"])
 
     def test_metadata_all_gather_carries_online_tensor_specs(self) -> None:
         """Tensor transport descriptors should reuse the existing metadata collective."""
-        owner_three = OnlineSampleMetadata(
-            SampleMeta(sample_id="three"),
-            TensorSampleSpec((3,), "float32", 3),
+        owner_three = OnlineLocalBatchMetadata(
+            LocalBatchMeta(local_batch_id="three"),
+            TensorLocalBatchSpec((3,), "float32", 3),
         )
-        owner_nine = OnlineSampleMetadata(
-            SampleMeta(sample_id="nine"),
-            TensorSampleSpec((2,), "float32", 2),
+        owner_nine = OnlineLocalBatchMetadata(
+            LocalBatchMeta(local_batch_id="nine"),
+            TensorLocalBatchSpec((2,), "float32", 2),
         )
         fake_platform = _FakePlatform(
             group_ranks=(9, 3),
@@ -253,28 +253,30 @@ class TestMicroBatchSharding(unittest.TestCase):
             synchronizer = TorchMetadataAllGather(group="metadata")
             result = synchronizer.gather((owner_nine,), data_owner_ranks=(3, 9))
 
-        self.assertEqual([metadata.sample_meta.sample_id for metadata in result], ["three", "nine"])
+        self.assertEqual(
+            [metadata.local_batch_meta.local_batch_id for metadata in result],
+            ["three", "nine"],
+        )
         self.assertEqual([metadata.tensor_spec.shape for metadata in result], [(3,), (2,)])
         self.assertEqual(fake_platform.all_gather_count, 1)
 
     @staticmethod
     def _cross_owner_plan() -> tuple[Any, DataTopology]:
-        """Build a two-owner plan in which both samples change owner."""
+        """Build a two-owner plan in which both local batches change owner."""
         metadata = [
-            SampleMeta(
-                sample_id="local",
+            LocalBatchMeta(
+                local_batch_id="local",
                 cost_hint=WorkloadCost(encoder=1.0),
             ),
-            SampleMeta(
-                sample_id="peer",
+            LocalBatchMeta(
+                local_batch_id="peer",
                 cost_hint=WorkloadCost(encoder=2.0),
             ),
         ]
-        plan = DistributedBatchPlanner(2, 1, 2).plan_microbatch(
+        plan = DistributedBatchPlanner(2, 1).plan(
             metadata,
             step=0,
-            sample_offset_start=1,
-            micro_batch_index=1,
+            local_batch_offset_start=0,
         )
         topology = DataTopology.from_layout(
             mesh_shape=(2,),
@@ -287,12 +289,15 @@ class TestMicroBatchSharding(unittest.TestCase):
     @staticmethod
     def _online_tensor_metadata(
         plan: Any,
-        tensor_specs: tuple[TensorSampleSpec, ...],
-    ) -> tuple[OnlineSampleMetadata, ...]:
+        tensor_specs: tuple[TensorLocalBatchSpec, ...],
+    ) -> tuple[OnlineLocalBatchMetadata, ...]:
         """Build transport metadata in global source-position order."""
-        planned_by_position = {sample.source_position: sample for sample in plan.samples}
+        planned_by_position = {
+            local_batch.source_position: local_batch
+            for local_batch in plan.local_batches
+        }
         return tuple(
-            OnlineSampleMetadata(planned_by_position[position].meta, tensor_spec)
+            OnlineLocalBatchMetadata(planned_by_position[position].meta, tensor_spec)
             for position, tensor_spec in enumerate(tensor_specs)
         )
 
@@ -308,7 +313,7 @@ class TestMicroBatchSharding(unittest.TestCase):
         )
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
-            redistributor = TorchPackedBytesRedistributor(group="metadata")
+            redistributor = TorchPackedBytesLocalBatchRedistributor(group="metadata")
             result = redistributor.redistribute(
                 ({"image": b"local-jpeg", "text": "local"},),
                 plan,
@@ -328,13 +333,13 @@ class TestMicroBatchSharding(unittest.TestCase):
         global_metadata = self._online_tensor_metadata(
             plan,
             (
-                TensorSampleSpec((2,), "float32", 2),
-                TensorSampleSpec((2,), "float32", 2),
+                TensorLocalBatchSpec((2,), "float32", 2),
+                TensorLocalBatchSpec((2,), "float32", 2),
             ),
         )
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
-            redistributor = TorchTensorRedistributor(group="metadata")
+            redistributor = TorchTensorLocalBatchRedistributor(group="metadata")
             result = redistributor.redistribute(
                 (_FakeTensor([1.0, 2.0]),),
                 plan,
@@ -357,13 +362,13 @@ class TestMicroBatchSharding(unittest.TestCase):
         global_metadata = self._online_tensor_metadata(
             plan,
             (
-                TensorSampleSpec((2,), "float32", 2),
-                TensorSampleSpec((3,), "float32", 3),
+                TensorLocalBatchSpec((2,), "float32", 2),
+                TensorLocalBatchSpec((3,), "float32", 3),
             ),
         )
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
-            redistributor = TorchTensorRedistributor(group="metadata")
+            redistributor = TorchTensorLocalBatchRedistributor(group="metadata")
             result = redistributor.redistribute(
                 (_FakeTensor([1.0, 2.0]),),
                 plan,
@@ -384,13 +389,13 @@ class TestMicroBatchSharding(unittest.TestCase):
         global_metadata = self._online_tensor_metadata(
             plan,
             (
-                TensorSampleSpec((2,), "float32", 2),
-                TensorSampleSpec((3,), "float16", 3),
+                TensorLocalBatchSpec((2,), "float32", 2),
+                TensorLocalBatchSpec((3,), "float16", 3),
             ),
         )
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
-            redistributor = TorchTensorRedistributor(group="metadata")
+            redistributor = TorchTensorLocalBatchRedistributor(group="metadata")
             with self.assertRaisesRegex(ValueError, "one dtype"):
                 redistributor.redistribute(
                     (_FakeTensor([1.0, 2.0]),),
@@ -405,17 +410,20 @@ class TestMicroBatchSharding(unittest.TestCase):
         """A non-tensor sample marker should fail consistently after metadata synchronization."""
         plan, topology = self._cross_owner_plan()
         fake_platform = _FakePlatform(group_ranks=(1, 0))
-        planned_by_position = {sample.source_position: sample for sample in plan.samples}
+        planned_by_position = {
+            local_batch.source_position: local_batch
+            for local_batch in plan.local_batches
+        }
         global_metadata = (
-            OnlineSampleMetadata(planned_by_position[0].meta),
-            OnlineSampleMetadata(
+            OnlineLocalBatchMetadata(planned_by_position[0].meta),
+            OnlineLocalBatchMetadata(
                 planned_by_position[1].meta,
-                TensorSampleSpec((3,), "float32", 3),
+                TensorLocalBatchSpec((3,), "float32", 3),
             ),
         )
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
-            redistributor = TorchTensorRedistributor(group="metadata")
+            redistributor = TorchTensorLocalBatchRedistributor(group="metadata")
             with self.assertRaisesRegex(ValueError, "missing tensor metadata"):
                 redistributor.redistribute(
                     (_FakeTensor([1.0, 2.0]),),
@@ -428,8 +436,12 @@ class TestMicroBatchSharding(unittest.TestCase):
 
     def test_owner_broadcasts_tensor_micro_batch_without_object_serializing_storage(self) -> None:
         """Microbatch structure uses object gather while tensor storage uses broadcast."""
-        metadata = [SampleMeta(sample_id="0")]
-        plan = DistributedBatchPlanner(1, 1, 1).plan(metadata, step=0, sample_offset_start=0)
+        metadata = [LocalBatchMeta(local_batch_id="0")]
+        plan = DistributedBatchPlanner(1, 1).plan(
+            metadata,
+            step=0,
+            local_batch_offset_start=0,
+        )
         topology = DataTopology.from_layout(
             mesh_shape=(2,),
             mesh_dim_names=("tp",),
@@ -440,7 +452,7 @@ class TestMicroBatchSharding(unittest.TestCase):
         micro_batch = {"input_ids": _FakeTensor((1, 2))}
 
         with patch("hyper_parallel.distributed_data.distributor.platform", fake_platform):
-            distributor = TorchMicroBatchDistributor(group="consumer")
+            distributor = TorchModelParallelLocalBatchDistributor(group="consumer")
             received_plan, result = distributor.distribute(micro_batch, plan, topology)
 
         self.assertEqual(received_plan.plan_id, plan.plan_id)

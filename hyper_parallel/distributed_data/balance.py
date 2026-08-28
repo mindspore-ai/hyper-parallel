@@ -19,14 +19,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from hyper_parallel.distributed_data.schema import SampleMeta, WorkloadCost
+from hyper_parallel.distributed_data.schema import LocalBatchMeta, WorkloadCost
 
 
 @dataclass(frozen=True)
 class BalanceItem:
     """One metadata item and its planner cost."""
 
-    metadata: SampleMeta
+    metadata: LocalBatchMeta
     source_position: int
     cost: WorkloadCost
 
@@ -58,15 +58,15 @@ class GreedyBatchBalancer:
         slot_count: int,
         slot_capacity: int,
     ) -> tuple[tuple[BalanceItem, ...], ...]:
-        """Place expensive samples into the cheapest non-full slot.
+        """Place expensive local batches into the cheapest non-full slot.
 
         Args:
-            items: Candidate samples and their normalized costs.
+            items: Candidate local batches and their normalized costs.
             slot_count: Number of ``(microbatch, data_rank)`` slots.
-            slot_capacity: Samples in every slot.
+            slot_capacity: Local batches in every slot.
 
         Returns:
-            Balanced slots, with samples in stable source order per slot.
+            Balanced slots, with local batches in stable source order per slot.
         """
         if slot_count < 1 or slot_capacity < 1:
             raise ValueError(
@@ -81,8 +81,8 @@ class GreedyBatchBalancer:
             key=lambda item: (
                 -item.cost.dominant,
                 -item.cost.total,
-                0 if isinstance(item.metadata.sample_id, int) else 1,
-                str(item.metadata.sample_id),
+                0 if isinstance(item.metadata.local_batch_id, int) else 1,
+                str(item.metadata.local_batch_id),
                 item.source_position,
             ),
         )
