@@ -14,11 +14,12 @@
 # ============================================================================
 """Packed-parameter ordering helpers used by TP apply and checkpoint paths."""
 
-from typing import Sequence
+from typing import Any, Sequence
 
-import torch
-
+from hyper_parallel.platform import get_platform
 from hyper_parallel.auto_models.components.distributed.sharding_config import PackedShard
+
+platform = get_platform()
 
 
 def _normalize_dim(dim: int, ndim: int) -> int:
@@ -28,7 +29,7 @@ def _normalize_dim(dim: int, ndim: int) -> int:
     return normalized
 
 
-def validate_packed_shape(tensor: torch.Tensor, placement: PackedShard, world_size: int) -> None:
+def validate_packed_shape(tensor: Any, placement: PackedShard, world_size: int) -> None:
     """Validate packed sections against a tensor and TP size.
 
     Args:
@@ -55,10 +56,10 @@ def validate_packed_shape(tensor: torch.Tensor, placement: PackedShard, world_si
 
 
 def pack_tensor_for_shard(
-    tensor: torch.Tensor,
+    tensor: Any,
     placement: PackedShard,
     world_size: int,
-) -> torch.Tensor:
+) -> Any:
     """Reorder section-major data into contiguous rank-major shards.
 
     Args:
@@ -78,14 +79,14 @@ def pack_tensor_for_shard(
         for rank in range(world_size)
         for section_index in range(len(placement.sections))
     ]
-    return torch.cat(ordered, dim=dim).contiguous()
+    return platform.cat(ordered, dim=dim).contiguous()
 
 
 def unpack_tensor_from_shard(
-    tensor: torch.Tensor,
+    tensor: Any,
     placement: PackedShard,
     world_size: int,
-) -> torch.Tensor:
+) -> Any:
     """Restore section-major ordering from gathered rank-major data.
 
     Args:
@@ -103,13 +104,17 @@ def unpack_tensor_from_shard(
     rank_chunks = tensor.split((rank_size,) * world_size, dim=dim)
     rank_sections = [chunk.split(local_section_sizes, dim=dim) for chunk in rank_chunks]
     logical_sections = [
-        torch.cat([rank_sections[rank][section_index] for rank in range(world_size)], dim=dim)
+        platform.cat([rank_sections[rank][section_index] for rank in range(world_size)], dim=dim)
         for section_index in range(len(placement.sections))
     ]
-    return torch.cat(logical_sections, dim=dim).contiguous()
+    return platform.cat(logical_sections, dim=dim).contiguous()
 
 
-def pack_tensor_for_placements(tensor: torch.Tensor, placements: Sequence[object], mesh) -> torch.Tensor:
+def pack_tensor_for_placements(
+    tensor: Any,
+    placements: Sequence[object],
+    mesh: Any,
+) -> Any:
     """Apply rank-major packing for every PackedShard in mesh-axis order."""
     result = tensor
     for mesh_dim, placement in enumerate(placements):
@@ -118,7 +123,11 @@ def pack_tensor_for_placements(tensor: torch.Tensor, placements: Sequence[object
     return result
 
 
-def unpack_tensor_from_placements(tensor: torch.Tensor, placements: Sequence[object], mesh) -> torch.Tensor:
+def unpack_tensor_from_placements(
+    tensor: Any,
+    placements: Sequence[object],
+    mesh: Any,
+) -> Any:
     """Undo rank-major packing in reverse mesh-axis order."""
     result = tensor
     for mesh_dim in reversed(range(len(placements))):

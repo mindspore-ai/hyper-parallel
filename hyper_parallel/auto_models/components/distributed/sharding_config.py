@@ -97,15 +97,19 @@ class PackedShard(Shard):
         return self._sections
 
     def __eq__(self, other: object) -> bool:
+        """Return whether two packed placements describe the same layout."""
         return type(self) is type(other) and self.dim == other.dim and self.sections == other.sections
 
     def __hash__(self) -> int:
+        """Return a stable hash for DTensor layout caching."""
         return hash((self.dim, self.sections, "PackedShard"))
 
     def __repr__(self) -> str:
+        """Return the explicit constructor-style representation."""
         return f"PackedShard(dim={self.dim}, sections={self.sections})"
 
     def __str__(self) -> str:
+        """Return the compact placement representation."""
         return f"PS({self.dim}, {self.sections})"
 
 
