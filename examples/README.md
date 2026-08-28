@@ -7,6 +7,8 @@ This directory contains usage examples for the HyperParallel distributed trainin
 ```text
 examples/
 ├── qwen3_vl_30b_a3b_instruct/ # Qwen3-VL-MoE VL trainer template
+├── qwen3_moe_tp_ep_cp/         # Qwen3-MoE TP + EP + CP combinations
+├── large_model_compile/        # Large Qwen3-MoE decoder-layer compile demo
 ├── torch/              # PyTorch examples
 │   ├── fully_shard/    # FSDP (Fully Sharded Data Parallel) examples
 │   ├── llama3/         # Llama3-style tensor parallel + sequence parallel
