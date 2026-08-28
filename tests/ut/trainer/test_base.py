@@ -94,6 +94,32 @@ class TestBaseTrainerInit(unittest.TestCase):
             f"state.max_steps must mirror args.train.max_steps, got {trainer.state.max_steps}"
         ))
 
+
+class TestVisionParallelSampling(unittest.TestCase):
+    """Vision parallel config is consulted by the shared dataloader path."""
+
+    def test_share_samples_across_dp_flag(self):
+        """The helper returns the normalized ``vision_parallel`` flag."""
+        with patch.object(trainer_base, "get_spec", return_value=object()), patch.object(
+            trainer_base,
+            "get_vision_parallel_config",
+            return_value={"share_samples_across_dp": True},
+        ):
+            trainer = BaseTrainer(_make_args())
+            self.assertTrue(trainer._share_samples_across_dp())
+
+    def test_share_samples_across_dp_defaults_false(self):
+        """Absent ``vision_parallel`` keeps the old per-DP sampling behavior."""
+        with patch.object(trainer_base, "get_spec", return_value=object()), patch.object(
+            trainer_base,
+            "get_vision_parallel_config",
+            return_value={},
+        ):
+            trainer = BaseTrainer(_make_args())
+
+        self.assertFalse(trainer._share_samples_across_dp())
+
+
 class _RecorderCallback:
     """Callback double that records every dispatched lifecycle event."""
 

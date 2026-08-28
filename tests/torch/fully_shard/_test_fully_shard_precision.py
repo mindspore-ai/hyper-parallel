@@ -50,18 +50,19 @@ class SimpleRecomputeModel(torch.nn.Module):
 
 
 class UnevenShardModel(torch.nn.Module):
-    """Two-layer model whose parameters are uneven on dim 0 for four-way FSDP."""
+    """Model with uneven and shorter-than-shard dim-0 parameters."""
 
     def __init__(self):
         super().__init__()
         self.input_projection_weight = torch.nn.Parameter(torch.full((5, 8), 0.01).npu())
         self.output_projection_weight = torch.nn.Parameter(torch.full((7, 5), 0.01).npu())
+        self.output_scale_weight = torch.nn.Parameter(torch.ones(1).npu())
 
     def forward(self, x):
         x = torch.matmul(x, self.input_projection_weight.t())
         x = torch.relu(x)
         x = torch.matmul(x, self.output_projection_weight.t())
-        return torch.sum(x)
+        return torch.sum(x * self.output_scale_weight)
 
 
 def _get_standard_fully_shard_kwargs(mp_policy, offload_policy=None):
@@ -188,7 +189,7 @@ def get_fully_shard_result(
         model_factory (Callable): Builds the model used by this precision case.
 
     Returns:
-        tuple: Loss tensor and a mapping of parameter names to actual local gradients.
+        tuple: Loss tensor, local gradients, and parameter names using RaggedShard gradients.
     """
     dist_model = model_factory().npu()
     dist_x = standalone_x.npu()
@@ -202,6 +203,7 @@ def get_fully_shard_result(
     comm_fusion_memory_checked = False
     with SkipDTensorDispatch():
         dist_grads = {}
+        ragged_grad_param_names = set()
         for _ in range(acc_epoch):
             for _ in range(acc_step):
                 # if i == acc_step - 1:
@@ -221,6 +223,8 @@ def get_fully_shard_result(
                         continue
                     assert isinstance(param.grad, DTensor), \
                         f"Expected {param_name}.grad to be a DTensor, but got {type(param.grad)}"
+                    if any(placement.is_ragged_shard() for placement in param.grad.placements):
+                        ragged_grad_param_names.add(param_name)
                     dist_grads[param_name] = param.grad.data.clone()
                 if not acc_grad:
                     dist_optimizer.step()
@@ -229,7 +233,7 @@ def get_fully_shard_result(
                 dist_optimizer.step()
                 dist_optimizer.zero_grad()
     dist_model.reset_iter_state()
-    return dist_loss, dist_grads
+    return dist_loss, dist_grads, ragged_grad_param_names
 
 
 def _build_prefetch_recompute_model(enable_recompute=False):
@@ -346,7 +350,7 @@ def shard_param_data_parallel(
         acc_grad=acc_grad,
         model_factory=model_factory,
     )
-    dist_loss, dist_grads = get_fully_shard_result(
+    dist_loss, dist_grads, ragged_grad_param_names = get_fully_shard_result(
         step,
         acc_grad=acc_grad,
         check_comm_fusion_memory=check_comm_fusion_memory,
@@ -364,10 +368,25 @@ def shard_param_data_parallel(
         shard_offset = min(shard_rank * dim0_shard_size, standalone_grad.size(0))
         actual_shard_length = min(dim0_shard_size, standalone_grad.size(0) - shard_offset)
         expected_grad = standalone_grad.narrow(0, shard_offset, actual_shard_length)
-        assert expected_grad.shape == dist_grads[param_name].shape, param_name
+        dist_grad = dist_grads[param_name]
+        if param_name in ragged_grad_param_names:
+            expected_grad = expected_grad.flatten()
+            dist_grad = dist_grad.flatten()
+            assert expected_grad.numel() == dist_grad.numel(), (
+                f"Ragged gradient local numel mismatch for {param_name}: "
+                f"expected={expected_grad.numel()}, actual={dist_grad.numel()}"
+            )
+        else:
+            assert expected_grad.shape == dist_grad.shape, (
+                f"Gradient shape mismatch for {param_name}: "
+                f"expected={expected_grad.shape}, actual={dist_grad.shape}"
+            )
         assert np.allclose(expected_grad.cpu().detach().numpy(),
-                           dist_grads[param_name].cpu().detach().numpy(),
-                           0.001, 0.001), param_name
+                           dist_grad.cpu().detach().numpy(),
+                           0.001, 0.001), (
+            f"Gradient values mismatch for {param_name}: "
+            f"expected={expected_grad}, actual={dist_grad}"
+        )
 
 
 @pytest.mark.parametrize(

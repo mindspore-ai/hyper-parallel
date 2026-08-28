@@ -14,26 +14,34 @@
 # ============================================================================
 """Task reward functions consumed by agentic environments."""
 import re
-from typing import Callable, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Union
 from rl.registry import Registry
-RewardInput = str | Sequence[str]
-RewardOutput = float | list[float]
+RewardInput = Union[str, Sequence[str]]
+RewardOutput = Union[float, List[float]]
 RewardFunction = Callable[[RewardInput, str], RewardOutput]
 REWARDS = Registry[RewardFunction]("reward")
 _ANSWER_PATTERN = re.compile(r"#### (\-?[0-9\.\,]+)")
 _REWARD_WINDOW = 300
+
+
 def register_reward(name: str) -> Callable[[RewardFunction], RewardFunction]:
     """Register a reward function under a stable task name."""
     return REWARDS.register(name)
+
+
 def get_reward(name: str) -> RewardFunction:
     """Return a registered reward function by task name."""
     return REWARDS.get(name)
+
+
 def extract_answer(solution: str) -> Optional[str]:
     """Extract the final strict numeric answer from the response tail."""
     matches = _ANSWER_PATTERN.findall(solution[-_REWARD_WINDOW:])
     if not matches:
         return None
     return matches[-1].replace(",", "").replace("$", "")
+
+
 @register_reward("gsm8k")
 def compute_rule_reward(solution: RewardInput, ground_truth: str) -> RewardOutput:
     """Return strict numeric exact-match reward for one or more responses."""

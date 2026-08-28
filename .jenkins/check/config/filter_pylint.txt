@@ -120,9 +120,6 @@
 # 13. test_style.py — abstract-class-instantiated is intentional (testing abstract class behavior)
 "hyper-parallel/tests/ut/core/tensor_parallel/test_style.py"           "abstract-class-instantiated"
 
-# Hyper-RL orchestration tests intentionally drive private lifecycle hooks.
-"hyper-parallel/hyper_parallel/rl/tests/test_trainer_orchestration.py" "protected-access"
-
 # 14. Tensor Parallel style.py — calls private distribute_module helpers (internal API contract);
 #     distribute_module callbacks require full signatures; some parameters are intentionally unused.
 #     Leading-underscore formals in nested callbacks violate default name regex (C0103) but mark unused.

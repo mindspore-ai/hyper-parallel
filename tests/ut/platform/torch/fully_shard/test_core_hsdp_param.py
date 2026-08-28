@@ -28,6 +28,7 @@ import torch
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard import hsdp_param as hsdp_param_mod
 from hyper_parallel.core.fully_shard import hsdp_scheduler as hsdp_scheduler_mod
+from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.core.fully_shard.hsdp_param import (
     HSDPParamV2,
     _build_group_info_from_process_group,
@@ -445,11 +446,10 @@ class TestCoreScheduler(unittest.TestCase):
         scheduler = object.__new__(HSDPSchedulerV2)
         scheduler.modules = ["cell"]
         scheduler.cell = "cell"
-        scheduler.config = SimpleNamespace(reshard_after_forward=True)
         scheduler.reshard_after_forward = True
         scheduler.scheduler_state = None
         scheduler.scheduler_ctx = HSDPSchedulerContext()
-        scheduler._is_root = False
+        scheduler._is_root = True
         scheduler._fsdp_group_post_pending = None
         scheduler.forward_prefetch_cells = []
         scheduler.backward_prefetch_cells = []
@@ -473,9 +473,6 @@ class TestCoreScheduler(unittest.TestCase):
             lazy_init=MagicMock(),
         )
         return scheduler
-
-    def tearDown(self):
-        HSDPSchedulerV2.root_bp_state = False
 
     def test_scheduler_context_and_abstract_methods(self):
         """Scheduler context defaults and platform hooks should stay abstract."""
@@ -525,6 +522,70 @@ class TestCoreScheduler(unittest.TestCase):
         prefetch_state.prefetch.assert_called_once_with()
         scheduler.hsdp_state.unshard.assert_called_once_with()
 
+    def test_forward_pre_hook_shares_context_across_module_tree(self):
+        """A root forward should bind child scheduler, state, and param group to one context."""
+        scheduler = self._scheduler()
+        root_module = HSDPModule()
+        root_module.hsdp_scheduler = scheduler
+        scheduler.cell = root_module
+        scheduler.modules = [root_module]
+        child_ctx = HSDPSchedulerContext()
+        child_state = SimpleNamespace(
+            scheduler_ctx=child_ctx,
+            param_group=SimpleNamespace(comm_ctx=child_ctx.param_group_comm_ctx),
+            module_name=None,
+        )
+        child_scheduler = SimpleNamespace(
+            scheduler_ctx=child_ctx,
+            hsdp_state=child_state,
+            _is_root=True,
+        )
+        child_module = HSDPModule()
+        child_module.hsdp_scheduler = child_scheduler
+        scheduler.hsdp_state.scheduler_ctx = scheduler.scheduler_ctx
+        scheduler.hsdp_state.param_group = None
+        scheduler._init_params_fqn = MagicMock()
+        scheduler._lazy_init_all_states = MagicMock()
+
+        with (
+            patch.object(
+                hsdp_scheduler_mod.platform,
+                "get_cells_and_names",
+                return_value=[("", root_module), ("layer", child_module)],
+            ),
+        ):
+            scheduler._hsdp_forward_pre_hook("cell", (), {})
+
+        self.assertIs(child_scheduler.scheduler_ctx, scheduler.scheduler_ctx)
+        self.assertIs(child_state.scheduler_ctx, scheduler.scheduler_ctx)
+        self.assertIs(child_state.param_group.comm_ctx, scheduler.scheduler_ctx.param_group_comm_ctx)
+        self.assertEqual(scheduler.scheduler_ctx.all_hsdp_schedulers, [scheduler, child_scheduler])
+        self.assertEqual(scheduler.hsdp_state.module_name, "")
+        self.assertEqual(child_state.module_name, "layer")
+        self.assertTrue(scheduler._is_root)
+        self.assertFalse(child_scheduler._is_root)
+
+    def test_forward_pre_hook_rejects_initialized_child_context(self):
+        """A scheduler initialized as another root must not migrate into a new tree."""
+        scheduler = self._scheduler()
+        child_ctx = HSDPSchedulerContext()
+        child_ctx.root_module = object()
+        child_scheduler = SimpleNamespace(
+            scheduler_ctx=child_ctx,
+            hsdp_state=SimpleNamespace(param_group=None),
+            _is_root=True,
+        )
+        child_module = HSDPModule()
+        child_module.hsdp_scheduler = child_scheduler
+        scheduler._init_params_fqn = MagicMock()
+        scheduler._lazy_init_all_states = MagicMock()
+
+        with (
+            patch.object(hsdp_scheduler_mod.platform, "get_cells_and_names", return_value=[("layer", child_module)]),
+            self.assertRaisesRegex(ValueError, "another initialized module tree"),
+        ):
+            scheduler._hsdp_forward_pre_hook("cell", (), {})
+
     def test_forward_pre_hook_returns_early_for_pre_backward_and_disables_recompute_prefetch(self):
         """Pre-forward should skip during pre-backward and disable recompute prefetch."""
         scheduler = self._scheduler()
@@ -535,7 +596,7 @@ class TestCoreScheduler(unittest.TestCase):
         )
 
         scheduler = self._scheduler()
-        HSDPSchedulerV2.root_bp_state = True
+        scheduler.scheduler_ctx.root_bp_state = True
         scheduler._disable_forward_prefetch_for_recompute = MagicMock()
         scheduler._init_params_fqn = MagicMock()
         scheduler._lazy_init_all_states = MagicMock()

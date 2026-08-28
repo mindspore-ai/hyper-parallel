@@ -3,6 +3,8 @@
 Per-subcommand mechanics. The loop shape, cadence, terminal states,
 and triage flowchart live elsewhere:
 
+- Diagnose JSON / bypass builds / dual-phase next-action table →
+  [diagnose-signals.md](diagnose-signals.md)
 - Loop discipline + cadence + terminal states →
   [closed-loop.md](closed-loop.md)
 - 3-question triage + Path A/B/C routing → [flake-policy.md](flake-policy.md)

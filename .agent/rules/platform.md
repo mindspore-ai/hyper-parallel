@@ -1,4 +1,5 @@
 ---
+name: platform
 description: Cross-platform development rules for PyTorch and MindSpore backends
 paths:
   - hyper_parallel/platform/**

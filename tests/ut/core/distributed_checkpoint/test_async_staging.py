@@ -17,6 +17,7 @@
 import importlib
 import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -30,6 +31,11 @@ import hyper_parallel.core.distributed_checkpoint.async_staging as staging_mod
 importlib.reload(staging_mod)
 
 from hyper_parallel.core.distributed_checkpoint.async_staging import build_staged_state_dict
+from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import RaggedShard
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 
 class TestAsyncStaging(unittest.TestCase):
@@ -81,6 +87,26 @@ class TestAsyncStaging(unittest.TestCase):
         self.assertIn("w", staged["model"])
         self.assertEqual(staged["optim"][0]["step"], 1)
         self.assertEqual(tuple(staged["optim"][0]["exp_avg"].shape), (2,))
+
+    def test_build_staged_state_dict_preserves_ragged_global_shape(self):
+        """Ragged DTensor staging keeps the explicit logical global shape."""
+        _DEVICE_MESH_MAP.clear()
+        EXISTING_COMM_GROUPS.clear()
+        with patch(
+                "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+                return_value=0,
+        ):
+            mesh = Layout((2,), ("ragged",), init_backend=False).mesh
+            tensor = DTensor.from_local(
+                torch.arange(48),
+                mesh,
+                (RaggedShard(dims=(0, 1), local_units=(1, 3)),),
+                shape=(6, 4, 8),
+            )
+            staged = build_staged_state_dict({"weight": tensor})["weight"]
+
+        self.assertEqual(tuple(staged.shape), (6, 4, 8))
+        torch.testing.assert_close(staged.to_local(), tensor.to_local())
 
 
 if __name__ == "__main__":

@@ -120,6 +120,10 @@ class _ContextFilter(logging.Filter):
         return True
 
 
+class _HPStreamHandler(logging.StreamHandler):
+    """Stream handler owned by the HyperParallel component logger."""
+
+
 def _build_formatter() -> logging.Formatter:
     """Return a formatter for the current global format settings."""
     return logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
@@ -194,7 +198,7 @@ def _env_levels() -> Dict[str, int]:
 
 def _make_handler(component: str) -> logging.StreamHandler:
     """Build the stdout handler for ``component`` with HP formatting."""
-    handler = logging.StreamHandler(sys.stdout)
+    handler = _HPStreamHandler(sys.stdout)
     handler.setLevel(logging.NOTSET)
     handler.setFormatter(_build_formatter())
     handler.addFilter(_ContextFilter(component))
@@ -261,7 +265,8 @@ def set_format(fmt: Optional[str] = None, datefmt: Optional[str] = None) -> None
         _DATE_FORMAT = datefmt
     for component_logger in _registry.values():
         for handler in component_logger.handlers:
-            handler.setFormatter(_build_formatter())
+            if isinstance(handler, _HPStreamHandler):
+                handler.setFormatter(_build_formatter())
 
 
 def logging_enabled(component: str, level: int = logging.DEBUG) -> bool:

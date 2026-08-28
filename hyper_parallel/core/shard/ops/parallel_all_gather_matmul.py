@@ -133,11 +133,21 @@ class AllGatherMatmulDistributedOp(DistributedOp):
         """
         alias = output_layout.alias_name
         n = len(alias)
-        if isinstance(k_placement, tuple):
-            for v in k_placement:
-                output_layout.set_partial_by_dev_axis(alias[n - 1 - v], op)
-        else:
-            output_layout.set_partial_by_dev_axis(alias[n - 1 - k_placement], op)
+        mesh_axes = k_placement if isinstance(k_placement, tuple) else (k_placement,)
+        # Validate all axes before mutating the layout to avoid leaving partial state on failure.
+        for mesh_axis in mesh_axes:
+            if mesh_axis == -1:
+                continue
+            if (not isinstance(mesh_axis, int) or isinstance(mesh_axis, bool)
+                    or mesh_axis < 0 or mesh_axis >= n):
+                raise ValueError(
+                    f"Invalid k-dim tensor_map axis {mesh_axis!r}; expected -1 or "
+                    f"an integer in [0, {n - 1}]."
+                )
+        for mesh_axis in mesh_axes:
+            if mesh_axis == -1:
+                continue
+            output_layout.set_partial_by_dev_axis(alias[n - 1 - mesh_axis], op)
 
     @staticmethod
     def _validate_input_layouts(
@@ -192,7 +202,8 @@ class AllGatherMatmulDistributedOp(DistributedOp):
         k dim (contraction): when k is sharded, output carries Partial(sum) on the
           k-dim mesh axis; the caller must apply AllReduce to get the correct result.
 
-        gather_out layout: m is Replicate (-1); k follows x1's k-dim placement.
+        gather_out layout: when enabled, m is Replicate (-1) and k follows x1's
+        k-dim placement. When disabled, CANN's 1-D empty tensor is Replicate.
 
         Args:
             cache_values: [x1_layout, x2_layout, trans_x2, gather_output]
@@ -227,12 +238,13 @@ class AllGatherMatmulDistributedOp(DistributedOp):
         if k_placement != -1:
             self._set_partial_from_k(output_layout, k_placement)
 
-        # gather_out: gather_output=True → m Replicate (-1), k follows x1's k placement.
-        # gather_output=False → CANN returns a 1-D empty tensor; force all-Replicate so
-        # the layout is compatible with any tensor rank returned by the kernel.
+        # CANN returns a 1-D empty tensor when gather_output is disabled, so its
+        # layout rank must differ from the normal 2-D (m, k) gather output.
         gather_out_layout = Layout.from_device_mesh(x1_layout.mesh)
-        gather_k = k_placement if gather_output else -1
-        gather_out_layout.set_tensor_map((-1, gather_k))
+        if gather_output:
+            gather_out_layout.set_tensor_map((-1, k_placement))
+        else:
+            gather_out_layout.set_tensor_map((-1,))
         gather_out_layout.tensor_map_to_placement()
 
         return (copy.deepcopy(output_layout), copy.deepcopy(gather_out_layout)), None

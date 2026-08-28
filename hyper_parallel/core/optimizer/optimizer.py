@@ -27,6 +27,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from hyper_parallel.core.dtensor.dtensor import SkipDTensorDispatch
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
@@ -170,12 +171,16 @@ class ChainedOptimizer:
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Load optimizer state dicts and synchronize steps."""
         for optimizer in self.chained_optimizers:
-            set_optimizer_state_dict(
-                self.model,
-                optimizer,
-                optim_state_dict=state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=self.flatten),
-            )
+            # PyTorch may initialize missing slots through a synthetic
+            # optimizer step. Distributed parameters must stay on their local
+            # storage path, matching a real Trainer optimizer step.
+            with SkipDTensorDispatch():
+                set_optimizer_state_dict(
+                    self.model,
+                    optimizer,
+                    optim_state_dict=state_dict,
+                    options=StateDictOptions(flatten_optimizer_state_dict=self.flatten),
+                )
 
         self._synchronize_steps()
 
@@ -240,7 +245,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         """Deduce hsdp_replica_count based on cluster topology.
 
         - Intra-node PGs: Full dedup (no split), high bandwidth makes broadcast cheap.
-        - Inter-node PGs: Split at node boundaries to restrict communication domains 
+        - Inter-node PGs: Split at node boundaries to restrict communication domains
           within a single node, bypassing cross-node bottlenecks.
         """
         devices_per_node = get_device_count()
@@ -522,7 +527,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             is_shard=is_shard_for_ns,
             layout_spec=hsdp_group.layout_spec,
         )
-        logger.info_rank0(f'[Hyper-optimizer] hsdp_assign: {hsdp_assign}')
+        logger.debug_rank0(f'[Hyper-optimizer] hsdp_assign: {hsdp_assign}')
 
         # Build broadcast reverse mapping for replicated groups
         if hsdp_assign.is_replicated and hsdp_assign.replicate_pgs:
@@ -707,7 +712,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         Note: dimensions within a single buffer are still sequential (dim N+1
         depends on dim N completing), but different buffers can overlap.
         """
-        handles: List[dist.Work] = []
+        broadcast_ops: List[Tuple[dist.ProcessGroup, int]] = []
 
         for dim_idx, pg in enumerate(replicate_pgs):
             if pg is None:
@@ -724,10 +729,20 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
 
             src_rank_in_pg = src_coord[dim_idx]
             global_src_rank = dist.get_global_rank(pg, src_rank_in_pg)
+            broadcast_ops.append((pg, global_src_rank))
+
+        handles: List[dist.Work] = []
+        for op_idx, (pg, global_src_rank) in enumerate(broadcast_ops):
             handle = dist.broadcast(
                 batch_buffer, src=global_src_rank, group=pg, async_op=True,
             )
-            handles.append(handle)
+            if op_idx + 1 < len(broadcast_ops):
+                # The next mesh dimension relays the data received here.
+                # It must not read the shared buffer until this hop finishes.
+                handle.wait()
+            else:
+                # Only the final hop may overlap with subsequent computation.
+                handles.append(handle)
 
         return handles
 
@@ -937,6 +952,7 @@ class AsyncReplicateBroadcaster:
         if not batches:
             return
 
+        buffer: torch.Tensor
         if not async_op:
             max_batch_size = max(batch_size for _, batch_size in batches)
             buffer = torch.empty(max_batch_size, dtype=dtype, device=device)

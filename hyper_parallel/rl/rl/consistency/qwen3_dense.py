@@ -24,16 +24,15 @@ from typing import Any, Optional
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from rl.consistency.vllm_ascend import install_partial_prefill_rng_fix
+
 from hyper_parallel import get_platform
 from hyper_parallel.platform.platform import PlatformType
 
 platform = get_platform()
 
 CONSISTENCY_PROFILE_OFF = "off"
-QWEN3_ASCEND_FA3_BATCH_INVARIANT_V1 = "qwen3_ascend_fa3_batch_invariant_v1"
-_SUPPORTED_PROFILES = frozenset(
-    (CONSISTENCY_PROFILE_OFF, QWEN3_ASCEND_FA3_BATCH_INVARIANT_V1)
-)
+QWEN3_ASCEND_CONSISTENCY_V1 = "qwen3_ascend_consistency_v1"
 _TRAINER_ATTENTION_IMPLEMENTATION = "hyper_qwen3_npu_consistent_v1"
 _EXPECTED_PACKAGE_VERSIONS = {
     "batch-invariant-ops": "1.0.0",
@@ -47,12 +46,8 @@ _ROLLOUT_PROFILE_SETTINGS = {
     "batch_invariant": True,
     "block_size": 128,
     "dtype": "bfloat16",
-    "enable_chunked_prefill": True,
-    "enable_prefix_caching": True,
     "enforce_eager": True,
     "logprobs_mode": "raw_logprobs",
-    "model_implementation": "hyper",
-    "tensor_parallel_size": 1,
 }
 _TRAINER_MIXED_PRECISION_SETTINGS = {
     "enabled": True,
@@ -71,9 +66,88 @@ class _ConsistencyRuntime:
     npu_rms_norm: Optional[Callable[..., Any]] = None
     installed_profile: str = CONSISTENCY_PROFILE_OFF
     installed_rollout_profile: str = CONSISTENCY_PROFILE_OFF
+    batch_invariant_sum_compatibility_installed: bool = False
 
 
 _runtime = _ConsistencyRuntime()
+
+
+def consistency_runtime_state() -> dict[str, Any]:
+    """Return process-local numerical patch state for auditable isolation."""
+    return {
+        "trainer_recipe": _runtime.installed_profile,
+        "rollout_recipe": _runtime.installed_rollout_profile,
+        "trainer_attention_installed": _runtime.flash_attn_func is not None,
+        "trainer_varlen_attention_installed": (
+            _runtime.flash_attn_varlen_func is not None
+        ),
+        "qwen3_rms_norm_installed": _runtime.npu_rms_norm is not None,
+        "batch_invariant_sum_compatibility_installed": (
+            _runtime.batch_invariant_sum_compatibility_installed
+        ),
+    }
+
+
+def _reduce_non_last_dimension(
+    tensor: Any,
+    dim: int,
+    keepdim: bool,
+    reduce_last: Callable[[Any, bool], Any],
+) -> Any:
+    """Move one reduction axis to the kernel-supported last dimension."""
+    normalized_dim = dim % tensor.dim()
+    moved = tensor.movedim(normalized_dim, -1).contiguous()
+    reduced = reduce_last(moved, keepdim)
+    if keepdim:
+        return reduced.movedim(-1, normalized_dim)
+    return reduced
+
+
+def _install_batch_invariant_sum_compatibility() -> None:
+    """Keep AscendC sum enabled while supporting PyTorch's non-last reductions."""
+    if _runtime.batch_invariant_sum_compatibility_installed:
+        return
+    try:
+        from vllm_ascend import (  # pylint: disable=C0415
+            batch_invariant as batch_invariant_module,
+        )
+    except ImportError as error:
+        raise ValueError(
+            f"Qwen3 batch-invariant sum compatibility is unavailable: {error}"
+        ) from error
+    original_reduce_sum = batch_invariant_module.reduce_sum
+    reduce_sum_op = getattr(
+        batch_invariant_module.torch.ops.batch_invariant_ops,
+        "npu_reduce_sum_batch_invariant",
+    )
+
+    def reduce_sum(
+        tensor: Any,
+        dim: Optional[int] = None,
+        keepdim: bool = False,
+    ) -> Any:
+        """Route non-last NPU reductions through a stable moved last axis."""
+        if (
+            getattr(tensor.device, "type", None) == "npu"
+            and isinstance(dim, int)
+            and tensor.dim() > 0
+            and dim % tensor.dim() != tensor.dim() - 1
+        ):
+            return _reduce_non_last_dimension(
+                tensor,
+                dim,
+                keepdim,
+                lambda moved, preserve_dim: reduce_sum_op(
+                    moved,
+                    -1,
+                    preserve_dim,
+                ),
+            )
+        return original_reduce_sum(tensor, dim, keepdim)
+
+    batch_invariant_module.reduce_sum = reduce_sum
+    batch_invariant_module.torch.sum = reduce_sum
+    _runtime.batch_invariant_sum_compatibility_installed = True
 
 
 def _qwen3_npu_rms_norm_forward(module: Any, hidden_states: Any) -> Any:
@@ -107,35 +181,36 @@ def _install_qwen3_npu_rms_norm() -> None:
     Qwen3RMSNorm.forward = _qwen3_npu_rms_norm_forward
 
 
+def install_qwen3_rollout_rms_norm_diagnostic() -> None:
+    """Install only fused Qwen3 RMSNorm for an explicit TP2 diagnostic arm."""
+    _install_qwen3_npu_rms_norm()
+
+
 def consistency_profile(config: Mapping[str, Any]) -> str:
-    """Return and validate the selected consistency profile name."""
+    """Return the internal recipe selected by the user-facing enable switch."""
     consistency = config.get("consistency", {})
     if not isinstance(consistency, Mapping):
         raise ValueError("Configuration section 'consistency' must be a mapping")
-    unknown = set(consistency) - {"profile"}
+    unknown = set(consistency) - {"enabled"}
     if unknown:
         raise ValueError(f"Unsupported consistency configuration keys: {sorted(unknown)}")
-    profile = consistency.get("profile", CONSISTENCY_PROFILE_OFF)
-    if not isinstance(profile, str) or not profile:
-        raise ValueError("consistency.profile must be a non-empty string")
-    if profile not in _SUPPORTED_PROFILES:
-        raise ValueError(
-            f"Unsupported consistency.profile {profile!r}; available={sorted(_SUPPORTED_PROFILES)}"
-        )
-    return profile
+    enabled = consistency.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("consistency.enabled must be a boolean")
+    return QWEN3_ASCEND_CONSISTENCY_V1 if enabled else CONSISTENCY_PROFILE_OFF
 
 
 def configure_consistency_profile(config: dict[str, Any]) -> str:
-    """Atomically derive Trainer and rollout settings owned by one profile.
+    """Atomically derive Trainer and rollout settings owned by consistency mode.
 
     Args:
         config: Mutable, fully merged Hyper-RL configuration.
 
     Returns:
-        The normalized profile name.
+        The internal recipe identity or ``off``.
 
     Raises:
-        ValueError: If the profile does not support the selected model or rollout.
+        ValueError: If consistency mode does not support the selected runtime.
     """
     profile = consistency_profile(config)
     if profile == CONSISTENCY_PROFILE_OFF:
@@ -155,6 +230,13 @@ def configure_consistency_profile(config: dict[str, Any]) -> str:
     vllm = rollout.get("vllm")
     if not isinstance(vllm, dict):
         raise ValueError("Consistency profiles require configuration section 'rollout.vllm' to be a mapping")
+    implementation = str(vllm.get("model_implementation", "native")).strip().lower()
+    if implementation != "hyper":
+        raise ValueError(
+            "Qwen3 training-inference consistency requires "
+            "rollout.vllm.model_implementation='hyper', "
+            f"got {implementation!r}"
+        )
     train = config.get("train")
     if not isinstance(train, dict):
         raise ValueError("Consistency profiles require configuration section 'train' to be a mapping")
@@ -164,9 +246,20 @@ def configure_consistency_profile(config: dict[str, Any]) -> str:
 
     model["attn_implementation"] = _TRAINER_ATTENTION_IMPLEMENTATION
     mixed_precision.update(_TRAINER_MIXED_PRECISION_SETTINGS)
+    accelerator = train.get("accelerator", {})
+    if not isinstance(accelerator, Mapping):
+        raise ValueError(
+            "Consistency profiles require train.accelerator to be a mapping"
+        )
+    trainer_tp = int(accelerator.get("tp", 1))
+    rollout_tp = int(vllm.get("tensor_parallel_size", 1))
+    if trainer_tp != rollout_tp:
+        raise ValueError(
+            "Qwen3 training-inference consistency requires matched Trainer and "
+            f"rollout TP, got Trainer TP{trainer_tp} and rollout TP{rollout_tp}"
+        )
     vllm.update(_ROLLOUT_PROFILE_SETTINGS)
     vllm["consistency_profile"] = profile
-    rollout.update({"temperature": 1.0, "top_p": 1.0, "top_k": 0})
     return profile
 
 
@@ -258,7 +351,7 @@ def trainer_sequence_log_probs(
     """
     if _runtime.installed_profile == CONSISTENCY_PROFILE_OFF:
         return None
-    if _runtime.installed_profile != QWEN3_ASCEND_FA3_BATCH_INVARIANT_V1:
+    if _runtime.installed_profile != QWEN3_ASCEND_CONSISTENCY_V1:
         raise RuntimeError(f"Unsupported installed Trainer profile {_runtime.installed_profile!r}")
     if sequences.ndim != 2 or tuple(attention_mask.shape) != tuple(sequences.shape):
         raise ValueError("Packed Trainer inputs require aligned two-dimensional sequences and attention_mask")
@@ -326,7 +419,7 @@ def validate_rollout_consistency_profile(profile: str) -> None:
     """Fail closed if an isolated rollout process cannot provide its profile."""
     if profile == CONSISTENCY_PROFILE_OFF:
         return
-    if profile != QWEN3_ASCEND_FA3_BATCH_INVARIANT_V1:
+    if profile != QWEN3_ASCEND_CONSISTENCY_V1:
         raise ValueError(f"Unsupported rollout consistency profile {profile!r}")
     _require_package_versions()
     try:
@@ -360,11 +453,7 @@ def install_rollout_consistency_profile(profile: str) -> None:
             "Cannot replace process-global rollout consistency profile "
             f"{_runtime.installed_rollout_profile!r} with {profile!r}"
         )
-    # Delay this import to avoid the rl.roles package cycle during facade initialization.
-    from rl.roles.weight_sync.vllm_worker import (  # pylint: disable=C0415
-        install_vllm_ascend_partial_prefill_rng_fix,
-    )
-    install_vllm_ascend_partial_prefill_rng_fix()
+    install_partial_prefill_rng_fix()
     _install_qwen3_npu_rms_norm()
     _runtime.installed_rollout_profile = profile
 
@@ -425,16 +514,19 @@ def install_trainer_consistency_profile(config: Mapping[str, Any]) -> None:
     os.environ["HCCL_DETERMINISTIC"] = "strict"
     os.environ["LCCL_DETERMINISTIC"] = "1"
     enable_batch_invariant_mode()
+    _install_batch_invariant_sum_compatibility()
     _install_qwen3_npu_rms_norm()
     _runtime.installed_profile = profile
 
 
 __all__ = [
     "CONSISTENCY_PROFILE_OFF",
-    "QWEN3_ASCEND_FA3_BATCH_INVARIANT_V1",
+    "QWEN3_ASCEND_CONSISTENCY_V1",
     "configure_consistency_profile",
+    "consistency_runtime_state",
     "consistency_profile",
     "install_rollout_consistency_profile",
+    "install_qwen3_rollout_rms_norm_diagnostic",
     "install_trainer_consistency_profile",
     "trainer_sequence_log_probs",
     "validate_consistency_model_identity",

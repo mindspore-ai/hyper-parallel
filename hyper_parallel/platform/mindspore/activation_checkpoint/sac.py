@@ -68,14 +68,14 @@ class SelectiveCheckpointContext:
 SAC_IGNORED_OPS = {"StopGradient"}
 
 
-def ignore_sac_ops(ops: List[Optional[object]]) -> None:
+def ignore_sac_ops(ignore_ops: List[Optional[object]]) -> None:
     """Add available operator names to the selective-checkpoint ignore set.
 
     Args:
-        ops: MindSpore operator names to execute without selective-AC replay
+        ops (List[Optional[object]]): MindSpore operator names to execute without selective-AC replay
             accounting. ``None`` entries are ignored.
     """
-    SAC_IGNORED_OPS.update(op for op in ops if op is not None)
+    SAC_IGNORED_OPS.update(op for op in ignore_ops if op is not None)
 
 
 class _CachingMindSporeDispatchMode(MsDispatchMode):

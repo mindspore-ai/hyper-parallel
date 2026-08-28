@@ -19,10 +19,14 @@ from rl.algorithm.advantage import TargetOutput, get_advantage_estimator
 from rl.registry import Registry
 from hyper_parallel import get_platform
 platform = get_platform()
+
+
 @dataclass(frozen=True)
 class RoleRequirements:
     reference: bool = False
     critic: bool = False
+
+
 @dataclass(frozen=True)
 class DataRequirements:
     rollout_log_probs: bool = True
@@ -30,10 +34,14 @@ class DataRequirements:
     values: bool = False
     grouped_responses: bool = False
     returns: bool = False
+
+
 @dataclass(frozen=True)
 class AlgorithmRequirements:
     roles: RoleRequirements
     data: DataRequirements
+
+
 @dataclass(frozen=True)
 class LossOutput:
     """Unreduced token sums returned to backend-owned optimization code."""
@@ -43,21 +51,27 @@ class LossOutput:
     valid_token_count: Any
     old_policy_kl_sum: Any
     clipped_token_count: Any
+
+
 @dataclass(frozen=True)
 class CriticLossOutput:
     """Unreduced value-loss sum returned to backend-owned optimization code."""
     loss_sum: Any
     valid_token_count: Any
+
+
 class RLAlgorithm(Protocol):
     """Complete public recipe; it never owns models or steps optimizers."""
     name: str
     requirements: AlgorithmRequirements
+
     def compute_advantages(
         self,
         rewards: Any,
         group_ids: Optional[tuple[Optional[str], ...]] = None,
     ) -> Any:
         """Compute sequence-level advantages when the recipe supports it."""
+
     def build_targets(
         self,
         rewards: Any,
@@ -66,6 +80,7 @@ class RLAlgorithm(Protocol):
         values: Optional[Any] = None,
     ) -> TargetOutput:
         """Build token-aligned advantages and optional returns."""
+
     def compute_actor_loss(
         self,
         current_log_probs: Any,
@@ -75,6 +90,7 @@ class RLAlgorithm(Protocol):
         action_mask: Any,
     ) -> LossOutput:
         """Compute unreduced actor loss terms for valid action tokens."""
+
     def compute_critic_loss(
         self,
         current_values: Any,
@@ -83,13 +99,18 @@ class RLAlgorithm(Protocol):
         action_mask: Any,
     ) -> CriticLossOutput:
         """Compute an unreduced critic loss when the recipe requires it."""
+
+
 @dataclass(frozen=True)
 class PolicyObjectiveOutput:
     """Per-token objective values and clipping indicators."""
     loss: Any
     clipped: Any
+
+
 class PolicyObjective(Protocol):
     """Policy-loss component selected by a complete algorithm recipe."""
+
     def compute(
         self,
         current_log_probs: Any,
@@ -99,12 +120,18 @@ class PolicyObjective(Protocol):
         """Compute per-token policy loss and clipping indicators."""
 PolicyLossBuilder = Callable[..., PolicyObjective]
 POLICY_LOSSES = Registry[PolicyLossBuilder]("policy loss")
+
+
 def register_policy_loss(name: str) -> Callable[[PolicyLossBuilder], PolicyLossBuilder]:
     """Register a policy-loss constructor under a stable name."""
     return POLICY_LOSSES.register(name)
+
+
 def get_policy_loss(name: str, **kwargs: Any) -> PolicyObjective:
     """Instantiate a registered policy loss."""
     return POLICY_LOSSES.build(name, **kwargs)
+
+
 @register_policy_loss("clipped")
 @dataclass(frozen=True)
 class ClippedPolicyObjective:
@@ -112,6 +139,7 @@ class ClippedPolicyObjective:
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
     dual_clip: Optional[float] = None
+
     def compute(
         self,
         current_log_probs: Any,
@@ -135,6 +163,8 @@ class ClippedPolicyObjective:
             | (ratio > 1.0 + self.clip_ratio_high)
         ).to(dtype=current_log_probs.dtype)
         return PolicyObjectiveOutput(loss=policy_loss, clipped=clipped)
+
+
 def low_variance_kl(
     current_log_probs: Any,
     target_log_probs: Any,
@@ -142,10 +172,13 @@ def low_variance_kl(
     """Non-negative k3 KL estimate used by GRPO and PPO recipes."""
     log_ratio = target_log_probs - current_log_probs
     return (log_ratio.exp() - log_ratio - 1.0).clamp(min=0.0, max=10.0)
+
+
 @dataclass(frozen=True)
 class LowVarianceKLRegularizer:
     """Apply a configurable coefficient to the k3 reference-policy KL."""
     coefficient: float
+
     def compute(
         self,
         current_log_probs: Any,
@@ -154,6 +187,8 @@ class LowVarianceKLRegularizer:
         """Compute weighted and raw low-variance KL estimates."""
         raw = low_variance_kl(current_log_probs, reference_log_probs)
         return self.coefficient * raw, raw
+
+
 def _actor_loss(
     *,
     algorithm_name: str,
@@ -186,9 +221,13 @@ def _actor_loss(
     )
 AlgorithmBuilder = Callable[[Mapping[str, Any]], RLAlgorithm]
 ALGORITHMS = Registry[AlgorithmBuilder]("algorithm")
+
+
 def register_algorithm(name: str) -> Callable[[AlgorithmBuilder], AlgorithmBuilder]:
     """Register a complete algorithm recipe builder under a stable name."""
     return ALGORITHMS.register(name)
+
+
 def build_algorithm(config: Mapping[str, Any]) -> RLAlgorithm:
     """Build the complete recipe selected by ``algorithm.name``."""
     name = config.get("name")
@@ -212,6 +251,8 @@ PPO_REQUIREMENTS = AlgorithmRequirements(
         returns=True,
     ),
 )
+
+
 def masked_mean(values: Any, mask: Any) -> Any:
     """Return the mean over elements selected by a non-empty mask."""
     numeric_mask = mask.to(dtype=values.dtype)
@@ -219,6 +260,8 @@ def masked_mean(values: Any, mask: Any) -> Any:
     if count.item() <= 0:
         raise ValueError("masked_mean requires at least one valid element")
     return (values * numeric_mask).flatten().sum(dim=0) / count
+
+
 @dataclass(frozen=True)
 class GRPOConfig:
     """Validated hyperparameters for the complete GRPO recipe."""
@@ -227,6 +270,7 @@ class GRPOConfig:
     clip_ratio_high: float = 0.2
     clip_ratio_c: float = 3.0
     kl_coef: float = 0.001
+
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> "GRPOConfig":
         """Validate and build a GRPO configuration from a mapping."""
@@ -246,10 +290,13 @@ class GRPOConfig:
         if instance.kl_coef < 0:
             raise ValueError("GRPO KL coefficient must be non-negative")
         return instance
+
+
 class GRPOAlgorithm:
     """GRPO math with no optimizer, model, or distributed dependencies."""
     name = "grpo"
     requirements = GRPO_REQUIREMENTS
+
     def __init__(self, config: GRPOConfig) -> None:
         """Compose the complete GRPO recipe from registered components."""
         self.config = config
@@ -264,6 +311,7 @@ class GRPOAlgorithm:
             dual_clip=config.clip_ratio_c,
         )
         self._regularizer = LowVarianceKLRegularizer(config.kl_coef)
+
     def compute_advantages(
         self,
         rewards: Any,
@@ -276,6 +324,7 @@ class GRPOAlgorithm:
         return self._advantage_estimator.estimate(
             rewards, action_mask, group_ids
         ).advantages[:, 0]
+
     def build_targets(
         self,
         rewards: Any,
@@ -287,6 +336,7 @@ class GRPOAlgorithm:
         return self._advantage_estimator.estimate(
             rewards, action_mask, group_ids, values
         )
+
     def compute_actor_loss(
         self,
         current_log_probs: Any,
@@ -306,6 +356,7 @@ class GRPOAlgorithm:
             advantages=advantages,
             action_mask=action_mask,
         )
+
     def compute_critic_loss(
         self,
         current_values: Any,
@@ -316,10 +367,14 @@ class GRPOAlgorithm:
         """Reject critic loss requests because GRPO has no critic role."""
         del current_values, old_values, returns, action_mask
         raise RuntimeError("GRPO does not create or optimize a Critic")
+
+
 @register_algorithm("grpo")
 def build_grpo(config: Mapping[str, Any]) -> GRPOAlgorithm:
     """Build the registered GRPO recipe from user configuration."""
     return GRPOAlgorithm(GRPOConfig.from_mapping(config))
+
+
 @dataclass(frozen=True)
 class PPOConfig:
     """Validated hyperparameters for the complete PPO recipe."""
@@ -330,6 +385,7 @@ class PPOConfig:
     clip_ratio: float = 0.2
     value_clip_ratio: float = 0.2
     kl_coef: float = 0.001
+
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> "PPOConfig":
         """Validate and build a PPO configuration from a mapping."""
@@ -351,10 +407,13 @@ class PPOConfig:
         if instance.kl_coef < 0:
             raise ValueError("PPO KL coefficient must be non-negative")
         return instance
+
+
 class PPOAlgorithm:
     """PPO recipe composed from registered GAE, clipped objective, and KL."""
     name = "ppo"
     requirements = PPO_REQUIREMENTS
+
     def __init__(self, config: PPOConfig) -> None:
         """Compose the complete PPO recipe from registered components."""
         self.config = config
@@ -371,6 +430,7 @@ class PPOAlgorithm:
             clip_ratio_high=config.clip_ratio,
         )
         self._regularizer = LowVarianceKLRegularizer(config.kl_coef)
+
     def compute_advantages(
         self,
         rewards: Any,
@@ -379,6 +439,7 @@ class PPOAlgorithm:
         """Reject sequence-only estimation because PPO requires token values."""
         del rewards, group_ids
         raise ValueError("PPO advantages require token values; call build_targets")
+
     def build_targets(
         self,
         rewards: Any,
@@ -390,6 +451,7 @@ class PPOAlgorithm:
         return self._advantage_estimator.estimate(
             rewards, action_mask, group_ids, values
         )
+
     def compute_actor_loss(
         self,
         current_log_probs: Any,
@@ -409,6 +471,7 @@ class PPOAlgorithm:
             advantages=advantages,
             action_mask=action_mask,
         )
+
     def compute_critic_loss(
         self,
         current_values: Any,
@@ -429,6 +492,8 @@ class PPOAlgorithm:
             loss_sum=(loss * numeric_mask).flatten().sum(dim=0),
             valid_token_count=numeric_mask.flatten().sum(dim=0).detach(),
         )
+
+
 @register_algorithm("ppo")
 def build_ppo(config: Mapping[str, Any]) -> PPOAlgorithm:
     """Build the registered PPO recipe from user configuration."""

@@ -31,10 +31,10 @@ from hyper_parallel.core.fully_shard.utils import (
     DDPMeshInfo,
     FSDPMeshInfo,
     HSDPMeshInfo,
-    TPShardMetaInfo,
+    SourceShardMetaInfo,
 )
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
-from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx, HSDPParamGroup, AllReduceParamGroup
+from hyper_parallel.platform.torch.fully_shard.param_group import HSDPParamGroup, AllReduceParamGroup
 
 logger = get_logger("FSDP")
 
@@ -55,12 +55,6 @@ def _to_dtype_if_needed(
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
-    # Record AllReduceParamGroup that has reduce_scatter issued, waiting for next post_backward to process
-    pre_all_reduce_groups: List[AllReduceParamGroup] = []
-
-    # Keep groups with in-flight all-reduce work for the root hook to wait and finalize.
-    all_reduce_work_groups: List[AllReduceParamGroup] = []
-
     def __init__(
         self,
         cell,
@@ -72,8 +66,9 @@ class TorchHSDPStateV2(HSDPState):
         raw_ignored_params,
         raw_replicate_params,
         platform,
+        scheduler_ctx,
         device,
-        tp_grad_infos: Optional[Mapping[torch.nn.Parameter, TPShardMetaInfo]] = None,
+        source_shard_infos: Optional[Mapping[torch.nn.Parameter, SourceShardMetaInfo]] = None,
     ):
         """
         Initialize TorchHSDPStateV2.
@@ -87,7 +82,7 @@ class TorchHSDPStateV2(HSDPState):
             platform (TorchPlatform): Torch platform abstraction.
             device (torch.device): Target device.
         """
-        self.tp_grad_infos = tp_grad_infos
+        self.source_shard_infos = source_shard_infos
         super().__init__(
             cell,
             mesh,
@@ -98,6 +93,7 @@ class TorchHSDPStateV2(HSDPState):
             raw_ignored_params,
             raw_replicate_params,
             platform,
+            scheduler_ctx,
             device,
         )
         self._init_param_group()
@@ -118,6 +114,7 @@ class TorchHSDPStateV2(HSDPState):
                 self.hsdp_params,
                 self.device,
                 self.comm_fusion_policy.comm_fusion_zero_copy,
+                comm_ctx=self.scheduler_ctx.param_group_comm_ctx,
             )
 
     def _move_states_to_device(self):
@@ -134,23 +131,23 @@ class TorchHSDPStateV2(HSDPState):
                     continue
                 buffer.data = buffer.to(self.device)
 
-    def _build_param_tp_grad_info(
+    def _build_param_source_shard_info(
         self, param: torch.nn.Parameter
-    ) -> Optional[TPShardMetaInfo]:
+    ) -> Optional[SourceShardMetaInfo]:
         """Build normalized source-layout metadata for one managed parameter."""
         if isinstance(param, DTensor):
-            if self.tp_grad_infos is not None:
+            if self.source_shard_infos is not None:
                 raise ValueError(
-                    "tp_grad_infos cannot be provided when fully_shard manages a native DTensor parameter"
+                    "source_shard_infos cannot be provided when fully_shard manages a native DTensor parameter"
                 )
-            return TPShardMetaInfo(
+            return SourceShardMetaInfo(
                 mesh=param.device_mesh,
                 placements=tuple(param.placements),
                 origin_is_dtensor=True,
             )
-        if self.tp_grad_infos is None:
+        if self.source_shard_infos is None:
             return None
-        return self.tp_grad_infos.get(param)
+        return self.source_shard_infos.get(param)
 
     def _init_hsdp_params(self):
         """Initialize all fully_shard-managed parameters for the module."""
@@ -179,7 +176,7 @@ class TorchHSDPStateV2(HSDPState):
                     mp_policy=self.mp_policy,
                     offload_policy=self.offload_policy,
                     device=self.device,
-                    tp_grad_info=self._build_param_tp_grad_info(param),
+                    source_shard_info=self._build_param_source_shard_info(param),
                 )
             )
 
@@ -254,7 +251,7 @@ class TorchHSDPStateV2(HSDPState):
         # Fused gradient reduction path: first apply any pending async reduction
         # from the previous module's backward (pipelined overlap), then issue
         # this module's fused reduce-scatter (+ all-reduce for HSDP).
-        comm_ctx = get_comm_ctx()
+        comm_ctx = self.scheduler_ctx.param_group_comm_ctx
         # Phase 2: save gradients for the param group whose all-reduce is done.
         if comm_ctx.all_reduce_param_group is not None:
             logger.debug("post_backward module=%s wait=comm_fusion_all_reduce", self)
@@ -267,20 +264,9 @@ class TorchHSDPStateV2(HSDPState):
             comm_ctx.pre_param_group = None
         if self.param_group is not None:
             logger.debug("post_backward module=%s launch=comm_fusion_reduce_scatter", self)
-            self.param_group.foreach_reduce(
+            self.param_group.foreach_reducescatter(
                 reduce_scatter_reduce_op=self.reduce_op_type,
             )
-
-    def _resolve_default_reduce_op(self):
-        """Resolve the default reduce op for the whole fully_shard state."""
-        all_params_have_tp_grad_info = bool(self.hsdp_params) and all(
-            hsdp_param.tp_grad_info is not None for hsdp_param in self.hsdp_params
-        )
-        return (
-            torch.distributed.ReduceOp.SUM
-            if all_params_have_tp_grad_info
-            else torch.distributed.ReduceOp.AVG
-        )
 
     def post_backward(self, *unused):  # pylint: disable=unused-argument
         """Reduce gradients and reshard parameters after backward."""
@@ -365,7 +351,7 @@ class TorchHSDPStateV2(HSDPState):
                 hsdp_param.reduce_scatter_grad(
                     reduce_op=self.reduce_op_type,
                 )
-                HSDPState.pre_reduce_scatter_params.append(hsdp_param)
+                self.scheduler_ctx.pre_reduce_scatter_params.append(hsdp_param)
 
         # Handle params that need all_reduce (HSDP with multiple replicas)
         for group_key, hsdp_params in groups_by_comm.items():
@@ -396,7 +382,7 @@ class TorchHSDPStateV2(HSDPState):
                 )
 
             # Save the group so the next module hook can wait RS and launch AR.
-            TorchHSDPStateV2.pre_all_reduce_groups.append(group)
+            self.scheduler_ctx.pre_all_reduce_groups.append(group)
 
     def _wait_prev_reduce_scatter(self) -> List[AllReduceParamGroup]:
         """Step 1: wait prev reduce_scatter.
@@ -407,9 +393,9 @@ class TorchHSDPStateV2(HSDPState):
         Returns:
             List of previous AllReduceParamGroups (one per communication group).
         """
-        if TorchHSDPStateV2.pre_all_reduce_groups:
-            prev_groups = list(TorchHSDPStateV2.pre_all_reduce_groups)
-            TorchHSDPStateV2.pre_all_reduce_groups.clear()
+        if self.scheduler_ctx.pre_all_reduce_groups:
+            prev_groups = list(self.scheduler_ctx.pre_all_reduce_groups)
+            self.scheduler_ctx.pre_all_reduce_groups.clear()
             for prev_group in prev_groups:
                 logger.debug(
                     "post_backward module=%s wait=fused_reduce_scatter group_params=%s",
@@ -429,7 +415,7 @@ class TorchHSDPStateV2(HSDPState):
     def _issue_prev_fused_all_reduce(self, prev_groups: List[AllReduceParamGroup]) -> None:
         """Step 4: issue the previous module's fused all-reduce asynchronously.
 
-        The all-reduce work is collected in ``all_reduce_work_groups``
+        The all-reduce work is collected in ``pending_all_reduce_groups``
         and is waited in the root backward hook.
 
         Args:
@@ -443,7 +429,7 @@ class TorchHSDPStateV2(HSDPState):
                 prev_group.hsdp_params,
             )
             prev_group.issue_async_allreduce()
-            TorchHSDPStateV2.all_reduce_work_groups.append(prev_group)
+            self.scheduler_ctx.pending_all_reduce_groups.append(prev_group)
 
     def _wait_prev_reduce_scatter_without_all_reduce(self) -> None:
         """Wait previous RS outputs that do not enter a replicate all-reduce.
@@ -453,8 +439,8 @@ class TorchHSDPStateV2(HSDPState):
         On the final synchronized micro-step, the partial result is merged into
         the current RS output and retained for root-hook finalization.
         """
-        while HSDPState.pre_reduce_scatter_params:
-            pre_hsdp_param = HSDPState.pre_reduce_scatter_params.pop(0)
+        while self.scheduler_ctx.pre_reduce_scatter_params:
+            pre_hsdp_param = self.scheduler_ctx.pre_reduce_scatter_params.pop(0)
             logger.debug(
                 "post_backward module=%s wait=reduce_scatter param=%s",
                 self,
@@ -476,23 +462,23 @@ class TorchHSDPStateV2(HSDPState):
             elif pre_hsdp_param.unsharded_param.grad is not None:
                 pre_hsdp_param.unsharded_param.grad = None
 
-    @classmethod
-    def wait_and_split_all_reduce_work_groups(cls) -> None:
+    def wait_and_split_all_reduce_work_groups(self) -> None:
         """Wait fused all-reduce work and expose each parameter result."""
-        for group in cls.all_reduce_work_groups:
+        for group in self.scheduler_ctx.pending_all_reduce_groups:
             logger.debug(
-                "post_backward wait=fused_all_reduce group_params=%s",
+                "post_backward module=%s wait=fused_all_reduce group_params=%s",
+                self,
                 group.hsdp_params,
             )
             group.wait_and_split_grads()
-        cls.all_reduce_work_groups.clear()
+        self.scheduler_ctx.pending_all_reduce_groups.clear()
 
     def reset_iter_state(self) -> None:
         """Clear Torch communication bookkeeping without clearing optimizer gradients."""
-        HSDPState.pre_reduce_scatter_params.clear()
-        HSDPState.pre_all_reduce_params.clear()
-        TorchHSDPStateV2.pre_all_reduce_groups.clear()
-        TorchHSDPStateV2.all_reduce_work_groups.clear()
+        self.scheduler_ctx.pre_reduce_scatter_params.clear()
+        self.scheduler_ctx.pre_all_reduce_params.clear()
+        self.scheduler_ctx.pre_all_reduce_groups.clear()
+        self.scheduler_ctx.pending_all_reduce_groups.clear()
         if self.param_group is not None:
             self.param_group.reset_iter_state()
         for hsdp_param in self.hsdp_params:

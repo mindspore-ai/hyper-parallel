@@ -17,8 +17,11 @@ from typing import Any, Optional, Sequence
 from rl.agentic import AgentRunner
 from rl.dataset.contracts import ExperienceBatch, PromptRecord
 from rl.roles.rollout.base import GenerationEngine, GenerationSettings
+
+
 class RolloutManager:
     """Configure an AgentRunner for training or evaluation rollout."""
+
     def __init__(
         self,
         engine: GenerationEngine,
@@ -37,6 +40,7 @@ class RolloutManager:
         collect_old_log_probs: bool = False,
         seed: Optional[int] = None,
         eos_token_ids: Sequence[int] = (),
+        ignore_eos: bool = False,
     ) -> None:
         """Initialize rollout orchestration and generation settings."""
         settings = GenerationSettings(
@@ -50,6 +54,7 @@ class RolloutManager:
             eos_token_ids=tuple(eos_token_ids),
             collect_log_probs=collect_old_log_probs,
             seed=seed,
+            ignore_eos=ignore_eos,
         )
         self.agent_runner = AgentRunner(
             engine=engine,
@@ -60,6 +65,7 @@ class RolloutManager:
             max_observation_tokens=max_observation_tokens,
             settings=settings,
         )
+
     def generate(
         self,
         prompt_records: Sequence[PromptRecord],

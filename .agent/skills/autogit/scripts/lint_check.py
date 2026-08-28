@@ -997,6 +997,7 @@ def _build_check_plan(
         (run_cmakelint,       by_type["cmake"],               {}),
         (run_shellcheck,      by_type["sh"],                  {}),
         (run_codespell,       by_type["all"],                 {}),
+        (run_agents_catalog_check, by_type["all"],            {}),
     ])
     return plan
 
@@ -1013,6 +1014,41 @@ def run_code_style_guard(files: List[str]) -> Tuple[bool, str]:
     if not files:
         return True, ""
     return check_files(files)
+
+
+def run_agents_catalog_check(files: Optional[List[str]] = None) -> Tuple[bool, str]:
+    """Fail if AGENTS.md Skills/Agents tables drift from on-disk .agent entries.
+
+    Always scans the full tree (cheap). ``files`` is accepted for plan
+    compatibility but ignored.
+
+    Args:
+        files: Unused; kept so this checker fits ``_build_check_plan``.
+
+    Returns:
+        Tuple of (success, report).
+    """
+    _ = files
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
+    script = os.path.join(root, ".agent", "scripts", "check_agents_catalog.py")
+    if not os.path.isfile(script):
+        return True, "[agents-catalog] skipped (script missing)\n"
+    try:
+        result = subprocess.run(
+            [sys.executable, script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, f"[agents-catalog] failed to run: {exc}\n"
+    out = ((result.stdout or "") + (result.stderr or "")).strip()
+    if result.returncode != 0:
+        return False, f"[agents-catalog]\n{out}\n"
+    return True, f"[agents-catalog] {out}\n" if out else "[agents-catalog] OK\n"
 
 
 def run_checks(files: List[str], include_pylint: bool = True) -> Tuple[bool, str]:

@@ -79,6 +79,7 @@ GMM1 与 GMM4 并行，AllToAll-Combine 与 GMM3 并行，进一步减少空闲�
 ```text
 multicore/
 ├── __init__.py
+├── _loader.py                      # 首次调用时定位 payload、校验 OPP 并加载框架 adapter
 │
 ├── scheduler/                       # Python 编译器核心（无算子特化）
 │   ├── __init__.py
@@ -101,7 +102,7 @@ multicore/
 │   └── registry.py                  # FILL_CONFIG_REGISTRY 字典
 │
 ├── modules/                         # 算子模块层（图定义 + CLI 数据生成）
-│   └── moe/
+│   └── mega_moe/
 │       ├── forward/
 │       │   ├── graph.py             # build_forward_graph(tsv, ...) → ComputeGraph
 │       │   ├── gen_runtime_data.py  # CLI: --tp/--ep/... 生成 *.bin 文件
@@ -116,26 +117,26 @@ multicore/
 │   │   ├── runtime_config.hpp       # 共享常量 + struct 定义（TaskDesc / EventDesc / TaskType 等）
 │   │   └── worker_kernel.h          # KernelWorkerBase<Derived> CRTP 基类
 │   │
-│   ├── mega_moe/               # MoE FFN 正向算子
+│   ├── hyper_mega_moe/              # MoE FFN 正向算子
 │   │   ├── op_host/                 # 主机侧：infershape / tiling / API
 │   │   └── op_kernel/               # 设备侧
-│   │       ├── mega_moe.cpp        # kernel 入口（include worker_kernel.cpp）
-│   │       ├── mega_moe_tiling_key.h
+│   │       ├── hyper_mega_moe.cpp  # kernel 入口（include worker_kernel.cpp）
+│   │       ├── hyper_mega_moe_tiling_key.h
 │   │       ├── worker_kernel.cpp    # KernelWorker（fwd 特化：tiling@[23], event@[24]）
 │   │       │                        # #include "runtime/worker_kernel.h"
-│   │       ├── swi_glu/             # 编译时从 ops-nn 拷入
-│   │       ├── grouped_matmul/      # 编译时从 ops-transformer 拷入
+│   │       ├── swi_glu/             # 仅隔离构建树：从 ops-nn 拷入
+│   │       ├── grouped_matmul/      # 仅隔离构建树：从 ops-transformer 拷入
 │   │       ├── put_mem_signal/
 │   │       │   └── put_mem_signal_kernel.cpp  # 自包含；DTYPE_DISPATCH_TARGET 实例化
-│   │       └── runtime/             # build 时由 build_multicore_local.sh 从 ops/runtime/ 拷入
+│   │       └── runtime/             # 构建时由源码组装器从 ops/runtime/ 拷入
 │   │           ├── runtime_config.hpp
 │   │           └── worker_kernel.h
 │   │
-│   └── mega_moe_grad/          # MoE FFN 反向算子（结构同上）
+│   └── hyper_mega_moe_grad/         # MoE FFN 反向算子（结构同上）
 │       ├── op_host/
 │       └── op_kernel/
-│           ├── mega_moe_grad.cpp
-│           ├── mega_moe_grad_tiling_key.h
+│           ├── hyper_mega_moe_grad.cpp
+│           ├── hyper_mega_moe_grad_tiling_key.h
 │           ├── worker_kernel.cpp    # KernelWorker（bwd 特化：tiling@[30], event@[31]）
 │           ├── swi_glu/
 │           ├── swi_glu_grad/
@@ -149,9 +150,6 @@ multicore/
 ├── platform/                        # 框架适配层
 │   ├── mindspore/                   # CMakeLists.txt + c_api/ + framework/
 │   └── torch/                       # setup.py + csrc/
-│
-└── prebuild/                        # 预编译 vendor 包
-    └── mega_moe.tar.gz
 ```
 
 ### 2.3 核心模块说明
@@ -194,7 +192,7 @@ FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
 | `runtime_config.hpp` | 共享数据结构：`MAX_TASK_NUM`、`TaskDesc`、`EventDesc`、`TaskType` 枚举、所有 accessor 函数 |
 | `worker_kernel.h` | `KernelWorkerBase<Derived>` CRTP 基类，含 `Process()`、`WaitForDependency()`、`TriggerEvent()` |
 
-**关键**：`ops/runtime/` 不会直接参与编译。`build_multicore_local.sh` 在执行时会将整个 `runtime/` 目录分别拷贝到 `build/mega_moe/mega_moe/op_kernel/runtime/` 和 `build/mega_moe/mega_moe_grad/op_kernel/runtime/`，使各算子 `worker_kernel.cpp` 可以用 `#include "runtime/worker_kernel.h"` 访问共享定义。
+**关键**：`ops/runtime/` 不会直接参与编译。`scripts/native/assemble_multicore_source.py` 在隔离的临时源码树中，将整个 `runtime/` 目录分别拷贝到 `hyper_mega_moe/op_kernel/runtime/` 和 `hyper_mega_moe_grad/op_kernel/runtime/`，使各算子 `worker_kernel.cpp` 可以用 `#include "runtime/worker_kernel.h"` 访问共享定义。仓内业务源码和上游依赖源码均不会被原地修改。
 
 #### ops/<op_name>/op_kernel/worker_kernel.cpp — 算子调度循环
 
@@ -507,74 +505,69 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_da
 
 ## 7. 编译与安装
 
-### 7.1 CANN vendor 包
+### 7.1 依赖准备
 
-Multicore MoE-FFN 依赖两个预编译 CANN vendor 包：
-
-| 包 | 导出符号 | 说明 |
-|---|---|---|
-| `mega_moe_nn` | `aclnnMegaMoe*` | 正向 kernel |
-| `mega_moe_grad_nn` | `aclnnMegaMoeGrad*` | 反向 kernel |
-
-库路径解析优先级（从高到低）：
+依赖版本和 SHA256 由 `scripts/native/config/dependencies.lock.json` 锁定。`build.sh` 自动校验本地依赖
+缓存，匹配时复用，缺失或不一致时下载/刷新，再进入编译阶段：
 
 ```bash
-# 方式 1：显式指定每个包的 lib 目录（最高优先级）
-export CANN_VENDOR_FWD_LIBDIR=/path/to/mega_moe_nn/op_api/lib
-export CANN_VENDOR_BWD_LIBDIR=/path/to/mega_moe_grad_nn/op_api/lib
-
-# 方式 2：指定 vendors 根目录（fwd/bwd 路径自动推导）
-export HP_MULTICORE_DIR=/path/to/vendors_root
-
-# 方式 3：遗留单库模式（fwd 和 bwd 共用同一 lib 目录）
-export CANN_VENDOR_LIBDIR=/path/to/opp_vendor_root/op_api/lib
-
-# 方式 4：无需设置（自动从 prebuild/mega_moe.tar.gz 解压）
+./build.sh --multicore all --shmem all --custom-ops off
 ```
 
-如使用预编译包（`prebuild/mega_moe.tar.gz`），无需手动设置，导入时自动解压并检测路径。
+依赖缓存位于 `build/native/deps`。用户先 source 所选 CANN 9.1.0 的官方 `set_env.sh`，构建脚本读取其
+导出的 `ASCEND_HOME_PATH`。
 
-### 7.2 从源码重新编译 CANN vendor 包
+### 7.2 统一 vendor 与框架 adapter
 
-如需从源码重新编译 CANN vendor 包，在 `scripts/build_multicore_local.sh` 末尾将 `SOC_VALUE` 填入对应硬件版本并取消注释，然后在仓库根目录运行：
+每个 SoC 的一次 CANN 调用同时编译 `HyperMegaMoe` 和 `HyperMegaMoeGrad`。多 SoC 构建分别生成并校验
+vendor 输入，再合并为一个 `hyper_parallel_multicore_nn` vendor 和一个 `libcust_opapi.so`。对外 ACLNN
+符号固定为：
+
+- `aclnnHyperMegaMoe` / `aclnnHyperMegaMoeGetWorkspaceSize`
+- `aclnnHyperMegaMoeGrad` / `aclnnHyperMegaMoeGradGetWorkspaceSize`
+
+vendor 仅允许导出上述 `aclnnHyperMegaMoe*` 符号；冲突或错误大小写的符号会使构建校验失败。MindSpore adapter 使用
+`ops.CustomOpBuilder`，PyTorch adapter 使用 `NpuExtension`；二者均含 CPython module，因此必须分别构建
+带 cp310、cp311 或 cp312 标签的 wheel。
+
+adapter 运行时按组件相对路径定位并绝对加载自带 vendor。host ELF 使用 `$ORIGIN` RUNPATH；`set_env.bash` 按 CANN custom OPP
+契约把 vendor 的 `op_api/lib` 加入调用 shell 的 `LD_LIBRARY_PATH`。
+
+### 7.3 wheel 与本地 PYTHONPATH
+
+wheel 与 PYTHONPATH 共用 `build/native/payload/hyper_parallel` 中的 native payload：
 
 ```bash
-bash scripts/build_multicore_local.sh
+./build.sh --multicore all --shmem all --custom-ops on --strict off
 ```
 
-该脚本会：
+该命令总是重新组装 payload 并生成 wheel；PYTHONPATH 开发直接复用 payload。默认保留组件 CMake/build_ext
+和按 SoC 的编译缓存，切换 cp310/cp311/cp312 时使用隔离的框架 adapter 缓存；`--clean` 显式清理所选组件的
+工作与安装输出，但保留依赖下载缓存。
 
-1. 克隆 `ops-nn`（v9.0.0-beta.1）和 `ops-transformer`（v8.5.0）并 sparse checkout 相关子目录
-2. 应用 `ops-nn.patch` 和 `ops-transformer.patch`
-3. 将 `ops/runtime/` 分别拷入正反向 `op_kernel/runtime/`
-4. 组装 `build/` 目录后调用 `build.sh` 编译
-
-### 7.3 MindSpore 接入
-
-**编译步骤**
+multicore 遵循 CANN 自定义算子包的环境契约。wheel 和 PYTHONPATH 都必须在启动业务或框架 Python 进程前 source 制品中的
+`set_env.bash`：
 
 ```bash
-cd hyper_parallel/core/multicore/platform/mindspore
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+source /usr/local/Ascend/cann/set_env.sh
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+python your_program.py
 ```
 
-**编译流程说明**
+wheel 安装态使用安装到活动 Python 环境 `bin` 目录的真实 shell 定位脚本：
 
-1. **vendor 库路径解析**：cmake 按优先级解析 `CANN_VENDOR_FWD/BWD_LIBDIR` → `HP_MULTICORE_DIR` → `CANN_VENDOR_LIBDIR` → prebuild tarball，确定 `libcust_opapi.so` 的位置。若四者均未配置且 tarball 不存在，cmake 报错退出。
-2. **代码生成**：cmake 将 vendor 路径、头文件路径、链接参数等写入 `build/build_custom_with_ms.py`，该脚本调用 `ms.ops.CustomOpBuilder` 编译 C++ 源码。
-3. **YAML 算子定义**：`c_api/mega_moe/mega_moe_op.yaml` 和 `c_api/mega_moe_grad/mega_moe_grad_op.yaml` 声明算子参数类型及约束。YAML 中设置了 `function: disable: True` 与 `dispatch: enable: False`，**静态图编译路径被显式禁用**（见下方注意事项）。
-4. **`ASCEND_CUSTOM_OPP_PATH`**：`__init__.py` 在首次 `import` 时自动从 vendor 路径派生并设置该环境变量，**不需要**手动 `source ~/.bashrc`。
-
-**编译产物**
-
-```text
-platform/mindspore/build/lib/
-├── hyper_parallel_mega_moe_ms.so
-└── hyper_parallel_mega_moe_ms_auto_generate/
-    ├── gen_ops_def.py
-    └── gen_ops_prim.py
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+source "$(command -v hyper_parallel_multicore_set_env.bash)"
+python your_program.py
 ```
+
+脚本可重定位、重复 source 幂等，并保留、去重已有 OPP/动态库路径。未 source 时首次调用给出
+`HP-NATIVE-OPP-NOT-ACTIVATED`；框架已导入时给出
+`HP-NATIVE-OPP-ACTIVATION-TOO-LATE`。
+
+### 7.4 MindSpore 接入
 
 **使用方式**
 
@@ -591,46 +584,10 @@ mc.mega_moe_grad(...)
 >
 > Graph 模式（`ms.GRAPH_MODE`）**暂未实现**。YAML 定义中 `function: disable: True` 使 MindSpore 编译器无法对这两个算子进行图级追踪和下沉；算子内部依赖运行时动态 tensor 地址，不满足静态图的编译期地址静态化要求。Graph 模式支持计划在后续版本中实现。
 
-### 7.4 PyTorch 接入
+### 7.5 PyTorch 接入
 
-> **⚠️ 注意**
->
-> **依赖版本要求**：`torch_npu >= 330`（即 PTA 330 及更高版本）。
->
-> PyTorch 扩展**默认处于关闭状态**（`scripts/build_multicore.sh` 中 `BUILD_TORCH_EXTENSION=false`）。
-> 如需编译，将该变量改为 `true`：
->
-> ```bash
-> # 编辑 scripts/build_multicore.sh，将：
-> BUILD_TORCH_EXTENSION=false
-> # 改为：
-> BUILD_TORCH_EXTENSION=true
-> ```
->
-> 或者直接调用 `setup.py`（见下方）。
-
-**编译步骤（手动）**
-
-```bash
-cd hyper_parallel/core/multicore/platform/torch
-python setup.py build_ext --inplace
-# 可选：Ninja 加速
-USE_NINJA=1 python setup.py build_ext --inplace
-```
-
-**编译流程说明**
-
-`setup.py` 使用 `torch_npu.utils.cpp_extension.NpuExtension` 将 `csrc/` 下的所有 `.cpp` 源文件编译为 Python C 扩展：
-
-1. **vendor 库路径解析**：按优先级依次查找 `CANN_VENDOR_FWD/BWD_LIBDIR` → `CANN_VENDOR_LIBDIR` → `prebuild/mega_moe.tar.gz`（自动解压）。
-2. **rpath**：将 vendor 库目录写入编译产物的 rpath，运行时无需依赖 `LD_LIBRARY_PATH`。
-3. **环境变量**：`ASCEND_CUSTOM_OPP_PATH` 和 `LD_LIBRARY_PATH` 由 `__init__.py` 在 import 时自动设置，无需手动修改 `~/.bashrc`。
-
-**编译产物**
-
-```text
-platform/torch/hyper_parallel_mega_moe_pta.cpython-3x-aarch64-linux-gnu.so
-```
+PyTorch 与 torch_npu 必须使用和所选 CANN 匹配、且 `_GLIBCXX_USE_CXX11_ABI=1` 的配套版本。
+框架 adapter 通过上述 component build 生成。
 
 ---
 
@@ -932,10 +889,10 @@ extern "C" inline __aicore__ void put_mem_signal_kernel(...) {
 }
 ```
 
-**Step 5** — 在 `build_multicore_local.sh` 中添加新算子的 `runtime/` 拷贝：
+**Step 5** — 在 `scripts/native/assemble_multicore_source.py` 中登记新算子，使源码组装阶段复制共享的 `runtime/`：
 
-```bash
-cp -r runtime build/mega_moe/attn_fwd/op_kernel/
+```python
+_HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
 ```
 
 ---
@@ -948,6 +905,6 @@ cp -r runtime build/mega_moe/attn_fwd/op_kernel/
 | 两 bin 文件 task_num 不一致 | SplitSpec 的 task_num_fn 写错 | 打印 `propagate_splits()` 后每个 op 的 task_num |
 | AIV hang（无限等待）| N:1 扇入 trigger_count 设置偏大 | 检查 FillConfig 的 trigger_count = 实际上游 tile 数 |
 | GMM workspace 越界 | TILE_M/N 设置过大 | 检查 `tiling_tables.py` 中 workspace 预算 |
-| `runtime/worker_kernel.h` 找不到 | build 脚本未执行或路径不对 | 确认 `build_multicore_local.sh` 中有 `cp -r runtime build/.../op_kernel/`，且已执行 |
+| `runtime/worker_kernel.h` 找不到 | 新算子未纳入隔离源码组装 | 检查 `assemble_multicore_source.py` 的算子列表和 `MULTICORE_SOURCE_ASSEMBLY_FAILED` 日志 |
 | Python `ImportError: scheduler` | 从非包根目录运行 | 从 `hyper-parallel/` 根目录用 `python -m` 方式运行 |
 | MindSpore `RuntimeError`: 切换 PYNATIVE | 在 Graph 模式下调用 | `ms.set_context(mode=ms.PYNATIVE_MODE)` 放在 import 之前 |

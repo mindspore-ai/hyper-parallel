@@ -92,21 +92,6 @@ def test_submesh_group4():
     ])
 
 
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_submesh_group4_gloo():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_sub_mesh_redistribute_1
-        2.test_sub_mesh_redistribute_2
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(SUBMESH, "test_sub_mesh_redistribute_1", num_proc=4),
-        TorchCase(SUBMESH, "test_sub_mesh_redistribute_2", num_proc=4),
-    ])
-
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group5():
     """

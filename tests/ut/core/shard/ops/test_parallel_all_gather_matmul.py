@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for AllGatherMatmulDistributedOp."""
-import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -33,13 +32,13 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 class TestAllGatherMatmulDistributedOp(unittest.TestCase):
     """Unit tests for AllGatherMatmulDistributedOp."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Clear global state before each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clear global state after each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
@@ -110,6 +109,52 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
             op, AllGatherMatmulDistributedOp,
             msg=f"Expected AllGatherMatmulDistributedOp, got {type(op)}"
         )
+
+    def test_set_partial_from_k_ignores_replicated_tuple_entries(self):
+        """A mixed k placement should mark only its sharded mesh axes as Partial."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "cp", "tp")
+
+        AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, (1, -1, 0))
+
+        self.assertEqual(
+            output_layout.set_partial_by_dev_axis.call_args_list,
+            [unittest.mock.call("cp", "sum"), unittest.mock.call("tp", "sum")],
+        )
+
+    def test_set_partial_from_k_ignores_fully_replicated_tuple(self):
+        """A tuple containing only replicated entries should not set Partial."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "tp")
+
+        AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, (-1, -1))
+
+        output_layout.set_partial_by_dev_axis.assert_not_called()
+
+    def test_set_partial_from_k_rejects_invalid_tuple_axis(self):
+        """A tuple containing an out-of-range mesh axis should raise ValueError."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "tp")
+
+        with self.assertRaisesRegex(ValueError, r"axis -2.*expected -1 or an integer in \[0, 1\]"):
+            AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, (0, -2))
+        output_layout.set_partial_by_dev_axis.assert_not_called()
+
+    def test_set_partial_from_k_rejects_invalid_scalar_axis(self):
+        """A scalar mesh axis outside the mesh rank should raise ValueError."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "tp")
+
+        with self.assertRaisesRegex(ValueError, r"axis 2.*expected -1 or an integer in \[0, 1\]"):
+            AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, 2)
+
+    def test_set_partial_from_k_rejects_boolean_axis(self):
+        """A boolean should not be accepted as an integer mesh axis."""
+        output_layout = MagicMock()
+        output_layout.alias_name = ("dp", "tp")
+
+        with self.assertRaisesRegex(ValueError, r"axis True.*expected -1 or an integer in \[0, 1\]"):
+            AllGatherMatmulDistributedOp._set_partial_from_k(output_layout, True)
 
     # ------------------------------------------------------------------
     # infer_layout — positive cases
@@ -221,8 +266,8 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
     def test_agm_gather_output_false_8(self, mock_platform):
         """
         Feature: infer_layout gather_output=False.
-        Description: When gather_output is False, gather_out layout should still be (-1, -1).
-        Expectation: gather_out tensor_map is (-1, -1).
+        Description: When gather_output is False, CANN returns a 1-D empty gather_out tensor.
+        Expectation: gather_out tensor_map is the 1-D replicated layout (-1,).
         """
         mesh = self._make_1d_mesh(mock_platform, size=4)
         x1_layout = _build_layout(mesh, (Shard(0),), 2)
@@ -232,8 +277,11 @@ class TestAllGatherMatmulDistributedOp(unittest.TestCase):
         (_, gather_layout), extra = op.infer_layout([x1_layout, x2_layout, False, False])
 
         self.assertIsNone(extra)
-        self.assertEqual(gather_layout.tensor_map, (-1, -1),
-                         msg=f"gather_output=False: expected (-1,-1), got {gather_layout.tensor_map}")
+        self.assertEqual(
+            gather_layout.tensor_map,
+            (-1,),
+            msg=f"gather_output=False: expected (-1,), got {gather_layout.tensor_map}",
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_agm_2d_mesh_dp_tp_9(self, mock_platform):

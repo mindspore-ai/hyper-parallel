@@ -3,7 +3,6 @@ build/
 output/
 dist/
 *.egg-info/
-hyper_parallel/.commit_id
 *.ir
 st_tests
 kernel_meta/
@@ -28,10 +27,12 @@ vendors/
 venv/
 .ipynb_checkpoints/
 
-# Test and local run results
+# Hyper-RL local-only development context and run artifacts
 .rollout-results/
 hyper_parallel/rl/AGENTS.md
 hyper_parallel/rl/local_docs/
+
+# Test results
 *.dot
 *.dat
 *.svg
@@ -75,6 +76,3 @@ hyper_parallel/auto_parallel/SAPP-ND/paradise/output/
 hyper_parallel/auto_parallel/SAPP-ND/paradise/results/
 hyper_parallel/auto_parallel/SAPP-ND/**/*nd_to_ppb*.json
 *.xlsx
-
-# output
-outputs

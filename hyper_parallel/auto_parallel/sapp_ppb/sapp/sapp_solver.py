@@ -147,6 +147,7 @@ class SappSolver:
                 continue
             if rec.name == "FULL":
                 self.recompute_considered_[rec] = False
+                layer.recompute_considered_[rec] = False
                 layer.memory_activation_rec_[rec] = None
                 logger.error("Seqpipe doesn't support full recomputation, "
                              "recompute_activation is set as None for seqpp")
@@ -302,43 +303,47 @@ class SappSolver:
     ##                                                                   ##
     #######################################################################
     @staticmethod
+    def _compute_activation_seq_interleave(num_of_stage, num_of_interleave,
+                                           seq_split_num, micro_batch, act_gap):
+        """compute activation for seq chunks when num_of_interleave > 1."""
+        activation_nums = []
+        for i in range(num_of_interleave):
+            activation_nums.append([])
+            for _ in range(num_of_stage):
+                activation_nums[i].append(num_of_stage)
+        for s in range(num_of_stage):
+            activation_nums[num_of_interleave - 1][s] = seq_split_num
+
+        loop_index = 1
+        for stage_index in range(num_of_stage - 2, -1, -1):
+            flag_added = False
+            for chunk_index in range(num_of_interleave):
+                condition1 = activation_nums[chunk_index][stage_index + 1] % num_of_stage != 0
+                condition2 = activation_nums[chunk_index][stage_index + 1] // num_of_stage < loop_index
+                if condition1 or condition2:
+                    for update in range(stage_index + 1):
+                        activation_nums[chunk_index][update] += act_gap
+                    flag_added = True
+                    break
+            if not flag_added:
+                for update in range(stage_index + 1):
+                    activation_nums[0][update] += act_gap
+                loop_index += 1
+        for i in range(num_of_interleave):
+            for s in range(num_of_stage):
+                activation_nums[i][s] = min(activation_nums[i][s], micro_batch)
+        return activation_nums
+
+    @staticmethod
     def compute_activation_seq_nums(num_of_stage: int, num_of_interleave: int,
                                     seq_split_num: int, micro_batch: int, less_memory: False) -> list[list[int]]:
         """compute the number of activation for seq chunks"""
-        activation_nums = []
-        if less_memory:
-            act_gap = 1
-        else:
-            act_gap = 2
+        act_gap = 1 if less_memory else 2
         if num_of_interleave > 1:
-            for i in range(num_of_interleave):
-                activation_nums.append([])
-                for _ in range(num_of_stage):
-                    activation_nums[i].append(num_of_stage)
-            for s in range(num_of_stage):
-                activation_nums[num_of_interleave - 1][s] = seq_split_num
-
-            loop_index = 1
-            for stage_index in range(num_of_stage - 2, -1, -1):
-                flag_added = False
-                for chunk_index in range(num_of_interleave):
-                    condition1 = activation_nums[chunk_index][stage_index + 1] % num_of_stage != 0
-                    condition2 = activation_nums[chunk_index][stage_index + 1] // num_of_stage < loop_index
-                    if condition1 or condition2:
-                        for update in range(stage_index + 1):
-                            activation_nums[chunk_index][update] += act_gap
-                        flag_added = True
-                        break
-                if not flag_added:
-                    for update in range(stage_index + 1):
-                        activation_nums[0][update] += act_gap
-                    loop_index += 1
-            # microbatch
-            for i in range(num_of_interleave):
-                for s in range(num_of_stage):
-                    activation_nums[i][s] = min(activation_nums[i][s],
-                                                micro_batch)
+            activation_nums = SappSolver._compute_activation_seq_interleave(
+                num_of_stage, num_of_interleave, seq_split_num, micro_batch, act_gap)
         else:
+            activation_nums = []
             for i in range(num_of_interleave):
                 activation_nums.append([])
                 for s in range(num_of_stage):
@@ -358,9 +363,7 @@ class SappSolver:
         seq_length = extracted_training_params['seq_length']
         head_dim = extracted_training_params['head_dim']
         mp = extracted_training_params['model_parallel']
-        # cp = extracted_training_params['context_parallel']
         # 2*Kv add
-        # cp?
         kv_update_mem_byte = 2 * ((TENSOR_FLOAT_16 * batch_size * heads * seq_length * head_dim) / (mp))
         kv_update_mem = kv_update_mem_byte / const_from_byte_to_mb
         # Attention Key,Value
@@ -383,8 +386,6 @@ class SappSolver:
         seq_length = extracted_training_params['seq_length']
         head_dim = extracted_training_params['head_dim']
         mp = extracted_training_params['model_parallel']
-        # cp = extracted_training_params['context_parallel']
-        # cp?
         kv_cache_parameter_mem_byte = 4 * (TENSOR_FLOAT_16 * batch_size * heads * seq_length * head_dim / (mp))
         kv_cache_parameter_mem = kv_cache_parameter_mem_byte / const_from_byte_to_mb
         seq_memory_parameter = original_memory_parameter + kv_cache_parameter_mem
@@ -399,7 +400,6 @@ class SappSolver:
         seq_length = extracted_training_params['seq_length']
         hidden_size = extracted_training_params['hidden_size']
         mp = extracted_training_params['model_parallel']
-        # cp = extracted_training_params['context_parallel']
         if mp > 1:
             # comm operator Mem (recv+reduceScatter)
             # cp?
@@ -430,9 +430,7 @@ class SappSolver:
         seq_length = extracted_training_params['seq_length']
         vocab_size = extracted_training_params['vocab_size']
         mp = extracted_training_params['model_parallel']
-        # cp = extracted_training_params['context_parallel']
         # Memory extra introduced by loss op:
-        # cp?
         loss_operator_mem_byte = TENSOR_FLOAT_32 * batch_size * seq_length * vocab_size / (mp)
         loss_operator_mem = loss_operator_mem_byte / const_from_byte_to_mb
         # New tail Cost = Old tail Cost - (3-3/k)M + (k-1)(M/k)
@@ -459,14 +457,15 @@ class SappSolver:
                 if (i, s) in reserved_positions:
                     continue
                 terms = []
-                for rec in Recompute.TYPE:
-                    if not self.recompute_considered_[rec]:
-                        continue
+                for ll in range(layer_type_num):
+                    body_layer = sorted_layers[Layer.type_enum.BODY][ll]
+                    for rec in Recompute.TYPE:
+                        if not self.recompute_considered_[rec]:
+                            continue
 
-                    for ll in range(layer_type_num):
                         terms.append(
                             variables[
-                                sorted_layers[Layer.type_enum.BODY][ll].name_
+                                body_layer.name_
                             ][rec][i][s]
                         )
 
@@ -564,9 +563,6 @@ class SappSolver:
             sorted_layers: Dict[Layer.type_enum, List[Layer]]) -> Any:
         """Keep recomputation schemes consistent across BODY layer types (MindFormer constraint)."""
 
-        # if (self.recompute_considered_[Recompute.TYPE.FULL] and
-        #     self.recompute_considered_[Recompute.TYPE.FULL]):
-
         considered = Recompute.get_used_list(self.recompute_considered_)
         if len(considered) > 2:
             logger.error("Careful: MindFormer does not allow a fine recomputation scheme "
@@ -592,10 +588,10 @@ class SappSolver:
 
         least_rec = min(considered)
         for layer_idx in range(0, layer_type_num - 1):
-            layer = sorted_layers[Layer.type_enum.BODY][layer_idx].name_
+            layer_name = sorted_layers[Layer.type_enum.BODY][layer_idx].name_
             for v in range(0, self.num_of_interleave_):
                 for s in range(0, self.num_of_stage_):
-                    prob += variables[layer][least_rec][v][s] <= (
+                    prob += variables[layer_name][least_rec][v][s] <= (
                         1 - variables[self.REC_FRONTIER][v][s][layer_idx]
                         ) * self.BIG_M
         return prob
@@ -603,8 +599,13 @@ class SappSolver:
     @staticmethod
     def find_recompute_considered(
             layers_sorted: Dict[Layer.type_enum, List[Layer]]) -> Dict[Recompute.TYPE, bool]:
-        """Return the recomputation-considered flags copied from the first BODY layer."""
-        return layers_sorted[Layer.type_enum.BODY][0].recompute_considered_
+        """Return the recomputation-considered flags copied from the first BODY layer.
+
+        All BODY layers share the same recompute type mask (which types are
+        enabled); each layer may have different activation memory values for
+        the enabled types.
+        """
+        return dict(layers_sorted[Layer.type_enum.BODY][0].recompute_considered_)
 
     def max_stage_micro_eq_stage(self, prob: Any,
                                  layers_sorted: Dict[Layer.type_enum, List[Layer]]) -> Any:
@@ -711,43 +712,33 @@ class SappSolver:
     ############################################
     #            Memory Constraint             #
     ############################################
+    def _accumulate_body_param(self, variables, layers_sorted, stage_id, num_of_interleave):
+        """Accumulate BODY-layer parameter memory into an LP expression."""
+        bound = lpSolver.LpAffineExpression()
+        for inter_id in range(num_of_interleave):
+            for layer in layers_sorted[Layer.type_enum.BODY]:
+                for rec in Recompute.TYPE:
+                    if self.recompute_considered_[rec]:
+                        bound += (
+                            variables[layer.name_][rec][inter_id][stage_id] *
+                            layer.memory_parameter_)
+        return bound
+
     def stage_param_memory(self, variables: Any,
                            layers_sorted: Dict[Layer.type_enum, List[Layer]],
                            stage_id: int, num_of_stage: int,
                            num_of_interleave: int) -> Any:
         """Return an LP expression for the parameter memory of ``stage_id``."""
-        # Add if dual to decide whether dualpipe_v is used
-        if self.dual_:
-            bound = lpSolver.LpAffineExpression()
-            for inter_id in range(num_of_interleave):
-                for layer in layers_sorted[Layer.type_enum.BODY]:
-                    for rec in Recompute.TYPE:
-                        if self.recompute_considered_[rec]:
-                            bound += (
-                                variables[layer.name_][rec][inter_id][stage_id] *
-                                layer.memory_parameter_)
-            if stage_id == 0:
-                for head in layers_sorted[Layer.type_enum.HEAD]:
-                    bound += head.memory_parameter_
+        bound = self._accumulate_body_param(variables, layers_sorted, stage_id, num_of_interleave)
+        if stage_id == 0:
+            for head in layers_sorted[Layer.type_enum.HEAD]:
+                bound += head.memory_parameter_
+            if self.dual_:
                 for tail in layers_sorted[Layer.type_enum.TAIL]:
                     bound += tail.memory_parameter_
-        else:
-            bound = lpSolver.LpAffineExpression()
-            for inter_id in range(num_of_interleave):
-                for layer in layers_sorted[Layer.type_enum.BODY]:
-                    for rec in Recompute.TYPE:
-                        if self.recompute_considered_[rec]:
-                            bound += (
-                                variables[layer.name_][rec][inter_id][stage_id] *
-                                layer.memory_parameter_)
-            if stage_id == 0:
-                for head in layers_sorted[Layer.type_enum.HEAD]:
-                    bound += head.memory_parameter_
-                for tail in layers_sorted[Layer.type_enum.TAIL]:
-                    bound += tail.memory_parameter_
-            if stage_id == num_of_stage - 1:
-                for tail in layers_sorted[Layer.type_enum.TAIL]:
-                    bound += tail.memory_parameter_
+        if not self.dual_ and stage_id == num_of_stage - 1:
+            for tail in layers_sorted[Layer.type_enum.TAIL]:
+                bound += tail.memory_parameter_
         return bound
 
     def stage_active_memory_per_micro(
@@ -910,25 +901,27 @@ class SappSolver:
                     + self.constant_memory_
                 )
 
+    def _stage_activation_memory(self, inter: int, stage: int) -> float:
+        """Compute activation memory for one ``(inter, stage)`` cell."""
+        memory_activation = 0
+        for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+            for rec in Recompute.TYPE:
+                if not self.recompute_considered_[rec]:
+                    continue
+                var_value = self.variables_.get(layer.name_)[rec][inter][stage].varValue
+                memory_activation += var_value * layer.memory_activation_rec_[rec]
+        return memory_activation
+
     def get_simulator_memory_activation(self) -> list[float]:
         """Give the activation memory per stage for simulator."""
 
         memory_active = []
         if self.has_some_memory_info():
             for inter in range(self.num_of_interleave_):
-                memory_active.append([])
+                inter_list = []
                 for stage in range(self.num_of_stage_):
-                    memory_active[inter].append(0)
-                    memory_activation = 0
-                    for rec in Recompute.TYPE:
-                        if not self.recompute_considered_[rec]:
-                            continue
-
-                        for layer in self.layers_sorted_[Layer.type_enum.BODY]:
-                            var_value = self.variables_.get(layer.name_)[rec][inter][stage].varValue
-                            memory_activation += var_value * layer.memory_activation_rec_[rec]
-
-                    memory_active[inter][stage] = memory_activation
+                    inter_list.append(self._stage_activation_memory(inter, stage))
+                memory_active.append(inter_list)
         return memory_active
 
     def get_simulator_memory_parameter(self) -> list[float]:
@@ -952,12 +945,12 @@ class SappSolver:
     def _get_stage_parameter_memory(self, interleave, stage):
         """Calculate BODY-layer parameter memory for one pipeline position."""
         total = 0
-        for rec in Recompute.TYPE:
-            if not self.recompute_considered_[rec]:
-                continue
+        for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+            if layer.memory_parameter_ is not None:
+                for rec in Recompute.TYPE:
+                    if not self.recompute_considered_[rec]:
+                        continue
 
-            for layer in self.layers_sorted_[Layer.type_enum.BODY]:
-                if layer.memory_parameter_ is not None:
                     var_value = self.variables_.get(layer.name_)[rec][interleave][stage].varValue
                     total += var_value * layer.memory_parameter_
         return total
@@ -978,10 +971,10 @@ class SappSolver:
                                     layer.backward_time_rec_[rec])
 
         for head in self.layers_sorted_[Layer.type_enum.HEAD]:
-            time[0][0] += head.time_
+            time[0][0] += head.forward_time_ + head.backward_time_rec_[Recompute.TYPE.NONE]
         for tail in self.layers_sorted_[Layer.type_enum.TAIL]:
             time[self.num_of_interleave_ - 1][self.num_of_stage_ -
-                                              1] += tail.time_
+                                              1] += tail.forward_time_ + tail.backward_time_rec_[Recompute.TYPE.NONE]
         return time
 
     def get_simulator_forward_time(self) -> list[float]:
@@ -997,10 +990,34 @@ class SappSolver:
                             time[i][s] += self.variables_[layer.name_][rec][i][
                                 s].varValue * (layer.forward_time_)
         for head in self.layers_sorted_[Layer.type_enum.HEAD]:
-            time[0][0] += head.time_
+            time[0][0] += head.forward_time_
         for tail in self.layers_sorted_[Layer.type_enum.TAIL]:
             time[self.num_of_interleave_ - 1][self.num_of_stage_ -
-                                              1] += tail.time_
+                                              1] += tail.forward_time_
+        return time
+
+    def get_simulator_backward_time(self) -> list[float]:
+        """Give the backward time per stage for simulator.
+
+        Unlike :meth:`get_simulator_forward_time`, this returns the actual
+        backward time derived from per-layer ``backward_time_rec_`` instead of
+        relying on ``forward_time × backward_ratio``.
+        """
+        time = []
+        for i in range(self.num_of_interleave_):
+            time.append([])
+            for s in range(self.num_of_stage_):
+                time[i].append(0)
+                for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+                    for rec in Recompute.TYPE:
+                        if self.recompute_considered_[rec]:
+                            time[i][s] += self.variables_[layer.name_][rec][i][
+                                s].varValue * layer.backward_time_rec_[rec]
+        for head in self.layers_sorted_[Layer.type_enum.HEAD]:
+            time[0][0] += head.backward_time_rec_[Recompute.TYPE.NONE]
+        for tail in self.layers_sorted_[Layer.type_enum.TAIL]:
+            time[self.num_of_interleave_ - 1][self.num_of_stage_ -
+                                              1] += tail.backward_time_rec_[Recompute.TYPE.NONE]
         return time
 
     def get_simulator_recompute_time(self) -> list[float]:
@@ -1028,11 +1045,7 @@ class SappSolver:
 
     def has_some_memory_info(self) -> bool:
         """Check if there is some information for memory constraint."""
-        some_info = False
-        for rec in Recompute.TYPE:
-            if self.recompute_considered_[rec]:
-                some_info = True
-        return some_info
+        return any(self.recompute_considered_.values())
 
     ############################################
     #            General Constraint            #
@@ -1060,18 +1073,15 @@ class SappSolver:
         logger.info("dump problem file: %s", dump_name)
         self.problem_.writeLP(dump_name)
 
-    def print_results(self) -> None:
-        """Log the detailed per-layer solver assignment for the solved problem."""
-        if self.has_some_memory_info():
-            logger.output("For max memory %s", self.max_memory_)
-            logger.output("==============")
+    def _print_body_layer_assignments(self) -> None:
+        """Log per-layer recompute assignments for each stage and interleave."""
         for body_layer in self.layers_sorted_[Layer.type_enum.BODY]:
             layer_name = body_layer.name_
             logger.output("For layer: %s", layer_name)
             logger.output("=========")
             logger.output("  Forward Prop time: %s", body_layer.forward_time_)
             for rec in Recompute.TYPE:
-                if body_layer.recompute_considered_[rec]:
+                if self.recompute_considered_[rec]:
                     logger.output("  Backward Prop %s time: %s",
                                   Recompute.YAML_NAME[rec], body_layer.backward_time_rec_[rec])
             for inter in range(self.num_of_interleave_):
@@ -1084,6 +1094,9 @@ class SappSolver:
                     chunk = f" of chunk {inter}" if self.num_of_interleave_ != 1 else ""
                     logger.output("    Assign %s: %s%s  to stage %d",
                                   layer_name, " ".join(parts), chunk, stage)
+
+    def _print_debug_variables(self) -> None:
+        """Log debug-level variable values for the solver problem."""
         for s in range(self.num_of_stage_):
             logger.debug(
                 "%s[%s] =%s",
@@ -1125,6 +1138,14 @@ class SappSolver:
                         self.variables_[self.LAYER_FRONTIER][body_layer][v][s].varValue,
                     )
 
+    def print_results(self) -> None:
+        """Log the detailed per-layer solver assignment for the solved problem."""
+        if self.has_some_memory_info():
+            logger.output("For max memory %s", self.max_memory_)
+            logger.output("==============")
+        self._print_body_layer_assignments()
+        self._print_debug_variables()
+
     def debug_print_solver_theoretical_memory(self) -> None:
         """Log the solver-implied per-stage theoretical memory (debug aid)."""
         logger.info("%s Solver Theoretical Memory Analysis %s", "=" * 20, "=" * 20)
@@ -1162,7 +1183,6 @@ class SappSolver:
                 activation_nums
             ).value()
 
-            # overhead = self.variables_[self.MEM_OVERHEAD_NAME][s].varValue * overhead_factors[s]
             overhead = 0
             total = param_mem + act_mem + overhead + self.constant_memory_
 
@@ -1227,6 +1247,18 @@ class SappSolver:
 
         # Var to Minimize
         prob += pipeline_total_time
+
+        # Explicitly constrain unused recompute type variables to zero.
+        # While current constraints filter by self.recompute_considered_[rec],
+        # this prevents latent issues if future constraints forget to filter.
+        for layer in layers_sorted[Layer.type_enum.BODY]:
+            for rec in Recompute.TYPE:
+                if not self.recompute_considered_[rec]:
+                    for inter in range(num_of_interleave):
+                        for stage in range(num_of_stage):
+                            prob += (
+                                self.variables_[layer.name_][rec][inter][stage] == 0
+                            )
 
         result = self.add_total_nb_layer_constraint(prob, self.variables_, layers_sorted)
         if result is None:
@@ -1403,17 +1435,17 @@ class SappSolver:
         if stage_id == 0:
             if inter_f == 0:
                 for head in layers_sorted[Layer.type_enum.HEAD]:
-                    bound += head.time_
+                    bound += head.forward_time_
             if inter_b == 0:
                 for head in layers_sorted[Layer.type_enum.HEAD]:
-                    bound += head.time_ * 2
+                    bound += head.backward_time_rec_[Recompute.TYPE.NONE]
         if stage_id == self.num_of_stage_ - 1:
             if inter_f == self.num_of_interleave_ - 1:
                 for tail in layers_sorted[Layer.type_enum.TAIL]:
-                    bound += tail.time_
+                    bound += tail.forward_time_
             if inter_b == self.num_of_interleave_ - 1:
                 for tail in layers_sorted[Layer.type_enum.TAIL]:
-                    bound += tail.time_ * 2
+                    bound += tail.backward_time_rec_[Recompute.TYPE.NONE]
         return bound
 
     def _total_sum(self, layers_sorted):
@@ -1443,29 +1475,30 @@ class SappSolver:
 
         return bound
 
+    def _append_head_tail_time(self, prop, layers_sorted, inter, stage, bound):
+        """Append head/tail time to the bound when at boundary stages."""
+        if stage == 0 and inter == 0:
+            for head in layers_sorted[Layer.type_enum.HEAD]:
+                if prop == self.PROP_PHASE.FW:
+                    bound += head.forward_time_
+                else:
+                    bound += head.backward_time_rec_[Recompute.TYPE.NONE]
+        if stage == self.num_of_stage_ - 1 and inter == self.num_of_interleave_ - 1:
+            for tail in layers_sorted[Layer.type_enum.TAIL]:
+                if prop == self.PROP_PHASE.FW:
+                    bound += tail.forward_time_
+                else:
+                    bound += tail.backward_time_rec_[Recompute.TYPE.NONE]
+        return bound
+
     def micro_batch_time(self, prop: "SappSolver.PROP_PHASE",
                          layers_sorted: Dict[Layer.type_enum, List[Layer]],
                          inter: int, stage: int) -> Any:
         """Return the total micro-batch time LP expression at ``(inter, stage)``."""
         bound = lpSolver.LpAffineExpression()
-        if prop == self.PROP_PHASE.FW:
-            for layer in layers_sorted[Layer.type_enum.BODY]:
-                bound = self.body_layer_time(prop, layer, inter, stage)
-            if stage == 0 and inter == 0:
-                for head in layers_sorted[Layer.type_enum.HEAD]:
-                    bound += head.time_
-            if stage == self.num_of_stage_ - 1 and inter == self.num_of_interleave_ - 1:
-                for tail in layers_sorted[Layer.type_enum.TAIL]:
-                    bound += tail.time_
-        else:
-            for layer in layers_sorted[Layer.type_enum.BODY]:
-                bound = self.body_layer_time(prop, layer, inter, stage)
-            if stage == 0 and inter == 0:
-                for head in layers_sorted[Layer.type_enum.HEAD]:
-                    bound += head.time_ * 2
-            if stage == self.num_of_stage_ - 1 and inter == self.num_of_interleave_ - 1:
-                for tail in layers_sorted[Layer.type_enum.TAIL]:
-                    bound += tail.time_ * 2
+        for layer in layers_sorted[Layer.type_enum.BODY]:
+            bound += self.body_layer_time(prop, layer, inter, stage)
+        bound = self._append_head_tail_time(prop, layers_sorted, inter, stage, bound)
         return bound
 
     def _chunks_sum(self, layers_sorted, v):
@@ -1500,7 +1533,7 @@ class SappSolver:
 
         head_time = 0
         for head in layers_sorted[Layer.type_enum.HEAD]:
-            head_time = head.time_
+            head_time = head.forward_time_
 
         prob += max_prev_stages[0] >= (self.micro_batch_time(
             self.PROP_PHASE.FW, layers_sorted, v, 0)) - head_time

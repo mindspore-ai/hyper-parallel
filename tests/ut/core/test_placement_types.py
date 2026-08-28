@@ -21,7 +21,14 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard, StridedShard
+from hyper_parallel.core.dtensor.placement_types import (
+    Partial,
+    Placement,
+    RaggedShard,
+    Replicate,
+    Shard,
+    StridedShard,
+)
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 
@@ -154,6 +161,103 @@ class TestPlacementConversion(unittest.TestCase):
         placements = layout.tensor_map_to_placement()
         self.assertEqual(placements[0], StridedShard(0, split_factor=2))
         self.assertEqual(placements[1], Shard(0))
+
+    def test_uneven_shard_marker_value_semantics(self):
+        """Test uneven markers participate in placement identity and representation."""
+        marked_shard = Shard(0, uneven_shard=True)
+        same_marked_shard = Shard(0, uneven_shard=True)
+        balanced_shard = Shard(0)
+        marked_strided_shard = StridedShard(0, split_factor=2, uneven_shard=True)
+
+        self.assertEqual(marked_shard, same_marked_shard)
+        self.assertEqual(hash(marked_shard), hash(same_marked_shard))
+        self.assertNotEqual(marked_shard, balanced_shard)
+        self.assertNotEqual(hash(marked_shard), hash(balanced_shard))
+        self.assertEqual(repr(marked_shard), "Shard(dim=0, uneven_shard=True)")
+        self.assertEqual(
+            repr(marked_strided_shard),
+            "StridedShard(dim=0, split_factor=2, uneven_shard=True)",
+        )
+        with self.assertRaisesRegex(TypeError, "uneven_shard must be bool"):
+            Shard(0, uneven_shard=1)
+
+    def test_uneven_shard_layout_round_trip(self):
+        """Test tensor-map reconstruction retains the marked FSDP mesh placement."""
+        layout = Layout((2, 2), ("fsdp", "tp"), init_backend=False)
+        expected_placements = [
+            StridedShard(0, split_factor=2, uneven_shard=True),
+            Shard(0),
+        ]
+
+        layout.set_placements(expected_placements)
+        tensor_map = layout.placement_to_tensor_map(dim=2)
+        rebuilt_placements = layout.tensor_map_to_placement()
+
+        self.assertEqual(tuple(tensor_map), ((0, 1), -1))
+        self.assertEqual(rebuilt_placements, expected_placements)
+        self.assertEqual(layout.uneven_shard_mesh_dims, (0,))
+        self.assertTrue(layout.has_uneven_shard)
+
+    def test_ragged_shard(self):
+        """Test RaggedShard value semantics and phase-one constructor validation."""
+        placement = RaggedShard(dims=(0, 1), local_units=(1, 2, 0))
+        same = RaggedShard(dims=(0, 1), local_units=(1, 2, 0))
+        different = RaggedShard(dims=(0,), local_units=(1, 2, 0))
+
+        self.assertEqual(placement.dims, (0, 1))
+        self.assertEqual(placement.local_units, (1, 2, 0))
+        self.assertTrue(placement.is_ragged_shard())
+        self.assertFalse(Placement().is_ragged_shard())
+        self.assertEqual(placement, same)
+        self.assertEqual(hash(placement), hash(same))
+        self.assertNotEqual(placement, different)
+        self.assertEqual(
+            repr(placement),
+            "RaggedShard(dims=(0, 1), local_units=(1, 2, 0))",
+        )
+        self.assertEqual(str(placement), "RS((0, 1), (1, 2, 0))")
+        with self.assertRaises(AttributeError):
+            placement.dims = (0,)
+        with self.assertRaises(AttributeError):
+            placement.local_units = (1,)
+
+        invalid_cases = (
+            ((), (1,), "non-empty tuple"),
+            ([0], (1,), "non-empty tuple"),
+            ((True,), (1,), "only integers"),
+            ((1,), (1,), "prefix dims"),
+            ((0, 2), (1,), "prefix dims"),
+            ((0,), (), "non-empty tuple"),
+            ((0,), [1], "non-empty tuple"),
+            ((0,), (True,), "only integers"),
+            ((0,), (-1, 2), "non-negative"),
+            ((0,), (0, 0), "positive sum"),
+        )
+        for dims, local_units, message in invalid_cases:
+            with self.subTest(dims=dims, local_units=local_units):
+                with self.assertRaisesRegex(ValueError, message):
+                    RaggedShard(dims=dims, local_units=local_units)
+
+    def test_ragged_shard_layout_round_trip(self):
+        """Test Layout preserves RaggedShard while tensor_map treats it as Replicate."""
+        ragged = RaggedShard(dims=(0,), local_units=(1, 2))
+        original_placements = [ragged, Shard(1)]
+        layout = Layout((2, 2), ("dp", "tp"), init_backend=False)
+
+        layout.set_placements(original_placements)
+        tensor_map = layout.placement_to_tensor_map(dim=2)
+
+        self.assertIs(layout.placements, original_placements)
+        self.assertEqual(layout.ragged_shard.mesh_dim, 0)
+        self.assertEqual(layout.ragged_shard.placement, ragged)
+        self.assertEqual(layout.normal_placements, (Replicate(), Shard(1)))
+        self.assertEqual(tuple(tensor_map), (-1, 0))
+
+        layout.set_alias_tensor_map((("dp", "tp"),))
+        self.assertIs(layout.alias_placements, original_placements)
+
+        rebuilt = layout.tensor_map_to_placement()
+        self.assertEqual(rebuilt, [ragged, Shard(1)])
 
     def test_tensor_map_to_placement_preserves_left_to_right_sharding(self):
         """Test left-to-right tensor_map maps back to plain Shard placements."""

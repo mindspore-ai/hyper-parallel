@@ -33,8 +33,15 @@ This module is for **training** (no KV-cache, no chunk recurrence reuse).
 For inference with cache, use a kernel-optimised path or the recurrent
 variant from ``transformers.models.qwen3_next``.
 """
+# This model module currently has a Torch-only implementation.
+# pylint: disable=forbidden-backend-import,missing-public-type-hints
+# pylint: disable=missing-public-docstring,not-callable
 # pylint: disable=C0103  # SSM/state-space convention: A_log, A
 
+import importlib
+import importlib.metadata
+import importlib.util
+import re
 from typing import Optional
 
 import torch
@@ -42,6 +49,14 @@ from torch import nn
 from torch.nn import functional as F
 
 from hyper_parallel.models.modules.rmsnorm import RMSNormGated
+
+
+_GDN_BACKENDS = frozenset({"eager", "triton"})
+_MIN_TRITON_ASCEND_VERSION = (3, 2, 1)
+_MAX_TRITON_ASCEND_VERSION = (3, 3, 0)
+_SUPPORTED_TRITON_MODULE_SERIES = (3, 2)
+_TRITON_GDN_HEAD_DIM = 128
+_TRITON_GDN_CHUNK_SIZE = 64
 
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -147,6 +162,133 @@ def torch_chunk_gated_delta_rule(
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
+
+
+def _parse_version(version_text: str) -> tuple[int, int, int]:
+    """Return a three-component numeric version tuple."""
+    parts = [
+        int(match.group())
+        for part in version_text.split("+")[0].split(".")[:3]
+        if (match := re.match(r"\d+", part)) is not None
+    ]
+    return tuple((parts + [0, 0, 0])[:3])
+
+
+def _is_triton_gdn_input_supported(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    g: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+) -> bool:
+    """Check the fixed Qwen3.5 GDN contract validated by this backend."""
+    if key is None or value is None or g is None or beta is None:
+        return False
+    if not (
+        query.device.type == "npu"
+        and query.dtype == key.dtype == value.dtype == beta.dtype == torch.bfloat16
+        and g.dtype == torch.float32
+        and query.ndim == key.ndim == value.ndim == 4
+        and g.ndim == beta.ndim == 3
+        and query.shape == key.shape
+        and query.shape[:3] == value.shape[:3] == g.shape == beta.shape
+        and query.shape[-1] == value.shape[-1] == _TRITON_GDN_HEAD_DIM
+    ):
+        return False
+    return all(
+        tensor.device == query.device
+        for tensor in (key, value, g, beta)
+    )
+
+
+def is_triton_gdn_available(
+    query: Optional[torch.Tensor] = None,
+    key: Optional[torch.Tensor] = None,
+    value: Optional[torch.Tensor] = None,
+    g: Optional[torch.Tensor] = None,
+    beta: Optional[torch.Tensor] = None,
+    chunk_size: int = _TRITON_GDN_CHUNK_SIZE,
+) -> bool:
+    """Return whether the validated Triton-Ascend GDN backend is available."""
+    if chunk_size != _TRITON_GDN_CHUNK_SIZE:
+        return False
+    if query is not None and not _is_triton_gdn_input_supported(
+        query, key, value, g, beta
+    ):
+        return False
+    try:
+        version_text = importlib.metadata.version("triton-ascend")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    version = _parse_version(version_text)
+    if not _MIN_TRITON_ASCEND_VERSION <= version < _MAX_TRITON_ASCEND_VERSION:
+        return False
+    try:
+        triton_module = importlib.import_module("triton")
+        module_version = _parse_version(triton_module.__version__)
+        if module_version[:2] != _SUPPORTED_TRITON_MODULE_SERIES:
+            return False
+        return importlib.util.find_spec("triton.backends.ascend") is not None
+    except (AttributeError, ImportError, ModuleNotFoundError):
+        return False
+
+
+def chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    backend: str = "eager",
+):
+    """Dispatch GDN to an explicitly selected eager or Triton backend."""
+    backend = backend.lower()
+    if backend not in _GDN_BACKENDS:
+        raise ValueError(
+            f"unsupported GDN backend {backend!r}; "
+            f"expected one of {sorted(_GDN_BACKENDS)}."
+        )
+    if backend == "eager":
+        return torch_chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+    if not is_triton_gdn_available(
+        query, key, value, g, beta, chunk_size=chunk_size
+    ):
+        raise RuntimeError(
+            "GDN backend='triton' requires a validated triton-ascend 3.2.x "
+            "installation with the Ascend backend and NPU inputs "
+            "q/k/v/beta=bf16, g=fp32, head_k_dim=head_v_dim=128, "
+            "and chunk_size=64."
+        )
+
+    from hyper_parallel.platform.torch.custom_ops.gdn.chunk_gated_delta_rule import (  # pylint: disable=import-outside-toplevel
+        chunk_gated_delta_rule as triton_chunk_gated_delta_rule,
+    )
+
+    return triton_chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        chunk_size=chunk_size,
+    )
 
 
 class GatedDeltaNet(nn.Module):

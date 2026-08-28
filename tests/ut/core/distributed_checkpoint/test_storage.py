@@ -44,6 +44,7 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(info.relative_path, "_rank0_.safetensors")
         self.assertEqual(info.offset, 0)
         self.assertEqual(info.length, -1)
+        self.assertIsNone(info.tensor_key)
 
     def test_write_result_links_index_and_storage(self):
         """

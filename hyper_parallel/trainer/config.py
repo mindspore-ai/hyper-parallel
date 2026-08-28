@@ -82,6 +82,8 @@ class ModelConfig:
     tp_plan: Optional[dict] = None
     cp_modules: Optional[list] = None
     ep_modules: Optional[list] = None
+    # Visual Encoder local DP/CP overrides for VL models.
+    vision_parallel: Optional[dict] = None
     # Universal transformer architecture overrides.
     num_hidden_layers: Optional[int] = None
     hidden_size: Optional[int] = None
@@ -92,6 +94,42 @@ class ModelConfig:
     max_position_embeddings: Optional[int] = None
     # Free-form per-model overrides handed to ``build_model_fn``.
     config_overrides: Optional[dict] = None
+
+
+def _coerce_vision_parallel_bool(value: Any) -> bool:
+    """Normalize free-form ``model.vision_parallel`` bool fields."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return _string_to_bool(value)
+
+
+def get_vision_parallel_config(model_cfg: ModelConfig) -> Dict[str, Any]:
+    """Return visual Encoder local parallel config from ``model.*``.
+
+    ``model.vision_parallel`` is the preferred schema field. The earlier
+    ``model.config_overrides.vision_parallel`` location remains supported for
+    compatibility with validation configs. Bool-like fields are normalized here
+    so trainer/model code can consume a parsed config instead of re-parsing YAML
+    strings at each use site.
+    """
+    vision_parallel_cfg = getattr(model_cfg, "vision_parallel", None)
+    if isinstance(vision_parallel_cfg, dict):
+        vision_parallel = vision_parallel_cfg
+    else:
+        config_overrides = getattr(model_cfg, "config_overrides", None)
+        vision_parallel = {}
+        if isinstance(config_overrides, dict):
+            legacy_vision_parallel = config_overrides.get("vision_parallel", {})
+            if isinstance(legacy_vision_parallel, dict):
+                vision_parallel = legacy_vision_parallel
+
+    normalized = dict(vision_parallel)
+    for key in ("reuse_dp_shard_mesh", "share_samples_across_dp", "async_cp"):
+        if key in normalized:
+            normalized[key] = _coerce_vision_parallel_bool(normalized[key])
+    return normalized
 
 # ============================================================================
 # data:
@@ -192,6 +230,9 @@ class AcceleratorConfig:
     reshard_after_forward: bool = True
     async_cp: bool = False
     ulysses_degree: Optional[int] = None
+    # Qwen3.5 linear-attention CP execution and local GDN implementation.
+    linear_attention_cp_mode: str = "ulysses"
+    linear_attention_gdn_backend: str = "eager"
     # Bucketed reduce-scatter: single fused RS per FSDP unit, stable fp32
     # reduction order across runs.
     comm_fusion: bool = True
@@ -499,7 +540,10 @@ def _resolve_field_type(cls: Type, dot_path: str) -> Optional[Type]:
         # Unwrap Optional[X] → X
         origin = get_origin(field_type)
         if origin is Union:
-            unwrapped = [a for a in get_args(field_type) if a is not type(None)]
+            unwrapped = [
+                a for a in get_args(field_type)
+                if a is not type(None)  # pylint: disable=unidiomatic-typecheck
+            ]
             field_type = unwrapped[0] if len(unwrapped) == 1 else field_type
         current_cls = field_type
     return current_cls
@@ -627,7 +671,10 @@ def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
         # Unwrap Optional[X] → X
         origin = get_origin(field_type)
         if origin is Union:
-            unwrapped = [a for a in get_args(field_type) if a is not type(None)]
+            unwrapped = [
+                a for a in get_args(field_type)
+                if a is not type(None)  # pylint: disable=unidiomatic-typecheck
+            ]
             if len(unwrapped) == 1:
                 field_type = unwrapped[0]
 

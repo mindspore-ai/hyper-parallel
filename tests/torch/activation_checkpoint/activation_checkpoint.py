@@ -17,17 +17,223 @@ import copy
 import multiprocessing as mp
 import queue
 import traceback
+from typing import Any
 
 import pytest
 import torch
+from torch.utils.checkpoint import DefaultDeviceType
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper, swap_wrapper
+from hyper_parallel.core.activation_checkpoint import (
+    CheckpointPolicy,
+    SwapManager,
+    checkpoint,
+    checkpoint_wrapper,
+    swap_wrapper,
+)
+from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.torch.activation_checkpoint import checkpoint as hyper_checkpoint
 from tests.torch.common_net import SimpleTransformer
 from tests.torch.activation_checkpoint.utils import prepare_data, seed_memory_time_context, set_seed, train_one_mode
 
 
 MEMORY_COMPARISON_MODES = ("none", "recompute", "save", "swap", "group_swap")
 MEMORY_COMPARISON_VOCAB_SIZE = 8192
+platform = get_platform()
+
+
+def _prefire_recompute(handles: list, session_id: Any) -> None:
+    """Run all collected checkpoint frames in one retained session."""
+    with platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+        for handle in handles:
+            platform.recompute_handle(handle, session_id)
+
+
+def _scheduled_dx_dw(
+    output: torch.Tensor,
+    input_tensor: torch.Tensor,
+    weights: tuple,
+    session_id: Any,
+) -> tuple:
+    """Compute separate input and weight gradients from one prefired session."""
+    with platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+        input_grad = torch.autograd.grad(output.sum(), input_tensor, retain_graph=True)[0]
+    with platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=False):
+        weight_grads = torch.autograd.grad(output.sum(), weights)
+    return input_grad, weight_grads
+
+
+def _run_closure_only_npu_rng_case(checkpoint_fn):
+    """Return checkpoint output and gradient when the NPU tensor is captured only by closure."""
+    captured_tensor = torch.ones(4096, device="npu", requires_grad=True)
+    cpu_argument = torch.zeros(1)
+    torch.npu.manual_seed(2026)
+
+    def function(unused_argument: torch.Tensor) -> torch.Tensor:
+        """Run NPU dropout while the device tensor is captured only by closure."""
+        del unused_argument
+        return torch.nn.functional.dropout(captured_tensor, p=0.5, training=True)
+
+    output = checkpoint_fn(function, cpu_argument)
+    output.sum().backward()
+    return output.detach(), captured_tensor.grad.detach()
+
+
+def test_native_npu_rng_for_closure_only_tensor_is_not_restored():
+    """Native checkpoint does not discover an NPU tensor that exists only in a closure."""
+    previous_device_type = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("npu")
+    try:
+        native_output, native_grad = _run_closure_only_npu_rng_case(
+            lambda function, argument: torch_checkpoint(function, argument, use_reentrant=False)
+        )
+    finally:
+        DefaultDeviceType.set_device_type(previous_device_type)
+
+    assert not torch.equal(native_grad, native_output)
+
+
+def test_hyper_npu_rng_for_closure_only_tensor_matches_native():
+    """Hyper should match native RNG behavior when the NPU tensor exists only in a closure."""
+    previous_device_type = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("npu")
+    try:
+        native_output, native_grad = _run_closure_only_npu_rng_case(
+            lambda function, argument: torch_checkpoint(function, argument, use_reentrant=False)
+        )
+        hyper_output, hyper_grad = _run_closure_only_npu_rng_case(hyper_checkpoint)
+    finally:
+        DefaultDeviceType.set_device_type(previous_device_type)
+
+    assert not torch.equal(native_grad, native_output)
+    assert torch.equal(hyper_output, native_output)
+    assert torch.equal(hyper_grad, native_grad)
+
+
+def test_scheduled_recompute_supports_dx_dw_split() -> None:
+    """A prefired recomputation should be shared by separate dx and dw autograd calls."""
+    set_seed(2026)
+    input_tensor = torch.randn(8, 16, device="npu", requires_grad=True)
+    weight = torch.randn(16, 16, device="npu", requires_grad=True)
+    reference_input = input_tensor.detach().clone().requires_grad_()
+    reference_weight = weight.detach().clone().requires_grad_()
+
+    reference_output = torch.nn.functional.gelu(reference_input @ reference_weight)
+    expected_dx, expected_dw = torch.autograd.grad(
+        reference_output.sum(),
+        (reference_input, reference_weight),
+    )
+
+    checkpoint_calls = 0
+
+    def checkpointed_function(current_input: torch.Tensor, current_weight: torch.Tensor) -> torch.Tensor:
+        """Count checkpoint executions while applying a weight-dependent function."""
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return torch.nn.functional.gelu(current_input @ current_weight)
+
+    with platform.recompute_handle_collector_ctx() as handles:
+        output = checkpoint(checkpointed_function, input_tensor, weight)
+
+    assert len(handles) == 1
+    session_id = ("dxdw_split_e2e", id(output))
+    try:
+        _prefire_recompute(handles, session_id)
+        actual_dx, actual_dws = _scheduled_dx_dw(output, input_tensor, (weight,), session_id)
+    finally:
+        platform.clear_recompute_session(session_id)
+
+    assert checkpoint_calls == 2
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(actual_dx, expected_dx)
+    torch.testing.assert_close(actual_dws[0], expected_dw)
+
+
+def test_scheduled_recompute_npu_preserves_rng_state() -> None:
+    """NPU dropout should replay its forward mask without advancing caller RNG state."""
+    set_seed(2030)
+    input_tensor = torch.randn(16, 32, device="npu", requires_grad=True)
+    weight = torch.randn(32, 32, device="npu", requires_grad=True)
+    reference_input = input_tensor.detach().clone().requires_grad_()
+    reference_weight = weight.detach().clone().requires_grad_()
+
+    set_seed(88)
+    reference_output = torch.nn.functional.dropout(
+        torch.nn.functional.gelu(reference_input @ reference_weight),
+        p=0.4,
+        training=True,
+    )
+    expected_dx, expected_dw = torch.autograd.grad(
+        reference_output.sum(),
+        (reference_input, reference_weight),
+    )
+
+    set_seed(88)
+    with platform.recompute_handle_collector_ctx() as handles:
+        output = checkpoint(
+            lambda current_input, current_weight: torch.nn.functional.dropout(
+                torch.nn.functional.gelu(current_input @ current_weight),
+                p=0.4,
+                training=True,
+            ),
+            input_tensor,
+            weight,
+            preserve_rng_state=True,
+        )
+
+    session_id = ("npu_rng", id(output))
+    rng_state_before_prefire = torch.npu.get_rng_state()
+    try:
+        _prefire_recompute(handles, session_id)
+        rng_state_after_prefire = torch.npu.get_rng_state()
+        actual_dx, actual_dws = _scheduled_dx_dw(output, input_tensor, (weight,), session_id)
+    finally:
+        platform.clear_recompute_session(session_id)
+
+    assert torch.equal(rng_state_after_prefire, rng_state_before_prefire)
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(actual_dx, expected_dx)
+    torch.testing.assert_close(actual_dws[0], expected_dw)
+
+
+def test_scheduled_recompute_npu_restores_autocast() -> None:
+    """A prefire outside autocast should restore the NPU forward autocast settings."""
+    set_seed(2031)
+    input_tensor = torch.randn(16, 32, device="npu", requires_grad=True)
+    weight = torch.randn(32, 32, device="npu", requires_grad=True)
+    reference_input = input_tensor.detach().clone().requires_grad_()
+    reference_weight = weight.detach().clone().requires_grad_()
+
+    with torch.autocast(device_type="npu", dtype=torch.bfloat16):
+        reference_output = torch.nn.functional.gelu(reference_input @ reference_weight)
+    expected_dx, expected_dw = torch.autograd.grad(
+        reference_output.float().sum(),
+        (reference_input, reference_weight),
+    )
+    execution_dtypes = []
+
+    def checkpointed_function(current_input: torch.Tensor, current_weight: torch.Tensor) -> torch.Tensor:
+        """Record the matmul dtype used in forward and scheduled replay."""
+        result = current_input @ current_weight
+        execution_dtypes.append(result.dtype)
+        return torch.nn.functional.gelu(result)
+
+    with torch.autocast(device_type="npu", dtype=torch.bfloat16):
+        with platform.recompute_handle_collector_ctx() as handles:
+            output = checkpoint(checkpointed_function, input_tensor, weight)
+
+    session_id = ("npu_autocast", id(output))
+    try:
+        _prefire_recompute(handles, session_id)
+        actual_dx, actual_dws = _scheduled_dx_dw(output.float(), input_tensor, (weight,), session_id)
+    finally:
+        platform.clear_recompute_session(session_id)
+
+    assert execution_dtypes == [torch.bfloat16, torch.bfloat16]
+    assert output.dtype == torch.bfloat16
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(actual_dx, expected_dx, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(actual_dws[0], expected_dw, atol=5e-3, rtol=5e-3)
 
 
 def apply_recompute(model, mode):

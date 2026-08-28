@@ -24,22 +24,36 @@ namespace {
 std::tuple<ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor>
 GenResultTensors(const ms::Tensor &x, int64_t num_iters) {
   const auto &x_shape = x.shape();
-  const int64_t bs = x_shape[0];
-  const int64_t seq_len = x_shape[1];
-  const int64_t n = x_shape[2];
-  const int64_t c = x_shape[3];
+  if (x_shape.size() != 3 && x_shape.size() != 4) {
+    MS_LOG(EXCEPTION) << "For npu_mhc_pre_sinkhorn, x must be 3-D (TNC) or 4-D (BSNC), but got rank "
+                      << x_shape.size() << ".";
+  }
+  const bool is_bsnd = x_shape.size() == 4;
+  const int64_t leading0 = x_shape[0];
+  const int64_t leading1 = is_bsnd ? x_shape[1] : 0;
+  const int64_t n = is_bsnd ? x_shape[2] : x_shape[1];
+  const int64_t c = is_bsnd ? x_shape[3] : x_shape[2];
   const int64_t fusion_size = n * n + 2 * n;
 
-  auto h_in = ms::Tensor(x.data_type(), std::vector<int64_t>{bs, seq_len, c});
-  auto h_post = ms::Tensor(ms::TypeId::kNumberTypeFloat32, std::vector<int64_t>{bs, seq_len, n});
-  auto h_res = ms::Tensor(ms::TypeId::kNumberTypeFloat32, std::vector<int64_t>{bs, seq_len, n * n});
-  auto h_pre_shape = std::vector<int64_t>{bs, seq_len, n};
-  auto hc_before_norm_shape = std::vector<int64_t>{bs, seq_len, fusion_size};
-  auto inv_rms_shape = std::vector<int64_t>{bs, seq_len, 1};
-  auto sum_out_shape = std::vector<int64_t>{2 * num_iters, bs, seq_len, n};
-  auto norm_out_shape =
-    std::vector<int64_t>{2 * num_iters, bs, seq_len, n, n};
-  auto h_pre = ms::Tensor(ms::TypeId::kNumberTypeFloat32, h_pre_shape);
+  const auto h_in_shape = is_bsnd ? std::vector<int64_t>{leading0, leading1, c}
+                                  : std::vector<int64_t>{leading0, c};
+  const auto h_post_shape = is_bsnd ? std::vector<int64_t>{leading0, leading1, n}
+                                    : std::vector<int64_t>{leading0, n};
+  const auto h_res_shape = is_bsnd ? std::vector<int64_t>{leading0, leading1, n * n}
+                                   : std::vector<int64_t>{leading0, n * n};
+  const auto hc_before_norm_shape = is_bsnd ? std::vector<int64_t>{leading0, leading1, fusion_size}
+                                            : std::vector<int64_t>{leading0, fusion_size};
+  const auto inv_rms_shape = is_bsnd ? std::vector<int64_t>{leading0, leading1, 1}
+                                     : std::vector<int64_t>{leading0, 1};
+  const auto sum_out_shape = is_bsnd ? std::vector<int64_t>{2 * num_iters, leading0, leading1, n}
+                                     : std::vector<int64_t>{2 * num_iters, leading0, n};
+  const auto norm_out_shape = is_bsnd ? std::vector<int64_t>{2 * num_iters, leading0, leading1, n, n}
+                                      : std::vector<int64_t>{2 * num_iters, leading0, n, n};
+
+  auto h_in = ms::Tensor(x.data_type(), h_in_shape);
+  auto h_post = ms::Tensor(ms::TypeId::kNumberTypeFloat32, h_post_shape);
+  auto h_res = ms::Tensor(ms::TypeId::kNumberTypeFloat32, h_res_shape);
+  auto h_pre = ms::Tensor(ms::TypeId::kNumberTypeFloat32, h_post_shape);
   auto hc_before_norm = ms::Tensor(ms::TypeId::kNumberTypeFloat32, hc_before_norm_shape);
   auto inv_rms = ms::Tensor(ms::TypeId::kNumberTypeFloat32, inv_rms_shape);
   auto sum_out = ms::Tensor(ms::TypeId::kNumberTypeFloat32, sum_out_shape);

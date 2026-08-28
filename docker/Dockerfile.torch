@@ -1,0 +1,96 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# HyperParallel PyTorch Ascend NPU Environment
+# ============================================
+# Base image:
+#   quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
+#
+# This image configures the PyTorch backend only. It does not include vLLM,
+# Mooncake, ModelScope, Ray, or Triton.
+
+ARG CANN_QUAY_URL="quay.io/ascend/cann"
+ARG CANN_VERSION="9.1.0"
+ARG CANN_ARCH="a3"
+ARG BASE_OS="ubuntu22.04"
+ARG PYTHON_VERSION="3.12"
+FROM ${CANN_QUAY_URL}:${CANN_VERSION}-${CANN_ARCH}-${BASE_OS}-py${PYTHON_VERSION}
+
+ARG CANN_VERSION
+ARG CANN_ARCH
+ARG BASE_OS
+ARG PYTHON_VERSION
+
+LABEL maintainer="jianzhnie"
+LABEL description="HyperParallel PyTorch Ascend NPU environment"
+LABEL version="cann${CANN_VERSION}-${CANN_ARCH}-hyper-parallel-torch"
+
+ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+ARG TORCH_EXTRA="torch29"
+ARG BUILD_MULTICORE_EXTENSION="off"
+ARG BUILD_SHMEM_EXTENSION="off"
+ARG BUILD_CUSTOM_OPS_EXTENSION="off"
+ARG HYPER_PARALLEL_BUILD_STRICT="off"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    ASCEND_HOME_PATH=/usr/local/Ascend/cann \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    BUILD_MULTICORE_EXTENSION=${BUILD_MULTICORE_EXTENSION} \
+    BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION} \
+    BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION} \
+    HYPER_PARALLEL_BUILD_STRICT=${HYPER_PARALLEL_BUILD_STRICT}
+
+ENV PATH=/usr/local/Ascend/cann/bin:/usr/local/Ascend/cann/tools/ccec_compiler/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/Ascend/cann/lib64:/usr/local/Ascend/cann/aarch64-linux/devlib:${LD_LIBRARY_PATH}
+
+WORKDIR /workspace/hyper-parallel
+
+RUN set -eux; \
+    if [ ! -f /usr/local/Ascend/cann/set_env.sh ]; then \
+        if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then \
+            ln -sfn /usr/local/Ascend/ascend-toolkit /usr/local/Ascend/cann; \
+        else \
+            CANN_HOME="$(find /usr/local/Ascend -mindepth 1 -maxdepth 1 -type d -name 'cann-*' \
+                | sort | head -n 1)"; \
+            test -n "${CANN_HOME}"; \
+            ln -sfn "${CANN_HOME}" /usr/local/Ascend/cann; \
+        fi; \
+    fi; \
+    test -f /usr/local/Ascend/cann/set_env.sh; \
+    printf '%s\n' \
+        'if [ -f /usr/local/Ascend/cann/set_env.sh ]; then' \
+        '    . /usr/local/Ascend/cann/set_env.sh' \
+        'fi' \
+        > /etc/profile.d/hyper-parallel-ascend.sh
+
+COPY . /workspace/hyper-parallel
+
+RUN . /usr/local/Ascend/cann/set_env.sh \
+    && python3 -m pip install --upgrade pip setuptools wheel safetensors \
+    && python3 -m pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -e ".[${TORCH_EXTRA}]" \
+        --no-build-isolation
+
+RUN . /usr/local/Ascend/cann/set_env.sh \
+    && python3 -c \
+        "import importlib.metadata as metadata; import hyper_parallel as hp; \
+print('hyper_parallel platform:', hp.get_platform()); \
+print('torch:', metadata.version('torch')); \
+print('torch-npu:', metadata.version('torch-npu')); \
+print('hyper_parallel:', metadata.version('hyper_parallel'))"
+
+CMD ["/bin/bash", "-l"]

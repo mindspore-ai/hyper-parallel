@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "release_baseline": {
+    "cann": "9.1.0",
+    "glibc_policy": "runtime must satisfy the version requirements recorded by the release-built ELF payload",
+    "host_arches": [
+      "aarch64",
+      "x86_64"
+    ],
+    "python_abis": [
+      "cp310",
+      "cp311",
+      "cp312"
+    ],
+    "frameworks": {
+      "mindspore": ">=2.10",
+      "torch": "not pinned by the native build",
+      "torch_npu": "must match the installed torch and CANN 9.1.0",
+      "torch_cxx11_abi": 1
+    }
+  },
+  "local_compatibility": {
+    "cann": [
+      "9.1.0"
+    ]
+  },
+  "components": {
+    "symmetric_memory": {
+      "shmem": {
+        "version": "v1.6.0",
+        "repository": "https://gitcode.com/cann/shmem.git",
+        "tag_object": "da433610e9e04946a58e22fc45e5d71cd6ca8f06",
+        "commit": "aee374a396b389626f68fab74ec8c555e18978a7",
+        "tree": "db970a948ab35ee25086e38d174b19b9985ebe99",
+        "git_archive_tar_sha256": "4e73cb51271c59850de36ce97e8b21d09593620b835b6d258dc9cceb9313fe63",
+        "resolution": "exact annotated tag resolved and verified",
+        "patches": [],
+        "packaging_policy": {
+          "upstream_source_modified": false,
+          "private_sonames": [
+            "libhyper_parallel_shmem.so",
+            "libhyper_parallel_shmem_utils.so"
+          ],
+          "reason": "avoid collision with framework-provided libshmem.so in one process"
+        }
+      }
+    },
+    "multicore": {
+      "shmem_api": "same native SDK contract as symmetric_memory",
+      "ops_nn": {
+        "version": "v9.1.0.pre",
+        "repository": "https://gitcode.com/cann/ops-nn.git",
+        "tag_object": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+        "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+        "tree": "52694bc828b50c83f37781b9d4a378466410f671",
+        "git_archive_tar_sha256": "20e717c1004de51bc2de594509ffde1a2cf84911a20fc8ab610bb4ec508fe14d",
+        "resolution": "exact CANN 9.1.0 pre-release tag; adapter patch is applied only to an isolated build copy",
+        "patches": [
+          {
+            "path": "hyper_parallel/core/multicore/ops/ops-nn.patch",
+            "sha256": "05f1a0363733366ec095277ba706af700dc24bc06ac217bcc81fc293ffc3c02c",
+            "purpose": "expose SwiGLU kernels as inline building blocks, constrain the copied build tree, consume the preverified opbase export without Git metadata, and keep unused package helpers optional"
+          }
+        ],
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+      },
+      "ops_transformer": {
+        "version": "v9.1.0.pre",
+        "repository": "https://gitcode.com/cann/ops-transformer.git",
+        "tag_object": "121f37def44062491173b5ccf34bddb500b95e47",
+        "commit": "121f37def44062491173b5ccf34bddb500b95e47",
+        "tree": "4c0ee7f90a7b91967c3cfb782745a70f92b20fe6",
+        "git_archive_tar_sha256": "00c8751c369b32373a3e77bce7f50efa1e239a1b2994db0cf79e07c85823a30d",
+        "resolution": "exact CANN 9.1.0 pre-release tag; adapter patch is applied only to an isolated build copy",
+        "patches": [
+          {
+            "path": "hyper_parallel/core/multicore/ops/ops-transformer.patch",
+            "sha256": "53341da1cb6d8ca1a0bb3a16deaff8a67a2d01a4525fac8a8e529535330e2d9d",
+            "purpose": "expose the selected grouped-matmul path as an inline building block"
+          }
+        ],
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+      },
+      "cann_cmake": {
+        "version": "master-015",
+        "repository": "https://gitcode.com/cann/cmake.git",
+        "tag_object": "53cfed184b41207a15d32ac6502e39e8d0963036",
+        "commit": "de1ad6f64ba9fb472a9a05a0ef6391d08033893e",
+        "tree": "4de37facab1917d2055ad663875a64cff137a9ad",
+        "git_archive_tar_sha256": "7b3436d3e3617541c8059723bfd96f781604580c2392a6a29a1181bc1d1f4248",
+        "resolution": "exact annotated tag required by the locked ops-nn 9.1 build scripts",
+        "patches": []
+      },
+      "opbase": {
+        "version": "b8bd9e6600eb",
+        "repository": "https://gitcode.com/cann/opbase.git",
+        "fetch_ref": "refs/keep-around/b8bd9e6600eb4fc11d59586bc1712cbc9d87c3ed",
+        "tag_object": null,
+        "commit": "b8bd9e6600eb4fc11d59586bc1712cbc9d87c3ed",
+        "tree": "88d83af7f8aef373033db2dabbe303ec794ec491",
+        "git_archive_tar_sha256": "86d97758f1fc5b79aa8c22ba5b7185b0031e1cdaa120c510dfb92bce8bbe778a",
+        "resolution": "exact commit referenced by the locked ops-nn 9.1 build scripts",
+        "patches": []
+      },
+      "ops_tensor": {
+        "version": "874005153a94",
+        "repository": "https://gitcode.com/cann/ops-tensor.git",
+        "fetch_ref": "refs/keep-around/874005153a94347c3083e408e395f3180b599c5f",
+        "tag_object": null,
+        "commit": "874005153a94347c3083e408e395f3180b599c5f",
+        "tree": "0c9f78e260ee32d1fd8eef3dafca8643421d1c97",
+        "git_archive_tar_sha256": "e65f839a70e41217556f5915f06d0242c03a7d6ba4a5702b2360866d37958b4b",
+        "resolution": "exact commit referenced by the locked ops-nn 9.1 build scripts",
+        "patches": []
+      },
+      "build_archives": {
+        "abseil": {
+          "file": "abseil-cpp-20230802.1.tar.gz",
+          "url": "https://gitcode.com/cann-src-third-party/abseil-cpp/releases/download/20230802.1/abseil-cpp-20230802.1.tar.gz",
+          "sha256": "987ce98f02eefbaf930d6e38ab16aa05737234d7afbab2d5c4ea7adbe50c28ed",
+          "staging": "archive"
+        },
+        "protobuf": {
+          "file": "protobuf-25.1.tar.gz",
+          "url": "https://gitcode.com/cann-src-third-party/protobuf/releases/download/v25.1/protobuf-25.1.tar.gz",
+          "sha256": "9bd87b8280ef720d3240514f884e56a712f2218f0d693b48050c836028940a42",
+          "staging": "archive"
+        },
+        "eigen": {
+          "file": "eigen-3.4.0.tar.gz",
+          "url": "https://gitcode.com/cann-src-third-party/eigen/releases/download/3.4.0/eigen-3.4.0.tar.gz",
+          "sha256": "8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72",
+          "staging": "extract:eigen"
+        },
+        "nlohmann_json": {
+          "file": "nlohmann-json-3.11.3-include.zip",
+          "url": "https://gitcode.com/cann-src-third-party/json/releases/download/v3.11.3/include.zip",
+          "sha256": "a22461d13119ac5c78f205d3df1db13403e58ce1bb1794edc9313677313f4a9d",
+          "staging": "extract:json"
+        },
+        "makeself": {
+          "file": "makeself-release-2.5.0-patch1.tar.gz",
+          "url": "https://gitcode.com/cann-src-third-party/makeself/releases/download/release-2.5.0-patch1.0/makeself-release-2.5.0-patch1.tar.gz",
+          "sha256": "bfa730a5763cdb267904a130e02b2e48e464986909c0733ff1c96495f620369a",
+          "staging": "extract:makeself"
+        }
+      }
+    }
+  },
+  "current_repository_baseline": {
+    "shmem": "v1.6.0",
+    "ops_nn": "v9.1.0.pre",
+    "ops_transformer": "v9.1.0.pre",
+    "cann_cmake": "master-015",
+    "opbase": "b8bd9e6600eb4fc11d59586bc1712cbc9d87c3ed",
+    "ops_tensor": "874005153a94347c3083e408e395f3180b599c5f",
+    "multicore_input": "locked CANN 9.1.0 ops-nn, ops-transformer, cann-cmake, opbase, and ops-tensor source plus verified build archives"
+  }
+}

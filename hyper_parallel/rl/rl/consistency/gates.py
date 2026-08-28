@@ -156,7 +156,9 @@ def validate_pre_update_consistency(
                 "row": row,
                 "trajectory_id": None if trajectory is None else trajectory.trajectory_id,
                 "prompt_id": None if trajectory is None else trajectory.prompt_id,
-                "response_offset": int(mask[row, : column + 1].sum().item()) - 1,
+                "response_offset": int(
+                    mask[row, : column + 1].flatten().sum(dim=0).item()
+                ) - 1,
                 "sequence_position": column + 1,
                 "token_id": int(experience.sequences[row, column + 1].item()),
                 "actor_value": actor_value,
@@ -195,7 +197,62 @@ def validate_pre_update_consistency(
     }
 
 
+def measure_post_update_old_policy_mismatch(
+    experience: Any,
+    actor_log_probs: Any,
+    *,
+    group: Any,
+    group_size: int,
+) -> dict[str, float]:
+    """Count exact-bit changes against rollout logprobs after optimization."""
+    rollout_log_probs = experience.old_log_probs
+    if rollout_log_probs is None:
+        raise ValueError("Post-update negative control requires rollout log-probabilities")
+    if tuple(actor_log_probs.shape) != tuple(rollout_log_probs.shape):
+        raise ValueError(
+            "Post-update log-probability shape mismatch: "
+            f"actor={tuple(actor_log_probs.shape)}, rollout={tuple(rollout_log_probs.shape)}"
+        )
+    if actor_log_probs.dtype != rollout_log_probs.dtype:
+        raise ValueError(
+            "Post-update log-probability dtype mismatch: "
+            f"actor={actor_log_probs.dtype}, rollout={rollout_log_probs.dtype}"
+        )
+    if actor_log_probs.dtype != platform.tensor_dtype.float32:
+        raise ValueError(
+            "Post-update negative control requires FP32 raw log-probabilities, "
+            f"got {actor_log_probs.dtype}"
+        )
+    mask = experience.loss_action_mask.bool()
+    if tuple(mask.shape) != tuple(actor_log_probs.shape):
+        raise ValueError(
+            "Post-update action mask shape mismatch: "
+            f"mask={tuple(mask.shape)}, log_probs={tuple(actor_log_probs.shape)}"
+        )
+    local_tokens = int(mask.flatten().sum(dim=0).item())
+    actor_bits = actor_log_probs.detach().contiguous().view(platform.tensor_dtype.int32)
+    rollout_bits = rollout_log_probs.detach().contiguous().view(platform.tensor_dtype.int32)
+    local_mismatches = int((actor_bits.ne(rollout_bits) & mask).flatten().sum(dim=0).item())
+    records: list[Optional[tuple[int, int]]] = [None] * group_size
+    local_record = (local_tokens, local_mismatches)
+    if group_size == 1:
+        records[0] = local_record
+    else:
+        platform.all_gather_object(records, local_record, group)
+    gathered = [record for record in records if record is not None]
+    token_count = sum(record[0] for record in gathered)
+    mismatch_count = sum(record[1] for record in gathered)
+    if token_count <= 0:
+        raise ValueError("Post-update negative control requires at least one valid action token")
+    return {
+        "training/post_update_old_policy_tokens": float(token_count),
+        "training/post_update_old_policy_mismatch_count": float(mismatch_count),
+        "training/post_update_negative_control_valid": float(mismatch_count > 0),
+    }
+
+
 __all__ = [
+    "measure_post_update_old_policy_mismatch",
     "validate_consistency_forward_inputs",
     "validate_pre_update_consistency",
 ]

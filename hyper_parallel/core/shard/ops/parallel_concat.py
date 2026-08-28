@@ -16,6 +16,7 @@
 Distributed implementation for Concat operator.
 """
 
+import copy
 from typing import Tuple
 
 from .parallel_ops import DistributedOp
@@ -117,4 +118,4 @@ class ConcatDistributedOp(DistributedOp):
                 f"(dim={dim}, normalized_dim={actual_dim}) is not supported."
             )
 
-        return ((base_layout,), None)
+        return ((copy.deepcopy(base_layout),), None)

@@ -23,6 +23,7 @@ from hyper_parallel.models.qwen3_vl_vision.model import (
     Qwen3VLMoeVisionPatchEmbed,
     Qwen3VLMoeVisionPatchMerger,
     Qwen3VLMoeVisionRotaryEmbedding,
+    Qwen3VLMoeVisionSdpaCore,
 )
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "Qwen3VLMoeVisionPatchEmbed",
     "Qwen3VLMoeVisionPatchMerger",
     "Qwen3VLMoeVisionRotaryEmbedding",
+    "Qwen3VLMoeVisionSdpaCore",
 ]

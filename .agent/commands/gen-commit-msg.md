@@ -71,10 +71,10 @@ Infer scope from changed file paths:
 
 **Rules:**
 
-- Subject: imperative mood, ~50-72 chars, no period
-- Body: explain "why" not "what", wrap at 72 chars
+- Subject: imperative mood, **~80 characters**, no period (same as `code-style.md` / `AGENTS.md`; code line width is ~120 — different rule)
+- Body: explain "why" not "what"; keep business-side only
 - Do NOT include AI/IDE attribution (no `Made-with:`, `Co-authored-by:` trailers)
-- Follow `.agent/rules/code-style.md` commit convention
+- Follow `.agent/rules/code-style.md` § Commit Convention
 
 ### Step 5: Preview and Confirm
 

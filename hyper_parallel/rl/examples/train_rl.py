@@ -24,8 +24,8 @@ import yaml
 
 from rl.trainer import SyncTrainer
 
-_DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "qwen3_5_0_8b_gsm8k.yaml"
 
+_OPTIONAL_OVERRIDE_PATHS = frozenset(("rollout.vllm.visible_devices",))
 
 def _parse_override_value(raw_value: str) -> Any:
     """Parse a CLI override value with YAML scalar/list semantics."""
@@ -45,7 +45,7 @@ def _apply_override(config: dict[str, Any], override: str) -> None:
             raise ValueError(f"Unknown configuration override path: {dot_path}")
         current = child
     final_key = keys[-1]
-    if final_key not in current:
+    if final_key not in current and dot_path not in _OPTIONAL_OVERRIDE_PATHS:
         raise ValueError(f"Unknown configuration override path: {dot_path}")
     current[final_key] = _parse_override_value(raw_value)
 
@@ -81,8 +81,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Hyper-Parallel minimal GRPO trainer")
     parser.add_argument(
         "config",
-        nargs="?",
-        default=str(_DEFAULT_CONFIG),
         help="Path to Hyper-RL YAML configuration",
     )
     args, overrides = parser.parse_known_args()

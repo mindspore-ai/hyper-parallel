@@ -39,6 +39,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState, ParamModuleInfo
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, StridedShard
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
@@ -47,7 +48,7 @@ from hyper_parallel.core.fully_shard.utils import (
     DDPMeshInfo,
     CPUOffloadPolicy,
     CommFusionPolicy,
-    TPShardMetaInfo,
+    SourceShardMetaInfo,
 )
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FullyShardParamMode,
@@ -123,6 +124,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         """Create a mock DTensor instance with common settings."""
         mock_dtensor_instance = MagicMock(spec=DTensor)
         mock_dtensor_instance._local_tensor = self.sharded_param_data
+        mock_dtensor_instance.untyped_storage.return_value = sharded_param_data.untyped_storage()
         mock_dtensor_instance.detach.return_value = mock_dtensor_instance
         mock_dtensor_instance.requires_grad_.return_value = mock_dtensor_instance
         mock_dtensor_instance.requires_grad = False
@@ -166,9 +168,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
-    def test_init_sharded_param(self, mock_layout, mock_dtensor_from_local,
-                                mock_sharded_local_tensor):
+    def test_init_sharded_param(self, mock_dtensor_from_local, mock_sharded_local_tensor):
         """Test parameter sharding initialization.
 
         description: Create TorchHSDPParamV2 with mocked Layout/DTensor; check init state.
@@ -176,7 +176,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         feature: fully_shard param init.
 
         Args:
-            mock_layout: Mock for Layout class
             mock_dtensor_from_local: Unused mock parameter
             mock_sharded_local_tensor: Mock for _sharded_local_tensor method
         """
@@ -194,8 +193,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
-    def test_init_sharded_param_below_threshold(self, mock_layout, mock_dtensor_from_local,
+    def test_init_sharded_param_below_threshold(self, mock_dtensor_from_local,
                                                 mock_sharded_local_tensor):
         """Test initialization when parameter size is small.
 
@@ -204,7 +202,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         feature: fully_shard param init (below-threshold Replicate not yet implemented).
 
         Args:
-            mock_layout: Mock for Layout class
             mock_dtensor_from_local: Unused mock parameter
             mock_sharded_local_tensor: Mock for _sharded_local_tensor method
         """
@@ -212,9 +209,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_data = torch.randn(4, 4).to(self.device)
         small_param = torch.nn.Parameter(param_data)
         self._create_mock_dtensor(mock_dtensor_from_local, param_data)
-        mock_layout_instance = MagicMock()
-        mock_layout.from_device_mesh.return_value = mock_layout_instance
-
         param_v2 = self._create_param_v2(param=small_param)
 
         # Current behavior: all params are sharded (below-threshold not yet implemented)
@@ -223,14 +217,11 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
     def test_disable_param_shard_skips_storage_sharding(
-        self, mock_layout, mock_dtensor_from_local, mock_sharded_local_tensor
+        self, mock_dtensor_from_local, mock_sharded_local_tensor
     ):
         """Verify DDPMeshInfo keeps replicate_params unsharded on the explicit mesh."""
         mock_dtensor_from_local.return_value = self.param.detach()
-        mock_layout_instance = MagicMock()
-        mock_layout.from_device_mesh.return_value = mock_layout_instance
         replicate_mesh_info = MagicMock(spec=DDPMeshInfo)
         replicate_mesh_info.mesh = self.mesh_info.mesh
         replicate_mesh_info.shard_mesh_dim = None
@@ -254,9 +245,8 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
     @patch.object(TorchHSDPParamV2, '_get_unsharded_param_data')
-    def test_unshard_and_wait(self, mock_get_unsharded, mock_layout, mock_dtensor_from_local,
+    def test_unshard_and_wait(self, mock_get_unsharded, mock_dtensor_from_local,
                               mock_sharded_local_tensor):
         """Test the unshard and wait_for_unshard process.
 
@@ -266,7 +256,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
         Args:
             mock_get_unsharded: Mock for _get_unsharded_param_data method
-            mock_layout: Mock for Layout class
             mock_dtensor_from_local: Unused mock parameter
             mock_sharded_local_tensor: Mock for _sharded_local_tensor method
         """
@@ -306,9 +295,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
-    def test_state_transitions(self, mock_layout, mock_dtensor_from_local,
-                               mock_sharded_local_tensor):
+    def test_state_transitions(self, mock_dtensor_from_local, mock_sharded_local_tensor):
         """Test parameter state transitions.
 
         description: After unsharded state, call to_sharded(); verify _setattr and free.
@@ -316,7 +303,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         feature: fully_shard param state transition to_sharded.
 
         Args:
-            mock_layout: Mock for Layout class
             mock_dtensor_from_local: Unused mock parameter
             mock_sharded_local_tensor: Mock for _sharded_local_tensor method
         """
@@ -340,9 +326,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
-    def test_reduce_scatter_grad(self, mock_layout, mock_dtensor_from_local,
-                                 mock_sharded_local_tensor):
+    def test_reduce_scatter_grad(self, mock_dtensor_from_local, mock_sharded_local_tensor):
         """Test gradient reduce-scatter operation.
 
         description: Set unsharded grad, call reduce_scatter_grad(async_op=True); mock dist.
@@ -350,7 +334,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         feature: fully_shard param reduce_scatter_grad.
 
         Args:
-            mock_layout: Mock for Layout class
             mock_dtensor_from_local: Unused mock parameter
             mock_sharded_local_tensor: Mock for _sharded_local_tensor method
         """
@@ -378,8 +361,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
-    def test_all_reduce_grad(self, mock_layout, mock_dtensor_from_local, mock_sharded_local_tensor):
+    def test_all_reduce_grad(self, mock_dtensor_from_local, mock_sharded_local_tensor):
         """Test gradient all-reduce operation.
 
         description: Use HSDPMeshInfo and call all_reduce_grad(grad, async_op=True); mock dist.
@@ -387,7 +369,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         feature: fully_shard param all_reduce_grad (HSDP path).
 
         Args:
-            mock_layout: Mock for Layout class
             mock_dtensor_from_local: Unused mock parameter
             mock_sharded_local_tensor: Mock for _sharded_local_tensor method
         """
@@ -427,8 +408,15 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
+    @patch.object(TorchHSDPParamV2, "_update_shardedparam_storage_forcely")
     @patch('hyper_parallel.core.dtensor.layout.Layout')
-    def test_reset_sharded_param(self, mock_layout, mock_dtensor_from_local, mock_sharded_local_tensor):
+    def test_reset_sharded_param(
+        self,
+        mock_layout,
+        mock_update_storage,
+        mock_dtensor_from_local,
+        mock_sharded_local_tensor,
+    ):
         """Test resetting sharded parameters.
 
         description: Create param_v2, call reset_sharded_param(); check _sharded_param_data.
@@ -449,6 +437,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2.reset_sharded_param()
         # Verify reset operation
         self.assertTrue(torch.all(param_v2._sharded_param_data == sharded_param_data.view(-1)))
+        mock_update_storage.assert_called_once_with()
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
@@ -548,15 +537,17 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         dp_mesh = MagicMock(spec=DeviceMesh)
         dp_mesh.ndim = 1
         orig_mesh = MagicMock(spec=DeviceMesh)
+        orig_mesh.mesh_dim_names = ("tp",)
         unified_mesh = MagicMock(spec=DeviceMesh)
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)
         param_v2.mesh_info.mesh = dp_mesh
-        param_v2.tp_grad_info = TPShardMetaInfo(
+        param_v2.source_shard_info = SourceShardMetaInfo(
             orig_mesh,
             (Replicate(),),
             origin_is_dtensor=True,
         )
+        param_v2._storage_source_layout = param_v2._build_storage_source_layout()
 
         with patch.object(DeviceMesh, "concatenate", return_value=unified_mesh) as mock_concatenate:
             placements = TorchHSDPParamV2._get_base_spmd_placements(param_v2)
@@ -574,8 +565,9 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)
         param_v2.mesh_info.mesh = dp_mesh
-        param_v2.tp_grad_info = TPShardMetaInfo(tp_mesh, (Shard(1),), origin_is_dtensor=False)
+        param_v2.source_shard_info = SourceShardMetaInfo(tp_mesh, (Shard(1),), origin_is_dtensor=False)
         param_v2._orig_param_is_dtensor = False
+        param_v2._storage_source_layout = param_v2._build_storage_source_layout()
 
         with patch.object(DeviceMesh, "concatenate", return_value=unified_mesh) as mock_concatenate:
             placements = TorchHSDPParamV2._get_base_spmd_placements(param_v2)
@@ -583,6 +575,80 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         mock_concatenate.assert_called_once_with([dp_mesh, tp_mesh])
         self.assertIs(param_v2._spmd_mesh, unified_mesh)
         self.assertEqual(placements, (Replicate(), Shard(1)))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
+    def test_storage_source_layout_filters_native_dtensor_fsdp_axes(self, mock_get_rank):
+        """Storage composition should exclude FSDP-owned axes without mutating compute metadata."""
+        # World layout (dp, cp, tp) with rank 0 at coordinate (0, 0, 0). The
+        # FSDP domain flattens and renames (dp, cp), so only rank topology —
+        # not dimension names — can prove the axes redundant.
+        source_mesh = DeviceMesh(
+            "cpu",
+            [[[0, 1], [2, 3]], [[4, 5], [6, 7]]],
+            mesh_dim_names=("dp", "cp", "tp"),
+            _init_backend=False,
+        )
+        fsdp_mesh = DeviceMesh(
+            "cpu",
+            [[0, 2], [4, 6]],
+            mesh_dim_names=("fsdp_replicate", "fsdp_shard"),
+            _init_backend=False,
+        )
+        source_placements = (Replicate(), Replicate(), Shard(0))
+        source_shard_info = SourceShardMetaInfo(
+            source_mesh,
+            source_placements,
+            origin_is_dtensor=True,
+        )
+        param_v2 = object.__new__(TorchHSDPParamV2)
+        param_v2.source_shard_info = source_shard_info
+        param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)
+        param_v2.mesh_info.mesh = fsdp_mesh
+
+        storage_mesh, storage_placements = param_v2._build_storage_source_layout()
+
+        self.assertEqual(storage_mesh.mesh_dim_names, ("tp",))
+        self.assertEqual(storage_placements, (Shard(0),))
+        self.assertIs(source_shard_info.mesh, source_mesh)
+        self.assertEqual(source_shard_info.placements, source_placements)
+        mock_get_rank.assert_called()
+
+    def test_storage_source_layout_keeps_full_layout_without_rank_topology(self):
+        """Topology-only meshes cannot prove redundancy, so no axis is filtered."""
+        source_mesh = MagicMock(spec=DeviceMesh)
+        source_mesh.mesh_dim_names = ("dp", "cp", "tp")
+        source_placements = (Replicate(), Replicate(), Shard(0))
+        param_v2 = object.__new__(TorchHSDPParamV2)
+        param_v2.source_shard_info = SourceShardMetaInfo(
+            source_mesh,
+            source_placements,
+            origin_is_dtensor=True,
+        )
+        param_v2.mesh_info = MagicMock(spec=FSDPMeshInfo)  # .mesh is a mock, not a tensor
+
+        storage_mesh, storage_placements = param_v2._build_storage_source_layout()
+
+        self.assertIs(storage_mesh, source_mesh)
+        self.assertEqual(storage_placements, source_placements)
+        source_mesh.__getitem__.assert_not_called()
+
+    def test_storage_source_layout_preserves_plain_parameter_metadata(self):
+        """Production plain-parameter metadata must not be filtered by DTensor compatibility logic."""
+        source_mesh = MagicMock(spec=DeviceMesh)
+        source_mesh.mesh_dim_names = ("dp", "tp")
+        source_placements = (Replicate(), Shard(0))
+        param_v2 = object.__new__(TorchHSDPParamV2)
+        param_v2.source_shard_info = SourceShardMetaInfo(
+            source_mesh,
+            source_placements,
+            origin_is_dtensor=False,
+        )
+
+        storage_mesh, storage_placements = param_v2._build_storage_source_layout()
+
+        self.assertIs(storage_mesh, source_mesh)
+        self.assertEqual(storage_placements, source_placements)
+        source_mesh.__getitem__.assert_not_called()
 
     def test_unsharded_grad_data_returns_plain_tensor_grad(self):
         """Verify gradient communication consumes the ordinary Tensor attached by Hyper autograd."""
@@ -660,7 +726,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2.shard_world_size = 2
         param_v2.hsdp_placement = Shard(1)
         param_v2._orig_size = grad.shape
-        param_v2.tp_grad_info = TPShardMetaInfo(
+        param_v2.source_shard_info = SourceShardMetaInfo(
             MagicMock(),
             (Shard(1),),
             origin_is_dtensor=True,
@@ -718,6 +784,19 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state.raw_replicate_params = set()
         target_parameter = object() if parameter is None else parameter
         return TorchHSDPStateV2._build_param_mesh_info(state, target_parameter)
+
+    def test_native_dtensor_requires_state_metadata(self):
+        """TorchHSDPParamV2 should reject native DTensor input without owning-state metadata."""
+        mesh = MagicMock(spec=DeviceMesh)
+        parameter = self._build_fake_dtensor(mesh, (Replicate(),))
+
+        with self.assertRaisesRegex(ValueError, "origin_is_dtensor"):
+            TorchHSDPParamV2(
+                param=parameter,
+                module_info=MagicMock(),
+                mesh_info=MagicMock(),
+                device=torch.device("cpu"),
+            )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
     def test_device_mesh_concatenate_concatenates_explicit_dp_and_tp_meshes(self, mock_get_rank):
@@ -922,8 +1001,8 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
     @patch("hyper_parallel.platform.torch.fully_shard.state.TorchHSDPParamV2")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
-    def test_state_builds_mesh_info_per_parameter(self, mock_get_rank, mock_hsdp_param_cls):
-        """Verify all managed parameters share one list and receive parameter-specific mesh info."""
+    def test_state_builds_param_metadata_per_parameter(self, mock_get_rank, mock_hsdp_param_cls):
+        """Verify managed parameters receive parameter-specific DP and source-layout metadata."""
         mesh = DeviceMesh(
             "cpu",
             np.array([0, 1]),
@@ -947,7 +1026,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         mock_instance = MagicMock()
         mock_instance._orig_param_is_dtensor = False
-        mock_instance.tp_grad_info = None
+        mock_instance.source_shard_info = None
         mock_instance.sharded_param.requires_grad = True
         mock_hsdp_param_cls.return_value = mock_instance
 
@@ -969,19 +1048,28 @@ class TestFullyShardMeshUtils(unittest.TestCase):
                 set(),
                 {module.local_weight},
                 MagicMock(),
+                HSDPSchedulerContext(),
                 torch.device("cpu"),
             )
 
         passed_mesh_infos = [call.args[2] for call in mock_hsdp_param_cls.call_args_list]
+        passed_source_shard_infos = [
+            call.kwargs["source_shard_info"] for call in mock_hsdp_param_cls.call_args_list
+        ]
         self.assertEqual(state.hsdp_params, [mock_instance, mock_instance])
         self.assertIsInstance(passed_mesh_infos[0], DDPMeshInfo)
         self.assertIs(passed_mesh_infos[0].mesh, mesh)
         self.assertIsInstance(passed_mesh_infos[1], FSDPMeshInfo)
         self.assertIs(passed_mesh_infos[1].mesh, mesh)
+        self.assertIsNone(passed_source_shard_infos[0])
+        self.assertIsInstance(passed_source_shard_infos[1], SourceShardMetaInfo)
+        self.assertIs(passed_source_shard_infos[1].mesh, mesh)
+        self.assertEqual(passed_source_shard_infos[1].placements, (Replicate(),))
+        self.assertTrue(passed_source_shard_infos[1].origin_is_dtensor)
 
     @patch("hyper_parallel.platform.torch.fully_shard.state.TorchHSDPParamV2")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
-    def test_state_passes_tp_grad_info_to_each_parameter(self, mock_get_rank, mock_hsdp_param_cls):
+    def test_state_passes_source_shard_info_to_each_parameter(self, mock_get_rank, mock_hsdp_param_cls):
         """The state should pass parameter-identity metadata into each Torch wrapper."""
         mesh = DeviceMesh(
             "cpu",
@@ -992,9 +1080,9 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         module = nn.Module()
         parameter = nn.Parameter(torch.randn(4, 4))
         module.register_parameter("weight", parameter)
-        metadata = TPShardMetaInfo(mesh, (Replicate(),))
+        metadata = SourceShardMetaInfo(mesh, (Replicate(),))
         mock_instance = MagicMock()
-        mock_instance.tp_grad_info = metadata
+        mock_instance.source_shard_info = metadata
         mock_instance.sharded_param.requires_grad = True
         mock_hsdp_param_cls.return_value = mock_instance
 
@@ -1006,7 +1094,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
                     "hyper_parallel.platform.torch.fully_shard.state._get_param_module_infos",
                     return_value=[MagicMock()],
                 ):
-            TorchHSDPStateV2(
+            state = TorchHSDPStateV2(
                 (module,),
                 mesh,
                 None,
@@ -1016,11 +1104,13 @@ class TestFullyShardMeshUtils(unittest.TestCase):
                 set(),
                 set(),
                 MagicMock(),
+                HSDPSchedulerContext(),
                 torch.device("cpu"),
-                tp_grad_infos={parameter: metadata},
+                source_shard_infos={parameter: metadata},
             )
 
-        self.assertIs(mock_hsdp_param_cls.call_args.kwargs["tp_grad_info"], metadata)
+        self.assertIs(mock_hsdp_param_cls.call_args.kwargs["source_shard_info"], metadata)
+        self.assertEqual(state.reduce_op_type, torch.distributed.ReduceOp.AVG)
 
     @patch("hyper_parallel.platform.torch.fully_shard.state.DDPMeshInfo")
     def test_replicate_param_flattens_2d_mesh_for_ddp(self, mock_ddp_mesh_info):
@@ -1040,46 +1130,6 @@ class TestFullyShardMeshUtils(unittest.TestCase):
             replicate_mesh_dim=0,
         )
         self.assertIs(result, mock_ddp_mesh_info.return_value)
-
-    def test_state_resolves_default_reduce_op_per_state(self):
-        """Verify default gradient reduction op is chosen once for the whole fully_shard state."""
-        state = object.__new__(TorchHSDPStateV2)
-        local_param = MagicMock()
-        local_param.tp_grad_info = None
-        dtensor_param = MagicMock()
-        dtensor_param.tp_grad_info = TPShardMetaInfo(MagicMock(), (Shard(0),), origin_is_dtensor=True)
-
-        state.hsdp_params = [local_param]
-        self.assertEqual(
-            TorchHSDPStateV2._resolve_default_reduce_op(state),
-            torch.distributed.ReduceOp.AVG,
-        )
-
-        state.hsdp_params = [local_param, dtensor_param]
-        self.assertEqual(
-            TorchHSDPStateV2._resolve_default_reduce_op(state),
-            torch.distributed.ReduceOp.AVG,
-        )
-
-        state.hsdp_params = [dtensor_param]
-        self.assertEqual(
-            TorchHSDPStateV2._resolve_default_reduce_op(state),
-            torch.distributed.ReduceOp.SUM,
-        )
-
-    def test_state_resolves_sum_for_plain_parameters_with_tp_metadata(self):
-        """Dual-mode metadata should select SUM independently of parameter tensor type."""
-        state = object.__new__(TorchHSDPStateV2)
-        first = MagicMock()
-        second = MagicMock()
-        first.tp_grad_info = TPShardMetaInfo(MagicMock(), (Shard(0),))
-        second.tp_grad_info = TPShardMetaInfo(MagicMock(), (Replicate(),))
-        state.hsdp_params = [first, second]
-
-        self.assertEqual(
-            TorchHSDPStateV2._resolve_default_reduce_op(state),
-            torch.distributed.ReduceOp.SUM,
-        )
 
     def test_state_init_mp_dtypes_initializes_replicate_params_independently(self):
         """Verify _init_mp_dtypes leaves dtype ownership with each managed parameter."""
@@ -1155,7 +1205,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         mock_instance = MagicMock()
         mock_instance._orig_param_is_dtensor = False
-        mock_instance.tp_grad_info = None
+        mock_instance.source_shard_info = None
         mock_instance.sharded_param.requires_grad = True
         mock_hsdp_param_cls.return_value = mock_instance
 
@@ -1176,6 +1226,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
                 {ignore_param},
                 set(),
                 MagicMock(),
+                HSDPSchedulerContext(),
                 torch.device("cpu"),
             )
 
@@ -1207,7 +1258,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         mock_instance = MagicMock()
         mock_instance._orig_param_is_dtensor = False
-        mock_instance.tp_grad_info = None
+        mock_instance.source_shard_info = None
         mock_instance.sharded_param.requires_grad = True
         mock_hsdp_param_cls.return_value = mock_instance
 
@@ -1228,6 +1279,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
                 set(),
                 set(),
                 MagicMock(),
+                HSDPSchedulerContext(),
                 torch.device("cpu"),
             )
 

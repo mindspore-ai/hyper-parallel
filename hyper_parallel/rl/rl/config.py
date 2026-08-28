@@ -14,10 +14,12 @@
 # ============================================================================
 """Validate Hyper-RL configuration and adapt it to Hyper-Parallel."""
 
+from copy import deepcopy
 import json
+import math
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from rl.agentic.registry import ENVIRONMENTS
 from rl.algorithm.loss import RLAlgorithm
@@ -32,16 +34,15 @@ from rl.roles.rollout import ROLLOUT_ENGINES
 
 from hyper_parallel import get_platform
 from hyper_parallel.platform.platform import PlatformType
-from hyper_models._transformers import HyperAutoModelForCausalLM
-from hyper_models.components.checkpoint.config import CheckpointingConfig
-from hyper_models.components.distributed.config import (
-    CPUOffloadPolicy,
+from hyper_parallel.auto_models._transformers import HyperAutoModelForCausalLM
+from hyper_parallel.auto_models.components.checkpoint.config import CheckpointingConfig
+from hyper_parallel.auto_models.components.distributed.config import (
     FSDP2Config,
-    MixedPrecisionPolicy,
+    FSDP2MixedPrecisionConfig,
 )
-from hyper_models.components.optim.lr_scheduler import MultiLRScheduler
-from hyper_models.components.optim.optimizer import AdamW
-from hyper_models.trainer.config import (
+from hyper_parallel.auto_models.components.optim.lr_scheduler import MultiLRScheduler
+from hyper_parallel.auto_models.components.optim.optimizer import AdamW
+from hyper_parallel.auto_models.trainer.config import (
     AcceleratorConfig,
     ActivationCheckpointConfig,
     MixedPrecisionConfig,
@@ -50,6 +51,8 @@ from hyper_models.trainer.config import (
     TrainingConfig,
 )
 platform = get_platform()
+_HCCL_MIN_PORT = 1024
+_HCCL_MAX_PORT = 65520
 _EXPECTED_TOP_LEVEL = frozenset(
     (
         "model",
@@ -63,23 +66,31 @@ _EXPECTED_TOP_LEVEL = frozenset(
         "consistency",
     )
 )
+
+
 def required_mapping(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     """Return one required mapping-valued configuration section."""
     value = config.get(name)
     if not isinstance(value, Mapping):
         raise ValueError(f"Configuration section '{name}' must be a mapping")
     return value
+
+
 def optional_mapping(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     """Return one optional mapping-valued configuration section."""
     value = config.get(name, {})
     if not isinstance(value, Mapping):
         raise ValueError(f"Configuration section '{name}' must be a mapping")
     return value
+
+
 def _path_value(section: Mapping[str, Any], name: str) -> str:
     value = section.get(name)
     if not isinstance(value, str) or not value:
         raise ValueError(f"Configuration field '{name}' must be a non-empty path string")
     return value
+
+
 def uses_colocated_vllm(config: Mapping[str, Any]) -> bool:
     """Return whether rollout shares each trainer rank's NPU."""
     rollout = config.get("rollout", {})
@@ -87,6 +98,8 @@ def uses_colocated_vllm(config: Mapping[str, Any]) -> bool:
         return False
     vllm = rollout.get("vllm", {})
     return isinstance(vllm, Mapping) and vllm.get("deployment", "disjoint") == "colocated"
+
+
 def _validate_model_and_data_paths(
     model: Mapping[str, Any],
     data: Mapping[str, Any],
@@ -109,6 +122,8 @@ def _validate_model_and_data_paths(
         test_path = Path(_path_value(data, "test_path"))
         if not test_path.is_file():
             raise ValueError(f"Evaluation parquet file does not exist: {test_path}")
+
+
 def _validate_training_sizes(
     train: Mapping[str, Any],
     rollout: Mapping[str, Any],
@@ -141,6 +156,8 @@ def _validate_training_sizes(
         )
     if int(rollout.get("max_new_tokens", 0)) <= 0:
         raise ValueError("rollout.max_new_tokens must be positive")
+    if not isinstance(rollout.get("ignore_eos", False), bool):
+        raise ValueError("rollout.ignore_eos must be a boolean")
     if int(data.get("max_prompt_length", 0)) <= 0:
         raise ValueError("data.max_prompt_length must be positive")
     if int(train.get("policy_update_epochs", 0)) <= 0:
@@ -150,10 +167,14 @@ def _validate_training_sizes(
         raise ValueError("train.learning_gate must be a mapping")
     if float(gate.get("min_gradient_norm", 0.0)) < 0:
         raise ValueError("train.learning_gate.min_gradient_norm must be non-negative")
+
+
 def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
     """Validate optional evaluation limits."""
     if not bool(evaluation.get("enabled", True)):
         return
+    if not isinstance(evaluation.get("ignore_eos", False), bool):
+        raise ValueError("evaluation.ignore_eos must be a boolean")
     for field in ("batch_size", "max_new_tokens"):
         if int(evaluation.get(field, 0)) <= 0:
             raise ValueError(f"evaluation.{field} must be positive")
@@ -163,25 +184,97 @@ def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
     for field in ("log_samples", "progress_steps"):
         if int(evaluation.get(field, 0)) < 0:
             raise ValueError(f"evaluation.{field} must be non-negative")
-def _validate_vllm_basics(vllm: Mapping[str, Any]) -> tuple[str, int]:
+
+
+def _parallel_size(vllm: Mapping[str, Any], field: str) -> int:
+    """Return one strictly positive vLLM parallel size."""
+    value = vllm.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"rollout.vllm.{field} must be a positive integer")
+    return value
+
+
+def _trainer_topology(accelerator: Mapping[str, Any]) -> dict[str, int]:
+    """Return the validated Trainer topology used by Hyper-RL orchestration."""
+    topology = {
+        "dp_replicate": int(accelerator.get("dp_replicate", 1)),
+        "dp_shard": int(accelerator.get("dp_shard", 0)),
+        "tp": int(accelerator.get("tp", 1)),
+        "cp": int(accelerator.get("cp", 1)),
+        "pp": int(accelerator.get("pp", 1)),
+    }
+    non_positive = {name: size for name, size in topology.items() if size <= 0}
+    if non_positive:
+        raise ValueError(
+            "Trainer parallel sizes must be positive integers, "
+            f"got {non_positive}"
+        )
+    unsupported = {
+        name: size
+        for name, size in topology.items()
+        if (name == "dp_replicate" and size != 1)
+        or (name == "tp" and size not in (1, 2))
+        or (name in ("cp", "pp") and size != 1)
+    }
+    if unsupported:
+        raise ValueError(
+            "Hyper-RL Trainer currently supports dp_replicate=1, TP1/TP2, "
+            f"and CP=PP=1; invalid topology={unsupported}"
+        )
+    return topology
+
+
+def _trainer_world_size(accelerator: Mapping[str, Any]) -> int:
+    """Return the physical process count for one supported Trainer topology."""
+    topology = _trainer_topology(accelerator)
+    return math.prod(topology.values())
+
+
+def _trainer_data_parallel_size(accelerator: Mapping[str, Any]) -> int:
+    """Return the logical Trainer data-parallel degree excluding model axes."""
+    topology = _trainer_topology(accelerator)
+    return topology["dp_replicate"] * topology["dp_shard"]
+
+
+def _validate_vllm_port(vllm: Mapping[str, Any]) -> int:
+    """Return the explicit port shared by all rollout clients."""
+    port = vllm.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 < port <= 65535:
+        raise ValueError(
+            "Shared rollout requires rollout.vllm.port to be an explicit integer between 1 and 65535"
+        )
+    return port
+
+
+def _reject_removed_vllm_topology(vllm: Mapping[str, Any]) -> None:
+    """Reject the removed user-facing rollout topology switch."""
+    if "topology" in vllm:
+        raise ValueError(
+            "rollout.vllm.topology was removed; configure deployment, "
+            "data_parallel_size, and tensor_parallel_size instead"
+        )
+
+
+def _validate_vllm_basics(vllm: Mapping[str, Any]) -> tuple[str, int, int]:
     """Validate settings shared by colocated and disjoint vLLM."""
+    _reject_removed_vllm_topology(vllm)
     deployment = str(vllm.get("deployment", "disjoint"))
     if deployment not in ("disjoint", "colocated"):
         raise ValueError(
             "rollout.vllm.deployment must be 'disjoint' or 'colocated', "
             f"got {deployment!r}"
         )
-    rollout_tp = int(vllm.get("tensor_parallel_size", 1))
-    if rollout_tp <= 0:
-        raise ValueError("rollout.vllm.tensor_parallel_size must be positive")
+    rollout_dp = _parallel_size(vllm, "data_parallel_size")
+    rollout_tp = _parallel_size(vllm, "tensor_parallel_size")
     if str(vllm.get("dtype", "bfloat16")) not in ("bfloat16", "bf16"):
         raise ValueError("The Qwen vLLM rollout path requires bfloat16")
     if str(vllm.get("host", "127.0.0.1")) not in ("127.0.0.1", "localhost"):
         raise ValueError("The external vLLM server must bind to loopback")
+    _validate_vllm_port(vllm)
     utilization = float(vllm.get("gpu_memory_utilization", 0.9))
     if not 0 < utilization < 1:
         raise ValueError("rollout.vllm.gpu_memory_utilization must be between 0 and 1")
-    return deployment, rollout_tp
+    return deployment, rollout_dp, rollout_tp
 
 
 def _validate_colocated_vllm(
@@ -190,13 +283,16 @@ def _validate_colocated_vllm(
     rollout_tp: int,
 ) -> None:
     """Validate colocated rollout topology and residency requirements."""
-    if rollout_tp != 1:
-        raise ValueError("The initial colocated rollout path supports tensor_parallel_size=1")
-    dp_shard = int(accelerator.get("dp_shard", 1))
-    if dp_shard <= 1:
+    trainer_world_size = _trainer_world_size(accelerator)
+    if trainer_world_size <= 1:
         raise ValueError(
-            "Colocated rollout requires multi-rank FSDP with "
-            "train.accelerator.dp_shard > 1"
+            "Colocated rollout requires a multi-rank Trainer topology"
+        )
+    if rollout_tp > trainer_world_size or trainer_world_size % rollout_tp != 0:
+        raise ValueError(
+            "Colocated rollout requires the Trainer world size divisible by "
+            "rollout.vllm.tensor_parallel_size: "
+            f"trainer_world_size={trainer_world_size}, rollout_tp={rollout_tp}"
         )
     if not bool(accelerator.get("cpu_offload", False)):
         raise ValueError("Colocated rollout requires train.accelerator.cpu_offload=true")
@@ -204,16 +300,19 @@ def _validate_colocated_vllm(
         raise ValueError(
             "Colocated rollout requires train.accelerator.reshard_after_forward=true"
         )
-    if vllm.get("visible_devices") is not None:
+    if "visible_devices" in vllm:
         raise ValueError(
-            "Colocated rollout derives one physical NPU from each trainer rank; "
+            "Colocated rollout derives its physical NPUs from the Trainer; "
             "remove rollout.vllm.visible_devices"
         )
-    base_port = vllm.get("port")
-    if base_port is None:
-        raise ValueError("Colocated rollout requires an explicit rollout.vllm.port base")
-    if int(base_port) <= 0 or int(base_port) + dp_shard - 1 > 65535:
-        raise ValueError("rollout.vllm.port range exceeds valid TCP ports")
+    _validate_vllm_port(vllm)
+    rollout_dp = _parallel_size(vllm, "data_parallel_size")
+    if rollout_dp * rollout_tp != trainer_world_size:
+        raise ValueError(
+            "Colocated rollout devices must match the Trainer world: "
+            f"data_parallel_size={rollout_dp}, tensor_parallel_size={rollout_tp}, "
+            f"trainer_world_size={trainer_world_size}"
+        )
 
 
 def _training_device_id() -> str:
@@ -237,32 +336,54 @@ def _validate_disjoint_vllm(
     rollout_tp: int,
 ) -> None:
     """Validate disjoint trainer and rollout device ownership."""
-    if int(accelerator.get("dp_shard", 1)) != 1:
-        raise ValueError(
-            "The external vLLM HCCL refitter currently supports "
-            "train.accelerator.dp_shard=1"
-        )
+    trainer_count = _trainer_world_size(accelerator)
+    rollout_dp = _parallel_size(vllm, "data_parallel_size")
+    _validate_vllm_port(vllm)
     visible_devices = vllm.get("visible_devices")
     if visible_devices is None:
         raise ValueError("rollout.vllm.visible_devices must select the external server NPUs")
     device_ids = [device.strip() for device in str(visible_devices).split(",")]
-    if not all(device_ids) or len(device_ids) < rollout_tp:
+    expected_devices = rollout_dp * rollout_tp
+    if not all(device_ids) or len(device_ids) != expected_devices:
         raise ValueError(
-            "rollout.vllm.visible_devices must contain at least one device ID per TP rank"
+            "Disjoint rollout requires data_parallel_size * tensor_parallel_size devices: "
+            f"expected {expected_devices} rollout devices, "
+            f"got {device_ids}"
         )
-    training_device = _training_device_id()
-    if training_device in device_ids:
+    if len(set(device_ids)) != len(device_ids):
+        raise ValueError(f"Disjoint rollout devices must be unique, got {device_ids}")
+    training_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if training_devices is None:
+        trainer_device_ids = [_training_device_id()]
+    else:
+        trainer_device_ids = [
+            device.strip() for device in training_devices.split(",")[:trainer_count]
+        ]
+    overlap = sorted(set(trainer_device_ids) & set(device_ids))
+    if overlap:
         raise ValueError(
             "The external vLLM server must use NPUs disjoint from the trainer: "
-            f"training_device={training_device}, rollout_devices={device_ids}"
+            f"training_devices={trainer_device_ids}, rollout_devices={device_ids}, "
+            f"overlap={overlap}"
         )
 
 
 def _validate_vllm_limits(vllm: Mapping[str, Any]) -> None:
     """Validate optional vLLM concurrency and capacity limits."""
     normalize_model_implementation(vllm.get("model_implementation", "native"))
-    if int(vllm.get("request_concurrency", 1)) <= 0:
-        raise ValueError("rollout.vllm.request_concurrency must be positive")
+    if "request_concurrency" in vllm:
+        raise ValueError(
+            "rollout.vllm.request_concurrency was replaced by automatic child admission "
+            "derived from max_num_seqs"
+        )
+    if "api_server_count" in vllm:
+        raise ValueError(
+            "rollout.vllm.api_server_count is controlled by vLLM upstream and must be removed"
+        )
+    if "max_num_seqs" not in vllm:
+        raise ValueError(
+            "rollout.vllm.max_num_seqs is required for automatic child admission"
+        )
     for field in (
         "kv_cache_memory_bytes",
         "max_model_len",
@@ -271,6 +392,127 @@ def _validate_vllm_limits(vllm: Mapping[str, Any]) -> None:
     ):
         if field in vllm and int(vllm[field]) <= 0:
             raise ValueError(f"rollout.vllm.{field} must be positive")
+    if (
+        vllm.get("max_num_seqs") is not None
+        and vllm.get("max_num_batched_tokens") is not None
+        and int(vllm["max_num_seqs"]) > int(vllm["max_num_batched_tokens"])
+    ):
+        raise ValueError(
+            "rollout.vllm.max_num_seqs cannot exceed max_num_batched_tokens"
+        )
+    server_hccl_base_port = vllm.get("server_hccl_if_base_port")
+    server_hccl_port_range = vllm.get("server_hccl_npu_socket_port_range")
+    if server_hccl_base_port is None and server_hccl_port_range is None:
+        return
+    if server_hccl_base_port is None or server_hccl_port_range is None:
+        raise ValueError(
+            "rollout.vllm.server_hccl_if_base_port and "
+            "server_hccl_npu_socket_port_range must be configured together"
+        )
+    if (
+        not isinstance(server_hccl_base_port, int)
+        or isinstance(server_hccl_base_port, bool)
+        or not _HCCL_MIN_PORT <= server_hccl_base_port <= _HCCL_MAX_PORT
+    ):
+        raise ValueError(
+            "rollout.vllm.server_hccl_if_base_port must be an integer in "
+            f"[{_HCCL_MIN_PORT}, {_HCCL_MAX_PORT}]"
+        )
+    try:
+        range_start_text, range_end_text = str(server_hccl_port_range).split("-", maxsplit=1)
+        range_start = int(range_start_text)
+        range_end = int(range_end_text)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "rollout.vllm.server_hccl_npu_socket_port_range must use START-END"
+        ) from error
+    if not (
+        _HCCL_MIN_PORT
+        <= range_start
+        <= server_hccl_base_port
+        <= range_end
+        <= _HCCL_MAX_PORT
+    ):
+        raise ValueError(
+            "rollout.vllm server HCCL socket ports must be in "
+            f"[{_HCCL_MIN_PORT}, {_HCCL_MAX_PORT}] and contain the base port"
+        )
+
+
+def _validate_vllm_weight_sync(
+    vllm: Mapping[str, Any],
+    deployment: str,
+    rollout_model: VLLMModelRegistration,
+    accelerator: Mapping[str, Any],
+) -> None:
+    """Validate full-weight DP sync and TP-aware direct-reshard recovery."""
+    weight_sync = optional_mapping(vllm, "weight_sync")
+    strategy = str(weight_sync.get("strategy", "direct_reshard"))
+    if strategy not in ("direct_reshard", "full_gather"):
+        raise ValueError(
+            "rollout.vllm.weight_sync.strategy must be 'direct_reshard' or "
+            "'full_gather', "
+            f"got {strategy!r}"
+        )
+    fallback_strategy = str(
+        weight_sync.get(
+            "fallback_strategy",
+            "full_gather" if strategy == "direct_reshard" else "none",
+        )
+    )
+    if fallback_strategy not in ("full_gather", "none"):
+        raise ValueError(
+            "rollout.vllm.weight_sync.fallback_strategy must be 'full_gather' "
+            f"or 'none', got {fallback_strategy!r}"
+        )
+    bucket_size_mb = int(weight_sync.get("bucket_size_mb", 128))
+    if bucket_size_mb <= 0:
+        raise ValueError("rollout.vllm.weight_sync.bucket_size_mb must be positive")
+    if deployment not in ("colocated", "disjoint"):
+        raise ValueError(f"Unsupported direct-reshard deployment: {deployment!r}")
+    rollout_tp = int(vllm.get("tensor_parallel_size", 1))
+    effective_strategy = "full_gather" if rollout_tp == 1 else strategy
+    if effective_strategy == "direct_reshard" and rollout_model.family != "qwen3":
+        raise ValueError(
+            "Direct reshard currently supports Qwen3 rollout models only; "
+            f"got family={rollout_model.family!r}"
+        )
+    parallel_sizes = {
+        field: int(accelerator.get(field, 1))
+        for field in ("dp_replicate", "tp", "cp", "pp")
+    }
+    non_tp_sizes = {
+        field: size for field, size in parallel_sizes.items() if field != "tp"
+    }
+    if any(size != 1 for size in non_tp_sizes.values()):
+        raise ValueError(
+            "Weight synchronization currently requires pure FSDP training with "
+            "dp_replicate=1 and train CP/PP=1, got "
+            f"{parallel_sizes}"
+        )
+    trainer_tp = parallel_sizes["tp"]
+    if trainer_tp == 1:
+        return
+    trainer_tp2_supported = (
+        trainer_tp == 2
+        and rollout_model.family == "qwen3"
+        and effective_strategy in ("full_gather", "direct_reshard")
+        and (
+            fallback_strategy == "none"
+            or (
+                effective_strategy == "direct_reshard"
+                and fallback_strategy == "full_gather"
+            )
+        )
+    )
+    if not trainer_tp2_supported:
+        raise ValueError(
+            "Trainer TP2 weight synchronization currently requires Qwen3 with "
+            "full-gather or direct-reshard weight sync; "
+            f"got deployment={deployment!r}, rollout_tp={rollout_tp}, "
+            f"family={rollout_model.family!r}, is_hyper={rollout_model.is_hyper!r}, "
+            f"strategy={effective_strategy!r}, fallback={fallback_strategy!r}"
+        )
 
 
 def _validate_model_implementation(
@@ -293,15 +535,19 @@ def _validate_vllm(
     if platform.platform_type != PlatformType.PYTORCH or platform.device_type() != "npu":
         raise ValueError("The vLLM-Ascend rollout backend requires the Torch NPU platform")
     vllm = optional_mapping(rollout, "vllm")
-    deployment, rollout_tp = _validate_vllm_basics(vllm)
+    deployment, _, rollout_tp = _validate_vllm_basics(vllm)
     if deployment == "colocated":
         _validate_colocated_vllm(vllm, accelerator, rollout_tp)
     else:
         _validate_disjoint_vllm(vllm, accelerator, rollout_tp)
     _validate_vllm_limits(vllm)
     rollout_model = _validate_model_implementation(vllm, model_registration)
-    if rollout_model.is_hyper and rollout_tp != 1:
-        raise ValueError("Hyper-vLLM currently requires tensor_parallel_size=1")
+    _validate_vllm_weight_sync(vllm, deployment, rollout_model, accelerator)
+    if rollout_model.is_hyper and rollout_model.family != "qwen3" and rollout_tp != 1:
+        raise ValueError(
+            "Hyper-vLLM tensor parallelism currently supports Qwen3 only; "
+            f"family={rollout_model.family!r}, tensor_parallel_size={rollout_tp}"
+        )
 
 
 def _validate_agentic(agentic: Mapping[str, Any]) -> None:
@@ -336,25 +582,13 @@ def validate_rollout_and_agentic(
     if seed is not None and int(seed) < 0:
         raise ValueError("rollout.seed must be non-negative or null")
     _validate_agentic(agentic)
+
+
 def _validate_topology(accelerator: Mapping[str, Any]) -> None:
-    """Validate the currently supported pure-FSDP topology."""
-    topology = {
-        "dp_replicate": int(accelerator.get("dp_replicate", 1)),
-        "dp_shard": int(accelerator.get("dp_shard", 0)),
-        "tp": int(accelerator.get("tp", 1)),
-        "cp": int(accelerator.get("cp", 1)),
-        "pp": int(accelerator.get("pp", 1)),
-    }
-    if topology["dp_shard"] <= 0:
-        raise ValueError(
-            "train.accelerator.dp_shard must be positive, "
-            f"got {topology['dp_shard']}"
-        )
-    unsupported = {
-        key: value for key, value in topology.items() if key != "dp_shard" and value != 1
-    }
-    if unsupported:
-        raise ValueError(f"Hyper-RL demo supports pure FSDP only; invalid topology={unsupported}")
+    """Validate the currently accepted Trainer FSDP and TP topology."""
+    _trainer_topology(accelerator)
+
+
 def _validate_checkpoint(checkpoint: Mapping[str, Any]) -> None:
     """Validate checkpoint options against available role support."""
     save_final = bool(checkpoint.get("save_final", True))
@@ -365,6 +599,8 @@ def _validate_checkpoint(checkpoint: Mapping[str, Any]) -> None:
     if save_steps < 0:
         raise ValueError("checkpoint.save_steps must be non-negative")
     _path_value(checkpoint, "output_dir")
+
+
 def _validate_logging(config: Mapping[str, Any]) -> None:
     backends = config.get("backends", ())
     if not isinstance(backends, list) or not backends:
@@ -375,6 +611,8 @@ def _validate_logging(config: Mapping[str, Any]) -> None:
     wandb = required_mapping(config, "wandb")
     if wandb.get("mode", "auto") not in {"auto", "online", "offline", "disabled"}:
         raise ValueError(f"Unsupported W&B mode: {wandb.get('mode')}")
+
+
 def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     """Validate Hyper-RL configuration before distributed startup."""
     unknown = set(config) - _EXPECTED_TOP_LEVEL
@@ -383,7 +621,7 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     consistency_profile(config)
     if algorithm.requirements.roles.critic:
         raise NotImplementedError(
-            "The initial HyperModels RL runtime supports critic-free algorithms only; "
+            "The initial HyperAutoModel RL runtime supports critic-free algorithms only; "
             f"algorithm '{algorithm.name}' requires a Critic"
         )
     model = required_mapping(config, "model")
@@ -402,6 +640,169 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     _validate_topology(accelerator)
     _validate_checkpoint(required_mapping(train, "checkpoint"))
     _validate_logging(required_mapping(config, "logging"))
+
+
+def resolve_vllm_automatic_limits(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve workload- and KV-bounded vLLM limits before validation.
+
+    Args:
+        config: Fully merged Hyper-RL configuration.
+
+    Returns:
+        A detached configuration with ``max_num_seqs`` resolved when it is null.
+
+    Raises:
+        ValueError: If automatic capacity lacks an explicit resource bound or the
+            model uses an unsupported hybrid KV layout.
+    """
+    resolved = deepcopy(dict(config))
+    rollout = resolved.get("rollout")
+    if not isinstance(rollout, dict) or rollout.get("engine") != "vllm":
+        return resolved
+    vllm = rollout.get("vllm")
+    if isinstance(vllm, Mapping):
+        _reject_removed_vllm_topology(vllm)
+    if (
+        not isinstance(vllm, dict)
+        or "max_num_seqs" not in vllm
+        or vllm["max_num_seqs"] is not None
+    ):
+        return resolved
+    model = required_mapping(resolved, "model")
+    data = required_mapping(resolved, "data")
+    agentic = required_mapping(resolved, "agentic")
+    train = required_mapping(resolved, "train")
+    accelerator = required_mapping(train, "accelerator")
+    model_path = Path(str(model["weights_path"])) / "config.json"
+    try:
+        with model_path.open(encoding="utf-8") as config_file:
+            model_config = json.load(config_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Automatic max_num_seqs requires a readable model config: {model_path}"
+        ) from error
+    text_config = model_config.get("text_config", model_config)
+    layer_types = text_config.get("layer_types") or []
+    if text_config.get("model_type") != "qwen3" or any(
+        layer_type != "full_attention" for layer_type in layer_types
+    ):
+        raise ValueError(
+            "Automatic max_num_seqs currently supports dense Qwen3 full-attention models only"
+        )
+
+    required_vllm_fields = (
+        "kv_cache_memory_bytes",
+        "max_model_len",
+        "max_num_batched_tokens",
+        "block_size",
+    )
+    missing = [field for field in required_vllm_fields if vllm.get(field) is None]
+    if missing:
+        raise ValueError(
+            f"Automatic max_num_seqs requires explicit rollout.vllm fields: {missing}"
+        )
+    positive_fields = (
+        (data, "max_prompt_length", "data"),
+        (rollout, "max_new_tokens", "rollout"),
+        (rollout, "num_return_sequences", "rollout"),
+        (agentic, "max_turns", "agentic"),
+        (train, "prompt_batch_size", "train"),
+        (accelerator, "dp_shard", "train.accelerator"),
+        (vllm, "kv_cache_memory_bytes", "rollout.vllm"),
+        (vllm, "max_model_len", "rollout.vllm"),
+        (vllm, "max_num_batched_tokens", "rollout.vllm"),
+        (vllm, "block_size", "rollout.vllm"),
+    )
+    for section, field, prefix in positive_fields:
+        value = section.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{prefix}.{field} must be a positive integer")
+    data_parallel_size = vllm.get("data_parallel_size")
+    if (
+        not isinstance(data_parallel_size, int)
+        or isinstance(data_parallel_size, bool)
+        or data_parallel_size <= 0
+    ):
+        raise ValueError("rollout.vllm.data_parallel_size must be a positive integer")
+    tensor_parallel_size = vllm.get("tensor_parallel_size")
+    if (
+        not isinstance(tensor_parallel_size, int)
+        or isinstance(tensor_parallel_size, bool)
+        or tensor_parallel_size <= 0
+    ):
+        raise ValueError("rollout.vllm.tensor_parallel_size must be a positive integer")
+    max_observation_tokens = agentic.get("max_observation_tokens", 0)
+    if (
+        not isinstance(max_observation_tokens, int)
+        or isinstance(max_observation_tokens, bool)
+        or max_observation_tokens < 0
+    ):
+        raise ValueError("agentic.max_observation_tokens must be a non-negative integer")
+
+    dtype = str(vllm.get("dtype", "bfloat16"))
+    dtype_bytes = {"bfloat16": 2, "bf16": 2}.get(dtype)
+    if dtype_bytes is None:
+        raise ValueError(f"Automatic max_num_seqs does not support dtype {dtype!r}")
+
+    max_turns = int(agentic["max_turns"])
+    context_tokens = (
+        int(data["max_prompt_length"])
+        + max_turns * int(rollout["max_new_tokens"])
+        + (max_turns - 1) * max_observation_tokens
+    )
+    max_model_len = int(vllm["max_model_len"])
+    if context_tokens > max_model_len:
+        raise ValueError(
+            "Automatic max_num_seqs requires workload context within max_model_len: "
+            f"context_tokens={context_tokens}, max_model_len={max_model_len}"
+        )
+
+    num_kv_heads = int(text_config["num_key_value_heads"])
+    if num_kv_heads % tensor_parallel_size != 0:
+        raise ValueError(
+            "Automatic max_num_seqs requires num_key_value_heads divisible by "
+            f"tensor_parallel_size: {num_kv_heads} % {tensor_parallel_size} != 0"
+        )
+    kv_heads_per_rank = num_kv_heads // tensor_parallel_size
+    head_dim = int(
+        text_config.get(
+            "head_dim",
+            int(text_config["hidden_size"]) // int(text_config["num_attention_heads"]),
+        )
+    )
+    num_layers = int(text_config["num_hidden_layers"])
+    block_size = int(vllm["block_size"])
+    block_bytes = (
+        num_layers
+        * block_size
+        * 2
+        * kv_heads_per_rank
+        * head_dim
+        * dtype_bytes
+    )
+    pool_blocks = int(vllm["kv_cache_memory_bytes"]) // block_bytes
+    blocks_per_sequence = math.ceil(context_tokens / block_size)
+    kv_capacity = pool_blocks // blocks_per_sequence
+    if kv_capacity <= 0:
+        raise ValueError(
+            "Automatic max_num_seqs found insufficient KV cache for one maximum-length sequence"
+        )
+
+    trainer_dp_size = _trainer_data_parallel_size(accelerator)
+    global_children = (
+        trainer_dp_size
+        * int(train.get("prompt_batch_size", 1))
+        * int(rollout["num_return_sequences"])
+    )
+    engine_count = int(vllm["data_parallel_size"])
+    workload_capacity = math.ceil(global_children / engine_count)
+    max_num_batched_tokens = int(vllm["max_num_batched_tokens"])
+    vllm["max_num_seqs"] = min(
+        workload_capacity,
+        kv_capacity,
+        max_num_batched_tokens,
+    )
+    return resolved
 
 
 def build_model_registration(config: Mapping[str, Any]) -> ModelRegistration:
@@ -435,8 +836,8 @@ def build_model_registration(config: Mapping[str, Any]) -> ModelRegistration:
     )
 
 
-def _resolve_dtype(name: Any) -> Any:
-    """Resolve one configured dtype through the active platform abstraction."""
+def _normalize_dtype_name(name: Any) -> Optional[str]:
+    """Normalize a configured mixed-precision dtype for the master FSDP2 API."""
     normalized = None if name is None else str(name).strip().lower()
     aliases = {
         "bf16": "bfloat16",
@@ -446,16 +847,14 @@ def _resolve_dtype(name: Any) -> Any:
         "fp16": "float16",
         "float16": "float16",
     }
-    if normalized is None:
-        return None
-    attribute = aliases.get(normalized)
-    if attribute is None or not hasattr(platform.tensor_dtype, attribute):
+    canonical_name = aliases.get(normalized)
+    if normalized is not None and canonical_name is None:
         raise ValueError(f"Unsupported mixed-precision dtype: {name!r}")
-    return getattr(platform.tensor_dtype, attribute)
+    return canonical_name
 
 
 def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
-    """Translate Hyper-RL YAML into the HyperModels runtime configuration."""
+    """Translate Hyper-RL YAML into the HyperAutoModel runtime configuration."""
     model_config = required_mapping(config, "model")
     train_config = required_mapping(config, "train")
     accelerator_config = required_mapping(train_config, "accelerator")
@@ -468,7 +867,9 @@ def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
 
     max_steps = int(train_config["max_steps"])
     prompt_batch_size = int(train_config.get("prompt_batch_size", 1))
-    dp_shard = int(accelerator_config["dp_shard"])
+    topology = _trainer_topology(accelerator_config)
+    dp_shard = topology["dp_shard"]
+    trainer_dp_size = topology["dp_replicate"] * topology["dp_shard"]
     cpu_offload = bool(accelerator_config.get("cpu_offload", False))
     param_dtype_name = str(mixed_precision_config.get("param_dtype", "bfloat16"))
     reduce_dtype_name = str(mixed_precision_config.get("reduce_dtype", "float32"))
@@ -503,7 +904,8 @@ def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
         model=Target(
             HyperAutoModelForCausalLM.from_pretrained,
             target_path=(
-                "hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained"
+                "hyper_parallel.auto_models._transformers."
+                "HyperAutoModelForCausalLM.from_pretrained"
             ),
             pretrained_model_name_or_path=str(model_config["weights_path"]),
             torch_dtype=param_dtype_name if enabled else "float32",
@@ -514,14 +916,14 @@ def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
         ),
         optimizer=Target(
             AdamW,
-            target_path="hyper_models.components.optim.optimizer.AdamW",
+            target_path="hyper_parallel.auto_models.components.optim.optimizer.AdamW",
             adamw_config=optimizer_kwargs,
             no_decay_params=["bias", "norm", "ln_"],
         ),
         lr_scheduler=Target(
             MultiLRScheduler,
             target_path=(
-                "hyper_models.components.optim.lr_scheduler.MultiLRScheduler"
+                "hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler"
             ),
             lr_decay_style=str(optimizer_config.get("lr_decay_style", "constant")),
             lr_config={
@@ -531,8 +933,7 @@ def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
         ),
         training=TrainingConfig(
             train_iters=max_steps,
-            num_train_epochs=1,
-            global_batch_size=dp_shard * prompt_batch_size,
+            global_batch_size=trainer_dp_size * prompt_batch_size,
             micro_batch_size=prompt_batch_size,
             backend=backend,
             max_grad_norm=float(optimizer_config.get("max_grad_norm", 1.0)),
@@ -550,46 +951,44 @@ def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
         ),
         fsdp_config=FSDP2Config(
             dp_shard_size=dp_shard,
-            mp_policy=(
-                MixedPrecisionPolicy(
-                    param_dtype=_resolve_dtype(param_dtype_name),
-                    reduce_dtype=_resolve_dtype(reduce_dtype_name),
-                    output_dtype=_resolve_dtype(output_dtype_name),
-                )
-                if enabled
-                else None
+            mix_precision=FSDP2MixedPrecisionConfig(
+                param_dtype=(
+                    _normalize_dtype_name(param_dtype_name) if enabled else None
+                ),
+                reduce_dtype=(
+                    _normalize_dtype_name(reduce_dtype_name) if enabled else None
+                ),
+                output_dtype=(
+                    _normalize_dtype_name(output_dtype_name) if enabled else None
+                ),
             ),
-            offload_policy=(
-                CPUOffloadPolicy(
-                    pin_memory=bool(accelerator_config.get("pin_memory", False))
-                )
-                if cpu_offload
-                else None
-            ),
+            enable_offload=cpu_offload,
             reshard_after_forward=bool(
                 accelerator_config.get("reshard_after_forward", True)
             ),
-            defer_fsdp_grad_sync=True,
+            reshard_after_backward=False,
+            requires_grad_sync=True,
             comm_fusion=bool(accelerator_config.get("comm_fusion", True)),
         ),
         mixed_precision=MixedPrecisionConfig(enabled=enabled),
         activation_checkpoint=ActivationCheckpointConfig(mode=activation_checkpoint),
         checkpoint=CheckpointingConfig(
-            enabled=(
+            save_ckpt=(
                 bool(checkpoint_config.get("save_final", True))
                 or int(checkpoint_config.get("save_steps", 0)) > 0
-                or checkpoint_config.get("load_path") is not None
             ),
             checkpoint_dir=str(checkpoint_config["output_dir"]),
             save_consolidated="none",
-            restore_from=checkpoint_config.get("load_path"),
         ),
     )
+
+
 __all__ = [
     "build_model_registration",
     "build_runtime_config",
     "optional_mapping",
     "required_mapping",
+    "resolve_vllm_automatic_limits",
     "uses_colocated_vllm",
     "validate_config",
     "validate_rollout_and_agentic",

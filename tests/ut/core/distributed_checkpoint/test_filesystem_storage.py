@@ -20,8 +20,10 @@ import pickle
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import torch
+from safetensors import safe_open
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import hyper_parallel.platform.platform as _platform_mod
@@ -39,8 +41,22 @@ from hyper_parallel.core.distributed_checkpoint.filesystem_storage import (
     FileSystemWriter,
     _get_tensor_size,
 )
-from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
+from hyper_parallel.core.distributed_checkpoint.metadata import (
+    ChunkStorageMetadata,
+    Metadata,
+    MetadataIndex,
+)
+from hyper_parallel.core.distributed_checkpoint.planner import (
+    SavePlan,
+    WriteItem,
+    WriteItemType,
+)
 from hyper_parallel.core.distributed_checkpoint.storage import METADATA_FILE_NAME, StorageInfo
+from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import RaggedShard
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 
 class TestFilesystemStorage(unittest.TestCase):
@@ -99,6 +115,99 @@ class TestFilesystemStorage(unittest.TestCase):
             reader.execute_read(load_plan, load_planner)
 
             torch.testing.assert_close(load_state["weight"], weight)
+
+    def test_writer_assigns_unique_physical_keys_to_same_fqn_chunks(self):
+        """Multiple logical chunks with one FQN remain distinct in safetensors."""
+        def make_item(fqn, offset):
+            return WriteItem(
+                index=MetadataIndex(fqn=fqn, offset=offset),
+                type=WriteItemType.TENSOR,
+                tensor_data={
+                    "chunk": ChunkStorageMetadata(offsets=offset, sizes=(1, 2)),
+                },
+            )
+
+        items = [
+            make_item("weight", (0, 0)),
+            make_item("weight", (1, 0)),
+            make_item("weight.__dcp_chunk_0", (0, 0)),
+        ]
+        planner = Mock()
+        planner.get_data.side_effect = [
+            torch.tensor([[1.0, 2.0]]),
+            torch.tensor([[3.0, 4.0]]),
+            torch.tensor([[5.0, 6.0]]),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = FileSystemWriter(tmpdir)
+            writer.configure_writer(is_coordinator=True, rank=0)
+            results = writer.execute_write(SavePlan(items=items), planner)
+
+            physical_keys = [result.storage_data.tensor_key for result in results]
+            self.assertEqual(len(set(physical_keys)), 3)
+            self.assertEqual(physical_keys[2], "weight.__dcp_chunk_0")
+            with safe_open(
+                    str(Path(tmpdir) / "_rank0_.safetensors"),
+                    framework="pt",
+                    device="cpu",
+            ) as tensor_file:
+                self.assertEqual(set(tensor_file.keys()), set(physical_keys))
+
+    def test_ragged_tensor_roundtrip_uses_nd_box_storage(self):
+        """Save and load a rank-local RaggedShard through filesystem storage."""
+        _DEVICE_MESH_MAP.clear()
+        EXISTING_COMM_GROUPS.clear()
+        with patch(
+                "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+                return_value=0,
+        ):
+            mesh = Layout((2,), ("ragged",), init_backend=False).mesh
+            source = DTensor.from_local(
+                torch.arange(48),
+                mesh,
+                (RaggedShard(dims=(0, 1), local_units=(1, 3)),),
+                shape=(6, 4, 8),
+            )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                ckpt_dir = Path(tmpdir)
+                from hyper_parallel.core.distributed_checkpoint.standard_planner import (
+                    StandardLoadPlanner,
+                    StandardSavePlanner,
+                )
+
+                save_planner = StandardSavePlanner(enable_plan_caching=False)
+                save_planner.configure_planner(
+                    {"weight": source}, rank=0, use_collectives=False
+                )
+                save_plan = save_planner.build_local_plan()
+                global_plans, metadata = save_planner.build_global_plan([save_plan])
+                writer = FileSystemWriter(ckpt_dir)
+                writer.configure_writer(is_coordinator=True, rank=0, use_collectives=False)
+                results = writer.execute_write(global_plans[0], save_planner)
+                writer.finalize_checkpoint(metadata, [results])
+
+                target = DTensor.from_local(
+                    torch.zeros(48, dtype=torch.int64),
+                    mesh,
+                    (RaggedShard(dims=(0, 1), local_units=(1, 3)),),
+                    shape=(6, 4, 8),
+                )
+                loaded_md = pickle.loads((ckpt_dir / f"0{METADATA_FILE_NAME}").read_bytes())
+                load_planner = StandardLoadPlanner()
+                load_planner.configure_planner(
+                    {"weight": target}, loaded_md, rank=0, use_collectives=False
+                )
+                reader = FileSystemReader(ckpt_dir)
+                reader.configure_reader(loaded_md, is_coordinator=True, rank=0)
+                with patch(
+                    "hyper_parallel.core.distributed_checkpoint.standard_planner.get_platform"
+                ) as mock_platform:
+                    mock_platform.return_value.get_rank.return_value = 0
+                    load_plan = load_planner.build_local_plan()
+                reader.execute_read(load_plan, load_planner)
+
+                torch.testing.assert_close(target.to_local(), source.to_local())
 
     def test_filesystem_reader_load_metadata_rank_local(self):
         """

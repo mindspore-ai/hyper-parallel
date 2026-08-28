@@ -254,7 +254,11 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
         """
         mesh_coordinate = device_mesh.get_coordinate()
         shard_idx_by_dim, total_num_shards_by_dim = _calc_shard_info(
-            mesh_coordinate, device_mesh, placements, global_shape
+            mesh_coordinate,
+            device_mesh,
+            placements,
+            global_shape,
+            reverse_repeated_shards=True,
         )
         shard_linear_idx = self._calc_shard_linear_idx(
             shard_idx_by_dim, total_num_shards_by_dim
@@ -360,8 +364,9 @@ def _calc_first_shard_size(device_mesh, placements, global_shape) -> list[int]:
         if isinstance(placement, Shard):
             mesh_dim_size = device_mesh.size(idx)
             shard_dim = placement.dim
+            current_dim_size = local_size_on_rank_0[shard_dim]
             local_size_on_rank_0[shard_dim], _ = local_shard_size_and_offset(
-                global_shape[shard_dim],
+                current_dim_size,
                 mesh_dim_size,
                 0,
             )
@@ -369,7 +374,11 @@ def _calc_first_shard_size(device_mesh, placements, global_shape) -> list[int]:
 
 
 def _calc_shard_info(
-    mesh_coordinate, device_mesh, placements, global_shape
+    mesh_coordinate,
+    device_mesh,
+    placements,
+    global_shape,
+    reverse_repeated_shards=False,
 ):
     """Calculate shard information for a specific rank."""
     mesh_size = device_mesh.mesh_shape
@@ -400,8 +409,13 @@ def _calc_shard_info(
         total_num_shards = 1
         # the tensor dim is sharded on more than 1 mesh dim
         if isinstance(mesh_dim, list):
-            rank_coord = [mesh_coordinate[d] for d in mesh_dim]
-            num_shards = [mesh_size[d] for d in mesh_dim]
+            repeated_mesh_dims = mesh_dim
+            if reverse_repeated_shards:
+                # RNG follows the sequential placement application: the last
+                # placement subdivides each earlier shard and becomes major.
+                repeated_mesh_dims = list(reversed(repeated_mesh_dims))
+            rank_coord = [mesh_coordinate[d] for d in repeated_mesh_dims]
+            num_shards = [mesh_size[d] for d in repeated_mesh_dims]
             # compute the shard idx and total number of shards
             for idx, size in zip(rank_coord, num_shards):
                 shard_idx = shard_idx * size + idx

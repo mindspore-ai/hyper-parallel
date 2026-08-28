@@ -26,7 +26,6 @@ from mindspore import Tensor, nn
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh, init_empty_weights, shard_module
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.api import fully_shard
-from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
@@ -111,14 +110,15 @@ def _build_hsdp_tp_mesh(
 
 
 def _build_tp_only_mesh(world_size: int, tp_size: int = 2):
-    """Build a 1D TP mesh for fully_shard compatibility mode."""
+    """Build explicit size-one FSDP and TP submeshes from one root mesh."""
     if world_size != tp_size:
-        return None
-    return init_device_mesh(
+        return None, None, None
+    root_mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(tp_size,),
-        mesh_dim_names=("tp",),
+        mesh_shape=(1, tp_size),
+        mesh_dim_names=("fsdp", "tp"),
     )
+    return root_mesh, root_mesh["fsdp"], root_mesh["tp"]
 
 
 def _flatten_coordinate(mesh_shape, coordinate):
@@ -269,13 +269,13 @@ def _wrap_tp_fully_shard_model(
     return model, x_placements
 
 
-def _wrap_pure_tp_replicate_fully_shard_model(model, tp_mesh):
-    """Apply replicated TP sharding then fully_shard(mesh=None)."""
+def _wrap_pure_tp_replicate_fully_shard_model(model, fsdp_mesh, tp_mesh):
+    """Apply replicated TP sharding then fully_shard on a size-one mesh."""
     x_placements, sharding_plan = _build_tp_replicate_sharding_plan(tp_mesh)
     model = shard_module(model, device_mesh=tp_mesh, sharding_plan=sharding_plan)
     model = fully_shard(
         model,
-        mesh=None,
+        mesh=fsdp_mesh,
         reshard_after_forward=True,
         mp_policy=_build_fp32_mp_policy(),
     )
@@ -466,9 +466,9 @@ def _run_tp_fully_shard_training(
     return losses, grads
 
 
-def _run_tp_fully_shard_compat_training(model, tp_mesh, x, y, steps):
-    """Run TP + fully_shard(mesh=None) compatibility training with DTensor-backed weights."""
-    model, x_placements = _wrap_tp_fully_shard_model(model, tp_mesh, mesh=None)
+def _run_tp_fully_shard_compat_training(model, fsdp_mesh, tp_mesh, x, y, steps):
+    """Run TP + fully_shard with an explicit size-one FSDP mesh."""
+    model, x_placements = _wrap_tp_fully_shard_model(model, tp_mesh, mesh=fsdp_mesh)
     optimizer = nn.Adam(model.trainable_params(), learning_rate=0.01)
     dist_x = DTensor.from_local(x, tp_mesh, x_placements)
     dist_y = DTensor.from_local(y, tp_mesh, x_placements)
@@ -495,9 +495,9 @@ def _run_tp_fully_shard_compat_training(model, tp_mesh, x, y, steps):
     return losses, grads
 
 
-def _run_pure_tp_fully_shard_training(model, tp_mesh, x, y, steps):
-    """Run pure-TP training where fully_shard(mesh=None) owns replicated DTensor grads."""
-    model, x_placements = _wrap_pure_tp_replicate_fully_shard_model(model, tp_mesh)
+def _run_pure_tp_fully_shard_training(model, fsdp_mesh, tp_mesh, x, y, steps):
+    """Run pure-TP training where size-one FSDP owns replicated DTensor grads."""
+    model, x_placements = _wrap_pure_tp_replicate_fully_shard_model(model, fsdp_mesh, tp_mesh)
     optimizer = nn.Adam(model.trainable_params(), learning_rate=0.01)
     dist_x = DTensor.from_local(x, tp_mesh, x_placements)
     dist_y = DTensor.from_local(y, tp_mesh, x_placements)
@@ -1010,7 +1010,7 @@ def _assert_loss_and_grad_match_hsdp_tp_root_mesh(
     )
 
 
-def _assert_loss_and_grad_match_compat_mesh_none(
+def _assert_loss_and_grad_match_size_one_fsdp(
     *,
     case_name: str,
     steps: int,
@@ -1022,15 +1022,15 @@ def _assert_loss_and_grad_match_compat_mesh_none(
     init_seed: int,
     tp_size: int = 2,
 ):
-    """Run one TP + fully_shard(mesh=None) compatibility case and compare with standalone."""
+    """Run one TP + size-one FSDP case and compare with standalone."""
     D.init()
     rank = D.get_rank()
     world_size = D.get_group_size()
-    tp_mesh = _build_tp_only_mesh(world_size, tp_size=tp_size)
-    if tp_mesh is None:
+    root_mesh, fsdp_mesh, tp_mesh = _build_tp_only_mesh(world_size, tp_size=tp_size)
+    if root_mesh is None:
         print(
             f"[Rank {rank}] Skip {case_name} because world_size={world_size} "
-            f"does not match tp_size={tp_size} for fully_shard(mesh=None) compatibility mode."
+            f"does not match tp_size={tp_size} for a size-one FSDP + TP mesh."
         )
         return
 
@@ -1060,6 +1060,7 @@ def _assert_loss_and_grad_match_compat_mesh_none(
     )
     dist_losses, dist_grads = _run_tp_fully_shard_compat_training(
         dist_model,
+        fsdp_mesh,
         tp_mesh,
         input_data,
         label_data,
@@ -1112,15 +1113,15 @@ def _assert_pure_tp_replicate_grad_managed_by_fully_shard(
     init_seed: int,
     tp_size: int = 2,
 ):
-    """Compare pure-TP replicated gradients managed by fully_shard(mesh=None)."""
+    """Compare pure-TP replicated gradients managed by size-one FSDP."""
     D.init()
     rank = D.get_rank()
     world_size = D.get_group_size()
-    tp_mesh = _build_tp_only_mesh(world_size, tp_size=tp_size)
-    if tp_mesh is None:
+    root_mesh, fsdp_mesh, tp_mesh = _build_tp_only_mesh(world_size, tp_size=tp_size)
+    if root_mesh is None:
         print(
             f"[Rank {rank}] Skip {case_name} because world_size={world_size} "
-            f"does not match tp_size={tp_size} for pure-TP compatibility mode."
+            f"does not match tp_size={tp_size} for a size-one FSDP + TP mesh."
         )
         return
 
@@ -1143,23 +1144,21 @@ def _assert_pure_tp_replicate_grad_managed_by_fully_shard(
     )
     dist_model, dist_losses, dist_grads = _run_pure_tp_fully_shard_training(
         dist_model,
+        fsdp_mesh,
         tp_mesh,
         input_data,
         label_data,
         steps,
     )
 
-    hsdp_state = dist_model.hsdp_scheduler.hsdp_state
-    assert hsdp_state.replicate_params == []
-    assert len(hsdp_state.hsdp_params) == 3
-    for managed_param in hsdp_state.hsdp_params:
-        assert managed_param.param_mode == FullyShardParamMode.DTENSOR_COMPAT
-        assert managed_param.enable_fsdp_shard is True
-        assert managed_param.is_sharded is False
-        assert managed_param.shard_size == 1
-        assert managed_param.dp_size == tp_size
-        # pylint: disable-next=protected-access
-        assert [repr(placement) for placement in managed_param._spmd_placements] == ["Replicate()"]
+    managed_params = dist_model.hsdp_scheduler.hsdp_state.hsdp_params
+    assert len(managed_params) == 3
+    # pylint: disable=protected-access
+    for managed_param in managed_params:
+        assert managed_param.shard_world_size == 1
+        assert managed_param._spmd_mesh.mesh_dim_names == ("fsdp", "tp")
+        assert tuple(managed_param._spmd_placements) == (Shard(0), Replicate())
+        assert tuple(managed_param._orig_dtensor_placements) == (Replicate(),)
 
     for step_idx in range(steps):
         assert np.allclose(
@@ -1252,10 +1251,10 @@ def test_hsdp_plus_tp_on_3d_root_mesh_match_standalone():
     )
 
 
-def test_tp_plus_fully_shard_mesh_none_compat_match_standalone():
-    """TP + fully_shard(mesh=None): compare loss/grad against standalone."""
-    _assert_loss_and_grad_match_compat_mesh_none(
-        case_name="tp2_mesh_none_compat_case_ms",
+def test_tp_plus_fully_shard_size_one_fsdp_match_standalone():
+    """TP + fully_shard on a size-one FSDP mesh: compare loss/grad against standalone."""
+    _assert_loss_and_grad_match_size_one_fsdp(
+        case_name="tp2_size_one_fsdp_case_ms",
         steps=6,
         batch_size=8,
         input_size=16,
@@ -1268,7 +1267,7 @@ def test_tp_plus_fully_shard_mesh_none_compat_match_standalone():
 
 
 def test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone():
-    """Pure TP + fully_shard(mesh=None): replicated DTensor grads match standalone."""
+    """Pure TP + size-one FSDP: replicated DTensor grads match standalone."""
     _assert_pure_tp_replicate_grad_managed_by_fully_shard(
         case_name="pure_tp_replicate_fully_shard_case_ms",
         steps=2,

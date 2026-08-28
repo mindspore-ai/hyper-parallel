@@ -18,11 +18,10 @@ from typing import Any, List, Mapping, Optional, Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.core.fully_shard.utils import CommFusionPolicy, TPShardMetaInfo
+from hyper_parallel.core.fully_shard.utils import CommFusionPolicy, SourceShardMetaInfo
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FSDPSchedulerState,
     get_managed_modules_parameters,
-    get_hsdp_state
 )
 from hyper_parallel.tools.logging import get_logger
 
@@ -31,26 +30,44 @@ logger = get_logger("FSDP")
 platform = get_platform()
 ModuleClass = platform.Module
 
-class HSDPSchedulerContext:
-    """HSDPSchedulerContext"""
+
+class ParamGroupCommCtx:
+    """Track the in-flight parameter-group communication for one module tree."""
 
     def __init__(self) -> None:
-        # Currently only record is_last_backward flag for scheduler context.
+        self.pre_param_group = None
+        self.all_reduce_param_group = None
+        # MindSpore keeps the reduce-scatter handle outside the parameter group.
+        self.comm_handle = None
+
+
+class HSDPSchedulerContext:
+    """Share scheduler and backward-pipeline state within one HSDP module tree."""
+
+    def __init__(self) -> None:
         self.is_last_backward: bool = True
-        # flag to identify "root_module"
         self.root_module = None
+        # Compile tracing may enter the root more than once; initialize shared
+        # parameter state only on the first real forward.
+        self.lazy_init_done: bool = False
+        self.root_bp_state = False
         # all_hsdp_schedulers (for one module tree structure), deduplicated at
         # registration time because ``fully_shard`` may be given a module list
         # whose modules share one scheduler.
         self.all_hsdp_schedulers = []
         # Parameter FQNs are initialized once after all schedulers share this context.
         self._param_fqn_initialized = False
+        # Backward pipeline queues shared only by schedulers in this module tree.
+        self.pre_reduce_scatter_params = []
+        self.pre_all_reduce_params = []
+        self.pre_direct_all_reduce_grads = []
+        self.pre_all_reduce_groups = []
+        self.pending_all_reduce_groups = []
+        self.param_group_comm_ctx = ParamGroupCommCtx()
 
 
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
-    root_bp_state = False
-
 
     def __init__(
         self,
@@ -65,7 +82,7 @@ class HSDPSchedulerV2:
         device,
         comm_fusion,
         comm_fusion_zero_copy=False,
-        tp_grad_infos: Optional[Mapping[platform.Parameter, TPShardMetaInfo]] = None,
+        source_shard_infos: Optional[Mapping[platform.Parameter, SourceShardMetaInfo]] = None,
     ):
         """init hsdp scheduler.
 
@@ -83,13 +100,13 @@ class HSDPSchedulerV2:
         self.replicate_params = replicate_params
         self.device = device
         self.reshard_after_forward = reshard_after_forward
-        self.tp_grad_infos = tp_grad_infos
+        self.source_shard_infos = source_shard_infos
         self.scheduler_state = None
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
         self._backup_forward_fetch = None
         # Flag to identify root module.
-        self._is_root = False
+        self._is_root = True
         # module and its all sub-modules share one same 'HSDPSchedulerContext'
         self.scheduler_ctx = HSDPSchedulerContext()
         # When ``fully_shard`` is given multiple root modules, forward pre/post hooks coordinate
@@ -153,7 +170,15 @@ class HSDPSchedulerV2:
 
     def reset_iter_state(self) -> None:
         """Reset scheduler bookkeeping after a completed iteration."""
-        HSDPSchedulerV2.root_bp_state = False
+        self.scheduler_ctx.root_bp_state = False
+        self.scheduler_ctx.pre_reduce_scatter_params.clear()
+        self.scheduler_ctx.pre_all_reduce_params.clear()
+        self.scheduler_ctx.pre_direct_all_reduce_grads.clear()
+        self.scheduler_ctx.pre_all_reduce_groups.clear()
+        self.scheduler_ctx.pending_all_reduce_groups.clear()
+        self.scheduler_ctx.param_group_comm_ctx.pre_param_group = None
+        self.scheduler_ctx.param_group_comm_ctx.all_reduce_param_group = None
+        self.scheduler_ctx.param_group_comm_ctx.comm_handle = None
         self.scheduler_state = None
         if self._fsdp_group_post_pending is not None:
             self._fsdp_group_post_pending.clear()
@@ -176,27 +201,37 @@ class HSDPSchedulerV2:
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             logger.debug("hook=forward_pre skip module=%s reason=pre_backward", self.hsdp_state)
             return args, kwargs
-        if HSDPSchedulerV2.root_bp_state:
+        if self.scheduler_ctx.root_bp_state:
             self._disable_forward_prefetch_for_recompute()
         if self.scheduler_ctx.root_module is None:
-            self.scheduler_ctx.root_module = self.cell
-            self._is_root = True
+            tree_ctx = self.scheduler_ctx
+            tree_ctx.root_module = self.cell
             registered_schedulers = set()
-            for module_name, module in platform.get_cells_and_names(self.scheduler_ctx.root_module):
+            for module_name, module in platform.get_cells_and_names(tree_ctx.root_module):
                 from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
                 if isinstance(module, HSDPModule):
                     submod_scheduler = module.hsdp_scheduler
                     if submod_scheduler is None or id(submod_scheduler) in registered_schedulers:
                         continue
                     registered_schedulers.add(id(submod_scheduler))
-                    if submod_scheduler.scheduler_ctx is not self.scheduler_ctx:
-                        submod_scheduler.scheduler_ctx = self.scheduler_ctx
-                        submod_scheduler.module_name = module_name
-                    self.scheduler_ctx.all_hsdp_schedulers.append(submod_scheduler)
+                    if submod_scheduler.scheduler_ctx is not tree_ctx:
+                        if submod_scheduler.scheduler_ctx.root_module is not None:
+                            raise ValueError(
+                                "HSDP scheduler already belongs to another initialized module tree"
+                            )
+                        submod_scheduler.scheduler_ctx = tree_ctx
+                        submod_scheduler.hsdp_state.scheduler_ctx = tree_ctx
+                        if submod_scheduler.hsdp_state.param_group is not None:
+                            submod_scheduler.hsdp_state.param_group.comm_ctx = tree_ctx.param_group_comm_ctx
+                    submod_scheduler._is_root = submod_scheduler is self  # pylint: disable=protected-access
+                    submod_scheduler.hsdp_state.module_name = module_name
+                    tree_ctx.all_hsdp_schedulers.append(submod_scheduler)
 
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
-        self._init_params_fqn()
-        self._lazy_init_all_states()
+        if self._is_root and not self.scheduler_ctx.lazy_init_done:
+            self._init_params_fqn()
+            self._lazy_init_all_states()
+            self.scheduler_ctx.lazy_init_done = True
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             args = self.platform.apply_to_tensors(cast_fn, args)
@@ -226,7 +261,7 @@ class HSDPSchedulerV2:
     def _init_params_fqn(self):  # pylint: disable=W0212
         if not self._is_root or self.scheduler_ctx.root_module is None:
             return
-        if self.scheduler_ctx._param_fqn_initialized:
+        if self.scheduler_ctx._param_fqn_initialized:  # pylint: disable=protected-access
             return
         # Build a map from original (sharded) parameter tensor to its HSDPParam wrapper.
         param_to_hsdp_param = {}
@@ -251,7 +286,7 @@ class HSDPSchedulerV2:
             hsdp_param = param_to_hsdp_param.get(parameter)
             if hsdp_param is not None:
                 hsdp_param._param_fqn = param_name  # pylint: disable=W0212
-        self.scheduler_ctx._param_fqn_initialized = True
+        self.scheduler_ctx._param_fqn_initialized = True  # pylint: disable=protected-access
 
     # pylint: disable=W0613, R1710
     def _hsdp_forward_hook(self, cell, inputs, outputs):

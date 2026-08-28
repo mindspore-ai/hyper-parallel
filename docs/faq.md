@@ -10,9 +10,13 @@
 
 ```bash
 cd hyper-parallel
-python setup.py bdist_wheel
-pip install dist/hyper_parallel-*.whl
+./build.sh
+# 安装 build.sh 最后打印的精确 wheel 路径
+wheel_path=/absolute/path/printed/by/build.sh
+pip install "${wheel_path}"
 ```
+
+如明确只需要不含 optional native 组件的 core-only wheel，可将三个组件都设为 `off`。
 
 ### Q: 导入时报错 "undefined Symbol"
 
@@ -22,27 +26,30 @@ pip install dist/hyper_parallel-*.whl
 
 ### Q: MindSpore custom_ops 编译失败
 
-**原因**：`ASCEND_HOME_PATH` 未正确设置，或 MindSpore 版本 < 2.8。
+**原因**：CANN 环境未正确激活、MindSpore 版本 < 2.10，或当前 MindSpore 不提供 `CustomOpBuilder`。
 
 **解决**：
 
 ```bash
 # 设置 CANN 路径
-export ASCEND_HOME_PATH=/usr/local/Ascend/cann
 source /usr/local/Ascend/cann/set_env.sh
 
 # 确认 MindSpore 版本
 python -c "import mindspore; print(mindspore.__version__)"
+
+# 仅重新构建 custom ops；optional 失败默认记录 warning 并继续出 wheel
+./build.sh --multicore off --shmem off --custom-ops on
 ```
 
 ### Q: PyTorch 扩展构建失败
 
-**原因**：PyTorch 版本 < 2.7 或 CXX11 ABI 不匹配。
+**原因**：PyTorch/torch_npu/CANN 版本不配套，或 CXX11 ABI 不匹配。
 
-**解决**：确保 PyTorch ≥ 2.7 且 `_GLIBCXX_USE_CXX11_ABI=1`（官方 wheel 默认满足）。
+**解决**：使用与当前 CANN 配套的 PyTorch/torch_npu，并确认 native adapter 所需的
+`_GLIBCXX_USE_CXX11_ABI=1`。
 
 ```bash
-python -c "import torch; print(torch.__version__); print(torch._GLIBCXX_USE_CXX11_ABI)"
+python -c "import torch; print(torch.__version__); print(torch._C._GLIBCXX_USE_CXX11_ABI)"
 ```
 
 ---

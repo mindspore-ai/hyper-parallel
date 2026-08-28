@@ -25,8 +25,11 @@ from rl.utils.monitoring.metrics import select_round_robin_samples
 from hyper_parallel import get_platform
 platform = get_platform()
 logger = logging.getLogger(__name__)
+
+
 class Evaluator:
     """Run synchronized evaluation using an independently configured rollout manager."""
+
     def __init__(
         self,
         *,
@@ -49,6 +52,7 @@ class Evaluator:
         self.log_samples = log_samples
         self.progress_steps = progress_steps
         self.last_step = -1
+
     def run(self, step: int) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Generate the evaluation split and return rank-zero metrics and samples."""
         rank = platform.get_rank()
@@ -80,6 +84,7 @@ class Evaluator:
             return {}, []
         records = [record for record in gathered if record is not None]
         return self._summarize(step, records)
+
     def _collect_local(
         self,
         step: int,
@@ -122,6 +127,7 @@ class Evaluator:
                     len(batches),
                 )
         return record
+
     def _evaluate_batch(
         self,
         step: int,
@@ -172,6 +178,7 @@ class Evaluator:
                     }
                 )
         return record
+
     def _summarize(
         self,
         step: int,

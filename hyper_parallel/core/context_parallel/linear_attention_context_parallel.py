@@ -13,6 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """Context parallel execution for Qwen3.5-style Gated DeltaNet layers."""
+
+# This module is the Torch implementation of the public CP style.
+# pylint: disable=forbidden-backend-import,missing-public-type-hints
+# pylint: disable=missing-public-docstring,not-callable
+# PyTorch autograd.Function intentionally defines framework-specific signatures.
+# pylint: disable=abstract-method,arguments-differ
 from __future__ import annotations
 
 from typing import NamedTuple, Optional
@@ -29,7 +35,11 @@ from hyper_parallel.core.context_parallel.context_parallel import (
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
-from hyper_parallel.models.modules.linear_attention import torch_chunk_gated_delta_rule
+from hyper_parallel.models.modules.linear_attention import (
+    chunk_gated_delta_rule,
+    is_triton_gdn_available,
+    torch_chunk_gated_delta_rule,
+)
 from hyper_parallel.platform import get_platform
 
 
@@ -646,6 +656,290 @@ def _gdn_state_p2p_summary(
     return core_attn_out
 
 
+class _GDNStateP2PTritonFunction(torch.autograd.Function):
+    """Pipeline fused affine GDN states over sequence-sharded CP ranks."""
+
+    @staticmethod
+    def forward(  # pylint: disable=arguments-differ,too-many-locals
+        ctx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        cp_rank: int,
+        cp_size: int,
+        cp_group,
+        prev_rank: int,
+        next_rank: int,
+    ) -> torch.Tensor:
+        """Run fused local GDN and forward its affine state across CP ranks."""
+        from hyper_parallel.platform.torch.custom_ops.gdn.chunk_gated_delta_rule import (  # pylint: disable=import-outside-toplevel
+            chunk_gated_delta_rule_fwd_apply_state_saved,
+            chunk_gated_delta_rule_fwd_output_saved,
+            chunk_gated_delta_rule_fwd_prepare_saved,
+        )
+        from hyper_parallel.platform.torch.custom_ops.gdn.state_summary import (  # pylint: disable=import-outside-toplevel
+            apply_gdn_state_summary,
+            chunk_gated_delta_rule_state_summary_fwd,
+        )
+
+        (
+            query_norm,
+            key_norm,
+            _,
+            _,
+            g_cumsum,
+            matrix_a,
+            w,
+            u,
+            scale,
+        ) = chunk_gated_delta_rule_fwd_prepare_saved(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            use_qk_l2norm_in_kernel=False,
+        )
+        initial_state = None
+        recv_buffer = None
+        recv_work = None
+        if cp_rank > 0:
+            recv_buffer = torch.empty(
+                (query.shape[0], query.shape[2], query.shape[3], value.shape[3]),
+                device=query.device,
+                dtype=torch.float32,
+            )
+            recv_work = dist.irecv(recv_buffer, src=prev_rank, group=cp_group)
+
+        state_ext = None
+        transition = None
+        if cp_rank < cp_size - 1:
+            state_ext, transition = chunk_gated_delta_rule_state_summary_fwd(
+                key_norm,
+                w,
+                u,
+                g_cumsum,
+            )
+
+        if recv_work is not None:
+            recv_work.wait()
+            initial_state = recv_buffer
+
+        send_buffer = None
+        send_work = None
+        if cp_rank < cp_size - 1:
+            send_buffer = apply_gdn_state_summary(
+                state_ext,
+                transition,
+                initial_state,
+            ).contiguous()
+            send_work = dist.isend(send_buffer, dst=next_rank, group=cp_group)
+
+        h, v_new, _ = chunk_gated_delta_rule_fwd_apply_state_saved(
+            key_norm,
+            g_cumsum,
+            w,
+            u,
+            initial_state=initial_state,
+            output_final_state=False,
+        )
+        output = chunk_gated_delta_rule_fwd_output_saved(
+            query_norm,
+            key_norm,
+            g_cumsum,
+            h,
+            v_new,
+            scale,
+        ).to(query.dtype)
+
+        if send_work is not None:
+            send_work.wait()
+
+        empty = query.new_empty(0)
+        ctx.save_for_backward(
+            query_norm,
+            key_norm,
+            value,
+            g_cumsum,
+            beta,
+            matrix_a,
+            initial_state if initial_state is not None else empty,
+            transition if transition is not None else empty,
+        )
+        ctx.has_initial_state = initial_state is not None
+        ctx.cp_rank = cp_rank
+        ctx.cp_size = cp_size
+        ctx.cp_group = cp_group
+        ctx.prev_rank = prev_rank
+        ctx.next_rank = next_rank
+        ctx.scale = scale
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # pylint: disable=too-many-locals
+        """Backpropagate local GDN tensors and the state gradient wavefront."""
+        from hyper_parallel.platform.torch.custom_ops.gdn.chunk_gated_delta_rule import (  # pylint: disable=import-outside-toplevel
+            chunk_gated_delta_rule_bwd_finish_saved,
+            chunk_gated_delta_rule_bwd_prepare_saved,
+            chunk_gated_delta_rule_bwd_state_saved,
+        )
+        from hyper_parallel.platform.torch.custom_ops.gdn.state_summary import (  # pylint: disable=import-outside-toplevel
+            apply_gdn_state_gradient_summary,
+            chunk_gated_delta_rule_state_gradient_summary_bwd,
+        )
+
+        (
+            query,
+            key,
+            value,
+            g_cumsum,
+            beta,
+            matrix_a,
+            initial_state,
+            transition,
+        ) = ctx.saved_tensors
+        if not ctx.has_initial_state:
+            initial_state = None
+
+        w, h, v_new, dv = chunk_gated_delta_rule_bwd_prepare_saved(
+            query,
+            key,
+            value,
+            g_cumsum,
+            beta,
+            matrix_a,
+            initial_state,
+            grad_output,
+            ctx.scale,
+        )
+
+        grad_state_ext = None
+        if ctx.cp_rank > 0:
+            grad_state_ext = chunk_gated_delta_rule_state_gradient_summary_bwd(
+                query,
+                key,
+                w,
+                g_cumsum,
+                grad_output,
+                dv,
+                ctx.scale,
+            )
+
+        grad_final_state = None
+        recv_work = None
+        if ctx.cp_rank < ctx.cp_size - 1:
+            recv_buffer = torch.empty(
+                (query.shape[0], query.shape[2], query.shape[3], value.shape[3]),
+                device=grad_output.device,
+                dtype=torch.float32,
+            )
+            recv_work = dist.irecv(
+                recv_buffer,
+                src=ctx.next_rank,
+                group=ctx.cp_group,
+            )
+        if recv_work is not None:
+            recv_work.wait()
+            grad_final_state = recv_buffer
+
+        send_buffer = None
+        send_work = None
+        if ctx.cp_rank > 0:
+            send_buffer = apply_gdn_state_gradient_summary(
+                grad_state_ext,
+                transition,
+                grad_final_state,
+            ).contiguous()
+            send_work = dist.isend(
+                send_buffer,
+                dst=ctx.prev_rank,
+                group=ctx.cp_group,
+            )
+
+        dh, _, dv = chunk_gated_delta_rule_bwd_state_saved(
+            query,
+            key,
+            g_cumsum,
+            w,
+            initial_state,
+            grad_final_state,
+            grad_output,
+            dv,
+            ctx.scale,
+        )
+        empty = query.new_empty(0)
+        dq, dk, dv, dg, dbeta = chunk_gated_delta_rule_bwd_finish_saved(
+            query,
+            key,
+            query,
+            key,
+            value,
+            g_cumsum,
+            beta,
+            matrix_a,
+            w,
+            h,
+            v_new,
+            dv,
+            grad_output,
+            dh,
+            empty,
+            empty,
+            ctx.scale,
+            use_qk_l2norm_in_kernel=False,
+        )
+
+        if send_work is not None:
+            send_work.wait()
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None
+
+
+def _gdn_state_p2p_triton(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cp_mesh: DeviceMesh,
+    cp_rank: int,
+    cp_size: int,
+) -> torch.Tensor:
+    """Run fused local GDN with an affine state wavefront."""
+    if cp_size == 1:
+        output, _ = chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            backend="triton",
+        )
+        return output
+
+    query = _l2norm_torch(query)
+    key = _l2norm_torch(key)
+    prev_rank = _global_peer_rank(cp_mesh, cp_rank - 1) if cp_rank > 0 else -1
+    next_rank = (
+        _global_peer_rank(cp_mesh, cp_rank + 1) if cp_rank < cp_size - 1 else -1
+    )
+    return _GDNStateP2PTritonFunction.apply(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        cp_rank,
+        cp_size,
+        cp_mesh.get_group(),
+        prev_rank,
+        next_rank,
+    )
+
+
 def _differentiable_all_to_all_shard(
     tensor: torch.Tensor,
     device_mesh: DeviceMesh,
@@ -736,9 +1030,16 @@ class LinearAttentionUlyssesCPWrapper(nn.Module):
     [B, S_local, full_heads]``.
     """
 
-    def __init__(self, module: nn.Module, device_mesh: DeviceMesh):
+    def __init__(
+        self,
+        module: nn.Module,
+        device_mesh: DeviceMesh,
+        *,
+        backend: str = "eager",
+    ):
         super().__init__()
         self.module = module
+        self.gdn_backend = backend
         self.cp_mesh = _ensure_1d(device_mesh)
         self.cp_size = self.cp_mesh.size()
         self.cp_rank = self.cp_mesh.get_local_rank()
@@ -871,7 +1172,9 @@ class LinearAttentionUlyssesCPWrapper(nn.Module):
             [base.key_dim, base.key_dim, base.value_dim],
             dim=-1,
         )
-        q_proj, k_proj, v_proj, b, a = self._seq_to_head_qkvba(q_proj, k_proj, v_proj, b, a)
+        q_proj, k_proj, v_proj, b, a = self._seq_to_head_qkvba(
+            q_proj, k_proj, v_proj, b, a
+        )
 
         full_seq_len = q_proj.shape[1]
         local_key_dim = base.key_dim // self.cp_size
@@ -910,7 +1213,7 @@ class LinearAttentionUlyssesCPWrapper(nn.Module):
             query = query.repeat_interleave(base.kv_groups, dim=2)
             key = key.repeat_interleave(base.kv_groups, dim=2)
 
-        core_attn_out, _ = torch_chunk_gated_delta_rule(
+        core_attn_out, _ = chunk_gated_delta_rule(
             query,
             key,
             value,
@@ -919,6 +1222,7 @@ class LinearAttentionUlyssesCPWrapper(nn.Module):
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
+            backend=self.gdn_backend,
         )
 
         core_attn_out = self._head_to_seq(core_attn_out)
@@ -934,9 +1238,16 @@ class LinearAttentionUlyssesCPWrapper(nn.Module):
 class LinearAttentionP2PCPWrapper(nn.Module):
     """Sequence-sharded GDN CP with an affine-summary state wavefront."""
 
-    def __init__(self, module: nn.Module, device_mesh: DeviceMesh):
+    def __init__(
+        self,
+        module: nn.Module,
+        device_mesh: DeviceMesh,
+        *,
+        backend: str = "eager",
+    ):
         super().__init__()
         self.module = module
+        self.gdn_backend = backend
         self.cp_mesh = _ensure_1d(device_mesh)
         self.cp_size = self.cp_mesh.size()
         self.cp_rank = self.cp_mesh.get_local_rank()
@@ -944,6 +1255,13 @@ class LinearAttentionP2PCPWrapper(nn.Module):
 
     def _validate_module(self) -> None:
         """Validate the Conv1d requirements of the P2P CP path."""
+        if self.gdn_backend == "triton" and (
+            self.module.head_k_dim != 128 or self.module.head_v_dim != 128
+        ):
+            raise NotImplementedError(
+                "linear attention P2P Triton backend requires "
+                "head_k_dim=head_v_dim=128."
+            )
         conv = self.module.conv1d
         if conv.stride != (1,):
             raise ValueError(
@@ -1015,17 +1333,41 @@ class LinearAttentionP2PCPWrapper(nn.Module):
             query = query.repeat_interleave(base.kv_groups, dim=2)
             key = key.repeat_interleave(base.kv_groups, dim=2)
 
-        core_attn_out = _gdn_state_p2p_summary(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            self.cp_mesh,
-            self.cp_rank,
-            self.cp_size,
-            use_qk_l2norm_in_kernel=True,
-        )
+        if self.gdn_backend == "triton":
+            if local_seq_len % 64 != 0:
+                raise NotImplementedError(
+                    "linear attention P2P Triton backend requires each CP "
+                    f"rank's local sequence length ({local_seq_len}) to be "
+                    "divisible by 64."
+                )
+            if not is_triton_gdn_available(query, key, value, g, beta):
+                raise RuntimeError(
+                    "linear attention P2P Triton backend requires an NPU "
+                    "input satisfying the fixed GDN contract and a validated "
+                    "triton-ascend 3.2.x installation."
+                )
+            core_attn_out = _gdn_state_p2p_triton(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                self.cp_mesh,
+                self.cp_rank,
+                self.cp_size,
+            )
+        else:
+            core_attn_out = _gdn_state_p2p_summary(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                self.cp_mesh,
+                self.cp_rank,
+                self.cp_size,
+                use_qk_l2norm_in_kernel=True,
+            )
 
         core_attn_out = core_attn_out.reshape(-1, base.head_v_dim)
         z_flat = z.reshape(-1, base.head_v_dim)
@@ -1147,22 +1489,41 @@ class LinearAttentionAllGatherCPWrapper(nn.Module):
 class LinearAttentionContextParallel(ParallelStyle):
     """Apply context parallel execution to a Gated DeltaNet module."""
 
-    def __init__(self, *, mode: str = "ulysses") -> None:
+    def __init__(self, *, mode: str = "ulysses", backend: str = "eager") -> None:
         if mode not in {"ulysses", "p2p", "all_gather"}:
             raise NotImplementedError(
                 "LinearAttentionContextParallel currently supports mode='ulysses', "
                 "mode='p2p', and mode='all_gather'."
             )
+        if backend not in {"eager", "triton"}:
+            raise ValueError(
+                "LinearAttentionContextParallel backend must be 'eager' or "
+                f"'triton', got {backend!r}."
+            )
+        if mode == "all_gather" and backend == "triton":
+            raise NotImplementedError(
+                "linear attention all-gather CP does not yet support the "
+                "Triton backend."
+            )
         self.mode = mode
+        self.backend = backend
 
     def apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         """Patch ``module.forward`` with a linear-attention CP executor."""
         if self.mode == "ulysses":
-            executor = LinearAttentionUlyssesCPWrapper(module, device_mesh)
+            executor = LinearAttentionUlyssesCPWrapper(
+                module,
+                device_mesh,
+                backend=self.backend,
+            )
         elif self.mode == "all_gather":
             executor = LinearAttentionAllGatherCPWrapper(module, device_mesh)
         else:
-            executor = LinearAttentionP2PCPWrapper(module, device_mesh)
+            executor = LinearAttentionP2PCPWrapper(
+                module,
+                device_mesh,
+                backend=self.backend,
+            )
         object.__setattr__(module, "_hp_linear_attention_cp_executor", executor)
         object.__setattr__(module, "_hp_linear_attention_original_forward", module.forward)
 

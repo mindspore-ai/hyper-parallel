@@ -14,11 +14,28 @@
 # ============================================================================
 """Activation checkpointing related interfaces"""
 from .checkpoint_wrapper import CheckpointWrapper, ckpt_wrapper
+from .checkpoint_exclude_wrapper import CheckpointExcludeWrapper, checkpoint_exclude_wrapper
 from .activation_swap import swap_wrapper, swap_tensor_wrapper
+from .checkpoint import (
+    CheckpointError,
+    checkpoint,
+    clear_recompute_session,
+    recompute_handle,
+    recompute_handle_collector_ctx,
+    recompute_session_ctx,
+)
 
 __all__ = [
     "CheckpointWrapper",
     "ckpt_wrapper",
+    "CheckpointExcludeWrapper",
+    "checkpoint_exclude_wrapper",
     "swap_wrapper",
     "swap_tensor_wrapper",
+    "CheckpointError",
+    "checkpoint",
+    "clear_recompute_session",
+    "recompute_handle",
+    "recompute_handle_collector_ctx",
+    "recompute_session_ctx",
 ]

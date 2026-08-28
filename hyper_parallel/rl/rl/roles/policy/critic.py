@@ -25,8 +25,11 @@ from hyper_parallel import (
 )
 from hyper_parallel.core.utils import clip_grad_norm_
 platform = get_platform()
+
+
 class Critic(platform.Module):
     """Own a value model and its optimization runtime."""
+
     def __init__(
         self,
         critic_model: platform.Module,
@@ -66,6 +69,7 @@ class Critic(platform.Module):
         self._response_mini_batch_size = response_mini_batch_size
         self._update_epochs = update_epochs
         self._max_grad_norm = max_grad_norm
+
     def sequence_values(
         self,
         sequences: platform.Tensor,
@@ -84,6 +88,7 @@ class Critic(platform.Module):
                 f"Critic values must have shape {expected}, got {tuple(values.shape)}"
             )
         return values[:, :-1].float()
+
     def compute_values(self, experience: ExperienceBatch) -> platform.Tensor:
         """Compute detached old values in response micro-batches."""
         was_training = self.training
@@ -109,6 +114,7 @@ class Critic(platform.Module):
         finally:
             self.train(was_training)
         return platform.cat(chunks, dim=0).detach()
+
     def forward_backward(
         self,
         experience: ExperienceBatch,
@@ -133,6 +139,7 @@ class Critic(platform.Module):
             raise RuntimeError("Non-finite Critic loss detected")
         scaled_loss.backward()
         return output.loss_sum.detach()
+
     def update(self, experience: ExperienceBatch) -> CriticUpdateMetrics:
         """Run configured value epochs and optimizer steps."""
         if experience.values is None or experience.returns is None:
@@ -185,6 +192,7 @@ class Critic(platform.Module):
             valid_tokens=processed_tokens,
             optimizer_steps=optimizer_steps,
         )
+
     def _global_token_count(self, action_mask: Any) -> int:
         """Return the data-parallel count of valid response tokens."""
         count = platform.tensor(
@@ -198,10 +206,12 @@ class Critic(platform.Module):
         if result <= 0:
             raise RuntimeError("Critic update has no valid action tokens")
         return result
+
     def _set_gradient_sync(self, is_last_micro_batch: bool) -> None:
         if isinstance(self.critic_model, HSDPModule):
             self.critic_model.set_requires_gradient_sync(is_last_micro_batch)
             self.critic_model.set_is_last_backward(is_last_micro_batch)
+
     def _optimizer_step(self) -> float:
         """Clip gradients and advance the Critic optimizer and scheduler."""
         hsdp_sync_stream()

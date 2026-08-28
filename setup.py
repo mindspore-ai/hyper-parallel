@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# encoding: utf-8
 # Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,11 +18,9 @@
 import sys
 import logging
 import os
-import re
 import shutil
 import stat
 import platform
-import subprocess
 from importlib import import_module
 from setuptools import setup, find_packages, Distribution
 from setuptools.command.egg_info import egg_info
@@ -28,7 +28,6 @@ from setuptools.command.build_py import build_py
 from setuptools.command.install import install
 
 ROOT_DIR = os.path.dirname(__file__)
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TORCH26_REQUIRES = [
@@ -50,74 +49,6 @@ MINDSPORE_REQUIRES = [
     "mindspore>=2.10",
 ]
 
-NATIVE_BUILD_VALUES = {
-    "BUILD_MULTICORE_EXTENSION": {
-        "mindspore", "ms", "torch", "pytorch", "all", "both",
-    },
-    "BUILD_SHMEM_EXTENSION": {
-        "mindspore", "ms", "torch", "pytorch", "all", "both",
-    },
-    "BUILD_CUSTOM_OPS_EXTENSION": {
-        "on",
-    },
-}
-
-STRICT_NATIVE_BUILD_TRUE_VALUES = {"1", "true", "on", "yes"}
-STRICT_NATIVE_BUILD_FALSE_VALUES = {"", "0", "false", "off", "no"}
-
-
-def _check_gcc_version():
-    """Enforce host GCC in [7.3.0, 11.3.0], aligned with mindspore policy.
-
-    Fatal on <7.3.0; warning on >11.3.0. No-op if gcc is unavailable on PATH
-    (setup may run in environments where only python deps are inspected).
-    """
-    gcc_bin = os.environ.get("CC", "gcc")
-    try:
-        out = subprocess.check_output(
-            [gcc_bin, "-dumpfullversion", "-dumpversion"],
-            stderr=subprocess.DEVNULL, text=True
-        ).strip().splitlines()[0]
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        logger.warning("GCC not found via '%s'; skipping host GCC version check.", gcc_bin)
-        return
-    m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", out)
-    if not m:
-        logger.warning("Could not parse GCC version '%s'; skipping check.", out)
-        return
-    major, minor, patch = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
-    num = major * 10000 + minor * 100 + patch
-    if num < 70300:
-        raise SystemExit(
-            f"ERROR: GCC version {out} < 7.3.0. Install GCC >= 7.3.0 (mindspore-compatible)."
-        )
-    if num > 110300:
-        logger.warning("GCC version %s > 11.3.0; may cause unknown problems.", out)
-    else:
-        logger.info("GCC %s accepted (target range [7.3.0, 11.3.0]).", out)
-
-
-def _should_check_gcc_version() -> bool:
-    """Return True when at least one native build module is explicitly enabled."""
-    for env_name, enabled_values in NATIVE_BUILD_VALUES.items():
-        env_value = os.environ.get(env_name, "").strip().lower()
-        if env_value in enabled_values:
-            return True
-    return False
-
-
-def _is_strict_native_build() -> bool:
-    """Return True when optional native build failures should fail wheel building."""
-    env_value = os.environ.get("HYPER_PARALLEL_BUILD_STRICT", "").strip().lower()
-    if env_value in STRICT_NATIVE_BUILD_TRUE_VALUES:
-        return True
-    if env_value in STRICT_NATIVE_BUILD_FALSE_VALUES:
-        return False
-    raise ValueError(
-        "HYPER_PARALLEL_BUILD_STRICT must be one of 1/0, true/false, on/off, or yes/no."
-    )
-
-
 def _read_requirements(requirements_path: str) -> list[str]:
     """Read Python requirement lines from a repository-local file."""
     with open(os.path.join(ROOT_DIR, requirements_path), encoding='utf-8') as file:
@@ -128,14 +59,14 @@ def _read_requirements(requirements_path: str) -> list[str]:
         ]
 
 
-def get_readme_content() -> str:
+def get_readme_content():
     """Read and return the contents of README.md for use as the package long description."""
     pwd = os.path.dirname(os.path.realpath(__file__))
     with open(os.path.join(pwd, 'README.md'), encoding='UTF-8') as f:
         return f.read()
 
 
-def get_platform() -> str:
+def get_platform():
     """
     Get platform name.
 
@@ -145,7 +76,7 @@ def get_platform() -> str:
     return f"{platform.system().strip().lower()}_{platform.machine().strip().lower()}"
 
 
-def get_description() -> str:
+def get_description():
     """
     Get description.
 
@@ -185,18 +116,7 @@ def get_extra_requires() -> dict[str, list[str]]:
     }
 
 
-def get_packages() -> list[str]:
-    """Discover Hyper-Parallel packages and the nested Hyper-RL package."""
-    excluded = [
-        "*tests*",
-        "hyper_parallel.auto_parallel.fast-tuner",
-        "hyper_parallel.auto_parallel.fast-tuner.*",
-    ]
-    rl_project_root = os.path.join("hyper_parallel", "rl")
-    return find_packages(exclude=excluded) + find_packages(where=rl_project_root, exclude=excluded)
-
-
-def update_permissions(path: str) -> None:
+def update_permissions(path):
     """
     Update permissions.
 
@@ -212,22 +132,10 @@ def update_permissions(path: str) -> None:
             os.chmod(file_fullpath, stat.S_IREAD | stat.S_IWRITE)
 
 
-def write_commit_id() -> None:
-    """Write the current git branch name and latest commit hash to the .commit_id file."""
-    ret_code = os.system("git rev-parse --abbrev-ref HEAD > ./hyper_parallel/.commit_id "
-                         "&& git log --abbrev-commit -1 >> ./hyper_parallel/.commit_id")
-    if ret_code != 0:
-        sys.stdout.write(
-            "Warning: Can not get commit id information. Please make sure git is available.")
-        os.system(
-            "echo 'git is not available while building.' > ./hyper_parallel/.commit_id")
-
-
 class EggInfo(egg_info):
     """Egg info."""
 
-    def run(self) -> None:
-        """Regenerate egg metadata and normalize its permissions."""
+    def run(self):
         egg_info_dir = os.path.join(os.path.dirname(
             __file__), 'hyper_parallel.egg-info')
         shutil.rmtree(egg_info_dir, ignore_errors=True)
@@ -238,67 +146,30 @@ class EggInfo(egg_info):
 class BuildPy(build_py):
     """Build py files."""
 
-    def run(self) -> None:
-        """Build Python and optional native artifacts into the wheel tree."""
-        strict_native_build = _is_strict_native_build()
-        if strict_native_build:
-            logger.info("Strict native build mode enabled.")
-        if _should_check_gcc_version():
-            _check_gcc_version()
-        # Native build scripts write .so files into build/lib/hyper_parallel/
-        # (a fixed path baked into their CMake install rules). When the wheel
-        # is tagged as platform-specific (BinaryDistribution), setuptools'
-        # build_py writes to build/lib.<plat>-<py>/ instead, so we have to
-        # mirror the script outputs into self.build_lib after super().run().
-        native_lib_dir = os.path.join(
-            os.path.dirname(__file__), 'build', 'lib', 'hyper_parallel')
-        shutil.rmtree(native_lib_dir, ignore_errors=True)
-        self._run_shell_script_optional("scripts/build_symmetric_memory.sh", strict=strict_native_build)
-        self._run_shell_script_optional("scripts/build_multicore.sh", strict=strict_native_build)
-        self._run_shell_script_optional("scripts/build_custom_ops.sh", strict=strict_native_build)
+    def run(self):
+        """Build Python sources and copy the explicitly prepared native payload."""
+        shutil.rmtree(self.build_lib, ignore_errors=True)
         super().run()
         target_lib_dir = os.path.join(self.build_lib, 'hyper_parallel')
-        if os.path.isdir(native_lib_dir) and \
-           os.path.abspath(native_lib_dir) != os.path.abspath(target_lib_dir):
-            shutil.copytree(native_lib_dir, target_lib_dir, dirs_exist_ok=True)
+        native_payload = os.environ.get("HYPER_PARALLEL_NATIVE_OUTPUT_ROOT", "").strip()
+        if native_payload:
+            if not os.path.isdir(native_payload):
+                logger.warning(
+                    "[HP-NATIVE-PAYLOAD-MISSING] wheel will contain only successfully built Python sources: %s",
+                    native_payload,
+                )
+            else:
+                shutil.copytree(native_payload, target_lib_dir, dirs_exist_ok=True)
+                logger.info("Copied optional native payload from %s", native_payload)
+        else:
+            logger.info("No native payload selected; assembling a core-only wheel.")
         update_permissions(target_lib_dir)
-
-    def _run_shell_script(self, script_path, args=None, capture_output=False):
-        """Execute specified shell script with error handling"""
-        if args is None:
-            args = []
-
-        if not os.path.exists(script_path):
-            error_msg = f"Warning: Script not found: {script_path}"
-            logger.error(error_msg)
-            raise FileNotFoundError(error_msg)
-
-        cmd = ["bash", script_path] + args
-        logger.info("Executing: %s", ' '.join(cmd))
-        try:
-            result = subprocess.run(cmd, check=True, capture_output=capture_output, text=True)
-            if result.stdout:
-                logger.info("Success: %s", result.stdout)
-        except subprocess.CalledProcessError as e:
-            error_msg = f"Failed to execute script: {script_path}, error: {e.stderr}"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg) from e
-
-    def _run_shell_script_optional(self, script_path, args=None, strict=False):
-        """Execute shell script; log a warning on failure instead of raising."""
-        try:
-            self._run_shell_script(script_path, args=args)
-        except (FileNotFoundError, RuntimeError) as e:
-            if strict:
-                raise
-            logger.warning("Optional build step skipped (%s): %s", script_path, e)
 
 
 class Install(install):
     """Install."""
 
-    def run(self) -> None:
-        """Install the package and normalize installed-file permissions."""
+    def run(self):
         super().run()
         if sys.argv[-1] == 'install':
             pip = import_module('pip')
@@ -323,14 +194,6 @@ class BinaryDistribution(Distribution):
 
 
 if __name__ == '__main__':
-    version_info = sys.version_info
-    if (version_info.major, version_info.minor) < (3, 10) or \
-       (version_info.major, version_info.minor) >= (3, 13):
-        sys.stderr.write('Python version must be in [3.10, 3.13).\r\n')
-        sys.exit(1)
-
-    write_commit_id()
-
     _cmdclass = {
         'egg_info': EggInfo,
         'build_py': BuildPy,
@@ -351,28 +214,19 @@ if __name__ == '__main__':
         long_description=get_readme_content(),
         long_description_content_type="text/markdown",
         test_suite="tests",
-        packages=get_packages(),
-        py_modules=['hyper_parallel_vllm_plugin'],
-        package_dir={"rl": os.path.join("hyper_parallel", "rl", "rl")},
+        packages=find_packages(exclude=["*tests*",
+                                        "hyper_parallel.auto_parallel.fast-tuner",
+                                        "hyper_parallel.auto_parallel.fast-tuner.*"]),
         platforms=[get_platform()],
         include_package_data=True,
+        scripts=['scripts/hyper_parallel_multicore_set_env.bash'],
         package_data={
-            'hyper_parallel': ['.commit_id',
-                       'lib/*.so',
-                       'lib/*/*.so'],
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
-            'hyper_parallel.platform.torch.symmetric_memory': ['*.so'],
-            'hyper_parallel.platform.mindspore.symmetric_memory': ['aclshmem_ms/*.so'],
-            'hyper_parallel.platform.mindspore.custom_ops': [
-                'build/lib/*.so',
-            ],
-            'hyper_parallel.core.multicore.platform.mindspore': [
-                'build/lib/*.so',
-                'build/lib/*_auto_generate/*.py',
-            ],
-            'hyper_parallel.core.multicore.platform.torch': [
-                '*.so',
-            ],
+            'hyper_parallel.platform.torch.custom_ops.gdn': ['LICENSE'],
+            'hyper_parallel.platform.mindspore.custom_ops': ['lib/*.so', 'lib/*_auto_generate/*.py'],
+            'hyper_parallel.core.multicore': ['lib/**/*'],
+            'hyper_parallel.core.symmetric_memory': ['lib/**/*'],
+            'hyper_parallel.auto_models.components.datasets.llm': ['*.so'],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
                 'configs_eval/default.yaml',
             ],
@@ -385,12 +239,6 @@ if __name__ == '__main__':
         python_requires='>=3.10,<3.13',
         install_requires=get_install_requires(),
         extras_require=get_extra_requires(),
-        entry_points={
-            'vllm.general_plugins': [
-                'hyper_parallel_models=hyper_parallel_vllm_plugin:register_hyper_models',
-                'hyper_rl_models=rl.roles.rollout.vllm_plugin:register_hyper_models',
-            ],
-        },
         classifiers=[
             'Development Status :: 4 - Beta',
             'Environment :: Console',

@@ -1,0 +1,48 @@
+{
+    "name": "fixture_multi_group",
+    "pre_defined_layer": {
+        "HEAD": 0,
+        "TAIL": -1
+    },
+    "auto_partition_layer": {
+        "NumberOfLayers": 24
+    },
+    "layers_description": [
+        {
+            "name": "HEAD",
+            "type": "HEAD",
+            "model_name": "fixture_multi_group",
+            "time": 10,
+            "nb_layer": 1,
+            "memory_parameter": 500
+        },
+        {
+            "name": "encoder",
+            "type": "BODY",
+            "model_name": "fixture_multi_group",
+            "time": 5,
+            "nb_layer": 12,
+            "memory_parameter": 100,
+            "memory_activation": 200,
+            "memory_recompute": 50
+        },
+        {
+            "name": "decoder",
+            "type": "BODY",
+            "model_name": "fixture_multi_group",
+            "time": 4,
+            "nb_layer": 12,
+            "memory_parameter": 80,
+            "memory_activation": 160,
+            "memory_recompute": 40
+        },
+        {
+            "name": "TAIL",
+            "type": "TAIL",
+            "model_name": "fixture_multi_group",
+            "time": 20,
+            "nb_layer": 1,
+            "memory_parameter": 500
+        }
+    ]
+}

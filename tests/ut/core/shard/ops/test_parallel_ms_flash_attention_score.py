@@ -407,7 +407,7 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         assert len(softmax_sum.tensor_map) == 4
         assert softmax_max.tensor_map == (1, 0, -1, -1)
         assert softmax_sum.tensor_map == (1, 0, -1, -1)
-        assert softmax_out.tensor_map == ()
+        assert softmax_out.tensor_map == (-1,)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_multi_dimensional_mesh_17(self, mock_platform):
@@ -935,7 +935,7 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         local_outputs = (
             np.empty((2, 2, 8), dtype=np.float32),
             np.empty((2, 2, 8), dtype=np.float32),
-            np.empty((), dtype=np.float32),
+            np.empty((1,), dtype=np.float32),
             np.empty((2, 2, 32), dtype=np.float32),
         )
 

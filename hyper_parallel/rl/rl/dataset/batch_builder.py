@@ -20,6 +20,8 @@ from rl.dataset.contracts import ExperienceBatch, Trajectory
 from rl.roles.rollout.base import GenerationSettings
 from hyper_parallel import get_platform
 platform = get_platform()
+
+
 def build_experience_batch(
     trajectories: tuple[Trajectory, ...],
     generation_seconds: float,
@@ -92,11 +94,15 @@ def build_experience_batch(
         worker_policy_fingerprint=worker_fingerprints.pop(),
         metadata=batch_metadata,
     )
+
+
 class ExperiencePreparer:
     """Combine completed role outputs into an immutable training batch."""
+
     def __init__(self, algorithm: RLAlgorithm) -> None:
         """Initialize target construction for one algorithm recipe."""
         self.algorithm = algorithm
+
     def prepare(
         self,
         rollout: ExperienceBatch,
