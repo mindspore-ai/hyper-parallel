@@ -796,6 +796,14 @@ def sdpa_hf_ulysses_cp_wrapper(
                 **attention_kwargs: Any) -> Any:
             """Run one intercepted SDPA call in the Ulysses layout."""
             fired["hit"] = True
+            # TP can leave GQA K/V with fewer local heads than the Ulysses
+            # degree (for example Qwen3: 4 Q heads / 2 KV heads with TP2,
+            # CP2).  Ulysses exchanges the head dimension, so normalize GQA
+            # before the exchange; otherwise a one-head K/V tensor cannot be
+            # evenly split across the CP group.
+            query, key, value, attention_kwargs = _normalize_hf_sdpa_gqa(
+                query, key, value, attention_kwargs
+            )
             return _ulysses_attention_call(
                 original_sdpa,
                 cp_mesh,
