@@ -57,6 +57,9 @@ from hyper_parallel.auto_models.components.distributed.injection import (
 from hyper_parallel.auto_models.components.distributed.precompiled_boundary import (
     PrecompiledBoundary,
 )
+from hyper_parallel.auto_models.components.distributed.packed_shard import (
+    pack_tensor_for_placements,
+)
 from hyper_parallel.auto_models.components.distributed.tp_collective_lowering import (
     create_tp_collective_lowerer,
 )
@@ -680,10 +683,24 @@ def _shard_module_params(module, param_specs, mesh, mesh_dim_names):
             continue
 
         src = param.data if hasattr(param, "data") else param
+        src = pack_tensor_for_placements(src, placements, mesh)
         dt = distribute_tensor(src, mesh, placements)
         requires_grad = getattr(param, "requires_grad", True)
         _set_param_by_path(module, param_path,
                            nn.Parameter(dt, requires_grad=requires_grad))
+        owner_path = param_path.rpartition(".")[0]
+        owner = module.get_submodule(owner_path) if owner_path else module
+        local_shape = tuple(dt.to_local().shape)
+        if isinstance(owner, nn.Linear) and param_path.endswith("weight"):
+            owner.out_features, owner.in_features = local_shape
+        if (
+            isinstance(owner, nn.Conv1d)
+            and param_path.endswith("weight")
+            and owner.groups == owner.in_channels == owner.out_channels
+        ):
+            owner.in_channels = local_shape[0]
+            owner.out_channels = local_shape[0]
+            owner.groups = local_shape[0]
 
 
 # ────────────────────────────────────────────────────────────────────────────

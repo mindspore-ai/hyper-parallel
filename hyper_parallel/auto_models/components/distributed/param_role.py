@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 class ParamRole(Enum):
-    """Semantic roles of parameters (14 enum values, 05 §3.6)."""
+    """Semantic roles of parameters used by sharding-plan derivation."""
     COLWISE = auto()        # column-sharded linear layers: q/k/v/gate/up proj → Shard(0)
     ROWWISE = auto()        # row-sharded linear layers: o/down proj → Shard(1)
     NORM = auto()           # RMSNorm/LayerNorm weight → Replicate
@@ -42,6 +42,8 @@ class ParamRole(Enum):
     SHARED_EXPERT = auto()  # MoE shared expert → EP Replicate + TP colwise/rowwise
     FUSED_QKV = auto()      # fused QKV → Shard(0) (a later SpecialHandler may adjust)
     FUSED_GATE_UP = auto()  # fused gate/up → Shard(0)
+    GDN_PACKED_QKV = auto() # GDN [Q | K | V] projection/conv → PackedShard(0)
+    GDN_HEAD = auto()       # GDN per-value-head parameter → Shard(0)
     BIAS = auto()           # unmatched bias → Replicate; Linear bias follows its weight role
     REPLICATED = auto()     # linear-layer weights forced to be replicated
                             # (e.g. MLA q_a/kv_a down projections)
@@ -117,9 +119,13 @@ def _build_default_rules() -> List[Tuple[List[str], ParamRole, str]]:
         (["shared_expert", "shared_experts"], ParamRole.SHARED_EXPERT, SEGMENT_EXACT),
         (["experts"], ParamRole.MOE_EXPERT, SEGMENT_SUBSTRING),
         ([".mlp.gate.", ".router.", "moe_gate", "mlp.router"], ParamRole.MOE_GATE, SEGMENT_SUBSTRING),
+        (["in_proj_qkv", "linear_attn.conv1d"], ParamRole.GDN_PACKED_QKV, SEGMENT_SUBSTRING),
+        (["in_proj_z", "in_proj_b", "in_proj_a"], ParamRole.COLWISE, SEGMENT_SUBSTRING),
+        (["linear_attn.out_proj"], ParamRole.ROWWISE, SEGMENT_SUBSTRING),
+        (["a_log", "dt_bias"], ParamRole.GDN_HEAD, SEGMENT_SUBSTRING),
         (["fused_qkv", "qkv_proj", "query_key_value"], ParamRole.FUSED_QKV, SEGMENT_SUBSTRING),
         (["gate_up_proj", "fused_gate_up", ".w13."], ParamRole.FUSED_GATE_UP, SEGMENT_SUBSTRING),
-        (["a_log", "dt_bias", "gated_delta"], ParamRole.SPECIAL, SEGMENT_SUBSTRING),
+        (["gated_delta"], ParamRole.SPECIAL, SEGMENT_SUBSTRING),
         (["norm", "layernorm", "rmsnorm", "ln_"], ParamRole.NORM, SEGMENT_SUBSTRING),
         (["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", ".w1.", ".w3."],
          ParamRole.COLWISE, SEGMENT_SUBSTRING),

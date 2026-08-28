@@ -68,6 +68,47 @@ DP = MeshAxisName.DP
 NamedPlacement = Dict[MeshAxisName, Placement]
 
 
+class PackedShard(Shard):
+    """Shard packed logical sections independently along one tensor dimension.
+
+    A packed tensor such as ``[Q | K | V]`` cannot be split as one contiguous
+    dimension when the logical section sizes differ. ``PackedShard`` keeps the
+    standard :class:`Shard` runtime semantics after arranging each rank's
+    section slices contiguously.
+
+    Args:
+        dim: Packed tensor dimension.
+        sections: Sizes of the logical sections along ``dim``.
+    """
+
+    def __init__(self, dim: int, sections: Tuple[int, ...]) -> None:
+        """Initialize a packed sharding placement."""
+        super().__init__(dim)
+        if len(sections) < 2 or any(not isinstance(size, int) or size <= 0 for size in sections):
+            raise ValueError(
+                "PackedShard sections must contain at least two positive integers, "
+                f"got {sections!r}"
+            )
+        self._sections = tuple(sections)
+
+    @property
+    def sections(self) -> Tuple[int, ...]:
+        """Return logical section sizes in their original packed order."""
+        return self._sections
+
+    def __eq__(self, other: object) -> bool:
+        return type(self) is type(other) and self.dim == other.dim and self.sections == other.sections
+
+    def __hash__(self) -> int:
+        return hash((self.dim, self.sections, "PackedShard"))
+
+    def __repr__(self) -> str:
+        return f"PackedShard(dim={self.dim}, sections={self.sections})"
+
+    def __str__(self) -> str:
+        return f"PS({self.dim}, {self.sections})"
+
+
 @dataclass(frozen=True)
 class TpLocalAttrPlan:
     """Planner-generated TP-local module attribute adjustment plan."""

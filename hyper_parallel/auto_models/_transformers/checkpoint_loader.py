@@ -37,6 +37,10 @@ from hyper_parallel.auto_models.weight_conversion import (
 )
 
 from hyper_parallel import DTensor, Partial, distribute_tensor
+from hyper_parallel.auto_models.components.distributed.packed_shard import (
+    pack_tensor_for_placements,
+    unpack_tensor_from_placements,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +411,11 @@ def _shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch
     if any(isinstance(placement, Partial) for placement in layout.placements):
         raise ValueError(f"Partial placement is not supported for pretrained loading: {target_name}")
 
+    full_tensor = pack_tensor_for_placements(
+        full_tensor,
+        layout.alias_placements,
+        layout.mesh,
+    )
     local_dtensor = distribute_tensor(
         full_tensor,
         layout.mesh,
@@ -749,7 +758,9 @@ class CheckpointManager:
         state_dict = self.model.state_dict(keep_vars=True)
         gathered = {}
         for name, value in state_dict.items():
+            layout = None
             if isinstance(value, DTensor):
+                layout = value.layout
                 value = value.full_tensor()
             elif isinstance(value, torch.Tensor):
                 layout = getattr(value, "_sharding_spec", None)
@@ -757,6 +768,12 @@ class CheckpointManager:
                     value = DTensor.from_local_with_layout(value.detach(), layout).full_tensor()
                 else:
                     value = value.detach()
+            if layout is not None:
+                value = unpack_tensor_from_placements(
+                    value,
+                    layout.alias_placements,
+                    layout.mesh,
+                )
             if keep_state_dict:
                 gathered[name] = value.cpu() if isinstance(value, torch.Tensor) else value
         return gathered

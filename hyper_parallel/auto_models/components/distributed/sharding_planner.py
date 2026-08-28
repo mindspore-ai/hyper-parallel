@@ -64,6 +64,7 @@ from hyper_parallel.auto_models.components.distributed.sharding_config import (
     MeshAxisName,
     ModuleShardingSpec,
     NamedPlacement,
+    PackedShard,
     ShardingPlan,
     ShardingTemplate,
     TEMPLATES,
@@ -321,7 +322,50 @@ class ShardingPlanner:
                     spec.inner_target = "self"
                     spec.inner_wrapper = "qwen3_8_gdn_ulysses"
                     spec.region_dispatch = False
+            if boundary_type == "linear_attention" and "tp" in mesh_dim_names:
+                self._configure_gdn_tp_spec(
+                    spec,
+                    model.get_submodule(boundary_fqn),
+                    boundary_fqn,
+                )
             plan.modules[boundary_fqn] = spec
+
+    @staticmethod
+    def _configure_gdn_tp_spec(
+        spec: ModuleShardingSpec,
+        module: nn.Module,
+        boundary_fqn: str,
+    ) -> None:
+        """Finalize packed GDN placements from the concrete module shapes."""
+        if "GatedDeltaNet" not in type(module).__name__:
+            return
+        required = ("in_proj_qkv", "in_proj_z", "conv1d")
+        missing = [name for name in required if not hasattr(module, name)]
+        if missing:
+            raise ValueError(
+                f"{boundary_fqn}: GatedDeltaNet TP requires modules {required}, "
+                f"missing {missing}"
+            )
+        qkv_size = module.in_proj_qkv.weight.shape[0]
+        value_size = module.in_proj_z.weight.shape[0]
+        remainder = qkv_size - value_size
+        if remainder <= 0 or remainder % 2:
+            raise ValueError(
+                f"{boundary_fqn}: cannot derive [Q|K|V] sections from "
+                f"in_proj_qkv={qkv_size}, in_proj_z={value_size}"
+            )
+        key_size = remainder // 2
+        packed = _multi_dim(
+            tp=PackedShard(0, (key_size, key_size, value_size)),
+            cp=Replicate(),
+            ep=Replicate(),
+        )
+        for param_name in ("in_proj_qkv.weight", "conv1d.weight", "conv1d.bias"):
+            if param_name in spec.params:
+                spec.params[param_name] = packed
+        spec.tp_divide_attrs = [
+            "num_v_heads", "num_k_heads", "key_dim", "value_dim", "conv_dim",
+        ]
 
     def _finalize_boundary_specs(
         self,
@@ -888,6 +932,13 @@ class ShardingPlanner:
                               cp=Replicate(), ep=Replicate())
         if role == ParamRole.ROWWISE:
             return _multi_dim(tp=template.rowwise_placement if has_tp else None,
+                              cp=Replicate(), ep=Replicate())
+        if role == ParamRole.GDN_PACKED_QKV:
+            # Concrete section sizes are installed after resolving the GDN
+            # boundary module in _configure_gdn_tp_spec.
+            return _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())
+        if role == ParamRole.GDN_HEAD:
+            return _multi_dim(tp=Shard(0) if has_tp else None,
                               cp=Replicate(), ep=Replicate())
         if role in (ParamRole.NORM, ParamRole.MOE_GATE):
             return _multi_dim(tp=template.norm_placement if has_tp else None,
@@ -1840,12 +1891,25 @@ class ShardingPlanner:
                             f"of range for a {ndim}D parameter; fix the "
                             f"plan_overrides declaration"
                         )
-                    if shape[dim] % size != 0:
+                    logical_sizes = (
+                        p.sections if isinstance(p, PackedShard) else (shape[dim],)
+                    )
+                    if isinstance(p, PackedShard) and sum(logical_sizes) != shape[dim]:
+                        raise ValueError(
+                            f"plan-time packed shard check failed: {full!r} has "
+                            f"shape {tuple(shape)} but sections {logical_sizes} do not "
+                            f"cover shape[{dim}]={shape[dim]}"
+                        )
+                    invalid_sizes = [
+                        logical_size for logical_size in logical_sizes
+                        if logical_size % size
+                    ]
+                    if invalid_sizes:
                         raise ValueError(
                             f"plan-time shard check failed: {full!r} has shape "
                             f"{tuple(shape)} but boundary {fqn!r} declares "
-                            f"{{{axis_name}: Shard({p.dim})}} — shape[{dim}]={shape[dim]} "
-                            f"is not divisible by {axis_name} size {size} (it would "
+                            f"{{{axis_name}: {p!r}}} — logical section sizes "
+                            f"{invalid_sizes} are not divisible by {axis_name} size {size} (it would "
                             f"produce empty shards at apply time). This is most "
                             f"often a parameter-classification error (e.g. a "
                             f"replicated/gate parameter misclassified into a "
