@@ -19,7 +19,7 @@ from tests.common.parallel_case import parallel_run, MindSporeCase
 BASE_SHARD = "ckpt_activation.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sac_group():
     """
     Feature: parallel run case in ckpt_activation

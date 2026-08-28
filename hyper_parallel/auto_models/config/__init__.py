@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Typed YAML configuration resolution for HyperModels."""
+"""Typed YAML configuration resolution for AutoModels."""
 
 __all__: list[str] = []

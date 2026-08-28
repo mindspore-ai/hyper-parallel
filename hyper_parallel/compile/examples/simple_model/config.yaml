@@ -1,0 +1,39 @@
+model:
+  vocab_size: 128256
+  dim: 4096
+  max_seq_len: 8192
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+train:
+  max_steps: 1000
+  optimizer:
+    lr: 3.0e-4
+  grad_clip: 1.0
+
+# ============================================================================
+# Parallel Configuration (Core)
+# ============================================================================
+parallel:
+  # Optimization options
+  enable_overlap: true
+
+# ============================================================================
+# Sharding Configuration
+# ============================================================================
+sharding:
+  # FSDP configuration
+  fsdp:
+    enabled: true  # REQUIRED: Enable FSDP
+    # Wrap modules by pattern (supports wildcards)
+    patterns:
+      - pattern: "*"  # FSDP all modules
+        reshard_after_forward: true
+        use_cpu_offload: false
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+logging:
+  log_interval: 10

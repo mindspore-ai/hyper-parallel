@@ -23,7 +23,11 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers.activations import ACT2FN
-from transformers.core_model_loading import Transpose, WeightConverter, WeightRenaming
+from hyper_parallel.auto_models.weight_conversion import (
+    Transpose,
+    WeightConverter,
+    WeightRenaming,
+)
 
 from hyper_parallel.auto_models.components.model_transform import module_replacement
 from hyper_parallel.auto_models.ops import (

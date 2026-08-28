@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Optimizer and learning-rate scheduler interfaces for HyperModels."""
+"""Optimizer and learning-rate scheduler interfaces for AutoModels."""
 
 from .lr_scheduler.lr_scheduler import MultiLRScheduler
 from .optimizer.optimizer import AdamW, Muon

@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Reusable components for the HyperModels training suite."""
+"""Reusable components for the AutoModels training suite."""

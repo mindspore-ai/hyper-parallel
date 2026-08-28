@@ -58,6 +58,7 @@ from hyper_parallel.auto_models.components.distributed.param_role import (
 from hyper_parallel.auto_models.components.distributed.function_module import FunctionModule
 from hyper_parallel.auto_models.components.distributed.head_count import build_tp_local_attr_plan
 from hyper_parallel.auto_models.components.distributed.sharding_config import (
+    CP,
     DP,
     TP,
     MeshAxisName,
@@ -789,6 +790,7 @@ class ShardingPlanner:
     ) -> Optional[ModuleShardingSpec]:
         """Template + ParamRole → ModuleShardingSpec (05 §3.5 Template Mapping)."""
         has_tp = "tp" in mesh_dim_names
+        has_cp = "cp" in mesh_dim_names
         has_ep = "ep" in mesh_dim_names
         # The derived spec is materialized directly with concrete dicts (None
         # is the "undeclared" semantics on the override input side; derived
@@ -822,9 +824,19 @@ class ShardingPlanner:
         # The CP dim is always Shard(1) (D-07/R8): under CP the loss is
         # computed on the local chunk; no gather is performed.
         if template is self._templates.get("lm_head"):
+            cp_placement = Shard(1) if has_cp else Replicate()
+            for input_contract in (spec.in_src, spec.in_dst):
+                for placements in input_contract.values():
+                    placements[CP] = cp_placement
+            spec.out_src = _multi_dim(
+                tp=Shard(-1),
+                cp=cp_placement,
+                ep=Replicate(),
+            )
             spec.out_dst = _multi_dim(
                 tp=Shard(-1) if loss_parallel else Replicate(),
-                cp=Shard(1), ep=Replicate(),
+                cp=cp_placement,
+                ep=Replicate(),
             )
 
         # Step 2.6: embed's CP contract (revision D-05): the CP data
@@ -833,7 +845,6 @@ class ShardingPlanner:
         # the template's default Replicate, otherwise the boundary would
         # scatter the already-sharded chunk a second time (the sequence
         # would be sharded twice).
-        has_cp = "cp" in mesh_dim_names
         if template is self._templates.get("embed") and has_cp and sequence_parallel:
             spec.in_src = {"input": _multi_dim(tp=Replicate(), cp=Shard(1),
                                                ep=Replicate())}
@@ -844,7 +855,7 @@ class ShardingPlanner:
         # Step 3: special flags
         spec.region_dispatch = template.region_dispatch
         if template.needs_cp_attn:
-            spec._needs_cp_attn = True
+            spec._needs_cp_attn = True  # pylint: disable=protected-access  # planner owns the spec DSL internals
 
         # Step 4: normalize out_src/out_dst scalar shorthand
         return _normalize_out_fields(spec)
@@ -996,7 +1007,7 @@ class ShardingPlanner:
             spec.params[stacked] = _multi_dim(
                 tp=tp_placement, cp=Replicate(), ep=template.moe_expert_placement
             )
-            spec._ep_stack[stacked] = sources
+            spec._ep_stack[stacked] = sources  # pylint: disable=protected-access  # planner owns the spec DSL internals
 
     @staticmethod
     def _mark_extended_expert_params(
@@ -1018,7 +1029,7 @@ class ShardingPlanner:
                 spec.params[stacked] = _multi_dim(
                     tp=None, cp=Replicate(), ep=template.moe_expert_placement
                 )
-                spec._ep_stack[stacked] = sources
+                spec._ep_stack[stacked] = sources  # pylint: disable=protected-access  # planner owns the spec DSL internals
             spec.region_dispatch = None
             return
         if batched:
@@ -1042,7 +1053,7 @@ class ShardingPlanner:
         out_layout = copy.deepcopy(next(iter(identity.values())))
         spec.out_src = {"output": copy.deepcopy(out_layout)}
         spec.out_dst = {"output": copy.deepcopy(out_layout)}
-        spec._ep_size = ep_extend
+        spec._ep_size = ep_extend  # pylint: disable=protected-access  # planner owns the spec DSL internals
 
     def _mark_hf_native_moe(
         self, spec: ModuleShardingSpec, group, boundary_fqn: str,
@@ -1346,7 +1357,7 @@ class ShardingPlanner:
                 raise ValueError(
                     f"Cannot finalize TP-local attributes: module "
                     f"{module_fqn!r} is not present in model.named_modules()")
-            spec._tp_local_attr_plan = build_tp_local_attr_plan(
+            spec._tp_local_attr_plan = build_tp_local_attr_plan(  # pylint: disable=protected-access  # planner owns the spec DSL internals
                 module, spec, module_fqn, tp_size, mesh_dim_names,
             )
 
@@ -1627,7 +1638,7 @@ class ShardingPlanner:
         to a generic skeleton when the module/signature is unavailable."""
         try:
             module = dict(model.named_modules()).get(fqn)
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught  # best-effort hint only
             module = None
         in_names = ["hidden_states"]
         param_names: List[str] = []
@@ -1899,7 +1910,7 @@ class ShardingPlanner:
         )
         terminal = sorted_fqns[-1] if sorted_fqns else None
         for fqn, spec in plan.modules.items():
-            spec._is_terminal = fqn == terminal
+            spec._is_terminal = fqn == terminal  # pylint: disable=protected-access  # planner owns the spec DSL internals
         return plan
 
     def _topological_sort_by_forward_order(self, fqns: List[str], model) -> List[str]:
@@ -1908,7 +1919,7 @@ class ShardingPlanner:
         fqn_set = set(fqns)
         ordered: List[str] = []
         seen: set = set()
-        for name, _module in model.named_modules():
+        for name, _ in model.named_modules():
             if name in fqn_set and name not in seen:
                 ordered.append(name)
                 seen.add(name)

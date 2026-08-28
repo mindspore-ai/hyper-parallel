@@ -1,195 +1,119 @@
-# HyperParallel Graph Compile Architecture Design
+# HyperParallel Graph Mode
 
-## Overview
+Graph-mode architecture for automatic parallelization with FSDP.
 
-HyperParallel Graph Compile is the graph-mode architecture of HyperParallel, adopting a **declarative parallelism** design philosophy:
+> **Note**: The `compile/` subpackage is currently torch-only (it relies on a
+> patched autograd engine for joint-graph capture; see Limitations). Backend
+> imports (`torch.*`) are therefore intentional and tracked as a known
+> platform-layering exception pending a future `get_platform()` abstraction for
+> graph trace / FSDP-pass APIs.
 
-- **User Perspective**: Only write single-card model + sharding configuration
-- **Framework Responsibilities**: Graph capture → Sharding annotation → Parallel partitioning → Communication-compute overlap → Execution
+## Core Concept
 
-## Core Design Philosophy
+**User**: Write model code + parallel configuration
+**Framework**: Graph capture → FSDP partitioning → Communication-compute overlap → Execution
+
+## Architecture
+
+### Layer 1: Configuration
+
+```python
+from hyper_parallel.compile import ShardingPlan, ParallelConfig
+
+# Configure which modules to wrap with FSDP
+sharding_plan = ShardingPlan()
+sharding_plan.fsdp_wrap("tok_embeddings")
+sharding_plan.fsdp_wrap_pattern("layers.*")
+
+# Parallel configuration
+parallel_config = ParallelConfig(enable_overlap=True)
+```
+
+### Layer 2: Graph Capture
+
+`trace_model_graph` captures forward + backward into a joint FX graph:
+
+- Parameters/buffers are static inputs (placeholders), not `get_attr` nodes
+- `torch.autograd.grad` runs inside the traced function
+- Uses `FakeTensorMode` + `make_fx` for symbolic tracing
+
+### Layer 3: Pass Pipeline
 
 ```text
-User Input:
-  ┌──────────────────┐      ┌────────────────────────┐
-  │ Single-card model│  +   │ Parallel config (YAML) │
-  │ code (nn.Module) │      │ - fsdp_degree: 8       │
-  │                  │      │ - tp_degree: 2         │
-  │ No parallel code │      │ - enable_overlap: true │
-  └──────────────────┘      └────────────────────────┘
-
-Framework Processing:
-  1. Graph Capture: Capture complete single-card model graph (Forward + Backward)
-  2. Sharding Annotation: Annotate sharding specs based on ShardingPlan
-  3. Parallel Partitioning: Automatic FSDP/TP/EP/PP partitioning in Pass stage
-  4. Communication-Compute Overlap: Optimize overlap between communication and computation
+DeadCodeElimination → CanonicalizeGraph → FSDPPass → AutoOverlapPass
 ```
 
-## Architecture Layers
+**FSDPPass**:
 
-### Layer 1: User Configuration Layer
+- Identifies FSDP parameter placeholders via ShardingPlan
+- Inserts `all_gather` after each FSDP parameter (Shard → Replicate)
+- Inserts `reduce_scatter` on gradient outputs (Replicate → Shard)
+- Physically shards live model parameters (dim 0) so optimizer is FSDP-agnostic
 
-**ShardingSpec - Sharding Specification**
+**AutoOverlapPass**:
+
+- Reorders `wait_tensor` nodes for communication-compute overlap
+
+### Layer 4: Execution
 
 ```python
-ShardingSpec({
-    MeshAxisName.TP: spmd.S(0),     # TP dimension shards on tensor dim 0
-    MeshAxisName.FSDP: spmd.S(0),   # FSDP dimension shards on tensor dim 0
-})
-```
+from hyper_parallel.compile import GraphTrainer
 
-**ShardingModuleConfig - Module Sharding Configuration**
-
-```python
-ShardingModuleConfig(
-    param_shardings={"weight": ShardingSpec.shard(TP, 0)},
-    input_src_shardings={"x": sequence_parallel_spec()},
-    input_dst_shardings={"x": ShardingSpec.replicate(TP)},
-    output_src_sharding=ShardingSpec.partial(TP),
-    output_dst_sharding=sequence_parallel_spec(),
-)
-```
-
-### Layer 2: Graph Capture Layer
-
-```python
-def trace_single_card_graph(model, train_fn, sample_input, sample_label):
-    """
-    Trace single-card model to generate complete computation graph
-
-    Features:
-    - No parallel processing, pure single-card semantics
-    - Parameters, activations, gradients are all complete tensors
-    - Forward + Loss + Backward complete joint graph
-    """
-```
-
-### Layer 3: Pass Pipeline Layer
-
-**Execution Order**:
-
-```text
-[DeadCodeElimination] → Clean up dead code
-        ↓
-[CanonicalizeGraph] → Canonicalize graph
-        ↓
-[ShardingPass] → Metadata layer: Annotate sharding specs to node.meta
-        ↓
-[TPPass] → Execution layer: TP partitioning and communication insertion
-        ↓
-[EPPass] → Execution layer: EP partitioning and communication insertion
-        ↓
-[FSDPPass] → Execution layer: FSDP partitioning and communication insertion
-        ↓
-[PPPass] → Execution layer: PP partitioning and P2P communication
-        ↓
-[CommReorderPass] → Communication-compute overlap: Reorder communication nodes
-        ↓
-[OverlapSchedulePass] → Communication-compute overlap: Generate overlap schedule
-```
-
-> Note: An optional `InductorPass` for backend compilation exists but is
-> currently disabled in `passes/pipeline.py`; the pipeline ends at
-> `OverlapSchedulePass` and executes the resulting graph directly.
-
-**Relationship between ShardingPass and TPPass**:
-
-- **ShardingPass** (Metadata layer):
-  - Parse ShardingPlan
-  - Annotate sharding metadata on graph nodes (no graph modification)
-  - Output: `node.meta["sharding_config"]`
-
-- **TPPass** (Execution layer):
-  - Read sharding specs annotated by ShardingPass
-  - Actually modify graph structure (partition parameters, insert communication)
-  - Handle all TP dimension logic
-
-### Layer 4: Graph Execution Layer
-
-The compiled graph is a callable `GraphModule`. On each step `GraphTrainer`
-feeds it the live model state in FQN order and consumes its outputs. The
-joint graph's parameters/buffers are *static inputs* (leading placeholders),
-so execution goes through `run_traced_graph`, which samples them from the
-live (FSDP-sharded) model each step and runs the whole fwd+bwd graph under
-`torch.no_grad()`:
-
-```python
-# GraphTrainer._run_graph
-outputs = run_traced_graph(
-    self._single_card_graph, self.model, input_batch, label_batch
-)
-# outputs == [loss] + list(grads)
-loss, grads = outputs[0], outputs[1:]
-```
-
-The graph itself embeds all parallel behaviour inserted by the passes (FSDP
-AllGather of parameters, forward/backward compute, gradient ReduceScatter,
-communication-compute overlap). There is no separate runtime object besides
-the state-feeding convenience of `run_traced_graph` -- execution is a call
-into the graph with the model's parameters threaded through as inputs.
-
-## Sharding Configuration System
-
-### Input/Output Resharding
-
-```text
-Input resharding (input_src → input_dst):
-  - src: Current sharding of input tensor (for DTensor.from_local)
-  - dst: Required sharding for computation (triggers redistribute)
-
-Output resharding (output_src → output_dst):
-  - src: Output sharding produced by computation
-  - dst: Expected output sharding (triggers redistribute)
-```
-
-### Common Sharding Patterns
-
-| Pattern | Param Sharding | Input Sharding | Output Sharding |
-|---------|----------------|----------------|-----------------|
-| ColwiseParallel | S(0) | - | S(-1) |
-| RowwiseParallel | S(1) | - | P → RS/AR |
-| SequenceParallel | - | S(1) | S(1) |
-| Norm | R/I | SP/I | SP/I |
-
-## Usage Example
-
-```python
-from hyper_parallel.compile import GraphTrainer, ParallelConfig
-from hyper_parallel.compile.sharding_config import create_sharding_plan_from_yaml
-
-# 1. Create single-card model (no parallel code)
-model = Llama3Model(model_spec)
-
-# 2. Configure parallelism
-parallel_config = ParallelConfig(
-    fsdp_degree=8,
-    tp_degree=2,
-    enable_overlap=True,
-)
-
-# 3. Configure sharding plan (loaded from examples/llama3/config.yaml)
-sharding_plan = create_sharding_plan_from_yaml(model_name="llama3")
-
-# 4. Create trainer
 trainer = GraphTrainer(
     model=model,
     train_fn=train_fn,
     parallel_config=parallel_config,
     sharding_plan=sharding_plan,
-    optimizer_config={"lr": 3e-4},
 )
 
-# 5. Training loop
-for batch in dataloader:
-    loss = trainer.train_step(input_ids, labels)
-    trainer.optimizer_step()
+# Compile on first batch, then run forward + backward + optimizer
+trainer.train(dataloader, max_steps=100, log_interval=10)
 ```
 
-## Comparison with TorchTitan
+The compiled graph is a `GraphModule` that:
 
-| Dimension | TorchTitan | HyperGraph |
-|-----------|------------|------------|
-| Configuration method | `ShardingConfig` on `Module.Config` | `ShardingPlan` + `ShardingModuleConfig` |
-| Application timing | Runtime `parallelize()` | Compile-time Pass Pipeline |
-| User interface | Model configuration object | Independent sharding plan object |
-| Pattern matching | Python code setup | Supports FQN wildcards |
+- Takes sharded parameters as inputs
+- Gathers them via AllGather at each step
+- Computes forward + backward
+- Scatters gradients via ReduceScatter
+- Outputs loss + grads
+
+## Usage
+
+```python
+from hyper_parallel.compile import GraphTrainer, ParallelConfig, ShardingPlan
+
+# 1. Model
+model = Llama3Model(config)
+
+# 2. Sharding plan
+sharding_plan = ShardingPlan()
+sharding_plan.fsdp_wrap_pattern("layers.*")
+
+# 3. Trainer
+trainer = GraphTrainer(
+    model=model,
+    train_fn=lambda m, x, y: m(x).loss(y),
+    parallel_config=ParallelConfig(enable_overlap=True),
+    sharding_plan=sharding_plan,
+)
+
+# 4. Training
+trainer.train(dataloader, max_steps=1000)
+```
+
+## Key Design Decisions
+
+1. **Static Inputs**: Parameters are graph inputs, not `get_attr`. This allows passes to split the graph by reshaping placeholders.
+
+2. **Joint Graph**: Forward + backward captured together via `torch.autograd.grad` inside the traced function.
+
+3. **FSDP-Agnostic Optimizer**: FSDPPass shards the live model's parameters in place. `model.parameters()` returns shards, so optimizer needs no FSDP awareness.
+
+4. **Declarative Sharding**: ShardingPlan uses FQN patterns (`layers.*`) instead of imperative module wrapping.
+
+## Limitations
+
+- FSDP only (TP/EP/PP planned)
+- Parameters must have dim 0 divisible by world_size
+- Requires torch with patched autograd engine for joint-graph capture

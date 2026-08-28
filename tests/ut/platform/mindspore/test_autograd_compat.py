@@ -15,6 +15,7 @@
 """Unit tests for MindSpore autograd compatibility helpers."""
 # pylint: disable=assignment-from-no-return,protected-access,unused-import
 
+import importlib.util
 import os
 import sys
 from types import SimpleNamespace
@@ -35,6 +36,11 @@ from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E4
 ensure_mindspore_platform_default()
 
 from hyper_parallel.platform.mindspore import autograd_compat
+
+# Some CI pythons are built without liblzma: the lazy transformers ->
+# torchvision import chain dies on "from _lzma import *". Tests hitting that
+# chain run only where lzma is available.
+_HAS_LZMA = importlib.util.find_spec("_lzma") is not None
 
 
 class FakeDType:
@@ -143,6 +149,7 @@ class TestGradProperty(unittest.TestCase):
 
         self.assertEqual(result, "dist_grad")
 
+    @unittest.skipIf(not _HAS_LZMA, "python build lacks liblzma (_lzma)")
     def test_grad_warns_for_non_leaf_tensor(self):
         """Reading `.grad` on a non-leaf tensor should emit the compatibility warning."""
         tensor = FakeTensor(is_leaf=False, requires_grad=True, grad="leaf_grad")

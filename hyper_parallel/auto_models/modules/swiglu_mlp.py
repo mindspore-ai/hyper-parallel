@@ -24,7 +24,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F
 from torch import nn
-from transformers.core_model_loading import (
+from hyper_parallel.auto_models.weight_conversion import (
     WeightConverter,
     WeightRenaming,
 )

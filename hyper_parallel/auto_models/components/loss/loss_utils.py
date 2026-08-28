@@ -26,7 +26,7 @@ from .dist_utils import all_reduce
 def count_loss_token(
     batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
-    # FIXME: VeOmni version -> HyperModels version
+    # FIXME: VeOmni version -> AutoModels version
     """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
     if isinstance(batches, dict):
         batches = [batches]
@@ -71,7 +71,7 @@ def mean_global_loss(
     step_token_counts: dict[str, torch.Tensor],
     device_mesh: MeshContext,
 ) -> dict[str, torch.Tensor]:
-    # FIXME: VeOmni version -> HyperModels version
+    # FIXME: VeOmni version -> AutoModels version
     """Calculate the global mean loss using explicit mesh information.
 
     FSDP divides gradients over its flattened DP+CP domain, so each local loss

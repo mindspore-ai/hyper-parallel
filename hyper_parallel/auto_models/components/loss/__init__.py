@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Loss component interfaces for HyperModels — following design doc §10 + §10.0."""
+"""Loss component interfaces for AutoModels — following design doc §10 + §10.0."""
 
 from .masked_ce import MaskedCrossEntropy
 from .model_output import ModelOutputLoss
