@@ -18,7 +18,7 @@ Full implementation will move to this module from infrastructure.py.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 
 
 @dataclass
@@ -31,9 +31,10 @@ class FSDP2MixedPrecisionConfig:
     FSDP2 manager builds the core policy.
     """
 
-    param_dtype: Literal["bfloat16", "float16", "float32"] | None = None
-    reduce_dtype: Literal["bfloat16", "float16", "float32"] | None = None
-    output_dtype: Literal["bfloat16", "float16", "float32"] | None = None
+    param_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
+    reduce_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
+    output_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
+    cast_forward_inputs: bool = True
 
 
 @dataclass
@@ -42,7 +43,6 @@ class FSDP2Config:
     dp_shard_size: int = 1
     edp_shard_size: int = 1
     replicate_params: list[str] = field(default_factory=list)
-    activation_checkpointing: bool | str = False
     mix_precision: FSDP2MixedPrecisionConfig = field(
         default_factory=FSDP2MixedPrecisionConfig
     )
@@ -50,12 +50,10 @@ class FSDP2Config:
     reshard_after_forward: bool = True
     reshard_after_backward: bool = True
     requires_grad_sync: bool = True
-    enable_async_tensor_parallel: bool = False
-    enable_compile: bool = False
     backward_prefetch_depth: int = 1
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False
-    comm_fusion_zero_copy: bool | None = None
+    comm_fusion_zero_copy: Optional[bool] = None
 
     def __post_init__(self) -> None:
         """Validate topology sizes and prefetch depths."""

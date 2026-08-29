@@ -1,0 +1,52 @@
+# Qwen2-MoE DP+CP+TP+EP FSDP fp32 main_param accuracy configuration.
+model:
+  _target_: torch.nn.Identity
+
+optimizer:
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.optimizer.AdamW
+  fp32_main_params: true
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+
+model_init_dtype: bfloat16
+
+training:
+  backend: hccl
+  global_batch_size: 8
+  micro_batch_size: 4
+  seed: 31415
+
+accelerator:
+  tp_size: 2
+  cp_size: 2
+  ep_size: 8
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: false
+
+plan_overrides:
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: "self"
+    inner_wrapper: sdpa_hf
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.auto_models.components.distributed.ep_compute.qwen2moe_ep_compute_fn
+
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 1
+  reshard_after_forward: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  replicate_params:
+    - model.norm.weight
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true

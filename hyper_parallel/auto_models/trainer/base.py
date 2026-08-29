@@ -1,4 +1,5 @@
 # Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +26,7 @@ Features:
     - Gradient accumulation
     - Checkpointing
 """
+# pylint: disable=forbidden-backend-import
 
 import json
 import logging
@@ -44,10 +46,11 @@ from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
-from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
+from hyper_parallel import HSDPModule, SkipDTensorDispatch
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from .config import TrainerConfig, save_configs
+from .model_init_dtype import apply_model_init_dtype
 from ..components.datasets import enable_dataset_logging
 from ..components.datasets.batching import build_dataloader
 from ..components.datasets.llm.chat_template import ChatTemplate
@@ -61,6 +64,9 @@ from ..components.distributed.infrastructure import (
 from ..components.loss.loss_utils import count_loss_token, mean_global_loss
 from ..components.loss.loss_parallel import causal_lm_loss_parallel
 from ..components.loss.model_output import ModelOutputLoss
+from ..components.optim.optimizer.mixed_precision_optimizer import (
+    Float16OptimizerWithFloat16Params,
+)
 from ..components.utils import helper
 from ..components.utils.device import synchronize, get_torch_device, get_device_type  # pylint: disable=syntax-error
 
@@ -242,12 +248,12 @@ class BaseTrainer(Stateful, ABC):
 
     # Model
     model: PreTrainedModel = None
-    model_parts: List[torch.nn.Module] | None = None
+    model_parts: Optional[List[torch.nn.Module]] = None
     hsdp_model_parts: List[torch.nn.Module] = []
     model_config: PretrainedConfig = PretrainedConfig()
     tokenizer: PreTrainedTokenizerBase = None
     processor: ProcessorMixin = None
-    chat_template: ChatTemplate | None = None
+    chat_template: Optional[ChatTemplate] = None
     model_assets: List[Any] = []
 
     # Training components
@@ -382,6 +388,12 @@ class BaseTrainer(Stateful, ABC):
             compile_config=self.config.compile
         )
         self.model_config = self.model.config
+        if self.global_rank == 0:
+            logger.info(
+                "Model config:\n%s",
+                json.dumps(self.model.config.to_dict(), indent=2),
+            )
+        apply_model_init_dtype(self.model, self.config.model_init_dtype)
         if self.config.accelerator.loss_parallel:
             self.model.loss_function = causal_lm_loss_parallel
         model_parts = getattr(self.model, "parts", None)
@@ -485,8 +497,12 @@ class BaseTrainer(Stateful, ABC):
     def _build_optimizer(self) -> None:
         """Build the configured optimizer with the runtime model context."""
         config: TrainerConfig = self.config
-        optimizer = config.optimizer.build(model=self.model)
-        self.optimizer = optimizer.get_optimizer()
+        optimizer = config.optimizer.target.build(model=self.model).get_optimizer()
+        self.optimizer = (
+            Float16OptimizerWithFloat16Params(optimizer, self.model)
+            if config.optimizer.fp32_main_params
+            else optimizer
+        )
 
     def _build_lr_scheduler(self):
         config: TrainerConfig = self.config
@@ -717,9 +733,6 @@ class BaseTrainer(Stateful, ABC):
             total_loss += loss.item()
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
-
-        # Wait for hsdp gradient handle to be completed
-        hsdp_sync_stream()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         grad_norm = clip_grad_norm_(

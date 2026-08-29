@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,18 +18,25 @@
 import os
 from typing import Any, Dict, List, Optional
 
-import torch
-import torch.distributed as dist
+import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel import SkipDTensorDispatch
+from hyper_parallel.auto_models.components.optim.optimizer.mixed_precision_optimizer import (
+    FP32_MAIN_PARAM_STATE_KEY,
+    MIXED_PRECISION_OPTIMIZER_STATE_KEY,
+    MixedPrecisionOptimizer,
+)
+from hyper_parallel.auto_models.components.checkpoint.checkpointer import CheckpointerBase
+from hyper_parallel.auto_models.components.utils import helper
 from hyper_parallel.core.distributed_checkpoint import (
     StandardLoadPlanner,
     async_save as dcp_async_save,
     load as dcp_load,
     save as dcp_save,
 )
-from hyper_parallel.auto_models.components.checkpoint.checkpointer import CheckpointerBase
-from hyper_parallel.auto_models.components.utils import helper
+from hyper_parallel.core.distributed_checkpoint.util import flatten_state_dict
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 
 
 logger = helper.create_logger(__name__)
@@ -75,6 +82,56 @@ def _barrier() -> None:
         dist.barrier()
 
 
+def _prepare_main_param_state_for_dcp_load(
+        state_dict: Dict[str, Any],
+        available_keys: set[str],
+) -> None:
+    """Select the ordinary or fp32-main optimizer checkpoint branch."""
+    flattened_state, _ = flatten_state_dict(state_dict)
+    optimizer_state = state_dict.get("optimizer")
+    optimizer_state_is_list = isinstance(optimizer_state, list)
+    optimizer_states = (
+        optimizer_state
+        if optimizer_state_is_list
+        else [optimizer_state]
+    )
+    for optimizer_index, optimizer_state in enumerate(optimizer_states):
+        if not isinstance(optimizer_state, dict):
+            continue
+        if MIXED_PRECISION_OPTIMIZER_STATE_KEY not in optimizer_state:
+            continue
+
+        state_prefix = (
+            f"optimizer.{optimizer_index}"
+            if optimizer_state_is_list
+            else "optimizer"
+        )
+        main_param_prefix = (
+            f"{state_prefix}.{MIXED_PRECISION_OPTIMIZER_STATE_KEY}."
+            f"{FP32_MAIN_PARAM_STATE_KEY}."
+        )
+        expected_keys = {
+            key for key in flattened_state if key.startswith(main_param_prefix)
+        }
+        if not expected_keys:
+            continue
+
+        checkpoint_keys = {
+            key for key in available_keys if key.startswith(main_param_prefix)
+        }
+        if not checkpoint_keys:
+            optimizer_state.pop(MIXED_PRECISION_OPTIMIZER_STATE_KEY)
+            continue
+
+        missing_keys = sorted(expected_keys - checkpoint_keys)
+        if missing_keys:
+            preview = ", ".join(missing_keys[:10])
+            raise RuntimeError(
+                "Mixed-precision optimizer checkpoint is incomplete; missing "
+                f"{len(missing_keys)} fp32 main parameter(s): {preview}"
+            )
+
+
 class _ModelStrictLoadPlanner(StandardLoadPlanner):
     """Allow partial optimizer state while still requiring a complete model.
 
@@ -96,6 +153,19 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
         """Load partially, optionally demanding every requested model key."""
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
+
+    def configure_planner(
+            self,
+            state_dict: Dict[str, Any],
+            metadata: Any,
+            **kwargs: Any,
+    ) -> None:
+        """Normalize optional optimizer state before flattening the load skeleton."""
+        _prepare_main_param_state_for_dcp_load(
+            state_dict,
+            set(metadata.state_dict_metadata),
+        )
+        super().configure_planner(state_dict, metadata, **kwargs)
 
     def build_local_plan(self) -> Any:
         """Validate model coverage, then defer to the standard planner."""
@@ -129,7 +199,7 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
         return super().build_local_plan()
 
 
-def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> List[torch.Tensor]:
+def _optimizer_parameters(optimizer: Any) -> List[torch.Tensor]:
     """Return trainable parameters managed by an optimizer."""
     return [
         param
@@ -140,7 +210,7 @@ def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> List[torch.Tensor
 
 
 def _prime_optimizer_state(
-    optimizer: torch.optim.Optimizer,
+    optimizer: Any,
     params: List[torch.Tensor],
 ) -> None:
     """Run a parameter-neutral optimizer step to materialize its state."""
@@ -156,7 +226,7 @@ def _prime_optimizer_state(
 
 
 def _restore_optimizer_hyperparams(
-    optimizer: torch.optim.Optimizer,
+    optimizer: Any,
     saved_hyperparams: List[tuple[Optional[float], Optional[float]]],
 ) -> None:
     """Restore optimizer hyperparameters after state priming."""
@@ -168,7 +238,19 @@ def _restore_optimizer_hyperparams(
     optimizer.zero_grad(set_to_none=True)
 
 
-def initialize_optimizer_state(optimizer: torch.optim.Optimizer) -> bool:
+def _leaf_optimizers(optimizer: Any) -> List[Any]:
+    """Return the concrete optimizers that own lazy tensor state."""
+    inner_optimizer = (
+        optimizer.optimizer
+        if isinstance(optimizer, MixedPrecisionOptimizer)
+        else optimizer
+    )
+    if isinstance(inner_optimizer, ChainedOptimizer):
+        return list(inner_optimizer.chained_optimizers)
+    return [inner_optimizer]
+
+
+def initialize_optimizer_state(optimizer: Any) -> bool:
     """Materialize optimizer state so a DCP load has entries to fill.
 
     ``Optimizer.state`` is empty until the first ``step()``, and DCP loads
@@ -181,37 +263,45 @@ def initialize_optimizer_state(optimizer: torch.optim.Optimizer) -> bool:
     The priming step runs with ``lr`` and ``weight_decay`` forced to zero, so the
     parameters themselves are left untouched.
 
+    Args:
+        optimizer: Optimizer whose state is materialized.
+
     Returns:
         Whether the optimizer now carries per-parameter state.
     """
-    # ``ChainedOptimizer`` (this repo's composition wrapper for split param
-    # groups, e.g. Muon/AdamW or decay/no-decay) has no ``.state`` of its own
-    # --- only each sub-optimizer it dispatches to does. ``param_groups`` /
-    # ``step`` / ``zero_grad`` are already delegated below via its own
-    # properties, so duck-typing this one flat-optimizer assumption is enough.
-    sub_optimizers = getattr(optimizer, "chained_optimizers", None) or [optimizer]
-    if all(opt.state for opt in sub_optimizers):
+    leaf_optimizers = _leaf_optimizers(optimizer)
+    if all(leaf_optimizer.state for leaf_optimizer in leaf_optimizers):
         return True
 
-    params = _optimizer_parameters(optimizer)
-    if not params:
+    leaf_parameters = {
+        leaf_optimizer: _optimizer_parameters(leaf_optimizer)
+        for leaf_optimizer in leaf_optimizers
+        if not leaf_optimizer.state
+    }
+    if any(not params for params in leaf_parameters.values()):
         return False
-    if any(param.grad is not None for param in params):
+    if any(
+            param.grad is not None
+            for params in leaf_parameters.values()
+            for param in params
+    ):
         logger.warning(
             "Optimizer parameters already carry gradients; skipping state priming "
             "to avoid corrupting them. Optimizer state may not be restored."
         )
         return False
 
-    saved_hyperparams = [
-        (group.get("lr"), group.get("weight_decay")) for group in optimizer.param_groups
-    ]
-    try:
-        _prime_optimizer_state(optimizer, params)
-    finally:
-        _restore_optimizer_hyperparams(optimizer, saved_hyperparams)
+    for leaf_optimizer, params in leaf_parameters.items():
+        saved_hyperparams = [
+            (group.get("lr"), group.get("weight_decay"))
+            for group in leaf_optimizer.param_groups
+        ]
+        try:
+            _prime_optimizer_state(leaf_optimizer, params)
+        finally:
+            _restore_optimizer_hyperparams(leaf_optimizer, saved_hyperparams)
 
-    return all(opt.state for opt in sub_optimizers)
+    return all(leaf_optimizer.state for leaf_optimizer in leaf_optimizers)
 
 
 class DistributedCheckpointer(CheckpointerBase):

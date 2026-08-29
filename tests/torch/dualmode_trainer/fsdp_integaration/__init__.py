@@ -12,19 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Optimizer and learning-rate scheduler interfaces for AutoModels."""
-
-from .lr_scheduler.lr_scheduler import MultiLRScheduler
-from .optimizer.optimizer import AdamW, Muon
-from .optimizer.mixed_precision_optimizer import (
-    Float16OptimizerWithFloat16Params,
-    MixedPrecisionOptimizer,
-)
-
-__all__ = [
-    "AdamW",
-    "Float16OptimizerWithFloat16Params",
-    "MixedPrecisionOptimizer",
-    "Muon",
-    "MultiLRScheduler",
-]
+"""Dual-mode Trainer FSDP integration system tests."""

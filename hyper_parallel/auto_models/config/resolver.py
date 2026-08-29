@@ -28,6 +28,7 @@ from hyper_parallel.auto_models.trainer.config import (
     DataLoaderConfig,
     DatasetConfig,
     ModelAssetsConfig,
+    OptimizerConfig,
     Target,
     TrainerConfig,
 )
@@ -450,8 +451,34 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
     )
 
 
+def _resolve_optimizer_config(node: object, *, path: str) -> OptimizerConfig:
+    """Resolve an optimizer target and its fp32 main-parameter policy."""
+    if not isinstance(node, Mapping):
+        raise _fail(path, "Optimizer configuration must be a YAML mapping")
+
+    target_node = dict(node)
+    fp32_main_params = coerce_value(
+        target_node.pop("fp32_main_params", False),
+        bool,
+        path=f"{path}.fp32_main_params",
+    )
+    return OptimizerConfig(
+        target=_resolve_target(target_node, path=path),
+        fp32_main_params=fp32_main_params,
+    )
+
+
 def resolve_component(node: object, *, expected_type: object, path: str) -> object:
-    """Resolve one YAML value according to its declared configuration type."""
+    """Resolve one YAML value according to its declared configuration type.
+
+    Args:
+        node: Raw YAML value to resolve.
+        expected_type: Declared configuration type for the value.
+        path: Dotted YAML path used in validation errors.
+
+    Returns:
+        The resolved configuration value.
+    """
     if node is None:
         return _coerce_none(expected_type, path=path)
     if _is_union(expected_type):
@@ -464,6 +491,8 @@ def resolve_component(node: object, *, expected_type: object, path: str) -> obje
         return _resolve_dataset_config(node, path=path)
     if expected_type is DataLoaderConfig:
         return _resolve_dataloader_config(node, path=path)
+    if expected_type is OptimizerConfig:
+        return _resolve_optimizer_config(node, path=path)
     if isinstance(expected_type, type) and dataclasses.is_dataclass(expected_type):
         return _resolve_dataclass(node, expected_type, path=path)
     return coerce_value(node, expected_type, path=path)

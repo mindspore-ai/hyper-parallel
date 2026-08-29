@@ -66,6 +66,75 @@ def _load_torch_optimizer_runtime():
     return AdamW, Muon, ChainedOptimizer, detect_dtensor_backend
 
 
+def _effective_optimizer_config(
+        optimizer_class: Any,
+        configured_values: Dict[str, Any],
+        runtime_optimizer: Any,
+) -> Dict[str, Any]:
+    """Merge constructor defaults, user values, and resolved runtime defaults."""
+    signature = inspect.signature(optimizer_class.__init__)
+    effective_config = {
+        name: parameter.default
+        for name, parameter in signature.parameters.items()
+        if name not in {"self", "params"}
+        and parameter.default is not inspect.Parameter.empty
+    }
+    effective_config.update(configured_values)
+    effective_config.update(runtime_optimizer.defaults)
+    if hasattr(runtime_optimizer, "hsdp_replica_count"):
+        effective_config["hsdp_replica_count"] = runtime_optimizer.hsdp_replica_count
+    return effective_config
+
+
+def _filter_optimizer_config(
+        optimizer_name: str,
+        optimizer_class: Any,
+        configured_values: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Normalize prefixed YAML keys and remove unsupported constructor args."""
+    prefix = f"{optimizer_name}_"
+    normalized_config = {
+        key[len(prefix):] if key.startswith(prefix) else key: value
+        for key, value in (configured_values or {}).items()
+    }
+    allowed_keys = (
+        inspect.signature(optimizer_class.__init__).parameters.keys()
+        - {"self", "params"}
+    )
+    filtered_config = {
+        key: value
+        for key, value in normalized_config.items()
+        if key in allowed_keys
+    }
+    excluded_keys = normalized_config.keys() - allowed_keys
+    if excluded_keys:
+        logger.info_rank0(
+            "Excluded %s config: %s",
+            optimizer_name,
+            list(excluded_keys),
+        )
+    return filtered_config
+
+
+def _build_configured_optimizer(
+        optimizer_name: str,
+        optimizer_class: Any,
+        param_groups: Any,
+        configured_values: Dict[str, Any],
+) -> Any:
+    """Construct one leaf optimizer and log its effective configuration."""
+    optimizer = optimizer_class(param_groups, **configured_values)
+    logger.info_rank0(
+        f"Effective {optimizer_name} config: %s",
+        _effective_optimizer_config(
+            optimizer_class,
+            configured_values,
+            optimizer,
+        ),
+    )
+    return optimizer
+
+
 def get_hyper_lr_scheduler(*args: Any, **kwargs: Any) -> Any:
     """Create the HyperParallel LR scheduler."""
     # pylint: disable=import-outside-toplevel
@@ -95,9 +164,9 @@ def get_hyper_optimizer(
         from hyper_parallel.core.optimizer import get_hyper_optimizer
 
         _adamw_legacy = {
-            'adamw_lr': 1e-3, 
-            'adamw_weight_decay': 1e-2, 
-            'adamw_betas': (0.9, 0.95), 
+            'adamw_lr': 1e-3,
+            'adamw_weight_decay': 1e-2,
+            'adamw_betas': (0.9, 0.95),
             'adamw_eps': 1e-8,
             'fused': True
         }
@@ -123,45 +192,42 @@ def get_hyper_optimizer(
     """
     AdamW, Muon, ChainedOptimizer, detect_dtensor_backend = _load_torch_optimizer_runtime()
 
-    # 1. Arguments Preparation
-    # 1.1 adamw
-    adamw_raw = adamw_kwargs or {}
-    adamw_config = {
-        k[6:] if k.startswith("adamw_") else k: v
-        for k, v in adamw_raw.items()
-    }
-    allowed_keys_adamw = inspect.signature(AdamW.__init__).parameters.keys() - {'self', 'params'}
-    filtered_adamw_config = {k: v for k, v in adamw_config.items() if k in allowed_keys_adamw}
-    if excluded_adamw_keys := adamw_config.keys() - allowed_keys_adamw:
-        logger.info_rank0("Excluded adamw config: %s", list(excluded_adamw_keys))
-
-    # 1.2 muon
-    muon_raw = muon_kwargs or {}
-    muon_config = {
-        k[5:] if k.startswith("muon_") else k: v
-        for k, v in muon_raw.items()
-    }
-    allowed_keys_muon = inspect.signature(Muon.__init__).parameters.keys() - {'self', 'params'}
-    filtered_muon_config = {k: v for k, v in muon_config.items() if k in allowed_keys_muon}
-    if excluded_muon_keys := muon_config.keys() - allowed_keys_muon:
-        logger.info_rank0("Excluded muon config: %s", list(excluded_muon_keys))
-
-    # 2. Optimizer Creation
+    filtered_adamw_config = _filter_optimizer_config(
+        "adamw",
+        AdamW,
+        adamw_kwargs,
+    )
+    filtered_muon_config = _filter_optimizer_config(
+        "muon",
+        Muon,
+        muon_kwargs,
+    )
     optimizers = {}
     detect_dtensor_backend(adamw_params, muon_params)
 
-    # build optimizer
     if adamw_params:
-        optimizers["adamw"] = AdamW(adamw_params, **filtered_adamw_config)
-        logger.info_rank0("Using adamw config: %s", filtered_adamw_config)
+        optimizers["adamw"] = _build_configured_optimizer(
+            "adamw",
+            AdamW,
+            adamw_params,
+            filtered_adamw_config,
+        )
 
     if muon_params:
-        optimizers["muon"] = Muon(muon_params, **filtered_muon_config)
-        logger.info_rank0("Using muon config: %s", filtered_muon_config)
+        optimizers["muon"] = _build_configured_optimizer(
+            "muon",
+            Muon,
+            muon_params,
+            filtered_muon_config,
+        )
 
     flatten = bool(adamw_params and muon_params)
 
-    return ChainedOptimizer(model, optimizers=optimizers, flatten=flatten)
+    return ChainedOptimizer(
+        model,
+        optimizers=optimizers,
+        flatten=flatten,
+    )
 
 
 __all__ = [

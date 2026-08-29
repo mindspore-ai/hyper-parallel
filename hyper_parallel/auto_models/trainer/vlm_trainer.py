@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,7 @@
 from collections import defaultdict
 from typing import Any, Dict
 
-from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
+from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.auto_models.components.datasets import calculate_num_micro_batches
 from hyper_parallel.auto_models.components.datasets.parallel.batch_context import create_batch_parallel_context
@@ -208,7 +208,6 @@ class VLMTrainer:
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
-        hsdp_sync_stream()
         grad_norm = clip_grad_norm_(
             self.base.model,
             config.training.max_grad_norm,

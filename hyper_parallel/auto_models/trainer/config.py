@@ -21,8 +21,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Callable, Generic, List, Literal, Optional, TypeVar, Union
 
-from torch import nn
-from torch.optim import Optimizer
+from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.optim import Optimizer  # pylint: disable=forbidden-backend-import
 from hyper_parallel.auto_models.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.auto_models.components.distributed.config import FSDP2Config
 from hyper_parallel.auto_models.components.model_transform import ModuleReplacementSpec, module_replacement
@@ -718,14 +718,31 @@ class DataLoaderConfig:
 
 
 @dataclass
+class OptimizerConfig:
+    """Optimizer target plus Trainer-owned parameter precision policy."""
+
+    target: Target[Optimizer]
+    fp32_main_params: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize optimizer options in their compact target YAML shape."""
+        config = self.target.to_dict()
+        config["fp32_main_params"] = self.fp32_main_params
+        return config
+
+
+@dataclass
 class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
     model: Target[Any]
-    optimizer: Target[Optimizer]
+    optimizer: OptimizerConfig
 
     lr_scheduler: Optional[Target[Any]] = None
     loss_fn: Optional[Target[Any]] = None
+    # Final floating-point dtype after model weights are loaded or initialized
+    # from scratch. None preserves the dtype produced by the initialization path.
+    model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # parallelism configs
@@ -754,9 +771,16 @@ class TrainerConfig:
     peft: Optional[Any] = None
 
     def __post_init__(self) -> None:
-        """Validate compile combinations that span multiple config sections."""
+        """Validate combinations that span multiple config sections."""
         if self.compile.enabled and self.accelerator.pp_size > 1:
             raise ValueError("compile is not supported together with pipeline parallelism")
+        reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
+        if self.optimizer.fp32_main_params and reduce_dtype != "float32":
+            raise ValueError(
+                "optimizer.fp32_main_params=true requires "
+                "fsdp_config.mix_precision.reduce_dtype='float32'; "
+                f"got {reduce_dtype!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the resolved trainer configuration for logging."""
@@ -787,6 +811,7 @@ __all__ = [
     "DebugConfig",
     "FSDP2Config",
     "MixedPrecisionConfig",
+    "OptimizerConfig",
     "ProfilingConfig",
     "Target",
     "TrainerConfig",
