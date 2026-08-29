@@ -74,22 +74,19 @@ dataset:
       use_fast: true
       trust_remote_code: true
   data_transform:
-    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
-    data_type: plaintext
-    text_keys: text
-    max_seq_len: 4096
+    _target_: examples.qwen3_8.data.PlainTextDataTransform
+    text_column: text
+    seq_len: 4096
+    append_eos: true
   data_config:
-    dataset_type: mapping
-    hf_dataset_name: Salesforce/wikitext
-    hf_config_name: wikitext-2-raw-v1
-    cache_dir: null
     create_attention_mask_in_dataloader: false
-  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
-  data_path: null
+  _target_: examples.qwen3_8.data.load_tokenized_text_dataset
+  path: Salesforce/wikitext
+  name: wikitext-2-raw-v1
+  split: train
 
 dataloader:
-  _target_: hyper_parallel.auto_models.components.datasets.DynamicBatchDataLoader
-  min_buffered_samples: 200
+  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
   collate_fn:
     _target_: hyper_parallel.auto_models.components.datasets.build_online_text_collate_fn
   get_batch:

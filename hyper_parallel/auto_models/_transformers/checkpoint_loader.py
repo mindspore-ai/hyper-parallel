@@ -411,9 +411,11 @@ def _shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch
     if any(isinstance(placement, Partial) for placement in layout.placements):
         raise ValueError(f"Partial placement is not supported for pretrained loading: {target_name}")
 
+    # Multi-axis alias_placements encodes tensor-dimension shard order and no
+    # longer contains placement subclasses such as PackedShard.
     full_tensor = pack_tensor_for_placements(
         full_tensor,
-        layout.alias_placements,
+        layout.placements,
         layout.mesh,
     )
     local_dtensor = distribute_tensor(
@@ -769,9 +771,11 @@ class CheckpointManager:
                 else:
                     value = value.detach()
             if layout is not None:
+                # Use mesh-axis placements to recover PackedShard metadata;
+                # multi-axis aliases only describe the nested gather order.
                 value = unpack_tensor_from_placements(
                     value,
-                    layout.alias_placements,
+                    layout.placements,
                     layout.mesh,
                 )
             if keep_state_dict:
