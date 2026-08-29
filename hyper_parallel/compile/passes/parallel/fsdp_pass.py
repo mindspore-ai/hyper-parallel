@@ -114,7 +114,11 @@ class FSDPPass(ParallelPass):
             print("[FSDPPass] Skipped: distributed not initialized or world_size=1")
             return graph_module
 
-        self._fsdp_degree = dist.get_world_size()
+        # FSDP group size: use the explicitly configured degree when present
+        # (required for TP+FSDP, where the FSDP group is a proper sub-group of
+        # the world — using world_size would over-shard along the TP axis).
+        configured = getattr(parallel_config, "fsdp_degree", None)
+        self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
         self._sharding_plan = kwargs.get("sharding_plan", self._sharding_plan)
         model = kwargs.get("model")

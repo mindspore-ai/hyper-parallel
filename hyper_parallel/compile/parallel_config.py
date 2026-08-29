@@ -19,20 +19,25 @@ Simple configuration for FSDP training.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch.distributed as dist
 
 
 @dataclass
 class ParallelConfig:
-    """
-    Parallel Configuration for FSDP training.
+    """Parallel configuration for FSDP (+ optional TP) training.
 
-    Note: fsdp_degree is automatically determined by world_size at runtime.
+    ``fsdp_degree``: size of the FSDP group. ``None`` (default) falls back to
+    ``world_size`` for backward compatibility with the FSDP-only path. In a
+    TP+FSDP hybrid the FSDP group is a proper sub-group of the world, so it
+    must be set explicitly — the ``GraphTrainer`` fills it from the automodel
+    ``MeshContext`` when one is provided.
     """
 
     enable_overlap: bool = True
+    fsdp_degree: Optional[int] = None
+    tp_size: int = 1
 
     @property
     def fsdp_enabled(self) -> bool:

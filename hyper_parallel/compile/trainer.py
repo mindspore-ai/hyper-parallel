@@ -48,6 +48,7 @@ class GraphTrainer:
         sharding_plan: Optional[ShardingPlan] = None,
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
+        mesh_context: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -58,12 +59,19 @@ class GraphTrainer:
             optimizer_config: Optimizer configuration
             device: Device to place the model and run training on. Defaults to
                 the NPU device when available, otherwise CPU.
+            mesh_context: Optional automodel ``MeshContext`` carrying a
+                pre-built TP/FSDP mesh. When provided, the TP group is reused
+                as-is (boundary forwards already hold the group object) and
+                only the FSDP shard sub-mesh is registered under ``"fsdp"``.
+                Use this to feed an automodel TP-sharded model into the
+                graph-mode FSDP pass.
         """
         self.model = model
         self.train_fn = train_fn
         self.parallel_config = parallel_config
         self.sharding_plan = sharding_plan
         self.optimizer_config = optimizer_config or {}
+        self._mesh_context = mesh_context
         self.device = device or (
             torch.device("npu")
             if (hasattr(torch, "npu") and torch.npu.is_available())
@@ -96,7 +104,7 @@ class GraphTrainer:
                     "Please initialize distributed training with torch.distributed.init_process_group() "
                     "before using FSDP."
                 )
-            self._init_device_mesh()
+            self._init_device_mesh(self._mesh_context)
 
         joint_graph = trace_model_graph(
             self.model, self.train_fn, sample_input, sample_label
@@ -116,12 +124,37 @@ class GraphTrainer:
 
         self._init_optimizer()
 
-    def _init_device_mesh(self):
-        """
-        Initialize DeviceMesh for FSDP.
+    def _init_device_mesh(self, mesh_context: Optional[Any] = None):
+        """Initialize the FSDP process group.
 
-        This creates and registers the ProcessGroup for collective operations.
+        Two modes:
+
+        * **External mesh** (``mesh_context`` from automodel): the TP group is
+          already created by automodel (the boundary forward holds the group
+          object directly), so we only resolve the FSDP shard sub-mesh and
+          register it under the name ``"fsdp"`` so ``FSDPPass``'s functional
+          collectives resolve it by name. ``fsdp_degree`` is back-filled on
+          ``parallel_config`` from the sub-mesh size — essential for a TP+FSDP
+          hybrid, where the FSDP group is a proper sub-group of the world and
+          must NOT be confused with ``world_size``.
+        * **Fallback** (no mesh): build a 1-D ``("fsdp",)`` mesh over the
+          whole world (the original FSDP-only path).
         """
+        if mesh_context is not None:
+            fsdp_mesh = (
+                getattr(mesh_context, "fsdp_non_moe_mesh", None)
+                or mesh_context.device_mesh
+            )
+            names = tuple(getattr(fsdp_mesh, "mesh_dim_names", ()) or ())
+            # automodel's fsdp_non_moe_mesh is ("fsdp_replicate","fsdp_shard","tp");
+            # device_mesh (cp=1) is ("dp","cp","tp") and "dp" is the FSDP axis.
+            dim = "fsdp_shard" if "fsdp_shard" in names else "dp"
+            sub = fsdp_mesh[dim]
+            pg = sub.get_group()
+            _register_process_group("fsdp", pg)
+            self.parallel_config.fsdp_degree = sub.size()
+            return
+
         device_type = (
             "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else "cpu"
         )

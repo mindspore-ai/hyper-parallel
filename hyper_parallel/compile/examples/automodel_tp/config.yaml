@@ -1,0 +1,39 @@
+# ============================================================================
+# Model — a tiny Llama (local config, no download). Naming matches automodel's
+# default rules: embed_tokens / q_proj / k_proj / v_proj / o_proj /
+# gate_proj / up_proj / down_proj / lm_head, so ShardingPlanner can derive TP
+# placements without any plan_overrides.
+# ============================================================================
+model:
+  vocab_size: 32000
+  hidden_size: 256            # 256 % (tp*dp) == 0
+  intermediate_size: 512      # 512 % tp == 0
+  num_hidden_layers: 2
+  num_attention_heads: 4      # 4 % tp == 0
+  num_key_value_heads: 2      # GQA: 2 % tp == 0
+  max_position_embeddings: 2048
+  torch_dtype: float32
+
+# ============================================================================
+# Training
+# ============================================================================
+train:
+  max_steps: 10
+  lr: 3.0e-4
+  grad_clip: 1.0
+  batch_size: 2
+  seq_len: 128
+
+# ============================================================================
+# Parallel topology — TP across ranks, FSDP across the dp sub-mesh.
+# world_size = tp_size * dp_size = 2 * 2 = 4.
+# ============================================================================
+parallel:
+  tp_size: 2
+  dp_size: 2
+  sequence_parallel: false
+  loss_parallel: false
+  enable_overlap: true
+
+logging:
+  log_interval: 1
