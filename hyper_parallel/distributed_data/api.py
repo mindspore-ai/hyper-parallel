@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public construction API for PyTorch distributed datasets."""
+"""Public construction API for distributed PyTorch DataLoaders."""
+# This package is intentionally PyTorch-only.
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable
+
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.distributed_data.cost_model import CostModel
 from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
@@ -31,22 +36,10 @@ from hyper_parallel.distributed_data.distributor import (
     TorchPackedBytesLocalBatchRedistributor,
     TorchTensorLocalBatchRedistributor,
 )
-from hyper_parallel.distributed_data.data_construct import (
-    LocalBatchMetadataView,
-    LocalBatchSource,
-    OnlineLocalBatchSource,
-    OnlineLocalBatchView,
-    RankLocalDataLoaderSource,
-    SidecarLocalBatchFetcher,
-    SidecarLocalBatchSource,
-)
+from hyper_parallel.distributed_data.data_construct import RankLocalDataLoaderSource
 from hyper_parallel.distributed_data.planner import DistributedBatchPlanner
 from hyper_parallel.distributed_data.schema import LocalBatchMeta, TensorShardSpec, WorkloadCost
 from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
-
-platform = get_platform()
 
 _PAYLOAD_TRANSPORTS = ("packed_bytes_a2a", "direct_tensor_a2a")
 
@@ -64,9 +57,9 @@ def _create_data_groups(topology: DataTopology) -> tuple[Any, Any]:
     created_groups = []
     metadata_group = None
     if len(topology.data_owner_ranks) > 1:
-        metadata_group = platform.create_named_group(
-            topology.data_owner_ranks,
-            f"hp_data_metadata_{namespace}",
+        metadata_group = dist.new_group(
+            ranks=list(topology.data_owner_ranks),
+            group_desc=f"hp_data_metadata_{namespace}",
         )
         created_groups.append((topology.data_owner_ranks, metadata_group))
 
@@ -74,9 +67,9 @@ def _create_data_groups(topology: DataTopology) -> tuple[Any, Any]:
     for data_rank, rank_group in enumerate(topology.model_parallel_rank_groups):
         if len(rank_group) == 1:
             continue
-        group = platform.create_named_group(
-            rank_group,
-            f"hp_data_model_{namespace}_{data_rank}",
+        group = dist.new_group(
+            ranks=list(rank_group),
+            group_desc=f"hp_data_model_{namespace}_{data_rank}",
         )
         created_groups.append((rank_group, group))
         if data_rank == topology.data_rank:
@@ -86,8 +79,8 @@ def _create_data_groups(topology: DataTopology) -> tuple[Any, Any]:
     # data producer thread can issue collectives on multiple fresh groups.
     for rank_group, group in created_groups:
         if topology.global_rank in rank_group:
-            platform.barrier(group)
-        platform.barrier()
+            dist.barrier(group=group)
+        dist.barrier()
     return metadata_group, model_parallel_group
 
 
@@ -121,48 +114,6 @@ class DistributedDatasetConfig:
             )
 
 
-def _validate_platform() -> None:
-    if platform.platform_type != PlatformType.PYTORCH:
-        raise ValueError("The distributed dataset MVP currently supports only PyTorch.")
-
-
-def _complete_local_entries(
-    source: LocalBatchSource,
-    planner: DistributedBatchPlanner,
-) -> int:
-    complete_steps = len(source) // planner.global_local_batches_per_step
-    return complete_steps * planner.local_batches_per_step
-
-
-def _create_local_batch_views(
-    source: LocalBatchSource,
-    planner: DistributedBatchPlanner,
-    topology: DataTopology,
-) -> tuple[LocalBatchMetadataView | None, OnlineLocalBatchView | None]:
-    max_entries = _complete_local_entries(source, planner)
-    if isinstance(source, SidecarLocalBatchSource):
-        return (
-            LocalBatchMetadataView(
-                source,
-                topology.data_rank,
-                topology.data_parallel_size,
-                max_entries=max_entries,
-            ),
-            None,
-        )
-    if not isinstance(source, OnlineLocalBatchSource):
-        raise ValueError(f"Unsupported local-batch source type {type(source)}.")
-    return (
-        None,
-        OnlineLocalBatchView(
-            source,
-            topology.data_rank,
-            topology.data_parallel_size,
-            max_entries=max_entries,
-        ),
-    )
-
-
 def _data_owner_loader_size(
     data_loader: Any,
     topology: DataTopology,
@@ -174,7 +125,7 @@ def _data_owner_loader_size(
     if data_loader is None:
         raise ValueError("A data-owner rank must provide its existing rank-local DataLoader.")
     if not hasattr(data_loader, "__iter__"):
-        raise ValueError("source must be an iterable rank-local DataLoader.")
+        raise ValueError("data_loader must be an iterable rank-local DataLoader.")
     try:
         local_size = len(data_loader)
     except TypeError as exc:
@@ -184,7 +135,7 @@ def _data_owner_loader_size(
     if topology.data_parallel_size > 1:
         topology.validate_metadata_group(metadata_group)
         owner_sizes = [None] * topology.data_parallel_size
-        platform.all_gather_object(owner_sizes, local_size, metadata_group)
+        dist.all_gather_object(owner_sizes, local_size, group=metadata_group)
     if any(not isinstance(size, int) or isinstance(size, bool) or size < 0 for size in owner_sizes):
         raise ValueError(f"Data owners reported invalid DataLoader sizes {owner_sizes}.")
     common_size = min(owner_sizes)
@@ -201,9 +152,9 @@ def _share_data_owner_size(
             raise ValueError("A single-rank data group must have a DataLoader size.")
         return owner_size
     topology.validate_model_parallel_group(model_parallel_group)
-    group_ranks = tuple(platform.get_process_group_ranks(model_parallel_group))
+    group_ranks = tuple(dist.get_process_group_ranks(model_parallel_group))
     gathered_sizes = [None] * len(group_ranks)
-    platform.all_gather_object(gathered_sizes, owner_size, model_parallel_group)
+    dist.all_gather_object(gathered_sizes, owner_size, group=model_parallel_group)
     sizes_by_rank = dict(zip(group_ranks, gathered_sizes, strict=True))
     shared_size = sizes_by_rank[topology.data_owner_rank]
     if not isinstance(shared_size, int) or isinstance(shared_size, bool) or shared_size < 0:
@@ -213,40 +164,30 @@ def _share_data_owner_size(
     return shared_size
 
 
-def _create_data_sources(
-    source: Any,
+def _create_rank_local_source(
+    data_loader: Any | None,
     metadata_fn: Callable[[Any, int | str], LocalBatchMeta | WorkloadCost] | None,
     planner: DistributedBatchPlanner,
     topology: DataTopology,
     metadata_group: Any,
     model_parallel_group: Any,
-) -> tuple[
-    LocalBatchSource,
-    LocalBatchMetadataView | None,
-    OnlineLocalBatchView | RankLocalDataLoaderSource | None,
-]:
-    if isinstance(source, (SidecarLocalBatchSource, OnlineLocalBatchSource)):
-        if metadata_fn is not None:
-            raise ValueError("metadata_fn is only valid when source is a rank-local DataLoader.")
-        metadata_source, online_source = _create_local_batch_views(source, planner, topology)
-        return source, metadata_source, online_source
-
+) -> RankLocalDataLoaderSource:
+    """Adapt the user DataLoader without changing its single-card semantics."""
     if metadata_fn is not None and not callable(metadata_fn):
         raise ValueError("metadata_fn must be callable or None.")
     owner_size = _data_owner_loader_size(
-        source,
+        data_loader,
         topology,
         metadata_group,
         planner.local_batches_per_step,
     )
     source_size = _share_data_owner_size(owner_size, topology, model_parallel_group)
-    rank_local_source = RankLocalDataLoaderSource(
-        source if topology.is_data_owner else None,
+    return RankLocalDataLoaderSource(
+        data_loader if topology.is_data_owner else None,
         metadata_fn,
         data_rank=topology.data_rank,
         source_size=source_size,
     )
-    return rank_local_source, None, rank_local_source
 
 
 def _create_local_batch_redistributor(
@@ -290,8 +231,19 @@ def _create_model_parallel_distributor(
     )
 
 
-def build_distributed_dataset(
-    source: Any,
+def _new_stream(communication_device: Any) -> Any:
+    """Create a PyTorch accelerator stream for data communication."""
+    device_type = torch.device(communication_device).type
+    device_module = getattr(torch, device_type, None)
+    if device_module is None:
+        raise ValueError(f"PyTorch has no device module for communication device {communication_device!r}.")
+    if device_type == "cpu":
+        return device_module.Stream()
+    return device_module.Stream(device=communication_device)
+
+
+def build_distributed_dataloader(
+    data_loader: Any | None,
     mesh: Any,
     config: DistributedDatasetConfig,
     *,
@@ -305,13 +257,15 @@ def build_distributed_dataset(
     The builder creates dedicated ``metadata_group`` and model-parallel data
     groups from ``mesh``. Only data-owner ranks iterate the user DataLoader;
     every iteration result is treated as one opaque, complete local batch. The
-    existing ``SidecarLocalBatchSource`` and ``OnlineLocalBatchSource`` inputs
-    remain supported for globally indexable sources.
+    DataLoader output is opaque to HyperParallel: every iteration result is one
+    complete ``local_batch`` that may already contain user-defined sampling,
+    preprocessing, packing, and collation.
 
     Args:
-        source: Existing rank-local DataLoader on data-owner ranks, ``None`` on
-            other ranks, or a prebuilt sidecar/global-map source.
-        mesh: Named root training mesh.
+        data_loader: Existing rank-local DataLoader on data-owner ranks. Other
+            model-parallel ranks may pass the same object or ``None`` because
+            HyperParallel only iterates the data-owner copy.
+        mesh: Named PyTorch or layout-compatible root training mesh.
         config: Distributed planning, prefetch, and payload transport options.
         metadata_fn: Optional rank-local callback receiving ``(local_batch,
             local_batch_id)`` and returning ``LocalBatchMeta`` or
@@ -321,9 +275,8 @@ def build_distributed_dataset(
         cost_model: Optional calibrated workload cost model.
 
     Returns:
-        Configured :class:`DistributedDataset` iterator.
+        Configured distributed DataLoader iterator.
     """
-    _validate_platform()
     topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
     metadata_group, model_parallel_group = _create_data_groups(topology)
     planner = DistributedBatchPlanner(
@@ -332,36 +285,35 @@ def build_distributed_dataset(
         cost_model=cost_model,
         cp_shards=config.cp_shards,
     )
-    source, metadata_source, online_source = _create_data_sources(
-        source,
+    source = _create_rank_local_source(
+        data_loader,
         metadata_fn,
         planner,
         topology,
         metadata_group,
         model_parallel_group,
     )
-    local_batch_redistributor = None
-    sidecar_fetcher = None
-    if online_source is not None:
-        local_batch_redistributor = _create_local_batch_redistributor(
-            topology, config, metadata_group, communication_device
-        )
-    else:
-        if not isinstance(source, SidecarLocalBatchSource):
-            raise ValueError("Sidecar metadata view requires SidecarLocalBatchSource.")
-        sidecar_fetcher = SidecarLocalBatchFetcher(source)
+    metadata_source = None
+    online_source = source
+    local_batch_redistributor = _create_local_batch_redistributor(
+        topology, config, metadata_group, communication_device
+    )
     metadata_synchronizer = _create_metadata_synchronizer(topology, metadata_group)
     model_parallel_distributor = _create_model_parallel_distributor(
         topology, model_parallel_group, communication_device
     )
-    data_stream = platform.new_stream() if config.double_buffer and communication_device is not None else None
+    data_stream = (
+        _new_stream(communication_device)
+        if config.double_buffer and communication_device is not None
+        else None
+    )
     return DistributedDataset(
         topology=topology,
         source=source,
         metadata_source=metadata_source,
         online_source=online_source,
         planner=planner,
-        sidecar_fetcher=sidecar_fetcher,
+        sidecar_fetcher=None,
         metadata_synchronizer=metadata_synchronizer,
         local_batch_redistributor=local_batch_redistributor,
         model_parallel_distributor=model_parallel_distributor,
@@ -369,4 +321,5 @@ def build_distributed_dataset(
         double_buffer=config.double_buffer,
         prepare_local_batch=prepare_local_batch,
         data_stream=data_stream,
+        data_stream_device=communication_device if data_stream is not None else None,
     )

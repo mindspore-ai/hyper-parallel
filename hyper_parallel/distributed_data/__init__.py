@@ -14,10 +14,9 @@
 # ============================================================================
 """Metadata-planned distribution of complete single-card local batches."""
 
-from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataset
+from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataloader
 from hyper_parallel.distributed_data.cost_model import CostModel, LinearMultimodalCostModel
-from hyper_parallel.distributed_data.data_construct import OnlineLocalBatchSource, SidecarLocalBatchSource
-from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset
+from hyper_parallel.distributed_data.distributed_dataset import DistributedDataset as DistributedDataLoader
 from hyper_parallel.distributed_data.schema import (
     DistributedDataStep,
     LocalBatch,
@@ -29,14 +28,12 @@ from hyper_parallel.distributed_data.schema import (
 __all__ = [
     "CostModel",
     "DistributedDataStep",
-    "DistributedDataset",
+    "DistributedDataLoader",
     "DistributedDatasetConfig",
     "LinearMultimodalCostModel",
     "LocalBatch",
     "LocalBatchMeta",
-    "OnlineLocalBatchSource",
-    "SidecarLocalBatchSource",
     "TensorShardSpec",
     "WorkloadCost",
-    "build_distributed_dataset",
+    "build_distributed_dataloader",
 ]

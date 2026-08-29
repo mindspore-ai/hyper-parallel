@@ -148,14 +148,22 @@ class TestDistributedDataPublicApi(unittest.TestCase):
     def test_exports_local_batch_contracts(self) -> None:
         """Public exports should describe complete local batches, not raw samples."""
         for name in (
+            "DistributedDataLoader",
             "LocalBatch",
             "LocalBatchMeta",
-            "OnlineLocalBatchSource",
-            "SidecarLocalBatchSource",
+            "build_distributed_dataloader",
         ):
             self.assertIn(name, distributed_data.__all__)
             self.assertTrue(hasattr(distributed_data, name))
-        self.assertNotIn("SampleMeta", distributed_data.__all__)
+        for internal_name in (
+            "DistributedDataset",
+            "OnlineLocalBatchSource",
+            "SampleMeta",
+            "SidecarLocalBatchSource",
+            "build_distributed_dataset",
+        ):
+            self.assertNotIn(internal_name, distributed_data.__all__)
+            self.assertFalse(hasattr(distributed_data, internal_name))
 
     def test_config_contains_only_distributed_controls(self) -> None:
         """Reading, worker, and raw-sample options belong to the single-card source."""
@@ -180,11 +188,11 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
     def test_builder_accepts_existing_dataloader_and_metadata_callback(self) -> None:
         """The builder should wrap batches without owning collation or workers."""
-        parameters = inspect.signature(distributed_data.build_distributed_dataset).parameters
+        parameters = inspect.signature(distributed_data.build_distributed_dataloader).parameters
 
-        self.assertIn("source", parameters)
+        self.assertIn("data_loader", parameters)
         self.assertIn("metadata_fn", parameters)
-        for removed in ("dataset", "metadata", "collate_fn", "worker_init_fn"):
+        for removed in ("source", "dataset", "metadata", "collate_fn", "worker_init_fn"):
             self.assertNotIn(removed, parameters)
 
 

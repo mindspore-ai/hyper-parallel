@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Run sidecar-planned DP/MP data loading over downloaded Hugging Face JPEG samples."""
+"""Wrap rank-local Hugging Face DataLoaders with DP/MP data distribution."""
 # This file is intentionally a PyTorch-only runnable example.
 # pylint: disable=C0413,forbidden-backend-import
 
@@ -27,29 +27,27 @@ import os
 from pathlib import Path
 from typing import Any
 
-# HyperParallel selects its framework before importing platform modules.
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
-
 from PIL import Image
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 try:
     import torch_npu  # pylint: disable=W0611
 except ImportError:
     torch_npu = None
 
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     LocalBatchMeta,
-    SidecarLocalBatchSource,
-    build_distributed_dataset,
+    build_distributed_dataloader,
 )
 
 
 class HuggingFaceManifestDataset:
-    """Expose local image-caption records and their lightweight metadata sidecar."""
+    """Read raw image-caption records from a downloaded manifest."""
 
     _REQUIRED_FIELDS = ("sample_id", "image", "text", "width", "height", "jpeg_bytes", "sha256")
 
@@ -73,31 +71,16 @@ class HuggingFaceManifestDataset:
 
         self._manifest_dir = manifest_path.parent
         self._rows = rows[:sample_count]
-        sidecar_metadata = []
         for index, row in enumerate(self._rows):
             if not isinstance(row, dict):
                 raise ValueError(f"Manifest row {index} must be a JSON object.")
             missing = [field for field in self._REQUIRED_FIELDS if field not in row]
             if missing:
                 raise ValueError(f"Manifest row {index} is missing fields {missing}.")
-            sidecar_metadata.append(
-                LocalBatchMeta(
-                    local_batch_id=index,
-                    text_tokens=max(1, len(row["text"].split())),
-                    vision_tokens=math.ceil(row["width"] / 14) * math.ceil(row["height"] / 14),
-                    io_bytes=row["jpeg_bytes"],
-                )
-            )
-        self._sidecar_metadata = tuple(sidecar_metadata)
 
     def __len__(self) -> int:
         """Return the records in the selected global-step window."""
         return len(self._rows)
-
-    @property
-    def sidecar_metadata(self) -> tuple[LocalBatchMeta, ...]:
-        """Return precomputed local-batch costs without reading JPEG contents."""
-        return self._sidecar_metadata
 
     def __getitem__(self, data_index: int) -> dict[str, Any]:
         """Read one caption and its original JPEG bytes."""
@@ -116,9 +99,11 @@ class HuggingFaceManifestDataset:
             "worker_pid": os.getpid(),
         }
 
-    def fetch_local_batch(self, local_batch_id: int | str) -> tuple[dict[str, Any], ...]:
-        """Run the existing single-card read and decode pipeline for one local batch."""
-        sample = self[int(local_batch_id)]
+
+def decode_and_collate(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Decode DataLoader samples and produce one complete opaque local batch."""
+    records = []
+    for sample in samples:
         digest = hashlib.sha256(sample["image_bytes"]).hexdigest()
         if digest != sample["sha256"]:
             raise ValueError(f"JPEG checksum mismatch for {sample['record_id']}.")
@@ -126,15 +111,35 @@ class HuggingFaceManifestDataset:
             image.load()
             if image.size != (sample["width"], sample["height"]):
                 raise ValueError(f"JPEG dimensions mismatch for {sample['record_id']}.")
-        return (
+        records.append(
             {
                 "record_id": sample["record_id"],
                 "data_index": sample["data_index"],
                 "caption": sample["caption"],
                 "worker_pid": sample["worker_pid"],
                 "sha256": digest,
-            },
+                "width": sample["width"],
+                "height": sample["height"],
+                "jpeg_bytes": len(sample["image_bytes"]),
+            }
         )
+    return tuple(records)
+
+
+def local_batch_metadata(
+    local_batch: tuple[dict[str, Any], ...],
+    local_batch_id: int | str,
+) -> LocalBatchMeta:
+    """Derive planner metadata after the user's DataLoader has collated a batch."""
+    return LocalBatchMeta(
+        local_batch_id=local_batch_id,
+        text_tokens=sum(max(1, len(record["caption"].split())) for record in local_batch),
+        vision_tokens=sum(
+            math.ceil(record["width"] / 14) * math.ceil(record["height"] / 14)
+            for record in local_batch
+        ),
+        io_bytes=sum(record["jpeg_bytes"] for record in local_batch),
+    )
 
 
 def _all_gather_object(value: Any, world_size: int) -> list[Any]:
@@ -151,6 +156,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("hccl", "gloo"), default="hccl")
     parser.add_argument("--micro-batch-num", type=int, default=4)
     parser.add_argument("--model-parallel-size", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--double-buffer", action="store_true")
     return parser.parse_args()
 
@@ -178,12 +184,12 @@ def _validate_global_result(
     sample_count: int,
     mesh_shape: tuple[int, int],
 ) -> int:
-    """Validate sidecar planning, local-batch reassignment, and MP replication."""
+    """Validate online planning, local-batch reassignment, and MP replication."""
     data_parallel_size, model_parallel_size = mesh_shape
     world_size = data_parallel_size * model_parallel_size
     gathered_plan_ids = _all_gather_object(local_plan_ids, world_size)
     if any(plan_ids != local_plan_ids for plan_ids in gathered_plan_ids):
-        raise ValueError(f"Ranks produced inconsistent sidecar plans: {gathered_plan_ids}.")
+        raise ValueError(f"Ranks produced inconsistent online plans: {gathered_plan_ids}.")
     gathered_step_ids = _all_gather_object(step_plan_id, world_size)
     if len(set(gathered_step_ids)) != 1:
         raise ValueError(f"Ranks produced inconsistent step plan IDs: {gathered_step_ids}.")
@@ -208,7 +214,7 @@ def _validate_global_result(
         for record in rank_records
     )
     if data_parallel_size > 1 and reassigned_local_batches == 0:
-        raise ValueError("The sidecar plan did not reassign any local batches across data ranks.")
+        raise ValueError("The online plan did not reassign any local batches across data ranks.")
     expected_local_samples = sample_count // data_parallel_size
     if any(len(records) != expected_local_samples for records in gathered_records):
         raise ValueError(f"Each rank must receive {expected_local_samples} samples, got {gathered_records}.")
@@ -216,7 +222,7 @@ def _validate_global_result(
 
 
 def main() -> None:
-    """Run and validate one sidecar-planned optimizer step."""
+    """Run and validate one DataLoader-backed optimizer step."""
     args = _parse_args()
     rank, world_size, communication_device, device_type = _initialize_distributed(args.backend)
     if args.model_parallel_size < 1 or world_size % args.model_parallel_size != 0:
@@ -234,7 +240,26 @@ def main() -> None:
     )
     sample_count = data_parallel_size * config.micro_batch_num
     dataset = HuggingFaceManifestDataset(args.manifest, sample_count)
-    source = SidecarLocalBatchSource(dataset.sidecar_metadata, dataset.fetch_local_batch)
+    is_data_owner = rank % args.model_parallel_size == 0
+    data_rank = rank // args.model_parallel_size
+    data_loader = None
+    if is_data_owner:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=data_parallel_size,
+            rank=data_rank,
+            shuffle=False,
+            drop_last=True,
+        )
+        data_loader_kwargs = {
+            "batch_size": 1,
+            "sampler": sampler,
+            "num_workers": args.num_workers,
+            "collate_fn": decode_and_collate,
+        }
+        if args.num_workers > 0:
+            data_loader_kwargs["prefetch_factor"] = 2
+        data_loader = DataLoader(dataset, **data_loader_kwargs)
     mesh_ranks = [
         list(range(data_rank * args.model_parallel_size, (data_rank + 1) * args.model_parallel_size))
         for data_rank in range(data_parallel_size)
@@ -245,10 +270,11 @@ def main() -> None:
         mesh_dim_names=("dp", "mp"),
         _init_backend=False,
     )
-    loader = build_distributed_dataset(
-        source,
+    loader = build_distributed_dataloader(
+        data_loader,
         mesh,
         config,
+        metadata_fn=local_batch_metadata,
         communication_device=communication_device,
     )
 
@@ -257,9 +283,6 @@ def main() -> None:
     try:
         step = next(loader)
         for local_batch in step:
-            data_indices = tuple(record["data_index"] for record in local_batch.data)
-            if data_indices != (local_batch.local_batch_id,):
-                raise ValueError(f"Rank {rank} received data in an order different from its plan.")
             local_records.extend(local_batch.data)
             local_plan_ids.append(local_batch.plan_id)
         reassigned_local_batches = _validate_global_result(
@@ -292,8 +315,8 @@ def main() -> None:
                     "local_batches_per_data_rank": config.micro_batch_num,
                     "micro_batch_num": args.micro_batch_num,
                     "double_buffer": args.double_buffer,
-                    "metadata_mode": "sidecar",
-                    "sample_loading": "shared_storage_index_fetch",
+                    "metadata_mode": "online_after_collate",
+                    "sample_loading": "user_dataloader_then_dp_a2a",
                     "reassigned_local_batches": reassigned_local_batches,
                     "consumed_offset": loader.consumed_offset,
                 },

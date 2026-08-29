@@ -15,6 +15,9 @@
 """Unit tests for distributed-data topology derivation."""
 
 import unittest
+from types import SimpleNamespace
+
+import torch
 
 from hyper_parallel.distributed_data.topology import DataTopology
 
@@ -68,3 +71,17 @@ class TestDataTopology(unittest.TestCase):
         self.assertEqual(topology.data_rank, 0)
         self.assertEqual(topology.data_owner_rank, 0)
         self.assertEqual(topology.model_parallel_ranks, (0, 1, 2, 3))
+
+    def test_accepts_native_pytorch_device_mesh_layout(self) -> None:
+        """Topology should consume the public fields of a PyTorch DeviceMesh."""
+        mesh = SimpleNamespace(
+            mesh=torch.tensor([[0, 1], [2, 3]]),
+            mesh_dim_names=("dp", "tp"),
+        )
+
+        topology = DataTopology.from_mesh(mesh, global_rank=3, dp_dim_names=("dp",))
+
+        self.assertEqual(topology.mesh_shape, (2, 2))
+        self.assertEqual(topology.rank_list, (0, 1, 2, 3))
+        self.assertEqual(topology.data_owner_ranks, (0, 2))
+        self.assertEqual(topology.model_parallel_ranks, (2, 3))

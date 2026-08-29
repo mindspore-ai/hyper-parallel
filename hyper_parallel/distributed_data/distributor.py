@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Metadata and local-batch communication over injected training groups."""
+# This package is intentionally PyTorch-only.
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
@@ -22,6 +24,8 @@ import struct
 from typing import Any, Protocol, Sequence, TypeVar
 
 import numpy as np
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.distributed_data.schema import (
     BatchPlan,
@@ -31,10 +35,6 @@ from hyper_parallel.distributed_data.schema import (
     TensorShardSpec,
 )
 from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
-
-platform = get_platform()
 
 MetadataValue = TypeVar("MetadataValue", LocalBatchMeta, OnlineLocalBatchMetadata)
 
@@ -124,8 +124,6 @@ class TorchMetadataAllGather:
 
     def __init__(self, group: Any) -> None:
         """Initialize metadata synchronization over an existing owner group."""
-        if platform.platform_type != PlatformType.PYTORCH:
-            raise ValueError("TorchMetadataAllGather is supported only on the PyTorch platform.")
         self._group = group
 
     def gather(
@@ -134,11 +132,11 @@ class TorchMetadataAllGather:
         data_owner_ranks: tuple[int, ...],
     ) -> tuple[MetadataValue, ...]:
         """All-gather metadata and concatenate it in ``data_owner_ranks`` order."""
-        group_ranks = tuple(platform.get_process_group_ranks(self._group))
+        group_ranks = tuple(dist.get_process_group_ranks(self._group))
         if set(group_ranks) != set(data_owner_ranks):
             raise ValueError(f"metadata_group ranks must be {data_owner_ranks}, but got {group_ranks}.")
         gathered: list[Any] = [None] * len(group_ranks)
-        platform.all_gather_object(gathered, tuple(local_metadata), self._group)
+        dist.all_gather_object(gathered, tuple(local_metadata), self._group)
         by_global_rank = dict(zip(group_ranks, gathered, strict=True))
         ordered = []
         for data_owner_rank in data_owner_ranks:
@@ -157,8 +155,6 @@ class TorchPackedBytesLocalBatchRedistributor:
 
     def __init__(self, group: Any, *, communication_device: Any = None) -> None:
         """Initialize packed-byte A2A over the data-owner group."""
-        if platform.platform_type != PlatformType.PYTORCH:
-            raise ValueError("TorchPackedBytesLocalBatchRedistributor is supported only on PyTorch.")
         self._group = group
         self._communication_device = communication_device
 
@@ -184,24 +180,24 @@ class TorchPackedBytesLocalBatchRedistributor:
         input_splits = [len(segment) for segment in segments]
         communication_device = _collective_device(self._group, self._communication_device)
 
-        size_tensor = platform.tensor(
+        size_tensor = torch.tensor(
             input_splits,
-            dtype=platform.tensor_dtype.int64,
+            dtype=torch.int64,
             device=communication_device,
         )
-        received_sizes_tensor, size_work = platform.all_to_all_single(
+        received_sizes_tensor, size_work = _all_to_all_single(
             size_tensor,
             [topology.data_parallel_size],
             self._group,
             async_op=True,
         )
         _wait_collective(size_work)
-        output_splits = [int(size) for size in platform.tensor_to_numpy(received_sizes_tensor).reshape(-1)]
+        output_splits = [int(size) for size in _tensor_to_numpy(received_sizes_tensor).reshape(-1)]
         if len(output_splits) != topology.data_parallel_size or any(size < 0 for size in output_splits):
             raise ValueError(f"Packed-byte A2A received invalid byte splits {output_splits}.")
 
         send_tensor = _bytes_to_tensor(b"".join(segments), communication_device)
-        received_tensor, data_work = platform.variable_all_to_all_single(
+        received_tensor, data_work = _variable_all_to_all_single(
             send_tensor,
             input_splits,
             output_splits,
@@ -209,7 +205,7 @@ class TorchPackedBytesLocalBatchRedistributor:
             async_op=True,
         )
         _wait_collective(data_work)
-        received_bytes = platform.tensor_to_numpy(received_tensor).tobytes()
+        received_bytes = _tensor_to_numpy(received_tensor).tobytes()
 
         local_batches_by_position = {}
         cursor = 0
@@ -229,15 +225,13 @@ class TorchTensorLocalBatchRedistributor:
 
     def __init__(self, group: Any, *, communication_device: Any = None) -> None:
         """Initialize direct tensor A2A over the data-owner group."""
-        if platform.platform_type != PlatformType.PYTORCH:
-            raise ValueError("TorchTensorLocalBatchRedistributor is supported only on PyTorch.")
         self._group = group
         self._communication_device = communication_device
 
     @staticmethod
     def describe_local_batch(local_batch: Any) -> TensorLocalBatchSpec | None:
         """Build the tensor descriptor synchronized by the existing metadata All-Gather."""
-        if not platform.is_tensor(local_batch):
+        if not torch.is_tensor(local_batch):
             return None
         shape = tuple(int(size) for size in local_batch.shape)
         return TensorLocalBatchSpec(shape=shape, dtype=str(local_batch.dtype), numel=math.prod(shape))
@@ -298,13 +292,13 @@ class TorchTensorLocalBatchRedistributor:
         tensor_specs: Sequence[TensorLocalBatchSpec],
     ) -> dict[int, Any]:
         local_batch_shape = tensor_specs[0].shape
-        send_tensor = platform.cat(
+        send_tensor = torch.cat(
             [tensor.reshape((1, *local_batch_shape)) for tensor in ordered_tensors],
             dim=0,
         )
         input_splits = [len(items) for items in outgoing]
         output_splits = [len(positions) for positions in received_positions]
-        received_tensor, work = platform.variable_all_to_all_single(
+        received_tensor, work = _variable_all_to_all_single(
             send_tensor,
             input_splits,
             output_splits,
@@ -330,7 +324,7 @@ class TorchTensorLocalBatchRedistributor:
         received_positions: Sequence[Sequence[int]],
         tensor_specs: Sequence[TensorLocalBatchSpec],
     ) -> dict[int, Any]:
-        send_tensor = platform.cat([tensor.reshape((-1,)) for tensor in ordered_tensors], dim=0)
+        send_tensor = torch.cat([tensor.reshape((-1,)) for tensor in ordered_tensors], dim=0)
         input_splits = [
             sum(tensor_specs[source_position].numel for source_position, _ in items)
             for items in outgoing
@@ -339,7 +333,7 @@ class TorchTensorLocalBatchRedistributor:
             sum(tensor_specs[source_position].numel for source_position in positions)
             for positions in received_positions
         ]
-        received_tensor, work = platform.variable_all_to_all_single(
+        received_tensor, work = _variable_all_to_all_single(
             send_tensor,
             input_splits,
             output_splits,
@@ -388,8 +382,6 @@ class TorchModelParallelLocalBatchDistributor:
 
     def __init__(self, group: Any, *, communication_device: Any = None) -> None:
         """Initialize local-batch broadcast over an existing consumer group."""
-        if platform.platform_type != PlatformType.PYTORCH:
-            raise ValueError("TorchModelParallelLocalBatchDistributor is supported only on PyTorch.")
         self._group = group
         self._communication_device = communication_device
 
@@ -400,13 +392,13 @@ class TorchModelParallelLocalBatchDistributor:
         topology: DataTopology,
     ) -> tuple[BatchPlan, Any]:
         """Broadcast one nested local batch, then apply this rank's CP slicing."""
-        group_ranks = tuple(platform.get_process_group_ranks(self._group))
+        group_ranks = tuple(dist.get_process_group_ranks(self._group))
         if set(group_ranks) != set(topology.model_parallel_ranks):
             raise ValueError(
                 f"model_parallel_group ranks must be {topology.model_parallel_ranks}, but got {group_ranks}."
             )
         is_source = topology.global_rank == topology.data_owner_rank
-        backend = str(platform.get_backend(self._group)).lower()
+        backend = str(dist.get_backend(self._group)).lower()
         accelerator_backend = "hccl" in backend or "nccl" in backend
         if is_source and (local_batch is None or plan is None):
             raise ValueError("The data owner must provide both local_batch and plan.")
@@ -426,7 +418,7 @@ class TorchModelParallelLocalBatchDistributor:
                 )
         header = (plan, descriptor) if is_source else None
         gathered_headers: list[Any] = [None] * len(group_ranks)
-        platform.all_gather_object(gathered_headers, header, self._group)
+        dist.all_gather_object(gathered_headers, header, self._group)
         source_index = group_ranks.index(topology.data_owner_rank)
         source_header = gathered_headers[source_index]
         if not isinstance(source_header, tuple) or len(source_header) != 2:
@@ -438,7 +430,7 @@ class TorchModelParallelLocalBatchDistributor:
         if not is_source:
             local_batch, tensors = _decode_payload(received_descriptor, self._communication_device)
         for tensor in tensors:
-            platform.broadcast(tensor, topology.data_owner_rank, self._group, async_op=False)
+            dist.broadcast(tensor, src=topology.data_owner_rank, group=self._group, async_op=False)
 
         sharded = shard_local_batch(
             local_batch,
@@ -450,19 +442,73 @@ class TorchModelParallelLocalBatchDistributor:
 
 
 def _data_owner_group_data_ranks(group: Any, topology: DataTopology) -> tuple[int, ...]:
-    group_ranks = tuple(platform.get_process_group_ranks(group))
+    group_ranks = tuple(dist.get_process_group_ranks(group))
     if set(group_ranks) != set(topology.data_owner_ranks):
         raise ValueError(f"metadata_group ranks must be {topology.data_owner_ranks}, but got {group_ranks}.")
     return tuple(topology.data_owner_ranks.index(global_rank) for global_rank in group_ranks)
 
 
 def _collective_device(group: Any, communication_device: Any) -> Any:
-    backend = str(platform.get_backend(group)).lower()
+    backend = str(dist.get_backend(group)).lower()
     if "hccl" in backend or "nccl" in backend:
         if communication_device is None:
             raise ValueError("communication_device is required for HCCL/NCCL local-batch A2A.")
         return communication_device
     return None
+
+
+def _all_to_all_single(
+    input_tensor: torch.Tensor,
+    output_shape: Sequence[int],
+    group: Any,
+    *,
+    async_op: bool = False,
+) -> tuple[torch.Tensor, Any]:
+    """Allocate output and run a fixed-shape PyTorch all-to-all."""
+    output = torch.empty(output_shape, dtype=input_tensor.dtype, device=input_tensor.device)
+    work = dist.all_to_all_single(output, input_tensor, group=group, async_op=async_op)
+    return output, work
+
+
+def _variable_all_to_all_single(
+    input_tensor: torch.Tensor,
+    input_splits: Sequence[int],
+    output_splits: Sequence[int],
+    group: Any,
+    *,
+    async_op: bool = False,
+) -> tuple[torch.Tensor, Any]:
+    """Allocate output and run a variable-split PyTorch all-to-all."""
+    output = torch.empty(
+        (sum(output_splits), *input_tensor.shape[1:]),
+        dtype=input_tensor.dtype,
+        device=input_tensor.device,
+    )
+    work = dist.all_to_all_single(
+        output,
+        input_tensor,
+        output_split_sizes=list(output_splits),
+        input_split_sizes=list(input_splits),
+        group=group,
+        async_op=async_op,
+    )
+    return output, work
+
+
+def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    """Copy a PyTorch tensor to Host NumPy storage."""
+    return tensor.cpu().numpy()
+
+
+def _str_to_dtype(dtype_name: str) -> torch.dtype:
+    """Resolve a serialized PyTorch dtype name."""
+    prefix, separator, name = dtype_name.partition(".")
+    if prefix != "torch" or separator != "." or not name:
+        raise ValueError(f"Expected dtype string like 'torch.float32', got {dtype_name!r}.")
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported PyTorch dtype {dtype_name!r}.")
+    return dtype
 
 
 def _wait_collective(work: Any) -> None:
@@ -552,7 +598,7 @@ def _prepare_tensors(
     group: Any,
     communication_device: Any,
 ) -> tuple[Any, ...]:
-    if not local_batches or any(not platform.is_tensor(local_batch) for local_batch in local_batches):
+    if not local_batches or any(not torch.is_tensor(local_batch) for local_batch in local_batches):
         raise ValueError("direct_tensor_a2a requires every online local batch to be a tensor.")
     local_count = len(local_batches)
     source_start = data_rank * local_count
@@ -570,7 +616,7 @@ def _prepare_tensors(
                 f"expected {expected_spec}, got {actual_spec}."
             )
 
-    backend = str(platform.get_backend(group)).lower()
+    backend = str(dist.get_backend(group)).lower()
     accelerator_backend = "hccl" in backend or "nccl" in backend
     prepared = []
     for local_batch in local_batches:
@@ -587,7 +633,7 @@ def _prepare_tensors(
 
 def _bytes_to_tensor(data: bytes, communication_device: Any) -> Any:
     host_array = np.frombuffer(bytearray(data), dtype=np.uint8)
-    tensor = platform.from_numpy(host_array)
+    tensor = torch.from_numpy(host_array)
     if communication_device is not None:
         tensor = tensor.to(communication_device, non_blocking=True)
     return tensor
@@ -597,10 +643,10 @@ def _encode_binary_payload(payload: Any) -> bytes:
     blobs = []
 
     def _describe(value: Any) -> Any:
-        if platform.is_tensor(value):
+        if torch.is_tensor(value):
             tensor = value.detach().cpu().contiguous()
-            byte_tensor = tensor.reshape((-1,)).view(platform.tensor_dtype.uint8)
-            blob = platform.tensor_to_numpy(byte_tensor).tobytes()
+            byte_tensor = tensor.reshape((-1,)).view(torch.uint8)
+            blob = _tensor_to_numpy(byte_tensor).tobytes()
             blobs.append(blob)
             return ["tensor", [list(tensor.shape), str(tensor.dtype), len(blob)]]
         if isinstance(value, np.ndarray):
@@ -658,7 +704,7 @@ def _decode_binary_payload(frame: bytes) -> Any:
             byte_array = np.frombuffer(frame[cursor:end], dtype=np.uint8).copy()
             cursor = end
             try:
-                tensor = platform.from_numpy(byte_array).view(platform.str_to_dtype(dtype_name))
+                tensor = torch.from_numpy(byte_array).view(_str_to_dtype(dtype_name))
                 return tensor.reshape(tuple(shape))
             except (RuntimeError, TypeError, ValueError) as exc:
                 raise ValueError(
@@ -770,7 +816,7 @@ def shard_local_batch(
     def _apply(value: Any, path: tuple[str | int, ...]) -> Any:
         spec = spec_by_path.get(path)
         if spec is not None:
-            if not platform.is_tensor(value):
+            if not torch.is_tensor(value):
                 raise ValueError(f"CP shard path {path} does not address a tensor local-batch leaf.")
             dimension = spec.dim + len(value.shape) if spec.dim < 0 else spec.dim
             if dimension < 0 or dimension >= len(value.shape):
@@ -781,7 +827,7 @@ def shard_local_batch(
                     f"which is not divisible by cp_size={cp_size}."
                 )
             seen_paths.add(path)
-            return platform.chunk(value, spec.dim, cp_size, cp_rank)
+            return torch.chunk(value, cp_size, dim=spec.dim)[cp_rank]
         if isinstance(value, dict):
             return {key: _apply(child, path + (key,)) for key, child in value.items()}
         if isinstance(value, list):
@@ -801,7 +847,7 @@ def _encode_payload(payload: Any) -> tuple[Any, list[Any]]:
     tensors = []
 
     def _encode(value: Any) -> Any:
-        if platform.is_tensor(value):
+        if torch.is_tensor(value):
             tensor = value.contiguous()
             tensors.append(tensor)
             return ("tensor", tuple(tensor.shape), tensor.dtype)
@@ -824,7 +870,7 @@ def _decode_payload(descriptor: Any, communication_device: Any) -> tuple[Any, li
             raise ValueError(f"Invalid payload descriptor node: {node!r}.")
         kind = node[0]
         if kind == "tensor" and len(node) == 3:
-            tensor = platform.new_tensor(node[1], node[2], communication_device)
+            tensor = torch.empty(size=node[1], dtype=node[2], device=communication_device)
             tensors.append(tensor)
             return tensor
         if kind == "dict" and len(node) == 2:

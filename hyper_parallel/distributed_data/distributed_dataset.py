@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Bounded-prefetch orchestration for planned local batches."""
+# This package is intentionally PyTorch-only.
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
@@ -21,6 +23,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator
+
+import torch
 
 from hyper_parallel.distributed_data.data_construct import (
     LoadedLocalBatch,
@@ -44,9 +48,15 @@ from hyper_parallel.distributed_data.schema import (
 )
 from hyper_parallel.distributed_data.state import DatasetStateTracker
 from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
+
+def _stream_device_module(device: Any) -> Any:
+    """Return the PyTorch accelerator module for a stream device."""
+    device_type = torch.device(device).type
+    device_module = getattr(torch, device_type, None)
+    if device_module is None:
+        raise ValueError(f"PyTorch has no device module for data stream device {device!r}.")
+    return device_module
 
 
 @dataclass
@@ -97,6 +107,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         double_buffer: bool = False,
         prepare_local_batch: Callable[[Any], Any] | None = None,
         data_stream: Any = None,
+        data_stream_device: Any = None,
     ) -> None:
         """Initialize local-batch planning, fetching, communication, and prefetch."""
         if planner.data_parallel_size != topology.data_parallel_size:
@@ -116,6 +127,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             raise ValueError(f"double_buffer must be a boolean, but got {double_buffer!r}.")
         if prepare_local_batch is not None and not callable(prepare_local_batch):
             raise ValueError("prepare_local_batch must be callable or None.")
+        if (data_stream is None) != (data_stream_device is None):
+            raise ValueError("data_stream and data_stream_device must be configured together.")
 
         self._topology = topology
         self._source = source
@@ -129,6 +142,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         self._prepare_local_batch = prepare_local_batch
         self._double_buffer = double_buffer
         self._data_stream = data_stream
+        self._data_stream_device = data_stream_device
         source_size = len(metadata_source) if metadata_source is not None else len(online_source)
         self._source_size = source_size
         self._state = DatasetStateTracker(source_size, planner.local_batches_per_step, prefetch_steps)
@@ -406,7 +420,8 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             slot.key = None
             slot.future = None
         if prepared.ready_event is not None:
-            prepared.ready_event.wait(platform.get_current_stream())
+            device_module = _stream_device_module(self._data_stream_device)
+            prepared.ready_event.wait(device_module.current_stream(self._data_stream_device))
         self._next_micro_batch_index += 1
         if self._next_micro_batch_index < self._planner.micro_batch_num:
             self._schedule_buffered_local_batch(reservation, self._next_micro_batch_index)
@@ -421,11 +436,10 @@ class DistributedDataset(Iterator[DistributedDataStep]):
     ) -> _PreparedLocalBatch:
         if reservation.host_future is None:
             raise ValueError("Reserved step has no Host-prefetch future.")
-        stream_context = (
-            nullcontext()
-            if self._data_stream is None
-            else platform.get_stream_context()(self._data_stream)
-        )
+        stream_context = nullcontext()
+        if self._data_stream is not None:
+            device_module = _stream_device_module(self._data_stream_device)
+            stream_context = device_module.stream(self._data_stream)
         with stream_context:
             host_step = reservation.host_future.result()
             owner_local_batch = host_step.local_batches[micro_batch_index]
@@ -449,7 +463,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
             )
             ready_event = None
             if self._data_stream is not None:
-                ready_event = platform.new_event()
+                ready_event = device_module.Event()
                 ready_event.record(self._data_stream)
         return _PreparedLocalBatch(received_plan, local_batch, ready_event)
 

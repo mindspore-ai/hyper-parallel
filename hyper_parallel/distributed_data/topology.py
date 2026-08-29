@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Topology derivation for distributed data loading."""
+# This package is intentionally PyTorch-only.
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
@@ -20,9 +22,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
+import torch.distributed as dist
 
 _DEFAULT_DP_DIM_NAMES = ("dp_replicate", "dp_shard", "dp")
 
@@ -41,6 +41,22 @@ def _unflatten_coordinate(flat_index: int, shape: tuple[int, ...]) -> tuple[int,
         coordinate[dim_index] = remaining % shape[dim_index]
         remaining //= shape[dim_index]
     return tuple(coordinate)
+
+
+def _mesh_layout(mesh: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return shape and flattened ranks from HyperParallel or PyTorch DeviceMesh."""
+    mesh_shape = getattr(mesh, "mesh_shape", None)
+    rank_list = getattr(mesh, "rank_list", None)
+    if mesh_shape is not None and rank_list is not None:
+        return tuple(mesh_shape), tuple(rank_list)
+
+    mesh_tensor = getattr(mesh, "mesh", None)
+    if mesh_tensor is None:
+        raise ValueError("mesh must expose mesh_shape/rank_list or a PyTorch mesh tensor.")
+    return (
+        tuple(int(size) for size in mesh_tensor.shape),
+        tuple(int(rank) for rank in mesh_tensor.reshape(-1).tolist()),
+    )
 
 
 @dataclass(frozen=True)
@@ -72,11 +88,11 @@ class DataTopology:
         global_rank: int | None = None,
         dp_dim_names: tuple[str, ...] | None = None,
     ) -> "DataTopology":
-        """Build topology from a HyperParallel ``DeviceMesh``.
+        """Build topology from a PyTorch or layout-compatible ``DeviceMesh``.
 
         Args:
-            mesh: Root named device mesh used by the training job.
-            global_rank: Current global rank. Defaults to the platform rank.
+            mesh: Root named PyTorch or layout-compatible device mesh.
+            global_rank: Current global rank. Defaults to the PyTorch distributed rank.
             dp_dim_names: Base mesh dimensions defining a DP coordinate.
 
         Returns:
@@ -84,11 +100,12 @@ class DataTopology:
         """
         if not mesh.mesh_dim_names:
             raise ValueError("Distributed data loading requires a DeviceMesh with named dimensions.")
-        rank = platform.get_rank() if global_rank is None else global_rank
+        mesh_shape, rank_list = _mesh_layout(mesh)
+        rank = dist.get_rank() if global_rank is None else global_rank
         return cls.from_layout(
-            tuple(mesh.mesh_shape),
+            mesh_shape,
             tuple(mesh.mesh_dim_names),
-            tuple(mesh.rank_list),
+            rank_list,
             rank,
             dp_dim_names=dp_dim_names,
         )
@@ -211,6 +228,6 @@ class DataTopology:
 
     @staticmethod
     def _validate_group(group, expected_ranks: tuple[int, ...], name: str) -> None:
-        actual_ranks = tuple(platform.get_process_group_ranks(group))
+        actual_ranks = tuple(dist.get_process_group_ranks(group))
         if set(actual_ranks) != set(expected_ranks):
             raise ValueError(f"{name} ranks must be {expected_ranks}, but got {actual_ranks}.")
