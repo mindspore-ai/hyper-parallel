@@ -504,7 +504,7 @@ def test_dcp_async_save_with_optimizer_tp_dp():
     if rank == 0:
         os.makedirs(str(checkpoint_path_async), exist_ok=True)
     dist.barrier()
-    async_resp = async_save(save_state, checkpoint_id=checkpoint_path_async, use_collectives=False)
+    async_resp = async_save(save_state, checkpoint_id=checkpoint_path_async, use_collectives=True)
     async_resp.persist_completion.result()
     dist.barrier()
 

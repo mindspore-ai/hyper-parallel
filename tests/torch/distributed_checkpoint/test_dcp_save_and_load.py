@@ -23,7 +23,7 @@ DCP_SAVE_AND_LOAD = "dcp_save_and_load.py"
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dcp_save_and_load_group1():
     """
-    Feature: parallel run case in checkpoint
+    Feature: parallel run case in distributed_checkpoint
     Description:
         1.test_dcp_save_and_load_with_dtensor_and_tensor_and_scalar
         2.test_dcp_async_save_and_load_with_dtensor_and_tensor_and_scalar
@@ -37,7 +37,7 @@ def test_dcp_save_and_load_group1():
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_dcp_save_and_load_group1_gloo():
     """
-    Feature: parallel run case in checkpoint
+    Feature: parallel run case in distributed_checkpoint
     Description:
         1.test_dcp_save_and_load_with_dtensor_and_tensor_and_scalar
         2.test_dcp_async_save_and_load_with_dtensor_and_tensor_and_scalar
@@ -52,7 +52,7 @@ def test_dcp_save_and_load_group1_gloo():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dcp_save_and_load_group2():
     """
-    Feature: parallel run case in checkpoint
+    Feature: parallel run case in distributed_checkpoint
     Description:
         1.test_dcp_save_and_load_with_full_tensor
     Expectation: Run success.
@@ -66,7 +66,7 @@ def test_dcp_save_and_load_group2():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level3", card_mark="allcards", essential_mark="essential")
 def test_dcp_save_and_load_group3():
     """
-    Feature: parallel run case in checkpoint
+    Feature: parallel run case in distributed_checkpoint
     Description:
         1.test_dcp_save_and_load_save_8card_load_4card
     Expectation: Run success.

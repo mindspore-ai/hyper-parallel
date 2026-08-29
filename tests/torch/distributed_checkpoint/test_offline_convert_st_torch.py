@@ -12,22 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base layout"""
+"""Thin entry for PyTorch offline checkpoint ST (lazy import)."""
+from __future__ import annotations
 
-from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
-
-BASE_SHARD = "base_shard.py"
+import importlib
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_get_global_layout():
-    """
-    Feature: parallel run case in checkpoint
-    Description:
-        1.test_get_global_layout
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(BASE_SHARD, "test_get_global_layout", 12251, 2)
-    ])
+def test_offline_convert_checkpoint_roundtrip_suite_torch():
+    """See impl suite."""
+    # pylint: disable=C0415
+    mod = importlib.import_module("tests.torch.distributed_checkpoint._offline_convert_st_torch_impl")
+    return mod.test_offline_convert_checkpoint_roundtrip_suite_torch()

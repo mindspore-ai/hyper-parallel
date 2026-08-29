@@ -23,7 +23,7 @@ DCP_MIN_PLAN_CACHE_API = "dcp_plan_cache_minimal_api.py"
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_dcp_plan_cache_minimal_api_group1():
     """
-    Feature: parallel run case in checkpoint minimal plan-cache API.
+    Feature: parallel run case in distributed_checkpoint minimal plan-cache API.
     Description:
         1.test_dcp_minimal_plan_cache_hit
         2.test_dcp_minimal_plan_cache_model_optimizer_isolation

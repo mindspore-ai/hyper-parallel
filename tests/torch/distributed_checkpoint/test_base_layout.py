@@ -12,21 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test saver loader"""
+"""test base layout"""
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-SAVER_LOADER = "saver_loader.py"
+BASE_SHARD = "base_shard.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
-def test_save_load_checkpoint():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_get_global_layout():
     """
-    Feature: parallel run case in checkpoint
+    Feature: parallel run case in distributed_checkpoint
     Description:
-        1.test_save_load_checkpoint
+        1.test_get_global_layout
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(SAVER_LOADER, "test_save_load_checkpoint", 12403, 1)
+        TorchCase(BASE_SHARD, "test_get_global_layout", 12251, 2)
     ])

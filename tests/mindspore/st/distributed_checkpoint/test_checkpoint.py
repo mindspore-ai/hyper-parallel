@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""all testcases in checkpoint"""
+"""all testcases in distributed_checkpoint"""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, MindSporeCase
 
@@ -23,7 +23,7 @@ RESHARD_HANDLER = "reshard_handler.py"
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_checkpoint_group1():
     """
-    Feature: parallel run case in checkpoint
+    Feature: parallel run case in distributed_checkpoint
     Description:
         1.test_base_layout
         2.test_get_global_layout
@@ -42,7 +42,7 @@ def test_checkpoint_group1():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_checkpoint_group2():
     """
-    Feature: parallel run case in checkpoint
+    Feature: parallel run case in distributed_checkpoint
     Description:
         1.test_wrong_to_rank_id_while_to_layout_not_none
         2.test_wrong_to_rank_id_while_to_layout_is_none
