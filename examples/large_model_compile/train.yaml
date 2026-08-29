@@ -1,19 +1,19 @@
 # Large Qwen3-MoE decoder-layer compile benchmark.
 #
 # The model is created from Qwen3MoeConfig; no checkpoint is loaded.  The
-# configuration has approximately 446.8B parameters (bf16 ~= 832GiB globally).
-# With 16 NPUs, TP=2 and FSDP shard=8, model parameters occupy about 52GiB per
-# card before activations and runtime workspaces.
+# The six-layer configuration preserves the large hidden and expert widths
+# while fitting optimizer state and backward workspaces on eight 64-GiB NPUs.
 
 model:
   _target_: examples.large_model_compile.large_qwen3_moe.build_large_qwen3_moe
   torch_dtype: bfloat16
   attn_implementation: sdpa
+  num_hidden_layers: 6
 
 training:
   train_iters: 1
   train_samples: null
-  global_batch_size: 16
+  global_batch_size: 1
   micro_batch_size: 1
   backend: hccl
   init_device: meta
@@ -24,16 +24,17 @@ training:
 
 accelerator:
   tp_size: 2
-  cp_size: 1
-  ep_size: 1
+  cp_size: 4
+  ep_size: 2
   pp_size: 1
-  sequence_parallel: false
+  sequence_parallel: true
   loss_parallel: true
 
 fsdp_config:
-  # world=16 and TP=2 => DP=8; shard all eight DP replicas.
-  dp_shard_size: 8
-  edp_shard_size: 1
+  # world=8, TP=2 and CP=4 => DP=1; CP participates in dense FSDP sharding.
+  dp_shard_size: 4
+  # Expert parameters are sharded over all four EDP ranks in addition to EP2.
+  edp_shard_size: 4
   replicate_params: []
   reshard_after_forward: true
   reshard_after_backward: false
@@ -51,15 +52,27 @@ plan_overrides:
     replace_module:
       _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
   - match: "*.self_attn"
-    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+    when: cp
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.auto_models.components.distributed.cp_wrappers.sdpa_hf_ulysses_cp_wrapper
+  - match: "*.mlp"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
     replace_module:
-      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_flash_attention
+      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_sparse_moe
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.auto_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn
+      use_grouped_gemm: false
 
 mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  mode: off
+  mode: full
 
 compile:
   enabled: true
@@ -81,7 +94,7 @@ dataset:
       eod_token_id: 2
       pad_token_id: 0
   data_config:
-    seq_length: 128
+    seq_length: 4096
     split: "100, 0, 0"
     mock_data: true
     data_lazy_load: false

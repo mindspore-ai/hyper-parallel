@@ -23,23 +23,26 @@ from hyper_parallel.auto_models.components.distributed.infrastructure import Dis
 from hyper_parallel.auto_models.trainer.config import CompileConfig
 
 
-def build_large_qwen3_moe_config() -> Qwen3MoeConfig:
+def build_large_qwen3_moe_config(
+    num_hidden_layers: int = 6,
+) -> Qwen3MoeConfig:
     """Return the parameter-sized Qwen3-MoE configuration used by the demo.
 
-    The dimensions are intentionally close to a large production MoE: 72
-    decoder layers, 64 routed experts, and 8 experts selected per token.  No
-    checkpoint is read; Trainer materializes and initializes the sharded model
-    directly on the target NPU mesh.
+    The dimensions keep the large hidden/expert projection sizes while fitting
+    an eight-card 64-GiB NPU benchmark: 6 decoder layers, 64 routed experts,
+    and 8 experts selected per token.  No checkpoint is read; Trainer
+    materializes and initializes the sharded model directly on the target NPU
+    mesh.
     """
     return Qwen3MoeConfig(
         vocab_size=65536,
         hidden_size=8192,
         intermediate_size=24576,
         moe_intermediate_size=3840,
-        num_hidden_layers=72,
+        num_hidden_layers=num_hidden_layers,
         num_attention_heads=64,
         num_key_value_heads=8,
-        max_position_embeddings=4096,
+        max_position_embeddings=32768,
         num_experts=64,
         num_experts_per_tok=8,
         decoder_sparse_step=1,
@@ -49,7 +52,10 @@ def build_large_qwen3_moe_config() -> Qwen3MoeConfig:
         attention_dropout=0.0,
         bos_token_id=1,
         eos_token_id=2,
-        pad_token_id=0,
+        # The benchmark uses pretokenized mock data and does not need a fixed
+        # padding row.  Keeping this unset also avoids integer-indexing a
+        # TP+FSDP-sharded embedding during HF random initialization.
+        pad_token_id=None,
         architectures=["Qwen3MoeForCausalLM"],
         attn_implementation="sdpa",
     )
@@ -60,13 +66,14 @@ def build_large_qwen3_moe(
     distributed_setup: Optional[DistributedSetup] = None,
     torch_dtype: Any = "bfloat16",
     attn_implementation: str = "sdpa",
+    num_hidden_layers: int = 6,
     compile_config: Optional[CompileConfig] = None,
     activation_checkpoint: Optional[str] = None,
     activation_swap: str = "none",
     validate_placement: bool = False,
 ) -> PreTrainedModel:
     """Build and parallelize the large model through the Trainer contract."""
-    config = build_large_qwen3_moe_config()
+    config = build_large_qwen3_moe_config(num_hidden_layers=num_hidden_layers)
     config.attn_implementation = attn_implementation
     return HyperAutoModelForCausalLM.from_config(
         config,
