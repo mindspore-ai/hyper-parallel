@@ -22,8 +22,18 @@ defines its own :class:`MpipeStepType` steps (kept out of the core
 carries no MPipe-specific code.
 """
 
-__all__ = ["MpipeStepType", "MPipeTransposeExecutorBase", "ScheduleMPipeTranspose"]
-
 from hyper_parallel.core.pipeline_parallel.mpipe.step_types import MpipeStepType
 from hyper_parallel.core.pipeline_parallel.mpipe.executor_base import MPipeTransposeExecutorBase
 from hyper_parallel.core.pipeline_parallel.mpipe.schedule import ScheduleMPipeTranspose
+from hyper_parallel.core.pipeline_parallel.mpipe.sampler import (
+    PPRankOwnedSampler,
+    mpipe_owned_micros,
+)
+
+__all__ = [
+    "MpipeStepType",
+    "MPipeTransposeExecutorBase",
+    "ScheduleMPipeTranspose",
+    "PPRankOwnedSampler",
+    "mpipe_owned_micros",
+]

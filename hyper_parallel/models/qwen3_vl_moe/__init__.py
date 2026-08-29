@@ -218,6 +218,7 @@ register_spec(
         build_model_fn=_build,
         parallelize_fn=parallelize_qwen3_vl_moe,
         pipelining_fn=pipeline_qwen3_vl_moe_for_trainer,
+        pp_applies_activation_checkpoint=True,
         state_dict_adapter=Qwen3VLMoeStateDictAdapter,
         tp_load_transform_fn=qwen3_5_moe_tp_load_transforms,
     ),

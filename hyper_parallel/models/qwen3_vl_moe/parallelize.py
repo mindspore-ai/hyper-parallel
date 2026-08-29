@@ -37,10 +37,14 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy
 from hyper_parallel.core.pipeline_parallel import (
-    BatchDimSpec, PipelineStage, Schedule1F1B, ScheduleGPipe, ScheduleInterleaved1F1B)
+    BatchDimSpec, PipelineStage, Schedule1F1B, ScheduleGPipe, ScheduleInterleaved1F1B,
+    ScheduleMPipeTranspose)
+from hyper_parallel.models.qwen3_vl_moe.prefetch import apply_fsdp_prefetch
 from hyper_parallel.models.qwen3_vl_moe.model import (
     Qwen3VLMoeForConditionalGeneration,
+    Qwen3VLMoeIdentityPreprocess,
     Qwen3VLMoeStageModule,
+    Qwen3VLMoeVisualPreprocess,
 )
 from hyper_parallel.platform import get_platform
 # The VL text backbone shares the Qwen3.5-MoE GQA and packed-expert modules, so
@@ -809,6 +813,11 @@ def _apply_vl_visual_tower(model, mesh, cfg) -> None:
     if visual is None:
         return
 
+    # Before the FSDP wrap so recompute sits inside the FSDP unit, and ahead of
+    # the replicated-tower early returns since the two are orthogonal.
+    _apply_visual_ac(visual, cfg, stage_idx=_visual_stage_entry(mesh),
+                     num_stages=_num_global_stages(cfg))
+
     frozen_visual = all(not param.requires_grad for param in visual.parameters())
     deterministic = bool(cfg.train.debug.deterministic)
     if deterministic and frozen_visual:
@@ -833,16 +842,26 @@ def _apply_vl_visual_tower(model, mesh, cfg) -> None:
     if single_frozen_visual:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
         logger.info_rank0("Single-rank frozen VL visual tower uses CPU-offloaded FSDP.")
+    if bool(cfg.train.accelerator.pp_mpipe_owner_backward) and not frozen_visual:
+        # The tower forward and its deferred owner backward are many steps
+        # apart, so the params must stay gathered for the retained graph.
+        fsdp_kwargs["reshard_after_forward"] = False
+        logger.info_rank0(
+            "[mpipe] owner-backward tower: reshard_after_forward=False "
+            "(params stay gathered for the deferred cooldown backward).")
     mp_policy = fsdp_kwargs.get("mp_policy")
     if mp_policy is not None:
-        # Keep the frozen visual tower's activation flow aligned with the
-        # single-card path. The text backbone may request fp32 FSDP outputs for
-        # residual math; vision blocks should not inherit that cast before the
-        # merger.
+        # The backbone may request fp32 FSDP outputs for residual math; the
+        # vision blocks must not inherit that cast before the merger.
         mp_policy.output_dtype = None
     _wrap_visual_children(visual, fsdp_kwargs)
     _wrap_visual_unit(visual, fsdp_kwargs)
     logger.info_rank0("VL visual tower wrapped (per-block + merger + root)")
+    # Only the blocks are chained: the mergers do not run in a simple sequence
+    # after them, so chaining would prefetch in the wrong order.
+    apply_fsdp_prefetch(
+        list(getattr(visual, "blocks", ())), cfg, fsdp_kwargs, "VL visual tower",
+    )
 
 
 def _should_skip_single_rank_fsdp(cfg) -> bool:
@@ -882,20 +901,118 @@ def _is_single_rank_without_parallel_axes(cfg) -> bool:
     return single_rank and not has_parallel_axis
 
 
-def _apply_ac(model, cfg) -> None:
-    """Apply ac (internal)."""
-    ac_mode = cfg.train.gradient_checkpointing.activation_checkpoint
+def _num_global_stages(cfg) -> int:
+    """Total interleaved global stages, ``pp * pp_vpp`` (1 without PP)."""
+    acc = getattr(cfg.train, "accelerator", None) if cfg is not None else None
+    pp = int(getattr(acc, "pp", 1) or 1)
+    vpp = int(getattr(acc, "pp_vpp", 1) or 1)
+    return max(1, pp) * max(1, vpp)
+
+
+def _visual_stage_entry(mesh) -> int:
+    """Per-stage-list entry for this rank's visual replica: its chunk-0 global
+    stage, which under the interleaved rank<->stage mapping equals the pp local
+    rank. 0 when there is no mesh or no pp dim (non-PP, single-card)."""
+    try:
+        return int(mesh["pp"].get_local_rank())
+    except (KeyError, TypeError, AttributeError, RuntimeError):
+        return 0
+
+
+def _resolve_recompute_depth(value, n_local, *, stage_idx, num_stages, key):
+    """How many of this stage's ``n_local`` layers to checkpoint-wrap.
+
+    ``value`` is ``None`` (wrap all), a uniform ``int`` (first N per stage), or
+    a per-global-stage list following the ``pp_layer_split`` convention (length
+    ``pp * pp_vpp``, entry ``g`` applies to global stage ``g``). Entries clamp
+    to ``n_local``; negatives raise.
+    """
+    if value is None:
+        return n_local
+    if isinstance(value, (list, tuple)):
+        if len(value) != num_stages:
+            raise ValueError(
+                f"{key} has {len(value)} entries but there are {num_stages} "
+                "global stages."
+            )
+        value = value[stage_idx]
+    depth = int(value)
+    if depth < 0:
+        raise ValueError(f"{key} entries must be >= 0; got {depth}.")
+    return min(depth, n_local)
+
+
+def _apply_ac(model, cfg, *, stage_idx: int = 0, num_stages: int = 1) -> None:
+    """Checkpoint-wrap the decoder layers of ``model`` (full model or one PP
+    stage module), honoring ``train.gradient_checkpointing.num_layers``:
+    ``None`` wraps every local layer, an ``int`` the first N of them per stage,
+    a per-global-stage list (``pp_layer_split`` convention) the first
+    ``list[stage_idx]``. ``0`` leaves the stage unwrapped.
+    """
+    ac_mode = getattr(cfg.train.gradient_checkpointing, "activation_checkpoint", "off")
     if ac_mode in ("off", "none", None, False, ""):
         return
     if not hasattr(model, "layers"):
         logger.warning("AC enabled but model has no .layers; skipping.")
         return
 
-    layers = list(model.layers)
-    for i, layer in enumerate(layers):
-        model.layers[i] = checkpoint_wrapper(layer)
-    logger.info_rank0("AC applied to %d Qwen3-VL-MoE text layers (mode=%s)",
-                      len(layers), ac_mode)
+    n_local = len(model.layers)
+    depth = _resolve_recompute_depth(
+        getattr(cfg.train.gradient_checkpointing, "num_layers", None),
+        n_local, stage_idx=stage_idx, num_stages=num_stages,
+        key="train.gradient_checkpointing.num_layers",
+    )
+    if depth == 0:
+        return
+    for i in range(depth):
+        model.layers[i] = checkpoint_wrapper(model.layers[i])
+    # Depth is rank/stage-dependent (per-stage lists), so log on every rank.
+    logger.info("AC applied to %d/%d Qwen3-VL-MoE text layers (stage %d of %d, mode=%s)",
+                depth, n_local, stage_idx, num_stages, ac_mode)
+
+
+def _apply_visual_ac(visual, cfg, *, stage_idx: int = 0, num_stages: int = 1) -> None:
+    """Checkpoint-wrap a trainable visual tower's blocks for activation recompute.
+
+    The text-only :func:`_apply_ac` skips the visual tower; this wraps
+    ``visual.blocks`` under the same ``activation_checkpoint`` flag, in every
+    path (non-PP, any PP schedule, single-card). The MPipe transposed
+    ``preprocess_module`` references this same tower, so it recomputes too.
+
+    Gated on a TRAINABLE visual via runtime ``requires_grad`` (a partial freeze
+    keeps recompute on the still-trainable blocks; a fully frozen tower has no
+    backward). Idempotent via a marker attribute. Must run *before* the FSDP
+    wrap so the checkpoint sits inside the FSDP unit.
+
+    ``visual_num_layers`` bounds the depth (first N blocks); a per-global-stage
+    list follows the ``pp_layer_split`` convention — the transposed replica on
+    rank ``r`` reads entry ``r``, the inline stage-0 tower entry ``0``.
+    """
+    if visual is None or not hasattr(visual, "blocks") or cfg is None:
+        return
+    if getattr(visual, "_visual_ac_applied", False):
+        return
+    gc_cfg = cfg.train.gradient_checkpointing
+    ac_mode = getattr(gc_cfg, "activation_checkpoint", "off")
+    if ac_mode in ("off", "none", None, False, ""):
+        return
+    if all(not p.requires_grad for p in visual.parameters()):
+        # Fully frozen (or param-free) tower: no backward, nothing to recompute.
+        return
+    n_blocks = len(visual.blocks)
+    num_layers = _resolve_recompute_depth(
+        getattr(gc_cfg, "visual_num_layers", None),
+        n_blocks, stage_idx=stage_idx, num_stages=num_stages,
+        key="train.gradient_checkpointing.visual_num_layers",
+    )
+    if num_layers == 0:
+        return
+    for i in range(num_layers):
+        visual.blocks[i] = checkpoint_wrapper(visual.blocks[i])
+    visual._visual_ac_applied = True  # pylint: disable=protected-access
+    # The replica's depth differs under a per-stage list, so log on every rank.
+    logger.info("AC applied to %d/%d Qwen3-VL-MoE visual blocks (stage entry %d, mode=%s)",
+                num_layers, n_blocks, stage_idx, ac_mode)
 
 
 def _apply_deterministic_moe_sort(model, cfg) -> None:
@@ -958,6 +1075,9 @@ def _apply_fsdp(model, mesh, cfg) -> None:
     for layer in layers:
         fully_shard(layer, **layer_fsdp_kwargs)
     fully_shard(model, **fsdp_kwargs)
+    # ``model.layers`` is execution order for the text decoder, and the layers
+    # are the bulk of the parameters — this is where the overlap pays.
+    apply_fsdp_prefetch(layers, cfg, layer_fsdp_kwargs, "text decoder")
     if cp_size > 1:
         model.set_reduce_op_type("sum")
         model.hp_token_loss_scale_size = 1
@@ -1071,6 +1191,11 @@ def parallelize_qwen3_vl_moe(
     _resolve_qwen3_vl_moe_fsdp_mesh(
         mesh, cfg, int(cfg.train.accelerator.cp or 1),
     )
+    # Hoisted above the single-rank gate below so a single-card trainable visual
+    # still recomputes; idempotent, so the in-tower call then no-ops.
+    _apply_visual_ac(_resolve_visual_tower(model, cfg), cfg,
+                     stage_idx=_visual_stage_entry(mesh),
+                     num_stages=_num_global_stages(cfg))
     _apply_vl_visual_cp(model, mesh, cfg)
     if not _should_skip_single_rank_fsdp(cfg):
         _apply_vl_visual_tower(model, mesh, cfg)
@@ -1144,6 +1269,16 @@ def _fsdp_wrap_stage_vl(stage_module, dp_mesh, cfg) -> None:
         "PP+FSDP: VL stage wrapped %d layer(s) + embed/norm/lm_head + root (dp=%d)",
         len(stage_module.layers), dp_mesh.size() if hasattr(dp_mesh, "size") else 1,
     )
+    # Always call so a user who set fsdp_forward_prefetch gets the explicit
+    # skip line (reshard_after_forward is forced off just above).
+    apply_fsdp_prefetch(
+        list(stage_module.layers), cfg, fsdp_kwargs, "PP stage text layers",
+    )
+
+
+def _less_memory_from_cfg(cfg) -> bool:
+    """Read ``train.accelerator.pp_less_memory`` (shallow interleaved warmup)."""
+    return bool(getattr(cfg.train.accelerator, "pp_less_memory", False)) if cfg else False
 
 
 def _build_qwen3_vl_moe_pp_schedule(
@@ -1152,15 +1287,144 @@ def _build_qwen3_vl_moe_pp_schedule(
     schedule_name: str,
     vpp: int,
     kwargs_batch_dim: dict,
+    cfg=None,
 ):
     """Build the configured Qwen3-VL-MoE pipeline schedule."""
     if vpp > 1:
         return ScheduleInterleaved1F1B(
             stages, micro_batch_num, kwargs_batch_dim=kwargs_batch_dim,
+            less_memory=_less_memory_from_cfg(cfg),
         )
     return _resolve_pp_schedule(schedule_name)(
         stages, micro_batch_num, kwargs_batch_dim=kwargs_batch_dim,
     )
+
+
+def _cast_frozen_visual_to_compute_dtype(module, cfg) -> None:
+    """Cast a frozen visual tower's params to the mixed-precision compute dtype.
+
+    The MPipe transpose path runs the tower in the executor's detached forward,
+    outside the FSDP / mixed-precision wrapper, so it must be cast in place to
+    encode the visual at the same precision as the inline path. Only a bf16/fp16
+    run with a FROZEN visual casts; fp32 stays bit-exact and a trainable visual
+    is left to the FSDP MixedPrecisionPolicy. Floating-point buffers (rotary
+    ``inv_freq``) stay fp32 — only parameters are cast.
+    """
+    if cfg is None:
+        return
+    mp_cfg = cfg.train.mixed_precision
+    if not mp_cfg.enabled:
+        return
+    freeze_modules = getattr(cfg.model, "freeze_modules", None) or []
+    if not any("visual" in p for p in freeze_modules):
+        return
+    target_dtype = {
+        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+        "float16": torch.float16, "fp16": torch.float16,
+    }.get(mp_cfg.param_dtype)
+    if target_dtype is None:
+        return
+    for p in module.parameters():
+        if p.data.dtype != target_dtype:
+            p.data = p.data.to(target_dtype)
+
+
+def _build_vl_mpipe_schedule(stages, composite, micro_batch_num, kwargs_batch_dim, device, cfg):
+    """Build a ScheduleMPipeTranspose for Qwen3-VL-MoE.
+
+    The transpose target is resolved from ``pp_mpipe_transpose_layers``
+    (``int | "visual"``) against the vision-layer count ``n_vis``:
+
+    * ``"visual"`` or ``n_vis`` — transpose the whole (frozen) visual tower;
+      each rank encodes its micro-batch's images in parallel and ships the
+      ``(image_embeds, *deepstack_features)`` payload to stage 0, which injects
+      it (the visual tower is frozen → no broadcast, no recompute). The payload
+      is routed into the ``mpipe_visual`` kwarg the stage forward reads.
+    * ``0`` — dataload-only (param-free identity; the visual tower stays on
+      stage 0).
+    * ``0 < T < n_vis`` (partial tower) and ``T > n_vis`` (spill into LLM
+      layers) are not implemented.
+    """
+    transpose_spec = getattr(cfg.train.accelerator, "pp_mpipe_transpose_layers", "visual") if cfg else "visual"
+    n_vis = len(getattr(composite.visual, "blocks", []) or [])
+    if transpose_spec == "visual":
+        spec_layers = n_vis
+    elif isinstance(transpose_spec, int):
+        spec_layers = transpose_spec
+    else:
+        raise ValueError(
+            f"pp_mpipe_transpose_layers must be an int or 'visual', got {transpose_spec!r}."
+        )
+
+    output_consumer = None
+    if spec_layers == n_vis and n_vis > 0:
+        preprocess_module = Qwen3VLMoeVisualPreprocess(composite.visual)
+
+        def output_consumer(ctx, micro, out):  # pylint: disable=function-redefined
+            ctx.kwarg_mbs[micro]["mpipe_visual"] = out
+    elif spec_layers == 0:
+        preprocess_module = Qwen3VLMoeIdentityPreprocess()
+    elif 0 < spec_layers < n_vis:
+        raise NotImplementedError(
+            f"Qwen3-VL-MoE MPipe: partial visual-tower transpose (0 < T={spec_layers} < "
+            f"n_vis={n_vis}) is not implemented; use 'visual' / T={n_vis} (whole tower) or T=0."
+        )
+    else:  # spec_layers > n_vis
+        raise NotImplementedError(
+            f"Qwen3-VL-MoE MPipe: spilling the transpose into LLM layers (T={spec_layers} > "
+            f"n_vis={n_vis}) is not implemented; use 'visual' / T={n_vis} or T=0."
+        )
+    # Without this the tower stays fp32 while mixed_precision feeds it bf16,
+    # forcing per-op casts that roughly double the per-rank visual encode.
+    _cast_frozen_visual_to_compute_dtype(preprocess_module, cfg)
+    if device is not None:
+        preprocess_module = preprocess_module.to(device=device)
+    # Replica-rank coverage: the transposed tower is replicated on every rank;
+    # idempotently wrap the replicas too (stage-0 inline wraps only cover rank 0).
+    _apply_visual_ac(getattr(preprocess_module, "visual", None), cfg,
+                     stage_idx=getattr(stages[0], "stage_index", 0) if stages else 0,
+                     num_stages=_num_global_stages(cfg))
+    owner_backward = (
+        getattr(cfg.train.accelerator, "pp_mpipe_owner_backward", False) if cfg else False
+    )
+    # cp is not yet handled: the tower's FSDP reduce folds cp into the dp mesh,
+    # which is not orthogonal to the pp axis MPipe reduces over.
+    if owner_backward and cfg and int(cfg.train.accelerator.cp or 1) > 1:
+        raise ValueError(
+            "pp_mpipe_owner_backward does not yet compose with cp>1 (the tower's "
+            "FSDP reduce mesh folds cp with dp; owner-backward reduces pp + dp only). "
+            "Use cp=1."
+        )
+    overflow_mode = str(getattr(cfg.train.accelerator, "pp_mpipe_transpose_overflow", "full")) if cfg else "full"
+    return ScheduleMPipeTranspose(
+        stages, micro_batch_num,
+        preprocess_module=preprocess_module,
+        num_transpose_layers=spec_layers,
+        num_visual_layers=n_vis,
+        kwargs_batch_dim=kwargs_batch_dim,
+        output_consumer=output_consumer,
+        owner_backward=owner_backward,
+        less_memory=_less_memory_from_cfg(cfg),
+        overflow_mode=overflow_mode,
+    )
+
+
+def _drop_non_owned_layers(layers, owned):
+    """Replace decoder layers not owned by this rank's stage(s) with param-free
+    ``nn.Identity`` placeholders, in place. Length and global indices are
+    preserved so checkpoint keys still match by full-model name. Returns the
+    number of entries replaced.
+
+    Interim fix: the trainer's PP+FSDP build still runs ``to_empty`` on the
+    FULL model before re-pointing ``self.model`` at the stage, so without this
+    every rank materializes all decoder layers at full (unsharded) size.
+    """
+    dropped = 0
+    for i, _ in enumerate(layers):
+        if i not in owned:
+            layers[i] = torch.nn.Identity()
+            dropped += 1
+    return dropped
 
 
 def pipelining_qwen3_vl_moe(
@@ -1228,10 +1492,12 @@ def pipelining_qwen3_vl_moe(
     # ``pp_rank, pp_rank+num_ranks, ...`` (loop / round-robin). ``vpp == 1``
     # collapses to a single contiguous stage.
     stages = []
+    owned = set()
     for v in range(vpp):
         stage_index = pp_rank + v * num_ranks
         start = starts[stage_index]
         end = start + counts[stage_index]
+        owned.update(range(start, end))
         is_first = stage_index == 0
         is_last = stage_index == num_stages - 1
         stage_module = Qwen3VLMoeStageModule(
@@ -1250,11 +1516,29 @@ def pipelining_qwen3_vl_moe(
         )
         if device is not None:
             stage_module = stage_module.to(device=device)
+        # The PP path bypasses ``_apply_ac``; apply before the FSDP wrap so
+        # checkpoint_wrapper sits inside the FSDP boundary.
+        if cfg is not None:
+            _apply_ac(stage_module, cfg, stage_idx=stage_index, num_stages=num_stages)
+            # Pure-PP-no-FSDP stage 0: the FSDP paths wrap the visual inside
+            # _apply_vl_visual_tower (pre-split); cover the no-FSDP case here.
+            if is_first and fsdp_mesh is None:
+                _apply_visual_ac(stage_module.visual, cfg,
+                                 stage_idx=0, num_stages=num_stages)
         if fsdp_mesh is not None:
             _fsdp_wrap_stage_vl(stage_module, fsdp_mesh, cfg)
         stages.append(
             PipelineStage(stage_module, stage_index, num_stages,
                           device=device, mesh=pp_mesh))
+
+    # The trainer ``to_empty``'s the FULL model before re-pointing at the
+    # stage; drop non-owned layers so each rank materializes only its own.
+    if fsdp_mesh is not None:
+        n_dropped = _drop_non_owned_layers(backbone.layers, owned)
+        logger.info_rank0(
+            "PP+FSDP interim OOM fix: neutralized %d/%d non-owned decoder layers "
+            "(this rank owns %s)", n_dropped, n_layers, sorted(owned),
+        )
 
     kwargs_batch_dim = {
         "targets": BatchDimSpec(0),
@@ -1263,11 +1547,16 @@ def pipelining_qwen3_vl_moe(
         "image_grid_thw": BatchDimSpec(0),
         "mm_token_type_ids": BatchDimSpec(0),
     }
-    # ``vpp > 1`` requires interleaved 1F1B (the only multi-stage-per-rank
-    # schedule); ``pp_schedule`` (1f1b / gpipe) selects single-stage schedules.
-    schedule = _build_qwen3_vl_moe_pp_schedule(
-        stages, micro_batch_num, schedule_name, vpp, kwargs_batch_dim,
-    )
+    # vpp > 1 requires interleaved 1F1B, the only multi-stage-per-rank
+    # schedule; 1f1b and gpipe are single-stage.
+    if schedule_name in ("mpipe", "mpipe_transpose"):
+        schedule = _build_vl_mpipe_schedule(
+            stages, composite, micro_batch_num, kwargs_batch_dim, device, cfg,
+        )
+    else:
+        schedule = _build_qwen3_vl_moe_pp_schedule(
+            stages, micro_batch_num, schedule_name, vpp, kwargs_batch_dim, cfg,
+        )
     logger.info_rank0(
         "PP(%s) applied to Qwen3-VL-MoE: pp=%d vpp=%d stages=%d counts=%s, "
         "this rank owns %s",

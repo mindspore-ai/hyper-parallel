@@ -1,3 +1,6 @@
+hyper-parallel/hyper_parallel/core/pipeline_parallel/mpipe/schedule.py:_build_transpose_prefix
+hyper-parallel/hyper_parallel/models/qwen3_vl_moe/parallelize.py:pipelining_qwen3_vl_moe
+hyper-parallel/hyper_parallel/models/qwen3_vl_moe/model.py:forward
 hyper-parallel/hyper_parallel/core/fully_shard/api.py:_check_hsdp_input_valid
 hyper-parallel/hyper_parallel/core/hsdp/api.py:hsdp
 hyper-parallel/hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp:ops::HyperMegaMoe::HyperMegaMoe

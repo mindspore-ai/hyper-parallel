@@ -121,13 +121,15 @@ def _micro_inputs():
     return [to_device(s, _DEVICE_TYPE) for s in slices]
 
 
-def _reference_grads(dataload_only=False):
-    """Single-process reference grads for preprocess / body0 / last over all micro-batches."""
+def _reference_grads(dataload_only=False, n_accum=1):
+    """Single-process reference grads for preprocess / body0 / last, accumulated
+    over ``n_accum`` identical passes (grad accumulation)."""
     preprocess, body0, last = _build_modules(dataload_only)
     total = None
-    for x in _micro_inputs():
-        loss = last(body0(preprocess(x)))  # pylint: disable=not-callable
-        total = loss if total is None else total + loss
+    for _ in range(n_accum):
+        for x in _micro_inputs():
+            loss = last(body0(preprocess(x)))  # pylint: disable=not-callable
+            total = loss if total is None else total + loss
     total.backward()
     return preprocess, body0, last, total.detach()
 
@@ -141,11 +143,25 @@ def _assert_grads_match(name, mod_a, mod_b):
             f"{name}.{pname} grad mismatch: max abs diff {diff}"
 
 
-def _run_case(num_transpose_layers):
+def _assert_loss_matches(losses, ref_total):
+    """Assert the MPipe summed loss matches the single-process reference."""
+    mpipe_total = torch.stack([loss.detach() for loss in losses]).sum()
+    loss_diff = (mpipe_total - ref_total).abs().item()
+    assert torch.allclose(mpipe_total, ref_total, atol=1e-5, rtol=1e-4), \
+        f"summed loss mismatch: mpipe={mpipe_total.item()}, ref={ref_total.item()}, diff={loss_diff}"
+
+
+def _run_case(num_transpose_layers, owner_backward=False, n_accum=1):
     """Run one MPipe Transpose schedule on this rank and check it vs the reference.
 
     ``num_transpose_layers == 0`` exercises the param-free dataload-only path;
-    ``> 0`` the trainable-preprocess (broadcast + recompute) path.
+    ``> 0`` the trainable-preprocess path -- centralized stage-0 backward by
+    default, or owner-does-backward when ``owner_backward`` is set (each owner
+    backprops its retained tower graph; tower grads are SUM-reduced to stage 0).
+    ``n_accum > 1`` runs the schedule that many times before the grad check
+    (gradient accumulation): the grads must accumulate, and owner-backward's
+    GRAD_REDUCE must reduce only each run's contribution (not re-reduce earlier
+    passes).
     """
     rank = dist.get_rank()
     world = dist.get_world_size()
@@ -159,14 +175,32 @@ def _run_case(num_transpose_layers):
         micro_batch_num=MICRO_BATCH_NUM,
         preprocess_module=preprocess,
         num_transpose_layers=num_transpose_layers,
+        owner_backward=owner_backward,
     )
 
     # Every rank reads the full batch; rank i uses its micro-batch i for the
     # transposed preprocess forward (matches the per-rank dataload convention).
     full_x = torch.cat(_micro_inputs(), dim=0)
-    losses = schedule.run(full_x)
+    losses = None
+    for _ in range(n_accum):  # gradient accumulation: grads add up across runs
+        losses = schedule.run(full_x)
 
-    ref_pre, ref_body0, ref_last, ref_total = _reference_grads(dataload_only)
+    ref_pre, ref_body0, ref_last, ref_total = _reference_grads(dataload_only, n_accum)
+    # ``losses`` holds the last pass only, so the summed-loss check is meaningful
+    # only without accumulation; the accumulated grads are the real assertion.
+    check_loss = n_accum == 1
+
+    if owner_backward:
+        # Grads are SUM-reduced to every rank, so each replica ends with the
+        # full reference gradient, including non-root.
+        _assert_grads_match("preprocess", preprocess, ref_pre)
+        if rank == 0:
+            _assert_grads_match("body0", body0, ref_body0)
+        else:
+            _assert_grads_match("last", last, ref_last)
+            if check_loss:
+                _assert_loss_matches(losses, ref_total)
+        return
 
     if rank == 0:
         # Preprocess gradients accumulate only on stage 0 (centralized backward).
@@ -177,10 +211,8 @@ def _run_case(num_transpose_layers):
         assert all(p.grad is None for p in preprocess.parameters()), \
             "non-root preprocess copy must not accumulate gradients (centralized on stage 0)"
         _assert_grads_match("last", last, ref_last)
-        mpipe_total = torch.stack([loss.detach() for loss in losses]).sum()
-        loss_diff = (mpipe_total - ref_total).abs().item()
-        assert torch.allclose(mpipe_total, ref_total, atol=1e-5, rtol=1e-4), \
-            f"summed loss mismatch: mpipe={mpipe_total.item()}, ref={ref_total.item()}, diff={loss_diff}"
+        if check_loss:
+            _assert_loss_matches(losses, ref_total)
 
 
 def test_mpipe_transpose():
@@ -197,5 +229,37 @@ def test_mpipe_transpose():
     print(f"[rank {dist.get_rank()}] MPipe Transpose distributed correctness OK")
 
 
+def test_mpipe_transpose_owner_backward():
+    """
+    Feature: MPipe Transpose owner-does-backward (PP=2, trainable tower).
+    Description: On each rank, run MPipe Transpose with owner_backward=True over
+        the trainable-preprocess (T=2) tiny model -- owners backprop their retained
+        tower graph and tower grads are SUM-reduced to stage 0.
+    Expectation: every rank's preprocess (tower) gradient equals the single-process
+        reference (the reduced full gradient), per-stage body grads match, and the
+        summed loss matches.
+    """
+    init_backend(_DEVICE_TYPE)
+    _run_case(NUM_TRANSPOSE_LAYERS, owner_backward=True)
+    print(f"[rank {dist.get_rank()}] MPipe owner-backward distributed correctness OK")
+
+
+def test_mpipe_transpose_owner_backward_accum():
+    """
+    Feature: MPipe owner-does-backward under gradient accumulation (PP=2).
+    Description: Run owner_backward with 2 accumulation passes (2 schedule runs
+        before the grad check); GRAD_REDUCE runs once per pass over the
+        accumulating tower grad.
+    Expectation: every rank's accumulated tower gradient equals the 2-pass
+        single-process reference -- GRAD_REDUCE must reduce only each run's
+        contribution, not re-reduce earlier passes.
+    """
+    init_backend(_DEVICE_TYPE)
+    _run_case(NUM_TRANSPOSE_LAYERS, owner_backward=True, n_accum=2)
+    print(f"[rank {dist.get_rank()}] MPipe owner-backward grad-accum correctness OK")
+
+
 if __name__ == "__main__":
     test_mpipe_transpose()
+    test_mpipe_transpose_owner_backward()
+    test_mpipe_transpose_owner_backward_accum()
