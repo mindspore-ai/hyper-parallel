@@ -13,9 +13,21 @@
 # limitations under the License.
 # ============================================================================
 """
-Sharding Configuration - FSDP Module Configuration
+Sharding Configuration - Graph-mode FSDP module configuration.
 
-Provides configuration for FSDP module wrapping.
+Declares which modules the graph-mode ``FSDPPass`` should shard. ``FSDPPass``
+itself owns all the actual sharding logic (all_gather on parameter
+placeholders, reduce_scatter on gradient outputs, in-place live-model
+sharding), so this is purely a *which modules* lookup.
+
+Note:
+    ``FSDPModuleConfig`` previously carried ``reshard_after_forward``,
+    ``use_cpu_offload`` and ``wrap_separately`` fields. None of them were
+    read by ``FSDPPass`` — graph-mode owns reshard as a future pass, CPU
+    offload lives elsewhere, and per-module separate-wrapping is implicit
+    (every marked module is sharded individually). They are removed as dead
+    surface; when a real reshard/offload pass lands it can re-add fields
+    with a real consumer.
 """
 
 import fnmatch
@@ -25,7 +37,6 @@ from typing import Dict, Optional
 
 import yaml
 
-# Default config directory (examples/)
 DEFAULT_CONFIG_DIR = Path(__file__).parent / "examples"
 
 __all__ = [
@@ -38,28 +49,25 @@ __all__ = [
 
 @dataclass
 class FSDPModuleConfig:
-    """
-    FSDP Module Configuration
+    """Marker that a single module FQN is FSDP-wrapped.
 
-        Configures which modules should be wrapped with FSDP.
-
-        Args:
-            module_fqn: Module fully qualified name
-            reshard_after_forward: Whether to reshard after forward
-            use_cpu_offload: Whether to offload to CPU
-            wrap_separately: Whether to wrap this module separately (not with children)
+    Attributes:
+        module_fqn: Module fully qualified name (or wildcard pattern). The
+            same value is also the dict key in ``ShardingPlan.fsdp_modules``
+            / ``fsdp_patterns``; it is kept on the dataclass so iterating
+            ``plan.fsdp_modules.values()`` stays self-describing.
     """
 
     module_fqn: str
-    reshard_after_forward: bool = True
-    use_cpu_offload: bool = False
-    wrap_separately: bool = False
 
 
 @dataclass
 class ShardingPlan:
-    """
-    Sharding Plan - Configure which modules to wrap with FSDP.
+    """Declare which modules ``FSDPPass`` should shard.
+
+    Two registries (exact FQN match + wildcard patterns) are checked in
+    order: exact wins first, then patterns in insertion order (first match
+    wins when patterns overlap).
 
     Example:
         plan = ShardingPlan()
@@ -71,67 +79,53 @@ class ShardingPlan:
     fsdp_patterns: Dict[str, FSDPModuleConfig] = field(default_factory=dict)
 
     def merge(self, other: "ShardingPlan") -> "ShardingPlan":
-        """Merge two sharding plans"""
-        self.fsdp_modules.update(other.fsdp_modules)
-        self.fsdp_patterns.update(other.fsdp_patterns)
-        return self
-
-    def fsdp_wrap(
-        self,
-        module_fqn: str,
-        reshard_after_forward: bool = True,
-        use_cpu_offload: bool = False,
-        wrap_separately: bool = False,
-    ) -> "ShardingPlan":
-        """
-        Mark a specific module for FSDP wrapping (exact match).
+        """Return a new plan with both registries merged (other wins on key conflict).
 
         Args:
-            module_fqn: Module fully qualified name
-            reshard_after_forward: Whether to reshard after forward
-            use_cpu_offload: Whether to offload to CPU
-            wrap_separately: Whether to wrap this module separately
+            other: Plan to merge in. Entries in ``other`` overwrite entries
+                with the same FQN / pattern in ``self``.
 
-        Example:
-            plan.fsdp_wrap("tok_embeddings")  # Specific module
+        Returns:
+            A new ``ShardingPlan``; ``self`` and ``other`` are not mutated.
         """
-        self.fsdp_modules[module_fqn] = FSDPModuleConfig(
-            module_fqn=module_fqn,
-            reshard_after_forward=reshard_after_forward,
-            use_cpu_offload=use_cpu_offload,
-            wrap_separately=wrap_separately,
-        )
-        return self
+        merged = ShardingPlan()
+        merged.fsdp_modules = {**self.fsdp_modules, **other.fsdp_modules}
+        merged.fsdp_patterns = {**self.fsdp_patterns, **other.fsdp_patterns}
+        return merged
 
-    def fsdp_wrap_pattern(
-        self,
-        pattern: str,
-        reshard_after_forward: bool = True,
-        use_cpu_offload: bool = False,
-        wrap_separately: bool = False,
-    ) -> "ShardingPlan":
-        """
-        Mark modules for FSDP wrapping (wildcard match).
+    def fsdp_wrap(self, module_fqn: str) -> "ShardingPlan":
+        """Mark a specific module for FSDP wrapping (exact match).
 
         Args:
-            pattern: Module FQN pattern (supports wildcards)
-            reshard_after_forward: Whether to reshard after forward
-            use_cpu_offload: Whether to offload to CPU
-            wrap_separately: Whether to wrap this module separately
+            module_fqn: Module fully qualified name.
+
+        Returns:
+            ``self`` (chainable).
 
         Example:
-            plan.fsdp_wrap_pattern("layers.*")  # All transformer blocks
+            plan.fsdp_wrap("tok_embeddings")
         """
-        self.fsdp_patterns[pattern] = FSDPModuleConfig(
-            module_fqn=pattern,
-            reshard_after_forward=reshard_after_forward,
-            use_cpu_offload=use_cpu_offload,
-            wrap_separately=wrap_separately,
-        )
+        self.fsdp_modules[module_fqn] = FSDPModuleConfig(module_fqn=module_fqn)
+        return self
+
+    def fsdp_wrap_pattern(self, pattern: str) -> "ShardingPlan":
+        """Mark modules for FSDP wrapping (wildcard match).
+
+        Args:
+            pattern: Module FQN pattern (``fnmatch`` wildcards, e.g. ``*``,
+                ``layers.*``).
+
+        Returns:
+            ``self`` (chainable).
+
+        Example:
+            plan.fsdp_wrap_pattern("layers.*")
+        """
+        self.fsdp_patterns[pattern] = FSDPModuleConfig(module_fqn=pattern)
         return self
 
     def is_fsdp_module(self, module_fqn: str) -> bool:
-        """Check if a module should be wrapped with FSDP"""
+        """Check if a module should be wrapped with FSDP."""
         if module_fqn in self.fsdp_modules:
             return True
 
@@ -142,7 +136,7 @@ class ShardingPlan:
         return False
 
     def get_fsdp_config(self, module_fqn: str) -> Optional[FSDPModuleConfig]:
-        """Get FSDP configuration for a module"""
+        """Get FSDP configuration for a module, or ``None`` if not wrapped."""
         if module_fqn in self.fsdp_modules:
             return self.fsdp_modules[module_fqn]
 
@@ -157,21 +151,22 @@ def create_sharding_plan_from_yaml(
     config_path: Optional[str] = None,
     model_name: Optional[str] = None,
 ) -> ShardingPlan:
-    """
-    Create ShardingPlan from YAML configuration file.
+    """Create ShardingPlan from a YAML configuration file.
 
     Args:
-        config_path: Path to YAML config file
-        model_name: Model name (looks up in examples/{model_name}/config.yaml)
+        config_path: Path to YAML config file.
+        model_name: Model name (looks up in ``examples/{model_name}/config.yaml``).
 
     Returns:
-        ShardingPlan object
+        ShardingPlan object.
+
+    Raises:
+        ValueError: When neither argument is given, ``model_name`` is empty
+            or contains path separators, or the YAML is not a mapping.
+        FileNotFoundError: When the resolved config file does not exist.
 
     Example:
-        # Use predefined config
         plan = create_sharding_plan_from_yaml(model_name="llama3")
-
-        # Use custom config
         plan = create_sharding_plan_from_yaml(config_path="path/to/config.yaml")
     """
     if config_path is None and model_name is None:
@@ -182,7 +177,8 @@ def create_sharding_plan_from_yaml(
             raise ValueError("model_name must be a non-empty string")
         if ".." in model_name or "/" in model_name or "\\" in model_name:
             raise ValueError(
-                f"Invalid model_name '{model_name}': must not contain path separators or parent directory references"
+                f"Invalid model_name '{model_name}': must not contain path "
+                "separators or parent directory references"
             )
         config_path = DEFAULT_CONFIG_DIR / model_name / "config.yaml"
     else:
@@ -198,12 +194,12 @@ def create_sharding_plan_from_yaml(
         raise ValueError(f"YAML config file is empty: {config_path}")
     if not isinstance(config, dict):
         raise ValueError(
-            f"YAML config must be a mapping (dict), got {type(config).__name__}: {config_path}"
+            f"YAML config must be a mapping (dict), "
+            f"got {type(config).__name__}: {config_path}"
         )
 
     plan = ShardingPlan()
 
-    # Process FSDP config if explicitly enabled OR if patterns/modules are present
     fsdp_config = config.get("fsdp", {})
     has_explicit_modules = bool(fsdp_config.get("modules"))
     has_explicit_patterns = bool(fsdp_config.get("patterns"))
@@ -218,37 +214,19 @@ def create_sharding_plan_from_yaml(
 
 
 def _process_fsdp(plan: ShardingPlan, fsdp_config: dict) -> None:
-    """Process FSDP configuration"""
-
+    """Process FSDP configuration (modules + patterns) into the plan."""
     for module_config in fsdp_config.get("modules", []):
-        name = module_config["name"]
-        reshard = module_config.get("reshard_after_forward", True)
-        cpu_offload = module_config.get("use_cpu_offload", False)
-
-        plan.fsdp_wrap(
-            name,
-            reshard_after_forward=reshard,
-            use_cpu_offload=cpu_offload,
-        )
+        plan.fsdp_wrap(module_config["name"])
 
     for pattern_config in fsdp_config.get("patterns", []):
-        pattern = pattern_config["pattern"]
-        reshard = pattern_config.get("reshard_after_forward", True)
-        cpu_offload = pattern_config.get("use_cpu_offload", False)
-
-        plan.fsdp_wrap_pattern(
-            pattern,
-            reshard_after_forward=reshard,
-            use_cpu_offload=cpu_offload,
-        )
+        plan.fsdp_wrap_pattern(pattern_config["pattern"])
 
 
 def create_simple_sharding_plan() -> ShardingPlan:
-    """
-    Create simple sharding plan (for testing)
+    """Create a plan that FSDP-wraps every module (``*`` pattern).
 
-    FSDP wraps all modules by default.
+    Convenience for tests / quick demos.
     """
     plan = ShardingPlan()
-    plan.fsdp_wrap_pattern("*")  # FSDP wrap all modules
+    plan.fsdp_wrap_pattern("*")
     return plan

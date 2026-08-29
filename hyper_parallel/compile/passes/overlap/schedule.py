@@ -28,6 +28,7 @@ Optimization Strategies:
 from typing import Any, List
 from torch import fx
 
+from ...parallel_config import ParallelConfig
 from ..base import GraphPass
 
 
@@ -44,24 +45,19 @@ class AutoOverlapPass(GraphPass):
     def run(
         self,
         graph_module: fx.GraphModule,
-        parallel_config: Any,
+        parallel_config: ParallelConfig,
         **kwargs: Any,
     ) -> fx.GraphModule:
-        """
-        Optimize communication-compute overlap by moving wait_tensor nodes.
+        """Optimize communication-compute overlap by moving wait_tensor nodes.
 
         FSDPPass inserts wait_tensor immediately after communication (for correctness).
         This pass moves wait_tensor later to allow overlap with independent computation.
         """
-        if not getattr(parallel_config, "enable_overlap", False):
+        if not parallel_config.enable_overlap:
             return graph_module
 
         graph = graph_module.graph
-
-        # Find all wait_tensor nodes
         wait_nodes = self._find_wait_nodes(graph)
-
-        # For each wait, try to move it later in the graph
         for wait_node in wait_nodes:
             graph_module = self._move_wait_later(graph_module, wait_node)
 
@@ -72,7 +68,6 @@ class AutoOverlapPass(GraphPass):
         """Find all wait_tensor nodes in the graph."""
         wait_nodes = []
         for node in graph.nodes:
-            # Match both string target and function object target
             if node.op == "call_function":
                 target_str = str(node.target)
                 if (
@@ -88,30 +83,13 @@ class AutoOverlapPass(GraphPass):
         graph_module: fx.GraphModule,
         wait_node: fx.Node,
     ) -> fx.GraphModule:
+        """Move wait_tensor later so it overlaps with independent compute.
+
+        Placeholder: keeps the wait where FSDPPass placed it (immediate
+        wait). A future implementation will sink each wait past independent
+        nodes up to its first dependent user.
         """
-        Move wait_tensor to a later position to maximize overlap.
-
-        Strategy:
-        1. Find all users of wait_node
-        2. Find independent computation that can run during communication
-        3. Move wait_tensor to just before the first dependent user
-
-        Note: This is a placeholder for future implementation.
-        Current implementation keeps wait_tensor in place.
-        """
-        # Reserved for the future overlap-scheduling implementation below.
-        _ = wait_node
-
-        # TODO: Implement sophisticated wait_tensor movement
-        # For now, keep the wait where FSDPPass placed it (immediate wait)
-        # This ensures correctness while we develop the optimization
-
-        # Future implementation:
-        # 1. Find the comm_node that this wait_node is waiting for
-        # 2. Find all nodes between comm_node and first user of wait_node
-        # 3. Check which of these nodes don't depend on comm_node
-        # 4. Move wait_node after those independent nodes
-
+        _ = wait_node  # intentional no-op until the scheduler lands
         return graph_module
 
 
