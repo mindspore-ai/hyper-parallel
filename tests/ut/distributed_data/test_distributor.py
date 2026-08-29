@@ -28,6 +28,8 @@ from hyper_parallel.distributed_data.distributor import (
     TorchModelParallelLocalBatchDistributor,
     TorchPackedBytesLocalBatchRedistributor,
     TorchTensorLocalBatchRedistributor,
+    _decode_binary_payload,
+    _encode_binary_payload,
     _pack_payload_segment,
     shard_local_batch,
 )
@@ -61,6 +63,18 @@ class _FakeTensor:
     def contiguous(self) -> "_FakeTensor":
         """Return an already-contiguous fake tensor."""
         return self
+
+    def detach(self) -> "_FakeTensor":
+        """Return a fake tensor without gradient state."""
+        return self
+
+    def cpu(self) -> "_FakeTensor":
+        """Return the host-resident fake tensor."""
+        return self
+
+    def view(self, dtype: Any) -> "_FakeTensor":
+        """Reinterpret fake tensor storage with a different dtype."""
+        return _FakeTensor(self.array.view(dtype), dtype)
 
     def reshape(self, shape: tuple[int, ...]) -> "_FakeTensor":
         """Return one reshaped fake tensor."""
@@ -134,6 +148,11 @@ class _FakePlatform:
     def from_numpy(array: np.ndarray) -> _FakeTensor:
         """Create a fake tensor from a NumPy array."""
         return _FakeTensor(array, array.dtype)
+
+    @staticmethod
+    def str_to_dtype(dtype_name: str) -> np.dtype:
+        """Resolve a serialized fake dtype name."""
+        return np.dtype(dtype_name)
 
     @staticmethod
     def tensor_to_numpy(tensor: _FakeTensor) -> np.ndarray:
@@ -324,6 +343,23 @@ class TestMicroBatchSharding(unittest.TestCase):
         self.assertEqual(result, {1: peer_payload})
         self.assertEqual(fake_platform.variable_splits[1], [len(peer_segment), 0])
         self.assertTrue(all(work.waited for work in fake_platform.works))
+
+    def test_packed_bytes_preserves_nested_dataloader_tensors(self) -> None:
+        """Default online transport should accept a normal nested tensor batch."""
+        payload = {
+            "input_ids": _FakeTensor([[1, 2], [3, 4]], np.int64),
+            "labels": (_FakeTensor([5, 6], np.int32),),
+            "metadata": {"source": "megatron"},
+        }
+
+        with patch("hyper_parallel.distributed_data.distributor.platform", _FakePlatform()):
+            frame = _encode_binary_payload(payload)
+            result = _decode_binary_payload(frame)
+
+        self.assertEqual(result["input_ids"].shape, (2, 2))
+        self.assertEqual(result["input_ids"].values, (1, 2, 3, 4))
+        self.assertEqual(result["labels"][0].values, (5, 6))
+        self.assertEqual(result["metadata"], {"source": "megatron"})
 
     def test_direct_tensor_a2a_preserves_tensor_storage(self) -> None:
         """Direct mode should exchange uniform tensors without Host serialization."""

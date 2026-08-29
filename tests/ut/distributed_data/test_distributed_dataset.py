@@ -26,6 +26,7 @@ from hyper_parallel.distributed_data.data_construct import (
     LocalBatchMetadataView,
     OnlineLocalBatchSource,
     OnlineLocalBatchView,
+    RankLocalDataLoaderSource,
     SidecarLocalBatchFetcher,
     SidecarLocalBatchSource,
 )
@@ -142,7 +143,7 @@ class _PeerLocalBatchRedistributor:
 
 
 class TestDistributedDataPublicApi(unittest.TestCase):
-    """Validate the source-oriented public API boundary."""
+    """Validate the DataLoader-oriented public API boundary."""
 
     def test_exports_local_batch_contracts(self) -> None:
         """Public exports should describe complete local batches, not raw samples."""
@@ -177,12 +178,13 @@ class TestDistributedDataPublicApi(unittest.TestCase):
                 payload_transport="object_p2p",
             )
 
-    def test_builder_accepts_a_source_instead_of_dataset_callbacks(self) -> None:
-        """The builder should not own metadata derivation, collation, or workers."""
+    def test_builder_accepts_existing_dataloader_and_metadata_callback(self) -> None:
+        """The builder should wrap batches without owning collation or workers."""
         parameters = inspect.signature(distributed_data.build_distributed_dataset).parameters
 
         self.assertIn("source", parameters)
-        for removed in ("dataset", "metadata", "metadata_fn", "collate_fn", "worker_init_fn"):
+        self.assertIn("metadata_fn", parameters)
+        for removed in ("dataset", "metadata", "collate_fn", "worker_init_fn"):
             self.assertNotIn(removed, parameters)
 
 
@@ -230,6 +232,64 @@ class TestLocalBatchSources(unittest.TestCase):
         self.assertEqual(events, [("load", 0), ("metadata", 32768)])
         self.assertEqual(loaded.metadata.text_tokens, 32768)
         self.assertEqual(loaded.data, {"tokens": 32768})
+
+    def test_rank_local_dataloader_reads_consecutive_batches_without_dp_stride(self) -> None:
+        """An already sharded DataLoader must be consumed in its local order."""
+        events = []
+
+        class _RankLocalDataLoader:
+            def __len__(self) -> int:
+                """Return four already DP-sharded local batches."""
+                return 4
+
+            def __iter__(self) -> Any:
+                """Yield rank-local batches in sampler order."""
+                return iter(("global-1", "global-3", "global-5", "global-7"))
+
+        def metadata_fn(local_batch: str, local_batch_id: int | str) -> LocalBatchMeta:
+            """Record framework IDs without changing the DataLoader order."""
+            events.append((local_batch, local_batch_id))
+            return LocalBatchMeta(local_batch_id=local_batch_id)
+
+        source = RankLocalDataLoaderSource(
+            _RankLocalDataLoader(),
+            metadata_fn,
+            data_rank=1,
+            source_size=4,
+        )
+
+        loaded = source.get_range(0, 2)
+
+        self.assertEqual([item.data for item in loaded], ["global-1", "global-3"])
+        self.assertEqual([item.metadata.local_batch_id for item in loaded], ["1:0", "1:1"])
+        self.assertEqual(events, [("global-1", "1:0"), ("global-3", "1:1")])
+
+    def test_rank_local_dataloader_defaults_to_uniform_metadata(self) -> None:
+        """Users should not need a metadata callback when every batch has equal cost."""
+        source = RankLocalDataLoaderSource(
+            ["batch-0"],
+            None,
+            data_rank=0,
+            source_size=1,
+        )
+
+        loaded = source.get_range(0, 1)
+
+        self.assertEqual(loaded[0].metadata, LocalBatchMeta(local_batch_id="0:0"))
+
+    def test_rank_local_dataloader_can_restore_a_committed_offset(self) -> None:
+        """A fresh adapter should skip to the distributed checkpoint offset once."""
+        source = RankLocalDataLoaderSource(
+            ["batch-0", "batch-1", "batch-2", "batch-3"],
+            None,
+            data_rank=0,
+            source_size=4,
+        )
+
+        loaded = source.get_range(2, 4)
+
+        self.assertEqual([item.data for item in loaded], ["batch-2", "batch-3"])
+        self.assertEqual([item.metadata.local_batch_id for item in loaded], ["0:2", "0:3"])
 
 
 class TestDistributedDataset(unittest.TestCase):

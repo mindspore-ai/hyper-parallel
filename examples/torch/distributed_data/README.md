@@ -1,4 +1,35 @@
-# Sidecar-planned Hugging Face local-batch example
+# Distributed local-batch loading
+
+The primary interface wraps an existing rank-local DataLoader. The user's
+DataLoader continues to own sampling, workers, preprocessing, packing, image
+loading, and collation. Only one data-owner rank in each model-parallel group
+is iterated by HyperParallel; other ranks may pass `None`.
+
+```python
+def metadata_fn(local_batch, local_batch_id):
+    return LocalBatchMeta(
+        local_batch_id=local_batch_id,
+        text_tokens=int(local_batch["attention_mask"].sum()),
+    )
+
+
+loader = build_distributed_dataset(
+    local_data_loader if is_data_owner else None,
+    mesh,
+    DistributedDatasetConfig(micro_batch_num=4, dp_dim_names=("dp",)),
+    metadata_fn=metadata_fn,
+    communication_device=device,
+)
+```
+
+Each data owner reads four consecutive DataLoader results for this step. The
+framework gathers their metadata, balances the eight opaque local batches for
+DP=2, exchanges reassigned batches between the two owners, and distributes each
+result to the corresponding model-parallel ranks. It never applies another
+sampler or DP stride to the user's DataLoader. Omitting `metadata_fn` selects
+uniform-cost planning.
+
+## Sidecar-planned Hugging Face example
 
 This example uses image-caption records downloaded from
 `diffusers/pokemon-gpt4-captions`. With eight ranks, the default configuration
@@ -39,6 +70,7 @@ For a CPU smoke test, use `--backend gloo`. Use
 data rank. The script validates DP coverage, plan agreement, MP replication,
 target-rank direct reads, and committed local-batch offsets.
 
-For online metadata, construct `OnlineLocalBatchSource` instead. It first lets
-the single-card source produce all local batches for one optimizer step, derives
-their metadata, then runs the same whole-step planner and payload A2A.
+The existing global-map `OnlineLocalBatchSource` remains available when every
+data owner can index the same complete local-batch source. In that mode,
+HyperParallel owns the DP stride. Use the direct DataLoader interface above
+when the user's sampler has already sharded data by DP rank.

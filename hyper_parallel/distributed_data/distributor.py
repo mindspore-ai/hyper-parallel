@@ -597,6 +597,17 @@ def _encode_binary_payload(payload: Any) -> bytes:
     blobs = []
 
     def _describe(value: Any) -> Any:
+        if platform.is_tensor(value):
+            tensor = value.detach().cpu().contiguous()
+            byte_tensor = tensor.reshape((-1,)).view(platform.tensor_dtype.uint8)
+            blob = platform.tensor_to_numpy(byte_tensor).tobytes()
+            blobs.append(blob)
+            return ["tensor", [list(tensor.shape), str(tensor.dtype), len(blob)]]
+        if isinstance(value, np.ndarray):
+            array = np.ascontiguousarray(value)
+            blob = array.tobytes()
+            blobs.append(blob)
+            return ["ndarray", [list(array.shape), array.dtype.str, len(blob)]]
         if isinstance(value, (bytes, bytearray, memoryview)):
             blob = bytes(value)
             blobs.append(blob)
@@ -607,10 +618,12 @@ def _encode_binary_payload(payload: Any) -> bytes:
             return ["list", [_describe(child) for child in value]]
         if isinstance(value, tuple):
             return ["tuple", [_describe(child) for child in value]]
+        if isinstance(value, np.generic):
+            return ["value", value.item()]
         if value is None or isinstance(value, (bool, int, float, str)):
             return ["value", value]
         raise ValueError(
-            "packed_bytes_a2a supports nested bytes, dict, list, tuple, and JSON scalar values, "
+            "packed_bytes_a2a supports nested tensors, arrays, bytes, dict, list, tuple, and JSON scalar values, "
             f"but got {type(value)}."
         )
 
@@ -637,6 +650,33 @@ def _decode_binary_payload(frame: bytes) -> Any:
         if not isinstance(node, list) or len(node) != 2 or not isinstance(node[0], str):
             raise ValueError("Packed-byte payload descriptor contains an invalid node.")
         kind, value = node
+        if kind == "tensor" and _valid_binary_array_descriptor(value):
+            shape, dtype_name, size = value
+            end = cursor + size
+            if end > len(frame):
+                raise ValueError("Packed-byte tensor descriptor exceeds the frame size.")
+            byte_array = np.frombuffer(frame[cursor:end], dtype=np.uint8).copy()
+            cursor = end
+            try:
+                tensor = platform.from_numpy(byte_array).view(platform.str_to_dtype(dtype_name))
+                return tensor.reshape(tuple(shape))
+            except (RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Packed-byte tensor descriptor has invalid shape {shape} or dtype {dtype_name!r}."
+                ) from exc
+        if kind == "ndarray" and _valid_binary_array_descriptor(value):
+            shape, dtype_name, size = value
+            end = cursor + size
+            if end > len(frame):
+                raise ValueError("Packed-byte array descriptor exceeds the frame size.")
+            try:
+                array = np.frombuffer(frame[cursor:end], dtype=np.dtype(dtype_name)).copy().reshape(tuple(shape))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Packed-byte array descriptor has invalid shape {shape} or dtype {dtype_name!r}."
+                ) from exc
+            cursor = end
+            return array
         if kind == "bytes" and isinstance(value, int) and value >= 0:
             end = cursor + value
             if end > len(frame):
@@ -658,6 +698,21 @@ def _decode_binary_payload(frame: bytes) -> Any:
     if cursor != len(frame):
         raise ValueError("Packed-byte payload frame contains trailing bytes.")
     return payload
+
+
+def _valid_binary_array_descriptor(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) != 3:
+        return False
+    shape, dtype_name, size = value
+    return (
+        isinstance(shape, list)
+        and all(isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in shape)
+        and isinstance(dtype_name, str)
+        and bool(dtype_name)
+        and isinstance(size, int)
+        and not isinstance(size, bool)
+        and size >= 0
+    )
 
 
 def _pack_payload_segment(items: Sequence[tuple[int, Any]]) -> bytes:

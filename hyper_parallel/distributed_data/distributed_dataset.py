@@ -27,6 +27,7 @@ from hyper_parallel.distributed_data.data_construct import (
     LocalBatchMetadataView,
     LocalBatchSource,
     OnlineLocalBatchView,
+    RankLocalDataLoaderSource,
     SidecarLocalBatchFetcher,
 )
 from hyper_parallel.distributed_data.distributor import (
@@ -86,7 +87,7 @@ class DistributedDataset(Iterator[DistributedDataStep]):
         topology: DataTopology,
         source: LocalBatchSource,
         metadata_source: LocalBatchMetadataView | None,
-        online_source: OnlineLocalBatchView | None,
+        online_source: OnlineLocalBatchView | RankLocalDataLoaderSource | None,
         planner: DistributedBatchPlanner,
         sidecar_fetcher: SidecarLocalBatchFetcher | None,
         metadata_synchronizer: MetadataSynchronizer,

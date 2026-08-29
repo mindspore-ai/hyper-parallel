@@ -17,9 +17,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Iterator, Protocol, Sequence
 
-from hyper_parallel.distributed_data.schema import BatchPlan, LocalBatchMeta
+from hyper_parallel.distributed_data.schema import BatchPlan, LocalBatchMeta, WorkloadCost
 
 
 class LocalBatchSource(Protocol):
@@ -165,6 +165,121 @@ class OnlineLocalBatchSource:
     def _raise_if_closed(self) -> None:
         if self._closed:
             raise ValueError("Cannot use a closed OnlineLocalBatchSource.")
+
+
+class RankLocalDataLoaderSource:
+    """Adapt an already DP-sharded DataLoader without re-sharding its batches."""
+
+    def __init__(
+        self,
+        data_loader: Any | None,
+        metadata_fn: Callable[[Any, int | str], LocalBatchMeta | WorkloadCost] | None,
+        *,
+        data_rank: int,
+        source_size: int,
+    ) -> None:
+        """Initialize a sequential rank-local DataLoader adapter.
+
+        Args:
+            data_loader: Existing user DataLoader on a data-owner rank, otherwise
+                ``None``. One iteration result must be one complete local batch.
+            metadata_fn: Optional callback receiving ``(local_batch,
+                local_batch_id)`` and returning planner metadata or a cost hint.
+            data_rank: Logical DP data rank used to generate globally unique IDs.
+            source_size: Common complete local-batch count across data owners.
+        """
+        if data_loader is not None and not hasattr(data_loader, "__iter__"):
+            raise ValueError("data_loader must be iterable or None on a non-data-owner rank.")
+        if metadata_fn is not None and not callable(metadata_fn):
+            raise ValueError("metadata_fn must be callable or None.")
+        if not isinstance(data_rank, int) or isinstance(data_rank, bool) or data_rank < 0:
+            raise ValueError(f"data_rank must be a non-negative integer, but got {data_rank!r}.")
+        if not isinstance(source_size, int) or isinstance(source_size, bool) or source_size < 0:
+            raise ValueError(f"source_size must be a non-negative integer, but got {source_size!r}.")
+        self._data_loader = data_loader
+        self._metadata_fn = metadata_fn
+        self._data_rank = data_rank
+        self._source_size = source_size
+        self._iterator: Iterator[Any] | None = None
+        self._next_offset = 0
+        self._closed = False
+
+    @property
+    def has_sidecar(self) -> bool:
+        """Return that metadata is derived after DataLoader iteration."""
+        return False
+
+    def __len__(self) -> int:
+        """Return the common complete local-batch count per data owner."""
+        return self._source_size
+
+    def get_range(self, start: int, end: int) -> tuple[LoadedLocalBatch, ...]:
+        """Read one consecutive local-batch range from the user DataLoader."""
+        self._raise_if_closed()
+        if self._data_loader is None:
+            raise ValueError("Only a data-owner rank may iterate the rank-local DataLoader.")
+        if start < 0 or end < start or end > len(self):
+            raise ValueError(f"DataLoader range must satisfy 0 <= start <= end <= {len(self)}.")
+        self._initialize_iterator(start)
+        if start != self._next_offset:
+            raise ValueError(
+                f"Rank-local DataLoader must be consumed sequentially at offset {self._next_offset}, "
+                f"but got range start {start}."
+            )
+        loaded = []
+        for local_batch_offset in range(start, end):
+            try:
+                local_batch = next(self._iterator)
+            except StopIteration as exc:
+                raise ValueError(
+                    f"Rank-local DataLoader ended at offset {local_batch_offset}, "
+                    f"before its reported size {len(self)}."
+                ) from exc
+            local_batch_id = f"{self._data_rank}:{local_batch_offset}"
+            metadata = self._build_metadata(local_batch, local_batch_id)
+            loaded.append(LoadedLocalBatch(metadata, local_batch))
+            self._next_offset += 1
+        return tuple(loaded)
+
+    def close(self) -> None:
+        """Release only the adapter iterator; the user retains DataLoader ownership."""
+        self._iterator = None
+        self._closed = True
+
+    def _initialize_iterator(self, start: int) -> None:
+        if self._iterator is not None:
+            return
+        self._iterator = iter(self._data_loader)
+        while self._next_offset < start:
+            try:
+                next(self._iterator)
+            except StopIteration as exc:
+                raise ValueError(
+                    f"Rank-local DataLoader ended while restoring offset {start}."
+                ) from exc
+            self._next_offset += 1
+
+    def _build_metadata(self, local_batch: Any, local_batch_id: str) -> LocalBatchMeta:
+        if self._metadata_fn is None:
+            return LocalBatchMeta(local_batch_id=local_batch_id)
+        metadata = self._metadata_fn(local_batch, local_batch_id)
+        if isinstance(metadata, WorkloadCost):
+            return LocalBatchMeta(local_batch_id=local_batch_id, cost_hint=metadata)
+        if not isinstance(metadata, LocalBatchMeta):
+            raise ValueError(
+                "metadata_fn must return LocalBatchMeta or WorkloadCost, "
+                f"but got {type(metadata)}."
+            )
+        if metadata.local_batch_id != local_batch_id:
+            raise ValueError(
+                f"metadata_fn must preserve framework local_batch_id {local_batch_id!r}, "
+                f"but got {metadata.local_batch_id!r}."
+            )
+        return metadata
+
+    def _raise_if_closed(self) -> None:
+        if self._closed:
+            raise ValueError("Cannot use a closed RankLocalDataLoaderSource.")
 
 
 class LocalBatchMetadataView:
