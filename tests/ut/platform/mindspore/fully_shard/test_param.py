@@ -37,6 +37,7 @@ import mindspore as ms
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, MixedPrecisionPolicy
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 from hyper_parallel.platform.mindspore.fully_shard.param import (
     AllGatherCommCtx,
     AllReduceCommCtx,
@@ -47,6 +48,8 @@ from hyper_parallel.platform.mindspore.fully_shard.param import (
     set_requires_grad_if_needed,
 )
 from tests.ut.platform.mindspore.fully_shard.conftest import MindSporeFullyShardUnitTest
+
+enable_mindspore_backward_compat()
 
 
 def _bare_param():
@@ -173,6 +176,63 @@ class TestPlacementConstruction(MindSporeFullyShardUnitTest):
 
 class TestParameterHelpers(MindSporeFullyShardUnitTest):
     """Test local parameter buffers, shapes, and lifecycle state helpers."""
+
+    def test_build_detaches_initial_communication_storage_from_logical_shard(self):
+        """Initial communication storage should be detached without copying the logical shard."""
+        hsdp_param = _bare_param()
+        hsdp_param.shard_world_size = 1
+        hsdp_param.shard_rank = 0
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.pin_memory = False
+        full_param = ms.Parameter(
+            ms.Tensor(np.arange(6, dtype=np.float32).reshape(2, 3)),
+            requires_grad=True,
+        )
+
+        local_param = hsdp_param._build_sharded_param_data(
+            full_param,
+            shard_dim=0,
+            dim_shard_size=2,
+        )
+
+        # _init_sharded_param builds this tensor under no_grad and enables
+        # gradients on the logical shard afterwards. Mirror that lifecycle so
+        # this assertion is independent of MindSpore package grad-mode details.
+        set_requires_grad_if_needed(full_param, local_param)
+        self.assertTrue(local_param.requires_grad)
+        self.assertFalse(hsdp_param._sharded_param_data.requires_grad)
+        self.assertTrue(hsdp_param._sharded_param_data.is_leaf)
+        self.assertEqual(
+            hsdp_param._sharded_param_data.untyped_storage().data_ptr(),
+            local_param.untyped_storage().data_ptr(),
+        )
+
+    def test_refresh_detaches_communication_storage_without_replacing_local_tensor(self):
+        """Communication storage should be a detached leaf while the optimizer shard stays unchanged."""
+        hsdp_param = _bare_param()
+        hsdp_param.sharded_size = (2, 3)
+        hsdp_param.padded_sharded_param_size = (2, 3)
+        hsdp_param.pin_memory = False
+        local_tensor = ms.Parameter(
+            ms.Tensor(np.arange(6, dtype=np.float32).reshape(2, 3)),
+            requires_grad=True,
+        )
+        hsdp_param.sharded_param = SimpleNamespace(
+            _local_tensor=local_tensor,
+            requires_grad=True,
+        )
+
+        hsdp_param._refresh_sharded_local_tensor(local_tensor)
+
+        self.assertIs(hsdp_param.sharded_param._local_tensor, local_tensor)
+        self.assertTrue(local_tensor.requires_grad)
+        self.assertTrue(local_tensor.is_leaf)
+        self.assertFalse(hsdp_param._sharded_param_data.requires_grad)
+        self.assertTrue(hsdp_param._sharded_param_data.is_leaf)
+        self.assertEqual(
+            hsdp_param._sharded_param_data.untyped_storage().data_ptr(),
+            local_tensor.untyped_storage().data_ptr(),
+        )
 
     def test_dim0_uneven_init_and_reset_keep_logical_shard_separate_from_padding(self):
         """

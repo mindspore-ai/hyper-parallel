@@ -578,7 +578,10 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             )
             if self.pin_memory and not padded_sharded_param.is_meta:
                 padded_sharded_param = padded_sharded_param.pin_memory()
-        self._sharded_param_data = padded_sharded_param.reshape(-1)
+        # Keep the fixed-size communication storage outside autograd from its
+        # initial construction as well as after a DelayInit refresh. The
+        # logical shard returned below remains the optimizer-owned tensor.
+        self._sharded_param_data = padded_sharded_param.detach().reshape(-1)
         # MindSpore optimizers must update the independent logical shard, not a
         # narrow view into padded communication storage.
         return sharded_param
@@ -668,7 +671,10 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             self.allgather_comm_ctx.allgather_output = None
 
         unsharded_numel = math.prod(self._orig_size)
-        unsharded_param = self.unsharded_param_buffers[0].narrow(0, 0, unsharded_numel)
+        # The buffer may be a view chain into `_sharded_param_data` (non-leaf when
+        # rebuilt outside _no_grad, e.g. the DelayInit refresh path). Narrow first,
+        # then detach the final view so the unsharded logical parameter stays a leaf.
+        unsharded_param = self.unsharded_param_buffers[0].narrow(0, 0, unsharded_numel).detach()
         unsharded_param = unsharded_param.reshape(self._orig_size)
         if self._orig_param_is_dtensor:
             unsharded_param = DTensor.from_local(
@@ -904,7 +910,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             )
             if self.pin_memory and not padded_local_tensor.is_meta:
                 padded_local_tensor = padded_local_tensor.pin_memory()
-        self._sharded_param_data = padded_local_tensor.reshape(-1)
+        # Communication storage must stay outside autograd when DelayInit refreshes with grad enabled.
+        self._sharded_param_data = padded_local_tensor.detach().reshape(-1)
         set_requires_grad_if_needed(self.sharded_param, local_tensor)
         self.sharded_param._local_tensor = local_tensor
         if not self.sharded_param._local_tensor.is_contiguous():
