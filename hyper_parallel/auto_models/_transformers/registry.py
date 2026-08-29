@@ -29,31 +29,7 @@ logger = logging.getLogger(__name__)
 
 # OrderedDict: arch_name → (module_path, class_name)
 # Lazy-loaded — only imported on first access.
-MODEL_ARCH_MAPPING = OrderedDict([
-    # ── Dense models ──
-    ("LlamaForCausalLM", (
-        "hyper_parallel.auto_models.components.models.llama.model",
-        "LlamaForCausalLM",
-    )),
-    ("Qwen3_5ForCausalLM", (
-        "hyper_parallel.auto_models.components.models.qwen3_5.model",
-        "Qwen3_5ForCausalLM",
-    )),
-    # ── MoE models ──
-    ("Qwen3_5MoeForConditionalGeneration", (
-        "hyper_parallel.auto_models.components.models.qwen3_5_moe.model",
-        "Qwen3_5MoeForConditionalGeneration",
-    )),
-    # ── VLM models ──
-    ("Qwen3_5ForConditionalGeneration", (
-        "hyper_parallel.auto_models.components.models.qwen3_5.model",
-        "Qwen3_5ForConditionalGeneration",
-    )),
-    ("Qwen3VLMoeForConditionalGeneration", (
-        "hyper_parallel.auto_models.components.models.qwen3_vl_moe.model",
-        "Qwen3VLMoeForConditionalGeneration",
-    )),
-])
+MODEL_ARCH_MAPPING = OrderedDict([])
 
 
 @lru_cache(maxsize=128)
