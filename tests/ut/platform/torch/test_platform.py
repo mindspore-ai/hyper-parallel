@@ -355,6 +355,93 @@ class TestTorchPlatformCore(unittest.TestCase):
         expected_avg = torch.tensor([3.0, 7.0])  # sum / 2
         self.assertTrue(torch.allclose(result, expected_avg))
 
+    def test_is_tracing_or_compiling_returns_false_in_eager(self):
+        """Outside of torch.compile / make_fx, _is_tracing_or_compiling is False."""
+        from hyper_parallel.platform.torch.platform import _is_tracing_or_compiling
+        self.assertFalse(_is_tracing_or_compiling())
+
+    @mock.patch('hyper_parallel.platform.torch.platform._is_tracing_or_compiling',
+                return_value=True)
+    @mock.patch('torch.distributed._functional_collectives.all_reduce')
+    def test_differentiable_all_reduce_compile_uses_functional_collectives(
+            self, mock_fc_all_reduce, mock_tracing):
+        """In compile mode, differentiable_all_reduce dispatches to functional collectives."""
+        tensor = torch.tensor([1.0, 2.0, 3.0])
+        expected = torch.tensor([2.0, 4.0, 6.0])
+        mock_fc_all_reduce.return_value = expected
+        mock_group = MagicMock()
+
+        result = TorchPlatform.differentiable_all_reduce(tensor, op='sum', group=mock_group)
+
+        mock_fc_all_reduce.assert_called_once()
+        call_args = mock_fc_all_reduce.call_args
+        self.assertTrue(torch.allclose(call_args[0][0], tensor))
+        self.assertEqual(call_args[0][1], 'sum')
+        self.assertIs(call_args[0][2], mock_group)
+        self.assertTrue(torch.allclose(result, expected))
+
+    @mock.patch('hyper_parallel.platform.torch.platform._is_tracing_or_compiling',
+                return_value=True)
+    @mock.patch('torch.distributed.get_world_size', return_value=2)
+    @mock.patch('torch.distributed._functional_collectives.all_gather_single')
+    def test_differentiable_all_gather_concat_compile_dim0(
+            self, mock_fc_ag, mock_ws, mock_tracing):
+        """Compile path uses all_gather_single and returns directly for concat_dim=0."""
+        tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        gathered = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        mock_fc_ag.return_value = gathered
+        mock_group = MagicMock()
+
+        result = TorchPlatform.differentiable_all_gather_concat(
+            tensor, mock_group, concat_size=2, concat_dim=0)
+
+        mock_fc_ag.assert_called_once_with(tensor, 0, mock_group)
+        self.assertTrue(torch.allclose(result, gathered))
+
+    @mock.patch('hyper_parallel.platform.torch.platform._is_tracing_or_compiling',
+                return_value=True)
+    @mock.patch('torch.distributed.get_world_size', return_value=2)
+    @mock.patch('torch.distributed._functional_collectives.all_gather_single')
+    def test_differentiable_all_gather_concat_compile_nonzero_dim(
+            self, mock_fc_ag, mock_ws, mock_tracing):
+        """Compile path reshapes gathered output when concat_dim != 0."""
+        tensor = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        gathered = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0],
+                                 [7.0, 8.0, 9.0], [10.0, 11.0, 12.0]])
+        mock_fc_ag.return_value = gathered
+        mock_group = MagicMock()
+
+        result = TorchPlatform.differentiable_all_gather_concat(
+            tensor, mock_group, concat_size=2, concat_dim=1)
+
+        mock_fc_ag.assert_called_once_with(tensor, 0, mock_group)
+        expected = torch.tensor([[1.0, 2.0, 3.0, 7.0, 8.0, 9.0],
+                                 [4.0, 5.0, 6.0, 10.0, 11.0, 12.0]])
+        self.assertEqual(result.shape, (2, 6))
+        self.assertTrue(torch.allclose(result, expected))
+
+    @mock.patch('hyper_parallel.platform.torch.platform._is_tracing_or_compiling',
+                return_value=True)
+    @mock.patch('torch.distributed._functional_collectives.reduce_scatter_single')
+    def test_differentiable_reduce_scatter_compile_avg_divides(
+            self, mock_fc_rs, mock_tracing):
+        """Compile path divides by dev_num for 'avg' op using functional collectives."""
+        tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        scatter_result = torch.tensor([3.0, 7.0])
+        mock_fc_rs.return_value = scatter_result
+        mock_group = MagicMock()
+
+        result = TorchPlatform.differentiable_reduce_scatter(
+            tensor, dev_num=2, axis=0, op='avg', group=mock_group)
+
+        mock_fc_rs.assert_called_once()
+        call_args = mock_fc_rs.call_args
+        self.assertTrue(torch.allclose(call_args[0][0], tensor))
+        self.assertEqual(call_args[0][1], 'sum')
+        self.assertEqual(call_args[0][2], 0)
+        expected_avg = torch.tensor([1.5, 3.5])
+        self.assertTrue(torch.allclose(result, expected_avg))
+
     @mock.patch('torch.distributed.all_reduce')
     def test_all_reduce_non_contiguous(self, mock_all_reduce):
         """Test all_reduce handling of non-contiguous tensors.
