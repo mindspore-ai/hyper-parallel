@@ -179,6 +179,13 @@ class CostModelParserHyperV2(_CostModelParser):
 
     def _map_model_config_to_ccfg(self, model_config) -> None:
         """Map model-specific Config object fields to ``ccfg``."""
+        self._map_core_model_config(model_config)
+        self._map_moe_model_config(model_config)
+        self._map_model_scaling_config(model_config)
+        self._resolve_device_capacity()
+
+    def _map_core_model_config(self, model_config) -> None:
+        """Map common Transformer and attention fields to ``ccfg``."""
         self.ccfg.h = int(model_config.hidden_size)
         self.ccfg.n_lay = int(model_config.num_hidden_layers)
         self.ccfg.a = int(model_config.num_attention_heads)
@@ -198,6 +205,8 @@ class CostModelParserHyperV2(_CostModelParser):
             getattr(model_config, "qk_rope_head_dim", 0) or 0
         )
 
+    def _map_moe_model_config(self, model_config) -> None:
+        """Map dense defaults and optional MoE fields to ``ccfg``."""
         self.ccfg.n_exp = 1
         self.ccfg.n_chosen_exp = 1
         self.ccfg.n_shared_exp = 0
@@ -235,6 +244,8 @@ class CostModelParserHyperV2(_CostModelParser):
                 getattr(model_config, "first_k_dense_replace", 0) or 0)
             self.ccfg.gmm = True
 
+    def _map_model_scaling_config(self, model_config) -> None:
+        """Map MTP and feed-forward scaling fields to ``ccfg``."""
         self.ccfg.n_mtp = int(getattr(model_config, "mtp_depth", 0) or 0)
         # Match the MF parser: when ``mtp_depth > 0`` the MTP layers
         # participate in pipeline offset balancing (default True); when there
@@ -248,8 +259,6 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.fdm = float(
             getattr(model_config, "ffn_dim_multiplier", 1.0) or 1.0
         )
-
-        self._resolve_device_capacity()
 
     @staticmethod
     def _first_model_attr(model_config: Any, names: tuple, default: Any) -> Any:
@@ -425,6 +434,13 @@ class CostModelParserHyperV2(_CostModelParser):
         accel = self._get_cfg_attr(self.config, "accelerator", legacy_accel)
         fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
 
+        dp_shard = self._parse_parallel_dimensions(accel, fsdp)
+        self._parse_sequence_parallelism(accel)
+        self._parse_optimizer_parallelism(accel, dp_shard)
+
+    def _parse_parallel_dimensions(self, accel, fsdp) -> int:
+        """Populate mesh dimensions and return the data shard degree."""
+
         dp_shard = int(
             self._get_cfg_attr(fsdp, "dp_shard_size", 0)
             or self._get_cfg_attr(accel, "dp_shard", 1)
@@ -465,6 +481,10 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.vp = max(1, int(
             self._get_cfg_attr(accel, "pp_interleave_num", 1) or 1
         ))
+        return dp_shard
+
+    def _parse_sequence_parallelism(self, accel) -> None:
+        """Populate sequence-parallel and pipeline scheduler settings."""
         use_sp = bool(
             self._get_cfg_attr(accel, "sequence_parallel", False)
             or self._get_cfg_attr(accel, "use_seq_parallel", False)
@@ -474,7 +494,8 @@ class CostModelParserHyperV2(_CostModelParser):
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
         )
 
-        # Optimizer parallel sharding
+    def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
+        """Populate optimizer and gradient sharding settings."""
         is_auto_models = "accelerator" in self.config.__dict__
         self.ccfg.has_op = (
             dp_shard > 1
