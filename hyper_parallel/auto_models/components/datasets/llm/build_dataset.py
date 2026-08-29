@@ -20,12 +20,14 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hyper_parallel.auto_models.components.datasets.dataset_logging import get_dataset_logger
+from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import PlaintextTransform
 from hyper_parallel.auto_models.components.datasets.llm.indexed_dataset import (
     build_indexed_dataset as _build_indexed_dataset,
 )
 from hyper_parallel.auto_models.components.datasets.llm.online_dataset import (
     build_online_dataset as _build_online_dataset,
 )
+from hyper_parallel.auto_models.components.datasets.llm.online_utils import ONLINE_PLAINTEXT_TEXT_KEYS_KEY
 from hyper_parallel.auto_models.components.datasets.llm.transform_dataset import apply_llm_data_transform
 from hyper_parallel.auto_models.components.datasets.parallel import (
     DataLoaderParallelContext,
@@ -103,6 +105,8 @@ def build_online_text_dataset(
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
+    if isinstance(transform, PlaintextTransform):
+        dataset_config[ONLINE_PLAINTEXT_TEXT_KEYS_KEY] = transform.text_keys
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)
 

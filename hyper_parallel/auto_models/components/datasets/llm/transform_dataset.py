@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeAlias
 
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.auto_models.components.datasets.dataset_logging import (
     get_dataset_logger,
@@ -93,27 +93,35 @@ class _LLMTransformDataset:
         return dataset_length
 
     def get_item(self, index: int) -> list[ModelSample]:
-        """Transform one source index into its ordered trainable ModelSamples."""
+        """Transform one source index into its ordered trainable ModelSamples.
+
+        Args:
+            index: Mapping source index to transform exactly once.
+
+        Returns:
+            Ordered trainable ModelSamples, possibly empty for an invalid item.
+        """
         dataset_length = len(self.source_dataset)
         if index < 0:
             index += dataset_length
         if index < 0 or index >= dataset_length:
             raise IndexError("LLM Dataset index out of range")
 
-        for offset in range(dataset_length):
-            source_index = (index + offset) % dataset_length
-            raw_sample = self.source_dataset[source_index]
-            model_samples = _transform_samples(raw_sample, self.transform)
-            if not self.skip_invalid_samples:
-                return model_samples
-            trainable_samples = [sample for sample in model_samples if _has_trainable_labels(sample)]
-            if trainable_samples:
-                return trainable_samples
-        raise ValueError("LLM Dataset contains no samples with trainable labels")
+        raw_sample = self.source_dataset[index]
+        model_samples = _transform_samples(raw_sample, self.transform)
+        if self.skip_invalid_samples:
+            model_samples = [sample for sample in model_samples if _has_trainable_labels(sample)]
+
+        return model_samples
 
     def __getitem__(self, index: int) -> ModelSample:
         """Return one ModelSample for fixed-size DataLoader consumers."""
         model_samples = self.get_item(index)
+        if not model_samples:
+            raise ValueError(
+                "An invalid mapping source item requires source filtering or DynamicBatchDataLoader"
+            )
+
         if len(model_samples) != 1:
             raise ValueError(
                 "A multi-sample source item requires DynamicBatchDataLoader"
@@ -148,14 +156,25 @@ class _LLMIterableTransformDataset(IterableDataset):
 
     @output_index_for_resume.setter
     def output_index_for_resume(self, value: bool) -> None:
-        """Forward output-index mode to a replayable upstream source."""
+        """Forward output-index mode to a replayable upstream source.
+
+        Args:
+            value: Whether the upstream source should emit stable output indices.
+        """
         if not _supports_output_index_for_resume(self.source_dataset):
             raise ValueError("The upstream iterable does not support output-index resume")
 
         self.source_dataset.output_index_for_resume = value
 
     def get_item(self, output_index: Any) -> list[ModelSample]:
-        """Rebuild and transform one upstream item from its stable output index."""
+        """Rebuild and transform one upstream item from its stable output index.
+
+        Args:
+            output_index: Stable replay key emitted by the upstream source.
+
+        Returns:
+            Ordered trainable ModelSamples rebuilt from the source item.
+        """
         if not _supports_output_index_for_resume(self.source_dataset):
             raise AttributeError("The upstream iterable does not support get_item")
 
@@ -200,7 +219,11 @@ class _LLMIterableTransformDataset(IterableDataset):
         return state
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore checkpoint state through the upstream stream interface."""
+        """Restore checkpoint state through the upstream stream interface.
+
+        Args:
+            state_dict: Checkpoint state containing the upstream Dataset state.
+        """
         state_loader = getattr(self.source_dataset, "load_state_dict", None)
         if not callable(state_loader):
             raise ValueError("Online iterable source does not support load_state_dict")
@@ -208,7 +231,11 @@ class _LLMIterableTransformDataset(IterableDataset):
         state_loader(state_dict["source_dataset"])
 
     def set_epoch(self, epoch: int) -> None:
-        """Forward deterministic epoch state when supported upstream."""
+        """Forward deterministic epoch state when supported upstream.
+
+        Args:
+            epoch: Epoch number forwarded to the upstream source.
+        """
         epoch_setter = getattr(self.source_dataset, "set_epoch", None)
         if callable(epoch_setter):
             epoch_setter(epoch)

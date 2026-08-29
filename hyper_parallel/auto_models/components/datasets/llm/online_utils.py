@@ -26,6 +26,8 @@ from hyper_parallel.auto_models.components.datasets.parallel import DataLoaderPa
 
 logger = get_dataset_logger(__name__)
 
+ONLINE_PLAINTEXT_TEXT_KEYS_KEY = "_online_plaintext_text_keys"
+
 _ONLINE_FILE_FORMATS = {
     ".arrow": "arrow",
     ".csv": "csv",
@@ -33,6 +35,47 @@ _ONLINE_FILE_FORMATS = {
     ".jsonl": "json",
     ".parquet": "parquet",
 }
+
+
+def _is_nonempty_plaintext_sample(sample: Mapping[str, Any], *, text_keys: str | Sequence[str]) -> bool:
+    """Return whether a raw plaintext sample contains non-whitespace text."""
+    if isinstance(text_keys, str):
+        text = sample[text_keys]
+    else:
+        for text_key in text_keys:
+            if text_key in sample:
+                text = sample[text_key]
+                break
+        else:
+            raise ValueError(f"Sample does not contain any configured text fields: {list(text_keys)!r}")
+
+    if not isinstance(text, str):
+        raise ValueError("Plaintext sample text must be a string")
+
+    is_nonempty = text.strip() != ""
+    return is_nonempty
+
+
+def _filter_online_plaintext_dataset(dataset: Any, data_config: Mapping[str, Any], *, streaming: bool) -> Any:
+    """Filter empty plaintext records before shuffling, sharding, or tokenization."""
+    text_keys = data_config.get(ONLINE_PLAINTEXT_TEXT_KEYS_KEY)
+    if text_keys is None:
+        return dataset
+
+    source_records = None if streaming else len(dataset)
+    filtered_dataset = dataset.filter(_is_nonempty_plaintext_sample, fn_kwargs={"text_keys": text_keys})
+
+    # log
+    if streaming:
+        logger.debug("Enabled lazy empty-plaintext filtering for Online iterable Dataset")
+    else:
+        filtered_records = len(filtered_dataset)
+        logger.debug(
+            "Filtered empty Online plaintext records: source=%d, filtered=%d, removed=%d",
+            source_records, filtered_records, source_records - filtered_records,
+        )
+
+    return filtered_dataset
 
 
 def resolve_online_data_files(data_path: str | Sequence[str]) -> tuple[list[str], str]:
@@ -55,28 +98,29 @@ def resolve_online_data_files(data_path: str | Sequence[str]) -> tuple[list[str]
 
     data_files = []
     for configured_path in configured_paths:
-        if os.path.isdir(configured_path):
-            directory_files = [
-                os.path.join(configured_path, filename)
-                for filename in sorted(os.listdir(configured_path))
-                if os.path.splitext(filename)[1].lower() in _ONLINE_FILE_FORMATS
-            ]
-            data_files.extend(directory_files)
-        elif os.path.isfile(configured_path):
+        if os.path.isfile(configured_path):
             data_files.append(configured_path)
-        else:
+            continue
+        if not os.path.isdir(configured_path):
             raise FileNotFoundError(f"Online Dataset path does not exist: {configured_path}")
+
+        for filename in sorted(os.listdir(configured_path)):
+            file_extension = os.path.splitext(filename)[1].lower()
+            if file_extension in _ONLINE_FILE_FORMATS:
+                data_files.append(os.path.join(configured_path, filename))
+
     if not data_files:
         raise ValueError("Online data_path must contain at least one supported data file")
 
-    loader_formats = {
-        _ONLINE_FILE_FORMATS.get(os.path.splitext(data_file)[1].lower())
-        for data_file in data_files
-    }
-    if None in loader_formats:
-        raise ValueError("Online Dataset supports only JSON/JSONL/Parquet/CSV/Arrow files")
-    if len(loader_formats) != 1:
-        raise ValueError("All Online Dataset files must use the same format")
+    loader_formats = set()
+    for data_file in data_files:
+        file_extension = os.path.splitext(data_file)[1].lower()
+        file_format = _ONLINE_FILE_FORMATS.get(file_extension)
+        loader_formats.add(file_format)
+
+    if None in loader_formats or len(loader_formats) != 1:
+        raise ValueError("Online Dataset files must use one supported format: JSON/JSONL/Parquet/CSV/Arrow")
+
     loader_format = loader_formats.pop()
     return data_files, loader_format
 
@@ -105,9 +149,7 @@ def load_online_hf_dataset(
     try:
         from datasets import load_dataset  # pylint: disable=C0415
     except ImportError as error:
-        raise ImportError(
-            "Online LLM Dataset requires the optional 'datasets' package"
-        ) from error
+        raise ImportError("Online LLM Dataset requires the optional 'datasets' package") from error
 
     cache_directory = data_config.get("cache_dir")
     hf_dataset_name = data_config.get("hf_dataset_name")
@@ -115,40 +157,27 @@ def load_online_hf_dataset(
         hf_config_name = data_config.get("hf_config_name")
         logger.debug(
             "Loading Hugging Face Dataset %s (config=%s, split=%s, streaming=%s)",
-            hf_dataset_name,
-            hf_config_name,
-            "train",
-            streaming,
+            hf_dataset_name, hf_config_name, "train", streaming,
         )
         dataset = load_dataset(
-            str(hf_dataset_name),
-            name=hf_config_name,
-            split="train",
-            streaming=streaming,
-            cache_dir=cache_directory,
+            str(hf_dataset_name), name=hf_config_name, split="train",
+            streaming=streaming, cache_dir=cache_directory,
         )
-        return dataset
+    else:
+        if data_path is None:
+            raise ValueError("data_path is required when hf_dataset_name is not configured")
 
-    if data_path is None:
-        raise ValueError(
-            "data_path is required when hf_dataset_name is not configured"
+        data_files, loader_format = resolve_online_data_files(data_path)
+        logger.debug(
+            "Loading %d Online Dataset files (format=%s, split=%s, streaming=%s)",
+            len(data_files), loader_format, "train", streaming,
         )
-    data_files, loader_format = resolve_online_data_files(data_path)
-    logger.debug(
-        "Loading %d Online Dataset files (format=%s, split=%s, streaming=%s)",
-        len(data_files),
-        loader_format,
-        "train",
-        streaming,
-    )
-    dataset = load_dataset(
-        loader_format,
-        data_files=data_files,
-        split="train",
-        streaming=streaming,
-        cache_dir=cache_directory,
-    )
-    return dataset
+        dataset = load_dataset(
+            loader_format, data_files=data_files, split="train",
+            streaming=streaming, cache_dir=cache_directory,
+        )
+
+    return _filter_online_plaintext_dataset(dataset, data_config, streaming=streaming)
 
 
 def normalize_online_dataloader_context(
