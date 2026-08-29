@@ -18,6 +18,7 @@ import inspect
 import unittest
 from dataclasses import fields
 
+from hyper_parallel import distributed_data
 from hyper_parallel.distributed_data import DistributedDatasetConfig, build_distributed_dataloader
 from hyper_parallel.distributed_data.topology import DataTopology
 
@@ -47,8 +48,21 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertEqual(parameters["metadata_fn"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(parameters["pack_fn"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(parameters["collate_fn"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameters["pack_fn"].default)
+        self.assertIsNone(parameters["collate_fn"].default)
         self.assertNotIn("raw_sample_size", parameters)
         self.assertNotIn("micro_batch_num", parameters)
+
+    def test_public_default_callbacks_preserve_nested_batch_boundaries(self) -> None:
+        """Default construction returns immutable bins and an immutable local batch."""
+        raw_samples = [{"id": 0}, {"id": 1}]
+        packed = distributed_data.default_pack_fn(raw_samples, seq_len=32)
+
+        self.assertEqual(packed, ({"id": 0}, {"id": 1}))
+        self.assertIsInstance(packed, tuple)
+        collated = distributed_data.default_collate_fn([packed, ({"id": 2},)])
+        self.assertEqual(collated, (({"id": 0}, {"id": 1}), ({"id": 2},)))
+        self.assertIsInstance(collated, tuple)
 
     def test_buffer_multiplier_must_be_finite(self) -> None:
         """Invalid read-ahead targets must fail before distributed collectives."""

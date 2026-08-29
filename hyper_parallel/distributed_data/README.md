@@ -27,10 +27,10 @@ here.
 - Optimizer global batch size and gradient accumulation remain Trainer
   concerns. There is no `raw_sample_size` or `micro_batch_num` input.
 
-The metadata callback and packer must use the same token accounting, including
-special tokens and reserved multimodal placeholders. Oversized samples fail by
-default; `oversized_policy="single"` explicitly allows an overflow sample to
-occupy a bin alone.
+The metadata callback defines the Planner's token accounting, including special
+tokens and reserved multimodal placeholders. A custom packer must use the same
+accounting. Oversized samples fail by default; `oversized_policy="single"`
+explicitly allows an overflow sample to occupy a bin alone.
 
 ## Public API
 
@@ -46,10 +46,34 @@ loader = build_distributed_dataloader(
     mesh,
     DistributedDatasetConfig(seq_len=32768, local_batch_size=2),
     metadata_fn=lambda sample: SampleMetadata(pack_tokens=sample["length"]),
+)
+```
+
+When callbacks are omitted, the lossless defaults return the planned structure
+without guessing the user sample schema:
+
+```text
+local batch tuple
+  -> packing-bin tuple
+       -> raw samples in deterministic planned order
+```
+
+Pass either callback only when model-specific construction is needed:
+
+```python
+loader = build_distributed_dataloader(
+    dataset,
+    mesh,
+    config,
+    metadata_fn=metadata_fn,
     pack_fn=pack_one_sequence,
     collate_fn=collate_packed_sequences,
 )
 ```
+
+Custom callback implementations are a user consistency contract and must be
+the same on every rank. The build preflight does detect default-versus-custom
+mode mismatches, but cannot reliably fingerprint arbitrary Python closures.
 
 Every Source Loader rank must provide a replica of the same logical
 mapping-style Dataset. The Source Loaders apply their own global stride, so do

@@ -29,6 +29,7 @@ from hyper_parallel.distributed_data import (
     SampleMetadata,
     WorkloadCost,
     build_distributed_dataloader,
+    default_pack_fn,
 )
 
 _WORLD_SIZE = 4
@@ -183,6 +184,10 @@ def _assert_collective_build_error(
         error_message = str(exc)
 
     statuses = _all_gather_object((error_type, error_message))
+    _assert_build_error_statuses(statuses, expected_message)
+
+
+def _assert_build_error_statuses(statuses: tuple[Any, ...], expected_message: str) -> None:
     expected_types = tuple("ValueError" for _ in range(_WORLD_SIZE))
     actual_types = tuple(status[0] for status in statuses)
     assert actual_types == expected_types, (
@@ -198,6 +203,34 @@ def _assert_collective_build_error(
         f"expected_fragment={expected_message!r}, got={messages[0]!r}."
     )
     dist.monitored_barrier(timeout=timedelta(seconds=30))
+
+
+def _assert_callback_mode_build_error(mesh: Any) -> None:
+    callback_options: dict[str, Any] = {"metadata_fn": _metadata_fn}
+    if dist.get_rank() == _WORLD_SIZE - 1:
+        callback_options["pack_fn"] = _pack_fn
+    error_type = None
+    error_message = None
+    try:
+        build_distributed_dataloader(
+            _RawDataset(),
+            mesh,
+            DistributedDatasetConfig(
+                seq_len=4,
+                local_batch_size=1,
+                dp_dim_names=("dp",),
+                source_loader_ranks=(0, 1, 2, 3),
+                buffer_size_multiplier=1.0,
+                max_buffered_samples=8,
+                cpu_backend="gloo",
+            ),
+            **callback_options,
+        )
+    except Exception as exc:  # The assertion below verifies the public error type.
+        error_type = type(exc).__name__
+        error_message = str(exc)
+    statuses = _all_gather_object((error_type, error_message))
+    _assert_build_error_statuses(statuses, "build configuration mismatch")
 
 
 def _assert_build_preflight_errors(mesh: Any) -> None:
@@ -233,6 +266,29 @@ def _assert_build_preflight_errors(mesh: Any) -> None:
         ),
         "source dataset length mismatch",
     )
+    _assert_callback_mode_build_error(mesh)
+
+
+def _assert_explicit_default_pack_is_equivalent(mesh: Any) -> None:
+    rank = dist.get_rank()
+    callback_options: dict[str, Any] = {"metadata_fn": _metadata_fn}
+    if rank == _WORLD_SIZE - 1:
+        callback_options["pack_fn"] = default_pack_fn
+    loader = build_distributed_dataloader(
+        _RawDataset(0) if rank in _CONSTRUCTOR_RANKS else None,
+        mesh,
+        DistributedDatasetConfig(
+            seq_len=4,
+            local_batch_size=1,
+            dp_dim_names=("dp",),
+            source_loader_ranks=None,
+            buffer_size_multiplier=1.0,
+            max_buffered_samples=8,
+            cpu_backend="gloo",
+        ),
+        **callback_options,
+    )
+    _assert_collective_stop(loader)
 
 
 def _assert_checkpoint_step_error_is_collective(mesh: Any) -> None:
@@ -387,6 +443,54 @@ def _run_epoch(mesh: Any, source_loader_ranks: tuple[int, ...] | None) -> None:
     _assert_collective_stop(loader)
 
 
+def _run_default_constructor_epoch(mesh: Any) -> None:
+    rank = dist.get_rank()
+    loader = build_distributed_dataloader(
+        _RawDataset() if rank in _CONSTRUCTOR_RANKS else None,
+        mesh,
+        DistributedDatasetConfig(
+            seq_len=2,
+            local_batch_size=2,
+            dp_dim_names=("dp",),
+            source_loader_ranks=None,
+            buffer_size_multiplier=1.0,
+            max_buffered_samples=8,
+            cpu_backend="gloo",
+        ),
+        metadata_fn=_metadata_fn,
+    )
+
+    outputs = _all_gather_object(next(loader))
+    _assert_same_model_parallel_batches(outputs)
+    global_sample_ids = []
+    for constructor_rank in _CONSTRUCTOR_RANKS:
+        local_batch = outputs[constructor_rank]
+        assert isinstance(local_batch, tuple) and len(local_batch) == 2, (
+            f"The default constructor must return a tuple of packing bins: "
+            f"rank={constructor_rank}, batch={local_batch!r}."
+        )
+        assert all(isinstance(packing_bin, tuple) and packing_bin for packing_bin in local_batch), (
+            f"Every default packing bin must be a non-empty tuple of raw samples: "
+            f"rank={constructor_rank}, batch={local_batch!r}."
+        )
+        raw_samples = tuple(sample for packing_bin in local_batch for sample in packing_bin)
+        assert all(isinstance(sample, dict) for sample in raw_samples), (
+            f"The default constructor must preserve raw sample payloads: "
+            f"rank={constructor_rank}, raw_samples={raw_samples!r}."
+        )
+        global_sample_ids.extend(sample["sample_id"] for sample in raw_samples)
+
+    expected_sample_ids = list(range(_DATASET_SIZE))
+    assert sorted(global_sample_ids) == expected_sample_ids, (
+        f"Default construction must emit every raw sample exactly once globally: "
+        f"expected={expected_sample_ids!r}, got={global_sample_ids!r}."
+    )
+    assert len(global_sample_ids) == len(set(global_sample_ids)), (
+        f"Default construction must not duplicate raw samples: sample_ids={global_sample_ids!r}."
+    )
+    _assert_collective_stop(loader)
+
+
 def _assert_metadata_error_is_collective(mesh: Any) -> None:
     loader = build_distributed_dataloader(
         _RawDataset(),
@@ -437,6 +541,10 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         # any rank enters a differently shaped service-group creation path.
         _assert_build_preflight_errors(mesh)
 
+        # Explicitly passing the public identity packer is semantically the
+        # same callback mode as omitting pack_fn on the other WORLD ranks.
+        _assert_explicit_default_pack_is_equivalent(mesh)
+
         # Rank 1 is a pure MP peer in the default Source topology. Its divergent
         # checkpoint state must fail on WORLD before Sources read any sample.
         _assert_model_peer_checkpoint_step_error_is_collective(mesh)
@@ -444,6 +552,10 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         # A fresh default loader must remain usable immediately after the
         # synchronized MP-state failure, proving collective order was preserved.
         _run_epoch(mesh, source_loader_ranks=None)
+
+        # Without construction callbacks, the built-in constructor returns
+        # local-batch and packing-bin structure as nested immutable tuples.
+        _run_default_constructor_epoch(mesh)
 
         # All ranks act as Sources, so payloads from MP peers must route to a
         # Data Constructor before their constructed batches return over MP.
