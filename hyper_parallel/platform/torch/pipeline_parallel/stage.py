@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,10 @@
 """pipeline stage"""
 import torch
 import torch.distributed as dist
+from torch.distributed.pipelining._backward import (
+    stage_backward_input,
+    stage_backward_weight,
+)
 
 import hyper_parallel
 
@@ -49,11 +53,14 @@ class PipelineStageBase:
         self.stage_num = stage_num
         self.fwd_outputs_cache = {}
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
+        self._trainable_params = None
+        self._dw_cache = {}
 
     def clear_cache(self):
         """clear cache."""
         self.fwd_outputs_cache.clear()
         self.bwd_cache.clear()
+        self._dw_cache.clear()
         self._meta_cache.clear()
 
     @staticmethod
@@ -85,15 +92,6 @@ class PipelineStageBase:
 
     def forward_one_chunk(self, micro_index, args=None, kwargs=None):
         """Execution a forward function."""
-        # PP drives FSDP unshard/reshard through injected FSDP MetaSteps, so the
-        # nested HSDPModules must NOT reshard after their own forward hook.  GPipe
-        # runs every micro-batch forward before any backward; if a module resharded
-        # after micro-batch 0, the next micro-batch's ``_assert_in_unshard_if_needed``
-        # would fail (parameters already freed). Keep them unsharded for the whole
-        # stage; the FSDP_RESHARD MetaStep frees them explicitly afterwards.
-        for _, mod in self.submodule.named_modules():
-            if isinstance(mod, hyper_parallel.HSDPModule):
-                mod.set_reshard_after_forward(False)
         if self.is_first_stage:
             composite_args = args
         else:
@@ -143,6 +141,14 @@ class PipelineStageBase:
                        if recv_info.requires_grad]
         self.bwd_cache[micro_index] = input_grads
 
+    def _get_trainable_params(self):
+        """Return the stable parameter tuple used to partition dx and dw."""
+        if self._trainable_params is None:
+            self._trainable_params = tuple(
+                param for param in self.submodule.parameters() if param.requires_grad
+            )
+        return self._trainable_params
+
     def backward_one_chunk(self, micro_index):
         """Execution a backward function.
 
@@ -154,16 +160,6 @@ class PipelineStageBase:
         """
         if not self._has_backward:
             return
-        # Accumulate per-micro-batch gradients locally without resharding or
-        # reducing.  The schedule's FSDP_REDUCE_GRAD MetaStep
-        # (PipelineStage.execute_reduce_grad) re-enables both flags and performs
-        # the single reduce-scatter once after the last micro-batch's backward.
-        # Per-micro-batch reduce here would conflict with that explicit reduce and
-        # over-count the gradient.
-        for _, mod in self.submodule.named_modules():
-            if isinstance(mod, hyper_parallel.HSDPModule):
-                mod.set_reshard_after_backward(False)
-                mod.set_requires_gradient_sync(False)
         recv_args = []
         if micro_index in self.grad_recv_info:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
@@ -190,3 +186,48 @@ class PipelineStageBase:
             self._populate_bwd_cache(micro_index)
         self._clear_recv_buffer(self.grad_recv_info, micro_index)
         self._clear_recv_buffer(self.args_recv_info, micro_index)
+
+    def backward_input_one_chunk(self, micro_index):
+        """Compute input gradients and retain only the graph state needed by dw."""
+        if not self._has_backward or self.is_first_stage:
+            return
+
+        recv_args = []
+        if micro_index in self.grad_recv_info:
+            recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
+        fwd_output = self.fwd_cache.pop(micro_index)
+        local_output = self._filter_grad_outputs(fwd_output)
+        grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
+        if not isinstance(grad_tensors, (list, tuple)):
+            grad_tensors = [grad_tensors]
+        input_values = [
+            recv_info.buffer
+            for recv_info in self.args_recv_info[micro_index]
+            if recv_info.requires_grad
+        ]
+
+        _, param_groups = stage_backward_input(
+            local_output,
+            list(grad_tensors),
+            input_values,
+            iter(self._get_trainable_params()),
+        )
+        self._dw_cache[micro_index] = param_groups
+        self._populate_bwd_cache(micro_index)
+
+    def backward_weight_one_chunk(self, micro_index):
+        """Compute parameter gradients from state captured by input backward."""
+        if not self._has_backward:
+            return
+        if self.is_first_stage:
+            self.backward_one_chunk(micro_index)
+            return
+        if micro_index not in self._dw_cache:
+            raise RuntimeError(f"stage: {self.stage_index} micro_{micro_index} dw called before dx.")
+
+        param_groups = self._dw_cache.pop(micro_index)
+        stage_backward_weight(iter(self._get_trainable_params()), param_groups)
+        self._clear_recv_buffer(self.grad_recv_info, micro_index)
+        self._clear_recv_buffer(self.args_recv_info, micro_index)
+        if self.is_last_stage:
+            self.fwd_outputs_cache.pop(micro_index, None)

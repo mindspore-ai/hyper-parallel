@@ -48,6 +48,23 @@ def test_vpp_schedule_group1():
     card_mark="allcards",
     essential_mark="essential",
 )
+def test_vpp_dxdw_split():
+    """
+    Feature: PyTorch VPP dx/dw split under concurrent backward/forward execution.
+    Description: Run four ranks with split input/weight backward and compare every local gradient.
+    Expectation: Pipeline outputs and gradients match the full-model reference.
+    """
+    parallel_run([
+        TorchCase(_VPP_SCHEDULE, "test_vpp_dxdw_split", num_proc=4)
+    ])
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
 def test_vpp_pipeline_swap():
     """
     Feature: PyTorch pipeline activation swap under Interleaved 1F1B.
@@ -125,4 +142,21 @@ def test_vpp_dynamic_batch_p2p_cold_start():
     """
     parallel_run([
         TorchCase(_VPP_SCHEDULE, "test_vpp_dynamic_batch_p2p_cold_start", num_proc=8)
+    ])
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_vpp_dynamic_multi_stream_p2p_cold_start():
+    """
+    Feature: Dynamic-shape VPP with peer-specific P2P groups.
+    Description: Launch two four-rank PP domains with an independent group for each PP edge.
+    Expectation: Group initialization and the first batched peer operations complete without deadlock.
+    """
+    parallel_run([
+        TorchCase(_VPP_SCHEDULE, "test_vpp_dynamic_multi_stream_p2p_cold_start", num_proc=8)
     ])

@@ -34,7 +34,7 @@ from hyper_parallel.platform.torch.dtensor import DTensorBase
 
 class TestTorchPlatformCore(unittest.TestCase):
     """Unit tests for TorchPlatform core functionality.
-    
+
     Tests cover device and distributed environment management,
     distributed communication primitives, parameter management,
     and tensor operations.
@@ -42,18 +42,64 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures before each test method.
-        
+
         Configures the environment and initializes the TorchPlatform instance.
         """
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.platform = TorchPlatform()
 
+    @mock.patch("hyper_parallel.platform.torch.platform._get_default_group")
     @mock.patch("torch.distributed.barrier")
-    def test_prepare_batch_p2p_group_uses_barrier(self, mock_barrier):
-        """Torch prepares the PP group with one full-group collective."""
-        TorchPlatform.prepare_batch_p2p_group(mock.sentinel.pp_group)
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torch.distributed.get_world_size", return_value=2)
+    def test_prepare_batch_p2p_group_serializes_group_root(
+            self, mock_world_size, mock_rank, mock_barrier, mock_default_group):
+        """A group root serializes HCCL initialization after members rendezvous."""
+        group = MagicMock()
+        group.group_name = "edge-0-2"
+        group_store = group.get_group_store.return_value
+        group_store.add.return_value = 2
+        default_store = mock_default_group.return_value.get_group_store.return_value
+        default_store.compare_set.side_effect = [b"edge-0-2", b""]
 
-        mock_barrier.assert_called_once_with(group=mock.sentinel.pp_group)
+        TorchPlatform.prepare_batch_p2p_group(group)
+
+        mock_world_size.assert_called_once_with(group=group)
+        mock_rank.assert_called_once_with(group=group)
+        group_store.add.assert_called_once_with(
+            "hyper_parallel_p2p_group_init_ready:edge-0-2", 1)
+        group_store.set.assert_has_calls([
+            mock.call("hyper_parallel_p2p_group_init_ready:edge-0-2_done", "1"),
+            mock.call("hyper_parallel_p2p_group_init_root_ready:edge-0-2", "1"),
+        ])
+        default_store.compare_set.assert_has_calls([
+            mock.call("hyper_parallel_p2p_group_init_lock", "", "edge-0-2"),
+            mock.call("hyper_parallel_p2p_group_init_lock", "edge-0-2", ""),
+        ])
+        mock_barrier.assert_called_once_with(group=group)
+
+    @mock.patch("hyper_parallel.platform.torch.platform._get_default_group")
+    @mock.patch("torch.distributed.barrier")
+    @mock.patch("torch.distributed.get_rank", return_value=1)
+    @mock.patch("torch.distributed.get_world_size", return_value=2)
+    def test_prepare_batch_p2p_group_waits_for_group_root(
+            self, mock_world_size, mock_rank, mock_barrier, mock_default_group):
+        """A non-root member waits until its group root owns the initialization lock."""
+        group = MagicMock()
+        group.group_name = "edge-0-2"
+        group_store = group.get_group_store.return_value
+        group_store.add.return_value = 1
+
+        TorchPlatform.prepare_batch_p2p_group(group)
+
+        mock_world_size.assert_called_once_with(group=group)
+        mock_rank.assert_called_once_with(group=group)
+        group_store.wait.assert_has_calls([
+            mock.call(["hyper_parallel_p2p_group_init_ready:edge-0-2_done"]),
+            mock.call(["hyper_parallel_p2p_group_init_root_ready:edge-0-2"]),
+        ])
+        mock_default_group.assert_not_called()
+        mock_barrier.assert_called_once_with(group=group)
 
     def test_buffers_dict_includes_all_registered_buffers(self):
         """Torch buffer enumeration includes persistent and non-persistent buffers."""
@@ -127,10 +173,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('hyper_parallel.platform.torch.platform.TorchPlatform.get_device_handle')
     def test_device_type(self, mock_get_device_handle):
         """Test device type detection logic.
-        
+
         Verifies that the platform correctly identifies different device types
         (NPU and CUDA) based on the device handle.
-        
+
         Args:
             mock_get_device_handle: Mock for the get_device_handle method.
         """
@@ -146,11 +192,11 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.init_process_group')
     def test_init_process_group(self, mock_init, mock_get_default):
         """Test distributed process group initialization logic.
-        
+
         Verifies that the platform properly initializes the distributed
         environment when not already initialized, and avoids reinitialization
         when already initialized.
-        
+
         Args:
             mock_init: Mock for torch.distributed.init_process_group.
             mock_get_default: Mock for _get_default_group function.
@@ -172,10 +218,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.new_group')
     def test_split_group(self, mock_new_group, mock_get_rank):
         """Test process group splitting logic.
-        
+
         Verifies that the platform correctly splits the default process group
         into subgroups based on provided rank lists.
-        
+
         Args:
             mock_new_group: Mock for torch.distributed.new_group.
             mock_get_rank: Mock for TorchPlatform.get_rank.
@@ -200,10 +246,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.nn.functional.all_gather')
     def test_differentiable_all_gather_concat(self, mock_all_gather):
         """Test differentiable all_gather and concatenation logic.
-        
+
         Verifies that the platform correctly performs all_gather operation
         and concatenates results along the specified dimension.
-        
+
         Args:
             mock_all_gather: Mock for torch.distributed.nn.functional.all_gather.
         """
@@ -225,10 +271,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.nn.functional.all_reduce')
     def test_differentiable_all_reduce(self, mock_all_reduce):
         """Test differentiable all_reduce logic.
-        
+
         Verifies that the platform correctly performs all_reduce operation
         with the specified reduction operation.
-        
+
         Args:
             mock_all_reduce: Mock for torch.distributed.nn.functional.all_reduce.
         """
@@ -245,10 +291,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.empty')
     def test_differentiable_reduce_scatter(self, mock_empty, mock_chunk, mock_reduce_scatter):
         """Test differentiable reduce_scatter logic.
-        
+
         Verifies that the platform correctly performs reduce_scatter operation
         with both sum and average reduction operations.
-        
+
         Args:
             mock_empty: Mock for torch.empty.
             mock_chunk: Mock for torch.chunk.
@@ -280,10 +326,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('torch.distributed.all_reduce')
     def test_all_reduce_non_contiguous(self, mock_all_reduce):
         """Test all_reduce handling of non-contiguous tensors.
-        
+
         Verifies that the platform correctly handles non-contiguous tensors
         by converting them to contiguous before performing all_reduce.
-        
+
         Args:
             mock_all_reduce: Mock for torch.distributed.all_reduce.
         """
@@ -393,6 +439,55 @@ class TestTorchPlatformCore(unittest.TestCase):
         work_a.wait.assert_called_once_with()
         work_b.wait.assert_called_once_with()
 
+    def test_create_p2p_multi_stream_groups_creates_local_edges_in_stable_order(self) -> None:
+        """
+        Feature: PyTorch multi-stream pipeline P2P groups.
+        Description: Initialize two interleaved PP rings while the current rank belongs to one.
+        Expectation: Every rank creates the global edge set in one order and retains only local groups.
+        """
+        groups = [MagicMock(name=f"group_{index}") for index in range(8)]
+
+        def _all_gather_pp_rank_lists(output, local_ranks):
+            self.assertEqual(local_ranks, [0, 1, 2, 3])
+            output[:] = [[0, 1, 2, 3]] * 4 + [[4, 5, 6, 7]] * 4
+
+        with mock.patch.dict(
+                "hyper_parallel.platform.torch.platform.EXISTING_COMM_GROUPS",
+                clear=True,
+        ), mock.patch.dict(
+                "hyper_parallel.platform.torch.platform._P2P_MULTI_STREAM_GROUPS",
+                clear=True,
+        ), mock.patch(
+            "hyper_parallel.platform.torch.platform.dist.get_rank",
+            return_value=1,
+        ), mock.patch(
+            "hyper_parallel.platform.torch.platform.dist.get_world_size",
+            return_value=8,
+        ), mock.patch(
+            "hyper_parallel.platform.torch.platform.dist.all_gather_object",
+            side_effect=_all_gather_pp_rank_lists,
+        ), mock.patch(
+            "hyper_parallel.platform.torch.platform.dist.new_group",
+            side_effect=groups,
+        ) as new_group:
+            local_groups = TorchPlatform.create_p2p_multi_stream_groups(
+                [0, 1, 2, 3],
+                include_wrap=True,
+            )
+
+        expected_calls = [
+            mock.call(ranks=[0, 1]),
+            mock.call(ranks=[0, 3]),
+            mock.call(ranks=[1, 2]),
+            mock.call(ranks=[2, 3]),
+            mock.call(ranks=[4, 5]),
+            mock.call(ranks=[4, 7]),
+            mock.call(ranks=[5, 6]),
+            mock.call(ranks=[6, 7]),
+        ]
+        self.assertEqual(new_group.call_args_list, expected_calls)
+        self.assertEqual(local_groups, {0: groups[0], 2: groups[2]})
+
     def test_differentiable_async_allgather_wait_immediate_backward(self):
         """Async all-gather wait should return a real gradient when handle_box is None."""
         x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
@@ -457,7 +552,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def test_search_parameter_by_name(self):
         """Test parameter search by name logic.
-        
+
         Verifies that the platform correctly searches for parameters
         in nested model structures using dot notation.
         """
@@ -494,7 +589,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def test_update_parameter_by_name(self):
         """Test parameter update by name logic.
-        
+
         Verifies that the platform correctly updates model parameters
         using the result from search_parameter_by_name.
         """
@@ -519,10 +614,10 @@ class TestTorchPlatformCore(unittest.TestCase):
     @mock.patch('hyper_parallel.core.dtensor.layout._get_slice_tensor_by_layout')
     def test_set_layout_into_parameter(self, mock_get_slice, mock_dtensor_from_local, mock_parameter):
         """Test parameter layout setting logic.
-        
+
         Verifies that the platform correctly sets tensor layouts into parameters
         and handles error cases appropriately.
-        
+
         Args:
             mock_get_slice: Mock for _get_slice_tensor_by_layout function.
             mock_dtensor_from_local: Mock for DTensor.from_local method.
@@ -555,7 +650,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def test_cast_fp_tensor(self):
         """Test floating-point tensor type casting logic.
-        
+
         Verifies that the platform correctly casts tensors to different
         floating-point types and handles edge cases.
         """
@@ -580,7 +675,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
     def test_apply_to_tensors(self):
         """Test recursive tensor processing logic.
-        
+
         Verifies that the platform correctly applies functions recursively
         to tensors within nested data structures.
         """

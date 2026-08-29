@@ -29,9 +29,16 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
         """Build the minimal schedule state needed by initialization tests."""
         schedule = object.__new__(ScheduleInterleaved1F1B)
         schedule._batch_p2p = batch_p2p
+        schedule._p2p_mode = "batch" if batch_p2p else "plain"
         schedule._batch_p2p_group = mock.sentinel.pp_group
         schedule._batch_p2p_group_initialized = False
-        schedule.stages = [SimpleNamespace(stage_index=0, pp_group=mock.sentinel.pp_group)]
+        schedule._p2p_multi_stream_groups = {}
+        schedule._p2p_multi_stream_groups_initialized = False
+        schedule.stages = [SimpleNamespace(
+            stage_index=0,
+            pp_group=mock.sentinel.pp_group,
+            has_backward=False,
+        )]
         schedule.real_stage_num = 2
         schedule.exec_order = {0: []}
         schedule.micro_batch_num = 1
@@ -59,6 +66,49 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
 
         prepare_group.assert_not_called()
         self.assertFalse(schedule._batch_p2p_group_initialized)
+
+    def test_multi_stream_transport_prepares_metadata_group(self) -> None:
+        """Multi-stream P2P should initialize the full PP group used for metadata."""
+        schedule = self._make_schedule(batch_p2p=True)
+        schedule._p2p_mode = "multi_stream"
+        with mock.patch.object(scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+            schedule.run_microbatches([], [], [])
+
+        prepare_group.assert_called_once_with(mock.sentinel.pp_group)
+        self.assertTrue(schedule._batch_p2p_group_initialized)
+
+    def test_multi_stream_transport_prepares_edge_groups_once_in_order(self) -> None:
+        """Multi-stream P2P prepares each local edge group once in stable order."""
+        schedule = self._make_schedule(batch_p2p=True)
+        schedule._p2p_mode = "multi_stream"
+        schedule._p2p_multi_stream_groups = {
+            1: mock.sentinel.edge_group_1,
+            7: mock.sentinel.edge_group_7,
+        }
+        with mock.patch.object(scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+            schedule.run_microbatches([], [], [])
+            schedule.run_microbatches([], [], [])
+
+        self.assertEqual(prepare_group.call_args_list, [
+            mock.call(mock.sentinel.pp_group),
+            mock.call(mock.sentinel.edge_group_1),
+            mock.call(mock.sentinel.edge_group_7),
+        ])
+        self.assertTrue(schedule._p2p_multi_stream_groups_initialized)
+
+    def test_non_multi_stream_transport_does_not_prepare_edge_groups(self) -> None:
+        """Batch and plain transports do not prepare multi-stream edge groups."""
+        for batch_p2p in (True, False):
+            with self.subTest(batch_p2p=batch_p2p):
+                schedule = self._make_schedule(batch_p2p=batch_p2p)
+                schedule._p2p_multi_stream_groups = {1: mock.sentinel.edge_group}
+                with mock.patch.object(
+                        scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+                    schedule.run_microbatches([], [], [])
+
+                self.assertNotIn(
+                    mock.call(mock.sentinel.edge_group), prepare_group.call_args_list)
+                self.assertFalse(schedule._p2p_multi_stream_groups_initialized)
 
     def test_single_rank_batch_transport_does_not_prepare_group(self) -> None:
         """A batch schedule without a cross-rank edge needs no preparation."""

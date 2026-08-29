@@ -50,7 +50,12 @@ from mindspore.ops.auto_generate.gen_ops_prim import inner_comm_all_to_all_v_op
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
 
-from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import (
+    Platform,
+    PlatformType,
+    EXISTING_COMM_GROUPS,
+    _build_p2p_edge_rank_lists,
+)
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
@@ -1449,6 +1454,37 @@ class MindSporePlatform(Platform):
         self._create_group_with_options(group_name, rank_list, pg_options=pg_options)
         EXISTING_COMM_GROUPS[group_name] = group_name
         return group_name
+
+    @staticmethod
+    def create_p2p_multi_stream_groups(
+            pp_rank_list: list[int],
+            include_wrap: bool = False,
+    ) -> dict[int, str]:
+        """Create adjacent two-rank PP groups for independent communication streams.
+
+        Args:
+            pp_rank_list: Ordered global ranks in one pipeline-parallel group.
+            include_wrap: Whether to include the last-to-first interleaved edge.
+
+        Returns:
+            A mapping from adjacent peer rank to its MindSpore group name.
+        """
+        current_rank = MindSporePlatform.get_rank()
+        local_groups = {}
+        for edge_ranks in _build_p2p_edge_rank_lists(pp_rank_list, include_wrap):
+            if current_rank not in edge_ranks:
+                continue
+            group_key = str(edge_ranks)
+            group = EXISTING_COMM_GROUPS.get(group_key)
+            if group is None:
+                group = MindSporePlatform._maybe_reuse_world_group(list(edge_ranks))
+                if group is None:
+                    MindSporePlatform._create_group_with_options(group_key, list(edge_ranks))
+                    group = group_key
+                EXISTING_COMM_GROUPS[group_key] = group
+            peer_rank = edge_ranks[0] if edge_ranks[1] == current_rank else edge_ranks[1]
+            local_groups[peer_rank] = group
+        return local_groups
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):

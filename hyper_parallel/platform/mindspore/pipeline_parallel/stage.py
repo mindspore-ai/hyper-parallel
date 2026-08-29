@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +58,9 @@ class PipelineStageBase:
         self.fwd_grad_fn_cache = {}
         self.bwd_cache = {}
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
+        # Lazily populated after the stage is first unsharded. HSDP keeps each
+        # unsharded Parameter identity stable across later shard/unshard cycles.
+        self._trainable_params = None
         # Set by the schedule (``PipelineScheduleRuntime._init_stages``); called
         # as ``hook(stage_index, micro_index)`` right after a forward chunk
         # completes.  Drives the fwd-boundary P2P issue without requiring the
@@ -89,10 +92,11 @@ class PipelineStageBase:
 
     @staticmethod
     def _grad_position_from_requires_grad(composite_args):
-        """Derive grad_position from composite_args' requires_grad attributes.
+        """Return positional Tensor indices that already require gradients.
 
-        Returns -1 if all tensor args require grad, a tuple of indices if some do,
-        and an empty list if none do.
+        Pipeline stages only route gradients for positional stage inputs. Always
+        returning explicit indices avoids the broader ``-1`` contract, which also
+        selects keyword Tensor inputs in ``forward_and_gradfn``.
         """
         # pylint: disable=C0415
         from mindspore import Tensor
@@ -101,10 +105,6 @@ class PipelineStageBase:
             i for i in tensor_indices
             if composite_args[i]._requires_grad  # pylint: disable=protected-access
         ]
-        if not requires_grad_indices:
-            return []
-        if len(requires_grad_indices) == len(tensor_indices):
-            return -1
         return tuple(requires_grad_indices)
 
     @property
@@ -119,11 +119,6 @@ class PipelineStageBase:
 
     def forward_one_chunk(self, micro_index, args=None, kwargs=None):
         """Execution a forward function."""
-        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
-        for _, mod in self.submodule.cells_and_names():
-            if not isinstance(mod, HSDPModule):
-                continue
-            mod.set_reshard_after_forward(False)
         if self.is_first_stage:
             composite_args = args
         else:
@@ -135,13 +130,14 @@ class PipelineStageBase:
         composite_kwargs = kwargs or {}
         if self._has_backward:
             grad_position = self._grad_position_from_requires_grad(composite_args)
-            weights = tuple(self.submodule.trainable_params())
+            if self._trainable_params is None:
+                self._trainable_params = tuple(self.submodule.trainable_params())
             platform = get_platform()
             with platform.recompute_handle_collector_ctx() as handles:
                 out, grad_fn = forward_and_gradfn(
                     self.submodule,
                     *composite_args,
-                    weights=weights,
+                    weights=self._trainable_params,
                     grad_position=grad_position,
                     **composite_kwargs,
                 )
@@ -170,9 +166,9 @@ class PipelineStageBase:
 
         Must be invoked on a thread with no concurrent forward: for
         ``overlap_b_f`` the caller runs this on the main thread *before*
-        ``overlap.run`` spawns the backward thread, so the forward re-run
-        never races the paired chunk's forward.  A no-op when the chunk has
-        no checkpointed blocks.
+        ``overlap.run`` submits work to the backward worker, so the forward
+        re-run never races the paired chunk's forward.  A no-op when the
+        chunk has no checkpointed blocks.
 
         Args:
             micro_index: Micro-batch index whose checkpointed blocks are
@@ -191,15 +187,8 @@ class PipelineStageBase:
 
     def backward_one_chunk(self, micro_index):
         """Execution a backward function."""
-        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
             return
-        for _, mod in self.submodule.cells_and_names():
-            if not isinstance(mod, HSDPModule):
-                continue
-            mod.set_reshard_after_backward(False)
-            mod.set_requires_gradient_sync(False)
-
         grad_fn = self.fwd_grad_fn_cache.pop(micro_index)
         handles = self.recompute_handles.pop(micro_index, None)
         platform = get_platform()
@@ -216,13 +205,13 @@ class PipelineStageBase:
         with session_ctx:
             if self.is_first_stage:
                 sens = self._build_padded_sens(micro_index)
-                _ = grad_fn(sens=sens)
+                grad_fn.accumulate_grad(sens=sens)
             else:
                 if self.is_last_stage:
                     sens = self.get_last_stage_sens(self.last_stage_outputs)
                 else:
                     sens = self._build_padded_sens(micro_index)
-                _ = grad_fn(sens=sens)
+                grad_fn.accumulate_grad(sens=sens)
         if handles:
             platform.clear_recompute_session(session_id)
         if not self.is_first_stage:
@@ -247,15 +236,9 @@ class PipelineStageBase:
         :meth:`backward_weight_one_chunk` runs the full backward instead, so
         ``grad_fn`` is left untouched in the cache for it to pop.
         """
-        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
             return
         with get_platform().profiler_record(f"backward_input_one_chunk: stage_{self.stage_index}/mi_{micro_index}"):
-            for _, mod in self.submodule.cells_and_names():
-                if not isinstance(mod, HSDPModule):
-                    continue
-                mod.set_reshard_after_backward(False)
-                mod.set_requires_gradient_sync(False)
             if self.is_first_stage:
                 return
             # Index, NOT pop: backward_weight_one_chunk performs the terminal pop.
@@ -290,16 +273,9 @@ class PipelineStageBase:
         runs here instead, which yields only weight gradients (the stage has no
         input grad to compute).
         """
-        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
             return
         with get_platform().profiler_record(f"backward_weight_one_chunk: stage_{self.stage_index}/mi_{micro_index}"):
-            for _, mod in self.submodule.cells_and_names():
-                if not isinstance(mod, HSDPModule):
-                    continue
-                mod.set_reshard_after_backward(False)
-                mod.set_requires_gradient_sync(False)
-
             grad_fn = self.fwd_grad_fn_cache.pop(micro_index)
             handles = self.recompute_handles.pop(micro_index, None)
             platform = get_platform()
@@ -312,7 +288,7 @@ class PipelineStageBase:
             with session_ctx:
                 if self.is_first_stage:
                     sens = self._build_padded_sens(micro_index)
-                    _ = grad_fn(sens=sens)
+                    grad_fn.accumulate_grad(sens=sens)
                 else:
                     if not grad_fn._saved_intermediates:  # pylint: disable=protected-access
                         raise RuntimeError(
