@@ -9,7 +9,9 @@ HyperParallel 提供芯片内多核 MPMD 并行能力，结合核级内存语义
 - **O0**：通过框架层 host CPU 侧的调度，支持 cube、vector、单边通信算子分核执行
 - **O1**：调度下沉到 AICore，支持 cube、vector、单边通信算子分核执行，进一步提升性能
 
-当前已基于多核并行实现 MoE 通算掩盖（Multicore MoE-FFN）：将 MoE-FFN 的五个算子（AllToAll-Dispatch、GMM1、SwiGLU、GMM2、AllToAll-Combine）融合为一个 kernel，由 AIC（AI Cube）和 AIV（AI Vector）核同时执行，实现通信与计算的细粒度重叠。
+HyperParallel 基于多核并行实现 MoE 通算掩盖（Multicore MoE-FFN）：将 MoE-FFN 的五个算子
+（AllToAll-Dispatch、GMM1、SwiGLU、GMM2、AllToAll-Combine）融合为一个 kernel，由 AIC（AI Cube）和
+AIV（AI Vector）核同时执行，实现通信与计算的细粒度重叠。
 
 ## 接口概览
 
@@ -48,6 +50,7 @@ mc.mega_moe_grad(...)
 源码开发态通过统一入口完成依赖准备和 native 构建：
 
 ```bash
+source /path/to/cann/set_env.sh
 ./build.sh --multicore mindspore --shmem mindspore --custom-ops off
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
@@ -55,8 +58,8 @@ python your_program.py
 ```
 
 同一次构建也会生成 wheel；默认复用依赖和编译缓存，必要时使用 `--clean` 重编所选组件。
-必须在启动 Python、导入 MindSpore/Torch/torch_npu 之前 source `set_env.bash`，设置 CANN custom OPP
-所需路径。
+必须在启动 Python、导入 MindSpore/Torch/torch_npu 之前依次 source 所选 CANN 的 `set_env.sh` 和
+HyperParallel payload 的 `set_env.bash`，设置 CANN 运行环境及 custom OPP 所需路径。
 
 ---
 

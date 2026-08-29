@@ -23,16 +23,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import urllib.request
 from typing import Any
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LOCK_PATH = _REPO_ROOT / "scripts" / "native" / "config" / "dependencies.lock.json"
 _DEFAULT_CACHE = _REPO_ROOT / "build" / "native" / "deps"
-_GIT_DEPENDENCIES = ("shmem", "ops_nn", "ops_transformer", "cann_cmake", "opbase", "ops_tensor")
-_DEPENDENCIES = (*_GIT_DEPENDENCIES, "multicore_archives")
-_DOWNLOAD_TIMEOUT_SECONDS = 60
+_DEPENDENCIES = ("shmem", "ops_nn", "ops_transformer")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -61,12 +58,6 @@ def main() -> int:
         raise ValueError("--source-dir can only be used with one --dependency value.")
     prepared: dict[str, Any] = {}
     for dependency in args.dependency:
-        if dependency == "multicore_archives":
-            prepared[dependency] = _prepare_archives(
-                cache_dir / "multicore" / "archives",
-                verify_only=args.verify_only,
-            )
-            continue
         source_dir = Path(args.source_dir) if args.source_dir else cache_dir / dependency / "src"
         if not source_dir.is_absolute():
             source_dir = _REPO_ROOT / source_dir
@@ -87,67 +78,6 @@ def main() -> int:
         prepared[dependency] = metadata
     print(json.dumps(prepared, sort_keys=True))
     return 0
-
-
-def _prepare_archives(cache_dir: Path, verify_only: bool) -> dict[str, dict[str, str]]:
-    """Acquire and verify archives used by the upstream ops-nn package build."""
-    lock = json.loads(_LOCK_PATH.read_text(encoding="utf-8"))
-    archives = lock["components"]["multicore"]["build_archives"]
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    metadata: dict[str, dict[str, str]] = {}
-    for archive_name, archive in sorted(archives.items()):
-        archive_path = cache_dir / archive["file"]
-        if not archive_path.is_file():
-            if verify_only:
-                raise ValueError(f"Locked multicore archive is missing: {archive_path}")
-            _download(archive["url"], archive_path)
-        actual_hash = _file_sha256(archive_path)
-        if actual_hash != archive["sha256"]:
-            if verify_only:
-                raise ValueError(
-                    f"Archive hash mismatch for {archive_path}: expected={archive['sha256']}, actual={actual_hash}"
-                )
-            archive_path.unlink()
-            _download(archive["url"], archive_path)
-            actual_hash = _file_sha256(archive_path)
-            if actual_hash != archive["sha256"]:
-                raise ValueError(
-                    f"Archive hash mismatch for {archive_path}: expected={archive['sha256']}, actual={actual_hash}"
-                )
-        metadata[archive_name] = {
-            "file": archive["file"],
-            "path": str(archive_path.resolve()),
-            "sha256": actual_hash,
-            "url": archive["url"],
-        }
-    return metadata
-
-
-def _download(url: str, destination: Path) -> None:
-    """Download one declared URL into an atomic cache entry."""
-    temporary = destination.with_suffix(destination.suffix + ".download")
-    temporary.unlink(missing_ok=True)
-    try:
-        with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response, temporary.open(
-            "wb"
-        ) as output_file:
-            shutil.copyfileobj(response, output_file)
-        temporary.replace(destination)
-    except OSError as error:
-        raise RuntimeError(
-            f"Failed to download locked dependency archive: url={url}, destination={destination}, error={error}"
-        ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _file_sha256(path: Path) -> str:
-    """Return a streaming SHA256 digest for one file."""
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def verify_git_dependency(
@@ -214,7 +144,7 @@ def _read_dependency_lock(dependency: str) -> dict[str, Any]:
 
 
 def _clone_dependency(dependency_lock: dict[str, Any], source_dir: Path) -> None:
-    """Clone one pinned tag only from the lock's declared repository."""
+    """Populate one pinned dependency from its declared tag or commit ref."""
     source_dir.parent.mkdir(parents=True, exist_ok=True)
     fetch_ref = dependency_lock.get("fetch_ref")
     if fetch_ref:
@@ -239,7 +169,7 @@ def _clone_dependency(dependency_lock: dict[str, Any], source_dir: Path) -> None
 
 
 def _fetch_dependency_commit(dependency_lock: dict[str, Any], source_dir: Path, fetch_ref: str) -> None:
-    """Fetch an upstream-published commit ref when no release tag names the required snapshot."""
+    """Fetch and check out a pinned upstream commit ref."""
     source_dir.mkdir(parents=True)
     commands = (
         ("git", "init", str(source_dir)),

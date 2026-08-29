@@ -243,7 +243,8 @@ In shells such as zsh, quote package names with extras so `[]` is not treated as
 
 ### 2. Build a Wheel From Source
 
-Building hyper-parallel from source can compile three native modules: `multicore`, `symmetric memory`, and `custom ops`.
+Building hyper-parallel from source can compile three optional native modules: `multicore`, `symmetric memory`, and
+`custom ops`. The indexed Dataset C++ helper is a required wheel artifact and is built on every `build.sh` invocation.
 
 Building a whl with `build.sh` supports the following build arguments:
 
@@ -262,11 +263,14 @@ Source build environment requirements for hyper-parallel are as follows:
 | Environment item                | Requirement                                                               | Notes                                                                                                             |
 |---------------------------------|---------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | Python                          | 3.10, 3.11, or 3.12                                                       | The built whl can only be installed into the matching Python minor version                                        |
-| Host GCC                        | >= 7.3.0                                                                  | 7.3.0--11.3.0 is the validated target range; newer versions emit a warning                                        |
+| Python build packages           | `setuptools`, `wheel`, and `pybind11`                                     | `pybind11` and the active Python development headers are required by the indexed Dataset helper                   |
+| Host C/C++ toolchain            | GCC/G++ >= 7.3.0 with C++17 support                                       | GCC/G++ 7.3.0--11.3.0 is recommended; newer versions emit a warning                                               |
+| Host architecture               | `aarch64` or `x86_64`                                                     | Each whl targets one host architecture and one CPython ABI                                                         |
 | CMake                           | >= 3.18                                                                   | Required for native extension builds                                                                              |
-| GNU Make                        | Available on `PATH`                                                       | Used by the CMake and CANN operator build pipelines                                                               |
-| CANN toolkit                    | CANN 9.1.0                                                             | Source the selected CANN `set_env.sh`; `build.sh` can activate `/usr/local/Ascend/cann/set_env.sh` automatically |
-| MindSpore                       | >= 2.10                                                                   | Required when `--custom-ops on`, `--multicore mindspore/all`, or `--shmem all/mindspore`                        |
+| Linux build tools               | GNU Make, Git, binutils, coreutils, `tar`, `sed`, and `awk`               | Required by dependency preparation, ELF validation, and the CANN operator build pipeline                          |
+| CANN toolkit and ops packages   | >= 9.1.0 complete development environment                                 | Source the selected CANN `set_env.sh`; it must provide `bisheng`, `asc_opc`, headers, `libopapi.so`, and `ops_base` |
+| Ninja                           | Available on `PATH` for MindSpore native targets                          | Required by `CustomOpBuilder` builds                                                                               |
+| MindSpore                       | >= 2.10                                                                   | Required when `--custom-ops on`, `--multicore mindspore/all`, or `--shmem all/mindspore`                          |
 | PyTorch and NPU adapter package | Backend-compatible pair with `_GLIBCXX_USE_CXX11_ABI=1`                   | Required when `--multicore torch/all`, or `--shmem all/torch`; the build uses the pair installed in the active environment |
 
 ```bash
@@ -291,19 +295,19 @@ framework adapters are rebuilt from clean framework-identity work directories on
 rebuild all work for the selected components. A matching dependency cache is reused automatically; absent or
 inconsistent locked dependencies are downloaded/refreshed.
 
-For a multi-SoC multicore build, ops-nn compiles each selected kernel target independently. A deterministic priority
-(`ascend910_93`/910C before `ascend910b`/910B) selects the only host payload, regardless of `--soc-list` order. Other
-vendors contribute kernel/config trees after their common host build input identity and ABI are checked.
+For a multi-SoC multicore build, HyperParallel builds the HyperMegaMoe vendor for every selected kernel target and
+combines the resulting kernel/config trees into one package. The package carries one common host payload after the
+vendor inputs and host ABI have been checked for consistency.
 
 > Note: the built whl has requirements on the glibc version of the runtime environment. The glibc version in the
 > installation environment must be no lower than the glibc version in the build environment.
 > If you need to deploy to an older system, build inside an older release image. For example, a whl built on OpenEuler
 > 22.03 (glibc 2.34) cannot run in an environment with glibc < 2.34.
-> A release build must use the release-designated glibc baseline and pass the Level 1/full release test matrix. The
-> resulting ELF payload determines the required runtime glibc floor.
+> Release wheels use the glibc baseline selected by the release environment. The resulting ELF payload determines the
+> required runtime glibc floor.
 
-Native source builds and prebuilt release wheels require CANN 9.1.0. Source the selected CANN `set_env.sh` before
-building; the build reads the exported `ASCEND_HOME_PATH`. The default CANN path is activated automatically.
+Native source builds and prebuilt release wheels require CANN 9.1.0 or newer. Source the selected CANN `set_env.sh`
+before building; the build reads the exported `ASCEND_HOME_PATH`. The default CANN path is activated automatically.
 
 ### 3. Activate the Multicore Custom OPP Environment
 

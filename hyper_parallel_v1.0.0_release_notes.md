@@ -205,7 +205,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
   - Pipeline Parallel：Torch + MindSpore 双后端
   - Activation Checkpoint/Swap：Torch + MindSpore 双后端
   - Process Group：Gloo + HCCL
-- Wheel 打包：Python/arch tag + CXX11 ABI 统一
+- Wheel 打包：Python/arch tag；framework adapter 使用对应框架的 CXX11 ABI 契约
 
 ---
 
@@ -237,7 +237,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - **Pipeline**：PipelineStage 设备默认值修复、batch size 整除校验
 - **Context Parallel**：async CP preserve TP layout 修复
 - **Optimizer**：clip_grad_norm_ reduction 对齐各 grad process group
-- **Packaging**：wheel python/arch tag + CXX11 ABI 统一
+- **Packaging**：wheel python/arch tag；framework adapter 使用对应框架的 CXX11 ABI 契约
 - **Codecheck**：66 文件补充 docstring（C0116 warnings）
 
 ### 测试覆盖提升
@@ -416,7 +416,8 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 2. **Optimizer 模块**：新增 `Muon` / `ChainedOptimizer` / `get_hyper_optimizer` / `get_hyper_lr_scheduler`，可直接集成到训练流程
 3. **PP API 扩展**：`PipelineStage` 新增 dx/dw 计算、FSDP metastep 支持；`ScheduleInterleaved1F1B` 新增 `overlap_b_f` / `overlap_p2p` 参数
 4. **CP API 扩展**：新增 `AsyncContextParallel` 及 DSA 系列接口
-5. **Wheel 打包变更**：whl 文件名包含 python/arch tag + CXX11 ABI 标识，需匹配目标环境
+5. **Wheel 打包变更**：whl 文件名包含 Python ABI 和主机架构标签；native adapter 必须与目标框架的
+   CXX11 ABI 契约一致
 
 ---
 

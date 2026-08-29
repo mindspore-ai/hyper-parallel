@@ -514,7 +514,7 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_da
 ./build.sh --multicore all --shmem all --custom-ops off
 ```
 
-依赖缓存位于 `build/native/deps`。用户先 source 所选 CANN 9.1.0 的官方 `set_env.sh`，构建脚本读取其
+依赖缓存位于 `build/native/deps`。用户先 source 所选 CANN >= 9.1.0 的官方 `set_env.sh`，构建脚本读取其
 导出的 `ASCEND_HOME_PATH`。
 
 ### 7.2 统一 vendor 与框架 adapter
@@ -526,7 +526,8 @@ vendor 输入，再合并为一个 `hyper_parallel_multicore_nn` vendor 和一�
 - `aclnnHyperMegaMoe` / `aclnnHyperMegaMoeGetWorkspaceSize`
 - `aclnnHyperMegaMoeGrad` / `aclnnHyperMegaMoeGradGetWorkspaceSize`
 
-vendor 仅允许导出上述 `aclnnHyperMegaMoe*` 符号；冲突或错误大小写的符号会使构建校验失败。MindSpore adapter 使用
+vendor 构建校验要求上述四个 `aclnnHyperMegaMoe*` 符号存在，并拒绝已知的冲突或错误大小写身份。
+MindSpore adapter 使用
 `ops.CustomOpBuilder`，PyTorch adapter 使用 `NpuExtension`；二者均含 CPython module，因此必须分别构建
 带 cp310、cp311 或 cp312 标签的 wheel。
 
@@ -541,9 +542,9 @@ wheel 与 PYTHONPATH 共用 `build/native/payload/hyper_parallel` 中的 native 
 ./build.sh --multicore all --shmem all --custom-ops on --strict off
 ```
 
-该命令总是重新组装 payload 并生成 wheel；PYTHONPATH 开发直接复用 payload。默认保留组件 CMake/build_ext
-和按 SoC 的编译缓存，切换 cp310/cp311/cp312 时使用隔离的框架 adapter 缓存；`--clean` 显式清理所选组件的
-工作与安装输出，但保留依赖下载缓存。
+该命令总是重新组装 payload 并生成 wheel；PYTHONPATH 开发直接复用 payload。默认复用 SHMEM SDK 和按 SoC
+vendor 的重型编译缓存；MindSpore/PyTorch adapter 使用按 CPython 和框架身份隔离的工作目录，每次从干净目录
+重建。`--clean` 显式清理所选组件的工作与安装输出，但保留依赖下载缓存。
 
 multicore 遵循 CANN 自定义算子包的环境契约。wheel 和 PYTHONPATH 都必须在启动业务或框架 Python 进程前 source 制品中的
 `set_env.bash`：
@@ -580,9 +581,11 @@ mc.mega_moe(...)
 mc.mega_moe_grad(...)
 ```
 
-> **注意：当前仅支持 PyNative 模式（动态图）**
+> **接口支持 PyNative 模式（动态图）**
 >
-> Graph 模式（`ms.GRAPH_MODE`）**暂未实现**。YAML 定义中 `function: disable: True` 使 MindSpore 编译器无法对这两个算子进行图级追踪和下沉；算子内部依赖运行时动态 tensor 地址，不满足静态图的编译期地址静态化要求。Graph 模式支持计划在后续版本中实现。
+> Graph 模式（`ms.GRAPH_MODE`）不属于本版本接口范围。YAML 定义中 `function: disable: True` 使 MindSpore
+> 编译器不会对这两个算子进行图级追踪和下沉；算子内部依赖运行时动态 tensor 地址，不满足静态图的
+> 编译期地址静态化要求。
 
 ### 7.5 PyTorch 接入
 
@@ -699,17 +702,16 @@ mc.mega_moe_grad(
 
 ### MindSpore
 
-```bash
-# msrun 2 卡
-msrun --worker_num=2 tests/mindspore/st/multicore/mega_moe.py
+7.3 节的 CANN 和 multicore payload 环境激活完成后，执行 pytest 入口。该用例通过仓内 launcher 启动
+MindSpore 多卡进程，并覆盖 HyperMegaMoe 正反向：
 
-# pytest 入口
-pytest tests/mindspore/st/multicore/test_moe.py -v
+```bash
+pytest -v tests/mindspore/st/multicore/test_moe.py
 ```
 
 ### PyTorch
 
-PyTorch 测试用例暂未提供（`tests/torch/multicore/` 目录尚不存在）。
+PyTorch multicore ST 不属于本版本提供的测试范围。
 
 ### 精度容限
 

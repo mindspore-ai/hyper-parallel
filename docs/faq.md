@@ -18,11 +18,18 @@ pip install "${wheel_path}"
 
 如明确只需要不含 optional native 组件的 core-only wheel，可将三个组件都设为 `off`。
 
-### Q: 导入时报错 "undefined Symbol"
+### Q: 导入时报错 `GLIBC_2.xx not found`
 
-**原因**：编译机和运行机的 glibc 版本不一致。
+**原因**：运行环境 glibc 版本低于 wheel 内 ELF 的版本需求。
 
-**解决**：在目标环境所在的 OS 发布镜像内重新构建 whl。例如部署在 OpenEuler 22.03 环境时，需要在该镜像内编译。
+**解决**：在不高于目标运行环境 glibc 基线的 OS 镜像内重新构建 wheel。
+
+### Q: 导入 native 组件时报错 `undefined symbol`
+
+**原因**：装载到进程的 native 库与 Python、框架、CANN 或 CXX11 ABI 组合不匹配。
+
+**解决**：记录完整符号名和实际加载的 `.so` 路径，确认 wheel 的 Python/架构标签、框架与 CANN
+配套关系，以及框架需求的 CXX11 ABI 一致。
 
 ### Q: MindSpore custom_ops 编译失败
 

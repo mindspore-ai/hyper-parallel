@@ -25,7 +25,8 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 
 ## 2. 从源码编译 whl 包
 
-基于源码构建 hyper-parallel 可选择编译 `multicore`、`symmetric memory`、`custom ops` 三个 native 模块。
+基于源码构建 hyper-parallel 可选择编译 `multicore`、`symmetric memory`、`custom ops` 三个 optional native
+模块。indexed Dataset C++ helper 是 wheel 的必需制品，每次执行 `build.sh` 都会编译。
 
 通过 `build.sh` 构建 whl 支持以下编译参数：
 
@@ -44,11 +45,14 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 | 环境项               | 要求                                    | 说明                                                                            |
 |-------------------|---------------------------------------|-------------------------------------------------------------------------------|
 | Python            | 3.10、3.11 或 3.12                      | 构建出的 whl 仅可装到对应 Python 小版本的解释器上                                               |
-| 主机 GCC            | >= 7.3.0                              | 7.3.0--11.3.0 为验证目标范围；更高版本仅告警                                          |
-| CMake             | ≥ 3.18                                | native 扩展构建需要                                                                 |
-| GNU Make          | 可从 `PATH` 找到                           | CMake 与 CANN 算子构建流程使用                                                        |
-| CANN 工具链          | CANN 9.1.0                            | 预先 source 所选 CANN 的 `set_env.sh`；默认路径 `/usr/local/Ascend/cann/set_env.sh` 可由 `build.sh` 自动激活 |
-| MindSpore         | >= 2.10                               | 当 `--custom-ops on`，`--multicore mindspore/all`，或 `--shmem all/mindspore` 时需要        |
+| Python 构建包        | `setuptools`、`wheel`、`pybind11`       | indexed Dataset helper 还需要当前 Python 的开发头文件                                      |
+| 主机 C/C++ 工具链     | GCC/G++ >= 7.3.0，支持 C++17              | 推荐使用 GCC/G++ 7.3.0--11.3.0；更高版本仅告警                                        |
+| 主机架构              | `aarch64` 或 `x86_64`                   | 每个 whl 对应一个主机架构和一个 CPython ABI                                                |
+| CMake             | >= 3.18                               | native 扩展构建需要                                                                 |
+| Linux 构建工具        | GNU Make、Git、binutils、coreutils、`tar`、`sed`、`awk` | 依赖准备、ELF 校验和 CANN 算子构建使用                                      |
+| CANN toolkit 和 ops 包 | >= 9.1.0 的完整开发环境                    | 预先 source 所选 CANN 的 `set_env.sh`；环境需提供 `bisheng`、`asc_opc`、头文件、`libopapi.so` 和 `ops_base` |
+| Ninja             | MindSpore native target 可从 `PATH` 找到    | `CustomOpBuilder` 构建需要                                                        |
+| MindSpore         | >= 2.10                               | 当 `--custom-ops on`、`--multicore mindspore/all` 或 `--shmem all/mindspore` 时需要       |
 | PyTorch 及 NPU 适配包 | 相互配套且 `_GLIBCXX_USE_CXX11_ABI=1` 的版本   | 当 `--multicore torch/all` 或 `--shmem all/torch` 时需要；构建使用活动环境中安装的配套版本       |
 
 ```bash
@@ -71,18 +75,16 @@ wheel 的精确路径；PYTHONPATH 开发直接复用同一 payload。单独执�
 编译缓存；轻量 framework adapter 每次从按框架身份隔离的干净目录重编。`--clean` 用于显式全量重编所选
 组件。锁定依赖缓存正确时直接复用，缺失或不一致时自动下载/刷新。
 
-multicore 多 SoC 构建会让 ops-nn 分别编译各 SoC kernel。流程使用固定优先级
-（`ascend910_93`/910C 优先于 `ascend910b`/910B）选择唯一的 host 制品，不受 `--soc-list` 顺序影响；
-其他 vendor 在公共 host 构建输入身份和 ABI 校验一致后，只合入各自的 kernel/config。
+multicore 多 SoC 构建会针对每个目标分别生成 HyperMegaMoe vendor，并将各 SoC 的 kernel/config 合入同一个
+软件包。合并前会校验 vendor 构建输入和 host ABI 的一致性，软件包仅携带一份公共 host 制品。
 
 > 注意事项：构建出的 whl 对运行环境的 glibc 版本有要求，安装环境的 glibc 需不低于编译环境的 glibc 版本。
 > 如需部署到 glibc 较低的系统，请在满足目标 glibc 基线的发布镜像内编译；例如在 OpenEuler 22.03
 >（glibc 2.34）编出的 whl 无法在 glibc < 2.34 的环境运行。
-> 正式发布构建需使用版本指定的 glibc 基线，并通过 Level 1/全量发布用例。产物所需的最低运行时 glibc
-> 由最终 ELF 依赖决定。
+> 正式发布构建使用版本指定的 glibc 基线。产物所需的最低运行时 glibc 由最终 ELF 依赖决定。
 
-native 源码构建和正式预编译 wheel 均要求 CANN 9.1.0。构建前 source 所选 CANN 的 `set_env.sh`，
-构建脚本读取其导出的 `ASCEND_HOME_PATH`；默认 CANN 路径由 `build.sh` 自动激活。
+native 源码构建和正式预编译 wheel 均要求 CANN 9.1.0 或更高版本。构建前 source 所选 CANN 的
+`set_env.sh`，构建脚本读取其导出的 `ASCEND_HOME_PATH`；默认 CANN 路径由 `build.sh` 自动激活。
 
 ## 3. 使用 multicore 前激活自定义算子环境
 
