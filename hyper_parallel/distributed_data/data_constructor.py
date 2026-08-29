@@ -22,8 +22,36 @@ from typing import Any
 from hyper_parallel.distributed_data.schema import DataConstructorPlan, SampleKey
 
 
+def default_pack_fn(samples: Sequence[Any], seq_len: int) -> tuple[Any, ...]:
+    """Preserve one planned packing bin without assuming a sample schema.
+
+    Args:
+        samples: Raw samples assigned to one Planner-validated bin, including
+            an explicitly permitted singleton overflow when configured.
+        seq_len: Configured normal sequence capacity.
+
+    Returns:
+        Immutable raw samples in their deterministic planned order.
+    """
+    if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
+        raise ValueError(f"seq_len must be a positive integer, but got {seq_len!r}.")
+    return tuple(samples)
+
+
+def default_collate_fn(packed_sequences: Sequence[Any]) -> tuple[Any, ...]:
+    """Preserve the planned bins as one immutable rank-local batch.
+
+    Args:
+        packed_sequences: Outputs produced for this rank's packing bins.
+
+    Returns:
+        Immutable bins in contiguous ``pack_index`` order.
+    """
+    return tuple(packed_sequences)
+
+
 class PackingDataConstructor:
-    """Apply user packing per planned bin and collate one rank-local batch.
+    """Apply configured packing per planned bin and collate one local batch.
 
     ``pack_fn`` never runs in a Source Loader. It receives raw samples only
     after sample-level planning and CPU redistribution have completed.
@@ -89,4 +117,4 @@ class PackingDataConstructor:
         return self._collate_fn(packed_sequences)
 
 
-__all__ = ["PackingDataConstructor"]
+__all__ = ["PackingDataConstructor", "default_collate_fn", "default_pack_fn"]

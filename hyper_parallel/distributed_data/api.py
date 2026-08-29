@@ -22,7 +22,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from hyper_parallel.distributed_data.data_constructor import PackingDataConstructor
+from hyper_parallel.distributed_data.data_constructor import (
+    PackingDataConstructor,
+    default_collate_fn,
+    default_pack_fn,
+)
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
 from hyper_parallel.distributed_data.schema import SampleMetadata
@@ -185,10 +189,15 @@ def _config_fingerprint(
         config: DistributedDatasetConfig,
         source_loader_ranks: tuple[int, ...],
         planner_rank: int,
+        *,
+        uses_default_pack: bool,
+        uses_default_collate: bool,
 ) -> str:
     stable_config = asdict(config)
     stable_config["source_loader_ranks"] = source_loader_ranks
     stable_config["planner_rank"] = planner_rank
+    stable_config["uses_default_pack"] = uses_default_pack
+    stable_config["uses_default_collate"] = uses_default_collate
     return hashlib.sha256(repr(sorted(stable_config.items())).encode("utf-8")).hexdigest()[:24]
 
 
@@ -203,8 +212,8 @@ def build_distributed_dataloader(
         config: DistributedDatasetConfig,
         *,
         metadata_fn: Callable[[Any], SampleMetadata],
-        pack_fn: Callable[[Sequence[Any], int], Any],
-        collate_fn: Callable[[Sequence[Any]], Any],
+        pack_fn: Callable[[Sequence[Any], int], Any] | None = None,
+        collate_fn: Callable[[Sequence[Any]], Any] | None = None,
 ) -> DistributedDataLoader:
     """Build a sample-balanced distributed DataLoader from a raw Dataset.
 
@@ -222,11 +231,13 @@ def build_distributed_dataloader(
         mesh: Named root HyperParallel or PyTorch DeviceMesh.
         config: Dynamic packing, service-rank, and worker configuration.
         metadata_fn: Convert one materialized raw sample to SampleMetadata.
-        pack_fn: Pack an ordered raw-sample list under ``seq_len``.
-        collate_fn: Collate ``local_batch_size`` packed sequences.
+        pack_fn: Optionally construct one model-specific packed sequence. The
+            default preserves each planned bin as a raw-sample tuple.
+        collate_fn: Optionally collate ``local_batch_size`` packed sequences.
+            The default preserves the bins as a tuple.
 
     Returns:
-        Stateful collective iterator yielding user-collated local batches.
+        Stateful collective iterator yielding constructed local batches.
 
     Note:
         This is reactive online planning: Source Loaders read payloads before
@@ -250,8 +261,16 @@ def build_distributed_dataloader(
     try:
         if not isinstance(config, DistributedDatasetConfig):
             raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
-        if not callable(metadata_fn) or not callable(pack_fn) or not callable(collate_fn):
-            raise ValueError("metadata_fn, pack_fn, and collate_fn must be callable.")
+        if not callable(metadata_fn):
+            raise ValueError("metadata_fn must be callable.")
+        if pack_fn is not None and not callable(pack_fn):
+            raise ValueError("pack_fn must be callable or None.")
+        if collate_fn is not None and not callable(collate_fn):
+            raise ValueError("collate_fn must be callable or None.")
+        uses_default_pack = pack_fn is None or pack_fn is default_pack_fn
+        uses_default_collate = collate_fn is None or collate_fn is default_collate_fn
+        effective_pack_fn = default_pack_fn if uses_default_pack else pack_fn
+        effective_collate_fn = default_collate_fn if uses_default_collate else collate_fn
         topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
         source_loader_ranks, planner_rank = _resolve_service_ranks(topology, config)
         if topology.global_rank in source_loader_ranks:
@@ -278,8 +297,14 @@ def build_distributed_dataloader(
             local_batch_size=config.local_batch_size,
             oversized_policy=config.oversized_policy,
         )
-        constructor = PackingDataConstructor(pack_fn, collate_fn, seq_len=config.seq_len)
-        config_fingerprint = _config_fingerprint(config, source_loader_ranks, planner_rank)
+        constructor = PackingDataConstructor(effective_pack_fn, effective_collate_fn, seq_len=config.seq_len)
+        config_fingerprint = _config_fingerprint(
+            config,
+            source_loader_ranks,
+            planner_rank,
+            uses_default_pack=uses_default_pack,
+            uses_default_collate=uses_default_collate,
+        )
     except Exception as exc:  # Every WORLD rank must fail before subgroup creation.
         local_error = f"{type(exc).__name__}: {exc}"
 

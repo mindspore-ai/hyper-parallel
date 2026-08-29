@@ -15,6 +15,7 @@
 """Source Loader, Planner, and Data Constructor distributed data pipeline."""
 
 from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataloader
+from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
@@ -39,4 +40,6 @@ __all__ = [
     "SampleMetadata",
     "WorkloadCost",
     "build_distributed_dataloader",
+    "default_collate_fn",
+    "default_pack_fn",
 ]

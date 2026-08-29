@@ -22,6 +22,8 @@ from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
     build_distributed_dataloader,
+    default_collate_fn,
+    default_pack_fn,
 )
 
 
@@ -80,8 +82,35 @@ def _drain(loader: DistributedDataLoader) -> tuple[list[Any], list[str]]:
 class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
     """Verify the collective orchestration in its one-rank reference mode."""
 
+    def test_default_callbacks_return_planned_bins_of_raw_samples(self) -> None:
+        """Omitted callbacks preserve raw samples while respecting Planner bin capacity."""
+        samples = [
+            {"id": 0, "tokens": 7},
+            {"id": 1, "tokens": 3},
+            {"id": 2, "tokens": 6},
+            {"id": 3, "tokens": 4},
+        ]
+
+        def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
+            """Expose the raw sample's packing footprint."""
+            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
+
+        loader = build_distributed_dataloader(
+            samples,
+            _StandaloneMesh(),
+            DistributedDatasetConfig(seq_len=10, local_batch_size=2, buffer_size_multiplier=1.0),
+            metadata_fn=metadata_fn,
+        )
+
+        batch = next(loader)
+
+        self.assertEqual(batch, ((samples[0], samples[1]), (samples[2], samples[3])))
+        self.assertIsInstance(batch, tuple)
+        self.assertTrue(all(isinstance(packing_bin, tuple) for packing_bin in batch))
+        self.assertTrue(all(sum(sample["tokens"] for sample in packing_bin) <= 10 for packing_bin in batch))
+
     def test_dynamically_packs_samples_then_collates_local_sequences(self) -> None:
-        """Planning happens per sample and construction happens per packed bin."""
+        """Explicit callbacks still run per planned bin and local batch."""
         samples = [
             {"id": 0, "tokens": 6},
             {"id": 1, "tokens": 4},
@@ -186,6 +215,39 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
             for sample_id in packed["sample_ids"]
         ]
         self.assertEqual(remaining_ids, [2, 3, 4, 5])
+
+    def test_checkpoint_fingerprint_canonicalizes_default_callback_mode(self) -> None:
+        """Explicit defaults resume default state, while custom construction is incompatible."""
+        samples = [{"id": index, "tokens": 6 if index % 2 == 0 else 4} for index in range(4)]
+        config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, buffer_size_multiplier=1.0)
+
+        def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
+            """Expose the sample token footprint for all three loaders."""
+            return SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
+
+        omitted_defaults = build_distributed_dataloader(
+            samples,
+            _StandaloneMesh(),
+            config,
+            metadata_fn=metadata_fn,
+        )
+        self.assertEqual(next(omitted_defaults), ((samples[0], samples[1]),))
+        checkpoint = omitted_defaults.state_dict()
+
+        explicit_defaults = build_distributed_dataloader(
+            samples,
+            _StandaloneMesh(),
+            config,
+            metadata_fn=metadata_fn,
+            pack_fn=default_pack_fn,
+            collate_fn=default_collate_fn,
+        )
+        explicit_defaults.load_state_dict(checkpoint)
+        self.assertEqual(next(explicit_defaults), ((samples[2], samples[3]),))
+
+        custom_callbacks = _build_standard_loader(samples, config, [])
+        with self.assertRaisesRegex(ValueError, "config_fingerprint"):
+            custom_callbacks.load_state_dict(checkpoint)
 
     def test_eof_drops_a_tail_that_cannot_fill_every_local_bin(self) -> None:
         """The default drop-last contract stops before invoking constructor callbacks."""
