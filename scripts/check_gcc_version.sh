@@ -37,6 +37,6 @@ check_gcc_version() {
     if [ "${num}" -gt 110300 ]; then
         echo "WARNING: GCC version ${ver} > 11.3.0. May cause unknown problems." >&2
     fi
-    echo "INFO: GCC ${ver} accepted (target range [7.3.0, 11.3.0])."
+    echo "INFO: GCC ${ver} accepted (recommended range [7.3.0, 11.3.0])."
     return 0
 }

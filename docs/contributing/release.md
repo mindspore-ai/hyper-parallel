@@ -72,7 +72,7 @@ source /usr/local/Ascend/cann/set_env.sh
 
 optional native 组件失败时仍保留 wheel，并在 build log 中记录稳定 reason code。native 能力缺失由
 Level 0 MegaMoe ST 和全量用例拦截。正式发布由版本指定的 glibc 基线构建、全量用例和人工评审共同决定，
-wheel 文件已生成不代表制品满足发布条件。native 制品的构建与运行基线为 CANN 9.1.0。
+wheel 文件已生成不代表制品满足发布条件。native 制品要求 CANN >= 9.1.0。
 
 ### 6. 发布后验证
 
@@ -92,7 +92,7 @@ pytest tests/mindspore/st/multicore/test_moe.py
 - [ ] 交叉引用链接正确、术语一致
 - [ ] wheel/PYTHONPATH 均先 source 制品内 `set_env.bash`，四种框架 import 顺序和 clean-venv smoke 通过
 - [ ] 未 source 时稳定报 `HP-NATIVE-OPP-NOT-ACTIVATED`，框架已先导入时稳定报 `HP-NATIVE-OPP-ACTIVATION-TOO-LATE`
-- [ ] 目标 glibc 基线门禁验证通过；910B/910C 支持矩阵验证通过，不支持的 SoC 返回明确 reason code
+- [ ] 目标 glibc 基线检查通过；910B/910C native 构建与用例通过，不支持的 SoC 返回明确 reason code
 
 ## 版本历史
 

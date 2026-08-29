@@ -181,7 +181,7 @@ _CMP = CompareSpec.allclose(rtol=1e-2, atol=1e-2)
 def _reg(name, fn, inputs, placements, derived, mesh, names):
     register(OpShardCase(name=name, fn=fn, inputs=inputs, placements=placements,
                          derived_inputs=derived, compare=_CMP, mesh_shape=mesh,
-                         mesh_dim_names=names, tags=("npu_level1",)))
+                         mesh_dim_names=names, tags=("npu_level0",)))
 
 
 # sm_max/sm_sum and the indexer stats share the same placement per config

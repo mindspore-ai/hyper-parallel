@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.18)
 project(hyper_parallel_shmem_wrapper LANGUAGES NONE)
 
 if(NOT DEFINED HP_SHMEM_SOURCE_DIR OR NOT EXISTS "${HP_SHMEM_SOURCE_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR "HP_SHMEM_SOURCE_DIR must identify the verified SHMEM source tree")
+    message(FATAL_ERROR "HP_SHMEM_SOURCE_DIR must identify the prepared SHMEM source tree")
 endif()
 
 # Keep the upstream source tree immutable. This wrapper owns packaging-only
@@ -40,7 +40,7 @@ foreach(target_name
             BUILD_WITH_INSTALL_RPATH TRUE
             BUILD_RPATH "$ORIGIN"
             INSTALL_RPATH "$ORIGIN")
-        # SHMEM v1.6.0 sets CMAKE_SKIP_RPATH in its child directory. LINK_FLAGS
+        # The upstream SHMEM source sets CMAKE_SKIP_RPATH in its child directory. LINK_FLAGS
         # is used here so the packaging policy remains outside upstream and the
         # Makefile receives one literal $ORIGIN rather than $$ORIGIN.
         set_property(TARGET ${target_name} APPEND_STRING PROPERTY LINK_FLAGS

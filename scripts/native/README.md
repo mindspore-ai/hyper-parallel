@@ -4,13 +4,15 @@
 selected optional components, assembles `build/native/payload/hyper_parallel`, and always creates a wheel in `dist/`.
 The payload can also be used directly through `PYTHONPATH`; wheel packaging uses the same payload.
 
-The host must already provide CANN 9.1.0, GCC/G++, CMake, GNU Make, Git and Python 3.10--3.12. When
-`ASCEND_HOME_PATH` is unset,
+The host must provide Python 3.10--3.12 with development headers, setuptools, wheel and pybind11; GCC/G++ with C++17;
+CMake, GNU Make, Git, binutils, coreutils, tar, sed and awk; and a complete CANN >= 9.1.0 toolkit/ops development
+environment. The CANN environment must expose bisheng, asc_opc, headers, libopapi.so and ops_base. The indexed Dataset
+C++ helper is a required wheel artifact and is compiled on every `build.sh` invocation. Supported build hosts are
+aarch64 and x86_64; each wheel targets one host architecture and one CPython ABI. When `ASCEND_HOME_PATH` is unset,
 the unified entry sources `/usr/local/Ascend/cann/set_env.sh` if that default installation exists. A custom CANN
 installation must be sourced by the caller. MindSpore targets additionally require MindSpore >= 2.10 and Ninja. Torch
 targets use the compatible Torch/torch_npu pair already selected by the
-repository extras or external build environment and require Torch's `_GLIBCXX_USE_CXX11_ABI=1`. Python wheel
-construction requires setuptools and wheel.
+repository extras or external build environment and require Torch's `_GLIBCXX_USE_CXX11_ABI=1`.
 
 ```bash
 # Source this explicitly for a custom installation. build.sh automatically
@@ -46,11 +48,11 @@ default: an optional component failure emits a stable reason code and warning, t
 Multicore has a one-way dependency on the SHMEM base capability. Selecting multicore automatically enables the
 matching symmetric-memory framework target. `--soc-list` controls multicore kernel fan-out and SHMEM hardware gating;
 supported targets are `ascend910b` (910B) and `ascend910_93` (910C). Selecting `ascend950` reports
-`SOC_SOURCE_NOT_SUPPORTED` as an optional component failure. ops-nn is built once per selected SoC. A deterministic
-priority (`ascend910_93`/910C before `ascend910b`/910B) selects the single common host
-payload regardless of the requested SoC order; other vendor builds contribute only their kernel/config trees. The
-merge requires a matching common-host input identity (locked sources, patches, CANN, compilers, linker, CMake/Make,
-and build scripts) and matching host ABI before discarding the other host binaries.
+`SOC_SOURCE_NOT_SUPPORTED` as an optional component failure. The assembled HyperParallel vendor kernel package is
+built once per selected SoC and the kernel/config trees are combined into one package. The merge requires consistent
+vendor build inputs and host ABI, and the package carries one common host payload.
+Each SoC payload contains compiled objects under `tbe/kernel/<soc>`, runtime binary indexes under
+`tbe/kernel/config/<soc>`, and the CANN operator registry under `tbe/config/<soc>`.
 
 Using multicore always requires sourcing its packaged custom-OPP environment before starting the application or
 framework Python process. For an installed wheel, source the shell locator in the active environment's `bin` directory:
@@ -83,8 +85,7 @@ Build and packaging behavior is verified by the unified/component build logs and
 the wheel/ST validation flow. Runtime payload lookup and loader behavior is
 covered by the standard repository tests under `tests/ut/native`.
 
-Pinned third-party identities and supported framework/CANN baselines are declared in
-`scripts/native/config/dependencies.lock.json`. The `ops-nn.patch` and `ops-transformer.patch` files are HyperParallel
-business adapters for composing the locked CANN 9.1 source inputs into `HyperMegaMoe` and `HyperMegaMoeGrad`. Their
-hashes are checked and they are applied only to an isolated build copy. A
-dependency update requires adapter rebase plus the native test matrix.
+Native source dependency revisions, hashes, and supported environment versions are declared in
+`scripts/native/config/dependencies.lock.json`. The assembler extracts the required SwiGLU/Grad and GroupedMatmul
+implementations and applies `swi_glu_fusion.patch` and `grouped_matmul_fusion.patch` in an isolated build tree. A
+dependency update must update the lock metadata, adapter hashes, and source-assembly checks together.

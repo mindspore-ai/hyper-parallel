@@ -10,6 +10,12 @@
 # -----------------------------------------------------------------------------------------------------------
 # Shared SHMEM SDK preparation for symmetric memory and multicore component builds.
 
+_HP_NATIVE_SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+if ! declare -F hp_cann_version_at_least >/dev/null; then
+    source "${_HP_NATIVE_SCRIPT_DIR}/cann_version.sh"
+fi
+unset _HP_NATIVE_SCRIPT_DIR
+
 function hp_prepare_shmem_sdk() {
     local project_root=$1
     local soc_list=$2
@@ -17,7 +23,7 @@ function hp_prepare_shmem_sdk() {
     local clean_sdk=${4:-off}
     local native_root="${project_root}/build/native"
     local locked_source_dir="${native_root}/deps/shmem/src"
-    local wrapper="${project_root}/scripts/native/cmake/shmem_wrapper"
+    local wrapper="${project_root}/hyper_parallel/core/symmetric_memory/cmake/shmem_wrapper"
     local requested_soc
     local -a requested_socs=()
 
@@ -27,12 +33,13 @@ function hp_prepare_shmem_sdk() {
         echo "       Source the required CANN set_env.sh before invoking the native build." >&2
         return 3
     fi
-    local cann_version_file="${ASCEND_HOME_PATH}/opp/version.info"
     local cann_version
-    cann_version=$(awk -F= '$1 == "Version" {print $2}' "${cann_version_file}" 2>/dev/null || true)
-    if [[ "${cann_version}" != "9.1.0" ]]; then
+    local cann_version_file="${ASCEND_HOME_PATH}/opp/version.info"
+    cann_version=$(hp_read_cann_version "${ASCEND_HOME_PATH}")
+    if ! hp_cann_version_at_least "${cann_version}"; then
         echo "HP_NATIVE_REASON_CODE=UNSUPPORTED_CANN_VERSION"
-        echo "ERROR: CANN 9.1.0 is required, found '${cann_version:-unknown}' under ${ASCEND_HOME_PATH}." >&2
+        echo "ERROR: CANN >= ${HP_MINIMUM_CANN_VERSION} is required, found " \
+            "'${cann_version:-unknown}' under ${ASCEND_HOME_PATH}." >&2
         return 3
     fi
     for required_tool in awk bisheng cmake gcc g++ git make python3 readlink sha256sum tar; do
@@ -75,7 +82,7 @@ function hp_prepare_shmem_sdk() {
             "${gxx_path}" --version 2>&1 || true
             sha256sum "${cann_version_file}" \
                 "${project_root}/scripts/native/config/dependencies.lock.json" \
-                "${project_root}/scripts/native/cmake/shmem_wrapper/CMakeLists.txt" \
+                "${project_root}/hyper_parallel/core/symmetric_memory/cmake/shmem_wrapper/CMakeLists.txt" \
                 "${project_root}/scripts/native/shmem_sdk.sh"
         } | sha256sum | awk '{print substr($1, 1, 16)}'
     )
@@ -97,7 +104,7 @@ function hp_prepare_shmem_sdk() {
                 ;;
             ascend950)
                 echo "HP_NATIVE_REASON_CODE=SOC_SOURCE_NOT_SUPPORTED"
-                echo "ERROR: SHMEM v1.6.0 does not support ascend950 in this build." >&2
+                echo "ERROR: The locked SHMEM source does not support ascend950 in this build." >&2
                 return 7
                 ;;
             *)
