@@ -870,11 +870,8 @@ def _maybe_upcast_trainable_params(accelerator, model: nn.Module) -> None:
         if isinstance(module, HSDPModule):
             state = module.hsdp_scheduler.hsdp_state  # pylint: disable=protected-access
             for hsdp_param in state.hsdp_params:
-                if hsdp_param.is_sharded:
-                    hsdp_param.reset_sharded_param()
-            param_group = getattr(state, "param_group", None)
-            if param_group is not None:
-                param_group._init_mp_dtypes()  # pylint: disable=protected-access
+                hsdp_param.reset_sharded_param()
+            state._init_mp_dtypes()  # pylint: disable=protected-access
 
     if accelerator.is_main_process:
         warnings.warn(

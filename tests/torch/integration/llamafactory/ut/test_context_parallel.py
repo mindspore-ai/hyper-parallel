@@ -46,6 +46,35 @@ _enable_qwen3vl_moe_attention_patch = qwen3vl_cp_mod._enable_qwen3vl_moe_attenti
 # ---- Context Parallel tests ----
 
 
+@pytest.mark.parametrize("embeds_arg", ["input_embeds", "inputs_embeds"])
+def test_qwen3vl_global_attention_mask_supports_transformers_embed_argument(monkeypatch, embeds_arg):
+    """Qwen3VL CP should support both historical causal-mask embedding argument names."""
+    recorded = {}
+
+    def old_mask(config, input_embeds, attention_mask, cache_position, past_key_values, position_ids):
+        del config, past_key_values, position_ids
+        recorded.update(embed=input_embeds, cache_position=cache_position)
+        return attention_mask
+
+    def new_mask(config, inputs_embeds, attention_mask, cache_position, past_key_values, position_ids):
+        del config, past_key_values, position_ids
+        recorded.update(embed=inputs_embeds, cache_position=cache_position)
+        return attention_mask
+
+    monkeypatch.setattr(qwen3vl_cp_mod, "create_causal_mask", new_mask if embeds_arg.endswith("s") else old_mask)
+    model = types.SimpleNamespace(language_model=types.SimpleNamespace(config=object()))
+    embeds = torch.randn(1, 4, 8)
+    attention_mask = torch.ones(1, 4, dtype=torch.bool)
+
+    result = qwen3vl_cp_mod._build_qwen3vl_global_attention_mask(
+        model, attention_mask, torch.arange(4).view(1, 4), embeds, cache_position=None, past_key_values=None
+    )
+
+    assert result is attention_mask
+    assert recorded["embed"] is embeds
+    assert torch.equal(recorded["cache_position"], torch.arange(4))
+
+
 def test_hp_args_cp_size_defaults_to_one():
     """
     Feature: Context parallel config default
@@ -251,12 +280,14 @@ def test_shard_inputs_for_cp_preserves_multimodal_metadata():
     """
     pixel_values = torch.randn(3, 4, 8)
     image_grid_thw = torch.tensor([[1, 2, 2], [1, 1, 4]], dtype=torch.long)
+    mm_token_type_ids = torch.tensor([[0, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.int32)
     inputs = {
         "input_ids": torch.arange(8, dtype=torch.long).reshape(1, 8),
         "position_ids": torch.arange(8, dtype=torch.long).reshape(1, 8),
         "labels": torch.arange(8, dtype=torch.long).reshape(1, 8),
         "pixel_values": pixel_values,
         "image_grid_thw": image_grid_thw,
+        "mm_token_type_ids": mm_token_type_ids,
     }
 
     result = shard_inputs_for_cp(inputs, cp_rank=1, cp_size=2)
@@ -265,6 +296,7 @@ def test_shard_inputs_for_cp_preserves_multimodal_metadata():
     assert torch.equal(result["labels"], inputs["labels"])
     assert result["pixel_values"] is pixel_values
     assert result["image_grid_thw"] is image_grid_thw
+    assert result["mm_token_type_ids"] is mm_token_type_ids
     assert result["_hp_cp_global_input_ids"] is inputs["input_ids"]
     assert result["_hp_cp_global_position_ids"] is inputs["position_ids"]
     assert result["_hp_cp_local_seq_start"] == 4
@@ -619,6 +651,51 @@ class _FakeQwen3VLMoeModel(torch.nn.Module):
 _FakeQwen3VLMoeModel.__name__ = "Qwen3VLMoeModel"
 _FakeQwen3VLMoeModel.forward.__globals__["Qwen3VLMoeModelOutputWithPast"] = _FakeQwen3VLMoeModelOutputWithPast
 _FakeQwen3VLMoeModel.forward.__globals__["is_torchdynamo_compiling"] = lambda: False
+
+
+def test_qwen3vl_rope_index_supports_old_and_new_signatures():
+    """Qwen3VL CP should pass the arguments required by both mRoPE APIs."""
+    recorded = []
+
+    class _OldRopeModel:
+        def get_rope_index(self, input_ids, image_grid_thw, video_grid_thw, attention_mask=None):
+            recorded.append((input_ids, None, image_grid_thw, video_grid_thw, attention_mask))
+            return "positions", "deltas"
+
+    class _NewRopeModel:
+        def get_rope_index(self, input_ids, mm_token_type_ids, **kwargs):
+            recorded.append((input_ids, mm_token_type_ids, *kwargs.values()))
+            return "positions", "deltas"
+
+    input_ids = torch.ones(1, 4, dtype=torch.long)
+    token_types = torch.ones_like(input_ids, dtype=torch.int32)
+    for model, types_arg in ((_OldRopeModel(), None), (_NewRopeModel(), token_types)):
+        assert qwen3vl_cp_mod._get_qwen3vl_rope_index(
+            model, input_ids, types_arg, "image-grid", "video-grid", "mask"
+        ) == ("positions", "deltas")
+    assert recorded == [
+        (input_ids, None, "image-grid", "video-grid", "mask"),
+        (input_ids, token_types, "image-grid", "video-grid", "mask"),
+    ]
+
+
+def test_qwen3vl_visual_feature_api_compatibility():
+    """Qwen3VL CP should normalize the old tuple and new model-output APIs."""
+    recorded = []
+
+    def old_features(pixel_values, grid_thw=None):
+        recorded.append((pixel_values, grid_thw, {}))
+        return outputs
+
+    def new_features(pixel_values, grid_thw=None, **kwargs):
+        recorded.append((pixel_values, grid_thw, kwargs))
+        return types.SimpleNamespace(pooler_output=outputs[0], deepstack_features=outputs[1])
+
+    pixels = torch.ones(2, 4)
+    outputs = ([pixels], [pixels + 1])
+    assert qwen3vl_cp_mod._get_qwen3vl_visual_features(old_features, pixels, "grid") == outputs
+    assert qwen3vl_cp_mod._get_qwen3vl_visual_features(new_features, pixels, "grid") == outputs
+    assert recorded == [(pixels, "grid", {}), (pixels, "grid", {"return_dict": True})]
 
 
 def test_apply_qwen3vl_moe_attention_patch_wraps_text_attention(monkeypatch):

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Qwen3VL MoE multimodal context-parallel runtime patching."""
+import inspect
 import sys
 
 import torch
@@ -22,8 +23,8 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextAttention as _Qwen3VLMoeTextAttention,
     create_causal_mask,
-    is_torchdynamo_compiling,
 )
+from transformers.utils import is_torchdynamo_compiling
 
 from hyper_parallel import ContextParallel, parallelize_module
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -199,14 +200,17 @@ def _build_qwen3vl_global_attention_mask(
             device=global_inputs_embeds.device,
         )
 
-    return create_causal_mask(
-        config=model.language_model.config,
-        input_embeds=global_inputs_embeds,
-        attention_mask=attention_mask,
-        cache_position=global_cache_position,
-        past_key_values=past_key_values,
-        position_ids=text_position_ids,
-    )
+    mask_kwargs = {
+        "config": model.language_model.config,
+        "attention_mask": attention_mask,
+        "cache_position": global_cache_position,
+        "past_key_values": past_key_values,
+        "position_ids": text_position_ids,
+    }
+    parameters = inspect.signature(create_causal_mask).parameters
+    embeds_arg = "inputs_embeds" if "inputs_embeds" in parameters else "input_embeds"
+    mask_kwargs[embeds_arg] = global_inputs_embeds
+    return create_causal_mask(**mask_kwargs)
 
 
 def _select_local_visual_feature_stream(
@@ -251,6 +255,42 @@ def _slice_global_position_ids_for_local_cp(position_ids: torch.Tensor | None, s
     return position_ids[..., seq_start:seq_end].contiguous()
 
 
+def _get_qwen3vl_rope_index(
+    model,
+    input_ids,
+    mm_token_type_ids,
+    image_grid_thw,
+    video_grid_thw,
+    attention_mask,
+):
+    """Call the Qwen3VL mRoPE helper across Transformers signature versions."""
+    parameters = inspect.signature(model.get_rope_index).parameters
+    if "mm_token_type_ids" in parameters:
+        return model.get_rope_index(
+            input_ids,
+            mm_token_type_ids=mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+        )
+    return model.get_rope_index(
+        input_ids,
+        image_grid_thw,
+        video_grid_thw,
+        attention_mask=attention_mask,
+    )
+
+
+def _get_qwen3vl_visual_features(feature_method, pixel_values, grid_thw):
+    """Call and normalize a Qwen3VL visual feature method across Transformers versions."""
+    parameters = inspect.signature(feature_method).parameters
+    supports_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if "return_dict" in parameters or supports_kwargs:
+        outputs = feature_method(pixel_values, grid_thw, return_dict=True)
+        return outputs.pooler_output, outputs.deepstack_features
+    return feature_method(pixel_values, grid_thw)
+
+
 class Qwen3VLMoeModelForCP(_Qwen3VLMoeModel):
     """Qwen3VL MoE model with CP-aware multimodal feature alignment."""
 
@@ -265,6 +305,7 @@ class Qwen3VLMoeModelForCP(_Qwen3VLMoeModel):
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         **kwargs,
     ):
@@ -285,6 +326,7 @@ class Qwen3VLMoeModelForCP(_Qwen3VLMoeModel):
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
                 cache_position=cache_position,
                 **kwargs,
             )
@@ -313,11 +355,13 @@ class Qwen3VLMoeModelForCP(_Qwen3VLMoeModel):
             )
             rope_deltas = getattr(self, "rope_deltas", None)
             if (prefill_compiled_stage or prefill_noncompiled_stage) or rope_deltas is None:
-                position_ids, rope_deltas = self.get_rope_index(
+                position_ids, rope_deltas = _get_qwen3vl_rope_index(
+                    self,
                     global_input_ids,
+                    mm_token_type_ids,
                     image_grid_thw,
                     video_grid_thw,
-                    attention_mask=attention_mask_tensor,
+                    attention_mask_tensor,
                 )
                 self.rope_deltas = rope_deltas
             else:
@@ -349,7 +393,9 @@ class Qwen3VLMoeModelForCP(_Qwen3VLMoeModel):
         # Keep raw visual inputs global, then select only the dense visual
         # embeddings whose placeholders fall inside this rank's local text shard.
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds, deepstack_image_embeds = _get_qwen3vl_visual_features(
+                self.get_image_features, pixel_values, image_grid_thw
+            )
             image_embeds, deepstack_image_embeds = _select_local_visual_feature_stream(
                 dense_embeds=image_embeds,
                 deepstack_embeds=deepstack_image_embeds,
@@ -368,7 +414,11 @@ class Qwen3VLMoeModelForCP(_Qwen3VLMoeModel):
 
         # Video features follow the same mask-aware local selection as images.
         if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds, deepstack_video_embeds = _get_qwen3vl_visual_features(
+                self.get_video_features,
+                pixel_values_videos,
+                video_grid_thw,
+            )
             video_embeds, deepstack_video_embeds = _select_local_visual_feature_stream(
                 dense_embeds=video_embeds,
                 deepstack_embeds=deepstack_video_embeds,
