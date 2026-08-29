@@ -38,6 +38,27 @@ _HP_TO_INTERNAL: Dict[str, str] = {
     "seq_length": "max_position_embeddings",
 }
 
+_HF_MODEL_FIELDS = (
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "vocab_size",
+    "intermediate_size",
+    "num_key_value_heads",
+    "max_position_embeddings",
+    "num_experts",
+    "num_experts_per_tok",
+    "num_shared_experts",
+    "moe_intermediate_size",
+    "first_k_dense_replace",
+    "mtp_depth",
+    "multiple_of",
+    "ffn_dim_multiplier",
+    "kv_lora_rank",
+    "q_lora_rank",
+    "qk_rope_head_dim",
+)
+
 
 def _normalize_model_spec(model_spec: Dict[str, Any]) -> Dict[str, Any]:
     """Rename non-standard config overrides keys to canonical names.
@@ -81,6 +102,77 @@ def _get_dict(raw: Dict[str, Any], key: str) -> Dict[str, Any]:
     """Return the value of a key if it is a dict, otherwise an empty dict."""
     val = raw.get(key, {})
     return val if isinstance(val, dict) else {}
+
+
+def _first_attr(config: Any, names: Tuple[str, ...], default: Any = None) -> Any:
+    """Return the first populated attribute from a Transformers config."""
+    for name in names:
+        value = getattr(config, name, None)
+        if value is not None:
+            return value
+    return default
+
+
+def _load_auto_models_model_spec(model_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve model dimensions through the AutoModels Transformers path."""
+    model_path = model_raw.get("pretrained_model_name_or_path")
+    explicit = model_raw.get("config_overrides", {})
+    explicit = dict(explicit) if isinstance(explicit, dict) else {}
+    if not model_path:
+        if explicit:
+            explicit.setdefault("name", model_raw.get("name", "custom"))
+            return _normalize_model_spec(explicit)
+        raise ValueError(
+            "AutoModels train.yaml requires model.pretrained_model_name_or_path "
+            "or model.config_overrides for Auto Parallel search"
+        )
+
+    # Transformers is optional for non-Hyper backends, so import it only when
+    # an AutoModels train.yaml needs its model metadata.
+    from hyper_parallel.auto_models._transformers.registry import get_hf_config  # pylint: disable=C0415
+
+    config_kwargs = {
+        name: model_raw[name]
+        for name in (
+            "cache_dir", "local_files_only", "revision", "subfolder",
+            "token", "trust_remote_code",
+        )
+        if model_raw.get(name) is not None
+    }
+    model_config = get_hf_config(
+        str(model_path),
+        str(model_raw.get("attn_implementation", "sdpa")),
+        model_raw.get("torch_dtype", "auto"),
+        **config_kwargs,
+    )
+    model_spec = {
+        name: getattr(model_config, name)
+        for name in _HF_MODEL_FIELDS
+        if getattr(model_config, name, None) is not None
+    }
+    model_spec["name"] = str(
+        getattr(model_config, "model_type", None) or model_path
+    )
+    model_spec["num_experts"] = int(_first_attr(
+        model_config, ("num_experts", "n_routed_experts"), 1,
+    ))
+    model_spec["num_shared_experts"] = int(_first_attr(
+        model_config, ("num_shared_experts", "n_shared_experts"), 0,
+    ))
+    moe_intermediate_size = int(model_spec.get("moe_intermediate_size", 0) or 0)
+    shared_intermediate_size = int(
+        getattr(model_config, "shared_expert_intermediate_size", 0) or 0
+    )
+    if (
+        not model_spec["num_shared_experts"]
+        and moe_intermediate_size
+        and shared_intermediate_size
+    ):
+        model_spec["num_shared_experts"] = max(
+            1, shared_intermediate_size // moe_intermediate_size,
+        )
+    model_spec.update(explicit)
+    return _normalize_model_spec(model_spec)
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -302,17 +394,95 @@ _ACCEL_TO_SEARCH = {
     "expert_tensor_parallel_degree": "expert_tensor_parallel_degree",
 }
 
+_AUTO_MODELS_ACCEL_TO_SEARCH = {
+    "tp_size": "tensor_parallel_degree",
+    "pp_size": "pipeline_parallel_degree",
+    "cp_size": "context_parallel_degree",
+    "ep_size": "expert_parallel_degree",
+}
+
+
+def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
+    """Construct a normalized config from the current AutoModels schema."""
+    model_raw = _get_dict(raw, "model")
+    training_raw = _get_dict(raw, "training")
+    accelerator_raw = _get_dict(raw, "accelerator")
+    fsdp_raw = _get_dict(raw, "fsdp_config")
+    activation_raw = _get_dict(raw, "activation_checkpoint")
+    dataset_raw = _get_dict(raw, "dataset")
+    data_transform_raw = _get_dict(dataset_raw, "data_transform")
+
+    model_spec = _load_auto_models_model_spec(model_raw)
+    model_spec["max_position_embeddings"] = data_transform_raw.get(
+        "max_seq_len", model_spec.get("max_position_embeddings", 4096),
+    )
+    model_spec["local_batch_size"] = training_raw.get("micro_batch_size", 1)
+    model_spec["compute_dtype"] = model_raw.get("torch_dtype", "bfloat16")
+
+    search_space: Dict[str, List[int]] = {}
+    dp_shard_size = fsdp_raw.get("dp_shard_size")
+    if dp_shard_size is not None:
+        search_space["data_parallel_shard_degree"] = [int(dp_shard_size)]
+    for field_name, search_name in _AUTO_MODELS_ACCEL_TO_SEARCH.items():
+        value = accelerator_raw.get(field_name)
+        if value is not None:
+            search_space[search_name] = [int(value)]
+
+    global_batch_size = int(training_raw.get("global_batch_size", 0) or 0)
+    local_batch_size = int(model_spec["local_batch_size"] or 1)
+    data_parallel_size = int(dp_shard_size or 1)
+    micro_batch_num = (
+        global_batch_size // (local_batch_size * data_parallel_size)
+        if global_batch_size
+        and global_batch_size % (local_batch_size * data_parallel_size) == 0
+        else 1
+    )
+    pp_degree = max(1, int(accelerator_raw.get("pp_size", 1) or 1))
+
+    mode = str(activation_raw.get("mode", "off"))
+    recompute_map = {
+        "off": "none",
+        "none": "none",
+        "full": "full",
+        "selective": "selective",
+    }
+    return NormalizedConfig(
+        model_spec=model_spec,
+        cluster_spec={},
+        search_space=search_space,
+        constraint={
+            "global_batch_size": global_batch_size,
+            "memory_limit_gb": 0.0,
+        },
+        estimator={
+            "type": "symbolic",
+            "recompute_strategy": recompute_map.get(mode, "none"),
+        },
+        pp_config={
+            "pp_degree": pp_degree,
+            "stage_partition_mode": "uniform",
+            "micro_batch_num": max(1, micro_batch_num),
+        },
+    )
+
 
 def _build_config_from_hp_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
     """Construct a NormalizedConfig from a parsed HyperParallel YAML dict.
 
-    Extracts model identifiers from ``model.name`` / ``model.config_overrides``,
+    Extracts current AutoModels fields when root-level ``training`` and
+    ``accelerator`` sections are present. The legacy ``model.name`` /
+    ``model.config_overrides`` schema remains supported for compatibility.
+
+    Legacy parsing extracts model identifiers from ``model.config_overrides``,
     parallelism from ``train.accelerator.*``, batch settings from ``train.*``,
     sequence length from ``data.max_seq_len``, and recompute mode from
     ``train.gradient_checkpointing.activation_checkpoint``.
 
     Model hyperparameters are extracted from ``model.config_overrides``.
     """
+    if "training" in raw or "accelerator" in raw or "fsdp_config" in raw:
+        return _build_config_from_auto_models_yaml(raw)
+
     model_raw = _get_dict(raw, "model")
     train_raw = _get_dict(raw, "train")
     data_raw = _get_dict(raw, "data")
@@ -383,9 +553,12 @@ def _build_config_from_hp_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
 def read_hp_yaml_config(path: str) -> NormalizedConfig:
     """Read a HyperParallel YAML configuration file.
 
-    This is a convenience reader for the native HyperParallel ``train.yaml``
-    format.  It extracts parallelism from ``train.accelerator`` and model
-    fields from ``model.config_overrides``.
+    For the current AutoModels Trainer schema, model dimensions are resolved
+    from ``model.pretrained_model_name_or_path`` through the shared
+    Transformers config path. Parallelism is read from root-level
+    ``accelerator`` / ``fsdp_config`` sections. The legacy
+    ``model.config_overrides`` / ``train.accelerator`` schema remains
+    supported for standalone cost-model configurations.
 
     .. note::
         Cluster configuration is **not** present in ``train.yaml``.

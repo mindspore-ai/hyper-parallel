@@ -72,6 +72,21 @@ _YAML_KEY_MAP: Dict[str, str] = {
     "etp": "expert_tensor_parallel_degree",
 }
 
+_AUTO_MODELS_YAML_KEY_MAP: Dict[str, str] = {
+    "tensor_parallel_degree": "tp_size",
+    "tp_degree": "tp_size",
+    "tp": "tp_size",
+    "pipeline_parallel_degree": "pp_size",
+    "pp_degree": "pp_size",
+    "pp": "pp_size",
+    "context_parallel_degree": "cp_size",
+    "cp_degree": "cp_size",
+    "cp": "cp_size",
+    "expert_parallel_degree": "ep_size",
+    "ep_degree": "ep_size",
+    "ep": "ep_size",
+}
+
 
 def _validate_strategy_and_yaml(
     config: NormalizedConfig,
@@ -90,22 +105,50 @@ def _validate_strategy_and_yaml(
 
 
 def _load_yaml_to_inject(original_yaml_path: str) -> Dict[str, Any]:
-    """Load and validate the original YAML, ensuring train/accelerator exist."""
+    """Load the original YAML and initialize its strategy sections."""
     with open(original_yaml_path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     if data is None or not isinstance(data, dict):
         raise ValueError(
             f"Original YAML {original_yaml_path} must contain a top-level mapping."
         )
-    if "train" not in data or not isinstance(data["train"], dict):
-        data["train"] = {}
-    if "accelerator" not in data["train"] or not isinstance(data["train"]["accelerator"], dict):
-        data["train"]["accelerator"] = {}
+    if "training" in data or "accelerator" in data or "fsdp_config" in data:
+        if not isinstance(data.get("training"), dict):
+            data["training"] = {}
+        if not isinstance(data.get("accelerator"), dict):
+            data["accelerator"] = {}
+        if not isinstance(data.get("fsdp_config"), dict):
+            data["fsdp_config"] = {}
+    else:
+        if "train" not in data or not isinstance(data["train"], dict):
+            data["train"] = {}
+        if "accelerator" not in data["train"] or not isinstance(data["train"]["accelerator"], dict):
+            data["train"]["accelerator"] = {}
     return data
 
 
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
     """Inject resolved strategy values into the YAML data dict."""
+    if "training" in data or "fsdp_config" in data:
+        accelerator = data["accelerator"]
+        for src_key, dst_key in _AUTO_MODELS_YAML_KEY_MAP.items():
+            if src_key in resolved:
+                accelerator[dst_key] = int(resolved[src_key])
+
+        dp_shard_size = resolved.get("dp_shard")
+        if dp_shard_size is None:
+            dp_shard_size = resolved.get(
+                "data_parallel_shard_degree",
+                resolved.get("dp"),
+            )
+        if dp_shard_size is not None:
+            data["fsdp_config"]["dp_shard_size"] = int(dp_shard_size)
+        if "global_batch_size" in resolved:
+            data["training"]["global_batch_size"] = int(
+                resolved["global_batch_size"]
+            )
+        return
+
     train = data["train"]
     accel = train["accelerator"]
 

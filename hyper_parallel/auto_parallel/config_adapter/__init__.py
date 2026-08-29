@@ -12,7 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Auto parallel strategy configuration interfaces"""
+"""Auto parallel strategy search configuration interfaces.
+
+Provides a pipeline for reading, validating, searching, and writing
+parallel strategy search configurations::
+
+    from hyper_parallel.auto_parallel.config_adapter import (
+        read_search_config, validate_strict, search_strategies,
+    )
+
+    config = read_search_config("search.yaml")
+    validate_strict(config)
+    result = search_strategies(config)
+
+    config.resolved_strategy = result
+    write_strategy_config(config, "output/strategy.json")
+"""
 
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import (  # noqa: E402, F401
     NormalizedConfig,
@@ -22,6 +37,9 @@ from hyper_parallel.auto_parallel.config_adapter._normalized_config import (  # 
 from hyper_parallel.auto_parallel.config_adapter._config_loader import (  # noqa: E402
     read_hp_yaml_config,
     read_search_config,
+)
+from hyper_parallel.auto_parallel.config_adapter._search_runner import (  # noqa: E402
+    search_strategies,
 )
 from hyper_parallel.auto_parallel.config_adapter._constraint_checker import (  # noqa: E402
     validate,
@@ -42,6 +60,7 @@ __all__ = [
     "normalized_to_summary",
     "read_hp_yaml_config",
     "read_search_config",
+    "search_strategies",
     "validate",
     "validate_strict",
     "write_ppb_config",
