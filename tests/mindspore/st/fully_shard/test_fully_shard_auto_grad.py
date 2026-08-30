@@ -43,3 +43,22 @@ def test_fully_shard_autograd_01():
         MindSporeCase(_TEST_FILE, "test_input_requires_grad_fully_shard_grad_parity",
                       worker_num=4, local_worker_num=4),
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_fully_shard_size_one_autograd():
+    """
+    Feature: size-one fully_shard autograd with an unused forward output.
+    Description: Run the MindSpore port of PyTorch's ``test_unused_forward_output``
+        on a one-rank FSDP mesh for ten optimizer iterations.
+    Expectation: Losses, gradients, and parameters match standalone while the
+        communication storage and logical parameters retain their leaf invariants.
+    """
+    parallel_run([
+        MindSporeCase(
+            _TEST_FILE,
+            "test_single_rank_unused_forward_output_autograd",
+            worker_num=1,
+            local_worker_num=1,
+        ),
+    ], global_num_proc=1)
