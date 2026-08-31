@@ -135,15 +135,6 @@ def _build_configured_optimizer(
     return optimizer
 
 
-def get_hyper_lr_scheduler(*args: Any, **kwargs: Any) -> Any:
-    """Create the HyperParallel LR scheduler."""
-    # pylint: disable=import-outside-toplevel
-    from hyper_parallel.core.optimizer.lr_scheduler import (
-        get_hyper_lr_scheduler as _get_hyper_lr_scheduler,
-    )
-    return _get_hyper_lr_scheduler(*args, **kwargs)
-
-
 def get_hyper_optimizer(
         model: Any,
         muon_params: List[Dict[str, Any]],
@@ -234,6 +225,5 @@ __all__ = [
     'SwapOptimizer',
     'SwapOptimizerConfig',
     'get_hyper_optimizer',
-    'get_hyper_lr_scheduler',
     'swap_optimizer',
 ]

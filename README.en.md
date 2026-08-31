@@ -164,7 +164,7 @@ performance.
     - [x] AdamW
     - [x] Muon (momentum-based optimizer)
     - [x] ChainedOptimizer (Muon+AdamW chained combination)
-    - [x] get_hyper_optimizer / get_hyper_lr_scheduler
+    - [x] get_hyper_optimizer
     - [x] Sharded Optimizer (FSDP/HSDP integration)
     - [x] gradient scaling factor + clip_grad enhancements
 

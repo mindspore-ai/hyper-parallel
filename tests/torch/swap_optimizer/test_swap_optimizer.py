@@ -38,7 +38,7 @@ def test_swap_optimizer_2():
     """
     Feature: parallel run case in swap_optimizer
     Description:
-        1. test_hyper_adamw_amsgrad_swap_optimizer_parameter_align
+        1. test_new_adamw_amsgrad_swap_optimizer_parameter_align
         2. test_torch_adam_swap_optimizer_multi_param_group_align
         3. test_torch_adam_swap_optimizer_checkpoint_host_state
         4. test_torch_adamw_eager_state_swap_optimizer_parameter_align
@@ -46,7 +46,7 @@ def test_swap_optimizer_2():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(SWAP_OPTIMIZER, "test_hyper_adamw_amsgrad_swap_optimizer_parameter_align", 12504, 1),
+        TorchCase(SWAP_OPTIMIZER, "test_new_adamw_amsgrad_swap_optimizer_parameter_align", 12504, 1),
         TorchCase(SWAP_OPTIMIZER, "test_torch_adam_swap_optimizer_multi_param_group_align", 12505, 1),
         TorchCase(SWAP_OPTIMIZER, "test_torch_adam_swap_optimizer_checkpoint_host_state", 12506, 1),
         TorchCase(SWAP_OPTIMIZER, "test_torch_adamw_eager_state_swap_optimizer_parameter_align", 12509, 1),
@@ -62,12 +62,12 @@ def test_swap_optimizer_3():
         1. test_torch_adam_swap_optimizer_parameter_align
         2. test_torch_adamw_swap_optimizer_parameter_align
         3. test_torch_adam_amsgrad_swap_optimizer_parameter_align
-        4. test_hyper_adamw_swap_optimizer_parameter_align
+        4. test_new_adamw_swap_optimizer_parameter_align
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(SWAP_OPTIMIZER, "test_torch_adam_swap_optimizer_parameter_align", 12505, 1),
         TorchCase(SWAP_OPTIMIZER, "test_torch_adamw_swap_optimizer_parameter_align", 12506, 1),
         TorchCase(SWAP_OPTIMIZER, "test_torch_adam_amsgrad_swap_optimizer_parameter_align", 12507, 1),
-        TorchCase(SWAP_OPTIMIZER, "test_hyper_adamw_swap_optimizer_parameter_align", 12508, 1),
+        TorchCase(SWAP_OPTIMIZER, "test_new_adamw_swap_optimizer_parameter_align", 12508, 1),
     ])

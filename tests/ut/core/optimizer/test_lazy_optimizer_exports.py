@@ -116,7 +116,6 @@ class TestLazyOptimizerExports(unittest.TestCase):
                 SwapOptimizer,
                 SwapOptimizerConfig,
                 get_hyper_optimizer,
-                get_hyper_lr_scheduler,
                 swap_optimizer,
             )
             loaded = [name for name in {_TORCH_ONLY_MODULES!r} if name in sys.modules]
@@ -125,7 +124,6 @@ class TestLazyOptimizerExports(unittest.TestCase):
             assert SwapOptimizerConfig is not None
             assert swap_optimizer is not None
             assert get_hyper_optimizer is not None
-            assert get_hyper_lr_scheduler is not None
             """
         )
         result = _run_isolated(script)
