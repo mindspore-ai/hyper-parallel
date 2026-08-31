@@ -20,8 +20,7 @@ from typing import Any, Dict
 from hyper_parallel import SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.auto_models.components.datasets import calculate_num_micro_batches
-from hyper_parallel.auto_models.components.datasets.parallel.batch_context import create_batch_parallel_context
-from hyper_parallel.auto_models.components.datasets.vlm import build_processor, build_vlm_get_batch
+from hyper_parallel.auto_models.components.data.vlm import build_processor, build_vlm_get_batch
 from hyper_parallel.auto_models.components.loss.loss_utils import count_loss_token
 from hyper_parallel.auto_models.components.utils import helper
 from hyper_parallel.auto_models.components.utils.device import synchronize  # pylint: disable=syntax-error
@@ -117,13 +116,10 @@ class VLMTrainer:
             if config.dataloader.get_batch
             else build_vlm_get_batch
         )
-        parallel_context = create_batch_parallel_context(
-            self.base.mesh,
-            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
-        )
         self.base.get_batch = get_batch_builder(
-            parallel_context=parallel_context,
+            mesh_context=self.base.mesh,
             device=self.base.device,
+            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
 
     @property

@@ -16,12 +16,14 @@
 
 import json
 import os
-from typing import Any, Optional
+from collections.abc import Callable
+from typing import Any, Optional, TypeAlias
 
 from torch.utils.data import Dataset
 
-from hyper_parallel.auto_models.components.datasets.contracts import SampleTransform
 from hyper_parallel.auto_models.components.utils.constants import IGNORE_INDEX
+
+SampleTransform: TypeAlias = Callable[[Any], Any]
 
 
 class VLMDataset(Dataset):

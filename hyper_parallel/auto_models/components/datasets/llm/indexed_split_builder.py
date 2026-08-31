@@ -420,17 +420,3 @@ class IndexedDatasetSplitBuilder:
             barrier_needed=barrier_needed,
         )
         return local_dataset
-
-
-def build_dataset_splits(
-    *,
-    dataset_type: type,
-    train_valid_test_num_samples: Sequence[int] | None,
-    dataloader_context: DataLoaderParallelContext,
-    config: GPTDatasetConfig,
-    blend_mode: BlendMode,
-) -> DatasetSplits:
-    """Build indexed Dataset splits through the compatibility function API."""
-    split_builder = IndexedDatasetSplitBuilder(dataloader_context)
-    dataset_splits = split_builder.build(dataset_type, train_valid_test_num_samples, config, blend_mode)
-    return dataset_splits

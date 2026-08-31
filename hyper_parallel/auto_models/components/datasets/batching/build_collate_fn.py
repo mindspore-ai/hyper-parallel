@@ -65,8 +65,8 @@ class DataCollator(ABC):
 class TextPackingCollator(DataCollator):
     """Pack unpadded Online text samples and emit ``cu_seq_lens``.
 
-    Only ``input_ids`` and ``labels`` are packed here. Unified ``get_batch``
-    constructs loss, position, mask, and CP runtime fields.
+    Only ``input_ids`` and pre-shifted ``labels`` are packed here. Unified
+    ``get_batch`` constructs loss, position, mask, and CP runtime fields.
     """
 
     sequence_parallel_size: int = 1

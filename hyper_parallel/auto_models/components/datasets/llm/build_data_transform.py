@@ -82,11 +82,11 @@ class PlaintextTransform:
             token_ids = [*token_ids, eos_token_id]
 
         transformed = []
-        for start in range(0, len(token_ids), self.max_seq_len):
-            input_ids = torch.tensor(token_ids[start:start + self.max_seq_len], dtype=torch.long)
+        for start in range(0, len(token_ids) - 1, self.max_seq_len):
+            text = torch.tensor(token_ids[start:start + self.max_seq_len + 1], dtype=torch.long)
             model_sample = {
-                "input_ids": input_ids,
-                "labels": input_ids.clone(),
+                "input_ids": text[:-1],
+                "labels": text[1:],
             }
             transformed.append(model_sample)
         return transformed
@@ -111,9 +111,11 @@ class TextConversationTransform:
         """Encode one conversation record."""
         messages = _get_record_value(sample, self.text_keys)
         encoded = self.chat_template.encode_messages(messages, max_seq_len=self.max_seq_len)
+        input_ids = torch.as_tensor(encoded["input_ids"], dtype=torch.long)
+        labels = torch.as_tensor(encoded["labels"], dtype=torch.long)
         model_sample = {
-            "input_ids": torch.as_tensor(encoded["input_ids"], dtype=torch.long),
-            "labels": torch.as_tensor(encoded["labels"], dtype=torch.long),
+            "input_ids": input_ids[:-1],
+            "labels": labels[1:],
         }
         return [model_sample]
 
