@@ -79,9 +79,19 @@ class MixedPrecisionConfig:
 
 @dataclass
 class ActivationCheckpointConfig:
-    """Activation-checkpoint mode exposed by the initial YAML schema."""
+    """Activation-checkpoint options exposed by the initial YAML schema.
+
+    ``swap_inputs`` is consumed only when ``mode`` is ``"full"`` or
+    ``"selective"``.
+    """
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
+    swap_inputs: bool = False
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous values for activation input swapping."""
+        if not isinstance(self.swap_inputs, bool):
+            raise TypeError("activation_checkpoint.swap_inputs must be a bool")
 
 
 @dataclass

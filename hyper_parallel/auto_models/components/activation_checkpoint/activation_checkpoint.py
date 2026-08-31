@@ -16,7 +16,8 @@
 
 import logging
 from collections.abc import Callable
-from typing import Any, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -25,6 +26,7 @@ from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
     CheckpointPolicy,
     checkpoint_wrapper,
 )
+from hyper_parallel.core.activation_checkpoint.swap import SwapManager
 from hyper_parallel.platform import get_platform
 
 logger = logging.getLogger(__name__)
@@ -157,121 +159,100 @@ def _build_selective_ac_must_save_ops():
 
 _SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_must_save_ops()
 
-_LayerContainer = Union[nn.ModuleList, nn.ModuleDict]
-_LayerContainerInfo = tuple[nn.Module, str, _LayerContainer, str]
 
-# Each group contains alternative locations of one transformer layer container
-# across transformers versions. The groups intentionally retain model roles so
-# callers can choose HF-native checkpointing only for language-only models.
-_GEMMA3_LAYER_CONTAINER_PATHS = (
-    ("language", ("model.language_model.layers", "language_model.model.layers")),
-    (
-        "vision",
-        (
-            "model.vision_tower.vision_model.encoder.layers",
-            "model.vision_tower.encoder.layers",
-            "vision_tower.vision_model.encoder.layers",
-        ),
-    ),
-)
-_QWEN2_VL_LAYER_CONTAINER_PATHS = (
-    ("language", ("model.language_model.layers", "model.layers")),
-    ("vision", ("model.visual.blocks", "visual.blocks")),
-)
-_LLAVA_LAYER_CONTAINER_PATHS = (
-    ("language", ("model.language_model.layers", "language_model.model.layers")),
-    (
-        "vision",
-        (
-            "model.vision_tower.vision_model.encoder.layers",
-            "model.vision_tower.encoder.layers",
-            "vision_tower.vision_model.encoder.layers",
-        ),
-    ),
-)
-_MODEL_LAYER_CONTAINER_PATHS = {
-    "Gemma3ForConditionalGeneration": _GEMMA3_LAYER_CONTAINER_PATHS,
-    "Qwen2_5_VLForConditionalGeneration": _QWEN2_VL_LAYER_CONTAINER_PATHS,
-    "Qwen2VLForConditionalGeneration": _QWEN2_VL_LAYER_CONTAINER_PATHS,
-    "SmolVLMForConditionalGeneration": (
-        ("language", ("model.text_model.layers",)),
-        ("vision", ("model.vision_model.encoder.layers",)),
-    ),
-    "LlavaForConditionalGeneration": _LLAVA_LAYER_CONTAINER_PATHS,
-    "LlavaNextForConditionalGeneration": _LLAVA_LAYER_CONTAINER_PATHS,
-    "LlavaNextVideoForConditionalGeneration": _LLAVA_LAYER_CONTAINER_PATHS,
-    "LlavaOnevisionForConditionalGeneration": _LLAVA_LAYER_CONTAINER_PATHS,
-    "Mistral3ForConditionalGeneration": (
-        ("language", ("model.language_model.layers",)),
-        (
-            "vision",
-            (
-                "model.vision_tower.encoder.layers",
-                "model.vision_tower.vision_model.encoder.layers",
-                "model.vision_tower.transformer.layers",
-            ),
-        ),
-    ),
-    "Mistral3FP8VLMForConditionalGeneration": (
-        ("language", ("model.language_model.layers",)),
-        (
-            "vision",
-            (
-                "model.vision_tower.encoder.layers",
-                "model.vision_tower.vision_model.encoder.layers",
-                "model.vision_tower.transformer.layers",
-            ),
-        ),
-    ),
-    "Ministral3BidirectionalModel": (("language", ("layers",)),),
-    "LlamaNemotronVLModel": (
-        ("language", ("language_model.layers",)),
-        ("vision", ("vision_model.vision_model.encoder.layers", "vision_model.encoder.layers")),
-    ),
-    "Llama4ForConditionalGeneration": (
-        ("language", ("language_model.model.layers",)),
-        ("vision", ("vision_model.model.layers",)),
-    ),
-    "Qwen3_5ForConditionalGeneration": (
-        ("language", ("model.language_model.layers",)),
-        ("vision", ("model.visual.blocks",)),
-    ),
-    "Qwen3_5MoeForConditionalGeneration": (
-        ("language", ("model.language_model.layers",)),
-        ("vision", ("model.visual.blocks",)),
-    ),
-    "Qwen3VLMoeForConditionalGeneration": (
-        ("language", ("model.language_model.layers",)),
-        ("vision", ("model.visual.blocks",)),
-    ),
-    "Gemma4ForConditionalGeneration": (("language", ("model.language_model.layers",)),),
-    "KimiVLForConditionalGeneration": (
-        ("language", ("model.language_model.layers",)),
-        ("vision", ("model.vision_tower.encoder.blocks",)),
-    ),
-    "KimiK25VLForConditionalGeneration": (
-        ("language", ("model.language_model.layers",)),
-        ("vision", ("model.vision_tower.encoder.blocks",)),
-    ),
-    "MiniMaxM3SparseForConditionalGeneration": (
-        ("language", ("model.layers",)),
-        ("vision", ("vision_tower.vision_model.encoder.layers",)),
-    ),
-    "Step3p7ForConditionalGeneration": (
-        ("language", ("model.language_model.layers",)),
-        ("vision", ("model.vision_model.transformer.resblocks",)),
-    ),
-    "BagelForUnifiedMultimodal": (
-        ("language", ("model.language_model.model.layers",)),
-        ("vision", ("model.vit_model.vision_model.encoder.layers",)),
-    ),
-    "NemotronHForCausalLM": (("language", ("backbone.layers", "model.layers")),),
-    "GPT2LMHeadModel": (("language", ("transformer.h",)),),
-}
+@dataclass(frozen=True)
+class _TransformerBlockInfo:
+    """A transformer block discovered below an HF checkpointing owner.
 
-_RETRIEVAL_WRAPPER_NAMES = frozenset(
-    {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel"}
-)
+    ``parent`` is the registered repeated-block container (for example, a
+    ``ModuleList``), while ``child_name`` is the actual registered key. Keeping
+    both lets callers replace a block without assuming that the key is a
+    contiguous integer or that the container is a specific PyTorch class.
+    """
+
+    fqn: str
+    module: nn.Module
+    parent: nn.Module
+    child_name: str
+    container_fqn: str
+
+
+@dataclass(frozen=True)
+class _LayerContainerInfo:
+    """One repeated-block container and the blocks selected from it."""
+
+    container: nn.Module
+    path: str
+    blocks: tuple[_TransformerBlockInfo, ...]
+
+
+def _get_checkpoint_wrapped_module(module: nn.Module) -> Optional[nn.Module]:
+    """Return the module directly held by a supported checkpoint wrapper."""
+    for attr_name in ("_wrapped_module", "_checkpoint_wrapped_module"):
+        wrapped_module = getattr(module, attr_name, None)
+        if isinstance(wrapped_module, nn.Module):
+            return wrapped_module
+    return None
+
+
+def _find_transformer_block_modules(
+    model: nn.Module,
+) -> tuple[list[_TransformerBlockInfo], set[int]]:
+    """Find transformer blocks below modules with HF checkpointing support.
+
+    HuggingFace model components expose ``gradient_checkpointing`` on modules
+    that own a repeated block container.  The marker is the structural
+    contract; no model class name or conventional ``layers`` path is needed.
+    Each direct child of a marked repeated container is returned with its
+    registered name so callers can safely replace it in-place.
+
+    Args:
+        model: Model whose transformer blocks should be located.
+
+    Returns:
+        A list of block metadata and the IDs of blocks already selected. The
+        ID set is useful to callers that need to add other wrap targets while
+        avoiding duplicate modules.
+    """
+    block_infos = []
+    discovered_block_ids = set()
+    for owner_fqn, owner in model.named_modules():
+        # Match FSDP2's behavior for nested checkpointing owners: once an
+        # owner has itself been selected as a block, do not scan inside it.
+        if id(owner) in discovered_block_ids:
+            continue
+        if not hasattr(owner, "gradient_checkpointing"):
+            continue
+
+        for container_name, container in owner.named_children():
+            children = list(container.named_children())
+            if not children:
+                continue
+            container_fqn = (
+                f"{owner_fqn}.{container_name}" if owner_fqn else container_name
+            )
+            for block_name, block in children:
+                if id(block) in discovered_block_ids:
+                    continue
+                discovered_block_ids.add(id(block))
+                wrapped_module = _get_checkpoint_wrapped_module(block)
+                if wrapped_module is not None:
+                    # A checkpoint wrapper may proxy attributes from its inner
+                    # block, including ``gradient_checkpointing``. Treat the
+                    # wrapper and inner module as one logical transformer block
+                    # during the rest of the module-tree traversal.
+                    discovered_block_ids.add(id(wrapped_module))
+                block_fqn = f"{container_fqn}.{block_name}"
+                block_infos.append(
+                    _TransformerBlockInfo(
+                        fqn=block_fqn,
+                        module=block,
+                        parent=container,
+                        child_name=block_name,
+                        container_fqn=container_fqn,
+                    )
+                )
+    return block_infos, discovered_block_ids
 
 
 def ignore_sac_ops(ops: list[object | None]) -> None:
@@ -403,141 +384,71 @@ def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]
     return selective_checkpoint_context_fn
 
 
-def _resolve_layer_container(model: nn.Module, path: str) -> Optional[_LayerContainerInfo]:
-    """Resolve one layer-container path and retain its parent for replacement."""
-    path_parts = path.split(".")
-    parent = model
-    for part in path_parts[:-1]:
-        parent = getattr(parent, part, None)
-        if parent is None:
-            return None
+def _find_transformer_layer_container_infos(
+    model: nn.Module,
+) -> list[_LayerContainerInfo]:
+    """Find repeated block containers without model-specific path rules.
 
-    if not isinstance(parent, nn.Module):
-        return None
-    child_name = path_parts[-1]
-    container = getattr(parent, child_name, None)
-    if not isinstance(container, (nn.ModuleList, nn.ModuleDict)):
-        return None
-    return parent, child_name, container, path
-
-
-def _find_largest_layer_container(model: nn.Module) -> Optional[_LayerContainerInfo]:
-    """Find the largest ModuleList or pipeline-split numeric ModuleDict."""
-    largest = None
-    largest_size = 0
-    for module_path, module in model.named_modules():
-        for child_name, child in module.named_children():
-            is_layer_container = isinstance(child, nn.ModuleList) or (
-                isinstance(child, nn.ModuleDict)
-                and all(key.isdigit() for key in child.keys())
-            )
-            if not is_layer_container or len(child) <= largest_size:
-                continue
-            path = f"{module_path}.{child_name}" if module_path else child_name
-            largest = module, child_name, child, path
-            largest_size = len(child)
-    return largest
-
-
-def _find_transformer_layer_container_infos(model: nn.Module) -> dict[str, list[_LayerContainerInfo]]:
-    """Find transformer layer containers grouped by model role.
-
-    Known model classes use ordered alternative paths so different transformers
-    module-tree versions resolve deterministically. Generic causal language
-    models use their conventional ``model.layers`` or ``layers`` path. Unknown
-    models fall back to the largest plausible layer container.
+    Containers are derived from :func:`_find_transformer_block_modules`, so a
+    model can freely name its towers and layer attributes.  A container is
+    included once even when blocks are shared or the module tree exposes an
+    alias to it.
 
     Args:
         model: Model whose transformer layer containers should be located.
 
     Returns:
-        Mapping from role names such as ``language``/``vision``/``audio`` to
-        ``(parent, child_name, container, path)`` tuples. Each logical group
-        contributes at most one container.
+        A list of discovered containers, ordered by the model's registration
+        order. An empty list means no module advertises HF checkpointing
+        support for a repeated block container.
     """
-    model_name = type(model).__name__
-    if model_name in _RETRIEVAL_WRAPPER_NAMES:
-        inner_model = getattr(model, "model", None)
-        if isinstance(inner_model, nn.Module):
-            inner_groups = _find_transformer_layer_container_infos(inner_model)
-            return {
-                group_name: [
-                    (parent, child_name, container, f"model.{path}")
-                    for parent, child_name, container, path in group_containers
-                ]
-                for group_name, group_containers in inner_groups.items()
-            }
+    block_infos, _ = _find_transformer_block_modules(model)
+    containers = []
+    blocks_by_container = {}
+    seen_container_ids = set()
+    for block_info in block_infos:
+        container_id = id(block_info.parent)
+        blocks_by_container.setdefault(container_id, []).append(block_info)
 
-    # Known architectures use ordered, version-aware paths for each model role.
-    # The first non-empty match wins so deprecated aliases cannot make the same
-    # language or vision tower appear more than once.
-    container_path_groups = _MODEL_LAYER_CONTAINER_PATHS.get(model_name)
-    if container_path_groups is not None:
-        layer_groups = {}
-        for group_name, candidate_paths in container_path_groups:
-            for path in candidate_paths:
-                container_info = _resolve_layer_container(model, path)
-                if container_info is None or not container_info[2]:
-                    continue
-                layer_groups[group_name] = [container_info]
-                break
-        if not layer_groups:
-            logger.warning(
-                "Layer-container spec for %s resolved no modules from expected paths %s",
-                model_name,
-                container_path_groups,
+    for block_info in block_infos:
+        container_id = id(block_info.parent)
+        if container_id in seen_container_ids:
+            continue
+        seen_container_ids.add(container_id)
+        containers.append(
+            _LayerContainerInfo(
+                container=block_info.parent,
+                path=block_info.container_fqn,
+                blocks=tuple(blocks_by_container[container_id]),
             )
-        return layer_groups
-
-    # Unregistered language models commonly expose their decoder blocks through
-    # ``model.layers`` or ``layers``. A match is labeled as language-only so
-    # downstream code can still evaluate HuggingFace-native checkpoint support.
-    for path in ("model.layers", "layers"):
-        container_info = _resolve_layer_container(model, path)
-        if container_info is not None:
-            return {"language": [container_info] if container_info[2] else []}
-
-    # For unfamiliar module trees, use the largest plausible repeated-block
-    # container as a conservative fallback. Numeric-only ModuleDict support in
-    # the helper covers pipeline splits without mistaking named adapter sets for layers.
-    logger.warning(
-        "Unknown model type %s; using the largest layer-container heuristic.",
-        model_name,
-    )
-    largest_container = _find_largest_layer_container(model)
-    return {} if largest_container is None else {"unknown": [largest_container]}
+        )
+    return containers
 
 
 def _flatten_layer_container_infos(
-    layer_groups: dict[str, list[_LayerContainerInfo]],
-) -> dict[str, list[nn.Module]]:
-    """Expand grouped layer containers into grouped individual transformer layers."""
-    flattened = {}
-    for group_name, group_containers in layer_groups.items():
-        layers = []
-        for _, _, container, _ in group_containers:
-            if isinstance(container, nn.ModuleDict):
-                layers.extend(container.values())
-            else:
-                layers.extend(container)
-        flattened[group_name] = layers
-    return flattened
+    containers: list[_LayerContainerInfo],
+) -> list[nn.Module]:
+    """Expand discovered containers into individual transformer blocks."""
+    return [
+        block_info.module
+        for container in containers
+        for block_info in container.blocks
+    ]
 
 
 def _should_use_hf_native_gradient_checkpointing(
     model: nn.Module,
-    layer_groups: dict[str, list[nn.Module]],
+    layers: list[nn.Module],
     *,
     enable_compile: bool = False,
 ) -> bool:
     """Return whether full checkpointing can use HuggingFace's native API."""
-    if enable_compile or set(layer_groups) != {"language"}:
+    if enable_compile:
         return False
 
-    language_layers = layer_groups.get("language", [])
-    if not language_layers or any(
+    if not layers or any(
         not any(parameter.requires_grad for parameter in layer.parameters())
-        for layer in language_layers
+        for layer in layers
     ):
         return False
 
@@ -549,7 +460,7 @@ def _should_use_hf_native_gradient_checkpointing(
         return False
 
     return (
-        all(isinstance(layer, GradientCheckpointingLayer) for layer in language_layers)
+        all(isinstance(layer, GradientCheckpointingLayer) for layer in layers)
         and getattr(model, "supports_gradient_checkpointing", False)
         and hasattr(model, "gradient_checkpointing_enable")
     )
@@ -563,15 +474,17 @@ def _wrap_layer_containers(
 ) -> int:
     """Wrap every layer in the discovered containers and return the count."""
     wrapped_count = 0
-    for _, _, layers, _ in containers:
-        layer_items = (
-            list(layers.items())
-            if isinstance(layers, nn.ModuleDict)
-            else list(enumerate(layers))
-        )
-        for layer_key, layer in layer_items:
+    for container_info in containers:
+        for block_info in container_info.blocks:
             checkpoint_kwargs = {} if context_fn is None else {"context_fn": context_fn}
-            layers[layer_key] = wrapper(layer, **checkpoint_kwargs)
+            current_block = getattr(block_info.parent, block_info.child_name, None)
+            if not isinstance(current_block, nn.Module) or _is_checkpoint_wrapped(current_block):
+                continue
+            setattr(
+                block_info.parent,
+                block_info.child_name,
+                wrapper(current_block, **checkpoint_kwargs),
+            )
             wrapped_count += 1
     return wrapped_count
 
@@ -582,6 +495,35 @@ def _is_checkpoint_wrapped(module: nn.Module) -> bool:
         module,
         "_checkpoint_wrapped_module",
     )
+
+
+def _find_checkpoint_wrappers(module: nn.Module, prefix: str = "") -> dict[str, nn.Module]:
+    """Find outermost checkpoint wrappers by their relative module paths."""
+    if _is_checkpoint_wrapped(module):
+        return {prefix: module}
+
+    wrappers = {}
+    for child_name, child in module.named_children():
+        child_path = f"{prefix}.{child_name}" if prefix else child_name
+        wrappers.update(_find_checkpoint_wrappers(child, child_path))
+    return wrappers
+
+
+def _register_forward_prefetch_layers(containers: list[_LayerContainerInfo]) -> None:
+    """Register swap prefetch chains within each repeated-block container."""
+    swap_manager = SwapManager()
+    for container_info in containers:
+        wrapper_chains = {}
+        for block_info in container_info.blocks:
+            current_block = getattr(block_info.parent, block_info.child_name, None)
+            if not isinstance(current_block, nn.Module):
+                continue
+            for relative_path, wrapper in _find_checkpoint_wrappers(current_block).items():
+                wrapper_chains.setdefault(relative_path, []).append(wrapper)
+
+        for wrappers in wrapper_chains.values():
+            for current_wrapper, next_wrapper in zip(wrappers, wrappers[1:]):
+                swap_manager.set_forward_prefetch_layer(current_wrapper, next_wrapper)
 
 
 def _wrap_first_existing_attr(
@@ -602,7 +544,7 @@ def _wrap_first_existing_attr(
         child_name = next(
             (
                 name
-                for name, registered_child in module._modules.items()
+                for name, registered_child in module.named_children()
                 if registered_child is child
             ),
             None,
@@ -619,30 +561,47 @@ def _wrap_first_existing_attr(
 def apply_submodule_checkpointing(
     layers: list[nn.Module],
     has_kv_sharing: bool,
+    enable_compile: bool = False,
+    swap_inputs: bool = False,
 ) -> int:
-    """Apply full activation checkpointing to transformer-layer submodules."""
+    """Apply full activation checkpointing to transformer-layer submodules.
+
+    Args:
+        layers: Transformer layers whose selected submodules should be wrapped.
+        has_kv_sharing: Whether attention submodules must remain outside the
+            recomputation regions.
+        enable_compile: Whether the wrapped regions will be compiled.
+        swap_inputs: Whether checkpoint inputs should be offloaded in eager
+            execution. This is ignored in compile mode.
+    """
+    checkpoint_kwargs = {"swap_inputs": swap_inputs} if not enable_compile else {}
+
+    def submodule_checkpoint_wrapper(module: nn.Module) -> nn.Module:
+        """Wrap one selected layer submodule with checkpointing."""
+        return checkpoint_wrapper(module, **checkpoint_kwargs)
+
     wrapped_count = 0
     for layer in layers:
         wrapped_count += _wrap_first_existing_attr(
             layer,
             ("mlp", "feed_forward", "ffn"),
-            checkpoint_wrapper,
+            submodule_checkpoint_wrapper,
         )
         wrapped_count += _wrap_first_existing_attr(
             layer,
             ("self_attn", "attention", "attn", "linear_attn"),
-            checkpoint_wrapper,
+            submodule_checkpoint_wrapper,
             skip=has_kv_sharing,
         )
         wrapped_count += _wrap_first_existing_attr(
             layer,
             ("input_layernorm", "attention_norm", "layer_norm1", "norm1"),
-            checkpoint_wrapper,
+            submodule_checkpoint_wrapper,
         )
         wrapped_count += _wrap_first_existing_attr(
             layer,
             ("post_attention_layernorm", "ffn_norm", "layer_norm2", "norm2"),
-            checkpoint_wrapper,
+            submodule_checkpoint_wrapper,
         )
         for attr in (
             "mlp_moe_gen",
@@ -651,7 +610,7 @@ def apply_submodule_checkpointing(
         ):
             child = getattr(layer, attr, None)
             if isinstance(child, nn.Module) and not _is_checkpoint_wrapped(child):
-                setattr(layer, attr, checkpoint_wrapper(child))
+                setattr(layer, attr, submodule_checkpoint_wrapper(child))
                 wrapped_count += 1
 
     logger.info(
@@ -659,26 +618,6 @@ def apply_submodule_checkpointing(
         len(layers),
         wrapped_count,
     )
-    return wrapped_count
-
-
-def apply_compile_submodule_checkpointing(layers: list[nn.Module]) -> int:
-    """Checkpoint-wrap attention and MLP submodules for compile mode."""
-    wrapped_count = 0
-    for layer in layers:
-        for attr in (
-            "self_attn",
-            "attention",
-            "attn",
-            "linear_attn",
-            "mlp",
-            "feed_forward",
-            "ffn",
-        ):
-            submodule = getattr(layer, attr, None)
-            if submodule is not None:
-                setattr(layer, attr, checkpoint_wrapper(submodule))
-                wrapped_count += 1
     return wrapped_count
 
 
@@ -702,7 +641,8 @@ def _detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
         if getattr(sub_config, "use_cache", None) is not False:
             try:
                 sub_config.use_cache = False
-            except Exception:  # Configuration objects may reject assignment with custom errors.
+            except Exception:  # pylint: disable=broad-exception-caught
+                # Configuration objects may reject assignment with custom errors.
                 pass
     return False
 
@@ -711,6 +651,7 @@ def _apply_activation_checkpointing(
     model: nn.Module,
     activation_checkpoint: Optional[str],
     enable_compile: bool = False,
+    swap_inputs: bool = False,
 ) -> nn.Module:
     """Apply full or selective recomputation to discovered transformer layers."""
     if activation_checkpoint not in ("full", "selective"):
@@ -718,26 +659,27 @@ def _apply_activation_checkpointing(
             "activation_checkpoint.mode must be 'full' or 'selective', but got "
             f"{activation_checkpoint!r}"
         )
-
-    container_groups = _find_transformer_layer_container_infos(model)
-    containers = [
-        container_info
-        for group_containers in container_groups.values()
-        for container_info in group_containers
-    ]
-    if not containers:
+    if not isinstance(swap_inputs, bool):
         raise ValueError(
-            f"{type(model).__name__} does not expose a supported transformer "
-            "layer container"
+            "activation_checkpoint.swap_inputs must be bool, but got "
+            f"{type(swap_inputs).__name__}"
         )
 
-    layer_groups = _flatten_layer_container_infos(container_groups)
-    ac_layers = [
-        layer
-        for group_layers in layer_groups.values()
-        for layer in group_layers
-    ]
-    _has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
+    if swap_inputs and enable_compile:
+        logger.warning(
+            "activation_checkpoint.swap_inputs is not supported with torch.compile; "
+            "input swapping will be disabled."
+        )
+
+    containers = _find_transformer_layer_container_infos(model)
+    if not containers:
+        raise ValueError(
+            f"{type(model).__name__} has no module with a 'gradient_checkpointing' "
+            "attribute and a non-empty repeated block container"
+        )
+
+    ac_layers = _flatten_layer_container_infos(containers)
+    has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
 
     # Selective recomputation normally wraps whole layers. KV-shared models
     # instead use submodule checkpointing so attention does not write the cache
@@ -745,26 +687,24 @@ def _apply_activation_checkpointing(
     if activation_checkpoint == "selective":
         if hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
-        if _has_kv_sharing:
+        if has_kv_sharing:
             logger.warning(
                 "Selective activation checkpointing is not supported for KV-shared models; "
                 "falling back to submodule activation checkpointing."
             )
-            apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
+            apply_submodule_checkpointing(
+                ac_layers,
+                has_kv_sharing,
+                enable_compile=enable_compile,
+                swap_inputs=swap_inputs,
+            )
         else:
             if enable_compile:
                 ensure_profiler_ops_sac_ignored()
                 ensure_fsdp_ops_sac_ignored()
 
                 def compile_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
-                    """Wrap ``layer`` with selective-AC policy for compile mode.
-
-                    Args:
-                        layer: Transformer layer to wrap.
-
-                    Returns:
-                        The checkpoint-wrapped layer.
-                    """
+                    """Wrap one layer with the compile-compatible SAC policy."""
                     return checkpoint_wrapper(
                         layer,
                         policy_fn=_make_selective_checkpoint_policy_fn(),
@@ -775,15 +715,23 @@ def _apply_activation_checkpointing(
                     compile_checkpoint_wrapper,
                 )
             else:
+                def eager_checkpoint_wrapper(layer: nn.Module, **checkpoint_kwargs: Any) -> nn.Module:
+                    """Wrap one layer with eager selective checkpointing."""
+                    return checkpoint_wrapper(
+                        layer,
+                        swap_inputs=swap_inputs,
+                        **checkpoint_kwargs,
+                    )
+
                 wrapped_count = _wrap_layer_containers(
                     containers,
-                    checkpoint_wrapper,
+                    eager_checkpoint_wrapper,
                     context_fn=make_selective_checkpoint_context_fn(),
                 )
             logger.info(
                 "Selective activation checkpointing applied to %d layer(s) in: %s",
                 wrapped_count,
-                ", ".join(path for _, _, _, path in containers),
+                ", ".join(container.path for container in containers),
             )
 
     elif activation_checkpoint == "full":
@@ -791,26 +739,41 @@ def _apply_activation_checkpointing(
         # pass. Otherwise use Hyper Parallel's submodule wrappers.
         if _should_use_hf_native_gradient_checkpointing(
             model,
-            layer_groups,
+            ac_layers,
             enable_compile=enable_compile,
         ):
+            if swap_inputs:
+                logger.warning(
+                    "activation_checkpoint.swap_inputs is not supported by Hugging Face native "
+                    "gradient checkpointing for now; input swapping will be disabled."
+                )
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
-            logger.info("Using HuggingFace native gradient checkpointing for language layers.")
+            logger.info("Using HuggingFace native gradient checkpointing for discovered layers.")
             return model
 
         if hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
-        if enable_compile:
-            # Whole-layer/reentrant checkpointing can drop trainable parameter
-            # gradients from the AOT-autograd graph. Wrap the compute-heavy
-            # submodules before FSDP instead.
-            wrapped_count = apply_compile_submodule_checkpointing(ac_layers)
+        if has_kv_sharing:
+            wrapped_count = apply_submodule_checkpointing(
+                ac_layers,
+                has_kv_sharing,
+                enable_compile=enable_compile,
+                swap_inputs=swap_inputs,
+            )
         else:
-            wrapped_count = apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
+            def full_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
+                """Wrap one complete transformer layer for full recomputation."""
+                if enable_compile:
+                    return checkpoint_wrapper(layer)
+                return checkpoint_wrapper(layer, swap_inputs=swap_inputs)
+
+            wrapped_count = _wrap_layer_containers(containers, full_checkpoint_wrapper)
         logger.info(
             "%s activation checkpointing wrapped %d submodule(s) in: %s",
             activation_checkpoint.capitalize(),
             wrapped_count,
-            ", ".join(path for _, _, _, path in containers),
+            ", ".join(container.path for container in containers),
         )
+    if swap_inputs and not enable_compile:
+        _register_forward_prefetch_layers(containers)
     return model

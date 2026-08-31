@@ -24,28 +24,30 @@ from hyper_parallel.core.optimizer import get_hyper_optimizer
 logger = logging.getLogger(__name__)
 
 
-# adapted from https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer_pt_utils.py#L1123
 def get_parameter_names(
         model: nn.Module,
         forbidden_param_names: Optional[Sequence[str]],
 ) -> List[str]:
-    """Return parameter names that do not match no-decay name keywords."""
-    forbidden_param_names = [] if forbidden_param_names is None else forbidden_param_names
-    result = []
-    for name, child in model.named_children():
-        child_params = get_parameter_names(child, forbidden_param_names)
-        result += [
-            f"{name}.{n}"
-            for n in child_params
-            if not any(forbidden in f"{name}.{n}".lower() for forbidden in forbidden_param_names)
-        ]
+    """Return canonical parameter names that do not match no-decay keywords.
 
-    result += [
+    Transparent module wrappers may expose different internal names through
+    ``named_children()`` while normalizing their public ``named_parameters()``
+    names. Deriving and consuming names from the same public traversal keeps
+    optimizer grouping stable when those wrappers are installed.
+
+    Args:
+        model: Model whose parameters should be classified.
+        forbidden_param_names: Case-insensitive keywords excluded from weight decay.
+
+    Returns:
+        Parameter names eligible for weight decay.
+    """
+    forbidden_names = tuple(name.lower() for name in forbidden_param_names or ())
+    return [
         name
-        for name, _ in model.named_parameters(recurse=False)
-        if not any(forbidden in name.lower() for forbidden in forbidden_param_names)
+        for name, _ in model.named_parameters()
+        if not any(forbidden in name.lower() for forbidden in forbidden_names)
     ]
-    return result
 
 
 class AdamW:

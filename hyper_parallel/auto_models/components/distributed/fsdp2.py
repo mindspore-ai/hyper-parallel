@@ -59,6 +59,15 @@ def _is_expert_source_mesh(mesh: DeviceMesh | None) -> bool:
     return mesh is not None and "ep" in (getattr(mesh, "mesh_dim_names", None) or ())
 
 
+def _get_checkpoint_wrapped_module(module: ModuleClass) -> ModuleClass | None:
+    """Return the module directly wrapped by a supported checkpoint wrapper."""
+    for attr_name in ("_wrapped_module", "_checkpoint_wrapped_module"):
+        wrapped_module = getattr(module, attr_name, None)
+        if isinstance(wrapped_module, ModuleClass):
+            return wrapped_module
+    return None
+
+
 class FSDP2Manager:
     """Configure and apply nested FSDP2 wrapping for a dual-mode model."""
 
@@ -333,6 +342,11 @@ class FSDP2Manager:
                     if id(block) in wrapped_module_ids:
                         continue
                     wrapped_module_ids.add(id(block))
+                    wrapped_module = _get_checkpoint_wrapped_module(block)
+                    if wrapped_module is not None:
+                        # The wrapper and its direct child represent one logical
+                        # transformer block during module-tree traversal.
+                        wrapped_module_ids.add(id(wrapped_module))
                     wrap_modules.append(
                         _WrapModuleInfo(f"{child_fqn}.{block_index}", block)
                     )
