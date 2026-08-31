@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Source Loader, Planner, and Data Constructor distributed data pipeline."""
+"""Dataset Reader, Planner, and Data Constructor distributed data pipeline."""
 
 from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataloader
 from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn

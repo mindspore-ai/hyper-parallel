@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for rank-strided Source Loader materialization and recovery."""
+"""Tests for rank-strided Dataset Reader materialization and recovery."""
 
 import unittest
 from collections.abc import Callable
@@ -24,7 +24,8 @@ from torch.utils.data._utils.pin_memory import (  # pylint: disable=forbidden-ba
 )
 
 from hyper_parallel.distributed_data.schema import SampleKey, SampleMetadata
-from hyper_parallel.distributed_data.source_loader import SourceLoader, _IndexedPayload
+from hyper_parallel.distributed_data.sidecar import SidecarMetadataReader
+from hyper_parallel.distributed_data.dataset_reader import DatasetReader, _IndexedPayload
 
 
 class _RecordingDataset:
@@ -64,23 +65,23 @@ def _metadata_callback(events: list[tuple[str, int]]) -> Callable[[dict[str, int
     return metadata_fn
 
 
-def _source_loader(
+def _dataset_reader(
         dataset: _RecordingDataset,
         metadata_fn: Callable[[dict[str, int]], SampleMetadata],
         *,
-        source_rank: int = 4,
-        source_lane: int = 0,
-        source_lane_count: int = 1,
+        reader_rank: int = 4,
+        reader_idx: int = 0,
+        reader_count: int = 1,
         num_workers: int = 0,
         pin_memory: bool = False,
         persistent_workers: bool = False,
-) -> SourceLoader:
-    return SourceLoader(
+) -> DatasetReader:
+    return DatasetReader(
         dataset,
         metadata_fn,
-        source_rank=source_rank,
-        source_lane=source_lane,
-        source_lane_count=source_lane_count,
+        reader_rank=reader_rank,
+        reader_idx=reader_idx,
+        reader_count=reader_count,
         seq_len=16,
         shuffle=False,
         seed=17,
@@ -91,25 +92,25 @@ def _source_loader(
     )
 
 
-class TestSourceLoader(unittest.TestCase):
+class TestDatasetReader(unittest.TestCase):
     """Verify samples are materialized once, then exposed as lightweight metadata."""
 
     def test_strides_dataset_indices_and_derives_metadata_after_getitem(self) -> None:
-        """A source lane reads its global stride and invokes metadata afterward."""
+        """A reader partition reads its global stride and invokes metadata afterward."""
         events: list[tuple[str, int]] = []
         dataset = _RecordingDataset(list(range(1, 9)), events)
-        source = _source_loader(
+        reader = _dataset_reader(
             dataset,
             _metadata_callback(events),
-            source_rank=6,
-            source_lane=1,
-            source_lane_count=3,
+            reader_rank=6,
+            reader_idx=1,
+            reader_count=3,
         )
 
-        error = source.fill(min_samples=4, min_tokens=100, max_samples=10)
+        error = reader.fill(min_samples=4, min_tokens=100, max_samples=10)
 
         self.assertIsNone(error)
-        self.assertTrue(source.exhausted)
+        self.assertTrue(reader.exhausted)
         self.assertEqual(
             events,
             [
@@ -121,46 +122,46 @@ class TestSourceLoader(unittest.TestCase):
                 ("metadata", 7),
             ],
         )
-        self.assertEqual([item.key for item in source.metadata()], [SampleKey(6, 1), SampleKey(6, 4), SampleKey(6, 7)])
-        self.assertEqual([item.metadata.pack_tokens for item in source.metadata()], [2, 5, 8])
-        self.assertEqual(source.effective_buffer_tokens, 15)
+        self.assertEqual([item.key for item in reader.metadata()], [SampleKey(6, 1), SampleKey(6, 4), SampleKey(6, 7)])
+        self.assertEqual([item.metadata.pack_tokens for item in reader.metadata()], [2, 5, 8])
+        self.assertEqual(reader.effective_buffer_tokens, 15)
 
     def test_selected_payloads_are_non_destructive_until_commit(self) -> None:
         """Routing reads payloads transactionally and commit removes only selected keys."""
         events: list[tuple[str, int]] = []
-        source = _source_loader(_RecordingDataset([2, 3, 4], events), _metadata_callback(events), source_rank=2)
-        self.assertIsNone(source.fill(min_samples=3, min_tokens=9, max_samples=3))
+        reader = _dataset_reader(_RecordingDataset([2, 3, 4], events), _metadata_callback(events), reader_rank=2)
+        self.assertIsNone(reader.fill(min_samples=3, min_tokens=9, max_samples=3))
         selected_key = SampleKey(2, 1)
 
-        first = source.selected_payloads({selected_key})
-        second = source.selected_payloads({selected_key})
+        first = reader.selected_payloads({selected_key})
+        second = reader.selected_payloads({selected_key})
 
         self.assertEqual(first, second)
         self.assertEqual(first[0][1], {"index": 1, "tokens": 3})
-        self.assertEqual(source.buffer_size, 3)
-        source.commit({selected_key})
-        self.assertEqual([item.key for item in source.metadata()], [SampleKey(2, 0), SampleKey(2, 2)])
+        self.assertEqual(reader.buffer_size, 3)
+        reader.commit({selected_key})
+        self.assertEqual([item.key for item in reader.metadata()], [SampleKey(2, 0), SampleKey(2, 2)])
 
     def test_checkpoint_restores_buffer_and_continues_without_replaying_indices(self) -> None:
-        """Restoration preserves read-ahead payloads and resumes at the next lane ordinal."""
+        """Restoration preserves payloads and resumes at the next reader ordinal."""
         original_events: list[tuple[str, int]] = []
-        original = _source_loader(
+        original = _dataset_reader(
             _RecordingDataset([1] * 8, original_events),
             _metadata_callback(original_events),
-            source_rank=5,
-            source_lane=0,
-            source_lane_count=2,
+            reader_rank=5,
+            reader_idx=0,
+            reader_count=2,
         )
         self.assertIsNone(original.fill(min_samples=2, min_tokens=2, max_samples=2))
         state = original.state_dict()
 
         restored_events: list[tuple[str, int]] = []
-        restored = _source_loader(
+        restored = _dataset_reader(
             _RecordingDataset([1] * 8, restored_events),
             _metadata_callback(restored_events),
-            source_rank=5,
-            source_lane=0,
-            source_lane_count=2,
+            reader_rank=5,
+            reader_idx=0,
+            reader_count=2,
         )
         restored.load_state_dict(state)
 
@@ -174,7 +175,7 @@ class TestSourceLoader(unittest.TestCase):
             [("getitem", 4), ("metadata", 4), ("getitem", 6), ("metadata", 6)],
         )
 
-    def test_metadata_callback_failure_is_returned_with_source_context(self) -> None:
+    def test_metadata_callback_failure_is_returned_with_reader_context(self) -> None:
         """A bad metadata callback is surfaced for collective error propagation."""
         events: list[tuple[str, int]] = []
         dataset = _RecordingDataset([3], events)
@@ -184,15 +185,15 @@ class TestSourceLoader(unittest.TestCase):
             events.append(("metadata", sample["index"]))
             return sample
 
-        source = _source_loader(dataset, invalid_metadata, source_rank=7)
-        error = source.fill(min_samples=1, min_tokens=1, max_samples=1)
+        reader = _dataset_reader(dataset, invalid_metadata, reader_rank=7)
+        error = reader.fill(min_samples=1, min_tokens=1, max_samples=1)
 
-        self.assertIn("Source Loader rank 7 failed", error)
+        self.assertIn("Dataset Reader rank 7 failed", error)
         self.assertIn("metadata_fn must return SampleMetadata", error)
         self.assertEqual(events, [("getitem", 0), ("metadata", 0)])
-        self.assertEqual(source.buffer_size, 0)
+        self.assertEqual(reader.buffer_size, 0)
 
-        repeated_error = source.fill(min_samples=1, min_tokens=1, max_samples=1)
+        repeated_error = reader.fill(min_samples=1, min_tokens=1, max_samples=1)
         self.assertEqual(repeated_error, error)
         self.assertEqual(events, [("getitem", 0), ("metadata", 0)])
 
@@ -234,28 +235,85 @@ class TestSourceLoader(unittest.TestCase):
                 return iter((self.collate_fn(self.dataset[dataset_index]),))
 
         events: list[tuple[str, int]] = []
-        with patch("hyper_parallel.distributed_data.source_loader.DataLoader", _FakeDataLoader):
-            source = _source_loader(
+        with patch("hyper_parallel.distributed_data.dataset_reader.DataLoader", _FakeDataLoader):
+            reader = _dataset_reader(
                 _RecordingDataset([2, 3, 4], events),
                 _metadata_callback(events),
-                source_rank=3,
+                reader_rank=3,
                 num_workers=1,
                 persistent_workers=True,
             )
-            self.assertIsNone(source.fill(min_samples=1, min_tokens=1, max_samples=1))
-            state = source.state_dict()
-            source.load_state_dict(state)
-            self.assertIsNone(source.fill(min_samples=2, min_tokens=2, max_samples=2))
+            self.assertIsNone(reader.fill(min_samples=1, min_tokens=1, max_samples=1))
+            state = reader.state_dict()
+            reader.load_state_dict(state)
+            self.assertIsNone(reader.fill(min_samples=2, min_tokens=2, max_samples=2))
 
         self.assertEqual(len(created_loaders), 1)
         self.assertEqual(created_loaders[0].iter_calls, 2)
         self.assertEqual(created_loaders[0].worker_options["num_workers"], 1)
         self.assertTrue(created_loaders[0].worker_options["persistent_workers"])
-        self.assertEqual([item.key for item in source.metadata()], [SampleKey(3, 0), SampleKey(3, 1)])
+        self.assertEqual([item.key for item in reader.metadata()], [SampleKey(3, 0), SampleKey(3, 1)])
         self.assertEqual(
             events,
             [("getitem", 0), ("metadata", 0), ("getitem", 1), ("metadata", 1)],
         )
+
+
+class TestSidecarMetadataReader(unittest.TestCase):
+    """Verify sidecar reader partitions never materialize Dataset payloads."""
+
+    @staticmethod
+    def _reader(metadata: list[SampleMetadata], reader_idx: int) -> SidecarMetadataReader:
+        return SidecarMetadataReader(
+            metadata,
+            reader_rank=reader_idx + 4,
+            reader_idx=reader_idx,
+            reader_count=2,
+            seq_len=16,
+            shuffle=False,
+            seed=23,
+        )
+
+    def test_reader_idxs_cover_sidecar_indices_without_payload_reads(self) -> None:
+        """Metadata readers should stride one shared index space without overlap."""
+        metadata = [SampleMetadata(pack_tokens=index + 1, sample_id=f"sample-{index}") for index in range(6)]
+        first = self._reader(metadata, 0)
+        second = self._reader(metadata, 1)
+
+        self.assertIsNone(first.fill(min_samples=6, min_tokens=100, max_samples=6))
+        self.assertIsNone(second.fill(min_samples=6, min_tokens=100, max_samples=6))
+
+        self.assertEqual([item.key.dataset_index for item in first.metadata()], [0, 2, 4])
+        self.assertEqual([item.key.dataset_index for item in second.metadata()], [1, 3, 5])
+        self.assertEqual(
+            {item.key.dataset_index for item in first.metadata() + second.metadata()},
+            set(range(6)),
+        )
+
+    def test_checkpoint_preserves_unselected_metadata_buffer(self) -> None:
+        """Restoration should keep skipped candidates and resume the reader cursor."""
+        metadata = [SampleMetadata(pack_tokens=1, sample_id=index) for index in range(8)]
+        original = self._reader(metadata, 0)
+        self.assertIsNone(original.fill(min_samples=3, min_tokens=3, max_samples=3))
+        selected_key = original.metadata()[1].key
+        original.commit({selected_key})
+        state = original.state_dict()
+
+        restored = self._reader(metadata, 0)
+        restored.load_state_dict(state)
+        self.assertEqual(restored.metadata(), original.metadata())
+
+        self.assertIsNone(original.fill(min_samples=4, min_tokens=4, max_samples=4))
+        self.assertIsNone(restored.fill(min_samples=4, min_tokens=4, max_samples=4))
+        self.assertEqual(restored.metadata(), original.metadata())
+
+    def test_active_sidecar_buffer_rejects_epoch_change(self) -> None:
+        """Changing epoch must not silently discard an in-progress planning buffer."""
+        reader = self._reader([SampleMetadata(pack_tokens=1, sample_id=index) for index in range(4)], 0)
+        self.assertIsNone(reader.fill(min_samples=1, min_tokens=1, max_samples=1))
+
+        with self.assertRaisesRegex(ValueError, "active sidecar metadata buffer"):
+            reader.set_epoch(1)
 
 
 if __name__ == "__main__":

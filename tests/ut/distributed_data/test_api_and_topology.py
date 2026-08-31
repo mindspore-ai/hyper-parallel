@@ -46,8 +46,12 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
         self.assertEqual(tuple(parameters)[:3], ("dataset", "mesh", "config"))
         self.assertEqual(parameters["metadata_fn"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(parameters["metadata"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(parameters["pack_fn"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(parameters["collate_fn"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(parameters["communication_device"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameters["metadata_fn"].default)
+        self.assertIsNone(parameters["metadata"].default)
         self.assertIsNone(parameters["pack_fn"].default)
         self.assertIsNone(parameters["collate_fn"].default)
         self.assertNotIn("raw_sample_size", parameters)
@@ -86,6 +90,11 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         )
 
         self.assertEqual(config.buffer_size_multiplier, huge_multiplier)
+
+    def test_control_backend_must_support_cpu_object_collectives(self) -> None:
+        """Accelerator-only backends belong to payload transport, not control."""
+        with self.assertRaisesRegex(ValueError, "cpu_backend must support CPU tensors"):
+            DistributedDatasetConfig(seq_len=32, local_batch_size=1, cpu_backend="hccl")
 
 
 class TestDataTopology(unittest.TestCase):

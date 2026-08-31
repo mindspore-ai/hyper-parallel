@@ -16,9 +16,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import Any
+from unittest.mock import patch
 
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -40,9 +41,10 @@ _CONSTRUCTOR_RANKS = (0, 2)
 class _RawDataset:
     """Return individual raw samples so redistribution precedes packing."""
 
-    def __init__(self, size: int = _DATASET_SIZE) -> None:
+    def __init__(self, size: int = _DATASET_SIZE, reader_rank: int | None = None) -> None:
         """Store the rank-local Dataset length."""
         self._size = size
+        self._reader_rank = reader_rank
 
     def __len__(self) -> int:
         """Return the complete deterministic epoch size."""
@@ -50,7 +52,7 @@ class _RawDataset:
 
     def __getitem__(self, index: int) -> dict[str, int]:
         """Return one sample carrying its stable identifier and token cost."""
-        return {"sample_id": index, "pack_tokens": 1}
+        return {"sample_id": index, "pack_tokens": 1, "reader_rank": self._reader_rank}
 
 
 def _metadata_fn(sample: dict[str, int]) -> SampleMetadata:
@@ -74,6 +76,7 @@ def _pack_fn(samples: Sequence[dict[str, int]], seq_len: int) -> dict[str, Any]:
     return {
         "sample_ids": tuple(sample["sample_id"] for sample in samples),
         "token_count": token_count,
+        "reader_ranks": tuple(sample["reader_rank"] for sample in samples),
     }
 
 
@@ -125,7 +128,7 @@ def _assert_plan_matches_outputs(plan: DistributedPackingPlan, outputs: tuple[An
     for data_rank, constructor_rank in enumerate(_CONSTRUCTOR_RANKS):
         constructor = plan.constructor_for(data_rank)
         planned_sample_ids = tuple(
-            sample.key.source_index
+            sample.key.dataset_index
             for packing_bin in constructor.bins
             for sample in packing_bin.samples
         )
@@ -139,12 +142,12 @@ def _assert_plan_matches_outputs(plan: DistributedPackingPlan, outputs: tuple[An
             f"rank={constructor_rank}, expected={planned_sample_ids!r}, got={output_sample_ids!r}."
         )
         routes.extend(
-            (sample.key.source_rank, constructor_rank)
+            (sample.key.reader_rank, constructor_rank)
             for packing_bin in constructor.bins
             for sample in packing_bin.samples
         )
 
-    assert any(source_rank != target_rank for source_rank, target_rank in routes), (
+    assert any(reader_rank != target_rank for reader_rank, target_rank in routes), (
         f"The test epoch must exercise cross-rank sample redistribution: routes={routes!r}."
     )
 
@@ -167,6 +170,7 @@ def _assert_collective_build_error(
         dataset: _RawDataset,
         config: DistributedDatasetConfig,
         expected_message: str,
+        dataloader_kwargs: Mapping[str, Any] | None = None,
 ) -> None:
     error_type = None
     error_message = None
@@ -178,6 +182,7 @@ def _assert_collective_build_error(
             metadata_fn=_metadata_fn,
             pack_fn=_pack_fn,
             collate_fn=_collate_fn,
+            dataloader_kwargs=dataloader_kwargs,
         )
     except Exception as exc:  # The assertion below verifies the public error type.
         error_type = type(exc).__name__
@@ -219,7 +224,7 @@ def _assert_callback_mode_build_error(mesh: Any) -> None:
                 seq_len=4,
                 local_batch_size=1,
                 dp_dim_names=("dp",),
-                source_loader_ranks=(0, 1, 2, 3),
+                dataset_reader_ranks=(0, 1, 2, 3),
                 buffer_size_multiplier=1.0,
                 max_buffered_samples=8,
                 cpu_backend="gloo",
@@ -243,7 +248,7 @@ def _assert_build_preflight_errors(mesh: Any) -> None:
             seq_len=mismatched_seq_len,
             local_batch_size=1,
             dp_dim_names=("dp",),
-            source_loader_ranks=(0, 1, 2, 3),
+            dataset_reader_ranks=(0, 1, 2, 3),
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
             cpu_backend="gloo",
@@ -259,12 +264,27 @@ def _assert_build_preflight_errors(mesh: Any) -> None:
             seq_len=4,
             local_batch_size=1,
             dp_dim_names=("dp",),
-            source_loader_ranks=(0, 1, 2, 3),
+            dataset_reader_ranks=(0, 1, 2, 3),
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
             cpu_backend="gloo",
         ),
-        "source dataset length mismatch",
+        "dataset length mismatch across dataset reader ranks",
+    )
+    _assert_collective_build_error(
+        mesh,
+        _RawDataset(),
+        DistributedDatasetConfig(
+            seq_len=4,
+            local_batch_size=1,
+            dp_dim_names=("dp",),
+            dataset_reader_ranks=(0, 1, 2, 3),
+            buffer_size_multiplier=1.0,
+            max_buffered_samples=8,
+            cpu_backend="gloo",
+        ),
+        "build configuration mismatch",
+        dataloader_kwargs={"pin_memory": rank == _WORLD_SIZE - 1},
     )
     _assert_callback_mode_build_error(mesh)
 
@@ -281,7 +301,7 @@ def _assert_explicit_default_pack_is_equivalent(mesh: Any) -> None:
             seq_len=4,
             local_batch_size=1,
             dp_dim_names=("dp",),
-            source_loader_ranks=None,
+            dataset_reader_ranks=None,
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
             cpu_backend="gloo",
@@ -299,7 +319,7 @@ def _assert_checkpoint_step_error_is_collective(mesh: Any) -> None:
             seq_len=4,
             local_batch_size=1,
             dp_dim_names=("dp",),
-            source_loader_ranks=(0, 1, 2, 3),
+            dataset_reader_ranks=(0, 1, 2, 3),
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
             cpu_backend="gloo",
@@ -344,7 +364,7 @@ def _assert_model_peer_checkpoint_step_error_is_collective(mesh: Any) -> None:
             seq_len=4,
             local_batch_size=1,
             dp_dim_names=("dp",),
-            source_loader_ranks=None,
+            dataset_reader_ranks=None,
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
             cpu_backend="gloo",
@@ -390,18 +410,18 @@ def _assert_model_peer_checkpoint_step_error_is_collective(mesh: Any) -> None:
         f"rank={rank}, last_plan_id={post_state['last_plan_id']!r}, last_plan={loader.last_plan!r}."
     )
     if rank in _CONSTRUCTOR_RANKS:
-        source_state = post_state["source_loader"]
-        assert source_state["next_ordinal"] == 0 and not source_state["buffer"], (
-            f"MP-state preflight must fail before Source reads or commits samples: "
-            f"rank={rank}, next_ordinal={source_state['next_ordinal']}, buffer={source_state['buffer']!r}."
+        reader_state = post_state["dataset_reader"]
+        assert reader_state["next_ordinal"] == 0 and not reader_state["buffer"], (
+            f"MP-state preflight must fail before Dataset Readers read or commit samples: "
+            f"rank={rank}, next_ordinal={reader_state['next_ordinal']}, buffer={reader_state['buffer']!r}."
         )
     dist.monitored_barrier(timeout=timedelta(seconds=30))
 
 
-def _run_epoch(mesh: Any, source_loader_ranks: tuple[int, ...] | None) -> None:
+def _run_epoch(mesh: Any, dataset_reader_ranks: tuple[int, ...] | None) -> None:
     rank = dist.get_rank()
-    effective_sources = source_loader_ranks or _CONSTRUCTOR_RANKS
-    dataset = _RawDataset() if rank in effective_sources else None
+    effective_readers = dataset_reader_ranks or _CONSTRUCTOR_RANKS
+    dataset = _RawDataset() if rank in effective_readers else None
     loader = build_distributed_dataloader(
         dataset,
         mesh,
@@ -409,7 +429,7 @@ def _run_epoch(mesh: Any, source_loader_ranks: tuple[int, ...] | None) -> None:
             seq_len=4,
             local_batch_size=1,
             dp_dim_names=("dp",),
-            source_loader_ranks=source_loader_ranks,
+            dataset_reader_ranks=dataset_reader_ranks,
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
             cpu_backend="gloo",
@@ -424,18 +444,18 @@ def _run_epoch(mesh: Any, source_loader_ranks: tuple[int, ...] | None) -> None:
     _assert_exactly_once(outputs)
 
     gathered_plans = _all_gather_object(loader.last_plan)
-    for source_rank in effective_sources:
-        assert gathered_plans[source_rank] == gathered_plans[effective_sources[0]], (
+    for reader_rank in effective_readers:
+        assert gathered_plans[reader_rank] == gathered_plans[effective_readers[0]], (
             f"All data-plane ranks must receive the same plan: "
-            f"rank{effective_sources[0]}={gathered_plans[effective_sources[0]]!r}, "
-            f"rank{source_rank}={gathered_plans[source_rank]!r}."
+            f"rank{effective_readers[0]}={gathered_plans[effective_readers[0]]!r}, "
+            f"rank{reader_rank}={gathered_plans[reader_rank]!r}."
         )
-    for model_only_rank in set(range(_WORLD_SIZE)) - set(effective_sources):
+    for model_only_rank in set(range(_WORLD_SIZE)) - set(effective_readers):
         assert gathered_plans[model_only_rank] is None, (
             f"A model-only rank must wait for MP delivery without joining planning: "
             f"rank={model_only_rank}, plan={gathered_plans[model_only_rank]!r}."
         )
-    reference_plan = gathered_plans[effective_sources[0]]
+    reference_plan = gathered_plans[effective_readers[0]]
     assert isinstance(reference_plan, DistributedPackingPlan), (
         f"A data-plane rank must retain the last distributed plan: plan={reference_plan!r}."
     )
@@ -452,7 +472,7 @@ def _run_default_constructor_epoch(mesh: Any) -> None:
             seq_len=2,
             local_batch_size=2,
             dp_dim_names=("dp",),
-            source_loader_ranks=None,
+            dataset_reader_ranks=None,
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
             cpu_backend="gloo",
@@ -491,6 +511,52 @@ def _run_default_constructor_epoch(mesh: Any) -> None:
     _assert_collective_stop(loader)
 
 
+def _run_sidecar_direct_read_epoch(mesh: Any) -> None:
+    """Verify disjoint metadata readers and constructors need no payload A2A."""
+    rank = dist.get_rank()
+    reader_ranks = (1, 3)
+    metadata = (
+        tuple(SampleMetadata(pack_tokens=1, cost=WorkloadCost(llm=1.0), sample_id=index)
+              for index in range(_DATASET_SIZE))
+        if rank in reader_ranks
+        else None
+    )
+    dataset = _RawDataset(reader_rank=rank) if rank in _CONSTRUCTOR_RANKS else None
+    loader = build_distributed_dataloader(
+        dataset,
+        mesh,
+        DistributedDatasetConfig(
+            seq_len=4,
+            local_batch_size=1,
+            dp_dim_names=("dp",),
+            dataset_reader_ranks=reader_ranks,
+            buffer_size_multiplier=1.0,
+            max_buffered_samples=8,
+            cpu_backend="gloo",
+        ),
+        metadata=metadata,
+        pack_fn=_pack_fn,
+        collate_fn=_collate_fn,
+    )
+
+    with patch.object(dist, "all_to_all_single", side_effect=AssertionError("sidecar path entered payload A2A")):
+        outputs = _all_gather_object(next(loader))
+
+    _assert_same_model_parallel_batches(outputs)
+    _assert_exactly_once(outputs)
+    for constructor_rank in _CONSTRUCTOR_RANKS:
+        reader_ranks = {
+            reader_rank
+            for packed_sequence in outputs[constructor_rank]
+            for reader_rank in packed_sequence["reader_ranks"]
+        }
+        assert reader_ranks == {constructor_rank}, (
+            f"Sidecar samples must be read directly by their target constructor: "
+            f"constructor={constructor_rank}, readers={reader_ranks}."
+        )
+    _assert_collective_stop(loader)
+
+
 def _assert_metadata_error_is_collective(mesh: Any) -> None:
     loader = build_distributed_dataloader(
         _RawDataset(),
@@ -499,7 +565,7 @@ def _assert_metadata_error_is_collective(mesh: Any) -> None:
             seq_len=4,
             local_batch_size=1,
             dp_dim_names=("dp",),
-            source_loader_ranks=(0, 1, 2, 3),
+            dataset_reader_ranks=(0, 1, 2, 3),
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
             cpu_backend="gloo",
@@ -515,7 +581,7 @@ def _assert_metadata_error_is_collective(mesh: Any) -> None:
         error = str(exc)
     errors = _all_gather_object(error)
     assert all(message == errors[0] for message in errors), (
-        f"Every model rank must receive the same Source Loader error: errors={errors!r}."
+        f"Every model rank must receive the same Dataset Reader error: errors={errors!r}."
     )
     assert "injected metadata failure" in errors[0], (
         f"The collective failure must retain its root cause: error={errors[0]!r}."
@@ -524,7 +590,7 @@ def _assert_metadata_error_is_collective(mesh: Any) -> None:
 
 
 def test_dynamic_packing_dp2_mp2_gloo() -> None:
-    """Verify Source Loader, Planner, and Data Constructor delivery on DP=2/MP=2."""
+    """Verify Dataset Reader, Planner, and Data Constructor delivery on DP=2/MP=2."""
     dist.init_process_group(backend="gloo")
     try:
         world_size = dist.get_world_size()
@@ -545,23 +611,27 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         # same callback mode as omitting pack_fn on the other WORLD ranks.
         _assert_explicit_default_pack_is_equivalent(mesh)
 
-        # Rank 1 is a pure MP peer in the default Source topology. Its divergent
-        # checkpoint state must fail on WORLD before Sources read any sample.
+        # Rank 1 is a pure MP peer in the default Dataset Reader topology. Its
+        # divergent checkpoint state must fail before readers consume samples.
         _assert_model_peer_checkpoint_step_error_is_collective(mesh)
 
         # A fresh default loader must remain usable immediately after the
         # synchronized MP-state failure, proving collective order was preserved.
-        _run_epoch(mesh, source_loader_ranks=None)
+        _run_epoch(mesh, dataset_reader_ranks=None)
 
         # Without construction callbacks, the built-in constructor returns
         # local-batch and packing-bin structure as nested immutable tuples.
         _run_default_constructor_epoch(mesh)
 
-        # All ranks act as Sources, so payloads from MP peers must route to a
-        # Data Constructor before their constructed batches return over MP.
-        _run_epoch(mesh, source_loader_ranks=(0, 1, 2, 3))
+        # Sidecar Dataset Readers expose metadata only. Constructors read
+        # planned indices locally, so disjoint reader/constructor ranks need no A2A.
+        _run_sidecar_direct_read_epoch(mesh)
 
-        # A single Source callback failure must reach every model rank before
+        # All ranks act as Dataset Readers, so payloads from MP peers must route to a
+        # Data Constructor before their constructed batches return over MP.
+        _run_epoch(mesh, dataset_reader_ranks=(0, 1, 2, 3))
+
+        # A single Dataset Reader callback failure must reach every model rank before
         # any participant enters payload or MP collectives in a different order.
         _assert_metadata_error_is_collective(mesh)
 

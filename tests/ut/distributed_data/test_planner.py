@@ -26,15 +26,15 @@ from hyper_parallel.distributed_data.schema import (
 
 
 def _candidate(
-        source_index: int,
+        dataset_index: int,
         pack_tokens: int,
         *,
         cost: WorkloadCost = WorkloadCost(),
-        source_rank: int = 0,
+        reader_rank: int = 0,
 ) -> BufferedSampleMetadata:
     return BufferedSampleMetadata(
-        key=SampleKey(source_rank, source_index),
-        metadata=SampleMetadata(pack_tokens=pack_tokens, cost=cost, sample_id=source_index),
+        key=SampleKey(reader_rank, dataset_index),
+        metadata=SampleMetadata(pack_tokens=pack_tokens, cost=cost, sample_id=dataset_index),
     )
 
 
@@ -83,7 +83,7 @@ class TestDynamicPackingPlanner(unittest.TestCase):
                 index,
                 tokens,
                 cost=WorkloadCost(encoder=encoder_cost, llm=tokens),
-                source_rank=index % 2,
+                reader_rank=index % 2,
             )
             for index, (tokens, encoder_cost) in enumerate(((8, 2), (7, 9), (6, 1), (5, 4), (4, 3), (3, 8)))
         )

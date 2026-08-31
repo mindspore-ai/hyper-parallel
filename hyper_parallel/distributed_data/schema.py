@@ -88,7 +88,7 @@ class WorkloadCost:
 
 @dataclass(frozen=True)
 class SampleMetadata:
-    """Lightweight metadata derived after a Source Loader reads one sample.
+    """Lightweight metadata used to plan one Dataset sample.
 
     Args:
         pack_tokens: Tokens occupied by the sample in a packed sequence. This
@@ -118,14 +118,14 @@ class SampleMetadata:
 
 @dataclass(frozen=True, order=True)
 class SampleKey:
-    """Stable identity assigned by a Source Loader to one materialized sample."""
+    """Stable identity for one Dataset sample owned by a Dataset Reader."""
 
-    source_rank: int
-    source_index: int
+    reader_rank: int
+    dataset_index: int
 
     def __post_init__(self) -> None:
         """Validate non-negative routing coordinates."""
-        for name in ("source_rank", "source_index"):
+        for name in ("reader_rank", "dataset_index"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"SampleKey.{name} must be a non-negative integer, but got {value!r}.")
@@ -133,7 +133,7 @@ class SampleKey:
 
 @dataclass(frozen=True)
 class BufferedSampleMetadata:
-    """Planner-visible metadata for one payload resident in a Source Loader."""
+    """Planner-visible metadata for one sample owned by a Dataset Reader."""
 
     key: SampleKey
     metadata: SampleMetadata
