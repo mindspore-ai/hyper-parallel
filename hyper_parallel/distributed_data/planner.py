@@ -94,11 +94,12 @@ class DynamicPackingPlanner:
     ) -> DistributedPackingPlan | None:
         """Create one full distributed packing plan.
 
-        Candidates not selected because they do not fit remain in their Source
-        Loader buffer for the next call.
+        Candidates not selected because they do not fit remain in their Dataset
+        Reader buffers for the next call.
 
         Args:
-            candidates: Lightweight metadata for all current source buffers.
+            candidates: Lightweight metadata for all current Dataset Reader
+                buffers.
             step: Zero-based distributed-yield index.
 
         Returns:
@@ -276,7 +277,7 @@ class DynamicPackingPlanner:
                         {
                             "pack_index": packing_bin.pack_index,
                             "samples": [
-                                [sample.key.source_rank, sample.key.source_index]
+                                [sample.key.reader_rank, sample.key.dataset_index]
                                 for sample in packing_bin.samples
                             ],
                         }

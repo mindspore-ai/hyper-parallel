@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Standalone end-to-end tests for Source Loader to Data Constructor flow."""
+"""Standalone end-to-end tests for Dataset Reader to Data Constructor flow."""
 
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from hyper_parallel.distributed_data import (
     DistributedDataLoader,
@@ -149,6 +150,107 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         self.assertIsNotNone(loader.last_plan_id)
         with self.assertRaises(StopIteration):
             next(loader)
+
+    def test_sidecar_plans_before_direct_reads_and_skips_payload_a2a(self) -> None:
+        """Sidecar mode should read only constructor-assigned indices after planning."""
+        read_indices = []
+
+        class _RecordingDataset:
+            def __init__(self) -> None:
+                """Store four deterministic raw samples."""
+                self.samples = [
+                    {"id": 0, "tokens": 6},
+                    {"id": 1, "tokens": 4},
+                    {"id": 2, "tokens": 6},
+                    {"id": 3, "tokens": 4},
+                ]
+
+            def __len__(self) -> int:
+                """Return the shared sidecar index-space size."""
+                return len(self.samples)
+
+            def __getitem__(self, index: int) -> dict[str, int]:
+                """Record each direct read performed after planning."""
+                read_indices.append(index)
+                return self.samples[index]
+
+        dataset = _RecordingDataset()
+        metadata = [
+            SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
+            for sample in dataset.samples
+        ]
+        loader = build_distributed_dataloader(
+            dataset,
+            _StandaloneMesh(),
+            DistributedDatasetConfig(seq_len=10, local_batch_size=2, buffer_size_multiplier=1.0),
+            metadata=metadata,
+        )
+        self.assertEqual(read_indices, [])
+
+        with (
+                patch.object(loader._data_plane, "prepare_exchange", side_effect=AssertionError("unexpected A2A")),
+                patch.object(loader._data_plane, "exchange_prepared", side_effect=AssertionError("unexpected A2A")),
+        ):
+            batch = next(loader)
+
+        self.assertEqual(batch, ((dataset.samples[0], dataset.samples[1]), (dataset.samples[2], dataset.samples[3])))
+        self.assertEqual(read_indices, [0, 1, 2, 3])
+        planned_indices = [
+            sample.key.dataset_index
+            for packing_bin in loader.last_plan.constructor_for(0).bins
+            for sample in packing_bin.samples
+        ]
+        self.assertEqual(read_indices, planned_indices)
+
+    def test_sidecar_checkpoint_replays_metadata_buffer_without_payloads(self) -> None:
+        """Sidecar resume should preserve future plans while rereading only selected indices."""
+        samples = [{"id": index, "tokens": 6 if index % 2 == 0 else 4} for index in range(6)]
+        metadata = [
+            SampleMetadata(pack_tokens=sample["tokens"], sample_id=sample["id"])
+            for sample in samples
+        ]
+        config = DistributedDatasetConfig(
+            seq_len=10,
+            local_batch_size=1,
+            buffer_size_multiplier=2.0,
+            shuffle=True,
+        )
+
+        baseline = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
+        baseline.set_epoch(3)
+        first_batch = next(baseline)
+        self.assertEqual(len(first_batch), 1)
+        checkpoint = baseline.state_dict()
+        self.assertEqual(checkpoint["epoch"], 3)
+        self.assertEqual(checkpoint["sidecar_reader"]["epoch"], 3)
+        self.assertEqual(checkpoint["direct_sample_loader"]["epoch"], 3)
+        expected_batches, expected_plan_ids = _drain(baseline)
+
+        resumed = build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata)
+        resumed.load_state_dict(checkpoint)
+        actual_batches, actual_plan_ids = _drain(resumed)
+
+        self.assertEqual(actual_batches, expected_batches)
+        self.assertEqual(actual_plan_ids, expected_plan_ids)
+
+    def test_builder_rejects_ambiguous_or_misaligned_metadata(self) -> None:
+        """Online and sidecar inputs must be exclusive and share one index space."""
+        samples = [{"id": 0, "tokens": 4}]
+        metadata = [SampleMetadata(pack_tokens=4, sample_id=0)]
+        config = DistributedDatasetConfig(seq_len=4, local_batch_size=1)
+
+        with self.assertRaisesRegex(ValueError, "either online metadata_fn or sidecar metadata"):
+            build_distributed_dataloader(
+                samples,
+                _StandaloneMesh(),
+                config,
+                metadata_fn=lambda sample: metadata[0],
+                metadata=metadata,
+            )
+        with self.assertRaisesRegex(ValueError, "must provide metadata"):
+            build_distributed_dataloader(samples, _StandaloneMesh(), config)
+        with self.assertRaisesRegex(ValueError, "does not match Dataset length"):
+            build_distributed_dataloader(samples, _StandaloneMesh(), config, metadata=metadata * 2)
 
     def test_prepacked_sample_can_be_one_complete_local_batch(self) -> None:
         """A full-length raw sample naturally remains a singleton constructor bin."""

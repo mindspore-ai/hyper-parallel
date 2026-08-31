@@ -53,7 +53,7 @@ def default_collate_fn(packed_sequences: Sequence[Any]) -> tuple[Any, ...]:
 class PackingDataConstructor:
     """Apply configured packing per planned bin and collate one local batch.
 
-    ``pack_fn`` never runs in a Source Loader. It receives raw samples only
+    ``pack_fn`` never runs in a Dataset Reader. It receives raw samples only
     after sample-level planning and CPU redistribution have completed.
     """
 
@@ -89,7 +89,8 @@ class PackingDataConstructor:
 
         Args:
             plan: Ordered packing bins assigned to this Data Constructor.
-            payloads: Received raw samples keyed by stable Source Loader key.
+            payloads: Received raw samples keyed by stable Dataset Reader and
+                Dataset-index identity.
 
         Returns:
             User-collated rank-local batch.

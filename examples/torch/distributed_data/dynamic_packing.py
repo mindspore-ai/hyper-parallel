@@ -108,7 +108,7 @@ def main() -> None:
         DistributedDatasetConfig(
             seq_len=16,
             local_batch_size=2,
-            source_loader_ranks=(0, 1, 2, 3),
+            dataset_reader_ranks=(0, 1, 2, 3),
         ),
         metadata_fn=metadata_fn,
         pack_fn=pack_fn,

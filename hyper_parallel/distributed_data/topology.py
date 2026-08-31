@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Derive Source Loader and Data Constructor ownership from a named mesh."""
+"""Derive Dataset Reader and Data Constructor ownership from a named mesh."""
 # This distributed-data package is intentionally PyTorch-only.
 
 from __future__ import annotations
