@@ -541,6 +541,166 @@ TP=2 checkpoint → TP=4 load
 关键中间 tensor、loss 和 gradient 与 TP=1 baseline 在既定容差内一致。仅通过 coverage check 或仅完成 forward 不能
 视为适配完成。
 
+### 12.5 当前 TP=1/TP=2 精度验证结果
+
+以下结果来自 Qwen3.8-27B 的单步因果诊断。两组实验使用相同的 8 条 token sequence：TP=1 使用 FSDP size 8 和一个
+micro-batch，TP=2 使用 FSDP size 4 和两个 micro-batch。为控制诊断成本，每条 sequence 截取前 16 tokens；这些数值
+用于定位误差来源，不能直接代替 1024 tokens 训练的最终验收结果。
+
+#### 12.5.1 原始前向对拍
+
+固定输入和权重后，TP=2 两个 TP rank 在每个 decoder layer 的通信后输出、final norm 输出及 logits 上完全一致，说明
+对应 boundary 的 TP collective 没有漏通信。TP=2 与 TP=1 的相对 RMS 误差沿网络逐步累积：
+
+| 对拍点 | TP=2 vs TP=1 relative RMS |
+| --- | ---: |
+| Layer 0 output | 0.2602% |
+| Layer 15 output | 0.7455% |
+| Layer 31 output | 1.1579% |
+| Layer 47 output | 1.2903% |
+| Layer 63 output | 1.4739% |
+| Final norm output | 1.6270% |
+| Final logits | 0.7559% |
+
+在 8172 个有效 token 的训练样本对拍中，TP=1 与 TP=2 的 Cross Entropy 分别为 `2.4429018497` 和
+`2.4426879883`；token loss 的 mean absolute delta 为 `0.021459`，max absolute delta 为 `0.392774`。
+
+对 RowWise projection 的两个 TP partial 做 FP32 手工求和后，结果仍与 TP=1 完整 GEMM 存在误差；改成 BF16 求和
+只会额外增加一部分误差。例如 Layer 0：
+
+| 算子 | FP32 partial SUM vs TP=1 | BF16 partial SUM vs TP=1 |
+| --- | ---: | ---: |
+| GDN `out_proj` | 0.2106% | 0.2891% |
+| MLP `down_proj` | 0.7322% | 0.7547% |
+
+这说明前向误差不能全部归因于 BF16 AllReduce；TP 分块 GEMM 与完整 GEMM 的累加顺序本身已经产生差异。
+
+#### 12.5.2 激活注入因果实验
+
+TP=2 每层 forward 仍执行真实 TP 计算，但在 boundary 输出处使用：
+
+```python
+corrected = tp2_hidden + (tp1_hidden - tp2_hidden).detach()
+```
+
+由此 forward value 等于 TP=1，而 backward 保留 TP=2 的局部 Jacobian。结果为：
+
+| 场景 | Loss | Logits relative RMS | Trainer grad norm |
+| --- | ---: | ---: | ---: |
+| TP=1 | 4.7247419357 | 0 | 78.82117 |
+| TP=2，未注入 | 4.7299818993 | 0.8183% | 79.15486 |
+| TP=2，注入全部 layer output | 4.7247419357 | 0 | 78.92594 |
+
+把前向值修正为 TP=1 后，本实验中的 grad norm 差距由约 0.423% 降至约 0.129%。因此前向数值误差确实会通过
+backward 改变梯度，但仅修正 forward value 不能消除 TP 分块 Jacobian 的差异。
+
+独立 grad norm 使用每个参数 local gradient 的 FP32 平方和，根据参数 source placement 去除 TP replica 重复项，再
+跨 rank 求和重建。TP=2 激活注入组中，Trainer 内部 grad norm 为 `78.92594`，独立结果为 `78.93059`，相差约
+0.0059%。因此剩余差异不是 grad norm 聚合公式、TP replica 重复计数或漏计数造成的。
+
+#### 12.5.3 GDN 参数完整梯度重建
+
+`conv1d.weight` 和 `in_proj_qkv.weight` 的最终 placement 为 FSDP `StridedShard(0, 2)` 与 TP
+`PackedShard(0, Q/K/V)`。对保存的 FSDP gradient shards 先沿 FSDP 维重建 TP-local packed gradient，再按 Q/K/V
+section 恢复全局逻辑顺序。Layer 13 的结果为：
+
+| 参数或 section | TP=1 norm | TP=2 norm | relative L2 |
+| --- | ---: | ---: | ---: |
+| `conv1d.weight` | 5.96926 | 6.31900 | 7.8208% |
+| `conv1d.weight/Q` | 2.44604 | 2.43568 | 5.1631% |
+| `conv1d.weight/K` | 5.30027 | 5.69540 | 8.4609% |
+| `conv1d.weight/V` | 1.24746 | 1.24884 | 2.3898% |
+| `in_proj_qkv.weight` | 4.83262 | 5.01927 | 7.6826% |
+
+`conv1d.weight` 的最大元素误差位于全局 K section 的第 640 个通道、卷积核第 4 个位置：TP=1 为 `4.75`，TP=2
+为 `5.125`。最大的 12 个元素贡献约 91.77% 的误差平方和，说明 5.86% 的参数 norm 差主要由少量梯度尖峰主导，
+不是整个 K section 等比例偏移。
+
+#### 12.5.4 同时注入激活与 boundary gradient
+
+为区分“Layer 13 局部 backward 错误”和“下游梯度误差传播到 Layer 13”，TP=2 在注入 TP=1 layer output 的基础上，
+进一步在每个 decoder boundary backward 注入 TP=1 `grad_output`。TP=2 的两个 micro-batch 使用对应 TP=1 gradient
+的二分之一，以保持 loss scaling 一致。
+
+| 场景 | 独立重建 grad norm |
+| --- | ---: |
+| TP=1 | 78.82919 |
+| TP=2，仅注入激活 | 78.93059 |
+| TP=2，注入激活与 `grad_output` | 78.83354 |
+
+双注入后整体 grad norm 与 TP=1 相差约 0.0055%。Layer 13 的变化为：
+
+| 指标 | 仅注入激活 | 同时注入 `grad_output` |
+| --- | ---: | ---: |
+| `conv1d.weight` norm | 6.31900 | 5.99228 |
+| 相对 TP=1 的 norm 差 | 5.86% | 0.39% |
+| 逐元素 relative L2 | 7.82% | 0.63% |
+| 最大元素误差 | 0.375 | 0.03125 |
+
+该实验说明 Layer 13 的大部分参数梯度尖峰来自其收到的上游 gradient，而不是 Layer 13 `PackedShard`、FSDP
+ReduceScatter 或 GDN local backward 单独产生。
+
+#### 12.5.5 顶部 backward 与 64 层边界对拍
+
+在 logits 已严格对齐的控制组中，依次比较 CE、lm_head、final norm 和 decoder layer boundary。`lm_head` 与 layer
+boundary 的 hook 捕获 TP-local partial gradient，因此必须先将两个 TP rank 的 partial 做 SUM，再与 TP=1 比较；不能
+把单个 TP rank 的 hook 结果直接乘以 TP size。
+
+| 对拍点 | TP=2 vs TP=1 relative L2 | norm ratio |
+| --- | ---: | ---: |
+| `dlogits` | 约 0 | 1.000000 |
+| `lm_head` backward 输出 | 0.1882% | 1.000021 |
+| Final norm backward 输出 | 0.2156% | 1.000025 |
+| Layer 63 backward 输出 | 0.5596% | 0.999988 |
+| Layer 62 backward 输出 | 0.7035% | 1.000143 |
+| Layer 60 backward 输出 | 0.8761% | 1.000417 |
+| Layer 48 backward 输出 | 1.5173% | 1.000168 |
+| Layer 32 backward 输出 | 1.9662% | 0.999868 |
+| Layer 13 backward 输出 | 2.4274% | 1.000837 |
+| Layer 0 backward 输出 | 2.5833% | 0.999653 |
+
+从 layer output gradient 到 layer input gradient 的最大单层 relative L2 增量依次包括：Layer 63 `+0.3439%`、
+Layer 62 `+0.1440%`、Layer 13 `+0.1210%` 和 Layer 61 `+0.1044%`。Layer 63 是 full-attention decoder layer，
+Layer 62、61、13 是 linear-attention decoder layer。
+
+### 12.6 当前结果的归因边界与后续验证
+
+当前结果不能归纳为“误差都来自 Attention 累积”，原因如下：
+
+1. 原始 forward 已经存在逐层误差。误差同时经过 GDN/full attention、MoE/MLP、residual 和 norm，现有 layer boundary
+   数据没有把这些分支拆开。
+2. 激活注入只固定 forward value，没有把 TP 分块算子的 Jacobian 改成 TP=1。相同输出值并不意味着 backward 路径
+   相同。
+3. Layer 63 的 boundary relative L2 增量最大，只能说明第一个 decoder layer 级明显放大发生在 Layer 63。该层同时
+   包含 full attention、MoE/MLP、residual 和 normalization，不能据此只归因于 attention。
+4. `lm_head` backward 的 relative L2 为 0.1882%，但 norm ratio 接近 1；它是顶部误差种子之一，不足以解释后续
+   2.5% 的方向误差和个别参数的梯度尖峰。
+5. 参数 gradient norm 对少量大元素很敏感。Layer 13 的 5.86% norm 差不能直接理解为该层全部 gradient 普遍相差
+   5.86%。
+
+因此当前可确认的结论是：
+
+```text
+TP forward 分块 GEMM/collective 产生数值差异
+  + TP backward 从 lm_head 开始产生小的 partial-SUM 差异
+  → 差异经过多个完整 decoder layer 的 Jacobian 逐步传播和放大
+  → 少量 GDN 参数元素形成明显 gradient spike
+```
+
+其中“哪个子模块贡献最大”仍未确定。下一步应在 Layer 63 和 Layer 62 内增加以下边界对拍：
+
+```text
+decoder grad_output
+  → residual 分支
+  → MoE/MLP grad_input
+  → attention/GDN out_proj grad_input
+  → Q/K/V 或 GDN recurrent core grad_input
+  → decoder grad_input
+```
+
+每个点都按 source placement 重建完整逻辑 gradient，并同时比较 relative L2、norm ratio、cosine 和 top-k error power。
+只有在 attention 分支的输入输出之间观察到独立于 MLP/residual 的显著增量，才能把对应误差归因于 Attention。
+
 ## 13. 实施顺序
 
 1. 在标准 plan placement 中定义 `PackedShard` 及其序列化表示；
