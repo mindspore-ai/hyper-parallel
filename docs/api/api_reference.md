@@ -803,33 +803,6 @@ get_hyper_optimizer(
 
 ---
 
-### `get_hyper_lr_scheduler`
-
-学习率调度器工厂函数。
-
-```python
-get_hyper_lr_scheduler(
-    optimizer: ChainedOptimizer,
-    total_steps: int,
-    warmup_steps: int = 0,
-    warmup_ratio: float = 0.0,
-    decay_style: str = "cosine",
-    lr: float = 1e-4,
-    lr_min: float = 1e-7,
-    lr_start: float = 0.0,
-    lr_decay_ratio: float = 1.0,
-    wsd_decay_steps: Optional[int] = None,
-    lr_wsd_decay_style: str = "exponential",
-    override_opt_param_scheduler: bool = False,
-) -> LRSchedulersContainer
-```
-
-**支持的 decay_style：** `"constant"` / `"linear"` / `"cosine"` / `"WSD"`
-
-**支持的 WSD decay_style：** `"linear"` / `"cosine"` / `"exponential"` / `"minus_sqrt"`
-
----
-
 ## Activation Checkpoint / Swap
 
 > PyTorch 与 MindSpore 后端均已实现。公共 API 位于 `hyper_parallel.core.activation_checkpoint`。

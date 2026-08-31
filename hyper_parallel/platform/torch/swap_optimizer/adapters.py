@@ -24,8 +24,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
-from hyper_parallel.core.optimizer.adamw import AdamW as HyperAdamW
-from hyper_parallel.core.optimizer.adamw import adamw as hyper_adamw
+from hyper_parallel.core.optimizer.adamw import AdamW as NewAdamW
+from hyper_parallel.core.optimizer.adamw import adamw as new_adamw
 from hyper_parallel.core.optimizer.swap_optimizer_base import (
     OptimizerSwapAdapter,
     SwapSlot,
@@ -39,7 +39,7 @@ class TorchAdamBaseAdapter(OptimizerSwapAdapter):
     functional_name = "adam"
     supported_cls = ()
     decoupled_weight_decay = False
-    is_hyper_adamw = False
+    is_new_adamw = False
     supports_fused = False
 
     @classmethod
@@ -72,7 +72,7 @@ class TorchAdamBaseAdapter(OptimizerSwapAdapter):
 
         units = []
         for group_index, group in enumerate(self.optimizer.param_groups):
-            if self.is_hyper_adamw:
+            if self.is_new_adamw:
                 group["step"] = (group.get("step") or 0) + 1
             for param in group["params"]:
                 grad = getattr(param, "grad", None)
@@ -95,7 +95,7 @@ class TorchAdamBaseAdapter(OptimizerSwapAdapter):
         """Build a stable packed layout while retaining inactive materialized states."""
         records = []
         for group_index, group in enumerate(self.optimizer.param_groups):
-            if self.is_hyper_adamw:
+            if self.is_new_adamw:
                 group["step"] = (group.get("step") or 0) + 1
             for param in group["params"]:
                 grad = getattr(param, "grad", None)
@@ -168,7 +168,7 @@ class TorchAdamBaseAdapter(OptimizerSwapAdapter):
                     max_exp_avg_sqs.append(
                         self._slot_tensor(unit, "max_exp_avg_sq", state["max_exp_avg_sq"])
                     )
-                if self.is_hyper_adamw:
+                if self.is_new_adamw:
                     state_steps.append(None)
                 else:
                     state_steps.append(state["step"])
@@ -176,10 +176,10 @@ class TorchAdamBaseAdapter(OptimizerSwapAdapter):
             if not params:
                 continue
 
-            if self.is_hyper_adamw:
+            if self.is_new_adamw:
                 if params and params[0].device.type == "cpu":
                     # torch.optim._functional.adamw increments tensor state_steps
-                    # internally. Hyper AdamW already advanced group["step"] in
+                    # internally. New AdamW already advanced group["step"] in
                     # prepare_step(), so feed step - 1 to preserve outer-step
                     # semantics for CPU-only tests.
                     step_tensor = torch.tensor(float(group["step"] - 1), dtype=torch.float32)
@@ -206,7 +206,7 @@ class TorchAdamBaseAdapter(OptimizerSwapAdapter):
                         has_complex=False,
                     )
                 else:
-                    hyper_adamw(
+                    new_adamw(
                         params,
                         grads,
                         exp_avgs,
@@ -428,7 +428,7 @@ class TorchAdamBaseAdapter(OptimizerSwapAdapter):
         """Initialize missing Adam state and swap slots for one parameter."""
         del grad
         state = self.optimizer.state[param]
-        if not self.is_hyper_adamw and len(state) == 0:
+        if not self.is_new_adamw and len(state) == 0:
             step_device = (
                 param.device
                 if group.get("fused", False)
@@ -611,13 +611,13 @@ class TorchNativeAdamWAdapter(TorchAdamBaseAdapter):
         return isinstance(optimizer, torch.optim.AdamW)
 
 
-class TorchHyperAdamWAdapter(TorchAdamBaseAdapter):
+class TorchNewAdamWAdapter(TorchAdamBaseAdapter):
     """Adapter for hyper-parallel's fused AdamW."""
 
     functional_name = "adamw"
-    supported_cls = (HyperAdamW,)
-    is_hyper_adamw = True
+    supported_cls = (NewAdamW,)
+    is_new_adamw = True
 
     @classmethod
     def matches(cls, optimizer: Any) -> bool:
-        return isinstance(optimizer, HyperAdamW)
+        return isinstance(optimizer, NewAdamW)

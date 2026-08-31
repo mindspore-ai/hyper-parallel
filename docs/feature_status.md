@@ -117,7 +117,7 @@
 - [x] AdamW
 - [x] Muon（momentum-based optimizer）
 - [x] ChainedOptimizer（Muon + AdamW 链式组合）
-- [x] get_hyper_optimizer / get_hyper_lr_scheduler
+- [x] get_hyper_optimizer
 - [x] 分片优化器（FSDP / HSDP 集成）
 - [x] gradient scaling factor + clip_grad 增强
 

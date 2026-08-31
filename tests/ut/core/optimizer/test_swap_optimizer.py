@@ -27,7 +27,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 
 from hyper_parallel.core.optimizer import SwapOptimizerConfig, swap_optimizer
-from hyper_parallel.core.optimizer.adamw import AdamW as HyperAdamW
+from hyper_parallel.core.optimizer.adamw import AdamW as NewAdamW
 from hyper_parallel.core.optimizer.swap_optimizer_base import (
     PipelineSwapRuntime,
     SwapSlot,
@@ -594,7 +594,7 @@ class TestTorchSwapOptimizer(unittest.TestCase):
         adapter.runtime = runtime
         adapter.config = runtime.config
         adapter._slots = {}
-        adapter.is_hyper_adamw = True
+        adapter.is_new_adamw = True
 
         with mock.patch.object(torch, "zeros_like", wraps=torch.zeros_like) as zeros_like:
             adapter._init_param_state(param, object(), {"amsgrad": False})
@@ -985,10 +985,10 @@ class TestTorchSwapOptimizer(unittest.TestCase):
         self.assertEqual(released, [slot])
         self.assertEqual(prepared, [slot])
 
-    def test_hyper_adamw_prepare_step_increments_group_once(self):
-        """Hyper AdamW unit preparation advances the group counter once."""
+    def test_new_adamw_prepare_step_increments_group_once(self):
+        """New AdamW unit preparation advances the group counter once."""
         param = torch.nn.Parameter(torch.ones(8))
-        optimizer = HyperAdamW([param], lr=0.01)
+        optimizer = NewAdamW([param], lr=0.01)
         swapped = swap_optimizer(optimizer, SwapOptimizerConfig(swap_times=4, min_numel=1))
         param.grad = torch.ones_like(param)
 
