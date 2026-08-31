@@ -41,7 +41,6 @@ from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.distributed_checkpoint import (
     save as dcp_save,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class _MixedDtypeModel(nn.Module):
@@ -139,7 +138,6 @@ def _muon_step_parameters(muon_optimizer: Any) -> list[nn.Parameter]:
 class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
     """Cover group routing, gradient movement, copy-back, reset, and DCP state."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_groups_separate_low_precision_and_native_fp32_params(self):
         """Separate low-precision and native fp32 parameters.
 
@@ -159,7 +157,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertEqual(model.low.main_param.dtype, torch.float32)
         self.assertIs(model.fp32.main_param, model.fp32)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
     def test_main_param_preserves_dtensor_layout_and_optimizer_metadata(
             self,
@@ -203,7 +200,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertFalse(hasattr(main_param, "is_muon"))
         self.assertIs(optimizer.param_groups[0]["params"][0], main_param)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_prepare_step_copy_back_and_zero_grad(self):
         """Exercise gradient preparation, update, copy-back, and reset.
 
@@ -235,7 +231,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertIsNone(model.fp32.grad)
         self.assertIsNone(model.fp32.main_grad)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_reload_model_params_uses_current_model_value(self):
         """Reload main parameters from model storage.
 
@@ -255,7 +250,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
             model.low.float(),
         )
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_explicit_fp32_main_param_state_restores_unrepresentable_value(self):
         """Restore main-parameter values beyond bfloat16 precision.
 
@@ -281,7 +275,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertTrue(torch.equal(model.low.main_param, expected))
         self.assertFalse(torch.equal(model.low.main_param, model.low.float()))
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
     @patch(
         "hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
@@ -328,7 +321,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         restored_main_param = restored_optimizer.fp32_from_float16_groups[0][0]
         self.assertTrue(torch.equal(restored_main_param, expected))
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
     @patch(
         "hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
@@ -387,7 +379,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
             restored_model.low.float(),
         )
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
     @patch(
         "hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
@@ -428,7 +419,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "checkpoint is incomplete"):
                 DistributedCheckpointer().load(checkpoint_path, load_state)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_ordinary_optimizer_state_has_no_main_param_branch(self):
         """Keep the ordinary optimizer checkpoint path structurally independent.
 
@@ -444,7 +434,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
 
         self.assertNotIn("_mixed_precision_optimizer", optimizer.state_dict())
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_ordinary_state_reloads_main_params_and_corrupt_state_fails(self):
         """Reload ordinary state and reject corrupted main-parameter state.
 
@@ -479,7 +468,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "must be a mapping"):
             optimizer.load_state_dict(invalid_state)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_native_fp32_only_wrapper_has_empty_main_param_state(self):
         """Allow an empty main-param state for a native-fp32 model.
 
@@ -504,7 +492,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
             {},
         )
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_chained_optimizer_uses_model_fqns_for_main_param_state(self):
         """Use model FQNs for main-parameter optimizer state.
 
@@ -529,7 +516,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertEqual(set(state_dict["state"]["low"]), {"exp_avg", "exp_avg_sq"})
         self.assertEqual(state_dict["param_groups"][0]["step"], 1)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
     @patch(
         "hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
@@ -696,7 +682,6 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
 class TestMuonMainParamConstruction(unittest.TestCase):
     """Muon must rebuild identity-based caches after wrapper replacement."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_muon_wrapper_rebuilds_all_parameter_caches(self):
         """Rebuild Muon caches after replacing model parameters.
 

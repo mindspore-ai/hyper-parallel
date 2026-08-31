@@ -28,8 +28,6 @@ How to run:
 import unittest
 from types import SimpleNamespace
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.comm_time import cp_comm_layer_detailed
@@ -106,10 +104,6 @@ def _make_ccfg(**overrides):
 class TestAPCP01(unittest.TestCase):
     """AP-CP-01: Long sequence with CP → attention activation memory reduction."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_long_sequence_cp_memory_reduction(self):
         """
         Feature: CP Memory Estimation
@@ -142,10 +136,6 @@ class TestAPCP01(unittest.TestCase):
 class TestAPCP02(unittest.TestCase):
     """AP-CP-02: Varying cp_degree → memory and communication trends."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_varying_cp_degree_trends(self):
         """
         Feature: CP Memory and Communication Estimation
@@ -184,10 +174,6 @@ class TestAPCP02(unittest.TestCase):
 class TestAPCP03(unittest.TestCase):
     """AP-CP-03: Invalid seq_len divisibility → validation failure."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_invalid_seq_len_divisibility(self):
         """
         Feature: CP Constraint Validation
@@ -212,10 +198,6 @@ class TestAPCP03(unittest.TestCase):
 class TestAPCP04(unittest.TestCase):
     """AP-CP-04: CP + TP/PP combination → combined cost estimation."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_tp_combined_estimation(self):
         """
         Feature: CP + TP Combined Estimation
@@ -237,10 +219,6 @@ class TestAPCP04(unittest.TestCase):
         self.assertEqual(cp_comm.cp_degree, 4)
         self.assertGreater(cp_comm.total_kv_volume, 0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_pp_combined_estimation(self):
         """
         Feature: CP + PP Combined Estimation
@@ -278,10 +256,6 @@ class TestAPCP04(unittest.TestCase):
         )
         self.assertTrue(cp_result.is_valid)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_pp_device_sufficiency_in_validation(self):
         """
         Feature: CP + PP Device Sufficiency in Validation
@@ -300,10 +274,6 @@ class TestAPCP04(unittest.TestCase):
         self.assertFalse(cp_result.is_valid)
         self.assertFalse(cp_result.device_sufficient)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_tp_pp_combined_estimation(self):
         """
         Feature: CP + TP + PP Triple Combination
@@ -337,10 +307,6 @@ class TestAPCP04(unittest.TestCase):
 class TestAPCP05(unittest.TestCase):
     """AP-CP-05: CP + TP combination but layout not supported → infeasible reason."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cross_node_topology_penalty(self):
         """
         Feature: CP Topology Constraint
@@ -362,10 +328,6 @@ class TestAPCP05(unittest.TestCase):
         self.assertIn("cross", result.warning_message.lower())
         self.assertIsNotNone(result.topology_penalty)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_insufficient_heads_infeasible(self):
         """
         Feature: Ulysses CP+TP layout not supported
@@ -385,10 +347,6 @@ class TestAPCP05(unittest.TestCase):
         self.assertIsNotNone(result.unsupported_reason)
         self.assertIn("Ulysses", result.unsupported_reason)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_sp_with_cp_infeasible(self):
         """
         Feature: SP+CP layout not supported
@@ -411,10 +369,6 @@ class TestAPCP05(unittest.TestCase):
 class TestAPCP06(unittest.TestCase):
     """AP-CP-06: Short sequence with CP → warning or auto-filter."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_short_sequence_warning(self):
         """
         Feature: CP Short Sequence Detection
@@ -434,10 +388,6 @@ class TestAPCP06(unittest.TestCase):
         self.assertIsNotNone(result.warning_message)
         self.assertIn("short", result.warning_message.lower())
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_short_sequence_memory_estimation_still_works(self):
         """
         Feature: CP Short Sequence Estimation
@@ -457,10 +407,6 @@ class TestAPCP06(unittest.TestCase):
 class TestAttentionTypeDetection(unittest.TestCase):
     """Test attention type detection logic."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_mla_detection(self):
         """
         Feature: Attention type detection
@@ -471,10 +417,6 @@ class TestAttentionTypeDetection(unittest.TestCase):
         attn_type = detect_attention_type(ccfg)
         self.assertEqual(attn_type, AttentionType.MLA)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_gqa_detection(self):
         """
         Feature: Attention type detection
@@ -485,10 +427,6 @@ class TestAttentionTypeDetection(unittest.TestCase):
         attn_type = detect_attention_type(ccfg)
         self.assertEqual(attn_type, AttentionType.GQA)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_mha_detection(self):
         """
         Feature: Attention type detection
@@ -503,10 +441,6 @@ class TestAttentionTypeDetection(unittest.TestCase):
 class TestMLAModelMemoryEstimation(unittest.TestCase):
     """AP-CP-07: MLA model memory estimation."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_mla_memory_estimation(self):
         """
         Feature: MLA Memory Estimation
@@ -523,10 +457,6 @@ class TestMLAModelMemoryEstimation(unittest.TestCase):
         self.assertGreater(cp_memory.total_memory, 0)
         self.assertGreater(cp_memory.total_reduction, 0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_mla_vs_mha_comparison(self):
         """
         Feature: MLA vs MHA Memory Comparison
@@ -556,10 +486,6 @@ class TestMLAModelMemoryEstimation(unittest.TestCase):
 class TestBoundaryValues(unittest.TestCase):
     """AP-CP-08: Boundary value tests."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_degree_one_no_reduction(self):
         """
         Feature: CP Degree = 1
@@ -594,10 +520,6 @@ class TestBoundaryValues(unittest.TestCase):
         self.assertAlmostEqual(cp_memory.kv_reduction, 0.0, places=0)
         self.assertAlmostEqual(cp_memory.s2_reduction, 0.0, places=0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_seq_len_equals_cp_degree(self):
         """
         Feature: Minimum Valid Sequence Length
@@ -614,10 +536,6 @@ class TestBoundaryValues(unittest.TestCase):
 
         self.assertTrue(result.seq_len_divisible)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_seq_len_not_divisible_by_cp(self):
         """
         Feature: Invalid Sequence Length Divisibility
@@ -636,10 +554,6 @@ class TestBoundaryValues(unittest.TestCase):
         self.assertFalse(result.seq_len_divisible)
         self.assertIsNotNone(result.error_message)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_zero_seq_len(self):
         """
         Feature: Zero Sequence Length
@@ -660,10 +574,6 @@ class TestBoundaryValues(unittest.TestCase):
 class TestExceptionHandling(unittest.TestCase):
     """AP-CP-09: Exception handling tests."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_negative_attention_heads(self):
         """
         Feature: Invalid a Parameter
@@ -678,10 +588,6 @@ class TestExceptionHandling(unittest.TestCase):
 
         self.assertIn("attention heads", str(context.exception).lower())
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_negative_cp_degree(self):
         """
         Feature: Invalid cp_degree Parameter
@@ -696,10 +602,6 @@ class TestExceptionHandling(unittest.TestCase):
 
         self.assertIn("cp degree", str(context.exception).lower())
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_n_kv_greater_than_a(self):
         """
         Feature: Invalid n_kv Parameter
@@ -718,10 +620,6 @@ class TestExceptionHandling(unittest.TestCase):
 class TestLargeSequenceLength(unittest.TestCase):
     """AP-CP-10: Large sequence length tests."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_one_million_sequence_length(self):
         """
         Feature: Very Large Sequence Length
@@ -747,10 +645,6 @@ class TestLargeSequenceLength(unittest.TestCase):
             f"Memory estimate overflow: total_memory={cp_memory.total_memory}"
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_large_sequence_with_high_cp_degree(self):
         """
         Feature: Large Sequence with High CP Degree
@@ -770,10 +664,6 @@ class TestLargeSequenceLength(unittest.TestCase):
 class TestRealCostModelConfigIntegration(unittest.TestCase):
     """AP-CP-11: Integration test with real CostModelConfig / _CostModVar fields."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_real_config_fields_no_crash(self):
         """
         Feature: Real Config Compatibility
@@ -789,10 +679,6 @@ class TestRealCostModelConfigIntegration(unittest.TestCase):
         self.assertGreater(cp_memory.total_memory, 0)
         self.assertGreater(cp_memory.total_reduction, 0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_real_config_mla_no_crash(self):
         """
         Feature: Real Config MLA Compatibility
@@ -811,10 +697,6 @@ class TestRealCostModelConfigIntegration(unittest.TestCase):
 class TestCPDeviceSufficiency(unittest.TestCase):
     """AP-CP-12: tp*cp*pp <= total_devices constraint."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_exceeds_total_devices(self):
         """
         Feature: CP Device Sufficiency Check
@@ -836,10 +718,6 @@ class TestCPDeviceSufficiency(unittest.TestCase):
         self.assertIsNotNone(result.error_message)
         self.assertIn("exceeds", result.error_message.lower())
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_within_total_devices(self):
         """
         Feature: CP Device Sufficiency - valid case
@@ -858,10 +736,6 @@ class TestCPDeviceSufficiency(unittest.TestCase):
 
         self.assertTrue(result.device_sufficient)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_total_devices_zero_skips_check(self):
         """
         Feature: CP Device Sufficiency - skip when total_devices=0
@@ -883,10 +757,6 @@ class TestCPDeviceSufficiency(unittest.TestCase):
 class TestCPMemoryWithinLimit(unittest.TestCase):
     """AP-CP-13: Single-card memory limit constraint."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_memory_exceeds_device_capacity(self):
         """
         Feature: CP Memory Limit Check
@@ -908,10 +778,6 @@ class TestCPMemoryWithinLimit(unittest.TestCase):
         self.assertFalse(result.memory_within_limit)
         self.assertIsNotNone(result.error_message)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_memory_within_device_capacity(self):
         """
         Feature: CP Memory Limit - valid case
@@ -931,10 +797,6 @@ class TestCPMemoryWithinLimit(unittest.TestCase):
 
         self.assertTrue(result.memory_within_limit)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_memory_check_skipped_when_zero(self):
         """
         Feature: CP Memory Limit - skip when params=0
@@ -958,10 +820,6 @@ class TestCPMemoryWithinLimit(unittest.TestCase):
 class TestWarningAccumulation(unittest.TestCase):
     """AP-CP-14: Warning messages should accumulate, not overwrite."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_short_seq_and_cross_node_both_warned(self):
         """
         Feature: Warning Accumulation
@@ -981,10 +839,6 @@ class TestWarningAccumulation(unittest.TestCase):
         self.assertIn("cross", result.warning_message.lower())
         self.assertIn("short", result.warning_message.lower())
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_recommended_cp_max_warning(self):
         """
         Feature: Recommended CP Max Enforcement
@@ -1007,10 +861,6 @@ class TestWarningAccumulation(unittest.TestCase):
 class TestCPWithTPLayout(unittest.TestCase):
     """AP-CP-15: CP+TP activation layout — TP reduces per-rank memory and comm."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_tp_reduces_cp_kv_cache(self):
         """
         Feature: CP+TP KV Cache Layout
@@ -1029,10 +879,6 @@ class TestCPWithTPLayout(unittest.TestCase):
             msg=f"TP=4 should reduce KV cache by 4x: {mem_t4.kv_cache_memory} vs {mem_t1.kv_cache_memory / 4}"
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_tp_reduces_cp_attention_scores(self):
         """
         Feature: CP+TP Attention Score Layout
@@ -1051,10 +897,6 @@ class TestCPWithTPLayout(unittest.TestCase):
             msg="TP=4 should reduce attn scores by 4x"
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_tp_reduces_cp_comm_volume(self):
         """
         Feature: CP+TP Communication Volume
@@ -1073,10 +915,6 @@ class TestCPWithTPLayout(unittest.TestCase):
             msg="TP=4 should reduce CP comm volume by 4x"
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_tp_reduces_cp_comm_buffer(self):
         """
         Feature: CP+TP Comm Buffer Layout
@@ -1095,10 +933,6 @@ class TestCPWithTPLayout(unittest.TestCase):
             msg="TP=4 should reduce CP comm buffer by 4x"
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_mla_kv_dim_unchanged_by_tp(self):
         """
         Feature: MLA KV Dim Not Split by TP
@@ -1117,10 +951,6 @@ class TestCPWithTPLayout(unittest.TestCase):
 class TestUlyssesVsRing(unittest.TestCase):
     """AP-CP-16: Ulysses vs Ring CP — different activation layouts and comm patterns."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_attention_scores_full_seq(self):
         """
         Feature: Ulysses Attention Scores Layout
@@ -1147,10 +977,6 @@ class TestUlyssesVsRing(unittest.TestCase):
         self.assertAlmostEqual(mem_ring.attention_scores_memory, expected_ring, places=1)
         self.assertAlmostEqual(mem_ulysses.attention_scores_memory, expected_ulysses, places=1)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_kv_cache_split_by_cp(self):
         """
         Feature: Ulysses KV Cache Layout
@@ -1173,10 +999,6 @@ class TestUlyssesVsRing(unittest.TestCase):
             msg="KV cache per rank is the same regardless of CP layout"
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_comm_uses_all2all(self):
         """
         Feature: Ulysses Communication Pattern
@@ -1195,10 +1017,6 @@ class TestUlyssesVsRing(unittest.TestCase):
         self.assertGreater(comm_ulysses.total_kv_volume, 0)
         self.assertGreater(comm_ring.total_kv_volume, 0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_with_tp_reduces_per_rank(self):
         """
         Feature: Ulysses + TP Combined
@@ -1214,10 +1032,6 @@ class TestUlyssesVsRing(unittest.TestCase):
         expected = 4 * s * s * b * (a / (t * cp))
         self.assertAlmostEqual(mem.attention_scores_memory, expected, places=1)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_cp_algo_in_result(self):
         """
         Feature: CP Algo Propagation
@@ -1239,10 +1053,6 @@ class TestUlyssesVsRing(unittest.TestCase):
         self.assertEqual(comm_ring.cp_algo, CPAlgo.COLOSSALAI_CP)
         self.assertEqual(comm_ulysses.cp_algo, CPAlgo.ULYSSES_CP)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_comm_buffer_uses_all2all(self):
         """
         Feature: Ulysses Comm Buffer
@@ -1259,10 +1069,6 @@ class TestUlyssesVsRing(unittest.TestCase):
         self.assertGreater(buf_ring, 0)
         self.assertGreater(buf_ulysses, 0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_hybrid_cp_same_as_ring(self):
         """
         Feature: Hybrid CP = Ring CP
@@ -1283,10 +1089,6 @@ class TestUlyssesVsRing(unittest.TestCase):
 class TestCPTopology(unittest.TestCase):
     """AP-CP-17: CP topology — intra-node, cross-node, mixed bandwidth."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_intra_node_topology(self):
         """
         Feature: Ring CP intra-node
@@ -1299,10 +1101,6 @@ class TestCPTopology(unittest.TestCase):
         self.assertEqual(comm.topology, "intra-node")
         self.assertEqual(comm.effective_bandwidth, ccfg.bw_intra)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_cross_node_topology(self):
         """
         Feature: Ring CP cross-node
@@ -1316,10 +1114,6 @@ class TestCPTopology(unittest.TestCase):
         self.assertLess(comm.effective_bandwidth, ccfg.bw_intra)
         self.assertGreater(comm.effective_bandwidth, ccfg.bw_inter)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_intra_node_topology(self):
         """
         Feature: Ulysses CP intra-node
@@ -1332,10 +1126,6 @@ class TestCPTopology(unittest.TestCase):
         self.assertEqual(comm.topology, "intra-node")
         self.assertEqual(comm.effective_bandwidth, ccfg.bw_intra)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_mixed_topology(self):
         """
         Feature: Ulysses CP mixed topology
@@ -1349,10 +1139,6 @@ class TestCPTopology(unittest.TestCase):
         self.assertLess(comm.effective_bandwidth, ccfg.bw_intra)
         self.assertGreater(comm.effective_bandwidth, ccfg.bw_inter)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_head_sufficiency_constraint(self):
         """
         Feature: Ulysses head sufficiency
@@ -1371,10 +1157,6 @@ class TestCPTopology(unittest.TestCase):
         self.assertFalse(result.is_valid)
         self.assertIn("ulysses", result.error_message.lower())
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_head_sufficient_passes(self):
         """
         Feature: Ulysses head sufficiency - pass
@@ -1392,10 +1174,6 @@ class TestCPTopology(unittest.TestCase):
         )
         self.assertTrue(result.is_valid)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_comm_buffer_intra_node(self):
         """
         Feature: Ring CP comm buffer intra-node
@@ -1410,10 +1188,6 @@ class TestCPTopology(unittest.TestCase):
         chunk = (ccfg.s / 4) * ccfg.b * kv_dim * 4
         self.assertAlmostEqual(buf, 3 * chunk, places=1)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_comm_buffer_cross_node(self):
         """
         Feature: Ring CP comm buffer cross-node
@@ -1432,10 +1206,6 @@ class TestCPTopology(unittest.TestCase):
 class TestCPStepTimeImpact(unittest.TestCase):
     """AP-CP-19: CP communication contributes to end-to-end step time."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_exposed_comm_time_positive(self):
         """
         Feature: CP Step Time Contribution
@@ -1447,10 +1217,6 @@ class TestCPStepTimeImpact(unittest.TestCase):
         comm = cp_comm_layer_detailed(ccfg, ctx)
         self.assertGreater(comm.exposed_comm_time, 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_zero_when_disabled(self):
         """
         Feature: CP Step Time When Disabled
@@ -1462,10 +1228,6 @@ class TestCPStepTimeImpact(unittest.TestCase):
         comm = cp_comm_layer_detailed(ccfg, ctx)
         self.assertEqual(comm.exposed_comm_time, 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_higher_cp_increases_exposed_time(self):
         """
         Feature: CP Step Time Scaling
@@ -1486,10 +1248,6 @@ class TestCPStepTimeImpact(unittest.TestCase):
                 f"cp={[2,4,8][i]} ({times[i]:.4f}ms) > cp={[2,4,8][i-1]} ({times[i-1]:.4f}ms)",
             )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cross_node_cp_has_higher_step_time(self):
         """
         Feature: CP Step Time with Cross-Node Topology
@@ -1508,10 +1266,6 @@ class TestCPStepTimeImpact(unittest.TestCase):
             "Cross-node CP should have higher exposed comm time than intra-node",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_total_step_time_includes_cp_component(self):
         """
         Feature: CP Part of Total Step Time
@@ -1540,10 +1294,6 @@ class TestCPStepTimeImpact(unittest.TestCase):
 class TestCPUnsupportedCombination(unittest.TestCase):
     """AP-CP-20: Unsupported CP combinations return infeasible / unsupported_reason."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_with_sp_enabled_is_invalid(self):
         """
         Feature: CP+SP Incompatibility
@@ -1562,10 +1312,6 @@ class TestCPUnsupportedCombination(unittest.TestCase):
         self.assertIsNotNone(result.unsupported_reason)
         self.assertIn("CP+SP", result.unsupported_reason)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_without_sp_is_valid(self):
         """
         Feature: CP without SP
@@ -1583,10 +1329,6 @@ class TestCPUnsupportedCombination(unittest.TestCase):
         self.assertTrue(result.is_valid)
         self.assertIsNone(result.unsupported_reason)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_insufficient_heads_unsupported(self):
         """
         Feature: Ulysses Insufficient Heads
@@ -1606,10 +1348,6 @@ class TestCPUnsupportedCombination(unittest.TestCase):
         self.assertIsNotNone(result.unsupported_reason)
         self.assertIn("Ulysses", result.unsupported_reason)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_valid_combination_no_unsupported_reason(self):
         """
         Feature: Valid CP Combination
@@ -1626,10 +1364,6 @@ class TestCPUnsupportedCombination(unittest.TestCase):
         self.assertTrue(result.is_valid)
         self.assertIsNone(result.unsupported_reason)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_constraint_params_carries_sp_enabled(self):
         """
         Feature: CPConstraintParams sp_enabled field
@@ -1652,10 +1386,6 @@ class TestCPUnsupportedCombination(unittest.TestCase):
 class TestCPWithPPLayout(unittest.TestCase):
     """AP-CP-18: CP+PP combination — device sufficiency and topology."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_pp_exceeds_total_devices(self):
         """
         Feature: CP+PP Device Sufficiency
@@ -1676,10 +1406,6 @@ class TestCPWithPPLayout(unittest.TestCase):
         self.assertFalse(result.device_sufficient)
         self.assertIn("exceeds", result.error_message.lower())
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_pp_within_total_devices(self):
         """
         Feature: CP+PP Device Sufficiency - valid
@@ -1699,10 +1425,6 @@ class TestCPWithPPLayout(unittest.TestCase):
         self.assertTrue(result.is_valid)
         self.assertTrue(result.device_sufficient)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_pp_cross_node_topology(self):
         """
         Feature: CP+PP Cross-Node Topology
@@ -1748,10 +1470,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
         ep = EvalLayerComm.ep_comm_layer(ccfg, ctx, 1)
         return dp + tp + ep
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_net_memory_saving_positive(self):
         """
         Feature: CP End-to-End Memory Effect
@@ -1768,10 +1486,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
             f"CP should produce net memory saving, got reduction={cp_mem.total_reduction}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_memory_reduction_ratio_vs_baseline(self):
         """
         Feature: CP Memory Reduction Ratio
@@ -1789,10 +1503,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
             f"Expected memory reduction ratio >= 30%, got {ratio*100:.1f}%",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_comm_buffer_offset_less_than_saving(self):
         """
         Feature: CP Comm Buffer vs Gross Saving
@@ -1809,10 +1519,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
             "Gross saving should exceed comm buffer overhead",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_reduces_other_comm_costs(self):
         """
         Feature: CP Indirect Communication Reduction
@@ -1834,10 +1540,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
         self.assertAlmostEqual(ratio, 0.25, places=2,
                                msg=f"TP comm ratio should ≈ 1/4, got {ratio}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_net_comm_tradeoff(self):
         """
         Feature: CP Net Communication Tradeoff
@@ -1860,10 +1562,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
         self.assertGreater(saving_ratio, 0.3,
                            "Memory saving should be significant")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_higher_cp_greater_memory_reduction(self):
         """
         Feature: CP Degree Scaling — Memory
@@ -1884,10 +1582,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
         self.assertGreater(ratios[2], ratios[1],
                            f"cp=8 ratio ({ratios[2]:.3f}) should > cp=4 ({ratios[1]:.3f})")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_vs_ring_memory_reduction(self):
         """
         Feature: Ulysses vs Ring Memory Reduction
@@ -1906,10 +1600,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
         self.assertGreater(ring_mem.total_reduction, 0.0)
         self.assertGreater(ulysses_mem.total_reduction, 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_overall_benefit_positive(self):
         """
         Feature: CP Overall Benefit
@@ -1933,10 +1623,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
         self.assertGreater(cp_comm.exposed_comm_time, 0.0,
                            "CP should have measurable comm cost")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_no_benefit_for_short_sequence(self):
         """
         Feature: CP No Benefit for Short Sequence
@@ -1965,10 +1651,6 @@ class TestCPEndToEndEffect(unittest.TestCase):
         short_comm = cp_comm_layer_detailed(ccfg_short, ctx)
         self.assertGreater(short_comm.exposed_comm_time, 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_validation_filters_bad_configs_but_passes_good(self):
         """
         Feature: CP Validation End-to-End
@@ -2003,10 +1685,6 @@ class TestCPRingPeakCorrection(unittest.TestCase):
     ratio 1.8433) confirms /cp scaling empirically.
     """
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_cp_sq_div_in_attn_score(self):
         """
         Feature: Ring CP /cp correction in attn_score_activations
@@ -2027,10 +1705,6 @@ class TestCPRingPeakCorrection(unittest.TestCase):
         self.assertAlmostEqual(ratio, expected_ratio, places=4,
                                msg=f"Ring CP=4 should divide attn_score by 4, got ratio={ratio:.6f}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_cp_only_div_by_cp_in_attn_score(self):
         """
         Feature: Ulysses CP /cp correction in attn_score_activations
@@ -2052,10 +1726,6 @@ class TestCPRingPeakCorrection(unittest.TestCase):
         self.assertAlmostEqual(ratio, expected_ratio, places=4,
                                msg=f"Ulysses CP=4 should divide attn_score by 4, got ratio={ratio:.6f}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp1_no_extra_divisor(self):
         """
         Feature: cp=1 applies no extra divisor
@@ -2073,10 +1743,6 @@ class TestCPRingPeakCorrection(unittest.TestCase):
         self.assertAlmostEqual(score_ring, score_ulysses, places=4,
                                msg="cp=1: Ring and Ulysses should produce identical attn scores")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_peak_mem_matches_cp_sq_correction(self):
         """
         Feature: CP peak memory reflects /cp correction
@@ -2098,10 +1764,6 @@ class TestCPRingPeakCorrection(unittest.TestCase):
         self.assertAlmostEqual(ratio, expected_ratio, places=3,
                                msg=f"Ring peak attn_scores ratio should ≈ 1/4, got {ratio:.6f}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_linear_activations_same_for_ring_and_ulysses(self):
         """
         Feature: Linear activations (qkv, proj, ffn, norm) scale with s not s²
@@ -2132,10 +1794,6 @@ class TestCPRingPeakCorrection(unittest.TestCase):
 class TestCPRecFactor(unittest.TestCase):
     """Verify rec_coeff is correctly applied with CP in activation formulas."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_attn_qkv_divides_by_cp(self):
         """
         Feature: attn_qkv_activations /cp
@@ -2154,10 +1812,6 @@ class TestCPRecFactor(unittest.TestCase):
         self.assertAlmostEqual(qkv_4, qkv_1 / 4, places=1,
                                msg="QKV activations should be 1/4 with cp=4")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ffn_activations_divides_by_cp(self):
         """
         Feature: ffn_activations /cp
@@ -2175,10 +1829,6 @@ class TestCPRecFactor(unittest.TestCase):
         self.assertAlmostEqual(ffn_4, ffn_1 / 4, places=1,
                                msg="FFN activations should be 1/4 with cp=4")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_norm_activations_divides_by_cp(self):
         """
         Feature: norm_activations /cp
@@ -2207,10 +1857,6 @@ class TestCPCommVolumeUnit(unittest.TestCase):
     exposed_comm_time calculation.
     """
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_total_kv_volume_positive_and_scaled(self):
         """
         Feature: CP total_kv_volume unit consistency
@@ -2225,10 +1871,6 @@ class TestCPCommVolumeUnit(unittest.TestCase):
         self.assertGreater(result.total_kv_volume, 0.0,
                            msg="Ring CP total_kv_volume should be positive for cp>1")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_total_kv_volume_positive(self):
         """
         Feature: CP total_kv_volume for Ulysses
@@ -2242,10 +1884,6 @@ class TestCPCommVolumeUnit(unittest.TestCase):
         self.assertGreater(result.total_kv_volume, 0.0,
                            msg="Ulysses CP total_kv_volume should be positive for cp>1")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_total_kv_volume_same_magnitude_as_old_cp_comm(self):
         """
         Feature: CP total_kv_volume participates in ranking
@@ -2266,10 +1904,6 @@ class TestCPCommVolumeUnit(unittest.TestCase):
                         msg=f"CP total_kv_volume ({new_result.total_kv_volume}) too large "
                             f"vs old cp_comm_layer ({old_result}), ratio={ratio:.1f}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_total_kv_volume_not_exposed_comm_time(self):
         """
         Feature: CP total_kv_volume vs exposed_comm_time
@@ -2290,10 +1924,6 @@ class TestCPCommVolumeUnit(unittest.TestCase):
                                    f"exposed_comm_time ({result.exposed_comm_time}), "
                                    f"ratio={ratio:.1f}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_total_kv_volume_zero_for_cp1(self):
         """
         Feature: CP total_kv_volume at cp=1
@@ -2306,10 +1936,6 @@ class TestCPCommVolumeUnit(unittest.TestCase):
         result = cp_comm_layer_detailed(ccfg, ctx)
         self.assertEqual(result.total_kv_volume, 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_comm_volume_positive_for_cp_gt_1(self):
         """
         Feature: CP comm_volume unit consistency
@@ -2329,10 +1955,6 @@ class TestCPCommVolumeUnit(unittest.TestCase):
         self.assertGreater(ulysses.comm_volume, 0.0,
                            msg="Ulysses CP comm_volume should be positive for cp>1")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_comm_volume_zero_for_cp1(self):
         """
         Feature: CP comm_volume at cp=1
@@ -2345,10 +1967,6 @@ class TestCPCommVolumeUnit(unittest.TestCase):
         result = cp_comm_layer_detailed(ccfg, ctx)
         self.assertEqual(result.comm_volume, 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_comm_volume_equals_old_cp_comm_layer(self):
         """
         Feature: CP comm_volume backward compatibility
@@ -2378,10 +1996,6 @@ class TestCPCommBufferInPeak(unittest.TestCase):
     max(dp_volume, tp_volume, cp_bytes) lose cp every time.
     """
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_buffer_zero_for_cp1(self):
         """
         Feature: CP comm buffer at cp=1
@@ -2392,10 +2006,6 @@ class TestCPCommBufferInPeak(unittest.TestCase):
         ctx = Context()
         self.assertEqual(EvalLayerComm.cp_comm_buffer(ccfg, ctx), 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_buffer_positive_for_cp_gt_1(self):
         """
         Feature: CP comm buffer at cp>1
@@ -2415,10 +2025,6 @@ class TestCPCommBufferInPeak(unittest.TestCase):
 class TestCPConstraintHeadsAndAlgo(unittest.TestCase):
     """Verify cp_algo and attention_heads are forwarded to validate_cp_constraints (Reviewer Fix #3)."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_validate_accepts_cp_algo_param(self):
         """
         Feature: validate_cp_constraints cp_algo parameter
@@ -2437,10 +2043,6 @@ class TestCPConstraintHeadsAndAlgo(unittest.TestCase):
         self.assertFalse(result.is_valid)
         self.assertIn("Ulysses", result.unsupported_reason)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_validate_accepts_attention_heads_param(self):
         """
         Feature: validate_cp_constraints attention_heads parameter
@@ -2459,10 +2061,6 @@ class TestCPConstraintHeadsAndAlgo(unittest.TestCase):
         self.assertTrue(result.is_valid,
                        f"attention_heads=0 should skip Ulysses check, got {result.error_message}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_heads_sufficient_when_provided(self):
         """
         Feature: Ulysses head sufficiency with attention_heads
@@ -2480,10 +2078,6 @@ class TestCPConstraintHeadsAndAlgo(unittest.TestCase):
         )
         self.assertTrue(result.is_valid)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_algo_ignores_attention_heads(self):
         """
         Feature: Ring CP ignores attention_heads
@@ -2512,10 +2106,6 @@ class TestCPUlyssesKVHeadsDivisibility(unittest.TestCase):
     a=64) through at cp=4/8 even though runtime would crash.
     """
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_gqa_8_2_kv_heads_divisible_passes(self):
         """
         Feature: Ulysses KV-head divisibility (GQA pass)
@@ -2535,10 +2125,6 @@ class TestCPUlyssesKVHeadsDivisibility(unittest.TestCase):
         self.assertTrue(result.is_valid,
                        f"GQA 8:2 cp=4 should be valid (8 % 4 == 0), got {result.error_message}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_gqa_8_2_kv_heads_not_divisible_rejected(self):
         """
         Feature: Ulysses KV-head divisibility (GQA reject)
@@ -2562,10 +2148,6 @@ class TestCPUlyssesKVHeadsDivisibility(unittest.TestCase):
         self.assertIn("num_kv_heads", result.error_message)
         self.assertIn("divisible", result.error_message)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_gqa_8_2_cp8_passes_with_tp1(self):
         """
         Feature: Ulysses KV-head divisibility boundary (cp=8)
@@ -2587,10 +2169,6 @@ class TestCPUlyssesKVHeadsDivisibility(unittest.TestCase):
         self.assertTrue(result.is_valid,
                        f"GQA 8:2 cp=8 (8 % 8 == 0) should be valid, got {result.error_message}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_num_kv_heads_zero_falls_back_to_attention_heads(self):
         """
         Feature: num_kv_heads=0 fallback
@@ -2611,10 +2189,6 @@ class TestCPUlyssesKVHeadsDivisibility(unittest.TestCase):
         self.assertTrue(result.is_valid,
                        f"num_kv_heads=0 should fall back to attention_heads=64, got {result.error_message}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_tp_shards_kv_heads_combined(self):
         """
         Feature: Ulysses KV-head divisibility with TP
@@ -2639,10 +2213,6 @@ class TestCPUlyssesKVHeadsDivisibility(unittest.TestCase):
 class TestCPStaticMethodsNoCtxMutation(unittest.TestCase):
     """Verify CP static methods do not depend on or mutate ctx.current_node."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_act_cp_layer_does_not_require_current_node(self):
         """
         Feature: CP Static Method Independence
@@ -2656,10 +2226,6 @@ class TestCPStaticMethodsNoCtxMutation(unittest.TestCase):
         self.assertIsInstance(result, CPMemoryBreakdown)
         self.assertGreater(result.total_reduction, 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_comm_buffer_does_not_require_current_node(self):
         """
         Feature: CP Static Method Independence
@@ -2672,10 +2238,6 @@ class TestCPStaticMethodsNoCtxMutation(unittest.TestCase):
         result = EvalLayerComm.cp_comm_buffer(ccfg, ctx)
         self.assertGreater(result, 0.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_comm_layer_detailed_does_not_require_current_node(self):
         """
         Feature: CP Function Independence
@@ -2693,10 +2255,6 @@ class TestCPStaticMethodsNoCtxMutation(unittest.TestCase):
 class TestCPTopologyHelpers(unittest.TestCase):
     """Cover get_cp_topology intra/cross-node branches in hardware.py."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_intra_node_when_tp_cp_within_device_per_node(self):
         """
         Feature: CP Topology Resolution
@@ -2708,10 +2266,6 @@ class TestCPTopologyHelpers(unittest.TestCase):
         self.assertTrue(is_intra)
         self.assertEqual(bw, 300.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_boundary_tp_cp_equals_device_per_node_is_intra(self):
         """
         Feature: CP Topology Resolution
@@ -2722,10 +2276,6 @@ class TestCPTopologyHelpers(unittest.TestCase):
         self.assertEqual(topology, "intra-node")
         self.assertTrue(is_intra)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cross_node_when_tp_cp_exceeds_device_per_node(self):
         """
         Feature: CP Topology Resolution
@@ -2737,10 +2287,6 @@ class TestCPTopologyHelpers(unittest.TestCase):
         self.assertFalse(is_intra)
         self.assertEqual(bw, 25.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp1_always_intra_node(self):
         """
         Feature: CP Topology Resolution
@@ -2754,10 +2300,6 @@ class TestCPTopologyHelpers(unittest.TestCase):
 class TestCPBandwidthAndRecommendation(unittest.TestCase):
     """Cover get_cp_bandwidth and recommend_cp_max_by_attention in hardware.py."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_bandwidth_intra_node_a2(self):
         """
         Feature: CP Bandwidth Lookup
@@ -2766,10 +2308,6 @@ class TestCPBandwidthAndRecommendation(unittest.TestCase):
         """
         self.assertEqual(get_cp_bandwidth("intra-node", "A2"), 50.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_bandwidth_cross_node_a2(self):
         """
         Feature: CP Bandwidth Lookup
@@ -2778,10 +2316,6 @@ class TestCPBandwidthAndRecommendation(unittest.TestCase):
         """
         self.assertEqual(get_cp_bandwidth("cross-node", "A2"), 10.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_bandwidth_unknown_device_falls_back_to_a2(self):
         """
         Feature: CP Bandwidth Lookup
@@ -2790,10 +2324,6 @@ class TestCPBandwidthAndRecommendation(unittest.TestCase):
         """
         self.assertEqual(get_cp_bandwidth("intra-node", "UnknownDevice"), 50.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_bandwidth_a3_intra_and_cross(self):
         """
         Feature: CP Bandwidth Lookup
@@ -2803,10 +2333,6 @@ class TestCPBandwidthAndRecommendation(unittest.TestCase):
         self.assertEqual(get_cp_bandwidth("intra-node", "A3"), 200.0)
         self.assertEqual(get_cp_bandwidth("cross-node", "A3"), 25.0)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_recommend_cp_max_mla_is_16(self):
         """
         Feature: CP Degree Recommendation by Attention Type
@@ -2816,10 +2342,6 @@ class TestCPBandwidthAndRecommendation(unittest.TestCase):
         self.assertEqual(recommend_cp_max_by_attention("mla"), 16)
         self.assertEqual(recommend_cp_max_by_attention("MLA"), 16)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_recommend_cp_max_gqa_is_8(self):
         """
         Feature: CP Degree Recommendation by Attention Type
@@ -2828,10 +2350,6 @@ class TestCPBandwidthAndRecommendation(unittest.TestCase):
         """
         self.assertEqual(recommend_cp_max_by_attention("gqa"), 8)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_recommend_cp_max_mha_and_unknown_is_4(self):
         """
         Feature: CP Degree Recommendation by Attention Type
@@ -2845,10 +2363,6 @@ class TestCPBandwidthAndRecommendation(unittest.TestCase):
 class TestResolveCPAlgoBranches(unittest.TestCase):
     """Cover _resolve_cp_algo's three branches: CPAlgo instance, str, fallback."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_returns_same_instance_when_already_cp_algo(self):
         """
         Feature: CP Algo Resolution
@@ -2861,10 +2375,6 @@ class TestResolveCPAlgoBranches(unittest.TestCase):
 
         self.assertIs(_resolve_cp_algo(_Cfg()), CPAlgo.ULYSSES_CP)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_resolves_known_string_to_enum(self):
         """
         Feature: CP Algo Resolution
@@ -2877,10 +2387,6 @@ class TestResolveCPAlgoBranches(unittest.TestCase):
 
         self.assertIs(_resolve_cp_algo(_Cfg()), CPAlgo.ULYSSES_CP)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_resolves_typo_hybird_to_hybrid(self):
         """
         Feature: CP Algo Resolution
@@ -2893,10 +2399,6 @@ class TestResolveCPAlgoBranches(unittest.TestCase):
 
         self.assertIs(_resolve_cp_algo(_Cfg()), CPAlgo.HYBRID_CP)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_unknown_string_falls_back_to_colossalai(self):
         """
         Feature: CP Algo Resolution
@@ -2909,10 +2411,6 @@ class TestResolveCPAlgoBranches(unittest.TestCase):
 
         self.assertIs(_resolve_cp_algo(_Cfg()), CPAlgo.COLOSSALAI_CP)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_missing_attr_falls_back_to_colossalai(self):
         """
         Feature: CP Algo Resolution
@@ -2925,10 +2423,6 @@ class TestResolveCPAlgoBranches(unittest.TestCase):
 
         self.assertIs(_resolve_cp_algo(_Cfg()), CPAlgo.COLOSSALAI_CP)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_none_value_falls_back_to_colossalai(self):
         """
         Feature: CP Algo Resolution
@@ -2980,10 +2474,6 @@ class TestParallelizeLayerCPValidation(unittest.TestCase):
             has_dim=lambda d: d in dims_val,
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp1_skips_cp_branch(self):
         """
         Feature: ParallelizeLayer CP validation
@@ -2995,10 +2485,6 @@ class TestParallelizeLayerCPValidation(unittest.TestCase):
         pc = self._make_pc({Dim.CP: 1, Dim.TP: 1, Dim.PP: 1})
         self.assertTrue(layer.is_valid(pc))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_invalid_seq_returns_false(self):
         """
         Feature: ParallelizeLayer CP validation
@@ -3010,10 +2496,6 @@ class TestParallelizeLayerCPValidation(unittest.TestCase):
         pc = self._make_pc({Dim.CP: 4, Dim.TP: 1, Dim.PP: 1})
         self.assertFalse(layer.is_valid(pc))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_warning_does_not_reject(self):
         """
         Feature: ParallelizeLayer CP validation
@@ -3025,10 +2507,6 @@ class TestParallelizeLayerCPValidation(unittest.TestCase):
         pc = self._make_pc({Dim.CP: 4, Dim.TP: 1, Dim.PP: 1})
         self.assertTrue(layer.is_valid(pc))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_absent_skips_branch(self):
         """
         Feature: ParallelizeLayer CP validation
@@ -3072,10 +2550,6 @@ class TestCPSearchSpaceEnumeration(unittest.TestCase):
         # device_loops / space do not touch balancing, so leave it unset.
         return gcfg
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_device_loops_visits_cp_greater_than_one(self):
         """
         Feature: CP Search Space Enumeration in device_loops
@@ -3132,36 +2606,20 @@ class TestDimensionsValidationBranches(unittest.TestCase):
     _cp_check_ulysses_heads.
     """
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_check_mbn_pp_invalid_mbn_less_than_pp(self):
         """MBN < PP → _check_mbn_pp returns False."""
         result = Dim.Dimensions._check_mbn_pp({Dim.MBN: 1, Dim.PP: 2}, [Dim.PP])
         self.assertFalse(result)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_check_mbn_pp_invalid_pp1_mbn_gt1(self):
         """PP=1 & MBN>1 → _check_mbn_pp returns False."""
         result = Dim.Dimensions._check_mbn_pp({Dim.MBN: 2, Dim.PP: 1}, [Dim.PP])
         self.assertFalse(result)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_check_power_of_two_rejects_non_power(self):
         """value=3 (not power of 2) → _check_power_of_two returns False."""
         self.assertFalse(Dim.Dimensions._check_power_of_two(Dim.TP, 3))
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_is_valid_rejects_sp_cp_coexistence(self):
         """SP enabled & CP>1 → is_valid returns False."""
         pc = object.__new__(Dim.Dimensions)
@@ -3169,10 +2627,6 @@ class TestDimensionsValidationBranches(unittest.TestCase):
         pc.all_dims = [Dim.SP, Dim.CP, Dim.TP, Dim.MBN, Dim.PP]
         self.assertFalse(pc.is_valid())
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_cp_check_ulysses_heads_shards_zero(self):
         """tp=0 & cp=0 → shards=0 → _cp_check_ulysses_heads returns None."""
         p = CPConstraintParams(
@@ -3192,10 +2646,6 @@ class TestCPCommBufferCrossNode(unittest.TestCase):
     the intra-node case.
     """
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ring_cp_cross_node_buffer(self):
         """
         Feature: CP comm buffer (Ring, cross-node)
@@ -3215,10 +2665,6 @@ class TestCPCommBufferCrossNode(unittest.TestCase):
         expected = (2 * 8 - 1) * chunk
         self.assertAlmostEqual(buffer, expected, places=4)
 
-    @arg_mark(
-        plat_marks=["cpu_linux"], level_mark="level0",
-        card_mark="onecard", essential_mark="unessential",
-    )
     def test_ulysses_cp_cross_node_buffer(self):
         """
         Feature: CP comm buffer (Ulysses, cross-node)

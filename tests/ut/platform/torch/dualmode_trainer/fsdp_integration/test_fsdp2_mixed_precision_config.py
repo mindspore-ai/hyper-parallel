@@ -28,13 +28,11 @@ from hyper_parallel.auto_models.components.distributed.config import (
     FSDP2MixedPrecisionConfig,
 )
 from hyper_parallel.auto_models.components.distributed.fsdp2 import FSDP2Manager
-from tests.common.mark_utils import arg_mark
 
 
 class TestFSDP2MixedPrecisionConfig(unittest.TestCase):
     """Validate optimizer-driven fp32 main gradients and core-policy mapping."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_policy_maps_cast_and_main_grad_flags(self):
         """Map YAML fields to the core policy.
 
@@ -58,7 +56,6 @@ class TestFSDP2MixedPrecisionConfig(unittest.TestCase):
         self.assertFalse(policy.cast_forward_inputs)
         self.assertTrue(policy.apply_grad_on_fp32_main_grad)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_policy_disables_main_grad_without_optimizer_policy(self):
         """Keep ordinary optimizer gradients on ``param.grad``.
 
@@ -72,7 +69,6 @@ class TestFSDP2MixedPrecisionConfig(unittest.TestCase):
 
         self.assertFalse(policy.apply_grad_on_fp32_main_grad)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_source_layout_reduction_scales_gradient_domain(self):
         """Configure source-layout gradient scaling.
 

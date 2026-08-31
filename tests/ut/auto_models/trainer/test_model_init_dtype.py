@@ -26,7 +26,6 @@ from torch import nn  # pylint: disable=wrong-import-position
 
 from hyper_parallel import DeviceMesh, DTensor, Replicate
 from hyper_parallel.auto_models.trainer.model_init_dtype import apply_model_init_dtype
-from tests.common.mark_utils import arg_mark
 
 
 class _DtypeModel(nn.Module):  # pylint: disable=abstract-method
@@ -44,7 +43,6 @@ class _DtypeModel(nn.Module):  # pylint: disable=abstract-method
 class TestModelInitDtype(unittest.TestCase):
     """Verify conversion direction, disabled behavior, and tensor identity."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_float32_to_bfloat16_preserves_identity_and_integer_buffers(self):
         """Convert a float32 model to bfloat16 after model finalization.
 
@@ -69,7 +67,6 @@ class TestModelInitDtype(unittest.TestCase):
         self.assertEqual(id(model.indices), identities["indices"])
         self.assertEqual(id(model.mask), identities["mask"])
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_bfloat16_to_float32_and_none(self):
         """Promote bfloat16 state and preserve disabled behavior.
 
@@ -85,7 +82,6 @@ class TestModelInitDtype(unittest.TestCase):
         self.assertEqual(model.weight.dtype, torch.float32)
         self.assertEqual(model.scale.dtype, torch.float32)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_meta_parameter_conversion_to_float32_preserves_identity(self):
         """Convert a low-precision meta-initialized model to float32.
 
@@ -108,7 +104,6 @@ class TestModelInitDtype(unittest.TestCase):
         self.assertEqual(model.weight.dtype, torch.float32)
         self.assertTrue(model.weight.is_meta)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_invalid_dtype_fails(self):
         """Report an invalid final model initialization dtype.
 
@@ -120,7 +115,6 @@ class TestModelInitDtype(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "model_init_dtype"):
             apply_model_init_dtype(model, "float64")  # type: ignore[arg-type]
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
     def test_dtensor_parameter_keeps_identity_and_layout(self, mock_get_rank):
         """Preserve distributed parameter identity and layout.

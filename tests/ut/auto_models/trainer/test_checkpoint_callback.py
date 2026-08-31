@@ -31,7 +31,6 @@ from hyper_parallel.auto_models.trainer.callbacks.checkpoint_callback import (
     CheckpointerCallback,
 )
 from hyper_parallel.auto_models.trainer.callbacks.base import TrainerState
-from tests.common.mark_utils import arg_mark
 
 
 class _CheckpointModel(nn.Module):  # pylint: disable=abstract-method
@@ -71,7 +70,6 @@ class _ModelOnlyCheckpointer:
 class TestCheckpointModelPrecision(unittest.TestCase):
     """Verify checkpoint restore applies the configured model initialization dtype."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_checkpoint_load_casts_model_to_float32(self):
         """Cast loaded low-precision model state to float32.
 
