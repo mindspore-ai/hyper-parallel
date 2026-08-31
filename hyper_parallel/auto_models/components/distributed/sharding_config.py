@@ -449,7 +449,7 @@ class ShardingPlan:
                 lines.append(f"    {param_name}: {self._format_named_placement(named)}")
         else:
             lines.append("  parameter sharding: none ({} = this boundary shards no parameters, I/O stitching only)")
-        attr_plan = spec._tp_local_attr_plan
+        attr_plan = spec._tp_local_attr_plan  # pylint: disable=protected-access
         if attr_plan is not None and (attr_plan.auto_divide or attr_plan.user_divide):
             lines.append("  TP-local attribute division:")
             if attr_plan.auto_divide:
@@ -697,7 +697,7 @@ def _out(tp_p, cp_p, ep_p=None) -> NamedPlacement:
 
 # ── TEMPLATES: complete templates for the 7 semantic roles (05 §3.5, declared over TP+CP+EP) ──
 # CP-dim rule: parameters are always Replicate (CP does not shard parameters);
-# activations are Shard(1) (sequence dim) or Replicate.
+# input sequence activations use Shard(1) independently of TP sequence_parallel.
 # EP-dim rule: non-MoE modules Replicate; MoE experts Shard(0).
 TEMPLATES: Dict[str, ShardingTemplate] = {
     # ── Attention (q/k/v Colwise + o Rowwise) ──
@@ -711,10 +711,10 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         sp_in_dst=_hid(Replicate(), Shard(1)),
         sp_out_src=_out(Partial(), Shard(1)),     # local Q-chunk output → CP Shard(1)
         sp_out_dst=_out(Shard(1), Shard(1)),
-        nosp_in_src=_hid(Replicate(), Replicate()),
-        nosp_in_dst=_hid(Replicate(), Replicate()),
-        nosp_out_src=_out(Partial(), Replicate()),
-        nosp_out_dst=_out(Replicate(), Replicate()),
+        nosp_in_src=_hid(Replicate(), Shard(1)),
+        nosp_in_dst=_hid(Replicate(), Shard(1)),
+        nosp_out_src=_out(Partial(), Shard(1)),
+        nosp_out_dst=_out(Replicate(), Shard(1)),
         needs_cp_attn=True,
     ),
 
@@ -730,10 +730,10 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         sp_in_dst=_hid(Replicate(), Shard(1)),
         sp_out_src=_out(Partial(), Shard(1)),
         sp_out_dst=_out(Shard(1), Shard(1)),
-        nosp_in_src=_hid(Replicate(), Replicate()),
-        nosp_in_dst=_hid(Replicate(), Replicate()),
-        nosp_out_src=_out(Partial(), Replicate()),
-        nosp_out_dst=_out(Replicate(), Replicate()),
+        nosp_in_src=_hid(Replicate(), Shard(1)),
+        nosp_in_dst=_hid(Replicate(), Shard(1)),
+        nosp_out_src=_out(Partial(), Shard(1)),
+        nosp_out_dst=_out(Replicate(), Shard(1)),
     ),
 
     # ── Norm (RMSNorm/LayerNorm: weight replicated, zero communication) ──
@@ -743,23 +743,23 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         sp_in_dst=_hid(Shard(1), Shard(1)),      # identity
         sp_out_src=_out(Shard(1), Shard(1)),
         sp_out_dst=_out(Shard(1), Shard(1)),     # identity
-        nosp_in_src=_hid(Replicate(), Replicate()),
-        nosp_in_dst=_hid(Replicate(), Replicate()),
-        nosp_out_src=_out(Replicate(), Replicate()),
-        nosp_out_dst=_out(Replicate(), Replicate()),
+        nosp_in_src=_hid(Replicate(), Shard(1)),
+        nosp_in_dst=_hid(Replicate(), Shard(1)),
+        nosp_out_src=_out(Replicate(), Shard(1)),
+        nosp_out_dst=_out(Replicate(), Shard(1)),
     ),
 
     # ── Embedding (weight Shard(0) along the vocab dim, output Partial → SP+CP) ──
     "embed": ShardingTemplate(
         colwise_placement=Shard(0),          # weight: [V/tp, H]
-        sp_in_src={"input": _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())},
-        sp_in_dst={"input": _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())},
-        sp_out_src=_out(Partial(), Replicate()),
+        sp_in_src={"input": _multi_dim(tp=Replicate(), cp=Shard(1), ep=Replicate())},
+        sp_in_dst={"input": _multi_dim(tp=Replicate(), cp=Shard(1), ep=Replicate())},
+        sp_out_src=_out(Partial(), Shard(1)),
         sp_out_dst=_out(Shard(1), Shard(1)),     # reduce-scatter → SP+CP
-        nosp_in_src={"input": _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())},
-        nosp_in_dst={"input": _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())},
-        nosp_out_src=_out(Partial(), Replicate()),
-        nosp_out_dst=_out(Replicate(), Replicate()),
+        nosp_in_src={"input": _multi_dim(tp=Replicate(), cp=Shard(1), ep=Replicate())},
+        nosp_in_dst={"input": _multi_dim(tp=Replicate(), cp=Shard(1), ep=Replicate())},
+        nosp_out_src=_out(Partial(), Shard(1)),
+        nosp_out_dst=_out(Replicate(), Shard(1)),
     ),
 
     # ── LM Head (weight Shard(0), output Shard(-1); out_dst is overridden according to loss_parallel) ──
@@ -775,10 +775,10 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         sp_out_dst=_out(Shard(-1), Shard(1)),   # loss_parallel=true default;
         # when loss_parallel=false, _build_spec_from_template overrides it to
         # {TP: Replicate, CP: Shard(1)}
-        nosp_in_src=_hid(Replicate(), Replicate()),
-        nosp_in_dst=_hid(Replicate(), Replicate()),
-        nosp_out_src=_out(Shard(-1), Replicate()),
-        nosp_out_dst=_out(Replicate(), Replicate()),
+        nosp_in_src=_hid(Replicate(), Shard(1)),
+        nosp_in_dst=_hid(Replicate(), Shard(1)),
+        nosp_out_src=_out(Shard(-1), Shard(1)),
+        nosp_out_dst=_out(Replicate(), Shard(1)),
     ),
 
     # ── MoE Gate (Router: weight replicated, output redistributes → EP) ──
@@ -788,7 +788,7 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         sp_in_dst=_hid(Replicate(), Replicate()),
         sp_out_src=_out(Replicate(), Replicate()),
         sp_out_dst=_out(Replicate(), Replicate(), Shard(0)),
-        nosp_in_src=_hid(Replicate(), Replicate()),
+        nosp_in_src=_hid(Replicate(), Shard(1)),
         nosp_in_dst=_hid(Replicate(), Replicate()),
         nosp_out_src=_out(Replicate(), Replicate()),
         nosp_out_dst=_out(Replicate(), Replicate(), Shard(0)),
@@ -805,10 +805,10 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         sp_in_dst={"x_BLD": _multi_dim(tp=Replicate(), cp=Shard(1), ep=Replicate())},
         sp_out_src=_out(Partial(), Shard(1)),
         sp_out_dst=_out(Shard(1), Shard(1)),
-        nosp_in_src={"x_BLD": _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())},
-        nosp_in_dst={"x_BLD": _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())},
-        nosp_out_src=_out(Partial(), Replicate()),
-        nosp_out_dst=_out(Replicate(), Replicate()),
+        nosp_in_src={"x_BLD": _multi_dim(tp=Replicate(), cp=Shard(1), ep=Replicate())},
+        nosp_in_dst={"x_BLD": _multi_dim(tp=Replicate(), cp=Shard(1), ep=Replicate())},
+        nosp_out_src=_out(Partial(), Shard(1)),
+        nosp_out_dst=_out(Replicate(), Shard(1)),
         region_dispatch=False,           # MoE forward has its own a2a; dispatch not allowed
     ),
 }

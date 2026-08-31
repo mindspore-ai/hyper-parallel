@@ -16,7 +16,6 @@
 # pylint: disable=wrong-import-position,abstract-method
 
 import copy
-import logging
 import os
 import tempfile
 import unittest
@@ -42,24 +41,7 @@ from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.distributed_checkpoint import (
     save as dcp_save,
 )
-from hyper_parallel.trainer.utils import logging as trainer_logging
 from tests.common.mark_utils import arg_mark
-
-
-def tearDownModule() -> None:  # pylint: disable=invalid-name
-    """Restore trainer logging helpers replaced by optimizer module imports."""
-    logging_helpers = (
-        "info_rank0",
-        "warning_rank0",
-        "info_once",
-        "warning_once",
-    )
-    for helper_name in logging_helpers:
-        setattr(
-            logging.Logger,
-            helper_name,
-            getattr(trainer_logging, helper_name),
-        )
 
 
 class _MixedDtypeModel(nn.Module):

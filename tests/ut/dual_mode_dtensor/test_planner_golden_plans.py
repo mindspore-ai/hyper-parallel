@@ -23,6 +23,7 @@ from hyper_parallel.auto_models.components.distributed.param_role import ParamRo
 from hyper_parallel.auto_models.components.distributed.sharding_config import (
     CP,
     EP,
+    ShardingPlan,
     TEMPLATES,
     TP,
     ModuleShardingSpec,
@@ -33,6 +34,7 @@ from hyper_parallel.core.dtensor.placement_types import (
     Replicate,
     Shard,
 )
+from tests.ut.dual_mode_dtensor.conftest import _meta_mesh
 
 
 # ==========================================================================
@@ -349,7 +351,7 @@ def test_tiny_llama_golden_sp_on(tiny_llama, make_mesh):
 
 
 def test_tiny_llama_golden_sp_off(tiny_llama, make_mesh):
-    """Golden plan for tiny_llama with sequence_parallel=False (all-Replicate I/O)."""
+    """Golden plan for no-SP on a TP-only mesh (all active I/O is Replicate)."""
     mesh = make_mesh((1,), ("tp",))
     plan = ShardingPlanner().plan(tiny_llama, mesh, tp_size=2,
                                   sequence_parallel=False)
@@ -363,6 +365,45 @@ def test_tiny_llama_golden_sp_off(tiny_llama, make_mesh):
     norm = plan.modules["model.norm"]
     _assert_placement(norm.in_src["hidden_states"], dims, Replicate())
     _assert_placement(norm.out_dst["output"], dims, Replicate())
+
+
+def test_tiny_llama_cp_contract_without_sequence_parallel(tiny_llama):
+    """CP-local activations stay sharded when TP sequence parallelism is disabled."""
+    mesh = _meta_mesh((2,), ("cp",))
+    plan = ShardingPlanner().plan(
+        tiny_llama, mesh, cp_size=2, sequence_parallel=False)
+
+    for module_name in (
+            "model.embed_tokens",
+            "model.layers.0.input_layernorm",
+            "model.layers.0.self_attn",
+            "model.layers.0.mlp",
+            "model.norm",
+            "lm_head",
+    ):
+        spec = plan.modules[module_name]
+        input_name = next(iter(spec.in_src))
+        input_src = spec.in_src[input_name][CP]
+        input_dst = spec.in_dst[input_name][CP]
+        output_src = spec.out_src["output"][CP]
+        output_dst = spec.out_dst["output"][CP]
+        expected = Shard(1)
+        assert input_src == expected, (
+            f"{module_name} input source CP placement mismatch: "
+            f"expected={expected}, got={input_src}")
+        assert input_dst == expected, (
+            f"{module_name} input destination CP placement mismatch: "
+            f"expected={expected}, got={input_dst}")
+        assert output_src == expected, (
+            f"{module_name} output source CP placement mismatch: "
+            f"expected={expected}, got={output_src}")
+        assert output_dst == expected, (
+            f"{module_name} output destination CP placement mismatch: "
+            f"expected={expected}, got={output_dst}")
+
+    empty_spec_report = ShardingPlan(
+        modules={"empty": ModuleShardingSpec()}).explain()
+    assert "parameter sharding: none" in empty_spec_report
 
 
 def test_tiny_hf_llama_golden(tiny_hf_llama, make_mesh):

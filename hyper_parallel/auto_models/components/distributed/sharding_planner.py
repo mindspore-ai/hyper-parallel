@@ -845,7 +845,7 @@ class ShardingPlanner:
         # the template's default Replicate, otherwise the boundary would
         # scatter the already-sharded chunk a second time (the sequence
         # would be sharded twice).
-        if template is self._templates.get("embed") and has_cp and sequence_parallel:
+        if template is self._templates.get("embed") and has_cp:
             spec.in_src = {"input": _multi_dim(tp=Replicate(), cp=Shard(1),
                                                ep=Replicate())}
             spec.in_dst = {"input": _multi_dim(tp=Replicate(), cp=Shard(1),
