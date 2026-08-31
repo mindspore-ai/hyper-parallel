@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""HyperParallel model definitions and default parallel templates."""
+"""Shared neural-network building blocks used by HyperParallel features."""

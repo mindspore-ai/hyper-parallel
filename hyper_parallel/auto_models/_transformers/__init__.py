@@ -13,17 +13,49 @@
 # limitations under the License.
 # ============================================================================
 """_transformers package."""
+from importlib import import_module as _import_module  # pylint: disable=invalid-name
+from typing import TYPE_CHECKING
 
-from hyper_parallel.auto_models._transformers.auto_model import (
-    HyperAutoModelForCausalLM,
-    HyperAutoModelForImageTextToText,
-    HyperAutoModelForSequenceClassification,
-)
-from hyper_parallel.auto_models._transformers.checkpoint_loader import (
-    CheckpointManager,
-    DCPBackend,
-    LoadReport,
-)
+if TYPE_CHECKING:
+    from hyper_parallel.auto_models._transformers.auto_model import (
+        HyperAutoModelForCausalLM,
+        HyperAutoModelForImageTextToText,
+        HyperAutoModelForSequenceClassification,
+    )
+    from hyper_parallel.auto_models._transformers.checkpoint_loader import (
+        CheckpointManager,
+        DCPBackend,
+        LoadReport,
+    )
+
+
+# AutoModel and checkpoint modules load the full torch/Transformers runtime.
+# Keep package initialization lightweight for direct imports such as ``registry``.
+_LAZY_EXPORTS = {
+    "HyperAutoModelForCausalLM": ".auto_model",
+    "HyperAutoModelForImageTextToText": ".auto_model",
+    "HyperAutoModelForSequenceClassification": ".auto_model",
+    "CheckpointManager": ".checkpoint_loader",
+    "DCPBackend": ".checkpoint_loader",
+    "LoadReport": ".checkpoint_loader",
+}
+
+
+def __getattr__(name):  # pylint: disable=invalid-name
+    """Lazily import public Transformers integration symbols."""
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module = _import_module(_LAZY_EXPORTS[name], __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():  # pylint: disable=invalid-name
+    """Include lazy public exports in ``dir()``."""
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
+
 
 __all__ = [
     "HyperAutoModelForCausalLM",

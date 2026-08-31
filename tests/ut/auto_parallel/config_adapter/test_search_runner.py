@@ -152,11 +152,12 @@ class TestBuildHpYamlDict(unittest.TestCase):
         config = _make_full_config()
         result = runner._build_hp_yaml_dict(config)
         self.assertIn("model", result)
-        self.assertIn("train", result)
-        self.assertIn("data", result)
+        self.assertIn("training", result)
+        self.assertIn("accelerator", result)
+        self.assertIn("fsdp_config", result)
+        self.assertIn("dataset", result)
         self.assertIn("config_overrides", result["model"])
-        self.assertIn("accelerator", result["train"])
-        self.assertIn("global_batch_size", result["train"])
+        self.assertIn("global_batch_size", result["training"])
 
     def test_fixed_dim_in_accelerator(self):
         """Fixed dims are written into accelerator."""
@@ -164,7 +165,7 @@ class TestBuildHpYamlDict(unittest.TestCase):
         config = _make_full_config()
         config.constraint["fixed_tp_degree"] = 4
         result = runner._build_hp_yaml_dict(config)
-        self.assertEqual(result["train"]["accelerator"]["tp_degree"], 4)
+        self.assertEqual(result["accelerator"]["tp_size"], 4)
 
     def test_search_dim_first_candidate_as_placeholder(self):
         """Search dims use the first candidate as placeholder."""
@@ -172,7 +173,7 @@ class TestBuildHpYamlDict(unittest.TestCase):
         config = _make_full_config()
         config.search_space["tensor_parallel_degree"] = [1, 2, 4, 8]
         result = runner._build_hp_yaml_dict(config)
-        self.assertEqual(result["train"]["accelerator"]["tp_degree"], 1)
+        self.assertEqual(result["accelerator"]["tp_size"], 1)
 
     def test_recompute_mapped(self):
         """recompute_strategy maps to activation_checkpoint."""
@@ -181,7 +182,7 @@ class TestBuildHpYamlDict(unittest.TestCase):
         config.estimator["recompute_strategy"] = "full"
         result = runner._build_hp_yaml_dict(config)
         self.assertEqual(
-            result["train"]["gradient_checkpointing"]["activation_checkpoint"],
+            result["activation_checkpoint"]["mode"],
             "full",
         )
 
@@ -192,7 +193,7 @@ class TestBuildHpYamlDict(unittest.TestCase):
         config.estimator["cp_algo"] = "ulysses_cp"
         result = runner._build_hp_yaml_dict(config)
         self.assertEqual(
-            result["train"]["accelerator"]["context_parallel_algo"],
+            result["accelerator"]["context_parallel_algo"],
             "ulysses_cp",
         )
 
@@ -202,7 +203,7 @@ class TestBuildHpYamlDict(unittest.TestCase):
         config = _make_full_config()
         config.estimator.pop("cp_algo", None)
         result = runner._build_hp_yaml_dict(config)
-        self.assertNotIn("context_parallel_algo", result["train"]["accelerator"])
+        self.assertNotIn("context_parallel_algo", result["accelerator"])
 
 
 class TestResolveSearchDimensions(unittest.TestCase):
@@ -286,7 +287,7 @@ class TestFormatResult(unittest.TestCase):
         """Result dict contains expected keys."""
         runner = self._get_runner()
         entry = _make_scored_entry()
-        result = runner._format_result(entry)
+        result = runner._format_result(entry, _make_full_config())
         self.assertIn("dp", result)
         self.assertIn("tp", result)
         self.assertIn("memory_estimate_mb", result)
@@ -300,9 +301,11 @@ class TestFormatResult(unittest.TestCase):
         """Dimension values match the entry."""
         runner = self._get_runner()
         entry = _make_scored_entry(tp=2, pp=4)
-        result = runner._format_result(entry)
+        result = runner._format_result(entry, _make_full_config())
         self.assertEqual(result["tp"], 2)
         self.assertEqual(result["pp"], 4)
+        self.assertEqual(result["dp_shard"], 1)
+        self.assertEqual(result["dp_replicate"], 2)
 
 
 class TestPostFilter(unittest.TestCase):
@@ -353,7 +356,7 @@ class TestWriteTempHpYaml(unittest.TestCase):
         with open(path, "r", encoding="utf-8") as fh:
             data = fh.read()
         self.assertIn("model:", data)
-        self.assertIn("train:", data)
+        self.assertIn("training:", data)
         os.remove(path)
 
 
@@ -365,7 +368,9 @@ class TestSearchStrategies(unittest.TestCase):
         return_value=_make_mock_dim_module(),
     )
     @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
-    def test_search_strategies_returns_result(self, mock_parallelize_cls, mock_get_dim):  # pylint: disable=unused-argument
+    def test_search_strategies_returns_result(
+        self, mock_parallelize_cls, mock_get_dim,
+    ):  # pylint: disable=unused-argument
         """search_strategies returns a dict with expected keys."""
         mock_dims = MagicMock()
         mock_dims.dims_val = {

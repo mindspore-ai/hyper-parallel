@@ -140,10 +140,10 @@ def _build_model_dict(model: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
-    """Build a HyperParallel ``train.yaml`` dict from *config*.
+    """Build an AutoModels-shaped cost-model YAML dict from *config*.
 
     Fixed dimensions (``constraint.fixed_*_degree``) are written directly
-    into ``train.accelerator``.  Dimensions with search-space candidates
+    into the strategy sections. Dimensions with search-space candidates
     use the first candidate as a placeholder -- the actual search is driven
     by the ``dimensions`` parameter passed to :class:`Parallelize`.
     """
@@ -152,15 +152,15 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     space = config.search_space
 
     accel: Dict[str, Any] = {}
+    fsdp: Dict[str, Any] = {}
 
     # Fixed dimensions -- write actual value.
     fixed_map = {
         "fixed_dp_degree": ("dp_replicate", "data_parallel_replicate_degree", [1]),
-        "fixed_fsdp_degree": ("dp_shard", "data_parallel_shard_degree", [1]),
-        "fixed_tp_degree": ("tp_degree", "tensor_parallel_degree", [1]),
-        "fixed_pp_degree": ("pipeline_parallel_degree", "pipeline_parallel_degree", [1]),
-        "fixed_cp_degree": ("context_parallel_degree", "context_parallel_degree", [1]),
-        "fixed_ep_degree": ("expert_parallel_degree", "expert_parallel_degree", [1]),
+        "fixed_tp_degree": ("tp_size", "tensor_parallel_degree", [1]),
+        "fixed_pp_degree": ("pp_size", "pipeline_parallel_degree", [1]),
+        "fixed_cp_degree": ("cp_size", "context_parallel_degree", [1]),
+        "fixed_ep_degree": ("ep_size", "expert_parallel_degree", [1]),
         "fixed_etp_degree": ("expert_tensor_parallel_degree", "expert_tensor_parallel_degree", [0]),
     }
     for constraint_key, (accel_key, space_key, default) in fixed_map.items():
@@ -171,8 +171,12 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
             candidates = space.get(space_key, default)
             accel[accel_key] = candidates[0]
 
-    # Enable parallel optimizer by default.
-    accel.setdefault("enable_parallel_optimizer", True)
+    fixed_fsdp = constraint.get("fixed_fsdp_degree")
+    fsdp_candidates = space.get("data_parallel_shard_degree", [1])
+    fsdp["dp_shard_size"] = int(
+        fixed_fsdp if fixed_fsdp is not None and fixed_fsdp > 0
+        else fsdp_candidates[0]
+    )
 
     # CP algorithm: propagate to yaml so CostModelParserHyperV2 can read it.
     cp_algo = config.estimator.get("cp_algo")
@@ -185,7 +189,7 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
         accel["optimizer_weight_shard_size"] = owss
 
     use_sp = model.get("use_seq_parallel", True)
-    accel.setdefault("use_seq_parallel", bool(use_sp))
+    accel.setdefault("sequence_parallel", bool(use_sp))
 
     recompute = config.estimator.get("recompute_strategy", "none")
 
@@ -195,28 +199,27 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     if device_mem_gb > 0:
         context["max_device_memory"] = f"{device_mem_gb}GB"
 
-    gc_dict: Dict[str, Any] = {"activation_checkpoint": recompute}
+    gc_dict: Dict[str, Any] = {"mode": "off" if recompute == "none" else recompute}
     recompute_slice = model.get("recompute_slice_activation")
     if recompute_slice is not None:
-        gc_dict["recompute_slice_activation"] = bool(recompute_slice)
+        fsdp["recompute_slice_activation"] = bool(recompute_slice)
 
     model_dict = _build_model_dict(model)
 
     hp_yaml: dict = {
         "model": model_dict,
-        "train": {
+        "training": {
             "global_batch_size": constraint.get("global_batch_size", 0),
             "micro_batch_size": model.get("local_batch_size", 1),
             "micro_batch_num": accel.pop("micro_batch_num", 1),
-            "accelerator": accel,
-            "gradient_checkpointing": gc_dict,
-            "mixed_precision": {
-                "enabled": True,
-                "param_dtype": model.get("compute_dtype", "bfloat16"),
-            },
         },
-        "data": {
-            "max_seq_len": model.get("max_position_embeddings", 4096),
+        "accelerator": accel,
+        "fsdp_config": fsdp,
+        "activation_checkpoint": gc_dict,
+        "dataset": {
+            "data_transform": {
+                "max_seq_len": model.get("max_position_embeddings", 4096),
+            },
         },
     }
 
@@ -334,7 +337,7 @@ def _post_filter(
     return filtered
 
 
-def _format_result(best_entry: tuple) -> Dict[str, Any]:
+def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any]:
     """Convert the best ND result entry into a flat result dict."""
     dim_mod = _get_dim_module()
     dims_val = best_entry[0].dims_val  # type: ignore[index]
@@ -355,6 +358,13 @@ def _format_result(best_entry: tuple) -> Dict[str, Any]:
             result[key] = int(dims_val[dim_obj])
     result.setdefault("cp", 1)
     result.setdefault("ep", 1)
+    total_dp = result.get("dp", 1)
+    fsdp_candidates = config.search_space.get("data_parallel_shard_degree", [1])
+    configured_fsdp = config.constraint.get("fixed_fsdp_degree")
+    dp_shard = int(configured_fsdp or fsdp_candidates[0])
+    dp_shard = max(1, min(dp_shard, total_dp))
+    result["dp_shard"] = dp_shard
+    result["dp_replicate"] = max(1, total_dp // dp_shard)
     return result
 
 
@@ -413,7 +423,7 @@ def search_strategies(config: NormalizedConfig) -> Dict[str, Any]:
 
     filtered = _post_filter(scored_space, config, candidate_dims)
     best = filtered[0]
-    result = _format_result(best)
+    result = _format_result(best, config)
 
     logger.info(
         "Optimal strategy found: dp=%(dp)s tp=%(tp)s pp=%(pp)s "

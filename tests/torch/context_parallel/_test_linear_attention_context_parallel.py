@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed accuracy tests for Qwen3.5 linear-attention CP."""
+"""Distributed accuracy tests for shared Gated DeltaNet linear-attention CP."""
 import torch
 import torch.distributed as dist
 
@@ -21,7 +21,7 @@ from hyper_parallel.core.context_parallel.linear_attention_context_parallel impo
     LinearAttentionContextParallel,
     _differentiable_all_to_all_shard,
 )
-from hyper_parallel.models.qwen3_5.model import Qwen3_5GatedDeltaNet
+from hyper_parallel.models.modules.linear_attention import GatedDeltaNet
 from tests.torch.utils import init_dist
 
 
@@ -49,7 +49,7 @@ def _global_relative_l2(actual, expected):
 
 
 def _build_module(device):
-    return Qwen3_5GatedDeltaNet(
+    return GatedDeltaNet(
         hidden_size=128,
         num_v_heads=8,
         num_k_heads=4,
@@ -84,8 +84,8 @@ def _check_single_token_a2a_round_trip(mesh, rank, device):
     torch.testing.assert_close(local.grad, torch.ones_like(local))
 
 
-def _run_mode(mode, mesh, rank, world, device):
-    """Compare one linear-attention CP mode with a full-sequence reference."""
+def _build_mode_state(mode, mesh, rank, world, device):
+    """Build matching reference and context-parallel inputs for one mode."""
     torch.manual_seed(20260726)
     reference = _build_module(device)
     candidate = _build_module(device)
@@ -107,7 +107,11 @@ def _run_mode(mode, mesh, rank, world, device):
     local_input = (
         full_input[:, local_slice].detach().clone().contiguous().requires_grad_(True)
     )
+    return reference, candidate, full_input, local_input, local_slice
 
+
+def _compute_forward_metrics(reference, candidate, full_input, local_input, local_slice):
+    """Run both forwards and collect output accuracy metrics."""
     expected_full = reference(full_input)
     actual = candidate(local_input)
     expected = expected_full[:, local_slice]
@@ -115,7 +119,16 @@ def _run_mode(mode, mesh, rank, world, device):
     output_expected_max_abs = _global_max(expected.abs().max())
     output_max_rel_scale = output_max_abs / output_expected_max_abs.clamp_min(1e-12)
     output_rel_l2 = _global_relative_l2(actual, expected)
+    metrics = {
+        "max_abs": output_max_abs,
+        "max_rel_scale": output_max_rel_scale,
+        "rel_l2": output_rel_l2,
+    }
+    return expected_full, actual, metrics
 
+
+def _run_backward(expected_full, actual, rank, world):
+    """Backpropagate matching full-sequence and local gradients."""
     torch.manual_seed(20260800 + rank)
     local_grad_output = torch.randn_like(actual)
     gathered_grad_output = [torch.empty_like(local_grad_output) for _ in range(world)]
@@ -123,6 +136,9 @@ def _run_mode(mode, mesh, rank, world, device):
     expected_full.backward(torch.cat(gathered_grad_output, dim=1))
     actual.backward(local_grad_output)
 
+
+def _compute_input_grad_metrics(full_input, local_input, local_slice):
+    """Collect input-gradient accuracy metrics."""
     input_grad_max_abs = _global_max(
         (local_input.grad - full_input.grad[:, local_slice]).abs().max()
     )
@@ -136,6 +152,15 @@ def _run_mode(mode, mesh, rank, world, device):
         local_input.grad,
         full_input.grad[:, local_slice],
     )
+    return {
+        "max_abs": input_grad_max_abs,
+        "max_rel_scale": input_grad_max_rel_scale,
+        "rel_l2": input_grad_rel_l2,
+    }
+
+
+def _compute_param_grad_metrics(reference, candidate, device):
+    """Collect reduced parameter-gradient accuracy metrics."""
     param_grad_max_abs = torch.zeros((), device=device, dtype=torch.float32)
     param_grad_max_rel_scale = torch.zeros_like(param_grad_max_abs)
     param_grad_max_rel_l2 = torch.zeros_like(param_grad_max_abs)
@@ -183,38 +208,65 @@ def _run_mode(mode, mesh, rank, world, device):
         / expected_grad_norm_sq.sqrt().clamp_min(1e-12)
     )
     grad_norm_rel = _global_max(grad_norm_rel)
+    return {
+        "max_abs": param_grad_max_abs,
+        "max_rel_scale": param_grad_max_rel_scale,
+        "max_rel_l2": param_grad_max_rel_l2,
+        "grad_norm_rel": grad_norm_rel,
+        "max_rel_scale_param": max_rel_scale_param,
+        "max_rel_l2_param": max_rel_l2_param,
+    }
+
+
+def _log_metrics(mode, rank, output_metrics, input_grad_metrics, param_grad_metrics):
+    """Log the collected metrics from rank zero."""
     if rank == 0:
         print(
             f"mode={mode} "
-            f"output_max_abs={output_max_abs.item():.6e} "
-            f"output_max_rel_scale={output_max_rel_scale.item():.6e} "
-            f"output_rel_l2={output_rel_l2.item():.6e} "
-            f"input_grad_max_abs={input_grad_max_abs.item():.6e} "
-            f"input_grad_max_rel_scale={input_grad_max_rel_scale.item():.6e} "
-            f"input_grad_rel_l2={input_grad_rel_l2.item():.6e} "
-            f"param_grad_max_abs={param_grad_max_abs.item():.6e} "
-            f"param_grad_max_rel_scale={param_grad_max_rel_scale.item():.6e} "
-            f"param_grad_max_rel_l2={param_grad_max_rel_l2.item():.6e} "
-            f"grad_norm_rel={grad_norm_rel.item():.6e}",
+            f"output_max_abs={output_metrics['max_abs'].item():.6e} "
+            f"output_max_rel_scale={output_metrics['max_rel_scale'].item():.6e} "
+            f"output_rel_l2={output_metrics['rel_l2'].item():.6e} "
+            f"input_grad_max_abs={input_grad_metrics['max_abs'].item():.6e} "
+            f"input_grad_max_rel_scale={input_grad_metrics['max_rel_scale'].item():.6e} "
+            f"input_grad_rel_l2={input_grad_metrics['rel_l2'].item():.6e} "
+            f"param_grad_max_abs={param_grad_metrics['max_abs'].item():.6e} "
+            f"param_grad_max_rel_scale={param_grad_metrics['max_rel_scale'].item():.6e} "
+            f"param_grad_max_rel_l2={param_grad_metrics['max_rel_l2'].item():.6e} "
+            f"grad_norm_rel={param_grad_metrics['grad_norm_rel'].item():.6e}",
             flush=True,
         )
         print(
-            f"mode={mode} max_rel_scale_param={max_rel_scale_param} "
-            f"max_rel_l2_param={max_rel_l2_param}",
+            f"mode={mode} max_rel_scale_param={param_grad_metrics['max_rel_scale_param']} "
+            f"max_rel_l2_param={param_grad_metrics['max_rel_l2_param']}",
             flush=True,
         )
 
+
+def _assert_metrics(output_metrics, input_grad_metrics, param_grad_metrics):
+    """Check all accuracy metrics against their existing tolerances."""
     # BF16 kernels may change reduction order across eager and fused backends.
     # Loose max-abs guards catch outliers; relative L2 guards broad numerical drift.
-    assert output_max_abs.item() <= _OUTPUT_MAX_ABS_TOL
-    assert input_grad_max_abs.item() <= _INPUT_GRAD_MAX_ABS_TOL
-    assert output_max_rel_scale.item() <= _MAX_REL_SCALE_TOL
-    assert input_grad_max_rel_scale.item() <= _MAX_REL_SCALE_TOL
-    assert param_grad_max_rel_scale.item() <= _MAX_REL_SCALE_TOL
-    assert output_rel_l2.item() <= _REL_L2_TOL
-    assert input_grad_rel_l2.item() <= _REL_L2_TOL
-    assert param_grad_max_rel_l2.item() <= _PARAM_GRAD_REL_L2_TOL
-    assert grad_norm_rel.item() <= _GRAD_NORM_REL_TOL
+    assert output_metrics["max_abs"].item() <= _OUTPUT_MAX_ABS_TOL
+    assert input_grad_metrics["max_abs"].item() <= _INPUT_GRAD_MAX_ABS_TOL
+    assert output_metrics["max_rel_scale"].item() <= _MAX_REL_SCALE_TOL
+    assert input_grad_metrics["max_rel_scale"].item() <= _MAX_REL_SCALE_TOL
+    assert param_grad_metrics["max_rel_scale"].item() <= _MAX_REL_SCALE_TOL
+    assert output_metrics["rel_l2"].item() <= _REL_L2_TOL
+    assert input_grad_metrics["rel_l2"].item() <= _REL_L2_TOL
+    assert param_grad_metrics["max_rel_l2"].item() <= _PARAM_GRAD_REL_L2_TOL
+    assert param_grad_metrics["grad_norm_rel"].item() <= _GRAD_NORM_REL_TOL
+
+
+def _run_mode(mode, mesh, rank, world, device):
+    """Compare one linear-attention CP mode with a full-sequence reference."""
+    state = _build_mode_state(mode, mesh, rank, world, device)
+    reference, candidate, full_input, local_input, local_slice = state
+    expected_full, actual, output_metrics = _compute_forward_metrics(*state)
+    _run_backward(expected_full, actual, rank, world)
+    input_grad_metrics = _compute_input_grad_metrics(full_input, local_input, local_slice)
+    param_grad_metrics = _compute_param_grad_metrics(reference, candidate, device)
+    _log_metrics(mode, rank, output_metrics, input_grad_metrics, param_grad_metrics)
+    _assert_metrics(output_metrics, input_grad_metrics, param_grad_metrics)
 
 
 def test_linear_attention_cp_forward_backward_accuracy():

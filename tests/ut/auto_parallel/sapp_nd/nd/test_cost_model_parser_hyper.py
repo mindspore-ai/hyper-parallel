@@ -20,7 +20,7 @@ How to run this:
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
@@ -168,6 +168,45 @@ def _mla_overrides(**kw: Any) -> Dict[str, Any]:
             "micro_batch_size": 1,
             "micro_batch_num": 1,
             "gradient_checkpointing": {"activation_checkpoint": "none"},
+        },
+    }
+    _deep_update(base, kw)
+    return base
+
+
+def _auto_models_config(**kw: Any) -> Dict[str, Any]:
+    """Return a minimal current AutoModels Trainer configuration."""
+    base = {
+        "model": {
+            "_target_": (
+                "hyper_parallel.auto_models._transformers."
+                "HyperAutoModelForCausalLM.from_pretrained"
+            ),
+            "pretrained_model_name_or_path": "local/model",
+            "torch_dtype": "bfloat16",
+            "attn_implementation": "sdpa",
+            "local_files_only": True,
+        },
+        "training": {
+            "global_batch_size": 64,
+            "micro_batch_size": 2,
+            "max_grad_norm": 1.0,
+        },
+        "accelerator": {
+            "tp_size": 4,
+            "cp_size": 1,
+            "ep_size": 2,
+            "pp_size": 2,
+            "sequence_parallel": True,
+        },
+        "fsdp_config": {
+            "dp_shard_size": 4,
+            "mix_precision": {"param_dtype": "bfloat16"},
+        },
+        "activation_checkpoint": {"mode": "full"},
+        "dataset": {"data_transform": {"max_seq_len": 2048}},
+        "optimizer": {
+            "_target_": "hyper_parallel.auto_models.components.optim.optimizer.AdamW",
         },
     }
     _deep_update(base, kw)
@@ -699,102 +738,79 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         self.assertEqual(flat["b"]["d"][1]["e"], 4)
         self.assertEqual(flat["f"], "hello")
 
-    # ---- L2: Direct-import path (mock) -----------------------------------
+    # ---- L2: AutoModels config path (mock) -------------------------------
 
-    def test_direct_import_happy_path(self):
+    @patch(
+        "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers."
+        "cost_model_parser_hyper.get_hf_config"
+    )
+    def test_auto_models_config_happy_path(self, mock_get_hf_config):
         """
-        Feature: _resolve_via_direct_import — success.
-        Description: Mock _build_config returning a model Config object.
-        Expectation: ccfg fields match mock values.
+        Feature: AutoModels Trainer configuration parsing.
+        Description: Resolve model metadata through the shared Transformers
+            config path and read the new root-level Trainer sections.
+        Expectation: Model, topology, batch, recompute, and dtype fields map
+            to the cost model without importing the removed Trainer.
         """
-        mock_config = MagicMock()
-        mock_config.hidden_size = 8192
-        mock_config.num_hidden_layers = 80
-        mock_config.num_attention_heads = 64
-        mock_config.intermediate_size = 29568
-        mock_config.vocab_size = 152064
-        mock_config.max_position_embeddings = 8192
-        mock_config.num_key_value_heads = 8
-        mock_config.kv_lora_rank = 0
-        mock_config.q_lora_rank = 0
-        mock_config.qk_rope_head_dim = 0
-        mock_config.num_experts = 1
-        mock_config.mtp_depth = 0
-        mock_config.multiple_of = 256
-        mock_config.ffn_dim_multiplier = 1.0
-        mock_config.n_shared_experts = 0
-        mock_config.first_k_dense_replace = 0
-        mock_config.moe_intermediate_size = 0
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="qwen3_moe",
+            hidden_size=8192,
+            num_hidden_layers=80,
+            num_attention_heads=64,
+            intermediate_size=29568,
+            vocab_size=152064,
+            max_position_embeddings=8192,
+            num_key_value_heads=8,
+            kv_lora_rank=0,
+            q_lora_rank=0,
+            qk_rope_head_dim=0,
+            num_experts=1,
+            mtp_depth=0,
+            multiple_of=256,
+            ffn_dim_multiplier=1.0,
+            first_k_dense_replace=0,
+            moe_intermediate_size=0,
+        )
 
-        mock_build = MagicMock(return_value=mock_config)
-        mock_mod = MagicMock(_build_config=mock_build)
+        ccfg = _make_ccfg(_auto_models_config())
 
-        # We need to mock the entire _resolve_via_direct_import path.
-        # The trick is to mock _instantiate_recursive + import_module.
-        cfg_dict = {
-            "model": {"name": "qwen3_5"},
-            "train": {
-                "accelerator": {"dp_shard": 1, "tp_degree": 8, "pipeline_parallel_degree": 1},
-                "micro_batch_size": 1, "micro_batch_num": 1,
-                "gradient_checkpointing": {"activation_checkpoint": "none"},
-            },
-            "context": {"max_device_memory": "54GB"},
-        }
-        ccfg = _ParserCostModelConfig(cfg_dict)
-
-        with patch(
-            "hyper_parallel.trainer.config._instantiate_recursive"
-        ) as mock_inst:
-            mock_trainer = MagicMock()
-            mock_trainer.model.name = "qwen3_5"
-            mock_inst.return_value = mock_trainer
-
-            with patch("importlib.import_module", return_value=mock_mod):
-                parser = CostModelParserHyperV2(ccfg)
-                parser.parse()
-
+        mock_get_hf_config.assert_called_once_with(
+            "local/model", "sdpa", "bfloat16", local_files_only=True,
+        )
+        self.assertEqual(ccfg.model_name, "qwen3_moe")
         self.assertEqual(ccfg.h, 8192)
         self.assertEqual(ccfg.n_lay, 80)
         self.assertEqual(ccfg.a, 64)
         self.assertEqual(ccfg.hff, 29568)
         self.assertEqual(ccfg.v, 152064)
-        self.assertEqual(ccfg.s, 8192)
-        self.assertEqual(ccfg.t, 8)
-        self.assertEqual(ccfg.t_exp, 8)
-        self.assertEqual(ccfg.etp, 0)
+        self.assertEqual(ccfg.s, 2048)
+        self.assertEqual(ccfg.d, 4)
+        self.assertEqual(ccfg.t, 4)
+        self.assertEqual(ccfg.p, 2)
+        self.assertEqual(ccfg.ep, 2)
+        self.assertEqual(ccfg.sp, 4)
+        self.assertEqual(ccfg.b, 2)
+        self.assertEqual(ccfg.m, 8)
+        self.assertEqual(ccfg.gbs, 64)
+        self.assertTrue(ccfg.full_rec)
+        self.assertEqual(ccfg.bytes_p, 2)
+        self.assertEqual(ccfg.bytes_compute, 2)
+        self.assertTrue(ccfg.has_clip)
+        self.assertIn("AdamW", ccfg.optimizer)
 
-    def test_direct_import_fallback_missing_module(self):
+    def test_auto_models_config_requires_model_metadata(self):
         """
-        Feature: _resolve_via_direct_import — missing model module.
-        Description: importlib.import_module raises ImportError → fallback.
-        Expectation: Parser falls through to config_overrides.
+        Feature: AutoModels Trainer configuration validation.
+        Description: Parse a model target without a pretrained path or
+            explicit config overrides.
+        Expectation: A clear ValueError is raised instead of a zero-sized
+            cost model.
         """
-        cfg_dict = _dense_overrides()
-        ccfg = _ParserCostModelConfig(cfg_dict)
-
-        with patch("importlib.import_module", side_effect=ImportError("not found")):
-            parser = CostModelParserHyperV2(ccfg)
-            parser.parse()
-
-        self.assertEqual(ccfg.h, 3584)
-        self.assertEqual(ccfg.n_lay, 8)
-
-    def test_direct_import_fallback_missing_build_config(self):
-        """
-        Feature: _resolve_via_direct_import — missing _build_config.
-        Description: Module exists but has no _build_config → fallback.
-        Expectation: Parser falls through to config_overrides.
-        """
-        cfg_dict = _dense_overrides()
-        ccfg = _ParserCostModelConfig(cfg_dict)
-        mock_mod = MagicMock(spec=[])  # no _build_config
-
-        with patch("importlib.import_module", return_value=mock_mod):
-            parser = CostModelParserHyperV2(ccfg)
-            parser.parse()
-
-        self.assertEqual(ccfg.h, 3584)
-        self.assertEqual(ccfg.n_lay, 8)
+        config = _auto_models_config(model={
+            "pretrained_model_name_or_path": None,
+        })
+        with self.assertRaisesRegex(ValueError, "no model.config_overrides"):
+            _make_ccfg(config)
 
     # ---- L3: E2E integration ---------------------------------------------
 

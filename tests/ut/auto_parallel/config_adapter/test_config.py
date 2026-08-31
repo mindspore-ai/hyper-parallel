@@ -17,7 +17,9 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from typing import Any, Dict
+from unittest.mock import patch
 
 try:
     import yaml  # type: ignore[import-untyped]  # pylint: disable=C0415
@@ -220,6 +222,32 @@ train:
 
 data:
   max_seq_len: 8192
+"""
+
+
+def _auto_models_hp_yaml_content() -> str:
+    """Return a minimal current AutoModels Trainer YAML string."""
+    return """
+model:
+  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: local/model
+  torch_dtype: bfloat16
+  local_files_only: true
+training:
+  global_batch_size: 64
+  micro_batch_size: 2
+accelerator:
+  tp_size: 4
+  cp_size: 1
+  ep_size: 2
+  pp_size: 2
+fsdp_config:
+  dp_shard_size: 4
+activation_checkpoint:
+  mode: full
+dataset:
+  data_transform:
+    max_seq_len: 2048
 """
 
 
@@ -503,6 +531,40 @@ class TestHpYamlReader(unittest.TestCase):
         self.assertEqual(config.search_space["tensor_parallel_degree"], [4])
         self.assertEqual(config.search_space["pipeline_parallel_degree"], [2])
         self.assertEqual(config.estimator["recompute_strategy"], "selective")
+
+    @patch(
+        "hyper_parallel.auto_models._transformers.registry.get_hf_config"
+    )
+    def test_read_auto_models_yaml_basic(self, mock_get_hf_config) -> None:
+        """read_hp_yaml_config extracts the current Trainer schema."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="qwen3_moe",
+            num_hidden_layers=32,
+            hidden_size=4096,
+            intermediate_size=11008,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            vocab_size=128256,
+            max_position_embeddings=8192,
+            num_experts=1,
+        )
+        path = os.path.join(self.tmpdir, "auto_models.yaml")
+        _write_yaml(path, _auto_models_hp_yaml_content())
+
+        config = read_hp_yaml_config(path)
+
+        mock_get_hf_config.assert_called_once_with(
+            "local/model", "sdpa", "bfloat16", local_files_only=True,
+        )
+        self.assertEqual(config.model_spec["name"], "qwen3_moe")
+        self.assertEqual(config.model_spec["num_hidden_layers"], 32)
+        self.assertEqual(config.model_spec["max_position_embeddings"], 2048)
+        self.assertEqual(config.model_spec["local_batch_size"], 2)
+        self.assertEqual(config.search_space["data_parallel_shard_degree"], [4])
+        self.assertEqual(config.search_space["tensor_parallel_degree"], [4])
+        self.assertEqual(config.search_space["pipeline_parallel_degree"], [2])
+        self.assertEqual(config.estimator["recompute_strategy"], "full")
+        self.assertEqual(config.pp_config["micro_batch_num"], 8)
 
     def test_hp_yaml_empty_accelerator_defaults(self) -> None:
         """Empty accelerator section produces default search_space (single-element lists)."""
@@ -1036,6 +1098,42 @@ class TestWriter(unittest.TestCase):
         self.assertEqual(accel["pipeline_parallel_degree"], 2)
         self.assertEqual(accel["context_parallel_degree"], 1)
         self.assertEqual(accel["expert_parallel_degree"], 1)
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_auto_models_yaml(self) -> None:
+        """write_resolved_yaml updates current Trainer topology fields."""
+        original_yaml_path = os.path.join(self.tmpdir, "auto_models.yaml")
+        original_content = {
+            "model": {"pretrained_model_name_or_path": "local/model"},
+            "training": {"global_batch_size": 8},
+            "accelerator": {"tp_size": 1, "pp_size": 1},
+            "fsdp_config": {"dp_shard_size": 1},
+        }
+        with open(original_yaml_path, "w", encoding="utf-8") as fh:
+            yaml.dump(original_content, fh, default_flow_style=False)
+
+        config = _make_full_config()
+        config.resolved_strategy = {
+            "dp": 8,
+            "dp_shard": 4,
+            "tp": 2,
+            "pp": 2,
+            "cp": 1,
+            "ep": 2,
+            "global_batch_size": 64,
+        }
+        output_path = os.path.join(self.tmpdir, "resolved_auto_models.yaml")
+        write_resolved_yaml(config, original_yaml_path, output_path)
+
+        with open(output_path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+        self.assertEqual(data["fsdp_config"]["dp_shard_size"], 4)
+        self.assertEqual(data["accelerator"]["tp_size"], 2)
+        self.assertEqual(data["accelerator"]["pp_size"], 2)
+        self.assertEqual(data["accelerator"]["cp_size"], 1)
+        self.assertEqual(data["accelerator"]["ep_size"], 2)
+        self.assertEqual(data["training"]["global_batch_size"], 64)
+        self.assertNotIn("train", data)
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_yaml_raises_when_none(self) -> None:
