@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """CPU tests for RL2-style role orchestration in the synchronous trainer."""
+# These tests intentionally inspect orchestration state and invoke internal hooks.
+# pylint: disable=protected-access
 
 import os
 from types import SimpleNamespace
@@ -21,9 +23,9 @@ from typing import Any, Optional
 import pytest
 import torch
 
-import rl.agentic.runner as runner_backend
+import rl.agentic.core.runner as runner_backend
 from rl.algorithm import build_algorithm
-from rl.agentic.runner import AgentRunner
+from rl.agentic.core.runner import AgentRunner
 from rl.consistency import (
     CONSISTENCY_PROFILE_OFF,
     QWEN3_ASCEND_CONSISTENCY_V1,
@@ -293,8 +295,9 @@ def test_rollout_setup_failure_closes_partially_built_sessions(
     runner.num_samples = 2
     runner.max_observation_tokens = None
 
-    def synchronize_error(error: Optional[Exception], _operation: str) -> None:
+    def synchronize_error(error: Optional[Exception], operation: str) -> None:
         """Emulate a single-rank generation engine error boundary."""
+        del operation
         if error is not None:
             raise error
 
@@ -310,8 +313,9 @@ def test_rollout_setup_failure_closes_partially_built_sessions(
 
     calls = 0
 
-    def build_environment(_name: str, _prompt: object) -> Environment:
+    def build_environment(name: str, prompt: object) -> Environment:
         """Create one environment, then fail the next replica setup."""
+        del name, prompt
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -416,6 +420,32 @@ def _rollout() -> ExperienceBatch:
         responses=("",),
         generation_seconds=0.0,
     )
+
+
+def test_publish_policy_releases_training_memory_before_vllm_weight_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Colocated refit must clear cached training allocations before weight wake."""
+    calls: list[str] = []
+    monkeypatch.setattr(trainer_backend, "hsdp_sync_stream", lambda: None)
+    trainer = object.__new__(SyncTrainer)
+    trainer.actor = SimpleNamespace(actor_model=object())
+    trainer.model_registration = SimpleNamespace(name="test")
+    trainer._reshard_model = lambda model: calls.append("reshard")
+    trainer._release_training_state_for_rollout = lambda: calls.append("release")
+    trainer.rollout_engine = SimpleNamespace(
+        update_weights=lambda _snapshot: calls.append("update_weights"),
+        prepare_for_rollout=lambda: calls.append("prepare_for_rollout"),
+    )
+
+    trainer._publish_policy(2, SimpleNamespace(optimizer_steps=2))
+
+    assert calls == [
+        "reshard",
+        "release",
+        "update_weights",
+        "prepare_for_rollout",
+    ]
 
 
 def _trainer(algorithm_name: str, calls: list[str]) -> SyncTrainer:

@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Tests for prompt data-source normalization."""
+# Tests intentionally exercise prompt normalization as a module-internal contract.
+# pylint: disable=protected-access
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,7 +22,42 @@ from types import SimpleNamespace
 import pytest
 
 from rl.dataset import data_source
+from rl.dataset import PROMPT_INSTRUCTION
 from rl.dataset.data_source import PromptDataset, _select_answer_source
+
+
+def test_prompt_instruction_remains_a_compatible_public_export() -> None:
+    """The package-level GSM8K instruction export must remain importable."""
+    assert 'after "####"' in PROMPT_INSTRUCTION
+
+
+def test_prompt_normalization_does_not_inject_task_instruction() -> None:
+    """Generic prompt loading must not add GSM8K text to unrelated tasks."""
+    source, prompt = data_source._normalize_prompt("Who wrote Hamlet?", index=0)
+
+    assert source == "Who wrote Hamlet?"
+    assert prompt == source
+
+
+def test_structured_prompt_receives_configured_instruction_once() -> None:
+    """Configured instructions apply equally to structured dataset prompts."""
+    instruction = 'Output the final answer after "####".'
+    source = [{"role": "user", "content": "What is 1 + 1?"}]
+
+    source_prompt, prompt = data_source._normalize_prompt(
+        source,
+        index=0,
+        prompt_instruction=instruction,
+    )
+    _, repeated = data_source._normalize_prompt(
+        [{"role": "user", "content": prompt}],
+        index=0,
+        prompt_instruction=instruction,
+    )
+
+    assert source_prompt == "What is 1 + 1?"
+    assert prompt == f"{source_prompt} {instruction}"
+    assert repeated == prompt
 
 
 def test_explicit_answer_column_takes_precedence_over_reward_model() -> None:

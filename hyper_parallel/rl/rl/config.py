@@ -21,7 +21,8 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from rl.agentic.registry import ENVIRONMENTS
+from rl.agentic.core.types import InteractionMode
+from rl.agentic.envs.environment import ENVIRONMENTS, load_agentic_module
 from rl.algorithm.loss import RLAlgorithm
 from rl.consistency import consistency_profile, validate_consistency_model_identity
 from rl.roles.model import (
@@ -439,6 +440,43 @@ def _validate_vllm_limits(vllm: Mapping[str, Any]) -> None:
         )
 
 
+def _weight_sync_parallel_sizes(accelerator: Mapping[str, Any]) -> dict[str, int]:
+    """Validate the pure-FSDP topology required for weight synchronization."""
+    parallel_sizes = {
+        field: int(accelerator.get(field, 1))
+        for field in ("dp_replicate", "tp", "cp", "pp")
+    }
+    non_tp_sizes = {
+        field: size for field, size in parallel_sizes.items() if field != "tp"
+    }
+    if any(size != 1 for size in non_tp_sizes.values()):
+        raise ValueError(
+            "Weight synchronization currently requires pure FSDP training with "
+            "dp_replicate=1 and train CP/PP=1, got "
+            f"{parallel_sizes}"
+        )
+    return parallel_sizes
+
+
+def _trainer_tp2_weight_sync_supported(
+    trainer_tp: int,
+    rollout_model: VLLMModelRegistration,
+    effective_strategy: str,
+    fallback_strategy: str,
+) -> bool:
+    """Return whether the configured trainer TP2 sync path is supported."""
+    fallback_supported = fallback_strategy == "none" or (
+        effective_strategy == "direct_reshard"
+        and fallback_strategy == "full_gather"
+    )
+    return (
+        trainer_tp == 2
+        and rollout_model.family == "qwen3"
+        and effective_strategy in ("full_gather", "direct_reshard")
+        and fallback_supported
+    )
+
+
 def _validate_vllm_weight_sync(
     vllm: Mapping[str, Any],
     deployment: str,
@@ -477,33 +515,15 @@ def _validate_vllm_weight_sync(
             "Direct reshard currently supports Qwen3 rollout models only; "
             f"got family={rollout_model.family!r}"
         )
-    parallel_sizes = {
-        field: int(accelerator.get(field, 1))
-        for field in ("dp_replicate", "tp", "cp", "pp")
-    }
-    non_tp_sizes = {
-        field: size for field, size in parallel_sizes.items() if field != "tp"
-    }
-    if any(size != 1 for size in non_tp_sizes.values()):
-        raise ValueError(
-            "Weight synchronization currently requires pure FSDP training with "
-            "dp_replicate=1 and train CP/PP=1, got "
-            f"{parallel_sizes}"
-        )
+    parallel_sizes = _weight_sync_parallel_sizes(accelerator)
     trainer_tp = parallel_sizes["tp"]
     if trainer_tp == 1:
         return
-    trainer_tp2_supported = (
-        trainer_tp == 2
-        and rollout_model.family == "qwen3"
-        and effective_strategy in ("full_gather", "direct_reshard")
-        and (
-            fallback_strategy == "none"
-            or (
-                effective_strategy == "direct_reshard"
-                and fallback_strategy == "full_gather"
-            )
-        )
+    trainer_tp2_supported = _trainer_tp2_weight_sync_supported(
+        trainer_tp,
+        rollout_model,
+        effective_strategy,
+        fallback_strategy,
     )
     if not trainer_tp2_supported:
         raise ValueError(
@@ -552,6 +572,9 @@ def _validate_vllm(
 
 def _validate_agentic(agentic: Mapping[str, Any]) -> None:
     """Validate the selected agent environment and turn limits."""
+    module_path = agentic.get("module_path")
+    if module_path is not None:
+        load_agentic_module(module_path)
     environment_name = agentic.get("environment")
     if environment_name not in ENVIRONMENTS.names:
         raise ValueError(
@@ -562,6 +585,19 @@ def _validate_agentic(agentic: Mapping[str, Any]) -> None:
         raise ValueError("agentic.max_turns must be positive")
     if int(agentic.get("max_observation_tokens", 0)) < 0:
         raise ValueError("agentic.max_observation_tokens must be non-negative")
+    mode = InteractionMode.parse(
+        agentic.get(
+            "interaction_mode",
+            "single_turn" if int(agentic["max_turns"]) == 1 else "multi_turn",
+        )
+    )
+    if mode is InteractionMode.SINGLE_TURN and int(agentic["max_turns"]) != 1:
+        raise ValueError("single_turn interaction requires agentic.max_turns=1")
+    max_episode_tokens = agentic.get("max_episode_tokens")
+    if max_episode_tokens is not None and int(max_episode_tokens) <= 0:
+        raise ValueError("agentic.max_episode_tokens must be positive when configured")
+    if not isinstance(agentic.get("apply_chat_template", False), bool):
+        raise ValueError("agentic.apply_chat_template must be a boolean")
 
 
 def validate_rollout_and_agentic(
@@ -642,6 +678,151 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     _validate_logging(required_mapping(config, "logging"))
 
 
+def _load_automatic_limit_text_config(model: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Load and validate the model metadata used for automatic vLLM limits."""
+    model_path = Path(str(model["weights_path"])) / "config.json"
+    try:
+        with model_path.open(encoding="utf-8") as config_file:
+            model_config = json.load(config_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Automatic max_num_seqs requires a readable model config: {model_path}"
+        ) from error
+    text_config = model_config.get("text_config", model_config)
+    layer_types = text_config.get("layer_types") or []
+    if text_config.get("model_type") != "qwen3" or any(
+        layer_type != "full_attention" for layer_type in layer_types
+    ):
+        raise ValueError(
+            "Automatic max_num_seqs currently supports dense Qwen3 "
+            "full-attention models only"
+        )
+    return text_config
+
+
+def _positive_integer(section: Mapping[str, Any], field: str, prefix: str) -> int:
+    """Read one strictly positive, non-Boolean integer configuration value."""
+    value = section.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{prefix}.{field} must be a positive integer")
+    return value
+
+
+def _validate_automatic_limit_inputs(
+    data: Mapping[str, Any],
+    rollout: Mapping[str, Any],
+    agentic: Mapping[str, Any],
+    train: Mapping[str, Any],
+    accelerator: Mapping[str, Any],
+    vllm: Mapping[str, Any],
+) -> tuple[int, int, int]:
+    """Validate automatic-limit inputs and return DP, TP, and observation limits."""
+    required_vllm_fields = (
+        "kv_cache_memory_bytes",
+        "max_model_len",
+        "max_num_batched_tokens",
+        "block_size",
+    )
+    missing = [field for field in required_vllm_fields if vllm.get(field) is None]
+    if missing:
+        raise ValueError(
+            f"Automatic max_num_seqs requires explicit rollout.vllm fields: {missing}"
+        )
+    positive_fields = (
+        (data, "max_prompt_length", "data"),
+        (rollout, "max_new_tokens", "rollout"),
+        (rollout, "num_return_sequences", "rollout"),
+        (agentic, "max_turns", "agentic"),
+        (train, "prompt_batch_size", "train"),
+        (accelerator, "dp_shard", "train.accelerator"),
+        (vllm, "kv_cache_memory_bytes", "rollout.vllm"),
+        (vllm, "max_model_len", "rollout.vllm"),
+        (vllm, "max_num_batched_tokens", "rollout.vllm"),
+        (vllm, "block_size", "rollout.vllm"),
+    )
+    for section, field, prefix in positive_fields:
+        _positive_integer(section, field, prefix)
+    data_parallel_size = _positive_integer(
+        vllm, "data_parallel_size", "rollout.vllm"
+    )
+    tensor_parallel_size = _positive_integer(
+        vllm, "tensor_parallel_size", "rollout.vllm"
+    )
+    max_observation_tokens = agentic.get("max_observation_tokens", 0)
+    if (
+        not isinstance(max_observation_tokens, int)
+        or isinstance(max_observation_tokens, bool)
+        or max_observation_tokens < 0
+    ):
+        raise ValueError("agentic.max_observation_tokens must be a non-negative integer")
+    return data_parallel_size, tensor_parallel_size, max_observation_tokens
+
+
+def _automatic_context_tokens(
+    data: Mapping[str, Any],
+    rollout: Mapping[str, Any],
+    agentic: Mapping[str, Any],
+    vllm: Mapping[str, Any],
+    max_observation_tokens: int,
+) -> int:
+    """Calculate and validate the maximum per-sequence context length."""
+    max_turns = int(agentic["max_turns"])
+    context_tokens = (
+        int(data["max_prompt_length"])
+        + max_turns * int(rollout["max_new_tokens"])
+        + (max_turns - 1) * max_observation_tokens
+    )
+    max_model_len = int(vllm["max_model_len"])
+    if context_tokens > max_model_len:
+        raise ValueError(
+            "Automatic max_num_seqs requires workload context within max_model_len: "
+            f"context_tokens={context_tokens}, max_model_len={max_model_len}"
+        )
+    return context_tokens
+
+
+def _automatic_kv_capacity(
+    text_config: Mapping[str, Any],
+    vllm: Mapping[str, Any],
+    tensor_parallel_size: int,
+    context_tokens: int,
+    dtype_bytes: int,
+) -> int:
+    """Calculate how many maximum-length sequences fit in the KV cache."""
+    num_kv_heads = int(text_config["num_key_value_heads"])
+    if num_kv_heads % tensor_parallel_size != 0:
+        raise ValueError(
+            "Automatic max_num_seqs requires num_key_value_heads divisible by "
+            f"tensor_parallel_size: {num_kv_heads} % {tensor_parallel_size} != 0"
+        )
+    kv_heads_per_rank = num_kv_heads // tensor_parallel_size
+    head_dim = int(
+        text_config.get(
+            "head_dim",
+            int(text_config["hidden_size"])
+            // int(text_config["num_attention_heads"]),
+        )
+    )
+    block_size = int(vllm["block_size"])
+    block_bytes = (
+        int(text_config["num_hidden_layers"])
+        * block_size
+        * 2
+        * kv_heads_per_rank
+        * head_dim
+        * dtype_bytes
+    )
+    pool_blocks = int(vllm["kv_cache_memory_bytes"]) // block_bytes
+    blocks_per_sequence = math.ceil(context_tokens / block_size)
+    kv_capacity = pool_blocks // blocks_per_sequence
+    if kv_capacity <= 0:
+        raise ValueError(
+            "Automatic max_num_seqs found insufficient KV cache for one "
+            "maximum-length sequence"
+        )
+    return kv_capacity
+
+
 def resolve_vllm_automatic_limits(config: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve workload- and KV-bounded vLLM limits before validation.
 
@@ -673,129 +854,33 @@ def resolve_vllm_automatic_limits(config: Mapping[str, Any]) -> dict[str, Any]:
     agentic = required_mapping(resolved, "agentic")
     train = required_mapping(resolved, "train")
     accelerator = required_mapping(train, "accelerator")
-    model_path = Path(str(model["weights_path"])) / "config.json"
-    try:
-        with model_path.open(encoding="utf-8") as config_file:
-            model_config = json.load(config_file)
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(
-            f"Automatic max_num_seqs requires a readable model config: {model_path}"
-        ) from error
-    text_config = model_config.get("text_config", model_config)
-    layer_types = text_config.get("layer_types") or []
-    if text_config.get("model_type") != "qwen3" or any(
-        layer_type != "full_attention" for layer_type in layer_types
-    ):
-        raise ValueError(
-            "Automatic max_num_seqs currently supports dense Qwen3 full-attention models only"
+    text_config = _load_automatic_limit_text_config(model)
+    data_parallel_size, tensor_parallel_size, max_observation_tokens = (
+        _validate_automatic_limit_inputs(
+            data, rollout, agentic, train, accelerator, vllm
         )
-
-    required_vllm_fields = (
-        "kv_cache_memory_bytes",
-        "max_model_len",
-        "max_num_batched_tokens",
-        "block_size",
     )
-    missing = [field for field in required_vllm_fields if vllm.get(field) is None]
-    if missing:
-        raise ValueError(
-            f"Automatic max_num_seqs requires explicit rollout.vllm fields: {missing}"
-        )
-    positive_fields = (
-        (data, "max_prompt_length", "data"),
-        (rollout, "max_new_tokens", "rollout"),
-        (rollout, "num_return_sequences", "rollout"),
-        (agentic, "max_turns", "agentic"),
-        (train, "prompt_batch_size", "train"),
-        (accelerator, "dp_shard", "train.accelerator"),
-        (vllm, "kv_cache_memory_bytes", "rollout.vllm"),
-        (vllm, "max_model_len", "rollout.vllm"),
-        (vllm, "max_num_batched_tokens", "rollout.vllm"),
-        (vllm, "block_size", "rollout.vllm"),
-    )
-    for section, field, prefix in positive_fields:
-        value = section.get(field)
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValueError(f"{prefix}.{field} must be a positive integer")
-    data_parallel_size = vllm.get("data_parallel_size")
-    if (
-        not isinstance(data_parallel_size, int)
-        or isinstance(data_parallel_size, bool)
-        or data_parallel_size <= 0
-    ):
-        raise ValueError("rollout.vllm.data_parallel_size must be a positive integer")
-    tensor_parallel_size = vllm.get("tensor_parallel_size")
-    if (
-        not isinstance(tensor_parallel_size, int)
-        or isinstance(tensor_parallel_size, bool)
-        or tensor_parallel_size <= 0
-    ):
-        raise ValueError("rollout.vllm.tensor_parallel_size must be a positive integer")
-    max_observation_tokens = agentic.get("max_observation_tokens", 0)
-    if (
-        not isinstance(max_observation_tokens, int)
-        or isinstance(max_observation_tokens, bool)
-        or max_observation_tokens < 0
-    ):
-        raise ValueError("agentic.max_observation_tokens must be a non-negative integer")
-
     dtype = str(vllm.get("dtype", "bfloat16"))
     dtype_bytes = {"bfloat16": 2, "bf16": 2}.get(dtype)
     if dtype_bytes is None:
         raise ValueError(f"Automatic max_num_seqs does not support dtype {dtype!r}")
-
-    max_turns = int(agentic["max_turns"])
-    context_tokens = (
-        int(data["max_prompt_length"])
-        + max_turns * int(rollout["max_new_tokens"])
-        + (max_turns - 1) * max_observation_tokens
+    context_tokens = _automatic_context_tokens(
+        data, rollout, agentic, vllm, max_observation_tokens
     )
-    max_model_len = int(vllm["max_model_len"])
-    if context_tokens > max_model_len:
-        raise ValueError(
-            "Automatic max_num_seqs requires workload context within max_model_len: "
-            f"context_tokens={context_tokens}, max_model_len={max_model_len}"
-        )
-
-    num_kv_heads = int(text_config["num_key_value_heads"])
-    if num_kv_heads % tensor_parallel_size != 0:
-        raise ValueError(
-            "Automatic max_num_seqs requires num_key_value_heads divisible by "
-            f"tensor_parallel_size: {num_kv_heads} % {tensor_parallel_size} != 0"
-        )
-    kv_heads_per_rank = num_kv_heads // tensor_parallel_size
-    head_dim = int(
-        text_config.get(
-            "head_dim",
-            int(text_config["hidden_size"]) // int(text_config["num_attention_heads"]),
-        )
+    kv_capacity = _automatic_kv_capacity(
+        text_config,
+        vllm,
+        tensor_parallel_size,
+        context_tokens,
+        dtype_bytes,
     )
-    num_layers = int(text_config["num_hidden_layers"])
-    block_size = int(vllm["block_size"])
-    block_bytes = (
-        num_layers
-        * block_size
-        * 2
-        * kv_heads_per_rank
-        * head_dim
-        * dtype_bytes
-    )
-    pool_blocks = int(vllm["kv_cache_memory_bytes"]) // block_bytes
-    blocks_per_sequence = math.ceil(context_tokens / block_size)
-    kv_capacity = pool_blocks // blocks_per_sequence
-    if kv_capacity <= 0:
-        raise ValueError(
-            "Automatic max_num_seqs found insufficient KV cache for one maximum-length sequence"
-        )
-
     trainer_dp_size = _trainer_data_parallel_size(accelerator)
     global_children = (
         trainer_dp_size
         * int(train.get("prompt_batch_size", 1))
         * int(rollout["num_return_sequences"])
     )
-    engine_count = int(vllm["data_parallel_size"])
-    workload_capacity = math.ceil(global_children / engine_count)
+    workload_capacity = math.ceil(global_children / data_parallel_size)
     max_num_batched_tokens = int(vllm["max_num_batched_tokens"])
     vllm["max_num_seqs"] = min(
         workload_capacity,
@@ -853,32 +938,8 @@ def _normalize_dtype_name(name: Any) -> Optional[str]:
     return canonical_name
 
 
-def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
-    """Translate Hyper-RL YAML into the HyperAutoModel runtime configuration."""
-    model_config = required_mapping(config, "model")
-    train_config = required_mapping(config, "train")
-    accelerator_config = required_mapping(train_config, "accelerator")
-    optimizer_config = required_mapping(train_config, "optimizer")
-    mixed_precision_config = required_mapping(train_config, "mixed_precision")
-    checkpoint_config = required_mapping(train_config, "checkpoint")
-    config_overrides = model_config.get("config_overrides")
-    if config_overrides not in (None, {}):
-        raise ValueError("model.config_overrides is not supported by HyperAutoModel")
-
-    max_steps = int(train_config["max_steps"])
-    prompt_batch_size = int(train_config.get("prompt_batch_size", 1))
-    topology = _trainer_topology(accelerator_config)
-    dp_shard = topology["dp_shard"]
-    trainer_dp_size = topology["dp_replicate"] * topology["dp_shard"]
-    cpu_offload = bool(accelerator_config.get("cpu_offload", False))
-    param_dtype_name = str(mixed_precision_config.get("param_dtype", "bfloat16"))
-    reduce_dtype_name = str(mixed_precision_config.get("reduce_dtype", "float32"))
-    output_dtype_name = mixed_precision_config.get("output_dtype")
-    enabled = bool(mixed_precision_config.get("enabled", True))
-    backend = str(train_config.get("comm_backend") or "hccl")
-    if cpu_offload and ":" not in backend:
-        backend = f"cpu:gloo,{platform.device_type()}:{backend}"
-
+def _build_optimizer_target(optimizer_config: Mapping[str, Any]) -> Target:
+    """Build the HyperAutoModel AdamW target."""
     optimizer_kwargs = {
         "adamw_lr": float(optimizer_config.get("lr", 1.0e-6)),
         "adamw_weight_decay": float(optimizer_config.get("weight_decay", 0.0)),
@@ -887,99 +948,197 @@ def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
     }
     if optimizer_config.get("foreach") is not None:
         optimizer_kwargs["foreach"] = bool(optimizer_config["foreach"])
-
-    activation_checkpoint_value = accelerator_config.get(
-        "activation_checkpoint", "off"
+    return Target(
+        AdamW,
+        target_path="hyper_parallel.auto_models.components.optim.optimizer.AdamW",
+        adamw_config=optimizer_kwargs,
+        no_decay_params=["bias", "norm", "ln_"],
     )
-    if isinstance(activation_checkpoint_value, bool):
-        activation_checkpoint = "full" if activation_checkpoint_value else "off"
+
+
+def _activation_checkpoint_mode(accelerator_config: Mapping[str, Any]) -> str:
+    """Normalize the activation-checkpoint mode."""
+    configured_value = accelerator_config.get("activation_checkpoint", "off")
+    if isinstance(configured_value, bool):
+        mode = "full" if configured_value else "off"
     else:
-        activation_checkpoint = str(activation_checkpoint_value).lower()
-    if activation_checkpoint not in ("off", "full", "selective"):
+        mode = str(configured_value).lower()
+    if mode not in ("off", "full", "selective"):
         raise ValueError(
             "train.accelerator.activation_checkpoint must be off, full, selective, "
-            f"or a Boolean, got {activation_checkpoint_value!r}"
+            f"or a Boolean, got {configured_value!r}"
         )
+    return mode
+
+
+def _build_model_target(
+    model_config: Mapping[str, Any],
+    param_dtype_name: str,
+    mixed_precision_enabled: bool,
+) -> Target:
+    """Build the pretrained causal-language-model target."""
+    return Target(
+        HyperAutoModelForCausalLM.from_pretrained,
+        target_path=(
+            "hyper_parallel.auto_models._transformers."
+            "HyperAutoModelForCausalLM.from_pretrained"
+        ),
+        pretrained_model_name_or_path=str(model_config["weights_path"]),
+        torch_dtype=param_dtype_name if mixed_precision_enabled else "float32",
+        attn_implementation=str(model_config.get("attn_implementation", "sdpa")),
+        force_hf=True,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+
+
+def _build_lr_scheduler_target(optimizer_config: Mapping[str, Any]) -> Target:
+    """Build the configured learning-rate scheduler target."""
+    return Target(
+        MultiLRScheduler,
+        target_path=(
+            "hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler"
+        ),
+        lr_decay_style=str(optimizer_config.get("lr_decay_style", "constant")),
+        lr_config={
+            "lr_warmup_ratio": float(optimizer_config.get("lr_warmup_ratio", 0.0)),
+            "min_lr": float(optimizer_config.get("lr_min", 0.0)),
+        },
+    )
+
+
+def _build_training_config(
+    train_config: Mapping[str, Any],
+    optimizer_config: Mapping[str, Any],
+    trainer_dp_size: int,
+    prompt_batch_size: int,
+    backend: str,
+) -> TrainingConfig:
+    """Build core training-loop settings."""
+    return TrainingConfig(
+        train_iters=int(train_config["max_steps"]),
+        global_batch_size=trainer_dp_size * prompt_batch_size,
+        micro_batch_size=prompt_batch_size,
+        backend=backend,
+        max_grad_norm=float(optimizer_config.get("max_grad_norm", 1.0)),
+        init_device=str(train_config.get("init_device", "meta")),
+        loss_aggregation="token_weighted",
+        seed=int(train_config.get("seed", 1234)),
+    )
+
+
+def _build_accelerator_config(
+    accelerator_config: Mapping[str, Any],
+) -> AcceleratorConfig:
+    """Build the supported parallel-dimension configuration."""
+    return AcceleratorConfig(
+        tp_size=int(accelerator_config.get("tp", 1)),
+        cp_size=int(accelerator_config.get("cp", 1)),
+        ep_size=1,
+        pp_size=int(accelerator_config.get("pp", 1)),
+        sequence_parallel=False,
+        loss_parallel=False,
+    )
+
+
+def _build_fsdp_config(
+    accelerator_config: Mapping[str, Any],
+    mixed_precision_config: Mapping[str, Any],
+    dp_shard: int,
+) -> FSDP2Config:
+    """Build FSDP, mixed-precision, and CPU-offload settings."""
+    mixed_precision_enabled = bool(mixed_precision_config.get("enabled", True))
+    return FSDP2Config(
+        dp_shard_size=dp_shard,
+        mix_precision=FSDP2MixedPrecisionConfig(
+            param_dtype=(
+                _normalize_dtype_name(
+                    mixed_precision_config.get("param_dtype", "bfloat16")
+                )
+                if mixed_precision_enabled
+                else None
+            ),
+            reduce_dtype=(
+                _normalize_dtype_name(
+                    mixed_precision_config.get("reduce_dtype", "float32")
+                )
+                if mixed_precision_enabled
+                else None
+            ),
+            output_dtype=(
+                _normalize_dtype_name(mixed_precision_config.get("output_dtype"))
+                if mixed_precision_enabled
+                else None
+            ),
+        ),
+        enable_offload=bool(accelerator_config.get("cpu_offload", False)),
+        reshard_after_forward=bool(
+            accelerator_config.get("reshard_after_forward", True)
+        ),
+        reshard_after_backward=False,
+        requires_grad_sync=True,
+        comm_fusion=bool(accelerator_config.get("comm_fusion", True)),
+    )
+
+
+def _build_checkpoint_config(
+    checkpoint_config: Mapping[str, Any],
+) -> CheckpointingConfig:
+    """Build checkpoint save settings."""
+    return CheckpointingConfig(
+        save_ckpt=(
+            bool(checkpoint_config.get("save_final", True))
+            or int(checkpoint_config.get("save_steps", 0)) > 0
+        ),
+        checkpoint_dir=str(checkpoint_config["output_dir"]),
+        save_consolidated="none",
+    )
+
+
+def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
+    """Translate Hyper-RL YAML into the HyperAutoModel runtime configuration."""
+    model_config = required_mapping(config, "model")
+    train_config = required_mapping(config, "train")
+    accelerator_config = required_mapping(train_config, "accelerator")
+    optimizer_config = required_mapping(train_config, "optimizer")
+    mixed_precision_config = required_mapping(train_config, "mixed_precision")
+    checkpoint_config = required_mapping(train_config, "checkpoint")
+    if model_config.get("config_overrides") not in (None, {}):
+        raise ValueError("model.config_overrides is not supported by HyperAutoModel")
+
+    prompt_batch_size = int(train_config.get("prompt_batch_size", 1))
+    topology = _trainer_topology(accelerator_config)
+    dp_shard = topology["dp_shard"]
+    trainer_dp_size = topology["dp_replicate"] * topology["dp_shard"]
+    cpu_offload = bool(accelerator_config.get("cpu_offload", False))
+    param_dtype_name = str(mixed_precision_config.get("param_dtype", "bfloat16"))
+    mixed_precision_enabled = bool(mixed_precision_config.get("enabled", True))
+    backend = str(train_config.get("comm_backend") or "hccl")
+    if cpu_offload and ":" not in backend:
+        backend = f"cpu:gloo,{platform.device_type()}:{backend}"
+
     return TrainerConfig(
-        model=Target(
-            HyperAutoModelForCausalLM.from_pretrained,
-            target_path=(
-                "hyper_parallel.auto_models._transformers."
-                "HyperAutoModelForCausalLM.from_pretrained"
-            ),
-            pretrained_model_name_or_path=str(model_config["weights_path"]),
-            torch_dtype=param_dtype_name if enabled else "float32",
-            attn_implementation=str(model_config.get("attn_implementation", "sdpa")),
-            force_hf=True,
-            local_files_only=True,
-            trust_remote_code=True,
+        model=_build_model_target(
+            model_config, param_dtype_name, mixed_precision_enabled
         ),
-        optimizer=Target(
-            AdamW,
-            target_path="hyper_parallel.auto_models.components.optim.optimizer.AdamW",
-            adamw_config=optimizer_kwargs,
-            no_decay_params=["bias", "norm", "ln_"],
+        optimizer=_build_optimizer_target(optimizer_config),
+        lr_scheduler=_build_lr_scheduler_target(optimizer_config),
+        training=_build_training_config(
+            train_config,
+            optimizer_config,
+            trainer_dp_size,
+            prompt_batch_size,
+            backend,
         ),
-        lr_scheduler=Target(
-            MultiLRScheduler,
-            target_path=(
-                "hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler"
-            ),
-            lr_decay_style=str(optimizer_config.get("lr_decay_style", "constant")),
-            lr_config={
-                "lr_warmup_ratio": float(optimizer_config.get("lr_warmup_ratio", 0.0)),
-                "min_lr": float(optimizer_config.get("lr_min", 0.0)),
-            },
+        accelerator=_build_accelerator_config(accelerator_config),
+        fsdp_config=_build_fsdp_config(
+            accelerator_config, mixed_precision_config, dp_shard
         ),
-        training=TrainingConfig(
-            train_iters=max_steps,
-            global_batch_size=trainer_dp_size * prompt_batch_size,
-            micro_batch_size=prompt_batch_size,
-            backend=backend,
-            max_grad_norm=float(optimizer_config.get("max_grad_norm", 1.0)),
-            init_device=str(train_config.get("init_device", "meta")),
-            loss_aggregation="token_weighted",
-            seed=int(train_config.get("seed", 1234)),
+        mixed_precision=MixedPrecisionConfig(enabled=mixed_precision_enabled),
+        activation_checkpoint=ActivationCheckpointConfig(
+            mode=_activation_checkpoint_mode(accelerator_config)
         ),
-        accelerator=AcceleratorConfig(
-            tp_size=int(accelerator_config.get("tp", 1)),
-            cp_size=int(accelerator_config.get("cp", 1)),
-            ep_size=1,
-            pp_size=int(accelerator_config.get("pp", 1)),
-            sequence_parallel=False,
-            loss_parallel=False,
-        ),
-        fsdp_config=FSDP2Config(
-            dp_shard_size=dp_shard,
-            mix_precision=FSDP2MixedPrecisionConfig(
-                param_dtype=(
-                    _normalize_dtype_name(param_dtype_name) if enabled else None
-                ),
-                reduce_dtype=(
-                    _normalize_dtype_name(reduce_dtype_name) if enabled else None
-                ),
-                output_dtype=(
-                    _normalize_dtype_name(output_dtype_name) if enabled else None
-                ),
-            ),
-            enable_offload=cpu_offload,
-            reshard_after_forward=bool(
-                accelerator_config.get("reshard_after_forward", True)
-            ),
-            reshard_after_backward=False,
-            requires_grad_sync=True,
-            comm_fusion=bool(accelerator_config.get("comm_fusion", True)),
-        ),
-        mixed_precision=MixedPrecisionConfig(enabled=enabled),
-        activation_checkpoint=ActivationCheckpointConfig(mode=activation_checkpoint),
-        checkpoint=CheckpointingConfig(
-            save_ckpt=(
-                bool(checkpoint_config.get("save_final", True))
-                or int(checkpoint_config.get("save_steps", 0)) > 0
-            ),
-            checkpoint_dir=str(checkpoint_config["output_dir"]),
-            save_consolidated="none",
-        ),
+        checkpoint=_build_checkpoint_config(checkpoint_config),
     )
 
 

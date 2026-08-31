@@ -1,3 +1,4 @@
+# pylint: disable=invalid-name
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,18 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Environment registry used by the default agent rollout path."""
-from typing import Callable
-from rl.agentic.base import Environment
-from rl.dataset.contracts import PromptRecord
-from rl.registry import Registry
-EnvironmentBuilder = Callable[[PromptRecord], Environment]
-
-
-class EnvironmentRegistry(Registry[EnvironmentBuilder]):
-    """Registry specialized only by its public error label."""
-
-    def __init__(self) -> None:
-        """Create the environment registry with its public error label."""
-        super().__init__("environment")
-ENVIRONMENTS = EnvironmentRegistry()
+"""Search-R1 local retrieval training example."""

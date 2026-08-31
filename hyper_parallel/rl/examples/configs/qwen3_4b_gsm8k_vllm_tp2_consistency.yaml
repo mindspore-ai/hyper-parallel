@@ -13,6 +13,7 @@ data:
   test_path: /data/gsm8k/test.parquet
   prompt_column: prompt
   answer_column: extra_info
+  prompt_instruction: 'Let''s think step by step and output the final answer after "####".'
   max_prompt_length: 256
   max_train_samples: 2
   shuffle: false
@@ -59,7 +60,9 @@ rollout:
     server_hccl_npu_socket_port_range: 64400-64500
 
 agentic:
-  environment: gsm8k
+  module_path: examples.agents.gsm8k.agent
+  environment: gsm8k_tools
+  interaction_mode: single_turn
   max_turns: 1
   max_observation_tokens: 0
 

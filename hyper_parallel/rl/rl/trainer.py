@@ -481,6 +481,11 @@ class SyncTrainer:
         """Transfer the updated Actor and restore rollout residency."""
         hsdp_sync_stream()
         self._reshard_model(self.actor.actor_model)
+        # Refit wakes the colocated vLLM weights before copying the updated
+        # parameters.  Clear rank-local FSDP and allocator residency first so
+        # vLLM does not have to restore its weights on top of cached training
+        # allocations left by the preceding optimizer step.
+        self._release_training_state_for_rollout()
         self.rollout_engine.update_weights(
             PolicySnapshot(
                 version=next_step,
@@ -489,7 +494,6 @@ class SyncTrainer:
                 metadata={"optimizer_steps": actor_update.optimizer_steps},
             )
         )
-        self._release_training_state_for_rollout()
         self.rollout_engine.prepare_for_rollout()
 
     def _train_step(self, batch: Mapping[str, Any]) -> None:
@@ -685,7 +689,9 @@ class SyncTrainer:
         )
         metadata: list[Any] = [None] * world_size
         platform.all_gather_object(metadata, local_metadata)
-        for rank, (rank_local_world_size, _host, _port, rank_devices) in enumerate(metadata):
+        for rank, rank_metadata in enumerate(metadata):
+            rank_local_world_size = rank_metadata[0]
+            rank_devices = rank_metadata[3]
             if int(rank_local_world_size) != world_size:
                 raise ValueError(
                     "The shared vLLM rollout path is single-node only: "
@@ -768,6 +774,11 @@ class SyncTrainer:
                 None
                 if data_config.get("answer_column") is None
                 else str(data_config["answer_column"])
+            ),
+            "prompt_instruction": (
+                None
+                if data_config.get("prompt_instruction") is None
+                else str(data_config["prompt_instruction"])
             ),
         }
         self.train_dataset = PromptDataset(
@@ -923,6 +934,13 @@ class SyncTrainer:
             "environment_name": str(agentic_config["environment"]),
             "max_turns": int(agentic_config["max_turns"]),
             "max_observation_tokens": int(agentic_config["max_observation_tokens"]),
+            "max_episode_tokens": (
+                None
+                if agentic_config.get("max_episode_tokens") is None
+                else int(agentic_config["max_episode_tokens"])
+            ),
+            "environment_settings": dict(agentic_config),
+            "interaction_mode": agentic_config.get("interaction_mode"),
             "pad_token_id": int(self.tokenizer.pad_token_id),
             "eos_token_id": eos_token_ids[0],
             "eos_token_ids": eos_token_ids,
@@ -1103,7 +1121,11 @@ class SyncTrainer:
         local_traceback = (
             None
             if local_error is None
-            else "".join(traceback.format_exception(local_error))
+            else "".join(
+                traceback.format_exception(
+                    type(local_error), local_error, local_error.__traceback__
+                )
+            )
         )
         platform.all_gather_object(errors, local_traceback)
         if any(error is not None for error in errors):
