@@ -74,16 +74,17 @@ dataset:
       use_fast: true
       trust_remote_code: true
   data_transform:
-    _target_: examples.qwen3_8.data.PlainTextDataTransform
-    text_column: text
-    seq_len: 4096
-    append_eos: true
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 4096
   data_config:
-    create_attention_mask_in_dataloader: false
-  _target_: examples.qwen3_8.data.load_tokenized_text_dataset
-  path: Salesforce/wikitext
-  name: wikitext-2-raw-v1
-  split: train
+    dataset_type: mapping
+    hf_dataset_name: Salesforce/wikitext
+    hf_config_name: wikitext-2-raw-v1
+    cache_dir: null
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
+  data_path: Salesforce/wikitext
 
 dataloader:
   _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
