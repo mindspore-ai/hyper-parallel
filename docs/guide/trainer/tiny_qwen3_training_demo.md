@@ -133,7 +133,7 @@ bash examples/training_demo/run_cp_wrappers.sh async_colossal \
   --training.train_iters=2
 ```
 
-Hybrid 用例要求 `cp_size=4` 且 `ulysses_degree=2`；tiny 模型的 4 个 Q head 和 2 个 K/V head 均满足整除约束。所有配置使用 `seq_len=16`，同时满足 CP 分片和 Head-Tail 的序列长度约束。
+Hybrid 用例要求 `cp_size=4` 且 `ulysses_degree=2`；tiny 模型配置为 8 个 Q head 和 4 个 K/V head。TP2 后每个 rank 保留 4/2 个 head，均满足 CP2 Pure Ulysses 与 CP4 Hybrid 的 Ulysses degree=2 整除约束。所有配置使用 `seq_len=16`，同时满足 CP 分片和 Head-Tail 的序列长度约束。
 
 ## 6. 日志与精度检查
 

@@ -35,4 +35,6 @@ torchrun --nproc_per_node=8 --rdzv_backend=c10d \
 ```
 
 两份配置均为 1 个 optimizer step、固定种子和本地 mock 数据，不依赖外部
-数据集或模型下载。运行时使用 HCCL；不要将 backend 改为 Gloo。
+数据集或模型下载。tiny 模型使用 8 个 Q head 和 4 个 K/V head；TP2 后每个
+rank 为 4/2 个 head，满足 Ulysses 的 head 维整除约束。运行时使用 HCCL；
+不要将 backend 改为 Gloo。
