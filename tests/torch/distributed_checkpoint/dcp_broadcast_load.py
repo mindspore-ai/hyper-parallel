@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from hyper_parallel import DTensor
 from hyper_parallel.core.distributed_checkpoint import load, save
@@ -78,7 +79,7 @@ def _setup(seed: int) -> tuple[Any, int]:
     platform = get_platform()
     world_size = platform.get_world_size()
     assert world_size == _WORLD_SIZE, f"expect world_size={_WORLD_SIZE}, got {world_size}"
-    return platform, platform.get_rank()
+    return platform, dist.get_rank()
 
 
 def _fresh_checkpoint_dir(platform: Any, rank: int, name: str) -> Path:

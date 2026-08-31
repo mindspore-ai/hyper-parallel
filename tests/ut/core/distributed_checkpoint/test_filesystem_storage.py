@@ -200,13 +200,7 @@ class TestFilesystemStorage(unittest.TestCase):
                 )
                 reader = FileSystemReader(ckpt_dir)
                 reader.configure_reader(loaded_md, is_coordinator=True, rank=0)
-                # The rank lookup happens on the shared ``platform`` object
-                # imported from util; patch the method on it.
-                with patch(
-                    "hyper_parallel.core.distributed_checkpoint.util.platform.get_rank",
-                    return_value=0,
-                ):
-                    load_plan = load_planner.build_local_plan()
+                load_plan = load_planner.build_local_plan()
                 reader.execute_read(load_plan, load_planner)
 
                 torch.testing.assert_close(target.to_local(), source.to_local())

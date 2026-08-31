@@ -165,7 +165,7 @@ class TestCreatePersistProcess(unittest.TestCase):
         with patch("hyper_parallel.core.distributed_checkpoint.api.mp.Process", recorder), \
                 patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
                       return_value=world_size), \
-                patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0), \
+                patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0), \
                 patch.dict(os.environ, env if env is not None else TestCreatePersistProcess._MASTER_ENV,
                            clear=True):
             api_mod._create_persist_process(
