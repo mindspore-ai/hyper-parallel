@@ -30,9 +30,7 @@ from hyper_parallel.core.dtensor.placement_types import (
     StridedShard,
 )
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _create_device_mesh
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
+import torch.distributed as dist
 
 
 class RaggedShardInfo(NamedTuple):
@@ -842,7 +840,7 @@ class Layout:
         dim_entry = alias_tm[tensor_dim]
         if dim_entry == 'None':
             return 0
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         if isinstance(dim_entry, tuple):
             non_none = [ax for ax in dim_entry if ax != 'None']
             if not non_none:

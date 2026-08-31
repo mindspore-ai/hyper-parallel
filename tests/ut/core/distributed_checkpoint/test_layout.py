@@ -61,7 +61,7 @@ class TestLayout(unittest.TestCase):
     def tearDown(self):
         self._params_dict_patcher.stop()
 
-    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.dist.get_rank", return_value=0)
     def test_get_current_layout_mesh_shape_becomes_device_matrix(self, mock_rank):
         """
         Feature: Distributed checkpoint layout export from a cell.
@@ -102,7 +102,7 @@ class TestLayout(unittest.TestCase):
         self.assertIn("mesh_shape", bias_src)
         mock_rank.assert_called_once()
 
-    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=3)
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.dist.get_rank", return_value=3)
     def test_get_current_layout_uses_string_rank_as_key(self, mock_rank):
         """
         Feature: Rank-scoped layout dictionary keys.
@@ -118,7 +118,7 @@ class TestLayout(unittest.TestCase):
         self.assertIn("w", layout_dict["3"])
         mock_rank.assert_called_once()
 
-    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.dist.get_rank", return_value=0)
     def test_get_current_layout_falsy_layout_records_type_and_full_shape(self, mock_rank):
         """
         Feature: Parameters with no usable layout still record dtype and global shape.
@@ -142,7 +142,7 @@ class TestLayout(unittest.TestCase):
         mock_rank.assert_called_once()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.logger")
-    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.dist.get_rank", return_value=0)
     def test_get_current_layout_logs_params_without_layout_attr(self, mock_rank, mock_logger):
         """
         Feature: Observability for parameters missing a layout attribute.
@@ -166,7 +166,7 @@ class TestLayout(unittest.TestCase):
         mock_rank.assert_called_once()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.logger")
-    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.dist.get_rank", return_value=0)
     def test_get_current_layout_only_missing_layout_attr_type_and_full_shape(self, mock_rank, mock_logger):
         """
         Feature: Rank layout map when every parameter lacks a layout attribute.
@@ -190,7 +190,7 @@ class TestLayout(unittest.TestCase):
         self.assertEqual(set(names), {"a", "b"})
         mock_rank.assert_called_once()
 
-    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.dist.get_rank", return_value=0)
     def test_get_current_layout_no_rename_without_mesh_shape(self, mock_rank):
         """
         Feature: Layout export without mesh_shape in to_dict.
@@ -333,7 +333,7 @@ class TestLayout(unittest.TestCase):
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.all_gather_object")
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_world_size", return_value=2)
-    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.dist.get_rank", return_value=0)
     def test_get_global_layout_gathers_all_ranks(self, mock_rank, mock_world_size, mock_all_gather):
         """
         Feature: get_global_layout cross-rank aggregation.

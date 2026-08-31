@@ -17,7 +17,7 @@
 Covers the four invariants that make this module load-bearing for the
 trainer:
 
-1. Rank lookup falls back through ``platform`` → ``RANK`` env → ``LOCAL_RANK``
+1. Rank lookup falls back through ``torch.distributed`` → ``RANK`` env → ``LOCAL_RANK``
    env → ``0`` (never raises).
 2. ``init_logger`` is idempotent and replaces handlers on re-init.
 3. ``info_rank0`` / ``warning_rank0`` fire **only** on rank 0; ``logger.info``
@@ -71,22 +71,19 @@ class TestRankLookup(unittest.TestCase):
                 os.environ[k] = v
 
     def test_rank_from_platform_when_initialised(self):
-        """Platform path takes priority when ``get_rank()`` succeeds."""
-        with patch("hyper_parallel.get_platform") as mock_get_platform:
-            mock_get_platform.return_value.get_rank.return_value = 3
+        """``torch.distributed`` path takes priority when ``get_rank()`` succeeds."""
+        with patch("torch.distributed.get_rank", return_value=3):
             self.assertEqual(_get_rank(), 3)
 
-    def test_rank_falls_back_to_rank_env_when_platform_fails(self):
-        """Platform raising ``RuntimeError`` (uninit'd PG) falls through to env."""
+    def test_rank_falls_back_to_rank_env_when_dist_fails(self):
+        """``dist.get_rank()`` raising ``RuntimeError`` (uninit'd PG) falls through to env."""
         os.environ["RANK"] = "5"
-        with patch("hyper_parallel.get_platform") as mock_get_platform:
-            mock_get_platform.return_value.get_rank.side_effect = RuntimeError("no pg")
+        with patch("torch.distributed.get_rank", side_effect=RuntimeError("no pg")):
             self.assertEqual(_get_rank(), 5)
 
     def test_rank_falls_back_to_local_rank_then_zero(self):
         """``LOCAL_RANK`` is the last env fallback; missing → 0."""
-        with patch("hyper_parallel.get_platform") as mock_get_platform:
-            mock_get_platform.return_value.get_rank.side_effect = RuntimeError("no pg")
+        with patch("torch.distributed.get_rank", side_effect=RuntimeError("no pg")):
             os.environ["LOCAL_RANK"] = "7"
             self.assertEqual(_get_rank(), 7)
             os.environ.pop("LOCAL_RANK")

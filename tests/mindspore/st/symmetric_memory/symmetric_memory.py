@@ -19,6 +19,7 @@ from mindspore import context
 from mindspore.communication.management import init
 import hyper_parallel.core.symmetric_memory as symm
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 
 context.set_context(mode=context.PYNATIVE_MODE)
 ms.set_seed(0)
@@ -31,7 +32,7 @@ def test_ms_symmetric_memory_put_mem():
     Description: Test symmetric memory put mem api.
     Expectation: symmetric memory put mem api performs as expected.
     """
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     symm_tensor = symm.empty(16, dtype=ms.int64)
 
     target_offset = ms.Tensor([0], dtype=ms.int64)
@@ -51,7 +52,7 @@ def test_ms_symmetric_memory_shmem_put_with_signal():
     Description: Test symmetric memory put mem with signal api.
     Expectation: symmetric memory put mem with signal api performs as expected.
     """
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     symm_tensor = symm.empty(4, dtype=ms.int64)
     symm_signal = symm.empty(2, dtype=ms.int32)
     symm_signal.fill_(0)
@@ -79,7 +80,7 @@ def test_ms_symmetric_memory_shmem_allgather():
     Description: Test symmetric memory allgather api.
     Expectation: symmetric memory allgather api performs as expected.
     """
-    rank_id = platform.get_rank()
+    rank_id = dist.get_rank()
     world_size = platform.get_world_size()
     size = 4
     input_tensor = ms.ops.ones((size,), dtype=ms.int64) * (rank_id + 1)
@@ -92,7 +93,7 @@ def test_ms_symmetric_memory_shmem_allgather():
 
 def test_ms_symmetric_memory_shmem_wait_for_signal():
     """test signal op"""
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     signal = symm.empty(6, dtype=ms.int32)
     signal.fill_(0)
     ms.mint.distributed.barrier()

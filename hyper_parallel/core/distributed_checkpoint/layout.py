@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Union
 
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 
 platform = get_platform()
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ def get_current_layout(cell: Any) -> dict:
             mapping parameter names to their layout information, including
             data type and full shape.
     """
-    current_rank = str(platform.get_rank())
+    current_rank = str(dist.get_rank())
     layout_dict = {current_rank: {}}
 
     params_without_layout_attr = []

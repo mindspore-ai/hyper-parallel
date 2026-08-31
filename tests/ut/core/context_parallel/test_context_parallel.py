@@ -151,7 +151,7 @@ class TestContextParallel(unittest.TestCase):
         module = _IdentityModule()
         mesh = _FakeMesh(2, rank_list=(0, 1))
 
-        with patch.object(cp_module.platform, "get_rank", return_value=0):
+        with patch.object(cp_module.dist, "get_rank", return_value=0):
             ContextParallel(ulysses_degree=1, load_balance=True).apply(module, mesh)
 
         self.assertIsInstance(module.forward, partial)

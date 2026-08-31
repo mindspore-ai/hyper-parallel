@@ -290,9 +290,8 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             f"BSND DP get_expand_impl should return None (S1 not sharded), got {impl}"
         ))
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_bsnd_cp_success_10(self, mock_mesh_plat, mock_layout_plat):
+    def test_bsnd_cp_success_10(self, mock_mesh_plat):
         """
         Feature: infer_layout BSND with S1-dim context parallel.
         Description: q/si sharded on S1, k/v replicated; 1-D cp mesh.
@@ -300,7 +299,6 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             get_expand_impl returns callable (BSND+CP slices k/v to causal window).
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=4)
-        mock_layout_plat.get_rank.return_value = 0
 
         mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("cp",))
         q = _build_layout(mesh, (Shard(1),), 4)    # (B,S1,N1,D) → S1 sharded
@@ -324,9 +322,8 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             f"BSND CP get_expand_impl should return callable, got {type(impl)}"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_bsnd_dp_cp_success_11(self, mock_mesh_plat, mock_layout_plat):
+    def test_bsnd_dp_cp_success_11(self, mock_mesh_plat):
         """
         Feature: infer_layout BSND with B-dim DP and S1-dim CP.
         Description: 2×4 (dp, cp) mesh; q B-sharded on dp, S1-sharded on cp.
@@ -334,7 +331,6 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             get_expand_impl returns callable (BSND+CP slices k/v to causal window).
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=8)
-        mock_layout_plat.get_rank.return_value = 0
 
         mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "cp"))
         q = _build_layout(mesh, (Shard(0), Shard(1)), 4)    # (B,S1,N1,D)
@@ -434,16 +430,14 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
         self.assertEqual(ssum.tensor_map, (-1, 0, -1),
                          msg=f"TND DP ssum: expected (-1,0,-1), got {ssum.tensor_map}")
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_tnd_cp_expand_impl_callable_15(self, mock_mesh_plat, mock_layout_plat):
+    def test_tnd_cp_expand_impl_callable_15(self, mock_mesh_plat):
         """
         Feature: get_expand_impl returns callable when q T1 sharded more than k (TND+CP).
         Description: q sharded on 8-device dp_cp mesh, k replicated → q_split=8 > k_split=1.
         Expectation: get_expand_impl returns a callable.
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=8)
-        mock_layout_plat.get_rank.return_value = 0
 
         mesh = init_device_mesh("npu", (8,), mesh_dim_names=("dp_cp",))
         q = _build_layout(mesh, (Shard(0),), 3)
@@ -457,9 +451,8 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
         self.assertTrue(callable(impl),
                         msg=f"TND+CP get_expand_impl should return callable, got {type(impl)}")
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_tnd_dp_cp_2d_mesh_expand_impl_callable_16(self, mock_mesh_plat, mock_layout_plat):
+    def test_tnd_dp_cp_2d_mesh_expand_impl_callable_16(self, mock_mesh_plat):
         """
         Feature: get_expand_impl returns callable for TND with 2-D dp+cp mesh.
         Description: 2×4 (dp, cp) mesh; q T1 sharded by BOTH dp and cp (combined 8-way
@@ -469,7 +462,6 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
             multi-axis tensor_map entries for T1.
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=8)
-        mock_layout_plat.get_rank.return_value = 0
 
         mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "cp"))
         # dp AND cp both shard T1 of q/si → combined 8-way split

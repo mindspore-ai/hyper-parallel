@@ -920,7 +920,7 @@ def export_to_hf_format(model: nn.Module, tokenizer, save_dir: str) -> None:
     options = StateDictOptions(full_state_dict=True, cpu_offload=True)
     state_dict = hp_get_model_state_dict(model, options=options)
 
-    if get_platform().get_rank() == 0:
+    if dist.get_rank() == 0:
         export_dir.mkdir(parents=True, exist_ok=True)
 
         if hasattr(model, "save_pretrained"):
@@ -946,7 +946,7 @@ def save_hsdp_checkpoint(
     from hyper_parallel.core.distributed_checkpoint.api import save as hp_save  # pylint: disable=C0415
 
     os.makedirs(output_dir, exist_ok=True)
-    rank = get_platform().get_rank()
+    rank = dist.get_rank()
 
     model_dir = os.path.join(output_dir, f"{HSDP_MODEL_NAME}_0")
     os.makedirs(model_dir, exist_ok=True)
@@ -989,7 +989,7 @@ def load_hsdp_optimizer_and_scheduler(
     if checkpoint_dir is None:
         return
 
-    rank = get_platform().get_rank()
+    rank = dist.get_rank()
     optim_file = os.path.join(checkpoint_dir, f"{HSDP_OPTIMIZER_NAME}_rank{rank}.pt")
 
     if os.path.isfile(optim_file) and optimizer is not None:

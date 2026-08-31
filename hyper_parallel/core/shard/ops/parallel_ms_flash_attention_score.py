@@ -28,6 +28,7 @@ from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 
 platform = get_platform()
 Tensor = platform.Tensor
@@ -1198,7 +1199,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
             return 0
 
         if isinstance(dim_map, str):
-            rank = platform.get_rank()
+            rank = dist.get_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(dim_map)
             if rank in rank_list:
                 return rank_list.index(rank)
@@ -1216,7 +1217,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
                     f"Using the last axis for split_id calculation."
                 )
             axis_name = non_none_axes[-1]
-            rank = platform.get_rank()
+            rank = dist.get_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(axis_name)
             if rank in rank_list:
                 return rank_list.index(rank)

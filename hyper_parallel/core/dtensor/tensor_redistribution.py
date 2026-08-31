@@ -15,6 +15,7 @@
 """tensor_redistribution"""
 import logging
 
+from hyper_parallel import comm
 from hyper_parallel.core.dtensor._ragged_utils import (
     _compute_ragged_all_to_all_splits,
     _compute_ragged_slice,
@@ -24,6 +25,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout, RaggedShardInfo
 from hyper_parallel.core.dtensor.redistribute_infer import RedistributionOperatorInfer
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 platform = get_platform()
 
 logger = logging.getLogger(__name__)
@@ -77,14 +79,14 @@ class TensorRedistribution:
             "concat_size=%d, rank_list=%s",
             tuple(x.shape), concat_dim, concat_size, rank_list,
         )
-        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
+        return comm.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
 
     @staticmethod
     def _construct_strided_slice(x, *args):
         """args: (begin, end, strides)"""
         dims = len(args) // 3
-        return platform.construct_strided_slice(x, args[0: dims], args[dims: 2 * dims], args[2 * dims:])
+        return comm.construct_strided_slice(x, args[0: dims], args[dims: 2 * dims], args[2 * dims:])
 
     @staticmethod
     def _construct_all_concat_new(x, *args):
@@ -98,7 +100,7 @@ class TensorRedistribution:
             "concat_size=%d, rank_list=%s",
             tuple(x.shape), concat_dim, concat_size, rank_list,
         )
-        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
+        return comm.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
     def _construct_all_split(self, x, *args):
         """args: (split_dim, split_size, group)"""
@@ -295,7 +297,7 @@ class TensorRedistribution:
         from_layout = input_x.layout
         x = input_x
         if not self.is_init:
-            self.rank_id = platform.get_rank()
+            self.rank_id = dist.get_rank()
             self.is_init = True
         key = from_layout.compact_str + to_layout.compact_str + str(self.rank_id)
         if key in self._transform_cache:

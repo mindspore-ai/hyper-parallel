@@ -36,6 +36,12 @@ __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDP
 
 from importlib import import_module as _import_module  # pylint: disable=invalid-name
 
+import os
+
+if os.environ.get("HYPER_PARALLEL_PLATFORM", "").lower() == "mindspore":
+    from hyper_parallel.platform.mindspore.patch import enable
+    enable()
+
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.shard.dfunction import DFunction
 from hyper_parallel.core.dtensor.layout import Layout

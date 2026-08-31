@@ -18,6 +18,7 @@ import shutil
 import types
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from hyper_parallel import (
@@ -37,7 +38,7 @@ def _local_rank() -> int:
     """Return local device index for this torchrun worker."""
     if "LOCAL_RANK" in os.environ:
         return int(os.environ["LOCAL_RANK"])
-    return platform.get_rank() % int(os.environ.get("LOCAL_WORLD_SIZE", "8"))
+    return dist.get_rank() % int(os.environ.get("LOCAL_WORLD_SIZE", "8"))
 
 
 def _set_local_device() -> None:
@@ -91,7 +92,7 @@ def _build_trainer(save_dir: str, *, load_path=None):
 
 def _prepare_root():
     """Rank-0 cleans + recreates the shared save root, then barrier across ranks."""
-    if platform.get_rank() == 0:
+    if dist.get_rank() == 0:
         shutil.rmtree(_SAVE_ROOT, ignore_errors=True)
         os.makedirs(_SAVE_ROOT, exist_ok=True)
     platform.barrier()
@@ -115,7 +116,7 @@ def test_checkpoint_callback_round_trip_4card():
     _set_local_device()
     try:
         _prepare_root()
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         trainer, model, dataloader = _build_trainer(_SAVE_ROOT)
         cb = CheckpointCallback(trainer)
 
@@ -165,6 +166,6 @@ def test_checkpoint_callback_round_trip_4card():
             platform.barrier()
         except RuntimeError:
             pass
-        if platform.get_rank() == 0:
+        if dist.get_rank() == 0:
             shutil.rmtree(_SAVE_ROOT, ignore_errors=True)
         destroy_process_group()

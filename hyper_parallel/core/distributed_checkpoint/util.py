@@ -35,6 +35,7 @@ from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 from hyper_parallel.tools.logging import get_logger
+import torch.distributed as dist
 
 platform = get_platform()
 Tensor = platform.Tensor
@@ -55,7 +56,7 @@ def dcp_timer_decorator(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
-            rank_id = platform.get_rank()
+            rank_id = dist.get_rank()
         except ValueError:
             # No process group yet (offline converters, single-process tools).
             rank_id = 0
@@ -183,7 +184,7 @@ def create_chunk_list_for_tensor(obj: Union[Tensor, DTensor]) -> list[ChunkStora
             shape = obj.shape if hasattr(obj, "shape") else obj.to_local().shape
             return [ChunkStorageMetadata(offsets=(0,) * len(shape), sizes=tuple(shape))]
 
-        current_rank = platform.get_rank()
+        current_rank = dist.get_rank()
         if current_rank not in rank_list:
             return []
 
@@ -391,7 +392,7 @@ def infer_same_shard_ranks_for_dtensor(dtensor: DTensor) -> tuple[int, ...]:
         tuple[int, ...]: Sorted global-rank tuples; each tuple is one
             same-shard group (length 1 when the shard is unique to one rank).
     """
-    current_rank = platform.get_rank()
+    current_rank = dist.get_rank()
     layout = dtensor.layout
     if layout is None:
         return (current_rank,)
@@ -527,7 +528,7 @@ def _destroy_groups(groups: dict[tuple, Any]) -> None:
     Args:
         groups (dict[tuple, Any]): Groups to release, keyed by their rank tuple.
     """
-    current_rank = platform.get_rank()
+    current_rank = dist.get_rank()
     # Destroying a group is collective over its members, so keep the same deterministic order
     # the groups were created in.
     for group_ranks in sorted(groups):

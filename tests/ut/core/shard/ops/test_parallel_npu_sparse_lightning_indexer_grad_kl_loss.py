@@ -679,16 +679,14 @@ class TestNpuSparseLightningIndexerGradKlLoss(unittest.TestCase):
             "get_expand_impl should return None when S1 is not sharded (no BSND CP)"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_expand_impl_tnd_no_cp_returns_callable_34(self, mock_mesh_plat, mock_layout_plat):
+    def test_expand_impl_tnd_no_cp_returns_callable_34(self, mock_mesh_plat):
         """
         Feature: get_expand_impl always returns callable for TND (DP batch slicing is always needed).
         Description: TND with same T1 sharding on qi and ki.
         Expectation: get_expand_impl returns a callable wrapper.
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=4)
-        mock_layout_plat.get_rank.return_value = 0
         mesh = init_device_mesh("npu", (4,), mesh_dim_names=("dp",))
         qi = _build_layout(mesh, (Shard(0),), 3)
         ki = _build_layout(mesh, (Shard(0),), 3)
@@ -715,8 +713,7 @@ class TestNpuSparseLightningIndexerGradKlLoss(unittest.TestCase):
 
     @patch("hyper_parallel.core.shard.ops.parallel_npu_sparse_lightning_indexer_grad_kl_loss.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    @patch("hyper_parallel.core.dtensor.layout.platform")
-    def test_expand_impl_tnd_cp_returns_callable_36(self, mock_layout_plat, mock_mesh_plat, mock_op_plat):
+    def test_expand_impl_tnd_cp_returns_callable_36(self, mock_mesh_plat, mock_op_plat):
         """
         Feature: get_expand_impl returns callable when q_split > k_split (TND+CP).
         Description: qi on 8-device dp_cp mesh, ki replicated → q_split=8 > k_split=1.
@@ -724,7 +721,6 @@ class TestNpuSparseLightningIndexerGradKlLoss(unittest.TestCase):
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=8)
         mock_op_plat.get_rank.return_value = 0
-        mock_layout_plat.get_rank.return_value = 0
 
         mesh_8 = init_device_mesh("npu", (8,), mesh_dim_names=("dp_cp",))
         qi = _build_layout(mesh_8, (Shard(0),), 3)    # alias_tensor_map[0]="dp_cp" → split=8

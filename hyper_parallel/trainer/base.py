@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import DistributedSampler
 
 from hyper_parallel import (
@@ -266,7 +267,7 @@ class BaseTrainer:
 
         logger.info_rank0(
             "Setup complete: rank=%d, world_size=%d, mesh=%s",
-            platform.get_rank(), platform.get_world_size(),
+            dist.get_rank(), platform.get_world_size(),
             self.mesh.mesh_dim_names,
         )
         logger.info_rank0(
@@ -439,7 +440,7 @@ class BaseTrainer:
         # Sampler uses DP rank/size — TP/CP/PP/EP peers share data.
         dp_size = self.parallel_dims.dp_size
         non_dp = self.parallel_dims.non_dp_size
-        global_rank = platform.get_rank()
+        global_rank = dist.get_rank()
         try:
             dp_rank = self.mesh["dp"].get_local_rank()
         except (KeyError, ValueError, RuntimeError):

@@ -30,6 +30,7 @@ import torch
 
 from hyper_parallel.platform.torch.platform import TorchPlatform
 from hyper_parallel.platform.torch.dtensor import DTensorBase
+from hyper_parallel import comm
 
 
 class TestTorchPlatformCore(unittest.TestCase):
@@ -83,7 +84,7 @@ class TestTorchPlatformCore(unittest.TestCase):
         fake_tensor_cls = SimpleNamespace(data=fake_descriptor)
         fake_dtensor = SimpleNamespace(_local_tensor=object())
 
-        with patch("hyper_parallel.platform.torch.dtensor.Tensor", fake_tensor_cls):
+        with patch("hyper_parallel.core.dtensor._dtensor_base.Tensor", fake_tensor_cls):
             DTensorBase.data.fset(fake_dtensor, "payload")
 
         self.assertEqual(
@@ -115,8 +116,8 @@ class TestTorchPlatformCore(unittest.TestCase):
         fake_dtensor = SimpleNamespace(_local_tensor=object())
         input_dtensor = FakeInputDTensor()
 
-        with patch("hyper_parallel.platform.torch.dtensor.Tensor", fake_tensor_cls):
-            with patch("hyper_parallel.platform.torch.dtensor.DTensorBase", FakeInputDTensor):
+        with patch("hyper_parallel.core.dtensor._dtensor_base.Tensor", fake_tensor_cls):
+            with patch("hyper_parallel.core.dtensor._dtensor_base.DTensorBase", FakeInputDTensor):
                 DTensorBase.data.fset(fake_dtensor, input_dtensor)
 
         self.assertEqual(
@@ -168,7 +169,7 @@ class TestTorchPlatformCore(unittest.TestCase):
         TorchPlatform.init_process_group()
         mock_init.assert_not_called()
 
-    @mock.patch('hyper_parallel.platform.torch.platform.TorchPlatform.get_rank')
+    @mock.patch('torch.distributed.get_rank', return_value=2)
     @mock.patch('torch.distributed.new_group')
     def test_split_group(self, mock_new_group, mock_get_rank):
         """Test process group splitting logic.
@@ -214,7 +215,7 @@ class TestTorchPlatformCore(unittest.TestCase):
         ]
         mock_all_gather.return_value = mock_output
 
-        result = TorchPlatform.differentiable_all_gather_concat(
+        result = comm.differentiable_all_gather_concat(
             tensor, group=None, concat_size=2, concat_dim=0
         )
 

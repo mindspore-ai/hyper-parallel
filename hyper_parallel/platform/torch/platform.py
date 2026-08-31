@@ -33,7 +33,7 @@ from torch.utils.checkpoint import noop_context_fn
 
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
-from hyper_parallel.platform.torch.dtensor import DTensorBase
+from hyper_parallel.core.dtensor._dtensor_base import DTensorBase
 from hyper_parallel.platform.torch.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
 from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_COMM_GROUPS
@@ -346,38 +346,6 @@ class _TorchSyncHookFunction(torch.autograd.Function):
         return grad_output, None, None
 
 
-class _TorchP2PExchangeFunction(torch.autograd.Function):
-    """Symmetric bidirectional P2P: send local tensor to peer, receive peer's tensor."""
-
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, peer_rank: int, group) -> torch.Tensor:  # pylint: disable=arguments-differ
-        """Perform symmetric bidirectional P2P exchange with peer_rank."""
-        ctx.peer_rank = peer_rank
-        ctx.group = group
-        send_buf = tensor.contiguous()
-        recv_buf = torch.empty_like(send_buf)
-        reqs = dist.batch_isend_irecv([
-            dist.P2POp(dist.isend, send_buf, peer_rank, group),
-            dist.P2POp(dist.irecv, recv_buf, peer_rank, group),
-        ])
-        for req in reqs:
-            req.wait()
-        return recv_buf
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        """Perform symmetric P2P exchange for the backward gradient pass."""
-        send_buf = grad_output.contiguous()
-        recv_buf = torch.empty_like(send_buf)
-        reqs = dist.batch_isend_irecv([
-            dist.P2POp(dist.isend, send_buf, ctx.peer_rank, ctx.group),
-            dist.P2POp(dist.irecv, recv_buf, ctx.peer_rank, ctx.group),
-        ])
-        for req in reqs:
-            req.wait()
-        return recv_buf, None, None
-
-
 class _TorchDifferentiableVariableAllGather(torch.autograd.Function):
     """Variable dim-zero all-gather with an uneven reduce-scatter backward."""
 
@@ -513,7 +481,6 @@ class TorchPlatform(Platform):
     tensor = torch.tensor
     Parameter = Parameter
     Module = Module
-    DTensorBase = DTensorBase
     PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.PYTORCH
     tensor_dtype = torch
@@ -717,16 +684,6 @@ class TorchPlatform(Platform):
         return torch.randn(size, dtype=dtype, device=device)
 
     @staticmethod
-    def get_rank():
-        """
-        Get the rank of the current process in the distributed group.
-
-        Returns:
-            int: The rank of the current process.
-        """
-        return dist.get_rank()
-
-    @staticmethod
     def get_global_rank(group, group_rank):
         """
         Get the global rank from a group rank.
@@ -837,17 +794,6 @@ class TorchPlatform(Platform):
         if "function" in func_str:
             return func_str.split()[1]
         return "unknown_op"
-
-    @staticmethod
-    def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
-        data = _ensure_contiguous(data)
-        output = list(dist_func.all_gather(data, group=group))
-        if rank_list is not None:
-            group_ranks = dist.get_process_group_ranks(group)
-            if tuple(rank_list) != tuple(group_ranks):
-                rank_to_idx = {int(rank): idx for idx, rank in enumerate(group_ranks)}
-                output = [output[rank_to_idx[int(rank)]] for rank in rank_list]
-        return torch.cat(output, dim=concat_dim)
 
     @staticmethod
     def chunk(data, split_dim, split_size, index):
@@ -1185,12 +1131,6 @@ class TorchPlatform(Platform):
         dist.barrier(group=group)
 
     @staticmethod
-    def p2p_exchange(tensor, peer_rank: int, group=None):
-        if peer_rank == dist.get_rank(group):
-            return tensor
-        return _TorchP2PExchangeFunction.apply(tensor, peer_rank, group)
-
-    @staticmethod
     def send_object_list(obj_list, dst=None, group=None):
         dist.send_object_list(obj_list, dst, group)
 
@@ -1357,10 +1297,6 @@ class TorchPlatform(Platform):
     @staticmethod
     def get_tensor_transform():
         raise NotImplementedError("Unsupported get_tensor_transform for torch platform")
-
-    @staticmethod
-    def construct_strided_slice(x, begin, end, stride):
-        raise NotImplementedError("Unsupported construct_strided_slice for torch platform")
 
     @staticmethod
     def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
@@ -1538,7 +1474,7 @@ class TorchPlatform(Platform):
             if dist_group is None:
                 dist_group = dist.new_group(ranks=split_rank)
                 EXISTING_COMM_GROUPS[str(tuple(sorted(split_rank)))] = dist_group
-            if TorchPlatform.get_rank() in split_rank:
+            if dist.get_rank() in split_rank:
                 split_group = dist_group
 
         return split_group

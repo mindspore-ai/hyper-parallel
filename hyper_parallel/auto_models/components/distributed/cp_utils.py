@@ -40,6 +40,7 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 
+from hyper_parallel import comm
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.platform import get_platform
 
@@ -899,13 +900,13 @@ def head_tail_load_balance_attention(
         )
 
     rank_list = list(cp_mesh.rank_list)
-    local_rank = rank_list.index(platform.get_rank())
+    local_rank = rank_list.index(dist.get_rank())
     peer_index = cp_mesh.size() - 1 - local_rank
     peer_rank = rank_list[peer_index]
     half = local_q_len // 2
     query_keep = query.narrow(2, 0, half)
     query_tail = query.narrow(2, half, half)
-    query_peer = platform.p2p_exchange(query_tail, peer_rank)
+    query_peer = comm.p2p_exchange(query_tail, peer_rank)
     global_key, global_value = flex_cp_allgather(key, value, 2, cp_mesh)
 
     def run_half(
@@ -928,7 +929,7 @@ def head_tail_load_balance_attention(
         query_peer,
         attention_kwargs if peer_attention_kwargs is None else peer_attention_kwargs,
     )
-    tail_output = platform.p2p_exchange(peer_output, peer_rank)
+    tail_output = comm.p2p_exchange(peer_output, peer_rank)
     return platform.cat([keep_output, tail_output], dim=2)
 
 

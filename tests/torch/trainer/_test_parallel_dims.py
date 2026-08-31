@@ -27,6 +27,8 @@ from hyper_parallel.trainer.utils.logging import (
     init_logger,
 )
 
+import torch.distributed as dist
+
 platform = get_platform()
 
 
@@ -74,7 +76,7 @@ def test_parallel_dims_pure_fsdp_mesh_and_rank_logging():
         logger.info("every_rank_msg")
 
         output = stream.getvalue()
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         assert "every_rank_msg" in output, (
             f"plain logger.info must fire on every rank (rank={rank}), got {output!r}"
         )
@@ -108,7 +110,7 @@ def test_parallel_dims_tp_plus_fsdp_mesh():
         pd = ParallelDims(dp_shard=2, tp=2, world_size=world)
         mesh = pd.build_mesh(platform.device_type())
 
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         # Canonical order: dp_shard outer, tp inner. So fsdp partners share the same tp coord.
         # With dp_shard=2, tp=2 → mesh shape (2, 2). Ranks {0,1,2,3} laid out:
         #   (dp=0,tp=0)=0  (dp=0,tp=1)=1

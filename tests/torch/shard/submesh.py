@@ -15,6 +15,7 @@
 """test torch sub_mesh"""
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
@@ -65,7 +66,7 @@ def test_full_mesh_shard_forward_1():
     dist_x = distribute_tensor(x_input, mesh, x_p)
     dist_w = distribute_tensor(w_input, mesh, w_p)
     dist_b = distribute_tensor(b_input, mesh, b_p)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     if rank in (0, 1):
         arr = np.array([
             [0, 1, 2, 3],
@@ -137,7 +138,7 @@ def test_sub_mesh_column_parallel_forward():
     """
     init_backend(_DEVICE_TYPE)
 
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     x_input_np_2 = None
     if rank in (0, 1):  # manually Shard(0) on dp axis of x
         x_input_np_2 = np.array([
@@ -248,7 +249,7 @@ def test_full_mesh_shard_forward_2():
     dist_x = distribute_tensor(x_input, mesh, x_p)
     dist_w = distribute_tensor(w_input, mesh, w_p)
     dist_b = distribute_tensor(b_input, mesh, b_p)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     if rank == 0:
         arr = np.array([
             [0, 1],
@@ -325,7 +326,7 @@ def test_sub_mesh_row_parallel_forward():
     """
     init_backend(_DEVICE_TYPE)
 
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     x_input_np_2 = None
     if rank in (0, 1):  # manually Shard(0) on dp axis of x
         x_input_np_2 = np.array([
@@ -428,7 +429,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
     """
     init_backend(_DEVICE_TYPE)
 
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     x_input_np_2 = None
     if rank in (0, 1):  # manually Shard(0) on dp axis of x
         x_input_np_2 = np.array([
@@ -553,7 +554,7 @@ def test_sub_mesh_redistribute_1():
     init_backend(_DEVICE_TYPE)
 
     x_input = to_device(torch.from_numpy(x_input_np), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
 
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
 
@@ -658,7 +659,7 @@ def test_sub_mesh_redistribute_2():
     init_backend(_DEVICE_TYPE)
 
     x_input = to_device(torch.from_numpy(x_input_np), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
 
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
 
@@ -752,7 +753,7 @@ def test_sub_mesh_redistribute_3():
 
     x_input_np_2 = np.arange(64).reshape(8, 8).astype(np.float32)
     x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
 
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (1, 2), mesh_dim_names = ("dp", "tp"))
 
@@ -860,7 +861,7 @@ def test_sub_mesh_redistribute_5():
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
     x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard dp
@@ -946,7 +947,7 @@ def test_sub_mesh_redistribute_6():
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
     x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard tp
@@ -1032,7 +1033,7 @@ def test_sub_mesh_redistribute_7():
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
     x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard mp
@@ -1118,7 +1119,7 @@ def test_sub_mesh_redistribute_8():
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
     x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard dp tp
@@ -1246,7 +1247,7 @@ def test_sub_mesh_redistribute_9():
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
     x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard dp mp
@@ -1375,7 +1376,7 @@ def test_sub_mesh_redistribute_10():
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
     x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard tp mp

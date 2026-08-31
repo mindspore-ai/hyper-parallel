@@ -30,7 +30,7 @@ _CP_VISION_INPUT_KEYS = {
 def _get_cp_dp_ranks(hp_args) -> tuple[int, int]:
     """Map global rank to logical ``(cp_rank, dp_rank)`` for a ``(dp, cp)`` mesh."""
     cp_size = getattr(hp_args, "cp_size", 1)
-    rank = get_platform().get_rank()
+    rank = dist.get_rank()
     if cp_size <= 1:
         return 0, rank
 

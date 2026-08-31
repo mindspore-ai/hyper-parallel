@@ -73,11 +73,15 @@ class _MockedDeviceMeshTestCase(unittest.TestCase):
         """Set up test fixtures."""
         patcher_dm = patch("hyper_parallel.core.dtensor.device_mesh.platform")
         patcher_tensor = patch("hyper_parallel.core.dtensor.device_mesh.Tensor", torch.Tensor)
+        patcher_rank = patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank")
         self.mock_platform = patcher_dm.start()
         patcher_tensor.start()
+        self.mock_rank = patcher_rank.start()
+        self.mock_rank.return_value = 0
         _setup_mock_platform(self.mock_platform)
         self.addCleanup(patcher_dm.stop)
         self.addCleanup(patcher_tensor.stop)
+        self.addCleanup(patcher_rank.stop)
         self.addCleanup(_DEVICE_MESH_MAP.clear)
         self.addCleanup(EXISTING_COMM_GROUPS.clear)
         _DEVICE_MESH_MAP.clear()
@@ -214,7 +218,7 @@ class TestGetCoordinate(_MockedDeviceMeshTestCase):
     """Tests for GetCoordinate."""
     def test_rank_in_mesh(self):
         """Test rank in mesh."""
-        self.mock_platform.get_rank.return_value = 0
+        self.mock_rank.return_value = 0
         dm = DeviceMesh("npu", [[0, 1], [2, 3]], mesh_dim_names=("dp", "tp"), _init_backend=False)
         coord = dm.get_coordinate()
         self.assertIsNotNone(coord)
@@ -222,7 +226,7 @@ class TestGetCoordinate(_MockedDeviceMeshTestCase):
 
     def test_rank_not_in_mesh(self):
         """Test rank not in mesh."""
-        self.mock_platform.get_rank.return_value = 99
+        self.mock_rank.return_value = 99
         dm = DeviceMesh("npu", [[0, 1], [2, 3]], mesh_dim_names=("dp", "tp"), _init_backend=False)
         coord = dm.get_coordinate()
         self.assertIsNone(coord)

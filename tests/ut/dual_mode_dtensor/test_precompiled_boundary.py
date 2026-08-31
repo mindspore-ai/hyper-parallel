@@ -428,7 +428,7 @@ def test_redistribute_io(mesh, monkeypatch, caplog):
     gathered = torch.randn(2, 6)
     monkeypatch.setattr(
         "hyper_parallel.auto_models.components.distributed.tp_collective_lowering."
-        "platform.differentiable_all_gather_concat",
+        "comm.differentiable_all_gather_concat",
         lambda *_args, **_kwargs: gathered,
     )
     monkeypatch.setattr(

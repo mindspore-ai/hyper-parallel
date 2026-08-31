@@ -211,7 +211,7 @@ class TestUtil(unittest.TestCase):
 
     def test_create_chunk_list_for_empty_uneven_shard(self):
         """DCP geometry should retain the logical offset of an empty trailing shard."""
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=3):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=3):
             mesh = DeviceMesh(
                 "cpu",
                 [0, 1, 2, 3],
@@ -224,7 +224,7 @@ class TestUtil(unittest.TestCase):
         layout.set_tensor_meta((6, 3), (3, 1), torch.float32)
         tensor = DTensor.from_local_with_layout(torch.empty(0, 3), layout)
 
-        with patch.object(util_mod.platform, "get_rank", return_value=3):
+        with patch.object(util_mod.dist, "get_rank", return_value=3):
             chunks = util_mod.create_chunk_list_for_tensor(tensor)
 
         self.assertEqual(len(chunks), 1)

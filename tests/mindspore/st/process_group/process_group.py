@@ -16,6 +16,7 @@
 
 from hyper_parallel import (get_platform, init_process_group, destroy_process_group, get_process_group_ranks,
                             get_backend, split_group)
+import torch.distributed as dist
 
 platform = get_platform()
 
@@ -48,7 +49,7 @@ def test_process_group():
             split_ranks.append([rank, rank + 1])
 
     # split rank
-    rank_id = platform.get_rank()
+    rank_id = dist.get_rank()
     split_rank = [rank_id]
     if rank_id % 2 == 0:
         split_rank.append(rank_id + 1)

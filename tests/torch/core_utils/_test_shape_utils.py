@@ -22,6 +22,8 @@ from hyper_parallel import (
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.utils.shape_utils import compute_local_shape_and_global_offset
 
+import torch.distributed as dist
+
 platform = get_platform()
 
 
@@ -41,7 +43,7 @@ def test_shape_utils_alias_shard_uneven_split_matches_chunk():
         local_shape = compute_local_shape_and_global_offset(
             global_shape=(10,), device_mesh=mesh, placement=("dp",),
         )
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         expected = 3 if rank < 2 else 2
         assert local_shape == [expected], (
             f"alias shard uneven split mismatch on rank={rank}: "
@@ -76,7 +78,7 @@ def test_shape_utils_placement_objects_uneven_match_alias_string():
             global_shape=global_shape, device_mesh=mesh,
             placement=("dp", "None"),
         )
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         assert local_via_placement == local_via_alias, (
             f"Placement vs alias mismatch on rank={rank}: "
             f"placement={local_via_placement}, alias={local_via_alias}"

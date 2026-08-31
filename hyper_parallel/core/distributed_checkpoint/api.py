@@ -56,6 +56,7 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     logger,
     platform,
 )
+import torch.distributed as dist
 
 _async_save_count = 0
 
@@ -101,7 +102,7 @@ def _save_impl(
     planner = StandardSavePlanner() if planner is None else planner
 
     # Get rank and coordinator info
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     world_size = platform.get_world_size()
     is_coordinator = rank == 0
 
@@ -275,7 +276,7 @@ def _create_persist_process(
         )
 
     logger.info("use Gloo communication for dcp async save.")
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     master_addr = os.environ.get("MASTER_ADDR", None)
     master_port = os.environ.get("MASTER_PORT", None)
     if master_addr is None:
@@ -447,7 +448,7 @@ def load(
     planner = StandardLoadPlanner() if planner is None else planner
 
     # Get rank and coordinator info
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     world_size = platform.get_world_size()
     is_coordinator = rank == 0
 

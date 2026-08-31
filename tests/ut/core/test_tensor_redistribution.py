@@ -174,7 +174,7 @@ class TestTensorRedistributionConstructOps(unittest.TestCase):
 
     def test_infer_ops_list_decomposes_strided_shard_concat(self):
         """StridedShard -> Replicate should decompose into standard concat groups."""
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             cases = [
                 (
                     (2, 2),
@@ -220,7 +220,7 @@ class TestTensorRedistributionConstructOps(unittest.TestCase):
 
     def test_infer_ops_list_keeps_plain_tuple_concat_combined(self):
         """Plain same-dim Shard -> Replicate should keep the original combined concat."""
-        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
             src_layout = Layout((2, 2), ("dp", "tp"), init_backend=False)
             src_layout.set_placements([Shard(0), Shard(0)])
             src_layout.placement_to_tensor_map(dim=2)

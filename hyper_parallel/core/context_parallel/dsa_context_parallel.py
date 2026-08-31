@@ -43,6 +43,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 
 platform = get_platform()
 Module = platform.Module
@@ -624,7 +625,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
     def _get_local_idx(cp_mesh: DeviceMesh) -> int:
         """Return current rank's index in the CP mesh rank list."""
         rank_list = list(cp_mesh.rank_list)
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         return rank_list.index(rank) if rank in rank_list else 0
 
     def _apply_with_loss_specs(

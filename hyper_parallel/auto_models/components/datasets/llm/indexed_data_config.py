@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 from hyper_parallel.auto_models.components.datasets.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
@@ -180,7 +181,7 @@ def resolve_data_paths(
     # 2. Use distributed walking only after the process group is available.
     # Before initialization, one process walks all configured directories.
     try:
-        rank = int(platform.get_rank())
+        rank = int(dist.get_rank())
         world_size = int(platform.get_world_size())
     except (RuntimeError, ValueError):
         rank, world_size = 0, 1

@@ -29,6 +29,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 import numpy as np
+import pytest
 
 # Set platform to torch for testing
 
@@ -48,6 +49,20 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 
 
 _AIV_OPTIONS = {"hccl_config": {"hccl_op_expansion_mode": "AIV"}}
+
+
+@pytest.fixture(autouse=True)
+def _default_rank(monkeypatch):
+    """Default ``device_mesh.dist.get_rank`` to 0.
+
+    ``device_mesh`` now obtains the local rank directly from ``torch.distributed``
+    (``dist.get_rank``) instead of the platform facade, so standalone unit tests
+    (no process group) must stub this call. Tests that exercise rank semantics
+    override it per-test.
+    """
+    monkeypatch.setattr(
+        "hyper_parallel.core.dtensor.device_mesh.dist.get_rank", lambda: 0
+    )
 
 
 def _setup_mindspore_device_mesh_mock(mock_platform, world_size=8):
@@ -1274,9 +1289,10 @@ class TestDeviceMesh(unittest.TestCase):
 
         call_order = []
         mock_platform.init_process_group.side_effect = lambda *a, **kw: call_order.append("init_process_group")
-        mock_platform.get_rank.side_effect = lambda *a, **kw: call_order.append("get_rank") or 0
-
-        init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"), init_backend=True)
+        # ``device_mesh`` reads the rank directly from ``dist`` now, not the platform facade.
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
+                   side_effect=lambda *a, **kw: call_order.append("get_rank") or 0):
+            init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"), init_backend=True)
 
         mock_platform.init_process_group.assert_called()
         self.assertIn("init_process_group", call_order)
@@ -1316,10 +1332,11 @@ class TestDeviceMesh(unittest.TestCase):
         pass rank_list explicitly or use init_backend=True.
         """
         self._setup_mock_platform(mock_platform, world_size=4)
-        mock_platform.get_rank.side_effect = RuntimeError("process group not initialized")
-
-        with self.assertRaises(RuntimeError) as ctx:
-            init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"), init_backend=False)
+        # ``device_mesh`` reads the rank directly from ``dist`` now, not the platform facade.
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
+                   side_effect=RuntimeError("process group not initialized")):
+            with self.assertRaises(RuntimeError) as ctx:
+                init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"), init_backend=False)
 
         msg = str(ctx.exception)
         self.assertIn("init_device_mesh", msg)

@@ -26,6 +26,7 @@ import numpy as np
 
 from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel import comm
 
 
 def _setup_mock_dm_platform(platform_mock):
@@ -64,14 +65,24 @@ class _MockedTestCase(unittest.TestCase):
         self.patcher_dm = patch("hyper_parallel.core.dtensor.device_mesh.platform")
         self.patcher_dm_tensor = patch("hyper_parallel.core.dtensor.device_mesh.Tensor", torch.Tensor)
         self.patcher_tr = patch("hyper_parallel.core.dtensor.tensor_redistribution.platform")
+        self.patcher_gather = patch.object(comm, "differentiable_all_gather_concat")
+        self.patcher_slice = patch.object(comm, "construct_strided_slice")
+        self.patcher_rank = patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank")
 
         self.mock_dm_platform = self.patcher_dm.start()
         self.patcher_dm_tensor.start()
         self.mock_tr_platform = self.patcher_tr.start()
+        self.mock_gather = self.patcher_gather.start()
+        self.mock_slice = self.patcher_slice.start()
+        self.mock_rank = self.patcher_rank.start()
+        self.mock_rank.return_value = 0
 
         _setup_mock_dm_platform(self.mock_dm_platform)
         # Also setup tr platform for rank
         self.mock_tr_platform.get_rank.return_value = 0
+        # Setup comm gateway used by all_gather_concat / strided_slice.
+        self.mock_gather.return_value = "gathered"
+        self.mock_slice.return_value = "sliced"
 
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
@@ -79,6 +90,9 @@ class _MockedTestCase(unittest.TestCase):
         self.addCleanup(self.patcher_dm.stop)
         self.addCleanup(self.patcher_dm_tensor.stop)
         self.addCleanup(self.patcher_tr.stop)
+        self.addCleanup(self.patcher_gather.stop)
+        self.addCleanup(self.patcher_slice.stop)
+        self.addCleanup(self.patcher_rank.stop)
         self.addCleanup(_DEVICE_MESH_MAP.clear)
         self.addCleanup(EXISTING_COMM_GROUPS.clear)
 
@@ -134,12 +148,12 @@ class TestConstructAllConcat(_MockedTestCase):
         tr = TensorRedistribution()
         x = MagicMock()
         self.mock_tr_platform.create_group.return_value = "group"
-        self.mock_tr_platform.differentiable_all_gather_concat.return_value = "gathered"
+        self.mock_gather.return_value = "gathered"
 
         result = tr._construct_all_concat(x, 0, 1, 2, 3)
         # rank_list = (0, 1, 2), concat_dim = 3
         self.mock_tr_platform.create_group.assert_called_once_with((0, 1, 2))
-        self.mock_tr_platform.differentiable_all_gather_concat.assert_called_once()
+        self.mock_gather.assert_called_once()
         self.assertEqual(result, "gathered")
 
 
@@ -150,10 +164,10 @@ class TestConstructStridedSlice(_MockedTestCase):
         from hyper_parallel.core.dtensor.tensor_redistribution import TensorRedistribution
         tr = TensorRedistribution()
         x = MagicMock()
-        self.mock_tr_platform.construct_strided_slice.return_value = "sliced"
+        self.mock_slice.return_value = "sliced"
         # args: begin0, begin1, end0, end1, stride0, stride1
         result = tr._construct_strided_slice(x, 0, 0, 4, 4, 1, 1)
-        self.mock_tr_platform.construct_strided_slice.assert_called_once()
+        self.mock_slice.assert_called_once()
         self.assertEqual(result, "sliced")
 
 
@@ -405,12 +419,12 @@ class TestConstructAllConcatNew(_MockedTestCase):
         from hyper_parallel.core.dtensor.tensor_redistribution import TensorRedistribution
         x = MagicMock()
         self.mock_tr_platform.create_group.return_value = "group"
-        self.mock_tr_platform.differentiable_all_gather_concat.return_value = "gathered"
+        self.mock_gather.return_value = "gathered"
 
         # args: (concat_dim, concat_size, group_rank_list)
         result = TensorRedistribution._construct_all_concat_new(x, 0, 4, [0, 1, 2, 3])
         self.mock_tr_platform.create_group.assert_called_once_with([0, 1, 2, 3])
-        self.mock_tr_platform.differentiable_all_gather_concat.assert_called_once()
+        self.mock_gather.assert_called_once()
 
 
 if __name__ == "__main__":

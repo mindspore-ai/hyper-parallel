@@ -41,7 +41,7 @@ from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.core.utils import compute_local_shape_and_global_offset
 
 platform = get_platform()
-DTensorBase = platform.DTensorBase
+from hyper_parallel.core.dtensor._dtensor_base import DTensorBase
 Tensor = platform.Tensor
 
 logger = logging.getLogger(__name__)

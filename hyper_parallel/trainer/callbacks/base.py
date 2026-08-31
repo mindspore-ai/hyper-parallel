@@ -31,6 +31,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 
 from hyper_parallel import get_platform
@@ -322,7 +323,7 @@ class CheckpointCallback(Callback):
                             state.global_step, state.epoch)
 
             # 3. Restore optimizer
-            optim_path = os.path.join(self.load_path, f"optimizer_rank{platform.get_rank()}.pt")
+            optim_path = os.path.join(self.load_path, f"optimizer_rank{dist.get_rank()}.pt")
             if os.path.isfile(optim_path) and self.trainer.optimizer:
                 optim_sd = torch.load(optim_path, map_location="cpu", weights_only=True)
                 self.trainer.optimizer.load_state_dict(optim_sd)
@@ -336,14 +337,14 @@ class CheckpointCallback(Callback):
                 logger.info("LR scheduler restored")
 
             # 5. Restore RNG state
-            rng_path = os.path.join(self.load_path, f"rng_rank{platform.get_rank()}.pt")
+            rng_path = os.path.join(self.load_path, f"rng_rank{dist.get_rank()}.pt")
             if os.path.isfile(rng_path):
                 rng_state = torch.load(rng_path, map_location="cpu", weights_only=True)
                 platform.set_rng_state(rng_state)
                 logger.info("RNG state restored")
 
             # 6. Restore dataloader position (StatefulDataLoader)
-            dl_path = os.path.join(self.load_path, f"dataloader_rank{platform.get_rank()}.pt")
+            dl_path = os.path.join(self.load_path, f"dataloader_rank{dist.get_rank()}.pt")
             if os.path.isfile(dl_path) and hasattr(self.trainer, 'train_dataloader'):
                 dl_state = torch.load(dl_path, map_location="cpu", weights_only=False)
                 self.trainer.train_dataloader.load_state_dict(dl_state)
@@ -425,7 +426,7 @@ class CheckpointCallback(Callback):
         # Use torch.save/load for these non-model artifacts.
         save_dir = os.path.join(self.output_dir, f"step_{state.global_step}")
         os.makedirs(save_dir, exist_ok=True)
-        rank = platform.get_rank()
+        rank = dist.get_rank()
 
         try:
             # 1. Model — via hyper DCP (each rank saves its own shards)
@@ -526,7 +527,7 @@ class SafetensorsExportCallback(Callback):
         """
         # pylint: disable=C0415
 
-        rank = platform.get_rank()
+        rank = dist.get_rank()
         save_dir = os.path.join(self.output_dir, f"step_{state.global_step}", "hf_ckpt")
 
         try:
@@ -583,7 +584,7 @@ class EvalCallback(Callback):
         eval_cfg = getattr(self.trainer.args, 'eval', None)
         eval_steps = getattr(eval_cfg, 'eval_steps', 0) if eval_cfg else 0
         if eval_steps > 0 and state.global_step % eval_steps == 0:
-            if platform.get_rank() == 0:
+            if dist.get_rank() == 0:
                 logger.warning(
                     "EvalCallback: evaluation not implemented (step=%d)", state.global_step
                 )
@@ -602,7 +603,7 @@ class ProfilerCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         prof_cfg = getattr(trainer.args, 'profiler', None)
-        if getattr(prof_cfg, 'enabled', False) and platform.get_rank() == 0:
+        if getattr(prof_cfg, 'enabled', False) and dist.get_rank() == 0:
             logger.warning(
                 "ProfilerCallback: enabled=True but the implementation is "
                 "a stub — torch profiler is NOT started. Implement before "
@@ -623,7 +624,7 @@ class WandbCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         wandb_cfg = getattr(trainer.args, 'wandb', None)
-        if getattr(wandb_cfg, 'enabled', False) and platform.get_rank() == 0:
+        if getattr(wandb_cfg, 'enabled', False) and dist.get_rank() == 0:
             logger.warning(
                 "WandbCallback: enabled=True but the implementation is a "
                 "stub — nothing is sent to W&B. Implement before relying on "
@@ -643,7 +644,7 @@ class ProgressCallback(Callback):
         self._pbar = None
 
     def on_train_begin(self, state: "TrainerState", **kwargs) -> None:
-        if platform.get_rank() != 0:
+        if dist.get_rank() != 0:
             return
         try:
             # pylint: disable=C0415
@@ -742,7 +743,7 @@ class MoEMonitorCallback(Callback):
 
     def on_train_begin(self, state: "TrainerState", **kwargs) -> None:
         """Log one-time confirmation when MoE monitoring is enabled."""
-        if self.enabled and platform.get_rank() == 0:
+        if self.enabled and dist.get_rank() == 0:
             logger.info("MoEMonitorCallback: MoE expert-load monitoring enabled")
 
     def on_step_end(self, state: "TrainerState", *, loss: float = None,
@@ -973,7 +974,7 @@ class TrainingStateMonitorCallback(Callback):
         if not self.enabled:
             return
         self._state = state
-        self._rank = platform.get_rank()
+        self._rank = dist.get_rank()
         if self._uses_tensorboard():
             tb_root = os.path.join(self.dump_path, "tensorboard")
             self._rank_writer = SummaryWriter(
@@ -1133,7 +1134,7 @@ class GradientHealthCallback(Callback):
                 grad_norm, state.global_step,
             )
             # Raise on rank 0 only; other ranks will be torn down by NCCL.
-            if platform.get_rank() == 0:
+            if dist.get_rank() == 0:
                 raise RuntimeError(
                     f"Non-finite grad_norm={grad_norm} at "
                     f"step {state.global_step}. "
@@ -1186,7 +1187,7 @@ class TensorBoardCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         tb_cfg = getattr(trainer.args, 'tensorboard', None)
-        if getattr(tb_cfg, 'enabled', False) and platform.get_rank() == 0:
+        if getattr(tb_cfg, 'enabled', False) and dist.get_rank() == 0:
             logger.warning(
                 "TensorBoardCallback: enabled=True but the implementation "
                 "is a stub — nothing is written to TensorBoard. Implement "
@@ -1208,7 +1209,7 @@ class MemoryMonitorCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         cfg = getattr(trainer.args, 'memory_monitor', None)
-        if getattr(cfg, 'enabled', False) and platform.get_rank() == 0:
+        if getattr(cfg, 'enabled', False) and dist.get_rank() == 0:
             logger.warning(
                 "MemoryMonitorCallback: enabled=True but the implementation "
                 "is a stub — no memory stats are emitted. Implement before "

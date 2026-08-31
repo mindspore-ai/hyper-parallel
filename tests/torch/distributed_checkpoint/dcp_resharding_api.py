@@ -49,7 +49,7 @@ def _make_shared_temp_checkpoint_dir(prefix: str) -> Path:
     """Create one temporary checkpoint directory shared by all distributed ranks."""
     platform = get_platform()
     path_holder = [None]
-    if platform.get_rank() == 0:
+    if dist.get_rank() == 0:
         path_holder[0] = tempfile.mkdtemp(prefix=prefix)
     dist.broadcast_object_list(path_holder, src=0)
     return Path(path_holder[0])
@@ -69,7 +69,7 @@ def _run_safe_open_reshard_case(
     filesystem_storage.safe_open and reconstructs the original global tensors.
     """
     platform = get_platform()
-    current_rank = platform.get_rank()
+    current_rank = dist.get_rank()
     load_mesh_size = load_mesh_shape[0] * load_mesh_shape[1]
     mesh_dim_names = ("dp", "tp")
     checkpoint_path = _make_shared_temp_checkpoint_dir(f"test_dcp_safe_open_{case_name}_")
@@ -318,7 +318,7 @@ def test_dcp_safe_open_with_fully_shard_tp_dp_resharding_load() -> None:
     np.random.seed(7)
 
     platform = get_platform()
-    current_rank = platform.get_rank()
+    current_rank = dist.get_rank()
     world_size = platform.get_world_size()
     checkpoint_path = _make_shared_temp_checkpoint_dir("test_dcp_safe_open_fully_shard_tp_dp_to_tp2_")
 

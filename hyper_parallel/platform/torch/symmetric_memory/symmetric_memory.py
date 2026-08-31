@@ -75,7 +75,7 @@ class TorchSymmetricMemoryHandler:
             return
         logger.info("start init torch symmetric memory")
         platform = get_platform()
-        rank_id = platform.get_rank()
+        rank_id = dist.get_rank()
         world_size = platform.get_world_size()
         local_mem_size = os.getenv("SYMMETRIC_MEMORY_HEAP_SIZE")
         if local_mem_size is not None:

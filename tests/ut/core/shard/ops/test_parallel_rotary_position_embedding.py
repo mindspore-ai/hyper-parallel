@@ -240,9 +240,8 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"CP-S with cos Replicate should be (-1,-1,0,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_dp_tp_2d_mesh_10(self, mock_mesh_plat, mock_layout_plat):
+    def test_dp_tp_2d_mesh_10(self, mock_mesh_plat):
         """
         Feature: infer_layout BNSD with DP+TP on 2-D mesh.
         Description: mesh (2,2) dp×tp; x Shard(B)×Shard(N), cos Shard(B)×Replicate.
@@ -251,7 +250,6 @@ class TestInferLayoutPositive(unittest.TestCase):
           output.tensor_map == (1, 0, -1, -1).
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=4)
-        mock_layout_plat.get_rank.return_value = 0
 
         mesh = self._make_2d_mesh(mock_mesh_plat, shape=(2, 2), names=("dp", "tp"))
         x = _build_layout(mesh, (Shard(0), Shard(1)), 4)    # B on dp, N on tp
@@ -267,16 +265,14 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"DP+TP output should be (1,0,-1,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_dp_cp_2d_mesh_11(self, mock_mesh_plat, mock_layout_plat):
+    def test_dp_cp_2d_mesh_11(self, mock_mesh_plat):
         """
         Feature: infer_layout BNSD with DP+CP on 2-D mesh.
         Description: mesh (2,2) dp×sp; x Shard(B)×Shard(S), cos Shard(B)×Shard(S).
         Expectation: output.tensor_map == (1, -1, 0, -1).
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=4)
-        mock_layout_plat.get_rank.return_value = 0
 
         mesh = self._make_2d_mesh(mock_mesh_plat, shape=(2, 2), names=("dp", "sp"))
         x = _build_layout(mesh, (Shard(0), Shard(2)), 4)    # B on dp, S on sp
@@ -292,16 +288,14 @@ class TestInferLayoutPositive(unittest.TestCase):
             msg=f"DP+CP output should be (1,-1,0,-1), got {out.tensor_map}"
         )
 
-    @patch("hyper_parallel.core.dtensor.layout.platform")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_tp_cp_2d_mesh_12(self, mock_mesh_plat, mock_layout_plat):
+    def test_tp_cp_2d_mesh_12(self, mock_mesh_plat):
         """
         Feature: infer_layout BNSD with TP+CP on 2-D mesh.
         Description: mesh (2,2) tp×sp; x Shard(N)×Shard(S), cos Replicate×Shard(S).
         Expectation: output.tensor_map == (-1, 1, 0, -1).
         """
         self._setup_mock_platform(mock_mesh_plat, world_size=4)
-        mock_layout_plat.get_rank.return_value = 0
 
         mesh = self._make_2d_mesh(mock_mesh_plat, shape=(2, 2), names=("tp", "sp"))
         x = _build_layout(mesh, (Shard(1), Shard(2)), 4)       # N on tp, S on sp

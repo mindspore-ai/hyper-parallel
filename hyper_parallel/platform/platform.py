@@ -158,15 +158,6 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement get_swap_optimizer")
 
     @staticmethod
-    def get_rank():
-        """Get the rank of the current process in the default process group.
-
-        Returns:
-            int: The rank of the current process.
-        """
-        raise NotImplementedError("Platform subclasses must implement get_rank")
-
-    @staticmethod
     def get_global_rank(group, group_rank):
         """Convert a group rank to its global rank.
 
@@ -204,22 +195,6 @@ class Platform:
             str: The canonical name of the operator.
         """
         raise NotImplementedError("Platform subclasses must implement get_op_name")
-
-    @staticmethod
-    def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
-        """Perform differentiable all-gather and concatenate tensors along a dimension.
-
-        Args:
-            data: The input tensor to gather.
-            group: The process group for collective communication.
-            concat_size (int): The size to concatenate along concat_dim.
-            concat_dim (int): The dimension along which to concatenate.
-            rank_list: Optional rank order expected by the logical layout.
-
-        Returns:
-            The concatenated tensor after all-gather operation.
-        """
-        raise NotImplementedError("Platform subclasses must implement differentiable_all_gather_concat")
 
     @staticmethod
     def chunk(data, split_dim, split_size, index):
@@ -606,25 +581,6 @@ class Platform:
                 ``None`` uses the default group.
         """
         raise NotImplementedError("Platform subclasses must implement prepare_batch_p2p_group")
-
-    @staticmethod
-    def p2p_exchange(tensor, peer_rank: int, group=None):
-        """Differentiable symmetric P2P exchange (send local tensor, receive peer's tensor).
-
-        Sends ``tensor`` to ``peer_rank`` and simultaneously receives the peer's
-        tensor.  The operation is differentiable: the backward pass performs the
-        same symmetric exchange on the upstream gradient.
-
-        Args:
-            tensor: Local tensor to send.
-            peer_rank (int): Global rank of the communication peer.
-            group: Process group. ``None`` uses the default group.
-
-        Returns:
-            Tensor received from ``peer_rank``, with the same shape and dtype as
-            the input ``tensor``.
-        """
-        raise NotImplementedError("Platform subclasses must implement p2p_exchange")
 
     @staticmethod
     def send_object_list(obj_list, dst=None, group=None):
@@ -1063,21 +1019,6 @@ class Platform:
             A module or object containing tensor transformation functions.
         """
         raise NotImplementedError("Platform subclasses must implement get_tensor_transform")
-
-    @staticmethod
-    def construct_strided_slice(x, begin, end, stride):
-        """Construct a strided slice operation on a tensor.
-
-        Args:
-            x: The input tensor to slice.
-            begin: The starting indices for each dimension.
-            end: The ending indices for each dimension.
-            stride: The stride for each dimension.
-
-        Returns:
-            The sliced tensor.
-        """
-        raise NotImplementedError("Platform subclasses must implement construct_strided_slice")
 
     @staticmethod
     def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):

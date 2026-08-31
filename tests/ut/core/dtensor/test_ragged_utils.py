@@ -44,7 +44,7 @@ class TestRaggedDTensor(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
         self.rank_patcher = patch(
-            "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+            "hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
             return_value=0,
         )
         self.rank_patcher.start()

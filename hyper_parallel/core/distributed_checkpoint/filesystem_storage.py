@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from safetensors import safe_open
+import torch.distributed as dist
 
 from hyper_parallel.core.distributed_checkpoint.metadata import (
     Metadata,
@@ -105,7 +106,7 @@ class FileSystemWriter(StorageWriter):
             **kwargs: Additional keyword arguments (e.g., rank, use_collectives).
         """
         self.is_coordinator = is_coordinator
-        self.rank = kwargs.get("rank") if "rank" in kwargs else platform.get_rank()
+        self.rank = kwargs.get("rank") if "rank" in kwargs else dist.get_rank()
         self.use_collectives = kwargs.get("use_collectives", True)
 
     def optimize_local_plan(self, plan: SavePlan) -> SavePlan:
@@ -556,7 +557,7 @@ class FileSystemReader(StorageReader):
         self.is_coordinator = is_coordinator
         # Do not evaluate get_rank() when an offline caller supplies rank. The
         # default process group is intentionally not initialized by converters.
-        self.rank = kwargs["rank"] if "rank" in kwargs else platform.get_rank()
+        self.rank = kwargs["rank"] if "rank" in kwargs else dist.get_rank()
         self.broadcast_from_minimum_rank = kwargs.get("broadcast_from_minimum_rank", self.broadcast_from_minimum_rank)
 
     def optimize_local_plan(self, plan: LoadPlan) -> LoadPlan:

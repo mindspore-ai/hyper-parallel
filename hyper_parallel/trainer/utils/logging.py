@@ -40,8 +40,7 @@ import sys
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Rank lookup — uses platform when available, falls back to env var.
-# Going through platform avoids importing torch / mindspore here directly.
+# Rank lookup — uses ``torch.distributed`` when available, falls back to env var.
 # ---------------------------------------------------------------------------
 
 
@@ -49,17 +48,15 @@ def _get_rank() -> int:
     """Best-effort rank lookup.
 
     Order:
-      1. ``hyper_parallel.platform.get_platform().get_rank()`` if the process
-         group is initialised.
+      1. ``torch.distributed.get_rank()`` if the process group is initialised.
       2. ``RANK`` env var (set by ``torchrun`` / ``msrun``).
       3. ``LOCAL_RANK`` env var.
       4. ``0`` as the last resort.
     """
     try:
         # pylint: disable=C0415
-        from hyper_parallel import get_platform
-        platform = get_platform()
-        return int(platform.get_rank())
+        import torch.distributed as dist
+        return int(dist.get_rank())
     except (ImportError, RuntimeError, ValueError, AttributeError):
         pass
     return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))

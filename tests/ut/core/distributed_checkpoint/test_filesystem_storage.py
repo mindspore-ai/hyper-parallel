@@ -159,7 +159,7 @@ class TestFilesystemStorage(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         EXISTING_COMM_GROUPS.clear()
         with patch(
-                "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+                "hyper_parallel.core.dtensor.device_mesh.dist.get_rank",
                 return_value=0,
         ):
             mesh = Layout((2,), ("ragged",), init_backend=False).mesh

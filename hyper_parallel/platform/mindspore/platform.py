@@ -849,7 +849,6 @@ class MindSporePlatform(Platform):
     tensor = Tensor
     Parameter = Parameter
     Module = Cell
-    DTensorBase = DTensorBase
     PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.MINDSPORE
     tensor_dtype = mstype
@@ -1079,16 +1078,6 @@ class MindSporePlatform(Platform):
         return tensor
 
     @staticmethod
-    def get_rank():
-        """
-        Get the rank of the current process in the distributed group.
-
-        Returns:
-            int: The rank of the current process.
-        """
-        return get_rank_id()
-
-    @staticmethod
     def get_global_rank(group, group_rank):
         """
         Get the global rank from a group rank.
@@ -1124,16 +1113,6 @@ class MindSporePlatform(Platform):
             str: The operation name.
         """
         return func.name
-
-    @staticmethod
-    def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
-        data = _ensure_contiguous(data)
-        # rank_list is accepted for torch parity; MindSpore keeps the existing group order.
-        output, _ = comm_func.all_gather_into_tensor(None, data, group=group)
-        if concat_dim == 0:
-            return output
-        output_tensors = ms.ops.Split(output_num=concat_size)(output)
-        return ms.mint.concat(output_tensors, concat_dim)
 
     @staticmethod
     def chunk(data, split_dim, split_size, index):
@@ -1389,12 +1368,6 @@ class MindSporePlatform(Platform):
             group: The communication group used by the batched P2P operations.
                 ``None`` uses the default group.
         """
-
-    @staticmethod
-    def p2p_exchange(tensor, peer_rank: int, group=None):  # pylint: disable=unused-argument
-        raise NotImplementedError(
-            "p2p_exchange is not yet supported on the MindSpore platform."
-        )
 
     @staticmethod
     def send_object_list(obj_list, dst=None, group=None):
@@ -1663,10 +1636,6 @@ class MindSporePlatform(Platform):
         return _tensor_transform
 
     @staticmethod
-    def construct_strided_slice(x, begin, end, stride):
-        return ms.ops.strided_slice(x, begin, end, stride)
-
-    @staticmethod
     def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch
@@ -1883,7 +1852,7 @@ class MindSporePlatform(Platform):
         if split_ranks is None or len(split_ranks) == 0:
             raise ValueError("split_ranks cannot be None or empty")
 
-        rank_id = MindSporePlatform.get_rank()
+        rank_id = get_rank_id()
         for split_rank in split_ranks:
             if rank_id in split_rank:
                 world_group = MindSporePlatform._maybe_reuse_world_group(split_rank)
@@ -1902,7 +1871,7 @@ class MindSporePlatform(Platform):
     @staticmethod
     def get_group_local_rank(group=None) -> int:
         """get group local rank id."""
-        return dist.get_group_rank(group, MindSporePlatform.get_rank())
+        return dist.get_group_rank(group, get_rank_id())
 
     @staticmethod
     def get_group_rank(group=None) -> int:

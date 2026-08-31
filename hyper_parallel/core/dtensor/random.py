@@ -35,9 +35,10 @@ import operator
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 
 platform = get_platform()
-DTensorBase = platform.DTensorBase
+from hyper_parallel.core.dtensor._dtensor_base import DTensorBase
 Tensor = platform.tensor
 
 logger = getLogger(__name__)
@@ -439,7 +440,7 @@ def _calc_shard_linear_idx(shard_coord: list[int], shard_size: list[int]) -> int
 
 def _resolve_device():
     device_handle = platform.get_device_handle()
-    device_idx = platform.get_rank() % platform.device_count(device_handle)
+    device_idx = dist.get_rank() % platform.device_count(device_handle)
 
     def get_device(device_idx):
         return platform.device(device_idx)

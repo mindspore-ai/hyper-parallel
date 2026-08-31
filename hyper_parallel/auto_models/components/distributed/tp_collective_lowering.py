@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
+from hyper_parallel import comm
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, Shard
 from hyper_parallel.platform import get_platform
 
@@ -39,7 +40,7 @@ class TPExecutionOp:
     def execute(self, tensor: Any) -> Any:
         """Execute the differentiable collective selected during lowering."""
         if self.kind == "all_gather":
-            return platform.differentiable_all_gather_concat(
+            return comm.differentiable_all_gather_concat(
                 tensor,
                 self.group,
                 self.group_size,

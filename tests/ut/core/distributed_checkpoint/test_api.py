@@ -66,7 +66,7 @@ class TestApi(unittest.TestCase):
         mock_barrier.assert_not_called()
 
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size", return_value=1)
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
     def test_save_load_roundtrip_no_dist(self, mock_barrier, mock_rank, mock_world_size):
         """
@@ -90,7 +90,7 @@ class TestApi(unittest.TestCase):
         mock_world_size.assert_called()
 
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size", return_value=1)
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
     def test_save_returns_metadata_with_tensor_entries(self, mock_barrier, mock_rank, mock_world_size):
         """

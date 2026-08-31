@@ -22,6 +22,7 @@ import numpy as np
 
 from hyper_parallel.core.dtensor._mesh_layout import IntTuple, _MeshLayout, _contiguous_strides, _is_int
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, Platform, PlatformType
 
 platform = get_platform()
@@ -211,7 +212,7 @@ class DeviceMesh:
             platform.init_process_group()
 
         self._layout, self._rank_map = self._resolve_layout_and_rank_map(mesh, _layout, _rank_map)
-        self._rank = platform.get_rank()
+        self._rank = dist.get_rank()
         self._root_mesh = _root_mesh
         self._refresh_mesh_view()
         self._set_mesh_dim_names(mesh_dim_names)
@@ -366,7 +367,7 @@ class DeviceMesh:
             return full_mesh[0]
 
         if current_rank is None:
-            current_rank = platform.get_rank()
+            current_rank = dist.get_rank()
 
         rank_coords = (full_mesh == current_rank).nonzero()
         if rank_coords.shape[0] > 0:
@@ -461,7 +462,7 @@ class DeviceMesh:
             split_rank = _get_sub_rank_list(mesh_shape, mesh_dim_names, rank_list, dim_name, rank)
             sorted_rank = tuple(sorted(split_rank))
             split_ranks.add(sorted_rank)
-            if rank == platform.get_rank():
+            if rank == dist.get_rank():
                 group_key = str(sorted_rank)
         split_ranks = sorted([list(item) for item in split_ranks])
         platform.split_group(split_ranks=split_ranks)
@@ -474,7 +475,7 @@ class DeviceMesh:
     ) -> tuple[list[list[int]], Optional[str]]:
         """Build rank lists and the local cache key for one logical mesh axis."""
         pg_ranks_by_dim = sub_layout.remap_to_numpy(platform.tensor_to_numpy(rank_map))
-        current_rank = platform.get_rank()
+        current_rank = dist.get_rank()
         split_ranks = []
         split_ranks_set = set()
         group_key = None
@@ -1503,7 +1504,7 @@ def init_device_mesh(
         if init_backend:
             platform.init_process_group()
         try:
-            current_rank = platform.get_rank()
+            current_rank = dist.get_rank()
         except Exception as exc:
             raise RuntimeError(
                 "init_device_mesh: failed to get current rank for automatic rank_list generation. "

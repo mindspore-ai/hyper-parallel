@@ -20,6 +20,7 @@ from hyper_parallel import DTensor
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 from .utils import _RecvInfo  # pylint: disable=E0402
 
 platform = get_platform()
@@ -152,7 +153,7 @@ class PipelineStage(PipelineStageBase):
         if self.mesh is not None:
             self.pp_group = self.mesh.get_group()
         else:
-            rank_id = platform.get_rank()
+            rank_id = dist.get_rank()
             device_num = platform.get_world_size()
             real_stage_num = self.stage_num // self._virtual_chunk_num
             device_num_per_stage = device_num // real_stage_num
@@ -330,7 +331,7 @@ class PipelineStage(PipelineStageBase):
             # stages by a fixed rank block and the within-stage tile is identical
             # across stages, so this receiver's submesh is the sender's submesh
             # (layout.rank_list) shifted by the P2P offset (me - sender_rank).
-            me = platform.get_rank()
+            me = dist.get_rank()
             cur_ranks = tuple(layout.rank_list or ())
             # The cached layout is reused across microbatches/steps and
             # _update_layout mutates it in place, so re-resolution must be
@@ -348,7 +349,7 @@ class PipelineStage(PipelineStageBase):
             name for name in (layout.alias_name or ()) if name not in pp_dim_names
         )
         if not layout_dim_names:
-            return (platform.get_rank(),)
+            return (dist.get_rank(),)
         if len(layout_dim_names) == 1:
             submesh = root[layout_dim_names[0]]
         else:

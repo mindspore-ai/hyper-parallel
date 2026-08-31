@@ -39,6 +39,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
+from hyper_parallel import comm
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
     distribute_module,
@@ -763,13 +764,13 @@ class DeredundencyTokenDispatcher:
                 "counts within each OEP group because the shared token view "
                 f"uses all-gather, got totals {source_token_totals}."
             )
-        gathered_routed = platform.differentiable_all_gather_concat(
+        gathered_routed = comm.differentiable_all_gather_concat(
             routed_input, mesh_info.oep_group, mesh_info.oep_size, 0,
         )
         if router_coeff is None:
             gathered_router_coeff = None
         else:
-            gathered_router_coeff = platform.differentiable_all_gather_concat(
+            gathered_router_coeff = comm.differentiable_all_gather_concat(
                 router_coeff, mesh_info.oep_group, mesh_info.oep_size, 0,
             )
         return gathered_counts, gathered_routed, gathered_router_coeff

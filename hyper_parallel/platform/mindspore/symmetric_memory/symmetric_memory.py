@@ -18,6 +18,7 @@ from pathlib import Path
 import sys
 import mindspore as ms
 from mindspore.runtime import Stream, StreamCtx, Event
+import torch.distributed as dist
 from hyper_parallel.platform import get_platform
 
 
@@ -177,7 +178,7 @@ class MSSymmetricMemoryHandler:
                         Its size should be (world_size * local_input_size).
             input_tensor:  Local input tensor contributed by this rank.
         """
-        rank_id= get_platform().get_rank()
+        rank_id = dist.get_rank()
         world_size = get_platform().get_world_size()
         size= input_tensor.numel()
         if size * world_size != output_tensor.numel():

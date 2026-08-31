@@ -219,11 +219,11 @@ class TestResolveDevice(unittest.TestCase):
         """Test basic."""
         mock_handle = MagicMock()
         mock_platform.get_device_handle.return_value = mock_handle
-        mock_platform.get_rank.return_value = 3
         mock_platform.device_count.return_value = 2
         mock_platform.device.return_value = "device_1"
 
-        result = _resolve_device()
+        with patch("hyper_parallel.core.dtensor.random.dist.get_rank", return_value=3):
+            result = _resolve_device()
         # rank 3 % 2 = 1
         mock_platform.device.assert_called_once_with(1)
         self.assertEqual(result, "device_1")

@@ -29,6 +29,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from hyper_parallel import comm
 from hyper_parallel.core.context_parallel.context_parallel import (
     _ensure_1d,
 )
@@ -188,7 +189,7 @@ def _all_gather_stack(
     """All-gather equal-shaped tensors and stack them on a leading rank dim."""
     if cp_size == 1:
         return tensor.unsqueeze(0)
-    return platform.differentiable_all_gather_concat(
+    return comm.differentiable_all_gather_concat(
         tensor.unsqueeze(0),
         cp_mesh.get_group(),
         cp_size,

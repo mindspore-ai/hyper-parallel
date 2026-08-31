@@ -22,6 +22,7 @@ from functools import partial
 from typing import Any
 
 from hyper_parallel.platform import get_platform
+import torch.distributed as dist
 from hyper_parallel.auto_models.components.datasets.dataset_logging import get_dataset_logger
 
 platform = get_platform()
@@ -74,7 +75,7 @@ def _is_global_cache_builder_rank(shared_storage: bool) -> bool:
         return True
 
     try:
-        global_rank = int(platform.get_rank())
+        global_rank = int(dist.get_rank())
     except (RuntimeError, ValueError):
         global_rank = 0
     builds_shared_cache = global_rank == 0
