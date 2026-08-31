@@ -61,7 +61,7 @@ class MPipeTransposeExecutor(MPipeTransposeExecutorBase):  # pragma: no cover
         filled = [g if g is not None else ops.zeros_like(out_i)
                   for out_i, g in zip(outs, grads)]
         sens = filled[0] if len(filled) == 1 else tuple(filled)
-        grad_fn(sens=sens)
+        grad_fn.accumulate_grad(sens=sens)
 
     # --- owner-does-backward hooks: unreached on MindSpore --------------------
     # ScheduleMPipeTranspose forces owner_backward off on MindSpore (the captured

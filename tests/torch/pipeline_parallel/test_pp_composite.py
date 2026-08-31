@@ -49,3 +49,18 @@ def test_pp_plus_fully_shard_vpp():
         master_port=13830,
         num_proc=8,
     )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_pp_plus_fully_shard_vpp_dxdw_split():
+    """Run Torch PP+HSDP with split input/weight backward on eight ranks."""
+    torchrun_case(
+        _WORKER,
+        "test_pp_hsdp_vpp_dxdw_split_matches_reference",
+        num_proc=8,
+    )

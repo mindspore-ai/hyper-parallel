@@ -21,11 +21,13 @@ import torch
 import torch.distributed as dist
 from hyper_parallel import (
     DTensor,
+    MetaStepType,
     PipelineStage,
     ScheduleInterleaved1F1B,
     init_device_mesh,
     manual_seed,
 )
+from hyper_parallel.core.pipeline_parallel import CommComputeOverlap
 from hyper_parallel.core.activation_checkpoint import swap_wrapper
 from hyper_parallel.core.activation_checkpoint.swap import SwapManager
 from hyper_parallel.core.dtensor.placement_types import Shard
@@ -82,7 +84,31 @@ def _pp_domain_dtensor_rng_smoke() -> None:
     assert torch.isfinite(out.to_local()).all()
 
 
-def run_parallel(micro_batch_num):
+def _register_dxdw_overlap(schedule) -> None:
+    """Run each split dx concurrently with its paired forward."""
+    overlap = CommComputeOverlap()
+
+    def _callback(step, ctx):
+        bwd_step, fwd_step = step.sub_steps
+
+        def fwd_fn():
+            ctx.schedule.execute_fwd_leaf(
+                fwd_step, ctx.arg_mbs, ctx.kwarg_mbs, ctx.losses,
+            )
+
+        def bwd_fn():
+            if _DEVICE_TYPE == "npu":
+                torch.npu.set_device(dist.get_rank() % torch.npu.device_count())
+            ctx.schedule._exec_step(  # pylint: disable=protected-access
+                bwd_step, ctx.arg_mbs, ctx.kwarg_mbs, ctx.losses,
+            )
+
+        overlap.run(fwd_fn=fwd_fn, bwd_fn=bwd_fn)
+
+    schedule.register_custom_function(MetaStepType.OVERLAP_B_F, _callback)
+
+
+def run_parallel(micro_batch_num, enable_dxdw_split=False):
     """
     Feature: PipelineParallel.
     Description: Test simple mlp net; before PP run, smoke-test per-domain ``manual_seed`` and
@@ -106,7 +132,14 @@ def run_parallel(micro_batch_num):
     device = torch.device(_DEVICE_TYPE)
     pipeline_stage0 = PipelineStage(model0, stage_index , num_stages + 4, device)
     pipeline_stage1 = PipelineStage(model1, stage_index + 4, num_stages + 4, device)
-    schedule = ScheduleInterleaved1F1B([pipeline_stage0, pipeline_stage1], micro_batch_num)
+    schedule = ScheduleInterleaved1F1B(
+        [pipeline_stage0, pipeline_stage1],
+        micro_batch_num,
+        overlap_b_f=enable_dxdw_split,
+        enable_dxdw_split=enable_dxdw_split,
+    )
+    if enable_dxdw_split:
+        _register_dxdw_overlap(schedule)
 
     # input
     local_hidden_size = 16
@@ -293,14 +326,28 @@ def test_vpp_deep_warmup():
                        pp_model[1].mlp_layers[str(stage_index+4)].weight.cpu().detach().numpy())
 
 
-def test_vpp_dynamic_batch_p2p_cold_start():
-    """
-    Feature: Dynamic-shape VPP with batched P2P on cold PP subgroups.
-    Description: Run two virtual stages per rank on a ``pp=4, dp=2`` mesh with
-        ``micro_batch_num=1``, ``dyn_shape=True``, and ``overlap_b_f=True``
-        before any tensor collective.
-    Expectation: The schedule completes and the final-stage output is finite.
-    """
+def test_vpp_dxdw_split():
+    """Torch split backward should match full-model input and parameter gradients."""
+    micro = 8
+    standalone_model = SimpleMLP(8, 16, 16)
+    standalone_loss = run_standalone(micro, standalone_model)
+    pp_loss, pp_model = run_parallel(micro, enable_dxdw_split=True)
+    stage_index = get_stage_index(4)
+
+    if stage_index == 3:
+        torch.testing.assert_close(
+            standalone_loss.detach().cpu(),
+            torch.cat(pp_loss, dim=0).detach().cpu(),
+        )
+    for chunk, layer_index in zip(pp_model, (stage_index, stage_index + 4)):
+        torch.testing.assert_close(
+            standalone_model.mlp_layers[str(layer_index)].weight.grad.detach().cpu(),
+            chunk.mlp_layers[str(layer_index)].weight.grad.detach().cpu(),
+        )
+
+
+def _test_vpp_dynamic_batched_p2p_cold_start(p2p_transport: str) -> None:
+    """Run dynamic-shape VPP before any tensor collective initializes its P2P groups."""
     init_hccl()
     pp_size = 4
     world_size = dist.get_world_size()
@@ -338,14 +385,25 @@ def test_vpp_dynamic_batch_p2p_cold_start():
         stages,
         micro_batch_num=1,
         overlap_b_f=True,
+        p2p_transport=p2p_transport,
     )
-    assert getattr(schedule, "_p2p_mode") == "batch"
+    assert getattr(schedule, "_p2p_mode") == p2p_transport
     input_tensor = to_device(torch.ones((1, 16), dtype=torch.float32), _DEVICE_TYPE)
     losses = schedule.run(input_tensor) if stage_index == 0 else schedule.run()
 
     if stage_index == pp_size - 1:
         assert len(losses) == 1
         assert torch.isfinite(losses[0]).all()
+
+
+def test_vpp_dynamic_batch_p2p_cold_start():
+    """Dynamic-shape VPP should initialize and run the full PP batch group."""
+    _test_vpp_dynamic_batched_p2p_cold_start("batch")
+
+
+def test_vpp_dynamic_multi_stream_p2p_cold_start():
+    """Dynamic-shape VPP should initialize and run peer-specific P2P groups."""
+    _test_vpp_dynamic_batched_p2p_cold_start("multi_stream")
 
 
 if __name__ == "__main__":

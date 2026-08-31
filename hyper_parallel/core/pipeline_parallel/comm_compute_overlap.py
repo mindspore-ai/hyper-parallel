@@ -49,13 +49,27 @@ Typical integration::
         bwd_fn=lambda: bwd_stage.backward_one_chunk(mb, loss=loss),
     )
 """
+import queue
 import threading
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookCoordinator
 
 platform = get_platform()
+
+_WORKER_STOP = object()
+
+
+@dataclass
+class _BwdTask:
+    """One backward task submitted to the persistent overlap worker."""
+
+    bwd_fn: Callable[[], None]
+    done: threading.Event
+    exc_box: list[Exception]
 
 
 class CommComputeOverlap:
@@ -64,7 +78,9 @@ class CommComputeOverlap:
     Manages a :class:`HookCoordinator` and provides helpers to insert the
     four synchronization hooks (``A``, ``B``, ``C``, ``D``) around MoE
     dispatch / combine phases and to run forward + backward concurrently
-    with deterministic comm-first kernel launch ordering.
+    with deterministic comm-first kernel launch ordering.  MindSpore reuses
+    one persistent backward worker to preserve its thread-bound autograd
+    state, while PyTorch uses an independent thread for each overlap window.
 
     Example:
         >>> overlap = CommComputeOverlap()
@@ -74,7 +90,15 @@ class CommComputeOverlap:
     """
 
     def __init__(self) -> None:
+        """Initialize backend-specific backward thread state."""
         self._coordinator = HookCoordinator()
+        self._use_persistent_worker = platform.platform_type == PlatformType.MINDSPORE
+        self._worker_queue: Optional[queue.Queue] = (
+            queue.Queue() if self._use_persistent_worker else None
+        )
+        self._worker_thread: Optional[threading.Thread] = None
+        self._worker_lock = threading.Lock()
+        self._run_lock = threading.Lock()
 
     @property
     def coordinator(self) -> HookCoordinator:
@@ -151,39 +175,51 @@ class CommComputeOverlap:
     # Execution
     # ------------------------------------------------------------------
 
-    def run(
-        self,
-        fwd_fn: Callable[[], None],
-        bwd_fn: Callable[[], None],
-    ) -> None:
-        """Run ``fwd_fn`` and ``bwd_fn`` with comm/compute overlap.
+    def _ensure_worker(self) -> None:
+        """Start the persistent backward worker if it is not already alive."""
+        with self._worker_lock:
+            if self._worker_thread is not None and self._worker_thread.is_alive():
+                return
+            self._worker_thread = threading.Thread(
+                target=self._worker_loop,
+                name="hp-overlap-bwd-worker",
+                daemon=True,
+            )
+            self._worker_thread.start()
 
-        Enables the coordinator, spawns the backward pass on a daemon
-        thread, and waits for both to complete.  Layer-boundary handling
-        is encoded statically by the ``is_last_layer`` flag passed to
-        :meth:`wrap_combine` at wrap time, so no per-call layer count is
-        needed here.
+    def _submit_bwd_task(self, task: _BwdTask) -> None:
+        """Submit one backward task to the persistent worker."""
+        self._ensure_worker()
+        self._worker_queue.put(task)
 
-        Args:
-            fwd_fn: Callable that executes the forward pass.
-            bwd_fn: Callable that executes the backward pass.  If it needs
-                    a specific device stream, wrap that logic inside
-                    ``bwd_fn``.
+    def _start_bwd_task(self, task: _BwdTask) -> Optional[threading.Thread]:
+        """Start a backward task using the backend-appropriate thread model."""
+        if self._use_persistent_worker:
+            self._submit_bwd_task(task)
+            return None
+        thread = threading.Thread(target=self._run_bwd_task, args=(task,), daemon=True)
+        thread.start()
+        return thread
 
-        Raises:
-            RuntimeError: If the backward thread raises an exception, it
-                is re-raised on the main thread after ``join``.
-        """
-        self._coordinator.enable()
-
-        exc_box: list = []
-        coordinator = self._coordinator
-
-        def _bwd_target():
+    def _worker_loop(self) -> None:
+        """Run submitted backward tasks serially on the persistent worker."""
+        while True:
+            task = self._worker_queue.get()
             try:
-                bwd_fn()
+                if task is _WORKER_STOP:
+                    return
+                self._run_bwd_task(task)
+            finally:
+                self._worker_queue.task_done()
+
+    def _run_bwd_task(self, task: _BwdTask) -> None:
+        """Execute one backward task and preserve the existing cleanup contract."""
+        coordinator = self._coordinator
+        try:
+            try:
+                task.bwd_fn()
             except Exception as exc:  # pylint: disable=W0718
-                exc_box.append(exc)
+                task.exc_box.append(exc)
                 # BWD died — disable the coordinator so any FWD rendezvous
                 # waiting on a barrier/event unblocks immediately.  Without
                 # this the FWD thread hangs forever at the very first hook
@@ -195,31 +231,63 @@ class CommComputeOverlap:
                 # otherwise block forever on the 2-party barrier waiting for
                 # a partner that has exited.  ``depart`` aborts the barrier
                 # and flags the coordinator so FWD's remaining hooks run
-                # solo.  Required for correctness, not just on error: BWD's
-                # normal return previously left FWD hanging whenever
-                # ``layers(fwd) > layers(bwd)``.
+                # solo.  Required for correctness, not just on error.
                 coordinator.depart()
+        finally:
+            task.done.set()
 
-        thread = threading.Thread(target=_bwd_target, daemon=True)
-        thread.start()
+    def close(self) -> None:
+        """Stop the persistent backward worker after its current task finishes."""
+        if not self._use_persistent_worker:
+            return
+        with self._worker_lock:
+            thread = self._worker_thread
+            if thread is None:
+                return
+            if not thread.is_alive():
+                self._worker_thread = None
+                return
+            self._worker_queue.put(_WORKER_STOP)
+        thread.join()
+        with self._worker_lock:
+            if self._worker_thread is thread:
+                self._worker_thread = None
 
-        fwd_exc: list = []
+    def _run(
+        self,
+        fwd_fn: Callable[[], None],
+        bwd_fn: Callable[[], None],
+    ) -> None:
+        """Run one overlap window using the selected backward thread model."""
+        self._coordinator.enable()
+        done = threading.Event()
+        exc_box: list[Exception] = []
+        try:
+            thread = self._start_bwd_task(_BwdTask(bwd_fn, done, exc_box))
+        except Exception:
+            self._coordinator.disable()
+            raise
+
+        fwd_exc: list[Exception] = []
         try:
             fwd_fn()
         except Exception as exc:  # pylint: disable=W0718
             fwd_exc.append(exc)
             # Symmetric: if FWD dies, unblock BWD so it can exit.
-            coordinator.disable()
+            self._coordinator.disable()
         finally:
-            # Graceful one-party-left, mirroring ``_bwd_target``: if the
+            # Graceful one-party-left, mirroring the worker task: if the
             # paired BWD chunk has MORE hooks, ``depart`` lets it drain its
             # remaining rendezvous solo instead of hanging on the barrier.
-            # Must precede ``join`` so a still-running BWD is released.
-            coordinator.depart()
-            thread.join()
-            # Full reset after both threads are done (idempotent with any
+            # Must precede waiting on the task so a still-running BWD is
+            # released.
+            self._coordinator.depart()
+            done.wait()
+            if thread is not None:
+                thread.join()
+            # Full reset after both sides are done (idempotent with any
             # earlier disable on the FWD error path).
-            coordinator.disable()
+            self._coordinator.disable()
 
         if exc_box:
             raise RuntimeError(
@@ -227,3 +295,30 @@ class CommComputeOverlap:
             ) from exc_box[0]
         if fwd_exc:
             raise fwd_exc[0]
+
+    def run(
+        self,
+        fwd_fn: Callable[[], None],
+        bwd_fn: Callable[[], None],
+    ) -> None:
+        """Run ``fwd_fn`` and ``bwd_fn`` with comm/compute overlap.
+
+        MindSpore serializes overlap windows on its persistent backward
+        worker. PyTorch keeps the original per-window thread path and does not
+        add worker-queue coordination.
+
+        Args:
+            fwd_fn: Callable that executes the forward pass.
+            bwd_fn: Callable that executes the backward pass.  If it needs
+                    a specific device stream, wrap that logic inside
+                    ``bwd_fn``.
+
+        Raises:
+            RuntimeError: If the backward thread raises an exception, it
+                is re-raised on the main thread after the task finishes.
+        """
+        if self._use_persistent_worker:
+            with self._run_lock:
+                self._run(fwd_fn, bwd_fn)
+            return
+        self._run(fwd_fn, bwd_fn)

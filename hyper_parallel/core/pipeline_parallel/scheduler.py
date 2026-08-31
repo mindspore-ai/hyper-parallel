@@ -55,7 +55,7 @@ class MetaStepType(Enum):
     # Composite P2P: a contiguous run of FWD_SEND/FWD_RECV/BWD_SEND/BWD_RECV
     # coalesced by ``coalesce_p2p`` into one step whose ``sub_steps`` the runtime
     # groups by peer and issues as ``batch_isend_irecv`` (same-peer send+recv ->
-    # duplex).  Only produced under ``p2p_transport="batch"``.
+    # duplex).  Produced under ``p2p_transport="batch"`` or ``"multi_stream"``.
     BATCH_SEND_RECV = auto()
     OVERLAP_F_B = auto()
     OVERLAP_B_F = auto()
@@ -258,7 +258,7 @@ def _exec_fsdp_reduce_grad(stage):
     stage.execute_reduce_grad()
 
 
-# FSDP control MetaStep -> handler(stage).  Membership also marks which
+# FSDP control MetaStep -> handler(stage). Membership also marks which
 # MetaStepTypes are FSDP control steps, so the runtime loop dispatches with a
 # single table lookup instead of re-switching on the step type.
 _FSDP_STEP_HANDLERS = {
@@ -312,9 +312,14 @@ class PipelineScheduleRuntime(ABC):
             (EI0005). On backends that require full-group participation before
             the first batched P2P call, batch-backed modes prepare the PP group
             once at their first run boundary.
+            ``"multi_stream"`` — EXPERIMENTAL: the same gap-time duplex
+            batching as ``"batch"``, but each adjacent PP peer pair uses its
+            own two-rank communication group. MindSpore's default per-group
+            communication-stream policy then lets the previous and next PP
+            edges progress on separate streams.
     """
 
-    _P2P_TRANSPORTS = ("auto", "plain", "batch", "boundary")
+    _P2P_TRANSPORTS = ("auto", "plain", "batch", "boundary", "multi_stream")
 
     def __init__(self,
                  stages,
@@ -390,6 +395,13 @@ class PipelineScheduleRuntime(ABC):
         #    ([S,R] vs [R,S]), safe under both candidate HCCL pairing
         #    semantics.  Promote to the auto default only after it earns both
         #    a hardware accuracy pass and a perf win over "batch".
+        #  * ``"multi_stream"`` (EXPERIMENTAL, explicit opt-in only) — keeps the
+        #    ``"batch"`` schedule and same-peer duplex fusion, but routes each
+        #    physical PP edge through a fixed two-rank group. With MindSpore's
+        #    ``multi_stream:group`` runtime policy, the previous and next
+        #    edges then use separate communication streams. Group count is
+        #    bounded by physical PP degree (at most two per rank), not by the
+        #    number of micro-batches.
         #
         # Two transport invariants for any future rewrite: plain per-pair
         # streams need the gap's recv-first/send-first complementarity (a
@@ -402,6 +414,10 @@ class PipelineScheduleRuntime(ABC):
         self._batch_p2p = False
         self._batch_p2p_group = None
         self._batch_p2p_group_initialized = False
+        # ``peer_global_rank -> two-rank process group``. Populated only for
+        # the experimental ``p2p_transport="multi_stream"`` mode.
+        self._p2p_multi_stream_groups = {}
+        self._p2p_multi_stream_groups_initialized = False
         # OVERLAP steps whose boundary_p2p was already issued this run (the
         # stage after-forward hook and the post-step safety net are both
         # allowed to call exec_boundary_p2p; reset per run_microbatches call).
@@ -443,16 +459,27 @@ class PipelineScheduleRuntime(ABC):
         """
         self._custom_fn_map[step_type] = fn
 
+    @staticmethod
+    def _stage_hsdp_modules(stage):
+        """Return the independently configurable HSDP roots in a stage."""
+        if isinstance(stage.submodule, HSDPModule):
+            return [stage.submodule]
+        modules = []
+        seen = set()
+        for _, module in platform.get_cells_and_names(stage.submodule):
+            if not isinstance(module, HSDPModule) or id(module) in seen:
+                continue
+            seen.add(id(module))
+            modules.append(module)
+        return modules
+
     def _inject_local_fsdp_actions(self):
         """Annotate the local rank schedule with optional FSDP control actions."""
         current_rank = self._stage_to_rank_index[self.stages[0].stage_index]
         managed_stage_indices = {
             stage.stage_index
             for stage in self.stages
-            if any(
-                isinstance(module, HSDPModule)
-                for _, module in platform.get_cells_and_names(stage.submodule)
-            )
+            if self._stage_hsdp_modules(stage)
         }
         if not managed_stage_indices:
             return
@@ -461,12 +488,30 @@ class PipelineScheduleRuntime(ABC):
                 "When injecting fsdp_action, expect all stages to be HSDPModule. "
                 "Check whether all separated modules are wrapped with 'fully_shard'."
             )
+        for stage in self.stages:
+            for module in self._stage_hsdp_modules(stage):
+                module.set_reshard_after_forward(False)
         rank_actions = add_fsdp_unshard_reshard(self.exec_order[current_rank], managed_stage_indices)
         self.exec_order[current_rank] = add_fsdp_reduce_grad(
             rank_actions,
             managed_stage_indices,
             self.micro_batch_num,
         )
+
+    def _prepare_fsdp_backward(self):
+        """Disable HSDP post-backward actions once for the current pipeline run.
+
+        Pipeline accumulates gradients across all micro-batches and executes
+        the reduction through ``FSDP_REDUCE_GRAD`` after the last backward.
+        ``execute_reduce_grad`` restores both flags, so they must be disabled
+        once again at the beginning of the next run.
+        """
+        for stage in self.stages:
+            if not stage.has_backward:
+                continue
+            for module in self._stage_hsdp_modules(stage):
+                module.set_reshard_after_backward(False)
+                module.set_requires_gradient_sync(False)
 
     def _inject_local_pp_swap_actions(self):
         """Annotate the local rank schedule with pipeline activation-swap actions."""
@@ -504,7 +549,7 @@ class PipelineScheduleRuntime(ABC):
 
         2. ``_inject_local_fsdp_actions()``
            FSDP parameter management: UNSHARD before compute, RESHARD after,
-           REDUCE_GRAD after the last backward of each stage.  This layer must
+           REDUCE_GRAD after the last backward of each stage. This layer must
            run *before* swap injection so that swap can see the already-placed
            FSDP steps and optimise its placement relative to them:
 
@@ -544,7 +589,12 @@ class PipelineScheduleRuntime(ABC):
             mode = "batch" if getattr(self, "_overlap_b_f", False) else "plain"
         self._p2p_mode = mode
         self._batch_p2p = mode != "plain"
-        self._batch_p2p_group = self._resolve_batch_p2p_group() if self._batch_p2p else None
+        # Multi-stream tensor P2P uses edge groups, but dynamic-shape metadata still uses the full PP group.
+        self._batch_p2p_group = (
+            self._resolve_batch_p2p_group() if self._batch_p2p else None
+        )
+        if mode == "multi_stream":
+            self._init_p2p_multi_stream_groups()
         self.construct_exec_order()
         # FSDP must inject before PP-swap so that swap can optimise
         # placement relative to FSDP steps (LAUNCH_OFFLOAD before
@@ -556,13 +606,39 @@ class PipelineScheduleRuntime(ABC):
             # forward).  Everything stays per-op solo batches — deliberately
             # NO coalesce_p2p (see __init__).
             self.exec_order = attach_fwd_boundary_p2p(self.exec_order)
-        elif mode == "batch":
+        elif mode in ("batch", "multi_stream"):
             # Coalesce contiguous P2P runs into BATCH_SEND_RECV so the runtime
             # issues same-peer send+recv as one duplex batch.  NOTE: couples
             # the riding send into the compute-gating recv wait — see
             # __init__.
             self.exec_order = coalesce_p2p(self.exec_order)
         self._inject_local_pp_swap_actions()
+
+    def _init_p2p_multi_stream_groups(self) -> None:
+        """Create adjacent two-rank groups for multi-stream P2P transport."""
+        first_stage = self.stages[0]
+        mesh = getattr(first_stage, "mesh", None)
+        pp_rank_list = (
+            list(mesh.rank_list)
+            if mesh is not None
+            else platform.get_process_group_ranks(first_stage.pp_group)
+        )
+        self._p2p_multi_stream_groups = platform.create_p2p_multi_stream_groups(
+            pp_rank_list,
+            include_wrap=self.n_local_stages > 1,
+        )
+
+    def _p2p_op(self, op_type, tensor, peer):
+        """Build a P2P descriptor, selecting the multi-stream group when enabled."""
+        group = self._batch_p2p_group
+        if self._p2p_mode == "multi_stream":
+            group = self._p2p_multi_stream_groups.get(peer)
+            if group is None:
+                raise RuntimeError(
+                    f"No P2P multi-stream group was created for peer global rank {peer}. "
+                    f"Available peers are {sorted(self._p2p_multi_stream_groups)}."
+                )
+        return platform.p2p_op(op_type, tensor, peer, group=group)
 
     def convert_stages_dict(self):
         """convert stages to dict."""
@@ -758,6 +834,15 @@ class PipelineScheduleRuntime(ABC):
         platform.prepare_batch_p2p_group(self._batch_p2p_group)
         self._batch_p2p_group_initialized = True
 
+    def _ensure_p2p_multi_stream_groups_initialized(self) -> None:
+        """Prepare multi-stream edge groups in their stable creation order."""
+        if (getattr(self, "_p2p_mode", None) != "multi_stream"
+                or getattr(self, "_p2p_multi_stream_groups_initialized", False)):
+            return
+        for group in self._p2p_multi_stream_groups.values():
+            platform.prepare_batch_p2p_group(group)
+        self._p2p_multi_stream_groups_initialized = True
+
     def _drain_inflight_p2p(self):
         """Wait every P2P handle still in flight — error-path cleanup.
 
@@ -789,10 +874,7 @@ class PipelineScheduleRuntime(ABC):
         """
         if not specs:
             return []
-        ops = [
-            platform.p2p_op(op_type, tensor, peer, group=self._batch_p2p_group)
-            for op_type, tensor, peer in specs
-        ]
+        ops = [self._p2p_op(op_type, tensor, peer) for op_type, tensor, peer in specs]
         handle = platform.batch_isend_irecv(ops)
         return [handle] if handle is not None else []
 
@@ -956,10 +1038,7 @@ class PipelineScheduleRuntime(ABC):
             by_peer.setdefault(item[2], []).append(item)
 
         for items in by_peer.values():
-            ops = [
-                platform.p2p_op(op_type, tensor, peer, group=self._batch_p2p_group)
-                for op_type, tensor, peer, _ in items
-            ]
+            ops = [self._p2p_op(op_type, tensor, peer) for op_type, tensor, peer, _ in items]
             handle = platform.batch_isend_irecv(ops)
             if handle is None:
                 continue
@@ -1188,7 +1267,9 @@ class PipelineScheduleRuntime(ABC):
         (handy when diagnosing deadlocks or callback ordering issues).
         """
         self._ensure_batch_p2p_group_initialized()
+        self._ensure_p2p_multi_stream_groups_initialized()
         real_stage_index = self.stages[0].stage_index % self.real_stage_num
+        self._prepare_fsdp_backward()
         self._send_handles = []
         self._boundary_issued = set()
         self._pending_boundary = {}

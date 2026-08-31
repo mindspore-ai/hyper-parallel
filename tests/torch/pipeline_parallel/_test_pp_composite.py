@@ -254,7 +254,9 @@ def _assert_grad_parity(
             )
 
 
-def _assert_pp_hsdp_vpp_matches_reference(case_name: str) -> None:
+def _assert_pp_hsdp_vpp_matches_reference(
+    case_name: str, enable_dxdw_split: bool = False,
+) -> None:
     """Drive PP + HSDP + Interleaved 1F1B and assert loss + grad parity vs single-card."""
     rank, device_id = init_dist()
     world_size = dist.get_world_size()
@@ -296,7 +298,12 @@ def _assert_pp_hsdp_vpp_matches_reference(case_name: str) -> None:
     stages, pipeline_stages, stage_param_map = _build_stages(
         base_layers, pp_rank, pp_mesh, hsdp_mesh, device
     )
-    schedule = ScheduleInterleaved1F1B(pipeline_stages, _NUM_MICROBATCHES)
+    schedule = ScheduleInterleaved1F1B(
+        pipeline_stages,
+        _NUM_MICROBATCHES,
+        overlap_b_f=enable_dxdw_split,
+        enable_dxdw_split=enable_dxdw_split,
+    )
     stage_optimizers = [optim.SGD(stage.parameters(), lr=_LR) for stage in stages]
 
     ref_layers = nn.ModuleList(copy.deepcopy(layer) for layer in base_layers).to(device=device)
@@ -371,3 +378,11 @@ def test_pp_hsdp_vpp_interleaved_1f1b_matches_reference() -> None:
         ``rtol=2e-3`` / ``atol=1e-3``.
     """
     _assert_pp_hsdp_vpp_matches_reference("pp_hsdp_vpp_interleaved_1f1b")
+
+
+def test_pp_hsdp_vpp_dxdw_split_matches_reference() -> None:
+    """Torch PP+HSDP split backward should match the full-model reference."""
+    _assert_pp_hsdp_vpp_matches_reference(
+        "pp_hsdp_vpp_dxdw_split",
+        enable_dxdw_split=True,
+    )
