@@ -161,6 +161,25 @@ class TestModuleFunctions(unittest.TestCase):
             self.assertEqual(len(result), 1)
             self.assertIn(t.untyped_storage().data_ptr(), result)
 
+    def test_collect_device_storage_ptrs_unwraps_dtensor(self):
+        """Test storage collection reads the local shard of a DTensor-like object."""
+        local_tensor = torch.empty(3, device="meta")
+
+        class FakeDTensor:
+            """Minimal DTensor-like wrapper whose storage is only available locally."""
+
+            @staticmethod
+            def to_local() -> torch.Tensor:
+                """Return the local tensor shard."""
+                return local_tensor
+
+        with _swap_plat_patch() as mp, patch.object(swap_module, "DTensor", FakeDTensor):
+            mp.Tensor = torch.Tensor
+            mp.tree_map = _build_mock_platform().tree_map
+            result = _collect_device_storage_ptrs(FakeDTensor())
+
+        self.assertEqual(result, {local_tensor.untyped_storage().data_ptr()})
+
     def test_collect_device_storage_ptrs_nested(self):
         """Test _collect_device_storage_ptrs traverses nested structures."""
         with _swap_plat_patch() as mp:
