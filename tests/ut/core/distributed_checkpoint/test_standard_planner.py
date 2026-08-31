@@ -101,7 +101,8 @@ class TestStandardPlanner(unittest.TestCase):
         """
         Feature: StandardSavePlanner.build_global_plan.
         Description: Merge two local plans writing distinct tensor FQNs.
-        Expectation: Metadata lists both tensors; chunk indices are assigned per FQN.
+        Expectation: Metadata lists both tensors; only this rank's plan is returned, with chunk
+            indices assigned per FQN.
         """
         chunk = ChunkStorageMetadata(offsets=(0, 0), sizes=(2, 2))
         props = TensorProperties(dtype="float32")
@@ -121,8 +122,11 @@ class TestStandardPlanner(unittest.TestCase):
         ]
         planner = StandardSavePlanner(enable_plan_caching=False, remove_redundancy=False)
         planner.configure_planner({"w": torch.zeros(2, 2), "b": torch.zeros(2, 2)}, use_collectives=False)
-        global_plans, metadata = planner.build_global_plan(local_plans)
-        self.assertEqual(len(global_plans), 2)
+        planner.rank = 1
+        own_plan, metadata = planner.build_global_plan(local_plans)
+        # Only rank 1's plan comes back, and it carries the item rank 1 contributed.
+        self.assertEqual([item.index.fqn for item in own_plan.items], ["b"])
+        self.assertEqual(own_plan.items[0].index.index, 0)
         self.assertIn("w", metadata.state_dict_metadata)
         self.assertIn("b", metadata.state_dict_metadata)
         w_md = metadata.state_dict_metadata["w"]

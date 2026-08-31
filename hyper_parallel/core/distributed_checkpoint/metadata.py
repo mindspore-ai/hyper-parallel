@@ -24,14 +24,22 @@ class MetadataIndex:
     """
     Index to identify a specific piece of data in the checkpoint.
 
+    ``index`` is a positional hint into the chunk list, not part of the identity: a chunk is
+    identified by its ``fqn`` and ``offset``, and the same chunk is described with ``index=None``
+    while plans are being deduplicated and with its ordinal afterwards. Keeping it out of
+    ``__eq__``/``__hash__`` (as torch's MetadataIndex does) makes those two spellings compare
+    equal, and drops the field from every hash computed over the millions of indices a global
+    plan builds.
+
     Attributes:
         fqn: Fully qualified name of the tensor/object.
         offset: Offset in the tensor (for sharded tensors). Default ().
-        index: Index for sharded tensors (None for non-sharded). Default None.
+        index: Index for sharded tensors (None for non-sharded). Not compared or hashed.
+            Default None.
     """
     fqn: str
     offset: tuple = field(default_factory=tuple)
-    index: Optional[int] = None
+    index: Optional[int] = field(default=None, compare=False, hash=False)
 
 
 @dataclass(frozen=True)

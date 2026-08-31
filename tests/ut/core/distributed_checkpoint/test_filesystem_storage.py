@@ -93,8 +93,8 @@ class TestFilesystemStorage(unittest.TestCase):
             save_planner = StandardSavePlanner(enable_plan_caching=False)
             save_planner.configure_planner(save_state, rank=0, use_collectives=False)
             save_plan = save_planner.build_local_plan()
-            global_plans, metadata = save_planner.build_global_plan([save_plan])
-            final_plan = save_planner.finalize_plan(global_plans[0])
+            global_plan, metadata = save_planner.build_global_plan([save_plan])
+            final_plan = save_planner.finalize_plan(global_plan)
 
             writer = FileSystemWriter(ckpt_dir)
             writer.configure_writer(is_coordinator=True, rank=0, use_collectives=False)
@@ -181,10 +181,10 @@ class TestFilesystemStorage(unittest.TestCase):
                     {"weight": source}, rank=0, use_collectives=False
                 )
                 save_plan = save_planner.build_local_plan()
-                global_plans, metadata = save_planner.build_global_plan([save_plan])
+                global_plan, metadata = save_planner.build_global_plan([save_plan])
                 writer = FileSystemWriter(ckpt_dir)
                 writer.configure_writer(is_coordinator=True, rank=0, use_collectives=False)
-                results = writer.execute_write(global_plans[0], save_planner)
+                results = writer.execute_write(global_plan, save_planner)
                 writer.finalize_checkpoint(metadata, [results])
 
                 target = DTensor.from_local(

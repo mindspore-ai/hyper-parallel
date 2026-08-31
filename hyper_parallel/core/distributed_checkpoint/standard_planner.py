@@ -17,6 +17,7 @@
 
 from dataclasses import dataclass
 import dataclasses
+from itertools import compress
 import pickle
 from typing import Any, Optional, Union
 
@@ -50,7 +51,7 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     narrow_tensor_by_index,
     chunk_to_area,
     create_chunk_list_for_tensor,
-    remove_redundant_plans,
+    plan_ownership_masks,
     infer_same_shard_ranks_for_dtensor,
     flatten_state_dict,
     set_element,
@@ -250,75 +251,75 @@ class StandardSavePlanner(SavePlanner):
                 )
                 items.append(write_item)
 
-        plan = SavePlan(items=items)
-        if self.flatten_state_dict:
-            plan.planner_data = self.name_mapping
-        return plan
+        return SavePlan(
+            items=items,
+            planner_data=self.name_mapping if self.flatten_state_dict else None,
+        )
 
     @dcp_timer_decorator
-    def build_global_plan(self, all_plans: list[SavePlan]) -> tuple[list[SavePlan], Metadata]:
+    def build_global_plan(self, all_plans: list[SavePlan]) -> tuple[SavePlan, Metadata]:
         """
-        Build global plan from all local plans.
+        Build this rank's final save plan and the global checkpoint metadata.
 
-        Collects chunks from all ranks, validates consistency, and creates metadata for the checkpoint.
+        Every rank receives all local plans from the gather and runs this itself, and each one
+        goes on to write only its own shards, so only this rank's plan is rebuilt here. The other
+        ranks' items are still walked -- the metadata is global, and an item's chunk index is its
+        position in that global chunk list -- but no plan object is built for them.
 
         Args:
-            all_plans (list[SavePlan]): List of local plans from all ranks.
+            all_plans (list[SavePlan]): Local plans from all ranks, indexed by rank.
 
         Returns:
-            tuple[list[SavePlan], Metadata]: Updated plans and checkpoint metadata.
+            tuple[SavePlan, Metadata]: This rank's plan with chunk indices assigned, and the
+                checkpoint metadata describing every rank's chunks.
+
+        Raises:
+            ValueError: If an item has an unsupported type.
         """
-        # Deduplicate plans if redundancy removal is enabled
-        if self.remove_redundancy and len(all_plans) > 1:
-            all_plans = remove_redundant_plans(all_plans, save_to_minimum_rank=self.save_to_minimum_rank)
+        own_index = self._own_plan_index(all_plans)
 
-        # Collect all write items by FQN
-        fqn_to_chunks: dict[str, list[ChunkStorageMetadata]] = {}
-        fqn_to_properties: dict[str, TensorProperties] = {}
-        fqn_to_size: dict[str, tuple] = {}
+        # Redundant items are skipped through a per-plan mask rather than by materialising
+        # deduplicated plans: the loop below walks plan.items anyway.
+        masks = (
+            plan_ownership_masks(all_plans, save_to_minimum_rank=self.save_to_minimum_rank)
+            if self.remove_redundancy and len(all_plans) > 1
+            else None
+        )
+
+        # FQN -> (properties, size, chunks), collecting every rank's chunks in gather order.
+        fqn_info: dict[str, tuple[TensorProperties, tuple, list[ChunkStorageMetadata]]] = {}
         state_dict_metadata: dict[str, Union[TensorStorageMetadata, BytesStorageMetadata]] = {}
+        own_items: list[WriteItem] = []
 
-        final_global_plans: list[SavePlan] = []
-        for plan in all_plans:
-            with_index_items = []
-            for item in plan.items:
+        for plan_index, plan in enumerate(all_plans):
+            is_own_plan = plan_index == own_index
+            items = plan.items if masks is None else compress(plan.items, masks[plan_index])
+            for item in items:
                 if item.type == WriteItemType.TENSOR and item.tensor_data:
-                    fqn = item.index.fqn
-                    chunk = item.tensor_data['chunk']
-                    properties = item.tensor_data['properties']
-                    size = item.tensor_data['size']
-
-                    # Validate consistency across ranks
-                    if fqn in fqn_to_chunks and (fqn_to_properties[fqn] != properties or fqn_to_size[fqn] != size):
-                        raise ValueError(f"The {fqn} in different rank has different properties and size, "
-                                         f"properties: {fqn_to_properties[fqn]} != {properties}, "
-                                         f"size: or {fqn_to_size[fqn]} != {size}.")
-
-                    # Initialize FQN entry if not exists
-                    if fqn not in fqn_to_chunks:
-                        fqn_to_properties[fqn] = properties
-                        fqn_to_size[fqn] = size
-                        fqn_to_chunks[fqn] = []
-
-                    # Append chunk and set index (platform.Tensor has exactly one chunk)
-                    new_index = dataclasses.replace(item.index, index=len(fqn_to_chunks[fqn]))
-                    with_index_item = dataclasses.replace(item, index=new_index)
-                    with_index_items.append(with_index_item)
-                    fqn_to_chunks[fqn].append(chunk)
+                    tensor_data = item.tensor_data
+                    chunks = self._global_chunks_for(
+                        item.index.fqn, tensor_data['properties'], tensor_data['size'], fqn_info)
+                    if is_own_plan:
+                        # Set index (platform.Tensor has exactly one chunk). replace() copies the
+                        # remaining fields by name, so adding a field to either dataclass cannot
+                        # silently drop it here; only this rank's items are rebuilt, so the cost
+                        # is per-rank, not per-cluster.
+                        new_index = dataclasses.replace(item.index, index=len(chunks))
+                        own_items.append(dataclasses.replace(item, index=new_index))
+                    chunks.append(tensor_data['chunk'])
 
                 elif item.type == WriteItemType.BYTE_IO:
-                    with_index_items.append(item)
+                    if is_own_plan:
+                        own_items.append(item)
                     state_dict_metadata[item.index.fqn] = BytesStorageMetadata()
                 else:
                     raise ValueError(f"Unsupported write item type: {item.type}")
 
-            final_global_plans.append(dataclasses.replace(plan, items=with_index_items))
-
         # Create metadata for all tensors
-        for fqn, chunks in fqn_to_chunks.items():
+        for fqn, (properties, size, chunks) in fqn_info.items():
             state_dict_metadata[fqn] = TensorStorageMetadata(
-                properties=fqn_to_properties[fqn],
-                size=fqn_to_size[fqn],
+                properties=properties,
+                size=size,
                 chunks=chunks
             )
 
@@ -328,7 +329,60 @@ class StandardSavePlanner(SavePlanner):
             for p in all_plans:
                 merged_mapping.update(p.planner_data)
             metadata.planner_data = merged_mapping
-        return final_global_plans, metadata
+        return dataclasses.replace(all_plans[own_index], items=own_items), metadata
+
+    def _own_plan_index(self, all_plans: list[SavePlan]) -> int:
+        """
+        Locate this rank's plan in the gathered list.
+
+        Both gather paths return one entry per rank in rank order; without collectives the
+        "gather" is just this rank's own plan in a one element list.
+
+        Args:
+            all_plans (list[SavePlan]): Local plans from all ranks.
+
+        Returns:
+            int: Index of this rank's plan.
+
+        Raises:
+            ValueError: If the gathered list holds no plan for this rank.
+        """
+        own_index = self.rank if len(all_plans) > 1 else 0
+        if not 0 <= own_index < len(all_plans):
+            raise ValueError(
+                f"Rank {self.rank} has no plan of its own among the {len(all_plans)} gathered "
+                "plans; the gathered list must hold one plan per rank, in rank order."
+            )
+        return own_index
+
+    @staticmethod
+    def _global_chunks_for(fqn: str, properties: TensorProperties, size: tuple, fqn_info: dict) -> list:
+        """
+        Return the global chunk list for ``fqn``, registering it on first sight.
+
+        Args:
+            fqn (str): Fully qualified name of the tensor.
+            properties (TensorProperties): Properties this rank reported for it.
+            size (tuple): Global shape this rank reported for it.
+            fqn_info (dict): FQN -> (properties, size, chunks), grown in place.
+
+        Returns:
+            list: The chunk list every rank's chunks for this FQN are appended to.
+
+        Raises:
+            ValueError: If another rank described this FQN with different properties or size.
+        """
+        info = fqn_info.get(fqn)
+        if info is None:
+            chunks = []
+            fqn_info[fqn] = (properties, size, chunks)
+            return chunks
+        known_properties, known_size, chunks = info
+        if known_properties != properties or known_size != size:
+            raise ValueError(f"The {fqn} in different rank has different properties and size, "
+                             f"properties: {known_properties} != {properties}, "
+                             f"size: or {known_size} != {size}.")
+        return chunks
 
     def finalize_plan(self, plan: SavePlan) -> SavePlan:
         """
@@ -602,19 +656,29 @@ class StandardLoadPlanner(LoadPlanner):
                 )
         return LoadPlan(items=requests)
 
-    def build_global_plan(self, all_plans: list[LoadPlan]) -> list[LoadPlan]:
+    def build_global_plan(self, all_plans: list[LoadPlan]) -> LoadPlan:
         """
-        Build global plan from all local plans.
+        Build this rank's final load plan from all local plans.
 
-        For now, returns plans as-is. In a more sophisticated implementation, you might need to coordinate across ranks.
+        Reads need no cross-rank coordination, so this rank's own plan is returned untouched. A
+        more sophisticated implementation would use the other ranks' plans to coordinate here.
 
         Args:
-            all_plans (list[LoadPlan]): List of local plans from all ranks.
+            all_plans (list[LoadPlan]): Local plans from all ranks, indexed by rank.
 
         Returns:
-            list[LoadPlan]: Global plans (currently returns plans as-is).
+            LoadPlan: This rank's load plan.
+
+        Raises:
+            ValueError: If the gathered list holds no plan for this rank.
         """
-        return all_plans
+        own_index = self.rank if len(all_plans) > 1 else 0
+        if not 0 <= own_index < len(all_plans):
+            raise ValueError(
+                f"Rank {self.rank} has no plan of its own among the {len(all_plans)} gathered "
+                "plans; the gathered list must hold one plan per rank, in rank order."
+            )
+        return all_plans[own_index]
 
     def finalize_plan(self, plan: LoadPlan) -> LoadPlan:
         """

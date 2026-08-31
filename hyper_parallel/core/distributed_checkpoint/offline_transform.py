@@ -400,8 +400,8 @@ def full_state_dict_to_dcp_format(
     local_plan = planner.build_local_plan()
     local_data = storage_writer.optimize_local_plan(local_plan)
 
-    all_local_plans, global_metadata = planner.build_global_plan([local_data])
-    central_plan = storage_writer.optimize_global_plan(all_local_plans)[0]
+    central_plan, global_metadata = planner.build_global_plan([local_data])
+    central_plan = storage_writer.optimize_global_plan(central_plan)
 
     final_local_plan = planner.finalize_plan(central_plan)
     all_writes = storage_writer.execute_write(final_local_plan, planner)
@@ -432,10 +432,10 @@ def dcp_to_full_state_dict(src_dir: str | os.PathLike[str]) -> dict[str, Any]:
     local_data = storage_reader.optimize_local_plan(local_plan)
     all_data = [local_data]
 
-    all_local_plans = planner.build_global_plan(all_data)
-    all_results = storage_reader.optimize_global_plan(all_local_plans)
+    central_plan = planner.build_global_plan(all_data)
+    central_plan = storage_reader.optimize_global_plan(central_plan)
 
-    final_local_plan = planner.finalize_plan(all_results[0])
+    final_local_plan = planner.finalize_plan(central_plan)
     storage_reader.execute_read(final_local_plan, planner)
 
     return state_dict

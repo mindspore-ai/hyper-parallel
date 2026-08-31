@@ -314,7 +314,7 @@ class DistributedCheckpointer(CheckpointerBase):
       Always correct.
     * ``False`` --- embedded in the DCP payload. Fewer files, but DCP
       deduplicates entries sharing an FQN across ranks (see
-      ``distributed_checkpoint/util.py::remove_redundant_plans``), so every rank
+      ``distributed_checkpoint/util.py::plan_ownership_masks``), so every rank
       restores whichever rank's copy won. Only valid when the extra state is
       rank-invariant.
 

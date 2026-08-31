@@ -120,17 +120,17 @@ class FileSystemWriter(StorageWriter):
         """
         return plan
 
-    def optimize_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
+    def optimize_global_plan(self, plan: SavePlan) -> SavePlan:
         """
-        Optimize global plan.
+        Optimize this rank's save plan.
 
         Args:
-            plans (list[SavePlan]): List of local plans from all ranks.
+            plan (SavePlan): This rank's save plan, with storage indices assigned.
 
         Returns:
-            list[SavePlan]: Optimized global plans.
+            SavePlan: Optimized save plan.
         """
-        return plans
+        return plan
 
 
     def _serialize_bytes_item(self, item: WriteItem, planner: SavePlanner) -> bytes:
@@ -571,17 +571,17 @@ class FileSystemReader(StorageReader):
         """
         return plan
 
-    def optimize_global_plan(self, plans: list[LoadPlan]) -> list[LoadPlan]:
+    def optimize_global_plan(self, plan: LoadPlan) -> LoadPlan:
         """
-        Optimize global plan.
+        Optimize this rank's load plan.
 
         Args:
-            plans (list[LoadPlan]): List of local plans from all ranks.
+            plan (LoadPlan): This rank's load plan.
 
         Returns:
-            list[LoadPlan]: Optimized global plans.
+            LoadPlan: Optimized load plan.
         """
-        return plans
+        return plan
 
     def _get_storage_path(self, read_item: ReadItem) -> str:
         """
