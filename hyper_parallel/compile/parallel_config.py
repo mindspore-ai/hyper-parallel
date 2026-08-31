@@ -30,7 +30,7 @@ from typing import Optional
 
 @dataclass
 class PassConfig:
-    """Parallel configuration for graph-mode FSDP (+ optional TP) training.
+    """Parallel configuration for graph-mode FSDP (+ optional TP/SP) training.
 
     Attributes:
         enable_overlap: Drive ``AutoOverlapPass`` to move ``wait_tensor`` for
@@ -47,11 +47,13 @@ class PassConfig:
             is a proper sub-group of the world), and ``FSDPPass`` falls back
             to ``world_size`` for the FSDP-only path. Mutating this after
             construction is supported but discouraged — prefer passing the
-            resolved degree at construction time (see ``GraphTextTrainer``).
+            resolved degree at construction time (see ``GraphTrainer``).
         tp_size: Tensor-parallel degree. Informational today (TP collectives
             live inside boundary forwards baked by automodel, not in the
             graph-mode passes); kept so a future TP-aware pass can read it
             without API churn.
+        sequence_parallel: Enable sequence parallel (SP) on the TP axis.
+        loss_parallel: Enable loss parallel (LP) on the TP axis.
 
     Note:
         ``fsdp_enabled`` no longer probes ``torch.distributed``. The
@@ -64,6 +66,8 @@ class PassConfig:
     fsdp_enabled: bool = True
     fsdp_degree: Optional[int] = None
     tp_size: int = 1
+    sequence_parallel: bool = False
+    loss_parallel: bool = False
 
     def __post_init__(self) -> None:
         self.validate()
