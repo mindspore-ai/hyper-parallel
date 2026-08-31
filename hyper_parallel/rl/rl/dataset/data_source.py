@@ -21,6 +21,8 @@ from rl.dataset.contracts import Message, PromptRecord
 
 from hyper_parallel import get_platform
 platform = get_platform()
+# Backward-compatible public constant. PromptDataset applies it only when the
+# caller explicitly passes prompt_instruction, so non-GSM8K tasks stay clean.
 PROMPT_INSTRUCTION = 'Let\'s think step by step and output the final answer after "####".'
 _PROMPT_COLUMN_CANDIDATES = ("prompt", "question", "problem", "input_text")
 _ANSWER_COLUMN_CANDIDATES = ("extra_info", "answer", "solution")
@@ -55,18 +57,25 @@ def _pick_column(
     )
 
 
-def _normalize_prompt(prompt_source: Any, index: int) -> tuple[str, str]:
+def _append_prompt_instruction(prompt: str, prompt_instruction: Optional[str]) -> str:
+    """Append one task-owned instruction without duplicating existing text."""
+    if prompt_instruction is None or prompt_instruction in prompt:
+        return prompt
+    return f"{prompt} {prompt_instruction}"
+
+
+def _normalize_prompt(
+    prompt_source: Any,
+    index: int,
+    prompt_instruction: Optional[str] = None,
+) -> tuple[str, str]:
     """Normalize one raw or structured prompt source."""
     prompt_source = _to_builtin(prompt_source)
     if isinstance(prompt_source, str):
         source_prompt = prompt_source.strip()
         if not source_prompt:
             raise ValueError("Prompt source must not be empty")
-        prompt = (
-            source_prompt
-            if PROMPT_INSTRUCTION in source_prompt
-            else f"{source_prompt} {PROMPT_INSTRUCTION}"
-        )
+        prompt = _append_prompt_instruction(source_prompt, prompt_instruction)
         return source_prompt, prompt
     if isinstance(prompt_source, Sequence) and not isinstance(prompt_source, (str, bytes)):
         messages = list(prompt_source)
@@ -77,7 +86,7 @@ def _normalize_prompt(prompt_source: Any, index: int) -> tuple[str, str]:
         if role != "user" or not isinstance(content, str) or not content.strip():
             raise ValueError("Structured prompt sources must contain one non-empty user message")
         source_prompt = content.strip()
-        return source_prompt, source_prompt
+        return source_prompt, _append_prompt_instruction(source_prompt, prompt_instruction)
     raise ValueError(
         f"Unsupported prompt source type at sample {index}: {type(prompt_source)!r}"
     )
@@ -136,6 +145,7 @@ class PromptDataset:
         prompt_column: Optional[str] = None,
         answer_column: Optional[str] = None,
         max_samples: Optional[int] = None,
+        prompt_instruction: Optional[str] = None,
     ) -> None:
         """Load and validate a tokenized prompt dataset from parquet."""
         path = Path(parquet_path)
@@ -145,6 +155,10 @@ class PromptDataset:
             raise ValueError(
                 f"max_prompt_length must be positive, got {max_prompt_length}"
             )
+        if prompt_instruction is not None:
+            if not isinstance(prompt_instruction, str) or not prompt_instruction.strip():
+                raise ValueError("prompt_instruction must be non-empty text when provided")
+            prompt_instruction = prompt_instruction.strip()
         frame = pd.read_parquet(path)
         if frame.empty:
             raise ValueError(f"Prompt parquet contains no rows: {path}")
@@ -171,6 +185,7 @@ class PromptDataset:
         self._records = frame.to_dict("records")
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
+        self._prompt_instruction = prompt_instruction
 
     def __len__(self) -> int:
         """Return the number of prompt samples."""
@@ -208,7 +223,11 @@ class PromptDataset:
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Return one formatted and tokenized prompt sample."""
         record = self._records[index]
-        source_prompt, prompt = _normalize_prompt(record[self._prompt_column], index)
+        source_prompt, prompt = _normalize_prompt(
+            record[self._prompt_column],
+            index,
+            self._prompt_instruction,
+        )
         answer_source = _select_answer_source(
             record,
             self._answer_column,

@@ -1,0 +1,11 @@
+agentic:
+  module_path: examples.agents.gsm8k.agent
+  environment: gsm8k_tools
+  interaction_mode: multi_turn
+  protocol: json_function_call
+  apply_chat_template: true
+  max_turns: 4
+  max_observation_tokens: 256
+  tool_timeout_seconds: 5.0
+  tool_max_concurrency: 2
+  tool_max_calls_per_turn: 2

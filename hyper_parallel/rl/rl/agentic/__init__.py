@@ -12,25 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Agent episode control flow and environment contracts."""
-from rl.agentic.base import Action, Environment, Observation, Transition
-from rl.agentic.gsm8k import GSM8KEnvironment
-from rl.agentic.program_runner import AgentProgram, ProgramAgentRunner
-from rl.agentic.registry import ENVIRONMENTS
-from rl.agentic.runner import AgentRunner
-from rl.agentic.session import AgentSession
+"""Business-neutral Agentic RL contracts and runtime orchestration."""
+
+from rl.agentic.core.runner import AgentRunner
+from rl.agentic.core.session import AgentSession
+from rl.agentic.core.types import (
+    Action,
+    AgentAction,
+    EpisodeContext,
+    EpisodeResult,
+    InteractionMode,
+    Observation,
+    RewardResult,
+    TerminationReason,
+    ToolCall,
+    ToolResult,
+    Transition,
+    TurnContext,
+    TurnResult,
+)
+from rl.agentic.envs.base import Environment
+from rl.agentic.envs.environment import (
+    ENVIRONMENTS,
+    RewardFunction,
+    ToolEnvironment,
+    load_agentic_module,
+)
+from rl.agentic.core.program_runner import AgentProgram, ProgramAgentRunner
+from rl.agentic.tools import Tool, ToolExecutor, ToolHandler, ToolRegistry
+from rl.agentic.tools.protocol import (
+    INTERACTION_PROTOCOLS,
+    InteractionProtocol,
+    JsonFunctionCallProtocol,
+    OpenAIToolCallProtocol,
+    ParsedAction,
+    ResponseParser,
+    ToolExecutorProtocol,
+)
 from rl.algorithm.reward import compute_rule_reward, extract_answer
+
+
 __all__ = [
     "Action",
-    "AgentRunner",
+    "AgentAction",
     "AgentProgram",
+    "AgentRunner",
     "AgentSession",
     "ENVIRONMENTS",
     "Environment",
-    "GSM8KEnvironment",
+    "EpisodeContext",
+    "EpisodeResult",
+    "INTERACTION_PROTOCOLS",
+    "InteractionMode",
+    "InteractionProtocol",
+    "JsonFunctionCallProtocol",
     "Observation",
+    "OpenAIToolCallProtocol",
+    "ParsedAction",
     "ProgramAgentRunner",
+    "ResponseParser",
+    "RewardFunction",
+    "RewardResult",
+    "TerminationReason",
+    "Tool",
+    "ToolCall",
+    "ToolEnvironment",
+    "ToolExecutor",
+    "ToolExecutorProtocol",
+    "ToolHandler",
+    "ToolRegistry",
+    "ToolResult",
     "Transition",
+    "TurnContext",
+    "TurnResult",
     "compute_rule_reward",
     "extract_answer",
+    "load_agentic_module",
 ]

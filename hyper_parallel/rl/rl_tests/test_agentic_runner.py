@@ -22,9 +22,9 @@ import pytest
 import torch
 
 import rl.trainer as trainer_backend
-from rl.agentic.base import Observation, Transition
-from rl.agentic.registry import ENVIRONMENTS
-from rl.agentic.runner import AgentRunner, _canonical_row_seed
+from rl.agentic.core.types import Observation, Transition
+from rl.agentic.envs.environment import ENVIRONMENTS
+from rl.agentic.core.runner import AgentRunner, _canonical_row_seed
 from rl.dataset.contracts import Message, PromptRecord
 from rl.roles.rollout.base import GenerationResult, GenerationSettings
 from rl.roles.rollout.vllm import _VLLMHTTPClient, VLLMGenerationEngine
@@ -82,7 +82,7 @@ def test_response_mask_includes_either_qwen3_eos_and_excludes_following_tokens()
     runner = AgentRunner(
         engine=object(),
         tokenizer=object(),
-        environment_name="gsm8k",
+        environment_name="gsm8k_tools",
         num_samples=1,
         max_turns=1,
         max_observation_tokens=0,
@@ -122,7 +122,7 @@ def test_response_mask_keeps_engine_valid_tokens_when_eos_is_ignored() -> None:
     runner = AgentRunner(
         engine=object(),
         tokenizer=object(),
-        environment_name="gsm8k",
+        environment_name="gsm8k_tools",
         num_samples=1,
         max_turns=1,
         max_observation_tokens=0,
@@ -205,7 +205,7 @@ def test_vllm_completion_removes_explicit_stops_when_eos_is_ignored() -> None:
     )
 
     assert payload["ignore_eos"] is True
-    assert payload["stop_token_ids"] == []
+    assert not payload["stop_token_ids"]
 
 
 def test_inprocess_vllm_receives_all_qwen3_stop_token_ids(
@@ -216,13 +216,16 @@ def test_inprocess_vllm_receives_all_qwen3_stop_token_ids(
     captured_sampling = {}
 
     class _Client:
+        """Minimal in-process vLLM client test double."""
+
         @staticmethod
         def generate(
-            _prompts: Any,
+            prompts: Any,
             sampling_params: Any,
             use_tqdm: bool,
         ) -> list[Any]:
             """Return one synthetic completion and capture its sampling settings."""
+            del prompts
             captured_sampling["params"] = sampling_params
             captured_sampling["use_tqdm"] = use_tqdm
             completion = SimpleNamespace(token_ids=[151643], logprobs=None)
@@ -264,13 +267,16 @@ def test_inprocess_vllm_receives_explicit_seed_per_prompt(
     captured_sampling = {}
 
     class _Client:
+        """Minimal seeded in-process vLLM client test double."""
+
         @staticmethod
         def generate(
-            _prompts: Any,
+            prompts: Any,
             sampling_params: Any,
             use_tqdm: bool,
         ) -> list[Any]:
             """Capture per-prompt settings and return one completion per prompt."""
+            del prompts
             captured_sampling["params"] = sampling_params
             captured_sampling["use_tqdm"] = use_tqdm
             return [
@@ -305,7 +311,7 @@ def test_rollout_manager_preserves_existing_positional_arguments() -> None:
     manager = RolloutManager(
         object(),
         object(),
-        "gsm8k",
+        "gsm8k_tools",
         1,
         1,
         0,
@@ -377,12 +383,14 @@ def test_agent_runner_preserves_two_turn_eos_mask_and_logprobs(
             self.turn = 0
             self.closed = False
 
-        async def reset(self, _prompt: PromptRecord) -> Observation:
+        async def reset(self, prompt: PromptRecord) -> Observation:
             """Return one initial user token."""
+            del prompt
             return Observation("prompt", torch.tensor([1]), {"role": "user"})
 
-        async def step(self, _action: Any) -> Transition:
+        async def step(self, action: Any) -> Transition:
             """Advance once and terminate after the second generated action."""
+            del action
             self.turn += 1
             return Transition(
                 Observation(
@@ -398,7 +406,9 @@ def test_agent_runner_preserves_two_turn_eos_mask_and_logprobs(
             """Record lifecycle cleanup."""
             self.closed = True
 
-    def build_environment(_prompt: PromptRecord) -> TwoTurnEnvironment:
+    def build_environment(prompt: PromptRecord) -> TwoTurnEnvironment:
+        """Build and retain one environment for lifecycle assertions."""
+        del prompt
         environment = TwoTurnEnvironment()
         environments.append(environment)
         return environment
@@ -432,8 +442,9 @@ def test_agent_runner_preserves_two_turn_eos_mask_and_logprobs(
             )
 
         @staticmethod
-        def synchronize_error(error: Any, _operation: str) -> None:
+        def synchronize_error(error: Any, operation: str) -> None:
             """Re-raise local failures in this single-rank contract test."""
+            del operation
             if error is not None:
                 raise error
 

@@ -6,17 +6,16 @@ model:
   config_overrides: null
 
 consistency:
-  enabled: true
+  enabled: false
 
 data:
-  train_path: /data/gsm8k/train.parquet
-  test_path: /data/gsm8k/test.parquet
+  train_path: /data/hotpotqa/train.parquet
+  test_path: /data/hotpotqa/test.parquet
   prompt_column: prompt
-  answer_column: extra_info
-  prompt_instruction: 'Let''s think step by step and output the final answer after "####".'
+  answer_column: answer
   max_prompt_length: 512
-  max_train_samples: null
-  shuffle: true
+  max_train_samples: 4
+  shuffle: false
   num_workers: 0
   prefetch_factor: null
   pin_memory: true
@@ -24,17 +23,17 @@ data:
 rollout:
   engine: vllm
   num_return_sequences: 4
-  max_new_tokens: 512
+  max_new_tokens: 256
   ignore_eos: false
   temperature: 1.0
   top_p: 1.0
   top_k: 0
-  seed: 20260814
+  seed: 20260829
   vllm:
     deployment: colocated
-    data_parallel_size: 8
+    data_parallel_size: 2
     port: 8100
-    model_implementation: hyper
+    model_implementation: native
     tensor_parallel_size: 1
     weight_sync:
       strategy: full_gather
@@ -43,37 +42,46 @@ rollout:
     dtype: bfloat16
     trust_remote_code: false
     enforce_eager: true
-    batch_invariant: true
-    enable_prefix_caching: true
-    enable_chunked_prefill: true
+    batch_invariant: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
     gpu_memory_utilization: 0.35
     kv_cache_memory_bytes: 2147483648
-    max_model_len: 1024
+    max_model_len: 3072
     block_size: 128
-    max_num_seqs: null
-    max_num_batched_tokens: 2048
+    max_num_seqs: 4
+    max_num_batched_tokens: 3072
     logprobs_mode: raw_logprobs
     startup_timeout: 600
     request_timeout: 600
 
 agentic:
-  module_path: examples.agents.gsm8k.agent
-  environment: gsm8k_tools
-  interaction_mode: single_turn
-  max_turns: 1
-  max_observation_tokens: 0
+  module_path: examples.agents.search_R1.agent
+  environment: search_r1_local
+  interaction_mode: multi_turn
+  protocol: search_r1
+  apply_chat_template: true
+  max_turns: 4
+  max_observation_tokens: 512
+  max_episode_tokens: 3072
+  search_corpus_path: /data/hotpotqa/corpus.jsonl
+  search_top_k: 2
+  search_max_document_chars: 300
+  tool_timeout_seconds: 5.0
+  tool_max_concurrency: 4
+  tool_max_calls_per_turn: 4
 
 evaluation:
-  enabled: true
-  batch_size: 16
-  max_samples: 128
-  max_new_tokens: 300
+  enabled: false
+  batch_size: 1
+  max_samples: 1
+  max_new_tokens: 256
   temperature: 1.0
   top_p: 1.0
   top_k: 0
   do_sample: false
-  log_samples: 4
-  progress_steps: 4
+  log_samples: 0
+  progress_steps: 0
 
 algorithm:
   name: grpo
@@ -86,11 +94,11 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
-  max_steps: 30
+  max_steps: 2
   seed: 1234
-  prompt_batch_size: 2
-  micro_batch_size: 2
-  response_mini_batch_size: 8
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 4
   policy_update_epochs: 1
   init_device: meta
   comm_backend: hccl
@@ -101,7 +109,7 @@ train:
     require_fingerprint_change: false
   accelerator:
     dp_replicate: 1
-    dp_shard: 8
+    dp_shard: 2
     tp: 1
     cp: 1
     pp: 1
@@ -124,18 +132,18 @@ train:
     betas: [0.9, 0.999]
     foreach: null
   checkpoint:
-    output_dir: /results/qwen3_4b_gsm8k_vllm_production/checkpoints
-    save_steps: 250
+    output_dir: /results/checkpoints
+    save_steps: 0
     save_final: true
-    verify_reload: true
+    verify_reload: false
 
 logging:
-  backends: [console, wandb]
+  backends: [console]
   project_name: hyper-rl
-  experiment_name: qwen3_4b_gsm8k_vllm_production
+  experiment_name: qwen3_4b_search_r1_multi_turn_two_step
   log_steps: 1
   log_samples: 2
   wandb:
-    mode: online
+    mode: disabled
     entity: null
-    directory: /results/qwen3_4b_gsm8k_vllm_production/wandb
+    directory: /results/wandb

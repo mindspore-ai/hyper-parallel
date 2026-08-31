@@ -41,6 +41,9 @@ class RolloutManager:
         seed: Optional[int] = None,
         eos_token_ids: Sequence[int] = (),
         ignore_eos: bool = False,
+        max_episode_tokens: Optional[int] = None,
+        environment_settings: Optional[dict[str, Any]] = None,
+        interaction_mode: Optional[str] = None,
     ) -> None:
         """Initialize rollout orchestration and generation settings."""
         settings = GenerationSettings(
@@ -64,6 +67,9 @@ class RolloutManager:
             max_turns=max_turns,
             max_observation_tokens=max_observation_tokens,
             settings=settings,
+            max_episode_tokens=max_episode_tokens,
+            environment_settings=environment_settings,
+            interaction_mode=interaction_mode,
         )
 
     def generate(
