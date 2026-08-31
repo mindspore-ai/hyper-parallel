@@ -10,8 +10,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 
 ## Scoped Instructions
 
-- Before reading, analyzing, modifying, testing, or running experiments for anything under `hyper_parallel/rl/**`, read
-  `hyper_parallel/rl/AGENTS.md` completely and apply it together with this repository-level file.
+- For anything under `hyper_parallel/rl/**`, read `.agent/rules/hyper-rl-workflow.md` completely (auto-applied via `paths:`) and apply it together with this repository-level file.
 
 ---
 
@@ -134,6 +133,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **dist-op-analysis** | Operator analysis → plan (human confirm) | called before dist-op-dev |
 | **dist-op-dev** | Implement + test from confirmed plan | `/dist-op-dev` |
 | **platform-dev** | Platform APIs, FSDP/HSDP/PP, DTensorBase, collectives | `/skill platform-dev` |
+| **hyper-rl-dev** | Implement Hyper-RL from approved design → CPU gate + NPU smoke | `/skill hyper-rl-dev` (design-first: rule `hyper-rl-workflow`) |
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
@@ -176,4 +176,5 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **multi-platform-features** | `core/**`, `platform/**` — multi-backend / list APIs |
 | **testing** | `tests/**` |
 | **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
+| **hyper-rl-workflow** | `hyper_parallel/rl/**` — RL context + design-first constraints; process → skill `hyper-rl-dev` |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |
