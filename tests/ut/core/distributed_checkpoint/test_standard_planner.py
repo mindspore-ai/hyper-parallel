@@ -235,13 +235,7 @@ class TestStandardPlanner(unittest.TestCase):
         planner.configure_planner({"weight": target}, metadata, rank=0)
         global_tensor = torch.arange(192).reshape(6, 4, 8)
 
-        # The rank lookup happens on the shared ``platform`` object imported from
-        # util, so patch the method on it rather than a module-level getter.
-        with patch(
-                "hyper_parallel.core.distributed_checkpoint.util.platform.get_rank",
-                return_value=0,
-        ):
-            read_items = planner.build_local_plan().items
+        read_items = planner.build_local_plan().items
 
         for item in read_items:
             storage_chunk = saved_chunks[item.storage_index.index]
