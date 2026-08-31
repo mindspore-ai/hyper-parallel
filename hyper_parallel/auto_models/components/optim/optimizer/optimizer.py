@@ -14,10 +14,11 @@
 # ============================================================================
 """YAML-targeted optimizer implementations."""
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
 import logging
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from torch import nn
+from torch import nn  # pylint: disable=forbidden-backend-import
+
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 
 logger = logging.getLogger(__name__)
@@ -59,11 +60,9 @@ class AdamW:
         """Initialize AdamW optimizer configuration.
 
         Args:
-            lr: Learning rate.
-            weight_decay: Weight decay for decay parameter groups.
-            betas: AdamW coefficient pair.
-            eps: AdamW numerical-stability term.
-            foreach: Whether to use the foreach implementation.
+            adamw_config: AdamW hyperparameters resolved from YAML.
+            model: Module whose trainable parameters are optimized.
+            no_decay_params: Optional names excluded from weight decay.
         """
         self.config = adamw_config
         self.model = model
@@ -91,18 +90,20 @@ class AdamW:
             param_groups: Optional[Sequence[Dict[str, Any]]] = None,
             allowed_param_ids: Optional[Sequence[int]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
-        """
-        Extracts model parameters and splits them into decaying and non-decaying groups.
-        It also injects metadata attributes ('model_name' and 'is_muon') into each parameter.
+        """Split model parameters into decaying and non-decaying groups.
+
+        The method also adds ``model_name`` optimizer metadata to each selected
+        parameter.
 
         Args:
-            model: The PyTorch module to extract parameters from.
-            weight_decay: The default weight decay coefficient for trainable parameters.
-            no_decay_params: Specific parameter name keywords to exclude from weight decay (e.g., ['bias']).
+            model: Module whose trainable parameters are routed.
+            weight_decay: Default decay coefficient for trainable parameters.
+            no_decay_params: Name keywords excluded from weight decay.
+            param_groups: Optional prebuilt groups to return unchanged.
+            allowed_param_ids: Optional parameter identities eligible for routing.
 
         Returns:
-            param_groups: A list of parameter groups compatible with PyTorch optimizers.
-            adamw_names: A list of all parameter names targeted for AdamW.
+            Parameter groups and names routed to AdamW.
         """
         adamw_names = []
         no_decay_keywords = ("bias", "norm", "ln_") if no_decay_params is None else no_decay_params
@@ -157,7 +158,15 @@ class Muon:
             extra_adamw_name_keywords: Optional[List[str]] = None,
             no_decay_params: Optional[List[str]] = None,
     ) -> None:
-        """Build a mixed Muon and fallback AdamW runtime for ``model``."""
+        """Build a mixed Muon and fallback AdamW runtime for ``model``.
+
+        Args:
+            muon_config: Muon hyperparameters resolved from YAML.
+            adamw_config: Fallback AdamW hyperparameters resolved from YAML.
+            model: Module whose trainable parameters are optimized.
+            extra_adamw_name_keywords: Additional names routed to AdamW.
+            no_decay_params: Optional names excluded from weight decay.
+        """
         self.muon_config = muon_config
         self.adamw_config = adamw_config
         self.model = model
@@ -197,7 +206,15 @@ class Muon:
             model: nn.Module,
             extra_adamw_name_keywords: Sequence[str] = (),
     ) -> Tuple[List[nn.Parameter], List[nn.Parameter], List[str], List[str]]:
-        """Route matrix parameters to Muon and the remaining parameters to AdamW."""
+        """Route matrix parameters to Muon and remaining parameters to AdamW.
+
+        Args:
+            model: Module whose trainable parameters are routed.
+            extra_adamw_name_keywords: Additional names reserved for AdamW.
+
+        Returns:
+            Muon parameters, AdamW parameters, and their respective names.
+        """
         adamw_keywords = tuple(
             keyword.lower()
             for keyword in (

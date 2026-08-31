@@ -12,19 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Optimizer and learning-rate scheduler interfaces for AutoModels."""
+"""Launch the eight-card dual-mode Trainer FSDP accuracy worker."""
 
-from .lr_scheduler.lr_scheduler import MultiLRScheduler
-from .optimizer.optimizer import AdamW, Muon
-from .optimizer.mixed_precision_optimizer import (
-    Float16OptimizerWithFloat16Params,
-    MixedPrecisionOptimizer,
+from pathlib import Path
+
+from tests.common.distributed_launcher import torchrun_case
+from tests.common.mark_utils import arg_mark
+
+
+_WORKER = str(Path(__file__).resolve().parent / "_test_fsdp_accuracy.py")
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
 )
-
-__all__ = [
-    "AdamW",
-    "Float16OptimizerWithFloat16Params",
-    "MixedPrecisionOptimizer",
-    "Muon",
-    "MultiLRScheduler",
-]
+def test_qwen2_tp_cp_ep_fsdp_global_accuracy() -> None:
+    """Compare Qwen2-MoE fp32 main_param training on DP(2)+CP(2)+TP(2)+EP(8)."""
+    torchrun_case(
+        _WORKER,
+        "test_qwen2_tp_cp_ep_fsdp_global_accuracy",
+        num_proc=8,
+    )

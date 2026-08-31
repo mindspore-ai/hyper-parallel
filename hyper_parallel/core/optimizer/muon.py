@@ -22,8 +22,8 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import torch
-import torch.distributed as dist
+import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
@@ -156,11 +156,11 @@ class Muon(BaseDistributedOptimizer):
 
     def __init__(
             self,
-            params,
+            params: Any,
             lr: float = 2e-2,
             weight_decay: float = 0.1,
             matched_adamw_rms: float = 0.2,
-            momentum: float = 0.95,
+            momentum: Union[float, List[float], Tuple[float, ...]] = 0.95,
             nesterov: bool = True,
             ns_steps: int = 5,
             ns_variant: str = "asym5",
@@ -174,7 +174,29 @@ class Muon(BaseDistributedOptimizer):
             zero_rms_scale_mode: str = "zero",
             apply_lr_in_update: bool = False,
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
-    ):
+    ) -> None:
+        """Initialize Muon and build parameter-identity runtime caches.
+
+        Args:
+            params: Parameters or parameter groups optimized by Muon.
+            lr: Learning rate.
+            weight_decay: Decoupled weight-decay coefficient.
+            matched_adamw_rms: RMS scale matched to an AdamW update.
+            momentum: Momentum coefficient or coefficient pair.
+            nesterov: Whether to use Nesterov momentum.
+            ns_steps: Newton-Schulz iteration count.
+            ns_variant: Newton-Schulz coefficient variant.
+            ns_coefficients: Optional custom Newton-Schulz coefficients.
+            ns_epsilon: Numerical stability term used during normalization.
+            zeropower_fn: Optional Newton-Schulz implementation override.
+            momentum_update_fn: Optional momentum update implementation override.
+            reshape_fn: Optional logical-matrix reshape function.
+            ns_transform_fn: Optional Newton-Schulz input transformation.
+            post_update_fn: Optional callback applied after a parameter update.
+            zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
+            apply_lr_in_update: Whether the update callback applies the learning rate.
+            hsdp_replica_count: Optional optimizer-state replica group size.
+        """
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
@@ -210,7 +232,10 @@ class Muon(BaseDistributedOptimizer):
         self.momentum_update_fn = momentum_update_fn
         self.ns_transform_fn = ns_transform_fn
         self.post_update_fn = post_update_fn
+        self.reset_optimizer_parameters()
 
+    def reset_optimizer_parameters(self) -> None:
+        """Rebuild all parameter-identity caches from current param groups."""
         self._group_dtensor_by_mesh()
         self._build_param_shard_metadata()
         deduced_count = self._auto_deduce_replica_count()
@@ -253,18 +278,28 @@ class Muon(BaseDistributedOptimizer):
             normalized.append(normalized_coefficients)
         return tuple(normalized)
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """Return the optimizer representation."""
         return super().__repr__()
 
     __repr__ = __str__
 
     @torch.no_grad()
-    def step(self, closure=None) -> Optional[float]:
-        """
-        Perform a single optimization step.
+    def step(
+            self,
+            closure: Optional[Callable[[], Any]] = None,
+    ) -> Optional[float]:
+        """Perform a single optimization step.
+
         De-duplication is controlled by the caller: ``param_to_ns_input`` should already contain only the owned
         params (via ``hsdp_assign.owned_params``). The caller is responsible for broadcasting the updated params to
         replica peers via ``AsyncReplicateBroadcaster.flush_group``.
+
+        Args:
+            closure: Optional callable that reevaluates the model and returns loss.
+
+        Returns:
+            The closure loss when provided, otherwise ``None``.
         """
         loss = None
         if closure is not None:

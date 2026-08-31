@@ -140,7 +140,11 @@ def instantiate_infrastructure(
     mesh = distributed_setup.mesh_context if distributed_setup is not None else None
     strategy_cfg = distributed_setup.strategy_config if distributed_setup is not None else None
     if strategy_cfg is not None:
-        fsdp2_manager = _instantiate_fsdp2(config=strategy_cfg, mesh_context=mesh)
+        fsdp2_manager = _instantiate_fsdp2(
+            config=strategy_cfg,
+            mesh_context=mesh,
+            fp32_main_params=distributed_setup.fp32_main_params,
+        )
 
     if fsdp2_manager is None:
         logger.info("FSDP2Manager: no strategy_config provided; skipping FSDP2 wrap")

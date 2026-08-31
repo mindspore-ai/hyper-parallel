@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,20 +18,23 @@ import os
 import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.auto_models.components.checkpoint import build_checkpointer
 from hyper_parallel.auto_models.components.checkpoint.dcp_checkpointer import (
     STEP_PREFIX,
     initialize_optimizer_state,
 )
+from hyper_parallel.auto_models.components.optim.optimizer.mixed_precision_optimizer import (
+    MixedPrecisionOptimizer,
+)
 from hyper_parallel.auto_models.components.utils import helper
 from hyper_parallel.auto_models.components.utils.device import (
     get_device_rng_state,
     set_device_rng_state,
 )
-
 from .base import Callback, TrainerState
+from ..model_init_dtype import apply_model_init_dtype
 
 
 if TYPE_CHECKING:
@@ -127,7 +130,9 @@ class CheckpointerCallback(Callback):
         )
         self._load_checkpoint()
 
-    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
+    def on_step_end(  # pylint: disable=arguments-differ
+            self, state: TrainerState, **kwargs: Any
+    ) -> None:
         """Save on the configured step cadence."""
         if self._save_steps > 0 and state.global_step % self._save_steps == 0:
             if state.global_step == self._last_saved_step:
@@ -339,16 +344,21 @@ class CheckpointerCallback(Callback):
         self.trainer.model.load_state_dict(
             checkpoint_state["model"], strict=not self._is_peft
         )
+        apply_model_init_dtype(
+            self.trainer.model,
+            self.trainer.config.model_init_dtype,
+        )
         # ``checkpoint_state["optimizer"]`` was built from ``optimizers`` above
-        # (line 320) and DCP only fills that skeleton's existing tensor leaves
-        # in place --- it never adds or removes list entries. So this list is
-        # always exactly as long as ``optimizers``; a checkpoint that actually
-        # carries fewer optimizer entries is reported by
-        # ``_ModelStrictLoadPlanner`` (dcp_checkpointer.py) during
-        # ``self.checkpointer.load()`` above, not by a length comparison here.
+        # and DCP only fills that skeleton's existing tensor leaves in place ---
+        # it never adds or removes list entries. The checkpoint planner reports
+        # missing persisted optimizer entries during ``checkpointer.load()``.
         optimizer_sds = _as_list(checkpoint_state.get("optimizer"))
         for optimizer, optimizer_sd in zip(optimizers, optimizer_sds):
             optimizer.load_state_dict(optimizer_sd)
+        if not optimizers:
+            for optimizer in _as_list(self.trainer.optimizer):
+                if isinstance(optimizer, MixedPrecisionOptimizer):
+                    optimizer.reload_model_params()
 
         if self._restore_train_state:
             self._apply_extra_state(checkpoint_state["extra_state"])

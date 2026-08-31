@@ -15,5 +15,14 @@
 """Optimizer runtime targets."""
 
 from .optimizer import AdamW, Muon
+from .mixed_precision_optimizer import (
+    Float16OptimizerWithFloat16Params,
+    MixedPrecisionOptimizer,
+)
 
-__all__ = ["AdamW", "Muon"]
+__all__ = [
+    "AdamW",
+    "Float16OptimizerWithFloat16Params",
+    "MixedPrecisionOptimizer",
+    "Muon",
+]

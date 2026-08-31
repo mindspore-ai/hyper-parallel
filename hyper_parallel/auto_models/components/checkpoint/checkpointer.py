@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -133,7 +133,8 @@ def _dcp_checkpointer(**kwargs: Any) -> CheckpointerBase:
     """Construct the distributed-checkpoint (DCP) backend."""
     # Imported lazily: dcp_checkpointer imports CheckpointerBase from this
     # module, so a top-level import here would be circular.
-    from hyper_parallel.auto_models.components.checkpoint.dcp_checkpointer import (  # pylint: disable=import-outside-toplevel
+    # pylint: disable=import-outside-toplevel,cyclic-import
+    from hyper_parallel.auto_models.components.checkpoint.dcp_checkpointer import (
         DistributedCheckpointer,
     )
 

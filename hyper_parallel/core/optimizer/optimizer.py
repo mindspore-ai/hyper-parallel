@@ -14,10 +14,12 @@
 # ============================================================================
 
 """Base distributed optimizer and chain optimizer composition."""
+# pylint: disable=forbidden-backend-import
 
 from collections import defaultdict
+from contextlib import contextmanager
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -47,43 +49,104 @@ class ChainedOptimizer:
             self,
             model: torch.nn.Module,
             optimizers: Dict[str, torch.optim.Optimizer],
-            flatten: bool = False
+            flatten: bool = False,
     ) -> None:
+        """Compose named optimizers over registered model parameters.
+
+        Args:
+            model: Module containing the registered model parameters.
+            optimizers: Leaf optimizers keyed by their configured names.
+            flatten: Whether leaf optimizer state uses flattened FQN keys.
+        """
         self.optimizers_dict = optimizers
         self.chained_optimizers = list(optimizers.values())
         self.optimizers_keys = list(optimizers.keys())
         self.model = model
         self.flatten = flatten  # not flatten adamw, flatten for multi-optimizer
         self._is_multi_optimizer = flatten
+        self.model_param_by_optimizer_param: Dict[
+            torch.nn.Parameter, torch.nn.Parameter
+        ] = {}
+        self.optimizer_param_by_model_param: Dict[
+            torch.nn.Parameter, torch.nn.Parameter
+        ] = {}
 
         self._rebind_param_attrs()
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[torch.optim.Optimizer]:
         """Allow iteration over the underlying optimizers."""
         return iter(self.chained_optimizers)
 
     def _rebind_param_attrs(self) -> None:
-        """Restore ``model_name`` and ``is_muon`` on the current parameters."""
+        """Restore model FQNs and optimizer-family name views."""
         muon_param_ids: set = set()
         adamw_param_ids: set = set()
         self.muon_keys = []
         self.no_muon_keys = []
         for _, opt in self.optimizers_dict.items():
-            target = muon_param_ids if getattr(opt, "is_muon", False) else adamw_param_ids
+            is_muon = hasattr(opt, "is_muon") and opt.is_muon
+            target = muon_param_ids if is_muon else adamw_param_ids
             for group in opt.param_groups:
                 for p in group.get("params", []):
                     target.add(id(p))
 
         for param_name, param in self.model.named_parameters():
+            optimizer_param = self.optimizer_param_by_model_param.get(param, param)
             setattr(param, "model_name", param_name)
-            if id(param) in muon_param_ids:
-                setattr(param, "is_muon", True)
+            setattr(optimizer_param, "model_name", param_name)
+            if id(optimizer_param) in muon_param_ids:
                 self.muon_keys.append(param_name)
-            elif id(param) in adamw_param_ids:
-                setattr(param, "is_muon", False)
+            elif id(optimizer_param) in adamw_param_ids:
                 self.no_muon_keys.append(param_name)
 
-    def __str__(self):
+    def reset_optimizer_parameters(
+            self,
+            model_param_by_optimizer_param: Dict[
+                torch.nn.Parameter, torch.nn.Parameter
+            ],
+    ) -> None:
+        """Register replaced optimizer params and rebuild identity-based metadata.
+
+        Args:
+            model_param_by_optimizer_param: Main-to-model parameter identity map.
+        """
+        self.model_param_by_optimizer_param = dict(
+            model_param_by_optimizer_param
+        )
+        self.optimizer_param_by_model_param = {
+            model_param: optimizer_param
+            for optimizer_param, model_param in self.model_param_by_optimizer_param.items()
+        }
+        self._rebind_param_attrs()
+        for optimizer in self.chained_optimizers:
+            if isinstance(optimizer, BaseDistributedOptimizer):
+                optimizer.reset_optimizer_parameters()
+
+    @contextmanager
+    def _optimizer_parameter_view(self) -> Iterator[None]:
+        """Temporarily register optimizer params under their model FQNs."""
+        if not self.model_param_by_optimizer_param:
+            yield
+            return
+
+        registrations = []
+        for module in self.model.modules():
+            for parameter_name, model_param in module._parameters.items():  # pylint: disable=protected-access
+                if model_param is None:
+                    continue
+                optimizer_param = self.optimizer_param_by_model_param.get(model_param)
+                if optimizer_param is None:
+                    continue
+                registrations.append((module, parameter_name, model_param))
+                module._parameters[parameter_name] = optimizer_param  # pylint: disable=protected-access
+        try:
+            yield
+        finally:
+            for module, parameter_name, model_param in registrations:
+                module._parameters[parameter_name] = model_param  # pylint: disable=protected-access
+
+    def __str__(self) -> str:
+        """Return each named leaf optimizer's representation."""
         if not self.optimizers_dict:
             return f'{self.__class__.__name__}'
 
@@ -94,13 +157,21 @@ class ChainedOptimizer:
 
     __repr__ = __str__
 
-    def step(self, closure=None) -> None:
-        """Call each sub-optimizer's step in order."""
+    def step(self, closure: Any = None) -> None:
+        """Call each sub-optimizer's step in order.
+
+        Args:
+            closure: Optional callable forwarded to every sub-optimizer.
+        """
         for opt in self.chained_optimizers:
             opt.step(closure=closure)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
-        """Clear gradients for all sub-optimizers."""
+        """Clear gradients for all sub-optimizers.
+
+        Args:
+            set_to_none: Whether gradients are reset to ``None``.
+        """
         for opt in self.chained_optimizers:
             opt.zero_grad(set_to_none=set_to_none)
 
@@ -121,7 +192,7 @@ class ChainedOptimizer:
 
         In HSDP, optimizer state is only populated on the owner rank for replicated
         parameters. This method first broadcasts state to all replicate-group peers,
-        then converts DTensor values to local CPU tensors so ``torch.save`` works.
+        then converts DTensor values to local CPU tensors for serialization.
         """
         # Ensure all ranks have consistent optimizer state before snapshotting
         for opt in self.chained_optimizers:
@@ -130,11 +201,12 @@ class ChainedOptimizer:
 
         merged: Dict[str, Any] = {}
         for name, optimizer in self.optimizers_dict.items():
-            sd = get_optimizer_state_dict(
-                self.model,
-                optimizer,
-                options=StateDictOptions(flatten_optimizer_state_dict=self.flatten)
-            )
+            with self._optimizer_parameter_view():
+                sd = get_optimizer_state_dict(
+                    self.model,
+                    optimizer,
+                    options=StateDictOptions(flatten_optimizer_state_dict=self.flatten)
+                )
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
                 raise KeyError(
@@ -168,14 +240,19 @@ class ChainedOptimizer:
     param_groups = property(_get_param_groups, _set_param_groups)
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Load optimizer state dicts and synchronize steps."""
+        """Load optimizer state dicts and synchronize steps.
+
+        Args:
+            state_dict: FQN-keyed optimizer state to restore.
+        """
         for optimizer in self.chained_optimizers:
-            set_optimizer_state_dict(
-                self.model,
-                optimizer,
-                optim_state_dict=state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=self.flatten),
-            )
+            with self._optimizer_parameter_view():
+                set_optimizer_state_dict(
+                    self.model,
+                    optimizer,
+                    optim_state_dict=state_dict,
+                    options=StateDictOptions(flatten_optimizer_state_dict=self.flatten),
+                )
 
         self._synchronize_steps()
 
@@ -219,6 +296,14 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             is_muon: bool,
             hsdp_replica_count: Optional[int] = None,
     ) -> None:
+        """Initialize topology-aware optimizer state and parameter groups.
+
+        Args:
+            params: Parameter groups optimized by this instance.
+            defaults: Default hyperparameters applied to every group.
+            is_muon: Whether parameters use the Muon update path.
+            hsdp_replica_count: Optional optimizer-state replica group size.
+        """
         super().__init__(params, defaults)
         self.is_muon = is_muon
         self.hsdp_replica_count = hsdp_replica_count
@@ -235,6 +320,10 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         for group_key, group in enumerate(self.param_groups):
             no_comm_params, hsdp_groups = group_parameters_for_hsdp(group["params"])
             self._hsdp_grouping[group_key] = (no_comm_params, hsdp_groups)
+
+    def reset_optimizer_parameters(self) -> None:
+        """Rebuild subclass metadata after optimizer parameters are replaced."""
+        raise NotImplementedError
 
     def _auto_deduce_replica_count(self) -> Optional[int]:
         """Deduce hsdp_replica_count based on cluster topology.
@@ -855,6 +944,11 @@ class AsyncReplicateBroadcaster:
             self,
             optimizer: BaseDistributedOptimizer,
     ) -> None:
+        """Bind the distributed optimizer whose broadcasts are batched.
+
+        Args:
+            optimizer: Distributed optimizer owning the replica assignments.
+        """
         self._optimizer = optimizer
 
         # Inflight async broadcasts: list of (buffer, batch_offsets, handles)

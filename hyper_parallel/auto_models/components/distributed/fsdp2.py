@@ -62,15 +62,86 @@ def _is_expert_source_mesh(mesh: DeviceMesh | None) -> bool:
 class FSDP2Manager:
     """Configure and apply nested FSDP2 wrapping for a dual-mode model."""
 
-    def __init__(self, config: FSDP2Config, mesh_context: MeshContext) -> None:
+    def __init__(
+        self,
+        config: FSDP2Config,
+        mesh_context: MeshContext,
+        fp32_main_params: bool = False,
+    ) -> None:
         """Initialize the manager from resolved YAML config and runtime mesh.
 
         Args:
             config: Resolved top-level ``fsdp_config``.
             mesh_context: Runtime topology containing the shared world mesh.
+            fp32_main_params: Whether FSDP writes reduced gradients to
+                ``main_grad`` for the fp32 main-parameter optimizer wrapper.
         """
         self.config = config
         self.mesh_context = mesh_context
+        self.fp32_main_params = fp32_main_params
+
+    def _build_dtensor_source_shard_info(
+        self,
+        model: ModuleClass,
+    ) -> SourceShardInfoByParam | None:
+        """Build source metadata from DTensor parameters when TP is active."""
+        if self.mesh_context.tp_size <= 1:
+            return None
+
+        parameters = list(model.parameters())
+        if not parameters or not all(
+            isinstance(parameter, DTensor) for parameter in parameters
+        ):
+            raise ValueError(
+                "TP is enabled but source_shard_info is missing and "
+                "not all model parameters are DTensors"
+            )
+        return {
+            parameter: fully_shard_utils.SourceShardMetaInfo(  # pylint: disable=no-member
+                mesh=parameter.device_mesh,
+                placements=tuple(parameter.placements),
+                origin_is_dtensor=True,
+            )
+            for parameter in parameters
+        }
+
+    @staticmethod
+    def _build_parameter_source_shard_info(
+        parameter_fqn: str,
+        placements: tuple[Placement, ...],
+        source_mesh: DeviceMesh,
+    ) -> fully_shard_utils.SourceShardMetaInfo:
+        """Validate and build source metadata for one model parameter."""
+        if any(isinstance(placement, Partial) for placement in placements):
+            raise ValueError(
+                "source_shard_info does not support Partial placement: "
+                f"{parameter_fqn}"
+            )
+        return fully_shard_utils.SourceShardMetaInfo(  # pylint: disable=no-member
+            mesh=source_mesh,
+            placements=tuple(placements),
+            origin_is_dtensor=False,
+        )
+
+    @staticmethod
+    def _record_parameter_source_shard_info(
+        metadata_by_parameter: SourceShardInfoByParam,
+        parameter: ParameterClass,
+        parameter_fqn: str,
+        parameter_source_shard_info: fully_shard_utils.SourceShardMetaInfo,
+    ) -> None:
+        """Record one layout while rejecting conflicting tied aliases."""
+        previous_source_shard_info = metadata_by_parameter.get(parameter)
+        if previous_source_shard_info is not None and (
+            previous_source_shard_info.mesh is not parameter_source_shard_info.mesh
+            or previous_source_shard_info.placements
+            != parameter_source_shard_info.placements
+        ):
+            raise ValueError(
+                "Tied parameter aliases have conflicting source layouts; "
+                f"conflict found at {parameter_fqn}"
+            )
+        metadata_by_parameter[parameter] = parameter_source_shard_info
 
     def _build_source_shard_info_by_param(
         self,
@@ -99,24 +170,7 @@ class FSDP2Manager:
                 contains ``Partial``, or gives tied aliases conflicting layouts.
         """
         if source_shard_info is None:
-            if self.mesh_context.tp_size > 1:
-                parameters = list(model.parameters())
-                if not parameters or not all(
-                    isinstance(parameter, DTensor) for parameter in parameters
-                ):
-                    raise ValueError(
-                        "TP is enabled but source_shard_info is missing and "
-                        "not all model parameters are DTensors"
-                    )
-                return {
-                    parameter: fully_shard_utils.SourceShardMetaInfo(  # pylint: disable=no-member
-                        mesh=parameter.device_mesh,
-                        placements=tuple(parameter.placements),
-                        origin_is_dtensor=True,
-                    )
-                    for parameter in parameters
-                }
-            return None
+            return self._build_dtensor_source_shard_info(model)
         if self.mesh_context.tp_size > 1 and not source_shard_info:
             raise ValueError("TP is enabled but source_shard_info is empty")
 
@@ -128,26 +182,17 @@ class FSDP2Manager:
                 raise ValueError(
                     f"source_shard_info contains unknown parameter FQN: {parameter_fqn}"
                 )
-            if any(isinstance(placement, Partial) for placement in placements):
-                raise ValueError(
-                    f"source_shard_info does not support Partial placement: {parameter_fqn}"
-                )
-
-            source_shard_info = fully_shard_utils.SourceShardMetaInfo(  # pylint: disable=no-member
-                mesh=source_mesh,
-                placements=tuple(placements),
-                origin_is_dtensor=False,
+            parameter_source_shard_info = self._build_parameter_source_shard_info(
+                parameter_fqn,
+                placements,
+                source_mesh,
             )
-            previous_source_shard_info = metadata_by_parameter.get(parameter)
-            if previous_source_shard_info is not None and (
-                previous_source_shard_info.mesh is not source_shard_info.mesh
-                or previous_source_shard_info.placements != source_shard_info.placements
-            ):
-                raise ValueError(
-                    "Tied parameter aliases have conflicting source layouts; "
-                    f"conflict found at {parameter_fqn}"
-                )
-            metadata_by_parameter[parameter] = source_shard_info
+            self._record_parameter_source_shard_info(
+                metadata_by_parameter,
+                parameter,
+                parameter_fqn,
+                parameter_source_shard_info,
+            )
         return metadata_by_parameter
 
     def _resolve_replicate_params(
@@ -170,24 +215,26 @@ class FSDP2Manager:
             replicate_params.add(parameter)
         return replicate_params
 
-    def _build_fsdp_actual_mesh(self, expert: bool = False) -> DeviceMesh:
-        """Select the prebuilt dense or expert FSDP child mesh."""
-        if expert and self.mesh_context.fsdp_moe_mesh is None:
+    def _build_expert_fsdp_mesh(self) -> DeviceMesh:
+        """Select the expert FSDP child mesh."""
+        expert_mesh = self.mesh_context.fsdp_moe_mesh
+        if expert_mesh is None:
             raise ValueError("Expert FSDP units require MeshContext.fsdp_moe_mesh")
-        if expert:
-            expert_mesh = self.mesh_context.fsdp_moe_mesh
-            if "edp_replicate" in (expert_mesh.mesh_dim_names or ()):
-                return expert_mesh[("edp_replicate", "edp_shard")]
-            return expert_mesh["edp_shard"]
+        if "edp_replicate" in (expert_mesh.mesh_dim_names or ()):
+            return expert_mesh[("edp_replicate", "edp_shard")]
+        return expert_mesh["edp_shard"]
 
-        if not expert and self.mesh_context.fsdp_non_moe_mesh is not None:
-            dense_mesh = self.mesh_context.fsdp_non_moe_mesh
-            if self.mesh_context.dp_replicate_size > 1:
-                return dense_mesh[("fsdp_replicate", "fsdp_shard")]
-            return dense_mesh["fsdp_shard"]
+    def _build_dense_fsdp_mesh(self) -> DeviceMesh | None:
+        """Select the prebuilt dense FSDP child mesh when available."""
+        dense_mesh = self.mesh_context.fsdp_non_moe_mesh
+        if dense_mesh is None:
+            return None
+        if self.mesh_context.dp_replicate_size > 1:
+            return dense_mesh[("fsdp_replicate", "fsdp_shard")]
+        return dense_mesh["fsdp_shard"]
 
-        # Compatibility path for callers that construct a MeshContext around
-        # the old combined world mesh directly.
+    def _build_compatibility_fsdp_mesh(self) -> DeviceMesh:
+        """Build an FSDP mesh from the combined world mesh."""
         world_mesh = self.mesh_context.device_mesh
         if world_mesh is None:
             raise ValueError("FSDP2 requires MeshContext.fsdp_non_moe_mesh")
@@ -208,6 +255,15 @@ class FSDP2Manager:
             return shard_mesh
         return DeviceMesh.concatenate([world_mesh["dp_replicate"], shard_mesh])
 
+    def _build_fsdp_actual_mesh(self, expert: bool = False) -> DeviceMesh:
+        """Select the prebuilt dense or expert FSDP child mesh."""
+        if expert:
+            return self._build_expert_fsdp_mesh()
+        dense_mesh = self._build_dense_fsdp_mesh()
+        if dense_mesh is not None:
+            return dense_mesh
+        return self._build_compatibility_fsdp_mesh()
+
     def _build_mixed_precision_policy(self) -> fully_shard_utils.MixedPrecisionPolicy:
         """Resolve the configured dtype strings to platform dtypes.
 
@@ -216,12 +272,19 @@ class FSDP2Manager:
         explicit param dtype fall back to the framework default.
         """
         mix_precision = self.config.mix_precision
-        dtypes = {
-            name: getattr(platform.tensor_dtype, getattr(mix_precision, name))
-            for name in ("param_dtype", "reduce_dtype", "output_dtype")
-            if getattr(mix_precision, name) is not None
+        dtype_by_name = {
+            None: None,
+            "bfloat16": platform.tensor_dtype.bfloat16,
+            "float16": platform.tensor_dtype.float16,
+            "float32": platform.tensor_dtype.float32,
         }
-        return fully_shard_utils.MixedPrecisionPolicy(**dtypes)
+        return fully_shard_utils.MixedPrecisionPolicy(
+            param_dtype=dtype_by_name[mix_precision.param_dtype],
+            reduce_dtype=dtype_by_name[mix_precision.reduce_dtype],
+            output_dtype=dtype_by_name[mix_precision.output_dtype],
+            cast_forward_inputs=mix_precision.cast_forward_inputs,
+            apply_grad_on_fp32_main_grad=self.fp32_main_params,
+        )
 
     def _build_offload_policy(self) -> fully_shard_utils.OffloadPolicy:
         """Return CPU offload when enabled, otherwise the default no-offload policy."""
@@ -665,10 +728,19 @@ class FSDP2Manager:
         return model
 
 
-def _instantiate_fsdp2(*, config: Any, mesh_context: MeshContext) -> FSDP2Manager | None:
+def _instantiate_fsdp2(
+    *,
+    config: Any,
+    mesh_context: MeshContext,
+    fp32_main_params: bool = False,
+) -> FSDP2Manager | None:
     """Create an FSDP2 manager for the resolved strategy config."""
     if config is None:
         return None
     if isinstance(config, FSDP2Config):
-        return FSDP2Manager(config=config, mesh_context=mesh_context)
+        return FSDP2Manager(
+            config=config,
+            mesh_context=mesh_context,
+            fp32_main_params=fp32_main_params,
+        )
     raise ValueError(f"FSDP2Manager requires FSDP2Config, got {type(config).__name__}")

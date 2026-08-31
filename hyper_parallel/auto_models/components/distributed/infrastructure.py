@@ -297,6 +297,7 @@ class DistributedSetup:
     # TrainingConfig.training.low_precision. Kept on the setup so model
     # construction and sharding consume one resolved policy object.
     low_precision_config: Any = None
+    fp32_main_params: bool = False
 
 
 # ── initialize_distributed (stub) ──
@@ -478,6 +479,7 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
             "low_precision",
             None,
         ),
+        fp32_main_params=cfg.optimizer.fp32_main_params,
     )
 
 
