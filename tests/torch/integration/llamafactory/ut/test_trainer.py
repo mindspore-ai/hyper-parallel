@@ -65,6 +65,33 @@ class _FakeOptimizer:
         return "stepped"
 
 
+def test_upcast_refreshes_refactored_hsdp_params(monkeypatch):
+    """Upcasting should refresh every HSDP parameter without relying on the removed is_sharded flag."""
+    calls = []
+    hsdp_param = types.SimpleNamespace(reset_sharded_param=lambda: calls.append("reset"))
+    state = types.SimpleNamespace(hsdp_params=[hsdp_param])
+    state._init_mp_dtypes = lambda: calls.append("dtypes")
+
+    class FakeHSDPModule:
+        """Minimal type marker for the isinstance check."""
+
+    module = FakeHSDPModule()
+    module.hsdp_scheduler = types.SimpleNamespace(hsdp_state=state)
+    converted = []
+    model = types.SimpleNamespace(
+        dtype=torch.bfloat16,
+        to=converted.append,
+        modules=lambda: [module],
+    )
+    monkeypatch.setattr(lf_utils, "HSDPModule", FakeHSDPModule)
+    accelerator = types.SimpleNamespace(mixed_precision="bf16", is_main_process=False)
+
+    lf_utils._maybe_upcast_trainable_params(accelerator, model)
+
+    assert converted == [torch.float32]
+    assert calls == ["reset", "dtypes"]
+
+
 def test_hp_args_reshard_after_forward_defaults_to_accelerate_plugin(monkeypatch):
     """
     Feature: reshard_after_forward config source

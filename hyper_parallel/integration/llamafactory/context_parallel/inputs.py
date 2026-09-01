@@ -24,6 +24,7 @@ _CP_VISION_INPUT_KEYS = {
     "pixel_values_videos",
     "image_grid_thw",
     "video_grid_thw",
+    "mm_token_type_ids",
 }
 
 
