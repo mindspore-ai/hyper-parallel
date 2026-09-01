@@ -3,12 +3,13 @@
  *
  * PyTorch TORCH_LIBRARY_IMPL for hyper_parallel::mega_moe_grad.
  *
- * NPU implementation calls aclnnHyperMegaMoeGrad via EXEC_NPU_CMD.
+ * NPU implementation calls aclnnHyperMegaMoeGrad via EXEC_NPU_CMD_EXT
+ * from the public torch_npu C++ extension header.
  * Meta implementation is a no-op (output tensors pre-allocated by caller).
  */
 #include <torch/library.h>
 #include <tuple>
-#include "op_plugin/utils/op_api_common.h"
+#include "op_plugin/include/npu_cpp_extension.h"
 
 namespace {
 

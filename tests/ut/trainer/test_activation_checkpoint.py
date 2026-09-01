@@ -19,7 +19,7 @@ import os
 import unittest
 from unittest.mock import MagicMock, call, patch
 
-from torch import nn
+from torch import Tensor, nn
 
 from tests.ut.platform.mindspore._ensure_mindspore_platform import (
     restore_torch_platform_for_ut,
@@ -45,11 +45,13 @@ _ACTIVATION_CHECKPOINT_MODULE = (
 class _DiscoveryBlock(nn.Module):
     """Minimal block used to test model-agnostic layer discovery."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Create one minimal transformer block."""
         super().__init__()
         self.linear = nn.Linear(2, 2)
 
-    def forward(self, inputs):
+    def forward(self, inputs: Tensor) -> Tensor:
+        """Apply the fixture's linear layer."""
         return self.linear(inputs)
 
 
@@ -58,11 +60,13 @@ class _DiscoveryOwner(nn.Module):
 
     gradient_checkpointing = False
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Create an owner with a non-contiguous repeated block container."""
         super().__init__()
         self.decoder = nn.ModuleDict({"2": _DiscoveryBlock(), "7": _DiscoveryBlock()})
 
-    def forward(self, inputs):
+    def forward(self, inputs: Tensor) -> Tensor:
+        """Apply every block in registration order."""
         for block in self.decoder.values():
             inputs = block(inputs)
         return inputs
@@ -71,23 +75,27 @@ class _DiscoveryOwner(nn.Module):
 class _DiscoveryModel(nn.Module):
     """Model with multiple marked towers and no architecture-specific class name."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Create independent text and image towers."""
         super().__init__()
         self.text_tower = _DiscoveryOwner()
         self.image_tower = _DiscoveryOwner()
 
-    def forward(self, inputs):
+    def forward(self, inputs: Tensor) -> Tensor:
+        """Apply both towers and combine their outputs."""
         return self.text_tower(inputs) + self.image_tower(inputs)
 
 
 class _UnmarkedDiscoveryModel(nn.Module):
     """Repeated layers without the HF discovery marker."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Create repeated blocks without a discovery marker."""
         super().__init__()
         self.layers = nn.ModuleList([_DiscoveryBlock(), _DiscoveryBlock()])
 
-    def forward(self, inputs):
+    def forward(self, inputs: Tensor) -> Tensor:
+        """Apply every unmarked block in order."""
         for block in self.layers:
             inputs = block(inputs)
         return inputs
@@ -174,6 +182,15 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
 
 class TestActivationCheckpointSwapInputs(unittest.TestCase):
     """Tests for activation checkpoint input-swapping configuration."""
+
+    def setUp(self) -> None:
+        """Keep swap-input tests independent of optional Transformers imports."""
+        hf_checkpointing_patch = patch(
+            f"{_ACTIVATION_CHECKPOINT_MODULE}._should_use_hf_native_gradient_checkpointing",
+            return_value=False,
+        )
+        hf_checkpointing_patch.start()
+        self.addCleanup(hf_checkpointing_patch.stop)
 
     @staticmethod
     def _wrapped_blocks(model):

@@ -3,8 +3,8 @@
  *
  * PyTorch TORCH_LIBRARY_IMPL for hyper_parallel::mega_moe.
  *
- * NPU implementation calls aclnnHyperMegaMoe via EXEC_NPU_CMD macro
- * (from op_plugin/utils/op_api_common.h), which handles:
+ * NPU implementation calls aclnnHyperMegaMoe via EXEC_NPU_CMD_EXT
+ * (from the public torch_npu C++ extension header), which handles:
  *   1. at::Tensor -> aclTensor conversion
  *   2. aclnnHyperMegaMoeGetWorkspaceSize() call + workspace alloc
  *   3. aclnnHyperMegaMoe(workspace, size, executor, stream) call
@@ -13,7 +13,7 @@
  */
 #include <torch/library.h>
 #include <tuple>
-#include "op_plugin/utils/op_api_common.h"
+#include "op_plugin/include/npu_cpp_extension.h"
 
 namespace {
 

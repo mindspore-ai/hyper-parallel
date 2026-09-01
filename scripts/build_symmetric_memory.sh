@@ -185,7 +185,7 @@ if [[ "${BUILD_SHMEM_TORCH}" == "true" ]]; then
         fail "TORCH_BUILD_DEPENDENCY_NOT_FOUND" \
             "The active Python environment must provide matching torch and torch_npu packages." 4
     fi
-    if ! python3 -c 'import torch; raise SystemExit(0 if torch._C._GLIBCXX_USE_CXX11_ABI else 1)' \
+    if ! python3 -c 'import torch; raise SystemExit(0 if torch.compiled_with_cxx11_abi() else 1)' \
         >/dev/null 2>&1; then
         fail "TORCH_CXX11_ABI_UNSUPPORTED" \
             "The selected Torch native build requires _GLIBCXX_USE_CXX11_ABI=1." 4

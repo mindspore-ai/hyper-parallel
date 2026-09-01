@@ -16,7 +16,6 @@
 #include "torch/script.h"
 #include "torch/torch.h"
 #include "torch_npu/csrc/aten/common/from_blob.h"
-#include "torch_npu/csrc/core/npu/DeviceUtils.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 #include "shmem.h"

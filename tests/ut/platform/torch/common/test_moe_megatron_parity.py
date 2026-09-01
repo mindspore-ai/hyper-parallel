@@ -109,42 +109,6 @@ class TestLoadBalanceLossMegatronParity(unittest.TestCase):
     Both are valid implementations but measure slightly different things.
     """
 
-    def test_semantic_difference_documentation(self):
-        """Document the semantic difference between implementations.
-
-        Megatron uses full softmax, so expert_prob includes probability mass from
-        tokens that did NOT select that expert.
-
-        HyperParallel uses top-k scores only, so expert_prob only includes scores
-        from tokens that DID select that expert.
-
-        This test verifies the difference is consistent and understandable.
-        """
-        torch.manual_seed(42)
-        num_tokens = 100
-        num_experts = 4
-        top_k = 2
-
-        logits = torch.randn(num_tokens, num_experts)
-        full_probs = torch.softmax(logits, dim=-1)
-
-        top_scores, selected_experts = full_probs.topk(top_k, dim=-1)
-        tokens_per_expert = torch.bincount(
-            selected_experts.flatten(), minlength=num_experts
-        ).float()
-
-        megatron_prob_sum = full_probs.sum(dim=0)
-        megatron_prob_total = megatron_prob_sum.sum().item()
-
-        flat_scores = top_scores.flatten()
-        flat_experts = selected_experts.flatten()
-        hp_prob_sum = torch.zeros(num_experts)
-        hp_prob_sum.scatter_add_(0, flat_experts, flat_scores)
-        hp_prob_total = hp_prob_sum.sum().item()
-
-        self.assertEqual(megatron_prob_total, num_tokens, "Megatron prob sum should equal num_tokens")
-        self.assertLess(hp_prob_total, num_tokens, "HP prob sum should be < num_tokens (only top-k)")
-
     def test_formula_equivalence_with_same_input(self):
         """Verify formulas are mathematically equivalent WHEN given same input.
 

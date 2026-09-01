@@ -56,7 +56,7 @@ python -c "import mindspore; print(mindspore.__version__)"
 `_GLIBCXX_USE_CXX11_ABI=1`。
 
 ```bash
-python -c "import torch; print(torch.__version__); print(torch._C._GLIBCXX_USE_CXX11_ABI)"
+python -c "import torch; print(torch.__version__); print(torch.compiled_with_cxx11_abi())"
 ```
 
 ---
