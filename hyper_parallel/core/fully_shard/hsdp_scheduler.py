@@ -14,6 +14,7 @@
 # ============================================================================
 """HSDP scheduler"""
 import functools
+from collections import deque
 from typing import Any, List, Mapping, Optional, Tuple, Union
 
 from hyper_parallel.platform import get_platform
@@ -41,6 +42,24 @@ class ParamGroupCommCtx:
         self.comm_handle = None
 
 
+class PerParamCommCtx:
+    """Track non-fused gradient communication for one HSDP module tree.
+
+    The two ``pre_*`` deques advance in lockstep. Each entry contains the
+    parameters or groups launched by one non-fused HSDP unit, including an
+    empty list when that unit has no gradient to reduce. A larger interval
+    retains reduce-scatter buffers and source gradients for more units, so the
+    root backward hook must drain every remaining entry before applying grads.
+    """
+
+    def __init__(self) -> None:
+        """Initialize one empty per-parameter communication pipeline."""
+        self.reduce_interval: int = 1
+        self.pre_reduce_scatter_params = deque()
+        self.pre_all_reduce_groups = deque()
+        self.all_reduce_work_groups = []
+
+
 class HSDPSchedulerContext:
     """Share scheduler and backward-pipeline state within one HSDP module tree."""
 
@@ -57,12 +76,8 @@ class HSDPSchedulerContext:
         self.all_hsdp_schedulers = []
         # Parameter FQNs are initialized once after all schedulers share this context.
         self._param_fqn_initialized = False
-        # Backward pipeline queues shared only by schedulers in this module tree.
-        self.pre_reduce_scatter_params = []
-        self.pre_all_reduce_params = []
-        self.pre_direct_all_reduce_grads = []
-        self.pre_all_reduce_groups = []
-        self.pending_all_reduce_groups = []
+        # Backward pipelines are shared only by schedulers in this module tree.
+        self.per_param_comm_ctx = PerParamCommCtx()
         self.param_group_comm_ctx = ParamGroupCommCtx()
 
 
@@ -171,11 +186,9 @@ class HSDPSchedulerV2:
     def reset_iter_state(self) -> None:
         """Reset scheduler bookkeeping after a completed iteration."""
         self.scheduler_ctx.root_bp_state = False
-        self.scheduler_ctx.pre_reduce_scatter_params.clear()
-        self.scheduler_ctx.pre_all_reduce_params.clear()
-        self.scheduler_ctx.pre_direct_all_reduce_grads.clear()
-        self.scheduler_ctx.pre_all_reduce_groups.clear()
-        self.scheduler_ctx.pending_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.pre_reduce_scatter_params.clear()
+        self.scheduler_ctx.per_param_comm_ctx.pre_all_reduce_groups.clear()
+        self.scheduler_ctx.per_param_comm_ctx.all_reduce_work_groups.clear()
         self.scheduler_ctx.param_group_comm_ctx.pre_param_group = None
         self.scheduler_ctx.param_group_comm_ctx.all_reduce_param_group = None
         self.scheduler_ctx.param_group_comm_ctx.comm_handle = None

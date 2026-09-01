@@ -275,6 +275,14 @@ class TestHSDPModuleInterfaceMindSpore(unittest.TestCase):
         handle.wait()
         handle.wait()
 
+    @patch("hyper_parallel.core.fully_shard.api.platform.platform_type", PlatformType.MINDSPORE)
+    def test_reduce_comm_interval_is_not_supported(self):
+        """MindSpore should reject the Torch-only reduce communication interval API."""
+        module = self.FakeHSDPModule()
+
+        with self.assertRaisesRegex(NotImplementedError, "only supported on PyTorch"):
+            module.set_reduce_comm_interval()
+
     @patch("hyper_parallel.core.fully_shard.api.platform.get_cells_and_names")
     def test_reshard_and_reduce_op_delegate_to_state(self, mock_cells):
         """State operations should be routed through the current scheduler."""

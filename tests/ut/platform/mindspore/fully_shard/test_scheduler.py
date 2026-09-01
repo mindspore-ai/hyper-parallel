@@ -20,7 +20,7 @@ import os
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -187,7 +187,7 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         self.assertTrue(scheduler.scheduler_ctx.root_bp_state)
 
     def test_root_backward_and_backward_hook_drain_comm_context(self):
-        """Root backward should finish staged fused groups and state reductions once."""
+        """A mixed root should drain every residual per-parameter unit before applying gradients."""
         scheduler = _make_scheduler()
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
         scheduler._is_root = True
@@ -197,7 +197,28 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         pre_group = SimpleNamespace(wait_reduce_scatter_and_issue_all_reduce=MagicMock())
         comm_ctx = SimpleNamespace(all_reduce_param_group=all_reduce_group, pre_param_group=pre_group)
         scheduler.scheduler_ctx.param_group_comm_ctx = comm_ctx
-        scheduler.hsdp_state._wait_prev_reduce_scatter.return_value = []
+        per_param_comm_ctx = scheduler.scheduler_ctx.per_param_comm_ctx
+        reduce_scatter_param_batches = [["param-0"], []]
+        all_reduce_group_batches = [["group-0"], ["group-1"]]
+        per_param_comm_ctx.pre_reduce_scatter_params.extend(reduce_scatter_param_batches)
+        per_param_comm_ctx.pre_all_reduce_groups.extend(all_reduce_group_batches)
+        communication_order = MagicMock()
+        communication_order.attach_mock(
+            scheduler.hsdp_state._wait_prev_reduce_scatter,
+            "wait_prev_reduce_scatter",
+        )
+        communication_order.attach_mock(
+            scheduler.hsdp_state._wait_prev_reduce_scatter_without_all_reduce,
+            "wait_prev_reduce_scatter_without_all_reduce",
+        )
+        communication_order.attach_mock(
+            scheduler.hsdp_state._issue_prev_fused_all_reduce,
+            "issue_prev_fused_all_reduce",
+        )
+        communication_order.attach_mock(
+            scheduler.hsdp_state.wait_and_split_all_reduce_work_groups,
+            "wait_and_split_all_reduce_work_groups",
+        )
         scheduler.hsdp_state.hsdp_params = []
 
         MindSporeHSDPSchedulerV2._root_backward_hook(scheduler)
@@ -205,9 +226,24 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         scheduler._hsdp_backward_hook.assert_called_once_with(scheduler.cell, None, None)
         all_reduce_group.wait_all_reduce_and_save_grad.assert_called_once_with()
         pre_group.wait_reduce_scatter_and_issue_all_reduce.assert_called_once_with()
-        scheduler.hsdp_state._wait_prev_reduce_scatter.assert_called_once_with()
-        scheduler.hsdp_state._wait_prev_reduce_scatter_without_all_reduce.assert_called_once_with()
-        scheduler.hsdp_state.wait_and_split_all_reduce_work_groups.assert_called_once_with()
+        self.assertEqual(
+            communication_order.mock_calls,
+            [
+                call.wait_prev_reduce_scatter(all_reduce_group_batches[0]),
+                call.wait_prev_reduce_scatter_without_all_reduce(
+                    reduce_scatter_param_batches[0]
+                ),
+                call.issue_prev_fused_all_reduce(all_reduce_group_batches[0]),
+                call.wait_prev_reduce_scatter(all_reduce_group_batches[1]),
+                call.wait_prev_reduce_scatter_without_all_reduce(
+                    reduce_scatter_param_batches[1]
+                ),
+                call.issue_prev_fused_all_reduce(all_reduce_group_batches[1]),
+                call.wait_and_split_all_reduce_work_groups(),
+            ],
+        )
+        self.assertEqual(list(per_param_comm_ctx.pre_reduce_scatter_params), [])
+        self.assertEqual(list(per_param_comm_ctx.pre_all_reduce_groups), [])
         self.assertFalse(scheduler.scheduler_ctx.root_bp_state)
 
         scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
@@ -298,21 +334,19 @@ class TestCoreScheduler(unittest.TestCase):
         other_scheduler = self._make_core_scheduler()
         current_ctx = scheduler.scheduler_ctx
         other_ctx = other_scheduler.scheduler_ctx
+        current_per_param_comm_ctx = current_ctx.per_param_comm_ctx
+        other_per_param_comm_ctx = other_ctx.per_param_comm_ctx
         current_ctx.root_bp_state = True
         other_ctx.root_bp_state = True
-        current_ctx.pre_reduce_scatter_params.append("current-rs")
-        current_ctx.pre_all_reduce_params.append("current-ar")
-        current_ctx.pre_direct_all_reduce_grads.append("current-direct-ar")
-        current_ctx.pre_all_reduce_groups.append("current-pre-group")
-        current_ctx.pending_all_reduce_groups.append("current-pending-group")
+        current_per_param_comm_ctx.pre_reduce_scatter_params.append(["current-rs"])
+        current_per_param_comm_ctx.pre_all_reduce_groups.append(["current-pre-group"])
+        current_per_param_comm_ctx.all_reduce_work_groups.append("current-ar-work")
         current_ctx.param_group_comm_ctx.pre_param_group = "current-pre-param-group"
         current_ctx.param_group_comm_ctx.all_reduce_param_group = "current-ar-param-group"
         current_ctx.param_group_comm_ctx.comm_handle = "current-rs-handle"
-        other_ctx.pre_reduce_scatter_params.append("other-rs")
-        other_ctx.pre_all_reduce_params.append("other-ar")
-        other_ctx.pre_direct_all_reduce_grads.append("other-direct-ar")
-        other_ctx.pre_all_reduce_groups.append("other-pre-group")
-        other_ctx.pending_all_reduce_groups.append("other-pending-group")
+        other_per_param_comm_ctx.pre_reduce_scatter_params.append(["other-rs"])
+        other_per_param_comm_ctx.pre_all_reduce_groups.append(["other-pre-group"])
+        other_per_param_comm_ctx.all_reduce_work_groups.append("other-ar-work")
         other_ctx.param_group_comm_ctx.pre_param_group = "other-pre-param-group"
         other_ctx.param_group_comm_ctx.all_reduce_param_group = "other-ar-param-group"
         other_ctx.param_group_comm_ctx.comm_handle = "other-rs-handle"
@@ -320,20 +354,16 @@ class TestCoreScheduler(unittest.TestCase):
         scheduler.reset_iter_state()
 
         self.assertFalse(current_ctx.root_bp_state)
-        self.assertEqual(current_ctx.pre_reduce_scatter_params, [])
-        self.assertEqual(current_ctx.pre_all_reduce_params, [])
-        self.assertEqual(current_ctx.pre_direct_all_reduce_grads, [])
-        self.assertEqual(current_ctx.pre_all_reduce_groups, [])
-        self.assertEqual(current_ctx.pending_all_reduce_groups, [])
+        self.assertEqual(list(current_per_param_comm_ctx.pre_reduce_scatter_params), [])
+        self.assertEqual(list(current_per_param_comm_ctx.pre_all_reduce_groups), [])
+        self.assertEqual(current_per_param_comm_ctx.all_reduce_work_groups, [])
         self.assertIsNone(current_ctx.param_group_comm_ctx.pre_param_group)
         self.assertIsNone(current_ctx.param_group_comm_ctx.all_reduce_param_group)
         self.assertIsNone(current_ctx.param_group_comm_ctx.comm_handle)
         self.assertTrue(other_ctx.root_bp_state)
-        self.assertEqual(other_ctx.pre_reduce_scatter_params, ["other-rs"])
-        self.assertEqual(other_ctx.pre_all_reduce_params, ["other-ar"])
-        self.assertEqual(other_ctx.pre_direct_all_reduce_grads, ["other-direct-ar"])
-        self.assertEqual(other_ctx.pre_all_reduce_groups, ["other-pre-group"])
-        self.assertEqual(other_ctx.pending_all_reduce_groups, ["other-pending-group"])
+        self.assertEqual(list(other_per_param_comm_ctx.pre_reduce_scatter_params), [["other-rs"]])
+        self.assertEqual(list(other_per_param_comm_ctx.pre_all_reduce_groups), [["other-pre-group"]])
+        self.assertEqual(other_per_param_comm_ctx.all_reduce_work_groups, ["other-ar-work"])
         self.assertEqual(other_ctx.param_group_comm_ctx.pre_param_group, "other-pre-param-group")
         self.assertEqual(other_ctx.param_group_comm_ctx.all_reduce_param_group, "other-ar-param-group")
         self.assertEqual(other_ctx.param_group_comm_ctx.comm_handle, "other-rs-handle")
