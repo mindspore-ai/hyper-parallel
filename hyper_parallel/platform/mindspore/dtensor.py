@@ -15,7 +15,6 @@
 """mindspore dtensor base"""
 from mindspore._c_expression import NoFallbackGuard, _DisableMsDispatchMode
 from mindspore.common.tensor import Tensor
-from mindspore.common.initializer import initializer
 
 
 class DTensorBase(Tensor):
@@ -92,13 +91,38 @@ class DTensorBase(Tensor):
     def __str__(self):
         return str(self._local_tensor)
 
-    def __copy__(self):
+    def __copy__(self) -> Tensor:
         """
         Create a shallow copy of the DTensorBase instance.
 
-        This method ensures that device_mesh and placements are correctly
-        propagated when creating a copy (e.g., for optimizer states).
+        When DTensor dispatch is enabled, device_mesh and placements are
+        propagated to the copied DTensor. Inside ``SkipDTensorDispatch``, the
+        local shard is copied instead. A ParameterDTensor is unwrapped to a
+        regular Parameter so optimizer states created through
+        ``Parameter.clone`` remain local tensors.
         """
+        # Import lazily to avoid a circular import while _op_dispatch imports
+        # DTensor and selects the backend DTensorBase implementation.
+        # pylint: disable=C0415
+        from mindspore.common.parameter import Parameter
+        from hyper_parallel.core.shard._op_dispatch import get_dtensor_dispatch
+
+        if self._local_tensor.has_init:
+            raise RuntimeError(
+                "DTensorBase.__copy__: cannot copy an uninitialized local tensor. "
+                "Call init_data() before copying."
+            )
+        local_copy = self._local_tensor.clone()
+
+        if not get_dtensor_dispatch():
+            if isinstance(self, Parameter):
+                return Parameter(
+                    local_copy,
+                    name=self.name,
+                    requires_grad=self.requires_grad,
+                )
+            return local_copy
+
         # Get device_mesh and placements from layout (prefer alias_placements to preserve multi-axis ordering)
         device_mesh = getattr(self, '_device_mesh', None)
         placements = None
@@ -118,22 +142,13 @@ class DTensorBase(Tensor):
                 "Ensure the tensor was constructed with a valid layout."
             )
 
-        if self._local_tensor.has_init:
-            obj = DTensorBase.__new__(
-                type(self),
-                initializer(self._local_tensor.init, self._local_tensor.shape, self._local_tensor.dtype),
-                device_mesh,
-                placements,
-                shape=getattr(self, "_global_shape", None),
-            )
-        else:
-            obj = DTensorBase.__new__(
-                type(self),
-                self._local_tensor.clone(),
-                device_mesh,
-                placements,
-                shape=getattr(self, "_global_shape", None),
-            )
+        obj = DTensorBase.__new__(
+            type(self),
+            local_copy,
+            device_mesh,
+            placements,
+            shape=getattr(self, "_global_shape", None),
+        )
         filtered_dict = {k: v for k, v in self.__dict__.items() if k != '_local_tensor'}
         obj.__dict__.update(filtered_dict)
         return obj
