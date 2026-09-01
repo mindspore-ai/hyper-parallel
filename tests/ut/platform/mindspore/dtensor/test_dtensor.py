@@ -21,12 +21,18 @@ side effect, and wrapping an existing DTensor.
 Device-handling on real Ascend tensors (the optimisation that avoids
 re-wrapping an already-on-Ascend tensor) is covered by the ST suite.
 """
+from copy import copy
+from unittest.mock import patch
+
 import pytest
 
 pytest.importorskip("mindspore")
 
 import mindspore as ms
+from mindspore import Parameter
+from mindspore.common.initializer import initializer
 
+from hyper_parallel.core.dtensor.dtensor import SkipDTensorDispatch
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 
 
@@ -52,6 +58,18 @@ def _stub_alias_placements(self):
 
 def _stub_device_mesh_get(self):
     return self._device_mesh
+
+
+def _keep_on_current_device(tensor, *_args, **_kwargs):
+    """Keep CPU tensors local while exercising device-agnostic copy logic."""
+    return tensor
+
+
+def _mock_clone_on_cpu(tensor):
+    """Bypass MindSpore's unavailable CPU Clone kernel in wrapper-only tests."""
+    # MindSpore does not register the Clone kernel on CPU. These tests verify
+    # HyperParallel's dispatch and wrapper semantics, not MindSpore's kernel.
+    return tensor
 
 
 # Attach the stubs for the lifetime of this test module.
@@ -99,7 +117,6 @@ def test_none_placements_raises(fake_mesh):
 def test_has_init_initializer_sets_init_device(fake_mesh, fake_placements):
     """``has_init`` tensors must have ``init_device`` set to Ascend without
     triggering an actual device move (the optimisation's "no .to()" branch)."""
-    from mindspore.common.initializer import initializer
     init_t = initializer("zeros", (4, 4), ms.float32)
     assert init_t.has_init
 
@@ -119,8 +136,6 @@ def test_wrap_existing_dtensor_reuses_mesh_and_placements(fake_mesh, fake_placem
 
     Uses a ``has_init`` initializer so the constructor stays inside the
     device-agnostic fast path (no Ascend runtime needed)."""
-    from mindspore.common.initializer import initializer
-
     # `_alias_placements` is invoked on the wrapped src; stub it with a
     # minimal layout that exposes the attribute the wrapping branch reads.
     class _Layout:
@@ -136,3 +151,66 @@ def test_wrap_existing_dtensor_reuses_mesh_and_placements(fake_mesh, fake_placem
     assert wrapped._placements == src._placements
     assert wrapped._global_shape == src._global_shape
     assert wrapped._local_tensor is src._local_tensor
+
+
+@patch.object(ms.Tensor, "clone", _mock_clone_on_cpu)
+def test_copy_dtensor_with_dispatch_disabled_returns_local_tensor(fake_mesh, fake_placements):
+    """SkipDTensorDispatch must make copy return a plain local Tensor."""
+    local = ms.Tensor([[1.0, 2.0]], dtype=ms.float32)
+    with patch.object(ms.Tensor, "to", _keep_on_current_device):
+        src = DTensorBase(local, fake_mesh, fake_placements, shape=(2, 2))
+
+        with SkipDTensorDispatch():
+            copied = copy(src)
+
+    assert isinstance(copied, ms.Tensor)
+    assert not isinstance(copied, DTensorBase)
+    assert copied.shape == src._local_tensor.shape
+    assert copied.dtype == src._local_tensor.dtype
+
+
+@patch.object(ms.Tensor, "clone", _mock_clone_on_cpu)
+def test_copy_parameter_dtensor_with_dispatch_disabled_returns_parameter(fake_mesh, fake_placements):
+    """SkipDTensorDispatch must unwrap a ParameterDTensor to Parameter."""
+    local = ms.Tensor([[1.0, 2.0]], dtype=ms.float32)
+    with patch.object(ms.Tensor, "to", _keep_on_current_device):
+        src = DTensorBase(local, fake_mesh, fake_placements, shape=(2, 2))
+        src = Parameter(src, name="weight", requires_grad=False)
+
+        with SkipDTensorDispatch():
+            copied = copy(src)
+
+    assert isinstance(copied, Parameter)
+    assert not isinstance(copied, DTensorBase)
+    assert copied.name == src.name
+    assert copied.requires_grad is False
+    assert copied.shape == src._local_tensor.shape
+
+
+@patch.object(ms.Tensor, "clone", _mock_clone_on_cpu)
+def test_copy_dtensor_with_dispatch_enabled_preserves_dtensor(fake_mesh, fake_placements):
+    """The existing DTensor copy behavior must remain unchanged."""
+    class _Layout:
+        mesh = fake_mesh
+        alias_placements = tuple(fake_placements)
+
+    local = ms.Tensor([[1.0, 2.0]], dtype=ms.float32)
+    with patch.object(ms.Tensor, "to", _keep_on_current_device):
+        src = DTensorBase(local, fake_mesh, fake_placements, shape=(2, 2))
+        src._layout = _Layout()
+
+        copied = copy(src)
+
+    assert isinstance(copied, DTensorBase)
+    assert copied._device_mesh is src._device_mesh
+    assert copied._placements == src._placements
+    assert copied._global_shape == src._global_shape
+
+
+def test_copy_uninitialized_dtensor_raises(fake_mesh, fake_placements):
+    """Copying a lazy initializer must fail instead of creating another initializer."""
+    init_t = initializer("zeros", (4, 4), ms.float32)
+    src = DTensorBase(init_t, fake_mesh, fake_placements, shape=(8, 4))
+
+    with pytest.raises(RuntimeError, match="uninitialized local tensor"):
+        copy(src)
