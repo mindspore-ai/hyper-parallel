@@ -17,9 +17,14 @@
 import torch
 
 from hyper_parallel.auto_models.components.distributed import cp_wrappers
+from hyper_parallel.auto_models.components.distributed.sharding_config import (
+    MeshAxisName,
+    TEMPLATES,
+)
 from hyper_parallel.auto_models.components.distributed.sharding_planner import (
     ShardingPlanner,
 )
+from hyper_parallel.core.dtensor.placement_types import Shard
 
 
 def causal_conv1d_fn(
@@ -161,6 +166,19 @@ def test_planner_recognizes_linear_attention_boundary():
         "model.layers.0.linear_attn",
         "linear_attn",
     ) == "linear_attention"
+
+
+def test_linear_attention_nosp_contract_keeps_cp_sequence_sharded():
+    """GDN boundaries retain their CP-local sequence without TP SP."""
+    template = TEMPLATES["linear_attention"]
+    contracts = (
+        template.nosp_in_src["hidden_states"],
+        template.nosp_in_dst["hidden_states"],
+        template.nosp_out_src,
+        template.nosp_out_dst,
+    )
+    for contract in contracts:
+        assert contract[MeshAxisName.CP] == Shard(1)
 
 
 def test_qwen3_8_gdn_wrapper_resolves_hooked_instance_primitives(monkeypatch):

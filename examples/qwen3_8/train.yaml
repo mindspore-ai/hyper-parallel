@@ -25,7 +25,7 @@ training:
 
 accelerator:
   tp_size: 1
-  cp_size: 1
+  cp_size: 2
   ep_size: 1
   pp_size: 1
   sequence_parallel: false
@@ -97,6 +97,7 @@ dataloader:
     _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
     source_type: indexed
     attention_mode: dense
+    cp_algorithm: ulysses
   dataloader_type: single
   data_rearrange_map: null
   data_sharding: false

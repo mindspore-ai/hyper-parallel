@@ -291,12 +291,16 @@ def _validate_qwen3_8_gdn_cp(target_module: Any, cp_mesh: Any) -> None:
 def _resolve_gdn_forward_implementation(
         original_forward: Callable[..., Any]) -> Callable[..., Any]:
     """Resolve the GDN implementation beneath Transformers hook wrappers."""
+    supported_rule_names = {
+        "torch_chunk_gated_delta_rule",
+        "chunk_gated_delta_rule",
+    }
     implementation = inspect.unwrap(original_forward)
     visited = set()
     while id(implementation) not in visited:
         visited.add(id(implementation))
         referenced_names = set(implementation.__code__.co_names)
-        if "chunk_gated_delta_rule" in referenced_names:
+        if supported_rule_names & referenced_names:
             return implementation
         closure = inspect.getclosurevars(implementation).nonlocals
         wrapped = closure.get("forward_func")
