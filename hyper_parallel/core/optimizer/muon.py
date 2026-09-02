@@ -667,7 +667,7 @@ class Muon(BaseDistributedOptimizer):
 
             if valid_params:
                 safe_batches = self._split_into_memory_safe_batches(
-                    valid_params, shard_size=total_shard_size,
+                    valid_params, shard_size=total_shard_size, min_batch_size=total_shard_size
                 )
                 for sub_batch in safe_batches:
                     my_updates, param_compute_coord = self._gather_and_compute_shard_updates(
@@ -866,13 +866,16 @@ class Muon(BaseDistributedOptimizer):
             self,
             p_list: List[torch.nn.Parameter],
             shard_size: int = 1,
+            min_batch_size: int = 1,
     ) -> List[List[torch.nn.Parameter]]:
         """Split parameters into memory-safe batches to prevent OOM during NS.
 
         The per-batch element limit is scaled down by shard_size to account
-        for the memory amplification from allgather.
+        for the memory amplification from allgather. Sharded paths prioritize
+        filling the compute-owner ranks before applying this soft limit.
         """
         max_numel_per_batch = 512 * 1024 * 1024 // shard_size
+        min_batch_size = max(1, min_batch_size)
 
         batches = []
         current_batch = []
@@ -880,7 +883,10 @@ class Muon(BaseDistributedOptimizer):
 
         for p in p_list:
             p_count = p.numel()
-            if current_batch and current_count + p_count > max_numel_per_batch:
+            if (
+                    len(current_batch) >= min_batch_size
+                    and current_count + p_count > max_numel_per_batch
+            ):
                 batches.append(current_batch)
                 current_batch = [p]
                 current_count = p_count
