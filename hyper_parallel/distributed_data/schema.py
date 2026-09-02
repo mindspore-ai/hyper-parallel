@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+
+OversizedPolicy = Literal["error", "single"]
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,54 @@ class BufferedSampleMetadata:
 
     key: SampleKey
     metadata: SampleMetadata
+    global_sample_position: int
+
+    def __post_init__(self) -> None:
+        """Validate the sample's position in the canonical epoch stream."""
+        if (
+                not isinstance(self.global_sample_position, int)
+                or isinstance(self.global_sample_position, bool)
+                or self.global_sample_position < 0
+        ):
+            raise ValueError(
+                "BufferedSampleMetadata.global_sample_position must be a non-negative integer, "
+                f"but got {self.global_sample_position!r}."
+            )
+
+
+@dataclass(frozen=True)
+class StepSampleSelection:
+    """Frozen sample membership and a known-feasible reference packing.
+
+    ``samples`` contains exactly the samples admitted to one distributed step.
+    ``reference_bins`` records the canonical streaming packing used to choose
+    that set. Balanced placement may change those bin boundaries, but it must
+    conserve every selected key exactly once.
+    """
+
+    samples: tuple[BufferedSampleMetadata, ...]
+    reference_bins: tuple[tuple[SampleKey, ...], ...]
+
+    def __post_init__(self) -> None:
+        """Validate sample identity, stream order, and reference conservation."""
+        if not self.samples:
+            raise ValueError("StepSampleSelection.samples must not be empty.")
+        if any(not isinstance(item, BufferedSampleMetadata) for item in self.samples):
+            raise ValueError("StepSampleSelection.samples must contain BufferedSampleMetadata entries.")
+        if not self.reference_bins or any(not packing_bin for packing_bin in self.reference_bins):
+            raise ValueError("StepSampleSelection.reference_bins must contain non-empty bins.")
+        keys = tuple(item.key for item in self.samples)
+        if len(keys) != len(set(keys)):
+            raise ValueError("StepSampleSelection samples must have unique SampleKey values.")
+        positions = tuple(item.global_sample_position for item in self.samples)
+        if positions != tuple(range(positions[0], positions[0] + len(positions))):
+            raise ValueError("StepSampleSelection samples must be contiguous in canonical stream order.")
+        reference_keys = tuple(key for packing_bin in self.reference_bins for key in packing_bin)
+        if reference_keys != keys:
+            raise ValueError(
+                "StepSampleSelection reference bins must contain every selected sample exactly once "
+                "in canonical stream order."
+            )
 
 
 @dataclass(frozen=True)
@@ -202,12 +253,16 @@ class DistributedPackingPlan:
 
     def __post_init__(self) -> None:
         """Validate plan dimensions, slots, and unique sample assignments."""
+        self._validate_dimensions()
+        keys = self._validate_constructors()
+        if len(keys) != len(set(keys)):
+            raise ValueError("A sample key may appear only once in a distributed packing plan.")
+
+    def _validate_dimensions(self) -> None:
         if not isinstance(self.plan_id, str) or not self.plan_id:
             raise ValueError("DistributedPackingPlan.plan_id must be a non-empty string.")
-        for name in ("step",):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"DistributedPackingPlan.{name} must be non-negative, but got {value!r}.")
+        if not isinstance(self.step, int) or isinstance(self.step, bool) or self.step < 0:
+            raise ValueError(f"DistributedPackingPlan.step must be non-negative, but got {self.step!r}.")
         for name in ("seq_len", "local_batch_size", "data_parallel_size"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -220,25 +275,28 @@ class DistributedPackingPlan:
         data_ranks = tuple(constructor.target_data_rank for constructor in self.constructors)
         if data_ranks != tuple(range(self.data_parallel_size)):
             raise ValueError("DistributedPackingPlan constructors must be ordered by contiguous data rank.")
+
+    def _validate_constructors(self) -> list[SampleKey]:
         keys = []
         for constructor in self.constructors:
-            if len(constructor.bins) != self.local_batch_size:
-                raise ValueError(
-                    f"Data rank {constructor.target_data_rank} expected {self.local_batch_size} bins, "
-                    f"but got {len(constructor.bins)}."
-                )
-            if tuple(packing_bin.pack_index for packing_bin in constructor.bins) != tuple(
-                    range(self.local_batch_size)
-            ):
-                raise ValueError("Data Constructor bins must be ordered by contiguous pack_index.")
-            for packing_bin in constructor.bins:
-                if packing_bin.pack_tokens > self.seq_len and not packing_bin.oversized:
-                    raise ValueError("A non-oversized packing bin exceeds seq_len.")
-                if packing_bin.oversized and len(packing_bin.samples) != 1:
-                    raise ValueError("An oversized sample must occupy its packing bin alone.")
+            self._validate_constructor(constructor)
             keys.extend(constructor.sample_keys)
-        if len(keys) != len(set(keys)):
-            raise ValueError("A sample key may appear only once in a distributed packing plan.")
+        return keys
+
+    def _validate_constructor(self, constructor: DataConstructorPlan) -> None:
+        if len(constructor.bins) != self.local_batch_size:
+            raise ValueError(
+                f"Data rank {constructor.target_data_rank} expected {self.local_batch_size} bins, "
+                f"but got {len(constructor.bins)}."
+            )
+        pack_indices = tuple(packing_bin.pack_index for packing_bin in constructor.bins)
+        if pack_indices != tuple(range(self.local_batch_size)):
+            raise ValueError("Data Constructor bins must be ordered by contiguous pack_index.")
+        for packing_bin in constructor.bins:
+            if packing_bin.pack_tokens > self.seq_len and not packing_bin.oversized:
+                raise ValueError("A non-oversized packing bin exceeds seq_len.")
+            if packing_bin.oversized and len(packing_bin.samples) != 1:
+                raise ValueError("An oversized sample must occupy its packing bin alone.")
 
     @property
     def selected_keys(self) -> tuple[SampleKey, ...]:
