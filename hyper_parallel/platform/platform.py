@@ -1444,6 +1444,18 @@ class Platform:
         """
         raise NotImplementedError("Platform subclasses must implement get_current_stream")
 
+    def synchronize(self) -> None:
+        """Block the host until the work queued on the current device stream has finished.
+
+        A collective issued with ``async_op=False`` is only ordered against the stream: the
+        handle is waited on, but the transfer itself can still be queued when the call
+        returns. Anything that releases what those operations still read - tearing down a
+        communication group, freeing a buffer - has to synchronize first.
+
+        Backends whose collectives run on the host have nothing to drain and may no-op.
+        """
+        raise NotImplementedError("Platform subclasses must implement synchronize")
+
     def new_event(self):
         """Create a new event for stream synchronization.
 

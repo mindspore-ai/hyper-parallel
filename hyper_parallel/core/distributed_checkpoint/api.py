@@ -134,15 +134,10 @@ def _save_impl(
                                                           FileType.LOCAL_PLAN,
                                                           rank) if use_storage_comm \
             else all_gather_object(local_plan, world_size, use_collectives)
-        global_plans, global_metadata = planner.build_global_plan(all_local_plans)
-        global_plans = storage_writer.optimize_global_plan(global_plans)
-        # Select central plan for current rank
-        if use_collectives and world_size > 1 and global_plans:
-            central_plan = global_plans[rank]
-        elif global_plans:
-            central_plan = global_plans[0]
-        else:
-            central_plan = local_plan
+        # build_global_plan returns this rank's plan only: every rank runs it over the same
+        # gathered plans and writes just its own shards.
+        central_plan, global_metadata = planner.build_global_plan(all_local_plans)
+        central_plan = storage_writer.optimize_global_plan(central_plan)
 
         # Finalize and cache plan
         finalized_plan = planner.finalize_plan(central_plan)
@@ -482,16 +477,9 @@ def load(
 
     # Gather all local plans and build global plan
     all_local_plans = all_gather_object(local_plan, world_size, use_collectives)
-    global_plans = planner.build_global_plan(all_local_plans)
-    global_plans = storage_reader.optimize_global_plan(global_plans)
-
-    # Select central plan for current rank
-    if use_collectives and world_size > 1 and global_plans:
-        central_plan = global_plans[rank]
-    elif global_plans:
-        central_plan = global_plans[0]
-    else:
-        central_plan = local_plan
+    # build_global_plan returns this rank's plan only.
+    central_plan = planner.build_global_plan(all_local_plans)
+    central_plan = storage_reader.optimize_global_plan(central_plan)
 
     # Finalize plan
     final_plan = planner.finalize_plan(central_plan)

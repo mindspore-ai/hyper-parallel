@@ -48,7 +48,7 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     flatten_state_dict,
     has_valid_filename,
     narrow_tensor_by_index,
-    remove_redundant_plans,
+    plan_ownership_masks,
     set_element,
     traverse_state_dict,
 )
@@ -163,11 +163,11 @@ class TestUtil(unittest.TestCase):
         traverse_state_dict(state, lambda path, _: visited.append(".".join(path)))
         self.assertEqual(set(visited), {"a.b", "c"})
 
-    def test_remove_redundant_plans_keeps_one_copy(self):
+    def test_plan_ownership_masks_keeps_one_copy(self):
         """
-        Feature: remove_redundant_plans deduplication.
+        Feature: plan_ownership_masks deduplication.
         Description: Two plans both write the same MetadataIndex.
-        Expectation: Only one plan retains the WriteItem.
+        Expectation: Exactly one plan is marked as the owner of the WriteItem.
         """
         chunk = ChunkStorageMetadata(offsets=(0,), sizes=(4,))
         props = TensorProperties(dtype="float32")
@@ -178,9 +178,9 @@ class TestUtil(unittest.TestCase):
             tensor_data={"chunk": chunk, "properties": props, "size": (4,)},
         )
         plans = [SavePlan(items=[item]), SavePlan(items=[item])]
-        deduped = remove_redundant_plans(plans)
-        total_items = sum(len(p.items) for p in deduped)
-        self.assertEqual(total_items, 1)
+        masks = plan_ownership_masks(plans)
+        self.assertEqual([len(m) for m in masks], [1, 1])
+        self.assertEqual(sum(sum(m) for m in masks), 1)
 
     def test_create_chunk_list_for_plain_tensor(self):
         """
@@ -270,6 +270,9 @@ class _RecordingPlatform:
         self.created_groups: list = []
         self.destroyed_groups: list = []
         self.gathered: list = []
+        # Ordered log of the calls whose relative order matters: a group must be drained
+        # before it is released, or the broadcast still queued on it is torn down with it.
+        self.events: list = []
 
     def get_rank(self) -> int:
         """Return the rank the timing decorator logs."""
@@ -293,9 +296,14 @@ class _RecordingPlatform:
         self.created_groups.append(group_ranks)
         return f"group{group_ranks}"
 
+    def synchronize(self) -> None:
+        """Record one device drain instead of reaching a backend."""
+        self.events.append("synchronize")
+
     def destroy_process_group(self, group: Any) -> None:
         """Record one group release instead of reaching a backend."""
         self.destroyed_groups.append(group)
+        self.events.append(f"destroy {group}")
 
     # pylint: disable=W0613
     def all_gather_object(self, object_list: list, obj: Any, group: Any = None) -> None:
@@ -519,6 +527,23 @@ class TestBroadcastLoadedTensors(unittest.TestCase):
             util_mod._create_groups_and_broadcast({(0, 1): [tensor]})
 
         self.assertEqual(fake.destroyed_groups, ["group(0, 1)"])
+
+    def test_on_demand_groups_are_drained_before_they_are_released(self):
+        """
+        Feature: _destroy_groups drains the device stream before releasing a group.
+        Description: A broadcast that has been waited on is only ordered against the device
+            stream, so the transfer can still be queued when the call returns. Releasing the
+            communicator at that point tears the transfer down with it, and every rank that
+            was to receive the shard silently keeps whatever its buffer held.
+        Expectation: The drain is issued, and it precedes every release.
+        """
+        fake = _RecordingPlatform(world_size=2, peer_missing_groups=((2, 3),))
+        tensor = self._tag(torch.zeros(2), (0, 1), 0)
+
+        with patch.object(util_mod, "platform", fake):
+            util_mod._create_groups_and_broadcast({(0, 1): [tensor]})
+
+        self.assertEqual(fake.events, ["synchronize", "destroy group(0, 1)"])
 
     def test_a_group_that_refuses_to_be_released_does_not_fail_the_load(self):
         """

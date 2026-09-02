@@ -21,6 +21,42 @@ from typing import Any, Optional, Union
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
 
 
+# Substring -> element size in bytes, matched in order (bfloat16 must be tried before float16
+# would match, and int32 before int64). Module level so tensor_storage_size() does not rebuild
+# the mapping on every call.
+_DTYPE_SUBSTR_TO_ELEM_SIZE = {
+    "int32": 4, "int64": 8, "bfloat16": 2, "float16": 2, "float32": 4, "float64": 8
+}
+_DEFAULT_ELEM_SIZE = 4
+# dtype strings come from a handful of distinct values per checkpoint, so memoising the scan
+# turns a per-item substring search into a single dict lookup.
+_dtype_elem_size_cache: dict[str, int] = {}
+
+
+def _elem_size_from_dtype(dtype_str: Any) -> int:
+    """
+    Best-effort element size in bytes for a dtype rendered as a string.
+
+    Args:
+        dtype_str (Any): Object whose ``str()`` names the dtype, e.g. ``"torch.bfloat16"``.
+
+    Returns:
+        int: Element size in bytes, defaulting to 4 for unrecognised dtypes.
+    """
+    key = str(dtype_str)
+    elem_size = _dtype_elem_size_cache.get(key)
+    if elem_size is not None:
+        return elem_size
+    lowered = key.lower()
+    elem_size = _DEFAULT_ELEM_SIZE
+    for dtype_name, size in _DTYPE_SUBSTR_TO_ELEM_SIZE.items():
+        if dtype_name in lowered:
+            elem_size = size
+            break
+    _dtype_elem_size_cache[key] = elem_size
+    return elem_size
+
+
 class WriteItemType(Enum):
     """Type of write item."""
     TENSOR = "tensor"
@@ -71,25 +107,14 @@ class WriteItem:
             return None
 
         # Get size from chunk (local chunk size, not global size)
-        size = chunk.sizes
         num = 1
-        for dim in size:
+        for dim in chunk.sizes:
             num *= int(dim)
         # Try to get dtype item size from properties
         dtype_str = getattr(properties, "dtype", None)
         if dtype_str is None:
             return int(num)
-        # Simple estimation: assume common dtypes
-        dtype_to_size_map = {
-            "int32": 4, "int64": 8, "bfloat16": 2, "float16": 2, "float32": 4, "float64": 8
-        }
-        dtype_str_lower = str(dtype_str).lower()
-        elem_size = 4  # Default to 4 bytes
-        for dtype_name, size in dtype_to_size_map.items():
-            if dtype_name in dtype_str_lower:
-                elem_size = size
-                break
-        return int(num) * int(elem_size)
+        return int(num) * _elem_size_from_dtype(dtype_str)
 
 
 
@@ -117,12 +142,17 @@ class ReadItem:
     lengths: tuple  # Size of the hypercube to copy
 
 
-@dataclass
+@dataclass(frozen=True)
 class SavePlan:
     """
     Plan for saving checkpoint.
 
     Contains write items and optional storage/planner-specific data.
+
+    Frozen so that a plan cannot be edited after it has been handed on: plans are gathered from
+    every rank, kept in the planner's cross-call result cache, and passed to hooks that must treat
+    them as inputs. Build a changed plan with ``dataclasses.replace`` instead. Note this freezes
+    the fields, not the contents -- ``items`` is still a list that could be appended to.
 
     Attributes:
         items: List of WriteItems to be saved. Default [].
@@ -134,12 +164,14 @@ class SavePlan:
     planner_data: Any = None  # Planner-specific data (can be any type)
 
 
-@dataclass
+@dataclass(frozen=True)
 class LoadPlan:
     """
     Plan for loading checkpoint.
 
     Contains read items and optional storage/planner-specific data.
+
+    Frozen for the same reason as :class:`SavePlan`.
 
     Attributes:
         items: List of ReadItems to be loaded. Default [].
@@ -178,18 +210,19 @@ class SavePlanner(abc.ABC):
         """
 
     @abc.abstractmethod
-    def build_global_plan(self, all_plans: list[SavePlan]) -> tuple[list[SavePlan], Metadata]:
+    def build_global_plan(self, all_plans: list[SavePlan]) -> tuple[SavePlan, Metadata]:
         """
-        Build global plan from all local plans.
+        Build this rank's final save plan and the global checkpoint metadata.
 
-        Combines local plans from all ranks into a global plan and creates checkpoint metadata.
-        This method may deduplicate redundant data across ranks and assign storage indices.
+        Combines local plans from all ranks: deduplicates redundant data across ranks and assigns
+        storage indices. Every rank runs this over the same gathered plans and writes only its own
+        shards, so only this rank's plan is returned -- the metadata still describes every rank's.
 
         Args:
-            all_plans (list[SavePlan]): List of local save plans from all ranks.
+            all_plans (list[SavePlan]): Local save plans from all ranks, indexed by rank.
 
         Returns:
-            tuple[list[SavePlan], Metadata]: Updated global plans (one per rank) and
+            tuple[SavePlan, Metadata]: This rank's save plan with storage indices assigned, and
                 checkpoint metadata containing information about all saved items.
         """
 
@@ -248,18 +281,19 @@ class LoadPlanner(abc.ABC):
         """
 
     @abc.abstractmethod
-    def build_global_plan(self, all_plans: list[LoadPlan]) -> list[LoadPlan]:
+    def build_global_plan(self, all_plans: list[LoadPlan]) -> LoadPlan:
         """
-        Build global plan from all local plans.
+        Build this rank's final load plan from all local plans.
 
-        Combines local plans from all ranks into a global plan. This method may
-        coordinate across ranks or perform optimizations.
+        Every rank runs this over the same gathered plans and reads only its own shards, so only
+        this rank's plan is returned. This method may coordinate across ranks or perform
+        optimizations while doing so.
 
         Args:
-            all_plans (list[LoadPlan]): List of local load plans from all ranks.
+            all_plans (list[LoadPlan]): Local load plans from all ranks, indexed by rank.
 
         Returns:
-            list[LoadPlan]: Updated global load plans (one per rank).
+            LoadPlan: This rank's load plan.
         """
 
     @abc.abstractmethod

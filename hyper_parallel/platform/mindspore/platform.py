@@ -1987,6 +1987,10 @@ class MindSporePlatform(Platform):
     def get_current_stream(self):
         return ms.runtime.current_stream()
 
+    def synchronize(self) -> None:
+        """Block the host until the work queued on the current device stream has finished."""
+        ms.runtime.synchronize()
+
     def new_event(self):
         return ms.runtime.Event()
 

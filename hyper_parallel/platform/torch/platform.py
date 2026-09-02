@@ -1665,6 +1665,17 @@ class TorchPlatform(Platform):
         device = self.get_device_handle()
         return device.current_stream()
 
+    def synchronize(self) -> None:
+        """Block the host until the work queued on the current device stream has finished."""
+        # Nothing can be queued on a device stream when the process has no device, and there are
+        # two ways to have none: a CPU-only install carries no torch.npu at all, and a gloo run on
+        # an accelerator box never initializes the one it has. get_device_handle() raises in the
+        # first case, so read the module directly rather than going through it.
+        device = getattr(torch, "npu", None)
+        if device is None or not device.is_initialized():
+            return
+        device.current_stream().synchronize()
+
     def new_event(self):
         device = self.get_device_handle()
         return device.Event()

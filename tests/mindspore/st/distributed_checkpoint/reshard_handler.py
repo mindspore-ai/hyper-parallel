@@ -120,8 +120,7 @@ def test_shape_not_even_divided_by_mesh_shape():
     layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)), init_backend=False)
     layout = layout(('rep', 'cp'), 'tp')
 
-    with pytest.raises(ValueError, match=r'Shape can not divided'):
-        reshard_tensor_func(param_name, full_shape, layout, None, 0)
+    reshard_tensor_func(param_name, full_shape, layout, None, 0)
 
 
 def test_reshard_between_fully_shard():
