@@ -564,8 +564,12 @@ def _run_dcp_save_load_with_different_mesh_test(
                 else:
                     load_state_dict[scalar_name] = None
 
-        # Call load API (only ranks within load_mesh_size participate)
-        load(load_state_dict, checkpoint_id=checkpoint_path)
+    # Every rank calls load, those outside the load mesh with an empty state dict: the plan
+    # exchange it does by default runs on the default process group, which is every rank the
+    # job was started with, and a rank that stayed out of it would leave the others waiting
+    # on a gather that never completes. A real load is its own job whose ranks all take part;
+    # a smaller mesh inside a larger job is this case emulating one.
+    load(load_state_dict, checkpoint_id=checkpoint_path)
 
     # Verify load results - compare loaded tensors with original tensors
     # Only ranks within load_mesh_size verify results

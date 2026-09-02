@@ -16,8 +16,10 @@
 
 import time
 from pathlib import Path
+from contextlib import contextmanager
 from functools import wraps
-from typing import Any, Union, Optional
+from typing import Any, Iterable, Optional, Union
+from collections import deque
 from collections.abc import Collection, Mapping
 
 from hyper_parallel.core.distributed_checkpoint.metadata import (
@@ -25,10 +27,16 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     MetadataIndex,
     CHUNK_INFO,
     ChunkInfo,
-    BroadcastInfo,
 )
-from hyper_parallel.core.distributed_checkpoint.planner import SavePlan
-from hyper_parallel.core.distributed_checkpoint.ragged_utils import compute_ragged_boxes
+from hyper_parallel.core.distributed_checkpoint.planner import (
+    BroadcastSource,
+    ReadItem,
+    SavePlan,
+)
+from hyper_parallel.core.distributed_checkpoint.ragged_utils import (
+    compute_ragged_boxes,
+    get_ragged_box_tensor,
+)
 from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
@@ -36,7 +44,6 @@ from hyper_parallel.tools.logging import get_logger
 
 platform = get_platform()
 Tensor = platform.Tensor
-BROADCAST_INFO = "broadcast_info"
 
 # The one DCP logger: other distributed_checkpoint modules import this instead of
 # registering a component of their own.
@@ -404,80 +411,6 @@ def set_element(root_dict: Any, path: tuple[Any, ...], value: Any) -> None:
     cur_container[last_key] = value
 
 
-def infer_same_shard_ranks_for_dtensor(dtensor: DTensor) -> tuple[int, ...]:
-    """
-    Group global ranks that hold the same local shard for a DTensor.
-
-    Shard identity is derived from each rank's global offsets, computed from the
-    DTensor device mesh and placements (via layout).
-
-    Args:
-        dtensor (DTensor): The DTensor to analyze.
-
-    Returns:
-        tuple[int, ...]: Sorted global-rank tuples; each tuple is one
-            same-shard group (length 1 when the shard is unique to one rank).
-    """
-    current_rank = platform.get_rank()
-    layout = dtensor.layout
-    if layout is None:
-        return (current_rank,)
-
-    mesh_shape = layout.mesh_shape
-    tensor_map = layout.tensor_map
-    rank_list = layout.rank_list
-
-    if mesh_shape is None or tensor_map is None or rank_list is None:
-        return (current_rank,)
-
-    if current_rank not in rank_list:
-        return (current_rank,)
-
-    n_mesh_dims = len(mesh_shape)
-    inner_rank_id = rank_list.index(current_rank)
-
-    def dev_id_list_from_rank(inner_id: int) -> list[int]:
-        dev_id_list = [0] * n_mesh_dims
-        temp = inner_id
-        for i in range(n_mesh_dims - 1, -1, -1):
-            dev_id_list[i] = temp % mesh_shape[i]
-            temp //= mesh_shape[i]
-        return dev_id_list
-
-    def compute_shard_key(dev_id_list: list[int]) -> tuple:
-        key_parts = []
-        for mapping in tensor_map:
-            if isinstance(mapping, int):
-                mapping = (mapping,) if mapping != -1 else ()
-            elif not isinstance(mapping, tuple):
-                mapping = (mapping,)
-            if not mapping:
-                continue
-            shard_id = 0
-            coef = 1
-            for dim in reversed(mapping):
-                if dim == -1:
-                    continue
-                shard_id += dev_id_list[-dim - 1] * coef
-                coef *= mesh_shape[-dim - 1]
-            key_parts.append(shard_id)
-        return tuple(key_parts)
-
-    current_dev_id_list = dev_id_list_from_rank(inner_rank_id)
-    current_shard_key = compute_shard_key(current_dev_id_list)
-
-    same_shard_ranks = []
-    for idx, global_rank in enumerate(rank_list):
-        if idx == inner_rank_id:
-            same_shard_ranks.append(global_rank)
-            continue
-        other_dev_id_list = dev_id_list_from_rank(idx)
-        if compute_shard_key(other_dev_id_list) == current_shard_key:
-            same_shard_ranks.append(global_rank)
-
-    return tuple(same_shard_ranks)
-
-
 @dcp_timer_decorator
 def all_gather_object(
     local_object: Any,
@@ -502,157 +435,412 @@ def all_gather_object(
     return [local_object]
 
 
-@dcp_timer_decorator
-def _broadcast_within_existing_groups(
-    state_dict: dict[str, Any],
-    groups: dict[tuple, Any]
-) -> dict[tuple, list[Any]]:
+# How many broadcasts one rank keeps going at once. Starting the next without waiting on
+# the last is what lets a read overlap the send before it, but each one in flight holds
+# resources inside the communication library, so the count is capped rather than left to
+# grow with the number of shards in the checkpoint.
+_MAX_BROADCASTS_IN_FLIGHT = 8
+
+# Shards smaller than this travel together rather than one at a time. A broadcast of
+# 64 KiB costs about as much as one of 1 MiB -- some 145 microseconds either way over
+# four Ascend ranks -- and only reaches full speed past a few megabytes, so below that a
+# load spends its time starting broadcasts rather than moving data. This sits just above
+# where the two meet, measured at around 4.6 MiB. Note that a batch is held until its
+# broadcast lands, so a load can have this much times the in-flight limit set aside.
+DEFAULT_BROADCAST_BATCH_BYTES = 6 * 1024 * 1024
+
+
+def _existing_group(group_ranks: tuple) -> Any:
     """
-    Broadcast the tensors whose same-shard group was pre-built by the caller.
+    A communication group over these ranks that is already there, or None if none is.
+
+    The cache is where a group that already exists is normally found: the mesh a model is
+    sharded over puts its tp columns and dp groups there, and they stay because training
+    still needs them. Only when it holds nothing is the world worth considering - a
+    parameter every rank has a copy of needs the group of every rank, which is the one the
+    job runs on. That one has been there since initialization and is not in the cache, but
+    it is no less already there, and remaking it would raise a second communicator over
+    every rank for the sake of one read.
+
+    Neither belongs to the load, so neither is destroyed when the load is done.
 
     Args:
-        state_dict (dict[str, Any]): Flat or nested state dict containing the entries whose
-            local tensors were populated on the minimum rank of each group.
-        groups (dict[tuple, Any]): Communication groups keyed by their rank tuple.
+        group_ranks (tuple): The ranks the group would hold.
 
     Returns:
-        dict[tuple, list[Any]]: The entries left untouched because ``groups`` has no group for
-        them, keyed by the rank tuple of the group they still need.
-
-    Raises:
-        ValueError: If the broadcast info attached to an entry has an unexpected type.
+        Any: The group, or None if it has to be created.
     """
-    missing_groups_ranks = {}
-    for obj in state_dict.values():
-        broadcast_info = getattr(obj, BROADCAST_INFO, None)
-        if broadcast_info is None:
+    existing = platform.get_created_group(group_ranks)
+    if existing is not None:
+        return existing
+    if group_ranks == tuple(range(platform.get_world_size())):
+        return platform.get_world_group()
+    return None
+
+
+def _build_broadcast_groups(
+    items: Iterable[ReadItem],
+    supplied: dict[tuple, Any],
+) -> tuple[dict[tuple, Any], set]:
+    """
+    The communication group of every shard this load broadcasts, and which of them it owns.
+
+    Every rank has to call this, including one with no shard to broadcast at all: it
+    all-gathers what is needed and takes part in creating all of it, and both of those are
+    collective. A rank that stayed out because it had nothing of its own to add would leave
+    the others waiting on it.
+
+    A group that already exists is reused rather than made a second time - the mesh a model
+    is sharded over has usually built the tp column or the dp group a replicated parameter
+    needs. But **whether to reuse has to be decided the same way on every rank**:
+    ``new_group`` is collective over the world, so a rank that skipped it because its own
+    cache held the group, while another went ahead, would hang everybody. The cache is not
+    symmetric on its own - ``DeviceMesh.from_group`` records only the group its rank is in -
+    so the decision is taken from the gathered reports rather than from the local cache: a
+    group is made afresh if it is absent on *any* rank that needs it, and reused only when
+    it is absent on none.
+
+    Groups made here are made with :meth:`platform.new_group`, which creates exactly the
+    ranks it is given and hands the group straight back. :meth:`platform.create_group` would
+    do more than is wanted: it takes the rank list as a *template*, expands it into a whole
+    partition of the world, and keeps every group of it in a process-wide cache. A load uses
+    each of these groups once - and the expansion refuses rank lists a pipeline-parallel
+    model produces, such as a parameter tied across two stages that are not neighbours.
+
+    Args:
+        items (Iterable[ReadItem]): The read items of this rank finalized plan.
+        supplied (dict[tuple, Any]): Communication groups the caller pre-built, keyed by
+            their rank tuple. Kept as they are and never counted as owned.
+
+    Returns:
+        tuple[dict[tuple, Any], set]: A group for every rank tuple this rank broadcasts
+            through, and the rank tuples whose groups this load made and must destroy.
+    """
+    needed = sorted({item.source.group_ranks for item in items
+                     if item.source is not None and item.source.group_ranks not in supplied})
+    absent = tuple(ranks for ranks in needed if _existing_group(ranks) is None)
+    if absent:
+        logger.warning("There are missing groups %s. Then all gather the missing groups on each rank and "
+                       "create them one by one, which will increase some time consumption.", absent)
+
+    gathered = all_gather_object(
+        (tuple(needed), absent), platform.get_world_size(), use_collectives=True
+    )
+    wanted = sorted({ranks for reported, _ in gathered for ranks in reported})
+    absent_somewhere = {ranks for _, reported in gathered for ranks in reported}
+
+    groups = dict(supplied)
+    owned = set()
+    for group_ranks in wanted:
+        # Both inputs to this came from the gather, so every rank takes the same branch.
+        fresh = platform.new_group(group_ranks) if group_ranks in absent_somewhere else None
+        if group_ranks not in needed:
             continue
-        if not isinstance(broadcast_info, BroadcastInfo):
-            raise ValueError(f"The broadcast info attached to tensor must be of type {BroadcastInfo}.")
-        group_ranks, src_rank = tuple(broadcast_info.group_ranks), broadcast_info.src_rank
-        if group_ranks in groups:
-            local_tensor = obj.to_local() if isinstance(obj, DTensor) else obj
-            platform.broadcast(
-                platform.detach(local_tensor),
-                src_rank,
-                groups[group_ranks]
-            )
-            delattr(obj, BROADCAST_INFO)
-        else:
-            missing_groups_ranks.setdefault(group_ranks, []).append(obj)
-    return missing_groups_ranks
+        if fresh is None:
+            groups[group_ranks] = _existing_group(group_ranks)
+            continue
+        groups[group_ranks] = fresh
+        owned.add(group_ranks)
+    return groups, owned
 
 
-@dcp_timer_decorator
-def _destroy_groups(groups: dict[tuple, Any]) -> None:
+def ensure_broadcast_groups(
+    items: Iterable[ReadItem],
+    groups: Optional[dict[tuple, Any]] = None,
+) -> dict[tuple, Any]:
     """
-    Release the groups built for one broadcast round.
+    The communication group of every shard this load broadcasts, built where one is missing.
 
-    Only groups obtained from :meth:`Platform.new_group` may be passed here: it always builds a
-    fresh communicator, so releasing one affects nothing else. :meth:`Platform.create_group`
-    hands back a *cached* group instead - and for the whole-world rank list, the default process
-    group itself - which this must never destroy.
+    See :func:`_build_broadcast_groups` for how they are made. Whatever this builds is left
+    to the caller to destroy; :func:`broadcast_groups_for_load` does that on its way out.
 
-    Only the ranks belonging to a group release it: a rank outside it never got a real group
-    back from :meth:`Platform.new_group`, only a non-member placeholder.
+    Args:
+        items (Iterable[ReadItem]): The read items of this rank finalized plan.
+        groups (Optional[dict[tuple, Any]]): Communication groups the caller pre-built, keyed
+            by their rank tuple. Kept as they are; only the missing ones are created.
 
-    The broadcasts were issued on these groups but are not necessarily done: a collective that
-    has been waited on is only ordered against the device stream, so the transfer can still be
-    queued when the call returns. Tearing the communicator down at that point kills the
+    Returns:
+        dict[tuple, Any]: A group for every rank tuple this rank broadcasts through.
+    """
+    return _build_broadcast_groups(items, dict(groups or {}))[0]
+
+
+def _destroy_broadcast_groups(groups: dict[tuple, Any], owned: set) -> None:
+    """
+    Release the groups this load made, once it is done broadcasting through them.
+
+    The broadcasts have been waited on but are not necessarily finished: a collective that
+    has been waited on is only ordered against the device stream, so the transfer can still
+    be queued when the call returns. Tearing the communicator down at that point kills the
     transfer - the receiving ranks silently keep whatever their buffer held - so drain the
     stream first.
 
-    Releasing a group is then best effort: the tensors have really arrived by the time the
-    loop runs, so a group that refuses to go away is a leak worth a warning, not a reason to
-    fail the load.
+    Releasing is then best effort: the tensors have really arrived by the time the loop
+    runs, so a group that refuses to go away is a leak worth a warning rather than a reason
+    to fail a load that already has its data.
+
+    Only what this load made is passed here, and only by a rank that belongs to it:
+    ``owned`` is built from this rank own reads, so a group it never joined never reaches
+    this.
 
     Args:
-        groups (dict[tuple, Any]): Groups to release, keyed by their rank tuple.
+        groups (dict[tuple, Any]): Every group the load broadcast through, keyed by rank tuple.
+        owned (set): Rank tuples whose groups this load made and has to release.
     """
+    if not owned:
+        return
     platform.synchronize()
-
-    current_rank = platform.get_rank()
-    # Destroying a group is collective over its members, so keep the same deterministic order
-    # the groups were created in.
-    for group_ranks in sorted(groups):
-        if current_rank not in group_ranks:
-            continue
+    # Destroying a group is collective over its members, so keep the same deterministic
+    # order they were created in.
+    for group_ranks in sorted(owned):
         try:
             platform.destroy_process_group(groups[group_ranks])
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("Failed to destroy the broadcast group %s: %s", group_ranks, e)
 
 
-@dcp_timer_decorator
-def _create_groups_and_broadcast(missing_groups_ranks: dict[tuple, list[Any]]) -> None:
+@contextmanager
+def broadcast_groups_for_load(
+    items: Iterable[ReadItem],
+    groups: Optional[dict[tuple, Any]] = None,
+) -> Any:
     """
-    Create the communication groups the caller did not provide, then broadcast through them.
+    The communication groups one load broadcasts through, destroyed once it is done.
 
-    Creating a group is a collective call, so the rank tuples still missing are all-gathered
-    first and every rank creates the whole set, not only the groups it needs itself.
+    A group made here exists to carry this load's broadcasts and nothing else, so it is torn
+    down on the way out rather than left behind: a communicator holds device memory for as
+    long as it lives, and a job that loads a checkpoint has no use for these afterwards.
 
-    The groups live for this call only. Holding on to them would leak one set of communicators
-    per load, because dropping the Python handle does not release the underlying communicator,
-    and a loop that resumes repeatedly would run the backend out of them.
+    Only what this load made is destroyed. A group the caller pre-built and passed in
+    belongs to the caller, and one that was already in the process-wide cache belongs to
+    whoever put it there - the device mesh, most often, which needs it for the rest of
+    training.
+
+    Destroying is done in rank-tuple order, which every rank works out the same way, and
+    only by the ranks of the group - the ones that reach the end of the read together.
 
     Args:
-        missing_groups_ranks (dict[tuple, list[Any]]): The entries waiting for a group, keyed
-            by the rank tuple of the group they need.
+        items (Iterable[ReadItem]): The read items of this rank finalized plan.
+        groups (Optional[dict[tuple, Any]]): Communication groups the caller pre-built.
+
+    Yields:
+        dict[tuple, Any]: A group for every rank tuple this rank broadcasts through.
     """
-    logger.warning("There are missing groups %s. Then all gather the missing groups on each rank and "
-                   "create them one by one, which will increase some time consumption.",
-                   missing_groups_ranks)
-    # all gather all missing groups, create them and broadcast the tensors
-    all_missing_groups_ranks = all_gather_object(tuple(missing_groups_ranks.keys()),
-                                                 platform.get_world_size(),
-                                                 use_collectives=True)
-    final_missing_groups_ranks = set(g for sub in all_missing_groups_ranks for g in sub)
-
-    # The groups are only needed for the broadcasts right below, so create them without
-    # registering them in the global group cache. Iterate in a deterministic order:
-    # creating a group is a collective call and every rank must issue them in the same order.
-    new_groups = {}
-    for group_ranks in sorted(final_missing_groups_ranks):
-        new_groups[group_ranks] = platform.new_group(group_ranks)
-    for group_ranks, tensors in missing_groups_ranks.items():
-        for tensor in tensors:
-            broadcast_info = getattr(tensor, BROADCAST_INFO, None)
-            if broadcast_info is None:
-                continue
-            local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
-            platform.broadcast(
-                platform.detach(local_tensor),
-                broadcast_info.src_rank,
-                new_groups[group_ranks]
-            )
-            delattr(tensor, BROADCAST_INFO)
-
-    # Only reached once every broadcast went through: releasing a group whose collectives just
-    # failed can block instead of raising, which would turn a clean error into a hang.
-    _destroy_groups(new_groups)
+    built, owned = _build_broadcast_groups(items, dict(groups or {}))
+    try:
+        yield built
+    finally:
+        _destroy_broadcast_groups(built, owned)
 
 
-@dcp_timer_decorator
-def broadcast_loaded_tensors(
-    state_dict: dict[str, Any],
-    groups: Optional[dict[tuple, Any]] = None
+def _start_broadcast(
+    in_flight: deque,
+    buffer: Any,
+    source: BroadcastSource,
+    groups: dict[tuple, Any],
+    after: Optional[Any] = None,
 ) -> None:
     """
-    Broadcast loaded tensor shard from the src rank in each same-shard group.
-
-    Non have attribute BROADCAST_INFO entries in ``state_dict`` are ignored.
+    Start one broadcast without waiting for it, making room for it first.
 
     Args:
-        state_dict (dict[str, Any]): Flat or nested state dict containing DTensors
-            whose local tensors were populated on the minimum rank of each group.
-        groups (dict): The Communication groups for broadcast.
+        in_flight (deque): Broadcasts already going, oldest first. This one is added, after
+            waiting on the oldest should too many already be going.
+        buffer (Any): Contiguous memory to send from the source and receive into elsewhere.
+        source (BroadcastSource): Which ranks take part and which of them sends.
+        groups (dict[tuple, Any]): Communication groups, as :func:`ensure_broadcast_groups`
+            returns them.
+        after (Optional[Any]): Called once this broadcast has landed, for a send that is not
+            finished when the bytes arrive -- a batch still to be dealt out to the shards it
+            was gathered from.
     """
-    # A caller that enabled broadcasting without pre-building groups lands in the
-    # missing-groups path below, which creates them on demand.
-    missing_groups_ranks = _broadcast_within_existing_groups(state_dict, groups or {})
-
-    # if no group missing, return
-    if not missing_groups_ranks:
+    while len(in_flight) >= _MAX_BROADCASTS_IN_FLIGHT:
+        _finish_broadcast(in_flight.popleft())
+    handle = platform.broadcast_async(buffer, source.src_rank, groups[source.group_ranks])
+    if handle is None:
+        if after is not None:
+            after()
         return
+    in_flight.append((handle, after))
 
-    _create_groups_and_broadcast(missing_groups_ranks)
+
+def _finish_broadcast(pending: tuple) -> None:
+    """Wait on one broadcast and do whatever was left until it had landed."""
+    handle, after = pending
+    handle.wait()
+    if after is not None:
+        after()
+
+
+def broadcast_shard(
+    in_flight: deque,
+    state_dict: dict[str, Any],
+    item: ReadItem,
+    groups: dict[tuple, Any],
+) -> None:
+    """
+    Start sending one shard between the ranks that hold it, without waiting for it.
+
+    A shard travels whole rather than region by region: it is one local buffer, which is
+    contiguous where a single region of it generally is not, and every rank holding it has it
+    in the same shape. Shards are otherwise unrelated -- two of one tensor are two buffers,
+    two groups and two broadcasts.
+
+    Callers have to reach the shards of a group in the same order on every rank of it, since
+    ranks that enter a group collectives in different orders deadlock. The order the global
+    plan puts them in is the one thing every rank agrees on without asking.
+
+    Args:
+        in_flight (deque): Broadcasts already going, oldest first.
+        state_dict (dict[str, Any]): Flat state dict holding the shard to send.
+        item (ReadItem): Any item of the shard, which names it and who reads it.
+        groups (dict[tuple, Any]): Communication groups, as :func:`ensure_broadcast_groups`
+            returns them.
+    """
+    buffer = _shard_buffer(state_dict[item.dest_index.fqn], item.dest_index)
+    _start_broadcast(in_flight, buffer, item.source, groups)
+
+
+def wait_broadcasts(in_flight: deque) -> None:
+    """
+    Wait on every broadcast still going, oldest first.
+
+    The buffers being sent are the state dict tensors themselves, so a load that carried on
+    with one still in flight would be reading into memory a collective is still writing.
+
+    Args:
+        in_flight (deque): Broadcasts started so far. Emptied.
+    """
+    while in_flight:
+        _finish_broadcast(in_flight.popleft())
+
+
+class BroadcastBatcher:
+    """
+    Shards small enough that sending them one at a time would cost more than moving them.
+
+    A broadcast costs about the same whether it carries 64 KiB or 1 MiB -- around 145
+    microseconds either way, measured over four Ascend ranks, against 33 GiB/s once the
+    shards are large. Below that crossing point a load spends its time starting broadcasts
+    rather than moving data, and a checkpoint holds a great many small tensors: norms,
+    biases, scalars, step counters. So shards under ``batch_bytes`` are gathered into one
+    buffer, sent together, and dealt out again on the far side, while larger ones are sent
+    as they are, the fixed cost being small against what they carry.
+
+    Shards can only travel together when they agree on the group, the sending rank and the
+    dtype, so one batch is kept per combination. Every rank of a group meets that group
+    shards in the same order and so fills and sends the same batches at the same points,
+    which is what keeps its collectives in step -- the same thing that lets shards be sent
+    one at a time without agreeing on anything first.
+    """
+
+    def __init__(self, batch_bytes: int, groups: dict[tuple, Any]) -> None:
+        """
+        Args:
+            batch_bytes (int): Shards this size or larger are sent on their own, and a batch
+                is sent as soon as another shard would take it past this. Zero sends every
+                shard on its own, which is what a platform whose tensors cannot be gathered
+                into one buffer gets.
+            groups (dict[tuple, Any]): Communication groups, as
+                :func:`ensure_broadcast_groups` returns them.
+        """
+        self._batch_bytes = batch_bytes
+        self._groups = groups
+        self._batches: dict[tuple, list] = {}
+        self._pending_bytes: dict[tuple, int] = {}
+        self.batched = 0
+        self.sent = 0
+
+    def add(self, in_flight: deque, state_dict: dict[str, Any], item: ReadItem) -> None:
+        """
+        Hand one shard over to be sent, on its own or with others.
+
+        Args:
+            in_flight (deque): Broadcasts already going, oldest first.
+            state_dict (dict[str, Any]): Flat state dict holding the shard to send.
+            item (ReadItem): Any item of the shard, which names it and who sends it.
+        """
+        buffer = _shard_buffer(state_dict[item.dest_index.fqn], item.dest_index)
+        nbytes = platform.get_tensor_storage_size(buffer)
+        if nbytes >= self._batch_bytes:
+            self.sent += 1
+            _start_broadcast(in_flight, buffer, item.source, self._groups)
+            return
+
+        key = (item.source.group_ranks, item.source.src_rank, buffer.dtype)
+        if self._pending_bytes.get(key, 0) + nbytes > self._batch_bytes:
+            self._send(in_flight, key)
+        self._batches.setdefault(key, []).append(buffer)
+        self._pending_bytes[key] = self._pending_bytes.get(key, 0) + nbytes
+
+    def flush(self, in_flight: deque) -> None:
+        """
+        Send whatever is still waiting to go with something else.
+
+        Batches go in the order they were first added to, which follows the shards and so is
+        the same on every rank that holds them.
+
+        Args:
+            in_flight (deque): Broadcasts already going, oldest first.
+        """
+        for key in list(self._batches):
+            self._send(in_flight, key)
+
+    def _send(self, in_flight: deque, key: tuple) -> None:
+        """Send one batch, and arrange for it to be dealt out once it has landed."""
+        buffers = self._batches.pop(key, [])
+        self._pending_bytes.pop(key, None)
+        if not buffers:
+            return
+
+        group_ranks, src_rank = key[:2]
+        source = BroadcastSource(group_ranks=group_ranks, src_rank=src_rank)
+        self.sent += 1
+        if len(buffers) == 1:
+            # Nothing to gather it with, so gathering it would only cost a round trip.
+            _start_broadcast(in_flight, buffers[0], source, self._groups)
+            return
+
+        self.batched += len(buffers)
+        # Left uninitialized: the views below cover it exactly, and it is written
+        # whole either by gathering the shards into it or by the broadcast landing.
+        staging = platform.new_tensor(
+            (sum(buffer.numel() for buffer in buffers),),
+            buffers[0].dtype,
+            getattr(buffers[0], "device", None),
+        )
+        views, offset = [], 0
+        for buffer in buffers:
+            views.append(staging[offset:offset + buffer.numel()].reshape(buffer.shape))
+            offset += buffer.numel()
+
+        if source.src_rank == platform.get_rank():
+            # The sender already holds every shard, so it gathers them and needs nothing back.
+            platform.copy_each(views, buffers)
+            _start_broadcast(in_flight, staging, source, self._groups)
+            return
+        _start_broadcast(
+            in_flight, staging, source, self._groups,
+            after=lambda: platform.copy_each(buffers, views),
+        )
+
+
+def _shard_buffer(obj: Any, index: MetadataIndex) -> Any:
+    """
+    The local buffer of one shard, which is what a single broadcast carries.
+
+    Mirrors what :meth:`StandardLoadPlanner.acquire_tensor` narrows into, so that the rank
+    reading a shard sends the same storage the others are waiting to have written.
+
+    Args:
+        obj (Any): The state dict entry the shard belongs to.
+        index (MetadataIndex): Names the shard, as a read item destination does.
+
+    Returns:
+        Any: A tensor view over the shard, writable in place by a collective.
+    """
+    if isinstance(obj, DTensor):
+        if obj.layout is not None and obj.layout.ragged_shard is not None:
+            return get_ragged_box_tensor(obj, index).detach()
+        return obj.to_local().detach()
+    return obj.detach()

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DCP load with ``broadcast_from_minimum_rank``; run via parallel_run or torchrun.
+"""DCP load with ``broadcast_replicated_tensors``; run via parallel_run or torchrun.
 
-Only the minimum rank of each same-shard group reads its shard from storage; every other
+Only one rank of each same-shard group reads its shard from storage; every other
 rank of the group receives it through a broadcast. Two paths reach that broadcast, and each
 case below runs on both: the caller either pre-builds the communication groups, or the load
 all-gathers the missing rank tuples and creates the groups on demand.
@@ -181,7 +181,7 @@ def _run_broadcast_load(scenario: str, checkpoint_name: str, seed: int, prebuild
         load_state,
         checkpoint_id=checkpoint_path,
         use_collectives=True,
-        broadcast_from_minimum_rank=True,
+        broadcast_replicated_tensors=True,
         broadcast_groups=broadcast_groups,
     )
 
@@ -206,7 +206,7 @@ def _run_plain_tensor_broadcast_load(scenario: str, checkpoint_name: str, prebui
         {_PLAIN_TENSOR_NAME: buffer},
         checkpoint_id=checkpoint_path,
         use_collectives=True,
-        broadcast_from_minimum_rank=True,
+        broadcast_replicated_tensors=True,
         broadcast_groups=broadcast_groups,
     )
 
@@ -216,18 +216,18 @@ def _run_plain_tensor_broadcast_load(scenario: str, checkpoint_name: str, prebui
         shutil.rmtree(checkpoint_path, ignore_errors=True)
 
 
-def test_dcp_load_broadcast_from_minimum_rank() -> None:
+def test_dcp_load_broadcast_replicated_tensors() -> None:
     """
-    Feature: ``load(..., broadcast_from_minimum_rank=True)`` without pre-built groups.
+    Feature: ``load(..., broadcast_replicated_tensors=True)`` without pre-built groups.
     Description: Save a (2, 2)-mesh state dict mixing replicated, tp-sharded and fully sharded
         DTensors with a CHUNK_INFO-marked plain tensor, then load it into sentinel-filled
-        buffers while only the minimum rank of each same-shard group reads from storage; the
+        buffers while only one rank of each same-shard group reads from storage; the
         missing groups are all-gathered and created during the load.
     Expectation: Run success, every rank holds its own shard after the load.
     """
     _run_broadcast_load(
         scenario="groups created on demand",
-        checkpoint_name="test_dcp_broadcast_from_minimum_rank",
+        checkpoint_name="test_dcp_broadcast_replicated_tensors",
         seed=7,
         prebuild_groups=False,
     )
@@ -235,7 +235,7 @@ def test_dcp_load_broadcast_from_minimum_rank() -> None:
 
 def test_dcp_load_broadcast_with_prebuilt_groups() -> None:
     """
-    Feature: ``load(..., broadcast_from_minimum_rank=True, broadcast_groups=...)``.
+    Feature: ``load(..., broadcast_replicated_tensors=True, broadcast_groups=...)``.
     Description: Same save/load as the on-demand case, but the caller pre-builds every
         same-shard communication group and hands them to ``load``.
     Expectation: Run success, every rank holds its own shard after the load.
@@ -252,7 +252,7 @@ def test_dcp_load_broadcast_plain_tensor_with_chunk_info() -> None:
     """
     Feature: broadcast path for a state dict holding no DTensor at all.
     Description: Integrations that do not use DTensor mark a replicated plain tensor with
-        ``ChunkInfo(replica_rank_list=...)``; with broadcasting on, only the minimum rank of
+        ``ChunkInfo(replica_rank_list=...)``; with broadcasting on, only one rank of
         that rank list reads the tensor and the others receive it. Run against both group
         paths, since each one broadcasts on its own.
     Expectation: Run success, the ranks that did not read still hold the saved tensor.

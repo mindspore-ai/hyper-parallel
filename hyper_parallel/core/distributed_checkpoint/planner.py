@@ -14,47 +14,16 @@
 # ============================================================================
 """Planner interfaces and implementations"""
 import abc
+import dataclasses
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
-from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
-
-
-# Substring -> element size in bytes, matched in order (bfloat16 must be tried before float16
-# would match, and int32 before int64). Module level so tensor_storage_size() does not rebuild
-# the mapping on every call.
-_DTYPE_SUBSTR_TO_ELEM_SIZE = {
-    "int32": 4, "int64": 8, "bfloat16": 2, "float16": 2, "float32": 4, "float64": 8
-}
-_DEFAULT_ELEM_SIZE = 4
-# dtype strings come from a handful of distinct values per checkpoint, so memoising the scan
-# turns a per-item substring search into a single dict lookup.
-_dtype_elem_size_cache: dict[str, int] = {}
-
-
-def _elem_size_from_dtype(dtype_str: Any) -> int:
-    """
-    Best-effort element size in bytes for a dtype rendered as a string.
-
-    Args:
-        dtype_str (Any): Object whose ``str()`` names the dtype, e.g. ``"torch.bfloat16"``.
-
-    Returns:
-        int: Element size in bytes, defaulting to 4 for unrecognised dtypes.
-    """
-    key = str(dtype_str)
-    elem_size = _dtype_elem_size_cache.get(key)
-    if elem_size is not None:
-        return elem_size
-    lowered = key.lower()
-    elem_size = _DEFAULT_ELEM_SIZE
-    for dtype_name, size in _DTYPE_SUBSTR_TO_ELEM_SIZE.items():
-        if dtype_name in lowered:
-            elem_size = size
-            break
-    _dtype_elem_size_cache[key] = elem_size
-    return elem_size
+from hyper_parallel.core.distributed_checkpoint.metadata import (
+    Metadata,
+    MetadataIndex,
+    dtype_element_size,
+)
 
 
 class WriteItemType(Enum):
@@ -110,12 +79,30 @@ class WriteItem:
         num = 1
         for dim in chunk.sizes:
             num *= int(dim)
-        # Try to get dtype item size from properties
+        # An item with no dtype recorded counts as one unit per element.
         dtype_str = getattr(properties, "dtype", None)
         if dtype_str is None:
             return int(num)
-        return int(num) * _elem_size_from_dtype(dtype_str)
+        return int(num) * dtype_element_size(dtype_str)
 
+
+
+@dataclass(frozen=True)
+class BroadcastSource:
+    """
+    Where a ReadItem gets its data when more than one rank needs the very same bytes.
+
+    Only ``src_rank`` reads them from storage; the other ranks of ``group_ranks`` receive
+    them from it. Which rank is the source is decided once, globally, while the load plan is
+    built, so every rank of the group names the same one without having to ask.
+
+    Attributes:
+        group_ranks: Ascending global ranks that load identical data.
+        src_rank: Member of the group that reads from storage and sends to the rest.
+    """
+
+    group_ranks: tuple[int, ...]
+    src_rank: int
 
 
 @dataclass(frozen=True)
@@ -133,6 +120,19 @@ class ReadItem:
         storage_index: Metadata index identifying the source in checkpoint.
         storage_offsets: Offsets into the checkpoint storage data.
         lengths: Size of the hypercube to copy (dimensions of the data region).
+        broadcastable: Whether this read is worth handing to a collective. False says the
+            destination stayed in host memory, where what a load keeps is little and few --
+            an optimizer's step counter, while the moments beside it follow the parameter
+            onto the accelerator -- so every rank that wants it reads it, like a pickled
+            entry, rather than one reading it and sending it to the rest. Reading it costs
+            less than moving it, and the group it would move through, raised on the
+            accelerator library, holds no backend for host memory in any case. The rank
+            that holds the destination is the only one that can tell, so it says so here
+            and the global plan hears it through the gather. Default True.
+        source: Set when other ranks load the same bytes, naming the one that reads them.
+            None means this rank reads the item itself, which is the only case until a
+            global plan decides otherwise, and the only case at all for an item the line
+            above rules out. Default None.
     """
     type: LoadItemType
     dest_index: MetadataIndex  # Index into the state_dict
@@ -140,6 +140,8 @@ class ReadItem:
     storage_index: MetadataIndex  # Index into the checkpoint
     storage_offsets: tuple  # Offset into the checkpoint data
     lengths: tuple  # Size of the hypercube to copy
+    broadcastable: bool = True  # Whether sending this is worth what it costs, or possible
+    source: Optional[BroadcastSource] = None  # Who reads it, once a global plan has said
 
 
 @dataclass(frozen=True)
@@ -164,7 +166,12 @@ class SavePlan:
     planner_data: Any = None  # Planner-specific data (can be any type)
 
 
-@dataclass(frozen=True)
+# Stand-in for the checkpoint location of a read that has been elided from a plan about to
+# cross the wire. One shared instance, so pickling stores it once for the whole plan.
+_STORAGE_ELIDED = MetadataIndex("")
+
+
+@dataclass
 class LoadPlan:
     """
     Plan for loading checkpoint.
@@ -181,6 +188,37 @@ class LoadPlan:
     items: list[ReadItem] = field(default_factory=list)
     storage_data: Optional[dict[MetadataIndex, Any]] = None  # Storage-specific data mapping
     planner_data: Any = None  # Planner-specific data (can be any type)
+
+    def identity(self) -> "LoadPlan":
+        """
+        A copy carrying only what other ranks need in order to recognize these reads.
+
+        :meth:`LoadPlanner.build_global_plan` matches reads across ranks by the shard they
+        land in, :attr:`ReadItem.dest_index`, and never looks at where a read comes from in
+        the checkpoint. That part is each rank own business -- it resolves it from metadata
+        it already holds -- so it does not have to travel through the all-gather that feeds
+        the global plan, which is one index and one offset tuple per read saved.
+
+        The elided fields are replaced by a shared placeholder rather than dropped, so the
+        result is still an ordinary LoadPlan. Only ever pass the result to the gather: the
+        rank that executes a plan keeps its own untouched copy.
+
+        Everything not named here travels, which is what the global plan matches and decides
+        on: the shard a read lands in, and whether a collective could write into it.
+
+        Returns:
+            LoadPlan: The same items with their checkpoint location elided.
+        """
+        return dataclasses.replace(
+            self,
+            items=[
+                dataclasses.replace(item, dest_offsets=(), storage_index=_STORAGE_ELIDED, storage_offsets=())
+                for item in self.items
+            ],
+            storage_data=None,
+            planner_data=None,
+
+        )
 
 
 class SavePlanner(abc.ABC):

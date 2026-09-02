@@ -19,6 +19,7 @@ import threading
 import multiprocessing as mp
 from collections.abc import Callable
 from concurrent.futures import Future
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -52,7 +53,9 @@ from hyper_parallel.core.distributed_checkpoint.storage import (
 )
 from hyper_parallel.core.distributed_checkpoint.util import (
     all_gather_object,
+    broadcast_groups_for_load,
     dcp_timer_decorator,
+    DEFAULT_BROADCAST_BATCH_BYTES,
     logger,
     platform,
 )
@@ -384,6 +387,40 @@ def async_save(
     return ret
 
 
+def _open_checkpoint(
+    checkpoint_id: Optional[Path],
+    storage_reader: Optional[StorageReader],
+    rank: int,
+) -> tuple[StorageReader, Metadata, bool]:
+    """
+    The reader a load goes through, and what that reader says the checkpoint holds.
+
+    Args:
+        checkpoint_id (Optional[Path]): Where the checkpoint is, if the caller named it.
+        storage_reader (Optional[StorageReader]): The reader to read through, or None to
+            open a file system one on ``checkpoint_id``, which the caller has checked is
+            there to open one on.
+        rank (int): This rank, which names the rank-local metadata of a checkpoint that
+            has no shared one.
+
+    Returns:
+        tuple[StorageReader, Metadata, bool]: The reader, the metadata, and whether that
+        metadata came from the shared ``.metadata``. A checkpoint written without
+        collectives has only a ``{rank}.metadata`` apiece, and comes back False: its ranks
+        never agreed on one description of it, so a load of it has none to plan against
+        together either.
+    """
+    if storage_reader is None:
+        storage_reader = FileSystemReader(checkpoint_id)
+    elif checkpoint_id:
+        storage_reader.initialize_reader(checkpoint_id)
+
+    try:
+        return storage_reader, storage_reader.load_metadata(), True
+    except FileNotFoundError:
+        return storage_reader, storage_reader.load_metadata(rank=rank), False
+
+
 def load(
     state_dict: dict[str, Any],
     *,
@@ -391,9 +428,10 @@ def load(
     storage_reader: Optional[StorageReader] = None,
     planner: Optional[LoadPlanner] = None,
     no_dist: bool = False,
-    use_collectives: bool = False,
-    broadcast_from_minimum_rank: bool = False,
+    use_collectives: bool = True,
+    broadcast_replicated_tensors: bool = True,
     broadcast_groups: Optional[dict[tuple, Any]] = None,
+    broadcast_batch_bytes: int = DEFAULT_BROADCAST_BATCH_BYTES,
 ) -> None:
     """
     Load a distributed checkpoint into state_dict in SPMD style.
@@ -412,9 +450,30 @@ def load(
             Default None.
         no_dist (bool): If True, load without cross-rank synchronization. Default False.
         use_collectives (bool): If False, each rank loads `.metadata` or `rank.metadata`,
-            there is no communication between ranks, and each rank loads its own data. Default False.
-        broadcast_from_minimum_rank (bool): Whether broadcast from minimum rank.
-        broadcast_groups (dict): The Communication groups for broadcast.
+            there is no communication between ranks, and each rank loads its own data. Default True,
+            matching :func:`save`. A checkpoint written without it has no shared `.metadata`, and a
+            load falls back to the rank-local one and turns this off by itself, so the default costs
+            nothing to a checkpoint that cannot use it. What it does ask, as :func:`save` already
+            does, is that **every rank of the default process group call this together**: the plan
+            exchange runs on that group, so a rank that stays out of it leaves the others waiting on
+            a gather that never completes. A rank with nothing to load still takes part, passing an
+            empty state dict. Pass False to load on some of the ranks only.
+        broadcast_replicated_tensors (bool): If True, a tensor that several ranks load identically is
+            read by one of them and sent to the rest instead of every rank reading it. Which rank
+            reads which tensor is chosen so that the reads spread evenly over the group. Default
+            True, which divides what a load takes off storage by the number of ranks holding the
+            same copy. Only consulted together with ``use_collectives``: without the plan exchange
+            there is no way to tell which ranks load the same shard, so a load that asks for this
+            without it quietly reads every copy instead, which is correct but no faster.
+        broadcast_groups (dict): The Communication groups for broadcast, keyed by rank tuple.
+            Only valid together with broadcast_replicated_tensors; built on demand when not given.
+        broadcast_batch_bytes (int): Shards smaller than this are gathered into one buffer and
+            broadcast together, so that the cost of starting a broadcast is paid once for many
+            of them rather than once each. Larger shards are sent on their own. Zero turns the
+            gathering off. Only consulted together with broadcast_replicated_tensors.
+            Every rank must pass the same value: what a rank gathers together is worked
+            out from this and from the plan, without asking anybody, so ranks that
+            disagreed would broadcast in different shapes and wait on each other.
 
     Returns:
         None. The state_dict is modified in-place.
@@ -425,18 +484,11 @@ def load(
     # Determine if we're in distributed mode
     use_collectives = False if no_dist else use_collectives
 
-    # Check the DTensor broadcast args
-    if broadcast_groups and not broadcast_from_minimum_rank:
-        raise ValueError("If not use broadcast_from_minimum_rank, the broadcast_groups should be None.")
-
-    # Set up storage reader
-    if storage_reader is None:
-        if checkpoint_id is None:
-            raise ValueError("Either storage_reader or checkpoint_id must be provided")
-        storage_reader = FileSystemReader(checkpoint_id)
-    else:
-        if checkpoint_id:
-            storage_reader.initialize_reader(checkpoint_id)
+    # Check the arguments
+    if broadcast_groups and not broadcast_replicated_tensors:
+        raise ValueError("broadcast_groups is only used when broadcast_replicated_tensors is True.")
+    if storage_reader is None and checkpoint_id is None:
+        raise ValueError("Either storage_reader or checkpoint_id must be provided")
 
     # Set up planner
     planner = StandardLoadPlanner() if planner is None else planner
@@ -446,13 +498,10 @@ def load(
     world_size = platform.get_world_size()
     is_coordinator = rank == 0
 
-    # Load metadata
-    try:
-        metadata = storage_reader.load_metadata()
-    except FileNotFoundError:
-        # Fallback to rank-local metadata (e.g. checkpoint saved with use_collectives=False)
-        metadata = storage_reader.load_metadata(rank=rank)
-        use_collectives = False
+    # Open the checkpoint. One saved without collectives has no shared metadata to plan
+    # against, so a load of it cannot exchange plans however it was asked to.
+    storage_reader, metadata, shared_metadata = _open_checkpoint(checkpoint_id, storage_reader, rank)
+    use_collectives = use_collectives and shared_metadata
 
     # Configure planner
     planner.configure_planner(
@@ -460,7 +509,7 @@ def load(
         metadata=metadata,
         is_coordinator=is_coordinator,
         rank=rank,
-        broadcast_from_minimum_rank=broadcast_from_minimum_rank,
+        broadcast_replicated_tensors=broadcast_replicated_tensors,
     )
 
     # Configure storage reader
@@ -468,21 +517,36 @@ def load(
         metadata=metadata,
         is_coordinator=is_coordinator,
         rank=rank,
-        broadcast_from_minimum_rank=broadcast_from_minimum_rank,
     )
 
     # Build local plan
     local_plan = planner.build_local_plan()
     local_plan = storage_reader.optimize_local_plan(local_plan)
 
-    # Gather all local plans and build global plan
-    all_local_plans = all_gather_object(local_plan, world_size, use_collectives)
-    # build_global_plan returns this rank's plan only.
+    # Gather all local plans and build global plan. Only the identity of each read is sent:
+    # the global plan matches reads across ranks on that alone, so where they come from in
+    # the checkpoint stays with the rank that will do them. This rank puts its own full plan
+    # back over what it just sent itself, since that is the one it goes on to execute.
+    all_local_plans = all_gather_object(local_plan.identity(), world_size, use_collectives)
+    all_local_plans[rank if len(all_local_plans) > 1 else 0] = local_plan
+    # build_global_plan returns this rank's plan only: every rank runs it over the same
+    # gathered plans and reads just its own shards.
     central_plan = planner.build_global_plan(all_local_plans)
     central_plan = storage_reader.optimize_global_plan(central_plan)
 
     # Finalize plan
     final_plan = planner.finalize_plan(central_plan)
 
+    # Build the groups the broadcasts go through, and destroy them once the read is
+    # done. Creating one is collective, so what decides whether to do it has to be
+    # something every rank agrees on before anybody reads -- these three are, where
+    # "does this rank hold a shared shard" is not.
+    scope = (
+        broadcast_groups_for_load(final_plan.items, broadcast_groups)
+        if broadcast_replicated_tensors and use_collectives and world_size > 1
+        else nullcontext(broadcast_groups)
+    )
+
     # Execute read
-    storage_reader.execute_read(final_plan, planner, broadcast_groups)
+    with scope as groups:
+        storage_reader.execute_read(final_plan, planner, groups, broadcast_batch_bytes)

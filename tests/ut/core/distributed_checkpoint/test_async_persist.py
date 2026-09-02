@@ -251,6 +251,23 @@ class TestFileExchange(unittest.TestCase):
             self.assertFalse((Path(tmpdir) / f"{staging_mod.FileType.STORAGE_DATA.name}_0.pkl").exists())
             self.assertTrue((Path(tmpdir) / f"{staging_mod.FileType.LOCAL_PLAN.name}_0.pkl").exists())
 
+    def test_a_file_someone_else_deleted_still_counts_as_read(self):
+        """
+        Feature: load_file cleanup racing another deleter.
+        Description: The file is gone by the time the delete runs, which is the state the
+            delete wanted. It is not the same as the file never having been written, and
+            the two used to be told apart by nothing, the delete having sat inside the
+            block whose FileNotFoundError means "not written yet".
+        Expectation: What was read comes back. Reporting this as not ready would send the
+            caller round for a file it already holds, until its own timeout.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            staging_mod.write_file(tmpdir, staging_mod.FileType.STORAGE_DATA, 0, self._plan("storage"))
+            with patch.object(staging_mod.os, "remove", side_effect=FileNotFoundError(2, "gone")):
+                loaded = staging_mod.load_file(tmpdir, staging_mod.FileType.STORAGE_DATA, 0)
+
+            self.assertEqual(loaded, self._plan("storage"))
+
     def test_load_file_returns_none_for_a_file_that_does_not_exist(self):
         """
         Feature: load_file on a rank that has not written yet.

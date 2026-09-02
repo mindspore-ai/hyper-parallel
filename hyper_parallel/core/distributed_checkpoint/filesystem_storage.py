@@ -13,9 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """File system storage implementations for checkpoint save and load."""
-import os
 import pickle
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -26,6 +25,7 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     MetadataIndex,
 )
 from hyper_parallel.core.distributed_checkpoint.planner import (
+    LoadItemType,
     LoadPlan,
     LoadPlanner,
     ReadItem,
@@ -42,9 +42,11 @@ from hyper_parallel.core.distributed_checkpoint.storage import (
 )
 from hyper_parallel.core.distributed_checkpoint.util import (
     narrow_tensor_by_index,
-    broadcast_loaded_tensors,
+    BroadcastBatcher,
     dcp_timer_decorator,
+    logger,
     platform,
+    wait_broadcasts,
 )
 
 from hyper_parallel.platform.platform import (
@@ -65,6 +67,16 @@ class _MetadataUnpickler(pickle.Unpickler):
     _FOREIGN_MODULE_MAP = {}
 
     def find_class(self, module: str, name: str) -> Any:
+        """
+        Resolve a pickled reference, sending the modules that moved to where they now live.
+
+        Args:
+            module (str): Module the pickle names.
+            name (str): Name to resolve within it.
+
+        Returns:
+            Any: The class or function the reference stands for.
+        """
         if module in _MetadataUnpickler._FOREIGN_MODULE_MAP:
             module = _MetadataUnpickler._FOREIGN_MODULE_MAP[module]
         return super().find_class(module, name)
@@ -78,7 +90,12 @@ class FileSystemWriter(StorageWriter):
     into safetensors files and bytes into separate files.
     """
 
-    def __init__(self, checkpoint_dir: Union[Path, str]):
+    def __init__(self, checkpoint_dir: Union[Path, str]) -> None:
+        """
+        Args:
+            checkpoint_dir (Union[Path, str]): Directory the checkpoint is written into,
+                made if it is not there yet.
+        """
         self.checkpoint_dir = Path(checkpoint_dir) if isinstance(checkpoint_dir, str) else checkpoint_dir
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.rank: int = 0
@@ -96,7 +113,7 @@ class FileSystemWriter(StorageWriter):
             self.checkpoint_dir = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    def configure_writer(self, is_coordinator: bool, **kwargs) -> None:
+    def configure_writer(self, is_coordinator: bool, **kwargs: Any) -> None:
         """
         Configure storage writer.
 
@@ -353,30 +370,30 @@ def _copy_tensor_to_target(
     planner.apply_tensor(req, target_tensor)
 
 
-def _load_bytes_file(
+def _fetch_bytes_file(
         path: str,
         reqs: list[ReadItem],
-        planner: LoadPlanner,
         storage_data: dict[MetadataIndex, StorageInfo],
-) -> None:
+) -> list[tuple[ReadItem, Any]]:
     """
-    Load bytes from a file.
+    Read the payload of each item out of a bytes file, leaving it packed.
 
     Args:
         path (str): Path to the bytes file.
         reqs (list[ReadItem]): List of ReadItems for this file.
-        planner (LoadPlanner): Load planner for loading bytes.
+        storage_data (dict[MetadataIndex, StorageInfo]): Physical storage mapping.
+
+    Returns:
+        list[tuple[ReadItem, Any]]: Each item with the bytes it asked for. Unpacking them
+        into objects needs the planner, so it is left to :func:`_apply_fetched`.
     """
+    fetched: list[tuple[ReadItem, Any]] = []
     with open(path, "rb") as f:
         for req in reqs:
-            storage_info = storage_data.get(req.storage_index)
-            if storage_info is None:
-                raise KeyError(
-                    f"StorageInfo not found for index {req.storage_index}"
-                )
+            storage_info = _get_storage_info(req, storage_data)
             f.seek(storage_info.offset)
-            value = f.read(storage_info.length)
-            planner.apply_bytes(req, value)
+            fetched.append((req, f.read(storage_info.length)))
+    return fetched
 
 
 def _get_tensor_size(tensor: Any) -> Optional[tuple]:
@@ -425,74 +442,184 @@ def _validate_and_copy_tensor(
     _copy_tensor_to_target(req, tensor, target_tensor, planner)
 
 
-def _load_torch_tensor_file(
-        path: str,
+def _fetch_torch_tensor_file(
+        tensor_file: Any,
         reqs: list[ReadItem],
-        planner: LoadPlanner,
         storage_data: dict[MetadataIndex, StorageInfo],
-) -> None:
-    """Load tensor slices from a Torch safetensors file."""
-    with safe_open(path, framework="pt", device="cpu") as tensor_file:
-        available_keys = set(tensor_file.keys())
-        for req in reqs:
-            storage_info = _get_storage_info(req, storage_data)
-            tensor_key = storage_info.tensor_key or req.storage_index.fqn
-            if tensor_key not in available_keys:
-                raise KeyError(f"Key {tensor_key} not found in checkpoint file {path}")
-            tensor_slices = tuple(
-                slice(int(off), int(off) + int(length))
-                for off, length in zip(req.storage_offsets, req.lengths)
-            )
-            if tensor_slices:
-                tensor = tensor_file.get_slice(tensor_key)[tensor_slices]
-            else:
-                # Scalar entries (rank-0 tensors such as the AdamW ``step``) have no slices to
-                # narrow by, and safetensors before 0.4.3 rejects the empty index with
-                # "too many indices for tensor of dimension 0" - read the whole tensor instead.
-                tensor = tensor_file.get_tensor(tensor_key)
-            _validate_and_copy_tensor(req, tensor, planner)
+) -> list[tuple[ReadItem, Any]]:
+    """Slice the region each item asked for off an open Torch safetensors file.
+
+    A name the file does not hold is left to safetensors to report - "File does not contain
+    tensor <name>", which says as much as a check here could. Checking first meant listing
+    the file, and listing brings every name in it across from the reader whether one shard is
+    being read or all of them: 6.5 ms on a file of nine thousand tensors, paid again every
+    time the file is opened, to say ahead of time what the next line says anyway.
+    """
+    fetched: list[tuple[ReadItem, Any]] = []
+    for req in reqs:
+        storage_info = _get_storage_info(req, storage_data)
+        tensor_key = storage_info.tensor_key or req.storage_index.fqn
+        tensor_slices = tuple(
+            slice(int(off), int(off) + int(length))
+            for off, length in zip(req.storage_offsets, req.lengths)
+        )
+        if tensor_slices:
+            tensor = tensor_file.get_slice(tensor_key)[tensor_slices]
+        else:
+            # Scalar entries (rank-0 tensors such as the AdamW ``step``) have no slices to
+            # narrow by, and safetensors before 0.4.3 rejects the empty index with
+            # "too many indices for tensor of dimension 0" - read the whole tensor instead.
+            tensor = tensor_file.get_tensor(tensor_key)
+        fetched.append((req, tensor))
+    return fetched
 
 
-def _load_ms_tensor_file(
-        path: str,
+def _fetch_ms_tensor_file(
+        param_dict: Any,
         reqs: list[ReadItem],
-        planner: LoadPlanner,
         storage_data: dict[MetadataIndex, StorageInfo],
-) -> None:
-    """Load tensor slices through the ms platform adapter."""
-    param_dict = platform.load_checkpoint(path)
+) -> list[tuple[ReadItem, Any]]:
+    """Narrow the region each item asked for out of a file the ms adapter has read in."""
+    fetched: list[tuple[ReadItem, Any]] = []
     for req in reqs:
         storage_info = _get_storage_info(req, storage_data)
         tensor_key = storage_info.tensor_key or req.storage_index.fqn
         if tensor_key not in param_dict:
-            raise KeyError(f"Key {tensor_key} not found in checkpoint file {path}")
-        tensor = narrow_tensor_by_index(
+            raise KeyError(f"Key {tensor_key} not found in checkpoint file")
+        fetched.append((req, narrow_tensor_by_index(
             param_dict[tensor_key],
             req.storage_offsets,
             req.lengths,
-        )
-        _validate_and_copy_tensor(req, tensor, planner)
+        )))
+    return fetched
 
 
-def _load_tensor_file(
-        path: str,
+def _fetch_tensor_file(
+        tensor_file: Any,
         reqs: list[ReadItem],
-        planner: LoadPlanner,
         storage_data: dict[MetadataIndex, StorageInfo],
-) -> None:
+) -> list[tuple[ReadItem, Any]]:
     """
-    Load and process tensors from a safetensors file.
+    Take what a set of items wants out of an already open checkpoint file.
+
+    Nothing but the file is touched: no planner, no device, which is what leaves the caller
+    free to decide when what was read is put in place.
 
     Args:
-        path (str): Path to the safetensors file.
+        tensor_file (Any): The open file, as :class:`_OpenFiles` hands it over.
         reqs (list[ReadItem]): List of ReadItems for this file.
-        planner (LoadPlanner): Load planner for resolving and committing tensors.
         storage_data (dict[MetadataIndex, StorageInfo]): Physical storage mapping.
+
+    Returns:
+        list[tuple[ReadItem, Any]]: Each item with the region it asked for.
     """
     if platform.platform_type == PlatformType.PYTORCH:
-        _load_torch_tensor_file(path, reqs, planner, storage_data)
-    else:
-        _load_ms_tensor_file(path, reqs, planner, storage_data)
+        return _fetch_torch_tensor_file(tensor_file, reqs, storage_data)
+    return _fetch_ms_tensor_file(tensor_file, reqs, storage_data)
+
+
+def _apply_fetched(
+        fetched: list[tuple[ReadItem, Any]],
+        planner: LoadPlanner,
+) -> None:
+    """
+    Put what was read where the load wants it.
+
+    The other half of a read, and the half that has to stay with whoever owns the device and
+    the planner: it copies into the state dict and hands each item back to the planner.
+
+    Args:
+        fetched (list[tuple[ReadItem, Any]]): Items with what was read for them, as
+            :func:`_fetch_tensor_file` and :func:`_fetch_bytes_file` return them.
+        planner (LoadPlanner): Load planner for resolving and committing.
+    """
+    for req, payload in fetched:
+        if req.type is LoadItemType.BYTE_IO:
+            planner.apply_bytes(req, payload)
+        else:
+            _validate_and_copy_tensor(req, payload, planner)
+
+
+# How many checkpoint files a read keeps open. Going through the shards in the order every
+# rank agrees on means walking the files over and over, where the old file-at-a-time read
+# went through each one once, and opening one costs far more than the slice read it wraps --
+# 0.70 ms against 0.045 ms, measured on a file holding four hundred tensors. So the files
+# stay open. How many depends on what open means: a torch reader is a memory map over the
+# file and several cost next to nothing to hold, while the ms adapter reads every tensor of
+# the file into memory, so only the one in use is kept, as before.
+_TORCH_FILES_KEPT = 8
+_MS_FILES_KEPT = 1
+
+
+class _OpenFiles:
+    """The checkpoint files a read is holding open, least recently reached for first."""
+
+    def __init__(self, capacity: int, open_one: Any, close_one: Any) -> None:
+        """
+        Args:
+            capacity (int): How many files to hold before letting the oldest go.
+            open_one (Any): Called with a path, returns a reader for it.
+            close_one (Any): Called with a reader that is being let go.
+        """
+        self._capacity = capacity
+        self._open_one = open_one
+        self._close_one = close_one
+        self._readers: dict[str, Any] = {}
+
+    def reader(self, path: str) -> Any:
+        """
+        The reader for this file, opening it when it is not already held.
+
+        Args:
+            path (str): Path of the checkpoint file.
+
+        Returns:
+            Any: The open reader, now the most recently reached for.
+        """
+        reader = self._readers.pop(path, None)
+        if reader is None:
+            while len(self._readers) >= self._capacity:
+                self._close_one(self._readers.pop(next(iter(self._readers))))
+            reader = self._open_one(path)
+        self._readers[path] = reader
+        return reader
+
+    def close(self) -> None:
+        """Let go of every file still held."""
+        for reader in self._readers.values():
+            self._close_one(reader)
+        self._readers.clear()
+
+
+def _open_checkpoint_files() -> _OpenFiles:
+    """
+    A place to keep the checkpoint files of one read open, for the platform in use.
+
+    Returns:
+        _OpenFiles: Opens through safetensors on torch and through the platform adapter
+        otherwise, holding as many as that kind of reader is cheap to hold.
+    """
+    if platform.platform_type == PlatformType.PYTORCH:
+        return _OpenFiles(
+            _TORCH_FILES_KEPT,
+            lambda path: safe_open(path, framework="pt", device="cpu"),
+            lambda reader: reader.__exit__(None, None, None),
+        )
+    return _OpenFiles(_MS_FILES_KEPT, platform.load_checkpoint, lambda reader: None)
+
+
+def _broadcast_batch_bytes(requested: int) -> int:
+    """
+    How small a shard has to be to travel with others, for the platform in use.
+
+    Returns:
+        int: What the caller asked for on torch. Zero on the ms platform, where gathering
+        shards into one buffer would go through reshaped views whose writes are not known to
+        reach the buffer behind them; there every shard is sent on its own, as before.
+    """
+    if platform.platform_type == PlatformType.PYTORCH:
+        return requested
+    return 0
 
 
 class FileSystemReader(StorageReader):
@@ -503,13 +630,16 @@ class FileSystemReader(StorageReader):
     from safetensors files and bytes from separate files.
     """
 
-    def __init__(self, checkpoint_dir: Union[Path, str]):
+    def __init__(self, checkpoint_dir: Union[Path, str]) -> None:
+        """
+        Args:
+            checkpoint_dir (Union[Path, str]): Directory the checkpoint is read out of.
+        """
         self.checkpoint_dir = Path(checkpoint_dir) if isinstance(checkpoint_dir, str) else checkpoint_dir
         # Cached storage layout: MetadataIndex -> StorageInfo (torch-aligned)
         self.storage_data: dict[MetadataIndex, StorageInfo] = {}
         self.rank: int = 0
         self.is_coordinator: bool = False
-        self.broadcast_from_minimum_rank = False
 
     def initialize_reader(self, checkpoint_id: Optional[Union[Path, str]] = None) -> None:
         """
@@ -522,7 +652,7 @@ class FileSystemReader(StorageReader):
             self.checkpoint_dir = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
 
     @dcp_timer_decorator
-    def load_metadata(self, **kwargs) -> Metadata:
+    def load_metadata(self, **kwargs: Any) -> Metadata:
         """
         Load checkpoint metadata from file.
 
@@ -548,7 +678,8 @@ class FileSystemReader(StorageReader):
             metadata = _MetadataUnpickler(f).load()
         return metadata
 
-    def configure_reader(self, metadata: Metadata, is_coordinator: bool, **kwargs) -> None:
+    def configure_reader(self, metadata: Metadata, is_coordinator: bool,
+                         **kwargs: Any) -> None:
         """Configure storage reader."""
         # Cache storage_data separately for quick lookup in execute_read.
         # This mirrors torch.filesystem, where reader keeps a storage_data dict.
@@ -557,7 +688,6 @@ class FileSystemReader(StorageReader):
         # Do not evaluate get_rank() when an offline caller supplies rank. The
         # default process group is intentionally not initialized by converters.
         self.rank = kwargs["rank"] if "rank" in kwargs else platform.get_rank()
-        self.broadcast_from_minimum_rank = kwargs.get("broadcast_from_minimum_rank", self.broadcast_from_minimum_rank)
 
     def optimize_local_plan(self, plan: LoadPlan) -> LoadPlan:
         """
@@ -600,21 +730,91 @@ class FileSystemReader(StorageReader):
             raise KeyError(f"StorageInfo not found for index {read_item.storage_index}")
         return str(self.checkpoint_dir / storage_info.relative_path)
 
-    def _group_items_by_file(self, plan: LoadPlan) -> dict[str, list]:
+    def _group_items_by_file(self, items: list) -> dict[str, list]:
         """
-        Group ReadItems by storage file path.
+        Group ReadItems by the checkpoint file they read from.
+
+        Which items a rank goes to storage for at all is settled by :meth:`execute_read`,
+        which only passes on the ones this rank reads itself.
 
         Args:
-            plan (LoadPlan): Load plan containing ReadItems.
+            items (list[ReadItem]): ReadItems to load from storage.
 
         Returns:
             dict[str, list[ReadItem]]: Dictionary mapping file paths to lists of ReadItems.
         """
         per_file: dict[str, list] = {}
-        for read_item in plan.items:
+        for read_item in items:
             path = self._get_storage_path(read_item)
             per_file.setdefault(path, []).append(read_item)
         return per_file
+
+    def _private_batches(self, by_shard: dict) -> dict[str, list]:
+        """
+        Gather the shards no other rank shares into one batch per checkpoint file.
+
+        Nothing waits on these - they are read after the last broadcast has been handed
+        over - so unlike the shared shards they are under no obligation to be read in the
+        order every rank agreed on, and are free to be read in whatever order costs least.
+        Asking for a file's worth at once is that order: the file is opened, read for every
+        shard that wants it, and left, however far apart in the plan those shards sit.
+
+        What this is for above all is the pickled entries. Those go through the save side's
+        dedup like everything else, so the one that writes an entry is whichever rank was
+        carrying the least at the time, but the load side never broadcasts them - each rank
+        rebuilds its own object - so every rank reads every entry it wants, out of whatever
+        file the dedup put it in. Nothing holds a bytes file open between reads either, so
+        one batch per shard opened a file for each: eighty entries spread over three files
+        cost eighty opens where three would do.
+
+        Args:
+            by_shard (dict[MetadataIndex, list[ReadItem]]): The plan's items, gathered by
+                the shard they land in.
+
+        Returns:
+            dict[str, list[ReadItem]]: The items of every file, keyed by its path, in the
+            order the files first come up in the plan.
+        """
+        private: dict[str, list] = {}
+        for items in by_shard.values():
+            if items[0].source is not None:
+                continue
+            for item in items:
+                private.setdefault(self._get_storage_path(item), []).append(item)
+        return private
+
+    def _fetch_from_storage(self, items: list, open_files: _OpenFiles) -> list[tuple[ReadItem, Any]]:
+        """
+        Take a set of items off disk, a file at a time, and hand back what was read.
+
+        Only the checkpoint files are touched: putting any of it in place, which is what
+        needs the planner and the device, is :func:`_apply_fetched`.
+
+        A file that is not there is left to the open to report. Both of them raise
+        FileNotFoundError naming the path - safetensors as well as the builtin open - so a
+        check ahead of them said no more than they do, and said it with a stat per file, on
+        storage where a stat is a round trip to another machine.
+
+        Args:
+            items (list[ReadItem]): The items to read, in any order.
+            open_files (_OpenFiles): The files this read is holding open.
+
+        Returns:
+            list[tuple[ReadItem, Any]]: Each item with what was read for it.
+
+        Raises:
+            FileNotFoundError: If a file the items name is not there.
+        """
+        fetched: list[tuple[ReadItem, Any]] = []
+        for path, reqs in self._group_items_by_file(items).items():
+            if path.endswith(".bytes"):
+                # BYTE_IO: one bytes file per rank with per-item offsets.
+                fetched.extend(_fetch_bytes_file(path, reqs, self.storage_data))
+            else:
+                # TENSOR: one safetensors file per rank
+                reader = open_files.reader(path)
+                fetched.extend(_fetch_tensor_file(reader, reqs, self.storage_data))
+        return fetched
 
     @dcp_timer_decorator
     def execute_read(
@@ -622,35 +822,75 @@ class FileSystemReader(StorageReader):
         plan: LoadPlan,
         planner: LoadPlanner,
         broadcast_groups: Optional[dict[tuple, Any]] = None,
+        broadcast_batch_bytes: int = 0,
     ) -> None:
         """
-        Read data from storage.
+        Read data from storage, overlapping the reads with the copies and sends they feed.
 
-        Aligned with torch filesystem read_data: groups ReadItems by file,
-        loads each file once, narrows tensors by storage_offsets/lengths for
-        resharding, then resolves/copies/commits data.
+        Shards several ranks hold are dealt with first, in the order the global plan put
+        them in, which every rank arrives at the same way. The rank that was chosen to read
+        one starts its broadcast the moment it has it and goes straight on to the next shard,
+        so a send runs while the one after it is still being read. Only so many sends are
+        left going at once; past that the oldest is waited on to make room.
+
+        What no other rank shares comes last. Nobody is waiting on it, so reading it earlier
+        would only hold up the broadcasts, and reading it here fills the time the final sends
+        are still in flight. Nobody waiting on it also means nothing holds it to the order the
+        ranks agreed on, so it is read a file at a time rather than a shard at a time: each
+        file is opened once and read for every shard that wants it.
 
         Args:
             plan (LoadPlan): Load plan containing ReadItems.
             planner (LoadPlanner): Load planner for resolving and committing tensors.
-            broadcast_groups (Optional[dict]): Communication groups for broadcast.
-                Only consulted when this reader was configured with
-                ``broadcast_from_minimum_rank``; omit it for a plain read.
+            broadcast_groups (Optional[dict]): Communication group of every shard the plan
+                marked, keyed by rank tuple, as :func:`ensure_broadcast_groups` returns them.
+                Building one is collective, so it is done before the read rather than here.
+            broadcast_batch_bytes (int): Shards smaller than this are gathered and sent
+                together instead of one at a time. Zero sends every shard on its own.
+
+        Raises:
+            KeyError: If the plan marked a shard whose group is not among the ones given.
         """
-        # Group ReadItems by storage file path (like torch per_file)
-        per_file = self._group_items_by_file(plan)
+        groups = broadcast_groups or {}
 
-        # Process each file
-        for path, reqs in per_file.items():
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Checkpoint file not found: {path}")
+        by_shard: dict[MetadataIndex, list] = {}
+        for item in plan.items:
+            by_shard.setdefault(item.dest_index, []).append(item)
+        shared = sorted(
+            (index for index, items in by_shard.items() if items[0].source is not None),
+            key=lambda index: (index.fqn, index.offset, index.index),
+        )
+        # What this rank goes to storage for, in the order it will ask for it: the shards it
+        # was picked to read for its group, a shard at a time so that a group waiting on this
+        # rank waits for its own shard and no more, then what nobody else shares, a file at a
+        # time.
+        batches = [by_shard[index] for index in shared
+                   if by_shard[index][0].source.src_rank == self.rank]
+        batches.extend(self._private_batches(by_shard).values())
 
-            if path.endswith(".bytes"):
-                # BYTE_IO: one bytes file per rank with per-item offsets.
-                _load_bytes_file(path, reqs, planner, self.storage_data)
-            else:
-                # TENSOR: one safetensors file per rank
-                _load_tensor_file(path, reqs, planner, self.storage_data)
+        in_flight: deque = deque()
+        batcher = BroadcastBatcher(_broadcast_batch_bytes(broadcast_batch_bytes), groups)
+        open_files = _open_checkpoint_files()
+        try:
+            read = (self._fetch_from_storage(batch, open_files) for batch in batches)
+            for index in shared:
+                items = by_shard[index]
+                if items[0].source.src_rank == self.rank:
+                    _apply_fetched(next(read), planner)
+                batcher.add(in_flight, planner.state_dict, items[0])
 
-        if self.broadcast_from_minimum_rank:
-            broadcast_loaded_tensors(planner.state_dict, broadcast_groups)
+            # Whatever is still waiting for company goes now, before the shards nobody
+            # shares: the ranks holding them are waiting on these, and reading what
+            # nobody wants first would keep them waiting through all of it.
+            batcher.flush(in_flight)
+            for batch in read:
+                _apply_fetched(batch, planner)
+            wait_broadcasts(in_flight)
+        finally:
+            open_files.close()
+
+        if shared:
+            logger.info(
+                "[rank=%d] >>> %d replicated shards sent in %d broadcasts, %d of them gathered",
+                self.rank, len(shared), batcher.sent, batcher.batched,
+            )

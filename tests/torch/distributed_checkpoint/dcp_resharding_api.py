@@ -61,12 +61,22 @@ def _run_safe_open_reshard_case(
         load_mesh_shape: tuple[int, int],
         save_param_configs: list[dict[str, Any]],
         load_param_configs: list[dict[str, Any]],
+        broadcast: bool = False,
 ) -> None:
     """
     Save DTensors with one layout and load them with another layout.
 
     This verifies that real DCP load-time resharding reads tensor data through
     filesystem_storage.safe_open and reconstructs the original global tensors.
+
+    With ``broadcast`` on, a shard several ranks load identically is read by one of them and
+    sent to the rest. Resharding is where that meets its hardest case: a local shard is put
+    together out of several regions of the checkpoint, so one destination is named by several
+    read items, and what travels is the assembled buffer rather than any one of them.
+
+    It turns collectives on with it, since the ranks have to compare plans before any of them
+    can know a shard is shared; left off, ``load`` reads every plan alone and the broadcast
+    never happens. The cases that do not ask for it keep reading rank by rank as before.
     """
     platform = get_platform()
     current_rank = platform.get_rank()
@@ -119,7 +129,8 @@ def _run_safe_open_reshard_case(
         with mock.patch.object(
                 filesystem_storage, "safe_open", wraps=filesystem_storage.safe_open
         ) as safe_open_mock:
-            load(load_state_dict, checkpoint_id=checkpoint_path)
+            load(load_state_dict, checkpoint_id=checkpoint_path,
+                 use_collectives=broadcast, broadcast_replicated_tensors=broadcast)
 
         if load_mesh is not None:
             assert safe_open_mock.called, f"{case_name} did not load tensors through safe_open"
@@ -301,6 +312,42 @@ def test_dcp_safe_open_with_real_resharding_load() -> None:
             {"name": "replicate_to_tp", "placements": [Replicate(), Shard(1)], "local_shape": (8, 8)},
             {"name": "tp4_to_tp2_same_dim", "placements": [Replicate(), Shard(1)], "local_shape": (8, 8)},
         ],
+    )
+
+
+def test_dcp_safe_open_resharding_load_with_broadcast() -> None:
+    """
+    Feature: Test DCP load-time resharding with the replicated-shard broadcast on.
+    Description:
+        1. Save on a 2x2 mesh with parameters sharded over both dimensions.
+        2. Load onto a 1x2 mesh, so that a destination shard spans several saved chunks and
+           is named by several read items, while other parameters land identically on both
+           ranks and so form a broadcast group.
+        3. Verify the reconstructed global tensors still match what was saved.
+    Expectation: Reads assembled from several regions come out whole. A broadcast carries the
+        assembled buffer, so a shard read in pieces has to be complete before it goes; sending
+        it a piece at a time, or sending only what one read item names, would leave the
+        receiving ranks with part of their shard unwritten.
+    """
+    init_backend(_DEVICE_TYPE)
+    torch.manual_seed(3)
+    np.random.seed(2)
+
+    _run_safe_open_reshard_case(
+        case_name="dp2tp2_to_tp2_broadcast",
+        save_mesh_shape=(2, 2),
+        load_mesh_shape=(1, 2),
+        save_param_configs=[
+            {"name": "two_dim_to_tp", "placements": [Shard(0), Shard(1)], "local_shape": (4, 4)},
+            {"name": "dp_to_replicate", "placements": [Shard(0), Replicate()], "local_shape": (4, 8)},
+            {"name": "tp_col_to_tp_row", "placements": [Replicate(), Shard(1)], "local_shape": (8, 4)},
+        ],
+        load_param_configs=[
+            {"name": "two_dim_to_tp", "placements": [Replicate(), Shard(1)], "local_shape": (8, 4)},
+            {"name": "dp_to_replicate", "placements": [Replicate(), Replicate()], "local_shape": (8, 8)},
+            {"name": "tp_col_to_tp_row", "placements": [Replicate(), Shard(0)], "local_shape": (4, 8)},
+        ],
+        broadcast=True,
     )
 
 

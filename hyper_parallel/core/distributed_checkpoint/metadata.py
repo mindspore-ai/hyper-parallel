@@ -74,21 +74,56 @@ class ChunkInfo:
     replica_rank_list: Optional[tuple[int]] = None
 
 
-@dataclass(frozen=True)
-class BroadcastInfo:
-    """
-    Info for one same-shard broadcast.
+# Ordered longest-match-first: "bfloat16" has to be tried before "float16", which is a
+# substring of it. A dict would work today but hides that the order is load-bearing.
+_DTYPE_ELEMENT_SIZES = (
+    ("bfloat16", 2),
+    ("float16", 2),
+    ("float32", 4),
+    ("float64", 8),
+    ("int8", 1),
+    ("int16", 2),
+    ("int32", 4),
+    ("int64", 8),
+    ("bool", 1),
+)
+DEFAULT_DTYPE_ELEMENT_SIZE = 4
 
-    Attached to a state dict entry by the load planner when several ranks hold the same
-    shard: only ``src_rank`` reads it from storage and the rest of ``group_ranks``
-    receive it through a broadcast.
+# A checkpoint names only a handful of distinct dtypes, while this is asked once per plan
+# item - tens of thousands of times on a large model - so each name is scanned once and
+# answered from here afterwards.
+_dtype_element_size_cache: dict[str, int] = {}
 
-    Attributes:
-        group_ranks: Rank list within the broadcast domain.
-        src_rank: Rank ID for data transmission within a broadcast domain
+
+def dtype_element_size(dtype: Optional[str]) -> int:
     """
-    group_ranks: tuple
-    src_rank: int
+    Bytes one element of ``dtype`` takes.
+
+    The dtype reaches the checkpoint as a framework-specific string such as
+    ``"torch.bfloat16"`` or ``"Float32"``, so it is matched by substring rather than by
+    equality. Anything unrecognized falls back to :data:`DEFAULT_DTYPE_ELEMENT_SIZE`, which
+    keeps the sizes usable as relative weights even for a dtype this table does not name.
+
+    Args:
+        dtype (Optional[str]): Dtype name from :class:`TensorProperties`, or None.
+
+    Returns:
+        int: Size of one element in bytes.
+    """
+    if dtype is None:
+        return DEFAULT_DTYPE_ELEMENT_SIZE
+    key = str(dtype)
+    cached = _dtype_element_size_cache.get(key)
+    if cached is not None:
+        return cached
+    lowered = key.lower()
+    element_size = DEFAULT_DTYPE_ELEMENT_SIZE
+    for name, size in _DTYPE_ELEMENT_SIZES:
+        if name in lowered:
+            element_size = size
+            break
+    _dtype_element_size_cache[key] = element_size
+    return element_size
 
 
 @dataclass(frozen=True)

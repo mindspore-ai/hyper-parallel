@@ -202,6 +202,7 @@ class StorageReader(abc.ABC):
         plan: LoadPlan,
         planner: LoadPlanner,
         broadcast_groups: Optional[dict] = None,
+        broadcast_batch_bytes: int = 0,
     ) -> None:
         """
         Execute read operation from storage according to the load plan.
@@ -211,5 +212,7 @@ class StorageReader(abc.ABC):
             planner (LoadPlanner): The load planner instance for applying loaded data.
             broadcast_groups (Optional[dict]): Communication groups for broadcast.
                 Only consulted when the reader was configured with
-                ``broadcast_from_minimum_rank``; omit it for a plain read.
+                the global plan marked as read by another rank; omit it for a plain read.
+            broadcast_batch_bytes (int): Shards smaller than this may be sent together
+                rather than one at a time. Zero sends every shard on its own.
         """
