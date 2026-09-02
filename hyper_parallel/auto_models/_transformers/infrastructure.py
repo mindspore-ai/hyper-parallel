@@ -246,8 +246,41 @@ def _move_model_to_device(
         logger.info("Model moved to %s", device)
         return model
 
-    model.to_empty(device=device)
+    _to_empty_preserving_nonpersistent_buffers(model, device)
     return model
+
+
+def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device) -> None:
+    """Materialize parameters without discarding config-derived buffers."""
+    buffers = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:  # pylint: disable=W0212
+            buffer = module._buffers.get(name)  # pylint: disable=W0212
+            if buffer is None:
+                continue
+            if isinstance(buffer, DTensor):
+                logger.warning(
+                    "Non-persistent DTensor buffer %s on %s cannot be preserved across materialization",
+                    name,
+                    type(module).__name__,
+                )
+                continue
+            local_buffer = _local_tensor(buffer)
+            if local_buffer.is_meta:
+                logger.warning(
+                    "Non-persistent buffer %s on %s is on meta and cannot be preserved across materialization",
+                    name,
+                    type(module).__name__,
+                )
+                continue
+            buffers.append((module, name, local_buffer.detach().clone()))
+
+    model.to_empty(device=device)
+
+    for module, name, buffer in buffers:
+        materialized_buffer = module._buffers[name]  # pylint: disable=W0212
+        local_materialized = _local_tensor(materialized_buffer)
+        module._buffers[name] = buffer.to(device=local_materialized.device)  # pylint: disable=W0212
 
 
 def _initialize_model_weights(model: nn.Module) -> None:
@@ -358,6 +391,7 @@ def _mark_loaded_targets_initialized(
     _validate_materialized(loaded_targets)
     for target in loaded_targets:
         target.tensor._is_hf_initialized = True  # pylint: disable=W0212
+        target.module._is_hf_initialized = True  # pylint: disable=W0212
         snapshots[target.fqn] = _snapshot_target(target)
     return snapshots
 
@@ -432,8 +466,20 @@ def _adjust_loading_keys(
     )
 
 
-def _prepare_initialization_targets(targets: list[_FinalizeTarget]) -> None:
-    """Clear stale initialization flags only for state that must be rebuilt."""
+def _prepare_initialization_targets(
+    model: nn.Module,
+    targets: list[_FinalizeTarget],
+) -> None:
+    """Clear initialization flags only for state that must be rebuilt.
+
+    Hugging Face ``initialize_weights()`` is module-scoped: if a module is not
+    marked initialized, its initializer may reset every direct parameter it owns.
+    During deferred checkpoint loading most modules already contain pretrained
+    tensors, so mark the model initialized first and then reopen only the
+    modules that own missing/non-persistent state.
+    """
+    for module in model.modules():
+        module._is_hf_initialized = True  # pylint: disable=W0212
     owner_modules = {}
     for target in targets:
         target.tensor._is_hf_initialized = False  # pylint: disable=W0212
@@ -527,7 +573,7 @@ def _finalize_model_loading(
         )
 
     _validate_materialized(initialization_targets)
-    _prepare_initialization_targets(initialization_targets)
+    _prepare_initialization_targets(model, initialization_targets)
     if initialization_targets:
         _initialize_model_state_after_loading(model)
         for target in initialization_targets:

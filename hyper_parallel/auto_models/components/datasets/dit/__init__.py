@@ -12,18 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public dataset interfaces."""
+"""DiT dataset, collation, and get-batch components."""
 
-from hyper_parallel.auto_models.components.datasets.batching import (
-    DynamicBatchDataLoader,
-    FixedBatchDataLoader,
-    ParallelBatch,
-    build_indexed_collate_fn,
-    build_online_text_collate_fn,
-    calculate_num_micro_batches,
-)
-from hyper_parallel.auto_models.components.datasets.dataset_logging import enable_dataset_logging
-from hyper_parallel.auto_models.components.datasets.dit import (
+from hyper_parallel.auto_models.components.datasets.dit.wan_video import (
     DiTBatch,
     DiTCollator,
     WanVideoTransform,
@@ -35,15 +26,8 @@ from hyper_parallel.auto_models.components.datasets.dit import (
 __all__ = [
     "DiTBatch",
     "DiTCollator",
-    "DynamicBatchDataLoader",
-    "FixedBatchDataLoader",
-    "ParallelBatch",
     "WanVideoTransform",
     "build_dit_collate_fn",
-    "build_indexed_collate_fn",
-    "build_online_text_collate_fn",
     "build_wan_video_dataset",
     "build_wan_video_transform",
-    "calculate_num_micro_batches",
-    "enable_dataset_logging",
 ]

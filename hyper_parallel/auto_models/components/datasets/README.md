@@ -479,6 +479,7 @@ Mapping Dataset 使用 `build_dataset_batch_sampler`：
 
 - `single`：从 `consumed_samples` 后顺序消费一个 epoch。
 - `cyclic`：按 seed 和 epoch 生成可重现顺序，可选 data sharding。
+- `distributed`：复现 PyTorch `DistributedSampler` 的 `randperm(seed + epoch)` 顺序和 rank stride。
 - `data_rearrange_map`：在返回 Dataset index 前做额外逻辑到物理索引映射。
 - `drop_last`：控制是否丢弃不完整的分布式 batch。
 

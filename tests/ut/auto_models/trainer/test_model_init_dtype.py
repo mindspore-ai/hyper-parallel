@@ -37,6 +37,7 @@ class _DtypeModel(nn.Module):  # pylint: disable=abstract-method
         super().__init__()
         self.weight = nn.Parameter(torch.ones(2, dtype=dtype))
         self.register_buffer("scale", torch.ones(2, dtype=dtype))
+        self.register_buffer("rope", torch.full((2,), 3.0, dtype=torch.float32), persistent=False)
         self.register_buffer("indices", torch.tensor([1, 2], dtype=torch.int64))
         self.register_buffer("mask", torch.tensor([True, False]))
 
@@ -63,6 +64,8 @@ class TestModelInitDtype(unittest.TestCase):
 
         self.assertEqual(model.weight.dtype, torch.bfloat16)
         self.assertEqual(model.scale.dtype, torch.bfloat16)
+        self.assertEqual(model.rope.dtype, torch.float32)
+        self.assertTrue(torch.equal(model.rope, torch.full((2,), 3.0)))
         self.assertEqual(model.indices.dtype, torch.int64)
         self.assertEqual(model.mask.dtype, torch.bool)
         self.assertEqual(id(model.weight), identities["weight"])
@@ -84,6 +87,7 @@ class TestModelInitDtype(unittest.TestCase):
         apply_model_init_dtype(model, "float32")
         self.assertEqual(model.weight.dtype, torch.float32)
         self.assertEqual(model.scale.dtype, torch.float32)
+        self.assertEqual(model.rope.dtype, torch.float32)
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_meta_parameter_conversion_to_float32_preserves_identity(self):

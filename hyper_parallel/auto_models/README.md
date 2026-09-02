@@ -1,11 +1,12 @@
 # AutoModels
 
-AutoModels 提供由 YAML 配置驱动的文本与多模态 Trainer。`parse_training_args()` 将 YAML 和 CLI dotted overrides 解析为 `TrainerConfig`，`TextTrainer` 或 `VLMTrainer` 再根据配置构建训练组件并执行训练。分布式张量、模型分片和集合通信等底层能力由 HyperParallel Core 提供。
+AutoModels 提供由 YAML 配置驱动的文本、多模态与 DiT Trainer。`parse_training_args()` 将 YAML 和 CLI dotted overrides 解析为 `TrainerConfig`，`TextTrainer`、`VLMTrainer` 或 `DiTTrainer` 再根据配置构建训练组件并执行训练。分布式张量、模型分片和集合通信等底层能力由 HyperParallel Core 提供。
 
 ## 使用入口
 
 - 安装要求、源码构建参数、CANN 与通信环境配置见 [安装指南](../../docs/installation.md)。
 - 训练启动方式见 [项目快速开始](../../README.md#快速开始)。
+- DiT/Wan 训练入口为 `scripts/train_dit.py`，Wan2.1 T2V/I2V 全参微调示例见 `examples/wan/`。
 
 ## TrainerConfig 配置
 

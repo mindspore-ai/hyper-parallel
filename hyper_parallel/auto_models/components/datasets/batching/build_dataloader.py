@@ -218,6 +218,8 @@ def build_dataloader(
     drop_last = getattr(dataloader_target, "drop_last", True)
     rearrangement_map = getattr(dataloader_target, "data_rearrange_map", None)
     data_sharding = getattr(dataloader_target, "data_sharding", False)
+    sampler_shuffle = getattr(dataloader_target, "sampler_shuffle", True)
+    sampler_drop_last = getattr(dataloader_target, "sampler_drop_last", False)
 
     dataloaders: list[Any | None] = [None] * len(datasets)
     batch_samplers: list[Any | None] = [None] * len(datasets)
@@ -240,6 +242,8 @@ def build_dataloader(
                 data_rearrange_map=rearrangement_map,
                 sampler_type=sampler_type,
                 data_sharding=data_sharding,
+                sampler_shuffle=sampler_shuffle,
+                sampler_drop_last=sampler_drop_last,
                 seed=seed,
             )
 

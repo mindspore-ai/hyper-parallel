@@ -1,0 +1,162 @@
+# Wan2.1 I2V 1.3B full-parameter finetuning through AutoModels DiTTrainer.
+
+model:
+  _target_: hyper_parallel.auto_models.components.models.wan.build_wan_transformer_model
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers
+  transformer_subfolder: transformer
+  condition_model_name_or_path: auto
+  task: i2v
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  local_files_only: false
+  condition_model:
+    tokenizer_subfolder: tokenizer
+    text_encoder_subfolder: text_encoder
+    vae_subfolder: vae
+    scheduler_subfolder: scheduler
+    image_processor_subfolder: image_processor
+    image_encoder_subfolder: image_encoder
+    max_sequence_length: 512
+    num_train_timesteps: 1000
+    video_max_size: 480
+    cfg_negative_prob: 0.1
+    transformer_dtype: bfloat16
+
+model_init_dtype: bfloat16
+
+training:
+  train_iters: 200
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: rank_average
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+  logging_steps: 1
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 1
+  edp_shard_size: 1
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: false
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+  swap_inputs: false
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  data_transform:
+    _target_: hyper_parallel.auto_models.components.datasets.build_wan_video_transform
+    task: i2v
+    source_name: Tom-and-Jerry-VideoGeneration-Dataset
+    fps: 24
+    max_frames: 81
+    frame_factor: null
+    frame_factor_remainder: 0
+    use_first_video_frame_as_image: true
+  _target_: hyper_parallel.auto_models.components.datasets.build_wan_video_dataset
+  data_path: ./Tom-and-Jerry-VideoGeneration-Dataset-parquet
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: null
+    shuffle: false
+    split_by_data_parallel: true
+
+dataloader:
+  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.auto_models.components.datasets.build_dit_collate_fn
+  get_batch:
+    _target_: hyper_parallel.auto_models.components.datasets.DiTBatch
+  dataloader_type: distributed
+  data_rearrange_map: null
+  data_sharding: false
+  sampler_shuffle: true
+  sampler_drop_last: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.auto_models.components.optim.optimizer.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 20
+    min_lr: 1.0e-6
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/wan2_1_i2v_1_3b_full/checkpoints
+  save_steps: 100
+  save_epochs: 1
+  is_async: false
+  is_peft: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: true
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiling:
+  enabled: false
+  start_step: 3
+  end_step: 4
+  trace_dir: ./outputs/wan2_1_i2v_1_3b_full/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  rank: 0

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import operator
 import os
 import random
@@ -26,7 +27,7 @@ from hyper_parallel.platform import get_platform
 from hyper_parallel.auto_models.components.datasets.dataset_logging import get_dataset_logger
 
 IndexMapping = Union[Mapping[int, int], Sequence[int]]
-SamplerType = Literal["single", "cyclic"]
+SamplerType = Literal["single", "cyclic", "distributed"]
 
 logger = get_dataset_logger(__name__)
 platform = get_platform()
@@ -263,6 +264,109 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         return active_samples
 
 
+class _DistributedDatasetBatchSampler(_DatasetBatchSampler):
+    """Yield PyTorch DistributedSampler-compatible rank-local indices."""
+
+    def __init__(
+            self,
+            *,
+            seed: int,
+            shuffle: bool,
+            sampler_drop_last: bool,
+            total_samples: int,
+            **sampler_options: Any,
+    ) -> None:
+        """Store original Dataset size and padded distributed-sampler size."""
+        _validate_positive_integer(total_samples, "total_samples")
+        dp_world_size = sampler_options["dp_world_size"]
+        _validate_positive_integer(dp_world_size, "dp_world_size")
+
+        if sampler_drop_last and total_samples % dp_world_size != 0:
+            num_samples = math.ceil((total_samples - dp_world_size) / dp_world_size)
+        else:
+            num_samples = math.ceil(total_samples / dp_world_size)
+        if num_samples <= 0:
+            raise ValueError("distributed Dataset must contain at least one sample per DP rank")
+
+        self.source_total_samples = total_samples
+        self.num_samples = num_samples
+        self.seed = seed
+        self.shuffle = shuffle
+        self.sampler_drop_last = sampler_drop_last
+        super().__init__(
+            total_samples=num_samples * dp_world_size,
+            **sampler_options,
+        )
+
+    def __len__(self) -> int:
+        """Return remaining rank-local micro-batches in DistributedSampler order."""
+        consumed_local_samples = min(
+            self.consumed_samples // self.dp_world_size,
+            self.num_samples,
+        )
+        remaining_samples = self.num_samples - consumed_local_samples
+        full_batches, partial_samples = divmod(remaining_samples, self.micro_batch_size)
+        if self.drop_last or partial_samples == 0:
+            return full_batches
+        return full_batches + 1
+
+    def __iter__(self) -> Iterator[list[int]]:
+        """Build the current epoch permutation and stride it by DP rank."""
+        if self.consumed_samples % self.dp_world_size != 0:
+            raise ValueError("distributed consumed_samples must align to the DP world size")
+
+        logger.debug(
+            "Starting distributed Dataset epoch=%d at consumed_samples=%d",
+            self.epoch,
+            self.consumed_samples,
+        )
+
+        indices = self._build_epoch_indices()
+        rank_indices = indices[self.dp_rank:self.total_samples:self.dp_world_size]
+        local_offset = self.consumed_samples // self.dp_world_size
+        if local_offset > len(rank_indices):
+            raise ValueError("distributed consumed_samples exceeds rank-local sampler length")
+
+        local_batch = []
+        for index in rank_indices[local_offset:]:
+            local_batch.append(self._resolve_index(index))
+            if len(local_batch) == self.micro_batch_size:
+                self.consumed_samples += self.micro_batch_size * self.dp_world_size
+                yield local_batch
+                local_batch = []
+
+        if local_batch:
+            if not self.drop_last:
+                self.consumed_samples += len(local_batch) * self.dp_world_size
+                yield local_batch
+            else:
+                self.consumed_samples = self.total_samples
+
+    def _build_epoch_indices(self) -> list[int]:
+        """Mirror torch.utils.data.DistributedSampler index construction."""
+        if self.shuffle:
+            import torch  # pylint: disable=import-outside-toplevel,forbidden-backend-import
+
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(self.source_total_samples, generator=generator).tolist()
+        else:
+            indices = list(range(self.source_total_samples))
+
+        if self.sampler_drop_last:
+            indices = indices[:self.total_samples]
+        else:
+            padding_size = self.total_samples - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+
+        if len(indices) != self.total_samples:
+            raise RuntimeError("distributed sampler failed to build the padded epoch index list")
+        return indices
+
+
 def _resolve_index_mapping(
         index_mapping: IndexMapping | None,
         data_rearrange_map: IndexMapping | str | os.PathLike[str] | None,
@@ -293,6 +397,8 @@ def build_dataset_batch_sampler(
         data_rearrange_map: IndexMapping | str | os.PathLike[str] | None = None,
         sampler_type: SamplerType = "single",
         data_sharding: bool = False,
+        sampler_shuffle: bool = True,
+        sampler_drop_last: bool = False,
         seed: int = 0,
 ) -> _DatasetBatchSampler:
     """Build a Dataset batch sampler.
@@ -307,6 +413,8 @@ def build_dataset_batch_sampler(
           in-memory mapping or a mapping checkpoint path.
         - ``cyclic``: Use epoch-based ``randperm`` order, with
           ``data_sharding=True/False`` and resumable sampler state.
+        - ``distributed``: Match PyTorch ``DistributedSampler`` index order,
+          then expose rank-local indices as AutoModels micro-batches.
 
     Args:
         total_samples: Number of logical samples in the Dataset.
@@ -319,9 +427,14 @@ def build_dataset_batch_sampler(
         index_mapping: Optional logical-to-physical sample index mapping.
         data_rearrange_map: Mapping object or checkpoint path.
         sampler_type: ``single`` for sequential sampling or ``cyclic`` for a
-            deterministic shuffled epoch.
+            deterministic shuffled epoch. ``distributed`` mirrors PyTorch
+            ``DistributedSampler`` and is useful when matching external
+            training stacks that use it directly.
         data_sharding: Whether cyclic sampling shuffles an independent
             contiguous bucket on each DP rank.
+        sampler_shuffle: Whether ``distributed`` shuffles epoch indices.
+        sampler_drop_last: Whether ``distributed`` drops tail samples before
+            rank striding. Keep false to match PyTorch's default.
         seed: Base seed used by cyclic epoch shuffling.
 
     Returns:
@@ -330,9 +443,10 @@ def build_dataset_batch_sampler(
     resolved_mapping = _resolve_index_mapping(index_mapping, data_rearrange_map)
     logger.debug(
         "Building Dataset sampler: type=%s, total_samples=%d, consumed_samples=%d, micro_batch_size=%d, "
-        "dp_rank=%d, dp_world_size=%d, drop_last=%s, data_sharding=%s, mapped=%s",
+        "dp_rank=%d, dp_world_size=%d, drop_last=%s, data_sharding=%s, "
+        "sampler_shuffle=%s, sampler_drop_last=%s, mapped=%s",
         sampler_type, total_samples, consumed_samples, micro_batch_size, dp_rank, dp_world_size, drop_last,
-        data_sharding, resolved_mapping is not None,
+        data_sharding, sampler_shuffle, sampler_drop_last, resolved_mapping is not None,
     )
     sampler_options = {
         "total_samples": total_samples,
@@ -365,4 +479,13 @@ def build_dataset_batch_sampler(
         )
         return batch_sampler
 
-    raise ValueError("sampler_type must be one of: single, cyclic")
+    if sampler_type == "distributed":
+        batch_sampler = _DistributedDatasetBatchSampler(
+            seed=seed,
+            shuffle=sampler_shuffle,
+            sampler_drop_last=sampler_drop_last,
+            **sampler_options,
+        )
+        return batch_sampler
+
+    raise ValueError("sampler_type must be one of: single, cyclic, distributed")

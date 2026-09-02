@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 _SAFE_WEIGHTS_NAME = "model.safetensors"
 _SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+_DIFFUSERS_SAFE_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
+_DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
 _SNAPSHOT_PATTERNS = ("*.safetensors", "*.safetensors.index.json")
 
 
@@ -178,15 +180,18 @@ def _resolve_checkpoint_index(pretrained_path: str) -> _CheckpointIndex:
             )
         )
 
-    index_path = checkpoint_directory / _SAFE_WEIGHTS_INDEX_NAME
-    if index_path.is_file():
-        return _index_sharded_checkpoint(checkpoint_directory, index_path)
+    for index_name in (_SAFE_WEIGHTS_INDEX_NAME, _DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME):
+        index_path = checkpoint_directory / index_name
+        if index_path.is_file():
+            return _index_sharded_checkpoint(checkpoint_directory, index_path)
 
-    single_file = checkpoint_directory / _SAFE_WEIGHTS_NAME
-    if single_file.is_file():
-        return _index_single_file(single_file)
+    for weights_name in (_SAFE_WEIGHTS_NAME, _DIFFUSERS_SAFE_WEIGHTS_NAME):
+        single_file = checkpoint_directory / weights_name
+        if single_file.is_file():
+            return _index_single_file(single_file)
     raise ValueError(
-        "MVP requires model.safetensors or model.safetensors.index.json under "
+        "MVP requires model.safetensors, model.safetensors.index.json, "
+        "diffusion_pytorch_model.safetensors, or diffusion_pytorch_model.safetensors.index.json under "
         f"{checkpoint_directory}"
     )
 
