@@ -63,8 +63,8 @@ forward's params (validated at apply time).
 - ``sdpa_*_load_balance_cp_wrapper``: local-tensor Colossal Head-Tail variants
   for Q exchange, K/V all-gather, dual SDPA execution, output restoration,
   and backward communication.
-- ``qwen3_8_gdn_ulysses_cp_wrapper``: primitive interception for Qwen3.8
-  Gated DeltaNet, with a causal-Conv1d halo and Ulysses exchange around the
+- ``gdn_ulysses_cp_wrapper``: primitive interception for Gated DeltaNet,
+  with a causal-Conv1d halo and Ulysses exchange around the
   Gated Delta Rule interface.
 
 Users may register their own named schemes::
@@ -194,7 +194,7 @@ def _gdn_cp_causal_conv1d(
             hidden_states, weight, bias, activation, **kwargs)
     if hidden_states.shape[-1] < halo_width:
         raise ValueError(
-            "Qwen3.8 GDN CP requires local sequence length "
+            "GDN CP requires local sequence length "
             f"({hidden_states.shape[-1]}) to be at least Conv1d halo width "
             f"({halo_width})"
         )
@@ -217,7 +217,7 @@ def _gdn_cp_conv1d_module(
         return original_forward(hidden_states)
     if hidden_states.shape[-1] < halo_width:
         raise ValueError(
-            "Qwen3.8 GDN CP requires local sequence length "
+            "GDN CP requires local sequence length "
             f"({hidden_states.shape[-1]}) to be at least Conv1d halo width "
             f"({halo_width})"
         )
@@ -241,11 +241,11 @@ def _gdn_rule_cp_to_hp(
             for tensor, expected in zip(tensors, expected_dims)):
         shapes = [tuple(tensor.shape) for tensor in tensors]
         raise ValueError(
-            "Qwen3.8 GDN CP expects 4-D Q/K/V and 3-D g/beta, got "
+            "GDN CP expects 4-D Q/K/V and 3-D g/beta, got "
             f"{shapes}"
         )
     if any(tensor.shape[1] != query.shape[1] for tensor in tensors[1:]):
-        raise ValueError("Qwen3.8 GDN CP inputs must share the sequence length")
+        raise ValueError("GDN CP inputs must share the sequence length")
     return tuple(
         ulysses_seq_to_head(
             tensor, seq_dim=1, head_dim=2, cp_mesh=cp_mesh)
@@ -258,32 +258,32 @@ def _gdn_rule_hp_to_cp(
     """Restore one GDN rule output to the local-sequence layout."""
     if output.dim() != 4:
         raise ValueError(
-            "Qwen3.8 GDN CP expects a 4-D GDN rule output, got "
+            "GDN CP expects a 4-D GDN rule output, got "
             f"shape {tuple(output.shape)}"
         )
     return ulysses_head_to_seq(
         output, seq_dim=1, head_dim=2, cp_mesh=cp_mesh)
 
 
-def _validate_qwen3_8_gdn_cp(target_module: Any, cp_mesh: Any) -> None:
-    """Validate the Qwen3.8 GDN interface required by CP interception."""
+def _validate_gdn_cp(target_module: Any, cp_mesh: Any) -> None:
+    """Validate the GDN interface required by CP interception."""
     if cp_mesh is None or cp_mesh.size() <= 1:
-        raise ValueError("Qwen3.8 GDN CP requires an active CP mesh")
+        raise ValueError("GDN CP requires an active CP mesh")
     module_name = type(target_module).__name__
     if "GatedDeltaNet" not in module_name:
         raise TypeError(
-            "Qwen3.8 GDN CP wrapper requires a GatedDeltaNet module, got "
+            "GDN CP wrapper requires a GatedDeltaNet module, got "
             f"{module_name}"
         )
     num_value_heads = getattr(target_module, "num_v_heads", None)
     if not isinstance(num_value_heads, int) or num_value_heads <= 0:
         raise ValueError(
-            "Qwen3.8 GDN CP requires target_module.num_v_heads to be a "
+            "GDN CP requires target_module.num_v_heads to be a "
             "positive integer"
         )
     if num_value_heads % cp_mesh.size():
         raise ValueError(
-            f"Qwen3.8 GDN value heads ({num_value_heads}) must be divisible "
+            f"GDN value heads ({num_value_heads}) must be divisible "
             f"by CP size ({cp_mesh.size()})"
         )
 
@@ -308,7 +308,7 @@ def _resolve_gdn_forward_implementation(
             break
         implementation = inspect.unwrap(wrapped)
     raise RuntimeError(
-        "Qwen3.8 GDN CP could not resolve the Transformers forward "
+        "GDN CP could not resolve the Transformers forward "
         "implementation"
     )
 
@@ -1767,16 +1767,16 @@ def qwen3_moe_async_hybrid_cp_wrapper(
 
 
 @inner_wrapper
-def qwen3_8_gdn_ulysses_cp_wrapper(
+def gdn_ulysses_cp_wrapper(
     target_module: Any,
     mesh: Any,
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
 ) -> None:
-    """Install primitive-level Ulysses CP around a Qwen3.8 GDN forward."""
+    """Install primitive-level Ulysses CP around a GDN forward."""
     del mesh, tp_mesh, ep_mesh
-    _validate_qwen3_8_gdn_cp(target_module, cp_mesh)
+    _validate_gdn_cp(target_module, cp_mesh)
     original_forward = target_module.forward
     forward_impl = _resolve_gdn_forward_implementation(original_forward)
     forward_globals = forward_impl.__globals__
@@ -1798,7 +1798,7 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
     )
     if not use_fused_conv and not use_module_conv:
         raise RuntimeError(
-            "Qwen3.8 GDN CP requires a fused or module causal Conv1d path"
+            "GDN CP requires a fused or module causal Conv1d path"
         )
 
     rule_names = tuple(
@@ -1813,7 +1813,7 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
     )
     if not rule_names:
         raise RuntimeError(
-            "Qwen3.8 GDN CP could not find a supported chunk Gated Delta "
+            "GDN CP could not find a supported chunk Gated Delta "
             "Rule call in the Transformers forward"
         )
     rule_owners = {
@@ -1845,18 +1845,18 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
         ) -> Any:
             if args:
                 raise TypeError(
-                    "Qwen3.8 GDN CP expects g and beta to be passed by keyword"
+                    "GDN CP expects g and beta to be passed by keyword"
                 )
             decay = kwargs.get("g")
             beta = kwargs.get("beta")
             if not isinstance(decay, torch.Tensor) or not isinstance(beta, torch.Tensor):
                 raise TypeError(
-                    "Qwen3.8 GDN CP requires Tensor keyword arguments g and beta"
+                    "GDN CP requires Tensor keyword arguments g and beta"
                 )
             if kwargs.get("initial_state") is not None or kwargs.get(
                     "output_final_state", False):
                 raise NotImplementedError(
-                    "Qwen3.8 GDN CP does not support recurrent cache state"
+                    "GDN CP does not support recurrent cache state"
                 )
             query, key, value, decay, beta = _gdn_rule_cp_to_hp(
                 query, key, value, decay, beta, cp_mesh)
@@ -1865,12 +1865,12 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
             output = original_rule(query, key, value, **call_kwargs)
             if not isinstance(output, tuple) or len(output) != 2:
                 raise TypeError(
-                    "Qwen3.8 GDN rule must return (output, recurrent_state)"
+                    "GDN rule must return (output, recurrent_state)"
                 )
             core_output, recurrent_state = output
             if recurrent_state is not None:
                 raise NotImplementedError(
-                    "Qwen3.8 GDN CP does not support a returned recurrent state"
+                    "GDN CP does not support a returned recurrent state"
                 )
             return _gdn_rule_hp_to_cp(core_output, cp_mesh), recurrent_state
 
@@ -1884,11 +1884,11 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
             cache_params = args[1]
         if cache_params is not None:
             raise NotImplementedError(
-                "Qwen3.8 GDN CP currently supports training with cache_params=None"
+                "GDN CP currently supports training with cache_params=None"
             )
         if kwargs.get("cu_seq_lens_q") is not None:
             raise NotImplementedError(
-                "Qwen3.8 GDN CP does not support packed sequences"
+                "GDN CP does not support packed sequences"
             )
 
         fired = {"conv": 0, "rule": 0}
@@ -1941,7 +1941,7 @@ def qwen3_8_gdn_ulysses_cp_wrapper(
                 replace_primitive(rule_owners[name], name, original_rule)
         if fired["conv"] != 1 or fired["rule"] != 1:
             raise RuntimeError(
-                "Qwen3.8 GDN CP wrapper expected one causal Conv1d and one "
+                "GDN CP wrapper expected one causal Conv1d and one "
                 "Gated Delta Rule call, got "
                 f"conv={fired['conv']}, rule={fired['rule']}"
             )
@@ -1969,7 +1969,7 @@ INNER_WRAPPER_REGISTRY = {
     "sdpa_hf_ulysses": sdpa_hf_ulysses_cp_wrapper,
     "flex_hf_ulysses": flex_hf_ulysses_cp_wrapper,
     "mla_dsa_ulysses": mla_dsa_ulysses_cp_wrapper,
-    "qwen3_8_gdn_ulysses": qwen3_8_gdn_ulysses_cp_wrapper,
+    "gdn_ulysses": gdn_ulysses_cp_wrapper,
 }
 
 # Static requirements for shipped wrappers. Custom registry entries own their

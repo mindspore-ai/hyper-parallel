@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for the Qwen3.8 Gated DeltaNet CP inner wrapper."""
+"""Unit tests for the Gated DeltaNet CP inner wrapper."""
 
 import torch
 
@@ -117,7 +117,7 @@ class HookedGatedDeltaNet:
         return output
 
 
-def test_qwen3_8_gdn_wrapper_intercepts_primitives_without_copying_forward(monkeypatch):
+def test_gdn_wrapper_intercepts_primitives_without_copying_forward(monkeypatch):
     """The wrapper delegates model semantics to the original GDN forward."""
     calls = {"conv": 0, "to_hp": 0, "to_cp": 0}
 
@@ -143,7 +143,7 @@ def test_qwen3_8_gdn_wrapper_intercepts_primitives_without_copying_forward(monke
     module = FakeGatedDeltaNet()
     original_conv = causal_conv1d_fn
     original_rule = torch_chunk_gated_delta_rule
-    cp_wrappers.qwen3_8_gdn_ulysses_cp_wrapper(
+    cp_wrappers.gdn_ulysses_cp_wrapper(
         module,
         mesh=None,
         tp_mesh=None,
@@ -161,7 +161,7 @@ def test_qwen3_8_gdn_wrapper_intercepts_primitives_without_copying_forward(monke
 
 
 def test_planner_recognizes_linear_attention_boundary():
-    """The standard planner classifies the Qwen3.8 linear-attention module."""
+    """The standard planner classifies a linear-attention module."""
     assert ShardingPlanner._explicit_boundary_type(  # pylint: disable=protected-access
         "model.layers.0.linear_attn",
         "linear_attn",
@@ -181,7 +181,7 @@ def test_linear_attention_nosp_contract_keeps_cp_sequence_sharded():
         assert contract[MeshAxisName.CP] == Shard(1)
 
 
-def test_qwen3_8_gdn_wrapper_resolves_hooked_instance_primitives(monkeypatch):
+def test_gdn_wrapper_resolves_hooked_instance_primitives(monkeypatch):
     """The wrapper supports the decorated Transformers 5.13 call structure."""
     monkeypatch.setattr(
         cp_wrappers,
@@ -203,7 +203,7 @@ def test_qwen3_8_gdn_wrapper_resolves_hooked_instance_primitives(monkeypatch):
     module = HookedGatedDeltaNet()
     original_conv = module.causal_conv1d_fn
     original_rule = module.chunk_gated_delta_rule
-    cp_wrappers.qwen3_8_gdn_ulysses_cp_wrapper(
+    cp_wrappers.gdn_ulysses_cp_wrapper(
         module,
         mesh=None,
         tp_mesh=None,

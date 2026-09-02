@@ -320,7 +320,7 @@ class ShardingPlanner:
                 boundary_module = model.get_submodule(boundary_fqn)
                 if "GatedDeltaNet" in type(boundary_module).__name__:
                     spec.inner_target = "self"
-                    spec.inner_wrapper = "qwen3_8_gdn_ulysses"
+                    spec.inner_wrapper = "gdn_ulysses"
                     spec.region_dispatch = False
             if boundary_type == "linear_attention" and "tp" in mesh_dim_names:
                 self._configure_gdn_tp_spec(

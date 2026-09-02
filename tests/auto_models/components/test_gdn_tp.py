@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for Qwen3.8 Gated DeltaNet tensor-parallel planning."""
+"""Unit tests for Gated DeltaNet tensor-parallel planning."""
 
 from __future__ import annotations
 
