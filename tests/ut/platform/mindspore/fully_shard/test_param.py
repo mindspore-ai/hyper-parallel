@@ -18,12 +18,13 @@
 import os
 import unittest
 from types import SimpleNamespace
+from typing import Optional, Sequence, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
-pytest.importorskip("mindspore")
+ms = pytest.importorskip("mindspore")
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E402
@@ -32,12 +33,18 @@ from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E4
 
 ensure_mindspore_platform_for_fully_shard()
 
-import mindspore as ms
-
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
-from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
-from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, MixedPrecisionPolicy
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor as CoreDTensor
+from hyper_parallel.core.dtensor.placement_types import Placement, Replicate, Shard, StridedShard
+from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo, ShardedState
+from hyper_parallel.core.fully_shard.utils import (
+    DDPMeshInfo,
+    FSDPMeshInfo,
+    MixedPrecisionPolicy,
+    SourceShardMetaInfo,
+)
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+from hyper_parallel.platform.mindspore.dtensor import DTensorBase as MindSporeDTensorBase
 from hyper_parallel.platform.mindspore.fully_shard.param import (
     AllGatherCommCtx,
     AllReduceCommCtx,
@@ -57,7 +64,6 @@ def _bare_param():
     hsdp_param = object.__new__(MindSporeHSDPParamV2)
     hsdp_param.unsharded_param_buffers = []
     hsdp_param.unsharded_accumulated_grad = None
-    hsdp_param._unsharded_param = None
     hsdp_param.allgather_comm_ctx = AllGatherCommCtx()
     hsdp_param.reduce_scatter_comm_ctx = ReduceScatterCommCtx()
     hsdp_param.all_reduce_comm_ctx = AllReduceCommCtx()
@@ -69,6 +75,113 @@ def _bare_param():
     hsdp_param.param_dtype = None
     hsdp_param.reduce_dtype = None
     return hsdp_param
+
+
+def _clone_with_mint_cat(tensor):
+    """Materialize a clone in CPU UTs where MindSpore has no Clone kernel."""
+    return ms.mint.cat((tensor,), dim=0)
+
+
+class _CpuMindSporeDTensor(MindSporeDTensorBase):
+    """Run production DTensor logic with a MindSpore base under the Torch-pinned UT bootstrap."""
+
+    def __new__(
+        cls,
+        local_tensor,
+        device_mesh=None,
+        placements=None,
+        layout=None,
+        shape=None,
+    ):
+        if isinstance(local_tensor, _CpuMindSporeDTensor) and layout is None:
+            return super().__new__(
+                cls,
+                local_tensor._local_tensor,
+                local_tensor.device_mesh,
+                local_tensor.placements,
+                local_tensor.layout,
+                local_tensor.shape,
+            )
+        return super().__new__(
+            cls,
+            local_tensor,
+            device_mesh,
+            placements,
+            layout,
+            shape,
+        )
+
+    __init_data__ = CoreDTensor.__init_data__
+    device_mesh = CoreDTensor.device_mesh
+    placements = CoreDTensor.placements
+    layout = CoreDTensor.layout
+    shape = CoreDTensor.shape
+    ndim = CoreDTensor.ndim
+    to_local = CoreDTensor.to_local
+
+    @staticmethod
+    def from_local(
+        local_tensor: ms.Tensor,
+        device_mesh: DeviceMesh,
+        placements: Sequence[Placement],
+        *,
+        run_check: bool = False,
+        shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
+    ) -> "_CpuMindSporeDTensor":
+        """Call production ``from_local`` while replacing only its backend class.
+
+        Args:
+            local_tensor: Local MindSpore shard.
+            device_mesh: Mesh used to build the real layout.
+            placements: Placements applied to the real layout.
+            run_check: Whether to run distributed metadata checks.
+            shape: Explicit logical global shape.
+            stride: Explicit logical global stride.
+
+        Returns:
+            A CPU-backed MindSpore DTensor test instance.
+        """
+        with patch(
+            "hyper_parallel.core.dtensor.dtensor.DTensor",
+            _CpuMindSporeDTensor,
+        ):
+            return CoreDTensor.from_local(
+                local_tensor,
+                device_mesh,
+                placements,
+                run_check=run_check,
+                shape=shape,
+                stride=stride,
+            )
+
+
+def _prepare_sharded_param_init(hsdp_param, param, shard_rank, shard_world_size):
+    """Configure a parameter wrapper with real mesh, layout, and module ownership."""
+    module = ms.nn.Cell()
+    module.weight = param
+    hsdp_param.device = "cpu"
+    hsdp_param._orig_param_is_dtensor = False
+    hsdp_param.source_shard_info = None
+    hsdp_param._orig_dtensor_mesh = None
+    hsdp_param._orig_dtensor_placements = None
+    hsdp_param._module_info = ParamModuleInfo(module, "weight")
+    hsdp_param._parameter_hook_migrator = ParameterHookMigrator()
+    hsdp_param._spmd_shard_mesh_dim = 0
+    hsdp_param._spmd_replicate_mesh_dim = None
+    hsdp_param.mesh_info = object.__new__(FSDPMeshInfo)
+    hsdp_param.mesh_info.mesh = DeviceMesh(
+        "cpu",
+        list(range(shard_world_size)),
+        _init_backend=False,
+    )
+    hsdp_param.mesh_info.shard_mesh_dim = 0
+    hsdp_param.mesh_info.replicate_mesh_dim = None
+    hsdp_param.mesh_info.shard_mesh_rank = shard_rank
+    hsdp_param.mesh_info.shard_mesh_size = shard_world_size
+    hsdp_param.offload_to_cpu = False
+    hsdp_param.pin_memory = False
+    return module
 
 
 class TestPlacementConstruction(MindSporeFullyShardUnitTest):
@@ -173,6 +286,72 @@ class TestPlacementConstruction(MindSporeFullyShardUnitTest):
             (StridedShard(0, split_factor=2, uneven_shard=True), Shard(0)),
         )
 
+    def test_plain_source_layout_survives_uneven_fsdp_initialization(self):
+        """
+        Feature: AutoModel/Trainer source-layout preservation during parameter initialization.
+        Description: Apply uneven FSDP to a plain parameter carrying a TP source layout.
+        Expectation: The final registered parameter retains the combined logical layout and local chunk.
+        """
+        full_param = ms.Parameter(
+            ms.Tensor(np.arange(15, dtype=np.float32).reshape(5, 3)),
+            name="weight",
+        )
+        hsdp_param = _bare_param()
+        module = _prepare_sharded_param_init(
+            hsdp_param,
+            full_param,
+            shard_rank=0,
+            shard_world_size=2,
+        )
+        with patch(
+            "hyper_parallel.core.dtensor.device_mesh.platform.get_rank",
+            return_value=0,
+        ):
+            root_mesh = DeviceMesh(
+                "cpu",
+                [[0, 1], [2, 3]],
+                mesh_dim_names=("fsdp", "tp"),
+                _init_backend=False,
+            )
+            fsdp_mesh = root_mesh["fsdp"]
+            source_mesh = root_mesh["tp"]
+        source_shard_info = SourceShardMetaInfo(
+            source_mesh,
+            (Shard(0),),
+            origin_is_dtensor=False,
+        )
+        hsdp_param.mesh_info.mesh = fsdp_mesh
+        hsdp_param.source_shard_info = source_shard_info
+
+        with (
+            patch.object(ms.Tensor, "clone", _clone_with_mint_cat),
+            patch(
+                "hyper_parallel.platform.mindspore.fully_shard.param.DTensor",
+                _CpuMindSporeDTensor,
+            ),
+        ):
+            hsdp_param._init_sharded_param(full_param, shard_placement_fn=None)
+
+        expected_placements = (
+            StridedShard(0, split_factor=2, uneven_shard=True),
+            Shard(0),
+        )
+        sharded_param = hsdp_param.sharded_param
+        self.assertIs(module.weight, sharded_param)
+        self.assertIs(hsdp_param.source_shard_info, source_shard_info)
+        self.assertIs(source_shard_info.mesh, source_mesh)
+        self.assertEqual(source_shard_info.placements, (Shard(0),))
+        self.assertEqual(sharded_param.placements, expected_placements)
+        self.assertEqual(sharded_param.shape, (10, 3))
+        self.assertEqual(sharded_param._local_tensor.shape, (3, 3))
+        self.assertEqual(sharded_param.layout.tensor_shape, (10, 3))
+        self.assertEqual(sharded_param.layout.tensor_stride, (3, 1))
+        self.assertEqual(sharded_param.layout.tensor_dtype, ms.float32)
+        np.testing.assert_allclose(
+            sharded_param._local_tensor.asnumpy(),
+            np.arange(9, dtype=np.float32).reshape(3, 3),
+        )
+
 
 class TestParameterHelpers(MindSporeFullyShardUnitTest):
     """Test local parameter buffers, shapes, and lifecycle state helpers."""
@@ -180,32 +359,47 @@ class TestParameterHelpers(MindSporeFullyShardUnitTest):
     def test_build_detaches_initial_communication_storage_from_logical_shard(self):
         """Initial communication storage should be detached without copying the logical shard."""
         hsdp_param = _bare_param()
-        hsdp_param.shard_world_size = 1
-        hsdp_param.shard_rank = 0
-        hsdp_param.offload_to_cpu = False
-        hsdp_param.pin_memory = False
         full_param = ms.Parameter(
             ms.Tensor(np.arange(6, dtype=np.float32).reshape(2, 3)),
             requires_grad=True,
+            name="weight",
         )
-
-        local_param = hsdp_param._build_sharded_param_data(
+        module = _prepare_sharded_param_init(
+            hsdp_param,
             full_param,
-            shard_dim=0,
-            dim_shard_size=2,
+            shard_rank=0,
+            shard_world_size=1,
         )
 
-        # _init_sharded_param builds this tensor under no_grad and enables
-        # gradients on the logical shard afterwards. Mirror that lifecycle so
-        # this assertion is independent of MindSpore package grad-mode details.
-        set_requires_grad_if_needed(full_param, local_param)
-        self.assertTrue(local_param.requires_grad)
+        with (
+            patch.object(ms.Tensor, "clone", _clone_with_mint_cat),
+            patch(
+                "hyper_parallel.platform.mindspore.fully_shard.param.DTensor",
+                _CpuMindSporeDTensor,
+            ),
+        ):
+            hsdp_param._init_sharded_param(full_param, shard_placement_fn=None)
+
+        sharded_param = hsdp_param.sharded_param
+        local_param = sharded_param._local_tensor
+        self.assertIsInstance(sharded_param, _CpuMindSporeDTensor)
+        self.assertIs(module.weight, sharded_param)
+        self.assertEqual(sharded_param.name, "weight")
+        self.assertTrue(sharded_param.requires_grad)
+        self.assertIsNone(sharded_param.grad)
+        self.assertEqual(sharded_param.shape, (2, 3))
+        self.assertEqual(sharded_param.layout.tensor_shape, (2, 3))
+        self.assertEqual(sharded_param.layout.tensor_stride, (3, 1))
+        self.assertEqual(sharded_param.placements, (Shard(0),))
         self.assertFalse(hsdp_param._sharded_param_data.requires_grad)
         self.assertTrue(hsdp_param._sharded_param_data.is_leaf)
         self.assertEqual(
             hsdp_param._sharded_param_data.untyped_storage().data_ptr(),
             local_param.untyped_storage().data_ptr(),
         )
+        self.assertEqual(full_param.untyped_storage().size(), 0)
+        self.assertTrue(sharded_param._hsdp_param_initialized)
+        self.assertEqual(hsdp_param.sharded_state, ShardedState.SHARDED)
 
     def test_refresh_detaches_communication_storage_without_replacing_local_tensor(self):
         """Communication storage should be a detached leaf while the optimizer shard stays unchanged."""
@@ -241,21 +435,41 @@ class TestParameterHelpers(MindSporeFullyShardUnitTest):
         Expectation: The optimizer shard stays independent from the zero-padded communication buffer.
         """
         hsdp_param = _bare_param()
-        hsdp_param.shard_world_size = 2
-        hsdp_param.shard_rank = 1
-        hsdp_param.offload_to_cpu = False
-        hsdp_param.pin_memory = False
-        full_param = ms.Tensor(np.arange(15, dtype=np.float32).reshape(5, 3))
-
-        local_param = hsdp_param._build_sharded_param_data(
+        full_param = ms.Parameter(
+            ms.Tensor(np.arange(15, dtype=np.float32).reshape(5, 3)),
+            name="weight",
+        )
+        module = _prepare_sharded_param_init(
+            hsdp_param,
             full_param,
-            shard_dim=0,
-            dim_shard_size=3,
+            shard_rank=1,
+            shard_world_size=2,
         )
 
+        with (
+            patch.object(ms.Tensor, "clone", _clone_with_mint_cat),
+            patch(
+                "hyper_parallel.platform.mindspore.fully_shard.param.DTensor",
+                _CpuMindSporeDTensor,
+            ),
+        ):
+            hsdp_param._init_sharded_param(full_param, shard_placement_fn=None)
+
+        sharded_param = hsdp_param.sharded_param
+        local_param = sharded_param._local_tensor
+        self.assertIsInstance(sharded_param, _CpuMindSporeDTensor)
+        self.assertIs(module.weight, sharded_param)
         self.assertEqual(hsdp_param.sharded_size, (2, 3))
         self.assertEqual(hsdp_param.padded_sharded_param_size, (3, 3))
+        self.assertEqual(sharded_param.shape, (5, 3))
         self.assertEqual(local_param.shape, (2, 3))
+        np.testing.assert_allclose(
+            local_param.asnumpy(),
+            np.array([[9, 10, 11], [12, 13, 14]], dtype=np.float32),
+        )
+        self.assertEqual(sharded_param.layout.tensor_shape, (5, 3))
+        self.assertEqual(sharded_param.layout.tensor_stride, (3, 1))
+        self.assertEqual(sharded_param.placements, (Shard(0, uneven_shard=True),))
         np.testing.assert_allclose(
             hsdp_param._sharded_param_data.asnumpy(),
             np.array([9, 10, 11, 12, 13, 14, 0, 0, 0], dtype=np.float32),
@@ -266,47 +480,109 @@ class TestParameterHelpers(MindSporeFullyShardUnitTest):
         )
 
         loaded_local_tensor = ms.Tensor(np.full((2, 3), 9.0, dtype=np.float32))
-        hsdp_param.sharded_param = MagicMock(
-            _local_tensor=loaded_local_tensor,
-            requires_grad=True,
-        )
-        with patch("hyper_parallel.platform.mindspore.fully_shard.param.set_requires_grad_if_needed"):
-            hsdp_param._refresh_sharded_local_tensor(loaded_local_tensor)
+        sharded_param._local_tensor = loaded_local_tensor
 
+        with patch(
+            "hyper_parallel.platform.mindspore.fully_shard.param.DTensor",
+            _CpuMindSporeDTensor,
+        ):
+            hsdp_param.reset_sharded_param()
+
+        self.assertIs(hsdp_param.sharded_param, sharded_param)
+        self.assertIs(module.weight, sharded_param)
+        self.assertIs(sharded_param._local_tensor, loaded_local_tensor)
         np.testing.assert_allclose(
-            hsdp_param.sharded_param._local_tensor.asnumpy(),
+            sharded_param._local_tensor.asnumpy(),
             loaded_local_tensor.asnumpy(),
         )
         np.testing.assert_allclose(
             hsdp_param._sharded_param_data.asnumpy(),
             np.array([9, 9, 9, 9, 9, 9, 0, 0, 0], dtype=np.float32),
         )
+        self.assertEqual(sharded_param.layout.tensor_shape, (5, 3))
+        self.assertEqual(sharded_param.layout.tensor_stride, (3, 1))
+        self.assertEqual(sharded_param.placements, (Shard(0, uneven_shard=True),))
 
-    def test_dim0_smaller_than_world_size_preserves_empty_actual_shape(self):
+    def test_dim0_balanced_chunk_initializes_every_rank(self):
         """
-        Feature: Empty ceil-chunk parameter shards.
-        Description: Shard two rows across four ranks and inspect the final rank.
-        Expectation: Its logical tensor is empty while its communication buffer contains one zero row.
+        Feature: MindSpore balanced dim-0 parameter sharding.
+        Description: Shard six rows over four ranks through the complete initialization path.
+        Expectation: Logical row counts are 2, 2, 1, 1 and short ranks use padded communication storage.
         """
-        hsdp_param = _bare_param()
-        hsdp_param.shard_world_size = 4
-        hsdp_param.shard_rank = 3
-        hsdp_param.offload_to_cpu = False
-        hsdp_param.pin_memory = False
+        full_data = np.arange(24, dtype=np.float32).reshape(6, 4)
+        expected_row_ranges = ((0, 2), (2, 4), (4, 5), (5, 6))
+        for shard_rank, (start, stop) in enumerate(expected_row_ranges):
+            with self.subTest(shard_rank=shard_rank):
+                hsdp_param = _bare_param()
+                full_param = ms.Parameter(ms.Tensor(full_data), name="weight")
+                module = _prepare_sharded_param_init(
+                    hsdp_param,
+                    full_param,
+                    shard_rank=shard_rank,
+                    shard_world_size=4,
+                )
 
-        local_param = hsdp_param._build_sharded_param_data(
-            ms.Tensor(np.arange(6, dtype=np.float32).reshape(2, 3)),
-            shard_dim=0,
-            dim_shard_size=1,
-        )
+                with (
+                    patch.object(ms.Tensor, "clone", _clone_with_mint_cat),
+                    patch(
+                        "hyper_parallel.platform.mindspore.fully_shard.param.DTensor",
+                        _CpuMindSporeDTensor,
+                    ),
+                ):
+                    hsdp_param._init_sharded_param(full_param, shard_placement_fn=None)
 
-        self.assertEqual(hsdp_param.sharded_size, (0, 3))
-        self.assertEqual(hsdp_param.padded_sharded_param_size, (1, 3))
-        self.assertEqual(local_param.shape, (0, 3))
-        np.testing.assert_allclose(
-            hsdp_param._sharded_param_data.asnumpy(),
-            np.zeros(3, dtype=np.float32),
-        )
+                sharded_param = hsdp_param.sharded_param
+                local_tensor = sharded_param._local_tensor
+                expected_local = full_data[start:stop]
+                expected_communication = np.zeros((2, 4), dtype=np.float32)
+                expected_communication[: stop - start] = expected_local
+                self.assertIs(module.weight, sharded_param)
+                self.assertEqual(hsdp_param.sharded_size, expected_local.shape)
+                self.assertEqual(hsdp_param.padded_sharded_param_size, (2, 4))
+                self.assertEqual(sharded_param.shape, (6, 4))
+                self.assertEqual(sharded_param.placements, (Shard(0, uneven_shard=True),))
+                np.testing.assert_allclose(local_tensor.asnumpy(), expected_local)
+                np.testing.assert_allclose(
+                    hsdp_param._sharded_param_data.asnumpy().reshape(2, 4),
+                    expected_communication,
+                )
+                if stop - start == 2:
+                    self.assertEqual(
+                        local_tensor.untyped_storage().data_ptr(),
+                        hsdp_param._sharded_param_data.untyped_storage().data_ptr(),
+                    )
+                else:
+                    self.assertNotEqual(
+                        local_tensor.untyped_storage().data_ptr(),
+                        hsdp_param._sharded_param_data.untyped_storage().data_ptr(),
+                    )
+
+    def test_dim0_smaller_than_world_size_is_rejected(self):
+        """
+        Feature: MindSpore zero-shape parameter validation.
+        Description: Attempt balanced chunking when there are fewer rows than shard ranks.
+        Expectation: Initialization fails before an optimizer receives a zero-sized local shard.
+        """
+        for rows, shard_world_size in ((7, 8), (0, 4)):
+            with self.subTest(rows=rows, shard_world_size=shard_world_size):
+                hsdp_param = _bare_param()
+                param = ms.Parameter(
+                    ms.Tensor(np.arange(rows * 4, dtype=np.float32).reshape(rows, 4)),
+                    name="weight",
+                )
+                module = _prepare_sharded_param_init(
+                    hsdp_param,
+                    param,
+                    shard_rank=shard_world_size - 1,
+                    shard_world_size=shard_world_size,
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "balanced chunking requires sharded dimension size",
+                ):
+                    hsdp_param._init_sharded_param(param, shard_placement_fn=None)
+                self.assertIs(module.weight, param)
 
     def test_uneven_non_dim0_sharding_is_rejected(self):
         """
@@ -350,6 +626,42 @@ class TestParameterHelpers(MindSporeFullyShardUnitTest):
         self.assertIsNot(hsdp_param.unsharded_param_buffers[0], original)
         self.assertEqual(hsdp_param.unsharded_param_buffers[0].dtype, ms.float16)
 
+    def test_init_unsharded_buffers_rejects_recreation_after_parameter_binding(self):
+        """
+        Feature: Stable unsharded parameter buffer ownership.
+        Description: Request buffer recreation after binding the stable Parameter.
+        Expectation: Recreation is rejected before the backing buffer can be replaced.
+        """
+        hsdp_param = _bare_param()
+        hsdp_param.unsharded_param_buffers = [ms.mint.empty((4,), dtype=ms.float32)]
+        hsdp_param._unsharded_param = object()
+
+        with self.assertRaisesRegex(RuntimeError, "stable unsharded parameter"):
+            hsdp_param.init_unsharded_param_buffers(
+                [3],
+                [ms.float16],
+                2,
+                "cpu",
+                force_recreate=True,
+            )
+
+    def test_init_unsharded_param_returns_before_rebinding_stable_parameter(self):
+        """
+        Feature: Stable unsharded Parameter reuse.
+        Description: Initialize an unshard cycle after the stable Parameter already exists.
+        Expectation: Initialization returns without creating a new buffer view or rebinding Parameter data.
+        """
+        hsdp_param = _bare_param()
+        stable_param = object()
+        stable_buffer = MagicMock()
+        hsdp_param._unsharded_param = stable_param
+        hsdp_param.unsharded_param_buffers = [stable_buffer]
+
+        hsdp_param.init_unsharded_param()
+
+        self.assertIs(hsdp_param._unsharded_param, stable_param)
+        stable_buffer.narrow.assert_not_called()
+
     def test_init_unsharded_param_restores_non_dim_zero_layout(self):
         """Per-parameter all-gather should inline chunk-cat reconstruction for dimension one."""
         hsdp_param = _bare_param()
@@ -386,10 +698,69 @@ class TestParameterHelpers(MindSporeFullyShardUnitTest):
         hsdp_param.init_unsharded_param()
 
         self.assertEqual(hsdp_param.unsharded_param.shape, (5,))
+        self.assertEqual(
+            hsdp_param.unsharded_param.untyped_storage().data_ptr(),
+            hsdp_param.unsharded_param_buffers[0].untyped_storage().data_ptr(),
+        )
         np.testing.assert_allclose(
             hsdp_param.unsharded_param.asnumpy(),
             np.arange(5, dtype=np.float32),
         )
+
+    def test_init_unsharded_param_removes_each_balanced_chunk_padding(self):
+        """
+        Feature: Balanced dim-0 all-gather reconstruction.
+        Description: Gather four communication slots for a six-row parameter split as 2, 2, 1, 1.
+        Expectation: The final parameter contains all six logical rows and no inter-rank padding.
+        """
+        full_data = np.arange(24, dtype=np.float32).reshape(6, 4)
+        packed_data = np.zeros((4, 2, 4), dtype=np.float32)
+        packed_data[0] = full_data[0:2]
+        packed_data[1] = full_data[2:4]
+        packed_data[2, 0] = full_data[4]
+        packed_data[3, 0] = full_data[5]
+        hsdp_param = _bare_param()
+        hsdp_param._orig_param_is_dtensor = False
+        hsdp_param._orig_size = (6, 4)
+        hsdp_param.sharded_size = (1, 4)
+        hsdp_param.padded_sharded_param_size = (2, 4)
+        hsdp_param.shard_world_size = 4
+        hsdp_param.hsdp_placement = Shard(0, uneven_shard=True)
+        hsdp_param.sharded_param = SimpleNamespace(name="weight", requires_grad=False)
+        hsdp_param.unsharded_param_buffers = [ms.mint.empty((32,), dtype=ms.float32)]
+        hsdp_param.allgather_comm_ctx.allgather_output = ms.Tensor(packed_data)
+
+        hsdp_param.init_unsharded_param()
+
+        self.assertEqual(hsdp_param.unsharded_param.shape, (6, 4))
+        np.testing.assert_allclose(
+            hsdp_param.unsharded_param.asnumpy(),
+            full_data,
+        )
+        self.assertIsNone(hsdp_param.allgather_comm_ctx.allgather_output)
+
+    def test_init_unsharded_param_rejects_temporary_output_for_even_dim0(self):
+        """
+        Feature: Even dim-0 all-gather fast-path invariant.
+        Description: Pass a temporary all-gather output to the even dim-0 consumer path.
+        Expectation: Initialization reports the internal producer/consumer state mismatch.
+        """
+        hsdp_param = _bare_param()
+        hsdp_param._module_info = SimpleNamespace(param_name="weight")
+        hsdp_param._orig_size = (4, 2)
+        hsdp_param.shard_world_size = 2
+        hsdp_param.hsdp_placement = Shard(0)
+        hsdp_param.unsharded_param_buffers = [ms.mint.empty((8,), dtype=ms.float32)]
+        hsdp_param.allgather_comm_ctx.allgather_output = ms.mint.empty(
+            (8,),
+            dtype=ms.float32,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "parameter 'weight'.*allgather_comm_ctx.allgather_output.*separate temporary buffer",
+        ):
+            hsdp_param.init_unsharded_param()
 
     def test_to_sharded_only_frees_distinct_unsharded_storage(self):
         """Replicate parameters must retain storage shared by sharded and unsharded views."""
@@ -554,6 +925,42 @@ class TestCommunicationContexts(MindSporeFullyShardUnitTest):
         np.testing.assert_allclose(
             packed_grad.asnumpy(),
             np.array([1.0, 2.0, 3.0, 4.0, 5.0, 0.0], dtype=np.float32),
+        )
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.apply_gradient_scaling_factor")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.reduce_scatter_tensor")
+    def test_reduce_scatter_pads_each_balanced_dim0_chunk(
+        self,
+        mock_reduce_scatter,
+        mock_apply_scaling,
+    ):
+        """
+        Feature: Balanced dim-0 reduce-scatter packing.
+        Description: Pack six gradient elements for a 2, 2, 1, 1 shard assignment.
+        Expectation: Rank two and rank three each receive one value followed by local padding.
+        """
+        hsdp_param = _bare_param()
+        hsdp_param._unsharded_param = SimpleNamespace(
+            grad=ms.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        )
+        hsdp_param._to_local_unsharded_grad = MagicMock(side_effect=lambda grad: grad)
+        hsdp_param.is_sharded = True
+        hsdp_param.shard_world_size = 4
+        hsdp_param.hsdp_placement = Shard(0, uneven_shard=True)
+        hsdp_param._orig_size = (6,)
+        hsdp_param.padded_sharded_param_size = (2,)
+        hsdp_param.mesh_info = object.__new__(FSDPMeshInfo)
+        hsdp_param.mesh_info.shard_process_group = "fsdp"
+        mock_reduce_scatter.return_value = MagicMock()
+
+        hsdp_param.reduce_scatter_grad(reduce_op="sum")
+
+        output, packed_grad = mock_reduce_scatter.call_args.args
+        self.assertEqual(output.shape, (2,))
+        mock_apply_scaling.assert_called_once_with(packed_grad, None)
+        np.testing.assert_allclose(
+            packed_grad.asnumpy(),
+            np.array([1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 6.0, 0.0], dtype=np.float32),
         )
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.all_reduce")

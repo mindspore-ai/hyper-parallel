@@ -28,7 +28,12 @@ from hyper_parallel.core.fully_shard.hsdp_scheduler import ParamGroupCommCtx
 from hyper_parallel.core.fully_shard.hsdp_utils import apply_gradient_scaling_factor
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
-from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
+from hyper_parallel.platform.mindspore.fully_shard.param import (
+    MindSporeHSDPParamV2,
+    _pad_dim0_for_communication,
+    _pack_dim0_reduce_scatter_input,
+    _unpack_dim0_all_gather_output,
+)
 
 
 def _normalize_device(device: Any) -> str:
@@ -82,7 +87,7 @@ class AllGatherBucket:
         if result.handle is not None:
             result.handle.wait()
             result.handle = None
-        gathered_rows = result.all_gather_output.reshape(self.shard_world_size, -1)
+        gathered_rows = result.all_gather_output.view(self.shard_world_size, -1)
         for input_numels, input_dtypes, hsdp_param in zip(
             self.metadata.param_input_numels,
             self.metadata.param_input_dtypes,
@@ -111,19 +116,32 @@ class AllGatherBucket:
             ):
                 gathered_param = gathered_rows.narrow(1, column_offset, input_numel)
                 if hsdp_param.hsdp_placement.dim == 0:
-                    destination = output_buffer.reshape(self.shard_world_size, -1)
-                    source = gathered_param
+                    if hsdp_param._orig_size[0] % self.shard_world_size == 0:
+                        destination = output_buffer.view(self.shard_world_size, -1)
+                        source = gathered_param
+                    else:
+                        source = _unpack_dim0_all_gather_output(
+                            gathered_param.contiguous(),
+                            hsdp_param._orig_size[0],
+                            self.shard_world_size,
+                            hsdp_param.padded_sharded_param_size,
+                        )
+                        source = _pad_dim0_for_communication(
+                            source.view(-1),
+                            output_buffer.numel(),
+                        )
+                        destination = output_buffer
                 else:
                     packed_shape = list(hsdp_param.sharded_size)
                     packed_shape[0] *= self.shard_world_size
-                    packed_param = gathered_param.contiguous().reshape(packed_shape)
+                    packed_param = gathered_param.contiguous().view(packed_shape)
                     param_chunks = packed_param.chunk(self.shard_world_size, dim=0)
                     source = ms.mint.cat(
                         param_chunks,
                         dim=hsdp_param.hsdp_placement.dim,
                     )
-                    destination = output_buffer.reshape(hsdp_param._orig_size)
-                # MindSpore has no cat(out=); the non-dim-0 branch materializes
+                    destination = output_buffer.view(hsdp_param._orig_size)
+                # MindSpore has no cat(out=); layout reconstruction materializes
                 # one temporary source before updating the stable destination.
                 copy_without_bumping_version(
                     destination,
@@ -287,7 +305,7 @@ def all_gather_copy_in(
     input_offset = 0
     for input_numel, source in zip(inp_split_sizes, all_gather_inputs):
         destination = all_gather_input.narrow(0, input_offset, input_numel)
-        copy_without_bumping_version(destination, source.reshape(-1))
+        copy_without_bumping_version(destination, source.view(-1))
         input_offset += input_numel
     return all_gather_input, all_gather_output
 
@@ -312,27 +330,22 @@ def reduce_scatter_copy_in(
             "reduce_scatter_copy_in expects one hsdp_param per unsharded_grad, but got "
             f"{len(hsdp_params)} params and {len(unsharded_grads)} grads"
         )
-    packed_rows = reduce_scatter_input.reshape(world_size, -1)
+    packed_rows = reduce_scatter_input.view(world_size, -1)
     column_offset = 0
     for hsdp_param, unsharded_grad in zip(hsdp_params, unsharded_grads):
         padded_shard_numel = _shape_numel(hsdp_param.padded_sharded_param_size)
         packed_grad_slot = packed_rows.narrow(1, column_offset, padded_shard_numel)
         shard_dim = hsdp_param.hsdp_placement.dim
         if shard_dim == 0:
-            padded_unsharded_dim0 = hsdp_param.padded_sharded_param_size[0] * world_size
-            if unsharded_grad.shape[0] != padded_unsharded_dim0:
-                padding_shape = (
-                    padded_unsharded_dim0 - unsharded_grad.shape[0],
-                    *unsharded_grad.shape[1:],
+            if unsharded_grad.shape[0] % world_size != 0:
+                unsharded_grad = _pack_dim0_reduce_scatter_input(
+                    unsharded_grad,
+                    world_size,
                 )
-                padding = ms.mint.zeros(padding_shape, dtype=unsharded_grad.dtype)
-                if _normalize_device(padding.device) != _normalize_device(unsharded_grad.device):
-                    padding = padding.to(_normalize_device(unsharded_grad.device))
-                unsharded_grad = ms.mint.cat((unsharded_grad, padding), dim=0)
-            packed_grad = unsharded_grad.reshape(world_size, -1)
+            packed_grad = unsharded_grad.view(world_size, -1)
         else:
             grad_chunks = unsharded_grad.chunk(world_size, dim=shard_dim)
-            packed_grad = ms.mint.cat(grad_chunks, dim=0).reshape(world_size, -1)
+            packed_grad = ms.mint.cat(grad_chunks, dim=0).view(world_size, -1)
         copy_without_bumping_version(packed_grad_slot, packed_grad)
         column_offset += padded_shard_numel
     if column_offset != packed_rows.shape[1]:
