@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for ``hyper_parallel.compile.parallel_config.ParallelConfig``.
+"""Unit tests for ``hyper_parallel.compile.parallel_config.PassConfig``.
 
 Covers the rules the dataclass asserts and that have regressed before:
 
@@ -29,15 +29,15 @@ Covers the rules the dataclass asserts and that have regressed before:
 
 import unittest
 
-from hyper_parallel.compile.parallel_config import ParallelConfig
+from hyper_parallel.compile.parallel_config import PassConfig
 
 
-class TestParallelConfigDefaults(unittest.TestCase):
+class TestPassConfigDefaults(unittest.TestCase):
     """Defaults reflect graph-mode's FSDP-focused intent."""
 
     def test_defaults(self):
         """Test default config: FSDP on, overlap on, degrees unresolved."""
-        cfg = ParallelConfig()
+        cfg = PassConfig()
         self.assertTrue(
             cfg.enable_overlap,
             (f"enable_overlap default should be True, got {cfg.enable_overlap}"),
@@ -59,7 +59,7 @@ class TestParallelConfigDefaults(unittest.TestCase):
 
     def test_explicit_construction(self):
         """Test explicit construction forwards every kwarg."""
-        cfg = ParallelConfig(
+        cfg = PassConfig(
             enable_overlap=False,
             fsdp_enabled=False,
             fsdp_degree=8,
@@ -71,14 +71,14 @@ class TestParallelConfigDefaults(unittest.TestCase):
         self.assertEqual(cfg.tp_size, 2)
 
 
-class TestParallelConfigValidation(unittest.TestCase):
+class TestPassConfigValidation(unittest.TestCase):
     """``__post_init__`` catches misconfigurations early."""
 
     def test_rejects_non_positive_tp_size(self):
         """Test ``tp_size < 1`` raises ValueError at construction."""
         for bad in (0, -1, -4):
             with self.assertRaises(ValueError) as ctx:
-                ParallelConfig(tp_size=bad)
+                PassConfig(tp_size=bad)
             self.assertIn(
                 "tp_size",
                 str(ctx.exception),
@@ -92,7 +92,7 @@ class TestParallelConfigValidation(unittest.TestCase):
         """Test explicit ``fsdp_degree < 1`` raises ValueError."""
         for bad in (0, -1, -8):
             with self.assertRaises(ValueError) as ctx:
-                ParallelConfig(fsdp_degree=bad)
+                PassConfig(fsdp_degree=bad)
             self.assertIn(
                 "fsdp_degree",
                 str(ctx.exception),
@@ -104,7 +104,7 @@ class TestParallelConfigValidation(unittest.TestCase):
 
     def test_fsdp_degree_none_allowed(self):
         """Test ``fsdp_degree=None`` is the documented auto-resolve sentinel."""
-        cfg = ParallelConfig(fsdp_degree=None)
+        cfg = PassConfig(fsdp_degree=None)
         self.assertIsNone(cfg.fsdp_degree)
 
     def test_validate_after_mutation(self):
@@ -114,7 +114,7 @@ class TestParallelConfigValidation(unittest.TestCase):
         mesh sub-size after construction; ``validate()`` is the public hook
         for re-checking invariants then.
         """
-        cfg = ParallelConfig()
+        cfg = PassConfig()
         cfg.fsdp_degree = 4
         cfg.validate()  # should not raise
 
@@ -123,7 +123,7 @@ class TestParallelConfigValidation(unittest.TestCase):
             cfg.validate()
 
 
-class TestParallelConfigTorchFree(unittest.TestCase):
+class TestPassConfigTorchFree(unittest.TestCase):
     """The dataclass must not import torch at module top.
 
     The previous implementation did ``import torch.distributed as dist`` at

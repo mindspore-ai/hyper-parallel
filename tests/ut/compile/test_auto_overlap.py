@@ -42,7 +42,7 @@ import torch
 from torch import fx
 from torch.ops import _c10d_functional
 
-from hyper_parallel.compile.parallel_config import ParallelConfig
+from hyper_parallel.compile.parallel_config import PassConfig
 from hyper_parallel.compile.passes.overlap.schedule import AutoOverlapPass
 
 
@@ -88,7 +88,7 @@ class TestAutoOverlapRun(unittest.TestCase):
         The early return must happen before ``_find_wait_nodes`` runs, so a
         graph that *would* contain wait nodes is handed back untouched.
         """
-        cfg = ParallelConfig(enable_overlap=False)
+        cfg = PassConfig(enable_overlap=False)
         overlap = AutoOverlapPass()
         gm = _wait_tensor_graph()
 
@@ -116,7 +116,7 @@ class TestAutoOverlapRun(unittest.TestCase):
         ``_move_wait_later`` is a no-op today, so the wait node stays where
         ``FSDPPass`` placed it and the returned graph is the same object.
         """
-        cfg = ParallelConfig(enable_overlap=True)
+        cfg = PassConfig(enable_overlap=True)
         overlap = AutoOverlapPass()
         gm = _wait_tensor_graph()
 
@@ -138,7 +138,7 @@ class TestAutoOverlapRun(unittest.TestCase):
 
     def test_run_enabled_on_graph_without_wait_nodes_is_noop(self):
         """Test ``run`` on a graph with no wait nodes is a safe no-op."""
-        cfg = ParallelConfig(enable_overlap=True)
+        cfg = PassConfig(enable_overlap=True)
         overlap = AutoOverlapPass()
         gm = _plain_graph()
 
@@ -207,7 +207,7 @@ class TestAutoOverlapMoveWaitLater(unittest.TestCase):
         scheduler is a deliberate, visible change rather than a silent one.
         """
         overlap = AutoOverlapPass()
-        cfg: ParallelConfig = ParallelConfig(enable_overlap=True)
+        cfg: PassConfig = PassConfig(enable_overlap=True)
         gm = _wait_tensor_graph()
         wait = overlap._find_wait_nodes(gm.graph)[0]  # pylint: disable=protected-access
 

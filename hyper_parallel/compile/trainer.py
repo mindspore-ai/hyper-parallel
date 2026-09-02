@@ -26,9 +26,9 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.distributed_c10d import _register_process_group
 
-from .parallel_config import ParallelConfig
+from .parallel_config import PassConfig
 from .passes.pipeline import PassPipeline
-from .sharding_config import ShardingPlan
+from .sharding_config import PassPlan
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
 
@@ -44,8 +44,8 @@ class GraphTrainer:
         self,
         model: torch.nn.Module,
         train_fn: Callable,
-        parallel_config: ParallelConfig,
-        sharding_plan: Optional[ShardingPlan] = None,
+        pass_config: PassConfig,
+        pass_plan: Optional[PassPlan] = None,
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
@@ -54,8 +54,8 @@ class GraphTrainer:
         Args:
             model: Model to train
             train_fn: Training function signature: (model, input, label) -> loss
-            parallel_config: Parallel configuration
-            sharding_plan: Sharding plan (optional, if provided use declarative sharding)
+            pass_config: Parallel configuration
+            pass_plan: Sharding plan (optional, if provided use declarative sharding)
             optimizer_config: Optimizer configuration
             device: Device to place the model and run training on. Defaults to
                 the NPU device when available, otherwise CPU.
@@ -68,8 +68,8 @@ class GraphTrainer:
         """
         self.model = model
         self.train_fn = train_fn
-        self.parallel_config = parallel_config
-        self.sharding_plan = sharding_plan
+        self.pass_config = pass_config
+        self.pass_plan = pass_plan
         self.optimizer_config = optimizer_config or {}
         self._mesh_context = mesh_context
         self.device = device or (
@@ -78,7 +78,7 @@ class GraphTrainer:
             else torch.device("cpu")
         )
 
-        parallel_config.validate()
+        pass_config.validate()
 
         self._joint_graph = None
         self.optimizer = None
@@ -95,7 +95,7 @@ class GraphTrainer:
         if self._pytree_pre_hook is not None:
             self._pytree_pre_hook()
 
-        if self.parallel_config.fsdp_enabled and dist.is_initialized():
+        if self.pass_config.fsdp_enabled and dist.is_initialized():
             # Only build the FSDP mesh when distributed is actually up.
             # ``FSDPPass`` early-returns when ``world_size == 1``, so a
             # single-process run (no dist, or a single rank) compiles and
@@ -106,7 +106,7 @@ class GraphTrainer:
             self.model, self.train_fn, sample_input, sample_label
         )
 
-        pipeline = PassPipeline.from_config(self.parallel_config, self.sharding_plan)
+        pipeline = PassPipeline.from_config(self.pass_config, self.pass_plan)
 
         pass_kwargs = self._build_pass_kwargs()
 
@@ -128,7 +128,7 @@ class GraphTrainer:
           object directly), so we only resolve the FSDP shard sub-mesh and
           register it under the name ``"fsdp"`` so ``FSDPPass``'s functional
           collectives resolve it by name. ``fsdp_degree`` is back-filled on
-          ``parallel_config`` from the sub-mesh size — essential for a TP+FSDP
+          ``pass_config`` from the sub-mesh size — essential for a TP+FSDP
           hybrid, where the FSDP group is a proper sub-group of the world and
           must NOT be confused with ``world_size``.
         * **Fallback** (no mesh): build a 1-D ``("fsdp",)`` mesh over the
@@ -146,7 +146,7 @@ class GraphTrainer:
             sub = fsdp_mesh[dim]
             pg = sub.get_group()
             _register_process_group("fsdp", pg)
-            self.parallel_config.fsdp_degree = sub.size()
+            self.pass_config.fsdp_degree = sub.size()
             return
 
         device_type = (
@@ -165,7 +165,7 @@ class GraphTrainer:
         # Back-fill, mirroring the external-mesh branch: FSDPPass resolves the
         # group size from ``fsdp_degree`` (falling back to world_size when
         # ``None``), so setting it here keeps the two paths consistent.
-        self.parallel_config.fsdp_degree = world_size
+        self.pass_config.fsdp_degree = world_size
 
     def _build_pass_kwargs(self) -> dict:
         """
@@ -177,7 +177,7 @@ class GraphTrainer:
         # parameters in place, keeping the trainer FSDP-agnostic.
         kwargs["model"] = self.model
 
-        if self.parallel_config.fsdp_enabled:
+        if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
 
         return kwargs

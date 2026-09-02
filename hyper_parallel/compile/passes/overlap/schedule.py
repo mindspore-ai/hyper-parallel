@@ -28,7 +28,7 @@ Optimization Strategies:
 from typing import Any, List
 from torch import fx
 
-from ...parallel_config import ParallelConfig
+from ...parallel_config import PassConfig
 from ..base import GraphPass
 
 
@@ -45,7 +45,7 @@ class AutoOverlapPass(GraphPass):
     def run(
         self,
         graph_module: fx.GraphModule,
-        parallel_config: ParallelConfig,
+        pass_config: PassConfig,
         **kwargs: Any,
     ) -> fx.GraphModule:
         """Optimize communication-compute overlap by moving wait_tensor nodes.
@@ -53,7 +53,7 @@ class AutoOverlapPass(GraphPass):
         FSDPPass inserts wait_tensor immediately after communication (for correctness).
         This pass moves wait_tensor later to allow overlap with independent computation.
         """
-        if not parallel_config.enable_overlap:
+        if not pass_config.enable_overlap:
             return graph_module
 
         graph = graph_module.graph

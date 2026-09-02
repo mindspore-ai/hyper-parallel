@@ -20,9 +20,9 @@ Covers the API contract asserted by the refactor:
    (``fsdp_enabled`` / ``enable_overlap``), always prefixed by the basic
    optimization passes.
 2. ``PassPipeline.run`` drives every pass with the pipeline's own config
-   (``self.config``); the redundant ``parallel_config`` parameter that
+   (``self.config``); the redundant ``pass_config`` parameter that
    shadowed it is gone — passing it raises a clean TypeError.
-3. ``PassPipeline.run`` auto-fills ``sharding_plan`` from the pipeline's
+3. ``PassPipeline.run`` auto-fills ``pass_plan`` from the pipeline's
    plan when the caller omits it.
 4. ``from_config`` builds + returns a ready pipeline.
 """
@@ -36,7 +36,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 from torch import fx
 
-from hyper_parallel.compile.parallel_config import ParallelConfig
+from hyper_parallel.compile.parallel_config import PassConfig
 from hyper_parallel.compile.passes.base import GraphPass
 from hyper_parallel.compile.passes.overlap.schedule import AutoOverlapPass
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
@@ -45,7 +45,7 @@ from hyper_parallel.compile.passes.pipeline import (
     DeadCodeEliminationPass,
     PassPipeline,
 )
-from hyper_parallel.compile.sharding_config import ShardingPlan
+from hyper_parallel.compile.sharding_config import PassPlan
 
 
 class _RecordingPass(GraphPass):
@@ -61,11 +61,11 @@ class _RecordingPass(GraphPass):
     def run(
         self,
         graph_module: fx.GraphModule,
-        parallel_config: ParallelConfig,
+        pass_config: PassConfig,
         **kwargs: Any,
     ) -> fx.GraphModule:
         """Record the call arguments and return the graph_module unchanged."""
-        self.calls.append((graph_module, parallel_config, dict(kwargs)))
+        self.calls.append((graph_module, pass_config, dict(kwargs)))
         return graph_module
 
 
@@ -84,7 +84,7 @@ class TestPassPipelineBuild(unittest.TestCase):
 
     def test_default_config_adds_fsdp_and_overlap(self):
         """Test default config (fsdp+overlap on) adds FSDPPass + AutoOverlapPass."""
-        pipeline = PassPipeline(ParallelConfig()).build()
+        pipeline = PassPipeline(PassConfig()).build()
         names = [type(p).__name__ for p in pipeline.passes]
         self.assertIn("DeadCodeEliminationPass", names)
         self.assertIn("CanonicalizeGraphPass", names)
@@ -93,7 +93,7 @@ class TestPassPipelineBuild(unittest.TestCase):
 
     def test_fsdp_disabled_skips_fsdp_pass(self):
         """Test ``fsdp_enabled=False`` skips FSDPPass but keeps overlap."""
-        cfg = ParallelConfig(fsdp_enabled=False, enable_overlap=True)
+        cfg = PassConfig(fsdp_enabled=False, enable_overlap=True)
         pipeline = PassPipeline(cfg).build()
         names = [type(p).__name__ for p in pipeline.passes]
         self.assertNotIn(
@@ -105,7 +105,7 @@ class TestPassPipelineBuild(unittest.TestCase):
 
     def test_overlap_disabled_skips_auto_overlap_pass(self):
         """Test ``enable_overlap=False`` skips AutoOverlapPass but keeps FSDP."""
-        cfg = ParallelConfig(fsdp_enabled=True, enable_overlap=False)
+        cfg = PassConfig(fsdp_enabled=True, enable_overlap=False)
         pipeline = PassPipeline(cfg).build()
         names = [type(p).__name__ for p in pipeline.passes]
         self.assertIn("FSDPPass", names)
@@ -120,21 +120,21 @@ class TestPassPipelineBuild(unittest.TestCase):
 
     def test_basic_optimization_passes_always_present(self):
         """Test DeadCode + Canonicalize are always added first."""
-        cfg = ParallelConfig(fsdp_enabled=False, enable_overlap=False)
+        cfg = PassConfig(fsdp_enabled=False, enable_overlap=False)
         pipeline = PassPipeline(cfg).build()
         names = [type(p).__name__ for p in pipeline.passes]
         self.assertEqual(names[0], "DeadCodeEliminationPass")
         self.assertEqual(names[1], "CanonicalizeGraphPass")
 
     def test_sharding_plan_forwarded_to_fsdp_pass(self):
-        """Test the pipeline's sharding_plan is forwarded to FSDPPass at build time."""
-        plan = ShardingPlan().fsdp_wrap("foo")
-        pipeline = PassPipeline(ParallelConfig(), plan).build()
+        """Test the pipeline's pass_plan is forwarded to FSDPPass at build time."""
+        plan = PassPlan().fsdp_wrap("foo")
+        pipeline = PassPipeline(PassConfig(), plan).build()
         fsdp_pass = next(p for p in pipeline.passes if isinstance(p, FSDPPass))
         self.assertIs(
-            fsdp_pass._sharding_plan,
-            plan,  # pylint: disable=protected-access
-            "FSDPPass should receive the pipeline's sharding_plan",
+            fsdp_pass._pass_plan,  # pylint: disable=protected-access
+            plan,
+            "FSDPPass should receive the pipeline's pass_plan",
         )
 
 
@@ -144,11 +144,11 @@ class TestPassPipelineRun(unittest.TestCase):
     def test_run_uses_pipeline_config_not_caller_config(self):
         """Test ``run`` drives passes with the pipeline's config, not a caller-supplied one.
 
-        The previous ``run(gm, parallel_config=None, **kwargs)`` accepted a
+        The previous ``run(gm, pass_config=None, **kwargs)`` accepted a
         config override that no caller used; the refactor removed it so the
         pipeline is the single source of truth.
         """
-        cfg = ParallelConfig(fsdp_enabled=False, enable_overlap=False)
+        cfg = PassConfig(fsdp_enabled=False, enable_overlap=False)
         pipeline = PassPipeline(cfg)
         pipeline.passes = [_RecordingPass()]  # bypass build()
         gm = _simple_graph()
@@ -164,60 +164,60 @@ class TestPassPipelineRun(unittest.TestCase):
         )
         self.assertEqual(kwargs.get("model"), "dummy-model")
 
-    def test_run_no_parallel_config_kwarg(self):
-        """Test passing ``parallel_config=`` raises (API removed).
+    def test_run_no_pass_config_kwarg(self):
+        """Test passing ``pass_config=`` raises (API removed).
 
         This documents the migration: a caller still passing the old
-        ``parallel_config`` kwarg gets a clear failure instead of silent
+        ``pass_config`` kwarg gets a clear failure instead of silent
         double-config behaviour.
         """
-        cfg = ParallelConfig(fsdp_enabled=False, enable_overlap=False)
+        cfg = PassConfig(fsdp_enabled=False, enable_overlap=False)
         pipeline = PassPipeline(cfg)
         pipeline.passes = [_RecordingPass()]
         gm = _simple_graph()
         with self.assertRaises(TypeError):
-            pipeline.run(gm, parallel_config=ParallelConfig())
+            pipeline.run(gm, pass_config=PassConfig())
 
     def test_run_auto_fills_sharding_plan(self):
-        """Test ``sharding_plan`` is auto-filled from the pipeline when omitted."""
-        plan = ShardingPlan().fsdp_wrap("auto")
-        cfg = ParallelConfig(fsdp_enabled=False, enable_overlap=False)
+        """Test ``pass_plan`` is auto-filled from the pipeline when omitted."""
+        plan = PassPlan().fsdp_wrap("auto")
+        cfg = PassConfig(fsdp_enabled=False, enable_overlap=False)
         pipeline = PassPipeline(cfg, plan)
         rec_pass = _RecordingPass()
         pipeline.passes = [rec_pass]
         gm = _simple_graph()
 
-        pipeline.run(gm)  # caller does NOT pass sharding_plan
+        pipeline.run(gm)  # caller does NOT pass pass_plan
 
         _, _, kwargs = rec_pass.calls[0]
         self.assertIs(
-            kwargs.get("sharding_plan"),
+            kwargs.get("pass_plan"),
             plan,
-            "run() should auto-fill sharding_plan from self.sharding_plan",
+            "run() should auto-fill pass_plan from self.pass_plan",
         )
 
     def test_run_does_not_override_explicit_sharding_plan(self):
-        """Test an explicitly-passed sharding_plan is NOT clobbered by the pipeline's."""
-        own_plan = ShardingPlan().fsdp_wrap("pipeline-plan")
-        caller_plan = ShardingPlan().fsdp_wrap("caller-plan")
-        cfg = ParallelConfig(fsdp_enabled=False, enable_overlap=False)
+        """Test an explicitly-passed pass_plan is NOT clobbered by the pipeline's."""
+        own_plan = PassPlan().fsdp_wrap("pipeline-plan")
+        caller_plan = PassPlan().fsdp_wrap("caller-plan")
+        cfg = PassConfig(fsdp_enabled=False, enable_overlap=False)
         pipeline = PassPipeline(cfg, own_plan)
         rec_pass = _RecordingPass()
         pipeline.passes = [rec_pass]
         gm = _simple_graph()
 
-        pipeline.run(gm, sharding_plan=caller_plan)
+        pipeline.run(gm, pass_plan=caller_plan)
 
         _, _, kwargs = rec_pass.calls[0]
         self.assertIs(
-            kwargs.get("sharding_plan"),
+            kwargs.get("pass_plan"),
             caller_plan,
-            "explicit caller sharding_plan should win over the pipeline's own",
+            "explicit caller pass_plan should win over the pipeline's own",
         )
 
     def test_run_returns_transformed_graph(self):
         """Test ``run`` returns the (mutated) graph_module each pass returns."""
-        cfg = ParallelConfig(fsdp_enabled=False, enable_overlap=False)
+        cfg = PassConfig(fsdp_enabled=False, enable_overlap=False)
         pipeline = PassPipeline(cfg)
         pipeline.passes = [_RecordingPass()]
         gm_in = _simple_graph()
@@ -231,15 +231,15 @@ class TestPassPipelineFromConfig(unittest.TestCase):
 
     def test_from_config_builds(self):
         """Test ``from_config`` returns a built pipeline (passes non-empty)."""
-        pipeline = PassPipeline.from_config(ParallelConfig())
+        pipeline = PassPipeline.from_config(PassConfig())
         self.assertIsInstance(pipeline, PassPipeline)
         self.assertGreater(len(pipeline.passes), 0)
 
     def test_from_config_with_sharding_plan(self):
         """Test ``from_config`` forwards the sharding plan to the pipeline."""
-        plan = ShardingPlan().fsdp_wrap_pattern("*")
-        pipeline = PassPipeline.from_config(ParallelConfig(), plan)
-        self.assertIs(pipeline.sharding_plan, plan)
+        plan = PassPlan().fsdp_wrap_pattern("*")
+        pipeline = PassPipeline.from_config(PassConfig(), plan)
+        self.assertIs(pipeline.pass_plan, plan)
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 from torch import nn
 
-from hyper_parallel.compile.parallel_config import ParallelConfig
+from hyper_parallel.compile.parallel_config import PassConfig
 from hyper_parallel.compile.trainer import GraphTrainer
 
 
@@ -82,7 +82,7 @@ class TestGraphTrainerCompile(unittest.TestCase):
         tr = GraphTrainer(
             model=model,
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(),
+            pass_config=PassConfig(),
             device=torch.device("cpu"),
         )
 
@@ -101,7 +101,7 @@ class TestGraphTrainerCompile(unittest.TestCase):
         tr = GraphTrainer(
             model=model,
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         before = model.weight.detach().clone()
@@ -123,7 +123,7 @@ class TestGraphTrainerCompile(unittest.TestCase):
         tr = GraphTrainer(
             model=model,
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             optimizer_config={"lr": 1e-3, "grad_clip": 1.0},
             device=torch.device("cpu"),
         )
@@ -155,7 +155,7 @@ class TestGraphTrainerTrainLoop(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         losses = tr.train(iter(_batches(5)), max_steps=3)
@@ -168,7 +168,7 @@ class TestGraphTrainerTrainLoop(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         before = tr.model.weight.detach().clone()
@@ -185,7 +185,7 @@ class TestGraphTrainerTrainLoop(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         buf = io.StringIO()
@@ -202,7 +202,7 @@ class TestGraphTrainerTrainLoop(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         seen = []
@@ -223,7 +223,7 @@ class TestGraphTrainerTrainLoop(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         buf = io.StringIO()
@@ -240,7 +240,7 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=True),
+            pass_config=PassConfig(fsdp_enabled=True),
             device=torch.device("cpu"),
         )
         mock_dist = MagicMock()
@@ -280,7 +280,7 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
             "the FSDP group should be registered under the name 'fsdp'",
         )
         self.assertEqual(
-            tr.parallel_config.fsdp_degree,
+            tr.pass_config.fsdp_degree,
             4,
             "fallback should back-fill fsdp_degree from the world size",
         )
@@ -294,7 +294,7 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=True, fsdp_degree=None),
+            pass_config=PassConfig(fsdp_enabled=True, fsdp_degree=None),
             device=torch.device("cpu"),
         )
 
@@ -333,7 +333,7 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
             "must resolve the fsdp_shard axis of a hybrid mesh",
         )
         self.assertEqual(
-            tr.parallel_config.fsdp_degree,
+            tr.pass_config.fsdp_degree,
             2,
             "external mesh should back-fill fsdp_degree from the fsdp_shard sub-mesh",
         )
@@ -349,7 +349,7 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=True, fsdp_degree=None),
+            pass_config=PassConfig(fsdp_enabled=True, fsdp_degree=None),
             device=torch.device("cpu"),
         )
         # Each axis returns a DISTINCT sub-mesh so picking "dp" (not cp/tp) is
@@ -387,7 +387,7 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
             "must fall back to the dp axis when fsdp_shard is absent",
         )
         self.assertEqual(
-            tr.parallel_config.fsdp_degree,
+            tr.pass_config.fsdp_degree,
             8,
             "a mesh without fsdp_shard should use the dp axis",
         )
@@ -402,7 +402,7 @@ class TestGraphTrainerHelpers(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         returned = tr.to(torch.device("cpu"))
@@ -414,7 +414,7 @@ class TestGraphTrainerHelpers(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         calls = []
@@ -433,7 +433,7 @@ class TestGraphTrainerHelpers(unittest.TestCase):
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            parallel_config=ParallelConfig(fsdp_enabled=False),
+            pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
         t = torch.randn(2, 4)
