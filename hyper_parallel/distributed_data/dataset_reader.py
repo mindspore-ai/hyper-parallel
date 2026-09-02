@@ -20,10 +20,11 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable, Iterator, Mapping, Sized
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any, NamedTuple
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch.utils.data import DataLoader, Dataset, Sampler  # pylint: disable=forbidden-backend-import
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.schema import BufferedSampleMetadata, SampleKey, SampleMetadata
 
@@ -54,6 +55,7 @@ class _IndexedPayload(NamedTuple):
 class _BufferedSample:
     key: SampleKey
     metadata: SampleMetadata
+    global_sample_position: int
     payload: Any
 
 
@@ -89,6 +91,68 @@ def _build_worker_options(
     return options
 
 
+def _validate_reader_configuration(
+        *,
+        metadata_fn: Callable[[Any], SampleMetadata],
+        reader_rank: int,
+        reader_idx: int,
+        reader_count: int,
+        seq_len: int,
+        seed: int,
+        num_workers: int,
+        prefetch_factor: int | None,
+        persistent_workers: bool,
+        dataset_already_sharded: bool,
+        source_kind: str,
+        shuffle: bool,
+) -> None:
+    if not callable(metadata_fn):
+        raise ValueError("metadata_fn must be callable.")
+    _validate_reader_integer_fields({
+        "reader_rank": reader_rank,
+        "reader_idx": reader_idx,
+        "reader_count": reader_count,
+        "seq_len": seq_len,
+        "seed": seed,
+        "num_workers": num_workers,
+    })
+    if reader_count < 1 or reader_idx >= reader_count or seq_len < 1:
+        raise ValueError("reader_count and seq_len must be positive, and reader_idx must be in range.")
+    _validate_reader_worker_options(num_workers, prefetch_factor, persistent_workers)
+    _validate_reader_source_options(dataset_already_sharded, source_kind, shuffle)
+
+
+def _validate_reader_integer_fields(values: Mapping[str, int]) -> None:
+    for name, value in values.items():
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
+
+
+def _validate_reader_worker_options(
+        num_workers: int,
+        prefetch_factor: int | None,
+        persistent_workers: bool,
+) -> None:
+    if prefetch_factor is not None and (
+            not isinstance(prefetch_factor, int) or isinstance(prefetch_factor, bool) or prefetch_factor < 1
+    ):
+        raise ValueError("prefetch_factor must be a positive integer or None.")
+    if num_workers == 0 and prefetch_factor is not None:
+        raise ValueError("prefetch_factor requires num_workers > 0.")
+    if persistent_workers and num_workers == 0:
+        raise ValueError("persistent_workers=True requires num_workers > 0.")
+
+
+def _validate_reader_source_options(dataset_already_sharded: bool, source_kind: str, shuffle: bool) -> None:
+    if not isinstance(dataset_already_sharded, bool):
+        raise ValueError("dataset_already_sharded must be boolean.")
+    if source_kind == "iterable" and shuffle:
+        raise ValueError(
+            "shuffle=True is not supported for an iterable online Dataset; "
+            "the Dataset must own its iterable shuffle order."
+        )
+
+
 class _IndexedDataset(Dataset):
     """Attach the mapping-Dataset index used to materialize each payload."""
 
@@ -103,6 +167,38 @@ class _IndexedDataset(Dataset):
     def __getitem__(self, index: int) -> _IndexedPayload:
         """Materialize one sample while retaining its Dataset index."""
         return _IndexedPayload(index, self._dataset[index])
+
+
+class _IterableDatasetAdapter(IterableDataset):
+    """Let a Dataset with ``__iter__`` participate in a native DataLoader."""
+
+    def __init__(
+            self,
+            dataset: Any,
+            *,
+            reader_idx: int,
+            reader_count: int,
+            dataset_already_sharded: bool,
+    ) -> None:
+        """Store the source and optional HyperParallel reader stride."""
+        self._dataset = dataset
+        self._reader_idx = reader_idx
+        self._reader_count = reader_count
+        self._dataset_already_sharded = dataset_already_sharded
+
+    def __iter__(self) -> Iterator[Any]:
+        """Yield the local source stream, applying a reader stride only when requested."""
+        iterator = iter(self._dataset)
+        if self._dataset_already_sharded:
+            return iterator
+        return islice(iterator, self._reader_idx, None, self._reader_count)
+
+    def __getattr__(self, name: str) -> Any:
+        """Preserve source hooks used by DataLoader worker initializers."""
+        if name == "_dataset":
+            raise AttributeError(name)
+        dataset = object.__getattribute__(self, "_dataset")
+        return getattr(dataset, name)
 
 
 class _ReaderIndexSampler(Sampler[int]):
@@ -151,14 +247,14 @@ class _ReaderIndexSampler(Sampler[int]):
 
 
 class DatasetReader:
-    """Read one mapping-Dataset partition and retain unplanned sample payloads.
+    """Read one online Dataset stream and retain unplanned sample payloads.
 
     The Dataset Reader deliberately receives ``batch_size=None`` and an identity
     collator. User packing and collation happen only after the global plan has
     routed individual samples to a Data Constructor.
     """
 
-    VERSION = 1
+    VERSION = 3
 
     def __init__(
             self,
@@ -175,12 +271,13 @@ class DatasetReader:
             pin_memory: bool,
             prefetch_factor: int | None,
             persistent_workers: bool,
+            dataset_already_sharded: bool = False,
             dataloader_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         """Initialize a Dataset Reader.
 
         Args:
-            dataset: Mapping-style Dataset materialized by this reader rank.
+            dataset: Mapping or iterable Dataset materialized by this reader rank.
             metadata_fn: Callback deriving lightweight metadata from one sample.
             reader_rank: Global rank owning this Dataset Reader.
             reader_idx: Position in the configured Dataset Reader rank tuple.
@@ -188,36 +285,32 @@ class DatasetReader:
             seq_len: Sequence capacity used for read-ahead token accounting.
             shuffle: Whether to shuffle the global mapping-Dataset order.
             seed: Base shuffle and DataLoader worker seed.
-            num_workers: PyTorch DataLoader worker count.
+            num_workers: Native DataLoader worker count.
             pin_memory: Whether workers pin returned sample memory.
             prefetch_factor: Samples prefetched by each worker.
             persistent_workers: Whether DataLoader workers persist.
+            dataset_already_sharded: Whether the Dataset already owns Reader-rank
+                sharding and must be consumed without another Reader stride.
             dataloader_kwargs: Additional validated DataLoader execution options.
         """
-        self._validate_dataset(dataset)
-        if not callable(metadata_fn):
-            raise ValueError("metadata_fn must be callable.")
-        for name, value in (
-                ("reader_rank", reader_rank),
-                ("reader_idx", reader_idx),
-                ("reader_count", reader_count),
-                ("seq_len", seq_len),
-                ("seed", seed),
-                ("num_workers", num_workers),
-        ):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
-        if reader_count < 1 or reader_idx >= reader_count or seq_len < 1:
-            raise ValueError("reader_count and seq_len must be positive, and reader_idx must be in range.")
-        if prefetch_factor is not None and (
-                not isinstance(prefetch_factor, int) or isinstance(prefetch_factor, bool) or prefetch_factor < 1
-        ):
-            raise ValueError("prefetch_factor must be a positive integer or None.")
-        if num_workers == 0 and prefetch_factor is not None:
-            raise ValueError("prefetch_factor requires num_workers > 0.")
-        if persistent_workers and num_workers == 0:
-            raise ValueError("persistent_workers=True requires num_workers > 0.")
+        source_kind, dataset_size = self._validate_dataset(dataset)
+        _validate_reader_configuration(
+            metadata_fn=metadata_fn,
+            reader_rank=reader_rank,
+            reader_idx=reader_idx,
+            reader_count=reader_count,
+            seq_len=seq_len,
+            seed=seed,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            dataset_already_sharded=dataset_already_sharded,
+            source_kind=source_kind,
+            shuffle=shuffle,
+        )
         self._dataset = dataset
+        self._source_kind = source_kind
+        self._dataset_size = dataset_size
         self._metadata_fn = metadata_fn
         self._reader_rank = reader_rank
         self._reader_idx = reader_idx
@@ -229,22 +322,18 @@ class DatasetReader:
         self._pin_memory = pin_memory
         self._prefetch_factor = prefetch_factor
         self._persistent_workers = persistent_workers
+        self._dataset_already_sharded = dataset_already_sharded
         self._epoch = 0
         self._next_ordinal = 0
         self._buffer: list[_BufferedSample] = []
-        self._iterator: Iterator[_IndexedPayload] | None = None
+        self._iterator: Iterator[Any] | None = None
         self._exhausted = False
         self._error: str | None = None
-        self._sampler = _ReaderIndexSampler(
-            dataset_size=len(self._dataset),
-            reader_idx=self._reader_idx,
-            reader_count=self._reader_count,
-            start_ordinal=self._next_ordinal,
-            shuffle=self._shuffle,
-            seed=self._seed,
-            epoch=self._epoch,
-        )
+        self._sampler = None
         self._worker_generator = torch.Generator().manual_seed(self._seed + self._epoch)
+        self._data_loader = self._create_data_loader(dataloader_kwargs)
+
+    def _create_data_loader(self, dataloader_kwargs: Mapping[str, Any] | None) -> DataLoader:
         worker_options = _build_worker_options(
             num_workers=self._num_workers,
             pin_memory=self._pin_memory,
@@ -253,24 +342,65 @@ class DatasetReader:
             generator=self._worker_generator,
             dataloader_kwargs=dataloader_kwargs,
         )
-        self._data_loader = DataLoader(
-            _IndexedDataset(self._dataset),
+        if self._source_kind == "mapping":
+            effective_reader_idx = 0 if self._dataset_already_sharded else self._reader_idx
+            effective_reader_count = 1 if self._dataset_already_sharded else self._reader_count
+            self._sampler = _ReaderIndexSampler(
+                dataset_size=self._require_dataset_size(),
+                reader_idx=effective_reader_idx,
+                reader_count=effective_reader_count,
+                start_ordinal=self._next_ordinal,
+                shuffle=self._shuffle,
+                seed=self._seed,
+                epoch=self._epoch,
+            )
+            return DataLoader(
+                _IndexedDataset(self._dataset),
+                batch_size=None,
+                sampler=self._sampler,
+                collate_fn=_identity,
+                **worker_options,
+            )
+        return DataLoader(
+            _IterableDatasetAdapter(
+                self._dataset,
+                reader_idx=self._reader_idx,
+                reader_count=self._reader_count,
+                dataset_already_sharded=self._dataset_already_sharded,
+            ),
             batch_size=None,
-            sampler=self._sampler,
             collate_fn=_identity,
             **worker_options,
         )
 
     @staticmethod
-    def _validate_dataset(dataset: Any) -> None:
-        if not callable(getattr(dataset, "__getitem__", None)) or not isinstance(dataset, Sized):
+    def _validate_dataset(dataset: Any) -> tuple[str, int | None]:
+        getitem = getattr(type(dataset), "__getitem__", None)
+        concrete_getitem = callable(getitem) and getitem is not Dataset.__getitem__
+        iterable = isinstance(dataset, IterableDataset) or (
+            callable(getattr(dataset, "__iter__", None)) and not concrete_getitem
+        )
+        if not iterable and (not concrete_getitem or not isinstance(dataset, Sized)):
             raise ValueError(
-                "Dataset Reader currently requires a mapping-style Dataset with __len__ and __getitem__. "
-                "Wrap multiple sources in ConcatDataset/BlendableDataset or a custom mapping Dataset."
+                "Online Dataset Reader requires either an iterable Dataset or a mapping-style Dataset with "
+                "__len__ and __getitem__."
             )
-        dataset_size = len(dataset)
-        if not isinstance(dataset_size, int) or isinstance(dataset_size, bool) or dataset_size < 0:
-            raise ValueError(f"Dataset length must be a non-negative integer, but got {dataset_size!r}.")
+        dataset_size = None
+        if isinstance(dataset, Sized):
+            dataset_size = len(dataset)
+            if not isinstance(dataset_size, int) or isinstance(dataset_size, bool) or dataset_size < 0:
+                raise ValueError(f"Dataset length must be a non-negative integer, but got {dataset_size!r}.")
+        return ("iterable" if iterable else "mapping"), dataset_size
+
+    @property
+    def dataset_size(self) -> int | None:
+        """Return a known source length, or ``None`` for an unsized iterable."""
+        return self._dataset_size
+
+    def _require_dataset_size(self) -> int:
+        if self._dataset_size is None:
+            raise ValueError("A mapping-style online Dataset must expose a finite length.")
+        return self._dataset_size
 
     @property
     def exhausted(self) -> bool:
@@ -309,19 +439,26 @@ class DatasetReader:
                     and len(self._buffer) < max_samples
                     and (len(self._buffer) < min_samples or self.effective_buffer_tokens < min_tokens)
             ):
-                indexed_payload = self._read_one()
-                if indexed_payload is None:
+                source_item = self._read_one()
+                if source_item is None:
                     break
-                metadata = self._metadata_fn(indexed_payload.payload)
+                if isinstance(source_item, _IndexedPayload):
+                    dataset_index = source_item.dataset_index
+                    payload = source_item.payload
+                else:
+                    dataset_index = self._next_ordinal
+                    payload = source_item
+                metadata = self._metadata_fn(payload)
                 if not isinstance(metadata, SampleMetadata):
                     raise ValueError(
                         f"metadata_fn must return SampleMetadata, but got {type(metadata)} "
-                        f"for Dataset index {indexed_payload.dataset_index}."
+                        f"for online sample position {dataset_index}."
                     )
                 self._buffer.append(_BufferedSample(
-                    key=SampleKey(self._reader_rank, indexed_payload.dataset_index),
+                    key=SampleKey(self._reader_rank, dataset_index),
                     metadata=metadata,
-                    payload=indexed_payload.payload,
+                    global_sample_position=self._reader_idx + self._next_ordinal * self._reader_count,
+                    payload=payload,
                 ))
                 self._next_ordinal += 1
         except Exception as exc:  # The collective caller propagates the same failure to every rank.
@@ -331,10 +468,21 @@ class DatasetReader:
 
     def metadata(self) -> tuple[BufferedSampleMetadata, ...]:
         """Return lightweight planner candidates without payloads."""
-        return tuple(BufferedSampleMetadata(item.key, item.metadata) for item in self._buffer)
+        return tuple(
+            BufferedSampleMetadata(
+                key=item.key,
+                metadata=item.metadata,
+                global_sample_position=item.global_sample_position,
+            )
+            for item in self._buffer
+        )
 
     def selected_payloads(self, selected_keys: set[SampleKey]) -> tuple[tuple[SampleKey, Any], ...]:
-        """Return selected payloads without removing them from the reader buffer."""
+        """Return selected payloads without removing them from the reader buffer.
+
+        Args:
+            selected_keys: Planned keys owned by this Dataset Reader.
+        """
         selected = tuple((item.key, item.payload) for item in self._buffer if item.key in selected_keys)
         selected_key_set = {key for key, _ in selected}
         missing = selected_keys - selected_key_set
@@ -343,7 +491,11 @@ class DatasetReader:
         return selected
 
     def commit(self, selected_keys: set[SampleKey]) -> None:
-        """Remove samples only after every Data Constructor succeeds."""
+        """Remove samples only after every Data Constructor succeeds.
+
+        Args:
+            selected_keys: Successfully consumed keys owned by this reader.
+        """
         existing_keys = {item.key for item in self._buffer}
         missing = selected_keys - existing_keys
         if missing:
@@ -354,16 +506,17 @@ class DatasetReader:
         """Return rank-local state at a completed batch boundary.
 
         Note:
-            Buffered transformed payloads replay exactly. Future mapping
-            Dataset indices replay exactly when ``Dataset.__getitem__`` is
-            deterministic for a given index and epoch.
+            Buffered transformed payloads replay exactly. Future source samples
+            replay when the Dataset order and transformations are deterministic.
         """
         state = {
             "version": self.VERSION,
             "reader_rank": self._reader_rank,
             "reader_idx": self._reader_idx,
             "reader_count": self._reader_count,
-            "dataset_size": len(self._dataset),
+            "source_kind": self._source_kind,
+            "dataset_already_sharded": self._dataset_already_sharded,
+            "dataset_size": self._dataset_size,
             "epoch": self._epoch,
             "next_ordinal": self._next_ordinal,
             "exhausted": self._exhausted,
@@ -387,18 +540,35 @@ class DatasetReader:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
             raise ValueError(f"Dataset Reader state is not copyable: {exc}") from exc
+        self._validate_checkpoint_identity(state)
+        epoch, next_ordinal, exhausted, error, buffer = self._validate_checkpoint_payload(state)
+        self._epoch = epoch
+        self._next_ordinal = next_ordinal
+        self._exhausted = exhausted
+        self._error = error
+        self._buffer = buffer
+        self._iterator = None
+
+    def _validate_checkpoint_identity(self, state: Mapping[str, Any]) -> None:
         expected = {
             "version": self.VERSION,
             "reader_rank": self._reader_rank,
             "reader_idx": self._reader_idx,
             "reader_count": self._reader_count,
-            "dataset_size": len(self._dataset),
+            "source_kind": self._source_kind,
+            "dataset_already_sharded": self._dataset_already_sharded,
+            "dataset_size": self._dataset_size,
         }
         for name, expected_value in expected.items():
             if state.get(name) != expected_value:
                 raise ValueError(
                     f"Dataset Reader checkpoint {name}={state.get(name)!r} does not match {expected_value!r}."
                 )
+
+    @staticmethod
+    def _validate_checkpoint_payload(
+            state: Mapping[str, Any],
+    ) -> tuple[int, int, bool, str | None, list[_BufferedSample]]:
         epoch = state.get("epoch")
         next_ordinal = state.get("next_ordinal")
         exhausted = state.get("exhausted")
@@ -415,12 +585,7 @@ class DatasetReader:
         keys = [item.key for item in buffer]
         if len(keys) != len(set(keys)):
             raise ValueError("Dataset Reader checkpoint buffer contains duplicate SampleKey values.")
-        self._epoch = epoch
-        self._next_ordinal = next_ordinal
-        self._exhausted = exhausted
-        self._error = error
-        self._buffer = buffer
-        self._iterator = None
+        return epoch, next_ordinal, exhausted, error, buffer
 
     def set_epoch(self, epoch: int) -> None:
         """Reset this reader partition to a deterministic new epoch.
@@ -441,25 +606,32 @@ class DatasetReader:
         self._error = None
         self._iterator = None
 
-    def _read_one(self) -> _IndexedPayload | None:
+    def _read_one(self) -> Any | None:
         if self._iterator is None:
             self._iterator = self._build_iterator()
         try:
-            indexed_payload = next(self._iterator)
+            return next(self._iterator)
         except StopIteration:
             self._exhausted = True
             return None
-        if not isinstance(indexed_payload, _IndexedPayload):
-            raise ValueError(f"Internal Dataset Reader expected _IndexedPayload, but got {type(indexed_payload)}.")
-        return indexed_payload
 
-    def _build_iterator(self) -> Iterator[_IndexedPayload]:
-        self._sampler.set_position(
-            start_ordinal=self._next_ordinal,
-            epoch=self._epoch,
-        )
+    def _build_iterator(self) -> Iterator[Any]:
+        if self._sampler is not None:
+            self._sampler.set_position(
+                start_ordinal=self._next_ordinal,
+                epoch=self._epoch,
+            )
         self._worker_generator.manual_seed(self._seed + self._epoch)
-        return iter(self._data_loader)
+        iterator = iter(self._data_loader)
+        if self._source_kind == "iterable" and self._next_ordinal:
+            for _ in range(self._next_ordinal):
+                try:
+                    next(iterator)
+                except StopIteration as exc:
+                    raise ValueError(
+                        "Iterable Dataset exhausted while restoring the Dataset Reader position."
+                    ) from exc
+        return iterator
 
 
 __all__ = ["DatasetReader"]

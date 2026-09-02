@@ -19,19 +19,18 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Literal, Sequence
+from typing import Sequence
 
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
     DataConstructorPlan,
     DistributedPackingPlan,
+    OversizedPolicy,
     PackingBinPlan,
     PlannedSample,
+    StepSampleSelection,
     WorkloadCost,
 )
-
-OversizedPolicy = Literal["error", "single"]
-
 
 @dataclass
 class _MutableBin:
@@ -44,7 +43,7 @@ class _MutableBin:
 
 
 class DynamicPackingPlanner:
-    """Balance raw samples across DP ranks and sequence-packing bins."""
+    """Place a frozen step sample set across DP packing bins."""
 
     def __init__(
             self,
@@ -88,37 +87,69 @@ class DynamicPackingPlanner:
 
     def plan(
             self,
-            candidates: Sequence[BufferedSampleMetadata],
+            selection: StepSampleSelection,
             *,
             step: int,
-    ) -> DistributedPackingPlan | None:
-        """Create one full distributed packing plan.
-
-        Candidates not selected because they do not fit remain in their Dataset
-        Reader buffers for the next call.
+    ) -> DistributedPackingPlan:
+        """Balance every selected sample exactly once.
 
         Args:
-            candidates: Lightweight metadata for all current Dataset Reader
-                buffers.
+            selection: Frozen current-step membership plus a known-feasible
+                canonical reference packing.
             step: Zero-based distributed-yield index.
 
         Returns:
-            A full plan, or ``None`` when fewer than one sample per bin exists.
+            Full plan containing exactly the selected sample keys.
         """
-        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
-            raise ValueError(f"step must be a non-negative integer, but got {step!r}.")
-        ordered = self._validate_and_order(candidates)
-        if len(ordered) < self.distributed_bin_count:
-            return None
-
+        ordered = self._validate_plan_request(selection, step)
         bins = [
             _MutableBin(data_rank=data_rank, pack_index=pack_index)
             for data_rank in range(self.data_parallel_size)
             for pack_index in range(self.local_batch_size)
         ]
         rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
-        rank_tokens = [0 for _ in range(self.data_parallel_size)]
+        bins, rank_costs = self._place_samples(selection, ordered, bins, rank_costs)
+        constructors = self._freeze_bins(bins, rank_costs)
+        self._validate_conservation(constructors, selection)
+        plan_id = self._plan_id(step, constructors)
+        return DistributedPackingPlan(
+            plan_id=plan_id,
+            step=step,
+            seq_len=self.seq_len,
+            local_batch_size=self.local_batch_size,
+            data_parallel_size=self.data_parallel_size,
+            constructors=constructors,
+        )
 
+    def _validate_plan_request(
+            self,
+            selection: StepSampleSelection,
+            step: int,
+    ) -> tuple[BufferedSampleMetadata, ...]:
+        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+            raise ValueError(f"step must be a non-negative integer, but got {step!r}.")
+        if not isinstance(selection, StepSampleSelection):
+            raise ValueError(f"selection must be StepSampleSelection, but got {type(selection)}.")
+        if len(selection.reference_bins) != self.distributed_bin_count:
+            raise ValueError(
+                f"Step selection expected {self.distributed_bin_count} reference bins, "
+                f"but got {len(selection.reference_bins)}."
+            )
+        ordered = self._validate_and_order(selection.samples)
+        if len(ordered) < self.distributed_bin_count:
+            raise ValueError(
+                f"Step selection has {len(ordered)} samples for {self.distributed_bin_count} non-empty bins."
+            )
+        return ordered
+
+    def _place_samples(
+            self,
+            selection: StepSampleSelection,
+            ordered: Sequence[BufferedSampleMetadata],
+            bins: list[_MutableBin],
+            rank_costs: list[WorkloadCost],
+    ) -> tuple[list[_MutableBin], list[WorkloadCost]]:
+        rank_tokens = [0 for _ in range(self.data_parallel_size)]
         seed_items = ordered[:self.distributed_bin_count]
         remaining_items = ordered[self.distributed_bin_count:]
         for item in seed_items:
@@ -133,7 +164,8 @@ class DynamicPackingPlanner:
         for item in remaining_items:
             feasible = [packing_bin for packing_bin in bins if self._fits(packing_bin, item)]
             if not feasible:
-                continue
+                bins, rank_costs = self._place_reference_bins(selection)
+                break
             selected = min(
                 feasible,
                 key=lambda packing_bin: self._placement_score(
@@ -141,17 +173,61 @@ class DynamicPackingPlanner:
                 ),
             )
             self._place(selected, item, rank_costs, rank_tokens)
+        return bins, rank_costs
 
-        constructors = self._freeze_bins(bins, rank_costs)
-        plan_id = self._plan_id(step, constructors)
-        return DistributedPackingPlan(
-            plan_id=plan_id,
-            step=step,
-            seq_len=self.seq_len,
-            local_batch_size=self.local_batch_size,
-            data_parallel_size=self.data_parallel_size,
-            constructors=constructors,
-        )
+    def _place_reference_bins(
+            self,
+            selection: StepSampleSelection,
+    ) -> tuple[list[_MutableBin], list[WorkloadCost]]:
+        """Balance known-feasible reference packs when sample-level packing fails."""
+        samples_by_key = {item.key: item for item in selection.samples}
+        reference_bins = []
+        for original_index, key_bin in enumerate(selection.reference_bins):
+            items = tuple(samples_by_key[key] for key in key_bin)
+            cost = sum((item.metadata.cost for item in items), WorkloadCost())
+            tokens = sum(item.metadata.pack_tokens for item in items)
+            reference_bins.append((original_index, items, cost, tokens))
+        reference_bins.sort(key=lambda item: (-item[2].dominant, -item[2].total, -item[3], item[0]))
+
+        rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
+        rank_tokens = [0 for _ in range(self.data_parallel_size)]
+        rank_bins: list[list[_MutableBin]] = [[] for _ in range(self.data_parallel_size)]
+        for _, items, cost, tokens in reference_bins:
+            eligible_ranks = [
+                data_rank
+                for data_rank in range(self.data_parallel_size)
+                if len(rank_bins[data_rank]) < self.local_batch_size
+            ]
+            data_rank = min(
+                eligible_ranks,
+                key=lambda rank: (
+                    (rank_costs[rank] + cost).dominant,
+                    (rank_costs[rank] + cost).total,
+                    rank_tokens[rank] + min(tokens, self.seq_len),
+                    rank,
+                ),
+            )
+            packing_bin = _MutableBin(data_rank=data_rank, pack_index=len(rank_bins[data_rank]))
+            for item in items:
+                self._place(packing_bin, item, rank_costs, rank_tokens)
+            rank_bins[data_rank].append(packing_bin)
+        return [packing_bin for bins in rank_bins for packing_bin in bins], rank_costs
+
+    @staticmethod
+    def _validate_conservation(
+            constructors: Sequence[DataConstructorPlan],
+            selection: StepSampleSelection,
+    ) -> None:
+        """Reject any balanced plan that drops or duplicates a selected key."""
+        selected_keys = tuple(item.key for item in selection.samples)
+        planned_keys = tuple(key for constructor in constructors for key in constructor.sample_keys)
+        if len(planned_keys) != len(set(planned_keys)) or set(planned_keys) != set(selected_keys):
+            missing = sorted(set(selected_keys) - set(planned_keys))
+            unexpected = sorted(set(planned_keys) - set(selected_keys))
+            raise ValueError(
+                "Balanced placement must conserve the frozen step sample set exactly; "
+                f"missing={missing}, unexpected={unexpected}."
+            )
 
     def _validate_and_order(
             self,

@@ -16,6 +16,7 @@
 
 from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataloader
 from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn
+from hyper_parallel.distributed_data.device_prefetch import DeviceBatchPrefetcher
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
@@ -31,6 +32,7 @@ from hyper_parallel.distributed_data.schema import (
 __all__ = [
     "BufferedSampleMetadata",
     "DataConstructorPlan",
+    "DeviceBatchPrefetcher",
     "DistributedDataLoader",
     "DistributedDatasetConfig",
     "DistributedPackingPlan",

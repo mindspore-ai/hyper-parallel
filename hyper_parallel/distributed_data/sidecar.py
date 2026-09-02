@@ -22,7 +22,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch.utils.data import DataLoader, Sampler  # pylint: disable=forbidden-backend-import
+from torch.utils.data import DataLoader, Dataset, Sampler  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
@@ -41,7 +41,7 @@ from hyper_parallel.distributed_data.dataset_reader import (
 class SidecarMetadataReader:
     """Expose one deterministic reader partition without reading sample payloads."""
 
-    VERSION = 1
+    VERSION = 3
 
     def __init__(
             self,
@@ -53,17 +53,21 @@ class SidecarMetadataReader:
             seq_len: int,
             shuffle: bool,
             seed: int,
+            dataset_already_sharded: bool = False,
     ) -> None:
         """Initialize a metadata-only Dataset Reader.
 
         Args:
-            metadata: Shared sidecar entries aligned one-to-one with Dataset indices.
+            metadata: Shared or rank-local sidecar entries aligned one-to-one
+                with the corresponding Dataset indices.
             reader_rank: Global rank owning this metadata reader.
             reader_idx: Position in the configured Dataset Reader rank tuple.
             reader_count: Number of metadata Dataset Readers.
             seq_len: Sequence capacity used for buffered-token accounting.
-            shuffle: Whether to shuffle the global metadata order per epoch.
+            shuffle: Whether to shuffle this metadata sequence per epoch.
             seed: Base shuffle seed.
+            dataset_already_sharded: Whether this Reader already receives only
+                its rank-local metadata and must not apply another stride.
         """
         if not hasattr(metadata, "__len__") or not callable(getattr(metadata, "__getitem__", None)):
             raise ValueError("metadata must support __len__ and integer __getitem__ access.")
@@ -83,6 +87,8 @@ class SidecarMetadataReader:
             raise ValueError("reader_count and seq_len must be positive, and reader_idx must be in range.")
         if not isinstance(shuffle, bool):
             raise ValueError("shuffle must be boolean.")
+        if not isinstance(dataset_already_sharded, bool):
+            raise ValueError("dataset_already_sharded must be boolean.")
         self._metadata = metadata
         self._reader_rank = reader_rank
         self._reader_idx = reader_idx
@@ -90,6 +96,7 @@ class SidecarMetadataReader:
         self._seq_len = seq_len
         self._shuffle = shuffle
         self._seed = seed
+        self._dataset_already_sharded = dataset_already_sharded
         self._epoch = 0
         self._next_ordinal = 0
         self._buffer: list[BufferedSampleMetadata] = []
@@ -143,8 +150,11 @@ class SidecarMetadataReader:
                         f"metadata must contain SampleMetadata, but got {type(metadata)} at index {dataset_index}."
                     )
                 self._buffer.append(BufferedSampleMetadata(
-                    SampleKey(self._reader_rank, dataset_index),
-                    metadata,
+                    key=SampleKey(self._reader_rank, dataset_index),
+                    metadata=metadata,
+                    global_sample_position=(
+                        self._reader_idx + self._next_ordinal * self._reader_count
+                    ),
                 ))
                 self._next_ordinal += 1
         except Exception as exc:  # The collective caller propagates the same failure to every rank.
@@ -157,7 +167,11 @@ class SidecarMetadataReader:
         return tuple(self._buffer)
 
     def commit(self, selected_keys: set[SampleKey]) -> None:
-        """Remove selected metadata only after construction and delivery succeed."""
+        """Remove selected metadata only after construction and delivery succeed.
+
+        Args:
+            selected_keys: Successfully consumed sidecar sample keys.
+        """
         existing_keys = {item.key for item in self._buffer}
         missing = selected_keys - existing_keys
         if missing:
@@ -171,6 +185,7 @@ class SidecarMetadataReader:
             "reader_rank": self._reader_rank,
             "reader_idx": self._reader_idx,
             "reader_count": self._reader_count,
+            "dataset_already_sharded": self._dataset_already_sharded,
             "metadata_size": len(self._metadata),
             "epoch": self._epoch,
             "next_ordinal": self._next_ordinal,
@@ -193,11 +208,22 @@ class SidecarMetadataReader:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
             raise ValueError(f"Sidecar metadata state is not copyable: {exc}") from exc
+        self._validate_checkpoint_identity(state)
+        epoch, next_ordinal, exhausted, error, buffer = self._validate_checkpoint_payload(state)
+        self._epoch = epoch
+        self._next_ordinal = next_ordinal
+        self._exhausted = exhausted
+        self._error = error
+        self._buffer = buffer
+        self._iterator = None
+
+    def _validate_checkpoint_identity(self, state: Mapping[str, Any]) -> None:
         expected = {
             "version": self.VERSION,
             "reader_rank": self._reader_rank,
             "reader_idx": self._reader_idx,
             "reader_count": self._reader_count,
+            "dataset_already_sharded": self._dataset_already_sharded,
             "metadata_size": len(self._metadata),
         }
         for name, expected_value in expected.items():
@@ -205,6 +231,11 @@ class SidecarMetadataReader:
                 raise ValueError(
                     f"Sidecar checkpoint {name}={state.get(name)!r} does not match {expected_value!r}."
                 )
+
+    @staticmethod
+    def _validate_checkpoint_payload(
+            state: Mapping[str, Any],
+    ) -> tuple[int, int, bool, str | None, list[BufferedSampleMetadata]]:
         epoch = state.get("epoch")
         next_ordinal = state.get("next_ordinal")
         exhausted = state.get("exhausted")
@@ -221,12 +252,7 @@ class SidecarMetadataReader:
         keys = [item.key for item in buffer]
         if len(keys) != len(set(keys)):
             raise ValueError("Sidecar checkpoint buffer contains duplicate SampleKey values.")
-        self._epoch = epoch
-        self._next_ordinal = next_ordinal
-        self._exhausted = exhausted
-        self._error = error
-        self._buffer = buffer
-        self._iterator = None
+        return epoch, next_ordinal, exhausted, error, buffer
 
     def set_epoch(self, epoch: int) -> None:
         """Reset this metadata partition for a deterministic epoch.
@@ -260,7 +286,10 @@ class SidecarMetadataReader:
             global_indices: Sequence[int] = torch.randperm(len(self._metadata), generator=generator).tolist()
         else:
             global_indices = range(len(self._metadata))
-        reader_indices = global_indices[self._reader_idx::self._reader_count]
+        if self._dataset_already_sharded:
+            reader_indices = global_indices
+        else:
+            reader_indices = global_indices[self._reader_idx::self._reader_count]
         return iter(reader_indices[self._next_ordinal:])
 
 
@@ -280,12 +309,16 @@ class _MutableIndexSampler(Sampler[int]):
         return len(self._indices)
 
     def replace(self, indices: Sequence[int]) -> None:
-        """Replace the request window before building the next iterator."""
+        """Replace the request window before building the next iterator.
+
+        Args:
+            indices: Dataset indices for the next request window.
+        """
         self._indices = tuple(indices)
 
 
 class PlannedSampleLoader:
-    """Use DataLoader workers to fetch only samples assigned to one constructor."""
+    """Use DataLoader workers to fetch only requested sidecar samples."""
 
     VERSION = 1
 
@@ -304,15 +337,16 @@ class PlannedSampleLoader:
 
         Args:
             dataset: Mapping-style Dataset aligned with the sidecar sequence.
-            num_workers: PyTorch DataLoader worker count.
+            num_workers: Native DataLoader worker count.
             pin_memory: Whether workers pin returned sample memory.
             prefetch_factor: Samples prefetched by each worker.
             persistent_workers: Whether workers persist for the loader lifetime.
             seed: Base worker seed.
             dataloader_kwargs: Additional validated DataLoader execution options.
         """
-        if not callable(getattr(dataset, "__getitem__", None)) or not hasattr(dataset, "__len__"):
-            raise ValueError("Sidecar direct reads require a mapping-style Dataset with __len__ and __getitem__.")
+        getitem = getattr(type(dataset), "__getitem__", None)
+        if not callable(getitem) or getitem is Dataset.__getitem__ or not hasattr(dataset, "__len__"):
+            raise ValueError("Sidecar planned reads require a mapping-style Dataset with __len__ and __getitem__.")
         self._dataset = dataset
         self._sampler = _MutableIndexSampler()
         self._seed = seed
@@ -345,7 +379,22 @@ class PlannedSampleLoader:
         """
         if not isinstance(plan, DataConstructorPlan):
             raise ValueError(f"plan must be DataConstructorPlan, but got {type(plan)}.")
-        sample_keys = plan.sample_keys
+        return self.fetch_keys(plan.sample_keys)
+
+    def fetch_keys(self, sample_keys: Sequence[SampleKey]) -> dict[SampleKey, Any]:
+        """Fetch an ordered sequence of sample keys from this loader's Dataset.
+
+        Args:
+            sample_keys: Keys whose local ``dataset_index`` values belong to
+                this loader's Dataset.
+
+        Returns:
+            Mapping from every requested key to its materialized payload.
+        """
+        if any(not isinstance(key, SampleKey) for key in sample_keys):
+            raise ValueError("sample_keys must contain SampleKey values.")
+        if len(sample_keys) != len(set(sample_keys)):
+            raise ValueError("sample_keys must not contain duplicates.")
         dataset_size = len(self._dataset)
         invalid_indices = [key.dataset_index for key in sample_keys if key.dataset_index >= dataset_size]
         if invalid_indices:
@@ -371,7 +420,7 @@ class PlannedSampleLoader:
         return payloads
 
     def state_dict(self) -> dict[str, Any]:
-        """Return the epoch required to seed future direct-read workers."""
+        """Return the epoch required to seed future plan-aware workers."""
         return {
             "version": self.VERSION,
             "dataset_size": len(self._dataset),
@@ -380,7 +429,7 @@ class PlannedSampleLoader:
         }
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore direct-reader state before its first planned fetch.
+        """Restore plan-aware reader state before its first fetch.
 
         Args:
             state_dict: State produced by :meth:`state_dict` on this constructor.

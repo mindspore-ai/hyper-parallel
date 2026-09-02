@@ -36,6 +36,7 @@ from hyper_parallel.distributed_data import (
 _WORLD_SIZE = 4
 _DATASET_SIZE = 8
 _CONSTRUCTOR_RANKS = (0, 2)
+_SHARDED_READER_RANKS = (1, 3)
 
 
 class _RawDataset:
@@ -53,6 +54,28 @@ class _RawDataset:
     def __getitem__(self, index: int) -> dict[str, int]:
         """Return one sample carrying its stable identifier and token cost."""
         return {"sample_id": index, "pack_tokens": 1, "reader_rank": self._reader_rank}
+
+
+class _ShardedRawDataset:
+    """Expose one distinct local sidecar shard on each Dataset Reader."""
+
+    def __init__(self, reader_rank: int, size: int = _DATASET_SIZE // 2) -> None:
+        """Store the source rank and globally unique diagnostic-ID offset."""
+        self._reader_rank = reader_rank
+        self._size = size
+        self._offset = _SHARDED_READER_RANKS.index(reader_rank) * size
+
+    def __len__(self) -> int:
+        """Return the local shard size."""
+        return self._size
+
+    def __getitem__(self, index: int) -> dict[str, int]:
+        """Materialize one rank-local sample after sidecar planning."""
+        return {
+            "sample_id": self._offset + index,
+            "pack_tokens": 1,
+            "reader_rank": self._reader_rank,
+        }
 
 
 def _metadata_fn(sample: dict[str, int]) -> SampleMetadata:
@@ -511,6 +534,44 @@ def _run_default_constructor_epoch(mesh: Any) -> None:
     _assert_collective_stop(loader)
 
 
+def _run_double_buffer_epoch(mesh: Any) -> None:
+    """Overlap one-step prefetch with foreground WORLD synchronization."""
+    rank = dist.get_rank()
+    loader = build_distributed_dataloader(
+        _RawDataset(size=2 * _DATASET_SIZE) if rank in _CONSTRUCTOR_RANKS else None,
+        mesh,
+        DistributedDatasetConfig(
+            seq_len=4,
+            local_batch_size=1,
+            dp_dim_names=("dp",),
+            dataset_reader_ranks=None,
+            buffer_size_multiplier=1.0,
+            max_buffered_samples=8,
+            double_buffer=True,
+            cpu_backend="gloo",
+        ),
+        metadata_fn=_metadata_fn,
+        pack_fn=_pack_fn,
+        collate_fn=_collate_fn,
+    )
+
+    for step in range(2):
+        outputs = _all_gather_object(next(loader))
+        _assert_same_model_parallel_batches(outputs)
+        global_sample_ids = sorted(
+            sample_id
+            for constructor_rank in _CONSTRUCTOR_RANKS
+            for packed_sequence in outputs[constructor_rank]
+            for sample_id in packed_sequence["sample_ids"]
+        )
+        expected_ids = list(range(step * _DATASET_SIZE, (step + 1) * _DATASET_SIZE))
+        assert global_sample_ids == expected_ids, (
+            f"Double-buffer step membership changed: step={step}, "
+            f"expected={expected_ids!r}, got={global_sample_ids!r}."
+        )
+    _assert_collective_stop(loader)
+
+
 def _run_sidecar_direct_read_epoch(mesh: Any) -> None:
     """Verify disjoint metadata readers and constructors need no payload A2A."""
     rank = dist.get_rank()
@@ -532,6 +593,7 @@ def _run_sidecar_direct_read_epoch(mesh: Any) -> None:
             dataset_reader_ranks=reader_ranks,
             buffer_size_multiplier=1.0,
             max_buffered_samples=8,
+            double_buffer=True,
             cpu_backend="gloo",
         ),
         metadata=metadata,
@@ -554,6 +616,56 @@ def _run_sidecar_direct_read_epoch(mesh: Any) -> None:
             f"Sidecar samples must be read directly by their target constructor: "
             f"constructor={constructor_rank}, readers={reader_ranks}."
         )
+    _assert_collective_stop(loader)
+
+
+def _run_pre_sharded_sidecar_epoch(mesh: Any) -> None:
+    """Verify local sidecars read on their owning Readers before payload A2A."""
+    rank = dist.get_rank()
+    is_reader = rank in _SHARDED_READER_RANKS
+    dataset = _ShardedRawDataset(rank) if is_reader else None
+    metadata = (
+        tuple(
+            SampleMetadata(
+                pack_tokens=1,
+                cost=WorkloadCost(llm=1.0),
+                sample_id=_SHARDED_READER_RANKS.index(rank) * (_DATASET_SIZE // 2) + index,
+            )
+            for index in range(_DATASET_SIZE // 2)
+        )
+        if is_reader
+        else None
+    )
+    loader = build_distributed_dataloader(
+        dataset,
+        mesh,
+        DistributedDatasetConfig(
+            seq_len=4,
+            local_batch_size=1,
+            dp_dim_names=("dp",),
+            dataset_reader_ranks=_SHARDED_READER_RANKS,
+            dataset_already_sharded=True,
+            buffer_size_multiplier=1.0,
+            max_buffered_samples=8,
+            cpu_backend="gloo",
+        ),
+        metadata=metadata,
+        pack_fn=_pack_fn,
+        collate_fn=_collate_fn,
+    )
+
+    outputs = _all_gather_object(next(loader))
+    _assert_same_model_parallel_batches(outputs)
+    _assert_exactly_once(outputs)
+    routes = [
+        (reader_rank, constructor_rank)
+        for constructor_rank in _CONSTRUCTOR_RANKS
+        for packed_sequence in outputs[constructor_rank]
+        for reader_rank in packed_sequence["reader_ranks"]
+    ]
+    assert any(reader_rank != constructor_rank for reader_rank, constructor_rank in routes), (
+        f"Pre-sharded sidecar planning must exercise Reader-to-Constructor A2A: routes={routes!r}."
+    )
     _assert_collective_stop(loader)
 
 
@@ -623,9 +735,17 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         # local-batch and packing-bin structure as nested immutable tuples.
         _run_default_constructor_epoch(mesh)
 
+        # Foreground WORLD collectives overlap with next-step work on the
+        # package-owned data process groups without changing step membership.
+        _run_double_buffer_epoch(mesh)
+
         # Sidecar Dataset Readers expose metadata only. Constructors read
         # planned indices locally, so disjoint reader/constructor ranks need no A2A.
         _run_sidecar_direct_read_epoch(mesh)
+
+        # Rank-local sidecars disable Reader stride. Their owning Readers fetch
+        # only selected samples and route them to the planned constructors.
+        _run_pre_sharded_sidecar_epoch(mesh)
 
         # All ranks act as Dataset Readers, so payloads from MP peers must route to a
         # Data Constructor before their constructed batches return over MP.
