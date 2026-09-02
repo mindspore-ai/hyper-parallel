@@ -38,6 +38,10 @@ from hyper_parallel.core.context_parallel.context_parallel import (
     _to_cp_dtensor,
 )
 from hyper_parallel.core.context_parallel.async_dsa_context_parallel import _AsyncSequenceReplicateSlot
+from hyper_parallel.core.context_parallel.dsa_context_parallel import (
+    DSASequenceReplicateCache,
+    _to_sequence_replicate,
+)
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
@@ -352,6 +356,88 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[3].placements, (Shard(1),))
         self.assertEqual(out[4].placements, (Shard(1),))
         self.assertEqual(out[5].placements, (Replicate(),))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sparse_attention_and_loss_reuse_main_kv_gathers(self, mock_mesh_platform):
+        """Sparse DSA should share only gradient-safe global K/V activations."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        shared_cache = DSASequenceReplicateCache()
+        attention_style = DSASparseAttentionContextParallel(
+            layout="BSND",
+            use_local_output=False,
+            shared_replicate_cache=shared_cache,
+            share_key_value=True,
+        )
+        loss_style = DSAIndexerLossContextParallel(
+            layout="BSND",
+            use_local_output=False,
+            shared_replicate_cache=shared_cache,
+        )
+        attention_module = _IdentityModule()
+        loss_module = _IdentityModule()
+        attention_style.apply(attention_module, mesh)
+
+        query = torch.randn(2, 4, 8, 16)
+        latent = torch.randn(2, 4, 1, 16)
+        topk = torch.randint(0, 4, (2, 4, 1, 2), dtype=torch.int32)
+        query_rope = torch.randn(2, 4, 8, 8)
+        key_rope = torch.randn(2, 4, 1, 8)
+        query_index = torch.randn(2, 4, 8, 16)
+        key_index = torch.randn(2, 4, 1, 16)
+        weights = torch.randn(2, 4, 8)
+        softmax_max = torch.randn(2, 4, 8, 1)
+        softmax_sum = torch.randn(2, 4, 8, 1)
+
+        with _patch_torch_dist_rank(), patch.object(mesh, "get_group", return_value=None), patch(
+                "hyper_parallel.core.context_parallel.dsa_context_parallel._to_sequence_replicate",
+                wraps=_to_sequence_replicate,
+        ) as mock_replicate:
+            loss_style.apply(loss_module, mesh)
+            attention_out = attention_module(query, latent, latent.view_as(latent), topk, query_rope, key_rope)
+            loss_out = loss_module(
+                query,
+                latent,
+                query_index,
+                key_index,
+                weights,
+                topk,
+                softmax_max,
+                softmax_sum,
+                query_rope,
+                key_rope,
+            )
+
+        self.assertEqual(attention_out[1].to_local().data_ptr(), attention_out[2].to_local().data_ptr())
+        self.assertEqual(loss_out[1].to_local().data_ptr(), attention_out[1].to_local().data_ptr())
+        self.assertEqual(loss_out[9].to_local().data_ptr(), attention_out[5].to_local().data_ptr())
+        self.assertNotEqual(loss_out[3].to_local().data_ptr(), attention_out[1].to_local().data_ptr())
+        self.assertEqual(mock_replicate.call_count, 3)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_shared_main_kv_preserves_parent_gradient(self, mock_mesh_platform):
+        """Aliased K/V gather should preserve the gradient of their common latent."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        shared_cache = DSASequenceReplicateCache()
+        style = DSASparseAttentionContextParallel(
+            layout="BSND",
+            use_local_output=False,
+            shared_replicate_cache=shared_cache,
+            share_key_value=True,
+        )
+        module = _IdentityModule()
+        style.apply(module, mesh)
+
+        latent = torch.randn(2, 4, 1, 16, requires_grad=True)
+        query = torch.randn(2, 4, 8, 16)
+        topk = torch.randint(0, 4, (2, 4, 1, 2), dtype=torch.int32)
+        query_rope = torch.randn(2, 4, 8, 8)
+        key_rope = torch.randn(2, 4, 1, 8)
+
+        with _patch_torch_dist_rank(), patch.object(mesh, "get_group", return_value=None):
+            out = module(query, latent * 1.0, latent.view_as(latent), topk, query_rope, key_rope)
+            (out[1].to_local().sum() + out[2].to_local().sum()).backward()
+
+        self.assertTrue(torch.equal(latent.grad, torch.full_like(latent, 2.0)))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_sparse_attention_boundary_kwargs_are_rewritten(self, mock_mesh_platform):
