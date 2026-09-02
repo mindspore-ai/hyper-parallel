@@ -16,9 +16,8 @@ platform/
 │   ├── activation_checkpoint/     # SAC + swap
 │   ├── fully_shard/               # FSDP + HSDP (core hsdp_*.py in core/)
 │   └── pipeline_parallel/
-└── mindspore/                     # MindSpore backend (mirror + graph/custom_pass)
+└── mindspore/                     # MindSpore backend (mirror)
     ├── platform.py / dtensor.py / init_weights.py / parameter_init.py
-    ├── platform_graph.py / custom_pass/
     ├── fully_shard/
     └── pipeline_parallel/
 ```

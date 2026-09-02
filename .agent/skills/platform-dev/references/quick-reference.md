@@ -20,8 +20,6 @@
 | Init weights (torch) | `hyper_parallel/platform/torch/init_weights.py` | init_on_device context |
 | Init weights (ms) | `hyper_parallel/platform/mindspore/init_weights.py` | init_on_device context |
 | Parameter init (ms) | `hyper_parallel/platform/mindspore/parameter_init.py` | Slice-based param init |
-| Graph utils (ms) | `hyper_parallel/platform/mindspore/platform_graph.py` | Graph construction |
-| Custom passes (ms) | `hyper_parallel/platform/mindspore/custom_pass/` | Graph optimization passes |
 | Tests (torch) | `tests/torch/` | `ut/` (unit), `st/` (distributed) |
 | Tests (mindspore) | `tests/mindspore/` | `ut/` (unit), `st/` (distributed) |
 
