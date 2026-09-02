@@ -34,6 +34,6 @@ torchrun \
     --rdzv_id="${RDZV_ID}" \
     --rdzv_backend=c10d \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-    --module examples.qwen3_8.train_lm \
+    --module examples.qwen3_8.train_text \
     "${SCRIPT_DIR}/train.yaml" \
     "$@"
