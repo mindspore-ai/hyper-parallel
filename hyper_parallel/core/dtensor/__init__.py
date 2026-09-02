@@ -13,4 +13,26 @@
 # limitations under the License.
 # ============================================================================
 """DTensor public re-exports for the hyper_parallel package."""
-from hyper_parallel.core.dtensor.debug import CommDebugMode
+from importlib import import_module as _import_module
+
+
+def __getattr__(name):  # pylint: disable=invalid-name
+    """Lazily import ``CommDebugMode`` when accessed.
+
+    Importing the debug subpackage eagerly pulls in ``dtensor.py`` through
+    ``debug._module_tracker``. On the MindSpore platform the runtime patch
+    must rebind ``_dtensor_base.DTensorBase`` *before* ``class DTensor`` is
+    defined; an eager import here would run the definition first. So defer the
+    debug chain to first use.
+    """
+    if name == "CommDebugMode":
+        module = _import_module("hyper_parallel.core.dtensor.debug")
+        value = getattr(module, "CommDebugMode")
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():  # pylint: disable=invalid-name
+    """Include the lazy ``CommDebugMode`` export in ``dir()``."""
+    return sorted(set(globals()) | {"CommDebugMode"})

@@ -25,6 +25,7 @@ _MS_PATCHED = False
 
 def _ms_get_rank(group=None):
     """torch ``dist.get_rank(group)`` surfaced over MindSpore's ``get_rank``."""
+    print("[HP_PATCH_LOG] _ms_get_rank called", flush=True)
     # pylint: disable=import-outside-toplevel
     from mindspore.communication import get_rank as get_rank_id
 
@@ -35,6 +36,7 @@ def _ms_get_rank(group=None):
 
 def _ms_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
     """MindSpore implementation of ``comm.differentiable_all_gather_concat``."""
+    print("[HP_PATCH_LOG] _ms_all_gather_concat called", flush=True)
     import mindspore as ms
     from mindspore.common.tensor import Tensor
     from mindspore.ops.function import comm_func
@@ -50,6 +52,7 @@ def _ms_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
 
 def _ms_ensure_contiguous(x):
     """Return a contiguous copy of *x* if not already contiguous."""
+    print("[HP_PATCH_LOG] _ms_ensure_contiguous called", flush=True)
     if not x.is_contiguous() or x.storage_offset() != 0:
         x = x.contiguous()
     return x
@@ -57,6 +60,7 @@ def _ms_ensure_contiguous(x):
 
 def _ms_p2p_exchange(tensor, peer_rank: int, group=None):
     """MindSpore has no symmetric P2P exchange; fail loudly at the call site."""
+    print("[HP_PATCH_LOG] _ms_p2p_exchange called", flush=True)
     raise NotImplementedError(
         "p2p_exchange is not yet supported on the MindSpore platform."
     )
@@ -64,6 +68,7 @@ def _ms_p2p_exchange(tensor, peer_rank: int, group=None):
 
 def _ms_construct_strided_slice(x, begin, end, stride):
     """MindSpore implementation of ``comm.construct_strided_slice``."""
+    print("[HP_PATCH_LOG] _ms_construct_strided_slice called", flush=True)
     import mindspore as ms
 
     return ms.ops.strided_slice(x, begin, end, stride)
