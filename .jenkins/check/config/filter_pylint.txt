@@ -169,3 +169,10 @@
 # 18. SAPP ND templates / demos
 "hyper-parallel/hyper_parallel/auto_parallel/sapp_nd/memory_estimation/demo.py"              "locally-disabled"
 "hyper-parallel/hyper_parallel/auto_parallel/sapp_nd/memory_estimation/hooks/template.py"    "locally-disabled"
+
+# 19. Graph-mode compile package — a torch.fx-based compiler that reaches into
+#     torch internals (torch._guards, torch._subclasses, torch.fx.experimental,
+#     torch.nn.utils.stateless, torch.distributed.device_mesh). These have no
+#     public API and no get_platform() equivalent (mindspore has no FX-tracing
+#     surface); moving the package under platform/torch/ is tracked separately.
+"hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"

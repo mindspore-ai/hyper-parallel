@@ -54,10 +54,7 @@ from .sharding_config import (
     create_simple_sharding_plan,
 )
 
-from .parallel_config import (
-    ParallelConfig,
-    parallel_config,
-)
+from .parallel_config import ParallelConfig
 
 from .trainer import GraphTrainer
 
@@ -69,7 +66,6 @@ __all__ = [
     "create_simple_sharding_plan",
     # Config
     "ParallelConfig",
-    "parallel_config",
     # Trainer
     "GraphTrainer",
 ]
