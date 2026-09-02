@@ -412,8 +412,8 @@ def _validate_and_copy_tensor(
 ) -> None:
     """Validate a loaded tensor slice and copy it to its planner destination."""
     target_tensor = planner.acquire_tensor(req)
-    if hasattr(target_tensor, "detach"):
-        target_tensor = target_tensor.detach()
+    if platform.is_tensor(target_tensor):
+        target_tensor = platform.detach(target_tensor)
 
     target_size = _get_tensor_size(target_tensor)
     tensor_size = _get_tensor_size(tensor)

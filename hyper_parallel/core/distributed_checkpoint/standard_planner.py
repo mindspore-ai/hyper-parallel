@@ -379,10 +379,10 @@ class StandardSavePlanner(SavePlanner):
         if item.type == WriteItemType.TENSOR:
             if isinstance(obj, DTensor):
                 if obj.layout is not None and obj.layout.ragged_shard is not None:
-                    return get_ragged_box_tensor(obj, item.index).detach().cpu()
-                return obj.to_local().detach().cpu()
+                    return platform.detach(get_ragged_box_tensor(obj, item.index)).to("cpu")
+                return platform.detach(obj.to_local()).to("cpu")
             if isinstance(obj, Tensor):
-                return obj.detach().cpu()
+                return platform.detach(obj).to("cpu")
             raise TypeError(f"Write item {fqn} expected tensor-like object, got {type(obj)}")
         if item.type == WriteItemType.BYTE_IO:
             return obj
@@ -662,7 +662,8 @@ class StandardLoadPlanner(LoadPlanner):
                 read_item.lengths,
             )
 
-        local_tensor = target.to_local().detach() if isinstance(target, DTensor) else target.detach()
+        local_tensor = target.to_local() if isinstance(target, DTensor) else target
+        local_tensor = platform.detach(local_tensor)
         return narrow_tensor_by_index(
             local_tensor,
             read_item.dest_offsets,

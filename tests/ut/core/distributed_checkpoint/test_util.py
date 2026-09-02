@@ -283,6 +283,11 @@ class _RecordingPlatform:
         """Record one broadcast instead of reaching a backend."""
         self.broadcasts.append((tensor, src_rank, group))
 
+    @staticmethod
+    def detach(tensor: Any) -> Any:
+        """Mirror the active Torch platform's data-only view."""
+        return tensor.detach()
+
     def new_group(self, group_ranks: tuple) -> str:
         """Record one group creation and return a recognizable handle."""
         self.created_groups.append(group_ranks)

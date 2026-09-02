@@ -33,6 +33,7 @@ from mindspore import Parameter
 from mindspore.common.initializer import initializer
 
 from hyper_parallel.core.dtensor.dtensor import SkipDTensorDispatch
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 
 
@@ -214,3 +215,82 @@ def test_copy_uninitialized_dtensor_raises(fake_mesh, fake_placements):
 
     with pytest.raises(RuntimeError, match="uninitialized local tensor"):
         copy(src)
+
+
+def _make_getitem_dtensor(placements, mesh_shape=(2,), global_shape=(4, 2)):
+    """Build a CPU DTensorBase wrapper without triggering an Ascend device move."""
+    local = ms.Tensor([[1.0, 2.0], [3.0, 4.0]], dtype=ms.float32)
+    dtensor = ms.Tensor._make_subclass(DTensorBase, local)
+    dtensor._local_tensor = local
+    dtensor._global_shape = global_shape
+
+    class _Layout:
+        pass
+
+    dtensor._layout = _Layout()
+    dtensor._layout.placements = placements
+    dtensor._layout.mesh_shape = mesh_shape
+    return dtensor
+
+
+def test_getitem_dispatches_shard_dim0_integer_case(monkeypatch):
+    """The supported owner-only case must enter Hyper-Parallel dispatch."""
+    dtensor = _make_getitem_dtensor((Shard(0),))
+    expected = object()
+    calls = []
+
+    def _dispatch(op, args, kwargs):
+        calls.append((op, args, kwargs))
+        return expected
+
+    monkeypatch.setattr(
+        "hyper_parallel.core.shard._op_dispatch._OP_DISPATCHER.dispatch",
+        _dispatch,
+    )
+
+    result = dtensor[2]
+
+    assert result is expected, f"getitem dispatch result mismatch: expected={expected!r}, got={result!r}"
+    assert len(calls) == 1, f"getitem dispatch call count mismatch: expected=1, got={len(calls)}"
+    op, args, kwargs = calls[0]
+    assert op.name == "__getitem__", f"getitem op name mismatch: expected='__getitem__', got={op.name!r}"
+    assert args[0] is dtensor, f"getitem tensor argument mismatch: expected={dtensor!r}, got={args[0]!r}"
+    assert args[1] == 2, f"getitem key argument mismatch: expected=2, got={args[1]!r}"
+    assert kwargs == {}, f"getitem kwargs mismatch: expected={{}}, got={kwargs!r}"
+
+
+@pytest.mark.parametrize(
+    "key,placements,mesh_shape",
+    [
+        (slice(None), (Shard(0),), (2,)),
+        (True, (Shard(0),), (2,)),
+        (1, (Replicate(),), (2,)),
+        (1, (Shard(0), Replicate()), (2, 1)),
+    ],
+)
+def test_getitem_other_cases_use_native_cpp(monkeypatch, key, placements, mesh_shape):
+    """Non-special indexing must bypass Hyper-Parallel and retain native behavior."""
+    dtensor = _make_getitem_dtensor(placements, mesh_shape=mesh_shape)
+    dispatched_ops = []
+
+    def _native_primitive_dispatch(op, args, kwargs):
+        op_name = getattr(op, "name", None)
+        dispatched_ops.append(op_name)
+        if op_name == "__getitem__":
+            raise AssertionError("non-special getitem unexpectedly entered owner-only dispatch")
+        local_args = [arg.to_local() if isinstance(arg, DTensorBase) else arg for arg in args]
+        return op(*local_args, **kwargs)
+
+    monkeypatch.setattr(
+        "hyper_parallel.core.shard._op_dispatch._OP_DISPATCHER.dispatch",
+        _native_primitive_dispatch,
+    )
+
+    result = dtensor[key]
+
+    assert isinstance(result, ms.Tensor), (
+        f"native getitem result type mismatch: expected={ms.Tensor}, got={type(result)}"
+    )
+    assert "__getitem__" not in dispatched_ops, (
+        f"non-special getitem should not enter owner-only dispatch, got={dispatched_ops}"
+    )

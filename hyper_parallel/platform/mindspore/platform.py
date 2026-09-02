@@ -257,6 +257,12 @@ def _mindspore_variable_all_to_all(
         group=group,
         async_op=False,
     )
+    # MindSpore may expose an all-zero receive result as a scalar Tensor.  The
+    # variable all-to-all contract is still the requested dim-zero shape, so
+    # normalize the local result after all ranks have participated in the
+    # collective.
+    if sum(output_splits) == 0:
+        return mint.empty(output_shape, dtype=input_tensor.dtype)
     return output
 
 
@@ -1419,6 +1425,19 @@ class MindSporePlatform(Platform):
         set requires grad flag for input tensor
         """
         input_tensor.requires_grad_()
+
+    @staticmethod
+    def detach(input_tensor):
+        """Return the input for the current MindSpore DCP data-only path.
+
+        MindSpore Tensor and Parameter do not expose PyTorch's ``detach``
+        method. The current distributed-checkpoint path does not construct or
+        manage a gradient graph, so returning the original object preserves
+        storage aliasing for load targets. If future callers need gradient
+        blocking, this temporary compatibility hook should be replaced by a
+        dedicated MindSpore gradient API.
+        """
+        return input_tensor
 
     @staticmethod
     def _normalize_group_options(pg_options: Any) -> Any:

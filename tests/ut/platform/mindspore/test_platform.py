@@ -46,6 +46,14 @@ def test_prepare_batch_p2p_group_does_not_synchronize():
     assert result is None
 
 
+def test_detach_preserves_mindspore_tensor_identity():
+    """MindSpore DCP detach compatibility hook preserves the input object."""
+    tensor = ms.Tensor(np.array([1.0, 2.0], dtype=np.float32))
+    detached = MindSporePlatform.detach(tensor)
+
+    assert detached is tensor, f"DCP detach should preserve identity: expected={tensor!r}, got={detached!r}"
+
+
 def test_buffers_dict_includes_all_registered_buffers():
     """MindSpore buffer enumeration includes persistent and non-persistent buffers."""
     cell = nn.Cell()
@@ -166,6 +174,22 @@ def test_variable_all_to_all_allocates_nd_output_from_row_splits():
         "group": "group",
         "async_op": False,
     }
+
+
+def test_variable_all_to_all_normalizes_empty_output_shape():
+    """All-zero receive splits return an empty tensor with the requested shape."""
+    input_tensor = ms.Tensor(np.arange(12, dtype=np.float32))
+    scalar_output = ms.Tensor(np.array(0, dtype=np.float32))
+    with mock.patch(
+        "hyper_parallel.platform.mindspore.platform.comm_func.all_to_all_single",
+        return_value=(scalar_output, None),
+    ) as mock_all_to_all:
+        result = _mindspore_variable_all_to_all(
+            input_tensor, [0, 12], [0, 0], "group"
+        )
+
+    assert tuple(result.shape) == (0,)
+    mock_all_to_all.assert_called_once()
 
 
 def test_variable_all_to_all_backward_swaps_splits():

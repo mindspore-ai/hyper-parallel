@@ -512,6 +512,19 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement set_tensor_requires_grad")
 
     @staticmethod
+    def detach(input_tensor):
+        """Return a tensor for a backend data-only operation.
+
+        This is currently a temporary compatibility hook used by the
+        distributed-checkpoint data path. Backends with Tensor-level autograd
+        support should return a detached view; backends whose checkpoint path
+        does not manage gradients may return the original tensor. A dedicated
+        gradient API can replace this hook when cross-backend detach semantics
+        are required elsewhere.
+        """
+        raise NotImplementedError("Platform subclasses must implement detach")
+
+    @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
         """Gather tensors from all ranks into a single output tensor.
 
