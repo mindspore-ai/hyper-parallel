@@ -311,8 +311,6 @@ class ShardingPlanner:
             )
             if spec is None:
                 continue
-            if boundary_type == "embed" and arch == "qwen3_5" and "tp" in mesh_dim_names:
-                self._configure_qwen3_5_embedding_tp_spec(spec)
             if boundary_type == "moe_mlp":
                 self._mark_hf_native_moe(
                     spec, group, boundary_fqn, template, mesh_dim_names, arch,
@@ -334,19 +332,6 @@ class ShardingPlanner:
                 )
             plan.modules[boundary_fqn] = spec
             plan.modules.update(nested_specs)
-
-    @staticmethod
-    def _configure_qwen3_5_embedding_tp_spec(spec: ModuleShardingSpec) -> None:
-        """Keep Qwen3.5 embedding parameters replicated like Transformers.
-
-        Qwen3.5's Transformers TP plan intentionally omits ``embed_tokens``.
-        The embedding output may still be sequence-sharded by the outer
-        boundary, but it does not originate from partial vocabulary shards.
-        """
-        for placement in spec.params.values():
-            placement[TP] = Replicate()
-        for placement in spec.out_src.values():
-            placement[TP] = Replicate()
 
     @staticmethod
     def _configure_gdn_tp_spec(

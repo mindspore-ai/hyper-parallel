@@ -38,7 +38,7 @@ from hyper_parallel.auto_models.components.distributed.sharding_config import (
     PackedShard,
 )
 from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
-from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard, StridedShard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 
 
 class FakeGatedDeltaNet(nn.Module):
@@ -70,34 +70,6 @@ class FakeModel(nn.Module):
         """Install one fake LinearAttention layer."""
         super().__init__()
         self.linear_attn = FakeGatedDeltaNet()
-
-
-class FakeQwen35Model(nn.Module):
-    """Minimal Qwen3.5 model exposing embedding and output head boundaries."""
-
-    def __init__(self) -> None:
-        """Create a model whose architecture selects the Qwen3.5 TP plan."""
-        super().__init__()
-        self.config = SimpleNamespace(
-            architectures=["Qwen3_5ForCausalLM"],
-            tie_word_embeddings=False,
-        )
-        self.model = nn.Module()
-        self.model.embed_tokens = nn.Embedding(8, 4)
-        self.lm_head = nn.Linear(4, 8, bias=False)
-
-
-class FakeTPMesh:
-    """Minimal two-rank TP mesh used by planner-only tests."""
-
-    mesh_dim_names = ("tp",)
-    mesh_shape = (2,)
-
-    def __getitem__(self, mesh_dim: str) -> object:
-        """Return a mesh view reporting the requested TP size."""
-        if mesh_dim != "tp":
-            raise KeyError(mesh_dim)
-        return SimpleNamespace(size=lambda: 2)
 
 
 def test_packed_shard_reorders_unequal_sections_by_rank():
@@ -229,37 +201,3 @@ def test_gdn_tp_spec_matches_transformers_colwise_gather_output_plan():
     assert all(placement[TP] == Replicate() for placement in spec.params.values())
     assert spec.out_src["output"][TP] == Replicate()
     assert spec.tp_divide_attrs == []
-
-
-def test_qwen3_5_embedding_stays_replicated_under_tp():
-    """Qwen3.5 follows Transformers by leaving embedding outside TP."""
-    spec = ModuleShardingSpec(
-        params={"weight": {TP: Shard(0), CP: Replicate()}},
-        out_src={"output": {TP: Partial(), CP: Replicate()}},
-        out_dst={"output": {TP: Shard(1), CP: Replicate()}},
-    )
-
-    ShardingPlanner._configure_qwen3_5_embedding_tp_spec(  # pylint: disable=protected-access
-        spec,
-    )
-
-    assert spec.params["weight"][TP] == Replicate()
-    assert spec.out_src["output"][TP] == Replicate()
-    assert spec.out_dst["output"][TP] == Shard(1)
-
-
-def test_qwen3_5_plan_leaves_embedding_outside_tp():
-    """Planner applies the replicated embedding rule only through Qwen3.5."""
-    plan = ShardingPlanner().plan(
-        FakeQwen35Model(),
-        FakeTPMesh(),
-        tp_size=2,
-        sequence_parallel=False,
-    )
-
-    embed_spec = plan.modules["model.embed_tokens"]
-    lm_head_spec = plan.modules["lm_head"]
-    assert embed_spec.params["weight"][TP] == Replicate()
-    assert embed_spec.out_src["output"][TP] == Replicate()
-    assert embed_spec.out_dst["output"][TP] == Replicate()
-    assert lm_head_spec.params["weight"][TP] == Shard(0)
