@@ -31,7 +31,7 @@ pipeline-assembly level in ``test_pass_pipeline``):
    stay replicated in both graph and live model — the divisibility gate must
    match between ``_identify_params_in_fsdp_modules`` and
    ``_shard_live_model_params``).
-5. Uses ``parallel_config.fsdp_degree`` over ``world_size`` (a TP+FSDP hybrid
+5. Uses ``pass_config.fsdp_degree`` over ``world_size`` (a TP+FSDP hybrid
    where the FSDP group is a proper sub-group of the world).
 
 Pure helpers:
@@ -56,9 +56,9 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 from torch import fx, nn
 
-from hyper_parallel.compile.parallel_config import ParallelConfig
+from hyper_parallel.compile.parallel_config import PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
-from hyper_parallel.compile.sharding_config import ShardingPlan
+from hyper_parallel.compile.sharding_config import PassPlan
 
 _DIST_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass.dist"
 
@@ -197,7 +197,7 @@ class TestFSDPPassRunGuards(unittest.TestCase):
 
     def test_run_skips_when_dist_not_initialized(self):
         """Test the pass early-returns when ``dist`` is not initialized."""
-        cfg = ParallelConfig(fsdp_enabled=True, fsdp_degree=2)
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
         pas = FSDPPass()
         gm = _linear_joint_graph()
         model = nn.Linear(4, 4)
@@ -232,7 +232,7 @@ class TestFSDPPassRunGuards(unittest.TestCase):
 
     def test_run_skips_when_world_size_one(self):
         """Test the pass early-returns when ``world_size == 1``."""
-        cfg = ParallelConfig(fsdp_enabled=True, fsdp_degree=2)
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
         pas = FSDPPass()
         gm = _linear_joint_graph()
         model = nn.Linear(4, 4)
@@ -262,7 +262,7 @@ class TestFSDPPassRunGuards(unittest.TestCase):
         The pass needs the live model to shard parameters in place; omitting
         it must fail loudly rather than silently doing nothing.
         """
-        cfg = ParallelConfig(fsdp_enabled=True, fsdp_degree=2)
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
         pas = FSDPPass()
         gm = _linear_joint_graph()
 
@@ -282,7 +282,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
 
     def test_run_shards_params_and_inserts_all_gather_and_reduce_scatter(self):
         """Test the happy path: shards params + inserts collectives."""
-        cfg = ParallelConfig(fsdp_enabled=True, fsdp_degree=2)
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
         pas = FSDPPass()
         gm = _linear_joint_graph()
         model = nn.Linear(4, 4)
@@ -343,7 +343,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
         non-divisible param is skipped on both sides, so no AllGather is
         inserted and the live tensor keeps its shape.
         """
-        cfg = ParallelConfig(fsdp_enabled=True, fsdp_degree=2)
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
         pas = FSDPPass()
         gm = _odd_joint_graph()
         model = _OddParam()
@@ -386,7 +386,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
         along the TP axis. Here ``world_size=4`` but ``fsdp_degree=2`` -> the
         param is split in 2, not 4.
         """
-        cfg = ParallelConfig(fsdp_enabled=True, fsdp_degree=2)
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
         pas = FSDPPass()
         gm = _linear_joint_graph()
         model = nn.Linear(4, 4)
@@ -412,15 +412,15 @@ class TestFSDPPassRunSharding(unittest.TestCase):
         on both sides — sharding it live while the graph holds it replicated
         (no AllGather) would mismatch at ``run_traced_graph`` time.
         """
-        cfg = ParallelConfig(fsdp_enabled=True, fsdp_degree=2)
-        plan = ShardingPlan().fsdp_wrap("lin")
-        pas = FSDPPass(sharding_plan=plan)
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
+        plan = PassPlan().fsdp_wrap("lin")
+        pas = FSDPPass(pass_plan=plan)
         gm = _lin_bias_extra_joint_graph()
         model = _WrappedPlusRootParam()
         before_extra = tuple(model.extra.shape)
 
         with _patch_dist(world_size=2, rank=0, initialized=True):
-            # sharding_plan auto-filled from the pass (not kwargs), as the
+            # pass_plan auto-filled from the pass (not kwargs), as the
             # pipeline would do.
             result = pas.run(gm, cfg, model=model, fsdp_group_name="fsdp")
 
@@ -472,7 +472,7 @@ class TestFSDPPassHelpers(unittest.TestCase):
 
     def test_param_belongs_to_fsdp_module_exact_and_pattern(self):
         """Test exact-FQN and wildcard-pattern matching of ancestor modules."""
-        exact = FSDPPass(sharding_plan=ShardingPlan().fsdp_wrap("lin"))
+        exact = FSDPPass(pass_plan=PassPlan().fsdp_wrap("lin"))
         self.assertTrue(
             exact._param_belongs_to_fsdp_module("lin.weight"),  # pylint: disable=protected-access
             "exact fsdp_wrap('lin') should match a param under module 'lin'",
@@ -482,7 +482,7 @@ class TestFSDPPassHelpers(unittest.TestCase):
             "exact wrap must not match an unrelated module",
         )
 
-        pattern = FSDPPass(sharding_plan=ShardingPlan().fsdp_wrap_pattern("layers.*"))
+        pattern = FSDPPass(pass_plan=PassPlan().fsdp_wrap_pattern("layers.*"))
         self.assertTrue(
             pattern._param_belongs_to_fsdp_module("layers.0.lin.weight"),  # pylint: disable=protected-access
             "pattern 'layers.*' should match an ancestor like 'layers.0.lin'",
@@ -499,7 +499,7 @@ class TestFSDPPassHelpers(unittest.TestCase):
         walking ancestors, so a param directly on the root (``weight``) matches
         a ``*`` plan or an explicit ``fsdp_wrap("weight")``.
         """
-        pas = FSDPPass(sharding_plan=ShardingPlan().fsdp_wrap_pattern("*"))
+        pas = FSDPPass(pass_plan=PassPlan().fsdp_wrap_pattern("*"))
         self.assertTrue(
             pas._param_belongs_to_fsdp_module("weight"),  # pylint: disable=protected-access
             "top-level param 'weight' should match a '*' plan via its own FQN",

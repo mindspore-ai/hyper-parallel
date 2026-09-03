@@ -40,7 +40,7 @@ import yaml
 DEFAULT_CONFIG_DIR = Path(__file__).parent / "examples"
 
 __all__ = [
-    "ShardingPlan",
+    "PassPlan",
     "FSDPModuleConfig",
     "create_sharding_plan_from_yaml",
     "create_simple_sharding_plan",
@@ -53,7 +53,7 @@ class FSDPModuleConfig:
 
     Attributes:
         module_fqn: Module fully qualified name (or wildcard pattern). The
-            same value is also the dict key in ``ShardingPlan.fsdp_modules``
+            same value is also the dict key in ``PassPlan.fsdp_modules``
             / ``fsdp_patterns``; it is kept on the dataclass so iterating
             ``plan.fsdp_modules.values()`` stays self-describing.
     """
@@ -62,7 +62,7 @@ class FSDPModuleConfig:
 
 
 @dataclass
-class ShardingPlan:
+class PassPlan:
     """Declare which modules ``FSDPPass`` should shard.
 
     Two registries (exact FQN match + wildcard patterns) are checked in
@@ -70,7 +70,7 @@ class ShardingPlan:
     wins when patterns overlap).
 
     Example:
-        plan = ShardingPlan()
+        plan = PassPlan()
         plan.fsdp_wrap("tok_embeddings")
         plan.fsdp_wrap_pattern("layers.*")
     """
@@ -78,7 +78,7 @@ class ShardingPlan:
     fsdp_modules: Dict[str, FSDPModuleConfig] = field(default_factory=dict)
     fsdp_patterns: Dict[str, FSDPModuleConfig] = field(default_factory=dict)
 
-    def merge(self, other: "ShardingPlan") -> "ShardingPlan":
+    def merge(self, other: "PassPlan") -> "PassPlan":
         """Return a new plan with both registries merged (other wins on key conflict).
 
         Args:
@@ -86,14 +86,14 @@ class ShardingPlan:
                 with the same FQN / pattern in ``self``.
 
         Returns:
-            A new ``ShardingPlan``; ``self`` and ``other`` are not mutated.
+            A new ``PassPlan``; ``self`` and ``other`` are not mutated.
         """
-        merged = ShardingPlan()
+        merged = PassPlan()
         merged.fsdp_modules = {**self.fsdp_modules, **other.fsdp_modules}
         merged.fsdp_patterns = {**self.fsdp_patterns, **other.fsdp_patterns}
         return merged
 
-    def fsdp_wrap(self, module_fqn: str) -> "ShardingPlan":
+    def fsdp_wrap(self, module_fqn: str) -> "PassPlan":
         """Mark a specific module for FSDP wrapping (exact match).
 
         Args:
@@ -108,7 +108,7 @@ class ShardingPlan:
         self.fsdp_modules[module_fqn] = FSDPModuleConfig(module_fqn=module_fqn)
         return self
 
-    def fsdp_wrap_pattern(self, pattern: str) -> "ShardingPlan":
+    def fsdp_wrap_pattern(self, pattern: str) -> "PassPlan":
         """Mark modules for FSDP wrapping (wildcard match).
 
         Args:
@@ -150,15 +150,15 @@ class ShardingPlan:
 def create_sharding_plan_from_yaml(
     config_path: Optional[str] = None,
     model_name: Optional[str] = None,
-) -> ShardingPlan:
-    """Create ShardingPlan from a YAML configuration file.
+) -> PassPlan:
+    """Create PassPlan from a YAML configuration file.
 
     Args:
         config_path: Path to YAML config file.
         model_name: Model name (looks up in ``examples/{model_name}/config.yaml``).
 
     Returns:
-        ShardingPlan object.
+        PassPlan object.
 
     Raises:
         ValueError: When neither argument is given, ``model_name`` is empty
@@ -198,7 +198,7 @@ def create_sharding_plan_from_yaml(
             f"got {type(config).__name__}: {config_path}"
         )
 
-    plan = ShardingPlan()
+    plan = PassPlan()
 
     fsdp_config = config.get("fsdp", {})
     has_explicit_modules = bool(fsdp_config.get("modules"))
@@ -213,7 +213,7 @@ def create_sharding_plan_from_yaml(
     return plan
 
 
-def _process_fsdp(plan: ShardingPlan, fsdp_config: dict) -> None:
+def _process_fsdp(plan: PassPlan, fsdp_config: dict) -> None:
     """Process FSDP configuration (modules + patterns) into the plan."""
     for module_config in fsdp_config.get("modules", []):
         plan.fsdp_wrap(module_config["name"])
@@ -222,11 +222,11 @@ def _process_fsdp(plan: ShardingPlan, fsdp_config: dict) -> None:
         plan.fsdp_wrap_pattern(pattern_config["pattern"])
 
 
-def create_simple_sharding_plan() -> ShardingPlan:
+def create_simple_sharding_plan() -> PassPlan:
     """Create a plan that FSDP-wraps every module (``*`` pattern).
 
     Convenience for tests / quick demos.
     """
-    plan = ShardingPlan()
+    plan = PassPlan()
     plan.fsdp_wrap_pattern("*")
     return plan

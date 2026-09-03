@@ -29,7 +29,7 @@ from typing import Optional
 
 
 @dataclass
-class ParallelConfig:
+class PassConfig:
     """Parallel configuration for graph-mode FSDP (+ optional TP) training.
 
     Attributes:
@@ -83,4 +83,4 @@ class ParallelConfig:
             )
 
 
-__all__ = ["ParallelConfig"]
+__all__ = ["PassConfig"]

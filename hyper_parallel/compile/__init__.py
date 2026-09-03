@@ -25,22 +25,22 @@ Core Features:
 Usage Example:
     from hyper_parallel.compile import (
         GraphTrainer,
-        ParallelConfig,
-        ShardingPlan,
+        PassConfig,
+        PassPlan,
     )
 
     # Create model
     model = Llama3ForCausalLM(config)
 
     # Configure parallelism
-    parallel_config = ParallelConfig(enable_overlap=True)
+    pass_config = PassConfig(enable_overlap=True)
 
     # Configure sharding plan
-    sharding_plan = ShardingPlan()
-    sharding_plan.fsdp_wrap_pattern("layers.*")
+    pass_plan = PassPlan()
+    pass_plan.fsdp_wrap_pattern("layers.*")
 
     # Create trainer
-    trainer = GraphTrainer(model, train_fn, parallel_config, sharding_plan)
+    trainer = GraphTrainer(model, train_fn, pass_config, pass_plan)
 
     # Training -- train compiles on the first batch, moves batches onto the
     # trainer's device, and drives the whole train/optimize loop.
@@ -48,24 +48,24 @@ Usage Example:
 """
 
 from .sharding_config import (
-    ShardingPlan,
+    PassPlan,
     FSDPModuleConfig,
     create_sharding_plan_from_yaml,
     create_simple_sharding_plan,
 )
 
-from .parallel_config import ParallelConfig
+from .parallel_config import PassConfig
 
 from .trainer import GraphTrainer
 
 __all__ = [
     # Sharding
-    "ShardingPlan",
+    "PassPlan",
     "FSDPModuleConfig",
     "create_sharding_plan_from_yaml",
     "create_simple_sharding_plan",
     # Config
-    "ParallelConfig",
+    "PassConfig",
     # Trainer
     "GraphTrainer",
 ]

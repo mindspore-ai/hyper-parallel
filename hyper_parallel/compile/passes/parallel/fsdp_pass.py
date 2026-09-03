@@ -21,7 +21,7 @@ nodes.
 
 Responsibilities:
 1. Identify parameter placeholders belonging to FSDP-wrapped modules
-   (via ShardingPlan, exact FQN or pattern)
+   (via PassPlan, exact FQN or pattern)
 2. Insert AllGather after each such placeholder (Shard -> Replicate), so the
    computation body operates on full parameters while the graph input stays
    sharded
@@ -47,14 +47,14 @@ import torch.distributed as dist
 from torch import fx, nn
 from torch.ops import _c10d_functional
 
-from ...parallel_config import ParallelConfig
-from ..base import ParallelPass
-from ...sharding_config import ShardingPlan
+from ...parallel_config import PassConfig
+from ..base import GraphPass
+from ...sharding_config import PassPlan
 
 _LOG = logging.getLogger(__name__)
 
 
-class FSDPPass(ParallelPass):
+class FSDPPass(GraphPass):
     """
         FSDP Partitioning Pass (Module-Level, static-input graph)
 
@@ -74,13 +74,11 @@ class FSDPPass(ParallelPass):
     """
 
     name = "fsdp_parallel"
-    mesh_dim = "dp_shard"
-    comm_ops = ["all_gather", "reduce_scatter"]
 
     def __init__(
         self,
         fsdp_group_name: Optional[str] = None,
-        sharding_plan: Optional[ShardingPlan] = None,
+        pass_plan: Optional[PassPlan] = None,
     ) -> None:
         """Initialize FSDP pass state.
 
@@ -88,13 +86,13 @@ class FSDPPass(ParallelPass):
             fsdp_group_name: Process-group name registered for FSDP
                 collectives. Defaults to ``"fsdp"``. May be overridden
                 per-run via the ``fsdp_group_name`` kwarg in ``run``.
-            sharding_plan: Declarative plan identifying which modules to
+            pass_plan: Declarative plan identifying which modules to
                 shard. When ``None``, all parameters are sharded.
         """
         super().__init__()
         self._fsdp_group_name = fsdp_group_name or "fsdp"
-        self._sharding_plan = sharding_plan
-        # Resolved from ``parallel_config.fsdp_degree`` (or world_size) at
+        self._pass_plan = pass_plan
+        # Resolved from ``pass_config.fsdp_degree`` (or world_size) at
         # ``run`` entry; left as ``None`` here so a stray access before
         # ``run`` fails loudly instead of silently using a wrong default.
         self._fsdp_degree: Optional[int] = None
@@ -104,19 +102,19 @@ class FSDPPass(ParallelPass):
     def run(
         self,
         graph_module: fx.GraphModule,
-        parallel_config: ParallelConfig,
+        pass_config: PassConfig,
         **kwargs: Any,
     ) -> fx.GraphModule:
         """Insert AllGather/ReduceScatter and shard the live model.
 
         Args:
             graph_module: Joint fwd+bwd FX graph from the tracer.
-            parallel_config: Parallel configuration. ``fsdp_degree`` is
+            pass_config: Parallel configuration. ``fsdp_degree`` is
                 read directly; ``None`` falls back to ``world_size`` (the
                 FSDP-only path). A ``TypeError`` here means a non-Protocol
                 config was passed — fix at the caller, do not paper over.
             **kwargs: Must include ``model`` (the live ``nn.Module``) and
-                ``fsdp_group_name`` / ``sharding_plan`` as needed.
+                ``fsdp_group_name`` / ``pass_plan`` as needed.
 
         Returns:
             The transformed graph module.
@@ -129,10 +127,10 @@ class FSDPPass(ParallelPass):
         # (required for TP+FSDP, where the FSDP group is a proper sub-group
         # of the world — using world_size would over-shard along the TP
         # axis).
-        configured = parallel_config.fsdp_degree
+        configured = pass_config.fsdp_degree
         self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
-        self._sharding_plan = kwargs.get("sharding_plan", self._sharding_plan)
+        self._pass_plan = kwargs.get("pass_plan", self._pass_plan)
         model = kwargs.get("model")
         if model is None:
             raise ValueError(
@@ -171,7 +169,7 @@ class FSDPPass(ParallelPass):
 
         if not param_nodes:
             _LOG.warning(
-                "No FSDP parameters found, check ShardingPlan or model structure"
+                "No FSDP parameters found, check PassPlan or model structure"
             )
             return graph_module
 
@@ -213,7 +211,7 @@ class FSDPPass(ParallelPass):
         Parameters are the leading ``num_state_inputs`` placeholders of the
         joint graph, in ``state_fqns`` order. A parameter is FSDP-sharded when
         any ancestor module FQN (e.g. ``layers.0.attention.wq`` for
-        ``layers.0.attention.wq.weight``) is marked in the ShardingPlan —
+        ``layers.0.attention.wq.weight``) is marked in the PassPlan —
         either exactly or via pattern (e.g. ``layers.*``).
 
         Only parameters are sharded. Buffers (e.g. RoPE's non-persistent
@@ -254,7 +252,7 @@ class FSDPPass(ParallelPass):
             fqn = state_fqns[idx]
 
             if (
-                self._sharding_plan is not None
+                self._pass_plan is not None
                 and not self._param_belongs_to_fsdp_module(fqn)
             ):
                 continue
@@ -304,7 +302,7 @@ class FSDPPass(ParallelPass):
             # (no AllGather inserted), causing a shape mismatch at
             # ``run_traced_graph`` time on any non-``*`` plan.
             if (
-                self._sharding_plan is not None
+                self._pass_plan is not None
                 and not self._param_belongs_to_fsdp_module(name)
             ):
                 _LOG.info(
@@ -348,13 +346,13 @@ class FSDPPass(ParallelPass):
         its own FQN is still tested first so it can be wrapped by its name
         (``fsdp_wrap("weight")``) or by a ``*`` pattern.
         """
-        if self._sharding_plan.is_fsdp_module(param_fqn):
+        if self._pass_plan.is_fsdp_module(param_fqn):
             return True
 
         parts = param_fqn.split(".")
         for i in range(len(parts) - 1, 0, -1):
             module_fqn = ".".join(parts[:i])
-            if self._sharding_plan.is_fsdp_module(module_fqn):
+            if self._pass_plan.is_fsdp_module(module_fqn):
                 return True
         return False
 

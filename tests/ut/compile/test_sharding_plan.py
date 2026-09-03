@@ -16,7 +16,7 @@
 
 Covers:
 
-1. ``ShardingPlan.fsdp_wrap`` / ``fsdp_wrap_pattern`` register entries and
+1. ``PassPlan.fsdp_wrap`` / ``fsdp_wrap_pattern`` register entries and
    support chaining.
 2. ``is_fsdp_module`` exact-match wins over patterns; patterns match via
    ``fnmatch`` semantics.
@@ -35,18 +35,18 @@ import yaml
 
 from hyper_parallel.compile.sharding_config import (
     FSDPModuleConfig,
-    ShardingPlan,
+    PassPlan,
     create_sharding_plan_from_yaml,
     create_simple_sharding_plan,
 )
 
 
-class TestShardingPlanRegistration(unittest.TestCase):
+class TestPassPlanRegistration(unittest.TestCase):
     """``fsdp_wrap`` / ``fsdp_wrap_pattern`` register entries; chainable."""
 
     def test_fsdp_wrap_registers_exact_match(self):
         """Test ``fsdp_wrap`` adds an exact-match entry."""
-        plan = ShardingPlan()
+        plan = PassPlan()
         result = plan.fsdp_wrap("tok_embeddings")
         self.assertIs(result, plan, ("fsdp_wrap should return self for chaining"))
         self.assertIn("tok_embeddings", plan.fsdp_modules)
@@ -56,7 +56,7 @@ class TestShardingPlanRegistration(unittest.TestCase):
 
     def test_fsdp_wrap_pattern_registers_pattern(self):
         """Test ``fsdp_wrap_pattern`` adds a wildcard-pattern entry."""
-        plan = ShardingPlan()
+        plan = PassPlan()
         result = plan.fsdp_wrap_pattern("layers.*")
         self.assertIs(result, plan)
         self.assertIn("layers.*", plan.fsdp_patterns)
@@ -65,7 +65,7 @@ class TestShardingPlanRegistration(unittest.TestCase):
     def test_chaining(self):
         """Test multiple builder calls chain on one plan."""
         plan = (
-            ShardingPlan()
+            PassPlan()
             .fsdp_wrap("tok_embeddings")
             .fsdp_wrap("head")
             .fsdp_wrap_pattern("layers.*")
@@ -74,13 +74,13 @@ class TestShardingPlanRegistration(unittest.TestCase):
         self.assertEqual(len(plan.fsdp_patterns), 1)
 
 
-class TestShardingPlanMatching(unittest.TestCase):
+class TestPassPlanMatching(unittest.TestCase):
     """``is_fsdp_module`` / ``get_fsdp_config`` match semantics."""
 
     def setUp(self) -> None:
         """Build a plan with one exact-match and one pattern entry."""
         self.plan = (
-            ShardingPlan().fsdp_wrap("tok_embeddings").fsdp_wrap_pattern("layers.*")
+            PassPlan().fsdp_wrap("tok_embeddings").fsdp_wrap_pattern("layers.*")
         )
 
     def test_is_fsdp_module_exact_match(self):
@@ -116,7 +116,7 @@ class TestShardingPlanMatching(unittest.TestCase):
     def test_first_pattern_wins_on_overlap(self):
         """Test first-inserted pattern wins when patterns overlap."""
         plan = (
-            ShardingPlan()
+            PassPlan()
             .fsdp_wrap_pattern("layers.*")  # inserted first
             .fsdp_wrap_pattern("layers.0.*")  # also matches layers.0.x
         )
@@ -128,21 +128,21 @@ class TestShardingPlanMatching(unittest.TestCase):
         )
 
 
-class TestShardingPlanMerge(unittest.TestCase):
+class TestPassPlanMerge(unittest.TestCase):
     """``merge`` returns a new plan; inputs are not mutated."""
 
     def test_merge_returns_new_plan(self):
         """Test merge returns a distinct object."""
-        a = ShardingPlan().fsdp_wrap("a")
-        b = ShardingPlan().fsdp_wrap("b")
+        a = PassPlan().fsdp_wrap("a")
+        b = PassPlan().fsdp_wrap("b")
         merged = a.merge(b)
         self.assertIsNot(merged, a, "merge should not return self")
         self.assertIsNot(merged, b, "merge should not return other")
 
     def test_merge_combines_registries(self):
         """Test merge combines both plans' modules and patterns."""
-        a = ShardingPlan().fsdp_wrap("a").fsdp_wrap_pattern("layers.*")
-        b = ShardingPlan().fsdp_wrap("b").fsdp_wrap_pattern("blocks.*")
+        a = PassPlan().fsdp_wrap("a").fsdp_wrap_pattern("layers.*")
+        b = PassPlan().fsdp_wrap("b").fsdp_wrap_pattern("blocks.*")
         merged = a.merge(b)
         self.assertTrue(merged.is_fsdp_module("a"))
         self.assertTrue(merged.is_fsdp_module("b"))
@@ -151,8 +151,8 @@ class TestShardingPlanMerge(unittest.TestCase):
 
     def test_merge_does_not_mutate_inputs(self):
         """Test merge leaves both input plans unchanged."""
-        a = ShardingPlan().fsdp_wrap("a")
-        b = ShardingPlan().fsdp_wrap("b")
+        a = PassPlan().fsdp_wrap("a")
+        b = PassPlan().fsdp_wrap("b")
         a.merge(b)
         self.assertNotIn("b", a.fsdp_modules, ("merge should not mutate the receiver"))
         self.assertNotIn(
@@ -161,8 +161,8 @@ class TestShardingPlanMerge(unittest.TestCase):
 
     def test_merge_other_wins_on_conflict(self):
         """Test entries in ``other`` overwrite entries with the same key."""
-        a = ShardingPlan().fsdp_wrap("shared")
-        b = ShardingPlan().fsdp_wrap("shared")  # same key
+        a = PassPlan().fsdp_wrap("shared")
+        b = PassPlan().fsdp_wrap("shared")  # same key
         a_cfg = a.fsdp_modules["shared"]
         b_cfg = b.fsdp_modules["shared"]
         merged = a.merge(b)
@@ -187,7 +187,7 @@ class TestShardingPlanMerge(unittest.TestCase):
         )
 
 
-class TestCreateSimpleShardingPlan(unittest.TestCase):
+class TestCreateSimplePassPlan(unittest.TestCase):
     """``create_simple_sharding_plan`` wraps everything via ``*``."""
 
     def test_wraps_all_modules(self):
@@ -199,7 +199,7 @@ class TestCreateSimpleShardingPlan(unittest.TestCase):
         self.assertEqual(len(plan.fsdp_modules), 0)
 
 
-class TestCreateShardingPlanFromYaml(unittest.TestCase):
+class TestCreatePassPlanFromYaml(unittest.TestCase):
     """YAML loading happy path + validation rules."""
 
     def test_loads_modules_and_patterns(self):
