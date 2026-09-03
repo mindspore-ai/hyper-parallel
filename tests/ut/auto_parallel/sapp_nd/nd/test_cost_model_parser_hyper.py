@@ -26,6 +26,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
     CostModelParserHyperV2,
+    custom_vision_tower_hook,
 )
 
 
@@ -740,10 +741,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
 
     # ---- L2: AutoModels config path (mock) -------------------------------
 
-    @patch(
-        "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers."
-        "cost_model_parser_hyper.get_hf_config"
-    )
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_auto_models_config_happy_path(self, mock_get_hf_config):
         """
         Feature: AutoModels Trainer configuration parsing.
@@ -774,9 +772,7 @@ class TestCostModelParserHyperV2(unittest.TestCase):
 
         ccfg = _make_ccfg(_auto_models_config())
 
-        mock_get_hf_config.assert_called_once_with(
-            "local/model", "sdpa", "bfloat16", local_files_only=True,
-        )
+        mock_get_hf_config.assert_called_once()
         self.assertEqual(ccfg.model_name, "qwen3_moe")
         self.assertEqual(ccfg.h, 8192)
         self.assertEqual(ccfg.n_lay, 80)
@@ -809,8 +805,312 @@ class TestCostModelParserHyperV2(unittest.TestCase):
         config = _auto_models_config(model={
             "pretrained_model_name_or_path": None,
         })
-        with self.assertRaisesRegex(ValueError, "no model.config_overrides"):
+        with self.assertRaisesRegex(ValueError, "model.config_overrides"):
             _make_ccfg(config)
+
+
+    # ---- L2b: AutoModels field mapping -----------------------------------
+
+    @staticmethod
+    def _hf_config(**kw):
+        """Return a fake Transformers config with sane dense defaults."""
+        base = {
+            "model_type": "qwen3_moe", "hidden_size": 2048,
+            "num_hidden_layers": 48, "num_attention_heads": 32,
+            "num_key_value_heads": 4, "intermediate_size": 6144,
+            "vocab_size": 151936, "max_position_embeddings": 40960,
+        }
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_head_dim_honoured(self, mock_hf):
+        """
+        Feature: attention head dimension.
+        Description: Transformers exposes head_dim explicitly.
+        Expectation: ccfg.dh uses it rather than hidden_size / heads.
+        """
+        mock_hf.return_value = self._hf_config(head_dim=128)
+        ccfg = _make_ccfg(_auto_models_config())
+        self.assertEqual(ccfg.dh, 128)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_head_dim_defaults_to_hidden_over_heads(self, mock_hf):
+        """
+        Feature: attention head dimension fallback.
+        Description: A config that declares no head_dim.
+        Expectation: ccfg.dh falls back to hidden_size / num_attention_heads.
+        """
+        mock_hf.return_value = self._hf_config()
+        ccfg = _make_ccfg(_auto_models_config())
+        self.assertEqual(ccfg.dh, 2048 / 32)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_mtp_depth_alias(self, mock_hf):
+        """
+        Feature: MTP depth resolution.
+        Description: Transformers spells MTP depth num_nextn_predict_layers.
+        Expectation: n_mtp picks up the alias and enters offset balancing.
+        """
+        mock_hf.return_value = self._hf_config(num_nextn_predict_layers=1)
+        ccfg = _make_ccfg(_auto_models_config())
+        self.assertEqual(ccfg.n_mtp, 1)
+        self.assertTrue(ccfg.is_mtp_in_offset)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_mtp_depth_prefers_internal_name(self, mock_hf):
+        """
+        Feature: MTP depth resolution.
+        Description: Both the internal and the Transformers spelling present.
+        Expectation: The internal mtp_depth wins.
+        """
+        mock_hf.return_value = self._hf_config(mtp_depth=3, num_nextn_predict_layers=1)
+        ccfg = _make_ccfg(_auto_models_config())
+        self.assertEqual(ccfg.n_mtp, 3)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_missing_field_falls_back_to_overrides(self, mock_hf):
+        """
+        Feature: AutoModels resolution failure.
+        Description: A config object missing a required field raises
+            AttributeError inside the resolver.
+        Expectation: The parser falls back to config_overrides rather than
+            propagating the error.
+        """
+        mock_hf.side_effect = AttributeError("intermediate_size")
+        config = _auto_models_config(model={"config_overrides": {
+            "hidden_size": 1024, "num_hidden_layers": 4,
+            "num_attention_heads": 8, "intermediate_size": 2048,
+            "vocab_size": 1000,
+        }})
+        ccfg = _make_ccfg(config)
+        self.assertEqual(ccfg.h, 1024)
+        self.assertEqual(ccfg.n_lay, 4)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_missing_transformers_falls_back_to_overrides(self, mock_hf):
+        """
+        Feature: optional Transformers dependency.
+        Description: transformers is not in requirements.txt, so importing it
+            can raise ModuleNotFoundError on a lean install.
+        Expectation: The parser falls back to config_overrides rather than
+            propagating the ImportError.
+        """
+        mock_hf.side_effect = ModuleNotFoundError("No module named 'transformers'")
+        config = _auto_models_config(model={"config_overrides": {
+            "hidden_size": 512, "num_hidden_layers": 2,
+            "num_attention_heads": 8, "intermediate_size": 1024,
+            "vocab_size": 100,
+        }})
+        ccfg = _make_ccfg(config)
+        self.assertEqual(ccfg.h, 512)
+        self.assertEqual(ccfg.n_lay, 2)
+
+    # ---- L2c: vision-language models --------------------------------------
+
+    @staticmethod
+    def _vl_config():
+        """Return a fake composite vision-language Transformers config."""
+        return SimpleNamespace(
+            model_type="qwen3_vl_moe",
+            text_config=SimpleNamespace(
+                hidden_size=2048, num_hidden_layers=24, num_attention_heads=16,
+                num_key_value_heads=16, intermediate_size=5632,
+                vocab_size=151936, max_position_embeddings=128000,
+                head_dim=128, num_experts=60, num_experts_per_tok=4,
+                moe_intermediate_size=1408,
+            ),
+            vision_config=SimpleNamespace(
+                hidden_size=1152, depth=27, num_heads=16,
+                intermediate_size=4304, out_hidden_size=3584,
+                patch_size=16, spatial_merge_size=2,
+                num_position_embeddings=2304,
+            ),
+        )
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_vl_config_builds_submodules(self, mock_hf):
+        """
+        Feature: multimodal cost model.
+        Description: A composite config keeps its language tower under
+            text_config and exposes none of its fields at the top level.
+        Expectation: The parser reads the text tower, and registers a vision
+            submodule alongside it instead of raising AttributeError.
+        """
+        mock_hf.return_value = self._vl_config()
+        ccfg = _make_ccfg(_auto_models_config())
+
+        self.assertTrue(ccfg.multimodal)
+        self.assertEqual(ccfg.mm_order, ["vision", "text"])
+        self.assertEqual(ccfg.mm_main, "text")
+        self.assertEqual(ccfg.n_lay, 0)
+        self.assertEqual(set(ccfg.hooks_dict), {"vision", "text"})
+
+        text = ccfg.mm_ccfgs["text"]
+        self.assertEqual(text.h, 2048)
+        self.assertEqual(text.n_lay, 24)
+        self.assertEqual(text.dh, 128)
+        self.assertEqual(text.n_exp, 60)
+        self.assertEqual(text.s, 2048)
+
+        vision = ccfg.mm_ccfgs["vision"]
+        self.assertEqual(vision.h, 1152)
+        self.assertEqual(vision.n_lay, 27)
+        self.assertEqual(vision.a, 16)
+        self.assertEqual(vision.v, 0)
+        self.assertEqual(vision.n_exp, 1)
+        self.assertEqual(vision.s, 2304 // 4)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_vl_visual_seq_len_override(self, mock_hf):
+        """
+        Feature: visual sequence length.
+        Description: The true visual token count depends on the dataset, so
+            context.visual_seq_len overrides the derived bound.
+        Expectation: The vision submodule adopts the override.
+        """
+        mock_hf.return_value = self._vl_config()
+        ccfg = _make_ccfg(_auto_models_config(context={"visual_seq_len": 2304}))
+        self.assertEqual(ccfg.mm_ccfgs["vision"].s, 2304)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_vl_submodules_share_the_strategy(self, mock_hf):
+        """
+        Feature: multimodal placement.
+        Description: combine_partition_multimodal requires both submodules to
+            share the pipeline degree.
+        Expectation: Vision and text agree on p/vp, and the vision tower is
+            placed entirely on the first stage.
+        """
+        mock_hf.return_value = self._vl_config()
+        ccfg = _make_ccfg(_auto_models_config())
+        vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
+        self.assertEqual(vision.p, text.p)
+        self.assertEqual(vision.vp, text.vp)
+        per_stage = vision.n_lay // vision.p // vision.vp
+        self.assertEqual(vision.offset[0], vision.n_lay - per_stage)
+        self.assertEqual(vision.offset[1:], [-per_stage] * (vision.p - 1))
+
+    def test_vision_hook_wraps_a_bare_config(self):
+        """
+        Feature: vision-tower arch hook.
+        Description: The hook is handed an evaluator during estimation, but a
+            bare cost config when applied directly.
+        Expectation: A config without set_ccfg is wrapped, and the tower's
+            two-matmul MLP profile is applied either way.
+        """
+        bare = SimpleNamespace(has_op=False, p=2)
+        custom_vision_tower_hook(bare)
+        self.assertEqual(bare.n_ffMM, 2)
+        self.assertEqual(bare.n_normOp, 2)
+        # A ViT block has no gated triple, unlike the language model.
+        self.assertEqual(bare.n_ffParamCast, 2)
+
+    def test_capacity_factor_override(self):
+        """
+        Feature: MoE capacity factor.
+        Description: Standalone search configs may pin a capacity factor.
+        Expectation: ccfg.cap_fact takes the declared value.
+        """
+        config = _auto_models_config(model={
+            "pretrained_model_name_or_path": None,
+            "config_overrides": {
+                "hidden_size": 1024, "num_hidden_layers": 4,
+                "num_attention_heads": 8, "intermediate_size": 2048,
+                "vocab_size": 100, "num_experts": 8,
+                "moe_intermediate_size": 512, "capacity_factor": 1.5,
+            },
+        })
+        ccfg = _make_ccfg(config)
+        self.assertEqual(ccfg.n_exp, 8)
+        self.assertEqual(ccfg.cap_fact, 1.5)
+
+    # ---- L2d: device count -------------------------------------------------
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_device_num_drives_dp(self, mock_hf):
+        """
+        Feature: cluster size.
+        Description: context.device_num states the world size that an
+            AutoModels train.yaml cannot express.
+        Expectation: d is derived as device_num / (t * p * cp).
+        """
+        mock_hf.return_value = self._hf_config()
+        ccfg = _make_ccfg(_auto_models_config(context={"device_num": 32}))
+        self.assertEqual(ccfg.t, 4)
+        self.assertEqual(ccfg.p, 2)
+        self.assertEqual(ccfg.d, 4)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_device_num_indivisible_raises(self, mock_hf):
+        """
+        Feature: cluster size validation.
+        Description: A device count not divisible by t * p * cp.
+        Expectation: ValueError instead of a silently truncated degree.
+        """
+        mock_hf.return_value = self._hf_config()
+        with self.assertRaisesRegex(ValueError, "not divisible"):
+            _make_ccfg(_auto_models_config(context={"device_num": 30}))
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_missing_device_num_assumes_no_replicate(self, mock_hf):
+        """
+        Feature: cluster size fallback.
+        Description: No context.device_num on an AutoModels config.
+        Expectation: d falls back to the FSDP shard degree, with a warning
+            that the replicate factor is assumed to be one.
+        """
+        mock_hf.return_value = self._hf_config()
+        with self.assertLogs(
+            "hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers."
+            "cost_model_parser_hyper", level="WARNING",
+        ) as captured:
+            ccfg = _make_ccfg(_auto_models_config())
+        self.assertEqual(ccfg.d, 4)
+        self.assertTrue(any("device_num" in m for m in captured.output))
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_vl_offsets_are_two_dimensional_when_interleaved(self, mock_hf):
+        """
+        Feature: multimodal placement under virtual pipelining.
+        Description: With pp_interleave_num > 1 the offset must be shaped
+            [vp][p], which is what is_consistent_pp_config accepts.
+        Expectation: Both submodules carry per-chunk offset rows, and the
+            vision tower still lands on the first stage of the first chunk.
+        """
+        mock_hf.return_value = self._vl_config()
+        ccfg = _make_ccfg(_auto_models_config(
+            accelerator={"pp_size": 4, "pp_interleave_num": 2},
+        ))
+        vision, text = ccfg.mm_ccfgs["vision"], ccfg.mm_ccfgs["text"]
+        self.assertEqual(ccfg.vp, 2)
+
+        self.assertEqual(len(text.offset), 2)
+        self.assertTrue(all(row == [0, 0, 0, 0] for row in text.offset))
+
+        self.assertEqual(len(vision.offset), 2)
+        per_stage = vision.n_lay // 4 // 2
+        self.assertEqual(vision.offset[0][0], vision.n_lay - per_stage)
+        self.assertEqual(vision.offset[0][1:], [-per_stage] * 3)
+        self.assertEqual(vision.offset[1], [-per_stage] * 4)
+
+    # ---- L2e: recompute-slice placement ------------------------------------
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_recompute_slice_activation_precedence(self, mock_hf):
+        """
+        Feature: recompute_slice_activation lookup.
+        Description: The flag belongs to the recompute section; fsdp_config
+            and the legacy path remain accepted.
+        Expectation: activation_checkpoint wins over both.
+        """
+        mock_hf.return_value = self._hf_config()
+        config = _auto_models_config(
+            activation_checkpoint={"mode": "full", "recompute_slice_activation": True},
+            fsdp_config={"recompute_slice_activation": False},
+        )
+        ccfg = _make_ccfg(config)
+        self.assertEqual(ccfg.shard_recompute_input, ccfg.t)
 
     # ---- L3: E2E integration ---------------------------------------------
 

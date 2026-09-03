@@ -293,6 +293,17 @@ if __name__ == "__main__":
         _run_hyper_v2_search(parser, args)
         sys.exit(0)
 
+    if args.framework == "hyper_v2" and args.devices is None:
+        # An AutoModels train.yaml carries no world size: the runtime derives
+        # the data-parallel replicate degree from it at launch. Without -d the
+        # cluster would be inferred as d*t*cp*p, which understates HSDP runs
+        # and silently invalidates every candidate in the search.
+        parser.error(
+            "-d/--devices is required for hyper_v2: the device count is not "
+            "expressible in an AutoModels train.yaml. Alternatively set "
+            "context.device_num in the config."
+        )
+
     set_verbose_level(args.verbosity)
     dims = Dim.get_dims(args.dimensions)
     YAML_FOLDER = None  # args.generate_yaml_in

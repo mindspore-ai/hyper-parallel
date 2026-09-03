@@ -532,9 +532,7 @@ class TestHpYamlReader(unittest.TestCase):
         self.assertEqual(config.search_space["pipeline_parallel_degree"], [2])
         self.assertEqual(config.estimator["recompute_strategy"], "selective")
 
-    @patch(
-        "hyper_parallel.auto_models._transformers.registry.get_hf_config"
-    )
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
     def test_read_auto_models_yaml_basic(self, mock_get_hf_config) -> None:
         """read_hp_yaml_config extracts the current Trainer schema."""
         mock_get_hf_config.return_value = SimpleNamespace(
@@ -553,9 +551,7 @@ class TestHpYamlReader(unittest.TestCase):
 
         config = read_hp_yaml_config(path)
 
-        mock_get_hf_config.assert_called_once_with(
-            "local/model", "sdpa", "bfloat16", local_files_only=True,
-        )
+        mock_get_hf_config.assert_called_once()
         self.assertEqual(config.model_spec["name"], "qwen3_moe")
         self.assertEqual(config.model_spec["num_hidden_layers"], 32)
         self.assertEqual(config.model_spec["max_position_embeddings"], 2048)
@@ -565,6 +561,97 @@ class TestHpYamlReader(unittest.TestCase):
         self.assertEqual(config.search_space["pipeline_parallel_degree"], [2])
         self.assertEqual(config.estimator["recompute_strategy"], "full")
         self.assertEqual(config.pp_config["micro_batch_num"], 8)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_spec_carries_head_dim_and_mtp(self, mock_get_hf_config) -> None:
+        """Loader resolves head_dim and the Transformers MTP spelling."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="deepseek_v3", num_hidden_layers=8, hidden_size=1024,
+            intermediate_size=4096, num_attention_heads=16,
+            num_key_value_heads=16, vocab_size=1000,
+            max_position_embeddings=4096, head_dim=64,
+            num_nextn_predict_layers=1, n_routed_experts=32,
+        )
+        path = os.path.join(self.tmpdir, "auto_models_ds.yaml")
+        _write_yaml(path, _auto_models_hp_yaml_content())
+
+        config = read_hp_yaml_config(path)
+
+        self.assertEqual(config.model_spec["head_dim"], 64)
+        self.assertEqual(config.model_spec["mtp_depth"], 1)
+        self.assertEqual(config.model_spec["num_experts"], 32)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_vl_config_uses_text_tower(self, mock_get_hf_config) -> None:
+        """A composite config resolves through its text_config."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="qwen3_vl_moe",
+            text_config=SimpleNamespace(
+                hidden_size=2048, num_hidden_layers=24, num_attention_heads=16,
+                num_key_value_heads=16, intermediate_size=5632,
+                vocab_size=151936, max_position_embeddings=128000,
+            ),
+            vision_config=SimpleNamespace(
+                hidden_size=1152, depth=27, num_heads=16,
+                intermediate_size=4304, spatial_merge_size=2,
+                num_position_embeddings=2304,
+            ),
+        )
+        path = os.path.join(self.tmpdir, "auto_models_vl.yaml")
+        _write_yaml(path, _auto_models_hp_yaml_content())
+
+        config = read_hp_yaml_config(path)
+
+        self.assertEqual(config.model_spec["name"], "qwen3_vl_moe")
+        self.assertEqual(config.model_spec["hidden_size"], 2048)
+        self.assertEqual(config.model_spec["vision"]["num_hidden_layers"], 27)
+        self.assertEqual(config.model_spec["vision"]["max_position_embeddings"], 576)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_offline_falls_back_to_overrides(self, mock_get_hf_config) -> None:
+        """An unreachable Transformers config falls back to config_overrides."""
+        mock_get_hf_config.side_effect = OSError("no network")
+        content = _auto_models_hp_yaml_content().replace(
+            "  local_files_only: true",
+            "  local_files_only: true\n"
+            "  config_overrides:\n"
+            "    hidden_size: 1024\n"
+            "    num_hidden_layers: 4",
+        )
+        path = os.path.join(self.tmpdir, "auto_models_offline.yaml")
+        _write_yaml(path, content)
+
+        config = read_hp_yaml_config(path)
+
+        self.assertEqual(config.model_spec["hidden_size"], 1024)
+        self.assertEqual(config.model_spec["num_hidden_layers"], 4)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_offline_without_overrides_raises(self, mock_get_hf_config) -> None:
+        """Without a fallback the failure names the ways to fix it."""
+        mock_get_hf_config.side_effect = OSError("no network")
+        path = os.path.join(self.tmpdir, "auto_models_hard_offline.yaml")
+        _write_yaml(path, _auto_models_hp_yaml_content())
+
+        with self.assertRaisesRegex(ValueError, "config_overrides"):
+            read_hp_yaml_config(path)
+
+    @patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config")
+    def test_auto_models_carries_device_num(self, mock_get_hf_config) -> None:
+        """context.device_num reaches model_spec for the cluster size."""
+        mock_get_hf_config.return_value = SimpleNamespace(
+            model_type="qwen3_moe", num_hidden_layers=32, hidden_size=4096,
+            intermediate_size=11008, num_attention_heads=32,
+            num_key_value_heads=8, vocab_size=128256,
+            max_position_embeddings=8192, num_experts=1,
+        )
+        content = _auto_models_hp_yaml_content() + "context:\n  device_num: 32\n"
+        path = os.path.join(self.tmpdir, "auto_models_devices.yaml")
+        _write_yaml(path, content)
+
+        config = read_hp_yaml_config(path)
+
+        self.assertEqual(config.model_spec["device_num"], 32)
 
     def test_hp_yaml_empty_accelerator_defaults(self) -> None:
         """Empty accelerator section produces default search_space (single-element lists)."""
@@ -1134,6 +1221,48 @@ class TestWriter(unittest.TestCase):
         self.assertEqual(data["accelerator"]["ep_size"], 2)
         self.assertEqual(data["training"]["global_batch_size"], 64)
         self.assertNotIn("train", data)
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_auto_models_rejects_inconsistent_batch(self) -> None:
+        """A strategy that contradicts the trainer batch derivation is refused."""
+        original_yaml_path = os.path.join(self.tmpdir, "auto_models_batch.yaml")
+        with open(original_yaml_path, "w", encoding="utf-8") as fh:
+            yaml.dump({
+                "model": {"pretrained_model_name_or_path": "local/model"},
+                "training": {"global_batch_size": 8, "micro_batch_size": 1},
+                "accelerator": {"tp_size": 1},
+                "fsdp_config": {"dp_shard_size": 1},
+            }, fh, default_flow_style=False)
+
+        config = _make_full_config()
+        # gbs 8 != mbn 4 * mbs 1 * dp 8
+        config.resolved_strategy = {"dp": 8, "dp_shard": 4, "micro_batch_num": 4}
+        out = os.path.join(self.tmpdir, "resolved_batch.yaml")
+        with self.assertRaisesRegex(ValueError, "batch derivation"):
+            write_resolved_yaml(config, original_yaml_path, out)
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_write_resolved_auto_models_omits_micro_batch_num(self) -> None:
+        """MBN is derived by the trainer, so it is intentionally not written."""
+        original_yaml_path = os.path.join(self.tmpdir, "auto_models_mbn.yaml")
+        with open(original_yaml_path, "w", encoding="utf-8") as fh:
+            yaml.dump({
+                "model": {"pretrained_model_name_or_path": "local/model"},
+                "training": {"global_batch_size": 32, "micro_batch_size": 1},
+                "accelerator": {"tp_size": 1},
+                "fsdp_config": {"dp_shard_size": 1},
+            }, fh, default_flow_style=False)
+
+        config = _make_full_config()
+        config.resolved_strategy = {"dp": 8, "dp_shard": 4, "micro_batch_num": 4}
+        out = os.path.join(self.tmpdir, "resolved_mbn.yaml")
+        write_resolved_yaml(config, original_yaml_path, out)
+
+        with open(out, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+        self.assertNotIn("micro_batch_num", data["training"])
+        self.assertEqual(data["training"]["global_batch_size"], 32)
+        self.assertEqual(data["fsdp_config"]["dp_shard_size"], 4)
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_write_resolved_yaml_raises_when_none(self) -> None:

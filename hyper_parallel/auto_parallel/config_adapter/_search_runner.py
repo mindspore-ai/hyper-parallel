@@ -36,6 +36,7 @@ CONFIG_OVERRIDE_FIELDS = [
     "moe_intermediate_size", "first_k_dense_replace", "mtp_depth",
     "multiple_of", "ffn_dim_multiplier", "kv_lora_rank", "q_lora_rank",
     "qk_rope_head_dim", "v_head_dim", "capacity_factor", "offset",
+    "head_dim", "vision",
     "param_init_type", "compute_dtype", "softmax_compute_type",
 ]
 
@@ -71,19 +72,10 @@ def _search_dim_map():
         "context_parallel_degree": dim_mod.CP,
         "expert_parallel_degree": dim_mod.EP,
         "micro_batch_num": dim_mod.MBN,
+        # OP carries the FSDP/optimizer shard degree (ccfg.os_max_shard),
+        # so mapping it here is what lets ND search that dimension.
+        "data_parallel_shard_degree": dim_mod.OP,
     }
-
-# Accelerator field names for fixed dimensions (written into the temp YAML).
-_ACCEL_FIELD_MAP: Dict[str, str] = {
-    "data_parallel_shard_degree": "dp_shard",
-    "data_parallel_replicate_degree": "dp_replicate",
-    "tensor_parallel_degree": "tp_degree",
-    "pipeline_parallel_degree": "pipeline_parallel_degree",
-    "context_parallel_degree": "context_parallel_degree",
-    "expert_parallel_degree": "expert_parallel_degree",
-    "micro_batch_num": "micro_batch_num",
-}
-
 
 def _validate_before_search(config: NormalizedConfig) -> None:
     """Check required model fields are populated (>0) before search.
@@ -198,11 +190,17 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     context: Dict[str, Any] = {}
     if device_mem_gb > 0:
         context["max_device_memory"] = f"{device_mem_gb}GB"
+    device_num = cluster.get("num_nodes", 0) * cluster.get("cards_per_node", 0)
+    if device_num > 0:
+        context["device_num"] = int(device_num)
+    visual_seq_len = model.get("visual_seq_len")
+    if visual_seq_len:
+        context["visual_seq_len"] = int(visual_seq_len)
 
     gc_dict: Dict[str, Any] = {"mode": "off" if recompute == "none" else recompute}
     recompute_slice = model.get("recompute_slice_activation")
     if recompute_slice is not None:
-        fsdp["recompute_slice_activation"] = bool(recompute_slice)
+        gc_dict["recompute_slice_activation"] = bool(recompute_slice)
 
     model_dict = _build_model_dict(model)
 
@@ -348,6 +346,7 @@ def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any
         dim_mod.CP: "cp",
         dim_mod.EP: "ep",
         dim_mod.MBN: "micro_batch_num",
+        dim_mod.OP: "dp_shard",
     }
     result: Dict[str, Any] = {
         "memory_estimate_mb": float(best_entry[1]),
@@ -359,10 +358,13 @@ def _format_result(best_entry: tuple, config: NormalizedConfig) -> Dict[str, Any
     result.setdefault("cp", 1)
     result.setdefault("ep", 1)
     total_dp = result.get("dp", 1)
-    fsdp_candidates = config.search_space.get("data_parallel_shard_degree", [1])
-    configured_fsdp = config.constraint.get("fixed_fsdp_degree")
-    dp_shard = int(configured_fsdp or fsdp_candidates[0])
-    dp_shard = max(1, min(dp_shard, total_dp))
+    if "dp_shard" not in result:
+        # OP absent from the searched dimensions: fall back to the declared
+        # degree, which is what the parser used for the whole run.
+        fsdp_candidates = config.search_space.get("data_parallel_shard_degree", [1])
+        configured_fsdp = config.constraint.get("fixed_fsdp_degree")
+        result["dp_shard"] = int(configured_fsdp or fsdp_candidates[0])
+    dp_shard = max(1, min(int(result["dp_shard"]), total_dp))
     result["dp_shard"] = dp_shard
     result["dp_replicate"] = max(1, total_dp // dp_shard)
     return result

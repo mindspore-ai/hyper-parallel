@@ -27,6 +27,10 @@ try:
 except ImportError:
     yaml = None  # pragma: no cover
 
+from hyper_parallel.auto_parallel._hf_model_spec import (
+    is_auto_models_schema,
+    resolve_hf_model_spec,
+)
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
 logger = logging.getLogger(__name__)
@@ -37,28 +41,6 @@ logger = logging.getLogger(__name__)
 _HP_TO_INTERNAL: Dict[str, str] = {
     "seq_length": "max_position_embeddings",
 }
-
-_HF_MODEL_FIELDS = (
-    "hidden_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "vocab_size",
-    "intermediate_size",
-    "num_key_value_heads",
-    "max_position_embeddings",
-    "num_experts",
-    "num_experts_per_tok",
-    "num_shared_experts",
-    "moe_intermediate_size",
-    "first_k_dense_replace",
-    "mtp_depth",
-    "multiple_of",
-    "ffn_dim_multiplier",
-    "kv_lora_rank",
-    "q_lora_rank",
-    "qk_rope_head_dim",
-)
-
 
 def _normalize_model_spec(model_spec: Dict[str, Any]) -> Dict[str, Any]:
     """Rename non-standard config overrides keys to canonical names.
@@ -104,75 +86,16 @@ def _get_dict(raw: Dict[str, Any], key: str) -> Dict[str, Any]:
     return val if isinstance(val, dict) else {}
 
 
-def _first_attr(config: Any, names: Tuple[str, ...], default: Any = None) -> Any:
-    """Return the first populated attribute from a Transformers config."""
-    for name in names:
-        value = getattr(config, name, None)
-        if value is not None:
-            return value
-    return default
+def _load_auto_models_model_spec(
+    model_raw: Dict[str, Any],
+    visual_seq_len: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Resolve model dimensions through the shared AutoModels path.
 
-
-def _load_auto_models_model_spec(model_raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve model dimensions through the AutoModels Transformers path."""
-    model_path = model_raw.get("pretrained_model_name_or_path")
-    explicit = model_raw.get("config_overrides", {})
-    explicit = dict(explicit) if isinstance(explicit, dict) else {}
-    if not model_path:
-        if explicit:
-            explicit.setdefault("name", model_raw.get("name", "custom"))
-            return _normalize_model_spec(explicit)
-        raise ValueError(
-            "AutoModels train.yaml requires model.pretrained_model_name_or_path "
-            "or model.config_overrides for Auto Parallel search"
-        )
-
-    # Transformers is optional for non-Hyper backends, so import it only when
-    # an AutoModels train.yaml needs its model metadata.
-    from hyper_parallel.auto_models._transformers.registry import get_hf_config  # pylint: disable=C0415
-
-    config_kwargs = {
-        name: model_raw[name]
-        for name in (
-            "cache_dir", "local_files_only", "revision", "subfolder",
-            "token", "trust_remote_code",
-        )
-        if model_raw.get(name) is not None
-    }
-    model_config = get_hf_config(
-        str(model_path),
-        str(model_raw.get("attn_implementation", "sdpa")),
-        model_raw.get("torch_dtype", "auto"),
-        **config_kwargs,
-    )
-    model_spec = {
-        name: getattr(model_config, name)
-        for name in _HF_MODEL_FIELDS
-        if getattr(model_config, name, None) is not None
-    }
-    model_spec["name"] = str(
-        getattr(model_config, "model_type", None) or model_path
-    )
-    model_spec["num_experts"] = int(_first_attr(
-        model_config, ("num_experts", "n_routed_experts"), 1,
-    ))
-    model_spec["num_shared_experts"] = int(_first_attr(
-        model_config, ("num_shared_experts", "n_shared_experts"), 0,
-    ))
-    moe_intermediate_size = int(model_spec.get("moe_intermediate_size", 0) or 0)
-    shared_intermediate_size = int(
-        getattr(model_config, "shared_expert_intermediate_size", 0) or 0
-    )
-    if (
-        not model_spec["num_shared_experts"]
-        and moe_intermediate_size
-        and shared_intermediate_size
-    ):
-        model_spec["num_shared_experts"] = max(
-            1, shared_intermediate_size // moe_intermediate_size,
-        )
-    model_spec.update(explicit)
-    return _normalize_model_spec(model_spec)
+    Delegates to :func:`resolve_hf_model_spec` so this reader and the
+    SAPP-ND parser cannot disagree about field names or fallbacks.
+    """
+    return _normalize_model_spec(resolve_hf_model_spec(model_raw, visual_seq_len))
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -412,10 +335,15 @@ def _build_config_from_auto_models_yaml(raw: Dict[str, Any]) -> NormalizedConfig
     dataset_raw = _get_dict(raw, "dataset")
     data_transform_raw = _get_dict(dataset_raw, "data_transform")
 
-    model_spec = _load_auto_models_model_spec(model_raw)
+    context_raw = _get_dict(raw, "context")
+    model_spec = _load_auto_models_model_spec(
+        model_raw, context_raw.get("visual_seq_len"),
+    )
     model_spec["max_position_embeddings"] = data_transform_raw.get(
         "max_seq_len", model_spec.get("max_position_embeddings", 4096),
     )
+    if context_raw.get("device_num") is not None:
+        model_spec["device_num"] = int(context_raw["device_num"])
     model_spec["local_batch_size"] = training_raw.get("micro_batch_size", 1)
     model_spec["compute_dtype"] = model_raw.get("torch_dtype", "bfloat16")
 
@@ -480,7 +408,7 @@ def _build_config_from_hp_yaml(raw: Dict[str, Any]) -> NormalizedConfig:
 
     Model hyperparameters are extracted from ``model.config_overrides``.
     """
-    if "training" in raw or "accelerator" in raw or "fsdp_config" in raw:
+    if is_auto_models_schema(raw):
         return _build_config_from_auto_models_yaml(raw)
 
     model_raw = _get_dict(raw, "model")
