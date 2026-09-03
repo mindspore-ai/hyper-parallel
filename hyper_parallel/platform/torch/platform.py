@@ -849,13 +849,37 @@ class TorchPlatform(Platform):
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
         data = _ensure_contiguous(data)
-        output = list(dist_func.all_gather(data, group=group))
         if rank_list is not None:
             group_ranks = dist.get_process_group_ranks(group)
             if tuple(rank_list) != tuple(group_ranks):
+                output = list(dist_func.all_gather(data, group=group))
                 rank_to_idx = {int(rank): idx for idx, rank in enumerate(group_ranks)}
                 output = [output[rank_to_idx[int(rank)]] for rank in rank_list]
-        return torch.cat(output, dim=concat_dim)
+                return torch.cat(output, dim=concat_dim)
+
+        input_front = _move_dim_to_front(data, concat_dim)
+        output_shape = list(input_front.shape)
+        output_shape[0] *= concat_size
+        output = torch.empty(
+            output_shape,
+            dtype=input_front.dtype,
+            device=input_front.device,
+        )
+        work = dist.all_gather_into_tensor(
+            output,
+            input_front,
+            group=group,
+            async_op=True,
+        )
+        return _TorchAsyncAllGatherFunction.apply(
+            data,
+            work,
+            output,
+            group,
+            concat_size,
+            concat_dim,
+            None,
+        )
 
     @staticmethod
     def chunk(data, split_dim, split_size, index):
