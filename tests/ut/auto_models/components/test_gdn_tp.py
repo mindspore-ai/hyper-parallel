@@ -79,8 +79,7 @@ class FakeQwen35Model(nn.Module):
         """Create a model whose architecture selects the Qwen3.5 TP plan."""
         super().__init__()
         self.config = SimpleNamespace(
-            architectures=None,
-            model_type="qwen3_5_text",
+            architectures=["Qwen3_5ForCausalLM"],
             tie_word_embeddings=False,
         )
         self.model = nn.Module()
