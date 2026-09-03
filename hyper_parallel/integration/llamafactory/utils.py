@@ -145,6 +145,7 @@ _DTYPE_MAP = {
 }
 
 _VALID_DTYPES = {"float32", "float16", "bfloat16", "fp32", "fp16", "bf16"}
+_VALID_TOKEN_DISPATCHERS = {"all_to_all", "deredundency"}
 
 HSDP_MODEL_NAME = "hsdp_model"
 HSDP_OPTIMIZER_NAME = "optimizer"
@@ -156,6 +157,9 @@ class HyperParallelArguments:
 
     tp_size: int = 1
     cp_size: int = 1
+    ep_size: int = 1
+    efsdp_size: Optional[int] = None
+    token_dispatcher: str = "all_to_all"
     device_type: str = "auto"
     param_dtype: Optional[str] = None
     reduce_dtype: Optional[str] = None
@@ -165,19 +169,55 @@ class HyperParallelArguments:
     activation_mode: str = "none"
     activation_swap_inputs: bool = True
 
-    def validate(self) -> None:
-        """Validate supported argument values."""
+    @staticmethod
+    def _validate_positive_int(name: str, value: int) -> None:
+        """Validate a required parallel size."""
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+
+    @staticmethod
+    def _validate_optional_positive_int(name: str, value: Optional[int], type_name: str) -> None:
+        """Validate an optional parallel size."""
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            raise ValueError(f"{name} must be a positive {type_name} when provided, got {value!r}.")
+
+    def _validate_parallel_sizes(self) -> None:
+        """Validate configured parallel dimensions."""
         if self.tp_size != 1:
             raise ValueError(
                 "Current trainer backend only supports replacing FSDP/fully_shard. "
                 f"Expected tp_size=1, got {self.tp_size}."
             )
-        if not isinstance(self.cp_size, int) or isinstance(self.cp_size, bool) or self.cp_size < 1:
-            raise ValueError(f"cp_size must be a positive integer, got {self.cp_size!r}.")
-        if self.cp_size > 1:
-            world_size = get_platform().get_world_size()
-            if world_size % self.cp_size != 0:
-                raise ValueError(f"world_size ({world_size}) must be divisible by cp_size ({self.cp_size}).")
+        self._validate_positive_int("cp_size", self.cp_size)
+        self._validate_positive_int("ep_size", self.ep_size)
+        self._validate_optional_positive_int("efsdp_size", self.efsdp_size, "integer")
+        self._validate_optional_positive_int("fsdp_size", self.fsdp_size, "int")
+
+    def _validate_world_size(self) -> None:
+        """Validate that parallel dimensions divide the runtime world size."""
+        if self.cp_size == 1 and self.ep_size == 1 and self.efsdp_size is None:
+            return
+        world_size = get_platform().get_world_size()
+        if self.cp_size > 1 and world_size % self.cp_size != 0:
+            raise ValueError(f"world_size ({world_size}) must be divisible by cp_size ({self.cp_size}).")
+        if self.ep_size == 1 and self.efsdp_size is None:
+            return
+        if world_size % self.ep_size != 0:
+            raise ValueError(f"world_size ({world_size}) must be divisible by ep_size ({self.ep_size}).")
+        edp_size = world_size // self.ep_size
+        if self.efsdp_size is not None and edp_size % self.efsdp_size != 0:
+            raise ValueError(
+                "world_size / ep_size must be divisible by efsdp_size, got "
+                f"({world_size} / {self.ep_size}) % {self.efsdp_size} != 0."
+            )
+
+    def _validate_runtime_options(self) -> None:
+        """Validate dispatcher, dtype, device, and activation settings."""
+        if self.token_dispatcher not in _VALID_TOKEN_DISPATCHERS:
+            raise ValueError(
+                "token_dispatcher must be one of "
+                f"{sorted(_VALID_TOKEN_DISPATCHERS)}, got {self.token_dispatcher!r}."
+            )
         if self.param_dtype is not None and self.param_dtype not in _VALID_DTYPES:
             raise ValueError(
                 f"param_dtype must be one of {sorted(_VALID_DTYPES)}, got {self.param_dtype!r}."
@@ -197,21 +237,18 @@ class HyperParallelArguments:
                 "reshard_after_forward must be a bool when provided, "
                 f"got {type(self.reshard_after_forward).__name__}."
             )
-        if self.fsdp_size is not None:
-            if (
-                not isinstance(self.fsdp_size, int)
-                or isinstance(self.fsdp_size, bool)
-                or self.fsdp_size <= 0
-            ):
-                raise ValueError(
-                    f"fsdp_size must be a positive int when provided, got {self.fsdp_size!r}."
-                )
         valid_activation_modes = {"none", "recompute", "swap"}
         if self.activation_mode not in valid_activation_modes:
             raise ValueError(
                 f"activation_mode must be one of {sorted(valid_activation_modes)}, "
                 f"got {self.activation_mode!r}."
             )
+
+    def validate(self) -> None:
+        """Validate supported argument values."""
+        self._validate_parallel_sizes()
+        self._validate_world_size()
+        self._validate_runtime_options()
 
     @classmethod
     def from_dict(cls, config: dict) -> "HyperParallelArguments":
@@ -430,6 +467,116 @@ def _move_model_to_meta(model: nn.Module) -> nn.Module:
     model = model.to(torch.device("meta"))
     if hasattr(model, "tie_weights"):
         model.tie_weights()
+    return model
+
+
+def _move_unwrapped_model_state_to_meta(model: nn.Module) -> nn.Module:
+    """Move all model state to meta without invalidating nested HSDP state.
+
+    EP fully-shards its expert containers before this common FSDP2 path. A
+    recursive ``model.to(meta)`` would replace the expert DTensor parameters
+    only in the module tree, leaving the inner HSDP objects pointing at their
+    old materialized parameters. Convert those managed parameters explicitly
+    so their distributed metadata and both reference graphs stay consistent.
+    """
+    # Reuse one replacement for every module slot that shares the same Parameter.
+    converted_parameters: dict[nn.Parameter, nn.Parameter] = {}
+    # Reuse one replacement for shared buffers as well as shared parameters.
+    converted_buffers: dict[torch.Tensor, torch.Tensor] = {}
+    # Construct the device object once because every state tensor has the same target.
+    meta_device = torch.device("meta")
+
+    def _convert_parameter(parameter: nn.Parameter) -> nn.Parameter:
+        """Create or return one metadata-preserving meta Parameter."""
+        # Inner-HSDP parameters converted in the first pass must keep exact object identity.
+        if parameter.is_meta:
+            # Returning the installed object also avoids wrapping pre-existing meta parameters twice.
+            return parameter
+        # A tied/shared parameter must keep object identity across all owning modules.
+        converted = converted_parameters.get(parameter)
+        # Only the first occurrence allocates its corresponding meta object.
+        if converted is None:
+            # DTensor.to(meta) preserves its mesh, placements, global shape/stride, and dtype.
+            converted_value = parameter.to(meta_device)
+            # Re-wrap the converted tensor while retaining the trainability contract.
+            converted = nn.Parameter(converted_value, requires_grad=parameter.requires_grad)
+            # Inner-HSDP ownership is an out-of-band attribute not copied by Parameter().
+            if getattr(parameter, "_hsdp_param_initialized", False):
+                # Preserve it so the later parent/root fully_shard skips this expert parameter.
+                converted._hsdp_param_initialized = True  # pylint: disable=protected-access
+            # Cache the replacement before another shared module slot is visited.
+            converted_parameters[parameter] = converted
+        # Return the unique meta Parameter for this source object.
+        return converted
+
+    # One HSDP scheduler may be exposed by several module roots, so process it once.
+    visited_hsdp_schedulers: set[int] = set()
+    # Walk the current tree before replacing ordinary parameters.
+    for module in model.modules():
+        # Plain modules have no additional parameter references to synchronize.
+        if not isinstance(module, HSDPModule):
+            continue
+        # Read the scheduler installed by fully_shard on the expert container.
+        scheduler = getattr(module, "hsdp_scheduler", None)
+        # A partially constructed mixin has no state to update.
+        if scheduler is None or id(scheduler) in visited_hsdp_schedulers:
+            continue
+        # Mark the shared scheduler before visiting its managed parameter list.
+        visited_hsdp_schedulers.add(id(scheduler))
+        # The state owns the HSDPParam objects used by forward/backward communication.
+        hsdp_state = getattr(scheduler, "hsdp_state", None)
+        # Treat a scheduler without an initialized state as having no managed parameters.
+        if hsdp_state is None:
+            continue
+        # Synchronize every HSDP-managed expert parameter with its meta replacement.
+        for hsdp_param in hsdp_state.hsdp_params:
+            # This is the materialized sharded DTensor currently installed on the module.
+            sharded_parameter = hsdp_param.sharded_param
+            # Preserve the DTensor metadata while replacing only its local storage by meta.
+            meta_parameter = _convert_parameter(sharded_parameter)
+            # Save hooks from the old object before switching HSDP's canonical reference.
+            hsdp_param._parameter_hook_migrator._save_backward_hooks(  # pylint: disable=protected-access
+                sharded_parameter
+            )
+            # Point HSDP at the same meta Parameter that will be visible in the module tree.
+            hsdp_param.sharded_param = meta_parameter
+            # Drop HSDP's second strong reference to the old materialized communication storage.
+            hsdp_param._sharded_param_data = (  # pylint: disable=protected-access
+                meta_parameter.to_local().reshape(-1)
+                if isinstance(meta_parameter, DTensor)
+                else meta_parameter.reshape(-1)
+            )
+            # Update the owner and every shared owner recorded by HSDP in one operation.
+            hsdp_param._setattr_on_modules(meta_parameter)  # pylint: disable=protected-access
+
+    # Convert parameters and buffers not managed by an already-created inner HSDP unit.
+    for module in model.modules():
+        # Only inspect direct parameter slots; recursive traversal would convert children twice.
+        for name, parameter in module._parameters.items():  # pylint: disable=protected-access
+            # None is a valid registered placeholder and needs no conversion.
+            if parameter is None:
+                continue
+            # Expert parameters already resolve from the cache; ordinary parameters convert here.
+            module._parameters[name] = _convert_parameter(parameter)  # pylint: disable=protected-access
+        # Buffers are not represented by HSDPParam, so all modules follow this common path.
+        for name, buffer in module._buffers.items():  # pylint: disable=protected-access
+            # None is a valid registered placeholder and needs no conversion.
+            if buffer is None:
+                continue
+            # Preserve shared-buffer identity instead of allocating one meta tensor per slot.
+            converted_buffer = converted_buffers.get(buffer)
+            # Convert the first occurrence and cache it for any aliases.
+            if converted_buffer is None:
+                converted_buffer = buffer.to(meta_device)
+                converted_buffers[buffer] = converted_buffer
+            # Install the meta buffer into this direct module slot.
+            module._buffers[name] = converted_buffer  # pylint: disable=protected-access
+
+    # Re-establish architecture-declared ties such as input embeddings and LM head.
+    if hasattr(model, "tie_weights"):
+        # Hugging Face models use this hook as the authoritative tying operation.
+        model.tie_weights()
+    # Keep the public preparation flow operating on the original model object.
     return model
 
 
@@ -1033,7 +1180,8 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
     fsdp2_plugin.set_auto_wrap_policy(model)
 
     model_has_params4bit = _model_has_4bit_params(model)
-    original_sd = model.state_dict()
+    pre_ep_state_dict = getattr(model, "_hyper_parallel_pre_ep_state_dict", None)
+    original_sd = pre_ep_state_dict if pre_ep_state_dict is not None else model.state_dict()
     should_restore_non_persistent_buffers = (
         fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit
     )
@@ -1041,7 +1189,10 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
         model, should_restore_non_persistent_buffers
     )
     if should_restore_non_persistent_buffers:
-        model = _move_model_to_meta(model)
+        if pre_ep_state_dict is None:
+            model = _move_model_to_meta(model)
+        else:
+            model = _move_unwrapped_model_state_to_meta(model)
 
     fsdp2_kwargs = _build_fsdp2_kwargs(accelerator, model, hp_args, fsdp2_plugin)
 
@@ -1065,6 +1216,8 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
 
     if fsdp2_plugin.cpu_ram_efficient_loading:
         model = fsdp2_load_full_state_dict(accelerator, model, original_sd)
+    if pre_ep_state_dict is not None:
+        delattr(model, "_hyper_parallel_pre_ep_state_dict")
 
     # Activation wrapping after loading: the loading path is identical to
     # the non-activation case, avoiding interaction between CheckpointWrapper's
