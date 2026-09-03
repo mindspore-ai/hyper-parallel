@@ -311,7 +311,7 @@ class ShardingPlanner:
             )
             if spec is None:
                 continue
-            if boundary_type == "embed" and arch == "qwen3_5" and "tp" in mesh_dim_names:
+            if boundary_type == "embed" and arch in {"qwen3_5", "qwen3_5_text"} and "tp" in mesh_dim_names:
                 self._configure_qwen3_5_embedding_tp_spec(spec)
             if boundary_type == "moe_mlp":
                 self._mark_hf_native_moe(
