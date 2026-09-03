@@ -175,17 +175,17 @@ def _validate_cross_entropy_params(
     """
     _validate_target_type_base(is_floating_fn(target))
 
-    # if _is_dtensor(input_tensor):
-    #     if not _is_shard_on_last_dim(input_tensor):
-    #         raise ValueError(
-    #             "input must be Shard(-1) on class dimension. "
-    #             f"Got placements: {input_tensor.placements}"
-    #         )
-    # else:
-    #     raise ValueError(
-    #         "input must be a DTensor when using loss_parallel. "
-    #         f"Got type: {type(input)}"
-    #     )
+    if _is_dtensor(input_tensor):
+        if not _is_shard_on_last_dim(input_tensor):
+            raise ValueError(
+                "input must be Shard(-1) on class dimension. "
+                f"Got placements: {input_tensor.placements}"
+            )
+    else:
+        raise ValueError(
+            "input must be a DTensor when using loss_parallel. "
+            f"Got type: {type(input)}"
+        )
 
     if weight is not None and _is_dtensor(weight):
         if not _is_replicate(weight):
