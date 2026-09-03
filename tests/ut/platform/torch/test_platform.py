@@ -251,7 +251,7 @@ class TestTorchPlatformCore(unittest.TestCase):
         with self.assertRaises(ValueError):
             TorchPlatform.split_group(split_ranks=None)
 
-    @mock.patch('torch.distributed.all_gather_into_tensor')
+    @mock.patch('torch.distributed.nn.functional.all_gather')
     def test_differentiable_all_gather_concat(self, mock_all_gather):
         """Test differentiable all_gather and concatenation logic.
 
@@ -262,23 +262,11 @@ class TestTorchPlatformCore(unittest.TestCase):
             mock_all_gather: Mock for torch.distributed.nn.functional.all_gather.
         """
         tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-        class FakeWork:
-            """Synchronous test handle matching the distributed work API."""
-
-            @staticmethod
-            def wait():
-                """Complete immediately because the mock copies eagerly."""
-
-        gathered = torch.tensor([
-            [1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0],
-        ])
-
-        def fake_all_gather(output, _input, **_kwargs):
-            """Populate the preallocated collective output."""
-            output.copy_(gathered)
-            return FakeWork()
-
-        mock_all_gather.side_effect = fake_all_gather
+        mock_output = [
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+        ]
+        mock_all_gather.return_value = mock_output
 
         result = TorchPlatform.differentiable_all_gather_concat(
             tensor, group=None, concat_size=2, concat_dim=0

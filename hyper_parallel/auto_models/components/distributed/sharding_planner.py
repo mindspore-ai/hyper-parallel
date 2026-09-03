@@ -377,12 +377,7 @@ class ShardingPlanner:
         activation_sharded = _multi_dim(
             tp=Shard(-1), cp=cp_placement, ep=Replicate(),
         )
-        parameter_sharded = _multi_dim(
-            tp=Shard(0), cp=Replicate(), ep=Replicate(),
-        )
-
         for linear_name in linear_names:
-            linear = getattr(module, linear_name)
             param_prefix = linear_name + "."
             linear_params = {
                 param_name[len(param_prefix):]: placement
@@ -391,8 +386,6 @@ class ShardingPlanner:
             }
             for param_name in linear_params:
                 spec.params.pop(param_prefix + param_name)
-            for param_name, _ in linear.named_parameters(recurse=False):
-                linear_params[param_name] = copy.deepcopy(parameter_sharded)
             nested_specs[f"{boundary_fqn}.{linear_name}"] = ModuleShardingSpec(
                 params=linear_params,
                 in_src={"input": copy.deepcopy(activation_replicated)},
