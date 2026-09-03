@@ -18,6 +18,10 @@ train:
 parallel:
   # Optimization options
   enable_overlap: true
+  # Pipeline parallelism (graph-pass stage split)
+  # pp_enabled: false       # opt-in; PpPass slices the joint graph per stage
+  # pp_degree: null         # null -> world_size (one stage per rank)
+  # pp_microbatch_size: 1   # samples per microbatch for the GPipe schedule
 
 # ============================================================================
 # Sharding Configuration

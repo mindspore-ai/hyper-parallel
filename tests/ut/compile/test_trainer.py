@@ -104,7 +104,7 @@ class TestGraphTrainerCompile(unittest.TestCase):
             pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
-        before = model.weight.detach().clone()
+        before = model.weight.detach().clone()  # pylint: disable=not-callable
 
         tr.compile(torch.randn(2, 4), torch.randn(2, 4))
         tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
