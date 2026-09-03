@@ -322,50 +322,95 @@ class ShardingPlanner:
                     spec.inner_target = "self"
                     spec.inner_wrapper = "gdn_ulysses"
                     spec.region_dispatch = False
+            nested_specs = {}
             if boundary_type == "linear_attention" and "tp" in mesh_dim_names:
-                self._configure_gdn_tp_spec(
+                nested_specs = self._configure_gdn_tp_spec(
                     spec,
                     model.get_submodule(boundary_fqn),
                     boundary_fqn,
+                    mesh_dim_names,
                 )
             plan.modules[boundary_fqn] = spec
+            plan.modules.update(nested_specs)
 
     @staticmethod
     def _configure_gdn_tp_spec(
         spec: ModuleShardingSpec,
         module: nn.Module,
         boundary_fqn: str,
-    ) -> None:
-        """Finalize packed GDN placements from the concrete module shapes."""
+        mesh_dim_names: Tuple[str, ...],
+    ) -> Dict[str, ModuleShardingSpec]:
+        """Apply the Transformers Gated DeltaNet tensor-parallel plan.
+
+        Transformers uses ``colwise_gather_output`` for all five GDN Linear
+        modules. Each weight is sharded on its output dimension and each
+        Linear output is gathered immediately, so the convolution, recurrent
+        rule, normalization, and cached dimensions remain fully replicated.
+        """
         if "GatedDeltaNet" not in type(module).__name__:
-            return
-        required = ("in_proj_qkv", "in_proj_z", "conv1d")
+            return {}
+        linear_names = (
+            "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+        )
+        required = (*linear_names, "conv1d")
         missing = [name for name in required if not hasattr(module, name)]
         if missing:
             raise ValueError(
                 f"{boundary_fqn}: GatedDeltaNet TP requires modules {required}, "
                 f"missing {missing}"
             )
-        qkv_size = module.in_proj_qkv.weight.shape[0]
-        value_size = module.in_proj_z.weight.shape[0]
-        remainder = qkv_size - value_size
-        if remainder <= 0 or remainder % 2:
-            raise ValueError(
-                f"{boundary_fqn}: cannot derive [Q|K|V] sections from "
-                f"in_proj_qkv={qkv_size}, in_proj_z={value_size}"
-            )
-        key_size = remainder // 2
-        packed = _multi_dim(
-            tp=PackedShard(0, (key_size, key_size, value_size)),
-            cp=Replicate(),
-            ep=Replicate(),
-        )
-        for param_name in ("in_proj_qkv.weight", "conv1d.weight", "conv1d.bias"):
-            if param_name in spec.params:
-                spec.params[param_name] = packed
-        spec.tp_divide_attrs = [
-            "num_v_heads", "num_k_heads", "key_dim", "value_dim", "conv_dim",
+        invalid = [
+            name for name in linear_names
+            if not isinstance(getattr(module, name), nn.Linear)
         ]
+        if invalid:
+            raise TypeError(
+                f"{boundary_fqn}: Transformers GatedDeltaNet TP expects nn.Linear "
+                f"for {invalid}"
+            )
+
+        nested_specs: Dict[str, ModuleShardingSpec] = {}
+        cp_placement = Shard(1) if "cp" in mesh_dim_names else Replicate()
+        activation_replicated = _multi_dim(
+            tp=Replicate(), cp=cp_placement, ep=Replicate(),
+        )
+        activation_sharded = _multi_dim(
+            tp=Shard(-1), cp=cp_placement, ep=Replicate(),
+        )
+        parameter_sharded = _multi_dim(
+            tp=Shard(0), cp=Replicate(), ep=Replicate(),
+        )
+
+        for linear_name in linear_names:
+            linear = getattr(module, linear_name)
+            param_prefix = linear_name + "."
+            linear_params = {
+                param_name[len(param_prefix):]: placement
+                for param_name, placement in list(spec.params.items())
+                if param_name.startswith(param_prefix)
+            }
+            for param_name in linear_params:
+                spec.params.pop(param_prefix + param_name)
+            for param_name, _ in linear.named_parameters(recurse=False):
+                linear_params[param_name] = copy.deepcopy(parameter_sharded)
+            nested_specs[f"{boundary_fqn}.{linear_name}"] = ModuleShardingSpec(
+                params=linear_params,
+                in_src={"input": copy.deepcopy(activation_replicated)},
+                in_dst={"input": copy.deepcopy(activation_replicated)},
+                out_src={"output": copy.deepcopy(activation_sharded)},
+                out_dst={"output": copy.deepcopy(activation_replicated)},
+            )
+
+        # The GDN core consumes and produces full hidden/head dimensions.
+        # The outer boundary still owns optional sequence-parallel entry/exit.
+        for placement in spec.params.values():
+            placement[TP] = Replicate()
+        for placement in spec.in_dst.values():
+            placement[TP] = Replicate()
+        for placement in spec.out_src.values():
+            placement[TP] = Replicate()
+        spec.tp_divide_attrs = []
+        return nested_specs
 
     def _finalize_boundary_specs(
         self,
@@ -933,13 +978,6 @@ class ShardingPlanner:
         if role == ParamRole.ROWWISE:
             return _multi_dim(tp=template.rowwise_placement if has_tp else None,
                               cp=Replicate(), ep=Replicate())
-        if role == ParamRole.GDN_PACKED_QKV:
-            # Concrete section sizes are installed after resolving the GDN
-            # boundary module in _configure_gdn_tp_spec.
-            return _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())
-        if role == ParamRole.GDN_HEAD:
-            return _multi_dim(tp=Shard(0) if has_tp else None,
-                              cp=Replicate(), ep=Replicate())
         if role in (ParamRole.NORM, ParamRole.MOE_GATE):
             return _multi_dim(tp=template.norm_placement if has_tp else None,
                               cp=Replicate(), ep=Replicate())
@@ -963,8 +1001,8 @@ class ShardingPlanner:
             # weight role before reaching this fallback.
             return _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())
         if role == ParamRole.REPLICATED:
-            # MLA down-projections etc. (explicitly assigned via
-            # ARCH_OVERRIDES): replicate on all dims.
+            # MLA down-projections and GDN core parameters replicate on all
+            # dimensions.
             # The output latent is identical within the TP group, so the
             # input contract of the downstream q_b/kv_b (COLWISE), sharded
             # along the head dim, matches standard attention.

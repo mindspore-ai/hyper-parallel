@@ -32,12 +32,13 @@ from hyper_parallel.auto_models.components.distributed.param_role import (
     ParamRole,
 )
 from hyper_parallel.auto_models.components.distributed.sharding_config import (
+    CP,
     TP,
     ModuleShardingSpec,
     PackedShard,
 )
 from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
-from hyper_parallel.core.dtensor.placement_types import StridedShard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 
 
 class FakeGatedDeltaNet(nn.Module):
@@ -92,8 +93,8 @@ def test_packed_shard_rejects_non_divisible_section():
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_checkpoint_loader_builds_expected_gdn_packed_shard(monkeypatch, rank):
-    """FSDP and TP loading gives every rank its local Q, K, and V slices."""
+def test_checkpoint_loader_builds_expected_packed_shard(monkeypatch, rank):
+    """FSDP and TP loading preserves logical sections in a packed weight."""
     fsdp_size = 2
     tp_size = 2
     placement = PackedShard(0, (4, 4, 8))
@@ -136,7 +137,7 @@ def test_checkpoint_loader_builds_expected_gdn_packed_shard(monkeypatch, rank):
     monkeypatch.setattr(checkpoint_loader, "distribute_tensor", fake_distribute_tensor)
 
     local_weight = checkpoint_loader._shard_for_target(  # pylint: disable=protected-access
-        "model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.layers.0.mlp.experts.gate_up_proj",
         full_weight,
         target,
     )
@@ -154,33 +155,49 @@ def test_gdn_parameter_classifier_covers_tp_parameters():
     """All GDN trainable parameters receive an explicit semantic role."""
     roles = ParameterClassifier().classify(FakeModel())
 
-    assert roles["linear_attn.in_proj_qkv.weight"] == ParamRole.GDN_PACKED_QKV
-    assert roles["linear_attn.conv1d.weight"] == ParamRole.GDN_PACKED_QKV
-    assert roles["linear_attn.in_proj_z.weight"] == ParamRole.COLWISE
-    assert roles["linear_attn.in_proj_b.weight"] == ParamRole.COLWISE
-    assert roles["linear_attn.in_proj_a.weight"] == ParamRole.COLWISE
-    assert roles["linear_attn.out_proj.weight"] == ParamRole.ROWWISE
-    assert roles["linear_attn.A_log"] == ParamRole.GDN_HEAD
-    assert roles["linear_attn.dt_bias"] == ParamRole.GDN_HEAD
+    for name in (
+        "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+    ):
+        assert roles[f"linear_attn.{name}.weight"] == ParamRole.COLWISE
+    for name in ("conv1d.weight", "A_log", "dt_bias"):
+        assert roles[f"linear_attn.{name}"] == ParamRole.REPLICATED
 
 
-def test_gdn_tp_spec_uses_same_packed_sections_for_projection_and_conv():
-    """Planner binds Q/K/V sections and TP-local cached dimensions together."""
+def test_gdn_tp_spec_matches_transformers_colwise_gather_output_plan():
+    """Each Transformers GDN Linear shards columns and gathers its output."""
     module = FakeGatedDeltaNet()
-    spec = ModuleShardingSpec(params={
-        "in_proj_qkv.weight": {TP: PackedShard(0, (8, 8))},
-        "conv1d.weight": {TP: PackedShard(0, (8, 8))},
-    })
+    spec = ModuleShardingSpec(
+        params={
+            name: {TP: Shard(0), CP: Replicate()}
+            for name, _ in module.named_parameters()
+        },
+        in_src={"hidden_states": {TP: Replicate(), CP: Shard(1)}},
+        in_dst={"hidden_states": {TP: Replicate(), CP: Shard(1)}},
+        out_src={"output": {TP: Shard(1), CP: Shard(1)}},
+        out_dst={"output": {TP: Replicate(), CP: Shard(1)}},
+    )
 
-    ShardingPlanner._configure_gdn_tp_spec(  # pylint: disable=protected-access
+    nested_specs = ShardingPlanner._configure_gdn_tp_spec(  # pylint: disable=protected-access
         spec,
         module,
         "model.layers.0.linear_attn",
+        ("tp", "cp"),
     )
 
-    expected = PackedShard(0, (4, 4, 8))
-    assert spec.params["in_proj_qkv.weight"][TP] == expected
-    assert spec.params["conv1d.weight"][TP] == expected
-    assert spec.tp_divide_attrs == [
-        "num_v_heads", "num_k_heads", "key_dim", "value_dim", "conv_dim",
-    ]
+    linear_names = (
+        "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+    )
+    assert set(nested_specs) == {
+        f"model.layers.0.linear_attn.{name}" for name in linear_names
+    }
+    for name in linear_names:
+        linear_spec = nested_specs[f"model.layers.0.linear_attn.{name}"]
+        assert linear_spec.params["weight"][TP] == Shard(0)
+        assert linear_spec.in_src["input"][TP] == Replicate()
+        assert linear_spec.in_src["input"][CP] == Shard(1)
+        assert linear_spec.out_src["output"][TP] == Shard(-1)
+        assert linear_spec.out_dst["output"][TP] == Replicate()
+    assert set(spec.params) == {"conv1d.weight", "A_log", "dt_bias", "norm.weight", "norm.bias"}
+    assert all(placement[TP] == Replicate() for placement in spec.params.values())
+    assert spec.out_src["output"][TP] == Replicate()
+    assert spec.tp_divide_attrs == []

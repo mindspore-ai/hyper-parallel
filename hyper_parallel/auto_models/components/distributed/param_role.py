@@ -42,13 +42,9 @@ class ParamRole(Enum):
     SHARED_EXPERT = auto()  # MoE shared expert → EP Replicate + TP colwise/rowwise
     FUSED_QKV = auto()      # fused QKV → Shard(0) (a later SpecialHandler may adjust)
     FUSED_GATE_UP = auto()  # fused gate/up → Shard(0)
-    GDN_PACKED_QKV = auto() # GDN [Q | K | V] projection/conv → PackedShard(0)
-    GDN_HEAD = auto()       # GDN per-value-head parameter → Shard(0)
     BIAS = auto()           # unmatched bias → Replicate; Linear bias follows its weight role
-    REPLICATED = auto()     # linear-layer weights forced to be replicated
-                            # (e.g. MLA q_a/kv_a down projections)
-                            # → Replicate on all dims; assigned only explicitly via
-                            # ARCH_OVERRIDES, never produced by the default naming rules
+    REPLICATED = auto()     # Parameters forced to be replicated, including
+                            # MLA down projections and the GDN core state.
     SPECIAL = auto()        # special parameters (gated_delta etc.) → Phase 6 SpecialHandler
     SKIP = auto()           # frozen / not sharded → excluded from spec.params
 
@@ -119,10 +115,9 @@ def _build_default_rules() -> List[Tuple[List[str], ParamRole, str]]:
         (["shared_expert", "shared_experts"], ParamRole.SHARED_EXPERT, SEGMENT_EXACT),
         (["experts"], ParamRole.MOE_EXPERT, SEGMENT_SUBSTRING),
         ([".mlp.gate.", ".router.", "moe_gate", "mlp.router"], ParamRole.MOE_GATE, SEGMENT_SUBSTRING),
-        (["in_proj_qkv", "linear_attn.conv1d"], ParamRole.GDN_PACKED_QKV, SEGMENT_SUBSTRING),
-        (["in_proj_z", "in_proj_b", "in_proj_a"], ParamRole.COLWISE, SEGMENT_SUBSTRING),
-        (["linear_attn.out_proj"], ParamRole.ROWWISE, SEGMENT_SUBSTRING),
-        (["a_log", "dt_bias"], ParamRole.GDN_HEAD, SEGMENT_SUBSTRING),
+        (["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "linear_attn.out_proj"],
+         ParamRole.COLWISE, SEGMENT_SUBSTRING),
+        (["linear_attn.conv1d", "a_log", "dt_bias"], ParamRole.REPLICATED, SEGMENT_SUBSTRING),
         (["fused_qkv", "qkv_proj", "query_key_value"], ParamRole.FUSED_QKV, SEGMENT_SUBSTRING),
         (["gate_up_proj", "fused_gate_up", ".w13."], ParamRole.FUSED_GATE_UP, SEGMENT_SUBSTRING),
         (["gated_delta"], ParamRole.SPECIAL, SEGMENT_SUBSTRING),
