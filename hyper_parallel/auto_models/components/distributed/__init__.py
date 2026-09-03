@@ -85,6 +85,10 @@ from hyper_parallel.auto_models.components.distributed.mtp_template import (
     build_mtp_specs,
     matches_mtp_template,
 )
+from hyper_parallel.auto_models.components.distributed.shared_expert_template import (
+    build_shared_expert_specs,
+    matches_shared_expert_template,
+)
 from hyper_parallel.auto_models.components.distributed.pipelining import (
     AutoPipeline,
     _instantiate_pipeline,
@@ -147,6 +151,7 @@ __all__ = [
     "build_dsa_specs",
     "build_mhc_specs",
     "build_mtp_specs",
+    "build_shared_expert_specs",
     "check_dispatchable",
     "deepseekv3_ep_compute_fn",
     "mixtral_ep_compute_fn",
@@ -164,6 +169,7 @@ __all__ = [
     "matches_dsa_template",
     "matches_mhc_template",
     "matches_mtp_template",
+    "matches_shared_expert_template",
     "qwen2moe_ep_compute_fn",
     "qwen3moe_ep_compute_fn",
     "qwen3_moe_async_colossal_cp_wrapper",

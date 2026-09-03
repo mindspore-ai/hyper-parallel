@@ -82,6 +82,10 @@ from hyper_parallel.auto_models.components.distributed.mtp_template import (
     build_mtp_specs,
     matches_mtp_template,
 )
+from hyper_parallel.auto_models.components.distributed.shared_expert_template import (
+    build_shared_expert_specs,
+    matches_shared_expert_template,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +93,7 @@ _STRUCTURAL_TEMPLATE_PROVIDERS = (
     ("dsa", matches_dsa_template, build_dsa_specs),
     ("mhc", matches_mhc_template, build_mhc_specs),
     ("mtp", matches_mtp_template, build_mtp_specs),
+    ("shared_expert", matches_shared_expert_template, build_shared_expert_specs),
 )
 
 # {arch_name: [(pattern | [patterns], ParamRole)]} — arch-level naming
