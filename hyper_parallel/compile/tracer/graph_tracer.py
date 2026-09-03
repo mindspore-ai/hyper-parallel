@@ -49,6 +49,7 @@ import copy
 import inspect
 import warnings
 from collections.abc import Callable, Generator
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -71,7 +72,7 @@ except (ValueError, TypeError):
     _MAKE_FX_PARAMS = {}
 _MAKE_FX_KWARGS: Dict[str, Any] = {
     kw: val
-    for kw, val in (("record_stack_traces", True), ("record_module_stack", False))
+    for kw, val in (("record_stack_traces", True), ("record_module_stack", True))
     if kw in _MAKE_FX_PARAMS
 }
 
@@ -189,6 +190,126 @@ def _reparametrize_train_state(
         yield
 
 
+def _iter_node_args(node: torch.fx.Node):
+    """Yield every ``fx.Node`` among ``node.args`` (unwrapping nested lists)."""
+    for a in node.args:
+        if isinstance(a, torch.fx.Node):
+            yield a
+        elif isinstance(a, (tuple, list)):
+            for x in a:
+                if isinstance(x, torch.fx.Node):
+                    yield x
+
+
+def _output_args(fx_g: torch.fx.GraphModule) -> List[torch.fx.Node]:
+    """Return the flattened forward arg list of the graph's ``output`` node."""
+    out_node = next((n for n in fx_g.graph.nodes if n.op == "output"), None)
+    if out_node is None:
+        return []
+    args: List[torch.fx.Node] = []
+    for a in out_node.args:
+        if isinstance(a, torch.fx.Node):
+            args.append(a)
+        elif isinstance(a, (tuple, list)):
+            for x in a:
+                if isinstance(x, torch.fx.Node):
+                    args.append(x)
+    return args
+
+
+def _ancestors_of(node: torch.fx.Node) -> set:
+    """Return the transitive producers of ``node`` (excluding ``node``)."""
+    ancestors = set()
+    dq = deque([node])
+    while dq:
+        cur = dq.popleft()
+        for a in _iter_node_args(cur):
+            if a.op == "placeholder" or a in ancestors:
+                continue
+            ancestors.add(a)
+            dq.append(a)
+    return ancestors
+
+
+def _has_module_stack(node: torch.fx.Node) -> bool:
+    """True if the node carries any ``nn_module_stack`` entry.
+
+    make_fx leaves stack-less nodes (e.g. autograd engine output) with an
+    *empty* ``OrderedDict`` rather than ``None``, so a truthiness check is
+    the robust test.
+    """
+    return bool(node.meta.get("nn_module_stack"))
+
+
+def _annotate_autograd_backward(fx_g: torch.fx.GraphModule) -> None:
+    """Tag backward nodes with ``meta['autograd_backward'] = True``.
+
+    Stock torch's make_fx (without the torchtitan ``_patch_engine_backward``
+    hook) never attaches the autograd engine's ``autograd_backward`` tag, so
+    passes that split the joint graph into fwd/bwd halves get nothing to key
+    on. This reconstructs the tag structurally.
+
+    The joint graph's ``output`` returns ``[loss, grad_0, ... grad_n]``. The
+    loss and the nodes feeding it (logits, loss reduction, ``getitem`` of the
+    loss value) are forward even though they live outside any module and so
+    carry no ``nn_module_stack``. Every other output is a parameter gradient
+    produced by ``torch.autograd.grad``.
+
+    Two pre-computed sets separate the halves:
+
+    - ``fwd_loss_nodes``: the transitive producers of ``loss`` — the logits,
+      the shift/reshape that makes the loss target, and the loss reduction
+      itself. These are forward (they are the loss *source*); backward is
+      computed *from* them.
+    - ``bwd_nodes``: ``call_function`` nodes reachable from the parameter
+      gradients (``output[1:]``) that carry no ``nn_module_stack`` and are
+      not in ``fwd_loss_nodes``. The module stack is only recorded while a
+      traced module ``forward`` runs, so autograd-engine nodes have none.
+      Walking backward and stopping at forward boundaries (stack-bearing
+      nodes or the loss source) spans exactly the backward half.
+    """
+    output = _output_args(fx_g)
+    if not output:
+        return
+    loss_node = output[0]
+    grad_seeds = output[1:]
+
+    # Forward loss chain: everything that flows INTO the loss. Backward is
+    # computed from the loss, so these are forward regardless of whether any
+    # module recorded them (they may sit in ``train_fn``, outside modules).
+    fwd_loss_nodes = _ancestors_of(loss_node)
+    fwd_loss_nodes.add(loss_node)
+
+    # BFS backward over dataflow from the gradient outputs, marking every
+    # stack-less, non-loss-source node as backward. Stack-bearing nodes are
+    # forward (module boundaries); loss-source nodes are forward (the loss is
+    # the backward's *source*, not part of it).
+    bwd_nodes = set()
+    dq = deque()
+    for seed in grad_seeds:
+        if (
+            not _has_module_stack(seed)
+            and seed.op != "placeholder"
+            and seed not in fwd_loss_nodes
+        ):
+            bwd_nodes.add(seed)
+            dq.append(seed)
+    while dq:
+        n = dq.popleft()
+        for a in _iter_node_args(n):
+            if a.op == "placeholder" or a in bwd_nodes:
+                continue
+            if a in fwd_loss_nodes:
+                continue  # forward loss source; do not expand
+            if _has_module_stack(a):
+                continue  # forward module boundary; do not expand
+            bwd_nodes.add(a)
+            dq.append(a)
+
+    for node in bwd_nodes:
+        node.meta["autograd_backward"] = True
+
+
 def _copy_fwd_metadata_to_bw_nodes(fx_g: torch.fx.GraphModule) -> None:
     """Copy forward metadata to backward nodes across all nested FX subgraphs.
 
@@ -198,12 +319,23 @@ def _copy_fwd_metadata_to_bw_nodes(fx_g: torch.fx.GraphModule) -> None:
     node to each backward node. Backward nodes are identified by the autograd
     engine's ``autograd_backward`` tag on ``node.meta``.
     """
-
-    def _is_backward(node: torch.fx.Node) -> bool:
-        return node.meta.get("autograd_backward", False)
-
     seq_nr_to_fwd_node: Dict[int, torch.fx.Node] = {}
+    for node in _iter_seq_nr_nodes(fx_g, backward=False):
+        seq_nr_to_fwd_node.setdefault(node.meta["seq_nr"], node)
 
+    for node in _iter_seq_nr_nodes(fx_g, backward=True):
+        fwd_node = seq_nr_to_fwd_node.get(node.meta["seq_nr"])
+        if fwd_node is None or fwd_node is node:
+            continue
+        _copy_fwd_meta(fwd_node, node)
+
+
+def _iter_seq_nr_nodes(fx_g: torch.fx.GraphModule, backward: bool):
+    """Yield ``seq_nr``-bearing call/get_attr nodes across all subgraphs.
+
+    ``backward=False`` yields forward nodes, ``backward=True`` backward ones
+    (tagged by the autograd engine's ``autograd_backward`` meta).
+    """
     for submod in fx_g.modules():
         if not isinstance(submod, torch.fx.GraphModule):
             continue
@@ -211,36 +343,23 @@ def _copy_fwd_metadata_to_bw_nodes(fx_g: torch.fx.GraphModule) -> None:
             if (
                 node.op not in ("call_function", "get_attr")
                 or "seq_nr" not in node.meta
-                or _is_backward(node)
+                or node.meta.get("autograd_backward", False) != backward
             ):
                 continue
-            seq_nr = node.meta["seq_nr"]
-            if seq_nr not in seq_nr_to_fwd_node:
-                seq_nr_to_fwd_node[seq_nr] = node
+            yield node
 
-    for submod in fx_g.modules():
-        if not isinstance(submod, torch.fx.GraphModule):
-            continue
-        for node in submod.graph.nodes:
-            if (
-                node.op not in ("call_function", "get_attr")
-                or "seq_nr" not in node.meta
-                or not _is_backward(node)
-            ):
-                continue
-            fwd_node = seq_nr_to_fwd_node.get(node.meta["seq_nr"])
-            if fwd_node is None or fwd_node is node:
-                continue
 
-            custom = fwd_node.meta.get("custom")
-            if custom:
-                node.meta.setdefault("custom", {}).update(copy.deepcopy(custom))
-            nn_module_stack = fwd_node.meta.get("nn_module_stack")
-            if nn_module_stack is not None:
-                node.meta["nn_module_stack"] = nn_module_stack.copy()
-            stack_trace = fwd_node.meta.get("stack_trace")
-            if stack_trace is not None:
-                node.meta["stack_trace"] = stack_trace
+def _copy_fwd_meta(fwd_node: torch.fx.Node, node: torch.fx.Node) -> None:
+    """Copy ``custom``/``nn_module_stack``/``stack_trace`` from fwd to bwd."""
+    custom = fwd_node.meta.get("custom")
+    if custom:
+        node.meta.setdefault("custom", {}).update(copy.deepcopy(custom))
+    nn_module_stack = fwd_node.meta.get("nn_module_stack")
+    if nn_module_stack is not None:
+        node.meta["nn_module_stack"] = nn_module_stack.copy()
+    stack_trace = fwd_node.meta.get("stack_trace")
+    if stack_trace is not None:
+        node.meta["stack_trace"] = stack_trace
 
 
 def _fakeify_input(fake_mode: FakeTensorMode, x: Any) -> Any:
@@ -286,6 +405,14 @@ def trace_model_graph(
 
     Returns:
         JointGraph: Joint forward-backward computation graph
+
+    Note:
+        Tracing is STATIC-SHAPE: no ``ShapeEnv`` is installed, so the graph
+        bakes the sample tensors' concrete shapes (symbolic ``sym_size``
+        nodes would make per-stage placement ambiguous in ``PpPass``).
+        This contract is shared by ALL graph-mode users, FSDP included — a
+        batch whose shape differs from the compile sample must be
+        re-compiled.
     """
     # Extract module state (parameters/buffers) into flat tensors threaded
     # through the graph as static inputs (leading placeholders).
@@ -320,10 +447,11 @@ def trace_model_graph(
 
     full_args = list(state_flat) + list(user_inputs_flat)
 
-    fake_mode = FakeTensorMode(
-        allow_non_fake_inputs=True,
-        shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
-    )
+    # Static shapes: no ShapeEnv -> no symbolic sizes -> the traced graph
+    # carries no aten.sym_size scalar nodes (their CSE-across-phases aliasing
+    # makes per-stage placement ambiguous). The trainer compiles per fixed
+    # batch shape, so static tracing loses nothing here.
+    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
     fake_args = tuple(
         _fakeify_input(fake_mode, a) if isinstance(a, torch.Tensor) else a
         for a in full_args
@@ -365,6 +493,15 @@ def trace_model_graph(
 
         return [loss] + processed_grads
 
+    # make_fx only records ``nn_module_stack`` when the traced callable
+    # carries ``_orig_mod``: its ``_init_modes_from_inputs`` then installs a
+    # ``_ModuleStackTracer`` that captures which module's ``forward`` was
+    # executing as each node is created. Forward nodes thereby gain the
+    # module-stack metadata ``PpPass._stage_from_stack`` needs to map a node
+    # to its pipeline stage. Backward nodes are annotated separately (see
+    # ``_annotate_autograd_backward``), after tracing.
+    _fwd_bwd_fn._orig_mod = model  # type: ignore[attr-defined]
+
     # The pytree spec of the combined state tree is captured here so the
     # traced closure can unflatten the leading state placeholders.
     _, state_spec = torch.utils._pytree.tree_flatten({"model": model_state})
@@ -380,8 +517,18 @@ def trace_model_graph(
     ):
         traced_graph = make_fx(_fwd_bwd_fn, **_MAKE_FX_KWARGS)(*fake_args)
 
+    # Stock torch's make_fx does not tag backward nodes (no torchtitan
+    # ``_patch_engine_backward`` hook), so the joint graph splits into
+    # fwd/bwd halves with no ``autograd_backward`` meta to key on.
+    # ``_annotate_autograd_backward`` reconstructs the tag structurally so
+    # ``PpPass`` can classify both halves.
+    _annotate_autograd_backward(traced_graph)
+
     # Copy forward metadata (nn_module_stack/stack_trace) to backward nodes so
     # passes can match nodes by module FQN on both halves of the joint graph.
+    # On torchtitan's patched torch this is the primary source (the engine
+    # already tagged backward nodes); on stock torch it is a no-op because
+    # backward nodes carry no ``seq_nr`` that collides with a forward one.
     _copy_fwd_metadata_to_bw_nodes(traced_graph)
 
     # Expose the state layout on the GraphModule so downstream passes can

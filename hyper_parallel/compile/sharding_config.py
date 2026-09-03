@@ -33,7 +33,7 @@ Note:
 import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -69,21 +69,32 @@ class PassPlan:
     order: exact wins first, then patterns in insertion order (first match
     wins when patterns overlap).
 
+    Pipeline-parallel stage assignment lives in
+    ``pp_module_fqns_per_stage``: a list whose i-th entry is the list of
+    module FQNs (exact, no wildcards) assigned to stage ``i``. When it is
+    ``None`` the ``PpPass`` falls back to an automatic even split of the
+    model's layer-like children (see ``pp_pass._auto_stage_split``).
+
     Example:
         plan = PassPlan()
         plan.fsdp_wrap("tok_embeddings")
         plan.fsdp_wrap_pattern("layers.*")
+        plan.pp_stage(0, ["tok_embeddings", "layers.0"])
+        plan.pp_stage(1, ["layers.1", "norm", "lm_head"])
     """
 
     fsdp_modules: Dict[str, FSDPModuleConfig] = field(default_factory=dict)
     fsdp_patterns: Dict[str, FSDPModuleConfig] = field(default_factory=dict)
+    pp_module_fqns_per_stage: Optional[List[List[str]]] = None
 
     def merge(self, other: "PassPlan") -> "PassPlan":
         """Return a new plan with both registries merged (other wins on key conflict).
 
         Args:
             other: Plan to merge in. Entries in ``other`` overwrite entries
-                with the same FQN / pattern in ``self``.
+                with the same FQN / pattern in ``self``; a PP stage plan on
+                ``other`` replaces ``self``'s wholesale (per-stage merges
+                are ambiguous and unsupported).
 
         Returns:
             A new ``PassPlan``; ``self`` and ``other`` are not mutated.
@@ -91,6 +102,10 @@ class PassPlan:
         merged = PassPlan()
         merged.fsdp_modules = {**self.fsdp_modules, **other.fsdp_modules}
         merged.fsdp_patterns = {**self.fsdp_patterns, **other.fsdp_patterns}
+        if other.pp_module_fqns_per_stage is not None:
+            merged.pp_module_fqns_per_stage = other.pp_module_fqns_per_stage
+        elif self.pp_module_fqns_per_stage is not None:
+            merged.pp_module_fqns_per_stage = self.pp_module_fqns_per_stage
         return merged
 
     def fsdp_wrap(self, module_fqn: str) -> "PassPlan":
@@ -146,6 +161,44 @@ class PassPlan:
 
         return None
 
+    def pp_stage(self, stage_idx: int, module_fqns: List[str]) -> "PassPlan":
+        """Declare the module FQNs of one pipeline stage (exact match).
+
+        Args:
+            stage_idx: Zero-based stage index, ``stage_idx >= 0``. Stages
+                may be declared in any order / sparsely; ``PpPass``
+                validates completeness (every stage ``0..pp_degree-1``
+                declared, no FQN assigned twice) before splitting.
+            module_fqns: Module FQNs owned by this stage, in model order.
+                Exact FQNs only — wildcards are rejected because a stage
+                cut must be unambiguous.
+
+        Returns:
+            ``self`` (chainable).
+
+        Raises:
+            ValueError: If ``stage_idx`` is negative or a module FQN
+                contains wildcard characters.
+
+        Example:
+            plan.pp_stage(0, ["tok_embeddings", "layers.0"])
+            plan.pp_stage(1, ["layers.1", "norm", "lm_head"])
+        """
+        if stage_idx < 0:
+            raise ValueError(f"stage_idx must be >= 0, got {stage_idx}")
+        for fqn in module_fqns:
+            if any(ch in fqn for ch in "*?["):
+                raise ValueError(
+                    f"pp_stage() takes exact module FQNs, got wildcard pattern "
+                    f"'{fqn}' — a stage cut must be unambiguous"
+                )
+        if self.pp_module_fqns_per_stage is None:
+            self.pp_module_fqns_per_stage = []
+        while len(self.pp_module_fqns_per_stage) <= stage_idx:
+            self.pp_module_fqns_per_stage.append([])
+        self.pp_module_fqns_per_stage[stage_idx] = list(module_fqns)
+        return self
+
 
 def create_sharding_plan_from_yaml(
     config_path: Optional[str] = None,
@@ -200,17 +253,42 @@ def create_sharding_plan_from_yaml(
 
     plan = PassPlan()
 
-    fsdp_config = config.get("fsdp", {})
-    has_explicit_modules = bool(fsdp_config.get("modules"))
-    has_explicit_patterns = bool(fsdp_config.get("patterns"))
-    is_enabled = fsdp_config.get(
-        "enabled", has_explicit_modules or has_explicit_patterns
-    )
+    fsdp_config = _yaml_section(config, "fsdp", config_path)
+    _maybe_process_fsdp(plan, fsdp_config)
 
-    if is_enabled:
-        _process_fsdp(plan, fsdp_config)
+    pp_config = _yaml_section(config, "pp", config_path)
+    if pp_config.get("stages"):
+        _process_pp(plan, pp_config)
 
     return plan
+
+
+def _yaml_section(config: dict, key: str, config_path: Path) -> dict:
+    """Return YAML ``key`` as a mapping; empty/``None`` becomes ``{}``.
+
+    ``or {}``: a YAML key present but empty (``fsdp:`` with only comments
+    under it) parses to None, and ``dict.get(key, {})`` then returns
+    None instead of the default.
+    """
+    section = config.get(key) or {}
+    if not isinstance(section, dict):
+        # A present-but-empty section parses to None and is normalized to {}
+        # above, so anything landing here is a real scalar/sequence typo.
+        raise ValueError(
+            f"YAML '{key}' section must be a mapping (e.g. nested keys or an "
+            f"empty section); got {type(section).__name__} in {config_path}"
+        )
+    return section
+
+
+def _maybe_process_fsdp(plan: PassPlan, fsdp_config: dict) -> None:
+    """Run the FSDP processor when the section is enabled.
+
+    Enabled defaults to True when explicit modules/patterns are declared.
+    """
+    has_explicit = bool(fsdp_config.get("modules")) or bool(fsdp_config.get("patterns"))
+    if fsdp_config.get("enabled", has_explicit):
+        _process_fsdp(plan, fsdp_config)
 
 
 def _process_fsdp(plan: PassPlan, fsdp_config: dict) -> None:
@@ -220,6 +298,34 @@ def _process_fsdp(plan: PassPlan, fsdp_config: dict) -> None:
 
     for pattern_config in fsdp_config.get("patterns", []):
         plan.fsdp_wrap_pattern(pattern_config["pattern"])
+
+
+def _process_pp(plan: PassPlan, pp_config: dict) -> None:
+    """Process PP configuration (explicit per-stage FQN lists) into the plan.
+
+    YAML shape::
+
+        pp:
+          stages:
+            - [tok_embeddings, layers.0]
+            - [layers.1, norm, lm_head]
+
+    An entry may also be a mapping with ``stage`` / ``modules`` keys for
+    readability::
+
+        pp:
+          stages:
+            - stage: 0
+              modules: [tok_embeddings, layers.0]
+    """
+    for idx, stage in enumerate(pp_config["stages"]):
+        if isinstance(stage, dict):
+            stage_idx = stage.get("stage", idx)
+            module_fqns = list(stage.get("modules", []))
+        else:
+            stage_idx = idx
+            module_fqns = list(stage)
+        plan.pp_stage(stage_idx, module_fqns)
 
 
 def create_simple_sharding_plan() -> PassPlan:

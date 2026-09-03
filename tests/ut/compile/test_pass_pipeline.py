@@ -38,13 +38,8 @@ from torch import fx
 
 from hyper_parallel.compile.parallel_config import PassConfig
 from hyper_parallel.compile.passes.base import GraphPass
-from hyper_parallel.compile.passes.overlap.schedule import AutoOverlapPass
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
-from hyper_parallel.compile.passes.pipeline import (
-    CanonicalizeGraphPass,
-    DeadCodeEliminationPass,
-    PassPipeline,
-)
+from hyper_parallel.compile.passes.pipeline import PassPipeline
 from hyper_parallel.compile.sharding_config import PassPlan
 
 
