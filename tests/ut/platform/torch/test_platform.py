@@ -276,6 +276,30 @@ class TestTorchPlatformCore(unittest.TestCase):
         expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
         self.assertTrue(torch.allclose(result, expected))
 
+    @mock.patch('torch.distributed.nn.functional.all_gather')
+    def test_differentiable_all_gather_concat_makes_backward_gradients_contiguous(self, mock_all_gather):
+        """Feature: Differentiable all-gather backward gradient layout.
+
+        Description: Backpropagate through concatenated mock all-gather outputs.
+        Expectation: The mock collective receives contiguous gradients.
+        """
+        received_contiguity = []
+        mock_output = [
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True),
+            torch.tensor([[5.0, 6.0], [7.0, 8.0]], requires_grad=True),
+        ]
+        for output in mock_output:
+            output.register_hook(lambda gradient: received_contiguity.append(gradient.is_contiguous()))
+        mock_all_gather.return_value = mock_output
+        tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+        result = TorchPlatform.differentiable_all_gather_concat(
+            tensor, group=None, concat_size=2, concat_dim=0
+        )
+        result.sum().backward()
+
+        self.assertEqual(received_contiguity, [True, True])
+
     @mock.patch('torch.distributed.nn.functional.all_reduce')
     def test_differentiable_all_reduce(self, mock_all_reduce):
         """Test differentiable all_reduce logic.

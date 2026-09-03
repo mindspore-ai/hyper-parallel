@@ -343,10 +343,22 @@ if [[ "${BUILD_MULTICORE_TORCH}" == "true" ]]; then
         fail "TORCH_BUILD_DEPENDENCY_NOT_FOUND" \
             "The selected Python must provide matching torch and torch_npu packages." 5
     fi
-    if ! python3 -c 'import torch; raise SystemExit(0 if torch._C._GLIBCXX_USE_CXX11_ABI else 1)' \
+    if ! python3 -c 'import torch; raise SystemExit(0 if torch.compiled_with_cxx11_abi() else 1)' \
         >/dev/null 2>&1; then
         fail "TORCH_CXX11_ABI_UNSUPPORTED" \
             "The selected Torch native build requires _GLIBCXX_USE_CXX11_ABI=1." 5
+    fi
+    if ! python3 -c '
+from pathlib import Path
+import torch_npu
+
+header = Path(torch_npu.__file__).resolve().parent / (
+    "include/third_party/op-plugin/op_plugin/include/npu_cpp_extension.h"
+)
+raise SystemExit(0 if header.is_file() else 1)
+' >/dev/null 2>&1; then
+        fail "TORCH_NPU_CPP_EXTENSION_HEADER_MISSING" \
+            "The selected torch_npu package must provide the public npu_cpp_extension.h header." 5
     fi
 fi
 

@@ -64,25 +64,68 @@ else()
 endif()
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
-list(APPEND CMAKE_PREFIX_PATH "${Python3_SITELIB}")
-set(Torch_DIR ${Python3_SITELIB}/torch/share/cmake/Torch)
-find_package(Torch REQUIRED)
+function(find_python_package_root package_name output_variable)
+    set(package_lookup_code
+        "from importlib.util import find_spec"
+        "from pathlib import Path"
+        "spec = find_spec('${package_name}')"
+        "print(Path(spec.origin).resolve().parent if spec and spec.origin else '')"
+    )
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "${package_lookup_code}"
+        RESULT_VARIABLE package_lookup_status
+        OUTPUT_VARIABLE package_root
+        ERROR_VARIABLE package_lookup_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT package_lookup_status EQUAL 0 OR NOT IS_DIRECTORY "${package_root}")
+        message(FATAL_ERROR
+            "Cannot locate the ${package_name} package used by ${Python3_EXECUTABLE}: "
+            "${package_lookup_error}")
+    endif()
+    set(${output_variable} "${package_root}" PARENT_SCOPE)
+endfunction()
+
+# This adapter is a C++ operator library loaded by torch.ops.load_library().
+# Direct package discovery keeps the build independent of Caffe2's optional
+# CUDA toolkit check and uses only the Torch and torch_npu C++ build inputs.
+find_python_package_root("torch" TORCH_PACKAGE_ROOT)
+find_python_package_root("torch_npu" TORCH_NPU_PACKAGE_ROOT)
+
+set(TORCH_INCLUDE_ROOT "${TORCH_PACKAGE_ROOT}/include")
+set(TORCH_NPU_INCLUDE_ROOT "${TORCH_NPU_PACKAGE_ROOT}/include")
+set(TORCH_LIBRARY_ROOT "${TORCH_PACKAGE_ROOT}/lib")
+set(TORCH_NPU_LIBRARY_ROOT "${TORCH_NPU_PACKAGE_ROOT}/lib")
+set(TORCH_LINK_LIBRARIES
+    "${TORCH_LIBRARY_ROOT}/libc10.so"
+    "${TORCH_LIBRARY_ROOT}/libtorch.so"
+    "${TORCH_LIBRARY_ROOT}/libtorch_cpu.so"
+    "${TORCH_NPU_LIBRARY_ROOT}/libtorch_npu.so"
+)
+
+foreach(required_path IN ITEMS
+    "${TORCH_INCLUDE_ROOT}"
+    "${TORCH_INCLUDE_ROOT}/torch/csrc/api/include"
+    "${TORCH_NPU_INCLUDE_ROOT}"
+    ${TORCH_LINK_LIBRARIES})
+    if(NOT EXISTS "${required_path}")
+        message(FATAL_ERROR
+            "The active Torch environment is missing a required C++ build input: ${required_path}")
+    endif()
+endforeach()
 
 include_directories(
     ${Python3_INCLUDE_DIRS}
-    ${TORCH_INCLUDE_DIRS}
-    ${Python3_SITELIB}/torch_npu/include
+    ${TORCH_INCLUDE_ROOT}
+    ${TORCH_INCLUDE_ROOT}/torch/csrc/api/include
+    ${TORCH_NPU_INCLUDE_ROOT}
     ${SHMEM_HOME_PATH}/shmem/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../ops/include
 )
 
 link_directories(
-    ${Python3_SITELIB}/torch/lib
-    ${Python3_SITELIB}/torch_npu/lib
     ${SHMEM_HOME_PATH}/shmem/lib
 )
-
-link_libraries("${TORCH_LIBRARIES}" torch_npu hyper_parallel_shmem)
 
 if(BUILD_TORCH_LIB)
     set(TORCH_BINDINGS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/torch_bindings.cpp)
@@ -90,6 +133,7 @@ if(BUILD_TORCH_LIB)
         SHARED ${TORCH_BINDINGS_SRC})
     target_link_libraries(
         aclshmem_torch PRIVATE
+        ${TORCH_LINK_LIBRARIES}
         hyper_parallel_shmem_utils
         hyper_parallel_shmem
         "${ACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB}")

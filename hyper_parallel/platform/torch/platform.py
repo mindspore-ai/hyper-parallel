@@ -96,6 +96,38 @@ def _move_dim_from_front(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     return tensor.permute(inverse).contiguous()
 
 
+class _TorchContiguousGrad(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Autograd identity that materializes gradients before upstream collectives."""
+
+    @staticmethod
+    def forward(ctx: Any, tensor: Tensor) -> Tensor:  # pylint: disable=arguments-differ
+        """Return the input unchanged in the forward pass.
+
+        Args:
+            ctx: Autograd context required by ``torch.autograd.Function``.
+            tensor: Tensor produced by the differentiable collective.
+
+        Returns:
+            The input tensor without a forward copy.
+        """
+        del ctx
+        return tensor
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> Tensor:  # pylint: disable=arguments-differ
+        """Return a contiguous gradient to the preceding autograd node.
+
+        Args:
+            ctx: Autograd context required by ``torch.autograd.Function``.
+            grad_output: Gradient from the collective output consumer.
+
+        Returns:
+            A contiguous gradient tensor.
+        """
+        del ctx
+        return grad_output.contiguous()
+
+
 class _TorchAsyncA2AFunction(torch.autograd.Function):
     """Differentiable wrapper for pre-launched async all-to-all.
 
@@ -849,7 +881,10 @@ class TorchPlatform(Platform):
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
         data = _ensure_contiguous(data)
-        output = list(dist_func.all_gather(data, group=group))
+        output = [
+            _TorchContiguousGrad.apply(tensor)
+            for tensor in dist_func.all_gather(data, group=group)
+        ]
         if rank_list is not None:
             group_ranks = dist.get_process_group_ranks(group)
             if tuple(rank_list) != tuple(group_ranks):
