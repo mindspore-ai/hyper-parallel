@@ -80,6 +80,10 @@ RawSample 是数据源刚读出的记录，字段由数据源决定，例如：
 {"conversation": [{"role": "user", "content": "Hello"}]}
 ```
 
+```python
+{"instruction": "Explain TP", "input": "Use two ranks", "output": "Shard model matrices."}
+```
+
 Online Dataset 输出 RawSample，然后在 `transform_dataset.py` 中延迟执行 tokenizer 或 chat template。
 Indexed Dataset 已经保存 token ID，不经过 Online transform。
 
@@ -99,7 +103,9 @@ tokens: [seq_length]
 labels: [seq_length]
 ```
 
-`PlaintextTransform` 和 `TextConversationTransform` 可返回单个 ModelSample 或有序的 ModelSample 列表。
+`PlaintextTransform`、`TextConversationTransform` 和 `TextInstructionTransform` 可返回单个 ModelSample 或有序的
+ModelSample 列表。Conversation transform 同时接受 `role/content` 和 ShareGPT `from/value` 消息；Instruction
+transform 通过列映射把 instruction、可选 input 和 output 转为 user/assistant 消息。
 固定 batch 路径要求一条 RawSample 最终只产生一条 ModelSample；一对多结果需要使用动态 batch 路径。
 
 ### 3.3 Collated batch
@@ -568,7 +574,46 @@ dataloader:
 将 `dataset_type` 改为 `iterable` 可切换到 `streaming=True` 的数据源；将 DataLoader target 改为
 `FixedBatchDataLoader` 可切换为固定 K 条样本的 batch。两项配置相互独立。
 
-### 11.2 Indexed 变长文档
+### 11.2 Online conversation 与 instruction
+
+OpenAI `role/content` 和 ShareGPT `from/value` conversation 使用同一配置，内层消息格式由 transform 自动识别：
+
+```yaml
+dataset:
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
+  data_path: /data/sharegpt.jsonl
+  data_transform:
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    data_type: conversation
+    text_keys: conversations
+    max_seq_len: 4096
+  data_config:
+    dataset_type: mapping
+```
+
+Alpaca 等 instruction/input/output 数据使用逻辑列到原始列的映射：
+
+```yaml
+dataset:
+  _target_: hyper_parallel.auto_models.components.datasets.llm.build_online_text_dataset
+  data_path: /data/alpaca.jsonl
+  data_transform:
+    _target_: hyper_parallel.auto_models.components.datasets.llm.build_data_transform.build_llm_data_transform
+    data_type: instruction
+    column_mapping:
+      instruction: instruction
+      input: input
+      output: output
+    input_separator: "\n\n"
+    max_seq_len: 4096
+  data_config:
+    dataset_type: mapping
+```
+
+`instruction` 和非空 `input` 拼成 user 内容，`output` 作为 assistant 内容，因此沿用 conversation chat template
+和 assistant-only loss mask。`column_mapping.input` 可以省略，或对应样本字段可以为空字符串。
+
+### 11.3 Indexed 变长文档
 
 ```yaml
 dataset:
@@ -592,7 +637,7 @@ dataloader:
     source_type: indexed
 ```
 
-### 11.3 Indexed 离线预切记录
+### 11.4 Indexed 离线预切记录
 
 先预处理：
 
