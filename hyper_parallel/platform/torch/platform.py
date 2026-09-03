@@ -51,6 +51,20 @@ override_functions()
 _P2P_MULTI_STREAM_GROUPS = {}
 
 
+class _TorchContiguousBackward(torch.autograd.Function):
+    """Preserve the forward value while materializing its backward gradient."""
+
+    @staticmethod
+    def forward(ctx, tensor):  # pylint: disable=arguments-differ,unused-argument
+        """Return the input unchanged."""
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ,unused-argument
+        """Return a contiguous gradient for backends that require it."""
+        return grad_output.contiguous()
+
+
 # ---------------------------------------------------------------------------
 # Module-level A2A reshape helpers
 # ---------------------------------------------------------------------------
@@ -849,7 +863,10 @@ class TorchPlatform(Platform):
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
         data = _ensure_contiguous(data)
-        output = list(dist_func.all_gather(data, group=group))
+        output = [
+            _TorchContiguousBackward.apply(tensor)
+            for tensor in dist_func.all_gather(data, group=group)
+        ]
         if rank_list is not None:
             group_ranks = dist.get_process_group_ranks(group)
             if tuple(rank_list) != tuple(group_ranks):

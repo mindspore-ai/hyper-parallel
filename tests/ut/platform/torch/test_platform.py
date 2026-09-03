@@ -263,10 +263,15 @@ class TestTorchPlatformCore(unittest.TestCase):
         """
         tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
         mock_output = [
-            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-            torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True),
+            torch.tensor([[5.0, 6.0], [7.0, 8.0]], requires_grad=True),
         ]
         mock_all_gather.return_value = mock_output
+        observed_grad_contiguity = []
+        for gathered_tensor in mock_output:
+            gathered_tensor.register_hook(
+                lambda grad: observed_grad_contiguity.append(grad.is_contiguous())
+            )
 
         result = TorchPlatform.differentiable_all_gather_concat(
             tensor, group=None, concat_size=2, concat_dim=0
@@ -275,6 +280,8 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertEqual(result.shape, (4, 2))
         expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
         self.assertTrue(torch.allclose(result, expected))
+        result.backward(torch.ones(2, 4).transpose(0, 1))
+        self.assertEqual(observed_grad_contiguity, [True, True])
 
     @mock.patch('torch.distributed.nn.functional.all_reduce')
     def test_differentiable_all_reduce(self, mock_all_reduce):
