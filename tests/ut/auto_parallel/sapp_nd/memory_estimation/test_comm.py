@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""Unit tests for comm-layer memory estimation."""
+# pylint: disable=W0105,W0125
 """Unit tests for comm.py: DP/TP/CP/EP communication volume estimation.
 
 Test IDs:
@@ -39,16 +41,16 @@ Test IDs:
   CM-C04b: Ring CP exact formula at p>1 (rec_factor=0, coefficient=0.5)
   CM-C05b: Ulysses CP exact formula at p>1 (rec_factor=0, coefficient=0.5)
 """
+# pylint: disable=missing-class-docstring,missing-function-docstring
 import os
 import unittest
 from unittest.mock import MagicMock
 
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
-
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 
 
 def _make_ccfg(
@@ -108,6 +110,9 @@ def _make_ccfg(
     ccfg.comm_cp = comm_cp
     ccfg.tokens_per_expert = tokens_per_expert
 
+    ccfg.fsdp = False
+    ccfg.comm_fsdp = 0.0
+    ccfg.comm_hsdp = 0.0
     # rec_op mock
     if rec_op is None:
         rec_op = MagicMock()
@@ -131,6 +136,568 @@ def _make_ctx(num_p_result=(150.0, 400.0, 200.0), current_node=None):
     return ctx
 
 
+class TestDpCommNonExpFsdp(unittest.TestCase):
+
+    def test_zero3_fsdp_only_grad_rs(self):
+        ccfg = _make_ccfg(tp=2, cp=1, comm_d_non_exp=3)
+        ccfg.fsdp = True
+        ctx = _make_ctx(num_p_result=(150.0, 400.0, 200.0))
+        result = EvalLayerComm.dp_comm_non_exp(ccfg, ctx)
+        expected = 150.0 / (1 * 2)
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_zero3_no_fsdp_includes_param_ag(self):
+        ccfg = _make_ccfg(tp=2, cp=1, comm_d_non_exp=3)
+        ccfg.fsdp = False
+        ctx = _make_ctx(num_p_result=(150.0, 400.0, 200.0))
+        result = EvalLayerComm.dp_comm_non_exp(ccfg, ctx)
+        expected = 150.0 / (1 * 2) + 150.0 / 2 + 150.0 / 2
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestDpCommExpFsdp(unittest.TestCase):
+
+    def test_zero3_fsdp_only_grad_rs(self):
+        ccfg = _make_ccfg(ep=4, tp=1, t_exp=1, cp=1, comm_d_exp=3)
+        ccfg.fsdp = True
+        ctx = _make_ctx(num_p_result=(150.0, 400.0, 200.0))
+        result = EvalLayerComm.dp_comm_exp(ccfg, ctx)
+        exp_param_size = 400.0 + 200.0
+        expected = exp_param_size / (1 * 1 * 4)
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_zero3_no_fsdp_includes_param_ag(self):
+        ccfg = _make_ccfg(ep=4, tp=1, t_exp=1, cp=1, comm_d_exp=3)
+        ccfg.fsdp = False
+        ctx = _make_ctx(num_p_result=(150.0, 400.0, 200.0))
+        result = EvalLayerComm.dp_comm_exp(ccfg, ctx)
+        exp_param_size = 400.0 + 200.0
+        expected = (
+            exp_param_size / (1 * 1 * 4)
+            + exp_param_size / max(4, 1)
+            + exp_param_size / max(4, 1)
+        )
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestEpCommLayerBalancedNewReturns(unittest.TestCase):
+
+    def test_n_exp_1_returns_zero(self):
+        ccfg = _make_ccfg(n_exp=1, ep=4, comm_ep=1.0)
+        ctx = _make_ctx()
+        result = EvalLayerComm.ep_comm_layer_balanced(ccfg, ctx, 1)
+        self.assertEqual(result, 0)
+
+    def test_comm_ep_zero_before_n_exp_check(self):
+        ccfg = _make_ccfg(n_exp=8, ep=4, comm_ep=0)
+        ctx = _make_ctx()
+        result = EvalLayerComm.ep_comm_layer_balanced(ccfg, ctx, 1)
+        self.assertEqual(result, 0)
+
+
+class TestEpCommLayerImbalancedNewReturns(unittest.TestCase):
+
+    def test_n_exp_1_returns_zero(self):
+        ccfg = _make_ccfg(n_exp=1, ep=4, comm_ep=1.0, tokens_per_expert=[100])
+        ctx = _make_ctx()
+        result = EvalLayerComm.ep_comm_layer_imbalanced(ccfg, ctx, 1)
+        self.assertEqual(result, 0)
+
+
+class TestEpCommLayerNewReturns(unittest.TestCase):
+
+    def test_n_exp_1_returns_zero(self):
+        ccfg = _make_ccfg(n_exp=1, ep=4, comm_ep=1.0, tokens_per_expert=None)
+        ctx = _make_ctx()
+        result = EvalLayerComm.ep_comm_layer(ccfg, ctx, 1)
+        self.assertEqual(result, 0)
+
+    def test_comm_ep_zero_returns_zero(self):
+        ccfg = _make_ccfg(n_exp=8, ep=4, comm_ep=0, tokens_per_expert=None)
+        ctx = _make_ctx()
+        result = EvalLayerComm.ep_comm_layer(ccfg, ctx, 1)
+        self.assertEqual(result, 0)
+
+
+class TestFsdpCommLayer(unittest.TestCase):
+
+    def test_pure_fsdp_non_exp_only(self):
+        non_exp = 200.0
+        ccfg = _make_ccfg(tp=2, cp=1, n_exp=1, ep=1, t_exp=1, bytes_compute=2)
+        ccfg.fsdp = True
+        ccfg.comm_fsdp = 1.0
+        ccfg.d = 4
+        ccfg.d_shard = 4
+        ccfg.d_shard_or_d = 4
+        ccfg.comm_hsdp = 0.0
+        ctx = _make_ctx(num_p_result=(non_exp, 0.0, 0.0))
+        result = EvalLayerComm.fsdp_comm_layer(ccfg, ctx)
+        expected = 1.0 * non_exp / (4 * 1 * 2) * 2 * 2
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_hsdp_adds_inter_node_comm(self):
+        non_exp, routed, shared = 200.0, 300.0, 100.0
+        ccfg = _make_ccfg(tp=2, cp=1, n_exp=8, ep=4, t_exp=1, bytes_compute=2)
+        ccfg.fsdp = True
+        ccfg.comm_fsdp = 1.0
+        ccfg.d = 8
+        ccfg.d_shard = 4
+        ccfg.d_shard_or_d = 4
+        ccfg.comm_hsdp = 1.0
+        ctx = _make_ctx(num_p_result=(non_exp, routed, shared))
+        result = EvalLayerComm.fsdp_comm_layer(ccfg, ctx)
+        exp = routed + shared
+        d_shard = 4
+        d_replicate = 8 // 4
+        non_exp_comm = 1.0 * non_exp / (d_shard * 1 * 2) * 2 * 2
+        exp_comm = 1.0 * exp / (d_shard * 4 * 1 * 1) * 2 * 2
+        sharded_non_exp = non_exp / (d_shard * 1 * 2)
+        sharded_exp = exp / (d_shard * 1 * 1)
+        hsdp_comm = 1.0 / d_replicate * (sharded_non_exp + sharded_exp) * 2
+        expected = non_exp_comm + hsdp_comm + exp_comm
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestFsdpBufferLayer(unittest.TestCase):
+
+    def test_non_exp_buffer(self):
+        non_exp = 200.0
+        ccfg = _make_ccfg(tp=2, cp=1, n_exp=1, ep=1, t_exp=1)
+        ccfg.fsdp = True
+        ccfg.comm_fsdp = 1.0
+        ccfg.fsdp_all_gather_buffer = 1.0
+        ccfg.bytes_p = 4
+        ccfg.d = 4
+        ccfg.d_shard = 4
+        ccfg.d_shard_or_d = 4
+        ctx = _make_ctx(num_p_result=(non_exp, 0.0, 0.0))
+        result = EvalLayerComm.fsdp_buffer_layer(ccfg, ctx)
+        expected = 1.0 * 1.0 * non_exp * 4 / (1 * 2)
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_with_expert(self):
+        non_exp, routed, shared = 200.0, 300.0, 100.0
+        ccfg = _make_ccfg(tp=2, cp=1, n_exp=8, ep=4, t_exp=1)
+        ccfg.fsdp = True
+        ccfg.comm_fsdp = 1.0
+        ccfg.fsdp_all_gather_buffer = 1.0
+        ccfg.bytes_p = 4
+        ccfg.d = 4
+        ccfg.d_shard = 4
+        ccfg.d_shard_or_d = 4
+        ctx = _make_ctx(num_p_result=(non_exp, routed, shared))
+        result = EvalLayerComm.fsdp_buffer_layer(ccfg, ctx)
+        non_exp_buf = 1.0 * 1.0 * non_exp * 4 / (1 * 2)
+        exp_buf = 1.0 * 1.0 * (routed + shared) * 4 / (4 * 1 * 1)
+        expected = non_exp_buf + exp_buf
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestFsdpBufferComm(unittest.TestCase):
+
+    def test_returns_bytes_not_element_count(self):
+        non_exp, routed, shared = 150.0, 400.0, 200.0
+        ccfg = _make_ccfg(tp=2, cp=1, comm_t=0.0, bytes_compute=2)
+        ccfg.fsdp = True
+        ccfg.comm_fsdp = 1.0
+        ccfg.fsdp_all_gather_buffer = 1.0
+        ccfg.bytes_p = 4
+        ccfg.d = 4
+        ccfg.d_shard = 4
+        ccfg.d_shard_or_d = 4
+        ccfg.t_exp = 1
+        ccfg.n_exp = 8
+        ccfg.ep = 4
+        ccfg.comm_hsdp = 0.0
+        ctx = _make_ctx(num_p_result=(non_exp, routed, shared))
+        result = EvalLayerComm.fsdp_buffer_comm(ccfg, ctx)
+        non_exp_buf = 1.0 * 1.0 * non_exp * 2 / (1 * 2)
+        exp_buf = 1.0 * 1.0 * (routed + shared) * 2 / (4 * 1 * 1)
+        expected = non_exp_buf + exp_buf
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_zero_when_no_fsdp(self):
+        ccfg = _make_ccfg()
+        ccfg.fsdp = False
+        ccfg.comm_fsdp = 0.0
+        ccfg.fsdp_all_gather_buffer = 0.0
+        ccfg.bytes_compute = 2
+        ctx = _make_ctx()
+        result = EvalLayerComm.fsdp_buffer_comm(ccfg, ctx)
+        self.assertEqual(result, 0.0)
+
+
+class TestHsdpInterBufferComm(unittest.TestCase):
+
+    def test_zero_for_pure_fsdp(self):
+        ccfg = _make_ccfg(tp=2, cp=1, bytes_compute=2)
+        ccfg.comm_hsdp = 0.0
+        ctx = _make_ctx(num_p_result=(150.0, 400.0, 200.0))
+        result = EvalLayerComm.hsdp_inter_buffer_comm(ccfg, ctx)
+        self.assertEqual(result, 0.0)
+
+    def test_hsdp_buffer_formula(self):
+        non_exp, routed, shared = 150.0, 400.0, 200.0
+        ccfg = _make_ccfg(tp=2, cp=1, n_exp=8, ep=4, t_exp=1, bytes_compute=2)
+        ccfg.d = 8
+        ccfg.d_shard = 4
+        ccfg.d_shard_or_d = 4
+        ccfg.comm_hsdp = 1.0
+        ctx = _make_ctx(num_p_result=(non_exp, routed, shared))
+        result = EvalLayerComm.hsdp_inter_buffer_comm(ccfg, ctx)
+        sharded_non_exp = non_exp / (4 * 1 * 2)
+        sharded_exp = (routed + shared) / (4 * 1 * 1)
+        expected = 1.0 * (sharded_non_exp + sharded_exp) * 2
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestFsdpGradBufferComm(unittest.TestCase):
+
+    def test_returns_bytes_grad_multiplier(self):
+        non_exp, routed, shared = 150.0, 400.0, 200.0
+        ccfg = _make_ccfg(tp=2, cp=1, comm_t=0.0, bytes_compute=2)
+        ccfg.fsdp = True
+        ccfg.comm_fsdp = 1.0
+        ccfg.fsdp_all_gather_buffer = 1.0
+        ccfg.bytes_grad = 4
+        ccfg.d = 4
+        ccfg.d_shard = 4
+        ccfg.d_shard_or_d = 4
+        ccfg.t_exp = 1
+        ccfg.n_exp = 8
+        ccfg.ep = 4
+        ccfg.comm_hsdp = 0.0
+        ctx = _make_ctx(num_p_result=(non_exp, routed, shared))
+        result = EvalLayerComm.fsdp_grad_buffer_comm(ccfg, ctx)
+        non_exp_buf = 1.0 * 1.0 * non_exp * 4 / (1 * 2)
+        exp_buf = 1.0 * 1.0 * (routed + shared) * 4 / (4 * 1 * 1)
+        expected = non_exp_buf + exp_buf
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_zero_when_no_fsdp(self):
+        ccfg = _make_ccfg()
+        ccfg.fsdp = False
+        ccfg.comm_fsdp = 0.0
+        ccfg.fsdp_all_gather_buffer = 0.0
+        ccfg.bytes_grad = 4
+        ctx = _make_ctx()
+        result = EvalLayerComm.fsdp_grad_buffer_comm(ccfg, ctx)
+        self.assertEqual(result, 0.0)
+
+
+def _make_tail_ccfg(
+    h=16, v=64, t=2, cp=1, d=4, n_mtp=1, n_exp=1, ep=1, t_exp=1,
+    bytes_p=2, bytes_compute=2, bytes_grad=2, bytes_os=12,
+    fsdp=True, comm_fsdp=1.0, comm_hsdp=0.0, fsdp_all_gather_buffer=1.0,
+    d_shard=0, is_shard_mtp_param=True, shard_p_os_non_exp_partial=None,
+    shard_grad_non_exp=None, **kwargs,
+):
+    ccfg = MagicMock()
+    ccfg.h = h
+    ccfg.v = v
+    ccfg.t = t
+    ccfg.cp = cp
+    ccfg.d = d
+    ccfg.n_mtp = n_mtp
+    ccfg.n_exp = n_exp
+    ccfg.ep = ep
+    ccfg.t_exp = t_exp
+    ccfg.bytes_p = bytes_p
+    ccfg.bytes_compute = bytes_compute
+    ccfg.bytes_grad = bytes_grad
+    ccfg.bytes_os = bytes_os
+    ccfg.fsdp = fsdp
+    ccfg.comm_fsdp = comm_fsdp
+    ccfg.comm_hsdp = comm_hsdp
+    ccfg.fsdp_all_gather_buffer = fsdp_all_gather_buffer
+    ccfg.is_shard_mtp_param = is_shard_mtp_param
+    if d_shard > 0:
+        ccfg.d_shard = d_shard
+        ccfg.d_shard_or_d = d_shard
+    else:
+        ccfg.d_shard = d if fsdp else 0
+        ccfg.d_shard_or_d = d if fsdp else d
+    if shard_p_os_non_exp_partial is not None:
+        ccfg.shard_p_os_non_exp_partial = shard_p_os_non_exp_partial
+    else:
+        ccfg.shard_p_os_non_exp_partial = d * cp * t if fsdp else 1
+    if shard_grad_non_exp is not None:
+        ccfg.shard_grad_non_exp = shard_grad_non_exp
+    else:
+        ccfg.shard_grad_non_exp = d * cp * t if fsdp else 1
+    ccfg.bytes_norm = 4
+    ccfg.s = 8
+    ccfg.b = 1
+    ccfg.shard_output_activ = 1
+    for k, val in kwargs.items():
+        setattr(ccfg, k, val)
+    return ccfg
+
+
+def _make_tail_ctx(
+    num_p_result=100.0,
+    current_node=LayerType.OUTPUT_LAYER,
+):
+    ctx = MagicMock()
+    ctx.eval = MagicMock()
+    ctx.eval.num_p = lambda c, x: num_p_result
+    ctx.current_node = current_node
+    ctx.micro_factor = 1
+    ctx.eval.dyn = MagicMock()
+    ctx.eval.dyn.comm = MagicMock()
+    ctx.eval.dyn.comm.fsdp = MagicMock(return_value=10.0)
+    ctx.eval.dyn.comm.fsdp_grad = MagicMock(return_value=20.0)
+    ctx.eval.stat = MagicMock()
+    ctx.eval.stat.p = MagicMock(return_value=50.0)
+    ctx.swap_os = False
+    return ctx
+
+
+class TestTailFsdpCommOutSingle(unittest.TestCase):
+
+    def test_basic_formula(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTailSingle
+
+        param_size = 100.0
+        ccfg = _make_tail_ccfg(t=2, cp=1, comm_fsdp=1.0, fsdp_all_gather_buffer=1.0, bytes_compute=2)
+        ctx = _make_tail_ctx(num_p_result=param_size)
+        result = EvalTailSingle.fsdp_comm_out_single(ccfg, ctx)
+        expected = 1.0 * 1.0 * param_size * 2 / (1 * 2)
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_zero_when_no_fsdp(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTailSingle
+
+        ccfg = _make_tail_ccfg(comm_fsdp=0.0, fsdp_all_gather_buffer=0.0)
+        ctx = _make_tail_ctx()
+        result = EvalTailSingle.fsdp_comm_out_single(ccfg, ctx)
+        self.assertAlmostEqual(result, 0.0, places=4)
+
+
+class TestTailFsdpGradCommOutSingle(unittest.TestCase):
+
+    def test_basic_formula(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTailSingle
+
+        param_size = 100.0
+        ccfg = _make_tail_ccfg(t=2, cp=1, comm_fsdp=1.0, fsdp_all_gather_buffer=1.0, bytes_grad=4)
+        ctx = _make_tail_ctx(num_p_result=param_size)
+        result = EvalTailSingle.fsdp_grad_comm_out_single(ccfg, ctx)
+        expected = 1.0 * 1.0 * param_size * 4 / (1 * 2)
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestTailHsdpCommOutSingle(unittest.TestCase):
+
+    def test_zero_for_pure_fsdp(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTailSingle
+
+        ccfg = _make_tail_ccfg(comm_hsdp=0.0)
+        ctx = _make_tail_ctx()
+        result = EvalTailSingle.hsdp_comm_out_single(ccfg, ctx)
+        self.assertEqual(result, 0.0)
+
+    def test_hsdp_formula(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTailSingle
+
+        param_size = 200.0
+        ccfg = _make_tail_ccfg(d=8, d_shard=4, t=2, cp=1, comm_hsdp=1.0, bytes_compute=2)
+        ctx = _make_tail_ctx(num_p_result=param_size)
+        result = EvalTailSingle.hsdp_comm_out_single(ccfg, ctx)
+        sharded_size = param_size / (4 * 1 * 2)
+        expected = 1.0 * sharded_size * 2
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestTailStatOutputSingleFsdp(unittest.TestCase):
+
+    def test_fsdp_vs_no_fsdp_bytes(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTailSingle
+
+        param_size = 100.0
+        ccfg_fsdp = _make_tail_ccfg(fsdp=True, bytes_compute=2, bytes_p=4,
+                                    shard_p_os_non_exp_partial=8)
+        ccfg_nofsdp = _make_tail_ccfg(fsdp=False, bytes_compute=2, bytes_p=4,
+                                      shard_p_os_non_exp_partial=1)
+        ctx = _make_tail_ctx(num_p_result=param_size)
+        r_fsdp = EvalTailSingle.stat_output_single_p(ccfg_fsdp, ctx)
+        r_nofsdp = EvalTailSingle.stat_output_single_p(ccfg_nofsdp, ctx)
+        self.assertAlmostEqual(r_fsdp, param_size * (2 / 8), places=4)
+        self.assertAlmostEqual(r_nofsdp, param_size * (4 / 1), places=4)
+
+
+class TestMtpFsdpCommMtp(unittest.TestCase):
+
+    def test_zero_when_n_mtp_zero(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalMTP
+
+        ccfg = _make_tail_ccfg(n_mtp=0)
+        ctx = _make_tail_ctx()
+        result = EvalMTP.fsdp_comm_mtp(ccfg, ctx)
+        self.assertEqual(result, 0)
+
+    def test_includes_mtp_param_and_head_tail(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalMTP
+
+        n_mtp = 2
+        h = 16
+        t = 2
+        cp = 1
+        bytes_compute = 2
+        comm_fsdp = 1.0
+        fsdp_all_gather_buffer = 1.0
+        ccfg = _make_tail_ccfg(
+            n_mtp=n_mtp, h=h, t=t, cp=cp, bytes_compute=bytes_compute,
+            comm_fsdp=comm_fsdp, fsdp_all_gather_buffer=fsdp_all_gather_buffer,
+        )
+        mtp_param = 2 * h * h + 4 * h
+        ctx = _make_tail_ctx(num_p_result=100.0)
+        ctx.eval.dyn.comm.fsdp = MagicMock(return_value=10.0)
+
+        result = EvalMTP.fsdp_comm_mtp(ccfg, ctx)
+        mtp_only = comm_fsdp * fsdp_all_gather_buffer * n_mtp * mtp_param * bytes_compute / (cp * t)
+        self.assertGreater(result, 0)
+        self.assertGreaterEqual(result, mtp_only - 1e-6)
+        self.assertGreater(result, mtp_only + n_mtp * 10.0)
+
+
+class TestMtpFsdpGradCommMtp(unittest.TestCase):
+
+    def test_zero_when_n_mtp_zero(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalMTP
+
+        ccfg = _make_tail_ccfg(n_mtp=0)
+        ctx = _make_tail_ctx()
+        result = EvalMTP.fsdp_grad_comm_mtp(ccfg, ctx)
+        self.assertEqual(result, 0)
+
+    def test_uses_bytes_grad(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalMTP
+
+        n_mtp = 1
+        h = 16
+        t = 2
+        cp = 1
+        bytes_grad = 4
+        comm_fsdp = 1.0
+        fsdp_all_gather_buffer = 1.0
+        ccfg = _make_tail_ccfg(
+            n_mtp=n_mtp, h=h, t=t, cp=cp, bytes_grad=bytes_grad,
+            comm_fsdp=comm_fsdp, fsdp_all_gather_buffer=fsdp_all_gather_buffer,
+        )
+        mtp_param = 2 * h * h + 4 * h
+        ctx = _make_tail_ctx(num_p_result=100.0)
+        ctx.eval.dyn.comm.fsdp_grad = MagicMock(return_value=5.0)
+
+        result = EvalMTP.fsdp_grad_comm_mtp(ccfg, ctx)
+        mtp_term = comm_fsdp * fsdp_all_gather_buffer * n_mtp * mtp_param * bytes_grad / (cp * t)
+        self.assertGreater(result, 0)
+        self.assertGreaterEqual(result, mtp_term - 1e-6)
+
+
+class TestMtpHsdpCommMtp(unittest.TestCase):
+
+    def test_zero_when_no_hsdp(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalMTP
+
+        ccfg = _make_tail_ccfg(n_mtp=1, comm_hsdp=0.0)
+        ctx = _make_tail_ctx()
+        result = EvalMTP.hsdp_comm_mtp(ccfg, ctx)
+        self.assertEqual(result, 0)
+
+    def test_hsdp_formula(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalMTP
+
+        n_mtp = 2
+        h = 16
+        d = 8
+        d_shard = 4
+        t = 2
+        cp = 1
+        bytes_compute = 2
+        comm_hsdp = 1.0
+        d_replicate = d // d_shard
+
+        ccfg = _make_tail_ccfg(
+            n_mtp=n_mtp, h=h, d=d, d_shard=d_shard, t=t, cp=cp,
+            bytes_compute=bytes_compute, comm_hsdp=comm_hsdp,
+        )
+        mtp_param = 2 * h * h + 4 * h
+
+        embed_param = 100.0
+        output_param = 200.0
+        ctx = _make_tail_ctx(num_p_result=embed_param)
+        original_num_p = ctx.eval.num_p
+
+        def _num_p(c, x):
+            if ctx.current_node == LayerType.EMBEDDING_LAYER:
+                return embed_param
+            if ctx.current_node == LayerType.OUTPUT_LAYER:
+                return output_param
+            return original_num_p(c, x)
+
+        ctx.eval.num_p = _num_p
+
+        result = EvalMTP.hsdp_comm_mtp(ccfg, ctx)
+
+        sharded_mtp = mtp_param / (d_shard * cp * t)
+        contrib_mtp = comm_hsdp * n_mtp * sharded_mtp * bytes_compute / d_replicate
+        sharded_embed = embed_param / (d_shard * cp * t)
+        contrib_embed = comm_hsdp * n_mtp * sharded_embed * bytes_compute / d_replicate
+        sharded_output = output_param / (d_shard * cp * t)
+        contrib_output = comm_hsdp * n_mtp * sharded_output * bytes_compute / d_replicate
+
+        expected = contrib_mtp + contrib_embed + contrib_output
+        self.assertAlmostEqual(result, expected, places=4)
+
+
+class TestEvalTailFsdpCommOutput(unittest.TestCase):
+
+    def test_sums_components(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail, EvalTailSingle, EvalMTP
+
+        ccfg = _make_tail_ccfg(n_mtp=1, h=16, t=2, cp=1, comm_fsdp=1.0,
+                               fsdp_all_gather_buffer=1.0, bytes_compute=2)
+        ctx = _make_tail_ctx(num_p_result=100.0)
+        ctx.eval.dyn.comm.fsdp = MagicMock(return_value=10.0)
+
+        result = EvalTail.fsdp_comm_output(ccfg, ctx)
+        out_single = EvalTailSingle.fsdp_comm_out_single(ccfg, ctx)
+        mtp = EvalMTP.fsdp_comm_mtp(ccfg, ctx)
+        self.assertAlmostEqual(result, out_single + mtp, places=4)
+
+
+class TestEvalTailHsdpCommOutput(unittest.TestCase):
+
+    def test_sums_components(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail, EvalTailSingle, EvalMTP
+
+        ccfg = _make_tail_ccfg(n_mtp=1, h=16, d=8, d_shard=4, t=2, cp=1,
+                               comm_hsdp=1.0, bytes_compute=2)
+        ctx = _make_tail_ctx(num_p_result=100.0)
+
+        result = EvalTail.hsdp_comm_output(ccfg, ctx)
+        out_single = EvalTailSingle.hsdp_comm_out_single(ccfg, ctx)
+        mtp = EvalMTP.hsdp_comm_mtp(ccfg, ctx)
+        self.assertAlmostEqual(result, out_single + mtp, places=4)
+
+
+class TestEvalTailFsdpGradCommOutput(unittest.TestCase):
+
+    def test_sums_components(self):
+        from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.tail import EvalTail, EvalTailSingle, EvalMTP
+
+        ccfg = _make_tail_ccfg(n_mtp=1, h=16, t=2, cp=1, comm_fsdp=1.0,
+                               fsdp_all_gather_buffer=1.0, bytes_grad=4)
+        ctx = _make_tail_ctx(num_p_result=100.0)
+        ctx.eval.dyn.comm.fsdp_grad = MagicMock(return_value=5.0)
+
+        result = EvalTail.fsdp_grad_comm_output(ccfg, ctx)
+        out_single = EvalTailSingle.fsdp_grad_comm_out_single(ccfg, ctx)
+        mtp = EvalMTP.fsdp_grad_comm_mtp(ccfg, ctx)
+        self.assertAlmostEqual(result, out_single + mtp, places=4)
+
+
 class TestDpCommNonExp(unittest.TestCase):
     """Test dp_comm_non_exp ZeRO level branching."""
 
@@ -144,11 +711,13 @@ class TestDpCommNonExp(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=4)
 
     def test_zero_level3(self):
-        """CM-D02: ZeRO level 3 non-exp comm = non_exp / t."""
+        """CM-D02: ZeRO level 3 non-exp comm = grad_rs + param_ag(fwd+bwd)."""
+        if False: """CM-D02: ZeRO level 3 non-exp comm = non_exp / t."""
         ccfg = _make_ccfg(tp=2, cp=1, comm_d_non_exp=3)
         ctx = _make_ctx(num_p_result=(150.0, 400.0, 200.0))
         result = EvalLayerComm.dp_comm_non_exp(ccfg, ctx)
-        expected = 150.0 / 2
+        if False: expected = 150.0 / 2
+        expected = 150.0 / (1 * 2) + 150.0 / 2 + 150.0 / 2
         self.assertAlmostEqual(result, expected, places=4)
 
 
@@ -166,12 +735,14 @@ class TestDpCommExp(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=4)
 
     def test_zero_level3_with_tuple(self):
-        """CM-D04: ZeRO level 3 exp comm = exp_param / (cp*t_exp*ep)."""
+        """CM-D04: ZeRO level 3 exp comm = grad_rs + param_ag(fwd+bwd)."""
+        if False: """CM-D04: ZeRO level 3 exp comm = exp_param / (cp*t_exp*ep)."""
         ccfg = _make_ccfg(ep=4, tp=1, t_exp=1, cp=1, comm_d_exp=3)
         ctx = _make_ctx(num_p_result=(150.0, 400.0, 200.0))
         result = EvalLayerComm.dp_comm_exp(ccfg, ctx)
         exp_param_size = 400.0 + 200.0
-        expected = exp_param_size / (1 * 1 * 4)
+        if False: expected = exp_param_size / (1 * 1 * 4)
+        expected = exp_param_size / (1 * 1 * 4) + exp_param_size / max(4, 1) + exp_param_size / max(4, 1)
         self.assertAlmostEqual(result, expected, places=4)
 
 

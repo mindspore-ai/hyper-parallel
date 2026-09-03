@@ -491,6 +491,7 @@ class CostModelParserHyperV2(_CostModelParser):
             self._get_cfg_attr(accel, "sequence_parallel", False)
             or self._get_cfg_attr(accel, "use_seq_parallel", False)
         )
+        self.ccfg.use_seq_parallel = use_sp
         self.ccfg.sp = self.ccfg.t if use_sp else 1
         self.ccfg.pp_sched = str(
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
@@ -652,6 +653,9 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.bytes_grad = 4
         self.ccfg.bytes_os = 4
         self.ccfg.bytes_norm = 4
+        self.ccfg.framework_overhead = getattr(
+            self.ccfg, "framework_overhead", 0
+        )
 
     def _init_moe_strategy(self):
         """Initialize MoE strategy variables via base helper.

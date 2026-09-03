@@ -182,7 +182,7 @@ class TestSetNodeEvalComputeFun(unittest.TestCase):
             stat=NodeStatEval(p=lambda: 0, os=lambda: 0, grad=lambda: 0),
             dyn=NodeDynEval(
                 activation=lambda: 0,
-                comm=NodeCommEval(dp=lambda: 0, tp=lambda: 0, cp=lambda: 0, ep=lambda: 0),
+                comm=NodeCommEval(dp=lambda: 0, tp=lambda: 0, cp=lambda: 0, ep=lambda: 0, fsdp=lambda: 0, hsdp=lambda: 0),
                 compute=existing_compute,
             ),
         )
@@ -202,7 +202,7 @@ class TestSetNodeEvalComputeFun(unittest.TestCase):
             stat=NodeStatEval(p=lambda: 0, os=lambda: 0, grad=lambda: 0),
             dyn=NodeDynEval(
                 activation=lambda: 0,
-                comm=NodeCommEval(dp=lambda: 0, tp=lambda: 0, cp=lambda: 0, ep=lambda: 0),
+                comm=NodeCommEval(dp=lambda: 0, tp=lambda: 0, cp=lambda: 0, ep=lambda: 0, fsdp=lambda: 0, hsdp=lambda: 0),
                 compute=None,
             ),
         )

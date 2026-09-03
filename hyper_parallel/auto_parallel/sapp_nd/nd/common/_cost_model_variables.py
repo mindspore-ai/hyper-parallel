@@ -53,9 +53,11 @@ class _CostModVar:
     cp: float = 0
     ep: float = 1
     sp: float = 0
+    use_seq_parallel: bool = True
     vp: float = 0
     os_max_shard: float = 0
     op_weight_shard: float = 0
+    fsdp: bool = False
     offset: Union[list, int] = None
     full_rec: Union[list, bool] = None
     sel_rec: Union[list, bool] = None
@@ -112,12 +114,29 @@ class _CostModVar:
     shard_grad_exp: float = 0
     shard_grad_exp_partial: float = 0
 
+    # FSDP
+    shard_p_fsdp_non_exp: float = 0
+    shard_os_fsdp_non_exp: float = 0
+    shard_grad_fsdp_non_exp: float = 0
+    shard_p_fsdp_exp: float = 0
+    shard_os_fsdp_exp: float = 0
+    shard_grad_fsdp_exp: float = 0
+    fsdp_all_gather_buffer: float = 0
+
+    # HSDP
+    d_shard: float = 1
+    d_replicate: float = 1
+    comm_hsdp: float = 0
+
     # comm flag
     comm_d_non_exp: float = 0
     comm_d_exp: float = 0
     comm_t: float = 0
     comm_ep: float = 0
     comm_cp: float = 0
+    comm_fsdp: float = 0
+    comm_dp_overlap: float = 0.9
+    comm_tp_overlap: float = 0.5
     # Transitional comm overlap correction (see comm_time.py).
     # Fraction of comm volume hidden behind compute, applied as
     #   comm[dim] *= (1 - overlap_dim)
@@ -155,6 +174,7 @@ class _CostModVar:
     shard_output_activ: float = 0
     shard_recompute_input: float = 0
     is_shard_mtp_param: bool = True
+    recompute_slice_activation: bool = False
 
     # bytes
     bytes_p: float = 0
@@ -163,6 +183,20 @@ class _CostModVar:
     bytes_grad: float = 0
     bytes_os: float = 0
     bytes_norm: float = 0
+
+    # framework overhead
+    framework_overhead: float = 0
+
+    # FSDP/HSDP framework overhead adjustment coefficients
+    fw_oh_hsdp_shard_coeff: float = 0.03
+    fw_oh_fsdp_shard_coeff: float = 0.01
+    fw_oh_replicate_discount: float = 0.025
+    fw_oh_shard_replicate_interact: float = 0.03
+    fw_oh_tp_hsdp_threshold: int = 8
+    fw_oh_tp_hsdp_extra_ratio: float = 0.28
+
+    # Safety buffer for memory estimation (GB)
+    safety_buffer_gb: float = 1
 
     def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:
         """Initialise from a config path and optional hooks/framework/source."""

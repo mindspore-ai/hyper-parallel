@@ -105,6 +105,26 @@ class _CostModelParser(ABC):
         hff = multiple_of * ((hff + multiple_of - 1) // multiple_of)
         return hff
 
+    def config_fsdp_shard(self, ccfg: Any) -> None:
+        """Configure FSDP/HSDP shard variables."""
+        d_shard = ccfg.d_shard_or_d
+        d_replicate = ccfg.d // d_shard
+        ccfg.shard_p_fsdp_non_exp = d_shard * ccfg.cp * ccfg.t
+        ccfg.shard_os_fsdp_non_exp = d_shard * ccfg.cp * ccfg.t
+        ccfg.shard_grad_fsdp_non_exp = d_shard * ccfg.cp * ccfg.t
+        ccfg.shard_p_fsdp_exp = d_shard * ccfg.cp * ccfg.t
+        ccfg.shard_os_fsdp_exp = d_shard * ccfg.cp * ccfg.t
+        ccfg.shard_grad_fsdp_exp = d_shard * ccfg.cp * ccfg.t
+        ccfg.fsdp_all_gather_buffer = 1.0
+        ccfg.has_grad_shard = True
+        ccfg.shard_p_os_non_exp_partial = ccfg.shard_p_fsdp_non_exp
+        ccfg.shard_p_os_non_exp = ccfg.shard_p_fsdp_non_exp
+        ccfg.shard_grad_non_exp = ccfg.shard_grad_fsdp_non_exp
+        ccfg.shard_p_os_exp_partial = ccfg.shard_p_fsdp_exp
+        ccfg.shard_p_os_exp = ccfg.shard_p_fsdp_exp
+        ccfg.shard_grad_exp = ccfg.shard_grad_fsdp_exp
+        ccfg.d_replicate = d_replicate
+
     def config_comm_flag(self, ccfg):
         """comm flag variables"""
         ccfg.comm_d_non_exp = (
@@ -122,8 +142,18 @@ class _CostModelParser(ABC):
             ccfg.ep > 1 or ccfg.n_exp > 1
         )  # expert parallel comm factor
         ccfg.comm_cp = float(ccfg.cp > 1)  # context parallel comm factor
+        ccfg.comm_fsdp = float(ccfg.fsdp and ccfg.d > 1)
+        is_hsdp = ccfg.fsdp and getattr(ccfg, "d_shard", 0) > 1 and ccfg.d_shard < ccfg.d
+        ccfg.comm_hsdp = float(is_hsdp)
         ccfg.comm_dp_overlap = 0.9  # transitional overlap, see _cost_model_variables.py
         ccfg.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
+
+    @staticmethod
+    def is_fsdp(ccfg: Any) -> bool:
+        if not (ccfg.has_op and ccfg.has_grad_shard):
+            return False
+        op_weight_shard = getattr(ccfg, "op_weight_shard", 0)
+        return op_weight_shard == ccfg.d * ccfg.t and op_weight_shard > 0
 
     def config_dp_tp_exp(self, ccfg):
         """MoE strategy variables"""
@@ -148,4 +178,5 @@ class _CostModelParser(ABC):
                 f"MoE parsing error: d_exp({ccfg.d_exp})/t_exp({ccfg.t_exp})/"
                 f"hff_exp({ccfg.hff_exp})/n_exp({ccfg.n_exp})/"
                 f"DP = {ccfg.d}, TP = {ccfg.t}, EP = {ccfg.ep}/"
+                f"DP = {ccfg.d}, TP(MP) = {ccfg.t}, EP = {ccfg.ep}/"
             )

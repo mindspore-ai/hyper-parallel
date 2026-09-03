@@ -39,13 +39,25 @@ class EvalLayerComm:
         """DP/OP comm for non-expert parameters"""
         non_exp, _, _ = ctx.eval.num_p(ccfg, ctx)
         dp_comm_non_exp = 0
+        # Level 0-1-2 :
+        # Either GradAR
+        # Or GradRS + ParamAG
+        # Level 3
+        # GradRS + FWD ParamAG + BWD ParamAG
+        # When FSDP is active, all-gather is accounted for by fsdp_comm_layer;
+        # dp_comm only counts the gradient reduce-scatter.
+
         # Non expert ZeRO LvL 2
         if ccfg.comm_d_non_exp == 2:
             dp_comm_non_exp += non_exp / (ccfg.cp * ccfg.t)
             dp_comm_non_exp += non_exp / ccfg.t
         # Non expert ZeRO LvL 3
+        # Non expert ZeRO LvL 3 / FSDP
         if ccfg.comm_d_non_exp == 3:
-            dp_comm_non_exp += non_exp / ccfg.t
+            dp_comm_non_exp += non_exp / (ccfg.cp * ccfg.t)
+            if not ccfg.fsdp:
+                dp_comm_non_exp += non_exp / ccfg.t
+                dp_comm_non_exp += non_exp / ccfg.t
         return dp_comm_non_exp
 
     @staticmethod
@@ -56,13 +68,25 @@ class EvalLayerComm:
         if exp_param_size == 0:
             return 0
         dp_comm_exp = 0
+        # Level 0-1-2 :
+        # Either GradAR
+        # Or GradRS + ParamAG
+        # Level 3
+        # GradRS + FWD ParamAG + BWD ParamAG
+        # When FSDP is active, all-gather is accounted for by fsdp_comm_layer;
+        # dp_comm only counts the gradient reduce-scatter.
+
         # Expert ZeRO LvL 2
         if ccfg.comm_d_exp == 2:
             dp_comm_exp += exp_param_size / (ccfg.cp * ccfg.t_exp * ccfg.ep)
             dp_comm_exp += exp_param_size / max(ccfg.ep, ccfg.t_exp)
         # Expert ZeRO LvL 3
+        # Expert ZeRO LvL 3 / FSDP
         if ccfg.comm_d_exp == 3:
             dp_comm_exp += exp_param_size / (ccfg.cp * ccfg.t_exp * ccfg.ep)
+            if not ccfg.fsdp:
+                dp_comm_exp += exp_param_size / max(ccfg.ep, ccfg.t_exp)
+                dp_comm_exp += exp_param_size / max(ccfg.ep, ccfg.t_exp)
         return dp_comm_exp
 
     @staticmethod
@@ -184,11 +208,21 @@ class EvalLayerComm:
 
         Uses (ep-1)/ep correction: only (ep-1)/ep fraction of local tokens
         actually cross rank boundaries in an all-to-all dispatch/combine pair.
+        When EP>1: uses (ep-1)/ep correction for cross-rank all-to-all.
+        When EP=1 & n_exp>1: expert dispatch/combine still occurs (within
+        the TP group for MoE routing). Volume = 2 * n_chosen_exp * b * s * h
+        per layer, routed through TP bandwidth.
         Result is in bytes (like TP activation comm), unlike CP/DP which are
         in element counts (parameter comm).
         """
         del ctx
         if ccfg.ep <= 1 or ccfg.comm_ep == 0:
+            return 0
+        if ccfg.comm_ep == 0:
+            return 0
+        if ccfg.n_exp <= 1:
+            return 0
+        if ccfg.ep <= 1:
             return 0
         t_local = mb * ccfg.n_chosen_exp * ccfg.s * ccfg.b / ccfg.cp
         t_cross = t_local * (ccfg.ep - 1) / ccfg.ep
@@ -206,6 +240,8 @@ class EvalLayerComm:
         Falls back to balanced when tokens_per_expert is empty
         or n_exp not divisible by ep.
 
+        When EP=1 & n_exp>1: falls back to balanced dispatch/combine volume.
+
         tokens_per_expert: global per-expert token count per microbatch
             (all EP ranks combined, before all-to-all dispatch; None = balanced).
             Under uniform distribution, each rank's share equals
@@ -215,6 +251,12 @@ class EvalLayerComm:
         in element counts (parameter comm).
         """
         if ccfg.ep <= 1 or ccfg.comm_ep == 0:
+            return 0
+        if ccfg.comm_ep == 0:
+            return 0
+        if ccfg.n_exp <= 1:
+            return 0
+        if ccfg.ep <= 1:
             return 0
         tokens = ccfg.tokens_per_expert
         if not tokens:
@@ -243,6 +285,12 @@ class EvalLayerComm:
     def ep_comm_layer(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
         """EP comm dispatcher: balanced or imbalanced based on tokens_per_expert."""
         if ccfg.ep <= 1 or ccfg.comm_ep == 0:
+            return 0
+        if ccfg.comm_ep == 0:
+            return 0
+        if ccfg.n_exp <= 1:
+            return 0
+        if ccfg.ep <= 1:
             return 0
         if ccfg.tokens_per_expert is not None:
             return EvalLayerComm.ep_comm_layer_imbalanced(ccfg, ctx, mb)
@@ -295,3 +343,124 @@ class EvalLayerComm:
             extra_chunks = 2 * intra_ranks - 1
 
         return extra_chunks * chunk
+
+    @staticmethod
+    def fsdp_comm_layer(ccfg: CostModelConfig, ctx: Context) -> float:
+        """FSDP/HSDP communication volume estimation."""
+        non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
+        exp = routed + shared
+        d_shard = ccfg.d_shard_or_d
+
+        non_exp_comm = (
+            ccfg.comm_fsdp
+            * non_exp / (d_shard * ccfg.cp * ccfg.t)
+            * ccfg.bytes_compute
+            * 2
+        )
+        exp_comm = (
+            ccfg.comm_fsdp
+            * exp / (d_shard * ccfg.ep * ccfg.cp * ccfg.t_exp)
+            * ccfg.bytes_compute
+            * 2
+            if ccfg.n_exp > 1
+            else 0
+        )
+
+        if getattr(ccfg, "comm_hsdp", 0) > 0:
+            d_replicate = ccfg.d // d_shard
+            sharded_non_exp = non_exp / (d_shard * ccfg.cp * ccfg.t)
+            sharded_exp = exp / (d_shard * ccfg.cp * ccfg.t_exp) if ccfg.n_exp > 1 else 0
+            hsdp_comm = ccfg.comm_hsdp / d_replicate * (sharded_non_exp + sharded_exp) * ccfg.bytes_compute
+            non_exp_comm += hsdp_comm
+
+        return non_exp_comm + exp_comm
+
+    @staticmethod
+    def fsdp_buffer_layer(ccfg: CostModelConfig, ctx: Context) -> float:
+        """FSDP/HSDP all-gather buffer memory (bytes)."""
+        non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
+        non_exp_buf = (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * non_exp * ccfg.bytes_p / (ccfg.cp * ccfg.t)
+        )
+        exp_buf = (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * (routed + shared) * ccfg.bytes_p
+            / (ccfg.ep * ccfg.cp * ccfg.t_exp)
+            if ccfg.n_exp > 1
+            else 0
+        )
+        return non_exp_buf + exp_buf
+
+    @staticmethod
+    def fsdp_buffer_comm(ccfg: CostModelConfig, ctx: Context) -> float:
+        """FSDP/HSDP all-gather buffer size (bytes)."""
+        non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
+        non_exp_buf = (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * non_exp * ccfg.bytes_compute / (ccfg.cp * ccfg.t)
+        )
+        exp_buf = (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * (routed + shared) * ccfg.bytes_compute
+            / (ccfg.ep * ccfg.cp * ccfg.t_exp)
+            if ccfg.n_exp > 1
+            else 0
+        )
+        return non_exp_buf + exp_buf
+
+    @staticmethod
+    def fsdp_grad_buffer_comm(ccfg: CostModelConfig, ctx: Context) -> float:
+        """FSDP/HSDP gradient reduce-scatter buffer size (bytes)."""
+        non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
+        non_exp_buf = (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * non_exp * ccfg.bytes_grad / (ccfg.cp * ccfg.t)
+        )
+        exp_buf = (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * (routed + shared) * ccfg.bytes_grad
+            / (ccfg.ep * ccfg.cp * ccfg.t_exp)
+            if ccfg.n_exp > 1
+            else 0
+        )
+        return non_exp_buf + exp_buf
+
+    @staticmethod
+    def hsdp_inter_buffer_comm(ccfg: CostModelConfig, ctx: Context) -> float:
+        """HSDP inter-node reduce-scatter buffer size (bytes)."""
+        if getattr(ccfg, "comm_hsdp", 0) <= 0:
+            return 0.0
+        non_exp, routed, shared = ctx.eval.num_p(ccfg, ctx)
+        exp = routed + shared
+        d_shard = ccfg.d_shard_or_d
+        sharded_non_exp = non_exp / (d_shard * ccfg.cp * ccfg.t)
+        sharded_exp = (
+            exp / (d_shard * ccfg.cp * ccfg.t_exp)
+            if ccfg.n_exp > 1
+            else 0
+        )
+        return (
+            ccfg.comm_hsdp
+            * (sharded_non_exp + sharded_exp)
+            * ccfg.bytes_compute
+        )
+
+    @staticmethod
+    def dp_buffer_comm(ccfg: CostModelConfig, ctx: Context) -> float:
+        del ccfg, ctx
+        return 0.0
+
+    @staticmethod
+    def tp_buffer_comm(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
+        """Peak HBM buffer for TP all-gather (bytes)."""
+        if ccfg.t <= 1 or ccfg.comm_t == 0:
+            return 0
+        rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
+        rec_coeff = EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather)
+
+        attn_buf = ccfg.s * ccfg.b * ccfg.h * ccfg.bytes_compute
+        ffn_buf = ccfg.s * ccfg.b * 2 * ccfg.hff * ccfg.bytes_compute
+
+        peak_buf = max(attn_buf, ffn_buf)
+        return rec_coeff * ccfg.comm_t * mb * peak_buf / ccfg.cp

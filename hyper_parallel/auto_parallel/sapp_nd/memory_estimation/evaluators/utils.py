@@ -77,7 +77,10 @@ class EvalUtils:
     def __log_ast_mem(ctx, cat, mem):
         """Save AST memory evaluation result in the current context."""
         ctx.save2log(cat, mem)
-        ctx.accu_mem_type[cat] += mem
+        if cat is not None and cat.name in ("AG_COMM", "A2A_COMM"):
+            ctx.accu_mem_type[cat] = max(ctx.accu_mem_type[cat], mem)
+        else:
+            ctx.accu_mem_type[cat] += mem
 
     @classmethod
     def __eval_ast_name(cls, n: ast.Name, depth: int, wait: bool, **kwargs):

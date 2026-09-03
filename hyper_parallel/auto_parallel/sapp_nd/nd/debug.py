@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Debugging utilities"""
+# pylint: disable=W0105
 
 import os
 import colorsys
@@ -42,6 +43,7 @@ class PerfParts(Enum):
     MP_COMM = auto()
     EP_COMM = auto()
     CP_COMM = auto()
+    FSDP_COMM = auto()
     PP_COMM = auto()
     BUBBLE = auto()
     TOTAL = auto()
@@ -63,10 +65,13 @@ class PerfParts(Enum):
             name = "DP"
         elif self == self.MP_COMM:
             name = "MP"
+            name = "TP(MP)"
         elif self == self.EP_COMM:
             name = "EP"
         elif self == self.CP_COMM:
             name = "CP"
+        elif self == self.FSDP_COMM:
+            name = "FSDP"
         elif self == self.PP_COMM:
             name = "P2P"
         elif self == self.BUBBLE:
@@ -84,6 +89,7 @@ class RealParts(Enum):
     MP_WAIT = auto()
     EP_WAIT = auto()
     CP_WAIT = auto()
+    FSDP_WAIT = auto()
     PP_WAIT = auto()
     IDLE = auto()
     TOTAL = auto()
@@ -189,6 +195,7 @@ def dim_color(dim, default="black"):
         Dim.TP: "red",
         Dim.EP: "blue",
         Dim.CP: "teal",
+        Dim.FSDP: "darkorange",
         Dim.PP: "green",
         Dim.VPP: "green",
         Dim.MBN: "green",
@@ -214,6 +221,7 @@ def gen_colors(categories):
         str(PerfParts.MP_COMM): pastel(dim_color(Dim.TP), -0.1),
         str(PerfParts.EP_COMM): pastel(dim_color(Dim.EP)),
         str(PerfParts.CP_COMM): pastel(dim_color(Dim.CP)),
+        str(PerfParts.FSDP_COMM): pastel(dim_color(Dim.FSDP)),
         str(PerfParts.PP_COMM): pastel(dim_color(Dim.PP)),
         str(PerfParts.BUBBLE): pastel(dim_color(Dim.PP), -0.15),
         "IDLE": idle_color,
@@ -328,6 +336,7 @@ class Plot:
         **kwargs,
     ):
         """Parse test data for plot"""
+        """Parse configuration data for plotting."""
         real_data = kwargs.get("real_data", None)
         plot_idle = kwargs.get("plot_idle", False)
         min_e = configs_estimated[0][2]
@@ -365,6 +374,7 @@ def plot_nd(
     configs_estimated, output_path, debug_parts, title=None, max_num=None
 ):
     """Plot estimation"""
+    """Plot estimated performance for different configurations."""
     plot = Plot(
         title, configs_estimated[0][0].keys(), debug_parts, top=max_num
     )
@@ -387,6 +397,7 @@ def plot_vs_real(
     configs_estimated, csv_f, output_path, debug_parts, title=None
 ):
     """Plot estimation vs real global time"""
+    """Plot estimated vs real performance."""
     plot = Plot(title, configs_estimated[0][0].keys(), debug_parts)
     plot.parse_data(configs_estimated)
 
@@ -565,6 +576,7 @@ def estimation_in_real_parts(
     estimations_in_real_components, estimations, score
 ):
     """Transform the estimation components into the RealParts components for comparison with real time"""
+    """Decompose estimation into real performance parts."""
     estimations_in_real_components[RealParts.TOTAL].append(score)
     estimations_in_real_components[RealParts.COMP].append(
         estimations[PerfParts.FW_COMPUTE.value - 1]
@@ -579,6 +591,9 @@ def estimation_in_real_parts(
     )
     estimations_in_real_components[RealParts.CP_WAIT].append(
         estimations[PerfParts.CP_COMM.value - 1]
+    )
+    estimations_in_real_components[RealParts.FSDP_WAIT].append(
+        estimations[PerfParts.FSDP_COMM.value - 1]
     )
     estimations_in_real_components[RealParts.EP_WAIT].append(
         estimations[PerfParts.EP_COMM.value - 1]
@@ -606,6 +621,10 @@ def real_in_parts(parts, real, time):
     op = "op_wait"
     if op in real.keys():
         parts[RealParts.DP_WAIT][-1] += real["op_wait"]
+
+    tp = "tp_wait"
+    if tp in real.keys():
+        parts[RealParts.MP_WAIT][-1] += real["tp_wait"]
 
     sp = "sp_wait"
     if sp in real.keys():

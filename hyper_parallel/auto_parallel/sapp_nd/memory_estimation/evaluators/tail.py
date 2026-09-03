@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Tail submodule"""
+# pylint: disable=W0125
 from __future__ import annotations
 from typing import TYPE_CHECKING
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
@@ -129,6 +130,94 @@ class EvalMTP:
         )
         return mtp_dp_comm_size
 
+    @staticmethod
+    def fsdp_comm_mtp(ccfg: CostModelConfig, ctx: Context) -> float:
+        """FSDP/HSDP all-gather buffer size for MTP (bytes)."""
+        if not ccfg.n_mtp:
+            return 0
+        mtp_fsdp_comm = 0.0
+        param_size = EvalMTP.num_params_mtp(ccfg, ctx)
+        mtp_fsdp_comm += (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * ccfg.n_mtp * param_size * ccfg.bytes_compute / (ccfg.cp * ccfg.t)
+        )
+        ctx.current_node = LayerType.EMBEDDING_LAYER
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        mtp_fsdp_comm += (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * ccfg.n_mtp * param_size * ccfg.bytes_compute / (ccfg.cp * ccfg.t)
+        )
+        mtp_fsdp_comm += ccfg.n_mtp * ctx.eval.dyn.comm.fsdp(ccfg, ctx)
+        ctx.current_node = LayerType.OUTPUT_LAYER
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        mtp_fsdp_comm += (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * ccfg.n_mtp * param_size * ccfg.bytes_compute / (ccfg.cp * ccfg.t)
+        )
+        mtp_fsdp_comm += ccfg.n_mtp * EvalTailSingle.fsdp_comm_out_single(
+            ccfg, ctx
+        )
+        return mtp_fsdp_comm
+
+    @staticmethod
+    def fsdp_grad_comm_mtp(ccfg: CostModelConfig, ctx: Context) -> float:
+        """FSDP/HSDP gradient reduce-scatter buffer size for MTP (bytes)."""
+        if not ccfg.n_mtp:
+            return 0
+        mtp_fsdp_grad_comm = 0.0
+        param_size = EvalMTP.num_params_mtp(ccfg, ctx)
+        mtp_fsdp_grad_comm += (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * ccfg.n_mtp * param_size * ccfg.bytes_grad / (ccfg.cp * ccfg.t)
+        )
+        ctx.current_node = LayerType.EMBEDDING_LAYER
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        mtp_fsdp_grad_comm += (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * ccfg.n_mtp * param_size * ccfg.bytes_grad / (ccfg.cp * ccfg.t)
+        )
+        mtp_fsdp_grad_comm += ccfg.n_mtp * ctx.eval.dyn.comm.fsdp_grad(ccfg, ctx)
+        ctx.current_node = LayerType.OUTPUT_LAYER
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        mtp_fsdp_grad_comm += (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * ccfg.n_mtp * param_size * ccfg.bytes_grad / (ccfg.cp * ccfg.t)
+        )
+        mtp_fsdp_grad_comm += ccfg.n_mtp * EvalTailSingle.fsdp_grad_comm_out_single(
+            ccfg, ctx
+        )
+        return mtp_fsdp_grad_comm
+
+    @staticmethod
+    def hsdp_comm_mtp(ccfg: CostModelConfig, ctx: Context) -> float:
+        """HSDP inter-node reduce-scatter buffer size for MTP (bytes)."""
+        if not ccfg.n_mtp or getattr(ccfg, "comm_hsdp", 0) <= 0:
+            return 0
+        d_shard = ccfg.d_shard_or_d
+        d_replicate = ccfg.d // d_shard
+        mtp_hsdp_comm = 0.0
+        param_size = EvalMTP.num_params_mtp(ccfg, ctx)
+        sharded_size = param_size / (d_shard * ccfg.cp * ccfg.t)
+        mtp_hsdp_comm += (
+            ccfg.comm_hsdp * ccfg.n_mtp * sharded_size
+            * ccfg.bytes_compute / d_replicate
+        )
+        ctx.current_node = LayerType.EMBEDDING_LAYER
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        sharded_size = param_size / (d_shard * ccfg.cp * ccfg.t)
+        mtp_hsdp_comm += (
+            ccfg.comm_hsdp * ccfg.n_mtp * sharded_size
+            * ccfg.bytes_compute / d_replicate
+        )
+        ctx.current_node = LayerType.OUTPUT_LAYER
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        sharded_size = param_size / (d_shard * ccfg.cp * ccfg.t)
+        mtp_hsdp_comm += (
+            ccfg.comm_hsdp * ccfg.n_mtp * sharded_size
+            * ccfg.bytes_compute / d_replicate
+        )
+        return mtp_hsdp_comm
+
 
 class EvalTailSingle:
     """Single tail layer formulas class"""
@@ -138,6 +227,7 @@ class EvalTailSingle:
         """static mem for model param (lmhead)"""
         param_size = ctx.eval.num_p(ccfg, ctx)
         b_p = ccfg.bytes_p
+        b_p = ccfg.bytes_compute if getattr(ccfg, "fsdp", False) else ccfg.bytes_p
         b_p /= ccfg.shard_p_os_non_exp_partial
         return param_size * b_p
 
@@ -156,6 +246,7 @@ class EvalTailSingle:
         """static mem for gradient (lmhead)"""
         param_size = ctx.eval.num_p(ccfg, ctx)
         b_grad = ccfg.bytes_grad
+        b_grad = ccfg.bytes_compute if getattr(ccfg, "fsdp", False) else ccfg.bytes_grad
         b_grad /= ccfg.shard_grad_non_exp
         return param_size * b_grad
 
@@ -172,11 +263,40 @@ class EvalTailSingle:
     @staticmethod
     def comm_out_single(ccfg: CostModelConfig, ctx: Context) -> float:
         """communicaiton mem (lmhead)"""
-        return (
+        if False: return (
             ccfg.comm_d_non_exp
             * ctx.eval.num_p(ccfg, ctx)
             / (ccfg.t * ccfg.cp)
         )
+        del ccfg, ctx
+        return 0.0
+
+    @staticmethod
+    def fsdp_comm_out_single(ccfg: CostModelConfig, ctx: Context) -> float:
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        non_exp_buf = (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * param_size * ccfg.bytes_compute / (ccfg.cp * ccfg.t)
+        )
+        return non_exp_buf
+
+    @staticmethod
+    def fsdp_grad_comm_out_single(ccfg: CostModelConfig, ctx: Context) -> float:
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        non_exp_buf = (
+            ccfg.comm_fsdp * ccfg.fsdp_all_gather_buffer
+            * param_size * ccfg.bytes_grad / (ccfg.cp * ccfg.t)
+        )
+        return non_exp_buf
+
+    @staticmethod
+    def hsdp_comm_out_single(ccfg: CostModelConfig, ctx: Context) -> float:
+        if getattr(ccfg, "comm_hsdp", 0) <= 0:
+            return 0.0
+        param_size = ctx.eval.num_p(ccfg, ctx)
+        d_shard = ccfg.d_shard_or_d
+        sharded_size = param_size / (d_shard * ccfg.cp * ccfg.t)
+        return ccfg.comm_hsdp * sharded_size * ccfg.bytes_compute
 
 
 class EvalTail:
@@ -234,5 +354,32 @@ class EvalTail:
             [
                 EvalTailSingle.comm_out_single(ccfg, ctx),
                 EvalMTP.comm_mtp(ccfg, ctx),
+            ]
+        )
+
+    @staticmethod
+    def fsdp_comm_output(ccfg: CostModelConfig, ctx: Context) -> float:
+        return sum(
+            [
+                EvalTailSingle.fsdp_comm_out_single(ccfg, ctx),
+                EvalMTP.fsdp_comm_mtp(ccfg, ctx),
+            ]
+        )
+
+    @staticmethod
+    def hsdp_comm_output(ccfg: CostModelConfig, ctx: Context) -> float:
+        return sum(
+            [
+                EvalTailSingle.hsdp_comm_out_single(ccfg, ctx),
+                EvalMTP.hsdp_comm_mtp(ccfg, ctx),
+            ]
+        )
+
+    @staticmethod
+    def fsdp_grad_comm_output(ccfg: CostModelConfig, ctx: Context) -> float:
+        return sum(
+            [
+                EvalTailSingle.fsdp_grad_comm_out_single(ccfg, ctx),
+                EvalMTP.fsdp_grad_comm_mtp(ccfg, ctx),
             ]
         )

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """parse config for cost model"""
+# pylint: disable=W0125,W1203
 import inspect
 from typing import Any
 import re
@@ -142,6 +143,10 @@ class CostModelConfig(PartitionGenerator):
         """Restore instance state after multiprocessing deserialization."""
         self.__dict__.update(state)
 
+    @property
+    def d_shard_or_d(self) -> int:
+        return self.d_shard if getattr(self, "d_shard", 0) > 0 else self.d
+
     def fp_bytes(self, precision: Any) -> int:
         """Return bytes size for datatype"""
         if precision and isinstance(precision, str):
@@ -188,6 +193,10 @@ class CostModelConfig(PartitionGenerator):
             logger.info("%s Parallelism used :", self.model_name)
             logger.info(
                 "DP %s, TP %s, PP %s, EP %s, CP %s, VPP %s",
+                self.d, self.t, self.p, self.ep, self.cp, self.vp,
+            )
+            logger.info(
+                "DP %s, TP(MP) %s, PP %s, EP %s, CP %s, VPP %s",
                 self.d,
                 self.t,
                 self.p,
@@ -265,7 +274,89 @@ class CostModelConfig(PartitionGenerator):
             f"{self.model_name}:  model_name is required (multimodal)"
         )
 
-    def set_strategy(self, **kwargs: Any) -> None:
+    def __apply_basic_strategy(self, target_ccfg, dp, tp, ep, etp, cp, pp,
+                                vpp, m, b, op):
+        """Apply the basic integer strategy attributes to the target config."""
+        for attr, value in (
+            ("d", dp),
+            ("t", tp),
+            ("ep", ep),
+            ("etp", etp),
+            ("cp", cp),
+            ("vp", vpp),
+            ("p", pp),
+            ("m", m),
+            ("b", b),
+        ):
+            self.__maybe_set_int(target_ccfg, attr, value)
+        if target_ccfg.use_seq_parallel:
+            target_ccfg.sp = target_ccfg.t if target_ccfg.t > 1 else 1
+        else:
+            target_ccfg.sp = 1
+        if target_ccfg.recompute_slice_activation and tp is not None:
+            target_ccfg.shard_recompute_input = target_ccfg.t
+            target_ccfg.shard_output_activ = target_ccfg.t
+        if op and isinstance(op, int):
+            target_ccfg.os_max_shard = op
+            # Sync has_op with os_max_shard: op<=1 means no optimizer sharding
+            target_ccfg.has_op = op > 1
+        target_ccfg.gbs = target_ccfg.b * target_ccfg.d * target_ccfg.m
+
+    def __apply_fsdp_strategy(self, target_ccfg, fsdp_kw, op):
+        if fsdp_kw is True:
+            target_ccfg.fsdp = True
+            target_ccfg.has_op = True
+        elif fsdp_kw is False:
+            target_ccfg.fsdp = False
+            if op and isinstance(op, int) and op <= 1:
+                target_ccfg.has_op = False
+            elif not op:
+                target_ccfg.has_op = False
+
+    def __apply_d_shard_strategy(self, target_ccfg, d_shard_kw):
+        if d_shard_kw is not None and isinstance(d_shard_kw, int) and d_shard_kw > 1:
+            target_ccfg.d_shard = d_shard_kw
+        else:
+            target_ccfg.d_shard = target_ccfg.d if target_ccfg.fsdp else 1
+
+    def __apply_parser_config(self, target_ccfg):
+        """Run the parser configuration hooks for sharding and comm flags."""
+        if hasattr(target_ccfg.parser, "config_shard_emb"):
+            target_ccfg.parser.config_shard_emb()
+        if hasattr(target_ccfg.parser, "config_shard_recompute"):
+            target_ccfg.parser.config_shard_recompute()
+        target_ccfg.parser.config_dp_tp_exp(target_ccfg)
+        if target_ccfg.fsdp:
+            target_ccfg.parser.config_fsdp_shard(target_ccfg)
+        else:
+            target_ccfg.parser.config_optimizer_shard(target_ccfg)
+            target_ccfg.shard_p_fsdp_non_exp = 0
+            target_ccfg.shard_os_fsdp_non_exp = 0
+            target_ccfg.shard_grad_fsdp_non_exp = 0
+            target_ccfg.shard_p_fsdp_exp = 0
+            target_ccfg.shard_os_fsdp_exp = 0
+            target_ccfg.shard_grad_fsdp_exp = 0
+            target_ccfg.fsdp_all_gather_buffer = 0
+        target_ccfg.parser.config_comm_flag(target_ccfg)
+
+    def __apply_recompute_offset(self, target_ccfg, off, fr, sr):
+        if fr is not None:
+            target_ccfg.full_rec = fr
+        if sr is not None:
+            target_ccfg.sel_rec = sr
+        if isinstance(off, (int, list)):
+            target_ccfg.offset = off
+        if not target_ccfg.is_consistent_pp_config():
+            raise AttributeError(
+                f"{target_ccfg.model_name}: "
+                "Inconsistent pipeline parallel variables "
+                f"pp {target_ccfg.p} vpp {target_ccfg.vp} "
+                f"offset {target_ccfg.offset} "
+                f"full_rec {target_ccfg.full_rec} "
+                f"sel_rec {target_ccfg.sel_rec}"
+            )
+
+    def set_strategy_legacy(self, **kwargs):
         """overwrite parallelism"""
         model_name = kwargs.get("model_name", None)
         if self.multimodal and model_name is None:
@@ -297,8 +388,8 @@ class CostModelConfig(PartitionGenerator):
             ("ep", ep),
             ("etp", etp),
             ("cp", cp),
-            ("vp", vpp),
             ("p", pp),
+            ("vp", vpp),
             ("m", m),
             ("b", b),
         ):
@@ -332,17 +423,87 @@ class CostModelConfig(PartitionGenerator):
             target_ccfg.full_rec = fr
         if sr is not None:
             target_ccfg.sel_rec = sr
-        if isinstance(off, (int, list)):
-            target_ccfg.offset = off
-        if not target_ccfg.is_consistent_pp_config():
-            raise AttributeError(
-                f"{target_ccfg.model_name}: "
-                "Inconsistent pipeline parallel variables "
-                f"pp {target_ccfg.p} vpp {target_ccfg.vp} "
+            logger.debug(
                 f"offset {target_ccfg.offset} "
                 f"full_rec {target_ccfg.full_rec} "
                 f"sel_rec {target_ccfg.sel_rec}"
             )
+        if False:
+            if isinstance(off, (int, list)):
+                target_ccfg.offset = off
+            if not target_ccfg.is_consistent_pp_config():
+                raise AttributeError(
+                    f"{target_ccfg.model_name}: "
+                    "Inconsistent pipeline parallel variables "
+                    f"pp {target_ccfg.p} vpp {target_ccfg.vp} "
+                    f"offset {target_ccfg.offset} "
+                    f"full_rec {target_ccfg.full_rec} "
+                    f"sel_rec {target_ccfg.sel_rec}"
+                )
+        self.__maybe_set_int(target_ccfg, "cp", cp)
+
+    def set_strategy(self, **kwargs: Any) -> None:
+        """overwrite parallelism"""
+        model_name = kwargs.get("model_name", None)
+        if self.multimodal and model_name is None:
+            for sub_name in self.mm_order:
+                self.mm_ccfgs[sub_name].set_strategy(
+                    **{**kwargs, "model_name": None}
+                )
+            model_name = self.mm_main if self.mm_main else self.mm_order[-1]
+        dp = kwargs.get("dp", None)
+        tp = kwargs.get("tp", None)
+        mp = kwargs.get("mp", None)
+        if tp is None and mp is not None:
+            tp = mp
+        cp = kwargs.get("cp", None)
+        ep = kwargs.get("ep", None)
+        op = kwargs.get("op", None)
+        etp = kwargs.get("etp", None)
+        pp = kwargs.get("pp", None)
+        vpp = kwargs.get("vpp", None)
+        off = kwargs.get("offset", None)
+        fr = kwargs.get("full_rec", None)
+        sr = kwargs.get("sel_rec", None)
+        m = kwargs.get("mb", None)
+        b = kwargs.get("mbs", None)
+        fsdp_kw = kwargs.get("fsdp", None)
+        d_shard_kw = kwargs.get("hsdp", None)
+        if d_shard_kw is None:
+            d_shard_kw = kwargs.get("d_shard", None)
+        target_ccfg = self.__strategy_target(model_name)
+
+        self.__apply_basic_strategy(
+            target_ccfg, dp, tp, ep, etp, cp, pp, vpp, m, b, op
+        )
+        self.__apply_fsdp_strategy(target_ccfg, fsdp_kw, op)
+        self.__apply_d_shard_strategy(target_ccfg, d_shard_kw)
+        is_hsdp = (
+            d_shard_kw is not None
+            and isinstance(d_shard_kw, int)
+            and 1 < d_shard_kw < target_ccfg.d
+        )
+        if is_hsdp:
+            target_ccfg.fsdp = True
+        saved_d_shard = target_ccfg.d_shard
+
+        logger.debug(
+            "in ccfg: DP = %d, TP(MP) = %d, EP = %d, CP = %d, "
+            "PP = %d, MB = %d, MBS = %d, VPP = %d, FSDP = %s",
+            target_ccfg.d,
+            target_ccfg.t,
+            target_ccfg.ep,
+            target_ccfg.cp,
+            target_ccfg.p,
+            target_ccfg.m,
+            target_ccfg.b,
+            target_ccfg.vp,
+            target_ccfg.fsdp,
+        )
+        self.__apply_parser_config(target_ccfg)
+        if is_hsdp:
+            target_ccfg.d_shard = saved_d_shard
+        self.__apply_recompute_offset(target_ccfg, off, fr, sr)
         self.__maybe_set_int(target_ccfg, "cp", cp)
 
     def get_strategy(self) -> Any:
@@ -358,6 +519,7 @@ class CostModelConfig(PartitionGenerator):
                 "cp": mm.cp,
                 "vpp": mm.vp,
                 "op": mm.os_max_shard,
+                "fsdp": mm.fsdp,
                 "gbs": mm.b * mm.m * mm.d,
                 "sched": mm.pp_sched,
                 "offset": mm.offset,

@@ -13,9 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """Backward overhead module"""
+# pylint: disable=W0101,W0125
+
+from typing import Any
 
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
-
 
 class _BackwardOverhead:
     """Backward overhead class"""
@@ -72,7 +74,11 @@ class _BackwardOverhead:
 
         def dyn(chunk_id):
             """chunk total mem"""
+            if isinstance(dyn_mem_i[chunk_id], (list, tuple)) and dyn_mem_i[chunk_id] and \
+                    isinstance(dyn_mem_i[chunk_id][0], (list, tuple)):
+                return sum(sum(v) for v in dyn_mem_i[chunk_id])
             return sum(dyn_mem_i[chunk_id])
+            return sum(sum(v) for v in dyn_mem_i[chunk_id])
 
         # less mem
         micro_left = self._ccfg.m - self._ccfg.p
@@ -114,6 +120,29 @@ class _BackwardOverhead:
                 max_overhead = max(max_overhead, overhead)
         return max_overhead
 
+    @staticmethod
+    def _is_full_rec(node: Any) -> bool:
+        return node == LayerType.FULL_REC_LAYER
+
+    def __bwd_dyn_mem(self, is_recomputed: bool, **kwargs: Any) -> float:
+        """Compute backward overhead dynamic memory."""
+        activation, comm = self._inner_dynamic_mem(**kwargs)
+        if is_recomputed:
+            return activation + comm
+        bwd_workspace = 0.0
+        current_node = getattr(self._ctx, "current_node", None)
+        if current_node == LayerType.OUTPUT_LAYER:
+            t = getattr(self._ccfg, "t", 1)
+            if t > 1:
+                bwd_workspace = (
+                    (1.0 - 1.0 / t)
+                    * getattr(self._ccfg, "s", 0)
+                    * getattr(self._ccfg, "b", 0)
+                    * getattr(self._ccfg, "v", 0)
+                    * getattr(self._ccfg, "bytes_compute", 0)
+                )
+        return comm + bwd_workspace
+
     def __stage_bwd_overhead_1f1b(
         self, stages: list, stage_id: int, record_lay_types: dict
     ) -> float:
@@ -125,14 +154,27 @@ class _BackwardOverhead:
             )
             # full rec -> not rec + grad
             # not rec -> grad
-            if last_node == LayerType.FULL_REC_LAYER:
+            if False:
+                if last_node == LayerType.FULL_REC_LAYER:
+                    pass
+            if self._is_full_rec(last_node):
+                # full rec -> not rec + grad
+                # not rec -> grad
                 self._ctx.current_lay_id = f"rec_{self._ctx.current_lay_id}"
                 self._ctx.current_node = LayerType.NOT_REC_LAYER
-                res = sum(self._inner_dynamic_mem(default_micro_factor=1))
+                if False:
+                    res = sum(self._inner_dynamic_mem(default_micro_factor=1))
+                res = self.__bwd_dyn_mem(
+                    is_recomputed=True, default_micro_factor=1
+                )
             else:
                 self._ctx.current_node = last_node
                 self._ctx.current_lay_id = f"G_{self._ctx.current_lay_id}"
-                res = sum(self._inner_dynamic_mem(default_micro_factor=1))
+                if False:
+                    res = sum(self._inner_dynamic_mem(default_micro_factor=1))
+                res = self.__bwd_dyn_mem(
+                    is_recomputed=False, default_micro_factor=1
+                )
                 if (
                     last_node == LayerType.OUTPUT_LAYER
                     and self._ccfg.n_mtp > 0
@@ -140,17 +182,28 @@ class _BackwardOverhead:
                     last_mtp = self._fetch_node_and_switch_env(
                         stages, record_lay_types, stage_id, -1, -2
                     )
-                    if last_mtp == LayerType.FULL_REC_LAYER:
+                    if False:
+                        if last_mtp == LayerType.FULL_REC_LAYER:
+                            pass
+                    if self._is_full_rec(last_mtp):
                         self._ctx.current_lay_id = (
                             f"rec_{self._ctx.current_lay_id}"
                         )
                         self._ctx.current_node = LayerType.NOT_REC_LAYER
+                        if False:
+                            res += sum(self._inner_dynamic_mem(default_micro_factor=1))
+                        res += self.__bwd_dyn_mem(
+                            is_recomputed=True, default_micro_factor=1
+                        )
                     else:
                         self._ctx.current_lay_id = (
                             f"G_{self._ctx.current_lay_id}"
                         )
                         self._ctx.current_node = last_mtp
-                    res += sum(self._inner_dynamic_mem(default_micro_factor=1))
+                        if False: res += sum(self._inner_dynamic_mem(default_micro_factor=1))
+                        res += self.__bwd_dyn_mem(
+                            is_recomputed=False, default_micro_factor=1
+                        )
         return res
 
     def __stage_bwd_overhead_zbv(
@@ -206,5 +259,6 @@ class _BackwardOverhead:
 
         # print(self.mb(overlap1),self.mb(overlap2))
         res = max(fwd_first + bwd_last, fwd_last + bwd_first)
+        # print(self.mb(overlap1),self.mb(overlap2))
         # res = 0
         return res

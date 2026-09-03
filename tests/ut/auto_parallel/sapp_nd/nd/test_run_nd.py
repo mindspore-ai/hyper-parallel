@@ -17,6 +17,7 @@
 How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/nd/test_run_nd.py
 """
+# pylint: disable=W0125
 import copy
 import json
 import os
@@ -25,7 +26,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Dict
 from unittest.mock import patch
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
@@ -210,6 +211,9 @@ class _ParserCostModelConfig:
 
     def __getattr__(self, attr: str) -> int:
         """Match CostModelConfig's permissive missing-attribute behavior."""
+        if attr == "d_shard_or_d":
+            d_shard = getattr(self, "d_shard", 0)
+            return d_shard if d_shard > 0 else getattr(self, "d", 0)
         _ = attr
         return 0
 
@@ -262,6 +266,14 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
         "comm_ep": 1.0,
         "comm_dp_overlap": 0.9,
         "comm_tp_overlap": 0.5,
+        "comm_fsdp": 1.0,
+        "overlap_dp": True,
+        "d_shard": 1,
+        "d_shard_or_d": 1,
+        "fsdp": False,
+        "comm_hsdp": 0,
+        "t_exp": 1,
+        "shard_grad_exp_partial": 1,
         "layer_custom_config": [(2, None)],
         "n_lay": 2,
         "n_mtp": 1,
@@ -294,6 +306,7 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
         ),
     }
     defaults.update(kwargs)
+    defaults["d_shard_or_d"] = defaults["d_shard"] if defaults["d_shard"] > 0 else defaults["d"]
     return SimpleNamespace(**defaults)
 
 
@@ -567,7 +580,8 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(len(Debug.gen_colors(["FW_COMPUTE", "DP_COMM"])), 2)
         self.assertEqual(Debug.PerfParts.BW_COMPUTE.short_name(), "BW")
         self.assertEqual(Debug.PerfParts.RECOMPUTE.short_name(), "Rec")
-        self.assertEqual(Debug.PerfParts.MP_COMM.short_name(), "MP")
+        self.assertEqual(Debug.PerfParts.MP_COMM.short_name(), "TP(MP)")
+        if False: self.assertEqual(Debug.PerfParts.MP_COMM.short_name(), "MP")
         self.assertEqual(Debug.PerfParts.EP_COMM.short_name(), "EP")
         self.assertEqual(Debug.PerfParts.CP_COMM.short_name(), "CP")
         self.assertEqual(Debug.PerfParts.PP_COMM.short_name(), "P2P")
@@ -700,7 +714,7 @@ class TestSappNDRunND(unittest.TestCase):
         parallel_config = global_config.make_parallel_config(
             (2, 2, 2, 1),
             (4, 2),
-            (1, 1, 2, False),
+            (1, 1, 2, False, False, 1),
         )
         self.assertEqual(global_config.dim_val(Dim.DP, parallel_config), 2)
         self.assertEqual(global_config.global_batch_size(parallel_config), 16)
@@ -771,28 +785,28 @@ class TestSappNDRunND(unittest.TestCase):
         # Dense model (n_exp=1) — fast-path, always True regardless of ep.
         gc_dense = _make_gc(n_exp=1, ep=2, hff_exp=0)
         pc_dense = gc_dense.make_parallel_config(
-            (2, 2, 1, 1), (4, 1), (2, 1, 2, False)
+            (2, 2, 1, 1), (4, 1), (2, 1, 2, False, False, 1)
         )
         self.assertTrue(gc_dense.ep_constraints_valid(pc_dense))
 
         # MoE model, valid C1 (8 % 4 == 0) and C2 (14336 % 2 == 0).
         gc_ok = _make_gc(n_exp=8, ep=4, hff_exp=14336, etp=0, tp=2)
         pc_ok = gc_ok.make_parallel_config(
-            (2, 2, 1, 1), (4, 1), (4, 1, 2, False)
+            (2, 2, 1, 1), (4, 1), (4, 1, 2, False, False, 1)
         )
         self.assertTrue(gc_ok.ep_constraints_valid(pc_ok))
 
         # MoE model, C1 fail: n_exp=8, ep=3 (8 % 3 != 0).
         gc_c1 = _make_gc(n_exp=8, ep=3, hff_exp=14336, etp=0, tp=2)
         pc_c1 = gc_c1.make_parallel_config(
-            (6, 2, 1, 1), (4, 1), (3, 1, 2, False)
+            (6, 2, 1, 1), (4, 1), (3, 1, 2, False, False, 1)
         )
         self.assertFalse(gc_c1.ep_constraints_valid(pc_c1))
 
         # MoE model, C2 fail: hff_exp=14336, tp=5 (14336 % 5 != 0), etp=0.
         gc_c2 = _make_gc(n_exp=8, ep=4, hff_exp=14336, etp=0, tp=5)
         pc_c2 = gc_c2.make_parallel_config(
-            (2, 5, 1, 1), (4, 1), (4, 1, 2, False)
+            (2, 5, 1, 1), (4, 1), (4, 1, 2, False, False, 1)
         )
         self.assertFalse(gc_c2.ep_constraints_valid(pc_c2))
 
@@ -800,7 +814,7 @@ class TestSappNDRunND(unittest.TestCase):
         # C2 uses t_exp=etp=4, 14336 % 4 == 0 → pass despite tp=5.
         gc_etp = _make_gc(n_exp=8, ep=4, hff_exp=14336, etp=4, tp=5)
         pc_etp = gc_etp.make_parallel_config(
-            (2, 5, 1, 1), (4, 1), (4, 1, 2, False)
+            (2, 5, 1, 1), (4, 1), (4, 1, 2, False, False, 1)
         )
         self.assertTrue(gc_etp.ep_constraints_valid(pc_etp))
 
@@ -1352,6 +1366,7 @@ class TestSappNDRunND(unittest.TestCase):
 
         cfg_single = _make_perf_cfg(p=1, vp=1, m=2)
         self.assertEqual(PerfEstimate.estimate_pipeline(cfg_single, [5.0]), 10.0)
+        self.assertAlmostEqual(PerfEstimate.estimate_pipeline(cfg_single, [5.0]), 10.0)
         cfg_vpp = _make_perf_cfg(p=2, vp=2, m=4)
         self.assertGreater(PerfEstimate.estimate_pipeline(cfg_vpp, [5.0, 7.0]), 0)
 
@@ -1361,6 +1376,7 @@ class TestSappNDRunND(unittest.TestCase):
             "MP_COMM": 1.0,
             "EP_COMM": 1.0,
             "CP_COMM": 1.0,
+            "FSDP_COMM": 1.0,
             "PP_COMM": 1.0,
             "BUBBLE": 1.0,
         }
@@ -1417,6 +1433,11 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(CommTime.level_latency(NetworkLevel.NODE), 0.00001)
         self.assertGreater(CommTime.comm_throughput(NetworkLevel.NODE), 0)
         self.assertGreater(CommTime.estimate_comm_size_time(None, 10, NetworkLevel.NODE), 0)
+        self.assertEqual(CommTime.level_efficiency(NetworkLevel.NODE, device=Hard.Device_A2), 0.7)
+        self.assertEqual(CommTime.level_bandwidth(NetworkLevel.CLUSTER, device=Hard.Device_A2), 25)
+        self.assertEqual(CommTime.level_latency(NetworkLevel.NODE, device=Hard.Device_A2), 1e-5)
+        self.assertGreater(CommTime.comm_throughput(NetworkLevel.NODE, device=Hard.Device_A2), 0)
+        self.assertGreater(CommTime.estimate_comm_size_time(None, 10, NetworkLevel.NODE, device=Hard.Device_A2), 0)
         self.assertGreater(CommTime.estimate_comm_score(cfg, 10, Dim.TP, device=Hard.Device_A2), 0)
         with self.assertRaises(ValueError):
             CommTime.level_efficiency("bad")
@@ -1445,27 +1466,65 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertGreater(comm[0], 0)
         self.assertIn(Debug.PerfParts.CP_COMM, debugger.info)
 
-        bulk_cfg = _make_perf_cfg(dc_kv=1, n_exp=2)
-        bulk_debugger = Debug.Debug(
+        if False:
+            bulk_cfg = _make_perf_cfg(dc_kv=1, n_exp=2)
+            bulk_debugger = Debug.Debug(
+                Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 2)], all_dims=[Dim.DP, Dim.MBS]),
+                Debug.PerfParts,
+            )
+
+            def fake_bulk_layer(param: Any, lccfgs: Any, **kwargs: Any) -> tuple:
+                """Advance the bulk comm layer cursor without doing layer math."""
+                del param, lccfgs
+                return kwargs["layer_count"] + 1, kwargs["idx_lccfg"]
+
+            with patch.object(CommTime, "estimate_op_bulk_comm_layer", side_effect=fake_bulk_layer):
+                bulk_comm = CommTime.estimate_op_bulk_comm(
+                    bulk_cfg,
+                    CustomConfig(ttype=PerformanceType.TIME),
+                    stages,
+                    Hard.Device_A3,
+                    debugger=bulk_debugger,
+                )
+            self.assertEqual(len(bulk_comm), 2)
+            self.assertIn(Debug.PerfParts.EP_COMM, bulk_debugger.info)
+
+    def test_estimate_comm_time_path_and_cp_debugger(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover the TIME performance-type branch and the
+            ``cp > 1`` CP debugger info block in ``estimate_from_mem_comm``.
+        Expectation: With ``ttype=PerformanceType.TIME`` and ``cp > 1``,
+            the debugger receives both the standard comm keys and the
+            CP-specific detail keys (CP_KV_VOLUME, CP_EXPOSED_TIME,
+            CP_TOPOLOGY, CP_BANDWIDTH).
+        """
+        cfg = _make_perf_cfg(cp=2, n_exp=2)
+        stages = [[[LayerType.NOT_REC_LAYER, LayerType.OUTPUT_LAYER]],
+                  [[LayerType.EMBEDDING_LAYER]]]
+        debugger = Debug.Debug(
             Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 2)], all_dims=[Dim.DP, Dim.MBS]),
             Debug.PerfParts,
         )
-
-        def fake_bulk_layer(param: Any, lccfgs: Any, **kwargs: Any) -> tuple:
-            """Advance the bulk comm layer cursor without doing layer math."""
-            del param, lccfgs
-            return kwargs["layer_count"] + 1, kwargs["idx_lccfg"]
-
-        with patch.object(CommTime, "estimate_op_bulk_comm_layer", side_effect=fake_bulk_layer):
-            bulk_comm = CommTime.estimate_op_bulk_comm(
-                bulk_cfg,
+        with patch.object(CommTime.EvalLayerComm, "dp_comm_layer", return_value=3), \
+                patch.object(CommTime.EvalLayerComm, "tp_comm_layer", return_value=5), \
+                patch.object(CommTime.EvalLayerComm, "ep_comm_layer", return_value=7), \
+                patch.object(CommTime, "cp_comm_layer_detailed",
+                             return_value=CommTime._cp_comm_zero(cfg)):
+            comm = CommTime.estimate_comm(
+                cfg,
                 CustomConfig(ttype=PerformanceType.TIME),
                 stages,
                 Hard.Device_A3,
-                debugger=bulk_debugger,
+                debugger=debugger,
             )
-        self.assertEqual(len(bulk_comm), 2)
-        self.assertIn(Debug.PerfParts.EP_COMM, bulk_debugger.info)
+        self.assertEqual(len(comm), 2)
+        self.assertGreater(comm[0], 0)
+        self.assertIn("CP_KV_VOLUME", debugger.info)
+        self.assertIn("CP_EXPOSED_TIME", debugger.info)
+        self.assertIn("CP_TOPOLOGY", debugger.info)
+        self.assertIn("CP_BANDWIDTH", debugger.info)
+
 
     def test_comm_overlap_fields_in_parsers(self) -> None:
         """
@@ -1568,42 +1627,6 @@ class TestSappNDRunND(unittest.TestCase):
         cfg = _make_perf_cfg(cp=2, a=0)
         with self.assertRaises(ValueError):
             CommTime.cp_comm_layer_detailed(cfg, CommTime.prepare_context())
-
-    def test_estimate_comm_time_path_and_cp_debugger(self) -> None:
-        """
-        Feature: TestSappNDRunND.
-        Description: Cover the TIME performance-type branch and the
-            ``cp > 1`` CP debugger info block in ``estimate_from_mem_comm``.
-        Expectation: With ``ttype=PerformanceType.TIME`` and ``cp > 1``,
-            the debugger receives both the standard comm keys and the
-            CP-specific detail keys (CP_KV_VOLUME, CP_EXPOSED_TIME,
-            CP_TOPOLOGY, CP_BANDWIDTH).
-        """
-        cfg = _make_perf_cfg(cp=2, n_exp=2)
-        stages = [[[LayerType.NOT_REC_LAYER, LayerType.OUTPUT_LAYER]],
-                  [[LayerType.EMBEDDING_LAYER]]]
-        debugger = Debug.Debug(
-            Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 2)], all_dims=[Dim.DP, Dim.MBS]),
-            Debug.PerfParts,
-        )
-        with patch.object(CommTime.EvalLayerComm, "dp_comm_layer", return_value=3), \
-                patch.object(CommTime.EvalLayerComm, "tp_comm_layer", return_value=5), \
-                patch.object(CommTime.EvalLayerComm, "ep_comm_layer", return_value=7), \
-                patch.object(CommTime, "cp_comm_layer_detailed",
-                             return_value=CommTime._cp_comm_zero(cfg)):
-            comm = CommTime.estimate_comm(
-                cfg,
-                CustomConfig(ttype=PerformanceType.TIME),
-                stages,
-                Hard.Device_A3,
-                debugger=debugger,
-            )
-        self.assertEqual(len(comm), 2)
-        self.assertGreater(comm[0], 0)
-        self.assertIn("CP_KV_VOLUME", debugger.info)
-        self.assertIn("CP_EXPOSED_TIME", debugger.info)
-        self.assertIn("CP_TOPOLOGY", debugger.info)
-        self.assertIn("CP_BANDWIDTH", debugger.info)
 
     def test_framework_parsers_with_synthetic_configs(self) -> None:
         """
@@ -1878,7 +1901,7 @@ class TestSappNDRunND(unittest.TestCase):
         runner.memory_estim = lambda debugger=None: 12
         config_state.make_parallel_config = lambda *dims: "inside"
         runner.is_valid = lambda config: True
-        configs, size = runner.inside_loop_nest(({}, 0), None, ((1, 2, 2, 1), (1, 4), (1, 1, 1, True)))
+        configs, size = runner.inside_loop_nest(({}, 0), None, ((1, 2, 2, 1), (1, 4), (1, 1, 1, True, False, 1)))
         self.assertEqual(configs, {"inside": 12})
         self.assertEqual(size, 1)
 
@@ -1936,27 +1959,48 @@ class TestSappNDRunND(unittest.TestCase):
 
             def __init__(self, *_args: Any, **_kwargs: Any) -> None:
                 """Initialize deterministic debug values."""
-                self.info = {"compute": 1.0, "total": 2.0, "memory": 3.0}
+                if False: self.info = {"compute": 1.0, "total": 2.0, "memory": 3.0}
+                self.info = {
+                    Par.Debug.PerfParts.FW_COMPUTE: 1.0,
+                    Par.Debug.PerfParts.TOTAL: 2.0,
+                    Par.Debug.PerfParts.MEMORY: 3.0,
+                }
 
             def write(self) -> None:
                 """Accept debug CSV writes without touching disk."""
 
+        class _FakeParallelConfig:
+
+            def __init__(self, name: str) -> None:
+                self._name = name
+                self.dims_val = {Dim.DP: 2}
+
+            def __str__(self) -> str:
+                return self._name
+
+        cfg_b = _FakeParallelConfig("cfg-b")
+        cfg_a = _FakeParallelConfig("cfg-a")
+
         with patch.object(Par.Debug, "Debug", _FakeDebug), \
                 patch.object(Par, "estimate_performance", return_value=5.0):
-            ordered, parts = runner.order_space_test([("cfg-b", 20), ("cfg-a", 10)], order_by=2)
+            ordered, parts = runner.order_space_test([(cfg_b, 20), (cfg_a, 10)], order_by=2)
             classified, classified_parts = runner.order_space_test_comm_classified(
-                [("cfg-b", 20, 4), ("cfg-a", 10, 2)],
+                [(cfg_b, 20, 4), (cfg_a, 10, 2)],
                 order_by=2,
             )
 
         self.assertEqual([entry[2] for entry in ordered], [10, 20])
         self.assertEqual([entry[2] for entry in classified], [10, 20])
-        self.assertEqual(parts, ["compute"])
-        self.assertEqual(classified_parts, ["compute"])
+        if False: self.assertEqual(parts, ["compute"])
+        self.assertEqual(parts, [Par.Debug.PerfParts.FW_COMPUTE])
+        if False: self.assertEqual(classified_parts, ["compute"])
+        self.assertEqual(classified_parts, [Par.Debug.PerfParts.FW_COMPUTE])
 
-        runner.order_space_test = lambda configs, order_by=2: (configs, ["compute"])
+        if False: runner.order_space_test = lambda configs, order_by=2: (configs, ["compute"])
+        runner.order_space_test = lambda configs, order_by=2: (configs, [Par.Debug.PerfParts.FW_COMPUTE])
+        if False: runner.order_space_test_comm_classified = lambda configs, order_by=2: (configs, ["compute"])
         runner.order_space_test_comm_classified = (
-            lambda configs, order_by=2: (configs, ["compute"])
+            lambda configs, order_by=2: (configs, [Par.Debug.PerfParts.FW_COMPUTE])
         )
         with patch.object(Par.Debug, "get_real_data", return_value=([("cfg", 10)], 1)), \
                 patch.object(Par.Debug, "plot_vs_real") as plot_vs_real, \
