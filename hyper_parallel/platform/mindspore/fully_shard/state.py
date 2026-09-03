@@ -430,3 +430,9 @@ class MindSporeHSDPStateV2(HSDPState):
         """Synchronize after a non-blocking CPU-offload copy when required."""
         if need_synchronize:
             ms.runtime.current_stream().synchronize()
+
+    def prefetch(self) -> None:
+        """Prefetch only when a managed parameter has a real shard collective."""
+        if not any(getattr(param, "shard_size", 1) > 1 for param in self.hsdp_params):
+            return
+        super().prefetch()

@@ -55,6 +55,7 @@ def _fake_param(*, shard_size=2, replicate_size=1, grad=True, source_shard_info=
     mesh_info.shard_process_group = "fsdp" if shard_size > 1 else None
     mesh_info.shard_mesh_size = shard_size
     hsdp_param.mesh_info = mesh_info
+    hsdp_param.shard_size = shard_size
     hsdp_param.shard_world_size = shard_size
     hsdp_param.replicate_world_size = replicate_size
     hsdp_param.source_shard_info = source_shard_info
@@ -202,6 +203,28 @@ class TestParameterInitialization(MindSporeFullyShardUnitTest):
             )
 
         self.assertEqual(state.reduce_op_type, "avg")
+
+
+class TestPrefetch(MindSporeFullyShardUnitTest):
+    """Test whether parameter prefetch has a real collective to overlap."""
+
+    def test_size_one_shard_group_skips_prefetch(self):
+        """A local-only unshard must not enter the asynchronous prefetch path."""
+        state = _new_state([_fake_param(shard_size=1)])
+        state.unshard = MagicMock()
+
+        state.prefetch()
+
+        state.unshard.assert_not_called()
+
+    def test_real_shard_group_keeps_prefetch(self):
+        """A real FSDP shard group must retain asynchronous parameter prefetch."""
+        state = _new_state([_fake_param(shard_size=4)])
+        state.unshard = MagicMock()
+
+        state.prefetch()
+
+        state.unshard.assert_called_once_with(async_op=True)
 
 
 class TestBackwardCommunication(MindSporeFullyShardUnitTest):
