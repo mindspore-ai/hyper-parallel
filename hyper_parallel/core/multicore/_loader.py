@@ -72,7 +72,7 @@ def get_multicore_paths(framework: str) -> tuple[Path, Path]:
     candidates = (
         [framework_root / "hyper_parallel_mega_moe_ms.so"]
         if framework == "mindspore"
-        else sorted(framework_root.glob("hyper_parallel_mega_moe_pta*.so"))
+        else [framework_root / "libhyper_parallel_mega_moe_torch.so"]
     )
     vendor_library = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
     if not vendor_library.is_file() or len(candidates) != 1 or not candidates[0].is_file():

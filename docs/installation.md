@@ -53,7 +53,7 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 | CANN toolkit 和 ops 包 | >= 9.1.0 的完整开发环境                    | 预先 source 所选 CANN 的 `set_env.sh`；环境需提供 `bisheng`、`asc_opc`、头文件、`libopapi.so` 和 `ops_base` |
 | Ninja             | MindSpore native target 可从 `PATH` 找到    | `CustomOpBuilder` 构建需要                                                        |
 | MindSpore         | >= 2.10                               | 当 `--custom-ops on`、`--multicore mindspore/all` 或 `--shmem all/mindspore` 时需要       |
-| PyTorch 及 NPU 适配包 | 相互配套且 `_GLIBCXX_USE_CXX11_ABI=1` 的版本   | 当 `--multicore torch/all` 或 `--shmem all/torch` 时需要；构建使用活动环境中安装的配套版本       |
+| PyTorch 及 NPU 适配包 | 相互配套的版本                            | 当 `--multicore torch/all` 或 `--shmem all/torch` 时需要；构建使用活动环境中安装的配套版本及其 C++ ABI |
 
 ```bash
 git clone https://gitcode.com/mindspore/hyper-parallel.git
@@ -74,6 +74,11 @@ wheel 的精确路径；PYTHONPATH 开发直接复用同一 payload。单独执�
 成功后会刷新该组件的 payload 子目录，可直接用于局部增量开发。默认保留耗时的 SHMEM 和按 SoC 的 vendor
 编译缓存；轻量 framework adapter 每次从按框架身份隔离的干净目录重编。`--clean` 用于显式全量重编所选
 组件。锁定依赖缓存正确时直接复用，缺失或不一致时自动下载/刷新。
+
+MindSpore adapter 通过 `ops.CustomOpBuilder` 构建。PyTorch adapter 是由 CMake 构建、通过
+`torch.ops.load_library()` 加载的共享库，不使用 setuptools compiler 内部属性、`NpuExtension`
+或 `find_package(Torch)`。构建过程从当前 Python 环境定位 Torch 和 torch_npu，并在编译前校验所需
+头文件和库文件。
 
 multicore 多 SoC 构建会针对每个目标分别生成 HyperMegaMoe vendor，并将各 SoC 的 kernel/config 合入同一个
 软件包。合并前会校验 vendor 构建输入和 host ABI 的一致性，软件包仅携带一份公共 host 制品。

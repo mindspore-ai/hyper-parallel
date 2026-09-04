@@ -22,6 +22,7 @@ function hp_prepare_shmem_sdk() {
     local native_jobs=$3
     local clean_sdk=${4:-off}
     local native_root="${project_root}/build/native"
+    local python_bin=python
     local locked_source_dir="${native_root}/deps/shmem/src"
     local wrapper="${project_root}/hyper_parallel/core/symmetric_memory/cmake/shmem_wrapper"
     local requested_soc
@@ -42,7 +43,13 @@ function hp_prepare_shmem_sdk() {
             "'${cann_version:-unknown}' under ${ASCEND_HOME_PATH}." >&2
         return 3
     fi
-    for required_tool in awk bisheng cmake gcc g++ git make python3 readlink sha256sum tar; do
+    if ! command -v "${python_bin}" >/dev/null 2>&1; then
+        echo "HP_NATIVE_REASON_CODE=PYTHON_BUILD_DEPENDENCY_NOT_FOUND"
+        echo "ERROR: The selected Python executable is unavailable: ${python_bin}." >&2
+        return 4
+    fi
+    python_bin=$(command -v "${python_bin}")
+    for required_tool in awk bisheng cmake gcc g++ git make readlink sha256sum tar; do
         if ! command -v "${required_tool}" >/dev/null 2>&1; then
             echo "HP_NATIVE_REASON_CODE=BUILD_TOOL_NOT_FOUND"
             echo "ERROR: Required SHMEM SDK build tool not found on PATH: ${required_tool}." >&2
@@ -55,19 +62,34 @@ function hp_prepare_shmem_sdk() {
     local gcc_path
     local gxx_path
     local host_arch
+    local shmem_lock_digest
     local toolchain_key
     local work_root
     local source_dir
     local build_dir
     local install_root
     cann_root=$(cd "${ASCEND_HOME_PATH}" && pwd -P)
-    bisheng_path=$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' \
+    bisheng_path=$("${python_bin}" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' \
         "$(command -v bisheng)")
-    gcc_path=$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' \
+    gcc_path=$("${python_bin}" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' \
         "$(command -v gcc)")
-    gxx_path=$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' \
+    gxx_path=$("${python_bin}" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' \
         "$(command -v g++)")
     host_arch=$(uname -m)
+    if ! shmem_lock_digest=$("${python_bin}" -c '
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    lock = json.load(source)["components"]["symmetric_memory"]["shmem"]
+encoded = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(encoded).hexdigest())
+' "${project_root}/scripts/native/config/dependencies.lock.json"); then
+        echo "HP_NATIVE_REASON_CODE=SHMEM_LOCK_INVALID"
+        echo "ERROR: Cannot read the locked SHMEM dependency contract." >&2
+        return 4
+    fi
     toolchain_key=$(
         {
             printf '%s\n' \
@@ -76,12 +98,12 @@ function hp_prepare_shmem_sdk() {
                 "bisheng=${bisheng_path}" \
                 "host_arch=${host_arch}" \
                 "gcc=${gcc_path}" \
-                "gxx=${gxx_path}"
+                "gxx=${gxx_path}" \
+                "shmem_lock=${shmem_lock_digest}"
             "${bisheng_path}" --version 2>&1 || true
             "${gcc_path}" --version 2>&1 || true
             "${gxx_path}" --version 2>&1 || true
             sha256sum "${cann_version_file}" \
-                "${project_root}/scripts/native/config/dependencies.lock.json" \
                 "${project_root}/hyper_parallel/core/symmetric_memory/cmake/shmem_wrapper/CMakeLists.txt" \
                 "${project_root}/scripts/native/shmem_sdk.sh"
         } | sha256sum | awk '{print substr($1, 1, 16)}'
@@ -115,7 +137,7 @@ function hp_prepare_shmem_sdk() {
         esac
     done
 
-    python3 -m scripts.native.prepare_dependencies --dependency shmem
+    "${python_bin}" -m scripts.native.prepare_dependencies --dependency shmem
     if [[ ! -d "${locked_source_dir}/src" || ! -f "${locked_source_dir}/CMakeLists.txt" ]]; then
         echo "HP_NATIVE_REASON_CODE=SHMEM_SOURCE_NOT_PREPARED"
         echo "ERROR: Pinned SHMEM source is not prepared at ${locked_source_dir}." >&2

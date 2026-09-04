@@ -148,6 +148,7 @@ case "${FRAMEWORK}" in
 esac
 
 CURRENT_REASON_CODE="SYMMETRIC_MEMORY_BUILD_FAILED"
+PYTHON_BIN=python
 function report_unhandled_error() {
     local exit_code=$?
     trap - ERR
@@ -164,31 +165,36 @@ fi
 rm -rf "${COMPONENT_ROOT}" "${PAYLOAD_COMPONENT_ROOT}"
 mkdir -p "${COMPONENT_ROOT}"
 
-for required_tool in cmake find gcc g++ grep make python3 readelf readlink sed; do
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    fail "PYTHON_BUILD_DEPENDENCY_NOT_FOUND" \
+        "The selected Python executable is unavailable: ${PYTHON_BIN}." 4
+fi
+PYTHON_BIN=$(command -v "${PYTHON_BIN}")
+for required_tool in cmake find gcc g++ grep make readelf readlink sed; do
     if ! command -v "${required_tool}" >/dev/null 2>&1; then
         fail "BUILD_TOOL_NOT_FOUND" \
             "Required symmetric-memory build tool not found on PATH: ${required_tool}." 4
     fi
 done
-PYTHON_CACHE_TAG=$(python3 -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+PYTHON_CACHE_TAG=$("${PYTHON_BIN}" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
 if [[ "${BUILD_SHMEM_MINDSPORE}" == "true" ]]; then
     if ! command -v ninja >/dev/null 2>&1; then
         fail "BUILD_TOOL_NOT_FOUND" "Required MindSpore build tool not found: ninja." 4
     fi
-    if ! python3 -c 'import mindspore as ms; assert hasattr(ms.ops, "CustomOpBuilder")' >/dev/null 2>&1; then
+    if ! "${PYTHON_BIN}" -c 'import mindspore as ms; assert hasattr(ms.ops, "CustomOpBuilder")' \
+        >/dev/null 2>&1; then
         fail "MINDSPORE_CUSTOM_OP_BUILDER_NOT_FOUND" \
             "The active Python environment must provide MindSpore CustomOpBuilder." 4
     fi
 fi
 if [[ "${BUILD_SHMEM_TORCH}" == "true" ]]; then
-    if ! python3 -c 'import torch, torch_npu' >/dev/null 2>&1; then
+    if ! TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${PYTHON_BIN}" -c '
+from importlib.util import find_spec
+import torch
+raise SystemExit(0 if find_spec("torch_npu") is not None else 1)
+' >/dev/null 2>&1; then
         fail "TORCH_BUILD_DEPENDENCY_NOT_FOUND" \
             "The active Python environment must provide matching torch and torch_npu packages." 4
-    fi
-    if ! python3 -c 'import torch; raise SystemExit(0 if torch.compiled_with_cxx11_abi() else 1)' \
-        >/dev/null 2>&1; then
-        fail "TORCH_CXX11_ABI_UNSUPPORTED" \
-            "The selected Torch native build requires _GLIBCXX_USE_CXX11_ABI=1." 4
     fi
 fi
 
@@ -221,7 +227,7 @@ if [[ ! -s "${SYMMETRIC_MEMORY_KERNEL_LIB}" ]]; then
 fi
 
 if [[ "${BUILD_SHMEM_TORCH}" == "true" ]]; then
-    TORCH_CACHE_KEY=$(python3 -c '
+    TORCH_CACHE_KEY=$("${PYTHON_BIN}" -c '
 import hashlib
 from importlib.metadata import version
 from importlib.util import find_spec
@@ -244,14 +250,14 @@ print(hashlib.sha256(identity.encode()).hexdigest()[:16])
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${TORCH_INSTALL_DIR}" \
         -DACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB="${SYMMETRIC_MEMORY_KERNEL_LIB}" \
-        -DPython3_EXECUTABLE="$(command -v python3)" \
+        -DPython3_EXECUTABLE="${PYTHON_BIN}" \
         -DBUILD_TORCH_LIB=True
     cmake --build "${TORCH_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
     cmake --install "${TORCH_BUILD_DIR}"
 fi
 
 if [[ "${BUILD_SHMEM_MINDSPORE}" == "true" ]]; then
-    MINDSPORE_CACHE_KEY=$(python3 -c '
+    MINDSPORE_CACHE_KEY=$("${PYTHON_BIN}" -c '
 import hashlib
 from importlib.metadata import version
 from importlib.util import find_spec
@@ -271,7 +277,7 @@ print(hashlib.sha256(identity.encode()).hexdigest()[:16])
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${MINDSPORE_INSTALL_DIR}" \
         -DACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB="${SYMMETRIC_MEMORY_KERNEL_LIB}" \
-        -DPython3_EXECUTABLE="$(command -v python3)" \
+        -DPython3_EXECUTABLE="${PYTHON_BIN}" \
         -DBUILD_MS_LIB=True
     cmake --build "${MINDSPORE_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
     if [[ ! -s "${MINDSPORE_BUILD_DIR}/kernel_meta/aclshmem_ms.so" ]]; then

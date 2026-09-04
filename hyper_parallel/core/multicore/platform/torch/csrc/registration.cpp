@@ -10,7 +10,6 @@
  *   torch.ops.hyper_parallel.mega_moe_grad(...)
  */
 #include <torch/library.h>
-#include <torch/extension.h>
 
 TORCH_LIBRARY(hyper_parallel, m) {
     // -------------------------------------------------------------------------
@@ -98,8 +97,3 @@ TORCH_LIBRARY(hyper_parallel, m) {
         "  int seq_size"
         ") -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!))");
 }
-
-// NpuExtension emits a CPython extension entry point with an explicit module name.
-// TORCH_LIBRARY_IMPL registrations in mega_moe.cpp / mega_moe_grad.cpp run via
-// static initializers when torch.ops.load_library() loads the shared object.
-PYBIND11_MODULE(hyper_parallel_mega_moe_pta, m) {}
