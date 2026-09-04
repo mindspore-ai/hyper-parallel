@@ -32,7 +32,6 @@ from hyper_parallel.auto_models.components.distributed.param_role import (
     ParamRole,
 )
 from hyper_parallel.auto_models.components.distributed.sharding_config import (
-    CP,
     TP,
     ModuleShardingSpec,
     PackedShard,
@@ -163,41 +162,26 @@ def test_gdn_parameter_classifier_covers_tp_parameters():
         assert roles[f"linear_attn.{name}"] == ParamRole.REPLICATED
 
 
-def test_gdn_tp_spec_matches_transformers_colwise_gather_output_plan():
-    """Each Transformers GDN Linear shards columns and gathers its output."""
+def test_gdn_tp_spec_keeps_the_complete_region_replicated():
+    """The stock GDN region keeps full parameters and activation dimensions."""
     module = FakeGatedDeltaNet()
     spec = ModuleShardingSpec(
-        params={
-            name: {TP: Shard(0), CP: Replicate()}
-            for name, _ in module.named_parameters()
-        },
-        in_src={"hidden_states": {TP: Replicate(), CP: Shard(1)}},
-        in_dst={"hidden_states": {TP: Replicate(), CP: Shard(1)}},
-        out_src={"output": {TP: Shard(1), CP: Shard(1)}},
-        out_dst={"output": {TP: Replicate(), CP: Shard(1)}},
+        params={name: {TP: Shard(0)} for name, _ in module.named_parameters()},
+        in_src={"hidden_states": {TP: Shard(1)}},
+        in_dst={"hidden_states": {TP: Shard(1)}},
+        out_src={"output": {TP: Shard(1)}},
+        out_dst={"output": {TP: Shard(1)}},
+        tp_divide_attrs=["num_v_heads", "key_dim"],
     )
 
-    nested_specs = ShardingPlanner._configure_gdn_tp_spec(  # pylint: disable=protected-access
+    ShardingPlanner._keep_gdn_replicated_on_tp(  # pylint: disable=protected-access
         spec,
         module,
-        "model.layers.0.linear_attn",
-        ("tp", "cp"),
     )
 
-    linear_names = (
-        "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
-    )
-    assert set(nested_specs) == {
-        f"model.layers.0.linear_attn.{name}" for name in linear_names
-    }
-    for name in linear_names:
-        linear_spec = nested_specs[f"model.layers.0.linear_attn.{name}"]
-        assert linear_spec.params["weight"][TP] == Shard(0)
-        assert linear_spec.in_src["input"][TP] == Replicate()
-        assert linear_spec.in_src["input"][CP] == Shard(1)
-        assert linear_spec.out_src["output"][TP] == Shard(-1)
-        assert linear_spec.out_dst["output"][TP] == Replicate()
-    assert set(spec.params) == {"conv1d.weight", "A_log", "dt_bias", "norm.weight", "norm.bias"}
     assert all(placement[TP] == Replicate() for placement in spec.params.values())
+    assert spec.in_src["hidden_states"][TP] == Shard(1)
+    assert spec.in_dst["hidden_states"][TP] == Replicate()
     assert spec.out_src["output"][TP] == Replicate()
+    assert spec.out_dst["output"][TP] == Shard(1)
     assert spec.tp_divide_attrs == []

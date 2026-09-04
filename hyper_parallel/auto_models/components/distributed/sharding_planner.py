@@ -322,80 +322,25 @@ class ShardingPlanner:
                     spec.inner_target = "self"
                     spec.inner_wrapper = "gdn_ulysses"
                     spec.region_dispatch = False
-            nested_specs = {}
             if boundary_type == "linear_attention" and "tp" in mesh_dim_names:
-                nested_specs = self._configure_gdn_tp_spec(
+                self._keep_gdn_replicated_on_tp(
                     spec,
                     model.get_submodule(boundary_fqn),
-                    boundary_fqn,
-                    mesh_dim_names,
                 )
             plan.modules[boundary_fqn] = spec
-            plan.modules.update(nested_specs)
 
     @staticmethod
-    def _configure_gdn_tp_spec(
+    def _keep_gdn_replicated_on_tp(
         spec: ModuleShardingSpec,
         module: nn.Module,
-        boundary_fqn: str,
-        mesh_dim_names: Tuple[str, ...],
-    ) -> Dict[str, ModuleShardingSpec]:
-        """Apply the Transformers Gated DeltaNet tensor-parallel plan.
-
-        Transformers uses ``colwise_gather_output`` for all five GDN Linear
-        modules. Each weight is sharded on its output dimension and each
-        Linear output is gathered immediately, so the convolution, recurrent
-        rule, normalization, and cached dimensions remain fully replicated.
-        """
+    ) -> None:
+        """Keep an unmodified Gated DeltaNet replicated across the TP mesh."""
         if "GatedDeltaNet" not in type(module).__name__:
-            return {}
-        linear_names = (
-            "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
-        )
-        required = (*linear_names, "conv1d")
-        missing = [name for name in required if not hasattr(module, name)]
-        if missing:
-            raise ValueError(
-                f"{boundary_fqn}: GatedDeltaNet TP requires modules {required}, "
-                f"missing {missing}"
-            )
-        invalid = [
-            name for name in linear_names
-            if not isinstance(getattr(module, name), nn.Linear)
-        ]
-        if invalid:
-            raise TypeError(
-                f"{boundary_fqn}: Transformers GatedDeltaNet TP expects nn.Linear "
-                f"for {invalid}"
-            )
+            return
 
-        nested_specs: Dict[str, ModuleShardingSpec] = {}
-        cp_placement = Shard(1) if "cp" in mesh_dim_names else Replicate()
-        activation_replicated = _multi_dim(
-            tp=Replicate(), cp=cp_placement, ep=Replicate(),
-        )
-        activation_sharded = _multi_dim(
-            tp=Shard(-1), cp=cp_placement, ep=Replicate(),
-        )
-        for linear_name in linear_names:
-            param_prefix = linear_name + "."
-            linear_params = {
-                param_name[len(param_prefix):]: placement
-                for param_name, placement in list(spec.params.items())
-                if param_name.startswith(param_prefix)
-            }
-            for param_name in linear_params:
-                spec.params.pop(param_prefix + param_name)
-            nested_specs[f"{boundary_fqn}.{linear_name}"] = ModuleShardingSpec(
-                params=linear_params,
-                in_src={"input": copy.deepcopy(activation_replicated)},
-                in_dst={"input": copy.deepcopy(activation_replicated)},
-                out_src={"output": copy.deepcopy(activation_sharded)},
-                out_dst={"output": copy.deepcopy(activation_replicated)},
-            )
-
-        # The GDN core consumes and produces full hidden/head dimensions.
-        # The outer boundary still owns optional sequence-parallel entry/exit.
+        # The stock GDN convolution and recurrent rule consume full head/channel
+        # dimensions. Until those kernels have a TP-local contract, sharding only
+        # their surrounding Linear modules would not form a complete TP region.
         for placement in spec.params.values():
             placement[TP] = Replicate()
         for placement in spec.in_dst.values():
@@ -403,7 +348,6 @@ class ShardingPlanner:
         for placement in spec.out_src.values():
             placement[TP] = Replicate()
         spec.tp_divide_attrs = []
-        return nested_specs
 
     def _finalize_boundary_specs(
         self,
