@@ -916,6 +916,27 @@ class TestSappNDRunND(unittest.TestCase):
             self.assertEqual(instance.args[1], config_path)
             self.assertEqual(instance.args[2].number, 128)
 
+    def test_run_nd_cli_hyper_v2_requires_devices(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: ``-f hyper_v2`` without ``-d`` and without a search
+                     config. An AutoModels train.yaml carries no world size,
+                     so ND would otherwise infer the cluster as d*t*cp*p.
+        Expectation: The CLI exits rather than searching a wrong machine.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(Par, "Parallelize", _FakeParallelize), \
+                patch.dict(os.environ, {"MPLCONFIGDIR": tmp_dir}):
+            _FakeParallelize.instances = []
+            argv = ["run_nd.py", "-f", "hyper_v2", "-y", config_path, "-v", "0"]
+            with patch.object(sys, "argv", argv):
+                with self.assertRaises(SystemExit):
+                    runpy.run_module(
+                        "hyper_parallel.auto_parallel.sapp_nd.nd.run_nd",
+                        run_name="__main__",
+                    )
+            self.assertEqual(_FakeParallelize.instances, [])
+
     def test_run_nd_cli_hyper_v2_with_search_config(self) -> None:
         """
         Feature: TestSappNDRunND.

@@ -26,6 +26,7 @@ from typing import Any, Dict
 
 import yaml  # type: ignore[import-untyped]
 
+from hyper_parallel.auto_parallel._hf_model_spec import is_auto_models_schema
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
 
@@ -112,7 +113,7 @@ def _load_yaml_to_inject(original_yaml_path: str) -> Dict[str, Any]:
         raise ValueError(
             f"Original YAML {original_yaml_path} must contain a top-level mapping."
         )
-    if "training" in data or "accelerator" in data or "fsdp_config" in data:
+    if is_auto_models_schema(data):
         if not isinstance(data.get("training"), dict):
             data["training"] = {}
         if not isinstance(data.get("accelerator"), dict):
@@ -127,9 +128,34 @@ def _load_yaml_to_inject(original_yaml_path: str) -> Dict[str, Any]:
     return data
 
 
+def _check_batch_derivation(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
+    """Verify the resolved strategy matches the Trainer's batch derivation.
+
+    AutoModels has no micro-batch-number field: it derives the accumulation
+    count as ``global_batch_size / (micro_batch_size * dp)``. ND applies the
+    same identity, so the searched value needs no writing, but a mismatch
+    would silently train a different schedule than the one that was scored.
+    """
+    micro_batch_num = resolved.get("micro_batch_num")
+    data_parallel = resolved.get("dp")
+    training = data.get("training", {})
+    global_batch_size = training.get("global_batch_size")
+    micro_batch_size = training.get("micro_batch_size", 1)
+    if not (micro_batch_num and data_parallel and global_batch_size):
+        return
+    expected = micro_batch_num * micro_batch_size * data_parallel
+    if expected != global_batch_size:
+        raise ValueError(
+            "resolved strategy is inconsistent with the trainer batch "
+            f"derivation: global_batch_size={global_batch_size} != "
+            f"micro_batch_num={micro_batch_num} * "
+            f"micro_batch_size={micro_batch_size} * dp={data_parallel}"
+        )
+
+
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
     """Inject resolved strategy values into the YAML data dict."""
-    if "training" in data or "fsdp_config" in data:
+    if is_auto_models_schema(data):
         accelerator = data["accelerator"]
         for src_key, dst_key in _AUTO_MODELS_YAML_KEY_MAP.items():
             if src_key in resolved:
@@ -147,6 +173,7 @@ def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) ->
             data["training"]["global_batch_size"] = int(
                 resolved["global_batch_size"]
             )
+        _check_batch_derivation(data, resolved)
         return
 
     train = data["train"]

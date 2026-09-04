@@ -83,9 +83,10 @@ _MOCK_PP = MagicMock(acronym="PP")
 _MOCK_CP = MagicMock(acronym="CP")
 _MOCK_EP = MagicMock(acronym="EP")
 _MOCK_MBN = MagicMock(acronym="MB")
+_MOCK_OP = MagicMock(acronym="OP")
 _MOCK_DIMS = MagicMock(
     DP=_MOCK_DP, TP=_MOCK_TP, PP=_MOCK_PP,
-    CP=_MOCK_CP, EP=_MOCK_EP, MBN=_MOCK_MBN,
+    CP=_MOCK_CP, EP=_MOCK_EP, MBN=_MOCK_MBN, OP=_MOCK_OP,
 )
 
 
@@ -103,6 +104,7 @@ def _make_scored_entry(**overrides) -> tuple:
         _MOCK_CP: overrides.get("cp", 1),
         _MOCK_EP: overrides.get("ep", 1),
         _MOCK_MBN: overrides.get("micro_batch_num", 2),
+        _MOCK_OP: overrides.get("dp_shard", 1),
     }
     mock_dims = MagicMock()
     mock_dims.dims_val = dims
@@ -186,6 +188,22 @@ class TestBuildHpYamlDict(unittest.TestCase):
             "full",
         )
 
+    def test_visual_seq_len_propagated(self):
+        """A declared visual token count reaches the cost-model yaml."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        config.model_spec["visual_seq_len"] = 2304
+        result = runner._build_hp_yaml_dict(config)
+        self.assertEqual(result["context"]["visual_seq_len"], 2304)
+
+    def test_visual_seq_len_absent_omitted(self):
+        """Without one, the parser is left to derive it."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        config.model_spec.pop("visual_seq_len", None)
+        result = runner._build_hp_yaml_dict(config)
+        self.assertNotIn("visual_seq_len", result.get("context", {}))
+
     def test_cp_algo_propagated(self):
         """cp_algo in estimator is written to accelerator.context_parallel_algo."""
         runner = self._get_runner()
@@ -244,6 +262,7 @@ class TestResolveSearchDimensions(unittest.TestCase):
             "context_parallel_degree": [1],
             "expert_parallel_degree": [1],
             "micro_batch_num": [1],
+            "data_parallel_shard_degree": [1],
         }
         dims, candidate_dims = runner._resolve_search_dimensions(config)
         self.assertEqual(len(dims), 0)

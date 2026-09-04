@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 # ============================================================================
 """parse config for cost model"""
 import inspect
+from typing import Any
 import re
 import weakref
 from copy import deepcopy
@@ -59,7 +60,7 @@ def detect_attention_type(ccfg: "CostModelConfig") -> AttentionType:
     return AttentionType.MHA
 
 
-def compute_kv_dim(ccfg) -> float:
+def compute_kv_dim(ccfg: Any) -> float:
     """Return effective KV dimension per TP rank based on attention type.
 
     When TP is active, KV heads are split across TP ranks, so each
@@ -89,17 +90,19 @@ class CostModelConfig(PartitionGenerator):
 
     def __init__(
         self,
-        input_config=None,
-        hook_cls=None,
-        framework=None,
-        source_code=None,
-    ):
+        input_config: Any = None,
+        hook_cls: Any = None,
+        framework: Any = None,
+        source_code: Any = None,
+    ) -> None:
+        """Initialise the cost model from a config, hooks and framework name."""
         super().__init__(input_config, hook_cls, framework, source_code)
         logger.debug(
             "parser = %s for %s", str(self.parser), str(self.model_name)
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """Return the cost model variables as readable text."""
         return "CostModelConfig attributes:\n" + pformat(
             {
                 k: v
@@ -139,7 +142,7 @@ class CostModelConfig(PartitionGenerator):
         """Restore instance state after multiprocessing deserialization."""
         self.__dict__.update(state)
 
-    def fp_bytes(self, precision):
+    def fp_bytes(self, precision: Any) -> int:
         """Return bytes size for datatype"""
         if precision and isinstance(precision, str):
             res = re.match(r"[^0-9]*([0-9]+)[^0-9]*", precision)
@@ -148,7 +151,7 @@ class CostModelConfig(PartitionGenerator):
         logger.warning("No bytes detected from FP Precision: %s", precision)
         return 0
 
-    def print_stages_i(self, stage_id, stage):
+    def print_stages_i(self, stage_id: Any, stage: Any) -> None:
         """for print_stages"""
         stage_layers = []
         for chunk in stage:
@@ -165,7 +168,7 @@ class CostModelConfig(PartitionGenerator):
             stage_layers += [chunk_lay_occ]
         logger.info("stage _%s : %s", stage_id, stage_layers)
 
-    def print_stages(self, stages, spec_stage_id=-1):
+    def print_stages(self, stages: Any, spec_stage_id: Any = -1) -> None:
         """Call after generate_partitions"""
         if spec_stage_id == -1:
             for stage_id, stage in enumerate(stages):
@@ -175,11 +178,11 @@ class CostModelConfig(PartitionGenerator):
         else:
             logger.warning("Incorrect spec_stage_id")
 
-    def count_layers(self, stages):
+    def count_layers(self, stages: Any) -> int:
         """Count non-embedding and non-output layers in generated stages."""
         return sum(sum(len(layer) for layer in chunk) for chunk in stages) - 2
 
-    def print_parallelism(self):
+    def print_parallelism(self) -> None:
         """strategy pretty printer"""
         if not self.multimodal:
             logger.info("%s Parallelism used :", self.model_name)
@@ -219,14 +222,15 @@ class CostModelConfig(PartitionGenerator):
             for m in self.mm_ccfgs:
                 self.mm_ccfgs[m].print_parallelism()
 
-    def strategy_num_devices(self):
+    def strategy_num_devices(self) -> float:
         """total num devices"""
         return self.d * self.t * self.cp * self.p
 
-    def is_consistent_pp_config(self):
+    def is_consistent_pp_config(self) -> bool:
         """check if pp/offset/recomputation consistency"""
 
-        def is_valid_cfg(cfg):
+        def is_valid_cfg(cfg: Any) -> bool:
+            """Return whether one per-stage config matches the pipeline shape."""
             if cfg is None or isinstance(cfg, (int, bool)):
                 return True
             if not isinstance(cfg, list) or not cfg:
@@ -261,9 +265,17 @@ class CostModelConfig(PartitionGenerator):
             f"{self.model_name}:  model_name is required (multimodal)"
         )
 
-    def set_strategy(self, **kwargs):
+    def set_strategy(self, **kwargs: Any) -> None:
         """overwrite parallelism"""
         model_name = kwargs.get("model_name", None)
+        if self.multimodal and model_name is None:
+            # Submodules share one pipeline, so a strategy update with no
+            # explicit target has to reach every one of them.
+            for sub_name in self.mm_order:
+                self.mm_ccfgs[sub_name].set_strategy(
+                    **{**kwargs, "model_name": None}
+                )
+            model_name = self.mm_main if self.mm_main else self.mm_order[-1]
         dp = kwargs.get("dp", None)
         tp = kwargs.get("mp", None)
         cp = kwargs.get("cp", None)
@@ -333,10 +345,11 @@ class CostModelConfig(PartitionGenerator):
             )
         self.__maybe_set_int(target_ccfg, "cp", cp)
 
-    def get_strategy(self):
+    def get_strategy(self) -> Any:
         """return parallelism/recompute strategies"""
 
-        def strategy(mm):
+        def strategy(mm: Any) -> Any:
+            """Return the strategy dict for one submodule."""
             return {
                 "dp": mm.d,
                 "tp": mm.t,
@@ -357,7 +370,7 @@ class CostModelConfig(PartitionGenerator):
             return {mm.model_name: strategy(mm) for mm in self.mm_ccfgs.values()}
         return strategy(self)
 
-    def layer_custom_config_callback(self, fun):
+    def layer_custom_config_callback(self, fun: Any) -> None:
         """
         Use input fun as callback for layer_custom_config
         Only for overwriting cost model variables
@@ -365,7 +378,8 @@ class CostModelConfig(PartitionGenerator):
         config_ref = weakref.ref(self)
         for idx, f in enumerate(self.layer_custom_config):
 
-            def wrap(e, hook=f[1]):
+            def wrap(e: Any, hook: Any = f[1]) -> None:
+                """Apply the extra callback after the layer's own hook."""
                 hook(e)
                 if isinstance(e, CostModelConfig):
                     config = config_ref()
