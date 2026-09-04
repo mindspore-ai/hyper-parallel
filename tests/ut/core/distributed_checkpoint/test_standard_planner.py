@@ -156,7 +156,7 @@ class TestStandardPlanner(unittest.TestCase):
 
         plan = planner.build_local_plan()
 
-        self.assertFalse(planner._enable_plan_caching)
+        self.assertTrue(planner._enable_plan_caching)
         self.assertEqual(
             [item.index.offset for item in plan.items],
             [(0, 0, 0), (1, 0, 0)],
@@ -165,6 +165,25 @@ class TestStandardPlanner(unittest.TestCase):
             [tuple(planner.get_data(item).shape) for item in plan.items],
             [(1, 4, 8), (1, 2, 8)],
         )
+
+    def test_ragged_save_plan_cache_reuses_geometry_and_reads_current_data(self):
+        """Reuse a RaggedShard plan while resolving data from the current state dict."""
+        first = StandardSavePlanner(enable_plan_caching=True)
+        first.configure_planner({"weight": self._ragged_tensor(torch.arange(48))}, rank=0)
+        first_plan = first.build_local_plan()
+        first_final, first_metadata = first.build_global_plan([first_plan])
+        first.cache_result(first.finalize_plan(first_final), first_metadata)
+
+        second = StandardSavePlanner(enable_plan_caching=True)
+        second.configure_planner({"weight": self._ragged_tensor(torch.arange(48, 96))}, rank=0)
+        cached = second.get_cached()
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(len(cached.final_plan.items), 2)
+        pieces = [second.get_data(item) for item in cached.final_plan.items]
+        self.assertEqual([tuple(piece.shape) for piece in pieces], [(1, 4, 8), (1, 2, 8)])
+        torch.testing.assert_close(pieces[0].reshape(-1), torch.arange(48, 80))
+        torch.testing.assert_close(pieces[1].reshape(-1), torch.arange(80, 96))
 
     def test_save_planner_plan_cache_hit(self):
         """

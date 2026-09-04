@@ -90,7 +90,6 @@ class StandardSavePlanner(SavePlanner):
         self.save_to_minimum_rank: bool = save_to_minimum_rank
         self.flatten_state_dict: bool = True
         self._enable_plan_caching: bool = enable_plan_caching
-        self._default_enable_plan_caching: bool = enable_plan_caching
         self._cached_plans_key: str = self.__class__.__name__
 
     def configure_planner(self, state_dict: dict[str, Any], **kwargs) -> None:
@@ -109,23 +108,15 @@ class StandardSavePlanner(SavePlanner):
         self.flatten_state_dict = kwargs.get("flatten_state_dict", True)
 
         use_collectives = bool(kwargs.get("use_collectives", True))
-        self._enable_plan_caching = bool(
-            kwargs.get("enable_plan_caching", self._default_enable_plan_caching)
-        )
         if not use_collectives:
             self.remove_redundancy = False
             self._enable_plan_caching = False
+        elif "enable_plan_caching" in kwargs:
+            self._enable_plan_caching = bool(kwargs["enable_plan_caching"])
 
         if self.flatten_state_dict:
             state_dict, self.name_mapping = flatten_state_dict(state_dict)
         self.state_dict = state_dict
-        if any(
-                isinstance(obj, DTensor)
-                and obj.layout is not None
-                and obj.layout.ragged_shard is not None
-                for obj in state_dict.values()
-        ):
-            self._enable_plan_caching = False
         self._cached_plans_key = self._build_cache_key(state_dict)
 
     def _build_cache_key(self, state_dict: dict[str, Any]) -> str:
