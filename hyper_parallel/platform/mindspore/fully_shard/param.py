@@ -43,7 +43,6 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     apply_gradient_scaling_factor,
 )
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
-from hyper_parallel.core.utils import compute_local_shape_and_global_offset_by_ceil_chunk
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
 from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
 
@@ -67,6 +66,72 @@ def _pad_dim0_for_communication(tensor: ms.Tensor, padded_dim0: int) -> ms.Tenso
     if normalize_runtime_device(padding.device) != normalize_runtime_device(tensor.device):
         padding = padding.to(normalize_runtime_device(tensor.device))
     return ms.mint.cat((tensor, padding), dim=0)
+
+
+def _split_sharded_param(
+    tensor: ms.Tensor,
+    shard_world_size: int,
+    shard_dim: int,
+) -> Tuple[ms.Tensor, ...]:
+    """Split a tensor into exactly ``shard_world_size`` contiguous shards.
+
+    Shard sizes differ by at most one, and the first ``dim_size % shard_world_size``
+    shards receive one additional element. For example, splitting a dimension of
+    size 6 over 4 ranks produces shard sizes ``(2, 2, 1, 1)``.
+    """
+    dim_size = tensor.shape[shard_dim]
+    base_chunk_size, remainder = divmod(dim_size, shard_world_size)
+    split_sizes = [base_chunk_size + 1] * remainder
+    split_sizes.extend([base_chunk_size] * (shard_world_size - remainder))
+    return tuple(ms.mint.split(tensor, split_sizes, dim=shard_dim))
+
+
+def _pack_dim0_reduce_scatter_input(
+    tensor: ms.Tensor,
+    shard_world_size: int,
+) -> ms.Tensor:
+    """Pack dim-0 shards into equal-sized reduce-scatter input slots.
+
+    For example, six rows over four ranks produce logical chunks of sizes
+    ``(2, 2, 1, 1)``. After padding each rank slot to two rows, the collective
+    input is ``[r0, r1] [r2, r3] [r4, pad] [r5, pad]``. Concatenating these
+    slots preserves the balanced rank assignment; padding only at the tensor
+    tail would incorrectly place both ``r4`` and ``r5`` in rank 2's slot.
+    """
+    chunks = _split_sharded_param(tensor, shard_world_size, shard_dim=0)
+    padded_dim0 = chunks[0].shape[0]
+    padded_chunks = tuple(
+        _pad_dim0_for_communication(chunk, padded_dim0)
+        for chunk in chunks
+    )
+    return ms.mint.cat(padded_chunks, dim=0)
+
+
+def _unpack_dim0_all_gather_output(
+    packed_data: ms.Tensor,
+    logical_dim0: int,
+    shard_world_size: int,
+    padded_sharded_shape: Tuple[int, ...],
+) -> ms.Tensor:
+    """Remove per-rank padding from gathered balanced dim-0 chunks.
+
+    For the ``6 / 4`` example, all-gather returns
+    ``[r0, r1] [r2, r3] [r4, pad] [r5, pad]``. Taking the first six flattened
+    rows would yield ``[r0, r1, r2, r3, r4, pad]`` and lose ``r5``. The valid
+    prefix of each rank slot must therefore be concatenated to restore
+    ``[r0, r1, r2, r3, r4, r5]``.
+    """
+    base_chunk_size, remainder = divmod(logical_dim0, shard_world_size)
+    chunk_sizes = [base_chunk_size + 1] * remainder
+    chunk_sizes.extend([base_chunk_size] * (shard_world_size - remainder))
+    packed_chunks = packed_data.view(
+        (shard_world_size, *padded_sharded_shape)
+    )
+    logical_chunks = tuple(
+        packed_chunks[rank].narrow(0, 0, chunk_size)
+        for rank, chunk_size in enumerate(chunk_sizes)
+    )
+    return ms.mint.cat(logical_chunks, dim=0)
 
 
 def make_contiguous_strides_for(shape, row_major=True):
@@ -238,7 +303,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._parameter_hook_migrator._save_backward_hooks(param)
         self.unsharded_param_buffers: List[ms.Tensor] = []
         self.unsharded_accumulated_grad = None
-        self._unsharded_param: Optional[Parameter] = None
         self._param_fqn: Optional[str] = None
         # Communication attributes for prefetch pattern
         self.allgather_comm_ctx = AllGatherCommCtx()
@@ -461,45 +525,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             )
         return hsdp_placement
 
-    def _init_shard_metadata(
-        self,
-        param: Parameter,
-        hsdp_placement: Shard,
-    ) -> tuple[list, ms.Tensor, int, int]:
-        """Initialize parameter shape and mesh metadata used by sharding."""
-
-        self.hsdp_placement = hsdp_placement
-        base_placements = list(self._get_base_spmd_placements())
-        param_data = param.to_local() if self._orig_param_is_dtensor else param
-        shard_dim = hsdp_placement.dim
-        if param_data.ndim == 0:
-            raise ValueError("fully_shard does not support scalar parameters")
-        if shard_dim < 0 or shard_dim >= param_data.ndim:
-            raise ValueError(
-                f"Invalid fully_shard dim {shard_dim} for parameter "
-                f"{self._module_info.param_name} with shape {tuple(param_data.shape)}"
-            )
-        self._orig_size = param_data.shape
-        self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
-
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            self.shard_rank = self.mesh_info.shard_mesh_rank
-            self.shard_world_size = self.mesh_info.shard_mesh_size
-        else:
-            self.shard_rank = 0
-            self.shard_world_size = 1
-        if isinstance(self.mesh_info, DDPMeshInfo):
-            self.replicate_world_size = self.mesh_info.replicate_mesh_size
-        else:
-            self.replicate_world_size = 1
-        self.is_replicate_param = (
-            isinstance(self.mesh_info, DDPMeshInfo)
-            and not isinstance(self.mesh_info, HSDPMeshInfo)
-        )
-        self.is_sharded = self.shard_world_size > 1
-        dim_shard_size = (param_data.shape[shard_dim] + self.shard_world_size - 1) // self.shard_world_size
-        return base_placements, param_data, shard_dim, dim_shard_size
-
     def _init_shard_placements(
         self,
         param_data: ms.Tensor,
@@ -531,39 +556,62 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             spmd_placements[self._spmd_shard_mesh_dim] = fsdp_placement
         self._spmd_placements = tuple(spmd_placements)
 
-    def _build_sharded_param_data(
+    @_no_grad()
+    def _init_sharded_param(
         self,
-        param_data: ms.Tensor,
-        shard_dim: int,
-        dim_shard_size: int,
-    ) -> ms.Tensor:
-        """Create the actual local shard and its fixed-size communication storage."""
-        local_shape, global_offset = compute_local_shape_and_global_offset_by_ceil_chunk(
-            param_data.shape,
-            shard_dim,
+        param: Parameter,
+        shard_placement_fn: Optional[Callable],
+    ) -> None:
+        """Initialize the persistent sharded parameter and communication storage."""
+        hsdp_placement = self._resolve_hsdp_placement(param, shard_placement_fn)
+        self.hsdp_placement = hsdp_placement
+        base_placements = list(self._get_base_spmd_placements())
+        param_data = param.to_local() if self._orig_param_is_dtensor else param
+        shard_dim = hsdp_placement.dim
+        if param_data.ndim == 0:
+            raise ValueError("fully_shard does not support scalar parameters")
+        if shard_dim < 0 or shard_dim >= param_data.ndim:
+            raise ValueError(
+                f"Invalid fully_shard dim {shard_dim} for parameter "
+                f"{self._module_info.param_name} with shape {tuple(param_data.shape)}"
+            )
+        self._orig_size = param_data.shape
+        self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
+
+        if isinstance(self.mesh_info, FSDPMeshInfo):
+            self.shard_rank = self.mesh_info.shard_mesh_rank
+            self.shard_world_size = self.mesh_info.shard_mesh_size
+        else:
+            self.shard_rank = 0
+            self.shard_world_size = 1
+        if isinstance(self.mesh_info, DDPMeshInfo):
+            self.replicate_world_size = self.mesh_info.replicate_mesh_size
+        else:
+            self.replicate_world_size = 1
+        self.is_replicate_param = (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and not isinstance(self.mesh_info, HSDPMeshInfo)
+        )
+        self.is_sharded = self.shard_world_size > 1
+        if param_data.shape[shard_dim] < self.shard_world_size:
+            raise ValueError(
+                f"MindSpore fully_shard balanced chunking requires sharded dimension size to be greater than or "
+                f"equal to the shard world size, but parameter {self._module_info.param_name} has shape "
+                f"{tuple(param_data.shape)}, shard dim {shard_dim}, and shard world size {self.shard_world_size}"
+            )
+
+        self._init_shard_placements(param_data, shard_dim, base_placements)
+
+        chunks = _split_sharded_param(
+            param_data,
             self.shard_world_size,
-            self.shard_rank,
+            shard_dim,
         )
-        actual_shard_offset = global_offset[shard_dim]
-        actual_shard_length = local_shape[shard_dim]
-        # Tensor.narrow rejects ``start == dim_size`` for an empty shard, while
-        # mint.narrow preserves Torch's ceil-chunk semantics for trailing ranks.
-        sharded_param = ms.mint.cat(
-            (
-                ms.mint.narrow(
-                    param_data,
-                    shard_dim,
-                    actual_shard_offset,
-                    actual_shard_length,
-                ),
-            ),
-            dim=0,
-        )
+        local_shard = chunks[self.shard_rank]
+        sharded_param = local_shard.clone().contiguous()
         self.sharded_size = sharded_param.shape
         self.contiguous_sharded_stride = make_contiguous_strides_for(self.sharded_size)
-        padded_sharded_size = list(param_data.shape)
-        padded_sharded_size[shard_dim] = dim_shard_size
-        self.padded_sharded_param_size = tuple(padded_sharded_size)
+        self.padded_sharded_param_size = chunks[0].shape
         if self.offload_to_cpu and not sharded_param.is_meta:
             sharded_param = sharded_param.to("cpu")
             if self.pin_memory:
@@ -580,30 +628,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 padded_sharded_param = padded_sharded_param.pin_memory()
         # Keep the fixed-size communication storage outside autograd from its
         # initial construction as well as after a DelayInit refresh. The
-        # logical shard returned below remains the optimizer-owned tensor.
-        self._sharded_param_data = padded_sharded_param.detach().reshape(-1)
-        # MindSpore optimizers must update the independent logical shard, not a
-        # narrow view into padded communication storage.
-        return sharded_param
-
-    @_no_grad()
-    def _init_sharded_param(
-        self,
-        param: Parameter,
-        shard_placement_fn: Optional[Callable],
-    ) -> None:
-        """Initialize the persistent sharded parameter and communication storage."""
-        hsdp_placement = self._resolve_hsdp_placement(param, shard_placement_fn)
-        base_placements, param_data, shard_dim, dim_shard_size = self._init_shard_metadata(
-            param,
-            hsdp_placement,
-        )
-        self._init_shard_placements(param_data, shard_dim, base_placements)
-        sharded_param = self._build_sharded_param_data(
-            param_data,
-            shard_dim,
-            dim_shard_size,
-        )
+        # logical shard remains the optimizer-owned tensor.
+        self._sharded_param_data = padded_sharded_param.detach().view(-1)
 
         self._sharding_spec = self._build_sharding_spec(param, param_data)
 
@@ -644,13 +670,18 @@ class MindSporeHSDPParamV2(HSDPParamV2):
     ):
         if not force_recreate and len(self.unsharded_param_buffers) > 0:
             return  # already initialized
+        if force_recreate and hasattr(self, "_unsharded_param"):
+            raise RuntimeError(
+                "Cannot recreate unsharded_param_buffers after initializing the stable "
+                "unsharded parameter."
+            )
         self.unsharded_param_buffers = [
             ms.mint.empty([numel * world_size], dtype=dtype, device=device.split(':')[0])
             for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
         ]
 
     def init_unsharded_param(self) -> None:
-        """Initialize the logical full parameter from its all-gather storage."""
+        """Initialize the stable unsharded parameter from its final output storage."""
         if len(self.unsharded_param_buffers) != 1:
             raise AssertionError(
                 f"Expected 1 unsharded_param_buffer, got {len(self.unsharded_param_buffers)}"
@@ -658,42 +689,62 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         all_gather_output = self.allgather_comm_ctx.allgather_output
         if all_gather_output is not None:
-            packed_shape = list(self.sharded_size)
-            packed_shape[0] *= self.shard_world_size
-            packed_param = all_gather_output.reshape(packed_shape)
-            param_chunks = packed_param.chunk(self.shard_world_size, dim=0)
-            unsharded_param = ms.mint.cat(param_chunks, dim=self.hsdp_placement.dim)
+            if self.hsdp_placement.dim == 0:
+                if self._orig_size[0] % self.shard_world_size == 0:
+                    output_kind = (
+                        "the stable unsharded buffer"
+                        if all_gather_output is self.unsharded_param_buffers[0]
+                        else "a separate temporary buffer"
+                    )
+                    raise AssertionError(
+                        "Internal fully_shard invariant violated for parameter "
+                        f"'{self._module_info.param_name}': even dim-0 all-gather with logical shape "
+                        f"{tuple(self._orig_size)} and shard world size {self.shard_world_size} must write "
+                        f"directly into unsharded_param_buffers[0] and clear "
+                        f"allgather_comm_ctx.allgather_output before init_unsharded_param(), but "
+                        f"{output_kind} remains. Check output-buffer routing and cleanup in "
+                        f"_get_unsharded_param_data()."
+                    )
+                unsharded_param = _unpack_dim0_all_gather_output(
+                    all_gather_output,
+                    self._orig_size[0],
+                    self.shard_world_size,
+                    self.padded_sharded_param_size,
+                )
+            else:
+                packed_shape = list(self.sharded_size)
+                packed_shape[0] *= self.shard_world_size
+                packed_param = all_gather_output.view(packed_shape)
+                param_chunks = packed_param.chunk(self.shard_world_size, dim=0)
+                unsharded_param = ms.mint.cat(param_chunks, dim=self.hsdp_placement.dim)
+            unsharded_param = _pad_dim0_for_communication(
+                unsharded_param.view(-1),
+                self.unsharded_param_buffers[0].numel(),
+            )
             copy_without_bumping_version(
                 self.unsharded_param_buffers[0],
-                unsharded_param.reshape(-1),
+                unsharded_param,
             )
             all_gather_output.untyped_storage().resize_(0)
             self.allgather_comm_ctx.allgather_output = None
+
+        if hasattr(self, "_unsharded_param"):
+            # The stable Parameter already views ``unsharded_param_buffers[0]``.
+            # Refreshing that buffer above is sufficient for every later cycle.
+            return
 
         unsharded_numel = math.prod(self._orig_size)
         # The buffer may be a view chain into `_sharded_param_data` (non-leaf when
         # rebuilt outside _no_grad, e.g. the DelayInit refresh path). Narrow first,
         # then detach the final view so the unsharded logical parameter stays a leaf.
         unsharded_param = self.unsharded_param_buffers[0].narrow(0, 0, unsharded_numel).detach()
-        unsharded_param = unsharded_param.reshape(self._orig_size)
+        unsharded_param = unsharded_param.view(self._orig_size)
         if self._orig_param_is_dtensor:
             unsharded_param = DTensor.from_local(
                 unsharded_param,
                 self._orig_dtensor_mesh,
                 self._orig_dtensor_placements,
             )
-        if self._unsharded_param is not None:
-            # Keep the Parameter identity stable across forward-reshard-backward
-            # cycles so backward hooks continue to read gradients from the same
-            # object that participated in the forward graph.
-            if self._orig_param_is_dtensor:
-                self._unsharded_param.set_data(unsharded_param)
-            else:
-                self._unsharded_param.data = unsharded_param
-            set_requires_grad_if_needed(self.sharded_param, self._unsharded_param)
-            self._unsharded_param.grad = None
-            return
-        if self._orig_param_is_dtensor:
             self._unsharded_param = Parameter(
                 unsharded_param,
                 name=self.sharded_param.name,
@@ -707,6 +758,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             name=self.sharded_param.name,
             requires_grad=False,
         )
+        # reset self._unsharded_param tensor_impl
         self._unsharded_param.data = unsharded_param
         if self.sharded_param.requires_grad:
             self._unsharded_param.requires_grad = True
@@ -911,7 +963,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             if self.pin_memory and not padded_local_tensor.is_meta:
                 padded_local_tensor = padded_local_tensor.pin_memory()
         # Communication storage must stay outside autograd when DelayInit refreshes with grad enabled.
-        self._sharded_param_data = padded_local_tensor.detach().reshape(-1)
+        self._sharded_param_data = padded_local_tensor.detach().view(-1)
         set_requires_grad_if_needed(self.sharded_param, local_tensor)
         self.sharded_param._local_tensor = local_tensor
         if not self.sharded_param._local_tensor.is_contiguous():
@@ -989,9 +1041,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.alloc_unsharded_param_buffers()
 
         self.allgather_comm_ctx.allgather_output = self.unsharded_param_buffers[0]
-        if self.hsdp_placement.dim != 0:
-            # Non-dim-0 shards require chunk + cat after the collective. The
-            # stable full-parameter buffer must not be overwritten beforehand.
+        if (
+            self.hsdp_placement.dim != 0
+            or self._orig_size[0] % self.shard_world_size != 0
+        ):
+            # Non-dim-0 shards and balanced uneven dim-0 shards require an
+            # unpack step. Preserve the stable logical full-parameter buffer.
             self.allgather_comm_ctx.allgather_output = ms.mint.empty_like(
                 self.unsharded_param_buffers[0]
             )
@@ -1052,15 +1107,17 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._grad = grad.to(self.reduce_comm_dtype(grad))
         shard_dim = self.hsdp_placement.dim
         if self.shard_world_size <= 1:
-            self._grad = self._grad.reshape(-1)
+            self._grad = self._grad.view(-1)
         elif shard_dim != 0:
             grad_chunks = self._grad.chunk(self.shard_world_size, dim=shard_dim)
-            self._grad = ms.mint.cat(grad_chunks, dim=0).reshape(-1)
+            self._grad = ms.mint.cat(grad_chunks, dim=0).view(-1)
         else:
-            padded_unsharded_dim0 = self.padded_sharded_param_size[0] * self.shard_world_size
-            if self._grad.shape[0] != padded_unsharded_dim0:
-                self._grad = _pad_dim0_for_communication(self._grad, padded_unsharded_dim0)
-            self._grad = self._grad.reshape(-1)
+            if self._grad.shape[0] % self.shard_world_size != 0:
+                self._grad = _pack_dim0_reduce_scatter_input(
+                    self._grad,
+                    self.shard_world_size,
+                )
+            self._grad = self._grad.view(-1)
 
         apply_gradient_scaling_factor(self._grad, self.gradient_scaling_factor)
 

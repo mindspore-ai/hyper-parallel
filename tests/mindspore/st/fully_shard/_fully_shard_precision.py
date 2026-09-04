@@ -14,9 +14,10 @@
 # ============================================================================
 """Pure fully_shard precision cases (MindSpore ST).
 
-A fully_shard SlimLeNet16, including its uneven 513-row parameters, and an identical single-card reference (built via
-init_empty_weights + in-process load) are trained for several optimizer steps on the same
-data; each step accumulates gradients in sharded form (grad sync on every micro-batch) and
+A fully_shard SlimLeNet16, including its uneven 513-row parameters and replicated one-row scale,
+and an identical single-card reference (built via init_empty_weights + in-process load) are trained
+for several optimizer steps on the same data; each step accumulates gradients in sharded form
+(grad sync on every micro-batch) and
 the reference's full gradient is compared against each rank's gradient shard (see
 ``_fsdp_precision_common``). No external checkpoint / dataset. Forward/backward prefetch and
 gradient accumulation are on in every case; recompute / comm_fusion / mesh vary so a single
@@ -125,6 +126,7 @@ def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion, comm_fus
             net,
             mesh=mesh,
             mp_policy=mp_policy,
+            replicate_params={net.output_scale_weight},
             comm_fusion=comm_fusion,
             comm_fusion_zero_copy=comm_fusion_zero_copy,
         )
@@ -211,8 +213,23 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
             f"{case_name}, rank {rank}, step {step}, loss: expected {reference_loss}, got {fsdp_loss}"
         )
         for idx, (full_grad, local_grad) in enumerate(zip(reference_grads, fsdp_grads)):
-            assert_shard_matches_reference(f"{case_name} step {step}", rank, f"grad {idx}",
-                                           _to_numpy(full_grad), _to_numpy(local_grad), shard_size, shard_coord)
+            full_grad_array = _to_numpy(full_grad)
+            local_grad_array = _to_numpy(local_grad)
+            if full_grad_array.shape == local_grad_array.shape:
+                assert np.allclose(full_grad_array, local_grad_array, rtol=_RTOL, atol=_ATOL), (
+                    f"{case_name}, rank {rank}, step {step}, replicated grad {idx}: "
+                    f"expected {full_grad_array}, got {local_grad_array}"
+                )
+            else:
+                assert_shard_matches_reference(
+                    f"{case_name} step {step}",
+                    rank,
+                    f"grad {idx}",
+                    full_grad_array,
+                    local_grad_array,
+                    shard_size,
+                    shard_coord,
+                )
 
         with SkipDTensorDispatch(), _no_grad():
             _apply_sgd_step(fsdp_net.trainable_params(), fsdp_grads)
