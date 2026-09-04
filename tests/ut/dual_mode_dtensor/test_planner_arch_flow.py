@@ -11,31 +11,37 @@ import logging
 import pytest
 import torch
 from torch import nn
-from hyper_parallel.auto_models.components.distributed.head_count import (
+from hyper_parallel.distributed.recipe_spec import (
+    CP,
+    EP,
+    ModuleShardingSpec,
+    TP,
+    resolve_placements,
+)
+from hyper_parallel.distributed.tensor_parallel.head_count import (
     _is_head_sharded,
     _update_user_tp_attrs,
     update_module_head_counts,
 )
-from hyper_parallel.auto_models.components.distributed.param_role import (
+from hyper_parallel.distributed.tensor_parallel.param_role import (
     ParamRole,
     ParameterClassifier,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_config import (
-    CP,
-    EP,
-    ModuleShardingSpec,
-    TEMPLATES,
-    TP,
-    resolve_placements,
-)
-from hyper_parallel.auto_models.components.distributed.sharding_applier import (
+from hyper_parallel.distributed._builder.default_templates import TEMPLATES
+from hyper_parallel.distributed._builder.forward_rewriter import (
     _add_bias_to_primary_output,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_planner import (
-    ARCH_OVERRIDES,
-    SPECIAL_HANDLERS,
+from hyper_parallel.distributed._builder.planner import (
     ShardingPlanner,
     validate_model_compatibility,
+)
+from hyper_parallel.models.registry import get_model_adapter
+from hyper_parallel.distributed._builder.default_templates import (
+    _placement_for_role,
+)
+from hyper_parallel.distributed._builder.special_handlers import (
+    SPECIAL_HANDLERS,
+    _collect_special_handlers,
 )
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
@@ -75,7 +81,7 @@ def test_deferred_bias_output_helper():
 
 # ==========================================================================
 # Source: test_s1_arch_override.py
-# S1.2: ARCH_OVERRIDES override priority + _get_architecture.
+# S1.2: arch-override priority (classifier arch_overrides) + _get_architecture.
 # ==========================================================================
 
 class _Model(nn.Module):
@@ -308,7 +314,7 @@ def test_role_to_placement():
         (ParamRole.BIAS, "unmatched.bias", Replicate()),
     ]
     for role, path, tp_want in tp_matrix:
-        out = P._placement_for_role(path, role, T, has_tp=True, has_ep=False)
+        out = _placement_for_role(path, role, T, has_tp=True, has_ep=False)
         assert out[TP] == tp_want, f"case: role_to_tp_placement[{role},{path}]"
         assert out[CP] == Replicate(), f"case: role_to_tp_placement[{role},{path}]"
         assert out[EP] == Replicate(), f"case: role_to_tp_placement[{role},{path}]"
@@ -316,55 +322,55 @@ def test_role_to_placement():
     moe_t = TEMPLATES["moe_mlp"]
 
     # case: moe_expert_ep_shard_tp_by_name -- D-08 per-expert 2D layout
-    w1 = P._placement_for_role("experts.w1", ParamRole.MOE_EXPERT, moe_t,
+    w1 = _placement_for_role("experts.w1", ParamRole.MOE_EXPERT, moe_t,
                                True, True, ndim=2)
     assert w1[EP] == Shard(0) and w1[TP] == Shard(0), \
         "case: moe_expert_ep_shard_tp_by_name"
-    w2 = P._placement_for_role("experts.w2", ParamRole.MOE_EXPERT, moe_t,
+    w2 = _placement_for_role("experts.w2", ParamRole.MOE_EXPERT, moe_t,
                                True, True, ndim=2)
     assert w2[EP] == Shard(0) and w2[TP] == Shard(1), \
         "case: moe_expert_ep_shard_tp_by_name"
 
     # case: moe_expert_3d_batched_tp_dims_shifted -- 3D [E, H_out, H_in] dim shift
-    w1 = P._placement_for_role("experts.w1", ParamRole.MOE_EXPERT, moe_t,
+    w1 = _placement_for_role("experts.w1", ParamRole.MOE_EXPERT, moe_t,
                                True, True, ndim=3)
     assert w1[EP] == Shard(0) and w1[TP] == Shard(1), \
         "case: moe_expert_3d_batched_tp_dims_shifted"
-    w2 = P._placement_for_role("experts.w2", ParamRole.MOE_EXPERT, moe_t,
+    w2 = _placement_for_role("experts.w2", ParamRole.MOE_EXPERT, moe_t,
                                True, True, ndim=3)
     assert w2[EP] == Shard(0) and w2[TP] == Shard(2), \
         "case: moe_expert_3d_batched_tp_dims_shifted"
 
     # case: moe_expert_no_tp_explicit_replicate -- has_tp=False still yields explicit TP:Replicate
-    out = P._placement_for_role("experts.w1", ParamRole.MOE_EXPERT, moe_t,
+    out = _placement_for_role("experts.w1", ParamRole.MOE_EXPERT, moe_t,
                                 has_tp=False, has_ep=True)
     assert out[TP] == Replicate(), "case: moe_expert_no_tp_explicit_replicate"
     assert out[EP] == Shard(0), "case: moe_expert_no_tp_explicit_replicate"
 
     # case: shared_expert_ep_replicate
-    w1 = P._placement_for_role("shared_experts.w1", ParamRole.SHARED_EXPERT,
+    w1 = _placement_for_role("shared_experts.w1", ParamRole.SHARED_EXPERT,
                                moe_t, True, True)
     assert w1[EP] == Replicate() and w1[TP] == Shard(0), \
         "case: shared_expert_ep_replicate"
-    w2 = P._placement_for_role("shared_experts.w2", ParamRole.SHARED_EXPERT,
+    w2 = _placement_for_role("shared_experts.w2", ParamRole.SHARED_EXPERT,
                                moe_t, True, True)
     assert w2[EP] == Replicate() and w2[TP] == Shard(1), \
         "case: shared_expert_ep_replicate"
 
     # case: special_and_skip_return_none
-    assert P._placement_for_role("a_log", ParamRole.SPECIAL, T, True, False) is None, \
+    assert _placement_for_role("a_log", ParamRole.SPECIAL, T, True, False) is None, \
         "case: special_and_skip_return_none"
-    assert P._placement_for_role("inv_freq", ParamRole.SKIP, T, True, False) is None, \
+    assert _placement_for_role("inv_freq", ParamRole.SKIP, T, True, False) is None, \
         "case: special_and_skip_return_none"
 
     # case: has_tp_false_drops_tp_key_for_dense
-    out = P._placement_for_role("q_proj.weight", ParamRole.COLWISE, T,
+    out = _placement_for_role("q_proj.weight", ParamRole.COLWISE, T,
                                 has_tp=False, has_ep=False)
     assert TP not in out, "case: has_tp_false_drops_tp_key_for_dense"
     assert out[CP] == Replicate(), "case: has_tp_false_drops_tp_key_for_dense"
 
     # case: has_ep_false_drops_ep_key_for_expert
-    out = P._placement_for_role("experts.w1", ParamRole.MOE_EXPERT, moe_t,
+    out = _placement_for_role("experts.w1", ParamRole.MOE_EXPERT, moe_t,
                                 has_tp=True, has_ep=False)
     assert EP not in out, "case: has_ep_false_drops_ep_key_for_expert"
 
@@ -410,7 +416,7 @@ def test_infer_boundary_type():
 
 # ==========================================================================
 # Source: test_s1_mla_deepseek.py
-# S1.14: DeepSeek MLA architecture overrides (ARCH_OVERRIDES + ParamRole.REPLICATED).
+# S1.14: DeepSeek MLA family sharding rules (ModelAdapterSpec.sharding_rules + ParamRole.REPLICATED).
 # ==========================================================================
 
 class _TinyMlaAttention(nn.Module):
@@ -457,22 +463,23 @@ class _TinyDeepseek(nn.Module):
 
 
 def test_mla_arch_override():
-    """MLA override registration (both spellings) + classification hits + model_type spelling + no-override regression guard."""
+    """MLA rules live in the deepseek_v3 family registration (all spellings resolve) + classification hits + no-override regression guard."""
 
-    # case: arch_overrides_registered_both_spellings -- v2/v3 are isomorphic; both spellings share one override
+    # case: family_rules_registered_all_spellings -- v2/v3 are isomorphic; every
+    # spelling (arch / model_type / canonical) resolves to the family's rules
     for key in ("deepseekv2", "deepseekv3", "deepseek_v2", "deepseek_v3"):
-        assert key in ARCH_OVERRIDES, \
-            f"case: arch_overrides_registered_both_spellings[{key}]"
-        roles = [r for _, r in ARCH_OVERRIDES[key]]
+        spec = get_model_adapter(key)
+        assert spec is not None and spec.sharding_rules is not None, \
+            f"case: family_rules_registered_all_spellings[{key}]"
+        roles = [r for _, r in spec.sharding_rules()]
         assert ParamRole.REPLICATED in roles, \
-            f"case: arch_overrides_registered_both_spellings[{key}]"
+            f"case: family_rules_registered_all_spellings[{key}]"
         assert ParamRole.COLWISE in roles, \
-            f"case: arch_overrides_registered_both_spellings[{key}]"
+            f"case: family_rules_registered_all_spellings[{key}]"
 
     # case: classifier_mla_roles -- q_a/kv_a->REPLICATED; q_b/kv_b->COLWISE; o->ROWWISE
     model = _TinyDeepseek()
-    clf = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
-    roles = clf.classify(model, "deepseekv3")
+    roles = ShardingPlanner()._classify_all_params(model, "deepseekv3")
     p = "model.layers.0.self_attn."
     assert roles[p + "q_a_proj.weight"] == ParamRole.REPLICATED, \
         "case: classifier_mla_roles"
@@ -485,8 +492,7 @@ def test_mla_arch_override():
     assert roles[p + "kv_a_layernorm.weight"] == ParamRole.NORM, "case: classifier_mla_roles"
 
     # case: classifier_model_type_spelling -- deepseek_v3 hits as well
-    clf = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
-    roles = clf.classify(_TinyDeepseek(), "deepseek_v3")
+    roles = ShardingPlanner()._classify_all_params(_TinyDeepseek(), "deepseek_v3")
     assert roles["model.layers.0.self_attn.q_a_proj.weight"] == ParamRole.REPLICATED, \
         "case: classifier_model_type_spelling"
 
@@ -561,24 +567,19 @@ def test_special_handlers():
         "model.layers.0.gated_delta.a_log": ParamRole.SPECIAL,
         "model.layers.0.self_attn.q_proj.weight": ParamRole.COLWISE,
     }
-    out = P._collect_special_handlers(roles)
+    out = _collect_special_handlers(roles, P._special_handler_patterns)
     assert out == {"model.layers.0.gated_delta.a_log": "gated_delta_tp_shard"}, \
         "case: special_role_mapped_to_handler"
 
     # case: unregistered_pattern_defaults
-    class _P(ShardingPlanner):
-        def __init__(self):
-            super().__init__()
-            self._special_handler_patterns = {}
-
-    out = _P()._collect_special_handlers({"m.x.special_w": ParamRole.SPECIAL})
+    out = _collect_special_handlers({"m.x.special_w": ParamRole.SPECIAL}, {})
     assert out == {"m.x.special_w": "default"}, "case: unregistered_pattern_defaults"
 
     # case: non_special_roles_ignored
-    out = P._collect_special_handlers({
+    out = _collect_special_handlers({
         "a.b.weight": ParamRole.COLWISE,
         "a.c.weight": ParamRole.SKIP,
-    })
+    }, P._special_handler_patterns)
     assert not out, "case: non_special_roles_ignored"
 
     # case: special_handlers_registry
@@ -884,22 +885,22 @@ class _TinyQwen2Moe(nn.Module):
 
 
 def test_qwen2moe_arch_override():
-    """Qwen2-MoE override registration (both spellings) + shared_expert_gate REPLICATED + model_type spelling."""
+    """Qwen2-MoE rules live in the qwen2_moe family registration (all spellings resolve) + shared_expert_gate REPLICATED."""
 
-    # case: arch_overrides_registered_both_spellings
+    # case: family_rules_registered_all_spellings
     for key in ("qwen2moe", "qwen2_moe"):
-        assert key in ARCH_OVERRIDES, \
-            f"case: arch_overrides_registered_both_spellings[{key}]"
+        spec = get_model_adapter(key)
+        assert spec is not None and spec.sharding_rules is not None, \
+            f"case: family_rules_registered_all_spellings[{key}]"
         assert (["shared_expert_gate"], ParamRole.REPLICATED) in list(
-            ARCH_OVERRIDES[key]), \
-            f"case: arch_overrides_registered_both_spellings[{key}]"
+            spec.sharding_rules()), \
+            f"case: family_rules_registered_all_spellings[{key}]"
 
     # case: shared_expert_gate_replicated -- do not anchor a fake routing boundary (!= MOE_GATE),
     # and do not Shard(0) the single-row weight into empty shards (!= SHARED_EXPERT,
     # accuracy_problem.md 10.1)
     model = _TinyQwen2Moe()
-    clf = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
-    roles = clf.classify(model, "qwen2moe")
+    roles = ShardingPlanner()._classify_all_params(model, "qwen2moe")
     p = "model.layers.0.mlp."
     assert roles[p + "shared_expert_gate.weight"] == ParamRole.REPLICATED, \
         "case: shared_expert_gate_replicated"
@@ -912,7 +913,6 @@ def test_qwen2moe_arch_override():
 
     # case: model_type_spelling -- qwen2_moe hits the override as well
     model = _TinyQwen2Moe(architectures=())
-    clf = ParameterClassifier(arch_overrides=ARCH_OVERRIDES)
-    roles = clf.classify(model, "qwen2_moe")
+    roles = ShardingPlanner()._classify_all_params(model, "qwen2_moe")
     assert roles["model.layers.0.mlp.shared_expert_gate.weight"] == (
         ParamRole.REPLICATED), "case: model_type_spelling"

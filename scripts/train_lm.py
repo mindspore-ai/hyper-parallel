@@ -14,9 +14,9 @@
 # ============================================================================
 """Language-model training entry point for the AutoModel workflow."""
 
-from hyper_parallel.auto_models.config.manager import parse_training_args
-from hyper_parallel.auto_models.trainer.config import TrainerConfig
-from hyper_parallel.auto_models.trainer.text_trainer import TextTrainer
+from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config import TrainerConfig
+from hyper_parallel.trainer.text_trainer import TextTrainer
 
 
 def main() -> None:

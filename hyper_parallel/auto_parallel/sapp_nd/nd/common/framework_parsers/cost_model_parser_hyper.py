@@ -15,8 +15,8 @@
 """HyperParallel AutoModels ``train.yaml`` parser (Hyper V2).
 
 Parses the HyperParallel YAML configuration format
-(``examples/demo_trainer/train.yaml``) and populates
-a :class:`CostModelConfig` for memory estimation.
+(``hyper_parallel/models/qwen3_moe/recipes/train.yaml``) and
+populates a :class:`CostModelConfig` for memory estimation.
 
 Model hyperparameters are resolved with the same Transformers
 ``AutoConfig.from_pretrained`` path used by AutoModels. Legacy
@@ -25,7 +25,7 @@ Model hyperparameters are resolved with the same Transformers
 Expected YAML structure::
 
     model:
-      _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+      _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
       pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
       torch_dtype: bfloat16
 

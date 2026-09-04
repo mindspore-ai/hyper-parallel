@@ -200,7 +200,7 @@ class TinyHFNativeMoEMLP(nn.Module):
     ModuleList; forward loops over experts — no all_to_all, no dispatcher
     hooks, no EP awareness.
 
-    Routing semantics match ep_utils._softmax_topk_router (softmax → top-2 →
+    Routing semantics match expert_parallel.routing._softmax_topk_router (softmax → top-2 →
     normalize), serving as the single-card reference implementation of the EP
     compute path.
     """
@@ -403,7 +403,7 @@ def cp_sdpa_hf_injection(match="*.self_attn"):
 
     Returns a plan_overrides fragment ({match: spec}) to merge directly into
     the ShardingPlanner plan_overrides dict."""
-    from hyper_parallel.auto_models.components.distributed.sharding_config import (
+    from hyper_parallel.distributed.recipe_spec import (
         ModuleShardingSpec,
     )
     return {match: ModuleShardingSpec(inner_target="self",
@@ -417,18 +417,18 @@ def ep_archetype_injection(match="*.mlp"):
     require writing your own factory).
 
     Returns a plan_overrides fragment ({match: spec})."""
-    from hyper_parallel.auto_models.components.distributed.ep_compute import (
+    from hyper_parallel.distributed.expert_parallel.recipes import (
         routed_only_ep_compute_fn,
     )
-    from hyper_parallel.auto_models.components.distributed.sharding_config import (
+    from hyper_parallel.distributed.recipe_spec import (
         ModuleShardingSpec,
     )
-    from hyper_parallel.auto_models.trainer.config import Target
+    from hyper_parallel.trainer.config import Target
     return {match: ModuleShardingSpec(
         local_compute_fn=Target(
             routed_only_ep_compute_fn,
-            target_path="hyper_parallel.auto_models.components.distributed."
-                        "ep_compute.routed_only_ep_compute_fn"), region_dispatch=False)}
+            target_path="hyper_parallel.distributed."
+                        "recipes.routed_only_ep_compute_fn"), region_dispatch=False)}
 
 @pytest.fixture
 def tiny_llama():

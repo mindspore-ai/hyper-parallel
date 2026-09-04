@@ -1,6 +1,6 @@
 # YAML Trainer 配置结构
 
-AutoModels 按 [`TrainerConfig`](../../../hyper_parallel/auto_models/trainer/config.py#L720-L753) 的字段定义解析 YAML。字段名决定 YAML 可以包含哪些配置项，字段类型决定对应的值如何解析。解析完成后得到 `TrainerConfig` 对象，随后通过 CLI dotted overrides 更新配置字段。
+AutoModels 按 [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) 的字段定义解析 YAML。字段名决定 YAML 可以包含哪些配置项，字段类型决定对应的值如何解析。解析完成后得到 `TrainerConfig` 对象，随后通过 CLI dotted overrides 更新配置字段。
 
 ```python
 @dataclass
@@ -47,13 +47,13 @@ accelerator:
 
 ## 2. Target 节点
 
-[`Target`](../../../hyper_parallel/auto_models/trainer/config.py#L182-L223) 是一个延迟调用 Python 类或函数的配置对象。它保存导入后的目标对象、原始导入路径和 YAML 参数；调用 `build()` 时，再合并 Trainer 提供的运行时参数并创建组件。
+[`Target`](../../../hyper_parallel/trainer/config/target.py#L54) 是一个延迟调用 Python 类或函数的配置对象。它保存导入后的目标对象、原始导入路径和 YAML 参数；调用 `build()` 时，再合并 Trainer 提供的运行时参数并创建组件。
 
 以模型配置为例：
 
 ```yaml
 model:
-  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
@@ -61,22 +61,22 @@ model:
   force_hf: true
 ```
 
-框架完成对于配置的解析 [`_resolve_target()`](../../../hyper_parallel/auto_models/config/resolver.py#L346-L381)：Resolver 导入 `_target_` 指向的对象，校验并规范化 YAML 参数，然后构造：
+框架完成对于配置的解析 [`_resolve_target()`](../../../hyper_parallel/trainer/config/resolver.py#L347-L382)：Resolver 导入 `_target_` 指向的对象，校验并规范化 YAML 参数，然后构造：
 
 ```python
 config.model = Target(
     HyperAutoModelForCausalLM.from_pretrained,
     target_path=(
-        "hyper_parallel.auto_models._transformers."
+        "hyper_parallel.models."
         "HyperAutoModelForCausalLM.from_pretrained"
     ),
     **normalized_args,
 )
 ```
 
-`normalized_args` 包含 YAML 参数和 [`HyperAutoModelForCausalLM.from_pretrained()`](../../../hyper_parallel/auto_models/_transformers/auto_model.py#L72-L142) 的默认参数。此时只生成配置对象，不调用 `from_pretrained`，也不加载模型权重。
+`normalized_args` 包含 YAML 参数和 [`HyperAutoModelForCausalLM.from_pretrained()`](../../../hyper_parallel/models/_transformers/auto_model.py#L77-L152) 的默认参数。此时只生成配置对象，不调用 `from_pretrained`，也不加载模型权重。
 
-[`BaseTrainer._build_model()`](../../../hyper_parallel/auto_models/trainer/base.py#L374-L383) 在分布式环境初始化完成后构建模型：
+[`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) 在分布式环境初始化完成后构建模型：
 
 ```python
 self.model = self.config.model.build(
@@ -105,7 +105,7 @@ self.model = HyperAutoModelForCausalLM.from_pretrained(
 )
 ```
 
-[`TrainerConfig`](../../../hyper_parallel/auto_models/trainer/config.py#L720-L729) 通过字段类型声明各配置节点的解析方式：`Target[...]` 字段解析为 `Target`，dataclass 字段解析为对应的 dataclass。
+[`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) 通过字段类型声明各配置节点的解析方式：`Target[...]` 字段解析为 `Target`，dataclass 字段解析为对应的 dataclass。
 
 解析 `Target` 时会检查：
 

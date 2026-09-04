@@ -22,46 +22,55 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
-from hyper_parallel.auto_models.components.distributed import ep_compute
-from hyper_parallel.auto_models.components.distributed.ep_compute import routed_only_ep_compute_fn
-from hyper_parallel.auto_models.components.distributed.ep_utils import (
+from hyper_parallel.distributed.expert_parallel import recipes as ep_compute
+from hyper_parallel.distributed.expert_parallel.recipes import routed_only_ep_compute_fn
+from hyper_parallel.distributed.expert_parallel.routing import (
     MOE_ROUTER_ADAPTERS,
-    _local_swiglu_expert_forward,
     _sigmoid_group_router,
     _softmax_topk_router,
-    resolve_swiglu_weights,
     _topk_router_module,
 )
-from hyper_parallel.auto_models.components.distributed.injection import (
+from hyper_parallel.distributed.expert_parallel.experts import (
+    _local_swiglu_expert_forward,
+    resolve_swiglu_weights,
+)
+from hyper_parallel.distributed.recipe_spec import (
     local_compute,
 )
-from hyper_parallel.auto_models.components.distributed.precompiled_boundary import PrecompiledBoundary
-from hyper_parallel.auto_models.components.distributed.sharding.apply import (
+from hyper_parallel.distributed._builder.precompiled_boundary import PrecompiledBoundary
+from hyper_parallel.models.qwen3_moe.adapter.distributed import (
+    expert_parallel as qwen3_adapter_ep,
+)
+from hyper_parallel.distributed._builder.parameter_sharding import (
     _StackedExperts,
     _stack_moe_experts,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_applier import (
+from hyper_parallel.distributed._builder.applier import (
     _apply_phase_c,
     _expert_mesh_layout,
+)
+from hyper_parallel.distributed._builder.forward_rewriter import (
     _rewrap_local_outputs,
-    _resolve_local_compute_fn,
     _wrap_local_region_forward,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_config import (
+from hyper_parallel.distributed._builder.rule_resolver import (
+    _resolve_local_compute_fn,
+)
+from hyper_parallel.distributed.plan import ShardingPlan
+from hyper_parallel.distributed.recipe_spec import (
     CP,
     EP,
     ModuleShardingSpec,
-    ShardingPlan,
-    TEMPLATES,
     TP,
     _normalize_out_fields,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_parallel.distributed._builder.default_templates import TEMPLATES
+from hyper_parallel.distributed._builder.planner import ShardingPlanner
 try:
-    from hyper_parallel.auto_models.trainer.config import Target
+    from hyper_parallel.trainer.config import Target
     _HAS_TRAINER_CONFIG = True
 except ImportError:
-    # trainer.config pulls in model_transform / checkpoint conversion, which
+    # trainer.config pulls in replacement / checkpoint conversion, which
     # require a newer transformers than some CI gates provide.
     _HAS_TRAINER_CONFIG = False
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
@@ -210,7 +219,7 @@ def test_declaration_and_region_dispatch(make_mesh, monkeypatch):
         return f"wrapped-{len(calls)}"
 
     monkeypatch.setattr(
-        "hyper_parallel.auto_models.components.distributed.sharding_applier.DTensor.from_local",
+        "hyper_parallel.distributed._builder.forward_rewriter.DTensor.from_local",
         fake_from_local,
     )
     outputs = [torch.ones(2), torch.zeros(2), None]
@@ -585,8 +594,8 @@ def test_local_compute_fn_contract_errors(make_mesh):
     spec = _identity_spec()
     spec.local_compute_fn = Target(
         routed_only_ep_compute_fn,
-        target_path="hyper_parallel.auto_models.components.distributed."
-                    "ep_compute.routed_only_ep_compute_fn",
+        target_path="hyper_parallel.distributed."
+                    "recipes.routed_only_ep_compute_fn",
         blok_size="oops")                     # typo: should be block_size
     spec.region_dispatch = False
     with pytest.raises(ValueError, match="undeclared keys"):
@@ -600,8 +609,8 @@ def test_local_compute_fn_contract_errors(make_mesh):
     spec = _identity_spec()
     spec.local_compute_fn = Target(
         routed_only_ep_compute_fn,
-        target_path="hyper_parallel.auto_models.components.distributed."
-                    "ep_compute.routed_only_ep_compute_fn",
+        target_path="hyper_parallel.distributed."
+                    "recipes.routed_only_ep_compute_fn",
         mesh="oops")
     spec.region_dispatch = False
     with pytest.raises(ValueError, match="framework-reserved context keys"):
@@ -616,7 +625,7 @@ def test_local_compute_fn_contract_errors(make_mesh):
 # ==========================================================================
 
 def test_ep_archetype_factories(make_mesh, monkeypatch):
-    """Built-in EP archetype factories (ep_compute.py): use of the mesh family
+    """Built-in EP archetype factories (recipes.py): use of the mesh family
     context + explicit router selection + each archetype's combine formula
     (accuracy_fix_plan.md section 3 E2)."""
     mesh = make_mesh((1,), ("tp",))
@@ -626,7 +635,7 @@ def test_ep_archetype_factories(make_mesh, monkeypatch):
     # ep_mesh.get_group("ep") and hands it to ep_routed_forward; the router
     # is embedded (default softmax top-k); no tp_group -- the TP
     # communication of a nested boundary is self-contained by the
-    # sub-boundary (contract in ep_utils).
+    # sub-boundary (contract in expert_parallel.experts).
     module = _TinyMoeMod()
     captured = _capture_ep_primitives(monkeypatch)
     compute_fn = ep_compute.routed_only_ep_compute_fn(
@@ -659,10 +668,12 @@ def test_ep_archetype_factories(make_mesh, monkeypatch):
         "case: qwen2moe_factory_combines_shared_and_gate"
 
     # ── case: test_qwen3_factory_embeds_topk_router ──
-    # Qwen3-MoE uses its explicit TopKRouter factory.
+    # Qwen3-MoE uses its explicit TopKRouter factory, migrated to the model
+    # adapter in M3; the generic combine skeleton stays in recipes.py, so the
+    # monkeypatched recipes primitives are still what the factory binds.
     module = _TinyMoeMod()
     captured = _capture_ep_primitives(monkeypatch)
-    compute_fn = ep_compute.qwen3moe_ep_compute_fn(
+    compute_fn = qwen3_adapter_ep.qwen3moe_ep_compute_fn(
         module=module,
         mesh=None,
         tp_mesh=None,

@@ -1,0 +1,194 @@
+# Qwen3-30B-A3B 完整训练配方（唯一对外交付的 Qwen3-MoE recipe）。
+#
+# 预期资源：单机 8 卡 Ascend NPU（hccl backend）；更大的 CP/EP 拓扑通过
+# 下方 plan_overrides 的 `when: cp` / `when: ep` 条件声明自动生效，无需
+# 维护第二份配置。
+#
+# 默认加载公开 Hugging Face 资源（模型、tokenizer、dataset）。本地或离线
+# 资源用命令行覆盖，例如：
+#   scripts/train_lm.py <this file> \
+#     --model.pretrained_model_name_or_path=/path/to/Qwen3-30B-A3B \
+#     --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/Qwen3-30B-A3B
+
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  ignore_mismatched_sizes: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_iters: 3
+  train_samples: null
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - model.norm
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
+    replace_module:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_rms_norm
+  - match: "*.self_attn"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+    replace_module:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_flash_attention
+  # The experts module is always the same grouped-GEMM implementation;
+  # enabling EP changes only token dispatch/combine around this boundary.
+  - match: "*.mlp.experts"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
+    replace_module:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_grouped_experts
+  # This CP wrapper accepts Online global block masks and falls back to an
+  # implicit offset-aware causal mask for Offline Indexed Dataset input.
+  - match: "*.self_attn"
+    when: cp
+    region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper
+  # EP conditional override: Qwen3-MoE TopKRouter archetype compute.
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+      use_grouped_gemm: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+      use_fast: true
+      trust_remote_code: true
+  data_transform:
+    _target_: hyper_parallel.data.text.build_data_transform.build_llm_data_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 4096
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: Salesforce/wikitext
+    hf_config_name: wikitext-2-raw-v1
+    cache_dir: null
+    labels_are_shifted: false
+    create_attention_mask_in_dataloader: true
+    create_ltor_fields_in_dataloader: false
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
+  data_path: null
+
+dataloader:
+  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
+  min_buffered_samples: 200
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.ParallelBatch
+    source_type: online
+    attention_mode: dense
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  no_decay_params: [bias, norm, ln_]
+  muon_config:
+    muon_lr: 3.0e-5
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 3.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/qwen3_moe/checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: false
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiling:
+  enabled: false
+  start_step: 3
+  end_step: 4
+  trace_dir: ./outputs/qwen3_moe/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  rank: 0

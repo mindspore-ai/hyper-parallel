@@ -38,7 +38,7 @@ Known models (LLaMA, GPT, Mixtral, …) auto-fill from `known-models.md`.
 
 1. **Global baseline** — memory without parallelism, FLOPs/step, bottleneck
 2. **Strategy summary** — e.g. `DP=4, TP=8, PP=2, FSDP=level2` + mem/bubble/comm/MFU
-3. **DeviceMesh code** — `init_device_mesh` + `fully_shard` / `shard_module`
+3. **DeviceMesh code** — `init_device_mesh` + `fully_shard`
 4. **Post-shard memory** — params, grads, optimizer, activations per device
 5. **Communication breakdown** — per-dimension volume / exposed time
 6. **Pipeline bubble** — ratio + 1F1B vs interleaved

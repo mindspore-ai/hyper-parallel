@@ -96,7 +96,6 @@ performance.
         - [x] Custom Distributed Operator Registration (YAML registry + Python impl)
         - [x] Custom Shard
         - [x] DFunction (custom distributed autograd functions)
-        - [x] parallelize_value_and_grad
         - [x] Loss Parallel (TP training loss parallelism)
         - TP Styles
             - [x] ColwiseParallel / RowwiseParallel / SequenceParallel
@@ -350,44 +349,7 @@ mesh = init_device_mesh(device_type="npu", mesh_shape=(dp_size,), mesh_dim_names
 model = fully_shard(model, mesh=mesh)
 ```
 
-2. Use `shard_module` for tensor parallelism
-
-```python
-from mindspore.nn.utils import no_init_parameters
-from hyper_parallel import DTensor, fully_shard, init_device_mesh, init_parameters, shard_module
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.core.shard.sharding_plan import ShardingPlan
-
-# Define device mesh and placement
-mesh = init_device_mesh(device_type="npu", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-x_placement = (Shard(0), Shard(1))
-w_placement = (Replicate(), Shard(0))
-out_placement = (Shard(0), Replicate())
-
-# Delayed network weight initialization
-with no_init_parameters():
-    model = SimpleModel()
-
-# Configure sharding for network input/output/weights
-sharding_plan = ShardingPlan(
-    input_plan={"input": x_placement},
-    output_plan={"output": out_placement},
-    plan={"weight": w_placement},
-)
-model = shard_module(model, device_mesh=mesh, sharding_plan=sharding_plan)
-
-# Can further configure fully_shard
-model = fully_shard(model, mesh=mesh["dp"])
-
-# Sharded weight initialization
-model = init_parameters(model)
-
-# Execute
-x = DTensor.from_local(local_x, mesh, x_placement)
-run_model(x, model)
-```
-
-3. Use declarative TP Styles for tensor parallelism
+2. Use declarative TP Styles for tensor parallelism
 
 ```python
 from hyper_parallel import ColwiseParallel, RowwiseParallel, parallelize_module, init_device_mesh
