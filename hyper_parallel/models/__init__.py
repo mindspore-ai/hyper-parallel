@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=undefined-all-variable
 """Models: public entry of the model-building suite.
 
 This package is the external interface of the former ``auto_models``
@@ -23,10 +24,9 @@ must not import Trainer/Data, read YAML, hit the network, build models or
 initialize distributed. The shared data contract lives in
 ``adapter_spec.py``, discovery in ``registry.py`` — both lazy.
 
-The AutoModel facade loads the full torch/Transformers runtime; keep
-package initialization lightweight for config-only imports (the converged
-recipe path is ``hyper_parallel.models.HyperAutoModelForCausalLM
-.from_pretrained``).
+The AutoModel facades load the full torch/Transformers runtime; keep package
+initialization lightweight for config-only imports.  Recipes resolve the
+appropriate facade from this package and call ``from_pretrained``.
 """
 
 import importlib
@@ -42,11 +42,17 @@ from hyper_parallel.models.build_options import (
 )
 
 if TYPE_CHECKING:
-    from hyper_parallel.models._transformers import HyperAutoModelForCausalLM
+    from hyper_parallel.models._transformers import (
+        HyperAutoModelForCausalLM,
+        HyperAutoModelForImageTextToText,
+        HyperAutoModelForSequenceClassification,
+    )
 
 
 _LAZY_FACADE_EXPORTS = {
     "HyperAutoModelForCausalLM": "hyper_parallel.models._transformers",
+    "HyperAutoModelForImageTextToText": "hyper_parallel.models._transformers",
+    "HyperAutoModelForSequenceClassification": "hyper_parallel.models._transformers",
 }
 
 __all__ = [
@@ -54,6 +60,8 @@ __all__ = [
     "FSDP2Config",
     "FSDP2MixedPrecisionConfig",
     "HyperAutoModelForCausalLM",
+    "HyperAutoModelForImageTextToText",
+    "HyperAutoModelForSequenceClassification",
     "ModelAdapterSpec",
     "ModelBuildOptions",
     "get_model_adapter",

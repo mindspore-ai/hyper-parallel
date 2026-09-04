@@ -14,10 +14,9 @@
 # ============================================================================
 """Manifold hyper-connection post-processing functions."""
 
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 
 try:
     import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
@@ -70,7 +69,6 @@ def mhc_post(
     h_post: torch.Tensor,
     h_res: torch.Tensor,
     num_stream: int,
-    use_custom_op: bool = False,
 ) -> torch.Tensor:
     """Combine transformed and residual streams after an MHC-wrapped block.
 
@@ -80,67 +78,10 @@ def mhc_post(
         h_post: Per-stream output mixing coefficients.
         h_res: Residual stream mixing matrix.
         num_stream: Number of residual streams.
-        use_custom_op: Whether to use the fused NPU custom operator.
 
     Returns:
         Flattened mixed residual streams.
     """
-    if use_custom_op:
-        x_shape = x.size()
-        residual_reshape = residual.reshape(x_shape[0], x_shape[1], num_stream, -1)
-        y_flat = _MhcPost.apply(residual_reshape, h_res, x, h_post)
-        y_flat = y_flat.flatten(2)
-        return y_flat
-    y = (
-        h_post.unsqueeze(-1) * x.unsqueeze(-2)
-        + torch.sum(
-            h_res.unsqueeze(-1)
-            * residual.unflatten(dim=-1, sizes=(num_stream, -1)).unsqueeze(-2),
-            dim=2,
-        )
-    ).flatten(2)
-    return y.type_as(x)
-
-
-def mhc_post_process(
-    x: torch.Tensor,
-    phi: torch.Tensor,
-    branch_alpha: torch.Tensor,
-    branch_beta: torch.Tensor,
-    num_stream: int,
-    norm_eps: float = 1e-6,
-    hc_eps: float = 1e-6,
-    gamma: Optional[torch.Tensor] = None,
-    hpre_renorm: bool = False,
-) -> torch.Tensor:
-    """Merge all residual streams at the end of an MHC stack.
-
-    Args:
-        x: Flattened residual streams.
-        phi: Final MHC projection weight.
-        branch_alpha: Learned coefficient scale.
-        branch_beta: Learned coefficient bias.
-        num_stream: Number of residual streams.
-        norm_eps: RMS normalization epsilon.
-        hc_eps: Hyper-connection numerical stability epsilon.
-        gamma: Optional RMS normalization scale.
-        hpre_renorm: Whether to normalize merge coefficients.
-
-    Returns:
-        The merged hidden states.
-    """
-    dtype = x.dtype
-    x = x.float()
-    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
-    if gamma is not None:
-        weight = F.linear(x * rsqrt * gamma, phi)  # pylint: disable=not-callable
-    else:
-        weight = F.linear(x, phi) * rsqrt  # pylint: disable=not-callable
-    h_pre = torch.sigmoid(
-        weight * branch_alpha + branch_beta.unsqueeze(0).unsqueeze(0)
-    ) + hc_eps
-    if hpre_renorm:
-        eps_cache = torch.full((), 1e-30, dtype=h_pre.dtype, device=h_pre.device)
-        h_pre = h_pre / h_pre.sum(dim=-1, keepdim=True).maximum(eps_cache)
-    y = torch.sum(h_pre.unsqueeze(-1) * x.unflatten(dim=-1, sizes=(num_stream, -1)), dim=2).to(dtype)
-    return y
+    x_shape = x.size()
+    residual = residual.reshape(x_shape[0], x_shape[1], num_stream, -1)
+    return _MhcPost.apply(residual, h_res, x, h_post).flatten(2)
