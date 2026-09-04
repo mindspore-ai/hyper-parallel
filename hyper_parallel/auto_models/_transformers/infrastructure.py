@@ -246,22 +246,7 @@ def _move_model_to_device(
         logger.info("Model moved to %s", device)
         return model
 
-    # torch.to_empty reconstructs Tensor subclasses from tensor-map aliases,
-    # which cannot represent custom Placement subclasses such as PackedShard.
-    parameter_layouts = {
-        name: parameter.layout
-        for name, parameter in model.named_parameters(remove_duplicate=False)
-        if isinstance(parameter, DTensor) and parameter.layout is not None
-    }
     model.to_empty(device=device)
-    for name, parameter in model.named_parameters(remove_duplicate=False):
-        layout = parameter_layouts.get(name)
-        if layout is None:
-            continue
-        parameter._sharding_spec = layout  # pylint: disable=protected-access
-        if isinstance(parameter, DTensor):
-            parameter._layout = layout  # pylint: disable=protected-access
-            parameter._placements = tuple(layout.placements)  # pylint: disable=protected-access
     return model
 
 

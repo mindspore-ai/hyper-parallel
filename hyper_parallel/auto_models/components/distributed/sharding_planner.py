@@ -64,7 +64,6 @@ from hyper_parallel.auto_models.components.distributed.sharding_config import (
     MeshAxisName,
     ModuleShardingSpec,
     NamedPlacement,
-    PackedShard,
     ShardingPlan,
     ShardingTemplate,
     TEMPLATES,
@@ -1866,25 +1865,12 @@ class ShardingPlanner:
                             f"of range for a {ndim}D parameter; fix the "
                             f"plan_overrides declaration"
                         )
-                    logical_sizes = (
-                        p.sections if isinstance(p, PackedShard) else (shape[dim],)
-                    )
-                    if isinstance(p, PackedShard) and sum(logical_sizes) != shape[dim]:
-                        raise ValueError(
-                            f"plan-time packed shard check failed: {full!r} has "
-                            f"shape {tuple(shape)} but sections {logical_sizes} do not "
-                            f"cover shape[{dim}]={shape[dim]}"
-                        )
-                    invalid_sizes = [
-                        logical_size for logical_size in logical_sizes
-                        if logical_size % size
-                    ]
-                    if invalid_sizes:
+                    if shape[dim] % size != 0:
                         raise ValueError(
                             f"plan-time shard check failed: {full!r} has shape "
                             f"{tuple(shape)} but boundary {fqn!r} declares "
-                            f"{{{axis_name}: {p!r}}} — logical section sizes "
-                            f"{invalid_sizes} are not divisible by {axis_name} size {size} (it would "
+                            f"{{{axis_name}: Shard({p.dim})}} — shape[{dim}]={shape[dim]} "
+                            f"is not divisible by {axis_name} size {size} (it would "
                             f"produce empty shards at apply time). This is most "
                             f"often a parameter-classification error (e.g. a "
                             f"replicated/gate parameter misclassified into a "
