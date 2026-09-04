@@ -223,6 +223,68 @@ def npu_mhc_pre_clamp_sinkhorn(
     )
 
 
+def npu_mhc_pre_cmhc(
+        x,
+        phi,
+        alpha,
+        bias,
+        perm_mats,
+        *,
+        gamma=None,
+        hc_eps: float = 1e-6,
+        norm_eps: float = 1e-6,
+) -> Tuple:
+    """MHC pre-processing with CMHC permutation-softmax blend (fused).
+
+    Uses the fused aclnnMhcPreCmhc kernel: softmax over n! permutations plus
+    einsum with gamma-blended permutation matrices yields a doubly-stochastic
+    h_res. ``gamma`` is optional: None passes through as nullptr to aclnn
+    (gammaOptional); the kernel applies ``(void)gamma`` (equivalent to gamma=1).
+
+    .. warning::
+        This is an experimental API that subject to change or deletion.
+
+    Returns:
+        tuple: 7 output tensors (hin, h_post, h_res, inv_rms, h_mix, h_pre, coeff).
+    """
+    return _platform.custom_ops.npu_mhc_pre_cmhc(
+        x, phi, alpha, bias, perm_mats, gamma, hc_eps, norm_eps)
+
+
+def npu_situ_glu(
+        x,
+        *,
+        dim: int = -1,
+        beta: float = 4.0,
+        linear_beta: float = 25.0,
+) -> Tensor:
+    """SiTU-GLU fused activation (Kimi K3 default beta/linear_beta).
+
+    Splits x into gate (front) and up (back) halves along ``dim``, then
+    computes ``beta * tanh(g/beta) * sigmoid(g)`` on the gate and
+    ``linear_beta * tanh(u/linear_beta)`` on the up (skipped when
+    ``linear_beta <= 0``), and multiplies them. The kernel casts to float32
+    internally and casts back to ``x``'s dtype. ``activate_left`` is pinned
+    to True to match the mindformers SiTUGLU Cell's ``chunk(x, 2, dim)``
+    gate=front semantics and is not exposed.
+
+    .. warning::
+        This is an experimental API that subject to change or deletion.
+
+    Args:
+        x (Tensor): Input tensor. dtype float32/float16/bfloat16. Must be
+            contiguous; the ``dim`` axis must be even.
+        dim (int): Axis to split gate/up halves. Range
+            ``[-x.dim(), x.dim()-1]``. Default: ``-1``.
+        beta (float): Gate-branch soft-cap. Default: ``4.0`` (Kimi K3).
+        linear_beta (float): Up-branch soft-cap. Default: ``25.0`` (Kimi K3).
+
+    Returns:
+        Tensor: ``y``, same dtype as ``x``; the ``dim`` axis is halved.
+    """
+    return _platform.custom_ops.npu_situ_glu(x, dim, beta, linear_beta, True)
+
+
 def npu_lightning_indexer(
         query,
         key,
