@@ -26,7 +26,8 @@ AIV（AI Vector）核同时执行，实现通信与计算的细粒度重叠。
 | `platform/` | MindSpore/PyTorch ABI adapter |
 
 源码构建生成一个同时包含正反向 kernel 的
-`hyper_parallel_multicore_nn` vendor，并与构建解释器对应的 Python ABI 框架 adapter 一起进入 wheel 或本地 native payload。
+`hyper_parallel_multicore_nn` vendor，并与构建环境对应的框架 adapter 一起进入 wheel 或本地 native payload。
+MindSpore adapter 包含 CPython ABI；PyTorch adapter 是通过 `torch.ops.load_library()` 加载的普通共享库。
 
 ---
 

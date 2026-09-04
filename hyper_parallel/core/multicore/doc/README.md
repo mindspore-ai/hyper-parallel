@@ -149,7 +149,7 @@ multicore/
 │
 ├── platform/                        # 框架适配层
 │   ├── mindspore/                   # CMakeLists.txt + c_api/ + framework/
-│   └── torch/                       # setup.py + csrc/
+│   └── torch/                       # CMakeLists.txt + csrc/
 ```
 
 ### 2.3 核心模块说明
@@ -527,9 +527,10 @@ vendor 输入，再合并为一个 `hyper_parallel_multicore_nn` vendor 和一�
 - `aclnnHyperMegaMoeGrad` / `aclnnHyperMegaMoeGradGetWorkspaceSize`
 
 vendor 构建校验要求上述四个 `aclnnHyperMegaMoe*` 符号存在，并拒绝已知的冲突或错误大小写身份。
-MindSpore adapter 使用
-`ops.CustomOpBuilder`，PyTorch adapter 使用 `NpuExtension`；二者均含 CPython module，因此必须分别构建
-带 cp310、cp311 或 cp312 标签的 wheel。
+MindSpore adapter 使用 `ops.CustomOpBuilder` 生成 CPython extension；PyTorch adapter 是由 CMake 构建、
+通过 `torch.ops.load_library()` 加载的 dispatcher 共享库，不生成 `PyInit_*` 入口，不链接
+`libpython` 或 `libtorch_python`。wheel 的 cp310、cp311 或 cp312 标签由仍包含 CPython extension 的
+MindSpore adapter 和 indexed Dataset helper 决定。
 
 adapter 运行时按组件相对路径定位并绝对加载自带 vendor。host ELF 使用 `$ORIGIN` RUNPATH；`set_env.bash` 按 CANN custom OPP
 契约把 vendor 的 `op_api/lib` 加入调用 shell 的 `LD_LIBRARY_PATH`。
@@ -589,8 +590,8 @@ mc.mega_moe_grad(...)
 
 ### 7.5 PyTorch 接入
 
-PyTorch 与 torch_npu 必须使用和所选 CANN 匹配、且 `_GLIBCXX_USE_CXX11_ABI=1` 的配套版本。
-框架 adapter 通过上述 component build 生成。
+PyTorch 与 torch_npu 必须使用和所选 CANN 匹配的配套版本。框架 adapter 根据活动 PyTorch
+报告的 C++ ABI 构建。
 
 ---
 

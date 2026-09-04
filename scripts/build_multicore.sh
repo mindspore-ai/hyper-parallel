@@ -27,6 +27,7 @@ CLEAN="off"
 BUILD_MULTICORE_MINDSPORE=false
 BUILD_MULTICORE_TORCH=false
 CURRENT_REASON_CODE="MULTICORE_BUILD_FAILED"
+PYTHON_BIN=python
 
 function show_help() {
     cat <<EOF
@@ -316,49 +317,39 @@ if ! hp_cann_version_at_least "${CANN_VERSION}"; then
         "'${CANN_VERSION:-unknown}' under ${ASCEND_HOME_PATH}." 3
 fi
 
-required_tools=(awk asc_opc bash cmake find gcc g++ git grep ld ldd make nm python3 readelf readlink)
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    fail "PYTHON_BUILD_DEPENDENCY_NOT_FOUND" \
+        "The selected Python executable is unavailable: ${PYTHON_BIN}." 4
+fi
+PYTHON_BIN=$(command -v "${PYTHON_BIN}")
+required_tools=(awk asc_opc bash cmake find gcc g++ git grep ld ldd make nm readelf readlink)
 required_tools+=(sed sha256sum sort tee)
 for required_tool in "${required_tools[@]}"; do
     if ! command -v "${required_tool}" >/dev/null 2>&1; then
         fail "BUILD_TOOL_NOT_FOUND" "Required multicore build tool not found on PATH: ${required_tool}." 4
     fi
 done
-PYTHON_CACHE_TAG=$(python3 -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+PYTHON_CACHE_TAG=$("${PYTHON_BIN}" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
 FRAMEWORK_WORK_ROOT="${WORK_ROOT}/framework/${PYTHON_CACHE_TAG}"
-if ! python3 -c 'import setuptools, wheel' >/dev/null 2>&1; then
-    fail "PYTHON_BUILD_DEPENDENCY_NOT_FOUND" \
-        "The selected Python requires setuptools and wheel before compiling multicore." 5
-fi
 if [[ "${BUILD_MULTICORE_MINDSPORE}" == "true" ]]; then
     if ! command -v ninja >/dev/null 2>&1; then
         fail "BUILD_TOOL_NOT_FOUND" "Required MindSpore multicore build tool not found: ninja." 5
     fi
-    if ! python3 -c 'import mindspore as ms; assert hasattr(ms.ops, "CustomOpBuilder")' >/dev/null 2>&1; then
+    if ! "${PYTHON_BIN}" -c 'import mindspore as ms; assert hasattr(ms.ops, "CustomOpBuilder")' \
+        >/dev/null 2>&1; then
         fail "MINDSPORE_CUSTOM_OP_BUILDER_NOT_FOUND" \
             "The selected Python must provide MindSpore CustomOpBuilder." 5
     fi
 fi
 if [[ "${BUILD_MULTICORE_TORCH}" == "true" ]]; then
-    if ! python3 -c 'import torch, torch_npu' >/dev/null 2>&1; then
+    if ! TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${PYTHON_BIN}" -c '
+from importlib.util import find_spec
+import torch
+raise SystemExit(0 if find_spec("torch_npu") is not None else 1)
+' \
+        >/dev/null 2>&1; then
         fail "TORCH_BUILD_DEPENDENCY_NOT_FOUND" \
             "The selected Python must provide matching torch and torch_npu packages." 5
-    fi
-    if ! python3 -c 'import torch; raise SystemExit(0 if torch.compiled_with_cxx11_abi() else 1)' \
-        >/dev/null 2>&1; then
-        fail "TORCH_CXX11_ABI_UNSUPPORTED" \
-            "The selected Torch native build requires _GLIBCXX_USE_CXX11_ABI=1." 5
-    fi
-    if ! python3 -c '
-from pathlib import Path
-import torch_npu
-
-header = Path(torch_npu.__file__).resolve().parent / (
-    "include/third_party/op-plugin/op_plugin/include/npu_cpp_extension.h"
-)
-raise SystemExit(0 if header.is_file() else 1)
-' >/dev/null 2>&1; then
-        fail "TORCH_NPU_CPP_EXTENSION_HEADER_MISSING" \
-            "The selected torch_npu package must provide the public npu_cpp_extension.h header." 5
     fi
 fi
 
@@ -370,7 +361,7 @@ OPS_TRANSFORMER_SOURCE_DIR="${NATIVE_ROOT}/deps/ops_transformer/src"
 MULTICORE_VENDOR_CMAKE="${PROJECT_ROOT}/hyper_parallel/core/multicore/cmake/vendor"
 
 CURRENT_REASON_CODE="MULTICORE_DEPENDENCY_PREPARATION_FAILED"
-python3 -m scripts.native.prepare_dependencies \
+"${PYTHON_BIN}" -m scripts.native.prepare_dependencies \
     --dependency ops_nn \
     --dependency ops_transformer
 
@@ -386,6 +377,22 @@ if [[ ! -f "${SHMEM_INSTALL_ROOT}/shmem/include/shmem.h" \
       || ! -f "${SHMEM_INSTALL_ROOT}/shmem/lib/aclshmem_bootstrap_config_store.so" ]]; then
     fail "SHMEM_SDK_NOT_PREPARED" \
         "Full SHMEM SDK is missing at ${SHMEM_INSTALL_ROOT}." 9
+fi
+
+if ! MULTICORE_LOCK_DIGEST=$("${PYTHON_BIN}" -c '
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    lock = json.load(source)["components"]["multicore"]
+encoded = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(encoded).hexdigest())
+' "${PROJECT_ROOT}/scripts/native/config/dependencies.lock.json"); then
+    fail "MULTICORE_LOCK_INVALID" "Cannot read the locked multicore dependency contract." 9
+fi
+if [[ ! "${MULTICORE_LOCK_DIGEST}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail "MULTICORE_LOCK_INVALID" "Cannot read the locked multicore dependency contract." 9
 fi
 
 RAW_SOC_LIST="${SOC_LIST}"
@@ -474,12 +481,13 @@ function calculate_vendor_fingerprint() {
                 "env_CPPFLAGS=${CPPFLAGS-}" \
                 "env_LDFLAGS=${LDFLAGS-}" \
                 "env_CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE-}" \
+                "multicore_lock=${MULTICORE_LOCK_DIGEST}" \
+                "shmem_toolchain=${HP_SHMEM_TOOLCHAIN_KEY}" \
                 "arch=$(uname -m)"
             sha256sum "${CANN_VERSION_FILE}"
             sha256sum "${asc_opc_path}"
             sha256sum \
                 scripts/build_multicore.sh \
-                scripts/native/config/dependencies.lock.json \
                 scripts/native/assemble_multicore_source.py \
                 scripts/native/merge_multicore_vendors.py \
                 scripts/native/shmem_sdk.sh
@@ -524,7 +532,7 @@ for cann_soc in "${CANN_SOCS[@]}"; do
 
     rm -rf "${ASSEMBLY_ROOT}" "${VENDOR_BUILD_ROOT}"
     CURRENT_REASON_CODE="MULTICORE_SOURCE_ASSEMBLY_FAILED"
-    python3 -m scripts.native.assemble_multicore_source \
+    "${PYTHON_BIN}" -m scripts.native.assemble_multicore_source \
         --ops-nn-source "${OPS_NN_SOURCE_DIR}" \
         --ops-transformer-source "${OPS_TRANSFORMER_SOURCE_DIR}" \
         --work-dir "${ASSEMBLY_ROOT}"
@@ -539,7 +547,7 @@ for cann_soc in "${CANN_SOCS[@]}"; do
             -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
             -DASCEND_CANN_PACKAGE_PATH="${ASCEND_HOME_PATH}" \
             -DASCEND_COMPUTE_UNIT="${cann_soc}" \
-            -DASCEND_PYTHON_EXECUTABLE="$(command -v python3)" \
+            -DASCEND_PYTHON_EXECUTABLE="${PYTHON_BIN}" \
             -DHP_MULTICORE_SOURCE_ROOT="${SOURCE_ROOT}" \
             -DHP_SHMEM_SDK_ROOT="${SHMEM_INSTALL_ROOT}/shmem" \
             -DHP_VENDOR_STAGE_ROOT="${VENDOR_STAGE_ROOT}"
@@ -574,7 +582,7 @@ done
 VENDOR_ROOT="${OUTPUT_ROOT}/vendors/hyper_parallel_multicore_nn"
 mkdir -p "$(dirname "${VENDOR_ROOT}")"
 CURRENT_REASON_CODE="CANN_VENDOR_MERGE_FAILED"
-python3 -m scripts.native.merge_multicore_vendors \
+"${PYTHON_BIN}" -m scripts.native.merge_multicore_vendors \
     "${PER_SOC_VENDOR_INPUTS[@]}" \
     "${PER_SOC_HOST_INPUT_IDENTITIES[@]}" \
     --output "${VENDOR_ROOT}"
@@ -590,7 +598,7 @@ BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 if [[ "${BUILD_MULTICORE_MINDSPORE}" == "true" ]]; then
     CURRENT_REASON_CODE="MINDSPORE_ADAPTER_BUILD_FAILED"
     MINDSPORE_SOURCE="${PROJECT_ROOT}/hyper_parallel/core/multicore/platform/mindspore"
-    MINDSPORE_CACHE_KEY=$(python3 -c '
+    MINDSPORE_CACHE_KEY=$("${PYTHON_BIN}" -c '
 import hashlib
 from importlib.metadata import version
 from importlib.util import find_spec
@@ -608,7 +616,7 @@ print(hashlib.sha256(identity.encode()).hexdigest()[:16])
         -B "${MINDSPORE_BUILD}" \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
         -DHP_MULTICORE_VENDOR_ROOT="${VENDOR_ROOT}" \
-        -DPython3_EXECUTABLE="$(command -v python3)"
+        -DPython3_EXECUTABLE="${PYTHON_BIN}"
     cmake --build "${MINDSPORE_BUILD}" --parallel "${NATIVE_JOBS}"
     if [[ ! -s "${MINDSPORE_BUILD}/lib/hyper_parallel_mega_moe_ms.so" ]]; then
         fail "EXPECTED_ARTIFACT_MISSING" \
@@ -624,7 +632,7 @@ fi
 if [[ "${BUILD_MULTICORE_TORCH}" == "true" ]]; then
     CURRENT_REASON_CODE="TORCH_ADAPTER_BUILD_FAILED"
     TORCH_SOURCE="${PROJECT_ROOT}/hyper_parallel/core/multicore/platform/torch"
-    TORCH_CACHE_KEY=$(python3 -c '
+    TORCH_CACHE_KEY=$("${PYTHON_BIN}" -c '
 import hashlib
 from importlib.metadata import version
 from importlib.util import find_spec
@@ -641,22 +649,19 @@ print(hashlib.sha256(identity.encode()).hexdigest()[:16])
     TORCH_BUILD="${FRAMEWORK_WORK_ROOT}/torch-${TORCH_CACHE_KEY}"
     TORCH_OUTPUT="${OUTPUT_ROOT}/framework/torch"
     rm -rf "${TORCH_BUILD}" "${TORCH_OUTPUT}"
-    mkdir -p "${TORCH_BUILD}/lib" "${TORCH_BUILD}/temp" "${TORCH_OUTPUT}"
-    (
-        cd "${TORCH_SOURCE}"
-        python3 setup.py build_ext \
-            --build-lib "${TORCH_BUILD}/lib" \
-            --build-temp "${TORCH_BUILD}/temp"
-    )
-    mapfile -t torch_adapters < <(
-        find "${TORCH_BUILD}/lib" -maxdepth 1 -type f \
-            -name 'hyper_parallel_mega_moe_pta*.so' -print
-    )
-    if [[ ${#torch_adapters[@]} -ne 1 ]]; then
+    mkdir -p "${TORCH_BUILD}" "${TORCH_OUTPUT}"
+    cmake -S "${TORCH_SOURCE}" \
+        -B "${TORCH_BUILD}" \
+        -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+        -DCMAKE_INSTALL_PREFIX="${TORCH_OUTPUT}" \
+        -DHP_MULTICORE_VENDOR_ROOT="${VENDOR_ROOT}" \
+        -DPython3_EXECUTABLE="${PYTHON_BIN}"
+    cmake --build "${TORCH_BUILD}" --parallel "${NATIVE_JOBS}"
+    cmake --install "${TORCH_BUILD}"
+    if [[ ! -s "${TORCH_OUTPUT}/libhyper_parallel_mega_moe_torch.so" ]]; then
         fail "TORCH_ADAPTER_ARTIFACT_MISSING" \
-            "Expected one PyTorch multicore adapter, found ${#torch_adapters[@]}." 13
+            "PyTorch multicore adapter was not installed under ${TORCH_OUTPUT}." 13
     fi
-    cp -a "${torch_adapters[0]}" "${TORCH_OUTPUT}/"
 fi
 
 CURRENT_REASON_CODE="HOST_ELF_VALIDATION_FAILED"

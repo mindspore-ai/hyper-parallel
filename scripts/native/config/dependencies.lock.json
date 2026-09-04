@@ -16,7 +16,7 @@
       "mindspore": ">=2.10",
       "torch": "not pinned by the native build",
       "torch_npu": "must match the installed torch and selected CANN >=9.1.0",
-      "torch_cxx11_abi": 1
+      "torch_cxx11_abi": "reported by the active torch package"
     }
   },
   "local_compatibility": {

@@ -244,6 +244,11 @@ if ! [[ "${NATIVE_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 validate_soc_list "${SOC_LIST_VALUE}"
 
+if ! command -v python >/dev/null 2>&1; then
+    die "Python is unavailable in the active PATH."
+fi
+PYTHON_BIN=$(command -v python)
+
 RESOLVED_SHMEM_VALUE=$(framework_union "${SHMEM_VALUE}" "${MULTICORE_VALUE}")
 if [[ "${RESOLVED_SHMEM_VALUE}" != "off" || "${MULTICORE_VALUE}" != "off" || \
       "${CUSTOM_OPS_VALUE}" != "off" ]]; then
@@ -262,6 +267,7 @@ printf '  %-24s %s\n' "soc_list" "${SOC_LIST_VALUE}"
 printf '  %-24s %s\n' "strict" "${STRICT_VALUE}"
 printf '  %-24s %s\n' "jobs" "${NATIVE_JOBS}"
 printf '  %-24s %s\n' "clean" "${CLEAN}"
+printf '  %-24s %s\n' "python" "${PYTHON_BIN}"
 if [[ "${RESOLVED_SHMEM_VALUE}" != "${SHMEM_VALUE}" ]]; then
     echo "INFO: symmetric_memory=${RESOLVED_SHMEM_VALUE} is required by multicore=${MULTICORE_VALUE}."
 fi
@@ -356,16 +362,17 @@ fi
 
 INDEXED_HELPERS_DIR="${PROJECT_ROOT}/hyper_parallel/auto_models/components/datasets/llm"
 INDEXED_HELPERS_SOURCE="${INDEXED_HELPERS_DIR}/csrc/indexed_helpers.cpp"
-PYTHON_BIN=${PYTHON:-python}
 CXX_BIN=${CXX:-c++}
 INDEXED_HELPERS_SUFFIX=$("${PYTHON_BIN}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
-INDEXED_HELPERS_OUTPUT="${INDEXED_HELPERS_DIR}/_indexed_helpers_cpp${INDEXED_HELPERS_SUFFIX}"
+INDEXED_HELPERS_OUTPUT_DIR="${PAYLOAD_ROOT}/auto_models/components/datasets/llm"
+INDEXED_HELPERS_OUTPUT="${INDEXED_HELPERS_OUTPUT_DIR}/_indexed_helpers_cpp${INDEXED_HELPERS_SUFFIX}"
 
 if ! PYBIND11_INCLUDES=$("${PYTHON_BIN}" -m pybind11 --includes 2>/dev/null); then
     die "pybind11 is required to build indexed Dataset helpers. Install it with 'pip install pybind11'."
 fi
 read -r -a PYBIND11_INCLUDE_ARGS <<< "${PYBIND11_INCLUDES}"
 
+mkdir -p "${INDEXED_HELPERS_OUTPUT_DIR}"
 echo "Building indexed Dataset helpers: ${INDEXED_HELPERS_OUTPUT}"
 "${CXX_BIN}" -O3 -Wall -shared -std=c++17 -fPIC "${PYBIND11_INCLUDE_ARGS[@]}" \
     "${INDEXED_HELPERS_SOURCE}" -o "${INDEXED_HELPERS_OUTPUT}"
