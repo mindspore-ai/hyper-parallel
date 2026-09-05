@@ -680,7 +680,7 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         # Step 3: local -> DTensor (re-wrap per the declared out_src, restoring
         # the DTensor metadata broken by all-to-all; under production the
         # boundary exit needs the same contract)
-        if not isinstance(output, DTensor):
+        if validate_mode and not isinstance(output, DTensor):
             output = _rewrap_local_outputs(
                 output, spec, mesh, mesh_dim_names, type(module).__name__)
 

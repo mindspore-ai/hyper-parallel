@@ -51,10 +51,10 @@ from contextlib import contextmanager
 from typing import Iterator
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-
 import torch
 from torch import fx, nn
+
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.compile.parallel_config import PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
@@ -169,6 +169,26 @@ class _WrappedPlusRootParam(nn.Module):
         self.extra = nn.Parameter(torch.zeros(2, 2))
 
 
+class _LocalExperts(nn.Module):
+    """Small dynamic-EP expert holder with a stacked local weight."""
+
+    def __init__(self) -> None:
+        """Initialize two local experts with distinguishable values."""
+        super().__init__()
+        self.local_expert_count = 2
+        self.weight = nn.Parameter(torch.arange(32, dtype=torch.float32).view(2, 4, 4))
+
+
+class _DenseAndExperts(nn.Module):
+    """Model exposing parameters assigned to dense and expert FSDP groups."""
+
+    def __init__(self) -> None:
+        """Initialize one dense weight and one EP-local expert stack."""
+        super().__init__()
+        self.dense = nn.Linear(4, 4, bias=False)
+        self.experts = _LocalExperts()
+
+
 def _lin_bias_extra_joint_graph() -> fx.GraphModule:
     """Joint-graph stub for ``_WrappedPlusRootParam``.
 
@@ -194,6 +214,116 @@ def _lin_bias_extra_joint_graph() -> fx.GraphModule:
     gm.state_is_param = [True, True, True]
     gm.num_state_inputs = 3
     return gm
+
+
+def _dense_expert_joint_graph() -> fx.GraphModule:
+    """Build a joint graph with one dense and one EP-local expert parameter."""
+    graph = fx.Graph()
+    dense_weight = graph.placeholder("dense_weight")
+    expert_weight = graph.placeholder("expert_weight")
+    dense_sum = graph.call_function(torch.sum, args=(dense_weight,))
+    expert_sum = graph.call_function(torch.sum, args=(expert_weight,))
+    loss = graph.call_function(torch.add, args=(dense_sum, expert_sum))
+    dense_grad = graph.placeholder("dense_grad")
+    expert_grad = graph.placeholder("expert_grad")
+    graph.output([loss, dense_grad, expert_grad])
+    graph_module = fx.GraphModule({}, graph)
+    graph_module.state_fqns = ["dense.weight", "experts.weight"]
+    graph_module.state_is_param = [True, True]
+    graph_module.num_state_inputs = 2
+    return graph_module
+
+
+def _assert_dense_expert_shards(
+    model: _DenseAndExperts,
+    expected_dense: torch.Tensor,
+    expected_expert: torch.Tensor,
+) -> None:
+    """Check dense and expert parameters use their own shard topology."""
+    torch.testing.assert_close(
+        model.dense.weight,
+        expected_dense,
+        rtol=0,
+        atol=0,
+        msg=(
+            f"Dense parameter used wrong group-local shard: "
+            f"expected={expected_dense}, got={model.dense.weight}"
+        ),
+    )
+    torch.testing.assert_close(
+        model.experts.weight,
+        expected_expert,
+        rtol=0,
+        atol=0,
+        msg=(
+            f"Expert parameter used wrong EDP-local shard: "
+            f"expected={expected_expert}, got={model.experts.weight}"
+        ),
+    )
+
+
+def _assert_dense_expert_collectives(
+    test_case: unittest.TestCase, graph_module: fx.GraphModule
+) -> None:
+    """Check group assignment and HSDP collective ordering."""
+    all_gathers = [
+        node
+        for node in graph_module.graph.nodes
+        if node.meta.get("comm_type") == "fsdp_all_gather"
+    ]
+    groups_by_param = {
+        node.meta["param_name"]: node.meta["comm_group"] for node in all_gathers
+    }
+    test_case.assertEqual(
+        groups_by_param,
+        {"dense.weight": "fsdp", "experts.weight": "fsdp_expert"},
+        msg=f"Expected dense/expert group assignment, got {groups_by_param}",
+    )
+    reduce_scatter_nodes = [
+        node
+        for node in graph_module.graph.nodes
+        if node.meta.get("comm_type") == "fsdp_reduce_scatter"
+    ]
+    reduce_scatter_groups = {
+        node.meta["comm_group"] for node in reduce_scatter_nodes
+    }
+    test_case.assertEqual(
+        reduce_scatter_groups,
+        {"fsdp", "fsdp_expert"},
+        msg=f"Expected both reduce-scatter groups, got {reduce_scatter_groups}",
+    )
+    all_reduce_nodes = [
+        node
+        for node in graph_module.graph.nodes
+        if node.meta.get("comm_type") == "fsdp_all_reduce"
+    ]
+    test_case.assertEqual(
+        len(all_reduce_nodes),
+        1,
+        msg=f"Expected one dense replica AllReduce, got {len(all_reduce_nodes)}",
+    )
+    test_case.assertEqual(
+        all_reduce_nodes[0].meta.get("param_name"),
+        "dense.weight",
+        msg=(
+            f"Only dense gradients should use the replica group, got "
+            f"{all_reduce_nodes[0].meta.get('param_name')}"
+        ),
+    )
+    dense_reduce_scatter = next(
+        node
+        for node in reduce_scatter_nodes
+        if node.meta.get("param_name") == "dense.weight"
+    )
+    dense_all_reduce_input = all_reduce_nodes[0].args[0]
+    test_case.assertEqual(
+        dense_all_reduce_input.meta.get("wait_for"),
+        dense_reduce_scatter.name,
+        msg=(
+            f"Dense AllReduce must consume the ReduceScatter wait, "
+            f"got input={dense_all_reduce_input}"
+        ),
+    )
 
 
 class TestFSDPPassRunGuards(unittest.TestCase):
@@ -467,6 +597,93 @@ class TestFSDPPassRunSharding(unittest.TestCase):
             (
                 f"only lin.weight/lin.bias grads should reduce_scatter, "
                 f"got {_count_targets(gm, 'reduce_scatter_tensor')}"
+            ),
+        )
+
+    def test_run_uses_dense_and_expert_fsdp_groups(self):
+        """Test FSDP+EP assigns each parameter to its topology-specific group."""
+        config = PassConfig(fsdp_enabled=True, fsdp_degree=4, ep_degree=2)
+        fsdp_pass = FSDPPass()
+        graph_module = _dense_expert_joint_graph()
+        model = _DenseAndExperts()
+        expected_dense = model.dense.weight.detach().chunk(4, dim=0)[2].clone()
+        expected_expert = torch.clone(model.experts.weight).detach().chunk(
+            2, dim=0
+        )[1]
+        group_infos = {
+            "fsdp": {"degree": 4, "rank": 2},
+            "fsdp_replicate": {"degree": 2, "rank": 1},
+            "fsdp_expert": {"degree": 2, "rank": 1},
+        }
+
+        with _patch_dist(world_size=4, rank=3, initialized=True):
+            fsdp_pass.run(
+                graph_module,
+                config,
+                model=model,
+                fsdp_group_name="fsdp",
+                fsdp_group_infos=group_infos,
+                fsdp_param_groups={"experts.weight": "fsdp_expert"},
+                fsdp_replicate_groups={"fsdp": "fsdp_replicate"},
+            )
+
+        _assert_dense_expert_shards(model, expected_dense, expected_expert)
+        _assert_dense_expert_collectives(self, graph_module)
+
+    def test_run_all_reduces_replica_only_gradients(self):
+        """A degree-one shard axis must still synchronize HSDP replicas."""
+        config = PassConfig(fsdp_enabled=True, fsdp_degree=1)
+        fsdp_pass = FSDPPass()
+        graph_module = _linear_joint_graph()
+        model = nn.Linear(4, 4)
+        original_weight = model.weight.detach().clone()
+        group_infos = {
+            "fsdp": {"degree": 1, "rank": 0},
+            "fsdp_replicate": {"degree": 2, "rank": 1},
+        }
+
+        with _patch_dist(world_size=2, rank=1, initialized=True):
+            fsdp_pass.run(
+                graph_module,
+                config,
+                model=model,
+                fsdp_group_name="fsdp",
+                fsdp_group_infos=group_infos,
+                fsdp_replicate_groups={"fsdp": "fsdp_replicate"},
+            )
+
+        torch.testing.assert_close(
+            model.weight,
+            original_weight,
+            rtol=0,
+            atol=0,
+            msg=(
+                f"Replica-only HSDP must not shard parameters: "
+                f"expected={original_weight}, got={model.weight}"
+            ),
+        )
+        self.assertEqual(
+            _count_targets(graph_module, "all_reduce"),
+            2,
+            msg=(
+                f"Expected two replica AllReduces, got "
+                f"{_count_targets(graph_module, 'all_reduce')}"
+            ),
+        )
+        self.assertEqual(
+            _count_targets(graph_module, "all_gather_into_tensor"),
+            0,
+            msg=(
+                f"Expected no AllGather for shard degree one, got "
+                f"{_count_targets(graph_module, 'all_gather_into_tensor')}"
+            ),
+        )
+        self.assertEqual(
+            _count_targets(graph_module, "reduce_scatter_tensor"),
+            0,
+            msg=(
+                f"Expected no ReduceScatter for shard degree one, got "
+                f"{_count_targets(graph_module, 'reduce_scatter_tensor')}"
             ),
         )
 

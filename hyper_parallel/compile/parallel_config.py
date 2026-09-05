@@ -30,7 +30,7 @@ from typing import Optional
 
 @dataclass
 class PassConfig:
-    """Parallel configuration for graph-mode FSDP (+ optional TP/SP) training.
+    """Parallel configuration for graph-mode FSDP, EP and optional TP/SP training.
 
     Attributes:
         enable_overlap: Drive ``AutoOverlapPass`` to move ``wait_tensor`` for
@@ -54,12 +54,14 @@ class PassConfig:
             without API churn.
         sequence_parallel: Enable sequence parallel (SP) on the TP axis.
         loss_parallel: Enable loss parallel (LP) on the TP axis.
+        ep_degree: Expert-parallel degree. Values greater than one capture the
+            already-applied AutoModels dynamic EP region into the graph.
+        require_ep_collectives: Whether EP graph validation requires captured
+            all-to-all evidence.
 
     Note:
-        ``fsdp_enabled`` no longer probes ``torch.distributed``. The
-        distributed-initialized check moved into ``FSDPPass.run`` (its
-        original location) so this dataclass stays torch-free and importable
-        anywhere.
+        This dataclass does not probe ``torch.distributed``. Runtime process
+        group validation remains in the corresponding graph passes.
     """
 
     enable_overlap: bool = True
@@ -68,23 +70,33 @@ class PassConfig:
     tp_size: int = 1
     sequence_parallel: bool = False
     loss_parallel: bool = False
+    ep_degree: int = 1
+    require_ep_collectives: bool = True
 
     def __post_init__(self) -> None:
         self.validate()
+
+    @property
+    def ep_enabled(self) -> bool:
+        """Whether dynamic EP should be captured into the graph."""
+        return self.ep_degree > 1
 
     def validate(self) -> None:
         """Sanity-check invariants; also re-run after manual field mutation.
 
         Raises:
-            ValueError: On a negative ``tp_size`` or a non-positive
-                explicit ``fsdp_degree``.
+            ValueError: On a non-positive or non-integer parallel degree.
+            NotImplementedError: When EP is combined with TP.
         """
-        if self.tp_size < 1:
-            raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
-        if self.fsdp_degree is not None and self.fsdp_degree < 1:
-            raise ValueError(
-                f"fsdp_degree must be None or a positive int, got {self.fsdp_degree}"
-            )
+        degrees = {"tp_size": self.tp_size, "ep_degree": self.ep_degree}
+        if self.fsdp_degree is not None:
+            degrees["fsdp_degree"] = self.fsdp_degree
+        for name, degree in degrees.items():
+            if isinstance(degree, bool) or not isinstance(degree, int) or degree < 1:
+                raise ValueError(f"{name} must be a positive integer")
+
+        if self.ep_enabled and self.tp_size != 1:
+            raise NotImplementedError("Static EP currently requires tp_size to be 1")
 
 
 __all__ = ["PassConfig"]

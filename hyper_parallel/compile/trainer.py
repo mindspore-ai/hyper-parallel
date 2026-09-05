@@ -19,13 +19,15 @@ Users provide model code and parallel configuration.
 Framework automatically handles all parallel logic.
 """
 
-from typing import Any, Callable, Iterable, Iterator, List, Optional
+from contextlib import nullcontext
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set
 
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.distributed_c10d import _register_process_group
 
+from .ep_capture import capture_dynamic_ep
 from .parallel_config import PassConfig
 from .passes.pipeline import PassPipeline
 from .sharding_config import PassPlan
@@ -82,9 +84,26 @@ class GraphTrainer:
 
         self._joint_graph = None
         self.optimizer = None
+        self._fsdp_group_infos: Dict[str, Dict[str, int]] = {}
+        self._fsdp_param_groups: Dict[str, str] = {}
+        self._fsdp_replicate_groups: Dict[str, str] = {}
         # Optional hook run right before the first compile, for model-specific
         # pytree / tracer registration (e.g. flex-attention BlockMask).
         self._pytree_pre_hook: Optional[Callable[[], None]] = None
+
+    @staticmethod
+    def _find_expert_param_names(model: torch.nn.Module) -> Set[str]:
+        """Find parameters owned by dynamic-EP local expert holders."""
+        expert_param_names: Set[str] = set()
+        for module_fqn, module in model.named_modules():
+            local_expert_count = getattr(module, "local_expert_count", None)
+            if not isinstance(local_expert_count, int) or local_expert_count < 1:
+                continue
+            for param_name, _ in module.named_parameters(recurse=True):
+                expert_param_names.add(
+                    f"{module_fqn}.{param_name}" if module_fqn else param_name
+                )
+        return expert_param_names
 
     def compile(self, sample_input: torch.Tensor, sample_label: torch.Tensor) -> None:
         """
@@ -102,9 +121,25 @@ class GraphTrainer:
             # trains as plain graph mode without sharding.
             self._init_device_mesh(self._mesh_context)
 
-        joint_graph = trace_model_graph(
-            self.model, self.train_fn, sample_input, sample_label
+        capture_context = (
+            capture_dynamic_ep(self.model, self.pass_config.ep_degree)
+            if self.pass_config.ep_enabled
+            else nullcontext()
         )
+        with capture_context as ep_capture_metadata:
+            joint_graph = trace_model_graph(
+                self.model, self.train_fn, sample_input, sample_label
+            )
+        if ep_capture_metadata is not None:
+            joint_graph.graph_module.ep_capture_metadata = {
+                "group_names": tuple(sorted(ep_capture_metadata.group_names)),
+                "expected_collective_count": (
+                    ep_capture_metadata.expected_collective_count
+                ),
+                "collective_counts_by_group": dict(
+                    ep_capture_metadata.collective_counts_by_group
+                ),
+            }
 
         pipeline = PassPipeline.from_config(self.pass_config, self.pass_plan)
 
@@ -125,15 +160,17 @@ class GraphTrainer:
 
         * **External mesh** (``mesh_context`` from automodel): the TP group is
           already created by automodel (the boundary forward holds the group
-          object directly), so we only resolve the FSDP shard sub-mesh and
-          register it under the name ``"fsdp"`` so ``FSDPPass``'s functional
-          collectives resolve it by name. ``fsdp_degree`` is back-filled on
-          ``pass_config`` from the sub-mesh size — essential for a TP+FSDP
-          hybrid, where the FSDP group is a proper sub-group of the world and
-          must NOT be confused with ``world_size``.
+          object directly). The FSDP shard sub-mesh is registered as
+          ``"fsdp"`` and a non-trivial replica sub-mesh as
+          ``"fsdp_replicate"``. ``fsdp_degree`` is back-filled from the shard
+          sub-mesh size — essential for TP+FSDP/HSDP hybrids, where the shard
+          group is a proper sub-group of the world.
         * **Fallback** (no mesh): build a 1-D ``("fsdp",)`` mesh over the
           whole world (the original FSDP-only path).
         """
+        self._fsdp_group_infos = {}
+        self._fsdp_param_groups = {}
+        self._fsdp_replicate_groups = {}
         if mesh_context is not None:
             fsdp_mesh = (
                 getattr(mesh_context, "fsdp_non_moe_mesh", None)
@@ -147,7 +184,31 @@ class GraphTrainer:
             pg = sub.get_group()
             _register_process_group("fsdp", pg)
             self.pass_config.fsdp_degree = sub.size()
+            self._fsdp_group_infos["fsdp"] = {
+                "degree": sub.size(),
+                "rank": sub.get_local_rank(),
+            }
+            if "fsdp_replicate" in names:
+                replicate_sub = fsdp_mesh["fsdp_replicate"]
+                replicate_degree = replicate_sub.size()
+                if replicate_degree > 1:
+                    _register_process_group(
+                        "fsdp_replicate", replicate_sub.get_group()
+                    )
+                    self._fsdp_group_infos["fsdp_replicate"] = {
+                        "degree": replicate_degree,
+                        "rank": replicate_sub.get_local_rank(),
+                    }
+                    self._fsdp_replicate_groups["fsdp"] = "fsdp_replicate"
+            if self.pass_config.ep_enabled:
+                self._init_expert_fsdp_group(mesh_context)
             return
+
+        if self.pass_config.ep_enabled:
+            raise ValueError(
+                "FSDP+EP graph mode requires the automodel MeshContext so dense "
+                "and expert parameters use their respective FSDP groups"
+            )
 
         device_type = (
             "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else "cpu"
@@ -166,6 +227,50 @@ class GraphTrainer:
         # group size from ``fsdp_degree`` (falling back to world_size when
         # ``None``), so setting it here keeps the two paths consistent.
         self.pass_config.fsdp_degree = world_size
+        self._fsdp_group_infos["fsdp"] = {
+            "degree": world_size,
+            "rank": dist.get_rank(),
+        }
+
+    def _init_expert_fsdp_group(self, mesh_context: Any) -> None:
+        """Register the expert-data-parallel shard group for routed experts."""
+        mesh_ep_size = getattr(mesh_context, "ep_size", None)
+        if mesh_ep_size != self.pass_config.ep_degree:
+            raise ValueError(
+                "PassConfig.ep_degree must match MeshContext.ep_size, got "
+                f"{self.pass_config.ep_degree} and {mesh_ep_size}"
+            )
+
+        expert_mesh = getattr(mesh_context, "fsdp_moe_mesh", None)
+        if expert_mesh is None:
+            raise ValueError(
+                "FSDP+EP graph mode requires MeshContext.fsdp_moe_mesh"
+            )
+        names = tuple(getattr(expert_mesh, "mesh_dim_names", ()) or ())
+        if "edp_replicate" in names and expert_mesh["edp_replicate"].size() > 1:
+            raise NotImplementedError(
+                "FSDP+EP graph mode does not yet support an edp_replicate axis"
+            )
+        if "edp_shard" not in names:
+            raise ValueError("Expert FSDP mesh must contain an edp_shard axis")
+
+        expert_sub = expert_mesh["edp_shard"]
+        expert_degree = expert_sub.size()
+        if expert_degree > 1:
+            _register_process_group("fsdp_expert", expert_sub.get_group())
+        self._fsdp_group_infos["fsdp_expert"] = {
+            "degree": expert_degree,
+            "rank": expert_sub.get_local_rank(),
+        }
+
+        expert_param_names = self._find_expert_param_names(self.model)
+        if not expert_param_names:
+            raise ValueError(
+                "FSDP+EP graph mode found no expert holder with local_expert_count"
+            )
+        self._fsdp_param_groups = {
+            param_name: "fsdp_expert" for param_name in expert_param_names
+        }
 
     def _build_pass_kwargs(self) -> dict:
         """
@@ -179,6 +284,12 @@ class GraphTrainer:
 
         if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
+            if self._fsdp_group_infos:
+                kwargs["fsdp_group_infos"] = self._fsdp_group_infos
+            if self._fsdp_param_groups:
+                kwargs["fsdp_param_groups"] = self._fsdp_param_groups
+            if self._fsdp_replicate_groups:
+                kwargs["fsdp_replicate_groups"] = self._fsdp_replicate_groups
 
         return kwargs
 

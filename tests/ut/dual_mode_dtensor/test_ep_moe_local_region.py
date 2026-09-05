@@ -240,6 +240,30 @@ def test_declaration_and_region_dispatch(make_mesh, monkeypatch):
         _rewrap_local_outputs(
             (torch.ones(2),), spec, mesh, ("tp",), "TestModule")
 
+    # ── case: test_production_local_region_keeps_identity_output_local ──
+    # Production boundaries execute precompiled redistribution directly on
+    # local tensors. An identity output must not take a DTensor round-trip.
+    module = _TinyMod()
+    spec = _identity_spec()
+    spec.region_dispatch = False
+    sample = torch.randn(2, 4)
+    expected = module(sample)
+
+    def fail_rewrap(*_args: object, **_kwargs: object) -> None:
+        """Fail when production unexpectedly rewraps a local output."""
+        raise AssertionError("production local output must remain local")
+
+    monkeypatch.setattr(
+        "hyper_parallel.distributed._builder.forward_rewriter._rewrap_local_outputs",
+        fail_rewrap,
+    )
+    _wrap_region(module, spec, mesh, validate_mode=False)
+    torch.testing.assert_close(
+        module(sample),
+        expected,
+        msg="case: production_local_region_keeps_identity_output_local",
+    )
+
     # ── case: test_local_compute_fn_without_region_dispatch_fails ──
     # region_dispatch injection discipline (no default): declaring an
     # injection must be explicit.

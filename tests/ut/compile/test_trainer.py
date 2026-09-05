@@ -40,10 +40,10 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-
 import torch
 from torch import nn
+
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.compile.parallel_config import PassConfig
 from hyper_parallel.compile.trainer import GraphTrainer
@@ -52,6 +52,26 @@ from hyper_parallel.compile.trainer import GraphTrainer
 def _make_model() -> nn.Linear:
     """A tiny CPU-linear model; tracing is cheap and deterministic."""
     return nn.Linear(4, 4)
+
+
+class _LocalExperts(nn.Module):
+    """Minimal dynamic-EP expert holder for mesh-routing tests."""
+
+    def __init__(self) -> None:
+        """Expose the local expert contract and a stacked parameter."""
+        super().__init__()
+        self.local_expert_count = 2
+        self.weight = nn.Parameter(torch.zeros(2, 4, 4))
+
+
+class _DenseExpertsModel(nn.Module):
+    """Tiny model with one dense and one routed-expert parameter family."""
+
+    def __init__(self) -> None:
+        """Initialize dense and local-expert holders."""
+        super().__init__()
+        self.dense = nn.Linear(4, 4, bias=False)
+        self.experts = _LocalExperts()
 
 
 def _mse_train_fn(model, x, y) -> torch.Tensor:
@@ -304,7 +324,7 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
         shard_sub.size.return_value = 2
         shard_sub.get_group.return_value = "SHARD_PG"
         repl_sub = MagicMock()
-        repl_sub.size.return_value = 99
+        repl_sub.size.return_value = 1
         repl_sub.get_group.return_value = "REPL_PG"
         tp_sub = MagicMock()
         tp_sub.size.return_value = 77
@@ -327,11 +347,7 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
         ):
             tr._init_device_mesh(mesh_context)
 
-        self.assertEqual(
-            mock_non_moe.__getitem__.call_args.args,
-            ("fsdp_shard",),
-            "must resolve the fsdp_shard axis of a hybrid mesh",
-        )
+        mock_non_moe.__getitem__.assert_any_call("fsdp_shard")
         self.assertEqual(
             tr.pass_config.fsdp_degree,
             2,
@@ -392,6 +408,100 @@ class TestGraphTrainerDeviceMesh(unittest.TestCase):
             "a mesh without fsdp_shard should use the dp axis",
         )
         self.assertEqual(mock_register.call_args.args[1], "DPPG")
+
+    def test_init_device_mesh_registers_dense_and_expert_fsdp_groups(self):
+        """Test FSDP+EP resolves dense and expert group-local ranks separately."""
+        model = _DenseExpertsModel()
+        trainer = GraphTrainer(
+            model=model,
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(
+                fsdp_enabled=True,
+                fsdp_degree=None,
+                ep_degree=2,
+            ),
+            device=torch.device("cpu"),
+        )
+        dense_sub = MagicMock()
+        dense_sub.size.return_value = 4
+        dense_sub.get_local_rank.return_value = 3
+        dense_sub.get_group.return_value = "DENSE_PG"
+        dense_replicate_sub = MagicMock()
+        dense_replicate_sub.size.return_value = 2
+        dense_replicate_sub.get_local_rank.return_value = 1
+        dense_replicate_sub.get_group.return_value = "DENSE_REPLICATE_PG"
+        dense_mesh = MagicMock()
+        dense_mesh.mesh_dim_names = ("fsdp_replicate", "fsdp_shard", "tp")
+        dense_mesh.__getitem__.side_effect = {
+            "fsdp_shard": dense_sub,
+            "fsdp_replicate": dense_replicate_sub,
+        }.__getitem__
+
+        expert_shard_sub = MagicMock()
+        expert_shard_sub.size.return_value = 2
+        expert_shard_sub.get_local_rank.return_value = 1
+        expert_shard_sub.get_group.return_value = "EXPERT_PG"
+        expert_replicate_sub = MagicMock()
+        expert_replicate_sub.size.return_value = 1
+        expert_mesh = MagicMock()
+        expert_mesh.mesh_dim_names = ("edp_replicate", "edp_shard", "ep")
+        expert_mesh.__getitem__.side_effect = {
+            "edp_replicate": expert_replicate_sub,
+            "edp_shard": expert_shard_sub,
+        }.__getitem__
+
+        mesh_context = MagicMock()
+        mesh_context.ep_size = 2
+        mesh_context.fsdp_non_moe_mesh = dense_mesh
+        mesh_context.fsdp_moe_mesh = expert_mesh
+
+        with patch(
+            "hyper_parallel.compile.trainer._register_process_group"
+        ) as mock_register:
+            trainer._init_device_mesh(mesh_context)
+
+        self.assertEqual(
+            mock_register.call_count,
+            3,
+            msg=(
+                f"Expected shard, replicate, and expert group registration, "
+                f"got {mock_register.call_count}"
+            ),
+        )
+        self.assertEqual(
+            trainer._fsdp_group_infos,
+            {
+                "fsdp": {"degree": 4, "rank": 3},
+                "fsdp_replicate": {"degree": 2, "rank": 1},
+                "fsdp_expert": {"degree": 2, "rank": 1},
+            },
+            msg=f"Unexpected group infos: {trainer._fsdp_group_infos}",
+        )
+        self.assertEqual(
+            trainer._fsdp_param_groups,
+            {"experts.weight": "fsdp_expert"},
+            msg=f"Unexpected expert parameter groups: {trainer._fsdp_param_groups}",
+        )
+        self.assertEqual(
+            trainer._fsdp_replicate_groups,
+            {"fsdp": "fsdp_replicate"},
+            msg=(
+                f"Unexpected FSDP replica groups: "
+                f"{trainer._fsdp_replicate_groups}"
+            ),
+        )
+
+    def test_fsdp_ep_without_mesh_context_is_rejected(self):
+        """Test mixed FSDP+EP refuses the unsafe one-dimensional fallback."""
+        trainer = GraphTrainer(
+            model=_DenseExpertsModel(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=True, ep_degree=2),
+            device=torch.device("cpu"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires the automodel MeshContext"):
+            trainer._init_device_mesh(None)
 
 
 class TestGraphTrainerHelpers(unittest.TestCase):

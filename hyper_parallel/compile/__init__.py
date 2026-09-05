@@ -21,6 +21,7 @@ Core Features:
 - Users write model code + parallel configuration
 - Framework automatically handles all parallel logic
 - Graph capture → Parallel partitioning → Communication-compute overlap → Execution
+- Capture an AutoModels dynamic-EP model without duplicating its sharding plan
 
 Usage Example:
     from hyper_parallel.compile import (
@@ -57,6 +58,7 @@ from .sharding_config import (
 from .parallel_config import PassConfig
 
 from .trainer import GraphTrainer
+from .ep_capture import capture_dynamic_ep
 
 __all__ = [
     # Sharding
@@ -68,4 +70,6 @@ __all__ = [
     "PassConfig",
     # Trainer
     "GraphTrainer",
+    # EP capture
+    "capture_dynamic_ep",
 ]

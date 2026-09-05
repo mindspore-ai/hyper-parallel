@@ -325,6 +325,14 @@ def ep_routed_forward(
     expert dim -- each rank holds num_experts/ep_size complete experts, so
     there is no all_gather/reduce_scatter pair.
     """
+    if getattr(module.experts, "_ep_capture_metadata", None) is not None:
+        # Keep compile optional for eager execution and avoid circular imports.
+        from hyper_parallel.compile.ep_capture import static_ep_routed_forward  # pylint: disable=C0415
+
+        return static_ep_routed_forward(
+            module, hidden_states, router_fn=router_fn, ep_group=ep_group
+        )
+
     ep_size = ep_group.size()
     ep_rank = dist.get_rank(group=ep_group)
     local_expert_count = module.experts.local_expert_count

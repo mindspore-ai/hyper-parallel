@@ -16,6 +16,7 @@
 Parallel Passes - Parallel Partitioning Passes
 """
 
+from .ep_pass import ExpertParallelPass
 from .fsdp_pass import FSDPPass
 
-__all__ = ["FSDPPass"]
+__all__ = ["ExpertParallelPass", "FSDPPass"]

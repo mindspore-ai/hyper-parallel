@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 from ..parallel_config import PassConfig
 from .base import GraphPass
 from .overlap.schedule import AutoOverlapPass
+from .parallel.ep_pass import ExpertParallelPass
 from .parallel.fsdp_pass import FSDPPass
 
 if TYPE_CHECKING:
@@ -70,6 +71,8 @@ class PassPipeline:
         # 2. Execution layer: Parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):
             self.passes.append(FSDPPass(pass_plan=self.pass_plan))
+        if getattr(self.config, "ep_enabled", False):
+            self.passes.append(ExpertParallelPass())
 
         # 3. Communication-compute overlap optimization
         if getattr(self.config, "enable_overlap", False):
