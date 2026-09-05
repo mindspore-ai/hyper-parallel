@@ -1962,11 +1962,15 @@ def test_build_weight_transfer_skips_reshard_for_pure_dp() -> None:
         ColocatedFullGatherWeightTransfer,
     )
     assert isinstance(
-        build_weight_transfer("disjoint", model, tensor_parallel_size=2),
+        build_weight_transfer(
+            "disjoint", model, tensor_parallel_size=2, strategy="direct_reshard"
+        ),
         FallbackWeightTransfer,
     )
     assert isinstance(
-        build_weight_transfer("colocated", model, tensor_parallel_size=2),
+        build_weight_transfer(
+            "colocated", model, tensor_parallel_size=2, strategy="direct_reshard"
+        ),
         FallbackWeightTransfer,
     )
     internal_direct = build_weight_transfer(
@@ -1974,6 +1978,7 @@ def test_build_weight_transfer_skips_reshard_for_pure_dp() -> None:
         model,
         tensor_parallel_size=2,
         data_parallel_size=1,
+        strategy="direct_reshard",
         fallback_strategy="none",
     )
     assert isinstance(internal_direct, ColocatedDirectReshardWeightTransfer)
@@ -1983,6 +1988,7 @@ def test_build_weight_transfer_skips_reshard_for_pure_dp() -> None:
         model,
         tensor_parallel_size=2,
         data_parallel_size=1,
+        strategy="direct_reshard",
     )
     assert isinstance(internal_fallback, FallbackWeightTransfer)
     assert internal_fallback._primary._data_parallel_size == 1  # pylint: disable=protected-access
@@ -1993,6 +1999,7 @@ def test_build_weight_transfer_skips_reshard_for_pure_dp() -> None:
             native_model,
             tensor_parallel_size=2,
             data_parallel_size=2,
+            strategy="direct_reshard",
             fallback_strategy="none",
         ),
         DirectReshardHCCLWeightTransfer,
@@ -2002,6 +2009,7 @@ def test_build_weight_transfer_skips_reshard_for_pure_dp() -> None:
         native_model,
         tensor_parallel_size=2,
         data_parallel_size=2,
+        strategy="direct_reshard",
         fallback_strategy="none",
     )
     assert disjoint_direct._data_parallel_size == 2  # pylint: disable=protected-access

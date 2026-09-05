@@ -37,6 +37,11 @@ python3 .agent/skills/autogit/scripts/code_style_guard.py --fix <files>
 python3 .agent/skills/autogit/scripts/autogit.py check
 ```
 
+If any `*.md` is in the diff, also run `.agent/scripts/check_agents_catalog.py`.
+A non-zero exit means a markdown file restates a fact from the canonical
+architecture/navigation docs — fix it (link instead of copy) before reporting
+ready to commit.
+
 Fallback tools if autogit missing: pylint / lizard / codespell / markdownlint /
 clang-format (see autogit `check` implementation).
 

@@ -36,9 +36,11 @@ An approved design, e.g.:
 1. **Scope** — diff the design against
    [references/module-map.md](references/module-map.md) to confirm which RL
    subsystems (config / trainer / dataset+agentic / algorithm+policy / rollout /
-   weight_sync / consistency) the change touches, and that **no file outside
-   `hyper_parallel/rl/`** needs editing. If a change needs HyperParallel source,
-   stop and tell the user to open a separate upstream task.
+   weight_sync / consistency) the change touches. If it also needs a
+   HyperParallel source change, keep it but record it per
+   `.agent/rules/hyper-rl-workflow.md` § Scope Boundaries (public/internal
+   boundary, impact on surrounding consumers) — do not silently frame it as
+   out of scope.
 2. **Implement** — respect the layouts and contracts in
    [references/module-map.md](references/module-map.md) and the design/interface
    notes in [references/design-notes.md](references/design-notes.md). No new

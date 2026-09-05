@@ -1400,9 +1400,9 @@ def build_vllm_engine(
         tensor_parallel_size=int(vllm_config.get("tensor_parallel_size", 1)),
         data_parallel_size=int(vllm_config.get("data_parallel_size", 1)),
         bucket_size_bytes=int(weight_sync_config.get("bucket_size_mb", 128)) * 2**20,
-        strategy=str(weight_sync_config.get("strategy", "direct_reshard")),
+        strategy=str(weight_sync_config.get("strategy", "full_gather")),
         fallback_strategy=str(
-            weight_sync_config.get("fallback_strategy", "full_gather")
+            weight_sync_config.get("fallback_strategy", "none")
         ),
     )
     return VLLMGenerationEngine(
