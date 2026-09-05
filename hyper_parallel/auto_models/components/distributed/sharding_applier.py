@@ -1329,10 +1329,9 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         else:
             output = compute_fn(*args, **kwargs)
 
-        # Step 3: local -> DTensor (re-wrap per the declared out_src, restoring
-        # the DTensor metadata broken by all-to-all; under production the
-        # boundary exit needs the same contract)
-        if not isinstance(output, DTensor):
+        # Validation checks the declared DTensor output placement. Production
+        # boundaries consume local tensors and perform their own redistribution.
+        if validate_mode and not isinstance(output, DTensor):
             output = _rewrap_local_outputs(
                 output, spec, mesh, mesh_dim_names, type(module).__name__)
 

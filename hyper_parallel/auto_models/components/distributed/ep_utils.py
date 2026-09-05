@@ -44,10 +44,14 @@ Public primitives:
 5. **Interface helpers** (``require_attrs`` / ``describe_moe_module``):
    build-time interface assertions with teaching errors, and a structural
    diagnostic for mapping a concrete MoE module to an archetype.
+6. **Execution binding** (``RoutedEPExecutionOp`` / ``bind_routed_ep_execution``):
+   a model-local transport seam with dynamic ragged EP as the default.
+   Alternative transports reuse the router and ``compute_swiglu_expert``;
+   their implementations live with their caller, without reverse imports.
 """
 
 import types
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol
 
 import torch
 import torch.distributed as dist
@@ -353,6 +357,32 @@ def resolve_swiglu_weights(
     return w_gate, w_up, w_down
 
 
+def compute_swiglu_expert(
+    states: torch.Tensor,
+    weights: tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor],
+    expert_index: int,
+    activation: Callable,
+) -> torch.Tensor:
+    """Evaluate one stacked SwiGLU expert independently of token transport.
+
+    Args:
+        states: Token activations for this expert, including any masked rows.
+        weights: Gate, optional up, and down weights from ``resolve_swiglu_weights``.
+        expert_index: Index into the local expert dimension.
+        activation: Activation chosen by the model's expert binding.
+
+    Returns:
+        Expert outputs with the same leading dimensions as ``states``.
+    """
+    gate_weight, up_weight, down_weight = weights
+    gate_states = states @ gate_weight[expert_index].transpose(0, 1)
+    if up_weight is None:
+        gate_states, up_states = gate_states.chunk(2, dim=-1)
+    else:
+        up_states = states @ up_weight[expert_index].transpose(0, 1)
+    return (activation(gate_states) * up_states) @ down_weight[expert_index].transpose(0, 1)
+
+
 def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
     """Compute dispatched tokens with the local stacked SwiGLU experts.
 
@@ -388,23 +418,12 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     for local_expert_index in range(experts.local_expert_count):
         expert_token_count = int(local_expert_counts[local_expert_index])
         expert_states = sorted_states[token_start:token_start + expert_token_count]
-        if up_weight is None:
-            gate_states, up_states = F.linear(  # pylint: disable=not-callable
-                expert_states,
-                gate_weight[local_expert_index],
-            ).chunk(2, dim=-1)
-        else:
-            gate_states = F.linear(  # pylint: disable=not-callable
-                expert_states, gate_weight[local_expert_index]
-            )
-            up_states = F.linear(  # pylint: disable=not-callable
-                expert_states, up_weight[local_expert_index]
-            )
-        activation = getattr(experts, "_ep_act_fn", F.silu)
         sorted_outputs.append(
-            F.linear(  # pylint: disable=not-callable
-                activation(gate_states) * up_states,
-                down_weight[local_expert_index],
+            compute_swiglu_expert(
+                expert_states,
+                (gate_weight, up_weight, down_weight),
+                local_expert_index,
+                getattr(experts, "_ep_act_fn", F.silu),
             )
         )
         token_start += expert_token_count
@@ -430,6 +449,90 @@ def _get_global_expert_count(module):
     )
 
 
+class RoutedEPExecutionOp(Protocol):
+    """Routed-EP operation attached to an AutoModels expert holder."""
+
+    def execute(
+        self,
+        module: Any,
+        hidden_states: torch.Tensor,
+        *,
+        router_fn: Callable,
+        ep_group: Any,
+    ) -> torch.Tensor:
+        """Execute the routed-expert branch for one MoE module.
+
+        Args:
+            module: MoE module with locally sharded expert weights.
+            hidden_states: Local token activations.
+            router_fn: Model-specific top-k indices and weights adapter.
+            ep_group: Expert-parallel process group.
+
+        Returns:
+            Routed outputs in the input activation shape.
+        """
+
+
+class _DynamicRoutedEPExecutionOp:
+    """Default routed-EP operation backed by the dynamic pipeline."""
+
+    @staticmethod
+    def execute(
+        module: Any,
+        hidden_states: torch.Tensor,
+        *,
+        router_fn: Callable,
+        ep_group: Any,
+    ) -> torch.Tensor:
+        """Execute the canonical ragged all-to-all implementation.
+
+        Args:
+            module: MoE module with locally sharded expert weights.
+            hidden_states: Local token activations.
+            router_fn: Model-specific top-k indices and weights adapter.
+            ep_group: Expert-parallel process group.
+
+        Returns:
+            Routed outputs in the input activation shape.
+        """
+        return _dynamic_ep_routed_forward(
+            module,
+            hidden_states,
+            router_fn=router_fn,
+            ep_group=ep_group,
+        )
+
+
+_DYNAMIC_ROUTED_EP_EXECUTION = _DynamicRoutedEPExecutionOp()
+
+
+def bind_routed_ep_execution(
+    module: Any,
+    execution_op: RoutedEPExecutionOp,
+) -> RoutedEPExecutionOp:
+    """Bind transport without changing routing, expert weights, or composition.
+
+    Args:
+        module: MoE module owning an ``experts`` holder.
+        execution_op: Operation implementing the routed-expert execution contract.
+
+    Returns:
+        Previous operation, which can be rebound to restore the caller's state.
+
+    Raises:
+        TypeError: If the operation does not expose a callable ``execute``.
+    """
+    if not callable(getattr(execution_op, "execute", None)):
+        raise TypeError("Routed EP execution must expose a callable execute method")
+    previous_op = getattr(
+        module.experts,
+        "_ep_execution_op",
+        _DYNAMIC_ROUTED_EP_EXECUTION,
+    )
+    module.experts._ep_execution_op = execution_op
+    return previous_op
+
+
 def bind_local_expert_forward(
     module: Any,
     ep_size: int,
@@ -441,6 +544,11 @@ def bind_local_expert_forward(
     time: sets ``module.experts.local_expert_count`` and installs
     ``experts.forward`` so nested FSDP hooks unshard/reshard around the
     local SwiGLU computation.
+
+    Args:
+        module: MoE module owning the local expert holder.
+        ep_size: Number of ranks sharing the global routed experts.
+        use_grouped_gemm: Whether to use the packed NPU expert kernel.
     """
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
@@ -464,16 +572,11 @@ def bind_local_expert_forward(
             )
     module.experts._ep_act_fn = activation
     module.experts._ep_use_grouped_gemm = use_grouped_gemm
+    bind_routed_ep_execution(module, _DYNAMIC_ROUTED_EP_EXECUTION)
     module.experts.forward = types.MethodType(
         _local_swiglu_expert_forward,
         module.experts,
     )
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Routed-experts pipeline primitive (D-10, 05 §6.4.8, isomorphic to Megatron
-# MoEAlltoAllTokenDispatcher + expert_tensor_parallel_size=1)
-# ────────────────────────────────────────────────────────────────────────────
 
 
 def _prepare_ep_dispatch(
@@ -548,7 +651,7 @@ def _aggregate_ep_outputs(
     return output.view(*output_shape)
 
 
-def ep_routed_forward(
+def _dynamic_ep_routed_forward(
     module: Any,
     hidden_states: torch.Tensor,
     *,
@@ -637,6 +740,41 @@ def ep_routed_forward(
         source_token_indices,
         dispatch_order,
         (batch_size, sequence_length, hidden_size),
+    )
+
+
+def ep_routed_forward(
+    module: Any,
+    hidden_states: torch.Tensor,
+    *,
+    router_fn: Callable,
+    ep_group: Any,
+) -> torch.Tensor:
+    """Run routed EP through the operation bound to this model.
+
+    Dynamic execution uses the canonical ragged all-to-all pipeline. Graph
+    capture may bind a shape-static operation without changing the model
+    factory, router adapter, expert parameters, or branch composition.
+
+    Args:
+        module: MoE module containing the locally sharded expert holder.
+        hidden_states: Local token activations.
+        router_fn: Explicit model-family router adapter.
+        ep_group: Expert-parallel process group.
+
+    Returns:
+        Routed expert output in the input activation shape.
+    """
+    execution_op = getattr(
+        module.experts,
+        "_ep_execution_op",
+        _DYNAMIC_ROUTED_EP_EXECUTION,
+    )
+    return execution_op.execute(
+        module,
+        hidden_states,
+        router_fn=router_fn,
+        ep_group=ep_group,
     )
 
 
