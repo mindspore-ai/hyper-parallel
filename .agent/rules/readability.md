@@ -11,12 +11,12 @@ traceability is the minimum gate.** The full rules + checklist:
 always in context; do not restate the skill's prose here.
 
 - Over-complex / hard-to-follow **code or docs** is a bug, not a style issue.
-- Prefer deleting over adding; a helper needs 3+ real call sites AND nontrivial
-  logic, else inline it. Applies to `.agent/` agents/skills/rules too.
+- Prefer deleting redundant code and instructions. Extract abstractions when
+  they reduce reading cost or define a necessary boundary; avoid trivial wrappers.
 - **One fact = one place.** Architecture → `docs/rl-architecture.md`; feature map →
   `docs/rl-navigation.md`; RL contracts → `module-map.md`; hard rules →
   `distributed.md`. Every other file links, never restates.
-- A config-key / module / metric / test change must update `docs/rl-navigation.md`
-  in the same diff, or review fails.
+- Changes to documented feature behavior or references must update the navigation
+  in the same diff. Internal-only changes need verification, not a cosmetic edit.
 - Do not remove features, performance knobs, or observability for simplicity.
 - Scope to the verified recipe; a bug that can't trigger there isn't worth fixing.

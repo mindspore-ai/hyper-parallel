@@ -31,13 +31,13 @@ duplicating a fact — and both are bugs.
 3. **Simplicity is the core engineering metric.** When two designs both work,
    ship the one with less code, fewer concepts, fewer files.
 
-4. **No over-encapsulation.** No new class / dataclass / module / agent / skill
-   / rule file for a single call site or a single reference. A helper needs 3+
-   real call sites AND nontrivial logic — otherwise inline it. Never wrap trivial
-   code. Never change a function signature or return shape to thread data that
-   only one caller needs. This applies to `.agent/` too: an agent that only
-   points at a skill, or a rule that only restates another file, does not earn
-   its file.
+4. **Every abstraction must reduce reading cost.** Prefer inline code for
+   trivial wrappers. Extract a function, class, or module when it removes
+   repeated nontrivial logic or gives a coherent algorithm or contract a clear
+   boundary. A single call site can be justified; a call-count quota cannot
+   decide readability. For `.agent/`, keep a separate file only when it provides
+   useful task-specific context or a substantial procedure. Link shared rules
+   instead of copying them.
 
 5. **One fact lives in exactly one place.** A source layout, a module table, a
    hard-rule list, a feature→test mapping — each has exactly one authoritative
@@ -61,14 +61,16 @@ duplicating a fact — and both are bugs.
 
 - Would a human reading this cold understand it in one pass? That is the gate.
 - Could this diff be half the size? If unsure, make it smaller.
-- Any new class / file / agent / skill / rule? Justify each with 3+ call sites and
-  nontrivial logic, or delete it.
+- Does each new abstraction or instruction file reduce reading cost or define
+  a necessary boundary? Remove wrappers and repeated instructions that do neither.
 - Did I duplicate a fact that already lives in `docs/rl-architecture.md`,
   `docs/rl-navigation.md`, `module-map.md`, `distributed.md`, or `project-overview.md`?
   If so, **link instead of restating**.
-- If I changed a config key, module entry, or added a metric/test — does
-  `docs/rl-navigation.md` have a row for it, and is that row updated in this diff?
-  If not, review fails.
+- If a documented config, entry point, contract, metric, or representative test
+  changed, update its navigation row in this diff. For internal-only changes,
+  verify the row still holds and note that in the report; no cosmetic edit is
+  required. Run the catalog checker for reference validity; review the actual
+  config-to-code-to-test relationship separately.
 - Any signature / return-shape change? Verify every caller genuinely needs it.
 - Comments: concise "why" only, 2-4 lines max, written for an external reader —
   no job ids, commit hashes, single-run metrics, or internal paths; keep upstream
