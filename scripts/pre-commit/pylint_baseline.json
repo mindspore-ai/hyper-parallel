@@ -1,0 +1,3429 @@
+{
+  ".agent/scripts/check_agents_catalog.py": {
+    "C0301": 1,
+    "W0611": 1
+  },
+  ".agent/skills/autogit/scripts/autogit.py": {
+    "C9004": 1
+  },
+  ".agent/skills/autogit/scripts/commands.py": {
+    "C0302": 1
+  },
+  ".agent/skills/autogit/scripts/git_utils.py": {
+    "C0104": 4
+  },
+  ".agent/skills/autogit/scripts/pr_content.py": {
+    "C0302": 1
+  },
+  ".agent/skills/gate-doctor/scripts/gate_doctor.py": {
+    "C9001": 1,
+    "C9006": 4,
+    "C9007": 4
+  },
+  "examples/generate/benchmark_generate.py": {
+    "C9002": 2,
+    "C9004": 1,
+    "C9006": 4,
+    "C9007": 1
+  },
+  "examples/generate/cp_generate_check.py": {
+    "C9002": 3,
+    "C9006": 5,
+    "C9007": 3
+  },
+  "examples/generate/hf_alignment_check.py": {
+    "C9002": 1,
+    "C9004": 1,
+    "C9006": 4,
+    "C9007": 1
+  },
+  "examples/mindspore/fully_shard/fsdp_demo.py": {
+    "C9002": 4,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "examples/mindspore/llama3/fsdp_tp_example.py": {
+    "C9002": 5
+  },
+  "examples/mindspore/llama3/model.py": {
+    "C9002": 2,
+    "C9007": 5
+  },
+  "examples/mindspore/llama3/parallelize.py": {
+    "C9002": 2
+  },
+  "examples/mindspore/llama3/tensor_parallel_example.py": {
+    "C9002": 5
+  },
+  "examples/torch/fully_shard/fsdp_demo.py": {
+    "C9002": 3,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "examples/torch/llama3/demo_utils.py": {
+    "C9002": 2
+  },
+  "examples/torch/llama3/dp_tp_cp_sp_fsdp_example.py": {
+    "C9002": 3
+  },
+  "examples/torch/llama3/fsdp_tp_example.py": {
+    "C9002": 2
+  },
+  "examples/torch/llama3/model.py": {
+    "C9002": 3,
+    "C9007": 5
+  },
+  "examples/torch/llama3/parallelize.py": {
+    "C9002": 2
+  },
+  "examples/torch/llama3/pipeline.py": {
+    "C0411": 1,
+    "C9002": 3,
+    "C9006": 2,
+    "C9007": 5
+  },
+  "examples/torch/llama3/pp_example.py": {
+    "C9002": 1
+  },
+  "examples/torch/llama3/pp_fsdp_cp_example.py": {
+    "C9002": 2
+  },
+  "examples/torch/llama3/pp_fsdp_tp_cp_sp_example.py": {
+    "C9002": 2
+  },
+  "examples/torch/llama3/pp_tp_example.py": {
+    "C9002": 1
+  },
+  "examples/torch/llama3/tensor_parallel_example.py": {
+    "C9002": 2
+  },
+  "examples/torch/llama3/tp_cp_example.py": {
+    "C9002": 3
+  },
+  "examples/torch/moe/demo_utils.py": {
+    "C9002": 2
+  },
+  "examples/torch/moe/expert_parallel_example.py": {
+    "C0411": 3,
+    "C9002": 2,
+    "C9004": 1
+  },
+  "examples/torch/moe/model.py": {
+    "C9002": 3,
+    "C9007": 4
+  },
+  "examples/torch/moe/parallelize.py": {
+    "C9002": 2
+  },
+  "examples/torch/moe/pipeline.py": {
+    "C0411": 1,
+    "C9002": 3,
+    "C9006": 2,
+    "C9007": 5
+  },
+  "examples/torch/moe/pp_ep_example.py": {
+    "C9002": 3
+  },
+  "examples/torch/pp_overlap/pp_overlap_moe_example.py": {
+    "C9002": 3,
+    "C9006": 1,
+    "C9007": 5
+  },
+  "hyper_parallel/auto_models/_transformers/auto_model.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/_transformers/checkpoint_loader.py": {
+    "C9002": 3,
+    "E1131": 10
+  },
+  "hyper_parallel/auto_models/_transformers/infrastructure.py": {
+    "C9002": 2,
+    "E1131": 2
+  },
+  "hyper_parallel/auto_models/components/activation_checkpoint/activation_checkpoint.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/activation_swap/attention_swap.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/checkpoint/dcp_checkpointer.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/compile/compile.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/data/chat_template.py": {
+    "C9001": 1,
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/data/data_collator.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/data/dataloader.py": {
+    "C9002": 3
+  },
+  "hyper_parallel/auto_models/components/data/datasets.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/datasets/batching/build_collate_fn.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/batching/build_dataloader.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/datasets/build_collate_fn.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/build_dataloader.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/build_dataset.py": {
+    "C9002": 2,
+    "E1131": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/contracts.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/dataset_logging.py": {
+    "E1131": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/llm/build_data_transform.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/llm/build_tokenizer.py": {
+    "C9001": 1,
+    "E1131": 8
+  },
+  "hyper_parallel/auto_models/components/datasets/llm/chat_template.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/llm/collator.py": {
+    "C9002": 2,
+    "E1131": 4
+  },
+  "hyper_parallel/auto_models/components/datasets/llm/transform_dataset.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/omni/collator.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/omni/dataset.py": {
+    "E1131": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/tools/huggingface_offline.py": {
+    "E1131": 2
+  },
+  "hyper_parallel/auto_models/components/datasets/tools/indexed_dataset.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/tools/offline_preparation.py": {
+    "E1131": 2
+  },
+  "hyper_parallel/auto_models/components/datasets/tools/read_indexed_dataset.py": {
+    "E1131": 2
+  },
+  "hyper_parallel/auto_models/components/datasets/vlm/build_data_transform.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/vlm/collator.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/datasets/vlm/dataset.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/datasets/vlm/get_batch.py": {
+    "E1131": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/config.py": {
+    "E1131": 5
+  },
+  "hyper_parallel/auto_models/components/distributed/cp_utils.py": {
+    "C9001": 1,
+    "C9002": 4
+  },
+  "hyper_parallel/auto_models/components/distributed/cp_wrappers.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9002": 1,
+    "E1131": 16
+  },
+  "hyper_parallel/auto_models/components/distributed/dispatch_probe.py": {
+    "C9001": 1,
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/distributed/ep_compute.py": {
+    "C9001": 1,
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/ep_utils.py": {
+    "C9001": 1,
+    "C9002": 3
+  },
+  "hyper_parallel/auto_models/components/distributed/function_module.py": {
+    "C9001": 1,
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/head_count.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/infrastructure.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/init_utils.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/injection.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/local_region.py": {
+    "C9001": 1,
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/param_role.py": {
+    "C9001": 1,
+    "W0632": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/pipelining.py": {
+    "C9002": 1,
+    "E1131": 2
+  },
+  "hyper_parallel/auto_models/components/distributed/precompiled_boundary.py": {
+    "C9001": 1,
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/sharding/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/sharding/apply.py": {
+    "C9001": 1,
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/distributed/sharding_applier.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/distributed/sharding_config.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/sharding_planner.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/source_shard.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/testing/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/distributed/testing/grad_equiv.py": {
+    "C9001": 1,
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/loss/dist_utils.py": {
+    "C9001": 1,
+    "C9002": 3
+  },
+  "hyper_parallel/auto_models/components/loss/linear_ce.py": {
+    "C9002": 3
+  },
+  "hyper_parallel/auto_models/components/loss/loss_parallel.py": {
+    "C9002": 3
+  },
+  "hyper_parallel/auto_models/components/loss/loss_parallel_ops.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/loss/loss_utils.py": {
+    "C9001": 1,
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/loss/masked_ce.py": {
+    "C9002": 2,
+    "E1123": 2
+  },
+  "hyper_parallel/auto_models/components/loss/utils.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/model_transform/replacement.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/models/qwen3_moe_attention_common.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/models/qwen3_moe_fusions.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/optim/optimizer/optimizer.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/components/stubs/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/stubs/sharding_plan.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/training/low_precision/module_adapter/linear.py": {
+    "C0103": 1
+  },
+  "hyper_parallel/auto_models/components/utils/constants.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/components/utils/device.py": {
+    "C9001": 1,
+    "C9002": 1,
+    "E1131": 3
+  },
+  "hyper_parallel/auto_models/components/utils/helper.py": {
+    "C0103": 1,
+    "C9001": 1,
+    "C9002": 3,
+    "E1131": 1
+  },
+  "hyper_parallel/auto_models/components/utils/model_utils.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/components/utils/registry.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/config/manager.py": {
+    "E1101": 2
+  },
+  "hyper_parallel/auto_models/config/resolver.py": {
+    "E1101": 5
+  },
+  "hyper_parallel/auto_models/trainer/base.py": {
+    "C9001": 1,
+    "C9002": 5,
+    "E1131": 2
+  },
+  "hyper_parallel/auto_models/trainer/callbacks/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/trainer/callbacks/base.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_models/trainer/callbacks/checkpoint_callback.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_models/trainer/callbacks/environ_meter_callback.py": {
+    "E1131": 5
+  },
+  "hyper_parallel/auto_models/trainer/callbacks/evaluate_callback.py": {
+    "E1131": 1
+  },
+  "hyper_parallel/auto_models/trainer/callbacks/logging_callback.py": {
+    "E1131": 1
+  },
+  "hyper_parallel/auto_models/trainer/callbacks/tqdm_callback.py": {
+    "E1131": 1
+  },
+  "hyper_parallel/auto_models/trainer/config.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/auto_models/trainer/text_trainer.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/ndsearch/build_initial_spaces.py": {
+    "C9001": 1,
+    "C9006": 6,
+    "C9007": 5
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/ndsearch/expert_filter_configs.py": {
+    "C0301": 1,
+    "C9001": 1,
+    "C9006": 31,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/ndsearch/memory_model.py": {
+    "C9001": 1,
+    "C9006": 9
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/ndsearch/para_for_nd_search.py": {
+    "C9001": 1,
+    "C9006": 12,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/parallel_tool.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/dryrun.py": {
+    "C9001": 1,
+    "C9006": 9,
+    "E0602": 9
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/fitting.py": {
+    "C9001": 1,
+    "C9006": 8
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/math_model.py": {
+    "C0103": 1,
+    "C9001": 1,
+    "C9006": 12
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/memory.py": {
+    "C9001": 1,
+    "C9006": 5
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/micro.py": {
+    "C9001": 1,
+    "C9006": 7
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/pipeline_parallel.py": {
+    "C0103": 2,
+    "C9001": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/pp_simulator.py": {
+    "C0104": 2,
+    "C0302": 1,
+    "C9001": 1,
+    "C9006": 52,
+    "C9007": 8,
+    "E0602": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/pp_util.py": {
+    "C0103": 4,
+    "C9001": 1,
+    "C9006": 29
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/result_csv.py": {
+    "C9001": 1,
+    "C9006": 7,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/solution.py": {
+    "C9001": 1,
+    "C9006": 7,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_conductor/start_service.py": {
+    "C9001": 1,
+    "C9006": 16
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/pipeline_tool.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/common.py": {
+    "C9001": 1,
+    "C9006": 16
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/dryrun_manage.py": {
+    "C9001": 1,
+    "C9006": 7
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/input_config.py": {
+    "C9001": 1,
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/input_param.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/logger.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/ppc_input.py": {
+    "C9001": 1,
+    "C9006": 7,
+    "C9007": 3
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/profiling/profile_info.py": {
+    "C9001": 1,
+    "C9006": 3
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/profiling/profile_launch.py": {
+    "C9001": 1,
+    "C9006": 4,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/profiling/profile_parser.py": {
+    "C9001": 1,
+    "C9006": 37,
+    "C9007": 2,
+    "E1101": 8
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/fast_tuner/utils/profiling/profile_prepare.py": {
+    "C9001": 1,
+    "C9006": 10
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/unit_tests/nd_search_test.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/fast-tuner/unit_tests/pipeline_alg_test.py": {
+    "C9001": 1,
+    "C9006": 6,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/_patch_accelerator.py": {
+    "C9002": 1,
+    "C9007": 10
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/api/session.py": {
+    "C9002": 1,
+    "C9006": 4,
+    "C9007": 2
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/execution/base.py": {
+    "C9002": 2,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/execution/replay/executor.py": {
+    "C9002": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/execution/tensor.py": {
+    "C9002": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/execution/warmup/executor.py": {
+    "C9002": 2,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/execution/warmup/tracker.py": {
+    "C9002": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/runtime/bandwidth.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/runtime/pinned_memory.py": {
+    "C9002": 1,
+    "C9007": 1,
+    "E1131": 1
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/runtime/residency.py": {
+    "C9002": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/hyper_offload/runtime/timer.py": {
+    "C9002": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/_backbone.py": {
+    "C9001": 1,
+    "C9006": 10,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/_bwd_overhead.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/_context.py": {
+    "C0207": 1,
+    "C9001": 1,
+    "C9006": 9,
+    "C9007": 6
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/_func_tracer.py": {
+    "C9001": 1,
+    "C9006": 10,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/_hook_manager.py": {
+    "C9001": 1,
+    "C9006": 16,
+    "C9007": 6
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/_utils.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/estimate_v2.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/evaluators/body.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/evaluators/comm.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/evaluators/compute.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/evaluators/head.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/evaluators/layer_block.py": {
+    "C9001": 1,
+    "C9006": 5
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/evaluators/tail.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/evaluators/utils.py": {
+    "C9001": 1,
+    "C9006": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/hook_base.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/logger.py": {
+    "C9001": 1,
+    "C9006": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/score.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/size.py": {
+    "C9001": 1,
+    "C9006": 20,
+    "C9007": 4
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/validators/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/memory_estimation/validators/ep_constraints.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/balancing_adapter.py": {
+    "C9001": 1,
+    "C9006": 21,
+    "C9007": 3
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/_cost_model_variables.py": {
+    "C0301": 1,
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/arch_hooks.py": {
+    "C9001": 1,
+    "C9006": 26,
+    "C9007": 12
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/config.py": {
+    "C9001": 1,
+    "C9006": 7,
+    "C9007": 3
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/cost_model_preprocess.py": {
+    "C9001": 1,
+    "C9006": 16,
+    "C9007": 5
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/framework_parsers/_cost_model_parser.py": {
+    "C9001": 1,
+    "C9006": 6,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/framework_parsers/cost_model_parser_hyperparallel.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/framework_parsers/cost_model_parser_mindformers.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/framework_parsers/cost_model_parser_mindspeed.py": {
+    "C9001": 1,
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/generate_partitions.py": {
+    "C9001": 1,
+    "C9006": 7
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/hardware.py": {
+    "C9001": 1,
+    "C9006": 18,
+    "C9007": 5
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/common/layer_type.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/debug.py": {
+    "C9001": 1,
+    "C9006": 37,
+    "C9007": 5
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/dimensions.py": {
+    "C9001": 1,
+    "C9006": 23,
+    "C9007": 6
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/global_config.py": {
+    "C9001": 1,
+    "C9006": 17,
+    "C9007": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/logger.py": {
+    "C9001": 1,
+    "C9006": 3
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/parallelize.py": {
+    "C9001": 1,
+    "C9006": 19,
+    "C9007": 3,
+    "E1101": 4
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/nd/run_nd.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/perf_estimation/comm_time.py": {
+    "C9001": 1,
+    "C9006": 16
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/perf_estimation/estimate.py": {
+    "C0103": 2,
+    "C9001": 1,
+    "C9006": 15
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/perf_estimation/getters.py": {
+    "C9001": 1,
+    "C9006": 3
+  },
+  "hyper_parallel/auto_parallel/sapp_nd/perf_estimation/utils_classes.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 3
+  },
+  "hyper_parallel/auto_parallel/sapp_ppb/sapp/sapp_pipeline.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_ppb/sapp/sapp_solver.py": {
+    "C0103": 1,
+    "C0302": 1
+  },
+  "hyper_parallel/auto_parallel/sapp_ppb/utils/computation_analyzer.py": {
+    "C0103": 2
+  },
+  "hyper_parallel/collectives/cc.py": {
+    "C9006": 5
+  },
+  "hyper_parallel/compile/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/config/configurable.py": {
+    "C9006": 2,
+    "E1123": 2
+  },
+  "hyper_parallel/core/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/activation_checkpoint/activation_checkpoint.py": {
+    "C9006": 5,
+    "C9007": 4
+  },
+  "hyper_parallel/core/activation_checkpoint/swap.py": {
+    "C9006": 31,
+    "C9007": 5
+  },
+  "hyper_parallel/core/context_parallel/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/context_parallel/async_context_parallel.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 3
+  },
+  "hyper_parallel/core/context_parallel/async_dsa_context_parallel.py": {
+    "C9007": 1,
+    "E1101": 1
+  },
+  "hyper_parallel/core/context_parallel/context_parallel.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/core/context_parallel/dsa_context_parallel.py": {
+    "C9006": 1,
+    "C9007": 11,
+    "E1101": 3
+  },
+  "hyper_parallel/core/context_parallel/linear_attention_context_parallel.py": {
+    "C0302": 1
+  },
+  "hyper_parallel/core/distributed_checkpoint/filesystem_storage.py": {
+    "C9006": 5,
+    "C9007": 2
+  },
+  "hyper_parallel/core/distributed_checkpoint/layout.py": {
+    "C9001": 1,
+    "C9008": 1
+  },
+  "hyper_parallel/core/distributed_checkpoint/loader.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/distributed_checkpoint/planner.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/core/distributed_checkpoint/reshard.py": {
+    "C9001": 1,
+    "C9006": 1,
+    "C9007": 3
+  },
+  "hyper_parallel/core/distributed_checkpoint/saver.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/core/distributed_checkpoint/standard_planner.py": {
+    "C9006": 5,
+    "C9007": 3
+  },
+  "hyper_parallel/core/distributed_checkpoint/storage.py": {
+    "C9006": 3
+  },
+  "hyper_parallel/core/distributed_checkpoint/util.py": {
+    "C9007": 2,
+    "C9008": 1
+  },
+  "hyper_parallel/core/dtensor/_from_local_utils.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/core/dtensor/debug/_call_records.py": {
+    "C9007": 1
+  },
+  "hyper_parallel/core/dtensor/debug/_collective_tracer.py": {
+    "C9006": 4,
+    "C9007": 2
+  },
+  "hyper_parallel/core/dtensor/debug/_comm_debug_mode.py": {
+    "C9006": 4,
+    "C9007": 4
+  },
+  "hyper_parallel/core/dtensor/debug/_module_tracker.py": {
+    "C9006": 5,
+    "C9007": 3
+  },
+  "hyper_parallel/core/dtensor/device_mesh.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9006": 19,
+    "C9007": 8
+  },
+  "hyper_parallel/core/dtensor/dtensor.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9006": 14,
+    "C9007": 3,
+    "W0236": 1
+  },
+  "hyper_parallel/core/dtensor/init_weights.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/core/dtensor/layout.py": {
+    "C9001": 1,
+    "C9006": 36,
+    "C9007": 5,
+    "C9008": 1
+  },
+  "hyper_parallel/core/dtensor/parameter_init.py": {
+    "C9001": 1,
+    "C9006": 1
+  },
+  "hyper_parallel/core/dtensor/placement_types.py": {
+    "C9006": 4,
+    "C9007": 22
+  },
+  "hyper_parallel/core/dtensor/random.py": {
+    "C9006": 9,
+    "C9007": 4,
+    "W0603": 1
+  },
+  "hyper_parallel/core/dtensor/redistribute_infer.py": {
+    "C9001": 1,
+    "C9006": 4,
+    "C9007": 2
+  },
+  "hyper_parallel/core/dtensor/tensor_redistribution.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "hyper_parallel/core/expert_parallel/expert_parallel.py": {
+    "C0302": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/core/fully_shard/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/fully_shard/api.py": {
+    "C0415": 6,
+    "C9001": 1,
+    "C9006": 14,
+    "C9008": 1,
+    "E1101": 3,
+    "R1710": 2
+  },
+  "hyper_parallel/core/fully_shard/hsdp_param.py": {
+    "C9001": 1,
+    "C9006": 20,
+    "E1131": 1
+  },
+  "hyper_parallel/core/fully_shard/hsdp_scheduler.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 3
+  },
+  "hyper_parallel/core/fully_shard/hsdp_state.py": {
+    "C9001": 1,
+    "C9003": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/core/fully_shard/hsdp_utils.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 2,
+    "R1710": 2
+  },
+  "hyper_parallel/core/multicore/__init__.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/core/multicore/modules/mega_moe/backward/gen_runtime_data.py": {
+    "C9006": 3
+  },
+  "hyper_parallel/core/multicore/modules/mega_moe/backward/graph.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/core/multicore/modules/mega_moe/backward/tiling_tables.py": {
+    "C0103": 14
+  },
+  "hyper_parallel/core/multicore/modules/mega_moe/forward/gen_runtime_data.py": {
+    "C9006": 3
+  },
+  "hyper_parallel/core/multicore/modules/mega_moe/forward/graph.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/core/multicore/platform/mindspore/__init__.py": {
+    "C9006": 2,
+    "W0603": 1
+  },
+  "hyper_parallel/core/multicore/platform/torch/__init__.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/core/multicore/scheduler/graph.py": {
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/core/multicore/scheduler/scheduler.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/core/multicore/tasks/alltoall.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/core/multicore/tasks/gmm.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/core/multicore/tasks/swiglu.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/core/multicore/tasks/task_base.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/core/multicore/tasks/utils.py": {
+    "C9006": 6
+  },
+  "hyper_parallel/core/optimizer/adamw.py": {
+    "C9002": 1,
+    "C9006": 3,
+    "C9007": 2
+  },
+  "hyper_parallel/core/optimizer/dtensor_compat.py": {
+    "C9002": 1,
+    "C9006": 5
+  },
+  "hyper_parallel/core/optimizer/lr_scheduler.py": {
+    "C9002": 2,
+    "C9006": 5,
+    "C9007": 2
+  },
+  "hyper_parallel/core/optimizer/muon.py": {
+    "C9002": 2,
+    "C9006": 3,
+    "C9007": 2
+  },
+  "hyper_parallel/core/optimizer/muon_shard.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/core/optimizer/optimizer.py": {
+    "C9002": 3,
+    "C9006": 3,
+    "C9007": 4
+  },
+  "hyper_parallel/core/optimizer/sharding_category.py": {
+    "C9002": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/core/optimizer/swap_optimizer_base.py": {
+    "C9006": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/core/optimizer/utils.py": {
+    "C9002": 1,
+    "C9006": 3,
+    "C9007": 3,
+    "W0603": 1
+  },
+  "hyper_parallel/core/pipeline_parallel/comm_compute_overlap.py": {
+    "C9007": 1
+  },
+  "hyper_parallel/core/pipeline_parallel/hook_coordinator.py": {
+    "C9007": 1
+  },
+  "hyper_parallel/core/pipeline_parallel/scheduler.py": {
+    "C0302": 1,
+    "C9006": 47,
+    "C9007": 15,
+    "W0107": 1
+  },
+  "hyper_parallel/core/pipeline_parallel/stage.py": {
+    "C9006": 17,
+    "C9007": 4
+  },
+  "hyper_parallel/core/pipeline_parallel/utils.py": {
+    "C9001": 1,
+    "C9006": 9,
+    "C9007": 4
+  },
+  "hyper_parallel/core/shard/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/_op_dispatch.py": {
+    "C9001": 1,
+    "C9006": 6,
+    "C9007": 7
+  },
+  "hyper_parallel/core/shard/api.py": {
+    "C9001": 1,
+    "C9006": 7,
+    "C9007": 3,
+    "C9008": 1
+  },
+  "hyper_parallel/core/shard/custom_shard.py": {
+    "C9001": 1,
+    "C9006": 1,
+    "C9007": 1,
+    "C9008": 1
+  },
+  "hyper_parallel/core/shard/dfunction.py": {
+    "C9006": 4,
+    "C9007": 2
+  },
+  "hyper_parallel/core/shard/ops/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_activation_with_axis.py": {
+    "C9001": 1,
+    "C9006": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_argmax_with_value_ops.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_atleast_1d.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_cell_backward_hook.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_conv3d.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "hyper_parallel/core/shard/ops/parallel_elementwise.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_embedding.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_expand_dims.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_gather.py": {
+    "C9006": 4,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_lightning_indexer.py": {
+    "W0613": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_matmul.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_mhc_post.py": {
+    "C9007": 2
+  },
+  "hyper_parallel/core/shard/ops/parallel_ms_flash_attention_score.py": {
+    "C0302": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_norm.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_npu_dense_lightning_indexer_grad_kl_loss.py": {
+    "W0613": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_npu_dense_lightning_indexer_softmax_lse.py": {
+    "W0613": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_npu_flash_attention_score.py": {
+    "C0302": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_npu_sparse_flash_attention.py": {
+    "W0613": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_npu_sparse_lightning_indexer_grad_kl_loss.py": {
+    "W0613": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_one_hot_ext.py": {
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_ops.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_ops_register.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/core/shard/ops/parallel_reduce.py": {
+    "C9001": 1,
+    "C9006": 9,
+    "C9007": 8
+  },
+  "hyper_parallel/core/shard/ops/parallel_reshape.py": {
+    "C9001": 1,
+    "C9006": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/core/shard/ops/parallel_scaled_dot_product_attention.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_scatter_update.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_slice.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_slice_ext.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_split.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_squeeze.py": {
+    "C9007": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_stack.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/core/shard/ops/parallel_topk.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/shard/ops/parallel_tuple_elementwise.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/symmetric_memory/__init__.py": {
+    "C9006": 12,
+    "C9008": 2
+  },
+  "hyper_parallel/core/tensor_parallel/_ce_op_registry.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/tensor_parallel/loss_parallel.py": {
+    "C9001": 1,
+    "W0603": 1
+  },
+  "hyper_parallel/core/tensor_parallel/loss_parallel_ops_common.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/core/tensor_parallel/mc2.py": {
+    "C9002": 2,
+    "C9006": 4
+  },
+  "hyper_parallel/core/tensor_parallel/mc2_style.py": {
+    "C9002": 1,
+    "C9006": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/core/tensor_parallel/style.py": {
+    "C9006": 13,
+    "C9007": 30,
+    "W0613": 9
+  },
+  "hyper_parallel/core/utils/clip_grad.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/core/utils/shape_utils.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/custom_ops/experimental/experimental_ops.py": {
+    "C9002": 1,
+    "C9006": 10
+  },
+  "hyper_parallel/data/dummy.py": {
+    "C9002": 2,
+    "C9007": 3
+  },
+  "hyper_parallel/data/hf.py": {
+    "C9002": 2,
+    "C9006": 1,
+    "C9007": 3
+  },
+  "hyper_parallel/data/megatron/blendable_dataset.py": {
+    "C9002": 1,
+    "C9007": 3
+  },
+  "hyper_parallel/data/megatron/gpt_dataset.py": {
+    "C9002": 2,
+    "C9007": 3,
+    "E1101": 3
+  },
+  "hyper_parallel/data/megatron/indexed_dataset.py": {
+    "C9007": 5
+  },
+  "hyper_parallel/data/preset_pt.py": {
+    "C9002": 2,
+    "C9007": 3
+  },
+  "hyper_parallel/data/registry.py": {
+    "C9007": 4
+  },
+  "hyper_parallel/data/vl_dummy.py": {
+    "C9002": 2,
+    "C9006": 1,
+    "C9007": 3
+  },
+  "hyper_parallel/dmodule/model.py": {
+    "C9006": 2,
+    "E1123": 4
+  },
+  "hyper_parallel/dmodule/module.py": {
+    "C9006": 2,
+    "C9007": 1,
+    "E1123": 2,
+    "E1136": 1,
+    "R0402": 1
+  },
+  "hyper_parallel/dmodule/sharding.py": {
+    "E1123": 4,
+    "E1131": 7
+  },
+  "hyper_parallel/infer/generation.py": {
+    "C9002": 2,
+    "C9006": 1
+  },
+  "hyper_parallel/infer/kv_cache.py": {
+    "C9002": 1,
+    "C9006": 2,
+    "C9007": 2
+  },
+  "hyper_parallel/infer/mixin.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/infer/sampler.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/infer/utils.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/integration/llamafactory/activation.py": {
+    "C9002": 3,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/integration/llamafactory/context_parallel/context_parallel_prepare.py": {
+    "C9002": 1,
+    "C9006": 1
+  },
+  "hyper_parallel/integration/llamafactory/context_parallel/inputs.py": {
+    "C9002": 2,
+    "C9006": 4,
+    "E1131": 1
+  },
+  "hyper_parallel/integration/llamafactory/context_parallel/loss.py": {
+    "C9002": 4
+  },
+  "hyper_parallel/integration/llamafactory/context_parallel/models/qwen3_vl/qwen3vl_forward.py": {
+    "C9002": 2,
+    "C9006": 4,
+    "C9007": 1,
+    "E1101": 11,
+    "E1131": 37,
+    "W0613": 3
+  },
+  "hyper_parallel/integration/llamafactory/context_parallel/models/registry.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/integration/llamafactory/utils.py": {
+    "C9002": 4,
+    "C9006": 10,
+    "C9007": 3,
+    "E1131": 2,
+    "W0603": 1
+  },
+  "hyper_parallel/models/glm5/attention.py": {
+    "C9002": 3,
+    "C9006": 7,
+    "C9007": 4
+  },
+  "hyper_parallel/models/glm5/checkpoint.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/models/glm5/dsa.py": {
+    "C9002": 3,
+    "C9007": 4
+  },
+  "hyper_parallel/models/glm5/model.py": {
+    "C9002": 3,
+    "C9006": 10,
+    "C9007": 9
+  },
+  "hyper_parallel/models/glm5/moe.py": {
+    "C9002": 3
+  },
+  "hyper_parallel/models/glm5/parallelize.py": {
+    "C9002": 1,
+    "C9006": 1
+  },
+  "hyper_parallel/models/glm5/state_dict.py": {
+    "C9002": 1,
+    "C9006": 2,
+    "C9007": 2
+  },
+  "hyper_parallel/models/modules/attention.py": {
+    "C9002": 3,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/models/modules/feed_forward.py": {
+    "C9002": 3,
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/models/modules/moe.py": {
+    "C9002": 3,
+    "C9006": 5,
+    "C9007": 4
+  },
+  "hyper_parallel/models/modules/rmsnorm.py": {
+    "C9002": 3,
+    "C9006": 2,
+    "C9007": 2
+  },
+  "hyper_parallel/models/modules/rope.py": {
+    "C9002": 2,
+    "C9006": 5,
+    "C9007": 3
+  },
+  "hyper_parallel/models/qwen3_5/checkpoint.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/models/qwen3_5/model.py": {
+    "C9002": 3,
+    "C9006": 14,
+    "C9007": 7
+  },
+  "hyper_parallel/models/qwen3_5/parallelize.py": {
+    "C0302": 1
+  },
+  "hyper_parallel/models/qwen3_5/state_dict.py": {
+    "C9002": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/models/qwen3_5_moe/checkpoint.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/models/qwen3_5_moe/model.py": {
+    "C9002": 3,
+    "C9006": 22,
+    "C9007": 8
+  },
+  "hyper_parallel/models/qwen3_5_moe/model_vl.py": {
+    "C9002": 3,
+    "C9006": 9,
+    "C9007": 7,
+    "E1131": 1
+  },
+  "hyper_parallel/models/qwen3_5_moe/mtp.py": {
+    "C9002": 3,
+    "C9006": 1,
+    "C9007": 1
+  },
+  "hyper_parallel/models/qwen3_5_moe/parallelize.py": {
+    "C0302": 1,
+    "C9002": 3,
+    "C9006": 1
+  },
+  "hyper_parallel/models/qwen3_5_moe/state_dict.py": {
+    "C9002": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/models/qwen3_vl_moe/checkpoint.py": {
+    "C9002": 1
+  },
+  "hyper_parallel/models/qwen3_vl_moe/model.py": {
+    "C0302": 1,
+    "C9002": 3,
+    "C9006": 29,
+    "C9007": 11
+  },
+  "hyper_parallel/models/qwen3_vl_moe/parallelize.py": {
+    "C0302": 1,
+    "C9002": 1,
+    "C9006": 1
+  },
+  "hyper_parallel/models/qwen3_vl_moe/state_dict.py": {
+    "C9002": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/models/qwen3_vl_vision/model.py": {
+    "C9002": 3,
+    "C9006": 12,
+    "C9007": 12
+  },
+  "hyper_parallel/models/qwen_image_dit/__init__.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/models/qwen_image_dit/model.py": {
+    "C9002": 3,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/models/qwen_image_dit/parallelize.py": {
+    "C9002": 2
+  },
+  "hyper_parallel/models/spec/state_dict_adapter.py": {
+    "C9002": 1,
+    "C9006": 2
+  },
+  "hyper_parallel/platform/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/platform/mindspore/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/platform/mindspore/activation_checkpoint/activation_swap.py": {
+    "C9001": 1,
+    "C9006": 11,
+    "C9007": 5
+  },
+  "hyper_parallel/platform/mindspore/activation_checkpoint/checkpoint_wrapper.py": {
+    "C9006": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/platform/mindspore/activation_checkpoint/sac.py": {
+    "C9006": 8,
+    "C9007": 8
+  },
+  "hyper_parallel/platform/mindspore/autograd_compat.py": {
+    "C9006": 11,
+    "C9007": 2,
+    "W0603": 1
+  },
+  "hyper_parallel/platform/mindspore/custom_ops/custom_op_impl.py": {
+    "C9006": 19,
+    "C9007": 2
+  },
+  "hyper_parallel/platform/mindspore/custom_ops/custom_ops.py": {
+    "C9006": 10
+  },
+  "hyper_parallel/platform/mindspore/dtensor.py": {
+    "C9001": 1,
+    "C9006": 12,
+    "C9007": 1,
+    "W0012": 2
+  },
+  "hyper_parallel/platform/mindspore/fully_shard/hook_function.py": {
+    "C9006": 3
+  },
+  "hyper_parallel/platform/mindspore/fully_shard/param.py": {
+    "C9006": 5,
+    "C9007": 12,
+    "C9008": 1
+  },
+  "hyper_parallel/platform/mindspore/fully_shard/param_group.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "hyper_parallel/platform/mindspore/fully_shard/scheduler.py": {
+    "C0415": 1,
+    "C9003": 1,
+    "C9006": 1,
+    "C9007": 1,
+    "R1710": 1
+  },
+  "hyper_parallel/platform/mindspore/fully_shard/state.py": {
+    "C9006": 2,
+    "C9007": 1
+  },
+  "hyper_parallel/platform/mindspore/init_weights.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/platform/mindspore/multicore/__init__.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/platform/mindspore/parameter_init.py": {
+    "C9001": 1,
+    "C9006": 1
+  },
+  "hyper_parallel/platform/mindspore/pipeline_parallel/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/platform/mindspore/pipeline_parallel/_utils.py": {
+    "C9006": 6,
+    "C9007": 1
+  },
+  "hyper_parallel/platform/mindspore/pipeline_parallel/backward.py": {
+    "C9006": 7,
+    "C9007": 3,
+    "C9008": 1
+  },
+  "hyper_parallel/platform/mindspore/pipeline_parallel/stage.py": {
+    "C9001": 1,
+    "C9006": 9,
+    "C9007": 1,
+    "E1101": 19
+  },
+  "hyper_parallel/platform/mindspore/platform.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9006": 128,
+    "C9007": 69,
+    "E1136": 1
+  },
+  "hyper_parallel/platform/mindspore/platform_graph.py": {
+    "C9001": 1,
+    "C9006": 9,
+    "C9007": 10
+  },
+  "hyper_parallel/platform/mindspore/swap_optimizer/adapters.py": {
+    "C9007": 8,
+    "E1102": 1,
+    "W1116": 1
+  },
+  "hyper_parallel/platform/mindspore/swap_optimizer/swap_optimizer.py": {
+    "C9006": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/platform/mindspore/symmetric_memory/aclshmem_ms/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/platform/mindspore/symmetric_memory/symmetric_memory.py": {
+    "C0103": 1,
+    "C9006": 13,
+    "C9008": 1
+  },
+  "hyper_parallel/platform/platform.py": {
+    "C0103": 1,
+    "C0302": 1,
+    "C9001": 1,
+    "C9006": 110,
+    "C9007": 1,
+    "W0603": 2
+  },
+  "hyper_parallel/platform/torch/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/platform/torch/activation_checkpoint/activation_swap.py": {
+    "C9006": 12,
+    "C9007": 5
+  },
+  "hyper_parallel/platform/torch/activation_checkpoint/checkpoint_wrapper.py": {
+    "C9006": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/platform/torch/activation_checkpoint/sac.py": {
+    "C9006": 9,
+    "C9007": 8
+  },
+  "hyper_parallel/platform/torch/custom_ops/__init__.py": {
+    "C9006": 10
+  },
+  "hyper_parallel/platform/torch/dtensor.py": {
+    "C9001": 1,
+    "C9006": 10,
+    "C9007": 1,
+    "W0012": 2
+  },
+  "hyper_parallel/platform/torch/fully_shard/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/platform/torch/fully_shard/hook_function.py": {
+    "C9006": 3
+  },
+  "hyper_parallel/platform/torch/fully_shard/param.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 9
+  },
+  "hyper_parallel/platform/torch/fully_shard/param_group.py": {
+    "C9001": 1,
+    "C9007": 2
+  },
+  "hyper_parallel/platform/torch/fully_shard/scheduler.py": {
+    "C9001": 1,
+    "C9003": 1,
+    "C9006": 2,
+    "C9007": 1,
+    "W0611": 1
+  },
+  "hyper_parallel/platform/torch/fully_shard/state.py": {
+    "C9001": 1,
+    "C9006": 4
+  },
+  "hyper_parallel/platform/torch/function_override.py": {
+    "C9001": 1,
+    "C9006": 3
+  },
+  "hyper_parallel/platform/torch/group_utils.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/platform/torch/init_weights.py": {
+    "C9006": 1
+  },
+  "hyper_parallel/platform/torch/multicore/__init__.py": {
+    "C9006": 2
+  },
+  "hyper_parallel/platform/torch/pipeline_parallel/__init__.py": {
+    "C9001": 1
+  },
+  "hyper_parallel/platform/torch/pipeline_parallel/_utils.py": {
+    "C9001": 1,
+    "C9006": 4,
+    "C9007": 1
+  },
+  "hyper_parallel/platform/torch/pipeline_parallel/stage.py": {
+    "C0104": 1,
+    "C9001": 1,
+    "C9006": 6,
+    "C9007": 1,
+    "E1101": 11
+  },
+  "hyper_parallel/platform/torch/platform.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9006": 120,
+    "C9007": 63,
+    "C9008": 1,
+    "E1136": 1
+  },
+  "hyper_parallel/platform/torch/swap_optimizer/adapters.py": {
+    "C9006": 1,
+    "C9007": 4
+  },
+  "hyper_parallel/platform/torch/swap_optimizer/swap_optimizer.py": {
+    "C9006": 6,
+    "C9007": 3
+  },
+  "hyper_parallel/platform/torch/symmetric_memory/symmetric_memory.py": {
+    "C0103": 1,
+    "C9006": 17,
+    "C9007": 4,
+    "C9008": 4
+  },
+  "hyper_parallel/rl/examples/agents/gsm8k/agent.py": {
+    "C0411": 6
+  },
+  "hyper_parallel/rl/examples/agents/gsm8k/prepare_gsm8k_m3.py": {
+    "C0411": 3
+  },
+  "hyper_parallel/rl/examples/agents/gsm8k/tools.py": {
+    "E1131": 1
+  },
+  "hyper_parallel/rl/examples/agents/search_R1/agent.py": {
+    "C0411": 6
+  },
+  "hyper_parallel/rl/rl/agentic/core/runner.py": {
+    "E1131": 2
+  },
+  "hyper_parallel/rl/rl/agentic/tools/executor.py": {
+    "C9007": 2
+  },
+  "hyper_parallel/rl/rl/agentic/tools/registry.py": {
+    "C9007": 2
+  },
+  "hyper_parallel/rl/rl/roles/rollout/vllm.py": {
+    "C0302": 1
+  },
+  "hyper_parallel/rl/rl/roles/weight_sync/transfer.py": {
+    "C0302": 1,
+    "E1133": 1,
+    "E1136": 1
+  },
+  "hyper_parallel/rl/rl/roles/weight_sync/vllm_worker.py": {
+    "C0302": 1
+  },
+  "hyper_parallel/rl/rl_tests/test_agentic_runner.py": {
+    "C9007": 5
+  },
+  "hyper_parallel/rl/rl_tests/test_algorithm_registry.py": {
+    "C9007": 1
+  },
+  "hyper_parallel/rl/rl_tests/test_checkpoint_manager.py": {
+    "C9007": 3
+  },
+  "hyper_parallel/rl/rl_tests/test_direct_reshard.py": {
+    "C0302": 1,
+    "C1803": 1,
+    "C9006": 19,
+    "C9007": 40,
+    "E1102": 1,
+    "E1131": 1,
+    "E1133": 1,
+    "E1136": 5
+  },
+  "hyper_parallel/rl/rl_tests/test_hccl_weight_sync.py": {
+    "C9006": 7,
+    "C9007": 11,
+    "W0108": 1
+  },
+  "hyper_parallel/rl/rl_tests/test_vllm_runtime.py": {
+    "C0302": 1
+  },
+  "hyper_parallel/tools/logging.py": {
+    "C9006": 1,
+    "C9007": 2,
+    "W0603": 1
+  },
+  "hyper_parallel/trainer/base.py": {
+    "C0302": 1,
+    "C9002": 6,
+    "C9006": 15,
+    "C9007": 2
+  },
+  "hyper_parallel/trainer/callbacks/base.py": {
+    "C0302": 1,
+    "C9002": 2,
+    "C9006": 35,
+    "C9007": 29
+  },
+  "hyper_parallel/trainer/dit_trainer.py": {
+    "C9002": 2,
+    "C9006": 11,
+    "C9007": 10
+  },
+  "hyper_parallel/trainer/llm_trainer.py": {
+    "C9002": 1,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "hyper_parallel/trainer/parallel_dims.py": {
+    "C9006": 3,
+    "E1101": 2
+  },
+  "hyper_parallel/trainer/utils/logging.py": {
+    "C9006": 5,
+    "C9007": 1,
+    "W0603": 1
+  },
+  "hyper_parallel/trainer/vl_trainer.py": {
+    "C9002": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "scripts/pre-commit/run_pylint.py": {
+    "W0611": 1
+  },
+  "setup.py": {
+    "C9001": 1,
+    "C9006": 7,
+    "C9007": 2
+  },
+  "tests/__init__.py": {
+    "C9001": 1
+  },
+  "tests/common/__init__.py": {
+    "C9001": 1
+  },
+  "tests/common/distributed_launcher.py": {
+    "C9006": 1
+  },
+  "tests/common/mark_utils.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "tests/common/random_generator.py": {
+    "C9001": 1,
+    "C9006": 7,
+    "C9007": 7
+  },
+  "tests/mindspore/__init__.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/__init__.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/_forward_and_gradfn_grad_storage_impl.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/mindspore/st/activation_checkpoint/ckpt_activation.py": {
+    "C9006": 31,
+    "C9007": 23
+  },
+  "tests/mindspore/st/activation_checkpoint/swap_activation.py": {
+    "C0411": 1,
+    "C9006": 22,
+    "C9007": 12
+  },
+  "tests/mindspore/st/checkpoint/base_shard.py": {
+    "C0103": 2,
+    "C0301": 1,
+    "C9001": 1,
+    "C9006": 4,
+    "C9007": 3
+  },
+  "tests/mindspore/st/checkpoint/reshard_handler.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "tests/mindspore/st/checkpoint/test_checkpoint.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/common_net.py": {
+    "C9001": 1,
+    "C9006": 14,
+    "C9007": 14
+  },
+  "tests/mindspore/st/context_parallel/__init__.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/context_parallel/context_parallel.py": {
+    "C9006": 12,
+    "C9007": 12
+  },
+  "tests/mindspore/st/dtensor/_test_comm_debug_mode_mlp.py": {
+    "C9006": 3,
+    "C9007": 3
+  },
+  "tests/mindspore/st/fully_shard/_fully_shard_precision.py": {
+    "C9006": 3,
+    "C9007": 2,
+    "E1101": 1
+  },
+  "tests/mindspore/st/fully_shard/_precision_fully_shard_list.py": {
+    "C9006": 4,
+    "C9007": 4,
+    "E1101": 1
+  },
+  "tests/mindspore/st/fully_shard/_test_fully_shard_auto_grad.py": {
+    "C9006": 11,
+    "C9007": 10
+  },
+  "tests/mindspore/st/fully_shard/_test_fully_shard_backward_overlap.py": {
+    "C9006": 1,
+    "C9007": 5
+  },
+  "tests/mindspore/st/fully_shard/_test_fully_shard_module.py": {
+    "C9006": 6,
+    "C9007": 6
+  },
+  "tests/mindspore/st/fully_shard/_test_fully_shard_replicate_params.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/mindspore/st/fully_shard/_test_fully_shard_simu_pp.py": {
+    "C0301": 1,
+    "C9006": 4,
+    "C9007": 4
+  },
+  "tests/mindspore/st/fully_shard/_test_gradient_scaling_factor_hsdp_acc.py": {
+    "C0103": 3,
+    "C9006": 3,
+    "C9007": 6
+  },
+  "tests/mindspore/st/fully_shard/_test_hsdp_avg_grad_scale_parity.py": {
+    "C9007": 4
+  },
+  "tests/mindspore/st/fully_shard/_test_tp_fsdp_backward_overlap_perf.py": {
+    "C0413": 16,
+    "C9006": 4,
+    "C9007": 10
+  },
+  "tests/mindspore/st/fully_shard/_tp_fully_shard_e2e.py": {
+    "C0302": 1,
+    "C9006": 5,
+    "C9007": 4,
+    "E1101": 1,
+    "E1131": 3
+  },
+  "tests/mindspore/st/init_weights/_test_empty_weights_and_reset_parameter.py": {
+    "C9006": 8,
+    "C9007": 2,
+    "E1101": 1
+  },
+  "tests/mindspore/st/init_weights/_test_init_weights.py": {
+    "C9006": 2,
+    "C9007": 2,
+    "E1101": 2
+  },
+  "tests/mindspore/st/loss_parallel/_loss_parallel_accuracy_dist.py": {
+    "C9006": 2,
+    "C9007": 1
+  },
+  "tests/mindspore/st/pipeline_parallel/__init__.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/pipeline_parallel/_backward_impl.py": {
+    "C9001": 1,
+    "C9006": 42,
+    "C9007": 42
+  },
+  "tests/mindspore/st/pipeline_parallel/_pipeline_shard.py": {
+    "C9006": 4,
+    "C9007": 4
+  },
+  "tests/mindspore/st/pipeline_parallel/_stage_impl.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/mindspore/st/pipeline_parallel/_test_pp_composite.py": {
+    "C0104": 1,
+    "C9006": 5,
+    "C9007": 5
+  },
+  "tests/mindspore/st/pipeline_parallel/_test_pp_swap_interleaved_1f1b.py": {
+    "C9006": 3,
+    "C9007": 3
+  },
+  "tests/mindspore/st/pipeline_parallel/overlap_expert_parallel.py": {
+    "C9006": 14,
+    "C9007": 13,
+    "E1101": 1
+  },
+  "tests/mindspore/st/pipeline_parallel/pp_overlap_moe_poc.py": {
+    "C0302": 1,
+    "C9006": 9,
+    "C9007": 12,
+    "E1101": 9
+  },
+  "tests/mindspore/st/pipeline_parallel/test_backward.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/__init__.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/_dfunction.py": {
+    "C9006": 16,
+    "C9007": 23
+  },
+  "tests/mindspore/st/shard/base_dtensor_init.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 3
+  },
+  "tests/mindspore/st/shard/base_random.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/construct_all_to_all.py": {
+    "C9001": 1,
+    "C9006": 1
+  },
+  "tests/mindspore/st/shard/distribute_tensor_comm.py": {
+    "E1101": 1
+  },
+  "tests/mindspore/st/shard/ops/cases/case_embedding.py": {
+    "E1101": 1
+  },
+  "tests/mindspore/st/shard/ops/cases/case_gather.py": {
+    "E1101": 1
+  },
+  "tests/mindspore/st/shard/ops/cases/case_inplace_scatter_value.py": {
+    "E1101": 2
+  },
+  "tests/mindspore/st/shard/ops/cases/case_lightning_indexer.py": {
+    "E1101": 2
+  },
+  "tests/mindspore/st/shard/ops/cases/case_matmul_partial_propagation.py": {
+    "E1101": 2
+  },
+  "tests/mindspore/st/shard/ops/cases/case_npu_sparse_flash_attention.py": {
+    "E1101": 3
+  },
+  "tests/mindspore/st/shard/ops/cases/case_npu_sparse_lightning_indexer_grad_kl_loss.py": {
+    "E1101": 2
+  },
+  "tests/mindspore/st/shard/ops/cases/case_one_hot_ext.py": {
+    "E1101": 5
+  },
+  "tests/mindspore/st/shard/redistribute.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/shard_api_args.py": {
+    "C9001": 1,
+    "C9006": 1,
+    "C9007": 1
+  },
+  "tests/mindspore/st/shard/submesh.py": {
+    "C0302": 1,
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/mindspore/st/shard/test_base_dtensor_init.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/test_base_random.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/test_construct_all_to_all.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/test_redistribute.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/test_shard_api_args.py": {
+    "C9001": 1
+  },
+  "tests/mindspore/st/shard/utils.py": {
+    "C9001": 1,
+    "C9006": 8,
+    "C9007": 2
+  },
+  "tests/mindspore/st/swap_optimizer/mf_adamw.py": {
+    "C9006": 6,
+    "C9007": 1
+  },
+  "tests/mindspore/st/swap_optimizer/swap_optimizer.py": {
+    "C0302": 1,
+    "C9006": 13,
+    "C9007": 12
+  },
+  "tests/mindspore/st/utils.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "tests/shard_ops/framework/utils.py": {
+    "E1101": 1
+  },
+  "tests/torch/__init__.py": {
+    "C9001": 1
+  },
+  "tests/torch/activation_checkpoint/activation_checkpoint.py": {
+    "C9006": 14,
+    "C9007": 13
+  },
+  "tests/torch/activation_checkpoint/activation_checkpoint_swap.py": {
+    "C9006": 9,
+    "C9007": 7
+  },
+  "tests/torch/activation_checkpoint/utils.py": {
+    "C9006": 4
+  },
+  "tests/torch/auto_parallel/hyper_offload/test_precision.py": {
+    "C9006": 5,
+    "C9007": 4,
+    "E1131": 1
+  },
+  "tests/torch/checkpoint/_test_dcp_tp_dp.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/torch/checkpoint/base_shard.py": {
+    "C9006": 1
+  },
+  "tests/torch/checkpoint/dcp_async_save.py": {
+    "C9007": 2,
+    "E1131": 2
+  },
+  "tests/torch/checkpoint/dcp_safe_open_api.py": {
+    "C9001": 1,
+    "C9006": 16,
+    "C9007": 16
+  },
+  "tests/torch/checkpoint/test_dcp_safe_open_api.py": {
+    "C9001": 1
+  },
+  "tests/torch/checkpoint/test_dcp_tp_dp.py": {
+    "C0301": 1
+  },
+  "tests/torch/common_net.py": {
+    "C9001": 1,
+    "C9006": 16,
+    "C9007": 16
+  },
+  "tests/torch/context_parallel/__init__.py": {
+    "C9001": 1
+  },
+  "tests/torch/context_parallel/_test_context_parallel.py": {
+    "C0302": 1
+  },
+  "tests/torch/dist_module/_test_module_parallelize.py": {
+    "C9006": 2,
+    "C9007": 1
+  },
+  "tests/torch/dtensor/_test_comm_debug_mode_mlp.py": {
+    "C9006": 3,
+    "C9007": 3
+  },
+  "tests/torch/dtensor/test_dtensor_api.py": {
+    "C9001": 1
+  },
+  "tests/torch/fully_shard/_test_device_mesh_concatenate.py": {
+    "C0413": 5
+  },
+  "tests/torch/fully_shard/_test_fully_shard.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/torch/fully_shard/_test_fully_shard_auto_grad.py": {
+    "C9006": 4,
+    "C9007": 4
+  },
+  "tests/torch/fully_shard/_test_fully_shard_hook_state_machine.py": {
+    "C9006": 2,
+    "C9007": 4
+  },
+  "tests/torch/fully_shard/_test_fully_shard_module.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/torch/fully_shard/_test_fully_shard_precision.py": {
+    "C9006": 12,
+    "C9007": 6
+  },
+  "tests/torch/fully_shard/_test_fully_shard_precision_list.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "tests/torch/fully_shard/_test_fully_shard_replicate_params.py": {
+    "C0103": 3,
+    "C9001": 1,
+    "C9006": 4,
+    "C9007": 6
+  },
+  "tests/torch/fully_shard/_test_fully_shard_with_defer_init.py": {
+    "C9007": 2
+  },
+  "tests/torch/fully_shard/_test_gradient_scaling_factor_hsdp_acc.py": {
+    "C0103": 3,
+    "C9007": 6
+  },
+  "tests/torch/fully_shard/_test_hsdp_avg_grad_scale_parity.py": {
+    "C0413": 9,
+    "C9007": 4
+  },
+  "tests/torch/fully_shard/_test_hsdp_param.py": {
+    "C0301": 1,
+    "C0302": 1,
+    "C0413": 10,
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 3,
+    "W0613": 1
+  },
+  "tests/torch/fully_shard/_test_tp_fully_shard_e2e.py": {
+    "C0302": 1,
+    "C0413": 12,
+    "C9006": 7,
+    "C9007": 6
+  },
+  "tests/torch/fully_shard/fully_shard_common.py": {
+    "C9006": 1
+  },
+  "tests/torch/fully_shard/test_device_mesh_concatenate.py": {
+    "C0301": 2
+  },
+  "tests/torch/fully_shard/test_fully_shard_replicate_params.py": {
+    "C0103": 1
+  },
+  "tests/torch/fully_shard/test_hsdp_param.py": {
+    "C9001": 1
+  },
+  "tests/torch/generate/stub_model.py": {
+    "C9006": 3,
+    "C9007": 2,
+    "E1131": 1
+  },
+  "tests/torch/generate/test_generate.py": {
+    "C9006": 13,
+    "C9007": 2
+  },
+  "tests/torch/generate/test_kv_cache.py": {
+    "C9006": 3,
+    "C9007": 1
+  },
+  "tests/torch/init_weights/_test_init_weights.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/torch/init_weights/test_init_weights_ut.py": {
+    "C9006": 5,
+    "C9007": 5
+  },
+  "tests/torch/integration/llamafactory/ut/test_activation.py": {
+    "C9006": 12,
+    "C9007": 12
+  },
+  "tests/torch/integration/llamafactory/ut/test_context_parallel.py": {
+    "C9006": 20,
+    "C9007": 20
+  },
+  "tests/torch/integration/llamafactory/ut/test_trainer.py": {
+    "C9006": 11,
+    "C9007": 11
+  },
+  "tests/torch/llama3_examples/_test_llama3_examples.py": {
+    "C9004": 1
+  },
+  "tests/torch/loss_parallel/_loss_parallel_pytorch_dist.py": {
+    "C9006": 3,
+    "C9007": 1
+  },
+  "tests/torch/loss_parallel/_pytorch_reference.py": {
+    "C0103": 1
+  },
+  "tests/torch/pipeline_parallel/__init__.py": {
+    "C9001": 1
+  },
+  "tests/torch/pipeline_parallel/_test_pp_composite.py": {
+    "C9006": 1,
+    "C9007": 2
+  },
+  "tests/torch/pipeline_parallel/pipeline.py": {
+    "C9006": 2,
+    "C9007": 5
+  },
+  "tests/torch/pipeline_parallel/pipeline_shard.py": {
+    "C9001": 1,
+    "C9006": 1
+  },
+  "tests/torch/pipeline_parallel/simple_mlp.py": {
+    "C9006": 9,
+    "C9007": 4
+  },
+  "tests/torch/pipeline_parallel/test_pp_shard.py": {
+    "C9001": 1
+  },
+  "tests/torch/pipeline_parallel/test_vpp_schedule.py": {
+    "C9001": 1
+  },
+  "tests/torch/pipeline_parallel/vpp_schedule.py": {
+    "C9001": 1,
+    "C9006": 1
+  },
+  "tests/torch/shard/_dfunction.py": {
+    "C9006": 16,
+    "C9007": 24
+  },
+  "tests/torch/shard/base_dtensor.py": {
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/torch/shard/base_dtensor_init.py": {
+    "C9006": 3,
+    "C9007": 3
+  },
+  "tests/torch/shard/base_random.py": {
+    "C9001": 1
+  },
+  "tests/torch/shard/base_shard.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 1
+  },
+  "tests/torch/shard/ops/cases/case_gather.py": {
+    "E1101": 1
+  },
+  "tests/torch/shard/ops/cases/case_masked_scatter.py": {
+    "E1101": 4
+  },
+  "tests/torch/shard/redistribute.py": {
+    "C9001": 1
+  },
+  "tests/torch/shard/submesh.py": {
+    "C0302": 1,
+    "C9001": 1,
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/torch/shard/test_base_dtensor.py": {
+    "C9001": 1
+  },
+  "tests/torch/shard/test_base_dtensor_init.py": {
+    "C9001": 1
+  },
+  "tests/torch/shard/test_base_random.py": {
+    "C9001": 1
+  },
+  "tests/torch/shard/test_base_shard.py": {
+    "C9001": 1
+  },
+  "tests/torch/shard/test_redistribute.py": {
+    "C9001": 1
+  },
+  "tests/torch/shard/test_submesh.py": {
+    "C9001": 1
+  },
+  "tests/torch/shard/utils.py": {
+    "C9001": 1,
+    "C9006": 4,
+    "C9007": 2
+  },
+  "tests/torch/swap_optimizer/swap_optimizer.py": {
+    "C9007": 2
+  },
+  "tests/torch/tensor_parallel/_test_distribute_module_distributed.py": {
+    "C9006": 4,
+    "C9007": 6,
+    "W0611": 1
+  },
+  "tests/torch/tensor_parallel/_test_mc2_distributed.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/torch/tensor_parallel/_test_no_parallel_distributed.py": {
+    "C9006": 2,
+    "C9007": 2,
+    "W0611": 1
+  },
+  "tests/torch/tensor_parallel/_test_parallelize_module_distributed.py": {
+    "C9006": 2,
+    "C9007": 2,
+    "W0611": 1
+  },
+  "tests/torch/tensor_parallel/_test_prepare_module_io_distributed.py": {
+    "C9006": 14,
+    "C9007": 14
+  },
+  "tests/torch/tensor_parallel/_test_tp_hybrid_distributed.py": {
+    "C9006": 1,
+    "C9007": 1
+  },
+  "tests/torch/tensor_parallel/_test_tp_styles_distributed.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/ut/auto_parallel/hyper_offload/api/test_opaque.py": {
+    "C9006": 13,
+    "C9007": 19
+  },
+  "tests/ut/auto_parallel/hyper_offload/api/test_session.py": {
+    "C9006": 1,
+    "C9007": 5
+  },
+  "tests/ut/auto_parallel/hyper_offload/execution/test_base.py": {
+    "C0415": 2,
+    "C9006": 4,
+    "C9007": 8
+  },
+  "tests/ut/auto_parallel/hyper_offload/execution/test_replay.py": {
+    "C0415": 1,
+    "C9006": 12,
+    "C9007": 24,
+    "W0611": 1,
+    "W0613": 1
+  },
+  "tests/ut/auto_parallel/hyper_offload/execution/test_tensor.py": {
+    "C9007": 1
+  },
+  "tests/ut/auto_parallel/hyper_offload/execution/test_tracker.py": {
+    "C9006": 1,
+    "C9007": 3
+  },
+  "tests/ut/auto_parallel/hyper_offload/execution/test_warmup.py": {
+    "C0415": 3,
+    "C9006": 3,
+    "C9007": 12,
+    "W0611": 1
+  },
+  "tests/ut/auto_parallel/hyper_offload/planning/test_greedy_planner.py": {
+    "C9007": 1
+  },
+  "tests/ut/auto_parallel/hyper_offload/runtime/test_bandwidth.py": {
+    "W0611": 1
+  },
+  "tests/ut/auto_parallel/hyper_offload/runtime/test_pinned_memory.py": {
+    "C9007": 9
+  },
+  "tests/ut/auto_parallel/hyper_offload/runtime/test_residency.py": {
+    "C9007": 19,
+    "W0613": 4
+  },
+  "tests/ut/auto_parallel/sapp_nd/memory_estimation/test_body.py": {
+    "C0413": 2,
+    "C0415": 5,
+    "W0611": 1,
+    "W0613": 2
+  },
+  "tests/ut/auto_parallel/sapp_nd/memory_estimation/test_comm.py": {
+    "C0413": 1,
+    "C0415": 9,
+    "C9006": 7,
+    "C9007": 7
+  },
+  "tests/ut/auto_parallel/sapp_nd/memory_estimation/test_compute.py": {
+    "C0413": 1,
+    "C0415": 1
+  },
+  "tests/ut/auto_parallel/sapp_nd/memory_estimation/test_cost_model_preprocess.py": {
+    "C0415": 4,
+    "C9006": 1,
+    "C9007": 1,
+    "W0611": 1
+  },
+  "tests/ut/auto_parallel/sapp_nd/memory_estimation/test_ep_constraints.py": {
+    "C0413": 1,
+    "W0611": 1,
+    "W0613": 1
+  },
+  "tests/ut/auto_parallel/sapp_nd/memory_estimation/test_hook_manager.py": {
+    "C0413": 2,
+    "C0415": 5,
+    "E1101": 10,
+    "W0611": 3
+  },
+  "tests/ut/auto_parallel/sapp_nd/nd/test_hardware.py": {
+    "C0413": 2
+  },
+  "tests/ut/auto_parallel/sapp_nd/nd/test_run_nd.py": {
+    "C0302": 1
+  },
+  "tests/ut/auto_parallel/sapp_nd/test_cp_modeling.py": {
+    "C0302": 1,
+    "C0415": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/conftest.py": {
+    "C9004": 1,
+    "C9006": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/pp_modeling/test_dual_param.py": {
+    "C9006": 2,
+    "C9007": 1,
+    "W0613": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/pp_modeling/test_head_tail_time_semantics.py": {
+    "W0611": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/pp_modeling/test_ilp_sol_status_feasibility.py": {
+    "W0611": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/pp_modeling/test_layer_offset_roundtrip.py": {
+    "W0611": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/pp_modeling/test_layer_remainder_correction.py": {
+    "W0611": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/pp_modeling/test_pipeline_simulator_integration.py": {
+    "C0415": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/pp_modeling/test_pp_types_stage_partitioner.py": {
+    "C0415": 6,
+    "C9007": 1,
+    "W0611": 1
+  },
+  "tests/ut/auto_parallel/sapp_ppb/pp_modeling/test_recompute_consistency.py": {
+    "C0415": 4
+  },
+  "tests/ut/collectives/test_cc.py": {
+    "C0413": 2,
+    "C0415": 1
+  },
+  "tests/ut/config/test_configurable.py": {
+    "C0413": 1,
+    "C9006": 7,
+    "C9007": 7,
+    "E1101": 1,
+    "E1123": 13
+  },
+  "tests/ut/conftest.py": {
+    "C0415": 1,
+    "C9006": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/activation_checkpoint/test_activation_checkpoint.py": {
+    "C9006": 14,
+    "C9007": 14
+  },
+  "tests/ut/core/activation_checkpoint/test_swap.py": {
+    "C0301": 1,
+    "C0302": 1,
+    "C0413": 1,
+    "C0415": 5,
+    "C9006": 36,
+    "C9007": 36,
+    "W0613": 6
+  },
+  "tests/ut/core/context_parallel/test_async_context_parallel.py": {
+    "C0413": 5,
+    "C9006": 14,
+    "C9007": 14,
+    "E1136": 6
+  },
+  "tests/ut/core/context_parallel/test_async_context_parallel_mindspore.py": {
+    "C0411": 1,
+    "C0413": 1,
+    "C9006": 11,
+    "C9007": 9
+  },
+  "tests/ut/core/context_parallel/test_context_parallel.py": {
+    "C0413": 6,
+    "C9006": 7,
+    "C9007": 7,
+    "E1101": 4
+  },
+  "tests/ut/core/context_parallel/test_dsa_context_parallel.py": {
+    "C0413": 7,
+    "C9006": 4,
+    "C9007": 4
+  },
+  "tests/ut/core/distributed_checkpoint/test_api.py": {
+    "C9006": 1,
+    "C9007": 2
+  },
+  "tests/ut/core/distributed_checkpoint/test_async_staging.py": {
+    "C9007": 1
+  },
+  "tests/ut/core/distributed_checkpoint/test_filesystem_storage.py": {
+    "C0415": 4,
+    "C9006": 1,
+    "C9007": 2
+  },
+  "tests/ut/core/distributed_checkpoint/test_layout.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/ut/core/distributed_checkpoint/test_loader.py": {
+    "C9007": 1
+  },
+  "tests/ut/core/distributed_checkpoint/test_ragged_utils.py": {
+    "C0413": 7
+  },
+  "tests/ut/core/distributed_checkpoint/test_saver.py": {
+    "C9007": 1
+  },
+  "tests/ut/core/distributed_checkpoint/test_standard_planner.py": {
+    "C0415": 1,
+    "C9007": 1
+  },
+  "tests/ut/core/distributed_checkpoint/test_util.py": {
+    "C9007": 1
+  },
+  "tests/ut/core/dtensor/__init__.py": {
+    "C9001": 1
+  },
+  "tests/ut/core/dtensor/test_calc_shard_info.py": {
+    "C0413": 2
+  },
+  "tests/ut/core/dtensor/test_comm_debug_mode.py": {
+    "C0413": 7,
+    "C0415": 4,
+    "C9001": 1,
+    "C9006": 1,
+    "C9007": 1,
+    "W0611": 2
+  },
+  "tests/ut/core/dtensor/test_device_mesh.py": {
+    "C0413": 7,
+    "C0415": 2,
+    "C9006": 2,
+    "W0611": 1,
+    "W0613": 4
+  },
+  "tests/ut/core/dtensor/test_device_mesh_meta_context.py": {
+    "C0411": 1,
+    "C0413": 4,
+    "E1101": 3
+  },
+  "tests/ut/core/dtensor/test_device_mesh_mindspore.py": {
+    "C0413": 3,
+    "C9001": 1,
+    "C9006": 5
+  },
+  "tests/ut/core/dtensor/test_device_mesh_pytest.py": {
+    "C0413": 6,
+    "C9006": 5,
+    "C9007": 1
+  },
+  "tests/ut/core/dtensor/test_distribute_tensor_comm.py": {
+    "C9001": 1
+  },
+  "tests/ut/core/dtensor/test_dtensor.py": {
+    "C0301": 9,
+    "C0411": 1,
+    "C0412": 1,
+    "C0413": 6,
+    "C9006": 18,
+    "C9007": 15,
+    "W0613": 15
+  },
+  "tests/ut/core/dtensor/test_dtensor_new_zeros_ones.py": {
+    "W0613": 21
+  },
+  "tests/ut/core/dtensor/test_dtensor_to.py": {
+    "C0415": 1,
+    "C9006": 4,
+    "C9007": 4,
+    "W0611": 1
+  },
+  "tests/ut/core/dtensor/test_dtensor_tolist.py": {
+    "C0304": 1
+  },
+  "tests/ut/core/dtensor/test_from_local_run_check.py": {
+    "C0301": 1,
+    "C0413": 3,
+    "C9006": 1,
+    "C9007": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/dtensor/test_init_weights.py": {
+    "C0415": 4,
+    "C9006": 4,
+    "W0613": 8
+  },
+  "tests/ut/core/dtensor/test_layout.py": {
+    "C0413": 7,
+    "C0415": 5,
+    "C9006": 2,
+    "W0611": 2,
+    "W0613": 4
+  },
+  "tests/ut/core/dtensor/test_manual_seed.py": {
+    "C0413": 2,
+    "C9007": 1
+  },
+  "tests/ut/core/dtensor/test_parameter_init.py": {
+    "C0415": 3
+  },
+  "tests/ut/core/dtensor/test_public_api_export.py": {
+    "C0415": 1
+  },
+  "tests/ut/core/dtensor/test_ragged_utils.py": {
+    "C0413": 6,
+    "C9006": 2
+  },
+  "tests/ut/core/dtensor/test_rand_factory.py": {
+    "C0413": 3
+  },
+  "tests/ut/core/dtensor/test_random.py": {
+    "C0413": 4,
+    "C0415": 4,
+    "W0611": 3,
+    "W0613": 3
+  },
+  "tests/ut/core/dtensor/test_tensor_redistribution.py": {
+    "C0413": 6,
+    "C0415": 21,
+    "C9006": 2,
+    "W0611": 1,
+    "W0613": 4
+  },
+  "tests/ut/core/expert_parallel/test_expert_parallel.py": {
+    "C0302": 1,
+    "C0303": 12,
+    "C0413": 2,
+    "C0415": 4,
+    "C9007": 3,
+    "W0613": 3,
+    "W0632": 7
+  },
+  "tests/ut/core/fully_shard/test_hsdp_param.py": {
+    "C0301": 1,
+    "C0413": 7,
+    "C9006": 1,
+    "C9007": 1
+  },
+  "tests/ut/core/optimizer/test_muon.py": {
+    "E1120": 1
+  },
+  "tests/ut/core/optimizer/test_swap_optimizer.py": {
+    "C0413": 8,
+    "C9006": 25,
+    "C9007": 23,
+    "E1123": 1
+  },
+  "tests/ut/core/pipeline_parallel/__init__.py": {
+    "C9001": 1
+  },
+  "tests/ut/core/pipeline_parallel/test_order.py": {
+    "C0302": 1,
+    "C9006": 17,
+    "C9007": 16
+  },
+  "tests/ut/core/shard/custom_parallel_ops/parallel_stack_ext.py": {
+    "C0104": 1,
+    "C9001": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/shard/ops/__init__.py": {
+    "C9001": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_activation_with_axis.py": {
+    "C9001": 1,
+    "C9006": 4,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_argmax_with_value_ops.py": {
+    "C9001": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_argsort.py": {
+    "C9001": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_atleast_1d.py": {
+    "C0304": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_cell_backward_hook.py": {
+    "C9006": 1,
+    "C9007": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_chunk_view.py": {
+    "W0613": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_concat.py": {
+    "C0413": 6,
+    "C9003": 1,
+    "C9006": 2,
+    "W0613": 2
+  },
+  "tests/ut/core/shard/ops/test_parallel_conv3d.py": {
+    "C0301": 1,
+    "C0413": 6,
+    "C9003": 1,
+    "C9006": 2
+  },
+  "tests/ut/core/shard/ops/test_parallel_cumsum.py": {
+    "C0303": 1,
+    "C9001": 1,
+    "C9006": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_elementwise.py": {
+    "C9001": 1,
+    "C9006": 10
+  },
+  "tests/ut/core/shard/ops/test_parallel_embedding.py": {
+    "C9006": 4,
+    "C9007": 2,
+    "W0611": 2
+  },
+  "tests/ut/core/shard/ops/test_parallel_expand.py": {
+    "C9006": 2
+  },
+  "tests/ut/core/shard/ops/test_parallel_expand_dims.py": {
+    "C9001": 1,
+    "C9006": 4,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_flatten.py": {
+    "C9006": 3,
+    "C9007": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_gather.py": {
+    "C0301": 2,
+    "C0302": 1,
+    "C9006": 12,
+    "C9007": 6,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_getitem.py": {
+    "W0613": 2
+  },
+  "tests/ut/core/shard/ops/test_parallel_inplace_scatter_value.py": {
+    "W0613": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_isin.py": {
+    "C9001": 1,
+    "W0611": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_lightning_indexer.py": {
+    "C9006": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_matmul.py": {
+    "C9001": 1,
+    "C9006": 6,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_max.py": {
+    "C9001": 1,
+    "W0611": 1,
+    "W0632": 13
+  },
+  "tests/ut/core/shard/ops/test_parallel_max_dim.py": {
+    "W0611": 1,
+    "W0632": 7
+  },
+  "tests/ut/core/shard/ops/test_parallel_mhc_post.py": {
+    "C9006": 2,
+    "W0611": 2
+  },
+  "tests/ut/core/shard/ops/test_parallel_min.py": {
+    "C9001": 1,
+    "W0611": 1,
+    "W0632": 13
+  },
+  "tests/ut/core/shard/ops/test_parallel_ms_flash_attention_score.py": {
+    "C9006": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_nonzero.py": {
+    "C0304": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_norm.py": {
+    "C0304": 1,
+    "C9001": 1,
+    "C9006": 4,
+    "W0611": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_npu_dense_lightning_indexer_grad_kl_loss.py": {
+    "C9006": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_npu_dense_lightning_indexer_softmax_lse.py": {
+    "C0415": 1,
+    "C9006": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_npu_flash_attention_score.py": {
+    "C0302": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_npu_sparse_flash_attention.py": {
+    "C9006": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_npu_sparse_lightning_indexer_grad_kl_loss.py": {
+    "C9006": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_one_hot_ext.py": {
+    "C0415": 2,
+    "C9006": 4,
+    "C9007": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_ops.py": {
+    "C0415": 1,
+    "C9006": 6,
+    "C9007": 6,
+    "W0611": 2,
+    "W0613": 2
+  },
+  "tests/ut/core/shard/ops/test_parallel_outer.py": {
+    "C0304": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_pad.py": {
+    "C9006": 2,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_reduce.py": {
+    "C9001": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_repeat.py": {
+    "C0301": 1,
+    "C9006": 2,
+    "W0611": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_reshape.py": {
+    "C0301": 2,
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_rotary_position_embedding.py": {
+    "C0415": 1,
+    "C9006": 10,
+    "C9007": 10,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_scaled_dot_product_attention.py": {
+    "C0415": 14,
+    "C9006": 6,
+    "C9007": 4,
+    "W0611": 1,
+    "W0613": 7
+  },
+  "tests/ut/core/shard/ops/test_parallel_scatter.py": {
+    "C9006": 2,
+    "W0611": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_slice.py": {
+    "C9001": 1,
+    "C9006": 3,
+    "C9007": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_slice_ext.py": {
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_sort.py": {
+    "C9001": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_split.py": {
+    "C0104": 3,
+    "C9001": 1,
+    "C9006": 4,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_squeeze.py": {
+    "C9001": 1,
+    "C9006": 2
+  },
+  "tests/ut/core/shard/ops/test_parallel_stack.py": {
+    "C9007": 2,
+    "W0611": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_sum_mean_prod_ext.py": {
+    "C9001": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_topk.py": {
+    "C9001": 1,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_transpose.py": {
+    "W0611": 1
+  },
+  "tests/ut/core/shard/ops/test_parallel_tuple_elementwise.py": {
+    "C9006": 2,
+    "C9007": 2,
+    "W0613": 1
+  },
+  "tests/ut/core/shard/test_api.py": {
+    "C0413": 7,
+    "C0415": 22,
+    "C9006": 34,
+    "C9007": 34,
+    "E1101": 17,
+    "W0611": 2,
+    "W0613": 29
+  },
+  "tests/ut/core/shard/test_custom_shard.py": {
+    "C0413": 6,
+    "C9006": 11,
+    "C9007": 11,
+    "W0611": 1
+  },
+  "tests/ut/core/shard/test_dfunction.py": {
+    "C0413": 2,
+    "C9006": 12,
+    "C9007": 12
+  },
+  "tests/ut/core/shard/test_op_dispatch.py": {
+    "C0415": 54,
+    "C9001": 1,
+    "C9006": 9,
+    "C9007": 9,
+    "W0611": 3,
+    "W0613": 5
+  },
+  "tests/ut/core/tensor_parallel/test_api.py": {
+    "C0103": 2,
+    "C0413": 4,
+    "C9006": 11,
+    "C9007": 11
+  },
+  "tests/ut/core/tensor_parallel/test_ce_op_without_context.py": {
+    "C0415": 52,
+    "C9001": 1,
+    "W0611": 2
+  },
+  "tests/ut/core/tensor_parallel/test_colwise_parallel.py": {
+    "C0413": 5,
+    "C9006": 4,
+    "C9007": 4,
+    "W0611": 1
+  },
+  "tests/ut/core/tensor_parallel/test_cross_entropy_still_works.py": {
+    "C0415": 8,
+    "C9001": 1
+  },
+  "tests/ut/core/tensor_parallel/test_decomposed_ce_op_error.py": {
+    "C0415": 16,
+    "C9001": 1
+  },
+  "tests/ut/core/tensor_parallel/test_loss_parallel_context.py": {
+    "C0303": 17,
+    "C0304": 1,
+    "C9001": 1
+  },
+  "tests/ut/core/tensor_parallel/test_loss_parallel_params.py": {
+    "C0303": 7,
+    "C0415": 3,
+    "C9001": 1
+  },
+  "tests/ut/core/tensor_parallel/test_loss_parallel_regression.py": {
+    "C0303": 3,
+    "C0415": 4,
+    "C9001": 1,
+    "W0611": 6
+  },
+  "tests/ut/core/tensor_parallel/test_loss_parallel_version.py": {
+    "C0303": 6,
+    "C0415": 5,
+    "C9001": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/tensor_parallel/test_mc2_style.py": {
+    "C0413": 5,
+    "C9006": 4,
+    "C9007": 4
+  },
+  "tests/ut/core/tensor_parallel/test_no_parallel.py": {
+    "C0413": 6,
+    "C9006": 5,
+    "C9007": 5
+  },
+  "tests/ut/core/tensor_parallel/test_rowwise_parallel.py": {
+    "C0413": 6,
+    "C9006": 9,
+    "C9007": 9
+  },
+  "tests/ut/core/tensor_parallel/test_sequence_parallel.py": {
+    "C0413": 5,
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/ut/core/tensor_parallel/test_style.py": {
+    "C0103": 1,
+    "C0413": 6,
+    "C9006": 20,
+    "C9007": 18,
+    "E0110": 1,
+    "W0613": 1
+  },
+  "tests/ut/core/test_device_mesh.py": {
+    "C0302": 1,
+    "C0413": 4,
+    "C9003": 1,
+    "C9006": 2,
+    "C9007": 1
+  },
+  "tests/ut/core/test_dtensor.py": {
+    "C0304": 1,
+    "C0413": 4,
+    "C9006": 4,
+    "W0611": 3,
+    "W0613": 1
+  },
+  "tests/ut/core/test_placement_types.py": {
+    "C0413": 4,
+    "C9006": 2
+  },
+  "tests/ut/core/test_tensor_redistribution.py": {
+    "C0413": 5,
+    "C9004": 1,
+    "C9006": 4
+  },
+  "tests/ut/core/utils/test_shape_utils.py": {
+    "C0413": 1,
+    "C9006": 5,
+    "C9007": 4
+  },
+  "tests/ut/custom_ops/experimental/test_experimental_ops.py": {
+    "C0413": 1
+  },
+  "tests/ut/dmodule/test_model_spec.py": {
+    "C0411": 2,
+    "C0413": 5,
+    "C9006": 3,
+    "C9007": 5,
+    "E0202": 1,
+    "E1123": 2
+  },
+  "tests/ut/dmodule/test_module.py": {
+    "C0411": 2,
+    "C0413": 4,
+    "C9006": 16,
+    "C9007": 18,
+    "E0202": 1,
+    "E1123": 11,
+    "E1131": 1,
+    "W0613": 1
+  },
+  "tests/ut/dmodule/test_module_local_map_stub.py": {
+    "C0413": 4,
+    "C9006": 2,
+    "C9007": 2,
+    "E0202": 1,
+    "E1123": 2
+  },
+  "tests/ut/dmodule/test_sharding_resolve.py": {
+    "C0413": 3
+  },
+  "tests/ut/dmodule/test_types.py": {
+    "C0413": 1
+  },
+  "tests/ut/platform/mindspore/activation_checkpoint/test_activation_swap.py": {
+    "C0411": 3,
+    "C0413": 8,
+    "C9006": 8
+  },
+  "tests/ut/platform/mindspore/activation_checkpoint/test_checkpoint_wrapper.py": {
+    "C0411": 2,
+    "C0413": 6,
+    "C9006": 2,
+    "C9007": 2,
+    "W0613": 2
+  },
+  "tests/ut/platform/mindspore/activation_checkpoint/test_sac.py": {
+    "C0411": 1,
+    "C0412": 1,
+    "C0413": 7,
+    "C9006": 2
+  },
+  "tests/ut/platform/mindspore/custom_ops/test_custom_op_impl.py": {
+    "C0415": 5,
+    "C9006": 3,
+    "C9007": 3,
+    "W0611": 1
+  },
+  "tests/ut/platform/mindspore/dtensor/test_dtensor.py": {
+    "C0413": 2,
+    "C0415": 2,
+    "C9006": 2,
+    "C9007": 2,
+    "W0613": 1
+  },
+  "tests/ut/platform/mindspore/dtensor/test_dtensor_set_data.py": {
+    "C0413": 2
+  },
+  "tests/ut/platform/mindspore/dtensor/test_ensure_contiguous.py": {
+    "C0413": 4
+  },
+  "tests/ut/platform/mindspore/fully_shard/conftest.py": {
+    "C9006": 1
+  },
+  "tests/ut/platform/mindspore/fully_shard/test_fully_shard_list_api.py": {
+    "C0411": 1,
+    "C0413": 5,
+    "C9006": 7,
+    "C9007": 4
+  },
+  "tests/ut/platform/mindspore/fully_shard/test_fully_shard_register_hook.py": {
+    "C0411": 4,
+    "C0413": 1,
+    "C9006": 9,
+    "C9007": 8
+  },
+  "tests/ut/platform/mindspore/fully_shard/test_mixed_precision.py": {
+    "C0411": 1,
+    "C0412": 1,
+    "C0413": 6
+  },
+  "tests/ut/platform/mindspore/fully_shard/test_param.py": {
+    "C0411": 1,
+    "C0412": 1,
+    "C0413": 7
+  },
+  "tests/ut/platform/mindspore/fully_shard/test_param_group.py": {
+    "C0411": 1,
+    "C0412": 1,
+    "C0413": 7
+  },
+  "tests/ut/platform/mindspore/fully_shard/test_scheduler.py": {
+    "C0411": 1,
+    "C0412": 1,
+    "C0413": 7
+  },
+  "tests/ut/platform/mindspore/fully_shard/test_state.py": {
+    "C0411": 1,
+    "C0412": 1,
+    "C0413": 7,
+    "C9006": 1,
+    "C9007": 1
+  },
+  "tests/ut/platform/mindspore/pipeline_parallel/test_microbatch.py": {
+    "C0411": 4,
+    "C0413": 11
+  },
+  "tests/ut/platform/mindspore/swap_optimizer/test_adapters.py": {
+    "C0413": 3,
+    "C9006": 34,
+    "C9007": 34
+  },
+  "tests/ut/platform/mindspore/test_autograd_compat.py": {
+    "C0413": 2,
+    "C9006": 12,
+    "C9007": 12
+  },
+  "tests/ut/platform/mindspore/test_platform_scatter.py": {
+    "C0413": 1,
+    "C9001": 1
+  },
+  "tests/ut/platform/test_async_handle.py": {
+    "C0413": 1
+  },
+  "tests/ut/platform/torch/activation_checkpoint/test_activation_swap.py": {
+    "C0413": 3,
+    "C9006": 2
+  },
+  "tests/ut/platform/torch/activation_checkpoint/test_checkpoint_wrapper.py": {
+    "C9006": 2,
+    "C9007": 2
+  },
+  "tests/ut/platform/torch/activation_checkpoint/test_sac.py": {
+    "C0301": 1,
+    "C0413": 4,
+    "C9006": 1
+  },
+  "tests/ut/platform/torch/common/test_moe.py": {
+    "C0415": 1,
+    "W0611": 1
+  },
+  "tests/ut/platform/torch/fully_shard/test_core_hsdp_param.py": {
+    "C9006": 3,
+    "C9007": 3,
+    "E1101": 1
+  },
+  "tests/ut/platform/torch/fully_shard/test_fully_shard.py": {
+    "C0302": 1,
+    "C0413": 14,
+    "C9006": 6,
+    "C9007": 5,
+    "W0613": 19
+  },
+  "tests/ut/platform/torch/fully_shard/test_fully_shard_list_api.py": {
+    "C0301": 1,
+    "C9006": 11,
+    "C9007": 8,
+    "W0613": 4
+  },
+  "tests/ut/platform/torch/fully_shard/test_fully_shard_register_hook.py": {
+    "C0301": 2,
+    "C9006": 8,
+    "C9007": 7,
+    "E1101": 10,
+    "W0611": 1
+  },
+  "tests/ut/platform/torch/fully_shard/test_fully_shard_utils.py": {
+    "C9006": 3
+  },
+  "tests/ut/platform/torch/fully_shard/test_hsdp_utils.py": {
+    "C0301": 1,
+    "C0415": 1,
+    "C9006": 9,
+    "C9007": 6
+  },
+  "tests/ut/platform/torch/fully_shard/test_param.py": {
+    "C9007": 1,
+    "E1101": 2
+  },
+  "tests/ut/platform/torch/fully_shard/test_param_group.py": {
+    "C9006": 16,
+    "C9007": 16,
+    "W0611": 1,
+    "W0613": 2
+  },
+  "tests/ut/platform/torch/fully_shard/test_state.py": {
+    "C9006": 11,
+    "C9007": 8,
+    "W0611": 1
+  },
+  "tests/ut/platform/torch/fully_shard/test_state_dict_utils.py": {
+    "C9006": 5,
+    "C9007": 5
+  },
+  "tests/ut/platform/torch/swap_optimizer/test_adapters.py": {
+    "C0413": 3,
+    "C9006": 13,
+    "C9007": 13
+  },
+  "tests/ut/platform/torch/test_module_type_check.py": {
+    "C0413": 2,
+    "C0415": 2,
+    "W0611": 1
+  },
+  "tests/ut/platform/torch/test_platform.py": {
+    "C9003": 1,
+    "C9006": 16,
+    "C9007": 12,
+    "W0611": 1,
+    "W0613": 2
+  },
+  "tests/ut/test_logging.py": {
+    "C9006": 2
+  },
+  "tests/ut/trainer/callbacks/test_base.py": {
+    "C0413": 4
+  },
+  "tests/ut/trainer/callbacks/test_checkpoint_callback.py": {
+    "C0413": 5,
+    "C9006": 3,
+    "C9007": 3,
+    "W0611": 2,
+    "W0613": 2
+  },
+  "tests/ut/trainer/test_base.py": {
+    "C0413": 2,
+    "C9006": 5,
+    "C9007": 5
+  },
+  "tests/ut/trainer/test_build_lr_scheduler.py": {
+    "C0413": 4
+  },
+  "tests/ut/trainer/test_build_optimizer.py": {
+    "C0413": 4,
+    "C9006": 3,
+    "C9007": 3
+  },
+  "tests/ut/trainer/test_config.py": {
+    "C0413": 1,
+    "C9006": 4,
+    "C9007": 4
+  },
+  "tests/ut/trainer/test_parallel_dims.py": {
+    "C0413": 1,
+    "C9006": 5,
+    "C9007": 5,
+    "E1101": 10
+  },
+  "tests/ut/trainer/test_train_step.py": {
+    "C0413": 4,
+    "C9006": 8,
+    "C9007": 7,
+    "W0611": 1
+  },
+  "tests/ut/trainer/utils/test_logging.py": {
+    "C0413": 2,
+    "C9006": 8,
+    "C9007": 8
+  },
+  "tests/ut/trainer/utils/test_loss.py": {
+    "C0413": 2,
+    "R0401": 33
+  }
+}

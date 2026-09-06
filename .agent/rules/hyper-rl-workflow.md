@@ -24,23 +24,11 @@ them must not regress the verified path.
 
 ### Source Layout
 
-```
-hyper_parallel/rl/rl/
-├── config.py           YAML/CLI, model identity, parallelism, deployment/consistency validation
-├── trainer.py          Top-level orchestrator: sync loop, eval, checkpoint, resource lifecycle
-├── evaluation.py       Distributed evaluation for the sync RL trainer
-├── registry.py         Algorithm / environment / rollout-engine registration
-├── dataset/            Parquet, tokenization, PromptRecord / GenerationResult, batch builder
-├── agentic/            Task/environment layer: harnesses, tool-use, multi-turn trajectories
-├── algorithm/          GRPO math (advantage, reward, loss)
-├── roles/
-│   ├── model.py        Model identity + registration (trainer vs vLLM)
-│   ├── policy/         Actor / Critic
-│   ├── rollout/        Shared vLLM server, HTTP generation, Qwen3 adapter, topology
-│   └── weight_sync/    Layout contract, transport (IPC/HCCL), transaction, publication
-├── consistency/        Qwen3-Ascend recipe + optimizer-pre-update comparator
-└── utils/              Helpers shared across the above
-```
+> Canonical directory tree + file-level responsibilities are in
+> [`module-map.md` § Subsystem → File Map](../skills/hyper-rl-dev/references/module-map.md#subsystem--file-map),
+> which is the single source of truth. Do **not** restate the tree here — link
+> it. This rule states constraints; the layout lives there. The source-root
+> consequence is in § Two Facts below and is not repeated in module-map.
 
 The `Trainer` is the **only** top-level orchestrator. `Algorithm` only declares
 math and data needs. The Reference Actor is a separate frozen model, not the
@@ -60,11 +48,11 @@ contracts: `.agent/skills/hyper-rl-dev/references/module-map.md` (loaded with th
 
 ### Docs
 
-[`architecture.md`](hyper_parallel/rl/docs/architecture.md) (roles, data contracts, lifecycle, checkpoint) ·
-[`vllm_rollout.md`](hyper_parallel/rl/docs/vllm_rollout.md) (ownership, admission, weight transaction, failure semantics) ·
-[`qwen3_training_inference_consistency.md`](hyper_parallel/rl/docs/qwen3_training_inference_consistency.md) (bit-exact definition, config, gate) ·
-[`hyper_rl_runtime_image.md`](hyper_parallel/rl/docs/hyper_rl_runtime_image.md) (image, checksum, host) ·
-[`public_module_changes.md`](hyper_parallel/rl/docs/public_module_changes.md) (CODEOWNER-facing changes outside `rl/`).
+[`architecture.md`](../../hyper_parallel/rl/docs/architecture.md) (roles, data contracts, lifecycle, checkpoint) ·
+[`vllm_rollout.md`](../../hyper_parallel/rl/docs/vllm_rollout.md) (ownership, admission, weight transaction, failure semantics) ·
+[`qwen3_training_inference_consistency.md`](../../hyper_parallel/rl/docs/qwen3_training_inference_consistency.md) (bit-exact definition, config, gate) ·
+[`hyper_rl_runtime_image.md`](../../hyper_parallel/rl/docs/hyper_rl_runtime_image.md) (image, checksum, host) ·
+[`public_module_changes.md`](../../hyper_parallel/rl/docs/public_module_changes.md) (CODEOWNER-facing changes outside `rl/`).
 
 ## Design First (applies to every code change)
 
@@ -84,8 +72,8 @@ Before writing any code — including bug fixes and refactors, not only new feat
   **internal** (`_`-prefixed module). Prefer a public API where one exists; upstream-style changes are fine
   when clearly scoped.
 - **Known internal coupling**: `rl/` already imports internal HyperParallel modules —
-  [`config.py`](hyper_parallel/rl/rl/config.py) pulls `HyperAutoModelForCausalLM` from `auto_models._transformers`,
-  and [`rl_tests/test_master_qwen3_contracts.py`](hyper_parallel/rl/rl_tests/test_master_qwen3_contracts.py) imports
+  [`config.py`](../../hyper_parallel/rl/rl/config.py) pulls `HyperAutoModelForCausalLM` from `auto_models._transformers`,
+  and [`rl_tests/test_master_qwen3_contracts.py`](../../hyper_parallel/rl/rl_tests/test_master_qwen3_contracts.py) imports
   `auto_models._transformers.{checkpoint_loader,infrastructure}` to lock upstream contracts. Changes to those internal
   modules must be assessed against HyperParallel itself and its own tests, not only `rl/`.
 - Keep the verified Qwen3 + GRPO path intact; changes must not regress it.

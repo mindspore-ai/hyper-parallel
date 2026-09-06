@@ -485,7 +485,7 @@ def _validate_vllm_weight_sync(
 ) -> None:
     """Validate full-weight DP sync and TP-aware direct-reshard recovery."""
     weight_sync = optional_mapping(vllm, "weight_sync")
-    strategy = str(weight_sync.get("strategy", "direct_reshard"))
+    strategy = str(weight_sync.get("strategy", "full_gather"))
     if strategy not in ("direct_reshard", "full_gather"):
         raise ValueError(
             "rollout.vllm.weight_sync.strategy must be 'direct_reshard' or "

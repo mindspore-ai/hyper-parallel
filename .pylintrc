@@ -9,13 +9,15 @@ py-version=3.9
 init-hook=import sys; from pathlib import Path; repo_root = Path.cwd().resolve(); repo_root_str = str(repo_root); scripts_str = str(repo_root / 'scripts'); sys.path.insert(0, repo_root_str) if repo_root_str not in sys.path else None; sys.path.insert(0, scripts_str) if scripts_str not in sys.path else None
 
 [MESSAGES CONTROL]
+# C0103 (invalid-name) and C0302 (too-many-lines) stay enabled: without them the
+# [BASIC] naming regexes and max-module-lines below are dead configuration.
+# Existing violations are grandfathered by scripts/pre-commit/pylint_baseline.json,
+# so only new ones block a commit.
 disable=
-    C0103,
     C0114,
     C0115,
     C0116,
     C0209,
-    C0302,
     C0325,
     E0401,
     E0611,

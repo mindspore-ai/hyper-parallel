@@ -12,21 +12,24 @@ deployment model intact. Use it during Scope (step 1) and Implement (step 2).
 | Trainer | `rl/trainer.py`, `rl/evaluation.py` | Sole top-level orchestrator: sync loop, eval, checkpoint, resource lifecycle. |
 | Dataset / Agentic | `rl/dataset/`, `rl/agentic/` | Parquet, tokenization, `PromptRecord`, `GenerationResult`; agentic: `core/` (runner, session, types, chat-template), `envs/` (base, environment, reward composition), `tools/` (executor, protocol, registry), plus the `@register_reward("gsm8k")` rule-based reward in `rl/algorithm/reward.py`. |
 | Algorithm / Policy | `rl/algorithm/`, `rl/roles/policy/`, `rl/roles/model.py` | Selected-token logprob, GRPO loss/advantage/reward, Actor/Critic, model identity & registration. |
-| Rollout | `rl/roles/rollout/` | One shared vLLM server, HTTP generation, Qwen3 adapter, topology. |
+| Rollout | `rl/roles/rollout/` | One shared vLLM server (`vllm.py`), HTTP generation (`base.py`), Qwen3 adapter (`vllm_qwen3.py`), topology (`topology.py`), engine registry (`registry.py`), worker lifecycle (`worker.py`), vLLM plugin entry + rollout-side consistency install (`vllm_plugin.py`, via `HYPER_RL_CONSISTENCY_PROFILE`). |
 | Weight sync | `rl/roles/weight_sync/` | Source/destination layout, transport (IPC/HCCL), transaction, publication. |
-| Consistency | `rl/consistency/` | Qwen3-Ascend numeric recipe + optimizer-pre-update comparator. |
+| Consistency | `rl/consistency/` | Qwen3-Ascend numeric recipe (`qwen3_dense.py`), optimizer-pre-update comparator (`gates.py`), vLLM-Ascend recipe pairing (`vllm_ascend.py`). |
+| Utils | `rl/utils/` | Helpers shared across the above (incl. `monitoring/metrics.py`). |
 
 `rl/registry.py` + `rl/roles/rollout/registry.py` handle Algorithm / environment
 / rollout-engine registration. `rl/roles/weight_sync/` is the most
-consequence-heavy — 7 files / ~5.4k lines — and the most fragile:
+consequence-heavy — 6 modules + `__init__.py` / ~5.4k lines — and the most
+fragile:
 `layout.py` (placement contract), `hccl.py`/`transfer.py` (transport),
 `checkpoint.py`/`sync.py`/`vllm_worker.py` (publication lifecycle).
 
 ## Source Layout
 
-`rl` is a **source root, not a sub-package** — see `.agent/rules/hyper-rl-workflow.md`
-(Two Facts). The practical upshot for any work here: **run pytest from the repo root,
-never `cd` into `rl/` first**.
+`rl` is a source root, not a sub-package — the fact, its cause, and the
+"run pytest from the repo root" consequence are stated once, in
+[`.agent/rules/hyper-rl-workflow.md` § Two Facts You Must Know](../../../rules/hyper-rl-workflow.md#two-facts-you-must-know).
+Not repeated here.
 
 ## Interface Contracts (do not break these)
 

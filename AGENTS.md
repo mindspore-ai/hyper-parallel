@@ -31,7 +31,9 @@ python3 .agent/skills/autogit/scripts/autogit.py check
 python3 .agent/skills/autogit/scripts/autogit.py commit -m "feat: ..."
 python3 .agent/skills/autogit/scripts/autogit.py pr
 
-# AGENTS.md Skills/Agents table vs disk (also in: autogit check / autogit commit)
+# AGENTS.md Skills/Agents table vs disk; confirms docs/index links + no doc drift.
+# Non-zero exit is BLOCKING. Run it whenever the diff touches *.md (also in:
+# autogit check / autogit commit).
 python3 .agent/scripts/check_agents_catalog.py
 ```
 
@@ -50,6 +52,12 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 
 ## Key Modules
 
+> Canonical architecture: [`docs/rl-architecture.md`](docs/rl-architecture.md) — the
+> single source of truth for module map + platform abstraction + RL deployment
+> picture. Feature→flag→branch→metric→test traceability:
+> [`docs/rl-navigation.md`](docs/rl-navigation.md). This table is a **pointer**, not a
+> copy; update the architecture doc, not this table, when modules change.
+
 | Module | Location | Purpose |
 |--------|----------|---------|
 | **Platform** | `platform/` (`platform.py`, `torch/`, `mindspore/`) | Abstraction — `get_platform()`, never import backends in core |
@@ -61,7 +69,13 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 | **Activation** | `core/activation_checkpoint/`, `platform/torch/activation_checkpoint/` | SAC + activation swap |
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
 | **Collectives** | `collectives/cc.py` | Process groups |
+| **RL** | `hyper_parallel/rl/` | Sync LLM RL runtime (Qwen3+GRPO baseline) — see `rl/` note below |
 | **Tests** | `tests/ut/`, `tests/torch/`, `tests/mindspore/` | UT + distributed ST |
+
+For anything under `hyper_parallel/rl/`, the source layout and interface
+contracts come from `.agent/skills/hyper-rl-dev/references/module-map.md`
+(loaded with the `hyper-rl-dev` skill); RL architecture is in
+[`hyper_parallel/rl/docs`](hyper_parallel/rl/docs/architecture.md).
 
 ---
 
@@ -136,6 +150,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **hyper-rl-dev** | Implement Hyper-RL from approved design → CPU gate + NPU smoke | `/skill hyper-rl-dev` (design-first: rule `hyper-rl-workflow`) |
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
+| **readability-first** | Readability + agent-traceability gate (simplicity, one-fact-one-place, nav-map sync) | invoke before any change / review |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 
 ### Commands
@@ -171,6 +186,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | ---- | ----- |
 | **project-overview** | Global — identity + hard-rule shortlist |
 | **code-style** | Global |
+| **readability** | Global — human-readable first, agent-traceable minimum gate (rules → skill `readability-first`) |
 | **distributed** | `core/**`, `collectives/**`, `**/fully_shard/**` |
 | **platform** | `platform/**` |
 | **multi-platform-features** | `core/**`, `platform/**` — multi-backend / list APIs |

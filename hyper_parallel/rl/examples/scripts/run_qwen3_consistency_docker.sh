@@ -356,6 +356,7 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
 
         set +e
         rollout_args=(
+            --consistency.enabled=true
             --rollout.vllm.deployment="${HYPER_QWEN3_DEPLOYMENT}"
             --rollout.vllm.data_parallel_size="${HYPER_QWEN3_ROLLOUT_DATA_PARALLEL_SIZE}"
             --rollout.vllm.tensor_parallel_size="${HYPER_QWEN3_TENSOR_PARALLEL_SIZE}"

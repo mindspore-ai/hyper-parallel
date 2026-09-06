@@ -30,7 +30,10 @@ design into implementation and when writing the design.
 - `rollout.vllm.topology`, `request_concurrency`, `api_server_count`
 - Rank-local server, per-rank port, second Router, fixed Trainer-rank→worker map
 - Multi-node, async/off-policy rollout, dynamic scaling, transparent generation retry
-- Any HyperParallel source change behind an RL feature
+- A HyperParallel source change made without declaring its public/internal
+  boundary and its impact on surrounding consumers — see
+  `.agent/rules/hyper-rl-workflow.md` § Scope Boundaries, which permits such
+  changes when scoped.
 
 ## Model identity
 

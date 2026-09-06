@@ -6,7 +6,7 @@ model:
   config_overrides: null
 
 consistency:
-  enabled: true
+  enabled: false
 
 data:
   train_path: /data/gsm8k/train.parquet

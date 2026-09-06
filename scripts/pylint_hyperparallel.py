@@ -29,7 +29,18 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
     "limitations under the License.",
 )
 BACKEND_IMPORTS = {"torch", "mindspore"}
-PLATFORM_ALLOWED_PARTS = ("hyper_parallel/platform/", "tests/", "scripts/", ".agent/")
+# A file is exempt from the backend-import ban when it *is* backend code: the
+# top-level platform package, plus the per-backend subpackages some features keep
+# locally (core/multicore/platform/torch/, ...), which follow the same
+# platform/<backend>/ convention and are selected through the same abstraction.
+PLATFORM_ALLOWED_PARTS = (
+    "hyper_parallel/platform/",
+    "/platform/torch/",
+    "/platform/mindspore/",
+    "tests/",
+    "scripts/",
+    ".agent/",
+)
 PUBLIC_MAGIC_ALLOWLIST = {
     "__init__", "__call__", "__enter__", "__exit__", "__iter__", "__next__",
     "__len__", "__getitem__", "__setitem__", "__delitem__", "__contains__",
@@ -100,6 +111,24 @@ def _is_platform_agnostic_module(path: str) -> bool:
     return not any(part in normalized for part in PLATFORM_ALLOWED_PARTS)
 
 
+def _runs_at_import_time(node: nodes.NodeNG) -> bool:
+    """Check whether an import statement executes when the module is imported.
+
+    The ban on backend imports targets import time only: a module-level ``import
+    torch`` makes the whole module unloadable on a MindSpore-only install, while a
+    lazy import inside a function only runs on the branch that needs it — the
+    pattern AGENTS.md prescribes for backend-specific code paths.
+
+    Args:
+        node: The import or import-from AST node being visited.
+
+    Returns:
+        True when the node sits in module scope, including inside a module-level
+        ``try``/``if``, which still executes on import.
+    """
+    return isinstance(node.frame(), nodes.Module)
+
+
 class HyperParallelChecker(BaseChecker):
     """Custom checks for HyperParallel project style rules."""
 
@@ -112,9 +141,11 @@ class HyperParallelChecker(BaseChecker):
             "Used when a Python file is missing the required Apache 2.0 header.",
         ),
         "C9002": (
-            "Direct backend import '%s' is forbidden in platform-agnostic code",
+            "Module-level backend import '%s' is forbidden in platform-agnostic code",
             "forbidden-backend-import",
-            "Used when torch or mindspore is imported outside approved platform-specific modules.",
+            "Used when torch or mindspore is imported at import time outside approved "
+            "platform-specific modules. Lazy imports inside a function or method are the "
+            "documented escape hatch (see AGENTS.md) and are not reported.",
         ),
         "C9003": (
             "Avoid assigning platform on instances; use module-level platform = get_platform()",
@@ -165,12 +196,12 @@ class HyperParallelChecker(BaseChecker):
         self._check_apache_header(node, path)
 
     def visit_import(self, node: nodes.Import) -> None:
-        """Block direct backend imports in platform-agnostic modules.
+        """Block import-time backend imports in platform-agnostic modules.
 
         Args:
             node: The import AST node being visited.
         """
-        if not _is_platform_agnostic_module(self._module_path):
+        if not _runs_at_import_time(node) or not _is_platform_agnostic_module(self._module_path):
             return
         for name, _ in node.names:
             root_name = name.split(".", maxsplit=1)[0]
@@ -178,12 +209,12 @@ class HyperParallelChecker(BaseChecker):
                 self.add_message("forbidden-backend-import", node=node, args=(name,))
 
     def visit_importfrom(self, node: nodes.ImportFrom) -> None:
-        """Block direct backend imports in platform-agnostic modules.
+        """Block import-time backend imports in platform-agnostic modules.
 
         Args:
             node: The import-from AST node being visited.
         """
-        if not _is_platform_agnostic_module(self._module_path):
+        if not _runs_at_import_time(node) or not _is_platform_agnostic_module(self._module_path):
             return
         module_name = node.modname or ""
         root_name = module_name.split(".", maxsplit=1)[0]

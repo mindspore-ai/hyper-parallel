@@ -1672,8 +1672,8 @@ def build_weight_transfer(
     tensor_parallel_size: int = 1,
     data_parallel_size: int = 1,
     bucket_size_bytes: int = 128 * 2**20,
-    strategy: str = "direct_reshard",
-    fallback_strategy: str = "full_gather",
+    strategy: str = "full_gather",
+    fallback_strategy: str = "none",
 ) -> WeightTransfer:
     """Build full-weight DP sync or TP-aware direct reshard with recovery."""
     if tensor_parallel_size <= 0:
