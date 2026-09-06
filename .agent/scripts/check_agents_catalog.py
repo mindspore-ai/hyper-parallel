@@ -15,16 +15,15 @@
 # ============================================================================
 """Check AGENTS.md Skills/Agents tables against files under .agent/.
 
-Also validates single-source doc topology: the navigation map must exist and be
-linked from AGENTS.md, every doc under docs/ must be reachable from
-docs/index.md (no orphans), and no other markdown file restates a fact from
-docs/rl-architecture.md / docs/rl-navigation.md (the "one fact = one place"
-invariant — flagged as doc drift). Exit 0 if all checks pass; non-zero with a
-short report otherwise.
+Also checks documentation links and RL navigation file/symbol references.
+Text duplication checks are heuristic, not semantic validation. Scope conflicts,
+configuration behavior and whether a test guards a feature still require review.
+Exit 0 means these mechanical checks passed, not that all docs are correct.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -61,6 +60,7 @@ def _broken_links(root: Path) -> list[str]:
     targets = [root / "AGENTS.md"]
     targets += sorted((root / ".agent").rglob("*.md"))
     targets += sorted((root / "docs").rglob("*.md"))
+    targets += sorted((root / "hyper_parallel/rl/docs").rglob("*.md"))
     for path in targets:
         if not path.is_file():
             continue
@@ -160,6 +160,86 @@ def _drift(root: Path) -> tuple[list[str], int]:
     return reported[:_MAX_REPORTED], len(reported)
 
 
+def _symbol_error(path: Path, symbol: str) -> str:
+    """Resolve a qualified definition within its lexical scope."""
+    try:
+        body = ast.parse(path.read_text(encoding="utf-8")).body
+    except SyntaxError as error:
+        return f"invalid Python: {error.msg}"
+    for part in symbol.split("."):
+        definition = next((node for node in body if isinstance(
+            node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ) and node.name == part), None)
+        if definition is None:
+            return f"missing symbol {symbol}"
+        body = definition.body
+    return ""
+
+
+def _navigation_errors(root: Path) -> list[str]:
+    """Check RL table references without importing training dependencies.
+
+    Paths are relative to hyper_parallel/rl; bare test filenames resolve under
+    rl_tests. Optional ::qualified.symbol references follow lexical definitions,
+    so a method on the wrong class cannot satisfy a reference.
+    """
+    nav = root / "docs/rl-navigation.md"
+    if not nav.is_file():
+        return []  # main reports the missing navigation document.
+    errors = []
+    in_rl = False
+    for number, line in enumerate(nav.read_text(encoding="utf-8").splitlines(), 1):
+        if line.startswith("## 2. "):
+            in_rl = True
+        if not in_rl or not line.startswith("|"):
+            continue
+        for reference in re.findall(r"`([^`]+)`", line):
+            match = re.fullmatch(r"([\w./-]+\.py)(?:::(\w+(?:\.\w+)*))?", reference)
+            if not match:
+                continue
+            relative, symbol = match.groups()
+            if "/" not in relative and relative.startswith("test_"):
+                relative = "rl_tests/" + relative
+            path = root / "hyper_parallel/rl" / relative
+            label = f"docs/rl-navigation.md:{number} -> {reference}"
+            if not path.is_file():
+                errors.append(f"{label}: missing file")
+                continue
+            if not symbol:
+                continue
+            error = _symbol_error(path, symbol)
+            if error:
+                errors.append(f"{label}: {error}")
+    return errors
+
+
+def _doc_topology_errors(root: Path, agents_md: str) -> list[str]:
+    """Validate the navigation entry and documentation index."""
+    errors: list[str] = []
+    # Single-source doc topology: navigation map + no orphan docs.
+    docs_dir = root / "docs"
+    nav = docs_dir / "rl-navigation.md"
+    if not nav.exists():
+        errors.append("docs: docs/rl-navigation.md missing (required traceability map)")
+    else:
+        if "rl-navigation.md" not in agents_md:
+            errors.append("docs: AGENTS.md does not link docs/rl-navigation.md")
+
+    index = docs_dir / "index.md"
+    docs_reachable: set[Path] = set()
+    if index.exists():
+        docs_reachable = _links(index.read_text(encoding="utf-8"), docs_dir)
+    on_disk = {p.resolve() for p in docs_dir.rglob("*.md") if "_" not in p.name}
+    canonical = {"index.md", "rl-architecture.md", "rl-navigation.md"}
+    orphans = sorted(
+        p for p in on_disk if p not in docs_reachable and p.name not in canonical
+    )
+    if orphans:
+        errors.append(f"docs orphan (not linked from docs/index.md): {[str(p) for p in orphans]}")
+
+    return errors
+
+
 def main() -> int:
     """Compare AGENTS.md catalogs to on-disk skills and agents, and check docs."""
     root = Path(__file__).resolve().parents[2]
@@ -195,26 +275,9 @@ def main() -> int:
     if "readability" not in disk_rules:
         errors.append("rules: 'readability' rule file is missing under .agent/rules/")
 
-    # Single-source doc topology: navigation map + no orphan docs.
-    docs_dir = root / "docs"
-    nav = docs_dir / "rl-navigation.md"
-    if not nav.exists():
-        errors.append("docs: docs/rl-navigation.md missing (required traceability map)")
-    else:
-        if "rl-navigation.md" not in agents_md:
-            errors.append("docs: AGENTS.md does not link docs/rl-navigation.md")
+    errors.extend(_doc_topology_errors(root, agents_md))
 
-    index = docs_dir / "index.md"
-    docs_reachable: set[Path] = set()
-    if index.exists():
-        docs_reachable = _links(index.read_text(encoding="utf-8"), docs_dir)
-    on_disk = {p.resolve() for p in docs_dir.rglob("*.md") if "_" not in p.name}
-    canonical = {"index.md", "rl-architecture.md", "rl-navigation.md"}
-    orphans = sorted(
-        p for p in on_disk if p not in docs_reachable and p.name not in canonical
-    )
-    if orphans:
-        errors.append(f"docs orphan (not linked from docs/index.md): {[str(p) for p in orphans]}")
+    errors.extend(_navigation_errors(root))
 
     broken = _broken_links(root)
     if broken:
@@ -235,8 +298,8 @@ def main() -> int:
         return 1
     print(
         f"AGENTS catalog OK ({len(disk_skills)} skills, {len(disk_agents)} agents, "
-        f"{len(disk_rules)} rules); doc topology OK ({len(on_disk)} docs reachable, "
-        f"0 broken links)"
+        f"{len(disk_rules)} rules); checked links and RL navigation references OK "
+        "(semantic review still required)"
     )
     return 0
 

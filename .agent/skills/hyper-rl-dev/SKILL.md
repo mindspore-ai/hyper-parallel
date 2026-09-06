@@ -24,6 +24,14 @@ An approved design, e.g.:
 /hyper-rl-dev implement per .agent/rules/hyper-rl-workflow.md (design approved 2026-08-29)
 ```
 
+## Design input
+
+Before implementation, describe the approach, affected files and interfaces,
+edge cases, and exact verification criteria. Follow the approval rule above;
+once approved, use the execution flow below without per-step confirmation.
+This skill is the only procedural checklist; references contain detailed
+contracts and commands, not another workflow.
+
 ## Preconditions (fail fast, do not silently proceed)
 
 - Read `.agent/rules/hyper-rl-workflow.md` + `.agent/rules/code-style.md` before touching any file.

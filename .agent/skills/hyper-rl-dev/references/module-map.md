@@ -55,12 +55,11 @@ Not repeated here.
   requires visible devices == `rollout_dp × rollout_tp` and no overlap with the
   trainer set.
 
-## Files Outside `rl/` (never touch here)
+## Change boundaries
 
-If a change touches any of these, it is out of scope for Hyper-RL — stop and
-open a separate upstream task: `auto_models/`, `core/`, `platform/`,
-`collectives/`, `trainer/`, `models/`, `data/`. The RL-facing public-module
-deltas are documented in `hyper_parallel/rl/docs/public_module_changes.md`.
+For changes outside `rl/` and future generalization work, follow
+[Scope Boundaries](../../../rules/hyper-rl-workflow.md#scope-boundaries).
+This file defines interfaces, not a second scope policy.
 
 ## Coding & Verification Notes
 
