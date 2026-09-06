@@ -3,7 +3,7 @@ model:
   _target_: torch.nn.Identity
 
 optimizer:
-  _target_: hyper_parallel.auto_models.components.optim.optimizer.optimizer.AdamW
+  _target_: hyper_parallel.components.optim.AdamW
   fp32_main_params: true
   adamw_config:
     adamw_lr: 0.0001
@@ -35,7 +35,7 @@ plan_overrides:
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_parallel.auto_models.components.distributed.ep_compute.qwen2moe_ep_compute_fn
+      _target_: hyper_parallel.distributed.expert_parallel.recipes.qwen2moe_ep_compute_fn
 
 fsdp_config:
   dp_shard_size: 2

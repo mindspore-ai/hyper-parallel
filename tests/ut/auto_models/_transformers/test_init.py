@@ -21,8 +21,8 @@ import unittest
 
 
 _EXPORT_MODULES = (
-    "hyper_parallel.auto_models._transformers.auto_model",
-    "hyper_parallel.auto_models._transformers.checkpoint_loader",
+    "hyper_parallel.models._transformers.auto_model",
+    "hyper_parallel.models._transformers.checkpoint_loader",
 )
 
 
@@ -55,8 +55,8 @@ class TestLazyTransformersExports(unittest.TestCase):
         script = textwrap.dedent(
             f"""
             import sys
-            from hyper_parallel.auto_models._transformers.registry import get_hf_config
-            import hyper_parallel.auto_models._transformers as integration
+            from hyper_parallel.models._transformers.config_resolver import get_hf_config
+            import hyper_parallel.models._transformers as integration
 
             loaded = [name for name in {_EXPORT_MODULES!r} if name in sys.modules]
             assert not loaded, loaded
@@ -79,7 +79,7 @@ class TestLazyTransformersExports(unittest.TestCase):
             """
             from types import SimpleNamespace
             from unittest.mock import patch
-            import hyper_parallel.auto_models._transformers as integration
+            import hyper_parallel.models._transformers as integration
 
             sentinel = object()
             owner_module = SimpleNamespace(CheckpointManager=sentinel)
@@ -102,7 +102,7 @@ class TestLazyTransformersExports(unittest.TestCase):
         """
         script = textwrap.dedent(
             """
-            import hyper_parallel.auto_models._transformers as integration
+            import hyper_parallel.models._transformers as integration
 
             try:
                 integration.NotATransformersIntegrationSymbol

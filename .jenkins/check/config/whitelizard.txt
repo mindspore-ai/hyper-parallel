@@ -1,13 +1,9 @@
 hyper-parallel/hyper_parallel/core/pipeline_parallel/mpipe/schedule.py:_build_transpose_prefix
-hyper-parallel/hyper_parallel/models/qwen3_vl_moe/parallelize.py:pipelining_qwen3_vl_moe
-hyper-parallel/hyper_parallel/models/qwen3_vl_moe/model.py:forward
 hyper-parallel/hyper_parallel/core/fully_shard/api.py:_check_hsdp_input_valid
 hyper-parallel/hyper_parallel/core/hsdp/api.py:hsdp
 hyper-parallel/hyper_parallel/core/multicore/ops/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp:ops::HyperMegaMoe::HyperMegaMoe
 hyper-parallel/hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_host/hyper_mega_moe_grad_def.cpp:ops::HyperMegaMoeGrad::HyperMegaMoeGrad
 hyper-parallel/hyper_parallel/integration/llamafactory/context_parallel/models/qwen3_vl/qwen3vl_forward.py:forward
-hyper-parallel/hyper_parallel/core/context_parallel/linear_attention_context_parallel.py:forward
-hyper-parallel/hyper_parallel/core/context_parallel/linear_attention_context_parallel.py:backward
 hyper-parallel/hyper_parallel/platform/torch/custom_ops/gdn/chunk_gated_delta_rule.py:chunk_gated_delta_rule
 hyper-parallel/hyper_parallel/platform/torch/custom_ops/gdn/triton/chunk_delta_h.py:chunk_gated_delta_rule_fwd_kernel_h_blockdim64
 hyper-parallel/hyper_parallel/platform/torch/custom_ops/gdn/triton/chunk_delta_h.py:chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64

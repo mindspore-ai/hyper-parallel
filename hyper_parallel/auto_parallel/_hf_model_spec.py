@@ -173,7 +173,7 @@ def _get_hf_config(model_raw: Mapping[str, Any]) -> Any:
     """Call the AutoModels Transformers entry point for *model_raw*."""
     # Transformers is an optional dependency; import only when a config
     # actually needs it so the other cost-model backends stay importable.
-    from hyper_parallel.auto_models._transformers.registry import get_hf_config  # pylint: disable=C0415
+    from hyper_parallel.models._transformers.config_resolver import get_hf_config  # pylint: disable=C0415
 
     config_kwargs = {
         name: model_raw[name]

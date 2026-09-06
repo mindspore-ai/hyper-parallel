@@ -24,7 +24,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ## 📣 最新消息
 
-- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](examples/demo_trainer/train.yaml)
+- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
 
 ---
 
@@ -32,11 +32,11 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ### AutoModels
 
-> [AutoModels](hyper_parallel/auto_models/README.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略和保存与恢复方式。
+> [AutoModels](hyper_parallel/models/README.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略和保存与恢复方式。
 >
 > **支持模型**
 >
-> - [Qwen3-30B-A3B](examples/demo_trainer/train.yaml)
+> - [Qwen3-30B-A3B](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
 
 ### HyperParallel Core
 
@@ -78,23 +78,23 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ### 使用 AutoModels 启动训练
 
-运行仓库提供的单机 8 卡训练示例 [`examples/demo_trainer/train.yaml`](examples/demo_trainer/train.yaml)：
+运行仓库提供的单机 8 卡训练示例 [`hyper_parallel/models/qwen3_moe/recipes/train.yaml`](hyper_parallel/models/qwen3_moe/recipes/train.yaml)：
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
-  scripts/train_lm.py examples/demo_trainer/train.yaml
+  scripts/train_lm.py hyper_parallel/models/qwen3_moe/recipes/train.yaml
 ```
 
 附加命令行参数可按 YAML 字段路径覆盖配置值，无需修改配置文件：
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
-  scripts/train_lm.py examples/demo_trainer/train.yaml \
+  scripts/train_lm.py hyper_parallel/models/qwen3_moe/recipes/train.yaml \
   --model.pretrained_model_name_or_path=/path/to/model \
   --training.train_iters=10
 ```
 
-配置结构、字段解析和更多训练示例见 [AutoModels](hyper_parallel/auto_models/README.md)。
+配置结构、字段解析和更多训练示例见 [AutoModels](hyper_parallel/models/README.md)。
 
 ### 使用 HyperParallel Core API
 
@@ -114,7 +114,7 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 ## 📖 文档
 
 - [文档中心](./docs/index.md) — 文档索引与导航
-- [AutoModels](hyper_parallel/auto_models/README.md) — YAML Trainer、训练组件与专题指南入口
+- [AutoModels](hyper_parallel/models/README.md) — YAML Trainer、训练组件与专题指南入口
 - [安装指南](docs/installation.md) — 源码构建、依赖安装
 - [特性使用指南](./docs/guide/) — 并行与训练能力指南
 - [API 参考](./docs/api/api_reference.md) — 按特性模块组织的接口说明
@@ -130,11 +130,12 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 ```text
 HyperParallel/
 ├── hyper_parallel/
-│   ├── auto_models/
-│   │   ├── config/                     # YAML、TrainerConfig 和 CLI override 解析
-│   │   ├── trainer/                    # TextTrainer、VLMTrainer 和训练生命周期
-│   │   ├── _transformers/              # Transformers 模型构建与预训练权重加载
-│   │   └── components/                 # 数据、优化器、并行计划、checkpoint 和 loss
+│   ├── models/                         # 模型族适配层与 recipes/train.yaml，对外入口 api.py
+│   │   └── _transformers/              # Transformers 模型构建与预训练权重加载
+│   ├── trainer/                        # TrainerConfig、TextTrainer/VLMTrainer 和训练生命周期
+│   ├── components/                     # 高性能 modules/functional、优化器、loss 和 checkpoint
+│   ├── data/                           # 数据集读取、样本转换与 dataloader
+│   ├── distributed/                    # 分布式模型构建、并行计划应用与激活管理
 │   ├── core/
 │   │   ├── dtensor/                    # DeviceMesh、Layout、placement 和 DTensor
 │   │   ├── shard/                      # sharding plan、自定义 shard 和 DFunction
@@ -147,13 +148,15 @@ HyperParallel/
 │   ├── collectives/                    # 集合通信接口与实现
 │   └── platform/                       # PyTorch、MindSpore 与设备后端适配
 ├── examples/
-│   ├── demo_trainer/                   # AutoModels 单机 8 卡训练示例
-│   ├── recipes/                        # 模型与并行拓扑配置
-│   └── distributed/                    # HyperParallel Core API 组合示例
+│   ├── training_demo/                  # AutoModels 训练示例（数据准备、离线/在线 YAML）
+│   ├── data/                           # 数据准备脚本
+│   ├── generate/                       # 生成与精度对齐校验脚本
+│   ├── mindspore/                      # MindSpore 后端示例
+│   └── torch/                          # PyTorch 后端 Core API 组合示例
 ├── docs/
 │   ├── guide/                          # 使用指南
 │   └── api/                            # API 参考
-└── tests/                              # AutoModels、Core 和后端测试
+└── tests/                              # models、Core 和后端测试
 ```
 
 ---

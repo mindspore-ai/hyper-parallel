@@ -229,7 +229,7 @@ def _auto_models_hp_yaml_content() -> str:
     """Return a minimal current AutoModels Trainer YAML string."""
     return """
 model:
-  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: local/model
   torch_dtype: bfloat16
   local_files_only: true

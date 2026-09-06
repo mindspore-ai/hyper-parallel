@@ -24,28 +24,25 @@ from unittest.mock import patch
 
 from torch import nn
 
-# The replacement engine rides on transformers.core_model_loading (newer
-# transformers); older transformers (e.g. some CI gates) cannot provide it.
-try:
-    from transformers.core_model_loading import WeightRenaming
+# The generic replacement contract must not depend on a specific transformers
+# version: use the WeightRenaming exposed by hyper_parallel itself (which falls
+# back to a local implementation when transformers lacks scoped transforms).
+from hyper_parallel.components.checkpoint.weight_conversion import WeightRenaming
 
-    from hyper_parallel.auto_models.components.model_transform import (
-        ModuleReplacementSpec,
-        apply_module_replacements,
-        compile_module_replacements,
-        module_replacement,
-    )
-    from hyper_parallel.auto_models.config.resolver import resolve_root
-    from hyper_parallel.auto_models.trainer.config import (
-        PlanOverride,
-        Target,
-        _import_module_type,
-        entries_to_module_replacements,
-        entries_to_plan_overrides,
-    )
-except ImportError as exc:  # pragma: no cover
-    raise unittest.SkipTest(
-        "module replacement requires newer transformers") from exc
+from hyper_parallel.models.replacement import (
+    ModuleReplacementSpec,
+    apply_module_replacements,
+    compile_module_replacements,
+    module_replacement,
+)
+from hyper_parallel.trainer.config.resolver import resolve_root
+from hyper_parallel.trainer.config import (
+    PlanOverride,
+    Target,
+    _import_module_type,
+    entries_to_module_replacements,
+    entries_to_plan_overrides,
+)
 
 
 class _ReplacementLinear(nn.Linear):
@@ -527,7 +524,7 @@ class TestModuleReplacementYaml(unittest.TestCase):
 
         # case: module_type_import_error_has_plan_override_context
         with patch(
-            "hyper_parallel.auto_models.trainer.config.importlib.import_module",
+            "hyper_parallel.trainer.config.parallelism.importlib.import_module",
             side_effect=ImportError("optional dependency is unavailable"),
         ):
             with self.assertRaisesRegex(

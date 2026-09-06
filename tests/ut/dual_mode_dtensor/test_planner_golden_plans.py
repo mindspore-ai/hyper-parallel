@@ -16,19 +16,19 @@ The golden-plan e2e tests stay standalone and unmerged.
 import pytest
 from torch import nn
 
-from hyper_parallel.auto_models.components.distributed import (
+from hyper_parallel.distributed import (
     ShardingPlanner,
 )
-from hyper_parallel.auto_models.components.distributed.param_role import ParamRole
-from hyper_parallel.auto_models.components.distributed.sharding_config import (
+from hyper_parallel.distributed.recipe_spec import (
     CP,
     EP,
-    ShardingPlan,
-    TEMPLATES,
     TP,
     ModuleShardingSpec,
     resolve_placements,
 )
+from hyper_parallel.distributed.plan import ShardingPlan
+from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
+from hyper_parallel.distributed._builder.default_templates import TEMPLATES
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
     Replicate,

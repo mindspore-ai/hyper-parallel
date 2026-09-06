@@ -23,11 +23,11 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch  # pylint: disable=wrong-import-position
 
-from hyper_parallel.auto_models.components.distributed.config import (
+from hyper_parallel.models.build_options import (
     FSDP2Config,
     FSDP2MixedPrecisionConfig,
 )
-from hyper_parallel.auto_models.components.distributed.fsdp2 import FSDP2Manager
+from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from tests.common.mark_utils import arg_mark
 
 

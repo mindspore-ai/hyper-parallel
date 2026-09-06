@@ -14,26 +14,26 @@ from pathlib import Path
 import pytest
 from torch import nn
 
-import hyper_parallel.auto_models.components.distributed as dist_pkg
-from hyper_parallel.auto_models.components.distributed.param_role import (
+import hyper_parallel.distributed as dist_pkg
+from hyper_parallel.distributed.tensor_parallel.param_role import (
     ParamRole,
     ParameterClassifier,
     SEGMENT_EXACT,
     SEGMENT_SUBSTRING,
     _build_default_rules,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_config import (
+from hyper_parallel.distributed.plan import ShardingPlan
+from hyper_parallel.distributed.recipe_spec import (
     CP,
     EP,
     ModuleShardingSpec,
     PlacementMismatchError,
-    ShardingPlan,
     TP,
-    _multi_dim,
     _normalize_out_fields,
     resolve_placements,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_planner import ShardingPlanner
+from hyper_parallel.distributed._builder.default_templates import _multi_dim
+from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
     Replicate,
@@ -165,7 +165,7 @@ def test_param_role_and_classifier():
     # ---- case: each_role_hit ----
     # At least one hit case for each of the 13 roles the default rules can
     # produce (SPECIAL/SKIP included; REPLICATED is only assigned via
-    # ARCH_OVERRIDES, see test_s1_mla_deepseek.py).
+    # family sharding_rules, see test_planner_arch_flow.py).
     cases = {
         "model.embed_tokens.weight": ParamRole.EMBED,
         "lm_head.weight": ParamRole.LM_HEAD,
@@ -176,6 +176,7 @@ def test_param_role_and_classifier():
         "model.layers.0.mlp.experts.w1": ParamRole.MOE_EXPERT,
         "model.layers.0.mlp.shared_experts.w2": ParamRole.SHARED_EXPERT,
         "model.layers.0.attn.fused_qkv.weight": ParamRole.FUSED_QKV,
+        "model.layers.0.self_attn.linear_qkv.weight": ParamRole.FUSED_QKV,
         "model.layers.0.mlp.gate_up_proj.weight": ParamRole.FUSED_GATE_UP,
         "model.layers.0.self_attn.q_proj.bias": ParamRole.COLWISE,
         "model.layers.0.gated_delta.a_log": ParamRole.SPECIAL,
@@ -219,7 +220,7 @@ def test_param_role_and_classifier():
     # F1 segment-exact match: the shared_expert_gate segment != the
     # shared_expert segment (the misclassification source in
     # accuracy_problem.md 10.1); classified as COLWISE by default (qwen2moe
-    # is explicitly overridden to REPLICATED via ARCH_OVERRIDES).
+    # is explicitly overridden to REPLICATED via the family's sharding_rules).
     assert role("m.mlp.shared_expert_gate.weight") != ParamRole.SHARED_EXPERT, "case: shared_expert_gate_not_shared_expert"
     assert role("m.mlp.shared_expert.weight") == ParamRole.SHARED_EXPERT, "case: shared_expert_gate_not_shared_expert"
     assert role("m.mlp.shared_experts.weight") == ParamRole.SHARED_EXPERT, "case: shared_expert_gate_not_shared_expert"
@@ -347,8 +348,19 @@ def test_spec_and_plan_fields():
 # ==========================================================================
 
 
-FORBIDDEN = ("recipes", "_transformers", "hyper_parallel.models",
+# "recipes" is matched as the legacy ``auto_models.recipes`` package path —
+# a bare substring would false-positive on distributed/expert_parallel/
+# recipes.py (the model-agnostic EP recipe module, 05 row 402).
+FORBIDDEN = ("auto_models.recipes", "_transformers", "hyper_parallel.models",
              "datasets", "trainer")
+
+# Sanctioned edges into the top-level ``hyper_parallel.models`` package
+# (top-level split, migration plan §3): ``build_options`` is a leaf DTO
+# module (stdlib/torch/components only, no back-edge) imported at module
+# level; ``registry`` is the planner's function-level adapter lookup. Both
+# stay acyclic; every other ``hyper_parallel.models.*`` edge is forbidden.
+ALLOWED_MODELS_EDGES = ("hyper_parallel.models.build_options",
+                        "hyper_parallel.models.registry")
 
 
 def _imports_of(path: Path):
@@ -372,5 +384,15 @@ def test_zero_dependency_lint():
         checked += 1
         for mod in _imports_of(py):
             for bad in FORBIDDEN:
-                assert bad not in mod, f"{py} has forbidden dependency {mod} (contains {bad})"
-    assert checked >= 8, f"only checked {checked} files; lint coverage insufficient"
+                sanctioned = any(
+                    mod == edge or mod.startswith(edge + ".")
+                    for edge in ALLOWED_MODELS_EDGES
+                )
+                assert sanctioned or bad not in mod, (
+                    f"{py} has forbidden dependency {mod} (contains {bad})"
+                )
+    # The legacy package is being emptied by stages 4e-4g/8 (fsdp2.py left in
+    # 4f; dispatch_probe/pipelining/testing were removed in 4g;
+    # infrastructure/init_utils follow in stages 6-8) — the floor only guards
+    # against a vacuous scan.
+    assert checked >= 1, f"only checked {checked} files; lint coverage insufficient"

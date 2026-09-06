@@ -12,13 +12,15 @@ import logging
 import pytest
 import torch
 from torch import nn
-from hyper_parallel.auto_models.components.distributed import (
-    FunctionModule,
+from hyper_parallel.distributed import (
     ShardingPlanner,
     apply_sharding_plan,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_applier import _preflight_compute_injection
-from hyper_parallel.auto_models.components.distributed.sharding_config import (
+from hyper_parallel.distributed._builder.function_module import (
+    FunctionModule,
+)
+from hyper_parallel.distributed._builder.applier import _preflight_compute_injection
+from hyper_parallel.distributed.recipe_spec import (
     CP,
     DP,
     EP,
@@ -27,13 +29,13 @@ from hyper_parallel.auto_models.components.distributed.sharding_config import (
     resolve_placements,
 )
 try:
-    from hyper_parallel.auto_models.trainer.config import (
+    from hyper_parallel.trainer.config import (
         PlanOverride,
         entries_to_plan_overrides,
     )
     _HAS_TRAINER_CONFIG = True
 except ImportError:
-    # trainer.config pulls in model_transform / checkpoint conversion, which
+    # trainer.config pulls in replacement / checkpoint conversion, which
     # require a newer transformers than some CI gates provide.
     _HAS_TRAINER_CONFIG = False
 from hyper_parallel.core.dtensor.placement_types import (
@@ -1112,21 +1114,21 @@ def test_ep_region_dispatch_and_expert_mesh(tiny_hf_native_moe,
     # the factory signature no longer takes expert_mesh — legacy config
     # (expert_mesh=...) fails fast as an "undeclared config key" and lists the
     # legal parameters (clear migration signal).
-    from hyper_parallel.auto_models.components.distributed import build_expert_mesh
-    from hyper_parallel.auto_models.components.distributed.ep_compute import (
+    from hyper_parallel.distributed._builder.applier import build_expert_mesh
+    from hyper_parallel.distributed.expert_parallel.recipes import (
         routed_only_ep_compute_fn,
     )
-    from hyper_parallel.auto_models.components.distributed.sharding_applier import (
+    from hyper_parallel.distributed._builder.rule_resolver import (
         _resolve_local_compute_fn,
     )
-    from hyper_parallel.auto_models.trainer.config import Target
+    from hyper_parallel.trainer.config import Target
 
     user_mesh = build_expert_mesh(mesh, ep_size=4)
     overrides = {"*.mlp": ModuleShardingSpec(
         local_compute_fn=Target(
             routed_only_ep_compute_fn,
-            target_path="hyper_parallel.auto_models.components.distributed."
-                        "ep_compute.routed_only_ep_compute_fn",
+            target_path="hyper_parallel.distributed."
+                        "recipes.routed_only_ep_compute_fn",
             expert_mesh=user_mesh), region_dispatch=False)}
     plan = ShardingPlanner(plan_overrides=overrides).plan(
         tiny_hf_native_moe, mesh, tp_size=2, ep_size=4)
@@ -1143,8 +1145,8 @@ def test_ep_region_dispatch_and_expert_mesh(tiny_hf_native_moe,
     overrides = {"*.mlp": ModuleShardingSpec(
         local_compute_fn=Target(
             routed_only_ep_compute_fn,
-            target_path="hyper_parallel.auto_models.components.distributed."
-                        "ep_compute.routed_only_ep_compute_fn",
+            target_path="hyper_parallel.distributed."
+                        "recipes.routed_only_ep_compute_fn",
             ep_mesh="user-mesh"), region_dispatch=False)}
     plan = ShardingPlanner(plan_overrides=overrides).plan(
         tiny_hf_native_moe, mesh, tp_size=2, ep_size=4)
@@ -1237,5 +1239,5 @@ def test_preflight_fail_fast(tiny_llama, tiny_hf_native_moe, tiny_moe,
     with pytest.raises(ValueError) as exc:
         apply_sharding_plan(tiny_hf_native_moe, plan, mesh_ep)
     msg = str(exc.value)
-    assert "ep_compute.qwen2moe_ep_compute_fn" in msg, f"case: {case}"
+    assert "recipes.qwen2moe_ep_compute_fn" in msg, f"case: {case}"
     assert "region_dispatch" in msg, f"case: {case}"

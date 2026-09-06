@@ -46,24 +46,26 @@ from transformers import (
     Qwen2MoeForCausalLM,
 )
 
-from hyper_parallel.auto_models._transformers.infrastructure import instantiate_infrastructure
-from hyper_parallel.auto_models.components.distributed.cp_utils import shard_batch_for_cp
-from hyper_parallel.auto_models.components.distributed.infrastructure import (
-    DistributedSetup,
-    MeshContext,
+from hyper_parallel.models._transformers.model_builder import instantiate_infrastructure
+from hyper_parallel.data.parallel.batch_parallel import shard_batch_for_cp
+from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
+from hyper_parallel.trainer.runtime.distributed import (
     create_distributed_setup_from_config,
     destroy_process_group,
     initialize_distributed,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_applier import apply_sharding_plan
-from hyper_parallel.auto_models.components.loss.loss_utils import mean_global_loss
-from hyper_parallel.auto_models.components.optim.optimizer.mixed_precision_optimizer import (
+from hyper_parallel.distributed.apply import apply_sharding_plan
+from hyper_parallel.trainer.runtime.metrics import mean_global_loss
+from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
 )
-from hyper_parallel.auto_models.components.utils.device import get_device_type
-from hyper_parallel.auto_models.config.manager import parse_training_args
-from hyper_parallel.auto_models.trainer.config import TrainerConfig
-from hyper_parallel.auto_models.trainer.model_init_dtype import apply_model_init_dtype
+from hyper_parallel.trainer.runtime.device import get_device_type
+from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config import (
+    TrainerConfig,
+    normalize_distributed_setup_overrides,
+)
+from hyper_parallel.models._transformers.model_builder import apply_model_init_dtype
 from hyper_parallel import (
     DTensor,
     DeviceMesh,
@@ -203,7 +205,7 @@ def _build_dual_mode_model(
     model.train()
 
     mesh_context = distributed_setup.mesh_context
-    sharding_planner, fsdp_manager, _ = instantiate_infrastructure(
+    sharding_planner, fsdp_manager = instantiate_infrastructure(
         distributed_setup=distributed_setup,
         device=device,
     )
@@ -895,6 +897,7 @@ def _run_accuracy_case(
         int(os.environ.get("LOCAL_RANK", "0")),
     )
     distributed_setup = create_distributed_setup_from_config(config)
+    normalize_distributed_setup_overrides(distributed_setup, config)
     mesh_context = distributed_setup.mesh_context
     _validate_accuracy_topology(mesh_context, dist.get_world_size())
     device_mesh = mesh_context.device_mesh

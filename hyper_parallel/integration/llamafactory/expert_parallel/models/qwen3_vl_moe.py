@@ -30,7 +30,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeTextSparseMoeBlock,
 )
 
-from hyper_parallel.auto_models.components.ops.npu_grouped_swiglu import (
+from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor

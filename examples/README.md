@@ -6,7 +6,6 @@ This directory contains usage examples for the HyperParallel distributed trainin
 
 ```text
 examples/
-├── demo_trainer/       # Transformers AutoModel training workflow
 ├── torch/              # PyTorch examples
 │   ├── fully_shard/    # FSDP (Fully Sharded Data Parallel) examples
 │   ├── llama3/         # Llama3-style tensor parallel + sequence parallel
@@ -38,9 +37,10 @@ examples/
 
 ## AutoModel Trainer Example
 
-The `demo_trainer/` directory provides a Transformers AutoModel training
-configuration and launcher. Model, dataset, optimizer, and parallel components
-are selected through typed targets in `train.yaml`.
+The delivered Qwen3-MoE AutoModel training recipe lives at
+`hyper_parallel/models/qwen3_moe/recipes/train.yaml` inside the
+package (shipped in the wheel). Model, dataset, optimizer, and parallel
+components are selected through typed targets in `train.yaml`.
 
 ## PyTorch MoE Examples
 

@@ -67,3 +67,39 @@ bash examples/training_demo/run_parallel_offline.sh \
 ```
 
 Logs and generated data are stored under `output/training_demo`.
+
+## Full pretrained model
+
+Both full-model launchers load all 48 layers and the complete Hugging Face
+checkpoint through `HyperAutoModelForCausalLM.from_pretrained`. Online uses the
+packaged `hyper_parallel/models/qwen3_moe/recipes/train.yaml`;
+Offline uses `examples/training_demo/train_parallel_full_offline.yaml` because
+the two data paths instantiate different Dataset, DataLoader, and collate
+targets. Ordinary values can be overridden on the command line, but the typed
+configuration interface intentionally does not replace `_target_` values.
+
+The Online launcher tokenizes and packs a deterministic local JSONL file at
+runtime. It generates that file under `output/training_demo/data` when needed
+and uses a 128-token smoke-test length by default; an appended typed override
+can increase the sequence length:
+
+```bash
+bash examples/training_demo/run_parallel_full_online.sh \
+    /path/to/Qwen3-30B-A3B
+```
+
+The Offline launcher requires an existing Indexed Dataset and never generates
+or downloads one implicitly. Pass the dataset prefix without the `.bin` or
+`.idx` suffix:
+
+```bash
+bash examples/training_demo/run_parallel_full_offline.sh \
+    /path/to/Qwen3-30B-A3B \
+    /path/to/offline_text_document
+```
+
+Both launchers validate the local model `config.json` before starting and force
+model/tokenizer loading into `local_files_only` mode. The Offline launcher also
+validates both Indexed Dataset files. Missing local assets therefore fail
+explicitly rather than triggering a network download. Additional typed Trainer
+overrides may be appended to either command.

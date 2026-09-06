@@ -354,7 +354,7 @@ if [[ ${#FAILED_COMPONENTS[@]} -gt 0 ]]; then
     echo "WARNING: [HP-NATIVE-SUMMARY] optional native components failed: ${failed_list}." >&2
 fi
 
-INDEXED_HELPERS_DIR="${PROJECT_ROOT}/hyper_parallel/auto_models/components/datasets/llm"
+INDEXED_HELPERS_DIR="${PROJECT_ROOT}/hyper_parallel/data/indexed"
 INDEXED_HELPERS_SOURCE="${INDEXED_HELPERS_DIR}/csrc/indexed_helpers.cpp"
 PYTHON_BIN=${PYTHON:-python}
 CXX_BIN=${CXX:-c++}

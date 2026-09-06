@@ -16,6 +16,7 @@
 # pylint: disable=wrong-import-position,abstract-method
 
 import copy
+import logging
 import os
 import tempfile
 import unittest
@@ -24,16 +25,32 @@ from unittest.mock import patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
+# Snapshot logging.Logger attributes before importing optimizer modules, whose
+# imports patch rank-aware helpers onto logging.Logger.
+_LOGGING_HELPER_NAMES = (
+    "info_rank0",
+    "warning_rank0",
+    "debug_rank0",
+    "info_once",
+    "warning_once",
+)
+_LOGGER_ATTR_SENTINEL = object()
+_LOGGER_ATTR_SNAPSHOT = {
+    helper_name: getattr(logging.Logger, helper_name, _LOGGER_ATTR_SENTINEL)
+    for helper_name in _LOGGING_HELPER_NAMES
+}
+
 import torch  # pylint: disable=wrong-import-position
 from torch import nn  # pylint: disable=wrong-import-position
 
 from hyper_parallel import DeviceMesh, DTensor, Replicate
-from hyper_parallel.auto_models.components.optim.optimizer.mixed_precision_optimizer import (
+from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
 )
-from hyper_parallel.auto_models.components.optim.optimizer.optimizer import Muon
-from hyper_parallel.auto_models.components.checkpoint.dcp_checkpointer import (
+from hyper_parallel.components.optim.builders import Muon
+from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     DistributedCheckpointer,
+    initialize_optimizer_state,
 )
 from hyper_parallel.core.optimizer.adamw import AdamW as CoreAdamW
 from hyper_parallel.core.optimizer.muon import Muon as CoreMuon
@@ -42,6 +59,16 @@ from hyper_parallel.core.distributed_checkpoint import (
     save as dcp_save,
 )
 from tests.common.mark_utils import arg_mark
+
+
+def tearDownModule() -> None:  # pylint: disable=invalid-name
+    """Restore logging.Logger attributes patched by optimizer module imports."""
+    for helper_name, original in _LOGGER_ATTR_SNAPSHOT.items():
+        if original is _LOGGER_ATTR_SENTINEL:
+            if hasattr(logging.Logger, helper_name):
+                delattr(logging.Logger, helper_name)
+        else:
+            setattr(logging.Logger, helper_name, original)
 
 
 class _MixedDtypeModel(nn.Module):
@@ -138,6 +165,36 @@ def _muon_step_parameters(muon_optimizer: Any) -> list[nn.Parameter]:
 
 class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
     """Cover group routing, gradient movement, copy-back, reset, and DCP state."""
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_initialize_hyper_optimizer_state_without_step(self):
+        """Materialize AdamW and Muon checkpoint state without optimizer updates.
+
+        Feature: Lazy optimizer-state checkpoint restore.
+        Description: Initialize a chained Hyper AdamW/Muon optimizer before DCP load.
+        Expectation: Required zero state exists without calling either optimizer step.
+        """
+        model = nn.Module()
+        model.adamw_param = nn.Parameter(torch.tensor([1.0, 2.0]))
+        model.muon_param = nn.Parameter(torch.arange(4.0).reshape(2, 2))
+        adamw = CoreAdamW([model.adamw_param], lr=0.1)
+        muon = CoreMuon([model.muon_param], lr=0.1)
+        optimizer = ChainedOptimizer(model, {"adamw": adamw, "muon": muon})
+        expected_adamw = model.adamw_param.detach().clone()
+        expected_muon = model.muon_param.detach().clone()
+
+        with patch.object(adamw, "step", side_effect=AssertionError("AdamW step called")), \
+                patch.object(muon, "step", side_effect=AssertionError("Muon step called")):
+            self.assertTrue(initialize_optimizer_state(optimizer))
+
+        self.assertEqual(adamw.param_groups[0]["step"], 0)
+        self.assertEqual(muon.param_groups[0]["step"], 0)
+        self.assertEqual(set(adamw.state[model.adamw_param]), {"exp_avg", "exp_avg_sq"})
+        self.assertEqual(set(muon.state[model.muon_param]), {"momentum_buffer"})
+        self.assertTrue(torch.equal(adamw.state[model.adamw_param]["exp_avg"], torch.zeros(2)))
+        self.assertTrue(torch.equal(muon.state[model.muon_param]["momentum_buffer"], torch.zeros(2, 2)))
+        self.assertTrue(torch.equal(model.adamw_param, expected_adamw))
+        self.assertTrue(torch.equal(model.muon_param, expected_muon))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_groups_separate_low_precision_and_native_fp32_params(self):
@@ -378,7 +435,7 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertNotIn("_mixed_precision_optimizer", load_state["optimizer"])
         restored_model.load_state_dict(load_state["model"])
         with self.assertLogs(
-                "hyper_parallel.auto_models.components.optim.optimizer.mixed_precision_optimizer",
+                "hyper_parallel.components.optim.mixed_precision_optimizer",
                 level="WARNING",
         ):
             restored_optimizer.load_state_dict(load_state["optimizer"])
@@ -460,7 +517,7 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         missing_state.pop("_mixed_precision_optimizer")
 
         with self.assertLogs(
-                "hyper_parallel.auto_models.components.optim.optimizer.mixed_precision_optimizer",
+                "hyper_parallel.components.optim.mixed_precision_optimizer",
                 level="WARNING",
         ) as logs:
             optimizer.load_state_dict(missing_state)

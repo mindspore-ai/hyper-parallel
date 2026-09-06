@@ -21,36 +21,45 @@ import pytest
 import torch
 from torch import nn
 
-from hyper_parallel.auto_models.components.distributed.cp_utils import (
+from hyper_parallel.data.parallel.batch_parallel import (
     _shard_seq_lens_for_cp,
     shard_batch_for_cp,
 )
-from hyper_parallel.auto_models.components.distributed.cp_wrappers import (
-    INNER_WRAPPER_REGISTRY,
+from hyper_parallel.distributed.context_parallel.collectives import (
     _slice_sequence,
+)
+from hyper_parallel.distributed.context_parallel.wrappers import (
+    INNER_WRAPPER_REGISTRY,
     is_flex_attention,
     is_hf_style_attention,
     is_sdpa_attention,
     mla_dsa_ulysses_cp_wrapper,
     sdpa_qkv_cp_wrapper,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_applier import (
-    _resolve_inner_target,
-    _resolve_inner_wrapper,
+from hyper_parallel.distributed._builder.forward_rewriter import (
+    _ForwardRewriteRequest,
+    _commit_forward_rewrite,
     _wrap_inner_attention,
 )
-from hyper_parallel.auto_models.components.distributed.injection import (
+from hyper_parallel.distributed._builder.rule_resolver import (
+    _resolve_inner_target,
+    _resolve_inner_wrapper,
+)
+from hyper_parallel.distributed.recipe_spec import (
     inner_wrapper,
 )
-from hyper_parallel.auto_models.components.distributed.sharding_config import (
+from hyper_parallel.distributed.recipe_spec import (
     ModuleShardingSpec,
     TP,
 )
+from hyper_parallel.distributed.tensor_parallel.head_count import (
+    TpLocalAttrPlan,
+)
 try:
-    from hyper_parallel.auto_models.trainer.config import Target
+    from hyper_parallel.trainer.config import Target
     _HAS_TRAINER_CONFIG = True
 except ImportError:
-    # trainer.config pulls in model_transform / checkpoint conversion, which
+    # trainer.config pulls in replacement / checkpoint conversion, which
     # require a newer transformers than some CI gates provide.
     _HAS_TRAINER_CONFIG = False
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -281,8 +290,8 @@ def test_callable_target_forms_and_no_cp_generalization():
     spec = ModuleShardingSpec(inner_target="inner_attention",
                               inner_wrapper=Target(
         sdpa_qkv_cp_wrapper,
-        target_path="hyper_parallel.auto_models.components.distributed."
-                    "cp_wrappers.sdpa_qkv_cp_wrapper"), region_dispatch=False)
+        target_path="hyper_parallel.distributed."
+                    "wrappers.sdpa_qkv_cp_wrapper"), region_dispatch=False)
     name, target, apply_fn = _resolve_inner_wrapper(
         m, spec, _FakeCpMesh(), None, ())
     assert name.endswith("sdpa_qkv_cp_wrapper"), "case: target_builtin_inplace"
@@ -310,6 +319,25 @@ def test_callable_target_forms_and_no_cp_generalization():
     _, target, apply_fn = _resolve_inner_wrapper(m, spec, cp_mesh, None, ())
     apply_fn()
     assert received == [(target, cp_mesh)], "case: target_factory_returning_callable"
+
+    # ── case: target_factory_returning_rewrite_request ── in-repo wrappers
+    # may atomically replace forward together with companion attributes.
+    @inner_wrapper
+    def request_factory(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+        return _ForwardRewriteRequest(target_module, target_module.forward)
+
+    m = NeMoAttention()
+    spec = ModuleShardingSpec(inner_target="inner_attention",
+                              inner_wrapper=Target(
+                                  request_factory,
+                                  target_path="tests.request_factory"),
+                              region_dispatch=False)
+    _, target, apply_fn = _resolve_inner_wrapper(m, spec, cp_mesh, None, ())
+    result = apply_fn()
+    assert isinstance(result, _ForwardRewriteRequest), \
+        "case: target_factory_returning_rewrite_request"
+    assert result.target is target, \
+        "case: target_factory_returning_rewrite_request"
 
     # ── case: context_filled_by_name ── all required mesh-family parameters
     # receive framework-provided values (cp_mesh/ep_mesh are None when there
@@ -414,8 +442,8 @@ def test_error_paths_combined(make_mesh):
     spec = ModuleShardingSpec(inner_target="self",
                               inner_wrapper=Target(
         sdpa_qkv_cp_wrapper,
-        target_path="hyper_parallel.auto_models.components.distributed."
-                    "cp_wrappers.sdpa_qkv_cp_wrapper",
+        target_path="hyper_parallel.distributed."
+                    "wrappers.sdpa_qkv_cp_wrapper",
         cp_mesg="oops"), region_dispatch=False)                      # typo: should be cp_mesh
     _expect_raise("target_typo_config_key_raises", ValueError, "cp_mesh",
                   _resolve_inner_wrapper, NeMoAttention(), spec,
@@ -442,8 +470,8 @@ def test_error_paths_combined(make_mesh):
     spec = ModuleShardingSpec(inner_target="inner_attention",
                               inner_wrapper=Target(
         sdpa_qkv_cp_wrapper,
-        target_path="hyper_parallel.auto_models.components.distributed."
-                    "cp_wrappers.sdpa_qkv_cp_wrapper"), region_dispatch=False)
+        target_path="hyper_parallel.distributed."
+                    "wrappers.sdpa_qkv_cp_wrapper"), region_dispatch=False)
     _expect_raise("builtin_target_without_cp_raises", ValueError,
                   "active cp axis", _wrap_inner_attention,
                   NeMoAttention(), None, spec=spec)
@@ -637,7 +665,7 @@ def test_decorator_and_injection_discipline():
 
     # ── case: wrong_kind_decorator_raises ── wrong decorator kind
     # (@local_compute used on an inner_wrapper) → fail-fast
-    from hyper_parallel.auto_models.components.distributed.injection import (
+    from hyper_parallel.distributed.recipe_spec import (
         local_compute,
     )
 
@@ -821,6 +849,62 @@ def test_dual_mode_adapter_rewrap(make_mesh):
     assert tuple(b.placements) == (Replicate(),), "case: multi_output_declared"
 
 
+def test_validate_black_box_inner_wrapper_uses_tp_local_head_counts():
+    """Match cached head counts to local TP projection shards in validate mode."""
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads = 4
+
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class TpMesh:
+        @staticmethod
+        def size():
+            return 2
+
+    class Mesh:
+        @staticmethod
+        def __getitem__(name):
+            assert name == "tp"
+            return TpMesh()
+
+    @inner_wrapper
+    def passthrough_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
+        del mesh, tp_mesh, cp_mesh, ep_mesh
+        original_forward = target_module.forward
+
+        def wrapped(*args, **kwargs):
+            return original_forward(*args, **kwargs)
+
+        target_module.forward = wrapped
+
+    module = Attention()
+    spec = ModuleShardingSpec(
+        inner_target="self",
+        inner_wrapper=passthrough_wrapper,
+        out_src={"output": {TP: Replicate()}},
+        region_dispatch=False,
+    )
+    spec._tp_local_attr_plan = TpLocalAttrPlan(  # pylint: disable=protected-access
+        auto_divide=("num_heads",),
+    )
+
+    _wrap_inner_attention(
+        module,
+        None,
+        spec=spec,
+        mesh=Mesh(),
+        mesh_dim_names=("tp",),
+        tp_mesh=TpMesh(),
+        validate_mode=True,
+        module_fqn="model.layers.0.self_attn",
+    )
+
+    assert module.num_heads == 2
+
+
 # ==========================================================================
 # Family 8: region_dispatch=True dispatch-through validation (DTensor passed
 # straight into the user forward + real validation)
@@ -891,7 +975,7 @@ def test_dispatch_through_validation(make_mesh):
 # ==========================================================================
 
 def test_style_helpers_and_sdpa_call_condition():
-    """Style-detection helpers (public utilities of cp_wrappers for custom
+    """Style-detection helpers (public utilities of wrappers for custom
     wrapper authors) + the D-04 trigger condition (based on CP semantics
     rather than a q_len!=kv_len shape comparison)."""
 
@@ -913,7 +997,7 @@ def test_style_helpers_and_sdpa_call_condition():
 
     # ── case: is_causal_kept_when_cp_inactive ── cp_size=1: is_causal is
     # passed through unchanged; no explicit mask substitution
-    from hyper_parallel.auto_models.components.distributed.cp_wrappers import (
+    from hyper_parallel.distributed.context_parallel.wrappers import (
         _cp_sdpa_call,
     )
     received = {}
@@ -1253,8 +1337,13 @@ def test_mla_dsa_wrapper_configures_adaptations(monkeypatch):
     original_model_forward = model.forward
     original_text_forward = model.text_model.forward
 
-    mla_dsa_ulysses_cp_wrapper(
+    # 4d contract: the wrapper RETURNS rewrite requests; the forward
+    # rewriter commits them (here the test plays the rewriter's role)
+    requests = mla_dsa_ulysses_cp_wrapper(
         model, None, None, _FakeCPMesh(), None)
+    assert requests, "case: wrapper_returns_requests"
+    for request in requests:
+        _commit_forward_rewrite(request)
 
     assert model.forward != original_model_forward
     assert model.text_model.forward != original_text_forward

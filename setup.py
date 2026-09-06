@@ -226,7 +226,8 @@ if __name__ == '__main__':
             'hyper_parallel.platform.mindspore.custom_ops': ['lib/*.so', 'lib/*_auto_generate/*.py'],
             'hyper_parallel.core.multicore': ['lib/**/*'],
             'hyper_parallel.core.symmetric_memory': ['lib/**/*'],
-            'hyper_parallel.auto_models.components.datasets.llm': ['*.so'],
+            'hyper_parallel.data.indexed': ['*.so'],
+            'hyper_parallel.models.qwen3_moe': ['recipes/*.yaml'],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
                 'configs_eval/default.yaml',
             ],

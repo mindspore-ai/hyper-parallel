@@ -16,7 +16,6 @@
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, MindSporeCase
 
-BASE_SHARD = "base_shard.py"
 RESHARD_HANDLER = "reshard_handler.py"
 
 
@@ -25,16 +24,10 @@ def test_checkpoint_group1():
     """
     Feature: parallel run case in distributed_checkpoint
     Description:
-        1.test_base_layout
-        2.test_get_global_layout
-        3.test_saver_loader
-        4.test_reshard_between_layout_and_none_layout
+        1.test_reshard_between_layout_and_none_layout
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(BASE_SHARD, "test_base_layout", 11222, 2, 2),
-        MindSporeCase(BASE_SHARD, "test_get_global_layout", 11224, 2, 2),
-        MindSporeCase(BASE_SHARD, "test_saver_loader", 11318, 2, 2),
         MindSporeCase(RESHARD_HANDLER, "test_reshard_between_layout_and_none_layout", 11000)
     ])
 

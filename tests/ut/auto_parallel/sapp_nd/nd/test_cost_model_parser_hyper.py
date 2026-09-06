@@ -180,7 +180,7 @@ def _auto_models_config(**kw: Any) -> Dict[str, Any]:
     base = {
         "model": {
             "_target_": (
-                "hyper_parallel.auto_models._transformers."
+                "hyper_parallel.models._transformers."
                 "HyperAutoModelForCausalLM.from_pretrained"
             ),
             "pretrained_model_name_or_path": "local/model",
@@ -207,7 +207,7 @@ def _auto_models_config(**kw: Any) -> Dict[str, Any]:
         "activation_checkpoint": {"mode": "full"},
         "dataset": {"data_transform": {"max_seq_len": 2048}},
         "optimizer": {
-            "_target_": "hyper_parallel.auto_models.components.optim.optimizer.AdamW",
+            "_target_": "hyper_parallel.components.optim.AdamW",
         },
     }
     _deep_update(base, kw)

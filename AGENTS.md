@@ -48,7 +48,7 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 |--------|----------|---------|
 | **Platform** | `platform/` (`platform.py`, `torch/`, `mindspore/`) | Abstraction — `get_platform()`, never import backends in core |
 | **DTensor** | `core/dtensor/` | Local shard + DeviceMesh + Placements; redistribution cache |
-| **Shard** | `core/shard/` | `shard_module()` / YAML ops + `parallel_*.py` |
+| **Shard** | `core/shard/` | `custom_shard` / YAML ops + `parallel_*.py` |
 | **Tensor parallel** | `core/tensor_parallel/` | `parallelize_module()`, `ParallelStyle`, mesh context |
 | **FSDP / HSDP** | `core/fully_shard/`, `platform/*/fully_shard/` | Param shard/unshard; HSDP under same trees (`hsdp_*.py`) |
 | **Pipeline** | `core/pipeline_parallel/`, `platform/*/pipeline_parallel/` | Stage schedule, micro-batch, P2P |

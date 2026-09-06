@@ -30,7 +30,7 @@ from hyper_parallel.auto_parallel._hf_model_spec import (
     resolve_hf_model_spec,
 )
 
-_REGISTRY = "hyper_parallel.auto_models._transformers.registry"
+_REGISTRY = "hyper_parallel.models._transformers.config_resolver"
 
 
 class _Recorder:

@@ -20,9 +20,9 @@ from typing import Any
 
 from transformers import AutoConfig, PreTrainedModel
 
-from hyper_parallel.auto_models._transformers import HyperAutoModelForCausalLM
-from hyper_parallel.auto_models.components.distributed.infrastructure import DistributedSetup
-from hyper_parallel.auto_models.trainer.config import CompileConfig
+from hyper_parallel.models._transformers import HyperAutoModelForCausalLM
+from hyper_parallel.distributed.mesh import DistributedSetup
+from hyper_parallel.models.build_options import CompileConfig
 
 
 def build_cropped_qwen3_moe(

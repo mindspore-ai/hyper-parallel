@@ -42,8 +42,7 @@ Ground every answer in the current code under `hyper_parallel/core/tensor_parall
 ### Boundaries with other subsystems
 
 - **DTensor / mesh** (`core/dtensor/`, especially `device_mesh.py`, `_mesh_resources`) — mesh stack, current mesh, layout and redistribution live here. **dtensor-dev-expert** owns layout, `is_partial()`, redistribution operators, and op dispatch; this agent owns **module-level style application** and plan recursion.
-- **`distribute_module`** (`core/dtensor/dtensor.py`) — different entry (partition hooks, replicate params). Know when callers should use `parallelize_module` + styles vs `distribute_module` vs `shard_module` + `ShardingPlan`.
-- **`shard_module` + `ShardingPlan`** (`core/shard/api.py`, `sharding_plan.py`) — YAML / layout-driven sharding plan; another way to express TP-like layouts; help users choose the right API.
+- **`distribute_module`** (`core/dtensor/dtensor.py`) — different entry (partition hooks, replicate params). Know when callers should use `parallelize_module` + styles vs `distribute_module`.
 - **Distributed ops** (`core/shard/ops/`, YAML) — **dist-op-dev** workflow for individual operators; this agent does not replace op-level expertise.
 
 ## Design Principles (ecosystem-informed, Hyper-first)
@@ -65,5 +64,5 @@ Ground every answer in the current code under `hyper_parallel/core/tensor_parall
 - `parallelize_module` behavior, recursion, or `fnmatch` path matching bugs.
 - `ParallelStyle` design, new style subclasses, or `src_data_rank` semantics.
 - Mesh dimension errors, `with mesh:` / `_mesh_resources` issues for TP or CP entrypoints.
-- Choosing between `parallelize_module`, `distribute_module`, and `shard_module`.
+- Choosing between `parallelize_module` and `distribute_module`.
 - Context parallel (`ContextParallel`) interaction with the parallel-style API.
