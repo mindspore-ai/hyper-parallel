@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Dict, Iterator, List, Optional, Set
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -82,8 +83,9 @@ def _collect_device_storage_ptrs(tensors: Any) -> Set[int]:
     storage_ptrs = set()
 
     def _collect(x):
-        if isinstance(x, platform.Tensor) and str(x.device).lower() != "cpu":
-            storage_ptrs.add(x.untyped_storage().data_ptr())
+        local_tensor = x.to_local() if isinstance(x, DTensor) else x
+        if isinstance(local_tensor, platform.Tensor) and str(local_tensor.device).lower() != "cpu":
+            storage_ptrs.add(local_tensor.untyped_storage().data_ptr())
         return x
 
     platform.tree_map(_collect, tensors)
