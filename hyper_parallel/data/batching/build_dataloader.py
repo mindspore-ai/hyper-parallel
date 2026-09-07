@@ -22,12 +22,19 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
-from torch.utils.data import IterableDataset
+# DataLoader implementations use the PyTorch runtime directly.
+import torch  # pylint: disable=forbidden-backend-import
+from torch.utils.data import IterableDataset  # pylint: disable=forbidden-backend-import
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
+from hyper_parallel.distributed_data import (
+    DistributedDatasetConfig,
+    build_distributed_dataloader,
+    collate_indexed_text_sequences,
+    pack_indexed_text_samples,
+)
 
 logger = get_dataset_logger(__name__)
 
@@ -84,6 +91,119 @@ def _supports_output_index_for_resume(dataset: Any) -> bool:
     get_item = getattr(dataset, "get_item", None)
     supports_output_index = callable(get_item) and hasattr(dataset, "output_index_for_resume")
     return supports_output_index
+
+
+def _uses_distributed_packing(data_config: Mapping[str, Any] | None) -> bool:
+    """Return whether Indexed source samples are packed by distributed data."""
+    return data_config is not None and data_config.get("packing_stage") == "distributed_dataloader"
+
+
+def _build_distributed_packing_config(
+        dataloader_target: Any,
+        data_config: Mapping[str, Any],
+        *,
+        micro_batch_size: int,
+        sampler_type: str,
+        seed: int,
+) -> DistributedDatasetConfig:
+    """Derive distributed-packing sizes and retain optional runtime tuning."""
+    try:
+        seq_len = int(data_config["seq_length"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Distributed Indexed packing requires a positive data_config.seq_length") from exc
+    raw_options = data_config.get("distributed_dataloader", {})
+    if not isinstance(raw_options, Mapping):
+        raise ValueError("data_config.distributed_dataloader must be a mapping")
+    options = dict(raw_options)
+    derived_options = {
+        "seq_len",
+        "local_batch_size",
+        "dp_dim_names",
+        "drop_last",
+        "shuffle",
+        "seed",
+        "num_workers",
+        "pin_memory",
+        "prefetch_factor",
+        "persistent_workers",
+        "dataset_already_sharded",
+    }
+    conflicting_options = sorted(set(options) & derived_options)
+    if conflicting_options:
+        raise ValueError(
+            "data_config.distributed_dataloader cannot override Trainer-derived options "
+            f"{conflicting_options}"
+        )
+    return DistributedDatasetConfig(
+        seq_len=seq_len,
+        local_batch_size=micro_batch_size,
+        dp_dim_names=("dp",),
+        drop_last=bool(getattr(dataloader_target, "drop_last", True)),
+        shuffle=sampler_type == "cyclic",
+        seed=seed,
+        num_workers=int(getattr(dataloader_target, "num_workers", 0)),
+        pin_memory=bool(getattr(dataloader_target, "pin_memory", False)),
+        prefetch_factor=getattr(dataloader_target, "prefetch_factor", None),
+        persistent_workers=bool(getattr(dataloader_target, "persistent_workers", False)),
+        dataset_already_sharded=False,
+        **options,
+    )
+
+
+def _build_distributed_packing_splits(
+        dataloader_target: Any,
+        datasets: Sequence[Any | None],
+        mesh_context: Any,
+        training_config: Any,
+        data_config: Mapping[str, Any],
+        *,
+        sampler_type: str,
+        seed: int,
+        data_sharding: bool,
+        rearrangement_map: Any,
+) -> tuple[tuple[Any | None, ...], tuple[None, None, None]]:
+    """Build collective source-sample DataLoaders for enabled splits."""
+    if data_sharding:
+        raise ValueError("Distributed Indexed packing owns DP routing and does not support data_sharding=True")
+    if rearrangement_map is not None:
+        raise ValueError("Distributed Indexed packing does not support data_rearrange_map")
+    if mesh_context is None or getattr(mesh_context, "device_mesh", None) is None:
+        raise ValueError("Distributed Indexed packing requires mesh_context.device_mesh")
+    if int(getattr(mesh_context, "pp_size", 1)) != 1:
+        raise ValueError("Distributed Indexed packing does not support pipeline parallelism in this version")
+
+    config = _build_distributed_packing_config(
+        dataloader_target,
+        data_config,
+        micro_batch_size=training_config.micro_batch_size,
+        sampler_type=sampler_type,
+        seed=seed,
+    )
+    worker_kwargs = {
+        name: getattr(dataloader_target, name)
+        for name in ("timeout", "worker_init_fn", "multiprocessing_context", "pin_memory_device", "in_order")
+        if getattr(dataloader_target, name, None) is not None
+    }
+    dataloaders = []
+    for split_name, dataset in zip(("train", "valid", "test"), datasets):
+        if dataset is None:
+            dataloaders.append(None)
+            continue
+        if not bool(getattr(dataset, "requires_distributed_packing", False)):
+            raise ValueError(
+                f"Dataset split {split_name!r} does not expose unpacked Indexed source samples"
+            )
+        dataloader = build_distributed_dataloader(
+            dataset,
+            mesh_context.device_mesh,
+            config,
+            dataloader_kwargs=worker_kwargs,
+            pack_fn=pack_indexed_text_samples,
+            collate_fn=collate_indexed_text_sequences,
+        )
+        dataloaders.append(dataloader)
+        logger.debug("Built distributed Indexed packing DataLoader split=%s", split_name)
+    return tuple(dataloaders), (None, None, None)
 
 
 def _normalize_source_samples(source_item: Any) -> list[Mapping[str, Any]]:
@@ -175,6 +295,7 @@ def build_dataloader(
         collate_fn: Any,
         mesh_context: Any,
         training_config: Any,
+        data_config: Mapping[str, Any] | None = None,
         max_seq_len: int | None = None,
         default_seed: int = 1234,
 ) -> tuple[tuple[Any | None, ...], tuple[Any | None, ...]]:
@@ -190,6 +311,7 @@ def build_dataloader(
         collate_fn: Collator applied after fixed or dynamic sample selection.
         mesh_context: Data-parallel mesh context.
         training_config: Batch size and random seed configuration.
+        data_config: Dataset options, including the Indexed packing stage.
         max_seq_len: Maximum sample length used to derive dynamic token budget.
         default_seed: Seed used when no training seed is configured.
 
@@ -218,6 +340,19 @@ def build_dataloader(
     drop_last = getattr(dataloader_target, "drop_last", True)
     rearrangement_map = getattr(dataloader_target, "data_rearrange_map", None)
     data_sharding = getattr(dataloader_target, "data_sharding", False)
+
+    if _uses_distributed_packing(data_config):
+        return _build_distributed_packing_splits(
+            dataloader_target,
+            datasets,
+            mesh_context,
+            training_config,
+            data_config,
+            sampler_type=sampler_type,
+            seed=seed,
+            data_sharding=data_sharding,
+            rearrangement_map=rearrangement_map,
+        )
 
     dataloaders: list[Any | None] = [None] * len(datasets)
     batch_samplers: list[Any | None] = [None] * len(datasets)

@@ -148,6 +148,7 @@ class DistributedDataLoader(Iterator[Any]):
     """
 
     VERSION = 5
+    collective_source = True
 
     def __init__(
             self,
@@ -316,6 +317,15 @@ class DistributedDataLoader(Iterator[Any]):
     def last_plan_id(self) -> str | None:
         """Return the most recently delivered deterministic plan identifier."""
         return self._last_plan_id
+
+    def wait_for_prefetch(self) -> None:
+        """Wait for in-flight data communication before training tears down groups.
+
+        All ranks must call this at the same consumed-batch boundary. The
+        prepared result remains available to the next iterator call.
+        """
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join()
 
     @property
     def last_plan(self) -> DistributedPackingPlan | None:

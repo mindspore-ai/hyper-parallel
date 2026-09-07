@@ -56,6 +56,20 @@ class _RawDataset:
         return {"sample_id": index, "pack_tokens": 1, "reader_rank": self._reader_rank}
 
 
+class _IndexedSourceDataset(_RawDataset):
+    """Expose metadata separately from payloads like an unpacked Indexed Dataset."""
+
+    requires_distributed_packing = True
+
+    def get_sample_metadata(self, index: int) -> SampleMetadata:
+        """Return index-only planning metadata for one source sample.
+
+        Args:
+            index: Source position used as the diagnostic sample ID.
+        """
+        return SampleMetadata(pack_tokens=1, cost=WorkloadCost(llm=1.0), sample_id=index)
+
+
 class _ShardedRawDataset:
     """Expose one distinct local sidecar shard on each Dataset Reader."""
 
@@ -619,6 +633,33 @@ def _run_sidecar_direct_read_epoch(mesh: Any) -> None:
     _assert_collective_stop(loader)
 
 
+def _run_inferred_sidecar_epoch(mesh: Any) -> None:
+    """Infer metadata from Indexed source Datasets and skip payload A2A."""
+    rank = dist.get_rank()
+    dataset = _IndexedSourceDataset(reader_rank=rank) if rank in _CONSTRUCTOR_RANKS else None
+    loader = build_distributed_dataloader(
+        dataset,
+        mesh,
+        DistributedDatasetConfig(
+            seq_len=4,
+            local_batch_size=1,
+            dp_dim_names=("dp",),
+            buffer_size_multiplier=1.0,
+            max_buffered_samples=8,
+            cpu_backend="gloo",
+        ),
+        pack_fn=_pack_fn,
+        collate_fn=_collate_fn,
+    )
+
+    with patch.object(dist, "all_to_all_single", side_effect=AssertionError("inferred sidecar entered payload A2A")):
+        outputs = _all_gather_object(next(loader))
+
+    _assert_same_model_parallel_batches(outputs)
+    _assert_exactly_once(outputs)
+    _assert_collective_stop(loader)
+
+
 def _run_pre_sharded_sidecar_epoch(mesh: Any) -> None:
     """Verify local sidecars read on their owning Readers before payload A2A."""
     rank = dist.get_rank()
@@ -742,6 +783,10 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         # Sidecar Dataset Readers expose metadata only. Constructors read
         # planned indices locally, so disjoint reader/constructor ranks need no A2A.
         _run_sidecar_direct_read_epoch(mesh)
+
+        # Indexed sources infer the aligned sidecar directly from Dataset
+        # metadata and also perform target-rank direct reads without A2A.
+        _run_inferred_sidecar_epoch(mesh)
 
         # Rank-local sidecars disable Reader stride. Their owning Readers fetch
         # only selected samples and route them to the planned constructors.

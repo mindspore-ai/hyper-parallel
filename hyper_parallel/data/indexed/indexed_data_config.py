@@ -20,7 +20,7 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -108,6 +108,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     skip_data_check: bool = False
     reuse_idx: bool = False
     data_lazy_load: bool = False
+    packing_stage: Literal["dataset", "distributed_dataloader"] = "dataset"
 
     is_dataset_from_mr: bool = False
     simple_blend: str = "no"
@@ -120,6 +121,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
             raise ValueError("sequence_length must be positive")
         if self.tokenizer is None and not self.mock:
             raise ValueError("Attribute 'tokenizer' must not be None")
+        if self.packing_stage not in {"dataset", "distributed_dataloader"}:
+            raise ValueError("packing_stage must be 'dataset' or 'distributed_dataloader'")
+        if self.packing_stage == "distributed_dataloader" and self.mock:
+            raise ValueError("packing_stage='distributed_dataloader' does not support mock data")
+        if self.packing_stage == "distributed_dataloader" and self.is_dataset_from_mr:
+            raise ValueError("packing_stage='distributed_dataloader' requires unpacked .bin/.idx data")
 
 
 def _discover_indexed_paths(
@@ -266,6 +273,7 @@ def build_gpt_dataset_config(
             mmap_bin_files=data_config.get("mmap_bin_files", True),
             reuse_idx=data_config.get("reuse_idx", False),
             data_lazy_load=data_config["data_lazy_load"],
+            packing_stage=data_config.get("packing_stage", "dataset"),
             reset_position_ids=data_config.get("reset_position_ids", False),
             reset_attention_mask=data_config.get("reset_attention_mask", False),
             eod_mask_loss=data_config.get("eod_mask_loss", False),

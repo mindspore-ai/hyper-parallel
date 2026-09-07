@@ -77,6 +77,101 @@ loader = build_distributed_dataloader(
 )
 ```
 
+### HyperParallel unpacked Indexed text data
+
+The HP Indexed provider keeps its existing `GPTDataset` behavior by
+default. To balance the source sequences inside each packed row, use an
+unpacked `.bin/.idx` corpus and select constructor-side packing:
+
+```yaml
+dataset:
+  _target_: hyper_parallel.data.text.build_indexed_text_dataset
+  data_path: /data/corpus_text_document
+  data_config:
+    seq_length: 32768
+    split: "98, 1, 1"
+    mock_data: false
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    data_lazy_load: true
+    distributed_walk: false
+    packing_stage: distributed_dataloader
+    create_attention_mask_in_dataloader: true
+    distributed_dataloader:
+      buffer_size_multiplier: 2.0
+      double_buffer: true
+```
+
+This changes the path to:
+
+```text
+.idx sequence length -> Step Sample Selection -> balanced plan
+                     -> target Constructor reads .bin by planned index
+                     -> fixed [local_batch_size, seq_len] text batch
+```
+
+`seq_len` and `local_batch_size` are derived from `data_config.seq_length` and
+`training.micro_batch_size`. The configured DataLoader worker count,
+`pin_memory`, `persistent_workers`, and `prefetch_factor` are reused. Other
+worker execution options (`timeout`, `worker_init_fn`, `multiprocessing_context`,
+`pin_memory_device`, and `in_order`) are forwarded through `dataloader_kwargs`.
+For accelerator jobs, set `dataloader.multiprocessing_context: spawn`.
+Other `DistributedDatasetConfig` tuning fields may be placed below
+`data_config.distributed_dataloader`.
+The provider uses shared indices, so `dataset_already_sharded` cannot be
+overridden here. Every Constructor needs access to the same corpus files.
+The Trainer selects the built-in text packing and collation callbacks;
+`dataloader.collate_fn` is optional in this mode.
+
+The `.idx` lengths form an implicit sidecar, so the shared-index path plans
+before payload reads and does not use payload A2A. Every packed row records
+source boundaries in `cu_seq_lens`; padding labels use `-100`. The HP Trainer also
+switches `ParallelBatch` to the `indexed_source` contract so those boundaries
+isolate attention between source samples. Position IDs restart at each source
+boundary, independent of its new packing offset. This path requires
+`create_attention_mask_in_dataloader: true`; compressed attention also requires
+an `attention_runtime_adapter` that consumes those boundaries. Implicit full-row
+causal attention cannot be used for independently packed documents.
+
+Each source record is shifted independently (`input_ids=text[:-1]`,
+`labels=text[1:]` by default), and source boundaries stay explicit even when
+the final EOD appears only in the labels. This preserves independent-document
+semantics; it is not token-for-token equivalent to GPTDataset concatenating
+documents across fixed-length sample boundaries. `labels_are_shifted` must
+remain true. With `add_extra_token_to_sequence=false`, the final label of each
+source record is ignored instead.
+
+Multiple prefixes retain weighted blending and lazy metadata lookup. A source
+epoch is sized by the longest source relative to its weight, with shorter
+sources repeated. Training continues across dynamic epochs until `train_iters`
+is reached; checkpoint restore keeps the consumed source cursor. Before
+tearing down communication groups, TextTrainer waits for double-buffer prefetch
+to finish. Standalone users can call `loader.wait_for_prefetch()` for the same
+synchronization without consuming the prepared batch.
+
+This first version requires unpacked `.bin/.idx`, `is_dataset_from_mr=false`,
+`simple_blend=no`, `drop_last=true`, no pipeline parallelism, and source sequences no longer
+than `seq_length`. Data produced with `--pack-to-seq-len` remains a pre-packed
+record and must keep the default `packing_stage: dataset` path.
+
+The HP Trainer path also needs `torchdata` (tested with 0.11.0) for its shared
+batching imports. After installing the project and its training dependencies,
+the CPU regression commands are:
+
+```bash
+HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
+  tests/ut/data/test_indexed_source_dataset.py \
+  tests/ut/distributed_data
+HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
+  tests/torch/distributed_data/test_indexed_text_gloo.py
+```
+
+The integration test creates real `.bin/.idx` files and verifies DP2/TP2
+delivery, index-only planning, no payload A2A, double buffering, and loss/gradient
+parity against independently evaluated documents with unequal valid-token
+counts. The unit tests cover weighted blending, persistent spawned workers,
+checkpoint replay, and the unchanged default GPT Dataset path.
+
 Online mode also accepts an iterable Dataset. Set
 `dataset_already_sharded=True` when each Reader's Dataset already owns its
 rank-local partition, as in an existing IterableDataset pipeline. HyperParallel
