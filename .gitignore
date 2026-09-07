@@ -74,3 +74,6 @@ hyper_parallel/auto_parallel/SAPP-ND/**/*nd_to_ppb*.json
 # NPU graph-fusion debug dump (regenerated in CWD on every NPU run)
 fusion_result.json
 *.xlsx
+
+# Offline CANN installers for docker/Dockerfile.trainer (multi-GB, never commit)
+Ascend-cann*.run
