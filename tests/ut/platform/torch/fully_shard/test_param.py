@@ -27,6 +27,7 @@ import torch
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo, ShardedState
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy, SourceShardMetaInfo
@@ -90,6 +91,32 @@ def _new_param():
 
 class TestTorchHSDPParamHelpers(unittest.TestCase):
     """Cover parameter helper behavior without constructing real device meshes."""
+
+    def test_to_sharded_dtensor_reuses_uneven_sharding_layout(self):
+        """Gradient wrapping should retain uneven metadata without copying its layout."""
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+            mesh = DeviceMesh(
+                "cpu",
+                [0, 1],
+                mesh_dim_names=("fsdp",),
+                _init_backend=False,
+            )
+        sharding_spec = Layout.from_device_mesh(mesh)
+        sharding_spec.set_placements((Shard(0, uneven_shard=True),))
+        sharding_spec.placement_to_tensor_map(2)
+        sharding_spec.set_tensor_meta((5, 3), (3, 1), torch.float32)
+        hsdp_param = object.__new__(TorchHSDPParamV2)
+        hsdp_param._sharding_spec = sharding_spec
+        local_gradient = torch.arange(6, dtype=torch.float32).view(2, 3)
+
+        with patch.object(DTensor, "from_local", side_effect=AssertionError("slow constructor called")):
+            sharded_gradient = hsdp_param.to_sharded_dtensor(local_gradient)
+
+        self.assertIs(sharded_gradient.layout, sharding_spec)
+        self.assertIs(sharded_gradient.to_local(), local_gradient)
+        self.assertEqual(sharded_gradient.shape, (5, 3))
+        self.assertEqual(sharded_gradient.placements, (Shard(0, uneven_shard=True),))
+        self.assertEqual(sharded_gradient.layout.tensor_stride, (3, 1))
 
     def test_reduce_comm_dtype_prefers_parameter_policy_and_falls_back_to_grad(self):
         """Effective reduction dtype should be resolved entirely by the parameter."""
