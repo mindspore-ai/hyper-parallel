@@ -20,6 +20,9 @@ must not force every backend onto CPU-only consumers that only need a
 single submodule (e.g. ``functional.npu_grouped_swiglu``).
 """
 
+# Public names are materialized by PEP 562 ``__getattr__`` below.
+# pylint: disable=undefined-all-variable
+
 import importlib
 from typing import Any
 
@@ -45,6 +48,7 @@ _EXPORT_TO_MODULE = {
     "sink_attention": "sink_attention",
     "sinkhorn": "sinkhorn",
     "swiglu": "swiglu",
+    "swiglu_backward": "swiglu",
 }
 
 
@@ -85,4 +89,5 @@ __all__ = [
     "sink_attention",
     "sinkhorn",
     "swiglu",
+    "swiglu_backward",
 ]

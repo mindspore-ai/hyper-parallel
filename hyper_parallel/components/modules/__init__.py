@@ -15,8 +15,13 @@
 """Public high-performance module interfaces."""
 
 from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
+from hyper_parallel.components.modules.chunked_swiglu_mlp import ChunkedSwiGLUMLP, chunked_swiglu
 from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.modules.head_chunk_gqa_attention import (
+    HeadChunkGQAAttention,
+    ProjectionHeadChunkAttention,
+)
 from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPostProcessModule, MhcPreModule
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
@@ -26,15 +31,19 @@ from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 __all__ = [
     "DeepseekV32DSAAttention",
     "DSAAttention",
+    "ChunkedSwiGLUMLP",
     "GQAAttention",
     "GatedGQAAttention",
+    "HeadChunkGQAAttention",
     "GroupedExperts",
     "MhcPostModule",
     "MhcPostProcessModule",
     "MhcPreModule",
     "MLAAttention",
     "OffsetRMSNorm",
+    "ProjectionHeadChunkAttention",
     "RMSNorm",
     "SharedExpert",
     "SwiGLUMLP",
+    "chunked_swiglu",
 ]

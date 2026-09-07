@@ -29,3 +29,21 @@ def swiglu(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         The fused SwiGLU output.
     """
     return torch_npu.npu_swiglu(x, dim=dim)
+
+
+def swiglu_backward(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    dim: int = -1,
+) -> torch.Tensor:
+    """Apply the explicit NPU SwiGLU backward operator.
+
+    Args:
+        grad_output: Gradient of the fused SwiGLU output.
+        x: Packed Gate/Up input used by the forward operator.
+        dim: Dimension along which ``x`` is split.
+
+    Returns:
+        Gradient with respect to the packed input ``x``.
+    """
+    return torch_npu.npu_swiglu_backward(grad_output, x, dim=dim)
