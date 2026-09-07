@@ -360,7 +360,6 @@ class SyncTrainer:
                         version=self.state.global_step,
                         model_name=self.model_registration.name,
                         payload=self.actor.actor_model,
-                        metadata={"reason": "checkpoint_resume"},
                     )
                 )
                 self._release_training_state_for_rollout()
@@ -477,7 +476,7 @@ class SyncTrainer:
         diagnostic_metrics.update(consistency_metrics)
         return experience, diagnostic_metrics
 
-    def _publish_policy(self, next_step: int, actor_update: Any) -> None:
+    def _publish_policy(self, next_step: int) -> None:
         """Transfer the updated Actor and restore rollout residency."""
         hsdp_sync_stream()
         self._reshard_model(self.actor.actor_model)
@@ -491,7 +490,6 @@ class SyncTrainer:
                 version=next_step,
                 model_name=self.model_registration.name,
                 payload=self.actor.actor_model,
-                metadata={"optimizer_steps": actor_update.optimizer_steps},
             )
         )
         self.rollout_engine.prepare_for_rollout()
@@ -568,7 +566,7 @@ class SyncTrainer:
             timings["update_critic"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()
         #synic weight
-        self._publish_policy(next_step, actor_update)
+        self._publish_policy(next_step)
         timings["weight_sync"] = time.perf_counter() - stage_started
         timings["step"] = time.perf_counter() - step_started
         if collect_diagnostics:

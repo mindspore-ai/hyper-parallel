@@ -20,8 +20,9 @@ import socket
 import time
 from typing import Any, Mapping, Optional, Union
 
-from rl.roles.weight_sync.layout import DirectReshardPlan, TransferBucket
+from rl.roles.weight_sync.layout import DirectReshardPlan
 from rl.roles.weight_sync.sync import VLLMWeightSyncClientMixin, synchronize_error
+from rl.roles.weight_sync.tensor_ops import pack_direct_bucket
 
 from hyper_parallel import get_platform
 
@@ -56,7 +57,6 @@ class BroadcastDirectReshardHCCLTransport:
         self._groups: dict[tuple[int, int], Any] = {}
         self._group_ids: dict[tuple[int, int], str] = {}
         self._endpoint: Optional[str] = None
-        self.last_metrics: dict[str, Union[float, int]] = {}
 
     @staticmethod
     def _trainer_init(init_info: Mapping[str, Any]) -> Any:
@@ -232,43 +232,132 @@ class BroadcastDirectReshardHCCLTransport:
                 )
         return endpoint
 
-    @staticmethod
-    def _local_tensor(value: Any) -> Any:
-        """Return a DTensor's local shard or the original plain tensor."""
-        to_local = getattr(value, "to_local", None)
-        return to_local() if callable(to_local) else value
-
-    @classmethod
-    def _pack_bucket(
-        cls,
-        state_dict: Mapping[str, Any],
-        bucket: TransferBucket,
-        device: Any,
-    ) -> Any:
-        """Pack source-local rectangular slices into one bounded NPU buffer."""
-        import torch  # pylint: disable=C0415,forbidden-backend-import
-
-        packed = torch.empty(bucket.total_bytes, dtype=torch.uint8, device=device)
-        for entry in bucket.entries:
-            value = state_dict.get(entry.name)
-            if value is None:
-                raise ValueError(f"Direct reshard source parameter {entry.name!r} is missing")
-            local_tensor = cls._local_tensor(value)
-            source_slice = tuple(
-                slice(start, start + length)
-                for start, length in zip(entry.source_starts, entry.lengths)
+    def ensure_streaming_groups(
+        self,
+        client: VLLMWeightSyncClientMixin,
+        destination_tp_size: int,
+    ) -> str:
+        """Create one rank-zero producer group for each streamed TP destination."""
+        if int(destination_tp_size) != self._tensor_parallel_size:
+            raise RuntimeError(
+                "Streaming full-gather destination TP size differs from configured "
+                f"topology: expected={self._tensor_parallel_size}, "
+                f"actual={destination_tp_size}"
             )
-            fragment = local_tensor[source_slice].detach().contiguous()
-            if str(fragment.device) != str(device):
-                fragment = fragment.to(device)
-            raw = fragment.view(torch.uint8).view(-1)
-            if int(raw.numel()) != entry.num_bytes:
-                raise ValueError(
-                    f"Direct reshard source fragment {entry.name!r} has "
-                    f"{raw.numel()} bytes, expected {entry.num_bytes}"
+        endpoint = self._shared_endpoint(client)
+        if self._endpoint is not None and endpoint != self._endpoint:
+            raise RuntimeError(
+                f"Streaming full-gather rollout endpoint changed: {self._endpoint} -> {endpoint}"
+            )
+        self._endpoint = endpoint
+        for tp_rank in range(int(destination_tp_size)):
+            self._initialize_route(client, endpoint, 0, tp_rank)
+        return endpoint
+
+    def broadcast_streaming_bucket(
+        self,
+        client: VLLMWeightSyncClientMixin,
+        endpoint: str,
+        packed: Any,
+        metadata: Mapping[str, Any],
+        *,
+        target_tp_rank: int,
+        bucket_index: int,
+        policy_version: int,
+    ) -> int:
+        """Broadcast one assembled bucket and return its exact receiver count."""
+        route = (0, int(target_tp_rank))
+        group_id = self._group_ids.get(route)
+        if group_id is None:
+            raise RuntimeError(
+                f"Streaming full-gather route {route} has no HCCL group identity"
+            )
+        total_bytes = int(metadata["total_bytes"])
+        if int(packed.numel()) != total_bytes:
+            raise ValueError(
+                "Streaming full-gather packed buffer differs from metadata: "
+                f"buffer={packed.numel()}, metadata={total_bytes}"
+            )
+        local_rank = platform.get_rank()
+        request = None
+        executor = None
+        worker_results = None
+        local_error = None
+        try:
+            if local_rank == 0:
+                executor = ThreadPoolExecutor(max_workers=1)
+                request = executor.submit(
+                    client.collective_rpc,
+                    "receive_direct_reshard",
+                    {
+                        "group_id": group_id,
+                        "target_tp_rank": int(target_tp_rank),
+                        "buckets": [dict(metadata)],
+                        "policy_version": int(policy_version),
+                        "expected_data_parallel_size": self._data_parallel_size,
+                        "expected_tensor_parallel_size": self._tensor_parallel_size,
+                    },
+                    endpoint,
                 )
-            packed.narrow(0, entry.buffer_offset, entry.num_bytes).copy_(raw)
-        return packed
+                group = self._groups.get(route)
+                if group is None:
+                    raise RuntimeError(
+                        f"Streaming full-gather route {route} has no HCCL group"
+                    )
+                platform.get_current_stream().synchronize()
+                group.broadcast(packed, src=0)
+                platform.get_current_stream().synchronize()
+                worker_results = request.result(timeout=600)
+        except Exception as error:  # pylint: disable=W0718
+            local_error = error
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False)
+        synchronize_error(
+            local_error,
+            f"streaming full-gather transfer tp={target_tp_rank} bucket={bucket_index}",
+        )
+        gathered_results: list[Any] = [None] * platform.get_world_size()
+        platform.all_gather_object(
+            gathered_results,
+            worker_results if local_rank == 0 else None,
+        )
+        worker_results = gathered_results[0]
+        if not isinstance(worker_results, list) or not worker_results:
+            raise RuntimeError(
+                f"Streaming full-gather route {route} returned invalid results: {worker_results}"
+            )
+        received_workers = set()
+        for result in worker_results:
+            if not isinstance(result, Mapping):
+                raise RuntimeError(
+                    f"Streaming full-gather route {route} returned invalid ACK: {result!r}"
+                )
+            result_tp_rank = int(result["tp_rank"])
+            result_dp_rank = int(result["dp_rank"])
+            result_bytes = int(result["bytes"])
+            if bool(result.get("received")):
+                if result_tp_rank != target_tp_rank or result_bytes != total_bytes:
+                    raise RuntimeError(
+                        f"Streaming full-gather route {route} returned invalid ACK: {result}"
+                    )
+                received_workers.add((result_dp_rank, result_tp_rank))
+            elif result_tp_rank == target_tp_rank or result_bytes != 0:
+                raise RuntimeError(
+                    f"Streaming full-gather route {route} returned invalid skip ACK: {result}"
+                )
+        if not received_workers or any(
+            not 0 <= dp_rank < self._data_parallel_size
+            for dp_rank, _tp_rank in received_workers
+        ):
+            raise RuntimeError(
+                "Streaming full-gather returned no valid representative ACK: "
+                f"target_tp={target_tp_rank}, actual={sorted(received_workers)}"
+            )
+        # vLLM internal-DP executes the collective on every engine but may expose
+        # only one representative result. The transaction's final content check
+        # and rank-local manifests verify complete DP coverage.
+        return self._data_parallel_size
 
     def _broadcast_route(
         self,
@@ -314,7 +403,7 @@ class BroadcastDirectReshardHCCLTransport:
                 if group is None:
                     raise RuntimeError(f"Direct reshard route {route} has no HCCL group")
                 for bucket in buckets:
-                    packed = self._pack_bucket(state_dict, bucket, group.device)
+                    packed = pack_direct_bucket(state_dict, bucket, group.device)
                     platform.get_current_stream().synchronize()
                     group.broadcast(packed, src=0)
                     platform.get_current_stream().synchronize()
@@ -405,15 +494,6 @@ class BroadcastDirectReshardHCCLTransport:
         )
         total_sent = sum(int(value["sent_bytes"]) for value in metric_values if value)
         total_fragments = sum(int(value["fragment_bytes"]) for value in metric_values if value)
-        self.last_metrics = {
-            "group_init_seconds": group_seconds,
-            "transfer_seconds": transfer_seconds,
-            "sent_bytes": total_sent,
-            "fragment_bytes": total_fragments,
-            "delivered_bytes": total_fragments * self._data_parallel_size,
-            "route_count": plan.route_count,
-            "fragment_count": plan.fragment_count,
-        }
         if local_rank == 0:
             logger.info(
                 "direct reshard completed: group_init=%.6fs transfer=%.6fs "

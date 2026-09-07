@@ -14,7 +14,7 @@
 # ============================================================================
 """Layout metadata and cached plans for FSDP-to-TP direct resharding."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from math import prod
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -84,6 +84,18 @@ class SourceTensorLayout:
     global_shape: tuple[int, ...]
     source_rank: int
     region: TensorRegion
+    source_name: Optional[str] = None
+    source_starts: Optional[tuple[int, ...]] = None
+
+    @property
+    def source_key(self) -> str:
+        """Return the physical Trainer state entry containing this tensor."""
+        return self.source_name or self.name
+
+    @property
+    def local_starts(self) -> tuple[int, ...]:
+        """Return the source-local offset corresponding to ``region``."""
+        return self.source_starts or (0,) * len(self.global_shape)
 
 
 @dataclass(frozen=True)
@@ -101,6 +113,8 @@ class DestinationTensorLayout:
     region: TensorRegion
     destination_name: Optional[str] = None
     destination_starts: Optional[tuple[int, ...]] = None
+    destination_permutation: Optional[tuple[int, ...]] = None
+    accepted_source_dtypes: tuple[str, ...] = ()
 
     @property
     def target_name(self) -> str:
@@ -111,6 +125,11 @@ class DestinationTensorLayout:
     def local_starts(self) -> tuple[int, ...]:
         """Return the physical parameter offset corresponding to ``region``."""
         return self.destination_starts or (0,) * len(self.global_shape)
+
+    @property
+    def physical_permutation(self) -> tuple[int, ...]:
+        """Return the canonical-to-physical axis order."""
+        return self.destination_permutation or tuple(range(len(self.global_shape)))
 
 
 @dataclass(frozen=True)
@@ -124,7 +143,32 @@ class TransferEntry:
     destination_starts: tuple[int, ...]
     lengths: tuple[int, ...]
     destination_name: Optional[str] = None
+    source_name: Optional[str] = None
+    canonical_starts: Optional[tuple[int, ...]] = None
+    destination_permutation: Optional[tuple[int, ...]] = None
     buffer_offset: int = 0
+    destination_dtype_name: Optional[str] = None
+    destination_element_size: Optional[int] = None
+
+    @property
+    def source_key(self) -> str:
+        """Return the physical Trainer state entry supplying this fragment."""
+        return self.source_name or self.name
+
+    @property
+    def logical_starts(self) -> tuple[int, ...]:
+        """Return this fragment's offset in canonical tensor coordinates."""
+        return self.canonical_starts or self.source_starts
+
+    @property
+    def physical_permutation(self) -> tuple[int, ...]:
+        """Return the canonical-to-destination axis order."""
+        return self.destination_permutation or tuple(range(len(self.lengths)))
+
+    @property
+    def destination_lengths(self) -> tuple[int, ...]:
+        """Return fragment lengths in destination physical axis order."""
+        return tuple(self.lengths[axis] for axis in self.physical_permutation)
 
     @property
     def target_name(self) -> str:
@@ -142,25 +186,24 @@ class TransferEntry:
         return self.numel * self.element_size
 
     def with_buffer_offset(self, offset: int) -> "TransferEntry":
-        """Return this immutable entry assigned to one packed buffer offset."""
-        return TransferEntry(
-            name=self.name,
-            dtype_name=self.dtype_name,
-            element_size=self.element_size,
-            source_starts=self.source_starts,
-            destination_starts=self.destination_starts,
-            lengths=self.lengths,
-            destination_name=self.destination_name,
-            buffer_offset=offset,
-        )
+        """Return a copy assigned to one packed-buffer offset."""
+        return replace(self, buffer_offset=offset)
 
     def worker_metadata(self) -> dict[str, Any]:
         """Serialize the destination half of this copy for a worker RPC."""
         return {
             "name": self.target_name,
+            "canonical_name": self.name,
+            "canonical_starts": list(self.logical_starts),
             "dtype_name": self.dtype_name,
             "element_size": self.element_size,
+            "destination_dtype_name": self.destination_dtype_name or self.dtype_name,
+            "destination_element_size": (
+                self.destination_element_size or self.element_size
+            ),
             "destination_starts": list(self.destination_starts),
+            "destination_lengths": list(self.destination_lengths),
+            "destination_permutation": list(self.physical_permutation),
             "lengths": list(self.lengths),
             "buffer_offset": self.buffer_offset,
             "num_bytes": self.num_bytes,
@@ -297,7 +340,10 @@ def resolve_source_layouts(
     layouts = []
     for name, descriptions in sorted(by_name.items()):
         descriptions = sorted(descriptions, key=lambda value: int(value["source_rank"]))
-        if len(descriptions) != len(rank_descriptions):
+        has_explicit_regions = all(
+            "region_starts" in description for description in descriptions
+        )
+        if len(descriptions) != len(rank_descriptions) and not has_explicit_regions:
             raise ValueError(
                 f"Direct reshard source tensor {name!r} is missing on an FSDP rank"
             )
@@ -367,6 +413,14 @@ def resolve_source_layouts(
                     global_shape,
                     int(description["source_rank"]),
                     TensorRegion(starts, lengths),
+                    str(description.get("source_name", name)),
+                    tuple(
+                        int(value)
+                        for value in description.get(
+                            "source_starts",
+                            [0] * len(global_shape),
+                        )
+                    ),
                 )
                 for (starts, lengths), description in unique_regions.items()
             )
@@ -432,6 +486,46 @@ def resolve_source_layouts(
     return tuple(layouts)
 
 
+def _destination_shard_offsets(
+    name: str, tensors: list[Mapping[str, Any]], global_shape: tuple[int, ...],
+) -> list[int]:
+    """Resolve parameter-specific shard groups within flattened physical targets."""
+    size = int(tensors[0].get("shard_group_size", len(tensors)))
+    if size <= 0 or len(tensors) % size:
+        raise ValueError(f"Invalid destination shard group size for {name!r}: {size}")
+    widths = {}
+    replicas = {}
+    coordinates = []
+    for target, tensor in enumerate(tensors):
+        if tensor["placement"] != "shard" or tensor.get("shard_dim") != tensors[0].get("shard_dim"):
+            raise ValueError(f"Rollout parameter {name!r} layout differs across TP workers")
+        if ("shard_rank" in tensor) != ("shard_group_size" in tensor):
+            raise ValueError(f"Incomplete destination shard coordinates for {name!r}")
+        rank = int(tensor.get("shard_rank", target))
+        if int(tensor.get("shard_group_size", len(tensors))) != size or not 0 <= rank < size:
+            raise ValueError(f"Invalid destination shard rank/group for {name!r}")
+        shape = tuple(int(value) for value in tensor["local_shape"])
+        dim = tensor.get("shard_dim")
+        if dim is None or not 0 <= int(dim) < len(global_shape) or len(shape) != len(global_shape):
+            raise ValueError(f"Invalid destination shard dimension/shape for {name!r}")
+        width = shape[int(dim)]
+        if width <= 0 or (rank in widths and widths[rank] != width):
+            raise ValueError(f"Destination shard replicas disagree on shape for {name!r}")
+        widths[rank] = width
+        replicas[rank] = replicas.get(rank, 0) + 1
+        coordinates.append(rank)
+    if set(widths) != set(range(size)) or set(replicas.values()) != {len(tensors) // size}:
+        raise ValueError(f"Destination shards do not cover every replica for {name!r}")
+    offsets = {}
+    offset = 0
+    for rank in range(size):
+        offsets[rank] = offset
+        offset += widths[rank]
+    if offset != global_shape[int(tensors[0]["shard_dim"])]:
+        raise ValueError(f"Rollout parameter {name!r} TP shards cover {offset} values, expected {global_shape}")
+    return [offsets[rank] for rank in coordinates]
+
+
 def resolve_destination_layouts(
     worker_descriptions: Sequence[Mapping[str, Any]],
     global_shapes: Mapping[str, tuple[int, ...]],
@@ -464,9 +558,27 @@ def resolve_destination_layouts(
         placement = str(first["placement"])
         shard_dim = first.get("shard_dim")
         destination_name = str(first.get("destination_name", name))
+        destination_permutation = tuple(
+            int(value)
+            for value in first.get(
+                "destination_permutation",
+                range(len(global_shape)),
+            )
+        )
+        if sorted(destination_permutation) != list(range(len(global_shape))):
+            raise ValueError(
+                f"Rollout parameter {name!r} has invalid destination permutation "
+                f"{destination_permutation}"
+            )
         dtype_name = str(first["dtype_name"])
         element_size = int(first["element_size"])
-        offset = 0
+        accepted_source_dtypes = tuple(
+            str(value) for value in first.get("accepted_source_dtypes", ())
+        )
+        shard_offsets = (
+            _destination_shard_offsets(name, [tensors_by_worker[rank][name] for rank in range(tp_size)], global_shape)
+            if placement == "shard" else ()
+        )
         for tp_rank in range(tp_size):
             tensor = tensors_by_worker[tp_rank][name]
             signature = (
@@ -475,6 +587,14 @@ def resolve_destination_layouts(
                 str(tensor.get("destination_name", name)),
                 str(tensor["dtype_name"]),
                 int(tensor["element_size"]),
+                tuple(
+                    int(value)
+                    for value in tensor.get(
+                        "destination_permutation",
+                        range(len(global_shape)),
+                    )
+                ),
+                tuple(str(value) for value in tensor.get("accepted_source_dtypes", ())),
             )
             if signature != (
                 placement,
@@ -482,6 +602,8 @@ def resolve_destination_layouts(
                 destination_name,
                 dtype_name,
                 element_size,
+                destination_permutation,
+                accepted_source_dtypes,
             ):
                 raise ValueError(
                     f"Rollout parameter {name!r} layout differs across TP workers"
@@ -504,9 +626,8 @@ def resolve_destination_layouts(
                             f"Rollout parameter {name!r} changes non-sharded dim {dim}"
                         )
                 starts_list = [0] * len(global_shape)
-                starts_list[shard_dim] = offset
+                starts_list[shard_dim] = shard_offsets[tp_rank]
                 starts = tuple(starts_list)
-                offset += local_shape[shard_dim]
             else:
                 raise ValueError(
                     f"Unsupported rollout placement {placement!r} for parameter {name!r}"
@@ -536,20 +657,18 @@ def resolve_destination_layouts(
                     TensorRegion(starts, local_shape),
                     destination_name,
                     destination_starts,
+                    destination_permutation,
+                    accepted_source_dtypes,
                 )
-            )
-        if placement == "shard" and offset != global_shape[int(shard_dim)]:
-            raise ValueError(
-                f"Rollout parameter {name!r} TP shards cover {offset} values, "
-                f"expected {global_shape[int(shard_dim)]}"
             )
     return tuple(layouts)
 
 
-def _intersect(
+def intersect_regions(
     source: TensorRegion,
     destination: TensorRegion,
 ) -> Optional[TensorRegion]:
+    """Return the overlap between two tensor regions, if any."""
     starts = tuple(max(left, right) for left, right in zip(source.starts, destination.starts))
     ends = tuple(min(left, right) for left, right in zip(source.ends, destination.ends))
     lengths = tuple(end - start for start, end in zip(starts, ends))
@@ -558,75 +677,74 @@ def _intersect(
     return TensorRegion(starts, lengths)
 
 
-def _aligned_offset(offset: int, alignment: int) -> int:
+def aligned_offset(offset: int, alignment: int) -> int:
+    """Round one byte offset up to the requested alignment."""
     return ((offset + alignment - 1) // alignment) * alignment
 
 
-def _bucketize(entries: Iterable[TransferEntry], bucket_size_bytes: int) -> tuple[TransferBucket, ...]:
-    buckets = []
-    current = []
-    current_size = 0
+def tile_region(region: TensorRegion, *, element_size: int, bucket_size_bytes: int) -> tuple[TensorRegion, ...]:
+    """Tile a rectangle in canonical order, independently of gather/direct routing."""
+    max_numel = bucket_size_bytes // element_size
+    if max_numel <= 0:
+        raise ValueError("Weight-sync bucket is smaller than one tensor element")
+    if region.numel <= max_numel:
+        return (region,)
+    chunks = [1] * len(region.lengths)
+    remaining = max_numel
+    for dim in reversed(range(len(chunks))):
+        chunks[dim] = min(region.lengths[dim], max(1, remaining))
+        remaining = max(1, remaining // chunks[dim])
+    ranges = [range(0, length, chunk) for length, chunk in zip(region.lengths, chunks)]
+    return tuple(
+        TensorRegion(
+            tuple(start + offset for start, offset in zip(region.starts, offsets)),
+            tuple(min(chunk, length - offset) for offset, chunk, length in zip(offsets, chunks, region.lengths)),
+        )
+        for offsets in product(*ranges)
+    )
+
+
+def bucketize_entries(entries: Iterable[Any], bucket_size_bytes: int) -> tuple[tuple[tuple[Any, ...], int], ...]:
+    """Assign aligned byte offsets to already bounded direct or gather entries."""
+    buckets, current = [], []
+    size = 0
     for entry in entries:
-        offset = _aligned_offset(current_size, entry.element_size)
+        if entry.num_bytes > bucket_size_bytes:
+            raise ValueError(f"Weight-sync fragment {entry.name!r} exceeds its bucket")
+        offset = aligned_offset(size, entry.element_size)
         if current and offset + entry.num_bytes > bucket_size_bytes:
-            buckets.append(TransferBucket(tuple(current), current_size))
-            current = []
-            current_size = 0
-            offset = 0
-        assigned = entry.with_buffer_offset(offset)
-        current.append(assigned)
-        current_size = offset + assigned.num_bytes
+            buckets.append((tuple(current), size))
+            current, offset = [], 0
+        current.append(entry.with_buffer_offset(offset))
+        size = offset + entry.num_bytes
     if current:
-        buckets.append(TransferBucket(tuple(current), current_size))
+        buckets.append((tuple(current), size))
     return tuple(buckets)
 
 
-def _split_entry(
-    entry: TransferEntry,
-    bucket_size_bytes: int,
-) -> tuple[TransferEntry, ...]:
-    """Tile one large rectangular copy so every fragment fits one bucket."""
-    max_numel = bucket_size_bytes // entry.element_size
-    if max_numel <= 0:
-        raise ValueError(
-            "Direct reshard bucket is smaller than one tensor element: "
-            f"bucket={bucket_size_bytes}, element_size={entry.element_size}"
-        )
-    if entry.numel <= max_numel:
+def _bucketize(entries: Iterable[TransferEntry], bucket_size_bytes: int) -> tuple[TransferBucket, ...]:
+    return tuple(TransferBucket(items, size) for items, size in bucketize_entries(entries, bucket_size_bytes))
+
+
+def _split_entry(entry: TransferEntry, bucket_size_bytes: int) -> tuple[TransferEntry, ...]:
+    """Apply shared canonical tiles to the source and permuted destination."""
+    region = TensorRegion((0,) * len(entry.lengths), entry.lengths)
+    tiles = tile_region(region, element_size=entry.element_size, bucket_size_bytes=bucket_size_bytes)
+    if tiles == (region,):
         return (entry,)
-    chunk_lengths = [1] * len(entry.lengths)
-    remaining = max_numel
-    for dim in reversed(range(len(entry.lengths))):
-        chunk_lengths[dim] = min(entry.lengths[dim], max(1, remaining))
-        remaining = max(1, remaining // chunk_lengths[dim])
-    ranges = [range(0, length, chunk) for length, chunk in zip(entry.lengths, chunk_lengths)]
-    tiles = []
-    for offsets in product(*ranges):
-        lengths = tuple(
-            min(chunk, full_length - offset)
-            for offset, chunk, full_length in zip(
-                offsets,
-                chunk_lengths,
-                entry.lengths,
-            )
+    return tuple(
+        replace(
+            entry,
+            source_starts=tuple(start + offset for start, offset in zip(entry.source_starts, tile.starts)),
+            destination_starts=tuple(
+                start + tile.starts[axis] for start, axis in zip(entry.destination_starts, entry.physical_permutation)
+            ),
+            canonical_starts=tuple(start + offset for start, offset in zip(entry.logical_starts, tile.starts)),
+            lengths=tile.lengths,
+            buffer_offset=0,
         )
-        tiles.append(
-            TransferEntry(
-                name=entry.name,
-                dtype_name=entry.dtype_name,
-                element_size=entry.element_size,
-                source_starts=tuple(
-                    start + offset for start, offset in zip(entry.source_starts, offsets)
-                ),
-                destination_starts=tuple(
-                    start + offset
-                    for start, offset in zip(entry.destination_starts, offsets)
-                ),
-                lengths=lengths,
-                destination_name=entry.destination_name,
-            )
-        )
-    return tuple(tiles)
+        for tile in tiles
+    )
 
 
 def build_direct_reshard_plan(
@@ -656,28 +774,39 @@ def build_direct_reshard_plan(
     for name in sorted(sources_by_name):
         for source in sources_by_name[name]:
             for destination in destinations_by_name[name]:
-                if (
-                    source.global_shape != destination.global_shape
-                    or source.dtype_name != destination.dtype_name
-                    or source.element_size != destination.element_size
-                ):
+                dtype_compatible = (
+                    source.dtype_name == destination.dtype_name
+                    and source.element_size == destination.element_size
+                ) or source.dtype_name in destination.accepted_source_dtypes
+                if source.global_shape != destination.global_shape or not dtype_compatible:
                     raise ValueError(
                         f"Direct reshard tensor contract mismatch for {name!r}: "
                         f"source={(source.global_shape, source.dtype_name)}, "
                         f"destination={(destination.global_shape, destination.dtype_name)}"
                     )
-                intersection = _intersect(source.region, destination.region)
+                intersection = intersect_regions(source.region, destination.region)
                 if intersection is None:
                     continue
                 source_starts = tuple(
-                    start - base for start, base in zip(intersection.starts, source.region.starts)
-                )
-                destination_starts = tuple(
                     local_start + start - base
                     for local_start, start, base in zip(
-                        destination.local_starts,
+                        source.local_starts,
+                        intersection.starts,
+                        source.region.starts,
+                    )
+                )
+                canonical_destination_offsets = tuple(
+                    start - base
+                    for start, base in zip(
                         intersection.starts,
                         destination.region.starts,
+                    )
+                )
+                destination_starts = tuple(
+                    local_start + canonical_destination_offsets[axis]
+                    for local_start, axis in zip(
+                        destination.local_starts,
+                        destination.physical_permutation,
                     )
                 )
                 entry = TransferEntry(
@@ -688,6 +817,11 @@ def build_direct_reshard_plan(
                     destination_starts=destination_starts,
                     lengths=intersection.lengths,
                     destination_name=destination.target_name,
+                    source_name=source.source_key,
+                    canonical_starts=intersection.starts,
+                    destination_permutation=destination.physical_permutation,
+                    destination_dtype_name=destination.dtype_name,
+                    destination_element_size=destination.element_size,
                 )
                 route_entries.setdefault((source.source_rank, destination.tp_rank), []).append(entry)
                 coverage[(name, destination.tp_rank)] = (
@@ -731,7 +865,9 @@ __all__ = [
     "TransferBucket",
     "TransferEntry",
     "build_direct_reshard_plan",
+    "aligned_offset",
     "describe_source_tensor",
+    "intersect_regions",
     "resolve_destination_layouts",
     "resolve_physical_worker_topology",
     "resolve_source_layouts",

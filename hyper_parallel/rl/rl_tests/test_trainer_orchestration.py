@@ -57,6 +57,10 @@ def test_training_metrics_expose_effective_weight_sync_strategy(
         weight_sync_last_strategy="direct_reshard",
         weight_sync_fallback_count=0,
         weight_sync_direct_success_count=2,
+        weight_sync_attempted_strategies=("direct_reshard",),
+        weight_sync_completed_strategy="direct_reshard",
+        weight_sync_fallback_reason=None,
+        weight_sync_streaming_stats={"trainer_post_release_allocated_bytes": 123},
     )
     actor_update = ActorUpdateMetrics(
         total_loss=0.0,
@@ -83,6 +87,12 @@ def test_training_metrics_expose_effective_weight_sync_strategy(
     assert metrics["weight_sync/last_full_gather"] == 0.0
     assert metrics["weight_sync/fallback_count"] == 0.0
     assert metrics["weight_sync/direct_success_count"] == 2.0
+    assert metrics["weight_sync/attempted_direct_reshard"] == 1.0
+    assert metrics["weight_sync/attempted_full_gather"] == 0.0
+    assert metrics["weight_sync/completed_direct_reshard"] == 1.0
+    assert metrics["weight_sync/completed_full_gather"] == 0.0
+    assert metrics["weight_sync/fallback_reason_present"] == 0.0
+    assert metrics["weight_sync/streaming_trainer_post_release_allocated_bytes"] == 123.0
 
 
 def test_batch_invariant_rollout_aligns_hccl_before_distributed_init(
@@ -438,7 +448,7 @@ def test_publish_policy_releases_training_memory_before_vllm_weight_wake(
         prepare_for_rollout=lambda: calls.append("prepare_for_rollout"),
     )
 
-    trainer._publish_policy(2, SimpleNamespace(optimizer_steps=2))
+    trainer._publish_policy(2)
 
     assert calls == [
         "reshard",

@@ -34,6 +34,8 @@ visible_devices=${HYPER_QWEN3_VISIBLE_DEVICES-0,1}
 tensor_parallel_size=${HYPER_QWEN3_TP:-1}
 weight_sync_strategy=${HYPER_QWEN3_WEIGHT_SYNC_STRATEGY:-full_gather}
 weight_sync_fallback=${HYPER_QWEN3_WEIGHT_SYNC_FALLBACK:-none}
+weight_sync_bucket_mb=${HYPER_QWEN3_WEIGHT_SYNC_BUCKET_MB:-128}
+weight_sync_test_fault=${HYPER_QWEN3_TEST_WEIGHT_SYNC_FAULT:-none}
 trainer_count_override=${HYPER_QWEN3_TRAINER_COUNT:-}
 rollout_dp_override=${HYPER_QWEN3_ROLLOUT_DP:-}
 default_learning_rate=0
@@ -48,11 +50,14 @@ timeout_seconds=${HYPER_QWEN3_TIMEOUT_SECONDS:-3600}
 max_steps=${HYPER_QWEN3_MAX_STEPS:-2}
 learning_rate=${HYPER_QWEN3_LEARNING_RATE:-${default_learning_rate}}
 learning_gate_enabled=${HYPER_QWEN3_LEARNING_GATE_ENABLED:-false}
+disable_prompt_instruction=${HYPER_QWEN3_DISABLE_PROMPT_INSTRUCTION:-false}
 default_log_name=qwen3-tp${tensor_parallel_size}-consistency.log
 if [[ "${deployment}" == "disjoint" ]]; then
     default_log_name=qwen3-disjoint-tp${tensor_parallel_size}-consistency.log
 fi
 log_name=${HYPER_QWEN3_LOG_NAME:-${default_log_name}}
+default_oracle_run_id=qwen3-${deployment}-tp${tensor_parallel_size}-${weight_sync_strategy}
+oracle_run_id=${HYPER_QWEN3_ORACLE_RUN_ID:-${default_oracle_run_id}}
 prompt_batch_size=${HYPER_QWEN3_PROMPT_BATCH_SIZE:-${default_prompt_batch_size}}
 max_new_tokens=${HYPER_QWEN3_MAX_NEW_TOKENS:-32}
 num_return_sequences=${HYPER_QWEN3_NUM_RETURN_SEQUENCES:-4}
@@ -112,6 +117,24 @@ device_count=${#device_ids[@]}
     printf 'HYPER_QWEN3_WEIGHT_SYNC_FALLBACK must be none or full_gather\n' >&2
     exit 1
 }
+[[ "${weight_sync_bucket_mb}" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'HYPER_QWEN3_WEIGHT_SYNC_BUCKET_MB must be a positive integer\n' >&2
+    exit 1
+}
+case "${weight_sync_test_fault}" in
+    none|direct_receive_once|streaming_bucket_once|direct_receive_once,streaming_bucket_once) ;;
+    *)
+        printf 'HYPER_QWEN3_TEST_WEIGHT_SYNC_FAULT has unsupported value: %s\n' \
+            "${weight_sync_test_fault}" >&2
+        exit 1
+        ;;
+esac
+if [[ "${weight_sync_test_fault}" != "none" &&
+      ("${weight_sync_strategy}" != "direct_reshard" ||
+       "${weight_sync_fallback}" != "full_gather") ]]; then
+    printf 'weight-sync fault injection requires direct_reshard with full_gather fallback\n' >&2
+    exit 1
+fi
 [[ -z "${trainer_count_override}" || "${trainer_count_override}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'HYPER_QWEN3_TRAINER_COUNT must be a positive integer\n' >&2
     exit 1
@@ -139,6 +162,11 @@ fi
 [[ "${learning_gate_enabled}" == "true" || "${learning_gate_enabled}" == "false" ]] || {
     printf 'HYPER_QWEN3_LEARNING_GATE_ENABLED must be true or false, got: %s\n' \
         "${learning_gate_enabled}" >&2
+    exit 1
+}
+[[ "${disable_prompt_instruction}" == "true" || "${disable_prompt_instruction}" == "false" ]] || {
+    printf 'HYPER_QWEN3_DISABLE_PROMPT_INSTRUCTION must be true or false, got: %s\n' \
+        "${disable_prompt_instruction}" >&2
     exit 1
 }
 [[ "${prompt_batch_size}" =~ ^[1-9][0-9]*$ ]] || {
@@ -264,6 +292,8 @@ printf '%s\n' \
     "rollout_data_parallel_size=${rollout_data_parallel_size}" \
     "weight_sync_strategy=${weight_sync_strategy}" \
     "weight_sync_fallback=${weight_sync_fallback}" \
+    "weight_sync_bucket_mb=${weight_sync_bucket_mb}" \
+    "weight_sync_test_fault=${weight_sync_test_fault}" \
     "rollout_port=${rollout_port}" \
     "api_server_count=auto" \
     "prompt_batch_size=${prompt_batch_size}" \
@@ -276,6 +306,8 @@ printf '%s\n' \
     "max_steps=${max_steps}" \
     "learning_rate=${learning_rate}" \
     "learning_gate_enabled=${learning_gate_enabled}" \
+    "disable_prompt_instruction=${disable_prompt_instruction}" \
+    "oracle_run_id=${oracle_run_id}" \
     "max_num_batched_tokens=2048" \
     "max_num_seqs=auto" \
     "config_name=${config_name}" \
@@ -312,7 +344,10 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
     -e "HYPER_QWEN3_MAX_STEPS=${max_steps}" \
     -e "HYPER_QWEN3_LEARNING_RATE=${learning_rate}" \
     -e "HYPER_QWEN3_LEARNING_GATE_ENABLED=${learning_gate_enabled}" \
+    -e "HYPER_QWEN3_DISABLE_PROMPT_INSTRUCTION=${disable_prompt_instruction}" \
     -e "HYPER_QWEN3_LOG_NAME=${log_name}" \
+    -e "HYPER_RL_WEIGHT_MANIFEST_DIR=/results/weight-manifests" \
+    -e "HYPER_RL_WEIGHT_ORACLE_RUN_ID=${oracle_run_id}" \
     -e "HYPER_QWEN3_DEPLOYMENT=${deployment}" \
     -e "HYPER_QWEN3_TRAINER_COUNT=${trainer_count}" \
     -e "HYPER_QWEN3_ROLLOUT_VISIBLE_DEVICES=${rollout_visible}" \
@@ -320,6 +355,8 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
     -e "HYPER_QWEN3_TENSOR_PARALLEL_SIZE=${tensor_parallel_size}" \
     -e "HYPER_QWEN3_WEIGHT_SYNC_STRATEGY=${weight_sync_strategy}" \
     -e "HYPER_QWEN3_WEIGHT_SYNC_FALLBACK=${weight_sync_fallback}" \
+    -e "HYPER_QWEN3_WEIGHT_SYNC_BUCKET_MB=${weight_sync_bucket_mb}" \
+    -e "HYPER_RL_TEST_WEIGHT_SYNC_FAULT=${weight_sync_test_fault}" \
     -e "HYPER_QWEN3_ROLLOUT_DATA_PARALLEL_SIZE=${rollout_data_parallel_size}" \
     -e "HYPER_QWEN3_ROLLOUT_PORT=${rollout_port}" \
     -e "HYPER_QWEN3_PROMPT_BATCH_SIZE=${prompt_batch_size}" \
@@ -362,6 +399,7 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
             --rollout.vllm.tensor_parallel_size="${HYPER_QWEN3_TENSOR_PARALLEL_SIZE}"
             --rollout.vllm.weight_sync.strategy="${HYPER_QWEN3_WEIGHT_SYNC_STRATEGY}"
             --rollout.vllm.weight_sync.fallback_strategy="${HYPER_QWEN3_WEIGHT_SYNC_FALLBACK}"
+            --rollout.vllm.weight_sync.bucket_size_mb="${HYPER_QWEN3_WEIGHT_SYNC_BUCKET_MB}"
             --rollout.vllm.port="${HYPER_QWEN3_ROLLOUT_PORT}"
             --data.max_train_samples="${HYPER_QWEN3_MAX_TRAIN_SAMPLES}"
             --data.shuffle=false
@@ -382,6 +420,9 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
             rollout_args+=(
                 --rollout.vllm.visible_devices="${HYPER_QWEN3_ROLLOUT_VISIBLE_DEVICES}"
             )
+        fi
+        if [[ "${HYPER_QWEN3_DISABLE_PROMPT_INSTRUCTION}" == "true" ]]; then
+            rollout_args+=(--data.prompt_instruction=null)
         fi
         {
             printf "resolved_world_size=%s resolved_prompt_batch_size=%s resolved_global_prompts=%s\n" \

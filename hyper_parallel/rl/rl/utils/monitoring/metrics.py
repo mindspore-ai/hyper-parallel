@@ -190,6 +190,15 @@ def build_training_metrics(
             None,
         )
         last_strategy = getattr(policy, "weight_sync_last_strategy", None)
+        attempted_strategies = set(
+            getattr(policy, "weight_sync_attempted_strategies", ())
+        )
+        completed_strategy = getattr(
+            policy,
+            "weight_sync_completed_strategy",
+            None,
+        )
+        fallback_reason = getattr(policy, "weight_sync_fallback_reason", None)
         metrics.update(
             {
                 "weight_sync/configured_direct_reshard": float(
@@ -210,8 +219,31 @@ def build_training_metrics(
                 "weight_sync/direct_success_count": float(
                     getattr(policy, "weight_sync_direct_success_count", 0)
                 ),
+                "weight_sync/attempted_direct_reshard": float(
+                    "direct_reshard" in attempted_strategies
+                ),
+                "weight_sync/attempted_full_gather": float(
+                    "full_gather" in attempted_strategies
+                ),
+                "weight_sync/completed_direct_reshard": float(
+                    completed_strategy == "direct_reshard"
+                ),
+                "weight_sync/completed_full_gather": float(
+                    completed_strategy == "full_gather"
+                ),
+                "weight_sync/fallback_reason_present": float(
+                    fallback_reason is not None
+                ),
             }
         )
+        streaming_stats = getattr(policy, "weight_sync_streaming_stats", None)
+        if streaming_stats:
+            metrics.update(
+                {
+                    f"weight_sync/streaming_{name}": float(value)
+                    for name, value in streaming_stats.items()
+                }
+            )
     return metrics
 
 

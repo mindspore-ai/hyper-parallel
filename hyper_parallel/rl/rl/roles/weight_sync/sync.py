@@ -13,11 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Actor-to-rollout policy publication and synchronization lifecycle."""
-import base64
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from hashlib import sha256
 import json
-import pickle
 from typing import Any, Callable, Mapping, Optional
 from urllib import parse as urllib_parse
 from hyper_parallel import get_platform
@@ -32,7 +30,6 @@ class PolicySnapshot:
     version: int
     model_name: str
     payload: Any
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.version < 0:
@@ -254,20 +251,6 @@ class VLLMWeightSyncClientMixin:
             self._request("GET", "get_world_size", base_url=base_url)["world_size"]
         )
 
-    def init_weight_transfer(
-        self,
-        init_info: Mapping[str, Any],
-        base_url: Optional[str] = None,
-    ) -> None:
-        """Initialize the server side of the stateless HCCL transfer group."""
-        self._request(
-            "POST",
-            "init_weight_transfer_engine",
-            {"init_info": dict(init_info)},
-            timeout=180,
-            base_url=base_url,
-        )
-
     def pause(self) -> None:
         """Pause generation and invalidate request caches before transfer."""
         status = self._request("POST", "pause?mode=abort&clear_cache=true").get("status")
@@ -303,44 +286,6 @@ class VLLMWeightSyncClientMixin:
         """Start loading checkpoint-format Actor weights."""
         self._request("POST", "start_weight_update", {"is_checkpoint_format": True})
 
-    def receive_weights(
-        self,
-        update_info: Mapping[str, Any],
-        policy_version: int,
-        base_url: Optional[str] = None,
-    ) -> None:
-        """Block until the server receives all HCCL weight buffers."""
-        versioned_update = dict(update_info)
-        versioned_update["_hyper_policy_version"] = policy_version
-        self._request(
-            "POST",
-            "update_weights",
-            {"update_info": versioned_update},
-            timeout=600,
-            base_url=base_url,
-        )
-
-    def receive_ipc_weights(
-        self,
-        base_url: str,
-        update_info: Any,
-        policy_version: int,
-    ) -> None:
-        """Send one merged NPU IPC handle set to a rollout replica."""
-        update_fields = asdict(update_info)
-        ipc_handles = update_fields.pop("ipc_handles")
-        update_fields["ipc_handles_pickled"] = base64.b64encode(
-            pickle.dumps(ipc_handles)
-        ).decode("ascii")
-        update_fields["_hyper_policy_version"] = policy_version
-        self._request(
-            "POST",
-            "update_weights",
-            {"update_info": update_fields},
-            timeout=600,
-            base_url=base_url,
-        )
-
     def finish_weight_update(self) -> None:
         """Commit one completed Actor-to-rollout weight transfer."""
         self._request("POST", "finish_weight_update")
@@ -363,40 +308,15 @@ class VLLMWeightSyncClientMixin:
             raise RuntimeError("vLLM collective RPC returned invalid worker results")
         return results
 
-    def reset_prefix_cache(
-        self,
-        *,
-        reset_running_requests: bool,
-        reset_connector: bool,
-    ) -> bool:
-        """Invalidate cached prefixes after loading a new policy."""
-        query = urllib_parse.urlencode(
-            {
-                "reset_running_requests": str(reset_running_requests).lower(),
-                "reset_external": str(reset_connector).lower(),
-            }
-        )
-        self._request("POST", f"reset_prefix_cache?{query}")
-        return True
-
     def get_policy_weight_fingerprints(
         self,
         base_url: Optional[str] = None,
     ) -> list[Mapping[str, Any]]:
         """Return one post-transfer fingerprint per vLLM worker."""
-        if base_url is None:
-            results = self.collective_rpc("get_policy_weight_fingerprint")
-        else:
-            response = self._request(
-                "POST",
-                "collective_rpc",
-                {
-                    "method": "get_policy_weight_fingerprint",
-                    "kwargs": {},
-                },
-                base_url=base_url,
-            )
-            results = response.get("results")
+        results = self.collective_rpc(
+            "get_policy_weight_fingerprint",
+            base_url=base_url,
+        )
         if not isinstance(results, list) or not all(
             isinstance(result, Mapping) for result in results
         ):
@@ -414,6 +334,23 @@ class VLLMWeightSyncClientMixin:
             {
                 "expected_version": int(expected_version),
                 "expected_fingerprint": dict(expected_fingerprint),
+            },
+        )
+
+    def verify_direct_content_identity(
+        self,
+        expected_version: int,
+        expected_by_tp_rank: Mapping[int, Mapping[str, Any]],
+    ) -> None:
+        """Require every worker to match its source-derived direct content."""
+        self.collective_rpc(
+            "verify_direct_content_identity",
+            {
+                "expected_version": int(expected_version),
+                "expected_by_tp_rank": {
+                    str(tp_rank): dict(identity)
+                    for tp_rank, identity in expected_by_tp_rank.items()
+                },
             },
         )
 
@@ -483,6 +420,29 @@ class ActorRolloutWeightSync:
         return int(getattr(self._weight_transfer, "direct_success_count", 0))
 
     @property
+    def attempted_strategies(self) -> tuple[str, ...]:
+        """Return strategies attempted by the latest publication."""
+        return tuple(
+            getattr(self._weight_transfer, "last_attempted_strategies", ())
+        )
+
+    @property
+    def completed_strategy(self) -> Optional[str]:
+        """Return the strategy that completed the latest publication."""
+        return getattr(self._weight_transfer, "last_completed_strategy", None)
+
+    @property
+    def fallback_reason(self) -> Optional[str]:
+        """Return the primary failure that triggered the latest fallback."""
+        return getattr(self._weight_transfer, "last_fallback_reason", None)
+
+    @property
+    def streaming_stats(self) -> Optional[Mapping[str, Any]]:
+        """Return bounded streaming counters from the latest publication."""
+        stats = getattr(self._weight_transfer, "last_streaming_stats", None)
+        return None if stats is None else dict(stats)
+
+    @property
     def phase(self) -> str:
         """Return the current residency and publication phase."""
         return self._phase
@@ -540,12 +500,10 @@ class ActorRolloutWeightSync:
 
     @staticmethod
     def _server_owner_call(
-        client: Any,
         operation: str,
         callback: Callable[[], Any],
     ) -> Any:
         """Run one mutating server operation exactly once on the coordinator."""
-        del client
         return coordinator_call(operation, callback)
 
     def prepare_for_training(self) -> None:
@@ -565,7 +523,6 @@ class ActorRolloutWeightSync:
             self._policy_identity = dict(identity)
             self._policy_fingerprint = str(identity["digest"])
         self._server_owner_call(
-            client,
             "sleep before training",
             lambda: client.sleep(level=1, mode="wait"),
         )
@@ -625,14 +582,12 @@ class ActorRolloutWeightSync:
         if transactional_client:
             try:
                 self._server_owner_call(
-                    client,
                     "resume rollout admission",
                     client.resume,
                 )
             except Exception as resume_error:
                 try:
                     self._server_owner_call(
-                        client,
                         "compensating rollout pause",
                         client.pause,
                     )
@@ -662,13 +617,11 @@ class ActorRolloutWeightSync:
         is_refit = self._phase == "refit"
         tags = ("kv_cache",) if is_refit else ("weights", "kv_cache")
         self._server_owner_call(
-            client,
             "wake before rollout",
             lambda: client.wake_up(tags),
         )
         if is_refit:
             self._server_owner_call(
-                client,
                 "post-refit cache reset",
                 client.pause,
             )
@@ -694,7 +647,6 @@ class ActorRolloutWeightSync:
             self._control_call("pending rollout identity", verify_pending_identity)
         try:
             self._server_owner_call(
-                client,
                 "resume rollout admission",
                 client.resume,
             )
@@ -706,7 +658,6 @@ class ActorRolloutWeightSync:
         except Exception as resume_error:
             try:
                 self._server_owner_call(
-                    client,
                     "compensating rollout pause",
                     client.pause,
                 )

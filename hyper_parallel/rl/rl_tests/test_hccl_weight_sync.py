@@ -30,7 +30,6 @@ from rl.roles.weight_sync.layout import (
     TransferBucket,
     TransferEntry,
 )
-from rl.roles.weight_sync.transfer import FullGatherHCCLWeightTransfer
 
 
 def test_direct_reshard_uses_one_shared_rpc_for_all_dp_receivers(
@@ -74,6 +73,7 @@ def test_direct_reshard_uses_one_shared_rpc_for_all_dp_receivers(
         device = torch.device("cpu")
 
         def __init__(self) -> None:
+            """Initialize FakeGroup state."""
             self.buffers: list[torch.Tensor] = []
 
         def broadcast(self, tensor: torch.Tensor, src: int) -> None:
@@ -85,6 +85,7 @@ def test_direct_reshard_uses_one_shared_rpc_for_all_dp_receivers(
         """Return one visible ACK for a worker-local all-engine operation."""
 
         def __init__(self) -> None:
+            """Initialize FakeDirectClient state."""
             self.calls: list[tuple[str, Mapping[str, Any], str]] = []
 
         def collective_rpc(
@@ -136,6 +137,7 @@ def test_direct_reshard_uses_one_shared_rpc_for_all_dp_receivers(
     transport._group_ids[(0, 0)] = "route"  # pylint: disable=protected-access
     client = FakeDirectClient()
     monkeypatch.setattr(hccl_module, "platform", FakePlatform())
+    monkeypatch.setattr(hccl_module, "_open_port", lambda: 12345)
 
     sent_bytes, fragment_bytes = transport._broadcast_route(  # pylint: disable=protected-access
         client,
@@ -158,6 +160,90 @@ def test_direct_reshard_uses_one_shared_rpc_for_all_dp_receivers(
     )
 
 
+def test_streaming_full_gather_broadcasts_one_ordered_bucket_to_each_dp_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One HCCL payload is ACKed by every DP worker at the selected TP rank."""
+
+    class FakePlatform:
+        """Represent rank zero of a one-process Trainer group."""
+
+        @staticmethod
+        def get_rank() -> int:
+            """Provide the get rank fixture for this regression."""
+            return 0
+
+        @staticmethod
+        def get_world_size() -> int:
+            """Provide the get world size fixture for this regression."""
+            return 1
+
+        @staticmethod
+        def all_gather_object(output: list[Any], value: Any) -> None:
+            """Provide the all gather object fixture for this regression."""
+            output[0] = value
+
+        @staticmethod
+        def get_current_stream() -> Any:
+            """Provide the get current stream fixture for this regression."""
+            return SimpleNamespace(synchronize=lambda: None)
+
+    class FakeGroup:
+        """Capture the one bounded byte tensor broadcast by Trainer rank zero."""
+
+        def __init__(self) -> None:
+            """Initialize FakeGroup state."""
+            self.values = []
+
+        def broadcast(self, tensor: torch.Tensor, src: int) -> None:
+            """Simulate the tensor broadcast used by this test."""
+            assert src == 0
+            self.values.append(tensor.clone())
+
+    class FakeClient:
+        """Return ACKs from DP2 x TP2 in deterministic worker order."""
+
+        @staticmethod
+        def collective_rpc(method: Any, kwargs: Any, base_url: Any) -> Any:
+            """Provide the fixture response for a collective RPC."""
+            assert method == "receive_direct_reshard"
+            assert base_url == "http://shared"
+            assert kwargs["buckets"][0]["total_bytes"] == 8
+            target = int(kwargs["target_tp_rank"])
+            return [
+                {
+                    "received": True,
+                    "dp_rank": 0,
+                    "tp_rank": target,
+                    "bytes": 8,
+                }
+            ]
+
+    monkeypatch.setattr(hccl_module, "platform", FakePlatform())
+    transport = BroadcastDirectReshardHCCLTransport(
+        data_parallel_size=2,
+        tensor_parallel_size=2,
+    )
+    group = FakeGroup()
+    transport._groups[(0, 1)] = group  # pylint: disable=protected-access
+    transport._group_ids[(0, 1)] = "streaming-tp1"  # pylint: disable=protected-access
+    packed = torch.arange(8, dtype=torch.uint8)
+
+    worker_count = transport.broadcast_streaming_bucket(
+        FakeClient(),
+        "http://shared",
+        packed,
+        {"target_tp_rank": 1, "total_bytes": 8, "entries": []},
+        target_tp_rank=1,
+        bucket_index=3,
+        policy_version=2,
+    )
+
+    assert worker_count == 2
+    assert len(group.values) == 1
+    assert torch.equal(group.values[0], packed)
+
+
 def test_direct_route_runs_coordinator_rpc_concurrently_with_nonzero_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -167,6 +253,7 @@ def test_direct_route_runs_coordinator_rpc_concurrently_with_nonzero_source(
         """Provide deterministic two-rank object collectives to two threads."""
 
         def __init__(self) -> None:
+            """Initialize FakePlatform state."""
             self.local = threading.local()
             self.barrier = threading.Barrier(2)
             self.values: dict[tuple[int, int], Any] = {}
@@ -216,7 +303,8 @@ def test_direct_route_runs_coordinator_rpc_concurrently_with_nonzero_source(
 
         calls = 0
 
-        def collective_rpc(self, method, kwargs, base_url):
+        def collective_rpc(self, method: Any, kwargs: Any, base_url: Any) -> Any:
+            """Provide the fixture response for a collective RPC."""
             assert method == "receive_direct_reshard"
             assert base_url == "http://shared"
             self.calls += 1
@@ -238,6 +326,7 @@ def test_direct_route_runs_coordinator_rpc_concurrently_with_nonzero_source(
 
         @staticmethod
         def broadcast(_tensor: torch.Tensor, src: int) -> None:
+            """Simulate the tensor broadcast used by this test."""
             assert src == 0
             assert rpc_started.wait(timeout=5)
             broadcast_completed.set()
@@ -263,6 +352,7 @@ def test_direct_route_runs_coordinator_rpc_concurrently_with_nonzero_source(
     errors: list[Any] = [None, None]
 
     def run(rank: int) -> None:
+        """Provide the run fixture for this regression."""
         fake_platform.set_rank(rank)
         transport = BroadcastDirectReshardHCCLTransport(
             data_parallel_size=2,
@@ -325,7 +415,7 @@ def test_direct_group_initializes_one_shared_dp2_route(
         """Return one visible ACK from an all-worker collective RPC."""
 
         @staticmethod
-        def collective_rpc(method, kwargs, base_url):
+        def collective_rpc(method: Any, kwargs: Any, base_url: Any) -> Any:
             """Record and acknowledge one worker-local group initialization."""
             calls.append((method, kwargs, base_url))
             return [
@@ -338,6 +428,7 @@ def test_direct_group_initializes_one_shared_dp2_route(
             ]
 
     monkeypatch.setattr(hccl_module, "platform", FakePlatform())
+    monkeypatch.setattr(hccl_module, "_open_port", lambda: 12345)
     monkeypatch.setattr(
         BroadcastDirectReshardHCCLTransport,
         "_trainer_init",
@@ -446,142 +537,3 @@ def test_worker_direct_group_uses_dp_major_receiver_rank(
             expected_data_parallel_size=2,
             expected_tensor_parallel_size=2,
         )
-
-
-def test_full_gather_uses_one_dp2_tp2_group_and_one_update(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Full gather initializes and updates one shared 1+DP*TP HCCL group."""
-    calls = []
-    group = object()
-
-    class FakeEngine:
-        """Capture trainer group initialization and send calls."""
-
-        @staticmethod
-        def trainer_init(init_info):
-            calls.append(("trainer_init", dict(init_info)))
-            return group
-
-        @staticmethod
-        def trainer_send_weights(iterator, trainer_args):
-            calls.append(("trainer_send", list(iterator), trainer_args))
-
-    class FakeClient:
-        """Expose the shared full-gather HTTP operations."""
-
-        @staticmethod
-        def get_world_size(base_url=None):
-            assert base_url == "http://shared"
-            calls.append(("world_size", base_url))
-            return 4
-
-        @staticmethod
-        def collective_rpc(method, kwargs, base_url=None):
-            assert method == "init_full_gather_group"
-            calls.append(("server_init", dict(kwargs), base_url))
-            return [
-                {
-                    "joined": True,
-                    "dp_rank": dp_rank,
-                    "tp_rank": tp_rank,
-                    "group_rank": 1 + dp_rank * 2 + tp_rank,
-                }
-                for dp_rank in range(2)
-                for tp_rank in range(2)
-            ]
-
-        @staticmethod
-        def receive_weights(update_info, policy_version, base_url=None):
-            calls.append(("server_update", dict(update_info), policy_version, base_url))
-
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.distributed.weight_transfer.hccl_engine",
-        SimpleNamespace(
-            HCCLTrainerSendWeightsArgs=lambda **kwargs: SimpleNamespace(**kwargs),
-            HCCLWeightTransferEngine=FakeEngine,
-        ),
-    )
-    transfer = FullGatherHCCLWeightTransfer(
-        SimpleNamespace(),
-        bucket_size_bytes=16,
-        data_parallel_size=2,
-        tensor_parallel_size=2,
-    )
-
-    transfer._send_shared(  # pylint: disable=protected-access
-        FakeClient(),
-        "http://shared",
-        {"weight": torch.ones(2, dtype=torch.float32)},
-        policy_version=1,
-    )
-
-    server_init = [call for call in calls if call[0] == "server_init"]
-    server_update = [call for call in calls if call[0] == "server_update"]
-    trainer_send = [call for call in calls if call[0] == "trainer_send"]
-    assert len(server_init) == len(server_update) == len(trainer_send) == 1
-    assert server_init[0][1]["world_size"] == 5
-    assert server_init[0][1]["expected_data_parallel_size"] == 2
-    assert server_init[0][1]["expected_tensor_parallel_size"] == 2
-    assert trainer_send[0][2].group is group
-
-
-def test_worker_full_gather_uses_global_dp_major_rank(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """DP1 TP0 joins a DP2 x TP2 full-gather group as rank 3."""
-    init_calls = []
-
-    class FakeTransferEngine:
-        """Capture the worker-side stateless communicator arguments."""
-
-        model_update_group = None
-
-        @staticmethod
-        def _stateless_init_process_group(*args, **kwargs):
-            init_calls.append((args, kwargs))
-            return "group"
-
-    worker = SimpleNamespace(
-        weight_transfer_engine=FakeTransferEngine(),
-        _check_weight_transfer_engine=lambda: None,
-    )
-    monkeypatch.setattr(
-        worker_module,
-        "_rollout_worker_topology",
-        lambda _worker: {
-            "dp_rank": 1,
-            "dp_size": 2,
-            "tp_rank": 0,
-            "tp_size": 2,
-            "physical_device_id": "host-4",
-        },
-    )
-    monkeypatch.setattr(
-        worker_module.platform,
-        "get_device_handle",
-        lambda _device_type: SimpleNamespace(
-            current_device=lambda: 4,
-            synchronize=lambda: None,
-        ),
-    )
-    monkeypatch.setattr(worker_module.platform, "device_type", lambda: "npu")
-
-    result = worker_module.init_full_gather_group(
-        worker,
-        master_address="127.0.0.1",
-        master_port=12345,
-        world_size=5,
-        expected_data_parallel_size=2,
-        expected_tensor_parallel_size=2,
-    )
-
-    assert result == {
-        "joined": True,
-        "dp_rank": 1,
-        "tp_rank": 0,
-        "group_rank": 3,
-    }
-    assert init_calls[0][0][2:4] == (3, 5)
-    assert worker.weight_transfer_engine.model_update_group == "group"

@@ -32,6 +32,7 @@ from rl.roles.model import (
     resolve_vllm_model,
 )
 from rl.roles.rollout import ROLLOUT_ENGINES
+from rl.roles.weight_sync.config import resolve_weight_sync_config
 
 from hyper_parallel import get_platform
 from hyper_parallel.platform.platform import PlatformType
@@ -485,36 +486,13 @@ def _validate_vllm_weight_sync(
 ) -> None:
     """Validate full-weight DP sync and TP-aware direct-reshard recovery."""
     weight_sync = optional_mapping(vllm, "weight_sync")
-    strategy = str(weight_sync.get("strategy", "full_gather"))
-    if strategy not in ("direct_reshard", "full_gather"):
-        raise ValueError(
-            "rollout.vllm.weight_sync.strategy must be 'direct_reshard' or "
-            "'full_gather', "
-            f"got {strategy!r}"
-        )
-    fallback_strategy = str(
-        weight_sync.get(
-            "fallback_strategy",
-            "full_gather" if strategy == "direct_reshard" else "none",
-        )
-    )
-    if fallback_strategy not in ("full_gather", "none"):
-        raise ValueError(
-            "rollout.vllm.weight_sync.fallback_strategy must be 'full_gather' "
-            f"or 'none', got {fallback_strategy!r}"
-        )
-    bucket_size_mb = int(weight_sync.get("bucket_size_mb", 128))
-    if bucket_size_mb <= 0:
-        raise ValueError("rollout.vllm.weight_sync.bucket_size_mb must be positive")
-    if deployment not in ("colocated", "disjoint"):
-        raise ValueError(f"Unsupported direct-reshard deployment: {deployment!r}")
     rollout_tp = int(vllm.get("tensor_parallel_size", 1))
-    effective_strategy = "full_gather" if rollout_tp == 1 else strategy
-    if effective_strategy == "direct_reshard" and rollout_model.family != "qwen3":
-        raise ValueError(
-            "Direct reshard currently supports Qwen3 rollout models only; "
-            f"got family={rollout_model.family!r}"
-        )
+    normalized = resolve_weight_sync_config(
+        weight_sync,
+        deployment=deployment,
+        model_family=rollout_model.family,
+        rollout_tp=rollout_tp,
+    )
     parallel_sizes = _weight_sync_parallel_sizes(accelerator)
     trainer_tp = parallel_sizes["tp"]
     if trainer_tp == 1:
@@ -522,8 +500,8 @@ def _validate_vllm_weight_sync(
     trainer_tp2_supported = _trainer_tp2_weight_sync_supported(
         trainer_tp,
         rollout_model,
-        effective_strategy,
-        fallback_strategy,
+        normalized.strategy,
+        normalized.fallback_strategy,
     )
     if not trainer_tp2_supported:
         raise ValueError(
@@ -531,7 +509,8 @@ def _validate_vllm_weight_sync(
             "full-gather or direct-reshard weight sync; "
             f"got deployment={deployment!r}, rollout_tp={rollout_tp}, "
             f"family={rollout_model.family!r}, is_hyper={rollout_model.is_hyper!r}, "
-            f"strategy={effective_strategy!r}, fallback={fallback_strategy!r}"
+            f"strategy={normalized.strategy!r}, "
+            f"fallback={normalized.fallback_strategy!r}"
         )
 
 

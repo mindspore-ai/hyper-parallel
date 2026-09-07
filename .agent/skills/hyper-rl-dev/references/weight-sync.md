@@ -24,14 +24,15 @@ hand-write a second mapping.
 
 | Strategy | TP1 | Qwen3 TP2 |
 | --- | --- | --- |
-| `full_gather` | Rebuild full logical tensors | Normal strategy, oracle, or fallback |
-| `direct_reshard` | Auto-degrades to full-gather | Transfer only source/destination region intersection |
+| `full_gather` | Bounded fragment/bucket gather, release after ACK | Normal strategy, oracle, or fallback |
+| `direct_reshard` | Direct slices into replicated destinations | Transfer only source/destination region intersection |
 
 ## Choosing a Strategy
 
 Default to **`full_gather`** unless the design explicitly requires
 `direct_reshard` (e.g. a TP-mismatch or a bandwidth-motivated change).
-`fallback_strategy ∈ {none, full_gather}` — `full_gather` is the only fallback.
+`fallback_strategy ∈ {none, full_gather}` — default `none`; fallback must be
+explicit.
 
 ## Transaction Semantics
 
