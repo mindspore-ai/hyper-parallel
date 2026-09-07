@@ -270,7 +270,7 @@ Source build environment requirements for hyper-parallel are as follows:
 | CANN toolkit and ops packages   | >= 9.1.0 complete development environment                                 | Source the selected CANN `set_env.sh`; it must provide `bisheng`, `asc_opc`, headers, `libopapi.so`, and `ops_base` |
 | Ninja                           | Available on `PATH` for MindSpore native targets                          | Required by `CustomOpBuilder` builds                                                                               |
 | MindSpore                       | >= 2.10                                                                   | Required when `--custom-ops on`, `--multicore mindspore/all`, or `--shmem all/mindspore`                          |
-| PyTorch and NPU adapter package | Backend-compatible pair with `_GLIBCXX_USE_CXX11_ABI=1`                   | Required when `--multicore torch/all`, or `--shmem all/torch`; the build uses the pair installed in the active environment |
+| PyTorch and NPU adapter package | Backend-compatible pair                                                  | Required when `--multicore torch/all`, or `--shmem all/torch`; the build uses the pair and C++ ABI from the active environment |
 
 ```bash
 git clone https://gitcode.com/mindspore/hyper-parallel.git
@@ -293,6 +293,10 @@ script refreshes its own payload slice for focused incremental builds. Heavy SHM
 framework adapters are rebuilt from clean framework-identity work directories on every invocation. Use `--clean` to
 rebuild all work for the selected components. A matching dependency cache is reused automatically; absent or
 inconsistent locked dependencies are downloaded/refreshed.
+
+MindSpore adapters are built with `ops.CustomOpBuilder`. PyTorch adapters are plain CMake shared libraries loaded with
+`torch.ops.load_library()`; they do not use setuptools compiler internals, `NpuExtension`, or `find_package(Torch)`.
+The build locates Torch and torch_npu in the active Python environment and validates every required header and library.
 
 For a multi-SoC multicore build, HyperParallel builds the HyperMegaMoe vendor for every selected kernel target and
 combines the resulting kernel/config trees into one package. The package carries one common host payload after the

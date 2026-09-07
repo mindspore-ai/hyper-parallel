@@ -12,7 +12,9 @@ aarch64 and x86_64; each wheel targets one host architecture and one CPython ABI
 the unified entry sources `/usr/local/Ascend/cann/set_env.sh` if that default installation exists. A custom CANN
 installation must be sourced by the caller. MindSpore targets additionally require MindSpore >= 2.10 and Ninja. Torch
 targets use the compatible Torch/torch_npu pair already selected by the
-repository extras or external build environment and require Torch's `_GLIBCXX_USE_CXX11_ABI=1`.
+repository extras or external build environment. Torch adapters use the ABI reported by the active Torch package.
+The unified entry and all component entries use the `python` executable from the active `PATH`; the same absolute
+interpreter is passed to CMake and used to tag the wheel.
 
 ```bash
 # Source this explicitly for a custom installation. build.sh automatically
@@ -38,6 +40,14 @@ Dependency preparation uses the versions and hashes in `config/dependencies.lock
 uses an isolated `git archive` export of the locked commit.
 Framework adapter work directories are separated by the active CPython ABI and framework installation identity.
 Each adapter is rebuilt from a clean identity directory.
+
+Torch adapters are rebuilt against the active Torch/torch_npu installation. They use Torch's reported C++ ABI,
+installed C++ headers and libraries, and the torch_npu extension headers needed for ACLNN dispatch and the current NPU
+stream. The multicore Torch adapter is a plain CMake shared library registered through `TORCH_LIBRARY`; it does not use
+setuptools compiler internals, `NpuExtension`/`BuildExtension`, `find_package(Torch)`, a CPython entry point,
+`libpython`, or `libtorch_python`. MindSpore adapters retain their component-local `CustomOpBuilder` definitions.
+CANN and operator-source inputs are provided by the sourced CANN environment and the revisions locked in
+`config/dependencies.lock.json`.
 
 Normal builds keep `build/native/work` and reuse the heavy SHMEM and per-SoC vendor caches. `--clean` removes the
 selected component's work/install outputs, but not downloaded dependency sources. Every invocation freshly assembles
