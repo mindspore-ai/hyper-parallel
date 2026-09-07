@@ -14,12 +14,17 @@
 # ============================================================================
 """Model identity and role construction shared by training and rollout."""
 
+import json
+import logging
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from pathlib import Path
+from typing import Any, Iterator, Mapping, Optional
 
 from hyper_parallel import HSDPModule, get_platform
 
 platform = get_platform()
+logger = logging.getLogger(__name__)
+_TRANSFORMERS_BUILTIN_ATTENTION = "transformers_builtin"
 
 HYPER_MODEL_IMPLEMENTATION = "hyper"
 NATIVE_MODEL_IMPLEMENTATION = "native"
@@ -33,6 +38,15 @@ HYPER_DEEPSEEK_V3_ARCHITECTURE = "HyperDeepseekV3ForCausalLM"
 NATIVE_QWEN3_ARCHITECTURE = "Qwen3ForCausalLM"
 NATIVE_QWEN3_MOE_ARCHITECTURE = "Qwen3MoeForCausalLM"
 NATIVE_DEEPSEEK_V3_ARCHITECTURE = "DeepseekV3ForCausalLM"
+QWEN3_30B_A3B_CONFIG = (
+    ("hidden_size", 2048),
+    ("moe_intermediate_size", 768),
+    ("num_attention_heads", 32),
+    ("num_experts", 128),
+    ("num_experts_per_tok", 8),
+    ("num_hidden_layers", 48),
+    ("num_key_value_heads", 4),
+)
 
 
 @dataclass(frozen=True)
@@ -47,15 +61,26 @@ class ModelRegistration:
     model_type: str
     text_model_type: str
     tie_word_embeddings: bool
+    q_lora_rank: Optional[int] = None
 
     @property
     def family(self) -> str:
-        """Return the supported Qwen3 model family."""
+        """Return the checkpoint-derived supported model family."""
         if (
             self.hf_architecture == "Qwen3ForCausalLM"
             and self.model_type == "qwen3"
         ):
             return "qwen3"
+        if (
+            self.hf_architecture == NATIVE_DEEPSEEK_V3_ARCHITECTURE
+            and self.model_type == "deepseek_v3"
+        ):
+            return "deepseek_v3"
+        if (
+            self.hf_architecture == NATIVE_QWEN3_MOE_ARCHITECTURE
+            and self.model_type == "qwen3_moe"
+        ):
+            return "qwen3_moe"
         raise ValueError(
             "Unsupported RL model identity: "
             f"architecture={self.hf_architecture!r}, model_type={self.model_type!r}, "
@@ -103,13 +128,26 @@ def architecture_for_implementation(
     implementation: str,
     model_family: str = "qwen3",
 ) -> str:
-    """Return the Qwen3 architecture for one rollout implementation."""
-    if model_family != "qwen3":
-        raise ValueError(f"Unsupported vLLM model family: {model_family!r}")
+    """Return the available architecture for one rollout implementation."""
     normalized = normalize_model_implementation(implementation)
-    if normalized == HYPER_MODEL_IMPLEMENTATION:
-        return HYPER_QWEN3_ARCHITECTURE
-    return NATIVE_QWEN3_ARCHITECTURE
+    architectures = {
+        "qwen3": {
+            HYPER_MODEL_IMPLEMENTATION: HYPER_QWEN3_ARCHITECTURE,
+            NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_ARCHITECTURE,
+        },
+        "qwen3_moe": {
+            HYPER_MODEL_IMPLEMENTATION: HYPER_QWEN3_MOE_ARCHITECTURE,
+            NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_MOE_ARCHITECTURE,
+        },
+        "deepseek_v3": {
+            HYPER_MODEL_IMPLEMENTATION: HYPER_DEEPSEEK_V3_ARCHITECTURE,
+            NATIVE_MODEL_IMPLEMENTATION: NATIVE_DEEPSEEK_V3_ARCHITECTURE,
+        },
+    }
+    try:
+        return architectures[model_family][normalized]
+    except KeyError as error:
+        raise ValueError(f"Unsupported vLLM model family: {model_family!r}") from error
 
 
 def resolve_vllm_model(
@@ -118,11 +156,15 @@ def resolve_vllm_model(
 ) -> VLLMModelRegistration:
     """Resolve the single vLLM model contract used by engine and weight sync."""
     normalized = normalize_model_implementation(implementation)
-    architecture = (
-        architecture_for_implementation(normalized, model.family)
-        if normalized == HYPER_MODEL_IMPLEMENTATION
-        else model.hf_architecture
-    )
+    architecture = architecture_for_implementation(normalized, model.family)
+    if (
+        normalized == NATIVE_MODEL_IMPLEMENTATION
+        and architecture != model.hf_architecture
+    ):
+        raise ValueError(
+            "Native vLLM architecture does not match the checkpoint identity: "
+            f"resolved={architecture!r}, checkpoint={model.hf_architecture!r}"
+        )
     return VLLMModelRegistration(model, normalized, architecture)
 
 
@@ -164,10 +206,15 @@ def iter_hsdp_roots(model: platform.Module) -> Iterator[HSDPModule]:
 
 __all__ = [
     "HYPER_MODEL_IMPLEMENTATION",
+    "HYPER_DEEPSEEK_V3_ARCHITECTURE",
     "HYPER_QWEN3_ARCHITECTURE",
+    "HYPER_QWEN3_MOE_ARCHITECTURE",
     "ModelRegistration",
+    "NATIVE_DEEPSEEK_V3_ARCHITECTURE",
     "NATIVE_MODEL_IMPLEMENTATION",
     "NATIVE_QWEN3_ARCHITECTURE",
+    "NATIVE_QWEN3_MOE_ARCHITECTURE",
+    "QWEN3_30B_A3B_CONFIG",
     "SUPPORTED_MODEL_IMPLEMENTATIONS",
     "VLLMModelRegistration",
     "architecture_for_implementation",
@@ -177,3 +224,118 @@ __all__ = [
     "normalize_model_implementation",
     "resolve_vllm_model",
 ]
+
+
+def _model_boolean(model: Mapping[str, Any], name: str, default: bool) -> bool:
+    """Return one validated Boolean model option."""
+    value = model.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"model.{name} must be a boolean")
+    return value
+
+
+def model_trust_remote_code(model: Mapping[str, Any]) -> bool:
+    """Return whether the Trainer model may load remote implementation code."""
+    return _model_boolean(model, "trust_remote_code", True)
+
+
+def tokenizer_trust_remote_code(model: Mapping[str, Any]) -> bool:
+    """Return the tokenizer remote-code choice, independent of the model choice."""
+    return _model_boolean(model, "tokenizer_trust_remote_code", True)
+
+
+def trainer_attention_implementation(model: Mapping[str, Any]) -> str:
+    """Translate the explicit model-family attention selection for Transformers."""
+    selection = model.get("attention_implementation")
+    if selection is None:
+        return str(model.get("attn_implementation", "sdpa"))
+    if "attn_implementation" in model:
+        raise ValueError(
+            "model.attention_implementation and model.attn_implementation are mutually exclusive"
+        )
+    if selection != _TRANSFORMERS_BUILTIN_ATTENTION:
+        raise ValueError(
+            "Unsupported model.attention_implementation "
+            f"{selection!r}; supported value is {_TRANSFORMERS_BUILTIN_ATTENTION!r}"
+        )
+    return "sdpa"
+
+
+def register_model(model: Mapping[str, Any]) -> ModelRegistration:
+    """Resolve the configured model shared by training and rollout."""
+    name = model.get("registry_name")
+    if not isinstance(name, str) or not name:
+        raise ValueError("model.registry_name must be a non-empty string")
+    config_path = Path(str(model["weights_path"])) / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"Model config does not exist: {config_path}")
+    with config_path.open(encoding="utf-8") as config_file:
+        hf_config = json.load(config_file)
+    architectures = hf_config.get("architectures")
+    if not isinstance(architectures, list) or len(architectures) != 1:
+        raise ValueError(
+            f"Model config must define exactly one architecture, got {architectures!r}"
+        )
+    text_config = hf_config.get("text_config", hf_config)
+    if not isinstance(text_config, Mapping):
+        raise ValueError("Model text_config must be a mapping when present")
+    q_lora_rank = text_config.get("q_lora_rank")
+    if q_lora_rank is not None and (
+        not isinstance(q_lora_rank, int) or isinstance(q_lora_rank, bool)
+    ):
+        raise ValueError("Model q_lora_rank must be an integer or null")
+    registration = ModelRegistration(
+        name=name,
+        hyper_model_name=str(model["name"]),
+        weights_path=str(model["weights_path"]),
+        tokenizer_path=str(model["tokenizer_path"]),
+        hf_architecture=str(architectures[0]),
+        model_type=str(hf_config.get("model_type", "")),
+        text_model_type=str(text_config.get("model_type", hf_config.get("model_type", ""))),
+        tie_word_embeddings=bool(text_config.get("tie_word_embeddings", False)),
+        q_lora_rank=q_lora_rank,
+    )
+    family = registration.family
+    model_remote_code = model_trust_remote_code(model)
+    tokenizer_remote_code = tokenizer_trust_remote_code(model)
+    attention = trainer_attention_implementation(model)
+    if family == "deepseek_v3":
+        if model_remote_code:
+            raise ValueError(
+                "DeepSeek-V3 Trainer requires model.trust_remote_code=false to use "
+                "the pinned Transformers implementation"
+            )
+        if model.get("attention_implementation") != _TRANSFORMERS_BUILTIN_ATTENTION:
+            raise ValueError(
+                "DeepSeek-V3 Trainer requires "
+                "model.attention_implementation='transformers_builtin'"
+            )
+        reason = (
+            "q_lora_rank is None; Hyper MLA replacement requires Q-LoRA"
+            if registration.q_lora_rank is None
+            else "the configured Trainer implementation is the pinned Transformers model"
+        )
+        logger.info(
+            "DeepSeek-V3 attention selection: %s; reason: %s; "
+            "model_trust_remote_code=%s tokenizer_trust_remote_code=%s",
+            _TRANSFORMERS_BUILTIN_ATTENTION,
+            reason,
+            model_remote_code,
+            tokenizer_remote_code,
+        )
+    elif family == "qwen3_moe":
+        mismatches = {
+            field: (expected, text_config.get(field))
+            for field, expected in QWEN3_30B_A3B_CONFIG
+            if text_config.get(field) != expected
+        }
+        if mismatches:
+            raise ValueError(
+                "Qwen3-MoE RL currently supports only the official Qwen3-30B-A3B "
+                f"configuration; mismatches={mismatches}"
+            )
+        if registration.tie_word_embeddings:
+            raise ValueError("Official Qwen3-30B-A3B requires untied embeddings")
+    elif attention != str(model.get("attn_implementation", "sdpa")):
+        logger.info("Trainer attention selection: %s", attention)
+    return registration

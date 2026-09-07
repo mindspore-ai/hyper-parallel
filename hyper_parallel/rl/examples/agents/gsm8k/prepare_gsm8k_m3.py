@@ -83,6 +83,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--architecture", default=None)
     parser.add_argument("--prompt-column", default="prompt")
     parser.add_argument("--answer-column", default="extra_info")
+    parser.add_argument("--prompt-instruction", default=PROMPT_INSTRUCTION)
     parser.add_argument("--candidate-offset", type=int, default=0)
     parser.add_argument("--candidate-limit", type=int, default=512)
     parser.add_argument("--sample-count", type=int, default=4)
@@ -165,7 +166,7 @@ def _build_candidates(
         prompt_column=args.prompt_column,
         answer_column=args.answer_column,
         max_samples=candidate_count,
-        prompt_instruction=PROMPT_INSTRUCTION,
+        prompt_instruction=args.prompt_instruction,
     )
     candidates = []
     for source_index, sample in enumerate(dataset):
@@ -218,11 +219,30 @@ def _select_candidates(
     ]
 
     accepted = []
+    reward_profiles: dict[tuple[float, ...], int] = {}
+    diagnostic_examples = []
     for candidate, *responses in zip(candidates, *generated):
         rewards = [
             compute_gsm8k_reward(record["text"], candidate["ground_truth"])
             for record in responses
         ]
+        reward_profile = tuple(rewards)
+        reward_profiles[reward_profile] = reward_profiles.get(reward_profile, 0) + 1
+        if len(diagnostic_examples) < 3:
+            diagnostic_examples.append(
+                {
+                    "source_index": candidate["source_index"],
+                    "ground_truth": candidate["ground_truth"],
+                    "responses": [
+                        {
+                            "extracted_answer": extract_answer(record["text"]),
+                            "reward": reward,
+                            "token_count": len(record["token_ids"]),
+                        }
+                        for record, reward in zip(responses, rewards)
+                    ],
+                }
+            )
         if set(rewards) != {0.0, 1.0}:
             continue
         individual_responses = _individual_responses(llm, candidate, args)
@@ -255,7 +275,8 @@ def _select_candidates(
             break
     if len(accepted) != args.sample_count:
         raise RuntimeError(
-            f"Found only {len(accepted)} mixed-reward rows in {len(candidates)} candidates"
+            f"Found only {len(accepted)} mixed-reward rows in {len(candidates)} candidates; "
+            f"reward_profiles={reward_profiles}; examples={diagnostic_examples}"
         )
     return accepted
 
@@ -290,6 +311,7 @@ def _write_outputs(
         "response_count": args.response_count,
         "max_prompt_length": args.max_prompt_length,
         "max_tokens": args.max_tokens,
+        "prompt_instruction": args.prompt_instruction,
         "records": accepted,
     }
     (args.output_dir / "manifest.json").write_text(

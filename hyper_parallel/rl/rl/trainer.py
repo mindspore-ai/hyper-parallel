@@ -35,6 +35,7 @@ from rl.config import (
     build_runtime_config,
     required_mapping,
     resolve_vllm_automatic_limits,
+    tokenizer_trust_remote_code,
     uses_colocated_vllm,
     validate_config,
 )
@@ -222,6 +223,15 @@ def _resolve_eos_token_ids(model: Any, tokenizer: Any) -> tuple[int, ...]:
     if not normalized_ids:
         raise ValueError("Model or tokenizer must define at least one EOS token ID")
     return normalized_ids
+
+
+def _load_tokenizer(model_config: Mapping[str, Any]) -> Any:
+    """Load the tokenizer with its model-independent remote-code selection."""
+    return AutoTokenizer.from_pretrained(
+        str(model_config["tokenizer_path"]),
+        trust_remote_code=tokenizer_trust_remote_code(model_config),
+        local_files_only=True,
+    )
 
 
 @dataclass
@@ -747,12 +757,7 @@ class SyncTrainer:
         data_config = required_mapping(self.resolved_config, "data")
         evaluation_config = required_mapping(self.resolved_config, "evaluation")
         self._evaluation_enabled = bool(evaluation_config.get("enabled", True))
-        tokenizer_path = str(model_config["tokenizer_path"])
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
+        self.tokenizer = _load_tokenizer(model_config)
         if self.tokenizer.pad_token_id is None:
             if self.tokenizer.eos_token_id is None:
                 raise ValueError("Tokenizer must define pad_token_id or eos_token_id")

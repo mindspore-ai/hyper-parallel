@@ -1,0 +1,148 @@
+model:
+  registry_name: moonlight_16b_a3b_instruct
+  name: moonlight
+  weights_path: /models/Moonlight-16B-A3B-Instruct
+  tokenizer_path: /models/Moonlight-16B-A3B-Instruct
+  trust_remote_code: false
+  tokenizer_trust_remote_code: false
+  attention_implementation: transformers_builtin
+  config_overrides: null
+
+consistency:
+  enabled: false
+
+data:
+  train_path: /data/gsm8k/train.parquet
+  test_path: /data/gsm8k/test.parquet
+  prompt_column: prompt
+  answer_column: extra_info
+  prompt_instruction: 'Let''s think step by step and output the final answer after "####".'
+  max_prompt_length: 256
+  max_train_samples: 4
+  shuffle: false
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: true
+
+rollout:
+  engine: vllm
+  num_return_sequences: 2
+  max_new_tokens: 256
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  seed: 20260903
+  vllm:
+    deployment: colocated
+    data_parallel_size: 4
+    port: 8600
+    model_implementation: native
+    tensor_parallel_size: 1
+    enable_expert_parallel: false
+    weight_sync:
+      strategy: direct_reshard
+      fallback_strategy: none
+      bucket_size_mb: 128
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: true
+    batch_invariant: false
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    gpu_memory_utilization: 0.30
+    kv_cache_memory_bytes: 1073741824
+    max_model_len: 512
+    block_size: 128
+    max_num_seqs: 2
+    max_num_batched_tokens: 512
+    logprobs_mode: raw_logprobs
+    startup_timeout: 900
+    request_timeout: 600
+
+agentic:
+  module_path: examples.agents.gsm8k.agent
+  environment: gsm8k_tools
+  interaction_mode: single_turn
+  max_turns: 1
+  max_observation_tokens: 0
+
+evaluation:
+  enabled: false
+  batch_size: 1
+  max_samples: 1
+  max_new_tokens: 128
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  log_samples: 1
+  progress_steps: 1
+
+algorithm:
+  name: grpo
+  advantage_epsilon: 1.0e-6
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  clip_ratio_c: 3.0
+  kl_coef: 0.001
+  kl_type: low_var_kl
+  loss_aggregation: token-mean
+
+train:
+  max_steps: 2
+  seed: 1234
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 2
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate:
+    enabled: true
+    max_step: 1
+    min_gradient_norm: 1.0e-12
+    require_mixed_rewards: true
+    require_fingerprint_change: true
+  accelerator:
+    dp_replicate: 1
+    dp_shard: 4
+    tp: 1
+    ep: 1
+    cp: 1
+    pp: 1
+    activation_checkpoint: full
+    reshard_after_forward: true
+    comm_fusion: true
+    cpu_offload: true
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16
+    output_dtype: null
+  optimizer:
+    lr: 1.0e-5
+    lr_min: 0.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    eps: 1.0e-8
+    betas: [0.9, 0.999]
+    foreach: null
+  checkpoint:
+    output_dir: /results/checkpoints
+    save_steps: 0
+    save_final: false
+    verify_reload: false
+
+logging:
+  backends: [console]
+  project_name: hyper-rl
+  experiment_name: moonlight_native
+  log_steps: 1
+  log_samples: 2
+  wandb:
+    mode: disabled
+    entity: null
+    directory: /results/wandb

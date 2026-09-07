@@ -30,7 +30,7 @@ import pytest
 import rl.roles.weight_sync.transfer as transfer_module
 import rl.roles.weight_sync.vllm_worker as worker_module
 import torch
-from rl.config import _validate_vllm_weight_sync
+from rl.config import _validate_moe_ep1_topology, _validate_vllm_weight_sync
 from rl.roles.weight_sync.config import resolve_weight_sync_config
 from rl.roles.weight_sync.layout import (
     DestinationTensorLayout,
@@ -72,6 +72,7 @@ from rl.roles.weight_sync.vllm_worker import (
 )
 
 from hyper_parallel import Replicate, Shard
+from hyper_parallel.auto_models.components.distributed import ep_utils
 
 
 def _source(rank: int, starts: tuple[int, int], lengths: tuple[int, int]) -> SourceTensorLayout:
@@ -3417,6 +3418,67 @@ def test_full_gather_rejects_a_redundant_fallback() -> None:
         )
 
 
+def test_deepseek_v3_config_supports_tp2_but_requires_colocated() -> None:
+    """Moonlight TP1/TP2 use the shared colocated synchronization runtime."""
+    deepseek = SimpleNamespace(is_hyper=False, family="deepseek_v3")
+    direct = {
+        "tensor_parallel_size": 1,
+        "weight_sync": {
+            "strategy": "direct_reshard",
+            "fallback_strategy": "none",
+            "bucket_size_mb": 128,
+        },
+    }
+
+    _validate_vllm_weight_sync(direct, "colocated", deepseek, {})
+    with pytest.raises(ValueError, match="disjoint weight synchronization is not implemented"):
+        _validate_vllm_weight_sync(direct, "disjoint", deepseek, {})
+    with pytest.raises(ValueError, match="disjoint weight synchronization is not implemented"):
+        build_weight_transfer(
+            "disjoint",
+            _deepseek_v3_registration(),
+            strategy="direct_reshard",
+            fallback_strategy="none",
+        )
+    _validate_vllm_weight_sync({**direct, "tensor_parallel_size": 2}, "colocated", deepseek, {})
+    with pytest.raises(ValueError, match="supports rollout TP1"):
+        _validate_vllm_weight_sync(
+            {**direct, "tensor_parallel_size": 3},
+            "colocated",
+            deepseek,
+            {},
+        )
+    fallback = {
+        **direct,
+        "weight_sync": {
+            "strategy": "direct_reshard",
+            "fallback_strategy": "full_gather",
+        },
+    }
+    _validate_vllm_weight_sync(fallback, "colocated", deepseek, {})
+    full_gather = {
+        **direct,
+        "weight_sync": {
+            "strategy": "full_gather",
+            "fallback_strategy": "none",
+        },
+    }
+    _validate_vllm_weight_sync(full_gather, "colocated", deepseek, {})
+    with pytest.raises(ValueError, match="disjoint weight synchronization is not implemented"):
+        _validate_vllm_weight_sync(
+            {
+                **direct,
+                "weight_sync": {
+                    "strategy": "full_gather",
+                    "fallback_strategy": "none",
+                },
+            },
+            "disjoint",
+            deepseek,
+            {},
+        )
+
+
 def test_full_gather_strategy_and_direct_fallback_are_accepted() -> None:
     """Full gather can be selected or retained only as direct recovery."""
     model = SimpleNamespace(is_hyper=True, family="qwen3")
@@ -3451,6 +3513,17 @@ def test_invalid_weight_sync_strategy_is_rejected(strategy: str) -> None:
             SimpleNamespace(is_hyper=True, family="qwen3"),
             {},
         )
+
+
+@pytest.mark.parametrize("family", ["qwen3_moe", "deepseek_v3"])
+@pytest.mark.parametrize("ep_size", [1, 2, 4])
+def test_colocated_ep_configuration(family: str, ep_size: int) -> None:
+    """The two families accept the same explicit rollout EP topology."""
+    _validate_moe_ep1_topology(
+        {"enable_expert_parallel": True, "data_parallel_size": ep_size},
+        SimpleNamespace(family=family, is_hyper=True),
+        {"dp_replicate": 1, "dp_shard": 4, "tp": 1, "cp": 1, "pp": 1},
+    )
 
 
 @pytest.mark.parametrize("family", ["qwen3_moe", "deepseek_v3"])
@@ -3513,6 +3586,19 @@ def test_ep_publication_owns_only_expert_axis(family: str, transfer_type: type, 
             assert destination.region.lengths == destination.global_shape
 
 
+def test_qwen_ep_combine_keeps_fp32_router_weights() -> None:
+    """EP reordering cannot round Qwen3 routing weights before multiplication."""
+    pytest.importorskip("vllm")
+    from rl.roles.rollout.vllm_moe import qwen3_combine  # pylint: disable=import-outside-toplevel
+
+    output = torch.tensor([[11.0, 0.25], [-5.0, 32.0], [4.0, -3.0], [2.0, 7.0]], dtype=torch.bfloat16)
+    weights = torch.tensor([0.201234, 0.798766, 0.701234, 0.298766])
+    order = torch.tensor([2, 0, 3, 1])
+    actual = qwen3_combine(output[order], weights, torch.tensor([0, 0, 1, 1]), order, (1, 2, 2))
+    expected = (output.float() * weights[:, None]).bfloat16().view(1, 2, 2, 2).sum(2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("transfer_type", [DirectReshardHCCLWeightTransfer, FullGatherHCCLWeightTransfer])
 def test_disjoint_transport_rejects_ep_destinations(transfer_type: type) -> None:
     """Inheritance from the shared planner must not imply disjoint EP support."""
@@ -3526,6 +3612,48 @@ def test_disjoint_transport_rejects_ep_destinations(transfer_type: type) -> None
     transfer = transfer_type(registration, data_parallel_size=4)
     with pytest.raises(ValueError, match="requires colocated IPC"):
         transfer._query_destination_workers(client)
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_ep_primitive_keeps_default_and_custom_gradient_contract(
+    monkeypatch: pytest.MonkeyPatch, custom: bool,
+) -> None:
+    """The optional combine does not change default weighting or break autograd."""
+    pytest.importorskip("vllm")
+    from rl.roles.rollout.vllm_moe import qwen3_combine  # pylint: disable=import-outside-toplevel
+
+    class Experts(torch.nn.Module):
+        """Simple differentiable leaf isolating dispatch and combine semantics."""
+
+        local_expert_count = 4
+
+        def forward(self, hidden: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+            """Apply a distinguishable local-expert multiplier."""
+            return hidden * (indices[:, None] + 1).to(hidden.dtype)
+
+    group = SimpleNamespace(size=lambda: 1)
+    monkeypatch.setattr(ep_utils.dist, "get_rank", lambda **_kwargs: 0)
+    monkeypatch.setattr(ep_utils.dist, "all_to_all_single", lambda out, src, **_kwargs: out.copy_(src))
+    monkeypatch.setattr(ep_utils, "ep_all_to_all", lambda x, *_args: x)
+    module = torch.nn.Module()
+    module.experts = Experts()
+    hidden = torch.tensor([[[2.0, 7.0], [3.0, -4.0]]], dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.tensor([[0.201234, 0.798766], [0.701234, 0.298766]], requires_grad=True)
+    indices = torch.tensor([[3, 1], [2, 0]])
+    output = ep_utils.ep_routed_forward(
+        module, hidden, router_fn=lambda *_args: (indices, weights), ep_group=group,
+        combine_fn=qwen3_combine if custom else None,
+    )
+    expanded = hidden.view(2, 1, 2) * (indices[..., None] + 1).bfloat16()
+    expected = (
+        (expanded.float() * weights[..., None]).bfloat16()
+        if custom else expanded * weights.bfloat16()[..., None]
+    ).sum(1).view_as(hidden)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    gradients = torch.autograd.grad(output.sum(), (hidden, weights), retain_graph=True)
+    reference_gradients = torch.autograd.grad(expected.sum(), (hidden, weights))
+    for actual, reference in zip(gradients, reference_gradients):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("family", ["qwen3_moe", "deepseek_v3"])
@@ -3595,6 +3723,17 @@ def test_native_moe_ownership_axes(family: str, ep_size: int, runtime: bool) -> 
         _native_moe_direct_tensors(
             model, config, 1, 4, family=family, ep_size=ep_size, ep_rank=2 if ep_size == 4 else 0,
         )
+
+
+@pytest.mark.parametrize("family", ["qwen3_moe", "deepseek_v3"])
+def test_native_ep_keeps_original_optimized_path_selectable(family: str) -> None:
+    """Native may use graph mode; EPLB and rollout TP remain outside P8.6."""
+    config = {"enable_expert_parallel": True, "data_parallel_size": 4, "enforce_eager": False}
+    model = SimpleNamespace(family=family, is_hyper=False)
+    accelerator = {"dp_replicate": 1, "dp_shard": 4, "tp": 1, "cp": 1, "pp": 1}
+    _validate_moe_ep1_topology(config, model, accelerator)
+    with pytest.raises(ValueError, match="EPLB"):
+        _validate_moe_ep1_topology({**config, "enable_eplb": True}, model, accelerator)
 
 
 def _model_worker(tp_rank: int, is_hyper: bool = False, family: str = "qwen3_moe") -> dict:
@@ -3697,6 +3836,17 @@ def test_tp2_ep4_keeps_distinct_shard_domains(transfer_type: type, is_hyper: boo
             assert layout.region.starts[dim] == (physical_rank % 2) * layout.region.lengths[dim]
         else:
             assert layout.region.starts == (0,) * len(layout.global_shape)
+
+
+@pytest.mark.parametrize("is_hyper", [False, True])
+def test_qwen_tp2_ep4_configuration(is_hyper: bool) -> None:
+    """Only the implemented first Native combination is admitted."""
+    rollout = {"tensor_parallel_size": 2, "data_parallel_size": 2, "enable_expert_parallel": True}
+    model = SimpleNamespace(family="qwen3_moe", is_hyper=is_hyper)
+    accelerator = {"dp_replicate": 1, "dp_shard": 4, "tp": 1, "cp": 1, "pp": 1}
+    _validate_moe_ep1_topology(rollout, model, accelerator)
+    with pytest.raises(ValueError, match="requires rollout TP1"):
+        _validate_moe_ep1_topology({**rollout, "enable_expert_parallel": False}, model, accelerator)
 
 
 @pytest.mark.parametrize("fault", ["missing_rank", "out_of_range", "wrong_size", "missing_replica"])

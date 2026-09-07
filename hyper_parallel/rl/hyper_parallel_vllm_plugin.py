@@ -15,11 +15,15 @@
 """Forward the installed vLLM plugin entry point to the Hyper-RL runtime."""
 
 from rl.roles.rollout.vllm_plugin import (
+    HYPER_DEEPSEEK_V3_ARCHITECTURE,
     HYPER_QWEN3_ARCHITECTURE,
+    HYPER_QWEN3_MOE_ARCHITECTURE,
     register_hyper_models,
 )
 
 __all__ = [
+    "HYPER_DEEPSEEK_V3_ARCHITECTURE",
     "HYPER_QWEN3_ARCHITECTURE",
+    "HYPER_QWEN3_MOE_ARCHITECTURE",
     "register_hyper_models",
 ]

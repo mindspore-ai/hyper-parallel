@@ -485,13 +485,16 @@ def _prepare_ep_dispatch(
     global_expert_count: int,
     ep_size: int,
     ep_group: Any,
+    preserve_router_dtype: bool = False,
 ):
     """Sort routed tokens and exchange per-rank dispatch counts."""
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     token_count = flattened_states.shape[0]
     experts_per_token = topk_indices.shape[1]
     expert_indices = topk_indices.reshape(-1)
-    expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+    expert_weights = topk_weights.reshape(-1)
+    if not preserve_router_dtype:
+        expert_weights = expert_weights.to(flattened_states.dtype)
     source_indices = torch.arange(token_count, device=flattened_states.device).repeat_interleave(experts_per_token)
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
     dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
@@ -548,12 +551,31 @@ def _aggregate_ep_outputs(
     return output.view(*output_shape)
 
 
+def qwen3_moe_combine(
+    combined_outputs: torch.Tensor,
+    expert_weights: torch.Tensor,
+    source_indices: torch.Tensor,
+    dispatch_order: torch.Tensor,
+    output_shape: tuple[int, int, int],
+) -> torch.Tensor:
+    """Restore Qwen3 Top-K order with FP32 weighting and hidden-dtype summation."""
+    del source_indices
+    ordered = torch.empty_like(combined_outputs)
+    ordered.index_copy_(0, dispatch_order, combined_outputs)
+    weighted = (ordered.float() * expert_weights.unsqueeze(-1).float()).to(ordered.dtype)
+    token_count = output_shape[0] * output_shape[1]
+    if token_count == 0:
+        return ordered.view(output_shape)
+    return weighted.view(token_count, -1, output_shape[-1]).sum(dim=1).view(output_shape)
+
+
 def ep_routed_forward(
     module: Any,
     hidden_states: torch.Tensor,
     *,
     router_fn: Callable,
     ep_group: Any,
+    combine_fn: Optional[Callable] = None,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -589,6 +611,11 @@ def ep_routed_forward(
     ``router_fn`` is supplied BY THE CALLER (explicit choice, e.g. an entry
     of MOE_ROUTER_ADAPTERS picked by name in the factory code).
 
+    ``combine_fn`` optionally preserves family-specific weighting/accumulation.
+    It accepts the same arguments as ``_aggregate_ep_outputs`` and receives
+    router weights in their original dtype. Omitting it preserves the existing
+    hidden-dtype weighting and index-add aggregation.
+
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to
     adjacent dp/cp ranks; MindSpeed TP-extend-EP / Megatron etp=1 + ep
@@ -612,6 +639,7 @@ def ep_routed_forward(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        preserve_router_dtype=combine_fn is not None,
     )
     (
         source_token_indices,
@@ -631,7 +659,8 @@ def ep_routed_forward(
         ep_group,
         expert_offset,
     )
-    return _aggregate_ep_outputs(
+    aggregate = _aggregate_ep_outputs if combine_fn is None else combine_fn
+    return aggregate(
         combined_expert_outputs,
         flattened_expert_weights,
         source_token_indices,

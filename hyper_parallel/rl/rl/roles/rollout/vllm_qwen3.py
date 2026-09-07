@@ -15,20 +15,22 @@
 """Transformers Qwen3 adapter for the Hyper-vLLM runtime."""
 
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
-from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3Attention,
-    Qwen3ForCausalLM,
-    apply_rotary_pos_emb,
-)
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from rl.roles.rollout.vllm_qwen3_common import (
+    Qwen3PagedAttention,
+    config_value,
+    join_prefix,
+    normalize_positions,
+)
 
 from hyper_parallel.auto_models.components.distributed import (
     ShardingPlanner,
@@ -38,15 +40,6 @@ from hyper_parallel.auto_models.components.distributed.sharding_planner import (
     validate_model_compatibility,
 )
 from hyper_parallel import DeviceMesh, distribute_tensor, mark_created_groups
-
-
-def _join_prefix(prefix: str, suffix: str) -> str:
-    return f"{prefix}.{suffix}" if prefix else suffix
-
-
-def _config_value(config: object, name: str, default: Any = None) -> Any:
-    value = getattr(config, name, default)
-    return default if value is None else value
 
 
 def _validate_adapter_config(vllm_config: VllmConfig) -> None:
@@ -60,108 +53,16 @@ def _validate_adapter_config(vllm_config: VllmConfig) -> None:
         raise ValueError("HyperQwen3ForCausalLM currently supports only bfloat16")
     if parallel_config.pipeline_parallel_size != 1:
         raise ValueError("HyperQwen3ForCausalLM currently supports pipeline_parallel_size=1")
-    if _config_value(parallel_config, "prefill_context_parallel_size", 1) != 1:
+    if config_value(parallel_config, "prefill_context_parallel_size", 1) != 1:
         raise ValueError("HyperQwen3ForCausalLM currently supports prefill_context_parallel_size=1")
-    if _config_value(parallel_config, "decode_context_parallel_size", 1) != 1:
+    if config_value(parallel_config, "decode_context_parallel_size", 1) != 1:
         raise ValueError("HyperQwen3ForCausalLM currently supports decode_context_parallel_size=1")
     if vllm_config.quant_config is not None:
         raise ValueError("HyperQwen3ForCausalLM requires an unquantized checkpoint")
-    if not bool(_config_value(hf_config, "is_causal", True)):
+    if not bool(config_value(hf_config, "is_causal", True)):
         raise ValueError("HyperQwen3ForCausalLM requires causal attention")
-    if float(_config_value(hf_config, "attention_dropout", 0.0)) != 0.0:
+    if float(config_value(hf_config, "attention_dropout", 0.0)) != 0.0:
         raise ValueError("HyperQwen3ForCausalLM does not support attention dropout")
-
-
-class _VLLMQwen3Attention(nn.Module):
-    """Keep Transformers Qwen3 projections around vLLM paged attention."""
-
-    def __init__(
-        self,
-        attention: Qwen3Attention,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str,
-    ) -> None:
-        """Replace Qwen3 attention compute with a vLLM paged-attention leaf."""
-        super().__init__()
-        self.q_proj = attention.q_proj
-        self.k_proj = attention.k_proj
-        self.v_proj = attention.v_proj
-        self.o_proj = attention.o_proj
-        self.q_norm = attention.q_norm
-        self.k_norm = attention.k_norm
-        self.head_dim = attention.head_dim
-        self.num_heads = attention.config.num_attention_heads
-        self.num_key_value_heads = attention.config.num_key_value_heads
-        tp_size = vllm_config.parallel_config.tensor_parallel_size
-        self.scaling = attention.scaling
-        self.layer_idx = attention.layer_idx
-        self.attention = Attention(
-            num_heads=self.num_heads // tp_size,
-            head_size=self.head_dim,
-            scale=self.scaling,
-            num_kv_heads=self.num_key_value_heads // tp_size,
-            cache_config=vllm_config.cache_config,
-            quant_config=vllm_config.quant_config,
-            per_layer_sliding_window=attention.sliding_window,
-            prefix=f"{prefix}.attn",
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[object] = None,
-        **kwargs: object,
-    ) -> tuple[torch.Tensor, None]:
-        """Run Transformers projections and RoPE with vLLM-owned KV state."""
-        del kwargs
-        if attention_mask is not None:
-            raise ValueError("vLLM manages causal masks; explicit attention_mask is unsupported")
-        if past_key_values is not None:
-            raise ValueError("vLLM owns KV cache state; Transformers past_key_values is unsupported")
-        if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
-            raise ValueError("HyperQwen3ForCausalLM expects packed hidden states with shape [1,T,H]")
-
-        batch_size, num_tokens, _ = hidden_states.shape
-        query = self.q_proj(hidden_states).view(
-            batch_size,
-            num_tokens,
-            self.num_heads,
-            self.head_dim,
-        )
-        key = self.k_proj(hidden_states).view(
-            batch_size,
-            num_tokens,
-            self.num_key_value_heads,
-            self.head_dim,
-        )
-        value = self.v_proj(hidden_states).view(
-            batch_size,
-            num_tokens,
-            self.num_key_value_heads,
-            self.head_dim,
-        )
-        query = self.q_norm(query).transpose(1, 2)
-        key = self.k_norm(key).transpose(1, 2)
-        value = value.transpose(1, 2)
-        cos, sin = position_embeddings
-        query, key = apply_rotary_pos_emb(query, key, cos, sin)
-        query = query.transpose(1, 2).reshape(num_tokens, -1)
-        key = key.transpose(1, 2).reshape(num_tokens, -1)
-        value = value.transpose(1, 2).reshape(num_tokens, -1)
-        output = self.attention(query, key, value)
-        output = output.view(batch_size, num_tokens, -1)
-        return self.o_proj(output), None
-
-
-def _normalize_positions(positions: torch.Tensor, num_tokens: int) -> torch.Tensor:
-    if positions.ndim == 1 and positions.shape[0] == num_tokens:
-        return positions.unsqueeze(0)
-    if positions.ndim == 2 and positions.shape == (1, num_tokens):
-        return positions
-    raise ValueError("Qwen3 positions must have shape [T] or [1,T]")
 
 
 def _map_weight_name(name: str) -> Optional[str]:
@@ -246,11 +147,12 @@ class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
             rotary_device
         )
         for layer_idx, layer in enumerate(self.model.layers):
-            layer_prefix = _join_prefix(prefix, f"model.layers.{layer_idx}.self_attn")
-            layer.self_attn = _VLLMQwen3Attention(
+            layer_prefix = join_prefix(prefix, f"model.layers.{layer_idx}.self_attn")
+            layer.self_attn = Qwen3PagedAttention(
                 layer.self_attn,
                 vllm_config=vllm_config,
                 prefix=layer_prefix,
+                family="HyperQwen3ForCausalLM",
             )
         self._tp_mesh: Optional[DeviceMesh] = None
         self._tp_placements: dict[str, tuple[object, ...]] = {}
@@ -324,7 +226,11 @@ class HyperQwen3ForCausalLM(Qwen3ForCausalLM):
         if hidden_states.ndim != 2:
             raise ValueError("packed input embeddings must have shape [T,H]")
 
-        position_ids = _normalize_positions(positions, hidden_states.shape[0])
+        position_ids = normalize_positions(
+            positions,
+            hidden_states.shape[0],
+            family="Qwen3",
+        )
         hidden_states = hidden_states.unsqueeze(0)
         position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
         for layer in self.model.layers:

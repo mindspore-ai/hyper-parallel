@@ -20,7 +20,7 @@ from collections import Counter, OrderedDict, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Optional, Protocol, Union
 
 import torch
 from huggingface_hub import snapshot_download
@@ -215,6 +215,11 @@ def _make_tensor_loader(index: _CheckpointIndex, source_key: str) -> Callable[[]
     return lambda: index.load_tensor(source_key)
 
 
+def _converter_scope_prefix(converter: WeightConverter) -> Optional[str]:
+    """Return the Hyper replacement scope absent from native HF converters."""
+    return getattr(converter, "scope_prefix", None)
+
+
 def _build_load_groups(
     model: nn.Module,
     checkpoint_index: _CheckpointIndex,
@@ -286,17 +291,19 @@ def _build_load_groups(
             scoped_candidates = [
                 converter
                 for converter in candidates
-                if converter.scope_prefix is not None
+                if _converter_scope_prefix(converter) is not None
                 and (
-                    target_name == converter.scope_prefix
-                    or target_name.startswith(f"{converter.scope_prefix}.")
+                    target_name == _converter_scope_prefix(converter)
+                    or target_name.startswith(f"{_converter_scope_prefix(converter)}.")
                 )
             ]
             if len(scoped_candidates) == 1:
                 converter = scoped_candidates[0]
             else:
                 unscoped_candidates = [
-                    converter for converter in candidates if converter.scope_prefix is None
+                    converter
+                    for converter in candidates
+                    if _converter_scope_prefix(converter) is None
                 ]
                 converter = unscoped_candidates[0] if len(unscoped_candidates) == 1 else None
             if converter is None:
@@ -366,7 +373,7 @@ def _build_replacement_routes(
 
         if source_pattern is None:
             collected_pattern = source_name
-            transform: WeightRenaming | WeightConverter = WeightRenaming(
+            transform: Union[WeightRenaming, WeightConverter] = WeightRenaming(
                 source_patterns=source_name,
                 target_patterns=target_name,
             )
@@ -376,10 +383,10 @@ def _build_replacement_routes(
             scoped_candidates = [
                 converter
                 for converter in candidates
-                if converter.scope_prefix is not None
+                if _converter_scope_prefix(converter) is not None
                 and (
-                    target_name == converter.scope_prefix
-                    or target_name.startswith(f"{converter.scope_prefix}.")
+                    target_name == _converter_scope_prefix(converter)
+                    or target_name.startswith(f"{_converter_scope_prefix(converter)}.")
                 )
             ]
             if len(scoped_candidates) != 1:

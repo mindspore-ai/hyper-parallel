@@ -24,12 +24,24 @@ from rl.consistency import (
     install_rollout_consistency_profile,
 )
 from rl.consistency.qwen3_dense import install_qwen3_rollout_rms_norm_diagnostic
-from rl.roles.model import HYPER_QWEN3_ARCHITECTURE
+from rl.roles.model import (
+    HYPER_DEEPSEEK_V3_ARCHITECTURE,
+    HYPER_QWEN3_ARCHITECTURE,
+    HYPER_QWEN3_MOE_ARCHITECTURE,
+)
 from rl.roles.weight_sync.vllm_worker import install_vllm_weight_sync_hooks
 
 HYPER_QWEN3_MODEL_CLASS = "rl.roles.rollout.vllm_qwen3:HyperQwen3ForCausalLM"
+HYPER_DEEPSEEK_V3_MODEL_CLASS = (
+    "rl.roles.rollout.vllm_deepseek_v3:HyperDeepseekV3ForCausalLM"
+)
+HYPER_QWEN3_MOE_MODEL_CLASS = (
+    "rl.roles.rollout.vllm_qwen3_moe:HyperQwen3MoeForCausalLM"
+)
 _HYPER_MODELS = {
+    HYPER_DEEPSEEK_V3_ARCHITECTURE: HYPER_DEEPSEEK_V3_MODEL_CLASS,
     HYPER_QWEN3_ARCHITECTURE: HYPER_QWEN3_MODEL_CLASS,
+    HYPER_QWEN3_MOE_ARCHITECTURE: HYPER_QWEN3_MOE_MODEL_CLASS,
 }
 _SUPPORTED_VLLM_VERSION = "0.22.1"
 _SUPPORTED_VLLM_ASCEND_VERSION = "0.22.1rc1"
@@ -93,6 +105,8 @@ def register_hyper_models() -> None:
 
 
 __all__ = [
+    "HYPER_DEEPSEEK_V3_ARCHITECTURE",
     "HYPER_QWEN3_ARCHITECTURE",
+    "HYPER_QWEN3_MOE_ARCHITECTURE",
     "register_hyper_models",
 ]

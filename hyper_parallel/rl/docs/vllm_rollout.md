@@ -3,7 +3,7 @@
 ## 适用范围
 
 本文定义 Hyper-RL 的 shared vLLM rollout 合同，覆盖 Qwen3 Hyper/Native TP1/TP2、colocated NPU IPC、disjoint HCCL、
-在线权重发布和同步失败语义。
+在线权重发布和同步失败语义；[MoE 模型](moe_models.md) 复用这些合同，仅扩展静态专家归属及模型特有布局。
 
 ## Ownership
 
@@ -76,8 +76,8 @@ Pause、sleep/wake、transaction、cache reset、resume 和 close 只由 coordin
 - 支持模型的 TP1/TP2 均可选择 `full_gather` 与 `direct_reshard`，TP1 不再自动改写显式策略。
 - `full_gather` 使用逐 fragment/bucket gather、传输、ACK 后释放的有界实现；colocated 走 NPU IPC，disjoint 走按 TP
   目标划分的 HCCL broadcast，不再提供 whole-model 实现选择器。
-- Direct planner 同时解释 Trainer FSDP/TP source layout 与 rollout DP/TP destination layout，普通模式允许
-  已支持的 train/inference degree mismatch。
+- Direct planner 同时解释 Trainer FSDP/TP/EP source layout 与 rollout DP/TP/EP destination layout，普通模式允许
+  已支持的 train/inference degree mismatch；MoE 当前只开放 colocated。
 - Colocated full/direct 使用 NPU IPC；disjoint 使用 HCCL fan-out。
 - Acceptance 使用 Trainer source-derived expected manifest，不用 full/direct 两个待测路径互相证明正确。
 
@@ -135,15 +135,17 @@ HYPER_QWEN3_TP_TOPOLOGY
 ## 已验证拓扑
 
 Colocated 与 disjoint 复用同一份配置 schema、`train_rl.py`、rollout controller 和权重事务接口；deployment 只选择
-设备所有权、residency 和传输实现。
+设备所有权、residency 和传输实现。下表的 bit-exact 结果仅针对 Qwen3 dense，不能推广到 MoE。
 
-| Deployment | Trainer | Rollout | 传输 | 验证结果 |
-| --- | --- | --- | --- | --- |
-| Colocated | `FSDP-shard2×TP2`，4 NPU | `DP2×TP2`，共享 4 NPU | NPU IPC | full/direct/fallback 两步 RL 均为 `0/0/0` |
-| Disjoint | `FSDP-shard2×TP2`，NPU 0–3 | `DP2×TP2`，NPU 4–7 | HCCL | full/direct/fallback 两步 RL 均为 `0/0/0` |
+| Deployment | Trainer                        | Rollout                  | 传输    | 验证结果                                   |
+| ---------- | ------------------------------ | ------------------------ | ------- | ------------------------------------------ |
+| Colocated  | `FSDP-shard2×TP2`，4 NPU    | `DP2×TP2`，共享 4 NPU | NPU IPC | full/direct/fallback 两步 RL 均为`0/0/0` |
+| Disjoint   | `FSDP-shard2×TP2`，NPU 0–3 | `DP2×TP2`，NPU 4–7   | HCCL    | full/direct/fallback 两步 RL 均为`0/0/0` |
 
 Disjoint 还验证了 direct partial receive 后 fallback、direct 与 fallback 双失败不发布、Prefix Cache、Chunked Prefill，
 以及四 Trainer rank DCP destroy/resume/refit。以上是单节点 Ascend 910B3 功能与正确性结论，不包含多节点和性能承诺。
+
+MoE 的四卡 TP2/EP4 发布矩阵、完整内容和有界缓冲验收见 [MoE 权重发布验收](moe_models.md#权重发布验收)。
 
 ## 修改门禁
 
