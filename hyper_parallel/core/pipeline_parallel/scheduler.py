@@ -33,6 +33,7 @@ from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
     swap_launch_offload,
     swap_wait_load,
     swap_wait_offload,
+    unregister_layer_swap_hooks,
 )
 from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
 platform = get_platform()
@@ -519,6 +520,7 @@ class PipelineScheduleRuntime(ABC):
         if not self._pp_swap_enabled:
             return
         current_rank = self._stage_to_rank_index[self.stages[0].stage_index]
+        unregister_layer_swap_hooks(self.stages)
         self.exec_order[current_rank] = inject_pipeline_swap_steps(self.exec_order[current_rank])
         self._swap_keys = frozenset(
             (step.stage_index, step.micro_index)

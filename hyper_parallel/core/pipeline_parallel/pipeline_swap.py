@@ -14,11 +14,12 @@
 # ============================================================================
 """Pipeline-parallel activation swap scheduling helpers."""
 
+import warnings
 from collections import defaultdict
 from contextlib import nullcontext
 from enum import IntEnum
 import itertools
-from typing import Any, ContextManager, FrozenSet, List
+from typing import Any, ContextManager, FrozenSet, Iterable, List
 
 from hyper_parallel.core.activation_checkpoint.swap import SwapManager
 from hyper_parallel.platform import get_platform
@@ -35,6 +36,41 @@ class _BeforeActionPriority(IntEnum):
 class _AfterActionPriority(IntEnum):
     WAIT_OFFLOAD = 10
     LAUNCH_OFFLOAD = 20
+
+
+def unregister_layer_swap_hooks(stages: Iterable[Any]) -> int:
+    """Remove layer-level swap hooks from pipeline stage modules.
+
+    Pipeline schedule swap groups are keyed by stage and micro-batch, while
+    hooks installed by ``SwapManager.set_forward_prefetch_layer`` replace the
+    active group with a layer-level group. When pipeline swap is enabled, the
+    schedule takes precedence and the layer hooks are permanently removed.
+
+    Args:
+        stages: Pipeline stages whose submodules are managed by the schedule.
+
+    Returns:
+        Number of removed hook handles.
+    """
+    removed_count = 0
+    visited_modules = set()
+    manager = SwapManager()
+    for stage in stages:
+        for _, module in platform.get_cells_and_names(stage.submodule):
+            module_id = id(module)
+            if module_id in visited_modules:
+                continue
+            visited_modules.add(module_id)
+            removed_count += manager.unregister_forward_prefetch_hooks(module)
+
+    if removed_count:
+        warnings.warn(
+            "Pipeline schedule swap=True takes precedence over layer-level activation swap; "
+            "hooks registered by SwapManager.set_forward_prefetch_layer() were removed.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return removed_count
 
 
 class PipelineSwapSession:

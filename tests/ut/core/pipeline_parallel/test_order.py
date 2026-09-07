@@ -484,7 +484,10 @@ class TestParseAndValidate(unittest.TestCase):
             1: eligible_order(1),
         }
 
-        Schedule1F1B._inject_local_pp_swap_actions(schedule)
+        with patch.object(scheduler_module, "unregister_layer_swap_hooks") as mock_unregister:
+            Schedule1F1B._inject_local_pp_swap_actions(schedule)
+
+        mock_unregister.assert_called_once_with(schedule.stages)
 
         def has_swap(rank):
             return any(step.type == MetaStepType.SWAP_LAUNCH_OFFLOAD for step in schedule.exec_order[rank])
@@ -729,6 +732,7 @@ class TestParseAndValidate(unittest.TestCase):
         stage = Mock(stage_index=0, stage_num=4, submodule=Mock(), pp_group=None)
         with patch.object(scheduler_module.platform, "platform_type", PlatformType.PYTORCH), \
              patch.object(Schedule1F1B, "_check_stages", return_value=[stage]), \
+             patch.object(scheduler_module, "unregister_layer_swap_hooks"), \
              patch.object(Schedule1F1B, "_inject_local_fsdp_actions"):
             schedule = Schedule1F1B(stage, 4, swap=True)
 
