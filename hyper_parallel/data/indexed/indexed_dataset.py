@@ -29,6 +29,7 @@ from hyper_parallel.data.indexed.indexed_data_config import (
 from hyper_parallel.data.indexed.indexed_pretrain_dataset import (
     GPTDataset,
     GPTFromMRDataset,
+    IndexedSourceDataset,
     MockGPTDataset,
 )
 from hyper_parallel.data.indexed.indexed_split_builder import IndexedDatasetSplitBuilder
@@ -110,6 +111,8 @@ class IndexedPretrainDatasetBuilder:
     def _build_dataset_splits(self, config: GPTDatasetConfig) -> DatasetSplits:
         """Select the instruction or indexed-pretraining Dataset pipeline."""
         if bool(self.data_config.get("is_instruction_dataset", False)):
+            if config.packing_stage == "distributed_dataloader":
+                raise ValueError("packing_stage='distributed_dataloader' does not support instruction Datasets")
             logger.debug("Selecting instruction Dataset pipeline")
             dataset_splits = self._build_instruction_dataset_splits(config)
             return dataset_splits
@@ -189,6 +192,9 @@ class IndexedPretrainDatasetBuilder:
 
         if config.is_dataset_from_mr:
             return GPTFromMRDataset
+
+        if config.packing_stage == "distributed_dataloader":
+            return IndexedSourceDataset
 
         return GPTDataset
 

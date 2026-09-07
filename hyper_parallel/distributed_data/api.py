@@ -474,6 +474,37 @@ class _BuildState:
         )
 
 
+class _DatasetMetadataView(Sequence[SampleMetadata]):
+    """Expose Dataset-provided sidecar metadata through a sequence contract."""
+
+    def __init__(self, dataset: Any) -> None:
+        """Store a source Dataset with a metadata-only lookup method."""
+        self._dataset = dataset
+
+    def __len__(self) -> int:
+        """Return the aligned source Dataset length."""
+        return len(self._dataset)
+
+    def __getitem__(self, index: int) -> SampleMetadata:
+        """Return metadata without materializing the source payload."""
+        return self._dataset.get_sample_metadata(index)
+
+
+def _infer_dataset_metadata(
+        dataset: Any | None,
+        metadata_fn: Callable[[Any], SampleMetadata] | None,
+        metadata: Sequence[SampleMetadata] | None,
+) -> Sequence[SampleMetadata] | None:
+    """Use an indexed Dataset sidecar when the caller omits metadata callbacks."""
+    if metadata_fn is not None or metadata is not None or dataset is None:
+        return metadata
+    get_sample_metadata = getattr(dataset, "get_sample_metadata", None)
+    supports_sidecar = bool(getattr(dataset, "requires_distributed_packing", False))
+    if supports_sidecar and callable(get_sample_metadata):
+        return _DatasetMetadataView(dataset)
+    return None
+
+
 def _validate_builder_callbacks(
         metadata_fn: Callable[[Any], SampleMetadata] | None,
         metadata: Sequence[SampleMetadata] | None,
@@ -616,6 +647,7 @@ def _populate_build_state(
 ) -> None:
     if not isinstance(config, DistributedDatasetConfig):
         raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
+    metadata = _infer_dataset_metadata(dataset, metadata_fn, metadata)
     state.dataset_already_sharded = config.dataset_already_sharded
     state.sidecar_payload_exchange = state.sidecar_mode and state.dataset_already_sharded
     _validate_builder_callbacks(metadata_fn, metadata, pack_fn, collate_fn)
@@ -728,7 +760,9 @@ def build_distributed_dataloader(
         config: Dynamic packing, service-rank, and worker configuration.
         metadata_fn: Convert one materialized raw sample to SampleMetadata in
             online mode. Mutually exclusive with ``metadata``.
-        metadata: Optional sidecar sequence on Dataset Reader ranks. It is a
+        metadata: Optional sidecar sequence on Dataset Reader ranks. Indexed
+            source Datasets that implement ``get_sample_metadata`` provide this
+            automatically when both metadata arguments are omitted. It is a
             shared global sequence by default and a rank-local sequence when
             ``dataset_already_sharded=True``. Entry ``metadata[index]`` must
             describe the corresponding ``dataset[index]``.

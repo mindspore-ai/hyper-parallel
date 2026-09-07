@@ -23,14 +23,18 @@ import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.random import RandomState
 
+from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
 from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
+
+if TYPE_CHECKING:
+    from hyper_parallel.distributed_data.schema import SampleMetadata
 
 logger = get_dataset_logger(__name__)
 _PAD_TOKEN_ID = -1
@@ -531,6 +535,129 @@ class GPTDataset(_IndexedPretrainDataset):
         text = np.asarray(np.concatenate(sample_parts), dtype=np.int64)
 
         return text, np.asarray(document_ids, dtype=np.int64), document_lengths
+
+
+class IndexedSourceDataset(_IndexedPretrainDataset):
+    """Expose one unpacked indexed sequence as one dynamic-packing source sample."""
+
+    requires_distributed_packing = True
+
+    def _finalize(self) -> None:
+        """Validate source records using only lengths stored in the index."""
+        if self.dataset is None or self.indices is None:
+            raise ValueError("IndexedSourceDataset requires a low-level Dataset and split indices")
+        if self.config.packing_stage != "distributed_dataloader":
+            raise ValueError("IndexedSourceDataset requires packing_stage='distributed_dataloader'")
+
+        source_lengths = self.dataset.sequence_lengths[self.indices]
+        extra_token = int(self.config.add_extra_token_to_sequence)
+        pack_lengths = source_lengths - extra_token
+        if np.any(pack_lengths < 1):
+            raise ValueError("Every indexed source sequence must produce at least one input token")
+        if np.any(pack_lengths > self.config.sequence_length):
+            largest = int(np.max(pack_lengths))
+            raise ValueError(
+                "Indexed source sequences cannot exceed sequence_length in the first dynamic-packing version; "
+                f"largest source has {largest} tokens, sequence_length={self.config.sequence_length}"
+            )
+
+    @staticmethod
+    def numel_low_level_dataset(low_level_dataset: IndexedDataReader) -> int:
+        """Return the number of source sequences available for splitting.
+
+        Args:
+            low_level_dataset: Reader exposing the index sequence lengths.
+
+        Returns:
+            Number of source sequences before packing.
+        """
+        return int(low_level_dataset.sequence_lengths.shape[0])
+
+    @staticmethod
+    def build_low_level_dataset(
+        dataset_path: str,
+        config: GPTDatasetConfig,
+    ) -> IndexedDataReader:
+        """Open the indexed token reader without building GPT sample indices.
+
+        Args:
+            dataset_path: Corpus prefix of the binary and index files.
+            config: Reader memory mapping and index reuse options.
+
+        Returns:
+            Random-access reader for the unpacked source sequences.
+        """
+        return IndexedDataReader(
+            dataset_path,
+            mmap=config.mmap_bin_files,
+            reuse_index=config.reuse_idx,
+        )
+
+    @staticmethod
+    def _key_config_attributes() -> list[str]:
+        """Return fields that identify an unpacked source Dataset."""
+        return [
+            "random_seed",
+            "sequence_length",
+            "split",
+            "split_matrix",
+            "tokenizer",
+            "add_extra_token_to_sequence",
+            "packing_stage",
+        ]
+
+    def __len__(self) -> int:
+        """Return every unpacked source sequence in this split."""
+        return len(self.indices)
+
+    def get_sample_metadata(self, index: int) -> SampleMetadata:
+        """Read planning metadata from ``.idx`` without touching token payloads.
+
+        Args:
+            index: Source Dataset index inside this split.
+
+        Returns:
+            Token occupancy and stable source sequence identifier.
+        """
+        sequence_id = self._sequence_id(index)
+        sequence_length = int(self.dataset.sequence_lengths[sequence_id])
+        pack_tokens = sequence_length - int(self.config.add_extra_token_to_sequence)
+        # Distributed data is a PyTorch-only optional path; keep its runtime
+        # import out of the default cross-platform GPT Dataset module.
+        from hyper_parallel.distributed_data.schema import SampleMetadata  # pylint: disable=C0415
+
+        return SampleMetadata(pack_tokens=pack_tokens, sample_id=sequence_id)
+
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
+        """Read and shift one unpacked source sequence for later packing."""
+        sequence_id = self._sequence_id(index)
+        text = np.asarray(self.dataset[sequence_id], dtype=np.int64)
+        if self.config.add_extra_token_to_sequence:
+            input_ids = text[:-1].copy()
+            labels = text[1:].copy()
+        else:
+            input_ids = text.copy()
+            labels = np.roll(text, shift=-1)
+            labels[-1] = IGNORE_INDEX
+
+        if np.any(input_ids < 0) or np.any(input_ids >= len(self.config.tokenizer)):
+            raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "source_id": sequence_id,
+        }
+
+    def _sequence_id(self, index: int) -> int:
+        """Resolve one split-local index to its low-level sequence ID."""
+        if not isinstance(index, (int, np.integer)):
+            raise TypeError(f"Indexed source indices must be integers, got {type(index).__name__}")
+        resolved_index = int(index)
+        if resolved_index < 0:
+            resolved_index += len(self)
+        if resolved_index < 0 or resolved_index >= len(self):
+            raise IndexError(f"Indexed source index {index} is outside [0, {len(self)})")
+        return int(self.indices[resolved_index])
 
 
 class GPTFromMRDataset(_IndexedPretrainDataset):

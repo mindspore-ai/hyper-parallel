@@ -145,8 +145,10 @@ class BaseTrainer(Stateful, ABC):
 
     # Data
     train_dataset: Dataset
+    data_transform: Any
     collate_fn: Any
     train_dataloader: Any
+    num_micro_batches: int
 
     # Model
     model: PreTrainedModel = None
@@ -361,6 +363,7 @@ class BaseTrainer(Stateful, ABC):
             collate_fn=self.collate_fn,
             mesh_context=self.mesh,
             training_config=self.config.training,
+            data_config=getattr(self.config.dataset, "data_config", {}),
             max_seq_len=getattr(self.data_transform, "max_seq_len", None),
             default_seed=self.default_seed,
         )
