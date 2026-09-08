@@ -16,11 +16,15 @@
 
 import asyncio
 import time
-from typing import Callable, Protocol, Sequence
+from typing import Any, Callable, Optional, Protocol, Sequence
 
-from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory
+from hyper_parallel import get_platform
+from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory, Turn
 from rl.dataset.batch_builder import build_experience_batch
 from rl.roles.rollout.base import GenerationSettings
+
+
+platform = get_platform()
 
 
 class AgentProgram(Protocol):
@@ -45,6 +49,7 @@ class ProgramAgentRunner:
         program_factory: AgentProgramFactory,
         num_samples: int,
         settings: GenerationSettings,
+        engine: Optional[Any] = None,
     ) -> None:
         """Initialize the runner with a program factory and sampling policy."""
         if num_samples <= 0:
@@ -52,6 +57,7 @@ class ProgramAgentRunner:
         self.program_factory = program_factory
         self.num_samples = num_samples
         self.settings = settings
+        self.engine = engine
 
     async def _run(
         self,
@@ -75,7 +81,26 @@ class ProgramAgentRunner:
         if not prompt_records:
             raise ValueError("ProgramAgentRunner requires at least one PromptRecord")
         started = time.perf_counter()
-        trajectories = asyncio.run(self._run(prompt_records, policy_version))
+        trajectories = None
+        local_error = None
+        is_owner = bool(getattr(self.engine, "is_request_owner", True))
+        if is_owner:
+            try:
+                trajectories = asyncio.run(self._run(prompt_records, policy_version))
+            except Exception as error:  # pylint: disable=W0718
+                local_error = error
+        synchronize_error = getattr(self.engine, "synchronize_error", None)
+        if callable(synchronize_error):
+            synchronize_error(local_error, "agent program rollout")
+        elif local_error is not None:
+            raise local_error
+        synchronize_payload = getattr(self.engine, "synchronize_agent_payload", None)
+        if callable(synchronize_payload):
+            payload = None if trajectories is None else self._serialize_trajectories(trajectories)
+            payload = synchronize_payload(payload)
+            trajectories = self._deserialize_trajectories(payload, prompt_records)
+        if trajectories is None:
+            raise RuntimeError("AgentProgram rollout produced no trajectories")
         allowed_prompt_ids = {prompt.prompt_id for prompt in prompt_records}
         for trajectory in trajectories:
             if trajectory.prompt_id not in allowed_prompt_ids:
@@ -90,3 +115,90 @@ class ProgramAgentRunner:
             settings=self.settings,
             metadata={"runner": "program"},
         )
+
+    @staticmethod
+    def _serialize_trajectories(trajectories: tuple[Trajectory, ...]) -> list[dict[str, Any]]:
+        """Convert device tensors to an object-collective-safe payload."""
+        return [
+            {
+                "trajectory_id": item.trajectory_id,
+                "prompt_id": item.prompt_id,
+                "group_id": item.group_id,
+                "policy_version": item.policy_version,
+                "turns": [
+                    {
+                        "role": turn.role,
+                        "content": turn.content,
+                        "token_start": turn.token_start,
+                        "token_end": turn.token_end,
+                        "trainable": turn.trainable,
+                        "metadata": turn.metadata,
+                    }
+                    for turn in item.turns
+                ],
+                "token_ids": item.token_ids.detach().cpu().tolist(),
+                "attention_mask": item.attention_mask.detach().cpu().tolist(),
+                "action_mask": item.action_mask.detach().cpu().tolist(),
+                "rollout_log_probs": (
+                    None
+                    if item.rollout_log_probs is None
+                    else item.rollout_log_probs.detach().cpu().tolist()
+                ),
+                "reward": item.reward,
+                "reward_components": item.reward_components,
+                "done": item.done,
+                "truncated": item.truncated,
+                "terminal_reason": item.terminal_reason,
+                "metadata": item.metadata,
+                "worker_policy_version": item.worker_policy_version,
+                "worker_policy_fingerprint": item.worker_policy_fingerprint,
+            }
+            for item in trajectories
+        ]
+
+    @staticmethod
+    def _deserialize_trajectories(
+        payload: Any,
+        prompt_records: Sequence[PromptRecord],
+    ) -> tuple[Trajectory, ...]:
+        """Restore synchronized trajectory payloads on each Trainer TP sibling."""
+        if not isinstance(payload, list):
+            raise ValueError("Synchronized agent trajectory payload must be a list")
+        prompts = {prompt.prompt_id: prompt for prompt in prompt_records}
+        trajectories = []
+        for item in payload:
+            if not isinstance(item, dict) or item.get("prompt_id") not in prompts:
+                raise ValueError("Synchronized agent trajectory references an unknown prompt")
+            prototype = prompts[item["prompt_id"]].metadata.get("input_ids")
+            if prototype is None or not platform.is_tensor(prototype):
+                raise ValueError("Synchronized agent trajectory requires prompt input_ids")
+            logprobs = item.get("rollout_log_probs")
+            trajectories.append(
+                Trajectory(
+                    trajectory_id=str(item["trajectory_id"]),
+                    prompt_id=str(item["prompt_id"]),
+                    group_id=item.get("group_id"),
+                    policy_version=int(item["policy_version"]),
+                    turns=tuple(Turn(**turn) for turn in item["turns"]),
+                    token_ids=prototype.new_tensor(item["token_ids"]),
+                    attention_mask=prototype.new_tensor(item["attention_mask"]),
+                    action_mask=prototype.new_tensor(
+                        item["action_mask"],
+                        dtype=platform.tensor_dtype.bool,
+                    ),
+                    rollout_log_probs=(
+                        None
+                        if logprobs is None
+                        else prototype.new_tensor(logprobs, dtype=platform.tensor_dtype.float32)
+                    ),
+                    reward=float(item["reward"]),
+                    reward_components=dict(item["reward_components"]),
+                    done=bool(item["done"]),
+                    truncated=bool(item["truncated"]),
+                    terminal_reason=str(item["terminal_reason"]),
+                    metadata=dict(item["metadata"]),
+                    worker_policy_version=item.get("worker_policy_version"),
+                    worker_policy_fingerprint=item.get("worker_policy_fingerprint"),
+                )
+            )
+        return tuple(trajectories)

@@ -1,0 +1,169 @@
+model:
+  registry_name: qwen3_4b
+  name: qwen3
+  weights_path: /models/Qwen3-4B
+  tokenizer_path: /models/Qwen3-4B
+  config_overrides: null
+
+consistency:
+  enabled: false
+
+data:
+  train_path: /data/gsm8k/train.parquet
+  test_path: /data/gsm8k/test.parquet
+  prompt_column: prompt
+  answer_column: null
+  max_prompt_length: 512
+  max_train_samples: 4
+  shuffle: false
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: true
+
+rollout:
+  engine: vllm
+  num_return_sequences: 4
+  max_new_tokens: 256
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  seed: 20260903
+  vllm:
+    deployment: colocated
+    data_parallel_size: 2
+    port: 8100
+    model_implementation: native
+    tensor_parallel_size: 1
+    weight_sync:
+      strategy: full_gather
+      fallback_strategy: none
+      bucket_size_mb: 128
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: true
+    batch_invariant: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    enable_auto_tool_choice: true
+    tool_call_parser: hermes
+    gpu_memory_utilization: 0.15
+    kv_cache_memory_bytes: 1073741824
+    max_model_len: 2048
+    block_size: 128
+    max_num_seqs: 4
+    max_num_batched_tokens: 8192
+    logprobs_mode: raw_logprobs
+    startup_timeout: 600
+    request_timeout: 600
+
+agentic:
+  runner: deepseek
+  module_path: examples.agents.gsm8k.agent
+  environment: gsm8k_tools
+  interaction_mode: multi_turn
+  protocol: json_function_call
+  apply_chat_template: true
+  max_turns: 2
+  max_observation_tokens: 0
+  max_episode_tokens: 2048
+  deepseek:
+    version: "0.1.1rc1"
+    provider: deepseek-official
+    model: qwen3
+    reasoning_effort: "off"
+    required_tool_calls: 1
+    required_tool_name: bash
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 8300
+    timeout_seconds: 1800
+    request_timeout: 600
+    shutdown_timeout_seconds: 5
+    session_root: /results/deepseek-trajectories
+    reward_callable: examples.agents.gsm8k.agent:score_deepseek_gsm8k_answer
+    instruction_template: |-
+      Solve the arithmetic word problem below.
+      Immediately call the Bash tool exactly once and use Python to calculate the answer.
+      Do not write analysis before the tool call.
+      After the tool returns, respond with exactly "#### NUMBER" and nothing else.
+
+      Problem: {prompt}
+
+evaluation:
+  enabled: false
+  batch_size: 1
+  max_samples: 1
+  max_new_tokens: 128
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  log_samples: 0
+  progress_steps: 0
+
+algorithm:
+  name: grpo
+  advantage_epsilon: 1.0e-6
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  clip_ratio_c: 3.0
+  kl_coef: 0.001
+  kl_type: low_var_kl
+  loss_aggregation: token-mean
+
+train:
+  max_steps: 2
+  seed: 1234
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 4
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate:
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+    require_fingerprint_change: false
+  accelerator:
+    dp_replicate: 1
+    dp_shard: 2
+    tp: 1
+    cp: 1
+    pp: 1
+    reshard_after_forward: true
+    comm_fusion: true
+    cpu_offload: true
+    activation_checkpoint: full
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: null
+  optimizer:
+    lr: 1.0e-6
+    lr_min: 0.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    eps: 1.0e-8
+    betas: [0.9, 0.999]
+    foreach: null
+  checkpoint:
+    output_dir: /results/checkpoints
+    save_steps: 0
+    save_final: true
+    verify_reload: false
+
+logging:
+  backends: [console]
+  project_name: hyper-rl
+  experiment_name: qwen3_4b_deepseek_gsm8k
+  log_steps: 1
+  log_samples: 2
+  wandb:
+    mode: disabled
+    entity: null
+    directory: /results/wandb

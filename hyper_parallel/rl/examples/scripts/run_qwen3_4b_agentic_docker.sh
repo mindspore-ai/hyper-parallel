@@ -20,6 +20,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../../.." && pwd)
 
 : "${HYPER_VLLM_IMAGE:=hyper-parallel/unified-e2-dev:v0.22.1rc1}"
+: "${HYPER_CODEX_IMAGE:=hyper-parallel/hyper-rl-codex:v0.22.1rc1}"
 : "${HYPER_VLLM_MODEL_ROOT:=/home/mwl/ckpt/qwen3-4b}"
 : "${HYPER_VLLM_DATA_ROOT:=/home/zjy/dataset/hotpotqa}"
 : "${HYPER_GSM8K_DATA_ROOT:=/home/zjy/dataset/gsm8k}"
@@ -28,22 +29,40 @@ repo_root=$(cd -- "${script_dir}/../../../.." && pwd)
 : "${HYPER_VLLM_MODEL_IMPLEMENTATION:=native}"
 : "${HYPER_VLLM_TIMEOUT_SECONDS:=3600}"
 : "${HYPER_REQUIRE_LEARNING_UPDATE:=false}"
+: "${HYPER_VLLM_PORT:=8100}"
+: "${HYPER_CODEX_GATEWAY_PORT:=8200}"
 
 case "${HYPER_AGENTIC_TASK}" in
     gsm8k)
+        runtime_image=${HYPER_VLLM_IMAGE}
         task_data_root=${HYPER_GSM8K_DATA_ROOT}
         container_data_root=/data/gsm8k
         config_relative=hyper_parallel/rl/examples/agents/gsm8k/configs/single_turn.yaml
         required_data_files=(train.parquet)
         ;;
+    gsm8k_codex)
+        runtime_image=${HYPER_CODEX_IMAGE}
+        task_data_root=${HYPER_GSM8K_DATA_ROOT}
+        container_data_root=/data/gsm8k
+        config_relative=hyper_parallel/rl/examples/agents/gsm8k/configs/codex_multi_turn.yaml
+        required_data_files=(train.parquet)
+        ;;
     search_r1)
+        runtime_image=${HYPER_VLLM_IMAGE}
         task_data_root=${HYPER_VLLM_DATA_ROOT}
         container_data_root=/data/hotpotqa
         config_relative=hyper_parallel/rl/examples/agents/search_R1/configs/multi_turn.yaml
         required_data_files=(train.parquet corpus.jsonl)
         ;;
+    search_r1_codex)
+        runtime_image=${HYPER_CODEX_IMAGE}
+        task_data_root=${HYPER_VLLM_DATA_ROOT}
+        container_data_root=/data/hotpotqa
+        config_relative=hyper_parallel/rl/examples/agents/search_R1/configs/codex_multi_turn.yaml
+        required_data_files=(train.parquet corpus.jsonl)
+        ;;
     *)
-        printf 'HYPER_AGENTIC_TASK must be gsm8k or search_r1, got: %s\n' \
+        printf 'HYPER_AGENTIC_TASK must be gsm8k, gsm8k_codex, search_r1, or search_r1_codex, got: %s\n' \
             "${HYPER_AGENTIC_TASK}" >&2
         exit 1
         ;;
@@ -65,6 +84,20 @@ IFS=',' read -r first_device second_device <<< "${HYPER_VLLM_VISIBLE_DEVICES}"
 }
 [[ "${HYPER_REQUIRE_LEARNING_UPDATE}" =~ ^(true|false)$ ]] || {
     printf 'HYPER_REQUIRE_LEARNING_UPDATE must be true or false\n' >&2
+    exit 1
+}
+[[ "${HYPER_VLLM_PORT}" =~ ^[0-9]+$ ]] &&
+(( HYPER_VLLM_PORT >= 1 && HYPER_VLLM_PORT <= 65535 )) || {
+    printf 'HYPER_VLLM_PORT must be an integer between 1 and 65535\n' >&2
+    exit 1
+}
+[[ "${HYPER_CODEX_GATEWAY_PORT}" =~ ^[0-9]+$ ]] &&
+(( HYPER_CODEX_GATEWAY_PORT >= 1 && HYPER_CODEX_GATEWAY_PORT <= 65535 )) || {
+    printf 'HYPER_CODEX_GATEWAY_PORT must be an integer between 1 and 65535\n' >&2
+    exit 1
+}
+[[ "${HYPER_VLLM_PORT}" != "${HYPER_CODEX_GATEWAY_PORT}" ]] || {
+    printf 'HYPER_VLLM_PORT and HYPER_CODEX_GATEWAY_PORT must differ\n' >&2
     exit 1
 }
 [[ -d "${HYPER_VLLM_MODEL_ROOT}" ]] || {
@@ -109,6 +142,8 @@ docker run --rm --privileged --shm-size=64g --network=host \
     -e "HYPER_RUN_TIMEOUT_SECONDS=${HYPER_VLLM_TIMEOUT_SECONDS}" \
     -e "HYPER_RUN_MODEL_IMPLEMENTATION=${HYPER_VLLM_MODEL_IMPLEMENTATION}" \
     -e "HYPER_RUN_REQUIRE_LEARNING_UPDATE=${HYPER_REQUIRE_LEARNING_UPDATE}" \
+    -e "HYPER_RUN_VLLM_PORT=${HYPER_VLLM_PORT}" \
+    -e "HYPER_RUN_CODEX_GATEWAY_PORT=${HYPER_CODEX_GATEWAY_PORT}" \
     -v /usr/local/dcmi:/usr/local/dcmi:ro \
     -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
     -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \
@@ -119,8 +154,11 @@ docker run --rm --privileged --shm-size=64g --network=host \
     -v "${task_data_root}:${container_data_root}:ro" \
     -v "${result_root}:/results" \
     -w /workspace/hyper-parallel \
-    "${HYPER_VLLM_IMAGE}" /bin/bash -lc '
+    "${runtime_image}" /bin/bash -lc '
         set -euo pipefail
+        if [[ "${HYPER_RUN_TASK}" == *_codex ]]; then
+            codex --version | grep -Eq "(^|[[:space:]])0[.]152[.]1($|[[:space:]])"
+        fi
         unset VLLM_PLUGINS
         export PYTHONPATH=/workspace/hyper-parallel/hyper_parallel/rl:/workspace/hyper-parallel:${PYTHONPATH:-}
         config_path=/workspace/hyper-parallel/${HYPER_RUN_CONFIG}
@@ -128,8 +166,15 @@ docker run --rm --privileged --shm-size=64g --network=host \
         args=(
             "${config_path}"
             "--rollout.vllm.model_implementation=${HYPER_RUN_MODEL_IMPLEMENTATION}"
+            "--rollout.vllm.port=${HYPER_RUN_VLLM_PORT}"
         )
-        if [[ "${HYPER_RUN_REQUIRE_LEARNING_UPDATE}" == "true" ]]; then
+        if [[ "${HYPER_RUN_TASK}" == *_codex ]]; then
+            args+=(
+                "--agentic.codex.gateway_port=${HYPER_RUN_CODEX_GATEWAY_PORT}"
+            )
+        fi
+        if [[ "${HYPER_RUN_REQUIRE_LEARNING_UPDATE}" == "true" &&
+              "${HYPER_RUN_TASK}" != *_codex ]]; then
             args+=(
                 --train.learning_gate.enabled=true
                 --train.learning_gate.min_gradient_norm=1.0e-12
@@ -156,6 +201,16 @@ docker run --rm --privileged --shm-size=64g --network=host \
         [[ -f "${checkpoint_manifest}" ]]
         grep -Eq '"step"[[:space:]]*:[[:space:]]*2' "${checkpoint_manifest}"
         grep -Eq '"world_size"[[:space:]]*:[[:space:]]*2' "${checkpoint_manifest}"
+        if [[ "${HYPER_RUN_REQUIRE_LEARNING_UPDATE}" == "true" &&
+              "${HYPER_RUN_TASK}" == *_codex ]]; then
+            learning_update_pattern="policy/fingerprint_changed=1([, ]|$).*reward/max=1([.]0+)?([, ]|$).*reward/min=0([.]0+)?([, ]|$).*train/gradient_norm=([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)([eE][+-]?[0-9]+)?([, ]|$).*train/optimizer_steps=[1-9][0-9]*([, ]|$)"
+            grep -Eq "${learning_update_pattern}" "${log_file}" || {
+                printf "Codex learning-update gate failed: no step had mixed rewards, a positive gradient, an optimizer step, and a changed policy fingerprint. Log: %s\n" \
+                    "${log_file}" >&2
+                exit 1
+            }
+            printf "Codex learning-update gate passed. Log: %s\n" "${log_file}"
+        fi
         printf "Two-step Qwen3-4B %s Agentic RL control flow passed. Log: %s\n" \
             "${HYPER_RUN_TASK}" "${log_file}"
     '

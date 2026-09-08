@@ -210,3 +210,34 @@ def build_search_registry(
         },
     )(search)
     return registry
+
+
+def build_codex_search_registry(settings: Mapping[str, Any]) -> ToolRegistry:
+    """Build the existing Search-R1 registry for the lightweight MCP process."""
+    corpus_value = settings.get("search_corpus_path")
+    if not isinstance(corpus_value, str) or not corpus_value.strip():
+        raise ValueError("agentic.search_corpus_path must be a non-empty JSONL path")
+    max_documents = settings.get("search_max_documents")
+    if max_documents is not None and (
+        isinstance(max_documents, bool)
+        or not isinstance(max_documents, int)
+        or max_documents <= 0
+    ):
+        raise ValueError("agentic.search_max_documents must be a positive integer")
+
+    def positive_int(name: str, default: int) -> int:
+        value = settings.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"agentic.{name} must be a positive integer")
+        return value
+
+    retriever = LocalBM25Retriever.from_jsonl(
+        Path(corpus_value).expanduser().resolve(),
+        max_documents=max_documents,
+    )
+    return build_search_registry(
+        retriever,
+        top_k=positive_int("search_top_k", 3),
+        max_query_chars=positive_int("search_max_query_chars", 256),
+        max_document_chars=positive_int("search_max_document_chars", 1200),
+    )

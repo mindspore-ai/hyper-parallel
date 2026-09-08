@@ -66,6 +66,16 @@ def compute_gsm8k_reward(solution: str, ground_truth: str) -> float:
     )
 
 
+def score_codex_gsm8k_answer(answer: str, prompt: PromptRecord) -> float:
+    """Score the final answer from one black-box Codex GSM8K episode."""
+    return compute_gsm8k_reward(answer, str(prompt.ground_truth))
+
+
+def score_deepseek_gsm8k_answer(answer: str, prompt: PromptRecord) -> float:
+    """Score the final answer from one DeepSeek Harness GSM8K episode."""
+    return compute_gsm8k_reward(answer, str(prompt.ground_truth))
+
+
 def _validate_context(expected: EpisodeContext, received: EpisodeContext) -> None:
     """Reject lifecycle calls crossing episode identities."""
     if (

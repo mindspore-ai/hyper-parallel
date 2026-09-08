@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img"
+     aria-labelledby="title description">
+  <title id="title">Agentic RL interaction with Hyper-RL</title>
+  <desc id="description">
+    Prompt records enter SyncTrainer, which selects an internal, Codex, or DeepSeek runner. All paths use one shared
+    vLLM policy and produce a canonical trajectory. Hyper-RL builds an experience batch, updates the actor, and
+    publishes the next policy snapshot back to vLLM.
+  </desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"
+            markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#6B7A88"/>
+    </marker>
+    <style>
+      .canvas { fill: #FFFFFF; }
+      .title { font: 700 30px "Times New Roman", serif; fill: #2F3E4D; }
+      .subtitle { font: 400 17px "Times New Roman", serif; fill: #596775; }
+      .section { font: 700 19px "Times New Roman", serif; fill: #334155; }
+      .label { font: 700 17px "Times New Roman", serif; fill: #334155; }
+      .detail { font: 400 14px "Times New Roman", serif; fill: #526170; }
+      .step { font: 700 16px "Times New Roman", serif; fill: #FFFFFF; }
+      .line { fill: none; stroke: #6B7A88; stroke-width: 2; marker-end: url(#arrow); }
+      .return { fill: none; stroke: #7D8F80; stroke-width: 2; marker-end: url(#arrow); }
+      .update { fill: none; stroke: #8B7E9D; stroke-width: 2.5; stroke-dasharray: 8 6; marker-end: url(#arrow); }
+      .soft-line { fill: none; stroke: #A1ADB7; stroke-width: 1.5; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1440" height="900"/>
+  <text class="title" x="720" y="48" text-anchor="middle">Agentic RL in Hyper-RL</text>
+  <text class="subtitle" x="720" y="76" text-anchor="middle">
+    One rollout contract, three runner paths, one shared policy lifecycle
+  </text>
+
+  <rect x="28" y="102" width="1384" height="390" rx="18" fill="#FAFBFC" stroke="#CCD5DC" stroke-width="1.5"/>
+  <text class="section" x="52" y="134">Rollout and Agent Interaction</text>
+
+  <rect x="55" y="190" width="190" height="100" rx="12" fill="#EAF2F8" stroke="#7A9EB8" stroke-width="2"/>
+  <circle cx="76" cy="208" r="14" fill="#7A9EB8"/>
+  <text class="step" x="76" y="214" text-anchor="middle">1</text>
+  <text class="label" x="150" y="230" text-anchor="middle">PromptRecord</text>
+  <text class="detail" x="150" y="257" text-anchor="middle">messages · ground truth</text>
+  <text class="detail" x="150" y="277" text-anchor="middle">tokenized prompt</text>
+
+  <rect x="285" y="190" width="205" height="100" rx="12" fill="#EDF5EF" stroke="#86A88D" stroke-width="2"/>
+  <circle cx="306" cy="208" r="14" fill="#86A88D"/>
+  <text class="step" x="306" y="214" text-anchor="middle">2</text>
+  <text class="label" x="388" y="230" text-anchor="middle">SyncTrainer</text>
+  <text class="detail" x="388" y="257" text-anchor="middle">build prompt · choose runner</text>
+  <text class="detail" x="388" y="277" text-anchor="middle">own the training step</text>
+
+  <rect x="530" y="150" width="300" height="260" rx="14" fill="#F7F2E8" stroke="#B9A784" stroke-width="2"/>
+  <circle cx="552" cy="171" r="14" fill="#B9A784"/>
+  <text class="step" x="552" y="177" text-anchor="middle">3</text>
+  <text class="label" x="680" y="180" text-anchor="middle">Rollout Manager Selection</text>
+
+  <rect x="558" y="205" width="244" height="52" rx="9" fill="#FFFFFF" stroke="#AEB9A8"/>
+  <text class="label" x="680" y="228" text-anchor="middle">Internal</text>
+  <text class="detail" x="680" y="247" text-anchor="middle">AgentRunner · AgentSession</text>
+
+  <rect x="558" y="272" width="244" height="52" rx="9" fill="#FFFFFF" stroke="#A99DB8"/>
+  <text class="label" x="680" y="295" text-anchor="middle">Codex</text>
+  <text class="detail" x="680" y="314" text-anchor="middle">ProgramAgentRunner · Gateway</text>
+
+  <rect x="558" y="339" width="244" height="52" rx="9" fill="#FFFFFF" stroke="#A99DB8"/>
+  <text class="label" x="680" y="362" text-anchor="middle">DeepSeek</text>
+  <text class="detail" x="680" y="381" text-anchor="middle">ProgramAgentRunner · Gateway</text>
+
+  <rect x="870" y="162" width="230" height="112" rx="12" fill="#F2EEF7" stroke="#9A8EAE" stroke-width="2"/>
+  <text class="label" x="985" y="200" text-anchor="middle">Agent Control Flow</text>
+  <text class="detail" x="985" y="226" text-anchor="middle">action · observation</text>
+  <text class="detail" x="985" y="247" text-anchor="middle">termination · reward</text>
+
+  <rect x="870" y="310" width="230" height="112" rx="12" fill="#F7F2E8" stroke="#B9A784" stroke-width="2"/>
+  <text class="label" x="985" y="348" text-anchor="middle">Tools and Environment</text>
+  <text class="detail" x="985" y="374" text-anchor="middle">ToolRegistry · ToolExecutor</text>
+  <text class="detail" x="985" y="395" text-anchor="middle">MCP when configured</text>
+
+  <rect x="1160" y="212" width="215" height="140" rx="12" fill="#EAF2F8" stroke="#7A9EB8" stroke-width="2"/>
+  <circle cx="1182" cy="232" r="14" fill="#7A9EB8"/>
+  <text class="step" x="1182" y="238" text-anchor="middle">4</text>
+  <text class="label" x="1268" y="258" text-anchor="middle">Shared vLLM Policy</text>
+  <text class="detail" x="1268" y="286" text-anchor="middle">token IDs · raw logprobs</text>
+  <text class="detail" x="1268" y="307" text-anchor="middle">version · fingerprint</text>
+  <text class="detail" x="1268" y="328" text-anchor="middle">one shared endpoint</text>
+
+  <path class="line" d="M245 240 H285"/>
+  <path class="line" d="M490 240 H530"/>
+  <path class="line" d="M830 240 H870"/>
+  <path class="line" d="M1100 218 C1128 218 1134 252 1160 252"/>
+  <path class="return" d="M1160 318 C1130 318 1125 250 1100 250"/>
+  <path class="soft-line" d="M985 274 V310"/>
+  <path class="return" d="M1100 366 C1135 366 1135 250 1100 250"/>
+
+  <rect x="28" y="518" width="1384" height="320" rx="18" fill="#FAFBFC" stroke="#CCD5DC" stroke-width="1.5"/>
+  <text class="section" x="52" y="550">Canonical Data and Learning</text>
+
+  <rect x="1025" y="595" width="300" height="105" rx="12" fill="#F2EEF7" stroke="#9A8EAE" stroke-width="2"/>
+  <circle cx="1047" cy="615" r="14" fill="#9A8EAE"/>
+  <text class="step" x="1047" y="621" text-anchor="middle">5</text>
+  <text class="label" x="1175" y="630" text-anchor="middle">Trajectory</text>
+  <text class="detail" x="1175" y="657" text-anchor="middle">token_ids · action_mask · reward</text>
+  <text class="detail" x="1175" y="678" text-anchor="middle">policy identity · aligned logprobs</text>
+
+  <rect x="700" y="595" width="270" height="105" rx="12" fill="#EAF2F8" stroke="#7A9EB8" stroke-width="2"/>
+  <circle cx="722" cy="615" r="14" fill="#7A9EB8"/>
+  <text class="step" x="722" y="621" text-anchor="middle">6</text>
+  <text class="label" x="835" y="630" text-anchor="middle">ExperienceBatch</text>
+  <text class="detail" x="835" y="657" text-anchor="middle">padding · validation</text>
+  <text class="detail" x="835" y="678" text-anchor="middle">advantages · reference logprobs</text>
+
+  <rect x="385" y="595" width="260" height="105" rx="12" fill="#EDF5EF" stroke="#86A88D" stroke-width="2"/>
+  <circle cx="407" cy="615" r="14" fill="#86A88D"/>
+  <text class="step" x="407" y="621" text-anchor="middle">7</text>
+  <text class="label" x="515" y="630" text-anchor="middle">RL Algorithm and Actor</text>
+  <text class="detail" x="515" y="657" text-anchor="middle">GRPO / PPO requirements</text>
+  <text class="detail" x="515" y="678" text-anchor="middle">loss · gradient · optimizer step</text>
+
+  <rect x="70" y="595" width="260" height="105" rx="12" fill="#F7F2E8" stroke="#B9A784" stroke-width="2"/>
+  <circle cx="92" cy="615" r="14" fill="#B9A784"/>
+  <text class="step" x="92" y="621" text-anchor="middle">8</text>
+  <text class="label" x="200" y="630" text-anchor="middle">Policy Publication</text>
+  <text class="detail" x="200" y="657" text-anchor="middle">PolicySnapshot(next version)</text>
+  <text class="detail" x="200" y="678" text-anchor="middle">weight sync · fingerprint check</text>
+
+  <path class="return" d="M1025 648 H970"/>
+  <path class="return" d="M700 648 H645"/>
+  <path class="return" d="M385 648 H330"/>
+  <path class="line" d="M830 390 C850 475 1175 475 1175 595"/>
+  <path class="update" d="M200 595 C200 515 1385 530 1385 354 C1385 330 1378 312 1375 300"/>
+
+  <rect x="55" y="758" width="1315" height="50" rx="10" fill="#FFFFFF" stroke="#D4DBE1"/>
+  <text class="detail" x="712" y="780" text-anchor="middle">
+    Invariant: every runner must return the same token-first contract; environment observations never enter policy loss.
+  </text>
+  <text class="detail" x="712" y="800" text-anchor="middle">
+    External episodes run on the request-owner rank and synchronize their trajectory payload to Trainer TP siblings.
+  </text>
+
+  <line x1="510" y1="865" x2="560" y2="865" stroke="#6B7A88" stroke-width="2"/>
+  <text class="detail" x="570" y="870">data / call flow</text>
+  <line x1="735" y1="865" x2="785" y2="865" stroke="#8B7E9D" stroke-width="2.5" stroke-dasharray="8 6"/>
+  <text class="detail" x="795" y="870">updated policy</text>
+</svg>
