@@ -18,11 +18,11 @@ deployment model intact. Use it during Scope (step 1) and Implement (step 2).
 | Utils | `rl/utils/` | Helpers shared across the above (incl. `monitoring/metrics.py`). |
 
 `rl/registry.py` + `rl/roles/rollout/registry.py` handle Algorithm / environment
-/ rollout-engine registration. `rl/roles/weight_sync/` is the most
-consequence-heavy — 6 modules + `__init__.py` / ~5.4k lines — and the most
-fragile:
-`layout.py` (placement contract), `hccl.py`/`transfer.py` (transport),
-`checkpoint.py`/`sync.py`/`vllm_worker.py` (publication lifecycle).
+/ rollout-engine registration. Weight synchronization uses `config.py` for
+defaults/support boundaries, `layout.py` for placements, `model_adapter.py` for
+canonical parameters, `streaming_full_gather.py` for bounded gather/packing,
+`tensor_ops.py` for local storage access, `hccl.py`/`transfer.py` for transport,
+and `checkpoint.py`/`sync.py`/`vllm_worker.py` for publication lifecycle.
 
 ## Source Layout
 

@@ -31,10 +31,7 @@ from rl.roles.model import (
     resolve_vllm_model,
 )
 from rl.roles.rollout.vllm import VLLMGenerationEngine
-from rl.roles.weight_sync.transfer import (
-    ColocatedFullGatherWeightTransfer,
-    map_actor_state_dict,
-)
+from rl.roles.weight_sync.model_adapter import build_model_weight_adapter
 from rl.roles.weight_sync.sync import (
     ActorRolloutWeightSync,
     PolicySnapshot,
@@ -96,14 +93,20 @@ def test_native_architecture_and_refit_names_follow_qwen3_contract() -> None:
         "lm_head.weight": object(),
     }
     qwen3_rollout_model = resolve_vllm_model(_model("qwen3"), "native")
-    assert list(map_actor_state_dict(qwen3_state, qwen3_rollout_model)) == [
+    mapped_state = build_model_weight_adapter(
+        qwen3_rollout_model
+    ).map_local_state_dict(qwen3_state)
+    assert list(mapped_state) == [
         "model.layers.0.self_attn.q_proj.weight"
     ]
     untied_rollout_model = resolve_vllm_model(
         _model(tie_word_embeddings=False),
         "native",
     )
-    assert list(map_actor_state_dict(qwen3_state, untied_rollout_model)) == [
+    mapped_state = build_model_weight_adapter(
+        untied_rollout_model
+    ).map_local_state_dict(qwen3_state)
+    assert list(mapped_state) == [
         "model.layers.0.self_attn.q_proj.weight",
         "lm_head.weight",
     ]
@@ -1263,21 +1266,6 @@ def test_http_client_close_ignores_reaped_resource_zombies(
         (123, vllm_module.signal.SIGKILL),
         (123, 0),
     ]
-
-
-@pytest.mark.parametrize("implementation", ["hyper", "native"])
-def test_qwen3_internal_dp_weight_transfer_uses_one_shared_endpoint(
-    implementation: str,
-) -> None:
-    """Both Qwen3 implementations submit one shared full-gather transaction."""
-    transfer = ColocatedFullGatherWeightTransfer(
-        resolve_vllm_model(_model(), implementation),
-    )
-    client = SimpleNamespace(base_url="http://127.0.0.1:8100")
-
-    assert transfer._transfer_endpoints(client) == (  # pylint: disable=protected-access
-        "http://127.0.0.1:8100",
-    )
 
 
 def test_server_command_preserves_explicit_prefill_and_logprob_semantics() -> None:

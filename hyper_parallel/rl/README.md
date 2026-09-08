@@ -41,7 +41,7 @@ Transformers Qwen3
 
 - `colocated`：Trainer 与 rollout 共用 NPU，通过 sleep/wake 切换 residency，使用 NPU IPC 发布权重。
 - `disjoint`：Trainer 与 rollout 使用不相交的 NPU，rollout 保持 resident，使用 HCCL 发布权重。
-- TP1 权重同步自动使用 full-gather；Qwen3 TP2 支持 full-gather、direct-reshard 和 full-gather fallback。
+- 权重同步默认使用流式 full-gather；TP1/TP2 均可显式选择 direct-reshard，fallback 需显式开启。
 - vLLM upstream 负责 DP request routing 与 frontend 数量；已删除 rank-local server 和额外 topology 配置。
 
 详细设计见 [Hyper-RL 架构](docs/architecture.md) 和 [vLLM Rollout](docs/vllm_rollout.md)。
@@ -232,6 +232,9 @@ Bit-exact 的比较时点、数值 recipe 和验收指标见
 - `rollout.vllm.model_implementation`：`hyper|native`。
 - `rollout.vllm.weight_sync.strategy`：`full_gather|direct_reshard`。
 - `rollout.vllm.weight_sync.fallback_strategy`：`none|full_gather`。
+- 未指定策略时默认 `full_gather`，未指定 fallback 时默认 `none`；launcher 或模型 YAML 中的显式选项优先。
+- `full_gather` 始终按确定性 fragment/bucket 逐批 gather、传输、ACK 和释放，不物化完整聚合模型权重；
+  `bucket_size_mb` 控制单个传输 buffer，不代表整个进程的显存上限。
 - `consistency.enabled=false` 时两侧 TP 可以不同；设为 `true` 时只允许 Qwen3 Hyper-vLLM matched TP。
 - Disjoint 必须提供与 rollout DP×TP 数量一致、且不与 Trainer 重叠的 `visible_devices`。
 - 已删除并显式拒绝：`rollout.vllm.topology`、`request_concurrency`、`api_server_count` 及旧 topology 环境变量。

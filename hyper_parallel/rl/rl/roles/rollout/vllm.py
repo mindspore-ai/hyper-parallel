@@ -49,6 +49,7 @@ from rl.roles.weight_sync import (
     synchronized_call,
     synchronize_error,
 )
+from rl.roles.weight_sync.config import resolve_weight_sync_config
 from hyper_parallel import get_platform
 platform = get_platform()
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
@@ -793,6 +794,26 @@ class VLLMGenerationEngine:
         return self._weight_sync.direct_success_count
 
     @property
+    def weight_sync_attempted_strategies(self) -> tuple[str, ...]:
+        """Return strategies attempted by the latest publication."""
+        return self._weight_sync.attempted_strategies
+
+    @property
+    def weight_sync_completed_strategy(self) -> Optional[str]:
+        """Return the strategy that completed the latest publication."""
+        return self._weight_sync.completed_strategy
+
+    @property
+    def weight_sync_fallback_reason(self) -> Optional[str]:
+        """Return the failure that triggered the latest fallback."""
+        return self._weight_sync.fallback_reason
+
+    @property
+    def weight_sync_streaming_stats(self) -> Optional[Mapping[str, Any]]:
+        """Return bounded counters from the latest streaming publication."""
+        return self._weight_sync.streaming_stats
+
+    @property
     def phase(self) -> str:
         """Return the current colocated residency and publication phase."""
         return self._weight_sync.phase
@@ -1394,16 +1415,21 @@ def build_vllm_engine(
     weight_sync_config = vllm_config.get("weight_sync", {})
     if not isinstance(weight_sync_config, Mapping):
         raise ValueError("rollout.vllm.weight_sync must be a mapping")
+    rollout_tp = int(vllm_config.get("tensor_parallel_size", 1))
+    normalized_weight_sync = resolve_weight_sync_config(
+        weight_sync_config,
+        deployment=deployment,
+        model_family=rollout_model.family,
+        rollout_tp=rollout_tp,
+    )
     weight_transfer = build_weight_transfer(
         deployment,
         rollout_model,
-        tensor_parallel_size=int(vllm_config.get("tensor_parallel_size", 1)),
+        tensor_parallel_size=rollout_tp,
         data_parallel_size=int(vllm_config.get("data_parallel_size", 1)),
-        bucket_size_bytes=int(weight_sync_config.get("bucket_size_mb", 128)) * 2**20,
-        strategy=str(weight_sync_config.get("strategy", "full_gather")),
-        fallback_strategy=str(
-            weight_sync_config.get("fallback_strategy", "none")
-        ),
+        bucket_size_bytes=normalized_weight_sync.bucket_size_bytes,
+        strategy=normalized_weight_sync.strategy,
+        fallback_strategy=normalized_weight_sync.fallback_strategy,
     )
     return VLLMGenerationEngine(
         model,

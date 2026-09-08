@@ -23,6 +23,14 @@ from rl.roles.model import (
     normalize_model_implementation,
 )
 from rl.roles.weight_sync.hccl import BroadcastDirectReshardHCCLTransport
+from rl.roles.weight_sync.model_adapter import (
+    DeepseekV3WeightAdapter,
+    ModelWeightAdapter,
+    PackedExpertWeightAdapter,
+    aggregate_direct_content_identity,
+    build_model_weight_adapter,
+    direct_fragment_record,
+)
 from rl.roles.weight_sync.sync import (
     ActorRolloutWeightSync,
     POLICY_FINGERPRINT_ALGORITHM,
@@ -47,7 +55,6 @@ from rl.roles.weight_sync.transfer import (
     FullGatherHCCLWeightTransfer,
     WeightTransfer,
     build_weight_transfer,
-    map_actor_state_dict,
 )
 __all__ = [
     "ActorRolloutWeightSync",
@@ -55,10 +62,13 @@ __all__ = [
     "ColocatedDirectReshardWeightTransfer",
     "ColocatedFullGatherWeightTransfer",
     "DirectReshardHCCLWeightTransfer",
+    "DeepseekV3WeightAdapter",
     "FallbackWeightTransfer",
     "FullGatherHCCLWeightTransfer",
     "HYPER_MODEL_IMPLEMENTATION",
     "HYPER_QWEN3_ARCHITECTURE",
+    "ModelWeightAdapter",
+    "PackedExpertWeightAdapter",
     "NATIVE_MODEL_IMPLEMENTATION",
     "NATIVE_QWEN3_ARCHITECTURE",
     "PolicySnapshot",
@@ -66,12 +76,14 @@ __all__ = [
     "VLLMWeightSyncClientMixin",
     "WeightTransfer",
     "aggregate_policy_fingerprint",
+    "aggregate_direct_content_identity",
     "architecture_for_implementation",
     "build_weight_transfer",
+    "build_model_weight_adapter",
     "canonical_policy_weight_name",
     "coordinator_call",
     "is_policy_fingerprint_weight",
-    "map_actor_state_dict",
+    "direct_fragment_record",
     "normalize_model_implementation",
     "policy_fingerprint_header",
     "policy_tensor_fingerprint",

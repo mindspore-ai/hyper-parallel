@@ -20,10 +20,19 @@ import json
 import os
 from pathlib import Path
 import pickle
+import resource
 from typing import Any, Mapping, Optional
 from rl.roles.model import (
+    HYPER_DEEPSEEK_V3_ARCHITECTURE,
     HYPER_QWEN3_ARCHITECTURE,
+    HYPER_QWEN3_MOE_ARCHITECTURE,
+    NATIVE_DEEPSEEK_V3_ARCHITECTURE,
     NATIVE_QWEN3_ARCHITECTURE,
+    NATIVE_QWEN3_MOE_ARCHITECTURE,
+)
+from rl.roles.weight_sync.model_adapter import (
+    aggregate_direct_content_identity,
+    direct_fragment_record,
 )
 from rl.roles.weight_sync.sync import (
     KEEP_SCHEDULER_PAUSED_TAG,
@@ -35,11 +44,23 @@ from rl.roles.weight_sync.sync import (
 from hyper_parallel import get_platform
 
 platform = get_platform()
-_HYPER_ARCHITECTURES = frozenset((HYPER_QWEN3_ARCHITECTURE,))
-_DIRECT_RESHARD_ARCHITECTURES = frozenset(
-    (HYPER_QWEN3_ARCHITECTURE, NATIVE_QWEN3_ARCHITECTURE)
+_HYPER_ARCHITECTURES = frozenset(
+    (
+        HYPER_DEEPSEEK_V3_ARCHITECTURE,
+        HYPER_QWEN3_ARCHITECTURE,
+        HYPER_QWEN3_MOE_ARCHITECTURE,
+    )
 )
-_POLICY_VERSION_FIELD = "_hyper_policy_version"
+_DIRECT_RESHARD_ARCHITECTURES = frozenset(
+    (
+        HYPER_QWEN3_ARCHITECTURE,
+        HYPER_QWEN3_MOE_ARCHITECTURE,
+        HYPER_DEEPSEEK_V3_ARCHITECTURE,
+        NATIVE_DEEPSEEK_V3_ARCHITECTURE,
+        NATIVE_QWEN3_ARCHITECTURE,
+        NATIVE_QWEN3_MOE_ARCHITECTURE,
+    )
+)
 
 
 @dataclass
@@ -51,6 +72,17 @@ class _PatchState:
 
 
 _patch_state = _PatchState()
+
+
+def _current_process_rss_bytes() -> int:
+    """Return current Linux resident memory, falling back to the process peak."""
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
 
 
 def _rollout_worker_topology(worker: Any) -> dict[str, Any]:
@@ -88,13 +120,21 @@ def _rollout_worker_topology(worker: Any) -> dict[str, Any]:
     else:
         dp_rank = int(parallel_config.data_parallel_index)
         dp_size = int(parallel_config.data_parallel_size)
-    return {
+    result = {
         "dp_rank": dp_rank,
         "dp_size": dp_size,
         "tp_rank": tp_rank,
         "tp_size": tp_size,
         "physical_device_id": physical_device_id,
     }
+    if bool(getattr(parallel_config, "enable_expert_parallel", False)):
+        from vllm.distributed import get_ep_group  # pylint: disable=C0415
+
+        group = get_ep_group()
+        result.update(ep_rank=int(group.rank_in_group), ep_size=int(group.world_size))
+        if result["ep_size"] != dp_size * tp_size or result["ep_rank"] != dp_rank * tp_size + tp_rank:
+            raise ValueError(f"Rollout EP ownership requires flattened DP x TP coordinates: {result}")
+    return result
 
 
 def _validate_direct_reshard_topology(
@@ -133,6 +173,33 @@ def get_policy_version(worker: Any) -> dict[str, int]:
     return {"version": int(getattr(worker, "_hyper_loaded_policy_version", 0))}
 
 
+def get_weight_sync_memory_stats(worker: Any) -> dict[str, Any]:
+    """Return worker peak device and host memory for sync acceptance logs."""
+    handle = platform.get_device_handle(platform.device_type())
+    allocated_fn = getattr(handle, "max_memory_allocated", None)
+    reserved_fn = getattr(handle, "max_memory_reserved", None)
+    current_allocated_fn = getattr(handle, "memory_allocated", None)
+    current_reserved_fn = getattr(handle, "memory_reserved", None)
+    result = _rollout_worker_topology(worker)
+    result.update(
+        {
+            "max_memory_allocated_bytes": int(allocated_fn()) if allocated_fn else 0,
+            "max_memory_reserved_bytes": int(reserved_fn()) if reserved_fn else 0,
+            "current_memory_allocated_bytes": (
+                int(current_allocated_fn()) if current_allocated_fn else 0
+            ),
+            "current_memory_reserved_bytes": (
+                int(current_reserved_fn()) if current_reserved_fn else 0
+            ),
+            "current_host_rss_bytes": _current_process_rss_bytes(),
+            # Linux reports ru_maxrss in KiB.
+            "host_max_rss_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            * 1024,
+        }
+    )
+    return result
+
+
 def get_policy_weight_fingerprint(
     worker: Any,
     version: Optional[int] = None,
@@ -164,7 +231,8 @@ def get_policy_weight_fingerprint(
         value_count += int(values.numel())
     if not tensor_digests:
         raise RuntimeError("vLLM policy fingerprint found no language-model norm tensors")
-    hf_config = getattr(worker.model_config, "hf_config", None)
+    model_config = getattr(worker, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
     architectures = tuple(getattr(hf_config, "architectures", ()) or ())
     try:
         rank = platform.get_rank()
@@ -199,6 +267,195 @@ def verify_policy_weight_identity(
     }
 
 
+def _record_direct_content_fragment(
+    worker: Any,
+    version: int,
+    entry: Mapping[str, Any],
+    target: Any,
+) -> None:
+    """Hash one copied destination slice back in canonical axis order."""
+    import torch  # pylint: disable=C0415,forbidden-backend-import
+
+    canonical_lengths = tuple(int(value) for value in entry["lengths"])
+    permutation = tuple(
+        int(value)
+        for value in entry.get(
+            "destination_permutation",
+            range(len(canonical_lengths)),
+        )
+    )
+    inverse_permutation = tuple(
+        permutation.index(canonical_axis)
+        for canonical_axis in range(len(permutation))
+    )
+    canonical = target.detach().permute(inverse_permutation).contiguous()
+    source_dtype = getattr(torch, str(entry["dtype_name"]))
+    if canonical.dtype != source_dtype:
+        canonical = canonical.to(dtype=source_dtype)
+    raw = canonical.view(torch.uint8).view(-1).to(device="cpu")
+    payload = platform.tensor_to_numpy(raw).tobytes()
+    key, record = direct_fragment_record(
+        str(entry.get("canonical_name", entry["name"])),
+        tuple(
+            int(value)
+            for value in entry.get(
+                "canonical_starts",
+                entry["destination_starts"],
+            )
+        ),
+        canonical_lengths,
+        str(entry["dtype_name"]),
+        payload,
+    )
+    fragments_by_version = getattr(
+        worker,
+        "_hyper_pending_content_fragments",
+        None,
+    )
+    if fragments_by_version is None:
+        fragments_by_version = {}
+        worker._hyper_pending_content_fragments = fragments_by_version
+    fragments = fragments_by_version.setdefault(int(version), {})
+    if key in fragments:
+        if fragments[key] != record:
+            raise RuntimeError(
+                f"Direct content destination changed duplicate fragment {key!r}"
+            )
+        return
+    fragments[key] = record
+    del canonical, raw, payload
+
+
+def verify_direct_content_identity(
+    worker: Any,
+    expected_version: int,
+    expected_by_tp_rank: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Verify one committed worker against its source-derived TP identity."""
+    version = int(expected_version)
+    loaded_version = int(getattr(worker, "_hyper_loaded_policy_version", 0))
+    if loaded_version != version:
+        raise RuntimeError(
+            "Direct content identity policy version mismatch: "
+            f"loaded={loaded_version}, expected={version}"
+        )
+    tp_rank = getattr(worker, "_hyper_loaded_content_tp_rank", None)
+    actual = getattr(worker, "_hyper_loaded_content_identity", None)
+    if tp_rank is None or not isinstance(actual, Mapping):
+        raise RuntimeError("Direct content identity was not committed on this worker")
+    expected = expected_by_tp_rank.get(str(int(tp_rank)))
+    if not isinstance(expected, Mapping):
+        raise RuntimeError(
+            f"Direct content identity has no source expectation for TP rank {tp_rank}"
+        )
+    if dict(actual) != dict(expected):
+        raise RuntimeError(
+            "Direct content identity differs from Trainer source: "
+            f"tp_rank={tp_rank}, expected_digest={expected.get('digest')}, "
+            f"actual_digest={actual.get('digest')}"
+        )
+    return {
+        "verified": True,
+        "version": version,
+        "tp_rank": int(tp_rank),
+        "digest": actual["digest"],
+        "fragment_count": int(actual["fragment_count"]),
+        "total_bytes": int(actual["total_bytes"]),
+    }
+
+
+def get_deepseek_v3_runtime_contract(worker: Any) -> dict[str, Any]:
+    """Describe the vLLM leaves retained by one DeepSeek-V3 worker.
+
+    Absorbed MLA owns latent paged-KV-cache execution and FusedMoE owns the
+    Ascend routed-expert storage/kernel contract.  This diagnostic makes those
+    two deliberate Hyper adapter boundaries observable without depending on
+    their private Python class names in the control plane.
+    """
+    if not _is_deepseek_v3_worker(worker):
+        raise ValueError("DeepSeek-V3 runtime diagnostics require a DeepSeek worker")
+    if worker.model_runner is None:
+        raise RuntimeError("DeepSeek-V3 runtime diagnostics require a model runner")
+    model = worker.model_runner.get_model()
+    hf_config = worker.model_config.hf_config
+    attention_leaves = {}
+    fused_moe_leaves = {}
+    hyper_mla_count = 0
+    for module in model.modules():
+        mla_attention = getattr(module, "mla_attn", None)
+        process_mla_weights = getattr(
+            mla_attention,
+            "process_weights_after_loading",
+            None,
+        )
+        if mla_attention is not None and callable(process_mla_weights):
+            attention_leaves[id(mla_attention)] = (
+                f"{type(mla_attention).__module__}.{type(mla_attention).__name__}"
+            )
+            mla_module = type(mla_attention).__module__
+            if mla_module.startswith(("hyper_parallel", "rl.")):
+                hyper_mla_count += 1
+        if (
+            getattr(module, "w13_weight", None) is not None
+            and getattr(module, "w2_weight", None) is not None
+        ):
+            fused_moe_leaves[id(module)] = (
+                f"{type(module).__module__}.{type(module).__name__}"
+            )
+    expected_attention_layers = int(hf_config.num_hidden_layers)
+    expected_moe_layers = expected_attention_layers - int(
+        getattr(hf_config, "first_k_dense_replace", 0)
+    )
+    if len(attention_leaves) != expected_attention_layers:
+        raise RuntimeError(
+            "DeepSeek-V3 absorbed MLA coverage is incomplete: "
+            f"expected={expected_attention_layers}, actual={len(attention_leaves)}"
+        )
+    if len(fused_moe_leaves) != expected_moe_layers:
+        raise RuntimeError(
+            "DeepSeek-V3 FusedMoE coverage is incomplete: "
+            f"expected={expected_moe_layers}, actual={len(fused_moe_leaves)}"
+        )
+    if hyper_mla_count:
+        raise RuntimeError(
+            "Moonlight q_lora_rank=None must not use the incompatible Hyper MLA: "
+            f"count={hyper_mla_count}"
+        )
+    enable_expert_parallel = bool(
+        getattr(worker.parallel_config, "enable_expert_parallel", False)
+    )
+    result = {
+        "use_mla": bool(worker.model_config.use_mla),
+        "q_lora_rank": getattr(hf_config, "q_lora_rank", None),
+        "kv_lora_rank": int(hf_config.kv_lora_rank),
+        "absorbed_mla_layer_count": len(attention_leaves),
+        "absorbed_mla_classes": sorted(set(attention_leaves.values())),
+        "hyper_mla_layer_count": hyper_mla_count,
+        "fused_moe_layer_count": len(fused_moe_leaves),
+        "fused_moe_classes": sorted(set(fused_moe_leaves.values())),
+        "enable_expert_parallel": enable_expert_parallel,
+    }
+    if _is_hyper_deepseek_v3_worker(worker):
+        ownership = getattr(model, "hyper_component_ownership", None)
+        if not isinstance(ownership, Mapping):
+            raise RuntimeError("Hyper DeepSeek-V3 omitted its component ownership contract")
+        result["component_ownership"] = dict(ownership)
+    return result
+
+
+def _policy_destination_tensors(model: Any) -> dict[str, Any]:
+    """Return refittable parameters and persistent DeepSeek router buffers."""
+    tensors = dict(model.named_parameters())
+    named_buffers = getattr(model, "named_buffers", lambda: ())
+    for name, buffer in named_buffers():
+        if not name.endswith(".mlp.gate.e_score_correction_bias"):
+            continue
+        if name in tensors:
+            raise RuntimeError(f"Duplicate rollout policy tensor {name!r}")
+        tensors[name] = buffer
+    return tensors
+
+
 def get_all_parameter_manifest(worker: Any) -> dict[str, Any]:
     """Return exact byte hashes for every rank-local rollout parameter.
 
@@ -213,10 +470,21 @@ def get_all_parameter_manifest(worker: Any) -> dict[str, Any]:
     tensors: dict[str, dict[str, Any]] = {}
     total_bytes = 0
     try:
-        named_parameters = model.named_parameters(remove_duplicate=False)
+        named_parameters = list(model.named_parameters(remove_duplicate=False))
     except TypeError:
-        named_parameters = model.named_parameters()
-    for name, parameter in sorted(named_parameters, key=lambda item: item[0]):
+        named_parameters = list(model.named_parameters())
+    existing_names = {name for name, _parameter in named_parameters}
+    iter_named_buffers = getattr(model, "named_buffers", lambda: ())
+    named_buffers = [
+        (name, buffer)
+        for name, buffer in iter_named_buffers()
+        if name.endswith(".mlp.gate.e_score_correction_bias")
+        and name not in existing_names
+    ]
+    for name, parameter in sorted(
+        named_parameters + named_buffers,
+        key=lambda item: item[0],
+    ):
         raw = (
             parameter.detach().contiguous().view(-1).view(torch.uint8).to(device="cpu")
         )
@@ -276,6 +544,9 @@ def write_parameter_manifest(
             f"loaded={loaded_version}, expected={version}"
         )
     manifest = get_all_parameter_manifest(worker)
+    model_config = getattr(worker, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = tuple(getattr(hf_config, "architectures", ()) or ())
     if not 0 <= int(manifest["dp_rank"]) < expected_dp_size:
         raise RuntimeError(
             "Parameter manifest DP rank is outside the publication topology: "
@@ -288,8 +559,14 @@ def write_parameter_manifest(
             "oracle_run_id": oracle_run_id,
             "policy_version": version,
             "rollout_replica_rank": int(rollout_replica_rank),
+            "architecture": architectures[0] if architectures else None,
+            "model_type": getattr(hf_config, "model_type", None),
         }
     )
+    if _is_deepseek_v3_worker(worker):
+        manifest["deepseek_runtime"] = get_deepseek_v3_runtime_contract(worker)
+    if _is_native_deepseek_v3_worker(worker) or _is_native_qwen3_moe_worker(worker):
+        manifest["native_moe_ownership"] = _native_moe_ownership_manifest(worker, manifest)
     filename = (
         f"{strategy}-version{version}-replica{int(rollout_replica_rank)}-"
         f"dp{manifest['dp_rank']}-tp{manifest['tp_rank']}.json"
@@ -407,6 +684,8 @@ def _direct_tensor_description(
     placement: str,
     shard_dim: Optional[int],
     destination_starts: tuple[int, ...],
+    destination_permutation: Optional[tuple[int, ...]] = None,
+    accepted_source_dtypes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Describe one logical Actor tensor region inside a physical parameter."""
     if len(local_shape) != len(parameter.shape):
@@ -419,11 +698,17 @@ def _direct_tensor_description(
             f"Native direct tensor {source_name!r} offset rank mismatch: "
             f"offset={destination_starts}, destination={tuple(parameter.shape)}"
         )
+    permutation = destination_permutation or tuple(range(len(local_shape)))
+    if sorted(permutation) != list(range(len(local_shape))):
+        raise ValueError(
+            f"Native direct tensor {source_name!r} has invalid permutation {permutation}"
+        )
+    physical_lengths = tuple(local_shape[axis] for axis in permutation)
     if any(
         start < 0 or start + length > int(limit)
         for start, length, limit in zip(
             destination_starts,
-            local_shape,
+            physical_lengths,
             parameter.shape,
         )
     ):
@@ -441,6 +726,8 @@ def _direct_tensor_description(
         "placement": placement,
         "shard_dim": shard_dim,
         "destination_starts": list(destination_starts),
+        "destination_permutation": list(permutation),
+        "accepted_source_dtypes": list(accepted_source_dtypes),
     }
 
 
@@ -522,7 +809,10 @@ def _native_qwen3_gate_up_descriptions(
     tp_size: int,
 ) -> list[dict[str, Any]]:
     """Map native fused gate/up storage to canonical Actor MLP tensors."""
-    intermediate_size = int(hf_config.intermediate_size)
+    intermediate_size = (
+        int(hf_config.moe_intermediate_size) * int(hf_config.n_shared_experts)
+        if ".shared_experts." in name else int(hf_config.intermediate_size)
+    )
     if intermediate_size % tp_size != 0:
         raise ValueError(
             f"Native Qwen3 intermediate size {intermediate_size} is not divisible by TP {tp_size}"
@@ -559,11 +849,14 @@ def _native_qwen3_direct_tensors(
     hf_config: Any,
     tp_rank: int,
     tp_size: int,
+    *,
+    parameters: Optional[list[tuple[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Describe native vLLM Qwen3 storage in canonical Actor coordinates."""
     tensors = []
     vocab_size = int(hf_config.vocab_size)
-    for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
+    entries = model.named_parameters() if parameters is None else parameters
+    for name, parameter in sorted(entries, key=lambda item: item[0]):
         if ".qkv_proj." in name:
             tensors.extend(
                 _native_qwen3_qkv_descriptions(
@@ -597,7 +890,12 @@ def _native_qwen3_direct_tensors(
             local_shape = (local_size,) + parameter_shape[1:]
             placement = "shard"
             shard_dim = 0
-        elif name.endswith((".self_attn.o_proj.weight", ".mlp.down_proj.weight")):
+        elif name.endswith((".self_attn.q_proj.weight", ".self_attn.kv_b_proj.weight")):
+            local_shape = parameter_shape
+            placement = "shard"
+            shard_dim = 0
+        elif name.endswith((".self_attn.o_proj.weight", ".mlp.down_proj.weight",
+                            ".mlp.shared_experts.down_proj.weight")):
             local_shape = parameter_shape
             placement = "shard"
             shard_dim = 1
@@ -619,8 +917,383 @@ def _native_qwen3_direct_tensors(
     return tensors
 
 
+def _fused_moe_expert_descriptions(
+    name: str,
+    parameter: Any,
+    *,
+    family: str,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+    flattened_size: int,
+) -> list[dict[str, Any]]:
+    """Map canonical expert projections into Ascend FusedMoE storage."""
+    if flattened_size <= 0 or intermediate_size % flattened_size != 0:
+        raise ValueError(
+            f"{family} routed intermediate size must divide the "
+            f"flattened MoE size: intermediate={intermediate_size}, size={flattened_size}"
+        )
+    local_intermediate_size = intermediate_size // flattened_size
+    placement = "shard" if flattened_size > 1 else "replicate"
+    shard_dim = 1 if flattened_size > 1 else None
+    if name.endswith(".w13_weight"):
+        checkpoint_shape = (num_experts, 2 * local_intermediate_size, hidden_size)
+        runtime_shape = (num_experts, hidden_size, 2 * local_intermediate_size)
+        parameter_shape = tuple(int(size) for size in parameter.shape)
+        if parameter_shape == checkpoint_shape:
+            destination_starts = ((0, 0, 0), (0, local_intermediate_size, 0))
+            permutation = None
+        elif parameter_shape == runtime_shape:
+            destination_starts = ((0, 0, 0), (0, 0, local_intermediate_size))
+            permutation = (0, 2, 1)
+        else:
+            raise ValueError(
+                f"{family} w13 parameter {name!r} has shape "
+                f"{parameter_shape}, expected checkpoint/runtime layouts "
+                f"{checkpoint_shape}/{runtime_shape}"
+            )
+        prefix = name.removesuffix(".w13_weight")
+        canonical_shape = (num_experts, local_intermediate_size, hidden_size)
+        return [
+            _direct_tensor_description(
+                f"{prefix}.{projection}.weight",
+                name,
+                parameter,
+                canonical_shape,
+                placement,
+                shard_dim,
+                destination_start,
+                permutation,
+            )
+            for projection, destination_start in zip(
+                ("gate_proj", "up_proj"),
+                destination_starts,
+            )
+        ]
+    checkpoint_shape = (num_experts, hidden_size, local_intermediate_size)
+    runtime_shape = (num_experts, local_intermediate_size, hidden_size)
+    parameter_shape = tuple(int(size) for size in parameter.shape)
+    if parameter_shape == checkpoint_shape:
+        permutation = None
+    elif parameter_shape == runtime_shape:
+        permutation = (0, 2, 1)
+    else:
+        raise ValueError(
+            f"{family} w2 parameter {name!r} has shape "
+            f"{parameter_shape}, expected checkpoint/runtime layouts "
+            f"{checkpoint_shape}/{runtime_shape}"
+        )
+    prefix = name.removesuffix(".w2_weight")
+    return [
+        _direct_tensor_description(
+            f"{prefix}.down_proj.weight",
+            name,
+            parameter,
+            (num_experts, hidden_size, local_intermediate_size),
+            placement,
+            2 if flattened_size > 1 else None,
+            (0, 0, 0),
+            permutation,
+        )
+    ]
+
+
+def _native_moe_gate_up_descriptions(
+    name: str,
+    parameter: Any,
+    hf_config: Any,
+) -> list[dict[str, Any]]:
+    """Map one replicated dense/shared gate/up linear in a native TP1 MoE model."""
+    if ".shared_experts." in name:
+        intermediate_size = int(hf_config.moe_intermediate_size) * int(
+            hf_config.n_shared_experts
+        )
+    else:
+        intermediate_size = int(hf_config.intermediate_size)
+    tail_shape = tuple(int(size) for size in parameter.shape[1:])
+    expected_shape = (2 * intermediate_size,) + tail_shape
+    if tuple(int(size) for size in parameter.shape) != expected_shape:
+        raise ValueError(
+            f"Native MoE gate/up parameter {name!r} has shape "
+            f"{tuple(parameter.shape)}, expected {expected_shape}"
+        )
+    return [
+        _direct_tensor_description(
+            name.replace("gate_up_proj", projection),
+            name,
+            parameter,
+            (intermediate_size,) + tail_shape,
+            "replicate",
+            None,
+            (destination_offset,) + (0,) * len(tail_shape),
+        )
+        for projection, destination_offset in (
+            ("gate_proj", 0),
+            ("up_proj", intermediate_size),
+        )
+    ]
+
+
+def _native_moe_local_experts(module: Any, num_experts: int, ep_size: int, ep_rank: int) -> int:
+    """Validate actual static native ownership before using contiguous planner slices."""
+    if bool(getattr(module, "dynamic_eplb", False)) or bool(getattr(module, "enable_eplb", False)):
+        raise ValueError("Native MoE weight synchronization requires EPLB disabled")
+    if ep_size <= 0 or not 0 <= ep_rank < ep_size or num_experts % ep_size:
+        raise ValueError("Native MoE requires evenly divisible static expert ownership")
+    local_experts = num_experts // ep_size
+    expert_map = getattr(module, "expert_map", None)
+    if ep_size > 1:
+        if expert_map is None:
+            raise ValueError("Native EP requires an actual global-to-local expert map")
+        actual = expert_map.detach().cpu().tolist()
+        expected = [-1] * num_experts
+        start = ep_rank * local_experts
+        expected[start:start + local_experts] = list(range(local_experts))
+        if actual != expected:
+            raise ValueError("Native MoE expert map is not the supported static contiguous placement")
+    elif expert_map is not None:
+        raise ValueError("Native EP-off unexpectedly exposes an expert map")
+    if int(module.w13_weight.shape[0]) != local_experts or int(module.w2_weight.shape[0]) != local_experts:
+        raise ValueError("Native MoE physical expert count differs from the verified ownership")
+    return local_experts
+
+
+def _native_moe_ownership_manifest(worker: Any, topology: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist actual original-leaf ownership only for explicitly requested manifests."""
+    config = worker.model_config.hf_config
+    num_experts = int(config.n_routed_experts if _is_native_deepseek_v3_worker(worker) else config.num_experts)
+    ep_size, ep_rank = int(topology.get("ep_size", 1)), int(topology.get("ep_rank", 0))
+    ownership = {}
+    for name, module in worker.model_runner.get_model().named_modules():
+        if not hasattr(module, "w13_weight") or not hasattr(module, "w2_weight"):
+            continue
+        local_experts = _native_moe_local_experts(module, num_experts, ep_size, ep_rank)
+        expert_map = getattr(module, "expert_map", None)
+        ownership[name] = {
+            "class": f"{type(module).__module__}.{type(module).__name__}",
+            "global_to_local": None if expert_map is None else expert_map.detach().cpu().tolist(),
+            "local_experts": local_experts,
+            "w13_shape": list(module.w13_weight.shape),
+            "w2_shape": list(module.w2_weight.shape),
+        }
+    return ownership
+
+
+def _native_moe_direct_tensors(
+    model: Any,
+    hf_config: Any,
+    tp_size: int,
+    dp_size: int = 1,
+    *,
+    family: str,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    tp_rank: int = 0,
+) -> list[dict[str, Any]]:
+    """Describe original vLLM MoE storage without replacing its compute components."""
+    if tp_size != 1 and not (
+        family in ("qwen3_moe", "deepseek_v3") and tp_size == 2 and ep_size == dp_size * tp_size
+    ):
+        raise ValueError(
+            "Native MoE direct reshard supports rollout TP1 only, "
+            f"got TP{tp_size}"
+        )
+    num_experts = int(hf_config.n_routed_experts if family == "deepseek_v3" else hf_config.num_experts)
+    modules = dict(getattr(model, "named_modules", lambda: ())())
+    ownership = {}
+    tensors = []
+    if tp_size > 1:
+        dense_parameters = [
+            (name, parameter) for name, parameter in model.named_parameters()
+            if not name.endswith((".experts.w13_weight", ".experts.w2_weight"))
+        ]
+        tensors.extend(_native_qwen3_direct_tensors(
+            model, hf_config, tp_rank, tp_size, parameters=dense_parameters,
+        ))
+        for description in tensors:
+            if description["name"].endswith(".mlp.gate.weight") and description["dtype_name"] == "float32":
+                description["accepted_source_dtypes"] = ["bfloat16"]
+    for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
+        if name.endswith((".experts.w13_weight", ".experts.w2_weight")):
+            module_name = name.rsplit(".", 1)[0]
+            if module_name not in ownership:
+                module = modules.get(module_name)
+                # EP-off storage contains every expert; EP-local views require the actual ownership map.
+                ownership[module_name] = (
+                    _native_moe_local_experts(module, num_experts, ep_size, ep_rank)
+                    if module is not None or ep_size > 1 else num_experts
+                )
+            descriptions = _fused_moe_expert_descriptions(
+                name,
+                parameter,
+                family=family,
+                num_experts=ownership[module_name],
+                intermediate_size=int(hf_config.moe_intermediate_size),
+                hidden_size=int(hf_config.hidden_size),
+                flattened_size=1 if ep_size > 1 else dp_size * tp_size,
+            )
+            if ep_size > 1:
+                for description in descriptions:
+                    description.update(placement="shard", shard_dim=0)
+            tensors.extend(descriptions)
+            continue
+        if tp_size > 1:
+            continue
+        if family == "qwen3_moe" and ".qkv_proj." in name:
+            descriptions = _native_qwen3_qkv_descriptions(name, parameter, hf_config, tp_size)
+            for description in descriptions:
+                description.update(placement="replicate", shard_dim=None)
+            tensors.extend(descriptions)
+            continue
+        if ".gate_up_proj." in name:
+            tensors.extend(
+                _native_moe_gate_up_descriptions(
+                    name,
+                    parameter,
+                    hf_config,
+                )
+            )
+            continue
+        shape = tuple(int(size) for size in parameter.shape)
+        if name in {"model.embed_tokens.weight", "lm_head.weight"}:
+            shape = (int(hf_config.vocab_size),) + shape[1:]
+        tensors.append(
+            _direct_tensor_description(
+                name,
+                name,
+                parameter,
+                shape,
+                "replicate",
+                None,
+                (0,) * len(shape),
+                accepted_source_dtypes=(
+                    ("bfloat16",)
+                    if name.endswith(".mlp.gate.weight")
+                    and str(parameter.dtype).rsplit(".", maxsplit=1)[-1] == "float32"
+                    else ()
+                ),
+            )
+        )
+    return tensors
+
+
+def _hyper_tp_placement(model: Any, name: str, tp_size: int) -> tuple[str, Optional[int]]:
+    """Read the public apply pass's parameter placement for either Hyper family."""
+    placements = tuple(getattr(model, "_tp_placements", {}).get(name, ()))
+    if tp_size == 1 and not placements:
+        return "replicate", None
+    if len(placements) != 1:
+        raise ValueError(f"Direct reshard parameter {name!r} requires one TP placement, got {placements}")
+    placement = placements[0]
+    if callable(getattr(placement, "is_shard", None)) and placement.is_shard():
+        return "shard", int(placement.dim)
+    if callable(getattr(placement, "is_replicate", None)) and placement.is_replicate():
+        return "replicate", None
+    raise ValueError(f"Direct reshard parameter {name!r} has unsupported placement {placement!r}")
+
+
+def _hyper_moe_direct_tensors(
+    model: Any,
+    *,
+    family: str,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+    tp_size: int,
+) -> list[dict[str, Any]]:
+    """Describe an HF outer model with common local FusedMoE leaves."""
+    if tp_size != 1 and not (tp_size == 2 and family in ("Qwen3-MoE", "qwen3_moe", "DeepSeek-V3")):
+        raise ValueError(
+            f"Hyper {family} weight synchronization supports rollout TP1 only, "
+            f"got TP{tp_size}"
+        )
+    tensors = []
+    policy_tensors = _policy_destination_tensors(model)
+    named_modules = getattr(model, "named_modules", lambda: ())
+    modules = dict(named_modules())
+    for name, parameter in sorted(policy_tensors.items(), key=lambda item: item[0]):
+        if name.endswith((".experts.w13_weight", ".experts.w2_weight")):
+            expert_module_name = name.rsplit(".", maxsplit=1)[0]
+            expert_module = modules.get(expert_module_name)
+            if not bool(getattr(expert_module, "hyper_local_expert_leaf", False)):
+                raise RuntimeError(
+                    f"Hyper {family} expert {expert_module_name!r} is not the common local leaf"
+                )
+            local_count = int(getattr(expert_module, "local_expert_count", num_experts))
+            if local_count <= 0 or num_experts % local_count:
+                raise ValueError(f"Invalid Hyper {family} local expert count {local_count}")
+            descriptions = _fused_moe_expert_descriptions(
+                name,
+                parameter,
+                family=family,
+                num_experts=local_count,
+                intermediate_size=intermediate_size,
+                hidden_size=hidden_size,
+                flattened_size=1,
+            )
+            if local_count != num_experts:
+                for description in descriptions:
+                    description.update(placement="shard", shard_dim=0)
+            tensors.extend(descriptions)
+            continue
+        shape = tuple(int(size) for size in parameter.shape)
+        placement_name, shard_dim = _hyper_tp_placement(model, name, tp_size)
+        tensors.append(
+            _direct_tensor_description(
+                name,
+                name,
+                parameter,
+                shape,
+                placement_name,
+                shard_dim,
+                (0,) * len(shape),
+                accepted_source_dtypes=(
+                    ("bfloat16",)
+                    if name.endswith(".mlp.gate.weight")
+                    and str(parameter.dtype).rsplit(".", maxsplit=1)[-1] == "float32"
+                    else ()
+                ),
+            )
+        )
+    return tensors
+
+
+def _hyper_deepseek_v3_direct_tensors(
+    model: Any,
+    hf_config: Any,
+    tp_size: int,
+    dp_size: int = 1,
+) -> list[dict[str, Any]]:
+    """Describe the Hyper DeepSeek-V3 EP1 destination layout."""
+    del dp_size
+    return _hyper_moe_direct_tensors(
+        model,
+        family="DeepSeek-V3",
+        num_experts=int(hf_config.n_routed_experts),
+        intermediate_size=int(hf_config.moe_intermediate_size),
+        hidden_size=int(hf_config.hidden_size),
+        tp_size=tp_size,
+    )
+
+
+def _hyper_qwen3_moe_direct_tensors(
+    model: Any,
+    hf_config: Any,
+    tp_size: int,
+) -> list[dict[str, Any]]:
+    """Describe the Hyper Qwen3-MoE EP1 destination layout."""
+    return _hyper_moe_direct_tensors(
+        model,
+        family="Qwen3-MoE",
+        num_experts=int(hf_config.num_experts),
+        intermediate_size=int(hf_config.moe_intermediate_size),
+        hidden_size=int(hf_config.hidden_size),
+        tp_size=tp_size,
+    )
+
+
 def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
-    """Describe one Hyper or native Qwen3 worker's local TP parameters."""
+    """Describe one supported worker's local parameters."""
     if worker.model_runner is None:
         raise RuntimeError("vLLM model runner is not initialized")
     model = worker.model_runner.get_model()
@@ -629,6 +1302,53 @@ def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
     tp_group = get_tp_group()
     tp_rank = int(tp_group.rank_in_group)
     tp_size = int(tp_group.world_size)
+    if _is_hyper_qwen3_moe_worker(worker):
+        hf_config = getattr(worker.model_config, "hf_config", None)
+        if hf_config is None:
+            raise ValueError("Qwen3-MoE direct reshard requires an HF config")
+        result = {
+            "tensors": _hyper_qwen3_moe_direct_tensors(
+                model,
+                hf_config,
+                tp_size,
+            ),
+        }
+        result.update(_rollout_worker_topology(worker))
+        return result
+    if _is_hyper_deepseek_v3_worker(worker):
+        hf_config = getattr(worker.model_config, "hf_config", None)
+        if hf_config is None:
+            raise ValueError("DeepSeek-V3 direct reshard requires an HF config")
+        topology = _rollout_worker_topology(worker)
+        result = {
+            "tensors": _hyper_deepseek_v3_direct_tensors(
+                model,
+                hf_config,
+                tp_size,
+                int(topology["dp_size"]),
+            ),
+        }
+        result.update(topology)
+        return result
+    if _is_native_deepseek_v3_worker(worker) or _is_native_qwen3_moe_worker(worker):
+        hf_config = getattr(worker.model_config, "hf_config", None)
+        if hf_config is None:
+            raise ValueError("DeepSeek-V3 direct reshard requires an HF config")
+        topology = _rollout_worker_topology(worker)
+        result = {
+            "tensors": _native_moe_direct_tensors(
+                model,
+                hf_config,
+                tp_size,
+                int(topology["dp_size"]),
+                family="deepseek_v3" if _is_native_deepseek_v3_worker(worker) else "qwen3_moe",
+                ep_size=int(topology.get("ep_size", 1)),
+                ep_rank=int(topology.get("ep_rank", 0)),
+                tp_rank=tp_rank,
+            ),
+        }
+        result.update(topology)
+        return result
     if _is_native_qwen3_worker(worker):
         hf_config = getattr(worker.model_config, "hf_config", None)
         if hf_config is None:
@@ -645,32 +1365,11 @@ def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
         return result
     if not _is_hyper_worker(worker) or not hasattr(model, "_tp_placements"):
         raise ValueError(
-            "Direct reshard requires a Hyper or native Qwen3 rollout model"
+            "Direct reshard requires a supported Hyper or native rollout model"
         )
-    placements_by_name = getattr(model, "_tp_placements")
     tensors = []
     for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
-        placements = tuple(placements_by_name.get(name, ()))
-        if tp_size == 1 and not placements:
-            placement_name = "replicate"
-            shard_dim = None
-        else:
-            if len(placements) != 1:
-                raise ValueError(
-                    f"Direct reshard parameter {name!r} requires one TP placement, "
-                    f"got {placements}"
-                )
-            placement = placements[0]
-            if callable(getattr(placement, "is_shard", None)) and placement.is_shard():
-                placement_name = "shard"
-                shard_dim = int(placement.dim)
-            elif callable(getattr(placement, "is_replicate", None)) and placement.is_replicate():
-                placement_name = "replicate"
-                shard_dim = None
-            else:
-                raise ValueError(
-                    f"Direct reshard parameter {name!r} has unsupported placement {placement!r}"
-                )
+        placement_name, shard_dim = _hyper_tp_placement(model, name, tp_size)
         tensors.append(
             {
                 "name": name,
@@ -752,47 +1451,86 @@ def init_direct_reshard_group(
     }
 
 
-def init_full_gather_group(
-    worker: Any,
-    *,
-    master_address: str,
-    master_port: int,
-    world_size: int,
-    expected_data_parallel_size: int,
-    expected_tensor_parallel_size: int,
-) -> dict[str, Any]:
-    """Create one full-gather group with a unique rank for every DP x TP worker."""
-    topology = _rollout_worker_topology(worker)
-    dp_rank, tp_rank = _validate_direct_reshard_topology(
-        topology,
-        expected_data_parallel_size=expected_data_parallel_size,
-        expected_tensor_parallel_size=expected_tensor_parallel_size,
-    )
-    expected_world_size = 1 + int(expected_data_parallel_size) * int(expected_tensor_parallel_size)
-    if int(world_size) != expected_world_size:
+def _validate_direct_update(worker: Any, policy_version: int, *, transport: str) -> int:
+    """Validate the shared transaction preconditions for one direct bucket."""
+    if worker.model_runner is None:
+        raise RuntimeError("vLLM model runner is not initialized")
+    if not _is_direct_reshard_worker(worker):
+        raise ValueError(f"{transport} reshard requires a supported rollout worker")
+    if not bool(getattr(worker, "_weight_update_active", False)):
+        raise RuntimeError(f"{transport} reshard requires an active vLLM weight update")
+    version = int(policy_version)
+    loaded_version = int(getattr(worker, "_hyper_loaded_policy_version", 0))
+    pending_version = getattr(worker, "_hyper_pending_policy_version", None)
+    if version <= loaded_version:
         raise ValueError(
-            "Full-gather HCCL group world size differs from configured rollout DP x TP: "
-            f"expected={expected_world_size}, actual={world_size}"
+            f"{transport} reshard policy version must increase: "
+            f"loaded={loaded_version}, received={version}"
         )
-    worker._check_weight_transfer_engine()  # pylint: disable=W0212
-    transfer_engine = worker.weight_transfer_engine
-    group_rank = 1 + dp_rank * int(expected_tensor_parallel_size) + tp_rank
-    device = int(
-        platform.get_device_handle(platform.device_type()).current_device()
-    )
-    transfer_engine.model_update_group = transfer_engine._stateless_init_process_group(  # pylint: disable=W0212
-        master_address,
-        int(master_port),
-        group_rank,
-        int(world_size),
-        device=device,
-    )
-    return {
-        "joined": True,
-        "dp_rank": dp_rank,
-        "tp_rank": tp_rank,
-        "group_rank": group_rank,
-    }
+    if pending_version is not None and int(pending_version) != version:
+        raise ValueError(
+            "One direct reshard update cannot mix policy versions: "
+            f"pending={pending_version}, received={version}"
+        )
+    return version
+
+
+def _apply_direct_bucket(
+    worker: Any,
+    parameters: Mapping[str, Any],
+    packed: Any,
+    metadata: Mapping[str, Any],
+    policy_version: int,
+    *,
+    transport: str,
+) -> int:
+    """Scatter one packed direct bucket into rollout-local parameters."""
+    import torch  # pylint: disable=C0415,forbidden-backend-import
+
+    received_bytes = 0
+    for entry in metadata["entries"]:
+        name = str(entry["name"])
+        parameter = parameters.get(name)
+        if parameter is None:
+            raise ValueError(f"{transport} parameter {name!r} is missing")
+        source_dtype = getattr(torch, str(entry["dtype_name"]))
+        destination_dtype = getattr(
+            torch,
+            str(entry.get("destination_dtype_name", entry["dtype_name"])),
+        )
+        destination_element_size = int(
+            entry.get("destination_element_size", entry["element_size"])
+        )
+        if (
+            int(parameter.element_size()) != destination_element_size
+            or parameter.dtype != destination_dtype
+        ):
+            raise ValueError(
+                f"{transport} parameter {name!r} dtype mismatch: "
+                f"parameter={parameter.dtype}, destination={destination_dtype}"
+            )
+        lengths = tuple(
+            int(value)
+            for value in entry.get("destination_lengths", entry["lengths"])
+        )
+        starts = tuple(int(value) for value in entry["destination_starts"])
+        num_bytes = int(entry["num_bytes"])
+        offset = int(entry["buffer_offset"])
+        fragment = packed.narrow(0, offset, num_bytes).view(source_dtype).view(lengths)
+        destination_slice = tuple(
+            slice(start, start + length) for start, length in zip(starts, lengths)
+        )
+        target = parameter[destination_slice]
+        if tuple(target.shape) != lengths:
+            raise ValueError(
+                f"{transport} destination {name!r} has shape "
+                f"{tuple(target.shape)}, expected {lengths}"
+            )
+        with torch.no_grad():
+            target.copy_(fragment)
+        _record_direct_content_fragment(worker, policy_version, entry, target)
+        received_bytes += num_bytes
+    return received_bytes
 
 
 def receive_direct_reshard(
@@ -825,69 +1563,31 @@ def receive_direct_reshard(
             "tp_rank": tp_rank,
             "bytes": 0,
         }
-    if worker.model_runner is None:
-        raise RuntimeError("vLLM model runner is not initialized")
-    if not _is_direct_reshard_worker(worker):
-        raise ValueError("Direct reshard requires a Hyper or native Qwen3 worker")
+    version = _validate_direct_update(worker, policy_version, transport="Direct")
     groups = getattr(worker, "_hyper_direct_reshard_groups", {})
     group = groups.get(group_id)
     if group is None:
         raise RuntimeError(f"Direct reshard HCCL group {group_id!r} is not initialized")
-    if not bool(getattr(worker, "_weight_update_active", False)):
-        raise RuntimeError("Direct reshard requires an active vLLM weight update")
-    version = int(policy_version)
-    loaded_version = int(getattr(worker, "_hyper_loaded_policy_version", 0))
-    pending_version = getattr(worker, "_hyper_pending_policy_version", None)
-    if version <= loaded_version:
-        raise ValueError(
-            "Direct reshard policy version must increase: "
-            f"loaded={loaded_version}, received={version}"
-        )
-    if pending_version is not None and int(pending_version) != version:
-        raise ValueError(
-            "One direct reshard update cannot mix policy versions: "
-            f"pending={pending_version}, received={version}"
-        )
     import torch  # pylint: disable=C0415,forbidden-backend-import
 
-    parameters = dict(worker.model_runner.get_model().named_parameters())
+    parameters = _policy_destination_tensors(worker.model_runner.get_model())
     received_bytes = 0
     for bucket in buckets:
         total_bytes = int(bucket["total_bytes"])
         packed = torch.empty(total_bytes, dtype=torch.uint8, device=group.device)
         group.broadcast(packed, src=0)
         torch.npu.current_stream().synchronize()
-        for entry in bucket["entries"]:
-            name = str(entry["name"])
-            parameter = parameters.get(name)
-            if parameter is None:
-                raise ValueError(f"Direct reshard rollout parameter {name!r} is missing")
-            dtype = getattr(torch, str(entry["dtype_name"]))
-            element_size = int(entry["element_size"])
-            if int(parameter.element_size()) != element_size or parameter.dtype != dtype:
-                raise ValueError(
-                    f"Direct reshard rollout parameter {name!r} dtype mismatch: "
-                    f"parameter={parameter.dtype}, transfer={dtype}"
-                )
-            lengths = tuple(int(value) for value in entry["lengths"])
-            starts = tuple(int(value) for value in entry["destination_starts"])
-            num_bytes = int(entry["num_bytes"])
-            offset = int(entry["buffer_offset"])
-            fragment = packed.narrow(0, offset, num_bytes).view(dtype).view(lengths)
-            destination_slice = tuple(
-                slice(start, start + length) for start, length in zip(starts, lengths)
-            )
-            target = parameter[destination_slice]
-            if tuple(target.shape) != lengths:
-                raise ValueError(
-                    f"Direct reshard destination slice for {name!r} has shape "
-                    f"{tuple(target.shape)}, expected {lengths}"
-                )
-            with torch.no_grad():
-                target.copy_(fragment)
-            received_bytes += num_bytes
+        received_bytes += _apply_direct_bucket(
+            worker,
+            parameters,
+            packed,
+            bucket,
+            version,
+            transport="Direct reshard rollout",
+        )
         del packed
     worker._hyper_pending_policy_version = version
+    worker._hyper_pending_content_tp_rank = tp_rank
     return {
         "received": True,
         "dp_rank": dp_rank,
@@ -911,26 +1611,7 @@ def receive_ipc_direct_reshard(
     from torch_npu.multiprocessing.reductions import rebuild_npu_tensor  # pylint: disable=C0415
     import torch  # pylint: disable=C0415,forbidden-backend-import
 
-    if worker.model_runner is None:
-        raise RuntimeError("vLLM model runner is not initialized")
-    if not _is_direct_reshard_worker(worker):
-        raise ValueError("IPC direct reshard requires a Hyper or native Qwen3 worker")
-    if not bool(getattr(worker, "_weight_update_active", False)):
-        raise RuntimeError("IPC direct reshard requires an active vLLM weight update")
-
-    version = int(policy_version)
-    loaded_version = int(getattr(worker, "_hyper_loaded_policy_version", 0))
-    pending_version = getattr(worker, "_hyper_pending_policy_version", None)
-    if version <= loaded_version:
-        raise ValueError(
-            "IPC direct reshard policy version must increase: "
-            f"loaded={loaded_version}, received={version}"
-        )
-    if pending_version is not None and int(pending_version) != version:
-        raise ValueError(
-            "One IPC direct reshard update cannot mix policy versions: "
-            f"pending={pending_version}, received={version}"
-        )
+    version = _validate_direct_update(worker, policy_version, transport="IPC direct")
 
     payload = pickle.loads(base64.b64decode(payload_pickled.encode("ascii")))
     topology = _rollout_worker_topology(worker)
@@ -939,7 +1620,22 @@ def receive_ipc_direct_reshard(
         worker_description["physical_device_id"]: worker_description
         for worker_description in payload["worker_topology"]
     }
-    buckets = payload["buckets_by_tp"].get(tp_rank, ())
+    delivery_mode = str(payload.get("delivery_mode", "replicated_tp"))
+    worker_tp_size = int(topology.get("tp_size", 1))
+    tensor_parallel_size = int(payload.get("tensor_parallel_size", worker_tp_size))
+    if tensor_parallel_size != worker_tp_size:
+        raise ValueError(
+            "IPC direct payload TP size differs from the worker topology: "
+            f"payload={tensor_parallel_size}, worker={worker_tp_size}"
+        )
+    if delivery_mode == "replicated_tp":
+        target_rank = tp_rank
+    elif delivery_mode == "flattened_dp_tp":
+        target_rank = int(topology["dp_rank"]) * tensor_parallel_size + tp_rank
+    else:
+        raise ValueError(f"Unsupported IPC direct delivery mode {delivery_mode!r}")
+    buckets_by_target = payload.get("buckets_by_target", payload.get("buckets_by_tp", {}))
+    buckets = buckets_by_target.get(target_rank, ())
     device_index = torch.accelerator.current_device_index()
     physical_npu_id = npu_generate_uuid()
     expected_worker = expected_workers.get(physical_npu_id)
@@ -958,7 +1654,7 @@ def receive_ipc_direct_reshard(
             f"physical_device_id={physical_npu_id}, expected={expected_identity}, "
             f"actual={actual_identity}"
         )
-    parameters = dict(worker.model_runner.get_model().named_parameters())
+    parameters = _policy_destination_tensors(worker.model_runner.get_model())
     received_bytes = 0
     imported_buffers = []
 
@@ -980,41 +1676,21 @@ def receive_ipc_direct_reshard(
                     "IPC direct reshard packed-buffer size mismatch: "
                     f"tensor={packed.numel()}, metadata={metadata['total_bytes']}"
                 )
-            for entry in metadata["entries"]:
-                name = str(entry["name"])
-                parameter = parameters.get(name)
-                if parameter is None:
-                    raise ValueError(f"IPC direct reshard parameter {name!r} is missing")
-                dtype = getattr(torch, str(entry["dtype_name"]))
-                element_size = int(entry["element_size"])
-                if int(parameter.element_size()) != element_size or parameter.dtype != dtype:
-                    raise ValueError(
-                        f"IPC direct reshard parameter {name!r} dtype mismatch: "
-                        f"parameter={parameter.dtype}, transfer={dtype}"
-                    )
-                lengths = tuple(int(value) for value in entry["lengths"])
-                starts = tuple(int(value) for value in entry["destination_starts"])
-                num_bytes = int(entry["num_bytes"])
-                offset = int(entry["buffer_offset"])
-                fragment = packed.narrow(0, offset, num_bytes).view(dtype).view(lengths)
-                destination_slice = tuple(
-                    slice(start, start + length) for start, length in zip(starts, lengths)
-                )
-                target = parameter[destination_slice]
-                if tuple(target.shape) != lengths:
-                    raise ValueError(
-                        f"IPC direct reshard destination {name!r} has shape "
-                        f"{tuple(target.shape)}, expected {lengths}"
-                    )
-                with torch.no_grad():
-                    target.copy_(fragment)
-                received_bytes += num_bytes
+            received_bytes += _apply_direct_bucket(
+                worker,
+                parameters,
+                packed,
+                metadata,
+                version,
+                transport="IPC direct reshard",
+            )
     finally:
         if imported_buffers:
             torch.npu.current_stream().synchronize()
             imported_buffers.clear()
 
     worker._hyper_pending_policy_version = version
+    worker._hyper_pending_content_tp_rank = target_rank
     return {
         "received": True,
         "dp_rank": int(topology["dp_rank"]),
@@ -1025,70 +1701,6 @@ def receive_ipc_direct_reshard(
     }
 
 
-def reload_weights(
-    worker: Any,
-    weights_iterator: Any = None,
-    weights_path: Optional[str] = None,
-    is_checkpoint_format: bool = True,
-    policy_version: Optional[int] = None,
-) -> None:
-    """Reload a Hyper checkpoint without vLLM's layerwise wrapper."""
-    if worker.model_runner is None:
-        raise RuntimeError("vLLM model runner is not initialized")
-    if not is_checkpoint_format:
-        raise ValueError("Hyper vLLM refit requires checkpoint-format weights")
-    consistency_profile = os.environ.get("HYPER_RL_CONSISTENCY_PROFILE")
-    if policy_version is None and consistency_profile not in (None, "", "off"):
-        raise ValueError("Consistency-profile CPU reload requires a worker policy version")
-    normalized_version = None
-    if policy_version is not None:
-        normalized_version = int(policy_version)
-        loaded_version = int(getattr(worker, "_hyper_loaded_policy_version", 0))
-        if normalized_version <= loaded_version:
-            raise ValueError(
-                "vLLM worker policy version must increase: "
-                f"loaded={loaded_version}, received={normalized_version}"
-            )
-        pending_version = getattr(worker, "_hyper_pending_policy_version", None)
-        if pending_version is not None:
-            raise RuntimeError(
-                "vLLM worker has an uncommitted CPU reload: "
-                f"pending={pending_version}, received={normalized_version}"
-            )
-    model_runner = worker.model_runner
-    model = model_runner.get_model()
-    if weights_iterator is not None:
-        model.load_weights(weights_iterator)
-        if normalized_version is not None:
-            worker._hyper_pending_policy_version = normalized_version
-        return
-    if weights_path is None:
-        raise ValueError("Hyper vLLM refit requires weights_iterator or weights_path")
-    from vllm.model_executor.model_loader import get_model_loader  # pylint: disable=C0415
-    original_model_path = model_runner.model_config.model
-    try:
-        model_runner.model_config.model = weights_path
-        model_loader = get_model_loader(model_runner.load_config)
-        model.load_weights(model_loader.get_all_weights(model_runner.model_config, model))
-        if normalized_version is not None:
-            worker._hyper_pending_policy_version = normalized_version
-    finally:
-        model_runner.model_config.model = original_model_path
-
-
-def commit_reloaded_weights(worker: Any, policy_version: int) -> None:
-    """Commit worker identity after every CPU reload RPC has completed."""
-    normalized_version = int(policy_version)
-    pending_version = getattr(worker, "_hyper_pending_policy_version", None)
-    if pending_version != normalized_version:
-        raise RuntimeError(
-            "vLLM CPU reload version does not match its pending weights: "
-            f"pending={pending_version}, received={normalized_version}"
-        )
-    worker._hyper_loaded_policy_version = normalized_version
-    worker._hyper_pending_policy_version = None
-
-
 def abort_weight_update(worker: Any, restore_policy_version: int) -> dict[str, Any]:
     """Clear a failed update transaction before a full-checkpoint retry."""
     was_active = bool(getattr(worker, "_weight_update_active", False))
@@ -1096,7 +1708,11 @@ def abort_weight_update(worker: Any, restore_policy_version: int) -> dict[str, A
     worker._weight_update_active = False
     worker._is_checkpoint_format = True
     worker._hyper_pending_policy_version = None
+    worker._hyper_pending_content_fragments = {}
+    worker._hyper_pending_content_tp_rank = None
     worker._hyper_loaded_policy_version = int(restore_policy_version)
+    worker._hyper_loaded_content_identity = None
+    worker._hyper_loaded_content_tp_rank = None
     return {
         "aborted": True,
         "was_active": was_active,
@@ -1107,7 +1723,8 @@ def abort_weight_update(worker: Any, restore_policy_version: int) -> dict[str, A
 
 def _worker_architectures(worker: Any) -> frozenset[str]:
     """Return the worker's declared Hugging Face model architectures."""
-    hf_config = getattr(worker.model_config, "hf_config", None)
+    model_config = getattr(worker, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
     architectures = getattr(hf_config, "architectures", ())
     return frozenset(architectures or ())
 
@@ -1122,6 +1739,31 @@ def _is_native_qwen3_worker(worker: Any) -> bool:
     return NATIVE_QWEN3_ARCHITECTURE in _worker_architectures(worker)
 
 
+def _is_hyper_qwen3_moe_worker(worker: Any) -> bool:
+    """Return whether the worker uses the Hyper Qwen3-MoE adapter."""
+    return HYPER_QWEN3_MOE_ARCHITECTURE in _worker_architectures(worker)
+
+
+def _is_native_qwen3_moe_worker(worker: Any) -> bool:
+    """Return whether the worker uses the original vLLM Qwen3-MoE model."""
+    return NATIVE_QWEN3_MOE_ARCHITECTURE in _worker_architectures(worker)
+
+
+def _is_hyper_deepseek_v3_worker(worker: Any) -> bool:
+    """Return whether the worker uses the HF-outer Hyper DeepSeek adapter."""
+    return HYPER_DEEPSEEK_V3_ARCHITECTURE in _worker_architectures(worker)
+
+
+def _is_native_deepseek_v3_worker(worker: Any) -> bool:
+    """Return whether the worker uses vLLM's native DeepSeek model."""
+    return NATIVE_DEEPSEEK_V3_ARCHITECTURE in _worker_architectures(worker)
+
+
+def _is_deepseek_v3_worker(worker: Any) -> bool:
+    """Return whether the worker hosts either DeepSeek-V3 runtime."""
+    return _is_hyper_deepseek_v3_worker(worker) or _is_native_deepseek_v3_worker(worker)
+
+
 def _is_direct_reshard_worker(worker: Any) -> bool:
     """Return whether the worker supports direct-reshard weight updates."""
     return bool(
@@ -1131,7 +1773,123 @@ def _is_direct_reshard_worker(worker: Any) -> bool:
 
 def _uses_custom_weight_update_lifecycle(worker: Any) -> bool:
     """Return whether Hyper owns this worker's update transaction lifecycle."""
-    return _is_hyper_worker(worker) or _is_native_qwen3_worker(worker)
+    return _is_direct_reshard_worker(worker)
+
+
+def _refresh_native_deepseek_v3_derived_weights(worker: Any) -> int:
+    """Refresh absorbed MLA leaves in place after their source weights change."""
+    if not _is_deepseek_v3_worker(worker):
+        return 0
+    if worker.model_runner is None:
+        raise RuntimeError("Native DeepSeek-V3 MLA refresh requires a model runner")
+    model = worker.model_runner.get_model()
+    act_dtype = getattr(worker.model_config, "dtype", None)
+    if act_dtype is None:
+        raise ValueError("Native DeepSeek-V3 MLA refresh requires model_config.dtype")
+    refreshed = set()
+    for module in model.modules():
+        mla_attention = getattr(module, "mla_attn", None)
+        process_weights = getattr(
+            mla_attention,
+            "process_weights_after_loading",
+            None,
+        )
+        if mla_attention is None or not callable(process_weights):
+            continue
+        if id(mla_attention) in refreshed:
+            continue
+        process_weights(act_dtype)
+        refreshed.add(id(mla_attention))
+    expected_layers = int(worker.model_config.hf_config.num_hidden_layers)
+    if len(refreshed) != expected_layers:
+        raise RuntimeError(
+            "Native DeepSeek-V3 MLA refresh did not cover every layer: "
+            f"expected={expected_layers}, actual={len(refreshed)}"
+        )
+    return len(refreshed)
+
+
+def _refresh_fused_moe_weights(worker: Any) -> int:
+    """Restore supported FusedMoE weights to Ascend runtime layout."""
+    is_deepseek = _is_deepseek_v3_worker(worker)
+    if not is_deepseek and not _is_hyper_qwen3_moe_worker(worker) and not _is_native_qwen3_moe_worker(worker):
+        return 0
+    if worker.model_runner is None:
+        raise RuntimeError("FusedMoE refresh requires a model runner")
+    model = worker.model_runner.get_model()
+    hf_config = worker.model_config.hf_config
+    topology = _rollout_worker_topology(worker)
+    flattened_size = int(topology["dp_size"]) * int(topology["tp_size"])
+    if int(topology.get("ep_size", 1)) > 1:
+        flattened_size = 1
+    intermediate_size = int(getattr(hf_config, "moe_intermediate_size", 0))
+    hidden_size = int(getattr(hf_config, "hidden_size", 0))
+    refreshed = 0
+    discovered = 0
+    for module in model.modules():
+        w13_weight = getattr(module, "w13_weight", None)
+        w2_weight = getattr(module, "w2_weight", None)
+        if w13_weight is None or w2_weight is None:
+            continue
+        discovered += 1
+        if bool(getattr(module, "hyper_local_expert_leaf", False)):
+            before = (tuple(w13_weight.shape), tuple(w2_weight.shape))
+            ensure_layout = getattr(module, "ensure_physical_weight_layout", None)
+            if not callable(ensure_layout):
+                raise RuntimeError("Hyper local FusedMoE cannot restore its physical layout")
+            ensure_layout()
+            after = (tuple(module.w13_weight.shape), tuple(module.w2_weight.shape))
+            refreshed += int(before != after)
+            continue
+        if not is_deepseek and not _is_native_qwen3_moe_worker(worker):
+            raise RuntimeError(
+                "Hyper Qwen3-MoE contains a routed expert that is not the common local leaf"
+            )
+        if intermediate_size % flattened_size != 0:
+            raise ValueError(
+                "Native MoE FusedMoE intermediate size must divide the flattened "
+                f"runtime size: intermediate={intermediate_size}, size={flattened_size}"
+            )
+        local_intermediate_size = intermediate_size // flattened_size
+        checkpoint_w13_tail = (2 * local_intermediate_size, hidden_size)
+        runtime_w13_tail = (hidden_size, 2 * local_intermediate_size)
+        w13_tail = tuple(int(size) for size in w13_weight.shape[1:])
+        w2_tail = tuple(int(size) for size in w2_weight.shape[1:])
+        if w13_tail == runtime_w13_tail and w2_tail == (local_intermediate_size, hidden_size):
+            continue
+        if w13_tail != checkpoint_w13_tail or w2_tail != (hidden_size, local_intermediate_size):
+            raise RuntimeError(
+                "Native MoE FusedMoE has an unsupported pre-refresh layout: "
+                f"w13={tuple(w13_weight.shape)}, w2={tuple(w2_weight.shape)}"
+            )
+        process_weights = getattr(
+            getattr(module, "quant_method", None),
+            "process_weights_after_loading",
+            None,
+        )
+        if not callable(process_weights):
+            raise RuntimeError("Native MoE FusedMoE quant method cannot refresh weights")
+        process_weights(module)
+        refreshed += 1
+    if discovered <= 0:
+        raise RuntimeError("FusedMoE refresh found no routed expert layers")
+    if refreshed not in (0, discovered):
+        raise RuntimeError(
+            "FusedMoE workers mixed checkpoint and runtime layouts: "
+            f"refreshed={refreshed}, discovered={discovered}"
+        )
+    return refreshed
+
+
+def prepare_direct_reshard_layout(worker: Any) -> dict[str, Any]:
+    """Restore executable FusedMoE storage before layout planning."""
+    refreshed = _refresh_fused_moe_weights(worker)
+    result = {
+        "prepared": True,
+        "moe_refresh_count": refreshed,
+    }
+    result.update(_rollout_worker_topology(worker))
+    return result
 
 
 def _finish_custom_weight_update(worker: Any) -> None:
@@ -1144,14 +1902,46 @@ def _finish_custom_weight_update(worker: Any) -> None:
         raise RuntimeError(
             "finish_weight_update requires received weights with a pending policy version"
         )
+    pending_tp_rank = getattr(worker, "_hyper_pending_content_tp_rank", None)
+    if pending_tp_rank is not None:
+        refreshed_moe_layers = (
+            _refresh_fused_moe_weights(worker)
+            if hasattr(worker, "model_config")
+            else 0
+        )
+        refreshed_mla_layers = (
+            _refresh_native_deepseek_v3_derived_weights(worker)
+            if hasattr(worker, "model_config")
+            else 0
+        )
+        fragments_by_version = getattr(
+            worker,
+            "_hyper_pending_content_fragments",
+            {},
+        )
+        fragments = fragments_by_version.pop(int(pending_version), None)
+        if not fragments:
+            raise RuntimeError(
+                "finish_weight_update requires direct content fragments before commit"
+            )
+        worker._hyper_loaded_content_identity = aggregate_direct_content_identity(
+            fragments
+        )
+        worker._hyper_loaded_content_tp_rank = int(pending_tp_rank)
+        worker._hyper_loaded_moe_refresh_count = refreshed_moe_layers
+        worker._hyper_loaded_mla_refresh_count = refreshed_mla_layers
+    else:
+        worker._hyper_loaded_content_identity = None
+        worker._hyper_loaded_content_tp_rank = None
     worker._weight_update_active = False  # pylint: disable=W0212
     worker._is_checkpoint_format = True  # pylint: disable=W0212
     worker._hyper_loaded_policy_version = pending_version
     worker._hyper_pending_policy_version = None
+    worker._hyper_pending_content_tp_rank = None
 
 
 def _patch_ascend_weight_update_lifecycle() -> None:
-    """Bypass vLLM's layerwise wrapper for direct Qwen3 weight updates."""
+    """Bypass vLLM's layerwise wrapper for supported direct weight updates."""
     if _patch_state.ascend_lifecycle:
         return
     try:
@@ -1159,17 +1949,16 @@ def _patch_ascend_weight_update_lifecycle() -> None:
     except ImportError:
         return
     original_start = NPUWorker.start_weight_update
-    original_update = NPUWorker.update_weights
     original_finish = NPUWorker.finish_weight_update
 
     def start_weight_update(worker: Any, is_checkpoint_format: bool = True) -> None:
-        """Start one direct Qwen3 weight-update transaction."""
+        """Start one model-owned direct weight-update transaction."""
         if not _uses_custom_weight_update_lifecycle(worker):
             original_start(worker, is_checkpoint_format=is_checkpoint_format)
             worker._hyper_pending_policy_version = None
             return
         if not is_checkpoint_format:
-            raise ValueError("Direct Qwen3 weight transfer requires checkpoint-format names")
+            raise ValueError("Direct weight transfer requires checkpoint-format names")
         worker._check_weight_transfer_engine()  # pylint: disable=W0212
         if worker._weight_update_active:  # pylint: disable=W0212
             raise RuntimeError(
@@ -1177,35 +1966,10 @@ def _patch_ascend_weight_update_lifecycle() -> None:
             )
         worker._check_nz_disabled()  # pylint: disable=W0212
         worker._hyper_pending_policy_version = None
+        worker._hyper_pending_content_fragments = {}
+        worker._hyper_pending_content_tp_rank = None
         worker._is_checkpoint_format = True  # pylint: disable=W0212
         worker._weight_update_active = True  # pylint: disable=W0212
-
-    def update_weights(worker: Any, update_info: dict[str, Any]) -> None:
-        """Receive weights while retaining worker-owned pending identity."""
-        versioned_update = dict(update_info)
-        version = versioned_update.pop(_POLICY_VERSION_FIELD, None)
-        if not _uses_custom_weight_update_lifecycle(worker):
-            original_update(worker, versioned_update)
-            if version is not None:
-                worker._hyper_pending_policy_version = int(version)
-            return
-        if version is None:
-            raise ValueError("Direct Qwen3 weight update requires a worker policy version")
-        version = int(version)
-        loaded_version = int(getattr(worker, "_hyper_loaded_policy_version", 0))
-        pending_version = getattr(worker, "_hyper_pending_policy_version", None)
-        if version <= loaded_version:
-            raise ValueError(
-                "vLLM worker policy version must increase: "
-                f"loaded={loaded_version}, received={version}"
-            )
-        if pending_version is not None and version != pending_version:
-            raise ValueError(
-                "One vLLM weight update cannot mix policy versions: "
-                f"pending={pending_version}, received={version}"
-            )
-        original_update(worker, versioned_update)
-        worker._hyper_pending_policy_version = version
 
     def finish_weight_update(worker: Any) -> None:
         """Commit worker identity only after the native receiver finishes."""
@@ -1219,7 +1983,6 @@ def _patch_ascend_weight_update_lifecycle() -> None:
             worker._hyper_loaded_policy_version = pending_version
         worker._hyper_pending_policy_version = None
     NPUWorker.start_weight_update = start_weight_update
-    NPUWorker.update_weights = update_weights
     NPUWorker.finish_weight_update = finish_weight_update
     _patch_state.ascend_lifecycle = True
 
@@ -1238,6 +2001,18 @@ def _patch_engine_core_wake_lifecycle() -> None:
         memory_tags = [tag for tag in tags if tag != KEEP_SCHEDULER_PAUSED_TAG]
         if memory_tags:
             engine_core.model_executor.wake_up(memory_tags)
+        if "weights" in memory_tags:
+            prepared = engine_core.model_executor.collective_rpc(
+                "prepare_direct_reshard_layout"
+            )
+            if not prepared or not all(
+                isinstance(result, Mapping) and bool(result.get("prepared"))
+                for result in prepared
+            ):
+                raise RuntimeError(
+                    "vLLM workers did not restore executable weight layouts "
+                    f"during atomic wake: {prepared}"
+                )
         return None
 
     EngineCore.wake_up = wake_up
@@ -1247,8 +2022,6 @@ def _patch_engine_core_wake_lifecycle() -> None:
 def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
     """Install stable worker RPCs and optionally pinned private lifecycle patches."""
     from vllm.v1.worker.worker_base import WorkerBase  # pylint: disable=C0415
-    if not hasattr(WorkerBase, "reload_weights"):
-        setattr(WorkerBase, "reload_weights", reload_weights)
     if not hasattr(WorkerBase, "get_policy_weight_fingerprint"):
         setattr(
             WorkerBase,
@@ -1257,6 +2030,12 @@ def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
         )
     if not hasattr(WorkerBase, "get_policy_version"):
         setattr(WorkerBase, "get_policy_version", get_policy_version)
+    if not hasattr(WorkerBase, "get_weight_sync_memory_stats"):
+        setattr(
+            WorkerBase,
+            "get_weight_sync_memory_stats",
+            get_weight_sync_memory_stats,
+        )
     if not hasattr(WorkerBase, "get_all_parameter_manifest"):
         setattr(
             WorkerBase,
@@ -1265,19 +2044,23 @@ def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
         )
     if not hasattr(WorkerBase, "write_parameter_manifest"):
         setattr(WorkerBase, "write_parameter_manifest", write_parameter_manifest)
-    if not hasattr(WorkerBase, "commit_reloaded_weights"):
-        setattr(WorkerBase, "commit_reloaded_weights", commit_reloaded_weights)
     if not hasattr(WorkerBase, "verify_policy_weight_identity"):
         setattr(
             WorkerBase,
             "verify_policy_weight_identity",
             verify_policy_weight_identity,
         )
+    if not hasattr(WorkerBase, "verify_direct_content_identity"):
+        setattr(
+            WorkerBase,
+            "verify_direct_content_identity",
+            verify_direct_content_identity,
+        )
     for name, method in (
         ("abort_weight_update", abort_weight_update),
+        ("prepare_direct_reshard_layout", prepare_direct_reshard_layout),
         ("get_direct_reshard_layout", get_direct_reshard_layout),
         ("init_direct_reshard_group", init_direct_reshard_group),
-        ("init_full_gather_group", init_full_gather_group),
         ("receive_direct_reshard", receive_direct_reshard),
         ("receive_ipc_direct_reshard", receive_ipc_direct_reshard),
     ):
@@ -1288,16 +2071,16 @@ def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
         _patch_engine_core_wake_lifecycle()
 __all__ = [
     "abort_weight_update",
-    "commit_reloaded_weights",
     "get_direct_reshard_layout",
     "get_all_parameter_manifest",
     "get_policy_weight_fingerprint",
     "get_policy_version",
+    "get_weight_sync_memory_stats",
     "init_direct_reshard_group",
-    "init_full_gather_group",
     "install_vllm_weight_sync_hooks",
-    "reload_weights",
+    "prepare_direct_reshard_layout",
     "verify_policy_weight_identity",
+    "verify_direct_content_identity",
     "write_parameter_manifest",
     "receive_direct_reshard",
     "receive_ipc_direct_reshard",

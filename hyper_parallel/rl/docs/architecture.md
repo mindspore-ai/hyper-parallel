@@ -140,8 +140,8 @@ Trainer FSDP/FSDP+TP source layout
 
 | 策略 | TP1 | Qwen3 TP2 |
 | --- | --- | --- |
-| Full-gather | 重建完整 logical tensors | 正常策略、oracle 或 fallback |
-| Direct-reshard | 自动退化为 full-gather | 只传输 source/destination region intersection |
+| Full-gather | 逐 fragment 重建当前 bucket | Colocated NPU IPC / disjoint HCCL；每 bucket ACK 后释放 |
+| Direct-reshard | replicated destination 的直接分片传输 | 只传输 source/destination region intersection |
 
 Policy version 严格递增。Direct 失败时先 abort pending transaction，再由 full-gather 完整覆盖；fallback 也失败时
 保持 admission 关闭，不恢复 rollout，也不发布新版本。详细合同见 [vLLM Rollout](vllm_rollout.md)。

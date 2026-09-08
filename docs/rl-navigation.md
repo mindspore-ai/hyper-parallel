@@ -63,12 +63,13 @@
 
 | 功能 | 配置键 | 入口 | 核心分支 | 指标 | 测试 |
 | --- | --- | --- | --- | --- | --- |
-| 权重同步策略 | `rollout.vllm.weight_sync.strategy` | `rl/config.py::_validate_vllm_weight_sync`, `rl/roles/rollout/vllm.py`(`build_vllm_engine` 处传入) | `rl/roles/weight_sync/transfer.py::build_weight_transfer`, `rl/roles/rollout/vllm.py::build_vllm_engine` | —(可观察 `configured_strategy` / `last_strategy` / `fallback_count`) | `rl_tests/test_direct_reshard.py`(`test_build_weight_transfer_skips_reshard_for_pure_dp`, `test_direct_failure_aborts_transaction_then_uses_full_gather`, `test_successful_direct_publication_updates_strategy_counters`) |
+| 权重同步策略 | `rollout.vllm.weight_sync.strategy` | `rl/config.py::_validate_vllm_weight_sync`, `rl/roles/rollout/vllm.py::build_vllm_engine` | `rl/roles/weight_sync/config.py::resolve_weight_sync_config`, `rl/roles/weight_sync/transfer.py::build_weight_transfer` | `weight_sync/configured_full_gather`、`weight_sync/fallback_count` | `rl_tests/test_direct_reshard.py::test_build_weight_transfer_keeps_direct_reshard_for_tp1` |
 | 传输 IPC/HCCL | `deployment`(colocated→IPC,disjoint→HCCL) | `rl/roles/weight_sync/transfer.py` | `rl/roles/weight_sync/hccl.py`, `rl/roles/weight_sync/transfer.py` | — | `rl_tests/test_hccl_weight_sync.py` |
 | 发布生命周期 | policy version / fingerprint | `rl/roles/weight_sync/vllm_worker.py` | `rl/roles/weight_sync/` | worker 本地 identity | `rl_tests/test_checkpoint_manager.py` |
+| 有界 full-gather | `rollout.vllm.weight_sync.strategy=full_gather`、`bucket_size_mb` | `rl/roles/weight_sync/config.py::resolve_weight_sync_config` | `rl/roles/weight_sync/streaming_full_gather.py` | `weight_sync/streaming_bucket_count` | `rl_tests/test_streaming_full_gather.py` |
 
-> `rl/roles/weight_sync/` 是后果最重的子系统 —— 6 个模块 + `__init__.py` / 约 5.4k 行。
-> 布局契约位于 `rl/roles/weight_sync/layout.py`。
+> 布局契约位于 `rl/roles/weight_sync/layout.py`，模型转换位于 `model_adapter.py`，运行合同见
+> [vLLM Rollout](../hyper_parallel/rl/docs/vllm_rollout.md#权重同步)。
 
 ## 5. Hyper-RL —— 一致性(bit-exact)
 
@@ -104,8 +105,7 @@ model · data · rollout · agentic · algorithm · evaluation · train · loggi
 
 `rollout.vllm.weight_sync.strategy` 接受 `direct_reshard` 与 `full_gather`
 (配合 `fallback_strategy ∈ {none, full_gather}`);默认即 **`full_gather`**,
-`bucket_size_mb` 默认 128。当 `rollout.vllm.tensor_parallel_size == 1` 时实际
-策略恒为 `full_gather`;`direct_reshard` 目前仅支持 Qwen3。
+`bucket_size_mb` 默认 128，fallback 默认 `none`。TP1 不再改写显式 `direct_reshard`；两个策略均支持 Qwen3 TP1/TP2。
 
 ---
 

@@ -72,13 +72,16 @@ Pause、sleep/wake、transaction、cache reset、resume 和 close 只由 coordin
 
 ## 权重同步
 
-- TP1 自动使用 full-gather。
-- Qwen3 TP2 支持 `full_gather` 与 `direct_reshard`。
-- Direct planner 同时解释 Trainer FSDP/TP source layout 与 rollout DP/TP destination layout，因此普通模式允许两侧 TP 不同。
+- 默认策略为 `full_gather`，fallback 默认 `none`；显式启用 `direct_reshard` 不会隐式开启 fallback。
+- 支持模型的 TP1/TP2 均可选择 `full_gather` 与 `direct_reshard`，TP1 不再自动改写显式策略。
+- `full_gather` 使用逐 fragment/bucket gather、传输、ACK 后释放的有界实现；colocated 走 NPU IPC，disjoint 走按 TP
+  目标划分的 HCCL broadcast，不再提供 whole-model 实现选择器。
+- Direct planner 同时解释 Trainer FSDP/TP source layout 与 rollout DP/TP destination layout，普通模式允许
+  已支持的 train/inference degree mismatch。
 - Colocated full/direct 使用 NPU IPC；disjoint 使用 HCCL fan-out。
 - Acceptance 使用 Trainer source-derived expected manifest，不用 full/direct 两个待测路径互相证明正确。
 
-Direct 失败时执行：
+仅当显式配置 `fallback_strategy=full_gather` 时，Direct 失败后执行：
 
 ```text
 keep admission paused
