@@ -1767,13 +1767,13 @@ class MindSporePlatform(Platform):
     @staticmethod
     def get_optim_state_dict(model, optimizer, *, options=None):
         raise NotImplementedError(
-            "issue240 optimizer state_dict adapter is currently supported only on Torch backend"
+            "optimizer state_dict adapter is currently supported only on Torch backend"
         )
 
     @staticmethod
     def set_optim_state_dict(model, optimizer, optim_state_dict, *, options=None):
         raise NotImplementedError(
-            "issue240 optimizer state_dict adapter is currently supported only on Torch backend"
+            "optimizer state_dict adapter is currently supported only on Torch backend"
         )
 
     @staticmethod
