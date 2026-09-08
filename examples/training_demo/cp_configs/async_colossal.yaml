@@ -55,8 +55,8 @@ plan_overrides:
     inner_target: self
     inner_wrapper:
       _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel_async.qwen3_moe_async_colossal_cp_wrapper
-  - match: "*.mlp"
-    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
+  - match: "*.mlp.experts"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
     replace_module:
       _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_grouped_experts
 
