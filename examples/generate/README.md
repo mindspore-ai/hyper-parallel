@@ -39,7 +39,7 @@ output_ids = generate(
 
 If the model returns `past_key_values`, decode uses KV cache. If the model
 does not return `past_key_values`, generation falls back to full-sequence
-recompute so existing project models can still run.
+recompute.
 
 Sampling supports greedy, top-k, and top-p modes through `GenerationConfig`.
 Custom `logits_processor` and `stopping_criteria` callables can be supplied as
@@ -127,22 +127,18 @@ The same JSON also includes decoded `hf_text`, `hyper_cache_text`, and
 `hyper_no_cache_text` fields, which can be inspected to confirm the generated
 text for the prompt.
 
-## Project model smoke
+## Transformers model smoke
 
-The CPU test suite covers no-cache generation against real repository model
-classes with small random configurations:
+The CPU test suite covers generation against a Transformers causal language
+model initialized from a small offline config:
 
-- `Qwen3_5ForCausalLM` through the functional `generate(model, ...)` API.
-- `Qwen3_5ForCausalLM` with `GenerateMixin`, using the `model.generate(...)`
+- `LlamaForCausalLM` through the functional `generate(model, ...)` API.
+- `LlamaForCausalLM` with `GenerateMixin`, using the `model.generate(...)`
   method form.
-- `Qwen3_5MoeForCausalLM` through the functional API and the
-  `model.generate(...)` method form.
 
-These tests validate that at least one repository model can use the generate
-flow without requiring checkpoint downloads. The current Qwen project-model
-checks use no-cache fallback because those model forwards do not return
-`past_key_values`; cache behavior is covered by cache-capable test models and
-the KV cache unit tests.
+These tests validate the Transformers integration without requiring checkpoint
+downloads. Cache behavior is also covered by cache-capable test models and the
+KV cache unit tests.
 
 ## Distributed boundary
 

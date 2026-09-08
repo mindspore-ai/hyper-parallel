@@ -30,9 +30,15 @@ class MpipeStepType(Enum):
     A trainable preprocess broadcasts its params (``MPIPE_PARAM_BROADCAST``),
     each owning rank runs the transposed forward (``MPIPE_TRANSPOSE_FWD``) and
     ships its output (``MPIPE_FWD_SEND`` / ``MPIPE_FWD_RECV``) and — for the
-    centralized recompute backward — its input (``MPIPE_GRAPH_SEND`` /
-    ``MPIPE_GRAPH_RECV``); stage 0 recomputes the backward
+    centralized stage-0 backward -- its input (``MPIPE_GRAPH_SEND`` /
+    ``MPIPE_GRAPH_RECV``); stage 0 runs the backward
     (``MPIPE_TRANSPOSE_BWD``).
+
+    Owner-does-backward (opt-in, trainable tower) replaces the stage-0-backward steps:
+    stage 0 ships the feature gradient back to the owner (``MPIPE_GRAD_SEND`` /
+    ``MPIPE_GRAD_RECV_WITH_BACKWARD``), the owner runs the tower backward on its retained
+    graph, and every rank SUM-reduces the tower param-grads to stage 0
+    (``MPIPE_GRAD_REDUCE``).
     """
 
     MPIPE_PARAM_BROADCAST = auto()
@@ -42,3 +48,6 @@ class MpipeStepType(Enum):
     MPIPE_GRAPH_SEND = auto()
     MPIPE_GRAPH_RECV = auto()
     MPIPE_TRANSPOSE_BWD = auto()
+    MPIPE_GRAD_SEND = auto()
+    MPIPE_GRAD_RECV_WITH_BACKWARD = auto()
+    MPIPE_GRAD_REDUCE = auto()

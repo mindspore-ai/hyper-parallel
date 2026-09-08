@@ -70,4 +70,7 @@ hyper_parallel/auto_parallel/SAPP-ND/memory_estimation/**/*.csv
 hyper_parallel/auto_parallel/SAPP-ND/paradise/output/
 hyper_parallel/auto_parallel/SAPP-ND/paradise/results/
 hyper_parallel/auto_parallel/SAPP-ND/**/*nd_to_ppb*.json
+
+# NPU graph-fusion debug dump (regenerated in CWD on every NPU run)
+fusion_result.json
 *.xlsx

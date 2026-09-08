@@ -62,7 +62,7 @@
 #include <vector>
 
 #include "framework/module.h"
-#include "include/kernel/ascend/custom/pyboost_impl/aclnn_op_runner.h"
+#include "mindspore/include/custom_op_api.h"
 
 namespace ms_multicore {
 

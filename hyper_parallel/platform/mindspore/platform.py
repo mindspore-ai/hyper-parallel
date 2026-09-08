@@ -50,7 +50,12 @@ from mindspore.ops.auto_generate.gen_ops_prim import inner_comm_all_to_all_v_op
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
 
-from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import (
+    Platform,
+    PlatformType,
+    EXISTING_COMM_GROUPS,
+    _build_p2p_edge_rank_lists,
+)
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
@@ -252,6 +257,12 @@ def _mindspore_variable_all_to_all(
         group=group,
         async_op=False,
     )
+    # MindSpore may expose an all-zero receive result as a scalar Tensor.  The
+    # variable all-to-all contract is still the requested dim-zero shape, so
+    # normalize the local result after all ranks have participated in the
+    # collective.
+    if sum(output_splits) == 0:
+        return mint.empty(output_shape, dtype=input_tensor.dtype)
     return output
 
 
@@ -1416,6 +1427,19 @@ class MindSporePlatform(Platform):
         input_tensor.requires_grad_()
 
     @staticmethod
+    def detach(input_tensor):
+        """Return the input for the current MindSpore DCP data-only path.
+
+        MindSpore Tensor and Parameter do not expose PyTorch's ``detach``
+        method. The current distributed-checkpoint path does not construct or
+        manage a gradient graph, so returning the original object preserves
+        storage aliasing for load targets. If future callers need gradient
+        blocking, this temporary compatibility hook should be replaced by a
+        dedicated MindSpore gradient API.
+        """
+        return input_tensor
+
+    @staticmethod
     def _normalize_group_options(pg_options: Any) -> Any:
         if not isinstance(pg_options, dict) or "hccl_config" not in pg_options:
             return pg_options
@@ -1440,6 +1464,20 @@ class MindSporePlatform(Platform):
         except (ImportError, RuntimeError, TypeError, ValueError):
             new_group(rank_ids=rank_list, group=group_name)
 
+    @staticmethod
+    def new_group(rank_list):
+        """Create a new communication group (not yet supported on MindSpore).
+
+        Args:
+            rank_list (list): List of global ranks to include in the group.
+
+        Raises:
+            NotImplementedError: MindSpore support is not yet implemented.
+        """
+        raise NotImplementedError(
+            "new_group is not yet supported on MindSpore"
+        )
+
     def _create_group(self, rank_list, pg_options: Any = None):
         world_group = self._maybe_reuse_world_group(rank_list)
         if world_group is not None:
@@ -1449,6 +1487,37 @@ class MindSporePlatform(Platform):
         self._create_group_with_options(group_name, rank_list, pg_options=pg_options)
         EXISTING_COMM_GROUPS[group_name] = group_name
         return group_name
+
+    @staticmethod
+    def create_p2p_multi_stream_groups(
+            pp_rank_list: list[int],
+            include_wrap: bool = False,
+    ) -> dict[int, str]:
+        """Create adjacent two-rank PP groups for independent communication streams.
+
+        Args:
+            pp_rank_list: Ordered global ranks in one pipeline-parallel group.
+            include_wrap: Whether to include the last-to-first interleaved edge.
+
+        Returns:
+            A mapping from adjacent peer rank to its MindSpore group name.
+        """
+        current_rank = MindSporePlatform.get_rank()
+        local_groups = {}
+        for edge_ranks in _build_p2p_edge_rank_lists(pp_rank_list, include_wrap):
+            if current_rank not in edge_ranks:
+                continue
+            group_key = str(edge_ranks)
+            group = EXISTING_COMM_GROUPS.get(group_key)
+            if group is None:
+                group = MindSporePlatform._maybe_reuse_world_group(list(edge_ranks))
+                if group is None:
+                    MindSporePlatform._create_group_with_options(group_key, list(edge_ranks))
+                    group = group_key
+                EXISTING_COMM_GROUPS[group_key] = group
+            peer_rank = edge_ranks[0] if edge_ranks[1] == current_rank else edge_ranks[1]
+            local_groups[peer_rank] = group
+        return local_groups
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
@@ -1917,6 +1986,10 @@ class MindSporePlatform(Platform):
 
     def get_current_stream(self):
         return ms.runtime.current_stream()
+
+    def synchronize(self) -> None:
+        """Block the host until the work queued on the current device stream has finished."""
+        ms.runtime.synchronize()
 
     def new_event(self):
         return ms.runtime.Event()

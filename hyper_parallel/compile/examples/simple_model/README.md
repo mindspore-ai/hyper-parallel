@@ -33,21 +33,21 @@ sharding:
 ## Code
 
 ```python
-from hyper_parallel.compile import GraphTrainer, ParallelConfig, ShardingPlan
+from hyper_parallel.compile import GraphTrainer, PassConfig, PassPlan
 
 # Model
 model = DummyModel(vocab_size, dim)
 
 # Sharding
-sharding_plan = ShardingPlan()
-sharding_plan.fsdp_wrap_pattern("*")
+pass_plan = PassPlan()
+pass_plan.fsdp_wrap_pattern("*")
 
 # Trainer
 trainer = GraphTrainer(
     model=model,
     train_fn=train_fn,
-    parallel_config=ParallelConfig(enable_overlap=True),
-    sharding_plan=sharding_plan,
+    pass_config=PassConfig(enable_overlap=True),
+    pass_plan=pass_plan,
 )
 
 # Train

@@ -1,0 +1,20 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Dataset test fixtures.
+
+``datasets.py`` hosts ``DummyDataset`` (moved from
+``components/data/datasets.py`` in stage 6, 05 §15.10 step 3); it is a
+smoke-test helper and is not part of the shipped package surface.
+"""

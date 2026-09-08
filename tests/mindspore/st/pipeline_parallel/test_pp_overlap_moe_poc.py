@@ -252,6 +252,23 @@ def test_pp_overlap_moe_accuracy_batch_p2p():
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
+def test_pp_overlap_moe_accuracy_multi_stream_p2p() -> None:
+    """Multi-stream PP groups — numerical equivalence and deadlock smoke test.
+
+    Feature: ``p2p_transport="multi_stream"`` keeps same-peer duplex batching while
+        routing each adjacent PP rank pair through its own two-rank group.
+    Description:
+        Launch the distributed overlap PoC using peer-specific P2P groups.
+    Expectation:
+        No group-init or P2P matching deadlock; losses and grads match the sync
+        baseline within ``rtol=1e-3, atol=1e-3``.
+    """
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_accuracy_multi_stream_p2p",
+               12367, worker_num=8, local_worker_num=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_accuracy_boundary():
     """fwd-boundary batching (EXPERIMENTAL opt-in) — equivalence vs baseline.
 

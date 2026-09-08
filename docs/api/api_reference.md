@@ -221,41 +221,7 @@ manual_seed(seed: int)
 
 ---
 
-## Shard / TP 张量并行
-
-### `shard_module`
-
-声明式并行策略接口。
-
-```python
-shard_module(
-    module: Module,
-    sharding_plan: dict,
-) -> Module
-```
-
-**参数：**
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `module` | `Module` | 要切分的模块 |
-| `sharding_plan` | `dict` | 切分配置，包含 `forward`（input/output）和 `parameter` |
-
-**sharding_plan 格式：**
-
-```python
-sharding_plan = {
-    "forward": {
-        "input": (x_layout,),
-        "output": (out_layout,),
-    },
-    "parameter": {
-        "weight": w_layout,
-    },
-}
-```
-
----
+## Shard / 自定义切分
 
 ### `custom_shard`
 
@@ -286,16 +252,6 @@ class DFunction(platform.Function):
 ```
 
 **详细文档：** 参见 [DFunction 文档](./dfunction.md)。
-
----
-
-### `parallelize_value_and_grad`
-
-并行化的值与梯度计算。
-
-```python
-parallelize_value_and_grad(...)
-```
 
 ---
 
@@ -803,33 +759,6 @@ get_hyper_optimizer(
 
 ---
 
-### `get_hyper_lr_scheduler`
-
-学习率调度器工厂函数。
-
-```python
-get_hyper_lr_scheduler(
-    optimizer: ChainedOptimizer,
-    total_steps: int,
-    warmup_steps: int = 0,
-    warmup_ratio: float = 0.0,
-    decay_style: str = "cosine",
-    lr: float = 1e-4,
-    lr_min: float = 1e-7,
-    lr_start: float = 0.0,
-    lr_decay_ratio: float = 1.0,
-    wsd_decay_steps: Optional[int] = None,
-    lr_wsd_decay_style: str = "exponential",
-    override_opt_param_scheduler: bool = False,
-) -> LRSchedulersContainer
-```
-
-**支持的 decay_style：** `"constant"` / `"linear"` / `"cosine"` / `"WSD"`
-
-**支持的 WSD decay_style：** `"linear"` / `"cosine"` / `"exponential"` / `"minus_sqrt"`
-
----
-
 ## Activation Checkpoint / Swap
 
 > PyTorch 与 MindSpore 后端均已实现。公共 API 位于 `hyper_parallel.core.activation_checkpoint`。
@@ -1001,7 +930,7 @@ __all__ = [
     "get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule",
     "DTensor", "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh",
     "distribute_module", "init_parameters", "init_empty_weights", "init_on_device",
-    "shard_module", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
+    "custom_shard", "SkipDTensorDispatch",
     "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
     "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend",
     "split_group", "get_group_local_rank", "mark_created_groups",

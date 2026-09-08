@@ -14,6 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(dirname "${SCRIPT_DIR}")
+source "${SCRIPT_DIR}/native/cann_version.sh"
 CUSTOM_OPS_SRC="${PROJECT_ROOT}/hyper_parallel/platform/mindspore/custom_ops"
 NATIVE_ROOT="${PROJECT_ROOT}/build/native"
 WORK_ROOT="${NATIVE_ROOT}/work/custom_ops"
@@ -154,11 +155,11 @@ if [[ -z "${ASCEND_HOME_PATH:-}" || ! -d "${ASCEND_HOME_PATH}" ]]; then
     fail "CANN_ENV_NOT_CONFIGURED" \
         "ASCEND_HOME_PATH must identify the selected CANN installation; source its set_env.sh first." 3
 fi
-CANN_VERSION_FILE="${ASCEND_HOME_PATH}/opp/version.info"
-CANN_VERSION=$(awk -F= '$1 == "Version" {print $2}' "${CANN_VERSION_FILE}" 2>/dev/null || true)
-if [[ "${CANN_VERSION}" != "9.1.0" ]]; then
+CANN_VERSION=$(hp_read_cann_version "${ASCEND_HOME_PATH}")
+if ! hp_cann_version_at_least "${CANN_VERSION}"; then
     fail "UNSUPPORTED_CANN_VERSION" \
-        "CANN 9.1.0 is required, found '${CANN_VERSION:-unknown}' under ${ASCEND_HOME_PATH}." 3
+        "CANN >= ${HP_MINIMUM_CANN_VERSION} is required, found " \
+        "'${CANN_VERSION:-unknown}' under ${ASCEND_HOME_PATH}." 3
 fi
 for cann_library in libascendcl.so libopapi.so; do
     if [[ ! -f "${ASCEND_HOME_PATH}/lib64/${cann_library}" ]]; then

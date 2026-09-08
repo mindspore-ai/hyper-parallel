@@ -21,7 +21,7 @@ nodes.
 
 Responsibilities:
 1. Identify parameter placeholders belonging to FSDP-wrapped modules
-   (via ShardingPlan, exact FQN or pattern)
+   (via PassPlan, exact FQN or pattern)
 2. Insert AllGather after each such placeholder (Shard -> Replicate), so the
    computation body operates on full parameters while the graph input stays
    sharded
@@ -40,17 +40,21 @@ Partitioning:
 - Backward: reduce_scatter gradients
 """
 
-from typing import Any, Dict, List, Set, Optional
+import logging
+from typing import Any, Dict, List, Optional, Set
 
 import torch.distributed as dist
 from torch import fx, nn
 from torch.ops import _c10d_functional
 
-from ..base import ParallelPass
-from ...sharding_config import ShardingPlan
+from ...parallel_config import PassConfig
+from ..base import GraphPass
+from ...sharding_config import PassPlan
+
+_LOG = logging.getLogger(__name__)
 
 
-class FSDPPass(ParallelPass):
+class FSDPPass(GraphPass):
     """
         FSDP Partitioning Pass (Module-Level, static-input graph)
 
@@ -70,53 +74,63 @@ class FSDPPass(ParallelPass):
     """
 
     name = "fsdp_parallel"
-    mesh_dim = "dp_shard"
-    comm_ops = ["all_gather", "reduce_scatter"]
 
     def __init__(
         self,
         fsdp_group_name: Optional[str] = None,
-        sharding_plan: Optional[ShardingPlan] = None,
+        pass_plan: Optional[PassPlan] = None,
     ) -> None:
         """Initialize FSDP pass state.
 
         Args:
             fsdp_group_name: Process-group name registered for FSDP
-                collectives. Defaults to ``"fsdp"``.
-            sharding_plan: Declarative plan identifying which modules to
+                collectives. Defaults to ``"fsdp"``. May be overridden
+                per-run via the ``fsdp_group_name`` kwarg in ``run``.
+            pass_plan: Declarative plan identifying which modules to
                 shard. When ``None``, all parameters are sharded.
         """
         super().__init__()
         self._fsdp_group_name = fsdp_group_name or "fsdp"
-        self._sharding_plan = sharding_plan
-        self._fsdp_degree = 1
+        self._pass_plan = pass_plan
+        # Resolved from ``pass_config.fsdp_degree`` (or world_size) at
+        # ``run`` entry; left as ``None`` here so a stray access before
+        # ``run`` fails loudly instead of silently using a wrong default.
+        self._fsdp_degree: Optional[int] = None
         self._processed_params: Set[str] = set()
         self._fsdp_modules: Set[str] = set()
 
     def run(
         self,
         graph_module: fx.GraphModule,
-        parallel_config: Any,
+        pass_config: PassConfig,
         **kwargs: Any,
     ) -> fx.GraphModule:
         """Insert AllGather/ReduceScatter and shard the live model.
 
         Args:
             graph_module: Joint fwd+bwd FX graph from the tracer.
-            parallel_config: Parallel configuration.
+            pass_config: Parallel configuration. ``fsdp_degree`` is
+                read directly; ``None`` falls back to ``world_size`` (the
+                FSDP-only path). A ``TypeError`` here means a non-Protocol
+                config was passed — fix at the caller, do not paper over.
             **kwargs: Must include ``model`` (the live ``nn.Module``) and
-                ``fsdp_group_name`` / ``sharding_plan`` as needed.
+                ``fsdp_group_name`` / ``pass_plan`` as needed.
 
         Returns:
             The transformed graph module.
         """
         if not dist.is_initialized() or dist.get_world_size() == 1:
-            print("[FSDPPass] Skipped: distributed not initialized or world_size=1")
+            _LOG.info("Skipped: distributed not initialized or world_size=1")
             return graph_module
 
-        self._fsdp_degree = dist.get_world_size()
+        # FSDP group size: use the explicitly configured degree when present
+        # (required for TP+FSDP, where the FSDP group is a proper sub-group
+        # of the world — using world_size would over-shard along the TP
+        # axis).
+        configured = pass_config.fsdp_degree
+        self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
-        self._sharding_plan = kwargs.get("sharding_plan", self._sharding_plan)
+        self._pass_plan = kwargs.get("pass_plan", self._pass_plan)
         model = kwargs.get("model")
         if model is None:
             raise ValueError(
@@ -125,45 +139,42 @@ class FSDPPass(ParallelPass):
                 "in compile()"
             )
 
-        print(
-            f"[FSDPPass] Running with fsdp_degree={self._fsdp_degree}, world_size={dist.get_world_size()}"
+        _LOG.info(
+            "Running with fsdp_degree=%s, world_size=%s",
+            self._fsdp_degree,
+            dist.get_world_size(),
         )
 
-        # 1. Identify FSDP parameter placeholders.
-        #
-        # The joint graph's parameters/buffers are static inputs (leading
-        # placeholders), not get_attr nodes. Identify them by position using
-        # the state layout the tracer attached to the GraphModule, then keep
-        # only those whose module FQN is marked for FSDP wrapping and whose
-        # leading dim is divisible by the FSDP degree (a non-divisible
-        # parameter stays replicated, in both the graph and the live model).
+        # Identify FSDP parameter placeholders. The joint graph's
+        # parameters/buffers are static inputs (leading placeholders, not
+        # get_attr nodes): locate them by position via the state layout the
+        # tracer attached, then keep only those in FSDP-marked modules whose
+        # leading dim is divisible by the FSDP degree (non-divisible params
+        # stay replicated, in both graph and live model).
         state_fqns = getattr(graph_module, "state_fqns", [])
         num_state_inputs = getattr(graph_module, "num_state_inputs", 0)
-        # Param-vs-buffer flag per leading state input, indexed by state
-        # position. Absent on graphs traced before this flag existed; default
-        # to all-params so old traces keep the previous (parameter-only)
-        # behaviour.
+        # Param-vs-buffer flag per leading state input. Absent on graphs
+        # traced before this flag existed; default to all-params so old
+        # traces keep the previous (parameter-only) behaviour.
         state_is_param = getattr(graph_module, "state_is_param", None)
         param_nodes = self._identify_params_in_fsdp_modules(
             graph_module, state_fqns, num_state_inputs, state_is_param, model
         )
 
-        print(
-            f"[FSDPPass] Identified {len(param_nodes)} FSDP parameter nodes "
-            f"out of {num_state_inputs} total state inputs"
+        _LOG.info(
+            "Identified %d FSDP parameter nodes out of %d total state inputs",
+            len(param_nodes),
+            num_state_inputs,
         )
 
         if not param_nodes:
-            print(
-                "[FSDPPass] Warning: No FSDP parameters found, check ShardingPlan or model structure"
+            _LOG.warning(
+                "No FSDP parameters found, check PassPlan or model structure"
             )
             return graph_module
 
-        # 2. Insert AllGather for each FSDP parameter (Shard -> Replicate).
         graph_module = self._insert_all_gather_for_params(graph_module, param_nodes)
 
-        # 3. Reduce-scatter the gradient outputs of FSDP parameters
-        #    (Replicate -> Shard).
         sharded_param_indices = frozenset(
             node.meta["state_idx"] for node in param_nodes
         )
@@ -176,12 +187,12 @@ class FSDPPass(ParallelPass):
             model,
         )
 
-        # 4. Physically shard the live model's parameters in place (dim 0, by
-        #    this rank's index in the FSDP group). ``model.parameters()`` now
-        #    returns the shards, so the trainer's optimizer and gradient
-        #    accumulation are FSDP-agnostic; the graph re-gathers each step.
+        # Shard the live model's parameters in place (dim 0, by this rank's
+        # index in the FSDP group). ``model.parameters()`` then yields the
+        # shards, so the trainer's optimizer / grad accumulation stay
+        # FSDP-agnostic; the graph re-gathers each step.
         self._shard_live_model_params(model)
-        print(f"[FSDPPass] Completed, sharded {len(param_nodes)} parameters")
+        _LOG.info("Completed, sharded %d parameters", len(param_nodes))
 
         graph_module.recompile()
         return graph_module
@@ -200,7 +211,7 @@ class FSDPPass(ParallelPass):
         Parameters are the leading ``num_state_inputs`` placeholders of the
         joint graph, in ``state_fqns`` order. A parameter is FSDP-sharded when
         any ancestor module FQN (e.g. ``layers.0.attention.wq`` for
-        ``layers.0.attention.wq.weight``) is marked in the ShardingPlan —
+        ``layers.0.attention.wq.weight``) is marked in the PassPlan —
         either exactly or via pattern (e.g. ``layers.*``).
 
         Only parameters are sharded. Buffers (e.g. RoPE's non-persistent
@@ -240,10 +251,8 @@ class FSDPPass(ParallelPass):
 
             fqn = state_fqns[idx]
 
-            # If ShardingPlan is provided, only shard parameters in FSDP-marked modules
-            # If ShardingPlan is None, shard all parameters (default behavior)
             if (
-                self._sharding_plan is not None
+                self._pass_plan is not None
                 and not self._param_belongs_to_fsdp_module(fqn)
             ):
                 continue
@@ -256,9 +265,11 @@ class FSDPPass(ParallelPass):
                 and param.shape
                 and param.shape[0] % self._fsdp_degree != 0
             ):
-                print(
-                    f"[FSDPPass] Skip {fqn}: dim 0 ({param.shape[0]}) "
-                    f"not divisible by fsdp_degree ({self._fsdp_degree})"
+                _LOG.info(
+                    "Skip %s: dim 0 (%s) not divisible by fsdp_degree (%s)",
+                    fqn,
+                    param.shape[0],
+                    self._fsdp_degree,
                 )
                 continue
 
@@ -285,23 +296,43 @@ class FSDPPass(ParallelPass):
             if not param.requires_grad:
                 continue
 
+            # Same plan gate as ``_identify_params_in_fsdp_modules``: only
+            # parameters inside FSDP-marked modules are sharded. Skipping the
+            # gate here would shard params the graph still expects full-rank
+            # (no AllGather inserted), causing a shape mismatch at
+            # ``run_traced_graph`` time on any non-``*`` plan.
+            if (
+                self._pass_plan is not None
+                and not self._param_belongs_to_fsdp_module(name)
+            ):
+                _LOG.info(
+                    "Skip %s: not in an FSDP-wrapped module",
+                    name,
+                )
+                continue
+
             # Mirror ``_identify_params_in_fsdp_modules``: scalar params
             # (empty shape) and non-divisible dim-0 params stay replicated.
             if not param.shape or param.shape[0] % self._fsdp_degree != 0:
-                print(
-                    f"[FSDPPass] Skip {name}: dim 0 ({param.shape[0] if param.shape else 'scalar'}) "
-                    f"not divisible by fsdp_degree ({self._fsdp_degree})"
+                _LOG.info(
+                    "Skip %s: dim 0 (%s) not divisible by fsdp_degree (%s)",
+                    name,
+                    param.shape[0] if param.shape else "scalar",
+                    self._fsdp_degree,
                 )
                 continue
 
             original_shape = param.shape
             param.data = param.detach().chunk(self._fsdp_degree, dim=0)[rank].clone()
             sharded_count += 1
-            print(
-                f"[FSDPPass] Sharded {name}: {list(original_shape)} -> {list(param.shape)}"
+            _LOG.info(
+                "Sharded %s: %s -> %s",
+                name,
+                list(original_shape),
+                list(param.shape),
             )
 
-        print(f"[FSDPPass] Total sharded parameters: {sharded_count}")
+        _LOG.info("Total sharded parameters: %d", sharded_count)
 
     def _param_belongs_to_fsdp_module(self, param_fqn: str) -> bool:
         """Check if a parameter FQN belongs to an FSDP-wrapped module.
@@ -310,11 +341,18 @@ class FSDPPass(ParallelPass):
         ``layers.0.attention.wq``) plus every ancestor (``layers.0``, ...) is
         tested, so both ``fsdp_wrap("layers.0.attention.wq")`` and
         ``fsdp_wrap_pattern("layers.*")`` match.
+
+        A parameter directly on the root (``weight``) has no module ancestor;
+        its own FQN is still tested first so it can be wrapped by its name
+        (``fsdp_wrap("weight")``) or by a ``*`` pattern.
         """
+        if self._pass_plan.is_fsdp_module(param_fqn):
+            return True
+
         parts = param_fqn.split(".")
         for i in range(len(parts) - 1, 0, -1):
             module_fqn = ".".join(parts[:i])
-            if self._sharding_plan.is_fsdp_module(module_fqn):
+            if self._pass_plan.is_fsdp_module(module_fqn):
                 return True
         return False
 
@@ -346,8 +384,8 @@ class FSDPPass(ParallelPass):
             if param_node.name in self._processed_params:
                 continue
 
-            # Insert AllGather + immediate wait (for correctness)
-            # AutoOverlapPass will later move wait_tensor for overlap optimization
+            # AllGather + immediate wait for correctness; AutoOverlapPass may
+            # sink the wait past independent compute later.
             with graph.inserting_after(param_node):
                 ag_node = graph.call_function(
                     _c10d_functional.all_gather_into_tensor,
@@ -360,13 +398,12 @@ class FSDPPass(ParallelPass):
                 ag_node.meta["state_idx"] = param_node.meta.get("state_idx")
                 ag_node.meta["fsdp_degree"] = self._fsdp_degree
 
-            # Insert wait *after* the AllGather (not inside the same
-            # inserting_after(param_node) block). The first insert inside a
-            # ``with inserting_after(X)`` lands immediately after ``X``, so a
-            # wait inserted in the same block would appear *before* the gather
-            # it depends on, and codegen would emit
-            # ``wait_tensor(all_gather_into_tensor)`` before that variable is
-            # assigned. AutoOverlapPass may move this wait later.
+            # Insert the wait in its own ``inserting_after(ag_node)`` block: a
+            # wait placed in the same block as the gather would land *before*
+            # the gather it depends on (the first insert inside
+            # ``with inserting_after(X)`` lands right after ``X``), and
+            # codegen would emit ``wait_tensor(all_gather_into_tensor)``
+            # before that variable is assigned.
             with graph.inserting_after(ag_node):
                 wait_node = graph.call_function(
                     _c10d_functional.wait_tensor,
@@ -377,8 +414,6 @@ class FSDPPass(ParallelPass):
             param_node.meta["fsdp_sharded"] = True
             param_node.meta["fsdp_ag_node"] = ag_node.name
 
-            # Replace all parameter usage with the waited result
-            # wait_tensor returns the gathered tensor
             for user in list(param_node.users.keys()):
                 if user not in (ag_node, wait_node):
                     user.replace_input_with(param_node, wait_node)
@@ -453,7 +488,6 @@ class FSDPPass(ParallelPass):
             if state_idx not in sharded_param_indices:
                 continue
 
-            # Insert ReduceScatter + immediate wait (for correctness)
             with graph.inserting_before(output_node):
                 rs_node = graph.call_function(
                     _c10d_functional.reduce_scatter_tensor,
@@ -463,7 +497,6 @@ class FSDPPass(ParallelPass):
                 rs_node.meta["comm_group"] = self._fsdp_group_name
                 rs_node.meta["fsdp_degree"] = self._fsdp_degree
 
-                # Insert wait immediately after ReduceScatter
                 wait_node = graph.call_function(
                     _c10d_functional.wait_tensor,
                     args=(rs_node,),
@@ -512,15 +545,8 @@ class FSDPPass(ParallelPass):
         self,
         graph_module: fx.GraphModule,
     ) -> fx.GraphModule:
-        """
-        Insert reshard logic: Release gathered parameters after Forward
-
-        Optimization points:
-        - Release parameters before loss computation
-        - Reduce peak memory
-        """
-        # This is a placeholder for more sophisticated memory management
-        # In practice, this would insert tensor deallocation operations
+        """Placeholder for a future reshard pass (release gathered params
+        after forward to cut peak memory). Currently a no-op."""
         return graph_module
 
 

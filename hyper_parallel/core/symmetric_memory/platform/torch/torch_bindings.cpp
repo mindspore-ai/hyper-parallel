@@ -7,20 +7,20 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
+#include <ATen/ops/from_blob.h>
+#include <shmem.h>
+#include <shmem_kernel.h>
+
 #include <algorithm>
-#include <iostream>
+#include <iostream>  // NOLINT(build/include_order)
 #include <numeric>
 #include <string>
 #include <vector>
-#include "acl/acl.h"
-#include "torch/script.h"
-#include "torch/torch.h"
-#include "torch_npu/csrc/aten/common/from_blob.h"
-#include "torch_npu/csrc/core/npu/DeviceUtils.h"
-#include "torch_npu/csrc/core/npu/NPUStream.h"
 
-#include "shmem.h"
-#include "shmem_kernel.h"
+#include "acl/acl.h"
+#include "torch/custom_class.h"
+#include "torch/types.h"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
 
 namespace ShmemOps {
 
@@ -60,7 +60,10 @@ class Manager : public torch::jit::CustomClassHolder {
                                          [](int64_t acc, int64_t dim) { return acc * dim; });
     int64_t element_size = at::elementSize(dtype);
     void *symmPtr = aclshmem_malloc(total_size * element_size);
-    at::Tensor aclshmem_tensor = at_npu::native::from_blob(symmPtr, shape, dtype);
+    auto current_stream = c10_npu::getCurrentNPUStream();
+    auto device = at::Device(at::DeviceType::PrivateUse1, current_stream.device_index());
+    auto options = at::TensorOptions().dtype(dtype).device(device);
+    at::Tensor aclshmem_tensor = at::from_blob(symmPtr, shape, [](void *) {}, options, device);
 
     return aclshmem_tensor;
   }
@@ -80,7 +83,9 @@ class Manager : public torch::jit::CustomClassHolder {
                         aclshmemx_uniqueid_t default_flag_uid, aclshmemx_init_attr_t *attributes) {
     size_t ip_len = 0;
     if (ip_port != nullptr) {
-      ip_len = std::min(strlen(ip_port), (size_t)(ACLSHMEM_MAX_IP_PORT_LEN - 1));
+      ip_len = std::min(
+          strlen(ip_port),
+          static_cast<size_t>(ACLSHMEM_MAX_IP_PORT_LEN - 1));
 
       std::copy_n(ip_port, ip_len, attributes->ip_port);
       if (attributes->ip_port[0] == '\0') {

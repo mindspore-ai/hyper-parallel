@@ -1,0 +1,164 @@
+diff --git a/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp b/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
+index f0d3a2c9..20e21ca7 100644
+--- a/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
++++ b/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
+@@ -76,7 +76,7 @@ struct SwigluSingleTilingKernel {
+ 
+   // calc tiling data
+   __aicore__ void GetTilingAndOffset(GM_ADDR tiling_gm, uint32_t inputDTypeLen) {
+-    GET_TILING_DATA(tempTilingGm, tiling_gm);
++    GET_TILING_DATA_WITH_STRUCT(SwiGluTilingData, tempTilingGm, tiling_gm);
+ 
+     is32BAligned = tempTilingGm.is32BAligned;
+     rowLen = tempTilingGm.rowLen;
+@@ -202,8 +202,8 @@ do {                                \
+ } while (0)
+ #define SWIGLU_SINGLE_PROCESS(kernelTiling) \
+ do {                                       \
+-    uint64_t blockNum = GetBlockNum();       \
+-	  for(uint64_t tileIdx = AscendC::GetBlockIdx(); tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
++    uint64_t blockNum = 1;       \
++	  for(uint64_t tileIdx = 0; tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
+         (kernelTiling).CaclOneTileParam(tileIdx); \
+         SWIGLU_SINGLE_PROCESS_TILE((kernelTiling).offsetParam, *((kernelTiling).curTileCopyParam), (kernelTiling).curCalLen); \
+ 	} \
+@@ -216,8 +216,8 @@ do {                                              \
+ } while(0)
+ #define SWIGLU_SINGLE_PROCESS_NON32BALIGNED(kernelTiling) \
+ do {                                       \
+-    uint64_t blockNum = GetBlockNum();       \
+-	  for(uint64_t tileIdx = AscendC::GetBlockIdx(); tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
++    uint64_t blockNum = 1;       \
++	  for(uint64_t tileIdx = 0; tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
+         (kernelTiling).CaclOneTileParam(tileIdx); \
+         SWIGLU_SINGLE_PROCESS_TILE_NON32BALIGNED((kernelTiling).offsetParam, *((kernelTiling).curTileCopyParam), (kernelTiling).curCalLen); \
+ 	} \
+diff --git a/activation/swi_glu/op_kernel/swi_glu.cpp b/activation/swi_glu/op_kernel/swi_glu.cpp
+index 0450bfbf..2e57d990 100644
+--- a/activation/swi_glu/op_kernel/swi_glu.cpp
++++ b/activation/swi_glu/op_kernel/swi_glu.cpp
+@@ -14,2 +14,4 @@
+  */
++#ifndef OPP_MEGA_MOE_SWI_GLU_CPP
++#define OPP_MEGA_MOE_SWI_GLU_CPP
+ #include "swi_glu_impl.hpp"
+@@ -19,3 +21,3 @@
+ using namespace AscendC;
+-extern "C" __global__ __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_gm,
++extern "C" inline __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_gm,
+                                               GM_ADDR workspace, GM_ADDR tiling) {
+@@ -25,18 +27,10 @@ extern "C" __global__ __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_g
+ 
+-  // DT_FLOAT = 0,            // float type
+-  // DT_FLOAT16 = 1,          // fp16 type
+-  // DT_BF16 = 27,            // bf16 type
+-  GET_TILING_DATA(tempTilingGm, tiling);
+-  if (tempTilingGm.isDoubleBuffer == 1) {
+-    if (TILING_KEY_IS(1)) {
+-      SwigluSingle<SwigluVectorBF16<half, float, half, 2>, half, half> op;
+-      op.Init(input_gm, nullptr, output_gm, tiling);
+-      op.Process();
+-    } else if (TILING_KEY_IS(0)) {
+-      SwigluSingle<SwigluVector<float, float, 2>, float, float> op;
++  GET_TILING_DATA_WITH_STRUCT(SwiGluTilingData, tempTilingGm, tiling);
++
++  if constexpr (std::is_same_v<DTYPE_Y, bfloat16_t>) {
++    if (tempTilingGm.isDoubleBuffer == 1) {
++      SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+       op.Init(input_gm, nullptr, output_gm, tiling);
+       op.Process();
+-    }
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__  == 220
+-    else if (TILING_KEY_IS(27)) {
++    } else {
+       SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+@@ -45,16 +39,9 @@ extern "C" __global__ __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_g
+     }
+-#endif
+   } else {
+-    if (TILING_KEY_IS(1)) {
+-      SwigluSingle<SwigluVectorBF16<half, float, half, 1>, half, half> op;
+-      op.Init(input_gm, nullptr, output_gm, tiling);
+-      op.Process();
+-    } else if (TILING_KEY_IS(0)) {
+-      SwigluSingle<SwigluVector<float, float, 1>, float, float> op;
++    if (tempTilingGm.isDoubleBuffer == 1) {
++      SwigluSingle<SwigluVectorBF16<half, float, half, 2>, half, half> op;
+       op.Init(input_gm, nullptr, output_gm, tiling);
+       op.Process();
+-    }
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__  == 220
+-    else if (TILING_KEY_IS(27)) {
+-      SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 1>, bfloat16_t, bfloat16_t> op;
++    } else {
++      SwigluSingle<SwigluVectorBF16<half, float, half, 1>, half, half> op;
+       op.Init(input_gm, nullptr, output_gm, tiling);
+@@ -62,4 +49,4 @@ extern "C" __global__ __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_g
+     }
+-#endif
+   }
+-}
+\ No newline at end of file
++}
++#endif  // OPP_MEGA_MOE_SWI_GLU_CPP
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
+index 2e386402..f672fbb1 100644
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
+@@ -17,45 +17,31 @@
+ #include "swi_glu_grad_single.hpp"
+ 
+ using namespace AscendC;
+-extern "C" __global__ __aicore__ void swi_glu_grad(GM_ADDR gradout_gm, GM_ADDR input_gm, GM_ADDR output_gm,
++extern "C" inline __aicore__ void swi_glu_grad(GM_ADDR gradout_gm, GM_ADDR input_gm, GM_ADDR output_gm,
+                                                    GM_ADDR workspace, GM_ADDR tiling) {
+     // DT_FLOAT = 0,            // float type
+     // DT_FLOAT16 = 1,          // fp16 type
+     // DT_BF16 = 27,            // bf16 type
+-    GET_TILING_DATA(tempTilingGm, tiling);
+-    if (tempTilingGm.isDoubleBuffer == 1) {
+-      if (TILING_KEY_IS(1)) {
+-        SwiGluGradSingle <SwiGluGradBF16<half, float, half, 2>, half, half> op;
+-        op.Init(gradout_gm, input_gm, output_gm, tiling);
+-        op.Process();
+-      } else if (TILING_KEY_IS(0)) {
+-        SwiGluGradSingle<SwiGluGradVector<float, float, float, float, float, 2>, float, float> op;
++    GET_TILING_DATA_WITH_STRUCT(SwiGluTilingData, tempTilingGm, tiling);
++    if constexpr (std::is_same_v<DTYPE_DY, bfloat16_t>) {
++      if (tempTilingGm.isDoubleBuffer == 1) {
++        SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+         op.Init(gradout_gm, input_gm, output_gm, tiling);
+         op.Process();
+-      }
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__  == 220
+-      else if (TILING_KEY_IS(27)) {
+-        SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
++      } else {
++        SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 1>, bfloat16_t, bfloat16_t> op;
+         op.Init(gradout_gm, input_gm, output_gm, tiling);
+         op.Process();
+       }
+-#endif
+     } else {
+-      if (TILING_KEY_IS(1)) {
+-        SwiGluGradSingle <SwiGluGradBF16<half, float, half, 1>, half, half> op;
+-        op.Init(gradout_gm, input_gm, output_gm, tiling);
+-        op.Process();
+-      } else if (TILING_KEY_IS(0)) {
+-        SwiGluGradSingle<SwiGluGradVector<float, float, float, float, float, 1>, float, float> op;
++      if (tempTilingGm.isDoubleBuffer == 1) {
++        SwiGluGradSingle <SwiGluGradBF16<half, float, half, 2>, half, half> op;
+         op.Init(gradout_gm, input_gm, output_gm, tiling);
+         op.Process();
+-      }
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__  == 220
+-      else if (TILING_KEY_IS(27)) {
+-        SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 1>, bfloat16_t, bfloat16_t> op;
++      } else {
++        SwiGluGradSingle <SwiGluGradBF16<half, float, half, 1>, half, half> op;
+         op.Init(gradout_gm, input_gm, output_gm, tiling);
+         op.Process();
+       }
+-#endif
+   }
+ }

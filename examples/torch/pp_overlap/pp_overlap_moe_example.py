@@ -330,7 +330,10 @@ def make_overlap_b_f_callback(overlap: CommComputeOverlap, device: torch.device)
                 torch.cuda.set_device(device.index)
             if bwd_recv_handles:
                 schedule._wait_p2p(bwd_recv_handles)  # pylint: disable=W0212
-            bwd_stage.backward_one_chunk(bwd_mi)
+            if bwd_step.type == MetaStepType.BWD_INPUT:
+                bwd_stage.backward_input_one_chunk(bwd_mi)
+            else:
+                bwd_stage.backward_one_chunk(bwd_mi)
 
         overlap.run(fwd_fn=fwd_fn, bwd_fn=bwd_fn)
 

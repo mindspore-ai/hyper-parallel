@@ -164,6 +164,31 @@ class TestHyperParallelLogging(unittest.TestCase):
 
         self.assertIn("HP|UnitH|hi", stream.getvalue())
 
+    def test_set_format_leaves_foreign_handlers_alone(self):
+        """A handler HP did not create keeps its own formatter.
+
+        pytest attaches its capture handlers to every non-propagating logger --
+        ours included -- and those objects are the root logger's handlers too, so
+        stamping the HP format there would push ``hp_component`` onto every record
+        in the process and blow up any record that lacks the field.
+        """
+        log = get_logger("UnitJ")
+        hp_stream = io.StringIO()
+        log.handlers[0].stream = hp_stream
+        foreign_stream = io.StringIO()
+        foreign = logging.StreamHandler(foreign_stream)
+        foreign.setFormatter(logging.Formatter("foreign|%(message)s"))
+        log.addHandler(foreign)
+        set_level("UnitJ", "INFO")
+
+        set_format(fmt="HP|%(hp_component)s|%(message)s")
+        log.info("hi")
+
+        self.assertEqual(hp_stream.getvalue().strip(), "HP|UnitJ|hi")
+        self.assertEqual(foreign_stream.getvalue().strip(), "foreign|hi", (
+            "set_format must not re-stamp a handler it did not create"
+        ))
+
     def test_set_format_preserves_external_handler_formatter(self):
         """Changing the HP format does not overwrite externally attached handlers."""
         log = get_logger("FSDP")

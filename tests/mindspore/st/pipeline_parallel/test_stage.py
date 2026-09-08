@@ -31,3 +31,14 @@ def _run(name: str):
 def test_pipeline_stage_backward_reuses_forward_and_gradfn_result():
     """See impl ``test_pipeline_stage_backward_reuses_forward_and_gradfn_result``."""
     return _run("test_pipeline_stage_backward_reuses_forward_and_gradfn_result")
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_pipeline_stage_caches_trainable_params_across_forward_chunks():
+    """See impl ``test_pipeline_stage_caches_trainable_params_across_forward_chunks``."""
+    return _run("test_pipeline_stage_caches_trainable_params_across_forward_chunks")

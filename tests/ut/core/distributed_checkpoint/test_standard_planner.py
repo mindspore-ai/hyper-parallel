@@ -32,6 +32,9 @@ import hyper_parallel.core.distributed_checkpoint.standard_planner as planner_mo
 importlib.reload(planner_mod)
 
 from hyper_parallel.core.distributed_checkpoint.metadata import (
+    BroadcastInfo,
+    CHUNK_INFO,
+    ChunkInfo,
     ChunkStorageMetadata,
     Metadata,
     MetadataIndex,
@@ -44,6 +47,7 @@ from hyper_parallel.core.distributed_checkpoint.standard_planner import (
     StandardSavePlanner,
     create_read_items_for_chunk_list,
 )
+from hyper_parallel.core.distributed_checkpoint.util import BROADCAST_INFO
 from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
@@ -58,7 +62,7 @@ class TestStandardPlanner(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
         importlib.reload(planner_mod)
-        StandardSavePlanner._cached_save_result.clear()
+        StandardSavePlanner.cached_save_result.clear()
 
     @staticmethod
     def _ragged_tensor(local, local_units=(1, 3)):
@@ -97,7 +101,8 @@ class TestStandardPlanner(unittest.TestCase):
         """
         Feature: StandardSavePlanner.build_global_plan.
         Description: Merge two local plans writing distinct tensor FQNs.
-        Expectation: Metadata lists both tensors; chunk indices are assigned per FQN.
+        Expectation: Metadata lists both tensors; only this rank's plan is returned, with chunk
+            indices assigned per FQN.
         """
         chunk = ChunkStorageMetadata(offsets=(0, 0), sizes=(2, 2))
         props = TensorProperties(dtype="float32")
@@ -117,8 +122,11 @@ class TestStandardPlanner(unittest.TestCase):
         ]
         planner = StandardSavePlanner(enable_plan_caching=False, remove_redundancy=False)
         planner.configure_planner({"w": torch.zeros(2, 2), "b": torch.zeros(2, 2)}, use_collectives=False)
-        global_plans, metadata = planner.build_global_plan(local_plans)
-        self.assertEqual(len(global_plans), 2)
+        planner.rank = 1
+        own_plan, metadata = planner.build_global_plan(local_plans)
+        # Only rank 1's plan comes back, and it carries the item rank 1 contributed.
+        self.assertEqual([item.index.fqn for item in own_plan.items], ["b"])
+        self.assertEqual(own_plan.items[0].index.index, 0)
         self.assertIn("w", metadata.state_dict_metadata)
         self.assertIn("b", metadata.state_dict_metadata)
         w_md = metadata.state_dict_metadata["w"]
@@ -148,7 +156,7 @@ class TestStandardPlanner(unittest.TestCase):
 
         plan = planner.build_local_plan()
 
-        self.assertFalse(planner._enable_plan_caching)
+        self.assertTrue(planner._enable_plan_caching)
         self.assertEqual(
             [item.index.offset for item in plan.items],
             [(0, 0, 0), (1, 0, 0)],
@@ -157,6 +165,25 @@ class TestStandardPlanner(unittest.TestCase):
             [tuple(planner.get_data(item).shape) for item in plan.items],
             [(1, 4, 8), (1, 2, 8)],
         )
+
+    def test_ragged_save_plan_cache_reuses_geometry_and_reads_current_data(self):
+        """Reuse a RaggedShard plan while resolving data from the current state dict."""
+        first = StandardSavePlanner(enable_plan_caching=True)
+        first.configure_planner({"weight": self._ragged_tensor(torch.arange(48))}, rank=0)
+        first_plan = first.build_local_plan()
+        first_final, first_metadata = first.build_global_plan([first_plan])
+        first.cache_result(first.finalize_plan(first_final), first_metadata)
+
+        second = StandardSavePlanner(enable_plan_caching=True)
+        second.configure_planner({"weight": self._ragged_tensor(torch.arange(48, 96))}, rank=0)
+        cached = second.get_cached()
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(len(cached.final_plan.items), 2)
+        pieces = [second.get_data(item) for item in cached.final_plan.items]
+        self.assertEqual([tuple(piece.shape) for piece in pieces], [(1, 4, 8), (1, 2, 8)])
+        torch.testing.assert_close(pieces[0].reshape(-1), torch.arange(48, 80))
+        torch.testing.assert_close(pieces[1].reshape(-1), torch.arange(80, 96))
 
     def test_save_planner_plan_cache_hit(self):
         """
@@ -231,10 +258,12 @@ class TestStandardPlanner(unittest.TestCase):
         planner.configure_planner({"weight": target}, metadata, rank=0)
         global_tensor = torch.arange(192).reshape(6, 4, 8)
 
+        # The rank lookup happens on the shared ``platform`` object imported from
+        # util, so patch the method on it rather than a module-level getter.
         with patch(
-                "hyper_parallel.core.distributed_checkpoint.standard_planner.get_platform"
-        ) as mock_platform:
-            mock_platform.return_value.get_rank.return_value = 0
+                "hyper_parallel.core.distributed_checkpoint.util.platform.get_rank",
+                return_value=0,
+        ):
             read_items = planner.build_local_plan().items
 
         for item in read_items:
@@ -250,6 +279,107 @@ class TestStandardPlanner(unittest.TestCase):
             planner.acquire_tensor(item).copy_(global_tensor[source_slices])
 
         torch.testing.assert_close(target.to_local(), torch.arange(144))
+
+    @staticmethod
+    def _chunk_tagged(tensor, replica_rank_list):
+        """Tag a plain tensor the way an integration that does not use DTensor does."""
+        shape = tuple(tensor.shape)
+        setattr(
+            tensor,
+            CHUNK_INFO,
+            ChunkInfo(
+                chunk=ChunkStorageMetadata(offsets=(0,) * len(shape), sizes=shape),
+                global_shape=shape,
+                replica_rank_list=replica_rank_list,
+            ),
+        )
+        return tensor
+
+    @staticmethod
+    def _single_chunk_metadata(fqn, shape):
+        """Metadata for one tensor the checkpoint holds as a single full chunk."""
+        return Metadata(
+            state_dict_metadata={
+                fqn: TensorStorageMetadata(
+                    properties=TensorProperties(dtype="torch.float32"),
+                    size=shape,
+                    chunks=[ChunkStorageMetadata(offsets=(0,) * len(shape), sizes=shape)],
+                )
+            }
+        )
+
+    def test_load_planner_marks_only_the_entries_it_reads(self):
+        """
+        Feature: StandardLoadPlanner.build_local_plan broadcast marking.
+        Description: Two replicated entries carry CHUNK_INFO, but the checkpoint holds only the
+            first one; rank 1 is a receiver of that first entry.
+        Expectation: Only the entry the plan covers carries BROADCAST_INFO. An entry skipped for
+            want of checkpoint data must stay unmarked, otherwise the broadcast overwrites it
+            with the source rank's buffer, which no rank ever loaded.
+        """
+        weight = self._chunk_tagged(torch.zeros(4, 4), (0, 1))
+        step = self._chunk_tagged(torch.full((1,), 7.0), (0, 1))
+        state = {"weight": weight, "step": step}
+
+        planner = StandardLoadPlanner()
+        planner.configure_planner(
+            state,
+            self._single_chunk_metadata("weight", (4, 4)),
+            rank=1,
+            broadcast_from_minimum_rank=True,
+        )
+        plan = planner.build_local_plan()
+
+        # Rank 1 reads neither: it receives the weight, and step is not in the checkpoint.
+        self.assertEqual(plan.items, [])
+        self.assertEqual(getattr(weight, BROADCAST_INFO), BroadcastInfo((0, 1), 0))
+        self.assertFalse(hasattr(step, BROADCAST_INFO))
+
+
+    def test_load_planner_rejects_a_shard_group_the_rank_is_absent_from(self):
+        """
+        Feature: StandardLoadPlanner.should_load_shard shard group validation.
+        Description: An integration attaches a replica_rank_list that does not contain the
+            current rank, which is what a wrong rank mapping looks like from here.
+        Expectation: ValueError naming the rank and the group. Accepting it would let the rank
+            fall through to ``self.rank == min(group_ranks)``, so it would read nothing and then
+            wait on a broadcast it is not a member of, hanging the whole group.
+        """
+        weight = self._chunk_tagged(torch.zeros(4, 4), (0, 1))
+
+        planner = StandardLoadPlanner()
+        planner.configure_planner(
+            {"weight": weight},
+            self._single_chunk_metadata("weight", (4, 4)),
+            rank=2,
+            broadcast_from_minimum_rank=True,
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            planner.should_load_shard(weight)
+
+        self.assertIn("(0, 1)", str(ctx.exception))
+        self.assertFalse(hasattr(weight, BROADCAST_INFO))
+
+    def test_load_planner_reads_a_tensor_whose_replica_list_is_absent(self):
+        """
+        Feature: StandardLoadPlanner.should_load_shard without a replica list.
+        Description: CHUNK_INFO is attached but carries no replica_rank_list, the shape an
+            integration that does not replicate produces.
+        Expectation: The rank reads the tensor itself and nothing is marked for broadcast.
+        """
+        weight = self._chunk_tagged(torch.zeros(4, 4), None)
+
+        planner = StandardLoadPlanner()
+        planner.configure_planner(
+            {"weight": weight},
+            self._single_chunk_metadata("weight", (4, 4)),
+            rank=2,
+            broadcast_from_minimum_rank=True,
+        )
+
+        self.assertTrue(planner.should_load_shard(weight))
+        self.assertFalse(hasattr(weight, BROADCAST_INFO))
 
 
 if __name__ == "__main__":

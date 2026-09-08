@@ -84,10 +84,10 @@ _DEFAULT_COMPONENT = "HP"
 # Known component labels. This list is NOT a gate -- unknown labels still work --
 # it exists only to (a) give case-insensitive matching its canonical spelling and
 # (b) warn on a likely typo (e.g. ``FDSP`` for ``FSDP``), which would otherwise
-# silently never match. Only FSDP is wired up today; whoever adds a new component
-# (DTensor, CP, EP, ...) appends its name here (one line) to make it
-# case-insensitive and silence the typo warning.
-_KNOWN_COMPONENTS = (_DEFAULT_COMPONENT, "FSDP")
+# silently never match. Whoever adds a new component (DTensor, CP, EP, ...)
+# appends its name here (one line) to make it case-insensitive and silence the
+# typo warning.
+_KNOWN_COMPONENTS = (_DEFAULT_COMPONENT, "FSDP", "DCP")
 _CANONICAL = {name.upper(): name for name in _KNOWN_COMPONENTS}
 _warned_unknown = set()
 
@@ -253,10 +253,16 @@ def configure(spec: str) -> None:
 
 
 def set_format(fmt: Optional[str] = None, datefmt: Optional[str] = None) -> None:
-    """Override the global log format and refresh every registered handler.
+    """Override the global log format and refresh every registered HP handler.
 
     Use ``%(hp_component)s`` in ``fmt`` for the component label, alongside any
     standard ``LogRecord`` field (``%(levelname)s``, ``%(filename)s``, ...).
+
+    Only :class:`_HPStreamHandler` instances are re-stamped. A foreign handler
+    sitting on a component logger (pytest attaches its capture handlers to every
+    non-propagating logger) is usually the *root* handler object too, so
+    formatting it here would push ``hp_component`` onto every record in the
+    process -- and any record without that field then fails to format.
     """
     global _LOG_FORMAT, _DATE_FORMAT
     if fmt is not None:

@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Per-model registration bundle for the training stack.
-
-Maps ``model.name`` in trainer YAML to construction and parallel hooks.
-See :mod:`hyper_parallel.models.spec.registry` for ``register_spec`` / ``get_spec``.
-"""
+"""Declarative bundle of model construction and parallelization hooks."""
 
 from dataclasses import dataclass
 from typing import Callable, Optional, Type
@@ -34,13 +30,10 @@ class ModelSpec:
     and checkpoint key mapping.
 
     Args:
-        name: Unique model id (matches trainer config ``model.name``).
-        build_model_fn: ``(trainer_cfg) -> Module`` factory used by the trainer
-            today in :mod:`hyper_parallel.models.spec`.
-        model: Declarative :class:`BaseModel.Config` tree; built via
-            ``spec.model.build()`` when the trainer supports this path.
-        parallelize_fn: ``(model, mesh, trainer_cfg) -> model`` custom
-            parallelization (required for current trainer).
+        name: Unique model identifier.
+        build_model_fn: Callable that builds the runtime model from a config.
+        model: Declarative :class:`BaseModel.Config` tree.
+        parallelize_fn: Optional custom model parallelization callable.
         clip_grad_fn: Optional custom gradient clipping.
         pipelining_fn: Optional pipeline-parallel setup.
         state_dict_adapter: Optional checkpoint key translation class.
@@ -55,10 +48,10 @@ class ModelSpec:
                 parallelize_fn=parallelize_my_model,
             )
 
-        Factory function (current trainer default)::
+        Factory function::
 
-            def build_my_model(trainer_cfg):
-                return MyModel(MyModel.Config(hidden=trainer_cfg.hidden_size))
+            def build_my_model(config):
+                return MyModel(MyModel.Config(hidden=config.hidden_size))
 
             spec = ModelSpec(
                 name="my_model",
@@ -66,11 +59,6 @@ class ModelSpec:
                 parallelize_fn=parallelize_my_model,
             )
 
-        Register before training::
-
-            from hyper_parallel.models.spec import register_spec
-
-            register_spec("my_model", spec)
     """
 
     name: str

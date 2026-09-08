@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+
 """Storage interfaces for checkpoint save and load."""
+
 import abc
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,15 +96,15 @@ class StorageWriter(abc.ABC):
         """
 
     @abc.abstractmethod
-    def optimize_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
+    def optimize_global_plan(self, plan: SavePlan) -> SavePlan:
         """
-        Optimize global plan from all local plans.
+        Optimize this rank's save plan once the global plan has been built.
 
         Args:
-            plans (list[SavePlan]): List of local save plans from all ranks.
+            plan (SavePlan): This rank's save plan, with storage indices assigned.
 
         Returns:
-            list[SavePlan]: List of optimized global save plans.
+            SavePlan: The optimized save plan.
         """
 
     @abc.abstractmethod
@@ -183,23 +185,31 @@ class StorageReader(abc.ABC):
         """
 
     @abc.abstractmethod
-    def optimize_global_plan(self, plans: list[LoadPlan]) -> list[LoadPlan]:
+    def optimize_global_plan(self, plan: LoadPlan) -> LoadPlan:
         """
-        Optimize global plan from all local plans.
+        Optimize this rank's load plan once the global plan has been built.
 
         Args:
-            plans (list[LoadPlan]): List of local load plans from all ranks.
+            plan (LoadPlan): This rank's load plan.
 
         Returns:
-            list[LoadPlan]: List of optimized global load plans.
+            LoadPlan: The optimized load plan.
         """
 
     @abc.abstractmethod
-    def execute_read(self, plan: LoadPlan, planner: LoadPlanner) -> None:
+    def execute_read(
+        self,
+        plan: LoadPlan,
+        planner: LoadPlanner,
+        broadcast_groups: Optional[dict] = None,
+    ) -> None:
         """
         Execute read operation from storage according to the load plan.
 
         Args:
             plan (LoadPlan): The load plan to execute.
             planner (LoadPlanner): The load planner instance for applying loaded data.
+            broadcast_groups (Optional[dict]): Communication groups for broadcast.
+                Only consulted when the reader was configured with
+                ``broadcast_from_minimum_rank``; omit it for a plain read.
         """

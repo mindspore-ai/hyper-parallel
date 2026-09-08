@@ -191,6 +191,7 @@ def _wrap_one_container(
     )
 
     wrapped_blocks = []
+    checkpoint_blocks = []
     num_wrapped = 0
     for block in blocks:
         # Skip frozen blocks — matches LlamaFactory's runtime check semantics.
@@ -200,6 +201,7 @@ def _wrap_one_container(
         wrapped = checkpoint_wrapper(block, **wrap_kwargs)
         wrapped.register_forward_hook(_clone_checkpoint_output)
         wrapped_blocks.append(wrapped)
+        checkpoint_blocks.append(wrapped)
         num_wrapped += 1
 
     num_skipped = len(blocks) - num_wrapped
@@ -213,12 +215,9 @@ def _wrap_one_container(
     setattr(parent, attr, nn.ModuleList(wrapped_blocks))
 
     if mode == "swap":
-        swap_blocks = [
-            b for b in wrapped_blocks if hasattr(b, "_checkpoint_wrapped_module")
-        ]
-        for i in range(len(swap_blocks) - 1):
-            SwapManager().set_forward_prefetch_layer(swap_blocks[i], swap_blocks[i + 1])
-        _replace_module_backward_hooks_with_tensor_hooks(swap_blocks)
+        for i in range(len(checkpoint_blocks) - 1):
+            SwapManager().set_forward_prefetch_layer(checkpoint_blocks[i], checkpoint_blocks[i + 1])
+        _replace_module_backward_hooks_with_tensor_hooks(checkpoint_blocks)
         logger.info(
             "[Activation] [%s] Applied swap checkpoint to %d/%d blocks, swap_inputs=%s",
             block_path,

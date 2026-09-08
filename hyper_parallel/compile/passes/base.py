@@ -15,46 +15,50 @@
 """
 Graph Pass Base - Base Class for Graph Transformation Passes
 
-All parallel partitioning passes and optimization passes inherit from this class.
+All parallel partitioning passes and optimization passes inherit from this
+class. The config a pass receives is typed as ``PassConfig`` so passes
+can rely on ``enable_overlap`` / ``fsdp_enabled`` / ``fsdp_degree``
+/ ``tp_size`` being present without each pass re-declaring the contract.
 """
 
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
+from ..parallel_config import PassConfig
+
 if TYPE_CHECKING:
     from torch import fx
-    from ..sharding_config import ShardingPlan
+    from ..sharding_config import PassPlan
 
 
 class GraphPass(ABC):
-    """
-    Graph Optimization Pass Base Class
+    """Graph Optimization Pass Base Class.
 
-    All parallel partitioning passes and optimization passes inherit from this class
+    All parallel partitioning passes and optimization passes inherit from
+    this class.
     """
 
     @property
     @abstractmethod
     def name(self) -> str:
-        """Pass name"""
+        """Pass name."""
         pass  # pylint: disable=W0107
 
     @abstractmethod
     def run(
         self,
         graph_module: "fx.GraphModule",
-        parallel_config: Any,
+        pass_config: PassConfig,
         **kwargs: Any,
     ) -> "fx.GraphModule":
-        """
-        Execute graph transformation
+        """Execute graph transformation.
 
         Args:
-            graph_module: Input graph
-            parallel_config: Parallel configuration
+            graph_module: Input graph.
+            pass_config: Parallel configuration.
 
         Returns:
-            Transformed graph
+            Transformed graph.
         """
         pass  # pylint: disable=W0107
 
@@ -63,22 +67,4 @@ class GraphPass(ABC):
         return f"{self.__class__.__name__}(name={self.name})"
 
 
-class ParallelPass(GraphPass):
-    """
-    Parallel Partitioning Pass Base Class
-
-    Specifically for FSDP/TP/EP/PP parallel partitioning
-    """
-
-    @property
-    def mesh_dim(self) -> str:
-        """Mesh dimension corresponding to this Pass"""
-        return ""
-
-    @property
-    def comm_ops(self) -> list:
-        """Communication operators this Pass may insert"""
-        return []
-
-
-__all__ = ["GraphPass", "ParallelPass"]
+__all__ = ["GraphPass"]

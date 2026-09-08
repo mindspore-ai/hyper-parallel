@@ -1,7 +1,7 @@
 # Tiny Qwen3-MoE: asynchronous Pure Ulysses CP.
 
 model:
-  _target_: hyper_parallel.auto_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: ./examples/training_demo/tiny_qwen3_moe
   ignore_mismatched_sizes: false
   torch_dtype: bfloat16
@@ -44,21 +44,21 @@ plan_overrides:
       - "model.norm"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
     replace_module:
-      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_rms_norm
   - match: "*.self_attn"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
     replace_module:
-      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_flash_attention
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_flash_attention
   - match: "*.self_attn"
     when: cp
     region_dispatch: false
     inner_target: self
     inner_wrapper:
-      _target_: hyper_parallel.auto_models.components.distributed.cp_wrappers.qwen3_moe_async_ulysses_cp_wrapper
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel_async.qwen3_moe_async_ulysses_cp_wrapper
   - match: "*.mlp"
     module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
     replace_module:
-      _target_: hyper_parallel.auto_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_sparse_moe
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_grouped_experts
 
 mixed_precision:
   enabled: false
@@ -70,7 +70,7 @@ dataset:
   model_assets:
     chat_template: null
     tokenizer:
-      _target_: hyper_parallel.auto_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: ./examples/training_demo/tiny_qwen3_moe
       tokenizer_type: pretokenized
       vocab_size: 256
@@ -85,14 +85,14 @@ dataset:
     simple_blend: "no"
     labels_are_shifted: true
     create_attention_mask_in_dataloader: false
-  _target_: hyper_parallel.auto_models.components.datasets.llm.build_indexed_text_dataset
+  _target_: hyper_parallel.data.text.build_indexed_text_dataset
 
 dataloader:
-  _target_: hyper_parallel.auto_models.components.datasets.FixedBatchDataLoader
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
-    _target_: hyper_parallel.auto_models.components.datasets.build_indexed_collate_fn
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
   get_batch:
-    _target_: hyper_parallel.auto_models.components.datasets.ParallelBatch
+    _target_: hyper_parallel.data.batching.ParallelBatch
     source_type: indexed
   dataloader_type: single
   data_rearrange_map: null
@@ -104,7 +104,7 @@ dataloader:
   prefetch_factor: null
 
 optimizer:
-  _target_: hyper_parallel.auto_models.components.optim.optimizer.AdamW
+  _target_: hyper_parallel.components.optim.AdamW
   no_decay_params: [bias, norm, ln_]
   adamw_config:
     adamw_lr: 1.0e-5
@@ -113,7 +113,7 @@ optimizer:
     adamw_eps: 1.0e-8
 
 lr_scheduler:
-  _target_: hyper_parallel.auto_models.components.optim.lr_scheduler.MultiLRScheduler
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
   lr_decay_style: cosine
   lr_config:
     lr_warmup_steps: 0

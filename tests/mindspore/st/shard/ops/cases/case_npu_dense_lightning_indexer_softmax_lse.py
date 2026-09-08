@@ -73,7 +73,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))
 
 register(OpShardCase(
@@ -92,7 +92,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))
 
 register(OpShardCase(
@@ -111,7 +111,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))
 
 # ======================== TND ========================
@@ -133,7 +133,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))
 
 register(OpShardCase(
@@ -153,7 +153,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))
 
 register(OpShardCase(
@@ -173,5 +173,5 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("npu_level1",),
+    tags=("npu_level0",),
 ))

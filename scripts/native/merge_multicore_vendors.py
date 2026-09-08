@@ -28,9 +28,15 @@ from typing import Any
 
 _VENDOR_NAME = "hyper_parallel_multicore_nn"
 _KERNEL_ROOT = Path("op_impl/ai_core/tbe/kernel")
+_KERNEL_CONFIG_ROOT = _KERNEL_ROOT / "config"
+_CONFIG_ROOT = Path("op_impl/ai_core/tbe/config")
+_SUPPORTED_OPS_PATH = Path("framework/tensorflow/npu_supported_ops.json")
 _SOC_NAME_PATTERN = re.compile(r"^ascend[0-9a-z_]+$")
 _HOST_ELF_PATHS = {
     "op_api/lib/libcust_opapi.so",
+    "op_impl/ai_core/tbe/op_tiling/liboptiling.so",
+    "op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so",
+    "op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64/libcust_opmaster_rt2.0.so",
     "op_proto/lib/linux/aarch64/libcust_opsproto_rt2.0.so",
     "op_proto/lib/linux/x86_64/libcust_opsproto_rt2.0.so",
 }
@@ -76,12 +82,18 @@ def _is_soc_payload(relative_path: Path, soc: str) -> bool:
     try:
         kernel_relative = relative_path.relative_to(_KERNEL_ROOT)
     except ValueError:
+        kernel_relative = None
+    if kernel_relative is not None and kernel_relative.parts:
+        return kernel_relative.parts[0] == soc or (
+            len(kernel_relative.parts) > 1
+            and kernel_relative.parts[0] == "config"
+            and kernel_relative.parts[1] == soc
+        )
+    try:
+        config_relative = relative_path.relative_to(_CONFIG_ROOT)
+    except ValueError:
         return False
-    parts = kernel_relative.parts
-    return bool(parts) and (
-        parts[0] == soc
-        or (len(parts) > 1 and parts[0] == "config" and parts[1] == soc)
-    )
+    return bool(config_relative.parts) and config_relative.parts[0] == soc
 
 
 def _common_files(vendor_root: Path, soc: str) -> dict[str, str]:
@@ -91,7 +103,7 @@ def _common_files(vendor_root: Path, soc: str) -> dict[str, str]:
         for path in sorted(vendor_root.rglob("*"))
         if path.is_file()
         for relative_path in (path.relative_to(vendor_root),)
-        if not _is_soc_payload(relative_path, soc)
+        if not _is_soc_payload(relative_path, soc) and relative_path != _SUPPORTED_OPS_PATH
     }
 
 
@@ -150,14 +162,15 @@ def _host_elf_abi_mismatches(relative_path: str, base_file: Path, candidate_file
     )
 
 
-def _require_soc_payload(vendor_root: Path, soc: str) -> tuple[Path, Path]:
-    """Require both the kernel binaries and package config for one SoC."""
+def _require_soc_payload(vendor_root: Path, soc: str) -> tuple[Path, Path, Path]:
+    """Require kernel binaries, binary indexes, and package config for one SoC."""
     kernel_path = vendor_root / _KERNEL_ROOT / soc
-    config_path = vendor_root / _KERNEL_ROOT / "config" / soc
-    for path in (kernel_path, config_path):
+    kernel_config_path = vendor_root / _KERNEL_CONFIG_ROOT / soc
+    config_path = vendor_root / _CONFIG_ROOT / soc
+    for path in (kernel_path, kernel_config_path, config_path):
         if not path.is_dir() or not any(child.is_file() for child in path.rglob("*")):
             raise ValueError(f"Missing compiled {soc} vendor payload: {path}")
-    return kernel_path, config_path
+    return kernel_path, kernel_config_path, config_path
 
 
 def _compare_host_payload(
@@ -261,6 +274,29 @@ def _validate_output(output: Path, normalized_inputs: list[tuple[str, Path]]) ->
     return output
 
 
+def _merge_supported_ops(
+    normalized_inputs: list[tuple[str, Path]],
+    output: Path,
+) -> int:
+    """Merge the SoC-derived supported-op keys emitted by the CANN package macros."""
+    merged: dict[str, Any] = {}
+    for soc, vendor_root in normalized_inputs:
+        supported_ops_path = vendor_root / _SUPPORTED_OPS_PATH
+        try:
+            supported_ops = json.loads(supported_ops_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Cannot read {soc} supported-op metadata: {supported_ops_path}") from error
+        if not isinstance(supported_ops, dict):
+            raise ValueError(f"Expected an object in supported-op metadata: {supported_ops_path}")
+        for key, value in supported_ops.items():
+            if key in merged and merged[key] != value:
+                raise ValueError(f"Conflicting supported-op metadata for key {key!r} in {soc}")
+            merged[key] = value
+    output_path = output / _SUPPORTED_OPS_PATH
+    output_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return len(merged)
+
+
 def merge_vendors(
     inputs: list[tuple[str, Path]],
     output: Path,
@@ -287,9 +323,11 @@ def merge_vendors(
     shutil.rmtree(output, ignore_errors=True)
     shutil.copytree(base_vendor, output)
     for soc, vendor_root in normalized_inputs[1:]:
-        kernel_path, config_path = _require_soc_payload(vendor_root, soc)
+        kernel_path, kernel_config_path, config_path = _require_soc_payload(vendor_root, soc)
         shutil.copytree(kernel_path, output / _KERNEL_ROOT / soc)
-        shutil.copytree(config_path, output / _KERNEL_ROOT / "config" / soc)
+        shutil.copytree(kernel_config_path, output / _KERNEL_CONFIG_ROOT / soc)
+        shutil.copytree(config_path, output / _CONFIG_ROOT / soc)
+    supported_ops_entries = _merge_supported_ops(normalized_inputs, output)
 
     libraries = sorted(output.rglob("libcust_opapi.so"))
     if len(libraries) != 1:
@@ -303,6 +341,7 @@ def merge_vendors(
         "host_payload_files": len(base_common_files),
         "host_input_identity": host_input_identity,
         "discarded_host_variants": discarded_host_variants,
+        "supported_ops_entries": supported_ops_entries,
         "libcust_opapi_sha256": _sha256(libraries[0]),
     }
 

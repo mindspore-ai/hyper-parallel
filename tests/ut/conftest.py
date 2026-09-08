@@ -19,8 +19,101 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+from unittest import mock
 
 import pytest
+
+# transformers v4 chains ``modeling_utils -> loss_utils -> loss_d_fine ->
+# loss_for_object_detection -> image_transforms`` and imports ``tensorflow``
+# whenever it is importable. The UT gate image ships a tensorflow build whose
+# native preload (self_check) segfaults the ARM executor, so a plain
+# ``from transformers import PreTrainedModel`` kills the whole collection.
+# ``USE_TF=0`` makes transformers' ``is_tf_available()`` return False and
+# skips that chain; nothing in this suite uses tensorflow.
+os.environ.setdefault("USE_TF", "0")
+
+
+class NoAcceleratorGuard:
+    """Fail fast when a CPU-gated test accidentally reaches for a device.
+
+    Patches CUDA device selection, NCCL/HCCL process-group initialization and
+    ``torch_npu`` entry points to raise immediately, so "accidentally on
+    accelerator" can never pass as an ordinary CPU test. Opt in via the
+    ``no_accelerator`` fixture or use as a context manager.
+    """
+
+    _DEVICE_TARGETS = (
+        "torch.cuda.init",
+        "torch.cuda.set_device",
+    )
+    _FORBIDDEN_BACKENDS = {"nccl", "hccl"}
+
+    def __init__(self):
+        self._patchers = []
+
+    @staticmethod
+    def _fail(name):
+        def _blocked(*args, **kwargs):
+            raise RuntimeError(
+                f"{name} reached from a CPU-gated test; Gate-1 forbids real "
+                "accelerator devices and process groups"
+            )
+
+        return _blocked
+
+    def _check_init_process_group(self, real_init):
+        def _guarded(*args, **kwargs):
+            backend = kwargs.get("backend")
+            if backend is None and args:
+                backend = args[0]
+            if isinstance(backend, str) and backend.lower() in self._FORBIDDEN_BACKENDS:
+                raise RuntimeError(
+                    f"init_process_group(backend={backend!r}) reached from a "
+                    "CPU-gated test; Gate-1 forbids real accelerator process groups"
+                )
+            return real_init(*args, **kwargs)
+
+        return _guarded
+
+    def start(self):
+        """Install the guard patches."""
+        for target in self._DEVICE_TARGETS:
+            patcher = mock.patch(target, self._fail(target))
+            patcher.start()
+            self._patchers.append(patcher)
+        import torch.distributed  # pylint: disable=import-outside-toplevel
+
+        if hasattr(torch.distributed, "init_process_group"):
+            patcher = mock.patch(
+                "torch.distributed.init_process_group",
+                self._check_init_process_group(torch.distributed.init_process_group),
+            )
+            patcher.start()
+            self._patchers.append(patcher)
+
+    def stop(self):
+        """Restore every patched entry point."""
+        while self._patchers:
+            self._patchers.pop().stop()
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+
+@pytest.fixture
+def no_accelerator():
+    """Activate :class:`NoAcceleratorGuard` for one test."""
+    guard = NoAcceleratorGuard()
+    guard.start()
+    try:
+        yield guard
+    finally:
+        guard.stop()
 
 
 def _preload_libgomp_early_for_static_tls() -> None:

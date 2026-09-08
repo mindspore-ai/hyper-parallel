@@ -1,4 +1,4 @@
-# Copyright 2024-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import multiprocessing as proc
 import json
 import os
 import logging
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.estimate import estimate_performance
@@ -46,13 +46,13 @@ class ParallelizeLayer:
 
     def __init__(
         self,
-        evaluator,
-        machine,
-        global_batch_size=None,
-        dimensions=None,
-        **extra_config,
-    ):
-
+        evaluator: Any,
+        machine: Any,
+        global_batch_size: Any = None,
+        dimensions: Any = None,
+        **extra_config: Any,
+    ) -> None:
+        """Build the search driver for one evaluator and machine."""
         self.enable_debug = logger.level < logging.CRITICAL
         self.machine = machine
         if "mppb" in extra_config:
@@ -106,7 +106,7 @@ class ParallelizeLayer:
 
         self.bound_space()
 
-    def bound_space(self):
+    def bound_space(self) -> None:
         """Set bounds for parallel dimensions"""
         vpp = (
             1
@@ -147,14 +147,14 @@ class ParallelizeLayer:
                 Hard.highest_power_of_2_divisor(self.config.ccfg.a)
             )
 
-    def filtered_out(self, _):
+    def filtered_out(self, _: Any) -> bool:
         """Manual conditions to remove config patterns"""
         # if parallel_config.has_dim(Dim.EP):
         #     if self.config.dim_val(Dim.EP, parallel_config) < 8:
         #         return True
         return False
 
-    def is_valid(self, parallel_config):
+    def is_valid(self, parallel_config: Any) -> bool:
         """Check configuration validity"""
         if not parallel_config.is_valid():
             logger.warning("configuration %s not valid", str(parallel_config))
@@ -218,7 +218,7 @@ class ParallelizeLayer:
             return False
         return True
 
-    def memory_estim(self, debugger=None):
+    def memory_estim(self, debugger: Any = None) -> Any:
         """Whether the config fits memory"""
         logger.debug("estimate_peak")
         verbose = logger.level < logging.INFO
@@ -233,8 +233,11 @@ class ParallelizeLayer:
             debugger.info[Debug.MemParts.TOTAL] = peak
         return peak
 
-    def generate_search_space(self, folder, threads_num):
+    def generate_search_space(self, folder: Any, threads_num: Any) -> Any:
         """Return a search space computed with memory estimation"""
+        # With a pool the accumulator holds AsyncResult, which the direct
+        # branch's float values hide from static inference.
+        # pylint: disable=no-member
         space = ({}, 0)
         configs = []
         results = {}
@@ -273,7 +276,7 @@ class ParallelizeLayer:
 
         return configs
 
-    def device_loops(self, space, pool):
+    def device_loops(self, space: Any, pool: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 0: parallel dimensions dividing devices"""
         for tp in self.config.space(Dim.TP, self.machine.number):
             for pp in self.config.space(Dim.PP, self.machine.number // tp):
@@ -293,7 +296,7 @@ class ParallelizeLayer:
                     space = self.batch_loops(space, pool, (dp, tp, pp, cp))
         return space
 
-    def batch_loops(self, space, pool, dtpc_p):
+    def batch_loops(self, space: Any, pool: Any, dtpc_p: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 1: dimensions dividing batch (except already processed DP)"""
         dp, _, pp, _ = dtpc_p
         # if pp > 1:
@@ -309,7 +312,7 @@ class ParallelizeLayer:
         #     space = self.parallel_loops(space, pool, (dtpc_p, (mbs, 1)))
         return space
 
-    def parallel_loops(self, space, pool, dims):
+    def parallel_loops(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
         """Exploration loop nest level 2: dimensions dependent on others"""
         dtpc_p, mbsn = dims
         dp, tp, pp, _ = dtpc_p
@@ -328,7 +331,7 @@ class ParallelizeLayer:
                         )
         return space
 
-    def inside_loop_nest(self, space, pool, dims):
+    def inside_loop_nest(self, space: Any, pool: Any, dims: Any) -> Tuple[dict, int]:
         """Exploration loop nest statements"""
         dtpc_p, mbsn, evos_p = dims
         configs, size = space
@@ -372,7 +375,7 @@ class ParallelizeLayer:
 
         return (configs, size)
 
-    def order_search_space(self, space, threads_num, cache_file):
+    def order_search_space(self, space: Any, threads_num: Any, cache_file: Any) -> Any:
         """Sort the search space computed with performance estimation"""
         if not space:
             return ([], [])
@@ -443,7 +446,7 @@ class ParallelizeLayer:
                 new_scored_space = scored_space
         return (sorted(new_scored_space, key=lambda x: x[2]), debug_parts)
 
-    def order_space_test_comm_classified(self, space, order_by=2):
+    def order_space_test_comm_classified(self, space: Any, order_by: Any = 2) -> Any:
         """Order the given space with performance estimation"""
         scored_space = []
         debug_parts = []
@@ -471,7 +474,7 @@ class ParallelizeLayer:
         del debug_parts[-2:]
         return (sorted(scored_space, key=lambda x: x[order_by]), debug_parts)
 
-    def order_space_test(self, space, order_by=2):
+    def order_space_test(self, space: Any, order_by: Any = 2) -> Any:
         """Order the given space with performance estimation"""
         scored_space = []
         debug_parts = []
@@ -498,7 +501,7 @@ class ParallelizeLayer:
         del debug_parts[-2:]
         return (sorted(scored_space, key=lambda x: x[order_by]), debug_parts)
 
-    def plot_title(self):
+    def plot_title(self) -> str:
         """Generate plot title"""
         return (
             f"{self.model_name} on {self.machine.number}"
@@ -506,8 +509,12 @@ class ParallelizeLayer:
         )
 
     def run_generation_to_ordering(
-        self, yaml_folder, threads_num=None, top_num=None, cache_file=None
-    ):
+        self,
+        yaml_folder: Any,
+        threads_num: Any = None,
+        top_num: Any = None,
+        cache_file: Any = None,
+    ) -> Any:
         """Test some functions"""
         start = time.time()
         space = self.generate_search_space(yaml_folder, threads_num)
@@ -547,7 +554,7 @@ class ParallelizeLayer:
                 )
         return scored_space
 
-    def to_ppb(self, scored_space, k, cfg_name):
+    def to_ppb(self, scored_space: Any, k: Any, cfg_name: Any) -> None:
         """Create an input file for pipeline balancing"""
         parallel_config = scored_space[k][0]
         self.config.set_parallel_config(parallel_config)
@@ -629,19 +636,21 @@ class ParallelizeMultiModal(ParallelizeLayer):
 
     def __init__(
         self,
-        evaluator,
-        machine,
-        global_batch_size=None,
-        dimensions=None,
-        **extra_config,
-    ):
-
+        evaluator: Any,
+        machine: Any,
+        global_batch_size: Any = None,
+        dimensions: Any = None,
+        **extra_config: Any,
+    ) -> None:
+        """Drive the search from the submodule the parser marked as main."""
         super().__init__(
             evaluator,
             machine,
             global_batch_size=global_batch_size,
             dimensions=dimensions,
-            sub_model="deepseekv3",
+            sub_model=getattr(
+                evaluator.ccfg, "mm_main", None
+            ) or evaluator.ccfg.mm_order[-1],
             **extra_config,
         )
 
@@ -649,13 +658,8 @@ class ParallelizeMultiModal(ParallelizeLayer):
 class Parallelize:  # pylint: disable=R0903
     """Main class instantiated by one of the above two"""
 
-    def __init__(
-        self,
-        framework,
-        config,
-        machine,
-        **extra_config,
-    ):
+    def __init__(self, framework: Any, config: Any, machine: Any, **extra_config: Any) -> None:
+        """Dispatch to the unimodal or multimodal search driver."""
         logger.debug("before evaluator init")
         if "model" in extra_config:
             model_name = extra_config.pop("model")
@@ -698,7 +702,7 @@ class Parallelize:  # pylint: disable=R0903
         return self.instance.__getattribute__(name)
 
 
-def space_to_string(space, max_num=None, debug_parts=None):
+def space_to_string(space: Any, max_num: Any = None, debug_parts: Any = None) -> str:
     """Space printer"""
     i = 0
     s = ""

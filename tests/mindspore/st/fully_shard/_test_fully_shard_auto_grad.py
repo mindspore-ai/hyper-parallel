@@ -23,6 +23,7 @@ from mindspore.communication import get_group_size, get_rank, init
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh, DTensor
 from hyper_parallel.core.fully_shard.api import fully_shard
+from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
@@ -95,6 +96,177 @@ class MLPAndChunkedOutputLayer(nn.Cell):
         return output
 
 
+class _DoubleLinear(nn.Cell):
+    """Return two independent linear outputs so the second may be unused."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.lin1 = nn.Dense(dim, dim)
+        self.lin2 = nn.Dense(dim, dim)
+
+    def construct(self, x):
+        return (
+            mint.nn.functional.relu(self.lin1(x)),
+            mint.nn.functional.relu(self.lin2(x)),
+        )
+
+
+def _to_local_numpy(tensor) -> np.ndarray:
+    """Convert a plain Tensor or size-one DTensor to a local numpy array."""
+    if isinstance(tensor, DTensor):
+        tensor = tensor.to_local()
+    return tensor.asnumpy()
+
+
+def _assert_initial_sharded_storage_invariants(model: _DoubleLinear) -> dict:
+    """Check initial communication storage before lazy-init and remember its identity."""
+    initial_sharded_data = {}
+    for module_name, module in (("lin1", model.lin1), ("root", model)):
+        state = get_hsdp_state(module)
+        assert state is not None, f"{module_name}: expected an HSDP state, got={state}"
+        assert not state._reset_sharded_params, (  # pylint: disable=protected-access
+            f"{module_name}: expected lazy-init reset=False, "
+            f"got={state._reset_sharded_params}"  # pylint: disable=protected-access
+        )
+        for hsdp_param in state.hsdp_params:
+            local_tensor = hsdp_param.sharded_param._local_tensor  # pylint: disable=protected-access
+            sharded_data = hsdp_param._sharded_param_data  # pylint: disable=protected-access
+            assert not sharded_data.requires_grad and sharded_data.is_leaf, (
+                f"{module_name}: initial communication storage expected "
+                f"requires_grad=False/is_leaf=True, got requires_grad={sharded_data.requires_grad}/"
+                f"is_leaf={sharded_data.is_leaf}"
+            )
+            assert local_tensor.requires_grad and local_tensor.is_leaf, (
+                f"{module_name}: initial local shard expected requires_grad=True/is_leaf=True, "
+                f"got requires_grad={local_tensor.requires_grad}/is_leaf={local_tensor.is_leaf}"
+            )
+            assert sharded_data.untyped_storage().data_ptr() == local_tensor.untyped_storage().data_ptr(), (
+                f"{module_name}: detached communication storage should alias the logical shard, "
+                f"got sharded_data_ptr={sharded_data.untyped_storage().data_ptr()}, "
+                f"local_tensor_ptr={local_tensor.untyped_storage().data_ptr()}"
+            )
+            initial_sharded_data[id(hsdp_param)] = sharded_data
+    return initial_sharded_data
+
+
+def _assert_size_one_leaf_invariants(
+    model: _DoubleLinear,
+    iteration: int,
+    initial_sharded_data: dict,
+) -> None:
+    """Check the lazy-init storage and logical parameter autograd contract."""
+    for module_name, module in (("lin1", model.lin1), ("root", model)):
+        state = get_hsdp_state(module)
+        assert state is not None, (
+            f"Iteration {iteration}, {module_name}: expected an HSDP state, got={state}"
+        )
+        assert state._reset_sharded_params, (  # pylint: disable=protected-access
+            f"Iteration {iteration}, {module_name}: lazy-init reset expected=True, "
+            f"got={state._reset_sharded_params}"  # pylint: disable=protected-access
+        )
+        assert state.hsdp_params, (
+            f"Iteration {iteration}, {module_name}: expected managed parameters, got={state.hsdp_params}"
+        )
+        for hsdp_param in state.hsdp_params:
+            sharded_param = hsdp_param.sharded_param
+            local_tensor = sharded_param._local_tensor  # pylint: disable=protected-access
+            sharded_data = hsdp_param._sharded_param_data  # pylint: disable=protected-access
+            unsharded_param = hsdp_param._unsharded_param  # pylint: disable=protected-access
+            if iteration == 0:
+                assert sharded_data is initial_sharded_data[id(hsdp_param)], (
+                    f"{module_name}: first lazy-init unexpectedly refreshed communication storage"
+                )
+            assert hsdp_param.shard_world_size == 1, (
+                f"Iteration {iteration}, {module_name}: expected shard_world_size=1, "
+                f"got={hsdp_param.shard_world_size}"
+            )
+            assert hsdp_param.unsharded_param_buffers[0] is sharded_data, (
+                f"Iteration {iteration}, {module_name}: expected the size-one all-gather buffer "
+                f"to be sharded_data, got buffer_id={id(hsdp_param.unsharded_param_buffers[0])}, "
+                f"sharded_data_id={id(sharded_data)}"
+            )
+            assert not sharded_data.requires_grad and sharded_data.is_leaf, (
+                f"Iteration {iteration}, {module_name}: communication storage expected "
+                f"requires_grad=False/is_leaf=True, got requires_grad={sharded_data.requires_grad}/"
+                f"is_leaf={sharded_data.is_leaf}"
+            )
+            assert local_tensor.requires_grad and local_tensor.is_leaf, (
+                f"Iteration {iteration}, {module_name}: local shard expected "
+                f"requires_grad=True/is_leaf=True, got requires_grad={local_tensor.requires_grad}/"
+                f"is_leaf={local_tensor.is_leaf}"
+            )
+            assert unsharded_param is not None, (
+                f"Iteration {iteration}, {module_name}: expected an unsharded parameter, got={unsharded_param}"
+            )
+            assert unsharded_param.requires_grad and unsharded_param.is_leaf, (
+                f"Iteration {iteration}, {module_name}: unsharded parameter expected "
+                f"requires_grad=True/is_leaf=True, got requires_grad={unsharded_param.requires_grad}/"
+                f"is_leaf={unsharded_param.is_leaf}"
+            )
+
+
+def _step_optimizer_if_grad(optimizer) -> None:
+    """Step one Dense optimizer, skipping it when that forward output was unused."""
+    grads = tuple(param.grad for param in optimizer.parameters)
+    has_grad = tuple(grad is not None for grad in grads)
+    if not any(has_grad):
+        return
+    assert all(has_grad), (
+        f"Expected either all or no gradients in one Dense optimizer, got has_grad={has_grad}"
+    )
+    optimizer(grads)
+
+
+def _zero_parameter_grads(model: nn.Cell) -> None:
+    """Clear eager gradients on both plain and fully_shard-managed parameters."""
+    for parameter in model.trainable_params():
+        parameter.grad = None
+
+
+def _assert_single_rank_parity(
+    reference_model: _DoubleLinear,
+    sharded_model: _DoubleLinear,
+    iteration: int,
+) -> None:
+    """Compare parameter gradients and values for standalone and size-one FSDP."""
+    reference_params = list(reference_model.parameters_and_names())
+    sharded_params = list(sharded_model.parameters_and_names())
+    assert [name for name, _ in reference_params] == [name for name, _ in sharded_params], (
+        f"Iteration {iteration}: parameter names differ, "
+        f"reference={[name for name, _ in reference_params]}, "
+        f"sharded={[name for name, _ in sharded_params]}"
+    )
+    for (param_name, reference_param), (_, sharded_param) in zip(reference_params, sharded_params):
+        assert (reference_param.grad is None) == (sharded_param.grad is None), (
+            f"Iteration {iteration}, {param_name}: gradient presence differs, "
+            f"reference_grad={reference_param.grad}, sharded_grad={sharded_param.grad}"
+        )
+        if reference_param.grad is not None:
+            reference_grad = _to_local_numpy(reference_param.grad)
+            sharded_grad = _to_local_numpy(sharded_param.grad)
+            assert np.allclose(reference_grad, sharded_grad, rtol=1e-4, atol=1e-5), (
+                f"Iteration {iteration}, {param_name}: gradients differ, "
+                f"reference={reference_grad}, sharded={sharded_grad}"
+            )
+
+
+def _assert_single_rank_parameters_match(
+    reference_model: _DoubleLinear,
+    sharded_model: _DoubleLinear,
+    iteration: int,
+) -> None:
+    """Compare parameter values after the optimizer step."""
+    reference_params = list(reference_model.parameters_and_names())
+    sharded_params = list(sharded_model.parameters_and_names())
+    for (param_name, reference_param), (_, sharded_param) in zip(reference_params, sharded_params):
+        reference_value = _to_local_numpy(reference_param)
+        sharded_value = _to_local_numpy(sharded_param)
+        assert np.allclose(reference_value, sharded_value, rtol=1e-4, atol=1e-5), (
+            f"Iteration {iteration}, {param_name}: parameter values differ, "
+            f"reference={reference_value}, sharded={sharded_value}"
+        )
+
+
 def test_chunked_output_fully_shard():
     """Test fully_shard with chunked input and looped OutputLayer forward.
 
@@ -138,6 +310,102 @@ def test_chunked_output_fully_shard():
 
         if rank_id == 0:
             print(f"rank: {rank_id} step: {step_idx}, loss: {float(loss.asnumpy())}")
+
+
+def test_single_rank_unused_forward_output_autograd():
+    """Port PyTorch's unused-forward-output autograd case to size-one FSDP.
+
+    Feature: size-one fully_shard autograd with an unused forward output.
+    Description: Wrap the first Dense and the root independently, then train for
+        ten iterations. The first three losses consume both outputs while the
+        remaining losses consume only the first output. Every iteration checks
+        standalone parity and the lazy-init leaf/storage invariants.
+    Expectation: Losses, gradients, and updated parameters match standalone;
+        repeated unshard/backward does not reuse an autograd graph or rebase a view.
+    """
+    ms.set_context(mode=ms.PYNATIVE_MODE)
+    ms.set_deterministic(True)
+    enable_mindspore_backward_compat()
+    init()
+    rank = get_rank()
+    world_size = get_group_size()
+    assert world_size == 1, (
+        f"This regression requires shard_world_size=1, expected world_size=1, got={world_size}"
+    )
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(1,), mesh_dim_names=("dp",))
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=ms.float32,
+        reduce_dtype=ms.float32,
+        output_dtype=ms.float32,
+        cast_forward_inputs=False,
+    )
+
+    ms.set_seed(42)
+    base_model = _DoubleLinear(dim=24)
+    reference_model = copy.deepcopy(base_model)
+    sharded_model = copy.deepcopy(base_model)
+    fully_shard(sharded_model.lin1, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(sharded_model, mesh=mesh, mp_policy=mp_policy)
+    sharded_model.set_reduce_op_type("sum")
+    initial_sharded_data = _assert_initial_sharded_storage_invariants(sharded_model)
+
+    reference_optimizers = (
+        nn.Adam(reference_model.lin1.trainable_params(), learning_rate=1e-2),
+        nn.Adam(reference_model.lin2.trainable_params(), learning_rate=1e-2),
+    )
+    sharded_optimizers = (
+        nn.Adam(sharded_model.lin1.trainable_params(), learning_rate=1e-2),
+        nn.Adam(sharded_model.lin2.trainable_params(), learning_rate=1e-2),
+    )
+
+    local_batch_size = 2
+    global_batch_size = world_size * local_batch_size
+    ms.set_seed(1)
+    for iteration in range(10):
+        _zero_parameter_grads(reference_model)
+        _zero_parameter_grads(sharded_model)
+        global_input = mint.rand((global_batch_size, 24), dtype=ms.float32)
+        local_input = mint.narrow(
+            global_input,
+            0,
+            rank * local_batch_size,
+            local_batch_size,
+        ).detach()
+
+        sharded_out1, sharded_out2 = sharded_model(local_input)
+        _assert_size_one_leaf_invariants(sharded_model, iteration, initial_sharded_data)
+        sharded_loss = (
+            mint.sum(mint.mul(sharded_out1, sharded_out2))
+            if iteration < 3
+            else mint.sum(sharded_out1)
+        )
+        sharded_loss.backward()
+
+        reference_out1, reference_out2 = reference_model(global_input)
+        reference_loss = (
+            mint.sum(mint.mul(reference_out1, reference_out2))
+            if iteration < 3
+            else mint.sum(reference_out1)
+        )
+        reference_loss.backward()
+
+        reference_loss_value = reference_loss.asnumpy()
+        sharded_loss_value = sharded_loss.asnumpy()
+        assert np.allclose(reference_loss_value, sharded_loss_value, rtol=1e-5, atol=1e-6), (
+            f"Iteration {iteration}: loss differs, "
+            f"reference={reference_loss_value}, sharded={sharded_loss_value}"
+        )
+        _assert_single_rank_parity(reference_model, sharded_model, iteration)
+
+        for optimizer in reference_optimizers:
+            _step_optimizer_if_grad(optimizer)
+        with SkipDTensorDispatch():
+            for optimizer in sharded_optimizers:
+                _step_optimizer_if_grad(optimizer)
+        _assert_single_rank_parameters_match(reference_model, sharded_model, iteration)
+
+    if rank == 0:
+        print("size-one fully_shard unused-output autograd parity passed: iterations=10")
 
 
 # --------------------------------------------------------------------------- #

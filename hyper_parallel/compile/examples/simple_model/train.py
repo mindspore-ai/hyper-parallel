@@ -32,8 +32,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from hyper_parallel.compile import (  # pylint: disable=C0413
     GraphTrainer,
-    ParallelConfig,
-    ShardingPlan,
+    PassConfig,
+    PassPlan,
 )
 
 
@@ -64,14 +64,14 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def build_parallel_config(config: dict) -> ParallelConfig:
-    parallel_config = config["parallel"]
-    return ParallelConfig(
-        enable_overlap=parallel_config.get("enable_overlap", True),
+def build_pass_config(config: dict) -> PassConfig:
+    pass_config = config["parallel"]
+    return PassConfig(
+        enable_overlap=pass_config.get("enable_overlap", True),
     )
 
 
-def build_sharding_plan(config: dict) -> ShardingPlan:
+def build_pass_plan(config: dict) -> PassPlan:
     """Build sharding plan from YAML config"""
     if "sharding" in config:
         # Use YAML configuration
@@ -93,7 +93,7 @@ def build_sharding_plan(config: dict) -> ShardingPlan:
         return plan
 
     # Default: FSDP all modules
-    plan = ShardingPlan()
+    plan = PassPlan()
     plan.fsdp_wrap_pattern("*")
     return plan
 
@@ -144,14 +144,14 @@ def main():
     device = "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else "cpu"
     model = DummyModel(config["model"]["vocab_size"], config["model"]["dim"]).to(device)
 
-    parallel_config = build_parallel_config(config)
-    sharding_plan = build_sharding_plan(config)
+    pass_config = build_pass_config(config)
+    pass_plan = build_pass_plan(config)
 
     trainer = GraphTrainer(
         model=model,
         train_fn=train_fn,
-        parallel_config=parallel_config,
-        sharding_plan=sharding_plan,
+        pass_config=pass_config,
+        pass_plan=pass_plan,
         optimizer_config={
             "lr": config["train"]["optimizer"]["lr"],
             "grad_clip": config["train"]["grad_clip"],

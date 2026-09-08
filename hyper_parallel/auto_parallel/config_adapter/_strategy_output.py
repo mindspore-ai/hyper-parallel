@@ -26,6 +26,7 @@ from typing import Any, Dict
 
 import yaml  # type: ignore[import-untyped]
 
+from hyper_parallel.auto_parallel._hf_model_spec import is_auto_models_schema
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import NormalizedConfig
 
 
@@ -72,6 +73,21 @@ _YAML_KEY_MAP: Dict[str, str] = {
     "etp": "expert_tensor_parallel_degree",
 }
 
+_AUTO_MODELS_YAML_KEY_MAP: Dict[str, str] = {
+    "tensor_parallel_degree": "tp_size",
+    "tp_degree": "tp_size",
+    "tp": "tp_size",
+    "pipeline_parallel_degree": "pp_size",
+    "pp_degree": "pp_size",
+    "pp": "pp_size",
+    "context_parallel_degree": "cp_size",
+    "cp_degree": "cp_size",
+    "cp": "cp_size",
+    "expert_parallel_degree": "ep_size",
+    "ep_degree": "ep_size",
+    "ep": "ep_size",
+}
+
 
 def _validate_strategy_and_yaml(
     config: NormalizedConfig,
@@ -90,22 +106,76 @@ def _validate_strategy_and_yaml(
 
 
 def _load_yaml_to_inject(original_yaml_path: str) -> Dict[str, Any]:
-    """Load and validate the original YAML, ensuring train/accelerator exist."""
+    """Load the original YAML and initialize its strategy sections."""
     with open(original_yaml_path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     if data is None or not isinstance(data, dict):
         raise ValueError(
             f"Original YAML {original_yaml_path} must contain a top-level mapping."
         )
-    if "train" not in data or not isinstance(data["train"], dict):
-        data["train"] = {}
-    if "accelerator" not in data["train"] or not isinstance(data["train"]["accelerator"], dict):
-        data["train"]["accelerator"] = {}
+    if is_auto_models_schema(data):
+        if not isinstance(data.get("training"), dict):
+            data["training"] = {}
+        if not isinstance(data.get("accelerator"), dict):
+            data["accelerator"] = {}
+        if not isinstance(data.get("fsdp_config"), dict):
+            data["fsdp_config"] = {}
+    else:
+        if "train" not in data or not isinstance(data["train"], dict):
+            data["train"] = {}
+        if "accelerator" not in data["train"] or not isinstance(data["train"]["accelerator"], dict):
+            data["train"]["accelerator"] = {}
     return data
+
+
+def _check_batch_derivation(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
+    """Verify the resolved strategy matches the Trainer's batch derivation.
+
+    AutoModels has no micro-batch-number field: it derives the accumulation
+    count as ``global_batch_size / (micro_batch_size * dp)``. ND applies the
+    same identity, so the searched value needs no writing, but a mismatch
+    would silently train a different schedule than the one that was scored.
+    """
+    micro_batch_num = resolved.get("micro_batch_num")
+    data_parallel = resolved.get("dp")
+    training = data.get("training", {})
+    global_batch_size = training.get("global_batch_size")
+    micro_batch_size = training.get("micro_batch_size", 1)
+    if not (micro_batch_num and data_parallel and global_batch_size):
+        return
+    expected = micro_batch_num * micro_batch_size * data_parallel
+    if expected != global_batch_size:
+        raise ValueError(
+            "resolved strategy is inconsistent with the trainer batch "
+            f"derivation: global_batch_size={global_batch_size} != "
+            f"micro_batch_num={micro_batch_num} * "
+            f"micro_batch_size={micro_batch_size} * dp={data_parallel}"
+        )
 
 
 def _inject_resolved_strategy(data: Dict[str, Any], resolved: Dict[str, Any]) -> None:
     """Inject resolved strategy values into the YAML data dict."""
+    if is_auto_models_schema(data):
+        accelerator = data["accelerator"]
+        for src_key, dst_key in _AUTO_MODELS_YAML_KEY_MAP.items():
+            if src_key in resolved:
+                accelerator[dst_key] = int(resolved[src_key])
+
+        dp_shard_size = resolved.get("dp_shard")
+        if dp_shard_size is None:
+            dp_shard_size = resolved.get(
+                "data_parallel_shard_degree",
+                resolved.get("dp"),
+            )
+        if dp_shard_size is not None:
+            data["fsdp_config"]["dp_shard_size"] = int(dp_shard_size)
+        if "global_batch_size" in resolved:
+            data["training"]["global_batch_size"] = int(
+                resolved["global_batch_size"]
+            )
+        _check_batch_derivation(data, resolved)
+        return
+
     train = data["train"]
     accel = train["accelerator"]
 

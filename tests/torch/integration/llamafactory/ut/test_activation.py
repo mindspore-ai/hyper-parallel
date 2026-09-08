@@ -48,6 +48,7 @@ from hyper_parallel.integration.llamafactory.activation import (
     setup_activation_optimization,
 )
 from hyper_parallel.integration.llamafactory.utils import HyperParallelArguments
+from hyper_parallel.platform.torch.activation_checkpoint import CheckpointWrapper
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +300,7 @@ class TestSetupActivationOptimization:
         setup_activation_optimization(model, args)
         # After wrapping, blocks should be CheckpointWrapper instances
         for block in model.model.layers:
-            assert hasattr(block, "_checkpoint_wrapped_module")
+            assert isinstance(block, CheckpointWrapper)
 
     def test_recompute_disables_use_cache(self):
         model = FakeCausalLM(num_layers=4)
@@ -321,11 +322,11 @@ class TestSetupActivationOptimization:
         setup_activation_optimization(model, args)
 
         for block in model.visual.blocks:
-            assert hasattr(block, "_checkpoint_wrapped_module"), (
+            assert isinstance(block, CheckpointWrapper), (
                 f"Visual block {type(block).__name__} should be wrapped"
             )
         for block in model.model.layers:
-            assert hasattr(block, "_checkpoint_wrapped_module"), (
+            assert isinstance(block, CheckpointWrapper), (
                 f"LLM block {type(block).__name__} should be wrapped"
             )
 
@@ -334,7 +335,8 @@ class TestSetupActivationOptimization:
         args = HyperParallelArguments(activation_mode="swap")
         setup_activation_optimization(model, args)
         for block in model.model.layers:
-            assert hasattr(block, "_checkpoint_wrapped_module")
+            assert isinstance(block, CheckpointWrapper)
+            assert hasattr(block, "_swap_group_order")
 
     def test_block_count_preserved(self):
         model = FakeCausalLM(num_layers=6)
@@ -354,16 +356,16 @@ class TestSetupActivationOptimization:
         args = HyperParallelArguments(activation_mode="recompute")
         setup_activation_optimization(model, args)
 
-        assert not hasattr(model.model.layers[0], "_checkpoint_wrapped_module"), (
+        assert not isinstance(model.model.layers[0], CheckpointWrapper), (
             "Frozen block 0 should not be wrapped"
         )
-        assert not hasattr(model.model.layers[1], "_checkpoint_wrapped_module"), (
+        assert not isinstance(model.model.layers[1], CheckpointWrapper), (
             "Frozen block 1 should not be wrapped"
         )
-        assert hasattr(model.model.layers[2], "_checkpoint_wrapped_module"), (
+        assert isinstance(model.model.layers[2], CheckpointWrapper), (
             "Trainable block 2 should be wrapped"
         )
-        assert hasattr(model.model.layers[3], "_checkpoint_wrapped_module"), (
+        assert isinstance(model.model.layers[3], CheckpointWrapper), (
             "Trainable block 3 should be wrapped"
         )
 
@@ -376,11 +378,11 @@ class TestSetupActivationOptimization:
         args = HyperParallelArguments(activation_mode="swap")
         setup_activation_optimization(model, args)
 
-        assert not hasattr(model.model.layers[0], "_checkpoint_wrapped_module"), (
+        assert not isinstance(model.model.layers[0], CheckpointWrapper), (
             "Frozen block 0 should not be wrapped"
         )
         for i in range(1, 4):
-            assert hasattr(model.model.layers[i], "_checkpoint_wrapped_module"), (
+            assert isinstance(model.model.layers[i], CheckpointWrapper), (
                 f"Trainable block {i} should be wrapped"
             )
 
@@ -394,7 +396,7 @@ class TestSetupActivationOptimization:
         setup_activation_optimization(model, args)
 
         for i in range(3):
-            assert not hasattr(model.model.layers[i], "_checkpoint_wrapped_module"), (
+            assert not isinstance(model.model.layers[i], CheckpointWrapper), (
                 f"Frozen block {i} should not be wrapped"
             )
 

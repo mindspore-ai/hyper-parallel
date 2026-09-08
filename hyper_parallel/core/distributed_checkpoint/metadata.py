@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,14 +24,22 @@ class MetadataIndex:
     """
     Index to identify a specific piece of data in the checkpoint.
 
+    ``index`` is a positional hint into the chunk list, not part of the identity: a chunk is
+    identified by its ``fqn`` and ``offset``, and the same chunk is described with ``index=None``
+    while plans are being deduplicated and with its ordinal afterwards. Keeping it out of
+    ``__eq__``/``__hash__`` (as torch's MetadataIndex does) makes those two spellings compare
+    equal, and drops the field from every hash computed over the millions of indices a global
+    plan builds.
+
     Attributes:
         fqn: Fully qualified name of the tensor/object.
         offset: Offset in the tensor (for sharded tensors). Default ().
-        index: Index for sharded tensors (None for non-sharded). Default None.
+        index: Index for sharded tensors (None for non-sharded). Not compared or hashed.
+            Default None.
     """
     fqn: str
     offset: tuple = field(default_factory=tuple)
-    index: Optional[int] = None
+    index: Optional[int] = field(default=None, compare=False, hash=False)
 
 
 @dataclass(frozen=True)
@@ -59,9 +67,28 @@ class ChunkInfo:
     Attributes:
         chunk: Offsets in the global tensor for each dimension.
         global_shape: Sizes of the chunk for each dimension.
+        replica_rank_list: Have the same sharded tensor ranks list.
     """
     chunk: ChunkStorageMetadata
-    global_shape: tuple
+    global_shape: tuple[int]
+    replica_rank_list: Optional[tuple[int]] = None
+
+
+@dataclass(frozen=True)
+class BroadcastInfo:
+    """
+    Info for one same-shard broadcast.
+
+    Attached to a state dict entry by the load planner when several ranks hold the same
+    shard: only ``src_rank`` reads it from storage and the rest of ``group_ranks``
+    receive it through a broadcast.
+
+    Attributes:
+        group_ranks: Rank list within the broadcast domain.
+        src_rank: Rank ID for data transmission within a broadcast domain
+    """
+    group_ranks: tuple
+    src_rank: int
 
 
 @dataclass(frozen=True)

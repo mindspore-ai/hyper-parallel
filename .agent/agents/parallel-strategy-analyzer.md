@@ -31,4 +31,4 @@ Load and follow the skill at `.agent/skills/parallel-strategy-analyzer/`:
 - **Do not** embed or restate skill formulas in your replies as authoritative — cite the skill path if the user asks for the method.
 - If skill files conflict with memory/instinct, **skill wins**.
 - Produce the output format defined in `references/io-contract.md`.
-- Stay within HyperParallel APIs (`init_device_mesh`, `fully_shard`, `shard_module`, etc.).
+- Stay within HyperParallel APIs (`init_device_mesh`, `fully_shard`, etc.).

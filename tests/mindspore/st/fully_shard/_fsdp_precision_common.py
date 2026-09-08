@@ -34,7 +34,12 @@ def assert_shard_matches_reference(
     rtol: float = 1e-4,
     atol: float = 1e-5,
 ) -> None:
-    """Assert a local shard equals the rank's ceil-chunk reference slice.
+    """Assert a local shard equals the rank's balanced contiguous chunk.
+
+    For example, six rows split over four ranks map to ranges ``[0:2]``,
+    ``[2:4]``, ``[4:5]``, and ``[5:6]``. This mirrors MindSpore's balanced
+    chunk assignment, where the first ``dim_size % shard_size`` ranks receive
+    one additional row.
 
     Args:
         case_name: Precision case name used in failures.
@@ -47,9 +52,9 @@ def assert_shard_matches_reference(
         rtol: Relative comparison tolerance.
         atol: Absolute comparison tolerance.
     """
-    chunk = (reference_full.shape[0] + shard_size - 1) // shard_size
-    shard_start = min(shard_coord * chunk, reference_full.shape[0])
-    shard_end = min(shard_start + chunk, reference_full.shape[0])
+    base_chunk, remainder = divmod(reference_full.shape[0], shard_size)
+    shard_start = shard_coord * base_chunk + min(shard_coord, remainder)
+    shard_end = shard_start + base_chunk + int(shard_coord < remainder)
     expected = reference_full[shard_start:shard_end]
     assert np.allclose(expected, local_shard, rtol=rtol, atol=atol), (
         f"{case_name}, rank {rank}, {what}: expected slice {expected}, got {local_shard}"

@@ -13,8 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """Generate tests."""
+from typing import Any, Optional
+
 import pytest
 import torch
+from transformers import LlamaConfig, LlamaForCausalLM
 
 from hyper_parallel.infer import (
     GenerationConfig,
@@ -31,11 +34,6 @@ from hyper_parallel.infer import (
     top_p_sample,
 )
 from hyper_parallel.infer import utils as infer_utils
-from hyper_parallel.models.qwen3_5 import Qwen3_5Config, Qwen3_5ForCausalLM
-from hyper_parallel.models.qwen3_5_moe import (
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeForCausalLM,
-)
 from tests.torch.generate.stub_model import CacheLengthLM, NoCacheLengthLM
 
 
@@ -43,23 +41,37 @@ class MixinLengthLM(GenerateMixin, CacheLengthLM):
     """CacheLengthLM with a model.generate method."""
 
 
-class MixinQwen35ForCausalLM(GenerateMixin, Qwen3_5ForCausalLM):
-    """Project Qwen3.5 model with a model.generate method."""
+class MixinTransformersCausalLM(GenerateMixin, LlamaForCausalLM):
+    """Transformers causal LM with HyperParallel's generate method."""
 
 
-class MixinQwen35MoeForCausalLM(GenerateMixin, Qwen3_5MoeForCausalLM):
-    """Project Qwen3.5-MoE model with a model.generate method."""
+def _tiny_transformers_config() -> LlamaConfig:
+    """Build a small offline Transformers config for generation tests."""
+    return LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+    )
 
 
 class StrictNoCacheLM(torch.nn.Module):
     """No-cache model without cache-related forward kwargs."""
 
-    def __init__(self, vocab_size: int = 32):
+    def __init__(self, vocab_size: int = 32) -> None:
         """Create the wrapped no-cache stub."""
         super().__init__()
         self.model = NoCacheLengthLM(vocab_size=vocab_size)
 
-    def forward(self, input_ids, position_ids=None, attention_mask=None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Any:
         """Forward without cache kwargs."""
         del position_ids, attention_mask
         return self.model(input_ids, use_cache=False)
@@ -68,12 +80,12 @@ class StrictNoCacheLM(torch.nn.Module):
 class InputOnlyLM(torch.nn.Module):
     """No-cache model whose forward only accepts input_ids."""
 
-    def __init__(self, vocab_size: int = 32):
+    def __init__(self, vocab_size: int = 32) -> None:
         """Create the wrapped no-cache stub."""
         super().__init__()
         self.model = NoCacheLengthLM(vocab_size=vocab_size)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids: torch.Tensor) -> Any:
         """Forward with only input_ids."""
         return self.model(input_ids, use_cache=False)
 
@@ -81,7 +93,7 @@ class InputOnlyLM(torch.nn.Module):
 class InternalTypeErrorLM(CacheLengthLM):
     """Model that raises TypeError from inside forward."""
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Raise the same TypeError regardless of input."""
         raise TypeError("internal model bug")
 
@@ -368,7 +380,8 @@ def test_generate_logits_processor_changes_sampled_token():
     Description: User processors can modify scores before sampling.
     Expectation: Greedy generation follows the processed logits.
     """
-    def force_token_five(input_ids, scores):
+    def force_token_five(input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        """Force greedy sampling to select token five."""
         del input_ids
         processed = scores.new_full(scores.shape, -1000)
         processed[:, 5] = 1000
@@ -393,7 +406,8 @@ def test_generate_stopping_criteria_stops_after_first_token():
     Description: User criteria can stop generation after a decode step.
     Expectation: Generation stops before max_new_tokens.
     """
-    def stop_after_prompt_plus_one(input_ids, scores):
+    def stop_after_prompt_plus_one(input_ids: torch.Tensor, scores: torch.Tensor) -> bool:
+        """Stop after generation appends one token to the prompt."""
         del scores
         return input_ids.shape[-1] >= 3
 
@@ -430,7 +444,11 @@ def test_context_parallel_logits_gather_selects_owner_rank(monkeypatch):
     Description: The final-token owner rank supplies logits to all ranks.
     Expectation: Gathered logits come from the configured CP owner rank.
     """
-    def fake_all_gather(output_tensors, tensor, group=None):
+    def fake_all_gather(
+        output_tensors: list[torch.Tensor],
+        tensor: torch.Tensor,
+        group: Any = None,
+    ) -> None:
         """Fill gathered logits from two fake ranks."""
         del tensor, group
         output_tensors[0].copy_(torch.tensor([[0.0, 4.0, 1.0]]))
@@ -456,7 +474,11 @@ def test_context_parallel_logits_gather_rejects_invalid_scalar_owner(monkeypatch
     Description: Scalar owner rank is local to the CP process group.
     Expectation: Invalid scalar owner rank raises a clear ValueError.
     """
-    def fake_all_gather(output_tensors, tensor, group=None):
+    def fake_all_gather(
+        output_tensors: list[torch.Tensor],
+        tensor: torch.Tensor,
+        group: Any = None,
+    ) -> None:
         """Fill gathered tensors with invalid owner rank values."""
         del group
         output_tensors[0].copy_(tensor)
@@ -481,7 +503,11 @@ def test_context_parallel_logits_gather_supports_batch_owner_ranks(monkeypatch):
     Description: Different batch items can use different CP owner ranks.
     Expectation: Output rows are selected per batch item.
     """
-    def fake_all_gather(output_tensors, tensor, group=None):
+    def fake_all_gather(
+        output_tensors: list[torch.Tensor],
+        tensor: torch.Tensor,
+        group: Any = None,
+    ) -> None:
         """Fill gathered logits from two fake ranks."""
         del tensor, group
         output_tensors[0].copy_(torch.tensor([[0.0, 5.0, 1.0], [0.0, 6.0, 1.0]]))
@@ -507,7 +533,11 @@ def test_tensor_parallel_logits_gather_rejects_uneven_vocab_shards(monkeypatch):
     Description: Uneven vocab shard sizes cannot be gathered with all_gather.
     Expectation: A clear ValueError is raised before tensor all_gather.
     """
-    def fake_all_gather(output_tensors, tensor, group=None):
+    def fake_all_gather(
+        output_tensors: list[torch.Tensor],
+        tensor: torch.Tensor,
+        group: Any = None,
+    ) -> None:
         """Report uneven local vocab shard sizes."""
         del group
         if tensor.numel() == 1:
@@ -536,7 +566,7 @@ def test_generate_greedy_uses_gathered_tensor_parallel_logits(monkeypatch):
     Expectation: Greedy can select a token from a later gathered vocab shard.
     """
     class ShardedLogitsLM(CacheLengthLM):
-        def forward(self, *args, **kwargs):
+        def forward(self, *args: Any, **kwargs: Any) -> Any:
             """Return a local vocab shard whose global winner is on rank 1."""
             output = super().forward(*args, **kwargs)
             logits = output["logits"].new_full(output["logits"].shape[:-1] + (4,), -1000)
@@ -544,7 +574,11 @@ def test_generate_greedy_uses_gathered_tensor_parallel_logits(monkeypatch):
             output["logits"] = logits
             return output
 
-    def fake_all_gather(output_tensors, tensor, group=None):
+    def fake_all_gather(
+        output_tensors: list[torch.Tensor],
+        tensor: torch.Tensor,
+        group: Any = None,
+    ) -> None:
         """Gather shard-size probes and fake tensor-parallel logits."""
         del group
         if tensor.numel() == 1:
@@ -574,26 +608,14 @@ def test_generate_greedy_uses_gathered_tensor_parallel_logits(monkeypatch):
     assert out.tolist() == [[1, 2, 6]]
 
 
-def test_generate_with_project_qwen3_5_model():
+def test_generate_with_transformers_model():
     """
-    Feature: project model compatibility
-    Description: Generate can run against a project model through no-cache fallback.
+    Feature: Transformers model compatibility
+    Description: Generate can run against a Transformers causal language model.
     Expectation: Output appends valid token ids to the prompt.
     """
-    config = Qwen3_5Config(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        max_position_embeddings=32,
-        partial_rotary_factor=1.0,
-        mrope_section=[2, 1, 1],
-        layer_types=["full_attention"],
-    )
-    model = Qwen3_5ForCausalLM(config)
+    config = _tiny_transformers_config()
+    model = LlamaForCausalLM(config)
     input_ids = torch.tensor([[1, 2, 3]])
 
     out = generate(
@@ -607,97 +629,14 @@ def test_generate_with_project_qwen3_5_model():
     assert int(out.max()) < config.vocab_size
 
 
-def test_generate_mixin_with_project_qwen3_5_model():
+def test_generate_mixin_with_transformers_model():
     """
-    Feature: project model generate method
-    Description: GenerateMixin exposes model.generate on a project Qwen3.5 model.
-    Expectation: The project model method appends valid token ids to the prompt.
+    Feature: Transformers model generate method
+    Description: GenerateMixin exposes model.generate on a Transformers model.
+    Expectation: The mixed-in method appends valid token ids to the prompt.
     """
-    config = Qwen3_5Config(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        max_position_embeddings=32,
-        partial_rotary_factor=1.0,
-        mrope_section=[2, 1, 1],
-        layer_types=["full_attention"],
-    )
-    model = MixinQwen35ForCausalLM(config)
-    input_ids = torch.tensor([[1, 2, 3]])
-
-    out = model.generate(
-        input_ids,
-        GenerationConfig(max_new_tokens=2, eos_token_id=None),
-    )
-
-    assert out.shape == (1, 5)
-    assert torch.equal(out[:, :3], input_ids)
-    assert int(out.max()) < config.vocab_size
-
-
-def test_generate_with_project_qwen3_5_moe_model():
-    """
-    Feature: project MoE model compatibility
-    Description: Generate can run against Qwen3.5-MoE through no-cache fallback.
-    Expectation: Output appends valid token ids to the prompt.
-    """
-    config = Qwen3_5MoeConfig(
-        vocab_size=32,
-        hidden_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        max_position_embeddings=32,
-        partial_rotary_factor=0.5,
-        mrope_section=[1, 1, 0],
-        layer_types=["full_attention"],
-        num_experts=2,
-        num_experts_per_tok=1,
-        moe_intermediate_size=8,
-        shared_expert_intermediate_size=8,
-    )
-    model = Qwen3_5MoeForCausalLM(config)
-    input_ids = torch.tensor([[1, 2, 3]])
-
-    out = generate(
-        model,
-        input_ids,
-        GenerationConfig(max_new_tokens=2, eos_token_id=None),
-    )
-
-    assert out.shape == (1, 5)
-    assert torch.equal(out[:, :3], input_ids)
-    assert int(out.max()) < config.vocab_size
-
-
-def test_generate_mixin_with_project_qwen3_5_moe_model():
-    """
-    Feature: project MoE model generate method
-    Description: GenerateMixin exposes model.generate on a project Qwen3.5-MoE model.
-    Expectation: The project MoE model method appends valid token ids to the prompt.
-    """
-    config = Qwen3_5MoeConfig(
-        vocab_size=32,
-        hidden_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        max_position_embeddings=32,
-        partial_rotary_factor=0.5,
-        mrope_section=[1, 1, 0],
-        layer_types=["full_attention"],
-        num_experts=2,
-        num_experts_per_tok=1,
-        moe_intermediate_size=8,
-        shared_expert_intermediate_size=8,
-    )
-    model = MixinQwen35MoeForCausalLM(config)
+    config = _tiny_transformers_config()
+    model = MixinTransformersCausalLM(config)
     input_ids = torch.tensor([[1, 2, 3]])
 
     out = model.generate(

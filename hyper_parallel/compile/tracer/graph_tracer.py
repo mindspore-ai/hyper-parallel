@@ -46,6 +46,7 @@ would keep every forward intermediate alive via ``grad_fn`` references.
 
 import contextlib
 import copy
+import inspect
 import warnings
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -59,6 +60,20 @@ from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
+
+# Older torch's make_fx predates record_stack_traces / record_module_stack
+# and rejects unknown kwargs; forward only the kwargs this torch supports.
+# The joint graph still captures without record_stack_traces -- the fwd->bw
+# metadata copy skips a missing stack_trace instead of failing.
+try:
+    _MAKE_FX_PARAMS = inspect.signature(make_fx).parameters
+except (ValueError, TypeError):
+    _MAKE_FX_PARAMS = {}
+_MAKE_FX_KWARGS: Dict[str, Any] = {
+    kw: val
+    for kw, val in (("record_stack_traces", True), ("record_module_stack", False))
+    if kw in _MAKE_FX_PARAMS
+}
 
 # Tensors and make_fx-safe primitives are allowed as graph leaves.
 # Everything else (callables, custom objects) must be captured in the
@@ -249,8 +264,8 @@ def trace_model_graph(
     Returns:
         JointGraph: Joint forward-backward computation graph
     """
-    # 1. Extract module state (parameters/buffers) into flat tensors and
-    #    thread them through the graph as static inputs (leading placeholders).
+    # Extract module state (parameters/buffers) into flat tensors threaded
+    # through the graph as static inputs (leading placeholders).
     model_state = extract_module_state(model)
     state_fqns = list(model_state.keys())
     # Which leading state inputs are parameters (vs buffers). FSDP shards
@@ -267,7 +282,6 @@ def trace_model_graph(
     user_inputs = (sample_input, sample_label)
     user_inputs_flat, user_inputs_spec = torch.utils._pytree.tree_flatten(user_inputs)
 
-    # Validate leaves: only tensors / primitives may enter the graph.
     for leaf in [*state_flat, *user_inputs_flat]:
         if isinstance(leaf, nn.Module):
             raise ValueError(
@@ -281,7 +295,6 @@ def trace_model_graph(
                 f"got {type(leaf).__name__}."
             )
 
-    # Combined flat input: [*state, *user_args].
     full_args = list(state_flat) + list(user_inputs_flat)
 
     fake_mode = FakeTensorMode(
@@ -295,7 +308,6 @@ def trace_model_graph(
     num_state_inputs = len(state_flat)
 
     def _fwd_bwd_fn(*plain_args):
-        # Rebuild model with trace-time state, then run forward + backward.
         state_wrapped = plain_args[:num_state_inputs]
         user_wrapped = plain_args[num_state_inputs:]
         state_t = torch.utils._pytree.tree_unflatten(list(state_wrapped), state_spec)
@@ -309,8 +321,8 @@ def trace_model_graph(
         ):
             loss = train_fn(model, *user_args)
 
-            # Collect parameters that require gradients from the reparametrized state
-            # Use state_t["model"] to ensure we get the exact tensors used in the graph
+            # Read params from state_t["model"] so the exact trace-time
+            # tensors (not the live module's) drive autograd.grad.
             params = []
             for idx, fqn in enumerate(state_fqns):
                 if state_is_param[idx]:
@@ -320,7 +332,7 @@ def trace_model_graph(
 
             grads = torch.autograd.grad(loss, params, allow_unused=True)
 
-        # Replace None gradients with zero tensors to maintain consistent output structure
+        # Replace None grads with zeros so the output arity is stable.
         processed_grads = []
         for grad, param in zip(grads, params):
             if grad is None:
@@ -343,11 +355,7 @@ def trace_model_graph(
         torch.autograd.set_multithreading_enabled(False),
         _non_strict_tracing_context(),
     ):
-        traced_graph = make_fx(
-            _fwd_bwd_fn,
-            record_stack_traces=True,
-            record_module_stack=False,
-        )(*fake_args)
+        traced_graph = make_fx(_fwd_bwd_fn, **_MAKE_FX_KWARGS)(*fake_args)
 
     # Copy forward metadata (nn_module_stack/stack_trace) to backward nodes so
     # passes can match nodes by module FQN on both halves of the joint graph.

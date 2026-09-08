@@ -68,16 +68,6 @@ class TestCustomOpsLoading(unittest.TestCase):
         self.assertTrue(any(expected_suffix in path for path in custom_op_impl._extension_search_paths()))
         self.assertEqual(sys.path, original_sys_path)
 
-    def test_missing_extension_does_not_jit_compile(self):
-        """A missing prebuilt extension reports guidance without invoking CustomOpBuilder."""
-        with self.assertRaisesRegex(
-            ImportError,
-            "HP-NATIVE-LOAD-FAILED.*--custom-ops on",
-        ):
-            from hyper_parallel.platform.mindspore.custom_ops import custom_op_impl  # noqa: F401
-
-        self._mock_ms.ops.CustomOpBuilder.assert_not_called()
-
     def test_binary_loader_error_is_wrapped_with_native_guidance(self):
         """An incompatible prebuilt extension reports a stable native load error."""
         mock_mod = MagicMock()

@@ -1,0 +1,1252 @@
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""context_parallel.wrappers: built-in CP-aware inner attention wrappers (public, explicit injection).
+
+Since the explicit-injection rework the framework NEVER picks a CP wrapper
+automatically: the built-ins below are referenced explicitly — by
+registry name (``spec.inner_wrapper="sdpa_hf"``), by callable, or by a YAML
+Target pointing at one of these functions:
+
+.. code-block:: yaml
+
+    plan_overrides:
+      - match: "*.self_attn"
+        when: cp
+        inner_wrapper:
+          _target_: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper
+
+Wrapper contract (also the Target factory contract — at apply time the
+Target is built with its declared context, filled by name)::
+
+    @inner_wrapper
+    fn(target_module, mesh, tp_mesh, cp_mesh, ep_mesh, <configured params...>)
+
+The ``@inner_wrapper`` decorator is MANDATORY (injection discipline,
+see recipe_spec.py): the mesh family (``mesh``/``tp_mesh``/``cp_mesh``/
+``ep_mesh``) plus the anchor ``target_module`` are REQUIRED context
+params, ALL filled by the framework at apply time (None for inactive
+axes) — the user just uses them.
+Undecorated wrappers fail fast in the resolution chain; *args/**kwargs
+are forbidden. In-repo wrappers RETURN the replacement — a forward
+callable or _ForwardRewriteRequest(s) — and the forward rewriter
+validates, installs and rolls back (05 §15.2.3: module.forward is
+assigned only by distributed/_builder/forward_rewriter.py); external
+wrappers may still replace ``target_module.forward`` in place and return
+None. The replaced forward must accept the original forward's params
+(validated at apply time).
+
+- ``sdpa_qkv_cp_wrapper``: NeMo convention ``forward(q, k, v, ...)`` — explicit
+  K/V all-gather + D-04 offset-aware causal mask (fixes the is_causal
+  alignment error under CP);
+- ``sdpa_hf_cp_wrapper``: HF convention ``forward(hidden_states, ...)`` —
+  primitive interception of ``F.scaled_dot_product_attention`` (reuses HF
+  projections/RoPE), with misfire detection (raises if no call is
+  intercepted);
+- ``flex_qkv_cp_wrapper`` / ``flex_hf_cp_wrapper``: the two isomorphic
+  FlexAttention entries (block_mask must be built for the global kv length).
+- ``*_ulysses_cp_wrapper``: Pure Ulysses variants that exchange Q/K/V from
+  sequence shards to head shards before attention and restore the local
+  sequence shard afterward.
+- ``*_hybrid_cp_wrapper``: local-tensor Hybrid variants that run Ulysses
+  all-to-all inside each subgroup and K/V all-gather across the complementary
+  Colossal subgroup.
+- ``sdpa_*_load_balance_cp_wrapper``: local-tensor Colossal Head-Tail variants
+  for Q exchange, K/V all-gather, dual SDPA execution, output restoration,
+  and backward communication.
+
+Users may register their own named schemes::
+
+    INNER_WRAPPER_REGISTRY["my_flash"] = my_fn
+
+after which ``spec.inner_wrapper="my_flash"`` references it by name.
+
+The ``is_*_attention`` helpers are public utilities for authors of custom
+wrappers (choosing a scheme programmatically); the framework itself no
+longer dispatches heuristically on them.
+"""
+
+import functools
+import importlib
+import inspect
+import logging
+from typing import Any, Callable
+
+import torch  # pylint: disable=forbidden-backend-import
+import torch.nn.functional as F
+
+from hyper_parallel.platform import get_platform
+from hyper_parallel.distributed._builder.forward_rewriter import (
+    _ForwardRewriteRequest,
+)
+from hyper_parallel.distributed.context_parallel.collectives import (
+    _build_hybrid_cp_submeshes,
+    _ULYSSES_WRAPPED_FLAG,
+    _UlyssesContext,
+    _slice_sequence,
+    flex_cp_allgather,
+    hybrid_cp_attention,
+    ulysses_head_to_seq,
+    ulysses_seq_to_head,
+)
+from hyper_parallel.distributed.context_parallel.attention import (
+    _cp_offset_causal_mask,
+    _dsa_cp_alltoall,
+    _mla_cp_alltoall,
+    _mome_cp_halo_exchange,
+    head_tail_load_balance_attention,
+)
+from hyper_parallel.distributed.recipe_spec import (
+    inner_wrapper,
+)
+
+logger = logging.getLogger(__name__)
+platform = get_platform()
+Module = platform.Module
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Style-detection helpers (public utilities for custom wrapper authors)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _attn_implementation(module):
+    cfg = getattr(module, "config", None)
+    impl = getattr(cfg, "_attn_implementation", None)
+    if impl is None and isinstance(cfg, dict):
+        impl = cfg.get("attn_implementation")
+    return impl
+
+
+def is_sdpa_attention(module: Any) -> bool:
+    """True when the module is configured for or named as SDPA attention."""
+    impl = _attn_implementation(module)
+    return (impl == "sdpa") or ("SdpaAttention" in type(module).__name__)
+
+
+def is_flex_attention(module: Any) -> bool:
+    """True when the module is configured for or named as FlexAttention."""
+    impl = _attn_implementation(module)
+    return (impl == "flex_attention") or ("FlexAttention" in type(module).__name__)
+
+
+def is_hf_style_attention(module: Any) -> bool:
+    """HF style (forward(hidden_states,...), projections inside forward) -> the primitive-interception path."""
+    has_proj = (hasattr(module, "q_proj") and hasattr(module, "k_proj")
+                and hasattr(module, "v_proj"))
+    if not has_proj:
+        return False
+    try:
+        sig = inspect.signature(module.forward)
+        first_param = next(iter(sig.parameters.values()), None)
+        return first_param is not None and first_param.name == "hidden_states"
+    except (ValueError, TypeError):
+        return type(module).__name__.endswith("Attention")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CP-aware SDPA core (K/V all-gather + D-04 offset causal mask)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _prepare_cp_sdpa_kwargs(
+        kwargs: dict[str, Any], *, q_len: int, kv_len: int,
+        query_offset: int, device: Any) -> dict[str, Any]:
+    """Adapt a complete SDPA mask to one CP-local query interval."""
+    call_kwargs = dict(kwargs)
+    attention_mask = call_kwargs.get("attn_mask")
+    if attention_mask is not None:
+        if not isinstance(attention_mask, torch.Tensor):
+            raise TypeError(
+                "CP SDPA attn_mask must be a Tensor or None, got "
+                f"{type(attention_mask).__name__}"
+            )
+        if attention_mask.ndim < 2:
+            raise ValueError(
+                "CP SDPA attn_mask must expose query and KV dimensions, got "
+                f"shape {tuple(attention_mask.shape)}"
+            )
+        if attention_mask.shape[-1] != kv_len:
+            raise ValueError(
+                "CP SDPA attn_mask must cover the complete KV sequence: "
+                f"mask KV length={attention_mask.shape[-1]}, expected {kv_len}"
+            )
+        mask_q_len = attention_mask.shape[-2]
+        if mask_q_len != q_len:
+            if mask_q_len < query_offset + q_len:
+                raise ValueError(
+                    "CP SDPA attn_mask does not cover the required query range "
+                    f"[{query_offset}, {query_offset + q_len}); mask query "
+                    f"length={mask_q_len}"
+                )
+            attention_mask = attention_mask.narrow(
+                -2, query_offset, q_len
+            )
+        call_kwargs["attn_mask"] = attention_mask
+        if call_kwargs.get("is_causal"):
+            call_kwargs["is_causal"] = False
+        return call_kwargs
+
+    if call_kwargs.get("is_causal"):
+        call_kwargs["is_causal"] = False
+        call_kwargs["attn_mask"] = _cp_offset_causal_mask(
+            q_len, kv_len, query_offset, device
+        )
+    return call_kwargs
+
+
+def _prepare_head_tail_sdpa_kwargs(
+        kwargs: dict[str, Any], query: Any, key: Any,
+        cp_mesh: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prepare complete-mask query rows for both Head-Tail attention calls."""
+    local_q_len = query.shape[2]
+    if local_q_len % 2:
+        raise ValueError(
+            "Head-Tail load balance requires an even local Q sequence "
+            f"length, got {local_q_len}"
+        )
+    half_q_len = local_q_len // 2
+    local_rank = cp_mesh.get_local_rank()
+    peer_rank = cp_mesh.size() - 1 - local_rank
+    global_kv_len = key.shape[2] * cp_mesh.size()
+    keep_kwargs = _prepare_cp_sdpa_kwargs(
+        kwargs,
+        q_len=half_q_len,
+        kv_len=global_kv_len,
+        query_offset=local_rank * local_q_len,
+        device=query.device,
+    )
+    peer_kwargs = _prepare_cp_sdpa_kwargs(
+        kwargs,
+        q_len=half_q_len,
+        kv_len=global_kv_len,
+        query_offset=peer_rank * local_q_len + half_q_len,
+        device=query.device,
+    )
+    return keep_kwargs, peer_kwargs
+
+
+def _prepare_hybrid_sdpa_kwargs(
+        kwargs: dict[str, Any], query: Any, key: Any,
+        cp_mesh: Any, ulysses_degree: int) -> dict[str, Any]:
+    """Prepare complete-mask query rows for Hybrid attention."""
+    _, colossal_mesh = _build_hybrid_cp_submeshes(cp_mesh, ulysses_degree)
+    hybrid_q_len = query.shape[2] * ulysses_degree
+    return _prepare_cp_sdpa_kwargs(
+        kwargs,
+        q_len=hybrid_q_len,
+        kv_len=key.shape[2] * cp_mesh.size(),
+        query_offset=colossal_mesh.get_local_rank() * hybrid_q_len,
+        device=query.device,
+    )
+
+
+def _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kwargs):
+    """CP-aware SDPA: K/V all-gather + D-04 offset-aware causal mask."""
+    cp_dim = 2  # sequence dim of the [B, N, S, H] layout
+    global_k, global_v = flex_cp_allgather(
+        k.contiguous(), v.contiguous(), cp_dim, cp_mesh)
+    if cp_mesh.size() > 1:
+        kwargs = _prepare_cp_sdpa_kwargs(
+            kwargs,
+            q_len=q.shape[cp_dim],
+            kv_len=global_k.shape[cp_dim],
+            query_offset=cp_mesh.get_local_rank() * q.shape[cp_dim],
+            device=q.device,
+        )
+    return orig_sdpa(q, global_k, global_v, **kwargs)
+
+
+def _ulysses_attention_call(
+        attention_fn, cp_mesh, query, key, value, kwargs,
+        *, seq_dim=2, head_dim=1):
+    """Run attention in the Pure Ulysses full-sequence/head-sharded layout."""
+    query, key, value = (
+        ulysses_seq_to_head(tensor, seq_dim, head_dim, cp_mesh)
+        for tensor in (query, key, value)
+    )
+    output = attention_fn(query, key, value, **kwargs)
+    return ulysses_head_to_seq(output, seq_dim, head_dim, cp_mesh)
+
+
+def _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs):
+    """Preserve a QKV forward signature while applying Pure Ulysses."""
+    signature = inspect.signature(original_forward)
+    bound = signature.bind(*args, **kwargs)
+    names = list(signature.parameters)
+    if len(names) < 3:
+        raise TypeError("Ulysses QKV wrapper requires at least three forward inputs")
+    try:
+        query, key, value = (
+            bound.arguments[names[index]] for index in range(3)
+        )
+    except KeyError as exc:
+        raise TypeError(
+            "Ulysses QKV wrapper requires query, key, and value inputs"
+        ) from exc
+    query, key, value = (
+        ulysses_seq_to_head(tensor, 2, 1, cp_mesh)
+        for tensor in (query, key, value)
+    )
+    bound.arguments[names[0]] = query
+    bound.arguments[names[1]] = key
+    bound.arguments[names[2]] = value
+    output = original_forward(*bound.args, **bound.kwargs)
+    return ulysses_head_to_seq(output, 2, 1, cp_mesh)
+
+
+def _require_ulysses_cp_mesh(cp_mesh, wrapper_name):
+    """Validate the communication context required by Pure Ulysses."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            f"Ulysses wrapper {wrapper_name!r} requires an active CP mesh"
+        )
+
+
+def _normalize_hf_sdpa_gqa(
+        query: Any, key: Any, value: Any,
+        call_kwargs: dict[str, Any]) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Give every CP rank the same explicit KV-head layout before gather.
+
+    HF may keep compact GQA K/V when no mask is present but expand K/V on a
+    rank with an explicit padding mask.  CP communication starts after that
+    decision, so the rank-local layouts must be normalized first.
+    """
+    query_heads = query.shape[1]
+    key_heads = key.shape[1]
+    value_heads = value.shape[1]
+    if key_heads != value_heads:
+        raise ValueError(
+            "HF CP SDPA requires matching K/V head counts, got "
+            f"key_heads={key_heads}, value_heads={value_heads}"
+        )
+    if query_heads % key_heads:
+        raise ValueError(
+            "HF CP SDPA requires Q heads divisible by KV heads, "
+            f"got query_heads={query_heads}, key_heads={key_heads}"
+        )
+    if query_heads != key_heads:
+        groups = query_heads // key_heads
+        key = key.repeat_interleave(groups, dim=1)
+        value = value.repeat_interleave(groups, dim=1)
+    normalized_kwargs = dict(call_kwargs)
+    normalized_kwargs.pop("enable_gqa", None)
+    return query, key, value, normalized_kwargs
+
+
+def _bind_qkv_invocation(
+        original_forward: Callable[..., Any], args: tuple[Any, ...],
+        kwargs: dict[str, Any], wrapper_name: str):
+    """Bind a QKV call once and return a local-tensor attention callback."""
+    signature = inspect.signature(original_forward)
+    parameter_names = tuple(signature.parameters)
+    if len(parameter_names) < 3:
+        raise TypeError(
+            f"CP wrapper {wrapper_name!r} requires at least three forward inputs"
+        )
+    qkv_names = parameter_names[:3]
+    bound = signature.bind(*args, **kwargs)
+    bound.apply_defaults()
+    try:
+        query, key, value = (
+            bound.arguments[name] for name in qkv_names
+        )
+    except KeyError as exc:
+        raise TypeError(
+            f"CP wrapper {wrapper_name!r} requires query, key, and value inputs"
+        ) from exc
+
+    var_keyword_name = next(
+        (
+            name for name, parameter in signature.parameters.items()
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD
+        ),
+        None,
+    )
+    attention_kwargs = {}
+    for name, parameter in signature.parameters.items():
+        if name in qkv_names or name not in bound.arguments:
+            continue
+        value_item = bound.arguments[name]
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            attention_kwargs.update(value_item)
+        elif parameter.kind is not inspect.Parameter.VAR_POSITIONAL:
+            attention_kwargs[name] = value_item
+
+    base_arguments = dict(bound.arguments)
+    if var_keyword_name is not None:
+        base_arguments[var_keyword_name] = dict(
+            base_arguments.get(var_keyword_name, {})
+        )
+
+    def attention_call(
+            call_query: Any, call_key: Any, call_value: Any,
+            call_kwargs: dict[str, Any]) -> Any:
+        """Invoke the original forward without duplicating bound Q/K/V args."""
+        call_arguments = dict(base_arguments)
+        if var_keyword_name is not None:
+            call_arguments[var_keyword_name] = dict(
+                base_arguments[var_keyword_name]
+            )
+        call_arguments[qkv_names[0]] = call_query
+        call_arguments[qkv_names[1]] = call_key
+        call_arguments[qkv_names[2]] = call_value
+        for name, item in call_kwargs.items():
+            parameter = signature.parameters.get(name)
+            if (parameter is not None
+                    and parameter.kind is not inspect.Parameter.VAR_KEYWORD):
+                call_arguments[name] = item
+            elif var_keyword_name is not None:
+                call_arguments[var_keyword_name][name] = item
+            else:
+                raise TypeError(
+                    f"CP wrapper {wrapper_name!r} needs to pass attention "
+                    f"argument {name!r}, but the original forward does not "
+                    "accept it"
+                )
+        call_bound = inspect.BoundArguments(signature, call_arguments)
+        return original_forward(*call_bound.args, **call_bound.kwargs)
+
+    return query, key, value, attention_kwargs, attention_call
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# The four built-in wrappers
+# ────────────────────────────────────────────────────────────────────────────
+
+@inner_wrapper
+def sdpa_qkv_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """NeMo/Megatron SDPA path (registry "sdpa_qkv"): explicit all-gather K/V.
+
+    Assumes the inner_attention.forward(q,k,v,...) signature convention.
+    **Local-only** (injection discipline): the dual-mode adapter converts
+    DTensor inputs to local and re-wraps the output — this wrapper never
+    touches DTensor. Since it wraps an inner submodule, the plan MUST
+    declare ``inner_out_src: "first_input"`` (its output layout == q's
+    layout). cp_mesh is framework-filled context; fail fast when the plan
+    has no cp axis.
+    """
+
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None:
+        raise ValueError(
+            "The in-repo CP wrapper reference implementation 'sdpa_qkv' requires an "
+            "active cp axis (the communication domain for K/V all-gather), but the "
+            "framework-filled cp_mesh is None (the current plan has no cp axis) — "
+            "without CP, use a custom @inner_wrapper wrapper instead (the "
+            "cp_mesh=None semantics are then your own responsibility), or use the "
+            "local_compute_fn channel (see "
+            "examples/distributed/perf_replacement.py)")
+
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def cp_forward(q: Any, k: Any, v: Any, **kwargs: Any) -> Any:
+        """All-gather K/V along CP, then run the original QKV SDPA forward."""
+        return _cp_sdpa_call(original_forward, cp_mesh, q, k, v, kwargs)
+
+    return cp_forward
+
+
+@inner_wrapper
+def flex_qkv_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """NeMo/Megatron FlexAttention path (registry "flex_qkv"): explicit all-gather K/V.
+
+    **Local-only** (see sdpa_qkv_cp_wrapper); requires
+    ``inner_out_src: "first_input"`` in the plan. Constraint: the
+    block_mask must be built for the global kv length. cp_mesh is
+    framework-filled context; fail fast when the plan has no cp axis.
+    """
+
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None:
+        raise ValueError(
+            "The in-repo CP wrapper reference implementation 'flex_qkv' requires an "
+            "active cp axis (the communication domain for K/V all-gather), but the "
+            "framework-filled cp_mesh is None (the current plan has no cp axis) — "
+            "without CP, use a custom @inner_wrapper wrapper instead (the "
+            "cp_mesh=None semantics are then your own responsibility), or use the "
+            "local_compute_fn channel (see "
+            "examples/distributed/perf_replacement.py)")
+
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def cp_forward(q: Any, k: Any, v: Any, **kwargs: Any) -> Any:
+        """All-gather K/V along CP, then run the original QKV Flex forward."""
+        global_k, global_v = flex_cp_allgather(
+            k.contiguous(), v.contiguous(), 2, cp_mesh)
+        return original_forward(q, global_k, global_v, **kwargs)
+
+    return cp_forward
+
+
+@inner_wrapper
+def sdpa_hf_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """HF standard SDPA path: forward(hidden_states,...) -> primitive interception (05 §4.4.2).
+
+    **Local-only** (see sdpa_qkv_cp_wrapper): the adapter handles DTensor
+    unwrap/param-unwrap/rewrap; the rewrap uses the boundary's declared
+    out_src (this wrapper targets the boundary module itself). The
+    primitive interception is a temporary global function replacement
+    (restored via try/finally) and is not thread-safe; it is safe under
+    single-process SPMD training (consistent with the TorchTitan CP
+    implementation).
+    Misfire detection: the wrapper may be applied to a module that does not
+    call F.sdpa -- if the primitive did not intercept a single call, the K/V
+    were not gathered (a silent numerical error), so raise a RuntimeError
+    immediately.
+    """
+
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None:
+        raise ValueError(
+            "The in-repo CP wrapper reference implementation 'sdpa_hf' requires an "
+            "active cp axis (the communication domain for K/V all-gather), but the "
+            "framework-filled cp_mesh is None (the current plan has no cp axis) — "
+            "without CP, use a custom @inner_wrapper wrapper instead (the "
+            "cp_mesh=None semantics are then your own responsibility), or use the "
+            "local_compute_fn channel (see "
+            "examples/distributed/perf_replacement.py)")
+
+    original_forward = target_module.forward
+    orig_sdpa = F.scaled_dot_product_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run the HF forward with F.sdpa temporarily replaced by the CP-aware one."""
+        fired = {"hit": False}
+
+        def cp_aware_sdpa(q: Any, k: Any, v: Any, **kw: Any) -> Any:
+            """CP-aware SDPA replacement: all-gather K/V plus the D-04 mask."""
+            fired["hit"] = True
+            return _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kw)
+
+        F.scaled_dot_product_attention = cp_aware_sdpa
+        try:
+            out = original_forward(hidden_states, *args, **kwargs)
+        finally:
+            F.scaled_dot_product_attention = orig_sdpa
+        if not fired["hit"]:
+            raise RuntimeError(
+                f"CP wrapper 'sdpa_hf' did not intercept any "
+                f"F.scaled_dot_product_attention call on "
+                f"{type(target_module).__name__} -- the wrapper does "
+                f"not match the module implementation (K/V were not "
+                f"all-gathered; continuing would produce silent numerical "
+                f"errors). Please explicitly set inner_wrapper='sdpa_qkv' "
+                f"(the (q,k,v) convention), or provide a custom inner_wrapper "
+                f"callable")
+        return out
+
+    return cp_forward
+
+
+@inner_wrapper
+def flex_hf_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """HF standard FlexAttention path: intercept flex_attention (same structure as the SDPA path).
+
+    **Local-only** (see sdpa_qkv_cp_wrapper). Constraint:
+    score_mod/block_mask pass through verbatim via kwargs -- under CP,
+    kv_len changes from S/cp to S, so the block_mask must be built for the
+    **global kv length** (constructed on the full sequence in the data
+    pipeline / model side), otherwise shapes and semantics are misaligned.
+    The wrapper does not validate this.
+    Misfire detection is the same as 'sdpa_hf': if no flex_attention call is
+    intercepted, raise a RuntimeError.
+    """
+
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None:
+        raise ValueError(
+            "The in-repo CP wrapper reference implementation 'flex_hf' requires an "
+            "active cp axis (the communication domain for K/V all-gather), but the "
+            "framework-filled cp_mesh is None (the current plan has no cp axis) — "
+            "without CP, use a custom @inner_wrapper wrapper instead (the "
+            "cp_mesh=None semantics are then your own responsibility), or use the "
+            "local_compute_fn channel (see "
+            "examples/distributed/perf_replacement.py)")
+
+    original_forward = target_module.forward
+    # FlexAttention is optional on older supported PyTorch versions.
+    flex_attention_module = importlib.import_module(
+        "torch.nn.attention.flex_attention")
+    original_flex_attention = flex_attention_module.flex_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run the HF forward with flex_attention temporarily replaced."""
+        fired = {"hit": False}
+
+        def cp_aware_flex(q: Any, k: Any, v: Any, **kw: Any) -> Any:
+            """CP-aware FlexAttention replacement: all-gather K/V first."""
+            fired["hit"] = True
+            global_k, global_v = flex_cp_allgather(
+                k.contiguous(), v.contiguous(), 2, cp_mesh)
+            return original_flex_attention(q, global_k, global_v, **kw)
+
+        flex_attention_module.flex_attention = cp_aware_flex
+        try:
+            out = original_forward(hidden_states, *args, **kwargs)
+        finally:
+            flex_attention_module.flex_attention = original_flex_attention
+        if not fired["hit"]:
+            raise RuntimeError(
+                f"CP wrapper 'flex_hf' did not intercept any flex_attention "
+                f"call on {type(target_module).__name__} -- the wrapper "
+                f"does not match the module implementation (K/V were "
+                f"not all-gathered; continuing would produce silent numerical "
+                f"errors). Please explicitly set inner_wrapper='flex_qkv' "
+                f"(the (q,k,v) convention), or provide a custom inner_wrapper "
+                f"callable")
+        return out
+
+    return cp_forward
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Colossal Head-Tail load-balance wrappers (explicit plan_overrides methods)
+# ────────────────────────────────────────────────────────────────────────────
+
+@inner_wrapper
+def sdpa_qkv_load_balance_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """Apply Colossal Head-Tail load balancing to a QKV-style SDPA module.
+
+    Args:
+        target_module: Attention module whose first three inputs are Q/K/V.
+        mesh: Framework-owned root mesh; unused by this wrapper.
+        tp_mesh: Framework-owned TP mesh; unused by this wrapper.
+        cp_mesh: Framework-owned CP communication mesh.
+        ep_mesh: Framework-owned EP mesh; unused by this wrapper.
+    """
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            "sdpa_qkv_load_balance_cp_wrapper requires an active CP mesh"
+        )
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Route local Q/K/V tensors through Head-Tail communication."""
+        query, key, value, call_kwargs, attention_call = (
+            _bind_qkv_invocation(
+                original_forward,
+                args,
+                kwargs,
+                "sdpa_qkv_load_balance",
+            )
+        )
+        keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
+            call_kwargs, query, key, cp_mesh
+        )
+        return head_tail_load_balance_attention(
+            attention_call,
+            query,
+            key,
+            value,
+            keep_kwargs,
+            cp_mesh,
+            peer_attention_kwargs=peer_kwargs,
+        )
+
+    return cp_forward
+
+
+@inner_wrapper
+def sdpa_hf_load_balance_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """Apply Colossal Head-Tail load balancing at an HF SDPA primitive.
+
+    Args:
+        target_module: HF-style attention containing an SDPA primitive call.
+        mesh: Framework-owned root mesh; unused by this wrapper.
+        tp_mesh: Framework-owned TP mesh; unused by this wrapper.
+        cp_mesh: Framework-owned CP communication mesh.
+        ep_mesh: Framework-owned EP mesh; unused by this wrapper.
+    """
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            "sdpa_hf_load_balance_cp_wrapper requires an active CP mesh"
+        )
+    original_forward = target_module.forward
+    original_sdpa = F.scaled_dot_product_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(
+            hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
+        """Intercept the module's SDPA primitive for one forward call."""
+        fired = {"hit": False}
+
+        def load_balanced_sdpa(
+                q: Any, k: Any, v: Any,
+                **call_kwargs: Any) -> Any:
+            """Run one intercepted SDPA call with Head-Tail communication."""
+            fired["hit"] = True
+            q, k, v, call_kwargs = _normalize_hf_sdpa_gqa(
+                q, k, v, call_kwargs
+            )
+            keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
+                call_kwargs, q, k, cp_mesh
+            )
+            return head_tail_load_balance_attention(
+                lambda query, key, value, attention_kwargs: original_sdpa(
+                    query, key, value, **attention_kwargs
+                ),
+                q,
+                k,
+                v,
+                keep_kwargs,
+                cp_mesh,
+                peer_attention_kwargs=peer_kwargs,
+            )
+
+        F.scaled_dot_product_attention = load_balanced_sdpa
+        try:
+            output = original_forward(hidden_states, *args, **kwargs)
+        finally:
+            F.scaled_dot_product_attention = original_sdpa
+        if not fired["hit"]:
+            raise RuntimeError(
+                "CP wrapper 'sdpa_hf_load_balance' did not intercept any "
+                "F.scaled_dot_product_attention call on "
+                f"{type(target_module).__name__}; choose the QKV wrapper or "
+                "provide a matching custom inner_wrapper"
+            )
+        return output
+
+    return cp_forward
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Pure Ulysses attention wrappers (explicit plan_overrides methods)
+# ────────────────────────────────────────────────────────────────────────────
+
+@inner_wrapper
+def sdpa_qkv_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """Apply Pure Ulysses to a separated ``forward(query, key, value, ...)``."""
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "sdpa_qkv_ulysses")
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the original QKV forward in the Ulysses head-sharded layout."""
+        return _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs)
+
+    return cp_forward
+
+
+@inner_wrapper
+def flex_qkv_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """Apply Pure Ulysses to a separated FlexAttention QKV forward."""
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "flex_qkv_ulysses")
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the original FlexAttention QKV forward in the Ulysses layout."""
+        return _ulysses_qkv_forward(original_forward, cp_mesh, args, kwargs)
+
+    return cp_forward
+
+
+@inner_wrapper
+def sdpa_hf_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """Apply Pure Ulysses by intercepting HF SDPA primitive calls."""
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "sdpa_hf_ulysses")
+    original_forward = target_module.forward
+    original_sdpa = F.scaled_dot_product_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the HF forward with F.sdpa temporarily Ulysses-exchanged."""
+        fired = {"hit": False}
+
+        def ulysses_sdpa(
+                query: Any, key: Any, value: Any,
+                **attention_kwargs: Any) -> Any:
+            """Run one intercepted SDPA call in the Ulysses layout."""
+            fired["hit"] = True
+            return _ulysses_attention_call(
+                original_sdpa,
+                cp_mesh,
+                query,
+                key,
+                value,
+                attention_kwargs,
+            )
+
+        F.scaled_dot_product_attention = ulysses_sdpa
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            F.scaled_dot_product_attention = original_sdpa
+        if not fired["hit"]:
+            raise RuntimeError(
+                "CP wrapper 'sdpa_hf_ulysses' did not intercept any "
+                "F.scaled_dot_product_attention call; the selected wrapper "
+                "does not match the module implementation"
+            )
+        return output
+
+    return cp_forward
+
+
+@inner_wrapper
+def flex_hf_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Callable:
+    """Apply Pure Ulysses by intercepting HF FlexAttention primitive calls."""
+    del mesh, tp_mesh, ep_mesh
+    _require_ulysses_cp_mesh(cp_mesh, "flex_hf_ulysses")
+    original_forward = target_module.forward
+    flex_attention_module = importlib.import_module(
+        "torch.nn.attention.flex_attention"
+    )
+    original_flex_attention = flex_attention_module.flex_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the HF forward with flex_attention temporarily Ulysses-exchanged."""
+        fired = {"hit": False}
+
+        def ulysses_flex(
+                query: Any, key: Any, value: Any,
+                **attention_kwargs: Any) -> Any:
+            """Run one intercepted FlexAttention call in the Ulysses layout."""
+            fired["hit"] = True
+            return _ulysses_attention_call(
+                original_flex_attention,
+                cp_mesh,
+                query,
+                key,
+                value,
+                attention_kwargs,
+            )
+
+        flex_attention_module.flex_attention = ulysses_flex
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            flex_attention_module.flex_attention = original_flex_attention
+        if not fired["hit"]:
+            raise RuntimeError(
+                "CP wrapper 'flex_hf_ulysses' did not intercept any "
+                "flex_attention call; the selected wrapper does not match "
+                "the module implementation"
+            )
+        return output
+
+    return cp_forward
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Hybrid attention wrappers (explicit Target with wrapper-local degree)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _validate_hybrid_config(
+        cp_mesh: Any, ulysses_degree: int, wrapper_name: str) -> None:
+    """Validate Hybrid topology at wrapper installation time."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            f"Hybrid wrapper {wrapper_name!r} requires an active CP mesh"
+        )
+    if isinstance(ulysses_degree, bool) or not isinstance(ulysses_degree, int):
+        raise TypeError(
+            f"Hybrid wrapper {wrapper_name!r} requires integer "
+            f"ulysses_degree, got {type(ulysses_degree).__name__}"
+        )
+    cp_size = cp_mesh.size()
+    if not 1 < ulysses_degree < cp_size:
+        raise ValueError(
+            f"Hybrid wrapper {wrapper_name!r} requires 1 < ulysses_degree "
+            f"< cp_size, got ulysses_degree={ulysses_degree}, cp_size={cp_size}"
+        )
+    if cp_size % ulysses_degree:
+        raise ValueError(
+            f"cp_size ({cp_size}) must be divisible by ulysses_degree "
+            f"({ulysses_degree})"
+        )
+
+
+def _apply_qkv_hybrid_wrapper(
+        target_module, cp_mesh, ulysses_degree, wrapper_name, *,
+        prepare_sdpa_mask: bool):
+    """Replace a separated QKV forward with local-tensor Hybrid CP."""
+    _validate_hybrid_config(cp_mesh, ulysses_degree, wrapper_name)
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the original QKV forward through local-tensor Hybrid CP."""
+        query, key, value, call_kwargs, attention_call = (
+            _bind_qkv_invocation(
+                original_forward,
+                args,
+                kwargs,
+                wrapper_name,
+            )
+        )
+        if prepare_sdpa_mask:
+            call_kwargs = _prepare_hybrid_sdpa_kwargs(
+                call_kwargs, query, key, cp_mesh, ulysses_degree
+            )
+        return hybrid_cp_attention(
+            attention_call,
+            query,
+            key,
+            value,
+            call_kwargs,
+            cp_mesh,
+            ulysses_degree,
+        )
+
+    return cp_forward
+
+
+@inner_wrapper
+def sdpa_qkv_hybrid_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any, cp_mesh: Any,
+        ep_mesh: Any, ulysses_degree: int) -> Callable:
+    """Apply Hybrid CP to a separated SDPA ``forward(query, key, value, ...)``."""
+    del mesh, tp_mesh, ep_mesh
+    return _apply_qkv_hybrid_wrapper(
+        target_module,
+        cp_mesh,
+        ulysses_degree,
+        "sdpa_qkv_hybrid",
+        prepare_sdpa_mask=True,
+    )
+
+
+@inner_wrapper
+def flex_qkv_hybrid_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any, cp_mesh: Any,
+        ep_mesh: Any, ulysses_degree: int) -> Callable:
+    """Apply Hybrid CP to a separated FlexAttention QKV forward."""
+    del mesh, tp_mesh, ep_mesh
+    return _apply_qkv_hybrid_wrapper(
+        target_module,
+        cp_mesh,
+        ulysses_degree,
+        "flex_qkv_hybrid",
+        prepare_sdpa_mask=False,
+    )
+
+
+@inner_wrapper
+def sdpa_hf_hybrid_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any, cp_mesh: Any,
+        ep_mesh: Any, ulysses_degree: int) -> Callable:
+    """Apply Hybrid CP by intercepting HF SDPA primitive calls."""
+    del mesh, tp_mesh, ep_mesh
+    _validate_hybrid_config(cp_mesh, ulysses_degree, "sdpa_hf_hybrid")
+    original_forward = target_module.forward
+    original_sdpa = F.scaled_dot_product_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the HF attention forward with temporary Hybrid SDPA interception."""
+        fired = {"hit": False}
+
+        def hybrid_sdpa(
+                query: Any, key: Any, value: Any,
+                **attention_kwargs: Any) -> Any:
+            """Route one intercepted SDPA call through Hybrid CP."""
+            fired["hit"] = True
+            query, key, value, attention_kwargs = _normalize_hf_sdpa_gqa(
+                query, key, value, attention_kwargs
+            )
+            attention_kwargs = _prepare_hybrid_sdpa_kwargs(
+                attention_kwargs,
+                query,
+                key,
+                cp_mesh,
+                ulysses_degree,
+            )
+            return hybrid_cp_attention(
+                lambda call_query, call_key, call_value, call_kwargs: (
+                    original_sdpa(
+                        call_query, call_key, call_value, **call_kwargs
+                    )
+                ),
+                query,
+                key,
+                value,
+                attention_kwargs,
+                cp_mesh,
+                ulysses_degree,
+            )
+
+        F.scaled_dot_product_attention = hybrid_sdpa
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            F.scaled_dot_product_attention = original_sdpa
+        if not fired["hit"]:
+            raise RuntimeError(
+                "CP wrapper 'sdpa_hf_hybrid' did not intercept any "
+                "F.scaled_dot_product_attention call; the selected wrapper "
+                "does not match the module implementation"
+            )
+        return output
+
+    return cp_forward
+
+
+@inner_wrapper
+def flex_hf_hybrid_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any, cp_mesh: Any,
+        ep_mesh: Any, ulysses_degree: int) -> Callable:
+    """Apply Hybrid CP by intercepting HF FlexAttention primitive calls."""
+    del mesh, tp_mesh, ep_mesh
+    _validate_hybrid_config(cp_mesh, ulysses_degree, "flex_hf_hybrid")
+    original_forward = target_module.forward
+    flex_attention_module = importlib.import_module(
+        "torch.nn.attention.flex_attention"
+    )
+    original_flex_attention = flex_attention_module.flex_attention
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the HF attention forward with temporary Hybrid Flex interception."""
+        fired = {"hit": False}
+
+        def hybrid_flex(
+                query: Any, key: Any, value: Any,
+                **attention_kwargs: Any) -> Any:
+            """Route one intercepted FlexAttention call through Hybrid CP."""
+            fired["hit"] = True
+            return hybrid_cp_attention(
+                lambda call_query, call_key, call_value, call_kwargs: (
+                    original_flex_attention(
+                        call_query, call_key, call_value, **call_kwargs
+                    )
+                ),
+                query,
+                key,
+                value,
+                attention_kwargs,
+                cp_mesh,
+                ulysses_degree,
+            )
+
+        flex_attention_module.flex_attention = hybrid_flex
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            flex_attention_module.flex_attention = original_flex_attention
+        if not fired["hit"]:
+            raise RuntimeError(
+                "CP wrapper 'flex_hf_hybrid' did not intercept any "
+                "flex_attention call; the selected wrapper does not match "
+                "the module implementation"
+            )
+        return output
+
+    return cp_forward
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# MLA/DSA Ulysses wrapper
+# ────────────────────────────────────────────────────────────────────────────
+
+def _input_cp_sharding(text_model, context):
+    """Build the CP-rank input-slicing rewrite request for a text model."""
+    if getattr(text_model, _ULYSSES_WRAPPED_FLAG, False):
+        return None
+    original_forward = text_model.forward
+
+    @functools.wraps(original_forward)
+    def forward_with_sequence_sharding(*args: Any, **kwargs: Any) -> Any:
+        """Slice sequence-dim inputs to this CP rank before the forward."""
+        if getattr(text_model, "_hyper_cp_inside_forward", False):
+            return original_forward(*args, **kwargs)
+        call_kwargs = kwargs.copy()
+        inputs_embeds = call_kwargs.get("inputs_embeds")
+        if inputs_embeds is None:
+            return original_forward(*args, **kwargs)
+        call_kwargs["inputs_embeds"] = _slice_sequence(inputs_embeds, 1, context)
+        position_ids = call_kwargs.get("position_ids")
+        if position_ids is not None:
+            call_kwargs["position_ids"] = _slice_sequence(
+                position_ids, position_ids.ndim - 1, context)
+        mome_mask = call_kwargs.get("mome_mask")
+        if mome_mask is not None:
+            call_kwargs["mome_mask"] = _slice_sequence(mome_mask, 1, context)
+        if call_kwargs.get("use_cache"):
+            raise ValueError("Ulysses CP requires use_cache=False")
+        call_kwargs["use_cache"] = False
+        setattr(text_model, "_hyper_cp_inside_forward", True)
+        try:
+            return original_forward(*args, **call_kwargs)
+        finally:
+            setattr(text_model, "_hyper_cp_inside_forward", False)
+
+    return _ForwardRewriteRequest(
+        text_model,
+        forward_with_sequence_sharding,
+        companion_attrs={_ULYSSES_WRAPPED_FLAG: True},
+    )
+
+
+def _validate_ulysses_requirements(target_module, cp_size):
+    """Validate the model configuration supported by Ulysses CP."""
+    config = getattr(target_module, "config", None)
+    if config is None:
+        raise ValueError(
+            "MLA/DSA Ulysses wrapper requires target_module.config")
+    text_config = getattr(config, "text_config", config)
+    if text_config is None:
+        raise ValueError(
+            "MLA/DSA Ulysses wrapper requires a non-None text_config")
+    for name in ("num_attention_heads", "index_num_attention_heads"):
+        value = getattr(text_config, name, None)
+        if value is None:
+            raise ValueError(
+                "MLA/DSA Ulysses wrapper requires "
+                f"text_config.{name}")
+        count = int(value)
+        if count % cp_size:
+            raise ValueError(
+                f"{name}={count} is not divisible by CP size {cp_size}")
+    if getattr(text_config, "dsa_dense_warm_up", False):
+        raise ValueError("MLA/DSA CP does not support DSA dense warm-up")
+    if not getattr(text_config, "apply_FA_rescale", False):
+        raise ValueError("MLA/DSA CP requires apply_FA_rescale=True")
+    if getattr(text_config, "use_fused_sink_fa", False):
+        raise ValueError("MLA/DSA CP does not support fused sink FA")
+
+
+@inner_wrapper
+def mla_dsa_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Any:
+    """Configure input, MoME, MLA and DSA Ulysses adaptations."""
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            "MLA/DSA Ulysses wrapper requires an active CP mesh")
+    if getattr(target_module, _ULYSSES_WRAPPED_FLAG, False):
+        return
+    _validate_ulysses_requirements(target_module, cp_mesh.size())
+    context = _UlyssesContext(cp_mesh)
+
+    text_models = [module for name, module in target_module.named_modules()
+                   if name.rsplit(".", maxsplit=1)[-1] in {
+                       "text_model", "language_model"}]
+    if not text_models:
+        raise RuntimeError("Cannot find a text or language model")
+    requests = []
+    for text_model in text_models:
+        request = _input_cp_sharding(text_model, context)
+        if request is not None:
+            requests.append(request)
+
+    attention_modules = {
+        inspect.getmodule(module) for module in target_module.modules()
+        if getattr(module, "attention_type", None) in {"mla", "dsa"}}
+    attention_modules.discard(None)
+    if len(attention_modules) != 1:
+        names = sorted(module.__name__ for module in attention_modules)
+        raise RuntimeError(
+            f"Expected one MLA/DSA attention module, found {names}")
+    attention_module = next(iter(attention_modules))
+    attention_registries = [
+        value for value in vars(attention_module).values()
+        if isinstance(value, dict)
+        and {"npu_fa_rescale", "dsa_sparse_attention"} <= value.keys()]
+    if len(attention_registries) != 1:
+        raise RuntimeError(
+            "Expected one attention-function registry containing MLA and DSA backends")
+    attention_functions = attention_registries[0]
+    _mome_cp_halo_exchange(attention_module, context)
+    _mla_cp_alltoall(attention_functions, context)
+    _dsa_cp_alltoall(attention_module, attention_functions, context)
+
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def forward_with_ulysses_adapters(*args: Any, **kwargs: Any) -> Any:
+        """Pass the forward through; the adapters are installed out of band."""
+        return original_forward(*args, **kwargs)
+
+    requests.append(_ForwardRewriteRequest(
+        target_module,
+        forward_with_ulysses_adapters,
+        companion_attrs={
+            "_hyper_ulysses_context": context,
+            _ULYSSES_WRAPPED_FLAG: True,
+        },
+    ))
+    return requests
+
+
+# {registry_name: wrapper_fn} -- inner-wrapper named registry (05 §4.4.2).
+# The mechanism is not CP-gated (declaration means application); the in-repo
+# reference implementations carry CP semantics (their self-checks require an
+# active cp axis); users may register arbitrary named schemes.
+# Contract: @inner_wrapper fn(target_module, mesh, tp_mesh, cp_mesh,
+# ep_mesh) RETURNS the replacement forward (K/V all-gather + dual-mode
+# tolerance); the forward rewriter installs it (external wrappers may
+# still replace in place and return None). Users may register their own
+# named schemes:
+# INNER_WRAPPER_REGISTRY["my_flash"] = my_fn, after which
+# spec.inner_wrapper="my_flash" references it by name.
+INNER_WRAPPER_REGISTRY = {
+    "sdpa_qkv": sdpa_qkv_cp_wrapper,  # NeMo convention forward(q,k,v,...) + D-04 mask
+    "sdpa_hf": sdpa_hf_cp_wrapper,    # HF convention + F.sdpa primitive interception (misfire detection)
+    "flex_qkv": flex_qkv_cp_wrapper,
+    "flex_hf": flex_hf_cp_wrapper,
+    "sdpa_qkv_ulysses": sdpa_qkv_ulysses_cp_wrapper,
+    "flex_qkv_ulysses": flex_qkv_ulysses_cp_wrapper,
+    "sdpa_hf_ulysses": sdpa_hf_ulysses_cp_wrapper,
+    "flex_hf_ulysses": flex_hf_ulysses_cp_wrapper,
+    "mla_dsa_ulysses": mla_dsa_ulysses_cp_wrapper,
+}
+
+# Static requirements for shipped wrappers. Custom registry entries own their
+# semantics; built-ins are known to contain CP collectives and therefore must
+# run as black-box local regions during placement validation.
+INNER_WRAPPER_REQUIREMENTS = {
+    name: {
+        "requires_cp": True,
+        "region_dispatch": False,
+        "forward_style": (
+            "hf_hidden_states"
+            if name.endswith("_hf") or "_hf_" in name
+            else "qkv"
+        ),
+    }
+    for name in INNER_WRAPPER_REGISTRY
+}

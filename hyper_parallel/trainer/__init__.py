@@ -12,13 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""HyperParallel Trainer module."""
+"""Top-level training public API.
 
-__all__ = ["ParallelDims"]
+Rebuilt in stage 7 (05 §10.1): the trainer classes moved here from
+``auto_models/trainer/`` (S7d). Exports are lazy so that importing the
+package (e.g. for ``trainer.config`` or ``trainer.callbacks``) stays cheap
+and does not pull the model/data stack until a trainer class is touched.
+"""
 
-# Importing utils first installs ``info_rank0`` / ``warning_rank0`` /
-# ``info_once`` / ``warning_once`` on ``logging.Logger`` so every
-# downstream module that does ``logger = logging.getLogger(__name__)``
-# can use them without explicit setup.
-from hyper_parallel.trainer import utils  # noqa: F401
-from hyper_parallel.trainer.parallel_dims import ParallelDims
+__all__ = [
+    "BaseTrainer",
+    "TextTrainer",
+    "VLMTrainer",
+    "TrainerState",
+]
+
+_LAZY_EXPORTS = {
+    "BaseTrainer": "hyper_parallel.trainer.base",
+    "TextTrainer": "hyper_parallel.trainer.text_trainer",
+    "VLMTrainer": "hyper_parallel.trainer.vlm_trainer",
+    "TrainerState": "hyper_parallel.trainer.state",
+}
+
+
+def __getattr__(name):
+    """Resolve trainer classes lazily on first attribute access."""
+    if name in _LAZY_EXPORTS:
+        import importlib  # pylint: disable=import-outside-toplevel
+
+        value = getattr(importlib.import_module(_LAZY_EXPORTS[name]), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    """List lazy exports for interactive discovery."""
+    return sorted(__all__)

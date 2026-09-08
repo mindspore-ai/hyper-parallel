@@ -45,7 +45,6 @@ from hyper_parallel.core.fully_shard.utils import (
     OffloadPolicy,
     SourceShardMetaInfo,
 )
-from hyper_parallel.core.utils import compute_local_shape_and_global_offset_by_ceil_chunk
 
 
 def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -524,43 +523,6 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
         return hsdp_placement
 
-    def _init_shard_metadata(
-        self,
-        param: nn.Parameter,
-        hsdp_placement: Shard,
-    ) -> tuple[list, torch.Tensor, int, int]:
-        """Initialize parameter shape and mesh metadata used by sharding."""
-        self.hsdp_placement = hsdp_placement
-        base_placements = list(self._get_base_spmd_placements())
-        param_data = param.to_local() if self._orig_param_is_dtensor else param
-        shard_dim = hsdp_placement.dim
-        if param_data.ndim == 0:
-            raise ValueError("fully_shard does not support scalar parameters")
-        if shard_dim < 0 or shard_dim >= param_data.ndim:
-            raise ValueError(
-                f"Invalid fully_shard dim {shard_dim} for parameter "
-                f"{self._module_info.param_name} with shape {tuple(param_data.shape)}"
-            )
-        self._orig_size = param_data.size()
-        self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            self.shard_rank = self.mesh_info.shard_mesh_rank
-            self.shard_world_size = self.mesh_info.shard_mesh_size
-        else:
-            self.shard_rank = 0
-            self.shard_world_size = 1
-
-        if isinstance(self.mesh_info, DDPMeshInfo):
-            self.replicate_world_size = self.mesh_info.replicate_mesh_size
-        else:
-            self.replicate_world_size = 1
-        self.is_replicate_param = (
-            isinstance(self.mesh_info, DDPMeshInfo)
-            and not isinstance(self.mesh_info, HSDPMeshInfo)
-        )
-        dim_shard_size = (param_data.size(shard_dim) + self.shard_world_size - 1) // self.shard_world_size
-        return base_placements, param_data, shard_dim, dim_shard_size
-
     def _init_shard_placements(
         self,
         param_data: torch.Tensor,
@@ -595,31 +557,60 @@ class TorchHSDPParamV2(HSDPParamV2):
             spmd_placements[self._spmd_shard_mesh_dim] = fsdp_placement
         self._spmd_placements = tuple(spmd_placements)
 
-    def _build_sharded_param_data(
+    @torch.no_grad()
+    def _init_sharded_param(
         self,
-        param_data: torch.Tensor,
-        shard_dim: int,
-        dim_shard_size: int,
-    ) -> torch.Tensor:
-        """Create the actual local shard and its fixed-size communication storage."""
-        local_shape, global_offset = compute_local_shape_and_global_offset_by_ceil_chunk(
-            param_data.size(),
-            shard_dim,
-            self.shard_world_size,
-            self.shard_rank,
+        param: nn.Parameter,
+        shard_placement_fn: Optional[Callable],
+    ) -> None:
+        """Initialize the persistent sharded parameter and communication storage."""
+        hsdp_placement = self._resolve_hsdp_placement(param, shard_placement_fn)
+        self.hsdp_placement = hsdp_placement
+        base_placements = list(self._get_base_spmd_placements())
+        param_data = param.to_local() if self._orig_param_is_dtensor else param
+        shard_dim = hsdp_placement.dim
+        if param_data.ndim == 0:
+            raise ValueError("fully_shard does not support scalar parameters")
+        if shard_dim < 0 or shard_dim >= param_data.ndim:
+            raise ValueError(
+                f"Invalid fully_shard dim {shard_dim} for parameter "
+                f"{self._module_info.param_name} with shape {tuple(param_data.shape)}"
+            )
+        self._orig_size = param_data.size()
+        self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
+
+        if isinstance(self.mesh_info, FSDPMeshInfo):
+            self.shard_rank = self.mesh_info.shard_mesh_rank
+            self.shard_world_size = self.mesh_info.shard_mesh_size
+        else:
+            self.shard_rank = 0
+            self.shard_world_size = 1
+        if isinstance(self.mesh_info, DDPMeshInfo):
+            self.replicate_world_size = self.mesh_info.replicate_mesh_size
+        else:
+            self.replicate_world_size = 1
+        self.is_replicate_param = (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and not isinstance(self.mesh_info, HSDPMeshInfo)
         )
-        actual_shard_offset = global_offset[shard_dim]
-        actual_shard_length = local_shape[shard_dim]
-        sharded_param = param_data.narrow(
+
+        self._init_shard_placements(
+            param_data,
             shard_dim,
-            actual_shard_offset,
-            actual_shard_length,
-        ).clone().contiguous()
+            base_placements,
+        )
+
+        chunks = torch.chunk(param_data, self.shard_world_size, dim=shard_dim)
+        if self.shard_rank < len(chunks):
+            local_shard = chunks[self.shard_rank]
+        else:
+            empty_slice = [slice(None)] * param_data.ndim
+            empty_slice[shard_dim] = slice(param_data.size(shard_dim), None)
+            local_shard = param_data[tuple(empty_slice)]
+        sharded_param = local_shard.clone().contiguous()
         self.sharded_size = sharded_param.size()
         self.contiguous_sharded_stride = make_contiguous_strides_for(self.sharded_size)
-        padded_sharded_size = list(param_data.size())
-        padded_sharded_size[shard_dim] = dim_shard_size
-        self.padded_sharded_param_size = torch.Size(padded_sharded_size)
+        self.padded_sharded_param_size = chunks[0].size()
         if self.offload_to_cpu and not sharded_param.is_meta:
             sharded_param = sharded_param.cpu()
             if self.pin_memory:
@@ -635,38 +626,15 @@ class TorchHSDPParamV2(HSDPParamV2):
                 padded_sharded_param.narrow(
                     shard_dim,
                     0,
-                    actual_shard_length,
+                    self.sharded_size[shard_dim],
                 ).copy_(sharded_param)
             self._sharded_param_data = padded_sharded_param.view(-1)
             sharded_param = padded_sharded_param.narrow(
                 shard_dim,
                 0,
-                actual_shard_length,
+                self.sharded_size[shard_dim],
             )
-        return sharded_param
 
-    @torch.no_grad()
-    def _init_sharded_param(
-        self,
-        param: nn.Parameter,
-        shard_placement_fn: Optional[Callable],
-    ) -> None:
-        """Initialize the persistent sharded parameter and communication storage."""
-        hsdp_placement = self._resolve_hsdp_placement(param, shard_placement_fn)
-        base_placements, param_data, shard_dim, dim_shard_size = self._init_shard_metadata(
-            param,
-            hsdp_placement,
-        )
-        self._init_shard_placements(
-            param_data,
-            shard_dim,
-            base_placements,
-        )
-        sharded_param = self._build_sharded_param_data(
-            param_data,
-            shard_dim,
-            dim_shard_size,
-        )
         self._sharding_spec = self._build_sharding_spec(param, param_data)
 
         self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param))

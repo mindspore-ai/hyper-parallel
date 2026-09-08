@@ -107,11 +107,21 @@ def test_ragged_write_items_and_box_views_use_logical_offsets():
     assert torch.equal(pieces[1].reshape(-1), torch.arange(32, 48))
 
 
-def test_ragged_state_dict_disables_only_its_save_plan_cache():
-    """Ragged geometry bypasses caching without permanently changing the planner."""
+def test_ragged_state_dict_keeps_save_plan_cache_enabled():
+    """Ragged geometry can use the standard save plan cache."""
     planner = StandardSavePlanner(enable_plan_caching=True)
     planner.configure_planner({"weight": _make_rank_zero_ragged_tensor()})
-    assert not planner._enable_plan_caching
+    assert planner._enable_plan_caching
 
     planner.configure_planner({"weight": torch.ones(2, 3)})
     assert planner._enable_plan_caching
+
+
+def test_ragged_state_dict_without_collectives_keeps_cache_disabled():
+    """Without plan collectives, RaggedShard remains uncached like other tensors."""
+    planner = StandardSavePlanner(enable_plan_caching=True)
+    planner.configure_planner(
+        {"weight": _make_rank_zero_ragged_tensor()},
+        use_collectives=False,
+    )
+    assert not planner._enable_plan_caching

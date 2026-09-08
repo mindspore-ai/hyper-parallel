@@ -37,3 +37,9 @@ def test_forward_and_gradfn_populates_parameter_grad():
 def test_forward_and_gradfn_parameter_grad_accumulates():
     """See impl ``test_forward_and_gradfn_parameter_grad_accumulates``."""
     return _run("test_forward_and_gradfn_parameter_grad_accumulates")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_accumulate_grad_falls_back_for_shared_non_leaf_weight():
+    """See impl ``test_accumulate_grad_falls_back_for_shared_non_leaf_weight``."""
+    return _run("test_accumulate_grad_falls_back_for_shared_non_leaf_weight")

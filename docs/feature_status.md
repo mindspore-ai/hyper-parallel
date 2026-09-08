@@ -30,7 +30,6 @@
 - [x] 自定义分布式算子注册（YAML registry + Python impl）
 - [x] Custom Shard
 - [x] DFunction 自定义分布式 autograd 函数
-- [x] parallelize_value_and_grad
 - [x] Loss Parallel（TP 训练损失并行）
 
 #### TP Styles
@@ -117,7 +116,7 @@
 - [x] AdamW
 - [x] Muon（momentum-based optimizer）
 - [x] ChainedOptimizer（Muon + AdamW 链式组合）
-- [x] get_hyper_optimizer / get_hyper_lr_scheduler
+- [x] get_hyper_optimizer
 - [x] 分片优化器（FSDP / HSDP 集成）
 - [x] gradient scaling factor + clip_grad 增强
 

@@ -21,12 +21,19 @@ side effect, and wrapping an existing DTensor.
 Device-handling on real Ascend tensors (the optimisation that avoids
 re-wrapping an already-on-Ascend tensor) is covered by the ST suite.
 """
+from copy import copy
+from unittest.mock import patch
+
 import pytest
 
 pytest.importorskip("mindspore")
 
 import mindspore as ms
+from mindspore import Parameter
+from mindspore.common.initializer import initializer
 
+from hyper_parallel.core.dtensor.dtensor import SkipDTensorDispatch
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 
 
@@ -52,6 +59,18 @@ def _stub_alias_placements(self):
 
 def _stub_device_mesh_get(self):
     return self._device_mesh
+
+
+def _keep_on_current_device(tensor, *_args, **_kwargs):
+    """Keep CPU tensors local while exercising device-agnostic copy logic."""
+    return tensor
+
+
+def _mock_clone_on_cpu(tensor):
+    """Bypass MindSpore's unavailable CPU Clone kernel in wrapper-only tests."""
+    # MindSpore does not register the Clone kernel on CPU. These tests verify
+    # HyperParallel's dispatch and wrapper semantics, not MindSpore's kernel.
+    return tensor
 
 
 # Attach the stubs for the lifetime of this test module.
@@ -99,7 +118,6 @@ def test_none_placements_raises(fake_mesh):
 def test_has_init_initializer_sets_init_device(fake_mesh, fake_placements):
     """``has_init`` tensors must have ``init_device`` set to Ascend without
     triggering an actual device move (the optimisation's "no .to()" branch)."""
-    from mindspore.common.initializer import initializer
     init_t = initializer("zeros", (4, 4), ms.float32)
     assert init_t.has_init
 
@@ -119,8 +137,6 @@ def test_wrap_existing_dtensor_reuses_mesh_and_placements(fake_mesh, fake_placem
 
     Uses a ``has_init`` initializer so the constructor stays inside the
     device-agnostic fast path (no Ascend runtime needed)."""
-    from mindspore.common.initializer import initializer
-
     # `_alias_placements` is invoked on the wrapped src; stub it with a
     # minimal layout that exposes the attribute the wrapping branch reads.
     class _Layout:
@@ -136,3 +152,145 @@ def test_wrap_existing_dtensor_reuses_mesh_and_placements(fake_mesh, fake_placem
     assert wrapped._placements == src._placements
     assert wrapped._global_shape == src._global_shape
     assert wrapped._local_tensor is src._local_tensor
+
+
+@patch.object(ms.Tensor, "clone", _mock_clone_on_cpu)
+def test_copy_dtensor_with_dispatch_disabled_returns_local_tensor(fake_mesh, fake_placements):
+    """SkipDTensorDispatch must make copy return a plain local Tensor."""
+    local = ms.Tensor([[1.0, 2.0]], dtype=ms.float32)
+    with patch.object(ms.Tensor, "to", _keep_on_current_device):
+        src = DTensorBase(local, fake_mesh, fake_placements, shape=(2, 2))
+
+        with SkipDTensorDispatch():
+            copied = copy(src)
+
+    assert isinstance(copied, ms.Tensor)
+    assert not isinstance(copied, DTensorBase)
+    assert copied.shape == src._local_tensor.shape
+    assert copied.dtype == src._local_tensor.dtype
+
+
+@patch.object(ms.Tensor, "clone", _mock_clone_on_cpu)
+def test_copy_parameter_dtensor_with_dispatch_disabled_returns_parameter(fake_mesh, fake_placements):
+    """SkipDTensorDispatch must unwrap a ParameterDTensor to Parameter."""
+    local = ms.Tensor([[1.0, 2.0]], dtype=ms.float32)
+    with patch.object(ms.Tensor, "to", _keep_on_current_device):
+        src = DTensorBase(local, fake_mesh, fake_placements, shape=(2, 2))
+        src = Parameter(src, name="weight", requires_grad=False)
+
+        with SkipDTensorDispatch():
+            copied = copy(src)
+
+    assert isinstance(copied, Parameter)
+    assert not isinstance(copied, DTensorBase)
+    assert copied.name == src.name
+    assert copied.requires_grad is False
+    assert copied.shape == src._local_tensor.shape
+
+
+@patch.object(ms.Tensor, "clone", _mock_clone_on_cpu)
+def test_copy_dtensor_with_dispatch_enabled_preserves_dtensor(fake_mesh, fake_placements):
+    """The existing DTensor copy behavior must remain unchanged."""
+    class _Layout:
+        mesh = fake_mesh
+        alias_placements = tuple(fake_placements)
+
+    local = ms.Tensor([[1.0, 2.0]], dtype=ms.float32)
+    with patch.object(ms.Tensor, "to", _keep_on_current_device):
+        src = DTensorBase(local, fake_mesh, fake_placements, shape=(2, 2))
+        src._layout = _Layout()
+
+        copied = copy(src)
+
+    assert isinstance(copied, DTensorBase)
+    assert copied._device_mesh is src._device_mesh
+    assert copied._placements == src._placements
+    assert copied._global_shape == src._global_shape
+
+
+def test_copy_uninitialized_dtensor_raises(fake_mesh, fake_placements):
+    """Copying a lazy initializer must fail instead of creating another initializer."""
+    init_t = initializer("zeros", (4, 4), ms.float32)
+    src = DTensorBase(init_t, fake_mesh, fake_placements, shape=(8, 4))
+
+    with pytest.raises(RuntimeError, match="uninitialized local tensor"):
+        copy(src)
+
+
+def _make_getitem_dtensor(placements, mesh_shape=(2,), global_shape=(4, 2)):
+    """Build a CPU DTensorBase wrapper without triggering an Ascend device move."""
+    local = ms.Tensor([[1.0, 2.0], [3.0, 4.0]], dtype=ms.float32)
+    dtensor = ms.Tensor._make_subclass(DTensorBase, local)
+    dtensor._local_tensor = local
+    dtensor._global_shape = global_shape
+
+    class _Layout:
+        pass
+
+    dtensor._layout = _Layout()
+    dtensor._layout.placements = placements
+    dtensor._layout.mesh_shape = mesh_shape
+    return dtensor
+
+
+def test_getitem_dispatches_shard_dim0_integer_case(monkeypatch):
+    """The supported owner-only case must enter Hyper-Parallel dispatch."""
+    dtensor = _make_getitem_dtensor((Shard(0),))
+    expected = object()
+    calls = []
+
+    def _dispatch(op, args, kwargs):
+        calls.append((op, args, kwargs))
+        return expected
+
+    monkeypatch.setattr(
+        "hyper_parallel.core.shard._op_dispatch._OP_DISPATCHER.dispatch",
+        _dispatch,
+    )
+
+    result = dtensor[2]
+
+    assert result is expected, f"getitem dispatch result mismatch: expected={expected!r}, got={result!r}"
+    assert len(calls) == 1, f"getitem dispatch call count mismatch: expected=1, got={len(calls)}"
+    op, args, kwargs = calls[0]
+    assert op.name == "__getitem__", f"getitem op name mismatch: expected='__getitem__', got={op.name!r}"
+    assert args[0] is dtensor, f"getitem tensor argument mismatch: expected={dtensor!r}, got={args[0]!r}"
+    assert args[1] == 2, f"getitem key argument mismatch: expected=2, got={args[1]!r}"
+    assert kwargs == {}, f"getitem kwargs mismatch: expected={{}}, got={kwargs!r}"
+
+
+@pytest.mark.parametrize(
+    "key,placements,mesh_shape",
+    [
+        (slice(None), (Shard(0),), (2,)),
+        (True, (Shard(0),), (2,)),
+        (1, (Replicate(),), (2,)),
+        (1, (Shard(0), Replicate()), (2, 1)),
+    ],
+)
+def test_getitem_other_cases_use_native_cpp(monkeypatch, key, placements, mesh_shape):
+    """Non-special indexing must bypass Hyper-Parallel and retain native behavior."""
+    dtensor = _make_getitem_dtensor(placements, mesh_shape=mesh_shape)
+    dispatched_ops = []
+
+    def _native_primitive_dispatch(op, args, kwargs):
+        op_name = getattr(op, "name", None)
+        dispatched_ops.append(op_name)
+        if op_name == "__getitem__":
+            raise AssertionError("non-special getitem unexpectedly entered owner-only dispatch")
+        local_args = [arg.to_local() if isinstance(arg, DTensorBase) else arg for arg in args]
+        return op(*local_args, **kwargs)
+
+    monkeypatch.setattr(
+        "hyper_parallel.core.shard._op_dispatch._OP_DISPATCHER.dispatch",
+        _native_primitive_dispatch,
+    )
+
+    result = dtensor[key]
+
+    assert isinstance(result, ms.Tensor), (
+        f"native getitem result type mismatch: expected={ms.Tensor}, got={type(result)}"
+    )
+    assert "__getitem__" not in dispatched_ops, (
+        f"non-special getitem should not enter owner-only dispatch, got={dispatched_ops}"
+    )

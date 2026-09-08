@@ -22,41 +22,43 @@ Execution Order:
 2. Execution layer:
    - FSDPPass (FSDP)
 3. Communication-compute overlap: AutoOverlapPass
-4. Backend compilation: InductorPass
+
+The backend compilation slot (InductorPass) is intentionally not wired yet;
+add it here when an inductor backend integration lands.
 """
 
-from typing import Any, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, List, Optional
 
+from ..parallel_config import PassConfig
 from .base import GraphPass
 from .overlap.schedule import AutoOverlapPass
 from .parallel.fsdp_pass import FSDPPass
 
 if TYPE_CHECKING:
     from torch import fx
-    from ..sharding_config import ShardingPlan
+    from ..sharding_config import PassPlan
 
 
 class PassPipeline:
-    """
-    Pass Pipeline Orchestrator
+    """Pass Pipeline Orchestrator.
 
     Automatically builds Pass execution order based on parallel configuration.
     """
 
     def __init__(
         self,
-        parallel_config: Any,
-        sharding_plan: Optional["ShardingPlan"] = None,
+        pass_config: PassConfig,
+        pass_plan: Optional["PassPlan"] = None,
     ) -> None:
         """Initialize the pipeline with a parallel config and optional plan.
 
         Args:
-            parallel_config: Parallel configuration driving pass selection.
-            sharding_plan: Optional sharding plan forwarded to partitioning
+            pass_config: Parallel configuration driving pass selection.
+            pass_plan: Optional sharding plan forwarded to partitioning
                 passes (e.g. ``FSDPPass``).
         """
-        self.config = parallel_config
-        self.sharding_plan = sharding_plan
+        self.config: PassConfig = pass_config
+        self.pass_plan = pass_plan
         self.passes: List[GraphPass] = []
 
     def build(self) -> "PassPipeline":
@@ -67,44 +69,42 @@ class PassPipeline:
 
         # 2. Execution layer: Parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):
-            self.passes.append(FSDPPass(sharding_plan=self.sharding_plan))
+            self.passes.append(FSDPPass(pass_plan=self.pass_plan))
 
         # 3. Communication-compute overlap optimization
         if getattr(self.config, "enable_overlap", False):
             self.passes.append(AutoOverlapPass())
-
-        # 4. Backend compilation (optional)
-        # self.passes.append(InductorPass())
 
         return self
 
     def run(
         self,
         graph_module: "fx.GraphModule",
-        parallel_config: Any = None,
         **kwargs: Any,
     ) -> "fx.GraphModule":
-        """
-        Execute all Passes.
+        """Execute all Passes against ``graph_module`` using the pipeline's config.
+
+        The pipeline is built from a single ``PassConfig``
+        (``from_config`` / ``__init__``); that same config drives every
+        pass. If a caller needs to run the same pipeline against a
+        different config, build a new pipeline.
 
         Args:
             graph_module: The FX GraphModule to transform.
-            parallel_config: Parallel configuration. Falls back to the config
-                the pipeline was built with when omitted.
             **kwargs: Extra keyword arguments forwarded to every pass
-                (e.g. fsdp_group_name / sharding_plan).
+                (e.g. ``model`` / ``fsdp_group_name``). ``pass_plan``
+                is auto-filled from the pipeline's plan when omitted.
 
         Returns:
             The transformed graph module.
         """
-        config = parallel_config if parallel_config is not None else self.config
-
-        # Ensure the sharding_plan is always available to passes that need it
-        # (FSDPPass reads it from kwargs), even if the caller did not
+        # Ensure the pass_plan is always available to passes that need
+        # it (FSDPPass reads it from kwargs), even if the caller did not
         # pass it explicitly.
-        if "sharding_plan" not in kwargs and self.sharding_plan is not None:
-            kwargs["sharding_plan"] = self.sharding_plan
+        if "pass_plan" not in kwargs and self.pass_plan is not None:
+            kwargs["pass_plan"] = self.pass_plan
 
+        config = self.config
         for graph_pass in self.passes:
             graph_module = graph_pass.run(graph_module, config, **kwargs)
         return graph_module
@@ -112,11 +112,11 @@ class PassPipeline:
     @classmethod
     def from_config(
         cls,
-        config: Any,
-        sharding_plan: Optional["ShardingPlan"] = None,
+        config: PassConfig,
+        pass_plan: Optional["PassPlan"] = None,
     ) -> "PassPipeline":
         """Create Pipeline from configuration."""
-        return cls(config, sharding_plan).build()
+        return cls(config, pass_plan).build()
 
 
 class DeadCodeEliminationPass(GraphPass):
@@ -127,7 +127,7 @@ class DeadCodeEliminationPass(GraphPass):
     def run(
         self,
         graph_module: "fx.GraphModule",
-        parallel_config: Any,
+        pass_config: PassConfig,
         **kwargs: Any,
     ) -> "fx.GraphModule":
         """Eliminate dead nodes and recompile the graph."""
@@ -144,7 +144,7 @@ class CanonicalizeGraphPass(GraphPass):
     def run(
         self,
         graph_module: "fx.GraphModule",
-        parallel_config: Any,
+        pass_config: PassConfig,
         **kwargs: Any,
     ) -> "fx.GraphModule":
         """Lint and recompile the graph to a canonical form."""

@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-pytest.importorskip("mindspore")
+ms = pytest.importorskip("mindspore")
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E402
@@ -31,8 +31,6 @@ from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E4
 )
 
 ensure_mindspore_platform_for_fully_shard()
-
-import mindspore as ms
 
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo
@@ -229,6 +227,34 @@ class TestParamGroupHelpers(MindSporeFullyShardUnitTest):
         self.assertEqual(layout.param_numels, [3])
         self.assertEqual(layout.total_numel, 3)
 
+    def test_reduce_scatter_copy_in_pads_each_balanced_dim_zero_chunk(self):
+        """
+        Feature: Fused balanced dim-0 reduce-scatter packing.
+        Description: Pack six elements for a four-rank 2, 2, 1, 1 shard assignment.
+        Expectation: Each short rank has its own trailing padding in the fused communication row.
+        """
+        hsdp_param = _fake_param(
+            [1.0, 2.0],
+            mesh_info=_mesh_info(FSDPMeshInfo, shard_group="pg"),
+        )
+        hsdp_param.shard_world_size = 4
+        hsdp_param._orig_size = (6,)
+        hsdp_param.sharded_size = (1,)
+        hsdp_param.padded_sharded_param_size = (2,)
+        full_grad = ms.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], ms.float32)
+        output = ms.mint.empty((8,), dtype=ms.float32)
+
+        reduce_scatter_copy_in([hsdp_param], [full_grad], output, world_size=4)
+
+        packed_grad = param_group_module.copy_without_bumping_version.call_args.args[1]
+        np.testing.assert_allclose(
+            packed_grad.asnumpy(),
+            np.array(
+                [[1.0, 2.0], [3.0, 4.0], [5.0, 0.0], [6.0, 0.0]],
+                dtype=np.float32,
+            ),
+        )
+
 
 class TestAllGatherBuckets(MindSporeFullyShardUnitTest):
     """Test parameter-level routing into fused all-gather buckets."""
@@ -301,6 +327,44 @@ class TestAllGatherBuckets(MindSporeFullyShardUnitTest):
         np.testing.assert_allclose(
             copy_calls[1].args[1].reshape(4, 4).asnumpy(),
             np.arange(16, dtype=np.float32).reshape(4, 4),
+        )
+        self.assertIsNone(all_gather_bucket.all_gather_result)
+
+    def test_copy_out_removes_each_balanced_dim_zero_chunk_padding(self):
+        """
+        Feature: Fused balanced dim-0 all-gather reconstruction.
+        Description: Copy out four gathered slots for a six-element 2, 2, 1, 1 assignment.
+        Expectation: The stable logical destination receives all six values without padding.
+        """
+        hsdp_param = _fake_param(
+            [0.0, 1.0],
+            mesh_info=_mesh_info(FSDPMeshInfo, shard_group="pg"),
+        )
+        hsdp_param.shard_world_size = 4
+        hsdp_param._orig_size = (6,)
+        hsdp_param.sharded_size = (1,)
+        hsdp_param.padded_sharded_param_size = (2,)
+        hsdp_param.unsharded_param_buffers = [ms.mint.empty((8,), dtype=ms.float32)]
+        group = HSDPParamGroup([hsdp_param], device="cpu")
+        group._init_all_gather_buckets()
+        all_gather_bucket = group.all_gather_buckets[0]
+        gathered_data = ms.Tensor(
+            [0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 5.0, 0.0],
+            ms.float32,
+        )
+        all_gather_bucket.all_gather_result = AllGatherResult(
+            all_gather_input=None,
+            all_gather_output=gathered_data,
+            handle=None,
+        )
+
+        all_gather_bucket.copy_out()
+
+        destination, source = param_group_module.copy_without_bumping_version.call_args.args
+        self.assertEqual(destination.shape, (8,))
+        np.testing.assert_allclose(
+            source.asnumpy(),
+            np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0], dtype=np.float32),
         )
         self.assertIsNone(all_gather_bucket.all_gather_result)
 

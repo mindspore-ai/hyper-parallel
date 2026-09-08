@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Dict, Iterator, List, Optional, Set
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -82,8 +83,9 @@ def _collect_device_storage_ptrs(tensors: Any) -> Set[int]:
     storage_ptrs = set()
 
     def _collect(x):
-        if isinstance(x, platform.Tensor) and str(x.device).lower() != "cpu":
-            storage_ptrs.add(x.untyped_storage().data_ptr())
+        local_tensor = x.to_local() if isinstance(x, DTensor) else x
+        if isinstance(local_tensor, platform.Tensor) and str(local_tensor.device).lower() != "cpu":
+            storage_ptrs.add(local_tensor.untyped_storage().data_ptr())
         return x
 
     platform.tree_map(_collect, tensors)
@@ -162,8 +164,6 @@ class SwapTensor:
         """Reallocate device memory on compute stream."""
         if self._state == self.STATE_NON_TENSOR or self._duplicate_swap:
             return
-        if self._group_managed:
-            return
 
         if self._state != self.STATE_HOST:
             return
@@ -193,6 +193,27 @@ class SwapTensor:
                 self.val.data.copy_(self.val_cpu, non_blocking=True)
             else:
                 self.val.untyped_storage().copy_(self.val_cpu.untyped_storage(), non_blocking=True)
+        self._state = self.STATE_H2D
+
+    def async_group_load(self, source):
+        """Copy a packed device-buffer slice back into the original storage."""
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
+            return
+        if not self._group_managed:
+            return
+        if self._state != self.STATE_HOST:
+            warnings.warn(
+                f"[SwapTensor.async_group_load] Invalid state: current={self._state}, "
+                f"expected 'host'. Operation skipped."
+            )
+            return
+        if self.val.untyped_storage().size() != self.storage_size:
+            raise RuntimeError(
+                f"Cannot load grouped tensor from {self.funcname}: device storage was not restored. "
+                f"expected size:{self.storage_size}, current size:{self.val.untyped_storage().size()}"
+            )
+        with platform.preserve_version_counter(self.val):
+            self.val.copy_(source.reshape(self.val.shape), non_blocking=True)
         self._state = self.STATE_H2D
 
     def wait_load(self):
@@ -402,8 +423,8 @@ class SwapGroup:
 
     Non-slice tensors within the group are packed into bounded contiguous device
     buffers before D2H transfer, and loaded back from bounded H2D buffers.
-    Each tensor then aliases its slice of the relevant buffer via
-    ``Tensor.set_()``, avoiding per-tensor memory fragmentation.
+    Each packed slice is copied back into its tensor's original device storage so
+    autograd views that alias that storage remain valid during backward.
 
     Slice tensors (storage larger than logical data) fall back to the original
     per-tensor copy path.
@@ -603,12 +624,11 @@ class SwapGroup:
         """Prepare storage and launch async load for all storages in the group.
 
         Non-slice tensors are loaded from pinned CPU memory into bounded
-        contiguous device buffers.  Tensors will alias their slice of the
-        relevant buffer after ``wait_load``.  Slice tensors use the existing
-        per-tensor path.
+        contiguous device buffers, then copied device-to-device into their
+        original storages.  Slice tensors use the existing per-tensor path.
         """
-        # Resize device storage for slice tensors only.
-        # Group-managed tensors skip resize_device_storage via _group_managed flag.
+        # Restore original storages before scheduling copies. Keeping the same
+        # storage object is required for autograd-saved views of packed tensors.
         with platform.no_grad():
             for storage in self._storages:
                 storage.resize_device_storage()
@@ -633,9 +653,15 @@ class SwapGroup:
                     # One-shot H2D per packed bucket.
                     group_device_bufs[bucket_key].copy_(cpu_buf[:numel], non_blocking=True)
                 self._group_device_buf = group_device_bufs
-                # Mirror async_load's STATE_H2D transition: H2D is in flight.
-                for st, _, _ in self._packed_tensor_info:
-                    st._state = SwapTensor.STATE_H2D
+
+                # Unpack with D2D copies into the original storages. Rebinding
+                # st.val with set_() would leave existing aliases on freed storage.
+                for st, bucket_key, element_offset in self._packed_tensor_info:
+                    group_device_buf = group_device_bufs.get(bucket_key)
+                    if group_device_buf is None:
+                        continue
+                    source = group_device_buf[element_offset:element_offset + st.val.numel()]
+                    st.async_group_load(source)
 
             # Slice tensors use the existing per-tensor path.
             # Group-managed tensors skip async_load via _group_managed flag.
@@ -644,13 +670,7 @@ class SwapGroup:
             self._load_event.record(copy_stream)
 
     def wait_load(self):
-        """Wait for load to complete for all storages in the group.
-
-        After the H2D transfer completes, each group-managed tensor is made to
-        alias its slice of the contiguous device buffer via ``Tensor.set_()``.
-        The buffer stays alive through the tensors' own storage references after
-        ``_group_device_buf`` is cleared here.
-        """
+        """Wait for grouped H2D and D2D loads to complete."""
         if self._load_event is None:
             raise RuntimeError(
                 f"SwapGroup '{self.group_name}' wait_load() called before launch_load()."
@@ -660,20 +680,6 @@ class SwapGroup:
         with platform.no_grad(), stream_context(compute_stream):
             self._load_event.wait(compute_stream)
             self._load_event = None
-            # Restore group-managed tensors: alias into the contiguous device buffer.
-            if self._group_device_buf is not None:
-                prev_key = None
-                group_storage = None
-                for st, bucket_key, element_offset in self._packed_tensor_info:
-                    if bucket_key != prev_key:
-                        group_device_buf = self._group_device_buf.get(bucket_key)
-                        group_storage = group_device_buf.untyped_storage() if group_device_buf is not None else None
-                        prev_key = bucket_key
-                    if group_storage is None:
-                        continue
-                    with platform.preserve_version_counter(st.val):
-                        st.val.set_(group_storage, element_offset, st.val.shape, st.val.stride())
-                    st._state = SwapTensor.STATE_DEVICE
             for storage in self._storages:
                 storage.wait_load()
         self._storages.clear()
@@ -687,10 +693,8 @@ class SwapGroup:
             for buf in self._group_cpu_buf.values():
                 _return_cpu_pinned_buf(buf)
         self._group_cpu_buf = None
-        # Device buffer: the pool holds the staging reference; just drop
-        # the local reference.  Tensors aliasing _group_device_buf's
-        # storage keep it alive via their own storage references until
-        # they are consumed in backward.
+        # D2D unpack has restored each original storage, so the staging device
+        # buffers can be released after the load event reaches the compute stream.
         self._group_device_buf = None
         self._packed_tensor_info = []
         self._packed_buckets = {}
@@ -702,6 +706,12 @@ class SwapManager:
     """Singleton manager for swap groups and their operations."""
     _instance: Optional["SwapManager"] = None
     _lock = threading.Lock()
+    _FORWARD_PREFETCH_HOOK_HANDLE_ATTRS = (
+        "_swap_forward_pre_hook_handle",
+        "_swap_forward_hook_handle",
+        "_swap_backward_pre_hook_handle",
+        "_swap_backward_hook_handle",
+    )
 
     def __init__(self) -> None:
         """Initialize process-local swap groups once for the singleton."""
@@ -814,6 +824,26 @@ class SwapManager:
         if group is None:
             return False
         return group.is_last_group
+
+    def unregister_forward_prefetch_hooks(self, module: Any) -> int:
+        """Remove hooks installed by :meth:`set_forward_prefetch_layer`.
+
+        Args:
+            module: Module whose layer-level swap hooks should be removed.
+
+        Returns:
+            Number of removed hook handles.
+        """
+        removed_count = 0
+        for attr_name in self._FORWARD_PREFETCH_HOOK_HANDLE_ATTRS:
+            if not hasattr(module, attr_name):
+                continue
+            handle = getattr(module, attr_name)
+            if handle is not None:
+                handle.remove()
+            delattr(module, attr_name)
+            removed_count += 1
+        return removed_count
 
     def set_forward_prefetch_layer(self, first_layer, second_layer):
         """

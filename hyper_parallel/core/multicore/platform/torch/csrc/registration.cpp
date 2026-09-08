@@ -4,14 +4,12 @@
  * PyTorch out-of-tree operator registration for MoE-FFN operators.
  * Registers into the 'hyper_parallel' namespace — does NOT modify aten:: or op-plugin.
  *
- * After building (setup.py build_ext --inplace), import with:
- *   import hyper_parallel.core.multicore.platform.torch  # loads this .so
- * Or call directly after import:
+ * The packaged adapter is loaded lazily through torch.ops.load_library().
+ * Static initializers register the operators, which are then called as:
  *   torch.ops.hyper_parallel.mega_moe(...)
  *   torch.ops.hyper_parallel.mega_moe_grad(...)
  */
 #include <torch/library.h>
-#include <torch/extension.h>
 
 TORCH_LIBRARY(hyper_parallel, m) {
     // -------------------------------------------------------------------------
@@ -99,11 +97,3 @@ TORCH_LIBRARY(hyper_parallel, m) {
         "  int seq_size"
         ") -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!))");
 }
-
-// Python module entry point — required for `import hyper_parallel_mega_moe_pta`.
-// Use an explicit name rather than TORCH_EXTENSION_NAME to avoid depending on
-// the build system injecting -DTORCH_EXTENSION_NAME (not all NpuExtension
-// versions guarantee this macro is defined).
-// TORCH_LIBRARY_IMPL registrations in mega_moe.cpp / mega_moe_grad.cpp fire
-// via static initializers when the .so is loaded.
-PYBIND11_MODULE(hyper_parallel_mega_moe_pta, m) {}

@@ -20,7 +20,6 @@ Muon 优化器针对特定参数组（如 embedding、projection 层）使用 mo
 | `Muon` | Momentum-based 优化器 |
 | `ChainedOptimizer` | 链式优化器（Muon+AdamW 组合） |
 | `get_hyper_optimizer` | 优化器工厂函数 |
-| `get_hyper_lr_scheduler` | 学习率调度器工厂函数 |
 
 ---
 
@@ -46,20 +45,7 @@ optimizer = get_hyper_optimizer(
 - `adamw_params`：AdamW 优化的参数组（通常为 embedding、bias 等参数）
 - 任一参数组为空列表时，对应优化器不创建
 
-### 2. 使用学习率调度器
-
-```python
-from hyper_parallel.core.optimizer import get_hyper_lr_scheduler
-
-scheduler = get_hyper_lr_scheduler(
-    optimizer=optimizer,
-    scheduler_type="cosine",
-    total_steps=10000,
-    warmup_steps=500,
-)
-```
-
-### 3. 参数分组示例
+### 2. 参数分组示例
 
 ```python
 # 将模型参数分为 Muon 和 AdamW 两组
@@ -86,7 +72,7 @@ optimizer = get_hyper_optimizer(
 )
 ```
 
-### 4. 训练循环
+### 3. 训练循环
 
 ```python
 for epoch in range(num_epochs):

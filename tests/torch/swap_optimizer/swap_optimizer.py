@@ -22,7 +22,7 @@ import torch
 
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.optimizer import SwapOptimizerConfig, swap_optimizer
-from hyper_parallel.core.optimizer.adamw import AdamW as HyperAdamW
+from hyper_parallel.core.optimizer.adamw import AdamW as NewAdamW
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.utils import init_dist
@@ -645,18 +645,18 @@ def test_torch_adam_amsgrad_swap_optimizer_parameter_align() -> None:
     )
 
 
-def test_hyper_adamw_swap_optimizer_parameter_align() -> None:
+def test_new_adamw_swap_optimizer_parameter_align() -> None:
     """
     Feature: HyperParallel AdamW packed swap optimizer.
     Description: Train with HyperParallel AdamW and the same optimizer wrapped in explicitly enabled packed swap mode.
     Expectation: Results align; packed swap storage is used and lowers peak memory.
     """
-    print("test_hyper_adamw_swap_optimizer_parameter_align")
+    print("test_new_adamw_swap_optimizer_parameter_align")
     base_group_steps = []
     swap_group_steps = []
     base_params, base_optimizer, base_losses, base_peak_memory = _train(
         use_swap=False,
-        optimizer_cls=HyperAdamW,
+        optimizer_cls=NewAdamW,
         group_step_history=base_group_steps,
     )
     del base_optimizer
@@ -664,7 +664,7 @@ def test_hyper_adamw_swap_optimizer_parameter_align() -> None:
 
     swap_params, swap_optimizer_inst, swap_losses, swap_peak_memory = _train(
         use_swap=True,
-        optimizer_cls=HyperAdamW,
+        optimizer_cls=NewAdamW,
         group_step_history=swap_group_steps,
         packed_swap=True,
     )
@@ -679,7 +679,7 @@ def test_hyper_adamw_swap_optimizer_parameter_align() -> None:
     _assert_peak_memory_reduced(base_peak_memory, swap_peak_memory)
 
 
-def test_hyper_adamw_amsgrad_swap_optimizer_parameter_align() -> None:
+def test_new_adamw_amsgrad_swap_optimizer_parameter_align() -> None:
     """
     Feature: HyperParallel AdamW AMSGrad packed swap optimizer.
     Description: Train with HyperParallel AdamW(amsgrad=True) and the same optimizer in explicitly enabled packed
@@ -687,8 +687,8 @@ def test_hyper_adamw_amsgrad_swap_optimizer_parameter_align() -> None:
     Expectation: Results align; packed swap storage is used and lowers peak memory.
     """
     _run_optimizer_align_case(
-        "test_hyper_adamw_amsgrad_swap_optimizer_parameter_align",
-        HyperAdamW,
+        "test_new_adamw_amsgrad_swap_optimizer_parameter_align",
+        NewAdamW,
         optimizer_extra_kwargs={"amsgrad": True},
         expected_state_count=_AMSGRAD_STATE_COUNT,
         verify_packed_swap=True,
@@ -734,7 +734,7 @@ def test_fully_shard_adamw_mixed_precision_swap_optimizer_parameter_align() -> N
 
     fully_shard_adamw_cases = (
         ("torch_adamw", torch.optim.AdamW),
-        ("hyper_adamw", HyperAdamW),
+        ("new_adamw", NewAdamW),
     )
 
     for case_name, optimizer_cls in fully_shard_adamw_cases:
@@ -1005,7 +1005,7 @@ def test_torch_adam_swap_optimizer_checkpoint_host_state() -> None:
     checkpoint_cases = (
         ("test_torch_adam_swap_optimizer_checkpoint_host_state", torch.optim.Adam),
         ("test_torch_adamw_swap_optimizer_checkpoint_host_state", torch.optim.AdamW),
-        ("test_hyper_adamw_swap_optimizer_checkpoint_host_state", HyperAdamW),
+        ("test_new_adamw_swap_optimizer_checkpoint_host_state", NewAdamW),
     )
     for case_name, optimizer_cls in checkpoint_cases:
         _run_optimizer_checkpoint_host_state_case(case_name, optimizer_cls)

@@ -1,4 +1,4 @@
-# Copyright 2024-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -292,6 +292,17 @@ if __name__ == "__main__":
     if args.framework == "hyper_v2" and args.search_config:
         _run_hyper_v2_search(parser, args)
         sys.exit(0)
+
+    if args.framework == "hyper_v2" and args.devices is None:
+        # An AutoModels train.yaml carries no world size: the runtime derives
+        # the data-parallel replicate degree from it at launch. Without -d the
+        # cluster would be inferred as d*t*cp*p, which understates HSDP runs
+        # and silently invalidates every candidate in the search.
+        parser.error(
+            "-d/--devices is required for hyper_v2: the device count is not "
+            "expressible in an AutoModels train.yaml. Alternatively set "
+            "context.device_num in the config."
+        )
 
     set_verbose_level(args.verbosity)
     dims = Dim.get_dims(args.dimensions)

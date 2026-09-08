@@ -26,7 +26,7 @@ import torch
 from hyper_parallel.core.optimizer.swap_optimizer_base import PipelineSwapRuntime, SwapSlot
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.torch.swap_optimizer.adapters import (
-    TorchHyperAdamWAdapter,
+    TorchNewAdamWAdapter,
     TorchNativeAdamAdapter,
     TorchNativeAdamWAdapter,
 )
@@ -576,7 +576,7 @@ class TorchSwapOptimizer(torch.optim.Optimizer):
     """Torch optimizer wrapper for Adam/AdamW state swap."""
 
     _is_swap_optimizer = True
-    _adapters = (TorchHyperAdamWAdapter, TorchNativeAdamAdapter, TorchNativeAdamWAdapter)
+    _adapters = (TorchNewAdamWAdapter, TorchNativeAdamAdapter, TorchNativeAdamWAdapter)
 
     def __init__(self, optimizer: Any, config: Any) -> None:
         # Do not call ``torch.optim.Optimizer.__init__``: the wrapped base

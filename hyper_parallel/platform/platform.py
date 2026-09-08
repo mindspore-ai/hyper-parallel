@@ -132,6 +132,28 @@ def get_platform():
 EXISTING_COMM_GROUPS = {}
 
 
+def _build_p2p_edge_rank_lists(pp_rank_list: list[int], include_wrap: bool = False) -> list[tuple[int, int]]:
+    """Build normalized two-rank groups for adjacent pipeline ranks."""
+    if not isinstance(pp_rank_list, (list, tuple)):
+        raise ValueError(
+            f"pp_rank_list must be a list or tuple of integer ranks, but got {type(pp_rank_list)}."
+        )
+    if any(not isinstance(rank, int) or isinstance(rank, bool) for rank in pp_rank_list):
+        raise ValueError(f"pp_rank_list must contain only integer ranks, but got {pp_rank_list}.")
+    if len(set(pp_rank_list)) != len(pp_rank_list):
+        raise ValueError(f"pp_rank_list must not contain duplicate ranks, but got {pp_rank_list}.")
+    if len(pp_rank_list) < 2:
+        return []
+
+    edge_rank_lists = {
+        tuple(sorted((src_rank, dst_rank)))
+        for src_rank, dst_rank in zip(pp_rank_list, pp_rank_list[1:])
+    }
+    if include_wrap and len(pp_rank_list) > 2:
+        edge_rank_lists.add(tuple(sorted((pp_rank_list[-1], pp_rank_list[0]))))
+    return sorted(edge_rank_lists)
+
+
 class Platform:
     """Platform api"""
     current_grad_handle = None
@@ -488,6 +510,19 @@ class Platform:
             The same tensor with requires_grad set to True.
         """
         raise NotImplementedError("Platform subclasses must implement set_tensor_requires_grad")
+
+    @staticmethod
+    def detach(input_tensor):
+        """Return a tensor for a backend data-only operation.
+
+        This is currently a temporary compatibility hook used by the
+        distributed-checkpoint data path. Backends with Tensor-level autograd
+        support should return a detached view; backends whose checkpoint path
+        does not manage gradients may return the original tensor. A dedicated
+        gradient API can replace this hook when cross-backend detach semantics
+        are required elsewhere.
+        """
+        raise NotImplementedError("Platform subclasses must implement detach")
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
@@ -1103,6 +1138,26 @@ class Platform:
         """Load data into a parameter, handling framework-specific semantics."""
         raise NotImplementedError("Platform subclasses must implement load_into_param")
 
+    @staticmethod
+    def new_group(rank_list):
+        """Create a new communication group with the specified ranks.
+
+        Unlike :meth:`create_group`, the returned group is neither looked up in nor
+        registered to the global group cache, so the caller owns its lifetime and can
+        drop it once the communication through it is done.
+
+        Note:
+            Creating a group is a collective call, so every rank must invoke this with
+            the same groups in the same order.
+
+        Args:
+            rank_list (list): List of ranks to include in the group.
+
+        Returns:
+            The newly created communication group.
+        """
+        raise NotImplementedError("Platform subclasses must implement new_group")
+
     def create_group(self, rank_list):
         """Create or retrieve a communication group with the specified ranks.
 
@@ -1122,6 +1177,29 @@ class Platform:
         group = self._create_group(rank_list)
         EXISTING_COMM_GROUPS[group_key] = group
         return group
+
+    @staticmethod
+    def create_p2p_multi_stream_groups(
+            pp_rank_list: list[int],
+            include_wrap: bool = False,
+    ) -> dict[int, Any]:
+        """Create P2P groups that enable independent communication streams.
+
+        Backends may use different process-group initialization protocols, but
+        must return the same logical mapping from peer global rank to the raw
+        process group shared by that two-rank pipeline edge.
+
+        Args:
+            pp_rank_list: Ordered global ranks in one pipeline-parallel group.
+            include_wrap: Whether the last and first ranks also communicate,
+                as required by interleaved virtual pipeline chunks.
+
+        Returns:
+            A mapping from adjacent peer global rank to its two-rank process
+            group. A rank at a linear pipeline boundary has one entry; a
+            middle rank normally has two.
+        """
+        raise NotImplementedError("Platform subclasses must implement create_p2p_multi_stream_groups")
 
     @staticmethod
     def _process_current_handle():
@@ -1365,6 +1443,18 @@ class Platform:
             The current stream object.
         """
         raise NotImplementedError("Platform subclasses must implement get_current_stream")
+
+    def synchronize(self) -> None:
+        """Block the host until the work queued on the current device stream has finished.
+
+        A collective issued with ``async_op=False`` is only ordered against the stream: the
+        handle is waited on, but the transfer itself can still be queued when the call
+        returns. Anything that releases what those operations still read - tearing down a
+        communication group, freeing a buffer - has to synchronize first.
+
+        Backends whose collectives run on the host have nothing to drain and may no-op.
+        """
+        raise NotImplementedError("Platform subclasses must implement synchronize")
 
     def new_event(self):
         """Create a new event for stream synchronization.

@@ -31,41 +31,45 @@ The mesh / layout chain is mocked so the test stays hardware-agnostic.
 # pylint: disable=protected-access
 import os
 import unittest
+from typing import Any
 from unittest.mock import patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.core.utils import shape_utils
+from hyper_parallel.core.utils import shape_utils  # pylint: disable=wrong-import-position
 
 
 class _FakeShardMesh:
     """Mesh stand-in that returns canned ``(num_devices, local_rank)`` per axis.
 
-    Named ``_FakeShardMesh`` (not ``_FakeMesh``) to disambiguate from the
-    flatten-alias fake mesh in ``tests/ut/trainer/test_parallel_dims.py``.
+    Named ``_FakeShardMesh`` to distinguish it from other mesh test doubles.
 
     Args:
         axis_info: Map from axis name (e.g. ``"dp"``) to ``(num_devices, local_rank)``.
     """
 
-    def __init__(self, axis_info):
+    def __init__(self, axis_info: dict[str, tuple[int, int]]) -> None:
+        """Store mesh size and local rank information by axis."""
         self._info = axis_info
 
-    def get_device_num_along_axis(self, axis):
+    def get_device_num_along_axis(self, axis: str) -> int:
+        """Return the configured device count for an axis."""
         return self._info[axis][0]
 
-    def get_local_rank(self, axis):
+    def get_local_rank(self, axis: str) -> int:
+        """Return the configured local rank for an axis."""
         return self._info[axis][1]
 
 
 class _FakeLayout:
     """Stub layout exposing only the fields ``compute_local_shape_and_global_offset`` reads."""
 
-    def __init__(self, alias_tensor_map, mesh):
+    def __init__(self, alias_tensor_map: Any, mesh: _FakeShardMesh) -> None:
+        """Store the tensor map and mesh exposed to the function under test."""
         self.alias_tensor_map = alias_tensor_map
         self.mesh = mesh
 
-    def placement_to_tensor_map(self, ndim):  # pylint: disable=unused-argument
+    def placement_to_tensor_map(self, ndim: int) -> None:  # pylint: disable=unused-argument
         """Real Layout populates ``alias_tensor_map`` from Placement objects here.
 
         We pre-populate ``alias_tensor_map`` in the constructor, so this is a no-op.

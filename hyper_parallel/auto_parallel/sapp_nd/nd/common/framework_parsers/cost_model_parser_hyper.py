@@ -12,36 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""HyperParallel native train.yaml parser (Hyper V2).
+"""HyperParallel AutoModels ``train.yaml`` parser (Hyper V2).
 
 Parses the HyperParallel YAML configuration format
-(``examples/qwen3_5_0_8b_base/train.yaml``) and populates
-a :class:`CostModelConfig` for memory estimation.
+(``hyper_parallel/models/qwen3_moe/recipes/train.yaml``) and
+populates a :class:`CostModelConfig` for memory estimation.
 
-Model hyperparameters are resolved by importing the model module's
-``_build_config`` function directly (by naming convention) rather than
-through the ``ModelSpec`` registry.  This avoids coupling the
-memory-estimation pipeline to the model registration interface.
+Model hyperparameters are resolved with the same Transformers
+``AutoConfig.from_pretrained`` path used by AutoModels. Legacy
+``model.config_overrides`` remains supported for standalone search configs.
 
 Expected YAML structure::
 
     model:
-      name: qwen3_5                    # model spec key
-      config_overrides:
-        num_hidden_layers: 4
-        hidden_size: 3584
-        ...
+      _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
+      pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+      torch_dtype: bfloat16
 
-    train:
-      accelerator:
-        dp_shard: 4                    # FSDP shard degree
-      gradient_checkpointing:
-        activation_checkpoint: none    # none | full | selective
+    training:
       global_batch_size: 4
       micro_batch_size: 1
 
-    data:
-      max_seq_len: 64
+    accelerator:
+      tp_size: 1
+      pp_size: 1
+
+    fsdp_config:
+      dp_shard_size: 4
+
+    activation_checkpoint:
+      mode: full
 """
 # pylint: disable=too-many-locals,too-many-statements,too-many-branches
 import logging
@@ -50,19 +50,49 @@ from typing import Any, Dict
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import _CostModelParser
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import (
+    CWrap,
+    check_and_apply_custom_hook,
+    custom_default_transformer,
+)
+from hyper_parallel.auto_parallel._hf_model_spec import (
+    is_auto_models_schema,
+    resolve_hf_model_spec,
+)
 
 logger = logging.getLogger(__name__)
+
+
+
+def custom_vision_tower(ccfg: Any) -> None:
+    """Operation profile of a vision-transformer tower.
+
+    Lives here rather than in ``arch_hooks`` because it is only ever used by
+    the multimodal split below.
+    """
+    custom_default_transformer(ccfg)
+    # ViT blocks use a plain two-matmul MLP, not the LLM's gated triple.
+    ccfg.n_ffMM = 2
+    ccfg.n_ffParamCast = ccfg.n_ffMM if not ccfg.has_op else 0
+    ccfg.n_normOp = 2
+    ccfg.n_gather = 4
+
+
+def custom_vision_tower_hook(evaluator: Any) -> None:
+    """Apply the vision-tower profile to an evaluator or a config."""
+    if not hasattr(evaluator, "set_ccfg"):
+        evaluator = CWrap(evaluator)
+    evaluator.set_ccfg(custom_vision_tower)
 
 
 class CostModelParserHyperV2(_CostModelParser):
     """Parser for HyperParallel native train.yaml configuration format.
 
     This parser replaces the placeholder ``CostModelParserHyperparallel``
-    which was written for an older TorchTitan TOML format.  It reads the
-    current Hyper YAML schema (``model.name`` + ``train.accelerator``)
-    and resolves model parameters by importing ``_build_config`` directly
-    from the model module.  When the model module is not available it
-    falls back to reading hyperparameters from ``config_overrides``.
+    which was written for an older TorchTitan TOML format. It reads the
+    AutoModels Trainer schema and resolves model parameters through the
+    Transformers configuration pipeline. Legacy ``config_overrides`` input
+    remains available for standalone cost-model search files.
     """
 
     def parse(self) -> None:
@@ -71,9 +101,11 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.multimodal = False
         self.ccfg.mm_ccfgs = None
         self.ccfg.mm_order = None
+        self._vision_spec = None
 
-        # Resolve model hyperparameters via Hyper's own config pipeline
+        # Resolve model hyperparameters via AutoModels' Transformers pipeline.
         self._resolve_model_config_pipeline()
+        self._resolve_sequence_length()
 
         # --- Parallelism ---
         self._parse_parallelism()
@@ -108,202 +140,222 @@ class CostModelParserHyperV2(_CostModelParser):
         self._init_offset()
         self.ccfg.overwrite_eval_functions = {}
 
+        # --- Multimodal split (vision-language models only) ---
+        self._resolve_multimodal()
+
     def _resolve_model_config_pipeline(self):
         """Resolve model hyperparameters to populate ``ccfg``.
 
-        Tries to import ``_build_config`` directly from the model module.
-        On failure, falls back to reading hyperparameters from
-        ``config_overrides``.  This avoids coupling the ModelSpec
-        registration interface to the memory-estimation pipeline.
+        Delegates to the shared AutoModels resolver, which reads the same
+        Transformers configuration as the Trainer and falls back to
+        ``model.config_overrides`` for standalone cost-model search files.
+        A vision-language config additionally yields a ``vision`` sub-spec,
+        held here until :meth:`_resolve_multimodal` can build its submodule.
         """
-        try:
-            self._resolve_via_direct_import()
-        except (ValueError, TypeError) as exc:
-            logger.debug(
-                "Direct _build_config failed (%s); "
-                "falling back to config_overrides", exc
-            )
-            self._resolve_from_config_overrides()
-
-    def _resolve_via_direct_import(self):
-        """Import ``_build_config`` directly from the model module.
-
-        Each model module may expose an internal ``_build_config(cfg)``
-        function (by naming convention) that returns a model-specific
-        Config object.  The parser imports it directly rather than
-        going through the ``ModelSpec`` registry.
-
-        Raises:
-            ValueError: If the model module or ``_build_config`` is not found.
-        """
-        # pylint: disable=import-outside-toplevel
-        from hyper_parallel.trainer.config import (
-            _instantiate_recursive, HyperTrainerConfig,
+        spec = resolve_hf_model_spec(
+            self._model_section(), self._visual_seq_len_override()
         )
-
-        config_dict = self._config_to_flat_dict(self.config)
-        trainer_cfg = _instantiate_recursive(HyperTrainerConfig, config_dict)
-        self.ccfg.model_name = trainer_cfg.model.name
-
-        import importlib  # pylint: disable=import-outside-toplevel
-        try:
-            mod = importlib.import_module(
-                f"hyper_parallel.models.{trainer_cfg.model.name}")
-        except (ImportError, OSError) as exc:
-            raise ValueError(
-                f"Model module '{trainer_cfg.model.name}' not found: {exc}"
-            ) from exc
-
-        build_config_fn = getattr(mod, "_build_config", None)
-        if build_config_fn is None:
-            raise ValueError(
-                f"Model module '{trainer_cfg.model.name}' has no "
-                f"_build_config function. The parser falls back to "
-                f"config_overrides."
-            )
-
-        model_config = build_config_fn(trainer_cfg)
-        self._map_model_config_to_ccfg(model_config)
-
-    def _map_model_config_to_ccfg(self, model_config) -> None:
-        """Map model-specific Config object fields to ``ccfg``."""
-        self.ccfg.h = int(model_config.hidden_size)
-        self.ccfg.n_lay = int(model_config.num_hidden_layers)
-        self.ccfg.a = int(model_config.num_attention_heads)
-        self.ccfg.hff = int(model_config.intermediate_size)
-        self.ccfg.v = int(model_config.vocab_size)
-        self.ccfg.s = int(model_config.max_position_embeddings)
-
-        self.ccfg.n_kv = int(getattr(model_config, "num_key_value_heads", 0))
-        if not self.ccfg.n_kv:
-            self.ccfg.n_kv = self.ccfg.a
-        self.ccfg.dh = self.ccfg.h / self.ccfg.a
-        self.ccfg.dc_kv = int(getattr(model_config, "kv_lora_rank", 0))
-        self.ccfg.dc_q = int(getattr(model_config, "q_lora_rank", 0))
-        self.ccfg.dhr = int(getattr(model_config, "qk_rope_head_dim", 0))
-
-        self.ccfg.n_exp = 1
-        self.ccfg.n_chosen_exp = 1
-        self.ccfg.n_shared_exp = 0
-        self.ccfg.hff_exp = self.ccfg.hff
-        self.ccfg.cap_fact = 1
-        self.ccfg.t_exp = self.ccfg.t
-        self.ccfg.d_exp = self.ccfg.d
-        self.ccfg.gmm = False
-        self.ccfg.k_1st_dense = 0
-        num_exp = int(getattr(model_config, "num_experts", 1))
-        if num_exp > 1:
-            self.ccfg.n_exp = max(1, num_exp)
-            self.ccfg.n_chosen_exp = max(
-                1, int(getattr(model_config, "num_experts_per_tok", 1)))
-            self.ccfg.n_shared_exp = int(
-                getattr(model_config, "n_shared_experts",
-                        getattr(model_config, "num_shared_experts", 0)))
-            moe_inter = int(getattr(model_config, "moe_intermediate_size", 0))
-            if moe_inter:
-                self.ccfg.hff_exp = moe_inter
-            self.ccfg.k_1st_dense = int(
-                getattr(model_config, "first_k_dense_replace", 0))
-            self.ccfg.gmm = True
-
-        self.ccfg.n_mtp = int(getattr(model_config, "mtp_depth", 0))
-        # Match the MF parser: when ``mtp_depth > 0`` the MTP layers
-        # participate in pipeline offset balancing (default True); when there
-        # is no MTP (``n_mtp == 0``) they are excluded, mirroring the MF
-        # parser's ``num_nextn_predict_layers`` fallback which sets
-        # ``is_mtp_in_offset = False``.
-        self.ccfg.is_mtp_in_offset = bool(self.ccfg.n_mtp)
-        self.ccfg.multiple_of = int(getattr(model_config, "multiple_of", 256))
-        self.ccfg.fdm = float(getattr(model_config, "ffn_dim_multiplier", 1.0))
-
+        self._vision_spec = spec.pop("vision", None)
+        self._apply_spec(self.ccfg, spec)
         self._resolve_device_capacity()
 
-    def _resolve_from_config_overrides(self) -> None:
-        """Populate ``ccfg`` directly from ``config_overrides``.
+    def _model_section(self) -> Dict[str, Any]:
+        """Return the ``model`` section as a plain mapping."""
+        model_raw = self._config_to_flat_dict(
+            self._get_cfg_attr(self.config, "model", Config({}))
+        )
+        return model_raw if isinstance(model_raw, dict) else {}
 
-        Used when the model is not registered in ``ModelSpec``.
+    def _visual_seq_len_override(self) -> int:
+        """Return ``context.visual_seq_len`` when the config declares one."""
+        ctx = self._get_cfg_attr(self.config, "context", Config({}))
+        return int(self._get_cfg_attr(ctx, "visual_seq_len", 0) or 0)
+
+    @staticmethod
+    def _spec_int(spec: Dict[str, Any], name: str, default: int = 0) -> int:
+        """Return an integer spec field, treating ``None`` as absent."""
+        return int(spec.get(name, default) or default)
+
+    def _apply_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
+        """Populate one cost-model config object from a canonical model spec.
+
+        Shared by the main model, the ``config_overrides`` fallback and every
+        multimodal submodule, so all three agree on field semantics.
         """
-        model_raw = self._get_cfg_attr(self.config, "model", Config({}))
-        overrides = self._get_cfg_attr(model_raw, "config_overrides", Config({}))
-        data_raw = self._get_cfg_attr(self.config, "data", Config({}))
+        self._apply_core_spec(ccfg, spec)
+        self._apply_moe_spec(ccfg, spec)
+        self._apply_scaling_spec(ccfg, spec)
 
-        self.ccfg.model_name = str(
-            self._get_cfg_attr(model_raw, "name", "custom"))
-        self.ccfg.h = int(self._get_cfg_attr(overrides, "hidden_size", 0))
-        self.ccfg.n_lay = int(self._get_cfg_attr(overrides, "num_hidden_layers", 0))
-        self.ccfg.a = int(self._get_cfg_attr(overrides, "num_attention_heads", 0))
-        self.ccfg.hff = int(self._get_cfg_attr(overrides, "intermediate_size", 0))
-        self.ccfg.v = int(self._get_cfg_attr(overrides, "vocab_size", 0))
-
-        # seq_len: data.max_seq_len > overrides > default
-        self.ccfg.s = int(
-            self._get_cfg_attr(data_raw, "max_seq_len", 0)
-            or self._get_cfg_attr(overrides, "max_position_embeddings", 0)
-            or self._get_cfg_attr(overrides, "seq_length", 0)
+    def _apply_core_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
+        """Map common transformer geometry and attention fields."""
+        ccfg.model_name = str(spec.get("name", "custom"))
+        ccfg.h = self._spec_int(spec, "hidden_size")
+        ccfg.n_lay = self._spec_int(spec, "num_hidden_layers")
+        ccfg.a = self._spec_int(spec, "num_attention_heads")
+        ccfg.hff = self._spec_int(spec, "intermediate_size")
+        ccfg.v = self._spec_int(spec, "vocab_size")
+        ccfg.s = (
+            self._spec_int(spec, "max_position_embeddings")
+            or self._spec_int(spec, "seq_length")
             or 4096
         )
+        ccfg.n_kv = self._spec_int(spec, "num_key_value_heads") or ccfg.a
+        # Transformers exposes head_dim explicitly and it is not always
+        # hidden_size / num_attention_heads (Qwen3 has h/a = 64, head_dim 128).
+        head_dim = self._spec_int(spec, "head_dim")
+        ccfg.dh = head_dim if head_dim else (ccfg.h / ccfg.a if ccfg.a else 0)
+        ccfg.dc_kv = self._spec_int(spec, "kv_lora_rank")
+        ccfg.dc_q = self._spec_int(spec, "q_lora_rank")
+        ccfg.dhr = self._spec_int(spec, "qk_rope_head_dim")
 
-        self.ccfg.n_kv = int(
-            self._get_cfg_attr(overrides, "num_key_value_heads", 0))
-        if not self.ccfg.n_kv:
-            self.ccfg.n_kv = self.ccfg.a
-        self.ccfg.dh = self.ccfg.h / self.ccfg.a if self.ccfg.a else 0
-        self.ccfg.dc_kv = int(
-            self._get_cfg_attr(overrides, "kv_lora_rank", 0))
-        self.ccfg.dc_q = int(
-            self._get_cfg_attr(overrides, "q_lora_rank", 0))
-        self.ccfg.dhr = int(
-            self._get_cfg_attr(overrides, "qk_rope_head_dim", 0))
+    def _apply_moe_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
+        """Map dense defaults and optional MoE fields."""
+        ccfg.n_exp = 1
+        ccfg.n_chosen_exp = 1
+        ccfg.n_shared_exp = 0
+        ccfg.hff_exp = ccfg.hff
+        ccfg.cap_fact = 1
+        ccfg.t_exp = ccfg.t
+        ccfg.d_exp = ccfg.d
+        ccfg.gmm = False
+        ccfg.k_1st_dense = 0
+        num_exp = self._spec_int(spec, "num_experts", 1)
+        if num_exp <= 1:
+            return
+        ccfg.n_exp = num_exp
+        ccfg.n_chosen_exp = max(1, self._spec_int(spec, "num_experts_per_tok", 1))
+        ccfg.n_shared_exp = self._spec_int(spec, "num_shared_experts")
+        moe_inter = self._spec_int(spec, "moe_intermediate_size")
+        if moe_inter:
+            ccfg.hff_exp = moe_inter
+        ccfg.k_1st_dense = self._spec_int(spec, "first_k_dense_replace")
+        cap_val = spec.get("capacity_factor", spec.get("cap_fact"))
+        if cap_val is not None:
+            ccfg.cap_fact = max(1, float(cap_val))
+        ccfg.gmm = bool(spec.get("use_gmm", spec.get("gmm", True)))
 
-        # MoE
-        self.ccfg.n_exp = 1
-        self.ccfg.n_chosen_exp = 1
-        self.ccfg.n_shared_exp = 0
-        self.ccfg.hff_exp = self.ccfg.hff
-        self.ccfg.cap_fact = 1
-        self.ccfg.t_exp = self.ccfg.t
-        self.ccfg.d_exp = self.ccfg.d
-        self.ccfg.gmm = False
-        self.ccfg.k_1st_dense = 0
-        num_exp = int(self._get_cfg_attr(overrides, "num_experts", 1))
-        if num_exp > 1:
-            self.ccfg.n_exp = max(1, num_exp)
-            self.ccfg.n_chosen_exp = max(
-                1, int(self._get_cfg_attr(overrides, "num_experts_per_tok", 1)))
-            self.ccfg.n_shared_exp = int(
-                self._get_cfg_attr(overrides, "num_shared_experts", 0))
-            moe_inter = int(
-                self._get_cfg_attr(overrides, "moe_intermediate_size", 0))
-            if moe_inter:
-                self.ccfg.hff_exp = moe_inter
-            self.ccfg.k_1st_dense = int(
-                self._get_cfg_attr(overrides, "first_k_dense_replace", 0))
-            cap_val = (
-                self._get_cfg_attr(overrides, "capacity_factor", None)
-                or self._get_cfg_attr(overrides, "cap_fact", None)
-            )
-            if cap_val is not None:
-                self.ccfg.cap_fact = max(1, float(cap_val))
-            self.ccfg.gmm = (
-                self._get_cfg_attr(overrides, "use_gmm", False)
-                or self._get_cfg_attr(overrides, "gmm", False)
-            )
+    def _apply_scaling_spec(self, ccfg: Any, spec: Dict[str, Any]) -> None:
+        """Map MTP and feed-forward scaling fields."""
+        ccfg.n_mtp = self._spec_int(spec, "mtp_depth")
+        # Match the MF parser: when the model declares MTP layers they
+        # participate in pipeline offset balancing (default True); when there
+        # is none they are excluded, mirroring the MF parser's
+        # ``num_nextn_predict_layers`` fallback which sets
+        # ``is_mtp_in_offset = False``.
+        ccfg.is_mtp_in_offset = bool(ccfg.n_mtp)
+        ccfg.multiple_of = self._spec_int(spec, "multiple_of", 256)
+        ccfg.fdm = float(spec.get("ffn_dim_multiplier", 1.0) or 1.0)
 
-        self.ccfg.n_mtp = int(self._get_cfg_attr(overrides, "mtp_depth", 0))
-        # Match the MF parser's MTP-in-offset semantics; see
-        # _map_model_config_to_ccfg for the rationale.
-        self.ccfg.is_mtp_in_offset = bool(self.ccfg.n_mtp)
-        self.ccfg.multiple_of = int(
-            self._get_cfg_attr(overrides, "multiple_of", 256))
-        self.ccfg.fdm = float(
-            self._get_cfg_attr(overrides, "ffn_dim_multiplier", 1.0))
+    # -- Multimodal ----------------------------------------------------
 
-        self._resolve_device_capacity()
+    def _resolve_multimodal(self) -> None:
+        """Split a vision-language model into cost-model submodules.
+
+        The vision tower and the language model run on one shared pipeline,
+        so both submodules inherit the parent's strategy and only their
+        geometry, sequence length and layer placement differ. The parent
+        keeps the strategy and drops to ``n_lay = 0`` so the backbone sums
+        the submodules rather than its own layer count.
+        """
+        if not self._vision_spec:
+            return
+
+        text_ccfg = self._clone_submodule(self.ccfg.model_name)
+        vision_ccfg = self._build_vision_submodule(self._vision_spec)
+
+        self.ccfg.multimodal = True
+        self.ccfg.mm_ccfgs = {"vision": vision_ccfg, "text": text_ccfg}
+        # Vision runs first; the language model drives the search space.
+        self.ccfg.mm_order = ["vision", "text"]
+        self.ccfg.mm_main = "text"
+        self.ccfg.hooks_dict = {
+            "vision": custom_vision_tower_hook,
+            "text": check_and_apply_custom_hook,
+        }
+        self.ccfg.n_lay = 0
+        self.ccfg.layer_custom_config = []
+        logger.info(
+            "Multimodal cost model: vision %s (%d layers, s=%d) + text %s "
+            "(%d layers, s=%d)",
+            vision_ccfg.model_name, vision_ccfg.n_lay, vision_ccfg.s,
+            text_ccfg.model_name, text_ccfg.n_lay, text_ccfg.s,
+        )
+
+    def _clone_submodule(self, name: str) -> Any:
+        """Return a submodule cost config seeded from the parsed parent."""
+        cc = type(self.ccfg)({})
+        for key, value in self.ccfg.__dict__.items():
+            if key in ("mm_ccfgs", "mm_order", "mm_main", "hooks_dict"):
+                continue
+            setattr(cc, key, value)
+        cc.multimodal = False
+        cc.mm_ccfgs = None
+        cc.mm_order = None
+        cc.parser = self
+        cc.model_name = name
+        cc.rec_op = Config(dict(self.ccfg.rec_op.__dict__))
+        cc.layer_custom_config = [(cc.n_lay + cc.n_mtp, None)]
+        cc.offset = self._even_offset()
+        return cc
+
+    def _build_vision_submodule(self, vision_spec: Dict[str, Any]) -> Any:
+        """Return the vision-tower submodule config.
+
+        The tower is dense, carries no vocabulary embedding, and consumes the
+        visual token count rather than the text sequence length. It is placed
+        entirely on the first pipeline stage, which is where the runtime puts
+        it unless an MPipe-style schedule moves it.
+        """
+        cc = self._clone_submodule(str(vision_spec.get("name", "vision")))
+        self._apply_spec(cc, vision_spec)
+        cc.v = 0  # patch embedding, not a vocabulary table
+        cc.vocab_emb_dp = False
+        cc.n_mtp = 0
+        cc.is_mtp_in_offset = False
+        cc.s_fa = cc.s / cc.a if cc.has_fa and cc.a > 0 else cc.s
+        cc.layer_custom_config = [(cc.n_lay, None)]
+        cc.offset = self._front_loaded_offset(cc.n_lay)
+        return cc
+
+    def _even_offset(self):
+        """Return a balanced offset of the shape ``is_consistent_pp_config`` wants."""
+        if self.ccfg.vp > 1:
+            return [[0] * self.ccfg.p for _ in range(self.ccfg.vp)]
+        return [0] * self.ccfg.p
+
+    def _front_loaded_offset(self, n_lay: int):
+        """Return an offset placing every layer on the first pipeline stage."""
+        per_stage = max(0, n_lay // max(1, self.ccfg.p) // max(1, self.ccfg.vp))
+        head = n_lay - per_stage
+        if self.ccfg.vp > 1:
+            chunks = [[-per_stage] * self.ccfg.p for _ in range(self.ccfg.vp)]
+            chunks[0][0] = head
+            return chunks
+        stages = [-per_stage] * self.ccfg.p
+        stages[0] = head
+        return stages
+
+    def _resolve_sequence_length(self) -> None:
+        """Prefer the Trainer dataset sequence length over the model limit."""
+        data_raw = self._get_cfg_attr(self.config, "data", Config({}))
+        legacy_seq_len = self._get_cfg_attr(data_raw, "max_seq_len", 0)
+
+        dataset_raw = self._get_cfg_attr(self.config, "dataset", Config({}))
+        transform_raw = self._get_cfg_attr(
+            dataset_raw, "data_transform", Config({}),
+        )
+        trainer_seq_len = self._get_cfg_attr(transform_raw, "max_seq_len", 0)
+        seq_len = int(trainer_seq_len or legacy_seq_len or self.ccfg.s or 4096)
+        self.ccfg.s = seq_len
 
     def _resolve_device_capacity(self) -> None:
         """Set device capacity from config or default (64 GB)."""
         ctx = self._get_cfg_attr(self.config, "context", Config({}))
-        device_mem_str = ctx.__dict__.get("max_device_memory", None) if isinstance(ctx, (Config, YamlObject)) else None
+        device_mem_str = (
+            ctx.__dict__.get("max_device_memory", None)
+            if isinstance(ctx, (Config, YamlObject))
+            else None
+        )
         if device_mem_str:
             self.ccfg.device_capacity = Memory.from_string(str(device_mem_str))
         else:
@@ -352,43 +404,111 @@ class CostModelParserHyperV2(_CostModelParser):
         return 4
 
     def _parse_parallelism(self):
-        """Extract parallelism settings from ``train.accelerator``."""
+        """Extract parallelism from the AutoModels or legacy Trainer schema."""
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
-        accel = self._get_cfg_attr(train_raw, "accelerator", Config({}))
+        legacy_accel = self._get_cfg_attr(train_raw, "accelerator", Config({}))
+        accel = self._get_cfg_attr(self.config, "accelerator", legacy_accel)
+        fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
 
-        dp_shard = int(self._get_cfg_attr(accel, "dp_shard", 1) or 1)
+        dp_shard = self._parse_parallel_dimensions(accel, fsdp)
+        self._parse_sequence_parallelism(accel)
+        self._parse_optimizer_parallelism(accel, dp_shard)
+
+    def _parse_parallel_dimensions(self, accel, fsdp) -> int:
+        """Populate mesh dimensions and return the data shard degree."""
+
+        dp_shard = int(
+            self._get_cfg_attr(fsdp, "dp_shard_size", 0)
+            or self._get_cfg_attr(accel, "dp_shard", 1)
+            or 1
+        )
         dp_replicate = int(self._get_cfg_attr(accel, "dp_replicate", 1) or 1)
-        tp = int(self._get_cfg_attr(accel, "tp_degree", 1) or 1)
-        pp = int(self._get_cfg_attr(accel, "pipeline_parallel_degree", 1) or 1)
-        cp = int(self._get_cfg_attr(accel, "context_parallel_degree", 1) or 1)
-        ep = int(self._get_cfg_attr(accel, "expert_parallel_degree", 1) or 1)
+        tp = int(
+            self._get_cfg_attr(accel, "tp_size", 0)
+            or self._get_cfg_attr(accel, "tp_degree", 1)
+            or 1
+        )
+        pp = int(
+            self._get_cfg_attr(accel, "pp_size", 0)
+            or self._get_cfg_attr(accel, "pipeline_parallel_degree", 1)
+            or 1
+        )
+        cp = int(
+            self._get_cfg_attr(accel, "cp_size", 0)
+            or self._get_cfg_attr(accel, "context_parallel_degree", 1)
+            or 1
+        )
+        ep = int(
+            self._get_cfg_attr(accel, "ep_size", 0)
+            or self._get_cfg_attr(accel, "expert_parallel_degree", 1)
+            or 1
+        )
         etp = int(self._get_cfg_attr(accel, "expert_tensor_parallel_degree", 0) or 0)
         ep = max(ep, 1)
 
-        # FSDP: d = replicate * shard (when shard > 1)
-        self.ccfg.d = max(1, dp_replicate * dp_shard)
         self.ccfg.t = max(1, tp)
         self.ccfg.p = max(1, pp)
         self.ccfg.cp = max(1, cp)
         self.ccfg.ep = max(1, ep)
+        self.ccfg.d = self._resolve_data_parallel(dp_replicate, dp_shard)
         self.ccfg.sp = self.ccfg.t  # Sequence parallel factor
         self.ccfg.etp = etp
         self.ccfg.vp = max(1, int(
             self._get_cfg_attr(accel, "pp_interleave_num", 1) or 1
         ))
-        use_sp = bool(self._get_cfg_attr(accel, "use_seq_parallel", False))
+        return dp_shard
+
+    def _resolve_data_parallel(self, dp_replicate: int, dp_shard: int) -> int:
+        """Return the data-parallel degree, preferring an explicit device count.
+
+        ND reads ``d * t * cp * p`` back as the cluster size whenever no
+        device count is supplied on the command line. The AutoModels schema
+        has no replicate field, since the runtime derives it from the world
+        size, so without ``context.device_num`` an HSDP run would understate
+        the cluster by exactly its replicate factor.
+        """
+        ctx = self._get_cfg_attr(self.config, "context", Config({}))
+        device_num = int(self._get_cfg_attr(ctx, "device_num", 0) or 0)
+        if not device_num:
+            if is_auto_models_schema(self.config) and dp_replicate == 1:
+                logger.warning(
+                    "AutoModels config carries no context.device_num; assuming "
+                    "dp_replicate=1 (d = dp_shard_size = %d). Pass -d/--devices "
+                    "for HSDP runs.", dp_shard,
+                )
+            return max(1, dp_replicate * dp_shard)
+        denom = self.ccfg.t * self.ccfg.p * self.ccfg.cp
+        if denom < 1 or device_num % denom:
+            raise ValueError(
+                f"context.device_num={device_num} is not divisible by "
+                f"t*p*cp={denom}"
+            )
+        return max(1, device_num // denom)
+
+    def _parse_sequence_parallelism(self, accel) -> None:
+        """Populate sequence-parallel and pipeline scheduler settings."""
+        use_sp = bool(
+            self._get_cfg_attr(accel, "sequence_parallel", False)
+            or self._get_cfg_attr(accel, "use_seq_parallel", False)
+        )
         self.ccfg.sp = self.ccfg.t if use_sp else 1
         self.ccfg.pp_sched = str(
             self._get_cfg_attr(accel, "pipeline_scheduler", "1f1b")
         )
 
-        # Optimizer parallel sharding
-        self.ccfg.has_op = bool(self._get_cfg_attr(accel,
-                                                     "enable_parallel_optimizer",
-                                                     True))
+    def _parse_optimizer_parallelism(self, accel, dp_shard: int) -> None:
+        """Populate optimizer and gradient sharding settings."""
+        is_auto_models = is_auto_models_schema(self.config)
+        self.ccfg.has_op = (
+            dp_shard > 1
+            if is_auto_models
+            else bool(self._get_cfg_attr(
+                accel, "enable_parallel_optimizer", True,
+            ))
+        )
         self.ccfg.op_weight_shard = max(1, int(
             self._get_cfg_attr(accel, "optimizer_weight_shard_size", 0)
-        ) or (self.ccfg.d * self.ccfg.t))
+        ) or (dp_shard if is_auto_models else self.ccfg.d * self.ccfg.t))
         self.ccfg.has_grad_shard = bool(self._get_cfg_attr(accel,
                                                              "gradient_accumulation_shard",
                                                              False))
@@ -398,15 +518,18 @@ class CostModelParserHyperV2(_CostModelParser):
         )
 
     def _parse_batch(self):
-        """Extract batch settings from ``train`` section."""
-        train_raw = self._get_cfg_attr(self.config, "train", Config({}))
+        """Extract batch settings from ``training`` or legacy ``train``."""
+        legacy_train = self._get_cfg_attr(self.config, "train", Config({}))
+        train_raw = self._get_cfg_attr(self.config, "training", legacy_train)
         self.ccfg.b = max(1, int(self._get_cfg_attr(train_raw, "micro_batch_size", 1) or 1))
         m = int(self._get_cfg_attr(train_raw, "micro_batch_num", 0) or 0)
+        gbs = int(self._get_cfg_attr(train_raw, "global_batch_size", 0) or 0)
         if m > 0:
             self.ccfg.m = m
+        elif gbs > 0 and gbs % (self.ccfg.b * self.ccfg.d) == 0:
+            self.ccfg.m = max(1, gbs // (self.ccfg.b * self.ccfg.d))
         else:
             self.ccfg.m = self.ccfg.p
-        gbs = int(self._get_cfg_attr(train_raw, "global_batch_size", 0) or 0)
         if gbs > 0:
             self.ccfg.gbs = gbs
         else:
@@ -418,14 +541,25 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.vocab_emb_dp = True
         self.ccfg.tie_emb_out = False
         self.ccfg.freeze = False
-        train_raw = self._get_cfg_attr(self.config, "train", Config({}))
-        optimizer = self._get_cfg_attr(train_raw, "optimizer", Config({}))
+        legacy_train = self._get_cfg_attr(self.config, "train", Config({}))
+        training = self._get_cfg_attr(self.config, "training", legacy_train)
+        optimizer = self._get_cfg_attr(
+            self.config,
+            "optimizer",
+            self._get_cfg_attr(legacy_train, "optimizer", Config({})),
+        )
         max_grad_norm = float(
-            self._get_cfg_attr(optimizer, "max_grad_norm", 0.0) or 0.0
+            self._get_cfg_attr(training, "max_grad_norm", None)
+            or self._get_cfg_attr(optimizer, "max_grad_norm", 0.0)
+            or 0.0
         )
         self.ccfg.has_clip = max_grad_norm > 0
         self.ccfg.vp_less_mem = False
-        accel = self._get_cfg_attr(train_raw, "accelerator", Config({}))
+        accel = self._get_cfg_attr(
+            self.config,
+            "accelerator",
+            self._get_cfg_attr(legacy_train, "accelerator", Config({})),
+        )
         cp_algo = self._get_cfg_attr(accel, "context_parallel_algo", None)
         if cp_algo:
             self.ccfg.cp_algo = cp_algo
@@ -441,16 +575,22 @@ class CostModelParserHyperV2(_CostModelParser):
         # Optimizer type — used by GlobalConfig.max_op to detect muon-based
         # optimizers.  Matches the MF parser's
         # ``self.ccfg.optimizer = self.config.optimizer.type``.
-        opt_type = self._get_cfg_attr(optimizer, "type", None)
-        if opt_type:
-            self.ccfg.optimizer = str(opt_type)
+        opt_type = (
+            self._get_cfg_attr(optimizer, "_target_", None)
+            or self._get_cfg_attr(optimizer, "type", None)
+        )
+        # Always a string: GlobalConfig.max_op only bounds OP by the data
+        # parallel degree when this reads as a non-muon optimizer name, and
+        # the generated cost-model yaml carries no optimizer section.
+        self.ccfg.optimizer = str(opt_type) if opt_type else "adamw"
 
     def _parse_recompute(self):
         """Parse recompute mode.
 
-        Reads ``activation_checkpoint`` from ``train.gradient_checkpointing``
-        first.  When ``config_overrides`` supplies ``full_rec`` or ``sel_rec``
-        (Matching the MF parser's ``recompute_config.recompute`` /
+        Reads ``activation_checkpoint.mode`` from the AutoModels schema, with
+        the legacy ``train.gradient_checkpointing`` path as a fallback. When
+        ``config_overrides`` supplies ``full_rec`` or ``sel_rec`` (matching
+        the MF parser's ``recompute_config.recompute`` /
         ``recompute_config.select_recompute`` fields), those values take
         precedence so that Hyper YAML demo files can express per-stage
         recompute lists for side-by-side comparisons with MindFormers.
@@ -462,7 +602,15 @@ class CostModelParserHyperV2(_CostModelParser):
 
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
-        ac_mode = str(self._get_cfg_attr(gc, "activation_checkpoint", "none"))
+        activation_checkpoint = self._get_cfg_attr(
+            self.config, "activation_checkpoint", Config({}),
+        )
+        ac_mode = str(
+            self._get_cfg_attr(activation_checkpoint, "mode", None)
+            or self._get_cfg_attr(gc, "activation_checkpoint", "none")
+        )
+        if ac_mode == "off":
+            ac_mode = "none"
 
         if full_rec_override is not None:
             self.ccfg.full_rec = full_rec_override
@@ -485,12 +633,20 @@ class CostModelParserHyperV2(_CostModelParser):
         })
 
     def _init_bytes(self):
-        """Set FP byte sizes from dtype fields in the model section."""
+        """Set FP byte sizes from AutoModels or legacy dtype fields."""
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
+        fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
+        mix_precision = self._get_cfg_attr(fsdp, "mix_precision", Config({}))
+        model_dtype = self._get_cfg_attr(model_raw, "torch_dtype", None)
         self.ccfg.bytes_p = self._bytes_from_dtype(
-            self._get_cfg_attr(model_raw, "param_init_type", "float32"))
+            self._get_cfg_attr(mix_precision, "param_dtype", None)
+            or model_dtype
+            or self._get_cfg_attr(model_raw, "param_init_type", "float32")
+        )
         self.ccfg.bytes_compute = self._bytes_from_dtype(
-            self._get_cfg_attr(model_raw, "compute_dtype", "bfloat16"))
+            model_dtype
+            or self._get_cfg_attr(model_raw, "compute_dtype", "bfloat16")
+        )
         self.ccfg.bytes_softmax = self._bytes_from_dtype(
             self._get_cfg_attr(model_raw, "softmax_compute_type", "float32"))
         self.ccfg.bytes_grad = 4
@@ -546,6 +702,8 @@ class CostModelParserHyperV2(_CostModelParser):
         model_raw = self._get_cfg_attr(self.config, "model", Config({}))
         overrides = self._get_cfg_attr(model_raw, "config_overrides", Config({}))
         explicit = self._get_cfg_attr(overrides, "offset", None)
+        if explicit is None:
+            explicit = self._get_cfg_attr(model_raw, "offset", None)
         if isinstance(explicit, list):
             self.ccfg.offset = list(explicit)
         elif isinstance(explicit, int):
@@ -619,8 +777,16 @@ class CostModelParserHyperV2(_CostModelParser):
         self.ccfg.shard_output_activ = 1
         train_raw = self._get_cfg_attr(self.config, "train", Config({}))
         gc = self._get_cfg_attr(train_raw, "gradient_checkpointing", Config({}))
+        fsdp = self._get_cfg_attr(self.config, "fsdp_config", Config({}))
+        ac = self._get_cfg_attr(self.config, "activation_checkpoint", Config({}))
         self._recompute_slice_activation = bool(self._get_cfg_attr(
-            gc, "recompute_slice_activation", False
+            ac,
+            "recompute_slice_activation",
+            self._get_cfg_attr(
+                fsdp,
+                "recompute_slice_activation",
+                self._get_cfg_attr(gc, "recompute_slice_activation", False),
+            ),
         ))
         self.config_shard_recompute()
         self.ccfg.is_shard_mtp_param = True

@@ -161,6 +161,25 @@ class TestModuleFunctions(unittest.TestCase):
             self.assertEqual(len(result), 1)
             self.assertIn(t.untyped_storage().data_ptr(), result)
 
+    def test_collect_device_storage_ptrs_unwraps_dtensor(self):
+        """Test storage collection reads the local shard of a DTensor-like object."""
+        local_tensor = torch.empty(3, device="meta")
+
+        class FakeDTensor:
+            """Minimal DTensor-like wrapper whose storage is only available locally."""
+
+            @staticmethod
+            def to_local() -> torch.Tensor:
+                """Return the local tensor shard."""
+                return local_tensor
+
+        with _swap_plat_patch() as mp, patch.object(swap_module, "DTensor", FakeDTensor):
+            mp.Tensor = torch.Tensor
+            mp.tree_map = _build_mock_platform().tree_map
+            result = _collect_device_storage_ptrs(FakeDTensor())
+
+        self.assertEqual(result, {local_tensor.untyped_storage().data_ptr()})
+
     def test_collect_device_storage_ptrs_nested(self):
         """Test _collect_device_storage_ptrs traverses nested structures."""
         with _swap_plat_patch() as mp:
@@ -341,15 +360,44 @@ class TestSwapTensor(unittest.TestCase):
             st._state = SwapTensor.STATE_HOST
             st.resize_device_storage()
 
-    def test_resize_device_storage_group_managed_noop(self):
-        """Test resize_device_storage is no-op for group-managed tensors."""
+    def test_resize_device_storage_group_managed_restores_original_storage(self):
+        """Group-managed tensors restore their original storage for D2D unpack."""
         with _swap_plat_patch() as mp:
             mp.Tensor = torch.Tensor
             mp.get_element_size = lambda t: t.element_size()
             t = self._make_tensor(3)
             st = SwapTensor(t, "test_func")
+            storage_size = st.storage_size
+            original_storage_id = t.untyped_storage()._cdata
+            t.untyped_storage().resize_(0)
             st._group_managed = True
+            st._state = SwapTensor.STATE_HOST
             st.resize_device_storage()
+            self.assertEqual(t.untyped_storage().size(), storage_size)
+            self.assertEqual(t.untyped_storage()._cdata, original_storage_id)
+
+    def test_async_group_load_preserves_alias_storage(self):
+        """D2D group load writes into the storage shared by existing aliases."""
+        with _swap_plat_patch() as mp:
+            mp.Tensor = torch.Tensor
+            mp.get_element_size = lambda t: t.element_size()
+            mp.preserve_version_counter.return_value = contextlib.nullcontext()
+            t = self._make_tensor(3, 4)
+            alias = t.view(6, 2)
+            st = SwapTensor(t, "test_func", group_swap=True)
+            storage_size = st.storage_size
+            original_storage_id = t.untyped_storage()._cdata
+            t.untyped_storage().resize_(0)
+            st._group_managed = True
+            st._state = SwapTensor.STATE_HOST
+            st.resize_device_storage()
+
+            st.async_group_load(torch.empty(12, device="meta"))
+
+            self.assertEqual(st._state, SwapTensor.STATE_H2D)
+            self.assertEqual(t.untyped_storage()._cdata, original_storage_id)
+            self.assertEqual(alias.untyped_storage()._cdata, original_storage_id)
+            self.assertEqual(alias.untyped_storage().size(), storage_size)
 
     def test_resize_device_storage_wrong_state_noop(self):
         """Test resize_device_storage is no-op when not in HOST state."""

@@ -113,3 +113,29 @@ def test_forward_and_gradfn_parameter_grad_accumulates():
     _ = grad_fn.compute_input_grad()
     _ = grad_fn.compute_weight_grad()
     _assert_param_grad_allclose(net.w, [[6.0]])
+
+
+def test_accumulate_grad_falls_back_for_shared_non_leaf_weight():
+    """
+    Feature: Pipeline parameter gradient accumulation.
+    Description: Distinct forward graphs share a transformed non-leaf weight, as in TP pipeline stages.
+    Expectation: Input gradients stay per-graph while the transformed weight gradient accumulates.
+    """
+    ms.set_context(mode=ms.PYNATIVE_MODE)
+    enable_mindspore_backward_compat()
+
+    base_weight = Parameter(Tensor(np.array([[2.0]], np.float32)), name="base_weight")
+    weight = ops.mul(base_weight, Tensor(np.array([[1.0]], np.float32)))
+    assert not weight.is_leaf
+    _assert_param_grad_is_none(weight)
+
+    def _fn(x: Tensor) -> Tensor:
+        return ops.matmul(x, weight)
+
+    for expected_weight_grad in ([[3.0]], [[6.0]]):
+        x = Tensor(np.array([[3.0]], np.float32))
+        _, grad_fn = forward_and_gradfn(_fn, x, weights=(weight,), grad_position=0)
+        input_grad = grad_fn.accumulate_grad()
+
+        np.testing.assert_allclose(input_grad.asnumpy(), np.array([[2.0]], dtype=np.float32))
+        _assert_param_grad_allclose(weight, expected_weight_grad)

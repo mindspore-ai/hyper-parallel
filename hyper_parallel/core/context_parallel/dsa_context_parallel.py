@@ -53,6 +53,134 @@ _SUPPORTED_LOSS_VARIANTS = ("sparse", "dense")
 _DEFAULT_ARG_INDEX = object()
 
 
+def _move_dim_to_front(value: Any, dim: int) -> tuple[Any, list[int]]:
+    """Move ``dim`` to the leading position and return the inverse permutation."""
+    order = [dim] + [index for index in range(len(value.shape)) if index != dim]
+    inverse = [0] * len(order)
+    for new_index, old_index in enumerate(order):
+        inverse[old_index] = new_index
+    return value.permute(order).contiguous(), inverse
+
+
+class _DSASequenceReplicateGradientBridge(platform.Function):
+    """Reuse one gathered forward value while preserving per-consumer backward."""
+
+    @staticmethod
+    def forward(
+            ctx: Any,
+            local_value: Any,
+            replicated_value: Any,
+            group: Any,
+            world_size: int,
+            seq_dim: int,
+    ) -> Any:
+        """Return the detached shared value and retain only collective metadata."""
+        del local_value
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.seq_dim = seq_dim
+        return replicated_value
+
+    @staticmethod
+    def backward(  # pylint: disable=arguments-differ
+            ctx: Any, grad_output: Any
+    ) -> tuple[Any, None, None, None, None]:
+        """Reduce-scatter this consumer's gradient independently to its local input."""
+        if ctx.world_size == 1:
+            return grad_output, None, None, None, None
+        grad_front, inverse = _move_dim_to_front(grad_output, ctx.seq_dim)
+        output_shape = list(grad_front.shape)
+        if output_shape[0] % ctx.world_size != 0:
+            raise ValueError(
+                "DSA shared replicate backward requires a divisible sequence dimension, "
+                f"got {output_shape[0]} and CP size {ctx.world_size}."
+            )
+        output_shape[0] //= ctx.world_size
+        local_grad, work = platform.reduce_scatter_single(
+            grad_front, output_shape, ctx.group, async_op=False
+        )
+        if work is not None:
+            work.wait()
+        local_grad = local_grad.permute(inverse).contiguous()
+        return local_grad, None, None, None, None
+
+
+class DSASequenceReplicateCache:
+    """Share semantically identical CP AllGather results within one DSA layer.
+
+    Callers assign stable semantic slot names only to local tensors that are
+    mathematically identical views of the same activation. The first consumer
+    performs the sequence AllGather and later consumers reuse that storage.
+    Each consumer receives an independent gradient bridge so its reverse
+    ReduceScatter remains separate, matching the pre-cache accumulation order.
+
+    The cache is deliberately scoped to one sparse-attention/indexer-loss
+    forward interval. :meth:`begin` drops stale entries before sparse attention
+    and :meth:`clear` releases references after indexer-loss inputs are built.
+    """
+
+    def __init__(self) -> None:
+        """Initialize an empty per-layer communication cache."""
+        self._values: dict[str, Any] = {}
+        self._signatures: dict[str, tuple] = {}
+
+    @staticmethod
+    def _signature(value: Any, device_mesh: DeviceMesh, seq_dim: int) -> tuple:
+        """Build a metadata-only signature without synchronizing the device."""
+        if isinstance(value, DTensor):
+            shape = tuple(value.local_shape)
+            dtype = value.dtype
+        else:
+            shape = tuple(value.shape)
+            dtype = value.dtype
+        return shape, dtype, tuple(device_mesh.rank_list), seq_dim
+
+    def begin(self) -> None:
+        """Start a new sparse-attention interval and discard stale references."""
+        self.clear()
+
+    def replicate(self, slot_name: str, value: Any, device_mesh: DeviceMesh, seq_dim: int) -> Any:
+        """Return the shared replicated DTensor for one semantic activation."""
+        if not _is_tensor_or_dtensor(value):
+            return value
+        signature = self._signature(value, device_mesh, seq_dim)
+        if slot_name in self._values:
+            if self._signatures[slot_name] != signature:
+                raise ValueError(
+                    f"DSA shared replicate slot {slot_name!r} received incompatible "
+                    f"metadata: expected {self._signatures[slot_name]}, got {signature}."
+                )
+            replicated = self._values[slot_name]
+        else:
+            replicated = _to_sequence_replicate(value, device_mesh, seq_dim)
+            if isinstance(replicated, DTensor):
+                replicated = DTensor.from_local_with_layout(
+                    replicated.to_local().detach(), replicated.layout
+                )
+            else:
+                replicated = replicated.detach()
+            self._values[slot_name] = replicated
+            self._signatures[slot_name] = signature
+
+        local_value = value.to_local() if isinstance(value, DTensor) else value
+        replicated_value = replicated.to_local() if isinstance(replicated, DTensor) else replicated
+        bridged_value = _DSASequenceReplicateGradientBridge.apply(
+            local_value,
+            replicated_value,
+            device_mesh.get_group(),
+            device_mesh.size(),
+            seq_dim,
+        )
+        if isinstance(replicated, DTensor):
+            return DTensor.from_local_with_layout(bridged_value, replicated.layout)
+        return bridged_value
+
+    def clear(self) -> None:
+        """Release cache-owned references after all forward consumers are wired."""
+        self._values.clear()
+        self._signatures.clear()
+
+
 def _is_tensor_or_dtensor(value: Any) -> bool:
     """Return True for framework tensors and HyperParallel DTensors."""
     return isinstance(value, DTensor) or platform.is_tensor(value)
@@ -225,6 +353,8 @@ def _configure_sparse_attention_boundary(  # pylint: disable=too-many-arguments
         query_rope_kwarg_name: Optional[str],
         key_rope_kwarg_name: Optional[str],
         use_local_output: bool,
+        shared_replicate_cache: Optional[DSASequenceReplicateCache],
+        share_key_value: bool,
 ) -> None:
     """Store sparse-attention boundary configuration on ``style``."""
     layout, seq_dim = _validate_layout_and_mode(style.__class__.__name__, layout, mode)
@@ -244,6 +374,8 @@ def _configure_sparse_attention_boundary(  # pylint: disable=too-many-arguments
     style.query_rope_kwarg_name = query_rope_kwarg_name
     style.key_rope_kwarg_name = key_rope_kwarg_name
     style.use_local_output = use_local_output
+    style.shared_replicate_cache = shared_replicate_cache
+    style.share_key_value = share_key_value
 
 
 def _apply_sparse_attention_boundary(
@@ -262,12 +394,19 @@ def _apply_sparse_attention_boundary(
     def _replicate(slot_name: str):
         if async_state is not None:
             return lambda value: async_state.wait(slot_name, value)
+        if style.shared_replicate_cache is not None:
+            return lambda value: style.shared_replicate_cache.replicate(
+                slot_name, value, cp_mesh, style.seq_dim
+            )
         return lambda value: _to_sequence_replicate(value, cp_mesh, style.seq_dim)
+
+    key_slot = "main_kv" if style.share_key_value else "key"
+    value_slot = "main_kv" if style.share_key_value else "value"
 
     specs = [
         _ParamSpec(style.query_index, style.query_kwarg_name, _shard),
-        _ParamSpec(style.key_index, style.key_kwarg_name, _replicate("key")),
-        _ParamSpec(style.value_index, style.value_kwarg_name, _replicate("value")),
+        _ParamSpec(style.key_index, style.key_kwarg_name, _replicate(key_slot)),
+        _ParamSpec(style.value_index, style.value_kwarg_name, _replicate(value_slot)),
         _ParamSpec(style.topk_index, style.topk_kwarg_name, _shard),
         _ParamSpec(style.query_rope_index, style.query_rope_kwarg_name, _shard),
         _ParamSpec(style.key_rope_index, style.key_rope_kwarg_name, _replicate("key_rope")),
@@ -276,6 +415,8 @@ def _apply_sparse_attention_boundary(
     def _pre_hook(hook_module, args, kwargs):
         new_args = list(args)
         new_kwargs = dict(kwargs)
+        if style.shared_replicate_cache is not None:
+            style.shared_replicate_cache.begin()
         _record_query_output_layout(
             hook_module,
             _read_value(new_args, new_kwargs, style.query_index, style.query_kwarg_name),
@@ -405,6 +546,8 @@ class DSASparseAttentionContextParallel(ParallelStyle):
             query_rope_kwarg_name: Optional[str] = "query_rope",
             key_rope_kwarg_name: Optional[str] = "key_rope",
             use_local_output: bool = False,
+            shared_replicate_cache: Optional[DSASequenceReplicateCache] = None,
+            share_key_value: bool = False,
     ) -> None:
         super().__init__()
         _configure_sparse_attention_boundary(
@@ -424,6 +567,8 @@ class DSASparseAttentionContextParallel(ParallelStyle):
             query_rope_kwarg_name=query_rope_kwarg_name,
             key_rope_kwarg_name=key_rope_kwarg_name,
             use_local_output=use_local_output,
+            shared_replicate_cache=shared_replicate_cache,
+            share_key_value=share_key_value,
         )
 
     def __repr__(self) -> str:
@@ -491,6 +636,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
             query_rope_kwarg_name: Optional[str] = None,
             key_rope_kwarg_name: Optional[str] = None,
             use_local_output: bool = False,
+            shared_replicate_cache: Optional[DSASequenceReplicateCache] = None,
     ) -> None:
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
@@ -526,6 +672,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
         self.query_rope_kwarg_name = query_rope_kwarg_name
         self.key_rope_kwarg_name = key_rope_kwarg_name
         self.use_local_output = use_local_output
+        self.shared_replicate_cache = shared_replicate_cache
 
     def __repr__(self) -> str:
         return (
@@ -633,6 +780,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
             specs: list[_ParamSpec],
             local_idx: int,
             cp_mesh: DeviceMesh,
+            completion_fn: Optional[Callable[[], None]] = None,
     ) -> Module:
         """Register indexer-loss hooks driven by parameter specs."""
         def _pre_hook(hook_module, args, kwargs):
@@ -647,7 +795,11 @@ class DSAIndexerLossContextParallel(ParallelStyle):
             key_shape = self._read_key_indexer_shape(new_args, new_kwargs)
             setattr(hook_module, "_hp_dsa_loss_key_index_local_shape", key_shape)
             setattr(hook_module, "_hp_dsa_loss_local_idx", local_idx)
-            _apply_param_specs(new_args, new_kwargs, specs)
+            try:
+                _apply_param_specs(new_args, new_kwargs, specs)
+            finally:
+                if completion_fn is not None:
+                    completion_fn()
             return tuple(new_args), new_kwargs
 
         platform.register_forward_pre_hook(module, _pre_hook, with_kwargs=True)
@@ -659,14 +811,28 @@ class DSAIndexerLossContextParallel(ParallelStyle):
         cp_mesh = _ensure_1d(device_mesh)
 
         def replicate(value: Any) -> Any:
+            """Replicate a key tensor without sharing its gradient path."""
             return self._replicate_key_side(value, cp_mesh)
+
+        def shared_replicate(slot_name: str, value: Any) -> Any:
+            """Reuse a gradient-safe main-attention activation when enabled."""
+            if self.shared_replicate_cache is None:
+                return replicate(value)
+            return self.shared_replicate_cache.replicate(slot_name, value, cp_mesh, self.seq_dim)
 
         specs = self._build_loss_specs(
             cp_mesh,
             replicate_fn_map={
-                "key": replicate,
+                "key": lambda value: shared_replicate("main_kv", value),
                 "key_indexer": replicate,
-                "key_rope": replicate,
+                "key_rope": lambda value: shared_replicate("key_rope", value),
             },
         )
-        return self._apply_with_loss_specs(module, specs, self._get_local_idx(cp_mesh), cp_mesh)
+        completion_fn = self.shared_replicate_cache.clear if self.shared_replicate_cache is not None else None
+        return self._apply_with_loss_specs(
+            module,
+            specs,
+            self._get_local_idx(cp_mesh),
+            cp_mesh,
+            completion_fn=completion_fn,
+        )
