@@ -28,16 +28,16 @@ Test strategy:
     atol=1e-3`` tolerances.
 """
 from copy import deepcopy
+
 import torch
 import torch.distributed as dist
 
 from hyper_parallel import init_device_mesh
-from hyper_parallel.platform.torch.common import FeedForward, MoE
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
+from hyper_parallel.platform.torch.common import FeedForward, MoE
 from tests.torch.utils import _DEVICE_TYPE, init_backend
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -303,6 +303,22 @@ def test_ep_grouped_mm_npu():
     _npu_precision_close(
         gmm_x_grad, ref_x_grad, label=f"rank{rank} grouped_mm input gradient", rtol=1e-2, atol=1e-2
     )
+    for weight_name in ("w1", "w2", "w3"):
+        ref_grad = getattr(ref_moe.experts, weight_name).grad
+        gmm_grad = getattr(gmm_moe.experts, weight_name).grad
+        assert ref_grad is not None and gmm_grad is not None, (
+            f"rank{rank} grouped_mm {weight_name} gradient is missing: "
+            f"reference={ref_grad is not None}, grouped_mm={gmm_grad is not None}."
+        )
+        ref_local_grad = ref_grad.to_local() if isinstance(ref_grad, DTensor) else ref_grad
+        gmm_local_grad = gmm_grad.to_local() if isinstance(gmm_grad, DTensor) else gmm_grad
+        _npu_precision_close(
+            gmm_local_grad,
+            ref_local_grad,
+            label=f"rank{rank} grouped_mm {weight_name} gradient",
+            rtol=1e-2,
+            atol=1e-2,
+        )
 
 
 # ---------------------------------------------------------------------------

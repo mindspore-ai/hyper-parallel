@@ -24,23 +24,31 @@ Distributed collectives are handled by
 :mod:`hyper_parallel.core.expert_parallel.expert_parallel`; this module
 contains only single-device computation.
 """
+from __future__ import annotations
+
 __all__ = [
     "FeedForward",
     "GroupedExperts",
-    "TokenChoiceTopKRouter",
     "MoE",
     "MoEAuxLossAutoScaler",
+    "TokenChoiceTopKRouter",
     "update_expert_bias",
 ]
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
+from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.core.dtensor.dtensor import DTensor
+
+
+def _is_npu_tensor(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor is stored on an Ascend NPU."""
+    return tensor.device.type == "npu"
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +61,7 @@ def _run_experts_for_loop(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
-    scores: Optional[torch.Tensor] = None,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run per-expert SwiGLU via a sequential loop (reference path).
 
@@ -108,7 +116,7 @@ def _run_experts_grouped_mm_gpu(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
-    scores: Optional[torch.Tensor] = None,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused grouped matmul path for NVIDIA GPU using ``torch._grouped_mm``.
 
@@ -147,7 +155,7 @@ def _run_experts_grouped_mm_npu(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
-    scores: Optional[torch.Tensor] = None,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused grouped matmul path for Ascend NPU using ``torch_npu.npu_grouped_matmul``.
 
@@ -160,42 +168,26 @@ def _run_experts_grouped_mm_npu(
         x: Shape ``[total_routed_tokens, dim]``.
         num_tokens_per_expert: 1-D integer tensor of length ``num_experts``.
         scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
-            Routing weights applied to intermediate activations (``silu(w1(x)) * w3(x)``)
-            before the w2 projection. When ``None``, no weighting is applied.
-            Defaults to ``None``.
+            Routing weights applied after the bias-free w2 projection.
+            When ``None``, no weighting is applied. Defaults to ``None``.
 
     Returns:
         Expert output of shape ``[total_routed_tokens, dim]``.
     """
-    import torch_npu  # pylint: disable=C0415
+    if x.shape[0] == 0:
+        parameter_zero = (w1.sum() + w2.sum() + w3.sum()).to(x.dtype) * 0.0
+        return x + parameter_zero
 
-    # npu_grouped_matmul computes y = x @ weight (no implicit transpose).
-    # Our weight storage is [num_experts, out_dim, in_dim], matching F.linear's
-    # convention (weight.T for y = x @ weight.T). Transpose each expert shard
-    # so the shapes satisfy: [tokens, in_dim] @ [in_dim, out_dim] = [tokens, out_dim].
-    num_experts = w1.shape[0]
-    counts = num_tokens_per_expert.tolist()
-    x_list = list(torch.split(x, counts, dim=0))
-    # w1, w3: [E, hidden_dim, dim]  → transposed per-expert: [dim, hidden_dim]
-    # w2:     [E, dim, hidden_dim]  → transposed per-expert: [hidden_dim, dim]
-    w1_list = [w1[e].T.contiguous() for e in range(num_experts)]
-    w2_list = [w2[e].T.contiguous() for e in range(num_experts)]
-    w3_list = [w3[e].T.contiguous() for e in range(num_experts)]
-
-    # npu_grouped_matmul: multi-multi-multi mode (x[i] @ weight[i]).
-    # group_type=-1 selects independent per-expert matmul (no shared axis).
-    h1_list = torch_npu.npu_grouped_matmul(x_list, w1_list, group_type=-1)
-    h3_list = torch_npu.npu_grouped_matmul(x_list, w3_list, group_type=-1)
-    h_list = [F.silu(h1) * h3 for h1, h3 in zip(h1_list, h3_list)]
+    gate_up_weight = torch.cat((w1, w3), dim=1)
+    output = npu_grouped_swiglu(
+        x,
+        gate_up_weight,
+        w2,
+        num_tokens_per_expert,
+    )
     if scores is not None:
-        offset = 0
-        for i, h in enumerate(h_list):
-            n = counts[i]
-            if n > 0:
-                h_list[i] = h * scores[offset:offset + n].unsqueeze(-1)
-            offset += n
-    out_list = torch_npu.npu_grouped_matmul(h_list, w2_list, group_type=-1)
-    return torch.cat(out_list, dim=0)
+        output = output * scores.to(output.dtype).unsqueeze(-1)
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +303,7 @@ class GroupedExperts(nn.Module):
         self,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
-        scores: Optional[torch.Tensor] = None,
+        scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run all experts on their assigned tokens.
 
@@ -321,7 +313,7 @@ class GroupedExperts(nn.Module):
             num_tokens_per_expert: 1-D integer tensor of length
                 ``num_local_experts`` with the token count per expert.
             scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
-                Routing weights applied to intermediate activations before w2.
+                Routing weights for each token's expert output.
                 When ``None``, no weighting is applied. Defaults to ``None``.
 
         Returns:
@@ -334,12 +326,10 @@ class GroupedExperts(nn.Module):
 
         if not self.use_grouped_mm:
             return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert, scores)
-
-        if hasattr(torch, 'npu') and torch.npu.is_available():
+        if _is_npu_tensor(x):
             return _run_experts_grouped_mm_npu(w1, w2, w3, x, num_tokens_per_expert, scores)
-        if torch.cuda.is_available():
+        if x.device.type == "cuda":
             return _run_experts_grouped_mm_gpu(w1, w2, w3, x, num_tokens_per_expert, scores)
-
         return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert, scores)
 
 
@@ -376,8 +366,8 @@ class TokenChoiceTopKRouter(nn.Module):
         num_experts: int,
         top_k: int = 1,
         score_func: str = "sigmoid",
-        num_expert_groups: Optional[int] = None,
-        num_limited_groups: Optional[int] = None,
+        num_expert_groups: int | None = None,
+        num_limited_groups: int | None = None,
         route_scale: float = 1.0,
     ) -> None:
         """Initialize the top-K router.
@@ -411,7 +401,7 @@ class TokenChoiceTopKRouter(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        expert_bias: Optional[torch.Tensor] = None,
+        expert_bias: torch.Tensor | None = None,
     ) -> tuple:
         """Compute routing scores and top-K expert assignments.
 
@@ -493,7 +483,7 @@ def _compute_load_balance_loss(
     top_scores: torch.Tensor,
     selected_experts: torch.Tensor,
     num_experts: int,
-    sequence_partition_group: Optional[Any] = None,
+    sequence_partition_group: Any | None = None,
 ) -> torch.Tensor:
     """Compute load-balance auxiliary loss.
 
@@ -579,7 +569,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
     Reference: Megatron-LM ``megatron/core/transformer/moe/moe_utils.py``
     """
 
-    main_loss_backward_scale: Optional[torch.Tensor] = None
+    main_loss_backward_scale: torch.Tensor | None = None
 
     @staticmethod
     def forward(ctx: Any, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
@@ -688,10 +678,10 @@ class MoE(nn.Module):
         num_experts: int,
         top_k: int = 1,
         score_before_experts: bool = True,
-        load_balance_coeff: Optional[float] = None,
-        sequence_partition_group: Optional[Any] = None,
-        shared_expert: Optional[FeedForward] = None,
-        router_kwargs: Optional[dict] = None,
+        load_balance_coeff: float | None = None,
+        sequence_partition_group: Any | None = None,
+        shared_expert: FeedForward | None = None,
+        router_kwargs: dict | None = None,
         use_grouped_mm: bool = False,
     ) -> None:
         """Initialize MoE block with experts, router and optional shared expert.
@@ -723,7 +713,7 @@ class MoE(nn.Module):
         self.score_before_experts = score_before_experts
         self.load_balance_coeff = load_balance_coeff
         self.sequence_partition_group = sequence_partition_group
-        self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_aux_loss: torch.Tensor | None = None
         self.enable_expert_bias = True
 
         # Auxiliary-loss-free load-balance buffers (no gradient).
@@ -734,7 +724,7 @@ class MoE(nn.Module):
         self,
         selected_experts: torch.Tensor,
         top_scores: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute token-major → expert-major permutation indices.
 
         Args:
@@ -918,7 +908,7 @@ class MoE(nn.Module):
 # ---------------------------------------------------------------------------
 
 def update_expert_bias(
-    moe: "MoE",
+    moe: MoE,
     lr: float = 1e-3,
     num_recomputations: int = 1,
 ) -> None:

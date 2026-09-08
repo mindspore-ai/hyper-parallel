@@ -16,15 +16,15 @@
 __all__ = [
     "FeedForward",
     "GroupedExperts",
-    "TokenChoiceTopKRouter",
     "MoE",
+    "TokenChoiceTopKRouter",
     "update_expert_bias",
 ]
 
 from hyper_parallel.platform.torch.common.moe import (
     FeedForward,
     GroupedExperts,
-    TokenChoiceTopKRouter,
     MoE,
+    TokenChoiceTopKRouter,
     update_expert_bias,
 )

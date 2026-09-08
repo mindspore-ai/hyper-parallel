@@ -73,12 +73,11 @@ class TestMulticoreNative(unittest.TestCase):
             _loader, "sys", SimpleNamespace(modules={})
         ), patch.object(
             _loader, "_component_root", return_value=self.native_root
+        ), self.assertRaisesRegex(
+            NativeComponentUnavailableError,
+            f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {self.native_root / 'set_env.bash'}",
         ):
-            with self.assertRaisesRegex(
-                NativeComponentUnavailableError,
-                f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {self.native_root / 'set_env.bash'}",
-            ):
-                _loader.require_multicore_environment()
+            _loader.require_multicore_environment()
 
     def test_missing_opp_environment_after_framework_import_is_too_late(self):
         """The loader rejects activation after framework initialization."""
@@ -86,12 +85,11 @@ class TestMulticoreNative(unittest.TestCase):
             _loader, "sys", SimpleNamespace(modules={"mindspore": object()})
         ), patch.object(
             _loader, "_component_root", return_value=self.native_root
+        ), self.assertRaisesRegex(
+            NativeComponentUnavailableError,
+            f"HP-NATIVE-OPP-ACTIVATION-TOO-LATE.*source {self.native_root / 'set_env.bash'}",
         ):
-            with self.assertRaisesRegex(
-                NativeComponentUnavailableError,
-                f"HP-NATIVE-OPP-ACTIVATION-TOO-LATE.*source {self.native_root / 'set_env.bash'}",
-            ):
-                _loader.require_multicore_environment()
+            _loader.require_multicore_environment()
 
     def test_adapter_load_error_has_stable_native_diagnostic(self):
         """An ABI loader failure is wrapped with component and recovery context."""
@@ -102,12 +100,11 @@ class TestMulticoreNative(unittest.TestCase):
             _loader.importlib.util, "spec_from_file_location", return_value=spec
         ), patch.object(
             _loader.importlib.util, "module_from_spec", return_value=module
+        ), self.assertRaisesRegex(
+            NativeComponentUnavailableError,
+            "HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED.*bad ABI",
         ):
-            with self.assertRaisesRegex(
-                NativeComponentUnavailableError,
-                "HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED.*bad ABI",
-            ):
-                _loader.load_cpython_extension("hp_bad_adapter", Path("bad.so"))
+            _loader.load_cpython_extension("hp_bad_adapter", Path("bad.so"))
 
         self.assertNotIn("hp_bad_adapter", _loader.sys.modules)
 
@@ -118,12 +115,11 @@ class TestMulticoreNative(unittest.TestCase):
             _loader.importlib.util, "spec_from_file_location", return_value=spec
         ), patch.object(
             _loader.importlib.util, "module_from_spec", side_effect=ImportError("file too short")
+        ), self.assertRaisesRegex(
+            NativeComponentUnavailableError,
+            "HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED.*file too short",
         ):
-            with self.assertRaisesRegex(
-                NativeComponentUnavailableError,
-                "HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED.*file too short",
-            ):
-                _loader.load_cpython_extension("hp_broken_adapter", Path("broken.so"))
+            _loader.load_cpython_extension("hp_broken_adapter", Path("broken.so"))
 
         self.assertNotIn("hp_broken_adapter", _loader.sys.modules)
 
@@ -178,3 +174,29 @@ class TestMulticoreNative(unittest.TestCase):
                     cann_environment[variable],
                     f"The ST helper did not restore parent rank metadata: variable={variable}",
                 )
+
+    def test_st_framework_probe_only_skips_an_absent_adapter(self):
+        """The ST probe skips an unbuilt target but exposes a broken adapter to its worker."""
+        helper_path = Path(__file__).resolve().parents[2] / "common" / "multicore_test_env.py"
+        helper_spec = importlib.util.spec_from_file_location("hp_multicore_test_env", helper_path)
+        self.assertIsNotNone(helper_spec)
+        self.assertIsNotNone(helper_spec.loader)
+        test_env = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(test_env)
+        environment = {
+            "ASCEND_CUSTOM_OPP_PATH": str(self.vendor_root),
+            "LD_LIBRARY_PATH": str(self.vendor_root / "op_api" / "lib"),
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertTrue(test_env.multicore_framework_adapter_is_available("mindspore"))
+            self.assertFalse(test_env.multicore_framework_adapter_is_available("torch"))
+
+            broken_adapter = (
+                self.native_root / "framework" / "torch" / "libhyper_parallel_mega_moe_torch.so"
+            )
+            broken_adapter.parent.mkdir(parents=True)
+            broken_adapter.touch()
+            self.assertTrue(test_env.multicore_framework_adapter_is_available("torch"))
+
+            with self.assertRaisesRegex(ValueError, "Unsupported multicore framework"):
+                test_env.multicore_framework_adapter_is_available("jax")
