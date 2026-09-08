@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Set
 
 import torch.distributed as dist
 from torch import fx, nn
+from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.ops import _c10d_functional
 
 from ...parallel_config import PassConfig
@@ -289,7 +290,11 @@ class FSDPPass(GraphPass):
 
         After this, model.parameters() yields the local shards.
         """
-        rank = dist.get_rank()
+        # Use the FSDP group's local rank (NOT the global rank) as the
+        # chunk index — when fsdp_degree < world_size (TP+FSDP), the global
+        # rank exceeds the chunk count and causes IndexError.
+        fsdp_pg = _resolve_process_group(self._fsdp_group_name)
+        rank = dist.get_rank(group=fsdp_pg)
         sharded_count = 0
 
         for name, param in model.named_parameters():

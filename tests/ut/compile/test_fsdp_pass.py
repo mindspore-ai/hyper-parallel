@@ -61,6 +61,7 @@ from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
 from hyper_parallel.compile.sharding_config import PassPlan
 
 _DIST_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass.dist"
+_RESOLVE_PG_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass._resolve_process_group"
 
 
 @contextmanager
@@ -71,13 +72,16 @@ def _patch_dist(
 
     The pass only calls ``dist.is_initialized`` / ``dist.get_world_size`` /
     ``dist.get_rank`` at pass time (collectives are FX nodes, never executed),
-    so a single MagicMock covers every call.
+    so a single MagicMock covers every call.  ``_resolve_process_group`` is
+    patched as well so ``_shard_live_model_params`` can resolve the FSDP group
+    name without a real process group being registered.
     """
     mock_dist = MagicMock()
     mock_dist.is_initialized.return_value = initialized
     mock_dist.get_world_size.return_value = world_size
     mock_dist.get_rank.return_value = rank
-    with patch(_DIST_PATH, mock_dist):
+    mock_pg = MagicMock()
+    with patch(_DIST_PATH, mock_dist), patch(_RESOLVE_PG_PATH, return_value=mock_pg):
         yield mock_dist
 
 
