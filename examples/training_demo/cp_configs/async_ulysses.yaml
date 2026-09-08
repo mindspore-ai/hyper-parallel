@@ -46,10 +46,6 @@ plan_overrides:
     replace_module:
       _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_rms_norm
   - match: "*.self_attn"
-    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
-    replace_module:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_flash_attention
-  - match: "*.self_attn"
     when: cp
     region_dispatch: false
     inner_target: self
