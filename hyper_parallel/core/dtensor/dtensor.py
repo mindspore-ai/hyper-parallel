@@ -983,6 +983,10 @@ class DTensor(DTensorBase):
         return out.to_local()
 
 
+if platform.platform_type == PlatformType.PYTORCH:
+    platform.register_optimizer_tensor_type(DTensor)
+
+
 def _normalize_shard_dim(dim: int, ndim: int) -> int:
     return dim + ndim if dim < 0 else dim
 
