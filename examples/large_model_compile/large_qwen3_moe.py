@@ -19,7 +19,7 @@ from typing import Any, Optional
 from transformers import Qwen3MoeConfig, PreTrainedModel
 
 from hyper_parallel.models._transformers import HyperAutoModelForCausalLM
-from hyper_parallel.distributed import DistributedSetup
+from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models.build_options import CompileConfig
 
 

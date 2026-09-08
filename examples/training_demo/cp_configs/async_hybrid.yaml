@@ -1,7 +1,7 @@
 # Tiny Qwen3-MoE: asynchronous Hybrid CP (Ulysses degree 2, Colossal degree 2).
 
 model:
-  _target_: hyper_parallel.models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: ./examples/training_demo/tiny_qwen3_moe
   ignore_mismatched_sizes: false
   torch_dtype: bfloat16
