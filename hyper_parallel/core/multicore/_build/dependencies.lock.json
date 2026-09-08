@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "release_baseline": {
+    "cann": ">=9.1.0",
+    "glibc_policy": "runtime must satisfy the version requirements recorded by the release-built ELF payload",
+    "host_arches": [
+      "aarch64",
+      "x86_64"
+    ],
+    "python_abis": [
+      "cp310",
+      "cp311",
+      "cp312"
+    ],
+    "frameworks": {
+      "torch": "not pinned by the native build",
+      "torch_npu": "must match the installed torch and selected CANN >=9.1.0",
+      "torch_cxx11_abi": "reported by the active torch package"
+    }
+  },
+  "local_compatibility": {
+    "cann": [
+      ">=9.1.0"
+    ]
+  },
+  "components": {
+    "multicore": {
+      "ops_nn": {
+        "version": "v9.1.0.pre",
+        "repository": "https://gitcode.com/cann/ops-nn.git",
+        "tag_object": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+        "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+        "tree": "52694bc828b50c83f37781b9d4a378466410f671",
+        "git_archive_tar_sha256": "20e717c1004de51bc2de594509ffde1a2cf84911a20fc8ab610bb4ec508fe14d",
+        "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+        "patches": [
+          {
+            "path": "hyper_parallel/core/multicore/ops/swi_glu_fusion.patch",
+            "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
+            "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
+          }
+        ],
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+      },
+      "ops_transformer": {
+        "version": "v9.1.0.pre",
+        "repository": "https://gitcode.com/cann/ops-transformer.git",
+        "tag_object": "121f37def44062491173b5ccf34bddb500b95e47",
+        "commit": "121f37def44062491173b5ccf34bddb500b95e47",
+        "tree": "4c0ee7f90a7b91967c3cfb782745a70f92b20fe6",
+        "git_archive_tar_sha256": "00c8751c369b32373a3e77bce7f50efa1e239a1b2994db0cf79e07c85823a30d",
+        "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+        "patches": [
+          {
+            "path": "hyper_parallel/core/multicore/ops/grouped_matmul_fusion.patch",
+            "sha256": "53341da1cb6d8ca1a0bb3a16deaff8a67a2d01a4525fac8a8e529535330e2d9d",
+            "purpose": "expose the selected grouped-matmul path as an inline building block"
+          }
+        ],
+        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+      },
+      "shmem": {
+        "version": "d30702bb55d0",
+        "repository": "https://gitcode.com/cann/shmem.git",
+        "fetch_ref": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
+        "tag_object": null,
+        "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
+        "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
+        "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
+        "resolution": "exact upstream commit supporting CANN 9.1 and 9.2 native builds",
+        "patches": [],
+        "packaging_policy": {
+          "upstream_source_modified": false,
+          "private_sonames": [
+            "libhyper_parallel_shmem.so",
+            "libhyper_parallel_shmem_utils.so"
+          ],
+          "reason": "avoid collision with framework-provided libshmem.so in one process"
+        }
+      }
+    }
+  },
+  "current_repository_baseline": {
+    "shmem": "d30702bb55d0",
+    "ops_nn": "v9.1.0.pre",
+    "ops_transformer": "v9.1.0.pre",
+    "multicore_input": "locked ops-nn and ops-transformer kernel source plus the selected installed CANN >=9.1.0 toolchain"
+  }
+}

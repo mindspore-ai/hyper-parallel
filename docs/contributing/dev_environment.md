@@ -35,7 +35,7 @@ pip install -e .
 
 # native 本地开发；先 source 用户选择的 CANN 官方环境
 source /usr/local/Ascend/cann/set_env.sh
-./build.sh --multicore all --shmem all --custom-ops on --soc-list ascend910b,ascend910_93
+./build.sh --multicore on --custom-ops on --soc-list ascend910b,ascend910_93
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
 python your_program.py
@@ -47,7 +47,8 @@ source "$(command -v hyper_parallel_multicore_set_env.bash)"
 ```
 
 直接执行 `python setup.py bdist_wheel` 只生成 core-only wheel，不在 setup/pip 阶段下载或编译 native 依赖。
-完整依赖准备、optional 失败策略和 multicore `set_env.bash` 使用方式见 `scripts/native/README.md`。
+其他公共构建选项见[安装指南](../installation.md)。Multicore 的依赖和 CANN custom OPP 激活方式见
+[Multicore 构建与使用](../../hyper_parallel/core/multicore/docs/build.md)。
 
 ## 安装开发依赖
 
@@ -68,6 +69,7 @@ pip install pytest pylint markdownlint
 - **Imports**：
   - `core/`、`collectives/`、`tests/` 等：模块顶部 import
   - `platform/torch/**`、`platform/mindspore/**`：方法内 lazy import torch/mindspore
+  - `core/multicore/**`：Torch-only 组件，模块顶部直接 import Torch，不使用 Platform 分发
 
 ## Git 工作流
 

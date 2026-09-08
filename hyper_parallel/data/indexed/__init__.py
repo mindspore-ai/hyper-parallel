@@ -19,3 +19,16 @@ Moved from ``components/datasets/llm/indexed_*`` and
 (05 §11.4/§11.6). Submodules are imported by full path; this package keeps
 no flat re-exports.
 """
+
+from pathlib import Path
+
+
+def _extend_native_path(package_file: str, package_path: list[str]) -> None:
+    """Make the source-build helper visible without copying binaries into source."""
+    repository = Path(package_file).resolve().parents[3]
+    native = repository / "build/native/payload/hyper_parallel/data/indexed"
+    if (repository / "setup.py").is_file() and native.is_dir() and str(native) not in package_path:
+        package_path.append(str(native))
+
+
+_extend_native_path(__file__, __path__)

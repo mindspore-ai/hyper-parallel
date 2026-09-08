@@ -172,15 +172,6 @@ performance.
     - [x] SAPP-PPB: Pipeline Parallelism Balancing
     - [ ] SAPP-Omni
 
-- One-Sided Communication
-    - [x] Symmetric Memory
-    - [x] AllGather
-    - [x] AllGatherMatmul / MatmulReduceScatter (MC2 fused communication ops)
-    - [ ] AllToAll
-    - [ ] AllReduce
-    - [ ] ReduceScatter
-    - [ ] Low-Precision Communication with High-Precision Accumulation
-
 - Fast Fault Recovery
     - [x] DCP (Distributed Checkpoint)
         - [x] Distributed checkpoint save/load
@@ -242,105 +233,33 @@ In shells such as zsh, quote package names with extras so `[]` is not treated as
 
 ### 2. Build a Wheel From Source
 
-Building hyper-parallel from source can compile three optional native modules: `multicore`, `symmetric memory`, and
-`custom ops`. The indexed Dataset C++ helper is a required wheel artifact and is built on every `build.sh` invocation.
+The common build entry invokes the selected component build scripts and assembles one wheel.
+The indexed Dataset C++ helper is built on every invocation. Multicore includes its private
+SHMEM dependency and therefore has no separate SHMEM build option.
 
-Building a whl with `build.sh` supports the following build arguments:
-
-| Argument       | Default     | Values                                                                  | Description                                                                                                                   |
-|----------------|-------------|-------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
-| `--multicore`  | `all`       | `off`, `mindspore`, `ms`, `torch`, `pytorch`, `all`, `both`             | Controls the multicore build scope; `ms` is equivalent to `mindspore`, `pytorch` is equivalent to `torch`, and `both` is equivalent to `all` |
-| `--shmem`      | `all`       | `off`, `mindspore`, `ms`, `torch`, `pytorch`, `all`, `both`             | Controls the symmetric memory build scope; `all` builds the common library, MindSpore wrapper, and PyTorch wrapper             |
-| `--custom-ops` | `on`        | `on`, `off`                                                             | Enables or disables the MindSpore custom-ops build                                                                            |
-| `--soc-list`   | `ascend910b,ascend910_93` | Comma-separated selection of `ascend910b`, `ascend910_93`, and `ascend950` | Selects packaged kernels; `ascend910b` (910B) and `ascend910_93` (910C) are supported; `ascend950` reports an optional failure |
-| `--strict`     | `off`       | `on`, `off`                                                             | `off` retains the wheel with a structured warning; use `on` for an explicitly strict developer build                          |
-| `--jobs`       | `nproc`     | Positive integer                                                        | Sets native compilation parallelism                                                                                            |
-| `--clean`      | disabled    | Flag                                                                    | Rebuilds selected component work/install outputs while retaining downloaded dependencies                                      |
-
-Source build environment requirements for hyper-parallel are as follows:
-
-| Environment item                | Requirement                                                               | Notes                                                                                                             |
-|---------------------------------|---------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| Python                          | 3.10, 3.11, or 3.12                                                       | The built whl can only be installed into the matching Python minor version                                        |
-| Python build packages           | `setuptools`, `wheel`, and `pybind11`                                     | `pybind11` and the active Python development headers are required by the indexed Dataset helper                   |
-| Host C/C++ toolchain            | GCC/G++ >= 7.3.0 with C++17 support                                       | GCC/G++ 7.3.0--11.3.0 is recommended; newer versions emit a warning                                               |
-| Host architecture               | `aarch64` or `x86_64`                                                     | Each whl targets one host architecture and one CPython ABI                                                         |
-| CMake                           | >= 3.18                                                                   | Required for native extension builds                                                                              |
-| Linux build tools               | GNU Make, Git, binutils, coreutils, `tar`, `sed`, and `awk`               | Required by dependency preparation, ELF validation, and the CANN operator build pipeline                          |
-| CANN toolkit and ops packages   | >= 9.1.0 complete development environment                                 | Source the selected CANN `set_env.sh`; it must provide `bisheng`, `asc_opc`, headers, `libopapi.so`, and `ops_base` |
-| Ninja                           | Available on `PATH` for MindSpore native targets                          | Required by `CustomOpBuilder` builds                                                                               |
-| MindSpore                       | >= 2.10                                                                   | Required when `--custom-ops on`, `--multicore mindspore/all`, or `--shmem all/mindspore`                          |
-| PyTorch and NPU adapter package | Backend-compatible pair                                                  | Required when `--multicore torch/all`, or `--shmem all/torch`; the build uses the pair and C++ ABI from the active environment |
+| Argument       | Default                         | Values     | Description                                      |
+|----------------|---------------------------------|------------|--------------------------------------------------|
+| `--multicore`  | `on`                            | `on`, `off` | Build the Torch Multicore component and SHMEM.   |
+| `--custom-ops` | `on`                            | `on`, `off` | Build MindSpore custom ops.                      |
+| `--soc-list`   | `ascend910b,ascend910_93`       | SoC list   | Select the Multicore kernel targets.             |
+| `--strict`     | `off`                           | `on`, `off` | Stop if a selected optional component fails.     |
+| `--jobs`       | `nproc`                         | Integer    | Set native compilation parallelism.              |
+| `--clean`      | disabled                        | Flag       | Rebuild selected component work and install data. |
 
 ```bash
-git clone https://gitcode.com/mindspore/hyper-parallel.git
-cd hyper-parallel
-
-# The default CANN installation is sourced automatically when needed. Source a
-# custom installation explicitly before build.sh.
-./build.sh
-./build.sh --multicore all --shmem all --custom-ops on --soc-list ascend910b,ascend910_93
-./build.sh --multicore torch --shmem torch --strict off
-./build.sh --multicore off --shmem off --custom-ops off
-# Install the exact wheel path printed by build.sh.
-wheel_path=/absolute/path/printed/by/build.sh
-pip install "${wheel_path}"
+./build.sh --help
+./build.sh --multicore on --custom-ops on --soc-list ascend910b,ascend910_93
+./build.sh --strict on --jobs 24
+pip install /absolute/path/to/the-built-wheel.whl
 ```
 
-Every `build.sh` invocation freshly assembles `build/native/payload/hyper_parallel` from component install roots and
-creates a wheel and prints its exact path. PYTHONPATH development uses that same payload. A successful component
-script refreshes its own payload slice for focused incremental builds. Heavy SHMEM and per-SoC vendor caches are retained by default; lightweight
-framework adapters are rebuilt from clean framework-identity work directories on every invocation. Use `--clean` to
-rebuild all work for the selected components. A matching dependency cache is reused automatically; absent or
-inconsistent locked dependencies are downloaded/refreshed.
+Generic prerequisites are Python 3.10–3.12, Python development headers, setuptools,
+wheel, pybind11 and a C++17 host toolchain. SDK, framework and device constraints
+are component-specific. A wheel targets one Python ABI and host architecture;
+its runtime must satisfy the framework ABI and the ELF glibc requirements.
 
-MindSpore adapters are built with `ops.CustomOpBuilder`. PyTorch adapters are plain CMake shared libraries loaded with
-`torch.ops.load_library()`; they do not use setuptools compiler internals, `NpuExtension`, or `find_package(Torch)`.
-The build locates Torch and torch_npu in the active Python environment and validates every required header and library.
-
-For a multi-SoC multicore build, HyperParallel builds the HyperMegaMoe vendor for every selected kernel target and
-combines the resulting kernel/config trees into one package. The package carries one common host payload after the
-vendor inputs and host ABI have been checked for consistency.
-
-> Note: the built whl has requirements on the glibc version of the runtime environment. The glibc version in the
-> installation environment must be no lower than the glibc version in the build environment.
-> If you need to deploy to an older system, build inside an older release image. For example, a whl built on OpenEuler
-> 22.03 (glibc 2.34) cannot run in an environment with glibc < 2.34.
-> Release wheels use the glibc baseline selected by the release environment. The resulting ELF payload determines the
-> required runtime glibc floor.
-
-Native source builds and prebuilt release wheels require CANN 9.1.0 or newer. Source the selected CANN `set_env.sh`
-before building; the build reads the exported `ASCEND_HOME_PATH`. The default CANN path is activated automatically.
-
-### 3. Activate the Multicore Custom OPP Environment
-
-Both an installed wheel and a PYTHONPATH development build require the packaged multicore `set_env.bash` before the
-application or framework Python process starts. The script activates the adjacent CANN custom OPP vendor for that shell.
-
-For a PYTHONPATH development build:
-
-```bash
-source /usr/local/Ascend/cann/set_env.sh
-export PYTHONPATH=/path/to/hyper-parallel:${PYTHONPATH:-}
-source /path/to/hyper-parallel/build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
-python application.py
-```
-
-Start the application or framework Python process after sourcing the payload script.
-
-For an installed wheel:
-
-```bash
-source /usr/local/Ascend/cann/set_env.sh
-source "$(command -v hyper_parallel_multicore_set_env.bash)"
-python application.py
-```
-
-After wheel installation, source the locator installed in the active Python environment's `bin` directory.
-
-Run the script before importing MindSpore or torch/torch_npu. Missing activation reports
-`HP-NATIVE-OPP-NOT-ACTIVATED`; detecting it after a framework import reports
-`HP-NATIVE-OPP-ACTIVATION-TOO-LATE` and requires a new Python process.
+See the [installation guide](docs/installation.md) for packaging details and the
+Multicore CANN custom OPP activation procedure.
 
 ## Quick Start
 
@@ -414,10 +333,6 @@ from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper, swap_w
 model.layers[0] = checkpoint_wrapper(model.layers[0])
 model.layers[1] = swap_wrapper(model.layers[1])
 ```
-
-7. Use MoE Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
-
-For details, see the [MoE Multi-Core Parallelism Guide](./docs/guide/multicore_moe.md).
 
 ## Documentation
 

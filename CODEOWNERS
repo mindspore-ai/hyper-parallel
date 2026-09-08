@@ -72,3 +72,7 @@
 /.gitmodules  @yangzhenzhang
 /requirements.txt  @yangzhenzhang
 /setup.py  @yangzhenzhang
+
+/hyper_parallel/core/multicore/ @david-he91 @probiotics_53
+/tests/ut/core/multicore/ @david-he91 @probiotics_53
+/tests/torch/multicore/ @david-he91 @probiotics_53

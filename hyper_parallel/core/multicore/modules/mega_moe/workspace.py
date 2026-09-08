@@ -20,12 +20,12 @@ import os
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from importlib import import_module
 from typing import Any
+
+import torch
 
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
-torch = import_module("torch")
 
 _GMM_WORKSPACE_BYTES = 32 * 1024 * 1024
 _SWIGLU_GRAD_WORKSPACE_BYTES = 16 * 1024 * 1024

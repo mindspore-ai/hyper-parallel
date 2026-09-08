@@ -17,8 +17,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib import import_module
 from typing import Any
+
+import torch
 
 import numpy as np
 
@@ -50,7 +51,6 @@ from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
 from .spec import MegaMoeSpec
 
-torch = import_module("torch")
 
 
 @dataclass(frozen=True)

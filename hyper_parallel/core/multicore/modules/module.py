@@ -19,10 +19,10 @@ from __future__ import annotations
 import itertools
 import weakref
 from collections.abc import Iterable
-from importlib import import_module
 from typing import Any
 
-torch = import_module("torch")
+import torch
+
 
 
 class _ExecutionResourceGroup:

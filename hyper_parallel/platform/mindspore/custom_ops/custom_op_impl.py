@@ -129,7 +129,7 @@ except ImportError as error:
     raise ImportError(
         "[HP-NATIVE-LOAD-FAILED] component=custom_ops framework=mindspore. "
         "No compatible prebuilt extension could be loaded. For a source/PYTHONPATH checkout, run "
-        "`./build.sh --multicore off --shmem off --custom-ops on`."
+        "`./build.sh --multicore off --custom-ops on`."
     ) from error
 if not hasattr(_custom_ops, "npu_mhc_pre_clamp_sinkhorn"):
     raise ImportError(

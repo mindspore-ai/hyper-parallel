@@ -10,8 +10,6 @@
 # -----------------------------------------------------------------------------------------------------------
 # Shared CANN toolkit version checks for optional native component builds.
 
-HP_MINIMUM_CANN_VERSION="9.1.0"
-
 function hp_read_cann_version() {
     local ascend_home_path=$1
     awk -F= '$1 == "Version" {print $2}' "${ascend_home_path}/opp/version.info" 2>/dev/null || true
@@ -19,7 +17,7 @@ function hp_read_cann_version() {
 
 function hp_cann_version_at_least() {
     local actual_version=${1:-}
-    local minimum_version=${2:-${HP_MINIMUM_CANN_VERSION}}
+    local minimum_version=${2:?The calling component must supply its minimum CANN version}
     local actual_core=${actual_version%%[-+]*}
     local minimum_core=${minimum_version%%[-+]*}
     local -a actual_parts=()

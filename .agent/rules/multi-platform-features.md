@@ -6,7 +6,10 @@ paths:
   - hyper_parallel/platform/**
 ---
 
-## Multi-Platform & List/Collection APIs
+# Multi-Platform & List/Collection APIs
+
+`hyper_parallel/core/multicore/` is explicitly Torch-only; do not add a MindSpore mirror or
+Platform dispatch there. The list/collection and state-ownership contracts still apply.
 
 When implementing or changing features that (1) have both Torch and MindSpore paths, or (2) accept list/collection inputs (e.g. `fully_shard([m1, m2])`), ensure:
 

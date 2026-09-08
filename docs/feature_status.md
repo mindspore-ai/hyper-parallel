@@ -126,16 +126,6 @@
 - [x] SAPP-PPB：Pipeline Parallelism Balancing
 - [ ] SAPP-Omni
 
-## 单边通信
-
-- [x] Symmetric Memory
-- [x] AllGather
-- [x] AllGatherMatmul / MatmulReduceScatter（MC2 融合通信算子）
-- [ ] AllToAll
-- [ ] AllReduce
-- [ ] ReduceScatter
-- [ ] 低精通信高精累加
-
 ## 故障快速恢复
 
 - [x] DCP（Distributed Checkpoint）

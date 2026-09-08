@@ -63,26 +63,19 @@ git push upstream vX.Y.Z
 ```bash
 # 外部构建工程先选择 CANN 环境；统一入口完成依赖准备、native 编译和 wheel 打包
 source /usr/local/Ascend/cann/set_env.sh
-./build.sh --multicore all --shmem all --custom-ops on \
-  --soc-list ascend910b,ascend910_93 --strict off
+bash build.sh --multicore on --custom-ops on --strict on --jobs 24
 
 # 每个 Python ABI/host 架构一个 wheel，例如：
 # hyper_parallel-0.1.0-cp310-cp310-linux_aarch64.whl
 ```
 
-optional native 组件失败时仍保留 wheel，并在 build log 中记录稳定 reason code。native 能力缺失由
-Level 0 MegaMoe ST 和全量用例拦截。正式发布由版本指定的 glibc 基线构建、全量用例和人工评审共同决定，
-wheel 文件已生成不代表制品满足发布条件。native 制品要求 CANN >= 9.1.0。
+严格模式下，任一启用组件失败都会终止，本次不生成 wheel。开发场景使用默认 `--strict off` 时，optional
+native 组件失败会记录 warning 并继续组包；此时 wheel 生成不代表所有 optional 能力可用。正式发布由版本
+指定的 glibc 基线构建、全量用例和人工评审共同决定。native 制品要求 CANN >= 9.1.0。
 
 ### 6. 发布后验证
 
-HyperMegaMoe/multicore ST 必须在启动 pytest、MindSpore、Torch 或分布式 worker 前完成环境激活：
-
-```bash
-source /usr/local/Ascend/cann/set_env.sh
-source "$(command -v hyper_parallel_multicore_set_env.bash)"
-pytest tests/mindspore/st/multicore/test_moe.py
-```
+逐组件执行其声明的制品、导入和 ST 验证。需要激活 SDK/制品环境的组件必须先激活再启动测试。
 
 - [ ] README 中英文版本章节一致、代码示例可运行
 - [ ] 用户手册安装步骤在空环境可复现、特性文档代码示例与 examples/ 一致
@@ -90,8 +83,8 @@ pytest tests/mindspore/st/multicore/test_moe.py
 - [ ] Release Notes 变更分类准确、贡献者名单完整
 - [ ] 所有文档 markdown lint 通过
 - [ ] 交叉引用链接正确、术语一致
-- [ ] wheel/PYTHONPATH 均先 source 制品内 `set_env.bash`，四种框架 import 顺序和 clean-venv smoke 通过
-- [ ] 未 source 时稳定报 `HP-NATIVE-OPP-NOT-ACTIVATED`，框架已先导入时稳定报 `HP-NATIVE-OPP-ACTIVATION-TOO-LATE`
+- [ ] wheel/PYTHONPATH 的组件验证和 clean-venv smoke 通过
+- [ ] 所选组件的缺失依赖、环境未激活和 ABI 错误诊断符合各自契约
 - [ ] 目标 glibc 基线检查通过；910B/910C native 构建与用例通过，不支持的 SoC 返回明确 reason code
 
 ## 版本历史

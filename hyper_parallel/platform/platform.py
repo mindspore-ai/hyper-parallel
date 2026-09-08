@@ -1129,11 +1129,6 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement micro_batch")
 
     @staticmethod
-    def get_symmetric_memory_handler():
-        """Return a platform-specific symmetric memory handler instance."""
-        raise NotImplementedError("Platform subclasses must implement get_symmetric_memory_handler")
-
-    @staticmethod
     def load_into_param(param, data):
         """Load data into a parameter, handling framework-specific semantics."""
         raise NotImplementedError("Platform subclasses must implement load_into_param")

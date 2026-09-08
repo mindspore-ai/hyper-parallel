@@ -100,6 +100,14 @@ def _is_platform_agnostic_module(path: str) -> bool:
     return not any(part in normalized for part in PLATFORM_ALLOWED_PARTS)
 
 
+def _is_forbidden_backend(path: str, module_name: str) -> bool:
+    """Allow only Torch in the explicitly Torch-only Multicore component."""
+    backend = module_name.split(".", maxsplit=1)[0]
+    if backend == "torch" and "hyper_parallel/core/multicore/" in _normalize_path(path):
+        return False
+    return backend in BACKEND_IMPORTS
+
+
 class HyperParallelChecker(BaseChecker):
     """Custom checks for HyperParallel project style rules."""
 
@@ -173,8 +181,7 @@ class HyperParallelChecker(BaseChecker):
         if not _is_platform_agnostic_module(self._module_path):
             return
         for name, _ in node.names:
-            root_name = name.split(".", maxsplit=1)[0]
-            if root_name in BACKEND_IMPORTS:
+            if _is_forbidden_backend(self._module_path, name):
                 self.add_message("forbidden-backend-import", node=node, args=(name,))
 
     def visit_importfrom(self, node: nodes.ImportFrom) -> None:
@@ -186,8 +193,7 @@ class HyperParallelChecker(BaseChecker):
         if not _is_platform_agnostic_module(self._module_path):
             return
         module_name = node.modname or ""
-        root_name = module_name.split(".", maxsplit=1)[0]
-        if root_name in BACKEND_IMPORTS:
+        if _is_forbidden_backend(self._module_path, module_name):
             self.add_message("forbidden-backend-import", node=node, args=(module_name,))
 
     def visit_assign(self, node: nodes.Assign) -> None:

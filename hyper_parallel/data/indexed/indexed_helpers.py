@@ -17,8 +17,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import importlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+import sysconfig
+import time
 
 import numpy as np
+
 
 try:
     from hyper_parallel.data.indexed._indexed_helpers_cpp import (
@@ -27,12 +35,35 @@ try:
         build_sample_index_int64,
     )
 except ImportError as error:
-    raise ImportError(
-        "The native indexed Dataset helpers are not built. From the HyperParallel repository root, run "
-        "`bash build.sh --multicore off --shmem off --custom-ops off`. If HyperParallel is not installed in "
-        "editable mode, then install the generated wheel with "
-        "`pip install --force-reinstall dist/hyper_parallel-*.whl`."
-    ) from error
+    source_dir = Path(__file__).resolve().parent / "csrc"
+    library_path = source_dir.parent / f"_indexed_helpers_cpp{sysconfig.get_config_var('EXT_SUFFIX')}"
+    start_time = time.monotonic()
+
+    # Config resolution imports this module before the process group is initialized.
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        print("> compiling dataset index builder ...", flush=True)
+        subprocess.run(
+            ["make", "-B", "-C", str(source_dir), f"PYTHON={sys.executable}", f"OUTPUT={library_path}.tmp"],
+            check=True,
+        )
+        # Other ranks must only see the library once compilation has completed.
+        os.replace(f"{library_path}.tmp", library_path)
+        print(
+            f">>> done with dataset index builder. Compilation time: {time.monotonic() - start_time:.3f} seconds",
+            flush=True,
+        )
+    else:
+        while not library_path.is_file():
+            if time.monotonic() - start_time > 300:
+                raise ImportError("Timed out waiting for rank 0 to compile the Dataset C++ helpers.") from error
+            time.sleep(0.1)
+
+    importlib.invalidate_caches()
+    from hyper_parallel.data.indexed._indexed_helpers_cpp import (
+        build_blending_indices as _build_blending_indices_cpp,
+        build_sample_index_int32,
+        build_sample_index_int64,
+    )
 
 
 def build_sample_index(
