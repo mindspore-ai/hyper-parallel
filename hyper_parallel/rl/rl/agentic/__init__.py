@@ -14,42 +14,63 @@
 # ============================================================================
 """Business-neutral Agentic RL contracts and runtime orchestration."""
 
-from rl.agentic.core.runner import AgentRunner
-from rl.agentic.core.session import AgentSession
-from rl.agentic.core.types import (
-    Action,
-    AgentAction,
-    EpisodeContext,
-    EpisodeResult,
-    InteractionMode,
-    Observation,
-    RewardResult,
-    TerminationReason,
-    ToolCall,
-    ToolResult,
-    Transition,
-    TurnContext,
-    TurnResult,
-)
-from rl.agentic.envs.base import Environment
-from rl.agentic.envs.environment import (
-    ENVIRONMENTS,
-    RewardFunction,
-    ToolEnvironment,
-    load_agentic_module,
-)
-from rl.agentic.core.program_runner import AgentProgram, ProgramAgentRunner
-from rl.agentic.tools import Tool, ToolExecutor, ToolHandler, ToolRegistry
-from rl.agentic.tools.protocol import (
-    INTERACTION_PROTOCOLS,
-    InteractionProtocol,
-    JsonFunctionCallProtocol,
-    OpenAIToolCallProtocol,
-    ParsedAction,
-    ResponseParser,
-    ToolExecutorProtocol,
-)
-from rl.algorithm.reward import compute_rule_reward, extract_answer
+from importlib import import_module
+from typing import Any
+
+
+_EXPORTS = {
+    "Action": ("rl.agentic.core.types", "Action"),
+    "AgentAction": ("rl.agentic.core.types", "AgentAction"),
+    "AgentProgram": ("rl.agentic.core.program_runner", "AgentProgram"),
+    "AgentRunner": ("rl.agentic.core.runner", "AgentRunner"),
+    "AgentSession": ("rl.agentic.core.session", "AgentSession"),
+    "ENVIRONMENTS": ("rl.agentic.envs.environment", "ENVIRONMENTS"),
+    "Environment": ("rl.agentic.envs.base", "Environment"),
+    "EpisodeContext": ("rl.agentic.core.types", "EpisodeContext"),
+    "EpisodeResult": ("rl.agentic.core.types", "EpisodeResult"),
+    "INTERACTION_PROTOCOLS": ("rl.agentic.tools.protocol", "INTERACTION_PROTOCOLS"),
+    "InteractionMode": ("rl.agentic.core.types", "InteractionMode"),
+    "InteractionProtocol": ("rl.agentic.tools.protocol", "InteractionProtocol"),
+    "JsonFunctionCallProtocol": ("rl.agentic.tools.protocol", "JsonFunctionCallProtocol"),
+    "Observation": ("rl.agentic.core.types", "Observation"),
+    "OpenAIToolCallProtocol": ("rl.agentic.tools.protocol", "OpenAIToolCallProtocol"),
+    "ParsedAction": ("rl.agentic.tools.protocol", "ParsedAction"),
+    "ProgramAgentRunner": ("rl.agentic.core.program_runner", "ProgramAgentRunner"),
+    "ResponseParser": ("rl.agentic.tools.protocol", "ResponseParser"),
+    "RewardFunction": ("rl.agentic.envs.environment", "RewardFunction"),
+    "RewardResult": ("rl.agentic.core.types", "RewardResult"),
+    "TerminationReason": ("rl.agentic.core.types", "TerminationReason"),
+    "Tool": ("rl.agentic.tools", "Tool"),
+    "ToolCall": ("rl.agentic.core.types", "ToolCall"),
+    "ToolEnvironment": ("rl.agentic.envs.environment", "ToolEnvironment"),
+    "ToolExecutor": ("rl.agentic.tools", "ToolExecutor"),
+    "ToolExecutorProtocol": ("rl.agentic.tools.protocol", "ToolExecutorProtocol"),
+    "ToolHandler": ("rl.agentic.tools", "ToolHandler"),
+    "ToolRegistry": ("rl.agentic.tools", "ToolRegistry"),
+    "ToolResult": ("rl.agentic.core.types", "ToolResult"),
+    "Transition": ("rl.agentic.core.types", "Transition"),
+    "TurnContext": ("rl.agentic.core.types", "TurnContext"),
+    "TurnResult": ("rl.agentic.core.types", "TurnResult"),
+    "compute_rule_reward": ("rl.algorithm.reward", "compute_rule_reward"),
+    "extract_answer": ("rl.algorithm.reward", "extract_answer"),
+    "load_agentic_module": ("rl.agentic.envs.environment", "load_agentic_module"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load public agentic symbols only when a caller requests them."""
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from error
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose lazy public symbols to interactive callers."""
+    return sorted((*globals(), *_EXPORTS))
 
 
 __all__ = [

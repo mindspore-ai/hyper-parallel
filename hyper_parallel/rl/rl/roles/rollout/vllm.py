@@ -261,6 +261,11 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         """Return whether this client owns the endpoint's server process."""
         return self._process is not None
 
+    @property
+    def base_url(self) -> str:
+        """Return the shared inference endpoint."""
+        return self._base_url
+
     def _request(
         self,
         method: str,
@@ -749,6 +754,24 @@ class VLLMGenerationEngine:
         return self._trainer_tp_rank == 0
 
     @property
+    def inference_base_url(self) -> str:
+        """Return the sole shared vLLM endpoint used by protocol adapters."""
+        client = self._ensure_client()
+        base_url = getattr(client, "base_url", None)
+        if not isinstance(base_url, str) or not base_url:
+            raise RuntimeError("Shared vLLM client does not expose its inference endpoint")
+        return base_url
+
+    @property
+    def inference_model_name(self) -> str:
+        """Return the model identity exposed by the shared vLLM endpoint."""
+        return self._model.name
+
+    def generation_policy_identity(self) -> tuple[int, str]:
+        """Verify and return the exact policy identity served by vLLM."""
+        return self._weight_sync.generation_identity(self._ensure_client())
+
+    @property
     def request_owner_generate_count(self) -> int:
         """Return the number of generation calls owned by this rank."""
         return self._request_owner_generate_count
@@ -888,6 +911,14 @@ class VLLMGenerationEngine:
             command.append("--enable-prompt-tokens-details")
         if bool(self._config.get("skip_mm_profiling", False)):
             command.append("--skip-mm-profiling")
+        if bool(self._config.get("enable_auto_tool_choice", False)):
+            command.append("--enable-auto-tool-choice")
+        for key, option in (
+            ("tool_call_parser", "--tool-call-parser"),
+            ("reasoning_parser", "--reasoning-parser"),
+        ):
+            if self._config.get(key) is not None:
+                command.extend((option, str(self._config[key])))
         if self._deployment == "colocated":
             command.extend(
                 (
@@ -1385,6 +1416,21 @@ class VLLMGenerationEngine:
     def synchronize_error(self, local_error: Optional[Exception], operation: str) -> None:
         """Propagate rollout and postprocessing failures across training ranks."""
         synchronize_error(local_error, operation)
+
+    def synchronize_agent_payload(self, payload: Optional[Any]) -> Any:
+        """Replicate one external-agent result within each Trainer TP group."""
+        if self._trainer_tp_size == 1:
+            if payload is None:
+                raise RuntimeError("Agent request owner produced no trajectory payload")
+            return payload
+        gathered: list[Any] = [None] * self._trainer_tp_size
+        platform.all_gather_object(gathered, payload, self._trainer_tp_group)
+        if gathered[0] is None or any(item is not None for item in gathered[1:]):
+            raise RuntimeError(
+                "Trainer TP external-agent ownership is invalid: "
+                f"owners={[item is not None for item in gathered]}"
+            )
+        return gathered[0]
 
     def update_weights(self, snapshot: PolicySnapshot) -> None:
         """Transfer and publish a strictly newer policy snapshot."""

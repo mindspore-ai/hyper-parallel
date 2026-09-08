@@ -30,6 +30,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
 from rl.algorithm.loss import build_algorithm
+from rl.agentic.codex import CodexRuntime
+from rl.agentic.deepseek import DeepSeekRuntime
 from rl.config import (
     build_model_registration,
     build_runtime_config,
@@ -64,7 +66,11 @@ from rl.roles.model import (
     iter_hsdp_roots,
 )
 from rl.roles.rollout.registry import build_rollout_engine
-from rl.roles.rollout.worker import RolloutManager
+from rl.roles.rollout.worker import (
+    CodexRolloutManager,
+    DeepSeekRolloutManager,
+    RolloutManager,
+)
 from rl.roles.weight_sync.checkpoint import RLCheckpointManager
 from rl.roles.weight_sync.sync import PolicySnapshot
 from rl.utils.monitoring.metrics import (
@@ -948,30 +954,85 @@ class SyncTrainer:
             "eos_token_id": eos_token_ids[0],
             "eos_token_ids": eos_token_ids,
         }
-        self.rollout_manager = RolloutManager(
-            num_return_sequences=int(rollout_config["num_return_sequences"]),
-            max_new_tokens=int(rollout_config["max_new_tokens"]),
-            temperature=float(rollout_config.get("temperature", 1.0)),
-            top_p=float(rollout_config.get("top_p", 1.0)),
-            top_k=int(rollout_config.get("top_k", 0)),
-            do_sample=True,
-            collect_old_log_probs=self.algorithm.requirements.data.rollout_log_probs,
-            seed=(None if rollout_config.get("seed") is None else int(rollout_config["seed"])),
-            ignore_eos=bool(rollout_config.get("ignore_eos", False)),
-            **manager_kwargs,
-        )
-        self.evaluator: Optional[Evaluator] = None
-        if self._evaluation_enabled:
-            evaluation_rollout_manager = RolloutManager(
-                num_return_sequences=1,
-                max_new_tokens=int(evaluation_config["max_new_tokens"]),
-                temperature=float(evaluation_config.get("temperature", 1.0)),
-                top_p=float(evaluation_config.get("top_p", 1.0)),
-                top_k=int(evaluation_config.get("top_k", 0)),
-                do_sample=bool(evaluation_config.get("do_sample", False)),
-                ignore_eos=bool(evaluation_config.get("ignore_eos", False)),
+        generation_kwargs = {
+            "num_return_sequences": int(rollout_config["num_return_sequences"]),
+            "max_new_tokens": int(rollout_config["max_new_tokens"]),
+            "temperature": float(rollout_config.get("temperature", 1.0)),
+            "top_p": float(rollout_config.get("top_p", 1.0)),
+            "top_k": int(rollout_config.get("top_k", 0)),
+            "collect_old_log_probs": self.algorithm.requirements.data.rollout_log_probs,
+            "seed": None if rollout_config.get("seed") is None else int(rollout_config["seed"]),
+            "ignore_eos": bool(rollout_config.get("ignore_eos", False)),
+        }
+        runner_name = str(agentic_config.get("runner", "internal"))
+        self.codex_runtime: Optional[CodexRuntime] = None
+        self.deepseek_runtime: Optional[DeepSeekRuntime] = None
+        if runner_name == "codex":
+            codex_config = {
+                **required_mapping(agentic_config, "codex"),
+                "max_turns": int(agentic_config["max_turns"]),
+                "max_episode_tokens": agentic_config.get("max_episode_tokens"),
+            }
+            self.codex_runtime = CodexRuntime(self.rollout_engine, codex_config)
+            self.rollout_manager = CodexRolloutManager(
+                runtime=self.codex_runtime,
+                pad_token_id=int(self.tokenizer.pad_token_id),
+                eos_token_id=eos_token_ids[0],
+                **generation_kwargs,
+            )
+        elif runner_name == "deepseek":
+            deepseek_config = {
+                **required_mapping(agentic_config, "deepseek"),
+                "max_turns": int(agentic_config["max_turns"]),
+                "max_episode_tokens": agentic_config.get("max_episode_tokens"),
+            }
+            self.deepseek_runtime = DeepSeekRuntime(self.rollout_engine, deepseek_config)
+            self.rollout_manager = DeepSeekRolloutManager(
+                runtime=self.deepseek_runtime,
+                pad_token_id=int(self.tokenizer.pad_token_id),
+                eos_token_id=eos_token_ids[0],
+                **generation_kwargs,
+            )
+        else:
+            self.rollout_manager = RolloutManager(
+                do_sample=True,
+                **generation_kwargs,
                 **manager_kwargs,
             )
+        self.evaluator: Optional[Evaluator] = None
+        if self._evaluation_enabled:
+            evaluation_kwargs = {
+                "num_return_sequences": 1,
+                "max_new_tokens": int(evaluation_config["max_new_tokens"]),
+                "temperature": float(evaluation_config.get("temperature", 1.0)),
+                "top_p": float(evaluation_config.get("top_p", 1.0)),
+                "top_k": int(evaluation_config.get("top_k", 0)),
+                "do_sample": bool(evaluation_config.get("do_sample", False)),
+                "ignore_eos": bool(evaluation_config.get("ignore_eos", False)),
+            }
+            if self.codex_runtime is not None:
+                evaluation_rollout_manager = CodexRolloutManager(
+                    runtime=self.codex_runtime,
+                    pad_token_id=int(self.tokenizer.pad_token_id),
+                    eos_token_id=eos_token_ids[0],
+                    collect_old_log_probs=False,
+                    seed=generation_kwargs["seed"],
+                    **evaluation_kwargs,
+                )
+            elif self.deepseek_runtime is not None:
+                evaluation_rollout_manager = DeepSeekRolloutManager(
+                    runtime=self.deepseek_runtime,
+                    pad_token_id=int(self.tokenizer.pad_token_id),
+                    eos_token_id=eos_token_ids[0],
+                    collect_old_log_probs=False,
+                    seed=generation_kwargs["seed"],
+                    **evaluation_kwargs,
+                )
+            else:
+                evaluation_rollout_manager = RolloutManager(
+                    **evaluation_kwargs,
+                    **manager_kwargs,
+                )
             max_samples = evaluation_config.get("max_samples")
             self.evaluator = Evaluator(
                 dataset=self.test_dataset,
@@ -1033,6 +1094,13 @@ class SyncTrainer:
                 logger.warning("Tracking cleanup failed: %s", exc)
             finally:
                 self._tracker = None
+        rollout_manager = getattr(self, "rollout_manager", None)
+        close_manager = getattr(rollout_manager, "close", None)
+        if callable(close_manager):
+            try:
+                close_manager()
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                logger.warning("Rollout manager cleanup failed: %s", exc)
         rollout_engine = getattr(self, "rollout_engine", None)
         close_rollout = getattr(rollout_engine, "close", None)
         if callable(close_rollout):

@@ -1,0 +1,177 @@
+model:
+  registry_name: qwen3_4b
+  name: qwen3
+  weights_path: /models/Qwen3-4B
+  tokenizer_path: /models/Qwen3-4B
+  config_overrides: null
+
+consistency:
+  enabled: false
+
+data:
+  train_path: /data/hotpotqa/train.parquet
+  test_path: /data/hotpotqa/test.parquet
+  prompt_column: prompt
+  answer_column: answer
+  max_prompt_length: 512
+  max_train_samples: 4
+  shuffle: false
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: true
+
+rollout:
+  engine: vllm
+  num_return_sequences: 4
+  max_new_tokens: 256
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  seed: 20260902
+  vllm:
+    deployment: colocated
+    data_parallel_size: 2
+    port: 8100
+    model_implementation: native
+    tensor_parallel_size: 1
+    weight_sync:
+      strategy: full_gather
+      fallback_strategy: none
+      bucket_size_mb: 128
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: true
+    batch_invariant: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    enable_auto_tool_choice: true
+    tool_call_parser: hermes
+    gpu_memory_utilization: 0.35
+    kv_cache_memory_bytes: 8589934592
+    max_model_len: 16384
+    block_size: 128
+    max_num_seqs: 4
+    max_num_batched_tokens: 16384
+    logprobs_mode: raw_logprobs
+    startup_timeout: 600
+    request_timeout: 600
+
+agentic:
+  runner: codex
+  module_path: examples.agents.search_R1.agent
+  environment: search_r1_local
+  interaction_mode: multi_turn
+  protocol: search_r1
+  apply_chat_template: true
+  max_turns: 4
+  max_observation_tokens: 512
+  max_episode_tokens: 12288
+  codex:
+    executable: codex
+    version: "0.152.1"
+    model: qwen3
+    reasoning_effort: medium
+    sandbox: danger-full-access
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 8200
+    timeout_seconds: 1800
+    request_timeout: 600
+    session_root: /results/codex-trajectories
+    reward_callable: examples.agents.search_R1.agent:score_codex_search_answer
+    instruction_template: |-
+      Use the configured search MCP tool when evidence is needed. You may search more than once.
+      Return only the short final answer, without explanation or XML tags.
+
+      Question: {prompt}
+    mcp_servers:
+      - name: search
+        command: python
+        required: true
+        inherit_env:
+          - PYTHONPATH
+        args:
+          - -m
+          - rl.agentic.mcp_server
+          - --factory
+          - examples.agents.search_R1.tools:build_codex_search_registry
+          - --settings-json
+          - '{"search_corpus_path":"/data/hotpotqa/corpus.jsonl","search_top_k":2,"search_max_query_chars":256,"search_max_document_chars":300}'
+
+evaluation:
+  enabled: false
+  batch_size: 1
+  max_samples: 1
+  max_new_tokens: 256
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  log_samples: 0
+  progress_steps: 0
+
+algorithm:
+  name: grpo
+  advantage_epsilon: 1.0e-6
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  clip_ratio_c: 3.0
+  kl_coef: 0.001
+  kl_type: low_var_kl
+  loss_aggregation: token-mean
+
+train:
+  max_steps: 2
+  seed: 1234
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 4
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate:
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+    require_fingerprint_change: false
+  accelerator:
+    dp_replicate: 1
+    dp_shard: 2
+    tp: 1
+    cp: 1
+    pp: 1
+    reshard_after_forward: true
+    comm_fusion: true
+    cpu_offload: true
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: null
+  optimizer:
+    lr: 1.0e-6
+    lr_min: 0.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    eps: 1.0e-8
+    betas: [0.9, 0.999]
+    foreach: null
+  checkpoint:
+    output_dir: /results/checkpoints
+    save_steps: 0
+    save_final: true
+    verify_reload: false
+
+logging:
+  backends: [console]
+  project_name: hyper-rl
+  experiment_name: qwen3_4b_codex_search_r1
+  log_steps: 1
+  log_samples: 2
+  wandb:
+    mode: disabled
+    entity: null
+    directory: /results/wandb

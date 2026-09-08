@@ -610,6 +610,9 @@ def _validate_vllm(
 
 def _validate_agentic(agentic: Mapping[str, Any]) -> None:
     """Validate the selected agent environment and turn limits."""
+    runner = agentic.get("runner", "internal")
+    if runner not in {"internal", "codex", "deepseek"}:
+        raise ValueError("agentic.runner must be 'internal', 'codex', or 'deepseek'")
     module_path = agentic.get("module_path")
     if module_path is not None:
         load_agentic_module(module_path)
@@ -636,6 +639,102 @@ def _validate_agentic(agentic: Mapping[str, Any]) -> None:
         raise ValueError("agentic.max_episode_tokens must be positive when configured")
     if not isinstance(agentic.get("apply_chat_template", False), bool):
         raise ValueError("agentic.apply_chat_template must be a boolean")
+    if runner == "codex":
+        _validate_codex_agentic(agentic)
+    if runner == "deepseek":
+        _validate_deepseek_agentic(agentic)
+
+
+def _validate_gateway_config(config: Mapping[str, Any], prefix: str) -> None:
+    """Validate settings shared by external Agentic gateways."""
+    port = int(config.get("gateway_port", 0))
+    if not 0 < port < 65536:
+        raise ValueError(f"{prefix}.gateway_port must be in [1, 65535]")
+    for name in ("timeout_seconds", "request_timeout"):
+        if float(config.get(name, 0.0)) <= 0.0:
+            raise ValueError(f"{prefix}.{name} must be positive")
+
+
+def _validate_codex_agentic(agentic: Mapping[str, Any]) -> None:
+    """Validate the pinned Codex CLI and MCP execution contract."""
+    codex = agentic.get("codex")
+    if not isinstance(codex, Mapping):
+        raise ValueError("agentic.codex must be a mapping for the Codex runner")
+    for name in ("version", "executable", "session_root", "reward_callable"):
+        value = codex.get(name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"agentic.codex.{name} must be a non-empty string")
+    if codex["version"] != "0.152.1":
+        raise ValueError("The Codex runner protocol is validated only for codex-cli 0.152.1")
+    _validate_gateway_config(codex, "agentic.codex")
+    if codex.get("sandbox", "danger-full-access") not in {"danger-full-access", "workspace-write"}:
+        raise ValueError("agentic.codex.sandbox must be danger-full-access or workspace-write")
+    mcp_servers = codex.get("mcp_servers", [])
+    if not isinstance(mcp_servers, list) or not all(isinstance(item, Mapping) for item in mcp_servers):
+        raise ValueError("agentic.codex.mcp_servers must be a list of mappings")
+    for server in mcp_servers:
+        environment = server.get("env", {})
+        if not isinstance(environment, Mapping) or not all(
+            isinstance(key, str) and key and isinstance(value, str) for key, value in environment.items()
+        ):
+            raise ValueError("agentic.codex.mcp_servers env must map non-empty names to strings")
+        inherited_names = server.get("inherit_env", [])
+        if not isinstance(inherited_names, list) or not all(
+            isinstance(item, str) and item for item in inherited_names
+        ):
+            raise ValueError("agentic.codex.mcp_servers inherit_env must be a list of non-empty names")
+
+
+def _validate_deepseek_agentic(agentic: Mapping[str, Any]) -> None:
+    """Validate the pinned DeepSeek Harness execution contract."""
+    deepseek = agentic.get("deepseek")
+    if not isinstance(deepseek, Mapping):
+        raise ValueError("agentic.deepseek must be a mapping for the DeepSeek runner")
+    for name in ("version", "provider", "model", "session_root", "reward_callable"):
+        value = deepseek.get(name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"agentic.deepseek.{name} must be a non-empty string")
+    if deepseek["version"] != "0.1.1rc1":
+        raise ValueError(
+            "The DeepSeek runner protocol is validated only for deepseek-harness-sdk 0.1.1rc1"
+        )
+    if deepseek.get("reasoning_effort", "off") not in {"off", "high", "max"}:
+        raise ValueError("agentic.deepseek.reasoning_effort must be 'off', 'high', or 'max'")
+    runtime_bin = deepseek.get("runtime_bin")
+    if runtime_bin is not None and (not isinstance(runtime_bin, str) or not runtime_bin):
+        raise ValueError("agentic.deepseek.runtime_bin must be a non-empty string when configured")
+    _validate_gateway_config(deepseek, "agentic.deepseek")
+    if float(deepseek.get("shutdown_timeout_seconds", 5.0)) <= 0.0:
+        raise ValueError("agentic.deepseek.shutdown_timeout_seconds must be positive")
+    required_tool_calls = deepseek.get("required_tool_calls")
+    if required_tool_calls is not None and int(required_tool_calls) < 0:
+        raise ValueError("agentic.deepseek.required_tool_calls must be non-negative")
+    required_tool_name = deepseek.get("required_tool_name")
+    if required_tool_name is not None and (not isinstance(required_tool_name, str) or not required_tool_name):
+        raise ValueError("agentic.deepseek.required_tool_name must be a non-empty string")
+
+
+def _validate_external_agentic_rollout(
+    runner: str,
+    engine_name: Any,
+    rollout: Mapping[str, Any],
+    agentic: Mapping[str, Any],
+) -> None:
+    """Validate requirements shared by Codex and DeepSeek vLLM adapters."""
+    display_name = {"codex": "Codex", "deepseek": "DeepSeek"}[runner]
+    if engine_name != "vllm":
+        raise ValueError(f"The {display_name} runner currently requires rollout.engine=vllm")
+    vllm = required_mapping(rollout, "vllm")
+    runner_config = required_mapping(agentic, runner)
+    if str(vllm.get("logprobs_mode", "")) != "raw_logprobs":
+        raise ValueError(f"The {display_name} runner requires rollout.vllm.logprobs_mode=raw_logprobs")
+    if not bool(vllm.get("enable_auto_tool_choice", False)):
+        raise ValueError(f"The {display_name} runner requires rollout.vllm.enable_auto_tool_choice=true")
+    parser = vllm.get("tool_call_parser")
+    if not isinstance(parser, str) or not parser:
+        raise ValueError(f"The {display_name} runner requires rollout.vllm.tool_call_parser")
+    if int(vllm.get("port", 0)) == int(runner_config["gateway_port"]):
+        raise ValueError(f"{display_name} gateway_port must differ from rollout.vllm.port")
 
 
 def validate_rollout_and_agentic(
@@ -656,6 +755,9 @@ def validate_rollout_and_agentic(
     if seed is not None and int(seed) < 0:
         raise ValueError("rollout.seed must be non-negative or null")
     _validate_agentic(agentic)
+    runner = str(agentic.get("runner", "internal"))
+    if runner in {"codex", "deepseek"}:
+        _validate_external_agentic_rollout(runner, engine_name, rollout, agentic)
 
 
 def _validate_topology(accelerator: Mapping[str, Any]) -> None:

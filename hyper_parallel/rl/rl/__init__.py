@@ -13,5 +13,34 @@
 # limitations under the License.
 # ============================================================================
 """Public cross-module contracts for the Hyper-RL runtime."""
-from rl.dataset.contracts import ExperienceBatch, Message, PromptRecord, Trajectory, Turn
+
+from importlib import import_module
+from typing import Any
+
+
+_EXPORTS = {
+    "ExperienceBatch": ("rl.dataset.contracts", "ExperienceBatch"),
+    "Message": ("rl.dataset.contracts", "Message"),
+    "PromptRecord": ("rl.dataset.contracts", "PromptRecord"),
+    "Trajectory": ("rl.dataset.contracts", "Trajectory"),
+    "Turn": ("rl.dataset.contracts", "Turn"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load public contracts only when a caller requests them."""
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from error
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose lazy public contracts to interactive callers."""
+    return sorted((*globals(), *_EXPORTS))
+
+
 __all__ = ["ExperienceBatch", "Message", "PromptRecord", "Trajectory", "Turn"]

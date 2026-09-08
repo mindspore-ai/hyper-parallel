@@ -1367,6 +1367,9 @@ def test_server_command_preserves_explicit_prefill_and_logprob_semantics() -> No
                 "enable_prompt_tokens_details": True,
                 "attention_backend": "FLASH_ATTN",
                 "logprobs_mode": "raw_logprobs",
+                "enable_auto_tool_choice": True,
+                "tool_call_parser": "hermes",
+                "reasoning_parser": "deepseek_r1",
             }
         },
         client=object(),
@@ -1379,6 +1382,9 @@ def test_server_command_preserves_explicit_prefill_and_logprob_semantics() -> No
     assert "--enable-prompt-tokens-details" in command
     assert command[command.index("--attention-backend") + 1] == "FLASH_ATTN"
     assert command[command.index("--logprobs-mode") + 1] == "raw_logprobs"
+    assert "--enable-auto-tool-choice" in command
+    assert command[command.index("--tool-call-parser") + 1] == "hermes"
+    assert command[command.index("--reasoning-parser") + 1] == "deepseek_r1"
 
 
 def test_server_environment_carries_consistency_profile() -> None:

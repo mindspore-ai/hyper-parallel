@@ -13,10 +13,15 @@
 # limitations under the License.
 # ============================================================================
 
+FROM node:22-bookworm-slim AS node
+
 FROM hyper-parallel/unified-e2-dev:v0.22.1rc1
 
 ARG FLASH_ATTN_NPU_WHEEL=flash_attn_npu-0.2.0b1-cp312-cp312-linux_aarch64.whl
 ARG FLASH_ATTN_NPU_SHA256=9f58e114b77f72079111e2f86fa9750d3be39d1ec9324b309588a540a3e9e12b
+ARG CODEX_CLI_VERSION=0.152.1
+
+COPY --from=node /usr/local/ /usr/local/
 
 COPY ${FLASH_ATTN_NPU_WHEEL} /tmp/${FLASH_ATTN_NPU_WHEEL}
 
@@ -31,8 +36,12 @@ expected = {'torch': '2.10.0+cpu', 'torch-npu': '2.10.0', 'transformers': '5.5.4
 'flash-attn-npu': '0.2.0b1'}; actual = {name: version(name) for name in expected}; \
 assert actual == expected, f'dependency version mismatch: expected={expected}, actual={actual}'; print(actual)"
 
+RUN npm install --global "@openai/codex@${CODEX_CLI_VERSION}" \
+    && codex --version | grep -Eq "(^|[[:space:]])${CODEX_CLI_VERSION}($|[[:space:]])"
+
 LABEL org.opencontainers.image.title="Hyper-RL Qwen3 runtime" \
       org.opencontainers.image.description="Pinned Ascend dependencies for Hyper-RL Qwen3 TP consistency" \
       org.opencontainers.image.base.name="hyper-parallel/unified-e2-dev:v0.22.1rc1" \
       hyper-rl.flash-attn-npu.version="0.2.0b1" \
-      hyper-rl.batch-invariant-ops.version="1.0.0"
+      hyper-rl.batch-invariant-ops.version="1.0.0" \
+      hyper-rl.codex-cli.version="0.152.1"

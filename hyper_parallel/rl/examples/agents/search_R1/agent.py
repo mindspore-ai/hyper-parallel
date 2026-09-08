@@ -26,7 +26,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from examples.agents.search_R1.tools import LocalBM25Retriever, build_search_registry
+from examples.agents.search_R1.tools import (
+    LocalBM25Retriever,
+    build_codex_search_registry as _build_codex_search_registry,
+    build_search_registry,
+)
 from rl.agentic.core.chat_template import CHAT_TEMPLATE_MESSAGES
 from rl.agentic.core.types import (
     Action,
@@ -346,6 +350,16 @@ def build_search_r1_environment(context: EpisodeContext) -> SearchR1Environment:
         retrieval_hit_reward=float(settings.get("search_retrieval_hit_reward", 0.1)),
         tool_observation_role="environment",
     )
+
+
+def build_codex_search_registry(settings: Mapping[str, Any]) -> ToolRegistry:
+    """Keep the previous factory path compatible with existing configurations."""
+    return _build_codex_search_registry(settings)
+
+
+def score_codex_search_answer(answer: str, prompt: PromptRecord) -> float:
+    """Reuse Search-R1 answer matching for a black-box Codex episode."""
+    return compute_qa_reward(answer, prompt.ground_truth)
 
 
 INTERACTION_PROTOCOLS.register("search_r1")(SearchR1Protocol)

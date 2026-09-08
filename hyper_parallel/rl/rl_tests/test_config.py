@@ -25,6 +25,7 @@ import torch
 import yaml
 from rl.algorithm import build_algorithm
 from rl.config import (
+    _validate_agentic,
     _validate_colocated_vllm,
     _validate_disjoint_vllm,
     _validate_model_implementation,
@@ -49,6 +50,61 @@ from rl.consistency import (
 )
 
 from examples.train_rl import _apply_override
+
+
+def _codex_agentic_config() -> dict:
+    return {
+        "runner": "codex",
+        "module_path": "examples.agents.search_R1.agent",
+        "environment": "search_r1_local",
+        "interaction_mode": "multi_turn",
+        "max_turns": 4,
+        "max_observation_tokens": 512,
+        "apply_chat_template": True,
+        "codex": {
+            "version": "0.152.1",
+            "executable": "codex",
+            "session_root": "/tmp/codex",
+            "reward_callable": "examples.agents.search_R1.agent:score_codex_search_answer",
+            "gateway_port": 8200,
+            "timeout_seconds": 60,
+            "request_timeout": 30,
+            "mcp_servers": [],
+        },
+    }
+
+
+def test_codex_agentic_config_accepts_only_validated_cli_version() -> None:
+    """The wire adapter must not silently accept an untested Codex schema."""
+    config = _codex_agentic_config()
+    _validate_agentic(config)
+
+    config["codex"]["version"] = "0.153.0"
+    with pytest.raises(ValueError, match="validated only for codex-cli 0.152.1"):
+        _validate_agentic(config)
+
+
+def test_codex_agentic_config_validates_mcp_environment_contract() -> None:
+    """MCP environment forwarding remains explicit and string-only."""
+    config = _codex_agentic_config()
+    config["codex"]["mcp_servers"] = [
+        {
+            "name": "search",
+            "command": "python",
+            "env": {"STATIC_VALUE": "value"},
+            "inherit_env": ["PYTHONPATH"],
+        }
+    ]
+    _validate_agentic(config)
+
+    config["codex"]["mcp_servers"][0]["inherit_env"] = "PYTHONPATH"
+    with pytest.raises(ValueError, match="inherit_env must be a list"):
+        _validate_agentic(config)
+
+    config["codex"]["mcp_servers"][0]["inherit_env"] = ["PYTHONPATH"]
+    config["codex"]["mcp_servers"][0]["env"] = {"RETRIES": 3}
+    with pytest.raises(ValueError, match="env must map"):
+        _validate_agentic(config)
 
 
 def test_cli_override_accepts_known_optional_disjoint_devices() -> None:

@@ -47,6 +47,15 @@ MLA、shared experts 与保留叶子边界见 [MoE 模型](moe_models.md#组件�
 Trainer 是唯一顶层编排者。Algorithm 只声明数学与数据需求；Reference Actor 是独立冻结模型，不是当前 Actor 的临时
 evaluation mode。
 
+## Agentic Harness
+
+`agentic.runner` 选择内部环境循环、Codex CLI 或 DeepSeek Harness。三条路径最终都必须产出同一个 token-first
+`Trajectory` 契约；模型返回的 token ID 和 sampled-token raw logprob 是训练证据，工具与环境内容只作为非训练上下文。
+
+Codex 和 DeepSeek 通过各自的本地协议 gateway 复用唯一的共享 vLLM endpoint，不创建第二个 rollout Router。
+Trainer TP 组只有 request-owner rank 执行外部 harness，完整 trajectory 经对象 collective 同步给同组 rank。每个
+episode 开始和结束均校验 policy version/fingerprint。
+
 ## Shared Deployment
 
 ```text

@@ -91,6 +91,8 @@
 | 数据源(Parquet) | `data.train_path` | `rl/dataset/data_source.py` | `rl/dataset/data_source.py` | — | `rl_tests/test_data_source.py` |
 | Batch builder | — | `rl/dataset/batch_builder.py` | `rl/dataset/batch_builder.py` | — | `rl_tests/test_experience_preparer.py`, `test_algorithm_registry.py` |
 | Agentic 环境 | `agentic.module_path`, `agentic.environment=gsm8k_tools`, `agentic.max_turns` | `rl/agentic/envs/environment.py::load_agentic_module` | `examples/agents/gsm8k/agent.py::build_gsm8k_environment`, `rl/agentic/core/session.py` | 每轮 reward | `rl_tests/test_agentic_runner.py::test_agent_runner_preserves_two_turn_eos_mask_and_logprobs`（通用 runner 契约） |
+| Codex harness | `agentic.runner=codex`, `agentic.codex.*` | `rl/trainer.py::SyncTrainer._build_rollout_runtime` | `rl/agentic/codex/`, `rl/agentic/core/program_runner.py`, `rl/roles/rollout/worker.py::CodexRolloutManager` | `reward/*`, `policy/version` | `rl_tests/test_codex_agentic_runtime.py` |
+| DeepSeek Harness | `agentic.runner=deepseek`, `agentic.deepseek.*` | `rl/trainer.py::SyncTrainer._build_rollout_runtime` | `rl/agentic/deepseek/`, `rl/agentic/core/program_runner.py`, `rl/roles/rollout/worker.py::DeepSeekRolloutManager` | `reward/*`, `policy/version` | `rl_tests/test_deepseek_agentic_runtime.py` |
 | 评估 Evaluation | `evaluation.enabled` | `rl/evaluation.py` | `rl/evaluation.py` | `reward/*` | `rl_tests/test_trainer_orchestration.py` |
 | 配置校验 | 顶层 YAML 键 | `rl/config.py` | `rl/config.py` | — | `rl_tests/test_config.py` |
 
