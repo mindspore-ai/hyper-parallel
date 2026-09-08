@@ -12,3 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""Managed MegaMoe expert API."""
+
+__all__ = ["MegaMoeExperts"]
+
+from importlib import import_module as _import_module  # pylint: disable=invalid-name
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .module import MegaMoeExperts
+
+_LAZY_EXPORTS = {"MegaMoeExperts": ".module"}
+
+
+def __getattr__(name):  # pylint: disable=invalid-name
+    """Lazily load the Torch-only managed MegaMoe implementation."""
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = _import_module(_LAZY_EXPORTS[name], __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():  # pylint: disable=invalid-name
+    """Include the managed expert symbol in dir()."""
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))

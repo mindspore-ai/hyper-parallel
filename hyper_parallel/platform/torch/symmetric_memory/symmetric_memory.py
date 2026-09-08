@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Symmetric Memory"""
+"""Torch symmetric-memory operations backed by the shared lifecycle."""
 
-import os
+from __future__ import annotations
+
+import threading
 from logging import getLogger
 from pathlib import Path
-import torch
-import torch.distributed as dist
-from hyper_parallel.platform import get_platform
+from typing import Any, ClassVar
 
 logger = getLogger(__name__)
 
@@ -27,6 +27,7 @@ _is_shmem_available = False
 
 _manager = None
 _ops = None
+_NATIVE_LOAD_LOCK = threading.Lock()
 
 
 def _require_library() -> Path:
@@ -49,71 +50,118 @@ def _require_library() -> Path:
     )
 
 
-file_path = str(_require_library())
-try:
-    torch.ops.load_library(file_path)
-    _manager = torch.classes.SymmetricMemory.Manager()
-    _ops = torch.classes.SymmetricMemory.Ops()
-    _is_shmem_available = True
-except (OSError, RuntimeError) as error:
-    raise ImportError(
-        "[HP-NATIVE-LOAD-FAILED] component=symmetric_memory framework=torch "
-        f"library={file_path} error={error}. Check the Python/Torch/torch_npu/CANN version combination and build log."
-    ) from error
+def _load_native() -> None:
+    """Load the optional native adapter exactly once on first SHMEM use."""
+    import torch  # pylint: disable=C0415
+
+    # pylint: disable=global-statement
+    global _is_shmem_available, _manager, _ops
+    if _manager is not None:
+        return
+    with _NATIVE_LOAD_LOCK:
+        if _manager is not None:
+            return
+        file_path = str(_require_library())
+        try:
+            torch.ops.load_library(file_path)
+            manager = torch.classes.SymmetricMemory.Manager()
+            ops = torch.classes.SymmetricMemory.Ops()
+        except (OSError, RuntimeError) as error:
+            raise ImportError(
+                "[HP-NATIVE-LOAD-FAILED] component=symmetric_memory framework=torch "
+                f"library={file_path} error={error}. Check the Python/Torch/torch_npu/CANN "
+                "version combination and build log."
+            ) from error
+        _manager = manager
+        _ops = ops
+        _is_shmem_available = True
+
+
+def _get_manager() -> Any:
+    """Return the native manager loaded by this binding module."""
+    _load_native()
+    return _manager
 
 
 class TorchSymmetricMemoryHandler:
     """SymmetricMemory is used for one-sided communication."""
-    _is_init = False
-    comm_streams = []
-    compute_streams = []
+
+    _owner: ClassVar[Any | None] = None
+    _owner_lock = threading.Lock()
+    _stream_lock = threading.Lock()
+    comm_streams: ClassVar[list] = []
+    compute_streams: ClassVar[list] = []
 
     @classmethod
-    def _init_shmem(cls):
-        """init platform"""
-        if cls._is_init:
+    def _init_shmem(cls) -> None:
+        """Acquire the legacy API's owner from the shared lifecycle."""
+        cls._get_owner()
+
+    @classmethod
+    def _get_owner(cls) -> Any:
+        """Return the process-lifetime owner used by the legacy API."""
+        if cls._owner is not None and not cls._owner.closed:
+            return cls._owner
+        with cls._owner_lock:
+            if cls._owner is not None and not cls._owner.closed:
+                return cls._owner
+            # pylint: disable=C0415
+            from .lifecycle import acquire_symmetric_memory
+
+            logger.info("start init torch symmetric memory")
+            cls._owner = acquire_symmetric_memory()
+            logger.info("init symmetric memory success!")
+            return cls._owner
+
+    @classmethod
+    def _init_streams(cls) -> None:
+        """Create streams only for legacy collective helpers that use them."""
+        import torch  # pylint: disable=C0415
+        import torch.distributed as dist  # pylint: disable=C0415
+
+        cls._get_owner()
+        if cls.comm_streams:
             return
-        logger.info("start init torch symmetric memory")
-        platform = get_platform()
-        rank_id = platform.get_rank()
-        world_size = platform.get_world_size()
-        local_mem_size = os.getenv("SYMMETRIC_MEMORY_HEAP_SIZE")
-        if local_mem_size is not None:
-            local_mem_size = int(local_mem_size)
-        else:
-            local_mem_size = 1024 * 1024 * 1024
-        ipports = "tcp://127.0.0.1:8662"
-        logger.info("start init ach shmem: rank_id:%d, rank size:%d, heap size:%d, ipports:%s",
-                    rank_id, world_size, local_mem_size, ipports)
-        _manager.attr_init(rank_id, world_size, local_mem_size, ipports)
-        cls.comm_streams = [torch.npu.Stream() for _ in range(min(world_size, 16))]
-        cls.compute_streams = [torch.npu.Stream() for _ in range(world_size)]
-        cls._is_init = True
-        logger.info("init symmetric memory success!")
+        with cls._stream_lock:
+            if cls.comm_streams:
+                return
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            cls.comm_streams = [torch.npu.Stream() for _ in range(min(world_size, 16))]
+            cls.compute_streams = [torch.npu.Stream() for _ in range(world_size)]
+
+    @classmethod
+    def close(cls) -> None:
+        """Release the legacy API owner without affecting other owners."""
+        with cls._owner_lock:
+            owner = cls._owner
+            if owner is None:
+                return
+            cls._owner = None
+            cls.comm_streams = []
+            cls.compute_streams = []
+            owner.close()
 
     @staticmethod
-    def is_shmem_available():
-        """Return True if the symmetric memory shared library was loaded successfully."""
-        return _is_shmem_available
+    def is_shmem_available() -> bool:
+        """Return whether the symmetric-memory native adapter can be loaded."""
+        try:
+            _load_native()
+        except ImportError:
+            return False
+        return True
 
     @staticmethod
-    def empty(shape, dtype):
-        """create symmetric memory tensor"""
-        if isinstance(shape, int):
-            shape = [shape]
-        elif isinstance(shape, tuple):
-            shape = list(shape)
-        if not TorchSymmetricMemoryHandler._is_init:
-            TorchSymmetricMemoryHandler._init_shmem()
-        return _manager.malloc(shape, dtype)
+    def empty(shape: Any, dtype: Any) -> Any:
+        """Create a symmetric-memory tensor through the shared owner."""
+        return TorchSymmetricMemoryHandler._get_owner().empty(shape, dtype)
 
     @staticmethod
-    def barrier():
-        """Synchronize all ranks via a distributed barrier."""
-        dist.barrier()
+    def barrier() -> None:
+        """Synchronize all ranks via the shared owner."""
+        TorchSymmetricMemoryHandler._get_owner().barrier()
 
     @staticmethod
-    def rendezvous(tensor, group):
+    def rendezvous(tensor: Any, group: Any) -> None:
         """Allocate symmetric memory across ranks; not needed in CANN SHMEM v1.6.0."""
         raise NotImplementedError("In CANN SHMEM v1.6.0, rendezvous is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
@@ -136,118 +184,134 @@ class TorchSymmetricMemoryHandler:
                                   "so this function is not implemented. ")
 
     @staticmethod
-    def shmem_put(target, target_offset, src, src_offset, size, target_rank):
+    def shmem_put(target: Any, target_offset: Any, src: Any, src_offset: Any,
+                  size: Any, target_rank: int) -> None:
         """shmem_put operator: shmem_put(target, target_offset, src, src_offset, size, target_rank)"""
+        import torch.distributed as dist  # pylint: disable=C0415
+
+        TorchSymmetricMemoryHandler._get_owner()
         world_size = dist.get_world_size()
         if target_rank < 0 or target_rank >= world_size:
             raise ValueError(f"target_rank must be in range [0, {world_size - 1}], but get {target_rank}")
         _ops.put_mem(target, target_offset, src, src_offset, size, target_rank)
 
     @staticmethod
-    def shmem_get(target, target_offset, src, src_offset, size, target_rank):
+    def shmem_get(target: Any, target_offset: Any, src: Any, src_offset: Any,
+                  size: Any, target_rank: int) -> None:
         """shmem_get operator: shmem_get(target, target_offset, src, src_offset, size, target_rank)"""
+        import torch.distributed as dist  # pylint: disable=C0415
+
+        TorchSymmetricMemoryHandler._get_owner()
         world_size = dist.get_world_size()
         if target_rank < 0 or target_rank >= world_size:
             raise ValueError(f"target_rank must be in range [0, {world_size - 1}], but get {target_rank}")
         _ops.get_mem(target, target_offset, src, src_offset, size, target_rank)
 
     @staticmethod
-    def shmem_signal_op(signal, signal_offset, signal_value, signal_op, target_rank):
+    def shmem_signal_op(signal: Any, signal_offset: Any, signal_value: Any,
+                        signal_op: Any, target_rank: int) -> None:
         """shmem_signal_op operator: shmem_signal_op(signal, signal_offset, signal_value, signal_op, target_rank)"""
+        import torch.distributed as dist  # pylint: disable=C0415
+
+        TorchSymmetricMemoryHandler._get_owner()
         world_size = dist.get_world_size()
         if target_rank < 0 or target_rank >= world_size:
             raise ValueError(f"target_rank must be in range [0, {world_size - 1}], but get {target_rank}")
         _ops.signal_op(signal, signal_offset, signal_value, signal_op, target_rank)
 
     @staticmethod
-    def shmem_wait_for_signal(depend_tensor, signal, signal_offset, compare_value, compare_op):
+    def shmem_wait_for_signal(depend_tensor: Any, signal: Any, signal_offset: Any,
+                              compare_value: Any, compare_op: Any) -> None:
         """
         shmem_wait_for_signal operator:
         shmem_wait_for_signal(depend_tensor, signal, signal_offset, compare_value, compare_op)
         """
+        TorchSymmetricMemoryHandler._get_owner()
         _ops.signal_wait_until(depend_tensor, signal, signal_offset, compare_value, compare_op)
 
     @staticmethod
-    def shmem_put_with_signal(target, target_offset, src, src_offset,
-                              size, signal, signal_offset, signal_value, signal_op, target_rank):
+    def shmem_put_with_signal(target: Any, target_offset: Any, src: Any, src_offset: Any,
+                              size: Any, signal: Any, signal_offset: Any, signal_value: Any,
+                              signal_op: Any, target_rank: int) -> None:
         """
         shmem_put_with_signal operator:
         shmem_put_with_signal(target, target_offset, src, src_offset,
                             size, signal, signal_offset, signal_value, signal_op, target_rank)
         """
-        world_size = get_platform().get_world_size()
+        import torch.distributed as dist  # pylint: disable=C0415
+
+        TorchSymmetricMemoryHandler._get_owner()
+        world_size = dist.get_world_size()
         if target_rank < 0 or target_rank >= world_size:
             raise ValueError(f"target_rank must be in range [0, {world_size - 1}], but get {target_rank}")
         _ops.put_mem_signal(target, target_offset, src, src_offset,
                             size, signal, signal_offset, signal_value, signal_op, target_rank)
 
     @classmethod
-    def shmem_allgather(cls, output_tensor, input_tensor):
-        """
-        allgather operator: shmem_allgather(output_tensor, input_tensor)
+    def shmem_allgather(cls, output_tensor: Any, input_tensor: Any) -> None:
+        """Gather equal-sized local inputs into a symmetric output tensor.
 
-        Performs an allgather collective operation using symmetric memory (SHMEM).
-        Each process/rank contributes its local 'input_tensor', and upon completion,
-        all processes receive the concatenated data from all ranks in 'output_tensor'.
-
-        Parameters:
-            output_tensor: Output tensor that will contain the gathered data from all ranks.
-                        Its size should be (world_size * local_input_size).
-            input_tensor:  Local input tensor contributed by this rank.
+        Args:
+            output_tensor: Symmetric output with ``world_size`` input segments.
+            input_tensor: Local tensor contributed by this rank.
         """
-        def to_tensor(x, dtype=torch.int64):
-            return torch.tensor([x], dtype=dtype, device='npu')
+        import torch  # pylint: disable=C0415
+        import torch.distributed as dist  # pylint: disable=C0415
+
+        def _to_tensor(value: Any, dtype: Any = torch.int64) -> Any:
+            return torch.tensor([value], dtype=dtype, device='npu')
+        owner = cls._get_owner()
+        cls._init_streams()
         rank_id = dist.get_rank()
         world_size = dist.get_world_size()
         size = input_tensor.numel()
         if size * world_size != output_tensor.numel():
             raise ValueError(f"All tensor must have same size, but in rank {world_size}, the size "
                              f"of input_tensor is {size}, the size of output_tensor is {output_tensor.numel()}")
-        signal = _manager.malloc(1, torch.int32)
+        signal = owner.empty(1, torch.int32)
         torch.zero_(signal)
-        dist.barrier()
+        owner.barrier()
         remain = rank_id
         now_pe = 0
         while remain:
             for i in range(min(16, remain)):
                 target_pe = now_pe + i
                 with torch.npu.stream(cls.comm_streams[i]):
-                    _ops.put_mem_signal(output_tensor, to_tensor(size * world_size), input_tensor, to_tensor(0),
-                                        to_tensor(size), signal, to_tensor(0), to_tensor(1, torch.int32), 1, target_pe)
+                    _ops.put_mem_signal(
+                        output_tensor, _to_tensor(size * world_size), input_tensor, _to_tensor(0),
+                        _to_tensor(size), signal, _to_tensor(0), _to_tensor(1, torch.int32), 1, target_pe
+                    )
             now_pe += 16
             remain -= min(16, remain)
-        _ops.signal_wait_until(output_tensor, signal, to_tensor(0), to_tensor(rank_id, torch.int32), 0)
-        _manager.free(signal)
+        _ops.signal_wait_until(output_tensor, signal, _to_tensor(0), _to_tensor(rank_id, torch.int32), 0)
+        owner.free(signal)
 
     @classmethod
-    def shmem_alltoall(cls, send_tensor_list, receive_tensor, receive_list):
-        """
-        alltoall operator: shmem_alltoall(send_tensor_list, receive_tensor, receive_list)
+    def shmem_alltoall(cls, send_tensor_list: list[Any], receive_tensor: Any,
+                       receive_list: Any) -> None:
+        """Exchange variable-sized tensor segments through symmetric memory.
 
-        Performs an all-to-all collective operation using symmetric memory (SHMEM).
-        Each process sends distinct data blocks to all other processes and receives 
-        corresponding blocks from all other processes.
-
-        Parameters:
-            send_tensor_list: List of tensors to send to each rank.
-                            send_tensor_list[i] is the tensor sent to rank i.
-            receive_tensor:   Output tensor that will contain all received data.
-                            Its total size should be sum(receive_list).
-            receive_list:     List specifying the size of data to receive from each rank.
-                            receive_list[i] is the size (e.g., number of elements) 
-                            of data to receive from rank i.
+        Args:
+            send_tensor_list: Per-rank tensors to send.
+            receive_tensor: Symmetric destination containing received segments.
+            receive_list: Per-rank receive sizes.
         """
-        def to_tensor(x, dtype=torch.int64):
-            return torch.tensor([x], dtype=dtype, device='npu')
+        import torch  # pylint: disable=C0415
+        import torch.distributed as dist  # pylint: disable=C0415
+
+        def _to_tensor(value: Any, dtype: Any = torch.int64) -> Any:
+            return torch.tensor([value], dtype=dtype, device='npu')
+        owner = cls._get_owner()
+        cls._init_streams()
         world_size = dist.get_world_size()
         receive_offsets = torch.zeros_like(receive_list)
         send_offsets = torch.zeros_like(receive_list)
         for i in range(1, world_size):
             receive_offsets[i] = receive_offsets[i - 1] + receive_list[i - 1]
         dist.all_to_all_single(send_offsets, receive_offsets)
-        signal = _manager.malloc(1, torch.int32)
+        signal = owner.empty(1, torch.int32)
         torch.zero_(signal)
-        dist.barrier()
+        owner.barrier()
         remain = world_size
         now_pe = 0
         while remain:
@@ -255,38 +319,36 @@ class TorchSymmetricMemoryHandler:
                 target_pe = now_pe + i
                 with torch.npu.stream(cls.comm_streams[i]):
                     _ops.put_mem_signal(receive_tensor, send_offsets[target_pe], send_tensor_list[target_pe],
-                                        to_tensor(0), to_tensor(send_tensor_list[target_pe].numel()),
-                                        signal, to_tensor(0), to_tensor(1, torch.int32), 1, target_pe)
+                                        _to_tensor(0), _to_tensor(send_tensor_list[target_pe].numel()),
+                                        signal, _to_tensor(0), _to_tensor(1, torch.int32), 1, target_pe)
             now_pe += 16
             remain -= min(16, remain)
-        _ops.signal_wait_until(receive_tensor, signal, to_tensor(0), to_tensor(world_size, torch.int32), 0)
-        _manager.free(signal)
+        _ops.signal_wait_until(receive_tensor, signal, _to_tensor(0), _to_tensor(world_size, torch.int32), 0)
+        owner.free(signal)
 
     @classmethod
-    def fused_all_gather_matmul(cls, a, b, c, gather_out, signal, block_size=None):
+    def fused_all_gather_matmul(cls, a: Any, b: Any, c: Any, gather_out: Any,
+                                signal: Any, block_size: int | None = None) -> tuple[Any, Any]:
+        """Fuse symmetric all-gather of ``a`` with matrix multiplication.
+
+        Args:
+            a: Rank-local input matrix.
+            b: Weight matrix.
+            c: Output matrix populated in place.
+            gather_out: Symmetric tensor receiving all rank-local inputs.
+            signal: Symmetric signal tensor.
+            block_size: Optional local rows per communication block.
+
+        Returns:
+            The populated ``gather_out`` and ``c`` tensors.
         """
-        fused_all_gather_matmul(a, b, c, gather_out, signal, block_size=None)
-        Fused operator combining allgather and matmul operations.
+        import torch  # pylint: disable=C0415
+        import torch.distributed as dist  # pylint: disable=C0415
 
-        Computational flow:
-            1. gather_out = allgather(a)    # Gather local tensor 'a' from all ranks
-            2. c = ReduceScatter(gather_out @ b)  # Matrix multiplication followed by reduce-scatter
-
-        Parameters:
-            a: Local input tensor with shape (m_local, k).
-            b: Weight matrix with shape (k, n).
-            c: Output tensor with shape (m, n).
-            gather_out: Output tensor containing gathered 'a' from all ranks, 
-                        shape (m, k) where m = m_local * world_size.
-            signal: Symmetric memory tensor with shape (world_size) and dtype int32.
-            block_size: Optional block size for tiled computation.
-
-        Note: 
-            - This fusion reduces communication overhead by combining gather and matmul operations.
-        """
-        def to_tensor(value, dtype=torch.int64):
+        def _to_tensor(value: Any, dtype: Any = torch.int64) -> Any:
             return torch.tensor(value, dtype=dtype, device='npu')
 
+        cls._init_streams()
         world_size = dist.get_world_size()
         rank_id = dist.get_rank()
 
@@ -316,13 +378,13 @@ class TorchSymmetricMemoryHandler:
         for block_idx in range(num_blocks):
 
             start_row = block_idx * block_size
-            start_idx_tensor = to_tensor(start_row * k)
+            start_idx_tensor = _to_tensor(start_row * k)
             block_local_size = block_sizes[block_idx] * k
-            block_local_size_tensor = to_tensor(block_local_size)
+            block_local_size_tensor = _to_tensor(block_local_size)
 
             remain = world_size
             now_pe = 0
-            dst_offset_tensor = to_tensor((rank_id * m + start_row) * k)
+            dst_offset_tensor = _to_tensor((rank_id * m + start_row) * k)
             while remain:
                 for i in range(min(16, remain)):
                     target_pe = now_pe + i
@@ -354,23 +416,27 @@ class TorchSymmetricMemoryHandler:
         return gather_out, c
 
     @classmethod
-    def fused_matmul_reduce_scatter(cls, x1, x2, symm_tensor, signal, reduce_op='sum'):
+    def fused_matmul_reduce_scatter(cls, x1: Any, x2: Any, symm_tensor: Any,
+                                    signal: Any, reduce_op: str = 'sum') -> Any:
+        """Fuse matrix multiplication with symmetric reduce-scatter.
+
+        Args:
+            x1: Left matrix whose row count is divisible by world size.
+            x2: Right matrix.
+            symm_tensor: Symmetric buffer for partial outputs.
+            signal: Symmetric signal tensor.
+            reduce_op: Either ``"sum"`` or ``"avg"``.
+
+        Returns:
+            This rank's reduced output rows.
         """
-        Fusion operator: Fuses Matmul and ReduceScatter operations.
-        Computation formula: output = ReduceScatter(x1 @ x2)
+        import torch  # pylint: disable=C0415
+        import torch.distributed as dist  # pylint: disable=C0415
 
-        Parameters:
-        x1: Left matrix with shape (m, k). 'm' must be an integer multiple of the number of devices (world_size).
-        x2: Right matrix with shape (k, n).
-        symm_tensor: Symmetric memory tensor with shape (m , n).
-        signal: Symmetric memory tensor with shape (world_size) and dtype int32.
-        reduce_op: Operator of scatter, only support 'sum' and 'avg'. Default value is 'sum'.
+        def _to_tensor(value: Any, dtype: Any = torch.int64) -> Any:
+            return torch.tensor([value], dtype=dtype, device='npu')
 
-        output: Output matrix with shape (m / world_size, n).
-        """
-        def to_tensor(x, dtype=torch.int64):
-            return torch.tensor([x], dtype=dtype, device='npu')
-
+        cls._init_streams()
         world_size = dist.get_world_size()
         rank_id = dist.get_rank()
 
@@ -393,10 +459,10 @@ class TorchSymmetricMemoryHandler:
 
         block_size = m // world_size
 
-        size_tensor = to_tensor(block_size * n)
+        size_tensor = _to_tensor(block_size * n)
         int32_1 = torch.ones(1, dtype=torch.int32, device='npu')
         offsets = torch.arange(0, world_size, dtype=torch.int64, device='npu')
-        dst_offset_tensor = to_tensor(block_size * n * rank_id)
+        dst_offset_tensor = _to_tensor(block_size * n * rank_id)
         output = torch.matmul(x1[rank_id * block_size:rank_id * block_size + block_size, :], x2)
         for rank in range(1, world_size):
             with torch.npu.stream(cls.compute_streams[rank]):

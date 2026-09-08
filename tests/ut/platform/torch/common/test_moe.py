@@ -20,12 +20,13 @@ All tests run on CPU without any distributed setup.
 import os
 import unittest
 from copy import deepcopy
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
+from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413
 from hyper_parallel.platform.torch.common.moe import (  # pylint: disable=C0413
     FeedForward,
     GroupedExperts,
@@ -33,7 +34,6 @@ from hyper_parallel.platform.torch.common.moe import (  # pylint: disable=C0413
     TokenChoiceTopKRouter,
     update_expert_bias,
 )
-
 
 # ---------------------------------------------------------------------------
 # TestFeedForward
@@ -139,10 +139,7 @@ class TestGroupedExperts(unittest.TestCase):
         Bypasses nn.Module.__setattr__ via _parameters dict to inject mock objects.
         Each mock returns the correct real weight data so the forward can complete.
         """
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-
         experts = deepcopy(self.experts)
-        call_counts = [0]
 
         def make_mock(real_data: torch.Tensor) -> MagicMock:
             """Wrap a tensor in a DTensor mock returning it on to_local()."""
@@ -216,7 +213,7 @@ class TestTokenChoiceTopKRouter(unittest.TestCase):
         """Router returns correct shapes with softmax."""
         router = self._make_router(score_func="softmax", top_k=1)
         x = torch.randn(10, 16)
-        scores, indices, counts = router(x)
+        scores, _, counts = router(x)
         assert scores.shape == (10, 1), (
             f"Expected scores shape (10, 1), got {scores.shape}"
         )
@@ -265,11 +262,11 @@ class TestTokenChoiceTopKRouter(unittest.TestCase):
             num_expert_groups=2, num_limited_groups=1,
         )
         x = torch.randn(10, 16)
-        scores, indices, _ = router(x)
+        _, indices, _ = router(x)
         # All selected experts should be within the single selected group
         # (experts 0-3 OR experts 4-7 per token, not mixed)
         for i in range(indices.shape[0]):
-            group_ids = set((int(indices[i, k]) // 4) for k in range(2))
+            group_ids = {int(indices[i, k]) // 4 for k in range(2)}
             assert len(group_ids) == 1, (
                 f"Token {i} routed to experts in multiple groups: {indices[i].tolist()}"
             )
@@ -340,7 +337,7 @@ class TestMoEPermutation(unittest.TestCase):
         num_tokens = 8
         selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
         scores = torch.rand(num_tokens, self.top_k)
-        token_indices, scores_sorted, counts = self.moe.permutation(selected, scores)
+        self.moe.permutation(selected, scores)
         flat_experts = selected.flatten()
         flat_indices = flat_experts.argsort(stable=True)
         experts_in_order = flat_experts[flat_indices]
@@ -414,7 +411,7 @@ class TestMoEPermutation(unittest.TestCase):
         """permutation with a single token works correctly."""
         selected = torch.tensor([[0, 2]])
         scores = torch.tensor([[0.6, 0.4]])
-        token_indices, scores_sorted, counts = self.moe.permutation(selected, scores)
+        token_indices, _, counts = self.moe.permutation(selected, scores)
         assert token_indices.shape == (2,), (
             f"token_indices shape {token_indices.shape}, expected (2,)"
         )
@@ -468,7 +465,7 @@ class TestMoEUnpermutation(unittest.TestCase):
         num_tokens = 8
         selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
         scores = torch.rand(num_tokens, self.top_k)
-        token_indices, scores_sorted, _ = self.moe.permutation(selected, scores)
+        token_indices, _, _ = self.moe.permutation(selected, scores)
         original_flat = torch.randn(num_tokens, self.dim)
         # Simulate: after permutation, expert_out[i] = original[token_indices[i]]
         expert_out = original_flat[token_indices]
@@ -551,13 +548,10 @@ class TestMoE(unittest.TestCase):
         num_experts = 4
         num_tokens = 6
         selected = torch.randint(0, num_experts, (num_tokens, top_k))
-        scores = torch.rand(num_tokens, top_k)
-
         flat = selected.flatten()
 
         # Reproduce inline logic
         flat_indices = flat.argsort(stable=True)
-        scores_sorted = scores.flatten()[flat_indices]
         token_indices = flat_indices // top_k
         counts = torch.bincount(flat, minlength=num_experts)
 
@@ -650,6 +644,7 @@ class TestMoE(unittest.TestCase):
         moe(x)
         tokens_before = moe.tokens_per_expert.clone()
         bias_before = moe.expert_bias.clone()
+        assert tokens_before.sum().item() > 0, "router did not record any routed tokens"
         update_expert_bias(moe, lr=1e-2)
         assert moe.tokens_per_expert.sum().item() == 0, (
             f"tokens_per_expert not reset to zero: {moe.tokens_per_expert}"

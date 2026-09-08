@@ -593,6 +593,55 @@ mc.mega_moe_grad(...)
 PyTorch 与 torch_npu 必须使用和所选 CANN 匹配的配套版本。框架 adapter 根据活动 PyTorch
 报告的 C++ ABI 构建。
 
+Torch 模型使用 `MegaMoeExperts` 执行 Router 选出的专家。先按 7.3 节激活 CANN 和 native payload，
+设置 `HYPER_PARALLEL_PLATFORM=torch`，并在业务进程中选定当前 NPU、初始化 HCCL 进程组。以下为两卡 EP 示例：
+
+```python
+import torch
+import torch.distributed as dist
+from hyper_parallel.core.multicore import MegaMoeExperts
+
+experts = MegaMoeExperts(
+    local_num_tokens=1024,
+    hidden_size=512,
+    intermediate_size=128,
+    num_experts=4,
+    top_k=2,
+    ep_size=dist.get_world_size(),
+    ep_group=dist.group.WORLD,
+).to(device="npu", dtype=torch.bfloat16)
+
+output = experts(hidden_states, topk_ids, topk_weights)
+```
+
+- 当前支持 Torch NPU BF16；EP 必须覆盖整个默认 world，不能只取更大 DP/TP world 的子组。
+- 每 rank 的 token 数 `T` 固定且为 128 的倍数；专家数 `E` 可被 EP 大小整除。plan 使用静态 tiling，
+  构造后 `T/H/I/E/K/EP` 固定，不能据此假定任意 shape 或芯片均受支持。
+- `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，ID 使用全局专家编号。
+  可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram；省略时内部统计，传入时由调用方
+  保证与 ID 一致。contiguous INT32 可直接使用，INT64 或非连续输入会转换。
+- 本地参数布局为 `gate_up_weight: [E/EP, H, 2I]`、`down_weight: [E/EP, I, H]`。普通 gate/up/down 权重
+  转换时，gate、up 分别转置后在末维拼接，down 转置最后两维。
+
+`expert_capacity_factor=None` 是默认值，接收容量为 `EP * T * K` 向上对齐到 128，保证 lossless。
+SHMEM workspace 和每个待反向 forward 的 dispatch clone、up-projection、activation 均按该容量保存。
+显式设置不小于 1 的有限 factor 时，容量改为 `ceil(T * K * factor)` 再对齐；超过容量会报
+`capacity overflow`，不会丢弃 token 或回退到 common MoE。
+
+相同配置的串行层可在首次 forward 前共享 workspace，各层参数和待反向激活仍独立：
+
+```python
+MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.layers)
+```
+
+共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
+checkpoint/recompute 和 `retain_graph=True` 暂未验证。所有 backward 完成后，各 rank 按相同顺序调用
+每层的幂等 `close()`，并在销毁进程组前结束关闭。普通 SHMEM helper 通过
+`TorchSymmetricMemoryHandler.close()` 关闭；它与 managed owner 共用进程级 runtime，最后一个 owner
+关闭才 finalize。重新开启生命周期时，所有 rank 完成关闭后使用新的 `SHMEM_IP_PORT`。
+
+完整 Qwen 接入和启动方式见 [MegaMoe 示例](../../../../examples/torch/multicore/mega_moe/README.md)。
+
 ---
 
 ## 8. API 接口
@@ -712,11 +761,11 @@ pytest -v tests/mindspore/st/multicore/test_moe.py
 
 ### PyTorch
 
-PyTorch multicore ST 不属于本版本提供的测试范围。
+Torch managed API 的调用方式见 7.5 节。
 
 ### 精度容限
 
-所有精度测试使用 bfloat16，容限为：
+上述 MindSpore 精度测试使用 bfloat16，容限为：
 
 ```text
 |kernel - ref| ≤ atol + rtol × |ref|    (rtol = atol = 1e-3)

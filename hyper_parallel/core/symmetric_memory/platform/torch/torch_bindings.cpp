@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -7,24 +7,40 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
-#include <ATen/ops/from_blob.h>
 #include <shmem.h>
 #include <shmem_kernel.h>
 
 #include <algorithm>
+#include <cstring>
 #include <iostream>  // NOLINT(build/include_order)
-#include <numeric>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "acl/acl.h"
 #include "torch/custom_class.h"
 #include "torch/types.h"
+#include "torch_npu/csrc/aten/common/from_blob.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 namespace ShmemOps {
 
 aclshmemx_uniqueid_t default_flag_uid;
+
+static int64_t CheckedAllocationBytes(const std::vector<int64_t> &shape, torch::Dtype dtype) {
+  TORCH_CHECK(!shape.empty(), "symmetric-memory allocation shape cannot be empty.");
+  int64_t total_size = 1;
+  for (const int64_t dimension : shape) {
+    TORCH_CHECK(dimension > 0, "symmetric-memory dimensions must be positive, got ", dimension, ".");
+    TORCH_CHECK(total_size <= std::numeric_limits<int64_t>::max() / dimension,
+                "symmetric-memory allocation element count overflowed int64.");
+    total_size *= dimension;
+  }
+  const int64_t element_size = at::elementSize(dtype);
+  TORCH_CHECK(total_size <= std::numeric_limits<int64_t>::max() / element_size,
+              "symmetric-memory allocation byte count overflowed int64.");
+  return total_size * element_size;
+}
 
 class Manager : public torch::jit::CustomClassHolder {
  public:
@@ -33,12 +49,18 @@ class Manager : public torch::jit::CustomClassHolder {
   std::string get_name() const { return name_; }
 
   int64_t attr_init(int64_t my_pe, int64_t n_ranks, int64_t local_mem_size, const std::string &ip_port) {
+    TORCH_CHECK(n_ranks > 0, "SHMEM rank count must be positive, got ", n_ranks, ".");
+    TORCH_CHECK(my_pe >= 0 && my_pe < n_ranks, "SHMEM rank must be in [0, ", n_ranks, "), got ", my_pe, ".");
+    TORCH_CHECK(local_mem_size > 0, "SHMEM heap size must be positive, got ", local_mem_size, ".");
+    TORCH_CHECK(!ip_port.empty(), "SHMEM endpoint cannot be empty.");
+    TORCH_CHECK(ip_port.size() < ACLSHMEM_MAX_IP_PORT_LEN, "SHMEM endpoint exceeds ", ACLSHMEM_MAX_IP_PORT_LEN - 1,
+                " bytes: ", ip_port, ".");
     int32_t set_conf_status = aclshmemx_set_conf_store_tls(false, nullptr, 0);
     if (set_conf_status != 0) {
       std::cerr << "Aclshmem set conf store tls failed, error code:" << set_conf_status << std::endl;
       return set_conf_status;
     }
-    aclshmemx_init_attr_t attributes;
+    aclshmemx_init_attr_t attributes{};
     int32_t set_attr_status = test_set_attr(my_pe, n_ranks, local_mem_size,
                                             ip_port.c_str(), default_flag_uid, &attributes);
     if (set_attr_status != 0) {
@@ -56,26 +78,31 @@ class Manager : public torch::jit::CustomClassHolder {
   int64_t finalize() { return aclshmem_finalize(); }
 
   at::Tensor malloc_tensor(const std::vector<int64_t> &shape, torch::Dtype dtype) {
-    int64_t total_size = std::accumulate(shape.begin(), shape.end(), static_cast<int64_t>(1),
-                                         [](int64_t acc, int64_t dim) { return acc * dim; });
-    int64_t element_size = at::elementSize(dtype);
-    void *symmPtr = aclshmem_malloc(total_size * element_size);
-    auto current_stream = c10_npu::getCurrentNPUStream();
-    auto device = at::Device(at::DeviceType::PrivateUse1, current_stream.device_index());
-    auto options = at::TensorOptions().dtype(dtype).device(device);
-    at::Tensor aclshmem_tensor = at::from_blob(symmPtr, shape, [](void *) {}, options, device);
+    const int64_t allocation_bytes = CheckedAllocationBytes(shape, dtype);
+    void *symm_ptr = aclshmem_malloc(allocation_bytes);
+    TORCH_CHECK(symm_ptr != nullptr, "aclshmem_malloc failed for ", allocation_bytes,
+                " bytes. Increase SYMMETRIC_MEMORY_HEAP_SIZE or release unused allocations.");
+    // NPU storage metadata is required when invalidating a released allocation.
+    return at_npu::native::from_blob(symm_ptr, shape, dtype);
+  }
 
-    return aclshmem_tensor;
+  at::Tensor aligned_malloc_tensor(const std::vector<int64_t> &shape, torch::Dtype dtype,
+                                   int64_t alignment) {
+    TORCH_CHECK(alignment > 0 && (alignment & (alignment - 1)) == 0,
+                "alignment must be a positive power of two, got ", alignment, ".");
+    const int64_t allocation_bytes = CheckedAllocationBytes(shape, dtype);
+    void *symm_ptr = aclshmem_align(static_cast<size_t>(alignment), allocation_bytes);
+    TORCH_CHECK(symm_ptr != nullptr, "aclshmem_align failed for ", allocation_bytes,
+                " bytes with ", alignment, "-byte alignment. Increase SYMMETRIC_MEMORY_HEAP_SIZE.");
+    return at_npu::native::from_blob(symm_ptr, shape, dtype);
   }
 
   void free_tensor(const at::Tensor &aclshmem_tensor) {
-    if (!aclshmem_tensor.defined() || aclshmem_tensor.data_ptr() == nullptr) {
-    std::cerr << "Invalid tensor or null data pointer" << std::endl;
-    return;
-    }
-    void* aclshmem_ptr = const_cast<void*>(aclshmem_tensor.data_ptr());
+    TORCH_CHECK(aclshmem_tensor.defined(), "cannot free an undefined symmetric-memory tensor.");
+    TORCH_CHECK(aclshmem_tensor.data_ptr() != nullptr,
+                "cannot free a symmetric-memory tensor with a null data pointer.");
+    void *aclshmem_ptr = const_cast<void *>(aclshmem_tensor.data_ptr());
     aclshmem_free(aclshmem_ptr);
-    return;
   }
 
  private:
@@ -198,6 +225,7 @@ static auto registry_common = torch::jit::class_<ShmemOps::Manager>("SymmetricMe
                                 .def("attr_init", &ShmemOps::Manager::attr_init)
                                 .def("finalize", &ShmemOps::Manager::finalize)
                                 .def("malloc", &ShmemOps::Manager::malloc_tensor)
+                                .def("aligned_malloc", &ShmemOps::Manager::aligned_malloc_tensor)
                                 .def("free", &ShmemOps::Manager::free_tensor)
                                 .def("get_name", &ShmemOps::Manager::get_name);
 
