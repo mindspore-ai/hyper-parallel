@@ -364,7 +364,7 @@ INDEXED_HELPERS_DIR="${PROJECT_ROOT}/hyper_parallel/data/indexed"
 INDEXED_HELPERS_SOURCE="${INDEXED_HELPERS_DIR}/csrc/indexed_helpers.cpp"
 CXX_BIN=${CXX:-c++}
 INDEXED_HELPERS_SUFFIX=$("${PYTHON_BIN}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
-INDEXED_HELPERS_OUTPUT_DIR="${PAYLOAD_ROOT}/auto_models/components/datasets/llm"
+INDEXED_HELPERS_OUTPUT_DIR="${PAYLOAD_ROOT}/data/indexed"
 INDEXED_HELPERS_OUTPUT="${INDEXED_HELPERS_OUTPUT_DIR}/_indexed_helpers_cpp${INDEXED_HELPERS_SUFFIX}"
 
 if ! PYBIND11_INCLUDES=$("${PYTHON_BIN}" -m pybind11 --includes 2>/dev/null); then
