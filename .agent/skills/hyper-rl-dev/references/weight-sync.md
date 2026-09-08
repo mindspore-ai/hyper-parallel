@@ -32,7 +32,8 @@ hand-write a second mapping.
 Default to **`full_gather`** unless the design explicitly requires
 `direct_reshard` (e.g. a TP-mismatch or a bandwidth-motivated change).
 `fallback_strategy ∈ {none, full_gather}` — default `none`; fallback must be
-explicit.
+explicit. Static MoE TP/EP support and model boundaries are documented in
+[MoE models](../../../../hyper_parallel/rl/docs/moe_models.md).
 
 ## Transaction Semantics
 

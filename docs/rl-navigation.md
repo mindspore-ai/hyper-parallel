@@ -52,6 +52,7 @@
 | --- | --- | --- | --- | --- | --- |
 | vLLM rollout 引擎 | `rollout.engine=vllm` | `rl/roles/rollout/registry.py` | `rl/roles/rollout/vllm.py`, `rl/roles/rollout/vllm_qwen3.py` | 生成期(rollout record) | `rl_tests/test_vllm_runtime.py` |
 | Qwen3 rollout 适配 | `rollout.vllm.model_implementation=hyper\|native` | `rl/roles/rollout/vllm_qwen3.py` | `rl/roles/rollout/vllm_qwen3.py` | — | `rl_tests/test_qwen3_launcher.py`, `test_qwen3_tp_launcher.py` |
+| MoE 模型与静态 EP | checkpoint `model_type`；`train.accelerator.ep`、`rollout.vllm.enable_expert_parallel` | `rl/config.py::build_model_registration` | `rl/roles/rollout/vllm_qwen3_moe.py`、`rl/roles/rollout/vllm_deepseek_v3.py`、`rl/roles/rollout/vllm_moe.py` | `train/gradient_norm`、`policy/version` | `rl_tests/test_config.py`、`rl_tests/test_vllm_moe.py` |
 | rollout 拓扑 | `rollout.vllm.deployment` | `rl/config.py::_validate_vllm_basics` | `rl/roles/rollout/topology.py` | — | `rl_tests/test_rollout_topology.py`, `test_disjoint_topology.py` |
 | vLLM 运行时生命周期 | `rollout.vllm.*`(port、dp/tp、max_num_seqs…) | `rl/config.py` | `rl/roles/rollout/worker.py` | — | `rl_tests/test_vllm_runtime.py` |
 
@@ -105,7 +106,8 @@ model · data · rollout · agentic · algorithm · evaluation · train · loggi
 
 `rollout.vllm.weight_sync.strategy` 接受 `direct_reshard` 与 `full_gather`
 (配合 `fallback_strategy ∈ {none, full_gather}`);默认即 **`full_gather`**,
-`bucket_size_mb` 默认 128，fallback 默认 `none`。TP1 不再改写显式 `direct_reshard`；两个策略均支持 Qwen3 TP1/TP2。
+`bucket_size_mb` 默认 128，fallback 默认 `none`。TP1 不再改写显式 `direct_reshard`；两个策略支持 Qwen3 dense 与
+[已接入的 MoE 模型](../hyper_parallel/rl/docs/moe_models.md)。MoE 当前仅支持 colocated，具体 TP/EP 组合由配置校验约束。
 
 ---
 

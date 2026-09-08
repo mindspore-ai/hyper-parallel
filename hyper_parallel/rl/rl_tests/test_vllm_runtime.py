@@ -44,7 +44,13 @@ import hyper_parallel_vllm_plugin
 
 def test_installed_vllm_plugin_entry_point_forwards_qwen3_runtime() -> None:
     """The fixed image's legacy entry point resolves to the migrated Qwen3 plugin."""
+    assert hyper_parallel_vllm_plugin.HYPER_DEEPSEEK_V3_ARCHITECTURE == (
+        "HyperDeepseekV3ForCausalLM"
+    )
     assert hyper_parallel_vllm_plugin.HYPER_QWEN3_ARCHITECTURE == "HyperQwen3ForCausalLM"
+    assert hyper_parallel_vllm_plugin.HYPER_QWEN3_MOE_ARCHITECTURE == (
+        "HyperQwen3MoeForCausalLM"
+    )
     assert callable(hyper_parallel_vllm_plugin.register_hyper_models)
 
 
@@ -53,6 +59,28 @@ def _model(
     *,
     tie_word_embeddings: bool = True,
 ) -> ModelRegistration:
+    if hyper_model_name == "deepseek_v3":
+        return ModelRegistration(
+            "moonlight",
+            hyper_model_name,
+            "/model",
+            "/tokenizer",
+            "DeepseekV3ForCausalLM",
+            "deepseek_v3",
+            "deepseek_v3",
+            False,
+        )
+    if hyper_model_name == "qwen3_moe":
+        return ModelRegistration(
+            "qwen3-30b-a3b",
+            hyper_model_name,
+            "/model",
+            "/tokenizer",
+            "Qwen3MoeForCausalLM",
+            "qwen3_moe",
+            "qwen3_moe",
+            False,
+        )
     if hyper_model_name != "qwen3":
         raise ValueError(f"Unsupported test model: {hyper_model_name}")
     return ModelRegistration(
@@ -110,6 +138,55 @@ def test_native_architecture_and_refit_names_follow_qwen3_contract() -> None:
         "model.layers.0.self_attn.q_proj.weight",
         "lm_head.weight",
     ]
+
+
+def test_moonlight_resolves_native_deepseek_v3_without_remote_code() -> None:
+    """Moonlight exposes distinct Native and Hyper-vLLM architectures."""
+    moonlight = _model("deepseek_v3")
+    rollout_model = resolve_vllm_model(moonlight, "native")
+    engine = VLLMGenerationEngine(
+        moonlight,
+        {
+            "vllm": {
+                "model_implementation": "native",
+                "trust_remote_code": False,
+            }
+        },
+        client=object(),
+    )
+
+    server_command = engine._server_command(  # pylint: disable=protected-access
+        "127.0.0.1", 8100
+    )
+
+    assert rollout_model.family == "deepseek_v3"
+    assert rollout_model.architecture == "DeepseekV3ForCausalLM"
+    assert architecture_for_implementation("native", "deepseek_v3") == (
+        "DeepseekV3ForCausalLM"
+    )
+    assert "--hf-overrides" not in server_command
+    assert "--trust-remote-code" not in server_command
+    hyper_model = resolve_vllm_model(moonlight, "hyper")
+    hyper_engine = VLLMGenerationEngine(
+        moonlight,
+        {"vllm": {"model_implementation": "hyper", "trust_remote_code": False}},
+        client=object(),
+    )
+    hyper_command = hyper_engine._server_command(  # pylint: disable=protected-access
+        "127.0.0.1", 8100
+    )
+    assert hyper_model.architecture == "HyperDeepseekV3ForCausalLM"
+    assert "HyperDeepseekV3ForCausalLM" in " ".join(hyper_command)
+
+
+def test_qwen3_moe_resolves_native_and_hyper_architectures() -> None:
+    """Qwen3-MoE keeps native vLLM and Hyper-vLLM model identities distinct."""
+    model = _model("qwen3_moe")
+
+    assert resolve_vllm_model(model, "native").architecture == "Qwen3MoeForCausalLM"
+    assert resolve_vllm_model(model, "hyper").architecture == (
+        "HyperQwen3MoeForCausalLM"
+    )
 
 
 def test_native_qwen3_can_launch_lazy_client(
@@ -248,6 +325,16 @@ def test_hyper_qwen3_uses_registered_architecture() -> None:
     override = command[command.index("--hf-overrides") + 1]
 
     assert override == '{"architectures": ["HyperQwen3ForCausalLM"]}'
+
+
+def test_rollout_ep_flag_reaches_shared_vllm_server() -> None:
+    """EP selection must not remain an unused YAML field."""
+    engine = VLLMGenerationEngine(
+        _model("qwen3"),
+        {"vllm": {"model_implementation": "hyper", "enable_expert_parallel": True}},
+        client=object(),
+    )
+    assert "--enable-expert-parallel" in engine._server_command("127.0.0.1", 8100)
 
 
 @pytest.mark.parametrize("implementation", ["hyper", "native"])

@@ -1,13 +1,14 @@
 # Hyper-RL
 
 Hyper-RL 是 HyperParallel 面向大语言模型强化学习的同步训练运行时。它使用 HyperAutoModel 与 HyperParallel
-FSDP/TP 训练 Actor，通过一个共享的 vLLM DP×TP deployment 生成样本，并在训练过程中发布最新策略权重。
+FSDP/TP/EP 训练 Actor，通过一个共享的 vLLM DP×TP deployment 生成样本，并在训练过程中发布最新策略权重。
 
 本版本已基于最新 `upstream/master@b9fa61a9` 的 HyperAutoModel、Trainer 和 distributed checkpoint 架构完成合入，
 不再依赖旧 trainer_dev 训练流程或 RL 专用 Trainer 副本。
 
-当前发布范围聚焦单节点 Ascend NPU 上的 Qwen3 GRPO，支持 Trainer TP1/TP2、Hyper-vLLM/Native-vLLM TP1/TP2，
-以及 Qwen3 + Hyper-vLLM matched TP1/TP2 在 colocated 和 disjoint deployment 下的训练-推理 bit-exact。
+当前支持单节点 Ascend NPU 上的 Qwen3 dense、Qwen3-30B-A3B 和 Moonlight-16B-A3B-Instruct GRPO。
+Qwen3 dense 保持 colocated/disjoint matched TP1/TP2 的训练-推理 bit-exact；两个 MoE 模型的共卡 TP/EP 配置和
+不同验证边界见 [MoE 模型](docs/moe_models.md)。
 
 ## 设计原则
 
@@ -51,7 +52,8 @@ Transformers Qwen3
 - Trainer
   - [x] Qwen3 TP1、pure TP2 和 FSDP-shard×TP2
   - [x] BF16、global gradient norm、AdamW 和 DCP resume
-  - [ ] Trainer CP、PP、EP 与多节点
+  - [x] 两个 MoE 模型的四卡 FSDP2×TP2 与 TP-extend-EP4
+  - [ ] Trainer CP、PP 与多节点
 - 训推一体
   - [x] Trainer/Hyper-vLLM 共享 Transformers Qwen3 模型语义
   - [x] 共享 HyperParallel TP planner、placement、tied-weight 和 layout contract
@@ -64,7 +66,8 @@ Transformers Qwen3
 - 在线权重发布
   - [x] Full-gather 与 TP-aware direct-reshard
   - [x] Transaction abort、fallback、worker identity 和 source-derived manifest
-  - [ ] 多节点与 rollout EP
+  - [x] 两个 MoE 模型的静态 rollout EP 与 TP/EP 分片发布
+  - [ ] 多节点与动态专家重分配
 - 训练-推理一致性
   - [x] Qwen3 + Hyper-vLLM matched TP1/TP2
   - [x] Colocated `FSDP-shard2×TP2→DP2×TP2`
@@ -151,7 +154,8 @@ mkdir -p "${HYPER_RL_RESULT_ROOT}"
 npu-smi info
 ```
 
-只选择 `Health=OK` 且没有其他运行进程的 NPU。Launcher 会自动挂载仓库源码、driver、模型、数据和结果目录。
+只选择没有其他运行进程的 NPU：优先空闲且 `Health=OK` 的卡，其次选择空闲但显示 `Alarm` 的卡。空闲卡不足时等待，
+不得停止、重置或抢占其他用户的进程。Launcher 会自动挂载仓库源码、driver、模型、数据和结果目录。
 
 ### 3. 运行 Qwen3 普通 TP 训练与推理
 
@@ -241,10 +245,11 @@ Bit-exact 的比较时点、数值 recipe 和验收指标见
 
 ## 当前限制
 
-- 当前只声明 Qwen3、单节点 Torch NPU 和同步 GRPO。
+- 当前限定单节点 Torch NPU 和同步 GRPO；MoE 仅支持 [已列出的模型与拓扑](docs/moe_models.md)。
 - PPO/GAE/Critic 具备数学与接口测试，但需要 Critic 的端到端配置仍会被拒绝。
 - Bit-exact 不覆盖 Native-vLLM、backward、gradient、optimizer state、更新后参数或收敛表现。
 - 不声明 TP4/TP8、多节点、graph、speculative decoding、长期 soak 或跨 workload 性能最优。
+- 两个 MoE 模型的 full/direct/fallback 已在四卡 colocated TP2/EP4 验证；MoE disjoint 与专家内部 TP 尚未支持。
 - vLLM RLHF/refit development endpoints 使用不安全序列化，只能运行在受信任、隔离的训练网络。
 
 ## 文档
@@ -254,3 +259,4 @@ Bit-exact 的比较时点、数值 recipe 和验收指标见
 - [Qwen3 训练-推理一致性](docs/qwen3_training_inference_consistency.md)：bit-exact 定义、配置和门禁。
 - [运行镜像](docs/hyper_rl_runtime_image.md)：公开镜像下载、校验和宿主要求。
 - [公共模块修改说明](docs/public_module_changes.md)：面向 CODEOWNER 的 RL 目录外修改、必要性和接口影响。
+- [MoE 模型](docs/moe_models.md)：Qwen3-30B-A3B/Moonlight 的配置、保留组件与验证边界。

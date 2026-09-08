@@ -83,7 +83,7 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -91,6 +91,7 @@ from hyper_parallel.auto_models.components.distributed.ep_utils import (
     MOE_ROUTER_ADAPTERS,
     bind_local_expert_forward,
     ep_routed_forward,
+    qwen3_moe_combine,
     require_attrs,
 )
 from hyper_parallel.auto_models.components.distributed.injection import (
@@ -140,6 +141,7 @@ def _build_ep_compute(
     expected_attrs,
     combine: Callable,
     use_grouped_gemm: bool = False,
+    routed_combine: Optional[Callable] = None,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -162,10 +164,12 @@ def _build_ep_compute(
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
 
+    routed_kwargs = {} if routed_combine is None else {"combine_fn": routed_combine}
+
     def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed branch and compose the MoE block output."""
         routed = ep_routed_forward(
-            module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            module, hidden_states, router_fn=router_fn, ep_group=ep_group, **routed_kwargs)
         return combine(module, hidden_states, routed)
 
     return compute_fn
@@ -244,11 +248,14 @@ def qwen3moe_ep_compute_fn(
     cp_mesh: Any,
     ep_mesh: Any,
     use_grouped_gemm: bool = False,
+    hf_combine: bool = False,
 ) -> Callable:
     """Archetype ``qwen3moe_topk_router``: TopKRouter module returning
     (logits, scores, indices), no shared expert (Qwen3-MoE).
 
     Expected module interface: ``gate`` (TopKRouter module), ``experts``.
+    ``hf_combine=True`` preserves Transformers FP32 routing weights and Top-K
+    accumulation order. The default retains the established EP aggregation.
     """
     del mesh, tp_mesh, cp_mesh
     return _build_ep_compute(
@@ -259,6 +266,7 @@ def qwen3moe_ep_compute_fn(
         expected_attrs=["gate", "experts"],
         combine=lambda module, hidden_states, routed: routed,
         use_grouped_gemm=use_grouped_gemm,
+        routed_combine=qwen3_moe_combine if hf_combine else None,
     )
 
 

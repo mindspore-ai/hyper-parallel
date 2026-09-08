@@ -36,12 +36,69 @@ from rl.dataset.contracts import ExperienceBatch
 import rl.trainer as trainer_backend
 import rl.utils.monitoring.metrics as metrics_backend
 from rl.roles import Actor
-from rl.trainer import SyncTrainer, _configure_batch_invariant_communication
-from rl.utils.monitoring.metrics import ActorUpdateMetrics, build_training_metrics
+from rl.trainer import (
+    SyncTrainer,
+    _configure_batch_invariant_communication,
+    _load_tokenizer,
+)
+from rl.utils.monitoring.metrics import (
+    ActorUpdateMetrics,
+    build_training_metrics,
+    enforce_learning_gate,
+)
 
 
 class _StopAfterRolePipeline(RuntimeError):
     """Stop the trainer after the role pipeline reaches weight publication."""
+
+
+def test_learning_gate_can_limit_strict_acceptance_to_initial_steps() -> None:
+    """A stochastic later smoke step may skip a gate already proven by step one."""
+    calls = []
+
+    enforce_learning_gate(
+        {},
+        step=2,
+        config={"enabled": True, "max_step": 1},
+        run_synchronized=lambda operation, callback: calls.append(operation),
+    )
+
+    assert not calls
+
+
+@pytest.mark.parametrize("trust_remote_code", [False, True])
+def test_tokenizer_loader_uses_its_independent_remote_code_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    trust_remote_code: bool,
+) -> None:
+    """Tokenizer loading does not inherit the Trainer model implementation choice."""
+    captured: dict[str, Any] = {}
+    tokenizer = object()
+
+    def _from_pretrained(path: str, **kwargs: Any) -> object:
+        captured.update({"path": path, **kwargs})
+        return tokenizer
+
+    monkeypatch.setattr(
+        trainer_backend.AutoTokenizer,
+        "from_pretrained",
+        _from_pretrained,
+    )
+
+    loaded = _load_tokenizer(
+        {
+            "tokenizer_path": "/tokenizer",
+            "trust_remote_code": not trust_remote_code,
+            "tokenizer_trust_remote_code": trust_remote_code,
+        }
+    )
+
+    assert loaded is tokenizer
+    assert captured == {
+        "path": "/tokenizer",
+        "trust_remote_code": trust_remote_code,
+        "local_files_only": True,
+    }
 
 
 def test_training_metrics_expose_effective_weight_sync_strategy(

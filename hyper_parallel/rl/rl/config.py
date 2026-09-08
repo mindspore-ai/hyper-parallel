@@ -14,10 +14,10 @@
 # ============================================================================
 """Validate Hyper-RL configuration and adapt it to Hyper-Parallel."""
 
-from copy import deepcopy
 import json
 import math
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -28,19 +28,26 @@ from rl.consistency import consistency_profile, validate_consistency_model_ident
 from rl.roles.model import (
     ModelRegistration,
     VLLMModelRegistration,
+    model_trust_remote_code,
     normalize_model_implementation,
+    register_model,
     resolve_vllm_model,
+    tokenizer_trust_remote_code,
+    trainer_attention_implementation,
 )
 from rl.roles.rollout import ROLLOUT_ENGINES
 from rl.roles.weight_sync.config import resolve_weight_sync_config
 
 from hyper_parallel import get_platform
-from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.auto_models._transformers import HyperAutoModelForCausalLM
 from hyper_parallel.auto_models.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.auto_models.components.distributed.config import (
     FSDP2Config,
     FSDP2MixedPrecisionConfig,
+)
+from hyper_parallel.auto_models.components.distributed.ep_compute import (
+    deepseekv3_ep_compute_fn,
+    qwen3moe_ep_compute_fn,
 )
 from hyper_parallel.auto_models.components.optim.lr_scheduler import MultiLRScheduler
 from hyper_parallel.auto_models.components.optim.optimizer import AdamW
@@ -48,10 +55,13 @@ from hyper_parallel.auto_models.trainer.config import (
     AcceleratorConfig,
     ActivationCheckpointConfig,
     MixedPrecisionConfig,
+    PlanOverride,
     Target,
     TrainerConfig,
     TrainingConfig,
 )
+from hyper_parallel.platform.platform import PlatformType
+
 platform = get_platform()
 _HCCL_MIN_PORT = 1024
 _HCCL_MAX_PORT = 65520
@@ -169,6 +179,13 @@ def _validate_training_sizes(
         raise ValueError("train.learning_gate must be a mapping")
     if float(gate.get("min_gradient_norm", 0.0)) < 0:
         raise ValueError("train.learning_gate.min_gradient_norm must be non-negative")
+    gate_max_step = gate.get("max_step")
+    if gate_max_step is not None and (
+        not isinstance(gate_max_step, int)
+        or isinstance(gate_max_step, bool)
+        or gate_max_step <= 0
+    ):
+        raise ValueError("train.learning_gate.max_step must be a positive integer or null")
 
 
 def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
@@ -269,7 +286,7 @@ def _validate_vllm_basics(vllm: Mapping[str, Any]) -> tuple[str, int, int]:
     rollout_dp = _parallel_size(vllm, "data_parallel_size")
     rollout_tp = _parallel_size(vllm, "tensor_parallel_size")
     if str(vllm.get("dtype", "bfloat16")) not in ("bfloat16", "bf16"):
-        raise ValueError("The Qwen vLLM rollout path requires bfloat16")
+        raise ValueError("The vLLM rollout path requires bfloat16")
     if str(vllm.get("host", "127.0.0.1")) not in ("127.0.0.1", "localhost"):
         raise ValueError("The external vLLM server must bind to loopback")
     _validate_vllm_port(vllm)
@@ -373,6 +390,8 @@ def _validate_disjoint_vllm(
 def _validate_vllm_limits(vllm: Mapping[str, Any]) -> None:
     """Validate optional vLLM concurrency and capacity limits."""
     normalize_model_implementation(vllm.get("model_implementation", "native"))
+    if not isinstance(vllm.get("trust_remote_code", True), bool):
+        raise ValueError("rollout.vllm.trust_remote_code must be a boolean")
     if "request_concurrency" in vllm:
         raise ValueError(
             "rollout.vllm.request_concurrency was replaced by automatic child admission "
@@ -472,7 +491,7 @@ def _trainer_tp2_weight_sync_supported(
     )
     return (
         trainer_tp == 2
-        and rollout_model.family == "qwen3"
+        and rollout_model.family in ("qwen3", "qwen3_moe", "deepseek_v3")
         and effective_strategy in ("full_gather", "direct_reshard")
         and fallback_supported
     )
@@ -514,6 +533,50 @@ def _validate_vllm_weight_sync(
         )
 
 
+def _trainer_ep_size(accelerator: Mapping[str, Any], family: str) -> int:
+    """Validate EP as a reuse of physical ranks, not an extra world-size axis."""
+    ep_size = accelerator.get("ep", 1)
+    if not isinstance(ep_size, int) or isinstance(ep_size, bool) or ep_size not in (1, 4):
+        raise ValueError("train.accelerator.ep currently supports EP1/EP4")
+    if ep_size > 1 and (family not in ("qwen3_moe", "deepseek_v3") or _trainer_world_size(accelerator) != 4):
+        raise ValueError("Trainer EP4 currently requires a supported MoE model on four physical ranks")
+    return ep_size
+
+
+def _validate_moe_ep1_topology(
+    vllm: Mapping[str, Any],
+    rollout_model: VLLMModelRegistration,
+    accelerator: Mapping[str, Any],
+) -> None:
+    """Validate public Trainer EP and static colocated MoE rollout boundaries."""
+    trainer_ep = _trainer_ep_size(accelerator, rollout_model.family)
+    if rollout_model.family not in ("qwen3_moe", "deepseek_v3"):
+        return
+    if _trainer_topology(accelerator)["tp"] != 1 and trainer_ep == 1:
+        raise ValueError(
+            f"{rollout_model.family} EP1 currently requires Trainer TP1; TP2 requires Trainer EP4"
+        )
+    implementation = "Hyper-vLLM" if rollout_model.is_hyper else "Native-vLLM"
+    moe_tp_ep = (
+        int(vllm.get("tensor_parallel_size", 1)) == 2
+        and int(vllm.get("data_parallel_size", 1)) == 2
+        and bool(vllm.get("enable_expert_parallel", False))
+    )
+    if int(vllm.get("tensor_parallel_size", 1)) != 1 and not moe_tp_ep:
+        raise ValueError(
+            f"{implementation} {rollout_model.family} requires rollout TP1 or DP2/TP2/EP4"
+        )
+    if bool(vllm.get("enable_expert_parallel", False)):
+        if vllm.get("deployment", "colocated") != "colocated":
+            raise ValueError(f"{implementation} rollout EP currently requires colocated deployment")
+        if int(vllm.get("data_parallel_size", 1)) not in (1, 2, 4):
+            raise ValueError(f"{implementation} rollout EP currently supports EP1/EP2/EP4")
+        if rollout_model.is_hyper and not bool(vllm.get("enforce_eager", True)):
+            raise ValueError("Hyper-vLLM rollout EP currently requires enforce_eager=true")
+    if bool(vllm.get("enable_eplb", False)):
+        raise ValueError(f"{implementation} {rollout_model.family} does not support EPLB")
+
+
 def _validate_model_implementation(
     vllm: Mapping[str, Any],
     model_registration: ModelRegistration,
@@ -541,12 +604,8 @@ def _validate_vllm(
         _validate_disjoint_vllm(vllm, accelerator, rollout_tp)
     _validate_vllm_limits(vllm)
     rollout_model = _validate_model_implementation(vllm, model_registration)
+    _validate_moe_ep1_topology(vllm, rollout_model, accelerator)
     _validate_vllm_weight_sync(vllm, deployment, rollout_model, accelerator)
-    if rollout_model.is_hyper and rollout_model.family != "qwen3" and rollout_tp != 1:
-        raise ValueError(
-            "Hyper-vLLM tensor parallelism currently supports Qwen3 only; "
-            f"family={rollout_model.family!r}, tensor_parallel_size={rollout_tp}"
-        )
 
 
 def _validate_agentic(agentic: Mapping[str, Any]) -> None:
@@ -871,33 +930,7 @@ def resolve_vllm_automatic_limits(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def build_model_registration(config: Mapping[str, Any]) -> ModelRegistration:
     """Resolve the configured model shared by training and rollout."""
-    model = required_mapping(config, "model")
-    name = model.get("registry_name")
-    if not isinstance(name, str) or not name:
-        raise ValueError("model.registry_name must be a non-empty string")
-    config_path = Path(str(model["weights_path"])) / "config.json"
-    if not config_path.is_file():
-        raise ValueError(f"Model config does not exist: {config_path}")
-    with config_path.open(encoding="utf-8") as config_file:
-        hf_config = json.load(config_file)
-    architectures = hf_config.get("architectures")
-    if not isinstance(architectures, list) or len(architectures) != 1:
-        raise ValueError(
-            f"Model config must define exactly one architecture, got {architectures!r}"
-        )
-    text_config = hf_config.get("text_config", hf_config)
-    if not isinstance(text_config, Mapping):
-        raise ValueError("Model text_config must be a mapping when present")
-    return ModelRegistration(
-        name=name,
-        hyper_model_name=str(model["name"]),
-        weights_path=str(model["weights_path"]),
-        tokenizer_path=str(model["tokenizer_path"]),
-        hf_architecture=str(architectures[0]),
-        model_type=str(hf_config.get("model_type", "")),
-        text_model_type=str(text_config.get("model_type", hf_config.get("model_type", ""))),
-        tie_word_embeddings=bool(text_config.get("tie_word_embeddings", False)),
-    )
+    return register_model(required_mapping(config, "model"))
 
 
 def _normalize_dtype_name(name: Any) -> Optional[str]:
@@ -964,10 +997,10 @@ def _build_model_target(
         ),
         pretrained_model_name_or_path=str(model_config["weights_path"]),
         torch_dtype=param_dtype_name if mixed_precision_enabled else "float32",
-        attn_implementation=str(model_config.get("attn_implementation", "sdpa")),
+        attn_implementation=trainer_attention_implementation(model_config),
         force_hf=True,
         local_files_only=True,
-        trust_remote_code=True,
+        trust_remote_code=model_trust_remote_code(model_config),
     )
 
 
@@ -1013,7 +1046,7 @@ def _build_accelerator_config(
     return AcceleratorConfig(
         tp_size=int(accelerator_config.get("tp", 1)),
         cp_size=int(accelerator_config.get("cp", 1)),
-        ep_size=1,
+        ep_size=int(accelerator_config.get("ep", 1)),
         pp_size=int(accelerator_config.get("pp", 1)),
         sequence_parallel=False,
         loss_parallel=False,
@@ -1096,6 +1129,32 @@ def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
     if cpu_offload and ":" not in backend:
         backend = f"cpu:gloo,{platform.device_type()}:{backend}"
 
+    family = build_model_registration(config).family if accelerator_config.get("ep", 1) != 1 else ""
+    ep_size = _trainer_ep_size(accelerator_config, family)
+    plan_overrides = []
+    if ep_size > 1:
+        factory = qwen3moe_ep_compute_fn
+        factory_kwargs = {"hf_combine": True}
+        matches = ["*.mlp"]
+        if family == "deepseek_v3":
+            factory = deepseekv3_ep_compute_fn
+            factory_kwargs = {}
+            with (Path(model_config["weights_path"]) / "config.json").open(encoding="utf-8") as handle:
+                hf_config = json.load(handle)
+            first_moe = int(hf_config.get("first_k_dense_replace", 3))
+            layer_count = int(hf_config["num_hidden_layers"])
+            if not 0 <= first_moe < layer_count:
+                raise ValueError("DeepSeek-V3 Trainer EP requires a valid nonempty MoE layer range")
+            matches = [f"model.layers.{index}.mlp" for index in range(first_moe, layer_count)]
+        plan_overrides = [PlanOverride(
+            match=match, when="ep", region_dispatch=False,
+            local_compute_fn=Target(
+                factory,
+                target_path="hyper_parallel.auto_models.components.distributed.ep_compute." + factory.__name__,
+                **factory_kwargs,
+            ),
+        ) for match in matches]
+
     return TrainerConfig(
         model=_build_model_target(
             model_config, param_dtype_name, mixed_precision_enabled
@@ -1110,6 +1169,7 @@ def build_runtime_config(config: Mapping[str, Any]) -> TrainerConfig:
             backend,
         ),
         accelerator=_build_accelerator_config(accelerator_config),
+        plan_overrides=plan_overrides,
         fsdp_config=_build_fsdp_config(
             accelerator_config, mixed_precision_config, dp_shard
         ),
@@ -1127,6 +1187,9 @@ __all__ = [
     "optional_mapping",
     "required_mapping",
     "resolve_vllm_automatic_limits",
+    "model_trust_remote_code",
+    "tokenizer_trust_remote_code",
+    "trainer_attention_implementation",
     "uses_colocated_vllm",
     "validate_config",
     "validate_rollout_and_agentic",

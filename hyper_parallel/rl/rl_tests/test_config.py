@@ -29,11 +29,14 @@ from rl.config import (
     _validate_disjoint_vllm,
     _validate_model_implementation,
     _validate_topology,
+    _validate_training_sizes,
     _validate_vllm_basics,
     _validate_vllm_limits,
     build_model_registration,
     build_runtime_config,
+    model_trust_remote_code,
     resolve_vllm_automatic_limits,
+    tokenizer_trust_remote_code,
     validate_config,
 )
 from rl.consistency import (
@@ -239,6 +242,7 @@ def test_example_config_directory_contains_only_major_recipes() -> None:
     """The public config directory stays limited to distinct supported workflows."""
     config_dir = Path(__file__).parents[1] / "examples" / "configs"
     expected = {
+        "moonlight_16b_a3b_gsm8k_native_vllm.yaml",
         "qwen3_4b_gsm8k_vllm_production.yaml",
         "qwen3_4b_gsm8k_vllm_tp2_consistency.yaml",
     }
@@ -262,6 +266,15 @@ def test_vllm_max_num_seqs_is_required_for_automatic_child_admission() -> None:
     """Configuration fails before runtime when automatic admission has no capacity."""
     with pytest.raises(ValueError, match="max_num_seqs is required"):
         _validate_vllm_limits({})
+
+
+def test_vllm_remote_code_choice_must_be_boolean() -> None:
+    """The rollout model remote-code switch cannot use string truthiness."""
+    with pytest.raises(
+        ValueError,
+        match="rollout.vllm.trust_remote_code must be a boolean",
+    ):
+        _validate_vllm_limits({"max_num_seqs": 1, "trust_remote_code": "false"})
 
 
 def test_vllm_max_num_seqs_cannot_exceed_token_budget() -> None:
@@ -632,6 +645,24 @@ def test_model_registration_uses_checkpoint_identity(tmp_path: Path) -> None:
     assert registration.tie_word_embeddings is True
 
 
+@pytest.mark.parametrize(
+    ("model_remote_code", "tokenizer_remote_code"),
+    [(False, True), (True, False)],
+)
+def test_model_and_tokenizer_remote_code_choices_are_independent(
+    model_remote_code: bool,
+    tokenizer_remote_code: bool,
+) -> None:
+    """The tokenizer choice cannot change the Trainer model implementation."""
+    model = {
+        "trust_remote_code": model_remote_code,
+        "tokenizer_trust_remote_code": tokenizer_remote_code,
+    }
+
+    assert model_trust_remote_code(model) is model_remote_code
+    assert tokenizer_trust_remote_code(model) is tokenizer_remote_code
+
+
 def test_qwen3_resolves_hyper_rollout_adapter(tmp_path: Path) -> None:
     """Qwen3 resolves the Hyper-vLLM implementation selector."""
     (tmp_path / "config.json").write_text(
@@ -704,10 +735,43 @@ def test_runtime_config_uses_atomic_hf_loader(tmp_path: Path) -> None:
         "HyperAutoModelForCausalLM.from_pretrained"
     )
     assert runtime.model.force_hf is True
+    assert runtime.model.trust_remote_code is True
+    assert runtime.model.attn_implementation == "sdpa"
     assert runtime.training.train_iters == 3
     assert runtime.training.backend == "cpu:gloo,npu:hccl"
     assert runtime.fsdp_config.dp_shard_size == 2
     assert runtime.activation_checkpoint.mode == "off"
+
+
+def test_runtime_config_applies_moonlight_builtin_attention_and_local_model_code(
+    tmp_path: Path,
+) -> None:
+    """The semantic Moonlight selection reaches the Transformers loader target."""
+    config = {
+        "model": {
+            "weights_path": str(tmp_path),
+            "config_overrides": None,
+            "trust_remote_code": False,
+            "attention_implementation": "transformers_builtin",
+        },
+        "train": {
+            "max_steps": 1,
+            "prompt_batch_size": 1,
+            "comm_backend": "hccl",
+            "accelerator": {"dp_shard": 1, "tp": 1, "cp": 1, "pp": 1},
+            "mixed_precision": {"enabled": True, "param_dtype": "bfloat16"},
+            "optimizer": {"lr": 1.0e-6},
+            "checkpoint": {
+                "output_dir": str(tmp_path / "outputs"),
+                "save_final": False,
+            },
+        },
+    }
+
+    runtime = build_runtime_config(config)
+
+    assert runtime.model.trust_remote_code is False
+    assert runtime.model.attn_implementation == "sdpa"
 
 
 def test_runtime_config_keeps_tp_out_of_logical_global_batch(tmp_path: Path) -> None:
@@ -915,6 +979,15 @@ def test_qwen3_consistency_profile_rejects_other_model_families() -> None:
         configure_consistency_profile(config)
 
 
+def test_moonlight_rejects_consistency_enablement() -> None:
+    """Moonlight cannot opt into the Qwen3-only bit-exact recipe."""
+    config = _consistency_config(True)
+    config["model"]["name"] = "deepseek_v3"
+
+    with pytest.raises(ValueError, match="supports only model.name='qwen3'"):
+        configure_consistency_profile(config)
+
+
 def test_enabled_consistency_profile_rejects_non_npu_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1095,3 +1168,25 @@ def test_critic_algorithm_is_rejected_before_runtime_setup() -> None:
 
     with pytest.raises(NotImplementedError, match="critic-free algorithms only"):
         validate_config({}, algorithm)
+
+
+@pytest.mark.parametrize("max_step", (0, -1, True, 1.5, "1"))
+def test_learning_gate_max_step_must_be_a_positive_integer(max_step: object) -> None:
+    """The optional bounded acceptance window rejects ambiguous values."""
+    algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
+    train = {
+        "max_steps": 2,
+        "prompt_batch_size": 1,
+        "micro_batch_size": 1,
+        "response_mini_batch_size": 2,
+        "policy_update_epochs": 1,
+        "learning_gate": {"max_step": max_step},
+    }
+
+    with pytest.raises(ValueError, match="learning_gate.max_step"):
+        _validate_training_sizes(
+            train,
+            {"num_return_sequences": 2, "max_new_tokens": 8},
+            {"max_prompt_length": 8},
+            algorithm,
+        )

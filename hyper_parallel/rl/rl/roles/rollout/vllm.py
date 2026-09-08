@@ -876,6 +876,8 @@ class VLLMGenerationEngine:
             command.append("--trust-remote-code")
         if bool(self._config.get("enforce_eager", True)):
             command.append("--enforce-eager")
+        if bool(self._config.get("enable_expert_parallel", False)):
+            command.append("--enable-expert-parallel")
         for key, option in (
             ("enable_prefix_caching", "--enable-prefix-caching"),
             ("enable_chunked_prefill", "--enable-chunked-prefill"),

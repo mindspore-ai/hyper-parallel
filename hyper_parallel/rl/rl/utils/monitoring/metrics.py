@@ -639,6 +639,9 @@ def enforce_learning_gate(
     """Fail numerical acceptance runs when configured invariants are absent."""
     if not bool(config.get("enabled", False)):
         return
+    max_step = config.get("max_step")
+    if max_step is not None and step > int(max_step):
+        return
 
     def validate() -> None:
         """Validate rank-zero learning evidence before synchronized publication."""

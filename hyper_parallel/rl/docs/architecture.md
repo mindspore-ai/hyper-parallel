@@ -3,7 +3,8 @@
 ## 范围
 
 Hyper-RL 是单节点 Torch NPU 上的同步大语言模型强化学习运行时。Trainer 使用 Transformers、HyperAutoModel 与
-HyperParallel FSDP/TP；rollout 使用 vLLM/vLLM-Ascend。当前端到端算法和模型范围为 Qwen3 GRPO。
+HyperParallel FSDP/TP/EP；rollout 使用 vLLM/vLLM-Ascend。模型范围为 Qwen3 dense、Qwen3-MoE、DeepSeek-V3 family，
+已验证的具体 checkpoint 和并行组合见 [MoE 模型](moe_models.md)，当前端到端算法为 GRPO。
 
 当前实现已迁移到 `upstream/master@b9fa61a9` 的 HyperAutoModel/Trainer 基线。训练基础能力直接使用 master 的模型加载、
 distributed setup、optimizer、gradient clipping 和 checkpoint，不保留 trainer_dev 或旧 RL Trainer 兼容路径。
@@ -28,7 +29,8 @@ Transformers Qwen3 definition
 ```
 
 这使权重同步可以直接使用同源 parameter/layout contract，而无需维护另一套手写推理模型或分布式映射。Native-vLLM 继续使用
-vLLM 原生 Qwen3 实现，因此不属于这一训推一体模型声明。
+vLLM 原生模型实现，因此不属于这一训推一体模型声明。MoE 同样复用公共 planner 和 EP 通信，模型特有的
+MLA、shared experts 与保留叶子边界见 [MoE 模型](moe_models.md#组件归属)。
 
 ## 组件
 
@@ -71,7 +73,7 @@ Colocated 要求 `rollout_dp × rollout_tp = trainer_dp_shard × trainer_tp`。D
 world size 独立，只要求显式设备数量等于 `rollout_dp × rollout_tp`。
 
 两种 deployment 使用同一个配置 schema、Trainer、rollout controller 和 policy transaction 接口；`deployment` 只选择
-设备 ownership、residency 和 transport。当前已验证的完整 TP2 拓扑为：
+设备 ownership、residency 和 transport。以下精确一致性结果仅针对 Qwen3 dense：
 
 | Deployment | Trainer | Rollout | 权重发布 | Consistency |
 | --- | --- | --- | --- | --- |
@@ -138,10 +140,13 @@ Trainer FSDP/FSDP+TP source layout
 -> controller publication
 ```
 
-| 策略 | TP1 | Qwen3 TP2 |
+| 策略 | TP1 | TP2 / 静态 EP |
 | --- | --- | --- |
 | Full-gather | 逐 fragment 重建当前 bucket | Colocated NPU IPC / disjoint HCCL；每 bucket ACK 后释放 |
 | Direct-reshard | replicated destination 的直接分片传输 | 只传输 source/destination region intersection |
+
+两种策略使用同一 canonical adapter、源/目标布局与事务校验。MoE dense 权重按 TP、专家权重按 EP 分别描述归属；
+不将 TP 与 EP 误当为同一个参数切分轴。默认值和失败行为见 [vLLM Rollout](vllm_rollout.md#权重同步)。
 
 Policy version 严格递增。Direct 失败时先 abort pending transaction，再由 full-gather 完整覆盖；fallback 也失败时
 保持 admission 关闭，不恢复 rollout，也不发布新版本。详细合同见 [vLLM Rollout](vllm_rollout.md)。
