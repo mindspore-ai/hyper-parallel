@@ -117,7 +117,7 @@ dataset:
     hf_dataset_name: Salesforce/wikitext
     hf_config_name: wikitext-2-raw-v1
     cache_dir: null
-    labels_are_shifted: false
+    labels_are_shifted: true
     create_attention_mask_in_dataloader: true
     create_ltor_fields_in_dataloader: false
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset

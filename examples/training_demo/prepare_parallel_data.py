@@ -31,7 +31,8 @@ def prepare_parallel_data(output_dir: Path, *, num_samples: int = 128, seq_lengt
 
     Offline samples contain ``seq_length + 1`` tokens because the Indexed
     dataset creates inputs from ``text[:-1]`` and already-shifted labels from
-    ``text[1:]``. Online samples remain unshifted and are tokenized at runtime.
+    ``text[1:]``. Online source records remain raw text; their runtime transform
+    also emits ``input_ids[:-1]`` paired with pre-shifted ``labels[1:]``.
 
     Args:
         output_dir: Directory containing generated demo data.

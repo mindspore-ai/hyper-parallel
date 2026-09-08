@@ -58,6 +58,14 @@ def _load_expert_parallel():
     return expert_parallel
 
 
+def _load_loss():
+    """Return the family's model-integrated output-loss adapter."""
+    from hyper_parallel.models.qwen3_moe.adapter import (  # pylint: disable=C0415
+        chunk_loss,
+    )
+    return chunk_loss
+
+
 QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3MoeForCausalLM",
     model_type="qwen3_moe",
@@ -65,6 +73,7 @@ QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     attention=_load_attention,
     context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
+    loss=_load_loss,
 )
 
 register_model_adapter(QWEN3_MOE_ADAPTER_SPEC)

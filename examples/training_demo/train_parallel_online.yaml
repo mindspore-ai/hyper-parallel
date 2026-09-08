@@ -100,8 +100,8 @@ dataset:
     hf_dataset_name: null
     # Packed documents require the external global block mask accepted by the CP mask wrapper.
     create_attention_mask_in_dataloader: true
-    # Online text is shifted once by the model/loss path.
-    labels_are_shifted: false
+    # The online text transform already pairs input_ids[:-1] with labels[1:].
+    labels_are_shifted: true
 
 dataloader:
   _target_: hyper_parallel.data.batching.DynamicBatchDataLoader

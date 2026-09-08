@@ -15,6 +15,11 @@
 """Model-level loss objectives and calling adapters — design doc §10 + §10.0."""
 
 from hyper_parallel.components.losses.dispatcher import calculate_loss
+from hyper_parallel.components.losses.chunked_cross_entropy import (
+    ChunkedCausalLMLoss,
+    ChunkedCausalLMOutput,
+    chunked_cross_entropy,
+)
 from hyper_parallel.components.losses.masked_ce import MaskedCrossEntropy
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.components.losses.mtp import calculate_mtp_loss
@@ -26,9 +31,12 @@ except ImportError:
     pass
 
 __all__ = [
+    "ChunkedCausalLMLoss",
+    "ChunkedCausalLMOutput",
     "MaskedCrossEntropy",
     "ModelOutputLoss",
     "FusedLinearCrossEntropy",
     "calculate_loss",
+    "chunked_cross_entropy",
     "calculate_mtp_loss",
 ]
