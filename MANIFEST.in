@@ -3,6 +3,7 @@ include README.md
 include README.en.md
 include LICENSE
 include scripts/hyper_parallel_multicore_set_env.bash
+include hyper_parallel/platform/torch/custom_ops/kda/README.md
 prune build
 prune dist
 prune *.egg-info
