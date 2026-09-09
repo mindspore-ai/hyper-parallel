@@ -399,8 +399,6 @@ class _HookManager(_Backbone):
 
             constant.__qualname__ = str(field)
             res = constant
-        if field in self._ccfg.overwrite_eval_functions:
-            res = self._ccfg.overwrite_eval_functions[field]
         if isinstance(field, str):
 
             def zero(*_):
@@ -410,6 +408,12 @@ class _HookManager(_Backbone):
             res = getattr(eval_class, field, zero)
             if self.toggle_func_trace == field:
                 res = self.func_tracer.wrap(getattr(eval_class, field))
+        # Priority 2 beats priority 3, so this has to come after the yaml
+        # name lookup above, which would otherwise overwrite the override.
+        if field in self._ccfg.overwrite_eval_functions:
+            res = self._ccfg.overwrite_eval_functions[field]
+            if self.toggle_func_trace == field:
+                res = self.func_tracer.wrap(res)
         res = self.__wrap_mem_counter(mem_type, res)
         if not res:
             raise TypeError(f"In eval config yaml, non valid field: {field}")
