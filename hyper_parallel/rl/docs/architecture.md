@@ -14,7 +14,7 @@ Hyper-RL 当前运行时的核心是一个同步训练状态机：每一步只�
 
 ## 系统视图
 
-![Hyper-RL 架构：极简易用、易于扩展与 Agentic 原生的组件和数据流](assets/hyper-rl-architecture.svg)
+![Hyper-RL 架构：极简易用、易于扩展与昇腾亲和的组件和数据流](assets/hyper-rl-architecture.svg)
 
 设计目标与取舍见[设计原则](design.md)。图中的统一入口和编排器连接以下三条主线：
 
@@ -23,6 +23,12 @@ Hyper-RL 当前运行时的核心是一个同步训练状态机：每一步只�
 - **Verified policy 状态流**：Actor 产生 V+1，经 layout-aware 传输、identity 校验和 cache reset 后才替换 rollout 可见的 V。
 
 `SyncTrainer` 串行控制 rollout、learning 和 publication，metrics、evaluation 和 checkpoint 只在发布成功后执行。vLLM upstream 负责 endpoint 内部的 DP request routing；Trainer TP>1 时，每个 TP group 只有一个 request owner 发起 HTTP 请求，结果随后广播给该组的其他 ranks。
+
+### 昇腾适配边界
+
+训练侧通过 HyperParallel / HyperAutoModel 承载模型与并行能力，采样侧通过 vLLM / vLLM-Ascend 运行栈执行推理。当前共卡部署使用 NPU IPC，分离部署使用 HCCL 传输权重，具体生命周期与适用组合见 [vLLM Rollout](vllm_rollout.md)。CANN、torch-npu 与推理依赖由[运行镜像](hyper_rl_runtime_image.md)固定。
+
+后续适配沿用这些职责边界：设备、算子和通信差异不进入任务与奖励逻辑；新增并行组合须验证样本语义、权重发布与恢复，并记录显存、通信和计算开销。“昇腾亲和”是设计与验证要求，不代表所有昇腾型号、拓扑或底层能力均已通过 RL 验收。
 
 ## 控制面
 

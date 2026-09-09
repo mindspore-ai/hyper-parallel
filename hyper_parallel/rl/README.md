@@ -1,12 +1,12 @@
 # ⚡ Hyper-RL
 
-**A lightweight framework for online reinforcement learning with LLMs and VLMs.**
+**A lightweight, extensible reinforcement learning framework.**
 
 Built on HyperParallel and vLLM, with explicit training orchestration and modular interfaces.
 
 Hyper-RL 的长期目标是：**以精简、可扩展的核心，支持从基础强化学习到多轮 Agent、多模态与大规模异步训练。**
 
-**极简易用、易于扩展、Agentic 原生**是实现这一目标的设计约束。框架聚焦 LLM/VLM 在线强化学习，由用户定义任务与交互程序。当前由 HyperParallel / HyperAutoModel 承载训练、vLLM 提供采样，SyncTrainer 显式编排同步训练流程；任务、工具与奖励通过 Python 定义。异步、多模态与更大规模训练按阶段建设，交付计划见 [TODO](docs/TODO.md)。
+**极简易用、易于扩展、昇腾亲和**是实现这一目标的设计约束。框架支持基础策略优化与 Agent 交互学习，由用户定义任务与交互程序，统一编排采样、训练与策略更新。当前由 HyperParallel / HyperAutoModel 承载训练、vLLM 提供采样，SyncTrainer 显式编排同步训练流程；任务、工具与奖励通过 Python 定义。异步、多模态与更大规模训练按阶段建设，交付计划见 [TODO](docs/TODO.md)。
 
 [💡 Why Hyper-RL](#why-hyper-rl) · [🏗️ 架构](#架构) · [🎯 支持范围](#支持范围) · [📦 安装与环境](#安装与环境) · [🚀 快速开始](#快速开始) · [🧩 扩展与定制](#扩展与定制) · [📚 文档](#文档)
 
@@ -19,7 +19,8 @@ Hyper-RL 的长期目标是：**以精简、可扩展的核心，支持从基础
 | 设计选择 | 能力与价值 |
 | --- | --- |
 | 🪶 **精简的基础设施** | HyperParallel / HyperAutoModel 负责训练，vLLM 负责采样；同步路径无需 Ray，一个 SyncTrainer 显式组织训练流程。 |
-| 🤖 **Agentic 原生的任务接口** | 环境、工具与奖励通过 Python 定义。单轮与多轮任务共用[轨迹合同](rl/dataset/contracts.py)，区分策略动作与环境观察；程序化 Agent 组件复用该合同。 |
+| ⚙️ **昇腾亲和的训练与采样** | 基于 HyperParallel 与 vLLM-Ascend 运行栈，复用已验证的并行、NPU IPC / HCCL 权重传输路径；提供[固定运行镜像](docs/hyper_rl_runtime_image.md)和代表性 recipe，支持范围以实测为准。 |
+| 🤖 **统一的任务与交互接口** | 环境、工具与奖励通过 Python 定义。单轮与多轮任务共用[轨迹合同](rl/dataset/contracts.py)，区分策略动作与环境观察；程序化 Agent 组件复用该合同。 |
 | 🔗 **可靠的训练与策略发布** | 原始 token、logprobs、动作掩码与策略身份贯穿训练。[新策略完成传输与校验后恢复采样](docs/vllm_rollout.md)，并在已验证组合中提供更新前 [Bit-Exact 校验](docs/qwen3_training_inference_consistency.md)。 |
 | 🧩 **明确的扩展边界** | 任务与兼容现有角色的算法在对应模块扩展，无需复制训练流程；采样与学习关系、更新顺序等机制变化可直接修改编排。具体取舍见[设计原则](docs/design.md)。 |
 | 📖 **可读、可追踪的实现** | 显式调用与状态归属便于追踪训练流程；[功能导航](../../docs/rl-navigation.md)连接配置、实现与测试。开发 Agent 从 [AGENTS.md](../../AGENTS.md) 进入 [Hyper-RL 规则](../../.agent/rules/hyper-rl.md)，按任务读取权威文档与代码。 |
