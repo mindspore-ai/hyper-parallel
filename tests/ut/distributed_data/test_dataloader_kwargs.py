@@ -26,6 +26,8 @@ from hyper_parallel.distributed_data import (
     build_distributed_dataloader,
 )
 from hyper_parallel.distributed_data.api import _config_fingerprint, _normalize_dataloader_kwargs
+from hyper_parallel.distributed_data.dataset_reader import DatasetReader
+from hyper_parallel.distributed_data.sidecar import PlannedSampleLoader
 
 
 class _StandaloneMesh:
@@ -171,6 +173,29 @@ class TestDataLoaderKwargs(unittest.TestCase):
             with self.subTest(supplied=tuple(supplied)):
                 with self.assertRaisesRegex(ValueError, expected_error):
                     _normalize_dataloader_kwargs(self._config(), supplied)
+
+    def test_worker_validation_is_shared_by_config_overrides_and_direct_readers(self) -> None:
+        """Every entry point rejects the same invalid worker settings before creating workers."""
+        cases = (
+            {"num_workers": True}, {"num_workers": -1}, {"pin_memory": 1}, {"persistent_workers": 1},
+            {"prefetch_factor": True}, {"prefetch_factor": 0}, {"prefetch_factor": 2},
+            {"persistent_workers": True},
+        )
+        for invalid in cases:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self._config(**invalid)
+                with self.assertRaises(ValueError):
+                    _normalize_dataloader_kwargs(self._config(), invalid)
+                options = {"num_workers": 0, "pin_memory": False, "prefetch_factor": None, "persistent_workers": False}
+                options.update(invalid)
+                with self.assertRaises(ValueError):
+                    PlannedSampleLoader(self._samples(), seed=17, **options)
+                with self.assertRaises(ValueError):
+                    DatasetReader(
+                        self._samples(), _metadata_fn, reader_rank=0, reader_idx=0, reader_count=1,
+                        seq_len=8, shuffle=False, seed=17, **options,
+                    )
 
     def test_equivalent_context_forms_and_custom_worker_init_share_fingerprint(self) -> None:
         """Stable fingerprints should ignore context objects and callable addresses."""

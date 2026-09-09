@@ -163,7 +163,7 @@ class DistributedDataLoader(Iterator[Any]):
             direct_sample_loader: PlannedSampleLoader | None,
             sidecar_mode: bool,
             sidecar_payload_exchange: bool,
-            step_sample_selector: StepSampleSelector,
+            step_sample_selector: StepSampleSelector | None,
             planner: DynamicPackingPlanner,
             data_constructor: PackingDataConstructor,
             data_plane: DataPlaneTransport,
@@ -176,6 +176,8 @@ class DistributedDataLoader(Iterator[Any]):
             initial_epoch: int = 0,
     ) -> None:
         """Store the fully validated runtime components."""
+        if not batch_sampler_mode and step_sample_selector is None:
+            raise ValueError("Stream-based loading requires a StepSampleSelector.")
         _validate_loader_components(
             topology=topology,
             dataset_reader_ranks=dataset_reader_ranks,

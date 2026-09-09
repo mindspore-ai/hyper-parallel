@@ -40,7 +40,7 @@ from hyper_parallel.distributed_data.distributed_dataloader import DistributedDa
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
 from hyper_parallel.distributed_data.schema import SampleMetadata
 from hyper_parallel.distributed_data.sidecar import PlannedSampleLoader, SidecarMetadataReader
-from hyper_parallel.distributed_data.dataset_reader import DatasetReader
+from hyper_parallel.distributed_data.dataset_reader import DatasetReader, _validate_worker_options
 from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
@@ -145,7 +145,7 @@ class DistributedDatasetConfig:
         self._validate_integer_fields()
         self._validate_buffer_size_multiplier()
         self._validate_policy_and_flags()
-        self._validate_worker_options()
+        _validate_worker_options({name: getattr(self, name) for name in _CONFIG_DATALOADER_KWARGS})
         self._validate_rank_tuple(self.dataset_reader_ranks, "dataset_reader_ranks")
         self._validate_name_tuple(self.dp_dim_names, "dp_dim_names")
         self._validate_planner_rank()
@@ -156,10 +156,8 @@ class DistributedDatasetConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, but got {value!r}.")
-        for name in ("seed", "num_workers"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool) or self.seed < 0:
+            raise ValueError(f"seed must be a non-negative integer, but got {self.seed!r}.")
 
     def _validate_buffer_size_multiplier(self) -> None:
         multiplier = self.buffer_size_multiplier
@@ -179,8 +177,6 @@ class DistributedDatasetConfig:
                 "dataset_already_sharded",
                 "drop_last",
                 "shuffle",
-                "pin_memory",
-                "persistent_workers",
                 "double_buffer",
         ):
             if not isinstance(getattr(self, name), bool):
@@ -190,18 +186,6 @@ class DistributedDatasetConfig:
                 "Dynamic distributed packing currently requires drop_last=True so every DP rank receives the "
                 "same number of non-empty packing bins."
             )
-
-    def _validate_worker_options(self) -> None:
-        if self.prefetch_factor is not None and (
-                not isinstance(self.prefetch_factor, int)
-                or isinstance(self.prefetch_factor, bool)
-                or self.prefetch_factor < 1
-        ):
-            raise ValueError("prefetch_factor must be a positive integer or None.")
-        if self.num_workers == 0 and self.prefetch_factor is not None:
-            raise ValueError("prefetch_factor requires num_workers > 0.")
-        if self.persistent_workers and self.num_workers == 0:
-            raise ValueError("persistent_workers=True requires num_workers > 0.")
 
     def _validate_planner_rank(self) -> None:
         if self.planner_rank is not None and (
@@ -274,7 +258,7 @@ def _normalize_dataloader_kwargs(
     _validate_dataloader_option_keys(supplied_options)
     options = {name: getattr(config, name) for name in _CONFIG_DATALOADER_KWARGS}
     options.update(supplied_options)
-    _validate_dataloader_worker_options(options)
+    _validate_worker_options(options)
     normalized_timeout = _validate_optional_dataloader_options(options)
     fingerprint_values = {
         "in_order": options.get("in_order", True),
@@ -315,26 +299,6 @@ def _validate_dataloader_option_keys(supplied_options: Mapping[str, Any]) -> Non
     unsupported_keys = sorted(set(supplied_options) - _SUPPORTED_DATALOADER_KWARGS)
     if unsupported_keys:
         raise ValueError(f"dataloader_kwargs contains unsupported options {unsupported_keys}.")
-
-
-def _validate_dataloader_worker_options(options: Mapping[str, Any]) -> None:
-    num_workers = options["num_workers"]
-    if not isinstance(num_workers, int) or isinstance(num_workers, bool) or num_workers < 0:
-        raise ValueError(f"dataloader_kwargs num_workers must be a non-negative integer, but got {num_workers!r}.")
-    for name in ("pin_memory", "persistent_workers"):
-        if not isinstance(options[name], bool):
-            raise ValueError(f"dataloader_kwargs {name} must be boolean, but got {options[name]!r}.")
-    prefetch_factor = options["prefetch_factor"]
-    if prefetch_factor is not None and (
-            not isinstance(prefetch_factor, int)
-            or isinstance(prefetch_factor, bool)
-            or prefetch_factor < 1
-    ):
-        raise ValueError("dataloader_kwargs prefetch_factor must be a positive integer or None.")
-    if num_workers == 0 and prefetch_factor is not None:
-        raise ValueError("dataloader_kwargs prefetch_factor requires num_workers > 0.")
-    if options["persistent_workers"] and num_workers == 0:
-        raise ValueError("dataloader_kwargs persistent_workers=True requires num_workers > 0.")
 
 
 def _validate_optional_dataloader_options(options: Mapping[str, Any]) -> float:
@@ -418,15 +382,14 @@ def _config_fingerprint(
     return hashlib.sha256(repr(sorted(stable_config.items())).encode("utf-8")).hexdigest()[:24]
 
 
-def _normalize_communication_device(communication_device: Any) -> tuple[torch.device | None, str | None]:
+def _normalize_communication_device(communication_device: Any) -> torch.device | None:
     """Normalize a rank-local A2A device without fingerprinting its local index."""
     if communication_device is None:
-        return None, None
+        return None
     try:
-        device = torch.device(communication_device)
+        return torch.device(communication_device)
     except Exception as exc:
         raise ValueError(f"communication_device is invalid: {communication_device!r}.") from exc
-    return device, device.type
 
 
 def _build_fingerprint(topology: DataTopology, config_fingerprint: str) -> str:
@@ -436,30 +399,23 @@ def _build_fingerprint(topology: DataTopology, config_fingerprint: str) -> str:
 
 @dataclass
 class _BuildState:
-    """Mutable rank-local components synchronized by the collective preflight."""
+    """Rank-local components and partial validation results needed across build stages."""
 
     sidecar_mode: bool
-    sidecar_payload_exchange: bool = False
-    dataset_already_sharded: bool = False
     topology: DataTopology | None = None
     dataset_reader_ranks: tuple[int, ...] | None = None
     planner_rank: int | None = None
     dataset_reader: DatasetReader | BatchSamplerReader | None = None
     sidecar_reader: SidecarMetadataReader | BatchSamplerReader | None = None
     direct_sample_loader: PlannedSampleLoader | None = None
-    normalized_dataloader_kwargs: dict[str, Any] | None = None
-    dataloader_fingerprint: tuple[tuple[str, Any], ...] | None = None
-    additional_dataloader_kwargs: dict[str, Any] | None = None
     planner: DynamicPackingPlanner | None = None
     step_sample_selector: StepSampleSelector | None = None
     constructor: PackingDataConstructor | None = None
     config_fingerprint: str | None = None
     communication_device: torch.device | None = None
-    communication_device_type: str | None = None
     reader_size: int | None = None
     direct_dataset_size: int | None = None
     local_error: str | None = None
-    batch_sampler_fingerprint: str | None = None
 
     @property
     def is_reader(self) -> bool:
@@ -468,15 +424,6 @@ class _BuildState:
             self.topology is not None
             and self.dataset_reader_ranks is not None
             and self.topology.global_rank in self.dataset_reader_ranks
-        )
-
-    @property
-    def is_direct_reader(self) -> bool:
-        """Return whether this rank reads sidecar-selected payloads directly."""
-        if not self.sidecar_mode or self.topology is None:
-            return False
-        return (self.dataset_already_sharded and self.is_reader) or (
-            not self.dataset_already_sharded and self.topology.is_constructor
         )
 
 
@@ -527,31 +474,13 @@ def _validate_builder_callbacks(
         raise ValueError("collate_fn must be callable or None.")
 
 
-def _make_planned_sample_loader(
-        dataset: Any,
-        config: DistributedDatasetConfig,
-        state: _BuildState,
-) -> PlannedSampleLoader:
-    options = state.normalized_dataloader_kwargs
-    if options is None or state.additional_dataloader_kwargs is None:
-        raise ValueError("DataLoader options must be normalized before creating a direct sample loader.")
-    return PlannedSampleLoader(
-        dataset,
-        num_workers=options["num_workers"],
-        pin_memory=options["pin_memory"],
-        prefetch_factor=options["prefetch_factor"],
-        persistent_workers=options["persistent_workers"],
-        seed=config.seed,
-        dataloader_kwargs=state.additional_dataloader_kwargs,
-    )
-
-
 def _configure_sidecar_reader(
         state: _BuildState,
         dataset: Any | None,
         metadata: Sequence[SampleMetadata] | None,
         config: DistributedDatasetConfig,
         reader_idx: int,
+        loader_options: dict[str, Any],
 ) -> None:
     if metadata is None or state.topology is None or state.dataset_reader_ranks is None:
         rank = None if state.topology is None else state.topology.global_rank
@@ -564,16 +493,16 @@ def _configure_sidecar_reader(
         seq_len=config.seq_len,
         shuffle=config.shuffle,
         seed=config.seed,
-        dataset_already_sharded=state.dataset_already_sharded,
+        dataset_already_sharded=config.dataset_already_sharded,
     )
     state.reader_size = len(metadata)
-    if not state.dataset_already_sharded:
+    if not config.dataset_already_sharded:
         return
     if dataset is None:
         raise ValueError(
             f"Pre-sharded sidecar Dataset Reader rank {state.topology.global_rank} must provide a Dataset."
         )
-    state.direct_sample_loader = _make_planned_sample_loader(dataset, config, state)
+    state.direct_sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
     state.direct_dataset_size = len(dataset)
     if state.reader_size != state.direct_dataset_size:
         raise ValueError(
@@ -588,13 +517,13 @@ def _configure_online_reader(
         metadata_fn: Callable[[Any], SampleMetadata] | None,
         config: DistributedDatasetConfig,
         reader_idx: int,
+        loader_options: dict[str, Any],
 ) -> None:
     if dataset is None or state.topology is None or state.dataset_reader_ranks is None:
         rank = None if state.topology is None else state.topology.global_rank
         raise ValueError(f"Online Dataset Reader rank {rank} must provide a Dataset.")
-    if metadata_fn is None or state.normalized_dataloader_kwargs is None:
-        raise ValueError("Online Dataset Reader requires metadata_fn and normalized DataLoader options.")
-    options = state.normalized_dataloader_kwargs
+    if metadata_fn is None:
+        raise ValueError("Online Dataset Reader requires metadata_fn.")
     state.dataset_reader = DatasetReader(
         dataset,
         metadata_fn,
@@ -604,12 +533,8 @@ def _configure_online_reader(
         seq_len=config.seq_len,
         shuffle=config.shuffle,
         seed=config.seed,
-        num_workers=options["num_workers"],
-        pin_memory=options["pin_memory"],
-        prefetch_factor=options["prefetch_factor"],
-        persistent_workers=options["persistent_workers"],
-        dataset_already_sharded=state.dataset_already_sharded,
-        dataloader_kwargs=state.additional_dataloader_kwargs,
+        dataset_already_sharded=config.dataset_already_sharded,
+        **loader_options,
     )
     state.reader_size = state.dataset_reader.dataset_size
 
@@ -620,18 +545,19 @@ def _configure_local_data_sources(
         metadata_fn: Callable[[Any], SampleMetadata] | None,
         metadata: Sequence[SampleMetadata] | None,
         config: DistributedDatasetConfig,
+        loader_options: dict[str, Any],
 ) -> None:
     if state.is_reader:
         reader_idx = state.dataset_reader_ranks.index(state.topology.global_rank)
         if state.sidecar_mode:
-            _configure_sidecar_reader(state, dataset, metadata, config, reader_idx)
+            _configure_sidecar_reader(state, dataset, metadata, config, reader_idx, loader_options)
         else:
-            _configure_online_reader(state, dataset, metadata_fn, config, reader_idx)
-    if not state.sidecar_mode or state.dataset_already_sharded or not state.topology.is_constructor:
+            _configure_online_reader(state, dataset, metadata_fn, config, reader_idx, loader_options)
+    if not state.sidecar_mode or config.dataset_already_sharded or not state.topology.is_constructor:
         return
     if dataset is None:
         raise ValueError(f"Sidecar Data Constructor rank {state.topology.global_rank} must provide a Dataset.")
-    state.direct_sample_loader = _make_planned_sample_loader(dataset, config, state)
+    state.direct_sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
     state.direct_dataset_size = len(dataset)
     if state.reader_size is not None and state.reader_size != state.direct_dataset_size:
         raise ValueError(
@@ -646,7 +572,8 @@ def _configure_batch_sampler_sources(
         metadata: Sequence[SampleMetadata] | None,
         config: DistributedDatasetConfig,
         batch_sampler: Any,
-) -> None:
+        loader_options: dict[str, Any],
+) -> str:
     """Use native DP sampler owners as Readers without applying a second stride."""
     if state.dataset_reader_ranks != state.topology.constructor_ranks:
         raise ValueError("Native batch_sampler currently requires Dataset Readers on the Data Constructor ranks.")
@@ -654,15 +581,15 @@ def _configure_batch_sampler_sources(
         raise ValueError(
             "Native batch_sampler owns DP slicing and shuffle; disable shuffle and dataset_already_sharded."
         )
-    state.batch_sampler_fingerprint = native_sampler_fingerprint(
+    sampler_fingerprint = native_sampler_fingerprint(
         batch_sampler, data_rank=state.topology.data_rank,
         dp_size=state.topology.data_parallel_size, local_batch_size=config.local_batch_size,
     )
     if not state.is_reader:
-        return
+        return sampler_fingerprint
     if dataset is None:
         raise ValueError("Native batch_sampler requires a mapping Dataset on each Data Constructor.")
-    sample_loader = _make_planned_sample_loader(dataset, config, state)
+    sample_loader = PlannedSampleLoader(dataset, seed=config.seed, **loader_options)
     sample_loader.set_epoch(batch_sampler.epoch)
     state.reader_size = len(dataset)
     if state.sidecar_mode:
@@ -674,7 +601,7 @@ def _configure_batch_sampler_sources(
         raise ValueError("Native batch_sampler online mode requires metadata_fn.")
     reader = BatchSamplerReader(
         batch_sampler, reader_rank=state.topology.global_rank,
-        policy_fingerprint=state.batch_sampler_fingerprint,
+        policy_fingerprint=sampler_fingerprint,
         metadata=metadata, metadata_fn=metadata_fn,
         sample_loader=None if state.sidecar_mode else sample_loader,
     )
@@ -682,6 +609,7 @@ def _configure_batch_sampler_sources(
         state.sidecar_reader = reader
     else:
         state.dataset_reader = reader
+    return sampler_fingerprint
 
 
 def _populate_build_state(
@@ -700,21 +628,18 @@ def _populate_build_state(
     if not isinstance(config, DistributedDatasetConfig):
         raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
     metadata = _infer_dataset_metadata(dataset, metadata_fn, metadata)
-    state.dataset_already_sharded = config.dataset_already_sharded
-    state.sidecar_payload_exchange = state.sidecar_mode and state.dataset_already_sharded
     _validate_builder_callbacks(metadata_fn, metadata, pack_fn, collate_fn)
-    state.normalized_dataloader_kwargs, state.dataloader_fingerprint = _normalize_dataloader_kwargs(
+    normalized_options, dataloader_fingerprint = _normalize_dataloader_kwargs(
         config,
         dataloader_kwargs,
     )
-    state.additional_dataloader_kwargs = {
+    loader_options = {name: normalized_options[name] for name in _CONFIG_DATALOADER_KWARGS}
+    loader_options["dataloader_kwargs"] = {
         name: value
-        for name, value in state.normalized_dataloader_kwargs.items()
+        for name, value in normalized_options.items()
         if name not in _CONFIG_DATALOADER_KWARGS
     }
-    state.communication_device, state.communication_device_type = _normalize_communication_device(
-        communication_device
-    )
+    state.communication_device = _normalize_communication_device(communication_device)
     uses_default_pack = pack_fn is None or pack_fn is default_pack_fn
     uses_default_collate = collate_fn is None or collate_fn is default_collate_fn
     effective_pack_fn = default_pack_fn if uses_default_pack else pack_fn
@@ -725,65 +650,72 @@ def _populate_build_state(
     effective_collate_fn = default_collate_fn if uses_default_collate else collate_fn
     state.topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
     state.dataset_reader_ranks, state.planner_rank = _resolve_service_ranks(state.topology, config)
+    batch_sampler_fingerprint = None
     if batch_sampler is None:
-        _configure_local_data_sources(state, dataset, metadata_fn, metadata, config)
+        _configure_local_data_sources(state, dataset, metadata_fn, metadata, config, loader_options)
     else:
-        _configure_batch_sampler_sources(state, dataset, metadata_fn, metadata, config, batch_sampler)
+        batch_sampler_fingerprint = _configure_batch_sampler_sources(
+            state, dataset, metadata_fn, metadata, config, batch_sampler, loader_options,
+        )
     state.planner = DynamicPackingPlanner(
         data_parallel_size=state.topology.data_parallel_size,
         seq_len=config.seq_len,
         local_batch_size=config.local_batch_size,
         oversized_policy=config.oversized_policy,
     )
-    state.step_sample_selector = StepSampleSelector(
-        seq_len=config.seq_len,
-        distributed_bin_count=state.planner.distributed_bin_count,
-        oversized_policy=config.oversized_policy,
-    )
+    if batch_sampler is None:
+        state.step_sample_selector = StepSampleSelector(
+            seq_len=config.seq_len,
+            distributed_bin_count=state.planner.distributed_bin_count,
+            oversized_policy=config.oversized_policy,
+        )
     state.constructor = PackingDataConstructor(effective_pack_fn, effective_collate_fn, seq_len=config.seq_len)
     state.config_fingerprint = _config_fingerprint(
         config,
         state.dataset_reader_ranks,
         state.planner_rank,
-        dataloader_fingerprint=state.dataloader_fingerprint,
+        dataloader_fingerprint=dataloader_fingerprint,
         sidecar_mode=state.sidecar_mode,
-        communication_device_type=state.communication_device_type,
+        communication_device_type=None if state.communication_device is None else state.communication_device.type,
         uses_default_pack=uses_default_pack,
         uses_default_collate=uses_default_collate,
     )
-    if state.batch_sampler_fingerprint is not None:
-        state.config_fingerprint += ":batch_sampler:" + state.batch_sampler_fingerprint
+    if batch_sampler_fingerprint is not None:
+        state.config_fingerprint += ":batch_sampler:" + batch_sampler_fingerprint
 
 
-def _synchronize_build_state(state: _BuildState) -> None:
+def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfig) -> None:
     build_fingerprint = None
     if state.topology is not None and state.config_fingerprint is not None:
         build_fingerprint = _build_fingerprint(state.topology, state.config_fingerprint)
+    # Invalid configs must still participate in WORLD error synchronization.
+    dataset_already_sharded = isinstance(config, DistributedDatasetConfig) and config.dataset_already_sharded
+    is_direct_reader = state.sidecar_mode and state.topology is not None and (
+        state.is_reader if dataset_already_sharded else state.topology.is_constructor
+    )
     synchronize_build_preflight(
         build_fingerprint=build_fingerprint,
         is_reader=state.is_reader,
         reader_size=state.reader_size,
-        is_direct_reader=state.is_direct_reader,
+        is_direct_reader=is_direct_reader,
         direct_dataset_size=state.direct_dataset_size,
         sidecar_mode=state.sidecar_mode,
-        dataset_already_sharded=state.dataset_already_sharded,
+        dataset_already_sharded=dataset_already_sharded,
         local_error=state.local_error,
     )
 
 
-def _require_build_state(state: _BuildState) -> None:
+def _require_build_state(state: _BuildState, *, batch_sampler_mode: bool) -> None:
     required_components = (
         state.topology,
         state.dataset_reader_ranks,
         state.planner_rank,
         state.planner,
-        state.step_sample_selector,
         state.constructor,
         state.config_fingerprint,
-        state.normalized_dataloader_kwargs,
-        state.dataloader_fingerprint,
-        state.additional_dataloader_kwargs,
     )
+    if not batch_sampler_mode:
+        required_components += (state.step_sample_selector,)
     if any(component is None for component in required_components):
         raise ValueError("Distributed DataLoader build preflight completed without validated components.")
 
@@ -908,8 +840,9 @@ def _build_distributed_dataloader_impl(
     except Exception as exc:  # Every WORLD rank must fail before subgroup creation.
         state.local_error = f"{type(exc).__name__}: {exc}"
 
-    _synchronize_build_state(state)
-    _require_build_state(state)
+    _synchronize_build_state(state, config)
+    _require_build_state(state, batch_sampler_mode=batch_sampler is not None)
+    sidecar_payload_exchange = state.sidecar_mode and config.dataset_already_sharded
     groups = create_data_groups(
         state.topology,
         state.dataset_reader_ranks,
@@ -917,7 +850,7 @@ def _build_distributed_dataloader_impl(
         cpu_backend=config.cpu_backend,
         payload_backend=config.payload_backend,
         communication_device=state.communication_device,
-        enable_payload_exchange=not state.sidecar_mode or state.sidecar_payload_exchange,
+        enable_payload_exchange=not state.sidecar_mode or sidecar_payload_exchange,
     )
 
     return DistributedDataLoader(
@@ -929,7 +862,7 @@ def _build_distributed_dataloader_impl(
         sidecar_reader=state.sidecar_reader,
         direct_sample_loader=state.direct_sample_loader,
         sidecar_mode=state.sidecar_mode,
-        sidecar_payload_exchange=state.sidecar_payload_exchange,
+        sidecar_payload_exchange=sidecar_payload_exchange,
         step_sample_selector=state.step_sample_selector,
         planner=state.planner,
         data_constructor=state.constructor,

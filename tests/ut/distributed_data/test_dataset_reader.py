@@ -513,5 +513,65 @@ class TestSidecarMetadataReader(unittest.TestCase):
             reader.set_epoch(1)
 
 
+class TestSharedReaderState(unittest.TestCase):
+    """Protect buffer transactions and shared shuffle/stride semantics."""
+
+    @staticmethod
+    def _readers(sharded: bool) -> tuple[DatasetReader, SidecarMetadataReader]:
+        """Create online and metadata readers over the same logical sample order."""
+        events: list[tuple[str, int]] = []
+        tokens = list(range(1, 10))
+        options = {
+            "reader_rank": 5, "reader_idx": 1, "reader_count": 2, "seq_len": 16,
+            "shuffle": True, "seed": 17, "dataset_already_sharded": sharded,
+        }
+        online = DatasetReader(
+            _RecordingDataset(tokens, events), _metadata_callback(events),
+            num_workers=0, pin_memory=False, prefetch_factor=None, persistent_workers=False, **options,
+        )
+        sidecar = SidecarMetadataReader(
+            [SampleMetadata(pack_tokens=value, sample_id=index) for index, value in enumerate(tokens)], **options,
+        )
+        return online, sidecar
+
+    def test_failed_restore_and_commit_leave_buffer_unchanged(self) -> None:
+        """Both formats reject corrupt state and missing keys before mutating live data."""
+        for reader in self._readers(False):
+            with self.subTest(reader=type(reader).__name__):
+                self.assertIsNone(reader.fill(min_samples=2, min_tokens=1, max_samples=2))
+                baseline = reader.state_dict()
+                corruptions = (
+                    {"version": 0}, {"reader_idx": 0}, {"epoch": True}, {"next_ordinal": -1},
+                    {"exhausted": 1}, {"error": ""}, {"buffer": ()}, {"buffer": [object()]},
+                    {"buffer": baseline["buffer"] * 2},
+                )
+                for changes in corruptions:
+                    with self.subTest(field=tuple(changes)), self.assertRaises(ValueError):
+                        reader.load_state_dict({**baseline, **changes})
+                    self.assertEqual(reader.state_dict(), baseline)
+                keys = {reader.metadata()[0].key, SampleKey(5, 100)}
+                with self.assertRaisesRegex(ValueError, "Cannot commit missing"):
+                    reader.commit(keys)
+                self.assertEqual(reader.state_dict(), baseline)
+                baseline["buffer"].clear()
+                self.assertEqual(reader.buffer_size, 2)
+
+    def test_shuffle_and_resume_match_between_reader_modes(self) -> None:
+        """Sharded and unsharded streams retain identical metadata order across recovery."""
+        for sharded in (False, True):
+            with self.subTest(sharded=sharded):
+                readers = self._readers(sharded)
+                restored = self._readers(sharded)
+                for reader, resumed in zip(readers, restored):
+                    reader.set_epoch(2)
+                    self.assertIsNone(reader.fill(min_samples=2, min_tokens=1, max_samples=2))
+                    reader.commit({reader.metadata()[0].key})
+                    resumed.load_state_dict(reader.state_dict())
+                    self.assertIsNone(reader.fill(min_samples=9, min_tokens=100, max_samples=9))
+                    self.assertIsNone(resumed.fill(min_samples=9, min_tokens=100, max_samples=9))
+                    self.assertEqual(resumed.state_dict(), reader.state_dict())
+                self.assertEqual(readers[0].metadata(), readers[1].metadata())
+
+
 if __name__ == "__main__":
     unittest.main()
