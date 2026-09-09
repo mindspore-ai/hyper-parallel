@@ -4,9 +4,9 @@
 
 Built on HyperParallel and vLLM, with explicit training orchestration and modular interfaces.
 
-Hyper-RL 的长期目标是：**以精简、可扩展的核心，支持从基础强化学习到多轮 Agent、多模态与大规模异步训练。**
+Hyper-RL 的长期目标是：**以精简、可扩展的核心，支持从基础强化学习到多轮 Agent、多模态与大规模异步训练，并尽可能实现训推一致。**
 
-**极简易用、易于扩展、Agentic 原生**是实现这一目标的设计约束。框架聚焦 LLM/VLM 在线强化学习，由用户定义任务与交互程序。当前由 HyperParallel / HyperAutoModel 承载训练、vLLM 提供采样，SyncTrainer 显式编排同步训练流程；任务、工具与奖励通过 Python 定义。异步、多模态与更大规模训练按阶段建设，交付计划见 [TODO](docs/TODO.md)。
+**极简易用、易于扩展、Agentic 原生**是实现这一目标的设计约束。框架聚焦 LLM/VLM 在线强化学习，由用户定义任务与交互程序。当前由 HyperParallel / HyperAutoModel 承载训练、vLLM 提供采样，SyncTrainer 显式编排同步训练流程；任务、工具与奖励通过 Python 定义。异步、多模态与更大规模训练按阶段建设，训推一致是我们追求的目标[Bit-Exact 校验](docs/qwen3_training_inference_consistency.md)，交付计划见 [TODO](docs/TODO.md)。
 
 [💡 Why Hyper-RL](#why-hyper-rl) · [🏗️ 架构](#架构) · [🎯 支持范围](#支持范围) · [📦 安装与环境](#安装与环境) · [🚀 快速开始](#快速开始) · [🧩 扩展与定制](#扩展与定制) · [📚 文档](#文档)
 
@@ -47,35 +47,44 @@ Trainer 与 Hyper-vLLM 复用模型语义。可选 Bit-Exact 比较更新前的 
 | **同步在线训练** | ✅ 已支持 | SyncTrainer 编排采样、奖励处理、策略更新与发布，并管理评估和检查点恢复；同步路径无需 Ray |
 | **训练与采样部署** | ✅ 已支持 | Qwen3 dense 支持 colocated 共卡与 disjoint 分离部署，共用训练主循环；MoE 当前限定 colocated |
 | **vLLM 采样** | ✅ 已支持 | Hyper-vLLM / Native-vLLM，支持 DP 请求路由与 TP；透传 Prefix Cache、Chunked Prefill 配置，具体组合与约束见 [vLLM Rollout](docs/vllm_rollout.md) |
+|**异卡训练**| ○ 规划 | 计划完成异卡训推分离的训练流程闭环|
 | **异步训练** | ○ 规划 | 计划通过 Ray 管理资源、任务与采样队列，实现采样和学习并发；需定义样本策略版本、允许的滞后及更新校正 |
 
 ### 🤖 任务、Agent 与奖励
 
 | 能力 | 状态 | 支持说明 |
-| :--- | :---: | :--- |
-| **单轮任务** | ✅ 已支持 | 环境接收模型输出并计算奖励，适用于问答、推理等任务；提供 [GSM8K 示例](examples/agents/gsm8k/agent.py) |
-| **多轮工具交互** | ✅ 已支持 | Environment 管理观察、动作、奖励与终止；ToolEnvironment 组合协议解析、工具执行与终局评分 |
-| **程序化 Agent** | ◐ 部分验证 | 内置 Codex / DeepSeek Harness 通过 ProgramAgentRunner 接入配置入口；任意自定义 runner 尚不能直接通过 YAML 接入，运行与验证范围见 [Agentic RL](docs/agentic_rl.md) |
-| **自定义奖励与工具** | ✅ 已支持 | 通过 Python 定义评分逻辑、注册工具与任务环境；工具执行支持超时和并发限制 |
-| **Token-first 轨迹** | ✅ 已支持 | 原始 token、logprobs、动作掩码、reward 与策略身份保持关联；环境观察不参与 policy loss，见[轨迹合同](rl/dataset/contracts.py) |
-| **多模态交互** | ○ 规划 | 将图像等输入及对应交互信息纳入统一任务接口，扩展样本对齐、模型适配与端到端验证 |
-
+ | :--- | :---: | :--- |
+ | **单轮任务** | ✅ 已支持 | 环境接收模型输出并计算奖励，适用于问答、推理等任务；提供 [GSM8K 示例](examples/agents/gsm8k/agent.py) |
+ | **多轮工具交互** | ✅ 已支持 | Environment 管理观察、动作、奖励与终止；ToolEnvironment 组合协议解析、工具执行与终局评分；提供 [GSM8K 示例](examples/agents/gsm8k/configs/multi_turn.yaml)和[Search-R1 示例](examples/agents/search_R1/configs/multi_turn.yaml)|
+ | **程序化 Agent** | ◐ 部分验证 | 内置 Codex / DeepSeek Harness 通过 ProgramAgentRunner 接入配置入口；任意自定义 runner 尚不能直接通过 YAML 接入，运行与验证范围见 [Agentic RL](docs/agentic_rl.md)；提供[Codex 示例](examples/agents/gsm8k/configs/codex_multi_turn.yaml)和 [DeepSeek 示例](examples/agents/gsm8k/configs/deepseek_multi_turn.yaml)   |
+ | **统一轨迹标准** | ✅ 已支持 |internal、Codex 和 DeepSeek 最终均生成标准 Trajectory，再转换为 ExperienceBatch |
+ | **自定义Env、奖励与工具** | ✅ 已支持 | 通过 Python 定义评分逻辑、注册工具与任务环境；工具执行支持超时和并发限制 |
+ | **Token-first 轨迹** | ✅ 已支持 | 原始 token、logprobs、动作掩码、reward 与策略身份保持关联；环境观察不参与 policy loss，见[轨迹合同](rl/dataset/contracts.py) |
+ | **历史对齐** | ◐ 部分验证 | 能够拼接多轮 token 历史并检测 prompt 重写；Harness 只允许有限的内容压缩，尚不支持 Harness 压缩后的完整重新对齐 |
+ | **可中断与可恢复交互** | ○ 规划 | 支持长时间 episode 在超时、资源切换、训练阶段切换或主动调度时暂停，并从保存点继续执行，实现长程交互 |
+ | **上下文压缩** | ○ 规划 | 当 episode 接近上下文上限时，将早期工具调用、环境观察和推理历史压缩为结构化摘要，并从压缩后的上下文继续交互 |
+ | **多模态交互** | ○ 规划 | 将图像等输入及对应交互信息纳入统一任务接口，扩展样本对齐、模型适配与端到端验证 |
+ | **长尾感知调度** | ○ 规划 |面向不同 episode 长度和工具延迟造成的长尾等待，引入 Partial Rollout、动态调度等方案，提高训练设备利用率和样本有效性。 |
+ | **Multi-Agent** | ○ 规划 |支持多个 Agent 在同一个任务中按角色协作，包括任务分解、消息传递、工具共享、子任务执行和结果汇总 |
+ | **MA信用分配** | ○ 规划 |在团队奖励之外，支持角色奖励、子任务奖励、turn-level 奖励和贡献度估计 |
 ### 🧮 算法与训练角色
 
 | 能力 | 状态 | 支持说明 |
 | :--- | :---: | :--- |
-| **GRPO** | ✅ 已支持 | 组相对优势、策略损失与 KL 项；当前训练路径包含可训练 Actor 和冻结 Reference |
-| **PPO / GAE / Critic** | 🧪 组件可用 | 数学、角色接口与编排测试已存在；需要 Critic 的端到端配置仍被拒绝，尚需接入角色构造、优化器与恢复流程 |
-| **算法扩展** | ✅ 已支持 | Algorithm 显式声明角色与数据需求；advantage 和 policy loss 可注册扩展，入口见 [Algorithm](rl/algorithm/loss.py) |
+| **GRPO** | ✅ 已支持 | 打通训练闭环，包含可训练的 Actor、冻结的 Reference 和推理侧 Rollout，计算组相对优势估计、策略损失与 KL 项|
+| **PPO** | 🧪 组件可用 | 已具备 Actor、Critic、Reference 和 Rollout 角色模块，以及 PPO 算法组件，尚未打通端到端训练闭环|
+| **算法扩展** |  ○ 规划 | 计划完善 PPO 端到端训练支持，并在现有算法框架上扩展 GSPO|
 
 ### 🧩 模型与并行
 
 | 能力 | 状态 | 支持说明 |
 | :--- | :---: | :--- |
-| **Qwen3 dense** | ✅ 已支持 | 单节点 GRPO；Trainer TP1、pure TP2、FSDP-shard×TP2，配合 Hyper-vLLM / Native-vLLM TP1/TP2 |
-| **Qwen3-30B-A3B** | ✅ 已支持 | Native/Hyper 两步功能闭环与受控非零更新；四卡 FSDP2/TP2/EP4 权重发布验证 |
-| **Moonlight-16B-A3B-Instruct** | ◐ 部分验证 | Hyper 路径四卡 TP2/EP4 两步非零学习通过；Native 路径权重发布通过，连续非零学习验收尚未通过 |
+| **Qwen3 dense** | ✅ 已支持 | 单节点 GRPO；共卡和异卡Trainer FSDP×TP，配合 Hyper-vLLM / Native-vLLM DPxTP；训推一致的实现|
+| **Qwen3-30B-A3B** | ✅ 已支持 | 单节点 GRPO; 共卡 Trainer FSDP×TPxEP，配合 Hyper-vLLM / Native-vLLM DPxTPxEP |
+| **Moonlight-16B-A3B-Instruct** | ✅ 已支持 |单节点 GRPO; 共卡Trainer FSDP×TPxEP，配合 Hyper-vLLM / Native-vLLM DPxTPxEP   |
 | **静态专家并行** | ✅ 已支持 | 两个 MoE 模型复用 HyperParallel TP-extend-EP 与 rollout 静态 EP；dense 与专家权重分别按 TP / EP 描述归属 |
+|**异卡实验接入**| ○ 规划 | 补齐 Qwen3-30B-A3B 和 Moonlight-16B-A3B-Instruct 异卡 RL 实验闭环｜
+|**训推一致**|○ 规划 | 实现 Qwen3-30B-A3B 的训推一致，并尽可能降低 Moonlight-16B-A3B-Instruct 的训推误差|
 | **更大规模 MoE** | ○ 规划 | 计划基于现有模型、并行与流式权重同步能力扩展模型规模和拓扑；具体规模与性能以后续验收为准 |
 
 MoE 的完整 checkpoint、并行组合、发布验收与学习验收分别记录在 [MoE 模型](docs/moe_models.md)。模型家族适配不代表该家族全部 checkpoint、并行配置或部署方式均已验证。
@@ -84,12 +93,12 @@ MoE 的完整 checkpoint、并行组合、发布验收与学习验收分别记�
 
 | 能力 | 状态 | 支持说明 |
 | :--- | :---: | :--- |
-| **流式权重同步** | ✅ 已支持 | 默认 full-gather，按 fragment/bucket 传输并在 ACK 后释放；支持显式 direct-reshard 与 full-gather fallback |
-| **IPC / HCCL 传输** | ✅ 已支持 | Colocated 使用 NPU IPC，disjoint 使用 HCCL；权重同步遵循源、目标布局合同 |
-| **策略发布事务** | ✅ 已支持 | 运行时校验 worker 策略版本与 fingerprint，完成缓存重置后恢复采样；显式开启的 fallback 完整覆盖部分写入。完整参数 manifest 用于发布验收 |
-| **更新前数值一致性** | ✅ 已支持 | 可选 Bit-Exact：限定已验证的 Qwen3 dense + Hyper-vLLM matched TP1/TP2，支持 colocated / disjoint，见[一致性定义与门禁](docs/qwen3_training_inference_consistency.md) |
+| **训推权重倒换** | ✅ 已支持 | 采用流式传输，默认通过 full-gather 聚合后重新切分，结合 swap 模式完成训推权重同步；支持direct_reshard，实现训练侧与推理侧权重分片的直接映射与传输|
+| **通信传输** | ✅ 已支持 | 支持同卡部署（colocated）下通过 NPU IPC 共享权重，以及分卡部署（disjoint）下通过 HCCL 传输权重|
+| **数值一致性检测** | ✅ 已支持 | 可选 Bit-Exact：限定已验证的 Qwen3 dense + Hyper-vLLM matched DP/TP，满足逐token的logprob完全一致，见[一致性定义与门禁](docs/qwen3_training_inference_consistency.md) |
 | **评估与可观测性** | ✅ 已支持 | 评估采样、任务奖励统计，以及训练、采样与策略发布指标；提供 console / W&B 日志后端 |
 | **检查点与恢复** | ✅ 已支持 | Actor、optimizer、scheduler、RNG 和 dataloader state；完成标记校验及恢复后的策略发布，见[恢复合同](docs/architecture.md#checkpoint-与恢复) |
+| **权重同步优化** | ○ 规划 | 计划利用昇腾单边通信能力优化训推权重同步，降低通信开销与同步延迟，提升权重传输效率 |
 
 当前验证平台为单节点 Ascend 910B3。固定依赖、镜像 digest 与宿主要求见[运行镜像](docs/hyper_rl_runtime_image.md)；未覆盖能力见[当前边界](#当前边界)。
 
