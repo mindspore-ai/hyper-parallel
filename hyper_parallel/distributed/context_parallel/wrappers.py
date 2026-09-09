@@ -62,6 +62,8 @@ None. The replaced forward must accept the original forward's params
 - ``*_hybrid_cp_wrapper``: local-tensor Hybrid variants that run Ulysses
   all-to-all inside each subgroup and K/V all-gather across the complementary
   Colossal subgroup.
+- ``mla_dsa_kv_allgather_cp_wrapper``: keep MLA/DSA queries sequence-local
+  with complete heads while gathering the causal K/V context.
 - ``sdpa_*_load_balance_cp_wrapper``: local-tensor Colossal Head-Tail variants
   for Q exchange, K/V all-gather, dual SDPA execution, output restoration,
   and backward communication.
@@ -102,7 +104,8 @@ from hyper_parallel.distributed.context_parallel.collectives import (
 )
 from hyper_parallel.distributed.context_parallel.attention import (
     _cp_offset_causal_mask,
-    _dsa_cp_alltoall,
+    _dsa_cp_allgather,
+    _mla_cp_allgather,
     _mla_cp_alltoall,
     _mome_cp_halo_exchange,
     head_tail_load_balance_attention,
@@ -1105,7 +1108,7 @@ def _input_cp_sharding(text_model, context):
         if mome_mask is not None:
             call_kwargs["mome_mask"] = _slice_sequence(mome_mask, 1, context)
         if call_kwargs.get("use_cache"):
-            raise ValueError("Ulysses CP requires use_cache=False")
+            raise ValueError("MLA/DSA CP requires use_cache=False")
         call_kwargs["use_cache"] = False
         setattr(text_model, "_hyper_cp_inside_forward", True)
         try:
@@ -1148,30 +1151,31 @@ def _validate_ulysses_requirements(target_module, cp_size):
         raise ValueError("MLA/DSA CP does not support fused sink FA")
 
 
-@inner_wrapper
-def mla_dsa_ulysses_cp_wrapper(
-        target_module: Module, mesh: Any, tp_mesh: Any,
-        cp_mesh: Any, ep_mesh: Any) -> Any:
-    """Configure input, MoME, MLA and DSA Ulysses adaptations."""
-    del mesh, tp_mesh, ep_mesh
-    if cp_mesh is None or cp_mesh.size() <= 1:
+def _validate_kv_allgather_requirements(target_module):
+    """Validate model features supported by MLA/DSA KV AllGather CP."""
+    config = getattr(target_module, "config", None)
+    if config is None:
         raise ValueError(
-            "MLA/DSA Ulysses wrapper requires an active CP mesh")
-    if getattr(target_module, _ULYSSES_WRAPPED_FLAG, False):
-        return
-    _validate_ulysses_requirements(target_module, cp_mesh.size())
-    context = _UlyssesContext(cp_mesh)
+            "MLA/DSA KV AllGather wrapper requires target_module.config")
+    text_config = getattr(config, "text_config", config)
+    if text_config is None:
+        raise ValueError(
+            "MLA/DSA KV AllGather wrapper requires a non-None text_config")
+    if getattr(text_config, "dsa_dense_warm_up", False):
+        raise ValueError("MLA/DSA CP does not support DSA dense warm-up")
+    if not getattr(text_config, "apply_FA_rescale", False):
+        raise ValueError("MLA/DSA CP requires apply_FA_rescale=True")
+    if getattr(text_config, "use_fused_sink_fa", False):
+        raise ValueError("MLA/DSA CP does not support fused sink FA")
 
+
+def _find_mla_dsa_adapters(target_module):
+    """Find the text models, attention module, and backend registry."""
     text_models = [module for name, module in target_module.named_modules()
                    if name.rsplit(".", maxsplit=1)[-1] in {
                        "text_model", "language_model"}]
     if not text_models:
         raise RuntimeError("Cannot find a text or language model")
-    requests = []
-    for text_model in text_models:
-        request = _input_cp_sharding(text_model, context)
-        if request is not None:
-            requests.append(request)
 
     attention_modules = {
         inspect.getmodule(module) for module in target_module.modules()
@@ -1189,10 +1193,40 @@ def mla_dsa_ulysses_cp_wrapper(
     if len(attention_registries) != 1:
         raise RuntimeError(
             "Expected one attention-function registry containing MLA and DSA backends")
-    attention_functions = attention_registries[0]
+    return text_models, attention_module, attention_registries[0]
+
+
+def _install_mla_dsa_common_adapters(
+        target_module, context, mla_adapter):
+    """Install input, MoME, MLA, and DSA adapters for one CP algorithm."""
+    text_models, attention_module, attention_functions = (
+        _find_mla_dsa_adapters(target_module))
+    requests = []
+    for text_model in text_models:
+        request = _input_cp_sharding(text_model, context)
+        if request is not None:
+            requests.append(request)
     _mome_cp_halo_exchange(attention_module, context)
-    _mla_cp_alltoall(attention_functions, context)
-    _dsa_cp_alltoall(attention_module, attention_functions, context)
+    mla_adapter(attention_functions, context)
+    _dsa_cp_allgather(attention_module, attention_functions, context)
+    return requests
+
+
+@inner_wrapper
+def mla_dsa_ulysses_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Any:
+    """Configure input, MoME, MLA and DSA Ulysses adaptations."""
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            "MLA/DSA Ulysses wrapper requires an active CP mesh")
+    if getattr(target_module, _ULYSSES_WRAPPED_FLAG, False):
+        return
+    _validate_ulysses_requirements(target_module, cp_mesh.size())
+    context = _UlyssesContext(cp_mesh)
+    requests = _install_mla_dsa_common_adapters(
+        target_module, context, _mla_cp_alltoall)
 
     original_forward = target_module.forward
 
@@ -1206,6 +1240,41 @@ def mla_dsa_ulysses_cp_wrapper(
         forward_with_ulysses_adapters,
         companion_attrs={
             "_hyper_ulysses_context": context,
+            _ULYSSES_WRAPPED_FLAG: True,
+        },
+    ))
+    return requests
+
+
+@inner_wrapper
+def mla_dsa_kv_allgather_cp_wrapper(
+        target_module: Module, mesh: Any, tp_mesh: Any,
+        cp_mesh: Any, ep_mesh: Any) -> Any:
+    """Configure local-query MLA/DSA CP with causal K/V AllGather."""
+    del mesh, tp_mesh, ep_mesh
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError(
+            "MLA/DSA KV AllGather wrapper requires an active CP mesh")
+    if getattr(target_module, _ULYSSES_WRAPPED_FLAG, False):
+        return
+    _validate_kv_allgather_requirements(target_module)
+    context = _UlyssesContext(cp_mesh)
+    requests = _install_mla_dsa_common_adapters(
+        target_module, context, _mla_cp_allgather)
+
+    original_forward = target_module.forward
+
+    @functools.wraps(original_forward)
+    def forward_with_kv_allgather_adapters(
+            *args: Any, **kwargs: Any) -> Any:
+        """Pass the forward through; the adapters are installed out of band."""
+        return original_forward(*args, **kwargs)
+
+    requests.append(_ForwardRewriteRequest(
+        target_module,
+        forward_with_kv_allgather_adapters,
+        companion_attrs={
+            "_hyper_kv_allgather_context": context,
             _ULYSSES_WRAPPED_FLAG: True,
         },
     ))
@@ -1233,6 +1302,7 @@ INNER_WRAPPER_REGISTRY = {
     "sdpa_hf_ulysses": sdpa_hf_ulysses_cp_wrapper,
     "flex_hf_ulysses": flex_hf_ulysses_cp_wrapper,
     "mla_dsa_ulysses": mla_dsa_ulysses_cp_wrapper,
+    "mla_dsa_kv_allgather": mla_dsa_kv_allgather_cp_wrapper,
 }
 
 # Static requirements for shipped wrappers. Custom registry entries own their
