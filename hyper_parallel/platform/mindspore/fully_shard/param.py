@@ -1015,10 +1015,11 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         The output buffer and optional asynchronous handle are stored in the
         parameter communication context.
         """
-        # Optimizer steps may refresh the underlying local tensor storage. Re-sync
-        # the cached flat shard view before reading all_gather_inputs for the next
-        # unshard cycle.
-        self.reset_sharded_param()
+        # A local-only async prefetch has no communication to launch and must not
+        # rebind module parameters while another layer is in backward. The later
+        # synchronous unshard refreshes the local storage before it is consumed.
+        if self.is_sharded or not async_op:
+            self.reset_sharded_param()
         all_gather_input = self.all_gather_inputs[0]
 
         shard_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
