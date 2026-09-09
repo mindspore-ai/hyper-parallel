@@ -23,7 +23,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 """
 
 import logging
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Callable, Dict, Literal, Optional, Union
 
 import torch
 from torch import nn
@@ -275,7 +275,14 @@ def _move_model_to_device(
         logger.info("Model moved to %s", device)
         return model
 
-    model.to_empty(device=device)
+    def materialize(tensor: torch.Tensor) -> torch.Tensor:
+        """Allocate only meta state, preserving buffers built with real values."""
+        local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        if local_tensor.is_meta:
+            return torch.empty_like(tensor, device=device)
+        return tensor.to(device)
+
+    model._apply(materialize)  # pylint: disable=protected-access
     return model
 
 
@@ -382,6 +389,7 @@ def _materialize_and_load_model(
     load_base_model: bool,
     pretrained_path: Optional[str],
     weights_mapping: Any,
+    model_initializer: Optional[Callable[[nn.Module], None]] = None,
 ) -> nn.Module:
     """Materialize model storage and load or initialize meta-device weights."""
     model = _move_model_to_device(model, is_meta_device, device)
@@ -392,6 +400,8 @@ def _materialize_and_load_model(
             pretrained_path, strict=False, weights_mapping=weights_mapping
         )
         _finalize_model_loading(model, load_report, strict=True)
+    elif model_initializer is not None:
+        model_initializer(model)
     else:
         _initialize_model_weights(model)
     return model
@@ -418,6 +428,7 @@ def apply_model_infrastructure(
     validate_placement: bool = False,
     low_precision_config: Optional[Any] = None,
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+    model_initializer: Optional[Callable[[nn.Module], None]] = None,
     **kwargs: Any,
 ) -> nn.Module:
     """Apply model infrastructure (sharding, recompute, FSDP2, and compile).
@@ -483,6 +494,7 @@ def apply_model_infrastructure(
         load_base_model=load_base_model,
         pretrained_path=pretrained_path,
         weights_mapping=weights_mapping,
+        model_initializer=model_initializer,
     )
 
     # Final dtype conversion belongs to the atomic build (05 stage-5 item

@@ -213,6 +213,16 @@ class ShardingPlanner:
         for boundary_fqn, group in boundary_groups.items():
             boundary_type = self._infer_boundary_type(boundary_fqn, group)
             template = self._templates.get(boundary_type)
+            if template is None and all(role == ParamRole.REPLICATED for _, role in group):
+                # Explicitly replicated parameters need layout metadata even when
+                # their modules do not require an activation communication boundary.
+                for parameter_fqn, _ in group:
+                    module_fqn, _, parameter_name = parameter_fqn.rpartition(".")
+                    spec = plan.modules.setdefault(
+                        module_fqn, ModuleShardingSpec(params={}, in_src={}, in_dst={}),
+                    )
+                    spec.params[parameter_name] = {}
+                continue
             if template is None:
                 logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
                 continue

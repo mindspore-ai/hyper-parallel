@@ -145,7 +145,13 @@ class FSDP2MixedPrecisionConfig:
 
 @dataclass
 class FSDP2Config:
-    """FSDP2 strategy configuration (06 §4.1)."""
+    """FSDP2 strategy configuration (06 §4.1).
+
+    ``extra_wrap_modules`` adds nested FSDP units using module FQN globs.
+    Each pattern selects its shallowest matches; descendants can be selected
+    separately with a more specific pattern. Conditional modules must execute
+    in identical order on all ranks sharing their FSDP mesh.
+    """
     dp_shard_size: int = 1
     edp_shard_size: int = 1
     replicate_params: list[str] = field(default_factory=list)
@@ -160,6 +166,7 @@ class FSDP2Config:
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False
     comm_fusion_zero_copy: Optional[bool] = None
+    extra_wrap_modules: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate topology sizes and prefetch depths."""

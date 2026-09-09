@@ -143,6 +143,7 @@ def build_ep_compute(
     expected_attrs,
     combine: Callable,
     use_grouped_gemm: bool = False,
+    preserve_router_dtype: bool = False,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -156,6 +157,9 @@ def build_ep_compute(
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
     their EP archetype on top of this skeleton while the router adapters and
     dispatch primitives stay in this generic layer.
+
+    ``preserve_router_dtype`` retains FP32 routing weights for model families
+    that accumulate their routed output in FP32 before the residual addition.
     """
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
@@ -170,10 +174,13 @@ def build_ep_compute(
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
 
+    router_options = {"preserve_router_dtype": True} if preserve_router_dtype else {}
+
     def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed branch and compose the MoE block output."""
         routed = ep_routed_forward(
-            module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            module, hidden_states, router_fn=router_fn, ep_group=ep_group,
+            **router_options)
         return combine(module, hidden_states, routed)
 
     return compute_fn
