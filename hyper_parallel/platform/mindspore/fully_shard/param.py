@@ -688,10 +688,11 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         Returns:
             (unsharded_param, handle): Unsharded parameter data and communication handle.
         """
-        # Optimizer steps may refresh the underlying local tensor storage. Re-sync
-        # the cached flat shard view before reading all_gather_inputs for the next
-        # unshard cycle.
-        self.reset_sharded_param()
+        # A local-only async prefetch has no communication to launch and must not
+        # rebind module parameters while another layer is in backward. The later
+        # synchronous unshard refreshes the local storage before it is consumed.
+        if self.is_sharded or not async_op:
+            self.reset_sharded_param()
         all_gather_input = self.all_gather_inputs[0]
 
         # If parameter is not sharded (below threshold), no communication needed
