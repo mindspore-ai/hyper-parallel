@@ -160,6 +160,7 @@ class JointGraph:
     # runtime parameter state into the graph.
     state_fqns: List[str]
     example_inputs: tuple
+    user_inputs_spec: Any
 
 
 def extract_module_state(mod: nn.Module) -> Dict[str, torch.Tensor]:
@@ -386,6 +387,7 @@ def trace_model_graph(
         num_layers=num_layers,
         state_fqns=state_fqns,
         example_inputs=fake_args,
+        user_inputs_spec=user_inputs_spec,
     )
 
 
@@ -421,7 +423,10 @@ def run_traced_graph(
 
     state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
 
-    flat_inputs = list(state_flat) + [input_batch, label_batch]
+    user_inputs_flat, _ = torch.utils._pytree.tree_flatten(
+        (input_batch, label_batch)
+    )
+    flat_inputs = list(state_flat) + list(user_inputs_flat)
 
     with torch.no_grad():
         outputs = joint_graph.graph_module(*flat_inputs)

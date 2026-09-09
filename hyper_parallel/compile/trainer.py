@@ -19,7 +19,7 @@ Users provide model code and parallel configuration.
 Framework automatically handles all parallel logic.
 """
 
-from typing import Any, Callable, Iterable, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -30,6 +30,9 @@ from .parallel_config import PassConfig
 from .passes.pipeline import PassPipeline
 from .sharding_config import PassPlan
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
+
+if TYPE_CHECKING:
+    from hyper_parallel.trainer.config import TrainerConfig
 
 
 class GraphTrainer:
@@ -49,6 +52,7 @@ class GraphTrainer:
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
+        manage_optimizer: bool = True,
     ) -> None:
         """
         Args:
@@ -65,6 +69,10 @@ class GraphTrainer:
                 only the FSDP shard sub-mesh is registered under ``"fsdp"``.
                 Use this to feed an automodel TP-sharded model into the
                 graph-mode FSDP pass.
+            manage_optimizer: Whether this graph trainer owns optimizer
+                initialization and stepping. Set ``False`` when embedding the
+                graph executor under the eager trainer runtime, which already
+                builds and steps the optimizer on the live model.
         """
         self.model = model
         self.train_fn = train_fn
@@ -72,6 +80,7 @@ class GraphTrainer:
         self.pass_plan = pass_plan
         self.optimizer_config = optimizer_config or {}
         self._mesh_context = mesh_context
+        self._manage_optimizer = manage_optimizer
         self.device = device or (
             torch.device("npu")
             if (hasattr(torch, "npu") and torch.npu.is_available())
@@ -116,7 +125,8 @@ class GraphTrainer:
 
         self._joint_graph = joint_graph
 
-        self._init_optimizer()
+        if self._manage_optimizer:
+            self._init_optimizer()
 
     def _init_device_mesh(self, mesh_context: Optional[Any] = None):
         """Initialize the FSDP process group.
@@ -204,6 +214,11 @@ class GraphTrainer:
 
     def optimizer_step(self) -> None:
         """Optimizer update"""
+        if not self._manage_optimizer:
+            raise RuntimeError(
+                "optimizer_step() is disabled when manage_optimizer=False. "
+                "Let the outer trainer runtime own optimizer stepping."
+            )
         if self.optimizer is None:
             return
 
@@ -294,6 +309,23 @@ class GraphTrainer:
                     print(f"Step {step + 1} | Loss: {loss.item():.4f}")
 
         return losses
+
+    @classmethod
+    def from_text_config(
+        cls,
+        config: "TrainerConfig",
+        **kwargs: Any,
+    ) -> "GraphTextTrainer":
+        """Build the graph-mode text trainer from a TrainerConfig.
+
+        This is the phase-1 bridge from the eager text runtime to graph mode:
+        model preparation still flows through AutoModel + Trainer config,
+        while the forward/backward step is executed by the graph tracer and
+        pass pipeline.
+        """
+        from .text_trainer import GraphTextTrainer  # pylint: disable=C0415
+
+        return GraphTextTrainer(config, **kwargs)
 
     def _init_optimizer(self):
         """Initialize optimizer on the model's (FSDP-sharded) parameters.

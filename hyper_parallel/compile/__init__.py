@@ -57,6 +57,7 @@ from .sharding_config import (
 from .parallel_config import PassConfig
 
 from .trainer import GraphTrainer
+from .text_trainer import GraphTextTrainer
 
 __all__ = [
     # Sharding
@@ -68,4 +69,5 @@ __all__ = [
     "PassConfig",
     # Trainer
     "GraphTrainer",
+    "GraphTextTrainer",
 ]
