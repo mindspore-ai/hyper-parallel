@@ -45,7 +45,7 @@ class NavigationTests(unittest.TestCase):
     def navigation(self, reference: str) -> None:
         """Write one row in the documented RL table format."""
         (self.root / "docs/rl-navigation.md").write_text(
-            f"## 2. RL\n| Feature | `{reference}` |\n", encoding="utf-8"
+            f"## 1. RL\n| Feature | `{reference}` |\n", encoding="utf-8"
         )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"],
