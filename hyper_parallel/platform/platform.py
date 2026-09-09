@@ -1580,13 +1580,15 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement checkpoint_exclude_wrapper")
 
     @staticmethod
-    def swap_wrapper(module, policy_fn=None, group_swap=False):
+    def swap_wrapper(module, policy_fn=None, group_swap=False, cpu_pool=None):
         """Wrap a module with activation swap functionality.
 
         Args:
             module: The module to wrap with activation swap.
             policy_fn: Optional per-tensor swap policy function.
             group_swap (bool, optional): Whether tensors participate in group copy fusion. Default: ``False``.
+            cpu_pool: Optional pinned host memory pool for swapped tensors. Currently supported
+                only by the Torch backend.
 
         Returns:
             The wrapped module with activation swap enabled.
@@ -1594,13 +1596,15 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement swap_wrapper")
 
     @staticmethod
-    def swap_tensor_wrapper(target, tag=None, group_swap=False):
+    def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None):
         """Register target tensors into the current swap group.
 
         Args:
             target: A tensor or nested container of tensors to register.
             tag: Optional debug tag associated with the wrapped tensors.
             group_swap (bool, optional): Whether tensors participate in group copy fusion. Default: ``False``.
+            cpu_pool: Optional pinned host memory pool for swapped tensors. Currently supported
+                only by the Torch backend.
 
         Returns:
             The original target structure, unchanged semantically.
@@ -1632,13 +1636,17 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement ignore_sac_ops")
 
     @staticmethod
-    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
+    def create_selective_checkpoint_contexts(
+        policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False, cpu_pool=None
+    ):
         """Create contexts for selective activation checkpointing.
 
         Args:
             policy_fn_or_list: A policy function or list of layer names to checkpoint.
             allow_cache_entry_mutation (bool): Whether to allow cache entry mutation.
             group_swap (bool, optional): Whether MUST_SWAP tensors participate in group copy fusion. Default: ``False``.
+            cpu_pool: Optional pinned host memory pool for MUST_SWAP tensors. Currently supported
+                only by the Torch backend.
 
         Returns:
             Context functions for selective checkpointing.
@@ -1653,13 +1661,15 @@ class Platform:
         )
 
     @staticmethod
-    def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
+    def async_save_on_cpu(policy_fn=None, group_swap: bool = False, cpu_pool=None):
         """Create an async CPU offload context for activation checkpointing.
 
         Args:
             policy_fn: Optional policy function to determine which activations to offload.
             group_swap (bool): Whether swapped tensors participate in group copy fusion.
                 Default: ``False``.
+            cpu_pool: Optional pinned host memory pool for swapped tensors. Currently supported
+                only by the Torch backend.
 
         Returns:
             Context manager for async CPU offloading during checkpointing.

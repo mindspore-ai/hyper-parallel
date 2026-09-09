@@ -23,4 +23,5 @@ from .activation_checkpoint import (
     swap_tensor_wrapper,
 )
 from .recompute_state import get_recompute_state, is_recomputing
+from .pinned_memory_pool import PinnedMemoryPool
 from .swap import SwapManager

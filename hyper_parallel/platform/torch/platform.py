@@ -1777,16 +1777,16 @@ class TorchPlatform(Platform):
         return checkpoint_exclude_wrapper(module, save_output=save_output)
 
     @staticmethod
-    def swap_wrapper(module, policy_fn=None, group_swap=False):
+    def swap_wrapper(module, policy_fn=None, group_swap=False, cpu_pool=None):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_wrapper
-        return swap_wrapper(module, policy_fn=policy_fn, group_swap=group_swap)
+        return swap_wrapper(module, policy_fn=policy_fn, group_swap=group_swap, cpu_pool=cpu_pool)
 
     @staticmethod
-    def swap_tensor_wrapper(target, tag=None, group_swap=False):
+    def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_tensor_wrapper
-        return swap_tensor_wrapper(target, tag=tag, group_swap=group_swap)
+        return swap_tensor_wrapper(target, tag=tag, group_swap=group_swap, cpu_pool=cpu_pool)
 
     @staticmethod
     def get_class_activation_wrapper():
@@ -1805,10 +1805,14 @@ class TorchPlatform(Platform):
         ignore_sac_ops(ignore_ops)
 
     @staticmethod
-    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
+    def create_selective_checkpoint_contexts(
+        policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False, cpu_pool=None
+    ):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.sac import create_selective_checkpoint_contexts
-        return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation, group_swap)
+        return create_selective_checkpoint_contexts(
+            policy_fn_or_list, allow_cache_entry_mutation, group_swap, cpu_pool
+        )
 
     @staticmethod
     def create_native_selective_checkpoint_contexts(policy_fn: Callable) -> Any:
@@ -1820,10 +1824,10 @@ class TorchPlatform(Platform):
         return create_native_selective_checkpoint_contexts(policy_fn)
 
     @staticmethod
-    def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
+    def async_save_on_cpu(policy_fn=None, group_swap: bool = False, cpu_pool=None):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import AsyncSaveOnCpu
-        return AsyncSaveOnCpu(policy_fn, group_swap=group_swap)
+        return AsyncSaveOnCpu(policy_fn, group_swap=group_swap, cpu_pool=cpu_pool)
 
     @staticmethod
     def get_element_size(tensor):

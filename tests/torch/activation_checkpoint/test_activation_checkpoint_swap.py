@@ -27,10 +27,14 @@ def test_act_swap_group():
         1.test_act_swap_memory_comparison
         2.test_act_swap_function_mode
         3.test_swap_wrapper_accepts_func
+        4.test_act_swap_tensor_function_mode
+        5.test_act_swap_tensor_cpu_pool_performance
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(ACTIVATION_CHECKPOINT_SWAP, "test_act_swap_memory_comparison", 12406, 1),
         TorchCase(ACTIVATION_CHECKPOINT_SWAP, "test_act_swap_function_mode", 12407, 1),
-        TorchCase(ACTIVATION_CHECKPOINT_SWAP, "test_swap_wrapper_accepts_func", 12408, 1)
+        TorchCase(ACTIVATION_CHECKPOINT_SWAP, "test_swap_wrapper_accepts_func", 12408, 1),
+        TorchCase(ACTIVATION_CHECKPOINT_SWAP, "test_act_swap_tensor_function_mode", 12409, 1),
+        TorchCase(ACTIVATION_CHECKPOINT_SWAP, "test_act_swap_tensor_cpu_pool_performance", 12410, 1),
     ])

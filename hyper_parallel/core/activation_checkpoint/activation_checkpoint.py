@@ -108,6 +108,7 @@ def checkpoint(
     policy_fn: Optional[Callable] = None,
     context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
     group_swap: bool = False,
+    cpu_pool=None,
     early_stop: bool = True,
     **kwargs,
 ):
@@ -130,6 +131,8 @@ def checkpoint(
             order and exit in reverse.
         group_swap (bool, optional): Whether MUST_SWAP tensors participate in group copy fusion.
             Only effective when ``policy_fn`` is provided. Default: ``False``.
+        cpu_pool (PinnedMemoryPool, optional): Explicit pinned host memory pool used by tensors
+            selected for swapping. Currently supported only by the Torch backend. Default: ``None``.
         early_stop (bool, optional): Whether recomputation stops after all tensors needed by
             backward have been produced. This per-call keyword is the only supported way to
             configure early stop. Default: ``True``.
@@ -149,6 +152,8 @@ def checkpoint(
             unsupported.append("swap_inputs")
         if group_swap:
             unsupported.append("group_swap")
+        if cpu_pool is not None:
+            unsupported.append("cpu_pool")
         if context_fn is not None:
             unsupported.append("custom context_fn")
         if kwargs.get("use_reentrant", False):
@@ -168,7 +173,10 @@ def checkpoint(
     else:
         factories: list = [create_recompute_contexts]
         if policy_fn is not None:
-            factories.append(partial(plat.create_selective_checkpoint_contexts, policy_fn, group_swap=group_swap))
+            selective_kwargs = {"group_swap": group_swap}
+            if cpu_pool is not None:
+                selective_kwargs["cpu_pool"] = cpu_pool
+            factories.append(partial(plat.create_selective_checkpoint_contexts, policy_fn, **selective_kwargs))
         if context_fn is not None:
             factories.append(context_fn)
 
@@ -177,7 +185,13 @@ def checkpoint(
         else:
             composed_context_fn = _compose_context_fns(tuple(factories))
 
-    context = partial(plat.async_save_on_cpu, group_swap=group_swap) if swap_inputs else contextlib.nullcontext
+    if swap_inputs:
+        async_kwargs = {"group_swap": group_swap}
+        if cpu_pool is not None:
+            async_kwargs["cpu_pool"] = cpu_pool
+        context = partial(plat.async_save_on_cpu, **async_kwargs)
+    else:
+        context = contextlib.nullcontext
     with context():
         checkpoint_kwargs = {**kwargs, "use_reentrant": False, "early_stop": early_stop}
         if composed_context_fn is not None:
@@ -185,7 +199,7 @@ def checkpoint(
         return plat.checkpoint(function, *args, **checkpoint_kwargs)
 
 
-def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
+def swap(function, *args, policy_fn=None, group_swap=False, cpu_pool=None, **kwargs):
     """Apply activation swap to a function call.
 
     Offloads intermediate activations saved by the autograd engine to CPU
@@ -203,6 +217,8 @@ def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
             eligible tensors are offloaded.
         group_swap (bool, optional): Whether swapped tensors participate in
             group copy fusion.  Default: ``False``.
+        cpu_pool (PinnedMemoryPool, optional): Explicit pinned host memory pool used by swapped
+            tensors. Currently supported only by the Torch backend. Default: ``None``.
         **kwargs: Keyword arguments forwarded to *function*.
 
     Returns:
@@ -217,7 +233,10 @@ def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
             "HyperParallel activation swap is not supported in compile mode. "
             "Use Torch-native non-reentrant checkpointing with SAVE/RECOMPUTE policies."
         )
-    with plat.async_save_on_cpu(policy_fn=policy_fn, group_swap=group_swap):
+    async_kwargs = {"policy_fn": policy_fn, "group_swap": group_swap}
+    if cpu_pool is not None:
+        async_kwargs["cpu_pool"] = cpu_pool
+    with plat.async_save_on_cpu(**async_kwargs):
         return function(*args, **kwargs)
 
 

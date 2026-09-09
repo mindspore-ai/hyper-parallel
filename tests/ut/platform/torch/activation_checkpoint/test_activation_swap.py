@@ -98,7 +98,7 @@ class TestSwapWrapper(unittest.TestCase):
             result = wrapper(x)
 
         self.assertEqual(result.shape, (2, 2))
-        mock_ctx.assert_called_once_with(policy_fn=wrapper.policy_fn, group_swap=True)
+        mock_ctx.assert_called_once_with(policy_fn=wrapper.policy_fn, group_swap=True, cpu_pool=None)
 
     def test_wraps_callable_in_func_module(self):
         """Plain callables should be adapted into FuncModule instances."""

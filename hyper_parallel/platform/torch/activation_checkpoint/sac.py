@@ -63,9 +63,9 @@ class _VersionWrapper:
 
 class _SwapCacheEntry:
     """Pair the recompute cache and swap record around the same tensor object."""
-    def __init__(self, val, funcname, group_swap=False):
+    def __init__(self, val, funcname, group_swap=False, cpu_pool=None):
         self.save = _VersionWrapper(val)
-        self.swap = SwapTensor(val, funcname, group_swap=group_swap)
+        self.swap = SwapTensor(val, funcname, group_swap=group_swap, cpu_pool=cpu_pool)
 
 
 def _maybe_detach(x, any_ret_has_alias_info):
@@ -142,12 +142,13 @@ def ignore_sac_ops(ignore_ops: List[Optional[object]]) -> None:
 
 class _CachingTorchDispatchMode(TorchDispatchMode):
     # Used together with _CachedTorchDispatchMode to implement SAC.
-    def __init__(self, policy_fn, swap_storage, storage, group_swap=False):
+    def __init__(self, policy_fn, swap_storage, storage, group_swap=False, cpu_pool=None):
         self.policy_fn = policy_fn
         self.swap_storage = swap_storage
         self.storage = storage
         self.add_to_storage = False
         self.group_swap = group_swap
+        self.cpu_pool = cpu_pool
         # Cache context and singleton to avoid per-dispatch allocation / lookup.
         self._swap_manager = SwapManager()
         self._group_prefix = ""
@@ -185,7 +186,9 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
             funcname = f"{self._group_prefix}{func}"
             group_swap = self.group_swap
             entries = tree_map(
-                lambda x: _SwapCacheEntry(_maybe_detach(x, has_alias), funcname, group_swap=group_swap), out,
+                lambda x: _SwapCacheEntry(
+                    _maybe_detach(x, has_alias), funcname, group_swap=group_swap, cpu_pool=self.cpu_pool
+                ), out,
             )
             self.storage[func].append(tree_map(lambda x: x.save, entries))
             self.swap_storage[func].append(tree_map(lambda x: x.swap, entries))
@@ -236,7 +239,9 @@ class _CachedTorchDispatchMode(TorchDispatchMode):
         return out
 
 
-def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
+def create_selective_checkpoint_contexts(
+    policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False, cpu_pool=None
+):
     """
     Helper to avoid recomputing certain ops during activation checkpointing.
 
@@ -321,6 +326,8 @@ def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mu
     swap_storage = Storage()  # patch code
     storage: Dict[Any, List[Any]] = defaultdict(list)
     return (
-        _CachingTorchDispatchMode(policy_fn, swap_storage, storage, group_swap=group_swap),
+        _CachingTorchDispatchMode(
+            policy_fn, swap_storage, storage, group_swap=group_swap, cpu_pool=cpu_pool
+        ),
         _CachedTorchDispatchMode(policy_fn, swap_storage, storage, allow_cache_entry_mutation),
     )
