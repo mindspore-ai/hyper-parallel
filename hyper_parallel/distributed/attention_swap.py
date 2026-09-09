@@ -15,13 +15,19 @@
 """Attention activation swap support for Hugging Face models."""
 
 import logging
+import weakref
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 from torch import nn
 
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, swap_wrapper
+from hyper_parallel.core.activation_checkpoint import (
+    CheckpointPolicy,
+    SwapManager,
+    swap_wrapper,
+)
+from hyper_parallel.core.activation_checkpoint.swap import _teardown_wired_swap_layers
 
 logger = logging.getLogger(__name__)
 
@@ -147,21 +153,38 @@ def apply_attention_swap(model: nn.Module, activation_swap: str) -> nn.Module:
             f"got {activation_swap!r}"
         )
     attention_targets = _find_attention_targets(model)
-    wrapped_attentions = []
-    for target in attention_targets:
-        attention = target.module
-        wrapped_attention = swap_wrapper(
-            attention,
-            policy_fn=attention_swap_policy,
-            group_swap=True,
-        )
-        for parent, child_name in target.references:
-            setattr(parent, child_name, wrapped_attention)
-        wrapped_attentions.append(wrapped_attention)
+    wrapped_attentions: list[nn.Module] = []
+    saved_refs: list[tuple[nn.Module, str, nn.Module]] = []
+    try:
+        for target in attention_targets:
+            attention = target.module
+            wrapped_attention = swap_wrapper(
+                attention,
+                policy_fn=attention_swap_policy,
+                group_swap=True,
+            )
+            for parent, child_name in target.references:
+                saved_refs.append((parent, child_name, getattr(parent, child_name)))
+                setattr(parent, child_name, wrapped_attention)
+            wrapped_attentions.append(wrapped_attention)
 
-    swap_manager = SwapManager()
-    for current_attention, next_attention in zip(wrapped_attentions, wrapped_attentions[1:]):
-        swap_manager.set_forward_prefetch_layer(current_attention, next_attention)
+        swap_manager = SwapManager()
+        for current_attention, next_attention in zip(wrapped_attentions, wrapped_attentions[1:]):
+            swap_manager.set_forward_prefetch_layer(current_attention, next_attention)
+        if wrapped_attentions:
+            weakref.finalize(
+                model,
+                _teardown_wired_swap_layers,
+                wrapped_attentions,
+            )
+    except Exception:
+        # Partial failure: restore the original attention modules on every
+        # reference already re-pointed, and release any swap wiring registered
+        # by the chain loop before it raised (idempotent when none was).
+        _teardown_wired_swap_layers(wrapped_attentions)
+        for parent, child_name, original in saved_refs:
+            setattr(parent, child_name, original)
+        raise
 
     logger.info(
         "Enabled attention activation swap for %d module(s) in %s",

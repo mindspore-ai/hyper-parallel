@@ -184,24 +184,40 @@ class PipelineSwapRuntime:
         if self.supports_packed_pipeline(batch_lists):
             return self._run_packed_pipeline(batch_lists, step_context, step_batch)
 
-        self.prefetch(batch_lists[0]) # prefetch 0
-        for index, batch_list in enumerate(batch_lists):
-            self.wait_prefetch(batch_list) # wait_prefetch n
+        try:
+            self.prefetch(batch_lists[0]) # prefetch 0
+            for index, batch_list in enumerate(batch_lists):
+                self.wait_prefetch(batch_list) # wait_prefetch n
 
-            previous_index = index - 1
-            if previous_index >= 0:
-                self.wait_offload(batch_lists[previous_index]) # wait_offload n-1
+                previous_index = index - 1
+                if previous_index >= 0:
+                    self.wait_offload(batch_lists[previous_index]) # wait_offload n-1
 
-            next_index = index + 1
-            if next_index < len(batch_lists):
-                self.prefetch(batch_lists[next_index]) # prefetch n+1
+                next_index = index + 1
+                if next_index < len(batch_lists):
+                    self.prefetch(batch_lists[next_index]) # prefetch n+1
 
-            results.append(step_batch(batch_list, step_context)) # update n
-            self.refresh_swappable_slots(batch_list)
-            self.offload(batch_list) # offload n
+                results.append(step_batch(batch_list, step_context)) # update n
+                self.refresh_swappable_slots(batch_list)
+                self.offload(batch_list) # offload n
 
-        self.wait_offload(batch_lists[-1])
+            self.wait_offload(batch_lists[-1])
+        finally:
+            self._drain_pending_transfers(batch_lists)
         return results
+
+    def _drain_pending_transfers(self, batch_lists: Sequence[Sequence[UpdateUnit]]) -> None:
+        """Settle slots left in an intermediate ``h2d``/``d2h`` state.
+
+        Called from ``run_pipeline``'s ``finally`` so that an exception raised
+        mid-pipeline (for example in ``step_batch``) cannot leave prefetched or
+        offloaded slots holding device storage and a pending stream event. Slots
+        that already reached a terminal state (``device`` or ``host``) are left
+        untouched.
+        """
+        for batch_list in batch_lists:
+            self.wait_prefetch(batch_list)
+            self.wait_offload(batch_list)
 
     def _run_packed_pipeline(
             self,
@@ -419,6 +435,7 @@ class PipelineSwapRuntime:
                 self.wait_event(event, compute_stream)
             for slot in slots:
                 self.wait_offload_slot(slot)
+                slot.event = None
 
     def _unit_cost(self, unit: UpdateUnit) -> int:
         return sum(slot.storage_nbytes for slot in unit.slots if slot.swappable)

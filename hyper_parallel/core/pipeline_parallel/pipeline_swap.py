@@ -61,7 +61,12 @@ def unregister_layer_swap_hooks(stages: Iterable[Any]) -> int:
             if module_id in visited_modules:
                 continue
             visited_modules.add(module_id)
-            removed_count += manager.unregister_forward_prefetch_hooks(module)
+            # Full teardown, not just handle removal: also drops the module's
+            # swap group from the process-wide singleton plus the
+            # _swap_group_name/_swap_group_order/_swap_state attributes, so a
+            # permanently-removed layer does not leave an orphaned SwapGroup
+            # holding pinned host/device storage (see B.cache_no_eviction).
+            removed_count += manager.unregister_forward_prefetch_layer(module)
 
     if removed_count:
         warnings.warn(

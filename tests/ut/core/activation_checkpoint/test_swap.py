@@ -33,6 +33,7 @@ from hyper_parallel.core.activation_checkpoint.swap import (  # noqa: E402
     _collect_device_storage_ptrs,
     _get_cpu_pinned_buf,
     _return_cpu_pinned_buf,
+    _teardown_wired_swap_layers,
     _CPU_PINNED_POOL,
 )
 
@@ -1790,6 +1791,119 @@ class TestSwapManager(unittest.TestCase):
         with patch.object(mgr, "set_current_group_name") as mock_set:
             hook_fn(layer1, None)
             mock_set.assert_not_called()
+
+    def test_unregister_forward_prefetch_layer_removes_hooks_and_group(self):
+        """Test unregister_forward_prefetch_layer removes hooks, wiring attrs and group."""
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+            def forward(self, x):
+                return self.linear(x)
+
+        layer1 = _Layer()
+        layer2 = _Layer()
+        mgr = SwapManager()
+        mgr.set_forward_prefetch_layer(layer1, layer2)
+        group_name1 = layer1._swap_group_name
+        group_name2 = layer2._swap_group_name
+        layer1._swap_state = "pre_backward"
+        self.assertEqual(len(mgr._groups), 2)
+
+        removed = mgr.unregister_forward_prefetch_layer(layer1)
+
+        self.assertEqual(removed, 4)
+        self.assertNotIn(group_name1, mgr._groups)
+        # layer2's wiring must be untouched by tearing down layer1
+        self.assertIn(group_name2, mgr._groups)
+        for attr in mgr._FORWARD_PREFETCH_HOOK_HANDLE_ATTRS:
+            self.assertFalse(hasattr(layer1, attr))
+        self.assertFalse(hasattr(layer1, "_swap_group_name"))
+        self.assertFalse(hasattr(layer1, "_swap_group_order"))
+        self.assertFalse(hasattr(layer1, "_swap_state"))
+
+    def test_unregister_forward_prefetch_layer_idempotent_when_already_released(self):
+        """Test a second unregister on a released module is a no-op returning 0."""
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+            def forward(self, x):
+                return self.linear(x)
+
+        layer1 = _Layer()
+        layer2 = _Layer()
+        mgr = SwapManager()
+        mgr.set_forward_prefetch_layer(layer1, layer2)
+
+        first = mgr.unregister_forward_prefetch_layer(layer1)
+        second = mgr.unregister_forward_prefetch_layer(layer1)
+
+        self.assertEqual(first, 4)
+        self.assertEqual(second, 0)
+
+    def test_unregister_forward_prefetch_layer_aborts_inflight_group(self):
+        """Test unregister synchronizes in-flight copy events before dropping the group."""
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+            def forward(self, x):
+                return self.linear(x)
+
+        layer1 = _Layer()
+        layer2 = _Layer()
+        mgr = SwapManager()
+        mgr.set_forward_prefetch_layer(layer1, layer2)
+        group = mgr._groups[layer1._swap_group_name]
+        group._offload_event = MagicMock()
+        group._load_event = MagicMock()
+
+        mgr.unregister_forward_prefetch_layer(layer1)
+
+        group._offload_event.synchronize.assert_called_once_with()
+        group._load_event.synchronize.assert_called_once_with()
+
+    def test_teardown_wired_swap_layers_releases_all_wired_modules(self):
+        """Test _teardown_wired_swap_layers releases groups for every wired module."""
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+            def forward(self, x):
+                return self.linear(x)
+
+        layers = [_Layer(), _Layer(), _Layer()]
+        mgr = SwapManager()
+        mgr.set_forward_prefetch_layer(layers[0], layers[1])
+        mgr.set_forward_prefetch_layer(layers[1], layers[2])
+        self.assertEqual(len(mgr._groups), 3)
+
+        _teardown_wired_swap_layers(layers)
+
+        self.assertEqual(len(mgr._groups), 0)
+        for layer in layers:
+            self.assertFalse(hasattr(layer, "_swap_group_name"))
+            self.assertFalse(hasattr(layer, "_swap_forward_pre_hook_handle"))
+
+    def test_teardown_wired_swap_layers_idempotent(self):
+        """Test _teardown_wired_swap_layers is a no-op on already released modules."""
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+            def forward(self, x):
+                return self.linear(x)
+
+        layer1 = _Layer()
+        layer2 = _Layer()
+        mgr = SwapManager()
+        mgr.set_forward_prefetch_layer(layer1, layer2)
+
+        _teardown_wired_swap_layers([layer1, layer2])
+        _teardown_wired_swap_layers([layer1, layer2])
+
+        self.assertEqual(len(mgr._groups), 0)
 
 
 if __name__ == "__main__":
