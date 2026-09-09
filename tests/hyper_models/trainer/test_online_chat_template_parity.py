@@ -23,10 +23,28 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import ConversationTransform
-from hyper_parallel.auto_models.components.datasets.llm.build_dataset import build_llm_dataset
+from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import (
+    TextConversationTransform,
+    build_llm_data_transform,
+)
+from hyper_parallel.auto_models.components.datasets.llm.build_dataset import build_online_text_dataset
 from hyper_parallel.auto_models.components.datasets.llm.chat_template import build_chat_template
 from hyper_parallel.auto_models.components.utils.constants import IGNORE_INDEX
+
+
+class _RecordingChatTemplate:
+    """Minimal chat template that retains the normalized messages."""
+
+    def __init__(self) -> None:
+        self.messages = None
+
+    def encode_messages(self, messages, max_seq_len=8192):
+        del max_seq_len
+        self.messages = messages
+        return {
+            "input_ids": [1, 2],
+            "labels": [IGNORE_INDEX, 2],
+        }
 
 
 def _build_tokenizer() -> PreTrainedTokenizerFast:
@@ -74,18 +92,17 @@ def test_online_conversation_transform_matches_huggingface_apply_chat_template(m
             load_dataset=lambda *args, **kwargs: source_dataset,
         ),
     )
-    transform = ConversationTransform(
+    transform = TextConversationTransform(
         build_chat_template("tokenizer", tokenizer),
         max_seq_len=128,
         text_keys="messages",
     )
-    transformed_dataset = build_llm_dataset(
+    transformed_dataset = build_online_text_dataset(
         data_path="unused",
         data_config={
             "source_type": "online",
             "dataset_type": "mapping",
             "hf_dataset_name": "dummy/conversations",
-            "namespace": "train",
         },
         transform=transform,
     )
@@ -98,7 +115,6 @@ def test_online_conversation_transform_matches_huggingface_apply_chat_template(m
         return_dict=True,
     )
     assert actual["input_ids"].tolist() == expected["input_ids"]
-    assert actual["attention_mask"].tolist() == expected["attention_mask"]
 
     user_prefix = tokenizer.apply_chat_template(
         messages[:1],
@@ -109,3 +125,54 @@ def test_online_conversation_transform_matches_huggingface_apply_chat_template(m
     expected_labels = [IGNORE_INDEX] * len(user_prefix) + expected["input_ids"][len(user_prefix):]
     assert actual["labels"].tolist() == expected_labels
     assert actual["input_ids"].dtype == torch.long
+
+
+def test_conversation_transform_normalizes_sharegpt_roles() -> None:
+    """Adapt ShareGPT ``conversations`` records to standard chat messages."""
+    chat_template = _RecordingChatTemplate()
+    transform = build_llm_data_transform(
+        "conversation",
+        chat_template=chat_template,
+        max_seq_len=128,
+        text_keys="conversations",
+        role_key="from",
+        content_key="value",
+    )
+
+    sample = transform({
+        "conversations": [
+            {"from": "system", "value": "rules"},
+            {"from": "human", "value": "hello"},
+            {"from": "gpt", "value": "world"},
+        ]
+    })[0]
+
+    assert chat_template.messages == [
+        {"from": "system", "value": "rules", "role": "system", "content": "rules"},
+        {"from": "human", "value": "hello", "role": "user", "content": "hello"},
+        {"from": "gpt", "value": "world", "role": "assistant", "content": "world"},
+    ]
+    assert sample["input_ids"].tolist() == [1, 2]
+
+
+def test_conversation_transform_preserves_standard_messages_and_custom_aliases() -> None:
+    """Keep standard messages compatible while allowing source-specific roles."""
+    chat_template = _RecordingChatTemplate()
+    transform = TextConversationTransform(
+        chat_template,
+        max_seq_len=128,
+        text_keys="messages",
+        role_map={"customer": "user"},
+    )
+
+    transform({
+        "messages": [
+            {"role": "customer", "content": "hello", "metadata": "keep"},
+            {"role": "assistant", "content": "world"},
+        ]
+    })
+
+    assert chat_template.messages == [
+        {"role": "user", "content": "hello", "metadata": "keep"},
+        {"role": "assistant", "content": "world"},
+    ]

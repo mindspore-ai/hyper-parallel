@@ -21,7 +21,7 @@ import pytest
 
 from hyper_parallel.auto_models.components.distributed import infrastructure
 from hyper_parallel.auto_models.components.datasets.llm import online_mapping_dataset
-from hyper_parallel.auto_models.components.datasets.parallel import DatasetParallelContext
+from hyper_parallel.auto_models.components.datasets.parallel import DataLoaderParallelContext
 
 
 def test_online_mapping_download_synchronizes_shared_cache(monkeypatch) -> None:
@@ -29,27 +29,27 @@ def test_online_mapping_download_synchronizes_shared_cache(monkeypatch) -> None:
     captured = {}
     expected_dataset = object()
 
-    def _build_distributed_dataset(dataset_factory, parallel_context, *, barrier_needed):
-        captured["parallel_context"] = parallel_context
+    def _build_dataset_for_dataloader(dataset_factory, dataloader_context, *, barrier_needed):
+        captured["dataloader_context"] = dataloader_context
         captured["barrier_needed"] = barrier_needed
         return expected_dataset
 
     monkeypatch.setattr(
         online_mapping_dataset,
-        "build_distributed_dataset",
-        _build_distributed_dataset,
+        "build_dataset_for_dataloader",
+        _build_dataset_for_dataloader,
     )
-    parallel_context = DatasetParallelContext(distributed_enabled=True)
+    dataloader_context = DataLoaderParallelContext(distributed_enabled=True)
 
     dataset = online_mapping_dataset.build_online_mapping_dataset(
         data_path="unused",
         data_config={"hf_dataset_name": "Salesforce/wikitext"},
-        parallel_context=parallel_context,
+        dataloader_context=dataloader_context,
     )
 
     assert dataset is expected_dataset
-    assert captured["parallel_context"] is not parallel_context
-    assert isinstance(captured["parallel_context"].barrier, infrastructure.OnlineDatasetBarrier)
+    assert captured["dataloader_context"] is not dataloader_context
+    assert isinstance(captured["dataloader_context"].barrier, infrastructure.OnlineDatasetBarrier)
     assert captured["barrier_needed"] is True
 
 

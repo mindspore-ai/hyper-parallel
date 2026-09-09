@@ -1,0 +1,2 @@
+{"instruction": "Classify the sentiment.", "input": "The result is excellent.", "output": "positive"}
+{"instruction": "Add the two numbers.", "input": "2 and 3", "output": "5"}

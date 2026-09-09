@@ -19,7 +19,6 @@ import torch
 from torch.utils.data import IterableDataset
 
 from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import PlaintextTransform
-from hyper_parallel.auto_models.components.datasets.llm import build_dataset as dataset_module
 from hyper_parallel.auto_models.components.datasets.llm.transform_dataset import apply_llm_data_transform
 from hyper_parallel.auto_models.components.datasets.contracts import is_iterable_dataset
 
@@ -171,47 +170,3 @@ def test_default_mapping_path_preserves_strict_source_index() -> None:
     dataset = apply_llm_data_transform([{"text": ""}, {"text": "1"}], transform)
 
     assert dataset[0]["input_ids"].tolist() == [99]
-
-
-@pytest.mark.parametrize(
-    ("source_type", "dataset_type", "expected_skip"),
-    [
-        ("online", "mapping", True),
-        ("online", "iterable", True),
-        ("offline", "mapping", False),
-    ],
-)
-def test_only_online_sources_enable_invalid_sample_filtering(
-        source_type,
-        dataset_type,
-        expected_skip,
-        monkeypatch,
-) -> None:
-    """Filter invalid Online samples without changing Offline sources."""
-    captured = {}
-    raw_dataset = object()
-
-    monkeypatch.setattr(dataset_module, "build_online_dataset", lambda **kwargs: raw_dataset)
-    monkeypatch.setattr(dataset_module, "build_indexed_dataset", lambda **kwargs: raw_dataset)
-
-    def _apply(dataset, transform, *, skip_invalid_samples):
-        captured["dataset"] = dataset
-        captured["transform"] = transform
-        captured["skip_invalid_samples"] = skip_invalid_samples
-        return dataset
-
-    monkeypatch.setattr(dataset_module, "apply_llm_data_transform", _apply)
-    data_config = {
-        "source_type": source_type,
-        "dataset_type": dataset_type,
-    }
-    result = dataset_module.build_llm_dataset(
-        data_path="unused",
-        data_config=data_config,
-        transform=None,
-        train_valid_test_num_samples=(1, 0, 0) if source_type == "offline" else None,
-    )
-
-    assert result is raw_dataset
-    assert captured["dataset"] is raw_dataset
-    assert captured["skip_invalid_samples"] is expected_skip

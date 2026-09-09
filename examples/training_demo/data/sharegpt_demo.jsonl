@@ -1,0 +1,2 @@
+{"conversations": [{"from": "system", "value": "You are a concise assistant."}, {"from": "human", "value": "What is 2 plus 3?"}, {"from": "gpt", "value": "2 plus 3 is 5."}]}
+{"conversations": [{"from": "human", "value": "Name one primary color."}, {"from": "gpt", "value": "Red is a primary color."}]}

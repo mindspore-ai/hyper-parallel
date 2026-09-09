@@ -20,8 +20,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import PlaintextTransform
-from hyper_parallel.auto_models.components.datasets.llm.build_dataset import build_llm_dataset
+from hyper_parallel.auto_models.components.datasets.llm.build_data_transform import (
+    PlaintextTransform,
+    build_llm_data_transform,
+)
+from hyper_parallel.auto_models.components.datasets.llm.build_dataset import build_online_text_dataset
 
 
 class _Tokenizer:
@@ -53,12 +56,11 @@ def test_online_mapping_plaintext_matches_direct_tokenization(monkeypatch) -> No
         ),
     )
     tokenizer = _Tokenizer()
-    dataset = build_llm_dataset(
+    dataset = build_online_text_dataset(
         data_config={
             "source_type": "online",
             "dataset_type": "mapping",
             "hf_dataset_name": "test/plaintext",
-            "namespace": "train",
         },
         transform=PlaintextTransform(tokenizer, max_seq_len=8),
     )
@@ -68,7 +70,6 @@ def test_online_mapping_plaintext_matches_direct_tokenization(monkeypatch) -> No
     expected_ids = [1, 2, 3, tokenizer.eos_token_id]
     assert tokenizer.calls == 1
     assert sample["input_ids"].tolist() == expected_ids
-    assert sample["attention_mask"].tolist() == [1] * len(expected_ids)
     assert sample["labels"].tolist() == expected_ids
     assert sample["input_ids"].dtype == torch.long
 
@@ -85,12 +86,11 @@ def test_online_mapping_transform_is_lazy(monkeypatch) -> None:
         ),
     )
     tokenizer = _Tokenizer()
-    dataset = build_llm_dataset(
+    dataset = build_online_text_dataset(
         data_config={
             "source_type": "online",
             "dataset_type": "mapping",
             "hf_dataset_name": "test/plaintext",
-            "namespace": "train",
         },
         transform=PlaintextTransform(tokenizer, max_seq_len=8),
     )
@@ -100,45 +100,40 @@ def test_online_mapping_transform_is_lazy(monkeypatch) -> None:
     assert tokenizer.calls == 1
 
 
-def test_online_iterable_hub_source_does_not_require_data_path(monkeypatch) -> None:
-    """Allow a streaming Hub Dataset to use only ``hf_dataset_name``."""
-    captured = {}
-
-    def _build_online_dataset(**kwargs):
-        captured.update(kwargs)
-        return iter([{"input_ids": [1, 2], "labels": [1, 2]}])
-
-    monkeypatch.setattr(
-        "hyper_parallel.auto_models.components.datasets.llm.build_dataset.build_online_dataset",
-        _build_online_dataset,
+@pytest.mark.parametrize(
+    ("sample", "template", "expected"),
+    [
+        (
+            {"instruction": "1", "input": "2", "output": "3"},
+            "{instruction} {input} {output}",
+            [1, 2, 3, 9],
+        ),
+        (
+            {"instruction": "1", "output": "3"},
+            "{instruction} {output}",
+            [1, 3, 9],
+        ),
+    ],
+)
+def test_plaintext_transform_renders_instruction_records(sample, template, expected) -> None:
+    """Render Alpaca-like records before using the normal tokenizer path."""
+    transform = build_llm_data_transform(
+        "plaintext",
+        tokenizer=_Tokenizer(),
+        max_seq_len=16,
+        text_template=template,
     )
-    dataset = build_llm_dataset(
-        data_config={
-            "source_type": "online",
-            "dataset_type": "iterable",
-            "hf_dataset_name": "Salesforce/wikitext",
-        },
-        transform=None,
+
+    assert transform(sample)[0]["input_ids"].tolist() == expected
+
+
+def test_plaintext_transform_rejects_missing_template_fields() -> None:
+    """Report the missing source field instead of tokenizing an invalid record."""
+    transform = PlaintextTransform(
+        _Tokenizer(),
+        max_seq_len=16,
+        text_template="{instruction} {input} {output}",
     )
 
-    assert captured["data_path"] is None
-    assert next(iter(dataset))["input_ids"] == [1, 2]
-
-
-def test_online_local_source_requires_data_path() -> None:
-    """Require data_path only when an Online Hub name is absent."""
-    with pytest.raises(ValueError, match="data_path is required"):
-        build_llm_dataset(
-            data_config={"source_type": "online", "dataset_type": "mapping"},
-            transform=None,
-        )
-
-
-def test_offline_source_requires_data_path() -> None:
-    """Keep indexed Offline Dataset paths mandatory."""
-    with pytest.raises(ValueError, match="Offline LLM Datasets require data_path"):
-        build_llm_dataset(
-            data_config={"source_type": "offline"},
-            transform=None,
-            train_valid_test_num_samples=(1, 0, 0),
-        )
+    with pytest.raises(ValueError, match="text_template field 'input'"):
+        transform({"instruction": "1", "output": "3"})
