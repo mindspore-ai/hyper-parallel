@@ -8,9 +8,11 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 
 ---
 
-## Scoped Instructions
+## Hyper-RL Entry
 
-- For anything under `hyper_parallel/rl/**`, read `.agent/rules/hyper-rl-workflow.md` completely (auto-applied via `paths:`) and apply it together with this repository-level file.
+- For RL-owned code, docs, or agent rules, start with `.agent/rules/hyper-rl.md`. It is the sole RL entry.
+- RL rules do not apply to other HyperParallel modules. Handle a required main-project change separately under that module's rules.
+- [`docs/rl-navigation.md`](docs/rl-navigation.md) is the RL feature index referenced by the workflow.
 
 ---
 
@@ -52,12 +54,6 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 
 ## Key Modules
 
-> Canonical architecture: [`docs/rl-architecture.md`](docs/rl-architecture.md) — the
-> single source of truth for module map + platform abstraction + RL deployment
-> picture. Feature→flag→branch→metric→test traceability:
-> [`docs/rl-navigation.md`](docs/rl-navigation.md). This table is a **pointer**, not a
-> copy; update the architecture doc, not this table, when modules change.
-
 | Module | Location | Purpose |
 |--------|----------|---------|
 | **Platform** | `platform/` (`platform.py`, `torch/`, `mindspore/`) | Abstraction — `get_platform()`, never import backends in core |
@@ -69,13 +65,8 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 | **Activation** | `core/activation_checkpoint/`, `platform/torch/activation_checkpoint/` | SAC + activation swap |
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
 | **Collectives** | `collectives/cc.py` | Process groups |
-| **RL** | `hyper_parallel/rl/` | Sync LLM RL runtime (Qwen3+GRPO baseline) — see `rl/` note below |
+| **RL** | `hyper_parallel/rl/` | Sync LLM RL runtime (Qwen3 + GRPO baseline) |
 | **Tests** | `tests/ut/`, `tests/torch/`, `tests/mindspore/` | UT + distributed ST |
-
-For anything under `hyper_parallel/rl/`, the source layout and interface
-contracts come from `.agent/skills/hyper-rl-dev/references/module-map.md`
-(loaded with the `hyper-rl-dev` skill); RL architecture is in
-[`hyper_parallel/rl/docs`](hyper_parallel/rl/docs/architecture.md).
 
 ---
 
@@ -147,10 +138,8 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **dist-op-analysis** | Operator analysis → plan (human confirm) | called before dist-op-dev |
 | **dist-op-dev** | Implement + test from confirmed plan | `/dist-op-dev` |
 | **platform-dev** | Platform APIs, FSDP/HSDP/PP, DTensorBase, collectives | `/skill platform-dev` |
-| **hyper-rl-dev** | Implement Hyper-RL from approved design → CPU gate + NPU smoke | `/skill hyper-rl-dev` (design-first: rule `hyper-rl-workflow`) |
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
-| **readability-first** | Readability + agent-traceability gate (simplicity, one-fact-one-place, nav-map sync) | invoke before any change / review |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 
 ### Commands
@@ -186,11 +175,10 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | ---- | ----- |
 | **project-overview** | Global — identity + hard-rule shortlist |
 | **code-style** | Global |
-| **readability** | Global — human-readable first, agent-traceable minimum gate (rules → skill `readability-first`) |
 | **distributed** | `core/**`, `collectives/**`, `**/fully_shard/**` |
 | **platform** | `platform/**` |
 | **multi-platform-features** | `core/**`, `platform/**` — multi-backend / list APIs |
 | **testing** | `tests/**` |
 | **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
-| **hyper-rl-workflow** | `hyper_parallel/rl/**` — RL context + design-first constraints; process → skill `hyper-rl-dev` |
+| **hyper-rl** | `hyper_parallel/rl/**` — sole RL entry |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |

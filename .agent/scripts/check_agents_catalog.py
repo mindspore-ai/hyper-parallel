@@ -187,11 +187,8 @@ def _navigation_errors(root: Path) -> list[str]:
     if not nav.is_file():
         return []  # main reports the missing navigation document.
     errors = []
-    in_rl = False
     for number, line in enumerate(nav.read_text(encoding="utf-8").splitlines(), 1):
-        if line.startswith("## 2. "):
-            in_rl = True
-        if not in_rl or not line.startswith("|"):
+        if not line.startswith("|"):
             continue
         for reference in re.findall(r"`([^`]+)`", line):
             match = re.fullmatch(r"([\w./-]+\.py)(?:::(\w+(?:\.\w+)*))?", reference)
@@ -269,11 +266,9 @@ def main() -> int:
             f"only_on_disk={sorted(disk_agents - listed_agents)}"
         )
 
-    # Readability skill/rule must be registered wherever it is invoked.
-    if "readability-first" not in listed_skills and "readability-first" in disk_skills:
-        errors.append("skills: 'readability-first' exists on disk but is not listed in AGENTS.md")
-    if "readability" not in disk_rules:
-        errors.append("rules: 'readability' rule file is missing under .agent/rules/")
+    # Hyper-RL has one path-scoped entry rule.
+    if "hyper-rl" not in disk_rules:
+        errors.append("rules: 'hyper-rl' is missing under .agent/rules/")
 
     errors.extend(_doc_topology_errors(root, agents_md))
 

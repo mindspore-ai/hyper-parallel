@@ -36,6 +36,7 @@ hyper_parallel/rl/local_docs/
 *.dot
 *.dat
 *.svg
+!hyper_parallel/rl/docs/assets/hyper-rl-architecture.svg
 *.perf
 *.info
 *.ckpt

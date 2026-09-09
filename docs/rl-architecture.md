@@ -7,7 +7,8 @@
 > | 事实 | 规范出处 |
 > | --- | --- |
 > | 硬规则与架构不变量 | `.agent/rules/project-overview.md`、`.agent/rules/distributed.md` |
-> | RL 内部细节(部署、布局、契约) | `hyper_parallel/rl/docs/`、`.agent/skills/hyper-rl-dev/references/module-map.md` |
+> | RL 内部细节(部署、布局、契约) | `hyper_parallel/rl/docs/` |
+> | RL 子系统归属与详细文档入口 | `.agent/rules/rl/module-map.md` |
 > | 功能 → 配置键 → 分支 → 指标 → 测试 | [rl-navigation.md](rl-navigation.md) |
 >
 > 本文件保持图状结构:读者应能从下面的表格直接回答“X 在哪里”,无需读代码。
@@ -78,9 +79,9 @@ pylint 插件 `scripts/pylint_hyperparallel.py` 的 **C9002** 检查上面第一
 | 你要找什么 | 规范出处 |
 |------------|----------|
 | 部署图、组件、权重发布、一致性边界 | [`hyper_parallel/rl/docs/architecture.md`](../hyper_parallel/rl/docs/architecture.md) |
-| 子系统 → 文件映射、接口契约 | [`module-map.md`](../.agent/skills/hyper-rl-dev/references/module-map.md) |
-| 设计优先约束、门禁、两个易踩坑的事实 | [`hyper-rl-workflow.md`](../.agent/rules/hyper-rl-workflow.md) |
-| Colocated / Disjoint 设备数关系、权重同步事务语义 | [`weight-sync.md`](../.agent/skills/hyper-rl-dev/references/weight-sync.md) |
+| 子系统归属、详细文档入口 | [`module-map.md`](../.agent/rules/rl/module-map.md) |
+| 工作顺序、范围边界、验证门禁 | [`hyper-rl.md`](../.agent/rules/hyper-rl.md) |
+| Colocated / Disjoint、权重同步事务语义 | [`vllm_rollout.md`](../hyper_parallel/rl/docs/vllm_rollout.md) |
 | 功能 → 配置键 → 分支 → 指标 → 测试 | [rl-navigation.md](rl-navigation.md) |
 
 ---
@@ -90,8 +91,8 @@ pylint 插件 `scripts/pylint_hyperparallel.py` 的 **C9002** 检查上面第一
 | 受众 | 文件 | 角色 |
 |------|------|------|
 | Agent(常驻加载) | `AGENTS.md` | 环境法则;链向本文件 |
-| Agent(RL 路径生效) | `.agent/rules/hyper-rl-workflow.md` | RL 设计优先 + 约束 |
-| Agent(流程 SoT) | `.agent/skills/hyper-rl-dev/` | 实现 + 门禁、module-map |
+| Agent(RL 路径生效) | `.agent/rules/hyper-rl.md` | RL 设计优先 + 约束 |
+| Agent(RL 模块索引) | `.agent/rules/rl/module-map.md` | 子系统归属 + 详细文档入口 |
 | 人 | `README.md` | 顶层介绍 + 设计原则 |
 | 人(指南) | `docs/index.md` → `docs/guide/*` | 各特性使用指南 |
 | 两者 | `docs/rl-navigation.md` | 功能 → 配置键 → 测试 可追溯映射 |
