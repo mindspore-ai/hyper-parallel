@@ -36,8 +36,9 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import numpy as np  # pylint: disable=C0413
 import torch  # pylint: disable=C0413
 
+from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413
 from hyper_parallel.core.dtensor.placement_types import Partial  # pylint: disable=C0413
-from hyper_parallel.platform.torch import clip_grad as clip_grad_mod  # pylint: disable=C0413
+from hyper_parallel.core.utils import clip_grad as clip_grad_mod  # pylint: disable=C0413
 
 
 def _make_mesh(dim_to_group):
@@ -286,7 +287,7 @@ class TestClipGradPartialPath(unittest.TestCase):
         g_global = g_local * ws   # SUM over the Partial group of identical locals
 
         mesh = _make_mesh({0: "PG"})
-        grad = MagicMock(spec=clip_grad_mod.DTensor)
+        grad = MagicMock(spec=DTensor)
         grad._local_tensor = g_local
         grad.placements = (Partial("sum"),)
         grad.device_mesh = mesh
