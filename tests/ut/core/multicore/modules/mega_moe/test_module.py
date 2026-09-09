@@ -72,6 +72,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         for overrides, message in (
             ({"local_num_tokens": 129}, "divisible"),
             ({"expert_capacity_factor": 0.999}, "expert_capacity_factor"),
+            ({"num_experts": 34}, "device scratch capacity"),
         ):
             with (
                 self.subTest(overrides=overrides),
@@ -81,7 +82,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                     local_num_tokens=overrides.get("local_num_tokens", 128),
                     hidden_size=16,
                     intermediate_size=8,
-                    num_experts=4,
+                    num_experts=overrides.get("num_experts", 4),
                     top_k=2,
                     expert_capacity_factor=overrides.get("expert_capacity_factor"),
                     ep_size=2,

@@ -22,9 +22,15 @@
 namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
+constexpr int64_t MAX_EXPERT_NUM_PER_RANK = 16;
 static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+  OP_CHECK_NULL_WITH_CONTEXT(context, context);
   auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
   auto coreNum = ascendcPlatform.GetCoreNumAic();
+  if (coreNum == 0) {
+    OP_LOGE(context->GetNodeName(), "The number of AIC cores must be positive.");
+    return ge::GRAPH_FAILED;
+  }
   context->SetBlockDim(coreNum);
   // OP_LOGE(context->GetNodeName(), "coreNum:%d", coreNum);
 
@@ -50,18 +56,44 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
 
   HyperMegaMoeGradTilingData tiling;
   auto attr = context->GetAttrs();
-  if (attr != nullptr) {
-    tiling.set_rankId((*(attr->GetAttrPointer<int64_t>(0))));
-    tiling.set_ep((*(attr->GetAttrPointer<int64_t>(1))));
-    tiling.set_expertNum((*(attr->GetAttrPointer<int64_t>(2))));
-    tiling.set_hiddenSize((*(attr->GetAttrPointer<int64_t>(3))));
-    tiling.set_seqSize((*(attr->GetAttrPointer<int64_t>(4))));
-    tiling.set_coreNum(static_cast<int64_t>(coreNum));
+  OP_CHECK_NULL_WITH_CONTEXT(context, attr);
+  const int64_t *rankIdAttr = attr->GetAttrPointer<int64_t>(0);
+  const int64_t *epAttr = attr->GetAttrPointer<int64_t>(1);
+  const int64_t *expertNumAttr = attr->GetAttrPointer<int64_t>(2);
+  const int64_t *hiddenSizeAttr = attr->GetAttrPointer<int64_t>(3);
+  const int64_t *seqSizeAttr = attr->GetAttrPointer<int64_t>(4);
+  OP_CHECK_NULL_WITH_CONTEXT(context, rankIdAttr);
+  OP_CHECK_NULL_WITH_CONTEXT(context, epAttr);
+  OP_CHECK_NULL_WITH_CONTEXT(context, expertNumAttr);
+  OP_CHECK_NULL_WITH_CONTEXT(context, hiddenSizeAttr);
+  OP_CHECK_NULL_WITH_CONTEXT(context, seqSizeAttr);
+
+  const int64_t rankId = *rankIdAttr;
+  const int64_t ep = *epAttr;
+  const int64_t expertNum = *expertNumAttr;
+  const int64_t hiddenSize = *hiddenSizeAttr;
+  const int64_t seqSize = *seqSizeAttr;
+  if (rankId < 0 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 ||
+      expertNum / ep > MAX_EXPERT_NUM_PER_RANK || hiddenSize <= 0 || seqSize <= 0) {
+    OP_LOGE(context->GetNodeName(),
+            "Invalid topology: rankId=%ld, ep=%ld, expertNum=%ld, hiddenSize=%ld, seqSize=%ld.", rankId, ep,
+            expertNum, hiddenSize, seqSize);
+    return ge::GRAPH_FAILED;
   }
-  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+  tiling.set_rankId(rankId);
+  tiling.set_ep(ep);
+  tiling.set_expertNum(expertNum);
+  tiling.set_hiddenSize(hiddenSize);
+  tiling.set_seqSize(seqSize);
+  tiling.set_coreNum(static_cast<int64_t>(coreNum));
+
+  auto rawTilingData = context->GetRawTilingData();
+  OP_CHECK_NULL_WITH_CONTEXT(context, rawTilingData);
+  tiling.SaveToBuffer(rawTilingData->GetData(), rawTilingData->GetCapacity());
+  rawTilingData->SetDataSize(tiling.GetDataSize());
 
   size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+  OP_CHECK_NULL_WITH_CONTEXT(context, currentWorkspace);
   currentWorkspace[0] = 99615232;
   return ge::GRAPH_SUCCESS;
 }

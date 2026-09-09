@@ -36,6 +36,7 @@ NUM_WORKERS_CUBE     = 24
 QUEUE_CAPACITY       = 100
 TASK_TYPE_INDEX_NUM  = 256 * 100
 MAX_GROUP_LIST       = 512
+MAX_EXPERT_NUM_PER_RANK = 16
 ATOMIC_ADD_VALUE_LEN = 8
 
 
@@ -201,6 +202,32 @@ class TaskSplitValue:
     all_expert_num: int = 32
     top_k:          int = 8
 
+    def __post_init__(self) -> None:
+        """Reject topology values that would invalidate runtime arithmetic."""
+        values = {
+            "tp": self.tp,
+            "ep": self.ep,
+            "seq_size": self.seq_size,
+            "all_expert_num": self.all_expert_num,
+            "top_k": self.top_k,
+        }
+        for name, value in values.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+        if self.top_k > self.all_expert_num:
+            raise ValueError(
+                f"top_k ({self.top_k}) cannot exceed all_expert_num ({self.all_expert_num})."
+            )
+        if self.all_expert_num % self.ep:
+            raise ValueError(
+                f"all_expert_num ({self.all_expert_num}) must be divisible by ep ({self.ep})."
+            )
+        if self.single_rank_expert_num > MAX_EXPERT_NUM_PER_RANK:
+            raise ValueError(
+                "single_rank_expert_num cannot exceed the device scratch capacity "
+                f"({MAX_EXPERT_NUM_PER_RANK}), got {self.single_rank_expert_num}."
+            )
+
     # ── Derived properties ────────────────────────────────────────────────────
     @property
     def single_rank_expert_num(self) -> int:
@@ -251,3 +278,106 @@ def init_task_split_value(tsv: TaskSplitValue) -> None:
     tsv.pre_cube_task_num   = 0
     tsv.pre_vector_task_num = 0
     tsv.pre_mix_task_num    = 0
+
+
+def _validate_num_cube_cores(num_cube_cores: int) -> None:
+    """Validate the hardware core count used by GMM task descriptors."""
+    if not isinstance(num_cube_cores, int) or isinstance(num_cube_cores, bool) or num_cube_cores <= 0:
+        raise ValueError(f"num_cube_cores must be a positive integer, got {num_cube_cores!r}.")
+
+
+def _validate_task_bounds(task: TaskDescC, descriptor_index: int) -> None:
+    """Validate the common task index range."""
+    if task.task_split_num == 0 or task.task_index >= task.task_split_num:
+        raise ValueError(
+            f"task {descriptor_index} has invalid task_index/task_split_num "
+            f"({task.task_index}/{task.task_split_num})."
+        )
+
+
+def _validate_swiglu_task(task: TaskDescC, descriptor_index: int, group_size: int) -> None:
+    """Validate SwiGLU expert partition arithmetic."""
+    if task.task_split_num < group_size or task.task_split_num % group_size:
+        raise ValueError(
+            f"SwiGLU task {descriptor_index} cannot be partitioned over {group_size} experts."
+        )
+
+
+def _validate_gmm_task(task: TaskDescC, descriptor_index: int, expected_tasks: int) -> None:
+    """Validate that every local expert owns one task per Cube core."""
+    if task.task_split_num != expected_tasks:
+        raise ValueError(
+            f"GMM task {descriptor_index} has task_split_num {task.task_split_num}; "
+            f"expected {expected_tasks}."
+        )
+
+
+def _validate_shmem_task(task: TaskDescC, descriptor_index: int, tsv: TaskSplitValue) -> None:
+    """Validate SHMEM task partitioning and remote-rank selection."""
+    if task.task_split_num < tsv.all_expert_num or task.task_split_num % tsv.all_expert_num:
+        raise ValueError(
+            f"SHMEM task {descriptor_index} cannot be partitioned over "
+            f"{tsv.all_expert_num} experts."
+        )
+    tasks_per_expert = task.task_split_num // tsv.all_expert_num
+    target_rank_offset = task.task_index // (tsv.single_rank_expert_num * tasks_per_expert)
+    if target_rank_offset >= tsv.ep:
+        raise ValueError(
+            f"SHMEM task {descriptor_index} targets rank offset {target_rank_offset}; "
+            f"ep is {tsv.ep}."
+        )
+
+
+def validate_runtime_config(
+    cfg: RuntimeConfigC,
+    tsv: TaskSplitValue,
+    num_cube_cores: int,
+) -> None:
+    """Validate task arithmetic before serializing a runtime configuration.
+
+    The device worker intentionally assumes that generated task descriptors are
+    internally consistent. Rejecting an invalid schedule here avoids both
+    out-of-bounds descriptor access and device-side early exits that could omit
+    event-counter or SHMEM-signal updates.
+
+    Args:
+        cfg: Populated runtime configuration awaiting serialization.
+        tsv: Validated topology and task split values.
+        num_cube_cores: Number of Cube cores used to generate GMM tasks.
+
+    Raises:
+        ValueError: If the runtime configuration violates a device-side invariant.
+    """
+    _validate_num_cube_cores(num_cube_cores)
+    if cfg.num_workers != 2 * num_cube_cores:
+        raise ValueError(
+            f"num_workers ({cfg.num_workers}) must equal twice num_cube_cores ({num_cube_cores})."
+        )
+    if cfg.task_num > MAX_TASK_NUM:
+        raise ValueError(f"task_num ({cfg.task_num}) exceeds MAX_TASK_NUM ({MAX_TASK_NUM}).")
+
+    local_experts = tsv.single_rank_expert_num
+    group_size = cfg.dynamic_data.dynamic_group_size
+    if group_size != local_experts:
+        raise ValueError(
+            f"dynamic_group_size ({group_size}) must equal local expert count ({local_experts})."
+        )
+
+    for descriptor_index in range(cfg.task_num):
+        task = cfg.all_tasks[descriptor_index]
+        task_type = task.task_type
+        if task_type not in (
+            TaskType.TASK_SWI_GLU,
+            TaskType.TASK_SWI_GLU_GRAD,
+            TaskType.TASK_GROUPED_MATMUL,
+            TaskType.TASK_SHMEM_PUT_MEM_SIGNAL,
+        ):
+            continue
+        _validate_task_bounds(task, descriptor_index)
+
+        if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
+            _validate_swiglu_task(task, descriptor_index, group_size)
+        elif task_type == TaskType.TASK_GROUPED_MATMUL:
+            _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts)
+        else:
+            _validate_shmem_task(task, descriptor_index, tsv)
