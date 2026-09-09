@@ -33,9 +33,9 @@ from hyper_parallel.core.pipeline_parallel.mpipe.step_types import MpipeStepType
 
 if TYPE_CHECKING:
     from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
-    from hyper_parallel.dmodule.module import Module
 
 platform = get_platform()
+Module = platform.Module
 logger = logging.getLogger(__name__)
 
 
