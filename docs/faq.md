@@ -16,7 +16,8 @@ wheel_path=/absolute/path/printed/by/build.sh
 pip install "${wheel_path}"
 ```
 
-如明确只需要不含 optional native 组件的 core-only wheel，可将三个组件都设为 `off`。
+如明确只需要不含 optional native 组件的 core-only wheel，可使用
+`./build.sh --multicore off --custom-ops off`。indexed Dataset helper 是基础组件，没有独立关闭开关。
 
 ### Q: 导入时报错 `GLIBC_2.xx not found`
 
@@ -44,16 +45,16 @@ source /usr/local/Ascend/cann/set_env.sh
 # 确认 MindSpore 版本
 python -c "import mindspore; print(mindspore.__version__)"
 
-# 仅重新构建 custom ops；optional 失败默认记录 warning 并继续出 wheel
-./build.sh --multicore off --shmem off --custom-ops on
+# 仅重新构建 custom ops payload；该组件入口失败会直接退出，不生成 wheel
+bash hyper_parallel/platform/mindspore/custom_ops/build.sh
 ```
 
 ### Q: PyTorch 扩展构建失败
 
 **原因**：PyTorch/torch_npu/CANN 版本不配套，或 CXX11 ABI 不匹配。
 
-**解决**：使用与当前 CANN 配套的 PyTorch/torch_npu，并确认 native adapter 所需的
-`_GLIBCXX_USE_CXX11_ABI=1`。
+**解决**：使用与当前 CANN 配套的 PyTorch/torch_npu，并确认 native adapter 按当前 PyTorch 报告的
+`compiled_with_cxx11_abi()` 值构建。该值可能为 0 或 1，必须与实际框架一致。
 
 ```bash
 python -c "import torch; print(torch.__version__); print(torch.compiled_with_cxx11_abi())"

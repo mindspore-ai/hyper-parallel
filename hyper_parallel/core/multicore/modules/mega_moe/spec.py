@@ -19,11 +19,11 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from importlib import import_module
 from typing import Any
 
-torch = import_module("torch")
-dist = import_module("torch.distributed")
+import torch
+import torch.distributed as dist
+
 
 _COMMUNICATION_SPLIT = 128
 

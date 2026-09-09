@@ -3,6 +3,8 @@ name: project-overview
 description: Global project context — hard rules that prevent common distributed bugs (canonical shortlist; link here instead of restating)
 ---
 
+# Project Overview
+
 ## Project Identity
 
 HyperParallel — distributed parallel library for Ascend NPU + Nvidia GPU, PyTorch + MindSpore backends.
@@ -21,6 +23,9 @@ Canonical shortlist for always-on context. Full patterns:
 
 ## Architecture Invariants
 
-- All features behind platform abstraction layer (`platform/`)
+- Framework-neutral features use the platform abstraction layer (`platform/`).
+- `hyper_parallel/core/multicore/` is Torch-only: direct Torch imports, no Platform dispatch or
+  MindSpore implementation. Its SHMEM component is private to Multicore. This exception does not
+  extend to other `core/` modules.
 - DTensor = local shard + DeviceMesh + Placements
 - Distributed ops registered via YAML (`core/shard/ops/yaml/`)

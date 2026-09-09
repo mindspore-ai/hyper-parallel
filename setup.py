@@ -181,8 +181,8 @@ class Install(install):
 class BinaryDistribution(Distribution):
     """Force wheel to be tagged as a binary distribution.
 
-    The package ships pre-compiled .so files (built by scripts/build_*.sh and
-    bundled via package_data). Without this hint setuptools/wheel would label
+    The package ships pre-compiled .so files prepared by component build entries
+    and merged from their payloads. Without this hint setuptools/wheel would label
     the wheel as pure-python (py3-none-any), which lets pip install it under
     incompatible Python versions or CPU architectures and triggers
     'Python version mismatch' at import time.
@@ -219,14 +219,11 @@ if __name__ == '__main__':
                                         "hyper_parallel.auto_parallel.fast-tuner.*"]),
         platforms=[get_platform()],
         include_package_data=True,
-        scripts=['scripts/hyper_parallel_multicore_set_env.bash'],
+        scripts=['hyper_parallel/core/multicore/scripts/hyper_parallel_multicore_set_env.bash'],
         package_data={
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
             'hyper_parallel.platform.torch.custom_ops.gdn': ['LICENSE'],
-            'hyper_parallel.platform.mindspore.custom_ops': ['lib/*.so', 'lib/*_auto_generate/*.py'],
-            'hyper_parallel.core.multicore': ['lib/**/*'],
-            'hyper_parallel.core.symmetric_memory': ['lib/**/*'],
-            'hyper_parallel.data.indexed': ['*.so'],
+            'hyper_parallel.core.multicore': ['README.md', 'docs/**/*', 'examples/**/*', 'set_env.bash'],
             'hyper_parallel.models.qwen3_moe': ['recipes/*.yaml'],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
                 'configs_eval/default.yaml',

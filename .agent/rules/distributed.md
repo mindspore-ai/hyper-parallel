@@ -8,6 +8,8 @@ paths:
   - hyper_parallel/platform/mindspore/fully_shard/**
 ---
 
+# Distributed Systems
+
 ## DTensor
 
 - `is_partial()` is a **method**, not a property — always call with parentheses
@@ -18,16 +20,23 @@ paths:
 
 ## Platform API Calling Conventions
 
+These Platform conventions apply to framework-neutral components. The Torch-only
+`hyper_parallel/core/multicore/` component uses direct Torch APIs instead. Stream ordering,
+autograd correctness, and memory-lifetime requirements below still apply to Multicore.
+
 ### Module-level `platform` vs `self.platform`
+
 - **Always use module-level `platform = get_platform()`** — never store platform as `self.platform` on instances
 - If you see `self.platform` in existing code, treat it as a bug and fix it to use the module-level `platform`
 
 ### `differentiable_*` vs non-differentiable collective APIs
+
 - Code in `TensorRedistribution` and any forward/backward computation path **must** use `platform.differentiable_all_reduce`, `platform.differentiable_reduce_scatter`, etc.
 - Non-differentiable versions (`platform.all_reduce`, `platform.reduce_scatter`) are only for contexts outside autograd (e.g., parameter sync, buffer broadcast)
 - When adding a new collective call, ask: "Does this tensor need gradients?" — if yes, use `differentiable_*`
 
 ### `group` vs `group_info` parameter types
+
 - `platform.all_reduce`, `platform.all_gather_into_tensor`, `platform.reduce_scatter_tensor` expect a **`group_info` object** with `.group` attribute (Torch) or a `str` (MindSpore)
 - `platform.differentiable_all_reduce`, `platform.differentiable_reduce_scatter` expect a **raw `group`** (ProcessGroup or str)
 - `platform.create_group()` returns a **raw group** — wrap it with `SimpleNamespace(group=group)` before passing to non-differentiable APIs

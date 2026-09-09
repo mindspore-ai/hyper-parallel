@@ -25,99 +25,57 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 
 ## 2. 从源码编译 whl 包
 
-基于源码构建 hyper-parallel 可选择编译 `multicore`、`symmetric memory`、`custom ops` 三个 optional native
-模块。indexed Dataset C++ helper 是 wheel 的必需制品，每次执行 `build.sh` 都会编译。
+统一入口调用所选组件的构建脚本，再将成功组件的产物组装为一个 wheel。indexed Dataset C++ helper
+每次都会编译；Multicore 包含其私有 SHMEM 依赖，不再提供独立 SHMEM 开关。
 
-通过 `build.sh` 构建 whl 支持以下编译参数：
-
-| 参数             | 默认值         | 可选值                                                   | 说明                                                                              |
-|----------------|-------------|-------------------------------------------------------|---------------------------------------------------------------------------------|
-| `--multicore`  | `all`       | `off`、`mindspore`、`ms`、`torch`、`pytorch`、`all`、`both` | 控制 multicore 模块编译范围；`ms` 等价于 `mindspore`，`pytorch` 等价于 `torch`，`both` 等价于 `all` |
-| `--shmem`      | `all`       | `off`、`mindspore`、`ms`、`torch`、`pytorch`、`all`、`both` | 控制 symmetric memory 模块编译范围；`all` 同时编译公共库、MindSpore wrapper 和 PyTorch wrapper    |
-| `--custom-ops` | `on`        | `on`、`off`                                            | 启用或关闭 MindSpore custom ops 编译                                                 |
-| `--soc-list`   | `ascend910b,ascend910_93` | `ascend910b`、`ascend910_93`、`ascend950` 的逗号分隔组合 | 控制 wheel 携带的 kernel；支持 `ascend910b`（910B）和 `ascend910_93`（910C），选择 `ascend950` 时记录 optional failure |
-| `--strict`     | `off`       | `on`、`off`                                            | `off` 保留 wheel 并记录结构化 warning；显式 strict 开发构建使用 `on`                              |
-| `--jobs`       | `nproc`     | 正整数                                                  | 控制 native 编译并行度                                                                  |
-| `--clean`      | 关闭          | 无参数开关                                                 | 清理所选组件的工作和安装输出后重编译；保留依赖下载缓存                                                  |
-
-源码构建 hyper-parallel 环境要求如下：
-
-| 环境项               | 要求                                    | 说明                                                                            |
-|-------------------|---------------------------------------|-------------------------------------------------------------------------------|
-| Python            | 3.10、3.11 或 3.12                      | 构建出的 whl 仅可装到对应 Python 小版本的解释器上                                               |
-| Python 构建包        | `setuptools`、`wheel`、`pybind11`       | indexed Dataset helper 还需要当前 Python 的开发头文件                                      |
-| 主机 C/C++ 工具链     | GCC/G++ >= 7.3.0，支持 C++17              | 推荐使用 GCC/G++ 7.3.0--11.3.0；更高版本仅告警                                        |
-| 主机架构              | `aarch64` 或 `x86_64`                   | 每个 whl 对应一个主机架构和一个 CPython ABI                                                |
-| CMake             | >= 3.18                               | native 扩展构建需要                                                                 |
-| Linux 构建工具        | GNU Make、Git、binutils、coreutils、`tar`、`sed`、`awk` | 依赖准备、ELF 校验和 CANN 算子构建使用                                      |
-| CANN toolkit 和 ops 包 | >= 9.1.0 的完整开发环境                    | 预先 source 所选 CANN 的 `set_env.sh`；环境需提供 `bisheng`、`asc_opc`、头文件、`libopapi.so` 和 `ops_base` |
-| Ninja             | MindSpore native target 可从 `PATH` 找到    | `CustomOpBuilder` 构建需要                                                        |
-| MindSpore         | >= 2.10                               | 当 `--custom-ops on`、`--multicore mindspore/all` 或 `--shmem all/mindspore` 时需要       |
-| PyTorch 及 NPU 适配包 | 相互配套的版本                            | 当 `--multicore torch/all` 或 `--shmem all/torch` 时需要；构建使用活动环境中安装的配套版本及其 C++ ABI |
+| 参数 | 默认值 | 可选值 | 说明 |
+|------|--------|--------|------|
+| `--multicore` | `on` | `on`、`off` | 编译 Torch Multicore 及其私有 SHMEM。 |
+| `--custom-ops` | `on` | `on`、`off` | 编译 MindSpore custom ops。 |
+| `--soc-list` | `ascend910b,ascend910_93` | SoC 列表 | 选择 Multicore kernel 目标。 |
+| `--strict` | `off` | `on`、`off` | 所选 optional 组件失败时是否终止。 |
+| `--jobs` | `nproc` | 正整数 | 设置 native 编译并行度。 |
+| `--clean` | 关闭 | 无参数开关 | 重建所选组件的工作和安装目录。 |
 
 ```bash
-git clone https://gitcode.com/mindspore/hyper-parallel.git
-cd hyper-parallel
-
-# 默认 CANN 安装会在需要时自动 source；自定义安装路径需要在 build.sh 前显式 source。
-./build.sh
-./build.sh --multicore all --shmem all --custom-ops on --soc-list ascend910b,ascend910_93
-./build.sh --multicore torch --shmem torch --strict off
-./build.sh --multicore off --shmem off --custom-ops off
-# 安装 build.sh 最后打印的精确 wheel 路径。
-wheel_path=/absolute/path/printed/by/build.sh
-pip install "${wheel_path}"
+./build.sh --help
+./build.sh --multicore on --custom-ops on --soc-list ascend910b,ascend910_93
+./build.sh --strict on --jobs 24
+# 安装本次命令打印的精确 wheel 路径
+pip install /absolute/path/to/the-built-wheel.whl
 ```
 
-`build.sh` 每次都从组件安装目录重新组装 `build/native/payload/hyper_parallel`、生成 wheel，并打印本次
-wheel 的精确路径；PYTHONPATH 开发直接复用同一 payload。单独执行某个组件脚本
-成功后会刷新该组件的 payload 子目录，可直接用于局部增量开发。默认保留耗时的 SHMEM 和按 SoC 的 vendor
-编译缓存；轻量 framework adapter 每次从按框架身份隔离的干净目录重编。`--clean` 用于显式全量重编所选
-组件。锁定依赖缓存正确时直接复用，缺失或不一致时自动下载/刷新。
+通用构建要求：Python 3.10–3.12、对应开发头文件、setuptools、wheel、pybind11、C++17 主机工具链。
+每个 wheel 对应一个 Python ABI 和主机架构；各 native 组件的 SDK、框架和设备要求由组件自行定义。
+源码和预编译 wheel 的运行环境还必须满足最终 ELF 记录的 glibc、框架 ABI 及 SDK 约束。
 
-MindSpore adapter 通过 `ops.CustomOpBuilder` 构建。PyTorch adapter 是由 CMake 构建、通过
-`torch.ops.load_library()` 加载的共享库，不使用 setuptools compiler 内部属性、`NpuExtension`
-或 `find_package(Torch)`。构建过程从当前 Python 环境定位 Torch 和 torch_npu，并在编译前校验所需
-头文件和库文件。
+每次统一构建重新生成 `build/native/payload/hyper_parallel`；只交付本次成功的组件。
+`--strict on` 在所选组件失败时终止，适用于验收与发布；默认宽松模式允许 optional 组件失败后继续组包，
+因此 wheel 生成不代表所有 optional 组件可用。
+`python setup.py bdist_wheel` 不触发 native 编译；无显式 payload 时仅组装 Python 源码。
+启用 Multicore 后，必须在启动 Python 前激活其 CANN custom OPP。
 
-multicore 多 SoC 构建会针对每个目标分别生成 HyperMegaMoe vendor，并将各 SoC 的 kernel/config 合入同一个
-软件包。合并前会校验 vendor 构建输入和 host ABI 的一致性，软件包仅携带一份公共 host 制品。
+## 3. 激活 Multicore CANN custom OPP
 
-> 注意事项：构建出的 whl 对运行环境的 glibc 版本有要求，安装环境的 glibc 需不低于编译环境的 glibc 版本。
-> 如需部署到 glibc 较低的系统，请在满足目标 glibc 基线的发布镜像内编译；例如在 OpenEuler 22.03
->（glibc 2.34）编出的 whl 无法在 glibc < 2.34 的环境运行。
-> 正式发布构建使用版本指定的 glibc 基线。产物所需的最低运行时 glibc 由最终 ELF 依赖决定。
-
-native 源码构建和正式预编译 wheel 均要求 CANN 9.1.0 或更高版本。构建前 source 所选 CANN 的
-`set_env.sh`，构建脚本读取其导出的 `ASCEND_HOME_PATH`；默认 CANN 路径由 `build.sh` 自动激活。
-
-## 3. 使用 multicore 前激活自定义算子环境
-
-wheel 和 PYTHONPATH 开发态都必须在启动业务或框架 Python 进程前 source multicore 制品自带的
-`set_env.bash`，为调用 shell 激活相邻的 CANN custom OPP vendor。
-
-PYTHONPATH 开发态：
+源码或 editable 开发使用统一构建生成的 payload：
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
-export PYTHONPATH=/path/to/hyper-parallel:${PYTHONPATH:-}
-source /path/to/hyper-parallel/build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
-python application.py
+source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+python your_program.py
 ```
 
-wheel 安装态：
+wheel 安装后，使用安装到当前 Python 环境的定位脚本：
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
 source "$(command -v hyper_parallel_multicore_set_env.bash)"
-python application.py
+python your_program.py
 ```
 
-wheel 安装完成后，从活动 Python 环境的 `bin` 目录 source 定位脚本，再启动业务或框架 Python 进程。
-
-脚本必须早于 `import mindspore` 或 `import torch/torch_npu` 执行。未激活时报
-`HP-NATIVE-OPP-NOT-ACTIVATED`；框架已经导入后才发现未激活时，报
-`HP-NATIVE-OPP-ACTIVATION-TOO-LATE`，需要退出该 Python 进程、source 脚本后重新运行。
+激活脚本必须在启动业务 Python 进程前执行。脚本设置已交付 Multicore vendor 所需的
+`ASCEND_CUSTOM_OPP_PATH` 和动态库路径。wheel 安装态不依赖源码仓中的 `build/` 目录；源码或 editable
+开发态则从同一 checkout 的 `build/native/payload` 加载构建产物。
 
 ## 4. 验证安装
 

@@ -46,6 +46,10 @@ Use these rules as the default coding style and convention set for HyperParallel
 
 - **Default (most of the repo):** Put runtime `import` / `from … import` at **module top** (after the license header and any module docstring). Do **not** put imports inside functions, methods, or nested class bodies except the narrow exceptions under “Other exceptions” below. Applies to e.g. `core/`, `collectives/`, `tests/`, and **platform-agnostic** files such as `platform/platform.py`.
 - **Platform backend implementations** (`hyper_parallel/platform/torch/**`, `hyper_parallel/platform/mindspore/**`): Use **lazy imports inside methods** (lazy import / lazy init) for `torch`, `mindspore`, and their submodules as needed. This avoids pulling in the wrong framework at module import time, reduces import-order/cycle issues, and keeps the other backend unloadable when not in use. Add `# pylint: disable=C0415` on those lines.
+- **Torch-only Multicore** (`hyper_parallel/core/multicore/**`): use direct module-level Torch imports.
+  The component root may export its business APIs; the HyperParallel root must not export them.
+  Do not implement lazy framework dispatch. Native-library
+  initialization may still be deferred until an operation needs the activated payload.
 - **Other exceptions** (outside platform backends; each should include a brief comment explaining why):
   - Import-time circular dependency that cannot be fixed by restructuring.
   - Optional dependencies that may be missing at runtime.

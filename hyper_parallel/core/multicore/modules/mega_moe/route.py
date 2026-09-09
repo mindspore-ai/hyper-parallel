@@ -17,15 +17,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib import import_module
 from typing import Any
+
+import torch
+import torch.distributed as dist
 
 import torch_npu
 
 from .spec import MegaMoeSpec
 
-torch = import_module("torch")
-dist = import_module("torch.distributed")
 
 
 @dataclass(frozen=True)

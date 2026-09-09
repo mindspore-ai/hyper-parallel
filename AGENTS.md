@@ -37,6 +37,8 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 
 - **Editable must track this tree.** If `pip show hyper_parallel` shows another path (e.g. a deleted `.worktrees/...`), re-run `pip install -e .` from repo root. Do not rely on `PYTHONPATH` alone.
 - **Never** `import torch` / `import mindspore` in platform-agnostic `core/` code — use `get_platform()`.
+- **Multicore exception:** `core/multicore/` is an explicit Torch-only component. Use direct, module-level
+  Torch imports there; do not add Platform dispatch or MindSpore implementations.
 - **Never** invent Jenkins build numbers or force-push shared branches in agent workflows.
 - Hard distributed rules (canonical): `.agent/rules/project-overview.md` + `.agent/rules/distributed.md` — do not restate long-form elsewhere; link instead.
 
@@ -54,6 +56,7 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 | **Pipeline** | `core/pipeline_parallel/`, `platform/*/pipeline_parallel/` | Stage schedule, micro-batch, P2P |
 | **Activation** | `core/activation_checkpoint/`, `platform/torch/activation_checkpoint/` | SAC + activation swap |
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
+| **Multicore** | `core/multicore/` | Torch-only component with private SHMEM and native build |
 | **Collectives** | `collectives/cc.py` | Process groups |
 | **Tests** | `tests/ut/`, `tests/torch/`, `tests/mindspore/` | UT + distributed ST |
 

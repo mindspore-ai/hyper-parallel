@@ -17,10 +17,11 @@
 from __future__ import annotations
 
 import math
-from importlib import import_module
 from typing import Any
 
-from hyper_parallel.platform.torch.symmetric_memory import acquire_symmetric_memory
+import torch
+
+from hyper_parallel.core.multicore.shmem.lifecycle import acquire_symmetric_memory
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe
@@ -29,7 +30,6 @@ from .route import prepare_topk_route, restore_topk_output
 from .spec import _COMMUNICATION_SPLIT, bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace, configure_symmetric_heap
 
-torch = import_module("torch")
 
 __all__ = ["MegaMoeExperts"]
 

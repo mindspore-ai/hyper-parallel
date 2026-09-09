@@ -17,11 +17,9 @@
 from __future__ import annotations
 
 import ctypes
-import importlib.util
 import os
 from pathlib import Path
 import sys
-from types import ModuleType
 
 _VENDOR_NAME = "hyper_parallel_multicore_nn"
 
@@ -38,7 +36,7 @@ def require_multicore_environment() -> Path:
         raise NativeComponentUnavailableError(
             f"[HP-NATIVE-PAYLOAD-MISSING] component=multicore vendor={vendor_root}. "
             "Inspect the current build log; for source/PYTHONPATH development, run "
-            "./build.sh --multicore all."
+            "./build.sh --multicore on."
         )
     vendor_root = vendor_root.resolve()
     op_api_root = (vendor_root / "op_api" / "lib").resolve()
@@ -50,10 +48,10 @@ def require_multicore_environment() -> Path:
     if missing_variables:
         set_env_script = component_root / "set_env.bash"
         missing_text = ",".join(missing_variables)
-        if any(module in sys.modules for module in ("mindspore", "torch", "torch_npu")):
+        if any(module in sys.modules for module in ("torch", "torch_npu")):
             raise NativeComponentUnavailableError(
                 "[HP-NATIVE-OPP-ACTIVATION-TOO-LATE] component=multicore "
-                f"missing={missing_text}. MindSpore/Torch/torch_npu has already been imported; "
+                f"missing={missing_text}. Torch/torch_npu has already been imported; "
                 f"exit the current Python process, run source {set_env_script}, and start a new process."
             )
         raise NativeComponentUnavailableError(
@@ -63,25 +61,18 @@ def require_multicore_environment() -> Path:
     return vendor_root.resolve()
 
 
-def get_multicore_paths(framework: str) -> tuple[Path, Path]:
-    """Return the unified vendor root and selected framework adapter."""
-    if framework not in {"mindspore", "torch"}:
-        raise ValueError(f"Unsupported multicore framework: {framework!r}.")
+def get_multicore_paths() -> tuple[Path, Path]:
+    """Return the unified vendor root and Torch adapter."""
     vendor_root = require_multicore_environment()
-    framework_root = _component_root() / "framework" / framework
-    candidates = (
-        [framework_root / "hyper_parallel_mega_moe_ms.so"]
-        if framework == "mindspore"
-        else [framework_root / "libhyper_parallel_mega_moe_torch.so"]
-    )
+    adapter = _component_root() / "framework" / "torch" / "libhyper_parallel_mega_moe_torch.so"
     vendor_library = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
-    if not vendor_library.is_file() or len(candidates) != 1 or not candidates[0].is_file():
+    if not vendor_library.is_file() or not adapter.is_file():
         raise NativeComponentUnavailableError(
-            f"[HP-NATIVE-FRAMEWORK-TARGET-UNAVAILABLE] component=multicore framework={framework} "
+            "[HP-NATIVE-FRAMEWORK-TARGET-UNAVAILABLE] component=multicore framework=torch "
             f"root={_component_root()}. The current wheel/PYTHONPATH payload does not include an adapter for this "
-            "framework; rebuild with the corresponding --multicore target and inspect the build log."
+            "framework; rebuild with --multicore on and inspect the build log."
         )
-    return vendor_root, candidates[0].resolve()
+    return vendor_root, adapter.resolve()
 
 
 def preload_vendor_library(vendor_root: Path) -> None:
@@ -93,34 +84,6 @@ def preload_vendor_library(vendor_root: Path) -> None:
         raise NativeComponentUnavailableError(
             f"[HP-NATIVE-VENDOR-LOAD-FAILED] library={library_path} error={error}."
         ) from error
-
-
-def load_cpython_extension(module_name: str, adapter_path: Path) -> ModuleType:
-    """Load one ABI-specific CPython extension from the component payload."""
-    existing = sys.modules.get(module_name)
-    if existing is not None:
-        return existing
-    spec = importlib.util.spec_from_file_location(module_name, adapter_path)
-    if spec is None or spec.loader is None:
-        raise NativeComponentUnavailableError(f"Cannot create a module spec for {adapter_path}.")
-    module = None
-    try:
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-    except (ImportError, OSError, RuntimeError) as error:
-        if module is not None and sys.modules.get(module_name) is module:
-            sys.modules.pop(module_name, None)
-        raise NativeComponentUnavailableError(
-            "[HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore "
-            f"module={module_name} library={adapter_path} error={error}. "
-            "Check the Python/framework/CANN version combination and rebuild the matching adapter."
-        ) from error
-    except Exception:
-        if module is not None and sys.modules.get(module_name) is module:
-            sys.modules.pop(module_name, None)
-        raise
-    return module
 
 
 def _component_root() -> Path:

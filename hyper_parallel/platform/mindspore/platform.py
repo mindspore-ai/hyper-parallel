@@ -1783,20 +1783,6 @@ class MindSporePlatform(Platform):
     def load_checkpoint(file_path: str, ckpt_format: str = "safetensors") -> dict:
         return ms.load_checkpoint(ckpt_file_name=file_path, format=ckpt_format)
 
-    @staticmethod
-    def get_symmetric_memory_handler():
-        # pylint: disable=C0415
-        from hyper_parallel.platform.mindspore.symmetric_memory import MSSymmetricMemoryHandler
-        symmetric_memory = MSSymmetricMemoryHandler()
-        return symmetric_memory
-
-    @staticmethod
-    def get_multicore_handler():
-        """Create and return a MindSpore multicore handler instance."""
-        # pylint: disable=C0415
-        from hyper_parallel.platform.mindspore.multicore import MSMulticoreHandler
-        return MSMulticoreHandler()
-
     def new_stream(self):
         return ms.runtime.Stream()
 
