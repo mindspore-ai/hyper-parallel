@@ -26,10 +26,12 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from hyper_parallel.data.batching.build_dataloader import build_dataloader
+from hyper_parallel.data.batching.build_collate_fn import build_indexed_collate_fn
 from hyper_parallel.data.batching.get_batch import ParallelBatch
 from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
 from hyper_parallel.data.indexed.io import IndexedDatasetBuilder
 from hyper_parallel.data.text.build_dataset import build_indexed_text_dataset
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 
@@ -168,6 +170,52 @@ def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
         loaders[0].wait_for_prefetch()
 
 
+def _run_native_sampler(prefix: str, mesh_context: object) -> None:
+    """Exercise the Trainer opt-in on native GPT samples, including cross-record slices."""
+    config = {
+        "seq_length": 4, "split": "1, 0, 0", "mock_data": False,
+        "is_dataset_from_mr": False, "simple_blend": "no",
+        "data_lazy_load": False, "distributed_walk": False,
+        "packing_stage": "dataset", "load_balance": "native_batch_sampler",
+        "create_ltor_fields_in_dataloader": True,
+        "reset_position_ids": True, "reset_attention_mask": True, "eod_mask_loss": True,
+        "distributed_dataloader": {"double_buffer": True},
+    }
+    datasets = build_indexed_text_dataset(
+        data_path=prefix, data_config=config, tokenizer=_Tokenizer(),
+        train_valid_test_num_samples=(8, 0, 0), mesh_context=mesh_context,
+    )
+    collate_fn = build_indexed_collate_fn()
+    loaders, _ = build_dataloader(
+        SimpleNamespace(dataloader_type="cyclic"), datasets=datasets, collate_fn=collate_fn,
+        mesh_context=mesh_context,
+        training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=8, seed=7), data_config=config,
+    )
+    loader = loaders[0]
+    sampler = build_dataset_batch_sampler(
+        total_samples=len(datasets[0]), micro_batch_size=2, global_batch_size=8,
+        dp_world_size=2, dp_rank=mesh_context.dp_rank, sampler_type="cyclic", seed=7,
+    )
+    for indices in sampler:
+        batch = next(loader)
+        plans = _all_gather_object(loader.last_plan)
+        expected_ids = _all_gather_object(indices)
+        actual_ids = sorted(key.dataset_index for key in plans[0].selected_keys)
+        expected = sorted(expected_ids[0] + expected_ids[2])
+        assert actual_ids == expected, f"Native GPT membership differs: actual={actual_ids}, expected={expected}"
+        constructor = plans[0].constructor_for(mesh_context.dp_rank)
+        reference = collate_fn([datasets[0][key.dataset_index] for key in constructor.sample_keys])
+        for field, expected_value in reference.items():
+            torch.testing.assert_close(batch[field], expected_value, rtol=0, atol=0)
+    exhausted = False
+    try:
+        next(loader)
+    except StopIteration:
+        exhausted = True
+    assert exhausted, f"Expected native sampler exhaustion, got exhausted={exhausted}"
+    loader.wait_for_prefetch()
+
+
 def test_indexed_text_dp2_tp2_gloo() -> None:
     """Run the full provider/loader/ParallelBatch path with real binary and index files."""
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
@@ -189,6 +237,7 @@ def test_indexed_text_dp2_tp2_gloo() -> None:
             dist.broadcast_object_list(prefixes, src=0)
             for double_buffer in (False, True):
                 _run_epoch(prefixes[0], mesh_context, double_buffer)
+            _run_native_sampler(prefixes[0], mesh_context)
             dist.barrier()
     finally:
         dist.destroy_process_group()
