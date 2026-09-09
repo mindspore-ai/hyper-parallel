@@ -24,13 +24,13 @@ from pathlib import Path
 import pytest
 
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import TorchCase, parallel_run
+from tests.common.port_utils import allocate_port
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
     without_inherited_rank_environment,
 )
-from tests.common.parallel_case import TorchCase, parallel_run
-from tests.common.port_utils import allocate_port
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_mega_moe.py")
 _PRECISION_WORLD_SIZE = 2
