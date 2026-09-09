@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.core.multicore.shmem.lifecycle import acquire_symmetric_memory
+from hyper_parallel.core.multicore import shmem
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe
@@ -53,7 +53,7 @@ def _create_mega_moe_parameters(
 
 
 class _MegaMoeExecutionResources:
-    """Own one shape-bound plan, SHMEM handle, and workspace."""
+    """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
     def __init__(
         self,
@@ -66,27 +66,22 @@ class _MegaMoeExecutionResources:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
         configure_symmetric_heap(active_specifications, tensor)
-        self.symmetric_memory = acquire_symmetric_memory(self.spec.ep_group)
+        shmem.acquire(self.spec.ep_group)
         try:
             self.plan = build_mega_moe_plan(self.spec, tensor.device)
-            self.workspace = MegaMoeWorkspace(
-                symmetric_memory=self.symmetric_memory,
-                shared=shared,
-            )
+            self.workspace = MegaMoeWorkspace(shared=shared)
         except Exception:
-            self.symmetric_memory.close()
+            shmem.release()
             raise
         self._closed = False
 
     def close(self) -> None:
-        """Release the workspace and last-owned SHMEM lifecycle."""
+        """Release the workspace and leave the shared SHMEM lifecycle."""
         if self._closed:
             return
+        self.workspace.close()
+        shmem.release()
         self._closed = True
-        try:
-            self.workspace.close()
-        finally:
-            self.symmetric_memory.close()
 
 
 class MegaMoeExperts(MulticoreModule):

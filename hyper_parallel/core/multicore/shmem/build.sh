@@ -27,7 +27,7 @@ Usage:
 Options:
   --soc-list VALUE    Comma-separated CANN SoC IDs. Default: ascend910b,ascend910_93.
   --jobs VALUE        Parallel build jobs. Default: nproc.
-  --clean             Remove symmetric-memory work and install outputs before building.
+  --clean             Remove SHMEM work and install outputs before building.
   -h, --help          Show this help message.
 EOF
 }
@@ -101,13 +101,13 @@ if ! [[ "${NATIVE_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 
-CURRENT_REASON_CODE="SYMMETRIC_MEMORY_BUILD_FAILED"
+CURRENT_REASON_CODE="SHMEM_BUILD_FAILED"
 PYTHON_BIN=python
 function report_unhandled_error() {
     local exit_code=$?
     trap - ERR
     echo "HP_NATIVE_REASON_CODE=${CURRENT_REASON_CODE}"
-    echo "ERROR: symmetric memory build failed unexpectedly with exit ${exit_code}." >&2
+    echo "ERROR: SHMEM build failed unexpectedly with exit ${exit_code}." >&2
     exit "${exit_code}"
 }
 trap report_unhandled_error ERR
@@ -127,7 +127,7 @@ PYTHON_BIN=$(command -v "${PYTHON_BIN}")
 for required_tool in cmake find gcc g++ grep make readelf readlink sed; do
     if ! command -v "${required_tool}" >/dev/null 2>&1; then
         fail "BUILD_TOOL_NOT_FOUND" \
-            "Required symmetric-memory build tool not found on PATH: ${required_tool}." 4
+            "Required SHMEM build tool not found on PATH: ${required_tool}." 4
     fi
 done
 PYTHON_CACHE_TAG=$("${PYTHON_BIN}" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
@@ -153,20 +153,7 @@ SHMEM_SOURCE_DIR="${SHMEM_INSTALL_ROOT}/shmem"
 export SHMEM_HOME_PATH="${SHMEM_INSTALL_ROOT}"
 export SHMEM_SOURCE_DIR
 
-OPS_BUILD_DIR="${SHMEM_WORK_ROOT}/ops"
 OPS_INSTALL_DIR="${COMPONENT_ROOT}/core/multicore/shmem"
-CURRENT_REASON_CODE="SYMMETRIC_MEMORY_OPS_BUILD_FAILED"
-cmake -S "${PROJECT_ROOT}/hyper_parallel/core/multicore/shmem/ops" \
-    -B "${OPS_BUILD_DIR}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="${OPS_INSTALL_DIR}"
-cmake --build "${OPS_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
-cmake --install "${OPS_BUILD_DIR}"
-SYMMETRIC_MEMORY_KERNEL_LIB="${OPS_INSTALL_DIR}/lib/libaclshmem_symmetric_memory_kernel.so"
-if [[ ! -s "${SYMMETRIC_MEMORY_KERNEL_LIB}" ]]; then
-    fail "EXPECTED_ARTIFACT_MISSING" \
-        "Symmetric-memory kernel library was not installed: ${SYMMETRIC_MEMORY_KERNEL_LIB}." 9
-fi
 
 TORCH_CACHE_KEY=$("${PYTHON_BIN}" -c '
 import hashlib
@@ -182,19 +169,39 @@ identity = f"{torch_version}|{torch_origin}|{npu_version}|{npu_origin}"
 print(hashlib.sha256(identity.encode()).hexdigest()[:16])
 ')
 require_cache_key "Torch" "${TORCH_CACHE_KEY}"
-TORCH_BUILD_DIR="${FRAMEWORK_WORK_ROOT}/torch-${TORCH_CACHE_KEY}"
 TORCH_INSTALL_DIR="${COMPONENT_ROOT}/core/multicore/shmem/lib/framework/torch"
-rm -rf "${TORCH_BUILD_DIR}" "${TORCH_INSTALL_DIR}"
-CURRENT_REASON_CODE="TORCH_SYMMETRIC_MEMORY_BUILD_FAILED"
-cmake -S "${PROJECT_ROOT}/hyper_parallel/core/multicore/shmem/torch" \
-    -B "${TORCH_BUILD_DIR}" \
+rm -rf "${TORCH_INSTALL_DIR}"
+
+# Build the SHMEM ops kernel library, then the HP SHMEM Runtime with its Torch bindings.
+CCSRC_OPS_BUILD_DIR="${SHMEM_WORK_ROOT}/ccsrc-ops"
+CURRENT_REASON_CODE="SHMEM_OPS_BUILD_FAILED"
+cmake -S "${PROJECT_ROOT}/hyper_parallel/core/multicore/shmem/ccsrc/ops" \
+    -B "${CCSRC_OPS_BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="${OPS_INSTALL_DIR}"
+cmake --build "${CCSRC_OPS_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
+cmake --install "${CCSRC_OPS_BUILD_DIR}"
+SHMEM_OPS_LIB="${OPS_INSTALL_DIR}/lib/libhyper_parallel_shmem_ops.so"
+if [[ ! -s "${SHMEM_OPS_LIB}" ]]; then
+    fail "EXPECTED_ARTIFACT_MISSING" \
+        "SHMEM ops kernel library was not installed: ${SHMEM_OPS_LIB}." 9
+fi
+
+CCSRC_TORCH_BUILD_DIR="${FRAMEWORK_WORK_ROOT}/ccsrc-torch-${TORCH_CACHE_KEY}"
+CURRENT_REASON_CODE="CCSRC_TORCH_BINDING_BUILD_FAILED"
+cmake -S "${PROJECT_ROOT}/hyper_parallel/core/multicore/shmem/ccsrc" \
+    -B "${CCSRC_TORCH_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${TORCH_INSTALL_DIR}" \
-    -DACLSHMEM_SYMMETRIC_MEMORY_KERNEL_LIB="${SYMMETRIC_MEMORY_KERNEL_LIB}" \
-    -DPython3_EXECUTABLE="${PYTHON_BIN}" \
-    -DBUILD_TORCH_LIB=True
-cmake --build "${TORCH_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
-cmake --install "${TORCH_BUILD_DIR}"
+    -DSHMEM_OPS_LIB="${SHMEM_OPS_LIB}" \
+    -DPython3_EXECUTABLE="${PYTHON_BIN}"
+cmake --build "${CCSRC_TORCH_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
+cmake --install "${CCSRC_TORCH_BUILD_DIR}"
+CCSRC_TORCH_MODULE="${TORCH_INSTALL_DIR}/hyper_parallel_shmem_torch.so"
+if [[ ! -s "${CCSRC_TORCH_MODULE}" ]]; then
+    fail "EXPECTED_ARTIFACT_MISSING" \
+        "SHMEM Torch binding module was not installed: ${CCSRC_TORCH_MODULE}." 9
+fi
 
 CURRENT_REASON_CODE="SHMEM_ELF_VALIDATION_FAILED"
 for private_library in \
@@ -235,6 +242,6 @@ trap - ERR
 "${PYTHON_BIN}" -c 'import json,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps({
     "install_root": sys.argv[2], "toolchain_key": sys.argv[3]}))' \
     "${WORK_ROOT}/sdk.json" "${HP_SHMEM_INSTALL_ROOT}" "${HP_SHMEM_TOOLCHAIN_KEY}"
-echo "INFO: symmetric memory build completed"
+echo "INFO: SHMEM build completed"
 echo "  framework: torch"
 echo "  component: ${COMPONENT_ROOT}"

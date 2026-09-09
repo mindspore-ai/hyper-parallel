@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Real-device acceptance of serial shared workspaces and mixed SHMEM owners."""
+"""Real-device acceptance of serial shared MegaMoe workspaces."""
 
 from dataclasses import asdict
 
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.core.multicore.shmem import lifecycle
-from hyper_parallel.core.multicore.shmem.lifecycle import acquire_symmetric_memory
+from hyper_parallel.core.multicore import MegaMoeExperts, shmem
 from tests.torch.multicore import _test_mega_moe as baseline
 from tests.torch.multicore._mega_moe_utils import (
     assert_stable_memory,
@@ -125,13 +123,8 @@ def _shared_stack_comparison(alternate_streams: bool) -> dict:
                     baseline.assert_close("updated expert parameter", observed, expected)
             if step >= 3:
                 sample = collect_memory()
-                # Count tracked allocations to detect leaks inside the native heap.
-                sample["shmem_allocations"] = sum(
-                    len(
-                        layer._resource_group.resources.symmetric_memory._allocations  # pylint: disable=W0212
-                    )
-                    for layer in independent + shared[:1]
-                )
+                # Count live Runtime allocations to detect leaks inside the symmetric heap.
+                sample["shmem_allocations"] = shmem.debug_state()["allocated_count"]
                 samples.append(sample)
         assert_stable_memory(samples)
         assert len({sample["shmem_allocations"] for sample in samples}) == 1, (
@@ -161,66 +154,10 @@ def _shared_stack_comparison(alternate_streams: bool) -> dict:
             layer.close()
 
 
-def _assert_invalidated(tensors: list[torch.Tensor]) -> None:
-    """Inspect storage metadata without touching freed device data."""
-    for tensor in tensors:
-        size = tensor.untyped_storage().nbytes()
-        assert size == 0, f"rank={baseline.RANK}: closed SHMEM allocation retained {size} bytes."
-
-
-def _mixed_owner_close_order(internal_first: bool) -> dict:
-    """Exercise real private allocations and a live managed backward together."""
-    start_shmem_lifetime()
-    shape = baseline.MoeShape()
-    layer = _new_stack(shape, layers=1)[0]
-    hidden, upstream = baseline.make_data(shape)
-    hidden.requires_grad_(True)
-    topk_ids, weights, counts = baseline.make_balanced_route(shape)
-    output = layer(hidden, topk_ids, weights, tokens_per_expert=counts)
-    # Retain the actual workspace tensors to verify their storage is invalidated on close.
-    resources = layer._resource_group.resources  # pylint: disable=protected-access
-    workspace_tensors = [resources.workspace.expert_buffer, resources.workspace.routed_buffer]
-    internal_owner = acquire_symmetric_memory()
-    internal_tensor = internal_owner.empty((256,), torch.int32)
-    internal_tensor.fill_(baseline.RANK + 1)
-    internal_owner.barrier()
-    # Reference counts and manager identity verify that only the last owner finalizes.
-    state = lifecycle._PROCESS_STATE  # pylint: disable=protected-access
-    manager = state.manager
-    assert state.clients == 2, f"rank={baseline.RANK}: expected two owners, got {state.clients}."
-    try:
-        if internal_first:
-            internal_owner.close()
-            _assert_invalidated([internal_tensor])
-            assert state.manager is manager and state.clients == 1, (
-                f"rank={baseline.RANK}: internal close finalized the managed owner."
-            )
-        output.backward(upstream)
-        torch.npu.synchronize()
-        baseline.assert_finite("mixed-owner input gradient", hidden.grad)
-        layer.close()
-        _assert_invalidated(workspace_tensors)
-        if not internal_first:
-            assert state.manager is manager and state.clients == 1, (
-                f"rank={baseline.RANK}: managed close finalized the internal owner."
-            )
-            internal_tensor.add_(1)
-            internal_owner.barrier()
-            expected = torch.full_like(internal_tensor, baseline.RANK + 2)
-            baseline.assert_close("surviving internal allocation", internal_tensor, expected)
-            internal_owner.close()
-            _assert_invalidated([internal_tensor])
-        assert not state.initialized and state.clients == 0, (
-            f"rank={baseline.RANK}: last owner did not finalize: clients={state.clients}."
-        )
-        return {"internal_first": internal_first, "survivor_usable": True, "last_close_invalidated": True}
-    finally:
-        layer.close()
-        internal_owner.close()
-
-
 def test_mega_moe_shared_resource_acceptance() -> None:
-    """Accept serial sharing and private/managed ownership with real NPU kernels."""
+    """Accept serial sharing and independent resources with real NPU kernels.
+
+    Both Stream scenarios run sequentially in one process.
+    """
     results = [_shared_stack_comparison(alternate) for alternate in (False, True)]
-    close_orders = [_mixed_owner_close_order(order) for order in (True, False)]
-    write_evidence({"sharing": results, "close_orders": close_orders, "checkpoint_tested": False})
+    write_evidence({"sharing": results, "checkpoint_tested": False})

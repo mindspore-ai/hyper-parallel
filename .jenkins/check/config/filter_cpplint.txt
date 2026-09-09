@@ -1,15 +1,17 @@
-# Hyper-Parallel private Multicore SHMEM rules (preserved across relocation)
-
-"hyper-parallel/hyper_parallel/core/multicore/shmem/ops"                               "build/namespaces"
-"hyper-parallel/hyper_parallel/core/multicore/shmem/ops"                               "build/include_subdir"
-"hyper-parallel/hyper_parallel/core/multicore/shmem/torch/torch_bindings.cpp"           "build/include_subdir"
-
 # Hyper-Parallel multicore Rules
 
 "hyper-parallel/hyper_parallel/core/multicore/ops"                                      "build/include_subdir"
 "hyper-parallel/hyper_parallel/core/multicore/ops"                                      "build/include"
 "hyper-parallel/hyper_parallel/core/multicore/ops/hyper_mega_moe/op_kernel"              "build/namespaces"
 "hyper-parallel/hyper_parallel/core/multicore/ops/hyper_mega_moe_grad/op_kernel"         "build/namespaces"
+
+# Hyper-Parallel multicore SHMEM Rules
+
+"hyper-parallel/hyper_parallel/core/multicore/shmem/ccsrc/ops"                          "build/namespaces"
+"hyper-parallel/hyper_parallel/core/multicore/shmem/ccsrc/ops"                          "build/include_subdir"
+"hyper-parallel/hyper_parallel/core/multicore/shmem/ccsrc/ops"                          "build/include"
+"hyper-parallel/hyper_parallel/core/multicore/shmem/ccsrc/bindings"                     "build/include_subdir"
+"hyper-parallel/hyper_parallel/core/multicore/shmem/ccsrc/bindings"                     "build/include"
 
 # Hyper-Parallel mindspore custom_ops Rules
 

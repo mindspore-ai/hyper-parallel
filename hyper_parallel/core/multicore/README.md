@@ -44,7 +44,7 @@ Torch adapter 是通过 `torch.ops.load_library()` 加载的普通共享库。
 
 Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家，当前支持 Ascend NPU 上的 Torch BF16 训练。
 先按[构建与交付](docs/build.md)选择 `--multicore on`，激活 CANN 和 native payload，
-并为所有 EP rank 配置相同的 `SHMEM_IP_PORT`。
+并为所有 EP rank 配置相同的 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`（如 `tcp://<rank-zero-ip>:<port>`）。
 
 在业务进程中选定当前 NPU、初始化 HCCL 进程组后，以下为两卡 EP 示例：
 
@@ -110,9 +110,14 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 checkpoint/recompute 和 `retain_graph=True` 暂未验证。所有 backward 完成后，各 rank 按相同顺序调用
 每层的幂等 `close()`，并在销毁进程组前完成关闭。
 
-Multicore 内部的多个 SHMEM owner 共用进程级 runtime，分别通过各自的 `close()` 关闭；
-最后一个 owner 关闭才 finalize。
-重新开启生命周期时，所有 rank 完成关闭后使用新的 `SHMEM_IP_PORT`。
+SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个MegaMoe执行资源组建立时配对调用一次
+内部`shmem.acquire()`，关闭时在workspace释放全部对称Tensor后调用一次`shmem.release()`；
+`share_execution_resources`的相同配置层共享同一组及workspace，因此只形成一个SHMEM引用。非最后一个
+`release()`只减少本地计数，进程内最后一个引用才执行跨rank关闭（仅丢弃模块对象不会触发释放）。未来
+MegaMHC、MegaDSA等Multicore特性复用同一SHMEM Runtime时，也通过同一配对接口共享这套进程级计数，
+不在各消费者内重复实现生命周期协调。
+重新开启生命周期时，所有 rank 完成关闭后使用新的 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`，
+`HYPER_PARALLEL_SHMEM_HEAP_SIZE` 等堆配置在下一生命周期首次获取引用时重新生效。
 
 完整 Qwen 接入及启动方式见 [MegaMoe 示例](examples/mega_moe/README.md)。
 

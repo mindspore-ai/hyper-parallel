@@ -16,13 +16,13 @@
 """Verify component exports and absence of framework dispatch."""
 
 import ast
+import sys
 from pathlib import Path
 import unittest
 
 import hyper_parallel
 from hyper_parallel.core import multicore
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
-from hyper_parallel.core.multicore.shmem import _bindings
 from hyper_parallel.platform.platform import Platform
 from tests.common.mark_utils import arg_mark
 
@@ -46,7 +46,7 @@ class TestMulticoreBoundary(unittest.TestCase):
             self.assertNotIn(name, hyper_parallel.__all__)
             self.assertFalse(hasattr(hyper_parallel, name))
         self.assertFalse(hasattr(multicore, "__getattr__"))
-        self.assertIsNone(_bindings._manager)
+        self.assertNotIn("hyper_parallel_shmem_torch", sys.modules)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
