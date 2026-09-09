@@ -92,12 +92,14 @@ activation_swap: none
 
 compile:
   enabled: false
+  graphtrainer_enabled: false
   mode: default
   fullgraph: false
   dynamic: false
   backend: null
   options: {}
   dynamo_cache_size_limit: 256
+
 
 dataset:
   model_assets:

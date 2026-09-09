@@ -14,6 +14,7 @@
 # ============================================================================
 """Language-model training entry point for the AutoModel workflow."""
 
+from hyper_parallel.compile import GraphTextTrainer
 from hyper_parallel.trainer.config.manager import parse_training_args
 from hyper_parallel.trainer.config import TrainerConfig
 from hyper_parallel.trainer.text_trainer import TextTrainer
@@ -22,7 +23,10 @@ from hyper_parallel.trainer.text_trainer import TextTrainer
 def main() -> None:
     """Resolve configured components and execute language-model training."""
     config: TrainerConfig = parse_training_args()
-    trainer = TextTrainer(config)
+    if config.compile.selects_graph_trainer():
+        trainer = GraphTextTrainer(config)
+    else:
+        trainer = TextTrainer(config)
     trainer.train()
 
 

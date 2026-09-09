@@ -84,7 +84,11 @@ class TrainerConfig:
 
     def __post_init__(self) -> None:
         """Validate combinations that span multiple config sections."""
-        if self.compile.enabled and self.accelerator.pp_size > 1:
+        if (
+            self.compile.enabled
+            and not self.compile.selects_graph_trainer()
+            and self.accelerator.pp_size > 1
+        ):
             raise ValueError("compile is not supported together with pipeline parallelism")
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":

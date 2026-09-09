@@ -85,6 +85,7 @@ def get_device_id() -> int:
 # whose module chain (via ``checkpoint``) reaches modules that import the
 # device primitives from here; keeping the primitives defined first makes
 # that circular edge resolve against already-defined names.
+# pylint: disable=C0413
 from hyper_parallel.components.quantization.config import (  # noqa: E402
     LowPrecisionConfig,
 )
@@ -95,6 +96,7 @@ class CompileConfig:
     """Decoder-layer ``torch.compile`` options exposed by the Trainer."""
 
     enabled: bool = False
+    graphtrainer_enabled: bool = False
     mode: str = "default"
     fullgraph: bool = False
     dynamic: bool = False
@@ -102,9 +104,13 @@ class CompileConfig:
     options: Optional[dict[str, Any]] = None
     dynamo_cache_size_limit: int = 256
 
+    def selects_graph_trainer(self) -> bool:
+        """Return whether this config selects the graph-mode trainer path."""
+        return self.enabled and self.graphtrainer_enabled
+
     def __post_init__(self) -> None:
         """Validate values that the YAML resolver cannot express precisely."""
-        for name in ("enabled", "fullgraph", "dynamic"):
+        for name in ("enabled", "graphtrainer_enabled", "fullgraph", "dynamic"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -115,7 +121,7 @@ class CompileConfig:
             raise ValueError("compile.backend must be None or a non-empty string")
         if self.options is not None and not isinstance(self.options, dict):
             raise TypeError("compile.options must be a mapping or None")
-        if self.options and self.mode != "default":
+        if self.options and self.mode != "default" and not self.selects_graph_trainer():
             raise ValueError(
                 "compile.options cannot be combined with a non-default compile.mode"
             )

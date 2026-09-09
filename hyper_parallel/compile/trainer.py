@@ -29,7 +29,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.distributed_c10d import _register_process_group
 
-from .pass_config import PassConfig
+from .pass_config import PassConfig, build_pass_config_from_trainer_config
 from .passes.pipeline import PassPipeline
 from .pass_plan import PassPlan
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
@@ -49,19 +49,27 @@ class GraphTrainer:
         self,
         model: torch.nn.Module,
         train_fn: Callable,
-        pass_config: PassConfig,
+        pass_config: Optional[PassConfig] = None,
         pass_plan: Optional[PassPlan] = None,
+        trainer_config: Optional[Any] = None,
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
+        manage_optimizer: bool = True,
     ) -> None:
         """
         Args:
             model: Model to train
             train_fn: Training function signature: (model, input, label) -> loss
-            pass_config: Parallel configuration
+            pass_config: Parallel configuration. When omitted, GraphTrainer
+                uses ``trainer_config`` to project topology intent onto a
+                graph-mode ``PassConfig``; if ``trainer_config`` is also
+                omitted, it falls back to ``PassConfig()``.
             pass_plan: PassPlan declaring which modules to shard (optional;
                 enables declarative sharding)
+            trainer_config: Optional eager trainer config used only to infer a
+                default graph-mode ``PassConfig`` when ``pass_config`` is not
+                provided.
             optimizer_config: Optimizer configuration
             device: Device to place the model and run training on. Defaults to
                 the NPU device when available, otherwise CPU.
@@ -71,26 +79,47 @@ class GraphTrainer:
                 only the FSDP shard sub-mesh is registered under ``"fsdp"``.
                 Use this to feed an automodel TP-sharded model into the
                 graph-mode FSDP pass.
+            manage_optimizer: Whether this graph trainer owns optimizer
+                initialization and stepping. Set ``False`` when embedding the
+                graph executor under the eager trainer runtime, which already
+                builds and steps the optimizer on the live model.
         """
         self.model = model
         self.train_fn = train_fn
-        self.pass_config = pass_config
+        self.pass_config = self._resolve_pass_config(
+            pass_config=pass_config,
+            trainer_config=trainer_config,
+        )
         self.pass_plan = pass_plan
         self.optimizer_config = optimizer_config or {}
         self._mesh_context = mesh_context
+        self._manage_optimizer = manage_optimizer
         self.device = device or (
             torch.device("npu")
             if (hasattr(torch, "npu") and torch.npu.is_available())
             else torch.device("cpu")
         )
 
-        pass_config.validate()
+        self.pass_config.validate()
 
         self._joint_graph = None
         self.optimizer = None
         # Optional hook run right before the first compile, for model-specific
         # pytree / tracer registration (e.g. flex-attention BlockMask).
         self._pytree_pre_hook: Optional[Callable[[], None]] = None
+
+    @staticmethod
+    def _resolve_pass_config(
+        *,
+        pass_config: Optional[PassConfig],
+        trainer_config: Optional[Any],
+    ) -> PassConfig:
+        """Resolve the graph pass config from explicit or trainer-level input."""
+        if pass_config is not None:
+            return pass_config
+        if trainer_config is not None:
+            return build_pass_config_from_trainer_config(trainer_config)
+        return PassConfig()
 
     def compile(self, sample_input: torch.Tensor, sample_label: torch.Tensor) -> None:
         """
@@ -122,7 +151,8 @@ class GraphTrainer:
 
         self._joint_graph = joint_graph
 
-        self._init_optimizer()
+        if self._manage_optimizer:
+            self._init_optimizer()
 
     def _init_device_mesh(self, mesh_context: Optional[Any] = None):
         """Initialize the FSDP process group.
@@ -210,6 +240,11 @@ class GraphTrainer:
 
     def optimizer_step(self) -> None:
         """Optimizer update"""
+        if not self._manage_optimizer:
+            raise RuntimeError(
+                "optimizer_step() is disabled when manage_optimizer=False. "
+                "Let the outer trainer runtime own optimizer stepping."
+            )
         if self.optimizer is None:
             return
 

@@ -54,6 +54,7 @@ class TestBuildOptionsFields(unittest.TestCase):
             _field_snapshot(CompileConfig),
             [
                 ("enabled", "False"),
+                ("graphtrainer_enabled", "False"),
                 ("mode", "'default'"),
                 ("fullgraph", "False"),
                 ("dynamic", "False"),
@@ -103,12 +104,34 @@ class TestBuildOptionsFields(unittest.TestCase):
         """CompileConfig rejects non-bool flags and contradictory options."""
         with self.assertRaisesRegex(TypeError, "compile.enabled must be a bool"):
             CompileConfig(enabled=1)
+        with self.assertRaisesRegex(TypeError, "compile.graphtrainer_enabled must be a bool"):
+            CompileConfig(graphtrainer_enabled=1)
         with self.assertRaisesRegex(ValueError, "compile.mode"):
             CompileConfig(mode="  ")
         with self.assertRaisesRegex(ValueError, "compile.options"):
             CompileConfig(mode="reduce-overhead", options={"triton": True})
         with self.assertRaisesRegex(ValueError, "dynamo_cache_size_limit"):
             CompileConfig(dynamo_cache_size_limit=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_graphtrainer_enabled_selects_graph_trainer(self):
+        """Graph-mode trainer selection is driven by compile.enabled + flag."""
+        config = CompileConfig(
+            enabled=True,
+            graphtrainer_enabled=True,
+            mode="reduce-overhead",
+            options={"triton": True},
+        )
+
+        self.assertTrue(config.selects_graph_trainer())
+        self.assertEqual(config.mode, "reduce-overhead")
+        self.assertEqual(config.options, {"triton": True})
+        self.assertFalse(
+            CompileConfig(
+                enabled=True, graphtrainer_enabled=False
+            ).selects_graph_trainer()
+        )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

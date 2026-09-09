@@ -597,8 +597,10 @@ def run_traced_graph(
         )
 
     state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
-
-    flat_inputs = list(state_flat) + [input_batch, label_batch]
+    user_inputs_flat, _ = torch.utils._pytree.tree_flatten(
+        (input_batch, label_batch)
+    )
+    flat_inputs = list(state_flat) + list(user_inputs_flat)
 
     with torch.no_grad():
         outputs = joint_graph.graph_module(*flat_inputs)
