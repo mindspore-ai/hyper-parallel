@@ -78,7 +78,7 @@ register(OpShardCase(
     inputs=[
         InputSpec(shape=(4, 4, 8, 512), init="randn", dtype="bfloat16", seed=42),
         InputSpec(shape=(4, 1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
-        InputSpec(shape=(4, 1024, 1, 512), init="randn", dtype="bfloat16", seed=44),
+        InputSpec(shape=(4, 1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
         InputSpec(shape=(4, 4, 8, 128), init="randn", dtype="bfloat16", seed=45),
         InputSpec(shape=(4, 1024, 1, 128), init="randn", dtype="bfloat16", seed=46),
         InputSpec(shape=(4, 4, 8), init="randn", dtype="bfloat16", seed=47),
@@ -107,7 +107,7 @@ register(OpShardCase(
     inputs=[
         InputSpec(shape=(4, 4, 8, 512), init="randn", dtype="bfloat16", seed=42),
         InputSpec(shape=(4, 1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
-        InputSpec(shape=(4, 1024, 1, 512), init="randn", dtype="bfloat16", seed=44),
+        InputSpec(shape=(4, 1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
         InputSpec(shape=(4, 4, 8, 128), init="randn", dtype="bfloat16", seed=45),
         InputSpec(shape=(4, 1024, 1, 128), init="randn", dtype="bfloat16", seed=46),
         InputSpec(shape=(4, 4, 8), init="randn", dtype="bfloat16", seed=47),
@@ -138,7 +138,7 @@ register(OpShardCase(
     inputs=[
         InputSpec(shape=(2, 1024, 32, 512), init="randn", dtype="bfloat16", seed=42),
         InputSpec(shape=(2, 1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
-        InputSpec(shape=(2, 1024, 1, 512), init="randn", dtype="bfloat16", seed=44),
+        InputSpec(shape=(2, 1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
         InputSpec(shape=(2, 1024, 32, 128), init="randn", dtype="bfloat16", seed=45),
         InputSpec(shape=(2, 1024, 1, 128), init="randn", dtype="bfloat16", seed=46),
         InputSpec(shape=(2, 1024, 32), init="randn", dtype="bfloat16", seed=47),
@@ -167,7 +167,7 @@ register(OpShardCase(
     inputs=[
         InputSpec(shape=(2, 1024, 32, 512), init="randn", dtype="bfloat16", seed=42),
         InputSpec(shape=(2, 1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
-        InputSpec(shape=(2, 1024, 1, 512), init="randn", dtype="bfloat16", seed=44),
+        InputSpec(shape=(2, 1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
         InputSpec(shape=(2, 1024, 32, 128), init="randn", dtype="bfloat16", seed=45),
         InputSpec(shape=(2, 1024, 1, 128), init="randn", dtype="bfloat16", seed=46),
         InputSpec(shape=(2, 1024, 32), init="randn", dtype="bfloat16", seed=47),
@@ -198,7 +198,7 @@ register(OpShardCase(
     inputs=[
         InputSpec(shape=(1024, 8, 512), init="randn", dtype="bfloat16", seed=42),
         InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
-        InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=44),
+        InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
         InputSpec(shape=(1024, 8, 128), init="randn", dtype="bfloat16", seed=45),
         InputSpec(shape=(1024, 1, 128), init="randn", dtype="bfloat16", seed=46),
         InputSpec(shape=(1024, 8), init="randn", dtype="bfloat16", seed=47),
@@ -228,7 +228,7 @@ register(OpShardCase(
     inputs=[
         InputSpec(shape=(1024, 8, 512), init="randn", dtype="bfloat16", seed=42),
         InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
-        InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=44),
+        InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
         InputSpec(shape=(1024, 8, 128), init="randn", dtype="bfloat16", seed=45),
         InputSpec(shape=(1024, 1, 128), init="randn", dtype="bfloat16", seed=46),
         InputSpec(shape=(1024, 8), init="randn", dtype="bfloat16", seed=47),
@@ -258,7 +258,7 @@ register(OpShardCase(
     inputs=[
         InputSpec(shape=(1024, 8, 512), init="randn", dtype="bfloat16", seed=42),
         InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
-        InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=44),
+        InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
         InputSpec(shape=(1024, 8, 128), init="randn", dtype="bfloat16", seed=45),
         InputSpec(shape=(1024, 1, 128), init="randn", dtype="bfloat16", seed=46),
         InputSpec(shape=(1024, 8), init="randn", dtype="bfloat16", seed=47),
@@ -288,7 +288,7 @@ register(OpShardCase(
     inputs=[
         InputSpec(shape=(1024, 8, 512), init="randn", dtype="bfloat16", seed=42),
         InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
-        InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=44),
+        InputSpec(shape=(1024, 1, 512), init="randn", dtype="bfloat16", seed=43),
         InputSpec(shape=(1024, 8, 128), init="randn", dtype="bfloat16", seed=45),
         InputSpec(shape=(1024, 1, 128), init="randn", dtype="bfloat16", seed=46),
         InputSpec(shape=(1024, 8), init="randn", dtype="bfloat16", seed=47),

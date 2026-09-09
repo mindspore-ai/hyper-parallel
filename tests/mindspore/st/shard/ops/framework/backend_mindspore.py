@@ -72,6 +72,8 @@ class MindSporeAscendBackend(ShardBackend):
         """Initialise the MS Ascend runtime + communication once per process."""
         if self._dist_inited:
             return
+        ms.set_seed(42)
+        ms.set_deterministic(True)
         ms.set_device("Ascend")
         D.init()
         self._dist_inited = True
