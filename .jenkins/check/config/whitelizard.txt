@@ -14,6 +14,8 @@ hyper-parallel/hyper_parallel/platform/torch/custom_ops/gdn/triton/solve_tril.py
 hyper-parallel/hyper_parallel/platform/torch/custom_ops/gdn/triton/state_summary.py:gdn_state_grad_ext_kernel
 hyper-parallel/hyper_parallel/platform/torch/custom_ops/gdn/triton/wy_fast.py:prepare_wy_repr_bwd_kernel
 hyper-parallel/hyper_parallel/distributed/context_parallel/kimi_delta_attention.py:_validate_module
+hyper-parallel/hyper_parallel/distributed/context_parallel/gated_delta_net.py:forward
+hyper-parallel/hyper_parallel/distributed/context_parallel/gated_delta_net.py:backward
 hyper-parallel/hyper_parallel/components/modules/kimi_delta_attention.py:torch_chunk_kda
 hyper-parallel/hyper_parallel/platform/torch/custom_ops/kda/chunk_kda.py:_validate_local_inputs
 hyper-parallel/hyper_parallel/platform/torch/custom_ops/kda/chunk_kda.py:forward

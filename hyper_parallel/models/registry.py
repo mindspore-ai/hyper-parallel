@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header
 """registry: model discovery — architecture → model entry / adapter provider.
 
 Owns ``MODEL_ARCH_MAPPING`` (HF architecture → custom model class, moved
@@ -81,12 +82,13 @@ MODEL_ADAPTER_REGISTRY = {}
 # normalized lookup key (see _normalize_family_key) → spec.model_type
 _FAMILY_ALIASES: Dict[str, str] = {}
 
-# Cross-family aliases: normalized lookup key → family directory whose
-# registration module also registers this family's spec. Needed only when one
-# family shares another family's adapter (DeepSeek-V2 reuses DeepSeek-V3's MLA
-# sharding rules); new families with their own directory never appear here.
+# Provider-directory aliases: normalized lookup key → family directory whose
+# registration module also registers this identity. This covers both shared
+# adapters (DeepSeek-V2 reuses DeepSeek-V3) and nested HF config identities
+# (Qwen3.5 text reuses the Qwen3.5 family adapter).
 _FAMILY_DIR_ALIASES = {
     "deepseekv2": "deepseek_v3",
+    "qwen35text": "qwen3_5",
 }
 
 # normalized family directory name → registration module path; built lazily.
@@ -114,7 +116,7 @@ def _normalize_family_key(name: str) -> str:
 def _discover_family_providers() -> Dict[str, str]:
     """Scan ``models/*/adapter/registration.py`` once (filesystem only — no
     family code is imported)."""
-    global _DISCOVERED_PROVIDERS
+    global _DISCOVERED_PROVIDERS  # pylint: disable=global-statement
     if _DISCOVERED_PROVIDERS is None:
         providers = {}
         models_dir = Path(__file__).resolve().parent
