@@ -17,10 +17,14 @@
 import inspect
 import unittest
 from dataclasses import fields
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from hyper_parallel import distributed_data
-from hyper_parallel.distributed_data import DistributedDatasetConfig, build_distributed_dataloader
+from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
+from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
 from hyper_parallel.distributed_data.topology import DataTopology
+from hyper_parallel.distributed_data.transport import synchronize_build_preflight
 from tests.common.mark_utils import arg_mark
 
 
@@ -142,6 +146,79 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         """
         with self.assertRaisesRegex(ValueError, "dataset_already_sharded must be boolean"):
             DistributedDatasetConfig(seq_len=32, local_batch_size=1, dataset_already_sharded=1)
+
+
+class TestDistributedDataBuildState(unittest.TestCase):
+    """Keep mode-specific construction and partial-failure preflight intact."""
+
+    @staticmethod
+    def _mesh() -> SimpleNamespace:
+        """Return a standalone mesh that needs no distributed initialization."""
+        return SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,))
+
+    def test_stream_modes_construct_selector_and_report_reader_roles(self) -> None:
+        """Online and both sidecar variants still select and deliver packed samples."""
+        samples = [0, 1]
+        metadata = [SampleMetadata(pack_tokens=4, sample_id=index) for index in samples]
+        for sidecar, sharded in ((False, False), (False, True), (True, False), (True, True)):
+            config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, dataset_already_sharded=sharded)
+            callbacks = {"metadata": metadata} if sidecar else {"metadata_fn": metadata.__getitem__}
+            with self.subTest(sidecar=sidecar, sharded=sharded), patch(
+                    "hyper_parallel.distributed_data.api.StepSampleSelector", wraps=StepSampleSelector,
+            ) as selector_type, patch(
+                    "hyper_parallel.distributed_data.api.synchronize_build_preflight",
+                    wraps=synchronize_build_preflight,
+            ) as preflight:
+                loader = build_distributed_dataloader(samples, self._mesh(), config, **callbacks)
+                self.assertEqual(next(loader), ((0, 1),))
+                selector_type.assert_called_once_with(seq_len=8, distributed_bin_count=1, oversized_policy="error")
+                preflight.assert_called_once()
+                status = preflight.call_args.kwargs
+                self.assertTrue(status["is_reader"])
+                self.assertEqual(status["reader_size"], len(samples))
+                self.assertEqual(status["is_direct_reader"], sidecar)
+                self.assertEqual(status["direct_dataset_size"], len(samples) if sidecar else None)
+                self.assertEqual(status["dataset_already_sharded"], sharded)
+                self.assertIsNone(status["local_error"])
+
+    def test_invalid_config_reaches_preflight_before_group_creation(self) -> None:
+        """Reading sharding policy must not mask an invalid-config build error."""
+        for config in (None, {}, object()):
+            with self.subTest(config=config), patch(
+                    "hyper_parallel.distributed_data.api.synchronize_build_preflight",
+                    wraps=synchronize_build_preflight,
+            ) as preflight, patch("hyper_parallel.distributed_data.api.create_data_groups") as create_groups:
+                with self.assertRaisesRegex(ValueError, "build preflight.*config must be DistributedDatasetConfig"):
+                    build_distributed_dataloader([], self._mesh(), config)
+                preflight.assert_called_once()
+                self.assertFalse(preflight.call_args.kwargs["dataset_already_sharded"])
+                create_groups.assert_not_called()
+
+    def test_partial_build_failures_reach_preflight_before_group_creation(self) -> None:
+        """Option errors and sidecar size mismatches must retain synchronized failure."""
+        cases = (
+            ({"dataloader_kwargs": {"num_workers": -1}}, "num_workers"),
+            ({"communication_device": "invalid-device"}, "communication_device"),
+            ({"metadata": [SampleMetadata(pack_tokens=1)]}, "metadata length"),
+        )
+        for sharded in (False, True):
+            config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, dataset_already_sharded=sharded)
+            for kwargs, message in cases:
+                with self.subTest(sharded=sharded, message=message), patch(
+                        "hyper_parallel.distributed_data.api.synchronize_build_preflight",
+                        wraps=synchronize_build_preflight,
+                ) as preflight, patch("hyper_parallel.distributed_data.api.create_data_groups") as create_groups:
+                    with self.assertRaisesRegex(ValueError, "build preflight.*" + message):
+                        build_distributed_dataloader([0, 1], self._mesh(), config, **kwargs)
+                    preflight.assert_called_once()
+                    status = preflight.call_args.kwargs
+                    self.assertEqual(status["dataset_already_sharded"], sharded)
+                    self.assertIn(message, status["local_error"])
+                    if "metadata" in kwargs:
+                        self.assertTrue(status["is_direct_reader"])
+                        self.assertEqual(status["reader_size"], 1)
+                        self.assertEqual(status["direct_dataset_size"], 2)
+                    create_groups.assert_not_called()
 
 
 class TestDataTopology(unittest.TestCase):

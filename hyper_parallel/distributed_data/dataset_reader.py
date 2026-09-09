@@ -21,7 +21,7 @@ import copy
 from collections.abc import Callable, Iterator, Mapping, Sized
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeVar
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler  # pylint: disable=forbidden-backend-import
@@ -59,8 +59,30 @@ class _BufferedSample:
     payload: Any
 
 
+_BufferEntry = TypeVar("_BufferEntry", _BufferedSample, BufferedSampleMetadata)
+
+
 def _identity(value: Any) -> Any:
     return value
+
+
+def _validate_worker_options(options: Mapping[str, Any]) -> None:
+    """Validate worker settings shared by config, API overrides, and direct readers."""
+    num_workers = options["num_workers"]
+    if not isinstance(num_workers, int) or isinstance(num_workers, bool) or num_workers < 0:
+        raise ValueError(f"num_workers must be a non-negative integer, but got {num_workers!r}.")
+    for name in ("pin_memory", "persistent_workers"):
+        if not isinstance(options[name], bool):
+            raise ValueError(f"{name} must be boolean, but got {options[name]!r}.")
+    prefetch_factor = options["prefetch_factor"]
+    if prefetch_factor is not None and (
+            not isinstance(prefetch_factor, int) or isinstance(prefetch_factor, bool) or prefetch_factor < 1
+    ):
+        raise ValueError("prefetch_factor must be a positive integer or None.")
+    if num_workers == 0 and prefetch_factor is not None:
+        raise ValueError("prefetch_factor requires num_workers > 0.")
+    if options["persistent_workers"] and num_workers == 0:
+        raise ValueError("persistent_workers=True requires num_workers > 0.")
 
 
 def _build_worker_options(
@@ -83,74 +105,79 @@ def _build_worker_options(
     options.update({
         "num_workers": num_workers,
         "pin_memory": pin_memory,
+        "prefetch_factor": prefetch_factor,
         "persistent_workers": persistent_workers,
         "generator": generator,
     })
-    if num_workers > 0 and prefetch_factor is not None:
-        options["prefetch_factor"] = prefetch_factor
+    _validate_worker_options(options)
+    if prefetch_factor is None:
+        options.pop("prefetch_factor")
     return options
 
 
-def _validate_reader_configuration(
+def _validate_reader_partition(
         *,
-        metadata_fn: Callable[[Any], SampleMetadata],
         reader_rank: int,
         reader_idx: int,
         reader_count: int,
         seq_len: int,
         seed: int,
-        num_workers: int,
-        prefetch_factor: int | None,
-        persistent_workers: bool,
         dataset_already_sharded: bool,
-        source_kind: str,
         shuffle: bool,
 ) -> None:
-    if not callable(metadata_fn):
-        raise ValueError("metadata_fn must be callable.")
-    _validate_reader_integer_fields({
+    """Validate the partition contract shared by payload and metadata readers."""
+    values = {
         "reader_rank": reader_rank,
         "reader_idx": reader_idx,
         "reader_count": reader_count,
         "seq_len": seq_len,
         "seed": seed,
-        "num_workers": num_workers,
-    })
-    if reader_count < 1 or reader_idx >= reader_count or seq_len < 1:
-        raise ValueError("reader_count and seq_len must be positive, and reader_idx must be in range.")
-    _validate_reader_worker_options(num_workers, prefetch_factor, persistent_workers)
-    _validate_reader_source_options(dataset_already_sharded, source_kind, shuffle)
-
-
-def _validate_reader_integer_fields(values: Mapping[str, int]) -> None:
+    }
     for name, value in values.items():
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
-
-
-def _validate_reader_worker_options(
-        num_workers: int,
-        prefetch_factor: int | None,
-        persistent_workers: bool,
-) -> None:
-    if prefetch_factor is not None and (
-            not isinstance(prefetch_factor, int) or isinstance(prefetch_factor, bool) or prefetch_factor < 1
-    ):
-        raise ValueError("prefetch_factor must be a positive integer or None.")
-    if num_workers == 0 and prefetch_factor is not None:
-        raise ValueError("prefetch_factor requires num_workers > 0.")
-    if persistent_workers and num_workers == 0:
-        raise ValueError("persistent_workers=True requires num_workers > 0.")
-
-
-def _validate_reader_source_options(dataset_already_sharded: bool, source_kind: str, shuffle: bool) -> None:
+    if reader_count < 1 or reader_idx >= reader_count or seq_len < 1:
+        raise ValueError("reader_count and seq_len must be positive, and reader_idx must be in range.")
     if not isinstance(dataset_already_sharded, bool):
         raise ValueError("dataset_already_sharded must be boolean.")
-    if source_kind == "iterable" and shuffle:
-        raise ValueError(
-            "shuffle=True is not supported for an iterable online Dataset; "
-            "the Dataset must own its iterable shuffle order."
-        )
+    if not isinstance(shuffle, bool):
+        raise ValueError("shuffle must be boolean.")
+
+
+def _commit_reader_buffer(
+        buffer: list[_BufferEntry], selected_keys: set[SampleKey], *, owner: str,
+) -> list[_BufferEntry]:
+    """Validate every selected key before returning the uncommitted entries."""
+    missing = selected_keys - {item.key for item in buffer}
+    if missing:
+        raise ValueError(f"Cannot commit missing {owner} sample keys {sorted(missing)}.")
+    return [item for item in buffer if item.key not in selected_keys]
+
+
+def _validate_reader_checkpoint(
+        state: Mapping[str, Any], identity: Mapping[str, Any], entry_type: type[_BufferEntry], *, owner: str,
+) -> tuple[int, int, bool, str | None, list[_BufferEntry]]:
+    """Validate both reader formats before applying any restored state."""
+    for name, expected_value in identity.items():
+        if state.get(name) != expected_value:
+            raise ValueError(f"{owner} checkpoint {name}={state.get(name)!r} does not match {expected_value!r}.")
+    epoch = state.get("epoch")
+    next_ordinal = state.get("next_ordinal")
+    exhausted = state.get("exhausted")
+    error = state.get("error")
+    buffer = state.get("buffer")
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in (epoch, next_ordinal)):
+        raise ValueError(f"{owner} epoch and next_ordinal must be non-negative integers.")
+    if not isinstance(exhausted, bool) or not isinstance(buffer, list) or any(
+            not isinstance(item, entry_type) for item in buffer
+    ):
+        raise ValueError(f"{owner} checkpoint contains invalid exhausted or buffer state.")
+    if error is not None and (not isinstance(error, str) or not error):
+        raise ValueError(f"{owner} checkpoint contains an invalid error state.")
+    keys = [item.key for item in buffer]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"{owner} checkpoint buffer contains duplicate SampleKey values.")
+    return epoch, next_ordinal, exhausted, error, buffer
 
 
 class _IndexedDataset(Dataset):
@@ -294,18 +321,20 @@ class DatasetReader:
             dataloader_kwargs: Additional validated DataLoader execution options.
         """
         source_kind, dataset_size = self._validate_dataset(dataset)
-        _validate_reader_configuration(
-            metadata_fn=metadata_fn,
+        if not callable(metadata_fn):
+            raise ValueError("metadata_fn must be callable.")
+        if source_kind == "iterable" and shuffle:
+            raise ValueError(
+                "shuffle=True is not supported for an iterable online Dataset; "
+                "the Dataset must own its iterable shuffle order."
+            )
+        _validate_reader_partition(
             reader_rank=reader_rank,
             reader_idx=reader_idx,
             reader_count=reader_count,
             seq_len=seq_len,
             seed=seed,
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers,
             dataset_already_sharded=dataset_already_sharded,
-            source_kind=source_kind,
             shuffle=shuffle,
         )
         self._dataset = dataset
@@ -496,11 +525,7 @@ class DatasetReader:
         Args:
             selected_keys: Successfully consumed keys owned by this reader.
         """
-        existing_keys = {item.key for item in self._buffer}
-        missing = selected_keys - existing_keys
-        if missing:
-            raise ValueError(f"Cannot commit missing Dataset Reader sample keys {sorted(missing)}.")
-        self._buffer = [item for item in self._buffer if item.key not in selected_keys]
+        self._buffer = _commit_reader_buffer(self._buffer, selected_keys, owner="Dataset Reader")
 
     def state_dict(self) -> dict[str, Any]:
         """Return rank-local state at a completed batch boundary.
@@ -510,13 +535,7 @@ class DatasetReader:
             replay when the Dataset order and transformations are deterministic.
         """
         state = {
-            "version": self.VERSION,
-            "reader_rank": self._reader_rank,
-            "reader_idx": self._reader_idx,
-            "reader_count": self._reader_count,
-            "source_kind": self._source_kind,
-            "dataset_already_sharded": self._dataset_already_sharded,
-            "dataset_size": self._dataset_size,
+            **self._checkpoint_identity(),
             "epoch": self._epoch,
             "next_ordinal": self._next_ordinal,
             "exhausted": self._exhausted,
@@ -540,8 +559,9 @@ class DatasetReader:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
             raise ValueError(f"Dataset Reader state is not copyable: {exc}") from exc
-        self._validate_checkpoint_identity(state)
-        epoch, next_ordinal, exhausted, error, buffer = self._validate_checkpoint_payload(state)
+        epoch, next_ordinal, exhausted, error, buffer = _validate_reader_checkpoint(
+            state, self._checkpoint_identity(), _BufferedSample, owner="Dataset Reader",
+        )
         self._epoch = epoch
         self._next_ordinal = next_ordinal
         self._exhausted = exhausted
@@ -549,8 +569,8 @@ class DatasetReader:
         self._buffer = buffer
         self._iterator = None
 
-    def _validate_checkpoint_identity(self, state: Mapping[str, Any]) -> None:
-        expected = {
+    def _checkpoint_identity(self) -> dict[str, Any]:
+        return {
             "version": self.VERSION,
             "reader_rank": self._reader_rank,
             "reader_idx": self._reader_idx,
@@ -559,33 +579,6 @@ class DatasetReader:
             "dataset_already_sharded": self._dataset_already_sharded,
             "dataset_size": self._dataset_size,
         }
-        for name, expected_value in expected.items():
-            if state.get(name) != expected_value:
-                raise ValueError(
-                    f"Dataset Reader checkpoint {name}={state.get(name)!r} does not match {expected_value!r}."
-                )
-
-    @staticmethod
-    def _validate_checkpoint_payload(
-            state: Mapping[str, Any],
-    ) -> tuple[int, int, bool, str | None, list[_BufferedSample]]:
-        epoch = state.get("epoch")
-        next_ordinal = state.get("next_ordinal")
-        exhausted = state.get("exhausted")
-        error = state.get("error")
-        buffer = state.get("buffer")
-        if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in (epoch, next_ordinal)):
-            raise ValueError("Dataset Reader epoch and next_ordinal must be non-negative integers.")
-        if not isinstance(exhausted, bool) or not isinstance(buffer, list) or any(
-                not isinstance(item, _BufferedSample) for item in buffer
-        ):
-            raise ValueError("Dataset Reader checkpoint contains invalid exhausted or buffer state.")
-        if error is not None and (not isinstance(error, str) or not error):
-            raise ValueError("Dataset Reader checkpoint contains an invalid error state.")
-        keys = [item.key for item in buffer]
-        if len(keys) != len(set(keys)):
-            raise ValueError("Dataset Reader checkpoint buffer contains duplicate SampleKey values.")
-        return epoch, next_ordinal, exhausted, error, buffer
 
     def set_epoch(self, epoch: int) -> None:
         """Reset this reader partition to a deterministic new epoch.

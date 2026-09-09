@@ -33,8 +33,12 @@ from hyper_parallel.distributed_data.schema import (
 from hyper_parallel.distributed_data.dataset_reader import (
     _IndexedDataset,
     _IndexedPayload,
+    _ReaderIndexSampler,
     _build_worker_options,
+    _commit_reader_buffer,
     _identity,
+    _validate_reader_checkpoint,
+    _validate_reader_partition,
 )
 
 
@@ -74,21 +78,15 @@ class SidecarMetadataReader:
         metadata_size = len(metadata)
         if not isinstance(metadata_size, int) or isinstance(metadata_size, bool) or metadata_size < 0:
             raise ValueError(f"metadata length must be a non-negative integer, but got {metadata_size!r}.")
-        for name, value in (
-                ("reader_rank", reader_rank),
-                ("reader_idx", reader_idx),
-                ("reader_count", reader_count),
-                ("seq_len", seq_len),
-                ("seed", seed),
-        ):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer, but got {value!r}.")
-        if reader_count < 1 or reader_idx >= reader_count or seq_len < 1:
-            raise ValueError("reader_count and seq_len must be positive, and reader_idx must be in range.")
-        if not isinstance(shuffle, bool):
-            raise ValueError("shuffle must be boolean.")
-        if not isinstance(dataset_already_sharded, bool):
-            raise ValueError("dataset_already_sharded must be boolean.")
+        _validate_reader_partition(
+            reader_rank=reader_rank,
+            reader_idx=reader_idx,
+            reader_count=reader_count,
+            seq_len=seq_len,
+            seed=seed,
+            dataset_already_sharded=dataset_already_sharded,
+            shuffle=shuffle,
+        )
         self._metadata = metadata
         self._reader_rank = reader_rank
         self._reader_idx = reader_idx
@@ -172,21 +170,12 @@ class SidecarMetadataReader:
         Args:
             selected_keys: Successfully consumed sidecar sample keys.
         """
-        existing_keys = {item.key for item in self._buffer}
-        missing = selected_keys - existing_keys
-        if missing:
-            raise ValueError(f"Cannot commit missing sidecar sample keys {sorted(missing)}.")
-        self._buffer = [item for item in self._buffer if item.key not in selected_keys]
+        self._buffer = _commit_reader_buffer(self._buffer, selected_keys, owner="sidecar")
 
     def state_dict(self) -> dict[str, Any]:
         """Return the metadata cursor and uncommitted planning buffer."""
         state = {
-            "version": self.VERSION,
-            "reader_rank": self._reader_rank,
-            "reader_idx": self._reader_idx,
-            "reader_count": self._reader_count,
-            "dataset_already_sharded": self._dataset_already_sharded,
-            "metadata_size": len(self._metadata),
+            **self._checkpoint_identity(),
             "epoch": self._epoch,
             "next_ordinal": self._next_ordinal,
             "exhausted": self._exhausted,
@@ -208,8 +197,9 @@ class SidecarMetadataReader:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
             raise ValueError(f"Sidecar metadata state is not copyable: {exc}") from exc
-        self._validate_checkpoint_identity(state)
-        epoch, next_ordinal, exhausted, error, buffer = self._validate_checkpoint_payload(state)
+        epoch, next_ordinal, exhausted, error, buffer = _validate_reader_checkpoint(
+            state, self._checkpoint_identity(), BufferedSampleMetadata, owner="Sidecar",
+        )
         self._epoch = epoch
         self._next_ordinal = next_ordinal
         self._exhausted = exhausted
@@ -217,8 +207,8 @@ class SidecarMetadataReader:
         self._buffer = buffer
         self._iterator = None
 
-    def _validate_checkpoint_identity(self, state: Mapping[str, Any]) -> None:
-        expected = {
+    def _checkpoint_identity(self) -> dict[str, Any]:
+        return {
             "version": self.VERSION,
             "reader_rank": self._reader_rank,
             "reader_idx": self._reader_idx,
@@ -226,33 +216,6 @@ class SidecarMetadataReader:
             "dataset_already_sharded": self._dataset_already_sharded,
             "metadata_size": len(self._metadata),
         }
-        for name, expected_value in expected.items():
-            if state.get(name) != expected_value:
-                raise ValueError(
-                    f"Sidecar checkpoint {name}={state.get(name)!r} does not match {expected_value!r}."
-                )
-
-    @staticmethod
-    def _validate_checkpoint_payload(
-            state: Mapping[str, Any],
-    ) -> tuple[int, int, bool, str | None, list[BufferedSampleMetadata]]:
-        epoch = state.get("epoch")
-        next_ordinal = state.get("next_ordinal")
-        exhausted = state.get("exhausted")
-        error = state.get("error")
-        buffer = state.get("buffer")
-        if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in (epoch, next_ordinal)):
-            raise ValueError("Sidecar epoch and next_ordinal must be non-negative integers.")
-        if not isinstance(exhausted, bool) or not isinstance(buffer, list) or any(
-                not isinstance(item, BufferedSampleMetadata) for item in buffer
-        ):
-            raise ValueError("Sidecar checkpoint contains invalid exhausted or buffer state.")
-        if error is not None and (not isinstance(error, str) or not error):
-            raise ValueError("Sidecar checkpoint contains an invalid error state.")
-        keys = [item.key for item in buffer]
-        if len(keys) != len(set(keys)):
-            raise ValueError("Sidecar checkpoint buffer contains duplicate SampleKey values.")
-        return epoch, next_ordinal, exhausted, error, buffer
 
     def set_epoch(self, epoch: int) -> None:
         """Reset this metadata partition for a deterministic epoch.
@@ -281,16 +244,15 @@ class SidecarMetadataReader:
             return None
 
     def _build_iterator(self) -> Iterator[int]:
-        if self._shuffle:
-            generator = torch.Generator().manual_seed(self._seed + self._epoch)
-            global_indices: Sequence[int] = torch.randperm(len(self._metadata), generator=generator).tolist()
-        else:
-            global_indices = range(len(self._metadata))
-        if self._dataset_already_sharded:
-            reader_indices = global_indices
-        else:
-            reader_indices = global_indices[self._reader_idx::self._reader_count]
-        return iter(reader_indices[self._next_ordinal:])
+        return iter(_ReaderIndexSampler(
+            dataset_size=len(self._metadata),
+            reader_idx=0 if self._dataset_already_sharded else self._reader_idx,
+            reader_count=1 if self._dataset_already_sharded else self._reader_count,
+            start_ordinal=self._next_ordinal,
+            shuffle=self._shuffle,
+            seed=self._seed,
+            epoch=self._epoch,
+        ))
 
 
 class _MutableIndexSampler(Sampler[int]):

@@ -92,6 +92,17 @@ class TestNativeBatchSampler(unittest.TestCase):
                     self.assertEqual(_batch_ids(next(loader)), [2, 3])
                 self.assertEqual(sorted(dataset.reads), [0, 1, 2, 3])
 
+    def test_native_mode_does_not_construct_dynamic_selector(self) -> None:
+        """Native sampling should not allocate an unused stream selector."""
+        for sidecar in (False, True):
+            with self.subTest(sidecar=sidecar), patch(
+                    "hyper_parallel.distributed_data.api.StepSampleSelector",
+                    side_effect=AssertionError("Native sampling must not construct a dynamic selector."),
+            ) as selector_type:
+                loader = _loader(_TrackedDataset(), sidecar=sidecar)
+                self.assertEqual(_batch_ids(next(loader)), [0, 1])
+                selector_type.assert_not_called()
+
     def test_cyclic_order_and_epoch_remain_native(self) -> None:
         """Both cyclic sharding policies retain the original round membership."""
         for data_sharding in (False, True):
