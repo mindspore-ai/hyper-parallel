@@ -25,12 +25,14 @@ import numpy as np
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.batching.build_dataloader import build_dataloader
+from hyper_parallel.data.batching.build_collate_fn import build_indexed_collate_fn
 from hyper_parallel.data.batching.get_batch import ParallelBatch
 from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
 from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
 from hyper_parallel.data.indexed.indexed_pretrain_dataset import GPTDataset, IndexedSourceDataset
 from hyper_parallel.data.indexed.io import IndexedDatasetBuilder
 from hyper_parallel.data.text.build_dataset import build_indexed_text_dataset
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.trainer.text_trainer import TextTrainer
 from hyper_parallel.distributed_data import SampleMetadata, build_distributed_dataloader
 from tests.common.mark_utils import arg_mark
@@ -207,6 +209,49 @@ class TestIndexedSourceDataset(unittest.TestCase):
             self.assertTrue(hasattr(dataset, "sample_index"))
             self.assertEqual(dataset[0]["tokens"].shape, (4,))
             self.assertEqual(dataset[0]["labels"].shape, (4,))
+
+    def test_native_batch_sampler_keeps_gpt_fields_and_round_membership(self) -> None:
+        """Native GPT slicing, label shifts, masks, and positions survive the new opt-in."""
+        with TemporaryDirectory() as directory:
+            prefix = _write_indexed_source(
+                directory, "native_corpus", [[1, 2, 9], [3, 4, 5, 6, 7, 8, 9], [2, 2, 9]],
+            )
+            config = _provider_config(
+                seq_length=4, packing_stage="dataset", load_balance="native_batch_sampler",
+                reset_position_ids=True, reset_attention_mask=True, eod_mask_loss=True,
+                create_ltor_fields_in_dataloader=True,
+            )
+            datasets = build_indexed_text_dataset(
+                data_path=prefix, data_config=config, tokenizer=_Tokenizer(),
+                train_valid_test_num_samples=(8, 0, 0),
+            )
+            dataset = datasets[0]
+            self.assertIsInstance(dataset, GPTDataset)
+            self.assertTrue(np.any(dataset.sample_index[1:, 0] != dataset.sample_index[:-1, 0]))
+            collate_fn = build_indexed_collate_fn()
+            for sampler_type in ("single", "cyclic"):
+                with self.subTest(sampler_type=sampler_type):
+                    loaders, samplers = build_dataloader(
+                        SimpleNamespace(dataloader_type=sampler_type), datasets=datasets, collate_fn=collate_fn,
+                        mesh_context=SimpleNamespace(device_mesh=_StandaloneMesh(), dp_rank=0, dp_size=1),
+                        training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
+                        data_config=config,
+                    )
+                    self.assertEqual(samplers, (None, None, None))
+                    reference_sampler = build_dataset_batch_sampler(
+                        total_samples=len(dataset), micro_batch_size=2, global_batch_size=4,
+                        dp_rank=0, dp_world_size=1, sampler_type=sampler_type, seed=7,
+                    )
+                    for expected_indices in reference_sampler:
+                        batch = next(loaders[0])
+                        planned_indices = [key.dataset_index for key in loaders[0].last_plan.selected_keys]
+                        self.assertCountEqual(planned_indices, expected_indices)
+                        reference = collate_fn([dataset[index] for index in planned_indices])
+                        self.assertEqual(set(batch), set(reference))
+                        for field, expected in reference.items():
+                            torch.testing.assert_close(batch[field], expected, rtol=0, atol=0)
+                    with self.assertRaises(StopIteration):
+                        next(loaders[0])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_worker_options_and_resume_with_real_indexed_files(self) -> None:

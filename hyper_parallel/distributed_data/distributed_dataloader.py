@@ -24,12 +24,14 @@ from threading import Thread
 from typing import Any, Literal
 
 from hyper_parallel.distributed_data.data_constructor import PackingDataConstructor
+from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
     ConstructedBatch,
     DistributedPackingPlan,
     SampleKey,
+    StepSampleSelection,
 )
 from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
 from hyper_parallel.distributed_data.sidecar import PlannedSampleLoader, SidecarMetadataReader
@@ -70,6 +72,7 @@ class _ReaderSnapshot:
     can_read_more: bool
     metadata: tuple[BufferedSampleMetadata, ...]
     error: str | None = None
+    batch_position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -89,8 +92,8 @@ def _validate_loader_components(
         *,
         topology: DataTopology,
         dataset_reader_ranks: tuple[int, ...],
-        dataset_reader: DatasetReader | None,
-        sidecar_reader: SidecarMetadataReader | None,
+        dataset_reader: DatasetReader | BatchSamplerReader | None,
+        sidecar_reader: SidecarMetadataReader | BatchSamplerReader | None,
         direct_sample_loader: PlannedSampleLoader | None,
         sidecar_mode: bool,
         sidecar_payload_exchange: bool,
@@ -155,8 +158,8 @@ class DistributedDataLoader(Iterator[Any]):
             *,
             topology: DataTopology,
             dataset_reader_ranks: tuple[int, ...],
-            dataset_reader: DatasetReader | None,
-            sidecar_reader: SidecarMetadataReader | None,
+            dataset_reader: DatasetReader | BatchSamplerReader | None,
+            sidecar_reader: SidecarMetadataReader | BatchSamplerReader | None,
             direct_sample_loader: PlannedSampleLoader | None,
             sidecar_mode: bool,
             sidecar_payload_exchange: bool,
@@ -169,6 +172,8 @@ class DistributedDataLoader(Iterator[Any]):
             max_buffered_samples: int,
             double_buffer: bool,
             config_fingerprint: str,
+            batch_sampler_mode: bool = False,
+            initial_epoch: int = 0,
     ) -> None:
         """Store the fully validated runtime components."""
         _validate_loader_components(
@@ -197,7 +202,8 @@ class DistributedDataLoader(Iterator[Any]):
         self._max_buffered_samples = max_buffered_samples
         self._double_buffer = double_buffer
         self._config_fingerprint = config_fingerprint
-        self._epoch = 0
+        self._batch_sampler_mode = batch_sampler_mode
+        self._epoch = initial_epoch
         self._step = 0
         self._stopped = False
         self._last_plan_id: str | None = None
@@ -661,6 +667,7 @@ class DistributedDataLoader(Iterator[Any]):
             ),
             metadata=planning_reader.metadata(),
             error=error,
+            batch_position=planning_reader.batch_position if isinstance(planning_reader, BatchSamplerReader) else None,
         )
 
     def _build_plan_control(self, snapshots: tuple[Any, ...]) -> _PlanControl:
@@ -721,10 +728,13 @@ class DistributedDataLoader(Iterator[Any]):
         reader_snapshots = [snapshot for snapshot in normalized if snapshot.is_reader]
         candidates = tuple(metadata for snapshot in reader_snapshots for metadata in snapshot.metadata)
         try:
-            selection = self._step_sample_selector.select(
-                candidates,
-                end_of_stream=all(snapshot.exhausted for snapshot in reader_snapshots),
-            )
+            if self._batch_sampler_mode:
+                selection = self._select_native_batch(reader_snapshots)
+            else:
+                selection = self._step_sample_selector.select(
+                    candidates,
+                    end_of_stream=all(snapshot.exhausted for snapshot in reader_snapshots),
+                )
             plan = None if selection is None else self._planner.plan(selection, step=self._step)
         except Exception as exc:
             return _PlanControl("error", error=self._format_error("Step Sample Selection or Planner", exc))
@@ -741,6 +751,23 @@ class DistributedDataLoader(Iterator[Any]):
                 f"Step Sample Selection could form {self._planner.distributed_bin_count} complete packing bins."
             ),
         )
+
+    def _select_native_batch(self, snapshots: list[_ReaderSnapshot]) -> StepSampleSelection | None:
+        """Freeze this forward/backward round exactly as native DP samplers selected it."""
+        positions = {snapshot.batch_position for snapshot in snapshots}
+        if len(positions) != 1 or None in positions:
+            raise ValueError("Native BatchSampler ranks have inconsistent consumed_samples cursors.")
+        if all(snapshot.exhausted for snapshot in snapshots):
+            return None
+        if any(snapshot.exhausted for snapshot in snapshots):
+            raise ValueError("Native BatchSampler ranks exhausted at different forward/backward rounds.")
+        if any(len(snapshot.metadata) != self._planner.local_batch_size for snapshot in snapshots):
+            raise ValueError("Native BatchSampler ranks must each provide exactly local_batch_size samples.")
+        samples = tuple(sorted(
+            (item for snapshot in snapshots for item in snapshot.metadata),
+            key=lambda item: item.global_sample_position,
+        ))
+        return StepSampleSelection(samples=samples, reference_bins=tuple((item.key,) for item in samples))
 
     def _prepare_outgoing(
             self,
@@ -772,7 +799,7 @@ class DistributedDataLoader(Iterator[Any]):
         except Exception as exc:
             return None, self._format_error("payload serialization/allocation", exc)
 
-    def _planning_reader(self) -> DatasetReader | SidecarMetadataReader | None:
+    def _planning_reader(self) -> DatasetReader | SidecarMetadataReader | BatchSamplerReader | None:
         """Return this rank's online or metadata-only Dataset Reader."""
         if self._dataset_reader is not None:
             return self._dataset_reader

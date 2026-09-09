@@ -77,6 +77,206 @@ loader = build_distributed_dataloader(
 )
 ```
 
+### Native HP BatchSampler: preserve each forward/backward round
+
+Pass `batch_sampler=` to keep the native HP sampling policy. This is separate
+from the stream-based dynamic packing path above; omitting it retains the old
+behavior.
+
+```python
+from hyper_parallel.data.parallel import build_dataset_batch_sampler
+
+# Build the rank-local sampler on every rank, using training DP coordinates.
+# Only the Data Constructor in each DP replica advances its sampler.
+batch_sampler = build_dataset_batch_sampler(
+    total_samples=len(dataset),
+    micro_batch_size=2,
+    global_batch_size=32,
+    dp_rank=dp_rank,
+    dp_world_size=dp_size,
+    sampler_type="cyclic",
+    seed=1234,
+)
+loader = build_distributed_dataloader(
+    dataset,
+    mesh,
+    DistributedDatasetConfig(seq_len=32768, local_batch_size=2),
+    batch_sampler=batch_sampler,
+    metadata_fn=lambda sample: SampleMetadata(pack_tokens=len(sample["tokens"])),
+    collate_fn=native_collate_fn,
+)
+```
+
+```text
+each DP Constructor advances its native BatchSampler once
+  -> freeze that round's native Dataset-index occurrences
+  -> online: read those Dataset outputs, then derive metadata
+     sidecar: look up metadata for exactly those Dataset indices
+  -> balance only this frozen round (one complete Dataset output per bin)
+  -> online: payload A2A / shared sidecar: target reads, no payload A2A
+  -> original collate_fn receives complete Dataset outputs
+  -> deliver the local batch to model-parallel peers
+  -> commit the native sampler cursor after delivery
+```
+
+For DP=2 and `local_batch_size=2`, if native samplers yield `[0, 1]` and
+`[2, 3]`, only these four occurrences can be balanced in that round. No samples
+are borrowed from another gradient-accumulation round. Index mappings that
+repeat a Dataset index remain repeated occurrences; routing keys distinguish
+them by `global_sample_position` rather than deduplicating the index.
+In this mode that position is a stable DP-major occurrence slot within the
+native round, not a physical document index or the sampler's internal shuffle
+permutation position.
+
+In the HP text Trainer, retain the original Indexed Dataset and collator and
+enable this path with:
+
+```yaml
+dataset:
+  data_config:
+    packing_stage: dataset
+    load_balance: native_batch_sampler
+    seq_length: 32768
+    distributed_dataloader:
+      double_buffer: true
+```
+
+The Trainer builds its normal `build_dataset_batch_sampler` first, including
+`single`/`cyclic`, `data_sharding`, and the supported index rearrangement map.
+It passes that sampler to the collective loader instead of applying another
+Reader stride. Worker settings and the original `dataloader.collate_fn` are
+retained. The initial text adapter supplies token lengths, not a calibrated TND
+cost model; fixed-length GPT outputs therefore do not automatically gain compute
+balance from this opt-in. The lower-level API accepts user-provided costs through
+`metadata_fn` or `metadata`.
+For CUDA/NPU meshes the Trainer passes the foreground rank-local device to the
+existing device payload transport; CPU meshes use Gloo.
+
+Current boundaries of the native-sampler path:
+
+- `dataset[index]` stays **whole**. Native GPT cross-document slicing, shifted
+  labels, loss masks, and positions are not rebuilt. Internal independent TND
+  fragments are **not yet extracted or balanced**. An offline-packed record also
+  stays whole.
+- Supply an HP-compatible native sampler on every rank. Only Constructor ranks
+  need the mapping Dataset, and only those ranks advance their samplers. Readers
+  must currently coincide with Constructors. `shuffle=False` and
+  `dataset_already_sharded=False` are required in `DistributedDatasetConfig`:
+  the native sampler already owns both decisions. `pack_fn` must be omitted and
+  `drop_last=True` is required. Iterable sources keep the existing stream path.
+- A supplied sidecar must describe the **logical native Dataset outputs** after
+  blend/shuffle/sample-index mapping, not raw document IDs. Raw `.idx` lengths
+  alone do not describe GPT-internal EOD/TND boundaries. This version does not
+  automatically generate a native-GPT sidecar; the Trainer opt-in uses online
+  metadata. Shared-sidecar reads also require deterministic, rank-independent
+  Dataset outputs.
+- Save and restore through `loader.state_dict()` / `load_state_dict()`, not
+  through the original sampler: its live cursor may include one prefetched
+  round. Native cursor snapshots count Dataset-output occurrences, never tokens
+  or fragments, and can restore at a synchronized forward/backward boundary with
+  unchanged DP topology, global batch size, and sampler policy.
+- Native-round membership and pre-collation Dataset fields are preserved, not
+  bitwise training results. Worker RNG replay, batch-dependent transforms,
+  dropout, reduction order, a concrete TND runtime adapter, and full NPU training
+  parity are outside this sampler integration. The Trainer path rejects PP and
+  a second `DynamicBatchDataLoader` selection stage.
+
+Native-sampler regression coverage:
+
+```bash
+HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
+  tests/ut/distributed_data/test_batch_sampler.py \
+  tests/ut/data/test_indexed_source_dataset.py \
+  tests/torch/distributed_data/test_batch_sampler_gloo.py \
+  tests/torch/distributed_data/test_indexed_text_gloo.py
+```
+
+### Native HP image-text Dataset (VLMTrainer)
+
+VLMTrainer can use the same native-sampler path. Add `load_balance` to the
+existing VLM Dataset configuration; keep the original transform and collator:
+
+```yaml
+dataset:
+  _target_: hyper_parallel.data.vlm.build_vlm_dataset
+  data_path: /data/conversations.json
+  data_config:
+    source_type: online
+    load_balance: native_batch_sampler
+    distributed_dataloader:
+      double_buffer: true
+  data_transform:
+    _target_: hyper_parallel.data.vlm.build_vlm_data_transform
+    max_seq_len: 32768
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  dataloader_type: single
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.build_vlm_collator
+    packing: false
+training:
+  micro_batch_size: 2
+  global_batch_size: 32
+```
+
+This is a data-section example to merge into an existing VLMTrainer model/run
+configuration. The distributed sequence capacity is inferred from the built
+transform's `max_seq_len`; `data_config.seq_length` is unnecessary. If both are
+supplied, they must agree. With DP=8 this example selects 16 global samples per
+forward/backward round and accumulates two rounds per optimizer update.
+
+```text
+native HP BatchSampler selects each round's Dataset-index occurrences
+  -> original VLM Dataset + processor read/decode/encode complete conversations
+  -> vlm_sample_metadata extracts padded width and image patch counts
+  -> gather metadata and balance this frozen round across DP ranks
+  -> A2A complete image-text sample dictionaries
+  -> original VLMCollator: stack text [local_batch_size, max_seq_len]
+                          concatenate image patches and image grids
+  -> VLMGetBatch -> model forward/backward -> gradient accumulation
+```
+
+- A conversation may contain multiple images and turns, but remains **one
+  indivisible sample**. Input IDs, prompt-masked labels, attention masks,
+  modality markers, pixels and grids move together. No label shifting, new
+  padding policy, or cross-conversation packing is introduced.
+- The default `hyper_parallel.data.vlm.metadata.vlm_sample_metadata` estimator
+  uses `sum(T * H * W)` over the processor's actual `image_grid_thw` as encoder
+  workload, and padded text width as LLM workload and `pack_tokens`. Raw vision
+  patches are not the same as merged LLM image placeholders. This is a simple
+  workload proxy, **not a calibrated cost model**. Custom estimates can be
+  supplied via `metadata_fn` when calling `build_distributed_dataloader` directly.
+- The Trainer integration uses **online metadata**, extracted after the native
+  Dataset transform. It cannot balance CPU image decoding/processing already
+  performed by the Readers. Native `_TransformDataset` still performs its
+  initial trainable-label filtering; no sidecar is automatically generated.
+  A manually supplied sidecar through the lower-level API must match the
+  filtered/transformed Dataset index space, not the original JSON row numbers.
+- The HP VLM runtime currently requires **TP=CP=PP=1**; this integration keeps
+  that boundary and supports DP. It does not add VLM packing, video/audio
+  adapters, or a new model-parallel batch-delivery implementation.
+- Omit `load_balance` to retain the native DataLoader. Enabled loaders own
+  checkpoint cursors and epochs; VLMTrainer preserves a restored first-epoch
+  cursor and waits for outstanding prefetch before distributed teardown.
+  CUDA/NPU payload communication uses the existing device transport; the
+  tests below cover CPU/Gloo, not full accelerator-model accuracy or speed.
+
+VLM regression coverage uses real local images and the original HP Dataset,
+transform, collator and get-batch path with a deterministic test processor
+(no remote assets). It checks sample/field conservation, DP2 payload A2A,
+worker loading, double buffering, resume, and native-vs-balanced gradients for
+an image-conditioned toy loss using HP token normalization:
+
+```bash
+HYPER_PARALLEL_PLATFORM=torch python -m pytest -q \
+  tests/ut/data/vlm/test_metadata.py \
+  tests/ut/trainer/test_vlm_trainer.py \
+  tests/torch/distributed_data/test_vlm_gloo.py
+```
+
 ### HyperParallel unpacked Indexed text data
 
 The HP Indexed provider keeps its existing `GPTDataset` behavior by

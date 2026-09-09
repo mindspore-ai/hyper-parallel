@@ -363,6 +363,13 @@ class DynamicPackingPlanner:
                 for constructor in constructors
             ],
         }
+        positions = [
+            key.global_sample_position
+            for constructor in constructors
+            for key in constructor.sample_keys
+        ]
+        if any(positions):
+            stable_plan["global_sample_positions"] = positions
         encoded = json.dumps(stable_plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()[:24]
 

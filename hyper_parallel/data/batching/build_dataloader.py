@@ -31,6 +31,7 @@ from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
+    SampleMetadata,
     build_distributed_dataloader,
     collate_indexed_text_sequences,
     pack_indexed_text_samples,
@@ -105,12 +106,15 @@ def _build_distributed_packing_config(
         micro_batch_size: int,
         sampler_type: str,
         seed: int,
+        max_seq_len: int | None = None,
 ) -> DistributedDatasetConfig:
     """Derive distributed-packing sizes and retain optional runtime tuning."""
     try:
-        seq_len = int(data_config["seq_length"])
+        seq_len = int(data_config.get("seq_length", max_seq_len))
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("Distributed Indexed packing requires a positive data_config.seq_length") from exc
+        raise ValueError("Distributed loading requires data_config.seq_length or transform.max_seq_len") from exc
+    if max_seq_len is not None and seq_len != max_seq_len:
+        raise ValueError("data_config.seq_length must match transform.max_seq_len for native batch balancing")
     raw_options = data_config.get("distributed_dataloader", {})
     if not isinstance(raw_options, Mapping):
         raise ValueError("data_config.distributed_dataloader must be a mapping")
@@ -224,6 +228,59 @@ def _normalize_source_samples(source_item: Any) -> list[Mapping[str, Any]]:
     raise ValueError("A dynamic source item must be a mapping or a sequence of mappings")
 
 
+def _native_text_metadata(sample: Mapping[str, Any]) -> SampleMetadata:
+    """Describe a complete GPT output without inferring new attention boundaries."""
+    return SampleMetadata(pack_tokens=int(sample["tokens"].shape[-1]))
+
+
+def _build_native_sampler_loader(
+        dataset: Any,
+        batch_sampler: Any,
+        collate_fn: Any,
+        dataloader_target: Any,
+        mesh_context: Any,
+        data_config: Mapping[str, Any],
+        seed: int,
+        *,
+        metadata_fn: Callable[[Any], SampleMetadata] | None = None,
+        max_seq_len: int | None = None,
+) -> Any:
+    """Reuse native Dataset outputs and the existing collator in collective loading."""
+    if batch_sampler is None:
+        raise ValueError("Native BatchSampler balancing requires a mapping Dataset")
+    if bool(getattr(dataset, "requires_distributed_packing", False)):
+        raise ValueError("Native BatchSampler balancing must retain packing_stage='dataset'")
+    if getattr(mesh_context, "device_mesh", None) is None:
+        raise ValueError("Native BatchSampler balancing requires mesh_context.device_mesh")
+    if int(getattr(mesh_context, "pp_size", 1)) != 1:
+        raise ValueError("Native BatchSampler balancing does not yet support pipeline parallelism")
+    # Target exposes its resolved callable only as _target_; inspecting it
+    # prevents replacing a second-stage dynamic selector without warning.
+    target_callable = getattr(dataloader_target, "_target_", None)
+    if isinstance(target_callable, type) and issubclass(target_callable, DynamicBatchDataLoader):
+        raise ValueError("Native BatchSampler balancing must not override native batches with dynamic batching")
+    config = _build_distributed_packing_config(
+        dataloader_target, data_config,
+        micro_batch_size=batch_sampler.micro_batch_size, sampler_type="single", seed=seed,
+        max_seq_len=max_seq_len,
+    )
+    worker_kwargs = {
+        name: getattr(dataloader_target, name)
+        for name in ("timeout", "worker_init_fn", "multiprocessing_context", "pin_memory_device", "in_order")
+        if getattr(dataloader_target, name, None) is not None
+    }
+    device_type = getattr(mesh_context.device_mesh, "device_type", "cpu")
+    communication_device = None
+    if device_type != "cpu":
+        communication_device = torch.device(device_type, getattr(torch, device_type).current_device())
+    return build_distributed_dataloader(
+        dataset, mesh_context.device_mesh, config,
+        batch_sampler=batch_sampler, metadata_fn=metadata_fn if metadata_fn is not None else _native_text_metadata,
+        collate_fn=collate_fn, dataloader_kwargs=worker_kwargs,
+        communication_device=communication_device,
+    )
+
+
 def _restore_index_buffer(
         source_dataset: Any,
         saved_buffer: Sequence[Any],
@@ -298,6 +355,7 @@ def build_dataloader(
         data_config: Mapping[str, Any] | None = None,
         max_seq_len: int | None = None,
         default_seed: int = 1234,
+        metadata_fn: Callable[[Any], SampleMetadata] | None = None,
 ) -> tuple[tuple[Any | None, ...], tuple[Any | None, ...]]:
     """Build train, validation, and test DataLoaders.
 
@@ -314,6 +372,8 @@ def build_dataloader(
         data_config: Dataset options, including the Indexed packing stage.
         max_seq_len: Maximum sample length used to derive dynamic token budget.
         default_seed: Seed used when no training seed is configured.
+        metadata_fn: Native sample cost callback for ``load_balance=native_batch_sampler``.
+            Defaults to complete GPT output lengths; VLMTrainer supplies its image-patch estimator.
 
     Returns:
         DataLoader and batch-sampler tuples for the three Dataset splits.
@@ -340,6 +400,12 @@ def build_dataloader(
     drop_last = getattr(dataloader_target, "drop_last", True)
     rearrangement_map = getattr(dataloader_target, "data_rearrange_map", None)
     data_sharding = getattr(dataloader_target, "data_sharding", False)
+    load_balance = (data_config or {}).get("load_balance")
+    if load_balance not in (None, "native_batch_sampler"):
+        raise ValueError("data_config.load_balance must be 'native_batch_sampler' or omitted")
+    native_balance = load_balance == "native_batch_sampler"
+    if native_balance and _uses_distributed_packing(data_config):
+        raise ValueError("Native BatchSampler balancing must retain packing_stage='dataset'")
 
     if _uses_distributed_packing(data_config):
         return _build_distributed_packing_splits(
@@ -378,15 +444,21 @@ def build_dataloader(
                 seed=seed,
             )
 
-        dataloader = dataloader_target.build(
-            dataset=dataset,
-            collate_fn=collate_fn,
-            batch_sampler=batch_sampler,
-            batch_size=micro_batch_size,
-            dp_world_size=dp_world_size,
-            max_seq_len=max_seq_len,
-            seed=seed,
-        )
+        if native_balance:
+            dataloader = _build_native_sampler_loader(
+                dataset, batch_sampler, collate_fn, dataloader_target, mesh_context, data_config, seed,
+                metadata_fn=metadata_fn, max_seq_len=max_seq_len,
+            )
+        else:
+            dataloader = dataloader_target.build(
+                dataset=dataset,
+                collate_fn=collate_fn,
+                batch_sampler=batch_sampler,
+                batch_size=micro_batch_size,
+                dp_world_size=dp_world_size,
+                max_seq_len=max_seq_len,
+                seed=seed,
+            )
         logger.debug(
             "Built DataLoader split=%s, dataset=%s, batch_sampler=%s",
             split_name,
@@ -394,7 +466,9 @@ def build_dataloader(
             type(batch_sampler).__name__ if batch_sampler is not None else None,
         )
         dataloaders[split_index] = dataloader
-        batch_samplers[split_index] = batch_sampler
+        # The collective loader owns sampler checkpoint/epoch state; exposing
+        # its speculative cursor to the Trainer would skip prefetched batches.
+        batch_samplers[split_index] = None if native_balance else batch_sampler
 
     dataloader_splits = tuple(dataloaders)
     batch_sampler_splits = tuple(batch_samplers)

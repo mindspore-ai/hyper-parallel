@@ -26,6 +26,11 @@ from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.distributed_data.batch_sampler import (
+    BatchSamplerReader,
+    native_sampler_fingerprint,
+    preserve_sample,
+)
 from hyper_parallel.distributed_data.data_constructor import (
     PackingDataConstructor,
     default_collate_fn,
@@ -439,8 +444,8 @@ class _BuildState:
     topology: DataTopology | None = None
     dataset_reader_ranks: tuple[int, ...] | None = None
     planner_rank: int | None = None
-    dataset_reader: DatasetReader | None = None
-    sidecar_reader: SidecarMetadataReader | None = None
+    dataset_reader: DatasetReader | BatchSamplerReader | None = None
+    sidecar_reader: SidecarMetadataReader | BatchSamplerReader | None = None
     direct_sample_loader: PlannedSampleLoader | None = None
     normalized_dataloader_kwargs: dict[str, Any] | None = None
     dataloader_fingerprint: tuple[tuple[str, Any], ...] | None = None
@@ -454,6 +459,7 @@ class _BuildState:
     reader_size: int | None = None
     direct_dataset_size: int | None = None
     local_error: str | None = None
+    batch_sampler_fingerprint: str | None = None
 
     @property
     def is_reader(self) -> bool:
@@ -633,6 +639,51 @@ def _configure_local_data_sources(
         )
 
 
+def _configure_batch_sampler_sources(
+        state: _BuildState,
+        dataset: Any,
+        metadata_fn: Callable[[Any], SampleMetadata] | None,
+        metadata: Sequence[SampleMetadata] | None,
+        config: DistributedDatasetConfig,
+        batch_sampler: Any,
+) -> None:
+    """Use native DP sampler owners as Readers without applying a second stride."""
+    if state.dataset_reader_ranks != state.topology.constructor_ranks:
+        raise ValueError("Native batch_sampler currently requires Dataset Readers on the Data Constructor ranks.")
+    if config.shuffle or config.dataset_already_sharded:
+        raise ValueError(
+            "Native batch_sampler owns DP slicing and shuffle; disable shuffle and dataset_already_sharded."
+        )
+    state.batch_sampler_fingerprint = native_sampler_fingerprint(
+        batch_sampler, data_rank=state.topology.data_rank,
+        dp_size=state.topology.data_parallel_size, local_batch_size=config.local_batch_size,
+    )
+    if not state.is_reader:
+        return
+    if dataset is None:
+        raise ValueError("Native batch_sampler requires a mapping Dataset on each Data Constructor.")
+    sample_loader = _make_planned_sample_loader(dataset, config, state)
+    sample_loader.set_epoch(batch_sampler.epoch)
+    state.reader_size = len(dataset)
+    if state.sidecar_mode:
+        if not callable(getattr(metadata, "__getitem__", None)) or len(metadata) != len(dataset):
+            raise ValueError("Native batch_sampler sidecar metadata must align with the mapping Dataset.")
+        state.direct_sample_loader = sample_loader
+        state.direct_dataset_size = len(dataset)
+    elif metadata_fn is None:
+        raise ValueError("Native batch_sampler online mode requires metadata_fn.")
+    reader = BatchSamplerReader(
+        batch_sampler, reader_rank=state.topology.global_rank,
+        policy_fingerprint=state.batch_sampler_fingerprint,
+        metadata=metadata, metadata_fn=metadata_fn,
+        sample_loader=None if state.sidecar_mode else sample_loader,
+    )
+    if state.sidecar_mode:
+        state.sidecar_reader = reader
+    else:
+        state.dataset_reader = reader
+
+
 def _populate_build_state(
         state: _BuildState,
         dataset: Any | None,
@@ -644,6 +695,7 @@ def _populate_build_state(
         pack_fn: Callable[[Sequence[Any], int], Any] | None,
         collate_fn: Callable[[Sequence[Any]], Any] | None,
         communication_device: Any,
+        batch_sampler: Any = None,
 ) -> None:
     if not isinstance(config, DistributedDatasetConfig):
         raise ValueError(f"config must be DistributedDatasetConfig, but got {type(config)}.")
@@ -666,10 +718,17 @@ def _populate_build_state(
     uses_default_pack = pack_fn is None or pack_fn is default_pack_fn
     uses_default_collate = collate_fn is None or collate_fn is default_collate_fn
     effective_pack_fn = default_pack_fn if uses_default_pack else pack_fn
+    if batch_sampler is not None:
+        if pack_fn is not None:
+            raise ValueError("Native batch_sampler preserves Dataset outputs; pack_fn must be omitted.")
+        effective_pack_fn = preserve_sample
     effective_collate_fn = default_collate_fn if uses_default_collate else collate_fn
     state.topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
     state.dataset_reader_ranks, state.planner_rank = _resolve_service_ranks(state.topology, config)
-    _configure_local_data_sources(state, dataset, metadata_fn, metadata, config)
+    if batch_sampler is None:
+        _configure_local_data_sources(state, dataset, metadata_fn, metadata, config)
+    else:
+        _configure_batch_sampler_sources(state, dataset, metadata_fn, metadata, config, batch_sampler)
     state.planner = DynamicPackingPlanner(
         data_parallel_size=state.topology.data_parallel_size,
         seq_len=config.seq_len,
@@ -692,6 +751,8 @@ def _populate_build_state(
         uses_default_pack=uses_default_pack,
         uses_default_collate=uses_default_collate,
     )
+    if state.batch_sampler_fingerprint is not None:
+        state.config_fingerprint += ":batch_sampler:" + state.batch_sampler_fingerprint
 
 
 def _synchronize_build_state(state: _BuildState) -> None:
@@ -738,6 +799,7 @@ def build_distributed_dataloader(
         pack_fn: Callable[[Sequence[Any], int], Any] | None = None,
         collate_fn: Callable[[Sequence[Any]], Any] | None = None,
         communication_device: Any = None,
+        batch_sampler: Any = None,
 ) -> DistributedDataLoader:
     """Build a sample-balanced distributed DataLoader from a raw Dataset.
 
@@ -749,6 +811,10 @@ def build_distributed_dataloader(
     constructors directly read assigned indices and skip payload A2A. With
     pre-sharded inputs, each Reader reads selected local indices and routes the
     payloads to target constructors through A2A.
+
+    With ``batch_sampler``, native HP sampling replaces stream-based selection:
+    one sampler yield per DP Constructor fixes one forward/backward round.
+    Complete Dataset outputs are balanced without repacking their contents.
 
     Args:
         dataset: Online mode requires a mapping or iterable Dataset on Dataset
@@ -777,6 +843,15 @@ def build_distributed_dataloader(
         communication_device: Optional rank-local device used by payload A2A.
             With NCCL/HCCL this is normally ``cuda:<local_rank>`` or
             ``npu:<local_rank>``. Omit it for CPU/Gloo payload exchange.
+        batch_sampler: Optional native HP BatchSampler. Supply the rank-local
+            sampler on every rank; only each DP Constructor advances it. Its
+            next yield fixes local sample membership, with no second stride,
+            shuffle, or dynamic selection. Each Dataset output stays whole in
+            one bin and goes unchanged to ``collate_fn``. Readers must coincide
+            with Constructors, ``drop_last`` must be true, and ``pack_fn`` must
+            be omitted. Sidecar entries must describe these Dataset indices,
+            not underlying document indices. Checkpoint through this loader,
+            not through the sampler's speculative prefetch cursor.
 
     Returns:
         Stateful collective iterator yielding constructed local batches.
@@ -798,6 +873,7 @@ def build_distributed_dataloader(
         pack_fn=pack_fn,
         collate_fn=collate_fn,
         communication_device=communication_device,
+        batch_sampler=batch_sampler,
     )
 
 
@@ -812,6 +888,7 @@ def _build_distributed_dataloader_impl(
         pack_fn: Callable[[Sequence[Any], int], Any] | None,
         collate_fn: Callable[[Sequence[Any]], Any] | None,
         communication_device: Any,
+        batch_sampler: Any = None,
 ) -> DistributedDataLoader:
     state = _BuildState(sidecar_mode=metadata_fn is None)
     try:
@@ -826,6 +903,7 @@ def _build_distributed_dataloader_impl(
             pack_fn,
             collate_fn,
             communication_device,
+            batch_sampler,
         )
     except Exception as exc:  # Every WORLD rank must fail before subgroup creation.
         state.local_error = f"{type(exc).__name__}: {exc}"
@@ -843,6 +921,8 @@ def _build_distributed_dataloader_impl(
     )
 
     return DistributedDataLoader(
+        batch_sampler_mode=batch_sampler is not None,
+        initial_epoch=0 if batch_sampler is None else batch_sampler.epoch,
         topology=state.topology,
         dataset_reader_ranks=state.dataset_reader_ranks,
         dataset_reader=state.dataset_reader,

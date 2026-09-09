@@ -121,14 +121,19 @@ class SampleMetadata:
 
 @dataclass(frozen=True, order=True)
 class SampleKey:
-    """Stable identity for one Dataset sample owned by a Dataset Reader."""
+    """Stable identity for one Dataset sample occurrence owned by a Reader.
+
+    ``global_sample_position`` distinguishes repeated indices in native
+    BatchSampler mode. The ordinary unique-index stream keeps the default zero.
+    """
 
     reader_rank: int
     dataset_index: int
+    global_sample_position: int = 0
 
     def __post_init__(self) -> None:
         """Validate non-negative routing coordinates."""
-        for name in ("reader_rank", "dataset_index"):
+        for name in ("reader_rank", "dataset_index", "global_sample_position"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"SampleKey.{name} must be a non-negative integer, but got {value!r}.")
@@ -160,8 +165,8 @@ class StepSampleSelection:
     """Frozen sample membership and a known-feasible reference packing.
 
     ``samples`` contains exactly the samples admitted to one distributed step.
-    ``reference_bins`` records the canonical streaming packing used to choose
-    that set. Balanced placement may change those bin boundaries, but it must
+    ``reference_bins`` records the canonical streaming packing or native
+    BatchSampler singleton grouping. Balanced placement may change those bins, but it must
     conserve every selected key exactly once.
     """
 
