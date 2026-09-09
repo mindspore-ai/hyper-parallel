@@ -338,6 +338,32 @@ class TestMindSporeParam(unittest.TestCase):
         self.assertIs(gathered, output)
         self.assertIsNone(handle)
 
+    def test_no_comm_async_unshard_defers_reset(self):
+        """A local-only prefetch should defer parameter reset until synchronous unshard."""
+        hsdp_param = _new_hsdp_param_v2()
+        hsdp_param.is_sharded = False
+        hsdp_param.prefetch_handle = None
+        hsdp_param.reset_sharded_param = MagicMock()
+        all_gather_input = MagicMock(numel=MagicMock(return_value=8), dtype="float16", device="npu:0")
+        output = MagicMock()
+        hsdp_param.init_all_gather_outputs = MagicMock(
+            side_effect=lambda **kwargs: setattr(hsdp_param, "all_gather_outputs", [output])
+        )
+        hsdp_param.alloc_all_gather_outputs = MagicMock()
+
+        with patch.object(
+            MindSporeHSDPParamV2,
+            "all_gather_inputs",
+            new_callable=PropertyMock,
+            return_value=[all_gather_input],
+        ):
+            hsdp_param.unshard(async_op=True)
+            hsdp_param.reset_sharded_param.assert_not_called()
+
+            hsdp_param.unshard(async_op=False)
+
+        hsdp_param.reset_sharded_param.assert_called_once_with()
+
     def test_copy_without_bumping_version_prefers_data_alias(self):
         """Shared helper should write through ``dst.data``."""
         dst = MagicMock(name="dst")
