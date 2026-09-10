@@ -57,7 +57,7 @@ class _LowLevelDataset:
     """Track payload reads independently from index metadata access."""
 
     def __init__(self, sequences: list[list[int]]) -> None:
-        """Store token sequences and their sidecar lengths."""
+        """Store token sequences and their metadata lengths."""
         self.sequences = [np.asarray(sequence, dtype=np.int64) for sequence in sequences]
         self.sequence_lengths = np.asarray([len(sequence) for sequence in sequences], dtype=np.int32)
         self.payload_reads = 0
@@ -129,7 +129,7 @@ class TestIndexedSourceDataset(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_metadata_uses_index_lengths_without_payload_read(self) -> None:
-        """Feature: Indexed source sidecar metadata.
+        """Feature: Indexed source metadata.
         Description: Query metadata before materializing the source sample.
         Expectation: Token length comes from the index and the binary payload remains unread.
         """

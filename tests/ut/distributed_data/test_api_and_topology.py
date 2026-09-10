@@ -157,13 +157,13 @@ class TestDistributedDataBuildState(unittest.TestCase):
         return SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,))
 
     def test_stream_modes_construct_selector_and_report_reader_roles(self) -> None:
-        """Online and both sidecar variants still select and deliver packed samples."""
+        """Online and both metadata variants still select and deliver packed samples."""
         samples = [0, 1]
         metadata = [SampleMetadata(pack_tokens=4, sample_id=index) for index in samples]
-        for sidecar, sharded in ((False, False), (False, True), (True, False), (True, True)):
+        for metadata_mode, sharded in ((False, False), (False, True), (True, False), (True, True)):
             config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, dataset_already_sharded=sharded)
-            callbacks = {"metadata": metadata} if sidecar else {"metadata_fn": metadata.__getitem__}
-            with self.subTest(sidecar=sidecar, sharded=sharded), patch(
+            callbacks = {"metadata": metadata} if metadata_mode else {"metadata_fn": metadata.__getitem__}
+            with self.subTest(metadata_mode=metadata_mode, sharded=sharded), patch(
                     "hyper_parallel.distributed_data.api.StepSampleSelector", wraps=StepSampleSelector,
             ) as selector_type, patch(
                     "hyper_parallel.distributed_data.api.synchronize_build_preflight",
@@ -176,8 +176,8 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 status = preflight.call_args.kwargs
                 self.assertTrue(status["is_reader"])
                 self.assertEqual(status["reader_size"], len(samples))
-                self.assertEqual(status["is_direct_reader"], sidecar)
-                self.assertEqual(status["direct_dataset_size"], len(samples) if sidecar else None)
+                self.assertEqual(status["is_direct_reader"], metadata_mode)
+                self.assertEqual(status["direct_dataset_size"], len(samples) if metadata_mode else None)
                 self.assertEqual(status["dataset_already_sharded"], sharded)
                 self.assertIsNone(status["local_error"])
 
@@ -195,11 +195,11 @@ class TestDistributedDataBuildState(unittest.TestCase):
                 create_groups.assert_not_called()
 
     def test_partial_build_failures_reach_preflight_before_group_creation(self) -> None:
-        """Option errors and sidecar size mismatches must retain synchronized failure."""
+        """Option errors and metadata size mismatches must retain synchronized failure."""
         cases = (
             ({"dataloader_kwargs": {"num_workers": -1}}, "num_workers"),
             ({"communication_device": "invalid-device"}, "communication_device"),
-            ({"metadata": [SampleMetadata(pack_tokens=1)]}, "metadata length"),
+            ({"metadata": [SampleMetadata(pack_tokens=1)]}, "[Mm]etadata length"),
         )
         for sharded in (False, True):
             config = DistributedDatasetConfig(seq_len=8, local_batch_size=1, dataset_already_sharded=sharded)
@@ -213,7 +213,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
                     preflight.assert_called_once()
                     status = preflight.call_args.kwargs
                     self.assertEqual(status["dataset_already_sharded"], sharded)
-                    self.assertIn(message, status["local_error"])
+                    self.assertRegex(status["local_error"], message)
                     if "metadata" in kwargs:
                         self.assertTrue(status["is_direct_reader"])
                         self.assertEqual(status["reader_size"], 1)

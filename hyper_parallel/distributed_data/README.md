@@ -13,7 +13,7 @@ online metadata_fn
   -> Balanced Placement
   -> CPU/Gloo or device NCCL/HCCL A2A routes selected payloads
 
-ahead-of-fetch sidecar metadata
+ahead-of-fetch metadata
   -> metadata-only Dataset Reader
   -> Step Sample Selection reproduces the same stream membership
   -> Balanced Placement
@@ -111,9 +111,9 @@ loader = build_distributed_dataloader(
 each DP Constructor advances its native BatchSampler once
   -> freeze that round's native Dataset-index occurrences
   -> online: read those Dataset outputs, then derive metadata
-     sidecar: look up metadata for exactly those Dataset indices
+     metadata: look up metadata for exactly those Dataset indices
   -> balance only this frozen round (one complete Dataset output per bin)
-  -> online: payload A2A / shared sidecar: target reads, no payload A2A
+  -> online: payload A2A / shared metadata: target reads, no payload A2A
   -> original collate_fn receives complete Dataset outputs
   -> deliver the local batch to model-parallel peers
   -> commit the native sampler cursor after delivery
@@ -164,11 +164,11 @@ Current boundaries of the native-sampler path:
   `dataset_already_sharded=False` are required in `DistributedDatasetConfig`:
   the native sampler already owns both decisions. `pack_fn` must be omitted and
   `drop_last=True` is required. Iterable sources keep the existing stream path.
-- A supplied sidecar must describe the **logical native Dataset outputs** after
+- Supplied metadata must describe the **logical native Dataset outputs** after
   blend/shuffle/sample-index mapping, not raw document IDs. Raw `.idx` lengths
   alone do not describe GPT-internal EOD/TND boundaries. This version does not
-  automatically generate a native-GPT sidecar; the Trainer opt-in uses online
-  metadata. Shared-sidecar reads also require deterministic, rank-independent
+  automatically generate native-GPT metadata; the Trainer opt-in uses online
+  metadata. Shared-metadata reads also require deterministic, rank-independent
   Dataset outputs.
 - Save and restore through `loader.state_dict()` / `load_state_dict()`, not
   through the original sampler: its live cursor may include one prefetched
@@ -252,8 +252,8 @@ native HP BatchSampler selects each round's Dataset-index occurrences
 - The Trainer integration uses **online metadata**, extracted after the native
   Dataset transform. It cannot balance CPU image decoding/processing already
   performed by the Readers. Native `_TransformDataset` still performs its
-  initial trainable-label filtering; no sidecar is automatically generated.
-  A manually supplied sidecar through the lower-level API must match the
+  initial trainable-label filtering; no precomputed metadata is automatically generated.
+  Manually supplied metadata through the lower-level API must match the
   filtered/transformed Dataset index space, not the original JSON row numbers.
 - The HP VLM runtime currently requires **TP=CP=PP=1**; this integration keeps
   that boundary and supports DP. It does not add VLM packing, video/audio
@@ -323,7 +323,7 @@ overridden here. Every Constructor needs access to the same corpus files.
 The Trainer selects the built-in text packing and collation callbacks;
 `dataloader.collate_fn` is optional in this mode.
 
-The `.idx` lengths form an implicit sidecar, so the shared-index path plans
+The `.idx` lengths provide metadata, so the shared-index path plans
 before payload reads and does not use payload A2A. Every packed row records
 source boundaries in `cu_seq_lens`; padding labels use `-100`. The HP Trainer also
 switches `ParallelBatch` to the `indexed_source` contract so those boundaries
@@ -479,8 +479,8 @@ Dataset and distributed batching semantics remain internal. Do not pass
 `dataset`, `batch_size`, `shuffle`, `sampler`, `batch_sampler`, `collate_fn`,
 `drop_last`, or `generator` through `dataloader_kwargs`.
 
-When sidecar entries are aligned one-to-one with mapping-Dataset indices, pass
-`metadata` instead of `metadata_fn`. Dataset Reader ranks need the sidecar; Data
+When metadata entries are aligned one-to-one with mapping-Dataset indices, pass
+`metadata` instead of `metadata_fn`. Dataset Reader ranks need the metadata; Data
 Constructor ranks need the Dataset. With the default topology they provide both:
 
 ```python
@@ -488,7 +488,7 @@ loader = build_distributed_dataloader(
     dataset,
     mesh,
     config,
-    metadata=sidecar_metadata,
+    metadata=precomputed_metadata,
     pack_fn=pack_one_sequence,
     collate_fn=collate_packed_sequences,
 )
@@ -496,9 +496,9 @@ loader = build_distributed_dataloader(
 
 The Planner runs before any `dataset[index]` call. Each constructor then uses
 its local DataLoader workers to fetch only assigned indices. For multiple
-datasets, compose the datasets and sidecars in the same global index order.
+datasets, compose the datasets and metadata in the same global index order.
 
-For rank-local sidecars, provide the local mapping Dataset and local metadata
+For rank-local metadata, provide the local mapping Dataset and local metadata
 on every Dataset Reader and enable the same sharding switch:
 
 ```python
@@ -510,7 +510,7 @@ loader = build_distributed_dataloader(
         local_batch_size=1,
         dataset_already_sharded=True,
     ),
-    metadata=local_sidecar_metadata,
+    metadata=local_precomputed_metadata,
     pack_fn=pack_one_sequence,
     collate_fn=collate_packed_sequences,
 )
@@ -547,9 +547,9 @@ the same on every rank. The build preflight does detect default-versus-custom
 mode mismatches, but cannot reliably fingerprint arbitrary Python closures.
 
 By default, every Dataset Reader rank provides a replica of the same logical
-online Dataset or sidecar metadata and HyperParallel applies the Reader stride.
+online Dataset or metadata and HyperParallel applies the Reader stride.
 With `dataset_already_sharded=True`, each Reader instead provides its local
-online stream or an aligned local Dataset/sidecar pair. Non-owning ranks may
+online stream or an aligned local Dataset/metadata pair. Non-owning ranks may
 pass the same object or `None`. By default, Data Constructor ranks are also the
 Dataset Readers; `dataset_reader_ranks` can separate metadata scanning from
 construction.
@@ -577,8 +577,8 @@ loader = build_distributed_dataloader(
 ```
 
 Packed Python payloads still incur pickle plus Host-to-Device and Device-to-Host
-copies, so device A2A should be benchmarked for the target payload size. Shared
-sidecar direct reads bypass this transport; pre-sharded sidecars use it.
+copies, so device A2A should be benchmarked for the target payload size. Direct
+reads using shared metadata bypass this transport; pre-sharded metadata mode uses it.
 
 If one offline sample is already a complete local batch, configure
 `local_batch_size=1`, report its logical `pack_tokens`, and use identity-style
@@ -587,7 +587,7 @@ balancing unit.
 
 ## Current boundaries
 
-- Mapping or iterable online Dataset; sidecar reads require mapping access.
+- Mapping or iterable online Dataset; metadata mode requires mapping access for payload reads.
 - At most one in-flight background batch when `double_buffer=True`; the first
   batch and non-double-buffer mode wait synchronously.
 - Gloo control plane and correctness-first framed pickle payloads; online A2A

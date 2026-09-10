@@ -23,7 +23,7 @@ from tests.common.mark_utils import arg_mark
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_native_batch_sampler_dp2_tp2_gloo() -> None:
     """Feature: Native HP BatchSampler integration.
-    Description: Exercise DP2/TP2 online and sidecar loading with both shuffle policies and prefetch.
+    Description: Exercise DP2/TP2 online and metadata loading with both shuffle policies and prefetch.
     Expectation: Every round preserves native occurrences and checkpoint replay never skips a prefetched batch.
     """
     torchrun_case(

@@ -63,9 +63,9 @@ def _sampler(**overrides: object) -> object:
     return build_dataset_batch_sampler(**options)
 
 
-def _loader(dataset: object, *, sampler: object = None, sidecar: bool = False, **options: object) -> object:
+def _loader(dataset: object, *, sampler: object = None, metadata_mode: bool = False, **options: object) -> object:
     kwargs = {"metadata": [SampleMetadata(pack_tokens=1, sample_id=index) for index in range(len(dataset))]}
-    if not sidecar:
+    if not metadata_mode:
         kwargs = {"metadata_fn": _metadata}
     return build_distributed_dataloader(
         dataset, _StandaloneMesh(), DistributedDatasetConfig(seq_len=16, local_batch_size=2, **options),
@@ -82,10 +82,10 @@ class TestNativeBatchSampler(unittest.TestCase):
 
     def test_fixed_membership_without_dynamic_selection(self) -> None:
         """Short samples still occupy native batches instead of filling token budgets."""
-        for sidecar in (False, True):
-            with self.subTest(sidecar=sidecar):
+        for metadata_mode in (False, True):
+            with self.subTest(metadata_mode=metadata_mode):
                 dataset = _TrackedDataset()
-                loader = _loader(dataset, sidecar=sidecar, buffer_size_multiplier=100)
+                loader = _loader(dataset, metadata_mode=metadata_mode, buffer_size_multiplier=100)
                 with patch.object(StepSampleSelector, "select", side_effect=AssertionError("must not select")):
                     self.assertEqual(_batch_ids(next(loader)), [0, 1])
                     self.assertEqual(sorted(dataset.reads), [0, 1])
@@ -94,12 +94,12 @@ class TestNativeBatchSampler(unittest.TestCase):
 
     def test_native_mode_does_not_construct_dynamic_selector(self) -> None:
         """Native sampling should not allocate an unused stream selector."""
-        for sidecar in (False, True):
-            with self.subTest(sidecar=sidecar), patch(
+        for metadata_mode in (False, True):
+            with self.subTest(metadata_mode=metadata_mode), patch(
                     "hyper_parallel.distributed_data.api.StepSampleSelector",
                     side_effect=AssertionError("Native sampling must not construct a dynamic selector."),
             ) as selector_type:
-                loader = _loader(_TrackedDataset(), sidecar=sidecar)
+                loader = _loader(_TrackedDataset(), metadata_mode=metadata_mode)
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
                 selector_type.assert_not_called()
 
@@ -118,30 +118,34 @@ class TestNativeBatchSampler(unittest.TestCase):
 
     def test_duplicate_indices_are_distinct_occurrences(self) -> None:
         """A repeated physical index is read and delivered once per sampling occurrence."""
-        for sidecar in (False, True):
-            with self.subTest(sidecar=sidecar):
+        for metadata_mode in (False, True):
+            with self.subTest(metadata_mode=metadata_mode):
                 dataset = _TrackedDataset()
-                loader = _loader(dataset, sampler=_sampler(index_mapping=[3] * 10), sidecar=sidecar)
+                loader = _loader(dataset, sampler=_sampler(index_mapping=[3] * 10), metadata_mode=metadata_mode)
                 self.assertEqual(_batch_ids(next(loader)), [3, 3])
                 self.assertEqual(dataset.reads, [3, 3])
                 self.assertEqual(len(set(loader.last_plan.selected_keys)), 2)
 
     def test_checkpoint_at_accumulation_round_excludes_prefetch(self) -> None:
         """A delivered FB round can replay even before an optimizer batch is complete."""
-        for sidecar in (False, True):
-            with self.subTest(sidecar=sidecar):
+        for metadata_mode in (False, True):
+            with self.subTest(metadata_mode=metadata_mode):
                 sampler = _sampler()
-                loader = _loader(_TrackedDataset(), sampler=sampler, sidecar=sidecar, double_buffer=True)
+                loader = _loader(_TrackedDataset(), sampler=sampler, metadata_mode=metadata_mode, double_buffer=True)
                 self.assertEqual(_batch_ids(next(loader)), [0, 1])
                 loader.wait_for_prefetch()
                 self.assertEqual(sampler.consumed_samples, 4)
                 state = loader.state_dict()
-                owner = "sidecar_reader" if sidecar else "dataset_reader"
+                owner = "metadata_reader" if metadata_mode else "dataset_reader"
                 self.assertEqual(state[owner]["sampler"]["consumed_samples"], 2)
                 original = [_batch_ids(batch) for batch in loader]
-                resumed = _loader(_TrackedDataset(), sidecar=sidecar, double_buffer=True)
-                resumed.load_state_dict(state)
-                self.assertEqual([_batch_ids(batch) for batch in resumed], original)
+                for reader_key in ("metadata_reader", "sidecar_reader"):
+                    with self.subTest(reader_key=reader_key):
+                        restored_state = dict(state)
+                        restored_state[reader_key] = restored_state.pop("metadata_reader")
+                        resumed = _loader(_TrackedDataset(), metadata_mode=metadata_mode, double_buffer=True)
+                        resumed.load_state_dict(restored_state)
+                        self.assertEqual([_batch_ids(batch) for batch in resumed], original)
                 self.assertEqual(original[0], [2, 3])
 
     def test_restore_rejects_changed_sampling_policy(self) -> None:
@@ -197,7 +201,7 @@ class TestNativeBatchSampler(unittest.TestCase):
                 batch_sampler=_sampler(), metadata_fn=_metadata, pack_fn=lambda samples, _: samples,
             )
 
-    def test_sidecar_reader_advances_only_on_complete_commit(self) -> None:
+    def test_metadata_reader_advances_only_on_complete_commit(self) -> None:
         """Metadata-only reads retain the committed sampler cursor until delivery."""
         sampler = _sampler()
         reader = BatchSamplerReader(

@@ -127,7 +127,7 @@ def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
         return read_payload(reader, index)
 
     with patch.object(IndexedDataReader, "__getitem__", autospec=True, side_effect=tracked_read), \
-            patch.object(dist, "all_to_all_single", side_effect=AssertionError("Indexed sidecar used payload A2A")):
+            patch.object(dist, "all_to_all_single", side_effect=AssertionError("Indexed metadata used payload A2A")):
         datasets = build_indexed_text_dataset(
             data_path=prefix, data_config=config, tokenizer=_Tokenizer(),
             train_valid_test_num_samples=(1, 0, 0), mesh_context=mesh_context,

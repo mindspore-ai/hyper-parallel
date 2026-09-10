@@ -66,7 +66,7 @@ class LazyDatasetProxy:
         return False
 
     def get_sample_metadata(self, index: int) -> SampleMetadata:
-        """Construct the Dataset if necessary and read sidecar metadata.
+        """Construct the Dataset if necessary and read metadata.
 
         Args:
             index: Source index in the deferred Dataset.

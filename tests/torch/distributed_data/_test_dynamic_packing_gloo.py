@@ -71,7 +71,7 @@ class _IndexedSourceDataset(_RawDataset):
 
 
 class _ShardedRawDataset:
-    """Expose one distinct local sidecar shard on each Dataset Reader."""
+    """Expose one distinct local metadata shard on each Dataset Reader."""
 
     def __init__(self, reader_rank: int, size: int = _DATASET_SIZE // 2) -> None:
         """Store the source rank and globally unique diagnostic-ID offset."""
@@ -84,7 +84,7 @@ class _ShardedRawDataset:
         return self._size
 
     def __getitem__(self, index: int) -> dict[str, int]:
-        """Materialize one rank-local sample after sidecar planning."""
+        """Materialize one rank-local sample after metadata planning."""
         return {
             "sample_id": self._offset + index,
             "pack_tokens": 1,
@@ -586,7 +586,7 @@ def _run_double_buffer_epoch(mesh: Any) -> None:
     _assert_collective_stop(loader)
 
 
-def _run_sidecar_direct_read_epoch(mesh: Any) -> None:
+def _run_metadata_direct_read_epoch(mesh: Any) -> None:
     """Verify disjoint metadata readers and constructors need no payload A2A."""
     rank = dist.get_rank()
     reader_ranks = (1, 3)
@@ -615,7 +615,7 @@ def _run_sidecar_direct_read_epoch(mesh: Any) -> None:
         collate_fn=_collate_fn,
     )
 
-    with patch.object(dist, "all_to_all_single", side_effect=AssertionError("sidecar path entered payload A2A")):
+    with patch.object(dist, "all_to_all_single", side_effect=AssertionError("metadata path entered payload A2A")):
         outputs = _all_gather_object(next(loader))
 
     _assert_same_model_parallel_batches(outputs)
@@ -627,13 +627,13 @@ def _run_sidecar_direct_read_epoch(mesh: Any) -> None:
             for reader_rank in packed_sequence["reader_ranks"]
         }
         assert reader_ranks == {constructor_rank}, (
-            f"Sidecar samples must be read directly by their target constructor: "
+            f"Samples planned from shared metadata must be read by their target constructor: "
             f"constructor={constructor_rank}, readers={reader_ranks}."
         )
     _assert_collective_stop(loader)
 
 
-def _run_inferred_sidecar_epoch(mesh: Any) -> None:
+def _run_inferred_metadata_epoch(mesh: Any) -> None:
     """Infer metadata from Indexed source Datasets and skip payload A2A."""
     rank = dist.get_rank()
     dataset = _IndexedSourceDataset(reader_rank=rank) if rank in _CONSTRUCTOR_RANKS else None
@@ -652,7 +652,7 @@ def _run_inferred_sidecar_epoch(mesh: Any) -> None:
         collate_fn=_collate_fn,
     )
 
-    with patch.object(dist, "all_to_all_single", side_effect=AssertionError("inferred sidecar entered payload A2A")):
+    with patch.object(dist, "all_to_all_single", side_effect=AssertionError("inferred metadata entered payload A2A")):
         outputs = _all_gather_object(next(loader))
 
     _assert_same_model_parallel_batches(outputs)
@@ -660,8 +660,8 @@ def _run_inferred_sidecar_epoch(mesh: Any) -> None:
     _assert_collective_stop(loader)
 
 
-def _run_pre_sharded_sidecar_epoch(mesh: Any) -> None:
-    """Verify local sidecars read on their owning Readers before payload A2A."""
+def _run_pre_sharded_metadata_epoch(mesh: Any) -> None:
+    """Verify samples planned from local metadata are read by their owners before payload A2A."""
     rank = dist.get_rank()
     is_reader = rank in _SHARDED_READER_RANKS
     dataset = _ShardedRawDataset(rank) if is_reader else None
@@ -705,7 +705,7 @@ def _run_pre_sharded_sidecar_epoch(mesh: Any) -> None:
         for reader_rank in packed_sequence["reader_ranks"]
     ]
     assert any(reader_rank != constructor_rank for reader_rank, constructor_rank in routes), (
-        f"Pre-sharded sidecar planning must exercise Reader-to-Constructor A2A: routes={routes!r}."
+        f"Pre-sharded metadata planning must exercise Reader-to-Constructor A2A: routes={routes!r}."
     )
     _assert_collective_stop(loader)
 
@@ -780,17 +780,17 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         # package-owned data process groups without changing step membership.
         _run_double_buffer_epoch(mesh)
 
-        # Sidecar Dataset Readers expose metadata only. Constructors read
+        # Metadata Dataset Readers expose metadata only. Constructors read
         # planned indices locally, so disjoint reader/constructor ranks need no A2A.
-        _run_sidecar_direct_read_epoch(mesh)
+        _run_metadata_direct_read_epoch(mesh)
 
-        # Indexed sources infer the aligned sidecar directly from Dataset
+        # Indexed sources infer the aligned metadata directly from Dataset
         # metadata and also perform target-rank direct reads without A2A.
-        _run_inferred_sidecar_epoch(mesh)
+        _run_inferred_metadata_epoch(mesh)
 
-        # Rank-local sidecars disable Reader stride. Their owning Readers fetch
+        # Rank-local metadata disable Reader stride. Their owning Readers fetch
         # only selected samples and route them to the planned constructors.
-        _run_pre_sharded_sidecar_epoch(mesh)
+        _run_pre_sharded_metadata_epoch(mesh)
 
         # All ranks act as Dataset Readers, so payloads from MP peers must route to a
         # Data Constructor before their constructed batches return over MP.

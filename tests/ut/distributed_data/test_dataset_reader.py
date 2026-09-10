@@ -25,7 +25,7 @@ from torch.utils.data._utils.pin_memory import (  # pylint: disable=forbidden-ba
 from torch.utils.data import Dataset  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.schema import SampleKey, SampleMetadata
-from hyper_parallel.distributed_data.sidecar import SidecarMetadataReader
+from hyper_parallel.distributed_data.metadata import MetadataReader
 from hyper_parallel.distributed_data.dataset_reader import DatasetReader, _IndexedPayload
 from tests.common.mark_utils import arg_mark
 
@@ -422,8 +422,8 @@ class TestDatasetReader(unittest.TestCase):
         )
 
 
-class TestSidecarMetadataReader(unittest.TestCase):
-    """Verify sidecar reader partitions never materialize Dataset payloads."""
+class TestMetadataReader(unittest.TestCase):
+    """Verify metadata reader partitions never materialize Dataset payloads."""
 
     @staticmethod
     def _reader(
@@ -431,8 +431,8 @@ class TestSidecarMetadataReader(unittest.TestCase):
             reader_idx: int,
             *,
             dataset_already_sharded: bool = False,
-    ) -> SidecarMetadataReader:
-        return SidecarMetadataReader(
+    ) -> MetadataReader:
+        return MetadataReader(
             metadata,
             reader_rank=reader_idx + 4,
             reader_idx=reader_idx,
@@ -444,9 +444,9 @@ class TestSidecarMetadataReader(unittest.TestCase):
         )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_reader_idxs_cover_sidecar_indices_without_payload_reads(self) -> None:
-        """Feature: Sidecar metadata partitioning.
-        Description: Read sidecar entries through complementary Dataset Reader strides.
+    def test_reader_idxs_cover_metadata_indices_without_payload_reads(self) -> None:
+        """Feature: Metadata partitioning.
+        Description: Read metadata entries through complementary Dataset Reader strides.
         Expectation: The strides form a complete disjoint index partition without payload reads.
         """
         metadata = [SampleMetadata(pack_tokens=index + 1, sample_id=f"sample-{index}") for index in range(6)]
@@ -467,7 +467,7 @@ class TestSidecarMetadataReader(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_checkpoint_preserves_unselected_metadata_buffer(self) -> None:
-        """Feature: Sidecar metadata recovery.
+        """Feature: Metadata recovery.
         Description: Commit one candidate and restore the remaining reader buffer.
         Expectation: Skipped candidates and the reader cursor are preserved.
         """
@@ -487,9 +487,9 @@ class TestSidecarMetadataReader(unittest.TestCase):
         self.assertEqual(restored.metadata(), original.metadata())
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_pre_sharded_reader_exposes_every_local_sidecar_entry(self) -> None:
-        """Feature: Pre-sharded sidecar metadata.
-        Description: Read a local sidecar with secondary striding disabled.
+    def test_pre_sharded_reader_exposes_every_local_metadata_entry(self) -> None:
+        """Feature: Pre-sharded metadata.
+        Description: Read local metadata with secondary striding disabled.
         Expectation: Every local metadata entry is exposed exactly once.
         """
         metadata = [SampleMetadata(pack_tokens=index + 1, sample_id=index) for index in range(3)]
@@ -501,15 +501,15 @@ class TestSidecarMetadataReader(unittest.TestCase):
         self.assertEqual([item.global_sample_position for item in reader.metadata()], [1, 3, 5])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_active_sidecar_buffer_rejects_epoch_change(self) -> None:
-        """Feature: Sidecar epoch transitions.
+    def test_active_metadata_buffer_rejects_epoch_change(self) -> None:
+        """Feature: Metadata epoch transitions.
         Description: Change epoch while the metadata planning buffer is active.
         Expectation: The reader rejects silently discarding in-progress candidates.
         """
         reader = self._reader([SampleMetadata(pack_tokens=1, sample_id=index) for index in range(4)], 0)
         self.assertIsNone(reader.fill(min_samples=1, min_tokens=1, max_samples=1))
 
-        with self.assertRaisesRegex(ValueError, "active sidecar metadata buffer"):
+        with self.assertRaisesRegex(ValueError, "active metadata buffer"):
             reader.set_epoch(1)
 
 
@@ -517,7 +517,7 @@ class TestSharedReaderState(unittest.TestCase):
     """Protect buffer transactions and shared shuffle/stride semantics."""
 
     @staticmethod
-    def _readers(sharded: bool) -> tuple[DatasetReader, SidecarMetadataReader]:
+    def _readers(sharded: bool) -> tuple[DatasetReader, MetadataReader]:
         """Create online and metadata readers over the same logical sample order."""
         events: list[tuple[str, int]] = []
         tokens = list(range(1, 10))
@@ -529,10 +529,10 @@ class TestSharedReaderState(unittest.TestCase):
             _RecordingDataset(tokens, events), _metadata_callback(events),
             num_workers=0, pin_memory=False, prefetch_factor=None, persistent_workers=False, **options,
         )
-        sidecar = SidecarMetadataReader(
+        metadata_reader = MetadataReader(
             [SampleMetadata(pack_tokens=value, sample_id=index) for index, value in enumerate(tokens)], **options,
         )
-        return online, sidecar
+        return online, metadata_reader
 
     def test_failed_restore_and_commit_leave_buffer_unchanged(self) -> None:
         """Both formats reject corrupt state and missing keys before mutating live data."""

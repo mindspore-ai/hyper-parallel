@@ -34,7 +34,7 @@ from hyper_parallel.distributed_data.schema import (
     StepSampleSelection,
 )
 from hyper_parallel.distributed_data.step_sample_selection import StepSampleSelector
-from hyper_parallel.distributed_data.sidecar import PlannedSampleLoader, SidecarMetadataReader
+from hyper_parallel.distributed_data.metadata import MetadataReader, PlannedSampleLoader
 from hyper_parallel.distributed_data.dataset_reader import DatasetReader
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import (
@@ -93,51 +93,51 @@ def _validate_loader_components(
         topology: DataTopology,
         dataset_reader_ranks: tuple[int, ...],
         dataset_reader: DatasetReader | BatchSamplerReader | None,
-        sidecar_reader: SidecarMetadataReader | BatchSamplerReader | None,
+        metadata_reader: MetadataReader | BatchSamplerReader | None,
         direct_sample_loader: PlannedSampleLoader | None,
-        sidecar_mode: bool,
-        sidecar_payload_exchange: bool,
+        metadata_mode: bool,
+        metadata_payload_exchange: bool,
         double_buffer: bool,
 ) -> None:
-    if not isinstance(sidecar_mode, bool):
-        raise ValueError("sidecar_mode must be boolean.")
-    if not isinstance(sidecar_payload_exchange, bool):
-        raise ValueError("sidecar_payload_exchange must be boolean.")
-    if sidecar_payload_exchange and not sidecar_mode:
-        raise ValueError("sidecar_payload_exchange requires sidecar mode.")
-    if sidecar_mode and dataset_reader is not None:
-        raise ValueError("Sidecar mode must not configure an online Dataset Reader.")
-    if not sidecar_mode and (sidecar_reader is not None or direct_sample_loader is not None):
-        raise ValueError("Online mode must not configure sidecar loading components.")
+    if not isinstance(metadata_mode, bool):
+        raise ValueError("metadata_mode must be boolean.")
+    if not isinstance(metadata_payload_exchange, bool):
+        raise ValueError("metadata_payload_exchange must be boolean.")
+    if metadata_payload_exchange and not metadata_mode:
+        raise ValueError("metadata_payload_exchange requires metadata mode.")
+    if metadata_mode and dataset_reader is not None:
+        raise ValueError("Metadata mode must not configure an online Dataset Reader.")
+    if not metadata_mode and (metadata_reader is not None or direct_sample_loader is not None):
+        raise ValueError("Online mode must not configure metadata loading components.")
     is_reader = topology.global_rank in dataset_reader_ranks
-    planning_reader = sidecar_reader if sidecar_mode else dataset_reader
+    planning_reader = metadata_reader if metadata_mode else dataset_reader
     if is_reader != (planning_reader is not None):
         raise ValueError("Dataset Reader ownership does not match dataset_reader_ranks.")
-    _validate_sidecar_loader_owner(
+    _validate_metadata_loader_owner(
         topology,
         is_reader=is_reader,
-        sidecar_mode=sidecar_mode,
-        sidecar_payload_exchange=sidecar_payload_exchange,
+        metadata_mode=metadata_mode,
+        metadata_payload_exchange=metadata_payload_exchange,
         direct_sample_loader=direct_sample_loader,
     )
     if not isinstance(double_buffer, bool):
         raise ValueError("double_buffer must be boolean.")
 
 
-def _validate_sidecar_loader_owner(
+def _validate_metadata_loader_owner(
         topology: DataTopology,
         *,
         is_reader: bool,
-        sidecar_mode: bool,
-        sidecar_payload_exchange: bool,
+        metadata_mode: bool,
+        metadata_payload_exchange: bool,
         direct_sample_loader: PlannedSampleLoader | None,
 ) -> None:
-    if not sidecar_mode:
+    if not metadata_mode:
         return
-    expected_loader_owner = is_reader if sidecar_payload_exchange else topology.is_constructor
+    expected_loader_owner = is_reader if metadata_payload_exchange else topology.is_constructor
     if expected_loader_owner != (direct_sample_loader is not None):
-        owner_name = "Dataset Reader" if sidecar_payload_exchange else "Data Constructor"
-        raise ValueError(f"Every sidecar {owner_name} must own one plan-aware sample loader.")
+        owner_name = "Dataset Reader" if metadata_payload_exchange else "Data Constructor"
+        raise ValueError(f"Every metadata {owner_name} must own one plan-aware sample loader.")
 
 
 class DistributedDataLoader(Iterator[Any]):
@@ -159,10 +159,10 @@ class DistributedDataLoader(Iterator[Any]):
             topology: DataTopology,
             dataset_reader_ranks: tuple[int, ...],
             dataset_reader: DatasetReader | BatchSamplerReader | None,
-            sidecar_reader: SidecarMetadataReader | BatchSamplerReader | None,
+            metadata_reader: MetadataReader | BatchSamplerReader | None,
             direct_sample_loader: PlannedSampleLoader | None,
-            sidecar_mode: bool,
-            sidecar_payload_exchange: bool,
+            metadata_mode: bool,
+            metadata_payload_exchange: bool,
             step_sample_selector: StepSampleSelector | None,
             planner: DynamicPackingPlanner,
             data_constructor: PackingDataConstructor,
@@ -182,19 +182,19 @@ class DistributedDataLoader(Iterator[Any]):
             topology=topology,
             dataset_reader_ranks=dataset_reader_ranks,
             dataset_reader=dataset_reader,
-            sidecar_reader=sidecar_reader,
+            metadata_reader=metadata_reader,
             direct_sample_loader=direct_sample_loader,
-            sidecar_mode=sidecar_mode,
-            sidecar_payload_exchange=sidecar_payload_exchange,
+            metadata_mode=metadata_mode,
+            metadata_payload_exchange=metadata_payload_exchange,
             double_buffer=double_buffer,
         )
         self._topology = topology
         self._dataset_reader_ranks = dataset_reader_ranks
         self._dataset_reader = dataset_reader
-        self._sidecar_reader = sidecar_reader
+        self._metadata_reader = metadata_reader
         self._direct_sample_loader = direct_sample_loader
-        self._sidecar_mode = sidecar_mode
-        self._sidecar_payload_exchange = sidecar_payload_exchange
+        self._metadata_mode = metadata_mode
+        self._metadata_payload_exchange = metadata_payload_exchange
         self._step_sample_selector = step_sample_selector
         self._planner = planner
         self._data_constructor = data_constructor
@@ -361,7 +361,7 @@ class DistributedDataLoader(Iterator[Any]):
             "stopped": self._stopped,
             "last_plan_id": self._last_plan_id,
             "dataset_reader": self._dataset_reader.state_dict() if self._dataset_reader is not None else None,
-            "sidecar_reader": self._sidecar_reader.state_dict() if self._sidecar_reader is not None else None,
+            "metadata_reader": self._metadata_reader.state_dict() if self._metadata_reader is not None else None,
             "direct_sample_loader": (
                 self._direct_sample_loader.state_dict() if self._direct_sample_loader is not None else None
             ),
@@ -387,8 +387,8 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError(f"Distributed DataLoader state is not copyable: {exc}") from exc
         self._validate_checkpoint_identity(state)
         epoch, step, stopped, last_plan_id = self._validate_checkpoint_values(state)
-        reader_state, sidecar_reader_state, direct_sample_state = self._validate_component_states(state, epoch)
-        self._restore_component_states(reader_state, sidecar_reader_state, direct_sample_state)
+        reader_state, metadata_reader_state, direct_sample_state = self._validate_component_states(state, epoch)
+        self._restore_component_states(reader_state, metadata_reader_state, direct_sample_state)
         self._epoch = epoch
         self._step = step
         self._stopped = stopped
@@ -440,17 +440,18 @@ class DistributedDataLoader(Iterator[Any]):
             epoch: int,
     ) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None, Mapping[str, Any] | None]:
         reader_state = state.get("dataset_reader")
-        sidecar_reader_state = state.get("sidecar_reader")
+        # Accept the old field name when restoring checkpoints written before the rename.
+        metadata_reader_state = state.get("metadata_reader", state.get("sidecar_reader"))
         direct_sample_state = state.get("direct_sample_loader")
         if (self._dataset_reader is None) != (reader_state is None):
             raise ValueError("Distributed DataLoader checkpoint Dataset Reader ownership changed.")
-        if (self._sidecar_reader is None) != (sidecar_reader_state is None):
-            raise ValueError("Distributed DataLoader checkpoint sidecar ownership changed.")
+        if (self._metadata_reader is None) != (metadata_reader_state is None):
+            raise ValueError("Distributed DataLoader checkpoint metadata ownership changed.")
         if (self._direct_sample_loader is None) != (direct_sample_state is None):
             raise ValueError("Distributed DataLoader checkpoint direct-reader ownership changed.")
         for component_name, component_state in (
                 ("Dataset Reader", reader_state),
-                ("sidecar reader", sidecar_reader_state),
+                ("metadata reader", metadata_reader_state),
                 ("direct reader", direct_sample_state),
         ):
             if component_state is None:
@@ -462,18 +463,18 @@ class DistributedDataLoader(Iterator[Any]):
                     f"Distributed DataLoader checkpoint {component_name} epoch "
                     f"{component_state.get('epoch')!r} does not match loader epoch {epoch}."
                 )
-        return reader_state, sidecar_reader_state, direct_sample_state
+        return reader_state, metadata_reader_state, direct_sample_state
 
     def _restore_component_states(
             self,
             reader_state: Mapping[str, Any] | None,
-            sidecar_reader_state: Mapping[str, Any] | None,
+            metadata_reader_state: Mapping[str, Any] | None,
             direct_sample_state: Mapping[str, Any] | None,
     ) -> None:
         if self._dataset_reader is not None:
             self._dataset_reader.load_state_dict(reader_state)
-        if self._sidecar_reader is not None:
-            self._sidecar_reader.load_state_dict(sidecar_reader_state)
+        if self._metadata_reader is not None:
+            self._metadata_reader.load_state_dict(metadata_reader_state)
         if self._direct_sample_loader is not None:
             self._direct_sample_loader.load_state_dict(direct_sample_state)
 
@@ -491,8 +492,8 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError("set_epoch cannot run while a double-buffer prefetch is in flight.")
         if self._dataset_reader is not None:
             self._dataset_reader.set_epoch(epoch)
-        if self._sidecar_reader is not None:
-            self._sidecar_reader.set_epoch(epoch)
+        if self._metadata_reader is not None:
+            self._metadata_reader.set_epoch(epoch)
         if self._direct_sample_loader is not None:
             self._direct_sample_loader.set_epoch(epoch)
         self._epoch = epoch
@@ -522,8 +523,8 @@ class DistributedDataLoader(Iterator[Any]):
             key for key in selected_keys if key.reader_rank == self._topology.global_rank
         }
         self._pending_local_keys = local_selected_keys
-        if self._sidecar_mode and not self._sidecar_payload_exchange:
-            return self._produce_sidecar_batch(plan)
+        if self._metadata_mode and not self._metadata_payload_exchange:
+            return self._produce_metadata_batch(plan)
 
         outgoing, preparation_error = self._prepare_outgoing(plan, local_selected_keys)
         shared_error = self._data_plane.synchronize_error(preparation_error)
@@ -547,18 +548,18 @@ class DistributedDataLoader(Iterator[Any]):
 
         return self._construct_received_payloads(plan, received_payloads)
 
-    def _produce_sidecar_batch(self, plan: DistributedPackingPlan) -> ConstructedBatch | None:
+    def _produce_metadata_batch(self, plan: DistributedPackingPlan) -> ConstructedBatch | None:
         """Directly read constructor-assigned shared indices without payload A2A."""
         received_payloads: dict[SampleKey, Any] = {}
         fetch_error = None
         if self._topology.is_constructor:
             try:
                 if self._direct_sample_loader is None:
-                    raise ValueError("A sidecar Data Constructor has no plan-aware sample loader.")
+                    raise ValueError("A metadata Data Constructor has no plan-aware sample loader.")
                 constructor_plan = plan.constructor_for(self._topology.data_rank)
                 received_payloads = self._direct_sample_loader.fetch(constructor_plan)
             except Exception as exc:
-                fetch_error = self._format_error("sidecar direct read", exc)
+                fetch_error = self._format_error("metadata direct read", exc)
         shared_error = self._data_plane.synchronize_error(fetch_error)
         if shared_error is not None:
             self._pending_local_keys.clear()
@@ -779,9 +780,9 @@ class DistributedDataLoader(Iterator[Any]):
         outgoing: dict[int, list[tuple[SampleKey, Any]]] = {}
         try:
             if local_selected_keys:
-                if self._sidecar_payload_exchange:
+                if self._metadata_payload_exchange:
                     if self._direct_sample_loader is None:
-                        raise ValueError("A pre-sharded sidecar Reader has no plan-aware sample loader.")
+                        raise ValueError("A pre-sharded metadata Reader has no plan-aware sample loader.")
                     ordered_keys = tuple(key for key in plan.selected_keys if key in local_selected_keys)
                     payloads = tuple(self._direct_sample_loader.fetch_keys(ordered_keys).items())
                 else:
@@ -801,11 +802,11 @@ class DistributedDataLoader(Iterator[Any]):
         except Exception as exc:
             return None, self._format_error("payload serialization/allocation", exc)
 
-    def _planning_reader(self) -> DatasetReader | SidecarMetadataReader | BatchSamplerReader | None:
+    def _planning_reader(self) -> DatasetReader | MetadataReader | BatchSamplerReader | None:
         """Return this rank's online or metadata-only Dataset Reader."""
         if self._dataset_reader is not None:
             return self._dataset_reader
-        return self._sidecar_reader
+        return self._metadata_reader
 
     def _constructor_envelope(
             self,
